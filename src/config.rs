@@ -834,7 +834,8 @@ pub struct BenchmarkConfig {
     pub datasets: Vec<DatasetRef>,
     /// Images per dataset, evenly spread (0 = all).
     pub max_images_per_dataset: usize,
-    /// Device specs; empty = every runnable option.
+    /// Device specs. Empty: the Benchmark page ticks, and a service run uses, the devices the
+    /// models run on; `benchmark --all-devices` takes it as every runnable option.
     pub devices: Vec<String>,
     /// Model names; empty = the enabled models whose files are present.
     pub models: Vec<String>,

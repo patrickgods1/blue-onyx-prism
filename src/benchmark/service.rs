@@ -5,8 +5,11 @@
 //! A run: resolve the datasets (downloading missing built-in sets first when
 //! `benchmark.auto_download_datasets` is on), compute pseudo ground truth for datasets without
 //! ground truth (reference model on a CPU device, or on one of the chosen devices when the run
-//! limits them), then sweep every model over the chosen devices, and merge the results into
-//! `benchmark.json`.
+//! limits them), then sweep every model over the chosen devices (none chosen: each model on the
+//! device it runs on), and merge the results into `benchmark.json`.
+//!
+//! Before each device starts the run writes a [`breadcrumb`]; a file left from a run that never
+//! ended is logged at the next start and shown once on the Benchmark page.
 //!
 //! The run uses the registry's shared [`Runtimes`] when there is one (same OpenVINO `Core`,
 //! same ONNX Runtime library: a process can load only one ONNX Runtime flavor), compiling under
@@ -23,7 +26,7 @@ use super::threshold::Objective;
 use super::{
     Bench, BenchmarkResults, ModelResult, Phase, Progress, SweepOptions, configured_device,
     find_model, is_cancelled, job_for_config, no_pseudo_gt_device, pick_reference,
-    pseudo_ground_truth, pseudo_gt_device, sweep,
+    pseudo_ground_truth, pseudo_gt_device,
 };
 use crate::backend::spec::{self, Device, DeviceSpec};
 use crate::backend::{CoreOptions, Runtimes};
@@ -38,6 +41,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub mod breadcrumb;
+
+/// Said wherever a run is about to use more than one GPU. What `docs/TRAINING.md` records, and no
+/// more: no cause was ever found.
+pub const SEVERAL_GPUS_WARNING: &str = "A benchmark across several GPUs has hung a machine: a \
+     GTX 1070 Ti + UHD 630 box froze within seconds of a sweep of its devices, twice, and the \
+     cause was never found. Run one GPU at a time unless a hard reset of this machine is \
+     acceptable.";
+
 pub const MAX_REPEAT: usize = 1000;
 pub const MAX_WARMUP: usize = 100;
 /// Images one run benchmarks at most, over all its datasets (BM-11: every device run keeps
@@ -51,7 +63,7 @@ pub const MAX_IMAGES_PER_RUN: usize = 2000;
 pub struct RunRequest {
     /// Config model names; empty = the enabled models whose files are present.
     pub models: Vec<String>,
-    /// Device specs; empty = every runnable option of each model.
+    /// Device specs; empty = each model on the device it runs on.
     pub devices: Vec<String>,
     pub datasets: Vec<DatasetRef>,
     /// Images per dataset (0 = all); a run takes at most [`MAX_IMAGES_PER_RUN`] in total.
@@ -190,7 +202,7 @@ impl RunRequest {
         Ok(())
     }
 
-    /// The device filter: None = all runnable.
+    /// The device filter: None = each model on its own device.
     pub fn parsed_devices(&self) -> Result<Option<Vec<Device>>> {
         parse_devices(&self.devices)
     }
@@ -307,6 +319,8 @@ struct Inner {
     finished_at: Option<String>,
     /// Bumped per run, so a finished thread of an old run cannot overwrite a newer one.
     run_id: u64,
+    /// The breadcrumb of a run that never ended, until the page shows it.
+    interrupted: Option<breadcrumb::Breadcrumb>,
 }
 
 /// The process-wide benchmark runner.
@@ -335,6 +349,7 @@ impl BenchmarkService {
                 started_at: None,
                 finished_at: None,
                 run_id: 0,
+                interrupted: None,
             }),
             cancel: AtomicBool::new(false),
         })
@@ -457,8 +472,37 @@ impl BenchmarkService {
         Ok(())
     }
 
+    /// Look for a breadcrumb left by a run that never ended ([`breadcrumb`]) and log it at warn,
+    /// once; [`Self::take_interrupted`] shows it. For the service's start, and repeated before a
+    /// new run can overwrite the file. A run of this process is alive, so its file is not looked
+    /// at, and one of another process holds the file's lock.
+    pub fn claim_breadcrumb(&self, data_root: &std::path::Path) {
+        if self.is_running() {
+            return;
+        }
+        let Some(left) = breadcrumb::left_behind(data_root) else {
+            return;
+        };
+        let mut g = self.lock();
+        if g.interrupted.as_ref() != Some(&left) {
+            tracing::warn!("{}", left.message());
+            g.interrupted = Some(left);
+        }
+    }
+
+    /// The note of a run that never ended, the one time it is asked for: the file goes with it.
+    pub fn take_interrupted(&self, data_root: &std::path::Path) -> Option<String> {
+        self.claim_breadcrumb(data_root);
+        let left = self.lock().interrupted.take()?;
+        if !self.is_running() {
+            breadcrumb::clear(data_root);
+        }
+        Some(left.message())
+    }
+
     /// Start a real benchmark of `request` (see [`run`]).
     pub fn start(self: &Arc<Self>, ctx: RunContext, request: RunRequest) -> Result<(), Busy> {
+        self.claim_breadcrumb(&ctx.config.data_root());
         let req = request.clone();
         self.start_job(request, move |h| run(&ctx, &req, h))
     }
@@ -723,6 +767,13 @@ impl DownloadWait {
     }
 }
 
+/// A request without devices: the one device `configured` names. Never every device of the
+/// machine, which only an explicit list or `--all-devices` asks for; None only when the model has
+/// no device at all, so the sweep has nothing runnable to touch and lists why.
+fn own_device(configured: Option<&str>) -> Option<Vec<Device>> {
+    parse_devices(&[configured?.to_string()]).ok().flatten()
+}
+
 /// Benchmark the requested models on the requested devices over the requested datasets,
 /// publishing progress and partial results, then merge the finished models into the results
 /// file (also when cancelled).
@@ -743,6 +794,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         },
         cache_dir: ctx.config.cache_dir_path(),
         run_id: super::history::new_run_id(),
+        trail: breadcrumb::Trail::new(&ctx.config.data_root()),
     };
     let image_count: usize = sets.iter().map(|s| s.images.len()).sum();
 
@@ -961,12 +1013,14 @@ struct ServiceRun<'a> {
     req: &'a RunRequest,
     h: &'a RunHandle,
     runtimes: Arc<Mutex<Runtimes>>,
-    /// The requested devices (None = every runnable option of each model).
+    /// The requested devices (None = each model on the device it runs on).
     devices: Option<Vec<Device>>,
     params: PostParams,
     cache_dir: Option<PathBuf>,
     /// The run's id (its start time), stamped on every model result.
     run_id: String,
+    /// Goes with the run, on every way out: see [`breadcrumb`].
+    trail: breadcrumb::Trail,
 }
 
 impl ServiceRun<'_> {
@@ -1012,6 +1066,7 @@ impl ServiceRun<'_> {
                 pb.cache_dir = self.cache_dir.as_deref();
                 pb.cancel = Some(h.cancel_flag());
                 pb.progress = Some(&progress);
+                self.trail.note(&device.to_string(), &job.name);
                 match pseudo_ground_truth(&pb, &self.runtimes, &job, device, sets) {
                     Ok(_) => {
                         if self.in_run(&job.name) {
@@ -1052,25 +1107,11 @@ impl ServiceRun<'_> {
 
     /// Total device runs of `entries` (unknown models count none).
     fn runs_total(&self, entries: &[(String, Option<crate::config::ModelConfig>)]) -> usize {
-        let per_model = |path: &std::path::Path| -> usize {
-            match &self.devices {
-                Some(d) => d.len(),
-                None => self
-                    .lock()
-                    .selection(Some(path))
-                    .options
-                    .iter()
-                    .filter(|o| o.runnable)
-                    .count(),
-            }
-        };
+        let per_model = self.devices.as_ref().map_or(1, Vec::len);
         entries
             .iter()
-            .map(|(_, m)| {
-                m.as_ref()
-                    .map(|m| per_model(&self.ctx.config.data_path(&m.path)))
-                    .unwrap_or(0)
-            })
+            .filter(|(_, m)| m.is_some())
+            .map(|_| per_model)
             .sum()
     }
 
@@ -1117,18 +1158,29 @@ impl ServiceRun<'_> {
         bench.weights = req.weights;
         bench.threshold_objective = req.threshold_objective;
         bench.accuracy_metric = req.accuracy_metric;
+        let devices = self
+            .devices
+            .clone()
+            .or_else(|| own_device(configured.as_deref()));
         let opts = SweepOptions {
-            devices: self.devices.clone(),
+            devices,
             configured,
             threshold_objective: req.threshold_objective,
         };
         let run_id = self.run_id.clone();
-        let mut r = sweep(&bench, &self.runtimes, &job, &opts, &mut |partial| {
-            overall.runs_done.fetch_add(1, Ordering::Relaxed);
-            let mut p = partial.summary();
-            p.run_id = Some(run_id.clone());
-            h.set_current(p);
-        })?;
+        let mut r = super::sweep::sweep_with(
+            &bench,
+            &self.runtimes,
+            &job,
+            &opts,
+            &mut |device| self.trail.note(&device.to_string(), &job.name),
+            &mut |partial| {
+                overall.runs_done.fetch_add(1, Ordering::Relaxed);
+                let mut p = partial.summary();
+                p.run_id = Some(run_id.clone());
+                h.set_current(p);
+            },
+        )?;
         r.run_id = Some(self.run_id.clone());
         let files = sets
             .iter()
@@ -1631,6 +1683,107 @@ mod tests {
             !super::super::history::history_path(&dir.join("benchmark.json")).exists(),
             "failed models make no history"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// G1: a request without devices runs a model on its own device only, whatever else the
+    /// machine has. (No runtime here: the one row fails, which is what counts.)
+    #[test]
+    fn no_devices_means_the_models_own_device() {
+        assert_eq!(
+            own_device(Some("ort:cpu")),
+            Some(vec![
+                spec::parse("ort:cpu").unwrap().device().copied().unwrap()
+            ])
+        );
+        assert_eq!(own_device(None), None);
+
+        let dir = std::env::temp_dir().join(format!("bop-own-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("m.onnx");
+        std::fs::write(&model, b"not a model").unwrap();
+        let config = Config {
+            models: vec![crate::config::ModelConfig {
+                name: Some("m".into()),
+                path: model,
+                device: Some("ort:cuda:0".into()),
+                family: crate::model::ModelFamilyKind::Yolo5,
+                ..Default::default()
+            }],
+            download_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let rt = Runtimes::new_with(
+            &CoreOptions {
+                openvino_dir: Some(dir.join("none")),
+                ..Default::default()
+            },
+            &crate::backend::OrtOptions {
+                onnxruntime_dir: Some(dir.join("none")),
+                default_dir: Some(dir.join("none")),
+                cuda_libs_dir: None,
+            },
+        );
+        let ctx = RunContext {
+            config,
+            results_path: dir.join("benchmark.json"),
+            runtimes: Some(Arc::new(Mutex::new(rt))),
+            loaded: HashMap::new(),
+            resources: None,
+        };
+        let svc = BenchmarkService::new();
+        svc.start(ctx, request(&["m"])).unwrap();
+        assert!(svc.wait_idle(Duration::from_secs(30)));
+        let st = svc.status();
+        assert_eq!(st.state, RunState::Done, "{st:?}");
+        let devices: Vec<&str> = st.models[0]
+            .devices
+            .iter()
+            .map(|d| d.device.as_str())
+            .collect();
+        assert_eq!(devices, ["ort:cuda:0"], "{st:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A breadcrumb is claimed only with no run alive, logged once, handed out once.
+    #[test]
+    fn a_left_breadcrumb_waits_for_the_run_to_end_and_is_handed_out_once() {
+        let dir = std::env::temp_dir().join(format!("bop-claim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(breadcrumb::BREADCRUMB_FILE);
+        let svc = BenchmarkService::new();
+        assert_eq!(svc.take_interrupted(&dir), None);
+
+        std::fs::write(
+            &file,
+            br#"{"device":"ort:cuda:0","model":"m","time":"2026-11-06T10:00:00Z"}"#,
+        )
+        .unwrap();
+        let mut req = request(&[]);
+        req.low_priority = false;
+        svc.start_job(req, |h| {
+            while !h.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::benchmark::Cancelled.into())
+        })
+        .unwrap();
+        assert_eq!(
+            svc.take_interrupted(&dir),
+            None,
+            "this process's run owns the file"
+        );
+        assert!(file.exists());
+        svc.cancel();
+        assert!(svc.wait_idle(Duration::from_secs(10)));
+
+        svc.claim_breadcrumb(&dir);
+        svc.claim_breadcrumb(&dir);
+        assert!(file.exists(), "kept until it is shown");
+        let note = svc.take_interrupted(&dir).expect("the note");
+        assert!(note.contains("ort:cuda:0"), "{note}");
+        assert!(!file.exists());
+        assert_eq!(svc.take_interrupted(&dir), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

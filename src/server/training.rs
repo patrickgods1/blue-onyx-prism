@@ -87,6 +87,12 @@ pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> 
     }
 }
 
+/// A training run or task of this process's queue is queued or running, so it may be using the
+/// GPU. A `train` command in another process is not seen.
+pub(crate) fn queue_busy() -> bool {
+    SERVICE.get().is_some_and(|s| s.busy())
+}
+
 /// The clock of job `id` ([`TrainingService::timing`]).
 pub(super) fn job_timing(id: &str) -> Option<crate::training::eta::JobTiming> {
     SERVICE.get()?.timing(id)

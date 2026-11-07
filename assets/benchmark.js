@@ -46,12 +46,23 @@
     var f = $("add-folder").value.trim(); if (f) b.append("add_folder", f);
     return b;
   }
-  var runMsg = $("run-msg");
+  var runMsg = $("run-msg"), gpuWarning = $("gpu-warning");
+  // Several GPUs in one run have hung a machine: said while ticking, asked at Start. The server
+  // refuses them without the `confirm_gpus` field.
+  function gpusTicked() { return form.querySelectorAll("input[name=device][data-gpu]:checked").length; }
+  function showGpuWarning() { gpuWarning.hidden = gpusTicked() < 2; }
+  form.querySelectorAll("input[name=device]").forEach(function (c) { c.addEventListener("change", showGpuWarning); });
+  showGpuWarning();
   $("start").addEventListener("click", function () {
     // No device field would make the server fall back to the saved devices, unseen here.
     if (!form.querySelector("input[name=device]:checked")) { runMsg.textContent = "Tick at least one device to benchmark on."; return; }
+    var body = formBody();
+    if (gpusTicked() > 1) {
+      if (!confirm(gpusTicked() + " GPU devices are ticked. " + gpuWarning.textContent + "\n\nStart anyway?")) return;
+      body.append("confirm_gpus", "1");
+    }
     msg.textContent = "starting…"; runMsg.textContent = "";
-    post("/v1/benchmark", formBody()).then(function (j) { msg.textContent = j.message; if (j.success) poll(); else runMsg.textContent = j.message; });
+    post("/v1/benchmark", body).then(function (j) { msg.textContent = j.message; if (j.success) poll(); else runMsg.textContent = j.message; });
   });
   $("cancel").addEventListener("click", function () { post("/v1/benchmark/cancel", "").then(function (j) { msg.textContent = j.message; }); });
   $("save-defaults").addEventListener("click", function () {

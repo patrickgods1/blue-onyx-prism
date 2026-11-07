@@ -645,6 +645,11 @@ pub(super) async fn login_only(
     }
 }
 
+/// See [`training::queue_busy`]: for the supervisor, which holds back GPU retries meanwhile.
+pub(crate) fn training_queue_busy() -> bool {
+    training::queue_busy()
+}
+
 /// The process-wide router state: the generation (`AppState`) that is current. A generation
 /// restart swaps it (`Shared::swap`); the listener stays up. Handlers extract
 /// `State<Arc<AppState>>` as before ([`axum::extract::FromRef`]), one `Arc` clone per request,

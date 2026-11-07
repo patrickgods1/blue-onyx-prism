@@ -3,8 +3,9 @@
 //! `backend::fake` runtime. They cover FIFO replies with several slots, a prep failure in the
 //! middle, the timeout before submit, shutdown with a busy slot, and the stuck-inference path.
 
-use super::watch::STUCK_PREFIX;
+use super::watch::{BROKEN_PREFIX, STUCK_PREFIX};
 use super::*;
+use crate::backend::Candidate;
 use crate::backend::fake::{Call, FakeScript, Step, yolo26_output};
 use crate::image::RgbImage;
 use crate::metrics::RouteFallback;
@@ -63,6 +64,17 @@ impl Harness {
 
     /// [`Self::start`] for model `name` with `live` settings and the worker directory `peers`.
     fn start_named(name: &str, slots: usize, live: LiveSettings, peers: Peers) -> Self {
+        Self::start_faulty(name, slots, live, peers, TestFaults::default())
+    }
+
+    /// [`Self::start_named`] with injected `faults`.
+    fn start_faulty(
+        name: &str,
+        slots: usize,
+        live: LiveSettings,
+        peers: Peers,
+        faults: TestFaults,
+    ) -> Self {
         let script = FakeScript::new(slots, INPUT);
         let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
         let path = PathBuf::from("fake.onnx");
@@ -88,6 +100,10 @@ impl Harness {
             concurrency: None,
             prep: Some(PrepPool::new(2)),
             peers,
+            only: None,
+            make_room: None,
+            recovering_from: None,
+            faults,
         };
         let metrics = Arc::new(ModelMetrics::new(name, "auto", ""));
         let shutdown = CancellationToken::new();
@@ -455,6 +471,201 @@ fn repeated_inference_errors_fail_the_model() {
 
 /// A reset device can answer every inference with unwritten (all-zero) buffers and no error:
 /// enough of those in a row mark the model broken too.
+/// A worker whose `submit` fails with what `error` makes while `on` is set.
+fn failing_submits(
+    slots: usize,
+    error: impl Fn() -> anyhow::Error + Send + Sync + 'static,
+) -> (Harness, Arc<AtomicBool>) {
+    let on = Arc::new(AtomicBool::new(false));
+    let flag = on.clone();
+    let faults = TestFaults {
+        submit: Some(Arc::new(move || {
+            if flag.load(Ordering::SeqCst) {
+                Err(error())
+            } else {
+                Ok(())
+            }
+        })),
+        ..TestFaults::default()
+    };
+    let live = LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        ..LiveSettings::default()
+    };
+    let h = Harness::start_faulty("fake", slots, live, Peers::new(), faults);
+    (h, on)
+}
+
+/// OpenVINO's `infer_async` after a GPU reset: every submit fails, no inference ever runs, and
+/// nothing reaches `finish`. The model must still count as broken so the supervisor reloads it.
+#[test]
+fn repeated_submit_errors_fail_the_model() {
+    let (h, on) = failing_submits(1, || anyhow::anyhow!("starting inference failed"));
+    assert!(h.send("ok.jpg").wait().success);
+    on.store(true, Ordering::SeqCst);
+    for i in 0..run::MAX_CONSECUTIVE_ERRORS {
+        assert_eq!(h.handle.state.get(), ModelState::Ready, "after {i} errors");
+        let r = h.send(&format!("bad{i}.jpg")).wait();
+        assert!(!r.success, "{r:?}");
+    }
+    h.wait_for("the model to be marked broken", || h.handle.is_stuck());
+    let ModelState::Failed(msg) = h.handle.state.get() else {
+        panic!("not failed");
+    };
+    assert!(msg.starts_with(BROKEN_PREFIX), "{msg}");
+    assert!(msg.contains("starting inference failed"), "{msg}");
+    // Fail-fast from here on, like a stuck inference.
+    let r = h.send("after.jpg").wait();
+    assert!(!r.success);
+    assert!(r.message.contains("unavailable"), "{r:?}");
+    h.stop();
+}
+
+/// One failed submit among good inferences is a per-request error, as on a completion.
+#[test]
+fn a_single_submit_error_keeps_the_model_ready() {
+    let (h, on) = failing_submits(1, || anyhow::anyhow!("one bad start"));
+    for i in 0..run::MAX_CONSECUTIVE_ERRORS * 2 {
+        on.store(true, Ordering::SeqCst);
+        assert!(!h.send(&format!("bad{i}.jpg")).wait().success);
+        on.store(false, Ordering::SeqCst);
+        assert!(h.send(&format!("good{i}.jpg")).wait().success);
+    }
+    assert_eq!(h.handle.state.get(), ModelState::Ready);
+    assert!(!h.handle.is_stuck());
+    h.stop();
+}
+
+/// ONNX Runtime's dead session answers `submit` with `SessionDead`: no later inference can
+/// work, so the first one marks the model, as on a completion.
+#[test]
+fn dead_session_at_submit_fails_the_model_at_once() {
+    let (h, on) = failing_submits(2, || {
+        crate::backend::SessionDead {
+            slot: 0,
+            reason: "session thread exited".into(),
+        }
+        .into()
+    });
+    on.store(true, Ordering::SeqCst);
+    let r = h.send("dead.jpg").wait();
+    assert!(!r.success, "{r:?}");
+    h.wait_for("the model to be marked stuck", || h.handle.is_stuck());
+    let ModelState::Failed(msg) = h.handle.state.get() else {
+        panic!("not failed");
+    };
+    assert!(msg.starts_with(STUCK_PREFIX), "{msg}");
+    assert!(msg.contains("session thread exited"), "{msg}");
+    h.stop();
+}
+
+/// A dead device is not held until the thread exits: the engine is given up as soon as the
+/// model is marked, while its worker goes on answering.
+#[test]
+fn a_stuck_models_engine_is_freed_while_its_worker_lives() {
+    let h = Harness::start(1, Duration::from_secs(30));
+    h.script.push([Step::Panic]);
+    assert!(!h.send("dead.jpg").wait().success);
+    h.wait_for("the engine to be given up", || {
+        h.script.calls().contains(&Call::Abort)
+    });
+    assert!(h.handle.is_stuck());
+    let r = h.send("after.jpg").wait();
+    assert!(r.message.contains("unavailable"), "{r:?}");
+    assert!(h.stop() < SOON);
+}
+
+fn candidate(spec: &str, fell_back: bool) -> Candidate {
+    let DeviceSpec::Device(device) = crate::backend::spec::parse(spec).unwrap() else {
+        panic!("{spec} is no device");
+    };
+    Candidate {
+        device,
+        fell_back,
+        note: None,
+    }
+}
+
+/// A worker on the fake runtime, not waited for: `script` as given, `faults` on.
+fn spawn_faulty(script: &FakeScript, faults: TestFaults) -> (WorkerHandle, CancellationToken) {
+    let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let path = PathBuf::from("fake.onnx");
+    let cfg = WorkerConfig {
+        name: "fake".into(),
+        model: ModelConfig {
+            path: path.clone(),
+            family: ModelFamilyKind::Yolo26,
+            ..ModelConfig::default()
+        },
+        device: DeviceSpec::Auto,
+        load: LoadRequest {
+            path,
+            requested: "auto".into(),
+            gpu_precision: None,
+        },
+        classes: classes(),
+        live: LiveSettings::default().shared(),
+        queue_size: QUEUE,
+        lazy: false,
+        can_use_gpu: false,
+        wait: None,
+        concurrency: None,
+        prep: Some(PrepPool::new(1)),
+        peers: Peers::new(),
+        only: None,
+        make_room: None,
+        recovering_from: None,
+        faults,
+    };
+    let metrics = Arc::new(ModelMetrics::new("fake", "auto", ""));
+    let shutdown = CancellationToken::new();
+    let handle = spawn_worker(runtimes, cfg, metrics, shutdown.clone());
+    (handle, shutdown)
+}
+
+/// A warm-up that never answers: the worker goes on to the next candidate at once, and the
+/// backend is stopped and freed on another thread instead of being leaked for ever. Every
+/// candidate hangs here (they share the script), so the abort of each is visible.
+#[test]
+fn an_abandoned_warm_up_is_freed_by_a_reaper_and_the_worker_goes_on() {
+    let mut script = FakeScript::new(1, INPUT);
+    script.warmup_hangs = true;
+    let faults = TestFaults {
+        candidates: Some(vec![
+            candidate("openvino:gpu", false),
+            candidate("openvino:cpu", true),
+        ]),
+        warmup_timeout: Some(Duration::from_millis(50)),
+        ..TestFaults::default()
+    };
+    let (handle, shutdown) = spawn_faulty(&script, faults);
+    let t = Instant::now();
+    while !matches!(handle.state.get(), ModelState::Failed(_)) {
+        assert!(t.elapsed() < SOON, "no outcome");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let ModelState::Failed(msg) = handle.state.get() else {
+        unreachable!();
+    };
+    assert!(msg.contains("did not finish"), "{msg}");
+    while script.calls().iter().filter(|c| **c == Call::Abort).count() < 2 {
+        assert!(t.elapsed() < SOON, "not freed: {:?}", script.calls());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // A hang may pass: this candidate is worth another try.
+    let better = handle.better().expect("a better device");
+    assert_eq!(
+        better.candidate.device,
+        candidate("openvino:gpu", false).device
+    );
+    assert_eq!(
+        better.failure,
+        crate::backend::plan::LoadFailure::DeviceLost
+    );
+    shutdown.cancel();
+    handle.join();
+}
+
 #[test]
 fn all_zero_outputs_fail_the_model() {
     use super::run::MAX_CONSECUTIVE_DEGENERATE;

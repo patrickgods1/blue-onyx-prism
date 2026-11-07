@@ -3805,6 +3805,15 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-S7 | security | fixed: uploads have a 10 s read deadline and a per-address limit on bodies still arriving; total requests from one Blue Iris are never capped |
 | RR-S8 | security | fixed: protected DACL on `tools\hf`; a failed token rename leaves no temp copy |
 | RR-S9 | security | partly fixed: URL import refuses internal addresses and hosts, by name and after resolving; a redirect to one is not covered, yt-dlp follows redirects itself. Review `out_dir` and `dir` use `allowed_folder`. Docker bases pinned by digest. Dependabot alerts are a repository setting and still off; the hashed pip locks are not suited to Dependabot |
+| RR-R1 | reliability | fixed: submit errors reach the health path, and a dead session marks the model at once |
+| RR-R2 | reliability | fixed: the supervisor keeps retrying a reload that failed (`Status::ReloadFailed`) |
+| RR-R3 | reliability | fixed: a model on a fallback after a memory or device-lost failure retries the better candidate with a long backoff, the current worker serving; other failures are not retried. Classifier in `plan.rs` |
+| RR-R4 | reliability | fixed: a healthy reload or restart keeps the old worker serving until the replacement is Ready; a memory failure retires it and tries again (RR-G5) |
+| RR-R5 | reliability | fixed: a bounded drain answers an overload 503 without breaking the connection |
+| RR-R6 | reliability | fixed: a runtime that lost a listed file is no longer Installed, and downloads again |
+| RR-R7 | reliability | fixed in code, not verified on a GPU: a Failed or stuck model is retired before its reload |
+| RR-R8 | reliability | fixed: bounded reapers free an abandoned backend instead of `mem::forget` |
+| RR-G1 | reliability | reduced, not solved: the root cause of the recorded hangs is unknown. The default is each model's device, several GPUs need a confirmation, the page refuses to start during a job, and a breadcrumb names the last device. A `train` CLI in another process is not seen, and CLI sweeps leave no breadcrumb |
 | RR-D1 | data | fixed: uninstall keeps user data on every package unless `REMOVEDATA=1`, `--purge` or `apt purge`; `KEEPDATA=1` wins over `REMOVEDATA=1`. An installed 0.2.0 still uninstalls by its old rules |
 | RR-D2 | data | fixed: failed label writes keep `work`, are counted in the summary, and a run that saved nothing fails |
 | RR-D3 | data | fixed: damaged `runs.json` / `tasks.json` move aside, per record where possible; a file that cannot be read is left alone and not saved over; saves `sync_all` |
@@ -3814,7 +3823,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-D7 | data | fixed: unchecked empty X-AnyLabeling files are skipped; import writes under the label lock |
 | RR-D8 | data | fixed: bulk accept and the chain's accept reject hidden classes; exports report lost frames and unreadable folders |
 | RR-D9 | data | fixed: `apply_relabel` leaves closed frames alone (votes and the marker only) |
-| RR-D10 | data | fixed: per-folder `.labels.lock`, 25 microseconds a write, falling back to the process lock where locks fail |
+| RR-D10 | data | fixed: per-folder `.labels.lock`, 25 microseconds a write, falling back to the process lock where locks fail. A first version treated a held lock like a broken one and ran the next minute of writes unprotected: CI on Windows lost 90 of 300 writes. Reproduced with a slowed write (2 of 3 passing at 40 ms, 1 of 3 at 80 ms; after the fix 8 of 8 and 4 of 4). Only a lock that cannot work is skipped now; a held lock is waited for up to 30 s, then one write goes on |
 | RR-D11 | data | fixed: `work` goes after register; `output` is recorded at install. Retry after a failed register has no button: the message points to Add a model by path |
 | RR-D12 | data | partly fixed: cross-volume install and `.provenance.json` are atomic; a hard crash still strands proposals until phase 7's sweep |
 | RR-M1 | data | fixed: an unavailable review folder is its own state on Review and the Train strip |

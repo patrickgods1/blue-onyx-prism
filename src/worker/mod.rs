@@ -23,10 +23,12 @@
 //!
 //! Layout: this module holds the public surface (work items, [`WorkerConfig`], [`LiveSettings`],
 //! [`WorkerHandle`], spawning); `run` is the thread's load + run loop, `pipeline` the request
-//! bookkeeping it drives, and `watch` the stuck-inference and slow-compile watchdogs.
+//! bookkeeping it drives, `watch` the stuck-inference and slow-compile watchdogs, and `reap` the
+//! threads that free a backend a worker has given up on.
 
 use crate::api::{VisionDetectionRequest, VisionDetectionResponse};
-use crate::backend::{DeviceInfo, DeviceSpec, LoadRequest, Runtimes};
+use crate::backend::plan::Better;
+use crate::backend::{Candidate, DeviceInfo, DeviceSpec, LoadRequest, Runtimes};
 use crate::config::{Config, ModelConfig, ThresholdSource};
 use crate::metrics::{ModelGauges, ModelMetrics, ModelStateLabel};
 use crate::prep::PrepPool;
@@ -46,12 +48,14 @@ use tracing::{error, warn};
 
 mod collect;
 mod pipeline;
+mod reap;
 mod run;
 #[cfg(test)]
 mod run_tests;
 mod verify;
 mod watch;
 
+pub(crate) use reap::wait_for_reapers;
 use run::WorkerCtx;
 
 /// A message for a worker thread.
@@ -225,6 +229,60 @@ pub struct WorkerConfig {
     pub prep: Option<Arc<PrepPool>>,
     /// The generation's other workers, for the night model switch (empty: never forwards).
     pub peers: Peers,
+    /// Try only this candidate, with no fallback (another try of a better device: the worker
+    /// serving meanwhile stays unless this one loads). None: the plan for `device`.
+    pub only: Option<Candidate>,
+    /// Asked once when the first candidate fails for lack of memory: free what the model's
+    /// other copy holds, then the candidate is tried again.
+    pub make_room: Option<MakeRoom>,
+    /// The canonical device this model ran on before the fault it is reloaded after.
+    pub recovering_from: Option<String>,
+    /// Faults a test injects where the fake runtime cannot produce them.
+    #[cfg(test)]
+    pub(crate) faults: TestFaults,
+}
+
+/// Frees the memory of the copy of a model that serves while a replacement loads; true when
+/// there was one, so another try can help. Blocks the caller for a bounded time.
+#[derive(Clone)]
+pub struct MakeRoom(Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl MakeRoom {
+    pub fn new(f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for MakeRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MakeRoom")
+    }
+}
+
+/// Runs before a candidate compiles; an error is that candidate's failure.
+#[cfg(test)]
+pub(crate) type LoadFault = Arc<dyn Fn(&Candidate) -> anyhow::Result<()> + Send + Sync>;
+
+/// What a test makes go wrong in a worker ([`WorkerConfig::faults`]). The fake runtime plays
+/// inferences only; these reach the paths around them.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestFaults {
+    /// Runs before each `submit`; an error takes the place of the backend's answer.
+    pub(crate) submit: Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
+    /// The candidates to walk instead of the fake's single one.
+    pub(crate) candidates: Option<Vec<Candidate>>,
+    /// Instead of [`run::WARMUP_TIMEOUT`].
+    pub(crate) warmup_timeout: Option<Duration>,
+    /// See [`LoadFault`].
+    pub(crate) load: Option<LoadFault>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TestFaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestFaults")
+    }
 }
 
 /// The per-model settings a config change applies without reloading the model (per-model
@@ -449,6 +507,14 @@ pub struct WorkerHandle {
     /// The model's class names (empty while unknown: a model waiting for its download), so a
     /// live object filter can be checked against them.
     classes: Vec<String>,
+    /// A better device than the one the model loaded on, worth another try (set by the worker
+    /// when it loads, see [`Better`]).
+    better: Arc<Mutex<Option<Better>>>,
+    /// This worker is an automatic reload ([`crate::supervisor`]): its failure to load means the
+    /// model is still down, unlike the failed load of a config change.
+    recovery: bool,
+    /// See [`WorkerConfig::recovering_from`].
+    recovering_from: Option<String>,
 }
 
 /// The labels of `filter` that name no class of `classes` (case-insensitive); empty when
@@ -518,7 +584,56 @@ impl WorkerHandle {
             live: LiveSettings::default().shared(),
             stuck: Arc::new(AtomicBool::new(false)),
             classes: Vec::new(),
+            better: Arc::default(),
+            recovery: false,
+            recovering_from: None,
         }
+    }
+
+    /// A handle with no thread that stands in for a model whose worker just left: `Initializing`
+    /// with `detail`, so requests get the usual immediate answer.
+    pub fn placeholder(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        metrics: Arc<ModelMetrics>,
+    ) -> Self {
+        let h = Self::failed(name, "", metrics);
+        h.state.set_initializing(detail);
+        h
+    }
+
+    /// The canonical device of the loaded model (None before it has loaded).
+    pub fn loaded_device(&self) -> Option<String> {
+        self.device.read_recover().as_ref().map(|d| d.spec.clone())
+    }
+
+    /// The device a reload of this model after a fault should be compared with: the one it
+    /// runs on, else the one an earlier reload was recovering.
+    pub fn device_before_fault(&self) -> Option<String> {
+        self.loaded_device()
+            .or_else(|| self.recovering_from.clone())
+    }
+
+    /// See [`Better`]: a candidate worth another try.
+    pub fn better(&self) -> Option<Better> {
+        self.better.lock_recover().clone()
+    }
+
+    /// Stop trying the better device (a later try failed for a reason that will not pass).
+    pub fn clear_better(&self) {
+        *self.better.lock_recover() = None;
+    }
+
+    /// True for a worker started by an automatic reload ([`crate::supervisor`]).
+    pub fn is_recovery(&self) -> bool {
+        self.recovery
+    }
+
+    /// Record how this worker came about: an automatic reload or not, and the device the model
+    /// ran on before the fault it is reloaded after.
+    pub fn set_history(&mut self, recovery: bool, recovering_from: Option<String>) {
+        self.recovery = recovery;
+        self.recovering_from = recovering_from;
     }
 
     /// True while the model's inference is stuck (the state is `Failed` with
@@ -793,6 +908,7 @@ pub fn spawn_worker_after(
     let after = if cfg.lazy { None } else { after };
     let load_started = Arc::new(AtomicBool::new(false));
     let stuck = Arc::new(AtomicBool::new(false));
+    let better: Arc<Mutex<Option<Better>>> = Arc::default();
 
     let ctx = WorkerCtx {
         runtimes,
@@ -804,6 +920,7 @@ pub fn spawn_worker_after(
         gate: gate.clone(),
         load_started: load_started.clone(),
         stuck: stuck.clone(),
+        better: better.clone(),
         shutdown,
         consecutive_errors: std::cell::Cell::new(0),
         consecutive_degenerate: std::cell::Cell::new(0),
@@ -844,6 +961,9 @@ pub fn spawn_worker_after(
         live: cfg.live.clone(),
         stuck,
         classes: cfg.classes,
+        better,
+        recovery: false,
+        recovering_from: cfg.recovering_from,
     }
 }
 

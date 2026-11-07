@@ -395,6 +395,11 @@ impl ModelMetrics {
         write_string(&self.execution_provider, String::new());
     }
 
+    /// The device asked for, when a replacement takes over: it set the rest as it loaded.
+    pub fn set_requested_device(&self, requested_device: impl Into<String>) {
+        write_string(&self.requested_device, requested_device.into());
+    }
+
     /// Device the model actually runs on (the requested device until it is loaded).
     pub fn device(&self) -> String {
         read_string(&self.device)

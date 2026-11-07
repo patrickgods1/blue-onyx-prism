@@ -15,7 +15,7 @@ use crossbeam_channel::TrySendError;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -27,7 +27,8 @@ use tracing::{debug, info, warn};
 /// so uploads take at most `max_inflight × BODY_LIMIT` (see [`max_inflight`]; e.g. 64 × 32 MiB
 /// = 2 GiB with the default cap, the bound the in-flight cap exists for), plus, per
 /// preprocessing thread, one decoded frame of up to `max_image_pixels × 3` bytes (RGB8) and its
-/// resized input tensor. Requests beyond the cap are answered 503 before their body is read.
+/// resized input tensor. Requests beyond the cap hold no in-flight slot: their 503 waits only for
+/// a bounded discard that buffers nothing ([`OVERLOAD_DRAINS`]).
 pub(crate) const BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 /// Added to the worker's request timeout while a handler waits for its reply, so the worker's
@@ -70,6 +71,19 @@ pub(crate) const DISCARD_LIMIT: usize = BODY_LIMIT;
 /// Longest spent discarding an unwanted body (see [`DISCARD_LIMIT`]); after it the body is left
 /// unread and the connection closes.
 pub(crate) const DISCARD_TIMEOUT: Duration = MULTIPART_READ_TIMEOUT;
+
+/// Overload answers that may be waiting for their upload to be discarded, server-wide. A 503 is
+/// worth an upload's bytes only because of what a closed socket costs (see [`DISCARD_LIMIT`]), so
+/// this is small: a real upload is thrown away in milliseconds, and a burst over the cap still
+/// fits through a few slots. Past it the 503 goes out at once and the connection closes, which is
+/// no worse than without a drain, so a client that stalls in all of them holds at most this many
+/// sockets for [`DISCARD_TIMEOUT`] and takes nothing from anyone else: a drain holds no in-flight
+/// slot and no read slot of a real peer.
+pub(crate) const OVERLOAD_DRAINS: usize = 8;
+
+/// Key of [`OVERLOAD_DRAINS`] in the metrics' count of uploads being read: `::` is no address a
+/// TCP peer can have, so no client shares it.
+const DRAIN_POOL: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 
 /// Response header carrying the id of a detection request: the id the worker puts in its
 /// per-request log line ([`crate::worker::WorkItem::DetectWithId`]) and the handler in its
@@ -127,11 +141,11 @@ impl BodyError {
     }
 }
 
-/// A detection upload: the multipart stream, or (not multipart/form-data) the rejection and the
-/// unread body, kept so it can be discarded before the answer (SV-13: a body left unread makes
-/// hyper close the connection, and a pooling client then fails its next request on it).
+/// A detection upload, not touched yet: the request is kept whole so a body nobody needs can be
+/// discarded byte by byte, whatever it holds (SV-13: a body left unread makes hyper close the
+/// connection, and a pooling client then fails its next request on it).
 pub(super) struct Upload {
-    body: Result<Multipart, NotMultipart>,
+    request: Request,
     /// Who sends it (`serve_on` adds the address to every request).
     peer: Option<IpAddr>,
     /// The peer's read slot ([`admit`]): lives as long as the upload, so it goes back the moment
@@ -139,7 +153,7 @@ pub(super) struct Upload {
     read_slot: Option<BodyReadPermit>,
 }
 
-pub(super) struct NotMultipart {
+struct NotMultipart {
     rejection: MultipartRejection,
     body: Body,
 }
@@ -147,32 +161,38 @@ pub(super) struct NotMultipart {
 impl<S: Send + Sync> FromRequest<S> for Upload {
     type Rejection = Infallible;
 
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (parts, body) = req.into_parts();
-        let peer = parts
-            .extensions
+    async fn from_request(req: Request, _: &S) -> Result<Self, Self::Rejection> {
+        let peer = req
+            .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|c| c.0.ip());
-        let upload = |body| Self {
-            body,
+        Ok(Self {
+            request: req,
             peer,
             read_slot: None,
-        };
-        // `Multipart` rejects only on the content type: probe it on a body-less request so a
-        // rejected body stays here to be drained.
-        let mut probe = Request::new(Body::empty());
-        if let Some(ct) = parts.headers.get(header::CONTENT_TYPE) {
-            probe.headers_mut().insert(header::CONTENT_TYPE, ct.clone());
-        }
-        if let Err(rejection) = Multipart::from_request(probe, state).await {
-            return Ok(upload(Err(NotMultipart { rejection, body })));
-        }
-        let mp = Multipart::from_request(Request::from_parts(parts, body), state).await;
-        Ok(upload(mp.map_err(|rejection| NotMultipart {
+        })
+    }
+}
+
+/// The multipart stream of `req`, or (not multipart/form-data) the rejection and the unread body,
+/// kept so it can be discarded before the answer.
+async fn multipart_stream(req: Request) -> Result<Multipart, NotMultipart> {
+    let (parts, body) = req.into_parts();
+    // `Multipart` rejects only on the content type: probe it on a body-less request so a
+    // rejected body stays here to be drained.
+    let mut probe = Request::new(Body::empty());
+    if let Some(ct) = parts.headers.get(header::CONTENT_TYPE) {
+        probe.headers_mut().insert(header::CONTENT_TYPE, ct.clone());
+    }
+    if let Err(rejection) = Multipart::from_request(probe, &()).await {
+        return Err(NotMultipart { rejection, body });
+    }
+    Multipart::from_request(Request::from_parts(parts, body), &())
+        .await
+        .map_err(|rejection| NotMultipart {
             rejection,
             body: Body::empty(),
-        })))
-    }
+        })
 }
 
 /// The server-wide cap on detection requests in flight: a fixed `Metrics::inflight_limit` when
@@ -206,7 +226,7 @@ fn peer_read_limit(cap: usize) -> usize {
     BODY_READS_PER_PEER.min(cap - cap / 4)
 }
 
-/// The 503 of a detection request refused before its body is read.
+/// The 503 of a detection request refused without using its body.
 fn overloaded(command: &str, text: String) -> Box<Response> {
     let mut r = VisionDetectionResponse::error(text);
     r.command = command.to_string();
@@ -282,30 +302,36 @@ async fn discard_body(upload: Upload) {
 /// [`discard_body`] with an explicit time limit.
 async fn discard_body_within(upload: Upload, limit: Duration) {
     let Upload {
-        body,
+        request,
         read_slot: _read_slot,
         ..
     } = upload;
-    match body {
-        Ok(mut mp) => {
-            let drain = async move {
-                let mut seen = 0usize;
-                while let Ok(Some(mut field)) = mp.next_field().await {
-                    while let Ok(Some(chunk)) = field.chunk().await {
-                        seen = seen.saturating_add(chunk.len());
-                        if seen > DISCARD_LIMIT {
-                            return;
-                        }
-                    }
-                }
-            };
-            let _ = tokio::time::timeout(limit, drain).await;
-        }
-        Err(not) => discard_raw_within(not.body, limit).await,
-    }
+    discard_raw_within(request.into_body(), limit).await;
 }
 
-/// Read and drop a raw (not multipart) body: at most [`DISCARD_LIMIT`] bytes within `limit`.
+/// The answer to a request refused by [`admit`], after its upload was discarded when that is
+/// allowed: not past [`DISCARD_LIMIT`] (a declared length over it can never end within the
+/// limit), and not past [`OVERLOAD_DRAINS`] waiting at once. Otherwise the answer goes out now
+/// and hyper closes the connection. The caller's in-flight permit is long gone: only the drain
+/// slot is held meanwhile.
+async fn after_drain(state: &AppState, upload: Upload, resp: Response, id: &str) -> Response {
+    let declared = upload
+        .request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_none_or(|n| n <= DISCARD_LIMIT as u64)
+        && let Some(_slot) = state
+            .metrics
+            .try_begin_body_read(DRAIN_POOL, OVERLOAD_DRAINS)
+    {
+        discard_body(upload).await;
+    }
+    with_request_id(resp, id)
+}
+
+/// Read and drop a raw body: at most [`DISCARD_LIMIT`] bytes within `limit`.
 async fn discard_raw_within(body: Body, limit: Duration) {
     let drain = async move {
         let mut stream = body.into_data_stream();
@@ -386,11 +412,11 @@ async fn parse_body_within(
     limit: Duration,
 ) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
     let Upload {
-        body,
+        request,
         read_slot: _read_slot,
         ..
     } = upload;
-    match body {
+    match multipart_stream(request).await {
         Ok(mp) => tokio::time::timeout(limit, read_multipart(mp))
             .await
             .unwrap_or_else(|_| {
@@ -433,7 +459,7 @@ pub(super) async fn detection_default(
     // The permit covers the whole request: body read, queue wait and the worker's reply.
     let _permit = match admit(&state, "detect", &mut upload) {
         Ok(p) => p,
-        Err(resp) => return with_request_id(*resp, &id),
+        Err(resp) => return after_drain(&state, upload, *resp, &id).await,
     };
     let Some(handle) = state.registry.default_model() else {
         discard_body(upload).await;
@@ -458,7 +484,7 @@ pub(super) async fn detection_custom(
     let id = new_request_id();
     let _permit = match admit(&state, "custom", &mut upload) {
         Ok(p) => p,
-        Err(resp) => return with_request_id(*resp, &id),
+        Err(resp) => return after_drain(&state, upload, *resp, &id).await,
     };
     let Some(handle) = state.registry.by_name(&model) else {
         discard_body(upload).await;
@@ -751,6 +777,26 @@ mod tests {
             .unwrap()
     }
 
+    /// A whole small multipart upload to `uri`: a rejection of it waits for nothing.
+    fn complete(uri: &str) -> Request {
+        Request::post(uri)
+            .header(header::CONTENT_TYPE, MP)
+            .body(Body::from(image_body(b"jpeg")))
+            .unwrap()
+    }
+
+    /// Every [`OVERLOAD_DRAINS`] slot, held: refusals go out at once, as without a drain.
+    fn all_drains(state: &Arc<AppState>) -> Vec<BodyReadPermit> {
+        (0..OVERLOAD_DRAINS)
+            .map(|_| {
+                state
+                    .metrics
+                    .try_begin_body_read(DRAIN_POOL, OVERLOAD_DRAINS)
+                    .unwrap()
+            })
+            .collect()
+    }
+
     async fn multipart_of(req: Request) -> Upload {
         match Upload::from_request(req, &()).await {
             Ok(u) => u,
@@ -878,10 +924,12 @@ mod tests {
     }
 
     /// SV-04: with the cap at 2 and two requests holding their slots (their uploads stall),
-    /// further detection requests are answered 503 at once and counted.
+    /// further detection requests are answered 503 at once and counted. Every drain slot is
+    /// taken, so these stalled uploads are not waited for.
     #[tokio::test]
     async fn requests_beyond_the_inflight_cap_get_503() {
         let state = test_state();
+        let _drains = all_drains(&state);
         state.metrics.inflight_limit.store(2, Ordering::Relaxed);
         assert_eq!(max_inflight(&state), 2);
         let held: Vec<_> = ["/v1/vision/detection", "/v1/vision/custom/ipcam-general"]
@@ -1029,7 +1077,7 @@ mod tests {
 
         let started = Instant::now();
         let (status, _, body) =
-            call(&state, from_peer(stalled("/v1/vision/detection"), PEER_A)).await;
+            call(&state, from_peer(complete("/v1/vision/detection"), PEER_A)).await;
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "answered at once"
@@ -1048,7 +1096,7 @@ mod tests {
         // The same address through a dual-stack socket is the same client.
         let (status, _, _) = call(
             &state,
-            from_peer(stalled("/v1/vision/detection"), "[::ffff:10.0.0.7]:50000"),
+            from_peer(complete("/v1/vision/detection"), "[::ffff:10.0.0.7]:50000"),
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1153,7 +1201,8 @@ mod tests {
         state.metrics.inflight_limit.store(8, Ordering::Relaxed);
         let held = stalled_from(&state, PEER_A, 6);
         wait_body_reads(&state, 6).await;
-        let (status, _, _) = call(&state, from_peer(stalled("/v1/vision/detection"), PEER_A)).await;
+        let (status, _, _) =
+            call(&state, from_peer(complete("/v1/vision/detection"), PEER_A)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.metrics.rejected(RejectReason::PeerBodyReads), 1);
         let other = stalled_from(&state, PEER_B, 2);
@@ -1188,14 +1237,14 @@ mod tests {
         wait_body_reads(&state, 3).await;
         let peer = call(
             &state,
-            from_peer(stalled("/v1/vision/custom/ipcam-general"), PEER_A),
+            from_peer(complete("/v1/vision/custom/ipcam-general"), PEER_A),
         )
         .await;
         let last = stalled_from(&state, PEER_B, 1);
         wait_inflight(&state, 4).await;
         let cap = call(
             &state,
-            from_peer(stalled("/v1/vision/custom/ipcam-general"), PEER_B),
+            from_peer(complete("/v1/vision/custom/ipcam-general"), PEER_B),
         )
         .await;
         assert_eq!(state.metrics.rejected(RejectReason::PeerBodyReads), 1);
@@ -1554,6 +1603,7 @@ mod tests {
     async fn burst_over_the_inflight_cap_is_rejected_fast() {
         const LIMIT: usize = 2;
         let state = test_state();
+        let _drains = all_drains(&state);
         state.metrics.inflight_limit.store(LIMIT, Ordering::Relaxed);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let tasks: Vec<_> = (0..LIMIT + 8)
@@ -1594,6 +1644,186 @@ mod tests {
             t.abort();
         }
         wait_inflight(&state, 0).await;
+    }
+
+    /// R5's bound: a stalling client fills [`OVERLOAD_DRAINS`] and no more. Past that a refusal
+    /// is answered at once with its body untouched, a drain holds no in-flight slot, and every
+    /// drain ends at the deadline with its slot back.
+    #[tokio::test]
+    async fn stalled_refusals_fill_the_drain_slots_and_no_more() {
+        let state = test_state();
+        state.metrics.inflight_limit.store(1, Ordering::Relaxed);
+        let held = state.metrics.try_begin_detection(1).unwrap();
+        let started = Instant::now();
+        let drains = stalled_from(&state, PEER_A, OVERLOAD_DRAINS);
+        wait_body_reads(&state, OVERLOAD_DRAINS).await;
+        assert_eq!(state.metrics.body_read_peers(), 1, "one pool for everyone");
+        assert_eq!(state.metrics.inflight(), 1, "drains take no in-flight slot");
+
+        let quick = Instant::now();
+        let (status, _, _) = call(&state, from_peer(stalled("/v1/vision/detection"), PEER_B)).await;
+        assert!(quick.elapsed() < Duration::from_secs(5), "not waited for");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        for d in drains {
+            let (status, headers, body) = d.await.unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(headers.contains_key(REQUEST_ID_HEADER));
+            let r: VisionDetectionResponse = serde_json::from_slice(&body).unwrap();
+            assert!(r.error.as_deref().unwrap().contains("overloaded"), "{r:?}");
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited >= DISCARD_TIMEOUT && waited < DISCARD_TIMEOUT + Duration::from_secs(5),
+            "{waited:?}"
+        );
+        assert_eq!(state.metrics.body_reads(), 0);
+        assert_eq!(state.metrics.body_read_peers(), 0);
+        assert_eq!(
+            state.metrics.rejected(RejectReason::Overloaded),
+            OVERLOAD_DRAINS as u64 + 1
+        );
+        drop(held);
+    }
+
+    /// A body that declares more than [`DISCARD_LIMIT`] can never end within it: the refusal is
+    /// answered at once, with no drain slot taken, and hyper closes the connection.
+    #[tokio::test]
+    async fn a_refused_upload_over_the_limit_is_not_read() {
+        let state = test_state();
+        state.metrics.inflight_limit.store(1, Ordering::Relaxed);
+        let held = state.metrics.try_begin_detection(1).unwrap();
+        let mut req = stalled("/v1/vision/detection");
+        req.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from(DISCARD_LIMIT as u64 + 1),
+        );
+        let started = Instant::now();
+        let (status, _, _) = call(&state, req).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "not waited for");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Without a declared length the byte count stops it, the end never reached.
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        let (body, reached_the_end) = tracked_body(vec![chunk; DISCARD_LIMIT / (1024 * 1024) + 2]);
+        let req = Request::post("/v1/vision/detection")
+            .header(header::CONTENT_TYPE, MP)
+            .body(body)
+            .unwrap();
+        let (status, _, _) = call(&state, req).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!reached_the_end.load(Ordering::SeqCst));
+        assert_eq!(state.metrics.body_reads(), 0);
+        drop(held);
+    }
+
+    /// Not even multipart: a refused raw post is discarded the same way, and a discard does not
+    /// stop at a part it cannot parse (the bytes after it would close the connection).
+    #[tokio::test]
+    async fn a_refused_body_is_discarded_whatever_it_holds() {
+        let state = test_state();
+        state.metrics.inflight_limit.store(1, Ordering::Relaxed);
+        let held = state.metrics.try_begin_detection(1).unwrap();
+        for ct in ["image/jpeg", MP] {
+            let garbage = Bytes::from_static(b"--XBOUNDARYX\r\nno header end, then bytes");
+            let (body, consumed) = tracked_body(vec![garbage.clone(), garbage]);
+            let req = Request::post("/v1/vision/custom/ipcam-general")
+                .header(header::CONTENT_TYPE, ct)
+                .body(body)
+                .unwrap();
+            let (status, _, _) = call(&state, req).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{ct}");
+            assert!(consumed.load(Ordering::SeqCst), "{ct}: read to its end");
+        }
+        drop(held);
+    }
+
+    /// A complete HTTP/1.1 answer from `s`: status and body (by `Content-Length`).
+    async fn read_answer(s: &mut tokio::net::TcpStream) -> std::io::Result<(u16, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if got.len() >= end + 4 + len {
+                    return Ok((status, got[end + 4..end + 4 + len].to_vec()));
+                }
+            }
+            match s.read(&mut chunk).await? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                n => got.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// R5, on a real socket: a client that sends its whole upload to an overloaded server reads
+    /// the full 503, and the same keep-alive connection serves its next request. One rejection
+    /// costs one frame, not two.
+    #[tokio::test]
+    async fn an_overload_503_leaves_the_connection_usable() {
+        use tokio::io::AsyncWriteExt;
+        const UPLOADS: usize = 3;
+        let state = test_state();
+        state.metrics.inflight_limit.store(1, Ordering::Relaxed);
+        let held = state.metrics.try_begin_detection(1).unwrap();
+        let listeners = crate::server::bind([127, 0, 0, 1].into(), 0).await.unwrap();
+        let port = listeners.v4.local_addr().unwrap().port();
+        let token = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(crate::server::serve_on(
+            listeners,
+            state.clone().into(),
+            token.clone(),
+        ));
+
+        let body = image_body(&vec![b'x'; 4 * 1024 * 1024]);
+        let head = format!(
+            "POST /v1/vision/detection HTTP/1.1\r\nHost: localhost\r\nContent-Type: {MP}\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        for _ in 0..UPLOADS {
+            s.write_all(head.as_bytes()).await.unwrap();
+            s.write_all(&body).await.expect("the upload is read");
+            let (status, answer) = read_answer(&mut s).await.expect("the answer arrives whole");
+            assert_eq!(status, 503);
+            let r: VisionDetectionResponse = serde_json::from_slice(&answer).unwrap();
+            assert!(r.error.as_deref().unwrap().contains("overloaded"), "{r:?}");
+        }
+        assert_eq!(
+            state.metrics.rejected(RejectReason::Overloaded),
+            UPLOADS as u64
+        );
+
+        // The room is back: the very same connection is served normally.
+        drop(held);
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(&body).await.unwrap();
+        let (status, answer) = read_answer(&mut s)
+            .await
+            .expect("served on the same socket");
+        assert_eq!(status, 200);
+        let r: VisionDetectionResponse = serde_json::from_slice(&answer).unwrap();
+        assert!(
+            !r.success && r.error.is_some(),
+            "the test model failed: {r:?}"
+        );
+        assert_eq!(state.metrics.body_read_peers(), 0);
+
+        token.cancel();
+        drop(s);
+        let _ = tokio::time::timeout(Duration::from_secs(20), server).await;
     }
 
     /// The admission guard itself: with every slot held, each further `admit` answers the
