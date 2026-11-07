@@ -3838,6 +3838,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-T8 | tests | open: the pause test failed once with "no output after resume" and did not recur in 72 runs; a mutant in the shared tree may explain it, not proven. It now prints what it saw |
 | RR-T9 | tests | open: `overlap_live` names a suggestion, not its boxes. Where two boxes share a position and one was relabelled, the page can drop the relabelled box. The fix needs a new field in `server/review.rs` |
 | RR-T10 | tests | open: weak tests `disabled_is_noop`, `service_guard_is_noop`, `quoted_path`, `bench_1080p`, `elapsedMs >= 0`, and `remove_dir_all(..).unwrap()` in test teardown, which antivirus can fail on Windows |
+| RR-T11 | tests | open: on PR #127 the Windows installer job lost its runner during the smoke test ("The hosted runner lost communication with the server", run 42340062106), leaving no log. That is 1 of 39 packaging runs. The step normally takes 45 s. Phase 5's only change on that path is a read-only memory query, and the smoke script ends nothing on purpose, so the cause is unknown. One path was real: `msiexec /qn` with no `/norestart` may restart the machine when a file is in use. 24 MSI logs from 3 earlier runs show no file in use and no 3010, so nothing shows that this happened. Every call now passes `/norestart`, and a 3010 prints the log |
 
 ### Review walk measurements
 

@@ -193,7 +193,7 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule; local subnet
   on Domain and Private networks only, so Blue Iris on another subnet or a PC on a Public network needs
   the manual rule in [packaging/windows/README.md](packaging/windows/README.md)), and a
-  Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn`. Uninstall from
+  Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn /norestart`. Uninstall from
   *Settings > Apps*; it keeps `C:\ProgramData\BlueOnyxPrism` ([what uninstalling keeps](#uninstalling-keeps-your-data)).
   Upgrading to a newer MSI keeps it too. If you installed the service earlier with `scripts\install_service.ps1`,
   run `scripts\uninstall_service.ps1` first; the MSI refuses to install over it. The console

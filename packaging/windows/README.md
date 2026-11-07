@@ -50,7 +50,7 @@ profiles. A Blue Iris on the same subnet, or on the same PC, needs nothing more.
 ## Properties
 
 `PORT` (default 32168): firewall rule port only; also set `port` in the config if you change it. Example:
-`msiexec /i blue-onyx-prism.msi /qn PORT=32169`. The install folder can be changed in the UI or with `INSTALLFOLDER=`.
+`msiexec /i blue-onyx-prism.msi /qn /norestart PORT=32169` (without `/norestart`, a silent install that finds a file in use may restart the machine). The install folder can be changed in the UI or with `INSTALLFOLDER=`.
 
 `REMOVEDATA=1` on uninstall deletes the data folder (below). Only the value `1` does. `KEEPDATA=1` asked for keeping
 that folder before it became the default: it is still accepted, so old scripts work, and wins over `REMOVEDATA=1`.
