@@ -1315,8 +1315,27 @@ mod cases {
         assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
         let index = index_of(&dir).unwrap();
         assert!(index.state.read_recover().foreign);
-        // One day changes, but a line of another day may name a frame of it: all is walked.
-        let frame = readable(&dir, &rels);
+        // One day changes, but a line of another day may name a frame of it: all is walked. The
+        // day changed holds no foreign line itself, so only the index's own mark can say so.
+        let own_lines_only = |day: &Path| {
+            let names: Vec<String> = day
+                .iter()
+                .rev()
+                .skip(1)
+                .take(2)
+                .map(|c| c.to_string_lossy().into_owned())
+                .collect();
+            layout::read_index(&day.join(INDEX_FILE))
+                .iter()
+                .all(|l| names == [l.camera.clone(), l.scene.clone()])
+        };
+        let frame = rels
+            .iter()
+            .filter_map(|r| Frame::resolve(&dir, r))
+            .find(|f| {
+                f.record().is_ok() && f.labels().is_ok() && own_lines_only(f.jpg.parent().unwrap())
+            })
+            .expect("a day with no foreign line");
         change_day(frame.jpg.parent().unwrap());
         let walked = frames_walked(&dir);
         index.pass(Pass::Scan, &|| {});
