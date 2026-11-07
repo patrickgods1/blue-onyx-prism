@@ -45,7 +45,6 @@ use crate::benchmark::images::{self, ImageSet};
 use crate::benchmark::service::default_models;
 use crate::benchmark::{BenchmarkResults, configured_device, results_path};
 use crate::config::Config;
-use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
 use axum::extract::State;
@@ -576,9 +575,11 @@ struct SavedView {
 
 /// The last [`SavedView`] and what it was computed from: the results, stored-predictions and
 /// history files' stamps and the config revision with what it says about each model. Polling
-/// reads none of the files (tens of MB) again until one of them or the config changes.
-type SavedCache = Option<(String, Arc<SavedView>)>;
-static SAVED_CACHE: std::sync::Mutex<SavedCache> = std::sync::Mutex::new(None);
+/// reads none of the files (tens of MB) again until one of them or the config changes. The view
+/// goes after [`crate::benchmark::search::CACHE_IDLE`] with no poll (M10): an idle
+/// service does not keep it.
+static SAVED_CACHE: crate::benchmark::search::IdleCache<String, Arc<SavedView>> =
+    crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE);
 
 /// How many times [`saved_view`] computed (tests: polling does not recompute).
 static SAVED_COMPUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -588,8 +589,8 @@ fn saved_view(
     revision: u64,
     now: &HashMap<String, crate::benchmark::current::ModelNow>,
 ) -> Arc<SavedView> {
-    use crate::benchmark::history::{History, history_path, view};
-    use crate::benchmark::search::{StoredPreds, preds_path};
+    use crate::benchmark::history::history_path;
+    use crate::benchmark::search::preds_path;
     let path = results_path(&state.config_path);
     let preds = preds_path(&state.config_path);
     let hist = history_path(&path);
@@ -602,18 +603,28 @@ fn saved_view(
         file_stamp(&preds),
         file_stamp(&hist)
     );
-    let mut cache = SAVED_CACHE.lock_recover();
-    if let Some((k, v)) = cache.as_ref()
-        && *k == key
-    {
-        return v.clone();
-    }
+    // Computed under the cache's lock: polls arriving together compute once.
+    SAVED_CACHE.get_or_insert_with(key, || {
+        Arc::new(compute_saved_view(state, &path, &preds, &hist, now))
+    })
+}
+
+/// What [`saved_view`] caches.
+fn compute_saved_view(
+    state: &AppState,
+    path: &std::path::Path,
+    preds: &std::path::Path,
+    hist: &std::path::Path,
+    now: &HashMap<String, crate::benchmark::current::ModelNow>,
+) -> SavedView {
+    use crate::benchmark::history::{History, view};
+    use crate::benchmark::search::StoredPreds;
     SAVED_COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let view = match BenchmarkResults::load_or_warn(&path) {
+    match BenchmarkResults::load_or_warn(path) {
         Some(mut r) => {
             let ranking = serde_json::to_value(r.ranking()).unwrap_or_default();
             let points = serde_json::to_value(r.points()).unwrap_or_default();
-            let stored = StoredPreds::load_cached(&preds)
+            let stored = StoredPreds::load_cached(preds)
                 .map_err(|e| warn!("{e:#}"))
                 .ok()
                 .flatten();
@@ -621,7 +632,7 @@ fn saved_view(
             crate::benchmark::trained_on::backfill(&mut r, &state.config_read());
             let facts = profiles::facts(&r);
             // No history file yet: seeded in memory (written by the next run, pin or delete).
-            let history = History::load_or_seed(&hist, Some(&r));
+            let history = History::load_or_seed(hist, Some(&r));
             let lineup = lineup_of(&r, stored.as_deref(), &history, now, &state.config_read());
             let mut results = serde_json::to_value(r.summary()).unwrap_or_default();
             view::annotate(&mut results, &r, &history);
@@ -640,10 +651,7 @@ fn saved_view(
                 .unwrap_or_default(),
             ..SavedView::default()
         },
-    };
-    let view = Arc::new(view);
-    *cache = Some((key, view.clone()));
-    view
+    }
 }
 
 /// The `lineup` of the saved results: the frames each trained model trained on, what can run and

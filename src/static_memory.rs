@@ -28,6 +28,27 @@ pub const MAX_KEYS: usize = 256;
 pub const MAX_TRACKS_PER_KEY: usize = 64;
 /// Most boxes kept per track (also the largest accepted `hits`).
 pub const MAX_BOXES_PER_TRACK: usize = 64;
+/// Longest client-chosen name kept, in bytes: an upload's `image_name` (cut at the request edge)
+/// and a [`camera_key`]. Both land in every dataset sidecar and in memory per camera; 255 bytes is
+/// what most file systems take as one file name.
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// `s` cut to at most [`MAX_NAME_BYTES`] bytes, on a character boundary.
+pub fn cap_name(s: &str) -> &str {
+    cap_bytes(s, MAX_NAME_BYTES)
+}
+
+/// `s` cut to at most `max` bytes, on a character boundary.
+pub fn cap_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.get(..end).unwrap_or_default()
+}
 
 /// `static_suppression` in the config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,8 +119,16 @@ impl StaticSuppression {
 /// `<model>|<w>x<h>`. The camera part is the file name up to its first `.`, without trailing
 /// digits, `_` and `-` (`Driveway.20240101_120000.jpg` and `Driveway_0042.jpg` -> `driveway`),
 /// so per-request file names of one camera share a key. Generic upload names (`image.jpg`,
-/// `blob`, ...) carry no camera and fall back to the model and frame size.
+/// `blob`, ...) carry no camera and fall back to the model and frame size. At most
+/// [`MAX_NAME_BYTES`] bytes.
 pub fn camera_key(model: &str, image_name: &str, w: u32, h: u32) -> String {
+    let mut key = key_of(model, cap_name(image_name), w, h);
+    let keep = cap_name(&key).len();
+    key.truncate(keep);
+    key
+}
+
+fn key_of(model: &str, image_name: &str, w: u32, h: u32) -> String {
     let file = image_name
         .rsplit(['/', '\\'])
         .next()
@@ -487,6 +516,28 @@ mod tests {
         assert_eq!(camera_key("m", "image.jpg", 640, 480), "m|640x480");
         assert_eq!(camera_key("m", "", 1920, 1080), "m|1920x1080");
         assert_eq!(camera_key("m", "12345.jpg", 10, 20), "m|10x20");
+    }
+
+    /// M2: a client-chosen name cannot grow what is kept per camera and written per frame.
+    #[test]
+    fn names_and_keys_are_capped_on_a_char_boundary() {
+        assert_eq!(cap_name("short.jpg"), "short.jpg");
+        let ascii = "a".repeat(1000);
+        assert_eq!(cap_name(&ascii).len(), MAX_NAME_BYTES);
+        // 'é' is two bytes: 255 falls inside the 128th, so the cut is at 254.
+        let wide = "é".repeat(200);
+        let cut = cap_name(&wide);
+        assert_eq!(cut.len(), 254);
+        assert!(cut.chars().all(|c| c == 'é'));
+        assert_eq!(cap_bytes("日本", 4), "日");
+        assert_eq!(cap_bytes("日本", 2), "");
+        let key = camera_key("model", &format!("{}.jpg", "x".repeat(10_000)), 1, 1);
+        assert_eq!(key.len(), MAX_NAME_BYTES);
+        assert!(key.starts_with("model|cam:xxx"));
+        let key = camera_key(&"m".repeat(300), "Driveway.jpg", 1, 1);
+        assert_eq!(key.len(), MAX_NAME_BYTES);
+        let key = camera_key("m", &"ü".repeat(400), 1, 1);
+        assert!(key.len() <= MAX_NAME_BYTES && key.is_char_boundary(key.len()));
     }
 
     #[test]

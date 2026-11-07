@@ -38,6 +38,7 @@ use super::device::{
 };
 use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, cuda_ordinals, onnx_path_for};
 use super::spec::{Runtime, Target};
+use super::vram;
 use super::{
     Candidate, Completion, DeviceInfo, LoadRequest, ModelInfo, SessionDead, libs, onnx_rewrite,
 };
@@ -434,6 +435,8 @@ impl OrtRuntime {
         })?;
         let t0 = Instant::now();
         let index = cand.device.index.unwrap_or(0);
+        // The card's free memory before the sessions exist, for the load line.
+        let probe = vram::LoadProbe::start(&path, &cand.device);
         // Ports first. On the CPU the real session doubles as the metadata source (rebuilt only
         // when dynamic dims need pinning); for accelerators an unoptimized CPU session reads
         // them, so the EP compiles once, already with the pinned shapes.
@@ -567,8 +570,10 @@ impl OrtRuntime {
                 .map(|p| (&p.name, &p.shape))
                 .collect::<Vec<_>>()
         );
+        let vram_hold = probe.finish();
         Ok(OrtCompiled {
             sessions: all,
+            vram_hold,
             info: ModelInfo {
                 path,
                 inputs,
@@ -667,6 +672,8 @@ impl OrtRuntime {
             tracing::warn!("could not create cache dir {}: {e}", dir.display());
             return None;
         }
+        // The storage sweep removes cache folders unused for 60 days.
+        crate::storage::touch(&dir);
         dir.to_str().map(str::to_string)
     }
 
@@ -725,8 +732,7 @@ impl OrtRuntime {
         let eps = match target {
             Target::Cpu => Vec::new(),
             Target::Cuda => vec![
-                ep::CUDA::default()
-                    .with_device_id(device_id)
+                cuda_provider(device_id, vram::ort_session_limit_mb())
                     .build()
                     .error_on_failure(),
             ],
@@ -744,8 +750,7 @@ impl OrtRuntime {
                 vec![
                     trt.build().error_on_failure(),
                     // Nodes TensorRT does not take run on CUDA rather than the CPU.
-                    ep::CUDA::default()
-                        .with_device_id(device_id)
+                    cuda_provider(device_id, vram::ort_session_limit_mb())
                         .build()
                         .fail_silently(),
                 ]
@@ -793,6 +798,27 @@ impl OrtRuntime {
             )
         })
     }
+}
+
+/// The CUDA execution provider of a CUDA session, and the one behind TensorRT:
+/// - `arena_extend_strategy` `kSameAsRequested`: the arena grows by what a run asks for; ONNX
+///   Runtime's default (`kNextPowerOfTwo`) rounds every extension up, so a model can hold up to
+///   about twice what it uses, on a card a training or auto-label job may share;
+/// - `cudnn_conv_algo_search` `HEURISTIC`: the default exhaustive search benchmarks every
+///   convolution algorithm at the first run, each with its own workspace: a memory peak at load
+///   that can fail on a nearly full card. The speed difference was not measured here (no NVIDIA
+///   GPU on the development machine);
+/// - `gpu_mem_limit` = `limit_mb` (config `ort_gpu_mem_limit_mb`, per session) when set.
+pub(crate) fn cuda_provider(device_id: i32, limit_mb: Option<u64>) -> ep::CUDA {
+    let mut cuda = ep::CUDA::default()
+        .with_device_id(device_id)
+        .with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
+        .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic);
+    if let Some(mb) = limit_mb {
+        let bytes = usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
+        cuda = cuda.with_memory_limit(bytes);
+    }
+    cuda
 }
 
 /// Environment variable that lets ONNX Runtime's thread pools spin-wait (`1`, `true`, `on`,
@@ -1047,6 +1073,8 @@ pub(crate) fn dimension_overrides(
 /// into the worker.
 pub struct OrtCompiled {
     sessions: Vec<Session>,
+    /// This model as a holder of its GPU's memory ([`vram::hold`]) while its sessions live.
+    vram_hold: Option<vram::Hold>,
     pub info: ModelInfo,
 }
 
@@ -1115,6 +1143,7 @@ impl OrtCompiled {
         Ok(OrtBackend {
             info: self.info,
             slots,
+            _vram_hold: self.vram_hold,
             done_rx,
             abort_timeout: ABORT_TIMEOUT,
         })
@@ -1177,6 +1206,9 @@ pub(crate) const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 pub struct OrtBackend {
     info: ModelInfo,
     slots: Vec<OrtSlot>,
+    /// [`OrtCompiled`]'s registration; dropped with the backend, after the sessions' threads
+    /// were told to stop.
+    _vram_hold: Option<vram::Hold>,
     done_rx: crossbeam_channel::Receiver<Completion>,
     /// [`ABORT_TIMEOUT`]; shorter in tests.
     abort_timeout: std::time::Duration,
@@ -1769,6 +1801,24 @@ mod tests {
     }
 
     #[test]
+    fn cuda_sessions_grow_their_arena_by_the_request_and_search_heuristically() {
+        let plain = format!("{:?}", cuda_provider(1, None));
+        for want in [
+            "\"device_id\": \"1\"",
+            "\"arena_extend_strategy\": \"kSameAsRequested\"",
+            "\"cudnn_conv_algo_search\": \"HEURISTIC\"",
+        ] {
+            assert!(plain.contains(want), "{want} in {plain}");
+        }
+        assert!(!plain.contains("gpu_mem_limit"), "{plain}");
+        let capped = format!("{:?}", cuda_provider(0, Some(1536)));
+        assert!(
+            capped.contains("\"gpu_mem_limit\": \"1610612736\""),
+            "{capped}"
+        );
+    }
+
+    #[test]
     fn ort_spinning_switch() {
         for on in [Some("1"), Some("true"), Some(" ON "), Some("yes")] {
             assert!(ort_spinning_enabled(on), "{on:?}");
@@ -2015,6 +2065,7 @@ mod tests {
                 compile_ms: 0,
             },
             slots,
+            _vram_hold: None,
             done_rx,
             abort_timeout: std::time::Duration::from_millis(100),
         }

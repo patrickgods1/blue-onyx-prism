@@ -26,6 +26,7 @@
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
 //! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
+//! - [`storage`]   disk use and the cleanup of rebuildable files (caches, staging, crashed job folders)
 //! - [`parallel`]  work-stealing maps on scoped threads (import analysis, dataset walks)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
@@ -89,6 +90,7 @@ pub mod setup_onnxruntime;
 pub mod setup_openvino;
 pub mod startup;
 pub mod static_memory;
+pub mod storage;
 pub mod supervisor;
 pub mod sync;
 pub mod system_info;

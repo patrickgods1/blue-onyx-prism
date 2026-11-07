@@ -689,7 +689,7 @@ pub fn service_config_path_from_args() -> Result<PathBuf> {
     )
 }
 
-/// Load `blue_onyx_prism_config_service.json`, creating a default one (log level debug, file
+/// Load `blue_onyx_prism_config_service.json`, creating a default one (log level info, file
 /// log in `logs/` next to the exe: a service's stdout is discarded, and the event log only gets
 /// INFO and above) when missing. A config without models gets the default catalog model
 /// ([`seed_default_model`], CO-05): the service then binds its port and serves the web UI on
@@ -717,14 +717,15 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Default service config for a file created in `config_dir`: log level debug and a file log
-/// (a service's stdout is discarded). In `exe_dir` everything stays relative to the exe dir
+/// Default service config for a file created in `config_dir`: log level info (debug writes a line
+/// per request, which a busy Blue Iris turns into hundreds of MB a day) and a file log (a service's
+/// stdout is discarded). In `exe_dir` everything stays relative to the exe dir
 /// (`logs/`, `cache/`, downloads next to the exe). Elsewhere the data lives next to the config:
 /// absolute `download_dir = <config_dir>`, `cache_dir = <config_dir>/cache`,
 /// `log_path = <config_dir>/logs` (the install folder may be read-only, e.g. Program Files).
 pub fn service_default_config(config_dir: &Path, exe_dir: &Path) -> Config {
     let mut config = Config {
-        log_level: LogLevel::Debug,
+        log_level: LogLevel::Info,
         log_path: Some(PathBuf::from(SERVICE_LOG_DIR)),
         ..Default::default()
     };
@@ -889,9 +890,15 @@ pub type ExtraLogLayer = Box<dyn Layer<LogBase> + Send + Sync>;
 
 /// Daily log files kept under `log_path` (two weeks).
 pub const MAX_LOG_FILES: usize = 14;
+/// All log files under `log_path` together: past it the oldest go (never today's).
+pub const MAX_LOG_TOTAL_BYTES: u64 = 500 * 1000 * 1000;
+/// Most bytes written to one day's file. Past it the rest of the day's lines are dropped, after one
+/// line saying so: today's log is never deleted, so this is what bounds it.
+pub const MAX_LOG_FILE_BYTES: u64 = 200 * 1000 * 1000;
 
-/// Initialize global tracing. Logs to stdout, or to a daily rolling file in `log_path`
-/// when given (the newest [`MAX_LOG_FILES`] are kept).
+/// Initialize global tracing. Logs to stdout, or to a daily file in `log_path` when given (see
+/// [`log_files`]: [`MAX_LOG_FILES`] days, [`MAX_LOG_TOTAL_BYTES`] in all, [`MAX_LOG_FILE_BYTES`]
+/// a day).
 pub fn init_logging(level: LogLevel, log_path: Option<&Path>) -> Result<LogReloadHandle> {
     init_logging_with(level, log_path, None)
 }
@@ -905,18 +912,232 @@ pub fn init_logging_with(
     init_logging_opts(level, log_path, LogFormat::Text, LogTimezone::Utc, extra)
 }
 
-/// The daily rolling appender under `dir` (created when missing).
-fn file_appender(dir: &Path) -> Result<tracing_appender::rolling::RollingFileAppender> {
+/// The daily log files under `dir` (created when missing), lines in `format`.
+fn file_appender(dir: &Path, format: LogFormat) -> Result<log_files::LogFiles> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("could not create the log directory {}", dir.display()))?;
-    // `blue_onyx_prism.log.<date>`, one per day; the oldest beyond MAX_LOG_FILES are
-    // deleted, so a long-running service cannot fill the disk with logs.
-    tracing_appender::rolling::Builder::new()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("blue_onyx_prism.log")
-        .max_log_files(MAX_LOG_FILES)
-        .build(dir)
-        .with_context(|| format!("could not open a log file in {}", dir.display()))
+    log_files::LogFiles::open(
+        dir,
+        log_files::Limits::default(),
+        format == LogFormat::Json,
+        Box::new(std::time::SystemTime::now),
+    )
+    .with_context(|| format!("could not open a log file in {}", dir.display()))
+}
+
+/// The file log: `blue_onyx_prism.log.<UTC date>`, one file a day (the names
+/// `tracing_appender`'s daily rotation used, so older files are counted and pruned too). Bounded
+/// three ways, so a long-running service cannot fill the disk with logs: the newest
+/// [`MAX_LOG_FILES`] days are kept, the oldest go first while all of them hold more than
+/// [`MAX_LOG_TOTAL_BYTES`], and one day's file stops at [`MAX_LOG_FILE_BYTES`] with a line saying
+/// so. Today's file is never deleted. Runs on the `non_blocking` writer's thread, so it cannot log
+/// its own failures; a file it cannot write is skipped, like a full disk.
+pub(crate) mod log_files {
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    /// File names start with this, then `.` and the date.
+    pub(crate) const PREFIX: &str = "blue_onyx_prism.log";
+    /// Bytes written between two checks of the folder's total.
+    const CHECK_EVERY: u64 = 16 * 1000 * 1000;
+
+    /// The bounds (tests shrink them).
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Limits {
+        pub files: usize,
+        pub total: u64,
+        pub per_file: u64,
+    }
+
+    impl Default for Limits {
+        fn default() -> Self {
+            Self {
+                files: super::MAX_LOG_FILES,
+                total: super::MAX_LOG_TOTAL_BYTES,
+                per_file: super::MAX_LOG_FILE_BYTES,
+            }
+        }
+    }
+
+    /// The clock (tests pass their own).
+    pub(crate) type Clock = Box<dyn Fn() -> SystemTime + Send>;
+
+    pub(crate) struct LogFiles {
+        dir: PathBuf,
+        limits: Limits,
+        json: bool,
+        clock: Clock,
+        /// Days since 1970 of the open file.
+        day: i64,
+        file: Option<File>,
+        /// Bytes in the open file.
+        size: u64,
+        /// Today's file reached its cap: lines are dropped until tomorrow.
+        capped: bool,
+        since_check: u64,
+    }
+
+    /// Days since 1970-01-01 (UTC) of `t`.
+    fn day_of(t: SystemTime) -> i64 {
+        let secs = match t.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+        };
+        secs.div_euclid(86_400)
+    }
+
+    /// `YYYY-MM-DD` of a day number.
+    fn date_of(day: i64) -> String {
+        chrono::DateTime::from_timestamp(day.saturating_mul(86_400), 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown-date".into())
+    }
+
+    /// The file of `day` under `dir`.
+    pub(crate) fn path_of(dir: &Path, day: i64) -> PathBuf {
+        dir.join(format!("{PREFIX}.{}", date_of(day)))
+    }
+
+    impl LogFiles {
+        /// Open (append) today's file under `dir` and prune the folder.
+        pub(crate) fn open(
+            dir: &Path,
+            limits: Limits,
+            json: bool,
+            clock: Clock,
+        ) -> std::io::Result<Self> {
+            let day = day_of(clock());
+            let mut me = Self {
+                dir: dir.to_path_buf(),
+                limits,
+                json,
+                clock,
+                day,
+                file: None,
+                size: 0,
+                capped: false,
+                since_check: 0,
+            };
+            me.open_day(day)?;
+            Ok(me)
+        }
+
+        fn open_day(&mut self, day: i64) -> std::io::Result<()> {
+            self.day = day;
+            self.file = None;
+            self.since_check = 0;
+            let path = path_of(&self.dir, day);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?;
+            self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            // A restart on a day whose file is already full keeps it full.
+            self.capped = self.size >= self.limits.per_file;
+            self.file = Some(file);
+            self.prune();
+            Ok(())
+        }
+
+        /// The line written once when today's file reaches its cap.
+        fn cap_line(&self) -> String {
+            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            let text = format!(
+                "this log file reached {} MB, so the rest of today's lines are dropped; logging \
+                 goes on in tomorrow's file. Something logs far more than usual: look at the lines \
+                 above, or lower log_level",
+                self.limits.per_file / 1_000_000
+            );
+            if self.json {
+                serde_json::json!({
+                    "timestamp": at,
+                    "level": "WARN",
+                    "fields": { "message": text },
+                    "target": "blue_onyx_prism::cli::log_files",
+                })
+                .to_string()
+                    + "\n"
+            } else {
+                format!("{at}  WARN blue_onyx_prism::cli::log_files: {text}\n")
+            }
+        }
+
+        /// Delete the oldest log files while there are more than `limits.files` or they hold more
+        /// than `limits.total` bytes, never the open (today's) file. Files of another name are left
+        /// alone.
+        pub(crate) fn prune(&mut self) {
+            let today = path_of(&self.dir, self.day);
+            let Ok(entries) = std::fs::read_dir(&self.dir) else {
+                return;
+            };
+            let mut files: Vec<(String, PathBuf, u64)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_string();
+                    let rest = name.strip_prefix(PREFIX)?.strip_prefix('.')?;
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    let meta = e.metadata().ok()?;
+                    meta.is_file().then(|| (name, e.path(), meta.len()))
+                })
+                .collect();
+            // Newest first: the dates sort as text.
+            files.sort_by(|a, b| b.0.cmp(&a.0));
+            let today_bytes = files.iter().find(|f| f.1 == today).map_or(0, |f| f.2);
+            let mut kept = 1usize;
+            let mut total = today_bytes;
+            for (_, path, len) in files.into_iter().filter(|f| f.1 != today) {
+                if kept < self.limits.files && total.saturating_add(len) <= self.limits.total {
+                    kept += 1;
+                    total = total.saturating_add(len);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    impl Write for LogFiles {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let day = day_of((self.clock)());
+            if day != self.day || self.file.is_none() {
+                // A file that cannot be opened drops the line; the next one tries again.
+                if self.open_day(day).is_err() {
+                    return Ok(buf.len());
+                }
+            }
+            if self.capped {
+                return Ok(buf.len());
+            }
+            let len = buf.len() as u64;
+            let Some(file) = self.file.as_mut() else {
+                return Ok(buf.len());
+            };
+            if self.size.saturating_add(len) > self.limits.per_file {
+                self.capped = true;
+                let line = self.cap_line();
+                if let Some(file) = self.file.as_mut() {
+                    let _ = file.write_all(line.as_bytes());
+                }
+                return Ok(buf.len());
+            }
+            file.write_all(buf)?;
+            self.size = self.size.saturating_add(len);
+            self.since_check = self.since_check.saturating_add(len);
+            if self.since_check >= CHECK_EVERY.min(self.limits.total / 4).max(1) {
+                self.since_check = 0;
+                self.prune();
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.as_mut().map_or(Ok(()), File::flush)
+        }
+    }
 }
 
 /// Install the global subscriber: the reloadable level filter (which also governs `extra` and
@@ -946,7 +1167,7 @@ pub fn init_logging_opts(
         .with(filter)
         .with(extra)
         .with(buffer.clone());
-    let appender = match log_path.map(|dir| (dir, file_appender(dir))) {
+    let appender = match log_path.map(|dir| (dir, file_appender(dir, format))) {
         Some((_, Ok(a))) => Some(a),
         Some((dir, Err(e))) => {
             crate::logbuf::early(
@@ -1610,7 +1831,7 @@ mod tests {
         let path = temp_cfg();
         let exe_dir = path.parent().unwrap().to_path_buf();
         let c = for_service_at_in(&path, &exe_dir).unwrap();
-        assert_eq!(c.log_level, LogLevel::Debug);
+        assert_eq!(c.log_level, LogLevel::Info);
         assert_eq!(c.log_path.as_deref(), Some(Path::new(SERVICE_LOG_DIR)));
         assert_eq!(c.models.len(), 1);
         assert!(crate::config::validate_config(&c).is_ok());
@@ -1656,7 +1877,7 @@ mod tests {
         let path = data.join("cfg.json");
         let c = for_service_at_in(&path, &exe_dir).unwrap();
         assert!(path.is_file());
-        assert_eq!(c.log_level, LogLevel::Debug);
+        assert_eq!(c.log_level, LogLevel::Info);
         assert_eq!(c.download_dir.as_deref(), Some(data.as_path()));
         assert_eq!(c.log_path, Some(data.join(SERVICE_LOG_DIR)));
         assert_eq!(PathBuf::from(&c.cache_dir), data.join("cache"));
@@ -1700,7 +1921,7 @@ mod tests {
         let c = service_default_config(&other, exe);
         assert_eq!(c.download_dir.as_deref(), Some(other.as_path()));
         assert_eq!(c.log_path, Some(other.join("logs")));
-        assert_eq!(c.log_level, LogLevel::Debug);
+        assert_eq!(c.log_level, LogLevel::Info);
     }
 
     #[test]
@@ -1821,10 +2042,179 @@ mod tests {
     fn unusable_log_dir_is_reported_not_panicking() {
         let dir = temp_cfg().with_file_name("a-file");
         std::fs::write(&dir, "x").unwrap();
-        let err = format!("{:#}", file_appender(&dir.join("logs")).unwrap_err());
+        let err = format!(
+            "{:#}",
+            file_appender(&dir.join("logs"), LogFormat::Text)
+                .err()
+                .unwrap()
+        );
         assert!(err.contains("could not create the log directory"), "{err}");
         let ok = temp_cfg().with_file_name("logs");
-        assert!(file_appender(&ok).is_ok());
+        assert!(file_appender(&ok, LogFormat::Text).is_ok());
         assert!(ok.is_dir());
+        let _ = std::fs::remove_dir_all(ok.parent().unwrap());
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    mod log_file_bounds {
+        use super::super::log_files::{LogFiles, PREFIX, path_of};
+        use super::super::*;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, SystemTime};
+
+        /// A log folder, removed when dropped.
+        struct Dir(PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn dir() -> Dir {
+            let d = std::env::temp_dir().join(format!("bop-logs-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+
+        const DAY: u64 = 86_400;
+        /// Day number of the tests' "today" (2026-11-07).
+        const TODAY: i64 = 20_764;
+
+        /// A clock at `TODAY` + the seconds in the returned cell.
+        fn clock() -> (log_files::Clock, Arc<AtomicU64>) {
+            let offset = Arc::new(AtomicU64::new(3600));
+            let o = offset.clone();
+            let clock: log_files::Clock = Box::new(move || {
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(TODAY as u64 * DAY + o.load(Ordering::Relaxed))
+            });
+            (clock, offset)
+        }
+
+        fn limits(files: usize, total: u64, per_file: u64) -> log_files::Limits {
+            log_files::Limits {
+                files,
+                total,
+                per_file,
+            }
+        }
+
+        fn names(d: &Path) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        }
+
+        #[test]
+        fn todays_file_has_the_dated_name() {
+            assert_eq!(
+                path_of(Path::new("x"), TODAY),
+                Path::new("x").join("blue_onyx_prism.log.2026-11-07")
+            );
+            assert_eq!(PREFIX, "blue_onyx_prism.log");
+        }
+
+        /// M8: old days go past the count and past the total, today's file never; other files in
+        /// the folder are left alone.
+        #[test]
+        fn the_oldest_files_go_past_the_count_and_the_total() {
+            let d = dir();
+            for back in 1..=20 {
+                std::fs::write(path_of(&d.0, TODAY - back), [b'x'; 10]).unwrap();
+            }
+            std::fs::write(d.0.join("stdout.log"), "keep").unwrap();
+            std::fs::write(d.0.join(PREFIX), "keep").unwrap();
+            let (c, _) = clock();
+            let _f = LogFiles::open(&d.0, limits(5, 1_000_000, 1000), false, c).unwrap();
+            let want: Vec<String> = [
+                PREFIX.to_string(),
+                format!("{PREFIX}.2026-11-03"),
+                format!("{PREFIX}.2026-11-04"),
+                format!("{PREFIX}.2026-11-05"),
+                format!("{PREFIX}.2026-11-06"),
+                format!("{PREFIX}.2026-11-07"),
+                "stdout.log".to_string(),
+            ]
+            .into();
+            assert_eq!(names(&d.0), want);
+
+            // By size: today (10 bytes) + two days of 10 fit in 35, a third does not.
+            std::fs::write(path_of(&d.0, TODAY), [b'x'; 10]).unwrap();
+            let (c, _) = clock();
+            let _f = LogFiles::open(&d.0, limits(14, 35, 1000), false, c).unwrap();
+            assert_eq!(names(&d.0).len(), 3 + 2, "{:?}", names(&d.0));
+            assert!(path_of(&d.0, TODAY - 2).exists() && !path_of(&d.0, TODAY - 3).exists());
+
+            // Today alone over the total: kept, everything older goes.
+            std::fs::write(path_of(&d.0, TODAY), [b'x'; 100]).unwrap();
+            let (c, _) = clock();
+            let _f = LogFiles::open(&d.0, limits(14, 35, 1000), false, c).unwrap();
+            assert!(path_of(&d.0, TODAY).exists());
+            assert!(!path_of(&d.0, TODAY - 1).exists());
+        }
+
+        /// M8: one day's file stops at its cap with one line saying so, also across a restart,
+        /// and the next day starts a new file.
+        #[test]
+        fn a_day_file_stops_at_its_cap_and_the_next_day_starts_fresh() {
+            let d = dir();
+            let (c, offset) = clock();
+            let mut f = LogFiles::open(&d.0, limits(14, 1_000_000, 100), false, c).unwrap();
+            let line = [b'a'; 29].iter().chain(b"\n").copied().collect::<Vec<u8>>();
+            for _ in 0..5 {
+                assert_eq!(
+                    f.write(&line).unwrap(),
+                    30,
+                    "a dropped line still counts as written"
+                );
+            }
+            f.flush().unwrap();
+            let today = std::fs::read_to_string(path_of(&d.0, TODAY)).unwrap();
+            let lines: Vec<&str> = today.lines().collect();
+            assert_eq!(lines.len(), 4, "{today}");
+            assert!(
+                lines[3].contains("WARN") && lines[3].contains("reached 0 MB"),
+                "{today}"
+            );
+            let size = today.len();
+
+            // A restart the same day: still full.
+            let (c, _) = clock();
+            let mut again = LogFiles::open(&d.0, limits(14, 1_000_000, 100), false, c).unwrap();
+            again.write_all(&line).unwrap();
+            assert_eq!(std::fs::read(path_of(&d.0, TODAY)).unwrap().len(), size);
+
+            // Tomorrow: a new file, yesterday's untouched.
+            offset.store(DAY + 60, Ordering::Relaxed);
+            f.write_all(&line).unwrap();
+            f.flush().unwrap();
+            assert_eq!(std::fs::read(path_of(&d.0, TODAY + 1)).unwrap(), line);
+            assert_eq!(std::fs::read(path_of(&d.0, TODAY)).unwrap().len(), size);
+        }
+
+        #[test]
+        fn the_cap_line_of_a_json_log_is_json() {
+            let d = dir();
+            let (c, _) = clock();
+            let mut f = LogFiles::open(&d.0, limits(14, 1_000_000, 10), true, c).unwrap();
+            f.write_all(&[b'{'; 20]).unwrap();
+            let text = std::fs::read_to_string(path_of(&d.0, TODAY)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(v["level"], "WARN");
+            assert!(v["fields"]["message"].as_str().unwrap().contains("dropped"));
+        }
+
+        /// The defaults the service runs with.
+        #[test]
+        fn default_bounds() {
+            let l = log_files::Limits::default();
+            assert_eq!(l.files, MAX_LOG_FILES);
+            assert_eq!(l.total, 500 * 1000 * 1000);
+            assert!(l.per_file < l.total);
+        }
     }
 }

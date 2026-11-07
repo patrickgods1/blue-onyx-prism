@@ -254,6 +254,47 @@
     form.querySelectorAll('input[name="mode"]').forEach(function (r) { r.addEventListener("change", update); });
     update();
   })();
+  // Auto-label: Qwen3-VL sizes the labelers' GPU cannot hold are disabled with the reason. Each
+  // option carries what it needs (data-need-mb, the server's rule in training/autolabel/memory.rs,
+  // which refuses such a request); the GPU's memory comes from the capability of /v1/training.
+  (function () {
+    var form = document.getElementById("autolabel-form");
+    var note = document.getElementById("al-fit");
+    if (!form || !note || !form.elements.vlm) return;
+    var vlm = form.elements.vlm, gpu = form.elements.gpu, cap = null;
+    var chosen = function () {
+      if (!cap) return null;
+      var a = cap.accelerator, want = gpu ? gpu.value : "";
+      if (want) (cap.cuda_options || []).forEach(function (o) { if ("cuda:" + o.ordinal === want) a = o; });
+      return a;
+    };
+    var gb = function (mb) { return (mb / 1024).toFixed(1) + " GB"; };
+    var update = function () {
+      var a = chosen(), mem = a ? (a.vram_mb || a.memory_mb || 0) : 0, big = [];
+      Array.prototype.forEach.call(vlm.options, function (o) {
+        var need = parseInt(o.getAttribute("data-need-mb") || "0", 10);
+        if (o.dataset.label === undefined) o.dataset.label = o.textContent;
+        var over = mem > 0 && need > mem;
+        o.disabled = over;
+        o.textContent = over ? o.dataset.label + " \u2013 needs " + gb(need) : o.dataset.label;
+        if (over) big.push(o.dataset.label.replace(/ \(.*$/, ""));
+      });
+      if (vlm.selectedOptions.length && vlm.selectedOptions[0].disabled) {
+        var fit = Array.prototype.filter.call(vlm.options, function (o) { return !o.disabled; });
+        vlm.value = fit.length ? fit[0].value : "off";
+        vlm.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      note.hidden = !big.length;
+      note.textContent = big.length
+        ? big.join(" and ") + " need more GPU memory than " + a.name + " has (" + gb(mem) + ")."
+        : "";
+    };
+    if (gpu) gpu.addEventListener("change", update);
+    fetch("/v1/training", { headers: { Accept: "application/json" } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) { cap = j && j.capability; update(); })
+      .catch(function () {});
+  })();
   // Auto-label: the SAM 3 threshold only while SAM 3 is the chosen labeler. Hidden, it is disabled:
   // not posted, not validated, not copied into an import's `al.*` fields. Like the block above this
   // runs after the mode toggle, which re-enables every field of the shown mode.

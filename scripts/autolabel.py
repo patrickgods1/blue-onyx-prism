@@ -387,6 +387,25 @@ def chunks(items: list, n: int) -> list:
     return [items[i:i + n] for i in range(0, len(items), n)]
 
 
+# Most animal classes for which SigLIP 2 ranks on the CPU beside models on the GPU. It ranks only
+# boxes of an animal class, one crop each: measured on an M1, 74 ms per crop on the CPU against
+# 51 ms on MPS, beside about 1 s per box for the VLM check, and its vision tower (354 MB in f32)
+# stays off the card the labelers share. A class list with more animal classes than this is a
+# wildlife set, many crops per frame: the GPU then.
+SIGLIP_CPU_MAX_ANIMALS = 12
+
+
+def siglip_device(device: str, gpu_models: int, animals: int):
+    """Where SigLIP 2 runs: None when it has nothing to rank (fewer than two animal classes, so
+    it is not loaded at all), the CPU when other models use the GPU and the animal classes are
+    few (SIGLIP_CPU_MAX_ANIMALS), else the run's device."""
+    if animals < 2:
+        return None
+    if device.startswith(("cuda", "mps")) and gpu_models > 0 and animals <= SIGLIP_CPU_MAX_ANIMALS:
+        return "cpu"
+    return device
+
+
 def self_test(parity: Path = None) -> int:
     n = 0
 
@@ -396,6 +415,12 @@ def self_test(parity: Path = None) -> int:
             raise SystemExit(f"[autolabel] self-test failed: {what}")
         n += 1
 
+    check(siglip_device("cuda:0", 3, 9) == "cpu", "siglip beside the labelers: cpu")
+    check(siglip_device("mps", 1, 2) == "cpu", "siglip beside one labeler on mps: cpu")
+    check(siglip_device("cuda:1", 3, 13) == "cuda:1", "siglip with many animal classes: the gpu")
+    check(siglip_device("cuda:0", 0, 9) == "cuda:0", "siglip alone: the gpu")
+    check(siglip_device("cpu", 3, 9) == "cpu", "siglip on a cpu run")
+    check(siglip_device("cuda:0", 3, 1) is None and siglip_device("cuda:0", 3, 0) is None, "nothing to rank")
     check({"person", "traffic light", "potted plant", "teddy bear", "dog", "hair drier"} <= COCO_NAMES, "coco names")
     check(len(COCO_NAMES) == 80, f"80 coco names, got {len(COCO_NAMES)}")
     check(coco_class("motorbike") == "motorcycle" and coco_class("raccoon") is None, "coco_class")
@@ -1185,9 +1210,10 @@ class Siglip:
         self.cache = {}
 
     def prepare(self, classes: tuple, synonyms: dict) -> None:
-        """Encode the day and night prompts, then move the text tower (~1.1 GB of the 1.4 GB in f32)
-        to the CPU: `rank` only needs the cached features. On an 8 GB card the tower pushed the run
-        into shared system memory, which slowed every model."""
+        """Encode the day and night prompts, then move the text tower (1077 MB of the 1431 MB in
+        f32) to the CPU: `rank` only needs the cached features. On an 8 GB card the tower pushed the
+        run into shared system memory, which slowed every model. Beside other models on the GPU the
+        whole model runs on the CPU (`siglip_device`)."""
         for night in (False, True):
             self.text_features(classes, night, synonyms)
         if self.device.startswith(("cuda", "mps")):
@@ -1360,14 +1386,16 @@ def main() -> int:
         t = time.time()
         vlm = Vlm(a.vlm, device, a.vlm_name)
         event("model", name="vlm", seconds=round(time.time() - t, 1))
-    if a.siglip:
-        t = time.time()
-        siglip = Siglip(a.siglip, device)
-        event("model", name="siglip", seconds=round(time.time() - t, 1))
     participants = participants_of(labelers, classes)
     animals = tuple(c for c in classes if category(c) == "animal")
-    if siglip is not None and len(animals) > 1:
+    siglip_on = siglip_device(device, len(labelers) + (vlm is not None), len(animals)) if a.siglip else None
+    if siglip_on is not None:
+        t = time.time()
+        siglip = Siglip(a.siglip, siglip_on)
         siglip.prepare(animals, synonyms)
+        event("model", name="siglip", seconds=round(time.time() - t, 1), device=siglip_on)
+    elif a.siglip:
+        log(f"SigLIP 2: not loaded, {len(animals)} animal class(es) to rank")
     weights = {m: 1.0 for m in labelers}
     a.out.parent.mkdir(parents=True, exist_ok=True)
     totals = {"boxes": 0, "agreed": 0, "vlm": 0}
@@ -1414,7 +1442,7 @@ def main() -> int:
                     ms["vlm"] = round((time.time() - t) * 1000)
                     totals["vlm"] += len(ask)
             for b in fused:
-                if siglip is not None and b["label"] in animals and len(animals) > 1:
+                if siglip is not None and b["label"] in animals:
                     t = time.time()
                     crop = image.crop(crop_box(b["bbox"], w, h, 0.1))
                     b["species_scores"] = siglip.rank(crop, animals, night, synonyms)

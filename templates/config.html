@@ -191,6 +191,12 @@
   {% endfor %}
   <p id="res-filter-none" class="muted" hidden>No resource matches the filter.</p>
 </section>
+<section class="card" id="storage">
+  <h2>Storage <span class="muted small" id="storage-free"></span></h2>
+  <p class="muted">What this service keeps on disk. <strong>Safe to clear</strong> is rebuilt or downloaded again when needed (a cleared cache makes the next model load slower once); caches unused for 60 days, leftover staging and the folders of crashed jobs are also removed automatically once a day. <strong>Your data</strong> is never deleted automatically; only an export can be removed here. Live JSON: <a href="/v1/storage"><code>/v1/storage</code></a>.</p>
+  <div id="storage-body" aria-live="polite"><p class="muted">Measuring&hellip;</p></div>
+  <p class="form-msg" id="storage-msg" role="status"></p>
+</section>
 </section>
 
 <section class="panel" id="tab-server">

@@ -624,3 +624,77 @@ document.addEventListener("click", function (e) {
   // The Models card is re-rendered when models are added or removed.
   if (window.MutationObserver) new MutationObserver(function () { if (catalog) summarizeAll(); }).observe(card, { childList: true });
 })();
+// Storage card (Resources tab): sizes from /v1/storage ("safe to clear" with Clear, "your data"
+// with Remove for exports only); asked again while the server is still measuring.
+(function () {
+  var body = document.getElementById("storage-body"), msg = document.getElementById("storage-msg"), free = document.getElementById("storage-free");
+  if (!body || !window.fetch) return;
+  function fmt(b) {
+    if (b >= 1e9) return (b / 1e9).toFixed(1) + " GB";
+    if (b >= 1e7) return Math.round(b / 1e6) + " MB";
+    if (b >= 1e6) return (b / 1e6).toFixed(1) + " MB";
+    if (b >= 1e3) return Math.round(b / 1e3) + " kB";
+    return b + " B";
+  }
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  function table(title, items, total) {
+    var wrap = el("div");
+    var h = el("h3", null, title + " ");
+    h.appendChild(el("span", "muted small", fmt(total)));
+    wrap.appendChild(h);
+    if (!items.length) { wrap.appendChild(el("p", "muted", "Nothing here.")); return wrap; }
+    var scroll = el("div", "scroll"), t = el("table", "storage rcards");
+    var head = el("thead"), hr = el("tr");
+    ["Item", "Size", "Action"].forEach(function (c) { hr.appendChild(el("th", null, c)); });
+    head.appendChild(hr); t.appendChild(head);
+    var tb = el("tbody");
+    items.forEach(function (i) {
+      var tr = el("tr"); tr.dataset.id = i.id;
+      var name = el("td", "rc-title-plain", i.title);
+      name.appendChild(el("br"));
+      name.appendChild(el("code", "small", i.path));
+      if (i.note) { name.appendChild(el("br")); name.appendChild(el("span", "muted", i.note)); }
+      tr.appendChild(name);
+      var size = el("td", "num", i.size); size.dataset.label = "Size"; tr.appendChild(size);
+      var act = el("td", "rc-action");
+      if (i.action === "clear" || i.action === "remove") {
+        var b = el("button", "small " + (i.action === "remove" ? "danger" : "secondary"), i.action === "remove" ? "Remove" : "Clear");
+        b.type = "button";
+        b.addEventListener("click", function () { run(i, b); });
+        act.appendChild(b);
+      }
+      tr.appendChild(act);
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); scroll.appendChild(t); wrap.appendChild(scroll);
+    return wrap;
+  }
+  function render(j) {
+    var r = j.report;
+    if (!r) { body.replaceChildren(el("p", "muted", "Measuring\u2026")); return; }
+    var parts = [table("Safe to clear", r.safe, r.safe_bytes), table("Your data", r.data, r.data_bytes)];
+    if (j.computing) parts.unshift(el("p", "muted small", "Measuring again\u2026"));
+    body.replaceChildren.apply(body, parts);
+    if (free) free.textContent = r.free_bytes === null || r.free_bytes === undefined ? "" : fmt(r.free_bytes) + " free";
+  }
+  function load() {
+    fetch("/v1/storage", {cache: "no-store"}).then(function (x) { return x.json(); }).then(function (j) {
+      render(j);
+      if (j.computing) setTimeout(load, 2000);
+    }).catch(function () { body.replaceChildren(el("p", "muted", "Could not measure the storage; reload the page.")); });
+  }
+  function run(i, b) {
+    var remove = i.action === "remove";
+    var q = remove ? "Remove " + i.title + " (" + i.size + ")? It cannot be undone." : "Clear " + i.title + " (" + i.size + ")?";
+    if (!confirm(q)) return;
+    b.disabled = true;
+    msg.textContent = remove ? "Removing\u2026" : "Clearing\u2026";
+    var form = new URLSearchParams();
+    if (remove) form.set("name", i.id.replace(/^export:/, "")); else form.set("id", i.id);
+    fetch(remove ? "/v1/storage/exports/remove" : "/v1/storage/clear", {method: "POST", body: form, headers: {Accept: "application/json"}})
+      .then(function (x) { return x.json(); })
+      .then(function (j) { msg.textContent = j.message || (j.success ? "done" : "failed"); load(); })
+      .catch(function () { msg.textContent = "The request failed; reload the page."; b.disabled = false; });
+  }
+  load();
+})();

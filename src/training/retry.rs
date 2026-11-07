@@ -12,8 +12,8 @@
 //! the training itself is not offered: Convergence, the selection and the learning-rate bends all
 //! live in the trainer's process.
 //!
-//! The rest is what a run leaves on disk: [`disk_use`] for the row's sizes, [`delete_run_files`]
-//! for Remove.
+//! The rest is what a run leaves on disk: [`disk_use`] for the row's sizes (hard links counted
+//! once, on Windows too), [`delete_run_files`] for Remove.
 
 use super::job::{ExportRetry, TrainJob};
 use super::service::{RunRecord, RunState};
@@ -170,14 +170,11 @@ pub fn partial_note(r: &RunRecord) -> String {
     }
 }
 
-/// Bytes deleting `dir` would free. Each file once, and on Unix only files with no link outside
-/// `dir`: a dataset's images are hard links to the export they came from, and deleting them
-/// frees nothing while the export stays. Windows counts every file.
+/// Bytes deleting `dir` would free. Each file once, and only files with no link outside `dir`: a
+/// dataset's images are hard links to the export they came from, and deleting them frees nothing
+/// while the export stays. A file whose identity cannot be read counts in full.
 pub fn disk_use(dir: &Path) -> u64 {
-    #[cfg(unix)]
-    let mut seen: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
-        std::collections::HashMap::new();
-    let mut total = 0u64;
+    let mut files: Vec<(Option<FileId>, u64)> = Vec::new();
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -188,28 +185,80 @@ pub fn disk_use(dir: &Path) -> u64 {
             if md.is_dir() {
                 todo.push(e.path());
             } else if md.is_file() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    let s = seen
-                        .entry((md.dev(), md.ino()))
-                        .or_insert((0, md.nlink(), md.len()));
-                    s.0 += 1;
-                }
-                #[cfg(not(unix))]
-                {
-                    total = total.saturating_add(md.len());
-                }
+                files.push((file_id(&e.path(), &md), md.len()));
             }
         }
     }
-    #[cfg(unix)]
+    freed(files)
+}
+
+/// Where a file's bytes live and how many names they have: (device or volume, file number, links).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub volume: u64,
+    pub index: u64,
+    pub links: u64,
+}
+
+/// What deleting every listed file frees: a file listed under several of its names counts once,
+/// and only when all its links are listed (no name outside keeps the bytes). `None` identities
+/// count in full.
+pub fn freed(files: impl IntoIterator<Item = (Option<FileId>, u64)>) -> u64 {
+    let mut seen: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
+        std::collections::HashMap::new();
+    let mut total = 0u64;
+    for (id, len) in files {
+        match id {
+            Some(id) => {
+                let s = seen
+                    .entry((id.volume, id.index))
+                    .or_insert((0, id.links, len));
+                s.0 += 1;
+            }
+            None => total = total.saturating_add(len),
+        }
+    }
     for (links_here, links, len) in seen.into_values() {
         if links_here >= links {
             total = total.saturating_add(len);
         }
     }
     total
+}
+
+#[cfg(unix)]
+fn file_id(_path: &Path, md: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileId {
+        volume: md.dev(),
+        index: md.ino(),
+        links: md.nlink(),
+    })
+}
+
+/// Windows: the volume serial number, file index and link count of an open handle
+/// (`GetFileInformationByHandle` through `winapi-util`). Opened for attributes only, so a file
+/// another program holds open is read too.
+#[cfg(windows)]
+fn file_id(path: &Path, _md: &std::fs::Metadata) -> Option<FileId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `FILE_READ_ATTRIBUTES`.
+    const READ_ATTRIBUTES: u32 = 0x80;
+    let f = std::fs::OpenOptions::new()
+        .access_mode(READ_ATTRIBUTES)
+        .open(path)
+        .ok()?;
+    let info = winapi_util::file::information(&f).ok()?;
+    Some(FileId {
+        volume: info.volume_serial_number(),
+        index: info.file_index(),
+        links: info.number_of_links(),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_path: &Path, _md: &std::fs::Metadata) -> Option<FileId> {
+    None
 }
 
 /// Delete the folder of run `id`, which must be `<root>/<id>`: a record edited by hand or moved
@@ -346,6 +395,36 @@ mod tests {
     }
 
     #[test]
+    fn freed_counts_a_linked_file_once_and_only_with_all_its_links() {
+        let id = |index, links| {
+            Some(FileId {
+                volume: 7,
+                index,
+                links,
+            })
+        };
+        // Two names of one file, both listed: once. One of two names: nothing freed. A file of
+        // another volume with the same index is another file. Unknown identity: in full.
+        let files = [
+            (id(1, 2), 1000),
+            (id(1, 2), 1000),
+            (id(2, 2), 300),
+            (id(3, 1), 500),
+            (
+                Some(FileId {
+                    volume: 8,
+                    index: 1,
+                    links: 1,
+                }),
+                40,
+            ),
+            (None, 6),
+        ];
+        assert_eq!(freed(files), 1000 + 500 + 40 + 6);
+        assert_eq!(freed([]), 0);
+    }
+
+    #[test]
     fn disk_use_counts_what_deleting_frees() {
         let d = tmp("disk");
         put(&d.join("run/a.bin"), 1000);
@@ -354,8 +433,8 @@ mod tests {
         std::fs::hard_link(d.join("run/a.bin"), d.join("run/sub/a-link.bin")).unwrap();
         put(&d.join("export/c.jpg"), 300);
         std::fs::hard_link(d.join("export/c.jpg"), d.join("run/sub/c.jpg")).unwrap();
-        let expected = if cfg!(unix) { 1500 } else { 2800 };
-        assert_eq!(disk_use(&d.join("run")), expected);
+        // On every OS (Windows counted a.bin twice and c.jpg in full before).
+        assert_eq!(disk_use(&d.join("run")), 1500);
         assert_eq!(disk_use(&d.join("missing")), 0);
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -2125,6 +2125,17 @@ pub(crate) fn balance_preview_json(
         None => TrainPaths::for_config(config).export.models,
     };
     let unreviewed = unreviewed_now(config);
+    // Free GPU memory against each ticked model, as the job checks it at its start.
+    let accelerator = crate::training::capability_now().accelerator;
+    let gpu: Vec<String> = accelerator
+        .as_ref()
+        .map(|a| {
+            recipes
+                .iter()
+                .filter_map(|r| preflight::gpu_warning(r, a))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut needs: Vec<preflight::VolumeNeed> = Vec::new();
     let runs: Vec<serde_json::Value> = data
         .scenes
@@ -2174,7 +2185,7 @@ pub(crate) fn balance_preview_json(
                         "scene": scene.as_str(),
                         "title": title,
                         "report": p.balance,
-                        "warnings": p.warnings,
+                        "warnings": p.warnings.iter().chain(&gpu).collect::<Vec<_>>(),
                         "classes": p.classes,
                         "train_frames": p.train.len(),
                         "train_images": p.train.iter().map(|(_, n)| *n as usize).sum::<usize>(),

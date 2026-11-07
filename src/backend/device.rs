@@ -549,7 +549,11 @@ fn select_cache_dir(
             core_set_property(core, &class, &RwPropertyKey::CacheDir, s)
         });
     match set {
-        Ok(()) => tracing::debug!("OpenVINO {class}: CACHE_DIR={}", dir.display()),
+        Ok(()) => {
+            // The storage sweep deletes cache folders no load used for 60 days.
+            crate::storage::touch(&dir);
+            tracing::debug!("OpenVINO {class}: CACHE_DIR={}", dir.display());
+        }
         Err(e) => {
             tracing::warn!(
                 "OpenVINO {class}: could not use the model cache {} ({e:#}); compiling without \

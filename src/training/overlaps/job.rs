@@ -381,6 +381,9 @@ impl Task for OverlapsJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
+        // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
+        // ([`crate::storage::sweep`]).
+        let _busy = crate::storage::Busy::hold(&self.work);
         let r = self.stages(ctx, report, cancel);
         let _ = crate::resources::manager::remove_any(&self.work);
         r

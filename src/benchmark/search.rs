@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// File name of the stored predictions, beside `benchmark.json`.
 pub(crate) const PREDS_FILE: &str = "benchmark-preds.json";
@@ -234,41 +234,55 @@ impl StoredPreds {
 
     /// [`Self::load`] through a one-entry, process-wide cache keyed by the file's path,
     /// modification time and length (BQ-04): repeated searches and options requests parse the
-    /// file (tens of MB) once until it changes. Load errors are not cached.
+    /// file (tens of MB) once until it changes. Load errors are not cached. The parsed file goes
+    /// after [`CACHE_IDLE`] without a reader (M10).
     pub fn load_cached(path: &Path) -> Result<Option<Arc<Self>>> {
         Self::load_cached_in(&PREDS_CACHE, path)
     }
 
     /// [`Self::load_cached`] with the cache given (tests).
-    fn load_cached_in(cache: &Mutex<PredsCache>, path: &Path) -> Result<Option<Arc<Self>>> {
+    fn load_cached_in(cache: &'static PredsCache, path: &Path) -> Result<Option<Arc<Self>>> {
         let stamp = file_stamp(path);
         let key = (path.to_path_buf(), stamp);
-        {
-            let cache = cache.lock_recover();
-            if let Some((k, v)) = cache.as_ref()
-                && *k == key
-            {
-                return Ok(v.clone());
-            }
+        if let Some(v) = cache.get(&key) {
+            return Ok(v);
         }
         // Parsed outside the lock (seconds for a large file): a concurrent request parses too.
         let loaded = Self::load(path)?.map(Arc::new);
         // The stamp taken before reading: a file replaced while it was read is parsed again
         // next time instead of being cached under the new stamp.
-        *cache.lock_recover() = Some((key, loaded.clone()));
+        cache.put(key, loaded.clone());
         Ok(loaded)
     }
 
     /// [`Self::load`] returning the warnings: `runs` is deserialized entry by entry, so one bad
-    /// entry drops only that run.
+    /// entry drops only that run (the rule of [`super::report::parse_lenient`]). Streamed from
+    /// the file: one run entry is held as JSON at a time, never the whole text or its tree.
     pub fn load_with_warnings(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
-        let Some(text) = super::report::read_if_exists(path)? else {
-            return Ok((None, Vec::new()));
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, Vec::new())),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let (mut r, runs, warnings) =
-            super::report::parse_lenient::<Self, StoredRun>(&text, "runs", path)?;
-        r.runs = runs;
-        Ok((Some(r), warnings))
+        let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
+        let parsed = serde::de::Deserializer::deserialize_map(&mut de, lenient::FileVisitor)
+            .and_then(|v| de.end().map(|()| v))
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let lenient::Parsed {
+            version,
+            runs,
+            dropped,
+        } = parsed;
+        let warnings = dropped
+            .into_iter()
+            .map(|(name, err)| {
+                format!(
+                    "{}: dropped `runs` entry {name}, which does not load: {err}",
+                    path.display()
+                )
+            })
+            .collect();
+        Ok((Some(Self { version, runs }), warnings))
     }
 
     /// Compact JSON through a temporary file and a rename.
@@ -338,8 +352,221 @@ fn file_stamp(p: &Path) -> FileStamp {
 }
 
 /// The last parsed stored-predictions file: (path, stamp) -> contents (None = no file).
-type PredsCache = Option<((PathBuf, FileStamp), Option<Arc<StoredPreds>>)>;
-static PREDS_CACHE: Mutex<PredsCache> = Mutex::new(None);
+type PredsCache = IdleCache<(PathBuf, FileStamp), Option<Arc<StoredPreds>>>;
+static PREDS_CACHE: PredsCache = IdleCache::new(CACHE_IDLE);
+
+/// A parsed file nobody asked for in this long is dropped from its cache (M10).
+pub(crate) const CACHE_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// A one-entry cache whose entry is dropped once nobody read it for its idle time: a thread
+/// started with an entry looks every tenth of that time (at most a minute) and ends with the
+/// entry, so an idle service holds neither. Process-wide caches are `static`s of it.
+pub(crate) struct IdleCache<K, V> {
+    state: Mutex<IdleState<K, V>>,
+    idle: Duration,
+}
+
+struct IdleState<K, V> {
+    /// Key, value and when it was last read or put.
+    entry: Option<(K, V, Instant)>,
+    /// The thread that drops the entry is running.
+    sweeping: bool,
+}
+
+impl<K, V> IdleCache<K, V>
+where
+    K: PartialEq + Send + 'static,
+    V: Clone + Send + 'static,
+{
+    pub(crate) const fn new(idle: Duration) -> Self {
+        Self {
+            state: Mutex::new(IdleState {
+                entry: None,
+                sweeping: false,
+            }),
+            idle,
+        }
+    }
+
+    /// The value cached under `key`, now counted as read.
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
+        let mut st = self.state.lock_recover();
+        let (k, v, used) = st.entry.as_mut()?;
+        if k != key {
+            return None;
+        }
+        *used = Instant::now();
+        Some(v.clone())
+    }
+
+    /// Cache `value` under `key` (replacing any other entry).
+    pub(crate) fn put(&'static self, key: K, value: V) {
+        let mut st = self.state.lock_recover();
+        st.entry = Some((key, value, Instant::now()));
+        self.start_sweeping(&mut st);
+    }
+
+    /// The value under `key`, or `make()`'s, cached. `make` runs under the cache's lock, so
+    /// callers asking at once compute it once.
+    pub(crate) fn get_or_insert_with(&'static self, key: K, make: impl FnOnce() -> V) -> V {
+        let mut st = self.state.lock_recover();
+        if let Some((k, v, used)) = st.entry.as_mut()
+            && *k == key
+        {
+            *used = Instant::now();
+            return v.clone();
+        }
+        let v = make();
+        st.entry = Some((key, v.clone(), Instant::now()));
+        self.start_sweeping(&mut st);
+        v
+    }
+
+    /// Start the thread that drops the entry when none runs (under the lock, so it cannot end
+    /// meanwhile). A thread that cannot start leaves the entry until the next put.
+    fn start_sweeping(&'static self, st: &mut IdleState<K, V>) {
+        if st.sweeping {
+            return;
+        }
+        let every = (self.idle / 10).clamp(Duration::from_millis(1), Duration::from_secs(60));
+        let spawned = std::thread::Builder::new()
+            .name("bop-cache-idle".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    if !self.sweep(Instant::now()) {
+                        break;
+                    }
+                }
+            });
+        st.sweeping = spawned.is_ok();
+    }
+
+    /// Drop the entry when it was not read for the idle time at `now`. False when no entry is
+    /// left: the sweeping thread then ends (marked under the lock, so a put starts a new one).
+    fn sweep(&self, now: Instant) -> bool {
+        let mut st = self.state.lock_recover();
+        if st
+            .entry
+            .as_ref()
+            .is_some_and(|(_, _, used)| now.saturating_duration_since(*used) >= self.idle)
+        {
+            st.entry = None;
+        }
+        if st.entry.is_none() {
+            st.sweeping = false;
+            return false;
+        }
+        true
+    }
+
+    /// Whether an entry is cached (tests).
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.state.lock_recover().entry.is_none()
+    }
+}
+
+/// The streaming, lenient reader of the stored-predictions file: the object's `version` and its
+/// `runs`, each run parsed from its own JSON value so a bad one is dropped with its name, as
+/// [`super::report::parse_lenient`] does for a text read whole. Other keys are skipped.
+mod lenient {
+    use super::StoredRun;
+    use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    pub(super) struct Parsed {
+        pub(super) version: String,
+        pub(super) runs: Vec<StoredRun>,
+        /// (entry name, error) of runs that did not load.
+        pub(super) dropped: Vec<(String, String)>,
+    }
+
+    pub(super) struct FileVisitor;
+
+    impl<'de> Visitor<'de> for FileVisitor {
+        type Value = Parsed;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Parsed, A::Error> {
+            let mut out = Parsed {
+                version: String::new(),
+                runs: Vec::new(),
+                dropped: Vec::new(),
+            };
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "version" => {
+                        out.version = map.next_value::<Option<String>>()?.unwrap_or_default();
+                    }
+                    "runs" => {
+                        let (runs, dropped) = map.next_value_seed(RunsSeed)?;
+                        out.runs = runs;
+                        out.dropped = dropped;
+                    }
+                    _ => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    type Runs = (Vec<StoredRun>, Vec<(String, String)>);
+
+    /// `runs`: null or a list.
+    struct RunsSeed;
+
+    impl<'de> DeserializeSeed<'de> for RunsSeed {
+        type Value = Runs;
+
+        fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Runs, D::Error> {
+            d.deserialize_any(RunsVisitor)
+        }
+    }
+
+    struct RunsVisitor;
+
+    impl<'de> Visitor<'de> for RunsVisitor {
+        type Value = Runs;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("`runs` as a list")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Runs, E> {
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Runs, E> {
+            Ok((Vec::new(), Vec::new()))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Runs, A::Error> {
+            let mut runs = Vec::new();
+            let mut dropped = Vec::new();
+            let mut i = 0usize;
+            while let Some(e) = seq.next_element::<serde_json::Value>()? {
+                i += 1;
+                let field = |k: &str| e.get(k).and_then(|x| x.as_str()).map(str::to_string);
+                let name = match (field("model"), field("device")) {
+                    (Some(m), Some(d)) => format!("#{i} ('{m}' on {d})"),
+                    (Some(m), None) => format!("#{i} ('{m}')"),
+                    _ => format!("#{i}"),
+                };
+                match serde_json::from_value::<StoredRun>(e) {
+                    Ok(r) => runs.push(r),
+                    Err(err) => dropped.push((name, err.to_string())),
+                }
+            }
+            Ok((runs, dropped))
+        }
+    }
+}
 
 /// Merge the predictions of `new` into the file beside `results_file`. Does not fail the
 /// benchmark: returns the warnings (also logged). A file that does not load is moved aside
@@ -1564,25 +1791,121 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("bop-preds-cache-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(PREDS_FILE);
-        let cache = Mutex::new(None);
-        assert!(
-            StoredPreds::load_cached_in(&cache, &path)
-                .unwrap()
-                .is_none()
-        );
+        let cache: &'static PredsCache = Box::leak(Box::new(IdleCache::new(CACHE_IDLE)));
+        assert!(StoredPreds::load_cached_in(cache, &path).unwrap().is_none());
         let (_, preds) = fixture();
         preds.save(&path).unwrap();
-        let a = StoredPreds::load_cached_in(&cache, &path).unwrap().unwrap();
+        let a = StoredPreds::load_cached_in(cache, &path).unwrap().unwrap();
         assert_eq!(*a, preds);
-        let b = StoredPreds::load_cached_in(&cache, &path).unwrap().unwrap();
+        let b = StoredPreds::load_cached_in(cache, &path).unwrap().unwrap();
         assert!(Arc::ptr_eq(&a, &b), "same stamp: no re-parse");
         // A changed file (other length) is parsed again.
         let mut fewer = preds.clone();
         fewer.runs.truncate(1);
         fewer.save(&path).unwrap();
-        let c = StoredPreds::load_cached_in(&cache, &path).unwrap().unwrap();
+        let c = StoredPreds::load_cached_in(cache, &path).unwrap().unwrap();
         assert!(!Arc::ptr_eq(&a, &c));
         assert_eq!(*c, fewer);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// M10: an entry nobody reads goes after the idle time, a read keeps it, and the thread that
+    /// drops it ends with it.
+    #[test]
+    fn an_idle_cache_entry_is_dropped_and_a_read_keeps_it() {
+        let cache: &'static IdleCache<u32, Arc<String>> =
+            Box::leak(Box::new(IdleCache::new(Duration::from_secs(600))));
+        let v = Arc::new("parsed".to_string());
+        cache.put(1, v.clone());
+        assert_eq!(cache.get(&2), None, "another key");
+        let t0 = Instant::now();
+        assert!(cache.get(&1).is_some());
+        assert!(cache.sweep(t0 + Duration::from_secs(599)), "read just now");
+        assert!(!cache.is_empty());
+        assert!(!cache.sweep(t0 + Duration::from_secs(1200)));
+        assert!(cache.is_empty());
+        assert_eq!(Arc::strong_count(&v), 1, "the cache let go of it");
+        assert_eq!(cache.get(&1), None);
+        // Under the lock: a compute for the same key happens once.
+        let made = std::sync::atomic::AtomicUsize::new(0);
+        let make = || {
+            made.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Arc::new("x".to_string())
+        };
+        cache.get_or_insert_with(3, make);
+        cache.get_or_insert_with(3, make);
+        assert_eq!(made.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// The real thread drops an idle entry and ends; a later put starts another.
+    #[test]
+    fn the_idle_thread_drops_the_entry_on_its_own() {
+        let cache: &'static IdleCache<u32, u32> =
+            Box::leak(Box::new(IdleCache::new(Duration::from_millis(40))));
+        for round in 0..2 {
+            cache.put(round, round);
+            let until = Instant::now() + Duration::from_secs(30);
+            while !cache.is_empty() {
+                assert!(Instant::now() < until, "round {round}: never dropped");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let until = Instant::now() + Duration::from_secs(30);
+            while cache.state.lock_recover().sweeping {
+                assert!(
+                    Instant::now() < until,
+                    "round {round}: the thread never ended"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// The streamed read keeps the lenient rules: a bad run is dropped by name, other keys and a
+    /// null list are fine, a missing file is None and a broken one an error naming it.
+    #[test]
+    fn stored_preds_stream_leniently() {
+        let dir = std::env::temp_dir().join(format!("bop-preds-stream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PREDS_FILE);
+        assert!(StoredPreds::load_with_warnings(&path).unwrap().0.is_none());
+        let (_, preds) = fixture();
+        preds.save(&path).unwrap();
+        let (back, w) = StoredPreds::load_with_warnings(&path).unwrap();
+        assert_eq!(back.unwrap(), preds);
+        assert!(w.is_empty(), "{w:?}");
+        let mut v = serde_json::to_value(&preds).unwrap();
+        v["extra"] = serde_json::json!({"nested": [1, 2]});
+        v["runs"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"model": "bad", "device": "cpu", "images": 7}),
+        );
+        std::fs::write(&path, v.to_string()).unwrap();
+        let (back, w) = StoredPreds::load_with_warnings(&path).unwrap();
+        assert_eq!(back.as_ref().unwrap(), &preds);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("dropped `runs` entry #1 ('bad' on cpu)"),
+            "{}",
+            w[0]
+        );
+        // The same as the whole-text reader it replaced.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (head, runs, old) =
+            super::super::report::parse_lenient::<StoredPreds, StoredRun>(&text, "runs", &path)
+                .unwrap();
+        assert_eq!(StoredPreds { runs, ..head }, back.unwrap());
+        assert_eq!(old, w);
+        std::fs::write(&path, r#"{"version":"v","runs":null}"#).unwrap();
+        let back = StoredPreds::load_with_warnings(&path).unwrap().0.unwrap();
+        assert_eq!((back.version.as_str(), back.runs.len()), ("v", 0));
+        for broken in [r#"{"runs":[{"#, r#"{"runs":5}"#, "[1]", r#"{"runs":[]} x"#] {
+            std::fs::write(&path, broken).unwrap();
+            let err = format!("{:#}", StoredPreds::load_with_warnings(&path).unwrap_err());
+            assert!(
+                err.contains("parsing") && err.contains(PREDS_FILE),
+                "{broken}: {err}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1187,6 +1187,18 @@ impl ImportJob {
             .collect();
         let embeddings = if r.selection == Selection::Siglip && unique.len() > r.frames {
             self.step(report, 6, 0, "SigLIP 2 embeddings");
+            if let Some(Accelerator::Cuda {
+                ordinal,
+                compute_capability,
+                ..
+            }) = &self.accelerator
+                && let Some(w) = crate::backend::vram::check_cuda_job(
+                    *ordinal,
+                    &crate::training::autolabel::memory::embed_need(Some(compute_capability.major)),
+                )
+            {
+                tracing::warn!("import: SigLIP 2 embeddings: {w}");
+            }
             let list = self.work.join("candidates.txt");
             let text: String = unique
                 .iter()
@@ -1557,6 +1569,9 @@ impl Task for ImportJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
+        // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
+        // ([`crate::storage::sweep`]). A kept work folder (`keep_work`) outlives the marker.
+        let _busy = crate::storage::Busy::hold(&self.work);
         let mut out = self.run_guarded(
             ctx,
             report,

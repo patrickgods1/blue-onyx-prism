@@ -22,6 +22,24 @@ use std::sync::atomic::AtomicBool;
 
 /// File of the task records in the training folder.
 pub const TASKS_FILE: &str = "tasks.json";
+/// Finished task records kept in `tasks.json` (the oldest go first); queued and running ones are
+/// always kept. A task owns no files the list is needed for.
+pub const MAX_FINISHED_TASKS: usize = 200;
+
+/// Drop the oldest finished records of `tasks` (in list order, which is queue order) past
+/// [`MAX_FINISHED_TASKS`]; busy ones stay whatever their number.
+pub fn cap_finished(tasks: &mut Vec<TaskRecord>) {
+    let finished = tasks.iter().filter(|r| !r.state.is_busy()).count();
+    let mut extra = finished.saturating_sub(MAX_FINISHED_TASKS);
+    tasks.retain(|r| {
+        if extra > 0 && !r.state.is_busy() {
+            extra -= 1;
+            false
+        } else {
+            true
+        }
+    });
+}
 
 /// What a task does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,6 +521,48 @@ mod tests {
         r.state = RunState::Failed;
         r.error = Some("boom".into());
         assert_eq!(r.describe(), "failed while extracting frames: boom");
+    }
+
+    #[test]
+    fn the_newest_finished_tasks_are_kept_and_busy_ones_always() {
+        let mut tasks: Vec<TaskRecord> = Vec::new();
+        // A queued and a running task among the oldest, then 2 more finished than the cap.
+        for i in 0..MAX_FINISHED_TASKS + 4 {
+            let mut r = record(&format!("t{i}"));
+            r.state = match i {
+                1 => RunState::Queued,
+                2 => RunState::Running,
+                3 => RunState::Failed,
+                _ => RunState::Done,
+            };
+            tasks.push(r);
+        }
+        cap_finished(&mut tasks);
+        let ids: Vec<&str> = tasks.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(tasks.len(), MAX_FINISHED_TASKS + 2);
+        assert_eq!(
+            ids[..3],
+            ["t1", "t2", "t4"],
+            "t0 and t3 were the oldest finished"
+        );
+        assert_eq!(
+            tasks.iter().filter(|r| !r.state.is_busy()).count(),
+            MAX_FINISHED_TASKS
+        );
+        assert_eq!(*ids.last().unwrap(), format!("t{}", MAX_FINISHED_TASKS + 3));
+        // Under the cap nothing goes, busy or not.
+        let before = tasks.clone();
+        cap_finished(&mut tasks);
+        assert_eq!(tasks, before);
+        let mut busy: Vec<TaskRecord> = (0..MAX_FINISHED_TASKS + 5)
+            .map(|i| {
+                let mut r = record(&format!("q{i}"));
+                r.state = RunState::Queued;
+                r
+            })
+            .collect();
+        cap_finished(&mut busy);
+        assert_eq!(busy.len(), MAX_FINISHED_TASKS + 5);
     }
 
     #[test]

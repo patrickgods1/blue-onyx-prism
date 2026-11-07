@@ -81,6 +81,53 @@ fn cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The labelers' proposals in `work`, one flushed JSONL line per finished frame.
+pub const PROPOSALS_FILE: &str = "proposals.jsonl";
+/// The selected frames in `work` (`frame`, `path`, `width`, `height`, `scene` per line).
+pub const FRAMES_FILE: &str = "frames.jsonl";
+/// What the run is ([`WorkRecord`]), in `work` beside the proposals.
+pub const JOB_FILE: &str = "job.json";
+const WORK_RECORD_VERSION: u32 = 1;
+
+/// The part of a labelers run that writing its proposals needs, kept in `work` so a sweep can do
+/// it after a crash ([`recover_crashed`]).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct WorkRecord {
+    version: u32,
+    id: String,
+    request: AutolabelRequest,
+    dataset_dir: PathBuf,
+    classes: Vec<String>,
+    /// [`AutolabelJob::labeler`], the frames' marker.
+    labeler: String,
+}
+
+/// A line of [`FRAMES_FILE`].
+#[derive(Debug, serde::Deserialize)]
+struct FrameLine {
+    frame: String,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    scene: String,
+}
+
+/// What [`recover_crashed`] wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Frames the proposals covered.
+    pub frames: usize,
+    /// Label files written.
+    pub frames_saved: usize,
+    /// Label files that could not be written (the folder must stay).
+    pub frames_failed: usize,
+    pub first_error: Option<String>,
+    /// Frames queued for review.
+    pub queued: usize,
+    /// Selected frames that are gone since (deleted by retention or by hand): nothing to write.
+    pub gone: usize,
+}
+
 /// A planned run ([`super::plan_autolabel`]).
 #[derive(Clone)]
 pub struct AutolabelJob {
@@ -452,7 +499,7 @@ impl AutolabelJob {
 
     /// The proposals of a labelers run, flushed by the script frame by frame.
     fn proposals_file(&self) -> PathBuf {
-        self.work.join("proposals.jsonl")
+        self.work.join(PROPOSALS_FILE)
     }
 
     /// What became of the frames [`AutolabelReport::count_write`] could not save and what to do
@@ -725,6 +772,106 @@ impl AutolabelJob {
         Ok(written)
     }
 
+    /// Stage 5 of a labelers run: triage and merge each line of `text` (the script's
+    /// `proposals.jsonl`) into its frame's label file, with the marker. `partial`: the script was
+    /// stopped, so a last line that does not parse is the one it was writing. Returns how many
+    /// frames the proposals covered. The run and [`recover_crashed`] both come here.
+    #[allow(clippy::too_many_arguments)]
+    fn write_proposals(
+        &self,
+        frames: &[Selected],
+        text: &str,
+        partial: bool,
+        labeler: &str,
+        spot_memory: &spots::Snapshot,
+        rep: &mut AutolabelReport,
+        changed: &mut Vec<String>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+    ) -> usize {
+        let r = &self.request;
+        let by_rel: BTreeMap<&str, &Selected> =
+            frames.iter().map(|f| (f.rel.as_str(), f)).collect();
+        let mut done: BTreeSet<&str> = BTreeSet::new();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        for (i, line) in lines.iter().enumerate() {
+            if i % 10 == 0 {
+                let pct = u8::try_from(i * 100 / lines.len().max(1)).unwrap_or(100);
+                self.step(report, 5, pct, &format!("{i} of {}", lines.len()));
+            }
+            let fp: FrameProposals = match serde_json::from_str(line) {
+                Ok(x) => x,
+                // The line the killed script was writing.
+                Err(_) if partial && i + 1 == lines.len() => continue,
+                Err(e) => {
+                    rep.warnings
+                        .push(format!("a proposals line does not parse: {e}"));
+                    continue;
+                }
+            };
+            let Some(sel) = by_rel.get(fp.frame.as_str()) else {
+                rep.warnings
+                    .push(format!("{}: not a selected frame; ignored", fp.frame));
+                continue;
+            };
+            done.insert(sel.rel.as_str());
+            let out = triage::to_boxes_counted(
+                &fp.boxes,
+                &self.classes,
+                &sel.scene,
+                sel.width,
+                sel.height,
+                r.accept_score,
+            );
+            rep.dropped_other_class += out.other_class;
+            rep.renamed.extend(out.renamed);
+            let boxes = out.boxes;
+            if !boxes.is_empty() {
+                rep.with_boxes += 1;
+            }
+            rep.proposals += boxes.len();
+            for b in &boxes {
+                *rep.by_label.entry(b.label.clone()).or_default() += 1;
+                match b.auto.triage {
+                    Some(Triage::Accept) => rep.accept += 1,
+                    _ => rep.review += 1,
+                }
+                if b.auto.vlm.as_ref().is_some_and(|v| !v.ok) {
+                    rep.vlm_objections += 1;
+                }
+            }
+            // Every frame the labelers returned gets the marker, boxes or not.
+            let marker = labels::AutoRun {
+                at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
+                labeler: labeler.to_string(),
+                classes: self.classes.clone(),
+            };
+            // Decided from the file as it is now: a reviewer may have got to the frame since
+            // it was selected.
+            let mut applied = None;
+            let res = self.write_frame(sel, rep, changed, |file| {
+                file.auto_run = Some(marker);
+                let memory = spot_memory.of(&sel.rel).map(|memory| triage::FrameSpots {
+                    memory,
+                    width: sel.width,
+                    height: sel.height,
+                });
+                let a = triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel, memory);
+                let write = FrameWrite {
+                    write: true,
+                    queue: a.for_review(),
+                };
+                applied = Some(a);
+                write
+            });
+            if rep.count_write(&sel.rel, res)
+                && let Some(a) = applied
+            {
+                rep.count_labelers(&a);
+            }
+        }
+        done.len()
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one linear stage machine reads best in one place"
@@ -747,6 +894,12 @@ impl AutolabelJob {
         let selection = self.select_for_run(&labeler, &mut rep.warnings)?;
         for w in &rep.warnings {
             tracing::warn!("{w}");
+        }
+        if let Some(a) = &self.accelerator {
+            for w in super::gpu_notes(r, a) {
+                tracing::warn!("auto-label: {w}");
+                rep.warnings.push(w);
+            }
         }
         let training_notes = rep.warnings.clone();
         let Selection {
@@ -861,7 +1014,22 @@ impl AutolabelJob {
             // 4. Label.
             std::fs::create_dir_all(&self.work)
                 .with_context(|| format!("creating {}", self.work.display()))?;
-            let list_path = self.work.join("frames.jsonl");
+            // What a sweep needs to write these proposals if this process dies
+            // ([`recover_crashed`]).
+            let job_file = self.work.join(JOB_FILE);
+            std::fs::write(
+                &job_file,
+                serde_json::to_vec(&WorkRecord {
+                    version: WORK_RECORD_VERSION,
+                    id: self.id.clone(),
+                    request: self.request.clone(),
+                    dataset_dir: self.dataset_dir.clone(),
+                    classes: self.classes.clone(),
+                    labeler: labeler.clone(),
+                })?,
+            )
+            .with_context(|| format!("writing {}", job_file.display()))?;
+            let list_path = self.work.join(FRAMES_FILE);
             let mut text = String::new();
             for f in &frames {
                 text.push_str(&serde_json::to_string(&serde_json::json!({
@@ -1038,92 +1206,21 @@ impl AutolabelJob {
                     }
                 }
             };
-            let by_rel: BTreeMap<&str, &Selected> =
-                frames.iter().map(|f| (f.rel.as_str(), f)).collect();
-            let mut done: BTreeSet<&str> = BTreeSet::new();
-            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            for (i, line) in lines.iter().enumerate() {
-                if i % 10 == 0 {
-                    let pct = u8::try_from(i * 100 / lines.len().max(1)).unwrap_or(100);
-                    self.step(report, 5, pct, &format!("{i} of {}", lines.len()));
-                }
-                let fp: FrameProposals = match serde_json::from_str(line) {
-                    Ok(x) => x,
-                    // The line the killed script was writing.
-                    Err(_) if partial && i + 1 == lines.len() => continue,
-                    Err(e) => {
-                        rep.warnings
-                            .push(format!("a proposals line does not parse: {e}"));
-                        continue;
-                    }
-                };
-                let Some(sel) = by_rel.get(fp.frame.as_str()) else {
-                    rep.warnings
-                        .push(format!("{}: not a selected frame; ignored", fp.frame));
-                    continue;
-                };
-                done.insert(sel.rel.as_str());
-                let out = triage::to_boxes_counted(
-                    &fp.boxes,
-                    &self.classes,
-                    &sel.scene,
-                    sel.width,
-                    sel.height,
-                    r.accept_score,
-                );
-                rep.dropped_other_class += out.other_class;
-                rep.renamed.extend(out.renamed);
-                let boxes = out.boxes;
-                if !boxes.is_empty() {
-                    rep.with_boxes += 1;
-                }
-                rep.proposals += boxes.len();
-                for b in &boxes {
-                    *rep.by_label.entry(b.label.clone()).or_default() += 1;
-                    match b.auto.triage {
-                        Some(Triage::Accept) => rep.accept += 1,
-                        _ => rep.review += 1,
-                    }
-                    if b.auto.vlm.as_ref().is_some_and(|v| !v.ok) {
-                        rep.vlm_objections += 1;
-                    }
-                }
-                // Every frame the labelers returned gets the marker, boxes or not.
-                let marker = labels::AutoRun {
-                    at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
-                    labeler: labeler.clone(),
-                    classes: self.classes.clone(),
-                };
-                // Decided from the file as it is now: a reviewer may have got to the frame since
-                // it was selected.
-                let mut applied = None;
-                let res = self.write_frame(sel, &mut rep, &mut changed, |file| {
-                    file.auto_run = Some(marker);
-                    let memory = spot_memory.of(&sel.rel).map(|memory| triage::FrameSpots {
-                        memory,
-                        width: sel.width,
-                        height: sel.height,
-                    });
-                    let a =
-                        triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel, memory);
-                    let write = FrameWrite {
-                        write: true,
-                        queue: a.for_review(),
-                    };
-                    applied = Some(a);
-                    write
-                });
-                if rep.count_write(&sel.rel, res)
-                    && let Some(a) = applied
-                {
-                    rep.count_labelers(&a);
-                }
-            }
+            let done_count = self.write_proposals(
+                &frames,
+                &text,
+                partial,
+                &labeler,
+                &spot_memory,
+                &mut rep,
+                &mut changed,
+                report,
+            );
             if let Some(e) = failure {
                 *keep_work = rep.frames_failed > 0;
                 return Err(self.failed_run(e, frames.len(), &rep, &changed));
             }
-            (stopped, done.len())
+            (stopped, done_count)
         };
         if stopped && frames_done == 0 {
             // Nothing finished: a plain cancel.
@@ -1684,6 +1781,9 @@ impl Task for AutolabelJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
+        // Until this returns, a storage sweep leaves `work` alone; after a crash it writes the
+        // finished proposals and removes it ([`crate::storage::sweep`]).
+        let _busy = crate::storage::Busy::hold(&self.work);
         let mut keep_work = false;
         let r = self.stages(ctx, report, cancel, &mut keep_work);
         if r.is_err() && !keep_work {
@@ -1716,6 +1816,92 @@ impl Task for AutolabelJob {
                 .then(|| super::NO_NEW_FRAMES.to_string())
         })
     }
+}
+
+/// Write the finished proposals of the labelers run whose process died, from its `work` folder:
+/// the frames' label files get them through the run's own write stage, markers included, as a
+/// Cancel does, and the changed frames are queued for review. The config gives the current class
+/// lists (the run's own classes are in the record). Frames gone since are counted, not failed. Err
+/// when the folder holds no readable record or proposals: then nothing was written.
+pub fn recover_crashed(work: &std::path::Path, config: &Config) -> Result<Recovered> {
+    let job_file = work.join(JOB_FILE);
+    let rec: WorkRecord = serde_json::from_slice(
+        &std::fs::read(&job_file).with_context(|| format!("reading {}", job_file.display()))?,
+    )
+    .with_context(|| format!("reading {}", job_file.display()))?;
+    if rec.version != WORK_RECORD_VERSION {
+        bail!(
+            "{} is of another version ({}); delete the folder by hand",
+            job_file.display(),
+            rec.version
+        );
+    }
+    let frames_file = work.join(FRAMES_FILE);
+    let list = crate::collect::layout::read_lines::<FrameLine>(&frames_file);
+    if let Some(e) = list.failed {
+        bail!("reading {e}");
+    }
+    let proposals = work.join(PROPOSALS_FILE);
+    let text = std::fs::read_to_string(&proposals)
+        .with_context(|| format!("reading {}", proposals.display()))?;
+    let mut out = Recovered::default();
+    let frames: Vec<Selected> = list
+        .lines
+        .into_iter()
+        .filter(|f| {
+            let here = Frame::resolve(&rec.dataset_dir, &f.frame).is_some();
+            out.gone += usize::from(!here);
+            here
+        })
+        .map(|f| Selected {
+            rel: f.frame,
+            jpg: f.path,
+            scene: f.scene,
+            width: f.width,
+            height: f.height,
+        })
+        .collect();
+    let job = AutolabelJob {
+        id: rec.id,
+        synonyms: BTreeMap::new(),
+        paths: TrainPaths::for_config(config),
+        platform: Platform::current(),
+        accelerator: None,
+        timeout: Duration::ZERO,
+        work: work.to_path_buf(),
+        config: Box::new(config.clone()),
+        model: None,
+        detector: None,
+        config_writer: None,
+        after: None,
+        finish: None,
+        request: rec.request,
+        dataset_dir: rec.dataset_dir,
+        classes: rec.classes,
+    };
+    let spot_memory = if job.request.sam3 {
+        spots::Snapshot::default()
+    } else {
+        spots::Snapshot::take(&job.dataset_dir, frames.iter().map(|f| f.rel.as_str()))
+    };
+    let mut rep = AutolabelReport::default();
+    let mut changed = Vec::new();
+    out.frames = job.write_proposals(
+        &frames,
+        &text,
+        true,
+        &rec.labeler,
+        &spot_memory,
+        &mut rep,
+        &mut changed,
+        &mut |_| {},
+    );
+    out.frames_saved = rep.frames_saved;
+    out.frames_failed = rep.frames_failed;
+    out.first_error = rep.first_write_error;
+    out.queued = crate::collect::layout::append_review(&job.dataset_dir, &changed)
+        .context("queueing the labelled frames for review")?;
+    Ok(out)
 }
 
 #[cfg(test)]

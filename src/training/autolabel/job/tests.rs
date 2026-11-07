@@ -3826,3 +3826,69 @@ fn a_model_run_leaves_closed_frames_closed() {
         out.summary
     );
 }
+
+/// A run whose process died leaves `work` with its marker: the storage sweep writes the finished
+/// proposals through the run's own write stage (markers included) and only then removes the
+/// folder; while a label file cannot be written, the folder and its marker stay.
+#[test]
+fn a_crashed_runs_proposals_are_written_by_the_sweep_before_its_folder_goes() {
+    use crate::storage::busy::marker_of;
+    use crate::storage::sweep;
+    let t = tmp("crash-sweep");
+    let rels = frames(&t.0, 3, false);
+    let dir = t.0.join("dataset");
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    // Every write fails, so the run keeps its proposals: the state a crash before the write stage
+    // leaves, apart from the marker.
+    let paths = label_paths(&dir, &rels);
+    let fake = LabelFake {
+        broken_during_run: paths.clone(),
+        ..LabelFake::default()
+    };
+    run_job(&job, &fake).unwrap_err();
+    assert!(job.work.join(PROPOSALS_FILE).is_file());
+    assert!(job.work.join(JOB_FILE).is_file());
+    assert!(
+        !marker_of(&job.work).exists(),
+        "an orderly end: kept on purpose, not crashed"
+    );
+    let s = crate::storage::Settings::for_config(&cfg);
+    let mut rep = sweep::Report::default();
+    sweep::sweep_work(&s, &mut rep);
+    assert!(job.work.is_dir(), "a kept folder is never swept");
+
+    // The process died instead: the marker stays behind, unlocked.
+    std::fs::write(marker_of(&job.work), b"1\n").unwrap();
+    for p in &paths[1..] {
+        std::fs::remove_file(p).unwrap();
+    }
+    std::fs::remove_file(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE)).unwrap();
+    let mut rep = sweep::Report::default();
+    sweep::sweep_work(&s, &mut rep);
+    assert!(job.work.is_dir(), "one frame could not be written: kept");
+    assert!(
+        marker_of(&job.work).exists(),
+        "so the next sweep tries again"
+    );
+    assert_eq!(rep.kept.len(), 1, "{rep:?}");
+    assert!(rep.kept[0].contains("1 of 3"), "{}", rep.kept[0]);
+    assert!(rep.removed.is_empty());
+    let first = labels_of(&dir, &rels[1]);
+
+    std::fs::remove_file(&paths[0]).unwrap();
+    let mut rep = sweep::Report::default();
+    sweep::sweep_work(&s, &mut rep);
+    assert!(rep.kept.is_empty(), "{rep:?}");
+    assert_eq!(rep.removed.len(), 1);
+    assert!(!job.work.exists());
+    assert!(!marker_of(&job.work).exists());
+    for r in &rels {
+        let f = labels_of(&dir, r);
+        assert!(f.auto_run.is_some(), "{r}: the run's marker");
+        assert_eq!(f.boxes.len(), first.boxes.len(), "{r}");
+    }
+    // Written twice, merged once.
+    assert_eq!(labels_of(&dir, &rels[1]).boxes, first.boxes);
+    assert_eq!(review_queue(&dir).len(), 3);
+}

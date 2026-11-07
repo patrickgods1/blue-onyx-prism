@@ -48,6 +48,10 @@ RUN mkdir -p /app/models /app/cache /app/config /app/data \
     && chown -R openvino:openvino /app/models /app/cache /app/config /app/data \
     && chmod 0755 /app/docker-entrypoint.sh
 USER openvino
+# glibc gives each thread that allocates its own malloc arena (up to 8 per core); the HTTP,
+# worker, collector and runtime threads all touch image-sized buffers, so a long run leaves many
+# fragmented arenas that are rarely returned and resident memory creeps up. Two keep it bounded.
+ENV MALLOC_ARENA_MAX=2
 EXPOSE 32168
 # GET /v1/status answers 200 when a model is ready (or degraded) and 503 while models download or
 # compile or when none loaded, so `docker ps` shows "starting" until the service can detect. The

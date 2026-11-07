@@ -15,9 +15,10 @@
 //! concurrent inference depends on the *device* a model runs on ([`Profile::tuning_for`]),
 //! not on the machine class. The class picks the recommended model sizes. A discrete GPU of at
 //! least [`ORT_TWO_SESSIONS_VRAM_MB`] with at least [`ORT_TWO_SESSIONS_MEMORY_GB`] of memory (or
-//! unknown memory) gets a second ONNX Runtime session per model whatever the class: one session
-//! leaves the GPU idle while the host decodes, preprocesses and copies (a 6-core box with a
-//! GTX 1070 Ti is Low yet stays at ~60% GPU with DirectML).
+//! unknown memory) gets a second ONNX Runtime session for the default model whatever the class:
+//! one session leaves the GPU idle while the host decodes, preprocesses and copies (a 6-core box
+//! with a GTX 1070 Ti is Low yet stays at ~60% GPU with DirectML). Other models keep one session
+//! each ([`Profile::tuning_with`]): every session is a full copy of the model on the card.
 
 use crate::backend::detect::{GpuVendor, HardwareInfo};
 use serde::{Deserialize, Serialize};
@@ -321,6 +322,9 @@ impl DeviceTuning {
 pub struct Overrides {
     pub inflight: usize,
     pub ort_sessions: usize,
+    /// The model serves `/v1/vision/detection` (the config's effective default when it loaded):
+    /// only it gets the profile's second ONNX Runtime session ([`Profile::tuning_with`]).
+    pub default_model: bool,
 }
 
 /// The profile of this machine.
@@ -486,12 +490,16 @@ impl Profile {
     /// [`Self::tuning_for`] with the explicit config values applied: `inflight` (model, else
     /// global; 0 = profile) replaces the count and is not clamped to the streams; for ONNX
     /// Runtime `ort_sessions` (0 = profile) sets the sessions and an explicit `inflight` caps
-    /// them.
+    /// them. Without `ort_sessions` only the default model gets the profile's sessions, every
+    /// other model one: each session is a full copy of the model in GPU memory, and the other
+    /// models (night, verifier, per-camera) see a fraction of the traffic.
     pub fn tuning_with(&self, dev: DeviceClass, o: Overrides) -> DeviceTuning {
         let mut t = self.tuning_for(dev);
         if let DeviceClass::Ort { .. } = dev {
             if o.ort_sessions > 0 {
                 t.ort_sessions = o.ort_sessions.min(MAX_INFLIGHT);
+            } else if !o.default_model {
+                t.ort_sessions = 1;
             }
             if o.inflight > 0 {
                 t.ort_sessions = t.ort_sessions.min(o.inflight);
@@ -862,6 +870,7 @@ mod tests {
             Overrides {
                 inflight: 2,
                 ort_sessions: 0,
+                ..Overrides::default()
             },
         );
         assert_eq!(cpu.inflight, 2);
@@ -873,6 +882,7 @@ mod tests {
             Overrides {
                 inflight: 0,
                 ort_sessions: 3,
+                ..Overrides::default()
             },
         );
         assert_eq!((ort.inflight, ort.ort_sessions), (3, 3));
@@ -881,6 +891,7 @@ mod tests {
             Overrides {
                 inflight: 1,
                 ort_sessions: 3,
+                ..Overrides::default()
             },
         );
         assert_eq!((ort.inflight, ort.ort_sessions), (1, 1));
@@ -889,9 +900,46 @@ mod tests {
             Overrides {
                 inflight: 100,
                 ort_sessions: 0,
+                ..Overrides::default()
             },
         );
         assert_eq!(big.inflight, MAX_INFLIGHT);
+    }
+
+    #[test]
+    fn only_the_default_model_gets_a_second_session() {
+        let f = facts(
+            6,
+            16.0,
+            "x86_64",
+            vec![gpu(GpuVendor::Nvidia, "GTX 1070 Ti", 8192, true)],
+        );
+        let p = classify(&f);
+        assert_eq!(p.ort_sessions, 2);
+        let gpu = DeviceClass::Ort { gpu: true };
+        let default = Overrides {
+            default_model: true,
+            ..Overrides::default()
+        };
+        let t = p.tuning_with(gpu, default);
+        assert_eq!((t.inflight, t.ort_sessions), (2, 2));
+        let other = p.tuning_with(gpu, Overrides::default());
+        assert_eq!((other.inflight, other.ort_sessions), (1, 1));
+        // `ort_sessions` still wins for every model.
+        let forced = p.tuning_with(
+            gpu,
+            Overrides {
+                ort_sessions: 3,
+                ..Overrides::default()
+            },
+        );
+        assert_eq!((forced.inflight, forced.ort_sessions), (3, 3));
+        // The CPU provider has one session whatever the model.
+        let cpu = p.tuning_with(DeviceClass::Ort { gpu: false }, default);
+        assert_eq!(cpu.ort_sessions, 1);
+        // OpenVINO is unaffected.
+        let igpu = p.tuning_with(DeviceClass::IntegratedGpu, Overrides::default());
+        assert_eq!(igpu.inflight, IGPU_INFLIGHT);
     }
 
     #[test]

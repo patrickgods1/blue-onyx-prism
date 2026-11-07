@@ -731,9 +731,13 @@ pub struct Config {
     /// see [`crate::profile::Profile::tuning_for`]); a model's own `inflight` wins. Restart.
     pub inflight: usize,
     /// ONNX Runtime sessions per model, one inference in flight each (0 = from the hardware
-    /// profile: 2 on a machine with a discrete GPU of at least 4 GB and 8 GB of memory, else 1).
-    /// Each session holds its own copy of the model, one inference in flight each. Restart.
+    /// profile: 2 for the default model on a machine with a discrete GPU of at least 4 GB and
+    /// 8 GB of memory, else 1). Each session holds its own copy of the model. Restart.
     pub ort_sessions: usize,
+    /// Cap of each ONNX Runtime CUDA / TensorRT session's memory arena, MB (`gpu_mem_limit`;
+    /// None = no cap). Restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ort_gpu_mem_limit_mb: Option<u64>,
     /// `auto` (classify the hardware) or a forced class: `low`, `mid`, `high`. Restart.
     pub hardware_profile: crate::profile::HardwareProfile,
     pub models_dir: PathBuf,
@@ -928,6 +932,7 @@ impl Default for Config {
             preprocess_threads: 0,
             inflight: 0,
             ort_sessions: 0,
+            ort_gpu_mem_limit_mb: None,
             hardware_profile: crate::profile::HardwareProfile::Auto,
             models_dir: PathBuf::from("models"),
             auto_download: true,
@@ -1209,6 +1214,8 @@ impl Config {
 
     /// ONNX Runtime lookup options for this config (explicit dir and the install root).
     pub fn ort_options(&self) -> crate::backend::OrtOptions {
+        // Process-wide like the library itself: every runtime is built from these options.
+        crate::backend::vram::set_ort_session_limit_mb(self.ort_gpu_mem_limit_mb);
         crate::backend::OrtOptions {
             onnxruntime_dir: self.onnxruntime_dir.as_deref().map(crate::resolve_path),
             default_dir: self
@@ -1228,11 +1235,18 @@ impl Config {
         crate::profile::Profile::current(self.hardware_profile)
     }
 
-    /// Explicit concurrency settings of `m` (its `inflight`, else the global one; 0 = profile).
+    /// Explicit concurrency settings of `m` (its `inflight`, else the global one; 0 = profile),
+    /// and whether it is the default model (the one that may get a second ONNX Runtime session).
     pub fn concurrency_overrides(&self, m: &ModelConfig) -> crate::profile::Overrides {
+        let default = self
+            .effective_default_index()
+            .and_then(|i| self.models.get(i))
+            .map(|d| crate::registry::normalize_name(&d.effective_name()));
         crate::profile::Overrides {
             inflight: m.inflight.filter(|&n| n > 0).unwrap_or(self.inflight),
             ort_sessions: self.ort_sessions,
+            default_model: default
+                .is_some_and(|d| d == crate::registry::normalize_name(&m.effective_name())),
         }
     }
 
@@ -1255,6 +1269,10 @@ pub const MAX_THREADS: usize = 256;
 pub const MAX_INFLIGHT_SETTING: usize = 64;
 /// Accepted range of `ort_sessions`.
 pub const MAX_ORT_SESSIONS: usize = 16;
+/// Accepted range of `ort_gpu_mem_limit_mb`: below 64 MB no detection model fits, above 1 TB is
+/// a typo.
+pub const MIN_ORT_GPU_MEM_LIMIT_MB: u64 = 64;
+pub const MAX_ORT_GPU_MEM_LIMIT_MB: u64 = 1024 * 1024;
 /// Accepted range of `gpu_index`.
 pub const MAX_GPU_INDEX: u32 = 64;
 /// Accepted range of `request_timeout_secs`.
@@ -1608,6 +1626,14 @@ impl Config {
         )?;
         check_range("inflight", self.inflight, 0, MAX_INFLIGHT_SETTING)?;
         check_range("ort_sessions", self.ort_sessions, 0, MAX_ORT_SESSIONS)?;
+        if let Some(mb) = self.ort_gpu_mem_limit_mb {
+            check_range(
+                "ort_gpu_mem_limit_mb",
+                mb,
+                MIN_ORT_GPU_MEM_LIMIT_MB,
+                MAX_ORT_GPU_MEM_LIMIT_MB,
+            )?;
+        }
         check_range("gpu_index", self.gpu_index, 0, MAX_GPU_INDEX)?;
         check_range(
             "max_image_pixels",
@@ -2918,6 +2944,49 @@ mod tests {
     fn rule_inflight_too_large() {
         let e = check(|c| c.inflight = 65).unwrap_err();
         assert!(e.contains("inflight:"), "{e}");
+    }
+
+    #[test]
+    fn rule_ort_gpu_mem_limit() {
+        assert!(check(|c| c.ort_gpu_mem_limit_mb = None).is_ok());
+        assert!(check(|c| c.ort_gpu_mem_limit_mb = Some(2048)).is_ok());
+        for bad in [0, 63, MAX_ORT_GPU_MEM_LIMIT_MB + 1] {
+            let e = check(|c| c.ort_gpu_mem_limit_mb = Some(bad)).unwrap_err();
+            assert!(e.contains("ort_gpu_mem_limit_mb:"), "{e}");
+        }
+        // Absent from a file that does not set it, read back when set.
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.ort_gpu_mem_limit_mb, None);
+        assert!(
+            !serde_json::to_string(&c)
+                .unwrap()
+                .contains("ort_gpu_mem_limit_mb")
+        );
+        let c: Config = serde_json::from_str(r#"{"ort_gpu_mem_limit_mb": 1536}"#).unwrap();
+        assert_eq!(c.ort_gpu_mem_limit_mb, Some(1536));
+    }
+
+    #[test]
+    fn concurrency_overrides_mark_the_default_model() {
+        let model = |name: &str, enabled: bool| ModelConfig {
+            name: Some(name.into()),
+            enabled,
+            ..ModelConfig::default()
+        };
+        let mut c = Config {
+            models: vec![model("off", false), model("a", true), model("b", true)],
+            ..Config::default()
+        };
+        // No default_model: the first enabled model.
+        let marks = |c: &Config| -> Vec<bool> {
+            c.models
+                .iter()
+                .map(|m| c.concurrency_overrides(m).default_model)
+                .collect()
+        };
+        assert_eq!(marks(&c), [false, true, false]);
+        c.default_model = Some("B".into());
+        assert_eq!(marks(&c), [false, false, true]);
     }
 
     #[test]
