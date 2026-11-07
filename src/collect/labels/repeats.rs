@@ -7,11 +7,13 @@
 //! every write of the folder's label files). The bulk edits are [`super::bulk::bulk_spot`] and
 //! [`super::bulk::bulk_accept_repeats`]; what a labelers run does with spots is in [`super::spots`].
 
+use super::super::layout::Walker;
 use super::{BoxState, LabelBox, LabelFile, RejectReason, Source, Status};
+use crate::sync::LockExt;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// IoU at or above which "reject this spot everywhere" takes a box.
@@ -184,10 +186,7 @@ fn counts(b: &LabelBox) -> bool {
 /// Scan `dir` for the decisions of `camera` ([`counts`]), newest frames first, at most `cap`.
 /// A frame whose sidecar does not read (its size is unknown) is left out.
 pub fn scan(dir: &Path, camera: &str, cap: usize) -> History {
-    let mut files: Vec<(String, PathBuf)> = super::label_files(dir)
-        .into_iter()
-        .filter(|(rel, _)| rel.split('/').nth(1) == Some(camera))
-        .collect();
+    let mut files = super::camera_label_files(dir, camera);
     // `<scene>/<camera>/<date>/<stem>`: newest date first, then the newest stem (a UTC time).
     files.sort_by(|a, b| {
         let key = |r: &str| {
@@ -203,6 +202,7 @@ pub fn scan(dir: &Path, camera: &str, cap: usize) -> History {
         camera: camera.to_string(),
         ..History::default()
     };
+    let mut walker = Walker::new(dir);
     'files: for (rel, path) in files {
         let Some(l) = super::read(&path).ok().flatten() else {
             continue;
@@ -210,7 +210,8 @@ pub fn scan(dir: &Path, camera: &str, cap: usize) -> History {
         if !l.boxes.iter().any(counts) {
             continue;
         }
-        let Some(rec) = super::Frame::resolve(dir, &rel).and_then(|f| f.record().ok()) else {
+        let Some(rec) = super::Frame::resolve_in(&mut walker, &rel).and_then(|f| f.record().ok())
+        else {
             continue;
         };
         for b in l.boxes.iter().filter(|b| counts(b)) {
@@ -232,7 +233,9 @@ pub fn scan(dir: &Path, camera: &str, cap: usize) -> History {
     h
 }
 
-type Cache = HashMap<(PathBuf, String), (Instant, Arc<History>)>;
+/// The canonical folder and the camera of a history.
+type Key = (PathBuf, String);
+type Cache = HashMap<Key, (Instant, Arc<History>)>;
 
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: std::sync::OnceLock<Mutex<Cache>> = std::sync::OnceLock::new();
@@ -247,33 +250,125 @@ fn scanning() -> &'static Mutex<HashMap<u64, (PathBuf, bool)>> {
     SCANNING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// One running scan and those waiting for it ([`history_with`]).
+#[derive(Default)]
+struct Flight {
+    /// `None` while it runs; then its history, `None` inside when the scan panicked.
+    done: Mutex<Option<Option<Arc<History>>>>,
+    finished: Condvar,
+}
+
+impl Flight {
+    /// Wait for the scan; its history, unless it panicked.
+    fn wait(&self) -> Option<Arc<History>> {
+        let mut done = self.done.lock_recover();
+        loop {
+            if let Some(h) = done.as_ref() {
+                return h.clone();
+            }
+            done = self.finished.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// The running scan of each folder and camera.
+fn flights() -> &'static Mutex<HashMap<Key, Arc<Flight>>> {
+    static FLIGHTS: std::sync::OnceLock<Mutex<HashMap<Key, Arc<Flight>>>> =
+        std::sync::OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Ends a scan when dropped, panic included, so one failure wedges neither the waiters nor the
+/// next [`written`].
+struct Landing {
+    id: u64,
+    key: Key,
+    flight: Arc<Flight>,
+    history: Option<Arc<History>>,
+}
+
+impl Drop for Landing {
+    fn drop(&mut self) {
+        scanning().lock_recover().remove(&self.id);
+        // In this order: a caller that finds no flight finds the cache already filled.
+        flights().lock_recover().remove(&self.key);
+        *self.flight.done.lock_recover() = Some(self.history.take());
+        self.flight.finished.notify_all();
+    }
+}
+
 /// [`scan`] of `camera` under `dir`, cached until a label file under `dir` is written
-/// ([`written`], [`invalidate`]) or for [`HISTORY_TTL`] (writes by other processes).
+/// ([`written`], [`invalidate`]) or for [`HISTORY_TTL`] (writes by other processes). One scan per
+/// folder and camera at a time: a second caller waits for the running one.
 pub fn history(dir: &Path, camera: &str) -> Arc<History> {
-    static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     // Keyed by the canonical folder: the frames' paths ([`super::Frame::resolve`]) are canonical.
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let key = (root.clone(), camera.to_string());
-    if let Ok(c) = cache().lock()
-        && let Some((at, h)) = c.get(&key)
-        && at.elapsed() < HISTORY_TTL
-    {
-        return h.clone();
+    history_with((root, camera.to_string()), &|| {
+        scan(dir, camera, HISTORY_CAP)
+    })
+}
+
+/// The cached history of `key`, else `scan`'s, one scan at a time.
+///
+/// A waiter whose scan was overtaken by a write ([`written`], not cached) may have been handed
+/// something older than what it came for, so it asks again; the scan it then meets started after
+/// it arrived, which is as good as its own, so it takes that answer whatever happens to it: under
+/// a steady stream of writes the waiters do not run one scan each, one after the other.
+fn history_with(key: Key, scan: &dyn Fn() -> History) -> Arc<History> {
+    static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut started_since_arrival = false;
+    loop {
+        if let Ok(c) = cache().lock()
+            && let Some((at, h)) = c.get(&key)
+            && at.elapsed() < HISTORY_TTL
+        {
+            return h.clone();
+        }
+        let flight = {
+            let mut running = flights().lock_recover();
+            match running.get(&key) {
+                Some(f) => Ok(f.clone()),
+                None => {
+                    let f = Arc::new(Flight::default());
+                    running.insert(key.clone(), f.clone());
+                    Err(f)
+                }
+            }
+        };
+        match flight {
+            Ok(joined) => {
+                let answer = joined.wait();
+                if started_since_arrival && let Some(h) = answer {
+                    return h;
+                }
+                started_since_arrival = true;
+            }
+            Err(flight) => {
+                let id = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                scanning().lock_recover().insert(id, (key.0.clone(), false));
+                let mut landing = Landing {
+                    id,
+                    key: key.clone(),
+                    flight,
+                    history: None,
+                };
+                let h = Arc::new(scan());
+                // The cache lock first: a [`written`] past the check below cannot get to the cache
+                // before this entry is in it, and it drops the entry then.
+                let mut c = cache().lock_recover();
+                let overtaken = scanning()
+                    .lock_recover()
+                    .remove(&id)
+                    .is_none_or(|(_, dirty)| dirty);
+                if !overtaken {
+                    c.insert(key, (Instant::now(), h.clone()));
+                }
+                drop(c);
+                landing.history = Some(h.clone());
+                return h;
+            }
+        }
     }
-    let id = IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut s) = scanning().lock() {
-        s.insert(id, (root, false));
-    }
-    let h = Arc::new(scan(dir, camera, HISTORY_CAP));
-    let overtaken = scanning()
-        .lock()
-        .ok()
-        .and_then(|mut s| s.remove(&id))
-        .is_none_or(|(_, dirty)| dirty);
-    if !overtaken && let Ok(mut c) = cache().lock() {
-        c.insert(key, (Instant::now(), h.clone()));
-    }
-    h
 }
 
 /// Drop the cached histories of `dir`.
@@ -587,5 +682,187 @@ mod tests {
         };
         assert!(!spot.matches(&d, &Verdict::Reject(None)));
         assert!(!spot.matches(&d, &Verdict::Accept));
+    }
+
+    /// Test of [`history_with`]: a scan that says it started and waits to be let go.
+    struct Gated {
+        scans: std::sync::atomic::AtomicUsize,
+        started: Mutex<std::sync::mpsc::Sender<usize>>,
+        go: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Gated {
+        fn scan(&self) -> History {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.scans.fetch_add(1, SeqCst) + 1;
+            self.started.lock().unwrap().send(n).unwrap();
+            self.go.lock().unwrap().recv().unwrap();
+            History {
+                camera: format!("scan {n}"),
+                ..History::default()
+            }
+        }
+    }
+
+    type Gate = (
+        Arc<Gated>,
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::Sender<()>,
+    );
+
+    fn gated() -> Gate {
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel();
+        let g = Gated {
+            scans: std::sync::atomic::AtomicUsize::new(0),
+            started: Mutex::new(started_tx),
+            go: Mutex::new(go_rx),
+        };
+        (Arc::new(g), started, go)
+    }
+
+    fn fresh_key() -> Key {
+        let root = PathBuf::from(format!("/bop-flight-{}", uuid::Uuid::new_v4()));
+        (root, "cam".to_string())
+    }
+
+    fn call(key: &Key, g: &Arc<Gated>) -> std::thread::JoinHandle<Arc<History>> {
+        let (key, g) = (key.clone(), g.clone());
+        std::thread::spawn(move || history_with(key, &|| g.scan()))
+    }
+
+    /// Wait until `n` callers wait for the running scan of `key`.
+    fn wait_for_waiters(key: &Key, n: usize) {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            // The list and the scan's own landing hold one each.
+            let held = flights()
+                .lock_recover()
+                .get(key)
+                .map_or(0, |f| Arc::strong_count(f).saturating_sub(2));
+            if held == n {
+                return;
+            }
+            assert!(Instant::now() < until, "{held} waiting, not {n}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn scans_left(key: &Key) -> bool {
+        flights().lock_recover().contains_key(key)
+            || scanning().lock_recover().values().any(|(d, _)| *d == key.0)
+    }
+
+    #[test]
+    fn a_second_caller_waits_for_the_running_scan() {
+        let (g, started, go) = gated();
+        let key = fresh_key();
+        let lead = call(&key, &g);
+        started.recv().unwrap();
+        let waiters: Vec<_> = (0..4).map(|_| call(&key, &g)).collect();
+        wait_for_waiters(&key, 4);
+        go.send(()).unwrap();
+        let first = lead.join().unwrap();
+        assert_eq!(first.camera, "scan 1");
+        for w in waiters {
+            assert!(Arc::ptr_eq(&w.join().unwrap(), &first), "the same scan");
+        }
+        assert_eq!(g.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!scans_left(&key));
+        // Another camera of the folder is its own scan.
+        let other = (key.0.clone(), "drive".to_string());
+        let lead = call(&other, &g);
+        started.recv().unwrap();
+        go.send(()).unwrap();
+        assert_eq!(lead.join().unwrap().camera, "scan 2");
+    }
+
+    #[test]
+    fn a_panic_in_a_scan_wedges_nobody() {
+        let (g, started, go) = gated();
+        let key = fresh_key();
+        let (let_go, wait) = std::sync::mpsc::channel::<()>();
+        let panicking = {
+            let (key, started) = (key.clone(), g.started.lock().unwrap().clone());
+            std::thread::spawn(move || {
+                history_with(key, &|| {
+                    started.send(0).unwrap();
+                    wait.recv().unwrap();
+                    panic!("a scan fails");
+                })
+            })
+        };
+        assert_eq!(started.recv().unwrap(), 0);
+        let waiter = call(&key, &g);
+        wait_for_waiters(&key, 1);
+        let_go.send(()).unwrap();
+        assert!(panicking.join().is_err());
+        // The waiter takes over.
+        assert_eq!(started.recv().unwrap(), 1);
+        go.send(()).unwrap();
+        assert_eq!(waiter.join().unwrap().camera, "scan 1");
+        assert!(!scans_left(&key));
+    }
+
+    #[test]
+    fn a_waiter_of_an_overtaken_scan_does_not_get_the_old_answer() {
+        let (g, started, go) = gated();
+        let key = fresh_key();
+        let lead = call(&key, &g);
+        started.recv().unwrap();
+        let waiter = call(&key, &g);
+        wait_for_waiters(&key, 1);
+        written(&key.0.join("ir/cam/2026-10-21/a.labels.json"));
+        go.send(()).unwrap();
+        assert_eq!(lead.join().unwrap().camera, "scan 1", "its caller's answer");
+        // Not cached: the waiter scans again, after the write.
+        started.recv().unwrap();
+        go.send(()).unwrap();
+        assert_eq!(waiter.join().unwrap().camera, "scan 2");
+        // That one saw no write: it is cached.
+        let cached = history_with(key, &|| panic!("cached"));
+        assert_eq!(cached.camera, "scan 2");
+    }
+
+    #[test]
+    fn under_steady_writes_a_waiter_takes_the_scan_that_started_after_it() {
+        let (g, started, go) = gated();
+        let key = fresh_key();
+        let lead = call(&key, &g);
+        started.recv().unwrap();
+        let waiters: Vec<_> = (0..3).map(|_| call(&key, &g)).collect();
+        wait_for_waiters(&key, 3);
+        let label = key.0.join("ir/cam/2026-10-21/a.labels.json");
+        written(&label);
+        go.send(()).unwrap();
+        lead.join().unwrap();
+        // One of them scans again; the others join it, and it too is overtaken.
+        started.recv().unwrap();
+        wait_for_waiters(&key, 2);
+        written(&label);
+        go.send(()).unwrap();
+        for w in waiters {
+            assert_eq!(w.join().unwrap().camera, "scan 2");
+        }
+        assert_eq!(g.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn history_lists_only_the_folders_of_its_camera() {
+        let dir = std::env::temp_dir().join(format!("bop-repeats-{}", uuid::Uuid::new_v4()));
+        let rejected = LabelBox {
+            state: BoxState::Rejected,
+            ..auto_box("car")
+        };
+        let frame = |camera, stem, b: &LabelBox| {
+            use super::super::bulk::test_support::put_frame_at;
+            put_frame_at(&dir, camera, stem, (64, 48), None, vec![b.clone()]);
+        };
+        frame("cam", "20261021T010000000Z_a", &rejected);
+        frame("drive", "20261021T010000000Z_b", &rejected);
+        assert_eq!(scan(&dir, "cam", HISTORY_CAP).decisions.len(), 1);
+        assert!(scan(&dir, "..", HISTORY_CAP).decisions.is_empty());
+        assert!(scan(&dir, "nobody", HISTORY_CAP).decisions.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

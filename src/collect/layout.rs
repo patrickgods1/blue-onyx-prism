@@ -1,8 +1,9 @@
 //! On-disk layout of the dataset folder (`docs/DATASET.md`):
 //! `<dir>/<scene>/<camera>/<YYYY-MM-DD>/<ts>_<request_id>.{jpg,json}`, one `index.jsonl` per day
 //! folder, and `<dir>/review-queue.jsonl`. Names, the relative-path check every served or
-//! queued path goes through ([`parse_rel`], [`resolve`]), the summary rebuilt from the index
-//! files ([`Summary::scan`]) and the review queue ([`append_review`]).
+//! queued path goes through ([`parse_rel`], [`resolve`], and [`Walker`] for a walk over many
+//! frames), the summary rebuilt from the index files ([`Summary::scan`]) and the review queue
+//! ([`append_review`]).
 //!
 //! The JSONL files survive a crash or a full disk: [`append_line`] ends a torn last line before
 //! writing, and [`read_lines`] costs a damaged line only that line, and counts it.
@@ -11,7 +12,7 @@ use super::record::{Bucket, IndexLine, Record};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -157,6 +158,71 @@ pub fn resolve(dir: &Path, rel: &str, ext: &str) -> Option<PathBuf> {
     }
     let (root, real) = (dir.canonicalize().ok()?, p.canonicalize().ok()?);
     real.starts_with(&root).then_some(real)
+}
+
+/// [`resolve`] for one walk over many frames: the same answers, with the root canonicalized once
+/// and each `<scene>/<camera>/<date>` folder once, then per file only a look at the leaf
+/// (`symlink_metadata`: a regular file, no symlink). The real path is the canonical day folder
+/// plus the leaf's name, which is what canonicalizing a regular file's path gives.
+///
+/// A day folder is checked once: one that is missing, or that a symlink takes outside the root,
+/// refuses all its frames for one failed call; one a symlink keeps inside the root works, as in
+/// [`resolve`]. Scope it to a walk, not longer: the answers are as of the first look. [`Clone`] it
+/// for the threads of a walk, so the root is not looked at again.
+#[derive(Debug, Clone)]
+pub struct Walker<'a> {
+    dir: &'a Path,
+    /// The canonical root, None when `dir` has none (then nothing resolves).
+    root: Option<PathBuf>,
+    /// `<scene>/<camera>/<date>` -> its canonical folder, None when it refuses.
+    days: HashMap<String, Option<PathBuf>>,
+    /// Day folders looked at on disk.
+    #[cfg(test)]
+    day_lookups: usize,
+}
+
+impl<'a> Walker<'a> {
+    pub fn new(dir: &'a Path) -> Self {
+        Self {
+            dir,
+            root: dir.canonicalize().ok(),
+            days: HashMap::new(),
+            #[cfg(test)]
+            day_lookups: 0,
+        }
+    }
+
+    /// The canonical folder of `r`'s day, when it is inside the root.
+    fn day(&mut self, r: &Rel) -> Option<&Path> {
+        let root = self.root.as_ref()?;
+        let dir = self.dir;
+        #[cfg(test)]
+        let lookups = &mut self.day_lookups;
+        self.days
+            .entry(r.day_dir())
+            .or_insert_with(|| {
+                #[cfg(test)]
+                {
+                    *lookups += 1;
+                }
+                let day = dir.join(&r.scene).join(&r.camera).join(&r.date);
+                let real = day.canonicalize().ok()?;
+                real.starts_with(root).then_some(real)
+            })
+            .as_deref()
+    }
+
+    /// The file of `r` with extension `ext`: [`resolve`] of an already parsed path.
+    pub fn file(&mut self, r: &Rel, ext: &str) -> Option<PathBuf> {
+        let p = self.day(r)?.join(format!("{}.{ext}", r.stem));
+        let meta = std::fs::symlink_metadata(&p).ok()?;
+        meta.file_type().is_file().then_some(p)
+    }
+
+    /// [`resolve`].
+    pub fn resolve(&mut self, rel: &str, ext: &str) -> Option<PathBuf> {
+        self.file(&parse_rel(rel)?, ext)
+    }
 }
 
 /// A frame the Collect tab shows.
@@ -331,6 +397,17 @@ pub fn day_dirs(dir: &Path) -> Vec<PathBuf> {
 /// [`day_dirs`], and the scene and camera folders it could not list, so a caller that must not
 /// shrink silently can say so.
 pub fn day_dirs_checked(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    days_of(dir, None)
+}
+
+/// [`day_dirs_checked`] of one camera: what filtering its answer by camera folder gives, without
+/// listing the other cameras. The camera folders are listed, never joined from `camera`: a name
+/// from a client reaches no path, and a symlinked camera folder is skipped like any other.
+pub fn camera_day_dirs(dir: &Path, camera: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    days_of(dir, Some(camera))
+}
+
+fn days_of(dir: &Path, only: Option<&str>) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut out = Vec::new();
     let mut unreadable = Vec::new();
     for scene in SCENES {
@@ -338,7 +415,7 @@ pub fn day_dirs_checked(dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
             let cam_ok = cam
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| name_ok(n, MAX_CAMERA_LEN));
+                .is_some_and(|n| name_ok(n, MAX_CAMERA_LEN) && only.is_none_or(|c| c == n));
             if !cam_ok {
                 continue;
             }
@@ -848,5 +925,36 @@ mod tests {
         assert_eq!(rewrite_index(&day).unwrap(), 1);
         assert_eq!(read_index(&day.join(INDEX_FILE)).len(), 1);
         let _ = std::fs::remove_dir_all(&day);
+    }
+
+    #[test]
+    fn a_walker_looks_at_a_day_folder_once() {
+        let dir = tmp("walker-days");
+        let rel = |date: &str, stem: &str| format!("ir/cam/{date}/{stem}.jpg");
+        let day = dir.join("ir/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        for stem in ["a", "b"] {
+            std::fs::write(day.join(format!("{stem}.jpg")), b"x").unwrap();
+        }
+        let mut w = Walker::new(&dir);
+        assert!(w.resolve(&rel("2026-10-22", "a"), "jpg").is_some());
+        assert!(w.resolve(&rel("2026-10-22", "b"), "jpg").is_some());
+        assert!(w.resolve(&rel("2026-10-22", "gone"), "jpg").is_none());
+        assert_eq!(w.day_lookups, 1, "a folder that is there");
+        // A folder that is not there costs one failed look, not one per frame.
+        let mut w = Walker::new(&dir);
+        for i in 0..50 {
+            assert!(
+                w.resolve(&rel("2026-10-23", &format!("f{i}")), "jpg")
+                    .is_none()
+            );
+        }
+        assert_eq!(w.day_lookups, 1, "a folder that is gone");
+        // The threads of a walk share what the root cost; each keeps its own days.
+        let clone = w.clone();
+        assert_eq!(clone.root, w.root);
+        assert!(w.resolve(&rel("2026-10-22", "a"), "jpg").is_some());
+        assert_eq!(w.day_lookups, 2, "another folder");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2066,25 +2066,20 @@ pub(super) async fn dataset_classes(
     .await
 }
 
-/// The answers of [`crate::training::unreviewed_frames`] (it reads every label file): the form
-/// asks on every change, the count moves on the Review tab's pace.
-static UNREVIEWED: std::sync::Mutex<Option<(PathBuf, std::time::Instant, Option<u64>)>> =
-    std::sync::Mutex::new(None);
-const UNREVIEWED_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long the form's preview waits for a first count of the folder under review.
+const UNREVIEWED_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
-fn unreviewed_cached(config: &crate::config::Config) -> Option<u64> {
-    use crate::sync::LockExt;
+/// Frames of the folder under review not reviewed yet, for the pre-flight report: the Train strip's
+/// count ([`super::train_area::tally_of`], kept, walked on its own thread, so the form never waits
+/// for a walk). Its `to_review` is [`crate::training::unreviewed_frames`] but for a frame whose
+/// sidecar does not read: that walk reads no sidecar, so such a frame counts here. None = not known:
+/// no such folder, or nothing counted yet.
+fn unreviewed_now(config: &crate::config::Config) -> Option<u64> {
     let dir = config.collect.resolved_review_dir(&config.data_root());
-    let mut c = UNREVIEWED.lock_recover();
-    if let Some((d, at, n)) = c.as_ref()
-        && *d == dir
-        && at.elapsed() < UNREVIEWED_TTL
-    {
-        return *n;
+    if !dir.is_dir() {
+        return None;
     }
-    let n = crate::training::unreviewed_frames(config);
-    *c = Some((dir, std::time::Instant::now(), n));
-    n
+    super::train_area::tally_of(&dir, UNREVIEWED_WAIT).map(|t| t.to_review)
 }
 
 /// The models the form ticks, a small one when none is yet: the disk estimate needs one.
@@ -2129,7 +2124,7 @@ pub(crate) fn balance_preview_json(
         Some(d) => config.data_path(std::path::Path::new(d)),
         None => TrainPaths::for_config(config).export.models,
     };
-    let unreviewed = unreviewed_cached(config);
+    let unreviewed = unreviewed_now(config);
     let mut needs: Vec<preflight::VolumeNeed> = Vec::new();
     let runs: Vec<serde_json::Value> = data
         .scenes
@@ -3012,6 +3007,33 @@ pub(super) mod tests {
     use crate::backend::detect::{HardwareInfo, apple_gpu};
     use crate::config::Config;
     use crate::model::ModelFamilyKind;
+
+    #[test]
+    fn the_preview_counts_unreviewed_frames_from_the_strips_walk_and_never_walks_itself() {
+        use crate::collect::labels::bulk::test_support::put_frame;
+        use crate::collect::labels::{self, Frame, LabelFile, Status};
+        let root = std::env::temp_dir().join(format!("bop-unrev-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("review");
+        let mut config = Config::default();
+        config.collect.review_dir = Some(dir.clone());
+        // No folder: not known, and no walk was started for it.
+        assert_eq!(unreviewed_now(&config), None);
+        put_frame(&dir, "open", None, vec![]);
+        let done = put_frame(&dir, "done", None, vec![]);
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        labels::write(&Frame::resolve(&dir, &done).unwrap().labels, &reviewed).unwrap();
+        // The first answer may take the walk's own time on a busy machine; it is the same number.
+        let walked = super::super::train_area::tally_of(&dir, std::time::Duration::from_secs(60));
+        assert_eq!(walked.unwrap().to_review, 1);
+        assert_eq!(
+            unreviewed_now(&config),
+            crate::training::unreviewed_frames(&config)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn form(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

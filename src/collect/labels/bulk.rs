@@ -18,6 +18,7 @@
 //! is pending (`POST /v1/review/restore-reopened`). Each frame is re-checked under the label write
 //! lock ([`super::update`]); counts are exact, frame lists capped at [`LISTED`].
 
+use super::super::layout::Walker;
 use super::queue::{self, AutoFilter, Filters, StatusFilter};
 use super::{BoxState, Frame, LabelFile, Source, Status, stacks};
 use serde::Serialize;
@@ -325,16 +326,18 @@ pub fn bulk_reject_unwanted(
         Scope::Unreviewed => reject_other_class(l, wanted),
         Scope::Reviewed => (reject_unwanted_reviewed(l, wanted), 0),
     };
-    let mut eligible = Vec::new();
-    for (rel, path) in super::label_files(dir) {
-        let (n, renamed) = super::read(&path)
-            .ok()
-            .flatten()
-            .map_or((0, 0), |l| count(&l));
-        if n + renamed > 0 {
-            eligible.push((rel, n, renamed));
-        }
-    }
+    let files = super::label_files(dir);
+    let eligible = queue::over_days(&files, &|day| {
+        day.iter()
+            .filter_map(|(rel, path)| {
+                let (n, renamed) = super::read(path)
+                    .ok()
+                    .flatten()
+                    .map_or((0, 0), |l| count(&l));
+                (n + renamed > 0).then(|| (rel.clone(), n, renamed))
+            })
+            .collect()
+    });
     edit_listed(dir, eligible, limit, dry_run, &|_| None, &edit)
 }
 
@@ -352,22 +355,29 @@ pub struct ReviewedUnwanted {
 pub fn reviewed_with_unwanted(dir: &Path, wanted: &Wanted<'_>) -> ReviewedUnwanted {
     let mut out = ReviewedUnwanted::default();
     let mut labels = std::collections::BTreeSet::new();
-    for (_, path) in super::label_files(dir) {
-        let Some(l) = super::read(&path).ok().flatten() else {
-            continue;
-        };
-        if l.status != Status::Reviewed {
-            continue;
-        }
-        let mut any = false;
-        for b in &l.boxes {
-            if unwanted_action(b, wanted, Pick::Training) == Some(None) {
-                any = true;
-                out.boxes += 1;
-                labels.insert(b.label.clone());
-            }
-        }
-        out.frames += usize::from(any);
+    let files = super::label_files(dir);
+    // The unwanted labels of each reviewed frame with some.
+    let frames = queue::over_days(&files, &|day| {
+        day.iter()
+            .filter_map(|(_, path)| {
+                let l = super::read(path).ok().flatten()?;
+                if l.status != Status::Reviewed {
+                    return None;
+                }
+                let found: Vec<String> = l
+                    .boxes
+                    .iter()
+                    .filter(|b| unwanted_action(b, wanted, Pick::Training) == Some(None))
+                    .map(|b| b.label.clone())
+                    .collect();
+                (!found.is_empty()).then_some(found)
+            })
+            .collect()
+    });
+    for found in frames {
+        out.frames += 1;
+        out.boxes += found.len();
+        labels.extend(found);
     }
     out.classes = labels.into_iter().collect();
     out
@@ -401,15 +411,19 @@ pub fn bulk_reject_stacked(
 ) -> StackedOutcome {
     let mut eligible = Vec::new();
     let (mut overlaps_left, mut overlaps_left_reviewed) = (0, 0);
-    for (rel, l) in queue::labelled(dir, filters, keep) {
-        if l.status == Status::Skipped {
-            continue;
-        }
-        if stacks::needs_look_after(&l, wanted) {
+    // The walk only reads; the edits below come after it, on this thread.
+    let looked = queue::labelled_map(dir, filters, keep, &|rel, l| {
+        (l.status != Status::Skipped).then(|| {
+            let needs_look = stacks::needs_look_after(&l, wanted);
+            let n = stacks::count_stacked(&l, wanted);
+            (rel.to_string(), n, needs_look, l.status == Status::Reviewed)
+        })
+    });
+    for (rel, n, needs_look, reviewed) in looked {
+        if needs_look {
             overlaps_left += 1;
-            overlaps_left_reviewed += usize::from(l.status == Status::Reviewed);
+            overlaps_left_reviewed += usize::from(reviewed);
         }
-        let n = stacks::count_stacked(&l, wanted);
         if n > 0 {
             eligible.push((rel, n, 0));
         }
@@ -491,8 +505,9 @@ fn edit_unreviewed(
     f.status = StatusFilter::Is(Status::Unreviewed);
     let built = queue::build(dir, &f);
     let mut eligible = Vec::new();
+    let mut walker = Walker::new(dir);
     for item in built.items.into_iter().filter(|i| keep(&i.frame)) {
-        let (n, renamed) = Frame::resolve(dir, &item.frame)
+        let (n, renamed) = Frame::resolve_in(&mut walker, &item.frame)
             .and_then(|fr| fr.labels().ok().flatten())
             .map_or((0, 0), |l| count(&l));
         if n + renamed > 0 {
@@ -527,9 +542,10 @@ fn edit_listed(
             .collect();
         return out;
     }
+    let mut walker = Walker::new(dir);
     for (rel, _, _) in eligible.into_iter().take(limit) {
         let rel = rel.as_str();
-        let Some(frame) = Frame::resolve(dir, rel) else {
+        let Some(frame) = Frame::resolve_in(&mut walker, rel) else {
             out.failed(rel, "the frame is gone");
             continue;
         };
@@ -694,8 +710,9 @@ pub fn bulk_spot(
         Some(super::prefill(&rec, classes, hidden))
     };
     let mut eligible = Vec::new();
+    let mut walker = Walker::new(dir);
     for item in built.items.into_iter().filter(|i| keep(&i.frame)) {
-        let Some(frame) = Frame::resolve(dir, &item.frame) else {
+        let Some(frame) = Frame::resolve_in(&mut walker, &item.frame) else {
             continue;
         };
         let Ok(rec) = frame.record() else {

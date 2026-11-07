@@ -4,14 +4,19 @@
 //! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
 //! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest. Also the counts the Review tab shows, and
 //! [`labelled`], every label file those filters select whichever queue it is in.
+//!
+//! The walks read a day folder at a time ([`by_day`], [`over_days`], one [`Walker`] per day folder)
+//! on [`parallel::walk_threads`] threads, and merge in a fixed order: the answers do not depend on
+//! the threads. Nothing here writes.
 
-use super::super::layout::{self, REVIEW_QUEUE_FILE};
+use super::super::layout::{self, REVIEW_QUEUE_FILE, Walker};
 use super::super::record::{Bucket, Record};
 use super::bulk::Wanted;
 use super::{BoxState, Frame, LabelFile, Status, Triage};
+use crate::parallel;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 /// Which frames the queue draws from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -478,6 +483,38 @@ pub struct Counts {
 }
 
 impl Counts {
+    /// Add the counts of another part of the walk.
+    fn merge(&mut self, other: Self) {
+        let Self {
+            total,
+            reviewed,
+            skipped,
+            remaining,
+            empty_confirmed,
+            per_class,
+            rejected_boxes,
+            auto_review,
+            auto_accept,
+            repeats_only,
+            audit_accepted,
+            audit_rejected,
+        } = other;
+        self.total += total;
+        self.reviewed += reviewed;
+        self.skipped += skipped;
+        self.remaining += remaining;
+        self.empty_confirmed += empty_confirmed;
+        for (class, n) in per_class {
+            *self.per_class.entry(class).or_default() += n;
+        }
+        self.rejected_boxes += rejected_boxes;
+        self.auto_review += auto_review;
+        self.auto_accept += auto_accept;
+        self.repeats_only += repeats_only;
+        self.audit_accepted += audit_accepted;
+        self.audit_rejected += audit_rejected;
+    }
+
     fn add(&mut self, labels: Option<&LabelFile>) {
         self.total += 1;
         match labels.map(|l| l.status) {
@@ -559,21 +596,42 @@ pub fn candidates(dir: &Path, source: QueueSource) -> Vec<Candidate> {
     out
 }
 
-/// Build the queue of `dir` for `f`. Frames whose image or sidecar is gone (retention) are
-/// left out silently; a sidecar or label file that does not parse counts as `unreadable`.
-pub fn build(dir: &Path, f: &Filters) -> Queue {
-    let mut q = Queue::default();
-    let mut cameras = BTreeSet::new();
-    let mut seen_labels = BTreeSet::new();
-    for c in candidates(dir, f.source) {
-        cameras.insert(c.camera.clone());
-        if f.scene.as_ref().is_some_and(|s| *s != c.scene)
-            || f.camera.as_ref().is_some_and(|s| *s != c.camera)
-            || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
-        {
-            continue;
+/// The day folder of a frame's `rel` (from the path: a review line's own `camera` and `scene` may
+/// say something else).
+fn day_of(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or(rel, |(day, _)| day)
+}
+
+/// `candidates` per day folder, in the order each folder first comes up.
+fn by_day(candidates: Vec<Candidate>) -> Vec<Vec<Candidate>> {
+    let mut at: HashMap<String, usize> = HashMap::new();
+    let mut days: Vec<Vec<Candidate>> = Vec::new();
+    for c in candidates {
+        let i = *at.entry(day_of(&c.rel).to_string()).or_insert_with(|| {
+            days.push(Vec::new());
+            days.len() - 1
+        });
+        if let Some(day) = days.get_mut(i) {
+            day.push(c);
         }
-        let Some(frame) = Frame::resolve(dir, &c.rel) else {
+    }
+    days
+}
+
+/// What one day folder adds to a [`Queue`].
+#[derive(Default)]
+struct DayQueue {
+    items: Vec<Item>,
+    counts: Counts,
+    labels: BTreeSet<String>,
+    unreadable: u64,
+}
+
+/// The candidates of one day folder, read: the part of [`build`] that touches files.
+fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue {
+    let mut q = DayQueue::default();
+    for c in day {
+        let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
             continue;
         };
         let (Ok(rec), Ok(labels)) = (frame.record(), frame.labels()) else {
@@ -582,7 +640,7 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
         };
         let classes = frame_labels(&rec, labels.as_ref());
         let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
-        seen_labels.extend(classes);
+        q.labels.extend(classes);
         if !keep {
             continue;
         }
@@ -602,16 +660,54 @@ pub fn build(dir: &Path, f: &Filters) -> Queue {
             ..Uncertainty::of(&rec).with_labels(labels.as_ref())
         };
         q.items.push(Item {
-            frame: c.rel,
+            frame: c.rel.clone(),
             timestamp: rec.timestamp.clone(),
-            scene: c.scene,
-            camera: c.camera,
+            scene: c.scene.clone(),
+            camera: c.camera.clone(),
             model: rec.model.clone(),
-            buckets: c.buckets,
+            buckets: c.buckets.clone(),
             status,
             queued: c.queued,
             uncertainty,
         });
+    }
+    q
+}
+
+/// Build the queue of `dir` for `f`. Frames whose image or sidecar is gone (retention) are
+/// left out silently; a sidecar or label file that does not parse counts as `unreadable`.
+pub fn build(dir: &Path, f: &Filters) -> Queue {
+    build_on(dir, f, None)
+}
+
+/// [`build`] on `threads` threads (None: as many as a walk of that size takes).
+fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
+    let mut q = Queue::default();
+    let mut cameras = BTreeSet::new();
+    let mut kept = Vec::new();
+    for c in candidates(dir, f.source) {
+        cameras.insert(c.camera.clone());
+        if f.scene.as_ref().is_some_and(|s| *s != c.scene)
+            || f.camera.as_ref().is_some_and(|s| *s != c.camera)
+            || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
+        {
+            continue;
+        }
+        kept.push(c);
+    }
+    let threads = threads.unwrap_or_else(|| parallel::walk_threads_over(kept.len()));
+    let days = by_day(kept);
+    let walker = Walker::new(dir);
+    let parts = parallel::map_all(days.len(), threads, &|i| {
+        let day = days.get(i).map_or(&[][..], Vec::as_slice);
+        build_day(walker.clone(), day, f)
+    });
+    let mut seen_labels = BTreeSet::new();
+    for part in parts {
+        q.items.extend(part.items);
+        q.counts.merge(part.counts);
+        seen_labels.extend(part.labels);
+        q.unreadable += part.unreadable;
     }
     sort_items(&mut q.items);
     q.cameras = cameras.into_iter().collect();
@@ -652,7 +748,50 @@ pub struct Tally {
     pub unreadable: u64,
 }
 
+impl ClassCoverage {
+    fn merge(&mut self, other: Self) {
+        let Self {
+            boxes,
+            by_scene,
+            by_camera,
+        } = other;
+        self.boxes += boxes;
+        for (scene, n) in by_scene {
+            *self.by_scene.entry(scene).or_default() += n;
+        }
+        for (camera, n) in by_camera {
+            *self.by_camera.entry(camera).or_default() += n;
+        }
+    }
+}
+
 impl Tally {
+    /// Add the counts of another part of the walk.
+    fn merge(&mut self, other: Self) {
+        let Self {
+            frames,
+            reviewed,
+            skipped,
+            to_review,
+            queued_to_review,
+            pending_boxes,
+            never_auto_labelled,
+            coverage,
+            unreadable,
+        } = other;
+        self.frames += frames;
+        self.reviewed += reviewed;
+        self.skipped += skipped;
+        self.to_review += to_review;
+        self.queued_to_review += queued_to_review;
+        self.pending_boxes += pending_boxes;
+        self.never_auto_labelled += never_auto_labelled;
+        for (class, row) in coverage {
+            self.coverage.entry(class).or_default().merge(row);
+        }
+        self.unreadable += unreadable;
+    }
+
     fn add(&mut self, c: &Candidate, labels: Option<&LabelFile>) {
         self.frames += 1;
         match labels.map(|l| l.status) {
@@ -686,56 +825,132 @@ impl Tally {
 /// file per frame; a caller on a request path keeps the answer ([`crate::server`]'s Train area
 /// does).
 pub fn tally(dir: &Path) -> Tally {
-    let mut t = Tally::default();
-    for c in candidates(dir, QueueSource::All) {
-        let Some(frame) = Frame::resolve(dir, &c.rel) else {
-            continue;
-        };
-        match frame.labels() {
-            Ok(labels) => t.add(&c, labels.as_ref()),
-            Err(_) => t.unreadable += 1,
+    tally_on(dir, None)
+}
+
+/// [`tally`] on `threads` threads (None: as many as a walk of that size takes).
+fn tally_on(dir: &Path, threads: Option<usize>) -> Tally {
+    let all = candidates(dir, QueueSource::All);
+    let threads = threads.unwrap_or_else(|| parallel::walk_threads_over(all.len()));
+    let days = by_day(all);
+    let walker = Walker::new(dir);
+    let parts = parallel::map_all(days.len(), threads, &|i| {
+        let mut walker = walker.clone();
+        let mut t = Tally::default();
+        for c in days.get(i).map_or(&[][..], Vec::as_slice) {
+            let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
+                continue;
+            };
+            match frame.labels() {
+                Ok(labels) => t.add(c, labels.as_ref()),
+                Err(_) => t.unreadable += 1,
+            }
         }
+        t
+    });
+    let mut t = Tally::default();
+    for part in parts {
+        t.merge(part);
     }
     t
 }
 
+/// A label file with its frame, as [`super::label_files`] lists it.
+type Listed = (String, PathBuf);
+
+/// `each` on the runs of one day folder in `files` (a list in [`super::label_files`]'s order), on
+/// the threads a walk of that size takes; the results in `files`' order. For read walks only: label
+/// writes stay on one thread.
+pub(super) fn over_days<T: Send>(
+    files: &[Listed],
+    each: &(dyn Fn(&[Listed]) -> Vec<T> + Sync),
+) -> Vec<T> {
+    over_days_on(files, parallel::walk_threads_over(files.len()), each)
+}
+
+fn over_days_on<T: Send>(
+    files: &[Listed],
+    threads: usize,
+    each: &(dyn Fn(&[Listed]) -> Vec<T> + Sync),
+) -> Vec<T> {
+    let days: Vec<&[Listed]> = files
+        .chunk_by(|a, b| day_of(&a.0) == day_of(&b.0))
+        .collect();
+    let parts = parallel::map_all(days.len(), threads, &|i| {
+        days.get(i).map_or_else(Vec::new, |day| each(day))
+    });
+    parts.into_iter().flatten().collect()
+}
+
+/// Whether [`labelled`] goes on to read the file of `rel`: what its name alone says.
+fn name_passes(rel: &str, f: &Filters, keep: &dyn Fn(&str) -> bool) -> bool {
+    layout::parse_rel(rel).is_some_and(|r| {
+        keep(rel)
+            && !f.scene.as_ref().is_some_and(|s| *s != r.scene)
+            && !f.camera.as_ref().is_some_and(|c| *c != r.camera)
+    })
+}
+
+/// The label file at `path` of frame `rel`, when the frame's files and the bucket and class filters
+/// of `f` let it through.
+fn read_passing(walker: &mut Walker<'_>, f: &Filters, rel: &str, path: &Path) -> Option<LabelFile> {
+    let frame = Frame::resolve_in(walker, rel)?;
+    // The buckets a review line or an index line carries: the sidecar's.
+    if let Some(b) = f.bucket
+        && !frame.record().ok()?.buckets.contains(&b)
+    {
+        return None;
+    }
+    let l = super::read(path).ok().flatten()?;
+    if !f.label.is_empty() {
+        let classes = file_labels(&l);
+        if !f.label.iter().any(|c| classes.contains(c)) {
+            return None;
+        }
+    }
+    Some(l)
+}
+
 /// The label files of `dir` ([`super::label_files`], in its order) that the bucket, scene, camera
-/// and class filters of `f` and `keep` select, read one at a time. For edits of already labelled
-/// frames, reviewed ones too: [`build`] only reaches what `f.source` draws from (by default
-/// `review-queue.jsonl`, which a frame reviewed under "all collected" is not in), so `source` is
-/// not used here, nor are `status` and `auto`. A frame whose image, sidecar or label file does not
-/// read is left out.
+/// and class filters of `f` and `keep` select, read one at a time, so a caller may write between
+/// them. For edits of already labelled frames, reviewed ones too: [`build`] only reaches what
+/// `f.source` draws from (by default `review-queue.jsonl`, which a frame reviewed under "all
+/// collected" is not in), so `source` is not used here, nor are `status` and `auto`. A frame whose
+/// image, sidecar or label file does not read is left out.
 pub fn labelled<'a>(
     dir: &'a Path,
     f: &'a Filters,
     keep: &'a dyn Fn(&str) -> bool,
 ) -> impl Iterator<Item = (String, LabelFile)> + 'a {
+    let mut walker = Walker::new(dir);
     super::label_files(dir)
         .into_iter()
         .filter_map(move |(rel, path)| {
-            let r = layout::parse_rel(&rel)?;
-            if !keep(&rel)
-                || f.scene.as_ref().is_some_and(|s| *s != r.scene)
-                || f.camera.as_ref().is_some_and(|c| *c != r.camera)
-            {
+            if !name_passes(&rel, f, keep) {
                 return None;
             }
-            let frame = Frame::resolve(dir, &rel)?;
-            // The buckets a review line or an index line carries: the sidecar's.
-            if let Some(b) = f.bucket
-                && !frame.record().ok()?.buckets.contains(&b)
-            {
-                return None;
-            }
-            let l = super::read(&path).ok().flatten()?;
-            if !f.label.is_empty() {
-                let classes = file_labels(&l);
-                if !f.label.iter().any(|c| classes.contains(c)) {
-                    return None;
-                }
-            }
+            let l = read_passing(&mut walker, f, &rel, &path)?;
             Some((rel, l))
         })
+}
+
+/// What `each` makes of the files [`labelled`] selects, in the same order, on the threads a walk
+/// of that size takes: for a walk that only reads and acts afterwards. `keep` runs on this thread.
+pub fn labelled_map<T: Send>(
+    dir: &Path,
+    f: &Filters,
+    keep: &dyn Fn(&str) -> bool,
+    each: &(dyn Fn(&str, LabelFile) -> Option<T> + Sync),
+) -> Vec<T> {
+    let mut files = super::label_files(dir);
+    files.retain(|(rel, _)| name_passes(rel, f, keep));
+    let walker = Walker::new(dir);
+    over_days(&files, &|day| {
+        let mut walker = walker.clone();
+        day.iter()
+            .filter_map(|(rel, path)| each(rel, read_passing(&mut walker, f, rel, path)?))
+            .collect()
+    })
 }
 
 /// The item after `after` in `items` with its index: the first one when `after` is None or
@@ -1608,5 +1823,322 @@ mod tests {
         assert_eq!(person.by_scene["day"], 2);
         assert_eq!(person.by_camera["gate"], 2);
         assert!(!t.coverage.contains_key("car"), "a pending box is no label");
+    }
+
+    /// [`build`] as one loop over one frame at a time, [`Frame::resolve`] per frame: what the day
+    /// by day walk must keep answering.
+    fn serial_build(dir: &Path, f: &Filters) -> Queue {
+        let mut q = Queue::default();
+        let mut cameras = BTreeSet::new();
+        let mut seen_labels = BTreeSet::new();
+        for c in candidates(dir, f.source) {
+            cameras.insert(c.camera.clone());
+            if f.scene.as_ref().is_some_and(|s| *s != c.scene)
+                || f.camera.as_ref().is_some_and(|s| *s != c.camera)
+                || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
+            {
+                continue;
+            }
+            let Some(frame) = Frame::resolve(dir, &c.rel) else {
+                continue;
+            };
+            let (Ok(rec), Ok(labels)) = (frame.record(), frame.labels()) else {
+                q.unreadable += 1;
+                continue;
+            };
+            let classes = frame_labels(&rec, labels.as_ref());
+            let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
+            seen_labels.extend(classes);
+            if !keep {
+                continue;
+            }
+            q.counts.add(labels.as_ref());
+            let status = labels.as_ref().map_or(Status::Unreviewed, |l| l.status);
+            if let StatusFilter::Is(s) = f.status
+                && s != status
+            {
+                continue;
+            }
+            if !f.auto_keeps(labels.as_ref()) {
+                continue;
+            }
+            let uncertainty = Uncertainty {
+                overlap_strength: f.overlap_strength(labels.as_ref()),
+                agreed_boxes: f.agreed_boxes(labels.as_ref()),
+                ..Uncertainty::of(&rec).with_labels(labels.as_ref())
+            };
+            q.items.push(Item {
+                frame: c.rel,
+                timestamp: rec.timestamp.clone(),
+                scene: c.scene,
+                camera: c.camera,
+                model: rec.model.clone(),
+                buckets: c.buckets,
+                status,
+                queued: c.queued,
+                uncertainty,
+            });
+        }
+        sort_items(&mut q.items);
+        q.cameras = cameras.into_iter().collect();
+        q.labels = seen_labels.into_iter().collect();
+        q
+    }
+
+    /// [`tally`] likewise.
+    fn serial_tally(dir: &Path) -> Tally {
+        let mut t = Tally::default();
+        for c in candidates(dir, QueueSource::All) {
+            let Some(frame) = Frame::resolve(dir, &c.rel) else {
+                continue;
+            };
+            match frame.labels() {
+                Ok(labels) => t.add(&c, labels.as_ref()),
+                Err(_) => t.unreadable += 1,
+            }
+        }
+        t
+    }
+
+    /// A seeded folder of every kind of frame the walks meet: frames with and without a label file
+    /// across scenes, cameras and days, gone frames and a gone day, an unreadable sidecar, an
+    /// unreadable label file, review lines in a shuffled order, lines whose camera or scene differ
+    /// from their path, a line naming a sidecar, indexed frames in and out of the queue.
+    fn mixed_folder(dir: &Path) {
+        use super::super::tests_support::auto_box;
+        use super::super::write;
+        use crate::collect::record::IndexLine;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % n as u64).unwrap()
+        };
+        let classes = ["person", "car", "dog", "truck"];
+        let mut queued: Vec<serde_json::Value> = Vec::new();
+        let line = |rel: &str, scene: &str, camera: &str, buckets: Vec<Bucket>| {
+            serde_json::json!({
+                "version": 1, "frame": rel, "sidecar": rel.replace(".jpg", ".json"), "id": "x",
+                "buckets": buckets, "scene": scene, "camera": camera,
+                "queued_at": "2026-10-21T00:00:00Z",
+            })
+        };
+        let mut index: BTreeMap<PathBuf, String> = BTreeMap::new();
+        for i in 0..120 {
+            let scene = ["day", "night", "ir"][next(3)];
+            let camera = ["gate", "yard", "porch"][next(3)];
+            let date = format!("2026-10-{:02}", 20 + next(4));
+            let stem = format!("20261021T{i:06}000Z_f{i}");
+            let day = dir.join(scene).join(camera).join(&date);
+            std::fs::create_dir_all(&day).unwrap();
+            let rel = format!("{scene}/{camera}/{date}/{stem}.jpg");
+            let bucket = [Bucket::Positive, Bucket::Empty, Bucket::Suppressed][next(3)];
+            let mut r = empty_record();
+            r.id = stem.clone();
+            r.scene = scene.into();
+            r.camera = camera.into();
+            // Ties on purpose: only the frame path orders these.
+            r.timestamp = format!("2026-10-21T00:00:{:02}Z", next(5));
+            r.threshold = 0.5;
+            r.model = format!("m{}", next(2));
+            r.buckets = vec![bucket];
+            let d = Det {
+                label: classes[next(4)].into(),
+                score: 0.5 + next(5) as f32 / 10.0,
+                bbox: [0.0, 0.0, 10.0, 10.0],
+            };
+            if next(5) > 0 {
+                r.predictions = vec![d.clone()];
+                r.raw = vec![d];
+            }
+            std::fs::write(day.join(format!("{stem}.jpg")), b"x").unwrap();
+            std::fs::write(
+                day.join(format!("{stem}.json")),
+                serde_json::to_vec(&r).unwrap(),
+            )
+            .unwrap();
+            let labels = day.join(format!("{stem}{}", super::super::LABELS_SUFFIX));
+            match next(12) {
+                // No label file (a third of the frames).
+                0..=3 => {}
+                4 => {
+                    std::fs::write(&labels, b"{ not json").unwrap();
+                }
+                5 => {
+                    std::fs::write(day.join(format!("{stem}.json")), b"{ not json").unwrap();
+                }
+                6 => {
+                    std::fs::remove_file(day.join(format!("{stem}.jpg"))).unwrap();
+                }
+                7 => {
+                    std::fs::remove_file(day.join(format!("{stem}.json"))).unwrap();
+                }
+                _ => {
+                    let mut b = auto_box(classes[next(4)]);
+                    b.auto.triage = Some(Triage::Review);
+                    b.auto.likely = next(2) == 0;
+                    let mut stacked = b.clone();
+                    stacked.bbox[2] -= 1.0;
+                    if next(3) > 0 {
+                        b.state = BoxState::Accepted;
+                        stacked.state = BoxState::Rejected;
+                    }
+                    let f = LabelFile {
+                        status: [Status::Unreviewed, Status::Reviewed, Status::Skipped][next(3)],
+                        boxes: vec![b, stacked],
+                        ..LabelFile::default()
+                    };
+                    write(&labels, &f).unwrap();
+                }
+            }
+            let il = IndexLine {
+                id: stem.clone(),
+                timestamp: r.timestamp.clone(),
+                scene: scene.into(),
+                camera: camera.into(),
+                model: r.model.clone(),
+                buckets: r.buckets.clone(),
+                labels: vec![],
+                bytes: 1,
+            };
+            let text = index.entry(day.join(layout::INDEX_FILE)).or_default();
+            text.push_str(&serde_json::to_string(&il).unwrap());
+            text.push('\n');
+            if next(2) == 0 {
+                // A review line may disagree with the path it names.
+                let (s, c) = match i % 7 {
+                    0 => ("day", "elsewhere"),
+                    1 => (scene, "elsewhere"),
+                    _ => (scene, camera),
+                };
+                queued.push(line(&rel, s, c, vec![bucket]));
+            }
+        }
+        for (path, text) in index {
+            std::fs::write(path, text).unwrap();
+        }
+        queued.push(line(
+            "ir/gate/2026-01-01/20260101T000000000Z_gone.jpg",
+            "ir",
+            "lost-camera",
+            vec![Bucket::Positive],
+        ));
+        queued.push(line(
+            "ir/gate/2026-10-20/20261021T000001000Z_f1.json",
+            "ir",
+            "sidecar-line",
+            vec![],
+        ));
+        for i in (1..queued.len()).rev() {
+            queued.swap(i, next(i + 1));
+        }
+        let text: String = queued.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(dir.join(REVIEW_QUEUE_FILE), text).unwrap();
+    }
+
+    #[test]
+    fn the_day_by_day_walks_answer_what_one_loop_answers() {
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        mixed_folder(&dir);
+        let all = Filters {
+            source: QueueSource::All,
+            status: StatusFilter::Any,
+            ..Filters::default()
+        };
+        let reference = serial_build(&dir, &all);
+        assert!(reference.items.len() > 30, "{}", reference.items.len());
+        assert!(reference.unreadable > 3, "{}", reference.unreadable);
+        assert!(reference.cameras.iter().any(|c| c == "lost-camera"));
+        assert!(reference.cameras.iter().any(|c| c == "elsewhere"));
+        assert!(reference.counts.per_class.len() > 1);
+        let classes: Vec<String> = ["person", "car"].map(String::from).to_vec();
+        let filters = [
+            Filters::default(),
+            all.clone(),
+            Filters {
+                status: StatusFilter::Is(Status::Reviewed),
+                ..all.clone()
+            },
+            Filters {
+                scene: Some("day".into()),
+                ..all.clone()
+            },
+            Filters {
+                camera: Some("elsewhere".into()),
+                ..all.clone()
+            },
+            Filters {
+                bucket: Some(Bucket::Suppressed),
+                ..all.clone()
+            },
+            Filters {
+                label: BTreeSet::from(["person".to_string(), "dog".to_string()]),
+                ..all.clone()
+            },
+            Filters {
+                auto: Some(AutoFilter::Review),
+                ..all.clone()
+            },
+            Filters {
+                auto: Some(AutoFilter::Overlaps),
+                wanted: Some((classes, Vec::new())),
+                ..all.clone()
+            },
+        ];
+        for f in &filters {
+            let want = serial_build(&dir, f);
+            let bytes = serde_json::to_vec(&want).unwrap();
+            for threads in [1, 2, 4, 8] {
+                let got = build_on(&dir, f, Some(threads));
+                assert_eq!(got, want, "{threads} threads, {f:?}");
+                assert_eq!(serde_json::to_vec(&got).unwrap(), bytes);
+            }
+            assert_eq!(build(&dir, f), want, "{f:?}");
+        }
+        let want = serial_tally(&dir);
+        assert!(want.unreadable > 0 && want.frames > 30, "{want:?}");
+        assert!(!want.coverage.is_empty());
+        for threads in [1, 2, 4, 8] {
+            assert_eq!(tally_on(&dir, Some(threads)), want, "{threads} threads");
+        }
+        assert_eq!(tally(&dir), want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_labelled_map_lists_what_labelled_lists_in_its_order() {
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        mixed_folder(&dir);
+        let drop_some = |rel: &str| !rel.contains("_f1");
+        for f in [
+            Filters::default(),
+            Filters {
+                scene: Some("night".into()),
+                ..Filters::default()
+            },
+            Filters {
+                bucket: Some(Bucket::Positive),
+                ..Filters::default()
+            },
+            Filters {
+                label: BTreeSet::from(["car".to_string()]),
+                ..Filters::default()
+            },
+        ] {
+            let want: Vec<(String, LabelFile)> = labelled(&dir, &f, &drop_some).collect();
+            let got = labelled_map(&dir, &f, &drop_some, &|rel, l| Some((rel.to_string(), l)));
+            assert_eq!(got, want, "{f:?}");
+        }
+        assert!(labelled(&dir, &Filters::default(), &drop_some).count() > 10);
+        let files = super::super::label_files(&dir);
+        let names = |day: &[(String, PathBuf)]| -> Vec<String> {
+            day.iter().map(|(rel, _)| rel.clone()).collect()
+        };
+        let want: Vec<String> = files.iter().map(|(rel, _)| rel.clone()).collect();
+        for threads in [1, 3, 8] {
+            assert_eq!(over_days_on(&files, threads, &names), want);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2399,17 +2399,45 @@
     });
   }
 
+  // The walk of /v1/review/next running ({countsOnly, stale: answer ignored, noLanding: counts
+  // only, done: promise}), and the newest intent waiting for it (R.nextPlan decides).
+  var nextRun = null, nextWaiting = null;
+
+  // A real Next is on its way: another press would only repeat the same walk.
+  function nextComing() {
+    return !!((nextRun && !nextRun.countsOnly) || (nextWaiting && !nextWaiting.countsOnly));
+  }
+
   // The next frame after `after` (the first without), `note` said first; `countsOnly` refreshes
-  // the counts and lists and keeps the frame on screen (and its edits).
+  // the counts and lists and keeps the frame on screen (and its edits). At most one walk at a time
+  // for a real Next; the promise ends once what this call asked for, or what replaced it, is done.
   function loadNext(after, note, countsOnly) {
+    var want = { after: after, note: note, countsOnly: !!countsOnly };
+    var kind = function (w) { return w ? (w.countsOnly ? 'counts' : 'real') : null; };
+    var plan = R.nextPlan(kind(nextRun), kind(nextWaiting), kind(want));
+    if (plan === 'drop') return nextRun.done;
+    if (plan === 'queue') {
+      if (!want.countsOnly) nextRun.noLanding = true;
+      nextWaiting = want;
+      return nextRun.done;
+    }
+    if (plan === 'jump') { nextRun.stale = true; nextWaiting = null; }
+    return runNext(want);
+  }
+
+  function runNext(want) {
+    var run = { countsOnly: want.countsOnly, stale: false, noLanding: false, done: null };
+    var after = want.after, note = want.note, countsOnly = want.countsOnly;
+    nextRun = run;
     var p = filterParams();
     if (after) p.set('after', after);
-    return api('/v1/review/next?' + p.toString()).then(function (j) {
+    run.done = api('/v1/review/next?' + p.toString()).then(function (j) {
+      if (run.stale) return;
       showCounts(j);
       fillCameras(j.cameras);
       fillLabels(j.labels);
       noteMissing(j.folder_missing ? j.message : '');
-      if (countsOnly) return;
+      if (countsOnly || run.noLanding) return;
       upcoming = Array.isArray(j.upcoming) ? j.upcoming : [];
       var text = note || '';
       if (j.wrapped) text = (text ? text + ' ' : '') + 'Back to the first frame of the queue.';
@@ -2421,7 +2449,16 @@
         return;
       }
       return loadFrame(j.item.frame);
-    }).catch(function (e) { say(e.message, true); });
+    }).catch(function (e) {
+      if (!run.stale) say(e.message, true);
+    }).then(function () {
+      if (nextRun !== run) return;
+      var w = nextWaiting;
+      nextRun = null;
+      nextWaiting = null;
+      if (w) return runNext(w);
+    });
+    return run.done;
   }
 
   // After a job or a bulk accept: a frame with unsaved edits stays, else the queue reloads.
@@ -2529,6 +2566,7 @@
 
   // `n`: the next frame without saving; after Back, the frame Back left.
   function skipToNext() {
+    if (nextComing()) return;
     if (!cur) return loadNext();
     if (!leaveOk()) return;
     if (fwdStack.length) {
@@ -2821,7 +2859,11 @@
     if (document.querySelector('dialog[open]')) return;
     // Letters are case-blind (Caps Lock); Shift is read from shiftKey.
     var k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
-    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY' || t.tagName === 'INPUT') && (k === 'Enter' || k === ' ')) return;
+    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY' || t.tagName === 'INPUT') && (k === 'Enter' || k === ' ')) {
+      // Held on a button, Enter clicks it again per repeat, and a second Save is "save anyway".
+      if (ev.repeat && t.tagName === 'BUTTON') ev.preventDefault();
+      return;
+    }
     // A letter on a box's class select is a shortcut, never "jump to the class starting with it";
     // the frame takes the focus back.
     if (t && t.tagName === 'SELECT') {
@@ -2871,10 +2913,12 @@
     } else if (k === 'r') {
       if (ev.shiftKey) rejectRest(); else rejectSelected();
     }
-    else if (k === 'n') skipToNext();
+    // Held keys: `n` and `s` once per press (each costs a walk of the folder, and a second `s` is
+    // what passes the save's "are you sure" steps); the arrows above keep repeating.
+    else if (k === 'n') { if (!ev.repeat) skipToNext(); }
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();
-    else if (k === 's' || k === 'Enter') save('reviewed');
+    else if (k === 's' || k === 'Enter') { if (!ev.repeat) save('reviewed'); }
     else if (k === 'j') select(stepShown(1), true);
     else if (k === 'k') select(stepShown(-1), true);
     else if (k === 'Delete' || k === 'Backspace') {

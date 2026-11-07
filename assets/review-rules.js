@@ -213,6 +213,22 @@
     if (labels.empty_confirmed) labels.empty_confirmed = false;
   }
 
+  // What a new call of the page's `loadNext` does while `running` ('real', 'counts' or null) and
+  // `waiting` (the same, or null) stand; `want` is 'real' or 'counts'. GET /v1/review/next walks the
+  // whole folder, seconds on a big one, so at most one real walk runs and the newest intent wins:
+  // 'start'  nothing runs: go;
+  // 'jump'   only a counts refresh runs: a real Next must not wait for it, and its answer, which
+  //          carries newer counts, replaces that refresh and any waiting one;
+  // 'queue'  take the one waiting place, after the running walk; a real intent also stops a real
+  //          walk from landing (a filter changed, or a save must move on from its own frame);
+  // 'drop'   a real Next already waits, and its answer will carry the counts.
+  // A refresh never cancels a real Next: it only ever waits, or is dropped for one.
+  function nextPlan(running, waiting, want) {
+    if (!running) return 'start';
+    if (want === 'real') return running === 'counts' ? 'jump' : 'queue';
+    return waiting === 'real' ? 'drop' : 'queue';
+  }
+
   globalThis.ReviewRules = {
     STACK_IOU: STACK_IOU,
     OVERLAP_IOU: OVERLAP_IOU,
@@ -232,6 +248,7 @@
     liveSuggestions: liveSuggestions,
     markRejected: markRejected,
     markDuplicate: markDuplicate,
-    acceptOverlap: acceptOverlap
+    acceptOverlap: acceptOverlap,
+    nextPlan: nextPlan
   };
 }());
