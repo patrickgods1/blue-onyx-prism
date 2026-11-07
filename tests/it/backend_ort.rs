@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-mod common;
+use crate::common;
 
 /// The ONNX Runtime library (a hard failure when none is installed).
 fn ort_lib() -> PathBuf {

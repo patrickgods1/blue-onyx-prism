@@ -16,6 +16,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,94 +25,91 @@ use std::time::{Duration, Instant};
 const CSS: &str = "text/css; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
 
-/// Files served under `/static/<name>`: name, Content-Type, body. Every page script lives here
-/// (the CSP allows `script-src 'self'` only: no inline scripts, handlers or style attributes);
-/// pages pass server values through `data-*` attributes.
+/// The text of `assets/<file>` in a release build. A debug build embeds nothing: `include_str!`
+/// alone makes cargo recompile the crate when the file changes, however the body is used, so the
+/// embedded copy has to go for a page edit to need no rebuild ([`static_body`] reads the file).
+#[cfg(not(debug_assertions))]
+macro_rules! embedded {
+    ($file:literal) => {
+        include_str!(concat!("../../assets/", $file))
+    };
+}
+
+#[cfg(debug_assertions)]
+macro_rules! embedded {
+    ($file:literal) => {
+        ""
+    };
+}
+
+macro_rules! asset {
+    ($file:literal, $content_type:expr) => {
+        ($file, $content_type, embedded!($file))
+    };
+}
+
+/// Files served under `/static/<name>`: name, Content-Type, embedded body (empty in a debug
+/// build, use [`static_body`]). Every page script lives here (the CSP allows `script-src 'self'`
+/// only: no inline scripts, handlers or style attributes); pages pass server values through
+/// `data-*` attributes.
 pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
-    ("style.css", CSS, include_str!("../../assets/style.css")),
-    ("live.js", JS, include_str!("../../assets/live.js")),
-    (
-        "bench-glossary.js",
-        JS,
-        include_str!("../../assets/bench-glossary.js"),
-    ),
-    (
-        "bench-table.js",
-        JS,
-        include_str!("../../assets/bench-table.js"),
-    ),
-    (
-        "bench-charts.js",
-        JS,
-        include_str!("../../assets/bench-charts.js"),
-    ),
-    (
-        "bench-compare.js",
-        JS,
-        include_str!("../../assets/bench-compare.js"),
-    ),
-    (
-        "bench-lineup.js",
-        JS,
-        include_str!("../../assets/bench-lineup.js"),
-    ),
-    (
-        "bench-profiles.js",
-        JS,
-        include_str!("../../assets/bench-profiles.js"),
-    ),
-    (
-        "benchmark.js",
-        JS,
-        include_str!("../../assets/benchmark.js"),
-    ),
-    ("config.js", JS, include_str!("../../assets/config.js")),
-    ("logs.js", JS, include_str!("../../assets/logs.js")),
-    ("stats.js", JS, include_str!("../../assets/stats.js")),
-    ("test.js", JS, include_str!("../../assets/test.js")),
-    ("training.js", JS, include_str!("../../assets/training.js")),
-    (
-        "train-area.js",
-        JS,
-        include_str!("../../assets/train-area.js"),
-    ),
-    (
-        "train-dataset.js",
-        JS,
-        include_str!("../../assets/train-dataset.js"),
-    ),
-    (
-        "train-metrics.js",
-        JS,
-        include_str!("../../assets/train-metrics.js"),
-    ),
-    ("browse.js", JS, include_str!("../../assets/browse.js")),
-    (
-        "class-picker.js",
-        JS,
-        include_str!("../../assets/class-picker.js"),
-    ),
-    (
-        "model-picker.js",
-        JS,
-        include_str!("../../assets/model-picker.js"),
-    ),
-    (
-        "review-rules.js",
-        JS,
-        include_str!("../../assets/review-rules.js"),
-    ),
-    ("review.js", JS, include_str!("../../assets/review.js")),
-    ("welcome.js", JS, include_str!("../../assets/welcome.js")),
+    asset!("style.css", CSS),
+    asset!("live.js", JS),
+    asset!("bench-glossary.js", JS),
+    asset!("bench-table.js", JS),
+    asset!("bench-charts.js", JS),
+    asset!("bench-compare.js", JS),
+    asset!("bench-lineup.js", JS),
+    asset!("bench-profiles.js", JS),
+    asset!("benchmark.js", JS),
+    asset!("config.js", JS),
+    asset!("logs.js", JS),
+    asset!("stats.js", JS),
+    asset!("test.js", JS),
+    asset!("training.js", JS),
+    asset!("train-area.js", JS),
+    asset!("train-dataset.js", JS),
+    asset!("train-metrics.js", JS),
+    asset!("browse.js", JS),
+    asset!("class-picker.js", JS),
+    asset!("model-picker.js", JS),
+    asset!("review-rules.js", JS),
+    asset!("review.js", JS),
+    asset!("welcome.js", JS),
 ];
+
+/// `Cache-Control` of a static file. A debug build must show an edit on the next reload.
+const STATIC_CACHE: &str = if cfg!(debug_assertions) {
+    "no-cache"
+} else {
+    "public, max-age=3600"
+};
+
+/// The body of the static file `name`: the embedded copy.
+#[cfg(not(debug_assertions))]
+fn static_body(_name: &str, embedded: &'static str) -> std::io::Result<Cow<'static, str>> {
+    Ok(Cow::Borrowed(embedded))
+}
+
+/// The body of the static file `name`, read from the source tree on every request, so a JS or CSS
+/// edit needs a reload and no rebuild. There is no embedded copy to fall back on ([`embedded`]): a
+/// debug binary moved off its source tree fails here, and says so.
+#[cfg(debug_assertions)]
+fn static_body(name: &str, _embedded: &'static str) -> std::io::Result<Cow<'static, str>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(name);
+    std::fs::read_to_string(&path)
+        .map(Cow::Owned)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
 
 /// Body of the static file `name` (`"benchmark.js"`), for tests that check page code.
 #[cfg(test)]
 pub(super) fn static_file(name: &str) -> Option<&'static str> {
-    STATIC_FILES
-        .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, _, body)| *body)
+    let (_, _, embedded) = STATIC_FILES.iter().find(|(n, _, _)| *n == name)?;
+    let body = static_body(name, embedded).ok()?;
+    Some(Box::leak(body.into_owned().into_boxed_str()))
 }
 
 static FAVICON_ICO: &[u8] = include_bytes!("../../assets/favicon.ico");
@@ -464,6 +462,7 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
             })
         })
         .collect();
+    let process = crate::metrics::ProcessStats::read();
     Json(serde_json::json!({
         "version": crate::VERSION,
         "uptimeSecs": state.metrics.uptime().as_secs(),
@@ -472,6 +471,9 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
         "models": models,
         "rejectedOverloaded": state.metrics.rejected_overloaded.load(Ordering::Relaxed),
         "inflightRequests": state.metrics.inflight(),
+        // null where the platform has no cheap source; the footprint is macOS only.
+        "residentMemoryBytes": process.resident_memory_bytes,
+        "memoryFootprintBytes": process.memory_footprint_bytes,
     }))
 }
 
@@ -745,20 +747,33 @@ pub(super) async fn logs_json(
 
 /// One entry of [`STATIC_FILES`]; 404 (JSON, like the router's fallback) for any other name.
 fn serve_static(name: &str) -> Response {
-    match STATIC_FILES.iter().find(|(n, _, _)| *n == name) {
-        Some((_, content_type, body)) => (
-            [
-                (header::CONTENT_TYPE, *content_type),
-                (header::CACHE_CONTROL, "public, max-age=3600"),
-            ],
-            *body,
-        )
-            .into_response(),
-        None => (
+    let Some((_, content_type, embedded)) = STATIC_FILES.iter().find(|(n, _, _)| *n == name) else {
+        return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "success": false,
                 "error": format!("Not found: /static/{name}"),
+            })),
+        )
+            .into_response();
+    };
+    match static_body(name, embedded) {
+        Ok(body) => (
+            [
+                (header::CONTENT_TYPE, *content_type),
+                (header::CACHE_CONTROL, STATIC_CACHE),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "A debug build reads its pages from the source tree and could not read one \
+                     ({e}). Run it where it was built, or use a release build."
+                ),
             })),
         )
             .into_response(),
@@ -864,6 +879,11 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["models"][0]["name"], "ipcam-general");
         assert_eq!(v["models"][0]["default"], true);
+        assert!(v["residentMemoryBytes"].as_u64().is_some_and(|b| b > 0));
+        assert_eq!(
+            v["memoryFootprintBytes"].as_u64().is_some(),
+            cfg!(target_os = "macos")
+        );
         assert_eq!(v["models"][0]["stateClass"], "fail");
         assert_eq!(v["models"][0]["stateShort"], "Failed:");
         assert!(
@@ -915,6 +935,25 @@ mod tests {
         assert!(cfg.contains("name=\"image_settings\""));
     }
 
+    #[test]
+    fn a_debug_build_embeds_no_page_so_a_page_edit_needs_no_rebuild() {
+        for (name, _, embedded) in STATIC_FILES {
+            assert_eq!(embedded.is_empty(), cfg!(debug_assertions), "{name}");
+        }
+        assert_eq!(
+            STATIC_CACHE == "no-cache",
+            cfg!(debug_assertions),
+            "a debug build must show an edit on the next reload"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_debug_build_names_the_page_it_cannot_read() {
+        let e = static_body("no-such-page.js", "").unwrap_err().to_string();
+        assert!(e.contains("no-such-page.js"), "{e}");
+    }
+
     #[tokio::test]
     async fn static_assets() {
         let state = test_state();
@@ -949,7 +988,9 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
 
         // Every page script and the stylesheet, with its Content-Type and cache policy.
-        for (name, content_type, body) in STATIC_FILES {
+        for (name, content_type, _) in STATIC_FILES {
+            let body = static_file(name).unwrap();
+            assert!(!body.is_empty(), "{name}");
             let (s, h, b) = call(
                 &state,
                 Request::get(format!("/static/{name}"))
@@ -959,7 +1000,7 @@ mod tests {
             .await;
             assert_eq!(s, StatusCode::OK, "{name}");
             assert_eq!(h[header::CONTENT_TYPE], *content_type, "{name}");
-            assert_eq!(h[header::CACHE_CONTROL], "public, max-age=3600", "{name}");
+            assert_eq!(h[header::CACHE_CONTROL], STATIC_CACHE, "{name}");
             assert_eq!(b, body.as_bytes(), "{name}");
             if name.ends_with(".js") {
                 assert!(content_type.starts_with("text/javascript"), "{name}");

@@ -1327,7 +1327,10 @@ mod tests {
 
     #[test]
     fn the_test_page_script_sends_the_no_collect_header() {
-        let script = include_str!("../../assets/test.js");
+        // Read at run time: `include_str!` would rebuild this test binary on a page edit.
+        let script =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test.js"))
+                .unwrap();
         assert!(
             script.contains(&format!("\"{NO_COLLECT_HEADER}\": \"1\"")),
             "assets/test.js must send {NO_COLLECT_HEADER}"

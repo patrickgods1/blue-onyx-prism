@@ -10,7 +10,7 @@
 //! about the spot ([`super::repeats`]).
 //!
 //! Twin of the Review tab's `dupGroups`, `rank` and `dupDrops` (`assets/review-rules.js`): keep the
-//! thresholds, the keeper rank and the tie break in step (`tests/js_rules.rs` runs both on generated
+//! thresholds, the keeper rank and the tie break in step (`tests/it/js_rules.rs` runs both on generated
 //! frames). Three differences: a box of no listed class that is not rejected counts as unwanted
 //! here, while the page keeps it (it shows such a box: a save refuses it until it is relabelled); an
 //! alias of a hidden class is unwanted here, while the page, which knows no aliases, keeps it; and

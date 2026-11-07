@@ -1,6 +1,6 @@
 // Review tab rules (/train/review; loaded before review.js): what decides which boxes stay, which
 // go as duplicates and which suggestions stand, so what reaches the exports. Pure: no page, no
-// browser API, no state of its own; everything comes in as an argument. `tests/js_rules.rs` runs
+// browser API, no state of its own; everything comes in as an argument. `tests/it/js_rules.rs` runs
 // this file in Node against its Rust twins (labels/stacks.rs, labels/overlaps.rs, labels/repeats.rs,
 // labels::resolve_pending), so a change here needs the same change there.
 (function () {

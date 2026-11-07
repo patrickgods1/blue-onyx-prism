@@ -77,6 +77,11 @@ That is GitHub's, not this repository's: `gh run rerun <id> --failed` is the rig
 case only**. A job with a failed step is a real failure until shown otherwise. Do not rerun it to
 see whether it goes away: read the step's log, reproduce it, and fix the cause.
 
+`The hosted runner lost communication with the server` is a different case: the annotation says a
+workflow can cause it by killing or starving the runner, so it is not GitHub's until shown otherwise.
+It leaves no step log, so look at what the step could do to the machine first (RR-T11 in
+`docs/PRODUCTION_REVIEW.md`).
+
 A step that reports it timed out hit its `timeout-minutes` in `ci.yml`, at least twice that
 step's slowest green run. Treat it as a hang: the `has been running for over 60 seconds` lines of
 the log name the test.

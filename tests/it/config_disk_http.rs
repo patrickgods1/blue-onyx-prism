@@ -10,7 +10,7 @@
 //! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
 //! `common::test_root()`. Run with `cargo test --test config_disk_http -- --ignored --nocapture`.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
 use blue_onyx_prism::config_store::{DISK_POLL, SETTLE};

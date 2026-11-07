@@ -9,7 +9,7 @@
 //! `#[ignore]`d: needs `models/IPcam-general.{onnx,yaml}` and `openvino/` under
 //! `common::test_root()` (a missing one fails the test).
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
 use blue_onyx_prism::model::ModelFamilyKind;

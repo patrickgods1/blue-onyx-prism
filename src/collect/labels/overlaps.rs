@@ -40,7 +40,7 @@
 //! most [`MAX_SUGGESTIONS`], strongest first ([`strength`]).
 //!
 //! Twin of the Review tab's `liveSuggestions` and `acceptOverlap` (`assets/review-rules.js`), which
-//! [`live`] and [`accept`] state as Rust: keep them in step (`tests/js_rules.rs` runs both on
+//! [`live`] and [`accept`] state as Rust: keep them in step (`tests/it/js_rules.rs` runs both on
 //! generated frames). The page cannot call [`super::map_class`],
 //! so `GET /v1/review/labels` names the live suggestions (`overlap_live`) and the page only adds what
 //! changes while the frame is open (a move, a relabel, a rejected box). `overlap_live` names a

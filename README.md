@@ -193,7 +193,7 @@ After installing, open `http://127.0.0.1:32168/`. The installers are not code-si
   a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule; local subnet
   on Domain and Private networks only, so Blue Iris on another subnet or a PC on a Public network needs
   the manual rule in [packaging/windows/README.md](packaging/windows/README.md)), and a
-  Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn`. Uninstall from
+  Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn /norestart`. Uninstall from
   *Settings > Apps*; it keeps `C:\ProgramData\BlueOnyxPrism` ([what uninstalling keeps](#uninstalling-keeps-your-data)).
   Upgrading to a newer MSI keeps it too. If you installed the service earlier with `scripts\install_service.ps1`,
   run `scripts\uninstall_service.ps1` first; the MSI refuses to install over it. The console
@@ -788,7 +788,8 @@ the most uploads allowed in progress, `body_timeout`: an upload took over 10 s t
 - `blue_onyx_prism_build_info{version,git_sha,build_date}`: always 1; the labels identify the binary (the older `info{version}` series stays).
 - `blue_onyx_prism_download_bytes_total`: bytes downloaded by the resource manager (runtimes, models, datasets).
 - `blue_onyx_prism_download_failures_total`: downloads that failed (network, size or SHA-256 mismatch).
-- `blue_onyx_prism_process_resident_memory_bytes`: resident memory of the process (omitted where the platform has no cheap source).
+- `blue_onyx_prism_process_resident_memory_bytes`: resident memory of the process (the working set on Windows; also `residentMemoryBytes` in `/stats.json`).
+- `blue_onyx_prism_process_memory_footprint_bytes`: macOS only, the process's physical footprint, which also counts compressed and GPU-backed memory the resident size misses (also `memoryFootprintBytes` in `/stats.json`).
 - `blue_onyx_prism_process_open_fds`: open file descriptors (Linux only).
 - `blue_onyx_prism_dataset_requests_total`, `blue_onyx_prism_dataset_offered_total`, `blue_onyx_prism_dataset_saved_total`, `blue_onyx_prism_dataset_no_bucket_total`, `blue_onyx_prism_dataset_frames_total{bucket}`, `blue_onyx_prism_dataset_dropped_total{reason="queue_full|rate|dup|disk|error"}`, `blue_onyx_prism_dataset_bytes` and `blue_onyx_prism_dataset_collect_disabled`: the dataset collector (`collect`).
 

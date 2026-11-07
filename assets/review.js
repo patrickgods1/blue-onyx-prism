@@ -41,7 +41,7 @@
   var hiddenClasses = [];  // collect.hidden_classes: not offered by the pickers and shortcuts
   var catalog = null;      // GET /v1/review/class-catalog
   var shownLabels = [];    // "Show boxes of": empty = every box
-  // The pure rules (review-rules.js, tested against their Rust twins by tests/js_rules.rs).
+  // The pure rules (review-rules.js, tested against their Rust twins by tests/it/js_rules.rs).
   var R = window.ReviewRules;
   var resolved = R.resolved, isDismissal = R.isDismissal, endDismissal = R.endDismissal;
   var iou = R.iou, sameObject = R.sameObject;

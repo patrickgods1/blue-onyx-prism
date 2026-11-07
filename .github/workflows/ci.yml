@@ -16,7 +16,7 @@ env:
   # A test that would skip for a missing Python or numpy fails instead (progress::test_python):
   # green must not mean "nothing ran". Local runs still skip.
   BOP_REQUIRE_PYTHON: "1"
-  # The same for `node` (tests/js_rules.rs); the hosted images have it.
+  # The same for `node` (tests/it/js_rules.rs); the hosted images have it.
   BOP_REQUIRE_NODE: "1"
 
 jobs:

@@ -11,7 +11,7 @@
 //! `rt-detrv2-s` is backed by a second copy of IPcam-general (the switching logic is the same,
 //! only the COCO label check is skipped).
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::api::VisionDetectionResponse;
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};

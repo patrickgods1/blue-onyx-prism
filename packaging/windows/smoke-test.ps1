@@ -56,9 +56,19 @@ function Fail([string]$Message, [string[]]$Logs = @()) {
     exit 1
 }
 
+# Every call passes /norestart: without it a silent msiexec that finds a file in use may restart the
+# machine on its own, which ends the job with no log.
 function Run-Msiexec([string[]]$MsiArgs) {
     $p = Start-Process -FilePath msiexec.exe -ArgumentList $MsiArgs -Wait -PassThru
     return $p.ExitCode
+}
+
+# 3010 is success with a restart held back: a file was in use. Say so, with the log.
+function Note-RebootWanted([int]$Code, [string]$Log) {
+    if ($Code -eq 3010) {
+        Write-Host "msiexec exited with 3010: it wanted a restart, so a file was in use."
+        Show-LogTail $Log
+    }
 }
 
 $ProgDir = Join-Path ${env:ProgramFiles} "Blue Onyx Prism"
@@ -173,8 +183,9 @@ function Assert-TokenFolderProtected([string]$Log) {
 
 function Install-AndCheck([string]$Log) {
     Write-Host "Installing $Msi ..."
-    $rc = Run-Msiexec @("/i", "`"$Msi`"", "/qn", "/l*v", "`"$Log`"", "PORT=$Port")
+    $rc = Run-Msiexec @("/i", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"", "PORT=$Port")
     if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /i exited with $rc" @($Log) }
+    Note-RebootWanted $rc $Log
 
     $svc = Get-CimInstance Win32_Service -Filter "Name='$Service'"
     if (-not $svc) { Fail "service $Service does not exist after install" @($Log) }
@@ -259,8 +270,9 @@ function Assert-DataKept([string]$Log) {
 # $Properties: what is passed to msiexec. Only REMOVEDATA=1 may delete the data folder.
 function Uninstall-AndCheck([string]$Log, [string[]]$Properties = @()) {
     Write-Host "Uninstalling ($($Properties -join ' ')) ..."
-    $rc = Run-Msiexec (@("/x", "`"$Msi`"", "/qn", "/l*v", "`"$Log`"") + $Properties)
+    $rc = Run-Msiexec (@("/x", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"") + $Properties)
     if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /x exited with $rc" @($Log) }
+    Note-RebootWanted $rc $Log
 
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Service $Service -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
