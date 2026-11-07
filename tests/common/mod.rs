@@ -1,4 +1,4 @@
-//! Helpers shared by the integration tests (`mod common;` in each test binary).
+//! Helpers shared by the integration tests (`tests/it/main.rs` and `tests/pipeline.rs`).
 //!
 //! Fixture-dependent tests (real models + the OpenVINO / ONNX Runtime libraries) are
 //! `#[ignore]`d so a plain `cargo test` stays hermetic; run them with
@@ -11,7 +11,7 @@
 //!   - `<root>/openvino/` (the OpenVINO runtime, `cargo run -- setup-openvino`)
 //!   - `<root>/onnxruntime/` (`cargo run -- setup-onnxruntime`: flat with `--dir`, else flavor subdir + `active.txt`)
 //!
-//! Cargo compiles this module once per test binary, so not every helper is used everywhere.
+//! Cargo compiles this module once per test binary, so not every helper is used in each.
 #![allow(dead_code)]
 
 use blue_onyx_prism::api::VisionDetectionResponse;
@@ -183,7 +183,8 @@ pub fn cache_dir(tag: &str) -> String {
         .into_owned()
 }
 
-/// The global subscriber can be installed once per test binary; every server shares the handle.
+/// The global subscriber can be installed once per test binary; every server shares the handle
+/// (`tests/pipeline.rs` needs its own subscriber, so it is a binary of its own).
 pub fn log_handle() -> LogReloadHandle {
     static LOG: OnceLock<LogReloadHandle> = OnceLock::new();
     LOG.get_or_init(|| cli::init_logging(LogLevel::Warn, None).expect("init logging"))

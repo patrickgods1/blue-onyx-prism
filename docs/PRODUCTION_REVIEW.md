@@ -3838,3 +3838,70 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-T8 | tests | open: the pause test failed once with "no output after resume" and did not recur in 72 runs; a mutant in the shared tree may explain it, not proven. It now prints what it saw |
 | RR-T9 | tests | open: `overlap_live` names a suggestion, not its boxes. Where two boxes share a position and one was relabelled, the page can drop the relabelled box. The fix needs a new field in `server/review.rs` |
 | RR-T10 | tests | open: weak tests `disabled_is_noop`, `service_guard_is_noop`, `quoted_path`, `bench_1080p`, `elapsedMs >= 0`, and `remove_dir_all(..).unwrap()` in test teardown, which antivirus can fail on Windows |
+
+### Review walk measurements
+
+*Apple M1 (MacBookAir10,1, 16 GB, 8 cores), internal SSD, APFS, release build, 2026-11-06. Repeat with `BOP_WALK_FRAMES=10000,50000 cargo test --release --test it review_walk -- --ignored --nocapture` (`tests/it/review_walk.rs`). The frames are synthetic, built from the real structs and written as the service writes them, in 720 day folders: sidecar 1.5 KB, label file 1.7 KB on 85% of frames, 3.6 boxes a file. Windows and the real dataset drive were not measured.*
+
+A "warm" number is the middle of 3 passes with the OS file cache holding the files. "Cold" remounts a disk image first, so the filesystem cache is empty, but the host may still cache the image file: read it as a lower bound for a truly cold disk. `purge` needs root, and the first pass of a run in the normal folder is not cold, because the files were just written.
+
+| walk | 10k warm | 50k warm | 50k cold (image) | 50k warm (image) | 200k warm |
+|---|---|---|---|---|---|
+| `queue::build` + damaged lines, what one save or Next costs | 1.14 s | 6.11 s | 13.9 s | 7.4 s | 42.2 s |
+| ms per frame | 0.114 | 0.122 | 0.278 | 0.148 | 0.211 |
+| `queue::tally` | 0.86 s | 4.49 s | 10.5 s | 5.9 s | 31.1 s |
+| `bulk_reject_stacked`, dry run | 0.83 s | 4.23 s | 12.9 s | 5.6 s | 38.7 s |
+| `Summary::scan` | 29 ms | 81 ms | 337 ms | 81 ms | 301 ms |
+
+Filtering to one camera of 8 costs an eighth (0.78 s at 50k). At 200k the walk touches about 570,000 files and `kern.maxvnodes` is 250,927, which probably explains the higher cost per frame; that link was not proven.
+
+Where the file work goes, as a share of the sum of parts:
+
+| part | 50k warm | 50k cold (image) | 200k warm |
+|---|---|---|---|
+| canonicalize x4 | 42.3% | 30.7% | 26.1% |
+| open + read x2 | 42.7% | 46.2% | 54.3% |
+| lstat x4 | 6.9% | 17.5% | 14.6% |
+| JSON parsing, both files | 5.3% | 2.6% | 3.3% |
+| index and queue lines | 2.2% | 2.7% | 1.2% |
+
+Fixes to the file work alone, no sort or counts, warm:
+
+| variant | 50k | 200k |
+|---|---|---|
+| today | 5.84 s | 41.8 s |
+| one canonicalize per day folder | 3.31 s (57%) | 30.9 s (74%) |
+| that + a struct of only the sidecar fields used | 3.28 s (56%) | 30.7 s (73%) |
+| that + all cores but one | 1.60 s (27%) | 8.1 s (19%) |
+
+A prototype compact index in the test holds what `queue::build`, the filters, the counts and `sort_items` read. Its sizes are computed from the struct sizes and the synthetic frames, not read from RSS. It answers the same query (filter, per-class count, sort) in 1.83 ms at 50k and 7.5 ms at 200k.
+
+| part | bytes per frame | MB at 200k |
+|---|---|---|
+| rows (48 bytes each), stems, class ids, names, path lookup | 101 | 20.3 |
+| boxes, for `auto=overlaps`, `auto=both` and `overlaps::live` | 70 | 14.1 |
+| overlap suggestions | 1 | 0.2 |
+| total | 173 | 34.6 |
+
+So the 64 MB budget holds about 370,000 frames and the 128 MB ceiling about 740,000. Every `AutoFilter` except `Overlaps` and `Both` fits in per-frame bits or small counts. Those two and `overlaps::frame_strength` depend on the class list, so they need box geometry, label, state, source, moved or relabelled marks and the labeler count, or a recompute when the classes change.
+
+### Build times
+
+*Same machine, private target folder, `cargo` 1.99, default `ld`, 2026-11-06. Each row is the range of 3 or 4 runs.*
+
+| step | before | after |
+|---|---|---|
+| full `cargo build` | 66 s wall, 236 s CPU | not repeated |
+| `cargo build` after a one-line Rust edit | 6.6 to 7.5 s | 6.8 to 7.3 s |
+| `cargo build` after a JS or CSS edit | 6.5 s | 0.16 to 0.18 s |
+| `cargo test --no-run` after a one-line Rust edit | 16.5 to 17.8 s | 12.2 to 12.8 s |
+| `cargo test --no-run` after a JS edit | 16.8 to 17.3 s | 0.16 to 0.39 s |
+| of that, CPU summed over the build units | 86.5 s | 43.7 s |
+| linker runs, wall span | 26 runs, 8.4 to 9.4 s | 13 runs, 4.6 s |
+
+Linking the 15 integration test binaries took 21.4 to 21.9 s of CPU time (25%) and 7.8 to 8.3 s of wall span (about 47%, parallel with other work), so they were merged into `tests/it/`. `tests/pipeline.rs` stays apart: it installs a global tracing subscriber, which the shared process already has.
+
+Slowest units of a full build: this crate 30 s, `aws-lc-sys` build script 26 s, `moxcms` 5.3 s, `tokio` 4.4 s, `objc2-app-kit` 4.3 s, `syn` 4.2 s, `zlib-rs` 4.0 s, `image` 3.9 s, `chrono-tz` 3.8 s.
+
+A debug build reads `assets/` from the source tree on each request and embeds nothing, because any `include_str!` of a file makes cargo rebuild when it changes. So a debug binary moved off its source tree answers 500 for `/static/*`; a release build is unchanged. Templates stay compiled in: askama 0.16 has no runtime template loading, so a template edit still needs a rebuild.
+

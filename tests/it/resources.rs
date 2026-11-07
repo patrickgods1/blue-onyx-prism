@@ -251,7 +251,7 @@ fn night_training_subset_is_trainable_and_disjoint_from_nir_night() {
     assert!(cameras.len() >= 50, "{} cameras", cameras.len());
     // No image of the nir-night benchmark set (camera locations are checked by the builder,
     // which has the source metadata).
-    let nir = Manifest::parse(include_str!("../assets/bench/nir-night.json")).unwrap();
+    let nir = Manifest::parse(include_str!("../../assets/bench/nir-night.json")).unwrap();
     let nir_files: BTreeSet<&str> = nir.images.iter().map(|i| i.file.as_str()).collect();
     let nir_urls: BTreeSet<&str> = nir.images.iter().filter_map(|i| i.url.as_deref()).collect();
     for i in &m.images {

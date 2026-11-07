@@ -11,7 +11,7 @@
 //! checks are skipped; without `yolo26n.xml` the lazy model is another copy of IPcam-general, so
 //! the lazy flow always runs.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::api::VisionDetectionResponse;
 use blue_onyx_prism::config::{Config, ModelConfig};

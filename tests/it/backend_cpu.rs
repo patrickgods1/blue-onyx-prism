@@ -4,7 +4,7 @@
 //! `common::test_root()` (a missing one fails the test). Run with
 //! `cargo test --test backend_cpu -- --ignored --nocapture` to see timings.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::backend::{CoreOptions, LoadRequest, Runtimes, spec};
 
@@ -108,7 +108,7 @@ fn cpu_and_gpu_inference() {
     }
 
     // `Runtimes::new` configures no ONNX Runtime library here, so the `ort:cuda` spec falls back to
-    // OpenVINO CPU (the ORT backend itself is covered by tests/backend_ort.rs).
+    // OpenVINO CPU (the ORT backend itself is covered by tests/it/backend_ort.rs).
     let backend = rt
         .load(&spec::parse("ort:cuda").unwrap(), &req("ort:cuda"))
         .expect("ort:cuda falls back to CPU");

@@ -700,10 +700,14 @@ impl Metrics {
 
 /// Process resource gauges that are cheap to read on this platform (`None`: not available
 /// here, so the series is left out). Linux reads `/proc/self/status` and `/proc/self/fd`;
-/// macOS and Windows expose neither through `std`, so both series are omitted there.
+/// macOS and Windows ask the OS for the memory ([`crate::backend::memory::process_memory`]) and
+/// have no open-descriptor count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessStats {
     pub resident_memory_bytes: Option<u64>,
+    /// macOS only: [`crate::backend::memory::ProcessMemory::footprint`], for a soak test on a Mac:
+    /// the resident size misses GPU-backed memory there.
+    pub memory_footprint_bytes: Option<u64>,
     pub open_fds: Option<u64>,
 }
 
@@ -720,13 +724,19 @@ impl ProcessStats {
             .map(|n| n.saturating_sub(1));
         Self {
             resident_memory_bytes,
+            memory_footprint_bytes: None,
             open_fds,
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     pub fn read() -> Self {
-        Self::default()
+        let memory = crate::backend::memory::process_memory();
+        Self {
+            resident_memory_bytes: memory.map(|m| m.resident),
+            memory_footprint_bytes: memory.and_then(|m| m.footprint),
+            open_fds: None,
+        }
     }
 }
 
@@ -835,6 +845,14 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         );
         let _ = writeln!(out, "# TYPE {PREFIX}process_resident_memory_bytes gauge");
         let _ = writeln!(out, "{PREFIX}process_resident_memory_bytes {rss}");
+    }
+    if let Some(footprint) = p.memory_footprint_bytes {
+        let _ = writeln!(
+            out,
+            "# HELP {PREFIX}process_memory_footprint_bytes Physical footprint of the process in bytes (macOS: counts compressed and GPU-backed memory)."
+        );
+        let _ = writeln!(out, "# TYPE {PREFIX}process_memory_footprint_bytes gauge");
+        let _ = writeln!(out, "{PREFIX}process_memory_footprint_bytes {footprint}");
     }
     if let Some(fds) = p.open_fds {
         let _ = writeln!(
@@ -1268,12 +1286,15 @@ mod tests {
             let line = text.lines().find(|l| l.starts_with(&prefix)).unwrap();
             assert!(line[prefix.len()..].parse::<u64>().is_ok(), "{line}");
         }
-        let linux = cfg!(target_os = "linux");
+        assert!(text.contains("blue_onyx_prism_process_resident_memory_bytes "));
         assert_eq!(
-            text.contains("blue_onyx_prism_process_resident_memory_bytes "),
-            linux
+            text.contains("blue_onyx_prism_process_memory_footprint_bytes "),
+            cfg!(target_os = "macos")
         );
-        assert_eq!(text.contains("blue_onyx_prism_process_open_fds "), linux);
+        assert_eq!(
+            text.contains("blue_onyx_prism_process_open_fds "),
+            cfg!(target_os = "linux")
+        );
         for l in text.lines().filter(|l| !l.starts_with('#')) {
             let v = l.rsplit(' ').next().unwrap();
             assert!(v.parse::<f64>().is_ok(), "bad sample line {l:?}");
@@ -1295,6 +1316,24 @@ mod tests {
         let p = ProcessStats::read();
         assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
         assert!(p.open_fds.is_some_and(|n| n >= 3));
+        assert_eq!(p.memory_footprint_bytes, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_stats_on_macos() {
+        let p = ProcessStats::read();
+        assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
+        assert!(p.memory_footprint_bytes.is_some_and(|b| b > 0));
+        assert_eq!(p.open_fds, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_stats_on_windows() {
+        let p = ProcessStats::read();
+        assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
+        assert_eq!((p.memory_footprint_bytes, p.open_fds), (None, None));
     }
 
     #[test]

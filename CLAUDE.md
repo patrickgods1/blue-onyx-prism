@@ -289,6 +289,7 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   by status, a rough time from 2 s + 0.2 s x phrases for SAM 3 or 0.55 s for gdino before the VLM, warnings that reviewed frames may
   reopen, that with the VLM off lone finds cannot, or that `limit` makes the run partial); `select` sets `wanted` like the Review page. *Suggest overlaps...* has *Ask again*
   (`again`): answered pairs are otherwise kept, so a rerun's new votes reach only unchecked frames and unanswered pairs.
+- Debug builds read `assets/` from the source tree per request (`no-cache`, no rebuild for a JS or CSS edit; `embedded!` in `server/pages.rs`), so a debug binary moved off its tree answers 500 on `/static/*`; release embeds them. `review_walk` in `tests/it/` measures the review queue (`BOP_WALK_FRAMES=10000,50000`, `--ignored`); results in `docs/PRODUCTION_REVIEW.md`.
 - Disk trap: `cargo clean` wipes data roots under `target/` (here `target/release` holds the OpenVINO / ORT libs, the training env,
   weights such as SAM 3's 3.4 GB, the config; a dataset or training folder placed there too). Do not run it without moving them first.
 - `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
@@ -363,8 +364,8 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   predictions[{x_min,y_min,x_max,y_max,confidence,label}], count, command, moduleId, executionProvider,
   canUseGPU, inferenceMs, processMs, analysisRoundTripMs`.
 - CI sets `BOP_REQUIRE_PYTHON=1` and `BOP_REQUIRE_NODE=1`: a test that would skip for a missing Python, numpy or node fails there, while local runs still skip. Tests run scripts through `progress::test_python`. CI installs Python 3.11.9 and `scripts/ci/requirements-test.txt` (base install, because tests use `-I`) and runs `scripts/ci/python_self_tests.sh`. Review rules that decide what reaches exports are in `assets/review-rules.js` (pure, no DOM; `globalThis.ReviewRules`), checked against the Rust twins through `node` by `tests/js_rules.rs`. When proving a test can fail, mutate a private copy with its own target dir, never a checkout other agents build from.
-- Tests: pure post-processing tests in `tests/postprocess.rs` with synthetic tensors; the HTTP and backend
-  integration tests (`tests/*_http.rs`, `backend_*.rs`, ...) are `#[ignore]`d and need the fixtures described in
+- Tests: integration tests are one binary, `tests/it/` (`cargo test --test it`; `tests/pipeline.rs` stays apart, it installs a global tracing subscriber): pure post-processing tests in `tests/it/postprocess.rs` with synthetic tensors; the HTTP and backend
+  tests (`tests/it/*_http.rs`, `backend_*.rs`, ...) are `#[ignore]`d and need the fixtures described in
   `tests/common/mod.rs` (`models/IPcam-general.*`, `openvino/`, `onnxruntime/`; run with
   `cargo test -- --ignored --test-threads=1`). `common::temp_dir` returns a guard that removes the folder
   (keep with `BOP_KEEP_TEST_DIRS=1`).

@@ -4,7 +4,7 @@
 //! `#[ignore]`d: needs `models/IPcam-general.onnx` and `openvino/` (see tests/common). Run with
 //! `cargo test --test backend_cache -- --ignored --nocapture`.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::backend::{CoreOptions, LoadRequest, Runtimes, spec};
 use std::path::Path;

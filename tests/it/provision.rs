@@ -9,7 +9,7 @@
 //! manager refuses outside its own `cfg(test)` build; the tests call
 //! `manager::allow_loopback_http_for_tests()` first to opt in for this process.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::backend::detect::{GpuAdapter, GpuVendor, HardwareInfo};
 use blue_onyx_prism::backend::select::{RuntimeProbe, select};

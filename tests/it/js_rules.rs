@@ -848,13 +848,13 @@ fn the_differences_are_the_documented_ones() {
 /// Needs no `node`: the page loads the rules first, and they stay pure.
 #[test]
 fn the_page_loads_the_rules_first_and_they_touch_no_page() {
-    let page = include_str!("../templates/train/review.html");
+    let page = include_str!("../../templates/train/review.html");
     let (rules, own) = (
         page.find("/static/review-rules.js?v=").unwrap(),
         page.find("/static/review.js?v=").unwrap(),
     );
     assert!(rules < own, "review.js reads ReviewRules when it starts");
-    let js = include_str!("../assets/review-rules.js");
+    let js = std::fs::read_to_string(rules_path()).unwrap();
     for word in [
         "document",
         "window",

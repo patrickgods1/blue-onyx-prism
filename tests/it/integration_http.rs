@@ -4,7 +4,7 @@
 //! `common::test_root()` (`BLUE_ONYX_TEST_ROOT`, else the repo root); a missing fixture fails
 //! the test. Run with `cargo test -- --ignored`.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::config::{Config, ModelConfig};
 use blue_onyx_prism::model::ModelFamilyKind;

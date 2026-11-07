@@ -515,13 +515,20 @@ mod tests {
         assert!(counts(&b), "\"Real, parked\" itself is a reviewer's look");
     }
 
+    /// `assets/<name>`, read at run time: `include_str!` would rebuild this test binary on a page
+    /// edit.
+    fn page_script(name: &str) -> String {
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        std::fs::read_to_string(assets.join(name)).unwrap()
+    }
+
     #[test]
     fn the_page_shares_the_spot_constants() {
-        let js = include_str!("../../../assets/review.js");
+        let js = page_script("review.js");
         assert!(js.contains(&format!("REPEAT_MIN = {REPEAT_MIN}")));
         assert!(js.contains(&format!("REPEAT_IOU = {REJECT_SPOT_IOU},")));
         assert!(js.contains(&format!("ACCEPT_SPOT_IOU = {ACCEPT_SPOT_IOU};")));
-        let rules = include_str!("../../../assets/review-rules.js");
+        let rules = page_script("review-rules.js");
         for reason in [
             super::super::bulk::DISMISSED_REASON,
             super::super::bulk::SPOT_DISMISSED_REASON,
@@ -533,11 +540,11 @@ mod tests {
     }
 
     /// The thresholds and the vehicle list of the page's rules, by their text: this runs where
-    /// `tests/js_rules.rs` skips for want of `node`, which compares the values too.
+    /// `tests/it/js_rules.rs` skips for want of `node`, which compares the values too.
     #[test]
     fn the_page_shares_the_stack_thresholds_and_the_vehicles() {
         use super::super::stacks::{NESTED_SHARE, OVERLAP_IOU, STACK_IOU};
-        let rules = include_str!("../../../assets/review-rules.js");
+        let rules = page_script("review-rules.js");
         for line in [
             format!(
                 "var STACK_IOU = {STACK_IOU}, OVERLAP_IOU = {OVERLAP_IOU}, \

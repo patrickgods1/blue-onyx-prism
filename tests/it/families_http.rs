@@ -6,7 +6,7 @@
 //! `common::test_root()` (a missing one fails the test). `yolo26s.xml`, `yolo26n.xml` and
 //! `rt-detrv2-s.onnx` are optional extras: each present one is served and checked too.
 
-mod common;
+use crate::common;
 
 use blue_onyx_prism::config::{Config, ModelConfig};
 use blue_onyx_prism::model::ModelFamilyKind;
