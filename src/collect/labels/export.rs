@@ -40,8 +40,8 @@
 //! A reviewed frame that lost its image or sidecar and a folder that cannot be listed cannot be
 //! exported; the report counts them (`lost_frames`, `unreadable_folders`) and warns.
 
-use super::super::layout::{self, Rel};
-use super::super::record::Bucket;
+use super::super::layout::{self, Rel, Walker};
+use super::super::record::{Bucket, Record};
 use super::xany;
 use super::{BoxState, Frame, LabelBox, LabelFile, Status, clamp_box, spots};
 use crate::benchmark::images::{Manifest, ManifestImage, ManifestObject};
@@ -672,6 +672,32 @@ fn lost_warning(lost: &[String]) -> String {
     )
 }
 
+/// What the walk of [`reviewed_frames_filtered`] read of one label file.
+enum ReadFrame {
+    /// The image or sidecar is gone from a frame that may have been reviewed.
+    Lost,
+    /// The label file or sidecar does not read: why.
+    Failed(String),
+    Reviewed(Box<(Frame, LabelFile, Record)>),
+}
+
+/// The reviewed frame of the label file at `path`; None when the frame is not reviewed, or is gone
+/// and was not.
+fn read_reviewed(walker: &mut Walker<'_>, rel: &str, path: &Path) -> Option<ReadFrame> {
+    let Some(frame) = Frame::resolve_in(walker, rel) else {
+        return may_be_reviewed(path).then_some(ReadFrame::Lost);
+    };
+    let labels = match frame.labels() {
+        Ok(Some(l)) if l.status == Status::Reviewed => l,
+        Ok(_) => return None,
+        Err(e) => return Some(ReadFrame::Failed(format!("{e:#}"))),
+    };
+    Some(match frame.record() {
+        Ok(rec) => ReadFrame::Reviewed(Box::new((frame, labels, rec))),
+        Err(e) => ReadFrame::Failed(format!("{e:#}")),
+    })
+}
+
 /// [`reviewed_frames`] that `filter` keeps, split after filtering (so both sides hold kept
 /// frames); also how many the filter left out and what could not be looked at.
 pub fn reviewed_frames_filtered(
@@ -697,27 +723,25 @@ pub fn reviewed_frames_filtered(
         .filter(|(_, path)| may_be_reviewed(path))
         .map(|(rel, _)| rel.clone())
         .collect();
-    for (rel, path) in scan.files {
-        let Some(frame) = Frame::resolve(dir, &rel) else {
-            if may_be_reviewed(&path) {
+    // Read on the walk's threads, judged here in the list's order, so the warnings keep theirs.
+    let walker = Walker::new(dir);
+    let read = super::queue::over_days(&scan.files, &|day| {
+        let mut walker = walker.clone();
+        day.iter()
+            .filter_map(|(rel, path)| Some((rel.clone(), read_reviewed(&mut walker, rel, path)?)))
+            .collect()
+    });
+    for (rel, read) in read {
+        let (frame, labels, rec) = match read {
+            ReadFrame::Lost => {
                 lost.push(rel);
-            }
-            continue;
-        };
-        let labels = match frame.labels() {
-            Ok(Some(l)) if l.status == Status::Reviewed => l,
-            Ok(_) => continue,
-            Err(e) => {
-                warnings.push(format!("{rel}: {e:#}; left out"));
                 continue;
             }
-        };
-        let rec = match frame.record() {
-            Ok(r) => r,
-            Err(e) => {
-                warnings.push(format!("{rel}: {e:#}; left out"));
+            ReadFrame::Failed(e) => {
+                warnings.push(format!("{rel}: {e}; left out"));
                 continue;
             }
+            ReadFrame::Reviewed(read) => *read,
         };
         let unknown: BTreeSet<&str> = labels
             .training()
@@ -1270,8 +1294,9 @@ fn unreviewed_queue_frames(
     warnings: &mut Vec<String>,
 ) -> Vec<(Frame, LabelFile, u32, u32)> {
     let mut out = Vec::new();
+    let mut walker = Walker::new(dir);
     for c in super::queue::candidates(dir, super::queue::QueueSource::Queue) {
-        let Some(frame) = Frame::resolve(dir, &c.rel) else {
+        let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
             continue;
         };
         let (rec, labels) = match (frame.record(), frame.labels()) {

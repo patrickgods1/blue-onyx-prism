@@ -3839,6 +3839,11 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-T9 | tests | open: `overlap_live` names a suggestion, not its boxes. Where two boxes share a position and one was relabelled, the page can drop the relabelled box. The fix needs a new field in `server/review.rs` |
 | RR-T10 | tests | open: weak tests `disabled_is_noop`, `service_guard_is_noop`, `quoted_path`, `bench_1080p`, `elapsedMs >= 0`, and `remove_dir_all(..).unwrap()` in test teardown, which antivirus can fail on Windows |
 | RR-T11 | tests | open: on PR #127 the Windows installer job lost its runner during the smoke test ("The hosted runner lost communication with the server", run 42340062106), leaving no log. That is 1 of 39 packaging runs. The step normally takes 45 s. Phase 5's only change on that path is a read-only memory query, and the smoke script ends nothing on purpose, so the cause is unknown. One path was real: `msiexec /qn` with no `/norestart` may restart the machine when a file is in use. 24 MSI logs from 3 earlier runs show no file in use and no 3010, so nothing shows that this happened. Every call now passes `/norestart`, and a 3010 prints the log |
+| RR-P1 | speed | fixed: `/v1/review/next` answers from a background index on folders of 2,000 frames or more: 0.6 to 1.2 ms at 50k (1.6 s by walking), 1.3 to 3.2 ms at 200k (12.3 s). A save shows on the next query. An equivalence test compares the whole answer with a fresh walk; 13 of 13 deliberate mutants are caught |
+| RR-P2 | speed | fixed: one canonicalize per day folder and up to 4 threads: `queue::build` 6.1 s to 1.6 s at 50k, `tally` 4.5 s to 0.9 s, `bulk_reject_stacked` 4.2 s to 0.9 s. Label writes stay on one thread. Not measured on Windows, a spinning disk or the real drive |
+| RR-P3 | speed | fixed: holding a key or pressing Next during a slow answer no longer piles up walks; the balance preview no longer holds a mutex across a walk; `brief_of` keeps its scan 10 s; the camera history scans one camera, single-flight |
+| RR-P4 | memory | open, for phase 7: at 200k frames process memory grew 224 MB around the index build against 26.8 MB of index. The figure includes the build's transients and earlier walks in the same process, so the index's own share is not isolated. Measure it alone, and whether the allocator returns the rest |
+| RR-P5 | ui | fixed: mounted drives (`/Volumes`, `/media`, `/run/media`, `/mnt` mount points) are browsable roots, as drive letters are on Windows; a symlink such as `/Volumes/Macintosh HD` is not. The refusal names Browse... |
 
 ### Review walk measurements
 
@@ -3885,6 +3890,23 @@ A prototype compact index in the test holds what `queue::build`, the filters, th
 | total | 173 | 34.6 |
 
 So the 64 MB budget holds about 370,000 frames and the 128 MB ceiling about 740,000. Every `AutoFilter` except `Overlaps` and `Both` fits in per-frame bits or small counts. Those two and `overlaps::frame_strength` depend on the class list, so they need box geometry, label, state, source, moved or relabelled marks and the labeler count, or a recompute when the classes change.
+
+### Review index results (phase 6)
+
+*Same machine and generator, release build, 2026-11-07, after wave 1's walk fixes. `BOP_WALK_FRAMES=50000,200000 cargo test --release --test it review_walk -- --ignored --nocapture`.*
+
+| | 50k | 200k |
+|---|---|---|
+| `queue::build`, warm | 1.65 s | 14.1 s |
+| `queue::tally`, warm | 0.91 s | 7.97 s |
+| index build, in the background | 1.6 s | 12.7 s |
+| index size (`index::bytes`) | 7.0 MB, 139 bytes a frame | 26.8 MB, 134 bytes a frame |
+| Next, any status, from the index | 1.18 ms | 3.19 ms |
+| Next, `auto=overlaps` / `auto=both` | 0.89 / 1.13 ms | 1.77 / 2.83 ms |
+| Next right after a label write | 1.49 ms | 3.52 ms |
+| the same answer by walking | 1632 ms | 12306 ms |
+
+A synthetic 300k folder in `index/tests.rs` is 37 MB (123 bytes a frame), under the 64 MB budget. The rows hold no box geometry: `auto=overlaps`, `auto=both` and the overlap strength are computed for the wanted classes at index time, and a class change rebuilds. Process memory (RR-P4) is not the index alone.
 
 ### Build times
 

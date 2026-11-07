@@ -6,15 +6,17 @@
 //!   ([`Event`]: started, an output line, finished) over a channel and only the calling (job)
 //!   thread reports them. Results come back by index, so the caller reassembles them in video
 //!   order (the dedup that follows depends on the order).
-//! - [`map`]: the analysis (decode, dHash, scene of every candidate), CPU-bound, work-stealing
-//!   by index over `threads` threads; the calling thread polls a counter for the progress.
+//! - [`map`] ([`crate::parallel::map`]): the analysis (decode, dHash, scene of every candidate),
+//!   CPU-bound, work-stealing by index over `threads` threads; the calling thread polls a counter
+//!   for the progress.
 //!
 //! Both stop starting work once `cancel` is set (a running helper is killed by the command
 //! runner, which watches the same flag); items never started come back as `None`.
 
+pub use crate::parallel::map;
+
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 /// Most videos extracted at once by default.
 pub const AUTO_EXTRACT_MAX: usize = 4;
@@ -127,71 +129,12 @@ pub fn run_with_lines<T: Send>(
     out
 }
 
-/// `f(i)` for `i` in `0..n` on `threads` threads (each takes the next index), results by index.
-/// `progress(done)` runs on the calling thread at the start, about every `poll` while the
-/// workers run, and once at the end. `None` when `cancel` was set before every item was done.
-pub fn map<T: Send>(
-    n: usize,
-    threads: usize,
-    f: &(dyn Fn(usize) -> T + Sync),
-    progress: &mut dyn FnMut(usize),
-    poll: Duration,
-    cancel: &AtomicBool,
-) -> Option<Vec<T>> {
-    let next = AtomicUsize::new(0);
-    let done = AtomicUsize::new(0);
-    let parts: Vec<Vec<(usize, T)>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..threads.clamp(1, n.max(1)))
-            .map(|_| {
-                let (next, done) = (&next, &done);
-                s.spawn(move || {
-                    let mut mine = Vec::new();
-                    while !cancel.load(Ordering::Relaxed) {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        mine.push((i, f(i)));
-                        done.fetch_add(1, Ordering::Relaxed);
-                    }
-                    mine
-                })
-            })
-            .collect();
-        // Wake often (the end is noticed within 10 ms), report every `poll`.
-        let mut reported = std::time::Instant::now();
-        progress(done.load(Ordering::Relaxed));
-        while handles.iter().any(|h| !h.is_finished()) {
-            std::thread::sleep(poll.min(Duration::from_millis(10)));
-            if reported.elapsed() >= poll {
-                progress(done.load(Ordering::Relaxed));
-                reported = std::time::Instant::now();
-            }
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect()
-    });
-    let finished = done.load(Ordering::Relaxed);
-    progress(finished);
-    if finished < n {
-        return None;
-    }
-    let mut slots: Vec<Option<T>> = (0..n).map(|_| None).collect();
-    for (i, v) in parts.into_iter().flatten() {
-        if let Some(s) = slots.get_mut(i) {
-            *s = Some(v);
-        }
-    }
-    slots.into_iter().collect()
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn worker_counts() {
@@ -295,42 +238,5 @@ mod tests {
         assert!(n <= 3, "{n} started");
         assert_eq!(out.iter().filter(|r| r.is_some()).count(), n);
         assert!(out[49].is_none());
-    }
-
-    #[test]
-    fn map_keeps_the_order_and_stops_on_cancel() {
-        let cancel = AtomicBool::new(false);
-        let mut seen = Vec::new();
-        let out = map(
-            500,
-            4,
-            &|i| i * i,
-            &mut |d| seen.push(d),
-            Duration::from_millis(1),
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(out, (0..500).map(|i| i * i).collect::<Vec<_>>());
-        assert_eq!(*seen.last().unwrap(), 500);
-        assert!(
-            map(0, 4, &|i| i, &mut |_| {}, Duration::from_millis(1), &cancel)
-                .unwrap()
-                .is_empty()
-        );
-        let r = map(
-            10_000,
-            3,
-            &|i| {
-                if i == 50 {
-                    cancel.store(true, Ordering::SeqCst);
-                }
-                std::thread::sleep(Duration::from_micros(50));
-                i
-            },
-            &mut |_| {},
-            Duration::from_millis(1),
-            &cancel,
-        );
-        assert!(r.is_none(), "cancelled");
     }
 }

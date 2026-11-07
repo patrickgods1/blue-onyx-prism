@@ -26,6 +26,7 @@
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
 //! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
+//! - [`parallel`]  work-stealing maps on scoped threads (import analysis, dataset walks)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
 //! # Lint policy
@@ -74,6 +75,7 @@ pub mod image_stats;
 pub mod logbuf;
 pub mod metrics;
 pub mod model;
+pub mod parallel;
 pub mod prep;
 pub mod profile;
 pub mod registry;

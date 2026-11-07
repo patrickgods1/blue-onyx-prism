@@ -5,10 +5,10 @@
 //! resolved, class check) and the merge of later proposals such as auto-labeler boxes
 //! ([`merge_proposals`]), whether the auto-labeler's triage alone settles a frame
 //! ([`auto_accept_eligible`]), and which boxes a labelers run set aside
-//! ([`LabelBox::is_dismissed`]). IO: [`Frame::resolve`] (every frame reference goes through
+//! ([`LabelBox::is_dismissed`]). IO: [`Frame::resolve`], [`Frame::resolve_in`] on a walk (every frame reference goes through
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
-//! review queue is in [`queue`], the bulk accept and the low-score and unwanted-class rejects in
+//! review queue is in [`queue`], with a background index of it for the Review tab in [`index`], the bulk accept and the low-score and unwanted-class rejects in
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
@@ -17,6 +17,7 @@
 
 pub mod bulk;
 pub mod export;
+pub mod index;
 pub mod overlaps;
 pub mod queue;
 pub mod repeats;
@@ -28,7 +29,7 @@ use super::layout::{self, Rel};
 use super::record::Record;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1118,6 +1119,19 @@ impl Frame {
         let r = layout::parse_rel(rel).filter(|_| rel.ends_with(".jpg"))?;
         let jpg = layout::resolve(dir, &r.jpg(), "jpg")?;
         let sidecar = layout::resolve(dir, &r.json(), "json")?;
+        Self::with_labels(r, jpg, sidecar)
+    }
+
+    /// [`Self::resolve`] on a walk over many frames ([`layout::Walker`]): the same answers.
+    pub fn resolve_in(walker: &mut layout::Walker<'_>, rel: &str) -> Option<Self> {
+        let r = layout::parse_rel(rel).filter(|_| rel.ends_with(".jpg"))?;
+        let jpg = walker.file(&r, "jpg")?;
+        let sidecar = walker.file(&r, "json")?;
+        Self::with_labels(r, jpg, sidecar)
+    }
+
+    /// The frame of `jpg` and `sidecar`, resolved, when its label file is no symlink.
+    fn with_labels(r: Rel, jpg: PathBuf, sidecar: PathBuf) -> Option<Self> {
         let labels = jpg.parent()?.join(format!("{}{LABELS_SUFFIX}", r.stem));
         if let Ok(m) = std::fs::symlink_metadata(&labels)
             && !m.file_type().is_file()
@@ -1414,6 +1428,7 @@ fn write_locked(path: &Path, f: &LabelFile) -> Result<()> {
     let r =
         layout::write_atomic(path, &text).with_context(|| format!("writing {}", path.display()));
     repeats::written(path);
+    index::written(path);
     r
 }
 
@@ -1477,6 +1492,7 @@ pub fn unless_protected<T>(path: &Path, delete: impl FnOnce() -> T) -> Option<T>
     }
     let out = delete();
     repeats::written(path);
+    index::written(path);
     Some(out)
 }
 
@@ -1501,7 +1517,16 @@ pub struct LabelScan {
 /// The label files under `dir`, and what a caller that must not shrink silently (an export) has
 /// to tell about the ones it cannot use.
 pub fn scan_labels(dir: &Path) -> LabelScan {
-    let (days, unreadable) = layout::day_dirs_checked(dir);
+    scan_days(dir, layout::day_dirs_checked(dir))
+}
+
+/// [`label_files`] of one camera, without listing the other cameras' folders.
+pub fn camera_label_files(dir: &Path, camera: &str) -> Vec<(String, PathBuf)> {
+    scan_days(dir, layout::camera_day_dirs(dir, camera)).files
+}
+
+/// [`scan_labels`] of the `(day folders, folders not listed)` of [`layout::day_dirs_checked`].
+fn scan_days(dir: &Path, (days, unreadable): (Vec<PathBuf>, Vec<PathBuf>)) -> LabelScan {
     let mut out = LabelScan {
         unreadable,
         ..LabelScan::default()
@@ -1516,12 +1541,19 @@ pub fn scan_labels(dir: &Path) -> LabelScan {
                 continue;
             }
         };
-        let mut names: Vec<String> = rd
+        // The listing says what is a regular file, so a frame costs no look of its own.
+        let (mut names, mut images) = (Vec::new(), HashSet::new());
+        for name in rd
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter(|n| n.ends_with(LABELS_SUFFIX))
-            .collect();
+        {
+            if name.ends_with(LABELS_SUFFIX) {
+                names.push(name);
+            } else if name.ends_with(".jpg") {
+                images.insert(name);
+            }
+        }
         names.sort();
         let Ok(rel_day) = day.strip_prefix(dir) else {
             continue;
@@ -1538,7 +1570,9 @@ pub fn scan_labels(dir: &Path) -> LabelScan {
             if layout::parse_rel(&rel).is_none() {
                 continue;
             }
-            if day.join(format!("{stem}.jpg")).is_file() {
+            // Not listed as a regular file: a symlink, or another case on a blind file system.
+            let image = format!("{stem}.jpg");
+            if images.contains(&image) || day.join(image).is_file() {
                 out.files.push((rel, day.join(n)));
             } else {
                 out.orphans.push((rel, day.join(n)));
@@ -3027,6 +3061,258 @@ mod tests {
         std::fs::set_permissions(&folder, mode(0o755)).unwrap();
         // Root reads everything: nothing to show then.
         assert!(!denied || read.is_err(), "{read:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `<stem>.jpg` and `<stem>.json` in `day`.
+    fn frame_files(day: &Path, stem: &str) {
+        std::fs::create_dir_all(day).unwrap();
+        std::fs::write(day.join(format!("{stem}.jpg")), b"x").unwrap();
+        let rec = serde_json::to_vec(&record()).unwrap();
+        std::fs::write(day.join(format!("{stem}.json")), rec).unwrap();
+    }
+
+    /// Every way of asking for `rel` agrees: a walker of its own, the shared `walker`, and the
+    /// one-off calls; the paths are canonical on both sides. Returns whether it resolved.
+    fn agree(dir: &Path, walker: &mut layout::Walker<'_>, rel: &str) -> bool {
+        let one_off = Frame::resolve(dir, rel);
+        let fresh = Frame::resolve_in(&mut layout::Walker::new(dir), rel);
+        assert_eq!(one_off, fresh, "{rel}: a new walker");
+        assert_eq!(
+            one_off,
+            Frame::resolve_in(walker, rel),
+            "{rel}: a used walker"
+        );
+        for ext in ["jpg", "json"] {
+            assert_eq!(
+                layout::resolve(dir, rel, ext),
+                walker.resolve(rel, ext),
+                "{rel}: .{ext}"
+            );
+        }
+        one_off.is_some()
+    }
+
+    #[test]
+    fn a_walker_answers_what_resolve_answers() {
+        let tmp = std::env::temp_dir().join(format!("bop-walker-{}", uuid::Uuid::new_v4()));
+        let dir = tmp.join("data");
+        let day = dir.join("ir/cam/2026-10-22");
+        frame_files(&day, "plain");
+        // A leaf missing, a leaf that is a folder, a label file that is one.
+        frame_files(&day, "no-sidecar");
+        std::fs::remove_file(day.join("no-sidecar.json")).unwrap();
+        frame_files(&day, "no-image");
+        std::fs::remove_file(day.join("no-image.jpg")).unwrap();
+        frame_files(&day, "folder-jpg");
+        std::fs::remove_file(day.join("folder-jpg.jpg")).unwrap();
+        std::fs::create_dir(day.join("folder-jpg.jpg")).unwrap();
+        frame_files(&day, "folder-json");
+        std::fs::remove_file(day.join("folder-json.json")).unwrap();
+        std::fs::create_dir(day.join("folder-json.json")).unwrap();
+        frame_files(&day, "folder-labels");
+        std::fs::create_dir(day.join("folder-labels.labels.json")).unwrap();
+        // A day "folder" that is a file.
+        std::fs::write(dir.join("ir/cam/2026-10-25"), b"x").unwrap();
+
+        let mut walker = layout::Walker::new(&dir);
+        let at = |d: &str, stem: &str| format!("{d}/{stem}.jpg");
+        assert!(agree(&dir, &mut walker, &at("ir/cam/2026-10-22", "plain")));
+        for refused in [
+            at("ir/cam/2026-10-22", "gone"),
+            at("ir/cam/2026-10-22", "no-sidecar"),
+            at("ir/cam/2026-10-22", "no-image"),
+            at("ir/cam/2026-10-22", "folder-jpg"),
+            at("ir/cam/2026-10-22", "folder-json"),
+            at("ir/cam/2026-10-22", "folder-labels"),
+            at("ir/cam/2026-01-01", "plain"),
+            at("ir/nobody/2026-10-22", "plain"),
+            at("ir/cam/2026-10-25", "plain"),
+            "ir/cam/2026-10-22/plain.json".to_string(),
+            "ir/cam/2026-10-22/plain.labels.json".to_string(),
+            "../data/ir/cam/2026-10-22/plain.jpg".to_string(),
+            "ir/../ir/cam/plain.jpg".to_string(),
+        ] {
+            assert!(!agree(&dir, &mut walker, &refused), "{refused}");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tmp.join("outside");
+            frame_files(&outside.join("day"), "plain");
+            frame_files(&outside.join("cam/2026-10-22"), "plain");
+            frame_files(&outside.join("scene/cam/2026-10-22"), "plain");
+            // Folders a symlink takes outside the root.
+            symlink(outside.join("day"), dir.join("ir/cam/2026-10-23")).unwrap();
+            symlink(outside.join("cam"), dir.join("ir/out-cam")).unwrap();
+            symlink(outside.join("scene"), dir.join("night")).unwrap();
+            // Folders a symlink keeps inside: they work, with the real path.
+            symlink(&day, dir.join("ir/cam/2026-10-24")).unwrap();
+            symlink(dir.join("ir/cam"), dir.join("ir/in-cam")).unwrap();
+            symlink(dir.join("ir"), dir.join("day")).unwrap();
+            // Leaves.
+            frame_files(&day, "link-jpg");
+            std::fs::remove_file(day.join("link-jpg.jpg")).unwrap();
+            symlink(day.join("plain.jpg"), day.join("link-jpg.jpg")).unwrap();
+            frame_files(&day, "link-json");
+            std::fs::remove_file(day.join("link-json.json")).unwrap();
+            symlink(day.join("plain.json"), day.join("link-json.json")).unwrap();
+            frame_files(&day, "link-out");
+            std::fs::remove_file(day.join("link-out.jpg")).unwrap();
+            symlink(outside.join("day/plain.jpg"), day.join("link-out.jpg")).unwrap();
+            frame_files(&day, "dangling");
+            std::fs::remove_file(day.join("dangling.jpg")).unwrap();
+            symlink(day.join("nothing"), day.join("dangling.jpg")).unwrap();
+            frame_files(&day, "link-labels");
+            symlink("/etc/hosts", day.join("link-labels.labels.json")).unwrap();
+
+            let mut walker = layout::Walker::new(&dir);
+            for refused in [
+                at("ir/cam/2026-10-23", "plain"),
+                at("ir/out-cam/2026-10-22", "plain"),
+                at("night/cam/2026-10-22", "plain"),
+                at("ir/cam/2026-10-22", "link-jpg"),
+                at("ir/cam/2026-10-22", "link-json"),
+                at("ir/cam/2026-10-22", "link-out"),
+                at("ir/cam/2026-10-22", "dangling"),
+                at("ir/cam/2026-10-22", "link-labels"),
+            ] {
+                assert!(!agree(&dir, &mut walker, &refused), "{refused}");
+            }
+            let real = dir
+                .canonicalize()
+                .unwrap()
+                .join("ir/cam/2026-10-22/plain.jpg");
+            for inside in [
+                at("ir/cam/2026-10-24", "plain"),
+                at("ir/in-cam/2026-10-22", "plain"),
+                at("day/cam/2026-10-22", "plain"),
+            ] {
+                assert!(agree(&dir, &mut walker, &inside), "{inside}");
+                let frame = Frame::resolve_in(&mut walker, &inside).unwrap();
+                assert_eq!(frame.jpg, real);
+            }
+            // The root itself behind a symlink.
+            let alias = tmp.join("alias");
+            symlink(&dir, &alias).unwrap();
+            let mut walker = layout::Walker::new(&alias);
+            assert!(agree(
+                &alias,
+                &mut walker,
+                &at("ir/cam/2026-10-22", "plain")
+            ));
+            assert!(!agree(
+                &alias,
+                &mut walker,
+                &at("night/cam/2026-10-22", "plain")
+            ));
+        }
+
+        // No root: nothing resolves.
+        let none = tmp.join("no-such-folder");
+        let mut walker = layout::Walker::new(&none);
+        assert!(!agree(
+            &none,
+            &mut walker,
+            &at("ir/cam/2026-10-22", "plain")
+        ));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn one_cameras_label_files_are_what_filtering_all_of_them_gives() {
+        let tmp = std::env::temp_dir().join(format!("bop-camera-{}", uuid::Uuid::new_v4()));
+        let dir = tmp.join("data");
+        for (scene, camera, date, stem) in [
+            ("ir", "cam", "2026-10-21", "a"),
+            ("ir", "cam", "2026-10-22", "b"),
+            ("day", "cam", "2026-10-21", "c"),
+            ("ir", "other", "2026-10-21", "d"),
+            ("ir", "BadName", "2026-10-21", "e"),
+            ("ir", "cam", "not-a-date", "f"),
+        ] {
+            let day = dir.join(scene).join(camera).join(date);
+            frame_files(&day, stem);
+            write(
+                &day.join(format!("{stem}{LABELS_SUFFIX}")),
+                &LabelFile::default(),
+            )
+            .unwrap();
+        }
+        #[cfg(unix)]
+        {
+            // A camera or day folder that is a symlink is no folder of the dataset; a scene folder
+            // is listed through one (`Frame::resolve` refuses its frames later).
+            use std::os::unix::fs::symlink;
+            let scene = tmp.join("outside/scene");
+            let day = scene.join("cam/2026-10-21");
+            frame_files(&day, "x");
+            let file = day.join(format!("x{LABELS_SUFFIX}"));
+            write(&file, &LabelFile::default()).unwrap();
+            symlink(&scene, dir.join("night")).unwrap();
+            symlink(scene.join("cam"), dir.join("ir/linked")).unwrap();
+            symlink(&day, dir.join("ir/cam/2026-10-23")).unwrap();
+        }
+        let all = label_files(&dir);
+        let through_scene = usize::from(cfg!(unix));
+        assert_eq!(all.len(), 4 + through_scene, "{all:?}");
+        for camera in ["cam", "other", "linked", "nobody", "BadName", "bad-name"] {
+            let filtered: Vec<_> = all
+                .iter()
+                .filter(|(rel, _)| rel.split('/').nth(1) == Some(camera))
+                .cloned()
+                .collect();
+            assert_eq!(camera_label_files(&dir, camera), filtered, "{camera}");
+        }
+        assert_eq!(camera_label_files(&dir, "cam").len(), 3 + through_scene);
+        // A name from a client reaches no path.
+        for bad in ["..", "../..", "cam/..", "", "."] {
+            assert!(camera_label_files(&dir, bad).is_empty(), "{bad}");
+        }
+        assert!(camera_label_files(&tmp.join("no-such-folder"), "cam").is_empty());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_label_file_keeps_its_frame_by_the_listing_or_by_a_look() {
+        let dir = std::env::temp_dir().join(format!("bop-listing-{}", uuid::Uuid::new_v4()));
+        let day = dir.join("ir/cam/2026-10-22");
+        frame_files(&day, "kept");
+        frame_files(&day, "orphan");
+        std::fs::remove_file(day.join("orphan.jpg")).unwrap();
+        frame_files(&day, "folder");
+        std::fs::remove_file(day.join("folder.jpg")).unwrap();
+        std::fs::create_dir(day.join("folder.jpg")).unwrap();
+        frame_files(&day, "linked");
+        std::fs::remove_file(day.join("linked.jpg")).unwrap();
+        for stem in ["kept", "orphan", "folder", "linked"] {
+            write(
+                &day.join(format!("{stem}{LABELS_SUFFIX}")),
+                &LabelFile::default(),
+            )
+            .unwrap();
+        }
+        let linked = cfg!(unix);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(day.join("kept.jpg"), day.join("linked.jpg")).unwrap();
+        let scan = scan_labels(&dir);
+        let rels = |l: &[(String, PathBuf)]| -> Vec<String> {
+            l.iter()
+                .map(|(r, _)| r.rsplit('/').next().unwrap().to_string())
+                .collect()
+        };
+        // A symlinked image is a file to `is_file` (Frame::resolve refuses it later).
+        let (mut files, mut orphans) = (vec!["kept.jpg"], vec!["folder.jpg", "orphan.jpg"]);
+        if linked {
+            files.push("linked.jpg");
+        } else {
+            orphans.push("linked.jpg");
+        }
+        // Both lists come by name, as the day folder is listed.
+        orphans.sort_unstable();
+        assert_eq!(rels(&scan.files), files);
+        assert_eq!(rels(&scan.orphans), orphans);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

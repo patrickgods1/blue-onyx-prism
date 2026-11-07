@@ -112,10 +112,15 @@ fn rules_path() -> PathBuf {
 
 /// Run [`DRIVER`] on `request`, in a folder of its own, and read its answer.
 fn node(request: &Value) -> Value {
+    node_with(DRIVER, request)
+}
+
+/// Run `driver` on `request`, in a folder of its own, and read its answer.
+fn node_with(driver_js: &str, request: &Value) -> Value {
     let dir = std::env::temp_dir().join(format!("bop-js-rules-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let (driver, cases) = (dir.join("driver.js"), dir.join("request.json"));
-    std::fs::write(&driver, DRIVER).unwrap();
+    std::fs::write(&driver, driver_js).unwrap();
     std::fs::write(&cases, serde_json::to_vec(request).unwrap()).unwrap();
     let out = Command::new("node")
         .arg(&driver)
@@ -843,6 +848,82 @@ fn the_differences_are_the_documented_ones() {
         "frames": [request_of(&f, &w)],
     }));
     assert_eq!(js_live(&got["frames"][0]["live"]), [(0, 2, 0, 0, 2)]);
+}
+
+/// What a new `loadNext` does in every state (`assets/review-rules.js` `nextPlan`): at most one real
+/// walk, the newest intent wins, a counts refresh never cancels a real Next.
+#[test]
+fn a_new_next_never_piles_up_and_a_refresh_never_cancels_a_real_next() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+process.stdout.write(JSON.stringify(
+  req.map(([r, w, want]) => globalThis.ReviewRules.nextPlan(r, w, want))));
+"#;
+    let table = [
+        (None, None, "real", "start"),
+        (None, None, "counts", "start"),
+        // A refresh runs: a real Next does not wait for its walk.
+        (Some("counts"), None, "real", "jump"),
+        (Some("counts"), Some("counts"), "real", "jump"),
+        // The running answer may predate what the refresh is for.
+        (Some("counts"), None, "counts", "queue"),
+        (Some("counts"), Some("counts"), "counts", "queue"),
+        // A real walk runs: the newest real intent waits for it, one place.
+        (Some("real"), None, "real", "queue"),
+        (Some("real"), Some("real"), "real", "queue"),
+        (Some("real"), Some("counts"), "real", "queue"),
+        (Some("real"), None, "counts", "queue"),
+        (Some("real"), Some("counts"), "counts", "queue"),
+        // A real Next waits: its answer carries the counts, and it stays.
+        (Some("real"), Some("real"), "counts", "drop"),
+    ];
+    let request: Vec<Value> = table
+        .iter()
+        .map(|(r, w, want, _)| json!([r, w, want]))
+        .collect();
+    let got = node_with(driver, &json!(request));
+    let want: Vec<&str> = table.iter().map(|t| t.3).collect();
+    assert_eq!(got, json!(want));
+}
+
+/// What a landed `loadNext` answer shows (`assets/review-rules.js` `nextLanding`): a counts refresh
+/// keeps the frame on screen, but with nothing on screen it brings the frame it found, which is how
+/// the 2 s refresh while a big folder is indexed shows the first frame to come in.
+#[test]
+fn a_refresh_keeps_the_frame_on_screen_and_brings_one_when_there_is_none() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+process.stdout.write(JSON.stringify(
+  req.map(([kind, replaced, shown]) => globalThis.ReviewRules.nextLanding(kind, replaced, shown))));
+"#;
+    let table = [
+        // A real Next shows its frame, whatever was there.
+        ("real", false, true, "frame"),
+        ("real", false, false, "frame"),
+        // A newer real intent replaced it: that one lands.
+        ("real", true, true, "counts"),
+        ("real", true, false, "counts"),
+        // A counts refresh keeps the frame on screen and its edits.
+        ("counts", false, true, "counts"),
+        // Nothing on screen (indexing, or no frame matched): it shows what it found.
+        ("counts", false, false, "frame"),
+        ("counts", true, false, "counts"),
+        ("counts", true, true, "counts"),
+    ];
+    let request: Vec<Value> = table.iter().map(|(k, r, s, _)| json!([k, r, s])).collect();
+    let got = node_with(driver, &json!(request));
+    let want: Vec<&str> = table.iter().map(|t| t.3).collect();
+    assert_eq!(got, json!(want));
 }
 
 /// Needs no `node`: the page loads the rules first, and they stay pure.

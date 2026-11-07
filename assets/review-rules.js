@@ -213,6 +213,34 @@
     if (labels.empty_confirmed) labels.empty_confirmed = false;
   }
 
+  // What a new call of the page's `loadNext` does while `running` ('real', 'counts' or null) and
+  // `waiting` (the same, or null) stand; `want` is 'real' or 'counts'. GET /v1/review/next walks the
+  // whole folder, seconds on a big one, so at most one real walk runs and the newest intent wins:
+  // 'start'  nothing runs: go;
+  // 'jump'   only a counts refresh runs: a real Next must not wait for it, and its answer, which
+  //          carries newer counts, replaces that refresh and any waiting one;
+  // 'queue'  take the one waiting place, after the running walk; a real intent also stops a real
+  //          walk from landing (a filter changed, or a save must move on from its own frame);
+  // 'drop'   a real Next already waits, and its answer will carry the counts.
+  // A refresh never cancels a real Next: it only ever waits, or is dropped for one.
+  function nextPlan(running, waiting, want) {
+    if (!running) return 'start';
+    if (want === 'real') return running === 'counts' ? 'jump' : 'queue';
+    return waiting === 'real' ? 'drop' : 'queue';
+  }
+
+  // What an answer of the page's `loadNext` shows once it lands, for a walk of `kind` ('real' or
+  // 'counts'): 'frame' its frame (or "no frame matches"), 'counts' the counts and lists only. A walk
+  // a newer real intent replaced (`replaced`) leaves the frame to that one. A counts refresh keeps
+  // the frame on screen and its edits; with none on screen or loading (`shown` false) it shows what
+  // it found: that is how the 2 s refresh while a big folder is indexed brings the first frame, and
+  // swaps "Indexing..." for "No frame matches" once the index is done with none.
+  function nextLanding(kind, replaced, shown) {
+    if (replaced) return 'counts';
+    if (kind === 'real') return 'frame';
+    return shown ? 'counts' : 'frame';
+  }
+
   globalThis.ReviewRules = {
     STACK_IOU: STACK_IOU,
     OVERLAP_IOU: OVERLAP_IOU,
@@ -232,6 +260,8 @@
     liveSuggestions: liveSuggestions,
     markRejected: markRejected,
     markDuplicate: markDuplicate,
-    acceptOverlap: acceptOverlap
+    acceptOverlap: acceptOverlap,
+    nextPlan: nextPlan,
+    nextLanding: nextLanding
   };
 }());

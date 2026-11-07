@@ -35,12 +35,14 @@ pub use record::{Bucket, Record, decide};
 
 use crate::model::Detection;
 use crate::model::filters::SuppressReason;
+use crate::sync::LockExt;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use metrics::{Dropped, METRICS};
 use record::{BoxPx, Det};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::warn;
 
 /// Frames waiting for the collector thread at most (each holds its encoded image).
@@ -49,6 +51,8 @@ pub const QUEUE: usize = 16;
 pub const PRUNE_INTERVAL: Duration = crate::retention::SWEEP_INTERVAL;
 /// Most below-threshold detections recorded per frame (highest first).
 pub const MAX_BELOW: usize = 20;
+/// How long [`Collector::brief_of`] keeps the summary of a folder that is not the collector's.
+const BRIEF_TTL: Duration = Duration::from_secs(10);
 
 /// UTC RFC 3339 with milliseconds (`2026-10-22T12:34:56.789Z`).
 pub fn utc_rfc3339(t: SystemTime) -> String {
@@ -236,6 +240,8 @@ enum Msg {
 pub struct Collector {
     tx: OnceLock<Option<Sender<Msg>>>,
     status: Arc<Mutex<Status>>,
+    /// [`Self::brief_of`]'s summaries of folders that are not the collector's, with their age.
+    briefs: Mutex<HashMap<PathBuf, (Instant, Summary)>>,
 }
 
 impl std::fmt::Debug for Msg {
@@ -256,6 +262,7 @@ pub fn global() -> &'static Collector {
     GLOBAL.get_or_init(|| Collector {
         tx: OnceLock::new(),
         status: Arc::new(Mutex::new(Status::default())),
+        briefs: Mutex::new(HashMap::new()),
     })
 }
 
@@ -348,7 +355,7 @@ impl Collector {
     /// describes `dir`, else read from disk now, every label file included; call off the async
     /// runtime), the disk stop reason, the last frame and the last error.
     pub fn status_of(&self, dir: &std::path::Path) -> Status {
-        let mut s = self.brief_of(dir);
+        let mut s = self.status_with(dir, &|| Summary::scan(dir));
         if self.describes(dir) {
             return s;
         }
@@ -356,8 +363,29 @@ impl Collector {
         s
     }
 
-    /// [`Self::status_of`] without the walk over the label files, for Home.
+    /// [`Self::status_of`] without the walk over the label files and, for a folder that is not the
+    /// collector's, with a summary up to [`BRIEF_TTL`] old: Home and the Train strip ask often.
     pub fn brief_of(&self, dir: &std::path::Path) -> Status {
+        self.status_with(dir, &|| self.brief_summary(dir, BRIEF_TTL))
+    }
+
+    /// The summary of `dir` kept for `ttl`, else a new one. No lock is held during the scan: two
+    /// callers at once may both scan, and neither waits for the other's slow disk.
+    fn brief_summary(&self, dir: &std::path::Path, ttl: Duration) -> Summary {
+        if let Some((at, s)) = self.briefs.lock_recover().get(dir)
+            && at.elapsed() < ttl
+        {
+            return s.clone();
+        }
+        let s = Summary::scan(dir);
+        let mut kept = self.briefs.lock_recover();
+        kept.retain(|_, (at, _)| at.elapsed() < ttl);
+        kept.insert(dir.to_path_buf(), (Instant::now(), s.clone()));
+        s
+    }
+
+    /// The collector's status when it describes `dir`, else with `summary`'s.
+    fn status_with(&self, dir: &std::path::Path, summary: &dyn Fn() -> Summary) -> Status {
         let s = self
             .status
             .lock()
@@ -368,7 +396,7 @@ impl Collector {
         }
         Status {
             dir: Some(dir.to_path_buf()),
-            summary: Summary::scan(dir),
+            summary: summary(),
             usage: crate::retention::DatasetUsage::default(),
             last_saved_at: None,
             ..s
@@ -442,6 +470,7 @@ mod tests {
                 disabled: Some(disabled.to_string()),
                 ..Status::default()
             })),
+            briefs: Mutex::new(HashMap::new()),
         };
         c.tx.set(Some(tx)).unwrap();
         c
@@ -535,5 +564,45 @@ mod tests {
         });
         assert_eq!(d.record.suppressed.len(), 2);
         assert_eq!(d.record.suppressed[1].reason, "verify");
+    }
+
+    #[test]
+    fn a_brief_of_another_folder_is_kept_for_a_moment_and_a_status_reads_now() {
+        let (tx, _rx) = crossbeam_channel::bounded::<Msg>(1);
+        let c = collector(tx, "x");
+        let dir = std::env::temp_dir().join(format!("bop-brief-{}", uuid::Uuid::new_v4()));
+        let day = dir.join("ir/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        assert_eq!(c.brief_of(&dir).summary.frames, 0);
+        let line = record::IndexLine {
+            id: "a".into(),
+            timestamp: "2026-10-22T00:00:00Z".into(),
+            scene: "ir".into(),
+            camera: "cam".into(),
+            model: "m".into(),
+            buckets: vec![],
+            labels: vec![],
+            bytes: 1,
+        };
+        let text = serde_json::to_string(&line).unwrap();
+        std::fs::write(day.join(layout::INDEX_FILE), text + "\n").unwrap();
+        assert_eq!(c.brief_of(&dir).summary.frames, 0, "kept");
+        assert_eq!(
+            c.status_of(&dir).summary.frames,
+            1,
+            "not kept: a page asked"
+        );
+        // Past its time.
+        assert_eq!(c.brief_summary(&dir, Duration::ZERO).frames, 1);
+        assert_eq!(c.brief_of(&dir).summary.frames, 1, "replaced");
+        // Per folder.
+        let other = dir.join("other");
+        assert_eq!(c.brief_of(&other).summary.frames, 0);
+        assert_eq!(c.brief_of(&dir).summary.frames, 1);
+        // The collector's own folder never goes through it.
+        c.status.lock().unwrap().dir = Some(dir.clone());
+        c.status.lock().unwrap().summary.frames = 7;
+        assert_eq!(c.brief_of(&dir).summary.frames, 7);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

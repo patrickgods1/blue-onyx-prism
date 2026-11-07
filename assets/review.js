@@ -2231,7 +2231,10 @@
       s.appendChild(el('span', 'k', k + ' '));
       s.appendChild(document.createTextNode(String(v)));
       box.appendChild(s);
+      return s;
     };
+    // A big folder's index still filling in: the counts and the order are of the frames so far.
+    if (j.indexing) add('Indexing', indexingRest(j.indexing)).id = 'rv-indexing';
     add('Reviewed', c.reviewed || 0);
     add('Remaining', c.remaining || 0);
     add('Skipped', c.skipped || 0);
@@ -2253,15 +2256,17 @@
     add('Matching', j.position ? (j.position + ' of ' + j.total) : (j.total || 0));
     if (j.unreadable) add('Unreadable', j.unreadable);
     queuePlace = j.position ? (j.position + ' of ' + j.total) : '';
+    // The counts are behind Details on a phone: the line says the order is still filling in.
+    phoneIndexing = j.indexing ? 'indexing' : '';
     setPhoneLine();
   }
 
   // Phones: one line over the frame; Details opens the counts, the filters and the frame's facts.
-  var queuePlace = '';
+  var queuePlace = '', phoneIndexing = '';
   function setPhoneLine() {
     if (!phoneLine) return;
     var r = (cur && cur.record) || {};
-    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
+    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', phoneIndexing, r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
     phoneLine.title = $('rv-meta').textContent;
   }
 
@@ -2288,10 +2293,16 @@
     return out;
   }
 
-  // The Class filter: remember the classes the queue saw.
+  // The Class filter: remember the classes the queue saw. Drawn again only when its entries
+  // change: the counts refresh while a folder is indexed comes every 2 s, maybe with it open.
+  var labelsDrawn = '';
   function fillLabels(list) {
     (list || []).forEach(function (c) { if (seenLabels.indexOf(c) < 0) seenLabels.push(c); });
-    if (labelPicker) labelPicker.setEntries(buildEntries());
+    if (!labelPicker) return;
+    var entries = buildEntries(), key = JSON.stringify(entries);
+    if (key === labelsDrawn) return;
+    labelsDrawn = key;
+    labelPicker.setEntries(entries);
   }
 
   function fillClassSelect() {
@@ -2351,6 +2362,50 @@
     if (!$('rv-none').hidden || !missingNote.hidden) showNone(true);
   }
 
+  // A big folder's index filling in (`indexing` of GET /v1/review/next, absent once done): its
+  // progress in the counts, and in place of "no frame matches" while no frame has come in yet (in
+  // the same paragraph, so it shows where and as that does). A counts refresh every 2 s follows it
+  // until it is done, the page is hidden or left.
+  var noneText = el('span'), indexNote = el('span');
+  while ($('rv-none').firstChild) noneText.appendChild($('rv-none').firstChild);
+  indexNote.id = 'rv-indexing-none';
+  indexNote.hidden = true;
+  $('rv-none').appendChild(noneText);
+  $('rv-none').appendChild(indexNote);
+  var indexing = null, indexTimer = null;
+  var INDEX_POLL_MS = 2000;
+  // The frames are still being counted at first: no "0 of 0".
+  function indexingRest(ix) {
+    var of = ix.total ? (ix.done || 0) + ' of ' + ix.total + ' frames' : 'the frames';
+    return of + '. Counts and order are still filling in.';
+  }
+  function stopIndexPoll() {
+    if (indexTimer) clearTimeout(indexTimer);
+    indexTimer = null;
+  }
+  function followIndexing(ix) {
+    indexing = ix || null;
+    indexNote.textContent = indexing ? 'Indexing ' + indexingRest(indexing) : '';
+    indexNote.hidden = !indexing;
+    noneText.hidden = !!indexing;
+    pollIndexing();
+  }
+  function pollIndexing() {
+    stopIndexPoll();
+    if (!indexing || document.hidden) return;
+    indexTimer = setTimeout(function () {
+      indexTimer = null;
+      loadNext(null, null, true);
+    }, INDEX_POLL_MS);
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) stopIndexPoll();
+    else if (indexing && !indexTimer) loadNext(null, null, true);
+  });
+  // Leaving the tab (or the page kept in the back-forward cache): no refresh in the background.
+  window.addEventListener('pagehide', stopIndexPoll);
+  window.addEventListener('pageshow', function (e) { if (e.persisted) pollIndexing(); });
+
   function prefetch() {
     var next = upcoming[0];
     if (!next || (cur && next === cur.frame)) return;
@@ -2358,10 +2413,15 @@
     prefetchImg.src = '/dataset/image?path=' + encodeURIComponent(next);
   }
 
+  // Frames on their way to the screen (`loadFrame`): a counts refresh does not land over one.
+  var framesLoading = 0;
+
   // `nav`: 'back' (`p`) or 'forward' (`n` after Back); else a move on, which forgets the frames
   // Back left.
   function loadFrame(frame, nav) {
     clearReason(true);
+    framesLoading++;
+    var settled = function () { framesLoading--; };
     return api('/v1/review/labels?frame=' + encodeURIComponent(frame)).then(function (j) {
       if (cur && cur.frame !== j.frame) {
         if (nav === 'back') fwdStack.push(cur.frame);
@@ -2396,20 +2456,50 @@
       refresh();
       revealFrame();
       prefetch();
-    });
+    }).then(settled, function (e) { settled(); throw e; });
+  }
+
+  // The walk of /v1/review/next running ({countsOnly, stale: answer ignored, noLanding: counts
+  // only, done: promise}), and the newest intent waiting for it (R.nextPlan decides).
+  var nextRun = null, nextWaiting = null;
+
+  // A real Next is on its way: another press would only repeat the same walk.
+  function nextComing() {
+    return !!((nextRun && !nextRun.countsOnly) || (nextWaiting && !nextWaiting.countsOnly));
   }
 
   // The next frame after `after` (the first without), `note` said first; `countsOnly` refreshes
-  // the counts and lists and keeps the frame on screen (and its edits).
+  // the counts and lists and keeps the frame on screen (and its edits). At most one walk at a time
+  // for a real Next; the promise ends once what this call asked for, or what replaced it, is done.
   function loadNext(after, note, countsOnly) {
+    var want = { after: after, note: note, countsOnly: !!countsOnly };
+    var kind = function (w) { return w ? (w.countsOnly ? 'counts' : 'real') : null; };
+    var plan = R.nextPlan(kind(nextRun), kind(nextWaiting), kind(want));
+    if (plan === 'drop') return nextRun.done;
+    if (plan === 'queue') {
+      if (!want.countsOnly) nextRun.noLanding = true;
+      nextWaiting = want;
+      return nextRun.done;
+    }
+    if (plan === 'jump') { nextRun.stale = true; nextWaiting = null; }
+    return runNext(want);
+  }
+
+  function runNext(want) {
+    var run = { countsOnly: want.countsOnly, stale: false, noLanding: false, done: null };
+    var after = want.after, note = want.note, countsOnly = want.countsOnly;
+    nextRun = run;
     var p = filterParams();
     if (after) p.set('after', after);
-    return api('/v1/review/next?' + p.toString()).then(function (j) {
+    run.done = api('/v1/review/next?' + p.toString()).then(function (j) {
+      if (run.stale) return;
       showCounts(j);
       fillCameras(j.cameras);
       fillLabels(j.labels);
       noteMissing(j.folder_missing ? j.message : '');
-      if (countsOnly) return;
+      followIndexing(j.indexing);
+      var shown = !!cur || framesLoading > 0;
+      if (R.nextLanding(countsOnly ? 'counts' : 'real', run.noLanding, shown) === 'counts') return;
       upcoming = Array.isArray(j.upcoming) ? j.upcoming : [];
       var text = note || '';
       if (j.wrapped) text = (text ? text + ' ' : '') + 'Back to the first frame of the queue.';
@@ -2421,7 +2511,19 @@
         return;
       }
       return loadFrame(j.item.frame);
-    }).catch(function (e) { say(e.message, true); });
+    }).catch(function (e) {
+      if (run.stale) return;
+      say(e.message, true);
+      // A failed refresh does not end the indexing message: the next one may answer.
+      if (indexing) pollIndexing();
+    }).then(function () {
+      if (nextRun !== run) return;
+      var w = nextWaiting;
+      nextRun = null;
+      nextWaiting = null;
+      if (w) return runNext(w);
+    });
+    return run.done;
   }
 
   // After a job or a bulk accept: a frame with unsaved edits stays, else the queue reloads.
@@ -2529,6 +2631,7 @@
 
   // `n`: the next frame without saving; after Back, the frame Back left.
   function skipToNext() {
+    if (nextComing()) return;
     if (!cur) return loadNext();
     if (!leaveOk()) return;
     if (fwdStack.length) {
@@ -2821,7 +2924,11 @@
     if (document.querySelector('dialog[open]')) return;
     // Letters are case-blind (Caps Lock); Shift is read from shiftKey.
     var k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
-    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY' || t.tagName === 'INPUT') && (k === 'Enter' || k === ' ')) return;
+    if (t && (t.tagName === 'BUTTON' || t.tagName === 'SUMMARY' || t.tagName === 'INPUT') && (k === 'Enter' || k === ' ')) {
+      // Held on a button, Enter clicks it again per repeat, and a second Save is "save anyway".
+      if (ev.repeat && t.tagName === 'BUTTON') ev.preventDefault();
+      return;
+    }
     // A letter on a box's class select is a shortcut, never "jump to the class starting with it";
     // the frame takes the focus back.
     if (t && t.tagName === 'SELECT') {
@@ -2871,10 +2978,12 @@
     } else if (k === 'r') {
       if (ev.shiftKey) rejectRest(); else rejectSelected();
     }
-    else if (k === 'n') skipToNext();
+    // Held keys: `n` and `s` once per press (each costs a walk of the folder, and a second `s` is
+    // what passes the save's "are you sure" steps); the arrows above keep repeating.
+    else if (k === 'n') { if (!ev.repeat) skipToNext(); }
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();
-    else if (k === 's' || k === 'Enter') save('reviewed');
+    else if (k === 's' || k === 'Enter') { if (!ev.repeat) save('reviewed'); }
     else if (k === 'j') select(stepShown(1), true);
     else if (k === 'k') select(stepShown(-1), true);
     else if (k === 'Delete' || k === 'Backspace') {
