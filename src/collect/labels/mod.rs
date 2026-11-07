@@ -3309,6 +3309,8 @@ mod tests {
         } else {
             orphans.push("linked.jpg");
         }
+        // Both lists come by name, as the day folder is listed.
+        orphans.sort_unstable();
         assert_eq!(rels(&scan.files), files);
         assert_eq!(rels(&scan.orphans), orphans);
         let _ = std::fs::remove_dir_all(dir);
