@@ -7,13 +7,19 @@
 //! - [`refusals`]: data a run must not start on, with the next action;
 //! - [`report`]: boxes per class and scene, the splits, the bulk-accepted share, frames dropped;
 //! - [`run_needs`], [`combine`], [`refusal`]: disk needed against disk free, the volumes and the free
-//!   space kept ([`disk::margin`]) as for an import.
+//!   space kept ([`disk::margin`]) as for an import;
+//! - [`gpu_need`], [`gpu_warning`]: the run's estimated GPU memory against what the card has free
+//!   now ([`crate::backend::vram`]), naming the service's models loaded on it; a warning, never a
+//!   refusal, and none when the card cannot be read.
 //!
-//! Everything here is advice over a pure plan, but for reading file sizes and [`disk::space`].
+//! Everything here is advice over a pure plan, but for reading file sizes, [`disk::space`] and the
+//! card's free memory.
 
+use super::capability::Accelerator;
 use super::dataset::{self, FrameRef, Options, Plan, SceneCounts, Source};
 use super::import::disk::{self, Space};
 use super::recipe::TrainRecipe;
+use crate::backend::vram;
 use crate::resources::catalog::{self, Trainer};
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
@@ -508,6 +514,48 @@ pub fn refusal(needs: &[(VolumeNeed, Option<Space>)]) -> Option<String> {
         })
         .collect();
     (!lines.is_empty()).then(|| lines.join(" "))
+}
+
+/// What a run of `recipe` needs on `accel`: the Train tab's estimate at the recipe's batch and
+/// size ([`super::estimate`], RF-DETR multi-scale as the run decides it). None when the family
+/// and size have no estimate there.
+pub fn gpu_need(recipe: &TrainRecipe, accel: &Accelerator) -> Option<vram::JobNeed> {
+    let multi_scale = recipe.multi_scale_on(accel.memory_mb());
+    let est = super::estimate::estimate_with(
+        recipe.family,
+        &recipe.size,
+        recipe.imgsz,
+        recipe.batch,
+        1,
+        1,
+        accel.target(),
+        multi_scale,
+    )?;
+    Some(vram::JobNeed {
+        what: "this training run".into(),
+        need_mb: est.vram_mb,
+        detail: format!(
+            "{} {} at batch {} and {} px{}, the Train tab's estimate",
+            recipe.family.title(),
+            recipe.size,
+            recipe.batch,
+            recipe.imgsz,
+            if multi_scale { " multi-scale" } else { "" }
+        ),
+        smaller: "a smaller batch or size".into(),
+    })
+}
+
+/// The warning before a run of `recipe` on `accel` when its card is short of free memory now
+/// ([`vram::check_cuda_job`]); None when it fits, when the card cannot be read, and on Apple
+/// silicon (unified memory: the system decides).
+pub fn gpu_warning(recipe: &TrainRecipe, accel: &Accelerator) -> Option<String> {
+    match accel {
+        Accelerator::Cuda { ordinal, .. } => {
+            vram::check_cuda_job(*ordinal, &gpu_need(recipe, accel)?)
+        }
+        Accelerator::Mps { .. } => None,
+    }
 }
 
 #[cfg(test)]

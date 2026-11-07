@@ -3,7 +3,8 @@
 //! folder, and `<dir>/review-queue.jsonl`. Names, the relative-path check every served or
 //! queued path goes through ([`parse_rel`], [`resolve`], and [`Walker`] for a walk over many
 //! frames), the summary rebuilt from the index files ([`Summary::scan`]) and the review queue
-//! ([`append_review`]).
+//! ([`append_review`]; [`compact_review`] drops its duplicate and dangling lines, both under the
+//! queue's cross-process lock [`QUEUE_LOCK_FILE`]).
 //!
 //! The JSONL files survive a crash or a full disk: [`append_line`] ends a torn last line before
 //! writing, and [`read_lines`] costs a damaged line only that line, and counts it.
@@ -580,8 +581,73 @@ pub struct ReviewLine {
     pub queued_at: String,
 }
 
-/// Serializes the appends of [`append_review`] within the process.
+/// Serializes the writers of the review queue ([`append_review`], [`compact_review`]) within the
+/// process. Taken before [`QUEUE_LOCK_FILE`].
 static REVIEW_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The review queue's cross-process lock at the dataset's root (zero bytes, never deleted): a
+/// `blue-onyx-prism train` command and the service append to the same queue, and a compaction
+/// rewrites it.
+pub const QUEUE_LOCK_FILE: &str = ".review-queue.lock";
+/// Longest wait of an append for the queue lock. Writers hold it for milliseconds; running out
+/// means a stopped process, and the append goes on (queueing wins over waiting).
+const QUEUE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Longest wait of a compaction for the queue lock: it is a chore, tried again at the next sweep.
+const COMPACT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What [`queue_lock`] holds: the folder lock (None when it could not be had), then this
+/// process's.
+struct QueueLock {
+    folder: Option<std::fs::File>,
+    _process: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl Drop for QueueLock {
+    fn drop(&mut self) {
+        if let Some(f) = &self.folder {
+            let _ = fs4::FileExt::unlock(f);
+        }
+    }
+}
+
+/// The queue lock of the dataset `dir`: this process's mutex (unless `process` is false, which
+/// only the tests use, to act as another process), then [`QUEUE_LOCK_FILE`], waiting at most
+/// `wait` for it.
+fn queue_lock(dir: &Path, wait: std::time::Duration, process: bool) -> QueueLock {
+    let held = process.then(|| REVIEW_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+    let path = dir.join(QUEUE_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path);
+    let folder = match file {
+        Ok(f) => {
+            let start = std::time::Instant::now();
+            loop {
+                match fs4::FileExt::try_lock(&f) {
+                    Ok(()) => break Some(f),
+                    Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(e) => {
+                        tracing::debug!("{}: {e}", path.display());
+                        break None;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!("{}: {e}", path.display());
+            None
+        }
+    };
+    QueueLock {
+        folder,
+        _process: held,
+    }
+}
 
 /// Queue the frames `rels` (image paths relative to `dir`) for review: every one must parse
 /// and exist with its sidecar; frames already queued are skipped. Returns how many were added.
@@ -610,7 +676,26 @@ pub fn append_review(dir: &Path, rels: &[String]) -> Result<usize> {
             queued_at: super::utc_rfc3339(std::time::SystemTime::now()),
         });
     }
-    let _held = REVIEW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let lock = queue_lock(dir, QUEUE_LOCK_WAIT, true);
+    if lock.folder.is_none() {
+        tracing::debug!(
+            "{}: queueing without the folder lock (it could not be had)",
+            dir.join(QUEUE_LOCK_FILE).display()
+        );
+    }
+    let added = append_review_lines(dir, lines)?;
+    drop(lock);
+    if added > 0 {
+        super::labels::index::queue_written(dir);
+    }
+    Ok(added)
+}
+
+/// The append of [`append_review`], under the caller's [`queue_lock`].
+fn append_review_lines(dir: &Path, lines: Vec<ReviewLine>) -> Result<usize> {
     let path = dir.join(REVIEW_QUEUE_FILE);
     let queued: BTreeSet<String> = read_review(&path).into_iter().map(|l| l.frame).collect();
     let mut added = 0;
@@ -623,10 +708,84 @@ pub fn append_review(dir: &Path, rels: &[String]) -> Result<usize> {
             .with_context(|| format!("writing {}", path.display()))?;
         added += 1;
     }
-    if added > 0 {
+    Ok(added)
+}
+
+/// What [`compact_review`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compacted {
+    /// Lines kept (damaged ones among them, byte for byte).
+    pub kept: usize,
+    /// Later lines of a frame queued already.
+    pub duplicates: usize,
+    /// Lines of a frame whose image is gone.
+    pub gone: usize,
+}
+
+impl Compacted {
+    pub fn dropped(&self) -> usize {
+        self.duplicates + self.gone
+    }
+}
+
+/// Rewrite `dir`'s review queue without duplicate lines (the first of a frame stays) and lines of
+/// frames whose image is gone, under the queue lock, so no append of this or another process is
+/// lost. A line that does not parse is kept as it is (a person may still read it). Ok(None): no
+/// queue, or the lock could not be had (then nothing is written; the next sweep tries again).
+pub fn compact_review(dir: &Path) -> Result<Option<Compacted>> {
+    if !dir.join(REVIEW_QUEUE_FILE).is_file() {
+        return Ok(None);
+    }
+    let lock = queue_lock(dir, COMPACT_LOCK_WAIT, true);
+    if lock.folder.is_none() {
+        return Ok(None);
+    }
+    let done = compact_locked(dir)?;
+    drop(lock);
+    if done.is_some_and(|c| c.dropped() > 0) {
         super::labels::index::queue_written(dir);
     }
-    Ok(added)
+    Ok(done)
+}
+
+/// [`compact_review`] under the caller's lock.
+fn compact_locked(dir: &Path) -> Result<Option<Compacted>> {
+    let path = dir.join(REVIEW_QUEUE_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut out = Compacted::default();
+    let mut seen = BTreeSet::new();
+    let mut text: Vec<u8> = Vec::with_capacity(bytes.len());
+    for raw in bytes.split(|b| *b == b'\n') {
+        if String::from_utf8_lossy(raw).trim().is_empty() {
+            continue;
+        }
+        let line = serde_json::from_str::<ReviewLine>(&String::from_utf8_lossy(raw)).ok();
+        if let Some(l) = &line {
+            if !seen.insert(l.frame.clone()) {
+                out.duplicates += 1;
+                continue;
+            }
+            let gone = parse_rel(&l.frame).is_some_and(|r| {
+                std::fs::symlink_metadata(r.to_path(dir, "jpg"))
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            });
+            if gone {
+                out.gone += 1;
+                continue;
+            }
+        }
+        out.kept += 1;
+        text.extend_from_slice(raw);
+        text.push(b'\n');
+    }
+    if out.dropped() > 0 {
+        write_atomic(&path, &text).with_context(|| format!("rewriting {}", path.display()))?;
+    }
+    Ok(Some(out))
 }
 
 /// The parsable lines of the review queue.
@@ -794,6 +953,115 @@ mod tests {
             camera: "cam".into(),
             queued_at: "2026-10-22T00:00:00Z".into(),
         }
+    }
+
+    /// An image for each of `frames` (`<scene>/<camera>/<date>/<stem>.jpg`).
+    fn images(dir: &Path, frames: &[String]) {
+        for f in frames {
+            let p = dir.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        }
+    }
+
+    fn frame(i: usize) -> String {
+        format!("ir/c/2026-10-22/20261022T000000000Z_f{i}.jpg")
+    }
+
+    #[test]
+    fn compaction_drops_duplicates_and_gone_frames_and_keeps_the_rest_in_order() {
+        let dir = tmp("compact");
+        let (a, b, gone) = (frame(1), frame(2), frame(3));
+        images(&dir, &[a.clone(), b.clone()]);
+        let queue = dir.join(REVIEW_QUEUE_FILE);
+        let line = |f: &str| serde_json::to_string(&review_line(f)).unwrap();
+        let mut text = String::new();
+        for l in [
+            line(&b),
+            line(&a),
+            line(&gone),
+            line(&b),
+            "{damaged".into(),
+            line(&a),
+        ] {
+            text.push_str(&l);
+            text.push('\n');
+        }
+        std::fs::write(&queue, &text).unwrap();
+        let c = compact_review(&dir).unwrap().unwrap();
+        assert_eq!(
+            c,
+            Compacted {
+                kept: 3,
+                duplicates: 2,
+                gone: 1
+            }
+        );
+        let frames: Vec<String> = read_review(&queue).into_iter().map(|l| l.frame).collect();
+        assert_eq!(
+            frames,
+            [b.clone(), a.clone()],
+            "first line of each frame, in order"
+        );
+        assert_eq!(
+            read_lines::<ReviewLine>(&queue).damaged,
+            1,
+            "a damaged line is kept"
+        );
+        // Nothing left to drop: the file is not rewritten.
+        let before = std::fs::read(&queue).unwrap();
+        assert_eq!(compact_review(&dir).unwrap().unwrap().dropped(), 0);
+        assert_eq!(std::fs::read(&queue).unwrap(), before);
+        // No queue: nothing to do. A queue whose lock another process holds: left alone.
+        assert_eq!(compact_review(&tmp("none")).unwrap(), None);
+        std::fs::write(&queue, format!("{}\n{}\n", line(&a), line(&a))).unwrap();
+        let other = queue_lock(&dir, std::time::Duration::ZERO, false);
+        assert!(other.folder.is_some());
+        let started = std::time::Instant::now();
+        assert_eq!(compact_review(&dir).unwrap(), None);
+        assert!(started.elapsed() >= COMPACT_LOCK_WAIT);
+        drop(other);
+        assert_eq!(compact_review(&dir).unwrap().unwrap().duplicates, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_append_of_another_process_during_compaction_is_never_lost() {
+        let dir = tmp("two-writers");
+        const N: usize = 300;
+        let frames: Vec<String> = (0..N).map(frame).collect();
+        images(&dir, &frames);
+        let queue = dir.join(REVIEW_QUEUE_FILE);
+        std::thread::scope(|s| {
+            // "Another process": the folder lock only, never this process's mutex.
+            s.spawn(|| {
+                for f in &frames {
+                    let lock = queue_lock(&dir, QUEUE_LOCK_WAIT, false);
+                    assert!(lock.folder.is_some());
+                    append_review_lines(&dir, vec![review_line(f)]).unwrap();
+                }
+            });
+            s.spawn(|| {
+                for i in 0..N {
+                    // A line of a frame that is gone, so every compaction rewrites the file.
+                    {
+                        let _l = queue_lock(&dir, QUEUE_LOCK_WAIT, true);
+                        let gone = format!("ir/c/2026-10-23/20261023T000000000Z_g{i}.jpg");
+                        append_line(&queue, &serde_json::to_string(&review_line(&gone)).unwrap())
+                            .unwrap();
+                    }
+                    compact_review(&dir).unwrap();
+                }
+            });
+        });
+        compact_review(&dir).unwrap();
+        let mut got: Vec<String> = read_review(&queue).into_iter().map(|l| l.frame).collect();
+        got.sort();
+        let mut want = frames.clone();
+        want.sort();
+        assert_eq!(got.len(), N, "every appended frame is still queued");
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

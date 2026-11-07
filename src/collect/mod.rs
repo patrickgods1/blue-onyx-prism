@@ -139,7 +139,7 @@ impl Draft {
             model: i.model.to_string(),
             device: i.device.to_string(),
             routed_from: i.routed_from.map(str::to_string),
-            image_name: i.image_name.to_string(),
+            image_name: crate::static_memory::cap_name(i.image_name).to_string(),
             camera: camera_dir(&camera_key, i.width, i.height),
             camera_key,
             scene: i.stats.scene().as_str().to_string(),
@@ -504,6 +504,30 @@ mod tests {
         assert_eq!(utc_rfc3339(t), "2026-09-21T14:13:20.123Z");
         assert_eq!(utc_date(t), "2026-09-21");
         assert_eq!(utc_file_ts(t), "20260921T141320123Z");
+    }
+
+    /// M2: a long upload name is cut before it reaches the sidecar (the camera folder has its own,
+    /// shorter cap).
+    #[test]
+    fn a_draft_caps_the_image_name_and_camera_key() {
+        let name = format!("{}.jpg", "Ä".repeat(500));
+        let d = Draft::new(&DraftInput {
+            model: "m",
+            device: "openvino:cpu",
+            request_id: "abc",
+            routed_from: None,
+            image_name: &name,
+            stats: crate::image_stats::ImageStats::default(),
+            width: 100,
+            height: 80,
+            threshold: 0.5,
+            near_margin: None,
+        });
+        let cap = crate::static_memory::MAX_NAME_BYTES;
+        assert!(d.record.image_name.len() <= cap && d.record.image_name.len() > cap - 4);
+        assert!(name.starts_with(&d.record.image_name));
+        assert!(d.record.camera_key.len() <= cap);
+        assert!(d.record.camera.len() <= 64, "the camera folder's own cap");
     }
 
     #[test]

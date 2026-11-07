@@ -11,8 +11,9 @@
 //!   LUID (Windows) or PCI bus id (Linux), then by name. No driver, or any failing call, leaves
 //!   them unknown.
 //!
-//! The result is computed once per process ([`hardware`]). The parsers are pure functions so they
-//! are unit-tested with literal file contents.
+//! The result is computed once per process ([`hardware`], with each GPU's LUID / PCI address in
+//! [`adapter_ids`]); free memory changes all the time and is read live by [`super::vram`]. The
+//! parsers are pure functions so they are unit-tested with literal file contents.
 
 use serde::{Serialize, Serializer};
 use std::fmt;
@@ -231,21 +232,76 @@ impl fmt::Display for GpuAdapter {
 
 /// Detected hardware, computed on first use and cached for the life of the process.
 pub fn hardware() -> &'static HardwareInfo {
-    static HW: OnceLock<HardwareInfo> = OnceLock::new();
-    HW.get_or_init(detect)
+    &detected().0
+}
+
+/// How the platform names each GPU of [`hardware`] (same order): what the live memory reading
+/// ([`super::vram`]) asks NVML / DXGI about.
+pub fn adapter_ids() -> &'static [AdapterIds] {
+    &detected().1
+}
+
+fn detected() -> &'static (HardwareInfo, Vec<AdapterIds>) {
+    static HW: OnceLock<(HardwareInfo, Vec<AdapterIds>)> = OnceLock::new();
+    HW.get_or_init(detect_with_ids)
+}
+
+/// The identifiers of one detected GPU beyond its [`GpuAdapter::index`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdapterIds {
+    /// Windows adapter LUID (`LowPart | HighPart << 32`).
+    pub luid: Option<u64>,
+    /// PCI location: the sysfs slot (Linux) or what the CUDA driver reports (NVIDIA).
+    pub pci: Option<PciAddress>,
+}
+
+/// [`AdapterIds`] of `gpus` from the platform `keys` and the CUDA driver's `cuda` devices
+/// (matched through [`GpuAdapter::cuda`]'s ordinal, which [`attach_cuda`] set). Pure.
+pub fn adapter_ids_of(
+    gpus: &[GpuAdapter],
+    keys: &[AdapterKey],
+    cuda: &[CudaDevice],
+) -> Vec<AdapterIds> {
+    gpus.iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let key = keys.get(i).copied().unwrap_or(AdapterKey::None);
+            let from_cuda = g
+                .cuda
+                .and_then(|c| cuda.iter().find(|d| d.ordinal == c.ordinal))
+                .and_then(|d| d.pci);
+            AdapterIds {
+                luid: match key {
+                    AdapterKey::Luid(l) => Some(l),
+                    _ => None,
+                },
+                pci: match key {
+                    AdapterKey::Pci(p) => Some(p),
+                    _ => from_cuda,
+                },
+            }
+        })
+        .collect()
 }
 
 /// Detect GPUs now (prefer the cached [`hardware`]). Never fails: errors are logged at debug
 /// level and yield fewer GPUs.
 pub fn detect() -> HardwareInfo {
+    detect_with_ids().0
+}
+
+fn detect_with_ids() -> (HardwareInfo, Vec<AdapterIds>) {
     let t = std::time::Instant::now();
     let (mut gpus, keys) = detect_gpus();
     let mut driver = None;
+    let mut cuda = Vec::new();
     if gpus.iter().any(|g| g.vendor == GpuVendor::Nvidia) {
-        let (cuda, version) = cuda_driver::probe();
-        attach_cuda(&mut gpus, &keys, &cuda);
+        let (devices, version) = cuda_driver::probe();
+        attach_cuda(&mut gpus, &keys, &devices);
         driver = version;
+        cuda = devices;
     }
+    let ids = adapter_ids_of(&gpus, &keys, &cuda);
     let mut hw = HardwareInfo::new(std::env::consts::OS, std::env::consts::ARCH, gpus);
     hw.cuda_driver = driver;
     tracing::debug!(
@@ -253,7 +309,7 @@ pub fn detect() -> HardwareInfo {
         ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX),
         "hardware detection"
     );
-    hw
+    (hw, ids)
 }
 
 /// GPUs plus, per GPU, the key that identifies it to the CUDA driver.
@@ -1206,5 +1262,56 @@ mod tests {
         let hw = hardware();
         assert_eq!(hw.os, std::env::consts::OS);
         assert_eq!(hw.arch, std::env::consts::ARCH);
+    }
+
+    #[test]
+    fn adapter_ids_come_from_the_platform_key_or_the_cuda_device() {
+        let pci = |bus| PciAddress {
+            domain: 0,
+            bus,
+            device: 0,
+            function: 0,
+        };
+        let mut gpus = vec![
+            adapter_from_ids(0, VENDOR_NVIDIA, 0x1B82, Some("GTX 1070 Ti"), 8192),
+            adapter_from_ids(1, VENDOR_INTEL, 0x3E92, Some("UHD 630"), 128),
+            adapter_from_ids(2, VENDOR_AMD, 0x73BF, Some("RX 6800"), 16368),
+        ];
+        let mut dev = cuda_dev(3, "GTX 1070 Ti", (6, 1), Some(7));
+        dev.pci = Some(pci(1));
+        attach_cuda(&mut gpus, &[AdapterKey::Luid(7)], &[dev.clone()]);
+        let keys = [
+            AdapterKey::Luid(7),
+            AdapterKey::Luid(9),
+            AdapterKey::Pci(pci(4)),
+        ];
+        let ids = adapter_ids_of(&gpus, &keys, &[dev]);
+        // NVIDIA on Windows: the LUID from DXGI, the PCI address from the CUDA driver.
+        assert_eq!(
+            ids[0],
+            AdapterIds {
+                luid: Some(7),
+                pci: Some(pci(1))
+            }
+        );
+        // No CUDA device: only the platform key.
+        assert_eq!(
+            ids[1],
+            AdapterIds {
+                luid: Some(9),
+                pci: None
+            }
+        );
+        // Linux: the sysfs slot.
+        assert_eq!(
+            ids[2],
+            AdapterIds {
+                luid: None,
+                pci: Some(pci(4))
+            }
+        );
+        // Fewer keys than GPUs (never on a real platform) leaves the rest unknown.
+        assert_eq!(adapter_ids_of(&gpus, &[], &[])[2], AdapterIds::default());
+        assert_eq!(adapter_ids().len(), hardware().gpus.len());
     }
 }

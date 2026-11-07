@@ -755,7 +755,7 @@ Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `n
 `night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked
 size, or `--model` repeated), and several scenes queue one run per scene per model
 ([Comparing](#comparing-day-nightir-and-mixed-models)); they run one at a time. Cancel
-kills the process tree. Run records are kept in `<training dir>/runs.json` (a damaged one moves to `runs.json.corrupt-<time>` and is logged, and a file that cannot be read is left alone and not saved over; `tasks.json` likewise; the working folder goes only after the model is registered); a run interrupted by a
+kills the process tree. Run records are kept in `<training dir>/runs.json` (state changes are saved at once, other progress at most every 5 minutes; `tasks.json` keeps the newest 200 finished tasks, runs are never dropped; a damaged one moves to `runs.json.corrupt-<time>` and is logged, and a file that cannot be read is left alone and not saved over; `tasks.json` likewise; the working folder goes only after the model is registered); a run interrupted by a
 stopped service is shown as failed. On Unix the trainer exits when the service process is gone; on
 Windows the job object does it.
 
@@ -871,8 +871,8 @@ The service maps the keys to stable ids (`src/training/progress.rs` `canonical`)
 `map75`, `mar`, `iou`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
 `f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, and `ema_map` ... for rfdetr's
 `val/ema_*`; unknown keys keep their raw name (`val/AP/raccoon`, `train/loss_ce`), so nothing is lost
-when a library renames one. Each run's `progress` in `runs.json` and `GET /v1/training` has
-`history` (one point per epoch: `epoch`, `elapsed_s`, `metrics`; an `eval` event fills its epoch's
+when a library renames one. Each run's `progress` in `GET /v1/training` has
+`history` (kept in `<run dir>/history.jsonl`, one line per new or changed epoch, so `runs.json` holds only `best` and the latest values; an older `runs.json` that still holds history is moved into the files at start; one point per epoch: `epoch`, `elapsed_s`, `metrics`; an `eval` event fills its epoch's
 point; at most 1000 points) and `best` (`{metric, epoch, value}` on the selected metric, by default
 `map`, else `map50`, else the lowest `val_loss`), which the stage text shows as "best mAP50-95 0.711 @ epoch 3". `GET /v1/training`
 also has `metrics` (label, short label, `higher_better`, `format` of every id) and `metric_columns`.

@@ -24,7 +24,7 @@
     <div class="tr-grid" data-mode="labelers">
       <div class="tr-field">
         <label for="al-gdino">Open-vocabulary labeler</label>
-        <select id="al-gdino" name="gdino"><option value="tiny">MM-Grounding-DINO tiny (Swin-T, 0.7 GB)</option><option value="base">MM-Grounding-DINO base (Swin-B, 0.9 GB)</option><option value="large">MM-Grounding-DINO large (Swin-L, 1.4 GB)</option><option value="sam3" id="al-gdino-sam3" disabled>SAM 3 (gated, needs the download below)</option><option value="off">off</option></select>
+        <select id="al-gdino" name="gdino"><option value="tiny" data-need-mb="1261">MM-Grounding-DINO tiny (Swin-T, 0.7 GB)</option><option value="base" data-need-mb="1493">MM-Grounding-DINO base (Swin-B, 0.9 GB)</option><option value="large" data-need-mb="1913">MM-Grounding-DINO large (Swin-L, 1.4 GB)</option><option value="sam3" data-need-mb="3886" id="al-gdino-sam3" disabled>SAM 3 (gated, needs the download below)</option><option value="off">off</option></select>
         <p class="muted small">Open vocabulary: the class list plus <code>training.synonyms</code>.</p>
         <div class="tr-sub" id="al-sam3-threshold-field" hidden>
           <label for="al-sam3-threshold">SAM 3 threshold</label>
@@ -47,8 +47,9 @@
       </div>
       <div class="tr-field">
         <label for="al-vlm">VLM check</label>
-        <select id="al-vlm" name="vlm"><option value="2b">Qwen3-VL 2B (4.3 GB)</option><option value="4b">Qwen3-VL 4B (8.9 GB)</option><option value="8b">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select>
+        <select id="al-vlm" name="vlm"><option value="2b" data-need-mb="4669">Qwen3-VL 2B (4.3 GB)</option><option value="4b" data-need-mb="9076">Qwen3-VL 4B (8.9 GB)</option><option value="8b" data-need-mb="17334">Qwen3-VL 8B (17.5 GB)</option><option value="off">off</option></select>
         <p class="muted small">Asks "Is there a real ...?" about each box; about 1 s per box.</p>
+        <p class="muted small" id="al-fit" hidden></p>
         <div class="tr-sub" id="al-vlm-options">
           <label class="check"><input type="checkbox" name="vlm_batch" checked> <span>Batch the check (up to 8 boxes per call)</span></label>
           <label class="check"><input type="checkbox" name="vlm_min_on" id="al-vlm-min-on" checked> <span>Skip boxes scoring <span class="tr-keep">below <input type="number" name="vlm_min_score" class="al-num" min="0.01" max="1" step="0.01" value="0.15" aria-label="VLM check minimum score"></span></span></label>

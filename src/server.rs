@@ -24,6 +24,7 @@ use tracing::{error, info, warn};
 mod apply;
 mod auth;
 mod benchmark;
+mod body_budget;
 mod browse;
 mod config_page;
 mod dataset;
@@ -37,6 +38,7 @@ mod resources;
 mod review;
 mod sam3_access;
 mod status;
+mod storage;
 #[cfg(test)]
 mod test_util;
 mod train_area;
@@ -205,6 +207,9 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/fs/pick", get(pick::status).post(pick::pick)),
         ("/v1/resources/export", post(resources_export)),
         ("/v1/resources/export/cancel", post(resources_export_cancel)),
+        ("/v1/storage", get(storage::status)),
+        ("/v1/storage/clear", post(storage::clear)),
+        ("/v1/storage/exports/remove", post(storage::remove_export)),
         ("/stats", get(stats_page)),
         ("/test", get(test_page).post(test_submit)),
         ("/config", get(config_page).post(config_submit)),
@@ -1206,6 +1211,9 @@ mod tests {
             "/v1/fs/pick",
             "/v1/resources/export",
             "/v1/resources/export/cancel",
+            "/v1/storage",
+            "/v1/storage/clear",
+            "/v1/storage/exports/remove",
             "/stats",
             "/test",
             "/config",

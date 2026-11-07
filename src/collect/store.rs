@@ -38,6 +38,16 @@ pub const REARM_MARGIN_MB: u64 = 256;
 pub const PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// An I/O failure is warned about at most this often.
 const WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// A camera that sent no frame for this long is forgotten (its rate limits and recent hashes),
+/// unless a bucket's `per_camera_min_interval_s` is longer: then that interval, so forgetting
+/// never lets a frame in early.
+pub const CAMERA_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Most cameras remembered; a new one past it makes the one silent the longest forgotten. The
+/// camera names come from upload file names, so a client sending random names must not grow the
+/// collector's memory. Blue Iris installs have tens of cameras.
+pub const MAX_CAMERAS: usize = 1024;
+/// Idle cameras are looked for at most this often (frame time).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// What happened to one frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +98,12 @@ pub struct Store {
     recent: HashMap<String, VecDeque<(SystemTime, u64)>>,
     /// camera -> when near duplicates were saved for a bucket that skips the dedup.
     skips: HashMap<String, VecDeque<SystemTime>>,
+    /// camera -> its latest frame that got as far as the per-camera limits. Every camera in
+    /// `last`, `recent` and `skips` is here, so this bounds them ([`CAMERA_IDLE`],
+    /// [`MAX_CAMERAS`]).
+    seen: HashMap<String, SystemTime>,
+    /// Frame time of the last sweep for idle cameras.
+    swept: Option<SystemTime>,
     /// When this process last saved a frame.
     last_saved: Option<SystemTime>,
     last_error: Option<LastError>,
@@ -128,6 +144,19 @@ pub fn sample(request_id: &str, bucket: Bucket) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// How long a camera stays remembered with no frame: [`CAMERA_IDLE`], or the longest bucket
+/// interval when that is longer.
+fn idle_after(settings: &CollectSettings) -> Duration {
+    Bucket::ALL
+        .iter()
+        .map(|b| {
+            Duration::from_secs(u64::from(
+                settings.buckets.get(*b).per_camera_min_interval_s,
+            ))
+        })
+        .fold(CAMERA_IDLE, Duration::max)
+}
+
 /// True for the errors of a full disk or an exhausted quota.
 pub fn is_disk_full(e: &std::io::Error) -> bool {
     matches!(
@@ -154,6 +183,8 @@ impl Store {
             last: HashMap::new(),
             recent: HashMap::new(),
             skips: HashMap::new(),
+            seen: HashMap::new(),
+            swept: None,
             last_saved: None,
             last_error: None,
             disabled: None,
@@ -308,6 +339,7 @@ impl Store {
             return Handled::Dropped(Dropped::Disk);
         }
         let camera = record.record.camera.clone();
+        self.note_camera(&camera, at, &settings);
         let passing: Vec<Bucket> = matched
             .iter()
             .copied()
@@ -410,6 +442,69 @@ impl Store {
         Handled::Saved {
             rel,
             buckets: passing,
+        }
+    }
+
+    /// Cameras remembered (tests).
+    #[cfg(test)]
+    fn cameras(&self) -> usize {
+        debug_assert!(
+            self.last.keys().all(|(c, _)| self.seen.contains_key(c))
+                && self.recent.keys().all(|c| self.seen.contains_key(c))
+                && self.skips.keys().all(|c| self.seen.contains_key(c))
+        );
+        self.seen.len()
+    }
+
+    /// `camera` sent a frame at `at`: remember it, forget cameras idle past [`CAMERA_IDLE`]
+    /// (checked every [`SWEEP_INTERVAL`]) and, for a new camera past [`MAX_CAMERAS`], the one
+    /// silent the longest.
+    fn note_camera(&mut self, camera: &str, at: SystemTime, settings: &CollectSettings) {
+        // A clock set back sweeps too (and restarts the interval from there).
+        let sweep_due = self.swept.is_none_or(|t| {
+            at.duration_since(t)
+                .map_or(true, |since| since >= SWEEP_INTERVAL)
+        });
+        if sweep_due {
+            self.swept = Some(at);
+            let idle = idle_after(settings);
+            let stale: Vec<String> = self
+                .seen
+                .iter()
+                .filter(|(c, t)| {
+                    c.as_str() != camera && at.duration_since(**t).is_ok_and(|since| since >= idle)
+                })
+                .map(|(c, _)| c.clone())
+                .collect();
+            if !stale.is_empty() {
+                debug!(
+                    cameras = stale.len(),
+                    "dataset collector: forgetting idle cameras"
+                );
+                self.forget(&stale);
+            }
+        }
+        if !self.seen.contains_key(camera)
+            && self.seen.len() >= MAX_CAMERAS
+            && let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(c, _)| c.clone())
+        {
+            self.forget(std::slice::from_ref(&oldest));
+        }
+        self.seen.insert(camera.to_string(), at);
+    }
+
+    /// Drop everything remembered of `cameras`.
+    fn forget(&mut self, cameras: &[String]) {
+        let gone: std::collections::HashSet<&str> = cameras.iter().map(String::as_str).collect();
+        self.last.retain(|(c, _), _| !gone.contains(c.as_str()));
+        for c in cameras {
+            self.recent.remove(c);
+            self.skips.remove(c);
+            self.seen.remove(c);
         }
     }
 
@@ -957,6 +1052,83 @@ mod tests {
             };
             assert!(buckets.contains(&want), "{buckets:?}");
         }
+    }
+
+    /// M2: the per-camera maps forget a camera silent for a day, and hold at most
+    /// [`MAX_CAMERAS`] however many names clients make up.
+    #[test]
+    fn idle_cameras_are_forgotten_and_the_count_is_capped() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = 30
+        });
+        let mut st = store();
+        let day = CAMERA_IDLE.as_secs();
+        for (cam, seed) in [("a", 1), ("b", 2)] {
+            assert!(matches!(
+                st.handle(frame(&s, positive(cam, cam, t(0)), seed)),
+                Handled::Saved { .. }
+            ));
+        }
+        // `b` sends again before the day is out; `a` does not.
+        assert!(matches!(
+            st.handle(frame(&s, positive("b", "b2", t(day - 3600)), 3)),
+            Handled::Saved { .. }
+        ));
+        assert_eq!(st.cameras(), 2);
+        assert!(matches!(
+            st.handle(frame(&s, positive("c", "c1", t(day + 60)), 4)),
+            Handled::Saved { .. }
+        ));
+        assert_eq!(st.cameras(), 2, "a is forgotten, b and c stay");
+        assert!(!st.seen.contains_key("a") && !st.recent.contains_key("a"));
+        assert!(!st.last.keys().any(|(c, _)| c == "a"));
+        assert!(st.last.contains_key(&("b".to_string(), Bucket::Positive)));
+        // A flood of made-up names (rate 0: none is written, each still counts as seen).
+        let none = settings(&tmp.0, |c| c.buckets.positive.rate = 0.0);
+        for i in 0..MAX_CAMERAS + 10 {
+            let at = t(day + 100 + i as u64);
+            assert_eq!(
+                st.handle(frame(&none, positive(&format!("x{i}"), "r", at), 5)),
+                Handled::Dropped(Dropped::Rate)
+            );
+        }
+        assert_eq!(st.cameras(), MAX_CAMERAS);
+        assert!(
+            st.last.is_empty() && st.recent.is_empty(),
+            "b and c went first"
+        );
+        assert!(st.seen.contains_key(&format!("x{}", MAX_CAMERAS + 9)));
+        assert!(!st.seen.contains_key("x0"));
+    }
+
+    /// Forgetting never lets a frame in before its bucket's interval is over.
+    #[test]
+    fn a_camera_inside_a_longer_interval_is_kept() {
+        let tmp = Tmp::new();
+        let two_days = 2 * CAMERA_IDLE.as_secs();
+        let s = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = u32::try_from(two_days).unwrap()
+        });
+        let mut st = store();
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "a1", t(0)), 1)),
+            Handled::Saved { .. }
+        ));
+        let later = two_days * 3 / 4;
+        assert!(matches!(
+            st.handle(frame(&s, positive("b", "b1", t(later)), 2)),
+            Handled::Saved { .. }
+        ));
+        assert_eq!(st.cameras(), 2, "past a day, inside the interval: kept");
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "a2", t(later + 10)), 3)),
+            Handled::Dropped(Dropped::Rate)
+        );
+        assert!(matches!(
+            st.handle(frame(&s, positive("a", "a3", t(two_days + 1)), 4)),
+            Handled::Saved { .. }
+        ));
     }
 
     #[test]

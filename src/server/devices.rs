@@ -168,6 +168,37 @@ pub(super) fn profile_view(state: &AppState) -> (crate::profile::Profile, usize)
     (p, n)
 }
 
+/// `gpuMemory` of `GET /v1/devices`: every adapter with a live reading
+/// ([`crate::backend::vram::VramReading`], `index` = `hardware.gpus[].index`) and the loaded
+/// models holding memory on it (`models`: `{model, device, adapter, heldMb}`). Empty where no
+/// adapter can be read (macOS: unified memory).
+pub(super) fn gpu_memory_json(
+    readings: &[crate::backend::vram::VramReading],
+    holders: &[crate::backend::vram::Holder],
+) -> serde_json::Value {
+    readings
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("usedMb".into(), r.used_mb().into());
+                o.insert("text".into(), r.text().into());
+                o.insert(
+                    "models".into(),
+                    serde_json::to_value(
+                        holders
+                            .iter()
+                            .filter(|h| h.adapter == r.index)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default(),
+                );
+            }
+            v
+        })
+        .collect()
+}
+
 /// `GET /v1/devices`: detected hardware, runtimes and every device option with `auto`'s pick.
 pub(super) async fn devices_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     blocking(move || {
@@ -189,6 +220,10 @@ pub(super) async fn devices_json(State(state): State<Arc<AppState>>) -> Json<ser
             "selection": snap.selection,
             "autoPick": snap.selection.auto_pick().map(|o| o.spec.to_string()),
             "profile": profile.to_json(threads),
+            "gpuMemory": gpu_memory_json(
+                &crate::backend::vram::readings(),
+                &crate::backend::vram::holders(),
+            ),
         }))
     })
     .await
@@ -222,6 +257,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["success"], true);
         assert!(v["hardware"]["gpus"].is_array());
+        assert!(v["gpuMemory"].is_array());
         assert_eq!(v["runtimes"]["openvino"]["version"], "2026.0.0-test");
         assert_eq!(v["runtimes"]["openvino"]["devices"][0], "CPU");
         let opts = v["selection"]["options"].as_array().unwrap();
@@ -245,6 +281,38 @@ mod tests {
         assert!(
             home.contains("ONNX Runtime") && home.contains("GPUs") && home.contains("Auto device")
         );
+    }
+
+    #[test]
+    fn gpu_memory_lists_readings_with_their_models() {
+        use crate::backend::vram::{Holder, MemoryKind, Source, VramReading};
+        let r = VramReading {
+            index: 1,
+            name: "NVIDIA GeForce GTX 1070 Ti".into(),
+            vendor: crate::backend::detect::GpuVendor::Nvidia,
+            kind: MemoryKind::Dedicated,
+            total_mb: 8192,
+            free_mb: 6144,
+            source: Source::Nvml,
+        };
+        let h = |adapter| Holder {
+            model: "IPcam-general".into(),
+            device: "ort:cuda:0".into(),
+            adapter,
+            held_mb: Some(410),
+        };
+        let v = super::gpu_memory_json(&[r], &[h(1), h(0)]);
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        let g = &v[0];
+        assert_eq!(g["index"], 1);
+        assert_eq!(g["totalMb"], 8192);
+        assert_eq!(g["freeMb"], 6144);
+        assert_eq!(g["usedMb"], 2048);
+        assert_eq!(g["kind"], "dedicated");
+        assert_eq!(g["text"], "6.0 GB free of 8.0 GB");
+        assert_eq!(g["models"].as_array().unwrap().len(), 1, "{g}");
+        assert_eq!(g["models"][0]["heldMb"], 410);
+        assert_eq!(super::gpu_memory_json(&[], &[]), serde_json::json!([]));
     }
 
     #[tokio::test]

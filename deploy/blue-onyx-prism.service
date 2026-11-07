@@ -26,6 +26,11 @@ WorkingDirectory=/var/lib/blue-onyx-prism
 ExecStart=/opt/blue-onyx-prism/blue-onyx-prism --config /var/lib/blue-onyx-prism/blue_onyx_prism_config.json
 Restart=on-failure
 RestartSec=5
+# glibc gives each thread that allocates its own malloc arena (up to 8 per core). The HTTP,
+# worker, collector and runtime threads all touch image-sized buffers, so a long run leaves many
+# fragmented arenas that are rarely returned to the system and resident memory creeps up for
+# days. Two arenas keep that bounded, for some allocator contention between threads.
+Environment=MALLOC_ARENA_MAX=2
 User=blueonyx
 Group=blueonyx
 # Needed for Intel GPU inference via /dev/dri (install intel-opencl-icd on the host).

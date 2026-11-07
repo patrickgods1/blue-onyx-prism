@@ -773,10 +773,14 @@ pub struct TrainProgress {
     pub eta_s: Option<f64>,
     /// `export` once the script exports.
     pub phase: Option<String>,
-    /// Loss per finished epoch.
+    /// Loss per finished epoch. Like `history`, kept out of the stored record
+    /// ([`Self::without_history`]); a reader's copy is rebuilt from the history's `loss`.
     pub losses: Vec<f64>,
     /// Every metric per epoch, merged by epoch (an `eval` event fills its epoch's row), at most
-    /// [`MAX_HISTORY`] points.
+    /// [`MAX_HISTORY`] points. Full in the running job's copy and in what readers get
+    /// (`TrainingService::runs`, `service::load_records`); a stored run record holds none, its
+    /// epochs are in `<run dir>/history.jsonl` (`crate::training::service::history`). A record
+    /// of an older `runs.json` holds them here until the queue moves them to that file.
     pub history: Vec<EpochPoint>,
     /// The best epoch so far ([`best_of`]).
     pub best: Option<Best>,
@@ -826,6 +830,29 @@ pub struct TrainProgress {
     /// The selected metric's source failed: the run went on by mAP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub select_fallback: Option<SelectFallback>,
+    /// Changes with every change of [`Self::history`] (never saved, equal in every comparison):
+    /// the history file's writer skips a report whose history it has seen.
+    #[serde(skip)]
+    pub history_rev: HistoryRev,
+}
+
+/// A process-wide unique stamp of a [`TrainProgress::history`] state: two progresses with the
+/// same non-zero stamp hold the same history (a clone keeps it). 0 = never changed. Compares
+/// equal to any other, so it never makes two progresses differ.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HistoryRev(pub u64);
+
+impl PartialEq for HistoryRev {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl HistoryRev {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -837,6 +864,90 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 
 impl TrainProgress {
+    /// A copy without the per-epoch lists ([`Self::history`], [`Self::losses`]), which a run
+    /// keeps in its history file (`crate::training::service::history`): what the run record
+    /// holds and `runs.json` saves. Every other field is copied (an added field fails to compile
+    /// here until it is listed).
+    pub fn without_history(&self) -> Self {
+        let Self {
+            device,
+            epoch,
+            epochs,
+            batch,
+            batches,
+            loss,
+            val_loss,
+            map50,
+            elapsed_s,
+            eta_s,
+            phase,
+            losses: _,
+            history: _,
+            best,
+            note,
+            patience,
+            min_delta,
+            min_epochs,
+            smooth,
+            since_best,
+            converge_point,
+            anneal,
+            extension,
+            stopped,
+            lr,
+            stop_epoch,
+            batch_size,
+            imgsz,
+            settings,
+            select_fallback,
+            history_rev: _,
+        } = self;
+        Self {
+            device: device.clone(),
+            epoch: *epoch,
+            epochs: *epochs,
+            batch: *batch,
+            batches: *batches,
+            loss: *loss,
+            val_loss: *val_loss,
+            map50: *map50,
+            elapsed_s: *elapsed_s,
+            eta_s: *eta_s,
+            phase: phase.clone(),
+            losses: Vec::new(),
+            history: Vec::new(),
+            best: best.clone(),
+            note: note.clone(),
+            patience: *patience,
+            min_delta: *min_delta,
+            min_epochs: *min_epochs,
+            smooth: *smooth,
+            since_best: *since_best,
+            converge_point: converge_point.clone(),
+            anneal: anneal.clone(),
+            extension: extension.clone(),
+            stopped: stopped.clone(),
+            lr: *lr,
+            stop_epoch: *stop_epoch,
+            batch_size: *batch_size,
+            imgsz: *imgsz,
+            settings: settings.clone(),
+            select_fallback: select_fallback.clone(),
+            history_rev: HistoryRev::default(),
+        }
+    }
+
+    /// Recompute [`Self::best`] and [`Self::since_best`] from [`Self::history`], as the events
+    /// set them: for a stored record whose progress was saved before its last epochs (an
+    /// interrupted run; its history file is current).
+    pub fn recompute_best(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        self.best = best_of(self.rule_history(), self.select_metric());
+        self.since_best = self.since_improvement();
+    }
+
     /// Fold `ev` in; `elapsed_s` is the wall time since training started.
     pub fn apply(&mut self, ev: &TrainEvent, elapsed_s: f64) {
         self.elapsed_s = elapsed_s;
@@ -1000,6 +1111,7 @@ impl TrainProgress {
             }
         };
         let newest = at + 1 == self.history.len();
+        self.history_rev = HistoryRev::next();
         let Some(p) = self.history.get_mut(at) else {
             return;
         };

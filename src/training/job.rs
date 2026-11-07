@@ -757,6 +757,8 @@ fn stages(
         let data_dir = job.run_dir.join("data");
         let prepared = dataset::read_prepared(&data_dir)?;
         let staging = models.join(format!(".{}.train-staging", job.name));
+        // Held until this returns, then removed: a crash leaves it to the storage sweep.
+        let _staging = crate::storage::Busy::hold(&staging).remove_target_on_drop();
         manager::remove_any(&staging)?;
         std::fs::create_dir_all(&staging)
             .with_context(|| format!("creating {}", staging.display()))?;
@@ -901,6 +903,10 @@ fn stages(
         &job.run_dir,
         models,
     )?)?;
+    if let Some(w) = preflight::gpu_warning(recipe, &job.accelerator) {
+        log.line(&format!("gpu: {w}"));
+        tracing::warn!("training {}: {w}", job.name);
+    }
     let prepared = dataset::write(&sources, &plan, &opts, &data_dir)
         .map_err(|e| explain_full_disk(e, &job.run_dir))?;
     for w in &prepared.warnings {
@@ -965,6 +971,9 @@ fn stages(
         report(TrainReport::Line(&w));
     }
     let staging = models.join(format!(".{}.train-staging", job.name));
+    // Held until this returns, then removed (also on the early errors that skip their own
+    // cleanup): a crash leaves it to the storage sweep ([`crate::storage::sweep`]).
+    let _staging = crate::storage::Busy::hold(&staging).remove_target_on_drop();
     manager::remove_any(&staging)?;
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let work = job.run_dir.join("work");

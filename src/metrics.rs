@@ -132,16 +132,20 @@ pub enum RejectReason {
     PeerBodyReads,
     /// The upload was not received within the read deadline.
     BodyTimeout,
+    /// The uploads in flight across all requests would pass their byte budget (503,
+    /// `server::body_budget`): many large frames at once, not one slow sender.
+    UploadBudget,
 }
 
 impl RejectReason {
-    pub const ALL: [RejectReason; 6] = [
+    pub const ALL: [RejectReason; 7] = [
         RejectReason::Overloaded,
         RejectReason::BodyTooLarge,
         RejectReason::DecodeError,
         RejectReason::BadRequest,
         RejectReason::PeerBodyReads,
         RejectReason::BodyTimeout,
+        RejectReason::UploadBudget,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -152,6 +156,7 @@ impl RejectReason {
             RejectReason::BadRequest => "bad_request",
             RejectReason::PeerBodyReads => "peer_body_reads",
             RejectReason::BodyTimeout => "body_timeout",
+            RejectReason::UploadBudget => "upload_budget",
         }
     }
 }
@@ -479,6 +484,8 @@ pub struct Metrics {
     pub rejected_peer_body_reads: AtomicU64,
     /// Detection uploads not received within the read deadline.
     pub rejected_body_timeout: AtomicU64,
+    /// Detection uploads refused by the upload byte budget ([`RejectReason::UploadBudget`]).
+    pub rejected_upload_budget: AtomicU64,
     /// Fixed server-wide in-flight cap for detection requests; 0 (the default) derives it from
     /// the models' queue capacities on every request (see `server::detect::max_inflight`).
     pub inflight_limit: AtomicUsize,
@@ -583,6 +590,7 @@ impl Metrics {
             rejected_bad_request: AtomicU64::new(0),
             rejected_peer_body_reads: AtomicU64::new(0),
             rejected_body_timeout: AtomicU64::new(0),
+            rejected_upload_budget: AtomicU64::new(0),
             inflight_limit: AtomicUsize::new(0),
             overload_log: LogThrottle::default(),
             peer_reads_log: LogThrottle::default(),
@@ -645,6 +653,7 @@ impl Metrics {
             RejectReason::BadRequest => &self.rejected_bad_request,
             RejectReason::PeerBodyReads => &self.rejected_peer_body_reads,
             RejectReason::BodyTimeout => &self.rejected_body_timeout,
+            RejectReason::UploadBudget => &self.rejected_upload_budget,
             RejectReason::DecodeError => return,
         };
         c.fetch_add(1, Ordering::Relaxed);
@@ -658,6 +667,7 @@ impl Metrics {
             RejectReason::BadRequest => self.rejected_bad_request.load(Ordering::Relaxed),
             RejectReason::PeerBodyReads => self.rejected_peer_body_reads.load(Ordering::Relaxed),
             RejectReason::BodyTimeout => self.rejected_body_timeout.load(Ordering::Relaxed),
+            RejectReason::UploadBudget => self.rejected_upload_budget.load(Ordering::Relaxed),
             RejectReason::DecodeError => self
                 .models
                 .read_recover()
@@ -752,6 +762,48 @@ fn parse_vm_rss(status: &str) -> Option<u64> {
     match it.next() {
         Some("kB") | None => kb.checked_mul(1024),
         Some(_) => None,
+    }
+}
+
+/// `gpu_memory_total_bytes` and `gpu_memory_free_bytes` per adapter with a live reading
+/// ([`crate::backend::vram`]): `adapter` (the platform index), `name`, `kind` (dedicated, or shared
+/// for an integrated GPU's shared-memory budget) and `source` (nvml, dxgi, sysfs). Nothing at all
+/// when no adapter can be read (macOS, a machine without a GPU).
+fn render_gpu_memory(out: &mut String, readings: &[crate::backend::vram::VramReading]) {
+    if readings.is_empty() {
+        return;
+    }
+    type Get = fn(&crate::backend::vram::VramReading) -> u64;
+    const MIB: u64 = 1024 * 1024;
+    let series: [(&str, &str, Get); 2] = [
+        (
+            "gpu_memory_total_bytes",
+            "GPU memory of the adapter in bytes (kind=shared: the shared-memory budget of an integrated GPU, not VRAM).",
+            |r| r.total_mb,
+        ),
+        (
+            "gpu_memory_free_bytes",
+            "Free GPU memory of the adapter in bytes, read live (NVML: the whole card; DXGI: this process's budget minus its usage).",
+            |r| r.free_mb,
+        ),
+    ];
+    for (name, help, get) in series {
+        let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
+        let _ = writeln!(out, "# TYPE {PREFIX}{name} gauge");
+        for r in readings {
+            let kind = match r.kind {
+                crate::backend::vram::MemoryKind::Dedicated => "dedicated",
+                crate::backend::vram::MemoryKind::Shared => "shared",
+            };
+            let _ = writeln!(
+                out,
+                "{PREFIX}{name}{{adapter=\"{}\",name=\"{}\",kind=\"{kind}\",source=\"{}\"}} {}",
+                r.index,
+                escape_label(&r.name),
+                r.source.as_str(),
+                get(r).saturating_mul(MIB)
+            );
+        }
     }
 }
 
@@ -862,6 +914,7 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         let _ = writeln!(out, "# TYPE {PREFIX}process_open_fds gauge");
         let _ = writeln!(out, "{PREFIX}process_open_fds {fds}");
     }
+    render_gpu_memory(&mut out, &crate::backend::vram::readings());
     let _ = writeln!(
         out,
         "# HELP {PREFIX}inflight_requests Detection requests being handled now (body read, queue wait, inference)."
@@ -1503,5 +1556,59 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(m.models.read().unwrap().len(), 1);
         assert!(!Arc::ptr_eq(&a, &m.model("other")));
+    }
+
+    #[test]
+    fn gpu_memory_gauges_per_adapter() {
+        use crate::backend::vram::{MemoryKind, Source, VramReading};
+        let mut out = String::new();
+        render_gpu_memory(&mut out, &[]);
+        assert!(out.is_empty(), "no reading, no series");
+        let r = |index, name: &str, kind, total_mb, free_mb, source| VramReading {
+            index,
+            name: name.into(),
+            vendor: crate::backend::detect::GpuVendor::Nvidia,
+            kind,
+            total_mb,
+            free_mb,
+            source,
+        };
+        render_gpu_memory(
+            &mut out,
+            &[
+                r(
+                    0,
+                    "Intel(R) UHD Graphics 630",
+                    MemoryKind::Shared,
+                    8000,
+                    7000,
+                    Source::Dxgi,
+                ),
+                r(
+                    1,
+                    "GTX \"1070\" Ti",
+                    MemoryKind::Dedicated,
+                    8192,
+                    2048,
+                    Source::Nvml,
+                ),
+            ],
+        );
+        assert!(
+            out.contains("# TYPE blue_onyx_prism_gpu_memory_total_bytes gauge"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "blue_onyx_prism_gpu_memory_total_bytes{adapter=\"0\",name=\"Intel(R) UHD Graphics 630\",kind=\"shared\",source=\"dxgi\"} 8388608000"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "blue_onyx_prism_gpu_memory_free_bytes{adapter=\"1\",name=\"GTX \\\"1070\\\" Ti\",kind=\"dedicated\",source=\"nvml\"} 2147483648"
+            ),
+            "{out}"
+        );
     }
 }

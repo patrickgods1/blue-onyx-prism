@@ -4,7 +4,8 @@
 //! one folder, [`prune_dataset`] to the dataset collector's folder tree ([`crate::collect`]),
 //! and [`spawn_sweeper`] runs them periodically on a background thread, reading the current
 //! settings each tick so a config change applies without a restart. The dataset is pruned on
-//! the collector's own thread (its only writer): the sweeper asks it to.
+//! the collector's own thread (its only writer): the sweeper asks it to. The same thread runs the
+//! storage sweep of rebuildable files once a day ([`crate::storage::sweep`]).
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -353,6 +354,9 @@ pub struct SweeperConfig {
     /// The dataset collector's settings (`collect`): its folder is pruned on every tick (by
     /// the collector thread) when it exists, whether collection is on or not.
     pub dataset: Option<crate::collect::CollectSettings>,
+    /// The storage sweep ([`crate::storage::sweep`]): on the first tick, then once every
+    /// [`crate::storage::sweep::INTERVAL`]. None = never.
+    pub storage: Option<crate::storage::Settings>,
 }
 
 /// True when a low-space warning may be logged now (never yet, or the last is old enough).
@@ -360,8 +364,14 @@ fn may_warn(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.saturating_duration_since(t) >= FREE_SPACE_WARN_INTERVAL)
 }
 
-/// One sweep: prune the saved images, then check free space (`last_warn` throttles the log).
-fn sweep(cfg: &SweeperConfig, last_warn: &mut Option<Instant>) {
+/// Whether the storage sweep is due: never run yet, or [`crate::storage::sweep::INTERVAL`] ago.
+fn storage_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= crate::storage::sweep::INTERVAL)
+}
+
+/// One sweep: prune the saved images, then check free space (`last_warn` throttles the log),
+/// then the storage sweep when it is due (`last_storage`).
+fn sweep(cfg: &SweeperConfig, last_warn: &mut Option<Instant>, last_storage: &mut Option<Instant>) {
     if let Some(dir) = &cfg.save_image_dir
         && let Err(e) = prune_saved_images(dir, cfg.max_age_days, cfg.max_mb)
     {
@@ -380,6 +390,13 @@ fn sweep(cfg: &SweeperConfig, last_warn: &mut Option<Instant>) {
         }
         None => *last_warn = None,
     }
+    if let Some(st) = &cfg.storage {
+        let now = Instant::now();
+        if storage_due(*last_storage, now) {
+            *last_storage = Some(now);
+            crate::storage::sweep::run(st);
+        }
+    }
 }
 
 /// Sleep `total` in short steps; false when `shutdown` was triggered meanwhile.
@@ -396,7 +413,7 @@ fn nap(total: Duration, shutdown: &CancellationToken) -> bool {
 }
 
 /// Run [`prune_saved_images`] and the free-space check every [`SWEEP_INTERVAL`] (first after
-/// [`FIRST_SWEEP_DELAY`]) until `shutdown`. `settings` is called on every tick, so config
+/// [`FIRST_SWEEP_DELAY`]), and the storage sweep once a day, until `shutdown`. `settings` is called on every tick, so config
 /// changes apply at once.
 #[allow(
     clippy::expect_used,
@@ -411,9 +428,10 @@ pub fn spawn_sweeper(
         .name("retention".into())
         .spawn(move || {
             let mut last_warn = None;
+            let mut last_storage = None;
             let mut delay = FIRST_SWEEP_DELAY;
             while nap(delay, &shutdown) {
-                sweep(&settings(), &mut last_warn);
+                sweep(&settings(), &mut last_warn, &mut last_storage);
                 delay = SWEEP_INTERVAL;
             }
         })
@@ -424,6 +442,17 @@ pub fn spawn_sweeper(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_storage_sweep_runs_first_then_once_a_day() {
+        let now = Instant::now();
+        assert!(storage_due(None, now));
+        assert!(!storage_due(Some(now), now + SWEEP_INTERVAL));
+        assert!(storage_due(
+            Some(now),
+            now + crate::storage::sweep::INTERVAL
+        ));
+    }
 
     /// A fresh temp directory removed on drop.
     struct Tmp(PathBuf);

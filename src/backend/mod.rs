@@ -44,6 +44,7 @@ pub mod plan;
 pub mod priority;
 pub mod select;
 pub mod spec;
+pub mod vram;
 
 pub use detect::{GpuAdapter, GpuVendor, HardwareInfo};
 pub use device::DeviceInfo;
@@ -884,7 +885,10 @@ impl Runtimes {
                         self.ov_error.as_deref().unwrap_or("not initialized")
                     );
                 };
-                Ok(Compiled::OpenVino(core.compile(cand, req, tuning)?))
+                let probe = vram::LoadProbe::start(&req.path, &cand.device);
+                let compiled = core.compile(cand, req, tuning)?;
+                probe.log();
+                Ok(Compiled::OpenVino(compiled))
             }
             #[cfg(feature = "onnxruntime")]
             Runtime::Ort => {

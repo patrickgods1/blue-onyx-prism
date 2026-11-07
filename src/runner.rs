@@ -250,6 +250,7 @@ impl Sweeper {
                     data_root: c.data_root(),
                     min_free_mb: crate::retention::MIN_FREE_MB,
                     dataset: Some(crate::collect::CollectSettings::for_config(&c)),
+                    storage: Some(crate::storage::Settings::for_config(&c)),
                 }
             }),
             stop.clone(),

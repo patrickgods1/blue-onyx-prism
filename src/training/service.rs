@@ -9,6 +9,12 @@
 //! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
 //! thread (one GPU job at a time); their records are kept in `tasks.json`.
 //!
+//! What reaches the disk: a state or stage change at once, progress at most every
+//! [`PROGRESS_SAVE_EVERY`] (a crash loses at most that much of the progress shown, never a state
+//! change or a result), and a run's per-epoch metrics in its own `history.jsonl`, appended per
+//! epoch ([`history`]); `runs.json` holds none of them. No run record is dropped (a run owns its
+//! folder and model); `tasks.json` keeps the newest [`task::MAX_FINISHED_TASKS`] finished tasks.
+//!
 //! The running job can be paused ([`TrainingService::pause`]): its helper processes (Python,
 //! ffmpeg, run through the queue's [`CommandRunner`] wrapped in a [`PausableRunner`]) are
 //! suspended where they are, keeping their memory, loaded models and GPU allocations, and no new
@@ -22,7 +28,7 @@ use super::job::{
     BenchSummary, Hooks, TrainError, TrainJob, TrainOutput, TrainReport, TrainRequest, TrainStage,
     not_in_config,
 };
-use super::progress::TrainProgress;
+use super::progress::{EpochPoint, TrainProgress};
 use super::task::{self, Task, TaskContext, TaskRecord, TaskReport};
 use crate::resources::export::{CommandRunner, Fetcher, PausableRunner};
 use crate::sync::LockExt;
@@ -34,12 +40,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod history;
+
 /// File of the run records in the training folder.
 pub const RUNS_FILE: &str = "runs.json";
-/// Records kept (oldest finished ones dropped first).
-pub const MAX_RECORDS: usize = 100;
 /// Log lines kept per run.
 const LOG_TAIL: usize = 60;
+/// How often a running job's progress (percent, epoch, detail, log tail) is saved when nothing
+/// else changed; state changes, stage changes and results are saved at once.
+pub const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// Whether a job's progress report is saved now: on a new stage (or step) at once, else when
+/// [`PROGRESS_SAVE_EVERY`] passed since the last save.
+pub fn progress_save_due(new_stage: bool, since_save: Duration) -> bool {
+    new_stage || since_save >= PROGRESS_SAVE_EVERY
+}
 
 /// Where a run is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +276,9 @@ fn open_records(path: &Path) -> task::Loaded<RunRecord> {
     let mut loaded = task::load_or_move_aside::<RunRecord>(path);
     for r in &mut loaded.records {
         if r.state.is_busy() {
+            if let Some(p) = r.progress.as_mut() {
+                history::refresh_best(p, &r.run_dir);
+            }
             r.state = RunState::Failed;
             r.error = Some(match (&r.output, &r.registered) {
                 (Some(o), None) => {
@@ -281,9 +299,14 @@ fn open_records(path: &Path) -> task::Loaded<RunRecord> {
     loaded
 }
 
-/// [`open_records`], for a reader that does not save.
+/// [`open_records`], for a reader that does not save, with each run's epochs
+/// ([`history::attach`]).
 pub fn load_records(path: &Path) -> Vec<RunRecord> {
-    open_records(path).records
+    let mut runs = open_records(path).records;
+    for r in &mut runs {
+        history::attach(r, None);
+    }
+    runs
 }
 
 struct Inner {
@@ -305,6 +328,9 @@ struct Inner {
     /// The clock of the job that last held the queue's thread. A leaf lock: nothing is taken
     /// under it.
     clock: Mutex<Option<(String, JobClock)>>,
+    /// The running run's epochs (its record holds none, [`history`]): readers get these rather
+    /// than the file, which may lag or have failed. A leaf lock.
+    live: Mutex<Option<(String, Arc<Vec<EpochPoint>>)>>,
 }
 
 /// The job on the queue's thread and its flags.
@@ -335,23 +361,37 @@ struct Stores {
     hold_tasks: bool,
 }
 
+/// What [`Stores::open`] read.
+struct Opened {
+    stores: Stores,
+    runs: Vec<RunRecord>,
+    tasks: Vec<TaskRecord>,
+    /// Records of an older `runs.json` whose history moved to their files
+    /// ([`history::migrate`]): `runs.json` is to be saved once.
+    migrated: bool,
+}
+
 impl Stores {
-    /// The stores at `runs` and the records they hold.
-    fn open(runs: Option<PathBuf>) -> (Self, Vec<RunRecord>, Vec<TaskRecord>) {
+    /// The stores at `runs` and the records they hold (histories moved out, [`history::migrate`]).
+    fn open(runs: Option<PathBuf>) -> Opened {
         let tasks = runs.as_deref().map(task::tasks_file);
-        let run_records = runs.as_deref().map(open_records);
+        let mut run_records = runs.as_deref().map(open_records);
         let task_records = tasks.as_deref().map(task::open_records);
+        let migrated = run_records
+            .as_mut()
+            .is_some_and(|l| history::migrate(&mut l.records) > 0);
         let stores = Self {
             hold_runs: run_records.as_ref().is_some_and(|l| !l.writable),
             hold_tasks: task_records.as_ref().is_some_and(|l| !l.writable),
             runs,
             tasks,
         };
-        (
+        Opened {
             stores,
-            run_records.map(|l| l.records).unwrap_or_default(),
-            task_records.map(|l| l.records).unwrap_or_default(),
-        )
+            runs: run_records.map(|l| l.records).unwrap_or_default(),
+            tasks: task_records.map(|l| l.records).unwrap_or_default(),
+            migrated,
+        }
     }
 
     fn runs_to_write(&self) -> Option<PathBuf> {
@@ -392,6 +432,16 @@ impl Inner {
         let _order = self.persist_lock.lock_recover();
         self.update(id, f);
         self.write_runs();
+    }
+
+    /// A reader's copy of `r` with its epochs ([`history::attach`]).
+    fn with_history(&self, r: RunRecord) -> RunRecord {
+        let live = self.live.lock_recover().clone();
+        attach_with(r, live.as_ref())
+    }
+
+    fn set_live(&self, id: &str, h: Option<Arc<Vec<EpochPoint>>>) {
+        *self.live.lock_recover() = h.map(|h| (id.to_string(), h));
     }
 
     /// Start the clock of job `id`.
@@ -435,6 +485,13 @@ impl Inner {
     }
 }
 
+/// `r` with its epochs: `live`'s when it is that run's ([`history::attach`]).
+fn attach_with(mut r: RunRecord, live: Option<&(String, Arc<Vec<EpochPoint>>)>) -> RunRecord {
+    let live = live.filter(|(id, _)| *id == r.id).map(|(_, h)| h);
+    history::attach(&mut r, live);
+    r
+}
+
 enum Msg {
     Job(Box<TrainJob>),
     Task(Box<dyn Task>),
@@ -469,21 +526,25 @@ impl TrainingService {
         hooks: Arc<dyn Hooks>,
         store: Option<PathBuf>,
     ) -> Arc<Self> {
-        let (stores, runs, tasks) = Stores::open(store);
+        let opened = Stores::open(store);
         let inner = Arc::new(Inner {
             runner,
             fetcher,
             hooks,
-            runs: Mutex::new(runs),
+            runs: Mutex::new(opened.runs),
             changed: Condvar::new(),
             current: Mutex::new(None),
             clock: Mutex::new(None),
+            live: Mutex::new(None),
             cancelled: Mutex::new(HashSet::new()),
-            stores: Mutex::new(stores),
+            stores: Mutex::new(opened.stores),
             persist_lock: Mutex::new(()),
             stop: AtomicBool::new(false),
-            tasks: Mutex::new(tasks),
+            tasks: Mutex::new(opened.tasks),
         });
+        if opened.migrated {
+            inner.persist();
+        }
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = Arc::clone(&inner);
         let thread = std::thread::Builder::new()
@@ -521,8 +582,13 @@ impl TrainingService {
                     .into(),
             );
         }
-        (*stores, *runs, *tasks) = Stores::open(Some(store.to_path_buf()));
+        let opened = Stores::open(Some(store.to_path_buf()));
+        (*stores, *runs, *tasks) = (opened.stores, opened.runs, opened.tasks);
         drop((stores, tasks, runs));
+        if opened.migrated {
+            // `_order` is held: no other write can come between.
+            self.inner.write_runs();
+        }
         self.inner.changed.notify_all();
         Ok(true)
     }
@@ -541,16 +607,8 @@ impl TrainingService {
             if runs.iter().any(|r| r.id == id) {
                 return Err(format!("run {id} exists"));
             }
+            // Never dropped: a run owns its folder and model, which only Remove deletes.
             runs.push(RunRecord::new(&job));
-            // Drop the oldest finished records past the cap.
-            while runs.len() > MAX_RECORDS {
-                match runs.iter().position(|r| !r.state.is_busy()) {
-                    Some(i) => {
-                        runs.remove(i);
-                    }
-                    None => break,
-                }
-            }
         }
         self.inner.persist();
         self.inner.changed.notify_all();
@@ -601,14 +659,7 @@ impl TrainingService {
                 return Err(format!("job {id} exists"));
             }
             tasks.push(TaskRecord::new(task.as_ref(), now()));
-            while tasks.len() > MAX_RECORDS {
-                match tasks.iter().position(|r| !r.state.is_busy()) {
-                    Some(i) => {
-                        tasks.remove(i);
-                    }
-                    None => break,
-                }
-            }
+            task::cap_finished(&mut tasks);
         }
         self.inner.persist_tasks();
         self.inner.changed.notify_all();
@@ -678,7 +729,7 @@ impl TrainingService {
             }
             return done;
         }
-        let Some(st) = self.get(id).map(|r| r.state) else {
+        let Some(st) = self.get_bare(id).map(|r| r.state) else {
             return false;
         };
         match st {
@@ -770,7 +821,7 @@ impl TrainingService {
     /// resumed first. Refused (with the reason) unless `id` is the run on the queue's thread in
     /// its training stage.
     pub fn finish(&self, id: &str) -> Result<String, String> {
-        let Some(r) = self.get(id) else {
+        let Some(r) = self.get_bare(id) else {
             return Err(if self.get_task(id).is_some() {
                 format!("{id} is an import or auto-label job; only a training run can finish early")
             } else {
@@ -893,8 +944,13 @@ impl TrainingService {
         flipped
     }
 
+    /// Every run, with its epochs ([`history::attach`]).
     pub fn runs(&self) -> Vec<RunRecord> {
-        self.inner.runs.lock_recover().clone()
+        let runs = self.inner.runs.lock_recover().clone();
+        let live = self.inner.live.lock_recover().clone();
+        runs.into_iter()
+            .map(|r| attach_with(r, live.as_ref()))
+            .collect()
     }
 
     /// How long job `id` has run and how long its step should still take; None unless it is the
@@ -905,7 +961,13 @@ impl TrainingService {
         Some(c.timing(Instant::now()))
     }
 
+    /// Run `id`, with its epochs ([`history::attach`]).
     pub fn get(&self, id: &str) -> Option<RunRecord> {
+        self.get_bare(id).map(|r| self.inner.with_history(r))
+    }
+
+    /// Run `id` as stored (no epochs): for the checks that read its state.
+    fn get_bare(&self, id: &str) -> Option<RunRecord> {
         self.inner
             .runs
             .lock_recover()
@@ -936,7 +998,7 @@ impl TrainingService {
         id: &str,
         delete: impl FnOnce(&RunRecord) -> anyhow::Result<()>,
     ) -> Result<RunRecord, String> {
-        let Some(r) = self.get(id) else {
+        let Some(r) = self.get_bare(id) else {
             return Err(format!("no run {id}"));
         };
         if r.state.is_busy() {
@@ -987,12 +1049,12 @@ impl TrainingService {
         let mut runs = self.inner.runs.lock_recover();
         loop {
             let r = runs.iter().find(|r| r.id == id).cloned();
-            if r.as_ref().is_none_or(|r| !r.state.is_busy()) {
-                return r;
+            let done = r.as_ref().is_none_or(|r| !r.state.is_busy());
+            if done || Instant::now() >= deadline {
+                drop(runs);
+                return r.map(|r| self.inner.with_history(r));
             }
-            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return r;
-            };
+            let left = deadline.saturating_duration_since(Instant::now());
             runs = self
                 .inner
                 .changed
@@ -1069,6 +1131,11 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         let started = Instant::now();
         let mut last_stage = None;
         let mut last_save = Instant::now();
+        // An export retry trains nothing: it never touches the history its run already has.
+        let mut epochs = job
+            .export_only
+            .is_none()
+            .then(|| history::HistoryLog::new(&job.run_dir));
         let mut report = |p: TrainReport<'_>| match p {
             TrainReport::Stage {
                 stage,
@@ -1087,7 +1154,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.percent = stage.overall(percent);
                     r.detail = detail.chars().take(300).collect();
                 });
-                if new_stage || last_save.elapsed() > Duration::from_secs(30) {
+                if progress_save_due(new_stage, last_save.elapsed()) {
                     inner.persist();
                     last_save = Instant::now();
                 }
@@ -1101,9 +1168,21 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
                     r.log.push(l.chars().take(300).collect());
                 });
             }
-            TrainReport::Progress(tp) => inner.update(&id, |r| r.progress = Some(tp.clone())),
+            TrainReport::Progress(tp) => {
+                let stored = match epochs.as_mut() {
+                    Some(log) => {
+                        if log.sync(tp) {
+                            inner.set_live(&id, Some(Arc::new(tp.history.clone())));
+                        }
+                        log.stored(tp)
+                    }
+                    None => tp.clone(),
+                };
+                inner.update(&id, |r| r.progress = Some(stored));
+            }
             TrainReport::Batch(b) => {
                 tracing::warn!(run = %id, "out of GPU memory: retrying at batch {b}");
+                inner.set_live(&id, None);
                 inner.update_persist(&id, |r| {
                     r.request.recipe.batch = b;
                     r.progress = None;
@@ -1132,6 +1211,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             &flag,
         );
         *inner.current.lock_recover() = None;
+        // Readers go to the file from now on (or to the record, which holds the epochs itself
+        // when the file could not be written).
+        inner.set_live(&id, None);
         match result {
             Ok(out) => {
                 tracing::info!(run = %id, model = %job.name, "training finished in {:.0} s: {}", started.elapsed().as_secs_f64(), out.output.onnx.display());
@@ -1250,7 +1332,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
                 r.percent = percent;
                 r.detail = detail.chars().take(300).collect();
             });
-            if new_step || last_save.elapsed() > Duration::from_secs(30) {
+            if progress_save_due(new_step, last_save.elapsed()) {
                 inner.persist_tasks();
                 last_save = Instant::now();
             }

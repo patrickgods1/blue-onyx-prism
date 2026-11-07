@@ -37,9 +37,12 @@
 //! - [`relabel`]: detection with a model of the config in this process.
 //! - [`job`]: the stage machine ([`AutolabelJob`], a [`super::task::Task`]).
 //! - [`preview`]: what a run would do, from its own first stage ([`preview_autolabel`]).
+//! - [`memory`]: the labelers' GPU memory: options a card cannot hold are refused, a card short
+//!   of free memory is warned about.
 
 pub mod catalog;
 pub mod job;
+pub mod memory;
 pub mod models;
 pub mod preview;
 pub mod relabel;
@@ -639,7 +642,62 @@ pub fn preview_autolabel(
     config: &Config,
     request: AutolabelRequest,
 ) -> Result<preview::AutolabelPreview> {
-    scoped_job(config, request)?.preview()
+    let job = scoped_job(config, request)?;
+    let mut p = job.preview()?;
+    if job.request.with_model.is_none()
+        && let Some(a) = preview_accelerator(job.request.gpu.as_deref())
+    {
+        // First: a run that cannot load matters more than anything about its frames.
+        let gpu = gpu_notes(&job.request, &a);
+        p.warnings.splice(0..0, gpu);
+    }
+    Ok(p)
+}
+
+/// The GPU a preview judges the labelers against: this machine's, except in tests, where it is
+/// the one the test's thread set ([`tests_gpu::set`], none by default), so no test depends on
+/// the host.
+fn preview_accelerator(gpu: Option<&str>) -> Option<super::capability::Accelerator> {
+    #[cfg(test)]
+    {
+        let _ = gpu;
+        tests_gpu::get()
+    }
+    #[cfg(not(test))]
+    {
+        super::capability_now().resolve_gpu(gpu).ok().flatten()
+    }
+}
+
+/// The accelerator previews see in tests ([`preview_accelerator`]): per thread, so a test that sets
+/// it changes nothing for the others (route tests run the preview on other threads and see none).
+#[cfg(test)]
+pub(crate) mod tests_gpu {
+    use super::super::capability::Accelerator;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static GPU: RefCell<Option<Accelerator>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn get() -> Option<Accelerator> {
+        GPU.with(|g| g.borrow().clone())
+    }
+
+    /// Set (or clear) it for this thread.
+    pub(crate) fn set(a: Option<Accelerator>) {
+        GPU.with(|g| *g.borrow_mut() = a);
+    }
+}
+
+/// What the preview and the run say about the labelers' GPU `a`: a labeler the card cannot hold
+/// ([`memory::too_big`], which [`plan_autolabel`] refuses) or too little free memory now
+/// ([`memory::gpu_warning`]).
+pub fn gpu_notes(request: &AutolabelRequest, a: &super::capability::Accelerator) -> Vec<String> {
+    if let Some(e) = memory::too_big(request, a.memory_mb(), &a.choice_label()) {
+        return vec![format!("This run would be refused: {e}.")];
+    }
+    memory::gpu_warning(request, a).into_iter().collect()
 }
 
 /// Plan an auto-label run of `request` on `config`, the config file at `config_path` (fails fast
@@ -690,6 +748,12 @@ pub fn plan_autolabel(
             .map(|r| (r, super::pyenv::weights_dir(paths, r)))
             .collect();
         super::pyenv::check_large(&list, allow_large)?;
+        if let Some(e) = memory::too_big(request, a.memory_mb(), &a.choice_label()) {
+            bail!(e);
+        }
+        if let Some(w) = memory::gpu_warning(request, a) {
+            tracing::warn!("auto-label: {w}");
+        }
         request.gpu = super::capability::gpu_arg(request.gpu.as_deref())?.map(|_| a.device_arg());
         job.accelerator = Some(a.clone());
     }

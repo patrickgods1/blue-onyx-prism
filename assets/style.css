@@ -713,7 +713,7 @@ table.dt td.warn-cell { color: var(--warn-fg); }
 .dt-empty { padding: 0.5rem 0; }
 table.dev-table th, table.setup-table th, table.conf-table th, table.cmp-table th { white-space: normal; vertical-align: bottom; }
 table.conf-table td, table.setup-table td { white-space: normal; }
-table.conf-table td.num, table.setup-table td.num { white-space: nowrap; }
+table.conf-table td.num, table.setup-table td.num, #storage-body td.num { white-space: nowrap; }
 /* Overview steps: numbered headings. */
 h2.step-h { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
 h2.step-h .step-n { display: inline-flex; align-items: center; justify-content: center; width: 1.7rem; height: 1.7rem; border-radius: 50%; background: var(--accent); color: var(--accent-fg); font-size: 0.95rem; font-weight: 700; flex: none; }

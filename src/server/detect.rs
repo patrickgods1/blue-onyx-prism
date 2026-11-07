@@ -1,8 +1,9 @@
 //! Detection endpoints: multipart parsing, dispatch to the model workers, `custom/list`.
 
 use super::AppState;
+use super::body_budget::{self, UploadBudget};
 use crate::api::{VisionCustomListResponse, VisionDetectionRequest, VisionDetectionResponse};
-use crate::metrics::{BodyReadPermit, DropReason, InflightPermit, RejectReason};
+use crate::metrics::{BodyReadPermit, DropReason, InflightPermit, Metrics, RejectReason};
 use crate::startup::ModelState;
 use crate::worker::WorkerHandle;
 use axum::Json;
@@ -11,6 +12,7 @@ use axum::extract::multipart::{MultipartError, MultipartRejection};
 use axum::extract::{ConnectInfo, FromRequest, Multipart, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use bytes::BytesMut;
 use crossbeam_channel::TrySendError;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -24,8 +26,9 @@ use tracing::{debug, info, warn};
 /// Maximum accepted request body (multipart image upload).
 ///
 /// Worst-case memory of the detection routes: every admitted request may hold one full body,
-/// so uploads take at most `max_inflight × BODY_LIMIT` (see [`max_inflight`]; e.g. 64 × 32 MiB
-/// = 2 GiB with the default cap, the bound the in-flight cap exists for), plus, per
+/// so uploads would take `max_inflight × BODY_LIMIT` (see [`max_inflight`]; e.g. 64 × 32 MiB
+/// = 2 GiB with the default cap, more with many models); the upload budget
+/// ([`body_budget::UPLOAD_BUDGET`], 1 GiB, M7) caps the bytes they hold together, plus, per
 /// preprocessing thread, one decoded frame of up to `max_image_pixels × 3` bytes (RGB8) and its
 /// resized input tensor. Requests beyond the cap hold no in-flight slot: their 503 waits only for
 /// a bounded discard that buffers nothing ([`OVERLOAD_DRAINS`]).
@@ -105,6 +108,9 @@ fn with_request_id(mut resp: Response, id: &str) -> Response {
 pub(super) struct BodyError {
     pub(super) reason: RejectReason,
     pub(super) message: String,
+    /// The answer's status: 503 when the server-wide upload budget was full
+    /// ([`body_budget`]), else 200 with the error in the body (CodeProject.AI's shape).
+    pub(super) status: StatusCode,
 }
 
 impl BodyError {
@@ -112,6 +118,16 @@ impl BodyError {
         Self {
             reason: RejectReason::BadRequest,
             message: message.into(),
+            status: StatusCode::OK,
+        }
+    }
+
+    /// The upload budget had no room for the next chunk of `budget`.
+    fn over_budget(budget: &UploadBudget) -> Self {
+        Self {
+            reason: body_budget::REJECT_REASON,
+            message: budget_message(budget),
+            status: StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -125,6 +141,7 @@ impl BodyError {
                      (e.g. a JPEG of the camera frame).",
                     BODY_LIMIT / (1024 * 1024)
                 ),
+                status: StatusCode::OK,
             }
         } else {
             Self::bad_request(format!(
@@ -137,8 +154,22 @@ impl BodyError {
 
     /// Count this rejection in the server metrics.
     pub(super) fn record(&self, state: &AppState) {
-        state.metrics.record_rejected(self.reason);
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            note_over_budget(&state.metrics, &body_budget::UPLOADS);
+        } else {
+            state.metrics.record_rejected(self.reason);
+        }
     }
+}
+
+/// The answer text of a request refused by the upload budget.
+fn budget_message(budget: &UploadBudget) -> String {
+    format!(
+        "Server is overloaded: uploads being handled already hold {} MiB of memory, the limit; \
+         clients send more or larger images than the models can serve, so retry later or send \
+         smaller images.",
+        budget.limit() / (1024 * 1024)
+    )
 }
 
 /// A detection upload, not touched yet: the request is kept whole so a body nobody needs can be
@@ -151,6 +182,11 @@ pub(super) struct Upload {
     /// The peer's read slot ([`admit`]): lives as long as the upload, so it goes back the moment
     /// the body is read or given up on, while the in-flight permit stays with the request.
     read_slot: Option<BodyReadPermit>,
+    /// The budget its bytes are charged to ([`body_budget::UPLOADS`]; tests give their own).
+    budget: &'static UploadBudget,
+    /// The server's metrics, set by [`admit`]: an upload refused by the budget part way is
+    /// discarded under one of the [`OVERLOAD_DRAINS`] slots, like a refusal at admission.
+    drains: Option<Arc<Metrics>>,
 }
 
 struct NotMultipart {
@@ -170,6 +206,8 @@ impl<S: Send + Sync> FromRequest<S> for Upload {
             request: req,
             peer,
             read_slot: None,
+            budget: &body_budget::UPLOADS,
+            drains: None,
         })
     }
 }
@@ -264,6 +302,18 @@ fn admit(
             ),
         ));
     };
+    // A body whose declared length does not fit is refused before any of it is read. Past
+    // BODY_LIMIT it is refused as too large by the read instead, which never charges more.
+    if let Some(n) = declared_length(&upload.request).filter(|&n| n <= BODY_LIMIT as u64)
+        && !upload
+            .budget
+            .has_room(usize::try_from(n).unwrap_or(usize::MAX))
+    {
+        upload.budget.note_rejected();
+        note_over_budget(&state.metrics, upload.budget);
+        return Err(overloaded(command, budget_message(upload.budget)));
+    }
+    upload.drains = Some(state.metrics.clone());
     let Some(peer) = upload.peer else {
         return Ok(permit);
     };
@@ -292,6 +342,29 @@ fn admit(
     Ok(permit)
 }
 
+/// Count a request refused by the upload budget in `requests_rejected_total` and warn (at most
+/// once per 10 s, with the in-flight cap's warnings).
+fn note_over_budget(metrics: &Metrics, budget: &UploadBudget) {
+    metrics.record_rejected(body_budget::REJECT_REASON);
+    if let Some(held_back) = metrics.overload_log.allow(metrics.now_ms()) {
+        warn!(
+            limit_mib = budget.limit() / (1024 * 1024),
+            held_mib = budget.used() / (1024 * 1024),
+            similar_since_last_warning = held_back,
+            "server is overloaded: uploads being handled hold the most memory allowed; \
+             answering 503"
+        );
+    }
+}
+
+/// The `Content-Length` of `req`, when it declares a valid one.
+fn declared_length(req: &Request) -> Option<u64> {
+    req.headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
 /// Read and throw away the start of a body that will not be used: at most [`DISCARD_LIMIT`]
 /// bytes within [`DISCARD_TIMEOUT`]. A body that ends within both leaves the connection
 /// reusable; otherwise hyper closes it after the answer (it drains only what is buffered).
@@ -315,12 +388,7 @@ async fn discard_body_within(upload: Upload, limit: Duration) {
 /// and hyper closes the connection. The caller's in-flight permit is long gone: only the drain
 /// slot is held meanwhile.
 async fn after_drain(state: &AppState, upload: Upload, resp: Response, id: &str) -> Response {
-    let declared = upload
-        .request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+    let declared = declared_length(&upload.request);
     if declared.is_none_or(|n| n <= DISCARD_LIMIT as u64)
         && let Some(_slot) = state
             .metrics
@@ -349,38 +417,100 @@ async fn discard_raw_within(body: Body, limit: Duration) {
 // ---------------------------------------------------------------------------------------------
 // Detection endpoints
 
+/// Read one field whole, every chunk charged to a new charge of `budget` as it arrives.
+/// `Err(None)`: the budget had no room for a chunk (the rest of the field is left unread).
+async fn read_charged(
+    field: &mut axum::extract::multipart::Field<'_>,
+    budget: &'static UploadBudget,
+) -> Result<(BytesMut, body_budget::Charge), Option<MultipartError>> {
+    let mut charge = budget.charge();
+    let mut buf = BytesMut::new();
+    while let Some(chunk) = field.chunk().await.map_err(Some)? {
+        if !charge.add(chunk.len()) {
+            return Err(None);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok((buf, charge))
+}
+
+/// The rest of a multipart body refused part way, read and thrown away (nothing buffered): what
+/// is left of `field`, then every other field, at most [`DISCARD_LIMIT`] bytes in all. The
+/// caller's time limit bounds it.
+async fn discard_rest(mut field: axum::extract::multipart::Field<'_>) -> Option<()> {
+    let mut seen = 0usize;
+    while let Ok(Some(chunk)) = field.chunk().await {
+        seen = seen.saturating_add(chunk.len());
+        if seen > DISCARD_LIMIT {
+            return None;
+        }
+    }
+    Some(())
+}
+
 /// Parse the multipart body: `image` (required), `min_confidence` (parse errors become 0.0)
 /// and any other text fields, returned in the map (e.g. `model` on the test page).
+///
+/// Every field's bytes are charged to `budget` as they arrive; the image keeps its charge
+/// ([`body_budget::charged_bytes`]), a text field's goes back once it is parsed. A chunk the
+/// budget has no room for ends the read with a 503 [`BodyError`]; the rest of the body is then
+/// discarded when one of the [`OVERLOAD_DRAINS`] slots of `drains` is free (else the connection
+/// closes after the answer), within the caller's read deadline. Unlike a refusal at admission the
+/// request still holds its in-flight permit and read slot meanwhile: at most [`OVERLOAD_DRAINS`]
+/// of them, for at most [`MULTIPART_READ_TIMEOUT`].
 async fn read_multipart(
     mut multipart: Multipart,
+    budget: &'static UploadBudget,
+    drains: Option<&Arc<Metrics>>,
 ) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
     let mut req = VisionDetectionRequest::default();
     let mut fields = HashMap::new();
     let mut got_image = false;
     loop {
-        let field = match multipart.next_field().await {
+        let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(e) => return Err(BodyError::from_multipart(&e, "Invalid multipart body")),
         };
-        match field.name().map(str::to_string) {
+        let name = field.name().map(str::to_string);
+        let what = if name.as_deref() == Some("image") {
+            "Reading the image field failed"
+        } else {
+            "Invalid multipart body"
+        };
+        let (buf, charge) = match read_charged(&mut field, budget).await {
+            Ok(v) => v,
+            Err(Some(e)) => return Err(BodyError::from_multipart(&e, what)),
+            Err(None) => {
+                budget.note_rejected();
+                let slot = drains.and_then(|m| m.try_begin_body_read(DRAIN_POOL, OVERLOAD_DRAINS));
+                if let Some(_slot) = slot
+                    && discard_rest(field).await.is_some()
+                {
+                    while let Ok(Some(f)) = multipart.next_field().await {
+                        if discard_rest(f).await.is_none() {
+                            break;
+                        }
+                    }
+                }
+                return Err(BodyError::over_budget(budget));
+            }
+        };
+        match name {
             Some(name) if name == "min_confidence" => {
-                let text = field.text().await.unwrap_or_default();
+                let text = String::from_utf8(buf.to_vec()).unwrap_or_default();
                 req.min_confidence = text.trim().parse::<f32>().unwrap_or(0.0);
                 fields.insert(name, text.trim().to_string());
             }
             Some(name) if name == "image" => {
                 if let Some(n) = field.file_name() {
-                    req.image_name = n.to_string();
+                    req.image_name = crate::static_memory::cap_name(n).to_string();
                 }
-                req.image_data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| BodyError::from_multipart(&e, "Reading the image field failed"))?;
+                req.image_data = body_budget::charged_bytes(buf, charge);
                 got_image = true;
             }
             Some(name) => {
-                if let Ok(text) = field.text().await {
+                if let Ok(text) = String::from_utf8(buf.to_vec()) {
                     fields.insert(name, text);
                 }
             }
@@ -414,10 +544,12 @@ async fn parse_body_within(
     let Upload {
         request,
         read_slot: _read_slot,
+        budget,
+        drains,
         ..
     } = upload;
     match multipart_stream(request).await {
-        Ok(mp) => tokio::time::timeout(limit, read_multipart(mp))
+        Ok(mp) => tokio::time::timeout(limit, read_multipart(mp, budget, drains.as_ref()))
             .await
             .unwrap_or_else(|_| {
                 Err(BodyError {
@@ -427,6 +559,7 @@ async fn parse_body_within(
                          network is too slow, so retry the request.",
                         limit.as_secs()
                     ),
+                    status: StatusCode::OK,
                 })
             }),
         Err(NotMultipart { rejection, body }) => {
@@ -470,8 +603,8 @@ pub(super) async fn detection_default(
         return with_request_id(resp.into_response(), &id);
     };
     let skip = no_collect(&headers);
-    let resp = detect_on(&state, &handle, upload, start, "detect", &id, skip).await;
-    with_request_id(Json(resp).into_response(), &id)
+    let (status, resp) = detect_on(&state, &handle, upload, start, "detect", &id, skip).await;
+    with_request_id((status, Json(resp)).into_response(), &id)
 }
 
 pub(super) async fn detection_custom(
@@ -498,8 +631,8 @@ pub(super) async fn detection_custom(
         return with_request_id(Json(r).into_response(), &id);
     };
     let skip = no_collect(&headers);
-    let resp = detect_on(&state, &handle, upload, start, "custom", &id, skip).await;
-    with_request_id(Json(resp).into_response(), &id)
+    let (status, resp) = detect_on(&state, &handle, upload, start, "custom", &id, skip).await;
+    with_request_id((status, Json(resp)).into_response(), &id)
 }
 
 /// Parse the upload, counting a rejection.
@@ -507,19 +640,20 @@ async fn parse_counted(
     state: &AppState,
     upload: Upload,
     no_collect: bool,
-) -> Result<VisionDetectionRequest, String> {
+) -> Result<VisionDetectionRequest, BodyError> {
     match parse_detection_body(upload).await {
         Ok((r, _)) => Ok(VisionDetectionRequest { no_collect, ..r }),
         Err(e) => {
             e.record(state);
-            Err(e.message)
+            Err(e)
         }
     }
 }
 
-/// A detection on `handle`. When the model cannot take it now (compiling, failed, queue full)
-/// the answer is known before the upload is needed: the body is discarded (bounded, see
-/// [`discard_body`]) instead of buffered, and the request answered at once.
+/// A detection on `handle` and the answer's status (503 for an upload the budget refused, else
+/// 200). When the model cannot take it now (compiling, failed, queue full) the answer is known
+/// before the upload is needed: the body is discarded (bounded, see [`discard_body`]) instead of
+/// buffered, and the request answered at once.
 async fn detect_on(
     state: &AppState,
     handle: &WorkerHandle,
@@ -528,7 +662,7 @@ async fn detect_on(
     command: &str,
     request_id: &str,
     no_collect: bool,
-) -> VisionDetectionResponse {
+) -> (StatusCode, VisionDetectionResponse) {
     // Counted here, not per inference: a failed model must not look like a silent Blue Iris.
     if !no_collect {
         crate::collect::metrics::METRICS.record_request();
@@ -537,18 +671,29 @@ async fn detect_on(
         handle.metrics.requests.fetch_add(1, Ordering::Relaxed);
         if let Some(early) = answer_without_inference(handle) {
             discard_body(upload).await;
-            return finish(state, handle, early, start, command, request_id);
+            let resp = finish(state, handle, early, start, command, request_id);
+            return (StatusCode::OK, resp);
         }
         // It became ready (or got room) meanwhile: serve it normally (the request is
         // already counted).
-        let resp = match parse_counted(state, upload, no_collect).await {
-            Ok(r) => send_to_worker(handle, r, start, request_id).await,
-            Err(e) => VisionDetectionResponse::error(e),
+        let (status, resp) = match parse_counted(state, upload, no_collect).await {
+            Ok(r) => (
+                StatusCode::OK,
+                send_to_worker(handle, r, start, request_id).await,
+            ),
+            Err(e) => (e.status, VisionDetectionResponse::error(e.message)),
         };
-        return finish(state, handle, resp, start, command, request_id);
+        return (
+            status,
+            finish(state, handle, resp, start, command, request_id),
+        );
     }
-    let req = parse_counted(state, upload, no_collect).await;
-    run_detection(state, handle, req, start, command, request_id).await
+    let (status, req) = match parse_counted(state, upload, no_collect).await {
+        Ok(r) => (StatusCode::OK, Ok(r)),
+        Err(e) => (e.status, Err(e.message)),
+    };
+    let resp = run_detection(state, handle, req, start, command, request_id).await;
+    (status, resp)
 }
 
 /// Longest client-chosen name written to the log.
@@ -1825,6 +1970,177 @@ mod tests {
         token.cancel();
         drop(s);
         let _ = tokio::time::timeout(Duration::from_secs(20), server).await;
+    }
+
+    /// An upload of `image` (one chunk per entry of `chunks`) with a `min_confidence` part
+    /// before it, with no declared length.
+    fn chunked_upload(chunks: &[&[u8]]) -> (Body, Arc<std::sync::atomic::AtomicBool>) {
+        let mut parts = vec![Bytes::from(
+            "--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"min_confidence\"\r\n\r\n0.4\r\n",
+        )];
+        parts.push(Bytes::from(&IMAGE_HEAD.as_bytes()[..IMAGE_HEAD.len() - 2]));
+        parts.extend(chunks.iter().map(|c| Bytes::copy_from_slice(c)));
+        parts.push(Bytes::from_static(b"\r\n--XBOUNDARYX--\r\n"));
+        tracked_body(parts)
+    }
+
+    fn post(body: Body) -> Request {
+        Request::post("/")
+            .header(header::CONTENT_TYPE, MP)
+            .body(body)
+            .unwrap()
+    }
+
+    /// M7: the image's bytes stay charged while any clone of them lives (the worker, the
+    /// collector), a text part's only while it is read.
+    #[tokio::test]
+    async fn upload_bytes_are_charged_while_the_image_lives() {
+        let budget = body_budget::leaked(1 << 20);
+        let (body, _) = chunked_upload(&[&[7u8; 3000], &[8u8; 2000]]);
+        let mut upload = multipart_of(post(body)).await;
+        upload.budget = budget;
+        let (req, fields) = parse_detection_body(upload).await.unwrap();
+        assert_eq!(fields["min_confidence"], "0.4");
+        assert_eq!(req.image_data.len(), 5000);
+        assert_eq!(budget.used(), 5000, "the image only");
+        let kept = req.image_data.clone();
+        drop(req);
+        assert_eq!(budget.used(), 5000);
+        drop(kept);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.rejected(), 0);
+    }
+
+    /// M7: a read past the budget is a 503 counted apart, its bytes go back, and the rest of the
+    /// upload is discarded so the connection stays usable.
+    #[tokio::test]
+    async fn an_upload_past_the_budget_is_refused_and_drained() {
+        let state = test_state();
+        let budget = body_budget::leaked(4096);
+        let (body, consumed) = chunked_upload(&[&[1u8; 3000], &[2u8; 3000], &[3u8; 3000]]);
+        let mut upload = multipart_of(from_peer(post(body), PEER_A)).await;
+        upload.budget = budget;
+        let _permit = admit(&state, "detect", &mut upload).unwrap();
+        let err = parse_detection_body(upload).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.reason, body_budget::REJECT_REASON);
+        assert!(err.message.contains("overloaded"), "{}", err.message);
+        assert_eq!(budget.used(), 0, "nothing stays charged");
+        assert_eq!(budget.rejected(), 1);
+        assert!(
+            consumed.load(Ordering::SeqCst),
+            "the rest was read and dropped"
+        );
+        assert_eq!(
+            state.metrics.body_reads(),
+            0,
+            "drain and read slots are back"
+        );
+        err.record(&state);
+        assert_eq!(state.metrics.rejected(body_budget::REJECT_REASON), 1);
+
+        // Every drain slot held: refused just the same, at once: the rest (which never ends
+        // here) is not waited for.
+        let _drains = all_drains(&state);
+        let head = Bytes::from(&IMAGE_HEAD.as_bytes()[..IMAGE_HEAD.len() - 2]);
+        let stream = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(head),
+            Ok(Bytes::from(vec![1u8; 5000])),
+        ])
+        .chain(futures_util::stream::pending());
+        let mut upload = multipart_of(from_peer(post(Body::from_stream(stream)), PEER_A)).await;
+        upload.budget = budget;
+        let _permit = admit(&state, "detect", &mut upload).unwrap();
+        let started = Instant::now();
+        let err = parse_detection_body(upload).await.unwrap_err();
+        assert!(started.elapsed() < MULTIPART_READ_TIMEOUT, "not drained");
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.rejected(), 2);
+    }
+
+    /// M7: a declared length that does not fit is refused at admission, before any read, with
+    /// the overload answer (and its drain).
+    #[tokio::test]
+    async fn a_declared_length_past_the_budget_is_refused_at_admission() {
+        let state = test_state();
+        let budget = body_budget::leaked(100);
+        let body = image_body(&[0u8; 500]);
+        let req = Request::post("/")
+            .header(header::CONTENT_TYPE, MP)
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap();
+        let mut upload = multipart_of(from_peer(req, PEER_A)).await;
+        upload.budget = budget;
+        let resp = admit(&state, "custom", &mut upload).unwrap_err();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(budget.rejected(), 1);
+        assert_eq!(state.metrics.rejected(body_budget::REJECT_REASON), 1);
+        assert_eq!(state.metrics.inflight(), 0, "its permit went back");
+        assert_eq!(state.metrics.body_reads(), 0, "no read slot taken");
+        // Past BODY_LIMIT a length is the too-large answer's business, not the budget's.
+        let req = Request::post("/")
+            .header(header::CONTENT_TYPE, MP)
+            .header(header::CONTENT_LENGTH, BODY_LIMIT + 1)
+            .body(Body::empty())
+            .unwrap();
+        let mut upload = multipart_of(from_peer(req, PEER_A)).await;
+        upload.budget = budget;
+        assert!(admit(&state, "detect", &mut upload).is_ok());
+    }
+
+    /// M7: a client hang-up and a stalled read give their bytes back.
+    #[tokio::test]
+    async fn a_hang_up_or_a_stall_mid_read_gives_the_bytes_back() {
+        let budget = body_budget::leaked(1 << 20);
+        let head = Bytes::from(&IMAGE_HEAD.as_bytes()[..IMAGE_HEAD.len() - 2]);
+        let stream = futures_util::stream::iter([
+            Ok(head.clone()),
+            Ok(Bytes::from(vec![9u8; 4000])),
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ]);
+        let mut upload = multipart_of(post(Body::from_stream(stream))).await;
+        upload.budget = budget;
+        let err = parse_detection_body(upload).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::OK);
+        assert_eq!(budget.used(), 0);
+
+        let stream = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(head),
+            Ok(Bytes::from(vec![9u8; 4000])),
+        ])
+        .chain(futures_util::stream::pending());
+        let mut upload = multipart_of(post(Body::from_stream(stream))).await;
+        upload.budget = budget;
+        let err = parse_body_within(upload, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, RejectReason::BodyTimeout);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A normal load never comes near the budget: many uploads of the largest size fit at once,
+    /// and a Blue Iris frame is a few hundred kB, a hundredth of that.
+    #[test]
+    fn the_budget_holds_many_largest_uploads() {
+        const { assert!(body_budget::UPLOAD_BUDGET / BODY_LIMIT >= 32) };
+        assert!(body_budget::UPLOADS.limit() == body_budget::UPLOAD_BUDGET);
+    }
+
+    /// M2: the upload name is cut at the request edge.
+    #[tokio::test]
+    async fn a_long_image_name_is_cut_at_the_request_edge() {
+        let name = "Ü".repeat(300);
+        let body = format!(
+            "--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{name}\"\r\n\r\njpeg\r\n--XBOUNDARYX--\r\n"
+        );
+        let (req, _) = parse_detection_body(multipart_of(post(Body::from(body))).await)
+            .await
+            .unwrap();
+        assert!(req.image_name.len() <= crate::static_memory::MAX_NAME_BYTES);
+        assert!(req.image_name.len() >= crate::static_memory::MAX_NAME_BYTES - 1);
+        assert!(name.starts_with(&req.image_name));
     }
 
     /// The admission guard itself: with every slot held, each further `admit` answers the

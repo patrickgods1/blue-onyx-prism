@@ -353,3 +353,47 @@ fn frames_that_cannot_be_linked_count_as_copies() {
     assert_eq!(n[1].bytes, w);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn the_gpu_need_is_the_train_tabs_estimate() {
+    use crate::backend::detect::ComputeCapability;
+    use crate::resources::export::train::TrainLane;
+    let cuda = Accelerator::Cuda {
+        ordinal: 0,
+        name: "NVIDIA GeForce GTX 1070 Ti".into(),
+        compute_capability: ComputeCapability::new(6, 1),
+        vram_mb: 8192,
+        lane: TrainLane::Cu126,
+    };
+    let mut recipe = TrainRecipe::new(crate::resources::catalog::TrainFamily::Yolo26, "n").unwrap();
+    recipe.batch = 16;
+    recipe.imgsz = 640;
+    let need = gpu_need(&recipe, &cuda).unwrap();
+    let est = crate::training::estimate::estimate(recipe.family, "n", 640, 16, 1, 1, cuda.target())
+        .unwrap();
+    assert_eq!(need.need_mb, est.vram_mb);
+    assert_eq!(need.what, "this training run");
+    assert!(
+        need.detail.starts_with("YOLO26 n at batch 16 and 640 px"),
+        "{}",
+        need.detail
+    );
+    // A larger batch needs more.
+    recipe.batch = 32;
+    assert!(gpu_need(&recipe, &cuda).unwrap().need_mb > need.need_mb);
+    // Apple silicon: unified memory, no warning whatever the estimate.
+    let mps = Accelerator::Mps {
+        name: "Apple M1".into(),
+        memory_mb: 1,
+    };
+    assert_eq!(gpu_warning(&recipe, &mps), None);
+    // CUDA device 99 is on no adapter here: no reading, no warning.
+    let far = Accelerator::Cuda {
+        ordinal: 99,
+        name: "far".into(),
+        compute_capability: ComputeCapability::new(6, 1),
+        vram_mb: 8192,
+        lane: TrainLane::Cu126,
+    };
+    assert_eq!(gpu_warning(&recipe, &far), None);
+}
