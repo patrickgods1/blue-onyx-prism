@@ -12,6 +12,7 @@
 use super::{AppState, ConfigView};
 use crate::config::{Config, validate_config};
 use crate::config_merge::{self, Pending};
+use crate::config_store::ConfigRef;
 use crate::registry::normalize_name;
 use crate::startup::ModelState;
 use crate::sync::LockExt;
@@ -33,7 +34,7 @@ pub(super) const CHANGES_SHOWN: usize = 20;
 // Benchmark facts (cached by file stamp: the results file can be tens of MB)
 
 /// What the last benchmark says about a model.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct BenchFacts {
     pub model: String,
     pub recommended: Option<String>,
@@ -163,7 +164,7 @@ fn device_facts(m: &crate::benchmark::ModelResult) -> Vec<DeviceFact> {
     out
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct BenchSummary {
     /// Normalized model name -> facts.
     pub models: HashMap<String, BenchFacts>,
@@ -297,7 +298,7 @@ pub(super) fn fmt_thr(t: f32) -> String {
 // Running state
 
 /// What the running worker of a model uses.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct RunningView {
     /// A worker of this generation serves the model.
@@ -422,26 +423,125 @@ fn configured_resolved(
 // ---------------------------------------------------------------------------------------------
 // GET /v1/config
 
-/// The payload of `GET /v1/config`.
+/// Everything the full answer is built from, read once per poll. Two polls with equal inputs
+/// ([`Inputs::same`]) get the same answer, so the second is served from [`AnswerCache`] without
+/// building, serializing or hashing anything (RR-C2).
+///
+/// The inputs, all found by reading [`build_payload`]: the store state (config, revision,
+/// generation, change log, file error: [`ConfigRef::serial`]), what this generation runs
+/// ([`AppState::running`], swapped by every apply), the benchmark facts (re-read by file
+/// stamp, [`bench_summary`]), the runtimes' hardware and probe (None while they compile), per
+/// configured model whether an `.onnx` sits beside it (the `auto` selection checks it), the
+/// worker's view (state, detail, provider, device, threshold) and its planned device, and the
+/// names of this generation's workers. The epoch and the config path never change for a state.
+pub(super) struct Inputs {
+    view: ConfigRef,
+    running: Arc<Config>,
+    bench: Arc<Option<BenchSummary>>,
+    probe: Option<(
+        crate::backend::HardwareInfo,
+        crate::backend::select::RuntimeProbe,
+    )>,
+    onnx: Vec<bool>,
+    views: Vec<RunningView>,
+    planned: Vec<Option<String>>,
+    workers: Vec<String>,
+}
+
+impl Inputs {
+    /// Read the inputs of `state` now (cheap: atomic loads, a few `stat`s, the workers' state).
+    fn gather(state: &AppState) -> Self {
+        let view = state.config_read();
+        let names: Vec<String> = view.models.iter().map(|m| m.effective_name()).collect();
+        Self {
+            running: state.running(),
+            bench: bench_summary(&crate::benchmark::results_path(&state.config_path)),
+            probe: quick_probe(state),
+            onnx: view
+                .models
+                .iter()
+                .map(|m| crate::backend::select::onnx_path_for(&view.data_path(&m.path)).is_some())
+                .collect(),
+            views: names.iter().map(|n| running_view(state, n)).collect(),
+            planned: names
+                .iter()
+                .map(|n| {
+                    state
+                        .registry
+                        .by_name(n)
+                        .and_then(|w| w.planned.as_ref().map(|p| p.to_string()))
+                })
+                .collect(),
+            workers: state
+                .registry
+                .workers()
+                .iter()
+                .map(|w| w.name.clone())
+                .collect(),
+            view,
+        }
+    }
+
+    /// Both answers would be the same. The `Arc`s compare by pointer: a cached entry holds its
+    /// own, so a pointer is never reused while it is compared.
+    fn same(&self, o: &Self) -> bool {
+        ConfigRef::serial(&self.view) == ConfigRef::serial(&o.view)
+            && Arc::ptr_eq(&self.running, &o.running)
+            // By content: `bench_summary` keeps one file's summary, so another caller's file (or a
+            // missing one, a fresh `None`) gives a new pointer to the same facts.
+            && (Arc::ptr_eq(&self.bench, &o.bench) || *self.bench == *o.bench)
+            && self.probe == o.probe
+            && self.onnx == o.onnx
+            && self.views == o.views
+            && self.planned == o.planned
+            && self.workers == o.workers
+    }
+}
+
+/// The payload of `GET /v1/config` (what [`full_answer`] serializes).
+#[cfg(test)]
 pub(super) fn payload(state: &AppState) -> Value {
-    super::sync_config(state);
-    let (revision, cfg) = state.config.snapshot();
-    let pending = config_merge::pending(&state.running(), &cfg);
-    let bench = bench_summary(&crate::benchmark::results_path(&state.config_path));
-    let probe = quick_probe(state);
+    sync_for_poll(state);
+    build_payload(state, &Inputs::gather(state))
+}
+
+/// Pick up a config file changed on disk and apply a revision not applied yet, like
+/// [`super::sync_config`], without ever waiting: the file check only tries the store's writer
+/// lock, and when `apply_lock` is held (a save writes and applies its edit under it, a restart
+/// or the disk watch applies) the holder applies the revision itself, so the poll answers with
+/// what runs now and the next poll shows the result.
+fn sync_for_poll(state: &AppState) {
+    state.config.check_disk();
+    let applied = state
+        .applied_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    if state.config.revision() != applied
+        && let Some(held) = state.apply_lock.try_lock_recover()
+    {
+        super::apply::apply_config_locked(state, &held);
+    }
+}
+
+/// The full payload from `inputs`.
+fn build_payload(state: &AppState, inputs: &Inputs) -> Value {
+    let cfg: &Config = &inputs.view;
+    let revision = ConfigRef::revision(&inputs.view);
+    let pending = config_merge::pending(&inputs.running, cfg);
+    let bench = &inputs.bench;
+    let probe = inputs.probe.as_ref();
     let default = cfg.effective_default_index();
     let thr = crate::config::round_threshold_f64;
     let models: Vec<Value> = cfg
         .models
         .iter()
+        .zip(&inputs.views)
         .enumerate()
-        .map(|(i, m)| {
+        .map(|(i, (m, running))| {
             let name = m.effective_name();
             let key = normalize_name(&name);
             let reasons = pending.for_model(&name);
-            let resolved = configured_resolved(state, &cfg, m, probe.as_ref());
-            let facts = (*bench).as_ref().and_then(|b| b.models.get(&key).cloned());
-            let running = running_view(state, &name);
+            let resolved = configured_resolved(state, cfg, m, probe);
+            let facts = (**bench).as_ref().and_then(|b| b.models.get(&key).cloned());
             // The device the threshold follows: the loaded one, else what the config resolves to.
             let threshold_key = device_key(running.device.as_deref().or(resolved.as_deref()));
             let cell = ThresholdCell::new(m, cfg.confidence_threshold, &threshold_key);
@@ -505,31 +605,29 @@ pub(super) fn payload(state: &AppState) -> Value {
         })
         .collect();
     // Workers of this generation whose model left the config.
-    let gone: Vec<String> = state
-        .registry
-        .workers()
+    let gone: Vec<&String> = inputs
+        .workers
         .iter()
-        .filter(|w| crate::benchmark::find_model(&cfg, &w.name).is_none())
-        .map(|w| w.name.clone())
+        .filter(|w| crate::benchmark::find_model(cfg, w).is_none())
         .collect();
     json!({
         "success": true,
         "revision": revision,
         "epoch": state.config.epoch(),
-        "generation": state.config.generation(),
+        "generation": ConfigRef::generation(&inputs.view),
         "path": state.config_path.display().to_string(),
-        "fileError": state.config.disk_error(),
+        "fileError": ConfigRef::disk_error(&inputs.view),
         "config": cfg,
         "globalThreshold": thr(cfg.confidence_threshold),
         "restartNeeded": pending.restart_needed(),
         "pendingCount": pending.count(),
-        "pending": pending_json(&pending, &cfg),
+        "pending": pending_json(&pending, cfg),
         "models": models,
         "loadedNotConfigured": gone,
-        "changes": state.config.changes(CHANGES_SHOWN),
+        "changes": ConfigRef::changes(&inputs.view, CHANGES_SHOWN),
         "forms": {
             "server": {
-                "view": ConfigView::from_config(&cfg),
+                "view": ConfigView::from_config(cfg),
             },
         },
     })
@@ -562,24 +660,146 @@ fn pending_json(p: &Pending, cfg: &Config) -> Value {
 /// The `GET /v1/config` answer for a client that may not administer: the counters the restart
 /// poller (`live.js`, `message.html`) compares and the header's pending-change count. No file
 /// read, no model reload ([`super::sync_config`] is not called), nothing of the config itself.
-pub(super) fn minimal_payload(state: &AppState) -> Value {
-    let (revision, cfg) = state.config.snapshot();
-    let pending = config_merge::pending(&state.running(), &cfg);
+fn minimal_payload(state: &AppState, view: &ConfigRef, running: &Config) -> Value {
+    let pending = config_merge::pending(running, view);
     json!({
         "success": true,
-        "revision": revision,
+        "revision": ConfigRef::revision(view),
         "epoch": state.config.epoch(),
-        "generation": state.config.generation(),
+        "generation": ConfigRef::generation(view),
         "restartNeeded": pending.restart_needed(),
         "pendingCount": pending.count(),
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Answer cache
+
+/// A serialized `GET /v1/config` answer and its validators.
+#[derive(Debug)]
+pub(super) struct Answer {
+    text: axum::body::Bytes,
+    /// Weak ETag over the text: `W/"<revision>-<hash>"`.
+    etag: HeaderValue,
+    /// `X-Config-Revision`.
+    revision: HeaderValue,
+}
+
+impl Answer {
+    fn of(body: &Value) -> Self {
+        let text = body.to_string();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        // `Value::Null` (shown as `null`) when missing, as indexing gave.
+        let revision = body.get("revision").cloned().unwrap_or_default();
+        let etag = format!("W/\"{}-{:016x}\"", revision, h.finish());
+        Self {
+            text: text.into(),
+            etag: HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("W/\"0\"")),
+            revision: HeaderValue::from_str(&revision.to_string())
+                .unwrap_or(HeaderValue::from_static("0")),
+        }
+    }
+}
+
+/// What the minimal answer is built from: the store state ([`ConfigRef::serial`]) and what runs.
+type MinimalKey = (u64, Arc<Config>);
+
+/// The last answers of one [`AppState`] (one generation).
+#[derive(Default)]
+struct Slots {
+    full: Option<(Inputs, Arc<Answer>)>,
+    /// The minimal answer depends on the store state and what runs only.
+    minimal: Option<(MinimalKey, Arc<Answer>)>,
+    /// Full answers built (the tests count them).
+    builds: u64,
+}
+
+/// Cached answers per [`AppState`], held weakly: a generation's entry goes once its state is
+/// dropped. A static rather than an `AppState` field so the state's constructors stay as
+/// they are. The lock is held only to look up or store an entry, never while building one
+/// (two polls racing on a change may both build; the answers are equal).
+struct AnswerCache(Mutex<Vec<(std::sync::Weak<AppState>, Slots)>>);
+
+static ANSWERS: AnswerCache = AnswerCache(Mutex::new(Vec::new()));
+
+impl AnswerCache {
+    fn with<R>(&self, state: &Arc<AppState>, f: impl FnOnce(&mut Slots) -> R) -> R {
+        let mut all = self.0.lock_recover();
+        all.retain(|(w, _)| w.strong_count() > 0);
+        let i = match all
+            .iter()
+            .position(|(w, _)| std::ptr::eq(w.as_ptr(), Arc::as_ptr(state)))
+        {
+            Some(i) => i,
+            None => {
+                all.push((Arc::downgrade(state), Slots::default()));
+                all.len() - 1
+            }
+        };
+        match all.get_mut(i) {
+            Some((_, slots)) => f(slots),
+            None => f(&mut Slots::default()),
+        }
+    }
+}
+
+/// The admin answer: from the cache when nothing it is built from changed, else built,
+/// serialized and hashed here (callers run this in [`super::blocking`]: it may read the
+/// config file, `benchmark.json` and probe devices).
+fn full_answer(state: &Arc<AppState>) -> Arc<Answer> {
+    sync_for_poll(state);
+    let inputs = Inputs::gather(state);
+    let hit = ANSWERS.with(state, |s| {
+        s.full
+            .as_ref()
+            .filter(|(k, _)| k.same(&inputs))
+            .map(|(_, a)| a.clone())
+    });
+    if let Some(a) = hit {
+        return a;
+    }
+    let answer = Arc::new(Answer::of(&build_payload(state, &inputs)));
+    ANSWERS.with(state, |s| {
+        s.full = Some((inputs, answer.clone()));
+        s.builds += 1;
+    });
+    answer
+}
+
+/// The minimal answer ([`minimal_payload`]), cached the same way.
+fn minimal_answer(state: &Arc<AppState>) -> Arc<Answer> {
+    let view = state.config_read();
+    let running = state.running();
+    let serial = ConfigRef::serial(&view);
+    let hit = ANSWERS.with(state, |s| {
+        s.minimal
+            .as_ref()
+            .filter(|((k, r), _)| *k == serial && Arc::ptr_eq(r, &running))
+            .map(|(_, a)| a.clone())
+    });
+    if let Some(a) = hit {
+        return a;
+    }
+    let answer = Arc::new(Answer::of(&minimal_payload(state, &view, &running)));
+    ANSWERS.with(state, |s| {
+        s.minimal = Some(((serial, running), answer.clone()))
+    });
+    answer
+}
+
+/// Full answers built for `state` so far.
+#[cfg(test)]
+pub(super) fn answers_built(state: &Arc<AppState>) -> u64 {
+    ANSWERS.with(state, |s| s.builds)
+}
+
 /// `GET /v1/config` with a weak ETag over the payload (If-None-Match answers 304). The full
-/// [`payload`] for admin peers, [`minimal_payload`] for everyone else (SV-05). Nobody is refused:
+/// [`build_payload`] for admin peers, [`minimal_payload`] for everyone else (SV-05). Nobody is refused:
 /// the pages' poller reads this route, so a missing or wrong token gets the minimal answer. A
 /// wrong one counts against the peer's limit, or this would be a free way to test tokens, and
-/// over the limit even the right one gets the minimal answer.
+/// over the limit even the right one gets the minimal answer. Both answers are cached until
+/// something they are built from changes ([`Inputs`]), so a poll with no change only compares.
 pub(super) async fn config_json(
     State(state): State<Arc<AppState>>,
     peer: Result<
@@ -611,29 +831,24 @@ pub(super) async fn config_json(
     } else {
         false
     };
-    let body = if admin {
+    let answer = if admin {
         // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
-        super::blocking(move || payload(&state)).await
+        super::blocking(move || full_answer(&state)).await
     } else {
-        minimal_payload(&state)
+        minimal_answer(&state)
     };
-    let text = body.to_string();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    // `Value::Null` (shown as `null`) when missing, as indexing gave.
-    let revision = body.get("revision").cloned().unwrap_or_default();
-    let etag = format!("W/\"{}-{:016x}\"", revision, h.finish());
     let matches = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
-    let etag_value = HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("W/\"0\""));
-    let rev = HeaderValue::from_str(&revision.to_string()).unwrap_or(HeaderValue::from_static("0"));
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| t.trim().as_bytes() == answer.etag.as_bytes())
+        });
     let mut resp = if matches {
         (
             StatusCode::NOT_MODIFIED,
             [
-                (header::ETAG, etag_value),
+                (header::ETAG, answer.etag.clone()),
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
             ],
         )
@@ -645,13 +860,14 @@ pub(super) async fn config_json(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
                 ),
-                (header::ETAG, etag_value),
+                (header::ETAG, answer.etag.clone()),
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
             ],
-            text,
+            answer.text.clone(),
         )
             .into_response();
-        resp.headers_mut().insert("x-config-revision", rev);
+        resp.headers_mut()
+            .insert("x-config-revision", answer.revision.clone());
         resp
     };
     if stale_cookie {
@@ -1137,6 +1353,235 @@ pub(super) mod tests {
         assert_eq!(n["deviceThresholds"], json!({}));
         assert_eq!(n["fallback"]["source"], "global");
         assert!(n["bench"].is_null());
+    }
+
+    fn config_get(etag: Option<&str>) -> axum::http::Request<axum::body::Body> {
+        let mut r =
+            axum::http::Request::get("/v1/config").header(header::ACCEPT, "application/json");
+        if let Some(e) = etag {
+            r = r.header(header::IF_NONE_MATCH, e);
+        }
+        r.body(axum::body::Body::empty()).unwrap()
+    }
+
+    /// RR-C2: a poll with nothing changed builds nothing (304 or the same 200 from the cache),
+    /// and every input of the answer invalidates it: a save, an edit on disk, a file error,
+    /// what runs, the benchmark file, a worker's state.
+    #[tokio::test]
+    async fn config_answer_is_cached_until_an_input_changes() {
+        let state = test_state();
+        let (s, h, first) = call(&state, config_get(None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let etag = h[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(answers_built(&state), 1);
+        for _ in 0..3 {
+            let (s, h, b) = call(&state, config_get(Some(&etag))).await;
+            assert_eq!((s, b.len()), (StatusCode::NOT_MODIFIED, 0));
+            assert_eq!(h[header::ETAG].to_str().unwrap(), etag);
+        }
+        let (s, h, b) = call(&state, config_get(None)).await;
+        assert_eq!((s, &b), (StatusCode::OK, &first));
+        assert_eq!(h["x-config-revision"], "1");
+        assert_eq!(answers_built(&state), 1, "an unchanged poll builds nothing");
+        // The cached answer is what a fresh build gives.
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap(),
+            payload(&state)
+        );
+
+        let mut built = 1;
+        let mut etag = etag;
+        let mut changed = async |what: &str, state: &Arc<AppState>| {
+            let (s, h, _) = call(state, config_get(Some(&etag))).await;
+            assert_eq!(s, StatusCode::OK, "{what}: a new answer");
+            built += 1;
+            assert_eq!(answers_built(state), built, "{what}: built once");
+            let (s, _, _) = call(state, config_get(Some(h[header::ETAG].to_str().unwrap()))).await;
+            assert_eq!(s, StatusCode::NOT_MODIFIED, "{what}: then cached again");
+            assert_eq!(answers_built(state), built);
+            etag = h[header::ETAG].to_str().unwrap().to_string();
+        };
+        // A save (new revision).
+        super::super::save_config(&state, "test", |c| {
+            c.nms_iou = 0.45;
+            Ok(())
+        })
+        .unwrap();
+        changed("a save", &state).await;
+        // An edit on disk, picked up by the poll.
+        let mut other = Config::load(&state.config_path).unwrap();
+        other.port = 4321;
+        other.save(&state.config_path).unwrap();
+        changed("an edit on disk", &state).await;
+        // A file that does not validate: no new revision, but `fileError`.
+        std::fs::write(&state.config_path, "{ not json").unwrap();
+        changed("a file error", &state).await;
+        // What runs, swapped by an apply.
+        state.running.store(Arc::new(Config::default()));
+        changed("what runs", &state).await;
+        // The benchmark results.
+        write_profiled_bench(&state);
+        changed("the benchmark file", &state).await;
+        // A worker's state.
+        state.registry.workers()[0]
+            .state
+            .set_initializing("waiting for x");
+        changed("a worker's state", &state).await;
+    }
+
+    /// The minimal answer (a peer that may not administer) is cached as well, and follows the
+    /// store.
+    #[tokio::test]
+    async fn minimal_answer_is_cached() {
+        let state = test_state();
+        let remote = |etag: Option<&str>| from_peer(config_get(etag), REMOTE);
+        let (s, h, b) = call(&state, remote(None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let j: Value = serde_json::from_slice(&b).unwrap();
+        assert!(j.get("config").is_none(), "{j}");
+        let etag = h[header::ETAG].to_str().unwrap().to_string();
+        let (s, _, _) = call(&state, remote(Some(&etag))).await;
+        assert_eq!(s, StatusCode::NOT_MODIFIED);
+        assert_eq!(answers_built(&state), 0, "no full answer for a remote peer");
+        super::super::save_config(&state, "test", |c| {
+            c.port = 4000;
+            Ok(())
+        })
+        .unwrap();
+        let (s, _, b) = call(&state, remote(Some(&etag))).await;
+        assert_eq!(s, StatusCode::OK);
+        let j: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(
+            (j["revision"].as_u64(), j["pendingCount"].as_u64()),
+            (Some(2), Some(1))
+        );
+    }
+
+    /// RR-C1 end to end: while a save from a page is inside its file write (holding
+    /// `apply_lock` and the store's writer lock), `GET /v1/config` (full and minimal) and the
+    /// request handlers' config reads answer with the previous config; after it, the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn config_poll_does_not_wait_for_a_save() {
+        const STEP: std::time::Duration = std::time::Duration::from_secs(20);
+        let state = test_state();
+        // Write the file once, so the parked save below is a change.
+        let (s, _, _) = call(&state, config_get(None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        state.config.set_write_hook(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock_recover()
+                .recv_timeout(STEP)
+                .expect("released");
+        })));
+        let saver = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                super::super::save_config(&state, "config page", |c| {
+                    c.port = 4000;
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        tokio::task::spawn_blocking(move || entered.recv_timeout(STEP))
+            .await
+            .unwrap()
+            .expect("the save reached its write");
+        assert!(
+            state.apply_lock.try_lock().is_err(),
+            "the save holds apply_lock"
+        );
+        let polls = async {
+            let full = call(&state, config_get(None)).await;
+            let minimal = call(&state, from_peer(config_get(None), REMOTE)).await;
+            (full, minimal, state.config_read().port)
+        };
+        let ((full, minimal, port), _) = (
+            tokio::time::timeout(STEP, polls)
+                .await
+                .expect("a poll waited for the save"),
+            (),
+        );
+        assert_eq!(full.0, StatusCode::OK);
+        let j: Value = serde_json::from_slice(&full.2).unwrap();
+        assert_eq!(j["revision"], 1);
+        assert_eq!(j["config"]["port"], crate::DEFAULT_PORT);
+        let j: Value = serde_json::from_slice(&minimal.2).unwrap();
+        assert_eq!(j["revision"], 1);
+        assert_eq!(port, crate::DEFAULT_PORT);
+        release.send(()).unwrap();
+        let msg = tokio::task::spawn_blocking(move || saver.join().unwrap())
+            .await
+            .unwrap();
+        assert!(msg.starts_with("Saved to "), "{msg}");
+        let (_, _, b) = call(&state, config_get(None)).await;
+        let j: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(
+            (j["revision"].as_u64(), j["config"]["port"].as_u64()),
+            (Some(2), Some(4000))
+        );
+        state.config.set_write_hook(None);
+    }
+
+    /// Work and bytes per `GET /v1/config` poll (run with `--ignored --nocapture`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "measurement"]
+    async fn measure_config_poll() {
+        use axum::body::Body;
+        use axum::http::Request;
+        let state = test_state();
+        write_profiled_bench(&state);
+        let get = |etag: Option<String>| {
+            let mut r = Request::get("/v1/config").header(header::ACCEPT, "application/json");
+            if let Some(e) = etag {
+                r = r.header(header::IF_NONE_MATCH, e);
+            }
+            r.body(Body::empty()).unwrap()
+        };
+        let (s, h, b) = call(&state, get(None)).await;
+        assert_eq!(s, StatusCode::OK);
+        let etag = h[header::ETAG].to_str().unwrap().to_string();
+        let n = 500;
+        let t = std::time::Instant::now();
+        let mut bytes = 0;
+        for _ in 0..n {
+            let (s, _, b) = call(&state, get(Some(etag.clone()))).await;
+            assert_eq!(s, StatusCode::NOT_MODIFIED);
+            bytes += b.len();
+        }
+        let per_304 = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let (s, _, _) = call(&state, get(None)).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let per_200 = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(payload(&state).to_string());
+        }
+        let per_build = t.elapsed() / n;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let r = Request::get("/static/no-such-file")
+                .body(Body::empty())
+                .unwrap();
+            std::hint::black_box(call(&state, r).await);
+        }
+        let per_route = t.elapsed() / n;
+        println!(
+            "full body {} bytes; 304 poll {per_304:?} ({} body bytes); 200 poll {per_200:?}; \
+             build+stringify {per_build:?}; test router round trip alone {per_route:?}; \
+             answers built over {} polls: {}",
+            b.len(),
+            bytes / n as usize,
+            2 * n + 1,
+            answers_built(&state)
+        );
     }
 
     #[test]

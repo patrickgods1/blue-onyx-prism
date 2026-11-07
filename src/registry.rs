@@ -717,8 +717,16 @@ impl Served {
         let name = r.slot.handle.name.clone();
         if failed && r.upgrade {
             let current = s.current(key).map(|w| w.handle.clone());
+            // The verdict lands under the lock that removed the try: whoever sees the try over
+            // (`is_replacing` false) sees its outcome too. `better` is a leaf mutex.
+            let still = r.slot.handle.better();
+            if still.is_none()
+                && let Some(c) = &current
+            {
+                c.clear_better();
+            }
             drop(s);
-            match (r.slot.handle.better(), current) {
+            match (still, current) {
                 (Some(b), _) => {
                     info!(
                         model = %name,
@@ -727,14 +735,13 @@ impl Served {
                         b.reason
                     );
                 }
-                (None, Some(current)) => {
+                (None, Some(_)) => {
                     let text = r.slot.handle.state.describe();
                     info!(
                         model = %name,
                         "the better device failed for a reason that will not pass ({text}); not \
                          trying it again"
                     );
-                    current.clear_better();
                 }
                 (None, None) => {}
             }

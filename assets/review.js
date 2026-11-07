@@ -5,8 +5,9 @@
 // params; they start from the page's own URL (a deep link such as ?auto=overlaps), stay in it, and
 // fold to the one-line summary above the frame, whose "Auto-label these frames" link passes them
 // on. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
-// A job queued on the Auto-label tab is followed on GET /v1/training, and the frames reload when it
-// ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
+// A job queued on the Auto-label tab is followed on GET /v1/train/jobs?task=<id> (its record only;
+// GET /v1/training on a server without it), every 3 s while the tab shows, and the frames reload
+// when it ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
 // POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
 // and "Reject stacked duplicates" POST /v1/review/reject-stacked
@@ -3022,7 +3023,7 @@
 
   var alStatus = $('rv-al-status');
   var alProgress = $('rv-al-progress');
-  var polling = null;   // {id, timer}
+  var polling = null;   // {id, box, bar, after, loop}: the task followed
 
   function describeTask(t) {
     if (t.state === 'queued') return 'Queued: ' + (t.title || 'auto-label') + ' (waiting for the queue).';
@@ -3032,51 +3033,98 @@
   }
 
   function stopPolling() {
-    if (polling) clearInterval(polling.timer);
+    if (polling) polling.loop.stop();
     polling = null;
+  }
+
+  // Task records: task `id` (a list of one, none when the server has no such task), else every
+  // queued, running or paused one. From GET /v1/train/jobs (task=<id> / tasks=busy: the records
+  // without log or result); a server whose answer lacks the field is asked on GET /v1/training
+  // from then on.
+  var jobsHasTasks = true;
+  function taskRecords(id) {
+    var json = function (url) {
+      return fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' }).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      });
+    };
+    if (!jobsHasTasks) {
+      return json('/v1/training').then(function (data) {
+        return (data.tasks || []).filter(function (t) { return id ? t.id === id : true; });
+      });
+    }
+    var key = id ? 'task' : 'tasks';
+    return json('/v1/train/jobs?' + (id ? 'task=' + encodeURIComponent(id) : 'tasks=busy')).then(function (j) {
+      if (!j || !(key in j)) { jobsHasTasks = false; return taskRecords(id); }
+      return id ? (j.task ? [j.task] : []) : (j.tasks || []);
+    });
+  }
+
+  // Chained, never an interval (no two requests at once), no request while the tab is hidden, one
+  // at once when it shows again. `run()` resolves false to stop.
+  function loop(run, period) {
+    if (window.PrismPoll) {
+      var p = window.PrismPoll.create({ run: run, period: period, more: function (go) { return go !== false; } });
+      p.start();
+      return p;
+    }
+    // An older live.js: the same loop without the back-off.
+    var timer = null, inFlight = false, done = false;
+    var clear = function () { if (timer !== null) { clearTimeout(timer); timer = null; } };
+    var go = function () {
+      clear();
+      if (done || inFlight || document.hidden) return;
+      inFlight = true;
+      run().then(function (more) { if (more === false) done = true; }, function () {}).then(function () {
+        inFlight = false;
+        if (!done && !document.hidden) timer = setTimeout(go, period);
+      });
+    };
+    document.addEventListener('visibilitychange', function () { if (document.hidden) clear(); else go(); });
+    go();
+    return { stop: function () { done = true; clear(); } };
   }
 
   // Follow task `id`; `box` and `bar` show it (default: the line above the frame), `after(t)` runs when
   // it ends.
   function pollTask(id, box, bar, after) {
     stopPolling();
-    polling = { id: id, box: box || alStatus, bar: bar || alProgress, after: after, timer: setInterval(function () { tick(id); }, 3000) };
-    tick(id);
+    var me = { id: id, box: box || alStatus, bar: bar || alProgress, after: after };
+    polling = me;
+    me.loop = loop(function () { return tick(me); }, 3000);
   }
 
-  function tick(id) {
-    fetch('/v1/training', { headers: { Accept: 'application/json' } })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        if (!data || !polling || polling.id !== id) return;
-        var t = (data.tasks || []).filter(function (x) { return x.id === id; })[0];
-        if (!t) return;
-        var box = polling.box, bar = polling.bar, after = polling.after;
-        if (t.state === 'queued' || t.state === 'running' || t.state === 'paused') {
-          report(box, [describeTask(t)]);
-          bar.hidden = false;
-          bar.value = t.percent || 0;
-          return;
-        }
-        stopPolling();
-        bar.hidden = true;
-        if (t.state === 'done') report(box, ['Done: ' + (t.summary || t.title || 'auto-label finished')]);
-        else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see Jobs on the Auto-label tab.')]);
-        else report(box, [t.summary ? 'Cancelled: ' + t.summary : 'Cancelled.']);
-        box.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
-        if (after) after(t);
-        reloadQueue();
-      })
-      .catch(function () {});
+  function tick(me) {
+    return taskRecords(me.id).then(function (list) {
+      if (polling !== me) return false;
+      var t = list.filter(function (x) { return x.id === me.id; })[0];
+      if (!t) return true;
+      var box = me.box, bar = me.bar, after = me.after;
+      if (t.state === 'queued' || t.state === 'running' || t.state === 'paused') {
+        report(box, [describeTask(t)]);
+        bar.hidden = false;
+        bar.value = t.percent || 0;
+        return true;
+      }
+      stopPolling();
+      bar.hidden = true;
+      if (t.state === 'done') report(box, ['Done: ' + (t.summary || t.title || 'auto-label finished')]);
+      else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see Jobs on the Auto-label tab.')]);
+      else report(box, [t.summary ? 'Cancelled: ' + t.summary : 'Cancelled.']);
+      box.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
+      if (after) after(t);
+      reloadQueue();
+      return false;
+    });
   }
 
   // A job queued earlier (here or on the Auto-label tab): follow it.
   if (alStatus) {
-    fetch('/v1/training', { headers: { Accept: 'application/json' } })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (data) {
-        if (!data || polling) return;
-        var busyTasks = (data.tasks || []).filter(function (t) {
+    taskRecords(null)
+      .then(function (list) {
+        if (polling) return;
+        var busyTasks = list.filter(function (t) {
           return (t.kind === 'autolabel' || t.kind === 'overlaps') && (t.state === 'queued' || t.state === 'running' || t.state === 'paused');
         });
         var t = busyTasks.filter(function (x) { return x.state === 'running'; })[0] || busyTasks[0];

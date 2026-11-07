@@ -32,7 +32,7 @@ fn reply(code: StatusCode, v: serde_json::Value) -> Response {
 pub(super) async fn status(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
         let s = sweep::Settings::for_config(&state.config_read());
-        let runs = super::training::runs(&state);
+        let runs = super::training::records(&state);
         let (report, computing) = usage::current(s, runs, WAIT);
         reply(
             StatusCode::OK,
@@ -117,7 +117,7 @@ pub(super) async fn remove_export(
     let name = field(form, "name");
     blocking(move || {
         let config = state.config_read().clone();
-        let runs = super::training::runs(&state);
+        let runs = super::training::records(&state);
         let training = crate::training::training_dir(&config);
         let configured: Vec<_> = config
             .training

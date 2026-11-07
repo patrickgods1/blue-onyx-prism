@@ -51,7 +51,8 @@ crossbeam-channel = "0.5"
 askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# raw_value: the benchmark answer splices cached JSON in (`server/benchmark/poll.rs`).
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml_ng = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

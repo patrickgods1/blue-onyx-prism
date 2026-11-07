@@ -146,7 +146,9 @@ impl AppState {
         self.running.load_full()
     }
 
-    fn config_read(&self) -> crate::config_store::ConfigRef<'_> {
+    /// The current config: one atomic load that never waits, also not while a save writes the
+    /// file (see [`crate::config_store`]).
+    fn config_read(&self) -> crate::config_store::ConfigRef {
         self.config.read()
     }
 

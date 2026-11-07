@@ -2,8 +2,8 @@
 // looks up its form or card and returns when this tab does not have it. The forms' show / hide
 // (import source, auto-label mode, night augmentation, the model name with several models ticked;
 // without JS every field shows and works), live progress of the queued and running training runs
-// and import / auto-label jobs (polls GET /v1/training) and a reload when one finishes, so the
-// results show.
+// and import / auto-label jobs (polls GET /v1/training?poll=1 every 3 s while one is busy and the
+// tab shows, chained) and a reload when one finishes, so the results show.
 // Auto-label after import: a ticked import posts the settings of the last Auto-label run (kept in
 // localStorage, else the form's defaults) as `al.<name>` hidden inputs, with the classes picked on
 // the Import tab; the box and its follow-up options are remembered in localStorage. A link to
@@ -1607,7 +1607,7 @@
       var h = r.progress && r.progress.history;
       if (h) window.TrainMetrics.keysOf(h).forEach(function (k) { if (!seen[k]) { seen[k] = true; raw.push(k); } });
     });
-    var known = (data.metrics || []).map(function (m) { return m.id; }).filter(function (id) { return seen[id]; });
+    var known = (data.metrics || metricsState.metrics || []).map(function (m) { return m.id; }).filter(function (id) { return seen[id]; });
     return known.concat(raw.filter(function (k) { return known.indexOf(k) < 0; }).sort());
   }
   function saveColumns(list) {
@@ -1723,14 +1723,34 @@
       if (tr) settingsLine(tr, r);
     });
   }
+  // The light answer of GET /v1/training?poll=1 (src/server/training/poll.rs): the epochs this page
+  // holds are named in `have` and not sent again; TrainMetrics.poll puts the whole history back on
+  // each run, so the answer reads as a full one. No capability (the GPU-fit block above fetches
+  // it once), no losses, logs only of busy jobs, no metrics catalog after the first (renderMetrics
+  // keeps it). Without train-metrics.js (no run on the page)
+  // nothing is held and every history comes whole.
+  var pollStore = {};
+  function fetchTraining() {
+    var P = window.TrainMetrics && window.TrainMetrics.poll;
+    var have = P ? P.have(pollStore) : "";
+    // Any `have` (an empty one too) also says the page holds the metrics catalog: not sent again.
+    var holds = have || (metricsState.metrics && metricsState.metrics.length);
+    return fetch("/v1/training?poll=1" + (holds ? "&have=" + have : ""), { headers: { Accept: "application/json" }, cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        if (P) P.merge(pollStore, data.runs);
+        return data;
+      });
+  }
   function loadMetrics() {
     if (!document.querySelector(".tr-metrics[data-run]")) return;
-    fetch("/v1/training", { headers: { Accept: "application/json" } })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (data) { if (data) { renderSettings(data); renderMetrics(data, false); } })
+    fetchTraining()
+      .then(function (data) { renderSettings(data); renderMetrics(data, false); })
       .catch(function () {});
   }
-  loadMetrics();
 
   // Continue hides the notice of that early-stop point (the run goes on by itself; a later
   // point shows again).
@@ -1747,7 +1767,7 @@
     });
   });
 
-  if (Object.keys(busy).length === 0) return;
+  if (Object.keys(busy).length === 0) { loadMetrics(); return; }
   function describe(r, list) {
     if (r.state === "queued") {
       if (!r.after) return "queued";
@@ -1822,19 +1842,41 @@
     });
     return finished;
   }
+  // One tick: false once a job this page showed busy has finished and the page moves on (the
+  // loop stops). A chained loop, never an interval: the next request leaves 3 s after this one
+  // answered, none while the tab is hidden, and one at once when it shows again, so a run that
+  // finished meanwhile still navigates.
   function tick() {
-    fetch("/v1/training", { headers: { Accept: "application/json" } })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (data) {
-        if (!data) return;
-        var a = update(runs, "run", data.runs);
-        var b = update(tasks, "task", data.tasks);
-        renderMetrics(data, false);
-        // Not reload(): the page may be the answer to a POST, and reloading it would ask to
-        // resubmit (and queue the job again).
-        if (a || b) window.location.assign(window.location.pathname + window.location.hash);
-      })
-      .catch(function () {});
+    return fetchTraining().then(function (data) {
+      var a = update(runs, "run", data.runs);
+      var b = update(tasks, "task", data.tasks);
+      renderMetrics(data, false);
+      if (!(a || b)) return true;
+      // Not reload(): the page may be the answer to a POST, and reloading it would ask to
+      // resubmit (and queue the job again).
+      window.location.assign(window.location.pathname + window.location.hash);
+      return false;
+    });
   }
-  setInterval(tick, 3000);
+  if (window.PrismPoll) {
+    window.PrismPoll.create({ run: tick, period: 3000, more: function (go) { return go !== false; } }).start();
+  } else {
+    // An older live.js: the same loop without the back-off.
+    (function () {
+      var timer = null, inFlight = false, done = false;
+      var go = function () {
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        if (done || inFlight || document.hidden) return;
+        inFlight = true;
+        tick().then(function (more) { done = more === false; }, function () {}).then(function () {
+          inFlight = false;
+          if (!done && !document.hidden) timer = setTimeout(go, 3000);
+        });
+      };
+      document.addEventListener("visibilitychange", function () {
+        if (document.hidden) { if (timer !== null) { clearTimeout(timer); timer = null; } } else go();
+      });
+      go();
+    })();
+  }
 })();

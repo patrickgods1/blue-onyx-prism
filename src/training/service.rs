@@ -309,6 +309,12 @@ pub fn load_records(path: &Path) -> Vec<RunRecord> {
     runs
 }
 
+/// [`open_records`] as stored, for a reader that neither saves nor shows epochs (the Jobs list,
+/// the storage card): no history file is read.
+pub fn load_bare_records(path: &Path) -> Vec<RunRecord> {
+    open_records(path).records
+}
+
 struct Inner {
     runner: Arc<dyn CommandRunner>,
     fetcher: Arc<dyn Fetcher>,
@@ -951,6 +957,12 @@ impl TrainingService {
         runs.into_iter()
             .map(|r| attach_with(r, live.as_ref()))
             .collect()
+    }
+
+    /// Every run as stored, without its epochs: for readers that do not show them (the Jobs list,
+    /// the storage card). A record of an older `runs.json` not migrated yet still holds its own.
+    pub fn records(&self) -> Vec<RunRecord> {
+        self.inner.runs.lock_recover().clone()
     }
 
     /// How long job `id` has run and how long its step should still take; None unless it is the

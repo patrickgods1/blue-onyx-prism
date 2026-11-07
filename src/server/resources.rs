@@ -16,8 +16,9 @@ use tracing::{info, warn};
 // Resources (phase 7.5)
 
 /// `GET /v1/resources`: every downloadable resource for this platform with its state, size,
-/// what it provides and which models wait for it.
-pub(super) async fn resources_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+/// what it provides and which models wait for it. Serialized inside `blocking`, off the tokio
+/// workers.
+pub(super) async fn resources_json(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
         let cfg = state.config_read().clone();
         let rows = crate::resources::status::rows(state.resources.as_ref(), &cfg);
@@ -36,6 +37,7 @@ pub(super) async fn resources_json(State(state): State<Arc<AppState>>) -> Json<s
             "resources": rows,
             "localModels": crate::resources::status::local_models(state.resources.as_ref(), &cfg),
         }))
+        .into_response()
     })
     .await
 }

@@ -15,6 +15,7 @@ mod config_disk_http;
 mod enabled_models_http;
 mod families_http;
 mod integration_http;
+mod js_poll;
 mod js_rules;
 mod live_config;
 mod multi_model_http;

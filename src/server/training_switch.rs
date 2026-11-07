@@ -4,7 +4,7 @@
 //! [`crate::training::switch`]; `POST /training/use` ([`super::training`]) does the switch.
 
 use super::train_area::MODELS;
-use super::training::{field, runs, view};
+use super::training::{field, records, view};
 use super::{AppState, blocking, devices_snapshot, render};
 use crate::benchmark::{BenchmarkResults, configured_device, find_model, results_path};
 use crate::config::{Config, ModelConfig};
@@ -152,7 +152,7 @@ pub(super) async fn preview(
     Query(q): Query<PreviewQuery>,
 ) -> Response {
     blocking(move || {
-        let rec = runs(&state).into_iter().find(|r| r.id == q.id);
+        let rec = records(&state).into_iter().find(|r| r.id == q.id);
         let answer = rec
             .ok_or_else(|| anyhow::anyhow!("no run {}", q.id))
             .and_then(|r| preview_of(&state, &r));

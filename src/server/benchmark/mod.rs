@@ -29,6 +29,7 @@
 
 mod apply;
 mod history;
+mod poll;
 mod profiles;
 mod report;
 mod run;
@@ -47,9 +48,10 @@ use crate::benchmark::{BenchmarkResults, configured_device, results_path};
 use crate::config::Config;
 use askama::Template;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
@@ -558,19 +560,35 @@ pub(super) fn file_stamp(p: &std::path::Path) -> Option<(Option<std::time::Syste
 
 /// `results`, `ranking`, `points` and `latest_run_id` of `GET /v1/benchmark`: the saved results
 /// rebased on the config now, with the history-derived fields
-/// ([`crate::benchmark::history::view`]).
-#[derive(Debug, Clone, Default)]
+/// ([`crate::benchmark::history::view`]). The trees are kept serialized: a poll copies their
+/// bytes into the answer, never the trees.
+#[derive(Debug, Clone)]
 struct SavedView {
-    results: serde_json::Value,
-    ranking: serde_json::Value,
-    points: serde_json::Value,
+    /// The [`SAVED_CACHE`] key this view was computed for (part of the answer's tag,
+    /// [`poll`]).
+    key: String,
+    results: Box<RawValue>,
+    ranking: Box<RawValue>,
+    points: Box<RawValue>,
     latest_run_id: Option<String>,
     /// `lineup`: the models side by side per image set ([`crate::benchmark::lineup`]).
-    lineup: serde_json::Value,
+    lineup: Box<RawValue>,
     /// The measured part of `profiles` ([`profiles::facts`]).
     facts: Vec<profiles::ModelFacts>,
     /// The hardware the results were measured on (`otherHardware`).
     hardware: Option<crate::benchmark::report::HardwareSummary>,
+}
+
+/// `value` serialized as its `serde_json::Value` serializes (sorted keys, f32 widened to f64:
+/// the bytes `json!` gave), `null` if it cannot be (as `to_value(..).unwrap_or_default()` gave).
+fn raw<T: serde::Serialize + ?Sized>(value: &T) -> Box<RawValue> {
+    serde_json::to_value(value)
+        .and_then(|v| serde_json::value::to_raw_value(&v))
+        .unwrap_or_else(|_| null())
+}
+
+fn null() -> Box<RawValue> {
+    RawValue::NULL.to_owned()
 }
 
 /// The last [`SavedView`] and what it was computed from: the results, stored-predictions and
@@ -604,14 +622,15 @@ fn saved_view(
         file_stamp(&hist)
     );
     // Computed under the cache's lock: polls arriving together compute once.
-    SAVED_CACHE.get_or_insert_with(key, || {
-        Arc::new(compute_saved_view(state, &path, &preds, &hist, now))
+    SAVED_CACHE.get_or_insert_with(key.clone(), || {
+        Arc::new(compute_saved_view(state, key, &path, &preds, &hist, now))
     })
 }
 
 /// What [`saved_view`] caches.
 fn compute_saved_view(
     state: &AppState,
+    key: String,
     path: &std::path::Path,
     preds: &std::path::Path,
     hist: &std::path::Path,
@@ -622,8 +641,8 @@ fn compute_saved_view(
     SAVED_COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match BenchmarkResults::load_or_warn(path) {
         Some(mut r) => {
-            let ranking = serde_json::to_value(r.ranking()).unwrap_or_default();
-            let points = serde_json::to_value(r.points()).unwrap_or_default();
+            let ranking = raw(&r.ranking());
+            let points = raw(&r.points());
             let stored = StoredPreds::load_cached(preds)
                 .map_err(|e| warn!("{e:#}"))
                 .ok()
@@ -637,7 +656,8 @@ fn compute_saved_view(
             let mut results = serde_json::to_value(r.summary()).unwrap_or_default();
             view::annotate(&mut results, &r, &history);
             SavedView {
-                results,
+                key,
+                results: raw(&results),
                 ranking,
                 points,
                 latest_run_id: view::latest_run_id(&r),
@@ -647,9 +667,14 @@ fn compute_saved_view(
             }
         }
         None => SavedView {
-            lineup: serde_json::to_value(crate::benchmark::lineup::Lineup::default())
-                .unwrap_or_default(),
-            ..SavedView::default()
+            key,
+            results: null(),
+            ranking: null(),
+            points: null(),
+            latest_run_id: None,
+            lineup: raw(&crate::benchmark::lineup::Lineup::default()),
+            facts: Vec::new(),
+            hardware: None,
         },
     }
 }
@@ -662,7 +687,7 @@ fn lineup_of(
     history: &crate::benchmark::history::History,
     now: &HashMap<String, crate::benchmark::current::ModelNow>,
     cfg: &Config,
-) -> serde_json::Value {
+) -> Box<RawValue> {
     use crate::benchmark::lineup::{Configured, Inputs, build};
     let key = crate::registry::normalize_name;
     let trained = cfg
@@ -695,7 +720,7 @@ fn lineup_of(
         trained: &trained,
         reachable: &|s| s.dir.as_deref().is_some_and(std::path::Path::is_dir),
     });
-    serde_json::to_value(lineup).unwrap_or_default()
+    raw(&lineup)
 }
 
 /// `GET /v1/benchmark`: the current/last run (state, progress, partial results), the saved
@@ -706,54 +731,20 @@ fn lineup_of(
 /// device the measured best threshold and the saved confidence profile ([`profiles::profiles`]),
 /// `otherHardware` whether the results were measured on other GPUs, `goal` the benchmark goal,
 /// `lineup` the models side by side per image set ([`crate::benchmark::lineup`]).
-pub(super) async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    super::blocking(move || {
-        let snap = devices_snapshot(&state);
-        let path = results_path(&state.config_path);
-        let config = config_view(&state, &snap);
-        let (revision, cfg) = state.config.snapshot();
-        let now = models_now(&state, &cfg, &snap);
-        let saved = saved_view(&state, revision, &now);
-        let loaded = loaded_devices(&state);
-        let profile_rows = profiles::profiles(
-            &saved.facts,
-            &cfg,
-            &|name| loaded.get(&crate::registry::normalize_name(name)).cloned(),
-            &|m| configured_device(&cfg, m, &snap.model_selection(&state, &cfg, m)),
-        );
-        let other_hardware = saved
-            .hardware
-            .as_ref()
-            .is_some_and(|h| !h.same_gpus(&snap.hardware));
-        let mut run = state.benchmark.status();
-        for m in &mut run.models {
-            if let Some(n) = now.get(&crate::registry::normalize_name(&m.model)) {
-                crate::benchmark::current::rebase_model(m, &[], None, n);
-            }
-        }
-        Json(serde_json::json!({
-            "success": true,
-            "state": run.state,
-            "running": run.running,
-            "run": run,
-            "results": saved.results,
-            "ranking": saved.ranking,
-            "points": saved.points,
-            "latest_run_id": saved.latest_run_id,
-            "lineup": saved.lineup,
-            "noise": crate::benchmark::history::view::noise_json(),
-            "resultsFile": path.display().to_string(),
-            "config": config,
-            "profiles": profile_rows,
-            "otherHardware": other_hardware,
-            "goal": {
-                "label": profiles::goal_label(&cfg.benchmark),
-                "objective": cfg.benchmark.threshold_objective.to_string(),
-            },
-            "warning": LIVE_WARNING,
-        }))
-    })
-    .await
+///
+/// `?only=run[&models=<modelsTag>]` answers the run alone with the tag of the rest (`viewTag`),
+/// for polling during a run; the full answer has an `ETag` (304 on `If-None-Match`) and
+/// `X-Benchmark-View` ([`poll`]).
+pub(super) async fn status(
+    State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let if_none_match = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    super::blocking(move || poll::answer(&state, query.as_deref(), if_none_match.as_deref())).await
 }
 
 pub(super) fn json_error(status: StatusCode, message: String) -> Response {
