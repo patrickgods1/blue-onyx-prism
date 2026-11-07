@@ -57,6 +57,7 @@ import errno
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -553,8 +554,7 @@ def self_test() -> int:
     assert [i["name"] for i in by_pts] == ["b", "a"]
     assert [i["name"] for i in by_n] == ["d", "c"]
     assert tolerance(30) == 0.25 / 30 and tolerance(None) == 0.01 and tolerance(1) == 0.01
-    tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"import_footage_selftest_{os.getpid()}"
-    tmp.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="import_footage_selftest_"))
     try:
         try:
             from PIL import Image

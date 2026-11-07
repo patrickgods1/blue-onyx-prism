@@ -6,7 +6,9 @@
 //! the Review tab.
 //!
 //! The signals, ported from `scripts/research/eval_overlaps.py` (the reference that reproduced the
-//! measured numbers; `tests/data/overlaps_parity.json` holds its answers on synthetic pairs):
+//! measured numbers; it was never committed, so `tests/data/overlaps_parity.json`, which holds its
+//! answers on synthetic pairs, is frozen and cannot be regenerated: a difference is a change in
+//! this code, never a reason to edit the fixture):
 //!
 //! - [`witnesses`]: the independent detectors that found a box, counted once each;
 //! - the zoom check: RF-DETR L on a crop of the pair's union, matched one-to-one to the two boxes by
@@ -37,10 +39,13 @@
 //! whose pair stopped being open, is stale and ignored ([`live`]), never an error. A frame holds at
 //! most [`MAX_SUGGESTIONS`], strongest first ([`strength`]).
 //!
-//! Twin of the Review tab's `liveSuggestions` and `acceptOverlap` (`assets/review.js`), which
-//! [`live`] and [`accept`] state as Rust: keep them in step. The page cannot call [`super::map_class`],
+//! Twin of the Review tab's `liveSuggestions` and `acceptOverlap` (`assets/review-rules.js`), which
+//! [`live`] and [`accept`] state as Rust: keep them in step (`tests/js_rules.rs` runs both on
+//! generated frames). The page cannot call [`super::map_class`],
 //! so `GET /v1/review/labels` names the live suggestions (`overlap_live`) and the page only adds what
-//! changes while the frame is open (a move, a relabel, a rejected box).
+//! changes while the frame is open (a move, a relabel, a rejected box). `overlap_live` names a
+//! suggestion, not its boxes: where two boxes share a position and [`live`] passes over the first for
+//! a relabel, the page, unaware of it, takes the first.
 
 use super::bulk::Wanted;
 use super::repeats::same_object;
@@ -637,8 +642,8 @@ fn promote(b: &mut LabelBox) {
 /// What the reviewer's key does (the page's `acceptOverlap`, which is the code that runs: this is
 /// its statement in Rust, tested against [`super::resolve_pending`] and [`super::normalize`]): a drop
 /// rejects the box as [`super::RejectReason::Duplicate`] and promotes a hint keeper, which a save would
-/// otherwise reject, leaving the object with no box; two objects promotes both. Returns false, changing
-/// nothing, when `s` is not [`live`].
+/// otherwise reject, leaving the object with no box; two objects promotes both. Either way the frame
+/// is no longer confirmed empty. Returns false, changing nothing, when `s` is not [`live`].
 pub fn accept(f: &mut LabelFile, s: &Suggestion, wanted: &Wanted<'_>) -> bool {
     let Some((a, b)) = live(f, Some(wanted))
         .iter()
@@ -660,6 +665,7 @@ pub fn accept(f: &mut LabelFile, s: &Suggestion, wanted: &Wanted<'_>) -> bool {
     if let Some(x) = drop.and_then(|d| f.boxes.get_mut(d)) {
         stacks::mark(x);
     }
+    f.empty_confirmed = false;
     true
 }
 
@@ -1229,6 +1235,22 @@ mod tests {
     }
 
     #[test]
+    fn accepting_ends_a_confirmed_empty_and_a_refusal_does_not() {
+        let c = classes();
+        let w = wanted(&c);
+        let s = drop_b_suggestion();
+        let mut f = file(vec![at("car", BIG), at("car", SMALL)], vec![s.clone()]);
+        f.empty_confirmed = true;
+        assert!(accept(&mut f, &s, &w));
+        assert!(!f.empty_confirmed, "a box stays: the page clears it too");
+        // Not live: nothing changes, this flag included.
+        let mut f = file(vec![at("car", BIG)], vec![s.clone()]);
+        f.empty_confirmed = true;
+        assert!(!accept(&mut f, &s, &w));
+        assert!(f.empty_confirmed);
+    }
+
+    #[test]
     fn check_bounds_what_a_client_sends() {
         let good = drop_b_suggestion();
         check(std::slice::from_ref(&good)).unwrap();
@@ -1461,7 +1483,8 @@ mod tests {
 
     /// The same check on every open pair of a research snapshot: a JSON file of the fixture's
     /// `cases`, written from `eval_overlaps.py`'s `pairs.json` and `zoom.jsonl`.
-    /// `BOP_OVERLAPS_PARITY=<file> cargo test --lib real_pairs -- --ignored`.
+    /// `BOP_OVERLAPS_PARITY=<file> cargo test --lib real_pairs -- --ignored`. Such a snapshot cannot
+    /// be written today: `eval_overlaps.py` is not in the repository.
     #[test]
     #[ignore = "needs a research snapshot"]
     fn real_pairs_agree_with_the_research_reference() {

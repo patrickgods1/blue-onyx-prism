@@ -14,8 +14,9 @@ use tokio::sync::oneshot;
 
 /// Model input (width, height) of the fake model.
 const INPUT: (u32, u32) = (64, 64);
-/// Generous bound for anything that should happen "at once" (CI runners are slow).
-const SOON: Duration = Duration::from_secs(10);
+/// Generous bound for anything that should happen "at once": a limit for a test that would
+/// otherwise hang, not a speed claim (CI runners stall for seconds).
+const SOON: Duration = Duration::from_secs(30);
 /// Worker queue length. Tests submit with `try_send` (as the server does) and send up to
 /// `MAX_CONSECUTIVE_DEGENERATE + 1` requests before waiting, so the queue must hold a whole
 /// burst: with 16, a slow runner whose worker had not drained 10 of 26 yet got `Full`.
@@ -316,11 +317,9 @@ fn shutdown_with_a_busy_slot_answers_everything_and_exits() {
     std::thread::sleep(Duration::from_millis(50));
     let script = h.script.clone();
     let exit = h.stop();
-    // The loop re-checks the token at least every POLL; nothing waits for the hung inference.
-    assert!(
-        exit < POLL + Duration::from_secs(2),
-        "worker took {exit:?} to exit"
-    );
+    // The loop re-checks the token at least every POLL; nothing waits for the hung inference,
+    // which would hold the worker for the whole request timeout.
+    assert!(exit < SOON, "worker took {exit:?} to exit");
     let mut all = vec![first];
     all.extend(queued);
     for (r, _) in wait_all(all) {
@@ -374,17 +373,16 @@ fn stuck_inference_fails_the_model_and_later_requests_fail_fast() {
         rb.message
     );
     assert!(h.handle.is_stuck());
-    // From now on the worker answers at once (the server answers 503 before even queuing).
-    let t = Instant::now();
+    // From now on the worker answers at once (the server answers 503 before even queuing): this
+    // answer is no timeout's, and nothing reaches the engine.
+    let submits = h.script.submits();
     let rc = h.send("later.jpg").wait();
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     assert!(!rc.success);
     assert!(
         rc.message.contains("is unavailable: inference stuck"),
         "{}",
         rc.message
     );
-    let submits = h.script.submits();
     h.send("later2.jpg").wait();
     assert_eq!(h.script.submits(), submits, "the parked engine is not used");
     h.stop();
@@ -1277,20 +1275,28 @@ fn unavailable_verifier_leaves_candidates_unverified() {
 fn verifier_past_the_deadline_leaves_candidates_unverified() {
     let (primary, checker, _peers) =
         primary_and_checker(live_verified("checker", |_| {}), live_with_night(None));
-    // The request arrived 29.5 s ago (timeout 30 s): 0.5 s are left, the checker needs 3 s.
-    checker.script.push([whole(1, 0.9, 3000)]);
+    // The request arrived 28 s ago (timeout 30 s): 2 s are left, room for a slow machine to get
+    // the frame to the checker, which never answers. The reply comes from the deadline alone.
+    const LEFT: Duration = Duration::from_secs(2);
+    checker.script.push([Step::Hang]);
     primary.script.push([det(1, 0)]);
-    let enqueued = Instant::now()
-        .checked_sub(Duration::from_millis(29_500))
-        .unwrap_or_else(Instant::now);
     let t = Instant::now();
-    let r = primary.send_at(gray_jpeg(), "late.jpg", enqueued).wait();
+    let enqueued = t
+        .checked_sub(Duration::from_secs(30) - LEFT)
+        .expect("the machine has been up for 28 s");
+    let reply = primary.send_at(gray_jpeg(), "late.jpg", enqueued);
+    checker.wait_for("the check to start", || checker.script.submits() == 1);
+    let until_deadline = (t + LEFT).saturating_duration_since(Instant::now());
+    let r = reply.wait();
     let waited = t.elapsed();
     assert_eq!(labels(&r), ["c1"], "kept unverified");
-    assert!(waited >= Duration::from_millis(400), "{waited:?}");
-    assert!(waited < Duration::from_millis(2500), "{waited:?}");
+    assert!(waited >= LEFT, "{waited:?}");
     assert_eq!(primary.handle.metrics.verified(Outcome::Unverified), 1);
-    assert!(r.processMs >= 400, "verify time counts: {}", r.processMs);
+    assert!(
+        u128::try_from(r.processMs).unwrap() >= until_deadline.as_millis(),
+        "verify time counts: {} of {until_deadline:?}",
+        r.processMs
+    );
     primary.stop();
     checker.stop();
 }
@@ -1299,27 +1305,30 @@ fn verifier_past_the_deadline_leaves_candidates_unverified() {
 fn slow_verifier_does_not_delay_other_requests() {
     let (primary, checker, _peers) =
         primary_and_checker(live_verified("checker", |_| {}), live_with_night(None));
-    checker.script.push([whole(1, 0.9, 800)]);
+    // The check of A does not finish until this test lets it.
+    checker.script.push([Step::Hang]);
     // A has a candidate (slow check), B and C have none, D is a day frame.
     primary
         .script
         .push([det(1, 0), det(0, 0), det(2, 0), det(1, 0)]);
-    let t = Instant::now();
-    let a = ir(&primary, "a.jpg");
+    let mut a = ir(&primary, "a.jpg");
     let b = ir(&primary, "b.jpg");
     let c = ir(&primary, "c.jpg");
     let d = primary.send("d.jpg");
-    let got = wait_all(vec![a, b, c, d]);
-    assert_eq!(labels(&got[0].0), ["c1"], "confirmed");
-    assert_eq!(labels(&got[1].0), ["c0"]);
-    assert_eq!(labels(&got[2].0), ["c2"]);
-    assert_eq!(labels(&got[3].0), ["c1"], "day frame, not verified");
-    // B, C and D were answered while A's check was still running.
-    for (i, (_, at)) in got.iter().enumerate().skip(1) {
-        assert!(*at < got[0].1, "request {i} waited for the verification");
-    }
-    assert!(got[0].1 - t >= Duration::from_millis(750));
-    assert!(got[0].0.processMs >= 750, "{}", got[0].0.processMs);
+    // B, C and D are answered while A's check still runs.
+    let got = wait_all(vec![b, c, d]);
+    assert_eq!(labels(&got[0].0), ["c0"]);
+    assert_eq!(labels(&got[1].0), ["c2"]);
+    assert_eq!(labels(&got[2].0), ["c1"], "day frame, not verified");
+    assert!(a.poll().is_none(), "A was answered without its check");
+    checker.wait_for("the check to start", || checker.script.submits() == 1);
+    std::thread::sleep(Duration::from_millis(200));
+    checker
+        .script
+        .release(Ok(vec![yolo26_output(&[[0.0, 0.0, 64.0, 64.0, 0.9, 1.0]])]));
+    let r = a.wait();
+    assert_eq!(labels(&r), ["c1"], "confirmed");
+    assert!(r.processMs >= 200, "verify time counts: {}", r.processMs);
     primary.stop();
     checker.stop();
 }
@@ -1523,6 +1532,10 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
     assert!(r.suppressed.iter().any(|s| s.reason == "verify"));
     let r = sidecar("day", "flood");
     assert_eq!(r.buckets, vec![Bucket::Empty]);
+    // The index line comes after the sidecar, and a scan counts index lines.
+    primary.wait_for("every frame in the index", || {
+        crate::collect::Summary::scan(&dir).frames >= 6
+    });
     let summary = crate::collect::Summary::scan(&dir);
     assert_eq!(summary.by_camera["flood"].frames, 1);
     assert!(!summary.by_camera.contains_key("dog"));

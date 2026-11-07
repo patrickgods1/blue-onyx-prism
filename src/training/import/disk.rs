@@ -367,6 +367,11 @@ pub struct Guard {
 
 impl Guard {
     pub fn new(work: &Path, dataset: &Path) -> Self {
+        // Like [`check`]: a job test's outcome must not depend on how full the machine's disk is.
+        #[cfg(test)]
+        if !crate::training::preflight::REAL_DISK.with(std::cell::Cell::get) {
+            return Self::with_probe(work, dataset, |_| None);
+        }
         Self::with_probe(work, dataset, space)
     }
 
@@ -654,6 +659,19 @@ mod tests {
             m.starts_with("the import stopped: the disk under /w is full (100 MB free); free some space, lower Candidates per video"),
             "{m}"
         );
+    }
+
+    /// A job test builds its guard with [`Guard::new`]: the machine's disk stays out of it unless
+    /// the test asks for it, however full a runner is.
+    #[test]
+    fn a_tests_guard_reads_the_real_disk_only_when_asked() {
+        let d = std::env::temp_dir();
+        let more_than_any_disk = u64::MAX / 2;
+        assert!(Guard::new(&d, &d).check_work_for(more_than_any_disk));
+        crate::training::preflight::REAL_DISK.with(|r| r.set(true));
+        let g = Guard::new(&d, &d);
+        assert!(!g.check_work_for(more_than_any_disk));
+        assert_eq!(g.tripped(), Some(Trip::Low));
     }
 
     #[test]

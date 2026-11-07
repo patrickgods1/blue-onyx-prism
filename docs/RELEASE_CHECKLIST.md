@@ -62,6 +62,25 @@ draft it creates. Each build job installs, checks and uninstalls its installers 
    (`<root>` also holds `openvino/` and `onnxruntime/`). `families_http` and `multi_model_http`
    must report the YOLO26 parts as run, not "not present: skipping".
 
+## When a CI job fails with no failed step
+
+The hosted macOS runners sometimes have no capacity. It looks like this:
+
+- `build-test (macos-latest)` shows **no failed step, in fact no steps at all**: `gh run view <id>
+  --json jobs` gives it `"conclusion": "cancelled"` and an empty `steps` list, while the run as a
+  whole is `failure`.
+- The job's annotation says `The job was not acquired by Runner of type hosted even after
+  multiple attempts`, usually with `Due to capacity constraints, jobs targeting macOS arm64
+  runners may experience longer queue times.` (seen in runs 41888292694, 41893062111, 41898876784).
+
+That is GitHub's, not this repository's: `gh run rerun <id> --failed` is the right answer **for this
+case only**. A job with a failed step is a real failure until shown otherwise. Do not rerun it to
+see whether it goes away: read the step's log, reproduce it, and fix the cause.
+
+A step that reports it timed out hit its `timeout-minutes` in `ci.yml`, at least twice that
+step's slowest green run. Treat it as a hang: the `has been running for over 60 seconds` lines of
+the log name the test.
+
 ## Tagging
 
 6. `git tag X.Y.Z && git push origin X.Y.Z` (plain `X.Y.Z`, no `v` prefix). The workflow builds the

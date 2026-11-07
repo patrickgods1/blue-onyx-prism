@@ -38,6 +38,21 @@ static SERVICE: OnceLock<Arc<TrainingService>> = OnceLock::new();
 #[cfg(test)]
 pub(super) static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// [`QUEUE_TEST_LOCK`] with the queue idle, then moved to `state`'s training folder, for a test
+/// that asserts what the queue holds: [`SERVICE`] is one for the process, so it holds what the
+/// last job left whatever folder the test configured, and only [`service`] moves it.
+#[cfg(test)]
+pub(super) async fn own_queue(state: &Arc<AppState>) -> tokio::sync::MutexGuard<'static, ()> {
+    let queue = QUEUE_TEST_LOCK.lock().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while SERVICE.get().is_some_and(|s| s.busy()) {
+        assert!(std::time::Instant::now() < deadline, "the queue stays busy");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    service(&Shared::from(state.clone()));
+    queue
+}
+
 /// The process's training queue, started on first use.
 pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
     let svc = SERVICE
@@ -3924,16 +3939,11 @@ pub(super) mod tests {
     async fn busy_jobs_show_pause_resume_and_cancel() {
         use crate::server::test_util::{call, get_text, post_form, test_state_with};
         use crate::training::task::{TaskKind, TaskRecord};
-        let _queue = QUEUE_TEST_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!("bop-train-pause-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let r2 = root.clone();
         let state = test_state_with(move |c| c.download_dir = Some(r2));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while SERVICE.get().is_some_and(|s| s.busy()) {
-            assert!(std::time::Instant::now() < deadline, "the queue stays busy");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let _queue = own_queue(&state).await;
         let svc = service(&Shared::from(state.clone()));
         let rec = |id: &str, st: RunState| TaskRecord {
             id: id.into(),
@@ -4553,6 +4563,8 @@ pub(super) mod tests {
     async fn a_failed_run_shows_its_warnings_files_and_retry_export() {
         use crate::server::test_util::{call, post_form, test_state_with};
         use askama::Template;
+        // The retry route moves the process's queue to this test's folder.
+        let _queue = QUEUE_TEST_LOCK.lock().await;
         let root = std::env::temp_dir().join(format!("bop-train-retry-{}", uuid::Uuid::new_v4()));
         let r2 = root.clone();
         let state = test_state_with(move |c| c.download_dir = Some(r2));

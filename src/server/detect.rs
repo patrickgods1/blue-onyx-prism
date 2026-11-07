@@ -910,17 +910,20 @@ mod tests {
         );
     }
 
+    /// Longest the tests wait for something that takes moments: a limit for a test that would
+    /// otherwise hang, not a speed claim (CI runners stall for seconds).
+    const PATIENCE: Duration = Duration::from_secs(30);
+
     async fn wait_inflight(state: &AppState, n: usize) {
-        for _ in 0..400 {
-            if state.metrics.inflight() == n {
-                return;
-            }
+        let until = Instant::now() + PATIENCE;
+        while state.metrics.inflight() != n {
+            assert!(
+                Instant::now() < until,
+                "in-flight count stayed {} (want {n})",
+                state.metrics.inflight()
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!(
-            "in-flight count stayed {} (want {n})",
-            state.metrics.inflight()
-        );
     }
 
     /// SV-04: with the cap at 2 and two requests holding their slots (their uploads stall),
@@ -946,10 +949,8 @@ mod tests {
             call(&state, stalled("/v1/vision/detection")),
             call(&state, stalled("/v1/vision/custom/ipcam-general")),
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "answered at once"
-        );
+        // Their uploads never end: an answer that waited for them comes at the deadline.
+        assert!(started.elapsed() < DISCARD_TIMEOUT, "answered at once");
         for ((status, _, body), command) in [(a, "detect"), (b, "custom")] {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             let r: VisionDetectionResponse = serde_json::from_slice(&body).unwrap();
@@ -1025,8 +1026,7 @@ mod tests {
         );
         let waited = started.elapsed();
         assert!(
-            waited >= MULTIPART_READ_TIMEOUT
-                && waited < MULTIPART_READ_TIMEOUT + Duration::from_secs(5),
+            waited >= MULTIPART_READ_TIMEOUT && waited < MULTIPART_READ_TIMEOUT + PATIENCE,
             "{waited:?}"
         );
         for (status, _, body) in [a, b] {
@@ -1039,16 +1039,15 @@ mod tests {
     }
 
     async fn wait_body_reads(state: &AppState, n: usize) {
-        for _ in 0..400 {
-            if state.metrics.body_reads() == n {
-                return;
-            }
+        let until = Instant::now() + PATIENCE;
+        while state.metrics.body_reads() != n {
+            assert!(
+                Instant::now() < until,
+                "uploads being read stayed {} (want {n})",
+                state.metrics.body_reads()
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        panic!(
-            "uploads being read stayed {} (want {n})",
-            state.metrics.body_reads()
-        );
     }
 
     /// `n` uploads from `peer` that stall, each on its own task.
@@ -1078,8 +1077,9 @@ mod tests {
         let started = Instant::now();
         let (status, _, body) =
             call(&state, from_peer(complete("/v1/vision/detection"), PEER_A)).await;
+        // The stalled uploads it is refused for end at this deadline, not before.
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < MULTIPART_READ_TIMEOUT,
             "answered at once"
         );
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -1144,7 +1144,7 @@ mod tests {
             })
             .collect();
         for t in tasks {
-            let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), t)
+            let (status, _, body) = tokio::time::timeout(PATIENCE, t)
                 .await
                 .expect("every upload of the burst is read")
                 .unwrap();
@@ -1298,10 +1298,7 @@ mod tests {
         let started = Instant::now();
         discard_body_within(mp, limit).await;
         let waited = started.elapsed();
-        assert!(
-            waited >= limit && waited < limit + Duration::from_secs(5),
-            "{waited:?}"
-        );
+        assert!(waited >= limit && waited < limit + PATIENCE, "{waited:?}");
     }
 
     /// A complete small body is discarded to its end (the request stream is fully consumed).
@@ -1624,7 +1621,7 @@ mod tests {
             .collect();
         drop(tx);
         for _ in 0..8 {
-            let (status, body, took) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            let (status, body, took) = tokio::time::timeout(PATIENCE, rx.recv())
                 .await
                 .expect("8 requests are rejected without waiting for their upload")
                 .unwrap();
@@ -1632,8 +1629,9 @@ mod tests {
             let r: VisionDetectionResponse = serde_json::from_slice(&body).unwrap();
             assert!(!r.success);
             assert!(r.error.as_deref().unwrap().contains("overloaded"), "{r:?}");
-            // Generous for loaded CI runners; the rejection does no I/O (see the direct test).
-            assert!(took < Duration::from_secs(2), "{took:?}");
+            // The rejection does no I/O (see the direct test); the admitted requests are only
+            // answered at this deadline.
+            assert!(took < MULTIPART_READ_TIMEOUT, "{took:?}");
         }
         wait_inflight(&state, LIMIT).await;
         assert_eq!(state.metrics.rejected(RejectReason::Overloaded), 8);
@@ -1662,7 +1660,7 @@ mod tests {
 
         let quick = Instant::now();
         let (status, _, _) = call(&state, from_peer(stalled("/v1/vision/detection"), PEER_B)).await;
-        assert!(quick.elapsed() < Duration::from_secs(5), "not waited for");
+        assert!(quick.elapsed() < DISCARD_TIMEOUT, "not waited for");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
         for d in drains {
@@ -1674,7 +1672,7 @@ mod tests {
         }
         let waited = started.elapsed();
         assert!(
-            waited >= DISCARD_TIMEOUT && waited < DISCARD_TIMEOUT + Duration::from_secs(5),
+            waited >= DISCARD_TIMEOUT && waited < DISCARD_TIMEOUT + PATIENCE,
             "{waited:?}"
         );
         assert_eq!(state.metrics.body_reads(), 0);
@@ -1700,7 +1698,7 @@ mod tests {
         );
         let started = Instant::now();
         let (status, _, _) = call(&state, req).await;
-        assert!(started.elapsed() < Duration::from_secs(5), "not waited for");
+        assert!(started.elapsed() < DISCARD_TIMEOUT, "not waited for");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
         // Without a declared length the byte count stops it, the end never reached.
@@ -1827,7 +1825,8 @@ mod tests {
     }
 
     /// The admission guard itself: with every slot held, each further `admit` answers the
-    /// overloaded 503 in under 50 ms and counts it.
+    /// overloaded 503 and counts it. It is a plain function, so it cannot wait for a slot: the
+    /// slots are still held when it returns.
     #[tokio::test]
     async fn admit_rejects_at_once_when_every_slot_is_held() {
         let state = test_state();
@@ -1838,11 +1837,10 @@ mod tests {
             .collect();
         upload.read_slot = None;
         for n in 1..=8u64 {
-            let started = Instant::now();
             let resp = admit(&state, "custom", &mut upload).unwrap_err();
-            assert!(started.elapsed() < Duration::from_millis(50));
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(state.metrics.rejected(RejectReason::Overloaded), n);
+            assert_eq!(state.metrics.inflight(), 3);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();

@@ -596,3 +596,279 @@ impl Fetcher for ManagerFetcher {
         }
     }
 }
+
+/// [`SystemRunner`] on a real process tree: cancel, timeout, pause, resume and a helper left behind,
+/// with a ticking grandchild so that "the whole tree" means more than the process the runner spawned.
+/// The bodies run on every OS and only [`Ticker`] differs. On Windows this is the only test of the
+/// job object's suspend, resume and kill ([`crate::backend::job`]), through [`Tree`]; Unix uses
+/// process groups, and `export::tests` covers those as well.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tree_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A child that starts a grandchild, which ticks about once a second: one line on stdout, read
+    /// by the runner, and one more line in [`Self::file`], which outlives the runner's interest. The
+    /// file is watched by its size (no handle held, so no sharing rules: a second handle may not
+    /// read a file a Windows process has locked). The loop ends by itself after two minutes, so a
+    /// failing test leaves nothing running; no test lets it run that long.
+    struct Ticker {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl Ticker {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("bop-tree-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            #[cfg(windows)]
+            std::fs::write(
+                dir.join("tick.cmd"),
+                "@echo off\r\nfor /L %%i in (1,1,120) do (\r\n  echo tick\r\n  \
+                 echo tick>>ticks.txt\r\n  ping -n 2 127.0.0.1 >NUL\r\n)\r\n",
+            )
+            .unwrap();
+            // PIPE ignored: when the runner stops reading, only the kill may end the loop.
+            #[cfg(unix)]
+            std::fs::write(
+                dir.join("tick.sh"),
+                "trap '' PIPE\ni=0\nwhile [ $i -lt 120 ]; do\n  echo tick\n  \
+                 echo tick >>ticks.txt\n  sleep 1\n  i=$((i+1))\ndone\n",
+            )
+            .unwrap();
+            let file = dir.join("ticks.txt");
+            Self { dir, file }
+        }
+
+        /// The tree: a shell that waits for a second shell, which runs the loop.
+        fn cmd(&self, timeout: Duration) -> Cmd {
+            #[cfg(windows)]
+            let (program, args) = ("cmd", vec!["/C", "cmd", "/C", "tick.cmd"]);
+            #[cfg(unix)]
+            let (program, args) = ("/bin/sh", vec!["-c", "sh tick.sh & wait"]);
+            Cmd {
+                stage: Stage::Export,
+                program: program.into(),
+                args: args.iter().map(OsString::from).collect(),
+                env: vec![],
+                cwd: self.dir.clone(),
+                timeout,
+                low_priority: false,
+            }
+        }
+
+        fn size(&self) -> u64 {
+            std::fs::metadata(&self.file).map_or(0, |m| m.len())
+        }
+
+        /// Assert that the file stops growing: quiet for several ticks, within a long bound (a
+        /// surviving ticker never gets there).
+        fn assert_stops(&self, what: &str) {
+            let quiet = Duration::from_secs(4);
+            let until = Instant::now() + Duration::from_secs(45);
+            let (mut last, mut since) = (self.size(), Instant::now());
+            while since.elapsed() < quiet {
+                assert!(
+                    Instant::now() < until,
+                    "{what}: the grandchild kept ticking"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+                let now = self.size();
+                if now != last {
+                    (last, since) = (now, Instant::now());
+                }
+            }
+        }
+    }
+
+    impl Drop for Ticker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A [`SystemRunner::run_pausable`] on its own thread, with its flags and the output lines.
+    struct Running {
+        lines: Arc<Mutex<Vec<String>>>,
+        cancel: Arc<AtomicBool>,
+        pause: Arc<AtomicBool>,
+        worker: std::thread::JoinHandle<Result<()>>,
+    }
+
+    impl Running {
+        fn start(cmd: Cmd) -> Self {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let pause = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let (lines, cancel, pause) = (lines.clone(), cancel.clone(), pause.clone());
+                std::thread::spawn(move || {
+                    SystemRunner.run_pausable(
+                        &cmd,
+                        &mut |l| lines.lock().unwrap().push(l.to_string()),
+                        &cancel,
+                        &pause,
+                    )
+                })
+            };
+            Self {
+                lines,
+                cancel,
+                pause,
+                worker,
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.lines.lock().unwrap().len()
+        }
+
+        /// Wait for `n` lines. A failure here is a tree that does not run, whatever it says of the
+        /// flags.
+        fn wait_for(&self, n: usize) {
+            let until = Instant::now() + Duration::from_secs(60);
+            while self.count() < n {
+                assert!(
+                    Instant::now() < until && !self.worker.is_finished(),
+                    "{} of {n} lines; finished: {}",
+                    self.count(),
+                    self.worker.is_finished()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Set the pause and wait until the tree is quiet (longer than a tick, the lines in flight
+        /// in). Returns the lines and the file's size from then on.
+        fn pause(&self, t: &Ticker) -> (usize, u64) {
+            self.pause.store(true, Ordering::Relaxed);
+            let until = Instant::now() + Duration::from_secs(45);
+            let mut last = (self.count(), t.size());
+            let mut since = Instant::now();
+            while since.elapsed() < Duration::from_secs(2) {
+                assert!(Instant::now() < until, "the tree kept ticking when paused");
+                std::thread::sleep(Duration::from_millis(50));
+                let now = (self.count(), t.size());
+                if now != last {
+                    (last, since) = (now, Instant::now());
+                }
+            }
+            last
+        }
+
+        /// The runner's result. A runner that never returns fails here rather than hanging the
+        /// test binary.
+        fn finish(self) -> Result<()> {
+            let until = Instant::now() + Duration::from_secs(120);
+            while !self.worker.is_finished() {
+                assert!(Instant::now() < until, "the runner did not return");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            self.worker.join().unwrap()
+        }
+    }
+
+    #[test]
+    fn a_cancel_stops_the_whole_tree() {
+        let t = Ticker::new("cancel");
+        let run = Running::start(t.cmd(Duration::from_secs(600)));
+        run.wait_for(2);
+        run.cancel.store(true, Ordering::Relaxed);
+        let e = run.finish().unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+        t.assert_stops("cancel");
+    }
+
+    #[test]
+    fn a_timeout_stops_the_whole_tree() {
+        let t = Ticker::new("timeout");
+        let run = Running::start(t.cmd(Duration::from_secs(3)));
+        let e = run.finish().unwrap_err();
+        assert!(format!("{e:#}").contains("timed out"), "{e:#}");
+        t.assert_stops("timeout");
+    }
+
+    #[test]
+    fn a_pause_holds_the_whole_tree_and_a_resume_continues_it() {
+        let t = Ticker::new("pause");
+        let run = Running::start(t.cmd(Duration::from_secs(600)));
+        run.wait_for(2);
+        let (lines, size) = run.pause(&t);
+        // Several ticks' worth of silence: the grandchild does the ticking.
+        std::thread::sleep(Duration::from_secs(4));
+        assert_eq!(run.count(), lines, "output while paused");
+        assert_eq!(t.size(), size, "the grandchild ran while paused");
+        run.pause.store(false, Ordering::Relaxed);
+        run.wait_for(lines + 2);
+        assert!(t.size() > size, "no tick after the resume");
+        // Paused again, a cancel still reaches the tree, and nothing it held comes back to life.
+        run.pause(&t);
+        run.cancel.store(true, Ordering::Relaxed);
+        let e = run.finish().unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+        t.assert_stops("cancel while paused");
+    }
+
+    /// The pause alone outlasts the child's `TIMEOUT`, yet the child goes on after it, and the runner
+    /// still times it out once it has used up the rest.
+    #[test]
+    fn paused_time_does_not_count_toward_the_timeout() {
+        const TIMEOUT: Duration = Duration::from_secs(15);
+        let t = Ticker::new("paused-timeout");
+        let run = Running::start(t.cmd(TIMEOUT));
+        run.wait_for(1);
+        let (lines, _) = run.pause(&t);
+        std::thread::sleep(TIMEOUT + Duration::from_secs(1));
+        if run.worker.is_finished() {
+            let why = run.finish().map_err(|e| format!("{e:#}"));
+            panic!("the runner ended during the pause: {why:?}");
+        }
+        run.pause.store(false, Ordering::Relaxed);
+        // Had the deadline stayed, the first poll after the resume would end the child.
+        run.wait_for(lines + 3);
+        let e = run.finish().unwrap_err();
+        assert!(format!("{e:#}").contains("timed out"), "{e:#}");
+        t.assert_stops("timeout after a pause");
+    }
+
+    /// Entered while paused, the child does not start until the pause clears; a cancel while it
+    /// waits returns without starting it.
+    #[test]
+    fn nothing_starts_during_a_pause() {
+        let t = Ticker::new("entered-paused");
+        let pause = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (pause, cancel) = (pause.clone(), cancel.clone());
+            let cmd = t.cmd(Duration::from_secs(600));
+            std::thread::spawn(move || {
+                SystemRunner.run_pausable(&cmd, &mut |_| {}, &cancel, &pause)
+            })
+        };
+        std::thread::sleep(POLL * 5);
+        assert_eq!(t.size(), 0, "started during the pause");
+        assert!(!worker.is_finished());
+        cancel.store(true, Ordering::Relaxed);
+        let e = worker.join().unwrap().unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+        assert_eq!(t.size(), 0);
+    }
+
+    /// A helper that outlives a successful child, holding the output pipes, is stopped after the
+    /// grace period: the run ends long before the helper would, and well before its timeout.
+    #[test]
+    fn a_helper_left_behind_is_stopped() {
+        let t = Ticker::new("orphan");
+        const TIMEOUT: Duration = Duration::from_secs(600);
+        #[cfg(windows)]
+        let args = ["/C", "start", "/B", "cmd", "/C", "tick.cmd"];
+        #[cfg(unix)]
+        let args = ["-c", "sh tick.sh & exit 0"];
+        let mut cmd = t.cmd(TIMEOUT);
+        cmd.args = args.iter().map(OsString::from).collect();
+        let run = Running::start(cmd);
+        run.finish().unwrap();
+        t.assert_stops("a helper left behind");
+    }
+}

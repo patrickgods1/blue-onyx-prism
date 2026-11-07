@@ -13,6 +13,7 @@
 mod common;
 
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
+use blue_onyx_prism::config_store::{DISK_POLL, SETTLE};
 use blue_onyx_prism::model::ModelFamilyKind;
 use common::{Server, list_models, post_image, temp_dir, wait_until};
 use std::time::{Duration, Instant};
@@ -70,7 +71,7 @@ async fn edit_on_disk_applies_without_a_page() {
     let only_a = vec!["ipcam-a".to_string()];
     wait_until(
         "ipcam-b to stop after the edit on disk",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         || async { list_models(&client, &base).await.as_ref() == Some(&only_a) },
     )
     .await;
@@ -83,25 +84,31 @@ async fn edit_on_disk_applies_without_a_page() {
     assert!(low.success && low.count > high.count, "{high:?} / {low:?}");
 
     // A broken edit is reported and changes nothing; fixing the file applies it.
+    // The list stays through rounds of the watch (these routes do not read the file), and only
+    // then is the error looked up: `GET /v1/config` reads the file itself.
     std::fs::write(&path, "{ \"models\": [").unwrap();
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let rounds = Instant::now() + 3 * DISK_POLL + SETTLE;
+    while Instant::now() < rounds {
+        assert_eq!(list_models(&client, &base).await, Some(only_a.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let config_url = format!("{base}/v1/config");
+    wait_until(
+        "the broken file to be reported",
+        Duration::from_secs(30),
+        || async {
+            let cfg = common::get_json(&client, &config_url).await;
+            let error = cfg.as_ref().and_then(|c| c["fileError"].as_str());
+            error.is_some_and(|e| e.contains("not applied"))
+        },
+    )
+    .await;
     assert_eq!(list_models(&client, &base).await, Some(only_a.clone()));
-    let cfg = common::get_json(&client, &format!("{base}/v1/config"))
-        .await
-        .expect("GET /v1/config");
-    eprintln!("fileError: {}", cfg["fileError"]);
-    assert!(
-        cfg["fileError"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("not applied"),
-        "{cfg}"
-    );
     v["models"][1]["enabled"] = true.into();
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
     wait_until(
         "ipcam-b to start again after the file is fixed",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         || async { list_models(&client, &base).await.as_ref() == Some(&both) },
     )
     .await;

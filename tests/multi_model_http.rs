@@ -20,6 +20,9 @@ use common::{Server, post_image_with};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Longest an "initializing" answer may take. That text already says it did not wait for the
+/// compile; this catches a request queued behind it, which waits for the whole compile.
+const AT_ONCE: Duration = Duration::from_secs(30);
 const PER_MODEL: usize = 8;
 const IPCAM: &str = "IPcam-general";
 const IPCAM_CLASSES: [&str; 3] = ["person", "vehicle", "unknown"];
@@ -327,10 +330,7 @@ async fn multiple_models_served_concurrently() {
         let msg = r.error.as_deref().unwrap_or_default();
         assert!(msg.contains("initializing"), "{lazy}: {r:?}");
         assert!(msg.contains("compiling on"), "{lazy}: {r:?}");
-        assert!(
-            first < Duration::from_secs(2),
-            "{lazy}: first request took {first:?}"
-        );
+        assert!(first < AT_ONCE, "{lazy}: first request took {first:?}");
         *sent.entry(lazy.as_str()).or_default() += 1;
         *rejected.entry(lazy.as_str()).or_default() += 1;
 
@@ -345,7 +345,7 @@ async fn multiple_models_served_concurrently() {
             let msg = r.error.as_deref().unwrap_or_default();
             assert!(msg.contains("initializing"), "{lazy}: {r:?}");
             assert!(
-                t.elapsed() < Duration::from_secs(2),
+                t.elapsed() < AT_ONCE,
                 "{lazy}: an initializing answer took {:?}",
                 t.elapsed()
             );

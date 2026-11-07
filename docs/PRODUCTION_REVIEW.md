@@ -3828,3 +3828,13 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-D12 | data | partly fixed: cross-volume install and `.provenance.json` are atomic; a hard crash still strands proposals until phase 7's sweep |
 | RR-M1 | data | fixed: an unavailable review folder is its own state on Review and the Train strip |
 | RR-R0 | reliability | fixed: a Cancel read as Queued just as the queue started the job did nothing and still answered true; the job ran on, and a training run's record said Cancelled meanwhile. Found by a new test failing 2 of 6 runs alone; 30 of 30 after, with deterministic tests for tasks and runs |
+| RR-T1 | tests | fixed: every test reaching the global queue holds `QUEUE_TEST_LOCK` (a probe over the whole lib suite found the last two); `own_queue` gives a test the queue in its own folder |
+| RR-T2 | tests | fixed: wall-clock upper bounds became polling, ordering or 30 s limits. Real races found and shown with counts: the collector test read the index before the last line was written (21 of 60 failing under load, 0 of 60 after), a relock raced a spawn (24 of 20,000), the export cancel raced the shell's pid line (forced 10 of 10, 0 of 10) |
+| RR-T3 | tests | fixed: CI installs Python and numpy, and `BOP_REQUIRE_PYTHON` / `BOP_REQUIRE_NODE` turn silent skips into failures there. The Windows `BrokenPipe` was a script exiting early without numpy (30 of 30 without, 0 of 30 with) |
+| RR-T4 | tests | fixed: Python self-tests run in CI. `eval_overlaps.py` was never committed, so the overlap fixture is frozen |
+| RR-T5 | tests | fixed: step timeouts from run history, `--no-fail-fast`, curl limits, retries on packaging downloads, free disk on Ubuntu |
+| RR-T6 | tests | fixed: review rules are in a pure `review-rules.js`, compared with the Rust twins on 3000 frames through `node`; 17 of 17 JS mutants caught |
+| RR-T7 | tests | partly fixed: job-control tree tests run on every OS, but the Windows job-object paths first run in CI. `--no-default-features` is tested on Ubuntu |
+| RR-T8 | tests | open: the pause test failed once with "no output after resume" and did not recur in 72 runs; a mutant in the shared tree may explain it, not proven. It now prints what it saw |
+| RR-T9 | tests | open: `overlap_live` names a suggestion, not its boxes. Where two boxes share a position and one was relabelled, the page can drop the relabelled box. The fix needs a new field in `server/review.rs` |
+| RR-T10 | tests | open: weak tests `disabled_is_noop`, `service_guard_is_noop`, `quoted_path`, `bench_1080p`, `elapsedMs >= 0`, and `remove_dir_all(..).unwrap()` in test teardown, which antivirus can fail on Windows |

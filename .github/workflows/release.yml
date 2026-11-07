@@ -73,11 +73,14 @@ jobs:
           echo "BLUE_ONYX_PRISM_GIT_SHA=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
           echo "BLUE_ONYX_PRISM_BUILD_DATE=$(date -u +%F)" >> "$GITHUB_ENV"
 
+      # Limits: at least twice the slowest green run of the step (16, 3 and 6 min).
       - name: Build release (default features, OpenVINO + ONNX Runtime)
+        timeout-minutes: 40
         run: cargo build --release --locked --bins --target ${{ matrix.target }}
 
       - name: Stage files
         shell: bash
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           OUT="target/${{ matrix.target }}/release"
@@ -142,10 +145,12 @@ jobs:
       # start. Unsigned for now (packaging/build-installers.sh marks where signing goes).
       - name: Build installers
         shell: bash
+        timeout-minutes: 15
         run: packaging/build-installers.sh ${{ matrix.target }} dist
 
       - name: Smoke-test installers (install, check the service answers, uninstall)
         shell: bash
+        timeout-minutes: 25
         working-directory: dist
         run: ../packaging/smoke-test-installers.sh .
 

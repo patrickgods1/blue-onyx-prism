@@ -117,6 +117,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     #[test]
     fn interval_parsing() {
@@ -151,14 +152,18 @@ mod tests {
             },
         )
         .unwrap();
+        // Past a few intervals: a ping would be here by now.
         std::thread::sleep(Duration::from_millis(450));
         assert!(sent.lock().unwrap().is_empty(), "no ping while not ready");
         ready.store(true, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(450));
+        let until = Instant::now() + Duration::from_secs(30);
+        while !sent.lock().unwrap().iter().any(|m| m == "WATCHDOG=1") {
+            assert!(Instant::now() < until, "no ping once ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         token.cancel();
         h.join().unwrap();
         let got = sent.lock().unwrap().clone();
-        assert!(got.iter().any(|m| m == "WATCHDOG=1"));
         assert_eq!(got.last().map(String::as_str), Some("STOPPING=1"));
     }
 
@@ -170,7 +175,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("n.sock");
         let rx = UnixDatagram::bind(&path).unwrap();
-        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         assert!(notify_to(path.as_os_str(), "READY=1"));
         let mut buf = [0u8; 64];
         let n = rx.recv(&mut buf).unwrap();

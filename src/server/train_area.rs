@@ -750,6 +750,7 @@ pub(super) async fn dataset_page(State(state): State<Arc<AppState>>) -> Response
 #[cfg(test)]
 mod tests {
     use super::super::test_util::{call, get_text, post_form, test_state_with};
+    use super::super::training::{QUEUE_TEST_LOCK, own_queue};
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -1105,6 +1106,18 @@ mod tests {
         })
     }
 
+    /// Finishes the first walk of `state`'s review folder: the routes wait 400 ms or 1.5 s for it,
+    /// a busy machine can take longer, and what is kept is answered at once however old.
+    fn walk_finished(state: &AppState) {
+        let config = state.config_read().clone();
+        let dir = config.collect.resolved_review_dir(&config.data_root());
+        assert!(
+            tally_of(&dir, Duration::from_secs(60)).is_some(),
+            "no walk of {} in 60 s",
+            dir.display()
+        );
+    }
+
     async fn status_and_location(state: &Arc<AppState>, url: &str) -> (StatusCode, String) {
         let (s, h, _) = call(state, Request::get(url).body(Body::empty()).unwrap()).await;
         let at = h
@@ -1141,6 +1154,8 @@ mod tests {
     async fn train_goes_to_the_tab_of_the_next_step() {
         let dir = scratch();
         let state = state_in(&dir);
+        let _queue = own_queue(&state).await;
+        walk_finished(&state);
         let (s, at) = status_and_location(&state, "/train").await;
         assert_eq!(s, StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(at, "/train/collect");
@@ -1150,6 +1165,8 @@ mod tests {
     async fn the_summary_route_answers_counts_and_a_next_step() {
         let dir = scratch();
         let state = state_in(&dir);
+        let _queue = own_queue(&state).await;
+        walk_finished(&state);
         let (s, body) = get_text(&state, "/v1/train/summary").await;
         assert_eq!(s, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1293,6 +1310,9 @@ mod tests {
     /// A form's answer is the tab it belongs to, whichever address it posted to.
     #[tokio::test]
     async fn forms_answer_with_their_tab() {
+        // These forms reach `training::service`, which moves the process's queue to this test's
+        // folder and would replace the jobs another test is waiting on.
+        let _queue = QUEUE_TEST_LOCK.lock().await;
         let dir = scratch();
         let state = state_in(&dir);
         let on_tab = |html: &str, tab: &str| html.contains(&format!("data-tab=\"{tab}\""));
@@ -1318,7 +1338,7 @@ mod tests {
     #[test]
     fn a_walk_answers_and_is_kept_while_the_next_one_runs() {
         let dir = scratch();
-        let first = tally_of(&dir, Duration::from_secs(10)).expect("a walk of an empty folder");
+        let first = tally_of(&dir, Duration::from_secs(60)).expect("a walk of an empty folder");
         assert_eq!(first.frames, 0);
         // Kept: the same answer, no new walk needed.
         let again = tally_of(&dir, Duration::ZERO).unwrap();

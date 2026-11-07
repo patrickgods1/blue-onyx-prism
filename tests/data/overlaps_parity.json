@@ -1,5 +1,5 @@
 {
- "about": "Answers of scripts/research/eval_overlaps.py (zoom_rule, match_zoom, crop_detect) on synthetic input; src/collect/labels/overlaps.rs and scripts/autolabel.py --self-test --parity are checked against them. `cases`: at match IoU 0.6 and score 0.5, with guards; `reviewer` is the reference's no-answer. `crops`: padded crop and detections in frame coordinates.",
+ "about": "FROZEN: this fixture cannot be regenerated, because scripts/research/eval_overlaps.py was never committed and no copy is in the repository or its history. Do not edit the answers to make a test pass: a difference is a behaviour change in the code under test. Answers of that script (zoom_rule, match_zoom, crop_detect) on synthetic input; src/collect/labels/overlaps.rs and scripts/autolabel.py --self-test --parity are checked against them. `cases`: at match IoU 0.6 and score 0.5, with guards; `reviewer` is the reference's no-answer. `crops`: padded crop and detections in frame coordinates.",
  "point": {
   "match_iou": 0.6,
   "score": 0.5,

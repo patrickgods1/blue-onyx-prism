@@ -14,6 +14,7 @@ if [ $# -ne 2 ]; then
 fi
 DEB="$(realpath "$1")"
 RPM="$(realpath "$2")"
+RETRY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/ci/retry.sh"
 UNIT=blue-onyx-prism
 DATA=/var/lib/blue-onyx-prism
 CONFIG="$DATA/blue_onyx_prism_config.json"
@@ -26,7 +27,10 @@ NEW_UID=900
 fail() { echo "SMOKE TEST FAILED: $*" >&2; sudo journalctl -u "$UNIT" --no-pager -n 50 || true; exit 1; }
 
 echo "== deb install"
-sudo apt-get update -qq
+# Only the network is retried. The install itself runs once: a second try would finish a failed
+# postinst and hide it, and that is what this test is for.
+"$RETRY" 4 20 sudo apt-get update -qq
+"$RETRY" 4 20 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --download-only "$DEB"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$DEB"
 
 id -u blueonyx >/dev/null 2>&1 || fail "user blueonyx missing"
@@ -130,7 +134,7 @@ new_orphans="$(comm -13 <(echo "$orphans_before") <(orphans))"
 [ -z "$new_orphans" ] || fail "files owned by the deleted user left behind: $new_orphans"
 
 echo "== rpm sanity"
-command -v rpm >/dev/null || sudo apt-get install -y rpm
+command -v rpm >/dev/null || "$RETRY" 4 20 sudo apt-get install -y rpm
 files="$(rpm -qpl "$RPM")"; echo "$files"
 echo "$files" | grep -q "/opt/blue-onyx-prism/blue-onyx-prism$" || fail "rpm lacks the binary"
 echo "$files" | grep -q '/usr/lib/systemd/system/blue-onyx-prism.service' || fail "rpm lacks the unit"

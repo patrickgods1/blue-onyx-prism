@@ -30,7 +30,7 @@ pub const REPEAT_MIN: usize = 2;
 pub const HISTORY_TTL: Duration = Duration::from_secs(60);
 
 /// Vehicle classes: a box of one may stand for an object another names (the Review tab's
-/// `VEHICLES`, `assets/review.js`).
+/// `VEHICLES`, `assets/review-rules.js`).
 pub const VEHICLES: [&str; 4] = ["car", "truck", "bus", "van"];
 
 /// Two labels that can name one object: the same class, or two vehicle classes.
@@ -519,12 +519,36 @@ mod tests {
     fn the_page_shares_the_spot_constants() {
         let js = include_str!("../../../assets/review.js");
         assert!(js.contains(&format!("REPEAT_MIN = {REPEAT_MIN}")));
+        assert!(js.contains(&format!("REPEAT_IOU = {REJECT_SPOT_IOU},")));
+        assert!(js.contains(&format!("ACCEPT_SPOT_IOU = {ACCEPT_SPOT_IOU};")));
+        let rules = include_str!("../../../assets/review-rules.js");
         for reason in [
             super::super::bulk::DISMISSED_REASON,
             super::super::bulk::SPOT_DISMISSED_REASON,
             super::super::spots::PARKED_REASON,
+            super::super::stacks::DUPLICATE_REASON,
         ] {
-            assert!(js.contains(&format!("'{reason}'")), "{reason}");
+            assert!(rules.contains(&format!("'{reason}'")), "{reason}");
+        }
+    }
+
+    /// The thresholds and the vehicle list of the page's rules, by their text: this runs where
+    /// `tests/js_rules.rs` skips for want of `node`, which compares the values too.
+    #[test]
+    fn the_page_shares_the_stack_thresholds_and_the_vehicles() {
+        use super::super::stacks::{NESTED_SHARE, OVERLAP_IOU, STACK_IOU};
+        let rules = include_str!("../../../assets/review-rules.js");
+        for line in [
+            format!(
+                "var STACK_IOU = {STACK_IOU}, OVERLAP_IOU = {OVERLAP_IOU}, \
+                 NESTED_SHARE = {NESTED_SHARE};"
+            ),
+            format!(
+                "var VEHICLES = [{}];",
+                VEHICLES.map(|v| format!("'{v}'")).join(", ")
+            ),
+        ] {
+            assert!(rules.contains(&line), "{line}");
         }
     }
 

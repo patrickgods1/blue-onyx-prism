@@ -96,6 +96,11 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
         JS,
         include_str!("../../assets/model-picker.js"),
     ),
+    (
+        "review-rules.js",
+        JS,
+        include_str!("../../assets/review-rules.js"),
+    ),
     ("review.js", JS, include_str!("../../assets/review.js")),
     ("welcome.js", JS, include_str!("../../assets/welcome.js")),
 ];
