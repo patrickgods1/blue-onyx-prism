@@ -9,10 +9,13 @@
 //! a real object, so it is neither a hard negative ([`LabelFile::hard_negatives`]) nor a decision
 //! about the spot ([`super::repeats`]).
 //!
-//! Twin of the Review tab's `dupGroups`, `rank` and `dupDrops` (`assets/review.js`): keep the
-//! thresholds, the keeper rank and the tie break in step. One difference, on purpose: a box of no
-//! listed class that is not rejected counts as unwanted here, while the page keeps it (it shows
-//! such a box: a save refuses it until it is relabelled).
+//! Twin of the Review tab's `dupGroups`, `rank` and `dupDrops` (`assets/review-rules.js`): keep the
+//! thresholds, the keeper rank and the tie break in step (`tests/js_rules.rs` runs both on generated
+//! frames). Three differences: a box of no listed class that is not rejected counts as unwanted
+//! here, while the page keeps it (it shows such a box: a save refuses it until it is relabelled); an
+//! alias of a hidden class is unwanted here, while the page, which knows no aliases, keeps it; and
+//! this file computes in f32 and the page in f64, so an IoU or share that sits on a threshold to
+//! within rounding (104.3 over 149 px, exactly 0.7 in the file's decimals) can fall on either side.
 
 use super::bulk::Wanted;
 use super::repeats::same_object;
@@ -169,11 +172,16 @@ pub fn needs_look(f: &LabelFile, wanted: Option<&Wanted<'_>>) -> bool {
         && (!groups(&f.boxes, wanted).is_empty() || !overlap_pairs(&f.boxes, wanted).is_empty())
 }
 
-/// Reject `b` as a duplicate, keeping its provenance (`reason`, [`DUPLICATE_REASON`] if none).
+/// Reject `b` as a duplicate, keeping its provenance (`reason`, [`DUPLICATE_REASON`] if none). A
+/// parked accept taken back loses the rule's mark, as at a save (`markDuplicate` on the page).
 pub(super) fn mark(b: &mut LabelBox) {
     b.state = BoxState::Rejected;
     b.reject_reason = Some(RejectReason::Duplicate);
     b.difficult = false;
+    if b.reason.as_deref() == Some(super::spots::PARKED_REASON) {
+        b.reason = None;
+        b.auto.parked = None;
+    }
     if b.reason.is_none() {
         b.reason = Some(DUPLICATE_REASON.into());
     }
@@ -530,6 +538,19 @@ mod tests {
         assert_eq!(f.boxes[0].state, BoxState::Accepted);
         assert_eq!(f.status, Status::Reviewed);
         assert_eq!(reject_stacked(&mut f, &w), 0, "done");
+    }
+
+    #[test]
+    fn a_parked_box_rejected_as_a_duplicate_loses_the_rules_mark() {
+        let mut b = accepted(at("car", A, 0.9));
+        b.reason = Some(super::super::spots::PARKED_REASON.into());
+        b.auto.parked = Some(super::super::ParkedMark {
+            since: "2026-11-06".into(),
+            bbox: A,
+        });
+        mark(&mut b);
+        assert_eq!(b.reason.as_deref(), Some(DUPLICATE_REASON));
+        assert_eq!(b.auto.parked, None);
     }
 
     #[test]

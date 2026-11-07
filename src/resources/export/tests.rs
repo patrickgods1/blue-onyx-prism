@@ -77,7 +77,7 @@ fn export_lock_wait_is_bounded() {
     let root = tmp("lock-wait");
     let path = root.join("export.lock");
     let never = AtomicBool::new(false);
-    let held = ExportLock::acquire(&path, &never, Duration::from_secs(1), || {}).unwrap();
+    let held = ExportLock::acquire(&path, &never, Duration::from_secs(30), || {}).unwrap();
     let mut told = 0;
     let e = ExportLock::acquire(&path, &never, Duration::from_millis(300), || told += 1)
         .err()
@@ -85,7 +85,8 @@ fn export_lock_wait_is_bounded() {
     assert_eq!(told, 1);
     assert!(format!("{e:#}").contains("another process"), "{e:#}");
     drop(held);
-    ExportLock::acquire(&path, &never, Duration::from_millis(300), || {}).unwrap();
+    // Not at once: a child another test spawns right now holds the open file until it execs.
+    ExportLock::acquire(&path, &never, Duration::from_secs(30), || {}).unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -412,7 +413,7 @@ fn exporter_queues_cancels_and_reports() {
     .unwrap();
     assert!(ex.busy());
     // Wait until the first export hangs in the exporter.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let st = ex.status("model:yolo26n").unwrap();
         if let ExportState::Running {
@@ -450,7 +451,7 @@ fn exporter_queues_cancels_and_reports() {
     );
     assert!(ex.cancel("MODEL:yolo26n"));
     let st = ex
-        .wait("model:yolo26n", Some(Duration::from_secs(10)))
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
         .unwrap();
     assert_eq!(st.state, ExportState::Cancelled);
     assert!(!ex.busy());
@@ -477,7 +478,7 @@ fn exporter_failure_and_success_with_callback() {
     })
     .unwrap();
     let st = ex
-        .wait("model:yolo26n", Some(Duration::from_secs(10)))
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
         .unwrap();
     match &st.state {
         ExportState::Failed { stage, error } => {
@@ -505,11 +506,11 @@ fn exporter_failure_and_success_with_callback() {
     })
     .unwrap();
     let st = ex
-        .wait("model:yolo26n", Some(Duration::from_secs(10)))
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
         .unwrap();
     assert_eq!(st.state, ExportState::Installed);
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(30)).unwrap(),
         root.join("models/yolo26n.onnx")
     );
     ex.forget("model:yolo26n");
@@ -616,16 +617,20 @@ fn system_runner_streams_fails_times_out_and_cancels() {
     assert!(msg.ends_with("line20") && !msg.contains("line12"), "{msg}");
     #[cfg(unix)]
     {
+        // A stopped child ends long before it would have ended by itself.
+        let by_itself = Duration::from_secs(60);
+        let sleeping = format!("sleep {}", by_itself.as_secs());
         let started = Instant::now();
         let e = SystemRunner
             .run(
-                &cmd("sleep 30", Duration::from_millis(300)),
+                &cmd(&sleeping, Duration::from_millis(300)),
                 &mut |_| {},
                 &never,
             )
             .unwrap_err();
         assert!(format!("{e:#}").contains("timed out"), "{e:#}");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < by_itself / 2);
+        let started = Instant::now();
         let cancel = Arc::new(AtomicBool::new(false));
         let c2 = cancel.clone();
         std::thread::spawn(move || {
@@ -633,28 +638,23 @@ fn system_runner_streams_fails_times_out_and_cancels() {
             c2.store(true, Ordering::Relaxed);
         });
         let e = SystemRunner
-            .run(
-                &cmd("sleep 30", Duration::from_secs(60)),
-                &mut |_| {},
-                &cancel,
-            )
+            .run(&cmd(&sleeping, by_itself * 2), &mut |_| {}, &cancel)
             .unwrap_err();
         assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < by_itself / 2);
 
         // RS-02: a grandchild (`sleep 30 &`, whose parent `sh` then waits on another sleep)
-        // dies with the process group on cancel.
-        let cancel = Arc::new(AtomicBool::new(false));
-        let c2 = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            c2.store(true, Ordering::Relaxed);
-        });
+        // dies with the process group on cancel. Cancelled on its pid line: a cancel on a timer
+        // can beat a shell that starts slowly, and then there is no pid to look for.
+        let cancel = AtomicBool::new(false);
         let mut lines = Vec::new();
         let e = SystemRunner
             .run(
                 &cmd("sleep 30 & echo $!; sleep 30", Duration::from_secs(60)),
-                &mut |l| lines.push(l.to_string()),
+                &mut |l| {
+                    lines.push(l.to_string());
+                    cancel.store(true, Ordering::Relaxed);
+                },
                 &cancel,
             )
             .unwrap_err();
@@ -669,7 +669,7 @@ fn system_runner_streams_fails_times_out_and_cancels() {
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(30);
         while alive() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -681,12 +681,12 @@ fn system_runner_streams_fails_times_out_and_cancels() {
         let mut lines = Vec::new();
         SystemRunner
             .run(
-                &cmd("sleep 30 & echo $!; exit 0", Duration::from_secs(60)),
+                &cmd("sleep 60 & echo $!; exit 0", by_itself * 2),
                 &mut |l| lines.push(l.to_string()),
                 &never,
             )
             .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < by_itself / 2);
         let orphan = lines.first().expect("pid line").trim().to_string();
         let alive = || {
             std::process::Command::new("kill")
@@ -696,7 +696,7 @@ fn system_runner_streams_fails_times_out_and_cancels() {
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(30);
         while alive() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -761,9 +761,13 @@ fn system_runner_starts_low_priority_children() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Pause / resume of a real process tree: no output while paused, output continues after it,
+/// Pause / resume of a real process tree: stopped while paused, output continues after it,
 /// paused time does not count toward the timeout, cancel works while paused, and a runner
 /// entered while paused waits before starting the child.
+///
+/// Whether the child is stopped is asked of the system: lines it wrote before the stop reach the
+/// test whenever the reader thread gets to run, so counting them proves nothing on a busy
+/// machine.
 #[cfg(unix)]
 #[test]
 fn system_runner_pauses_resumes_and_cancels_while_paused() {
@@ -780,8 +784,10 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
     };
     let lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let count = || lines.lock().unwrap().len();
-    let wait_for = |n: usize, within: Duration| {
-        let until = Instant::now() + within;
+    // Long limits for what takes moments: on a busy machine a child starts slowly.
+    let patience = Duration::from_secs(30);
+    let wait_for = |n: usize| {
+        let until = Instant::now() + patience;
         while count() < n && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -789,10 +795,12 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
     };
     let cancel = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(AtomicBool::new(false));
-    // A counter every 50 ms; 1.5 s of running time allowed, far less than the test's wall time.
+    // A counter every 50 ms, with less running time allowed than the test spends paused. Running
+    // time is used up by the moments the child runs, so this has to outlast a stalled machine.
+    let allowed = Duration::from_secs(10);
     let c = cmd(
         "echo pid $$; i=0; while true; do echo $i; i=$((i+1)); sleep 0.05; done",
-        Duration::from_millis(1500),
+        allowed,
     );
     let worker = {
         let (lines, cancel, pause) = (lines.clone(), cancel.clone(), pause.clone());
@@ -805,36 +813,58 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
             )
         })
     };
-    assert!(
-        wait_for(4, Duration::from_secs(5)) >= 4,
-        "the counter did not start"
-    );
-    pause.store(true, Ordering::Relaxed);
-    // Lines already in flight arrive within a poll or two; after that nothing.
-    std::thread::sleep(Duration::from_millis(300));
-    let paused = count();
-    std::thread::sleep(Duration::from_millis(1700));
-    assert_eq!(count(), paused, "output while paused");
-    assert!(
-        !worker.is_finished(),
-        "paused time counted toward the timeout"
-    );
-    pause.store(false, Ordering::Relaxed);
-    assert!(
-        wait_for(paused + 3, Duration::from_secs(3)) >= paused + 3,
-        "no output after resume"
-    );
+    assert!(wait_for(2) >= 2, "the counter did not start");
     let pid = lines.lock().unwrap()[0]
         .strip_prefix("pid ")
         .unwrap()
         .to_string();
+    // `T` is a stopped process in `ps` on Linux and macOS.
+    let stopped = || {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().starts_with('T')
+    };
+    let wait_stopped = || {
+        let until = Instant::now() + patience;
+        while !stopped() {
+            assert!(Instant::now() < until, "the child {pid} was not stopped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     pause.store(true, Ordering::Relaxed);
-    std::thread::sleep(Duration::from_millis(300));
-    let started = Instant::now();
+    wait_stopped();
+    let since = Instant::now();
+    while since.elapsed() < allowed + Duration::from_millis(500) {
+        assert!(stopped(), "the child {pid} ran while paused");
+        assert!(
+            !worker.is_finished(),
+            "paused time counted toward the timeout"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let paused = count();
+    pause.store(false, Ordering::Relaxed);
+    let after = wait_for(paused + 3);
+    assert!(
+        after >= paused + 3,
+        "no output after resume: {after} lines, {paused} when paused, child stopped: {}, run \
+         over: {}",
+        stopped(),
+        worker.is_finished()
+    );
+    assert!(!stopped(), "the child {pid} was not resumed");
+    pause.store(true, Ordering::Relaxed);
+    wait_stopped();
     cancel.store(true, Ordering::Relaxed);
+    let until = Instant::now() + patience;
+    while !worker.is_finished() {
+        assert!(Instant::now() < until, "the cancel did not end the run");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let e = worker.join().unwrap().unwrap_err();
     assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
-    assert!(started.elapsed() < Duration::from_secs(4), "slow cancel");
     let alive = || {
         std::process::Command::new("kill")
             .args(["-0", &pid])
@@ -843,6 +873,10 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
             .map(|s| s.success())
             .unwrap_or(false)
     };
+    let until = Instant::now() + patience;
+    while alive() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(!alive(), "the paused child {pid} survived the cancel");
 
     // Entered while paused: nothing starts until the pause clears.

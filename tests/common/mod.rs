@@ -358,10 +358,18 @@ impl Server {
             config,
             config_path,
         ));
-        let port = free_port();
-        let listeners = server::bind([127, 0, 0, 1].into(), port)
-            .await
-            .expect("bind");
+        // A port picked by `free_port` can be taken by another process before it is bound
+        // (see `Server::start`).
+        let mut attempts = 0;
+        let (port, listeners) = loop {
+            let port = free_port();
+            attempts += 1;
+            match server::bind([127, 0, 0, 1].into(), port).await {
+                Ok(listeners) => break (port, listeners),
+                Err(e) if attempts == 5 => panic!("no port to bind after 5 attempts: {e:#}"),
+                Err(e) => eprintln!("attempt {attempts}: {e:#}"),
+            }
+        };
         let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
         Self {
             base: format!("http://127.0.0.1:{port}"),

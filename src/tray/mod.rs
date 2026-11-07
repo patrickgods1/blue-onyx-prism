@@ -100,6 +100,7 @@ pub fn single_instance() -> std::io::Result<Option<File>> {
 mod tests {
     use super::*;
     use clap::Parser as _;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn second_lock_is_refused_until_the_first_is_dropped() {
@@ -110,7 +111,14 @@ mod tests {
         assert!(first.is_some());
         assert!(try_lock_file(&path).unwrap().is_none());
         drop(first);
-        assert!(try_lock_file(&path).unwrap().is_some());
+        // A child another test spawns at this moment shares the open file until it execs, so the
+        // lock can look held for a moment after the drop (`TrainLock::try_acquire` has the same
+        // grace). A lock that was really kept stays refused until the limit.
+        let until = Instant::now() + Duration::from_secs(30);
+        while try_lock_file(&path).unwrap().is_none() {
+            assert!(Instant::now() < until, "still refused after the drop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

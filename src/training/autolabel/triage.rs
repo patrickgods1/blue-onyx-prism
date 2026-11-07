@@ -3150,31 +3150,26 @@ mod tests {
     }
 
     /// The script's own tests of its fusion code (WBF, NMS, prompt batching, phrase mapping,
-    /// VLM answers): pure Python, run when a Python 3 is on PATH (skipped otherwise).
+    /// VLM answers) and of its crops against the parity fixture: pure Python, skipped without a
+    /// Python 3 unless `BOP_REQUIRE_PYTHON` is set.
     #[test]
     fn the_autolabel_script_self_test_passes() {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/autolabel.py");
-        let Some(py) = ["python3", "python"].into_iter().find(|p| {
-            std::process::Command::new(p)
-                .arg("--version")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        }) else {
-            eprintln!("no Python 3 on PATH; skipping the autolabel.py self-test");
+        use crate::training::progress::test_python;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/autolabel.py");
+        let parity = root.join("tests/data/overlaps_parity.json");
+        let Some(py) = test_python::python3("autolabel.py self-test") else {
             return;
         };
-        let out = std::process::Command::new(py)
-            .arg("-I")
-            .arg(&script)
-            .arg("--self-test")
-            .output()
-            .unwrap();
+        let args = [
+            "-I",
+            script.to_str().unwrap(),
+            "--self-test",
+            "--parity",
+            parity.to_str().unwrap(),
+        ];
+        let out = test_python::run(py, &args, "");
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success(),
-            "{text}{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
         assert!(text.contains("\"event\":\"self_test\""), "{text}");
     }
 

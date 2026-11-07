@@ -37,8 +37,9 @@ mkdir -p packaging/linux/build
 bop_install_unit deploy/blue-onyx-prism.service packaging/linux/build/blue-onyx-prism.service /opt/blue-onyx-prism
 
 have_tool() { cargo "$1" --version >/dev/null 2>&1; }
-have_tool deb || cargo install cargo-deb --version "$CARGO_DEB_VERSION" --locked
-have_tool generate-rpm || cargo install cargo-generate-rpm --version "$CARGO_GENERATE_RPM_VERSION" --locked
+# crates.io downloads can drop; a compile error just fails three times.
+have_tool deb || scripts/ci/retry.sh 3 20 cargo install cargo-deb --version "$CARGO_DEB_VERSION" --locked
+have_tool generate-rpm || scripts/ci/retry.sh 3 20 cargo install cargo-generate-rpm --version "$CARGO_GENERATE_RPM_VERSION" --locked
 
 DEB="$OUT/blue-onyx-prism_${VERSION}-1_${DEB_ARCH}.deb"
 RPM="$OUT/blue-onyx-prism-${VERSION}-1.${RPM_ARCH}.rpm"

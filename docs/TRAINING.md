@@ -1759,7 +1759,7 @@ is rejected as a duplicate (out of `hard_negatives.json` and the repeats history
 hint a save would reject is accepted, so the object keeps a box. On a two-object suggestion `y` keeps both,
 and the save records `overlaps_checked`. To turn a suggestion down, do anything else: decide the boxes
 yourself, or save with both kept. The twin rules are `liveSuggestions` / `acceptOverlap` in
-`assets/review.js` and `live` / `accept` in `collect/labels/overlaps.rs`.
+`assets/review-rules.js` and `live` / `accept` in `collect/labels/overlaps.rs`.
 
 ### M1 run (MPS)
 

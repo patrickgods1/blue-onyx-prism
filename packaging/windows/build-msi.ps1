@@ -32,19 +32,34 @@ foreach ($f in "blue-onyx-prism-service.exe", "blue-onyx-prism.exe", "blue-onyx-
     if (-not (Test-Path (Join-Path $BinDir $f))) { throw "$f not found in $BinDir" }
 }
 
+# The same rule as scripts/ci/retry.sh, which this script cannot call: it also runs outside Git
+# Bash, and from PowerShell `bash` can be WSL's stub. These two commands reach nuget.org, where one
+# dropped connection would otherwise fail the build.
+function Invoke-WithRetry {
+    param([int]$Attempts, [int]$DelaySeconds, [string]$Command, [string[]]$Arguments)
+    for ($i = 1; $i -le $Attempts; $i++) {
+        & $Command @Arguments | Out-Host
+        $rc = $LASTEXITCODE
+        if ($rc -eq 0) { return }
+        if ($i -lt $Attempts) {
+            Write-Host "::warning::attempt $i of $Attempts failed (exit $rc): $Command $Arguments; retrying in $DelaySeconds s"
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    throw "$Command $Arguments failed $Attempts times (last exit $rc)"
+}
+
 # --- WiX tool + extensions (pinned) -----------------------------------------------------------
 if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
     Write-Host "Installing the wix dotnet tool $WixVersion ..."
-    & dotnet tool install --global wix --version $WixVersion
-    if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed (exit $LASTEXITCODE)" }
+    Invoke-WithRetry -Attempts 4 -DelaySeconds 20 -Command dotnet -Arguments "tool", "install", "--global", "wix", "--version", $WixVersion
     $env:PATH = "$env:PATH;$(Join-Path $env:USERPROFILE '.dotnet\tools')"
 }
 $have = (& wix extension list -g -acceptEula wix7 2>$null) -join "`n"
 foreach ($e in $Extensions) {
     if ($have -notmatch [regex]::Escape("$e $WixVersion")) {
         Write-Host "Adding WiX extension $e/$WixVersion ..."
-        & wix extension add -g -acceptEula wix7 "$e/$WixVersion"
-        if ($LASTEXITCODE -ne 0) { throw "wix extension add $e failed (exit $LASTEXITCODE)" }
+        Invoke-WithRetry -Attempts 4 -DelaySeconds 20 -Command wix -Arguments "extension", "add", "-g", "-acceptEula", "wix7", "$e/$WixVersion"
     }
 }
 

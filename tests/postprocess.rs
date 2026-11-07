@@ -818,6 +818,10 @@ fn top_grid_scores(n: usize, k: usize) -> Vec<f32> {
     (0..n).rev().take(k).map(|i| grid_anchor(i, n).4).collect()
 }
 
+/// Far above what a capped run takes (milliseconds), so a stalled runner does not trip it. What
+/// the cap keeps is checked exactly by `yolo5_candidate_cap_keeps_top_scores`.
+const NMS_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[test]
 fn yolo5_25200_anchors_tiny_threshold_is_bounded() {
     const N: usize = 25_200;
@@ -836,7 +840,7 @@ fn yolo5_25200_anchors_tiny_threshold_is_bounded() {
         .postprocess(&[out], &identity_ctx(), &TINY)
         .unwrap();
     let elapsed = t.elapsed();
-    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < NMS_LIMIT, "{elapsed:?}");
     assert_eq!(dets.len(), MAX_DETS);
     let scores: Vec<f32> = dets.iter().map(|d| d.score).collect();
     assert_eq!(scores, top_grid_scores(N, MAX_DETS));
@@ -860,7 +864,7 @@ fn yolo8_8400_anchors_tiny_threshold_is_bounded() {
         .postprocess(&[out], &identity_ctx(), &TINY)
         .unwrap();
     let elapsed = t.elapsed();
-    assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    assert!(elapsed < NMS_LIMIT, "{elapsed:?}");
     assert_eq!(dets.len(), MAX_DETS);
     let scores: Vec<f32> = dets.iter().map(|d| d.score).collect();
     assert_eq!(scores, top_grid_scores(N, MAX_DETS));

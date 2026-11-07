@@ -9,7 +9,9 @@
 # model is served under, IMG the test image, MIN_COUNT (default 1) the fewest predictions the
 # detection must return at min_confidence 0.2, EXPECT_LABEL (optional) a label that must be among
 # them. A provider that answers success with no boxes (numeric failure, broken preprocessing)
-# fails the test.
+# fails the test. SMOKE_TIMEOUT (default 300) is how many seconds the server gets to answer a
+# first detection; a server that accepts and never answers fails with its log, not by the
+# step's timeout.
 set -euo pipefail
 
 if [ "$#" -lt 4 ]; then
@@ -30,6 +32,9 @@ TMP=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
 LOG="$TMP/blue-onyx-server-$PORT.log"
 CONFIG="$TMP/smoke_config_$PORT.json"
 URL=http://127.0.0.1:$PORT
+DEADLINE=$((SECONDS + ${SMOKE_TIMEOUT:-300}))
+# The server's own request timeout is 15 s by default, so 60 s means it stopped answering.
+http() { curl -s --connect-timeout 5 --max-time 60 "$@"; }
 rm -f "$CONFIG"
 
 "$BIN" --config "$CONFIG" --port "$PORT" "$@" >"$LOG" 2>&1 &
@@ -44,24 +49,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Fail at once (with the log, from the trap) when the server process is gone.
+# Fail at once (with the log, from the trap) when the server process is gone or out of time.
 alive() {
   if ! kill -0 "$PID" 2>/dev/null; then
     echo "the server exited early (see the log below)" >&2
+    exit 1
+  fi
+  if [ "$SECONDS" -ge "$DEADLINE" ]; then
+    echo "no detection within ${SMOKE_TIMEOUT:-300} s (see the log below)" >&2
     exit 1
   fi
 }
 
 for _ in $(seq 1 60); do
   alive
-  curl -sf "$URL/" >/dev/null && break
+  http -f "$URL/" >/dev/null && break
   sleep 2
 done
 
 OUT=""
 for _ in $(seq 1 60); do
   alive
-  OUT=$(curl -s -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/detection" || true)
+  OUT=$(http -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/detection" || true)
   echo "$OUT" | grep -q '"success":true' && break
   sleep 2
 done
@@ -84,11 +93,11 @@ if [ -n "$EXPECT_LABEL" ] && ! printf '%s' "$OUT" | grep -qF -- "\"label\":\"$EX
   exit 1
 fi
 
-LIST=$(curl -s -X POST "$URL/v1/vision/custom/list")
+LIST=$(http -X POST "$URL/v1/vision/custom/list")
 echo "list: $LIST"
 echo "$LIST" | grep -qiF -- "$MODEL_NAME"
 
-OUT=$(curl -s -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/custom/$MODEL_NAME")
+OUT=$(http -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/custom/$MODEL_NAME")
 echo "custom: $OUT"
 echo "$OUT" | grep -q '"success":true'
 alive

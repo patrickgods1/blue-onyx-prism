@@ -9,6 +9,7 @@ on:
       - "deploy/**"
       - "scripts/*systemd*"
       - "scripts/*launchd*"
+      - "scripts/ci/retry.sh"
       - "src/bin/blue_onyx_prism_service.rs"
       - "src/bin/blue_onyx_prism_tray.rs"
       - "Cargo.toml"
@@ -47,7 +48,9 @@ jobs:
           toolchain: 1.99.0 # keep equal to rust-toolchain.toml
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Limits: at least twice the slowest green run of the step (18, 3 and 6 min).
       - name: Build release
+        timeout-minutes: 40
         run: cargo build --release --locked --bins --target ${{ matrix.target }}
       - name: Lint shell scripts
         if: runner.os == 'Linux'
@@ -60,9 +63,11 @@ jobs:
         run: packaging/linux/test-scriptlets.sh
       - name: Build installers
         shell: bash
+        timeout-minutes: 15
         run: packaging/build-installers.sh ${{ matrix.target }} dist
       - name: Smoke-test installers
         shell: bash
+        timeout-minutes: 25
         working-directory: dist
         run: ../packaging/smoke-test-installers.sh .
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

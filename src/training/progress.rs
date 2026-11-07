@@ -1287,6 +1287,178 @@ fn plural(n: u32, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+/// Running the repository's Python scripts from tests. The one place that decides what a missing
+/// interpreter means: a local run skips, a run with `BOP_REQUIRE_PYTHON=1` (CI) fails, so a green
+/// CI cannot mean "nothing ran".
+#[cfg(test)]
+pub(crate) mod test_python {
+    use std::io::Write as _;
+    use std::process::{Command, Output, Stdio};
+
+    const REQUIRE_ENV: &str = "BOP_REQUIRE_PYTHON";
+
+    const HAS_PYTHON: &str = "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)";
+    const HAS_NUMPY: &str = "import numpy";
+
+    /// Whether the variable's value asks for it: anything but unset, empty or `0`.
+    fn is_required(value: Option<&std::ffi::OsStr>) -> bool {
+        value.is_some_and(|v| !v.is_empty() && v != "0")
+    }
+
+    /// The first of `python3`, `python` that runs `probe` with `-I`, as the tests run it. `-I`
+    /// leaves out the user's site-packages: a package counts only in the interpreter's own.
+    fn find(probe: &str) -> Option<&'static str> {
+        ["python3", "python"].into_iter().find(|p| {
+            Command::new(p)
+                .args(["-I", "-c", probe])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+
+    /// What a test does about a missing tool: panic when it is required, else say so and go on.
+    fn missing(required: bool, test: &str, tool: &str) {
+        assert!(
+            !required,
+            "{test}: {tool} not found with `python3` or `python`, and {REQUIRE_ENV} forbids \
+             skipping"
+        );
+        eprintln!("{test} skipped: no {tool}");
+    }
+
+    fn found(probe: &str, test: &str, tool: &str) -> Option<&'static str> {
+        let hit = find(probe);
+        if hit.is_none() {
+            let value = std::env::var_os(REQUIRE_ENV);
+            missing(is_required(value.as_deref()), test, tool);
+        }
+        hit
+    }
+
+    /// A Python 3.8+, or None when the test should skip (never under `BOP_REQUIRE_PYTHON`).
+    pub(crate) fn python3(test: &str) -> Option<&'static str> {
+        found(HAS_PYTHON, test, "Python 3.8+")
+    }
+
+    /// As [`python3`], with numpy in the interpreter's own site-packages.
+    pub(crate) fn python3_with_numpy(test: &str) -> Option<&'static str> {
+        found(HAS_NUMPY, test, "Python with numpy")
+    }
+
+    /// Run `python args...` with `input` on stdin; its output, or a panic stating why it failed.
+    /// The child's stderr is kept for that panic, and a pipe the child closed is not the
+    /// failure: a child that dies early must be reported by what it said, not as a broken pipe in
+    /// the test (scripts are larger than a pipe's buffer). The input goes in from a thread, so
+    /// a child that writes much before reading cannot deadlock against this one.
+    pub(crate) fn run(python: &str, args: &[&str], input: &str) -> Output {
+        let mut child = Command::new(python)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("cannot start {python}: {e}"));
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let input = input.to_string();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("waiting for {python}: {e}"));
+        let wrote = writer.join().expect("the stdin writer does not panic");
+        let said = || {
+            format!(
+                "\n--- stderr ---\n{}\n--- stdout ---\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            )
+        };
+        assert!(
+            out.status.success(),
+            "{python} failed: {}{}",
+            out.status,
+            said()
+        );
+        if let Err(e) = wrote {
+            panic!(
+                "{python} exited with success without reading its input ({e}){}",
+                said()
+            );
+        }
+        out
+    }
+
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn only_a_set_value_requires() {
+            assert!(!is_required(None));
+            assert!(!is_required(Some("".as_ref())));
+            assert!(!is_required(Some("0".as_ref())));
+            assert!(is_required(Some("1".as_ref())));
+            assert!(is_required(Some("true".as_ref())));
+        }
+
+        #[test]
+        fn a_missing_tool_is_a_skip_locally() {
+            missing(false, "this test", "tool");
+        }
+
+        #[test]
+        #[should_panic(expected = "this test: tool not found")]
+        fn a_missing_tool_is_a_failure_when_required() {
+            missing(true, "this test", "tool");
+        }
+
+        /// The child that dies with the input unread, larger than any pipe's buffer: the panic
+        /// states the child's stderr and status, not a broken pipe.
+        #[test]
+        fn a_child_that_exits_early_is_reported_by_its_stderr() {
+            let Some(python) = python3("a_child_that_exits_early") else {
+                return;
+            };
+            let code = "import sys; sys.stderr.write('the real reason\\n'); sys.exit(7)";
+            let input = "x".repeat(4 << 20);
+            let panic = std::panic::catch_unwind(|| run(python, &["-I", "-c", code], &input))
+                .expect_err("the child failed");
+            let text = panic.downcast_ref::<String>().expect("a formatted panic");
+            assert!(text.contains("the real reason"), "{text}");
+            assert!(text.contains('7'), "{text}");
+            assert!(!text.contains("roken pipe"), "{text}");
+        }
+
+        /// Exiting 0 with the input unread is a failure too: the script never saw what it tests.
+        #[test]
+        fn a_child_that_ignores_its_input_is_reported() {
+            let Some(python) = python3("a_child_that_ignores_its_input") else {
+                return;
+            };
+            let input = "x".repeat(4 << 20);
+            let panic =
+                std::panic::catch_unwind(|| run(python, &["-I", "-c", "print('done')"], &input))
+                    .expect_err("the child read nothing");
+            let text = panic.downcast_ref::<String>().expect("a formatted panic");
+            assert!(text.contains("without reading its input"), "{text}");
+            assert!(text.contains("done"), "{text}");
+        }
+
+        #[test]
+        fn input_and_output_larger_than_a_pipe_do_not_deadlock() {
+            let Some(python) = python3("input_and_output_larger_than_a_pipe") else {
+                return;
+            };
+            // Writes everything before reading on: no reader in the test would hang here.
+            let code = "import sys\nsys.stdout.write('y' * (4 << 20))\nsys.stdout.flush()\n\
+                        print(len(sys.stdin.read()))";
+            let out = run(python, &["-I", "-c", code], &"x".repeat(4 << 20));
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.trim_end().ends_with(&(4 << 20).to_string()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2353,22 +2525,6 @@ mod tests {
         assert_eq!(p.stop_text().unwrap(), "converged at epoch 20 (best 5)");
     }
 
-    /// A Python 3 to run the script's code with (`python3`, else `python`); None without one.
-    fn python3() -> Option<&'static str> {
-        ["python3", "python"].into_iter().find(|p| {
-            std::process::Command::new(p)
-                .args([
-                    "-I",
-                    "-c",
-                    "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        })
-    }
-
     /// The script's `Convergence` and `loss_falling` decide as [`convergence_run`] and
     /// [`loss_falling`] (skipped without Python 3).
     #[test]
@@ -2432,27 +2588,14 @@ bend = [[f(s) for s in (8, 10, 12, 15, 20, 25)] for f in sch.lr_lambdas]
 none = ns["bend_lambda_lr"](object(), 10, 0.1)
 print(json.dumps({"runs": out, "falling": falling, "finish": fin, "anneal_finish": af, "bend": [ok, none, bend]}))
 "#;
-        let Some(python) = python3() else {
-            eprintln!("no Python 3 found; parity test skipped");
+        let Some(python) = test_python::python3("convergence parity") else {
             return;
         };
-        let mut child = std::process::Command::new(python)
-            .args(["-I", "-c", code])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
         let input = format!(
             "{script}\n#CASES#\n{}",
             serde_json::json!({"runs": cases, "losses": losses})
         );
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(input.as_bytes()).unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{python} failed");
+        let out = test_python::run(python, &["-I", "-c", code], &input);
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         // The stop file finishes before min_epochs, once.
         assert_eq!(
@@ -2521,14 +2664,9 @@ print(json.dumps({"runs": out, "falling": falling, "finish": fin, "anneal_finish
         let script = include_str!("../../scripts/train_model.py");
         let code = r#"
 import json, sys
-src = sys.stdin.read()  # first: the test is still writing it when numpy is missing
-try:
-    import numpy as np
-except ImportError:
-    print("null")
-    sys.exit(0)
+import numpy as np
 ns = {"__name__": "train_model"}
-exec(compile(src, "train_model.py", "exec"), ns)
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
 logs = []
 ns["log"] = logs.append
 
@@ -2604,28 +2742,11 @@ ns["match_detections"](*ns["rfdetr_boxes"]([pred], [{"boxes": T([[0, 0, 10, 10]]
 print(json.dumps({"ious": ious, "same": same, "mean": mean["iou"], "empty": ns["mean_iou"]([]), "ok": ok["iou"],
                   "after_take": after_take, "failed": failed, "logs": logs, "yolo": yolo, "rfdetr": rfdetr}))
 "#;
-        let Some(python) = python3() else {
-            eprintln!("no Python 3 found; mean IoU test skipped");
+        let Some(python) = test_python::python3_with_numpy("mean IoU") else {
             return;
         };
-        let mut child = std::process::Command::new(python)
-            .args(["-I", "-c", code])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(script.as_bytes()).unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{python} failed");
+        let out = test_python::run(python, &["-I", "-c", code], script);
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        if v.is_null() {
-            eprintln!("{python} has no numpy; mean IoU test skipped");
-            return;
-        }
         let close = |got: &serde_json::Value, want: f64, what: &str| {
             let got = got.as_f64().unwrap();
             assert!((got - want).abs() < 1e-6, "{what}: {got} != {want}");
@@ -2696,23 +2817,10 @@ f.unlink()
 d.rmdir()
 print("RESULT: " + json.dumps(out))
 "#;
-        let Some(python) = python3() else {
-            eprintln!("no Python 3 found; memory gate test skipped");
+        let Some(python) = test_python::python3("export memory gate") else {
             return;
         };
-        let mut child = std::process::Command::new(python)
-            .args(["-I", "-c", code])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(script.as_bytes()).unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{python} failed");
+        let out = test_python::run(python, &["-I", "-c", code], script);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let line = stdout
             .lines()
@@ -2796,24 +2904,10 @@ sys.stdout.flush()
 ns["event"]("batch", epoch=1, epochs=3, batch=2, batches=5, lr=U(warmup))
 print("RESULT: " + json.dumps(out))
 "#;
-        let Some(python) = python3() else {
-            eprintln!("no Python 3 found; learning rate helper test skipped");
+        let Some(python) = test_python::python3("learning rate helpers") else {
             return;
         };
-        let mut child = std::process::Command::new(python)
-            .args(["-I", "-c", code])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(script.as_bytes()).unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{python} failed");
+        let out = test_python::run(python, &["-I", "-c", code], script);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let line = stdout
             .lines()
@@ -3187,26 +3281,12 @@ with redirect_stdout(io.StringIO()):
     sys.stderr = sys.__stderr__
 print("RESULT: " + json.dumps(out))
 "#;
-        let Some(python) = python3() else {
-            eprintln!("no Python 3 found; selected metric test skipped");
+        let Some(python) = test_python::python3("selected metric") else {
             return;
         };
-        let mut child = std::process::Command::new(python)
-            .args(["-I", "-c", code])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write as _;
-            let mut stdin = child.stdin.take().unwrap();
-            let script = include_str!("../../scripts/train_model.py");
-            stdin
-                .write_all(format!("{script}\n#CASES#\n{data}").as_bytes())
-                .unwrap();
-        }
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success(), "{python} failed");
+        let script = include_str!("../../scripts/train_model.py");
+        let input = format!("{script}\n#CASES#\n{data}");
+        let out = test_python::run(python, &["-I", "-c", code], &input);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let line = stdout
             .lines()

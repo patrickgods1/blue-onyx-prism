@@ -13,61 +13,106 @@ env:
   # scripts/ci/smoke.sh: the served model name and a label it must detect on the test image.
   MODEL_NAME: IPcam-general
   EXPECT_LABEL: vehicle
+  # A test that would skip for a missing Python or numpy fails instead (progress::test_python):
+  # green must not mean "nothing ran". Local runs still skip.
+  BOP_REQUIRE_PYTHON: "1"
+  # The same for `node` (tests/js_rules.rs); the hosted images have it.
+  BOP_REQUIRE_NODE: "1"
 
 jobs:
   check:
     name: build-test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # A hung test (e.g. a provider deadlock) must not hold a runner for the default 6 h. A cold
-    # Windows build plus the release build and every test takes about 40 min.
-    timeout-minutes: 90
+    # Windows build plus the release build and every test takes about 40 min (slowest green job
+    # of the last 60 runs: Windows 35, macOS 25, Ubuntu 18). The long steps have their own
+    # limits below, at least twice the slowest green run of that step, so a hang costs one step's
+    # limit; this one catches the sum.
+    timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The Ubuntu runner reached 793 MB free in this job, which failed tests.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: scripts/ci/free_disk.sh
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.99.0 # keep equal to rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # The tests drive scripts/*.py, so the interpreter is chosen here, not by the runner image.
+      # 3.11 is the training env's Python (export::PYTHON_VERSION); 3.11.9 is the last 3.11 that
+      # actions/python-versions has for Windows and macOS arm64 (later ones are source-only).
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11.9"
+      - name: Install Python test packages
+        shell: bash
+        timeout-minutes: 5
+        run: scripts/ci/retry.sh 4 20 python -m pip install --require-hashes --only-binary ":all:" -r scripts/ci/requirements-test.txt
+      - name: Python self-tests
+        shell: bash
+        timeout-minutes: 5
+        run: scripts/ci/python_self_tests.sh
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
+        timeout-minutes: 15
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (OpenVINO only)
         if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
         run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Build (OpenVINO only)
         if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
         run: cargo build --locked --no-default-features
       # Fixture-dependent tests are #[ignore]d here; they run in "Integration tests (real models)".
+      # --no-fail-fast: the first failing test binary must not hide the others.
       - name: Unit tests (no OpenVINO needed)
-        run: cargo test --locked
+        timeout-minutes: 25
+        run: cargo test --locked --no-fail-fast
+      # Also after a failure above: the two builds fail for different reasons.
+      - name: Unit tests (OpenVINO only)
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        timeout-minutes: 15
+        run: cargo test --locked --no-fail-fast --no-default-features
+      - name: Disk space before the release build
+        if: runner.os == 'Linux'
+        run: df -h .
       - name: Build release (all binaries)
+        timeout-minutes: 40
         run: cargo build --locked --release --bins
       # Downloads retry (scripts/ci/retry.sh): the CLI fails fast on a network error by design.
       - name: Fetch OpenVINO runtime
         shell: bash
+        timeout-minutes: 10
         run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- setup-openvino --dest target/release/openvino
       # IPcam-general detects the test image's car and bicycle as "vehicle", so every smoke run
       # can require at least one prediction with that label (a provider that answers success with
       # no boxes fails).
       - name: Download IPcam-general
         shell: bash
+        timeout-minutes: 10
         run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- download-models --name IPcam-general --dir target/release/models
       # RT-DETRv2 (i64 orig_target_sizes input, stretch preprocessing, the CoreML pinned-batch
       # path): without it the RT-DETR parts of the integration tests are skipped. YOLO26 needs an
       # AGPL export and stays a manual release-checklist step.
       - name: Download RT-DETRv2 small
         shell: bash
+        timeout-minutes: 10
         run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- download-models --name rt-detrv2-s --dir target/release/models
       # Each smoke run uses its own port so a slow shutdown of the previous server cannot collide.
       # scripts/ci/smoke.sh <bin> <client> <port> <provider substring> <server args...>
       # MODEL_NAME / EXPECT_LABEL are set for the whole job below.
       - name: Smoke test (OpenVINO CPU)
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           EXE=""
@@ -78,17 +123,20 @@ jobs:
             --cache-dir target/release/cache
       - name: Fetch ONNX Runtime (CPU)
         shell: bash
+        timeout-minutes: 10
         run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- setup-onnxruntime --flavor cpu --dir target/release/onnxruntime
       # The ignored tests need models/, openvino/ and onnxruntime/ (flat, as `--dir` installs it) under
       # BLUE_ONYX_TEST_ROOT, which is where the steps above installed them. A missing fixture fails
       # the test. They run on the debug test binaries (reusing the cargo cache); the runtime is found
       # through the root, not through the binary's location.
       - name: Integration tests (real models)
-        run: cargo test --locked -- --ignored --test-threads=1
+        timeout-minutes: 15
+        run: cargo test --locked --no-fail-fast -- --ignored --test-threads=1
         env:
           BLUE_ONYX_TEST_ROOT: ${{ github.workspace }}/target/release
       - name: Smoke test (ONNX Runtime CPU)
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           EXE=""
@@ -103,6 +151,7 @@ jobs:
       - name: Smoke test (ONNX Runtime CoreML)
         if: runner.os == 'macOS'
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           scripts/ci/smoke.sh target/release/blue-onyx-prism target/release/test-blue-onyx-prism \
@@ -115,17 +164,22 @@ jobs:
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: bash
+        timeout-minutes: 10
         run: scripts/ci/retry.sh 4 20 cargo run --locked --release -- setup-onnxruntime --flavor directml --dir target/release/onnxruntime-directml
       - name: Smoke test (ONNX Runtime DirectML, WARP)
         if: runner.os == 'Windows'
         continue-on-error: true
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           scripts/ci/smoke.sh target/release/blue-onyx-prism.exe target/release/test-blue-onyx-prism.exe \
             32171 "DirectML" \
             --model target/release/models/IPcam-general.onnx --family yolo5 --device ort:directml \
             --onnxruntime-dir target/release/onnxruntime-directml --cache-dir target/release/cache
+      - name: Disk space at the end
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: df -h .
 
   supply-chain:
     name: supply-chain (cargo-deny)

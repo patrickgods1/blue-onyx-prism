@@ -41,6 +41,11 @@
   var hiddenClasses = [];  // collect.hidden_classes: not offered by the pickers and shortcuts
   var catalog = null;      // GET /v1/review/class-catalog
   var shownLabels = [];    // "Show boxes of": empty = every box
+  // The pure rules (review-rules.js, tested against their Rust twins by tests/js_rules.rs).
+  var R = window.ReviewRules;
+  var resolved = R.resolved, isDismissal = R.isDismissal, endDismissal = R.endDismissal;
+  var iou = R.iou, sameObject = R.sameObject;
+  var markRejected = R.markRejected, markDuplicate = R.markDuplicate;
 
   var $ = function (id) { return document.getElementById(id); };
   var canvas = $('rv-canvas');
@@ -290,15 +295,6 @@
     dirty = true;
   }
 
-  // What saving makes of a box (mirrors labels::resolve_pending).
-  function resolved(b) {
-    if (b.state !== 'pending') return b.state;
-    if (b.source === 'human') return 'added';
-    if (b.source === 'auto') return 'accepted';
-    if (b.origin === 'prediction') return 'accepted';
-    return (b.triage === 'accept' && !b.auto_label) ? 'accepted' : 'rejected';
-  }
-
   // A pending model box saving rejects unless accepted (suppressed, below threshold, ...).
   function isHint(b) { return b.state === 'pending' && resolved(b) === 'rejected'; }
 
@@ -312,9 +308,6 @@
   // A flagged box a save would make a label: it needs a decision first. Twin of
   // `labels::needs_decision`, which refuses the save.
   function mustDecide(b) { return isReview(b) && resolved(b) === 'accepted'; }
-
-  // A reason that marks a dismissal (labels::bulk::is_dismissal).
-  function isDismissal(reason) { return reason === 'auto_dismissed' || reason === 'spot_dismissed'; }
 
   // Set aside by a labelers run for its score or its spot, nobody judged it
   // (labels::LabelBox::is_dismissed).
@@ -336,10 +329,6 @@
   function dismissedCount() {
     return boxes().filter(function (b) { return isDismissed(b) && !isUnwanted(b); }).length;
   }
-
-  // A reviewer's decision ends a dismissal: then the box is a label or a negative like any other
-  // (labels::normalize does the same).
-  function endDismissal(b) { if (isDismissal(b.reason)) delete b.reason; }
 
   // A pending box the labelers think is real (`likely`: a score and a VLM yes).
   function isLikely(b) { return b.state === 'pending' && !!b.likely && !isUnwanted(b); }
@@ -428,17 +417,10 @@
   function visible() { return classes.filter(function (c) { return hiddenClasses.indexOf(c) < 0; }); }
 
   // A "don't want" class (collect.hidden_classes; case-insensitive).
-  function isHiddenClass(label) {
-    var l = String(label || '').trim().toLowerCase();
-    return hiddenClasses.some(function (h) { return h.toLowerCase() === l; });
-  }
+  function isHiddenClass(label) { return R.isHiddenClass(label, hiddenClasses); }
 
-  // A box of an unwanted class: of a hidden class, or rejected and of no class of the list (the
-  // server's other_class rejects). Not drawn, listed or stepped through (display only; the file
-  // keeps it). Other boxes of no listed class stay visible: a save would refuse them.
-  function isUnwanted(b) {
-    return isHiddenClass(b.label) || (b.state === 'rejected' && classes.indexOf(b.label) < 0);
-  }
+  // A box of an unwanted class (R.isUnwanted): not drawn, listed or stepped through.
+  function isUnwanted(b) { return R.isUnwanted(b, classes, hiddenClasses); }
 
   // "Show boxes of": a box of another class is dimmed (display only; saving keeps every box).
   function isShown(b) {
@@ -449,86 +431,8 @@
 
   function round1(v) { return Math.round(v * 10) / 10; }
 
-  function iou(a, b) {
-    var x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]), x1 = Math.min(a[2], b[2]), y1 = Math.min(a[3], b[3]);
-    var inter = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
-    var u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter;
-    return u > 0 ? inter / u : 0;
-  }
-
-  var VEHICLES = ['car', 'truck', 'bus', 'van'];
-
-  // Two labels that can name one object: the same class, or two vehicle classes.
-  function sameObject(a, b) {
-    return a === b || (VEHICLES.indexOf(a) >= 0 && VEHICLES.indexOf(b) >= 0);
-  }
-
-  // How much of the smaller box lies inside the other (labels::inside_share).
-  function insideShare(a, b) {
-    var inter = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
-    var small = Math.min(Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]), Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]));
-    return small > 0 ? inter / small : 0;
-  }
-
-  var STACK_IOU = 0.7, OVERLAP_IOU = 0.5, NESTED_SHARE = 0.8;   // labels/stacks.rs
-
-  // Stacked boxes: the boxes (not rejected, not unwanted) of one object, IoU >= STACK_IOU and a
-  // label of the same object, grouped as NMS would. A group of 2 or more keeps one: a drawn box,
-  // else a reviewer-edited one, else an accepted one, else a pending one (a hint saving rejects
-  // last: as keeper it would leave the object with no box), then the highest score. `overlaps`:
-  // pairs of live boxes of one object outside a stack, IoU >= OVERLAP_IOU or the smaller
-  // >= NESTED_SHARE inside the larger; those are the reviewer's, no rule picks.
-  // {groups: [{members, keeper}], of: {index: group}, overlaps: [[i, j]], near: {index: partner}}.
-  // Twin of labels/stacks.rs (`stacks`, `rank`, `overlaps`): keep the two in step. One difference,
-  // on purpose: a live box of no listed class counts here (the page shows it, a save refuses it
-  // until it is relabelled), the server skips it. `list`: other boxes than the frame's own.
-  function dupGroups(list) {
-    var bs = list || boxes(), n = bs.length, parent = [], i, j;
-    var live = function (b) { return b.state !== 'rejected' && !isUnwanted(b); };
-    var root = function (x) { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
-    for (i = 0; i < n; i++) parent.push(i);
-    for (i = 0; i < n; i++) {
-      if (!live(bs[i])) continue;
-      for (j = i + 1; j < n; j++) {
-        if (live(bs[j]) && sameObject(bs[i].label, bs[j].label) && iou(bs[i].bbox, bs[j].bbox) >= STACK_IOU) parent[root(j)] = root(i);
-      }
-    }
-    var byRoot = {}, out = { groups: [], of: {}, overlaps: [], near: {} };
-    for (i = 0; i < n; i++) {
-      if (live(bs[i])) (byRoot[root(i)] = byRoot[root(i)] || []).push(i);
-    }
-    var rank = function (k) {
-      var b = bs[k], tier;
-      if (b.state === 'added') tier = 40;
-      else if (b.state === 'accepted') tier = (b.orig_bbox || b.model_label) ? 30 : 20;
-      else tier = resolved(b) === 'rejected' ? 0 : 10;
-      return tier + (b.score != null ? b.score : 0);
-    };
-    Object.keys(byRoot).forEach(function (r) {
-      var m = byRoot[r];
-      if (m.length < 2) return;
-      var g = { members: m, keeper: m.reduce(function (a, k) { return rank(k) > rank(a) ? k : a; }, m[0]) };
-      out.groups.push(g);
-      m.forEach(function (k) { out.of[k] = g; });
-    });
-    var closest = {};
-    var note = function (a, b, v) {
-      if (closest[a] == null || v > closest[a]) { closest[a] = v; out.near[a] = b; }
-    };
-    for (i = 0; i < n; i++) {
-      if (!live(bs[i])) continue;
-      for (j = i + 1; j < n; j++) {
-        if (!live(bs[j]) || !sameObject(bs[i].label, bs[j].label) || (out.of[i] && out.of[i] === out.of[j])) continue;
-        var v = iou(bs[i].bbox, bs[j].bbox);
-        if (v >= OVERLAP_IOU || insideShare(bs[i].bbox, bs[j].bbox) >= NESTED_SHARE) {
-          out.overlaps.push([i, j]);
-          note(i, j, v);
-          note(j, i, v);
-        }
-      }
-    }
-    return out;
-  }
+  // Stacked and overlapping boxes (R.dupGroups). `list`: other boxes than the frame's own.
+  function dupGroups(list) { return R.dupGroups(list || boxes(), classes, hiddenClasses); }
 
   // The box of `i`'s stack it is compared with: the keeper, or (for the keeper) the most
   // overlapping other one. Outside a stack, the box it overlaps most.
@@ -547,39 +451,8 @@
 
   // ---- overlap suggestions ------------------------------------------------------------------
 
-  function sameBbox(a, b) {
-    return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
-  }
-
-  // The suggestions a reviewer can act on now, strongest first (as stored): of those the server
-  // calls live (`overlap_live`: labels/overlaps.rs `live`, which also knows a mapped spelling from a
-  // relabel), the ones still true after what happened on this page. The pair must still be open
-  // under its two bboxes (`dupGroups`: a moved, relabelled or rejected box ends it), a box to drop must
-  // not have become a drawn, moved or relabelled one, and a two-object suggestion not be accepted yet.
-  // [{index, s, a, b, drop, keep}]: box indices; drop and keep -1 for two objects. Reads `dups`.
-  // Twin of labels/overlaps.rs `live`: keep the two in step.
-  function liveSuggestions() {
-    var out = [];
-    var list = cur && cur.labels.overlap_suggestions, ok = cur && cur.overlap_live;
-    if (!list || !ok || cur.labels.overlaps_checked) return out;
-    var bs = boxes();
-    ok.forEach(function (n) {
-      var s = list[n];
-      if (!s || s._done) return;
-      (dups.overlaps || []).some(function (o) {
-        var i = o[0], j = o[1], a, b;
-        if (sameBbox(bs[i].bbox, s.a) && sameBbox(bs[j].bbox, s.b)) { a = i; b = j; }
-        else if (sameBbox(bs[j].bbox, s.a) && sameBbox(bs[i].bbox, s.b)) { a = j; b = i; }
-        else return false;
-        var drop = s.verdict === 'drop_a' ? a : (s.verdict === 'drop_b' ? b : -1);
-        var d = bs[drop];
-        if (d && (d.source === 'human' || d.orig_bbox || d._relabelled)) return false;
-        out.push({ index: n, s: s, a: a, b: b, drop: drop, keep: drop < 0 ? -1 : (drop === a ? b : a) });
-        return true;
-      });
-    });
-    return out;
-  }
+  // The suggestions a reviewer can act on now (R.liveSuggestions). Reads `dups`.
+  function liveSuggestions() { return R.liveSuggestions(cur, dups); }
 
   // The suggestion on screen: the one about the selected box, else the strongest.
   function shownSuggestion() {
@@ -597,34 +470,20 @@
     return i === g.a || i === g.b ? 'keep' : '';
   }
 
-  // A hint saving would reject stays through the save: accepted, so the object keeps a box.
-  function keepThrough(b) {
-    if (b.state === 'pending' && resolved(b) === 'rejected') b.state = 'accepted';
-    b._checked = true;
-  }
-
   // `y`: the suggestion on screen. A drop rejects the box as a duplicate and keeps the other through
   // the save; two objects keeps both (the save then records `overlaps_checked`). One undo step.
-  // Twin of labels/overlaps.rs `accept`: keep the two in step.
+  // The rule is R.acceptOverlap.
   function acceptOverlap() {
     if (!cur) return;
     dups = dupGroups();
     suggestions = liveSuggestions();
-    var g = shownSuggestion(), bs = boxes();
+    var g = shownSuggestion();
     if (!g) { say('No overlap suggestion on this frame.'); return; }
     snapshot();
-    var text;
-    if (g.drop >= 0) {
-      keepThrough(bs[g.keep]);
-      markDuplicate(bs[g.drop]);
-      text = 'Box ' + (g.drop + 1) + ' rejected as a duplicate of box ' + (g.keep + 1) + ' (z undoes).';
-    } else {
-      keepThrough(bs[g.a]);
-      keepThrough(bs[g.b]);
-      g.s._done = true;
-      text = 'Boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + ' kept as two objects (z undoes).';
-    }
-    if (cur.labels.empty_confirmed) cur.labels.empty_confirmed = false;
+    R.acceptOverlap(cur.labels, g);
+    var text = g.drop >= 0
+      ? 'Box ' + (g.drop + 1) + ' rejected as a duplicate of box ' + (g.keep + 1) + ' (z undoes).'
+      : 'Boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + ' kept as two objects (z undoes).';
     dups = dupGroups();
     suggestions = liveSuggestions();
     var next = suggestions.length ? suggestionBox(suggestions[0]) : nextUndecided(-1);
@@ -1586,19 +1445,6 @@
     sayProgress();
   }
 
-  // Every rejection by the reviewer goes through here (no undo step, no move: the callers).
-  // `why`: the box's `reject_reason` ('duplicate', ...); none keeps an earlier one. A rejected
-  // box is not "unsure".
-  function markRejected(b, why) {
-    b.state = 'rejected';
-    b._checked = true;
-    delete b.difficult;
-    endDismissal(b);
-    // A parked accept taken back is a look like any other (labels::normalize does the same).
-    if (b.reason === 'parked_spot') { delete b.reason; delete b.parked; }
-    if (why) b.reject_reason = why;
-  }
-
   // Reject box `i` (`why`: the reason, see markRejected), then the next box; without a reason,
   // the decision bar offers the reason chips for a few seconds (never required: rejecting stays
   // one key).
@@ -1711,25 +1557,10 @@
   }
 
   // The non-drawn boxes of the stacks that are not their keeper.
-  function dupDrops(d) {
-    var out = [];
-    d.groups.forEach(function (g) {
-      g.members.forEach(function (k) { if (k !== g.keeper && boxes()[k].source !== 'human') out.push(k); });
-    });
-    return out;
-  }
+  function dupDrops(d) { return R.dupDrops(d, boxes()); }
 
-  // Of those, the pending ones: what saving or Shift+A would otherwise accept as new duplicates
-  // (a box the reviewer accepted stays; labels/stacks.rs `reject_pending_stacked`).
-  function pendingDupDrops(d) {
-    return dupDrops(d).filter(function (k) { return boxes()[k].state === 'pending'; });
-  }
-
-  // A duplicate rejected by rule rather than by hand: the provenance says so, an older one stays.
-  function markDuplicate(b) {
-    markRejected(b, 'duplicate');
-    if (!b.reason) b.reason = 'duplicate';
-  }
+  // Of those, the pending ones: what saving or Shift+A would otherwise accept as new duplicates.
+  function pendingDupDrops(d) { return R.pendingDupDrops(d, boxes()); }
 
   // Shift+U: keep the best box of each stack, reject the others as duplicates (one undo step).
   function rejectDuplicates() {
