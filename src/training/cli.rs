@@ -3,7 +3,9 @@
 //! row (`run`), past runs (`list`), removing the training environment (`remove-env`), footage
 //! import (`import`) and auto-labelling (`autolabel`, also the self-training re-label).
 
-use super::capability::{self, Capability};
+#[cfg(test)]
+use super::capability;
+use super::capability::Capability;
 use super::compare::{self, CompareRun};
 use super::dataset::{self, Excluded, SceneFilter};
 use super::estimate;
@@ -1023,30 +1025,24 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             for m in &models {
                 let (family, size) = recipe::parse_label(m)
                     .with_context(|| format!("unknown model label '{m}' (e.g. yolo26n, rfdetr-nano, rt-detrv2-s, dfine-s)"))?;
-                let mut r = TrainRecipe::new(family, size)?;
-                r.epochs = epochs.unwrap_or(config.training.epochs_for(family));
-                r.patience =
-                    patience.unwrap_or_else(|| config.training.patience_for(family).min(r.epochs));
-                r.patience_recommended = patience.is_none() && config.training.patience.is_none();
-                if let Some(i) = imgsz {
-                    r.imgsz = i;
-                }
-                r.batch = batch.unwrap_or_else(|| {
-                    capability::Capability::family(&cap, family)
-                        .and_then(|f| f.sizes.iter().find(|s| s.size == size))
-                        .and_then(|s| s.suggested_batch)
-                        .unwrap_or(r.batch)
-                        .min(16)
-                });
-                config.training.apply_lr(
-                    &mut r,
-                    lr,
-                    lr_schedule.as_deref().and_then(recipe::LrSchedule::parse),
-                    lr_min_factor,
-                );
-                r.select_metric = config.training.select_metric_for(select_metric);
-                r.augment = augment;
-                r.multi_scale = recipe::MultiScale::parse(&multi_scale).unwrap_or_default();
+                let r = recipe::build_recipe(
+                    family,
+                    size,
+                    &recipe::RecipeInputs {
+                        epochs,
+                        patience,
+                        imgsz,
+                        batch,
+                        lr,
+                        lr_schedule: lr_schedule.as_deref().and_then(recipe::LrSchedule::parse),
+                        lr_min_factor,
+                        select_metric,
+                        augment,
+                        multi_scale: recipe::MultiScale::parse(&multi_scale).unwrap_or_default(),
+                    },
+                    &config.training,
+                    &cap,
+                )?;
                 for (scene, i) in scenes.iter().flat_map(|s| (0..seeds).map(move |i| (s, i))) {
                     let req = TrainRequest {
                         recipe: r.clone(),
@@ -1083,6 +1079,9 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 register: !no_register,
                 benchmark: !no_register && !no_benchmark,
             });
+            if !no_register && !no_benchmark {
+                eprintln!("{BASELINE_NOTE}");
+            }
             let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
             let svc = TrainingService::start(
                 Arc::new(crate::resources::export::SystemRunner),
@@ -1318,6 +1317,9 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 register: !no_register,
                 benchmark: !no_register && !no_benchmark,
             });
+            if !no_register && !no_benchmark {
+                eprintln!("{BASELINE_NOTE}");
+            }
             let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
             let svc = TrainingService::start(
                 Arc::new(crate::resources::export::SystemRunner),
@@ -1792,6 +1794,10 @@ fn read_sources(
     };
     Ok((sources, opts))
 }
+
+/// Printed before a run that benchmarks: `CliHooks` has no `baseline`, so the comparison with the
+/// current default model happens on the Train tab only.
+const BASELINE_NOTE: &str = "note: the comparison with the current default model is on the Train tab only; this command benchmarks the new model alone";
 
 /// The CLI's [`Hooks`]: the config file is edited like `add-model` does; the benchmark runs in
 /// this process with its own runtimes.

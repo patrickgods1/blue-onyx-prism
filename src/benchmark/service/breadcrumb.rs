@@ -3,10 +3,11 @@
 //! with the process alive. A file still there at the next start therefore says what a run last
 //! touched before the process or the machine went away; it does not say why.
 //!
-//! The running process holds an OS lock on the file (released when it dies), so a run in another
-//! process, such as a `train` CLI benchmarking its model, is never taken for one that was
-//! interrupted. Nothing here can fail a benchmark: a data root that cannot be written costs the
-//! breadcrumb and one warning.
+//! The service's runs and the `benchmark` CLI's sweeps write it alike. The running process holds
+//! an OS lock on the file (released when it dies), so a run in another process, such as a CLI
+//! sweep or a `train` CLI benchmarking its model, is never taken for one that was interrupted.
+//! Nothing here can fail a benchmark: a data root that cannot be written costs the breadcrumb
+//! and one warning.
 
 use crate::sync::LockExt;
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,7 @@ fn path_in(data_root: &Path) -> PathBuf {
 
 /// The breadcrumb of one run, removed when it is dropped (also by a panic: the process lives).
 #[derive(Debug)]
-pub(super) struct Trail {
+pub(crate) struct Trail {
     path: PathBuf,
     state: Mutex<TrailState>,
 }
@@ -62,7 +63,7 @@ enum TrailState {
 }
 
 impl Trail {
-    pub(super) fn new(data_root: &Path) -> Self {
+    pub(crate) fn new(data_root: &Path) -> Self {
         Self {
             path: path_in(data_root),
             state: Mutex::new(TrailState::Idle),
@@ -70,7 +71,7 @@ impl Trail {
     }
 
     /// `model` is about to run on `device`: on the disk when this returns.
-    pub(super) fn note(&self, device: &str, model: &str) {
+    pub(crate) fn note(&self, device: &str, model: &str) {
         let crumb = Breadcrumb {
             device: device.to_string(),
             model: model.to_string(),
@@ -176,7 +177,7 @@ impl Drop for Trail {
 
 /// The file `data_root` holds with no run behind it: None when absent, or held by a live run.
 /// Unreadable content is dropped: there is nothing to report from it.
-pub(super) fn left_behind(data_root: &Path) -> Option<Breadcrumb> {
+pub(crate) fn left_behind(data_root: &Path) -> Option<Breadcrumb> {
     let path = path_in(data_root);
     let mut file = File::open(&path).ok()?;
     file.try_lock().ok()?;

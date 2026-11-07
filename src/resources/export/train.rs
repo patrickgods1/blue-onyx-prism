@@ -140,9 +140,14 @@ impl TrainPaths {
         Self::new(&config.data_root(), config.data_path(&config.models_dir))
     }
 
-    /// Directory the base weights `res` are installed in: the export's weights directory for the
-    /// Ultralytics pins (shared with exports), `tools/train-weights/<key>` otherwise.
+    /// Directory the weights `res` are installed in: `tools/train-weights/<key>` for a labeler
+    /// checkpoint (`autolabel:` ids; RF-DETR's training base pin keeps its training directory),
+    /// the export's weights directory for the Ultralytics pins (shared with exports),
+    /// `tools/train-weights/<id without prefix>` otherwise.
     pub fn weights_dir(&self, res: &Resource) -> PathBuf {
+        if res.id.starts_with(catalog::AUTOLABEL_PREFIX) {
+            return self.weights.join(catalog::install_key(res));
+        }
         match res.model_name() {
             Some(name) => self.export.weights_of(name),
             None => self.weights.join(
@@ -440,6 +445,47 @@ mod train_env_tests {
         let d = std::env::temp_dir().join(format!("bop-train-env-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn resource(id: &'static str, provides: catalog::Provides) -> Resource {
+        Resource {
+            id,
+            kind: ResourceKind::Model,
+            version: "1",
+            platform: None,
+            parts: &[],
+            dest: "x",
+            provides,
+            title: "t",
+            description: "d",
+            license: "l",
+        }
+    }
+
+    #[test]
+    fn weights_dir_by_id_prefix() {
+        let paths = TrainPaths::new(Path::new("/root"), PathBuf::from("/root/models"));
+        // A labeler checkpoint: `tools/train-weights/<key>`.
+        let labeler = resource("autolabel:mm-gdino-tiny", catalog::Provides::CudaLibs);
+        assert_eq!(
+            paths.weights_dir(&labeler),
+            paths.weights.join("mm-gdino-tiny")
+        );
+        // Not a labeler and not a model: the id without the training-base prefix.
+        let base = resource("train-base:rfdetr-l", catalog::Provides::CudaLibs);
+        assert_eq!(paths.weights_dir(&base), paths.weights.join("rfdetr-l"));
+        // A model pin: the export's weights directory.
+        let model = resource(
+            "model:yolo26s",
+            catalog::Provides::Model {
+                name: "yolo26s",
+                family: crate::model::ModelFamilyKind::Yolo26,
+            },
+        );
+        assert_eq!(
+            paths.weights_dir(&model),
+            paths.export.weights_of("yolo26s")
+        );
     }
 
     #[test]

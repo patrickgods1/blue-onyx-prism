@@ -34,11 +34,7 @@ pub fn is_cancel(e: &anyhow::Error) -> bool {
 /// Where a labeler checkpoint is installed: `tools/train-weights/<key>` (RF-DETR's training base
 /// pin keeps its training directory).
 pub fn weights_dir(paths: &TrainPaths, res: &Resource) -> PathBuf {
-    if res.id.starts_with(catalog::AUTOLABEL_PREFIX) {
-        paths.weights.join(catalog::install_key(res))
-    } else {
-        paths.weights_dir(res)
-    }
+    paths.weights_dir(res)
 }
 
 /// Where pinned footage is installed: `<data root>/train-data/<key>`.

@@ -36,6 +36,10 @@ struct TrainFake {
     fail_lines: Vec<&'static str>,
     /// Report these classes instead of the dataset's.
     wrong_classes: Option<Vec<String>>,
+    /// Report this service family instead of the recipe's.
+    wrong_family: Option<&'static str>,
+    /// Finish without the `done` report.
+    no_done_report: bool,
     /// Run out of GPU memory when `--batch` is above this, after `oom_epochs` finished epochs.
     oom_above: Option<u32>,
     oom_epochs: u32,
@@ -200,6 +204,7 @@ impl CommandRunner for TrainFake {
                 .collect()
         });
         let family = match arg_after(cmd, "--family").unwrap().to_str().unwrap() {
+            _ if self.wrong_family.is_some() => self.wrong_family.unwrap(),
             "yolo26" => "yolo26",
             "yolo11" | "yolov8" => "yolo8",
             "rfdetr" => "rfdetr",
@@ -208,6 +213,9 @@ impl CommandRunner for TrainFake {
         std::fs::write(out.join(format!("{name}.onnx")), vec![1u8; 4096]).unwrap();
         let names: String = classes.iter().map(|c| format!("  - {c}\n")).collect();
         std::fs::write(out.join(format!("{name}.yaml")), format!("NAMES:\n{names}")).unwrap();
+        if self.no_done_report {
+            return Ok(());
+        }
         on_line(&format!(
             "@train {}",
             serde_json::json!({"event": "done", "onnx": out.join(format!("{name}.onnx")), "yaml": "y",
@@ -1069,6 +1077,51 @@ fn a_class_mismatch_from_the_trainer_is_an_error() {
     let e = r.unwrap_err();
     assert!(e.message.contains("classes"), "{}", e.message);
     assert!(!t.0.join("models/night-yolo26n-test.onnx").exists());
+}
+
+#[test]
+fn every_refused_report_leaves_no_staging_and_installs_nothing() {
+    let cases = [
+        (
+            "no-done",
+            TrainFake {
+                no_done_report: true,
+                ..TrainFake::new()
+            },
+            "without reporting",
+        ),
+        (
+            "family",
+            TrainFake {
+                wrong_family: Some("rfdetr"),
+                ..TrainFake::new()
+            },
+            "expected yolo26",
+        ),
+        (
+            "classes",
+            TrainFake {
+                wrong_classes: Some(vec!["cat".into()]),
+                ..TrainFake::new()
+            },
+            "has classes",
+        ),
+    ];
+    for (tag, fake, says) in cases {
+        let t = tmp(tag);
+        let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+        let hooks = RecHooks::default();
+        let (r, _) = run(&j, &fake, &hooks, &AtomicBool::new(false));
+        let e = r.unwrap_err();
+        assert!(e.message.contains(says), "{tag}: {}", e.message);
+        let models = t.0.join("models");
+        assert!(
+            !models.join(".night-yolo26n-test.train-staging").exists(),
+            "{tag}: staging left"
+        );
+        assert!(!models.join("night-yolo26n-test.onnx").exists(), "{tag}");
+        assert!(hooks.registered.lock().unwrap().is_empty(), "{tag}");
+    }
 }
 
 #[test]

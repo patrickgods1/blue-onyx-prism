@@ -625,6 +625,8 @@ blue-onyx-prism benchmark --all-devices --report report.html  # standalone HTML 
 blue-onyx-prism benchmark --list-datasets
 ```
 
+A sweep over two or more GPU devices is refused unless you add `--confirm-gpus`. Each runtime of a card counts (`openvino:gpu` and `ort:directml` on the same UHD 630 are two), because the spec does not say which share a card. Such a sweep hung a GTX 1070 Ti + UHD 630 machine twice. The web UI asks the same question before it starts. `--apply`, `--apply-threshold`, `--threshold-search` and `--report` sweep every device.
+
 Or open **Benchmark** in the web UI: choose datasets, models, devices and settings, **Start**
 (runs in the background, one run at a time, cancelable, live progress and ETA), then **Use <device>**
 per row or **Apply recommended devices to all models** (offers a restart). Benchmarking while serving

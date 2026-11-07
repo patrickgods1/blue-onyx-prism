@@ -9,117 +9,9 @@
 
 use super::{ANIMALS, Category, DEFAULT_SYNONYMS, VEHICLES, synonyms};
 use crate::config::Config;
+pub use crate::model::coco::{COCO_ALIASES, COCO_NAMES, coco_class, same_class};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-
-/// The 80 COCO class names (RF-DETR L's label space), as `scripts/autolabel.py` spells them.
-pub const COCO_NAMES: [&str; 80] = [
-    "person",
-    "bicycle",
-    "car",
-    "motorcycle",
-    "airplane",
-    "bus",
-    "train",
-    "truck",
-    "boat",
-    "traffic light",
-    "fire hydrant",
-    "stop sign",
-    "parking meter",
-    "bench",
-    "bird",
-    "cat",
-    "dog",
-    "horse",
-    "sheep",
-    "cow",
-    "elephant",
-    "bear",
-    "zebra",
-    "giraffe",
-    "backpack",
-    "umbrella",
-    "handbag",
-    "tie",
-    "suitcase",
-    "frisbee",
-    "skis",
-    "snowboard",
-    "sports ball",
-    "kite",
-    "baseball bat",
-    "baseball glove",
-    "skateboard",
-    "surfboard",
-    "tennis racket",
-    "bottle",
-    "wine glass",
-    "cup",
-    "fork",
-    "knife",
-    "spoon",
-    "bowl",
-    "banana",
-    "apple",
-    "sandwich",
-    "orange",
-    "broccoli",
-    "carrot",
-    "hot dog",
-    "pizza",
-    "donut",
-    "cake",
-    "chair",
-    "couch",
-    "potted plant",
-    "bed",
-    "dining table",
-    "toilet",
-    "tv",
-    "laptop",
-    "mouse",
-    "remote",
-    "keyboard",
-    "cell phone",
-    "microwave",
-    "oven",
-    "toaster",
-    "sink",
-    "refrigerator",
-    "book",
-    "clock",
-    "vase",
-    "scissors",
-    "teddy bear",
-    "hair drier",
-    "toothbrush",
-];
-
-/// Other spellings of COCO classes (`scripts/autolabel.py` `ALIASES`; the VOC names of the
-/// bundled `coco_classes.yaml` among them).
-pub const COCO_ALIASES: [(&str, &str); 9] = [
-    ("motorbike", "motorcycle"),
-    ("people", "person"),
-    ("pedestrian", "person"),
-    ("bike", "bicycle"),
-    ("sofa", "couch"),
-    ("tvmonitor", "tv"),
-    ("aeroplane", "airplane"),
-    ("pottedplant", "potted plant"),
-    ("diningtable", "dining table"),
-];
-
-/// The COCO name of a class (aliases applied, case-insensitive), or None: RF-DETR L can propose
-/// it. Mirrors `coco_class` of `scripts/autolabel.py`.
-pub fn coco_class(label: &str) -> Option<&'static str> {
-    let l = label.to_lowercase();
-    let n = COCO_ALIASES
-        .iter()
-        .find(|(a, _)| *a == l)
-        .map_or(l.as_str(), |(_, c)| c);
-    COCO_NAMES.iter().copied().find(|c| *c == n)
-}
 
 /// A configured model's classes, as the catalog answers them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -176,13 +68,6 @@ pub fn model_classes(config: &Config) -> Vec<ModelClasses> {
 
 fn contains_ci(list: &[String], name: &str) -> bool {
     list.iter().any(|x| x.eq_ignore_ascii_case(name))
-}
-
-/// One class under two spellings: equal ignoring case, or the same COCO class through the
-/// aliases (a VOC-spelled model's `motorbike` is the list's `motorcycle`). Also maps a detection
-/// label onto the class list ([`super::triage::map_label`]).
-pub(crate) fn same_class(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b) || coco_class(a).is_some_and(|c| coco_class(b) == Some(c))
 }
 
 fn contains_same(list: &[String], name: &str) -> bool {
@@ -361,60 +246,6 @@ impl ClassCatalog {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-
-    const SCRIPT: &str = include_str!("../../../scripts/autolabel.py");
-
-    /// The `{...}` literal after `NAME = ` in the script.
-    fn py_literal(name: &str) -> &'static str {
-        let start = SCRIPT
-            .find(&format!("\n{name} = {{"))
-            .unwrap_or_else(|| panic!("{name} not in autolabel.py"));
-        let rest = &SCRIPT[start..];
-        let open = rest.find('{').unwrap();
-        let close = rest.find('}').unwrap();
-        &rest[open + 1..close]
-    }
-
-    /// The double-quoted strings of a Python literal.
-    fn strings(lit: &str) -> Vec<String> {
-        lit.split('"')
-            .skip(1)
-            .step_by(2)
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[test]
-    fn the_alias_map_and_coco_names_match_the_script() {
-        let s = strings(py_literal("ALIASES"));
-        assert_eq!(s.len() % 2, 0);
-        let py: BTreeMap<String, String> =
-            s.chunks(2).map(|p| (p[0].clone(), p[1].clone())).collect();
-        let rs: BTreeMap<String, String> = COCO_ALIASES
-            .iter()
-            .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
-            .collect();
-        assert_eq!(py, rs);
-        let py: BTreeSet<String> = strings(py_literal("COCO_NAMES")).into_iter().collect();
-        let rs: BTreeSet<String> = COCO_NAMES.iter().map(|s| (*s).to_string()).collect();
-        assert_eq!(py.len(), 80);
-        assert_eq!(py, rs);
-    }
-
-    #[test]
-    fn coco_class_applies_aliases() {
-        assert_eq!(coco_class("motorbike"), Some("motorcycle"));
-        assert_eq!(coco_class("Person"), Some("person"));
-        assert_eq!(coco_class("TVMonitor"), Some("tv"));
-        assert_eq!(coco_class("raccoon"), None);
-        assert_eq!(coco_class("vehicle"), None);
-        // The bundled (VOC-spelled) COCO-80 list: every name maps onto a COCO name.
-        let unmapped: Vec<String> = crate::model::classes::coco80()
-            .into_iter()
-            .filter(|n| coco_class(n).is_none())
-            .collect();
-        assert!(unmapped.is_empty(), "{unmapped:?}");
-    }
 
     #[test]
     fn alias_spellings_are_one_class() {

@@ -32,6 +32,8 @@ bop_create_account
 chown -R root:wheel "$INSTALL_DIR"
 chmod -R go-w "$INSTALL_DIR"
 
+# Kept data of an earlier _blueonyx with another id: before bop_create_dirs, which hides it.
+bop_own_kept_dirs
 bop_create_dirs
 if [ -d "$INSTALL_DIR/models" ]; then
   # Bundled / previously installed models; files already in the data root win.

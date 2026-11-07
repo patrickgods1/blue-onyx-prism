@@ -301,6 +301,12 @@ fn request_timed_out_before_submit_is_never_submitted() {
         "{}",
         dropped.message
     );
+    assert_eq!(
+        dropped.dropped,
+        Some(crate::metrics::DropReason::Timeout),
+        "the drop is typed, not only worded"
+    );
+    assert_eq!(got[0].0.dropped, None);
     assert_eq!(label(&got[2].0), "c2");
     assert_eq!(h.script.submits(), 2);
     h.stop();

@@ -48,20 +48,8 @@ mod plan;
 mod reload_tests;
 
 pub use crate::backend::RuntimeInfo;
+pub use crate::model::name::normalize_name;
 pub use plan::{ModelPlan, PlanOutcome, PlanRuntimes, plan_model, plan_models};
-
-/// Lowercase and strip a trailing `.onnx` / `.xml` (Blue Iris sends file stems, users may not).
-pub fn normalize_name(name: &str) -> String {
-    let lower = name.trim().to_ascii_lowercase();
-    for ext in [".onnx", ".xml"] {
-        if let Some(stripped) = lower.strip_suffix(ext)
-            && !stripped.is_empty()
-        {
-            return stripped.to_string();
-        }
-    }
-    lower
-}
 
 /// Build the per-model `LoadRequest` (the device spec comes from `Config::device_spec_for`).
 pub fn load_request(config: &Config, m: &ModelConfig, path: PathBuf) -> LoadRequest {

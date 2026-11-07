@@ -17,11 +17,12 @@ use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, spec};
 use crate::benchmark::grade::AccuracyMetric;
 use crate::benchmark::images::{self, ImageSet};
 use crate::benchmark::report::{HardwareSummary, RuntimeVersions};
+use crate::benchmark::service::breadcrumb::{self, Trail};
 use crate::benchmark::threshold::Objective;
 use crate::benchmark::{
     Bench, BenchmarkResults, Comparison, Job, MATCH_IOU, ModelResult, Phase, SweepOptions, compare,
     config_models, configured_device, export, job_for_config, job_for_file, no_pseudo_gt_device,
-    pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path, sweep,
+    pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path,
 };
 use crate::config::{Config, DatasetRef, ModelConfig};
 use crate::config_form::{
@@ -346,10 +347,35 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         cache_dir.clone(),
         openvino_dir,
     )?;
+    // `benchmark.devices` of the config limits the sweep, as on the web UI's Benchmark page,
+    // and the pseudo-ground-truth device.
+    let sweep_devices = crate::benchmark::service::parse_devices(&config.benchmark.devices)
+        .context("benchmark.devices in the config")?;
+    if all_devices && !args.confirm_gpus {
+        let gpus = jobs.iter().fold(Vec::new(), |mut acc, p| {
+            let sel = runtimes.selection(Some(&p.job.path));
+            for g in sweep_gpus(&sel, sweep_devices.as_deref()) {
+                if !acc.contains(&g) {
+                    acc.push(g);
+                }
+            }
+            acc
+        });
+        if let Some(refusal) = gpu_gate(&gpus, args.confirm_gpus) {
+            bail!("{refusal}");
+        }
+    }
     let info = runtimes.info();
     let versions = RuntimeVersions::of(&runtimes);
     let runtimes = Mutex::new(runtimes);
     let mut report = Report::new(info, errors, &sets, warnings);
+    // A sweep of this run takes the breadcrumb over: report the one a run that never ended left.
+    let data_root = config.data_root();
+    // The header prints the warnings so far.
+    if all_devices && let Some(left) = breadcrumb::left_behind(&data_root) {
+        report.warnings.push(left.message());
+    }
+    let trail = Trail::new(&data_root);
     if !args.json {
         print_header(
             &report,
@@ -367,10 +393,6 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     };
     let progress = cli_progress(args.json);
 
-    // `benchmark.devices` of the config limits the sweep, as on the web UI's Benchmark page,
-    // and the pseudo-ground-truth device.
-    let sweep_devices = crate::benchmark::service::parse_devices(&config.benchmark.devices)
-        .context("benchmark.devices in the config")?;
     let ctx = RunCtx {
         args: &args,
         config: &config,
@@ -381,6 +403,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         metric,
         weights,
         variant_names: &variant_names,
+        trail: &trail,
     };
 
     // Pseudo ground truth for datasets without it (accuracy relative to a reference model).
@@ -546,6 +569,54 @@ fn cli_progress(quiet: bool) -> impl Fn(&crate::benchmark::Progress) + Sync {
     }
 }
 
+/// The GPUs a sweep of a model with selection `sel` runs, as [`sweep_with`] plans them: the
+/// runnable GPU-class options (`allowed` = `benchmark.devices` limits them). A device of each
+/// runtime counts on its own, as on the service's Benchmark page: the spec does not tell which of
+/// them share a card.
+///
+/// [`sweep_with`]: crate::benchmark::sweep::sweep_with
+fn sweep_gpus(
+    sel: &crate::backend::Selection,
+    allowed: Option<&[spec::Device]>,
+) -> Vec<(spec::Device, String)> {
+    let mut out: Vec<(spec::Device, String)> = Vec::new();
+    for o in &sel.options {
+        let listed = allowed.is_none_or(|a| a.contains(&o.spec));
+        if o.runnable && listed && o.spec.is_gpu_like() && !out.iter().any(|(d, _)| *d == o.spec) {
+            out.push((o.spec, o.label.clone()));
+        }
+    }
+    out
+}
+
+/// Whether a sweep over `gpus` may start: None = yes; else the refusal. Two or more GPU devices
+/// need `--confirm-gpus` (`confirmed`), as the web UI asks before such a sweep.
+fn gpu_gate(gpus: &[(spec::Device, String)], confirmed: bool) -> Option<String> {
+    (gpus.len() > 1 && !confirmed).then(|| several_gpus_refusal(gpus))
+}
+
+/// The refusal of a sweep over `gpus` (two or more) without `--confirm-gpus`.
+fn several_gpus_refusal(gpus: &[(spec::Device, String)]) -> String {
+    let names: Vec<String> = gpus
+        .iter()
+        .map(|(d, label)| {
+            if label.is_empty() || *label == d.to_string() {
+                d.to_string()
+            } else {
+                format!("{d} ({label})")
+            }
+        })
+        .collect();
+    format!(
+        "this sweep would benchmark {} GPU devices: {}. {} To run them anyway, add \
+         --confirm-gpus; to sweep fewer, list the devices in benchmark.devices of the config \
+         (--apply, --apply-threshold, --threshold-search and --report sweep every device).",
+        gpus.len(),
+        names.join(", "),
+        crate::benchmark::service::SEVERAL_GPUS_WARNING
+    )
+}
+
 /// What the steps of [`run`] share once the runtimes are open.
 struct RunCtx<'a> {
     args: &'a BenchArgs,
@@ -559,6 +630,10 @@ struct RunCtx<'a> {
     weights: crate::benchmark::grade::Weights,
     /// Names of the variant jobs (`<model>+<variant>`): never applied to the config.
     variant_names: &'a std::collections::HashSet<String>,
+    /// The run's breadcrumb (see [`breadcrumb`]): noted before each device of a sweep and the
+    /// pseudo-ground-truth reference starts, so a run killed there is reported like the
+    /// service's.
+    trail: &'a Trail,
 }
 
 impl RunCtx<'_> {
@@ -605,6 +680,7 @@ impl RunCtx<'_> {
                     ),
                 );
             }
+            self.trail.note(&device.to_string(), &job.name);
             pseudo_ground_truth(pb, self.runtimes, &job, device, sets)
         });
         if let Err(e) = outcome {
@@ -661,7 +737,14 @@ impl RunCtx<'_> {
             threshold_objective: self.objective,
         };
         bench.progress = Some(progress);
-        let mut result = sweep(bench, self.runtimes, job, &opts, &mut |_| {})?;
+        let mut result = crate::benchmark::sweep::sweep_with(
+            bench,
+            self.runtimes,
+            job,
+            &opts,
+            &mut |device| self.trail.note(&device.to_string(), &job.name),
+            &mut |_| {},
+        )?;
         bench.progress = None;
         if let Some(m) = entry {
             let files = bench
@@ -1392,6 +1475,101 @@ mod tests {
         let a = parse(&["x", "--dataset", "nope", "--model", "m.onnx"]).unwrap();
         let err = load_sets(&a, &config).unwrap_err();
         assert!(format!("{err:#}").contains("valid ids"), "{err:#}");
+    }
+
+    fn selection_of(opts: &[(&str, bool)]) -> crate::backend::Selection {
+        let options: Vec<_> = opts
+            .iter()
+            .map(|&(s, runnable)| crate::backend::select::DeviceOption {
+                spec: *spec::parse(s).unwrap().device().unwrap(),
+                label: format!("label of {s}"),
+                runnable,
+                reason: (!runnable).then(|| "not runnable".to_string()),
+                download: None,
+            })
+            .collect();
+        crate::backend::Selection {
+            auto: options
+                .iter()
+                .filter(|o| o.runnable)
+                .map(|o| o.spec)
+                .collect(),
+            options,
+            auto_measured: false,
+        }
+    }
+
+    fn names(gpus: &[(spec::Device, String)]) -> Vec<String> {
+        gpus.iter().map(|(d, _)| d.to_string()).collect()
+    }
+
+    /// The GTX 1070 Ti + UHD 630 machine: what a sweep would touch, and the refusal.
+    #[test]
+    fn a_sweep_over_several_gpus_needs_a_confirmation() {
+        let sel = selection_of(&[
+            ("ort:cuda:0", true),
+            ("ort:tensorrt:0", false),
+            ("openvino:gpu.0", true),
+            ("ort:directml:1", true),
+            ("openvino:cpu", true),
+            ("ort:cpu", true),
+        ]);
+        let all = sweep_gpus(&sel, None);
+        assert_eq!(
+            names(&all),
+            ["ort:cuda:0", "openvino:gpu.0", "ort:directml:1"],
+            "runnable GPU-class options only"
+        );
+        let dev = |s: &str| *spec::parse(s).unwrap().device().unwrap();
+        let one = [
+            dev("openvino:cpu"),
+            dev("ort:cuda:0"),
+            dev("ort:tensorrt:0"),
+        ];
+        assert_eq!(names(&sweep_gpus(&sel, Some(&one))), ["ort:cuda:0"]);
+        assert!(sweep_gpus(&sel, Some(&[])).is_empty());
+        let msg = several_gpus_refusal(&all);
+        assert!(msg.contains("3 GPU devices"), "{msg}");
+        // The gate: one GPU device goes, two need the confirmation, which lets them through.
+        assert!(gpu_gate(&all[..1], false).is_none(), "one GPU device");
+        assert!(gpu_gate(&[], false).is_none());
+        assert_eq!(
+            gpu_gate(&all[..2], false),
+            Some(several_gpus_refusal(&all[..2]))
+        );
+        assert!(gpu_gate(&all, true).is_none(), "confirmed");
+        assert!(
+            msg.contains("ort:cuda:0 (label of ort:cuda:0), openvino:gpu.0 (label of"),
+            "{msg}"
+        );
+        assert!(msg.contains("has hung a machine"), "{msg}");
+        assert!(msg.contains("--confirm-gpus") && msg.contains("benchmark.devices"));
+        assert!(
+            parse(&["x", "--apply", "--confirm-gpus"])
+                .unwrap()
+                .confirm_gpus
+        );
+        assert!(!parse(&["x", "--apply"]).unwrap().confirm_gpus);
+    }
+
+    /// A sweep's breadcrumb is the service's: noted before a device starts, held while the CLI
+    /// lives (so the service never reports it), left behind when the process dies there.
+    #[test]
+    fn the_cli_trail_is_the_service_breadcrumb() {
+        let dir = std::env::temp_dir().join(format!("bop-bcrumb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(breadcrumb::BREADCRUMB_FILE);
+        let trail = Trail::new(&dir);
+        trail.note("ort:cuda:0", "IPcam-general");
+        assert!(file.exists());
+        assert_eq!(
+            breadcrumb::left_behind(&dir),
+            None,
+            "a live run is not interrupted"
+        );
+        drop(trail);
+        assert!(!file.exists(), "a run that ends leaves nothing");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

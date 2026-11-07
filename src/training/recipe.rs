@@ -768,6 +768,56 @@ pub fn valid_model_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a queue form or `train run` typed for a run, already parsed (string parsing stays at the
+/// two edges, where its errors are worded for the form or the command line); `None` = not given.
+#[derive(Debug, Clone, Copy)]
+pub struct RecipeInputs {
+    pub epochs: Option<u32>,
+    pub patience: Option<u32>,
+    pub imgsz: Option<u32>,
+    pub batch: Option<u32>,
+    pub lr: Option<f32>,
+    pub lr_schedule: Option<LrSchedule>,
+    pub lr_min_factor: Option<f32>,
+    pub select_metric: Option<SelectMetric>,
+    pub augment: Augment,
+    pub multi_scale: MultiScale,
+}
+
+/// The recipe of one run of `family` / `size`: the typed values over the saved `training` settings
+/// over the family's recommendation; the batch is the chosen GPU's suggestion (`cap`, at most 16)
+/// when none was typed. The one place both `train run` and the Train tab's queue form build it.
+pub fn build_recipe(
+    family: TrainFamily,
+    size: &str,
+    typed: &RecipeInputs,
+    training: &super::config::TrainingConfig,
+    cap: &super::capability::Capability,
+) -> Result<TrainRecipe> {
+    let mut r = TrainRecipe::new(family, size)?;
+    r.epochs = typed.epochs.unwrap_or_else(|| training.epochs_for(family));
+    // A typed patience is checked against the epochs; a default one is capped by them.
+    r.patience = typed
+        .patience
+        .unwrap_or_else(|| training.patience_for(family).min(r.epochs));
+    r.patience_recommended = typed.patience.is_none() && training.patience.is_none();
+    if let Some(i) = typed.imgsz {
+        r.imgsz = i;
+    }
+    r.batch = typed.batch.unwrap_or_else(|| {
+        cap.family(family)
+            .and_then(|x| x.sizes.iter().find(|s| s.size == size))
+            .and_then(|s| s.suggested_batch)
+            .unwrap_or(r.batch)
+            .min(16)
+    });
+    training.apply_lr(&mut r, typed.lr, typed.lr_schedule, typed.lr_min_factor);
+    r.select_metric = training.select_metric_for(typed.select_metric);
+    r.augment = typed.augment;
+    r.multi_scale = typed.multi_scale;
+    Ok(r)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,5 +1295,45 @@ mod tests {
                 .1
                 .contains("F0.5 averaged over the last 3 epochs")
         );
+    }
+
+    #[test]
+    fn build_recipe_layers_typed_over_saved_over_recommended() {
+        let cap = crate::training::capability::host_for_tests();
+        let none = RecipeInputs {
+            epochs: None,
+            patience: None,
+            imgsz: None,
+            batch: None,
+            lr: None,
+            lr_schedule: None,
+            lr_min_factor: None,
+            select_metric: None,
+            augment: Augment::default(),
+            multi_scale: MultiScale::default(),
+        };
+        let saved = crate::training::config::TrainingConfig::default();
+        let r = build_recipe(TrainFamily::Yolo26, "n", &none, &saved, &cap).unwrap();
+        assert_eq!(r.epochs, recommended(TrainFamily::Yolo26).epochs);
+        assert!(r.patience_recommended && r.patience <= r.epochs);
+        assert!(r.batch <= 16);
+        let typed = RecipeInputs {
+            epochs: Some(12),
+            patience: Some(4),
+            imgsz: Some(480),
+            batch: Some(3),
+            lr: Some(0.002),
+            lr_schedule: Some(LrSchedule::Cosine),
+            lr_min_factor: Some(0.05),
+            select_metric: Some(SelectMetric::default()),
+            augment: Augment::NIGHT,
+            multi_scale: MultiScale::default(),
+        };
+        let r = build_recipe(TrainFamily::Yolo26, "n", &typed, &saved, &cap).unwrap();
+        assert_eq!((r.epochs, r.patience, r.imgsz, r.batch), (12, 4, 480, 3));
+        assert!(!r.patience_recommended);
+        assert_eq!(r.lr, Some(0.002));
+        assert_eq!(r.augment, Augment::NIGHT);
+        assert!(build_recipe(TrainFamily::Dfine, "n", &typed, &saved, &cap).is_err());
     }
 }

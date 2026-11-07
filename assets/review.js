@@ -2430,6 +2430,8 @@
         if (backStack.length > 200) backStack.shift();
       }
       cur = j;
+      // Suggestions keep to the boxes the server named (`overlap_live_boxes`).
+      R.markServed(j.labels);
       loadHistory(camOf(j.frame));
       loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
@@ -2594,6 +2596,7 @@
     body.boxes.forEach(function (b) {
       delete b._checked;
       delete b._relabelled;
+      delete b._n;
       if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
         b.state = 'rejected';
         b.reason = 'other_class';

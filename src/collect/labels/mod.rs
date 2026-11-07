@@ -663,9 +663,9 @@ pub(crate) fn rename_to_class(b: &mut LabelBox, class: &str) {
 }
 
 /// The class of `classes` a detection `label` is (exact, case-insensitive, then the COCO / VOC
-/// aliases): [`crate::training::autolabel::triage::map_label`].
+/// aliases): [`crate::model::coco::map_label`].
 pub fn map_class<'a>(label: &str, classes: &'a [String]) -> Option<&'a str> {
-    crate::training::autolabel::triage::map_label(label, classes)
+    crate::model::coco::map_label(label, classes)
 }
 
 /// Whether `class` is one of `hidden` (`collect.hidden_classes`; case-insensitive).
@@ -2079,7 +2079,7 @@ mod tests {
         };
         write(&path, &done).unwrap();
         assert!(!is_protected(&path));
-        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

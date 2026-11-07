@@ -62,17 +62,6 @@ pub(super) fn footage() -> Vec<FootageRow> {
         .collect()
 }
 
-fn state_str(s: RunState) -> &'static str {
-    match s {
-        RunState::Queued => "queued",
-        RunState::Running => "running",
-        RunState::Paused => "paused",
-        RunState::Done => "done",
-        RunState::Failed => "failed",
-        RunState::Cancelled => "cancelled",
-    }
-}
-
 /// What a row says about `r`: [`TaskRecord::describe`], a queued job that follows an import
 /// as "queued (after import <id>)".
 fn describe_row(r: &TaskRecord, tasks: &[TaskRecord]) -> String {
@@ -102,7 +91,7 @@ pub(super) fn task_rows(tasks: &[TaskRecord]) -> Vec<TaskRow> {
                 TaskKind::Overlaps => "overlap check",
             },
             title: r.title.clone(),
-            state: state_str(r.state),
+            state: r.state.as_str(),
             busy: r.state.is_busy(),
             percent: r.percent,
             describe: describe_row(r, tasks),

@@ -26,6 +26,24 @@ bop_ensure_user() {
   done
 }
 
+# bop_own_data_root DATA_DIR: an uninstall keeps the data root, so an install can meet files of an
+# earlier $BOP_USER with another uid (the user was deleted by hand and made again, or the folder
+# came from a backup). `install -d -o` corrects the named folders only and `chown -R` covers only
+# models/, so look at everything: one entry (the folder itself or anything in it) of another
+# owner or group and the whole tree is chowned. Run it after bop_ensure_user and before
+# `install -d`. -h, find's default -P and the `/.`: links are never followed (uv's Python
+# environment has some), a data root that is itself a link to a larger disk is. `-print -quit`
+# stops at the first hit (GNU and BSD find). A failure warns: the data is intact.
+bop_own_data_root() {
+  _own="$1"
+  [ -d "$_own" ] || return 0
+  _first="$(find "$_own/." \( ! -user "$BOP_USER" -o ! -group "$BOP_USER" \) -print -quit 2>/dev/null || true)"
+  [ -n "$_first" ] || return 0
+  echo "$_own holds files not owned by $BOP_USER (first: $_first): changing the owner of everything in it, which can take a while." >&2
+  chown -hR "$BOP_USER:$BOP_USER" "$_own/." \
+    || echo "Could not change the owner of everything in $_own, so the service may fail to read it (is it a network share?). Fix it with: sudo chown -hR $BOP_USER:$BOP_USER $_own/." >&2
+}
+
 # bop_seed_config INSTALL_DIR DATA_DIR CONFIG WITH_RUNTIMES: write CONFIG unless it exists (never
 # overwrites), then fix owner/mode. download_dir and cache_dir always point at the data root.
 # WITH_RUNTIMES=1 (archive flow) also names the bundled, root-owned openvino/ and onnxruntime/

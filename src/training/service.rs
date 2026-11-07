@@ -70,6 +70,18 @@ pub enum RunState {
 }
 
 impl RunState {
+    /// The state as the pages and the API spell it: equal to its serde (snake_case) name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunState::Queued => "queued",
+            RunState::Running => "running",
+            RunState::Paused => "paused",
+            RunState::Done => "done",
+            RunState::Failed => "failed",
+            RunState::Cancelled => "cancelled",
+        }
+    }
+
     pub fn is_busy(self) -> bool {
         matches!(
             self,
@@ -1414,3 +1426,35 @@ fn run_task(inner: &Inner, t: &dyn Task) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod run_state_tests {
+    use super::RunState;
+
+    #[test]
+    fn as_str_is_the_serde_name_of_every_state() {
+        let all = [
+            RunState::Queued,
+            RunState::Running,
+            RunState::Paused,
+            RunState::Done,
+            RunState::Failed,
+            RunState::Cancelled,
+        ];
+        // An exhaustive match: a new variant breaks this build until it is listed above.
+        for s in all {
+            match s {
+                RunState::Queued
+                | RunState::Running
+                | RunState::Paused
+                | RunState::Done
+                | RunState::Failed
+                | RunState::Cancelled => {}
+            }
+            assert_eq!(
+                serde_json::to_string(&s).unwrap(),
+                format!("\"{}\"", s.as_str())
+            );
+        }
+    }
+}

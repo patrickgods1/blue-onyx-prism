@@ -210,10 +210,33 @@ pub fn read_command(config: &Path) -> String {
 mod tests {
     use super::*;
 
-    fn dir() -> std::path::PathBuf {
+    /// A scratch folder, removed on drop (also when the test fails). A removal that fails, such
+    /// as antivirus holding a file on Windows, never fails a passing test.
+    struct Scratch(std::path::PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Scratch {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn dir() -> Scratch {
         let d = std::env::temp_dir().join(format!("bo_token_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Scratch(d)
     }
 
     fn hex64(t: &str) -> bool {
@@ -235,7 +258,6 @@ mod tests {
         assert_eq!(read(&p).unwrap().reveal(), a.reveal());
         let left: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
         assert_eq!(left.len(), 1, "a temporary file stayed behind");
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -243,7 +265,6 @@ mod tests {
         let d = dir();
         let p = d.join("not").join("yet").join(FILE_NAME);
         assert!(ensure(&p).unwrap().1);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -255,7 +276,6 @@ mod tests {
         assert!(e.contains("--rotate"), "{e}");
         assert!(!e.contains("not a token"), "{e}");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "not a token");
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -271,7 +291,6 @@ mod tests {
         std::fs::write(&p, "").unwrap();
         assert!(hex64(rotate(&p).unwrap().reveal()));
         assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[cfg(unix)]
@@ -285,7 +304,6 @@ mod tests {
         assert_eq!(mode(&p), 0o600);
         rotate(&p).unwrap();
         assert_eq!(mode(&p), 0o600);
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     /// Reading fails closed: nothing but one well-formed token counts, so an empty file can
@@ -315,7 +333,6 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         std::fs::create_dir(&p).unwrap();
         assert!(read(&p).is_err());
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -328,7 +345,6 @@ mod tests {
         assert!(!t.matches(b""));
         assert!(!t.matches(&value.as_bytes()[..63]));
         assert!(!t.matches(format!("{value}0").as_bytes()));
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -337,6 +353,5 @@ mod tests {
         let p = d.join(FILE_NAME);
         let (t, _) = ensure(&p).unwrap();
         assert!(!format!("{t:?}").contains(t.reveal()));
-        std::fs::remove_dir_all(&d).unwrap();
     }
 }
