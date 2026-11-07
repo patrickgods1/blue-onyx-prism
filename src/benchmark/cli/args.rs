@@ -32,11 +32,13 @@ pub struct BenchArgs {
     /// limits them) for each model, grade accuracy and
     /// speed, compare detections with the CPU reference, print the recommended device, and save
     /// the results to `benchmark.json` next to the config file (web UI Benchmark page). Cannot
-    /// be combined with --device, --force-cpu or --compare-cpu.
+    /// be combined with --device, --force-cpu or --compare-cpu. Two or more GPUs need
+    /// --confirm-gpus.
     #[arg(long, conflicts_with_all = ["device", "force_cpu", "compare_cpu"])]
     pub all_devices: bool,
     /// Implies --all-devices: write each benchmarked config model's recommended device into its
-    /// `device` in the config file and print what changed (restart the server to apply).
+    /// `device` in the config file and print what changed (restart the server to apply). Two or
+    /// more GPUs need --confirm-gpus.
     #[arg(long, conflicts_with_all = ["device", "force_cpu", "compare_cpu", "model"])]
     pub apply: bool,
     /// Implies --all-devices: write each benchmarked config model's best confidence threshold
@@ -87,6 +89,12 @@ pub struct BenchArgs {
     /// `.md`).
     #[arg(long, conflicts_with_all = ["device", "force_cpu", "compare_cpu"])]
     pub report: Option<PathBuf>,
+    /// Run a device sweep (--all-devices, also implied by --apply, --apply-threshold,
+    /// --threshold-search and --report) that touches two or more GPUs. Without it such a sweep
+    /// is refused before any model loads: a sweep across several GPUs has hung a machine. To
+    /// sweep one GPU, list the devices in `benchmark.devices` of the config instead.
+    #[arg(long)]
+    pub confirm_gpus: bool,
     /// Do not write `benchmark.json` (--all-devices).
     #[arg(long)]
     pub no_save: bool,

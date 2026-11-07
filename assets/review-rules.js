@@ -137,34 +137,68 @@
     return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
   }
 
+  // Mark every box of `labels` with its index in the file as served (`_n`), so that a suggestion
+  // keeps to the boxes the server named (`overlap_live_boxes`) when the page removes a box before
+  // them. Called on every answer of GET /v1/review/labels; `_n` survives undo (JSON) and a save
+  // strips it. A box drawn on the page has none.
+  function markServed(labels) {
+    ((labels && labels.boxes) || []).forEach(function (b, i) { b._n = i; });
+  }
+
+  // Where the box served at index `n` is now, -1 if it went.
+  function servedAt(bs, n) {
+    for (var k = 0; k < bs.length; k++) if (bs[k]._n === n) return k;
+    return -1;
+  }
+
   // The suggestions a reviewer can act on now, strongest first (as stored): of those the server
-  // calls live (`overlap_live`: labels/overlaps.rs `live`, which also knows a mapped spelling from a
-  // relabel), the ones still true after what happened on this page. The pair must still be open
-  // under its two bboxes (`dupGroups`: a moved, relabelled or rejected box ends it), a box to drop must
-  // not have become a drawn, moved or relabelled one, and a two-object suggestion not be accepted yet.
-  // `cur`: the frame as GET /v1/review/labels answers it, `dups`: its `dupGroups`.
-  // [{index, s, a, b, drop, keep}]: box indices; drop and keep -1 for two objects.
-  // Twin of labels/overlaps.rs `live`: keep the two in step. One difference: `overlap_live` names a
-  // suggestion, not its boxes, so where two boxes share a position and the server passed over the
-  // first for a relabel made before this page opened, this takes the first.
+  // calls live (labels/overlaps.rs `live`, which also knows a mapped spelling from a relabel), the
+  // ones still true after what happened on this page. The pair must still be open under its two
+  // bboxes (`dupGroups`: a moved, relabelled or rejected box ends it), a box to drop must not have
+  // become a drawn, moved or relabelled one, and a two-object suggestion not be accepted yet.
+  // `cur`: the frame as GET /v1/review/labels answers it (its boxes marked by `markServed`), `dups`:
+  // its `dupGroups`. [{index, s, a, b, drop, keep}]: box indices; drop and keep -1 for two objects.
+  // Twin of labels/overlaps.rs `live`: keep the two in step. `overlap_live_boxes` names the boxes the
+  // server chose for each suggestion, so where two boxes share a position and the server passed over
+  // the first for a relabel, this takes the same box (RR-T9). It holds a suggestion to those boxes:
+  // where an edit here ends their pair, a twin at the same key waits for the next load. An older
+  // server sends only `overlap_live` (the suggestion's index): then this takes the first open pair
+  // under the suggestion's bboxes.
   function liveSuggestions(cur, dups) {
     var out = [];
-    var list = cur && cur.labels.overlap_suggestions, ok = cur && cur.overlap_live;
-    if (!list || !ok || cur.labels.overlaps_checked) return out;
-    var bs = cur.labels.boxes;
+    var list = cur && cur.labels.overlap_suggestions;
+    var named = cur && cur.overlap_live_boxes, ok = cur && cur.overlap_live;
+    if (!list || !(named || ok) || cur.labels.overlaps_checked) return out;
+    var bs = cur.labels.boxes, open = dups.overlaps || [];
+    // Box `a` for the suggestion's `a`, `b` for its `b`: offered unless the box to drop is guarded.
+    var take = function (n, s, a, b) {
+      var drop = s.verdict === 'drop_a' ? a : (s.verdict === 'drop_b' ? b : -1);
+      var d = bs[drop];
+      if (d && (d.source === 'human' || d.orig_bbox || d._relabelled)) return false;
+      out.push({ index: n, s: s, a: a, b: b, drop: drop, keep: drop < 0 ? -1 : (drop === a ? b : a) });
+      return true;
+    };
+    if (named) {
+      named.forEach(function (e) {
+        var s = list[e.index];
+        if (!s || s._done) return;
+        var a = servedAt(bs, e.a), b = servedAt(bs, e.b);
+        if (a < 0 || b < 0 || !sameBbox(bs[a].bbox, s.a) || !sameBbox(bs[b].bbox, s.b)) return;
+        var still = open.some(function (o) {
+          return (o[0] === a && o[1] === b) || (o[0] === b && o[1] === a);
+        });
+        if (still) take(e.index, s, a, b);
+      });
+      return out;
+    }
     ok.forEach(function (n) {
       var s = list[n];
       if (!s || s._done) return;
-      (dups.overlaps || []).some(function (o) {
-        var i = o[0], j = o[1], a, b;
-        if (sameBbox(bs[i].bbox, s.a) && sameBbox(bs[j].bbox, s.b)) { a = i; b = j; }
-        else if (sameBbox(bs[j].bbox, s.a) && sameBbox(bs[i].bbox, s.b)) { a = j; b = i; }
-        else return false;
-        var drop = s.verdict === 'drop_a' ? a : (s.verdict === 'drop_b' ? b : -1);
-        var d = bs[drop];
-        if (d && (d.source === 'human' || d.orig_bbox || d._relabelled)) return false;
-        out.push({ index: n, s: s, a: a, b: b, drop: drop, keep: drop < 0 ? -1 : (drop === a ? b : a) });
-        return true;
+      open.some(function (o) {
+        var i = o[0], j = o[1];
+        if (sameBbox(bs[i].bbox, s.a) && sameBbox(bs[j].bbox, s.b)) return take(n, s, i, j);
+        if (sameBbox(bs[j].bbox, s.a) && sameBbox(bs[i].bbox, s.b)) return take(n, s, j, i);
+        return false;
       });
     });
     return out;
@@ -257,6 +291,7 @@
     dupGroups: dupGroups,
     dupDrops: dupDrops,
     pendingDupDrops: pendingDupDrops,
+    markServed: markServed,
     liveSuggestions: liveSuggestions,
     markRejected: markRejected,
     markDuplicate: markDuplicate,

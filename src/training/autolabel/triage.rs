@@ -15,7 +15,6 @@
 //! [`apply_spots`] applies what the reviewer taught about fixed places of the camera
 //! ([`labels::spots`]): rejected spots hide boxes, parked spots accept them.
 
-use super::catalog::same_class;
 use super::{Category, MISSING_THRESHOLD};
 use crate::collect::labels::repeats::{REPEAT_SPOT_REASON, same_object};
 use crate::collect::labels::spots::{CameraMemory, PARKED_REASON};
@@ -24,6 +23,8 @@ use crate::collect::labels::{
     self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Origin, ParkedMark,
     Source, Status, Triage, VlmCheck, inside_share, iou, merge_proposals,
 };
+pub use crate::model::coco::map_label;
+use crate::model::coco::same_class;
 use crate::resources::catalog::SAM3_KEY;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,20 +182,6 @@ pub fn night_review(label: &str, scene: &str) -> Option<&'static str> {
 
 fn round(v: f32, scale: f32) -> f32 {
     (v * scale).round() / scale
-}
-
-/// The class of `classes` a detection `label` is: the same name, else the same name ignoring
-/// case, else the same COCO class through the aliases (a VOC-spelled model's `motorbike`,
-/// `tvmonitor`, `pottedplant`, `aeroplane`, `sofa`, `diningtable` are the list's `motorcycle`,
-/// `tv`, `potted plant`, `airplane`, `couch`, `dining table`). None: not a class of the run.
-pub fn map_label<'a>(label: &str, classes: &'a [String]) -> Option<&'a str> {
-    let l = label.trim();
-    classes
-        .iter()
-        .find(|c| c.as_str() == l)
-        .or_else(|| classes.iter().find(|c| c.eq_ignore_ascii_case(l)))
-        .or_else(|| classes.iter().find(|c| same_class(c, l)))
-        .map(String::as_str)
 }
 
 /// [`to_boxes`] with what it left out and renamed.

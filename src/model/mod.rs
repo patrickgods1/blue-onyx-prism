@@ -4,9 +4,11 @@
 //! Everything here is pure CPU code with no OpenVINO dependency so it is unit-testable.
 
 pub mod classes;
+pub mod coco;
 pub mod detr;
 pub mod enhance;
 pub mod filters;
+pub mod name;
 pub mod nms;
 pub mod preprocess;
 pub mod rtdetr;

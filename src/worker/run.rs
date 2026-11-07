@@ -692,15 +692,18 @@ impl WorkerCtx {
             timeout_ms = millis_u64(timeout),
             "dropping request that waited longer than the request timeout (server overloaded)"
         );
-        Some(self.error_response(
-            format!(
-                "Request dropped: waited {} ms in queue (timeout {} ms)",
-                waited.as_millis(),
-                timeout.as_millis()
-            ),
-            0,
-            0,
-        ))
+        Some(VisionDetectionResponse {
+            dropped: Some(DropReason::Timeout),
+            ..self.error_response(
+                format!(
+                    "Request dropped: waited {} ms in queue (timeout {} ms)",
+                    waited.as_millis(),
+                    timeout.as_millis()
+                ),
+                0,
+                0,
+            )
+        })
     }
 
     /// The error answer for a request that failed before inference (bad image, ...).
@@ -1457,6 +1460,7 @@ impl WorkerCtx {
                     inferenceMs: ms(infer_d),
                     processMs: ms(process_d),
                     analysisRoundTripMs: 0,
+                    dropped: None,
                 };
                 let plan = match (&live.verify, may_verify(&meta)) {
                     (Some(cfg), true) => {

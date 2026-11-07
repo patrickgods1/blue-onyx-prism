@@ -27,6 +27,8 @@ fi
 bop_check_paths "$INSTALL_DIR$DATA_DIR" || exit 1
 
 bop_ensure_user "$DATA_DIR"
+# Kept data of an earlier blueonyx with another uid: before `install -d`, which hides it.
+bop_own_data_root "$DATA_DIR"
 
 # Program files: root-owned, not writable by the service (an earlier install chowned them).
 chown -R root:root "$INSTALL_DIR"

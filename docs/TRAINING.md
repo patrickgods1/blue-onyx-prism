@@ -748,8 +748,11 @@ Stages (page and `train run` show them with percent and ETA):
    starting, twice; the cause was never found). The Benchmark page keeps away from it too: it
    starts with the devices the models run on, asks before a run of several GPUs, refuses while a
    queue job runs, and leaves `<data root>/benchmark-breadcrumb.json` naming the device it was
-   about to start, so a hang leaves the last device on record. A failed benchmark is reported but
-   keeps the model.
+   about to start, so a hang leaves the last device on record. The `benchmark` CLI does the same:
+   a sweep (`--all-devices`, implied by `--apply`, `--apply-threshold`, `--threshold-search` and
+   `--report`) over two or more GPUs is refused before any model loads unless `--confirm-gpus` is
+   given (or `benchmark.devices` lists fewer), and it leaves the same breadcrumb, reported by the
+   next run or service start. A failed benchmark is reported but keeps the model.
 
 Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `night-` for `night+ir`,
 `night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked
@@ -799,7 +802,7 @@ different verifier unless the confirm names it (`replace_verifier`). All go thro
 save path and apply at once. A camera that names a custom model in Blue Iris keeps using that model.
 
 After a run's benchmark the current default runs on the same sets and devices (`Hooks::baseline`,
-Train tab only), so the Models tab's Use card can say "On N held-out frames: new finds ...; current finds ...".
+Train tab only; `train run` and `train retry-export` print one line saying so), so the Models tab's Use card can say "On N held-out frames: new finds ...; current finds ...".
 Its results stay in `<run>/baseline/`, removed afterwards: they never touch `benchmark.json`, the
 history or the `auto` order. It is skipped, with the reason in the row, when the default is the new
 model, is not loaded, or reports none of its classes.

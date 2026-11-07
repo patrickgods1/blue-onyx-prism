@@ -29,7 +29,7 @@ use super::{Decoded, LiveSettings, ORDER_TARGET, Peers, Purpose, Reply, WorkItem
 use crate::api::{Prediction, VisionDetectionResponse};
 use crate::image::RgbImage;
 use crate::image_stats::ImageStats;
-use crate::metrics::ModelMetrics;
+use crate::metrics::{DropReason, ModelMetrics};
 use crate::model::filters::{SuppressCounts, SuppressReason};
 use crate::startup::ModelState;
 use crate::verify::{Outcome, Plan, VerifyMode};
@@ -286,18 +286,22 @@ fn run(ctx: &LaneCtx, rx: &Receiver<Box<Pending>>) {
                         }
                         Ok(r) => {
                             debug_verifier_error(ctx, &a.p.request_id, &r.message);
-                            // The verifier dropped the check as late (its queue was too long).
-                            a.fail(if r.message.starts_with("Request dropped") {
-                                Failure::Timeout
-                            } else {
-                                Failure::Error
-                            });
+                            a.fail(answer_failure(&r));
                         }
                         Err(_) => a.fail(Failure::Stopped),
                     }
                 }
             }
         }
+    }
+}
+
+/// The failure of a check the verifier answered unsuccessfully: a drop as late (its queue was
+/// too long) is a timeout, anything else an error. Read from the typed kind, never the text.
+fn answer_failure(r: &VisionDetectionResponse) -> Failure {
+    match r.dropped {
+        Some(DropReason::Timeout) => Failure::Timeout,
+        _ => Failure::Error,
     }
 }
 
@@ -556,5 +560,29 @@ fn complete(
     // After the reply (a `try_send`, never waits).
     if let Some((job, predictions)) = collect {
         job.submit(&predictions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Failure, answer_failure};
+    use crate::api::VisionDetectionResponse;
+    use crate::metrics::DropReason;
+
+    #[test]
+    fn a_drop_as_late_is_a_timeout_whatever_its_text() {
+        let late = VisionDetectionResponse {
+            dropped: Some(DropReason::Timeout),
+            ..VisionDetectionResponse::error("any wording")
+        };
+        assert_eq!(answer_failure(&late), Failure::Timeout);
+        // The old wording without the kind is an error, not a timeout.
+        let text = VisionDetectionResponse::error("Request dropped: waited 9 ms in queue");
+        assert_eq!(answer_failure(&text), Failure::Error);
+        let other = VisionDetectionResponse {
+            dropped: Some(DropReason::QueueFull),
+            ..VisionDetectionResponse::error("busy")
+        };
+        assert_eq!(answer_failure(&other), Failure::Error);
     }
 }

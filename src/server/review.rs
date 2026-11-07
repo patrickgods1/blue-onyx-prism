@@ -24,16 +24,31 @@
 //! that is not there (an unplugged drive) is its own state, `folder_missing: true` with a message
 //! ([`folder_problem`]: 200 from `/v1/review/next`, 503 where the folder is needed), not an empty
 //! dataset.
+//!
+//! This file holds what the routes share (answers, body and filter checks, the context of the
+//! current config), the page, the queue (`next`) and a frame's labels; the other routes are split by
+//! concern: [`bulk_routes`] (the bulk tools and the overlap check), [`spots`] (the reviewer's
+//! history and the spot memory) and [`files`] (export, import, the folder under review, classes).
 
-use super::{AppState, Shared, blocking, encode_uri_component, render, save_config};
+mod bulk_routes;
+mod files;
+mod spots;
+
+pub(super) use bulk_routes::{
+    accept_auto, accept_repeats, reject_low, reject_other_class, reject_stacked,
+    reject_unwanted_reviewed, restore_reopened, suggest_overlaps,
+};
+pub(super) use files::{allowed_folder, class_catalog, classes, export, folder, import};
+pub(super) use spots::{
+    accept_spot, history, reject_spot, spots, spots_moved, spots_parked, spots_retire,
+};
+
+use super::{AppState, blocking, encode_uri_component, render};
 use crate::collect::CollectSettings;
 #[cfg(test)]
 use crate::collect::labels::bulk::accept_one;
-use crate::collect::labels::export::{
-    self, BenchSplit, ClassFilter, ExportRequest, Format, SplitConfig,
-};
 use crate::collect::labels::queue::Filters;
-use crate::collect::labels::{self, Frame, LabelFile, bulk, xany};
+use crate::collect::labels::{self, Frame, LabelFile, bulk};
 use crate::collect::{Bucket, layout};
 use askama::Template;
 use axum::Json;
@@ -42,20 +57,18 @@ use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use files::known_dirs;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use {super::save_config, files::exports_dir};
 
 /// Largest `POST /v1/review/labels` body.
 pub(super) const LABELS_BODY_LIMIT: usize = 256 * 1024;
 /// Largest body of the other review POST routes.
 pub(super) const SMALL_BODY_LIMIT: usize = 16 * 1024;
-/// The folder of the page's default exports, `<UTC time>` under it unless `out_dir` is given: where the Train tab looks for them
-/// ([`crate::training::discover_exports`]), so a custom `training.dir` moves it too.
-fn exports_dir(state: &AppState) -> std::path::PathBuf {
-    crate::training::training_dir(&state.config_read()).join("exports")
-}
 
 fn fail(status: StatusCode, message: impl Into<String>) -> Response {
     (
@@ -71,6 +84,34 @@ fn not_found() -> Response {
 
 /// An error answer not built yet (status, message): see [`fail`].
 type Problem = (StatusCode, String);
+
+/// A refused request, answered as [`fail`]: a route returning [`Answer`] checks with `?`.
+pub(super) struct Refused(Problem);
+
+impl From<Problem> for Refused {
+    fn from(p: Problem) -> Self {
+        Self(p)
+    }
+}
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        let (status, message) = self.0;
+        fail(status, message)
+    }
+}
+
+/// What a route answers: its response, or the [`fail`] answer of a check that refused it.
+pub(super) type Answer = Result<Response, Refused>;
+
+/// `{"success": true}` with `fields` (an object), as JSON.
+fn success(fields: serde_json::Value) -> Response {
+    let mut v = fields;
+    if let Some(o) = v.as_object_mut() {
+        o.insert("success".into(), true.into());
+    }
+    Json(v).into_response()
+}
 
 /// Why the folder under review `dir` cannot be used, as the page words it; None when it can. A
 /// folder that does not exist, an unmounted drive first of all, would otherwise look like an empty
@@ -145,6 +186,63 @@ fn query_map(
     q.map(|Query(m)| m).unwrap_or_default()
 }
 
+/// The queue filters of `q` ([`Filters::from_query`]), or 400.
+fn filters(q: &BTreeMap<String, String>) -> Result<Filters, Problem> {
+    Filters::from_query(q).map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+/// The filters of a bulk route's body, `[bucket, scene, camera, label, source]` (None = any), with
+/// the `fixed` ones the route sets itself (`status`, `auto`), or 400.
+fn bulk_filters(given: [Option<String>; 5], fixed: &[(&str, &str)]) -> Result<Filters, Problem> {
+    let keys = ["bucket", "scene", "camera", "label", "source"];
+    let mut q: BTreeMap<String, String> = keys
+        .into_iter()
+        .zip(given)
+        .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+        .collect();
+    for (k, v) in fixed {
+        q.insert((*k).to_string(), (*v).to_string());
+    }
+    filters(&q)
+}
+
+/// The most frames a bulk route changes: `given`, else `default`, within
+/// 1..=[`ACCEPT_AUTO_MAX_LIMIT`], or 400.
+fn bulk_limit(given: Option<usize>, default: usize) -> Result<usize, Problem> {
+    let limit = given.unwrap_or(default);
+    if (1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
+        ))
+    }
+}
+
+/// Ends a bulk route's `message` with the `failed` frames it could not change, when there are any:
+/// `" {failed} {not_done} (listed); {fix} them by hand."`. The words are the route's own
+/// (`"frame(s) not changed"`, `"review"`, ...): every message is pinned as it reads.
+fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
+    if failed > 0 {
+        message.push_str(&format!(
+            " {failed} {not_done} (listed); {fix} them by hand."
+        ));
+    }
+}
+
+/// Ends a bulk route's `message` with the `eligible` frames past its `limit`, when there are any:
+/// `" {n} {more} beyond the limit of {limit}; run it again."`, `more` in the route's words
+/// (`"more frame(s)"`, `"more eligible"`, `"more"`).
+fn push_past_limit(message: &mut String, eligible: usize, limit: usize, more: &str) {
+    if eligible > limit {
+        message.push_str(&format!(
+            " {} {more} beyond the limit of {limit}; run it again.",
+            eligible - limit
+        ));
+    }
+}
+
 /// Folder under review (`collect.review_dir`, else the dataset folder), classes and data root
 /// of the current config.
 fn context(state: &AppState) -> (PathBuf, Vec<String>, PathBuf) {
@@ -186,60 +284,6 @@ struct ReviewTemplate {
     known_dirs: Vec<String>,
 }
 
-/// The dataset folder and every folder a finished import wrote to (newest first), once each.
-fn known_dirs(state: &AppState, dataset: &std::path::Path) -> Vec<String> {
-    let mut v = vec![dataset.display().to_string()];
-    for t in super::training::tasks(state).iter().rev() {
-        if let Some(d) = t
-            .result
-            .as_ref()
-            .and_then(|r| r.get("dataset_dir"))
-            .and_then(|d| d.as_str())
-            && !v.iter().any(|k| k == d)
-        {
-            v.push(d.to_string());
-        }
-    }
-    v
-}
-
-/// [`super::browse::allowed_path`] for a folder of frames, also accepting a folder this server
-/// already works on: one a finished import wrote to ([`known_dirs`]) or the folder under review.
-/// Both passed that check when chosen, often as a native pick, which it trusts for an hour only;
-/// going back to one later must not need another pick. Exact folders only, canonicalized.
-pub(super) fn allowed_folder(
-    state: &AppState,
-    config: &crate::config::Config,
-    raw: &str,
-) -> Result<PathBuf, (StatusCode, String)> {
-    let err = match super::browse::allowed_path(config, raw) {
-        Ok(p) => return Ok(p),
-        Err(e) => e.into_parts(),
-    };
-    if err.0 != StatusCode::FORBIDDEN {
-        return Err(err);
-    }
-    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-    let Ok(canon) = config
-        .data_path(std::path::Path::new(trimmed))
-        .canonicalize()
-    else {
-        return Err(err);
-    };
-    let canon = super::browse::plain(&canon);
-    let dataset = CollectSettings::for_config(config).dir;
-    let mut trusted: Vec<PathBuf> = known_dirs(state, &dataset)
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    trusted.push(config.collect.resolved_review_dir(&config.data_root()));
-    let known = trusted
-        .iter()
-        .filter_map(|k| k.canonicalize().ok())
-        .any(|k| super::browse::plain(&k) == canon);
-    if known { Ok(canon) } else { Err(err) }
-}
-
 /// `GET /train/review`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
@@ -271,13 +315,10 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
 pub(super) async fn next(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
-) -> Response {
+) -> Answer {
     let q = query_map(query);
-    let mut filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    blocking(move || {
+    let mut filters = filters(&q)?;
+    Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         filters.wanted = Some((classes, hidden(&state)));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
@@ -295,7 +336,7 @@ pub(super) async fn next(
         }
         Json(answer).into_response()
     })
-    .await
+    .await)
 }
 
 fn frame_param(q: &BTreeMap<String, String>) -> Result<String, Problem> {
@@ -330,9 +371,14 @@ fn labels_answer(
     let file = saved.unwrap_or_else(|| labels::prefill(&rec, classes, hidden));
     let version = labels::classes_version(classes);
     let wanted = bulk::Wanted { classes, hidden };
-    let overlap_live: Vec<usize> = labels::overlaps::live(&file, Some(&wanted))
+    let live = labels::overlaps::live(&file, Some(&wanted));
+    let overlap_live: Vec<usize> = live.iter().map(|l| l.index).collect();
+    // The boxes of each live suggestion, indices into `labels.boxes` as served: where two boxes
+    // share a position, the page must take the one `live` chose (RR-T9). `overlap_live` stays for
+    // an older page.
+    let overlap_live_boxes: Vec<serde_json::Value> = live
         .iter()
-        .map(|l| l.index)
+        .map(|l| serde_json::json!({"index": l.index, "a": l.a, "b": l.b}))
         .collect();
     let q = encode_uri_component(&frame.rel.jpg());
     Json(serde_json::json!({
@@ -347,6 +393,7 @@ fn labels_answer(
         "revision": revision,
         "stale_classes": is_saved && !file.classes_version.is_empty() && file.classes_version != version,
         "overlap_live": overlap_live,
+        "overlap_live_boxes": overlap_live_boxes,
         "labels": file,
         "classes": classes,
         "hidden": hidden,
@@ -373,12 +420,9 @@ fn labels_answer(
 pub(super) async fn labels_get(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
-) -> Response {
-    let rel = match frame_param(&query_map(query)) {
-        Ok(r) => r,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
+) -> Answer {
+    let rel = frame_param(&query_map(query))?;
+    Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
         match Frame::resolve(&dir, &rel) {
@@ -386,7 +430,7 @@ pub(super) async fn labels_get(
             None => no_frame(&state, &dir),
         }
     })
-    .await
+    .await)
 }
 
 /// Message of a save refused because the frame changed since the client read it.
@@ -404,18 +448,12 @@ pub(super) async fn labels_post(
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
-) -> Response {
+) -> Answer {
     let q = query_map(query);
-    let rel = match frame_param(&q) {
-        Ok(r) => r,
-        Err((s, m)) => return fail(s, m),
-    };
+    let rel = frame_param(&q)?;
     let expected = q.get("revision").map(|r| r.trim().to_string());
-    let file: LabelFile = match json_body(&headers, body) {
-        Ok(f) => f,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
+    let file: LabelFile = json_body(&headers, body)?;
+    Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
         let Some(frame) = Frame::resolve(&dir, &rel) else {
@@ -458,1738 +496,13 @@ pub(super) async fn labels_post(
             Some(format!("Saved as {}.", status.as_str())),
         )
     })
-    .await
+    .await)
 }
 
 /// Default most frames of one bulk accept.
 pub(super) const ACCEPT_AUTO_DEFAULT_LIMIT: usize = 500;
 /// Most frames of one bulk accept.
 pub(super) const ACCEPT_AUTO_MAX_LIMIT: usize = 20_000;
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AcceptAutoBody {
-    #[serde(default)]
-    bucket: Option<String>,
-    #[serde(default)]
-    scene: Option<String>,
-    #[serde(default)]
-    camera: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// `POST /v1/review/accept-auto` with `{bucket?, scene?, camera?, label?, source?, dry_run,
-/// limit?}` (empty = any): the unreviewed frames of those filters whose auto-label triage alone
-/// settles them (`auto=accept`, [`labels::auto_accept_eligible`]) saved as reviewed, at most
-/// `limit` (default 500; [`bulk::bulk_accept`]). `dry_run` only counts them.
-pub(super) async fn accept_auto(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: AcceptAutoBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let mut q: BTreeMap<String, String> = [
-        ("bucket", b.bucket),
-        ("scene", b.scene),
-        ("camera", b.camera),
-        ("label", b.label),
-        ("source", b.source),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-    .collect();
-    q.insert("status".into(), "unreviewed".into());
-    q.insert("auto".into(), "accept".into());
-    let mut filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let dry_run = b.dry_run;
-    blocking(move || {
-        let (dir, classes, _) = context(&state);
-        filters.wanted = Some((classes.clone(), hidden(&state)));
-        let o = bulk::bulk_accept(&dir, &filters, &classes, limit, &now(), dry_run, &|_| true);
-        let eligible = o.eligible;
-        if dry_run {
-            return Json(serde_json::json!({
-                "success": true,
-                "eligible": eligible,
-                "accepted": 0,
-                "frames": o.done,
-            }))
-            .into_response();
-        }
-        let mut message = format!(
-            "Accepted {} frame(s) the auto-labelers settled (saved as reviewed).",
-            o.done_count
-        );
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} not accepted (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if eligible > limit {
-            message.push_str(&format!(
-                " {} more eligible beyond the limit of {limit}; run it again.",
-                eligible - limit
-            ));
-        }
-        tracing::info!(
-            accepted = o.done_count,
-            failed = o.failed_count,
-            eligible,
-            "review: auto-labels bulk accepted"
-        );
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": eligible,
-            "accepted": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectLowBody {
-    #[serde(default)]
-    bucket: Option<String>,
-    #[serde(default)]
-    scene: Option<String>,
-    #[serde(default)]
-    camera: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    min_score: f32,
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// `POST /v1/review/reject-low` with `{bucket?, scene?, camera?, label?, source?, min_score,
-/// dry_run, limit?}`: on the unreviewed frames of those filters, the pending auto boxes scoring
-/// below `min_score` (0.01..=1) rejected with `reason: low_score` (kept as hard-negative
-/// evidence; [`bulk::bulk_reject_below`]), at most `limit` frames (default 500). `dry_run`
-/// only counts the frames and boxes.
-pub(super) async fn reject_low(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: RejectLowBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    if !(0.01..=1.0).contains(&b.min_score) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("min_score: must be between 0.01 and 1, got {}", b.min_score),
-        );
-    }
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let mut q: BTreeMap<String, String> = [
-        ("bucket", b.bucket),
-        ("scene", b.scene),
-        ("camera", b.camera),
-        ("label", b.label),
-        ("source", b.source),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-    .collect();
-    q.insert("status".into(), "unreviewed".into());
-    let filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let (dry_run, min) = (b.dry_run, b.min_score);
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let o = bulk::bulk_reject_below(&dir, &filters, min, limit, dry_run, &|_| true);
-        let eligible = o.eligible;
-        if dry_run {
-            return Json(serde_json::json!({
-                "success": true,
-                "eligible": eligible,
-                "boxes": o.boxes,
-                "rejected": 0,
-                "frames": o.done,
-            }))
-            .into_response();
-        }
-        let mut message = format!(
-            "Rejected {} auto box(es) scoring below {min} on {} frame(s) (kept as hard \
-             negatives; the frames stay unreviewed).",
-            o.boxes, o.done_count
-        );
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} frame(s) not changed (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if eligible > limit {
-            message.push_str(&format!(
-                " {} more frame(s) beyond the limit of {limit}; run it again.",
-                eligible - limit
-            ));
-        }
-        tracing::info!(
-            rejected = o.boxes,
-            frames = o.done_count,
-            failed = o.failed_count,
-            eligible,
-            min_score = min,
-            "review: low-scoring auto boxes rejected"
-        );
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": eligible,
-            "boxes": o.boxes,
-            "rejected": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-/// `GET /v1/review/history?camera=<c>`: the reviewer's decisions on that camera's frames in the
-/// folder under review (accepted / rejected model and auto boxes, not by a bulk rule; newest
-/// first, at most [`labels::repeats::HISTORY_CAP`], `truncated` past it), for the Review tab's
-/// "rejected here before" hint. Cached until a label file of the folder is written.
-pub(super) async fn history(
-    State(state): State<Arc<AppState>>,
-    query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
-) -> Response {
-    let q = query_map(query);
-    let Some(camera) = q
-        .get("camera")
-        .map(|c| c.trim().to_string())
-        .filter(|c| layout::camera_ok(c))
-    else {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            "give `camera` (a camera name of the dataset, as in the frame paths)",
-        );
-    };
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let h = labels::repeats::history(&dir, &camera);
-        Json(serde_json::json!({
-            "success": true,
-            "camera": h.camera,
-            "decisions": h.decisions,
-            "truncated": h.truncated,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpotBody {
-    camera: String,
-    label: String,
-    bbox: [f32; 4],
-    width: u32,
-    height: u32,
-    #[serde(default)]
-    min_iou: Option<f32>,
-    /// reject-spot only: the reviewer's reason (`reject_reason`).
-    #[serde(default)]
-    reject_reason: Option<labels::RejectReason>,
-    /// The queue the page shows (`queue|all`; default queue).
-    #[serde(default)]
-    source: Option<String>,
-    /// A frame left alone (the one the page shows: it applies the rule there itself, so its
-    /// open edits do not run into a save conflict).
-    #[serde(default)]
-    skip_frame: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// `POST /v1/review/reject-spot` with `{camera, label, bbox, width, height, min_iou?,
-/// reject_reason?, source?, skip_frame?, dry_run, limit?}`: on the unreviewed frames of that camera (of the
-/// same size), every pending model / auto box of the same object class (vehicle classes count as
-/// one) at IoU >= `min_iou` (default 0.6, 0.3..=1) with `bbox` is rejected (`reject_reason` as
-/// given; `reason: repeat_spot` when it had no provenance) and the frame marked repeat-spot
-/// ([`bulk::bulk_spot`]), at most `limit` frames (default 500). `dry_run` only counts.
-pub(super) async fn reject_spot(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    spot_route(state, headers, body, false).await
-}
-
-/// `POST /v1/review/accept-spot`: [`reject_spot`]'s mirror for a real object that stays put (a
-/// parked car): the pending boxes of the same label at IoU >= `min_iou` (default and minimum
-/// 0.8) are accepted. `reject_reason` is refused.
-pub(super) async fn accept_spot(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    spot_route(state, headers, body, true).await
-}
-
-async fn spot_route(
-    state: Arc<AppState>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-    accept: bool,
-) -> Response {
-    use labels::repeats::{ACCEPT_SPOT_IOU, REJECT_SPOT_IOU, Spot, Verdict};
-    let b: SpotBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let camera = b.camera.trim().to_string();
-    if !layout::camera_ok(&camera) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            "camera: not a camera name of the dataset",
-        );
-    }
-    if crate::collect::config::validate_classes(std::slice::from_ref(&b.label)).is_err() {
-        return fail(StatusCode::BAD_REQUEST, "label: not a valid class name");
-    }
-    let [x0, y0, x1, y1] = b.bbox;
-    if !b.bbox.iter().all(|v| v.is_finite())
-        || x1 <= x0
-        || y1 <= y0
-        || b.width == 0
-        || b.height == 0
-    {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            "bbox: give [x0, y0, x1, y1] in pixels of the width x height frame, x1 > x0, y1 > y0",
-        );
-    }
-    let (lo, default) = if accept {
-        (ACCEPT_SPOT_IOU, ACCEPT_SPOT_IOU)
-    } else {
-        (0.3, REJECT_SPOT_IOU)
-    };
-    let min_iou = b.min_iou.unwrap_or(default);
-    if !(lo..=1.0).contains(&min_iou) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("min_iou: must be between {lo} and 1, got {min_iou}"),
-        );
-    }
-    if accept && b.reject_reason.is_some() {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            "reject_reason: only for reject-spot",
-        );
-    }
-    if let Some(labels::RejectReason::Other(r)) = &b.reject_reason {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "reject_reason: '{}' is not a reason this build knows",
-                r.escape_debug()
-            ),
-        );
-    }
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let mut q = BTreeMap::new();
-    if let Some(s) = b.source {
-        q.insert("source".to_string(), s);
-    }
-    let filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let spot = Spot {
-        camera,
-        label: b.label,
-        bbox: b.bbox,
-        width: b.width,
-        height: b.height,
-        min_iou,
-    };
-    let verdict = if accept {
-        Verdict::Accept
-    } else {
-        Verdict::Reject(b.reject_reason)
-    };
-    let (dry_run, skip) = (b.dry_run, b.skip_frame.unwrap_or_default());
-    blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let o = bulk::bulk_spot(
-            &dir,
-            &filters,
-            &classes,
-            &hidden,
-            &spot,
-            &verdict,
-            limit,
-            dry_run,
-            &|r| r != skip,
-        );
-        let verb = if accept { "Accepted" } else { "Rejected" };
-        let mut message = format!(
-            "{verb} {} {} box(es) at that spot on {} unreviewed {} frame(s) (the frames stay \
-             unreviewed; frames left with nothing to decide can be saved with \"Save \
-             repeat-only frames\").",
-            o.boxes, spot.label, o.done_count, spot.camera
-        );
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} frame(s) not changed (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if o.eligible > limit && !dry_run {
-            message.push_str(&format!(
-                " {} more frame(s) beyond the limit of {limit}; run it again.",
-                o.eligible - limit
-            ));
-        }
-        if !dry_run {
-            tracing::info!(
-                boxes = o.boxes,
-                frames = o.done_count,
-                camera = %spot.camera,
-                label = %spot.label,
-                accept,
-                "review: spot edited on every unreviewed frame"
-            );
-        }
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": o.eligible,
-            "boxes": o.boxes,
-            "changed": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": (!dry_run).then_some(message),
-        }))
-        .into_response()
-    })
-    .await
-}
-
-/// `POST /v1/review/accept-repeats` with `{bucket?, scene?, camera?, label?, source?, dry_run,
-/// limit?}`: the repeat-only frames of those filters (spot edits settled every box, none
-/// pending; [`labels::repeats::repeats_only`]) saved as reviewed with `bulk_accepted`
-/// ([`bulk::bulk_accept_repeats`]), at most `limit` (default 500). `dry_run` only counts.
-pub(super) async fn accept_repeats(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: AcceptAutoBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let q: BTreeMap<String, String> = [
-        ("bucket", b.bucket),
-        ("scene", b.scene),
-        ("camera", b.camera),
-        ("label", b.label),
-        ("source", b.source),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-    .collect();
-    let filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let dry_run = b.dry_run;
-    blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let o =
-            bulk::bulk_accept_repeats(&dir, &filters, &classes, limit, &now(), dry_run, &|_| true);
-        if dry_run {
-            return Json(serde_json::json!({
-                "success": true,
-                "eligible": o.eligible,
-                "accepted": 0,
-                "frames": o.done,
-            }))
-            .into_response();
-        }
-        let mut message = format!("Saved {} repeat-only frame(s) as reviewed.", o.done_count);
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} not saved (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if o.eligible > limit {
-            message.push_str(&format!(
-                " {} more beyond the limit of {limit}; run it again.",
-                o.eligible - limit
-            ));
-        }
-        tracing::info!(
-            saved = o.done_count,
-            failed = o.failed_count,
-            "review: repeat-only frames saved"
-        );
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": o.eligible,
-            "accepted": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-/// The camera of a spots route, or 400.
-fn spot_camera(camera: Option<&String>) -> Result<String, Problem> {
-    camera
-        .map(|c| c.trim().to_string())
-        .filter(|c| layout::camera_ok(c))
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "give `camera` (a camera name of the dataset, as in the frame paths)".to_string(),
-            )
-        })
-}
-
-/// A box of a spots route, or 400: a valid class name, `[x0, y0, x1, y1]` in pixels, inside a
-/// `width` x `height` frame once clamped, both sides at least [`labels::MIN_BOX_PX`].
-fn spot_box(label: &str, bbox: [f32; 4], width: u32, height: u32) -> Result<[f32; 4], Problem> {
-    if crate::collect::config::validate_classes(&[label.to_string()]).is_err() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "label: not a valid class name".to_string(),
-        ));
-    }
-    let c = labels::clamp_box(bbox, width, height);
-    let finite = bbox.iter().all(|v| v.is_finite());
-    if !finite || c[2] - c[0] < labels::MIN_BOX_PX || c[3] - c[1] < labels::MIN_BOX_PX {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "bbox: give [x0, y0, x1, y1] in pixels inside the frame".to_string(),
-        ));
-    }
-    Ok(c)
-}
-
-/// `GET /v1/review/spots?camera=<c>`: the camera's parked spots (every frame size, retired ones
-/// too), its rejected spots as of today, derived from the history
-/// ([`labels::spots::CameraMemory::rejected_spots`]), `moved_at`, and how many spots
-/// "Camera moved" would forget (`live`).
-pub(super) async fn spots(
-    State(state): State<Arc<AppState>>,
-    query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
-) -> Response {
-    let camera = match spot_camera(query_map(query).get("camera")) {
-        Ok(c) => c,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let store = match labels::spots::read(&dir, &camera) {
-            Ok(s) => s,
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        };
-        let today = chrono::Utc::now().date_naive();
-        let memory =
-            labels::spots::CameraMemory::new(&labels::repeats::history(&dir, &camera), store);
-        let rejected = memory.rejected_spots(today);
-        let store = memory.store();
-        Json(serde_json::json!({
-            "success": true,
-            "camera": camera,
-            "moved_at": store.moved_at,
-            "parked": store.parked,
-            "rejected": rejected,
-            "live": store.live_count() + rejected.len(),
-        }))
-        .into_response()
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpotParkedBody {
-    frame: String,
-    label: String,
-    bbox: [f32; 4],
-}
-
-/// `POST /v1/review/spots/parked` with `{frame, label, bbox}` (the page's "Real, parked"): a parked
-/// spot on the frame's camera and size, from the frame's date ([`labels::spots::add_parked`]). The
-/// page accepts the box itself, in its unsaved edits. Answers the spot and whether it is `new`.
-pub(super) async fn spots_parked(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: SpotParkedBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let Some(frame) = Frame::resolve(&dir, &b.frame) else {
-            return not_found();
-        };
-        let rec = match frame.record() {
-            Ok(r) => r,
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        };
-        let bbox = match spot_box(&b.label, b.bbox, rec.width, rec.height) {
-            Ok(c) => c,
-            Err((s, m)) => return fail(s, m),
-        };
-        let at = labels::spots::Place {
-            camera: &frame.rel.camera,
-            width: rec.width,
-            height: rec.height,
-            label: &b.label,
-            bbox,
-        };
-        match labels::spots::add_parked(&dir, &at, &frame.rel.date) {
-            Ok((spot, new)) => {
-                tracing::info!(
-                    camera = at.camera,
-                    label = at.label,
-                    new,
-                    "review: parked spot"
-                );
-                Json(serde_json::json!({ "success": true, "spot": spot, "new": new }))
-                    .into_response()
-            }
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpotRetireBody {
-    camera: String,
-    width: u32,
-    height: u32,
-    label: String,
-    bbox: [f32; 4],
-}
-
-/// `POST /v1/review/spots/retire` with `{camera, width, height, label, bbox}`: that parked spot
-/// stops counting ([`labels::spots::retire`]); 404 when there is none.
-pub(super) async fn spots_retire(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: SpotRetireBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let camera = match spot_camera(Some(&b.camera)) {
-        Ok(c) => c,
-        Err((s, m)) => return fail(s, m),
-    };
-    let bbox = match spot_box(&b.label, b.bbox, b.width, b.height) {
-        Ok(c) => c,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let at = labels::spots::Place {
-            camera: &camera,
-            width: b.width,
-            height: b.height,
-            label: &b.label,
-            bbox,
-        };
-        let today = crate::collect::utc_date(std::time::SystemTime::now());
-        match labels::spots::retire(&dir, &at, &today) {
-            Ok(true) => Json(serde_json::json!({ "success": true })).into_response(),
-            Ok(false) => fail(StatusCode::NOT_FOUND, "no parked spot there"),
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpotMovedBody {
-    camera: String,
-}
-
-/// `POST /v1/review/spots/moved` with `{camera}` ("Camera moved: forget spots"): every parked spot
-/// retires and `moved_at` is set, so rejected spots from before it stop counting too
-/// ([`labels::spots::camera_moved`]). A run already going keeps the spots it read at its start.
-pub(super) async fn spots_moved(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: SpotMovedBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let camera = match spot_camera(Some(&b.camera)) {
-        Ok(c) => c,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let at = now();
-        match labels::spots::camera_moved(&dir, &camera, &at) {
-            Ok(retired) => {
-                tracing::info!(camera, retired, "review: camera moved, spots forgotten");
-                Json(serde_json::json!({ "success": true, "retired": retired, "moved_at": at }))
-                    .into_response()
-            }
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        }
-    })
-    .await
-}
-
-/// `POST /v1/review/reject-stacked` with `{bucket?, scene?, camera?, label?, source?, dry_run,
-/// limit?}`: on the reviewed and unreviewed frames with a label file that the bucket, scene, camera
-/// and class filters select, the boxes stacked on a better box of the object (IoU >= 0.7) are
-/// rejected (`reject_reason: duplicate`, kept as evidence; [`bulk::bulk_reject_stacked`]), at most
-/// `limit` frames (default 500). The frames keep their status; drawn boxes and frames a reviewer
-/// checked (`overlaps_checked`) are left alone. `source` is checked but does not narrow the walk: a
-/// reviewed frame need not be in the review queue. `dry_run` only counts. `boxes` counts the boxes
-/// rejected, `rejected` the frames changed (as reject-low), `overlaps_left` the frames that still
-/// need a reviewer once the duplicates are gone (nested or overlapping boxes no rule can settle:
-/// `auto=overlaps`), in a dry run too.
-pub(super) async fn reject_stacked(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: RejectOtherClassBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let q: BTreeMap<String, String> = [
-        ("bucket", b.bucket),
-        ("scene", b.scene),
-        ("camera", b.camera),
-        ("label", b.label),
-        ("source", b.source),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-    .collect();
-    let filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let dry_run = b.dry_run;
-    blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
-        let done = bulk::bulk_reject_stacked(&dir, &filters, &wanted, limit, dry_run, &|_| true);
-        let (o, left, left_reviewed) = (
-            done.outcome,
-            done.overlaps_left,
-            done.overlaps_left_reviewed,
-        );
-        let mut message = if o.boxes == 0 {
-            "No stacked duplicates on the frames these filters select.".to_string()
-        } else if dry_run {
-            format!(
-                "Would reject {} stacked duplicate box(es) on {} frame(s); the frames keep their \
-                 status.",
-                o.boxes, o.eligible
-            )
-        } else {
-            format!(
-                "Rejected {} stacked duplicate box(es) on {} frame(s) (kept as evidence, reason \
-                 duplicate; reviewed frames stay reviewed).",
-                o.boxes, o.done_count
-            )
-        };
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} frame(s) not changed (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if !dry_run && o.eligible > limit {
-            message.push_str(&format!(
-                " {} more frame(s) beyond the limit of {limit}; run it again.",
-                o.eligible - limit
-            ));
-        }
-        if left > 0 {
-            message.push_str(&format!(
-                " {left} frame(s) still have overlapping boxes no rule can settle, \
-                 {left_reviewed} of them reviewed (those are the ones training uses): set Auto \
-                 to overlapping boxes, Status to reviewed and Frames to all collected, then keep \
-                 or reject them by hand."
-            ));
-        }
-        if !dry_run {
-            tracing::info!(
-                boxes = o.boxes,
-                frames = o.done_count,
-                failed = o.failed_count,
-                eligible = o.eligible,
-                overlaps_left = left,
-                "review: stacked duplicates rejected"
-            );
-        }
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": o.eligible,
-            "boxes": o.boxes,
-            "rejected": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-            "overlaps_left": left,
-            "overlaps_left_reviewed": left_reviewed,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-/// `POST /v1/review/restore-reopened` with `{bucket?, scene?, camera?, label?, source?, dry_run,
-/// limit?}`: the undo of a re-label that reopened reviewed frames. On the unreviewed frames of those
-/// filters, a frame with a `disagreement` note, a `reviewed_at` and nothing pending goes back to
-/// reviewed and loses the note ([`bulk::bulk_restore_reopened`], re-checked under the write lock),
-/// at most `limit` frames (default 500). Frames with a pending box and frames never reviewed are
-/// not touched. `dry_run` only counts. `eligible` counts the frames, `restored` those changed.
-pub(super) async fn restore_reopened(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: RejectOtherClassBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let mut q: BTreeMap<String, String> = [
-        ("bucket", b.bucket),
-        ("scene", b.scene),
-        ("camera", b.camera),
-        ("label", b.label),
-        ("source", b.source),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-    .collect();
-    q.insert("status".into(), "unreviewed".into());
-    let filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let dry_run = b.dry_run;
-    blocking(move || {
-        let (dir, _, _) = context(&state);
-        let o = bulk::bulk_restore_reopened(&dir, &filters, limit, dry_run, &|_| true);
-        let eligible = o.eligible;
-        if dry_run {
-            return Json(serde_json::json!({
-                "success": true,
-                "eligible": eligible,
-                "restored": 0,
-                "frames": o.done,
-            }))
-            .into_response();
-        }
-        let mut message = format!(
-            "Restored {} reopened frame(s) to reviewed (their boxes are unchanged; they are back \
-             in exports).",
-            o.done_count
-        );
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} frame(s) not changed (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if eligible > limit {
-            message.push_str(&format!(
-                " {} more frame(s) beyond the limit of {limit}; run it again.",
-                eligible - limit
-            ));
-        }
-        tracing::info!(
-            restored = o.done_count,
-            failed = o.failed_count,
-            eligible,
-            "review: reopened frames restored"
-        );
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": eligible,
-            "restored": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SuggestOverlapsBody {
-    #[serde(default)]
-    bucket: Option<String>,
-    #[serde(default)]
-    scene: Option<String>,
-    #[serde(default)]
-    camera: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    gpu: Option<String>,
-    #[serde(default)]
-    allow_large: bool,
-    /// Also pairs with an answer.
-    #[serde(default)]
-    again: bool,
-    #[serde(default)]
-    dry_run: bool,
-}
-
-/// `POST /v1/review/suggest-overlaps` with `{bucket?, scene?, camera?, label?, gpu?, allow_large?,
-/// again?, dry_run?}`: queue the overlap check ([`crate::training::overlaps`]) on the label files
-/// of the folder under review those filters select, reviewed frames too (no `source` or `status`
-/// narrows it, a reviewed frame need not be in the review queue). It writes suggestions and nothing
-/// else. `dry_run` only counts (`frames`, `pairs`, `crops`, `no_zoom`, `answered`, `passed_over`), and
-/// needs no GPU. Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
-pub(super) async fn suggest_overlaps(
-    State(shared): State<Shared>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    use crate::training::overlaps::{OverlapsRequest, plan_overlaps, select};
-    let b: SuggestOverlapsBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let state = shared.current();
-        let mut req = match OverlapsRequest::parse(if b.again { "again=1" } else { "" }) {
-            Ok(r) => r,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
-        };
-        for (k, v) in [
-            ("bucket", b.bucket),
-            ("scene", b.scene),
-            ("camera", b.camera),
-            ("label", b.label),
-        ] {
-            if let Some(v) = v.filter(|v| !v.trim().is_empty()) {
-                req.frames.query.insert(k.to_string(), v);
-            }
-        }
-        req.gpu = b.gpu;
-        req.allow_large = b.allow_large;
-        if let Err(e) = req.frames.filters() {
-            return fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
-        }
-        if b.dry_run {
-            let (dir, classes, _) = context(&state);
-            let hidden = hidden(&state);
-            let wanted = bulk::Wanted {
-                classes: &classes,
-                hidden: &hidden,
-            };
-            let s = match select::select(&dir, &req.frames, &wanted) {
-                Ok(s) => s,
-                Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
-            };
-            let message = (s.pairs == 0).then(|| {
-                let again = if s.answered > 0 {
-                    "; tick Ask again to check the answered ones again"
-                } else {
-                    ""
-                };
-                format!(
-                    "No open overlap without an answer on these frames ({} pairs answered before, \
-                     {} frames skipped or checked by a reviewer){again}.",
-                    s.answered, s.passed_over
-                )
-            });
-            return Json(serde_json::json!({
-                "success": true,
-                "frames": s.frame_count,
-                "pairs": s.pairs,
-                "no_zoom": s.no_zoom,
-                "crops": s.crops,
-                "answered": s.answered,
-                "passed_over": s.passed_over,
-                "message": message,
-            }))
-            .into_response();
-        }
-        let config = state.config_read().clone();
-        let cap = crate::training::capability_now();
-        let job = match plan_overlaps(&config, req, &cap) {
-            Ok(j) => j,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("Not queued: {e:#}")),
-        };
-        let title = crate::training::task::Task::title(&job);
-        match super::training::service(&shared).enqueue_task(Box::new(job)) {
-            Ok(id) => Json(serde_json::json!({
-                "success": true,
-                "id": id,
-                "message": format!(
-                    "Queued: {title}. It writes suggestions only: no box changes until you \
-                     confirm one here."
-                ),
-            }))
-            .into_response(),
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not queued: {e}")),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectOtherClassBody {
-    #[serde(default)]
-    bucket: Option<String>,
-    #[serde(default)]
-    scene: Option<String>,
-    #[serde(default)]
-    camera: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// `POST /v1/review/reject-other-class` with `{bucket?, scene?, camera?, label?, source?,
-/// dry_run, limit?}`: on the unreviewed frames of those filters, the pending model and auto boxes
-/// of unwanted classes (not in `collect.classes`, or in `collect.hidden_classes`) rejected with
-/// `reason: other_class` (kept as evidence), or renamed to the list's spelling when the label is
-/// a wanted class under another name (`pottedplant` -> `potted plant`;
-/// [`bulk::bulk_reject_other_class`]), at most `limit` frames (default 500). `dry_run` only
-/// counts. `boxes` counts the boxes changed, `relabelled` the renamed ones among them,
-/// `rejected` the frames changed (as reject-low); `reviewed_with_unwanted` the reviewed frames
-/// that still hold training boxes of unwanted classes
-/// ([`bulk::reviewed_with_unwanted`]; `POST /v1/review/reject-unwanted-reviewed` rejects them).
-pub(super) async fn reject_other_class(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: RejectOtherClassBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_DEFAULT_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let mut q: BTreeMap<String, String> = [
-        ("bucket", b.bucket),
-        ("scene", b.scene),
-        ("camera", b.camera),
-        ("label", b.label),
-        ("source", b.source),
-    ]
-    .into_iter()
-    .filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
-    .collect();
-    q.insert("status".into(), "unreviewed".into());
-    let filters = match Filters::from_query(&q) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let dry_run = b.dry_run;
-    blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
-        let o = bulk::bulk_reject_other_class(&dir, &filters, &wanted, limit, dry_run, &|_| true);
-        let eligible = o.eligible;
-        let reviewed = bulk::reviewed_with_unwanted(&dir, &wanted);
-        if dry_run {
-            return Json(serde_json::json!({
-                "success": true,
-                "eligible": eligible,
-                "boxes": o.boxes,
-                "relabelled": o.relabelled,
-                "rejected": 0,
-                "frames": o.done,
-                "reviewed_with_unwanted": reviewed,
-            }))
-            .into_response();
-        }
-        let mut message = format!(
-            "Rejected {} pending box(es) of unwanted classes on {} frame(s) (kept as evidence, \
-             reason other_class; the frames stay unreviewed).",
-            o.boxes - o.relabelled,
-            o.done_count
-        );
-        if o.relabelled > 0 {
-            message.push_str(&format!(
-                " Renamed {} box(es) to the class list's spelling.",
-                o.relabelled
-            ));
-        }
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} frame(s) not changed (listed); review them by hand.",
-                o.failed_count
-            ));
-        }
-        if eligible > limit {
-            message.push_str(&format!(
-                " {} more frame(s) beyond the limit of {limit}; run it again.",
-                eligible - limit
-            ));
-        }
-        tracing::info!(
-            boxes = o.boxes,
-            relabelled = o.relabelled,
-            frames = o.done_count,
-            failed = o.failed_count,
-            eligible,
-            "review: pending boxes of unwanted classes rejected"
-        );
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": eligible,
-            "boxes": o.boxes,
-            "relabelled": o.relabelled,
-            "rejected": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-            "reviewed_with_unwanted": reviewed,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectUnwantedReviewedBody {
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// `POST /v1/review/reject-unwanted-reviewed` with `{dry_run, limit?}`: on the reviewed frames
-/// of the folder under review, the training boxes (accepted or added) of unwanted classes (not in
-/// `collect.classes`, or in `collect.hidden_classes`) rejected with `reason: other_class`; the
-/// frames stay reviewed ([`bulk::bulk_reject_unwanted`] with [`bulk::Scope::Reviewed`]), at most
-/// `limit` frames (default and most [`ACCEPT_AUTO_MAX_LIMIT`]). `dry_run` only counts: `eligible`
-/// frames, `boxes`, `classes` (their labels). The Review tab asks before it calls this.
-pub(super) async fn reject_unwanted_reviewed(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: RejectUnwantedReviewedBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let limit = b.limit.unwrap_or(ACCEPT_AUTO_MAX_LIMIT);
-    if !(1..=ACCEPT_AUTO_MAX_LIMIT).contains(&limit) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("limit: must be between 1 and {ACCEPT_AUTO_MAX_LIMIT}, got {limit}"),
-        );
-    }
-    let dry_run = b.dry_run;
-    blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
-        if dry_run {
-            let r = bulk::reviewed_with_unwanted(&dir, &wanted);
-            return Json(serde_json::json!({
-                "success": true,
-                "eligible": r.frames,
-                "boxes": r.boxes,
-                "classes": r.classes,
-                "rejected": 0,
-            }))
-            .into_response();
-        }
-        let o = bulk::bulk_reject_unwanted(&dir, &wanted, bulk::Scope::Reviewed, limit, false);
-        let eligible = o.eligible;
-        let mut message = format!(
-            "Rejected {} accepted box(es) of unwanted classes on {} reviewed frame(s) (kept as \
-             evidence, reason other_class; the frames stay reviewed).",
-            o.boxes, o.done_count
-        );
-        if o.failed_count > 0 {
-            message.push_str(&format!(
-                " {} frame(s) not changed (listed); fix them by hand.",
-                o.failed_count
-            ));
-        }
-        if eligible > limit {
-            message.push_str(&format!(
-                " {} more frame(s) beyond the limit of {limit}; run it again.",
-                eligible - limit
-            ));
-        }
-        tracing::info!(
-            boxes = o.boxes,
-            frames = o.done_count,
-            failed = o.failed_count,
-            eligible,
-            "review: accepted boxes of unwanted classes rejected on reviewed frames"
-        );
-        Json(serde_json::json!({
-            "success": true,
-            "eligible": eligible,
-            "boxes": o.boxes,
-            "rejected": o.done_count,
-            "failed": o.failed,
-            "frames": o.done,
-            "message": message,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-/// One format or a list (`"yolo"`, `["yolo", "coco"]`, `"all"`).
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Formats {
-    One(String),
-    Many(Vec<String>),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExportBody {
-    #[serde(alias = "format")]
-    formats: Option<Formats>,
-    out_dir: Option<String>,
-    #[serde(default)]
-    holdout_cameras: Vec<String>,
-    #[serde(default)]
-    holdout_days: Vec<String>,
-    holdout_fraction: Option<f32>,
-    #[serde(default)]
-    benchmark_split: BenchSplit,
-    #[serde(default)]
-    include_unreviewed: bool,
-    /// Only frames with a training box of these classes; empty = every class.
-    #[serde(default)]
-    labels: Vec<String>,
-    /// Also frames confirmed empty.
-    #[serde(default = "default_true")]
-    include_empty: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// The export's class filter: names trimmed, blanks and repeats dropped, every one in
-/// `classes` (else the message for a 400).
-fn class_filter(
-    labels: Vec<String>,
-    include_empty: bool,
-    classes: &[String],
-) -> Result<ClassFilter, String> {
-    let mut out: Vec<String> = Vec::new();
-    for l in labels.iter().map(|l| l.trim()).filter(|l| !l.is_empty()) {
-        if !out.iter().any(|o| o == l) {
-            out.push(l.to_string());
-        }
-    }
-    let f = ClassFilter {
-        labels: out,
-        include_empty,
-    };
-    f.check(classes)
-        .map_err(|e| format!("Not exported: {e:#}"))?;
-    Ok(f)
-}
-
-fn parse_formats(f: Option<Formats>) -> Result<Vec<Format>, String> {
-    let list = match f {
-        None => return Ok(Format::ALL.to_vec()),
-        Some(Formats::One(s)) => vec![s],
-        Some(Formats::Many(v)) => v,
-    };
-    let mut out = Vec::new();
-    for s in list {
-        if s.trim().eq_ignore_ascii_case("all") {
-            return Ok(Format::ALL.to_vec());
-        }
-        let f = Format::parse(&s).ok_or_else(|| {
-            format!("format: '{s}' is not one of yolo, coco, xanylabeling, benchmark, all")
-        })?;
-        if !out.contains(&f) {
-            out.push(f);
-        }
-    }
-    if out.is_empty() {
-        return Err("format: give at least one of yolo, coco, xanylabeling, benchmark".into());
-    }
-    Ok(out)
-}
-
-/// A folder a client named for this server to read or write: well formed and no system folder
-/// ([`crate::config::validate_dir_setting`], 400), then [`allowed_folder`]. `Ok(None)` when
-/// `allowed_folder` found nothing there.
-fn named_folder(
-    state: &AppState,
-    key: &str,
-    raw: &str,
-    root: &std::path::Path,
-) -> Result<Option<PathBuf>, (StatusCode, String)> {
-    match crate::config::validate_dir_setting(key, raw, root) {
-        Ok(Some(_)) => {}
-        Ok(None) => return Err((StatusCode::BAD_REQUEST, format!("{key}: empty"))),
-        Err(e) => return Err((StatusCode::BAD_REQUEST, format!("{e:#}"))),
-    }
-    let config = state.config_read().clone();
-    match allowed_folder(state, &config, raw) {
-        Ok(p) => Ok(Some(p)),
-        Err((StatusCode::NOT_FOUND, _)) => Ok(None),
-        Err(e) => Err(folder_refusal(key, e)),
-    }
-}
-
-/// `refusal` of a folder under the setting's name, with what to do about it.
-fn folder_refusal(key: &str, (status, message): (StatusCode, String)) -> (StatusCode, String) {
-    let message = format!("{key}: {message}; choose the folder with the Browse button instead");
-    (status, message)
-}
-
-/// Where a client-named export goes ([`named_folder`]). The export creates it, so a folder that
-/// does not exist yet is fine inside the browsable folders or a native pick.
-fn export_folder(
-    state: &AppState,
-    raw: &str,
-    root: &std::path::Path,
-) -> Result<PathBuf, (StatusCode, String)> {
-    if let Some(p) = named_folder(state, "out_dir", raw, root)? {
-        return Ok(p);
-    }
-    let config = state.config_read().clone();
-    super::browse::allowed_or_missing_inside_roots(&config, raw)
-        .map_err(|e| folder_refusal("out_dir", e.into_parts()))
-}
-
-/// `POST /v1/review/export` with `{format(s), out_dir?, holdout_cameras?, holdout_days?,
-/// holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`.
-pub(super) async fn export(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: ExportBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    let formats = match parse_formats(b.formats) {
-        Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-    };
-    let fraction = b
-        .holdout_fraction
-        .unwrap_or(export::DEFAULT_HOLDOUT_FRACTION);
-    if !(fraction.is_finite() && (0.0..=1.0).contains(&fraction)) {
-        return fail(
-            StatusCode::BAD_REQUEST,
-            format!("holdout_fraction: must be between 0 and 1, got {fraction}"),
-        );
-    }
-    blocking(move || {
-        let (dir, classes, root) = context(&state);
-        if let Some(message) = folder_problem(&state, &dir) {
-            return folder_unavailable(message);
-        }
-        let filter = match class_filter(b.labels, b.include_empty, &classes) {
-            Ok(f) => f,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, e),
-        };
-        let out_dir = match b.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            None => {
-                exports_dir(&state).join(crate::collect::utc_file_ts(std::time::SystemTime::now()))
-            }
-            Some(raw) => match export_folder(&state, raw, &root) {
-                Ok(p) => p,
-                Err((s, m)) => return fail(s, m),
-            },
-        };
-        let req = ExportRequest {
-            formats,
-            out_dir,
-            split: SplitConfig {
-                holdout_cameras: b.holdout_cameras,
-                holdout_days: b.holdout_days,
-                holdout_fraction: fraction,
-            },
-            benchmark_split: b.benchmark_split,
-            include_unreviewed: b.include_unreviewed,
-            hidden_classes: hidden(&state),
-        };
-        match export::run_filtered(&dir, &classes, &req, &filter) {
-            Ok(r) => {
-                tracing::info!(out = %r.out_dir.display(), frames = r.frames, "review export written");
-                Json(serde_json::json!({ "success": true, "report": r })).into_response()
-            }
-            Err(e) => fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not exported: {e:#}")),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ImportBody {
-    dir: String,
-    #[serde(default)]
-    treat_unchecked_as_reviewed: bool,
-}
-
-/// `POST /v1/review/import` with `{dir, treat_unchecked_as_reviewed?}`: X-AnyLabeling files of
-/// exported frames back into their label files.
-pub(super) async fn import(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: ImportBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let (dir, classes, root) = context(&state);
-        if let Some(message) = folder_problem(&state, &dir) {
-            return folder_unavailable(message);
-        }
-        let src = match named_folder(&state, "dir", &b.dir, &root) {
-            Ok(Some(p)) if p.is_dir() => p,
-            Ok(Some(_)) => {
-                return fail(
-                    StatusCode::BAD_REQUEST,
-                    format!("dir: '{}' is not a folder", b.dir),
-                );
-            }
-            Ok(None) => {
-                return fail(
-                    StatusCode::NOT_FOUND,
-                    format!("dir: '{}' does not exist; choose the folder again", b.dir),
-                );
-            }
-            Err((s, m)) => return fail(s, m),
-        };
-        let hidden = hidden(&state);
-        match xany::import_dir(
-            &dir,
-            &src,
-            &classes,
-            &hidden,
-            b.treat_unchecked_as_reviewed,
-            &now(),
-        ) {
-            Ok(r) => Json(serde_json::json!({ "success": true, "report": r })).into_response(),
-            Err(e) => fail(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("Not imported: {e:#}"),
-            ),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FolderBody {
-    dir: String,
-}
-
-/// `POST /v1/review/folder` with `{dir}`: the folder this page, its exports and the auto-labeler
-/// work on (`collect.review_dir`), for frames an import saved outside the dataset folder. Empty or
-/// the dataset folder itself = back to the dataset folder. Like the import's paths, it must be a
-/// browsable folder, one picked in the native dialog or one already in use ([`allowed_folder`]).
-pub(super) async fn folder(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: FolderBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let config = state.config_read().clone();
-        let dataset = CollectSettings::for_config(&config).dir;
-        let raw = b.dir.trim();
-        let chosen = if raw.is_empty() {
-            None
-        } else {
-            let p = match allowed_folder(&state, &config, raw) {
-                Ok(p) => p,
-                Err((s, m)) => return fail(s, format!("Folder not changed: {m}")),
-            };
-            if !p.is_dir() {
-                return fail(
-                    StatusCode::BAD_REQUEST,
-                    format!("Folder not changed: {raw} is not a folder"),
-                );
-            }
-            let same = dataset
-                .canonicalize()
-                .is_ok_and(|d| super::browse::plain(&d) == p);
-            (!same).then_some(p)
-        };
-        let result = save_config(&state, "review page", |c| {
-            crate::collect::config::set_review_dir(c, chosen.clone())
-        });
-        match result {
-            Ok(msg) => Json(serde_json::json!({
-                "success": true,
-                "message": msg,
-                "dir": chosen.as_ref().unwrap_or(&dataset),
-            }))
-            .into_response(),
-            Err(e) => fail(
-                StatusCode::BAD_REQUEST,
-                format!("Folder not changed: {e:#}"),
-            ),
-        }
-    })
-    .await
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClassesBody {
-    classes: Vec<String>,
-    /// `collect.hidden_classes`; absent = unchanged (pruned to the names still listed).
-    #[serde(default)]
-    hidden: Option<Vec<String>>,
-}
-
-/// The classes `old` wanted (its list without its hidden ones) that `new` does not: removed
-/// from the list or newly hidden, in the old list's order.
-fn newly_unwanted(old: &bulk::Wanted<'_>, new: &bulk::Wanted<'_>) -> Vec<String> {
-    old.classes
-        .iter()
-        .filter(|c| old.class_of(c).is_some() && new.class_of(c).is_none())
-        .cloned()
-        .collect()
-}
-
-/// `POST /v1/review/classes` with `{classes: [...], hidden?: [...]}`: saves `collect.classes`
-/// and, when given, `collect.hidden_classes` (each must be listed; "don't want": hidden from
-/// Review and their pending boxes rejected); hidden names no longer listed are dropped. Answers
-/// both. When the save makes classes unwanted (removed or newly hidden: `newly_unwanted`), the
-/// pending model and auto boxes of unwanted classes on the unreviewed frames of the folder under
-/// review are rejected right away (`auto_rejected: {frames, boxes, relabelled, failed}`,
-/// [`bulk::bulk_reject_unwanted`]) and `reviewed_with_unwanted: {frames, boxes, classes}` counts
-/// the reviewed frames still holding accepted boxes of unwanted classes (the page asks before
-/// `POST /v1/review/reject-unwanted-reviewed`); both zero otherwise.
-pub(super) async fn classes(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
-    let b: ClassesBody = match json_body(&headers, body) {
-        Ok(b) => b,
-        Err((s, m)) => return fail(s, m),
-    };
-    blocking(move || {
-        let classes: Vec<String> = b
-            .classes
-            .into_iter()
-            .map(|c| c.trim().to_string())
-            .collect();
-        let hidden_req: Option<Vec<String>> = b
-            .hidden
-            .map(|h| h.into_iter().map(|c| c.trim().to_string()).collect());
-        let mut hidden = Vec::new();
-        let (mut old_classes, mut old_hidden) = (Vec::new(), Vec::new());
-        let mut dir = PathBuf::new();
-        let result = save_config(&state, "review page", |c| {
-            old_classes = c.collect.classes.clone();
-            old_hidden = c.collect.hidden_classes.clone();
-            c.collect.classes = classes.clone();
-            match &hidden_req {
-                Some(h) => c.collect.hidden_classes = h.clone(),
-                None => c.collect.prune_hidden(),
-            }
-            c.collect.validate(&c.data_root())?;
-            hidden = c.collect.hidden_classes.clone();
-            dir = c.collect.resolved_review_dir(&c.data_root());
-            Ok(())
-        });
-        let msg = match result {
-            Ok(msg) => msg,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
-        };
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
-        let old = bulk::Wanted {
-            classes: &old_classes,
-            hidden: &old_hidden,
-        };
-        let gone = newly_unwanted(&old, &wanted);
-        let (rejected, reviewed) = if gone.is_empty() {
-            (
-                bulk::BulkOutcome::default(),
-                bulk::ReviewedUnwanted::default(),
-            )
-        } else {
-            let o = bulk::bulk_reject_unwanted(
-                &dir,
-                &wanted,
-                bulk::Scope::Unreviewed,
-                usize::MAX,
-                false,
-            );
-            tracing::info!(
-                classes = %gone.join(", "),
-                boxes = o.boxes,
-                frames = o.done_count,
-                failed = o.failed_count,
-                "review: classes no longer wanted; their pending boxes rejected"
-            );
-            (o, bulk::reviewed_with_unwanted(&dir, &wanted))
-        };
-        Json(serde_json::json!({
-            "success": true,
-            "message": msg,
-            "classes": classes,
-            "hidden": hidden,
-            "classes_version": labels::classes_version(&classes),
-            "newly_unwanted": gone,
-            "auto_rejected": {
-                "frames": rejected.done_count,
-                "boxes": rejected.boxes,
-                "relabelled": rejected.relabelled,
-                "failed": rejected.failed,
-            },
-            "reviewed_with_unwanted": reviewed,
-        }))
-        .into_response()
-    })
-    .await
-}
-
-/// `GET /v1/review/class-catalog`: the class list, the hidden classes, the classes the enabled
-/// models report, the models' classes and every class worth offering
-/// ([`crate::training::autolabel::catalog::ClassCatalog`]; reads the models' class files).
-pub(super) async fn class_catalog(State(state): State<Arc<AppState>>) -> Response {
-    blocking(move || {
-        let config = state.config_read().clone();
-        let cat = crate::training::autolabel::catalog::ClassCatalog::for_config(&config);
-        let mut v = match serde_json::to_value(&cat) {
-            Ok(v) => v,
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-        };
-        if let Some(o) = v.as_object_mut() {
-            o.insert("success".into(), true.into());
-        }
-        Json(v).into_response()
-    })
-    .await
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -3159,6 +1472,123 @@ mod tests {
         let bad = r#"{"status":"reviewed"}"#;
         let (st, _) = json(&d.state, post_json("/v1/review/suggest-overlaps", bad)).await;
         assert_ne!(st, StatusCode::OK);
+    }
+
+    /// The message ends the bulk routes share, in each route's words, byte for byte.
+    #[test]
+    fn the_bulk_message_ends_keep_each_routes_words() {
+        let end = |failed: usize, not_done: &str, fix: &str, eligible: usize, more: &str| {
+            let mut m = String::from("Done.");
+            push_failed(&mut m, failed, not_done, fix);
+            push_past_limit(&mut m, eligible, 10, more);
+            m
+        };
+        assert_eq!(end(0, "not saved", "review", 10, "more"), "Done.");
+        assert_eq!(
+            end(2, "not accepted", "review", 13, "more eligible"),
+            "Done. 2 not accepted (listed); review them by hand. 3 more eligible beyond the \
+             limit of 10; run it again."
+        );
+        assert_eq!(
+            end(1, "frame(s) not changed", "fix", 11, "more frame(s)"),
+            "Done. 1 frame(s) not changed (listed); fix them by hand. 1 more frame(s) beyond \
+             the limit of 10; run it again."
+        );
+        assert_eq!(
+            end(4, "not saved", "review", 20, "more"),
+            "Done. 4 not saved (listed); review them by hand. 10 more beyond the limit of 10; \
+             run it again."
+        );
+        let refused = |l: Option<usize>| bulk_limit(l, ACCEPT_AUTO_DEFAULT_LIMIT);
+        assert_eq!(refused(None), Ok(ACCEPT_AUTO_DEFAULT_LIMIT));
+        assert_eq!(
+            refused(Some(ACCEPT_AUTO_MAX_LIMIT)),
+            Ok(ACCEPT_AUTO_MAX_LIMIT)
+        );
+        assert_eq!(
+            refused(Some(0)),
+            Err((
+                StatusCode::BAD_REQUEST,
+                "limit: must be between 1 and 20000, got 0".to_string()
+            ))
+        );
+        let f = bulk_filters(
+            [None, Some("ir".into()), None, None, None],
+            &[("status", "unreviewed")],
+        )
+        .unwrap();
+        assert_eq!(
+            f,
+            Filters::from_query(&BTreeMap::from([
+                ("scene".to_string(), "ir".to_string()),
+                ("status".to_string(), "unreviewed".to_string()),
+            ]))
+            .unwrap()
+        );
+        assert_eq!(
+            bulk_filters([None, Some("dusk".into()), None, None, None], &[]).map(|_| ()),
+            Err((
+                StatusCode::BAD_REQUEST,
+                Filters::from_query(&BTreeMap::from([("scene".to_string(), "dusk".to_string())]))
+                    .unwrap_err()
+            ))
+        );
+    }
+
+    /// RR-T9: two boxes at one position, the first relabelled by a reviewer, and a drop keyed to
+    /// that position. `overlap_live` names only the suggestion; `overlap_live_boxes` names the boxes
+    /// the server chose (the second, never the relabelled one), in the file as served.
+    #[tokio::test]
+    async fn a_live_suggestion_names_its_boxes_so_a_relabelled_twin_is_not_dropped() {
+        use crate::collect::labels::overlaps::{Suggestion, Verdict};
+        let d = ds_with(|c| c.collect.classes = vec!["car".into(), "truck".into()]);
+        let rel = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let q = encode_uri_component(&rel);
+        let path = d
+            .dir
+            .join("ir/drive/2026-10-21/20261021T010203004Z_a.labels.json");
+        let car = |bbox: [f32; 4]| labels::LabelBox {
+            label: "car".into(),
+            bbox,
+            source: labels::Source::Auto,
+            score: Some(0.5),
+            state: labels::BoxState::Pending,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: labels::AutoInfo::default(),
+        };
+        let (keep, inner) = ([0.0, 0.0, 100.0, 100.0], [10.0, 10.0, 60.0, 60.0]);
+        let mut relabelled = car(inner);
+        relabelled.model_label = Some("truck".into());
+        let mut hit = car(inner);
+        hit.state = labels::BoxState::Accepted;
+        let f = LabelFile {
+            boxes: vec![relabelled, hit, car(keep)],
+            overlap_suggestions: vec![Suggestion {
+                a: keep,
+                b: inner,
+                verdict: Verdict::DropB,
+                why: String::new(),
+                kept_score: Some(0.8),
+                other_score: Some(0.0),
+                low_confidence: false,
+                weak: false,
+            }],
+            ..LabelFile::default()
+        };
+        labels::write(&path, &f).unwrap();
+        let (st, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(st, StatusCode::OK, "{l}");
+        // The old field, for an old page, is unchanged.
+        assert_eq!(l["overlap_live"], serde_json::json!([0]));
+        assert_eq!(
+            l["overlap_live_boxes"],
+            serde_json::json!([{"index": 0, "a": 2, "b": 1}])
+        );
     }
 
     #[tokio::test]

@@ -807,17 +807,6 @@ fn extension(r: &RunRecord) -> Option<&crate::training::progress::ExtensionNotic
     r.progress.as_ref()?.extension.as_ref()
 }
 
-fn state_str(s: RunState) -> &'static str {
-    match s {
-        RunState::Queued => "queued",
-        RunState::Running => "running",
-        RunState::Paused => "paused",
-        RunState::Done => "done",
-        RunState::Failed => "failed",
-        RunState::Cancelled => "cancelled",
-    }
-}
-
 /// The Benchmark page's Compare tab on the images a run was benchmarked on: its held-out set
 /// comes first in `datasets`. Without a benchmark the page opens on its default set.
 fn compare_href(b: Option<&BenchSummary>) -> String {
@@ -978,7 +967,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                             if r.state == RunState::Done {
                                 "not benchmarked".to_string()
                             } else {
-                                state_str(r.state).to_string()
+                                r.state.as_str().to_string()
                             }
                         })
                         .unwrap_or_default();
@@ -1341,7 +1330,7 @@ fn view_with(
             id: r.id.clone(),
             name: r.name.clone(),
             model: r.request.recipe.label(),
-            state: state_str(r.state),
+            state: r.state.as_str(),
             busy: r.state.is_busy(),
             can_finish: can_finish(r),
             extend: extension(r).map_or_else(String::new, |n| n.text.clone()),
@@ -1808,25 +1797,24 @@ pub(crate) fn requests_from_form(
     {
         let (family, size) =
             recipe::parse_label(m).ok_or_else(|| anyhow::anyhow!("model: unknown '{m}'"))?;
-        let mut r = TrainRecipe::new(family, size)?;
-        r.epochs = epochs.unwrap_or_else(|| training.epochs_for(family));
-        // A typed patience is checked against the epochs; a default one is capped by them.
-        r.patience = patience.unwrap_or_else(|| training.patience_for(family).min(r.epochs));
-        r.patience_recommended = patience.is_none() && training.patience.is_none();
-        if let Some(i) = imgsz {
-            r.imgsz = i;
-        }
-        r.batch = batch.unwrap_or_else(|| {
-            cap.family(family)
-                .and_then(|x| x.sizes.iter().find(|s| s.size == size))
-                .and_then(|s| s.suggested_batch)
-                .unwrap_or(r.batch)
-                .min(16)
-        });
-        training.apply_lr(&mut r, lr, lr_schedule, lr_min_factor);
-        r.select_metric = training.select_metric_for(select_metric);
-        r.augment = augment;
-        r.multi_scale = multi_scale;
+        let r = recipe::build_recipe(
+            family,
+            size,
+            &recipe::RecipeInputs {
+                epochs,
+                patience,
+                imgsz,
+                batch,
+                lr,
+                lr_schedule,
+                lr_min_factor,
+                select_metric,
+                augment,
+                multi_scale,
+            },
+            training,
+            cap,
+        )?;
         let request = TrainRequest {
             recipe: r,
             datasets: data.datasets.clone(),
@@ -2324,7 +2312,7 @@ pub(super) async fn compare_json(
                 "runs": rs
                     .iter()
                     .map(|r| serde_json::json!({
-                        "id": r.id, "name": r.name, "state": state_str(r.state)
+                        "id": r.id, "name": r.name, "state": r.state.as_str()
                     }))
                     .collect::<Vec<_>>(),
                 "text": c.render_text(),
@@ -3100,6 +3088,48 @@ pub(super) mod tests {
             &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
             Some(16.0),
         )
+    }
+
+    /// The form and `train run` build their recipe through `recipe::build_recipe`: the same
+    /// typed values give the same recipe whichever edge parsed them.
+    #[test]
+    fn the_form_recipe_is_the_shared_builder_s() {
+        let cap = mac();
+        let training = crate::training::config::TrainingConfig::default();
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("epochs", "12"),
+            ("patience", "4"),
+            ("batch", "3"),
+            ("imgsz", "480"),
+            ("lr", "0.002"),
+            ("lr_schedule", "cosine"),
+            ("lr_min_factor", "0.05"),
+            ("night_aug", "1"),
+            ("multi_scale", "off"),
+        ]);
+        let (reqs, _) = requests_from_form(&f, &cap, &training).unwrap();
+        let direct = recipe::build_recipe(
+            crate::resources::catalog::TrainFamily::Yolo26,
+            "n",
+            &recipe::RecipeInputs {
+                epochs: Some(12),
+                patience: Some(4),
+                imgsz: Some(480),
+                batch: Some(3),
+                lr: Some(0.002),
+                lr_schedule: Some(recipe::LrSchedule::Cosine),
+                lr_min_factor: Some(0.05),
+                select_metric: None,
+                augment: Augment::NIGHT,
+                multi_scale: recipe::MultiScale::parse("off").unwrap(),
+            },
+            &training,
+            &cap,
+        )
+        .unwrap();
+        assert_eq!(reqs[0].recipe, direct);
     }
 
     #[test]

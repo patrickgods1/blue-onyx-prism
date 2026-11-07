@@ -32,12 +32,13 @@ const clone = (v) => JSON.parse(JSON.stringify(v));
 // What a save strips from the file (assets/review.js `save`).
 const saved = (labels) => {
   (labels.overlap_suggestions || []).forEach((s) => { delete s._done; });
-  labels.boxes.forEach((b) => { delete b._checked; delete b._relabelled; });
+  labels.boxes.forEach((b) => { delete b._checked; delete b._relabelled; delete b._n; });
   return labels;
 };
-const liveOf = (labels, ok, classes, hidden) => {
+// `served`: what GET /v1/review/labels says is live (`overlap_live`, `overlap_live_boxes`).
+const liveOf = (labels, served, classes, hidden) => {
   const d = R.dupGroups(labels.boxes, classes, hidden);
-  return R.liveSuggestions({ labels: labels, overlap_live: ok }, d);
+  return R.liveSuggestions(Object.assign({ labels: labels }, served), d);
 };
 const brief = (l) => l.map((g) => ({ index: g.index, a: g.a, b: g.b, drop: g.drop, keep: g.keep }));
 // `relabel` of assets/review.js, the part that decides.
@@ -51,8 +52,11 @@ const relabel = (b, label) => {
 };
 const frame = (c, classes, hidden) => {
   const labels = c.labels;
+  // What the page does with every answer (assets/review.js `loadFrame`).
+  R.markServed(labels);
   const d = R.dupGroups(labels.boxes, classes, hidden);
-  const live = R.liveSuggestions({ labels: labels, overlap_live: c.overlap_live }, d);
+  const served = { overlap_live: c.overlap_live, overlap_live_boxes: c.overlap_live_boxes };
+  const live = R.liveSuggestions(Object.assign({ labels: labels }, served), d);
   const pending = clone(labels);
   R.pendingDupDrops(d, pending.boxes).forEach((k) => { R.markDuplicate(pending.boxes[k]); });
   return {
@@ -63,18 +67,18 @@ const frame = (c, classes, hidden) => {
     pending_drops: R.pendingDupDrops(d, labels.boxes),
     pending_marked: saved(pending),
     live: brief(live),
-    own_live: brief(liveOf(c.clean, c.all_live, classes, hidden)),
+    own_live: brief(liveOf(c.clean, { overlap_live: c.all_live }, classes, hidden)),
     accepted: live.map((g) => {
       const copy = clone(labels);
-      const own = liveOf(copy, c.overlap_live, classes, hidden).find((x) => x.index === g.index);
+      const own = liveOf(copy, served, classes, hidden).find((x) => x.index === g.index);
       R.acceptOverlap(copy, own);
-      const after = liveOf(copy, c.overlap_live, classes, hidden).map((x) => x.index);
+      const after = brief(liveOf(copy, served, classes, hidden));
       return { index: g.index, labels: saved(copy), after: after };
     }),
     relabelled: c.relabel.map((r) => {
       const copy = clone(labels);
       relabel(copy.boxes[r.box], r.label);
-      return brief(liveOf(copy, c.overlap_live, classes, hidden));
+      return brief(liveOf(copy, served, classes, hidden));
     }),
   };
 };
@@ -441,9 +445,8 @@ fn on_a_threshold(f: &LabelFile) -> bool {
     })
 }
 
-/// Two boxes at one position, one with a `model_label`: the fourth documented difference. The server
-/// may pass over a relabelled box for its twin at the same key; `overlap_live` names only the
-/// suggestion, so the page takes the first box there.
+/// Two boxes at one position, one with a `model_label`: the server may pass over the relabelled box
+/// for its twin at the same key, and the page must take the same box (RR-T9).
 fn key_shared_with_a_relabel(f: &LabelFile) -> bool {
     f.boxes.iter().enumerate().any(|(i, x)| {
         f.boxes[..i]
@@ -453,7 +456,10 @@ fn key_shared_with_a_relabel(f: &LabelFile) -> bool {
 }
 
 /// `(index, a, b, drop, keep)` of a live suggestion, the page's -1 for no drop.
-fn tuple(l: &overlaps::Live<'_>) -> (usize, i64, i64, i64, i64) {
+type Tuple = (usize, i64, i64, i64, i64);
+
+/// The [`Tuple`] of `l`.
+fn tuple(l: &overlaps::Live<'_>) -> Tuple {
     let (a, b) = (i64::try_from(l.a).unwrap(), i64::try_from(l.b).unwrap());
     let (drop, keep) = match l.suggestion.verdict {
         Verdict::DropA => (a, b),
@@ -463,11 +469,11 @@ fn tuple(l: &overlaps::Live<'_>) -> (usize, i64, i64, i64, i64) {
     (l.index, a, b, drop, keep)
 }
 
-fn rust_live(f: &LabelFile, w: &Wanted<'_>) -> Vec<(usize, i64, i64, i64, i64)> {
+fn rust_live(f: &LabelFile, w: &Wanted<'_>) -> Vec<Tuple> {
     overlaps::live(f, Some(w)).iter().map(tuple).collect()
 }
 
-fn js_live(v: &Value) -> Vec<(usize, i64, i64, i64, i64)> {
+fn js_live(v: &Value) -> Vec<Tuple> {
     v.as_array()
         .unwrap()
         .iter()
@@ -481,6 +487,39 @@ fn js_live(v: &Value) -> Vec<(usize, i64, i64, i64, i64)> {
             )
         })
         .collect()
+}
+
+/// The page after an edit (`page`) against [`overlaps::live`] on the edited file (`rust`), for the
+/// suggestions it was told of (`served`, as `overlap_live_boxes` named them). The page holds each one
+/// to the boxes named: where `live` keeps them, so does the page; where `live` drops the suggestion,
+/// so does the page; where `live` now takes another pair at the same key (a twin of an edited box),
+/// the page offers the named pair or nothing, and this answers false (the documented difference).
+fn held_to_named(page: &[Tuple], rust: &[Tuple], served: &[Tuple], what: &str) -> bool {
+    let mut same = true;
+    for p in page {
+        assert!(
+            served.iter().any(|t| t.0 == p.0),
+            "{what}: the page offers {p:?}, which it was not told of"
+        );
+    }
+    for t in served {
+        let (p, r) = (
+            page.iter().find(|x| x.0 == t.0),
+            rust.iter().find(|x| x.0 == t.0),
+        );
+        match r {
+            Some(r) if r == t => assert_eq!(p, Some(t), "{what}: {page:?} against {rust:?}"),
+            None => assert_eq!(p, None, "{what}: {page:?} against {rust:?}"),
+            Some(_) => {
+                assert!(
+                    p.is_none() || p == Some(t),
+                    "{what}: {page:?} against {rust:?}"
+                );
+                same = false;
+            }
+        }
+    }
+    same
 }
 
 fn indices(v: &Value) -> Vec<usize> {
@@ -528,16 +567,23 @@ fn relabels(f: &LabelFile, w: &Wanted<'_>) -> Vec<(usize, &'static str)> {
         .collect()
 }
 
-/// What the driver gets for frame `f`: `labels` and `overlap_live` as `GET /v1/review/labels` answers.
+/// What the driver gets for frame `f`: `labels`, `overlap_live` and `overlap_live_boxes` as
+/// `GET /v1/review/labels` answers.
 fn request_of(f: &LabelFile, w: &Wanted<'_>) -> Value {
     let moves: Vec<Value> = relabels(f, w)
         .iter()
         .map(|(i, l)| json!({"box": i, "label": l}))
         .collect();
-    let page: Vec<usize> = overlaps::live(f, Some(w)).iter().map(|l| l.index).collect();
+    let live = overlaps::live(f, Some(w));
+    let page: Vec<usize> = live.iter().map(|l| l.index).collect();
+    let boxes: Vec<Value> = live
+        .iter()
+        .map(|l| json!({"index": l.index, "a": l.a, "b": l.b}))
+        .collect();
     json!({
         "labels": f,
         "overlap_live": page,
+        "overlap_live_boxes": boxes,
         "clean": cleaned(f),
         "all_live": all_live(f),
         "relabel": moves,
@@ -634,11 +680,10 @@ fn the_rules_agree_with_their_rust_twins() {
             }
         }
 
-        if key_shared_with_a_relabel(f) {
-            *seen.entry("key shared with a relabel").or_default() += 1;
-            continue;
+        if key_shared_with_a_relabel(f) && !live.is_empty() {
+            *seen.entry("live key shared with a relabel").or_default() += 1;
         }
-        assert_eq!(js_live(&a["live"]), live, "frame {n}: as served");
+        assert_eq!(js_live(&a["live"]), live, "frame {n}: as served {f:?}");
 
         for (accepted, l) in a["accepted"]
             .as_array()
@@ -658,17 +703,19 @@ fn the_rules_agree_with_their_rust_twins() {
             // What stays on offer: of what the page was told, minus a two-object answer it took
             // (`_done`; on the server that is `overlaps_checked` once saved).
             let two_objects = l.suggestion.verdict == Verdict::TwoObjects;
-            let after: Vec<usize> = overlaps::live(&mine, Some(&w))
+            let offered: Vec<_> = live
                 .iter()
-                .map(|x| x.index)
-                .filter(|i| live.iter().any(|t| t.0 == *i))
-                .filter(|i| !(two_objects && *i == index))
+                .filter(|t| !(two_objects && t.0 == index))
+                .copied()
                 .collect();
-            assert_eq!(
-                indices(&accepted["after"]),
-                after,
-                "frame {n}: left after {index}"
-            );
+            if !held_to_named(
+                &js_live(&accepted["after"]),
+                &rust_live(&mine, &w),
+                &offered,
+                &format!("frame {n}: left after {index}"),
+            ) {
+                *seen.entry("twin after an edit").or_default() += 1;
+            }
             *seen
                 .entry(if two_objects { "two objects" } else { "drop" })
                 .or_default() += 1;
@@ -694,11 +741,14 @@ fn the_rules_agree_with_their_rust_twins() {
         let moves = relabels(f, &w);
         for (page, (i, label)) in a["relabelled"].as_array().unwrap().iter().zip(&moves) {
             let moved = relabelled(f, *i, label);
-            let want: Vec<_> = rust_live(&moved, &w)
-                .into_iter()
-                .filter(|t| live.iter().any(|x| x.0 == t.0))
-                .collect();
-            assert_eq!(js_live(page), want, "frame {n}: relabel of box {i}");
+            if !held_to_named(
+                &js_live(page),
+                &rust_live(&moved, &w),
+                &live,
+                &format!("frame {n}: relabel of box {i}"),
+            ) {
+                *seen.entry("twin after an edit").or_default() += 1;
+            }
             *seen.entry("relabel").or_default() += 1;
         }
     }
@@ -723,6 +773,8 @@ fn the_rules_agree_with_their_rust_twins() {
         ("hint promoted", 10),
         ("parked box dropped", 3),
         ("relabel", 20),
+        ("live key shared with a relabel", 20),
+        ("twin after an edit", 20),
     ] {
         let n = seen.get(key).copied().unwrap_or(0);
         assert!(n >= least, "the generator reached \"{key}\" only {n} times");
@@ -754,8 +806,9 @@ fn the_constants_are_the_rust_ones() {
     assert_eq!(got["VEHICLES"], json!(repeats::VEHICLES));
 }
 
-/// The twins differ in four places (`stacks.rs`, `overlaps.rs`). Pinned, so that a change on either
-/// side is a decision.
+/// The twins differ in three places (`stacks.rs`), and the page holds a suggestion to the boxes the
+/// server named (`overlaps.rs`, checked by `held_to_named`). Pinned, so that a change on either side
+/// is a decision.
 #[test]
 fn the_differences_are_the_documented_ones() {
     if !have_node() {
@@ -812,17 +865,33 @@ fn the_differences_are_the_documented_ones() {
         {"boxes": on_it, "classes": listed, "hidden": none},
     ]}));
     assert_eq!(got["groups"], json!([1, 1, 0]));
+}
 
-    // Two boxes at one position, the first relabelled by a reviewer, and a drop keyed to it: the
-    // server's answer takes the second, the page, told only "suggestion 0 is live", the first.
+/// Two boxes at one position, the first relabelled by a reviewer before the page opened, and a
+/// drop keyed to that position (RR-T9).
+fn twin_frame() -> LabelFile {
+    let plain = |bbox: [f32; 4]| LabelBox {
+        label: "car".to_string(),
+        bbox,
+        source: Source::Auto,
+        score: Some(0.5),
+        state: BoxState::Pending,
+        origin: None,
+        reason: None,
+        model_label: None,
+        orig_bbox: None,
+        difficult: false,
+        reject_reason: None,
+        auto: AutoInfo::default(),
+    };
     let keep = [0.0, 0.0, 100.0, 100.0];
     let inner = [10.0, 10.0, 60.0, 60.0];
-    let mut relabelled = plain("car", inner);
+    let mut relabelled = plain(inner);
     relabelled.model_label = Some("truck".to_string());
-    let mut hit = plain("car", inner);
+    let mut hit = plain(inner);
     hit.state = BoxState::Accepted;
-    let f = LabelFile {
-        boxes: vec![relabelled, hit, plain("car", keep)],
+    LabelFile {
+        boxes: vec![relabelled, hit, plain(keep)],
         overlap_suggestions: vec![Suggestion {
             a: keep,
             b: inner,
@@ -834,20 +903,87 @@ fn the_differences_are_the_documented_ones() {
             weak: false,
         }],
         ..LabelFile::default()
-    };
+    }
+}
+
+/// RR-T9: the server passes over the relabelled box for its twin, and names the boxes it chose
+/// (`overlap_live_boxes`); the page takes those, never the relabelled box. Told only "suggestion 0 is
+/// live" (an old server), it still takes the first box at the key.
+#[test]
+fn the_page_never_drops_a_relabelled_twin() {
+    if !have_node() {
+        return;
+    }
+    let f = twin_frame();
     assert!(key_shared_with_a_relabel(&f));
-    let classes = classes();
+    let (classes, none) = (classes(), Vec::<String>::new());
     let w = Wanted {
         classes: &classes,
         hidden: &none,
     };
     assert_eq!(rust_live(&f, &w), [(0, 2, 1, 1, 2)]);
+    let served = request_of(&f, &w);
+    let mut old = served.clone();
+    old.as_object_mut().unwrap().remove("overlap_live_boxes");
     let got = node(&json!({
         "classes": classes,
         "hidden": none,
-        "frames": [request_of(&f, &w)],
+        "frames": [served, old],
     }));
-    assert_eq!(js_live(&got["frames"][0]["live"]), [(0, 2, 0, 0, 2)]);
+    assert_eq!(js_live(&got["frames"][0]["live"]), [(0, 2, 1, 1, 2)]);
+    assert_eq!(js_live(&got["frames"][1]["live"]), [(0, 2, 0, 0, 2)]);
+}
+
+/// A box removed on the page before the pair (a drawn box deleted, `removeBox`) shifts the indices:
+/// the suggestion follows the boxes the server named, through an undo too, and a box drawn at the
+/// same position later is not one of them.
+#[test]
+fn a_suggestion_follows_its_boxes_when_the_page_removes_one_before_them() {
+    if !have_node() {
+        return;
+    }
+    let mut f = twin_frame();
+    let mut drawn = f.boxes[2].clone();
+    drawn.source = Source::Human;
+    drawn.state = BoxState::Added;
+    drawn.bbox = [300.0, 300.0, 340.0, 340.0];
+    f.boxes.insert(0, drawn);
+    let (classes, none) = (classes(), Vec::<String>::new());
+    let w = Wanted {
+        classes: &classes,
+        hidden: &none,
+    };
+    assert_eq!(rust_live(&f, &w), [(0, 3, 2, 2, 3)]);
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const c = req.frame;
+const live = (labels) => R.liveSuggestions(
+  { labels: labels, overlap_live: c.overlap_live, overlap_live_boxes: c.overlap_live_boxes },
+  R.dupGroups(labels.boxes, req.classes, req.hidden),
+).map((g) => [g.index, g.a, g.b, g.drop, g.keep]);
+const labels = c.labels;
+R.markServed(labels);
+const out = { served: live(labels) };
+labels.boxes.splice(0, 1);
+out.removed = live(labels);
+out.undone = live(JSON.parse(JSON.stringify(labels)));
+// The named box goes too; one drawn at its place is not it.
+const twin = labels.boxes.splice(1, 1)[0];
+labels.boxes.push({ label: twin.label, bbox: twin.bbox, source: 'human', state: 'added' });
+out.redrawn = live(labels);
+process.stdout.write(JSON.stringify(out));
+"#;
+    let got = node_with(
+        driver,
+        &json!({"classes": classes, "hidden": none, "frame": request_of(&f, &w)}),
+    );
+    assert_eq!(got["served"], json!([[0, 3, 2, 2, 3]]));
+    assert_eq!(got["removed"], json!([[0, 2, 1, 1, 2]]));
+    assert_eq!(got["undone"], json!([[0, 2, 1, 1, 2]]));
+    assert_eq!(got["redrawn"], json!([]));
 }
 
 /// What a new `loadNext` does in every state (`assets/review-rules.js` `nextPlan`): at most one real

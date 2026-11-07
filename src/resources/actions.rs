@@ -1154,11 +1154,23 @@ mod custom_model_tests {
         );
     }
 
+    /// A path pasted with quotes (Windows "Copy as path") adds the same entry as the bare path;
+    /// unmatched quotes are part of the name and find no file.
     #[test]
     fn quoted_path() {
         let (d, mut c) = setup();
         let f = d.outside.join("q.onnx");
         touch(&f);
+        let before = c.models.len();
+        let added = |c: &Config| {
+            assert_eq!(c.models.len(), before + 1);
+            let m = c.models.last().unwrap();
+            (m.effective_name(), m.path.clone())
+        };
+        let mut plain = c.clone();
+        add_custom_model(&mut plain, &req(&f)).unwrap();
+        let want = added(&plain);
+        assert_eq!(want, ("q".to_string(), f.clone()));
         for q in ['"', '\''] {
             let mut c2 = c.clone();
             let r = CustomModel {
@@ -1166,8 +1178,15 @@ mod custom_model_tests {
                 ..Default::default()
             };
             add_custom_model(&mut c2, &r).unwrap();
+            assert_eq!(added(&c2), want, "quoted with {q}");
         }
-        add_custom_model(&mut c, &req(&f)).unwrap();
+        let r = CustomModel {
+            path: format!("\"{}'", f.display()),
+            ..Default::default()
+        };
+        let e = add_custom_model(&mut c, &r).unwrap_err();
+        assert!(matches!(e, ActionError::NotFound(_)), "{e}");
+        assert_eq!(c.models.len(), before);
     }
 
     #[test]

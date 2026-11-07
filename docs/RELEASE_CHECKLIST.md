@@ -23,14 +23,14 @@ draft it creates. Each build job installs, checks and uninstalls its installers 
    ```sh
    # Linux
    ./blue-onyx-prism list-devices | grep -F 'ort:cuda'            # must be listed as runnable
-   ./blue-onyx-prism benchmark --all-devices --report cuda.html
+   ./blue-onyx-prism benchmark --all-devices --confirm-gpus --report cuda.html   # refused without the flag on two GPU devices
    grep -qF 'ort:cuda' cuda.html || { echo "FAIL: no ort:cuda row, CUDA was not exercised"; exit 1; }
    ```
 
    ```powershell
    # Windows (Turing or newer)
    .\blue-onyx-prism.exe list-devices
-   .\blue-onyx-prism.exe benchmark --all-devices --report cuda.html
+   .\blue-onyx-prism.exe benchmark --all-devices --confirm-gpus --report cuda.html   # refused without the flag on two GPU devices
    if (-not (Select-String -Path cuda.html -SimpleMatch 'ort:cuda' -Quiet)) { throw "FAIL: no ort:cuda row, CUDA was not exercised" }
    ```
 
@@ -44,7 +44,7 @@ draft it creates. Each build job installs, checks and uninstalls its installers 
 
    ```powershell
    .\blue-onyx-prism.exe list-devices                     # openvino:gpu runnable, and the auto pick
-   .\blue-onyx-prism.exe benchmark --all-devices --report igpu.html
+   .\blue-onyx-prism.exe benchmark --all-devices --confirm-gpus --report igpu.html   # openvino:gpu and ort:directml count as two
    if (-not (Select-String -Path igpu.html -SimpleMatch 'openvino:gpu' -Quiet)) { throw "FAIL: no openvino:gpu row" }
    ```
 

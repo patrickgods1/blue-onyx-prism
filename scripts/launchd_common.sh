@@ -61,6 +61,25 @@ bop_create_account() {
   fi
 }
 
+# Kept data root and log dir (an uninstall keeps them) can hold files of an earlier $SVC with
+# another id (the account was deleted by hand and made again, or the folder came from a backup).
+# bop_create_dirs corrects the top folders only and the models copy covers only models/, so look
+# at everything: one entry of another owner or group and the whole tree is chowned. Run it after
+# bop_create_account and before bop_create_dirs. -h, find's default -P and the `/.`: links are
+# never followed (uv's Python environment has some), a data root that is itself a link to a
+# larger disk is. `-print -quit` stops at the first hit. A failure warns: the data is intact.
+bop_own_kept_dirs() {
+  local dir first
+  for dir in "$DATA_DIR" "$LOG_DIR"; do
+    [ -d "$dir" ] || continue
+    first="$(find "$dir/." \( ! -user "$SVC" -o ! -group "$SVC" \) -print -quit 2>/dev/null || true)"
+    [ -n "$first" ] || continue
+    echo "$dir holds files not owned by $SVC (first: $first): changing the owner of everything in it, which can take a while."
+    chown -hR "$SVC:$SVC" "$dir/." \
+      || echo "Could not change the owner of everything in $dir, so the service may fail to read it. Fix it with: sudo chown -hR $SVC:$SVC $dir/." >&2
+  done
+}
+
 # Data root and log dir: the only places the daemon writes.
 bop_create_dirs() {
   install -d -o "$SVC" -g "$SVC" -m 0750 "$DATA_DIR" "$DATA_DIR/models" "$DATA_DIR/cache" "$LOG_DIR"

@@ -1122,14 +1122,18 @@ mod tests {
         assert_eq!(v["objective"], "f1");
 
         // A valid search (default: every model, recommended device, f1).
+        let started = std::time::Instant::now();
         let (s, v) = call(&st, post("/v1/benchmark/threshold-search", "")).await;
+        let wall_ms = started.elapsed().as_secs_f64() * 1e3;
         assert_eq!(s, StatusCode::OK, "{v}");
         let r = &v["results"][0];
         assert_eq!(r["device"], "ort:coreml");
         assert_eq!(r["best"]["threshold"].as_f64().unwrap() as f32, 0.35);
         assert_eq!(r["grid"].as_array().unwrap().len(), 19);
         assert!(v["csv"].as_str().unwrap().starts_with("model,device"));
-        assert!(v["elapsedMs"].as_f64().unwrap() >= 0.0);
+        // The search's own time: measured (not the 0 it starts at), in ms, within the call.
+        let ms = v["elapsedMs"].as_f64().expect("elapsedMs is a number");
+        assert!(ms > 0.0 && ms <= wall_ms, "{ms} ms of a {wall_ms} ms call");
 
         // Filters.
         let (s, v) = call(

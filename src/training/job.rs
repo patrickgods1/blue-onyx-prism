@@ -1266,6 +1266,43 @@ struct Finish<'a> {
 }
 
 impl Finish<'_> {
+    /// The script's `done` report against the run: it must exist, name the family the recipe
+    /// exports and carry the dataset's classes. Returns the service family and the export's
+    /// device and seconds (from the retried run when the training ran earlier). A failure leaves
+    /// the staging folder to the caller (`run` removes it; the job's guard is the backstop).
+    fn validate(
+        family: TrainFamily,
+        classes_expected: &[String],
+        done: Option<TrainEvent>,
+        export_only: Option<&ExportRetry>,
+    ) -> Result<(ModelFamilyKind, Option<String>, Option<f64>)> {
+        let Some(TrainEvent::Done {
+            family: fam,
+            classes,
+            device,
+            seconds,
+            ..
+        }) = done
+        else {
+            bail!("the trainer finished without reporting its exported model");
+        };
+        let service_family: ModelFamilyKind = fam.parse()?;
+        if service_family != family.service_family() {
+            bail!(
+                "the trainer exported a {service_family} model, expected {}",
+                family.service_family()
+            );
+        }
+        if classes != classes_expected {
+            bail!("the trained model has classes {classes:?}, the dataset {classes_expected:?}");
+        }
+        // Trained earlier: the script reports the export's own device and seconds.
+        Ok(match export_only {
+            Some(r) => (service_family, Some(r.device.clone()), r.train_seconds),
+            None => (service_family, device, seconds),
+        })
+    }
+
     /// Check the script's report, install (on the record at once), register (the checkpoints go
     /// then: nothing is left to redo) and benchmark.
     #[allow(clippy::too_many_arguments)]
@@ -1286,35 +1323,14 @@ impl Finish<'_> {
             cancel,
         } = *self;
         let family = recipe.family;
-        let Some(TrainEvent::Done {
-            family: fam,
-            classes,
-            device,
-            seconds,
-            ..
-        }) = done
-        else {
-            let _ = manager::remove_any(staging);
-            bail!("the trainer finished without reporting its exported model");
-        };
-        let service_family: ModelFamilyKind = fam.parse()?;
-        if service_family != family.service_family() {
-            bail!(
-                "the trainer exported a {service_family} model, expected {}",
-                family.service_family()
-            );
-        }
-        if classes != prepared.classes {
-            bail!(
-                "the trained model has classes {classes:?}, the dataset {:?}",
-                prepared.classes
-            );
-        }
-        // Trained earlier: the script reports the export's own device and seconds.
-        let (device, seconds) = match &job.export_only {
-            Some(r) => (Some(r.device.clone()), r.train_seconds),
-            None => (device, seconds),
-        };
+        let (service_family, device, seconds) =
+            match Self::validate(family, &prepared.classes, done, job.export_only.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = manager::remove_any(staging);
+                    return Err(e);
+                }
+            };
 
         // 6. Install.
         enter(

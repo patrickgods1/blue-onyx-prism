@@ -44,10 +44,22 @@ impl Guard {
 /// CLI `--no-low-priority`). `in_service` = the call comes from the running service (web UI),
 /// not the CLI. Keep the returned guard alive for the whole run.
 pub fn lower_for_benchmark(enabled: bool, in_service: bool) -> Guard {
-    if !enabled {
+    if !lowers(enabled, in_service) {
+        if enabled {
+            tracing::debug!(
+                "benchmark: process priority unchanged (the runtimes' threads already exist; \
+                 use Nice= in the service unit)"
+            );
+        }
         return Guard::noop();
     }
-    imp::lower(in_service)
+    imp::lower()
+}
+
+/// Whether [`lower_for_benchmark`] changes the priority (pure): never when disabled, and on Unix
+/// not in the service, whose runtime threads already exist (see the module docs).
+fn lowers(enabled: bool, in_service: bool) -> bool {
+    enabled && !(cfg!(unix) && in_service)
 }
 
 /// `BELOW_NORMAL_PRIORITY_CLASS`, a process creation flag on Windows.
@@ -95,7 +107,7 @@ mod imp {
         SetPriorityClass,
     };
 
-    pub(super) fn lower(_in_service: bool) -> Guard {
+    pub(super) fn lower() -> Guard {
         // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no closing; both calls
         // only read/write this process's priority class.
         let previous = unsafe { GetPriorityClass(GetCurrentProcess()) };
@@ -154,14 +166,7 @@ mod imp {
     /// Nice value of a low-priority benchmark.
     const NICE: libc::c_int = 10;
 
-    pub(super) fn lower(in_service: bool) -> Guard {
-        if in_service {
-            tracing::debug!(
-                "benchmark: process priority unchanged (the runtimes' threads already exist; \
-                 use Nice= in the service unit)"
-            );
-            return Guard::noop();
-        }
+    pub(super) fn lower() -> Guard {
         // SAFETY: setpriority only changes the scheduling priority of the calling thread
         // (Linux) / process; no memory is touched.
         let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, NICE) };
@@ -184,7 +189,7 @@ mod imp {
 mod imp {
     use super::Guard;
 
-    pub(super) fn lower(_in_service: bool) -> Guard {
+    pub(super) fn lower() -> Guard {
         Guard::noop()
     }
 }
@@ -209,10 +214,28 @@ mod tests {
         );
     }
 
+    /// The nice value of the calling thread (Linux: nice is per thread, so a fresh thread sees
+    /// no other test's change).
+    #[cfg(target_os = "linux")]
+    fn own_nice() -> i32 {
+        // SAFETY: reads the calling thread's scheduling priority.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+    }
+
     #[test]
     fn disabled_is_noop() {
-        let g = lower_for_benchmark(false, false);
-        drop(g);
+        assert!(!lowers(false, false) && !lowers(false, true));
+        assert!(lowers(true, false), "the CLI lowers when enabled");
+        #[cfg(windows)]
+        assert!(lower_for_benchmark(false, false).restore.is_none());
+        #[cfg(target_os = "linux")]
+        std::thread::spawn(|| {
+            let before = own_nice();
+            drop(lower_for_benchmark(false, false));
+            assert_eq!(own_nice(), before);
+        })
+        .join()
+        .unwrap();
     }
 
     #[cfg(windows)]
@@ -231,10 +254,20 @@ mod tests {
         assert_eq!(class(), before);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[test]
     fn service_guard_is_noop() {
-        let guard = lower_for_benchmark(true, true);
-        drop(guard);
+        assert!(!lowers(true, true));
+        #[cfg(target_os = "linux")]
+        std::thread::spawn(|| {
+            let before = own_nice();
+            drop(lower_for_benchmark(true, true));
+            assert_eq!(own_nice(), before, "the service keeps its priority");
+            // The CLI path in the same fresh thread does lower it: the check above can fail.
+            drop(lower_for_benchmark(true, false));
+            assert!(own_nice() >= 10, "nice {}", own_nice());
+        })
+        .join()
+        .unwrap();
     }
 }

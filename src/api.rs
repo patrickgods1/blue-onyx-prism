@@ -48,6 +48,11 @@ pub struct VisionDetectionResponse {
     pub inferenceMs: i32,
     pub processMs: i32,
     pub analysisRoundTripMs: i32,
+    /// Why the request was not served by inference, when a worker dropped it (in-process only:
+    /// never serialized, so the Blue Iris answer is unchanged). Callers inside the service, such
+    /// as the verify lane, read this instead of matching `message`.
+    #[serde(skip)]
+    pub dropped: Option<crate::metrics::DropReason>,
 }
 
 impl VisionDetectionResponse {
@@ -178,5 +183,56 @@ mod tests {
             VersionInfo::parse("1.2.3", Some("notes".into())).unwrap()
         );
         assert!(VersionInfo::parse("1.2", None).is_err());
+    }
+
+    /// The in-process `dropped` kind never reaches the wire: a dropped answer serializes to the
+    /// same bytes as one without it, with exactly the CodeProject.AI keys, and reads back as
+    /// not dropped.
+    #[test]
+    fn dropped_kind_is_not_serialized() {
+        use super::{Prediction, VisionDetectionResponse};
+        use crate::metrics::DropReason;
+        let plain = VisionDetectionResponse {
+            predictions: vec![Prediction {
+                x_min: 1,
+                y_min: 2,
+                x_max: 3,
+                y_max: 4,
+                confidence: 0.5,
+                label: "person".into(),
+            }],
+            count: 1,
+            ..VisionDetectionResponse::error("Request dropped: waited 9 ms in queue (timeout 5 ms)")
+        };
+        let dropped = VisionDetectionResponse {
+            dropped: Some(DropReason::Timeout),
+            ..plain.clone()
+        };
+        let a = serde_json::to_string(&plain).unwrap();
+        let b = serde_json::to_string(&dropped).unwrap();
+        assert_eq!(a, b);
+        let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut want = vec![
+            "success",
+            "message",
+            "error",
+            "predictions",
+            "count",
+            "command",
+            "moduleId",
+            "executionProvider",
+            "canUseGPU",
+            "inferenceMs",
+            "processMs",
+            "analysisRoundTripMs",
+        ];
+        let mut got = keys.clone();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(got, want, "{b}");
+        let back: VisionDetectionResponse = serde_json::from_str(&b).unwrap();
+        assert_eq!(back.dropped, None);
+        assert_eq!(back.message, dropped.message);
     }
 }

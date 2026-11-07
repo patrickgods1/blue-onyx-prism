@@ -723,12 +723,30 @@ mod tests {
                 Preprocess::Grayscale,
             ] {
                 let mut best = f64::MAX;
+                let mut first: Option<RgbImage> = None;
                 for _ in 0..10 {
                     let mut img = src.clone();
                     let t = std::time::Instant::now();
                     apply(&mut img, mode);
                     best = best.min(t.elapsed().as_secs_f64() * 1e3);
                     std::hint::black_box(&img);
+                    // Same size, same answer every time.
+                    assert_eq!(
+                        (img.width, img.height, img.rgb.len()),
+                        (w, h, src.rgb.len())
+                    );
+                    match &first {
+                        Some(f) => assert!(f.rgb == img.rgb, "{name} {mode}: not deterministic"),
+                        None => first = Some(img),
+                    }
+                }
+                let out = first.expect("ten runs");
+                // Every mode changes these frames, except grayscale of one already gray.
+                let unchanged = name == "mono" && mode == Preprocess::Grayscale;
+                assert_eq!(out.rgb == src.rgb, unchanged, "{name} {mode}");
+                if mode == Preprocess::Grayscale {
+                    let (pixels, _) = out.rgb.as_chunks::<3>();
+                    assert!(pixels.iter().all(|&[r, g, b]| r == g && g == b));
                 }
                 println!("{name} {mode}: {best:.2} ms (best of 10)");
             }

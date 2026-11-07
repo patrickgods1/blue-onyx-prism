@@ -42,10 +42,14 @@
 //! Twin of the Review tab's `liveSuggestions` and `acceptOverlap` (`assets/review-rules.js`), which
 //! [`live`] and [`accept`] state as Rust: keep them in step (`tests/it/js_rules.rs` runs both on
 //! generated frames). The page cannot call [`super::map_class`],
-//! so `GET /v1/review/labels` names the live suggestions (`overlap_live`) and the page only adds what
-//! changes while the frame is open (a move, a relabel, a rejected box). `overlap_live` names a
-//! suggestion, not its boxes: where two boxes share a position and [`live`] passes over the first for
-//! a relabel, the page, unaware of it, takes the first.
+//! so `GET /v1/review/labels` names the live suggestions with their boxes (`overlap_live_boxes`:
+//! [`Live::index`], [`Live::a`], [`Live::b`] in the file as served) and the page only adds what
+//! changes while the frame is open (a move, a relabel, a rejected box). Where two boxes share a
+//! position and [`live`] passes over the first for a relabel, the page therefore takes the second too
+//! (RR-T9). It holds a suggestion to those boxes: where an edit on the page ends that pair, a twin at
+//! the same key is offered only once the frame is loaded again, where [`live`] on the edited file
+//! would take the twin at once. An older server's `overlap_live` names only the suggestion; with it
+//! the page takes the first pair at the key.
 
 use super::bulk::Wanted;
 use super::repeats::same_object;
