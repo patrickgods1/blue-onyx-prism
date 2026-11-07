@@ -17,8 +17,7 @@
     return [s.avg.toFixed(1), String(s.min), String(s.max)];
   }
   function update() {
-    if (document.hidden) return;
-    fetch("/stats.json", {cache: "no-store"}).then(function (r) {
+    return fetch("/stats.json", {cache: "no-store"}).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     }).then(function (j) {
@@ -69,8 +68,10 @@
         }
       });
       live.textContent = "updated " + new Date().toLocaleTimeString();
-    }).catch(function (e) { live.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : ""); });
+    }).catch(function (e) {
+      live.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : "");
+      throw e; // the poller backs off
+    });
   }
-  setInterval(update, 5000);
-  document.addEventListener("visibilitychange", function () { if (!document.hidden) update(); });
+  PrismPoll.create({run: update, period: 5000}).start();
 })();

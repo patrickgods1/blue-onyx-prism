@@ -10,7 +10,7 @@
 //! last says "in this step".
 
 use super::train_area::{JOBS, TRAIN, tab_title, task_tab};
-use super::{AppState, render, training};
+use super::{AppState, blocking, render, training};
 use crate::training::estimate::format_duration;
 use crate::training::eta::JobTiming;
 use crate::training::job::TrainStage;
@@ -242,14 +242,71 @@ pub(super) fn view(
     }
 }
 
-/// `GET /v1/train/jobs`.
-pub(super) async fn jobs(State(state): State<Arc<AppState>>) -> Response {
-    let v = view(
-        &training::runs(&state),
-        &training::tasks(&state),
-        &training::job_timing,
+/// Query of `GET /v1/train/jobs`: `task=<id>` adds that task's record (`task`, null when there
+/// is none), `tasks=busy` the records of every queued, running or paused task (`tasks`), both
+/// without `log` and `result` ([`task_brief`]). For a page that follows one job (Review) without
+/// the runs and histories of `GET /v1/training`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct JobsQuery {
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    tasks: Option<String>,
+}
+
+/// A task's record as the Jobs answer carries it: what a follower shows (state, stage, step,
+/// percent, detail, summary, error), not its log or result.
+fn task_brief(t: &TaskRecord) -> serde_json::Value {
+    let mut v = serde_json::to_value(t).unwrap_or(serde_json::Value::Null);
+    if let Some(o) = v.as_object_mut() {
+        o.remove("log");
+        o.remove("result");
+    }
+    v
+}
+
+/// The answer of `GET /v1/train/jobs` for `q`: `jobs` ([`view`]), and the task records `q` asks
+/// for.
+fn answer(
+    runs: &[RunRecord],
+    tasks: &[TaskRecord],
+    timing: &dyn Fn(&str) -> Option<JobTiming>,
+    q: &JobsQuery,
+) -> serde_json::Value {
+    let mut v = serde_json::Map::new();
+    v.insert("success".into(), true.into());
+    v.insert(
+        "jobs".into(),
+        serde_json::to_value(view(runs, tasks, timing)).unwrap_or_default(),
     );
-    Json(serde_json::json!({ "success": true, "jobs": v })).into_response()
+    if let Some(id) = q.task.as_deref() {
+        let t = tasks.iter().find(|t| t.id == id);
+        v.insert("task".into(), t.map_or(serde_json::Value::Null, task_brief));
+    }
+    if q.tasks.as_deref() == Some("busy") {
+        let busy = tasks.iter().filter(|t| t.state.is_busy()).map(task_brief);
+        v.insert("tasks".into(), busy.collect());
+    }
+    serde_json::Value::Object(v)
+}
+
+/// `GET /v1/train/jobs` (`?task=<id>`, `?tasks=busy`: [`JobsQuery`]). Off the async workers: the
+/// queue's records are cloned under its locks and, without a started queue, `runs.json` and
+/// `tasks.json` are read; the answer is serialized there too.
+pub(super) async fn jobs(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<JobsQuery>,
+) -> Response {
+    blocking(move || {
+        let v = answer(
+            &training::records(&state),
+            &training::tasks(&state),
+            &training::job_timing,
+            &q,
+        );
+        Json(v).into_response()
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -421,6 +478,42 @@ mod tests {
             ]
         );
         assert_eq!(v.queued[1].step, "");
+    }
+
+    #[test]
+    fn a_follower_gets_its_task_without_log_or_result_and_the_full_answer_stays() {
+        let mut done = task("d", TaskKind::Autolabel, RunState::Done);
+        done.log = vec!["a long line".into(); 50];
+        done.result = Some(serde_json::json!({ "frames": 900 }));
+        done.summary = Some("labelled 900 frames".into());
+        let tasks = [done, task("o", TaskKind::Overlaps, RunState::Running)];
+        let plain = answer(&[], &tasks, &NO_CLOCK, &JobsQuery::default());
+        assert!(plain.get("task").is_none() && plain.get("tasks").is_none());
+        assert_eq!(
+            plain["jobs"],
+            serde_json::to_value(view(&[], &tasks, &NO_CLOCK)).unwrap()
+        );
+        let q = JobsQuery {
+            task: Some("d".into()),
+            tasks: Some("busy".into()),
+        };
+        let v = answer(&[], &tasks, &NO_CLOCK, &q);
+        assert_eq!(v["task"]["state"], "done");
+        assert_eq!(v["task"]["summary"], "labelled 900 frames");
+        assert!(v["task"].get("log").is_none() && v["task"].get("result").is_none());
+        let busy: Vec<_> = v["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].clone())
+            .collect();
+        assert_eq!(busy, ["o"]);
+        assert_eq!(v["tasks"][0]["kind"], "overlaps");
+        let gone = JobsQuery {
+            task: Some("nope".into()),
+            tasks: None,
+        };
+        assert!(answer(&[], &tasks, &NO_CLOCK, &gone)["task"].is_null());
     }
 
     #[test]

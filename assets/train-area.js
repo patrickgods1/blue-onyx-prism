@@ -144,10 +144,11 @@
     jobsEmpty.hidden = !!all.length;
   }
 
-  var jobsTimer = null, onQueue = null;
+  // One chain per list (PrismPoll: a chained timeout, never two requests of a list in flight, none
+  // while the tab is hidden). A refresh asks the same chain to run now; it never starts another.
+  var onQueue = null;
   function loadJobs() {
-    if (jobsTimer) { clearTimeout(jobsTimer); jobsTimer = null; }
-    fetch("/v1/train/jobs", { headers: { Accept: "application/json" }, cache: "no-store" })
+    return fetch("/v1/train/jobs", { headers: { Accept: "application/json" }, cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) {
         if (!j || !j.jobs) return;
@@ -157,37 +158,40 @@
         jobsCount.hidden = !all.length;
         if (jobsBox) drawJobs(all);
         // A job ended or started: the counts and the next step moved too.
-        if (onQueue !== null && key !== onQueue) load();
+        if (onQueue !== null && key !== onQueue) summaryPoller.kick();
         onQueue = key;
       })
       .catch(function () { /* the list stays as it was */ })
-      .then(function () {
-        if (jobsBox && !document.hidden) jobsTimer = setTimeout(loadJobs, 3000);
-      });
+      .then(function () { return !!jobsBox; });
   }
+  // Only the Jobs tab keeps following the list; the other tabs read it when asked (the count on its label).
+  var jobsPoller = PrismPoll.create({ run: loadJobs, period: 3000, more: function (again) { return again; } });
 
-  var timer = null;
   function load() {
-    if (timer) { clearTimeout(timer); timer = null; }
-    fetch("/v1/train/summary", { headers: { Accept: "application/json" }, cache: "no-store" })
+    return fetch("/v1/train/summary", { headers: { Accept: "application/json" }, cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (j) {
-        if (!j || !j.summary) return;
+        if (!j || !j.summary) return false;
         draw(j);
         // A first count of a large folder is still running.
-        if (!j.summary.counted) timer = setTimeout(load, 2000);
+        return !j.summary.counted;
       })
-      .catch(function () { /* the strip stays as it was */ });
+      .catch(function () { /* the strip stays as it was */ return false; });
   }
-  function loadAll() { load(); loadJobs(); }
+  var summaryPoller = PrismPoll.create({ run: load, period: 2000, more: function (again) { return again; } });
+  function loadAll() { summaryPoller.kick(); jobsPoller.kick(); }
   document.addEventListener("DOMContentLoaded", function () {
     jobsBox = document.getElementById("train-jobs");
     jobsEmpty = document.getElementById("train-jobs-empty");
-    if (jobsBox) loadJobs();
+    if (jobsBox) jobsPoller.kick();
   });
   loadAll();
   // Pages that change the counts say so.
   window.addEventListener("train-area:refresh", loadAll);
-  document.addEventListener("visibilitychange", function () { if (!document.hidden) loadAll(); });
+  // A chain that is running resumes itself when the tab shows; a parked one is asked here.
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) return;
+    [summaryPoller, jobsPoller].forEach(function (p) { if (p.state().parked) p.kick(); });
+  });
   setInterval(function () { if (!document.hidden) loadAll(); }, 30000);
 })();

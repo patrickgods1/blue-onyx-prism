@@ -26,7 +26,7 @@ document.addEventListener("click", function (e) {
   if (!L || !window.fetch || !box) return;
   var boxes = [box, sources].filter(Boolean);
   var key = function (r) { return r.busy ? "busy" : r.state; };
-  var timer = null, swapping = null;
+  var swapping = null;
   function rowOf(id) { return box.querySelector('[data-id="' + CSS.escape(id) + '"]'); }
   // Replace the sections' content (Resources, and Add a model by path / Local models) with the
   // fresh page's, keeping scroll offsets, open <details> and the answers shown next to the buttons.
@@ -55,7 +55,7 @@ document.addEventListener("click", function (e) {
     return swapping;
   }
   function tick() {
-    fetch("/v1/resources", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (j) {
+    return fetch("/v1/resources", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (j) {
       var changed = false;
       j.resources.forEach(function (r) {
         var row = rowOf(r.id);
@@ -68,13 +68,16 @@ document.addEventListener("click", function (e) {
           if (bar) { if (r.progress !== null && r.progress !== undefined) bar.value = r.progress; else bar.removeAttribute("value"); }
         }
       });
-      if (changed) swap(); else watch();
-    }).catch(function () { watch(); });
+      if (changed) return swap();
+    });
   }
-  // Poll while a row is busy.
+  // Poll while a row is busy (PrismPoll: one request at a time, none while the tab is hidden, backs
+  // off after a failure; it parks itself when no row is busy).
+  var busyRows = function () { return !!box.querySelector('tr[data-busy="true"]'); };
+  var poller = PrismPoll.create({run: tick, period: 1500, more: busyRows});
   function watch() {
-    clearTimeout(timer); timer = null;
-    if (box.querySelector('tr[data-busy="true"]')) timer = setTimeout(tick, 1500);
+    if (!busyRows()) poller.stop();
+    else if (poller.state().parked) poller.kick();
   }
   boxes.forEach(function (b) { b.addEventListener("prism:action", function (e) {
     // A refused "Add a model by path" keeps what was typed.
@@ -677,12 +680,15 @@ document.addEventListener("click", function (e) {
     body.replaceChildren.apply(body, parts);
     if (free) free.textContent = r.free_bytes === null || r.free_bytes === undefined ? "" : fmt(r.free_bytes) + " free";
   }
-  function load() {
-    fetch("/v1/storage", {cache: "no-store"}).then(function (x) { return x.json(); }).then(function (j) {
+  // Asked again every 2 s while the server is still measuring (PrismPoll: one request at a time,
+  // none while the tab is hidden).
+  var poller = PrismPoll.create({period: 2000, more: function (computing) { return computing; }, run: function () {
+    return fetch("/v1/storage", {cache: "no-store"}).then(function (x) { return x.json(); }).then(function (j) {
       render(j);
-      if (j.computing) setTimeout(load, 2000);
-    }).catch(function () { body.replaceChildren(el("p", "muted", "Could not measure the storage; reload the page.")); });
-  }
+      return !!j.computing;
+    }).catch(function () { body.replaceChildren(el("p", "muted", "Could not measure the storage; reload the page.")); return false; });
+  }});
+  function load() { poller.kick(); }
   function run(i, b) {
     var remove = i.action === "remove";
     var q = remove ? "Remove " + i.title + " (" + i.size + ")? It cannot be undone." : "Clear " + i.title + " (" + i.size + ")?";

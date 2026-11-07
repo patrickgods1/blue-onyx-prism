@@ -4,8 +4,70 @@
 // apply" indicator current, and hands each new payload to the page scripts
 // (PrismLive.onConfig). Also the form helpers the pages use to refresh fields the user has not
 // edited while keeping (and marking) the ones they have.
+// PrismPoll: the one scheduler for the pages' poll loops (Logs, Stats, Home, Train, Config). A chained
+// timeout, never an interval: the next run is scheduled when the last one has finished, so a slow
+// server never sees two requests of one loop at once. No timer runs while the tab is hidden; the
+// loop runs at once when it becomes visible again; errors back off (period x 2, 4, 8, ... up to
+// `max`); `kick()` asks for a run now (one more right after the current one if it is in flight).
+// PrismPoll.create({run, period, max, more, env}): `run()` returns a promise (a rejection counts
+// as a failure); `more(value)` false parks the loop until `kick()` (polling only while busy).
+// `env` is for tests: {hidden(), set(fn, ms), clear(id), onVisible(cb)}.
+(function (root) {
+  "use strict";
+  function delay(period, failures, max) {
+    return failures ? Math.min(max, period * Math.pow(2, Math.min(failures, 5))) : period;
+  }
+  var browser = {
+    hidden: function () { return typeof document !== "undefined" && document.hidden; },
+    set: function (f, ms) { return setTimeout(f, ms); },
+    clear: function (id) { clearTimeout(id); },
+    onVisible: function (cb) {
+      if (typeof document !== "undefined") document.addEventListener("visibilitychange", cb);
+    }
+  };
+  function create(o) {
+    var env = o.env || browser, max = o.max || 30000;
+    var timer = null, busy = false, again = false, failures = 0, stops = 0, parked = true; // parked until start()
+    function clear() { if (timer !== null) { env.clear(timer); timer = null; } }
+    function schedule() {
+      clear();
+      if (parked || env.hidden()) return;
+      timer = env.set(function () { timer = null; go(); }, delay(o.period, failures, max));
+    }
+    function go() {
+      clear();
+      if (busy) { again = true; return; }
+      if (env.hidden()) return;
+      busy = true; again = false;
+      var seen = stops; // a stop() while the run is out wins over its answer
+      var p;
+      try { p = Promise.resolve(o.run()); } catch (e) { p = Promise.reject(e); }
+      p.then(function (v) {
+        failures = 0;
+        if (o.more && seen === stops) parked = !o.more(v);
+      }, function () {
+        failures++;
+        if (o.onError) { try { o.onError(failures); } catch (e) { /* the loop goes on */ } }
+      }).then(function () {
+        busy = false;
+        if (again && !parked && !env.hidden()) { again = false; go(); } else schedule();
+      });
+    }
+    env.onVisible(function () {
+      if (env.hidden()) clear(); else if (!parked) go();
+    });
+    return {
+      start: function () { parked = false; go(); },
+      kick: function () { parked = false; go(); },
+      stop: function () { stops++; parked = true; clear(); },
+      state: function () { return {busy: busy, timer: timer !== null, parked: parked, failures: failures}; }
+    };
+  }
+  root.PrismPoll = {create: create, delay: delay};
+})(typeof globalThis !== "undefined" ? globalThis : window);
 (function () {
   "use strict";
+  if (typeof document === "undefined") return; // loaded by the node test for PrismPoll only
   var PERIOD = 2000, MAX_PERIOD = 30000, RESTART_GIVE_UP_MS = 120000;
   // On a phone the header's links are one row that scrolls: the current page in view.
   var navRow = document.querySelector("header nav"), navHere = navRow && navRow.querySelector("a.active");

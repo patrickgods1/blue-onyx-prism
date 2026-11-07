@@ -39,9 +39,7 @@
     if (stick && follow.checked) view.scrollTop = view.scrollHeight;
   }
   function poll() {
-    if (paused) return;
-    if (document.hidden) return;
-    fetch("/logs.json?after=" + cursor, {cache: "no-store", headers: {"Accept": "application/json"}}).then(function (r) {
+    return fetch("/logs.json?after=" + cursor, {cache: "no-store", headers: {"Accept": "application/json"}}).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     }).then(function (j) {
@@ -53,15 +51,19 @@
       }
       cursor = j.last;
       status.textContent = (j.success ? entries.length + " events" : j.message) + (j.truncated ? " (older events were dropped)" : "");
-    }).catch(function (e) { status.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : ""); });
+    }).catch(function (e) {
+      status.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : "");
+      throw e; // the poller backs off
+    });
   }
+  var poller = PrismPoll.create({run: poll, period: 2000});
   showLevel.addEventListener("change", rerender);
   search.addEventListener("input", rerender);
   follow.addEventListener("change", function () { if (follow.checked) view.scrollTop = view.scrollHeight; });
   pauseBtn.addEventListener("click", function () {
     paused = !paused;
     pauseBtn.textContent = paused ? "Resume" : "Pause";
-    if (!paused) poll();
+    if (paused) poller.stop(); else poller.start();
   });
   function text() { return entries.filter(visible).map(line).join("\n") + "\n"; }
   document.getElementById("copy").addEventListener("click", function () {
@@ -90,7 +92,5 @@
       .then(function (j) { msg.textContent = j.message; msg.className = j.success ? "muted" : "error-text"; })
       .catch(function (ex) { msg.textContent = "failed: " + ex; });
   });
-  poll();
-  setInterval(poll, 2000);
-  document.addEventListener("visibilitychange", function () { if (!document.hidden) poll(); });
+  poller.start();
 })();

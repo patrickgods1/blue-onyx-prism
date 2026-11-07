@@ -9,6 +9,22 @@
 //! The store is shared by every registry generation of the process (restarts keep the revision
 //! and the log).
 //!
+//! Readers never wait (RR-C1): the state readers see (config, revision, generation, change log,
+//! file error) is an immutable `Published` value behind an [`ArcSwap`]; [`ConfigStore::read`]
+//! and the other readers are one atomic load, and a [`ConfigRef`] is one consistent state. A
+//! writer builds the next state beside the current one and publishes it after the file is
+//! written, so a request handler reading the config while a save syncs the file to disk gets
+//! the previous config at once instead of waiting for the `fsync`.
+//!
+//! Lock order: readers take no lock. Writers ([`ConfigStore::update`], [`ConfigStore::adopt`],
+//! [`ConfigStore::check_disk`]) serialize on `writer`, the store's only lock, held across the
+//! external-edit check, the edit, the file write (its `fsync`) and the publish. When a writer
+//! also holds `server::AppState::apply_lock` (`save_config`), that lock is taken first:
+//! `apply_lock` -> `writer`, never the reverse (nothing done under `writer`, an edit closure
+//! included, may take `apply_lock` or call a writer of this store: the mutex is not reentrant).
+//! [`ConfigStore::check_disk`] only tries `writer`: the polls that call it never queue behind a
+//! save.
+//!
 //! Edits on disk: each generation runs a disk watch ([`spawn_disk_watch`], every
 //! [`DISK_POLL`]) that calls `server::sync_config`, which applies a changed file exactly like a
 //! Save (live settings swap, per-model reload, runtime-level fields pending until a restart).
@@ -19,13 +35,14 @@
 
 use crate::config::Config;
 use crate::config_merge::{FieldChange, describe_changes};
-use crate::sync::RwLockExt;
+use crate::sync::LockExt;
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// Changes kept for `GET /v1/config`.
@@ -142,28 +159,73 @@ fn rejected_message(path: &Path, e: &anyhow::Error) -> String {
     )
 }
 
-struct Inner {
+/// What readers see: one consistent state, never changed in place; every change publishes a new
+/// one ([`ConfigStore::publish`]).
+#[derive(Debug, Clone)]
+struct Published {
     config: Config,
     revision: u64,
     generation: u64,
     changes: VecDeque<ChangeRecord>,
-    disk: Option<DiskStamp>,
     disk_error: Option<String>,
+    /// +1 per publish: anything a reader sees changed (config, revision, generation, change
+    /// log, file error).
+    serial: u64,
 }
 
-/// Read access to the current config.
-pub struct ConfigRef<'a>(RwLockReadGuard<'a, Inner>);
+/// What only writers touch (under [`ConfigStore::writer`]).
+#[derive(Debug)]
+struct Writer {
+    /// The file as this store last read or wrote it.
+    disk: Option<DiskStamp>,
+}
 
-impl std::fmt::Debug for ConfigRef<'_> {
+/// Read access to the current config: a shared handle on one published state, so it never
+/// blocks a writer, a writer never blocks it, and it can be held across an `.await`. It derefs
+/// to the [`Config`]; the store state it was taken from is read with the associated functions
+/// ([`ConfigRef::revision`], ...), named like `Arc::ptr_eq` so none shadows a `Config` item.
+pub struct ConfigRef(Arc<Published>);
+
+impl std::fmt::Debug for ConfigRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ConfigRef").field(&self.0.config).finish()
     }
 }
 
-impl std::ops::Deref for ConfigRef<'_> {
+impl std::ops::Deref for ConfigRef {
     type Target = Config;
     fn deref(&self) -> &Config {
         &self.0.config
+    }
+}
+
+impl ConfigRef {
+    /// Revision of this config.
+    pub fn revision(this: &Self) -> u64 {
+        this.0.revision
+    }
+
+    /// Registry generation when this was published.
+    pub fn generation(this: &Self) -> u64 {
+        this.0.generation
+    }
+
+    /// Publish counter: equal for two handles exactly when they hold the same published state
+    /// (config, revision, generation, change log, file error), so a cache keyed by it is never
+    /// stale.
+    pub fn serial(this: &Self) -> u64 {
+        this.0.serial
+    }
+
+    /// The last `n` changes, oldest first.
+    pub fn changes(this: &Self, n: usize) -> Vec<ChangeRecord> {
+        let skip = this.0.changes.len().saturating_sub(n);
+        this.0.changes.iter().skip(skip).cloned().collect()
+    }
+
+    /// Why the file on disk could not be used, if so.
+    pub fn disk_error(this: &Self) -> Option<String> {
+        this.0.disk_error.clone()
     }
 }
 
@@ -182,11 +244,21 @@ pub struct Updated<R> {
     pub record: Option<ChangeRecord>,
 }
 
+/// Test hook: runs inside [`ConfigStore::update`] with `writer` held, right where the file is
+/// written and synced to disk.
+#[cfg(test)]
+pub(crate) type WriteHook = Arc<dyn Fn() + Send + Sync>;
+
 pub struct ConfigStore {
     path: PathBuf,
     /// Process start in Unix milliseconds: revisions restart at 1 in a new process.
     epoch: u64,
-    inner: RwLock<Inner>,
+    /// What readers see (replaced whole, only with `writer` held).
+    current: ArcSwap<Published>,
+    /// Serializes the writers (see the module doc for the lock order).
+    writer: Mutex<Writer>,
+    #[cfg(test)]
+    write_hook: Mutex<Option<WriteHook>>,
 }
 
 impl std::fmt::Debug for ConfigStore {
@@ -219,16 +291,37 @@ impl ConfigStore {
         Self {
             path,
             epoch,
-            inner: RwLock::new(Inner {
+            current: ArcSwap::from_pointee(Published {
                 config,
                 revision: 1,
                 generation: 1,
                 changes: VecDeque::new(),
-                disk,
                 disk_error: None,
+                serial: 1,
             }),
+            writer: Mutex::new(Writer { disk }),
+            #[cfg(test)]
+            write_hook: Mutex::new(None),
         }
     }
+
+    /// Run `hook` inside every later [`Self::update`] that writes the file, with the writer lock
+    /// held, just before the write and its `fsync` (None removes it).
+    #[cfg(test)]
+    pub(crate) fn set_write_hook(&self, hook: Option<WriteHook>) {
+        *self.write_hook.lock_recover() = hook;
+    }
+
+    #[cfg(test)]
+    fn run_write_hook(&self) {
+        let hook = self.write_hook.lock_recover().clone();
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run_write_hook(&self) {}
 
     /// What an edit from `before` to `new` writes: `new`, but a one-off flag of this run
     /// ([`Config::one_off_flags`]) stays in memory, or any save from a page would make it
@@ -249,12 +342,14 @@ impl ConfigStore {
         out
     }
 
-    fn lock_read(&self) -> RwLockReadGuard<'_, Inner> {
-        self.inner.read_recover()
-    }
-
-    fn lock_write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
-        self.inner.write_recover()
+    /// Publish the current state changed by `edit` (a copy: readers holding the old one keep
+    /// it). `_held` proves the caller holds `writer`, so no two publishes race.
+    fn publish<R>(&self, _held: &Writer, edit: impl FnOnce(&mut Published) -> R) -> R {
+        let mut next = Published::clone(&self.current.load());
+        let out = edit(&mut next);
+        next.serial += 1;
+        self.current.store(Arc::new(next));
+        out
     }
 
     pub fn path(&self) -> &Path {
@@ -265,67 +360,67 @@ impl ConfigStore {
         self.epoch
     }
 
-    /// The current config (hold the guard briefly).
-    pub fn read(&self) -> ConfigRef<'_> {
-        ConfigRef(self.lock_read())
+    /// The current config. Never waits, also not while a save writes the file; the handle is
+    /// one consistent state (see [`ConfigRef`]).
+    pub fn read(&self) -> ConfigRef {
+        ConfigRef(self.current.load_full())
     }
 
     /// Revision and a copy of the config, consistent with each other.
     pub fn snapshot(&self) -> (u64, Config) {
-        let g = self.lock_read();
+        let g = self.current.load();
         (g.revision, g.config.clone())
     }
 
     pub fn revision(&self) -> u64 {
-        self.lock_read().revision
+        self.current.load().revision
     }
 
     /// Registry generation (1 for the first, +1 per restart).
     pub fn generation(&self) -> u64 {
-        self.lock_read().generation
+        self.current.load().generation
     }
 
     /// The last `n` changes, oldest first.
     pub fn changes(&self, n: usize) -> Vec<ChangeRecord> {
-        let g = self.lock_read();
-        let skip = g.changes.len().saturating_sub(n);
-        g.changes.iter().skip(skip).cloned().collect()
+        ConfigRef::changes(&self.read(), n)
     }
 
     /// Why the file on disk could not be used (it is not valid JSON, ...), if so.
     pub fn disk_error(&self) -> Option<String> {
-        self.lock_read().disk_error.clone()
+        self.current.load().disk_error.clone()
     }
 
-    fn record(inner: &mut Inner, source: &str, before: &Config) -> Option<ChangeRecord> {
-        if *before == inner.config {
+    /// Bump the revision and log the change from `before` to `p.config`, if any.
+    fn record(p: &mut Published, source: &str, before: &Config) -> Option<ChangeRecord> {
+        if *before == p.config {
             return None;
         }
-        inner.revision += 1;
-        let (fields, summary) = describe_changes(before, &inner.config);
+        p.revision += 1;
+        let (fields, summary) = describe_changes(before, &p.config);
         let rec = ChangeRecord {
-            revision: inner.revision,
+            revision: p.revision,
             time: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             source: source.to_string(),
             summary,
             live: crate::config_merge::applied_live(&fields),
             fields,
         };
-        inner.changes.push_back(rec.clone());
-        while inner.changes.len() > CHANGE_LOG_LEN {
-            inner.changes.pop_front();
+        p.changes.push_back(rec.clone());
+        while p.changes.len() > CHANGE_LOG_LEN {
+            p.changes.pop_front();
         }
         Some(rec)
     }
 
-    /// Reload the file when another process changed it (call with the write lock held).
-    /// `verify`: read and hash the file even when its length and mtime are unchanged. An edit
-    /// within the same mtime tick (1-2 s on FAT/exFAT, some SMB and bind mounts, HFS+) that
-    /// keeps the length (`4000` -> `4001`) is only seen that way (CO-08).
-    fn sync_disk(&self, inner: &mut Inner, verify: bool) -> Option<ChangeRecord> {
+    /// Reload the file when another process changed it (`w` is the held writer lock) and
+    /// publish what it changed. `verify`: read and hash the file even when its length and mtime
+    /// are unchanged. An edit within the same mtime tick (1-2 s on FAT/exFAT, some SMB and bind
+    /// mounts, HFS+) that keeps the length (`4000` -> `4001`) is only seen that way (CO-08).
+    fn sync_disk(&self, w: &mut Writer, verify: bool) -> Option<ChangeRecord> {
         let (modified, len) = stat(&self.path)?;
         if !verify
-            && let Some(d) = &inner.disk
+            && let Some(d) = &w.disk
             && d.modified == modified
             && d.len == len
         {
@@ -333,8 +428,8 @@ impl ConfigStore {
         }
         let bytes = std::fs::read(&self.path).ok()?;
         let stamp = stamp_of(&self.path, &bytes)?;
-        if inner.disk.as_ref().is_some_and(|d| d.hash == stamp.hash) {
-            inner.disk = Some(stamp);
+        if w.disk.as_ref().is_some_and(|d| d.hash == stamp.hash) {
+            w.disk = Some(stamp);
             return None;
         }
         let parsed = std::str::from_utf8(&bytes)
@@ -360,16 +455,22 @@ impl ConfigStore {
             );
             return None;
         }
-        inner.disk = Some(stamp);
+        w.disk = Some(stamp);
+        let cur = self.current.load_full();
         match parsed {
             Ok(c) => {
-                inner.disk_error = None;
-                if c == inner.config {
+                if c == cur.config {
+                    if cur.disk_error.is_some() {
+                        self.publish(w, |p| p.disk_error = None);
+                    }
                     return None;
                 }
-                let before = std::mem::replace(&mut inner.config, c);
-                apply_max_pixels(&before, &inner.config);
-                let rec = Self::record(inner, SOURCE_DISK, &before);
+                apply_max_pixels(&cur.config, &c);
+                let rec = self.publish(w, |p| {
+                    p.disk_error = None;
+                    let before = std::mem::replace(&mut p.config, c);
+                    Self::record(p, SOURCE_DISK, &before)
+                });
                 if let Some(r) = &rec {
                     tracing::info!(
                         revision = r.revision,
@@ -383,7 +484,9 @@ impl ConfigStore {
             Err(e) => {
                 let msg = rejected_message(&self.path, &e);
                 tracing::warn!("{msg}");
-                inner.disk_error = Some(msg);
+                if cur.disk_error.as_deref() != Some(msg.as_str()) {
+                    self.publish(w, |p| p.disk_error = Some(msg));
+                }
                 None
             }
         }
@@ -392,35 +495,38 @@ impl ConfigStore {
     /// Pick up changes other processes made to the file (cheap when it did not change: one
     /// `stat`; an edit that keeps both the length and the mtime tick is only seen by the next
     /// [`Self::update`], which always hashes). Returns the logged change.
+    ///
+    /// Never waits for a writer: while one holds the lock (a save writing the file) this
+    /// returns None at once. That writer hashes the file itself before it writes, and the next
+    /// poll (the disk watch, a page) looks again.
     pub fn check_disk(&self) -> Option<ChangeRecord> {
-        // Cheap pre-check under the read lock.
-        {
-            let g = self.lock_read();
-            let now = stat(&self.path);
-            match (&g.disk, now) {
-                (_, None) => return None,
-                (Some(d), Some((m, l))) if d.modified == m && d.len == l => return None,
-                _ => {}
-            }
+        let mut w = self.writer.try_lock_recover()?;
+        let now = stat(&self.path);
+        match (&w.disk, now) {
+            (_, None) => None,
+            (Some(d), Some((m, l))) if d.modified == m && d.len == l => None,
+            _ => self.sync_disk(&mut w, false),
         }
-        let mut g = self.lock_write();
-        self.sync_disk(&mut g, false)
     }
 
     /// Apply `edit` to a copy of the current config (after picking up external file changes),
     /// write the file and make it current. The revision is bumped and the change logged when
     /// the config changed; the file is written when it changed or does not exist yet. On error
-    /// nothing changes.
+    /// the config stays (a change picked up from the file before the edit is kept).
+    ///
+    /// Readers keep the previous config until the file is written and read back; `edit` runs
+    /// with the writer lock held (see the module doc).
     pub fn update<R>(
         &self,
         source: &str,
         edit: impl FnOnce(&mut Config) -> Result<R>,
     ) -> Result<Updated<R>> {
-        let mut g = self.lock_write();
+        let mut w = self.writer.lock_recover();
         // Always hash here (rare, and about to overwrite the file): the stat-only shortcut of
         // the poll can miss an external edit, which this write would then destroy.
-        self.sync_disk(&mut g, true);
-        let before = g.config.clone();
+        self.sync_disk(&mut w, true);
+        let cur = self.current.load_full();
+        let before = cur.config.clone();
         let mut new = before.clone();
         let value = edit(&mut new)?;
         new.normalize();
@@ -428,16 +534,28 @@ impl ConfigStore {
         if changed {
             new.validate()?;
         }
-        if changed || !self.path.exists() {
+        let wrote = changed || !self.path.exists();
+        if wrote {
+            self.run_write_hook();
             self.for_the_file(&before, &new).save(&self.path)?;
             let bytes = std::fs::read(&self.path)
                 .with_context(|| format!("reading back {}", self.path.display()))?;
-            g.disk = stamp_of(&self.path, &bytes);
-            g.disk_error = None;
+            w.disk = stamp_of(&self.path, &bytes);
         }
-        g.config = new;
-        apply_max_pixels(&before, &g.config);
-        let record = Self::record(&mut g, source, &before);
+        let (revision, record) = if changed || (wrote && cur.disk_error.is_some()) {
+            apply_max_pixels(&before, &new);
+            self.publish(&w, |p| {
+                if wrote {
+                    p.disk_error = None;
+                }
+                p.config = new;
+                let rec = Self::record(p, source, &before);
+                (p.revision, rec)
+            })
+        } else {
+            (cur.revision, None)
+        };
+        drop(w);
         if let Some(r) = &record {
             tracing::info!(
                 revision = r.revision,
@@ -448,7 +566,7 @@ impl ConfigStore {
         }
         Ok(Updated {
             value,
-            revision: g.revision,
+            revision,
             changed,
             before,
             record,
@@ -466,23 +584,30 @@ impl ConfigStore {
         source: &str,
         based_on: u64,
     ) -> Option<ChangeRecord> {
-        let mut g = self.lock_write();
-        g.generation += 1;
-        let mut config = config?;
-        if g.revision != based_on {
+        let mut w = self.writer.lock_recover();
+        let revision = self.current.load().revision;
+        let Some(mut config) = config else {
+            self.publish(&w, |p| p.generation += 1);
+            return None;
+        };
+        if revision != based_on {
             tracing::info!(
-                revision = g.revision,
+                revision,
                 based_on,
                 "the config was saved while the server restarted; keeping the saved config ({source} not adopted)"
             );
+            self.publish(&w, |p| p.generation += 1);
             return None;
         }
         config.normalize();
-        let before = std::mem::replace(&mut g.config, config);
         if let Ok(bytes) = std::fs::read(&self.path) {
-            g.disk = stamp_of(&self.path, &bytes);
+            w.disk = stamp_of(&self.path, &bytes);
         }
-        Self::record(&mut g, source, &before)
+        self.publish(&w, |p| {
+            p.generation += 1;
+            let before = std::mem::replace(&mut p.config, config);
+            Self::record(p, source, &before)
+        })
     }
 }
 
@@ -491,10 +616,34 @@ mod tests {
     use super::*;
     use crate::config::ModelConfig;
 
-    fn tmp() -> PathBuf {
+    /// `cfg.json` in a new temporary folder, removed with the guard.
+    struct Tmp(PathBuf);
+
+    impl std::ops::Deref for Tmp {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Tmp {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            if let Some(d) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+
+    fn tmp() -> Tmp {
         let d = std::env::temp_dir().join(format!("bo_store_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
-        d.join("cfg.json")
+        Tmp(d.join("cfg.json"))
     }
 
     fn cfg() -> Config {
@@ -506,6 +655,263 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// How long a test waits for a step another thread must reach (never a sleep: a timeout
+    /// only turns a hang into a failure).
+    const STEP: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// A write hook that parks the writing thread inside the file write until released:
+    /// `entered` receives one message per write that reached the hook.
+    struct Park {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn park(s: &ConfigStore) -> Park {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        s.set_write_hook(Some(Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock_recover()
+                .recv_timeout(STEP)
+                .expect("released");
+        })));
+        Park { entered, release }
+    }
+
+    /// RR-C1: while a save is inside its file write (`fsync` included), with the writer lock
+    /// held, every reader answers at once with the previous config, and the poll's disk check
+    /// does not queue behind the writer. Once the save returns, readers see the new config.
+    #[test]
+    fn readers_are_not_blocked_while_a_save_writes() {
+        let path = tmp();
+        let s = Arc::new(ConfigStore::new(cfg(), path.clone()));
+        s.update("test", |_| Ok(())).unwrap();
+        let p = park(&s);
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                s.update("config page", |c| {
+                    c.port = 4000;
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        p.entered
+            .recv_timeout(STEP)
+            .expect("the save reached its write");
+        // The writer is parked in the write, holding the lock.
+        assert!(
+            s.writer.try_lock().is_err(),
+            "writer lock held across the write"
+        );
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let reader = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let r = s.read();
+                let seen = (
+                    r.port,
+                    ConfigRef::revision(&r),
+                    s.snapshot().0,
+                    s.revision(),
+                    s.generation(),
+                    s.changes(10).len(),
+                    s.disk_error(),
+                    s.check_disk().is_none(),
+                );
+                done_tx.send(seen).unwrap();
+            })
+        };
+        let seen = done
+            .recv_timeout(STEP)
+            .expect("a reader waited for the save's write");
+        assert_eq!(
+            seen,
+            (crate::DEFAULT_PORT, 1, 1, 1, 1, 0, None, true),
+            "readers see the previous config while the save writes"
+        );
+        reader.join().unwrap();
+        p.release.send(()).unwrap();
+        let up = writer.join().unwrap();
+        assert_eq!(up.revision, 2);
+        let r = s.read();
+        assert_eq!((r.port, ConfigRef::revision(&r)), (4000, 2));
+        assert_eq!(Config::load(&path).unwrap().port, 4000);
+        // A handle taken before the save still holds the old state, consistently.
+        drop(r);
+    }
+
+    /// Saves still serialize: a second save that starts while the first is inside its write
+    /// runs its edit only after the first published, so it starts from the first's result and
+    /// neither edit is lost.
+    #[test]
+    fn concurrent_saves_serialize() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = tmp();
+        let s = Arc::new(ConfigStore::new(cfg(), path.clone()));
+        s.update("test", |_| Ok(())).unwrap();
+        let p = park(&s);
+        let first = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                s.update("first", |c| {
+                    c.port = 4000;
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        p.entered
+            .recv_timeout(STEP)
+            .expect("the first save reached its write");
+        let released = Arc::new(AtomicBool::new(false));
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let second = {
+            let (s, released) = (s.clone(), released.clone());
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                s.update("second", |c| {
+                    // Runs only once the first save let go of the writer lock.
+                    assert!(
+                        released.load(Ordering::SeqCst),
+                        "edit ran during another save"
+                    );
+                    assert_eq!(c.port, 4000, "the edit starts from the first save");
+                    c.nms_iou = 0.45;
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        started.recv_timeout(STEP).unwrap();
+        // The second save cannot have taken the lock: the first still holds it.
+        assert!(s.writer.try_lock().is_err());
+        assert!(p.entered.try_recv().is_err(), "two saves inside the write");
+        released.store(true, Ordering::SeqCst);
+        p.release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().revision, 2);
+        p.entered
+            .recv_timeout(STEP)
+            .expect("the second save writes after");
+        p.release.send(()).unwrap();
+        assert_eq!(second.join().unwrap().revision, 3);
+        let on_disk = Config::load(&path).unwrap();
+        assert_eq!((on_disk.port, on_disk.nms_iou), (4000, 0.45));
+        let sources: Vec<String> = s.changes(10).into_iter().map(|c| c.source).collect();
+        assert_eq!(sources, ["first", "second"]);
+    }
+
+    /// The external-edit check still runs under the writer lock before every save: an edit on
+    /// disk is adopted before the save writes (never overwritten), and a file that does not
+    /// validate is refused, reported to readers, and replaced by the save with the running
+    /// config. A disk check while a save writes leaves the file to that save.
+    #[test]
+    fn saves_still_check_the_file_first() {
+        let path = tmp();
+        let s = Arc::new(ConfigStore::new(cfg(), path.clone()));
+        s.update("test", |_| Ok(())).unwrap();
+        let serial = ConfigRef::serial(&s.read());
+        // An editor sets the port; a save of another field keeps it.
+        let mut other = Config::load(&path).unwrap();
+        other.port = 4321;
+        other.save(&path).unwrap();
+        s.update("config page", |c| {
+            c.nms_iou = 0.45;
+            Ok(())
+        })
+        .unwrap();
+        let now = Config::load(&path).unwrap();
+        assert_eq!((now.port, now.nms_iou), (4321, 0.45));
+        assert!(ConfigRef::serial(&s.read()) > serial);
+        // A value out of range on disk: refused, readers see why, the config stays.
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            "\"worker_queue_size\": 0",
+            "\"worker_queue_size\": 1000000000",
+        );
+        std::fs::write(&path, text).unwrap();
+        assert!(s.check_disk().is_none());
+        let err = ConfigRef::disk_error(&s.read()).expect("refusal published");
+        assert!(err.contains("worker_queue_size"), "{err}");
+        assert_eq!(s.read().worker_queue_size, 0);
+        // The next save writes the running config over the broken file and clears the error.
+        s.update("config page", |c| {
+            c.port = 4322;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.disk_error(), None);
+        let now = Config::load(&path).unwrap();
+        assert_eq!((now.port, now.worker_queue_size), (4322, 0));
+        // A file edit seen by a poll during a save: the poll leaves it to the save, which
+        // hashes the file first, so the edit made before the save's write survives it.
+        let mut other = Config::load(&path).unwrap();
+        other.nms_iou = 0.4;
+        other.save(&path).unwrap();
+        let p = park(&s);
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                s.update("config page", |c| {
+                    c.port = 4323;
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        p.entered.recv_timeout(STEP).unwrap();
+        assert!(s.check_disk().is_none(), "a poll never waits for the save");
+        p.release.send(()).unwrap();
+        writer.join().unwrap();
+        let now = Config::load(&path).unwrap();
+        assert_eq!((now.port, now.nms_iou), (4323, 0.4));
+        let sources: Vec<String> = s.changes(10).into_iter().map(|c| c.source).collect();
+        assert_eq!(
+            sources,
+            [
+                SOURCE_DISK,
+                "config page",
+                "config page",
+                SOURCE_DISK,
+                "config page"
+            ]
+        );
+    }
+
+    /// Every publish changes the serial; a write that changes nothing publishes nothing, so a
+    /// cache keyed by the serial stays valid.
+    #[test]
+    fn serial_changes_with_every_published_state() {
+        let path = tmp();
+        let s = ConfigStore::new(cfg(), path.clone());
+        let serial = || ConfigRef::serial(&s.read());
+        let a = serial();
+        s.update("test", |_| Ok(())).unwrap();
+        assert_eq!(
+            serial(),
+            a,
+            "a first write of the same config publishes nothing"
+        );
+        s.update("test", |c| {
+            c.port = 4000;
+            Ok(())
+        })
+        .unwrap();
+        let b = serial();
+        assert!(b > a);
+        s.adopt(None, "restart", 2);
+        let c = serial();
+        assert!(c > b, "a new generation is a new state");
+        std::fs::write(&path, "{ not json").unwrap();
+        s.check_disk();
+        assert!(serial() > c, "a file error is a new state");
+        let d = serial();
+        s.check_disk();
+        assert_eq!(serial(), d, "the same error again publishes nothing");
     }
 
     #[test]
@@ -661,7 +1067,7 @@ mod tests {
         assert_eq!(s.revision(), 1);
         // An edit that makes the config invalid is refused and changes nothing.
         let path2 = tmp();
-        let s = ConfigStore::new(cfg(), path2);
+        let s = ConfigStore::new(cfg(), path2.clone());
         assert!(
             s.update("x", |c| {
                 c.nms_iou = 3.0;

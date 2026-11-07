@@ -8,6 +8,9 @@
 // opts: runId, available [keys the picker offers], onColumns(list) -> Promise<{ok, message}>.
 // Everything is built with createElement / textContent (metric keys come from a training
 // script); colours come from CSS classes (CSP style-src 'self'). ES5, no build step.
+// poll.have(store) / poll.merge(store, runs): the history a page holds across the light polls of
+// GET /v1/training?poll=1&have=... (src/server/training/poll.rs). Pure, no DOM: checked against the
+// server's answers by node (server::training::poll tests).
 (function () {
   "use strict";
   var PB = window.PrismBench || {};
@@ -425,8 +428,46 @@
     return true;
   }
 
+  // ---- the poll's history ----------------------------------------------------------------------
+  // store: run id -> {rows, last, keys}: the rows a page holds, its last epoch and the keys the
+  // server sent with them. have() names them for the next poll ("<id>:<last epoch>:<prefix key>:
+  // <full key>", comma separated); merge() folds an answer's runs into the store and puts each run's
+  // whole history back on its progress, so the rest of the page reads the answer as a full one. A
+  // run with `history_since` keeps its rows before that epoch and appends the ones sent; a run
+  // without it (a full answer, an old server's included) takes the rows sent. Runs the answer no
+  // longer lists are forgotten.
+  function pollHave(store) {
+    return Object.keys(store).map(function (id) {
+      var s = store[id];
+      return encodeURIComponent(id) + ":" + s.last + ":" + s.keys[0] + ":" + s.keys[1];
+    }).join(",");
+  }
+  function pollMerge(store, runs) {
+    var seen = {};
+    (runs || []).forEach(function (r) {
+      seen[r.id] = true;
+      var p = r.progress;
+      if (!p) { delete store[r.id]; return; }
+      var rows = p.history || [];
+      if (has(p.history_since)) {
+        var since = p.history_since, old = store[r.id];
+        // Never asked for (cannot happen with have()): forget it, the next poll sends it all.
+        if (!old) { delete store[r.id]; delete p.history_since; delete p.history_keys; p.history = rows; return; }
+        rows = old.rows.filter(function (h) { return h.epoch < since; }).concat(rows);
+      }
+      p.history = rows;
+      var keys = p.history_keys;
+      delete p.history_since;
+      delete p.history_keys;
+      if (rows.length && keys && keys.length === 2) store[r.id] = { rows: rows, last: rows[rows.length - 1].epoch, keys: keys };
+      else delete store[r.id];
+    });
+    Object.keys(store).forEach(function (id) { if (!seen[id]) delete store[id]; });
+    return runs;
+  }
+
   window.TrainMetrics = {
     render: render, refresh: refresh, signature: signature, format: format, infoMap: infoMap, keysOf: keysOf,
-    overfitting: overfitting, shortSci: shortSci
+    overfitting: overfitting, shortSci: shortSci, poll: { have: pollHave, merge: pollMerge }
   };
 })();

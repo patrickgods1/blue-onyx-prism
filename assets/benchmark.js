@@ -4,11 +4,42 @@
 // and History are in bench-compare.js) and the page wiring. Compare's table is in bench-lineup.js,
 // Tune's profile cards and its Save in bench-profiles.js, the vocabulary in bench-glossary.js, the
 // charts in bench-charts.js, all shared through window.PrismBench (loaded before this file).
+// BenchPoll (pure, no DOM; checked in node by src/server/benchmark/poll.rs): what a run poll's
+// answer means. During a run the page polls GET /v1/benchmark?only=run (the run, `viewTag` = the
+// tag of everything else, `modelsTag` = the tag of run.models, left out when the page sent it
+// back as `models=`); the full answer is fetched only when `viewTag` changes or the run ends.
+(function (root) {
+  "use strict";
+  function runUri(modelsTag) {
+    return "/v1/benchmark?only=run" + (modelsTag ? "&models=" + encodeURIComponent(modelsTag) : "");
+  }
+  // last = {status, viewTag, modelsTag}: what the page shows (the last full answer with the runs
+  // polled since), the full answer's X-Benchmark-View and the tag of status.run.models (null =
+  // unknown, e.g. from a full answer). Answers {full: true} (fetch the full answer), {old: true}
+  // (an old server answered the full status: show it as it is) or {status, modelsTag}.
+  function step(last, s) {
+    if (!s || typeof s !== "object") return {full: true};
+    if (s.viewTag === undefined) return {old: true};
+    if (!last || !last.status || !last.viewTag || s.viewTag !== last.viewTag) return {full: true};
+    // The run ended (its results are saved; the page says so with the full answer).
+    if (!s.running && last.status.running) return {full: true};
+    var run = s.run || {};
+    if (run.models === undefined) {
+      // Left out: the page's models are still these, unless it never had their tag.
+      if (!last.modelsTag || last.modelsTag !== s.modelsTag) return {full: true};
+      var prev = last.status.run && last.status.run.models;
+      run = Object.assign({}, run, {models: prev || []});
+    }
+    return {status: Object.assign({}, last.status, {state: s.state, running: s.running, run: run}), modelsTag: s.modelsTag || null};
+  }
+  root.BenchPoll = {runUri: runUri, step: step};
+})(typeof globalThis !== "undefined" ? globalThis : window);
 (function () {
+  if (typeof document === "undefined") return; // loaded by the node test for BenchPoll only
   var PB = window.PrismBench, C = PB.charts, F = PB.fmt, has = PB.has;
   var $ = function (id) { return document.getElementById(id); };
   var form = $("bench-form"), msg = $("msg"), bar = $("bar"), ptext = $("ptext");
-  var polling = null, lastState = null, lastConfig = null, lastModels = [], lastStatus = null;
+  var lastState = null, lastConfig = null, lastModels = [], lastStatus = null;
   // Old links: Overview, Results, Profiles and Apply are Tune now, Advanced is Details, and its
   // sections moved with it (History has its own tab). Rewritten before the tabs read the URL (and
   // on later hash changes, before their listener runs); a link into a section opens that section.
@@ -78,13 +109,15 @@
         if (!j.success) { b.disabled = false; return; }
         // Follow the download in the dataset's state text, then reload in place once it is done.
         var row = b.closest("label"), state = row && row.querySelector(".ds-state");
-        (function tick() {
-          fetch("/v1/resources", {cache: "no-store"}).then(function (r) { return r.json(); }).then(function (j2) {
+        PrismPoll.create({period: 1500, max: 30000, run: function () {
+          return fetch("/v1/resources", {cache: "no-store"}).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(function (j2) {
             var r = (j2.resources || []).find(function (x) { return x.id === id; });
             if (r && state) state.textContent = r.state_text;
-            if (r && r.busy) setTimeout(tick, 1500); else L.reloadKeep();
-          }).catch(function () { setTimeout(tick, 3000); });
-        })();
+            if (r && r.busy) return true;
+            L.reloadKeep();
+            return false;
+          });
+        }, more: function (busy) { return busy; }}).start();
       });
     });
   });
@@ -1151,19 +1184,40 @@
     PB.refreshTip();
     return running;
   }
+  // The full answer (ETag / If-None-Match: 304 = the one shown last); `polled` is what the page
+  // shows (BenchPoll.step's `last`), `full` the full answer it came from.
+  var BP = window.BenchPoll, polled = {status: null, viewTag: null, modelsTag: null}, full = null, fullTag = null, etag = null;
   function refresh() {
-    return fetch("/v1/benchmark", {cache: "no-store"}).then(function (r) {
+    var opts = {cache: "no-store"};
+    if (etag && full) opts.headers = {"If-None-Match": etag};
+    return fetch("/v1/benchmark", opts).then(function (r) {
+      if (r.status === 304 && full) return full;
       if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    }).then(render);
+      etag = r.headers.get("ETag"); fullTag = r.headers.get("X-Benchmark-View");
+      return r.json().then(function (j) { full = j; return j; });
+    }).then(function (j) { polled = {status: j, viewTag: fullTag, modelsTag: null}; return render(j); });
   }
   PB.refresh = refresh;
-  function poll() {
-    if (polling) return;
-    polling = setInterval(function () {
-      refresh().then(function (running) { if (!running) { clearInterval(polling); polling = null; } }).catch(function (e) { msg.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : ""); });
-    }, 1000);
+  // One poll of a run: the run alone, the full answer when anything else changed.
+  function pollRun() {
+    return fetch(BP.runUri(polled.modelsTag), {cache: "no-store"}).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function (s) {
+      var n = BP.step(polled, s);
+      if (n.full) return refresh();
+      if (n.old) { polled = {status: s, viewTag: null, modelsTag: null}; return render(s); }
+      polled = {status: n.status, viewTag: polled.viewTag, modelsTag: n.modelsTag};
+      return render(n.status);
+    }).catch(function (e) {
+      msg.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : "");
+      throw e;
+    });
   }
+  // Every second while a run goes (PrismPoll: chained, one request at a time, nothing while the
+  // tab is hidden and at once when it shows again, slower after errors); parked when it ends.
+  var poller = PrismPoll.create({run: pollRun, period: 1000, max: 30000, more: function (running) { return !!running; }});
+  function poll() { poller.kick(); }
   refresh().then(function (running) { if (running) poll(); }, function (e) { msg.textContent = "server not answering (" + e.message + ")"; });
   loadSearch();
 

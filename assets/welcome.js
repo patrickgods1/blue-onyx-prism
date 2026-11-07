@@ -4,9 +4,8 @@
   var rows = document.querySelectorAll("table.models tbody tr");
   var busy = Array.prototype.some.call(rows, function (r) { return r.className === "st-loading" || r.className === "st-wait"; });
   if (!busy) return;
-  var timer = setInterval(function () {
-    if (document.hidden) return;
-    fetch("/stats.json", {cache: "no-store"}).then(function (r) {
+  var poller = PrismPoll.create({period: 2000, run: function () {
+    return fetch("/stats.json", {cache: "no-store"}).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     }).then(function (j) {
@@ -19,9 +18,10 @@
         if (d && m.stateDetail) d.textContent = m.stateDetail;
       });
       // Reload where the user was (PrismLive keeps the scroll position across it).
-      if (changed) { clearInterval(timer); if (window.PrismLive) PrismLive.reloadKeep(); else location.reload(); }
-    }).catch(function () {});
-  }, 2000);
+      if (changed) { poller.stop(); if (window.PrismLive) PrismLive.reloadKeep(); else location.reload(); }
+    });
+  }});
+  poller.start();
 })();
 // Pending restart badges follow the live config (another tab, Benchmark apply, the CLI).
 if (window.PrismLive) PrismLive.onConfig(function (j) {

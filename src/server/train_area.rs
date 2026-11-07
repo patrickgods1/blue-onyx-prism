@@ -537,7 +537,7 @@ pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<A
     let dataset_dir = CollectSettings::for_config(&config).dir;
     let tally = tally_of(&review_dir, wait);
     let brief = crate::collect::global().brief_of(&dataset_dir);
-    let runs = super::training::runs(state);
+    let runs = super::training::records(state);
     let tasks = super::training::tasks(state);
     let exports = crate::training::discover_exports(&config);
     let cap = crate::training::capability_now();

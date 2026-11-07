@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
 
+mod poll;
+
 /// Built-in benchmark sets offered besides the held-out frames.
 const EXTRA_SETS: [&str; 3] = ["nir-night", "exdark-ir", "exdark-night"];
 
@@ -111,6 +113,17 @@ pub(crate) fn queue_busy() -> bool {
 /// The clock of job `id` ([`TrainingService::timing`]).
 pub(super) fn job_timing(id: &str) -> Option<crate::training::eta::JobTiming> {
     SERVICE.get()?.timing(id)
+}
+
+/// [`runs`] without their epochs, for readers that do not show them (the Jobs list, the storage
+/// card): no history file is read and no history cloned.
+pub(super) fn records(state: &AppState) -> Vec<RunRecord> {
+    match SERVICE.get() {
+        Some(s) => s.records(),
+        None => crate::training::service::load_bare_records(&crate::training::runs_file(
+            &state.config_read(),
+        )),
+    }
 }
 
 /// The queue if it was started (the page shows `runs.json` otherwise).
@@ -1965,16 +1978,45 @@ pub(super) async fn models_tab(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || render(&view(&state, MODELS, None, None))).await
 }
 
-/// `GET /v1/training`: capability and runs as JSON (the page's poller).
-pub(super) async fn json(State(state): State<Arc<AppState>>) -> Response {
+/// Query of `GET /v1/training`: `poll=1` asks for the light answer of the page's tick, `have`
+/// names the history it holds ([`poll`]).
+#[derive(Debug, Default, serde::Deserialize)]
+pub(super) struct TrainingQuery {
+    #[serde(default)]
+    poll: Option<String>,
+    #[serde(default)]
+    have: Option<String>,
+}
+
+/// `GET /v1/training`: capability and runs as JSON. With `poll=1` the page's poller gets only
+/// the epochs it does not hold, and none of what its tick never reads ([`poll`]).
+pub(super) async fn json(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<TrainingQuery>,
+) -> Response {
     blocking(move || {
-        let cap = crate::training::capability_with_runs(&runs(&state));
+        let all = runs(&state);
         let columns = state.config_read().training.effective_metric_columns();
+        let busy = SERVICE.get().is_some_and(|s| s.busy());
+        let tasks = tasks(&state);
+        if q.poll.as_deref().is_some_and(|p| !p.is_empty() && p != "0") {
+            let have = q.have.as_deref().map(poll::parse_have);
+            let v = poll::answer(
+                all,
+                &tasks,
+                busy,
+                serde_json::json!(columns),
+                serde_json::json!(crate::training::progress::METRICS),
+                have.as_ref(),
+            );
+            return Json(v).into_response();
+        }
+        let cap = crate::training::capability_with_runs(&all);
         Json(serde_json::json!({
             "capability": cap,
-            "busy": SERVICE.get().is_some_and(|s| s.busy()),
-            "runs": runs(&state),
-            "tasks": tasks(&state),
+            "busy": busy,
+            "runs": all,
+            "tasks": tasks,
             "metric_columns": columns,
             "metrics": crate::training::progress::METRICS,
         }))
@@ -2274,7 +2316,7 @@ pub(super) async fn compare_json(
                 "give a comparison group (group=...)",
             );
         };
-        let records = runs(&state);
+        let records = records(&state);
         match group_comparison(&records, &group) {
             Some((rs, c)) => Json(serde_json::json!({
                 "success": true,
@@ -2688,7 +2730,7 @@ pub(super) async fn use_model(
         let mut message = String::new();
         let result = (|| -> anyhow::Result<String> {
             let id = field(&f, "id").ok_or_else(|| anyhow::anyhow!("no run id"))?;
-            let rec = runs(&state)
+            let rec = records(&state)
                 .into_iter()
                 .find(|r| r.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no run {id}"))?;
@@ -3698,6 +3740,38 @@ pub(super) mod tests {
         let (s, text) = get_text(&state, "/v1/training/switch-preview?id=nope").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(text.contains("no run nope"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_poll_answer_is_the_light_one_only_when_asked_and_jobs_carry_tasks() {
+        use crate::server::test_util::{get_text, test_state_with};
+        let _queue = QUEUE_TEST_LOCK.lock().await;
+        let root = std::env::temp_dir().join(format!("bop-train-poll-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let get = |path: &'static str| {
+            let state = state.clone();
+            async move {
+                let (s, text) = get_text(&state, path).await;
+                assert_eq!(s, StatusCode::OK, "{path}: {text}");
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()
+            }
+        };
+        let full = get("/v1/training").await;
+        assert!(full.get("capability").is_some() && full.get("metrics").is_some());
+        let first = get("/v1/training?poll=1").await;
+        assert!(first.get("capability").is_none(), "{first}");
+        assert!(first.get("metrics").is_some() && first.get("runs").is_some());
+        let next = get("/v1/training?poll=1&have=").await;
+        assert!(next.get("metrics").is_none() && next.get("tasks").is_some());
+        // poll=0 is the full answer.
+        assert!(get("/v1/training?poll=0").await.get("capability").is_some());
+        let jobs = get("/v1/train/jobs").await;
+        assert!(jobs.get("task").is_none() && jobs["jobs"].get("active").is_some());
+        let jobs = get("/v1/train/jobs?task=nope&tasks=busy").await;
+        assert!(jobs["task"].is_null() && jobs["tasks"].is_array(), "{jobs}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
