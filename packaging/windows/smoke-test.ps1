@@ -204,10 +204,17 @@ function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
     } catch {
         Fail "cannot list the modules of the service process $ProcessId`: $($_.Exception.Message)" @($Log)
     }
+    # The exe links vcruntime140 itself, so it must be loaded, from the program folder. msvcp140 is
+    # loaded only when a C++ runtime DLL links it dynamically (first CI run: the runtime that
+    # served did not); when it is loaded it must be the shipped copy too.
     foreach ($name in "vcruntime140.dll", "msvcp140.dll") {
         $loaded = @($modules | Where-Object { $_.ModuleName -ieq $name })
         if ($loaded.Count -eq 0) {
-            Fail "the service has no $name loaded: OpenVINO / ONNX Runtime (which use msvcp140) did not load, or the exe no longer links the runtime dynamically" @($Log)
+            if ($name -ieq "vcruntime140.dll") {
+                Fail "the service has no vcruntime140.dll loaded: the exe no longer links the runtime dynamically, or the module list is incomplete" @($Log)
+            }
+            Write-Host "$name is not loaded in the service process (no loaded DLL links it dynamically)."
+            continue
         }
         foreach ($m in $loaded) {
             if ((Split-Path -Parent $m.FileName) -ine $ProgDir) {
@@ -215,8 +222,9 @@ function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
             }
         }
     }
-    $runtimes = @($modules | Where-Object { $_.ModuleName -match '^(openvino|onnxruntime)' } | ForEach-Object { $_.FileName })
-    Write-Host "Service uses the shipped VC++ runtime; runtime DLLs loaded: $($runtimes -join ', ')"
+    $runtimes = @($modules | Where-Object { $_.ModuleName -match '^(openvino|onnxruntime|tbb)' } | ForEach-Object { $_.FileName })
+    $crt = @($modules | Where-Object { $_.ModuleName -match '^(vcruntime|msvcp|ucrtbase)' } | ForEach-Object { $_.FileName })
+    Write-Host "Service uses the shipped VC++ runtime. Runtime DLLs loaded: $($runtimes -join ', '). C runtime DLLs: $($crt -join ', ')"
 }
 
 function Install-AndCheck([string]$Log) {
