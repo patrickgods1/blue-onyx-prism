@@ -1244,14 +1244,24 @@ static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// The folder lock of a dataset, a zero-byte file never deleted: at the dataset's root, so day
 /// folders keep emptying for retention.
 const LOCK_FILE: &str = ".labels.lock";
-/// Longest wait for the folder lock. A write holds it for milliseconds, so running out means a
-/// stopped process or a share that never answers: saving wins over waiting.
-const LOCK_WAIT: Duration = Duration::from_secs(5);
-/// How long a folder whose lock failed goes without one before it is tried again, so a stuck lock
-/// costs one [`LOCK_WAIT`] and not one per write.
+/// Longest wait for the folder lock. A write holds it for milliseconds, but a bulk job in another
+/// process takes it again at once, and a flush can take tens of milliseconds, so a waiter can miss
+/// many turns. Running out means a stopped process: that one write goes on, saving winning over
+/// waiting, and the next one waits again.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// How long a folder whose lock cannot work (it will not open or lock) goes without one before it
+/// is tried again. A lock that is merely held is never given up on: the next write would then
+/// race the holder, with its work lost.
 const LOCK_RETRY: Duration = Duration::from_secs(60);
-/// Longest pause between tries of a held lock.
-const LOCK_POLL: Duration = Duration::from_millis(5);
+/// Wait for a lock that outlasted [`LOCK_WAIT`] until it is next taken: writes still respect it
+/// the moment it frees, without each costing the long wait while a process stays stopped.
+const HELD_WAIT: Duration = Duration::from_secs(1);
+/// Longest pause between tries of a held lock: short, to catch the moment a busy holder lets go.
+const LOCK_POLL: Duration = Duration::from_millis(1);
+
+/// Locks that outlasted a wait, until they are next taken: see [`HELD_WAIT`].
+static LONG_HELD: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Folders whose lock failed, with when: see [`LOCK_RETRY`]. A folder is listed from its first
 /// failure until a lock works there again, so it warns once.
@@ -1348,6 +1358,12 @@ fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
             return None;
         }
     };
+    let long_held = || LONG_HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let wait = if long_held().contains(&lock) {
+        wait.min(HELD_WAIT)
+    } else {
+        wait
+    };
     let start = Instant::now();
     let mut pause = Duration::from_micros(100);
     loop {
@@ -1358,7 +1374,13 @@ fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
                 pause = (pause * 2).min(LOCK_POLL);
             }
             Err(fs4::TryLockError::WouldBlock) => {
-                without_folder_lock(&lock, &format!("it stayed held for {wait:?}"));
+                long_held().insert(lock.clone());
+                tracing::warn!(
+                    "{} stayed held for {wait:?}, so this one label write goes on without it: \
+                     another process may have stopped while writing. If it is running, its \
+                     change to the same frame could be overwritten",
+                    lock.display()
+                );
                 return None;
             }
             Err(fs4::TryLockError::Error(e)) => {
@@ -1367,6 +1389,7 @@ fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
             }
         }
     }
+    long_held().remove(&lock);
     NO_FOLDER_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2853,6 +2876,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A lock another process holds for long is busy, not broken: the next write must wait for it
+    /// again. Treating a timeout as a failure ran every write of the next minute with no lock, and
+    /// lost writes on a slow disk.
+    #[test]
+    fn a_lock_that_stayed_held_is_not_given_up_on() {
+        let (dir, path) = laid_out_label_file("busy-lock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = std::fs::File::create(dir.join(".labels.lock")).unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+        assert!(folder_lock(&path, Duration::from_millis(20)).is_none());
+        let listed = |p: &Path| {
+            NO_FOLDER_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&lock_path(p))
+        };
+        assert!(!listed(&path), "a busy lock was given up on");
+        fs4::FileExt::unlock(&held).unwrap();
+        assert!(folder_lock(&path, Duration::from_secs(5)).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn the_lock_sits_at_the_dataset_root_whatever_the_day() {
         let root = Path::new("data").join("dataset");
@@ -2913,19 +2958,16 @@ mod tests {
         let start = Instant::now();
         assert!(folder_lock(&path, wait).is_none());
         assert!(start.elapsed() >= wait);
-        // Only one wait: the next write goes straight on.
+        // Only one long wait: the next write still tries the lock, for a moment.
         let start = Instant::now();
-        assert!(folder_lock(&path, Duration::from_secs(5)).is_none());
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(folder_lock(&path, 2 * HELD_WAIT).is_none());
+        assert!(start.elapsed() >= HELD_WAIT);
+        assert!(start.elapsed() < 2 * HELD_WAIT);
         add_a_box(&path);
-        // Past the retry time, and the holder gone, the lock works again.
+        // The holder gone, the lock works again, and the next long wait is a full one.
         fs4::FileExt::unlock(&held).unwrap();
-        NO_FOLDER_LOCK
-            .lock()
-            .unwrap()
-            .insert(lock.clone(), Instant::now() - 2 * LOCK_RETRY);
         assert!(folder_lock(&path, wait).is_some());
-        assert!(!NO_FOLDER_LOCK.lock().unwrap().contains_key(&lock));
+        assert!(!LONG_HELD.lock().unwrap().contains(&lock));
         let _ = std::fs::remove_dir_all(dir);
     }
 

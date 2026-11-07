@@ -3823,7 +3823,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | RR-D7 | data | fixed: unchecked empty X-AnyLabeling files are skipped; import writes under the label lock |
 | RR-D8 | data | fixed: bulk accept and the chain's accept reject hidden classes; exports report lost frames and unreadable folders |
 | RR-D9 | data | fixed: `apply_relabel` leaves closed frames alone (votes and the marker only) |
-| RR-D10 | data | fixed: per-folder `.labels.lock`, 25 microseconds a write, falling back to the process lock where locks fail |
+| RR-D10 | data | fixed: per-folder `.labels.lock`, 25 microseconds a write, falling back to the process lock where locks fail. A first version treated a held lock like a broken one and ran the next minute of writes unprotected: CI on Windows lost 90 of 300 writes. Reproduced with a slowed write (2 of 3 passing at 40 ms, 1 of 3 at 80 ms; after the fix 8 of 8 and 4 of 4). Only a lock that cannot work is skipped now; a held lock is waited for up to 30 s, then one write goes on |
 | RR-D11 | data | fixed: `work` goes after register; `output` is recorded at install. Retry after a failed register has no button: the message points to Add a model by path |
 | RR-D12 | data | partly fixed: cross-volume install and `.provenance.json` are atomic; a hard crash still strands proposals until phase 7's sweep |
 | RR-M1 | data | fixed: an unavailable review folder is its own state on Review and the Train strip |

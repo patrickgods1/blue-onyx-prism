@@ -137,6 +137,23 @@ fn write_crumb(file: &mut File, crumb: &Breadcrumb) -> std::io::Result<()> {
     file.sync_all()
 }
 
+#[cfg(test)]
+impl Trail {
+    /// What the file says, read through the run's own handle: on Windows a lock is mandatory, so
+    /// another handle cannot read a live run's file.
+    fn recorded(&self) -> Breadcrumb {
+        let state = self.state.lock_recover();
+        let TrailState::Open(file) = &*state else {
+            panic!("no file open");
+        };
+        let mut file = file.try_clone().unwrap();
+        file.rewind().unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+}
+
 impl Drop for Trail {
     fn drop(&mut self) {
         let state = std::mem::replace(&mut *self.state.lock_recover(), TrailState::Off);
@@ -205,8 +222,7 @@ mod tests {
         assert!(!path_in(&root).exists(), "nothing before a device starts");
         trail.note("ort:cuda:0", "m");
         trail.note("openvino:gpu.0", "m");
-        let crumb: Breadcrumb =
-            serde_json::from_slice(&std::fs::read(path_in(&root)).unwrap()).unwrap();
+        let crumb = trail.recorded();
         assert_eq!(
             (crumb.device.as_str(), crumb.model.as_str()),
             ("openvino:gpu.0", "m"),
@@ -257,9 +273,7 @@ mod tests {
         first.note("ort:cpu", "a");
         let second = Trail::new(&root);
         second.note("openvino:cpu", "b");
-        let crumb: Breadcrumb =
-            serde_json::from_slice(&std::fs::read(path_in(&root)).unwrap()).unwrap();
-        assert_eq!(crumb.model, "a");
+        assert_eq!(first.recorded().model, "a");
         drop(second);
         assert!(path_in(&root).exists(), "the second one removes nothing");
         drop(first);
