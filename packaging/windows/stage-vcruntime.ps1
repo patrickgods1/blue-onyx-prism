@@ -63,7 +63,7 @@ foreach ($name in $Files) {
     $info = (Get-Item -LiteralPath $src).VersionInfo
     $version = [version]("{0}.{1}.{2}.{3}" -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart)
     if ($version -lt $min) {
-        throw "$src is version $version, older than $min: code built with Visual Studio 17.10+ (the pinned runtimes) can crash on it. Update Visual Studio on the build machine."
+        throw "$src is version $version, older than ${min}: code built with Visual Studio 17.10+ (the pinned runtimes) can crash on it. Update Visual Studio on the build machine."
     }
     $sig = Get-AuthenticodeSignature -LiteralPath $src
     if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {

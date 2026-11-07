@@ -141,7 +141,7 @@ foreach ($name in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
 }
 Wait-Ready "after the upgrade"
 $newPid = Get-ServicePid
-if ($newPid -eq $oldPid) { Fail "the service process is still $oldPid: the upgrade did not restart it" }
+if ($newPid -eq $oldPid) { Fail "the service process is still ${oldPid}: the upgrade did not restart it" }
 Start-Sleep -Seconds 5
 if ((Get-ServicePid) -ne $newPid) { Fail "the service process changed again after the upgrade ($newPid -> $(Get-ServicePid)): it was restarted" }
 Write-Host "Service up on the new exe (pid $oldPid -> $newPid)."

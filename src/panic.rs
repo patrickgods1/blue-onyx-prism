@@ -217,6 +217,8 @@ mod tests {
             .iter()
             .find(|e| e.contains("synthetic failure 42"))
             .unwrap_or_else(|| panic!("panic not logged: {events:?}"));
+        // Windows: `src\panic.rs`, and the field's Debug quoting doubles the backslash.
+        let line = line.replace("\\\\", "/").replace('\\', "/");
         assert!(line.starts_with("ERROR panic"), "{line}");
         assert!(line.contains("thread=panic-test-worker"), "{line}");
         assert!(

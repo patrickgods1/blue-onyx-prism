@@ -35,6 +35,8 @@ packaging/windows/obj/
 .downloads.lock
 *.tmp
 benchmark.json
+# Test fixtures are data, not results.
+!tests/data/**/benchmark.json
 *.log
 *_config*.json
 !blue_onyx_prism_config_example*.json
