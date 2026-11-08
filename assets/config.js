@@ -342,6 +342,7 @@ document.addEventListener("click", function (e) {
         else deviceTitle(sel);
         nightThr(r, false);
       });
+      noteUnsaved();
     }).catch(function () {});
   }
 
@@ -384,6 +385,7 @@ document.addEventListener("click", function (e) {
       refreshCard(j, false);
     }
     pendingBox(j);
+    noteUnsaved();
   });
 
   // "use" next to the benchmark's best threshold.
@@ -393,6 +395,42 @@ document.addEventListener("click", function (e) {
     var tr = b.closest("tr"), input = tr.querySelector("input.thr-input");
     input.value = b.dataset.useThreshold; input.classList.toggle("edited", U.edited(input)); U.flash(input);
     if (tr.dataset.model) typed[tr.dataset.model + "\n" + thrParts(tr).key.value] = input.value;
+  });
+
+  // ---- Unsaved edits. The Models card and the Server form say "Unsaved changes" in their save
+  // bars while a field differs from what the server holds; leaving the page or closing the tab
+  // then asks (the browser's own prompt, as on the Review page). Tab switches stay in the page
+  // and links that open a new tab leave nothing; a save in flight does not ask; a saved form
+  // takes its values as the new baseline at once (the next poll then shows the server's).
+  var saving = 0;
+  function fields(form) {
+    if (!form) return [];
+    return Array.prototype.filter.call(form.elements, function (c) {
+      return c.name && !c.disabled && /^(INPUT|SELECT|TEXTAREA)$/.test(c.tagName) && !/^(hidden|submit|button|reset|file|image)$/.test(c.type);
+    });
+  }
+  function unsaved(form) { return fields(form).some(function (c) { return U.edited(c); }); }
+  function commit(form) {
+    fields(form).forEach(function (c) {
+      if (c.type === "checkbox" || c.type === "radio") c.defaultChecked = c.checked;
+      else if (c.tagName === "SELECT") Array.prototype.forEach.call(c.options, function (o) { o.defaultSelected = o.selected; });
+      else c.defaultValue = c.value;
+      c.classList.remove("edited");
+    });
+  }
+  function noteUnsaved() {
+    [card, serverForm].forEach(function (f) {
+      var n = f && f.querySelector(".unsaved-note");
+      if (n) n.hidden = !unsaved(f);
+    });
+  }
+  // After the form's own handlers (the device switch fills the threshold field, "use" too).
+  [card, serverForm, jsonForm].forEach(function (f) {
+    if (f) ["input", "change", "click"].forEach(function (t) { f.addEventListener(t, function () { setTimeout(noteUnsaved, 0); }); });
+  });
+  window.addEventListener("beforeunload", function (ev) {
+    if (saving || ![card, serverForm, jsonForm].some(unsaved)) return;
+    ev.preventDefault(); ev.returnValue = "";
   });
 
   // Save without leaving the page: JSON answers shown next to the button.
@@ -405,13 +443,15 @@ document.addEventListener("click", function (e) {
     opts = opts || {};
     say(form, "muted", opts.url ? "working…" : "saving…");
     if (by) by.disabled = true;
-    var done = function () { if (by) by.disabled = false; };
+    saving++;
+    var done = function () { saving--; if (by) by.disabled = false; };
     return fetch(opts.url || form.getAttribute("action").split("#")[0], {method: "POST", body: new URLSearchParams(data), headers: {"Accept": "application/json"}})
       .then(function (r) { return r.json().then(function (j) { j._status = r.status; return j; }); })
       .then(function (j) {
         done();
         if (!j.success) { say(form, "error-text", j.message); return; }
         own[j.revision] = true;
+        if (!opts.keep) { commit(form); noteUnsaved(); }
         say(form, "ok-text", j.message);
         if (j.restarting) { say(form, "ok-text", j.message + " Restarting…"); L.restarting(); L.afterRestart(); return; }
         if (!opts.keep) resetAfter = {form: form, rev: j.revision};

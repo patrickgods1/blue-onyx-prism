@@ -97,21 +97,32 @@ pub(super) fn model_selection(
     sel
 }
 
-/// Snapshot of the process's devices. Uses the shared runtimes when they are free (workers hold
-/// the lock while compiling a model; waiting would stall the page), else rebuilds the options from
-/// the OpenVINO facts the registry captured at startup.
+/// Hardware and runtime probe of this generation: the shared runtimes' own when they are free,
+/// else (a worker holds the lock while compiling; waiting would stall the page) the same facts
+/// captured when the registry started ([`crate::registry::StartupDevices`]). None only for
+/// registries without runtimes.
+pub(super) fn runtime_facts(state: &AppState) -> Option<(HardwareInfo, RuntimeProbe)> {
+    let reg = &state.registry;
+    reg.runtimes()
+        .and_then(|rt| {
+            let rt = rt.try_lock().ok()?;
+            Some((rt.hardware().clone(), rt.probe().clone()))
+        })
+        .or_else(|| {
+            reg.startup_devices()
+                .map(|s| (s.hardware.clone(), s.probe.clone()))
+        })
+}
+
+/// Snapshot of the process's devices, from [`runtime_facts`], else (registries without
+/// runtimes) rebuilt from the OpenVINO facts the registry captured at startup. The global
+/// selection is `Runtimes::selection(None)`'s: any model, an `.onnx` assumed, no measured order
+/// (per-model orders come from [`DevicesSnapshot::model_selection`]).
 pub(super) fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
     let info = &state.registry.runtime_info;
-    let live = state.registry.runtimes().and_then(|rt| {
-        let rt = rt.try_lock().ok()?;
-        Some((
-            rt.hardware().clone(),
-            rt.selection(None),
-            rt.probe().clone(),
-        ))
-    });
-    let live_probe = live.as_ref().map(|(_, _, p)| p.clone());
-    let (hardware, selection, probe) = live.unwrap_or_else(|| {
+    let facts = runtime_facts(state);
+    let live_probe = facts.as_ref().map(|(_, p)| p.clone());
+    let (hardware, probe) = facts.unwrap_or_else(|| {
         let hardware = crate::backend::detect::hardware().clone();
         let probe = if info.openvino_version.is_empty() && info.available_devices.is_empty() {
             RuntimeProbe {
@@ -121,11 +132,10 @@ pub(super) fn devices_snapshot(state: &AppState) -> DevicesSnapshot {
         } else {
             RuntimeProbe::openvino_only(&info.available_devices)
         };
-        let selection = select(&hardware, &probe, true);
-        (hardware, selection, probe)
+        (hardware, probe)
     });
+    let mut selection = select(&hardware, &probe, true);
     // Options a download would make runnable ("downloadable").
-    let mut selection = selection;
     {
         let cfg = state.config_read();
         let root = crate::resources::download_root(&cfg);
@@ -349,6 +359,116 @@ mod tests {
         assert_eq!(p["recommendedSizes"], serde_json::json!(["m", "l", "x"]));
         let (_, home) = get_text(&state, "/").await;
         assert!(home.contains("high-spec"), "{home}");
+    }
+
+    /// Apple silicon with the CoreML flavor loaded, as a generation records it at startup.
+    fn coreml_startup() -> crate::registry::StartupDevices {
+        use crate::backend::select::{EpStatus, OpenVinoProbe, OrtProbe, RuntimeProbe};
+        use crate::backend::spec::Target;
+        crate::registry::StartupDevices {
+            hardware: crate::backend::HardwareInfo::new("macos", "aarch64", Vec::new()),
+            probe: RuntimeProbe {
+                openvino: OpenVinoProbe::with_device_names(&["CPU".to_string()]),
+                ort: OrtProbe::installed(
+                    "coreml",
+                    vec![
+                        EpStatus::usable(Target::CoreMl),
+                        EpStatus::usable(Target::Cpu),
+                    ],
+                )
+                .with_version("1.24.4"),
+            },
+            onnxruntime_version: Some("1.24.4".into()),
+        }
+    }
+
+    /// While a worker compiles it holds the runtimes lock: `/v1/devices`, Home and Config answer
+    /// from the probe the generation recorded at startup (ONNX Runtime options runnable, `auto`
+    /// on CoreML), never the OpenVINO-only guess that called every `ort:*` option unavailable.
+    #[tokio::test]
+    async fn devices_answer_from_the_startup_probe_while_a_worker_compiles() {
+        use std::sync::{Arc, mpsc};
+        let dir = std::env::temp_dir().join(format!("bo_srv_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let startup = coreml_startup();
+        // The live runtimes (a fake) differ from the startup facts, so each answer shows which
+        // one it came from.
+        let rt = crate::backend::Runtimes::fake(crate::backend::fake::FakeScript::new(1, (64, 64)));
+        let registry = crate::registry::ModelRegistry::idle_for_test(rt, startup.clone());
+        let config = crate::config::Config {
+            download_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let state = Arc::new(crate::server::AppState::new(
+            Arc::new(registry),
+            Arc::new(crate::metrics::Metrics::new("0.0.0")),
+            config,
+            dir.join("cfg.json"),
+        ));
+
+        // A "compiling worker": holds the runtimes lock until told to stop.
+        let runtimes = state.registry.runtimes().unwrap().clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _held = runtimes.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        assert!(state.registry.runtimes().unwrap().try_lock().is_err());
+
+        let snap = super::devices_snapshot(&state);
+        assert_eq!(snap.probe, startup.probe);
+        assert_eq!(snap.hardware, startup.hardware);
+        let coreml = snap
+            .selection
+            .options
+            .iter()
+            .find(|o| o.spec.to_string() == "ort:coreml")
+            .expect("ort:coreml option");
+        assert!(coreml.runnable, "{coreml:?}");
+        assert_eq!(
+            snap.selection.auto_pick().map(|o| o.spec.to_string()),
+            Some("ort:coreml".to_string())
+        );
+        assert!(
+            snap.selection
+                .options
+                .iter()
+                .filter(|o| o.spec.to_string().starts_with("ort:"))
+                .all(|o| o.runnable),
+            "{:?}",
+            snap.selection.options
+        );
+        assert!(snap.auto_pick_label().starts_with("ort:coreml"));
+        assert_eq!(
+            super::super::pages::ort_version(&state.registry).as_deref(),
+            Some("1.24.4")
+        );
+
+        let (s, _, b) = call(
+            &state,
+            Request::get("/v1/devices").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["autoPick"], "ort:coreml", "{v}");
+        assert_eq!(v["hardware"]["os"], "macos");
+        let (_, home) = get_text(&state, "/").await;
+        assert!(home.contains("ort:coreml"), "{home}");
+        let (_, cfg) = get_text(&state, "/config").await;
+        assert!(cfg.contains("Auto \u{2014} currently: ort:coreml"), "{cfg}");
+        assert!(!cfg.contains("ort:coreml \u{2014} not available"), "{cfg}");
+
+        // Free again: the live runtimes answer (the fake has no ONNX Runtime).
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let snap = super::devices_snapshot(&state);
+        assert_eq!(snap.probe, crate::backend::select::RuntimeProbe::default());
+        assert_eq!(super::super::pages::ort_version(&state.registry), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

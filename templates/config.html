@@ -65,6 +65,7 @@
     <button type="submit" name="action" value="save">Save</button>
     <button type="submit" name="action" value="restart" class="danger">Save and restart</button>
     <button type="submit" formaction="/config/restart?back=models" class="danger restart-now" data-restart{% if pending.is_empty() %} hidden{% endif %}>Restart now</button>
+    <span class="unsaved-note" hidden>Unsaved changes</span>
     <span class="form-msg" aria-live="polite"></span>
   </div>
   <p class="muted">{{ bench_summary }} Measure and apply devices and thresholds on the <a href="/benchmark">Benchmark page</a>. More models: <a href="#tab-resources">download</a> them, add files from the models directory under <a href="#local-models">Local models</a>, or <a href="#custom-model">add a model by path</a>.</p>
@@ -292,7 +293,7 @@
     <p class="muted">Recent log lines: <a href="/logs">Logs</a>.</p>
   </fieldset>
 
-  <div class="actions"><button type="submit">Save</button> <span class="form-msg" aria-live="polite"></span></div>
+  <div class="actions"><button type="submit">Save</button> <span class="unsaved-note" hidden>Unsaved changes</span> <span class="form-msg" aria-live="polite"></span></div>
 </form>
 {% if let Some(t) = token_panel %}
 <div class="card" id="admin-token">

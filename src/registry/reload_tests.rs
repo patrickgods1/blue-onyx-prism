@@ -197,6 +197,7 @@ impl Fixture {
         prepare(&loads);
         let script = FakeScript::new(1, (64, 64));
         let rt = Runtimes::fake(script.clone());
+        let startup = StartupDevices::of(&rt);
         let plans = plan_models(&config, &rt, None, DeviceSpec::Device(cpu())).unwrap();
         let shutdown = CancellationToken::new();
         let probe = loads.clone();
@@ -230,6 +231,7 @@ impl Fixture {
             reload: Mutex::new(()),
             previous,
             loaded: LoadedRuntimes::default(),
+            startup,
             faults,
         };
         let reg = Arc::new(ModelRegistry::with_spawner(

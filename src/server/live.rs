@@ -381,17 +381,15 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
     }
 }
 
-/// Hardware and runtime probe of the loaded runtimes (cheap; None while they are busy
-/// compiling).
+/// Hardware and runtime probe of the loaded runtimes (cheap; the startup facts while they are
+/// busy compiling, see [`super::devices::runtime_facts`]; None without runtimes).
 fn quick_probe(
     state: &AppState,
 ) -> Option<(
     crate::backend::HardwareInfo,
     crate::backend::select::RuntimeProbe,
 )> {
-    let rt = state.registry.runtimes()?;
-    let rt = rt.try_lock().ok()?;
-    Some((rt.hardware().clone(), rt.probe().clone()))
+    super::devices::runtime_facts(state)
 }
 
 /// The device `m` runs on after a restart, as a canonical spec (`auto` resolved with the
@@ -430,7 +428,7 @@ fn configured_resolved(
 /// The inputs, all found by reading [`build_payload`]: the store state (config, revision,
 /// generation, change log, file error: [`ConfigRef::serial`]), what this generation runs
 /// ([`AppState::running`], swapped by every apply), the benchmark facts (re-read by file
-/// stamp, [`bench_summary`]), the runtimes' hardware and probe (None while they compile), per
+/// stamp, [`bench_summary`]), the runtimes' hardware and probe (None without runtimes), per
 /// configured model whether an `.onnx` sits beside it (the `auto` selection checks it), the
 /// worker's view (state, detail, provider, device, threshold) and its planned device, and the
 /// names of this generation's workers. The epoch and the config path never change for a state.

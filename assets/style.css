@@ -496,6 +496,12 @@ table.model-card .sub { display: block; font-size: 0.78rem; color: var(--muted);
 table.model-card .sub button.small { padding: 0 0.4rem; font-size: 0.75rem; margin: 0 0 0 0.2rem; }
 table.model-card select { max-width: 16rem; }
 .card > .actions + p.muted { margin-bottom: 0; }
+/* Config: the Save rows of the Models card and the Server form stay at the bottom of the window
+   while the form scrolls (card background, edge to edge of the card); "Unsaved changes" shows
+   while a field differs from what the server holds (config.js). */
+form#models > .actions, form#server > .actions { position: sticky; bottom: 0; z-index: 5; align-items: center; gap: 0.5rem 0.75rem; margin: 0.75rem -1.2rem 0; padding: 0.5rem 1.2rem calc(0.5rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
+form#models > .actions:last-child, form#server > .actions:last-child { margin-bottom: -1rem; border-radius: 0 0 8px 8px; }
+.unsaved-note { font-size: 0.9rem; font-weight: 600; color: var(--warn-fg); }
 
 /* Benchmark: compact tables hide secondary columns behind "More columns". */
 table.compact .extra { display: none; }
@@ -1364,6 +1370,10 @@ td.tr-bal-bars { vertical-align: middle; }
   h1 { font-size: 1.45rem; margin-bottom: 0.6rem; }
   .card { padding: 0.75rem 0.85rem; }
   footer { padding: 1.2rem 1rem; }
+  form#models > .actions, form#server > .actions { gap: 0.4rem 0.5rem; margin-left: -0.85rem; margin-right: -0.85rem; padding: 0.4rem 0.85rem calc(0.4rem + env(safe-area-inset-bottom)); }
+  form#models > .actions:last-child, form#server > .actions:last-child { margin-bottom: -0.75rem; }
+  form#models > .actions button, form#server > .actions button { margin: 0; }
+  form#models > .actions .form-msg, form#server > .actions .form-msg { font-size: 0.82rem; }
 }
 
 /* Finger-sized controls. */

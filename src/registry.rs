@@ -250,6 +250,28 @@ impl LoadedRuntimes {
     }
 }
 
+/// The devices a generation started with: the hardware, what each runtime offered and the
+/// loaded ONNX Runtime version, captured before any worker can take the runtimes lock. None of
+/// it changes while the generation lives (a new runtime starts a new generation), so pages asked
+/// while a worker compiles (it holds the lock) answer from it instead of guessing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupDevices {
+    pub hardware: crate::backend::HardwareInfo,
+    pub probe: crate::backend::select::RuntimeProbe,
+    /// The loaded library's version ("1.24.4"); None when ONNX Runtime is not loaded.
+    pub onnxruntime_version: Option<String>,
+}
+
+impl StartupDevices {
+    pub fn of(rt: &Runtimes) -> Self {
+        Self {
+            hardware: rt.hardware().clone(),
+            probe: rt.probe().clone(),
+            onnxruntime_version: rt.onnxruntime_version(),
+        }
+    }
+}
+
 /// What a registry started from a config needs to spawn (and respawn) workers.
 struct Spawner {
     runtimes: Arc<Mutex<Runtimes>>,
@@ -272,6 +294,8 @@ struct Spawner {
     /// candidate with no memory beside it asks it for room ([`ModelRegistry::yield_model`]).
     previous: Option<Weak<ModelRegistry>>,
     loaded: LoadedRuntimes,
+    /// See [`StartupDevices`].
+    startup: StartupDevices,
     /// What tests make go wrong in this registry's workers.
     #[cfg(test)]
     faults: crate::worker::TestFaults,
@@ -956,6 +980,7 @@ impl ModelRegistry {
             "hardware profile"
         );
         let loaded = LoadedRuntimes::of(&runtimes);
+        let startup = StartupDevices::of(&runtimes);
         let spawner = Spawner {
             runtimes: Arc::new(Mutex::new(runtimes)),
             metrics: metrics.clone(),
@@ -970,6 +995,7 @@ impl ModelRegistry {
             reload: Mutex::new(()),
             previous,
             loaded,
+            startup,
             #[cfg(test)]
             faults: crate::worker::TestFaults::default(),
         };
@@ -1070,6 +1096,37 @@ impl ModelRegistry {
     /// See [`LoadedRuntimes`] (nothing for registries built with [`Self::from_handles`]).
     pub fn loaded_runtimes(&self) -> LoadedRuntimes {
         self.spawner.as_ref().map(|s| s.loaded).unwrap_or_default()
+    }
+
+    /// See [`StartupDevices`] (None for registries built with [`Self::from_handles`]). Never
+    /// waits: use it when [`Self::runtimes`] is busy.
+    pub fn startup_devices(&self) -> Option<&StartupDevices> {
+        self.spawner.as_ref().map(|s| &s.startup)
+    }
+
+    /// A registry with no models over `runtimes`, which reports `startup` as its startup devices
+    /// (tests of pages asked while a worker holds the runtimes lock).
+    #[cfg(test)]
+    pub(crate) fn idle_for_test(runtimes: Runtimes, startup: StartupDevices) -> Self {
+        let config = Config::default();
+        let spawner = Spawner {
+            runtimes: Arc::new(Mutex::new(runtimes)),
+            metrics: Arc::new(Metrics::new("0")),
+            shutdown: CancellationToken::new(),
+            profile: config.profile(),
+            prep: crate::prep::PrepPool::new(1),
+            peers: Peers::new(),
+            prep_threads: 1,
+            best_cpu: DeviceSpec::Auto,
+            can_use_gpu: false,
+            provision: RwLock::new(None),
+            reload: Mutex::new(()),
+            previous: None,
+            loaded: LoadedRuntimes::default(),
+            startup,
+            faults: crate::worker::TestFaults::default(),
+        };
+        Self::with_spawner(&config, spawner, Vec::new(), RuntimeInfo::default())
     }
 
     /// The hardware profile of this generation and its decode + preprocess thread count (None
