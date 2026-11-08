@@ -20,7 +20,7 @@ use tracing::warn;
 /// false when absent (browsers omit unchecked boxes); each is read only when its form's marker
 /// field (`inference_settings`, `image_settings`, `access_settings`, `download_settings`) is
 /// posted too, so a form that does not show the box never clears it. [`LIBRARY_PATH_SETTINGS`]
-/// are not here: the page shows them read-only.
+/// and [`FILE_ONLY_SETTINGS`] are not here: the page shows them read-only.
 pub const FORM_FIELDS: &[&str] = &[
     "port",
     "bind_address",
@@ -59,6 +59,12 @@ pub const FORM_FIELDS: &[&str] = &[
 /// file and the command line (people who already control the service) may set them; a form
 /// gets [`check_library_paths`].
 pub const LIBRARY_PATH_SETTINGS: [&str; 3] = ["download_dir", "onnxruntime_dir", "openvino_dir"];
+
+/// Other settings only the config file sets, for the same reason: `allowed_networks` decides
+/// which networks reach the server at all (`server::network`), so a page that could widen it
+/// could open the server to the internet. A form gets [`check_file_only`]; every other writer
+/// starts from the current config, so a save from a page keeps the file's value.
+pub const FILE_ONLY_SETTINGS: [&str; 1] = ["allowed_networks"];
 
 /// The overlap rule behind the Config page's "drop person on potted plant" checkbox.
 pub const PLANT_RULE: (&str, &str) = ("person", "potted plant");
@@ -141,6 +147,7 @@ pub fn parse_config_form(
     // Directory settings: syntax-checked, relative ones resolved under the data root, system
     // directories refused (SV-03).
     check_library_paths(c, form)?;
+    check_file_only(c, form)?;
     parse_models_dir(c, form)?;
     let data_root = c.data_root();
     let dir = |key: &str, v: &str| validate_dir_setting(key, v, &data_root);
@@ -279,6 +286,32 @@ fn check_library_paths(c: &Config, form: &std::collections::HashMap<String, Stri
                  service"
             );
         }
+    }
+    Ok(())
+}
+
+/// Refuse a form that changes a [`FILE_ONLY_SETTINGS`] entry. The list the page shows (any
+/// separators, any spelling of the same networks) is no change, and no field keeps it too.
+fn check_file_only(c: &Config, form: &std::collections::HashMap<String, String>) -> Result<()> {
+    let [networks] = FILE_ONLY_SETTINGS;
+    let Some(v) = form.get(networks) else {
+        return Ok(());
+    };
+    let posted: Vec<String> = v
+        .split([',', ' ', '\t', '\r', '\n'])
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut posted = crate::config::normalized_networks(&posted);
+    let mut current = crate::config::normalized_networks(&c.allowed_networks);
+    posted.sort();
+    current.sort();
+    if posted != current {
+        anyhow::bail!(
+            "{networks}: not changed. It decides which networks reach this server at all, so a \
+             web form cannot set it: a page that could widen it could open the server to the \
+             internet. Edit \"{networks}\" in the config file on the server; it applies at once"
+        );
     }
     Ok(())
 }
@@ -1377,6 +1410,54 @@ mod tests {
         assert_eq!(c, before);
         // The page no longer offers them, so a redisplayed form cannot show a refused value.
         for key in LIBRARY_PATH_SETTINGS {
+            assert!(!FORM_FIELDS.contains(&key), "{key}");
+        }
+    }
+
+    /// `allowed_networks` decides who reaches the server at all: no form may change it, a form
+    /// that shows the current list (in any order or spelling) passes, and every other form keeps
+    /// it.
+    #[test]
+    fn allowed_networks_cannot_change_through_a_form() {
+        let mut c = with_model();
+        c.allowed_networks = vec!["100.64.0.0/10".into(), "fd7a:115c:a1e0::/48".into()];
+        c.normalize();
+        let before = c.clone();
+        for value in [
+            "0.0.0.0/1",
+            "",
+            "100.64.0.0/10",
+            "100.64.0.0/10, 8.8.8.0/24",
+            "nope",
+        ] {
+            let mut c = before.clone();
+            let e = format!(
+                "{:#}",
+                apply_config_form(&mut c, &form(&[("allowed_networks", value)])).unwrap_err()
+            );
+            assert!(
+                e.starts_with("allowed_networks: not changed"),
+                "{value}: {e}"
+            );
+            assert!(e.contains("config file"), "{e}");
+            assert_eq!(c, before);
+        }
+        for same in [
+            "100.64.0.0/10, fd7a:115c:a1e0::/48",
+            " fd7a:115c:a1e0::/48\n100.64.0.9/10 ",
+        ] {
+            let mut c = before.clone();
+            apply_config_form(&mut c, &form(&[("allowed_networks", same)])).unwrap();
+            assert_eq!(c, before, "{same}");
+        }
+        let mut c = before.clone();
+        apply_config_form(
+            &mut c,
+            &form(&[("port", "4000"), ("allowed_hosts", "nas.local")]),
+        )
+        .unwrap();
+        assert_eq!(c.allowed_networks, before.allowed_networks);
+        for key in FILE_ONLY_SETTINGS {
             assert!(!FORM_FIELDS.contains(&key), "{key}");
         }
     }

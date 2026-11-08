@@ -181,6 +181,7 @@ fn global_label(k: &str) -> String {
         "bind_address" => "Bind address".into(),
         "allow_remote_admin" => "Allow remote administration".into(),
         "allowed_hosts" => "Allowed host names".into(),
+        "allowed_networks" => "Allowed networks".into(),
         "request_timeout_secs" => "Request timeout".into(),
         "worker_queue_size" => "Worker queue size".into(),
         "device" => "Device".into(),
@@ -408,7 +409,8 @@ impl Pending {
     }
 }
 
-/// Globals a restart does not need: the log level and `allow_remote_admin` apply immediately,
+/// Globals a restart does not need: the log level, `allow_remote_admin`, `allowed_hosts` and
+/// `allowed_networks` apply immediately (read per request, the last also per connection),
 /// the per-request settings go into every worker's live settings
 /// ([`crate::worker::LiveSettings`], through `ModelRegistry::apply_live`), `default_model`
 /// switches the registry's default at once, and the benchmark section is read when a
@@ -423,6 +425,7 @@ pub fn live_global(k: &str) -> bool {
             | "previous_default"
             | "allow_remote_admin"
             | "allowed_hosts"
+            | "allowed_networks"
             | "request_timeout_secs"
             | "confidence_threshold"
             | "nms_iou"

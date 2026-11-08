@@ -93,6 +93,8 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "http1"] }
 # `Service::call` on the router per connection; already a dependency of axum.
 tower = { version = "0.5", default-features = false, features = ["util"] }
+# CIDR parsing of `allowed_networks` (`server::network`); already in the tree through reqwest.
+ipnet = "=2.12.2"
 # `hf-login` reads the Hugging Face token without echoing it.
 rpassword = "7.5.4"
 

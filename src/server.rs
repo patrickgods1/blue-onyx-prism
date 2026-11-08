@@ -1,6 +1,11 @@
 //! axum HTTP server: CodeProject.AI compatible detection endpoints plus the web UI
 //! (welcome, stats, test, config and logs pages rendered with askama templates from `templates/`).
 //! Handler flow and page set modeled on blue-onyx `server.rs` and its templates (MIT).
+//!
+//! Only the local network is answered ([`network`]): the accept loop closes a connection from
+//! outside it before reading anything, and the router's outermost middleware
+//! ([`guard::network_rule`]) refuses such a request, or one whose forwarding headers name such a
+//! client, with 403 on every route.
 
 use crate::cli::LogReloadHandle;
 use crate::config::Config;
@@ -33,6 +38,7 @@ mod devices;
 mod diagnostics;
 mod guard;
 mod live;
+mod network;
 mod pages;
 mod pick;
 mod resources;
@@ -160,7 +166,8 @@ impl AppState {
 }
 
 /// The open routes: Blue Iris (often on another machine), monitoring, static files and the
-/// minimal `/v1/config` the pages' restart poller uses. Every path here answers remote peers;
+/// minimal `/v1/config` the pages' restart poller uses. Every path here answers remote peers of
+/// the local network (the network rule, [`network`], comes first on every route);
 /// `router_classification` in the tests checks the list against the expected set.
 fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
@@ -407,6 +414,21 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     ]
 }
 
+/// How a connection reached the server, a request extension the accept loop adds next to
+/// `ConnectInfo`. Every connection is `Plain` HTTP today; nothing decides by it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transport {
+    Plain,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the TLS listener adds it; the tests mark requests with it"
+        )
+    )]
+    Tls,
+}
+
 /// The router. Every handler reads the generation that is current when its request arrives
 /// (see [`Shared`]); a plain `Arc<AppState>` works for tests and makes a fixed one.
 pub(crate) fn router(state: impl Into<Shared>) -> Router {
@@ -438,11 +460,16 @@ pub(crate) fn router(state: impl Into<Shared>) -> Router {
     #[cfg(test)]
     let open = open
         .route("/__test/panic", get(test_panic))
-        .route("/__test/blocking-panic", get(test_blocking_panic));
+        .route("/__test/blocking-panic", get(test_blocking_panic))
+        .route("/__test/transport", get(test_transport));
     open.merge(admin)
         .merge(login)
         .fallback(fallback)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            guard::network_rule,
+        ))
         .layer(axum::middleware::from_fn(catch_panic))
         .layer(axum::middleware::map_response(guard::security_headers))
         .with_state(shared)
@@ -474,6 +501,13 @@ async fn fallback(headers: HeaderMap) -> Response {
 #[allow(clippy::unused_async, reason = "axum handlers are async")]
 async fn test_panic() -> &'static str {
     std::panic::panic_any("test handler panic")
+}
+
+/// Test-only route: the request's [`Transport`] marker, as `Debug` (`None` without one).
+#[cfg(test)]
+#[allow(clippy::unused_async, reason = "axum handlers are async")]
+async fn test_transport(t: Option<axum::Extension<Transport>>) -> String {
+    format!("{:?}", t.map(|t| t.0))
 }
 
 /// Test-only route: a handler whose [`blocking`] closure panics.
@@ -765,15 +799,15 @@ pub async fn serve_on(
     shared: Shared,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    let app = router(shared);
+    let app = router(shared.clone());
     match listeners.v6 {
         Some(l6) => {
             tokio::join!(
-                accept_loop(listeners.v4, app.clone(), shutdown.clone()),
-                accept_loop(l6, app, shutdown)
+                accept_loop(listeners.v4, app.clone(), shared.clone(), shutdown.clone()),
+                accept_loop(l6, app, shared, shutdown)
             );
         }
-        None => accept_loop(listeners.v4, app, shutdown).await,
+        None => accept_loop(listeners.v4, app, shared, shutdown).await,
     }
     info!("HTTP server stopped");
     Ok(())
@@ -794,8 +828,15 @@ fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::r
 }
 
 /// Accept connections on `listener` until `shutdown`, then let the open ones finish their
-/// requests (graceful shutdown, at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]).
-async fn accept_loop(listener: tokio::net::TcpListener, app: Router, shutdown: CancellationToken) {
+/// requests (graceful shutdown, at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]). A peer outside the
+/// network rule (read from `shared`'s current config at each accept, [`guard::admit`]) is closed
+/// at once: nothing is read from it or written to it.
+async fn accept_loop(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shared: Shared,
+    shutdown: CancellationToken,
+) {
     let builder = connection_builder();
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
     loop {
@@ -811,12 +852,17 @@ async fn accept_loop(listener: tokio::net::TcpListener, app: Router, shutdown: C
                 }
             },
         };
+        if !guard::admit(peer, &shared) {
+            drop(stream);
+            continue;
+        }
         let router = app.clone();
-        // The peer address feeds the admin-route check ([`admin_only`]).
+        // The peer address feeds the network rule and the admin-route check ([`admin_only`]).
         let service =
             hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                req.extensions_mut()
-                    .insert(axum::extract::ConnectInfo(peer));
+                let ext = req.extensions_mut();
+                ext.insert(axum::extract::ConnectInfo(peer));
+                ext.insert(Transport::Plain);
                 // `Router` is always ready (its `poll_ready` returns `Ready` at once).
                 tower::Service::call(&mut router.clone(), req)
             });
@@ -1158,9 +1204,9 @@ mod tests {
         let mut h = HeaderMap::new();
         assert!(direct_local(Some(local), &h));
         for (name, value) in [
-            ("x-forwarded-for", "203.0.113.9"),
-            ("forwarded", "for=203.0.113.9"),
-            ("x-real-ip", "203.0.113.9"),
+            ("x-forwarded-for", "192.168.1.9"),
+            ("forwarded", "for=192.168.1.9"),
+            ("x-real-ip", "192.168.1.9"),
         ] {
             h = HeaderMap::new();
             h.insert(name, value.parse().unwrap());
@@ -1178,7 +1224,7 @@ mod tests {
         let state = test_state();
         let mut req = from("127.0.0.1:40000", "GET", "/config", true);
         req.headers_mut()
-            .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+            .insert("x-forwarded-for", "192.168.1.9".parse().unwrap());
         let (s, _, _) = call(&state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         assert!(LOCAL_PROXY_WARNED.load(std::sync::atomic::Ordering::Relaxed));

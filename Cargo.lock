@@ -328,6 +328,7 @@ dependencies = [
  "hyper-util",
  "image",
  "indicatif",
+ "ipnet",
  "jpeg-encoder",
  "libc",
  "libloading 0.9.0",

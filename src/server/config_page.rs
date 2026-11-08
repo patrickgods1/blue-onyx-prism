@@ -36,6 +36,7 @@ pub(super) struct ConfigView {
     bind_address: String,
     allow_remote_admin: bool,
     allowed_hosts: String,
+    allowed_networks: String,
     request_timeout_secs: String,
     worker_queue_size: String,
     device: String,
@@ -84,6 +85,7 @@ impl ConfigView {
             bind_address: c.bind_address.to_string(),
             allow_remote_admin: c.allow_remote_admin,
             allowed_hosts: c.allowed_hosts.join(", "),
+            allowed_networks: c.allowed_networks.join(", "),
             request_timeout_secs: c.request_timeout_secs.to_string(),
             worker_queue_size: c.worker_queue_size.to_string(),
             device: c.device.clone(),
@@ -2296,6 +2298,39 @@ mod tests {
             assert_eq!(*state.config_read(), before);
             assert!(!state.config_path.exists(), "{key}");
         }
+    }
+
+    /// `allowed_networks` is shown read-only, a save from the page keeps it (in memory and in
+    /// the file), and a post that changes it is refused with nothing saved.
+    #[tokio::test]
+    async fn config_page_keeps_allowed_networks() {
+        let state = test_state_with(|c| c.allowed_networks = vec!["100.64.0.0/10".into()]);
+        let (_, html) = get_text(&state, "/config").await;
+        assert!(
+            html.contains("data-view=\"allowed_networks\" readonly value=\"100.64.0.0/10\""),
+            "{html}"
+        );
+        assert!(!html.contains("name=\"allowed_networks\""));
+        let (s, _, b) = call(&state, post_form("/config", "port=4000", true)).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(!String::from_utf8(b).unwrap().contains("Not saved"));
+        assert_eq!(state.config_read().port, 4000);
+        assert_eq!(state.config_read().allowed_networks, vec!["100.64.0.0/10"]);
+        let file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state.config_path).unwrap()).unwrap();
+        assert_eq!(
+            file["allowed_networks"],
+            serde_json::json!(["100.64.0.0/10"])
+        );
+        let body = format!("port=4001&allowed_networks={}", urlencode("0.0.0.0/1"));
+        let (_, _, b) = call(&state, post_form("/config", &body, true)).await;
+        let page = String::from_utf8(b).unwrap();
+        assert!(
+            page.contains("class=\"error\">Not saved: allowed_networks"),
+            "{page}"
+        );
+        assert_eq!(state.config_read().port, 4000);
+        assert_eq!(state.config_read().allowed_networks, vec!["100.64.0.0/10"]);
     }
 
     #[tokio::test]

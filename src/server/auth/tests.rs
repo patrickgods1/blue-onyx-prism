@@ -231,6 +231,47 @@ fn the_limit_treats_a_mapped_address_as_the_same_peer() {
     assert!(l.blocked("10.0.0.5".parse().unwrap(), t0).is_some());
 }
 
+/// One IPv6 host can use any address of its /64, so the limit counts the /64; IPv4 counts the
+/// address, also when it arrives mapped into IPv6.
+#[test]
+fn the_limit_keys_ipv6_peers_by_their_64() {
+    let key = |s: &str| peer_key(s.parse().unwrap());
+    assert_eq!(
+        key("2001:db8:1:2:aaaa::1"),
+        key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+    );
+    assert_eq!(
+        key("2001:db8:1:2:aaaa::1"),
+        "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+    );
+    assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+    assert_eq!(key("fe80::1"), key("fe80::2"));
+    assert_eq!(key("10.0.0.5"), "10.0.0.5".parse::<IpAddr>().unwrap());
+    assert_eq!(key("::ffff:10.0.0.5"), key("10.0.0.5"));
+    assert_ne!(key("10.0.0.5"), key("10.0.0.6"));
+
+    let mut l = FailureLimit::default();
+    let t0 = Instant::now();
+    for i in 0..5u16 {
+        let ip = IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0, 0, 7, i, 0, 0, 1));
+        l.fail(ip, t0);
+    }
+    // Five different addresses of one /64 are one peer: blocked under a sixth.
+    assert!(
+        l.blocked("fd00:0:0:7:beef::9".parse().unwrap(), t0)
+            .is_some()
+    );
+    assert_eq!(l.peers(), 1);
+    // The next /64 is another peer.
+    assert_eq!(l.blocked("fd00:0:0:8::1".parse().unwrap(), t0), None);
+    // IPv4 neighbours are not lumped together.
+    for _ in 0..5 {
+        l.fail("10.0.0.5".parse().unwrap(), t0);
+    }
+    assert!(l.blocked("10.0.0.5".parse().unwrap(), t0).is_some());
+    assert_eq!(l.blocked("10.0.0.6".parse().unwrap(), t0), None);
+}
+
 #[test]
 fn the_limit_keeps_at_most_1024_peers_and_drops_the_oldest() {
     let mut l = FailureLimit::default();
@@ -665,11 +706,11 @@ async fn the_rotate_button_is_for_this_machine_and_never_shows_the_token() {
     // A local proxy's client is not this machine: it needs the token, then is refused.
     let mut r = req(LOCAL, "POST", ROTATE, false);
     r.headers_mut()
-        .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        .insert("x-forwarded-for", "192.168.1.9".parse().unwrap());
     assert_eq!(call(&state, r).await.0, StatusCode::UNAUTHORIZED);
     let mut r = bearer(req(LOCAL, "POST", ROTATE, false), &token_a());
     r.headers_mut()
-        .insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        .insert("x-forwarded-for", "192.168.1.9".parse().unwrap());
     assert_eq!(call(&state, r).await.0, StatusCode::FORBIDDEN);
     // CSRF: the guard runs before the handler.
     let r = origin(req(LOCAL, "POST", ROTATE, true), "http://evil.test");
@@ -820,24 +861,34 @@ async fn turning_remote_admin_on_creates_the_token() {
     );
 }
 
-/// A request with no peer address is not trusted as this machine's.
+/// A request with no peer address is not trusted as this machine's: the network rule refuses
+/// it before the token is looked at, also with the right token.
 #[tokio::test]
-async fn a_request_without_a_peer_address_needs_the_token() {
+async fn a_request_without_a_peer_address_is_refused() {
     let state = remote_state();
-    let r = Request::get("/config")
-        .header(header::HOST, TEST_HOST)
-        .body(Body::empty())
-        .unwrap();
-    let resp = router(state.clone()).oneshot(r).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    for with_token in [false, true] {
+        let mut r = Request::get("/config")
+            .header(header::HOST, TEST_HOST)
+            .body(Body::empty())
+            .unwrap();
+        if with_token {
+            r = bearer(r, &token_a());
+        }
+        let resp = router(state.clone()).oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(text(&b).contains("allowed_networks"), "{}", text(&b));
+    }
 }
 
 /// Every header a reverse proxy adds, as a client sends it.
 const PROXY_HEADERS: [(&str, &str); 4] = [
-    ("x-forwarded-for", "203.0.113.9"),
-    ("X-Forwarded-For", "203.0.113.9, 198.51.100.7"),
-    ("forwarded", "for=203.0.113.9"),
-    ("x-real-ip", "203.0.113.9"),
+    ("x-forwarded-for", "192.168.1.9"),
+    ("X-Forwarded-For", "192.168.1.9, 10.1.2.3"),
+    ("forwarded", "for=192.168.1.9"),
+    ("x-real-ip", "192.168.1.9"),
 ];
 
 fn forwarded(mut r: Request<Body>, name: &str, value: &str) -> Request<Body> {
@@ -889,7 +940,7 @@ async fn a_forwarded_loopback_request_is_refused_with_remote_admin_off() {
     let r = forwarded(
         req(LOCAL, "GET", "/v1/vision/custom/list", false),
         "x-forwarded-for",
-        "203.0.113.9",
+        "192.168.1.9",
     );
     assert_eq!(call(&state, r).await.0, StatusCode::OK);
     // Without the header this machine is unchanged.
