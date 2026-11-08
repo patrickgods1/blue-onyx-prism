@@ -217,7 +217,7 @@
       d.addEventListener("toggle", function () {
         if (!d.open || built) return; built = true;
         var t = o.table(), tb = el("table", "bench chart-data"), th = el("thead"), tr = el("tr");
-        t.head.forEach(function (h) { tr.appendChild(el("th", null, h)); }); th.appendChild(tr); tb.appendChild(th);
+        t.head.forEach(function (h, i) { tr.appendChild(el("th", i ? "num" : null, h)); }); th.appendChild(tr); tb.appendChild(th);
         var body = el("tbody"); t.rows.forEach(function (r) { var row = el("tr"); r.forEach(function (c, i) { row.appendChild(el("td", i ? "num" : null, c)); }); body.appendChild(row); }); tb.appendChild(body);
         var w = el("div", "scroll"); w.appendChild(tb); d.appendChild(w);
       });

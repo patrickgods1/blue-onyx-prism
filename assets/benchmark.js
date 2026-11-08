@@ -152,7 +152,18 @@
   function cell(tr, text, v, label) { var c = el("td", v !== undefined ? "num" : null, text); if (v !== undefined) c.dataset.v = v === null ? "" : v; if (label) c.dataset.label = label; tr.appendChild(c); return c; }
   // A horizontally scrolling wrapper; `key` names it (and its table) so its scroll position
   // and sort order survive re-renders.
-  function wrap(t, key) { var d = el("div", "scroll"); if (key) { d.dataset.keep = "w:" + key; t.dataset.keep = "t:" + key; } d.appendChild(t); return d; }
+  function wrap(t, key) { numHeads(t); var d = el("div", "scroll"); if (key) { d.dataset.keep = "w:" + key; t.dataset.keep = "t:" + key; } d.appendChild(t); return d; }
+  // A heading over a column whose cells are all numbers (td.num in every full-width row) sits
+  // over them, right-aligned. Rows with a colspan (errors, notes) do not count.
+  function numHeads(t) {
+    var head = t.tHead && t.tHead.rows.length ? t.tHead.rows[t.tHead.rows.length - 1] : null, body = t.tBodies[0];
+    if (!head || !body) return;
+    var n = head.cells.length, rows = Array.prototype.filter.call(body.rows, function (r) { return r.cells.length === n; });
+    if (!rows.length) return;
+    Array.prototype.forEach.call(head.cells, function (th, i) {
+      if (rows.every(function (r) { return r.cells[i].classList.contains("num"); })) th.classList.add("num");
+    });
+  }
   // A <details> whose open state survives re-renders.
   function det(key, summary, open) { var d = el("details", "bd"); d.dataset.keep = "d:" + key; if (open) d.open = true; d.appendChild(el("summary", null, summary)); return d; }
   function near(x, y) { return x !== null && x !== undefined && y !== null && y !== undefined && Math.abs(x - y) < 1e-6; }

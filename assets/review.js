@@ -1396,11 +1396,19 @@
     }
   }
 
+  // Wide screens: the frame's CSS height is capped at the window less the line over it
+  // (style.css reads `--rv-head`), so the line and the whole frame fit together.
+  var metaRow = document.querySelector('.review-meta-row');
+  function fitHead() {
+    if (metaRow) canvas.style.setProperty('--rv-head', metaRow.offsetHeight + 'px');
+  }
+
   // A new frame: the page scrolls as little as needed to show the whole frame and the side panel
   // (with its Save row; from the grid's top when they are taller than the window), the box list
   // starts at its top.
   function revealFrame() {
     boxList.scrollTop = 0;
+    fitHead();
     revealSelected();
     if (!grid) return;
     var top = grid.getBoundingClientRect().top;
@@ -2218,7 +2226,7 @@
   var resizeTimer = null;
   window.addEventListener('resize', function () {
     if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () { resizeTimer = null; draw(); }, 100);
+    resizeTimer = setTimeout(function () { resizeTimer = null; fitHead(); draw(); }, 100);
   });
 
   // ---- loading and saving -------------------------------------------------------------------
@@ -2442,6 +2450,8 @@
       dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
       canvas.width = j.width || 640;
       canvas.height = j.height || 360;
+      // The CSS size keeps this ratio (style.css caps a tall frame at the window's height).
+      canvas.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
       view.z = 1; view.ox = 0; view.oy = 0;
       hoverIdx = -1;
       selected = nextUndecided(-1);

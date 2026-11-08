@@ -411,7 +411,7 @@
     }
     if (c.summary) d.appendChild(el("p", "notice", c.summary));
     var t = el("table", "bench stack ab-table"), th = el("thead"), tr = el("tr");
-    ["What", "Device", "A (before)", "B (after)", "Change", "Why"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+    ["What", "Device", "A (before)", "B (after)", "Change", "Why"].forEach(function (h, i) { tr.appendChild(el("th", i >= 2 && i <= 4 ? "num" : null, h)); });
     th.appendChild(tr); t.appendChild(th);
     var tb = el("tbody");
     (c.metrics || []).forEach(function (mc) {

@@ -3,14 +3,14 @@
 {% block content %}
 <h1>Stats</h1>
 <p class="muted">Uptime <span id="uptime">{{ uptime }}</span> &middot; <span id="live">updates every 5 s</span> &middot; <a href="/stats.json">JSON</a></p>
+<p class="muted">Times are the average, with the fastest and slowest under it.</p>
 <noscript><p class="muted">Reload the page to update (live updates need JavaScript).</p></noscript>
 <div class="scroll">
 <table class="stats sticky-first rcards rgrid">
 <thead>
-<tr class="group-head"><th rowspan="2">Model</th><th rowspan="2">State</th><th rowspan="2">Runtime</th><th rowspan="2">Device</th><th rowspan="2">Fell back</th>
-<th rowspan="2">Requests</th><th rowspan="2">Dropped</th><th rowspan="2">Queue</th>
-<th colspan="3">Inference ms</th><th colspan="3">Process ms</th><th colspan="3">Round trip ms</th></tr>
-<tr><th>avg</th><th>min</th><th>max</th><th>avg</th><th>min</th><th>max</th><th>avg</th><th>min</th><th>max</th></tr>
+<tr><th>Model</th><th>State</th><th>Runtime</th><th>Device</th><th>Fell back</th>
+<th class="num">Requests</th><th class="num">Dropped</th><th class="num">Queue</th>
+<th class="num">Inference ms</th><th class="num">Process ms</th><th class="num">Round trip ms</th></tr>
 </thead>
 <tbody id="stats-body">
 {% for m in models %}
@@ -23,7 +23,7 @@
 <td class="num" data-label="Requests">{{ m.requests }}</td>
 <td class="num" data-label="Dropped">{{ m.dropped }}</td>
 <td class="num" data-label="Queue">{{ m.queue }}</td>
-{% for s in m.timings %}{% let n = ["Inference", "Process", "Round trip"][loop.index0] %}<td class="num" data-label="{{ n }} avg">{{ s.avg }}</td><td class="num" data-label="{{ n }} min">{{ s.min }}</td><td class="num" data-label="{{ n }} max">{{ s.max }}</td>{% endfor %}
+{% for s in m.timings %}{% let n = ["Inference", "Process", "Round trip"][loop.index0] %}<td class="num" data-label="{{ n }} ms"{% if s.seen %} title="min {{ s.min }} &middot; max {{ s.max }}"{% endif %}>{{ s.avg }}{% if s.seen %}<span class="sub">{{ s.min }}&ndash;{{ s.max }}</span>{% endif %}</td>{% endfor %}
 </tr>
 {% endfor %}
 </tbody>

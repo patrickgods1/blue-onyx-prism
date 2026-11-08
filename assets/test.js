@@ -39,6 +39,9 @@
   function draw(img, preds) {
     var c = document.getElementById("canvas"), ctx = c.getContext("2d");
     c.width = img.naturalWidth; c.height = img.naturalHeight;
+    // style.css sizes the canvas from these, keeping the image's ratio.
+    c.style.setProperty("--ar", String(c.width / c.height));
+    c.style.setProperty("--nw", c.width + "px");
     ctx.drawImage(img, 0, 0);
     var lw = Math.max(2, Math.round(Math.min(c.width, c.height) / 300));
     ctx.lineWidth = lw;

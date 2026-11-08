@@ -156,11 +156,18 @@ document.addEventListener("click", function (e) {
       var b = el("button", "small secondary", "use"); b.type = "button"; b.dataset.useThreshold = bench; b.title = "Put " + bench + " in the threshold field (then save)"; r.hint.append(b);
     }
   }
+  // The Device select is narrower than its longest options: its tooltip holds the chosen one in full.
+  function deviceTitle(sel) {
+    var o = selectedOption(sel);
+    if (sel) sel.title = o ? o.textContent : "";
+  }
+  card.querySelectorAll("td.model-device select").forEach(deviceTitle);
   // Point the field at the selected option's device. `prefill`: a user's switch (fill in the
   // benchmark's best when the device has no profile); `keepValue`: leave the value (carried over
   // from an edit), only rebase the key, baseline and hint.
   function applyDevice(tr, prefill, keepValue) {
     var r = thrParts(tr), o = selectedOption(r.sel);
+    deviceTitle(r.sel);
     if (!r.input || !r.key || !o) return;
     var key = o.dataset.key || "", thr = o.dataset.thr || "", bench = o.dataset.bench || "", fb = fallbackOf(r);
     var mem = typed[tr.dataset.model + "\n" + key], value = r.input.value;
@@ -332,6 +339,7 @@ document.addEventListener("click", function (e) {
         // A carried-over device choice: point the threshold field at that device again.
         var sel = r.querySelector("td.model-device select");
         if (sel && U.edited(sel)) applyDevice(r, false, true);
+        else deviceTitle(sel);
         nightThr(r, false);
       });
     }).catch(function () {});
@@ -648,7 +656,7 @@ document.addEventListener("click", function (e) {
     if (!items.length) { wrap.appendChild(el("p", "muted", "Nothing here.")); return wrap; }
     var scroll = el("div", "scroll"), t = el("table", "storage rcards");
     var head = el("thead"), hr = el("tr");
-    ["Item", "Size", "Action"].forEach(function (c) { hr.appendChild(el("th", null, c)); });
+    ["Item", "Size", "Action"].forEach(function (c) { hr.appendChild(el("th", c === "Size" ? "num" : null, c)); });
     head.appendChild(hr); t.appendChild(head);
     var tb = el("tbody");
     items.forEach(function (i) {
