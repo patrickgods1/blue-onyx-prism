@@ -18,6 +18,10 @@
 #   5.0 to 9.0 kernels; the service offers 6.1+), any driver with CUDA 12.
 # - locks/train-cu130-{windows,linux}-x86_64.txt: PyTorch CUDA 13.0 builds (7.5 to 12.0), for
 #   Blackwell (10.0, 12.0), which the 12.6 builds have no kernels for; needs a CUDA 13 driver.
+#
+# Before resolving, the pins are checked against each other's declared requirements
+# (`scripts/ci/check_deps.py conflicts`, reads PyPI): rfdetr's `train` extra is listed here by hand
+# (without roboflow), so uv never sees its ranges (torchmetrics, hotcoco, vernier, ...).
 set -eu
 UV="$1"
 EXCLUDE_NEWER="${2:-2026-10-24T00:00:00Z}"
@@ -27,6 +31,7 @@ OUT="$DIR/locks"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$OUT"
+python3 -I "$DIR/../ci/check_deps.py" conflicts
 
 compile() { # <python-platform> <output> [extra args]
   # Resolved into a new file, then copied: uv prefers the versions already in an existing output

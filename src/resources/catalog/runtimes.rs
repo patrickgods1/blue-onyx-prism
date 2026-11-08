@@ -11,7 +11,7 @@ use super::*;
 macro_rules! ov_url {
     ($dir:literal, $file:literal) => {
         concat!(
-            "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.4/",
+            "https://storage.openvinotoolkit.org/repositories/openvino/packages/2026.4.1/",
             $dir,
             "/",
             $file
@@ -63,10 +63,10 @@ pub(crate) static OPENVINO: &[Resource] = &[
         Platform::WINDOWS_X64,
         &[ov_part!(
             "windows_vc_mt",
-            "openvino_toolkit_windows_vc_mt_2026.4.0.22959.99c81491cc3_x86_64.zip",
+            "openvino_toolkit_windows_vc_mt_2026.4.1.22982.07f9c262b05_x86_64.zip",
             ArchiveKind::Zip,
-            "82946205ac9f9f8113acf5f7fb5c705ef06a666aa15a8acf52cf2b4e1be90063",
-            235127912
+            "5dc0c993c2033cf2937881cc7b1a72bfedb2a296582bf5916ef12d68441fc2ca",
+            237069634
         )],
         OV_GPU_CPU,
     ),
@@ -77,10 +77,10 @@ pub(crate) static OPENVINO: &[Resource] = &[
         Platform::LINUX_X64,
         &[ov_part!(
             "linux",
-            "openvino_toolkit_rhel8_2026.4.0.22959.99c81491cc3_x86_64.tgz",
+            "openvino_toolkit_rhel8_2026.4.1.22982.07f9c262b05_x86_64.tgz",
             ArchiveKind::TarGz,
-            "70e40134514d54b291b557ad26f85cc0ad554587ba49686285fee1e0cee8ab79",
-            80635452
+            "db71613921217f52b2316acee6dc543d57ef54dd7c7c9241c575628b361c202e",
+            80653736
         )],
         OV_GPU_CPU,
     ),
@@ -88,10 +88,10 @@ pub(crate) static OPENVINO: &[Resource] = &[
         Platform::LINUX_ARM64,
         &[ov_part!(
             "linux",
-            "openvino_toolkit_ubuntu22_2026.4.0.22959.99c81491cc3_arm64.tgz",
+            "openvino_toolkit_ubuntu22_2026.4.1.22982.07f9c262b05_arm64.tgz",
             ArchiveKind::TarGz,
-            "ed3f103ae8dd7a509c23645f0d34983378d3e609711a82d65301ac77d4a34800",
-            43359520
+            "09712347aa8c14f1c7f9cbf05150ccc0057c67b6c80762b330b4be23cadc8cf1",
+            43358224
         )],
         OV_CPU,
     ),
@@ -99,10 +99,10 @@ pub(crate) static OPENVINO: &[Resource] = &[
         Platform::MACOS_ARM64,
         &[ov_part!(
             "macos",
-            "openvino_toolkit_macos_12_6_2026.4.0.22959.99c81491cc3_arm64.tgz",
+            "openvino_toolkit_macos_12_6_2026.4.1.22982.07f9c262b05_arm64.tgz",
             ArchiveKind::TarGz,
-            "1e67db1fa25e8d736f35f5b3d663d2fd669d51c0d2892f682d0facc9c22b019c",
-            44413951
+            "e5929a0c11916603953353133d27ef8a18cb4897474bcddbe084a39ee5b7a537",
+            44412254
         )],
         OV_CPU,
     ),

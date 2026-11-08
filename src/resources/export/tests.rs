@@ -211,7 +211,7 @@ fn full_export_runs_every_stage_in_order() {
     assert!(
         std::fs::read_to_string(root.join("tools/model-export-requirements.lock.txt"))
             .unwrap()
-            .contains("ultralytics==8.4.163")
+            .contains(&format!("ultralytics=={}", catalog::ULTRALYTICS_VERSION))
     );
 
     // Second export: toolchain reused; only the self-check and the export run (weights are kept
@@ -1022,8 +1022,8 @@ fn locks_match_the_requirements_and_platforms() {
         assert!(lock.contains("--hash=sha256:"));
         assert!(!lock.contains("openvino"), "no OpenVINO Python package");
     }
-    assert!(LOCK_TORCH_CPU_INDEX.contains("torch==2.14.0+cpu"));
-    assert!(LOCK_MACOS_ARM64.contains("torch==2.14.0 "));
+    assert!(LOCK_TORCH_CPU_INDEX.contains("torch==2.14.1+cpu"));
+    assert!(LOCK_MACOS_ARM64.contains("torch==2.14.1 "));
     assert!(reqs.contains(&format!("ultralytics=={}", catalog::ULTRALYTICS_VERSION)));
     assert!(reqs.contains(&format!("transformers=={}", catalog::TRANSFORMERS_VERSION)));
     // Supported platforms agree across the lock, uv and the estimates.
@@ -1254,6 +1254,24 @@ fn outdated_manifest_means_needs_export() {
     assert!(is_outdated(rf, &models));
     assert!(!is_exported(rf, &models));
     assert_eq!(pending_export(&onnx).unwrap().id, "model:rfdetr-large");
+    // An export by the earlier transformers of the same recipe and weights: still valid.
+    let (now, before) = catalog::EARLIER_EXPORTERS
+        .iter()
+        .find(|(now, _)| rf.version.starts_with(now))
+        .unwrap();
+    let earlier = Manifest {
+        version: rf.version.replacen(now, before, 1),
+        ..old
+    };
+    assert_ne!(earlier.version, rf.version);
+    std::fs::write(
+        manager::manifest_path(rf, &models),
+        serde_json::to_vec(&earlier).unwrap(),
+    )
+    .unwrap();
+    assert!(!is_outdated(rf, &models));
+    assert!(is_exported(rf, &models));
+    assert!(pending_export(&onnx).is_none());
     // Missing file: pending; not an export output (IR, unknown name): none.
     assert!(pending_export(&models.join("yolov8n.onnx")).is_some());
     assert!(pending_export(&models.join("yolov8n.xml")).is_none());

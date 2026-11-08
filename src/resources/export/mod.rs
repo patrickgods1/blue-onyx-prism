@@ -363,9 +363,11 @@ pub fn is_exported(res: &Resource, models: &Path) -> bool {
 }
 
 /// A manifest of `res` in `models` records another version: the file there is from an older
-/// export or an earlier download under the same name (the onnx-community RF-DETR large v1).
+/// export or an earlier download under the same name (the onnx-community RF-DETR large v1). An
+/// export by an earlier exporter of the same recipe is not outdated
+/// ([`catalog::EARLIER_EXPORTERS`]).
 pub fn is_outdated(res: &Resource, models: &Path) -> bool {
-    manifest(res, models).is_some_and(|m| m.version != res.version)
+    manifest(res, models).is_some_and(|m| !catalog::export_version_matches(res.version, &m.version))
 }
 
 /// The exportable model whose output `path` (absolute, as the service reads it) is and that still

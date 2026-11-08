@@ -19,7 +19,7 @@ cargo run -- download-models --name IPcam-general
 cargo run -- add-model --path <file|dir> [--name n] [--family rfdetr] [--classes c.yaml]   # custom model (config page: Add a model by path)
 cargo run -- fetch [--for-config] [--resource <id>] [--all-for-platform] [--allow-large]   # pre-download what the config needs
 cargo run -- list-resources [--check-urls]   # installed / needed / available; --check-urls checks every pinned URL (weekly CI)
-python3 -I scripts/ci/check_deps.py consistency|upstream|audit   # pins agree (CI) / newer upstream / OSV advisories of the Python locks (weekly CI issues; docs/RELEASE_CHECKLIST.md)
+python3 -I scripts/ci/check_deps.py consistency|upstream|audit|conflicts   # pins agree (CI) / due upstream bumps (2+ weeks old, Python 3.11, within other pins' Requires-Dist) / OSV advisories of the Python locks (weekly CI issues) / pins vs each other's Requires-Dist (gen_train_locks.sh); docs/RELEASE_CHECKLIST.md
 cargo run -- fetch --resource model:yolo26s --allow-large   # on-demand model export (pinned uv + Python env in <data root>/tools)
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
@@ -46,7 +46,7 @@ only, never by `auto_download`): `tool:uv` + `scripts/model-export/locks/*.txt` 
 Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (`.pt`, AGPL-3.0), RF-DETR L (transformers,
 safetensors, 704 px), DEIMv2 (official code `tool:deimv2-src` pinned to the last Apache-2.0 commit + safetensors; marked non-commercial / personal use, the upstream license now covers the weights);
 all offline, static-shape ONNX checked against PyTorch with ONNX Runtime, stamped with `COREML_CACHE_KEY` (ORT's
-CoreML cache is otherwise keyed by path). A manifest of another version = "needs export". `catalog::F32_MODELS`
+CoreML cache is otherwise keyed by path). A manifest of another version = "needs export" (not loaded), except one by an earlier exporter listed in `catalog::EARLIER_EXPORTERS`. `catalog::F32_MODELS`
 (RF-DETR L, DEIMv2 L/X) overflow f16: OpenVINO compiles them with f32 on CPU and GPU.
 
 Python export env (models -> ONNX + OpenVINO IR, by hand): `.venv` (Python 3.11; `scripts/requirements-export.txt` = `-r requirements-model-export.txt`, the exact `==` pins the service uses, plus `openvino==`; the hashed per-platform locks in `scripts/model-export/locks/` are the stricter option), created with `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt`;

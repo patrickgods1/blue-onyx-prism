@@ -23,8 +23,8 @@ RUN cargo build --release --locked
 # Keep the tag equal to OPENVINO_VERSION in src/resources/catalog/mod.rs, and update the digest with it.
 # openvino/ubuntu24_runtime ships the OpenVINO runtime, Intel compute runtime (OpenCL) and sets
 # INTEL_OPENVINO_DIR, which openvino-finder honours.
-# Manifest of openvino/ubuntu24_runtime:2026.4.0 (amd64 only), read 2026-11-06.
-FROM openvino/ubuntu24_runtime:2026.4.0@sha256:b326dcae9b91fa25f794a391d9953e65a65096597237e6de431116b184a01718
+# Manifest of openvino/ubuntu24_runtime:2026.4.1 (amd64 only), read 2026-11-07.
+FROM openvino/ubuntu24_runtime:2026.4.1@sha256:ef00731944b89db0148ff41bae9ef5f581dc9a1a2de90b1dd9a8ce1af69dc7b5
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

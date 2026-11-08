@@ -14,8 +14,13 @@ runtime is swapped in at the next start). Two weekly jobs (`.github/workflows/ch
 when a bump is due, each in one issue kept current:
 
 - **Upstream updates available** (`scripts/ci/check_deps.py upstream`): catalog runtimes, uv, VC++
-  runtime and the Python pins with a newer release. Pins held back on purpose (`HOLDS`: ONNX Runtime
-  1.24.x for DirectML, cuDNN < 9.11 for Pascal) are listed apart.
+  runtime and the Python pins with a release that is due: newer than the pin, from before the day two
+  weeks ago (what a lock cutoff of that day admits) and, for Python, one that installs on the
+  environments' Python 3.11 and fits what the other pins declare (Requires-Dist, e.g. rfdetr's
+  `train` extra caps torchmetrics, hotcoco and vernier). Newer releases that are not due yet are listed
+  with the reason and the day they become due, and do not keep the issue open. Pins held back on
+  purpose (`HOLDS`: ONNX Runtime 1.24.x for DirectML, cuDNN < 9.11 for Pascal, the VC++ runtime at
+  14.44 until 14.5x is checked on Windows) are listed apart.
 - **Dependency advisories**: `cargo deny check advisories` on `main` and OSV advisories against every
   Python lock (`check_deps.py audit`).
 
@@ -27,9 +32,13 @@ Bumping a pin:
    Dockerfile's `openvino/ubuntu24_runtime` tag and digest in the same commit (CI checks the tag).
 2. Python: change the `==` pin in `scripts/requirements-model-export.txt` / `-train.txt`, regenerate
    the locks with the pinned uv (`scripts/model-export/gen_locks.sh`, `gen_train_locks.sh`, a cutoff at
-   least two weeks old), and for ultralytics / transformers the catalog constants too
-   (`check_deps.py consistency` in CI checks all of these). Run a model export and a short training on
-   one platform before merging.
+   least two weeks old; `gen_train_locks.sh` first runs `check_deps.py conflicts`, since uv never sees
+   the ranges of rfdetr's hand-listed `train` extra), and for ultralytics / transformers the catalog
+   constants too, plus an `EARLIER_EXPORTERS` entry (`catalog/models.rs`) when the new exporter writes
+   the same model, or every user's existing export of that recipe stops loading until exported again
+   (`check_deps.py consistency` in CI checks the pins, locks and constants agree; a catalog test that
+   `EARLIER_EXPORTERS` names the current exporter). Run a model export and a short training on one
+   platform before merging.
 3. Rust toolchain: `rust-toolchain.toml`, `Cargo.toml` `rust-version` and every workflow
    `toolchain:` line together (CI checks they agree).
 

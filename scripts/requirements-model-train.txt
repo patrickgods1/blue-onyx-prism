@@ -16,15 +16,15 @@
 #
 # The shared pins (ultralytics, torch, onnx, onnxruntime, transformers, ...) are the model export's
 # (requirements-model-export.txt), so a trained model is exported exactly like a downloaded one.
-ultralytics==8.4.163
-torch==2.14.0
-torchvision==0.29.0
-onnx==1.22.0
-onnxslim==0.1.96
-onnxruntime==1.29.0
-transformers==5.17.0
+ultralytics==8.4.184
+torch==2.14.1
+torchvision==0.29.1
+onnx==1.23.2
+onnxslim==0.1.98
+onnxruntime==1.31.0
+transformers==5.20.2
 safetensors==0.8.0
-huggingface-hub==1.33.0
+huggingface-hub==2.3.0
 pyyaml==6.0.3
 # transformers.Trainer (RT-DETRv2, D-FINE).
 accelerate==1.15.0
@@ -37,7 +37,7 @@ pytorch-lightning==2.6.6
 torchmetrics[detection]==1.8.2
 hotcoco==1.0.1
 faster-coco-eval==1.8.0
-ultrafast-pycocotools==0.1.13
+ultrafast-pycocotools==0.1.14
 vernier==0.5.4
 pycocotools==2.0.11
 scipy==1.17.1
@@ -51,4 +51,4 @@ torch-hungarian==0.1.0rc0
 # never needs an ffmpeg binary to merge streams. The auto-labelers (MM-Grounding-DINO, Qwen3-VL,
 # SigLIP 2) run on transformers above; RF-DETR on rfdetr above.
 av==18.1.0
-yt-dlp==2026.8.19
+yt-dlp==2026.10.21
