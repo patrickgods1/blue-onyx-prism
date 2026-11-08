@@ -442,6 +442,8 @@ nav.train-tabs .tab-count { display: inline-block; margin-left: 0.2em; min-width
 nav.train-tabs .tab-count[hidden] { display: none; }
 /* Jobs tab: one row each, the whole row links to the job on its tab. */
 .train-next[hidden] { display: none; }
+/* Review: the counts stay, the next step (usually "review frames") would only repeat the page. */
+.train-strip[data-tab="review"] .train-next { display: none; }
 .train-jobs { margin: 0.5rem 0 0; }
 .train-jobs[hidden] { display: none; }
 a.tj { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.25rem 0.7rem; align-items: center; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); text-decoration: none; }
@@ -1197,7 +1199,7 @@ ul.thr-profile-list code, .profiles code { font-size: 0.8rem; }
 .cp-group { border: 1px solid var(--border); border-radius: 6px; margin: 0 0 0.4rem; padding: 0.2rem 0.5rem 0.4rem; min-width: 0; }
 .cp-group > legend { font-size: 0.8rem; color: var(--muted); padding: 0 0.3rem; }
 .cp-chips { display: flex; flex-wrap: wrap; gap: 0.3rem 0.4rem; }
-.cp-chip { display: inline-flex; align-items: center; gap: 0.25rem; border: 1px solid var(--border); border-radius: 999px; padding: 0.1rem 0.55rem 0.1rem 0.4rem; background: var(--card); }
+.cp-chip { display: inline-flex; align-items: center; gap: 0.25rem; border: 1px solid var(--border); border-radius: 8px; padding: 0.1rem 0.55rem 0.1rem 0.4rem; background: var(--card); }
 .cp-chip:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
 .cp-chip:has(input[type=checkbox]:checked) { border-color: var(--accent); background: var(--code-bg); }
 .cp-chip[hidden] { display: none; }
@@ -1210,6 +1212,10 @@ ul.thr-profile-list code, .profiles code { font-size: 0.8rem; }
 .cp-badge.cp-notlist { color: var(--accent); border-color: var(--accent); }
 .cp-models { font-size: 0.68rem; color: var(--muted); }
 .cp-extra { font-size: 0.75rem; color: var(--muted); display: inline-flex; align-items: center; gap: 0.2rem; margin-left: 0.2rem; }
+/* A picker inside a <form>: `form label` would stack a chip's parts in a column. */
+.cp-chip .cp-label, .cp-chip .cp-extra { flex-direction: row; align-items: center; text-align: left; }
+.cp-chip .cp-label { margin: 0; color: var(--fg); }
+.cp-chip .cp-extra { margin: 0 0 0 0.2rem; }
 .cp-add { display: flex; gap: 0.4rem; align-items: center; }
 .cp-compact { position: relative; }
 .cp-compact > .cp-summary { cursor: pointer; border: 1px solid var(--border); border-radius: 4px; padding: 0.25rem 0.5rem; background: var(--card); list-style: revert; max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1256,10 +1262,13 @@ dialog#class-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 .tr-delta.good { color: var(--ok-fg); }
 .tr-delta.bad { color: var(--err-fg); }
 .tr-delta.neutral, .tr-delta.same { color: var(--muted); }
-.tr-charts { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
-.tr-chart-wrap { flex: 1 1 22rem; min-width: 0; max-width: 100%; }
+/* Every chart in a cell of the same size, at most its viewBox width (560), so the SVG text stays
+   11-12 px whatever the window; a lone chart does not stretch across a wide row. */
+.tr-charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr)); gap: 0.5rem 1rem; }
+.tr-chart-wrap { min-width: 0; max-width: 560px; }
 .tr-chart-title { margin: 0.2rem 0; font-size: 0.9rem; }
-.tr-chart-wrap svg.thr-chart { max-width: 100%; height: auto; }
+.tr-chart-wrap svg.thr-chart { max-width: 560px; height: auto; }
+.tr-chart-note { margin: 0.2rem 0 0.4rem; font-size: 0.85rem; }
 .tr-table-wrap { margin: 0.4rem 0; overflow-x: auto; }
 table.tr-mtable { font-size: 0.82rem; width: auto; min-width: 100%; }
 table.tr-mtable th, table.tr-mtable td { padding: 0.25rem 0.5rem; white-space: nowrap; }
@@ -1282,8 +1291,7 @@ table.tr-mtable tr.best-epoch td { background: var(--ok-bg); }
 .tr-scene-other label.check { display: inline-flex; margin-right: 1.2rem; }
 .tr-runs-line { margin: 0.3rem 0 0; padding: 0.3rem 0.6rem; border-left: 3px solid var(--accent); background: var(--code-bg); overflow-wrap: anywhere; }
 #train-picker .cp-compact > .cp-body { max-width: 48rem; max-height: none; }
-#train-picker .cp-label { flex-direction: row; align-items: center; text-align: left; margin: 0; color: var(--fg); gap: 0.35rem; }
-#train-picker .cp-chip { border-radius: 8px; }
+#train-picker .cp-label { gap: 0.35rem; }
 #train-epochs, #train-patience { width: 10rem; }
 .tr-cls-count { font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .cp-badge.tr-cls-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
@@ -1352,7 +1360,14 @@ td.tr-bal-bars { vertical-align: middle; }
    label over a control, `rc-action` holds buttons. `rgrid` lays the cells out in three columns. */
 @media (min-width: 901px) { #rv-accept-likely { display: none; } }
 .rv-phone-head { display: none; }
-.rv-actions-main, .rv-actions-more { display: contents; }
+.rv-actions-main { display: contents; }
+/* Wide screens: Skip / Back / Next / Undo / Keys on a quieter row of their own under the decision
+   buttons (phones place them in the max-width: 900px block below). */
+@media (min-width: 901px) {
+  .rv-actions-more { display: flex; flex-wrap: wrap; flex-basis: 100%; gap: 0.25rem; }
+  .rv-actions-more button.small { margin: 0; padding: 0.05rem 0.5rem; font-size: 0.78rem; color: var(--muted); background: transparent; border-color: var(--border); }
+  .rv-actions-more button.small:hover { color: var(--accent); border-color: var(--accent); }
+}
 
 /* Header: one row, the links scroll (live.js keeps the current page in view). */
 @media (max-width: 700px) {
@@ -1393,7 +1408,7 @@ td.tr-bal-bars { vertical-align: middle; }
   nav.train-tabs a, nav.tabs a[role="tab"] { display: flex; align-items: center; min-height: 44px; }
   .next-step a.button-link { display: inline-flex; align-items: center; min-height: 44px; }
   td a.small, a.small { display: inline-block; padding: 0.55rem 0; }
-  .cp-chip { min-height: 44px; padding: 0.15rem 0.7rem 0.15rem 0.5rem; border-radius: 12px; }
+  .cp-chip { min-height: 44px; padding: 0.15rem 0.7rem 0.15rem 0.5rem; }
   .cp-chip .cp-label { min-height: 40px; align-content: center; }
   .cp-compact > .cp-summary { max-width: 100%; display: list-item; padding: 0.6rem 0.5rem; }
   .cp-compact > .cp-body { max-width: 100%; }

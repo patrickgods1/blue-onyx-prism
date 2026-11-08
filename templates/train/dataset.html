@@ -67,7 +67,7 @@
 
 <div class="card">
   <h2>Classes <span class="tag now">applies now</span></h2>
-  <p class="muted">The class list of the Review tab and of the exports (<code>collect.classes</code>); YOLO class ids follow this order, so append rather than reorder once you exported. <em>Don't want</em> hides a class from Review (pickers, shortcuts and its boxes) and rejects its pending boxes on the unreviewed frames right away, as removing a class does; reviewed frames with accepted boxes of it change only if you say so when asked. The class keeps its place and YOLO id. The auto-label defaults follow the classes the enabled models detect (<a href="/config#at-models">Config page</a>).</p>
+  <p class="muted">The class list of the Review tab and of the exports (<code>collect.classes</code>); YOLO class ids follow this order, so append rather than reorder once you exported. Ticking <em>hide</em> on a class you don't want hides it from Review (pickers, shortcuts and its boxes) and rejects its pending boxes on the unreviewed frames right away, as removing a class does; reviewed frames with accepted boxes of it change only if you say so when asked. The class keeps its place and YOLO id. The auto-label defaults follow the classes the enabled models detect (<a href="/config#at-models">Config page</a>).</p>
   <form id="rv-classes">
     <div id="rv-classes-picker"></div>
     <input type="text" name="classes" value="{{ classes_text }}" class="cp-fallback" aria-label="Classes (comma separated)">
