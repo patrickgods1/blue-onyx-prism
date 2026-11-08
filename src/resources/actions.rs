@@ -167,7 +167,14 @@ pub fn download(
         "downloading {} ({})",
         res.describe(),
         match (res.kind, update) {
-            (ResourceKind::Model, _) => "add it to the config when it is installed".to_string(),
+            (ResourceKind::Model, true) => format!(
+                "replaces the installed {}; a model using it loads the new file the next time it \
+                 loads (a restart, or a change to its device or family)",
+                installed.installed_version(res.id).unwrap_or("version")
+            ),
+            (ResourceKind::Model, false) => {
+                "add it to the config when it is installed".to_string()
+            }
             (_, true) => format!(
                 "replaces the installed {}; used after the next restart",
                 installed.installed_version(res.id).unwrap_or("version")
@@ -476,6 +483,10 @@ pub fn remove(
         }
         _ => {
             std::fs::remove_dir_all(&dir).map_err(|e| fail(e, &dir))?;
+            // An update waiting for the next start would otherwise bring it back.
+            if let Some(p) = manager::pending_dir(&dir).filter(|p| p.exists()) {
+                std::fs::remove_dir_all(&p).map_err(|e| fail(e, &p))?;
+            }
             if let (Some(f), Some(parent)) = (res.flavor(), dir.parent())
                 && crate::backend::libs::read_active_flavor(parent).as_deref() == Some(f.as_str())
             {

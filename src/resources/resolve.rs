@@ -23,6 +23,16 @@
 //!   other than the active one is downloaded next to it and is active after a restart
 //!   ([`Need::after_restart`]). With `onnxruntime_dir` / `ORT_DYLIB_PATH` set the active flavor
 //!   is pinned and never replaced.
+//! - **Updates**: an installed OpenVINO, `nvidia-cuda-libs` or catalog model in another version
+//!   than the catalog's (a pin changed in a new release) is a need with
+//!   [`Need::update_from`] set, so its reason ends in "(update from X)". The installed version
+//!   keeps working until then: an update blocks no model and never makes a device unrunnable;
+//!   it is used after a restart ([`Need::after_restart`]: a loaded runtime is replaced at the
+//!   next start, see `manager::in_use`; a model file the next time the model loads). A large
+//!   update without `allow_large_downloads` is listed in [`Resolution::optional`]. Versions come
+//!   from our manifests (else a runtime's `VERSION` file); an install of unknown version, a
+//!   user-managed `openvino_dir` and a system CUDA are never updated. An update already
+//!   downloaded and waiting for the next start ([`Installed::staged`]) is no need.
 //! - **`auto_download: false`**: the needs are still computed; [`Resolution::downloads`] is
 //!   empty and [`Resolution::manual_message`] names the command to run instead.
 
@@ -49,8 +59,15 @@ pub struct Installed {
     pub resources: BTreeSet<String>,
     /// Installed version per resource id, when known (`.installed.json`, else the `VERSION`
     /// file). A version other than the catalog's means an update is available
-    /// ([`Installed::outdated`]).
+    /// ([`Installed::outdated`]). Catalog models too, from their manifest in `models_dir`
+    /// (shown by the Resources card; the resolver uses [`Installed::model_versions`]).
     pub versions: BTreeMap<String, String>,
+    /// Version per resource id downloaded as an update while the runtime was in use, waiting for
+    /// the next start (`manager::pending_dir`).
+    pub staged: BTreeMap<String, String>,
+    /// Catalog model downloads by configured model path (as written in the config): the version
+    /// the manifest in that model's folder records. A file without one is absent here.
+    pub model_versions: BTreeMap<PathBuf, String>,
     /// ONNX Runtime flavor this process loads (or would load at startup); None = no ORT library.
     pub active_ort: Option<Flavor>,
     /// `onnxruntime_dir` / `ORT_DYLIB_PATH` is set: the active flavor is user-managed and never
@@ -79,6 +96,8 @@ impl Default for Installed {
         Self {
             resources: BTreeSet::new(),
             versions: BTreeMap::new(),
+            staged: BTreeMap::new(),
+            model_versions: BTreeMap::new(),
             active_ort: None,
             ort_pinned: false,
             files: BTreeSet::new(),
@@ -123,10 +142,32 @@ impl Installed {
         self.versions.get(id).map(String::as_str)
     }
 
-    /// `r` is installed in a version other than the catalog's (an update is available). An
-    /// install of unknown version never counts as outdated.
+    /// Record that the catalog model download at config path `path` is version `version`
+    /// (builder).
+    pub fn with_model_version<P: AsRef<Path>>(mut self, path: P, version: &str) -> Self {
+        self.model_versions
+            .insert(path.as_ref().to_path_buf(), version.to_string());
+        self
+    }
+
+    /// Record that version `version` of resource `id` waits for the next start (builder).
+    pub fn with_staged(mut self, id: &str, version: &str) -> Self {
+        self.staged.insert(id.to_string(), version.to_string());
+        self
+    }
+
+    /// `r` is installed in a version other than the catalog's (an update is available) and the
+    /// catalog's version is not already downloaded for the next start ([`Self::update_staged`]).
+    /// An install of unknown version never counts as outdated.
     pub fn outdated(&self, r: &Resource) -> bool {
-        self.installed_version(r.id).is_some_and(|v| v != r.version)
+        self.installed_version(r.id).is_some_and(|v| v != r.version) && !self.update_staged(r)
+    }
+
+    /// The catalog's version of `r` is downloaded and replaces the installed one at the next
+    /// start.
+    pub fn update_staged(&self, r: &Resource) -> bool {
+        self.staged.get(r.id).is_some_and(|v| v == r.version)
+            && self.installed_version(r.id) != Some(r.version)
     }
 
     /// The ONNX Runtime flavor this process has loaded (live probe), if any.
@@ -189,8 +230,10 @@ pub struct Need {
     #[serde(serialize_with = "ser_opt_device")]
     pub device: Option<Device>,
     /// Takes effect only after a process restart: a second ONNX Runtime flavor while another one
-    /// is active.
+    /// is active, or an update (`update_from`).
     pub after_restart: bool,
+    /// An update: the version installed now, which keeps working until then.
+    pub update_from: Option<String>,
     /// Models only: directory to put the files in, as written in the config (relative paths
     /// resolve against the exe dir). Runtimes go to `<download root>/<resource.dest>`.
     pub model_dir: Option<PathBuf>,
@@ -304,11 +347,33 @@ impl Resolution {
         if self.auto_download || self.needs.is_empty() {
             return None;
         }
-        let list: Vec<String> = self.needs.iter().map(|n| n.resource.describe()).collect();
+        let (updates, missing): (Vec<&Need>, Vec<&Need>) =
+            self.needs.iter().partition(|n| n.update_from.is_some());
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            let list: Vec<String> = missing.iter().map(|n| n.resource.describe()).collect();
+            parts.push(format!("missing: {}", list.join(", ")));
+        }
+        if !updates.is_empty() {
+            let list: Vec<String> = updates
+                .iter()
+                .map(|n| {
+                    format!(
+                        "{} (installed {})",
+                        n.resource.describe(),
+                        n.update_from.as_deref().unwrap_or("?")
+                    )
+                })
+                .collect();
+            parts.push(format!(
+                "updates available, the installed versions keep working: {}",
+                list.join(", ")
+            ));
+        }
         Some(format!(
-            "auto_download is off; missing: {}. Run `{FETCH_FOR_CONFIG}` (on a machine with \
+            "auto_download is off; {}. Run `{FETCH_FOR_CONFIG}` (on a machine with \
              network access, then copy the directory), or enable auto_download",
-            list.join(", ")
+            parts.join("; ")
         ))
     }
 }
@@ -426,10 +491,19 @@ struct Resolver<'a> {
     out: Resolution,
 }
 
+/// What a usable candidate needs.
+struct Usable {
+    /// Missing resources (possibly none): the device runs once they are installed.
+    missing: Vec<&'static Resource>,
+    /// Installed in an older version: the device runs now, the update is used after a restart.
+    updates: Vec<&'static Resource>,
+    flavor: Option<Flavor>,
+}
+
 /// Outcome of checking one candidate.
 enum Check {
-    /// Usable; these resources are missing (possibly none).
-    Ok(Vec<&'static Resource>, Option<Flavor>),
+    /// Usable, with what it needs.
+    Ok(Usable),
     /// Usable only with a large download that is not allowed.
     Large(Vec<&'static Resource>, String),
     /// Cannot run here.
@@ -482,6 +556,18 @@ impl Resolver<'_> {
                 classes_path(m).display()
             ));
         }
+        // Present, but downloaded from an older pin (the manifest in its folder says so):
+        // replaced, and used the next time the model loads. A file without a manifest is never
+        // replaced on a guess.
+        let model_update = entry
+            .filter(|_| model_need.is_none())
+            .and_then(|r| {
+                self.installed
+                    .model_versions
+                    .get(&m.path)
+                    .filter(|v| v.as_str() != r.version)
+            })
+            .cloned();
         let has_onnx = m
             .path
             .extension()
@@ -506,11 +592,11 @@ impl Resolver<'_> {
         };
         let candidates = plan::plan_for(&spec, &sel, &ov_names);
 
-        let mut accepted: Option<(Device, Vec<&'static Resource>, Option<Flavor>)> = None;
+        let mut accepted: Option<(Device, Usable)> = None;
         for cand in &candidates {
             match self.check(cand.device, &sel) {
-                Check::Ok(res, flavor) => {
-                    accepted = Some((cand.device, res, flavor));
+                Check::Ok(usable) => {
+                    accepted = Some((cand.device, usable));
                     break;
                 }
                 Check::Large(res, why) => {
@@ -524,7 +610,7 @@ impl Resolver<'_> {
                 Check::No(why) => plan.skipped.push(format!("{}: {why}", cand.device)),
             }
         }
-        let Some((device, resources, flavor)) = accepted else {
+        let Some((device, usable)) = accepted else {
             plan.error = Some(format!(
                 "no device can run this model here ({})",
                 if plan.skipped.is_empty() {
@@ -537,7 +623,7 @@ impl Resolver<'_> {
             return;
         };
         plan.device = Some(device);
-        if let Some(f) = flavor {
+        if let Some(f) = usable.flavor {
             self.chosen = Some(f);
         }
         // The plan's CPU fallback (tried when the chosen device fails to compile): make sure its
@@ -548,33 +634,58 @@ impl Resolver<'_> {
             .skip(1)
             .find(|c| c.device.is_cpu())
             .and_then(|c| match self.check(c.device, &sel) {
-                Check::Ok(res, _) => Some((c.device, res)),
+                Check::Ok(u) => Some((c.device, u)),
                 _ => None,
             });
 
+        let model_dir = || m.path.parent().map(Path::to_path_buf).unwrap_or_default();
         if let (Some(reason), Some(entry)) = (model_need, entry) {
-            let dir = m.path.parent().map(Path::to_path_buf).unwrap_or_default();
-            let need = self.need(entry, reason, &name, None, Some(dir));
+            let need = self.need(entry, reason, &name, None, Some(model_dir()));
             push_need(&mut self.out.needs, need);
         }
-        for r in resources {
+        if let (Some(old), Some(entry)) = (model_update, entry) {
+            let mut need = self.need(entry, String::new(), &name, None, Some(model_dir()));
+            need.reason = format!(
+                "model file {} was downloaded from an older pin (update from {old})",
+                m.path.display()
+            );
+            need.update_from = Some(old);
+            self.push_update(need);
+        }
+        for r in usable.missing {
             let need = self.need(r, format!("{name} on {device}"), &name, Some(device), None);
             push_need(&mut self.out.needs, need);
         }
-        if let Some((fb, res)) = fallback {
-            for r in res {
-                let mut need = self.need(
-                    r,
-                    format!("CPU fallback for {name} ({fb})"),
-                    &name,
-                    Some(fb),
-                    None,
-                );
+        for r in usable.updates {
+            let need = self.need(r, format!("{name} on {device}"), &name, Some(device), None);
+            self.push_update(need);
+        }
+        if let Some((fb, u)) = fallback {
+            let reason = format!("CPU fallback for {name} ({fb})");
+            for r in u.missing {
+                let mut need = self.need(r, reason.clone(), &name, Some(fb), None);
                 need.blocking_models.clear();
                 push_need(&mut self.out.needs, need);
             }
+            for r in u.updates {
+                let need = self.need(r, reason.clone(), &name, Some(fb), None);
+                self.push_update(need);
+            }
         }
         self.out.models.push(plan);
+    }
+
+    /// Add an update ([`Need::update_from`]): it blocks no model (the installed version keeps
+    /// working) and is used after a restart. A large one needs `allow_large_downloads` exactly as
+    /// a first install does; without it, it is only listed as optional.
+    fn push_update(&mut self, mut need: Need) {
+        need.after_restart = true;
+        if need.resource.is_large() && !self.config.allow_large_downloads {
+            push_need(&mut self.out.optional, need);
+        } else {
+            need.blocking_models.clear();
+            push_need(&mut self.out.needs, need);
+        }
     }
 
     fn need(
@@ -593,9 +704,15 @@ impl Resolver<'_> {
             active.is_some_and(|a| a != f)
                 || (outdated && self.installed.loaded_flavor() == Some(f))
         });
-        let reason = match self.installed.installed_version(resource.id) {
-            Some(old) if outdated => format!("{reason} (update from {old})"),
-            _ => reason,
+        // Model updates are judged per file by the caller (`Installed::model_versions`).
+        let update_from = self
+            .installed
+            .installed_version(resource.id)
+            .filter(|_| outdated && !resource.kind.is_model())
+            .map(str::to_string);
+        let reason = match &update_from {
+            Some(old) => format!("{reason} (update from {old})"),
+            None => reason,
         };
         Need {
             resource,
@@ -603,6 +720,7 @@ impl Resolver<'_> {
             blocking_models: vec![model.to_string()],
             device,
             after_restart,
+            update_from,
             model_dir,
         }
     }
@@ -784,13 +902,26 @@ impl Resolver<'_> {
             }
             Some(_) => {}
         }
-        let (missing, flavor) = match device.runtime {
+        let usable = match device.runtime {
             Runtime::OpenVino => {
+                let package = catalog::openvino_runtime(self.os(), self.arch());
                 if self.installed.openvino_present() {
-                    (Vec::new(), None)
+                    // Present in an older version: runs now, updated for the next start.
+                    Usable {
+                        missing: Vec::new(),
+                        updates: package
+                            .filter(|r| self.installed.outdated(r))
+                            .into_iter()
+                            .collect(),
+                        flavor: None,
+                    }
                 } else {
-                    match catalog::openvino_runtime(self.os(), self.arch()) {
-                        Some(r) => (vec![r], None),
+                    match package {
+                        Some(r) => Usable {
+                            missing: vec![r],
+                            updates: Vec::new(),
+                            flavor: None,
+                        },
                         None => return Check::No("no OpenVINO runtime package".to_string()),
                     }
                 }
@@ -800,26 +931,24 @@ impl Resolver<'_> {
                 Err(e) => return Check::No(e),
             },
         };
+        let missing = &usable.missing;
         let large: Vec<&'static Resource> =
             missing.iter().copied().filter(|r| r.is_large()).collect();
         if !large.is_empty() && !self.config.allow_large_downloads {
             let what: Vec<String> = large.iter().map(|r| r.describe()).collect();
             return Check::Large(
-                missing,
+                usable.missing,
                 format!(
                     "needs {}; set allow_large_downloads to download it",
                     what.join(", ")
                 ),
             );
         }
-        Check::Ok(missing, flavor)
+        Check::Ok(usable)
     }
 
-    /// Missing resources (and the flavor) for an ONNX Runtime target.
-    fn ort_resources(
-        &self,
-        target: Target,
-    ) -> Result<(Vec<&'static Resource>, Option<Flavor>), String> {
+    /// Missing resources, updates and the flavor for an ONNX Runtime target.
+    fn ort_resources(&self, target: Target) -> Result<Usable, String> {
         let (os, arch) = (self.os(), self.arch());
         let flavor = match Flavor::providing(target) {
             Some(f) => f,
@@ -863,16 +992,28 @@ impl Resolver<'_> {
                     .ok_or_else(|| format!("no ONNX Runtime {flavor} package for {os}/{arch}"))?,
             );
         }
-        if matches!(target, Target::Cuda | Target::TensorRt)
-            && !self.cuda_libs_present()
-            && self.live_status(Flavor::Cuda, target) != Some(None)
-        {
-            missing.push(
-                catalog::cuda_libs_for(os, arch)
-                    .ok_or_else(|| format!("no CUDA libraries package for {os}/{arch}"))?,
-            );
+        let mut updates = Vec::new();
+        if matches!(target, Target::Cuda | Target::TensorRt) {
+            let libs = catalog::cuda_libs_for(os, arch);
+            if !self.cuda_libs_present() && self.live_status(Flavor::Cuda, target) != Some(None) {
+                missing.push(
+                    libs.ok_or_else(|| format!("no CUDA libraries package for {os}/{arch}"))?,
+                );
+            } else if let Some(r) = libs.filter(|r| {
+                // Ours in an older version (they are preloaded by path, so used after a
+                // restart); a system CUDA install makes them unnecessary.
+                !self.installed.system_cuda
+                    && self.installed.has(catalog::CUDA_LIBS_ID)
+                    && self.installed.outdated(r)
+            }) {
+                updates.push(r);
+            }
         }
-        Ok((missing, Some(flavor)))
+        Ok(Usable {
+            missing,
+            updates,
+            flavor: Some(flavor),
+        })
     }
 }
 
@@ -948,10 +1089,10 @@ pub fn downloadable_options(
         .iter()
         .filter(|o| o.runnable)
         .filter_map(|o| match r.check(o.spec, &sel) {
-            Check::Ok(res, _) if !res.is_empty() => Some(Downloadable {
+            Check::Ok(u) if !u.missing.is_empty() => Some(Downloadable {
                 device: o.spec,
                 label: o.label.clone(),
-                resources: res,
+                resources: u.missing,
             }),
             _ => None,
         })
@@ -1105,6 +1246,11 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
         out.resources
             .insert(catalog::OPENVINO_RUNTIME_ID.to_string());
     }
+    // Its version only for our install: a user-managed `openvino_dir` is never updated. Without
+    // a manifest the `VERSION` file speaks for it; unreadable = unknown, never outdated.
+    if !user_ov && out.has(catalog::OPENVINO_RUNTIME_ID) {
+        record_versions(&mut out, &ov_dir, catalog::OPENVINO_RUNTIME_ID);
+    }
 
     // ONNX Runtime: the library the loader would pick, plus per-flavor installs.
     let ort_root = root.join(crate::backend::libs::ORT_DIR_NAME);
@@ -1143,10 +1289,7 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
         }
         if manifest.is_some() || by_marker {
             out.resources.insert(f.resource_id().to_string());
-            let version = manifest.map(|m| m.version).or_else(|| version_file(&dir));
-            if let Some(v) = version {
-                out.versions.insert(f.resource_id().to_string(), v);
-            }
+            record_versions(&mut out, &dir, f.resource_id());
         }
     }
     let cuda_dir = root.join(catalog::CUDA_LIBS_DEST);
@@ -1155,12 +1298,7 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
         !cuda_dir.join(super::manager::MANIFEST_FILE).is_file() && dir_non_empty(&cuda_dir);
     if cuda_manifest.is_some() || cuda_unlisted {
         out.resources.insert(catalog::CUDA_LIBS_ID.to_string());
-        let version = cuda_manifest
-            .map(|m| m.version)
-            .or_else(|| version_file(&cuda_dir));
-        if let Some(v) = version {
-            out.versions.insert(catalog::CUDA_LIBS_ID.to_string(), v);
-        }
+        record_versions(&mut out, &cuda_dir, catalog::CUDA_LIBS_ID);
     }
 
     // Model files, spelled as in the config. An exported model's file from another version (the
@@ -1173,7 +1311,52 @@ pub fn detect_installed(config: &Config, root: &Path, probe: Option<RuntimeProbe
             }
         }
     }
+    record_model_versions(&mut out, config);
     out
+}
+
+/// Versions of the runtime `id` installed in `dir`: the manifest's (else the `VERSION` file's),
+/// and one downloaded for the next start ([`super::manager::staged_version`]).
+fn record_versions(out: &mut Installed, dir: &Path, id: &str) {
+    let version = intact_manifest(dir, id).map(|m| m.version).or_else(|| {
+        (!dir.join(super::manager::MANIFEST_FILE).is_file())
+            .then(|| version_file(dir))
+            .flatten()
+    });
+    if let Some(v) = version {
+        out.versions.insert(id.to_string(), v);
+    }
+    if let Some(v) = super::manager::staged_version(id, dir) {
+        out.staged.insert(id.to_string(), v);
+    }
+}
+
+/// Versions of catalog models from their manifests (`.<model>.installed.json`): per enabled
+/// model, the one in its own folder ([`Installed::model_versions`], what the resolver updates),
+/// and per resource the one in `models_dir` ([`Installed::versions`], for the Resources card and
+/// `list-resources`). A model file without a manifest (placed by hand, or by an older release)
+/// records nothing, so it is never replaced on a guess.
+fn record_model_versions(out: &mut Installed, config: &Config) {
+    let version_in = |res: &Resource, dir: &Path| {
+        super::manager::read_manifest(&super::manager::manifest_path(res, dir))
+            .filter(|m| m.id == res.id)
+            .map(|m| m.version)
+    };
+    for m in config.enabled_models() {
+        let Some(res) = catalog_model_for(m) else {
+            continue;
+        };
+        let dir = config.data_path(m.path.parent().unwrap_or(Path::new("")));
+        if let Some(v) = version_in(res, &dir) {
+            out.model_versions.insert(m.path.clone(), v);
+        }
+    }
+    let models_dir = config.data_path(&config.models_dir);
+    for res in catalog::MODELS {
+        if let Some(v) = version_in(res, &models_dir) {
+            out.versions.insert(res.id.to_string(), v);
+        }
+    }
 }
 
 #[cfg(test)]

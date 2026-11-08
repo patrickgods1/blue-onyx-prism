@@ -100,6 +100,25 @@ fn library_version(path: &Path) -> Result<String> {
     }
 }
 
+/// Before this process first loads ONNX Runtime from `path`: apply an update of that flavor that
+/// was downloaded while it was in use, and mark the folder in use for the life of the process
+/// (`resources::manager::in_use`). Runs before anything touches the folder (the DLL search
+/// registration included). The swap may rename a versioned library file
+/// (`libonnxruntime.so.1.24.4`), so the library is looked up again in the same folder.
+fn before_first_load(path: &Path) -> PathBuf {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return path.to_path_buf();
+    };
+    if LOADED.lock_recover().is_some() {
+        return path.to_path_buf();
+    }
+    crate::resources::manager::before_load(dir);
+    if path.is_file() {
+        return path.to_path_buf();
+    }
+    crate::backend::libs::find_ort_library_in(dir).unwrap_or_else(|| path.to_path_buf())
+}
+
 /// `(major, minor)` of a version string like "1.24.4".
 pub(crate) fn parse_version(v: &str) -> Option<(u32, u32)> {
     let mut it = v.trim().split('.');
@@ -348,6 +367,7 @@ impl OrtRuntime {
         hw: &HardwareInfo,
         cuda_libs: Option<&Path>,
     ) -> Result<Self> {
+        let path = &before_first_load(path);
         // The flavor dir holds the library's own imports (`onnxruntime_providers_shared`,
         // `DirectML.dll`): make it part of the DLL search (Windows; a no-op elsewhere) since
         // `PATH` and the working directory are not searched (BE-01).

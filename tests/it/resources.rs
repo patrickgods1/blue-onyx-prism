@@ -612,12 +612,15 @@ fn outdated_cuda_flavor_is_updated() {
     let r = needed(&cfg, &hw, &current);
     assert!(r.is_satisfied(), "{:?}", ids(&r));
     assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
-    // Installed cuda-libs of another cuDNN still work: never re-planned.
+    // Installed cuda-libs of an older pin keep working (CUDA stays the pick, nothing waits)
+    // and are updated for the next start (see `outdated_cuda_libs_are_updated_after_a_restart`).
     let libs = current
         .clone()
         .with_version(CUDA_LIBS_ID, "cuda-12.8.1+cudnn-9.8.0.87");
     let r = needed(&cfg, &hw, &libs);
-    assert!(r.is_satisfied(), "{:?}", ids(&r));
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert_eq!(ids(&r), [CUDA_LIBS_ID]);
+    assert!(r.needs[0].blocking_models.is_empty());
 
     // The old CUDA flavor loaded by this process: judged by its own build (CUDA refused with the
     // update hint), the update is planned for after a restart, DirectML is not downloaded.
@@ -1123,6 +1126,388 @@ fn detect_installed_reads_manifests() {
     let dml = catalog::onnxruntime("windows", "x86_64", Flavor::DirectMl).unwrap();
     assert!(inst.outdated(dml));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Updates after a pin bump (OpenVINO, nvidia-cuda-libs, catalog models)
+// ---------------------------------------------------------------------------------------------
+
+fn ov_package(hw: &HardwareInfo) -> &'static catalog::Resource {
+    catalog::openvino_runtime(&hw.os, &hw.arch).unwrap()
+}
+
+#[test]
+fn outdated_openvino_is_updated_after_a_restart() {
+    let cfg = ipcam();
+    let hw = win(vec![intel_igpu(0)]);
+    let old = files_only(&cfg)
+        .with_resources(&[OPENVINO_RUNTIME_ID])
+        .with_version(OPENVINO_RUNTIME_ID, "2025.1.0");
+    let r = needed(&cfg, &hw, &old);
+    // Still runs on the installed version meanwhile: the GPU stays the pick, nothing waits.
+    assert_eq!(pick(&r, "IPcam-general"), "openvino:gpu");
+    assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
+    let n = &r.needs[0];
+    assert!(n.after_restart);
+    assert!(n.blocking_models.is_empty(), "{:?}", n.blocking_models);
+    assert_eq!(n.update_from.as_deref(), Some("2025.1.0"));
+    assert!(n.reason.ends_with("(update from 2025.1.0)"), "{}", n.reason);
+    assert_eq!(r.downloads().len(), 1);
+    // auto_download off: nothing is downloaded, and the message calls it an update.
+    let off = Config {
+        auto_download: false,
+        ..cfg.clone()
+    };
+    let r = needed(&off, &hw, &old);
+    assert!(r.downloads().is_empty());
+    let msg = r.manual_message().unwrap();
+    assert!(msg.contains("updates available"), "{msg}");
+    assert!(msg.contains("(installed 2025.1.0)"), "{msg}");
+    assert!(!msg.contains("missing"), "{msg}");
+
+    // At the catalog's version: nothing to do.
+    let current = old
+        .clone()
+        .with_version(OPENVINO_RUNTIME_ID, catalog::OPENVINO_VERSION);
+    assert!(needed(&cfg, &hw, &current).is_satisfied());
+    // Of unknown version: never updated on a guess.
+    let unknown = files_only(&cfg).with_resources(&[OPENVINO_RUNTIME_ID]);
+    assert!(needed(&cfg, &hw, &unknown).is_satisfied());
+    // Already downloaded and waiting for the next start: not downloaded again.
+    let staged = old
+        .clone()
+        .with_staged(OPENVINO_RUNTIME_ID, ov_package(&hw).version);
+    assert!(!staged.outdated(ov_package(&hw)));
+    assert!(staged.update_staged(ov_package(&hw)));
+    assert!(needed(&cfg, &hw, &staged).is_satisfied());
+
+    // The CPU fallback of a CUDA model: the update is queued too, blocking nothing.
+    let mut big = ipcam();
+    big.allow_large_downloads = true;
+    let hw = win(vec![rtx(0)]);
+    let inst = old
+        .clone()
+        .with_resources(&["onnxruntime-cuda", CUDA_LIBS_ID]);
+    let r = needed(&big, &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
+    assert!(
+        r.needs[0].reason.contains("CPU fallback"),
+        "{}",
+        r.needs[0].reason
+    );
+    assert!(r.needs[0].after_restart);
+}
+
+/// What `detect_installed` reads for OpenVINO: the manifest's version, else `VERSION`; never for a
+/// user-managed `openvino_dir`.
+#[test]
+fn openvino_versions_on_disk() {
+    use blue_onyx_prism::resources::manager::{MANIFEST_FILE, Manifest, pending_dir};
+    use blue_onyx_prism::resources::resolve::detect_installed;
+    let root = crate::common::temp_dir("ov-update");
+    let ov = root.join("openvino");
+    let hw = win(vec![intel_igpu(0)]);
+    let cfg = Config {
+        download_dir: Some(root.to_path_buf()),
+        ..ipcam()
+    };
+    let manifest = |dir: &std::path::Path, version: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        let m = Manifest {
+            id: OPENVINO_RUNTIME_ID.into(),
+            version: version.into(),
+            sha256: vec!["0".repeat(64)],
+            files: vec![],
+        };
+        std::fs::write(dir.join(MANIFEST_FILE), serde_json::to_vec(&m).unwrap()).unwrap();
+    };
+    let plan = |cfg: &Config, inst: &Installed| {
+        needed(
+            cfg,
+            &hw,
+            &inst
+                .clone()
+                .with_files(&files_only(cfg).files.iter().collect::<Vec<_>>()),
+        )
+    };
+
+    // An older install by the manager.
+    manifest(&ov, "2025.1.0");
+    let inst = detect_installed(&cfg, &root, None);
+    assert_eq!(
+        inst.installed_version(OPENVINO_RUNTIME_ID),
+        Some("2025.1.0")
+    );
+    let r = plan(&cfg, &inst);
+    assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
+    assert!(r.needs[0].after_restart);
+    assert!(
+        r.needs[0].reason.contains("update from 2025.1.0"),
+        "{}",
+        r.needs[0].reason
+    );
+
+    // The update was downloaded while OpenVINO was loaded: it waits, nothing more to fetch.
+    manifest(&pending_dir(&ov).unwrap(), catalog::OPENVINO_VERSION);
+    let inst = detect_installed(&cfg, &root, None);
+    assert_eq!(
+        inst.staged.get(OPENVINO_RUNTIME_ID).map(String::as_str),
+        Some(catalog::OPENVINO_VERSION)
+    );
+    assert!(plan(&cfg, &inst).is_satisfied());
+    std::fs::remove_dir_all(pending_dir(&ov).unwrap()).unwrap();
+
+    // The current version: nothing.
+    manifest(&ov, catalog::OPENVINO_VERSION);
+    assert!(plan(&cfg, &detect_installed(&cfg, &root, None)).is_satisfied());
+
+    // A user-managed openvino_dir is never updated, whatever our folder holds.
+    manifest(&ov, "2025.1.0");
+    let user = root.join("my-openvino");
+    std::fs::create_dir_all(&user).unwrap();
+    let mine = Config {
+        openvino_dir: Some(user.clone()),
+        ..cfg.clone()
+    };
+    let inst = detect_installed(&mine, &root, None);
+    assert!(inst.has(OPENVINO_RUNTIME_ID));
+    assert_eq!(inst.installed_version(OPENVINO_RUNTIME_ID), None);
+    assert!(plan(&mine, &inst).is_satisfied());
+
+    // An install from before the manager: only a VERSION file, compared as it is.
+    std::fs::remove_file(ov.join(MANIFEST_FILE)).unwrap();
+    std::fs::write(ov.join("VERSION"), "2024.6.0\n").unwrap();
+    let inst = detect_installed(&cfg, &root, None);
+    assert_eq!(
+        inst.installed_version(OPENVINO_RUNTIME_ID),
+        Some("2024.6.0")
+    );
+    let r = plan(&cfg, &inst);
+    assert_eq!(ids(&r), [OPENVINO_RUNTIME_ID]);
+    assert!(
+        r.needs[0].reason.contains("update from 2024.6.0"),
+        "{}",
+        r.needs[0].reason
+    );
+    // An unreadable (empty) VERSION file: left alone.
+    std::fs::write(ov.join("VERSION"), "\n").unwrap();
+    let inst = detect_installed(&cfg, &root, None);
+    assert!(inst.has(OPENVINO_RUNTIME_ID));
+    assert_eq!(inst.installed_version(OPENVINO_RUNTIME_ID), None);
+    assert!(plan(&cfg, &inst).is_satisfied());
+}
+
+#[test]
+fn outdated_cuda_libs_are_updated_after_a_restart() {
+    let hw = win(vec![rtx(0)]);
+    let libs = catalog::cuda_libs_for("windows", "x86_64").unwrap();
+    assert!(libs.is_large());
+    let inst = files_only(&ipcam())
+        .with_resources(&["onnxruntime-cuda", CUDA_LIBS_ID, OPENVINO_RUNTIME_ID])
+        .with_version("onnxruntime-cuda", catalog::ONNXRUNTIME_CUDA_VERSION)
+        .with_version(CUDA_LIBS_ID, "cuda-12.8.1+cudnn-9.8.0.87");
+
+    // Large downloads allowed: queued, blocking nothing; CUDA runs on the old libraries.
+    let mut cfg = ipcam();
+    cfg.allow_large_downloads = true;
+    let r = needed(&cfg, &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert_eq!(ids(&r), [CUDA_LIBS_ID]);
+    let n = &r.needs[0];
+    assert!(n.after_restart);
+    assert!(n.blocking_models.is_empty());
+    assert!(
+        n.reason
+            .ends_with("(update from cuda-12.8.1+cudnn-9.8.0.87)"),
+        "{}",
+        n.reason
+    );
+    assert!(r.optional.is_empty());
+
+    // Not allowed: the same gate as a first install, so only offered; CUDA stays the pick.
+    let r = needed(&ipcam(), &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert!(r.is_satisfied(), "{:?}", ids(&r));
+    let opt: Vec<&str> = r.optional.iter().map(|n| n.id()).collect();
+    assert_eq!(opt, [CUDA_LIBS_ID]);
+    assert_eq!(
+        r.optional[0].update_from.as_deref(),
+        Some("cuda-12.8.1+cudnn-9.8.0.87")
+    );
+
+    // A system CUDA install: our old copy is not needed, nothing is queued.
+    let mut system = inst.clone();
+    system.system_cuda = true;
+    let r = needed(&cfg, &hw, &system);
+    assert_eq!(pick(&r, "IPcam-general"), "ort:cuda:0");
+    assert!(r.is_satisfied(), "{:?}", ids(&r));
+    assert!(r.optional.is_empty());
+    // System CUDA and none of ours: nothing either.
+    let mut bare = files_only(&ipcam())
+        .with_resources(&["onnxruntime-cuda", OPENVINO_RUNTIME_ID])
+        .with_version("onnxruntime-cuda", catalog::ONNXRUNTIME_CUDA_VERSION);
+    bare.system_cuda = true;
+    assert!(needed(&cfg, &hw, &bare).is_satisfied());
+    // Current version: nothing.
+    let current = inst.clone().with_version(CUDA_LIBS_ID, libs.version);
+    assert!(needed(&cfg, &hw, &current).is_satisfied());
+}
+
+/// A catalog model downloaded from an older pin (its manifest says so) is downloaded again into
+/// its folder; a model file with no manifest counts as installed.
+#[test]
+fn catalog_model_from_an_older_pin_is_updated() {
+    use blue_onyx_prism::resources::manager::{Manifest, manifest_path};
+    use blue_onyx_prism::resources::resolve::detect_installed;
+    let root = crate::common::temp_dir("model-update");
+    let cfg = Config {
+        download_dir: Some(root.to_path_buf()),
+        ..ipcam()
+    };
+    let hw = win(vec![intel_igpu(0)]);
+    let res = catalog::model("IPcam-general.onnx").unwrap();
+    let models = root.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    for p in res.parts {
+        std::fs::write(models.join(p.file_name), b"weights").unwrap();
+    }
+    let with_ov = |i: Installed| i.with_resources(&[OPENVINO_RUNTIME_ID]);
+
+    // No manifest (placed by hand, or by an older release): installed, never replaced.
+    let inst = with_ov(detect_installed(&cfg, &root, None));
+    assert_eq!(inst.installed_version(res.id), None);
+    assert!(
+        needed(&cfg, &hw, &inst).is_satisfied(),
+        "{:?}",
+        ids(&needed(&cfg, &hw, &inst))
+    );
+
+    // A manifest of an older version: an update into the model's folder, blocking nothing.
+    let manifest = |version: &str| {
+        let m = Manifest {
+            id: res.id.into(),
+            version: version.into(),
+            sha256: vec![],
+            files: res.parts.iter().map(|p| p.file_name.to_string()).collect(),
+        };
+        std::fs::write(manifest_path(res, &models), serde_json::to_vec(&m).unwrap()).unwrap();
+    };
+    manifest("v0-old");
+    let inst = with_ov(detect_installed(&cfg, &root, None));
+    assert_eq!(inst.installed_version(res.id), Some("v0-old"));
+    assert!(inst.outdated(res));
+    assert_eq!(
+        inst.model_versions
+            .get(&PathBuf::from("models/IPcam-general.onnx"))
+            .map(String::as_str),
+        Some("v0-old")
+    );
+    let r = needed(&cfg, &hw, &inst);
+    assert_eq!(pick(&r, "IPcam-general"), "openvino:gpu");
+    assert_eq!(ids(&r), [res.id]);
+    let n = &r.needs[0];
+    assert_eq!(n.model_dir, Some(PathBuf::from("models")));
+    assert!(n.blocking_models.is_empty());
+    assert!(n.after_restart);
+    assert!(n.reason.ends_with("(update from v0-old)"), "{}", n.reason);
+    // The manager's jobs put it into the models folder under the data root.
+    let jobs = blue_onyx_prism::resources::manager::jobs_for(&r, &r.needs, &root);
+    assert_eq!(jobs[0].target, root.join("models"));
+
+    // The current version: nothing.
+    manifest(res.version);
+    let inst = with_ov(detect_installed(&cfg, &root, None));
+    assert!(needed(&cfg, &hw, &inst).is_satisfied());
+
+    // An old download in models_dir does not reach a copy placed by hand elsewhere.
+    manifest("v0-old");
+    let own = root.join("mine");
+    std::fs::create_dir_all(&own).unwrap();
+    let path = own.join("IPcam-general.onnx");
+    std::fs::write(&path, b"weights").unwrap();
+    std::fs::write(own.join("IPcam-general.yaml"), b"names: [person]").unwrap();
+    let elsewhere = Config {
+        models: vec![model(&path.to_string_lossy())],
+        ..cfg.clone()
+    };
+    let inst = with_ov(detect_installed(&elsewhere, &root, None));
+    assert!(inst.outdated(res), "models_dir's copy is old");
+    assert!(inst.model_versions.is_empty());
+    assert!(needed(&elsewhere, &hw, &inst).is_satisfied());
+
+    // A file that went, with its old manifest left: missing, so blocking, not an update.
+    std::fs::remove_file(models.join(res.parts[0].file_name)).unwrap();
+    let inst = with_ov(detect_installed(&cfg, &root, None));
+    let r = needed(&cfg, &hw, &inst);
+    assert_eq!(ids(&r), [res.id]);
+    assert_eq!(r.needs[0].update_from, None);
+    assert_eq!(r.needs[0].blocking_models, ["IPcam-general"]);
+    assert!(
+        !r.needs[0].reason.contains("update from"),
+        "{}",
+        r.needs[0].reason
+    );
+}
+
+/// The resolver judges a model update by the configured file's own folder, never by the
+/// resource-wide version the Resources card shows.
+#[test]
+fn model_update_is_judged_per_file() {
+    let cfg = ipcam();
+    let hw = win(vec![intel_igpu(0)]);
+    let res = catalog::model("IPcam-general.onnx").unwrap();
+    let base = files_only(&cfg).with_resources(&[OPENVINO_RUNTIME_ID]);
+    let old = base
+        .clone()
+        .with_model_version("models/IPcam-general.onnx", "v0-old");
+    let r = needed(&cfg, &hw, &old);
+    assert_eq!(ids(&r), [res.id]);
+    assert_eq!(r.needs[0].update_from.as_deref(), Some("v0-old"));
+    assert_eq!(r.downloads().len(), 1);
+    let off = Config {
+        auto_download: false,
+        ..cfg.clone()
+    };
+    assert!(needed(&off, &hw, &old).downloads().is_empty());
+    // Only models_dir's manifest is old: not this file's business.
+    let card_only = base.clone().with_version(res.id, "v0-old");
+    assert!(needed(&cfg, &hw, &card_only).is_satisfied());
+    let current = base.with_model_version("models/IPcam-general.onnx", res.version);
+    assert!(needed(&cfg, &hw, &current).is_satisfied());
+}
+
+/// `list-resources` names an update with the installed version and says it is not missing.
+#[test]
+fn list_resources_shows_updates() {
+    use blue_onyx_prism::resources::commands::list_resources;
+    let cfg = ipcam();
+    let hw = win(vec![intel_igpu(0)]);
+    let inst = files_only(&cfg)
+        .with_resources(&[OPENVINO_RUNTIME_ID])
+        .with_version(OPENVINO_RUNTIME_ID, "2025.1.0");
+    let text = list_resources(&cfg, &hw, &inst);
+    let row = text
+        .lines()
+        .find(|l| l.trim_start().starts_with(OPENVINO_RUNTIME_ID))
+        .unwrap();
+    assert!(
+        row.contains(&format!(
+            "installed 2025.1.0, {} available",
+            catalog::OPENVINO_VERSION
+        )),
+        "{row}"
+    );
+    assert!(text.contains("replaces the installed 2025.1.0"), "{text}");
+    assert!(text.contains("1 update(s)"), "{text}");
+    assert!(!text.contains("Missing"), "{text}");
+    let staged = inst.with_staged(OPENVINO_RUNTIME_ID, catalog::OPENVINO_VERSION);
+    let text = list_resources(&cfg, &hw, &staged);
+    assert!(text.contains("downloaded for the next start"), "{text}");
+    assert!(
+        text.contains("Everything the config needs is installed."),
+        "{text}"
+    );
 }
 
 #[test]
