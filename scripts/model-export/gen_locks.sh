@@ -16,7 +16,7 @@
 #   identical (checked below). macOS x86_64 has no PyTorch 2.14 wheels and is not supported.
 set -eu
 UV="$1"
-EXCLUDE_NEWER="${2:-2026-09-26T00:00:00Z}"
+EXCLUDE_NEWER="${2:-2026-10-24T00:00:00Z}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 IN="$DIR/../requirements-model-export.txt"
 OUT="$DIR/locks"
@@ -25,10 +25,14 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$OUT"
 
 compile() { # <python-platform> <output> [extra args]
+  # Resolved into a new file, then copied: uv prefers the versions already in an existing output
+  # file, so writing over the old lock would keep its versions and a new cutoff would change nothing.
   t="$1"; o="$2"; shift 2
+  f="$TMP/fresh-$(basename "$o")"
   MACOSX_DEPLOYMENT_TARGET=14.0 UV_NO_CONFIG=1 UV_CACHE_DIR="$TMP/cache" "$UV" pip compile "$IN" \
     --python-version 3.11 --python-platform "$t" --generate-hashes --only-binary :all: \
-    --exclude-newer "$EXCLUDE_NEWER" --no-header --no-annotate -q -o "$o" "$@"
+    --exclude-newer "$EXCLUDE_NEWER" --no-header --no-annotate -q -o "$f" "$@"
+  cp "$f" "$o"
 }
 
 compile aarch64-apple-darwin "$OUT/macos-arm64.txt"

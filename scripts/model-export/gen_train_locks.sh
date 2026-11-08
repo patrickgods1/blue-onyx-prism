@@ -20,7 +20,7 @@
 #   Blackwell (10.0, 12.0), which the 12.6 builds have no kernels for; needs a CUDA 13 driver.
 set -eu
 UV="$1"
-EXCLUDE_NEWER="${2:-2026-10-08T00:00:00Z}"
+EXCLUDE_NEWER="${2:-2026-10-24T00:00:00Z}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 IN="$DIR/../requirements-model-train.txt"
 OUT="$DIR/locks"
@@ -29,10 +29,14 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$OUT"
 
 compile() { # <python-platform> <output> [extra args]
+  # Resolved into a new file, then copied: uv prefers the versions already in an existing output
+  # file, so writing over the old lock would keep its versions and a new cutoff would change nothing.
   t="$1"; o="$2"; shift 2
+  f="$TMP/fresh-$(basename "$o")"
   MACOSX_DEPLOYMENT_TARGET=14.0 UV_NO_CONFIG=1 UV_CACHE_DIR="$TMP/cache" "$UV" pip compile "$IN" \
     --python-version 3.11 --python-platform "$t" --generate-hashes --only-binary :all: \
-    --exclude-newer "$EXCLUDE_NEWER" --no-header --no-annotate -q -o "$o" "$@"
+    --exclude-newer "$EXCLUDE_NEWER" --no-header --no-annotate -q -o "$f" "$@"
+  cp "$f" "$o"
 }
 
 compile aarch64-apple-darwin "$OUT/train-macos-arm64.txt"
