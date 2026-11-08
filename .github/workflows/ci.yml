@@ -192,3 +192,7 @@ jobs:
           command: check advisories bans licenses sources
       - name: THIRD_PARTY_LICENSES.md matches Cargo.lock
         run: python3 -I scripts/gen_third_party.py --check
+      # Pins that must agree: requirements vs hashed locks, catalog vs requirements, every workflow's
+      # Rust vs rust-toolchain.toml, the Dockerfile's OpenVINO image vs the catalog; deny.toml review dates.
+      - name: Dependency pins consistent
+        run: python3 -I scripts/ci/check_deps.py consistency
