@@ -515,10 +515,50 @@ struct ModelChoice {
 
 struct TestResult {
     summary: String,
+    /// The sentence shown when nothing was found ([`no_objects_line`]); empty otherwise.
+    none_found: String,
+    /// Its hint (how to see weaker boxes); empty when there is none.
+    none_hint: &'static str,
     /// `data:image/jpeg;base64,...` of the annotated image; empty when it could not be drawn.
     image_data_uri: String,
     json: String,
 }
+
+/// A threshold as the Test page shows it: two decimals, three when they matter (0.375).
+fn fmt_threshold(t: f32) -> String {
+    let s = format!("{t:.3}");
+    s.strip_suffix('0').map(str::to_string).unwrap_or(s)
+}
+
+/// The Test page's sentence for a detection that found nothing: the threshold it ran at, as the
+/// worker reads it ([`crate::worker::effective_threshold`]: the form's Min confidence when it
+/// is set, a value over 1 being a percentage, else the model's `model` threshold, with its
+/// `night` threshold named when it differs), and how to see weaker boxes ([`LOWER_HINT`],
+/// unless the threshold is already the floor). `assets/test.js` `noneLine` is its twin.
+fn no_objects_line(min_confidence: &str, model: f32, night: Option<f32>) -> (String, &'static str) {
+    use crate::worker::effective_threshold;
+    let asked = min_confidence.trim().parse::<f32>().unwrap_or(0.0);
+    let t = effective_threshold(asked, model);
+    let from_request = t != effective_threshold(0.0, model);
+    let night = night
+        .filter(|_| !from_request)
+        .map(|n| effective_threshold(asked, n))
+        .filter(|n| fmt_threshold(*n) != fmt_threshold(t));
+    let mut line = format!("No objects at or above {}", fmt_threshold(t));
+    if let Some(n) = night {
+        line.push_str(&format!(" ({} on night and IR frames)", fmt_threshold(n)));
+    }
+    line.push('.');
+    let hint = if t.min(night.unwrap_or(t)) > crate::model::nms::MIN_CONFIDENCE_FLOOR {
+        LOWER_HINT
+    } else {
+        ""
+    };
+    (line, hint)
+}
+
+/// The hint under "No objects at or above ..." (also in `assets/test.js`).
+const LOWER_HINT: &str = "Lower Min confidence to see weaker detections.";
 
 #[derive(Template)]
 #[template(path = "test.html")]
@@ -526,6 +566,9 @@ struct TestTemplate {
     nav: &'static str,
     version: &'static str,
     models: Vec<ModelChoice>,
+    /// `{"<model>": {"t": <threshold now>, "night": <night_threshold>|null}}`: what test.js
+    /// names when a detection finds nothing (the select's `data-thresholds`).
+    thresholds: String,
     min_confidence: String,
     error: Option<String>,
     result: Option<TestResult>,
@@ -554,11 +597,25 @@ fn test_template(
             is_default: n == default,
             value: n,
         })
+        .collect::<Vec<_>>();
+    let thresholds: serde_json::Map<String, serde_json::Value> = models
+        .iter()
+        .filter_map(|m| {
+            let h = state.registry.by_name(&m.value)?;
+            // Three decimals, as shown (an f32 0.21 would read 0.20999999344348907).
+            let round = |t: f32| (f64::from(t) * 1000.0).round() / 1000.0;
+            let t = serde_json::json!({
+                "t": round(h.effective_threshold().0),
+                "night": h.live().night_threshold.map(round),
+            });
+            Some((m.value.clone(), t))
+        })
         .collect();
     TestTemplate {
         nav: "test",
         version: crate::VERSION,
         models,
+        thresholds: serde_json::Value::Object(thresholds).to_string(),
         min_confidence,
         error,
         result,
@@ -622,6 +679,15 @@ pub(super) async fn test_submit(State(state): State<Arc<AppState>>, upload: Uplo
     } else {
         format!("Detection failed: {}", resp.message)
     };
+    let (none_found, none_hint) = if resp.success && resp.predictions.is_empty() {
+        no_objects_line(
+            &min_conf,
+            handle.effective_threshold().0,
+            handle.live().night_threshold,
+        )
+    } else {
+        (String::new(), "")
+    };
     let mut image_data_uri = String::new();
     if resp.success {
         let preds = resp.predictions.clone();
@@ -649,6 +715,8 @@ pub(super) async fn test_submit(State(state): State<Arc<AppState>>, upload: Uplo
         None,
         Some(TestResult {
             summary,
+            none_found,
+            none_hint,
             image_data_uri,
             json,
         }),
@@ -1244,6 +1312,76 @@ mod tests {
                 .unwrap()
                 .contains("Unknown model &#39;zzz&#39;")
         );
+    }
+
+    #[test]
+    fn no_objects_line_names_the_threshold_that_ran() {
+        // The model's own threshold, its night one when it differs.
+        assert_eq!(
+            super::no_objects_line("", 0.5, None),
+            ("No objects at or above 0.50.".into(), super::LOWER_HINT)
+        );
+        assert_eq!(
+            super::no_objects_line(" ", 0.375, Some(0.3)).0,
+            "No objects at or above 0.375 (0.30 on night and IR frames)."
+        );
+        assert_eq!(
+            super::no_objects_line("", 0.4, Some(0.4)).0,
+            "No objects at or above 0.40."
+        );
+        // The form's value wins over both, read like the worker reads it.
+        assert_eq!(
+            super::no_objects_line("0.3", 0.5, Some(0.2)).0,
+            "No objects at or above 0.30."
+        );
+        assert_eq!(
+            super::no_objects_line("45", 0.5, None).0,
+            "No objects at or above 0.45."
+        );
+        assert_eq!(
+            super::no_objects_line("500", 0.5, None).0,
+            "No objects at or above 0.50."
+        );
+        assert_eq!(
+            super::no_objects_line("abc", 0.6, None).0,
+            "No objects at or above 0.60."
+        );
+        // At the floor there is nothing lower to try.
+        assert_eq!(
+            super::no_objects_line("0.001", 0.5, None),
+            ("No objects at or above 0.01.".into(), "")
+        );
+    }
+
+    #[test]
+    fn test_page_says_when_nothing_was_found() {
+        let state = test_state();
+        let result = |none_found: &str, none_hint: &'static str| super::TestResult {
+            summary: "0 object(s) from model 'ipcam-general'".into(),
+            none_found: none_found.into(),
+            none_hint,
+            image_data_uri: String::new(),
+            json: "{}".into(),
+        };
+        let (line, hint) = super::no_objects_line("", 0.5, None);
+        let html = super::test_template(&state, "", String::new(), None, Some(result(&line, hint)))
+            .render()
+            .unwrap();
+        assert!(
+            html.contains(
+                "<p class=\"zero-state\">No objects at or above 0.50. <span class=\"muted\">Lower Min confidence to see weaker detections.</span></p>"
+            ),
+            "{html}"
+        );
+        assert_csp_clean("/test (no objects)", &html);
+        // test.js reads each model's threshold from the select.
+        assert!(html.contains("data-thresholds=\"{"), "{html}");
+        assert!(html.contains("ipcam-general"), "{html}");
+        // An answer with boxes has no such line.
+        let html = super::test_template(&state, "", String::new(), None, Some(result("", "")))
+            .render()
+            .unwrap();
+        assert!(!html.contains("zero-state"), "{html}");
     }
 
     fn logs_state() -> Arc<AppState> {

@@ -61,6 +61,30 @@
       ctx.fillText(text, p.x_min + 4, ty + 3);
     });
   }
+  // `effective_threshold` of src/worker/mod.rs: a request value over 1 is a percentage, over 100
+  // it is ignored; never under the 0.01 floor.
+  var FLOOR = 0.01;
+  function effective(asked, configured) {
+    var t = asked > 0 && isFinite(asked) ? (asked <= 1 ? asked : asked <= 100 ? asked / 100 : configured) : configured;
+    return isFinite(t) && t >= FLOOR ? t : FLOOR;
+  }
+  function fmtT(t) { return t.toFixed(3).replace(/0$/, ""); }
+  // Twin of `no_objects_line` (src/server/pages.rs): what an answer with no predictions says,
+  // [sentence, hint]. The model's thresholds come from the select's data-thresholds.
+  function noneLine(model) {
+    var field = form.querySelector('[name="min_confidence"]'), asked = parseFloat(field ? field.value : "");
+    var map = {}, sel = document.getElementById("model");
+    try { map = JSON.parse((sel && sel.dataset.thresholds) || "{}") || {}; } catch (e) { map = {}; }
+    var m = map[model], t, night = null;
+    if (asked > 0 && asked <= 100) t = effective(asked, 0);
+    else if (m && typeof m.t === "number") {
+      t = effective(0, m.t);
+      if (typeof m.night === "number") night = effective(0, m.night);
+    } else return ["No objects found.", "Lower Min confidence to see weaker detections."];
+    if (night !== null && fmtT(night) === fmtT(t)) night = null;
+    var line = "No objects at or above " + fmtT(t) + (night !== null ? " (" + fmtT(night) + " on night and IR frames)" : "") + ".";
+    return [line, Math.min(t, night === null ? t : night) > FLOOR ? "Lower Min confidence to see weaker detections." : ""];
+  }
   function show(j, model) {
     var err = document.getElementById("client-error");
     document.getElementById("client-json").textContent = JSON.stringify(j, null, 2);
@@ -83,6 +107,15 @@
         });
         tbody.appendChild(tr);
       });
+      if (!(j.predictions || []).length) {
+        var none = noneLine(model), tr = document.createElement("tr"), td = document.createElement("td");
+        td.colSpan = 3; td.className = "zero-state"; td.textContent = none[0];
+        if (none[1]) {
+          var hint = document.createElement("span"); hint.className = "muted"; hint.textContent = " " + none[1];
+          td.appendChild(hint);
+        }
+        tr.appendChild(td); tbody.appendChild(tr);
+      }
     }
     document.getElementById("client-result").hidden = false;
     var img = new Image();

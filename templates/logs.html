@@ -33,6 +33,6 @@
   </div>
 </div>
 <p class="muted">The last {{ capacity }} events this process logged at the server log level (newest last). Live JSON: <a href="/logs.json"><code>/logs.json?after=&lt;seq&gt;&amp;level=&lt;min&gt;</code></a>.</p>
-<div class="logview" id="logview" data-capacity="{{ capacity }}" role="log" aria-live="polite"><noscript><p class="muted">The log view needs JavaScript; see <a href="/logs.json">/logs.json</a>.</p></noscript></div>
+<div class="logview" id="logview" data-capacity="{{ capacity }}" role="log" aria-live="polite" aria-label="Log" tabindex="0"><noscript><p class="muted">The log view needs JavaScript; see <a href="/logs.json">/logs.json</a>.</p></noscript></div>
 <script src="/static/logs.js?v={{ version }}"></script>
 {% endblock %}

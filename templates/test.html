@@ -9,7 +9,7 @@
     <img id="preview" alt="selected image preview" hidden>
   </div>
   <label>Model
-    <select name="model" id="model">
+    <select name="model" id="model" data-thresholds="{{ thresholds }}">
     {% for m in models %}
       <option value="{{ m.value }}"{% if m.selected %} selected{% endif %}>{{ m.value }}{% if m.is_default %} (default){% endif %}</option>
     {% endfor %}
@@ -38,6 +38,7 @@
 <section id="server-result">
 <h2>Result</h2>
 <p>{{ r.summary }}</p>
+{% if !r.none_found.is_empty() %}<p class="zero-state">{{ r.none_found }}{% if !r.none_hint.is_empty() %} <span class="muted">{{ r.none_hint }}</span>{% endif %}</p>{% endif %}
 {% if !r.image_data_uri.is_empty() %}<img class="result" src="{{ r.image_data_uri }}" alt="annotated result">{% endif %}
 <details open><summary>Response JSON</summary>
 <pre>{{ r.json }}</pre>
