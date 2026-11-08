@@ -19,6 +19,7 @@ cargo run -- download-models --name IPcam-general
 cargo run -- add-model --path <file|dir> [--name n] [--family rfdetr] [--classes c.yaml]   # custom model (config page: Add a model by path)
 cargo run -- fetch [--for-config] [--resource <id>] [--all-for-platform] [--allow-large]   # pre-download what the config needs
 cargo run -- list-resources [--check-urls]   # installed / needed / available; --check-urls checks every pinned URL (weekly CI)
+python3 -I scripts/ci/check_deps.py consistency|upstream|audit   # pins agree (CI) / newer upstream / OSV advisories of the Python locks (weekly CI issues; docs/RELEASE_CHECKLIST.md)
 cargo run -- fetch --resource model:yolo26s --allow-large   # on-demand model export (pinned uv + Python env in <data root>/tools)
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu

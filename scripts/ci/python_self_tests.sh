@@ -14,4 +14,5 @@ PY=${PYTHON:-python}
 "$PY" -I scripts/import_footage.py --self-test
 "$PY" -I scripts/research/eval_autolabel.py --self-test
 "$PY" -I packaging/release/ci_green.py --self-test
+"$PY" -I scripts/ci/check_deps.py --self-test
 echo "python self-tests ok"

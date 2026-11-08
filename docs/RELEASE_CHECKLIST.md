@@ -5,6 +5,34 @@ native installers: MSI, deb, rpm and pkg, with a `.sha256` each) and published b
 draft it creates. Each build job installs, checks and uninstalls its installers on the runner
 (`packaging/smoke-test-installers.sh`); a failed smoke test fails the release.
 
+## Keeping dependencies current
+
+The service never fetches "latest": every download is a pin (URL, size, SHA-256) in
+`src/resources/catalog/`, and the Python environments install hashed locks. Updates reach users as
+reviewed pin bumps in a release; an existing install sees the new version as an update (a loaded
+runtime is swapped in at the next start). Two weekly jobs (`.github/workflows/check-urls.yml`) say
+when a bump is due, each in one issue kept current:
+
+- **Upstream updates available** (`scripts/ci/check_deps.py upstream`): catalog runtimes, uv, VC++
+  runtime and the Python pins with a newer release. Pins held back on purpose (`HOLDS`: ONNX Runtime
+  1.24.x for DirectML, cuDNN < 9.11 for Pascal) are listed apart.
+- **Dependency advisories**: `cargo deny check advisories` on `main` and OSV advisories against every
+  Python lock (`check_deps.py audit`).
+
+Bumping a pin:
+
+1. Catalog download: take URL, size and SHA-256 from the upstream file itself (download it, hash
+   it), never from a web page alone; update every platform's part together. Run
+   `cargo run -- list-resources --check-urls` and `cargo test resources`. OpenVINO: bump the
+   Dockerfile's `openvino/ubuntu24_runtime` tag and digest in the same commit (CI checks the tag).
+2. Python: change the `==` pin in `scripts/requirements-model-export.txt` / `-train.txt`, regenerate
+   the locks with the pinned uv (`scripts/model-export/gen_locks.sh`, `gen_train_locks.sh`, a cutoff at
+   least two weeks old), and for ultralytics / transformers the catalog constants too
+   (`check_deps.py consistency` in CI checks all of these). Run a model export and a short training on
+   one platform before merging.
+3. Rust toolchain: `rust-toolchain.toml`, `Cargo.toml` `rust-version` and every workflow
+   `toolchain:` line together (CI checks they agree).
+
 ## Before tagging
 
 1. CI is green on `main` (build-test on all three OSes, including the OpenVINO CPU,
