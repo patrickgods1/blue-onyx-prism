@@ -20,7 +20,7 @@ COPY . .
 RUN cargo build --release --locked
 
 # Builder glibc 2.36 (bookworm) <= runtime glibc 2.39 (ubuntu24), so the binary runs unchanged.
-# Keep the tag equal to OPENVINO_VERSION in src/resources/catalog.rs, and update the digest with it.
+# Keep the tag equal to OPENVINO_VERSION in src/resources/catalog/mod.rs, and update the digest with it.
 # openvino/ubuntu24_runtime ships the OpenVINO runtime, Intel compute runtime (OpenCL) and sets
 # INTEL_OPENVINO_DIR, which openvino-finder honours.
 # Manifest of openvino/ubuntu24_runtime:2026.4.0 (amd64 only), read 2026-11-06.
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY --from=builder /src/target/release/blue-onyx-prism /app/blue-onyx-prism
 COPY --from=builder /src/target/release/blue-onyx-prism-benchmark /app/blue-onyx-prism-benchmark
-# ONNX Runtime (CPU flavor, pinned in src/resources/catalog.rs) so `ort:cpu` works; OpenVINO comes
+# ONNX Runtime (CPU flavor, pinned in src/resources/catalog/mod.rs) so `ort:cpu` works; OpenVINO comes
 # from the base image. NVIDIA/CUDA is not supported by this image.
 RUN /app/blue-onyx-prism setup-onnxruntime --flavor cpu --dir /app/onnxruntime
 # Default config (deploy/docker-config.json): IPcam-general on `auto`, OpenVINO from the base

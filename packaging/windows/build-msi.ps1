@@ -50,10 +50,20 @@ function Invoke-WithRetry {
 }
 
 # --- WiX tool + extensions (pinned) -----------------------------------------------------------
-if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
-    Write-Host "Installing the wix dotnet tool $WixVersion ..."
-    Invoke-WithRetry -Attempts 4 -DelaySeconds 20 -Command dotnet -Arguments "tool", "install", "--global", "wix", "--version", $WixVersion
-    $env:PATH = "$env:PATH;$(Join-Path $env:USERPROFILE '.dotnet\tools')"
+# A wix of another version is replaced, not accepted: the pin is what the MSI is built with.
+$wixTools = Join-Path $env:USERPROFILE '.dotnet\tools'
+if ($env:PATH -notlike "*$wixTools*") { $env:PATH = "$env:PATH;$wixTools" }
+$wixHave = $null
+if (Get-Command wix -ErrorAction SilentlyContinue) {
+    # "7.0.0+<sha>" -> "7.0.0"
+    $wixHave = (((& wix --version) | Select-Object -First 1) -split '\+')[0].Trim()
+}
+if ($wixHave -ne $WixVersion) {
+    Write-Host "Installing the wix dotnet tool $WixVersion (found '$wixHave') ..."
+    # `update` installs when absent and replaces another version (up or down).
+    Invoke-WithRetry -Attempts 4 -DelaySeconds 20 -Command dotnet -Arguments "tool", "update", "--global", "wix", "--version", $WixVersion
+    $wixNow = (((& wix --version) | Select-Object -First 1) -split '\+')[0].Trim()
+    if ($wixNow -ne $WixVersion) { throw "wix is $wixNow after the update, expected $WixVersion (another wix earlier on PATH?)." }
 }
 $have = (& wix extension list -g -acceptEula wix7 2>$null) -join "`n"
 foreach ($e in $Extensions) {
@@ -80,7 +90,7 @@ foreach ($line in (Get-Content -LiteralPath (Join-Path $RepoRoot "LICENSE"))) {
 
 # --- Visual C++ runtime, installed next to the exes (stage-vcruntime.ps1, in obj/) ---------------
 $vcRuntime = Join-Path $obj "vcruntime"
-& (Join-Path $PSScriptRoot "stage-vcruntime.ps1") -Dest $vcRuntime
+& (Join-Path $PSScriptRoot "stage-vcruntime.ps1") -Dest $vcRuntime -Cli (Join-Path $BinDir "blue-onyx-prism.exe")
 
 # --- Build -------------------------------------------------------------------------------------
 $out = [System.IO.Path]::GetFullPath($OutFile)

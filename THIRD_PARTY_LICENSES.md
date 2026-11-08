@@ -9,7 +9,7 @@ files are kept next to their libraries in the archive.
 
 ### OpenVINO (`openvino/`)
 
-- Intel OpenVINO toolkit runtime 2026.4.0 (pinned as `OPENVINO_VERSION` in `src/resources/catalog.rs`).
+- Intel OpenVINO toolkit runtime 2026.4.0 (pinned as `OPENVINO_VERSION` in `src/resources/catalog/mod.rs`).
 - Copyright (C) 2018-2026 Intel Corporation.
 - License: Apache License 2.0 (full text below).
 - Upstream: https://github.com/openvinotoolkit/openvino
@@ -41,9 +41,10 @@ files are kept next to their libraries in the archive.
 ### Microsoft Visual C++ runtime (Windows archive and MSI, next to the exes)
 
 - `vcruntime140.dll`, `vcruntime140_1.dll` and `msvcp140.dll` of the Microsoft Visual C++ 2015-2022
-  redistributable, version 14.40 or later (the release build log lists each file's version and
-  SHA-256), copied unmodified and Microsoft-signed from the build machine's Visual Studio
-  (`VC\Redist\MSVC\<version>\x64\Microsoft.VC14x.CRT`) by `packaging/windows/stage-vcruntime.ps1`.
+  redistributable, version 14.44.35211.0 (the release build log lists each file's version and
+  SHA-256), unmodified and Microsoft-signed, from the pinned `msvc-runtime` 14.44.35112 wheel on PyPI
+  (`tool:vc-runtime`, `src/resources/catalog/tools.rs`) by `packaging/windows/stage-vcruntime.ps1`,
+  not from the build machine's Visual Studio.
 - Copyright (c) Microsoft Corporation.
 - License: redistributable as part of this application under the "Distributable Code" terms of the
   Microsoft Visual Studio license terms,
@@ -75,6 +76,12 @@ own license, which the README and the Config page name before the download:
   `msvc-runtime` wheel on PyPI, redistributable under Microsoft's "Distributable Code for Visual
   Studio 2022" terms, https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution .
   Copied only next to the export's own Python under `tools/python/`.
+- uv (`tool:uv`, astral-sh/uv, only when a model export runs): MIT OR Apache-2.0; the pinned release
+  archive's binary, unmodified, under `tools/uv/`.
+- DEIMv2 source code (`tool:deimv2-src`, Intellindust-AI-Lab/DEIMv2, only when a DEIMv2 model is
+  exported): Apache-2.0 at the pinned commit add5bcd, the last Apache-2.0 release; the upstream
+  repository has since moved to the non-commercial DEIMv2 License, which also covers the weights
+  (see Models below).
 - Models: each under its own license (the blue-onyx IPcam models and RT-DETRv2 from their
   Hugging Face repositories; exported Ultralytics models AGPL-3.0; RF-DETR Apache-2.0; DEIMv2
   non-commercial). See the README, *Exporting models* and *License*.

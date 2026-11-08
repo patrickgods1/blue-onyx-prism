@@ -1,0 +1,73 @@
+# Builds the Docker image (Dockerfile, no push) and starts it: the entrypoint must accept the
+# volumes and GET /v1/status must answer 200 (a model compiled and ready). Runs only when the
+# image's inputs change, on PRs and on main. The Rust build inside the image dominates (~15 min).
+name: docker
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - "Dockerfile"
+      - ".dockerignore"
+      - "deploy/**"
+      - "src/resources/catalog/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        timeout-minutes: 25
+        run: docker build -t blue-onyx-prism:ci .
+
+      - name: Start it and wait for /v1/status
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          # Host folders for the volumes docker-compose.yml mounts; the container user is not ours.
+          mkdir -p ci-vol/cache ci-vol/config ci-vol/data
+          chmod 777 ci-vol/cache ci-vol/config ci-vol/data
+          docker run -d --name bop \
+            -p 127.0.0.1:32168:32168 \
+            -v "$PWD/ci-vol/cache:/app/cache" \
+            -v "$PWD/ci-vol/config:/app/config" \
+            -v "$PWD/ci-vol/data:/app/data" \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+            blue-onyx-prism:ci
+          ok=0
+          for i in $(seq 1 120); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:32168/v1/status || true)"
+            echo "attempt $i: /v1/status -> $code"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' bop)" != "true" ]; then
+              echo "::error::the container exited"
+              break
+            fi
+            sleep 5
+          done
+          docker logs bop 2>&1 | tail -n 100
+          [ "$ok" = 1 ] || { echo "::error::/v1/status never answered 200"; exit 1; }
+          curl -fsS http://127.0.0.1:32168/v1/status; echo
+
+      - name: Stop
+        if: always()
+        run: docker rm -f bop || true
