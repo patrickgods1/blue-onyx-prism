@@ -1428,11 +1428,16 @@ mod tests {
     /// manual command.
     #[test]
     fn retries_are_bounded_by_max_attempts() {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Held for the whole test and every connection closed unanswered. A port bound and
+        // dropped can be handed to a parallel test's `serve`, which answers any path with the
+        // same `body()`: the download then installs and that server counts a stray request.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in dead.incoming() {
+                drop(stream);
+            }
+        });
         let data = body();
         // A catalog id: the manual command only exists for what `fetch` can resolve.
         let res: &'static Resource = Box::leak(Box::new(Resource {
