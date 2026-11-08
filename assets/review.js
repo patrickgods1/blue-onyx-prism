@@ -693,17 +693,17 @@
     return Math.min(bb[2] - bb[0], bb[3] - bb[1]) * view.z / cssScale();
   }
 
-  // Half size of a handle in CSS pixels. On a small screen it follows the box, so a tiny box
-  // keeps its object in view: a sixth of the shorter side at most.
+  // Half size of a handle in CSS pixels. It follows the box, so a small box keeps its object in
+  // view: a sixth of the shorter side, 2 to 5 px (any pointer; the desktop hit area stays 7 px).
   function handleCss(bb) {
-    return touchUi.matches ? clamp(boxSideCss(bb) / 6, 1.5, HANDLE_CSS) : HANDLE_CSS;
+    return clamp(boxSideCss(bb) / 6, 2, HANDLE_CSS);
   }
 
   function handlePoints(bb) {
     var cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
     var corners = [['nw', bb[0], bb[1]], ['ne', bb[2], bb[1]], ['se', bb[2], bb[3]], ['sw', bb[0], bb[3]]];
-    var shorter = touchUi.matches ? boxSideCss(bb) : Infinity;
-    // Small screens: the side handles go first, a box under 10 CSS px has none (a drag moves it).
+    var shorter = boxSideCss(bb);
+    // Small boxes: the side handles go first, a box under 10 CSS px has none (a drag moves it).
     if (shorter < 10) return [];
     if (shorter < 24) return corners;
     return [corners[0], ['n', cx, bb[1]], corners[1], ['e', bb[2], cy],

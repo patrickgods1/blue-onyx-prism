@@ -595,4 +595,40 @@ process.stdout.write(JSON.stringify({ store: input.store, have: P.have(input.sto
         );
         assert_eq!(first["metrics"], "catalog");
     }
+
+    /// `TrainMetrics.constantOf` of `assets/train-metrics.js`: a learning rate that never changed
+    /// is one line of text instead of a flat chart; any change, or fewer than 2 epochs, keeps it.
+    #[test]
+    fn a_constant_learning_rate_is_named_not_charted() {
+        if !have_node() {
+            return;
+        }
+        const DRIVER: &str = r#"
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const ctx = vm.createContext({ window: {}, console });
+vm.runInContext(fs.readFileSync(process.env.BOP_TRAIN_METRICS, 'utf8'), ctx);
+const C = ctx.window.TrainMetrics.constantOf, F = ctx.window.TrainMetrics.format;
+const h = (lrs) => lrs.map((lr, i) => ({ epoch: i + 1, metrics: lr === null ? { map: 0.1 } : { lr, map: 0.1 } }));
+// An f32 1e-4 widened to f64 is the same rate.
+assert.strictEqual(C(h([1e-4, 0.0000999999974737875, 1e-4]), 'lr'), 1e-4);
+assert.strictEqual(F('sci', C(h([1e-4, 1e-4]), 'lr')), '1.00e-4');
+// Epochs without the key are left out; a gap is no change.
+assert.strictEqual(C(h([5e-5, null, 5e-5]), 'lr'), 5e-5);
+assert.strictEqual(C(h([1e-4, 9e-5]), 'lr'), null);
+assert.strictEqual(C(h([1e-4]), 'lr'), null);
+assert.strictEqual(C(h([1e-4, 1e-4]), 'missing'), null);
+assert.strictEqual(C([], 'lr'), null);
+"#;
+        let js = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/train-metrics.js");
+        let out = std::process::Command::new("node")
+            .args(["-e", DRIVER])
+            .env("BOP_TRAIN_METRICS", js)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "node: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

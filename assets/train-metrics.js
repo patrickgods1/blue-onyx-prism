@@ -82,6 +82,19 @@
   function seriesOf(history, key) {
     return history.map(function (h) { return { x: h.epoch, y: has((h.metrics || {})[key]) ? h.metrics[key] : null }; });
   }
+  // The one value `key` holds on every epoch that has it (to 6 significant digits, so an f32
+  // widened to f64 compares equal), else null; fewer than 2 such epochs are no constant either.
+  function constantOf(history, key) {
+    var first = null, n = 0, same = true;
+    (history || []).forEach(function (h) {
+      var v = (h.metrics || {})[key];
+      if (!has(v)) return;
+      n++;
+      if (first === null) first = v;
+      else if (+v.toPrecision(6) !== +first.toPrecision(6)) same = false;
+    });
+    return n >= 2 && same ? first : null;
+  }
   function lastTwo(history, key) {
     var vals = [];
     history.forEach(function (h) { var v = (h.metrics || {})[key]; if (has(v)) vals.push(v); });
@@ -230,11 +243,13 @@
     var best = progress.best, marks = best && has(best.epoch) ? [{ x: best.epoch, cls: "thr-mark-best", label: "best " + best.epoch }] : [];
     var ticks = C.niceTicks(x0, x1, 6).filter(function (v) { return v === Math.round(v); });
     var legend = series.map(function (s) { return { id: s.id, label: s.label, cls: s.cls, dash: s.dash }; });
+    // A phone draws a smaller viewBox, so the 11 px tick text is not scaled down to ~6 px.
+    var narrow = window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
     var blk = C.block({
       key: "tm:" + runId + ":" + kind, series: legend,
       draw: function (hidden) {
         return C.lineChart(series, {
-          title: title, desc: title + " by epoch", hidden: hidden, xMin: x0, xMax: x1, yMin: 0, yMax: ymax, xTicks: ticks, xFmt: intTick,
+          title: title, desc: title + " by epoch", hidden: hidden, width: narrow ? 320 : 560, height: narrow ? 210 : 290, xMin: x0, xMax: x1, yMin: 0, yMax: ymax, xTicks: ticks, xFmt: intTick,
           yFmt: yFmt, yHover: val,
           xName: "epoch", xLabel: "Epoch", yLabel: pct ? "%" : "", marks: marks, pointDots: history.length < 40, hover: "x", left: pct ? 44 : 56
         });
@@ -414,12 +429,19 @@
     // Learning rate on its own axis (1e-4 against a loss of 3 would be a flat line at zero): the
     // axis still starts at 0 and niceMax rounds tiny maxima fine (1e-4 -> ticks 0, 2e-5 .. 1e-4),
     // the tick text is scientific so 0.00002 does not crowd the margin.
+    // A rate that never changed is one line of text, not a flat chart.
     var lrKeys = history.length >= 2 && keys.indexOf("lr") >= 0 ? ["lr"] : [];
+    var lrFlat = lrKeys.length ? constantOf(history, "lr") : null;
+    if (lrFlat !== null) lrKeys = [];
     var c3 = chart(runId, "lr", "Learning rate", lrKeys, history, info, progress, shortSci, false, function (v) { return format("sci", v); });
     if (c1) charts.appendChild(c1);
     if (c2) charts.appendChild(c2);
     if (c3) charts.appendChild(c3);
     if (charts.childNodes.length) host.appendChild(charts);
+    if (lrFlat !== null) {
+      var note = el("p", "muted tr-chart-note", "Learning rate " + format("sci", lrFlat) + ", constant over every epoch.");
+      host.appendChild(note);
+    }
 
     var tw = table(runId, history, cols, info, progress);
     if (tw) host.appendChild(tw);
@@ -468,6 +490,6 @@
 
   window.TrainMetrics = {
     render: render, refresh: refresh, signature: signature, format: format, infoMap: infoMap, keysOf: keysOf,
-    overfitting: overfitting, shortSci: shortSci, poll: { have: pollHave, merge: pollMerge }
+    overfitting: overfitting, shortSci: shortSci, constantOf: constantOf, poll: { have: pollHave, merge: pollMerge }
   };
 })();

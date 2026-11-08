@@ -1,6 +1,6 @@
 // Dataset tab (/train/dataset): the Export form (POST /v1/review/export), the X-AnyLabeling import
 // (POST /v1/review/import) and the Classes card (POST /v1/review/classes, the class picker of
-// class-picker.js: the list in order, "don't want (hide + reject)" per class =
+// class-picker.js: the list in order, "hide" (don't want: hide + reject) per class =
 // collect.hidden_classes). A class save that leaves reviewed frames with accepted boxes of unwanted
 // classes asks, then POST /v1/review/reject-unwanted-reviewed. After an export the Exports and
 // coverage cards are read again from the page's own URL. No inline handlers (CSP); server values
@@ -229,7 +229,8 @@
         cb.setAttribute('aria-label', 'Do not want ' + entry.name + ': hide it in Review and reject its pending boxes');
         cb.addEventListener('change', function () { hideSet[entry.name] = cb.checked; });
         lab.appendChild(cb);
-        lab.appendChild(document.createTextNode("don't want (hide + reject)"));
+        lab.title = "Don't want " + entry.name + ": hide it in Review and reject its pending boxes";
+        lab.appendChild(document.createTextNode('hide'));
         chip.appendChild(lab);
       }
     });
