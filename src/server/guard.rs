@@ -1,5 +1,6 @@
-//! Request guards of the router: the admin routes' cross-site check (SV-01), their `Host` check
-//! against DNS rebinding and the security response headers (SV-09).
+//! Request guards of the router: the network rule at accept and on every request ([`admit`],
+//! [`network_rule`]; the rule itself is [`super::network`]), the admin routes' cross-site check
+//! (SV-01), their `Host` check against DNS rebinding and the security response headers (SV-09).
 //!
 //! # Cross-site requests (CSRF)
 //!
@@ -51,7 +52,7 @@
 //! must come from `/static/`), `charset=utf-8` to HTML without one, and `Cache-Control:
 //! no-store` to JSON that sets no cache policy of its own.
 
-use super::{MessageTemplate, render, wants_html};
+use super::{MessageTemplate, network, render, wants_html};
 use crate::sync::LockExt;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -160,8 +161,10 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
 
 /// Headers a reverse proxy adds: a request carrying one did not come straight from a browser on
 /// this machine, whatever the TCP peer is. Read in that direction only: the header takes the
-/// trust of a loopback peer away and its value is never believed, since any client can send it.
-const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
+/// trust of a loopback peer away, and an address in it can only get the request refused
+/// ([`super::network::forwarding_problem`]), never let in, since any client can send it. The one
+/// list of these names.
+pub(super) const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "forwarded", "x-real-ip"];
 
 /// The first [`PROXY_HEADERS`] entry the request carries.
 pub(super) fn proxy_header(headers: &HeaderMap) -> Option<&'static str> {
@@ -263,6 +266,84 @@ impl WarnThrottle {
 
 /// The refused-`Host` warnings of this process.
 static HOST_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+
+/// Refusals of the network rule ([`network_rule`]) logged by this process.
+static NETWORK_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+
+/// Connections dropped at accept ([`admit`]) logged by this process.
+static ACCEPT_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+
+/// At most one log line per this long for each of [`NETWORK_WARNS`] and [`ACCEPT_WARNS`]: a
+/// scanner would otherwise write one per connection.
+const NETWORK_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Whether the accept loop serves a connection from `peer`: [`network::allowed`] with the
+/// current config's `allowed_networks`. A refused one is logged (throttled) and the caller drops
+/// it, before anything is read or written.
+pub(super) fn admit(peer: std::net::SocketAddr, shared: &super::Shared) -> bool {
+    let extra = shared.current().config_read().extra_networks();
+    if network::allowed(peer.ip(), &extra) {
+        return true;
+    }
+    let dropped = ACCEPT_WARNS
+        .lock_recover()
+        .allow_at(Instant::now(), NETWORK_WARN_EVERY);
+    if let Some(dropped) = dropped {
+        warn!(
+            peer = %peer.ip().to_canonical(),
+            dropped,
+            "closed a connection from outside the local network (this server answers loopback, \
+             private and link-local addresses only); if this client should be served, add its \
+             network to allowed_networks in the config file"
+        );
+    }
+    false
+}
+
+/// Outermost middleware of the router (inside the panic catcher and the security headers): a
+/// request with no peer, from a peer outside [`network::allowed`], or with a forwarding header
+/// that names an address outside it or cannot be read, gets a 403 with a short JSON body
+/// ([`network::refusal_message`]) before any route, credential or body is looked at. Every route,
+/// the detection API included. `allowed_networks` is read per request, so a change applies at
+/// once.
+pub(super) async fn network_rule(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<super::AppState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let extra = state.config_read().extra_networks();
+    let peer = super::peer_of(&req).map(|a| a.ip());
+    let Some(why) = network::refusal(peer, req.headers(), &extra) else {
+        return next.run(req).await;
+    };
+    let dropped = NETWORK_WARNS
+        .lock_recover()
+        .allow_at(Instant::now(), NETWORK_WARN_EVERY);
+    if let Some(dropped) = dropped {
+        let who = peer.map_or_else(|| "unknown".to_string(), |ip| ip.to_canonical().to_string());
+        let (header, problem) = match why {
+            network::Refusal::Header {
+                header, problem, ..
+            } => (header, Some(problem)),
+            _ => ("", None),
+        };
+        warn!(
+            peer = %who,
+            path = %req.uri().path(),
+            header,
+            ?problem,
+            dropped,
+            "refused a request from outside the local network; if this client should be \
+             served, add its network to allowed_networks in the config file"
+        );
+    }
+    let msg = network::refusal_message(why);
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
+    )
+        .into_response()
+}
 
 /// 403 for a `host` the admin routes do not answer under: an HTML page for browsers, else
 /// JSON. `host` comes from [`foreign_host`].

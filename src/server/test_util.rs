@@ -74,15 +74,22 @@ pub(super) async fn call(
 }
 
 pub(super) const LOCAL: &str = "127.0.0.1:50000";
+/// Another machine on the local network (RFC 1918), so inside the network rule.
 pub(super) const REMOTE: &str = "10.0.0.5:50000";
+/// A machine on the internet (TEST-NET-3), outside the network rule.
+pub(super) const PUBLIC: &str = "203.0.113.5:50000";
 
 /// The `Host` every real HTTP/1.1 client sends; added by [`from_peer`] when a test did not.
 pub(super) const TEST_HOST: &str = "localhost:32168";
 
-/// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one, with
-/// a `Host` header when it has none (hyper's requests always carry one).
+/// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one, over
+/// [`Transport::Tls`] unless it is already marked, with a `Host` header when it has none
+/// (hyper's requests always carry one).
 pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
     let ext = req.extensions_mut();
+    if ext.get::<Transport>().is_none() {
+        ext.insert(Transport::Tls);
+    }
     if ext
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .is_none()
@@ -103,7 +110,7 @@ pub(super) async fn listed(app: &Router) -> Vec<String> {
     let req = Request::get("/v1/vision/custom/list")
         .body(Body::empty())
         .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(from_peer(req, LOCAL)).await.unwrap();
     let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();

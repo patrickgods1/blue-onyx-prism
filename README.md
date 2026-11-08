@@ -309,6 +309,7 @@ it; every key can also be set in the file.
 | `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
 | `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Remote access](#remote-access) |
+| `allowed_networks` | `[]` | Networks served besides the local network (loopback, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10`), e.g. a VPN: `["100.64.0.0/10"]` for Tailscale. Every other client is refused on every route. List of up to 32 CIDRs (a bare address = one address), stored in network form; `/0` is refused. Applies: at once. UI: read-only; set it in the config file, see [Local network only](#local-network-only) |
 | `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout). Integer 1-3600. Applies: at once. UI: yes |
 | `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time. Integer 0-1024. Applies: restart. UI: yes |
 | `device` | `"auto"` | Device spec (`auto`, `openvino:gpu`, `ort:cuda`, ..., or legacy `GPU`/`CPU`); see [Hardware and device selection](#hardware-and-device-selection). Falls back to CPU when the device cannot run. Applies: restart. UI: yes |
@@ -808,6 +809,35 @@ the most uploads allowed in progress, `body_timeout`: an upload took over 10 s t
 `log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
 TLS, and clients on this machine need no login: do not expose the port beyond your LAN.
 
+### Local network only
+
+The service answers its local network and nothing else, on every route (the detection API
+included): loopback, the private IPv4 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`),
+link-local (`169.254.0.0/16`, `fe80::/10`) and IPv6 unique-local addresses (`fc00::/7`). An IPv4
+address mapped into IPv6 counts as IPv4. Everything else is refused, including NAT64
+(`64:ff9b::/96`, it carries public IPv4 addresses), the old site-local `fec0::/10` and the carrier
+range `100.64.0.0/10` that Tailscale uses. A connection from outside is closed as soon as it is
+accepted, before anything is read; a request that still gets in (e.g. through a reverse proxy)
+gets **403** with a short JSON answer naming its address. Refusals are logged at most once a
+minute, with a count of the ones left out.
+
+- To serve another network of your own, such as a VPN, list it in `allowed_networks` in the
+  config file (`"allowed_networks": ["100.64.0.0/10"]` for Tailscale; up to 32 CIDRs, a bare
+  address is one address, `/0` is refused). It applies at once, also to open connections' next
+  requests. The Config page shows it but cannot change it: whoever could widen it from a page
+  could open the server to the internet.
+- `X-Forwarded-For`, `Forwarded` and `X-Real-IP` only ever refuse: when one names an address
+  outside the rule (every entry of every such header counts), or holds `unknown`, an obfuscated
+  `_name` or anything that is no address, the request gets 403. A private address in them never
+  lets a request in, since any client can send one.
+- **Docker:** Docker Desktop, rootless Docker and the userland proxy replace the client's address
+  with a private bridge address, so there the rule cannot tell your LAN from the internet, and
+  every client shares one address for the wrong-token limit. The published port is the real gate
+  there: bind it to `127.0.0.1` or to a LAN address of the host (`-p 192.168.1.10:32168:32168`),
+  never `0.0.0.0`, when a router forwards ports to that machine.
+- A reverse proxy that adds no forwarding header looks like its own address, so its clients pass
+  as the proxy's network. Make it add one (see below).
+
 ### Remote access
 
 Blue Iris may run on another machine, so the service listens on every interface by default
@@ -835,8 +865,9 @@ static files.
     (`bop_admin`, `HttpOnly`, `SameSite=Strict`) lasts until the browser closes; *Sign out* on the
     Config page, or `POST /logout`, clears it. Scripts send `Authorization: Bearer <token>`, and
     without one get a JSON 401. `GET /v1/config` gives a client without the token the minimal answer.
-  - Five wrong tokens in a minute from one address answer **429** with `Retry-After`, the right
-    token included, until the oldest of the five is a minute old.
+  - Five wrong tokens in a minute from one address (an IPv6 client by its /64, which it can pick
+    any address of) answer **429** with `Retry-After`, the right token included, until the oldest
+    of the five is a minute old.
   - `blue-onyx-prism admin-token --rotate`, or *Rotate token* on the Config page from this machine,
     replaces it. A running service uses the new token at once, and every signed-in browser has to
     sign in again. If the file is missing or damaged, remote peers are refused until you rotate.

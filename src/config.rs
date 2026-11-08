@@ -648,6 +648,13 @@ pub struct Config {
     /// goes here, also to sign in from a browser under that name. Stored lower-case. Applies
     /// at once.
     pub allowed_hosts: Vec<String>,
+    /// Networks (CIDR such as `100.64.0.0/10`, a bare address = `/32` or `/128`; at most
+    /// [`MAX_ALLOWED_NETWORKS`]) this server answers besides its local network (loopback, the
+    /// private IPv4 ranges, link-local, IPv6 unique-local): e.g. a VPN such as Tailscale. Every
+    /// other client is refused on every route, before anything is read (`server::network`).
+    /// Config file only, never web-editable ([`crate::config_form::FILE_ONLY_SETTINGS`]).
+    /// Stored in network form (`192.168.5.7/24` -> `192.168.5.0/24`). Applies at once.
+    pub allowed_networks: Vec<String>,
     /// How long a request may wait in the queue + processing before it is dropped (the only
     /// request timeout; the HTTP handler waits this plus a 500 ms grace for the worker).
     pub request_timeout_secs: u64,
@@ -939,6 +946,7 @@ impl Default for Config {
             bind_address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             allow_remote_admin: false,
             allowed_hosts: Vec::new(),
+            allowed_networks: Vec::new(),
             request_timeout_secs: 15,
             worker_queue_size: 0,
             device: "auto".to_string(),
@@ -1125,6 +1133,7 @@ impl Config {
             }
         }
         self.allowed_hosts = hosts;
+        self.allowed_networks = normalized_networks(&self.allowed_networks);
         self.confidence_threshold = round_threshold(self.confidence_threshold);
         for m in &mut self.models {
             m.confidence_threshold = m.confidence_threshold.map(round_threshold);
@@ -1658,6 +1667,7 @@ impl Config {
         }
         check_range("port", self.port, 1, u16::MAX)?;
         validate_allowed_hosts(&self.allowed_hosts)?;
+        validate_allowed_networks(&self.allowed_networks)?;
         check_range(
             "request_timeout_secs",
             self.request_timeout_secs,
@@ -1763,6 +1773,9 @@ pub const MAX_PATH_COMPONENT_LEN: usize = 255;
 
 /// Most entries of `allowed_hosts`.
 pub const MAX_ALLOWED_HOSTS: usize = 32;
+
+/// Most entries of `allowed_networks`.
+pub const MAX_ALLOWED_NETWORKS: usize = 32;
 
 /// The settings that name a directory and go through [`validate_dir_setting`].
 pub const DIR_SETTINGS: &[&str] = &[
@@ -1974,6 +1987,93 @@ pub fn validate_allowed_hosts(hosts: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// An `allowed_networks` entry as a network: `addr/len`, or a bare address as a single-address
+/// network. The error says what is wrong in words a config file's author can act on.
+pub fn parse_network(entry: &str) -> std::result::Result<ipnet::IpNet, String> {
+    let e = entry.trim();
+    let shown: String = e.chars().take(100).collect();
+    let net = match e.parse::<ipnet::IpNet>() {
+        Ok(net) => net,
+        Err(_) => match e.parse::<std::net::IpAddr>() {
+            Ok(ip) => ipnet::IpNet::from(ip),
+            Err(_) if e.is_empty() => {
+                return Err("an entry is empty; remove it or give a network such as \
+                            100.64.0.0/10"
+                    .to_string());
+            }
+            Err(_) => {
+                return Err(format!(
+                    "'{shown}' is not a network; give an address with its prefix length, such \
+                     as 100.64.0.0/10 or fd7a:115c:a1e0::/48, or a single address"
+                ));
+            }
+        },
+    };
+    if net.prefix_len() == 0 {
+        return Err(format!(
+            "'{shown}' covers every address, so this server would answer the whole internet; \
+             list only the networks you reach it from, such as your VPN's (100.64.0.0/10 for \
+             Tailscale)"
+        ));
+    }
+    if let ipnet::IpNet::V6(v6) = net
+        && v6.network().to_ipv4_mapped().is_some()
+        && v6.prefix_len() >= 96
+    {
+        return Err(format!(
+            "'{shown}' is an IPv4 network written as IPv6; write it as IPv4 (such as \
+             192.0.2.0/24), which also covers clients that arrive mapped into IPv6"
+        ));
+    }
+    Ok(net.trunc())
+}
+
+/// `allowed_networks` as it is stored: each entry in its network form, or trimmed when it does
+/// not parse (so [`validate_allowed_networks`] can name it), the first of equal entries only.
+pub fn normalized_networks(entries: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let n = parse_network(entry).map_or_else(|_| entry.trim().to_string(), |n| n.to_string());
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// `allowed_networks`: at most [`MAX_ALLOWED_NETWORKS`] networks ([`parse_network`]), none
+/// listed twice.
+pub fn validate_allowed_networks(networks: &[String]) -> Result<()> {
+    use anyhow::bail;
+    if networks.len() > MAX_ALLOWED_NETWORKS {
+        bail!(
+            "allowed_networks: {} networks, at most {MAX_ALLOWED_NETWORKS} are accepted; list \
+             whole networks (such as 100.64.0.0/10) rather than single addresses",
+            networks.len()
+        );
+    }
+    let mut seen = Vec::with_capacity(networks.len());
+    for entry in networks {
+        let net = parse_network(entry).map_err(|e| anyhow::anyhow!("allowed_networks: {e}"))?;
+        if seen.contains(&net) {
+            bail!("allowed_networks: {net} is listed twice; remove one of the entries");
+        }
+        seen.push(net);
+    }
+    Ok(())
+}
+
+impl Config {
+    /// The `allowed_networks` that parse ([`parse_network`]); a config that passed
+    /// [`Config::validate`] has no other kind. An entry that does not parse opens nothing.
+    pub fn extra_networks(&self) -> Vec<ipnet::IpNet> {
+        self.allowed_networks
+            .iter()
+            .filter_map(|n| parse_network(n).ok())
+            .collect()
+    }
 }
 
 /// Error of an empty models list.
@@ -2908,6 +3008,98 @@ mod tests {
         };
         c.normalize();
         assert_eq!(c.allowed_hosts, hosts(&["nas.local", "other"]));
+    }
+
+    #[test]
+    fn validate_allowed_networks_entries() {
+        let nets = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for good in [
+            nets(&[]),
+            nets(&[
+                "100.64.0.0/10",
+                "fd7a:115c:a1e0::/48",
+                "203.0.113.5",
+                "2001:db8::1",
+            ]),
+            nets(&[" 10.8.0.0/24 ", "0.0.0.0/1"]),
+        ] {
+            assert!(super::validate_allowed_networks(&good).is_ok(), "{good:?}");
+        }
+        for (bad, want) in [
+            ("", "empty"),
+            ("  ", "empty"),
+            ("0.0.0.0/0", "every address"),
+            ("::/0", "every address"),
+            ("8.8.8.8/0", "every address"),
+            ("10.0.0.0/33", "not a network"),
+            ("10.0.0/8", "not a network"),
+            ("tailscale", "not a network"),
+            ("100.64.0.0/10,", "not a network"),
+            ("http://10.0.0.1", "not a network"),
+            ("10.0.0.1:80", "not a network"),
+            ("::ffff:10.0.0.0/104", "IPv4"),
+        ] {
+            let e = super::validate_allowed_networks(&nets(&[bad])).unwrap_err();
+            let e = e.to_string();
+            assert!(e.starts_with("allowed_networks: "), "{bad}: {e}");
+            assert!(e.contains(want), "{bad}: {e}");
+        }
+        // Listed twice, in any spelling (seen before `normalize` merges them).
+        let e =
+            super::validate_allowed_networks(&nets(&["10.8.0.0/24", "10.8.0.9/24"])).unwrap_err();
+        assert!(e.to_string().contains("listed twice"), "{e}");
+        // The limit, and one past it.
+        let many: Vec<String> = (0..=super::MAX_ALLOWED_NETWORKS)
+            .map(|i| format!("10.0.{i}.0/24"))
+            .collect();
+        let (fit, _) = many.split_at(super::MAX_ALLOWED_NETWORKS);
+        assert!(super::validate_allowed_networks(fit).is_ok());
+        let e = super::validate_allowed_networks(&many).unwrap_err();
+        assert!(e.to_string().contains("at most 32"), "{e}");
+        // Through `validate`, so a config file is held to it too; old files have no key.
+        rejects(
+            |c| c.allowed_networks = vec!["0.0.0.0/0".into()],
+            "allowed_networks",
+            "every address",
+        );
+        rejects(
+            |c| c.allowed_networks = vec!["garbage".into()],
+            "allowed_networks",
+            "not a network",
+        );
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert!(c.allowed_networks.is_empty());
+        // Stored in network form, once; a bare address as a single-address network; what does
+        // not parse stays for `validate` to name.
+        let mut c = Config {
+            allowed_networks: nets(&[
+                " 192.168.5.7/24 ",
+                "192.168.5.0/24",
+                "203.0.113.5",
+                "2001:DB8::1",
+                "nope",
+            ]),
+            ..Config::default()
+        };
+        c.normalize();
+        assert_eq!(
+            c.allowed_networks,
+            nets(&[
+                "192.168.5.0/24",
+                "203.0.113.5/32",
+                "2001:db8::1/128",
+                "nope"
+            ])
+        );
+        let parsed: Vec<String> = c.extra_networks().iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            parsed,
+            nets(&["192.168.5.0/24", "203.0.113.5/32", "2001:db8::1/128"])
+        );
+        // Saved and loaded back unchanged.
+        let text = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.allowed_networks, c.allowed_networks);
     }
 
     #[test]

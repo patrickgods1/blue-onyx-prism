@@ -12,7 +12,8 @@
 //! - `/login` and `/logout` are their own class of route (`server::login_routes`): a remote peer
 //!   without a token must reach them, so they take no token, but they pass the same `Host` check
 //!   and CSRF guard as an admin route, and the same 403 while remote administration is off.
-//! - [`FailureLimit`]: at most [`MAX_FAILURES`] wrong tokens a [`WINDOW`] per peer address, then
+//! - [`FailureLimit`]: at most [`MAX_FAILURES`] wrong tokens a [`WINDOW`] per peer address (an
+//!   IPv6 peer by its /64, which one host or LAN usually has to itself: [`peer_key`]), then
 //!   429 with `Retry-After`, without comparing, so the right token is refused as well and nothing
 //!   tells it apart. The check and the count happen under one lock, so concurrent guesses cannot
 //!   pass it, and valid traffic never counts: a page loading many frames at once is safe.
@@ -61,7 +62,20 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 /// The refused-token warnings of this process.
 static WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
 
-/// Recent wrong tokens per peer address, oldest first. Bounded: at most [`MAX_PEERS`] peers
+/// The address [`FailureLimit`] counts `ip` under: an IPv4 address (also one mapped into IPv6)
+/// as it is, an IPv6 address by its /64. One host can pick any of the 2^64 addresses of its
+/// prefix (privacy addresses), so counting single IPv6 addresses would not limit it at all.
+pub(crate) fn peer_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let prefix = u128::from(v6) & !(u128::from(u64::MAX));
+            IpAddr::V6(std::net::Ipv6Addr::from(prefix))
+        }
+        v4 => v4,
+    }
+}
+
+/// Recent wrong tokens per peer address ([`peer_key`]), oldest first. Bounded: at most [`MAX_PEERS`] peers
 /// ([`Self::fail`] drops the one whose last failure is oldest) and [`MAX_FAILURES`] times each.
 /// Every method takes the time, so the tests need no sleep.
 #[derive(Debug, Default)]
@@ -72,7 +86,7 @@ pub(crate) struct FailureLimit {
 impl FailureLimit {
     /// Seconds (rounded up, at least 1) until `ip` may try again; `None` when it may now.
     fn blocked(&mut self, ip: IpAddr, now: Instant) -> Option<u64> {
-        let ip = ip.to_canonical();
+        let ip = peer_key(ip);
         let times = self.peers.get_mut(&ip)?;
         while times
             .front()
@@ -95,7 +109,7 @@ impl FailureLimit {
 
     /// One more wrong token from `ip`.
     fn fail(&mut self, ip: IpAddr, now: Instant) {
-        let ip = ip.to_canonical();
+        let ip = peer_key(ip);
         if !self.peers.contains_key(&ip) && self.peers.len() >= MAX_PEERS {
             self.make_room(now);
         }
