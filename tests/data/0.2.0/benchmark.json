@@ -1,0 +1,332 @@
+{
+  "version": "0.2.0",
+  "timestamp": "2026-10-25T08:00:00Z",
+  "hardware": {
+    "os": "windows",
+    "arch": "x86_64",
+    "cpu": "Intel(R) Core(TM) i5-8500 CPU @ 3.00GHz",
+    "gpus": [
+      "Intel(R) UHD Graphics 630"
+    ]
+  },
+  "runtimes": {
+    "openvino": "2025.3.0",
+    "onnxruntime": "1.24.4",
+    "onnxruntime_flavor": "directml"
+  },
+  "models": [
+    {
+      "model": "IPcam-general",
+      "path": "models/IPcam-general.onnx",
+      "family": "yolo5",
+      "timestamp": "2026-10-25T08:00:00Z",
+      "run_id": "2026-10-25T07:58:12Z",
+      "image": "",
+      "datasets": [
+        "coco-cctv"
+      ],
+      "images": 2,
+      "warmup": 3,
+      "repeat": 1,
+      "configured": "auto",
+      "reference": "openvino:cpu",
+      "devices": [
+        {
+          "device": "openvino:cpu",
+          "label": "OpenVINO CPU",
+          "run": {
+            "model": "IPcam-general",
+            "path": "models/IPcam-general.onnx",
+            "family": "yolo5",
+            "requested_device": "openvino:cpu",
+            "device": "CPU",
+            "device_name": "Intel(R) Core(TM) i5-8500 CPU @ 3.00GHz",
+            "spec": "openvino:cpu",
+            "fell_back": false,
+            "input": "images [1,3,640,640] f32",
+            "image": "",
+            "image_size": "",
+            "images": 2,
+            "compile_ms": 512.4,
+            "cache": "miss",
+            "warmup_iterations": 3,
+            "warmup_ms": 140.2,
+            "repeat": 1,
+            "stages_ms": {
+              "decode": {
+                "min": 4.1,
+                "mean": 4.5,
+                "p50": 4.4,
+                "p95": 5.0,
+                "max": 5.0
+              },
+              "preprocess": {
+                "min": 2.0,
+                "mean": 2.2,
+                "p50": 2.1,
+                "p95": 2.4,
+                "max": 2.4
+              },
+              "infer": {
+                "min": 38.0,
+                "mean": 40.1,
+                "p50": 39.8,
+                "p95": 42.4,
+                "max": 42.4
+              },
+              "postprocess": {
+                "min": 0.3,
+                "mean": 0.35,
+                "p50": 0.34,
+                "p95": 0.4,
+                "max": 0.4
+              },
+              "total": {
+                "min": 44.6,
+                "mean": 47.2,
+                "p50": 46.9,
+                "p95": 50.2,
+                "max": 50.2
+              }
+            },
+            "throughput_fps": 21.3,
+            "detections": [
+              {
+                "label": "person",
+                "confidence": 0.88,
+                "x_min": 101,
+                "y_min": 40,
+                "x_max": 180,
+                "y_max": 300
+              }
+            ],
+            "by_resolution": [
+              {
+                "bucket": "1080p",
+                "images": 2,
+                "pre_p50": 6.5,
+                "infer_p50": 39.8,
+                "post_p50": 0.34,
+                "total_p50": 46.9,
+                "total_p95": 50.2
+              }
+            ],
+            "accuracy": {
+              "ground_truth": "manifest",
+              "relative": false,
+              "classes": [
+                "person",
+                "car"
+              ],
+              "threshold": 0.5,
+              "overall": {
+                "images": 2,
+                "counts": {
+                  "tp": 3,
+                  "fp": 1,
+                  "fn": 1
+                },
+                "precision": 0.75,
+                "recall": 0.75,
+                "f1": 0.75,
+                "ap50": 0.71,
+                "ap50_95": 0.43,
+                "per_class": [
+                  {
+                    "class": "person",
+                    "gt": 3,
+                    "ap50": 0.8,
+                    "ap50_95": 0.5,
+                    "precision": 1.0,
+                    "recall": 0.6666666666666666
+                  },
+                  {
+                    "class": "car",
+                    "gt": 1,
+                    "ap50": 0.62,
+                    "ap50_95": 0.36,
+                    "precision": 0.5,
+                    "recall": 1.0
+                  }
+                ],
+                "by_size": [
+                  {
+                    "bucket": "small",
+                    "gt": 1,
+                    "recall": 0.0
+                  },
+                  {
+                    "bucket": "medium",
+                    "gt": 2,
+                    "recall": 1.0
+                  },
+                  {
+                    "bucket": "large",
+                    "gt": 1,
+                    "recall": 1.0
+                  }
+                ]
+              },
+              "by_dataset": [
+                {
+                  "key": "coco-cctv",
+                  "images": 2,
+                  "gt": 4,
+                  "precision": 0.75,
+                  "recall": 0.75,
+                  "f1": 0.75,
+                  "ap50": 0.71,
+                  "ap50_95": 0.43,
+                  "relative": false
+                }
+              ],
+              "by_tag": [
+                {
+                  "key": "night",
+                  "images": 1,
+                  "gt": 2,
+                  "precision": 0.5,
+                  "recall": 0.5,
+                  "f1": 0.5,
+                  "ap50": 0.5,
+                  "ap50_95": 0.3,
+                  "relative": false,
+                  "roc_auc": 0.81
+                }
+              ],
+              "all_classes": {
+                "classes": 2,
+                "ap50": 0.71,
+                "ap50_95": 0.43
+              }
+            },
+            "grades": {
+              "accuracy": "B",
+              "accuracy_score": 0.71,
+              "speed": "A",
+              "p50_ms": 46.9,
+              "overall": "B",
+              "overall_points": 3.4,
+              "relative": false,
+              "metric": "ap50"
+            },
+            "agreement": {
+              "reference": "openvino:cpu",
+              "matched": 4,
+              "only_device": 0,
+              "only_reference": 0,
+              "max_confidence_diff": 0.0,
+              "mean_confidence_diff": 0.0,
+              "score": 1.0,
+              "verdict": "reference"
+            },
+            "per_image": [
+              {
+                "set": "coco-cctv",
+                "file": "000000001.jpg",
+                "total_ms": 46.9,
+                "infer_ms": 39.8,
+                "preds": [
+                  {
+                    "label": "person",
+                    "confidence": 0.88,
+                    "bbox": [
+                      101.0,
+                      40.0,
+                      180.0,
+                      300.0
+                    ],
+                    "tp": true
+                  }
+                ],
+                "gt_matched": [
+                  true,
+                  false
+                ],
+                "counts": {
+                  "tp": 1,
+                  "fp": 0,
+                  "fn": 1
+                }
+              },
+              {
+                "set": "coco-cctv",
+                "file": "000000002.jpg",
+                "total_ms": 50.2,
+                "infer_ms": 42.4,
+                "preds": []
+              }
+            ]
+          }
+        },
+        {
+          "device": "openvino:gpu",
+          "label": "OpenVINO GPU (Intel(R) UHD Graphics 630)",
+          "error": "compile failed: the GPU plugin could not be loaded; update the Intel graphics driver"
+        }
+      ],
+      "skipped": [
+        "ort:directml (not installed)"
+      ],
+      "recommended": "openvino:cpu",
+      "recommendation": "openvino:cpu: the only device that ran",
+      "threshold_objective": "f1"
+    }
+  ],
+  "image_sets": [
+    {
+      "id": "coco-cctv",
+      "title": "COCO CCTV-like",
+      "kind": "builtin",
+      "dir": null,
+      "license": "CC BY 4.0",
+      "attribution": "COCO Consortium",
+      "source": "https://cocodataset.org",
+      "ground_truth": {
+        "kind": "manifest"
+      },
+      "scored_labels": [
+        "person",
+        "car"
+      ],
+      "images": [
+        {
+          "file": "000000001.jpg",
+          "width": 640,
+          "height": 480,
+          "tags": [
+            "night",
+            "res:vga"
+          ],
+          "objects": [
+            {
+              "label": "person",
+              "bbox": [
+                100.0,
+                42.0,
+                181.0,
+                298.0
+              ]
+            },
+            {
+              "label": "car",
+              "bbox": [
+                300.0,
+                200.0,
+                420.0,
+                280.0
+              ],
+              "ignore": true
+            }
+          ]
+        },
+        {
+          "file": "000000002.jpg",
+          "width": 640,
+          "height": 480,
+          "tags": []
+        }
+      ]
+    }
+  ]
+}

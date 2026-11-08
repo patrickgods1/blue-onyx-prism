@@ -152,6 +152,16 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Write a diagnostics zip for a bug report: version, OS, devices, resources, the config,
+    /// the newest 5 MB of logs, metrics and a benchmark summary (devices and metrics from the
+    /// service running on this machine, when it answers). Never frames, labels, datasets or
+    /// tokens; camera names and paths stay. `--config` (before the subcommand) names the
+    /// service's config.
+    Diagnostics {
+        /// Folder for the zip (default: the current directory).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 /// `blue-onyx-prism service ...`.
@@ -316,6 +326,10 @@ pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
             path.display()
         ),
     );
+    crate::logbuf::early(
+        tracing::Level::INFO,
+        seeded_model_note(&name, config.auto_download),
+    );
     let file = Config::parse_file(path).unwrap_or_default();
     if let Err(e) = without_one_off_flags(config, &file).save(path) {
         crate::logbuf::early(
@@ -328,6 +342,21 @@ pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
         );
     }
     true
+}
+
+/// The first-start INFO line about the seeded model `name`: its licence from the catalog (the
+/// default, IPcam-general, is AGPL-3.0) and whether its weights download now.
+pub(crate) fn seeded_model_note(name: &str, auto_download: bool) -> String {
+    let license = crate::download::find(name)
+        .map(|r| r.license)
+        .filter(|l| !l.is_empty())
+        .unwrap_or("unknown (not in the catalog)");
+    let weights = if auto_download {
+        "its weights download now"
+    } else {
+        "its weights are not downloaded (auto_download is off)"
+    };
+    format!("default model {name} (license: {license}) added to the config; {weights}")
 }
 
 /// `config` with the one-off boolean flags ([`Config::one_off_flags`]) put back to their values
@@ -509,6 +538,7 @@ impl Cli {
                 rotate,
                 config: abs(&config),
             },
+            Command::Diagnostics { out } => Command::Diagnostics { out: abs(&out) },
             Command::Fetch { .. }
             | Command::ListResources { .. }
             | Command::Benchmark(_)
@@ -1806,6 +1836,17 @@ mod tests {
         assert!(seed_default_model(&mut c, &path));
         let disk = Config::load(&path).unwrap();
         assert!(disk.allow_remote_admin && disk.save_ref_image && !disk.force_cpu);
+    }
+
+    #[test]
+    fn the_seeded_model_note_names_its_license() {
+        assert_eq!(
+            seeded_model_note(crate::config::DEFAULT_MODEL_NAME, true),
+            "default model IPcam-general (license: AGPL-3.0) added to the config; its weights \
+             download now"
+        );
+        assert!(seeded_model_note("IPcam-general", false).contains("auto_download is off"));
+        assert!(seeded_model_note("no-such-model", true).contains("license: unknown"));
     }
 
     #[test]

@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "status": "unreviewed",
+  "empty_confirmed": false,
+  "boxes": [
+    {
+      "label": "dog",
+      "bbox": [
+        120.0,
+        640.0,
+        300.0,
+        790.0
+      ],
+      "source": "auto",
+      "score": 0.66,
+      "state": "pending",
+      "reason": "auto: gdino + rfdetr",
+      "agree": true,
+      "triage": "review",
+      "why": [
+        "the auto-labelers say raccoon (0.90); the box says dog"
+      ],
+      "labelers": {
+        "gdino": 0.58,
+        "rfdetr": 0.74
+      },
+      "auto_label": "raccoon",
+      "auto_score": 0.9
+    },
+    {
+      "label": "person",
+      "bbox": [
+        812.0,
+        400.5,
+        870.2,
+        560.0
+      ],
+      "source": "model",
+      "score": 0.55,
+      "state": "pending",
+      "origin": "prediction"
+    }
+  ],
+  "classes_version": "d122ee5b7ff78937",
+  "disagreement": "re-label by night-yolo26n: 1 new box, 1 missed",
+  "auto_run": {
+    "at": "2026-10-23T06:10:00Z",
+    "labeler": "mm-gdino-tiny + rfdetr-large"
+  }
+}

@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "status": "reviewed",
+  "empty_confirmed": false,
+  "boxes": [
+    {
+      "label": "person",
+      "bbox": [
+        812.0,
+        400.5,
+        870.2,
+        560.0
+      ],
+      "source": "model",
+      "score": 0.55,
+      "state": "accepted",
+      "origin": "suppressed",
+      "reason": "night_threshold"
+    },
+    {
+      "label": "raccoon",
+      "bbox": [
+        100.0,
+        700.0,
+        180.0,
+        760.0
+      ],
+      "source": "model",
+      "score": 0.43,
+      "state": "accepted",
+      "origin": "below_threshold",
+      "model_label": "cat",
+      "orig_bbox": [
+        98.0,
+        702.5,
+        181.0,
+        760.0
+      ]
+    },
+    {
+      "label": "dog",
+      "bbox": [
+        10.0,
+        10.0,
+        50.0,
+        90.0
+      ],
+      "source": "model",
+      "score": 0.71,
+      "state": "rejected",
+      "origin": "prediction"
+    },
+    {
+      "label": "car",
+      "bbox": [
+        600.0,
+        500.0,
+        900.0,
+        700.0
+      ],
+      "source": "model",
+      "score": 0.61,
+      "state": "accepted",
+      "origin": "verify_found"
+    },
+    {
+      "label": "deer",
+      "bbox": [
+        1200.0,
+        300.0,
+        1400.0,
+        520.0
+      ],
+      "source": "human",
+      "state": "added"
+    },
+    {
+      "label": "dog",
+      "bbox": [
+        1036.8,
+        489.6,
+        1372.0,
+        1079.0
+      ],
+      "source": "auto",
+      "score": 0.7541,
+      "state": "accepted",
+      "reason": "auto: gdino + rfdetr",
+      "agree": true,
+      "triage": "review",
+      "why": [
+        "an animal at night: always reviewed"
+      ],
+      "labelers": {
+        "gdino": 0.6372,
+        "rfdetr": 0.871
+      },
+      "vlm": {
+        "model": "qwen3-vl-2b",
+        "answer": "animal",
+        "expected": "animal",
+        "ok": true
+      },
+      "species_scores": {
+        "cat": 0.0034,
+        "dog": 0.9932,
+        "fox": 0.0021
+      }
+    },
+    {
+      "label": "cat",
+      "bbox": [
+        400.0,
+        900.0,
+        460.0,
+        980.0
+      ],
+      "source": "auto",
+      "score": 0.18,
+      "state": "rejected",
+      "reason": "low_score",
+      "agree": false,
+      "triage": "review",
+      "labelers": {
+        "gdino": 0.36
+      }
+    }
+  ],
+  "reviewed_at": "2026-10-22T13:05:00.000Z",
+  "classes_version": "d122ee5b7ff78937",
+  "auto_run": {
+    "at": "2026-10-22T12:50:00Z",
+    "labeler": "mm-gdino-tiny + rfdetr-large + qwen3-vl-2b + siglip2",
+    "classes": [
+      "person",
+      "car",
+      "dog",
+      "cat"
+    ]
+  }
+}

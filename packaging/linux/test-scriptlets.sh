@@ -45,7 +45,37 @@ stub userdel "rm -f '$WORK/user'"
 # The user: its uid and gid are in $WORK/user, the data root's owner in $WORK/owner.
 stub id "[ -f '$WORK/user' ] || exit 1; cat '$WORK/user'"
 stub getent "[ -f '$WORK/user' ]"
-stub stat "cat '$WORK/owner'"
+# Owners: everything belongs to the user (uid = gid = $WORK/user) unless $WORK/owners names it in
+# a line "<path> <uid>:<gid>". The stubbed find walks the real tree and prints what
+# `find DIR/. ( ! -user U -o ! -group U ) -print -quit` would: the first entry of another owner.
+# The stubbed stat answers `stat -Lc %u:%g DIR` from the same table (what an older scriptlet
+# looked at), so a check of the top folder alone gets a fair run and misses a deeper file.
+REAL_FIND="$(command -v find)"
+cat > "$BIN/owner_of" <<'EOF'
+#!/bin/sh
+# owner_of WORK PATH: "uid:gid" of PATH in WORK/owners (PATH with its /./ dropped), else the user's.
+p="$(printf '%s' "$2" | sed -e 's#/\./#/#g' -e 's#/\.$##')"
+o="$(awk -v p="$p" '$1 == p { print $2 }' "$1/owners")"
+[ -n "$o" ] || o="$(cat "$1/user"):$(cat "$1/user")"
+echo "$o"
+EOF
+chmod +x "$BIN/owner_of"
+cat > "$BIN/find" <<EOF
+#!/bin/sh
+echo "find \$*" >> "$CALLS"
+want="\$(cat "$WORK/user"):\$(cat "$WORK/user")"
+"$REAL_FIND" "\$1" | while IFS= read -r p; do
+  [ "\$("$BIN/owner_of" "$WORK" "\$p")" = "\$want" ] || { echo "\$p"; break; }
+done
+EOF
+chmod +x "$BIN/find"
+cat > "$BIN/stat" <<EOF
+#!/bin/sh
+echo "stat \$*" >> "$CALLS"
+for last in "\$@"; do :; done
+"$BIN/owner_of" "$WORK" "\$last"
+EOF
+chmod +x "$BIN/stat"
 # install -d -o u -g g -m 0750 DIR...: create the folders without the (root only) owner.
 stub install 'while [ $# -gt 0 ]; do case "$1" in -d) ;; -o | -g | -m) shift ;; *) mkdir -p "$1" ;; esac; shift; done'
 
@@ -59,7 +89,7 @@ setup() {
   : > "$DATA/dataset/frame.labels.json"
   echo '{}' > "$DATA/blue_onyx_prism_config.json"
   echo 990 > "$WORK/user"
-  echo 990:990 > "$WORK/owner"
+  : > "$WORK/owners"
   rewrite "$HERE/pkg-scriptlet.sh" "$OPT/scripts/pkg_scriptlet.sh"
   rewrite "$REPO/scripts/systemd_common.sh" "$OPT/scripts/systemd_common.sh"
 }
@@ -143,15 +173,30 @@ expect_no_call 'chown -hR'
 # Before `install -d`, which corrects the top folders only and would hide the mismatch from this
 # check and from systemd's own StateDirectory= one.
 setup "install over data of an older uid takes the whole tree"
-echo 777:777 > "$WORK/owner"
+echo "$DATA 777:777" > "$WORK/owners"
 run "$HERE/rpm/post_install.sh" 1
 expect_call "chown -hR blueonyx:blueonyx $DATA/."
 if [ "$(grep -n 'chown -hR' "$CALLS" | head -1 | cut -d: -f1)" -gt "$(grep -n '^install -d' "$CALLS" | head -1 | cut -d: -f1)" ]; then
   fail "the owner check ran after install -d"
 fi
 
+# RR-U6: the top folder is the user's, so `install -d` and systemd's StateDirectory= see nothing
+# wrong, but a file inside is not, and the service cannot read it.
+setup "install over data with one file of an older uid deep inside takes the whole tree"
+mkdir -p "$DATA/training/run-1"
+: > "$DATA/training/run-1/history.jsonl"
+echo "$DATA/training/run-1/history.jsonl 777:777" > "$WORK/owners"
+run "$HERE/rpm/post_install.sh" 1
+expect_call "chown -hR blueonyx:blueonyx $DATA/."
+expect_out 'history.jsonl'
+
+setup "install over data with only another group deep inside takes the whole tree"
+echo "$DATA/dataset/frame.labels.json 990:777" > "$WORK/owners"
+run "$HERE/debian/postinst" configure ""
+expect_call "chown -hR blueonyx:blueonyx $DATA/."
+
 setup "a chown that fails warns and the install goes on"
-echo 777:777 > "$WORK/owner"
+echo "$DATA 777:777" > "$WORK/owners"
 stub chown 'case "$1" in -hR) exit 1 ;; esac'
 run "$HERE/rpm/post_install.sh" 1
 expect_out 'Could not'

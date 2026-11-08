@@ -6,5 +6,6 @@
 use clap::Parser as _;
 
 fn main() -> std::process::ExitCode {
+    blue_onyx_prism::panic::install();
     blue_onyx_prism::tray::run(blue_onyx_prism::tray::TrayArgs::parse())
 }

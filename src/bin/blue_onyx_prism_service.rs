@@ -10,6 +10,13 @@
 //! Controls: Stop / Shutdown, Interrogate, and the user-defined codes 130 (stop) and 131 (restart: cancel the running server, reload the
 //! service config, start again), e.g. `sc.exe control BlueOnyxPrismService 131`.
 //!
+//! Start: StartPending (the checkpoint moves every second) until the HTTP listener is bound, then
+//! Running (models compile while the service runs). When no listener could be bound for
+//! `runner::BIND_GIVE_UP` (60 s; another program holds the port, or the config cannot be read)
+//! the service stops with a service-specific exit code (3: port in use, 4: other start failure),
+//! logging what holds the port, so the SCM's recovery actions apply. A panicking server thread
+//! stops it with exit code 1 (the panic hook logs the message, [`blue_onyx_prism::panic`]).
+//!
 //! Logs go to the configured `log_path` (daily rolling file; stdout is discarded for services)
 //! and, at INFO and above, to the Application event log under the source `BlueOnyxPrism`.
 //! Modeled on the blue-onyx service binary (MIT).
@@ -41,6 +48,7 @@ fn version_requested() -> bool {
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    blue_onyx_prism::panic::install();
     if version_requested() {
         println!(
             "blue-onyx-prism-service {}",
@@ -53,6 +61,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
+    blue_onyx_prism::panic::install();
     if version_requested() {
         println!(
             "blue-onyx-prism-service {}",
@@ -73,6 +82,7 @@ mod service {
     use blue_onyx_prism::backend::libs;
     use blue_onyx_prism::cli::{self, ExtraLogLayer, LogReloadHandle};
     use blue_onyx_prism::config::{Config, LogFormat, LogLevel, LogTimezone};
+    use blue_onyx_prism::panic::ExitSignal;
     use blue_onyx_prism::sync::LockExt;
     use blue_onyx_prism::{resolve_path, runner, system_info};
     use std::ffi::OsString;
@@ -102,12 +112,24 @@ mod service {
     const CONTROL_STOP: u32 = 130;
     /// User-defined control code: restart the server with a freshly loaded service config.
     const CONTROL_RESTART: u32 = 131;
-    /// Generous: the first GPU compile of several models can take minutes.
-    const START_WAIT_HINT: Duration = Duration::from_secs(600);
+    /// Wait hint of each StartPending report. The checkpoint moves every [`START_TICK`] until
+    /// the HTTP listener is bound (models compile after that, while the service is Running).
+    const START_WAIT_HINT: Duration = Duration::from_secs(10);
+    /// How often StartPending is reported again with the next checkpoint.
+    const START_TICK: Duration = Duration::from_secs(1);
     const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
     const RETRY_DELAY: Duration = Duration::from_secs(5);
+    /// Service-specific exit code: the server thread ended unexpectedly (a panic, logged with
+    /// its message by the panic hook, or a runtime that could not be built).
+    const EXIT_SERVER_EXITED: u32 = 1;
     /// Service-specific exit code: the server did not stop within `runner::SHUTDOWN_DEADLINE`.
     const EXIT_STOP_TIMED_OUT: u32 = 2;
+    /// Service-specific exit code: the HTTP port could not be bound for
+    /// `runner::BIND_GIVE_UP` (another program holds it).
+    const EXIT_PORT_IN_USE: u32 = 3;
+    /// Service-specific exit code: the server could not start for `runner::BIND_GIVE_UP`
+    /// (e.g. an unreadable config) and never got to listen.
+    const EXIT_START_FAILED: u32 = 4;
 
     define_windows_service!(ffi_service_main, service_main);
 
@@ -129,7 +151,35 @@ mod service {
     /// Signals from the control handler (and the server thread) to the service main thread.
     enum Event {
         Stop,
-        ServerExited,
+        /// The HTTP listener is bound: the service is Running.
+        Bound,
+        /// The server thread ended (sent on return and, by [`ExitSignal`], on a panic).
+        ServerExited(ServerExit),
+    }
+
+    /// Why the server thread ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ServerExit {
+        /// A stop was requested.
+        Stopped,
+        /// It panicked (the message is in the log, written by the panic hook) or could not
+        /// build its runtime.
+        Unexpected,
+        /// The port could not be bound for `runner::BIND_GIVE_UP`.
+        PortInUse,
+        /// Startup kept failing for `runner::BIND_GIVE_UP` before the port was bound.
+        StartFailed,
+    }
+
+    impl ServerExit {
+        fn exit_code(self) -> ServiceExitCode {
+            match self {
+                ServerExit::Stopped => ServiceExitCode::NO_ERROR,
+                ServerExit::Unexpected => ServiceExitCode::ServiceSpecific(EXIT_SERVER_EXITED),
+                ServerExit::PortInUse => ServiceExitCode::ServiceSpecific(EXIT_PORT_IN_USE),
+                ServerExit::StartFailed => ServiceExitCode::ServiceSpecific(EXIT_START_FAILED),
+            }
+        }
     }
 
     fn status(state: ServiceState, wait_hint: Duration, checkpoint: u32) -> ServiceStatus {
@@ -305,8 +355,19 @@ mod service {
             std::thread::Builder::new()
                 .name("server".into())
                 .spawn(move || {
-                    server_loop(first, config_path, log, stop, current, restart_requested);
-                    let _ = tx.send(Event::ServerExited);
+                    // Sent on return and on a panic (unwinding drops it).
+                    let signal =
+                        ExitSignal::new(tx.clone(), Event::ServerExited(ServerExit::Unexpected));
+                    let exit = server_loop(
+                        first,
+                        config_path,
+                        log,
+                        stop,
+                        current,
+                        restart_requested,
+                        tx,
+                    );
+                    signal.finish(Event::ServerExited(exit));
                 })
         };
         let server = match server {
@@ -320,13 +381,43 @@ mod service {
             }
         };
 
-        // HTTP is served while models compile, so the service counts as running right away.
-        set_status(&handle, status(ServiceState::Running, Duration::ZERO, 0));
-        let exit = match rx.recv() {
-            Ok(Event::Stop) | Err(_) => ServiceExitCode::NO_ERROR,
-            Ok(Event::ServerExited) => {
-                error!("server thread exited unexpectedly");
-                ServiceExitCode::ServiceSpecific(1)
+        // StartPending (checkpoint moving every second) until the HTTP listener is bound, then
+        // Running: HTTP is served while models compile. A port that stays taken ends the
+        // server thread after `runner::BIND_GIVE_UP` (`ServerExit::PortInUse`), so the SCM sees
+        // a failed start and its recovery actions apply.
+        let mut running = false;
+        let mut checkpoint = 1;
+        let exit = loop {
+            match rx.recv_timeout(START_TICK) {
+                Ok(Event::Bound) => {
+                    if !running {
+                        set_status(&handle, status(ServiceState::Running, Duration::ZERO, 0));
+                        info!("service running");
+                        running = true;
+                    }
+                }
+                Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break ServiceExitCode::NO_ERROR;
+                }
+                Ok(Event::ServerExited(why)) => {
+                    if why == ServerExit::Unexpected {
+                        error!(
+                            "the server thread ended unexpectedly (the error or panic before \
+                             this line says why); stopping the service with exit code \
+                             {EXIT_SERVER_EXITED} so its recovery actions apply"
+                        );
+                    }
+                    break why.exit_code();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !running {
+                        checkpoint += 1;
+                        set_status(
+                            &handle,
+                            status(ServiceState::StartPending, START_WAIT_HINT, checkpoint),
+                        );
+                    }
+                }
             }
         };
         stop.cancel();
@@ -334,7 +425,8 @@ mod service {
         // Workers finish their current inference (or compile) before exiting; keep the SCM
         // informed while we wait, at most `runner::SHUTDOWN_DEADLINE` (CO-12: a GPU compile
         // can take minutes). Past it the service reports Stopped with
-        // `EXIT_STOP_TIMED_OUT` and the process ends with the server thread still running.
+        // the failure's own code (a requested stop: no error) and the process ends with the server
+        // thread still running.
         let deadline = std::time::Instant::now() + runner::SHUTDOWN_DEADLINE;
         let mut checkpoint = 1;
         while !server.is_finished() && std::time::Instant::now() < deadline {
@@ -358,7 +450,17 @@ mod service {
                  log for the model that was loading",
                 runner::SHUTDOWN_DEADLINE.as_secs()
             );
-            ServiceExitCode::ServiceSpecific(EXIT_STOP_TIMED_OUT)
+            // A stop someone asked for stays a clean stop: with the failure flag set
+            // (`sc failureflag`, so a start that gives up is restarted), a non-zero code here
+            // would restart a service its user just stopped. A stop the server's own failure
+            // started keeps that failure's code.
+            if matches!(exit, ServiceExitCode::Win32(0)) {
+                ServiceExitCode::Win32(0)
+            } else if matches!(exit, ServiceExitCode::ServiceSpecific(_)) {
+                exit
+            } else {
+                ServiceExitCode::ServiceSpecific(EXIT_STOP_TIMED_OUT)
+            }
         };
         let mut s = status(ServiceState::Stopped, Duration::ZERO, 0);
         s.exit_code = exit;
@@ -367,7 +469,9 @@ mod service {
     }
 
     /// Run the server until `stop`; on failure log and retry after [`RETRY_DELAY`]; on restart
-    /// (131) reload the service config and start again immediately.
+    /// (131) reload the service config and start again immediately. Sends [`Event::Bound`]
+    /// each time the listener is bound. Gives up when attempts fail for
+    /// [`runner::BIND_GIVE_UP`] with no bind between ([`runner::BindRetry`]).
     fn server_loop(
         first: Result<(Config, PathBuf)>,
         config_path: std::result::Result<PathBuf, String>,
@@ -375,21 +479,25 @@ mod service {
         stop: CancellationToken,
         current: Arc<Mutex<CancellationToken>>,
         restart_requested: Arc<AtomicBool>,
-    ) {
+        events: mpsc::Sender<Event>,
+    ) -> ServerExit {
         let rt = match runner::build_runtime() {
             Ok(rt) => rt,
             Err(e) => {
                 error!("{e:#}");
-                return;
+                return ServerExit::Unexpected;
             }
         };
         let mut loaded = Some(first);
         let mut active_level: Option<LogLevel> = None;
         let mut last_error: Option<String> = None;
+        let mut retry = runner::BindRetry::new(runner::BIND_GIVE_UP);
+        let mut exit = ServerExit::Stopped;
         while !stop.is_cancelled() {
             let attempt = stop.child_token();
             *current.lock_recover() = attempt.clone();
             restart_requested.store(false, Ordering::SeqCst);
+            let bound = Arc::new(AtomicBool::new(false));
 
             let result = match loaded.take().unwrap_or_else(|| load_config(&config_path)) {
                 Ok((config, path)) => {
@@ -400,10 +508,27 @@ mod service {
                     }
                     log.set_timezone(config.log_timezone);
                     active_level = Some(config.log_level);
-                    runner::run_server_on(&rt, config, path, log.clone(), attempt.clone())
+                    let on_bound = {
+                        let (bound, events) = (bound.clone(), events.clone());
+                        Box::new(move |_port: u16| {
+                            bound.store(true, Ordering::SeqCst);
+                            let _ = events.send(Event::Bound);
+                        })
+                    };
+                    runner::run_server_notifying(
+                        &rt,
+                        config,
+                        path,
+                        log.clone(),
+                        attempt.clone(),
+                        on_bound,
+                    )
                 }
                 Err(e) => Err(e),
             };
+            if bound.load(Ordering::SeqCst) {
+                retry.bound();
+            }
             if stop.is_cancelled() {
                 break;
             }
@@ -416,13 +541,35 @@ mod service {
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
+                    if retry.failed(std::time::Instant::now()) {
+                        let port = e.downcast_ref::<runner::BindFailed>();
+                        error!(
+                            "giving up after {} s without an HTTP listener: {msg}. Stopping the \
+                             service with exit code {} so its recovery actions apply (they \
+                             restart it); fix the cause above to stop the restarts",
+                            runner::BIND_GIVE_UP.as_secs(),
+                            if port.is_some() {
+                                EXIT_PORT_IN_USE
+                            } else {
+                                EXIT_START_FAILED
+                            },
+                        );
+                        exit = if port.is_some() {
+                            ServerExit::PortInUse
+                        } else {
+                            ServerExit::StartFailed
+                        };
+                        break;
+                    }
                     // Avoid flooding the event log with the same error every few seconds.
                     if last_error.as_deref() == Some(msg.as_str()) {
                         debug!("server still failing: {msg}");
                     } else {
                         error!(
-                            "server failed: {msg}; retrying every {} s",
-                            RETRY_DELAY.as_secs()
+                            "server failed: {msg}; retrying every {} s (after {} s without an \
+                             HTTP listener the service stops with an error)",
+                            RETRY_DELAY.as_secs(),
+                            runner::BIND_GIVE_UP.as_secs()
                         );
                         last_error = Some(msg);
                     }
@@ -441,5 +588,6 @@ mod service {
         }
         // Blocking tasks get a bounded grace period (CO-12).
         rt.shutdown_timeout(runner::RUNTIME_SHUTDOWN_GRACE);
+        exit
     }
 }

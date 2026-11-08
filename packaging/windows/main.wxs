@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Per-machine MSI for Blue Onyx Prism (WiX Toolset v7, v4+ schema).
-  Build with build-msi.ps1; preprocessor variables: Version, BinDir, RepoRoot, LicenseRtf.
+  Build with build-msi.ps1; preprocessor variables: Version, BinDir, RepoRoot, LicenseRtf,
+  VcRuntimeDir.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
@@ -70,6 +71,12 @@
                   Directory="INSTALLFOLDER"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; failure BlueOnyxPrismService reset= 3600 actions= restart/5000/restart/30000/restart/120000"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Apply those actions when the service stops itself with an error code too (a start that
+         gave up on a busy port, a server thread that ended), not only when the process crashes. -->
+    <CustomAction Id="SetServiceFailureFlag"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]sc.exe&quot; failureflag BlueOnyxPrismService 1"
+                  Execute="deferred" Impersonate="no" Return="check" />
     <!-- Required privileges: the SCM removes every privilege not listed from the service process
          (no SeImpersonate, SeAssignPrimaryToken, ...). Same as install_service.ps1, which explains
          the choice of this one. It takes effect at the next start, and StartServices comes after. -->
@@ -130,7 +137,8 @@
       <Custom Action="ProtectDataFolder" After="EnsureDataFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="ProtectTokenFolder" After="ProtectDataFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServiceFailureActions" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
-      <Custom Action="SetServicePrivileges" After="SetServiceFailureActions" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="SetServiceFailureFlag" After="SetServiceFailureActions" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="SetServicePrivileges" After="SetServiceFailureFlag" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RemoveProgramFolder" After="RemoveFiles"
               Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND INSTALLFOLDER ~= BOP_DEFAULT_INSTALLFOLDER" />
       <Custom Action="RemoveDataFolder" After="RemoveProgramFolder"
@@ -156,7 +164,10 @@
                         Start="install"
                         Stop="both"
                         Remove="uninstall"
-                        Wait="yes" />
+                        Wait="no" />
+        <!-- Wait="no": the service reports Running only once its port is bound and gives up after
+             60 s when another program (CodeProject.AI, say) holds it; waiting would fail the
+             install (error 1920). The failure flag above restarts it until the port is free. -->
         <util:EventSource Name="BlueOnyxPrism"
                           Log="Application"
                           EventMessageFile="[WindowsFolder]Microsoft.NET\Framework64\v4.0.30319\EventLogMessages.dll"
@@ -179,6 +190,19 @@
       </Component>
       <Component Id="BenchmarkComponent" Bitness="always64">
         <File Id="BenchmarkExe" Source="$(var.BinDir)\blue-onyx-prism-benchmark.exe" KeyPath="yes" />
+      </Component>
+      <!-- Visual C++ runtime, app-local (stage-vcruntime.ps1): Windows looks in the program
+           folder before System32, so the exes and the OpenVINO / ONNX Runtime DLLs they load from
+           the data folder run on a machine without the VC++ redistributable, or with an old one.
+           One component per versioned file. -->
+      <Component Id="VcRuntimeComponent" Bitness="always64">
+        <File Id="VcRuntimeDll" Source="$(var.VcRuntimeDir)\vcruntime140.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="VcRuntime1Component" Bitness="always64">
+        <File Id="VcRuntime1Dll" Source="$(var.VcRuntimeDir)\vcruntime140_1.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="MsvcpComponent" Bitness="always64">
+        <File Id="MsvcpDll" Source="$(var.VcRuntimeDir)\msvcp140.dll" KeyPath="yes" />
       </Component>
       <Component Id="LicenseComponent" Bitness="always64">
         <File Id="LicenseFile" Source="$(var.RepoRoot)\LICENSE" KeyPath="yes" />

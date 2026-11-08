@@ -2,6 +2,8 @@
 # - Update `version` in Cargo.toml and merge to main
 # - git tag X.Y.Z && git push origin X.Y.Z
 # - Edit the draft release created by this workflow and publish it
+# Nothing is built unless CI passed on the tagged commit (job ci-green, packaging/release/): it waits
+# while CI still runs (up to 80 min) and refuses, naming the checks, when any check failed.
 # Each build job also builds its native installers (packaging/: MSI, deb + rpm, pkg), installs,
 # checks and uninstalls them on the runner, and uploads them next to the archive.
 # (workflow_dispatch builds the archives and creates a draft for the Cargo.toml version, without a tag.
@@ -26,8 +28,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The commit's check runs and workflow runs, read with the job's token: ci.yml must have passed
+  # and no other check may have failed (this workflow's own runs aside). See ci_green.py.
+  ci-green:
+    name: CI passed on the commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test the gate
+        run: python3 -I packaging/release/ci_green.py --self-test
+      - name: Wait for CI on the commit, refuse unless it passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+        run: packaging/release/wait-ci-green.sh
+
   build:
     name: build (${{ matrix.label }})
+    needs: ci-green
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -78,6 +101,14 @@ jobs:
         timeout-minutes: 40
         run: cargo build --release --locked --bins --target ${{ matrix.target }}
 
+      # The README promises RHEL 9 (glibc 2.34); this runner has 2.35 (packaging/linux/glibc-floor).
+      - name: Check the glibc the binaries need
+        if: runner.os == 'Linux'
+        run: |
+          packaging/linux/check-glibc.sh target/${{ matrix.target }}/release/blue-onyx-prism \
+            target/${{ matrix.target }}/release/blue-onyx-prism-benchmark \
+            target/${{ matrix.target }}/release/test-blue-onyx-prism
+
       - name: Stage files
         shell: bash
         timeout-minutes: 15
@@ -91,6 +122,8 @@ jobs:
               cp "$OUT/$b.exe" "$STAGE/"
             done
             cp scripts/*.ps1 "$STAGE/scripts/"
+            # The Visual C++ runtime next to the exes (the MSI installs the same files).
+            pwsh -NoProfile -File packaging/windows/stage-vcruntime.ps1 -Dest "$STAGE"
           else
             # The service binary is Windows-only (a stub elsewhere), so it is not shipped.
             for b in blue-onyx-prism blue-onyx-prism-benchmark test-blue-onyx-prism; do

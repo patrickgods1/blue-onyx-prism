@@ -1,0 +1,80 @@
+{
+  "description": "The same commit while CI still ran (status in_progress, conclusion null, as seen minutes before): wait.",
+  "sha": "a97b9d13209b3d72d55d34e973d15b336c6a957d",
+  "expect": 3,
+  "check_runs": [
+    {
+      "app": {
+        "slug": "github-actions"
+      },
+      "check_suite": {
+        "id": 114919396639
+      },
+      "completed_at": null,
+      "conclusion": null,
+      "html_url": "https://github.com/patrickgods1/blue-onyx-prism/actions/runs/42419167352/job/128543665051",
+      "name": "build-test (macos-latest)",
+      "started_at": "2026-11-07T22:08:16Z",
+      "status": "in_progress"
+    },
+    {
+      "app": {
+        "slug": "github-actions"
+      },
+      "check_suite": {
+        "id": 114919396639
+      },
+      "completed_at": null,
+      "conclusion": null,
+      "html_url": "https://github.com/patrickgods1/blue-onyx-prism/actions/runs/42419167352/job/128543664987",
+      "name": "build-test (ubuntu-latest)",
+      "started_at": "2026-11-07T22:08:16Z",
+      "status": "in_progress"
+    },
+    {
+      "app": {
+        "slug": "github-actions"
+      },
+      "check_suite": {
+        "id": 114919396639
+      },
+      "completed_at": null,
+      "conclusion": null,
+      "html_url": "https://github.com/patrickgods1/blue-onyx-prism/actions/runs/42419167352/job/128543664979",
+      "name": "build-test (windows-latest)",
+      "started_at": "2026-11-07T22:08:15Z",
+      "status": "in_progress"
+    },
+    {
+      "app": {
+        "slug": "github-actions"
+      },
+      "check_suite": {
+        "id": 114919396639
+      },
+      "completed_at": "2026-11-07T22:09:04Z",
+      "conclusion": "success",
+      "html_url": "https://github.com/patrickgods1/blue-onyx-prism/actions/runs/42419167352/job/128543664881",
+      "name": "supply-chain (cargo-deny)",
+      "started_at": "2026-11-07T22:08:16Z",
+      "status": "completed"
+    }
+  ],
+  "workflow_runs": [
+    {
+      "check_suite_id": 114919396639,
+      "conclusion": null,
+      "created_at": "2026-11-07T22:08:12Z",
+      "event": "push",
+      "html_url": "https://github.com/patrickgods1/blue-onyx-prism/actions/runs/42419167352",
+      "id": 42419167352,
+      "name": "CI",
+      "path": ".github/workflows/ci.yml",
+      "run_attempt": 1,
+      "status": "in_progress"
+    }
+  ],
+  "mentions": [
+    "build-test (windows-latest) [.github/workflows/ci.yml]: in_progress"
+  ]
+}

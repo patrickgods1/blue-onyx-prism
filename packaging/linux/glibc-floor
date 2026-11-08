@@ -1,0 +1,6 @@
+# The oldest glibc the Linux binaries (release archive, .deb, .rpm) must run on, read by
+# packaging/linux/check-glibc.sh in release.yml and packaging.yml. It is the README's claim
+# ("Install with an installer": Debian / Ubuntu 22.04+ = glibc 2.35, Fedora / RHEL 9+ = 2.34,
+# Debian 12 = 2.36): the lowest of them. A binary that needs a newer GLIBC_ symbol fails the build.
+# Raise it only together with that README table.
+2.34

@@ -1,0 +1,231 @@
+{
+  "port": 32168,
+  "bind_address": "0.0.0.0",
+  "allow_remote_admin": false,
+  "request_timeout_secs": 15,
+  "worker_queue_size": 0,
+  "device": "auto",
+  "gpu_index": 0,
+  "force_cpu": false,
+  "cache_dir": "cache",
+  "openvino_dir": null,
+  "onnxruntime_dir": null,
+  "confidence_threshold": 0.5,
+  "nms_iou": 0.45,
+  "object_filter": [
+    "person",
+    "car",
+    "dog"
+  ],
+  "night_confidence_threshold": 0.4,
+  "label_thresholds": {
+    "car": 0.6
+  },
+  "person_aspect": [
+    0.2,
+    1.5
+  ],
+  "suppress_overlaps": [
+    {
+      "drop": "person",
+      "if_overlaps": "car",
+      "iou": 0.8,
+      "night_only": true
+    }
+  ],
+  "static_suppression": {
+    "enabled": true,
+    "iou": 0.85,
+    "hits": 5,
+    "window_minutes": 30,
+    "labels": [
+      "person"
+    ]
+  },
+  "night_preprocess": "clahe",
+  "collect": {
+    "enabled": true,
+    "dir": "frames",
+    "buckets": {
+      "positive": {
+        "enabled": true,
+        "rate": 0.5,
+        "per_camera_min_interval_s": 60
+      },
+      "empty": {
+        "enabled": false,
+        "rate": 1.0,
+        "per_camera_min_interval_s": 600
+      },
+      "suppressed": {
+        "enabled": true,
+        "rate": 1.0,
+        "per_camera_min_interval_s": 0
+      },
+      "verify_rejected": {
+        "enabled": true,
+        "rate": 1.0,
+        "per_camera_min_interval_s": 0
+      },
+      "verify_kept": {
+        "enabled": true,
+        "rate": 1.0,
+        "per_camera_min_interval_s": 0
+      },
+      "near_threshold": {
+        "enabled": true,
+        "rate": 1.0,
+        "per_camera_min_interval_s": 0,
+        "margin": 0.15
+      },
+      "disagreement": {
+        "enabled": true,
+        "rate": 1.0,
+        "per_camera_min_interval_s": 0
+      }
+    },
+    "max_gb": 20.0,
+    "max_age_days": 120,
+    "dedup_hamming": 6,
+    "classes": [
+      "person",
+      "car",
+      "bicycle",
+      "motorcycle",
+      "truck",
+      "dog",
+      "cat",
+      "raccoon",
+      "opossum",
+      "skunk",
+      "fox",
+      "deer",
+      "squirrel",
+      "bird"
+    ],
+    "hidden_classes": [
+      "squirrel"
+    ]
+  },
+  "training": {
+    "dir": null,
+    "datasets": [],
+    "epochs": 80,
+    "patience": 15,
+    "negative_share": 0.2,
+    "heldout_share": 0.2,
+    "oversample": 3,
+    "timeout_hours": 24,
+    "metric_columns": [
+      "loss",
+      "map50"
+    ]
+  },
+  "log_level": "info",
+  "log_path": null,
+  "log_format": "text",
+  "log_timezone": "utc",
+  "save_image_path": null,
+  "save_ref_image": false,
+  "save_image_max_age_days": 30,
+  "save_image_max_mb": 2048,
+  "intra_threads": 0,
+  "preprocess_threads": 0,
+  "inflight": 0,
+  "ort_sessions": 0,
+  "hardware_profile": "auto",
+  "models_dir": "models",
+  "auto_download": true,
+  "allow_large_downloads": false,
+  "download_dir": null,
+  "max_image_pixels": 50000000,
+  "default_model": "IPcam-general",
+  "models": [
+    {
+      "name": "IPcam-general",
+      "path": "models/IPcam-general.onnx",
+      "family": "yolo5",
+      "classes": null,
+      "device": null,
+      "confidence_threshold": null,
+      "device_thresholds": {
+        "openvino:cpu": 0.45,
+        "openvino:gpu.0": 0.55
+      },
+      "object_filter": null,
+      "lazy": false,
+      "gpu_precision": null,
+      "enabled": true,
+      "night_model": "night-rfdetr",
+      "verify": {
+        "enabled": true,
+        "model": "yolo26s",
+        "labels": [
+          "person"
+        ],
+        "min_confidence": 0.5,
+        "iou": 0.3,
+        "night_only": true,
+        "mode": "crop",
+        "pad": 0.2,
+        "max_crops": 4,
+        "aliases": {}
+      }
+    },
+    {
+      "name": "yolo26s",
+      "path": "models/yolo26s.onnx",
+      "family": "yolo26",
+      "classes": null,
+      "device": "openvino:cpu",
+      "confidence_threshold": 0.4,
+      "object_filter": [
+        "person"
+      ],
+      "lazy": true,
+      "gpu_precision": null,
+      "enabled": true,
+      "inflight": 2
+    },
+    {
+      "name": "night-rfdetr",
+      "path": "models/night-rfdetr.onnx",
+      "family": "rfdetr",
+      "classes": "models/night-rfdetr.yaml",
+      "device": null,
+      "confidence_threshold": 0.35,
+      "object_filter": null,
+      "lazy": false,
+      "gpu_precision": "f32",
+      "enabled": true,
+      "min_box_area_frac": 0.001,
+      "preprocess": "gamma:1.5",
+      "night_threshold": 0.3
+    }
+  ],
+  "benchmark": {
+    "datasets": [
+      "coco-cctv",
+      "bmd45-cctv",
+      "exdark-night",
+      {
+        "dir": "/srv/bench/driveway",
+        "name": "driveway"
+      }
+    ],
+    "max_images_per_dataset": 20,
+    "devices": [],
+    "models": [],
+    "warmup": 3,
+    "repeat_per_image": 1,
+    "reference_model": null,
+    "weights": {
+      "accuracy": 0.6,
+      "speed": 0.4
+    },
+    "auto_download_datasets": true,
+    "threshold_objective": "f1",
+    "accuracy_metric": "ap50",
+    "low_priority": true
+  }
+}

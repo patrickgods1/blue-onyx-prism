@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest an addition or a change
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The situation first (your cameras, Blue Iris setup, hardware), then the idea.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to see
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today, or tried instead

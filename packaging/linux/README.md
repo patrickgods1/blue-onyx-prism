@@ -43,10 +43,19 @@ data on an erase, and an installed package erases by its own scripts: upgrade fi
 A reinstall over kept data works like a first install, and `apt` needs help for it: `apt remove` leaves
 the package in dpkg's config-files state, so the postinst gets the old version as on an upgrade,
 though the unit was disabled. `debian/preinst` sees `install <old-version>` and leaves
-`/opt/blue-onyx-prism/.reinstall` for the postinst. A data root whose owner is not the current
-`blueonyx` (the user was deleted by hand and made again, or the folder came from a backup) is chowned
-as a whole first, before `install -d` corrects only its top folders and hides the mismatch from
-`StateDirectory=` as well.
+`/opt/blue-onyx-prism/.reinstall` for the postinst. A data root holding anything (the folder itself or a file deep inside) whose owner or group is not
+the current `blueonyx` (the user was deleted by hand and made again, the folder came from a backup, a
+file was copied in with `sudo cp`) is chowned as a whole first (`bop_own_data_root` in
+`scripts/systemd_common.sh`, shared with `install_systemd.sh`), before `install -d` corrects only its
+top folders and hides the mismatch from `StateDirectory=` as well.
+
+Binaries: `check-glibc.sh` fails a build whose binaries need a newer `GLIBC_` symbol than
+`glibc-floor` (2.34: RHEL 9, the oldest system the README's installer table names; the build runner,
+Ubuntu 22.04, has 2.35). Raise the floor only together with that table.
+
+`../upgrade-test.sh` (packaging.yml) installs the latest published `.deb`, seeds a config edit, a
+reviewed label file (root-owned), a frame and a training `runs.json`, upgrades to the new package and
+checks the service, one detection and that all of it is unchanged.
 
 `smoke-test.sh` checks all of this, the RPM in a Fedora container, including a reinstall with another
 uid, and searches the filesystem for leftovers (names and files owned by the deleted user).

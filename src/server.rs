@@ -30,6 +30,7 @@ mod config_page;
 mod dataset;
 mod detect;
 mod devices;
+mod diagnostics;
 mod guard;
 mod live;
 mod pages;
@@ -212,6 +213,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/v1/storage", get(storage::status)),
         ("/v1/storage/clear", post(storage::clear)),
         ("/v1/storage/exports/remove", post(storage::remove_export)),
+        ("/v1/diagnostics", get(diagnostics::download)),
         ("/stats", get(stats_page)),
         ("/test", get(test_page).post(test_submit)),
         ("/config", get(config_page).post(config_submit)),
@@ -1216,6 +1218,7 @@ mod tests {
             "/v1/storage",
             "/v1/storage/clear",
             "/v1/storage/exports/remove",
+            "/v1/diagnostics",
             "/stats",
             "/test",
             "/config",

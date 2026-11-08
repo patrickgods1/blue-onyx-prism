@@ -42,5 +42,6 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    blue_onyx_prism::panic::install();
     bench_main(Cli::parse().args, None)
 }

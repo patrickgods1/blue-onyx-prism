@@ -209,6 +209,9 @@ struct ModelSelectRow {
     /// Night model select: "none" first, "same model" ([`NIGHT_SELF`]), then the other models
     /// it may name.
     night_models: Vec<DeviceChoice>,
+    /// The licence of a catalog model's weights (by its name, else its file's stem); None for a
+    /// model of your own.
+    license: Option<&'static str>,
     /// The model's `night_threshold` ("" = none), the field beside "same model".
     night_threshold: String,
     /// "same model" is chosen (the night threshold field shows).
@@ -514,8 +517,20 @@ fn model_choices(
             // Missing, or from another version (the old RF-DETR large download).
             let needs_export = crate::resources::export::pending_export(&c.data_path(&m.path))
                 .map(|r| r.id.to_string());
+            let license = m
+                .name
+                .as_deref()
+                .and_then(crate::resources::catalog::model)
+                .or_else(|| {
+                    m.path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(crate::resources::catalog::model)
+                })
+                .map(|r| r.license);
             ModelSelectRow {
                 devices,
+                license,
                 night_models: night_model_choices(&c.models, i),
                 night_threshold: m.night_threshold.map(live::fmt_thr).unwrap_or_default(),
                 night_self: m.night_model.is_none() && m.night_threshold.is_some(),
@@ -2300,6 +2315,21 @@ mod tests {
         // Shown as typed, like every other rejected field.
         assert!(page.contains("value=\"nope:1\""), "{page}");
         assert_eq!(state.config_read().allowed_hosts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_models_card_names_the_licence_of_a_catalog_models_weights() {
+        let state = test_state_with(|c| {
+            c.models[0].name = Some("IPcam-general".into());
+        });
+        let (s, html) = get_text(&state, "/config").await;
+        assert_eq!(s, StatusCode::OK);
+        let card = html
+            .split("<table class=\"model-card rcards\">")
+            .nth(1)
+            .and_then(|t| t.split("</table>").next())
+            .expect("the Models card");
+        assert!(card.contains("AGPL-3.0"), "{card}");
     }
 
     #[tokio::test]

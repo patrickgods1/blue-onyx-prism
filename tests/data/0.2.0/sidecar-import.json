@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "id": "20261023T054102115Z_imp-20261023-055526-88d5-17",
+  "request_id": "imp-20261023-055526-88d5-17",
+  "timestamp": "2018-03-07T17:00:36.000Z",
+  "model": "import",
+  "device": "",
+  "image_name": "2018-03-07.17-00-00.17-05-00.school.G419.r13.avi",
+  "camera": "meva-school-g419",
+  "camera_key": "import|cam:meva-school-g419",
+  "scene": "day",
+  "stats": {
+    "mean_luma": 112.4,
+    "chroma_spread": 9.1,
+    "tint_spread": 7.6,
+    "is_ir": false,
+    "is_dark": false
+  },
+  "width": 1920,
+  "height": 1072,
+  "image": {
+    "file": "20261023T054102115Z_imp-20261023-055526-88d5-17.jpg",
+    "bytes": 301772,
+    "original": false
+  },
+  "threshold": 0.0,
+  "raw": [],
+  "suppressed": [],
+  "predictions": [],
+  "buckets": [],
+  "matched": [],
+  "dhash": "0f1e2d3c4b5a6978",
+  "source": "import:20261023-055526-88d5",
+  "provenance": {
+    "import_id": "20261023-055526-88d5",
+    "kind": "video",
+    "path": "/footage/2018-03-07.17-00-00.17-05-00.school.G419.r13.avi",
+    "license": "CC BY 4.0 (MEVA, mevadata.org)",
+    "license_confirmed": true,
+    "confirmed_at": "2026-10-23T05:41:02.115Z",
+    "time_offset_s": 36.0
+  }
+}

@@ -10,7 +10,8 @@
 //!
 //! [`load_or_move_aside`] and [`save_file`] are how `tasks.json` and `runs.json` reach the disk: a
 //! damaged file or a record this build cannot read is set aside as `<name>.corrupt-<time>` before
-//! the next save could write over it.
+//! the next save could write over it. Each saved record carries a `format` ([`RECORD_FORMAT`]); the
+//! file stays a bare JSON list, so an older build (which ignores unknown fields) still reads it.
 
 use super::service::RunState;
 use crate::resources::export::{CommandRunner, Fetcher};
@@ -22,6 +23,11 @@ use std::sync::atomic::AtomicBool;
 
 /// File of the task records in the training folder.
 pub const TASKS_FILE: &str = "tasks.json";
+/// Layout version of a `runs.json` / `tasks.json` record, the `format` key [`save_file`] writes
+/// on each. Bumped only when an older build would misread a record of this one; a new field
+/// keeps it. A record of a later format is set aside unread ([`load_or_move_aside`]); 0.2.0
+/// wrote none, which is this format.
+pub const RECORD_FORMAT: u32 = 1;
 /// Finished task records kept in `tasks.json` (the oldest go first); queued and running ones are
 /// always kept. A task owns no files the list is needed for.
 pub const MAX_FINISHED_TASKS: usize = 200;
@@ -266,8 +272,10 @@ const READ_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 ///   and antivirus or a backup can hold a file for a moment on Windows. After [`READ_TRIES`] tries
 ///   the history is empty and nothing is saved over the file until a restart;
 /// - a record of an otherwise good file that does not parse (a [`TaskKind`] of a later version,
-///   after a downgrade) is copied, alone, to such a file, and the others load. The file itself keeps
-///   it until the next save, so a later load finds it again: the same records are not copied twice.
+///   after a downgrade), or of a later `format` than [`RECORD_FORMAT`] (it might parse into
+///   something it does not mean), is copied, alone, to such a file, and the others load. The file
+///   itself keeps it until the next save, so a later load finds it again: the same records are not
+///   copied twice.
 ///
 /// Every reader comes through here, including those that never save (the page before the queue
 /// starts, `train list`): a damaged file is damaged for all of them.
@@ -300,7 +308,7 @@ pub fn load_or_move_aside<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
     let mut unread = Vec::new();
     let mut first_error = None;
     for v in list {
-        match T::deserialize(&v) {
+        match record_format(&v).and_then(|()| T::deserialize(&v).map_err(|e| e.to_string())) {
             Ok(r) => records.push(r),
             Err(e) => {
                 first_error.get_or_insert(e);
@@ -313,6 +321,29 @@ pub fn load_or_move_aside<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
         None => true,
     };
     Loaded { records, writable }
+}
+
+/// Whether this build reads record `v` by its `format`: none (0.2.0) or at most
+/// [`RECORD_FORMAT`].
+fn record_format(v: &serde_json::Value) -> Result<(), String> {
+    match v.get(FORMAT_KEY) {
+        None => Ok(()),
+        Some(f) if f.as_u64().is_some_and(|f| f <= u64::from(RECORD_FORMAT)) => Ok(()),
+        Some(f) => Err(format!(
+            "record format {f}, this version reads format {RECORD_FORMAT} and older"
+        )),
+    }
+}
+
+/// The key of [`RECORD_FORMAT`] in a saved record.
+const FORMAT_KEY: &str = "format";
+
+/// A record as [`save_file`] writes it: `format` first, then the record's own fields.
+#[derive(Serialize)]
+struct Stamped<'a, T> {
+    format: u32,
+    #[serde(flatten)]
+    record: &'a T,
 }
 
 /// [`std::fs::read`], tried again for a moment on any failure but "not found".
@@ -379,7 +410,7 @@ fn move_aside<T>(path: &Path, why: &str) -> Loaded<T> {
 
 /// Copy `unread`, the records of `path` this build cannot read, to a file of their own, unless an
 /// earlier load did. Returns whether they are safe there.
-fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &serde_json::Error) -> bool {
+fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &str) -> bool {
     let Ok(bytes) = serde_json::to_vec_pretty(unread) else {
         return false;
     };
@@ -423,11 +454,19 @@ fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &serde_json::Err
     }
 }
 
-/// Write `records` to `path` as a JSON list: through a temporary file, on the disk before the
-/// rename, so a crash leaves the old file or the new one. A failure only warns.
+/// Write `records` to `path` as a JSON list, each stamped with its `format` ([`RECORD_FORMAT`]):
+/// through a temporary file, on the disk before the rename, so a crash leaves the old file or the
+/// new one. A failure only warns.
 pub fn save_file<T: Serialize>(path: &Path, records: &[T]) {
     let tmp = path.with_extension("json.tmp");
-    let r = serde_json::to_vec_pretty(records)
+    let stamped: Vec<Stamped<'_, T>> = records
+        .iter()
+        .map(|record| Stamped {
+            format: RECORD_FORMAT,
+            record,
+        })
+        .collect();
+    let r = serde_json::to_vec_pretty(&stamped)
         .map_err(anyhow::Error::from)
         .and_then(|b| {
             if let Some(p) = path.parent() {
@@ -725,6 +764,78 @@ mod tests {
         save_records(&p, &load_records(&p));
         assert_eq!(ids(&load_records(&p)), ["a", "b"]);
         assert_eq!(asides(&p).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_records_carry_their_format_and_the_file_stays_a_bare_list() {
+        let dir = scratch("format");
+        let p = dir.join(TASKS_FILE);
+        let mut r = record("a");
+        r.uses = vec!["sam3".into()];
+        save_records(&p, &[r.clone(), record("b")]);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let list = v.as_array().expect("a bare JSON list");
+        assert!(
+            list.iter().all(|x| x[FORMAT_KEY] == RECORD_FORMAT),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("\"format\"").count(),
+            2,
+            "once per record: {text}"
+        );
+        assert!(
+            serde_json::to_value(&r).unwrap().get(FORMAT_KEY).is_none(),
+            "the record has no field of that name: the stamp is the only one"
+        );
+        // This build reads it back unchanged...
+        assert_eq!(load_records(&p), [r.clone(), record("b")]);
+        // ...and so does a reader that knows no `format` and ignores unknown fields, as 0.2.0
+        // did (today's struct, read the old way: the whole file as one list).
+        let old_way: Vec<TaskRecord> = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(old_way, [r, record("b")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_of_a_later_format_is_set_aside_unread_and_the_rest_load() {
+        let dir = scratch("later-format");
+        let p = dir.join(TASKS_FILE);
+        let stamp = |id: &str, format: serde_json::Value| {
+            let mut v = serde_json::to_value(record(id)).unwrap();
+            v[FORMAT_KEY] = format;
+            v
+        };
+        // A later format parses as a record here, and is still not read: its fields may mean
+        // something else now. A field this build does not know is fine at a known format.
+        let mut known = stamp("known", RECORD_FORMAT.into());
+        known["later_field"] = "ignored".into();
+        let later = stamp("later", (RECORD_FORMAT + 1).into());
+        let odd = stamp("odd", "1".into());
+        let list = serde_json::json!([
+            record("old"),
+            known,
+            later.clone(),
+            odd.clone(),
+            stamp("zero", 0.into())
+        ]);
+        std::fs::write(&p, serde_json::to_vec(&list).unwrap()).unwrap();
+        let l = load_or_move_aside::<TaskRecord>(&p);
+        let ids: Vec<&str> = l.records.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["old", "known", "zero"]);
+        assert!(l.writable, "the unread ones are safe aside");
+        let aside = asides(&p);
+        assert_eq!(aside.len(), 1);
+        let kept: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&aside[0]).unwrap()).unwrap();
+        assert_eq!(kept, [later, odd]);
+        assert!(
+            record_format(&stamp("x", (RECORD_FORMAT + 1).into()))
+                .unwrap_err()
+                .contains(&format!("this version reads format {RECORD_FORMAT}"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -163,6 +163,8 @@ Invoke-Sc description $ServiceName "Blue Iris / CodeProject.AI compatible object
 # Restart on every failure (the SCM keeps applying the last action): at once, then after 30 s,
 # then every 2 min; the failure count resets after an hour without one.
 Invoke-Sc failure $ServiceName reset= 3600 actions= restart/5000/restart/30000/restart/120000
+# ...also when the service stops itself with an error code (a start that gave up on a busy port).
+Invoke-Sc failureflag $ServiceName 1
 
 # --- Permissions --------------------------------------------------------------------------------
 # Well-known SIDs, so the script works on non-English Windows.

@@ -147,9 +147,8 @@ impl Buckets {
 
 /// A bucket as written in the config: every field optional, missing ones take the bucket's
 /// own default ([`BucketConfig::default_for`]), so `{"empty": {"enabled": false}}` keeps the
-/// 600 s interval.
+/// 600 s interval. An unknown key is ignored and named in a warning ([`unknown_keys`]).
 #[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct RawBucket {
     enabled: Option<bool>,
     rate: Option<f32>,
@@ -158,7 +157,6 @@ struct RawBucket {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
 struct RawBuckets {
     positive: Option<RawBucket>,
     empty: Option<RawBucket>,
@@ -198,9 +196,12 @@ impl<'de> Deserialize<'de> for Buckets {
     }
 }
 
-/// `collect` in the config (see the README and `docs/DATASET.md`).
+/// `collect` in the config (see the README and `docs/DATASET.md`). A key this version does not
+/// know, here or in a bucket, is ignored and named once in a warning ([`unknown_keys`]): a
+/// config written by a later version with a new `collect.*` setting still loads, and a typo
+/// still shows in the log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, remote = "Self")]
 pub struct CollectConfig {
     /// Save frames at all (default off).
     pub enabled: bool,
@@ -229,6 +230,88 @@ pub struct CollectConfig {
     /// ([`super::labels::bulk::Wanted`]); they stay in the list and keep their YOLO ids.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hidden_classes: Vec<String>,
+}
+
+impl Serialize for CollectConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // The derived `remote = "Self"` serializer (an inherent function of the same name).
+        Self::serialize(self, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for CollectConfig {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        warn_unknown(&v);
+        // The derived `remote = "Self"` deserializer (an inherent function of the same name).
+        Self::deserialize(v).map_err(|e| serde::de::Error::custom(format!("collect: {e}")))
+    }
+}
+
+/// The keys of the section as written (`v`, the `collect` object) that this version does not
+/// know, as `collect.<key>` / `collect.buckets.<bucket>[.<key>]`, sorted. A key is known when a
+/// fully set section ([`known_shape`]) serializes it, so a new field is known without a list to
+/// keep.
+pub fn unknown_keys(v: &serde_json::Value) -> Vec<String> {
+    static KNOWN: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(known_shape);
+    let mut out = Vec::new();
+    unknown_in(v, known, "collect", &mut out);
+    out.sort();
+    out
+}
+
+/// A section with every optional key set (each bucket with a margin: [`RawBucket`] reads one on
+/// every bucket, validation refuses it there).
+fn known_shape() -> serde_json::Value {
+    let mut c = CollectConfig {
+        dir: Some("d".into()),
+        review_dir: Some("r".into()),
+        hidden_classes: vec![DEFAULT_CLASSES[0].to_string()],
+        ..CollectConfig::default()
+    };
+    for b in Bucket::ALL {
+        c.buckets.get_mut(b).margin = Some(DEFAULT_NEAR_MARGIN);
+    }
+    serde_json::to_value(&c).unwrap_or_default()
+}
+
+fn unknown_in(v: &serde_json::Value, known: &serde_json::Value, at: &str, out: &mut Vec<String>) {
+    let (serde_json::Value::Object(m), serde_json::Value::Object(k)) = (v, known) else {
+        return;
+    };
+    for (key, val) in m {
+        let path = format!("{at}.{key}");
+        match k.get(key) {
+            Some(kv) => unknown_in(val, kv, &path, out),
+            None => out.push(path),
+        }
+    }
+}
+
+/// Warn about the [`unknown_keys`] of `v`, each once per process (the config is parsed again
+/// at every save and disk check).
+fn warn_unknown(v: &serde_json::Value) {
+    for key in first_seen(unknown_keys(v)) {
+        tracing::warn!(
+            "config: {key} is not a setting this version knows and is ignored: a typo (the \
+             README lists every collect.* key), or a setting of a later version"
+        );
+    }
+}
+
+/// The keys of `keys` not returned by an earlier call.
+fn first_seen(keys: Vec<String>) -> Vec<String> {
+    use crate::sync::LockExt as _;
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if keys.is_empty() {
+        return keys;
+    }
+    let mut seen = SEEN.lock_recover();
+    keys.into_iter()
+        .filter(|k| seen.insert(k.clone()))
+        .collect()
 }
 
 impl Default for CollectConfig {
@@ -712,14 +795,62 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_refused() {
-        assert!(serde_json::from_str::<CollectConfig>(r#"{"enable": true}"#).is_err());
+    fn unknown_keys_are_ignored_and_named() {
+        let text = r#"{"enable": true, "max_gb": 2, "buckets": {"positives": {},
+            "empty": {"interval": 5, "enabled": false}, "near_threshold": {"margin": 0.2}}}"#;
+        let c: CollectConfig = serde_json::from_str(text).unwrap();
+        assert!(!c.enabled, "the misspelt key changes nothing");
+        assert_eq!(c.max_gb, 2.0);
         assert!(
-            serde_json::from_str::<CollectConfig>(r#"{"buckets": {"positives": {}}}"#).is_err()
+            !c.buckets.empty.enabled,
+            "known keys beside an unknown one still apply"
         );
+        assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
+        assert_eq!(c.buckets.near_margin(), 0.2);
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            unknown_keys(&v),
+            [
+                "collect.buckets.empty.interval",
+                "collect.buckets.positives",
+                "collect.enable"
+            ]
+        );
+        // Every key a full section writes is known, a margin on any bucket included.
+        let full = known_shape();
+        assert!(unknown_keys(&full).is_empty());
+        assert!(full["dir"].is_string() && full["hidden_classes"].is_array());
         assert!(
-            serde_json::from_str::<CollectConfig>(r#"{"buckets": {"empty": {"interval": 5}}}"#)
-                .is_err()
+            unknown_keys(&serde_json::json!({"buckets": {"empty": {"margin": 0.1}}})).is_empty()
         );
+        // A wrong type is still an error, naming the section.
+        let e = serde_json::from_str::<CollectConfig>(r#"{"max_gb": "big"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("collect: "), "{e}");
+    }
+
+    #[test]
+    fn a_config_with_a_new_collect_key_loads_and_keeps_the_known_ones() {
+        let c: crate::config::Config = serde_json::from_str(
+            r#"{"port": 4100, "collect": {"enabled": true, "later_setting": {"x": 1},
+                "buckets": {"empty": {"rate": 0.5, "later_bucket_key": true}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.port, 4100);
+        assert!(c.collect.enabled);
+        assert_eq!(c.collect.buckets.empty.rate, 0.5);
+        c.validate().unwrap();
+        let text = c.saved_text().unwrap();
+        assert!(!text.contains("later_"), "not written back: {text}");
+    }
+
+    #[test]
+    fn each_unknown_key_is_warned_once() {
+        let k = |s: &str| vec![format!("collect.first-seen-test.{s}")];
+        assert_eq!(first_seen(k("a")), k("a"));
+        assert!(first_seen(k("a")).is_empty());
+        assert_eq!(first_seen([k("a"), k("b")].concat()), k("b"));
+        assert!(first_seen(Vec::new()).is_empty());
     }
 }
