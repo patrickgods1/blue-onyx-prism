@@ -97,9 +97,18 @@ sudo test -f "$SEED" || fail "$SEED deleted by the second uninstall"
 
 # Then with the account's id changed meanwhile (deleted by hand and made again): the daemon must
 # own and read what the old id wrote. The kernel refuses a bind while a socket of the port belongs
-# to another uid, and the old daemon's closed connections stay in TIME_WAIT for 30 s, so wait them
-# out: launchd would otherwise restart the daemon until they are gone.
-sleep 35
+# to another uid, and the old daemon's closed connections stay in TIME_WAIT (2 MSL, nominally 30 s,
+# longer on a busy VM: a fixed 35 s sleep once lost by a second), so wait until the port has no
+# sockets left: launchd would otherwise restart the daemon until they are gone.
+port_sockets() { netstat -an -p tcp | awk '$4 ~ /[.:]32168$/' | wc -l | tr -d ' '; }
+echo "sockets on port 32168 after the uninstall: $(port_sockets)"
+waited=0
+until [ "$(port_sockets)" = 0 ]; do
+  [ "$waited" -lt 120 ] || { netstat -an -p tcp | awk '$4 ~ /[.:]32168$/' >&2; fail "port 32168 still has sockets after ${waited} s"; }
+  sleep 1
+  waited=$((waited + 1))
+done
+echo "port 32168 free after ${waited} s"
 new_uid=""
 for i in $(seq 499 -1 300); do
   if ! dscl . -list /Users UniqueID | awk -v id="$i" '$2 == id { f = 1 } END { exit !f }'; then new_uid="$i"; break; fi
