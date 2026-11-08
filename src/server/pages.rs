@@ -373,10 +373,19 @@ fn runtime_text(
     }
 }
 
-/// Version of the loaded ONNX Runtime, when the shared runtimes are free to ask.
-fn ort_version(reg: &ModelRegistry) -> Option<String> {
-    let rt = reg.runtimes()?.try_lock().ok()?;
-    rt.onnxruntime_version()
+/// Version of the loaded ONNX Runtime: the shared runtimes' when they are free to ask, else
+/// (a worker compiles) the one recorded at startup ([`crate::registry::StartupDevices`]).
+pub(super) fn ort_version(reg: &ModelRegistry) -> Option<String> {
+    let live = reg.runtimes().and_then(|rt| {
+        let rt = rt.try_lock().ok()?;
+        Some(rt.onnxruntime_version())
+    });
+    match live {
+        Some(v) => v,
+        None => reg
+            .startup_devices()
+            .and_then(|s| s.onnxruntime_version.clone()),
+    }
 }
 
 pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
