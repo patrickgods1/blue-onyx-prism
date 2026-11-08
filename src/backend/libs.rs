@@ -206,6 +206,11 @@ pub fn prepare_environment(explicit: Option<&Path>) {
         chosen
     };
 
+    // Our install: apply an update downloaded while it was in use, and mark it in use so the
+    // downloader never swaps it under this process (`resources::manager::in_use`).
+    if let Some(dir) = &install_dir {
+        crate::resources::manager::before_load(dir);
+    }
     #[cfg(windows)]
     if let Some(dir) = &install_dir {
         let dirs: Vec<PathBuf> = WINDOWS_DLL_SUBDIRS
@@ -963,6 +968,8 @@ pub fn preload_cuda_libs(dir: &Path) -> CudaPreload {
         }
         return r.clone();
     }
+    // As for OpenVINO (`prepare_environment`): a staged update first, then marked in use.
+    crate::resources::manager::before_load(dir);
     let windows = cfg!(windows);
     let names: Vec<String> = std::fs::read_dir(dir)
         .map(|rd| {

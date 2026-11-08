@@ -67,7 +67,7 @@ catalog: `ONNXRUNTIME_VERSION` 1.24.4 for cpu/directml/coreml (the last release 
 again), `DIRECTML_VERSION`, `CUDNN_VERSION` 9.10.2.21 (the last cuDNN with Pascal kernels; must stay < 9.11 while the
 CUDA 12 lane covers Pascal, a test checks it). The `ort` crate is built without an `api-NN` feature, so any ORT 1.17+
 library loads; never add one above the oldest pinned flavor. A process loads one ORT flavor only; an outdated flavor
-is updated in place (used after a restart when loaded). `onnxruntime/cuda-libs` (opt-in NVIDIA wheels, ~1.9 GB) is
+is updated in place, or, while a process has it loaded, staged as `<parent>/.<name>.pending` and swapped in by the next process before it loads (`manager::in_use`: every loader holds a shared lock on `.<name>.in-use`; covers OpenVINO, ORT flavors and `cuda-libs`). A catalog pin bump reaches existing installs: OpenVINO and cuda-libs record their version, an outdated one is an update (the old one stays usable; a large one without `allow_large_downloads` is only offered), a catalog model whose own manifest names another version is re-downloaded, a model file without a manifest stays as is. `onnxruntime/cuda-libs` (opt-in NVIDIA wheels, ~1.9 GB) is
 preloaded by path before the CUDA provider loads.
 
 Device spec (`device` in config/model entry, `--device`): `auto` (default), `openvino:gpu[.N]`,

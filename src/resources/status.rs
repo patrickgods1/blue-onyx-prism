@@ -634,6 +634,8 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
             let status = status_of(&statuses, r.id);
             let on_disk = is_installed(r, &installed, config);
             let update = on_disk && installed.outdated(r);
+            // The catalog's version is downloaded and waits for the next start.
+            let staged = on_disk && installed.update_staged(r);
             let need = res.needs.iter().find(|n| n.id() == r.id);
             let optional = res.optional.iter().any(|n| n.id() == r.id);
             let (state, progress, error, retry_in) = match status.map(|s| &s.state) {
@@ -646,9 +648,10 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                 Some(State::Queued) => ("queued", None, None, None),
                 Some(State::Verifying) => ("verifying", None, None, None),
                 Some(State::Extracting) => ("extracting", None, None, None),
+                // A failed update shows too: the installed version still works.
                 Some(State::Failed {
                     error, retry_at, ..
-                }) if !on_disk => {
+                }) if !on_disk || update => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs());
@@ -687,15 +690,13 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                     "installed {}; {} available (Update replaces it{})",
                     installed.installed_version(r.id).unwrap_or("?"),
                     r.version,
-                    match need {
-                        Some(n) if loaded => format!(
-                            "; needed by {}, used after a restart",
-                            n.blocking_models.join(", ")
-                        ),
-                        Some(n) => format!("; needed by {}", n.blocking_models.join(", ")),
-                        None if loaded => "; used after a restart".to_string(),
-                        None => String::new(),
-                    }
+                    update_note(r, need, loaded)
+                ),
+                (_, "installed") if staged => format!(
+                    "installed {}; {} is downloaded and replaces it at the next start (restart \
+                     the service to use it)",
+                    installed.installed_version(r.id).unwrap_or("?"),
+                    r.version
                 ),
                 (_, s) => s.to_string(),
             };
@@ -753,6 +754,24 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
             }
         })
         .collect()
+}
+
+/// The tail of an "update available" state: who waits for it and when it is used.
+fn update_note(r: &Resource, need: Option<&resolve::Need>, loaded: bool) -> String {
+    let when = if r.kind == ResourceKind::Model {
+        "used the next time the model loads"
+    } else {
+        "used after a restart"
+    };
+    let later = loaded || need.is_some_and(|n| n.after_restart);
+    match need.map(|n| n.blocking_models.as_slice()) {
+        Some(models) if !models.is_empty() && later => {
+            format!("; needed by {}, {when}", models.join(", "))
+        }
+        Some(models) if !models.is_empty() => format!("; needed by {}", models.join(", ")),
+        _ if later => format!("; {when}"),
+        _ => String::new(),
+    }
 }
 
 /// "~350 MB download, ~1.1 GB on disk".
@@ -1014,6 +1033,41 @@ mod tests {
             log: Vec::new(),
             update_available: None,
         }
+    }
+
+    /// The "update available" tail: an update blocks nobody and says when it is used.
+    #[test]
+    fn update_note_says_when_the_update_is_used() {
+        let ov = catalog::openvino_runtime("windows", "x86_64").unwrap();
+        let model = catalog::model("IPcam-general.onnx").unwrap();
+        let need = |r: &'static Resource, blocking: &[&str], after_restart: bool| resolve::Need {
+            resource: r,
+            reason: "x".into(),
+            blocking_models: blocking.iter().map(|s| s.to_string()).collect(),
+            device: None,
+            after_restart,
+            update_from: Some("old".into()),
+            model_dir: None,
+        };
+        assert_eq!(
+            update_note(ov, Some(&need(ov, &[], true)), false),
+            "; used after a restart"
+        );
+        assert_eq!(update_note(ov, None, true), "; used after a restart");
+        assert_eq!(update_note(ov, None, false), "");
+        assert_eq!(
+            update_note(model, Some(&need(model, &[], true)), false),
+            "; used the next time the model loads"
+        );
+        // An ONNX Runtime flavor a model waits for (the CUDA build without its GPU's kernels).
+        assert_eq!(
+            update_note(ov, Some(&need(ov, &["a"], true)), true),
+            "; needed by a, used after a restart"
+        );
+        assert_eq!(
+            update_note(ov, Some(&need(ov, &["a"], false)), false),
+            "; needed by a"
+        );
     }
 
     #[test]

@@ -13,6 +13,9 @@
 //!   on that in the meantime; otherwise it waits.
 //! - A second ONNX Runtime flavor while one is already loaded in this process cannot be used
 //!   before the process restarts; it is downloaded and marked active for the next start.
+//! - **Updates** (an installed runtime or model file from an older pin, [`Need::update_from`]):
+//!   queued like any need but blocking no model, which keeps running on the installed version; a
+//!   loaded runtime's update is used after the process restarts (`manager::in_use`).
 //! - **`auto_download: false`**: nothing is downloaded; blocked models are `Failed` with
 //!   [`Resolution::manual_message`] (the missing resources and the command to run).
 //! - Downloads are queued model files first, then CPU-fallback runtimes (small, so something can
@@ -174,12 +177,22 @@ impl Provisioner {
             }
         }
         for n in &resolution.optional {
-            info!(
-                "{} could use {} ({}); set allow_large_downloads to download it",
-                n.blocking_models.join(", "),
-                n.id(),
-                super::catalog::format_size(n.size())
-            );
+            match &n.update_from {
+                Some(old) => info!(
+                    "{} {} is available ({}; {} is installed and keeps working); set \
+                     allow_large_downloads, or press Update on the Config page, to download it",
+                    n.id(),
+                    n.resource.version,
+                    super::catalog::format_size(n.size()),
+                    old
+                ),
+                None => info!(
+                    "{} could use {} ({}); set allow_large_downloads to download it",
+                    n.blocking_models.join(", "),
+                    n.id(),
+                    super::catalog::format_size(n.size())
+                ),
+            }
         }
 
         let mut jobs = Vec::new();

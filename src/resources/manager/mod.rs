@@ -14,7 +14,8 @@
 //!    with "hash mismatch" (not retried automatically).
 //! 5. Archives: extract the whitelisted entries ([`super::extract`]) into a staging directory
 //!    next to the target, write the manifest there, then rename it into place. Model files are
-//!    renamed into place one by one.
+//!    renamed into place one by one. An update of a runtime that a process has loaded is kept
+//!    beside it instead and swapped in by the next process that loads it (`in_use`).
 //! 6. Optionally mark an ONNX Runtime flavor active (`onnxruntime/active.txt`).
 //!
 //! Failures are retried with a 30 s -> 5 min exponential backoff ([`backoff`]) when
@@ -981,8 +982,10 @@ pub fn install_all(opts: ManagerOptions, jobs: Vec<Job>) -> Result<Vec<Status>> 
     Ok(statuses)
 }
 
+mod in_use;
 mod progress;
 mod worker;
 
+pub use in_use::{before_load, pending_dir, staged_version};
 pub use progress::*;
 pub use worker::*;

@@ -255,11 +255,16 @@ fn run_job(
 ) -> Result<()> {
     let res = job.resource;
     let local = job.local_archives.is_some();
-    if !local && is_installed(res, &job.target) {
+    // Installed, or downloaded already and waiting for the next start (`in_use::place`).
+    let done = || {
+        is_installed(res, &job.target)
+            || super::in_use::staged_version(res.id, &job.target).as_deref() == Some(job.version())
+    };
+    if !local && done() {
         return Ok(());
     }
     let _lock = DownloadLock::acquire(&shared.opts.root, shared.opts.lock_wait, &shared.stop)?;
-    if !local && is_installed(res, &job.target) {
+    if !local && done() {
         return Ok(());
     }
     if !local && let Some(damage) = install_damage(&manifest_path(res, &job.target), &job.target) {
@@ -419,7 +424,7 @@ fn run_job(
         let _ = remove_any(&staging);
         return Err(e);
     }
-    put_in_place(res, &staging, &job.target)?;
+    super::in_use::place(res, &staging, &job.target)?;
     if !local && !job.keep_downloads {
         for a in &archives {
             let _ = std::fs::remove_file(a);
@@ -530,14 +535,15 @@ pub(crate) fn remove_any(p: &Path) -> Result<()> {
     }
 }
 
-/// Move a finished `staging` directory to `target`:
+/// Move a finished `staging` directory to `target` (a runtime another process may have loaded goes
+/// through [`super::in_use::place`] first):
 /// - `target` absent: one rename.
 /// - `target` is a previous install of the same resource (its manifest says so): rename it
 ///   aside, rename staging in, delete the old one (restored if the second rename fails).
 /// - otherwise (a directory we do not own exclusively, e.g. a legacy flat
 ///   `onnxruntime/` that also holds per-flavor installs, or a user `--dir`): merge file by
 ///   file, first removing ONNX Runtime files of a previous install so flavors never mix.
-fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Result<()> {
+pub(super) fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Result<()> {
     let in_use_hint = |e: std::io::Error| {
         anyhow!(e).context(format!(
             "replacing {} (if a running process has its libraries loaded, stop it or restart \
@@ -550,20 +556,7 @@ fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Result<()> {
     }
     let owned = read_manifest(&target.join(MANIFEST_FILE)).is_some_and(|m| m.id == res.id);
     if owned {
-        let old = sibling(target, &format!("old-{}", std::process::id()))?;
-        remove_any(&old)?;
-        std::fs::rename(target, &old).map_err(in_use_hint)?;
-        if let Err(e) = std::fs::rename(staging, target) {
-            let _ = std::fs::rename(&old, target);
-            return Err(in_use_hint(e));
-        }
-        if let Err(e) = remove_any(&old) {
-            tracing::warn!(
-                "could not remove the previous install {}: {e:#}",
-                old.display()
-            );
-        }
-        return Ok(());
+        return swap_owned(staging, target);
     }
     if let ResourceKind::OnnxRuntime(_) = res.kind {
         let windows = res.platform.is_some_and(|p| p.os == "windows");
@@ -579,6 +572,33 @@ fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Result<()> {
     }
     merge_dir(staging, target)?;
     remove_any(staging)
+}
+
+/// Replace the install `target` (ours, see [`put_in_place`]) by the complete directory `from`:
+/// rename `target` aside, rename `from` in, delete the old one (restored if the second rename
+/// fails).
+pub(super) fn swap_owned(from: &Path, target: &Path) -> Result<()> {
+    let in_use_hint = |e: std::io::Error| {
+        anyhow!(e).context(format!(
+            "replacing {} (if a running process has its libraries loaded, stop it or restart \
+             to finish the update)",
+            target.display()
+        ))
+    };
+    let old = sibling(target, &format!("old-{}", std::process::id()))?;
+    remove_any(&old)?;
+    std::fs::rename(target, &old).map_err(in_use_hint)?;
+    if let Err(e) = std::fs::rename(from, target) {
+        let _ = std::fs::rename(&old, target);
+        return Err(in_use_hint(e));
+    }
+    if let Err(e) = remove_any(&old) {
+        tracing::warn!(
+            "could not remove the previous install {}: {e:#}",
+            old.display()
+        );
+    }
+    Ok(())
 }
 
 fn merge_dir(from: &Path, to: &Path) -> Result<()> {
@@ -2089,7 +2109,8 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with('.'))
+            // The in-use lock stays (see `in_use`); nothing else.
+            .filter(|n| n.starts_with('.') && n != ".cpu.in-use")
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);

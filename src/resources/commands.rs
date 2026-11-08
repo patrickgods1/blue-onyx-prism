@@ -296,20 +296,44 @@ pub fn list_resources(config: &Config, hw: &HardwareInfo, installed: &Installed)
             _ => {}
         }
     }
+    let (updates, missing): (Vec<&resolve::Need>, Vec<&resolve::Need>) =
+        r.needs.iter().partition(|n| n.update_from.is_some());
+    let size = |l: &[&resolve::Need]| catalog::format_size(l.iter().map(|n| n.size()).sum());
+    let how = if config.auto_download {
+        " or start the service (auto_download is on)"
+    } else {
+        ""
+    };
     if r.needs.is_empty() {
         let _ = writeln!(out, "Everything the config needs is installed.");
-    } else {
+    }
+    if !missing.is_empty() {
         let _ = writeln!(
             out,
-            "Missing {} ({}); run `{}`{}.",
-            r.needs.len(),
-            catalog::format_size(r.total_size()),
+            "Missing {} ({}); run `{}`{how}.",
+            missing.len(),
+            size(&missing),
             resolve::FETCH_FOR_CONFIG,
-            if config.auto_download {
-                " or start the service (auto_download is on)"
-            } else {
-                ""
-            }
+        );
+    }
+    for n in &updates {
+        let _ = writeln!(
+            out,
+            "Update: {} {} replaces the installed {} ({}).",
+            n.resource.title,
+            n.resource.version,
+            n.update_from.as_deref().unwrap_or("?"),
+            n.reason
+        );
+    }
+    if !updates.is_empty() {
+        let _ = writeln!(
+            out,
+            "{} update(s) ({}); the installed versions keep working until they are replaced, \
+             and a loaded runtime uses its update after a restart; run `{}`{how}.",
+            updates.len(),
+            size(&updates),
+            resolve::FETCH_FOR_CONFIG,
         );
     }
     out
@@ -357,7 +381,13 @@ fn state_of(
         let update = installed
             .installed_version(res.id)
             .filter(|v| *v != res.version)
-            .map(|old| format!("{old}, {} available", res.version));
+            .map(|old| {
+                if installed.update_staged(res) {
+                    format!("{old}, {} downloaded for the next start", res.version)
+                } else {
+                    format!("{old}, {} available", res.version)
+                }
+            });
         return match (update, active) {
             (Some(u), true) => format!("installed {u} (active)"),
             (Some(u), false) => format!("installed {u}"),

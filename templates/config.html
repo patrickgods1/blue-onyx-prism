@@ -170,6 +170,7 @@
       {% else if let Some(why) = r.remove_blocked %}<span class="muted">{{ why }}</span>{% endif %}
     {% else if r.action == "none" %}<span class="muted">not available here</span>
     {% else if r.state == "installed" %}
+      {% if r.update_available.is_some() && resources_enabled %}<form method="post" action="/v1/resources/download#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}">{% if r.large %}<input type="hidden" name="confirm_large" value="1"><button type="submit" class="small" data-confirm="{{ r.title }} is {{ r.size_text }} ({{ r.license }}). Download the update?">Update {{ r.size_text }} (large)</button>{% else %}<button type="submit" class="small">Update</button>{% endif %}</form>{% endif %}
       {% if r.removable %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Remove {{ r.title }}?">Remove</button></form>
       {% else if let Some(why) = r.remove_blocked %}<span class="muted">{{ why }}</span>{% endif %}
       {% if r.can_add_to_config %}<form method="post" action="/v1/resources/add-to-config#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="small secondary">Add to config</button></form>{% endif %}
