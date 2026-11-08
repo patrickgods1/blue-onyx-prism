@@ -52,7 +52,7 @@ pub use tools::*;
 pub use train::*;
 
 /// Pinned OpenVINO runtime version.
-pub const OPENVINO_VERSION: &str = "2026.4.0";
+pub const OPENVINO_VERSION: &str = "2026.4.1";
 /// Pinned ONNX Runtime version of the `cpu`, `directml` and `coreml` flavors. The `ort` crate is
 /// built without `api-NN` features, so any ONNX Runtime 1.17+ library loads; 1.24.4 is the newest
 /// release with a DirectML package (`Microsoft.ML.OnnxRuntime.DirectML` on NuGet and
@@ -295,8 +295,8 @@ pub(crate) const TOOL_ID_PREFIX: &str = "tool:";
 pub const UV_ID: &str = "tool:uv";
 /// Install directory of `tool:uv` under the download root.
 pub const UV_DEST: &str = "tools/uv";
-/// Pinned uv release (2026-09-25).
-pub const UV_VERSION: &str = "0.12.19";
+/// Pinned uv release (2026-10-22).
+pub const UV_VERSION: &str = "0.13.5";
 /// `(os, arch)` as in `std::env::consts::{OS, ARCH}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Platform {
@@ -1208,11 +1208,53 @@ mod tests {
         for m in F32_MODELS {
             assert!(export_model(m).is_some(), "{m}");
         }
-        // YOLO26 export version unchanged (earlier exports stay valid).
+        // Exports of the earlier exporters stay valid (their manifests are on users' disks).
         assert_eq!(
             ULTRALYTICS_EXPORT_VERSION,
-            "ultralytics-8.4.163+assets-v8.4.0"
+            format!("ultralytics-{ULTRALYTICS_VERSION}+assets-v8.4.0")
         );
+        assert!(export_version_matches(
+            ULTRALYTICS_EXPORT_VERSION,
+            "ultralytics-8.4.163+assets-v8.4.0"
+        ));
+        assert!(export_version_matches(
+            MDV6_ULTRALYTICS_VERSION,
+            "ultralytics-8.4.163+zenodo-15398270"
+        ));
+        let rf = export_model("rfdetr-large").unwrap();
+        assert!(export_version_matches(
+            rf.version,
+            "transformers-5.17.0+rf-detr-large-f62f7dd5252b61097cbace33886045816dadbde9"
+        ));
+        // Other weights, another recipe, or the old onnx-community download: not a match.
+        assert!(!export_version_matches(
+            ULTRALYTICS_EXPORT_VERSION,
+            "ultralytics-8.4.163+assets-v8.3.0"
+        ));
+        assert!(!export_version_matches(
+            rf.version,
+            "transformers-5.17.0+rf-detr-large-0000000"
+        ));
+        assert!(!export_version_matches(
+            rf.version,
+            "4988fbacee4aa815e43c2e0666377ab26bddf1e8"
+        ));
+        assert!(!export_version_matches(
+            ULTRALYTICS_EXPORT_VERSION,
+            "ultralytics-8.4.100+assets-v8.4.0"
+        ));
+        // Every entry names the current exporter and an older one.
+        for (now, before) in EARLIER_EXPORTERS {
+            assert_ne!(now, before);
+            let pkg = now.split('-').next().unwrap();
+            assert!(before.starts_with(pkg), "{now} {before}");
+            let current = match pkg {
+                "ultralytics" => ULTRALYTICS_VERSION,
+                "transformers" => TRANSFORMERS_VERSION,
+                _ => panic!("{now}"),
+            };
+            assert_eq!(*now, format!("{pkg}-{current}+"));
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ macro_rules! uv_part {
     ($file:literal, $kind:expr, $sha:literal, $size:literal) => {
         Part {
             url: concat!(
-                "https://github.com/astral-sh/uv/releases/download/0.12.19/",
+                "https://github.com/astral-sh/uv/releases/download/0.13.5/",
                 $file
             ),
             sha256: $sha,
@@ -48,8 +48,8 @@ pub static TOOLS: &[Resource] = &[
         &[uv_part!(
             "uv-aarch64-apple-darwin.tar.gz",
             ArchiveKind::TarGz,
-            "a9a8df1eedeb192f2e47e40e2faabfb387db4b850209118786d42f89dde3e0ba",
-            16988553
+            "743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73",
+            14365303
         )],
     ),
     uv(
@@ -57,8 +57,8 @@ pub static TOOLS: &[Resource] = &[
         &[uv_part!(
             "uv-x86_64-apple-darwin.tar.gz",
             ArchiveKind::TarGz,
-            "cb5fa57bafe68fc0fb94b17f06bee0b0b9a7feb94ccbd110445afa0696e39273",
-            20718482
+            "b0f52b0e3945b4107d89024ea38e625683011fbfc05a0d98f9fa2d6dcee28c66",
+            17167423
         )],
     ),
     uv(
@@ -66,8 +66,8 @@ pub static TOOLS: &[Resource] = &[
         &[uv_part!(
             "uv-x86_64-unknown-linux-gnu.tar.gz",
             ArchiveKind::TarGz,
-            "23bf5552d220e0842b65c862097b2ebaeba0064b74eda5e565e77fd25969d8c8",
-            19831732
+            "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f",
+            16682639
         )],
     ),
     uv(
@@ -75,8 +75,8 @@ pub static TOOLS: &[Resource] = &[
         &[uv_part!(
             "uv-aarch64-unknown-linux-gnu.tar.gz",
             ArchiveKind::TarGz,
-            "0804e9b164c64b6914182d5920c08551958a095986f10a3731056df701126436",
-            18916891
+            "4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403",
+            15914298
         )],
     ),
     uv(
@@ -84,8 +84,8 @@ pub static TOOLS: &[Resource] = &[
         &[uv_part!(
             "uv-x86_64-pc-windows-msvc.zip",
             ArchiveKind::Zip,
-            "6dbb02d79e419522f1c500f0adb1cddcff0cda7d59b0d66ea7f5e3b4a1b2f5f0",
-            17955780
+            "a38b8d1902b7cfbc76b423ba1bb456f623f42064cdc72628b6075b89afd1019a",
+            15264056
         )],
     ),
 ];

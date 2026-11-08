@@ -3,8 +3,9 @@
 
 Usage (from anywhere; paths are relative to the repository root):
   check_deps.py consistency [--today YYYY-MM-DD]   offline, CI on every push (exit 1 on a mismatch)
-  check_deps.py upstream [--out FILE]              online, weekly: pins with a newer upstream release
+  check_deps.py upstream [--out FILE] [--today D]  online, weekly: pins with a newer upstream release that is due
   check_deps.py audit [--out FILE]                 online, weekly: known vulnerabilities in the Python locks (OSV)
+  check_deps.py conflicts                          online: a Python pin outside what another pin declares (exit 1)
   check_deps.py --self-test
 
 Nothing here changes a pin. Pins (URLs, SHA-256, sizes) change only in reviewed commits:
@@ -19,6 +20,11 @@ consistency checks:
 - the Dockerfile's OpenVINO runtime image tag equals OPENVINO_VERSION;
 - no deny.toml advisory ignore is past its "Review by" date;
 - a lock cutoff (`EXCLUDE_NEWER` in the gen scripts) older than STALE_LOCK_DAYS is a warning, not an error.
+
+upstream calls a release due when it is newer than the pin, at least MIN_AGE_DAYS old and (Python)
+runs on the environments' Python (Requires-Python) and (Python) fits what the other pins declare
+(Requires-Dist, with the extras we install: USED_EXTRAS); newer releases that are not due yet are listed apart,
+with the reason, and do not keep the issue open. Pins held back on purpose (HOLDS) are listed apart too.
 
 upstream and audit exit 0 with nothing to report, 10 when the report lists something (the workflow then
 opens or updates an issue), 2 when a source could not be read at all.
@@ -40,6 +46,10 @@ UNREADABLE = 2
 STALE_LOCK_DAYS = 180
 USER_AGENT = "blue-onyx-prism-ci"
 SHOWN_IDS = 3
+# A pin moves only to a release at least this old (docs/RELEASE_CHECKLIST.md).
+MIN_AGE_DAYS = 14
+# Python of the export / train environments (src/resources/export/mod.rs PYTHON_VERSION; the newest 3.11).
+PYTHON = (3, 11, 99)
 
 EXPORT_REQ = "scripts/requirements-model-export.txt"
 TRAIN_REQ = "scripts/requirements-model-train.txt"
@@ -54,6 +64,8 @@ GEN_SCRIPTS = ("scripts/model-export/gen_locks.sh", "scripts/model-export/gen_tr
 HOLDS = {
     "ONNXRUNTIME_VERSION": "1.24.x is the last ONNX Runtime release with a DirectML package (cpu/directml/coreml flavors)",
     "CUDNN_VERSION": "must stay below 9.11 while the CUDA 12 lane covers Pascal (a catalog test checks it)",
+    "VC_RUNTIME_VERSION": "14.5x is the Visual Studio 2026 runtime (no cp311 wheel, the 2026 redistribution terms, "
+                          "vcomp140 regressions reported on 14.50): bump after a check on a real Windows machine",
 }
 
 
@@ -212,85 +224,281 @@ def fetch_json(url, data=None):
         return json.load(r)
 
 
-def github_latest(repo):
-    return fetch_json(f"https://api.github.com/repos/{repo}/releases/latest")["tag_name"].lstrip("v")
+def release_rows(versions):
+    """[(version, first upload date, requires_python)] -> releases only (no pre-release), oldest first."""
+    rows = [r for r in versions if version_key(r[0]) is not None and r[1] is not None]
+    return sorted(rows, key=lambda r: version_key(r[0]))
 
 
-def pypi_latest(name):
-    return fetch_json(f"https://pypi.org/pypi/{name}/json")["info"]["version"]
+def github_releases(repo):
+    """[(version, published date, None)] of a GitHub repository's releases (drafts and pre-releases
+    skipped; tags that are not a plain version, such as onnxruntime's `plugin-ep-cuda/v0.3.0`, too)."""
+    rels = fetch_json(f"https://api.github.com/repos/{repo}/releases?per_page=100")
+    out = []
+    for r in rels:
+        tag = r.get("tag_name", "")
+        if r.get("draft") or r.get("prerelease") or not re.fullmatch(r"v?\d+(\.\d+)*", tag):
+            continue
+        out.append((tag.lstrip("v"), dt.date.fromisoformat(r["published_at"][:10]), None))
+    return out
 
 
-def nuget_latest(name):
-    versions = fetch_json(f"https://api.nuget.org/v3-flatcontainer/{name.lower()}/index.json")["versions"]
-    releases = [v for v in versions if version_key(v) is not None]
-    return max(releases, key=version_key) if releases else versions[-1]
+def pypi_releases(name):
+    """[(version, first upload date, requires_python)] of a PyPI project."""
+    out = []
+    for ver, files in fetch_json(f"https://pypi.org/pypi/{name}/json")["releases"].items():
+        files = [f for f in files if not f.get("yanked")]
+        if not files:
+            continue
+        first = min(f["upload_time"][:10] for f in files)
+        out.append((ver, dt.date.fromisoformat(first), files[0].get("requires_python")))
+    return out
+
+
+def nuget_releases(name):
+    """[(version, published date, None)] of a NuGet package (registration index, pages fetched when
+    they are not inlined)."""
+    index = fetch_json(f"https://api.nuget.org/v3/registration5-semver1/{name.lower()}/index.json")
+    out = []
+    for page in index.get("items", []):
+        items = page.get("items")
+        if items is None:
+            items = fetch_json(page["@id"]).get("items", [])
+        for it in items:
+            e = it["catalogEntry"]
+            if e.get("listed", True):
+                out.append((e["version"], dt.date.fromisoformat(e["published"][:10]), None))
+    return out
+
+
+def python_ok(spec, py=PYTHON):
+    """Whether a Requires-Python specifier (`>=3.10`, `>=3.9,<3.14`, `!=3.0.*`, `~=3.8`) admits the
+    Python of the environments; a missing one admits it."""
+    return spec_ok(spec, py)
+
+
+def spec_ok(spec, version):
+    """Whether a version specifier (`<1.9.0,>=1.8.2`, `==1.0.1`, `!=3.0.*`, `~=3.8`) admits `version`
+    (a tuple of ints, or a release string); an empty one admits everything, clauses that are not
+    plain release versions are skipped."""
+    if not spec:
+        return True
+    if isinstance(version, str):
+        version = tuple(int(x) for x in strip_local(version).split("."))
+    have = list(version)
+    for clause in spec.split(","):
+        m = re.fullmatch(r"\s*(~=|===|==|!=|<=|>=|<|>)\s*([0-9.]+)(\.\*)?\s*", clause)
+        if m is None:
+            continue
+        op, ver, star = m.groups()
+        want = [int(x) for x in ver.split(".")]
+        if star:
+            same = have[:len(want)] == want
+            if (op == "==" and not same) or (op == "!=" and same):
+                return False
+            continue
+        n = max(len(want), len(have))
+        a, b = have + [0] * (n - len(have)), want + [0] * (n - len(want))
+        ok = {"==": a == b, "===": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b,
+              ">=": a >= b, "~=": a >= b and a[:len(want) - 1] == b[:len(want) - 1]}[op]
+        if not ok:
+            return False
+    return True
+
+
+# Extras installed of a pinned package (requirements-model-train.txt lists rfdetr's `train` extra by
+# hand, minus roboflow); requirements under any other extra of it are not ours.
+USED_EXTRAS = {"rfdetr": {"train"}, "torchmetrics": {"detection"}}
+
+
+def parse_requirement(line):
+    """(name, specifier, extras of its marker) of a Requires-Dist line, or None."""
+    req, _, marker = line.partition(";")
+    m = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._\-]*)\s*(?:\[[^\]]*\])?\s*\(?([^)]*)\)?\s*$", req)
+    if m is None:
+        return None
+    extras = set(re.findall(r"""extra\s*==\s*['"]([^'"]+)['"]""", marker))
+    return norm_name(m.group(1)), m.group(2).replace(" ", ""), extras
+
+
+def pin_constraints(pins, requires_dist):
+    """{dependency: [(specifier, "pkg ver")]}: what each pinned package (`requires_dist(name, ver)`)
+    declares about the others, counting only its requirements without an extra or under an extra we
+    install (USED_EXTRAS)."""
+    out = {}
+    for name, ver in pins.items():
+        for line in requires_dist(name, ver) or []:
+            parsed = parse_requirement(line)
+            if parsed is None:
+                continue
+            dep, spec, extras = parsed
+            if extras and not extras & USED_EXTRAS.get(name, set()):
+                continue
+            if dep in pins and dep != name and spec:
+                out.setdefault(dep, []).append((spec, f"{name} {ver}"))
+    return out
+
+
+def pin_conflicts(pins, constraints):
+    """["torchmetrics==1.9.0: rfdetr 1.11.2 requires <1.9.0,>=1.8.2", ...]: pins outside what another
+    pin declares (`pin_constraints`)."""
+    out = []
+    for name, ver in sorted(pins.items()):
+        for spec, who in constraints.get(name, ()):
+            if version_key(ver) is not None and not spec_ok(spec, ver):
+                out.append(f"{name}=={ver}: {who} requires {spec}")
+    return out
+
+
+def python_pins(root):
+    pins = requirement_pins(read(root, EXPORT_REQ))
+    pins.update(requirement_pins(read(root, TRAIN_REQ)))
+    return pins
+
+
+def conflicts(root):
+    """Online: the export and train pins against each other's Requires-Dist. uv cannot see these:
+    the train requirements list rfdetr's `train` extra by hand (without roboflow), so its ranges for
+    torchmetrics, hotcoco, vernier, ... are only declared, never resolved."""
+    pins = python_pins(root)
+    try:
+        found = pin_conflicts(pins, pin_constraints(pins, pypi_requires_dist))
+    except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
+        return f"Could not read PyPI: {e}\n", UNREADABLE
+    if not found:
+        return f"The {len(pins)} Python pins fit each other's declared requirements.\n", 0
+    return "Pins outside what another pin requires:\n" + "".join(f"- {c}\n" for c in found), 1
+
+
+def pypi_requires_dist(name, version):
+    return fetch_json(f"https://pypi.org/pypi/{name}/{version}/json")["info"].get("requires_dist")
+
+
+def due_release(rows, today, constraints=()):
+    """(due, newest, why) over `release_rows`: `due` is the newest release from before the day
+    MIN_AGE_DAYS ago (the lock cutoff `--exclude-newer <that day>T00:00:00Z` admits it) that runs on
+    the environments' Python, the one a pin may move to; `newest` the newest release of all, `why` says
+    why newest is not due (None when it is)."""
+    rows = release_rows(rows)
+    if not rows:
+        return None, None, None
+    cutoff = today - dt.timedelta(days=MIN_AGE_DAYS)
+    fits = [r for r in rows if python_ok(r[2]) and all(spec_ok(s, r[0]) for s, _ in constraints)]
+    old = [r for r in fits if r[1] < cutoff]
+    due = old[-1][0] if old else None
+    newest = rows[-1]
+    why = None
+    if due != newest[0]:
+        blocked = [(s, who) for s, who in constraints if not spec_ok(s, newest[0])]
+        if blocked:
+            why = f"{newest[0]} is outside what {blocked[0][1]} requires ({blocked[0][0]})"
+        elif not python_ok(newest[2]):
+            why = f"{newest[0]} needs Python {newest[2]}; the environments run Python {'.'.join(map(str, PYTHON[:2]))}"
+        else:
+            why = f"{newest[0]} was released {newest[1]}, due from {newest[1] + dt.timedelta(days=MIN_AGE_DAYS + 1)}"
+    return due, newest[0], why
 
 
 def catalog_sources(root):
-    """[(component, const name, pinned, fetch latest)] for the runtime pins in the catalog."""
+    """[(component, const name, pinned, fetch releases)] for the runtime pins in the catalog."""
     cat, tools = read(root, CATALOG), read(root, CATALOG_TOOLS)
     rows = [
         ("OpenVINO runtime", "OPENVINO_VERSION", rust_const(cat, "OPENVINO_VERSION"),
-         lambda: github_latest("openvinotoolkit/openvino")),
+         lambda: github_releases("openvinotoolkit/openvino")),
         ("ONNX Runtime (cpu/directml/coreml)", "ONNXRUNTIME_VERSION", rust_const(cat, "ONNXRUNTIME_VERSION"),
-         lambda: github_latest("microsoft/onnxruntime")),
+         lambda: github_releases("microsoft/onnxruntime")),
         ("ONNX Runtime (cuda)", "ONNXRUNTIME_CUDA_VERSION", rust_const(cat, "ONNXRUNTIME_CUDA_VERSION"),
-         lambda: github_latest("microsoft/onnxruntime")),
+         lambda: github_releases("microsoft/onnxruntime")),
         ("DirectML", "DIRECTML_VERSION", rust_const(cat, "DIRECTML_VERSION"),
-         lambda: nuget_latest("Microsoft.AI.DirectML")),
+         lambda: nuget_releases("Microsoft.AI.DirectML")),
         ("cuDNN (nvidia-cudnn-cu12)", "CUDNN_VERSION", rust_const(cat, "CUDNN_VERSION"),
-         lambda: pypi_latest("nvidia-cudnn-cu12")),
-        ("uv", "UV_VERSION", rust_const(cat, "UV_VERSION"), lambda: github_latest("astral-sh/uv")),
+         lambda: [(v, d, None) for v, d, _ in pypi_releases("nvidia-cudnn-cu12")]),
+        ("uv", "UV_VERSION", rust_const(cat, "UV_VERSION"), lambda: github_releases("astral-sh/uv")),
         ("VC++ runtime (msvc-runtime)", "VC_RUNTIME_VERSION", rust_const(tools, "VC_RUNTIME_VERSION"),
-         lambda: pypi_latest("msvc-runtime")),
+         lambda: [(v, d, None) for v, d, _ in pypi_releases("msvc-runtime")]),
     ]
     return rows
 
 
-def upstream(root):
-    rows, failures = [], 0
-    for component, const, pinned, latest_fn in catalog_sources(root):
-        if pinned is None:
-            rows.append((component, "?", "?", f"{const} not found in the catalog"))
-            failures += 1
-            continue
-        try:
-            latest = latest_fn()
-        except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
-            rows.append((component, pinned, "?", f"could not read upstream: {e}"))
-            failures += 1
-            continue
-        rows.append((component, pinned, latest, HOLDS.get(const, "")))
-    pins = requirement_pins(read(root, EXPORT_REQ))
-    pins.update(requirement_pins(read(root, TRAIN_REQ)))
-    for name, pinned in sorted(pins.items()):
-        try:
-            latest = pypi_latest(name)
-        except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
-            rows.append((f"{name} (Python)", pinned, "?", f"could not read PyPI: {e}"))
-            failures += 1
-            continue
-        rows.append((f"{name} (Python)", pinned, latest, ""))
-    total = len(rows)
-    newer = [r for r in rows if r[2] != "?" and is_newer(r[2], r[1]) and not any(r[3] == h for h in HOLDS.values())]
-    held = [r for r in rows if r[2] != "?" and is_newer(r[2], r[1]) and any(r[3] == h for h in HOLDS.values())]
+def upstream_report(rows):
+    """Markdown report and whether anything is due, from rows of
+    {component, pinned, due, newest, why, hold} (due/newest None = could not be read; `why` then
+    says why)."""
+    unread = [r for r in rows if r["newest"] is None]
+    read_ok = [r for r in rows if r["newest"] is not None]
+    due = [r for r in read_ok if r["due"] and is_newer(r["due"], r["pinned"]) and not r["hold"]]
+    held = [r for r in read_ok if r["hold"] and is_newer(r["newest"], r["pinned"])]
+    waiting = [r for r in read_ok if not r["hold"] and is_newer(r["newest"], r["pinned"])
+               and r["why"] and not (r["due"] and is_newer(r["due"], r["pinned"]))]
+    later = [r for r in due if r["why"]]
     lines = []
-    if newer:
-        lines += ["Newer upstream releases than the pinned versions. Nothing was changed: bump a pin in a reviewed",
+    if due:
+        lines += ["Newer upstream releases than the pinned versions, at least "
+                  f"{MIN_AGE_DAYS} days old. Nothing was changed: bump a pin in a reviewed",
                   "commit (catalog URL, size and SHA-256; or the requirements pin and regenerated locks), and read the",
                   "upstream release notes for breaking changes first.", "",
-                  "| Component | Pinned | Latest |", "|---|---|---|"]
-        lines += [f"| {c} | {p} | {l} |" for c, p, l, _ in newer]
+                  "| Component | Pinned | Due | Newest |", "|---|---|---|---|"]
+        lines += [f"| {r['component']} | {r['pinned']} | {r['due']} | {r['newest']} |" for r in due]
+        if later:
+            lines += [""] + [f"- {r['component']}: {r['why']}" for r in later]
+    if waiting:
+        lines += ["", "Newer, but not due yet:", "", "| Component | Pinned | Newest | Why not yet |", "|---|---|---|---|"]
+        lines += [f"| {r['component']} | {r['pinned']} | {r['newest']} | {r['why']} |" for r in waiting]
     if held:
-        lines += ["", "Held back on purpose:", "", "| Component | Pinned | Latest | Why |", "|---|---|---|---|"]
-        lines += [f"| {c} | {p} | {l} | {n} |" for c, p, l, n in held]
-    errs = [r for r in rows if r[2] == "?"]
-    if errs:
-        lines += ["", "Could not check:", ""] + [f"- {c}: {n}" for c, _, _, n in errs]
+        lines += ["", "Held back on purpose:", "", "| Component | Pinned | Newest | Why |", "|---|---|---|---|"]
+        lines += [f"| {r['component']} | {r['pinned']} | {r['newest']} | {r['hold']} |" for r in held]
+    if unread:
+        lines += ["", "Could not check:", ""] + [f"- {r['component']}: {r['why']}" for r in unread]
     if not lines:
         lines = ["Every pin is at its latest upstream release."]
-    code = UNREADABLE if failures == total else (REPORT if newer else 0)
-    return "\n".join(lines) + "\n", code
+    elif not due:
+        lines = ["No pin is due for a bump."] + lines
+    return "\n".join(lines) + "\n", bool(due)
+
+
+def upstream(root, today):
+    rows, failures = [], 0
+
+    def add(component, pinned, fetch, hold="", constraints=()):
+        nonlocal failures
+        try:
+            d, newest, why = due_release(fetch(), today, constraints)
+            if newest is None and version_key(pinned) is None:
+                return  # a pre-release pin of a project with no release yet (torch-hungarian): by hand
+            if newest is None:
+                raise ValueError("no releases listed")
+        except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
+            failures += 1
+            rows.append(dict(component=component, pinned=pinned, due=None, newest=None,
+                             why=f"could not read upstream: {e}", hold=hold))
+            return
+        rows.append(dict(component=component, pinned=pinned, due=d, newest=newest, why=why, hold=hold))
+
+    for component, const, pinned, fetch in catalog_sources(root):
+        if pinned is None:
+            failures += 1
+            rows.append(dict(component=component, pinned="?", due=None, newest=None,
+                             why=f"{const} not found in the catalog", hold=""))
+            continue
+        add(component, pinned, fetch, HOLDS.get(const, ""))
+    pins = python_pins(root)
+    try:
+        cons = pin_constraints(pins, pypi_requires_dist)
+        for c in pin_conflicts(pins, cons):
+            rows.append(dict(component=c.split("==", 1)[0] + " (Python)", pinned=c.split("==", 1)[1].split(":", 1)[0],
+                             due=None, newest=None, why=f"pin conflict: {c}", hold=""))
+            failures += 1
+    except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
+        cons = {}
+        failures += 1
+        rows.append(dict(component="Requirements of the pinned Python packages", pinned="?", due=None,
+                         newest=None, why=f"could not read PyPI: {e}", hold=""))
+    for name, pinned in sorted(pins.items()):
+        add(f"{name} (Python)", pinned, lambda n=name: pypi_releases(n), HOLDS.get(name, ""),
+            cons.get(name, ()))
+    text, any_due = upstream_report(rows)
+    code = UNREADABLE if failures == len(rows) else (REPORT if any_due else 0)
+    return text, code
 
 
 def lock_packages(root):
@@ -352,6 +560,69 @@ def self_test():
     dates = review_dates('ignore = [\n { id = "RUSTSEC-1", reason = "x. Review by 2027-04-01" },\n]')
     assert dates == [("RUSTSEC-1", dt.date(2027, 4, 1))], dates
 
+    for spec, ok in ((None, True), ("", True), (">=3.10", True), (">=3.12", False), (">=3.9,<3.14", True),
+                     ("<3.11", False), ("!=3.11.*", False), ("==3.11.*", True), ("~=3.8", True), ("~=3.12", False),
+                     (">=3.10.0", True), ("!=3.0.*,!=3.1.*,>=2.7", True)):
+        assert python_ok(spec) is ok, (spec, ok)
+    assert spec_ok("<1.9.0,>=1.8.2", "1.8.2") and not spec_ok("<1.9.0,>=1.8.2", "1.9.0")
+    assert spec_ok("==1.0.1", "1.0.1") and not spec_ok("==1.0.1", "1.3.0") and spec_ok("", "9")
+    assert spec_ok("==2.9.*", "2.9.1") and not spec_ok("==2.9.*", "2.14.1")
+    assert parse_requirement('torchmetrics[detection]<1.9.0,>=1.8.2; extra == "train"') == (
+        "torchmetrics", "<1.9.0,>=1.8.2", {"train"})
+    assert parse_requirement("transformers (<6.0.0,>=5.1.0)") == ("transformers", "<6.0.0,>=5.1.0", set())
+    dist = {("rfdetr", "1.11.2"): ['transformers<6.0.0,>=5.1.0', 'torchmetrics[detection]<1.9.0,>=1.8.2; extra == "train"',
+                                   'hotcoco==1.0.1; extra == "train"', 'torch==2.9.*; sys_platform == "linux" and extra == "xla"',
+                                   'roboflow; extra == "train"', 'peft; extra == "train"'],
+            ("torchmetrics", "1.8.2"): ['torch>=2.0.0', 'scipy>1.0.0; extra == "detection"', 'numpy>1; extra == "image"']}
+    cons = pin_constraints({"rfdetr": "1.11.2", "torchmetrics": "1.8.2", "hotcoco": "1.0.1", "torch": "2.14.1",
+                            "transformers": "5.20.2", "scipy": "1.17.1", "peft": "0.21.2"},
+                           lambda n, v: dist.get((n, v)))
+    assert cons == {"transformers": [("<6.0.0,>=5.1.0", "rfdetr 1.11.2")],
+                    "torchmetrics": [("<1.9.0,>=1.8.2", "rfdetr 1.11.2")],
+                    "hotcoco": [("==1.0.1", "rfdetr 1.11.2")],
+                    "torch": [(">=2.0.0", "torchmetrics 1.8.2")],
+                    "scipy": [(">1.0.0", "torchmetrics 1.8.2")]}, cons
+    day = dt.date(2026, 11, 7)
+    d = dt.date.fromisoformat
+    pins = {"rfdetr": "1.11.2", "torchmetrics": "1.9.0", "hotcoco": "1.0.1", "torch": "2.14.1"}
+    assert pin_conflicts(pins, cons) == ["torchmetrics==1.9.0: rfdetr 1.11.2 requires <1.9.0,>=1.8.2"]
+    pins["torchmetrics"] = "1.8.2"
+    assert pin_conflicts(pins, cons) == []
+    tm = [("1.8.2", d("2025-09-01"), None), ("1.9.0", d("2026-03-09"), None)]
+    assert due_release(tm, day, cons["torchmetrics"]) == (
+        "1.8.2", "1.9.0", "1.9.0 is outside what rfdetr 1.11.2 requires (<1.9.0,>=1.8.2)")
+    rel = [("1.17.1", d("2026-02-01"), ">=3.11"), ("1.18.1", d("2026-08-21"), ">=3.12"),
+           ("2.0.0rc1", d("2026-01-01"), None), ("1.17.0", d("2026-01-01"), ">=3.11")]
+    assert due_release(rel, day) == ("1.17.1", "1.18.1", "1.18.1 needs Python >=3.12; the environments run Python 3.11")
+    rel = [("8.4.163", d("2026-09-26"), None), ("8.4.184", d("2026-10-22"), None), ("8.4.188", d("2026-10-24"), None),
+           ("8.4.207", d("2026-11-07"), None)]
+    assert due_release(rel, day) == ("8.4.184", "8.4.207", "8.4.207 was released 2026-11-07, due from 2026-11-22")
+    assert due_release(rel[:2], day) == ("8.4.184", "8.4.184", None)
+    assert due_release(rel[:3], dt.date(2026, 11, 8))[0] == "8.4.188"
+    assert due_release([("1.0", d("2026-11-01"), None)], day) == (None, "1.0", "1.0 was released 2026-11-01, due from 2026-11-16")
+    assert due_release([], day) == (None, None, None)
+
+    def row(c, p, due, newest, why=None, hold=""):
+        return dict(component=c, pinned=p, due=due, newest=newest, why=why, hold=hold)
+    text, any_due = upstream_report([
+        row("ultralytics (Python)", "8.4.163", "8.4.184", "8.4.207", "8.4.207 was released 2026-11-07, due from 2026-11-22"),
+        row("rfdetr (Python)", "1.11.2", "1.11.2", "1.12.0", "1.12.0 was released 2026-11-06, due from 2026-11-21"),
+        row("scipy (Python)", "1.17.1", "1.17.1", "1.18.1", "1.18.1 needs Python >=3.12; the environments run Python 3.11"),
+        row("ONNX Runtime (cpu/directml/coreml)", "1.24.4", "1.31.0", "1.31.1", hold="DirectML"),
+        row("onnx (Python)", "1.23.2", "1.23.2", "1.23.2"),
+        row("uv", "0.13.5", None, None, "could not read upstream: timeout")])
+    assert any_due
+    assert "| ultralytics (Python) | 8.4.163 | 8.4.184 | 8.4.207 |" in text, text
+    assert "- ultralytics (Python): 8.4.207 was released" in text, text
+    assert "| rfdetr (Python) | 1.11.2 | 1.12.0 | 1.12.0 was released" in text, text
+    assert "| scipy (Python) | 1.17.1 | 1.18.1 | 1.18.1 needs Python" in text, text
+    assert "| ONNX Runtime (cpu/directml/coreml) | 1.24.4 | 1.31.1 | DirectML |" in text, text
+    assert "onnx (Python)" not in text and "- uv: could not read upstream" in text, text
+    text, any_due = upstream_report([row("rfdetr (Python)", "1.11.2", "1.11.2", "1.12.0", "too new")])
+    assert not any_due and text.startswith("No pin is due for a bump.\n\nNewer, but not due yet:"), text
+    text, any_due = upstream_report([row("onnx (Python)", "1.23.2", "1.23.2", "1.23.2")])
+    assert not any_due and text == "Every pin is at its latest upstream release.\n", text
+
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
 
@@ -402,7 +673,7 @@ def self_test():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    ap.add_argument("command", nargs="?", choices=("consistency", "upstream", "audit"))
+    ap.add_argument("command", nargs="?", choices=("consistency", "upstream", "audit", "conflicts"))
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--today", type=dt.date.fromisoformat, default=None)
     ap.add_argument("--out", type=Path, help="also write the report (Markdown) here")
@@ -421,7 +692,12 @@ def main():
         if not errors:
             print("dependency pins consistent")
         return 1 if errors else 0
-    text, code = upstream(ROOT) if a.command == "upstream" else audit(ROOT)
+    if a.command == "upstream":
+        text, code = upstream(ROOT, a.today or dt.date.today())
+    elif a.command == "conflicts":
+        text, code = conflicts(ROOT)
+    else:
+        text, code = audit(ROOT)
     sys.stdout.write(text)
     if a.out:
         a.out.write_text(text, encoding="utf-8")

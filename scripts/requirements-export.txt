@@ -10,6 +10,6 @@
 #   uv pip install --require-hashes --no-deps --only-binary :all: --torch-backend cpu -r <lock>
 # (drop --torch-backend cpu on macOS). Those locks have no `openvino` package, which the OpenVINO IR
 # step of export_model.py needs (--no-openvino skips it); install it next to them with
-#   uv pip install openvino==2026.4.0
+#   uv pip install openvino==2026.4.1
 -r requirements-model-export.txt
-openvino==2026.4.0
+openvino==2026.4.1

@@ -901,7 +901,8 @@ fn auto_download_off_reports_with_command() {
     assert!(r.downloads().is_empty(), "nothing is downloaded");
     let msg = r.manual_message().unwrap();
     assert!(msg.contains(FETCH_FOR_CONFIG), "{msg}");
-    assert!(msg.contains("OpenVINO runtime 2026.4.0 (235 MB)"), "{msg}");
+    let ov_line = format!("OpenVINO runtime {} (237 MB)", catalog::OPENVINO_VERSION);
+    assert!(msg.contains(&ov_line), "{msg}");
     assert!(msg.contains("Model IPcam-general"), "{msg}");
     assert_eq!(
         r.needs[1].fetch_command(),
@@ -990,7 +991,11 @@ fn detect_installed_reads_the_layout() {
     let root = std::env::temp_dir().join(format!("bop-resources-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("openvino")).unwrap();
-    std::fs::write(root.join("openvino/VERSION"), "2026.4.0\n").unwrap();
+    std::fs::write(
+        root.join("openvino/VERSION"),
+        format!("{}\n", catalog::OPENVINO_VERSION),
+    )
+    .unwrap();
     std::fs::create_dir_all(root.join("onnxruntime/cuda")).unwrap();
     std::fs::write(root.join("onnxruntime/cuda/flavor.txt"), "cuda\n").unwrap();
     std::fs::create_dir_all(root.join("models")).unwrap();
@@ -1600,7 +1605,13 @@ fn yolo26_exports_and_uv_are_pinned() {
         // release assets.
         let mdv6 = name.starts_with("mdv6-");
         if mdv6 {
-            assert_eq!(r.version, "ultralytics-8.4.163+zenodo-15398270");
+            assert_eq!(
+                r.version,
+                format!(
+                    "ultralytics-{}+zenodo-15398270",
+                    catalog::ULTRALYTICS_VERSION
+                )
+            );
             assert!(p.file_name.starts_with("MDV6-") && p.file_name.ends_with(".pt"));
             assert_eq!(
                 p.url,
@@ -1680,7 +1691,10 @@ fn yolo26_exports_and_uv_are_pinned() {
         assert_eq!(part.file_name, file);
         assert_eq!(
             part.url,
-            format!("https://github.com/astral-sh/uv/releases/download/0.12.19/{file}")
+            format!(
+                "https://github.com/astral-sh/uv/releases/download/{}/{file}",
+                catalog::UV_VERSION
+            )
         );
         assert_eq!(part.layout, Layout::Uv);
         let zip = file.ends_with(".zip");

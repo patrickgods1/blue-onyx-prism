@@ -9,7 +9,7 @@ files are kept next to their libraries in the archive.
 
 ### OpenVINO (`openvino/`)
 
-- Intel OpenVINO toolkit runtime 2026.4.0 (pinned as `OPENVINO_VERSION` in `src/resources/catalog/mod.rs`).
+- Intel OpenVINO toolkit runtime 2026.4.1 (pinned as `OPENVINO_VERSION` in `src/resources/catalog/mod.rs`).
 - Copyright (C) 2018-2026 Intel Corporation.
 - License: Apache License 2.0 (full text below).
 - Upstream: https://github.com/openvinotoolkit/openvino

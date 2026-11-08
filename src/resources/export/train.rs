@@ -515,7 +515,7 @@ mod train_env_tests {
             // One OpenCV build only (a second would overwrite cv2).
             assert!(!l.text.contains("opencv-python-headless=="), "{}", l.name);
             if let Some(b) = backend {
-                assert!(l.text.contains(&format!("torch==2.14.0+{b}")), "{}", l.name);
+                assert!(l.text.contains(&format!("torch==2.14.1+{b}")), "{}", l.name);
             }
         }
         assert!(train_lock("macos", "aarch64", TrainLane::Cu126).is_none());

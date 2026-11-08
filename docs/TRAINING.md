@@ -65,7 +65,7 @@ PyTorch's because the child process inherits the service's `CUDA_VISIBLE_DEVICES
 
 | Family | Sizes | Trainer | Base weights | Licence of the result | Service family |
 |---|---|---|---|---|---|
-| YOLO26 | n, s, m, l, x | Ultralytics 8.4.163 | the model export's `model:yolo26<size>` `.pt` pins | AGPL-3.0 | `yolo26` (end-to-end `[1, 300, 6]`) |
+| YOLO26 | n, s, m, l, x | Ultralytics 8.4.184 | the model export's `model:yolo26<size>` `.pt` pins | AGPL-3.0 | `yolo26` (end-to-end `[1, 300, 6]`) |
 | YOLO11 | n, s, m, l, x | Ultralytics | `model:yolo11<size>` | AGPL-3.0 | `yolo8` (`[1, 4 + C, A]`, NMS in the service) |
 | YOLOv8 | n, s, m, l, x | Ultralytics | `model:yolov8<size>` | AGPL-3.0 | `yolo8` |
 | RF-DETR | nano, small, medium, base, large | `rfdetr` 1.11.2 (its training stack) | Roboflow's COCO checkpoints (`train-base:rfdetr-<size>`, the package's own pins, SHA-256 checked) | Apache-2.0 | `rfdetr` |
@@ -141,10 +141,10 @@ benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on
   `scripts/requirements-model-train.txt` with `scripts/model-export/gen_train_locks.sh <pinned uv>`.
   All five are resolved with uv's cross-platform resolution (`--python-platform`); the CUDA ones were
   generated on macOS and have not been installed on a Windows or Linux machine yet.
-- Contents: torch 2.14.0 / torchvision 0.29.0, ultralytics 8.4.163, transformers 5.17.0, accelerate
+- Contents: torch 2.14.1 / torchvision 0.29.1, ultralytics 8.4.184, transformers 5.20.2, accelerate
   1.15.0, rfdetr 1.11.2 with its training extra except `roboflow` (only for uploading to Roboflow; it
   pins a second OpenCV build that would overwrite Ultralytics' `cv2`), onnx, onnxruntime, onnxslim;
-  for the footage import and auto-labelling (below) PyAV 18.1.0 (`av`) and yt-dlp 2026.8.19.
+  for the footage import and auto-labelling (below) PyAV 18.1.0 (`av`; 19 needs Python 3.12) and yt-dlp 2026.10.21.
   The shared pins match the export environment, so a trained model is exported like a downloaded one.
 - Size: about 450 MB download / 1.5 GB on disk on macOS; about 3 GB download / 6.5 GB on disk with
   CUDA. Over 500 MB, so the first run needs `allow_large_downloads`, the page's confirmation box or
