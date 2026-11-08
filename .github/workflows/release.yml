@@ -80,7 +80,7 @@ jobs:
         with:
           toolchain: 1.99.0 # keep equal to rust-toolchain.toml
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Determine version
         shell: bash
@@ -122,8 +122,9 @@ jobs:
               cp "$OUT/$b.exe" "$STAGE/"
             done
             cp scripts/*.ps1 "$STAGE/scripts/"
-            # The Visual C++ runtime next to the exes (the MSI installs the same files).
-            pwsh -NoProfile -File packaging/windows/stage-vcruntime.ps1 -Dest "$STAGE"
+            # The Visual C++ runtime next to the exes (the MSI installs the same files), from the
+            # pinned tool:vc-runtime wheel fetched by the CLI just built, not the runner's Visual Studio.
+            pwsh -NoProfile -File packaging/windows/stage-vcruntime.ps1 -Dest "$STAGE" -Cli "$OUT/blue-onyx-prism.exe"
           else
             # The service binary is Windows-only (a stub elsewhere), so it is not shipped.
             for b in blue-onyx-prism blue-onyx-prism-benchmark test-blue-onyx-prism; do
@@ -142,7 +143,7 @@ jobs:
               cp deploy/com.blueonyx.prism.plist deploy/com.blueonyx.prism.tray.plist "$STAGE/deploy/"
             fi
           fi
-          cp scripts/export_model.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt "$STAGE/scripts/"
+          cp scripts/export_model.py scripts/convert_onnx_to_ir.py scripts/requirements-export.txt scripts/requirements-model-export.txt "$STAGE/scripts/"
           # By-hand training where the service cannot train (capability::BY_HAND); the service
           # itself runs the copies embedded in the binary.
           cp scripts/train_model.py scripts/autolabel.py scripts/requirements-model-train.txt "$STAGE/scripts/"

@@ -48,8 +48,7 @@ all offline, static-shape ONNX checked against PyTorch with ONNX Runtime, stampe
 CoreML cache is otherwise keyed by path). A manifest of another version = "needs export". `catalog::F32_MODELS`
 (RF-DETR L, DEIMv2 L/X) overflow f16: OpenVINO compiles them with f32 on CPU and GPU.
 
-Python export env (models -> ONNX + OpenVINO IR, by hand): `.venv` (Python 3.11, `ultralytics`, `openvino`,
-`transformers`), created with `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt`;
+Python export env (models -> ONNX + OpenVINO IR, by hand): `.venv` (Python 3.11; `scripts/requirements-export.txt` = `-r requirements-model-export.txt`, the exact `==` pins the service uses, plus `openvino==`; the hashed per-platform locks in `scripts/model-export/locks/` are the stricter option), created with `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt`;
 run `.venv/bin/python scripts/export_model.py --name yolo26s` (Windows: `.venv/Scripts/python.exe`).
 
 OpenVINO libs are discovered through `openvino-finder`: `OPENVINO_INSTALL_DIR` (Windows; on Unix

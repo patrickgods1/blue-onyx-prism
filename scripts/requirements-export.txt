@@ -1,15 +1,15 @@
 # Python environment for exporting models by hand with scripts/export_model.py (Ultralytics YOLO,
-# RF-DETR, DEIMv2 -> ONNX + OpenVINO IR). The service's on-demand export uses its own pinned set:
-# requirements-model-export.txt.
-# Python 3.10-3.12. Create with:  uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt
-# (or: python -m venv .venv && .venv/bin/pip install -r scripts/requirements-export.txt)
-ultralytics>=8.4,<9
-openvino>=2026.0,<2027
-pyyaml>=6
-# ONNX export (on by default; --no-onnx skips it). Ultralytics would otherwise try to install these itself.
-onnx>=1.12,<2
-onnxslim>=0.1.82
-onnxruntime>=1.20
-# RF-DETR (transformers RfDetrForObjectDetection) and DEIMv2 (safetensors checkpoints).
-transformers>=5.17,<6
-safetensors>=0.8
+# RF-DETR, DEIMv2 -> ONNX + OpenVINO IR). Python 3.11. Create with:
+#   uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt
+#   (or: python -m venv .venv && .venv/bin/pip install -r scripts/requirements-export.txt)
+#
+# Exact versions (no ranges), the same set the service's on-demand export installs. For the same
+# set checked against SHA-256 hashes use the service's lock for your platform instead (in the
+# repository: scripts/model-export/locks/macos-arm64.txt on macOS arm64,
+# scripts/model-export/locks/torch-cpu-index.txt on Linux and Windows):
+#   uv pip install --require-hashes --no-deps --only-binary :all: --torch-backend cpu -r <lock>
+# (drop --torch-backend cpu on macOS). Those locks have no `openvino` package, which the OpenVINO IR
+# step of export_model.py needs (--no-openvino skips it); install it next to them with
+#   uv pip install openvino==2026.4.0
+-r requirements-model-export.txt
+openvino==2026.4.0

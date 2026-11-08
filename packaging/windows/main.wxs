@@ -191,7 +191,7 @@
       <Component Id="BenchmarkComponent" Bitness="always64">
         <File Id="BenchmarkExe" Source="$(var.BinDir)\blue-onyx-prism-benchmark.exe" KeyPath="yes" />
       </Component>
-      <!-- Visual C++ runtime, app-local (stage-vcruntime.ps1): Windows looks in the program
+      <!-- Visual C++ runtime, app-local (stage-vcruntime.ps1, from the pinned tool:vc-runtime wheel): Windows looks in the program
            folder before System32, so the exes and the OpenVINO / ONNX Runtime DLLs they load from
            the data folder run on a machine without the VC++ redistributable, or with an old one.
            One component per versioned file. -->
