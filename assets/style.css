@@ -124,6 +124,8 @@ table { border-collapse: collapse; width: 100%; background: var(--card); border:
 th, td { padding: 0.45rem 0.7rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
 th { font-weight: 600; font-size: 0.85rem; color: var(--muted); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* A numeric column's heading sits over its right-aligned numbers (card layouts hide thead). */
+th.num { text-align: right; }
 tbody tr:last-child td { border-bottom: none; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.2rem; margin: 1rem 0; }
 .card h2:first-child { margin-top: 0; }
@@ -148,7 +150,7 @@ button.danger { background: var(--card); color: #c0392b; border-color: #c0392b; 
 button.danger:hover { background: #c0392b; color: #fff; }
 button:disabled { opacity: 0.55; cursor: default; }
 button:focus-visible, a:focus-visible, th.sortable:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-img.result { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; }
+img.result { max-width: 100%; max-height: 80svh; width: auto; height: auto; border: 1px solid var(--border); border-radius: 6px; }
 .card .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.75rem; }
 
 /* Footer endpoints */
@@ -219,13 +221,21 @@ table.sticky-first td:first-child, table.sticky-first thead tr:first-child th:fi
   box-shadow: 1px 0 0 var(--border);
 }
 table.stats td, table.stats th { white-space: nowrap; }
+table.stats td.trunc { max-width: 16rem; }
+/* Eleven columns in the page width: headings wrap ("Round trip / ms"), padding a little tighter. */
+table.stats th { white-space: normal; vertical-align: bottom; }
+table.stats th, table.stats td { padding-left: 0.5rem; padding-right: 0.5rem; }
+/* A timing's min-max, under its average. */
+table.stats td .sub { display: block; font-size: 0.78rem; color: var(--muted); }
 
 /* Test page */
 .drop { border: 2px dashed var(--border); border-radius: 8px; padding: 0.6rem 0.9rem; }
 .drop.over { border-color: var(--accent); background: var(--code-bg); }
 .drop img { display: block; max-width: 100%; max-height: 16rem; margin-top: 0.5rem; border-radius: 6px; }
 .drop img[hidden] { display: none; }
-canvas.result { max-width: 100%; height: auto; border: 1px solid var(--border); border-radius: 6px; }
+/* A tall image fits the window: the width from the image's ratio and size (`--ar`, `--nw`, set by
+   test.js), never more than the column; the height follows. */
+canvas.result { width: min(100%, calc(80svh * var(--ar, 1.78)), var(--nw, 100%)); height: auto; border: 1px solid var(--border); border-radius: 6px; }
 .result-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
 @media (max-width: 800px) { .result-grid { grid-template-columns: 1fr; } }
 
@@ -481,10 +491,9 @@ fieldset.group legend .tag { margin-left: 0.4rem; font-weight: normal; vertical-
 fieldset.group > p, fieldset.group > label.check, fieldset.group > .wide { grid-column: 1 / -1; }
 fieldset.group > p { margin: 0.2rem 0 0.4rem; font-size: 0.85rem; }
 
-/* Models card: a control and its small hint line under it; the file name only. */
-table.model-card .sub { display: block; font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; white-space: nowrap; }
+/* Models card: a control and its small hint line under it (hints wrap to the column). */
+table.model-card .sub { display: block; font-size: 0.78rem; color: var(--muted); margin-top: 0.15rem; white-space: normal; }
 table.model-card .sub button.small { padding: 0 0.4rem; font-size: 0.75rem; margin: 0 0 0 0.2rem; }
-table.model-card td.file code { max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 table.model-card select { max-width: 16rem; }
 .card > .actions + p.muted { margin-bottom: 0; }
 
@@ -769,6 +778,12 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .review-stage { min-width: 0; }
 .review-stage canvas { display: block; width: 100%; height: auto; background: #000; border-radius: 6px; cursor: crosshair; touch-action: none; }
 .review-stage canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Wide screens: the whole frame and the line over it (`--rv-head`) fit the window. The width follows
+   the frame's ratio (`--rv-ar`; both set by review.js) so CSS width / height never disagree with the
+   canvas buffer (pointer mapping reads the rect); small frames still grow to the column width. */
+@media (min-width: 701px) {
+  .review-stage canvas { width: min(100%, calc((100svh - 2rem - var(--rv-head, 0px)) * var(--rv-ar, 1.78))); height: auto; margin-inline: auto; }
+}
 .review-meta { font-size: 0.85rem; margin: 0 0 0.4rem; overflow-wrap: anywhere; }
 .review-side.card { margin: 0; min-width: 0; }
 .review-side > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; color: var(--muted); }
@@ -935,7 +950,7 @@ details.tr-tasks > summary { color: var(--fg); font-weight: 600; }
 .tr-folder { display: flex; flex-wrap: wrap; align-items: center; gap: 0 0.6rem; }
 .tr-folder label.check { flex: 1 1 18rem; min-width: 0; overflow-wrap: anywhere; }
 .tr-folder button.small { margin: 0; }
-table.tr-models th[scope="row"] { white-space: nowrap; color: var(--fg); font-size: 0.95rem; }
+table.tr-models th[scope="row"] { white-space: normal; max-width: 14rem; color: var(--fg); font-size: 0.95rem; }
 table.tr-models td.tr-size { min-width: 8.5rem; }
 table.tr-models td.tr-size label.check { margin: 0 0 0.15rem; align-items: center; }
 table.tr-models td.tr-size label.check input { margin-top: 0; }
@@ -964,15 +979,23 @@ input.num-sm { width: 6rem; }
 table.buckets input[type="number"] { width: 6rem; }
 table.buckets td:first-child code { overflow-wrap: normal; white-space: nowrap; }
 
-/* Stats: the state cell wraps (short state, then its detail); two-row header ends level. */
-table.stats td.state { white-space: normal; min-width: 12rem; max-width: 26rem; overflow-wrap: anywhere; }
+/* Stats: the state cell wraps (short state, then its detail). */
+table.stats td.state { white-space: normal; min-width: 10rem; max-width: 26rem; overflow-wrap: anywhere; }
 table.stats td.state .detail { font-weight: normal; color: var(--muted); font-size: 0.85rem; }
-table.stats thead th[rowspan] { vertical-align: bottom; }
 
-/* Config Models card: the file name in full (path in the tooltip); a failure on one line. */
-table.model-card td.file { min-width: 7rem; max-width: 13rem; }
-table.model-card td.file code { max-width: none; overflow: visible; white-space: normal; display: inline; overflow-wrap: break-word; }
-table.model-card td.model-device select { max-width: 12rem; }
+/* Config Models card: the name, then its family + licence and file (in full, path in the
+   tooltip) and Remove under it; a failure on one line. */
+table.model-card td.mc-name { min-width: 9rem; max-width: 14rem; overflow-wrap: anywhere; }
+table.model-card td.mc-name .sub { font-weight: normal; font-size: 0.8rem; }
+table.model-card .mc-file code { overflow-wrap: anywhere; }
+table.model-card .mc-remove { display: block; margin-top: 0.3rem; font-weight: normal; }
+table.model-card .mc-remove button { margin: 0; }
+table.model-card td.model-device select { max-width: 16rem; }
+/* Eight columns in 1280 px: the night select holds a model name, Load and Default are narrow. */
+@media (min-width: 901px) {
+  table.model-card td.model-night select { max-width: 11rem; }
+  table.model-card th:nth-child(-n+2), table.model-card td.mc-load, table.model-card td.mc-default { padding-left: 0.4rem; padding-right: 0.4rem; }
+}
 table.model-card td.running { max-width: 12rem; min-width: 7rem; }
 table.model-card td.running .run-text { display: block; }
 details.run-detail > summary { color: inherit; margin: 0.1rem 0 0; font-size: 0.8rem; font-weight: normal; list-style-position: inside; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 12rem; }
@@ -1079,7 +1102,8 @@ details.adv > .card { margin-left: 0; margin-right: 0; }
 table.lineup-table { width: 100%; }
 table.lineup-table thead th { vertical-align: bottom; }
 table.lineup-table th.lineup-group { text-align: center; border-left: 1px solid var(--border); }
-table.lineup-table th.lineup-group.num { text-align: right; }
+/* Totals and the per-scene sub-headings over right-aligned numbers. */
+table.lineup-table th.lineup-group.num, table.lineup-table th.num { text-align: right; }
 table.lineup-table th.lineup-model { text-align: left; }
 table.lineup-table td.lineup-model { min-width: 12rem; white-space: normal; }
 table.lineup-table .lineup-name { font-weight: 600; }
@@ -1259,7 +1283,7 @@ table.tr-mtable tr.best-epoch td { background: var(--ok-bg); }
 .cp-badge.tr-cls-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
 .cp-chip:not(:has(input[type=checkbox]:checked)) .tr-scene-warn { display: none; }
 #train-classes .tr-radios { align-items: baseline; gap: 0 1rem; }
-.tr-rec { white-space: nowrap; font-weight: normal; }
+.tr-rec { white-space: normal; font-weight: normal; }
 details.tr-compare { margin: 0.4rem 0 0.8rem; }
 details.tr-compare > summary { cursor: pointer; font-weight: 600; margin: 0.2rem 0 0.4rem; overflow-wrap: anywhere; }
 table.tr-ctable { font-size: 0.85rem; width: auto; min-width: 100%; }
@@ -1382,7 +1406,7 @@ td.tr-bal-bars { vertical-align: middle; }
   table.model-card > tbody > tr > td.mc-name { grid-column: 1 / 3; grid-row: 1; font-weight: 600; font-size: 1rem; }
   table.model-card > tbody > tr > td.mc-load { grid-column: 3; grid-row: 1; }
   table.model-card > tbody > tr > td.mc-default { grid-column: 4; grid-row: 1; }
-  table.model-card > tbody > tr > td.model-device, table.model-card > tbody > tr > td.file { grid-column: span 3; }
+  table.model-card > tbody > tr > td.model-device { grid-column: span 3; }
   table.model-card > tbody > tr > td.model-thr, table.model-card > tbody > tr > td.model-night,
   table.model-card > tbody > tr > td.model-classes, table.model-card > tbody > tr > td.running { grid-column: span 2; }
   table.model-card select, table.model-card td.model-device select { width: 100%; max-width: 100%; }
@@ -1432,8 +1456,9 @@ td.tr-bal-bars { vertical-align: middle; }
   table.stats td { white-space: normal; }
 
   /* Config: Load and Default beside the name, then one field per line. */
-  table.model-card > tbody > tr { grid-template-columns: minmax(0, 1fr) auto auto; gap: 0 0.8rem; align-items: center; }
-  table.model-card > tbody > tr > td, table.model-card > tbody > tr > td.model-device, table.model-card > tbody > tr > td.file,
+  /* `display` again: table.rcards rows are blocks here, which put Load and Default over the name. */
+  table.model-card > tbody > tr { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0 0.8rem; align-items: center; }
+  table.model-card > tbody > tr > td, table.model-card > tbody > tr > td.model-device,
   table.model-card > tbody > tr > td.model-thr, table.model-card > tbody > tr > td.model-night,
   table.model-card > tbody > tr > td.model-classes, table.model-card > tbody > tr > td.running { grid-column: 1 / -1; }
   table.model-card > tbody > tr > td[data-label]::before { min-width: 6.2rem; }
@@ -1441,9 +1466,8 @@ td.tr-bal-bars { vertical-align: middle; }
   table.model-card > tbody > tr > td.mc-name { grid-column: 1; grid-row: 1; }
   table.model-card > tbody > tr > td.mc-load { grid-column: 2; grid-row: 1; }
   table.model-card > tbody > tr > td.mc-default { grid-column: 3; grid-row: 1; }
-  table.model-card > tbody > tr > td.mc-load, table.model-card > tbody > tr > td.mc-default { text-align: center; }
+  table.model-card > tbody > tr > td.mc-load, table.model-card > tbody > tr > td.mc-default { text-align: center; align-self: start; }
   table.model-card > tbody > tr > td.mc-load::before, table.model-card > tbody > tr > td.mc-default::before { display: block; min-width: 0; margin: 0; }
-  table.model-card td.file code { max-width: 100%; }
   ul.thr-profile-list li { white-space: normal; }
 
   /* Collect: the bucket's name and switch on one line. */

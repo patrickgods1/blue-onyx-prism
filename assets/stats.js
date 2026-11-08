@@ -3,8 +3,8 @@
 (function () {
   var body = document.getElementById("stats-body"), live = document.getElementById("live");
   // Column names for the cards of a phone, the same as the template's data-label.
-  var LABELS = ["", "", "Runtime", "Device", "Fell back", "Requests", "Dropped", "Queue"];
-  ["Inference", "Process", "Round trip"].forEach(function (n) { LABELS.push(n + " avg", n + " min", n + " max"); });
+  var LABELS = ["", "", "Runtime", "Device", "Fell back", "Requests", "Dropped", "Queue",
+    "Inference ms", "Process ms", "Round trip ms"];
   function td(text, cls, title) {
     var c = document.createElement("td");
     c.textContent = text;
@@ -12,9 +12,14 @@
     if (title) c.title = title;
     return c;
   }
+  // One timing in one cell: the average, min-max under it (as the template).
   function stat(s) {
-    if (!s || !s.count) return ["-", "-", "-"];
-    return [s.avg.toFixed(1), String(s.min), String(s.max)];
+    if (!s || !s.count) return td("-", "num");
+    var c = td(s.avg.toFixed(1), "num", "min " + s.min + " \u00b7 max " + s.max);
+    var sub = document.createElement("span");
+    sub.className = "sub"; sub.textContent = s.min + "\u2013" + s.max;
+    c.appendChild(sub);
+    return c;
   }
   function update() {
     return fetch("/stats.json", {cache: "no-store"}).then(function (r) {
@@ -47,9 +52,7 @@
         tr.appendChild(td(String(m.requests), "num"));
         tr.appendChild(td(String(m.dropped), "num"));
         tr.appendChild(td(m.queueLength + "/" + m.queueCapacity, "num"));
-        [m.inferenceMs, m.processMs, m.roundTripMs].forEach(function (s) {
-          stat(s).forEach(function (v) { tr.appendChild(td(v, "num")); });
-        });
+        [m.inferenceMs, m.processMs, m.roundTripMs].forEach(function (s) { tr.appendChild(stat(s)); });
         Array.prototype.forEach.call(tr.cells, function (c, i) { if (LABELS[i]) c.setAttribute("data-label", LABELS[i]); });
         frag.appendChild(tr);
       });

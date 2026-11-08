@@ -76,7 +76,7 @@
   }
 
   // ---- Tune: one card per model -----------------------------------------------------------------
-  function th(tr, id) { var c = el("th"); c.appendChild(PB.head(id)); tr.appendChild(c); }
+  function th(tr, id, cls) { var c = el("th", cls || null); c.appendChild(PB.head(id)); tr.appendChild(c); }
   function td(tr, label, content, cls) {
     var c = el("td", cls || null); c.dataset.label = label;
     if (content === null || content === undefined) c.textContent = "-";
@@ -100,7 +100,9 @@
     box.appendChild(line);
     if (!p.configured) box.appendChild(el("p", "muted", "Not in the config: shown for comparison, nothing is saved for it."));
     var t = el("table", "bench stack profile-table"), hd = el("thead"), tr = el("tr");
-    ["device", "speed", "finds", "correct", "best_conf", "saved_conf", "run_on"].forEach(function (id) { th(tr, id); });
+    // Numeric columns: their headings sit over the right-aligned numbers.
+    var NUM = {speed: 1, finds: 1, correct: 1, best_conf: 1, saved_conf: 1};
+    ["device", "speed", "finds", "correct", "best_conf", "saved_conf", "run_on"].forEach(function (id) { th(tr, id, NUM[id] ? "num" : null); });
     hd.appendChild(tr); t.appendChild(hd);
     var body = el("tbody"), pick = chosen(p);
     (p.devices || []).forEach(function (d) {

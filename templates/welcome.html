@@ -22,7 +22,7 @@
 <h2>Models</h2>
 <div class="scroll">
 <table class="models rcards">
-<thead><tr><th>Model</th><th>Default</th><th>State</th><th>Device</th><th>Requests</th><th>Queue</th><th><span class="sr-only">Pending</span></th></tr></thead>
+<thead><tr><th>Model</th><th>Default</th><th>State</th><th>Device</th><th class="num">Requests</th><th class="num">Queue</th><th><span class="sr-only">Pending</span></th></tr></thead>
 <tbody>
 {% for m in models %}
 <tr class="st-{{ m.state_class }}"><td>{{ m.name }}</td><td data-label="Default">{% if m.is_default %}yes{% endif %}</td><td>{{ m.state }}{% if let Some(d) = m.state_detail %}<br><span class="detail">{{ d }}</span>{% endif %}</td><td class="trunc" data-label="Device" title="{{ m.provider }}">{{ m.provider }}</td><td class="num" data-label="Requests">{{ m.requests }}</td><td class="num" data-label="Queue">{{ m.queue }}</td><td class="rc-badge"><span class="tag restart pending-badge" data-model="{{ m.name }}" title="{{ m.pending }}"{% if m.pending.is_empty() %} hidden{% endif %}>restart needed</span></td></tr>

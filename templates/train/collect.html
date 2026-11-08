@@ -49,7 +49,7 @@
       <p class="muted">Which kinds of frame are kept, how often, and how alike two frames may be. Saved with the button above.</p>
       <div class="scroll">
       <table class="buckets rcards rgrid">
-        <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th>Saved</th></tr></thead>
+        <thead><tr><th>Bucket</th><th>Saved when</th><th>On</th><th>Rate (0..1)</th><th>Min interval per camera (s)</th><th class="num">Saved</th></tr></thead>
         <tbody>
         {% for b in buckets %}
         <tr>
@@ -73,7 +73,7 @@
       <p class="muted">A frame counts once in each bucket it was kept for.</p>
       <div class="scroll">
       <table class="rcards rgrid">
-        <thead><tr><th>Scene</th>{% for n in bucket_names %}<th>{{ n }}</th>{% endfor %}</tr></thead>
+        <thead><tr><th>Scene</th>{% for n in bucket_names %}<th class="num">{{ n }}</th>{% endfor %}</tr></thead>
         <tbody>
         {% for s in scenes %}<tr><td class="rc-title">{{ s.scene }}</td>{% for c in s.counts %}<td class="num" data-label="{{ bucket_names[loop.index0] }}">{{ c }}</td>{% endfor %}</tr>{% endfor %}
         </tbody>
@@ -89,7 +89,7 @@
   {% if labels.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
   <div class="scroll">
   <table>
-    <thead><tr><th>Class</th><th>day</th><th>night</th><th>ir</th><th>Total</th></tr></thead>
+    <thead><tr><th>Class</th><th class="num">day</th><th class="num">night</th><th class="num">ir</th><th class="num">Total</th></tr></thead>
     <tbody>
     {% for l in labels %}<tr><td>{{ l.label }}</td><td class="num">{{ l.day }}</td><td class="num">{{ l.night }}</td><td class="num">{{ l.ir }}</td><td class="num">{{ l.total }}</td></tr>{% endfor %}
     </tbody>
@@ -102,7 +102,7 @@
   <h2>Cameras</h2>
   {% if cameras.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
   <table class="rcards">
-    <thead><tr><th>Camera</th><th>Frames</th><th>MB</th><th>Newest (UTC)</th></tr></thead>
+    <thead><tr><th>Camera</th><th class="num">Frames</th><th class="num">MB</th><th>Newest (UTC)</th></tr></thead>
     <tbody>
     {% for c in cameras %}<tr><td class="rc-title">{{ c.name }}</td><td class="num" data-label="Frames">{{ c.frames }}</td><td class="num" data-label="MB">{{ c.mb }}</td><td data-label="Newest (UTC)">{{ c.newest }}</td></tr>{% endfor %}
     </tbody>
@@ -115,7 +115,7 @@
   <p class="muted">Frames imported on the <a href="/train/import">Import</a> tab or with <code>train import</code> (videos, image folders, Blue Iris clips, URLs, pinned open footage) are stored here like collected frames, with no bucket, and queued for review. Their sidecars carry the source and licence.</p>
   {% if imports.is_empty() %}<p class="muted">No imports yet.</p>{% else %}
   <div class="scroll"><table class="rcards">
-    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th>Frames</th><th>Scenes</th><th>Cameras</th></tr></thead>
+    <thead><tr><th>Import</th><th>Source</th><th>Licence</th><th class="num">Frames</th><th>Scenes</th><th>Cameras</th></tr></thead>
     <tbody>{% for i in imports %}<tr><td class="rc-title-plain"><code>{{ i.id }}</code><br><span class="muted small">{{ i.created }}</span></td><td data-label="Source">{{ i.source }}</td><td data-label="Licence">{{ i.license }}</td><td class="num" data-label="Frames">{{ i.frames }}</td><td data-label="Scenes">{% for (k, v) in i.scenes %}{{ k }} {{ v }} {% endfor %}</td><td data-label="Cameras">{{ i.cameras.join(", ") }}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}

@@ -294,10 +294,12 @@ pub(super) async fn update_available(State(state): State<Arc<AppState>>) -> impl
 // ---------------------------------------------------------------------------------------------
 // Stats
 
+/// One timing in one cell: the average, with min-max under it (`seen` false = no requests yet).
 struct TimingCells {
     avg: String,
     min: String,
     max: String,
+    seen: bool,
 }
 
 impl TimingCells {
@@ -308,12 +310,14 @@ impl TimingCells {
                 avg: dash(),
                 min: dash(),
                 max: dash(),
+                seen: false,
             };
         }
         Self {
             avg: format!("{:.1}", s.avg()),
             min: s.min().to_string(),
             max: s.max().to_string(),
+            seen: true,
         }
     }
 }
