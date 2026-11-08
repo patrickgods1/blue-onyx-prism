@@ -1334,6 +1334,9 @@
         rr.appendChild(cb);
       });
       decide.appendChild(rr);
+      // On a phone the chips are one row that scrolls: fade the edge with more chips past it.
+      rr.setAttribute('data-scroll-cue', '');
+      if (window.PrismLive && window.PrismLive.scrollCue) window.PrismLive.scrollCue(rr);
     }
     // Stacked boxes on the frame (in the progress line): keep the best of each stack, the rest
     // go as duplicates.

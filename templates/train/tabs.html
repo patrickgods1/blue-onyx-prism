@@ -1,5 +1,5 @@
 <h1 class="sr-only">Train: {{ tab_title }}</h1>
-<nav class="train-tabs" aria-label="Train">
+<nav class="train-tabs" aria-label="Train" data-scroll-cue>
   <a href="/train/collect"{% if tab == "collect" %} class="active" aria-current="page"{% endif %}>Collect</a>
   <a href="/train/import"{% if tab == "import" %} class="active" aria-current="page"{% endif %}>Import</a>
   <a href="/train/autolabel"{% if tab == "autolabel" %} class="active" aria-current="page"{% endif %}>Auto-label</a>

@@ -17,6 +17,9 @@
   --warn-bg: #fff4d6;
   --warn-fg: #7a5200;
   --lv-error: #b42318;
+  /* Destructive actions: 4.5:1 or more on --card, and --danger-fg on a --danger fill. */
+  --danger: #b42318;
+  --danger-fg: #ffffff;
   --lv-warn: #9a6700;
   --lv-info: #1f5fbf;
   --lv-debug: #5d6677;
@@ -60,6 +63,8 @@
     --warn-bg: #3a2f12;
     --warn-fg: #ffd98a;
     --lv-error: #ff8a80;
+    --danger: #ff8a80;
+    --danger-fg: #1b2029;
     --lv-warn: #ffcc66;
     --lv-info: #8ab4ff;
     --lv-debug: #a3acbd;
@@ -103,8 +108,10 @@ header {
 }
 header .brand { color: var(--head-fg); font-weight: 600; text-decoration: none; font-size: 1.1rem; }
 nav { display: flex; flex-wrap: wrap; gap: 0.25rem; }
-nav a { color: var(--head-fg); text-decoration: none; padding: 0.3rem 0.7rem; border-radius: 6px; opacity: 0.8; }
-nav a:hover, nav a.active { opacity: 1; background: rgba(255, 255, 255, 0.12); }
+nav a { text-decoration: none; padding: 0.3rem 0.7rem; border-radius: 6px; }
+/* The dimmed look is for the dark header only: tab strips on cards keep their full contrast. */
+header nav a { color: var(--head-fg); opacity: 0.8; }
+header nav a:hover, header nav a.active { opacity: 1; background: rgba(255, 255, 255, 0.12); }
 main { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
 footer { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 2rem 1rem; }
 h1 { font-size: 1.75rem; margin: 0 0 1rem; }
@@ -146,10 +153,24 @@ textarea { width: 100%; font-family: ui-monospace, "SF Mono", Menlo, Consolas, m
 button { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); cursor: pointer; padding: 0.45rem 1.1rem; }
 button.secondary { background: var(--card); color: var(--accent); border-color: var(--border); }
 button.secondary:hover { border-color: var(--accent); }
-button.danger { background: var(--card); color: #c0392b; border-color: #c0392b; }
-button.danger:hover { background: #c0392b; color: #fff; }
+button.danger { background: var(--card); color: var(--danger); border-color: var(--danger); }
+button.danger:hover { background: var(--danger); color: var(--danger-fg); }
 button:disabled { opacity: 0.55; cursor: default; }
-button:focus-visible, a:focus-visible, th.sortable:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:focus-visible, a:focus-visible, th.sortable:focus-visible, summary:focus-visible,
+input:focus-visible, select:focus-visible, textarea:focus-visible, .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Boxes that scroll take the keyboard focus (tabindex="0"): the ring sits inside, where no
+   overflow clips it. */
+.scroll[tabindex]:focus-visible, .logview:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Skip link: the first stop of the Tab key, hidden until it has the focus. */
+.skip-link { position: absolute; left: 0.5rem; top: 0.5rem; z-index: 1000; padding: 0.45rem 0.9rem; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-weight: 600; text-decoration: none; transform: translateY(-200%); }
+.skip-link:focus { transform: none; }
+.skip-link:focus-visible { outline: 2px solid var(--head-fg); outline-offset: 2px; }
+main:focus { outline: none; }
+/* Sideways scroll cue: live.js sets these on `[data-scroll-cue]` rows while more is hidden past
+   an edge. A mask fades the content itself, so it suits any background. */
+.more-right { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent); }
+.more-left { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 2rem), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 2rem), transparent); }
+.more-left.more-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 2rem, #000 calc(100% - 2rem), transparent); mask-image: linear-gradient(to right, transparent, #000 2rem, #000 calc(100% - 2rem), transparent); }
 img.result { max-width: 100%; max-height: 80svh; width: auto; height: auto; border: 1px solid var(--border); border-radius: 6px; }
 .card .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.75rem; }
 
@@ -826,8 +847,8 @@ button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 
 .rv-q-reason { align-items: center; gap: 0.15rem; font-size: 0.8rem; margin-top: 0.3rem; }
 .rv-q-reason button.small { padding: 0 0.25rem; font-size: 0.72rem; line-height: 1.35; }
 .rv-q-reason > span { margin-right: 0.15rem; }
-.rv-decide kbd, .rv-q-classes kbd, .rv-q-reason kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: normal; padding: 0 0.3rem; border: 1px solid currentColor; border-radius: 3px; opacity: 0.75; }
-.rv-decide .rv-q-reason kbd { font-size: 0.6rem; padding: 0 0.15rem; margin-right: 0.15rem; border: 0; opacity: 0.6; }
+.rv-decide kbd, .rv-q-classes kbd, .rv-q-reason kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: normal; padding: 0 0.3rem; border: 1px solid currentColor; border-radius: 3px; }
+.rv-decide .rv-q-reason kbd { font-size: 0.6rem; padding: 0 0.15rem; margin-right: 0.15rem; border: 0; }
 .rv-progress { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.45rem; font-size: 0.8rem; }
 .rv-progress progress { width: 100%; max-width: none; height: 0.45rem; accent-color: #2e9e4f; }
 .rv-q-dup { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }

@@ -290,6 +290,8 @@
     var shown = all ? rows : rows.slice(0, limit);
     var wrap = el("div", "tr-table-wrap");
     var sc = el("div", "scroll");
+    // A wide table scrolls: reachable by the keyboard, named for screen readers.
+    sc.tabIndex = 0; sc.setAttribute("role", "region"); sc.setAttribute("aria-label", "Per-epoch metrics of " + runId);
     var t = el("table", "tr-mtable"), thead = el("thead"), hr = el("tr");
     hr.appendChild(el("th", null, "Epoch"));
     shownCols.forEach(function (c) { var th = el("th", "num", info(c).short); th.title = info(c).label; hr.appendChild(th); });

@@ -219,7 +219,8 @@
         var t = o.table(), tb = el("table", "bench chart-data"), th = el("thead"), tr = el("tr");
         t.head.forEach(function (h, i) { tr.appendChild(el("th", i ? "num" : null, h)); }); th.appendChild(tr); tb.appendChild(th);
         var body = el("tbody"); t.rows.forEach(function (r) { var row = el("tr"); r.forEach(function (c, i) { row.appendChild(el("td", i ? "num" : null, c)); }); body.appendChild(row); }); tb.appendChild(body);
-        var w = el("div", "scroll"); w.appendChild(tb); d.appendChild(w);
+        var w = el("div", "scroll"); w.tabIndex = 0; w.setAttribute("role", "region"); w.setAttribute("aria-label", ((holder.querySelector("svg > title") || {}).textContent || o.title || "Chart") + ": data");
+        w.appendChild(tb); d.appendChild(w);
       });
       box.appendChild(d);
     }

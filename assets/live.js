@@ -72,6 +72,33 @@
   // On a phone the header's links are one row that scrolls: the current page in view.
   var navRow = document.querySelector("header nav"), navHere = navRow && navRow.querySelector("a.active");
   if (navHere) navRow.scrollLeft = navHere.offsetLeft - navRow.offsetLeft - (navRow.clientWidth - navHere.offsetWidth) / 2;
+
+  // ---- scroll cues ------------------------------------------------------------------------------
+  // `[data-scroll-cue]`: a row that scrolls sideways (the phone header, the Train tabs, Review's
+  // reason chips) fades the edge where more is hidden (`more-left` / `more-right` in style.css).
+  function cueOne(el) {
+    if (!el || !el.classList) return;
+    var max = (el.scrollWidth || 0) - (el.clientWidth || 0), x = Math.abs(el.scrollLeft || 0);
+    el.classList.toggle("more-left", max > 1 && x > 1);
+    el.classList.toggle("more-right", max > 1 && x < max - 1);
+  }
+  function scrollCue(el) {
+    if (!el || !el.addEventListener) return;
+    if (!el._cue) {
+      el._cue = true;
+      el.addEventListener("scroll", function () { cueOne(el); }, {passive: true});
+    }
+    cueOne(el);
+    // A row built by a script is measured once it is in the page.
+    if (window.requestAnimationFrame) window.requestAnimationFrame(function () { cueOne(el); });
+  }
+  function scrollCues() {
+    if (document.querySelectorAll) document.querySelectorAll("[data-scroll-cue]").forEach(scrollCue);
+  }
+  scrollCues();
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", scrollCues);
+  window.addEventListener("load", scrollCues);
+  window.addEventListener("resize", scrollCues);
   var listeners = [], etag = null, last = null, busy = null, failures = 0, timer = null;
 
   function emit(data, prev) {
@@ -546,6 +573,7 @@
     keep: keep,
     patch: patch,
     sortTable: sortTable,
+    scrollCue: scrollCue,
     tabs: tabs,
     view: {capture: capture, restore: restore, busy: busyIn},
     ui: {edited: edited, current: current, baseline: baseline, same: same, set: set, flash: flash, note: note, refresh: refresh, markEdits: markEdits}

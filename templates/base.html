@@ -9,9 +9,10 @@
 <link rel="stylesheet" href="/static/style.css?v={{ version }}">
 </head>
 <body>
+<a class="skip-link" href="#main">Skip to content</a>
 <header>
   <a class="brand" href="/">Blue Onyx Prism</a>
-  <nav>
+  <nav aria-label="Main" data-scroll-cue>
     <a href="/"{% if nav == "home" %} class="active" aria-current="page"{% endif %}>Home</a>
     <a href="/stats"{% if nav == "stats" %} class="active" aria-current="page"{% endif %}>Stats</a>
     <a href="/test"{% if nav == "test" %} class="active" aria-current="page"{% endif %}>Test</a>
@@ -24,7 +25,7 @@
   <span id="pending-restart" class="pending-restart" hidden><a href="/config#models"></a> <button type="button" class="small danger" data-restart>Restart</button></span>
 </header>
 <script src="/static/live.js?v={{ version }}"></script>
-<main>
+<main id="main" tabindex="-1">
 {% block content %}{% endblock %}
 </main>
 <footer>
