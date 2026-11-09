@@ -44,6 +44,7 @@ case "${1:-}" in
     fi
     echo "Config: $CONFIG (data: $DATA_DIR)"
     echo "Logs:   journalctl -u $UNIT -f"
+    bop_print_urls "$CONFIG" "$INSTALL_DIR/blue-onyx-prism"
     ;;
   pre-remove)
     if have_systemd; then

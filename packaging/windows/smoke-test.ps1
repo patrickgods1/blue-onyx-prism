@@ -7,8 +7,10 @@
     older version's ACL corrects it, and KEEPDATA=1 (old scripts) keeps it again, even with REMOVEDATA=1; a last install
     over it and REMOVEDATA=1 removes everything, the protected token folder too. Each install also
     checks the data folder's DACL, the auth folder's protected DACL, the service's required
-    privileges, both firewall rules' scope and profiles, and that the service runs on the Visual
-    C++ runtime installed next to it.
+    privileges, both firewall rules' scope and profiles, that the service runs on the Visual
+    C++ runtime installed next to it, and the web UI: HTTPS answers behind a sign-in, the plain
+    port sends browsers there, and `setup-code` prints the first account's code from the
+    protected auth folder. Needs PowerShell 7 (-SkipCertificateCheck, -SkipHttpErrorCheck).
 .PARAMETER Msi
     Path of the MSI to test.
 .PARAMETER Port
@@ -248,6 +250,63 @@ function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
     Write-Host "Service uses the shipped VC++ runtime. Runtime DLLs loaded: $($runtimes -join ', '). C runtime DLLs: $($crt -join ', ')"
 }
 
+# The status and the resolved Location of a browser GET of $Url, redirects not followed and the
+# certificate not checked (the service's own self-signed one).
+function Get-Redirect([string]$Url) {
+    $out = & curl.exe -s -k -o NUL -H "Accept: text/html" --max-time 10 -w '%{http_code} %{redirect_url}' $Url
+    $parts = "$out".Split(' ', 2)
+    [pscustomobject]@{ Code = [int]$parts[0]; Location = $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }) }
+}
+
+# The web UI: HTTPS behind a sign-in (the service's own self-signed certificate, so no
+# certificate check here), the plain port sending browsers there (308), and the first account's
+# one-time setup code, which the service made in the auth folder and `setup-code` prints. The code
+# itself is never written to the job's log.
+function Assert-WebUi([string]$Log) {
+    $tls = "https://127.0.0.1:$HttpsPort"
+    $html = @{ Accept = "text/html" }
+    $deadline = (Get-Date).AddSeconds(60)
+    $code = 0
+    while ((Get-Date) -lt $deadline) {
+        try {
+            # The sign-in page, or the setup page it sends to before the first account.
+            $code = [int](Invoke-WebRequest -Uri "$tls/login" -Headers $html -SkipCertificateCheck -UseBasicParsing -TimeoutSec 10).StatusCode
+        } catch {
+            $code = Get-HttpCode $_
+        }
+        if ($code -eq 200) { break }
+        Start-Sleep -Seconds 2
+    }
+    if ($code -ne 200) { Fail "$tls/login did not answer 200 within 60 s (last: $code)" @($Log) }
+    Write-Host "GET $tls/login -> 200"
+    # curl.exe, not Invoke-WebRequest: with -MaximumRedirection 0, PowerShell 7 throws on a
+    # redirect even with -SkipHttpErrorCheck. curl does not follow one and reports the status and
+    # the resolved Location.
+    $r = Get-Redirect "$tls/config"
+    # The sign-in page, or the setup page while no account exists (a fresh install).
+    if ($r.Code -ne 303 -or -not ($r.Location.StartsWith("$tls/login") -or $r.Location -eq "$tls/setup")) {
+        Fail "$tls/config without a sign-in answered $($r.Code) to '$($r.Location)', expected 303 to the login or setup page" @($Log)
+    }
+    Write-Host "GET $tls/config without a sign-in -> 303 $($r.Location)"
+    $plain = "http://127.0.0.1:$Port/config"
+    $r = Get-Redirect $plain
+    if ($r.Code -ne 308 -or $r.Location -ne "$tls/config") {
+        Fail "$plain answered $($r.Code) to '$($r.Location)', expected 308 to $tls/config" @($Log)
+    }
+    Write-Host "GET $plain -> 308 $($r.Location)"
+
+    $codeFile = Join-Path $AuthDir "setup-code"
+    if (-not (Test-Path -LiteralPath $codeFile)) { Fail "$codeFile missing: the service made no setup code" @($Log) }
+    $codeSids = @((Get-Acl -LiteralPath $codeFile).Access | ForEach-Object {
+        $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value })
+    if ($codeSids -contains "S-1-5-32-545") { Fail "$codeFile has an entry for Users (S-1-5-32-545)" @($Log) }
+    $cli = Join-Path $ProgDir "blue-onyx-prism.exe"
+    $out = @(& $cli --config $Config setup-code)
+    if ($LASTEXITCODE -ne 0) { Fail "setup-code exited with $LASTEXITCODE" @($Log) }
+    if (-not (($out -join "`n") -match '(?m)^Setup code: [A-Z2-7-]{20,}')) { Fail "setup-code printed no setup code" @($Log) }
+    Write-Host "setup-code prints a code; $codeFile has no entry for Users."
+}
+
 function Install-AndCheck([string]$Log) {
     Write-Host "Installing $Msi ..."
     $rc = Run-Msiexec @("/i", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"", "PORT=$Port", "HTTPS_PORT=$HttpsPort")
@@ -307,6 +366,7 @@ function Install-AndCheck([string]$Log) {
         }
     }
     Assert-Hardening $Log
+    Assert-WebUi $Log
 
     # Tray: exe, start-at-login Run value, Start Menu shortcut (the tray itself is not run: no desktop session in CI).
     if (-not (Test-Path $TrayExe)) { Fail "$TrayExe missing after install" @($Log) }

@@ -888,11 +888,31 @@ minute, with a count of the ones left out.
 ### Accounts
 
 The web UI has username-and-password accounts, all of them administrators ([Signing
-in](#signing-in) says how browsers use them). They are managed on the server with the commands
-below (an Accounts card on the Config page follows in a later change). Run the commands as the
-service's account, with `--config <file>` when the service has its own config (the Windows
-service, the packages, Docker: `docker exec -it blue-onyx-prism /app/blue-onyx-prism --config
-/app/config/blue_onyx_prism_config.json user list`).
+in](#signing-in) says how browsers use them). They are managed in the browser on the Config page
+(Server tab, **Accounts** card) or on the server with the commands below.
+
+**The Accounts card** lists every account (name, created, password changed, wrong passwords in a
+row or disabled; never a hash) and marks yours, then offers:
+
+- **Change my password** (current, new twice). Every other browser signed in to your account is
+  signed out; this one stays signed in under a new session id, and its device cookie stays.
+- **Add an account** (its name and password twice, then *your* current password).
+- **Unlock or remove an account** (*your* current password). Unlock forgets an account's wrong
+  passwords and lifts the 100-in-a-row disabling. Remove ends that account's sessions and device
+  cookies at once; the last account cannot be removed, and removing your own signs you out.
+- **Sign out everywhere** (*your* current password): every session of your account ends, this one
+  included.
+
+Each of these asks for your current password and checks it the way the sign-in page does (the
+per-address limit, your account's wrong-password count and delay, the same words for every wrong
+password). A wrong one is counted against *your* account and answered with 403 and a message on the
+card; nothing changes. Signed in with the API token, the card lists the accounts only: the token
+has no password to confirm with, so account changes need an account or the commands. Every change
+is logged with who made it and from which address.
+
+Run the commands as the service's account, with `--config <file>` when the service has its own
+config (the Windows service, the packages, Docker: `docker exec -it blue-onyx-prism
+/app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json user list`).
 
 - **The first account:** `blue-onyx-prism setup-code` prints a one-time setup code
   (`XXXX-XXXX-XXXX-XXXX-XXXX`, 100 random bits; case, spaces and dashes do not matter), the HTTPS
@@ -948,7 +968,8 @@ https://localhost:32169/setup` (the code itself is never logged).
    page included) shows a fingerprint, since a page put in between would show its own.
 3. The browser lands on `/setup`: type the code, a username and a password twice. That creates the
    first account and signs you in; `/setup` closes for good once an account exists. (Or create it
-   on the server with `blue-onyx-prism user add <name>`.) More accounts: [Accounts](#accounts).
+   on the server with `blue-onyx-prism user add <name>`.) More accounts, your password and *Sign
+   out everywhere*: the Config page's **Accounts** card ([Accounts](#accounts)).
 
 **Sessions.** A sign-in sets `__Host-bop_session` (`Secure`, `HttpOnly`, `SameSite=Strict`, a new
 random id every time) and `__Host-bop_device`. The session ends after an hour without use (a page

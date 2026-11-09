@@ -99,3 +99,4 @@ bop_bootstrap
 launchctl print system/com.blueonyx.prism | head -20 || true
 echo "Config: $CONFIG (data: $DATA_DIR)"
 echo "Logs:   $LOG_DIR/blue_onyx_prism.log.<date> (stdout/stderr: $LOG_DIR/stdout.log)"
+bop_print_urls "$CONFIG" "$INSTALL_DIR/blue-onyx-prism"

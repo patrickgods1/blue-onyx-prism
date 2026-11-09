@@ -1039,6 +1039,8 @@ async fn account_lockout_device_cookies_and_disabling() {
         Some(device.as_str()),
         "renewed"
     );
+    // The reset is written after the answer (`record_later`): wait for it.
+    recorded(&state).await;
     let failures = Store::open(&root(&state)).load().unwrap().unwrap().users[0].failures;
     assert_eq!(failures, 0, "a success resets the count");
     // But not the per-address limit.

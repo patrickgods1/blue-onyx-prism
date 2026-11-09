@@ -107,3 +107,16 @@ bop_remove_legacy_unit() {
 bop_install_unit() {
   sed "s#/opt/blue-onyx-prism#$3#g" "$1" > "$2"
 }
+
+# bop_print_urls CONFIG EXE: the addresses an install prints. The web UI is HTTPS (self-signed
+# certificate, a sign-in; the first visit creates the first account with the one-time code that
+# `setup-code` prints); Blue Iris uses the plain HTTP port with no account. The ports are the
+# config's when it names them (a pretty config, one key per line), else the defaults.
+bop_print_urls() {
+  _port=$(sed -n 's/^[[:space:]]*"port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)
+  _https=$(sed -n 's/^[[:space:]]*"https_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)
+  echo "Web UI:    https://<this machine>:${_https:-32169}/ (self-signed certificate; on the first visit,"
+  echo "           create the first account with the code that this prints:"
+  echo "           sudo -u $BOP_USER $2 --config $1 setup-code)"
+  echo "Blue Iris: http://<this machine's IP>:${_port:-32168} (plain HTTP, no account)"
+}

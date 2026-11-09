@@ -2,10 +2,13 @@
 <#
 .SYNOPSIS
     Upgrade test for the MSI (CI only; modifies the machine). Installs the published OldMsi, seeds
-    what a user has (a config edit, a reviewed label file and its frame, a training runs.json),
-    upgrades to NewMsi and checks: the service runs the new exe, answers a detection, every seeded
-    file and the config edit are unchanged, and the Visual C++ runtime the new MSI ships is in the
-    program folder. Ends with an uninstall with REMOVEDATA=1. Called by packaging/upgrade-test.sh.
+    what a user has (a config edit, allow_remote_admin: true, a reviewed label file and its frame,
+    a training runs.json), upgrades to NewMsi and checks: the service runs the new exe (the
+    retired allow_remote_admin is no reason to refuse the config), the API token was rotated once
+    for it, the web UI answers over HTTPS in setup mode and the plain port sends browsers there,
+    it answers a detection, every seeded file and the config edit are unchanged, and the Visual
+    C++ runtime the new MSI ships is in the program folder. Ends with an uninstall with
+    REMOVEDATA=1. Called by packaging/upgrade-test.sh.
 .PARAMETER OldMsi
     The published MSI to upgrade from.
 .PARAMETER NewMsi
@@ -23,6 +26,8 @@ param(
     [Parameter(Mandatory)][string]$NewServiceExe,
     [string]$RepoRoot = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
     [int]$Port = 32168,
+    # The new MSI's HTTPS port (its default).
+    [int]$HttpsPort = 32169,
     # Where the msiexec logs go (the workflow uploads dist/*.log).
     [string]$LogDir = (Get-Location).Path
 )
@@ -114,6 +119,14 @@ Write-Host "== seed a user's data (the service stopped)"
 Stop-Service $Service
 if ($null -eq (Get-TimeoutValue)) { Fail "$Config has no request_timeout_secs to edit (the old service writes every key on its first start)" }
 $text = [regex]::Replace((Get-Content -LiteralPath $Config -Raw), '"request_timeout_secs":\s*\d+', "`"request_timeout_secs`": $TimeoutEdit")
+# Remote admin on, as many 0.2 installs have it: the new version retires the key (read, warned,
+# never written) and must still start.
+if ($text -match '"allow_remote_admin":\s*(true|false)') {
+    $text = [regex]::Replace($text, '"allow_remote_admin":\s*(true|false)', '"allow_remote_admin": true')
+} else {
+    $text = [regex]::Replace($text, '^\s*\{', '{ "allow_remote_admin": true,')
+}
+if ($text -notmatch '"allow_remote_admin":\s*true') { Fail "could not set allow_remote_admin in $Config" }
 [System.IO.File]::WriteAllText($Config, $text)
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Labels), (Split-Path -Parent $Runs) | Out-Null
 Copy-Item -LiteralPath $Image -Destination $Frame
@@ -145,6 +158,27 @@ if ($newPid -eq $oldPid) { Fail "the service process is still ${oldPid}: the upg
 Start-Sleep -Seconds 5
 if ((Get-ServicePid) -ne $newPid) { Fail "the service process changed again after the upgrade ($newPid -> $(Get-ServicePid)): it was restarted" }
 Write-Host "Service up on the new exe (pid $oldPid -> $newPid)."
+
+Write-Host "== the retired allow_remote_admin, the API token and the web UI"
+# The token the old version may have sent over plain HTTP was rotated once (marker), into the
+# protected auth folder; no account exists, so the service is in setup mode (setup code made).
+$AuthDir = Join-Path $DataDir "auth"
+foreach ($name in ".token-rotated-v1", "admin-token", "setup-code") {
+    if (-not (Test-Path -LiteralPath (Join-Path $AuthDir $name))) { Fail "$AuthDir\$name missing after the upgrade (allow_remote_admin token rotation / setup mode)" }
+}
+$tls = "https://127.0.0.1:$HttpsPort"
+$code = ""
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline) {
+    # The service's own self-signed certificate: no certificate check (-k).
+    $code = "$(& curl.exe -sk -L --max-redirs 3 --max-time 20 -H "Accept: text/html" -o NUL -w "%{http_code}" "$tls/login")"
+    if ($code -eq "200") { break }
+    Start-Sleep -Seconds 2
+}
+if ($code -ne "200") { Fail "$tls/login answered '$code' after the upgrade, expected 200 (the setup page)" }
+$redirect = "$(& curl.exe -s --max-time 20 -H "Accept: text/html" -o NUL -w "%{http_code} %{redirect_url}" "$Url/config")"
+if ($redirect -ne "308 $tls/config") { Fail "$Url/config answered '$redirect', expected '308 $tls/config'" }
+Write-Host "Token rotated once; $tls/login 200; $Url/config -> $redirect."
 
 Write-Host "== a detection"
 $out = & curl.exe -s --max-time 60 -F "image=@$Image" -F "min_confidence=0.2" "$Url/v1/vision/detection"

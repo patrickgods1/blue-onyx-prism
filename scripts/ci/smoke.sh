@@ -11,7 +11,9 @@
 # them. A provider that answers success with no boxes (numeric failure, broken preprocessing)
 # fails the test. SMOKE_TIMEOUT (default 300) is how many seconds the server gets to answer a
 # first detection; a server that accepts and never answers fails with its log, not by the
-# step's timeout.
+# step's timeout. The web UI's HTTPS port (whatever the server logs it bound, see
+# `https_port`) is checked too (scripts/ci/check_https.sh): it answers, needs a sign-in, and the
+# plain port sends browsers there; the detection checks stay on the plain port.
 set -euo pipefail
 
 if [ "$#" -lt 4 ]; then
@@ -44,6 +46,11 @@ cleanup() {
   if [ "${RUNNER_OS:-}" = "Windows" ]; then
     taskkill //F //IM "$(basename "$BIN")" >/dev/null 2>&1 || true
   fi
+  # Gone before the next run binds: the HTTPS port of one run can be the plain port of the next.
+  for _ in $(seq 1 20); do
+    kill -0 "$PID" 2>/dev/null || break
+    sleep 1
+  done
   echo "---- server log ($PORT) ----"
   tail -n 50 "$LOG" || true
 }
@@ -107,4 +114,16 @@ alive
 "$CLIENT" --url "$URL" --repeat 5 --parallel 2
 "$CLIENT" --url "$URL" --model "$MODEL_NAME" --repeat 3
 "$CLIENT" --url "$URL" --list
-echo "smoke ok ($EXPECTED on port $PORT)"
+
+# The web UI: HTTPS on the port the server logged ("HTTPS on https://localhost:<port>/").
+HTTPS_PORT=""
+for _ in $(seq 1 30); do
+  alive
+  HTTPS_PORT=$(sed -n 's|.*HTTPS on https://localhost:\([0-9][0-9]*\)/.*|\1|p' "$LOG" | tail -n 1)
+  [ -n "$HTTPS_PORT" ] && break
+  sleep 2
+done
+[ -n "$HTTPS_PORT" ] || { echo "the server logged no HTTPS listener within 60 s" >&2; exit 1; }
+"$(dirname "$0")/check_https.sh" "$PORT" "$HTTPS_PORT"
+alive
+echo "smoke ok ($EXPECTED on port $PORT, web UI on HTTPS port $HTTPS_PORT)"

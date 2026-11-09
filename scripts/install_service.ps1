@@ -278,7 +278,10 @@ if (-not $NoStart) {
     Get-Service $ServiceName | Format-Table -AutoSize
     Write-Host "First start compiles the models; watch https://localhost:$HttpsPort/ (the web UI; the browser warns once"
     Write-Host "about the self-signed certificate: compare its SHA-256 with 'blue-onyx-prism tls-fingerprint') and the"
-    Write-Host "Application event log. Blue Iris uses http://<this machine>:$Port/."
+    Write-Host "Application event log. Blue Iris uses http://<this machine's IP>:$Port/ (plain HTTP, no account)."
+    $cli = Join-Path $InstallDir "blue-onyx-prism.exe"
+    Write-Host "The first visit creates the first web UI account with the one-time code this prints (as administrator):"
+    Write-Host "  & '$cli' --config '$cfgFile' setup-code"
     Write-Host "If the GPU is not used under $runAs, reinstall with -Account LocalSystem."
 }
 

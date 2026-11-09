@@ -1,6 +1,8 @@
 # Builds the Docker image (Dockerfile, no push) and starts it: the entrypoint must accept the
-# volumes and GET /v1/status must answer 200 (a model compiled and ready). Runs only when the
-# image's inputs change, on PRs and on main. The Rust build inside the image dominates (~15 min).
+# volumes and GET /v1/status must answer 200 (a model compiled and ready); then the web UI over
+# HTTPS on 32169 (scripts/ci/check_https.sh: answers, needs a sign-in, the plain port 32168 sends
+# browsers there) and `setup-code` in the container. Runs only when the image's inputs change, on
+# PRs and on main. The Rust build inside the image dominates (~15 min).
 name: docker
 
 on:
@@ -14,6 +16,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - "scripts/ci/check_https.sh"
       - ".github/workflows/docker.yml"
   pull_request:
     paths: *paths
@@ -48,6 +51,7 @@ jobs:
           chmod 777 ci-vol/cache ci-vol/config ci-vol/data
           docker run -d --name bop \
             -p 127.0.0.1:32168:32168 \
+            -p 127.0.0.1:32169:32169 \
             -v "$PWD/ci-vol/cache:/app/cache" \
             -v "$PWD/ci-vol/config:/app/config" \
             -v "$PWD/ci-vol/data:/app/data" \
@@ -67,6 +71,21 @@ jobs:
           docker logs bop 2>&1 | tail -n 100
           [ "$ok" = 1 ] || { echo "::error::/v1/status never answered 200"; exit 1; }
           curl -fsS http://127.0.0.1:32168/v1/status; echo
+
+      # The web UI: HTTPS on its own port, behind a sign-in; Blue Iris stays on plain HTTP. The
+      # first account needs the one-time setup code, printed in the container (in the data volume's
+      # private auth folder).
+      - name: HTTPS and the setup code
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          scripts/ci/check_https.sh 32168 32169
+          out="$(docker exec bop /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json setup-code)"
+          echo "$out" | grep -v '^Setup code:'
+          echo "$out" | grep -Eq '^Setup code: [A-Z2-7-]{20,}' || { echo "::error::setup-code printed no code"; exit 1; }
+          docker exec bop test -f /app/data/auth/setup-code || { echo "::error::no setup-code file in /app/data/auth"; exit 1; }
+          [ "$(docker exec bop stat -c %a /app/data/auth)" = 700 ] || { echo "::error::/app/data/auth is not 0700"; exit 1; }
+          [ "$(docker exec bop stat -c %a /app/data/auth/setup-code)" = 600 ] || { echo "::error::the setup-code file is not 0600"; exit 1; }
 
       - name: Stop
         if: always()

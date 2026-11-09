@@ -22,6 +22,7 @@ on:
       - "scripts/*systemd*"
       - "scripts/*launchd*"
       - "scripts/ci/retry.sh"
+      - "scripts/ci/check_https.sh"
       - ".github/workflows/packaging.yml"
       - ".github/workflows/release.yml"
   pull_request:
@@ -72,7 +73,8 @@ jobs:
         run: |
           shellcheck -x -S warning scripts/*systemd*.sh scripts/*launchd*.sh packaging/*.sh \
             packaging/linux/*.sh packaging/linux/debian/* packaging/linux/rpm/*.sh \
-            packaging/macos/*.sh packaging/macos/scripts/* packaging/release/*.sh
+            packaging/macos/*.sh packaging/macos/scripts/* packaging/release/*.sh \
+            scripts/ci/check_https.sh
       - name: Test package scriptlets
         if: runner.os == 'Linux'
         run: packaging/linux/test-scriptlets.sh

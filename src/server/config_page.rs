@@ -12,7 +12,7 @@ use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
 use axum::extract::rejection::{ExtensionRejection, FormRejection, QueryRejection};
-use axum::extract::{ConnectInfo, Form, Query, State};
+use axum::extract::{ConnectInfo, Extension, Form, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
@@ -678,6 +678,34 @@ fn token_panel(
     Some(TokenPanel::of(state, super::direct_local(peer, headers)))
 }
 
+/// The Config page after an account change, at the Accounts card
+/// ([`super::accounts`]): `signed` is marked "you" there.
+pub(super) fn accounts_result(
+    state: &AppState,
+    signed: &super::auth::SignedIn,
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    message: Option<String>,
+    error: Option<String>,
+) -> Response {
+    let mut t = config_template_at(state, message, error, None, "accounts");
+    t.token_panel = token_panel(state, peer, headers);
+    t.accounts.signed_in(Some(signed));
+    render(&t)
+}
+
+/// The Config page as `GET /config` renders it, with `edit` applied to its Accounts card first
+/// (tests: what the template does with any name).
+#[cfg(test)]
+pub(super) fn page_with_accounts(
+    state: &AppState,
+    edit: impl FnOnce(&mut super::accounts::AccountsPanel),
+) -> String {
+    let mut t = config_template(state, None, None, None);
+    edit(&mut t.accounts);
+    t.render().expect("the Config page renders")
+}
+
 /// The Config page after a rotation, at the API token card. Only this machine gets here.
 pub(super) fn token_result(
     state: &AppState,
@@ -704,6 +732,8 @@ pub(super) struct ConfigTemplate {
     error: Option<String>,
     /// The API token card (Server tab): set where the peer is known ([`token_panel`]).
     token_panel: Option<TokenPanel>,
+    /// The Accounts card (Server tab); "you" is marked where the handler knows who is signed in.
+    accounts: super::accounts::AccountsPanel,
     /// Resources card, grouped (Runtimes, GPU libraries, Models by family).
     pub(super) resource_groups: Vec<crate::resources::status::ResourceGroup>,
     /// Model files in `models_dir` that no config entry uses.
@@ -733,8 +763,8 @@ pub(super) struct ConfigTemplate {
     global_threshold: String,
     /// What a restart would apply (all reasons).
     pending: Vec<String>,
-    /// Where `message` / `error` are shown: "" (top), "models", "server", "resources" or
-    /// "resources-row" (in the row of resource `at_row`). The forms post to their section's
+    /// Where `message` / `error` are shown: "" (top), "models", "server", "resources",
+    /// "admin-token", "accounts" or "resources-row" (in the row of resource `at_row`). The forms post to their section's
     /// `#fragment`, so a no-JS answer lands there.
     pub(super) at: &'static str,
     pub(super) at_row: String,
@@ -1020,6 +1050,7 @@ pub(super) fn config_template(
         message,
         error,
         token_panel: None,
+        accounts: super::accounts::AccountsPanel::of(state),
         revision,
         global_threshold: format!(
             "{:.2}",
@@ -1046,6 +1077,7 @@ fn config_template_at(
 
 pub(super) async fn config_page(
     State(state): State<Arc<AppState>>,
+    signed: Option<Extension<super::auth::SignedIn>>,
     peer: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
 ) -> Response {
@@ -1053,6 +1085,7 @@ pub(super) async fn config_page(
     blocking(move || {
         let mut t = config_template(&state, None, None, None);
         t.token_panel = token_panel(&state, peer, &headers);
+        t.accounts.signed_in(signed.as_ref().map(|e| &e.0));
         render(&t)
     })
     .await
@@ -1135,6 +1168,7 @@ pub(super) fn save_config(
 /// `Accept: application/json` get JSON.
 pub(super) async fn config_submit(
     State(state): State<Arc<AppState>>,
+    signed: Option<Extension<super::auth::SignedIn>>,
     peer: Result<ConnectInfo<SocketAddr>, ExtensionRejection>,
     headers: HeaderMap,
     form: Result<Form<Vec<(String, String)>>, FormRejection>,
@@ -1171,6 +1205,7 @@ pub(super) async fn config_submit(
                 }
                 let mut t = config_template_at(&state, Some(msg), None, None, "server");
                 t.token_panel = token_panel(&state, peer, &headers);
+                t.accounts.signed_in(signed.as_ref().map(|e| &e.0));
                 render(&t)
             }
             Err(e) => {
@@ -1181,6 +1216,7 @@ pub(super) async fn config_submit(
                 }
                 let mut t = config_template_at(&state, None, Some(msg), Some(&form), "server");
                 t.token_panel = token_panel(&state, peer, &headers);
+                t.accounts.signed_in(signed.as_ref().map(|e| &e.0));
                 render(&t)
             }
         }
