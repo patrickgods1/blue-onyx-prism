@@ -43,7 +43,7 @@
     var st = stateOf(o.key, o.sort), f = o.filters || {};
     var box = el("div", "dtable"); box.dataset.keep = "dt:" + o.key;
     var tools = el("div", "dt-tools"), count = el("span", "dt-count muted"), clear = el("button", "small secondary dt-clear", "Clear filters"); clear.type = "button";
-    var q = el("input"); q.type = "search"; q.name = "dt-q-" + o.key; q.placeholder = "Filter…"; q.value = st.q; q.setAttribute("aria-label", "Filter the rows of this table");
+    var q = el("input"); q.type = "search"; q.setAttribute("enterkeyhint", "search"); q.setAttribute("autocapitalize", "none"); q.setAttribute("autocorrect", "off"); q.spellcheck = false; q.name = "dt-q-" + o.key; q.placeholder = "Filter…"; q.value = st.q; q.setAttribute("aria-label", "Filter the rows of this table");
     q.addEventListener("input", function () { st.q = q.value; save(o.key); draw(); });
     tools.appendChild(q);
     var selects = [];
@@ -138,7 +138,7 @@
   // not removed, so its own sort keeps working). The filter text is remembered per key.
   function tableFilter(t, key) {
     var st = stateOf("tf:" + key), tools = el("div", "dt-tools"), q = el("input"), count = el("span", "dt-count muted");
-    q.type = "search"; q.name = "dt-q-tf-" + key; q.placeholder = "Filter…"; q.value = st.q; q.setAttribute("aria-label", "Filter the rows of this table");
+    q.type = "search"; q.setAttribute("enterkeyhint", "search"); q.setAttribute("autocapitalize", "none"); q.setAttribute("autocorrect", "off"); q.spellcheck = false; q.name = "dt-q-tf-" + key; q.placeholder = "Filter…"; q.value = st.q; q.setAttribute("aria-label", "Filter the rows of this table");
     function draw() {
       var rows = Array.prototype.slice.call(t.tBodies[0] ? t.tBodies[0].rows : []), words = st.q.toLowerCase().split(/\s+/).filter(Boolean), n = 0;
       rows.forEach(function (r) { var text = r.textContent.toLowerCase(), ok = words.every(function (w2) { return text.indexOf(w2) >= 0; }); r.hidden = !ok; if (ok) n++; });

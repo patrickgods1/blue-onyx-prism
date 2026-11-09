@@ -4910,7 +4910,9 @@ pub(super) mod tests {
         assert!(page.contains(
             "value=\"yolo26n\" aria-label=\"yolo26n\" data-default-lr=\"auto (optimizer picks)\""
         ));
-        assert!(page.contains("name=\"lr\" inputmode=\"decimal\""));
+        // No inputmode: a decimal keypad could not type `1e-4`.
+        assert!(page.contains("name=\"lr\" autocomplete=\"off\""));
+        assert!(!page.contains("name=\"lr\" inputmode"));
         assert!(page.contains("placeholder=\"recommended\""));
         assert!(page.contains("RF-DETR: cosine (default) or step, final factor 0.1"));
         assert!(page.contains("<option value=\"\" selected>default</option>"));

@@ -77,15 +77,15 @@
   <div id="resource-custom-model" class="card" data-id="custom-model">
   {% if at_row == "custom-model" %}{% call notices("resources-row") %}{% endcall %}{% endif %}
   <form method="post" action="/v1/models/add#resource-custom-model" class="grid" data-ajax>
-    <label>Path <span class="with-browse"><input type="text" name="path" required placeholder="{{ model_path_example }}" autocomplete="off"><button type="button" class="browse secondary" data-browse="model" data-target="path" hidden>Browse&hellip;</button></span></label>
-    <label>Name (optional) <input type="text" name="name" placeholder="default: file name" autocomplete="off"></label>
+    <label>Path <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="path" required placeholder="{{ model_path_example }}" autocomplete="off"><button type="button" class="browse secondary" data-browse="model" data-target="path" hidden>Browse&hellip;</button></span></label>
+    <label>Name (optional) <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="name" placeholder="default: file name" autocomplete="off"></label>
     <label>Family
       <select name="family">
       <option value="">auto - pick from the model's outputs</option>
       {% for f in family_choices %}<option value="{{ f.value }}">{{ f.label }}</option>{% endfor %}
       </select>
     </label>
-    <label>Classes YAML (optional) <span class="with-browse"><input type="text" name="classes" placeholder="default: &lt;model&gt;.yaml beside it" autocomplete="off"><button type="button" class="browse secondary" data-browse="classes" data-target="classes" hidden>Browse&hellip;</button></span></label>
+    <label>Classes YAML (optional) <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="classes" placeholder="default: &lt;model&gt;.yaml beside it" autocomplete="off"><button type="button" class="browse secondary" data-browse="classes" data-target="classes" hidden>Browse&hellip;</button></span></label>
     <div class="actions"><button type="submit">Add to config</button></div>
     <details class="help"><summary>Which files work</summary><p>A <code>.onnx</code> / <code>.xml</code> file, or the directory holding one, on the machine running the service (Browse&hellip; lists that machine's folders, not the browser's); relative paths are under <code>{{ data_root }}</code>. Fine-tuned RF-DETR: choose <code>rfdetr</code>. Classes: a YAML with a names list (default: <code>&lt;model&gt;.yaml</code> beside it, then COCO-80). Restart to load.</p></details>
   </form>
@@ -116,7 +116,7 @@
 <details class="advanced card" id="models-json">
   <summary>Advanced: Models (JSON)</summary>
   <form method="post" action="/config#at-models" id="models-json-form">
-  <textarea name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
+  <textarea autocapitalize="none" autocorrect="off" name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
   <p class="muted">Merged per model and field with changes made elsewhere (the Models card, Benchmark apply). Each entry: <code>path</code> (required), <code>family</code>, <code>name</code>, <code>classes</code>, <code>device</code>,
   <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>). A new or changed <code>path</code> / <code>classes</code> must be inside the data root, the models or download folder or your home folder (it may not exist yet), or chosen with Browse&hellip; under <a href="#custom-model">Add a model by path</a>.</p>
   <div class="actions"><button type="submit">Save models JSON</button> <span class="form-msg" aria-live="polite"></span></div>
@@ -134,7 +134,7 @@
   <p>With <em>auto download</em> on (<a href="#tab-server">Server</a> tab), whatever the config needs is fetched at startup. A new runtime is used after a restart (automatic when a model waits for it). Some models are not downloadable as ONNX (licenses per recipe under <a href="#res-models-export">About exports</a>): use Export in the <a href="#res-models-export">exported models</a> section, or export by hand with <code>scripts/export_model.py --out-dir "{{ models_dir }}"</code> (see the README); other model files show up under <a href="#local-models">Local models</a>. The NVIDIA CUDA/cuDNN libraries (for <code>ort:cuda</code> without a CUDA 12 / cuDNN 9 install) are covered by NVIDIA's license.</p>
   </details>
   {% if !resources_enabled %}<p class="muted">This server has no download manager; use <code>blue-onyx-prism fetch</code>.</p>{% endif %}
-  {% if !resource_groups.is_empty() %}<p class="res-filter-row" hidden><label class="inline-label">Filter <input type="search" id="res-filter" placeholder="name, id or state" autocomplete="off" aria-label="Filter resources"></label> <span id="res-filter-count" class="muted small" role="status"></span></p>{% endif %}
+  {% if !resource_groups.is_empty() %}<p class="res-filter-row" hidden><label class="inline-label">Filter <input autocapitalize="none" autocorrect="off" spellcheck="false" enterkeyhint="search" type="search" id="res-filter" placeholder="name, id or state" autocomplete="off" aria-label="Filter resources"></label> <span id="res-filter-count" class="muted small" role="status"></span></p>{% endif %}
   {% for g in resource_groups %}
   <details class="res-group" id="res-{{ g.key }}" data-group="{{ g.key }}"{% if g.open %} open{% endif %}>
   <summary><h3>{{ g.title }} <span class="muted small res-count">{{ g.summary }}</span></h3></summary>
@@ -213,12 +213,12 @@
 
   <fieldset class="group">
     <legend>Network and access {{ self.badge("port,https_port,bind_address,request_timeout_secs,worker_queue_size")|safe }}</legend>
-    <label>Port {{ self.badge("port")|safe }} <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required> <span class="muted">(plain HTTP: Blue Iris and the detection API)</span></label>
-    <label>HTTPS port {{ self.badge("https_port")|safe }} <input type="number" name="https_port" min="1" max="65535" value="{{ c.https_port }}" required> <span class="muted">(this web UI over HTTPS; must differ from the port)</span></label>
-    <label>Bind address {{ self.badge("bind_address")|safe }} <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
-    <label>Request timeout (s) {{ self.badge("request_timeout_secs")|safe }} <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
-    <label>Worker queue size (0 = auto) {{ self.badge("worker_queue_size")|safe }} <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
-    <label><span>Allowed host names</span> {{ self.badge("allowed_hosts")|safe }} <input type="text" name="allowed_hosts" value="{{ c.allowed_hosts }}" placeholder="nas.local, prism.example.com" autocomplete="off" spellcheck="false"> <span class="muted">(comma separated, names only, no port; the names this page may be opened under, besides IP addresses and localhost. Any other name is refused, which stops a web page from reaching it through DNS rebinding. A browser on another machine that opens the server by name needs that name here to sign in)</span></label>
+    <label>Port {{ self.badge("port")|safe }} <input inputmode="numeric" type="number" name="port" min="1" max="65535" value="{{ c.port }}" required> <span class="muted">(plain HTTP: Blue Iris and the detection API)</span></label>
+    <label>HTTPS port {{ self.badge("https_port")|safe }} <input inputmode="numeric" type="number" name="https_port" min="1" max="65535" value="{{ c.https_port }}" required> <span class="muted">(this web UI over HTTPS; must differ from the port)</span></label>
+    <label>Bind address {{ self.badge("bind_address")|safe }} <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
+    <label>Request timeout (s) {{ self.badge("request_timeout_secs")|safe }} <input inputmode="numeric" type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
+    <label>Worker queue size (0 = auto) {{ self.badge("worker_queue_size")|safe }} <input inputmode="numeric" type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
+    <label><span>Allowed host names</span> {{ self.badge("allowed_hosts")|safe }} <input autocapitalize="none" autocorrect="off" type="text" name="allowed_hosts" value="{{ c.allowed_hosts }}" placeholder="nas.local, prism.example.com" autocomplete="off" spellcheck="false"> <span class="muted">(comma separated, names only, no port; the names this page may be opened under, besides IP addresses and localhost. Any other name is refused, which stops a web page from reaching it through DNS rebinding. A browser on another machine that opens the server by name needs that name here to sign in)</span></label>
     <label><span>TLS certificate file</span> <input type="text" data-view="tls_cert_path" readonly value="{{ c.tls_cert_path }}" placeholder="generated: a self-signed certificate in the data root's auth folder"> <span class="muted">(config file only, with <code>tls_key_path</code>; <code>blue-onyx-prism tls-fingerprint</code> prints the fingerprint to compare with the browser's)</span></label>
     <label><span>Allowed networks</span> <input type="text" data-view="allowed_networks" readonly value="{{ c.allowed_networks }}" placeholder="none: this machine and the local network only"> <span class="muted">(config file only: this server answers loopback, private and link-local addresses, and refuses every other client; <code>allowed_networks</code> in the config file adds networks, such as a VPN's)</span></label>
   </fieldset>
@@ -231,16 +231,16 @@
       </select>
       <span class="hint" id="device-hint"{% if !c.force_cpu %} hidden{% endif %}>Overridden by Force CPU{% if let Some(n) = force_cpu_note %}: {{ n }}{% endif %}</span>
     </label>
-    <label>GPU index <input type="number" name="gpu_index" min="0" value="{{ c.gpu_index }}" required></label>
-    <label>CPU threads (0 = default) <input type="number" name="intra_threads" min="0" value="{{ c.intra_threads }}" required></label>
-    <label>Cache dir (empty disables) <span class="with-browse"><input type="text" name="cache_dir" value="{{ c.cache_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="cache_dir" data-title="Choose the cache folder" hidden>Browse&hellip;</button></span></label>
+    <label>GPU index <input inputmode="numeric" type="number" name="gpu_index" min="0" value="{{ c.gpu_index }}" required></label>
+    <label>CPU threads (0 = default) <input inputmode="numeric" type="number" name="intra_threads" min="0" value="{{ c.intra_threads }}" required></label>
+    <label>Cache dir (empty disables) <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="cache_dir" value="{{ c.cache_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="cache_dir" data-title="Choose the cache folder" hidden>Browse&hellip;</button></span></label>
     <label class="check"><input type="checkbox" name="force_cpu" id="force-cpu"{% if c.force_cpu %} checked{% endif %}> Force CPU (overrides every device setting)</label>
     <p class="muted">"will download" options are fetched on save (models serve on what they can meanwhile; the server restarts once to load a new runtime when it is installed). Unavailable options are greyed out with the reason. Per-model devices: the Models tab. Live list: <a href="/v1/devices"><code>/v1/devices</code></a>.</p>
   </fieldset>
 
   <fieldset class="group" id="folders">
     <legend>Folders {{ self.badge("download_dir,models_dir,onnxruntime_dir,openvino_dir")|safe }}</legend>
-    <label><span>Models folder (empty = <code>models</code> under the data root)</span> <span class="with-browse"><input type="text" name="models_dir" value="{{ c.models_dir }}" placeholder="models"><button type="button" class="browse secondary" data-browse="folder" data-target="models_dir" data-title="Choose the models folder" hidden>Browse&hellip;</button></span></label>
+    <label><span>Models folder (empty = <code>models</code> under the data root)</span> <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="models_dir" value="{{ c.models_dir }}" placeholder="models"><button type="button" class="browse secondary" data-browse="folder" data-target="models_dir" data-title="Choose the models folder" hidden>Browse&hellip;</button></span></label>
     <label>Download folder (data root; empty = the program folder) <input type="text" data-view="download_dir" readonly value="{{ c.download_dir }}" placeholder="{{ exe_dir }}"></label>
     <label><span>ONNX Runtime folder (empty = <code>ORT_DYLIB_PATH</code>, else <code>onnxruntime/</code> in the data root)</span> <input type="text" data-view="onnxruntime_dir" readonly value="{{ c.onnxruntime_dir }}" placeholder="automatic"></label>
     <label><span>OpenVINO folder (empty = <code>openvino/</code> in the data root, else the system)</span> <input type="text" data-view="openvino_dir" readonly value="{{ c.openvino_dir }}" placeholder="automatic"></label>
@@ -258,7 +258,7 @@
     <legend>Detection defaults {{ self.badge("confidence_threshold,nms_iou,object_filter")|safe }}</legend>
     <label>Confidence threshold <input type="number" name="confidence_threshold" min="0" max="1" step="0.01" value="{{ c.confidence_threshold }}" required></label>
     <label>NMS IoU <input type="number" name="nms_iou" min="0" max="1" step="0.01" value="{{ c.nms_iou }}" required></label>
-    <label>Object filter (comma separated, empty = all) <span class="with-browse"><input type="text" name="object_filter" id="object-filter" value="{{ c.object_filter }}"><button type="button" class="secondary" id="of-global-edit" hidden>Choose&hellip;</button></span></label>
+    <label>Object filter (comma separated, empty = all) <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="object_filter" id="object-filter" value="{{ c.object_filter }}"><button type="button" class="secondary" id="of-global-edit" hidden>Choose&hellip;</button></span></label>
     <p class="muted">Per-model thresholds in the Models tab override the global threshold. A model's own <em>Classes</em> choice (Models tab) replaces this filter for that model. The Review and Training auto-label forms default to the classes the enabled models detect.</p>
   </fieldset>
 
@@ -286,10 +286,10 @@
       {% for t in log_timezones %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
       </select>
     </label>
-    <label>Log directory (empty = stdout) {{ self.badge("log_path")|safe }} <span class="with-browse"><input type="text" name="log_path" value="{{ c.log_path }}"><button type="button" class="browse secondary" data-browse="folder" data-target="log_path" data-title="Choose the log folder" hidden>Browse&hellip;</button></span></label>
-    <label>Save annotated images to {{ self.badge("save_image_path")|safe }} <span class="with-browse"><input type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"><button type="button" class="browse secondary" data-browse="folder" data-target="save_image_path" data-title="Choose the folder for saved images" hidden>Browse&hellip;</button></span></label>
-    <label>Delete saved images older than (days, 0 = keep) {{ self.badge("save_image_max_age_days")|safe }} <input type="number" name="save_image_max_age_days" min="0" max="3650" value="{{ c.save_image_max_age_days }}"></label>
-    <label>Max saved-image folder size (MB, 0 = unlimited) {{ self.badge("save_image_max_mb")|safe }} <input type="number" name="save_image_max_mb" min="0" max="1000000" value="{{ c.save_image_max_mb }}"></label>
+    <label>Log directory (empty = stdout) {{ self.badge("log_path")|safe }} <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="log_path" value="{{ c.log_path }}"><button type="button" class="browse secondary" data-browse="folder" data-target="log_path" data-title="Choose the log folder" hidden>Browse&hellip;</button></span></label>
+    <label>Save annotated images to {{ self.badge("save_image_path")|safe }} <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="save_image_path" value="{{ c.save_image_path }}" placeholder="disabled"><button type="button" class="browse secondary" data-browse="folder" data-target="save_image_path" data-title="Choose the folder for saved images" hidden>Browse&hellip;</button></span></label>
+    <label>Delete saved images older than (days, 0 = keep) {{ self.badge("save_image_max_age_days")|safe }} <input inputmode="numeric" type="number" name="save_image_max_age_days" min="0" max="3650" value="{{ c.save_image_max_age_days }}"></label>
+    <label>Max saved-image folder size (MB, 0 = unlimited) {{ self.badge("save_image_max_mb")|safe }} <input inputmode="numeric" type="number" name="save_image_max_mb" min="0" max="1000000" value="{{ c.save_image_max_mb }}"></label>
     <label class="check"><input type="checkbox" name="save_ref_image"{% if c.save_ref_image %} checked{% endif %}> Also save the unannotated image {{ self.badge("save_ref_image")|safe }}</label>
     <p class="muted">Recent log lines: <a href="/logs">Logs</a>.</p>
   </fieldset>
@@ -335,7 +335,7 @@
   <form method="post" action="/config/accounts/add#accounts" class="acct-form" id="acct-add">
     <fieldset class="group">
       <legend>Add an account</legend>
-      <label>Username <input type="text" name="name" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32" required> <span class="muted">(1 to 32 of a-z, 0-9, '.', '_' and '-')</span></label>
+      <label>Username <input type="text" name="name" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="32" required> <span class="muted">(1 to 32 of a-z, 0-9, '.', '_' and '-')</span></label>
       <label>Its password <input type="password" name="password" autocomplete="new-password" minlength="15" maxlength="512" required></label>
       <label>Its password again <input type="password" name="password2" autocomplete="new-password" minlength="15" maxlength="512" required></label>
       <label>Your current password <input type="password" name="current" autocomplete="current-password" maxlength="512" required></label>

@@ -22,7 +22,7 @@
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
   </form>
   <form id="rv-folder" class="inline-row">
-    <label class="grow">Folder under review <span class="with-browse"><input type="text" name="dir" value="{{ dir }}" list="rv-folders" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the folder of imported frames" hidden>Browse&hellip;</button></span></label>
+    <label class="grow">Folder under review <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="dir" value="{{ dir }}" list="rv-folders" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the folder of imported frames" hidden>Browse&hellip;</button></span></label>
     <button type="submit">Review this folder</button>
     {% if custom_dir %}<button type="button" id="rv-folder-reset" class="small secondary">Back to the dataset folder</button>{% endif %}
   </form>

@@ -27,3 +27,4 @@ mod provision;
 mod resources;
 mod review_walk;
 mod select;
+mod template_inputs;

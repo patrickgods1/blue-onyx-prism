@@ -5,7 +5,7 @@
 <p>No web UI account exists yet. This page creates the first one with the one-time setup code, and only works until an account exists. Every account can do everything here; add more on the Config page afterwards.</p>
 {% if let Some(e) = error %}<p class="error" role="alert">{{ e }}</p>{% endif %}
 <form method="post" action="/setup" class="card auth-form">
-  <label>Setup code <input type="text" name="code" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="64" required autofocus></label>
+  <label>Setup code <input type="text" name="code" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" maxlength="64" required autofocus></label>
   <label>Username <input type="text" name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32" required> <span class="muted">(1 to 32 of a-z, 0-9, '.', '_' and '-')</span></label>
   <label>Password <input type="password" name="password" autocomplete="new-password" minlength="15" maxlength="512" required> <span class="muted">(15 to 128 characters; a passphrase of a few words is fine)</span></label>
   <label>Password again <input type="password" name="password2" autocomplete="new-password" minlength="15" maxlength="512" required></label>

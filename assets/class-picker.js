@@ -267,6 +267,10 @@
     search.placeholder = 'Search classes';
     search.setAttribute('aria-label', 'Search classes');
     search.autocomplete = 'off';
+    search.setAttribute('enterkeyhint', 'search');
+    search.setAttribute('autocapitalize', 'none');
+    search.setAttribute('autocorrect', 'off');
+    search.spellcheck = false;
     var groupsEl = el('div', 'cp-groups');
     var msg = el('p', 'cp-msg form-msg');
     msg.setAttribute('role', 'status');
@@ -279,6 +283,9 @@
       addInput = el('input', 'cp-add-input');
       addInput.type = 'text';
       addInput.maxLength = NAME_MAX;
+      addInput.setAttribute('autocapitalize', 'none');
+      addInput.setAttribute('autocorrect', 'off');
+      addInput.spellcheck = false;
       addInput.placeholder = 'Add a class (free text)';
       addInput.setAttribute('aria-label', 'Add a class by name');
       var addBtn = el('button', 'small secondary', 'Add');
