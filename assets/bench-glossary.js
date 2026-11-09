@@ -1,7 +1,8 @@
 // Blue Onyx Prism: Benchmark page vocabulary and shared helpers (window.PrismBench).
 // One vocabulary for every view: GLOSSARY (plain name, expert term, one-line meaning, which
 // direction is better) and LABELS (column headers -> glossary key), the accessible tooltip
-// `term(label, key)` / `tip(label, text)`, change chips, trust badges and number formats.
+// `term(label, key)` / `tip(label, text)` (shown by PrismTip, live.js), change chips, trust
+// badges and number formats.
 // Loaded before bench-charts.js, bench-compare.js and benchmark.js (ES5, no build step, CSP
 // script-src 'self': no inline handlers or style attributes; positions are set through CSSOM).
 (function () {
@@ -131,65 +132,10 @@
   function label(id) { return (LABELS[id] || [id])[0]; }
 
   // ---- tooltip -------------------------------------------------------------------------------
-  // One bubble in <body> (outside every re-rendered section, so polling never removes it). A
-  // `.term` button opens it on hover, keyboard focus and tap/click; Esc closes it. The
-  // listeners are delegated on the document in the capture phase, so a term inside a sortable
-  // header never reaches the header's click / Enter / Space handlers.
-  var bubble = null, anchor = null, anchorId = null, pinned = false, quiet = null;
-  function ensureBubble() {
-    if (bubble) return bubble;
-    bubble = el("div", "term-tip"); bubble.id = "pb-tip"; bubble.setAttribute("role", "tooltip"); bubble.hidden = true;
-    document.body.appendChild(bubble); return bubble;
-  }
-  function textOf(b) { return b.dataset.tip || tipText(b.dataset.term); }
-  function place() {
-    if (!anchor || !bubble) return;
-    var r = anchor.getBoundingClientRect(), vw = document.documentElement.clientWidth || window.innerWidth;
-    bubble.style.maxWidth = Math.min(340, vw - 24) + "px";
-    var bw = bubble.offsetWidth, bh = bubble.offsetHeight;
-    var left = Math.max(8, Math.min(r.left + window.pageXOffset, window.pageXOffset + vw - bw - 8));
-    var top = r.bottom + window.pageYOffset + 6;
-    if (r.bottom + bh + 12 > window.innerHeight && r.top > bh + 12) top = r.top + window.pageYOffset - bh - 6;
-    bubble.style.left = left + "px"; bubble.style.top = top + "px";
-  }
-  function show(b, stick) {
-    ensureBubble();
-    if (anchor && anchor !== b) anchor.removeAttribute("aria-describedby");
-    anchor = b; anchorId = b.dataset.tipId; pinned = !!stick;
-    bubble.textContent = textOf(b); bubble.hidden = false;
-    b.setAttribute("aria-describedby", "pb-tip"); b.setAttribute("aria-expanded", "true");
-    place();
-  }
-  function hide() {
-    if (anchor) { anchor.removeAttribute("aria-describedby"); anchor.setAttribute("aria-expanded", "false"); }
-    anchor = null; anchorId = null; pinned = false; if (bubble) bubble.hidden = true;
-  }
-  function termOf(t) { return t && t.closest ? t.closest(".term") : null; }
-  document.addEventListener("click", function (e) {
-    var b = termOf(e.target);
-    if (b) { e.stopPropagation(); e.preventDefault(); if (anchor === b && pinned) hide(); else show(b, true); return; }
-    if (anchor && bubble && !bubble.contains(e.target)) hide();
-  }, true);
-  document.addEventListener("keydown", function (e) {
-    if (e.key === "Escape" && anchor) { var a = anchor; hide(); if (document.activeElement !== a && a.isConnected) { quiet = a; a.focus(); quiet = null; } return; }
-    var b = termOf(e.target); if (b && (e.key === "Enter" || e.key === " ")) e.stopPropagation();
-  }, true);
-  document.addEventListener("mouseover", function (e) { var b = termOf(e.target); if (b && b !== anchor) show(b, false); }, true);
-  document.addEventListener("mouseout", function (e) {
-    var b = termOf(e.target); if (!b || b !== anchor || pinned) return;
-    var to = e.relatedTarget; if (to && (b.contains(to) || (bubble && bubble.contains(to)))) return;
-    if (document.activeElement !== b) hide();
-  }, true);
-  document.addEventListener("focusin", function (e) { var b = termOf(e.target); if (b && b !== quiet) show(b, false); }, true);
-  document.addEventListener("focusout", function (e) { var b = termOf(e.target); if (b && b === anchor && !pinned) hide(); }, true);
-  window.addEventListener("resize", place);
-  window.addEventListener("scroll", place, true);
-  // After a re-render: follow the open tooltip to its rebuilt button (same tip id), else close.
-  function refreshTip() {
-    if (!anchor || anchor.isConnected) { place(); return; }
-    var n = anchorId ? document.querySelector('.term[data-tip-id="' + anchorId.replace(/"/g, "") + '"]') : null;
-    if (n) { var p = pinned; show(n, p); } else hide();
-  }
+  // The bubble, its listeners and its placement are PrismTip in live.js (every page has it); a
+  // `.term` here names its glossary entry in `data-term` (PrismTip asks tipText for the text).
+  function refreshTip() { if (window.PrismTip) window.PrismTip.refresh(); }
+  function hide() { if (window.PrismTip) window.PrismTip.hide(); }
   // A stable id from the label and key (so a rebuilt button is found again).
   function tipId(label, key, scope) { return (scope || "") + "|" + (key || "") + "|" + label; }
   // `label` with a tooltip from the glossary entry `key`.

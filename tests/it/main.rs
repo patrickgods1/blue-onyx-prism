@@ -16,6 +16,7 @@ mod enabled_models_http;
 mod families_http;
 mod formats_020;
 mod integration_http;
+mod js_charts;
 mod js_poll;
 mod js_review_touch;
 mod js_rules;

@@ -1898,6 +1898,21 @@ mod tests {
         assert!(html.contains(
             "value=\"dfine-m\" data-confirm=\"Remove dfine-m from the config and delete its files in the models folder? Files outside it and catalog models stay.\" title=\"Remove this entry"
         ), "{html}");
+        // The reason also opens on a tap (a disabled button's title shows on mouse hover only),
+        // only beside the disabled one; the full model path is a tap away too, and so are the
+        // reasons of a restart badge.
+        assert!(html.contains(
+            "class=\"term term-q mc-remove-why\" data-tip=\"Enabled: disable it first (untick Load and save), then remove it.\" aria-label=\"Why Remove is off for ipcam-general\">?</button>"
+        ), "{html}");
+        assert!(html.contains("aria-label=\"Why Remove is off for dfine-m\" hidden>?</button>"));
+        assert!(html.contains("<button type=\"button\" class=\"term mc-path\" data-tip=\""));
+        assert!(
+            html.contains("<code>dfine-m.onnx</code></button>"),
+            "{html}"
+        );
+        assert!(html.contains(
+            "<button type=\"button\" class=\"term tag restart pending-badge\" data-tip=\""
+        ));
 
         // A request that is not signed in and a cross-site page are refused; nothing changes.
         let remote = anonymous(from_peer(

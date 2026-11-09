@@ -31,7 +31,7 @@ if (window.PrismLive) PrismLive.onConfig(function (j) {
   document.querySelectorAll("table.models .pending-badge[data-model]").forEach(function (b) {
     var m = byKey[norm(b.dataset.model)];
     var reasons = m ? m.reasons : ["removed from the config; still loaded"];
-    b.hidden = !reasons.length; b.title = reasons.join("; ");
+    b.hidden = !reasons.length; b.dataset.tip = reasons.join("; ");
   });
 });
 fetch("/v1/status/updateavailable").then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }).then(u => {

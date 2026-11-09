@@ -36,7 +36,7 @@
   {% if exports.is_empty() %}<p class="muted">No export yet. Exports appear here and on the <a href="/train/train">Train</a> tab.</p>{% else %}
   <div class="scroll"><table class="rcards">
     <thead><tr><th>Export</th><th class="num">Frames</th><th>Split</th><th>Boxes</th><th>Formats</th><th></th></tr></thead>
-    <tbody>{% for e in exports %}<tr><td class="rc-title" title="{{ e.path }}">{{ e.when }}</td><td class="num" data-label="Frames">{% if let Some(n) = e.frames %}{{ n }}{% else %}?{% endif %}</td><td data-label="Split">{{ e.split }}</td><td data-label="Boxes">{{ e.classes }}</td><td data-label="Formats">{{ e.formats }}</td><td class="rc-action"><a class="small" href="{{ e.train_link }}">Train on it</a></td></tr>{% endfor %}</tbody>
+    <tbody>{% for e in exports %}<tr><td class="rc-title"><button type="button" class="term" data-tip="{{ e.path }}">{{ e.when }}</button></td><td class="num" data-label="Frames">{% if let Some(n) = e.frames %}{{ n }}{% else %}?{% endif %}</td><td data-label="Split">{{ e.split }}</td><td data-label="Boxes">{{ e.classes }}</td><td data-label="Formats">{{ e.formats }}</td><td class="rc-action"><a class="small" href="{{ e.train_link }}">Train on it</a></td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
 </div>

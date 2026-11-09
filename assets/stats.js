@@ -47,7 +47,10 @@
         }
         tr.appendChild(st);
         tr.appendChild(td(m.runtime));
-        tr.appendChild(td(m.executionProvider, "trunc", m.device || m.requestedDevice));
+        // The provider, the device spec under it (as the template; visible, not only a title).
+        var dev = td(m.executionProvider, "trunc", m.executionProvider), spec = document.createElement("span");
+        spec.className = "sub"; spec.textContent = m.device || m.requestedDevice || "";
+        dev.appendChild(spec); tr.appendChild(dev);
         tr.appendChild(td(m.fellBack === null || m.fellBack === undefined ? "-" : (m.fellBack ? "yes" : "no")));
         tr.appendChild(td(String(m.requests), "num"));
         tr.appendChild(td(String(m.dropped), "num"));

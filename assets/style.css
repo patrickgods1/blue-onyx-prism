@@ -115,7 +115,8 @@ nav { display: flex; flex-wrap: wrap; gap: 0.25rem; }
 nav a { text-decoration: none; padding: 0.3rem 0.7rem; border-radius: 6px; }
 /* The dimmed look is for the dark header only: tab strips on cards keep their full contrast. */
 header nav a { color: var(--head-fg); opacity: 0.8; }
-header nav a:hover, header nav a.active { opacity: 1; background: rgba(255, 255, 255, 0.12); }
+header nav a.active { opacity: 1; background: rgba(255, 255, 255, 0.12); }
+@media (hover: hover) { header nav a:hover { opacity: 1; background: rgba(255, 255, 255, 0.12); } }
 /* `--main-px`: the page's side padding, at least the notch's inset (edge-to-edge parts such as
    the Review frame on a phone undo exactly this much). */
 main { --main-px: max(1.5rem, env(safe-area-inset-left), env(safe-area-inset-right)); max-width: 1200px; margin: 0 auto; padding: 1.5rem var(--main-px); }
@@ -158,9 +159,9 @@ input, select, textarea, button {
 textarea { width: 100%; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.85rem; }
 button { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); cursor: pointer; padding: 0.45rem 1.1rem; }
 button.secondary { background: var(--card); color: var(--accent); border-color: var(--border); }
-button.secondary:hover { border-color: var(--accent); }
+@media (hover: hover) { button.secondary:hover { border-color: var(--accent); } }
 button.danger { background: var(--card); color: var(--danger); border-color: var(--danger); }
-button.danger:hover { background: var(--danger); color: var(--danger-fg); }
+@media (hover: hover) { button.danger:hover { background: var(--danger); color: var(--danger-fg); } }
 button:disabled { opacity: 0.55; cursor: default; }
 button:focus-visible, a:focus-visible, th.sortable:focus-visible, summary:focus-visible,
 input:focus-visible, select:focus-visible, textarea:focus-visible, .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -311,7 +312,7 @@ span.small { font-size: 0.8rem; font-weight: normal; }
 .warn-list { margin: 0.3rem 0; padding-left: 1.2rem; color: var(--warn-fg); }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.75rem; margin: 1rem 0; }
 .gcard { display: block; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem 0.9rem; color: var(--fg); text-decoration: none; }
-.gcard:hover { border-color: var(--accent); }
+@media (hover: hover) { .gcard:hover { border-color: var(--accent); } }
 .gname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gbig .grade { font-size: 1.8rem; padding: 0.1rem 0.7rem; margin: 0.3rem 0; display: inline-block; }
 .gsub { font-size: 0.85rem; color: var(--muted); }
@@ -324,7 +325,7 @@ span.small { font-size: 0.8rem; font-weight: normal; }
 .grade-none { background: var(--code-bg); color: var(--muted); }
 table.bench td, table.bench th { white-space: nowrap; }
 th.sortable { cursor: pointer; user-select: none; }
-th.sortable:hover { color: var(--fg); }
+@media (hover: hover) { th.sortable:hover { color: var(--fg); } }
 th.sortable[data-dir="asc"]::after { content: " \25B2"; }
 th.sortable[data-dir="desc"]::after { content: " \25BC"; }
 table.bench tr.fastest td { background: var(--ok-bg); }
@@ -369,6 +370,13 @@ figure.thumb figcaption { font-size: 0.78rem; color: var(--muted); word-break: b
 .thr-chart .thr-mark-cfg { stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 3 3; }
 .thr-chart .thr-f2 { stroke: var(--chart-f2); stroke-dasharray: 2 3; }
 .thr-chart .thr-hit { fill: transparent; pointer-events: all; cursor: crosshair; }
+/* A finger: up-down drags and pinches stay the page's, a sideways drag scrubs the readout
+   (bench-charts.js). On the svg itself: Chrome ignores touch-action on the shapes inside one. */
+svg.thr-chart:not(.pb-scatter), .thr-chart .thr-hit { touch-action: pan-y pinch-zoom; }
+/* Over the hit rect: the readout and its guide let the pointer through; the ROC dots take it
+   (their <title> on hover, their text as the readout on a tap; bench-charts.js). */
+.thr-chart .thr-tip, .thr-chart .thr-guide, .thr-chart .roc-hover { pointer-events: none; }
+.thr-chart .roc-dot-best, .thr-chart .roc-dot-cfg { cursor: help; }
 .thr-chart .thr-guide { stroke: var(--muted); stroke-width: 1; }
 .thr-chart .thr-tip rect { fill: var(--card); stroke: var(--border); }
 .thr-chart .thr-tip text { fill: var(--fg); font-size: 11px; }
@@ -414,7 +422,7 @@ tr.pending > td:first-child { box-shadow: inset 3px 0 0 var(--warn-fg); }
 #pending-list { margin: 0.2rem 0 0; padding-left: 1.2rem; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 nav.toc a { color: var(--accent); opacity: 1; padding: 0; }
-nav.toc a:hover { background: none; text-decoration: underline; }
+@media (hover: hover) { nav.toc a:hover { background: none; text-decoration: underline; } }
 table.model-card select { max-width: 22rem; }
 /* Pinned while the server restarts (the page reloads in place afterwards). */
 .restart-banner { position: fixed; top: 3.2rem; left: 50%; transform: translateX(-50%); z-index: 50; max-width: calc(100vw - 1.5rem); background: var(--card); color: var(--fg, inherit); border: 1px solid var(--border); border-left: 4px solid var(--ok-fg); border-radius: 6px; padding: 0.5rem 0.9rem; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25); }
@@ -446,7 +454,8 @@ dialog#browse-dialog h3 { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 dialog#browse-dialog > .browse-list { flex: 0 1 auto; min-height: 6rem; }
 .browse-list:empty { display: none; }
 button.browse-item { display: flex; justify-content: space-between; gap: 0.8rem; width: 100%; text-align: left; background: transparent; color: var(--fg); border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 0.4rem 0.6rem; }
-button.browse-item:hover, button.browse-item:focus-visible { background: var(--code-bg); }
+button.browse-item:focus-visible { background: var(--code-bg); }
+@media (hover: hover) { button.browse-item:hover { background: var(--code-bg); } }
 button.browse-item.selected { background: var(--ok-bg); color: var(--ok-fg); }
 .browse-name { overflow-wrap: anywhere; }
 .browse-size { color: var(--muted); white-space: nowrap; }
@@ -467,20 +476,20 @@ dialog.signin-dialog input { width: 100%; box-sizing: border-box; }
 /* Collapsed help text: one sentence stays in the card, the rest opens on demand. */
 details.help { margin: 0.25rem 0 0.75rem; font-size: 0.9rem; }
 details.help > summary { color: var(--muted); font-size: 0.85rem; margin: 0; }
-details.help > summary:hover { color: var(--accent); }
+@media (hover: hover) { details.help > summary:hover { color: var(--accent); } }
 details.help > :not(summary) { color: var(--muted); margin: 0.4rem 0 0; }
 details.help[open] > summary { color: var(--fg); }
 
 /* Train area: sub-tabs at their own URLs, the status strip under them. */
 nav.train-tabs { display: flex; gap: 0; margin: 0 0 0.5rem; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; }
 nav.train-tabs a { flex: none; padding: 0.55rem 0.85rem; border-bottom: 2px solid transparent; margin-bottom: -1px; color: var(--muted); text-decoration: none; white-space: nowrap; }
-nav.train-tabs a:hover { color: var(--fg); }
+@media (hover: hover) { nav.train-tabs a:hover { color: var(--fg); } }
 nav.train-tabs a.active { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
 .train-strip { margin: 0 0 0.8rem; font-size: 0.88rem; }
 .train-strip[hidden] { display: none; }
 ul.train-counts { display: flex; flex-wrap: wrap; gap: 0.1rem 1rem; list-style: none; margin: 0 0 0.2rem; padding: 0; }
 ul.train-counts a { color: var(--fg); text-decoration: none; }
-ul.train-counts a:hover { color: var(--accent); }
+@media (hover: hover) { ul.train-counts a:hover { color: var(--accent); } }
 ul.train-counts strong { font-variant-numeric: tabular-nums; }
 .train-next { margin: 0; }
 .train-next-k { color: var(--muted); }
@@ -494,7 +503,7 @@ nav.train-tabs .tab-count[hidden] { display: none; }
 .train-jobs { margin: 0.5rem 0 0; }
 .train-jobs[hidden] { display: none; }
 a.tj { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0.25rem 0.7rem; align-items: center; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); text-decoration: none; }
-a.tj:hover { border-color: var(--accent); text-decoration: none; }
+@media (hover: hover) { a.tj:hover { border-color: var(--accent); text-decoration: none; } }
 .tj-head { display: flex; align-items: baseline; gap: 0.5rem; min-width: 0; }
 .tj-kind { font-weight: 600; white-space: nowrap; }
 .tj-title { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -518,7 +527,7 @@ a.tj[data-state="queued"] .tj-meter { display: none; }
 /* Tab strip: the sticky nav.toc look; one panel at a time with JavaScript, all stacked without. */
 nav.tabs { gap: 0; padding: 0 0.4rem; }
 nav.tabs a[role="tab"] { padding: 0.6rem 0.9rem; border-bottom: 2px solid transparent; color: var(--muted); border-radius: 0; }
-nav.tabs a[role="tab"]:hover { color: var(--fg); text-decoration: none; }
+@media (hover: hover) { nav.tabs a[role="tab"]:hover { color: var(--fg); text-decoration: none; } }
 nav.tabs a[role="tab"][aria-selected="true"] { color: var(--fg); font-weight: 600; border-bottom-color: var(--accent); }
 .panel[hidden] { display: none; }
 .panel > h2:first-child { margin-top: 0.5rem; }
@@ -530,7 +539,7 @@ nav.tabs a[role="tab"][aria-selected="true"] { color: var(--fg); font-weight: 60
 .pending-bar[hidden] { display: none; }
 .pending-bar .muted { color: inherit; opacity: 0.85; }
 .pending-bar button.danger { background: transparent; color: inherit; border-color: currentColor; margin: 0; }
-.pending-bar button.danger:hover { background: var(--warn-fg); color: var(--warn-bg); }
+@media (hover: hover) { .pending-bar button.danger:hover { background: var(--warn-fg); color: var(--warn-bg); } }
 .pending-bar ul { margin: 0.3rem 0 0; padding-left: 1.2rem; font-size: 0.9rem; }
 
 /* Server form: fields grouped by what applies when. */
@@ -600,7 +609,7 @@ table.accounts .acct-name { font-weight: 600; }
 ol.steps { display: flex; flex-wrap: wrap; gap: 0.4rem; list-style: none; margin: 0 0 0.8rem; padding: 0; }
 ol.steps li { flex: 1 1 10rem; }
 ol.steps li a { display: flex; flex-wrap: wrap; align-items: center; gap: 0.1rem 0.45rem; padding: 0.45rem 0.7rem; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--muted); text-decoration: none; height: 100%; }
-ol.steps li a:hover { border-color: var(--accent); }
+@media (hover: hover) { ol.steps li a:hover { border-color: var(--accent); } }
 ol.steps .step-n { display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; border: 1.5px solid currentColor; font-weight: 700; font-size: 0.85rem; }
 ol.steps .step-sub { flex-basis: 100%; font-size: 0.78rem; font-weight: normal; }
 ol.steps li.current a { color: var(--fg); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600; }
@@ -611,10 +620,21 @@ ol.steps li.done .step-n { background: var(--ok-bg); border-color: var(--ok-fg);
 
 /* Term tooltips: a plain-language label; the expert term and its meaning on hover / focus / tap. */
 button.term { font: inherit; color: inherit; background: none; border: none; border-radius: 3px; padding: 0; margin: 0; cursor: help; text-decoration: underline dotted; text-underline-offset: 0.18em; text-decoration-color: var(--muted); text-align: inherit; }
-button.term:hover, button.term[aria-expanded="true"] { color: var(--accent); text-decoration-color: var(--accent); }
+button.term[aria-expanded="true"] { color: var(--accent); text-decoration-color: var(--accent); }
+@media (hover: hover) { button.term:hover { color: var(--accent); text-decoration-color: var(--accent); } }
 button.term.term-q { display: inline-flex; align-items: center; justify-content: center; width: 1.3rem; height: 1.3rem; border: 1px solid var(--border); border-radius: 50%; font-size: 0.75rem; font-weight: 700; text-decoration: none; color: var(--muted); vertical-align: middle; }
 th button.term { font-weight: 600; }
-.term-tip { position: absolute; z-index: 50; max-width: 340px; padding: 0.5rem 0.7rem; background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18); font-size: 0.85rem; line-height: 1.4; font-weight: normal; text-align: left; white-space: normal; pointer-events: none; }
+.term-tip { position: absolute; z-index: 50; max-width: 340px; padding: 0.5rem 0.7rem; background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18); font-size: 0.85rem; line-height: 1.4; font-weight: normal; text-align: left; white-space: normal; overflow-wrap: anywhere; pointer-events: none; }
+button.term[hidden] { display: none; }
+/* A badge that opens its reasons (restart needed, training frames): the tag's own size. */
+button.term.tag { font-size: 0.75rem; line-height: inherit; padding: 0 0.4rem; border-radius: 4px; text-decoration: none; }
+button.term.muted { color: var(--muted); }
+button.term.small { font-size: 0.8rem; }
+/* A finger: the round "?" and the badges get a little more to hit. */
+@media (pointer: coarse) {
+  button.term.term-q { width: 1.75rem; height: 1.75rem; }
+  button.term.tag { padding: 0.15rem 0.5rem; }
+}
 .glossary .gloss-list { display: grid; grid-template-columns: minmax(10rem, max-content) 1fr; gap: 0.3rem 1rem; margin: 0.5rem 0 0; }
 .glossary .gloss-list dt { font-weight: 600; color: var(--fg); }
 .glossary .gloss-list dd { margin: 0; color: var(--muted); }
@@ -627,7 +647,8 @@ th button.term { font-weight: 600; }
 .chip-worse, button.term.chip-worse { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
 .chip-same, button.term.chip-same, .chip-first, button.term.chip-first { background: var(--chip-same-bg); color: var(--chip-same-fg); border-color: var(--border); font-weight: normal; }
 .chip-nc, button.term.chip-nc { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
-button.term.chip:hover, button.term.chip[aria-expanded="true"] { outline: 1px solid currentColor; }
+button.term.chip[aria-expanded="true"] { outline: 1px solid currentColor; }
+@media (hover: hover) { button.term.chip:hover { outline: 1px solid currentColor; } }
 
 /* Trust badges, run tags, best trade-off. */
 button.term.trust { display: inline-block; font-size: 0.75rem; line-height: 1.35; padding: 0 0.45rem; border-radius: 4px; border: 1px solid; text-decoration: none; font-weight: 600; white-space: nowrap; vertical-align: middle; }
@@ -653,7 +674,7 @@ p.banner { margin: 0.5rem 0; }
 .preset-card h2 { display: flex; align-items: center; gap: 0.5rem; }
 fieldset.presets { border: none; padding: 0; margin: 0.4rem 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.5rem; }
 label.preset { display: flex; flex-direction: row; align-items: flex-start; gap: 0.5rem; margin: 0; padding: 0.55rem 0.7rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--fg); cursor: pointer; font-size: 0.9rem; }
-label.preset:hover { border-color: var(--accent); }
+@media (hover: hover) { label.preset:hover { border-color: var(--accent); } }
 label.preset.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--card); }
 label.preset input { margin-top: 0.25rem; }
 label.preset .preset-text { display: flex; flex-direction: column; gap: 0.1rem; }
@@ -705,7 +726,7 @@ button.secondary.active { border-color: var(--accent); background: var(--code-bg
 .legend { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.3rem 0; }
 button.legend-item { display: inline-flex; align-items: center; gap: 0.35rem; background: var(--card); color: var(--fg); border: 1px solid var(--border); padding: 0.1rem 0.55rem; font-size: 0.8rem; border-radius: 999px; max-width: 100%; overflow-wrap: anywhere; }
 button.legend-item[aria-pressed="false"] { opacity: 0.55; text-decoration: line-through; }
-button.legend-item:hover { border-color: var(--accent); }
+@media (hover: hover) { button.legend-item:hover { border-color: var(--accent); } }
 .lg-swatch { width: 22px; height: 10px; flex: none; }
 .lg-swatch line { stroke-width: 2.5; fill: none; }
 .lg-swatch .thr-p { stroke: var(--chart-p); } .lg-swatch .thr-r { stroke: var(--chart-r); } .lg-swatch .thr-f1 { stroke: var(--chart-f1); } .lg-swatch .thr-f2 { stroke: var(--chart-f2); }
@@ -748,6 +769,11 @@ table.bench td.why { white-space: normal; min-width: 14rem; color: var(--muted);
   .scatter-wrap, .roc-chart-wrap.wide, .chart-row .thr-chart-wrap { max-width: 100%; flex-basis: 100%; }
   .cmp-grid { grid-template-columns: 1fr 1fr; }
   label.inline-label select { max-width: 60vw; }
+  /* WebKit lays a <select> out as wide as its longest option inside a label that cannot shrink,
+     so "Try another goal" widened the page: the label may shrink and wrap, the select takes
+     the room left (on its own line under a long label). */
+  .chart-tools label.inline-label { min-width: 0; flex-wrap: wrap; }
+  .chart-tools label.inline-label select { flex: 1 1 10rem; width: 100%; }
 }
 
 /* Benchmark: nothing may widen the page (long paths, long <select> options, grid items). */
@@ -782,7 +808,7 @@ table.rank-table td .best-tradeoff { display: inline-block; margin: 0.15rem 0 0;
 .dt-tools .dt-count { font-size: 0.85rem; }
 .dt-tools button.small { margin: 0; }
 table.dt th.dt-sort { cursor: pointer; user-select: none; }
-table.dt th.dt-sort:hover { color: var(--fg); }
+@media (hover: hover) { table.dt th.dt-sort:hover { color: var(--fg); } }
 table.dt th.dt-sort::after { content: " \2195"; opacity: 0.35; }
 table.dt th.dt-sort[aria-sort="ascending"]::after { content: " \25B2"; opacity: 1; }
 table.dt th.dt-sort[aria-sort="descending"]::after { content: " \25BC"; opacity: 1; }
@@ -864,7 +890,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .review-boxes li.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 /* A box that is not selected: one row. */
 .review-boxes li.compact { display: flex; align-items: center; gap: 0.4rem; padding: 0.2rem 0.45rem; margin: 0 0 0.2rem; font-size: 0.88rem; }
-.review-boxes li.compact:hover { border-color: var(--accent); }
+@media (hover: hover) { .review-boxes li.compact:hover { border-color: var(--accent); } }
 .review-boxes li.compact .bx-num { flex: none; min-width: 1.8rem; font-variant-numeric: tabular-nums; }
 .review-boxes li.compact .bx-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .review-boxes li.compact .rv-chip { flex: none; white-space: nowrap; }
@@ -874,7 +900,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 /* Accept / reject in the colours of the decision. */
 button.ok { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok-fg); }
 button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
-button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 1px currentColor; }
+@media (hover: hover) { button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 1px currentColor; } }
 /* The decision bar: the selected box's question and answers, the frame's progress. */
 .rv-decide { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.4rem 0; background: var(--bg); }
 .rv-decide:empty { display: none; }
@@ -1103,8 +1129,10 @@ details.res-group > summary::-webkit-details-marker { display: none; }
 details.res-group > summary::before { content: "\25B8"; color: var(--muted); flex: none; width: 0.8rem; }
 details.res-group[open] > summary::before { content: "\25BE"; }
 details.res-group > summary h3 { margin: 0; font-size: 1.02rem; }
-details.res-group > summary:hover h3 { color: var(--accent); }
-details.res-group > summary:hover .res-count { color: var(--muted); }
+@media (hover: hover) {
+  details.res-group > summary:hover h3 { color: var(--accent); }
+  details.res-group > summary:hover .res-count { color: var(--muted); }
+}
 details.res-group[hidden] { display: none; }
 .res-note { margin: 0 0 0.3rem; }
 .export-add-row { margin: 0.2rem 0 0.5rem; }
@@ -1120,7 +1148,7 @@ details.res-group table.resources tr[hidden] { display: none; }
 @media (max-width: 700px) {
   details.res-group table.resources, details.res-group table.resources tbody { display: block; }
   details.res-group table.resources colgroup, details.res-group table.resources thead { display: none; }
-  details.res-group table.resources tr { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 0.8rem; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); }
+  details.res-group table.resources tr { display: grid; grid-template-columns: fit-content(55%) minmax(0, 1fr); gap: 0.25rem 0.8rem; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); }
   details.res-group table.resources tr[hidden] { display: none; }
   details.res-group table.resources tbody tr:last-child { border-bottom: none; }
   details.res-group table.resources td { display: block; padding: 0; border: none; text-align: left; min-width: 0; }
@@ -1141,7 +1169,7 @@ nav.wizard .tab-count[hidden] { display: none; }
 .plain-key { font-size: 0.9rem; }
 .next-step { margin: 1rem 0; }
 .next-step a.button-link { display: inline-block; background: var(--accent); color: var(--accent-fg); padding: 0.45rem 1.1rem; border-radius: 6px; text-decoration: none; font-weight: 600; }
-.next-step a.button-link:hover { filter: brightness(1.08); }
+@media (hover: hover) { .next-step a.button-link:hover { filter: brightness(1.08); } }
 
 /* Step 2: one card per model, one row per device (7 columns at most). */
 .profile-card h3.profile-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem 0.6rem; margin: 0 0 0.25rem; font-size: 1.1rem; overflow-wrap: anywhere; }
@@ -1300,6 +1328,7 @@ ul.thr-profile-list code, .profiles code { font-size: 0.8rem; }
 .model-classes { white-space: normal; min-width: 8rem; }
 .model-classes .of-summary { overflow-wrap: anywhere; }
 .model-classes .of-summary.warn { color: var(--warn-fg); }
+.model-classes .of-unknown { color: var(--warn-fg); }
 dialog#class-dialog { width: min(46rem, calc(100vw - 32px)); max-height: 90vh; max-height: 90dvh; overflow: auto; overscroll-behavior: contain; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem 0.8rem 0; }
 dialog#class-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 dialog#class-dialog h3 { margin: 0 0 0.5rem; }
@@ -1441,6 +1470,8 @@ td.tr-bal-bars { vertical-align: middle; }
 @media (min-width: 901px) {
   .rv-actions-more { display: flex; flex-wrap: wrap; flex-basis: 100%; gap: 0.25rem; }
   .rv-actions-more button.small { margin: 0; padding: 0.05rem 0.5rem; font-size: 0.78rem; color: var(--muted); background: transparent; border-color: var(--border); }
+}
+@media (min-width: 901px) and (hover: hover) {
   .rv-actions-more button.small:hover { color: var(--accent); border-color: var(--accent); }
 }
 
@@ -1480,6 +1511,9 @@ td.tr-bal-bars { vertical-align: middle; }
 /* Finger-sized controls. */
 @media (max-width: 900px), (pointer: coarse) {
   button:not(.term):not(.browse-item), select, input:not([type=checkbox], [type=radio], [type=range]) { min-height: 44px; }
+  /* WebKit does not clip the text of a <select> narrower than its longest option: the spill
+     counted as overflow and widened the page (Benchmark Compare, History, Details at 390 px). */
+  select { overflow: hidden; text-overflow: ellipsis; }
   table.model-card td.mc-load input, table.model-card td.mc-default input { width: 1.6rem; height: 1.6rem; }
   button.small { padding-left: 0.75rem; padding-right: 0.75rem; }
   button.browse-item { padding-top: 0.75rem; padding-bottom: 0.75rem; }
