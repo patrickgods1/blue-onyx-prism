@@ -250,6 +250,14 @@ function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
     Write-Host "Service uses the shipped VC++ runtime. Runtime DLLs loaded: $($runtimes -join ', '). C runtime DLLs: $($crt -join ', ')"
 }
 
+# The status and the resolved Location of a browser GET of $Url, redirects not followed and the
+# certificate not checked (the service's own self-signed one).
+function Get-Redirect([string]$Url) {
+    $out = & curl.exe -s -k -o NUL -H "Accept: text/html" --max-time 10 -w '%{http_code} %{redirect_url}' $Url
+    $parts = "$out".Split(' ', 2)
+    [pscustomobject]@{ Code = [int]$parts[0]; Location = $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }) }
+}
+
 # The web UI: HTTPS behind a sign-in (the service's own self-signed certificate, so no
 # certificate check here), the plain port sending browsers there (308), and the first account's
 # one-time setup code, which the service made in the auth folder and `setup-code` prints. The code
@@ -271,16 +279,20 @@ function Assert-WebUi([string]$Log) {
     }
     if ($code -ne 200) { Fail "$tls/login did not answer 200 within 60 s (last: $code)" @($Log) }
     Write-Host "GET $tls/login -> 200"
-    $r = Invoke-WebRequest -Uri "$tls/config" -Headers $html -SkipCertificateCheck -MaximumRedirection 0 -SkipHttpErrorCheck -UseBasicParsing -TimeoutSec 10
-    if ([int]$r.StatusCode -ne 303) { Fail "$tls/config without a sign-in answered $([int]$r.StatusCode), expected 303 to the login page" @($Log) }
-    Write-Host "GET $tls/config without a sign-in -> 303"
-    $plain = "http://127.0.0.1:$Port/config"
-    $r = Invoke-WebRequest -Uri $plain -Headers $html -MaximumRedirection 0 -SkipHttpErrorCheck -UseBasicParsing -TimeoutSec 10
-    $location = "$($r.Headers['Location'])"
-    if ([int]$r.StatusCode -ne 308 -or $location -ne "$tls/config") {
-        Fail "$plain answered $([int]$r.StatusCode) to '$location', expected 308 to $tls/config" @($Log)
+    # curl.exe, not Invoke-WebRequest: with -MaximumRedirection 0, PowerShell 7 throws on a
+    # redirect even with -SkipHttpErrorCheck. curl does not follow one and reports the status and
+    # the resolved Location.
+    $r = Get-Redirect "$tls/config"
+    if ($r.Code -ne 303 -or -not $r.Location.StartsWith("$tls/login")) {
+        Fail "$tls/config without a sign-in answered $($r.Code) to '$($r.Location)', expected 303 to the login page" @($Log)
     }
-    Write-Host "GET $plain -> 308 $location"
+    Write-Host "GET $tls/config without a sign-in -> 303 $($r.Location)"
+    $plain = "http://127.0.0.1:$Port/config"
+    $r = Get-Redirect $plain
+    if ($r.Code -ne 308 -or $r.Location -ne "$tls/config") {
+        Fail "$plain answered $($r.Code) to '$($r.Location)', expected 308 to $tls/config" @($Log)
+    }
+    Write-Host "GET $plain -> 308 $($r.Location)"
 
     $codeFile = Join-Path $AuthDir "setup-code"
     if (-not (Test-Path -LiteralPath $codeFile)) { Fail "$codeFile missing: the service made no setup code" @($Log) }
