@@ -298,9 +298,14 @@ enum Mode {
     },
 }
 
-/// A running Blue Onyx Prism server on a free loopback port.
+/// A running Blue Onyx Prism server on a free loopback port: plain HTTP at `base` (Blue Iris,
+/// the open routes), HTTPS at `https_base` (the web UI and admin API; [`Server::admin_client`]).
 pub struct Server {
     pub base: String,
+    /// `https://127.0.0.1:<https_port>`.
+    pub https_base: String,
+    /// The config the server started with (its data root holds the API token and certificate).
+    pub config: Config,
     pub token: CancellationToken,
     /// Metrics of the in-process server (None in runner mode: the run loop owns its own).
     metrics: Option<Arc<Metrics>>,
@@ -319,11 +324,18 @@ impl Server {
         let mut last_err = String::new();
         for _ in 0..5 {
             let mut config = config.clone();
+            // The accounts, the setup code, the API token and the certificate live in the data
+            // root: the test's folder, never the exe dir.
+            if config.download_dir.is_none() {
+                config.download_dir = config_path.parent().map(std::path::Path::to_path_buf);
+            }
             config.port = free_port();
             // Never the default HTTPS port: a service on this machine may hold it.
             config.https_port = free_port();
             config.save(&config_path).expect("write config");
             let base = format!("http://127.0.0.1:{}", config.port);
+            let https_base = format!("https://127.0.0.1:{}", config.https_port);
+            let started = config.clone();
             let token = CancellationToken::new();
             let shutdown = token.clone();
             let log = log_handle();
@@ -334,6 +346,8 @@ impl Server {
             });
             let server = Self {
                 base,
+                https_base,
+                config: started,
                 token,
                 metrics: None,
                 mode: Mode::Runner { thread },
@@ -349,13 +363,20 @@ impl Server {
 
     /// Start a registry and the HTTP server directly (no restart support), exposing the
     /// registry and metrics. Returns once the listener is bound.
-    pub async fn start_in_process(config: Config) -> Self {
+    pub async fn start_in_process(mut config: Config) -> Self {
         let token = CancellationToken::new();
         let metrics = Arc::new(Metrics::new(blue_onyx_prism::VERSION));
         let registry =
             Arc::new(ModelRegistry::start(&config, &metrics, token.clone()).expect("registry"));
         let dir = temp_dir("config");
         let config_path = dir.join("config.json");
+        // The HTTPS certificate, the API token and the accounts live in the data root: never the
+        // exe dir in a test.
+        if config.download_dir.is_none() {
+            config.download_dir = Some(dir.to_path_buf());
+        }
+        config.https_port = free_port();
+        let started = config.clone();
         let state = Arc::new(AppState::new(
             registry.clone(),
             metrics.clone(),
@@ -369,7 +390,11 @@ impl Server {
             let port = free_port();
             attempts += 1;
             match server::bind([127, 0, 0, 1].into(), port).await {
-                Ok(listeners) => break (port, listeners),
+                Ok(listeners) => {
+                    let mut plan = server::HttpsPlan::of(&started);
+                    plan.address = [127, 0, 0, 1].into();
+                    break (port, listeners.with_https(plan));
+                }
                 Err(e) if attempts == 5 => panic!("no port to bind after 5 attempts: {e:#}"),
                 Err(e) => eprintln!("attempt {attempts}: {e:#}"),
             }
@@ -377,11 +402,51 @@ impl Server {
         let server = tokio::spawn(server::serve_on(listeners, state.into(), token.clone()));
         Self {
             base: format!("http://127.0.0.1:{port}"),
+            https_base: format!("https://127.0.0.1:{}", started.https_port),
+            config: started,
             token,
             metrics: Some(metrics),
             mode: Mode::InProcess { server, registry },
             _dir: Some(dir),
         }
+    }
+
+    /// A client for the admin routes over HTTPS: it trusts only this server's certificate
+    /// (`tls::pinned_client`) and sends the API token as `Authorization: Bearer`. Waits (60 s at
+    /// most) until the HTTPS listener answers.
+    pub async fn admin_client(&self) -> reqwest::Client {
+        let token =
+            blue_onyx_prism::admin_token::for_command(&self.config, false).expect("the API token");
+        let cert = blue_onyx_prism::tls::cert_path(&self.config);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !cert.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "no HTTPS certificate at {}",
+                cert.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut auth: reqwest::header::HeaderValue =
+            format!("Bearer {}", token.reveal()).parse().unwrap();
+        auth.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, auth);
+        let client = blue_onyx_prism::tls::pinned_client(&cert)
+            .expect("pinned client")
+            .default_headers(headers)
+            .build()
+            .expect("client");
+        let probe = format!("{}/v1/status", self.https_base);
+        while client.get(&probe).send().await.is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "HTTPS did not answer at {}",
+                self.https_base
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        client
     }
 
     /// The metrics of an in-process server.

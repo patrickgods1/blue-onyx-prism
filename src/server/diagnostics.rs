@@ -83,13 +83,18 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
 
-    /// The admin route answers a zip with the live parts, and never the planted tokens; a remote
-    /// peer without the token is refused like every admin route.
+    /// The admin route answers a zip with the live parts, and never the planted tokens; a request
+    /// that is not signed in is refused like on every admin route.
     #[tokio::test]
     async fn diagnostics_route_answers_a_zip_without_secrets() {
         let state = test_state();
         let root = state.config_read().data_root();
         planted(&root);
+        // `planted` replaced the accounts with its own `alice`: the test cookie signs in as her.
+        state
+            .auth
+            .sessions
+            .insert_known(TEST_SESSION, "alice", 1, crate::accounts::now());
         // `planted` saved its own config over the state's file; the state's live config
         // points its log dir at the planted logs too.
         state
@@ -137,14 +142,14 @@ mod tests {
         let remote = test_state();
         let resp = tower::ServiceExt::oneshot(
             crate::server::router(remote.clone()),
-            from_peer(
+            anonymous(from_peer(
                 Request::get("/v1/diagnostics").body(Body::empty()).unwrap(),
                 REMOTE,
-            ),
+            )),
         )
         .await
         .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let _ = std::fs::remove_dir_all(remote.config_read().data_root());
     }
 }

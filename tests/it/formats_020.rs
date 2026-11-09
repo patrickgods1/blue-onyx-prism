@@ -112,6 +112,25 @@ fn config_of_0_2_0_loads_with_every_setting_and_saves_in_the_current_format() {
     assert_eq!(saved["format"], CONFIG_FORMAT);
     assert_kept(&old, &saved, "saved config");
     assert_eq!(Config::load(&path).unwrap(), c);
+
+    // The same file with remote administration on (retired): it loads, the start can see the key
+    // (to warn and rotate the token once), and a save drops it.
+    let on = text.replacen(
+        "\"allow_remote_admin\": false",
+        "\"allow_remote_admin\": true",
+        1,
+    );
+    assert_ne!(on, text, "the fixture names allow_remote_admin");
+    std::fs::write(&path, &on).unwrap();
+    let c = Config::load(&path).unwrap();
+    assert!(c.allow_remote_admin);
+    c.save(&path).unwrap();
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("allow_remote_admin")
+    );
+    assert!(!Config::load(&path).unwrap().allow_remote_admin);
 }
 
 /// `runs.json` with `@TRAINING_DIR@` replaced by `dir`, and every run folder made.

@@ -77,7 +77,8 @@ work and mean `openvino:*`. Set it globally (`device`), per model (`models[].dev
 
 ```sh
 blue-onyx-prism list-devices         # detected GPUs, runnable options with reasons, and the auto pick
-curl http://127.0.0.1:32168/v1/devices   # the same as JSON
+curl --cacert cert.pem -H "Authorization: Bearer $(blue-onyx-prism admin-token)" \
+  https://localhost:32169/v1/devices     # the same as JSON (API token over HTTPS, see Signing in)
 ```
 
 The Config page has a device dropdown ("Auto - currently: ...", then the runnable options; options that
@@ -187,7 +188,9 @@ internet access the first time, and the web UI shows the download progress.
 | macOS (Apple silicon) | `blue-onyx-prism-<version>-macos-aarch64.pkg` | `/usr/local/blue-onyx-prism` | `/usr/local/var/blue-onyx-prism` |
 
 After installing, open `https://localhost:32169/` (the browser warns once about the self-signed
-certificate: see [HTTPS](#https)); Blue Iris uses port 32168. The installers are not code-signed yet:
+certificate: see [HTTPS](#https)) and create the first account with the code `blue-onyx-prism
+setup-code --config <the service's config>` prints ([Signing in](#signing-in)); Blue Iris uses
+port 32168. The installers are not code-signed yet:
 
 - **Windows:** SmartScreen may show "Windows protected your PC". Click *More info*, then *Run anyway*.
   The MSI installs the `BlueOnyxPrismService` service (runs as Local Service, starts automatically),
@@ -270,7 +273,7 @@ tar xzf blue-onyx-prism-*-linux-x86_64.tar.gz && cd blue-onyx-prism-*-linux-x86_
 ./blue-onyx-prism                 # device "auto": CoreML on Apple silicon, Intel GPU or CUDA where present, else CPU
 ```
 
-Check it: open `http://127.0.0.1:32168/`, or `./test-blue-onyx-prism` (see [Test client](#test-client)).
+Check it: open `https://127.0.0.1:32169/` and create the first account ([Signing in](#signing-in)), or run `./test-blue-onyx-prism` (see [Test client](#test-client)).
 `--model <path> --family yolo5|yolo26|yolo8|rtdetr|detr|rfdetr|auto` enables that model (adding it to the config when it is not there yet).
 `blue-onyx-prism --help` lists every option; `list-models` shows the downloadable catalog.
 
@@ -290,10 +293,10 @@ the model is ready.
 
 `blue_onyx_prism_config.json` next to the executable (`--config <file>` to use another). A CLI
 flag overrides the file and the merged result is written back when it differs from the file (an
-invalid value is an error and the file is left untouched). Three switches are one-off flags:
-`--allow-remote-admin`, `--force-cpu` and `--save-ref-image` apply to that run only and are never
-written to the file (set `allow_remote_admin`, `force_cpu` or `save_ref_image` there, or on the
-Config page, to keep them). Relative paths in the file resolve
+invalid value is an error and the file is left untouched). Two switches are one-off flags:
+`--force-cpu` and `--save-ref-image` apply to that run only and are never written to the file
+(set `force_cpu` or `save_ref_image` there, or on the Config page, to keep them). The retired
+`--allow-remote-admin` is accepted and ignored with a warning. Relative paths in the file resolve
 against the executable directory. The Windows service reads `blue_onyx_prism_config_service.json`
 (created with debug logging on first start).
 
@@ -307,12 +310,12 @@ it; every key can also be set in the file.
 |---|---|---|
 | `format` | `1` | Layout version of the config file, written on every save. Leave it alone: a file with a later `format` (written by a newer version) is refused with a message instead of misread. A file without it is format 1. Integer. Applies: not editable. UI: no |
 | `port` | `32168` | Plain HTTP listen port (Blue Iris, the detection API). Integer 1-65535. Applies: process restart. UI: yes |
-| `https_port` | `32169` | HTTPS listen port (the web UI; same routes as `port` for now). Must differ from `port`. Integer 1-65535. Applies: process restart. UI: yes. See [HTTPS](#https) |
+| `https_port` | `32169` | HTTPS listen port (the web UI and the admin API, behind [sign-in](#signing-in); the open routes answer here too). Must differ from `port`. Integer 1-65535. Applies: process restart. UI: yes. See [HTTPS](#https) |
 | `tls_cert_path` | not set | Your own HTTPS certificate (PEM, the chain allowed, leaf first) instead of the generated self-signed one; set together with `tls_key_path`. A relative path is under the data root. Used as given, never written. Applies: process restart. UI: read-only; set it in the config file, see [HTTPS](#https) |
 | `tls_key_path` | not set | The private key of `tls_cert_path` (PEM: PKCS#8, PKCS#1 or SEC1). Both or neither. Applies: process restart. UI: no; set it in the config file |
-| `bind_address` | `0.0.0.0` | Address the HTTP and HTTPS listeners bind; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
-| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/auth/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
-| `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Remote access](#remote-access) |
+| `bind_address` | `0.0.0.0` | Address the HTTP and HTTPS listeners bind; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Signing in](#signing-in) |
+| `allow_remote_admin` | retired | No longer used: every browser, this machine's included, signs in with an account over HTTPS. Read from old files only (a warning at start; the first start with it `true` rotates the API token once, since it travelled over plain HTTP) and dropped from the file at the next save. UI: no |
+| `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Signing in](#signing-in) |
 | `allowed_networks` | `[]` | Networks served besides the local network (loopback, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10`), e.g. a VPN: `["100.64.0.0/10"]` for Tailscale. Every other client is refused on every route. List of up to 32 CIDRs (a bare address = one address), stored in network form; `/0` is refused. Applies: at once. UI: read-only; set it in the config file, see [Local network only](#local-network-only) |
 | `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout). Integer 1-3600. Applies: at once. UI: yes |
 | `worker_queue_size` | `0` | Per-model queue length; 0 = auto from timeout and measured inference time. Integer 0-1024. Applies: restart. UI: yes |
@@ -393,7 +396,7 @@ it; every key can also be set in the file.
    enter the configured model names comma separated, e.g. `ipcam-general,yolo26s`
    (each is served via `/v1/vision/custom/<name>`; matching is case-insensitive and ignores a file extension).
 3. Click "Trigger now" on the camera (or use the AI test in Blue Iris); the alert shows the label.
-4. Check `http://127.0.0.1:32168/stats`: per-model request counters rise and `dropped` should stay 0.
+4. Check `https://127.0.0.1:32169/stats` (signed in): per-model request counters rise and `dropped` should stay 0.
    If it does not, lower the number of models on the GPU or move one to `"device": "CPU"`.
 
 ## Developer setup
@@ -764,8 +767,9 @@ All of them apply at once: they are read when a benchmark starts.
 ## Web UI
 
 Open `https://<host>:32169/` in a browser (`https://localhost:32169/` on the server; see
-[HTTPS](#https) for the certificate warning). `http://<host>:32168/` still serves the same pages
-for now; Blue Iris keeps using it:
+[HTTPS](#https) for the certificate warning) and sign in ([Signing in](#signing-in)).
+`http://<host>:32168/` is for Blue Iris: a browser that opens a page there is sent to the HTTPS
+address. Every page below needs a sign-in:
 
 | Page | What it does |
 |---|---|
@@ -813,14 +817,14 @@ the most uploads allowed in progress, `body_timeout`: an upload took over 10 s t
 - `blue_onyx_prism_dataset_requests_total`, `blue_onyx_prism_dataset_offered_total`, `blue_onyx_prism_dataset_saved_total`, `blue_onyx_prism_dataset_no_bucket_total`, `blue_onyx_prism_dataset_frames_total{bucket}`, `blue_onyx_prism_dataset_dropped_total{reason="queue_full|rate|dup|disk|error"}`, `blue_onyx_prism_dataset_bytes` and `blue_onyx_prism_dataset_collect_disabled`: the dataset collector (`collect`).
 
 `log_path`, `port`, `https_port`, `tls_cert_path`, `tls_key_path` and `bind_address` changes need
-a full process restart. Clients on this machine need no login: do not expose the ports beyond your
-LAN.
+a full process restart. `/prometheus` (like `/stats.json` and `/v1/devices`) needs the API token
+over HTTPS; see [Signing in](#signing-in) for a scrape config.
 
 ### HTTPS
 
 The service listens twice: plain HTTP on `port` (32168, Blue Iris and the detection API, which
-cannot speak TLS) and HTTPS on `https_port` (32169, the web UI). Both serve the same routes for
-now. HTTP never waits for HTTPS: if the HTTPS port is taken or its certificate does not load, the
+cannot speak TLS) and HTTPS on `https_port` (32169, the web UI). The plain port serves Blue Iris's
+routes only and sends browsers to HTTPS ([Signing in](#signing-in)). HTTP never waits for HTTPS: if the HTTPS port is taken or its certificate does not load, the
 log says why (and what holds the port), HTTP keeps serving, and HTTPS is tried again every 30 s.
 The start-up log names the address and the certificate's fingerprint:
 `HTTPS on https://localhost:32169/ (certificate SHA-256 AB:CD:...)`.
@@ -874,7 +878,8 @@ minute, with a count of the ones left out.
   lets a request in, since any client can send one.
 - **Docker:** Docker Desktop, rootless Docker and the userland proxy replace the client's address
   with a private bridge address, so there the rule cannot tell your LAN from the internet, and
-  every client shares one address for the wrong-token limit. The published port is the real gate
+  every client shares one address for the wrong-password limit (passwords and the account lockout
+  still apply). The published port is the real gate
   there: bind it to `127.0.0.1` or to a LAN address of the host (`-p 192.168.1.10:32168:32168`),
   never `0.0.0.0`, when a router forwards ports to that machine.
 - A reverse proxy that adds no forwarding header looks like its own address, so its clients pass
@@ -882,9 +887,9 @@ minute, with a count of the ones left out.
 
 ### Accounts
 
-The web UI gets username-and-password accounts, all of them administrators. They are managed on
-the server with the commands below; signing in to the pages with them comes with a later change
-(until then the rules of [Remote access](#remote-access) apply). Run the commands as the
+The web UI has username-and-password accounts, all of them administrators ([Signing
+in](#signing-in) says how browsers use them). They are managed on the server with the commands
+below (an Accounts card on the Config page follows in a later change). Run the commands as the
 service's account, with `--config <file>` when the service has its own config (the Windows
 service, the packages, Docker: `docker exec -it blue-onyx-prism /app/blue-onyx-prism --config
 /app/config/blue_onyx_prism_config.json user list`).
@@ -913,78 +918,113 @@ service, the packages, Docker: `docker exec -it blue-onyx-prism /app/blue-onyx-p
   cannot be read or is damaged, nobody can sign in and setup does not reopen: restore the file
   from a backup, or delete it to start over with a new setup code.
 
-### Remote access
+### Signing in
 
 Blue Iris may run on another machine, so the service listens on every interface by default
-(`bind_address` `0.0.0.0`, plus `[::1]` for `localhost`). Administration is answered for clients on
-this machine only: from another machine the admin pages and actions (`/config`, `/test`, `/logs`,
-`/stats`, `/benchmark`, `/v1/resources*`, `/v1/models/add`, `/v1/fs/browse`, `/v1/benchmark*`,
-`/config/*`) return **403** with a short page (browsers) or JSON. Open to every client: the
-detection API (`/v1/vision/*`), `/v1/status`, `/v1/status/updateavailable`, the home page `/`, `/stats.json`,
-`/prometheus`, `/v1/devices`, `/v1/config` (a minimal answer unless the client is an admin) and the
-static files.
+(`bind_address` `0.0.0.0`, plus `[::1]` for `localhost`), and answers the local network only
+([Local network only](#local-network-only)). What answers where:
 
-- To administer from another machine, set `"allow_remote_admin": true` (or check *Allow remote
-  administration* on the Config page from this machine). It applies at once. `--allow-remote-admin`
-  does the same for one run only: it is not written to the config file, so the next plain start is
-  back to loopback-only. The service logs a warning at every start while it is on, with the path
-  of the token and the command that prints it.
-- Remote administration needs the **admin token**, 256 random bits in
-  `<data root>/auth/admin-token` (the private `auth` folder: mode 0700/0600 on Unix, a protected
-  ACL without Users on Windows), made when `allow_remote_admin` is first on. A token that an
-  earlier version kept in `<data root>/admin-token` is moved there at the next start or
-  `admin-token` command. Clients on this machine never need it, and detection and the
-  other open routes never look at it.
-  - Read it on the server, as the service's account: `blue-onyx-prism admin-token`, with
-    `--config <file>` when the service has its own config (the Windows service, the packages,
-    Docker). Stdout holds the token and nothing else.
-  - A browser opens any admin page, is sent to `/login`, and pastes the token once. The cookie
-    (`bop_admin`, `HttpOnly`, `SameSite=Strict`) lasts until the browser closes; *Sign out* on the
-    Config page, or `POST /logout`, clears it. Scripts send `Authorization: Bearer <token>`, and
-    without one get a JSON 401. `GET /v1/config` gives a client without the token the minimal answer.
-  - Five wrong tokens in a minute from one address (an IPv6 client by its /64, which it can pick
-    any address of) answer **429** with `Retry-After`, the right token included, until the oldest
-    of the five is a minute old.
-  - `blue-onyx-prism admin-token --rotate`, or *Rotate token* on the Config page from this machine,
-    replaces it. A running service uses the new token at once, and every signed-in browser has to
-    sign in again. If the file is missing or damaged, remote peers are refused until you rotate.
-  - The token and the cookie go over **plain HTTP**: the cookie has no `Secure` flag, because the
-    service speaks no TLS, so anyone who can watch the network can read them. Use remote
-    administration only on a trusted network or behind TLS, and treat the token as the admin
-    password. A cookie is sent to every port of that host name, so another service on the same
-    name can see it. Remote admin reaches the Config page's file browser (`GET /v1/fs/browse`, which
-    lists folders and model/YAML file names across the whole filesystem) and every admin action
-    (config writes, downloads, model export, restarts).
-  - A browser that opens the server by name (`http://nas.local:32168/`) needs that name in
-    `allowed_hosts` first, see below; by IP address it works as it is.
-- Cross-site requests (CSRF): a web page on another site cannot drive the admin actions through
-  your browser. An admin request that changes something (POST, PUT, PATCH, DELETE) is refused with
-  403 when the browser marks it `Sec-Fetch-Site: cross-site`, or when its `Origin` (else
-  `Referer`) header names another host:port than the request's `Host` (`Origin: null` counts as
-  foreign). Requests with none of these headers are allowed, so `curl` and scripts on this machine
-  keep working; browsers always send `Origin` on cross-origin POSTs. The detection API is never
-  checked.
-- DNS rebinding: a web page can point a DNS name of its own at this machine, and then `Origin`
-  matches `Host` and the peer looks local, so the check above does not help. Every admin route
-  therefore answers only under an IP address (so LAN administration by address keeps working),
-  `localhost`, or a name you list in `allowed_hosts`; any other `Host` gets **403**, on every
-  method, naming the host. If you open the service by name (`http://nas.local:32168/`, or a name
-  a reverse proxy passes on), add that name to `allowed_hosts`, on the Config page opened by IP
-  address or in the config file. Names match exactly: a subdomain needs its own entry. The
-  detection API and the other open routes accept any `Host`.
-- A reverse proxy on this machine (nginx, Caddy, Traefik, e.g. for TLS) makes every proxied request
-  arrive from `127.0.0.1`. A request from a loopback address that carries `X-Forwarded-For`,
-  `Forwarded` or `X-Real-IP` counts as remote, whatever `allow_remote_admin` says: with it off the
-  admin routes answer 403, with it on they need the admin token. **A local proxy must add one of
-  these headers, or its clients count as this machine and get the admin pages with no token.**
-  nginx adds none by default and needs `proxy_set_header X-Forwarded-For $remote_addr;`; Caddy
-  adds it by itself. Check yours: `curl` an admin path through the proxy with no token, and expect
-  401 or 403. The header only ever takes trust away, and its value is ignored, because any
-  client can send it. So every client behind the proxy shares the proxy's address for the
-  wrong-token limit, and a wrong guess from one counts for all. To sign in through a proxy it must
-  also pass the browser's `Host` (nginx: `proxy_set_header Host $http_host;`) and that name must be in
-  `allowed_hosts`, or the login is refused as a cross-site request. A TLS proxy on another machine
-  needs no forwarding header, since its requests are remote anyway.
+- **Plain HTTP, port 32168, is for Blue Iris.** The detection API (`/v1/vision/*`), `/v1/status`,
+  `/v1/status/updateavailable`, the minimal `/v1/config` and the static files answer there with no
+  login, for every client of the local network (Blue Iris can neither sign in nor speak HTTPS).
+  Anything else: a browser's GET is redirected (308) to the same page on the HTTPS port under the
+  address it used; other requests get **403** with JSON naming the HTTPS address (**503** while
+  the HTTPS listener is down). No credential is accepted there: a request with `Authorization` is
+  refused before anything is compared.
+- **HTTPS, port 32169, is everything else**: every page and admin action, and `/`, `/stats.json`,
+  `/prometheus` and `/v1/devices`, with a signed-in session or the API token, from every address
+  alike (this machine is no exception). The open routes answer there too.
+
+**The first start.** While no account exists the service makes a one-time setup code and logs
+`no web UI accounts yet: run '<command> setup-code' on this server and open
+https://localhost:32169/setup` (the code itself is never logged).
+
+1. On the server, as the service's account: `blue-onyx-prism setup-code` (with `--config <file>`
+   when the service has its own config: the Windows service, the packages, Docker). It prints the
+   code, the HTTPS addresses and the certificate's fingerprint.
+2. Open `https://<server address>:32169/` in a browser (`http://...:32168/` sends you there),
+   open the certificate's details, compare the SHA-256 fingerprint the browser shows with the one
+   printed on the server, and accept it once. Only the server's output counts: no page (the setup
+   page included) shows a fingerprint, since a page put in between would show its own.
+3. The browser lands on `/setup`: type the code, a username and a password twice. That creates the
+   first account and signs you in; `/setup` closes for good once an account exists. (Or create it
+   on the server with `blue-onyx-prism user add <name>`.) More accounts: [Accounts](#accounts).
+
+**Sessions.** A sign-in sets `__Host-bop_session` (`Secure`, `HttpOnly`, `SameSite=Strict`, a new
+random id every time) and `__Host-bop_device`. The session ends after an hour without use (a page
+polling on its own, or a reload it makes, does not count, so a tab left open signs out), after
+12 hours in any case, on **Sign out** (it ends on the server, not only in the browser), and when the password is reset or
+the account removed. Sessions survive a restart of the service.
+
+**Wrong passwords.** Every refusal reads "Wrong username or password." Five wrong attempts a
+minute from one address, or 30 from all addresses of one IPv6 /64 together, answer **429** with
+`Retry-After`, the right password included. An account waits 1 s after 10 wrong passwords in a
+row, doubling up to 15 minutes, and is disabled at 100 until `blue-onyx-prism user unlock
+<name>`; names without an account get the same answers. Attempts still being checked count as
+failures already, so guesses sent at once from many addresses are judged as if one at a time. A browser that signed in to that account before (its device cookie)
+skips the account's wait, never the per-address limit nor a disabled account. A forgotten
+password: `blue-onyx-prism user reset-password <name>` on the server.
+
+**The API token, for scripts and Prometheus.** 256 random bits in `<data root>/auth/admin-token`
+(the private `auth` folder), made at the first start. `blue-onyx-prism admin-token` prints it
+(stdout holds nothing else); `--rotate`, or *Rotate token* on the Config page in a browser on the
+server itself, replaces it at once. Send it as `Authorization: Bearer <token>` to the HTTPS port;
+wrong tokens are limited like passwords (counted apart from them, so a misconfigured scraper does
+not block a person's sign-in). The certificate is self-signed: give the
+client `<data root>/auth/tls/cert.pem` (copied from the server; `tls-fingerprint` names it) rather
+than turning verification off.
+
+```sh
+TOKEN=$(blue-onyx-prism admin-token)
+curl --cacert cert.pem -H "Authorization: Bearer $TOKEN" https://localhost:32169/prometheus
+```
+
+```yaml
+scrape_configs:
+  - job_name: blue-onyx-prism
+    scheme: https
+    metrics_path: /prometheus
+    authorization:
+      credentials_file: /etc/prometheus/blue-onyx-prism.token
+    tls_config:
+      ca_file: /etc/prometheus/blue-onyx-prism.pem   # cert.pem of the server
+      # insecure_skip_verify: true accepts any certificate, so whoever answers on that address
+      # gets the token: only on a network you trust, never instead of ca_file by habit.
+    static_configs:
+      - targets: ["192.168.1.10:32169"]
+```
+
+The certificate names `localhost`, `127.0.0.1`, `::1`, the computer's name and the addresses it
+had when it was made; a target under another address needs `tls_config.server_name` set to one of
+them (or a `tls-regenerate`).
+
+- **An upgrade from `allow_remote_admin`.** The key is ignored and dropped at the next save, with a
+  warning at start. Its old `bop_admin` cookie carried the token over plain HTTP, so the first
+  start of this version with `"allow_remote_admin": true` replaces the token once (a marker in
+  `auth/` records it) and logs that scripts must read the new one. Browsers are asked to delete
+  that cookie; it is never accepted.
+- **Cross-site requests (CSRF).** A web page on another site cannot drive the admin actions
+  through your browser: the session cookie is `SameSite=Strict`, and a request that changes
+  something (POST, PUT, PATCH, DELETE) is also refused with 403 when the browser marks it
+  `Sec-Fetch-Site: cross-site` or `same-site` (a plain-HTTP page of the same host is same-site, and
+  anyone on the LAN can inject into plain HTTP), or when its `Origin` (else `Referer`) is not
+  `https://` and the request's own host:port (`Origin: null` counts as foreign). Requests with none
+  of these headers are allowed, so `curl` and scripts keep working; browsers always send `Origin`
+  on cross-origin POSTs. `/login`, `/logout` and `/setup` are checked the same way.
+- **DNS rebinding.** A web page can point a DNS name of its own at this server; then `Origin`
+  matches `Host` and the check above does not help. Every admin and sign-in route therefore answers
+  only under an IP address, `localhost`, or a name you list in `allowed_hosts`; any other `Host`
+  gets **403** naming the host, and the plain port does not redirect to it. If you open the
+  service by name (`https://nas.local:32169/`, or a name a reverse proxy passes on), add that name
+  to `allowed_hosts`. Names match exactly: a subdomain needs its own entry. The detection API and
+  the other open routes accept any `Host`.
+- **Reverse proxies.** A proxy is one more client: its users sign in like everyone else. A proxy
+  on this machine makes every request arrive from `127.0.0.1`, so they share its address for the
+  wrong-password limit; forwarding headers (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) only ever
+  refuse ([Local network only](#local-network-only)), and a request carrying one is no request of
+  this machine for the native file dialog and the token's rotation. Point the proxy at the HTTPS
+  port (trusting `cert.pem`), and let it pass the browser's `Host` (nginx: `proxy_set_header Host
+  $http_host;`) with that name in `allowed_hosts`.
 - To keep everything on this machine (Blue Iris on the same PC), set `"bind_address": "127.0.0.1"`
   (or `--bind-address 127.0.0.1`); it applies when the process restarts.
 
@@ -1114,21 +1154,20 @@ The compose file publishes both ports on the host's loopback only (`127.0.0.1:32
 HTTP, `127.0.0.1:32169:32169` for the HTTPS web UI; the certificate lives in the `data` volume, and
 `docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json tls-fingerprint`
 prints its fingerprint). Inside
-Docker every client, the host's browser included, arrives from the bridge network, never from
-loopback, so with the shipped `"allow_remote_admin": false` the admin pages (Config, Test, Logs,
-Benchmark) answer 403 and the detection API works:
+Docker every client, the host's browser included, arrives from the bridge network, so the web UI
+is behind sign-in like everywhere ([Signing in](#signing-in)). On the first start the log says no
+account exists yet; get the setup code with
+`docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json setup-code`
+and open `https://127.0.0.1:32169/setup` on the host. The accounts, the API token
+(`... admin-token`) and the certificate live in the `data` volume, so they survive a new container.
 
 - Blue Iris on another machine: switch to the commented LAN line (`"32168:32168"`) in
-  `deploy/docker-compose.yml`. Detection is then reachable from the LAN; keep
-  `allow_remote_admin` false and change settings by editing the config file in `deploy/config`.
-- Web UI: set `"allow_remote_admin": true` in that config file. Every browser, the host's own
-  included, then counts as remote and signs in with the admin token, which you read with
-  `docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json admin-token`
-  (add `--rotate` to replace it). It lives in the `data` volume, so it survives a new container.
-  With the default loopback-only port only this host reaches it; from your PC use an SSH tunnel
-  (`ssh -L 32168:127.0.0.1:32168 <docker host>`, then open `http://127.0.0.1:32168/`). With the
-  LAN line, every LAN client gets the login page, and the token travels over plain HTTP (see
-  [Remote access](#remote-access)): turn it on only on a trusted network.
+  `deploy/docker-compose.yml`, or better a LAN address of the host (`192.168.1.10:32168:32168`):
+  detection is then reachable from the LAN.
+- The web UI from your PC: publish 32169 on a LAN address of the host the same way, or use an SSH
+  tunnel (`ssh -L 32169:127.0.0.1:32169 <docker host>`, then open `https://127.0.0.1:32169/`).
+  Docker's proxy hides the client's address (see [Local network only](#local-network-only)), so
+  the published binding is the gate; passwords and the lockout still apply.
 
 The container's health check polls `/v1/status` (`docker ps` shows `healthy` once a model is ready).
 
@@ -1143,13 +1182,14 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | GET | `/v1/fs/browse` | read-only file browser behind the Config page's *Browse...* buttons and the Train tab's footage import: `?path=<dir>&kind=model`, `classes` or `video`; lists only folders and `.onnx`/`.xml` (or `.yaml`/`.yml`, or `.mp4`/`.mkv`/`.avi`/`.mov`) files of the machine running the service |
 | GET | `/v1/status` | readiness for Blue Iris, Docker `HEALTHCHECK` or systemd: `{ready, status: ready/degraded/initializing/failed, models[{name,state,device,detail}], uptimeSecs, generation, version}`; HTTP 200 when ready or degraded (a failed model next to a usable one), 503 while a non-lazy model is still loading or nothing is usable |
 | GET | `/v1/status/updateavailable` | GitHub release check |
-| GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics |
+| GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics (sign-in or the API token) |
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |
 | GET, POST | `/test`, `/config` | test page, config editor |
 | POST | `/config/restart`, `/config/loglevel` | reload config, change log level |
-| POST | `/config/admin-token/rotate` | replace the admin token (this machine only; never answers with the token) |
-| GET, POST | `/login` | sign in with the admin token: sets the `bop_admin` cookie; `next` must be a local path |
-| POST | `/logout` | clear that cookie |
+| POST | `/config/admin-token/rotate` | replace the API token (a browser on the server itself only; never answers with the token) |
+| GET, POST | `/login` | the sign-in form; POST `username`, `password`, `next` (a local path): sets the session and device cookies, 303 to `next` (JSON clients get JSON); refusals 401, 429 with `Retry-After`, 503 while hashing is busy |
+| POST | `/logout` | end the session on the server and clear its cookie |
+| GET, POST | `/setup` | the first account, only while none exists: POST `code`, `username`, `password`, `password2`; signs in. Afterwards 303 to `/login` |
 | GET | `/v1/devices` | device options (runnable, downloadable with size, unavailable with reason) and the `auto` pick |
 | GET | `/v1/resources` | downloadable resources for this platform: state (installed, downloading with %, queued, needed, optional, available, failed with error and retry), size, what they provide, which models wait for them |
 | POST | `/v1/resources/download` | form `id` (e.g. `model:ipcam-bird`); large resources also need `confirm_large=1` unless `allow_large_downloads` |
@@ -1192,9 +1232,11 @@ The detection response is byte-compatible with CodeProject.AI: `success, message
 [{x_min, y_min, x_max, y_max, confidence, label}], count, command, moduleId, executionProvider,
 canUseGPU, inferenceMs, processMs, analysisRoundTripMs`.
 
-The admin routes (pages and actions) answer clients on this machine only unless
-`allow_remote_admin` is set; others get 403. With it set, remote clients show the admin token:
-without it a browser goes to `/login` and anything else gets 401 (see [Remote access](#remote-access)).
+Open routes (no sign-in, on both ports): `/v1/vision/*`, `/v1/status`, `/v1/status/updateavailable`,
+`/v1/config` (the minimal answer unless signed in), `/static/*`, `/favicon.ico`. Every other route is
+HTTPS only and needs a session or `Authorization: Bearer <API token>`: without one a browser goes
+to `/login` (or `/setup` before the first account), anything else gets a JSON 401 with
+`WWW-Authenticate: Bearer`, and a damaged accounts file answers 503 (see [Signing in](#signing-in)).
 
 ## Benchmark
 
@@ -1290,7 +1332,13 @@ test-blue-onyx-prism --save out.jpg                    # annotated copy of the i
 ```
 
 Also `--url` (default `http://127.0.0.1:32168`) and `--interval-ms`. Exits non-zero if any
-response has `success: false` or a non-200 status.
+response has `success: false` or a non-200 status. The open-loop mode (`--rate R --duration S`)
+samples the server's memory from `/prometheus`, which needs the API token over HTTPS:
+`--https-port` (default 32169) with `--token-file <file>` (`-` reads it from stdin:
+`blue-onyx-prism admin-token | test-blue-onyx-prism --token-file - ...`; never a value on the
+command line, where `ps` shows it), or `--config <the server's config>` to read the token and pin
+the certificate from its files (`--cert <pem>` names the certificate; `--insecure` accepts any,
+for throwaway test servers only).
 
 ## Troubleshooting
 

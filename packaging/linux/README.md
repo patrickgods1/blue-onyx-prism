@@ -8,6 +8,12 @@ also holds the by-hand training scripts) in
 enabled and started. OpenVINO / ONNX Runtime are not bundled: the service downloads them on first
 start into `download_dir` (the seeded config sets `download_dir` and `cache_dir` only).
 
+After install, open `https://<this machine>:32169/` (the web UI, self-signed certificate) and create
+the first account with the one-time code
+`sudo -u blueonyx /opt/blue-onyx-prism/blue-onyx-prism --config /var/lib/blue-onyx-prism/blue_onyx_prism_config.json setup-code`
+prints (with `tls-fingerprint` instead to compare the certificate). Blue Iris uses port 32168,
+plain HTTP, with no account.
+
 Build (after `cargo build --release --locked --bins --target T`):
 
     packaging/linux/build.sh x86_64-unknown-linux-gnu dist/

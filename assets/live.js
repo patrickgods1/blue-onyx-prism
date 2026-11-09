@@ -12,8 +12,77 @@
 // PrismPoll.create({run, period, max, more, env}): `run()` returns a promise (a rejection counts
 // as a failure); `more(value)` false parks the loop until `kick()` (polling only while busy).
 // `env` is for tests: {hidden(), set(fn, ms), clear(id), onVisible(cb)}.
+// Signed-in requests: every same-origin `fetch` of the pages goes through the wrapper below. A
+// request made by a poll loop (synchronously inside a PrismPoll run, inside
+// PrismPoll.background(fn), or through PrismPoll.fetch) carries `X-Prism-Poll: 1`, so it does not
+// keep the session alive (an unattended tab signs out after the idle hour); a 401 (the session
+// ended) sends the page to /login?next=<this page> instead of backing off. A 503 ("sign-in is
+// closed") stays an error for the page to show. A fetch chained after a poll's answer (inside a
+// `.then`) is no longer synchronous: poll code uses PrismPoll.fetch or PrismPoll.background for
+// it. A page load cannot carry a header, so a reload or navigation a poll makes (not the user)
+// goes through PrismPoll.navigate, which sets the short-lived `__Host-bop_poll` cookie the server
+// reads as the poll mark (and clears in its answer).
 (function (root) {
   "use strict";
+  var polling = 0, signingIn = false, pollFetch = null;
+  function sameOrigin(url) {
+    if (typeof url !== "string") return false;
+    if (url.charAt(0) === "/") return url.charAt(1) !== "/" && url.charAt(1) !== "\\";
+    var o = root.location && root.location.origin;
+    return !!o && url.indexOf(o + "/") === 0;
+  }
+  function withPollHeader(init) {
+    var out = {}, k;
+    init = init || {};
+    for (k in init) if (Object.prototype.hasOwnProperty.call(init, k)) out[k] = init[k];
+    var h = init.headers;
+    if (typeof Headers !== "undefined" && h instanceof Headers) {
+      h = new Headers(h); h.set("X-Prism-Poll", "1");
+    } else {
+      var copy = {};
+      for (k in (h || {})) if (Object.prototype.hasOwnProperty.call(h, k)) copy[k] = h[k];
+      copy["X-Prism-Poll"] = "1"; h = copy;
+    }
+    out.headers = h;
+    return out;
+  }
+  function signIn() {
+    var loc = root.location;
+    if (signingIn || !loc || loc.pathname === "/login" || loc.pathname === "/setup") return;
+    signingIn = true;
+    loc.assign("/login?next=" + encodeURIComponent(loc.pathname + loc.search));
+  }
+  function wrap(real, poll) {
+    return function (input, init) {
+      var url = typeof input === "string" ? input : (input && input.url) || "";
+      var mine = sameOrigin(url);
+      if (mine && (poll || polling > 0) && typeof input === "string") init = withPollHeader(init);
+      return real.call(root, input, init).then(function (r) {
+        if (mine && r && r.status === 401) { signIn(); return new Promise(function () {}); }
+        return r;
+      });
+    };
+  }
+  if (typeof root.fetch === "function" && !root.fetch.prismWrapped) {
+    var realFetch = root.fetch;
+    root.fetch = wrap(realFetch, false);
+    root.fetch.prismWrapped = true;
+    pollFetch = wrap(realFetch, true);
+  }
+  // Run `fn` as a poll: the requests it starts synchronously carry the poll header.
+  function background(fn) {
+    polling++;
+    try { return fn(); } finally { polling--; }
+  }
+  // A reload (`url` empty) or navigation a poll makes: marked as no activity of the user.
+  function navigate(url, replace) {
+    var loc = root.location;
+    if (!loc) return;
+    try {
+      if (typeof document !== "undefined") document.cookie = "__Host-bop_poll=1; Secure; SameSite=Strict; Path=/; Max-Age=30";
+    } catch (e) { /* no cookies: the load counts as activity */ }
+    if (!url) loc.reload(); else if (replace) loc.replace(url); else loc.assign(url);
+  }
   function delay(period, failures, max) {
     return failures ? Math.min(max, period * Math.pow(2, Math.min(failures, 5))) : period;
   }
@@ -41,7 +110,7 @@
       busy = true; again = false;
       var seen = stops; // a stop() while the run is out wins over its answer
       var p;
-      try { p = Promise.resolve(o.run()); } catch (e) { p = Promise.reject(e); }
+      try { p = Promise.resolve(background(o.run)); } catch (e) { p = Promise.reject(e); }
       p.then(function (v) {
         failures = 0;
         if (o.more && seen === stops) parked = !o.more(v);
@@ -63,7 +132,15 @@
       state: function () { return {busy: busy, timer: timer !== null, parked: parked, failures: failures}; }
     };
   }
-  root.PrismPoll = {create: create, delay: delay};
+  root.PrismPoll = {
+    create: create,
+    delay: delay,
+    background: background,
+    inPoll: function () { return polling > 0; },
+    navigate: navigate,
+    signIn: signIn,
+    fetch: function (url, init) { return pollFetch ? pollFetch(url, init) : root.fetch(url, withPollHeader(init)); }
+  };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 (function () {
   "use strict";
@@ -101,8 +178,11 @@
   window.addEventListener("resize", scrollCues);
   var listeners = [], etag = null, last = null, busy = null, failures = 0, timer = null;
 
+  // Listeners run on a poll's answer: what they ask the server synchronously is a poll too.
   function emit(data, prev) {
-    listeners.forEach(function (fn) { try { fn(data, prev); } catch (e) { if (window.console) console.error(e); } });
+    listeners.forEach(function (fn) {
+      try { PrismPoll.background(function () { fn(data, prev); }); } catch (e) { if (window.console) console.error(e); }
+    });
   }
   // Why a request failed, for the user: "HTTP 403", "not JSON (HTTP 200)", "no answer".
   function why(e) { return (e && e.reason) || "no answer"; }
@@ -123,9 +203,13 @@
     if (busy) return busy;
     var h = {"Accept": "application/json"};
     if (etag && !force) h["If-None-Match"] = etag;
-    busy = fetch("/v1/config", {headers: h, cache: "no-store"}).then(function (r) {
+    busy = PrismPoll.fetch("/v1/config", {headers: h, cache: "no-store"}).then(function (r) {
       if (r.status === 304) return last;
-      return json(r).then(function (j) { etag = r.headers.get("ETag"); var prev = last; last = j; emit(j, prev); return j; });
+      return json(r).then(function (j) {
+        // The full answer turned minimal: the session ended (idle, 12 h, signed out elsewhere).
+        if (last && last.config !== undefined && j.config === undefined) { PrismPoll.signIn(); return last; }
+        etag = r.headers.get("ETag"); var prev = last; last = j; emit(j, prev); return j;
+      });
     }).then(function (j) {
       failures = 0; liveStatus(null); return j;
     }, function (e) {
@@ -160,9 +244,11 @@
   // back where the user was: the position is kept in sessionStorage for this path and restored
   // once, after load (and again while asynchronously rendered content is still growing).
   var SCROLL_KEY = "prism:scroll:" + location.pathname;
-  function reloadKeep(url) {
+  // `quiet`: a poll asked for it, not the user (PrismPoll.navigate).
+  function reloadKeep(url, quiet) {
     try { sessionStorage.setItem(SCROLL_KEY, JSON.stringify({x: window.scrollX, y: window.scrollY, t: Date.now()})); } catch (e) { /* private mode */ }
-    if (url) location.replace(url); else location.reload();
+    if (quiet) PrismPoll.navigate(url, true);
+    else if (url) location.replace(url); else location.reload();
   }
   (function restoreScroll() {
     var saved = null;
@@ -207,8 +293,8 @@
         restartFailed("Still restarting after 2 minutes. Check the server log (or the service) and reload this page by hand.");
         return;
       }
-      fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
-        if (j.generation !== gen || j.epoch !== epoch) reloadKeep(); else setTimeout(again, 700);
+      PrismPoll.fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
+        if (j.generation !== gen || j.epoch !== epoch) reloadKeep(null, true); else setTimeout(again, 700);
       }, function () { setTimeout(again, 1000); });
     }
     setTimeout(again, 700);
@@ -222,7 +308,8 @@
     restarting();
     var done = function () { waitRestart(gen, epoch); };
     fetch("/config/restart", {method: "POST", headers: {"Accept": "application/json"}}).then(function (r) {
-      // Refused (403 from another machine, a rejected origin, ...): nothing restarts.
+      // Refused (403: a rejected origin or host name, ...): nothing restarts. A 401 (signed out)
+      // never gets here: the fetch wrapper goes to the login page.
       if (r.status >= 400 && r.status < 500) {
         return r.json().catch(function () { return {}; }).then(function (j) {
           restartFailed("Restart refused (HTTP " + r.status + ")" + (j && j.message ? ": " + j.message : "."));
@@ -548,10 +635,10 @@
         status.className = "error";
         return;
       }
-      fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
+      PrismPoll.fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
         if (j.generation === gen) throw failure("same generation");
         status.textContent = "Server is back; reloading…";
-        location.href = target;
+        PrismPoll.navigate(target);
       }).catch(function () {
         status.textContent = "Waiting for the server… (" + secs + " s)";
         setTimeout(tick, 1000);

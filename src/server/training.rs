@@ -4058,9 +4058,13 @@ pub(super) mod tests {
             .unwrap();
         let (s, _, _) = call(&state, form).await;
         assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-        // Admin only: a remote peer is refused.
-        let (s, _, _) = call(&state, from_peer(post(r#"{"columns": ["map"]}"#), REMOTE)).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        // Admin only: a request that is not signed in is refused.
+        let (s, _, _) = call(
+            &state,
+            crate::server::test_util::anonymous(from_peer(post(r#"{"columns": ["map"]}"#), REMOTE)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         // The default list is stored as empty (not written to the config file).
         let (s, _, _) = call(
             &state,
@@ -4386,8 +4390,12 @@ pub(super) mod tests {
         let req = axum::http::Request::get("/v1/training/dataset-classes")
             .body(axum::body::Body::empty())
             .unwrap();
-        let (s, _, _) = call(&state, from_peer(req, REMOTE)).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = call(
+            &state,
+            crate::server::test_util::anonymous(from_peer(req, REMOTE)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5261,14 +5269,18 @@ pub(super) mod tests {
                 .is_some_and(|e| !e.is_empty()),
             "{v}"
         );
-        // Cross-site browser requests and remote peers are refused.
+        // Cross-site browser requests and requests that are not signed in are refused.
         let mut req = post(format!("dataset={enc}&balance=class"));
         req.headers_mut()
             .insert("sec-fetch-site", "cross-site".parse().unwrap());
         let (s, _, _) = call(&state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let (s, _, _) = call(&state, from_peer(post(format!("dataset={enc}")), REMOTE)).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = call(
+            &state,
+            crate::server::test_util::anonymous(from_peer(post(format!("dataset={enc}")), REMOTE)),
+        )
+        .await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         let _ = std::fs::remove_dir_all(&root);
     }
 

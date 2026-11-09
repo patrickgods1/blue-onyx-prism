@@ -8,7 +8,9 @@
 //! client, with 403 on every route.
 //!
 //! The listeners ([`listen`]): plain HTTP on `port` and HTTPS on `https_port` serve this same
-//! router; HTTP never depends on HTTPS.
+//! router; HTTP never depends on HTTPS. The plain port answers the open routes only (Blue Iris,
+//! status, static files; [`plain_gate`] sends browsers to HTTPS); everything else is HTTPS with a
+//! signed-in session or the API token ([`admin_only`], [`auth`]), from every address alike.
 
 use crate::cli::LogReloadHandle;
 use crate::config::Config;
@@ -19,7 +21,7 @@ use crate::sync::RwLockExt;
 use crate::worker::WorkerHandle;
 use askama::Template;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
@@ -27,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::error;
 
 mod apply;
 mod auth;
@@ -39,6 +41,8 @@ mod dataset;
 mod detect;
 mod devices;
 mod diagnostics;
+#[cfg(test)]
+mod gate_tests;
 mod guard;
 mod listen;
 mod live;
@@ -59,7 +63,7 @@ mod training_switch;
 mod training_tasks;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
-pub(crate) use auth::FailureLimit;
+pub(crate) use auth::{FailureLimit, Logins};
 use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
@@ -110,10 +114,12 @@ pub struct AppState {
     pub(crate) resources: Option<crate::resources::status::ResourcesCtx>,
     /// Benchmark runner (one per process, shared by every generation).
     pub(crate) benchmark: Arc<crate::benchmark::service::BenchmarkService>,
-    /// Wrong admin tokens per peer (one list for the process, like the config).
+    /// Wrong API tokens per peer (one list for the process, like the config).
     pub(crate) admin_failures: Arc<std::sync::Mutex<FailureLimit>>,
+    /// Wrong passwords and setup codes per peer, the hashing permits (one for the process).
+    pub(crate) login: Arc<Logins>,
     /// Accounts, sessions and device cookies (one for the process, like `admin_failures`, so a
-    /// restart signs nobody out). Not read by any route yet.
+    /// restart signs nobody out).
     pub(crate) auth: Arc<crate::accounts::Auth>,
 }
 
@@ -140,6 +146,10 @@ impl AppState {
         let mut running = config.clone();
         running.normalize();
         let auth = crate::accounts::Auth::load(&running.data_root(), crate::accounts::now());
+        // Unit tests: an account and a session every test request carries unless it says
+        // otherwise (`test_util::from_peer`).
+        #[cfg(test)]
+        test_util::seed_tester(&running.data_root(), &auth);
         Self {
             registry,
             metrics,
@@ -157,6 +167,7 @@ impl AppState {
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
             admin_failures: Arc::default(),
+            login: Arc::default(),
             auth: Arc::new(auth),
         }
     }
@@ -178,22 +189,19 @@ impl AppState {
     }
 }
 
-/// The open routes: Blue Iris (often on another machine), monitoring, static files and the
-/// minimal `/v1/config` the pages' restart poller uses. Every path here answers remote peers of
-/// the local network (the network rule, [`network`], comes first on every route);
-/// `router_classification` in the tests checks the list against the expected set.
+/// The open routes: Blue Iris (often on another machine), the readiness probe, static files and
+/// the minimal `/v1/config` the pages' restart poller uses. No sign-in, on both ports, for every
+/// peer of the local network (the network rule, [`network`], comes first on every route);
+/// `router_classification` in the tests checks the list against the expected set, and
+/// [`plain_gate`] serves exactly these on the plain port.
 fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
-        ("/", get(welcome)),
         ("/v1/vision/detection", post(detection_default)),
         ("/v1/vision/custom/list", get(custom_list).post(custom_list)),
         ("/v1/vision/custom/{model}", post(detection_custom)),
         ("/v1/status", get(status::readiness)),
         ("/v1/status/updateavailable", get(update_available)),
-        ("/v1/devices", get(devices_json)),
         ("/v1/config", get(live::config_json)),
-        ("/stats.json", get(stats_json)),
-        ("/prometheus", get(prometheus)),
         ("/static/style.css", get(style_css)),
         ("/static/live.js", get(live_js)),
         ("/static/{file}", get(static_asset)),
@@ -201,9 +209,9 @@ fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     ]
 }
 
-/// Signing in with the admin token: a remote peer must reach these with no token, so they are
-/// neither open nor admin. They pass the admin routes' peer and `Host` checks ([`login_only`]) and
-/// the CSRF guard.
+/// Signing in, out and the first account: nobody is signed in yet, so they take no credential,
+/// but they are HTTPS only ([`plain_gate`]) and pass the admin routes' `Host` check
+/// ([`login_only`]) and the CSRF guard.
 fn login_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
         (
@@ -213,14 +221,24 @@ fn login_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
                 .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
         ),
         ("/logout", post(auth::logout)),
+        (
+            "/setup",
+            get(auth::setup_page)
+                .post(auth::setup_submit)
+                .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
     ]
 }
 
-/// The administration routes: loopback clients, and with `allow_remote_admin` remote clients
-/// that show the admin token ([`admin_only`]), under an IP address, `localhost` or an
-/// `allowed_hosts` name, and no cross-site state changes ([`guard::csrf`]).
+/// The routes behind sign-in: HTTPS only ([`plain_gate`]), a session or the API token
+/// ([`admin_only`]), under an IP address, `localhost` or an `allowed_hosts` name, and no
+/// cross-site state changes ([`guard::csrf`]).
 fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
+        ("/", get(welcome)),
+        ("/stats.json", get(stats_json)),
+        ("/prometheus", get(prometheus)),
+        ("/v1/devices", get(devices_json)),
         ("/v1/resources", get(resources_json)),
         ("/v1/resources/download", post(resources_download)),
         ("/v1/resources/remove", post(resources_remove)),
@@ -428,8 +446,9 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
 }
 
 /// How a connection reached the server, a request extension the accept loop adds next to
-/// `ConnectInfo`: the HTTP port (`Plain`) or the HTTPS port (`Tls`, [`listen`]). Both serve the
-/// same routes today; nothing decides by it yet.
+/// `ConnectInfo`: the HTTP port (`Plain`) or the HTTPS port (`Tls`, [`listen`]). The plain port
+/// serves the open routes only ([`plain_gate`]); a request without the marker (none outside
+/// tests) counts as plain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transport {
     Plain,
@@ -475,8 +494,13 @@ pub(crate) fn router(state: impl Into<Shared>) -> Router {
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(axum::middleware::from_fn_with_state(
             shared.clone(),
+            plain_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
             guard::network_rule,
         ))
+        .layer(axum::middleware::from_fn(guard::legacy_cookie))
         .layer(axum::middleware::from_fn(catch_panic))
         .layer(axum::middleware::map_response(guard::security_headers))
         .with_state(shared)
@@ -586,39 +610,12 @@ pub(super) fn loopback_peer(peer: Option<std::net::SocketAddr>) -> bool {
 }
 
 /// Whether the client is a person on this machine: a loopback peer with no forwarding header.
-/// What the admin routes, `GET /v1/config`, `/login` and the rotation all ask, so a reverse proxy's
-/// client is remote for all of them. A proxy that adds no such header cannot be told apart.
+/// Never a way in (every admin route needs a sign-in); an extra condition of what only makes
+/// sense on the server's own screen or must not be done remotely: the native file dialog
+/// (`pick`) and the API token's rotation (`auth::rotate`). A proxy that adds no forwarding
+/// header cannot be told apart.
 pub(super) fn direct_local(peer: Option<std::net::SocketAddr>, headers: &HeaderMap) -> bool {
     loopback_peer(peer) && guard::proxy_header(headers).is_none()
-}
-
-/// Whether a client gets past the peer check of the admin routes: this machine, or anyone with
-/// `allow_remote_admin` (then a remote client still has to show the token: [`admin_only`]).
-pub(super) fn admin_allowed(
-    peer: Option<std::net::SocketAddr>,
-    headers: &HeaderMap,
-    allow_remote_admin: bool,
-) -> bool {
-    allow_remote_admin || direct_local(peer, headers)
-}
-
-/// Set once the "local reverse proxy" notice was logged (SV-12).
-static LOCAL_PROXY_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Log, once per `flag` (once per process for [`LOCAL_PROXY_WARNED`]), that admin requests arrive
-/// through a reverse proxy on this machine, and what that takes. True when this call logged it.
-fn warn_local_proxy_once(flag: &std::sync::atomic::AtomicBool) -> bool {
-    if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
-    warn!(
-        "requests arrive through a local reverse proxy: they count as remote clients, so the \
-         admin routes need allow_remote_admin and the admin token. A proxy that adds no \
-         forwarding header (X-Forwarded-For, Forwarded or X-Real-IP) cannot be told from this \
-         machine and gets the admin routes with no token, so make sure yours adds one"
-    );
-    true
 }
 
 /// The peer of a request (what [`serve_on`] adds).
@@ -628,71 +625,218 @@ fn peer_of(req: &axum::extract::Request) -> Option<std::net::SocketAddr> {
         .map(|c| c.0)
 }
 
-/// The peer and `Host` checks of the admin and login routes: 403 (an HTML page for browsers, else
-/// JSON) for a client that is not on this machine unless `allow_remote_admin` is set, and for a
-/// request under a host name that could be a DNS rebinding ([`guard::foreign_host`]). `None`
-/// passes. Both settings are read per request, so they apply at once.
-fn peer_refusal(state: &AppState, req: &axum::extract::Request) -> Option<Response> {
-    let peer = peer_of(req);
-    let (allow_remote, foreign) = {
-        let c = state.config_read();
-        let foreign = guard::foreign_host(req.headers(), req.uri(), &c.allowed_hosts);
-        (c.allow_remote_admin, foreign)
-    };
-    let proxied = guard::proxy_header(req.headers()).filter(|_| loopback_peer(peer));
-    if proxied.is_some() {
-        warn_local_proxy_once(&LOCAL_PROXY_WARNED);
-    }
-    if admin_allowed(peer, req.headers(), allow_remote) {
-        let host = foreign?;
-        return Some(guard::host_refused(req.headers(), req.uri().path(), &host));
-    }
-    let who = peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string());
-    warn!(peer = %who, path = %req.uri().path(), "admin route refused for a remote client");
-    let through = proxied.map_or_else(String::new, |h| {
-        format!(" This request came through a proxy ({h} header), so it is not from this machine.")
-    });
-    let msg = format!(
-        "Administration is only available from this machine (your address: {who}).{through} Set \
-         \"allow_remote_admin\": true in the config (or start with --allow-remote-admin, or \
-         check \"Allow remote administration\" on the Config page from this machine) to allow it \
-         with the admin token."
-    );
-    Some(guard::forbidden(req.headers(), msg))
+/// The request's [`Transport`]; none counts as plain.
+fn transport_of(req: &axum::extract::Request) -> Transport {
+    req.extensions()
+        .get::<Transport>()
+        .copied()
+        .unwrap_or(Transport::Plain)
 }
 
-/// Middleware of the admin routes, every method: [`peer_refusal`], then a remote peer has to show
-/// the admin token (`auth::verify`; a browser without it goes to `/login`, other clients get a
-/// JSON 401, too many wrong tokens 429). A person on this machine never does ([`direct_local`]).
+/// The `Host` check of the admin and login routes: 403 (an HTML page for browsers, else JSON)
+/// under a host name that could be a DNS rebinding ([`guard::foreign_host`]). `None` passes.
+/// `allowed_hosts` is read per request, so a change applies at once.
+fn host_refusal(state: &AppState, req: &axum::extract::Request) -> Option<Response> {
+    let foreign = {
+        let c = state.config_read();
+        guard::foreign_host(req.headers(), req.uri(), &c.allowed_hosts)
+    };
+    let host = foreign?;
+    Some(auth::no_store(guard::host_refused(
+        req.headers(),
+        req.uri().path(),
+        &host,
+    )))
+}
+
+/// Middleware of the admin routes, every method (inside [`plain_gate`], so HTTPS only):
+/// [`host_refusal`], then a session cookie or the API token ([`auth::authenticate`]); a browser
+/// without either goes to `/login` (or `/setup` before the first account), other clients get a
+/// JSON 401, too many wrong tokens 429. No address passes without one. A signed-in request
+/// carries [`auth::SignedIn`], and its HTML pages show the account's name.
 pub(super) async fn admin_only(
     State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Some(refusal) = peer_refusal(&state, &req) {
+    if let Some(refusal) = host_refusal(&state, &req) {
         return refusal;
     }
     let peer = peer_of(&req);
-    if direct_local(peer, req.headers()) {
-        return next.run(req).await;
+    match auth::authenticate(&state, peer, req.headers()).await {
+        auth::Outcome::SignedIn(signed) => {
+            let user = (signed.via == auth::Via::Session).then(|| signed.user.clone());
+            let poll_load = auth::cookie(req.headers(), auth::POLL_COOKIE).is_some();
+            req.extensions_mut().insert(signed);
+            let resp = next.run(req).await;
+            let mut resp = match user {
+                Some(user) => auth::show_user(resp, &user).await,
+                None => resp,
+            };
+            if poll_load {
+                auth::clear_poll_cookie(&mut resp);
+            }
+            resp
+        }
+        other => auth::refused(&other, req.method(), req.uri(), req.headers(), peer),
     }
-    let checked = auth::verify(&state, peer, req.headers()).await;
-    if checked.verdict == auth::Verdict::Valid {
-        return next.run(req).await;
-    }
-    auth::refused(checked, req.method(), req.uri(), req.headers(), peer)
 }
 
-/// Middleware of `/login` and `/logout`: [`peer_refusal`], with no token.
+/// Middleware of `/login`, `/logout` and `/setup`: [`host_refusal`], with no credential.
 pub(super) async fn login_only(
     State(state): State<Arc<AppState>>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    match peer_refusal(&state, &req) {
+    match host_refusal(&state, &req) {
         Some(refusal) => refusal,
         None => next.run(req).await,
     }
+}
+
+/// The paths of the open routes, `{param}` segments as wildcards (built once).
+fn open_paths() -> &'static [&'static str] {
+    static PATHS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    PATHS.get_or_init(|| {
+        let mut paths: Vec<&'static str> = open_routes().into_iter().map(|(p, _)| p).collect();
+        if cfg!(test) {
+            paths.extend([
+                "/__test/panic",
+                "/__test/blocking-panic",
+                "/__test/transport",
+            ]);
+        }
+        paths
+    })
+}
+
+/// Whether `path` is one of the open routes ([`open_paths`]; a `{param}` segment matches any one
+/// non-empty segment).
+fn is_open_path(path: &str) -> bool {
+    open_paths().iter().any(|pattern| {
+        let (mut want, mut got) = (pattern.split('/'), path.split('/'));
+        loop {
+            match (want.next(), got.next()) {
+                (None, None) => return true,
+                (Some(w), Some(g)) if w.starts_with('{') && w.ends_with('}') => {
+                    if g.is_empty() {
+                        return false;
+                    }
+                }
+                (Some(w), Some(g)) if w == g => {}
+                _ => return false,
+            }
+        }
+    })
+}
+
+/// The HTTPS address of what a plain-port request asked for: `https://<its host>:<port><path>`
+/// under the request's own `Host` (when it may be answered under it, [`guard::host_allowed`]),
+/// without the client's port, the path and query through [`auth::safe_next`] (else `/`). None:
+/// no usable host.
+fn https_location(req: &axum::extract::Request, port: u16, allowed: &[String]) -> Option<String> {
+    let host = guard::request_host(req.headers(), req.uri())?;
+    if !guard::host_allowed(&host, allowed) {
+        return None;
+    }
+    let name = guard::host_part(&host)?;
+    let name = if name.contains(':') {
+        format!("[{name}]")
+    } else {
+        name
+    };
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .and_then(auth::safe_next)
+        .unwrap_or("/");
+    Some(format!("https://{name}:{port}{path}"))
+}
+
+/// The transport gate (inside the network rule, outside everything else): the plain HTTP port
+/// serves the open routes only. Anything else there: a browser's GET or HEAD is redirected (308)
+/// to the same page over HTTPS ([`https_location`]; a foreign host name gets 403, a down HTTPS
+/// listener 503); any other method or client gets a 403 JSON answer naming the HTTPS address. A
+/// request with `Authorization` is refused (403) before anything is compared or counted: the
+/// API token is for HTTPS only. No HSTS: with a self-signed certificate it would make the
+/// browser's warning impossible to click through.
+pub(super) async fn plain_gate(
+    State(state): State<Arc<AppState>>,
+    State(https): State<HttpsPort>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if transport_of(&req) == Transport::Tls || is_open_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    let (allowed, configured) = {
+        let c = state.config_read();
+        (c.allowed_hosts.clone(), c.https_port)
+    };
+    let port = https.get();
+    let shown_port = port.unwrap_or(configured);
+    let location = https_location(&req, shown_port, &allowed);
+    let url = location
+        .clone()
+        .unwrap_or_else(|| format!("https://<this server's address>:{shown_port}/"));
+    let headers = req.headers();
+    if headers.contains_key(header::AUTHORIZATION) {
+        return auth::no_store(guard::refused(
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            "Forbidden",
+            format!(
+                "This port is plain HTTP, where no credential is accepted (it would travel \
+                 unencrypted). Send the API token to {url} instead; it may have been seen on \
+                 the network, so consider rotating it (`blue-onyx-prism admin-token --rotate` \
+                 on the server)."
+            ),
+        ));
+    }
+    let browser_get = matches!(*req.method(), Method::GET | Method::HEAD) && wants_html(headers);
+    if !browser_get {
+        return auth::no_store(guard::refused(
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            "Forbidden",
+            format!(
+                "This port (plain HTTP) serves Blue Iris and the detection API only. The web UI \
+                 and the admin API are at {url}, with a sign-in or `Authorization: Bearer <API \
+                 token>`."
+            ),
+        ));
+    }
+    let Some(location) = location else {
+        let host = guard::foreign_host(headers, req.uri(), &allowed).unwrap_or_default();
+        return auth::no_store(guard::host_refused(headers, req.uri().path(), &host));
+    };
+    if port.is_none() {
+        return auth::no_store(guard::refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            headers,
+            "Web UI not available",
+            format!(
+                "The web UI is served over HTTPS on port {configured}, and that listener is not \
+                 running right now: its port may be taken by another program or its \
+                 certificate may not load. The server's log says which; it keeps trying. Blue \
+                 Iris on this port is not affected."
+            ),
+        ));
+    }
+    let value = HeaderValue::from_str(&location).unwrap_or(HeaderValue::from_static("/"));
+    auth::no_store(
+        (
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, value)],
+            Html(
+                "<!doctype html><title>Moved to HTTPS</title><h1>Moved to HTTPS</h1>\
+                 <p>The web UI is served over HTTPS. Your browser warns once about the \
+                 server's self-signed certificate.</p>",
+            ),
+        )
+            .into_response(),
+    )
 }
 
 /// See [`training::queue_busy`]: for the supervisor, which holds back GPU retries meanwhile.
@@ -861,7 +1005,11 @@ mod tests {
         let shared = Shared::new(first.clone());
         let id = shared.current().auth.sessions.create("alice", 1, now);
         let mut next = Arc::try_unwrap(test_state()).unwrap();
-        assert!(next.auth.sessions.is_empty(), "a fresh state has its own");
+        assert!(
+            next.auth.sessions.record(&id).is_none(),
+            "a fresh state has its own (only the seeded test session)"
+        );
+        assert_eq!(next.auth.sessions.len(), 1);
         next.auth = first.auth.clone();
         drop(first);
         let old = shared.swap(Arc::new(next));
@@ -873,7 +1021,10 @@ mod tests {
             .check(id.reveal().as_bytes(), &users, now, Activity::User)
             .unwrap();
         assert_eq!(valid.user, "alice");
-        assert!(format!("{current:?}").contains("sessions: 1"));
+        assert!(
+            format!("{current:?}").contains("sessions: 2"),
+            "{current:?}"
+        );
     }
 
     /// Answers given before the image is used (unknown model, no usable default model) still
@@ -1053,21 +1204,14 @@ mod tests {
     /// A token in the right shape, for the tests that are about something else.
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    /// `req` with the admin token.
-    fn signed_in(mut req: Request<Body>) -> Request<Body> {
-        req.headers_mut().insert(
-            header::AUTHORIZATION,
-            format!("Bearer {TOKEN}").parse().unwrap(),
-        );
-        req
+    /// `req` with the API token instead of the seeded session.
+    fn signed_in(req: Request<Body>) -> Request<Body> {
+        bearer(req, TOKEN)
     }
 
-    /// [`test_state_with`] with `allow_remote_admin` on and [`TOKEN`] in its file.
+    /// [`test_state_with`] with [`TOKEN`] in its API token file.
     fn remote_state_with_token(edit: impl FnOnce(&mut Config)) -> Arc<AppState> {
-        let state = test_state_with(|c| {
-            c.allow_remote_admin = true;
-            edit(c);
-        });
+        let state = test_state_with(edit);
         std::fs::write(
             crate::admin_token::prepare(&state.config_read()).unwrap(),
             TOKEN,
@@ -1076,10 +1220,11 @@ mod tests {
         state
     }
 
+    /// What counts as this machine for the file dialog and the token's rotation (never a way in).
     #[test]
     fn loopback_peers_are_local() {
         let none = HeaderMap::new();
-        let ok = |a: &str| admin_allowed(Some(a.parse().unwrap()), &none, false);
+        let ok = |a: &str| direct_local(Some(a.parse().unwrap()), &none);
         assert!(ok("127.0.0.1:1"));
         assert!(ok("127.8.9.10:1"));
         assert!(ok("[::1]:1"));
@@ -1088,70 +1233,63 @@ mod tests {
         assert!(!ok("192.168.1.20:1"));
         assert!(!ok("[fe80::1]:1"));
         assert!(!ok("[::ffff:10.0.0.5]:1"));
-        assert!(!admin_allowed(None, &none, false));
-        assert!(admin_allowed(
-            Some("10.0.0.5:1".parse().unwrap()),
-            &none,
-            true
-        ));
+        assert!(!direct_local(None, &none));
+        assert!(loopback_peer(Some("127.0.0.1:1".parse().unwrap())));
+        assert!(!loopback_peer(None));
     }
 
-    /// SV-12: a loopback admin request carrying a proxy's forwarding header is no local request,
-    /// and says so in the log, once per process.
+    /// SV-12, rewritten for sign-in: a loopback request carrying a proxy's forwarding header is no
+    /// request of this machine (for the dialog and the rotation), and like every other request it
+    /// needs a sign-in; signed in, it is served.
     #[tokio::test]
-    async fn a_local_proxy_is_noted_once() {
+    async fn a_local_proxy_is_no_local_request() {
         let local: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let mut h = HeaderMap::new();
-        assert!(direct_local(Some(local), &h));
+        assert!(direct_local(Some(local), &HeaderMap::new()));
         for (name, value) in [
             ("x-forwarded-for", "192.168.1.9"),
             ("forwarded", "for=192.168.1.9"),
             ("x-real-ip", "192.168.1.9"),
         ] {
-            h = HeaderMap::new();
+            let mut h = HeaderMap::new();
             h.insert(name, value.parse().unwrap());
             assert!(!direct_local(Some(local), &h), "{name}");
-            assert!(admin_allowed(Some(local), &h, true), "{name}");
-            assert!(!admin_allowed(Some(local), &h, false), "{name}");
         }
-
-        let flag = std::sync::atomic::AtomicBool::new(false);
-        assert!(warn_local_proxy_once(&flag));
-        assert!(!warn_local_proxy_once(&flag));
-
-        // Through the admin guard: the proxied loopback request is refused and sets the
-        // process-wide flag.
         let state = test_state();
-        let mut req = from("127.0.0.1:40000", "GET", "/config", true);
-        req.headers_mut()
-            .insert("x-forwarded-for", "192.168.1.9".parse().unwrap());
-        let (s, _, _) = call(&state, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
-        assert!(LOCAL_PROXY_WARNED.load(std::sync::atomic::Ordering::Relaxed));
+        let proxied = |r: Request<Body>| {
+            let mut r = r;
+            r.headers_mut()
+                .insert("x-forwarded-for", "192.168.1.9".parse().unwrap());
+            r
+        };
+        let req = proxied(anonymous(from("127.0.0.1:40000", "GET", "/config", true)));
+        let (s, h, _) = call(&state, req).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(h[header::LOCATION], "/login?next=%2Fconfig");
+        let req = proxied(from("127.0.0.1:40000", "GET", "/config", true));
+        assert_eq!(call(&state, req).await.0, StatusCode::OK);
     }
 
     /// Every route of the router, classified. A new route must be added here: the test fails
-    /// when the router has a path this list does not (and the other way round), and probes
-    /// each path from a remote peer: with `allow_remote_admin` off admin and login routes answer
-    /// 403, with it on admin routes want the token, login routes do not, and open routes never
-    /// answer 401 or 403.
+    /// when the router has a path this list does not (and the other way round), and probes each
+    /// path: anonymous on HTTPS, admin routes want a sign-in (401), login routes take none, open
+    /// routes never answer 401 or 403; on the plain port only the open routes are served.
     #[tokio::test]
     async fn router_classification() {
         const OPEN: &[&str] = &[
-            "/",
             "/v1/vision/detection",
             "/v1/vision/custom/list",
             "/v1/vision/custom/{model}",
             "/v1/status",
             "/v1/status/updateavailable",
-            "/v1/devices",
             "/v1/config",
-            "/stats.json",
-            "/prometheus",
             "/favicon.ico",
         ];
-        const LOGIN: &[&str] = &["/login", "/logout"];
+        const LOGIN: &[&str] = &["/login", "/logout", "/setup"];
         const ADMIN: &[&str] = &[
+            "/",
+            "/stats.json",
+            "/prometheus",
+            "/v1/devices",
             "/v1/resources",
             "/v1/resources/download",
             "/v1/resources/remove",
@@ -1295,50 +1433,68 @@ mod tests {
 
         let state = test_state();
         let probe = |p: &str| p.replace("{model}", "x").replace("{file}", "x.js");
-        for p in &admin {
-            for method in ["GET", "POST"] {
-                let (s, _, _) = call(&state, from(REMOTE, method, &probe(p), false)).await;
-                assert_eq!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
-            }
-        }
+        // The plain port's gate knows exactly the open routes.
         for p in &open {
-            for method in ["GET", "POST"] {
-                let (s, _, _) = call(&state, from(REMOTE, method, &probe(p), false)).await;
-                assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
+            assert!(is_open_path(&probe(p)), "{p} is open but gated");
+        }
+        for p in admin.iter().chain(login.iter()) {
+            assert!(!is_open_path(p), "{p} is not open but passes the gate");
+        }
+        for peer in [REMOTE, LOCAL] {
+            for p in &admin {
+                for method in ["GET", "POST"] {
+                    let r = anonymous(from(peer, method, &probe(p), false));
+                    let (s, h, _) = call(&state, r).await;
+                    assert_eq!(
+                        s,
+                        StatusCode::UNAUTHORIZED,
+                        "{method} {p} anonymous from {peer}"
+                    );
+                    assert_eq!(h[header::WWW_AUTHENTICATE], "Bearer", "{method} {p}");
+                }
             }
         }
-        for p in &login {
-            for method in ["GET", "POST"] {
-                let (s, _, _) = call(&state, from(REMOTE, method, p, false)).await;
-                assert_eq!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
-            }
-        }
-
-        let lan = test_state_with(|c| c.allow_remote_admin = true);
-        for p in &admin {
-            for method in ["GET", "POST"] {
-                let (s, _, _) = call(&lan, from(REMOTE, method, &probe(p), false)).await;
-                assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {p} with no token");
-            }
-        }
-        for (method, p) in [("GET", "/login"), ("POST", "/login"), ("POST", "/logout")] {
-            let (s, _, b) = call(&lan, from(REMOTE, method, p, false)).await;
+        for (method, p) in [
+            ("GET", "/login"),
+            ("POST", "/login"),
+            ("POST", "/logout"),
+            ("GET", "/setup"),
+            ("POST", "/setup"),
+        ] {
+            let (s, _, b) = call(&state, anonymous(from(REMOTE, method, p, false))).await;
             let answer = String::from_utf8_lossy(&b);
             assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p}: {answer}");
-            // POST /login with no form says so; the route itself let the peer in.
+            // POST /login with no form is no sign-in; the route itself let the peer in.
             if p != "/login" || method == "GET" {
                 assert_ne!(s, StatusCode::UNAUTHORIZED, "{method} {p}: {answer}");
             }
         }
         for p in &open {
             for method in ["GET", "POST"] {
-                let (s, _, _) = call(&lan, from(REMOTE, method, &probe(p), false)).await;
+                let (s, _, _) =
+                    call(&state, anonymous(from(REMOTE, method, &probe(p), false))).await;
                 assert_ne!(s, StatusCode::FORBIDDEN, "{method} {p} from a remote peer");
                 assert_ne!(
                     s,
                     StatusCode::UNAUTHORIZED,
                     "{method} {p} from a remote peer"
                 );
+            }
+        }
+        // Signed in, every admin route is reached (whatever it answers then).
+        for p in &admin {
+            let (s, _, _) = call(&state, from(REMOTE, "GET", &probe(p), false)).await;
+            assert!(![401, 403].contains(&s.as_u16()), "GET {p} signed in: {s}");
+        }
+        // The plain port: open routes as before, everything else refused (non-browser: 403).
+        for p in &open {
+            let (s, _, _) = call(&state, plain(from(REMOTE, "GET", &probe(p), false))).await;
+            assert_ne!(s, StatusCode::FORBIDDEN, "GET {p} on the plain port");
+        }
+        for p in admin.iter().chain(login.iter()) {
+            for method in ["GET", "POST"] {
+                let (s, _, _) = call(&state, plain(from(REMOTE, method, &probe(p), false))).await;
+                assert_eq!(s, StatusCode::FORBIDDEN, "{method} {p} on the plain port");
             }
         }
     }
@@ -1348,7 +1504,7 @@ mod tests {
     fn with_host(mut req: Request<Body>, host: &str) -> Request<Body> {
         req.headers_mut()
             .insert(header::HOST, host.parse().unwrap());
-        let origin = format!("http://{host}");
+        let origin = format!("https://{host}");
         req.headers_mut()
             .insert(header::ORIGIN, origin.parse().unwrap());
         req
@@ -1399,19 +1555,20 @@ mod tests {
             assert!(String::from_utf8_lossy(&b).contains("allowed_hosts"));
         }
         assert_eq!(state.config_read().port, Config::default().port);
-        // `allow_remote_admin` does not lift it, nor does the token: the rebound browser may be
-        // on the LAN.
+        // Neither a session (above) nor the API token lifts it: the rebound browser may be on the
+        // LAN.
         let open = remote_state_with_token(|_| {});
         let req = with_host(signed_in(from(REMOTE, "GET", "/config", false)), rebound);
         assert_eq!(call(&open, req).await.0, StatusCode::FORBIDDEN);
-        // A remote peer keeps its own message: the host name is not what it needs to fix.
-        let (s, _, b) = call(
-            &state,
-            with_host(from(REMOTE, "GET", "/config", false), rebound),
-        )
-        .await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
-        assert!(String::from_utf8_lossy(&b).contains("your address"));
+        // A remote peer, signed in or not, gets the same refusal: the name is the problem.
+        for req in [
+            from(REMOTE, "GET", "/config", false),
+            anonymous(from(REMOTE, "GET", "/config", false)),
+        ] {
+            let (s, _, b) = call(&state, with_host(req, rebound)).await;
+            assert_eq!(s, StatusCode::FORBIDDEN);
+            assert!(String::from_utf8_lossy(&b).contains("allowed_hosts"));
+        }
     }
 
     /// S1: IP literals, `localhost` and `allowed_hosts` names reach the handler.
@@ -1488,13 +1645,23 @@ mod tests {
                 ("POST", "/v1/vision/detection"),
                 ("POST", "/v1/vision/custom/list"),
                 ("GET", "/v1/status"),
-                ("GET", "/stats.json"),
+                ("GET", "/favicon.ico"),
             ] {
                 let (s, _, _) =
                     call(&state, with_host(from(REMOTE, method, uri, false), host)).await;
                 assert_ne!(s, StatusCode::FORBIDDEN, "{method} {uri} {host}");
             }
         }
+    }
+
+    /// Whether `h` sets the session cookie.
+    fn set_cookie_has_session(h: &HeaderMap) -> bool {
+        h.get_all(header::SET_COOKIE).iter().any(|v| {
+            v.to_str()
+                .unwrap_or_default()
+                .starts_with("__Host-bop_session=")
+                && !v.to_str().unwrap_or_default().contains("Max-Age=0")
+        })
     }
 
     /// SV-01: a state-changing admin request from another site is refused, same-origin and
@@ -1514,13 +1681,18 @@ mod tests {
             from_peer(b.body(Body::from("port=4000")).unwrap(), LOCAL)
         };
         let host = ("host", "localhost:32168");
-        // Cross-site: 403 as JSON, and as a page for browsers; the config is untouched.
+        // Cross-site: 403 as JSON, and as a page for browsers; the config is untouched. Over
+        // HTTPS (the test default) a plain-HTTP page of this very host and a same-site page are
+        // foreign too.
         for headers in [
             vec![host, ("sec-fetch-site", "cross-site")],
             vec![host, ("origin", "http://evil.example")],
             vec![host, ("origin", "null")],
             vec![host, ("referer", "http://evil.example/page")],
-            vec![host, ("origin", "http://localhost:8080")],
+            vec![host, ("origin", "https://localhost:8080")],
+            vec![host, ("origin", "http://localhost:32168")],
+            vec![host, ("referer", "http://localhost:32168/config")],
+            vec![host, ("sec-fetch-site", "same-site")],
         ] {
             let (s, h, b) = call(&state, post(&headers, false)).await;
             let body = String::from_utf8_lossy(&b).to_string();
@@ -1534,6 +1706,7 @@ mod tests {
             let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
             assert_eq!(j["success"], false);
             assert!(j["message"].as_str().unwrap().contains("Cross-site"), "{j}");
+            assert!(!set_cookie_has_session(&h), "nothing signs in on a refusal");
             let (s, h, b) = call(&state, post(&headers, true)).await;
             assert_eq!(s, StatusCode::FORBIDDEN);
             assert!(
@@ -1547,13 +1720,13 @@ mod tests {
         }
         // Same-origin (Origin, Referer, Sec-Fetch-Site) and header-less: the handler runs.
         for (i, headers) in [
-            vec![host, ("origin", "http://localhost:32168")],
-            vec![host, ("referer", "http://localhost:32168/config")],
+            vec![host, ("origin", "https://localhost:32168")],
+            vec![host, ("referer", "https://localhost:32168/config")],
             vec![host, ("sec-fetch-site", "same-origin")],
             vec![host],
             vec![
                 host,
-                ("origin", "http://LOCALHOST:32168"),
+                ("origin", "https://LOCALHOST:32168"),
                 ("sec-fetch-site", "none"),
             ],
         ]
@@ -1603,53 +1776,51 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
     }
 
-    /// SV-05: `GET /v1/config` gives a non-admin peer only the restart poller's counters.
+    /// SV-05: `GET /v1/config` gives a request that is not signed in (on any address, loopback
+    /// included) only the restart poller's counters.
     #[tokio::test]
     async fn config_json_is_minimal_for_non_admin_peers() {
         let state = test_state();
-        let (s, h, b) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
-        assert_eq!(s, StatusCode::OK);
-        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
-        let mut keys: Vec<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "epoch",
-                "generation",
-                "pendingCount",
-                "restartNeeded",
-                "revision",
-                "success"
-            ]
-        );
-        assert!(j["revision"].is_u64() && j["generation"].is_u64() && j["epoch"].is_u64());
-        assert!(h.contains_key(header::ETAG));
+        for peer in [REMOTE, LOCAL] {
+            let (s, h, b) = call(&state, anonymous(from(peer, "GET", "/v1/config", false))).await;
+            assert_eq!(s, StatusCode::OK);
+            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+            let mut keys: Vec<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "epoch",
+                    "generation",
+                    "pendingCount",
+                    "restartNeeded",
+                    "revision",
+                    "success"
+                ],
+                "{peer}"
+            );
+            assert!(j["revision"].is_u64() && j["generation"].is_u64() && j["epoch"].is_u64());
+            assert!(h.contains_key(header::ETAG));
+        }
         // The ETag round-trips to 304.
+        let (_, h, _) = call(&state, anonymous(from(REMOTE, "GET", "/v1/config", false))).await;
         let etag = h[header::ETAG].to_str().unwrap().to_string();
-        let req = from_peer(
+        let req = anonymous(from_peer(
             Request::get("/v1/config")
                 .header(header::IF_NONE_MATCH, etag)
                 .body(Body::empty())
                 .unwrap(),
             REMOTE,
-        );
+        ));
         let (s, _, _) = call(&state, req).await;
         assert_eq!(s, StatusCode::NOT_MODIFIED);
         // Nothing of the config was read or written from disk for it.
         assert!(!state.config_path.exists());
-        // This machine gets the full payload, remote peers with `allow_remote_admin` and the
-        // token too (more cases in `auth::tests`).
-        let (_, _, b) = call(&state, from(LOCAL, "GET", "/v1/config", false)).await;
+        // A signed-in browser gets the full payload, from any address, and so does the API token
+        // (more cases in `auth::tests`).
+        let (_, _, b) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(j["config"].is_object() && j["models"].is_array() && j["path"].is_string());
-        state
-            .config
-            .update("test", |c| {
-                c.allow_remote_admin = true;
-                Ok(())
-            })
-            .unwrap();
         std::fs::write(
             crate::admin_token::prepare(&state.config_read()).unwrap(),
             TOKEN,
@@ -1659,6 +1830,18 @@ mod tests {
         let (_, _, b) = call(&state, req).await;
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert!(j["config"].is_object());
+        // The plain port never gives it, whatever the request shows.
+        let mut req = plain(from(LOCAL, "GET", "/v1/config", false));
+        req.headers_mut().insert(
+            header::COOKIE,
+            format!("__Host-bop_session={TEST_SESSION}")
+                .parse()
+                .unwrap(),
+        );
+        let (s, _, b) = call(&state, req).await;
+        assert_eq!(s, StatusCode::OK);
+        let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert!(j.get("config").is_none(), "{j}");
     }
 
     /// `GET /v1/config` is an open route with its own gate, so [`admin_only`] never sees it: a
@@ -1701,9 +1884,11 @@ mod tests {
         // `/v1/config` keeps its own cache policy (ETag revalidation).
         let (_, h, _) = call(&state, from(REMOTE, "GET", "/v1/config", false)).await;
         assert_eq!(h[header::CACHE_CONTROL], "no-cache");
-        // The 403 page and the panic page carry them too.
-        let (s, h, _) = call(&state, from(REMOTE, "GET", "/config", true)).await;
+        // The 403 page carries them too (and no-store: nobody is signed in to it).
+        let req = with_host(from(REMOTE, "GET", "/config", true), "rebind.attacker.test");
+        let (s, h, _) = call(&state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(h[header::CACHE_CONTROL], "no-store");
         assert_eq!(h["content-security-policy"], guard::CSP);
         assert_eq!(h["x-frame-options"], "DENY");
 
@@ -1739,7 +1924,7 @@ mod tests {
         let (s, _, _) = call(&state, from(REMOTE, "POST", "/nope", false)).await;
         assert_eq!(s, StatusCode::NOT_FOUND);
 
-        // A method the path does not take: 405 (open route), 403 first on admin routes.
+        // A method the path does not take: 405 (open route, or an admin route signed in).
         for (method, uri) in [
             ("DELETE", "/v1/devices"),
             ("PUT", "/"),
@@ -1752,8 +1937,11 @@ mod tests {
         assert_eq!(s, StatusCode::METHOD_NOT_ALLOWED);
     }
 
+    /// Every admin route needs a sign-in, from every address: loopback is no exception any more.
+    /// A browser is sent to the login page, others get a JSON 401; signed in, a remote peer of
+    /// the local network gets the route. Blue Iris's routes stay open to everyone on the LAN.
     #[tokio::test]
-    async fn admin_routes_answer_loopback_only() {
+    async fn admin_routes_need_a_sign_in_from_every_address() {
         let state = test_state();
         let admin = [
             ("GET", "/config"),
@@ -1761,69 +1949,62 @@ mod tests {
             ("GET", "/v1/fs/browse"),
             ("POST", "/v1/resources/export"),
             ("POST", "/config/restart"),
+            ("GET", "/"),
+            ("GET", "/stats.json"),
+            ("GET", "/prometheus"),
+            ("GET", "/v1/devices"),
         ];
         for (method, uri) in admin {
-            // A remote client gets 403 with the setting that enables remote administration.
-            let (s, h, b) = call(&state, from(REMOTE, method, uri, false)).await;
-            let body = String::from_utf8_lossy(&b).to_string();
-            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+            for peer in [REMOTE, LOCAL, "[::1]:50000"] {
+                let (s, h, b) = call(&state, anonymous(from(peer, method, uri, false))).await;
+                let body = String::from_utf8_lossy(&b).to_string();
+                assert_eq!(s, StatusCode::UNAUTHORIZED, "{method} {uri} {peer}: {body}");
+                assert_eq!(h[header::WWW_AUTHENTICATE], "Bearer");
+                assert!(
+                    h[header::CONTENT_TYPE]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("application/json"),
+                    "{method} {uri}"
+                );
+                assert_eq!(h[header::CACHE_CONTROL], "no-store");
+                let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                assert_eq!(j["success"], false);
+                assert!(j["message"].as_str().unwrap().contains("/login"), "{j}");
+                // Browsers go to the login page (back here only for a GET).
+                let (s, h, _) = call(&state, anonymous(from(peer, method, uri, true))).await;
+                assert_eq!(s, StatusCode::SEE_OTHER, "{method} {uri}");
+                let to = h[header::LOCATION].to_str().unwrap();
+                if method == "GET" {
+                    assert_eq!(to, format!("/login?next={}", encode_uri_component(uri)));
+                } else {
+                    assert_eq!(to, "/login");
+                }
+                assert_eq!(h[header::CACHE_CONTROL], "no-store");
+            }
+            // Signed in: the route, from another machine too.
+            let (s, _, b) = call(&state, from(REMOTE, method, uri, true)).await;
             assert!(
-                h[header::CONTENT_TYPE]
-                    .to_str()
-                    .unwrap()
-                    .starts_with("application/json"),
-                "{method} {uri}"
-            );
-            let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
-            assert_eq!(j["success"], false);
-            assert!(
-                j["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("allow_remote_admin"),
-                "{j}"
-            );
-            assert!(j["message"].as_str().unwrap().contains("10.0.0.5"), "{j}");
-            // Browsers get a page.
-            let (s, h, b) = call(&state, from(REMOTE, method, uri, true)).await;
-            assert_eq!(s, StatusCode::FORBIDDEN, "{method} {uri}");
-            assert!(
-                h[header::CONTENT_TYPE]
-                    .to_str()
-                    .unwrap()
-                    .starts_with("text/html")
-            );
-            let html = String::from_utf8_lossy(&b);
-            assert!(html.contains("Forbidden") && html.contains("allow_remote_admin"));
-            // This machine gets the route.
-            let (s, _, b) = call(&state, from(LOCAL, method, uri, true)).await;
-            assert_ne!(
-                s,
-                StatusCode::FORBIDDEN,
+                ![401, 403].contains(&s.as_u16()),
                 "{method} {uri}: {}",
                 String::from_utf8_lossy(&b)
             );
-            let (s, _, _) = call(&state, from("[::1]:50000", method, uri, true)).await;
-            assert_ne!(s, StatusCode::FORBIDDEN, "{method} {uri} from ::1");
         }
+        assert!(!state.restart.is_cancelled());
 
-        // Read-only and Blue Iris routes stay open to remote clients.
+        // Blue Iris's routes, the readiness probe and static files stay open to remote clients.
         for uri in [
-            "/",
-            "/stats.json",
-            "/prometheus",
-            "/v1/devices",
             "/v1/config",
             "/static/style.css",
             "/favicon.ico",
             "/v1/vision/custom/list",
         ] {
-            let (s, _, _) = call(&state, from(REMOTE, "GET", uri, false)).await;
+            let (s, _, _) = call(&state, anonymous(from(REMOTE, "GET", uri, false))).await;
             assert_eq!(s, StatusCode::OK, "{uri}");
         }
         let (s, _, b) = call(
             &state,
-            from_peer(
+            anonymous(from_peer(
                 Request::post("/v1/vision/detection")
                     .header(
                         header::CONTENT_TYPE,
@@ -1835,29 +2016,12 @@ mod tests {
                     ))
                     .unwrap(),
                 REMOTE,
-            ),
+            )),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
         let r: VisionDetectionResponse = serde_json::from_slice(&b).unwrap();
         assert!(!r.success, "the test models failed to load: {r:?}");
         assert!(r.error.unwrap().contains("ipcam-general"));
-
-        // `allow_remote_admin` applies at once.
-        state
-            .config
-            .update("test", |c| {
-                c.allow_remote_admin = true;
-                Ok(())
-            })
-            .unwrap();
-        std::fs::write(
-            crate::admin_token::prepare(&state.config_read()).unwrap(),
-            TOKEN,
-        )
-        .unwrap();
-        let req = signed_in(from(REMOTE, "GET", "/config", true));
-        let (s, _, _) = call(&state, req).await;
-        assert_eq!(s, StatusCode::OK);
     }
 }

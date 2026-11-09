@@ -85,8 +85,8 @@ async fn a_public_peer_is_refused_on_every_route() {
     }
 }
 
-/// Peers of the local network reach the routes as before (the admin routes still answer this
-/// machine only).
+/// Peers of the local network reach the routes as before; the admin routes then want a sign-in,
+/// from every address alike (not the network rule's refusal).
 #[tokio::test]
 async fn local_network_peers_pass() {
     let state = test_state();
@@ -107,19 +107,18 @@ async fn local_network_peers_pass() {
     // The status route answers 503 for these failed models, not 403.
     let (s, _, _) = answer(&state, get("/v1/status", REMOTE)).await;
     assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
-    let (s, _, msg) = answer(&state, get("/config", REMOTE)).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-    assert!(msg.contains("allow_remote_admin"), "{msg}");
-    assert!(!msg.contains("allowed_networks"), "{msg}");
-    assert_eq!(
-        answer(&state, get("/config", LOCAL)).await.0,
-        StatusCode::OK
-    );
+    for peer in [REMOTE, LOCAL] {
+        let (s, _, msg) = answer(&state, anonymous(get("/config", peer))).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{peer}");
+        assert!(msg.contains("/login"), "{msg}");
+        assert!(!msg.contains("allowed_networks"), "{msg}");
+        assert_eq!(answer(&state, get("/config", peer)).await.0, StatusCode::OK);
+    }
 }
 
 /// Forwarding headers can only refuse: a public address in one refuses a loopback request on an
-/// open route, a private one passes the rule and still makes the request non-local for the
-/// admin routes.
+/// open route, a private one passes the rule, and the admin routes then want a sign-in as from
+/// any other address.
 #[tokio::test]
 async fn forwarding_headers_only_refuse() {
     let state = test_state();
@@ -158,10 +157,16 @@ async fn forwarding_headers_only_refuse() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _, msg) = answer(&state, with("/config", "x-forwarded-for", "192.168.1.9")).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-    assert!(msg.contains("proxy"), "{msg}");
+    let (s, _, msg) = answer(
+        &state,
+        anonymous(with("/config", "x-forwarded-for", "192.168.1.9")),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert!(msg.contains("/login"), "{msg}");
     assert!(!msg.contains("allowed_networks"), "{msg}");
+    let (s, _, _) = answer(&state, with("/config", "x-forwarded-for", "192.168.1.9")).await;
+    assert_eq!(s, StatusCode::OK);
     // A private header never lets a public peer in.
     let mut r = get("/v1/vision/custom/list", PUBLIC);
     r.headers_mut()
@@ -238,10 +243,16 @@ async fn allowed_networks_apply_at_once() {
     r.headers_mut()
         .insert("x-forwarded-for", "203.0.113.77".parse().unwrap());
     assert_eq!(answer(&state, r).await.0, StatusCode::OK);
-    // The admin routes still answer this machine only.
+    // The admin routes want a sign-in there like everywhere.
+    assert_eq!(
+        answer(&state, as_peer(get("/config", LOCAL), PUBLIC))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         answer(&state, get("/config", PUBLIC)).await.0,
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
     state
         .config

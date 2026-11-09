@@ -164,11 +164,14 @@ async fn multiple_models_served_concurrently() {
     let server = Server::start_in_process(config).await;
     let base = server.base.clone();
     let client = reqwest::Client::new();
+    // The admin routes (`/stats.json`, `/prometheus`): HTTPS with the API token.
+    let https = server.https_base.clone();
+    let admin = server.admin_client().await;
 
     // Wait for the eager models; the lazy one must stay unloaded meanwhile.
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        if let Ok(r) = client.get(format!("{base}/stats.json")).send().await
+        if let Ok(r) = admin.get(format!("{https}/stats.json")).send().await
             && let Ok(stats) = r.json::<serde_json::Value>().await
         {
             for m in stats["models"].as_array().unwrap() {
@@ -190,8 +193,8 @@ async fn multiple_models_served_concurrently() {
     }
     eprintln!("eager models ready after {:?}", t_start.elapsed());
 
-    let stats = get_stats(&client, &base).await;
-    let prom = get_prometheus(&client, &base).await;
+    let stats = get_stats(&admin, &https).await;
+    let prom = get_prometheus(&admin, &https).await;
     for n in eager {
         let row = stats_model(&stats, n);
         let device = row["device"].as_str().expect("device after load");
@@ -241,7 +244,7 @@ async fn multiple_models_served_concurrently() {
         assert!(r.predictions.iter().any(|p| p.label == "dog"), "{r:?}");
     }
     *sent.entry("yolo26s").or_default() += 1;
-    let stats = get_stats(&client, &base).await;
+    let stats = get_stats(&admin, &https).await;
     assert_eq!(stats_model(&stats, "yolo26s")["requests"], 1);
     assert_eq!(stats_model(&stats, IPCAM)["requests"], 0);
 
@@ -360,9 +363,9 @@ async fn multiple_models_served_concurrently() {
         );
         let want = if lazy_coco { "dog" } else { "vehicle" };
         assert!(r.predictions.iter().any(|p| p.label == want), "{r:?}");
-        let stats = get_stats(&client, &base).await;
+        let stats = get_stats(&admin, &https).await;
         assert_eq!(stats_model(&stats, lazy)["state"], "Ready");
-        let prom = get_prometheus(&client, &base).await;
+        let prom = get_prometheus(&admin, &https).await;
         assert!(
             prom_info(&prom, lazy).ends_with("state=\"ready\"} 1"),
             "{prom}"
@@ -371,8 +374,8 @@ async fn multiple_models_served_concurrently() {
     }
 
     // Per-model counters match exactly what was sent; nothing was dropped.
-    let stats = get_stats(&client, &base).await;
-    let prom = get_prometheus(&client, &base).await;
+    let stats = get_stats(&admin, &https).await;
+    let prom = get_prometheus(&admin, &https).await;
     for n in &names {
         let want = sent.get(n.as_str()).copied().unwrap_or(0);
         let row = stats_model(&stats, n);

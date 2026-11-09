@@ -2,11 +2,12 @@
 {% block title %}Sign in{% endblock %}
 {% block content %}
 <h1>Sign in</h1>
-{% if let Some(e) = error %}<p class="error">{{ e }}</p>{% endif %}
-<form method="post" action="/login" class="card grid">
+{% if let Some(e) = error %}<p class="error" role="alert">{{ e }}</p>{% endif %}
+<form method="post" action="/login" class="card auth-form">
   <input type="hidden" name="next" value="{{ next }}">
-  <label>Admin token <input type="password" name="token" autocomplete="current-password" spellcheck="false" autofocus required></label>
+  <label>Username <input type="text" name="username" value="{{ username }}" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32" required{% if username.is_empty() %} autofocus{% endif %}></label>
+  <label>Password <input type="password" name="password" autocomplete="current-password" maxlength="512" required{% if !username.is_empty() %} autofocus{% endif %}></label>
   <div class="actions"><button type="submit">Sign in</button></div>
 </form>
-<p class="muted">Administration from another machine needs the admin token. Read it on the server with <code>blue-onyx-prism admin-token</code> (add <code>--config &lt;file&gt;</code> if the service uses its own config file). This page and the token travel over plain HTTP, so use it only on a trusted network or behind TLS.</p>
+<p class="muted">Forgot the password? On the server, <code>blue-onyx-prism user reset-password &lt;name&gt;</code> sets a new one (add <code>--config &lt;file&gt;</code> if the service uses its own config file). Blue Iris needs no account: it uses the plain HTTP port.</p>
 {% endblock %}

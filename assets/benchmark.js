@@ -114,7 +114,7 @@
             var r = (j2.resources || []).find(function (x) { return x.id === id; });
             if (r && state) state.textContent = r.state_text;
             if (r && r.busy) return true;
-            L.reloadKeep();
+            L.reloadKeep(null, true);
             return false;
           });
         }, more: function (busy) { return busy; }}).start();
@@ -1216,7 +1216,8 @@
       return r.json();
     }).then(function (s) {
       var n = BP.step(polled, s);
-      if (n.full) return refresh();
+      // Chained after the poll's answer: still a poll (live.js).
+      if (n.full) return PrismPoll.background(refresh);
       if (n.old) { polled = {status: s, viewTag: null, modelsTag: null}; return render(s); }
       polled = {status: n.status, viewTag: polled.viewTag, modelsTag: n.modelsTag};
       return render(n.status);

@@ -501,6 +501,25 @@ impl Sessions {
         s.v.written = s.v.written.max(version);
         true
     }
+
+    /// Tests only: a session with the known id `id` (64 lowercase hex characters) for `user` at
+    /// `generation`, made and last active at `at` (in memory; the next flush writes it). The
+    /// server tests' signed-in requests carry such an id (`server::test_util`).
+    #[cfg(test)]
+    pub(crate) fn insert_known(&self, id: &str, user: &str, generation: u64, at: u64) {
+        let id = SessionId::from_presented(id.as_bytes()).expect("a 64-hex test session id");
+        let mut s = self.state.lock_recover();
+        s.map.insert(
+            id.digest(),
+            Record {
+                user: user.to_string(),
+                generation,
+                created: at,
+                last_active: at,
+            },
+        );
+        s.v.lazy();
+    }
 }
 
 #[cfg(test)]

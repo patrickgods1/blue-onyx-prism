@@ -989,15 +989,15 @@ mod tests {
 
         let (code, _, _) = call(
             &state,
-            from_peer(
+            anonymous(from_peer(
                 Request::get("/v1/autolabel/sam3")
                     .body(Body::empty())
                     .unwrap(),
                 REMOTE,
-            ),
+            )),
         )
         .await;
-        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -10,6 +10,25 @@ The release-readiness review (phases 1-10, PRs #121-#131 and this phase), groupe
 
 ### Upgrading
 
+- **Breaking: the web UI moves to HTTPS with a login.** It is served at `https://<server>:32169/`
+  (`https_port`, a self-signed certificate: compare its fingerprint with `blue-onyx-prism
+  tls-fingerprint` once) and every page needs a sign-in with a username and password, from every
+  address, this machine included. The first account is created at `/setup` with the one-time code
+  `blue-onyx-prism setup-code` prints on the server (or `blue-onyx-prism user add <name>`).
+- **Breaking: the plain HTTP port (32168) serves Blue Iris only**: the detection API, `/v1/status`,
+  `/v1/status/updateavailable`, a minimal `/v1/config` and static files. Browsers opening a page
+  there are redirected to HTTPS; other requests get 403. Blue Iris needs no change.
+- **Breaking: `/stats.json`, `/prometheus`, `/v1/devices` and `/` need a sign-in or the API token**
+  (`Authorization: Bearer`, HTTPS only; `blue-onyx-prism admin-token` prints it). Point Prometheus
+  at `https://<server>:32169/prometheus` with `authorization` and the server's certificate (README,
+  *Signing in*).
+- **Breaking: `allow_remote_admin` and `--allow-remote-admin` are gone** (read, ignored with a
+  warning, dropped from the file at the next save). The `bop_admin` cookie is no longer accepted
+  and is cleared. If remote administration was on, the API token is rotated once at the first
+  start, since it travelled over plain HTTP: scripts must read the new one.
+- **Breaking: only the local network is answered** (loopback, private and link-local addresses).
+  Tailscale (`100.64.0.0/10`) and other VPNs need their network in `allowed_networks` in the config
+  file.
 - Upgrading from 0.2.0 keeps every file: config, label files, sidecars, the review queue, training
   runs and tasks, benchmark results (checked by frozen 0.2.0 fixtures and an install-then-upgrade
   test). Training history moves out of `runs.json` into each run's `history.jsonl` at first start.
@@ -26,11 +45,13 @@ The release-readiness review (phases 1-10, PRs #121-#131 and this phase), groupe
 - `test-blue-onyx-prism --rate --duration`: an open-loop load test.
 
 ### Security
-- Admin pages and `GET /v1/config` refuse a `Host` that is not an IP address, `localhost` or an `allowed_hosts` name (DNS rebinding, RR-S1). An admin page opened by a name such as `http://nas.local:32168` answers 403 until the name is in `allowed_hosts`.
-- Remote administration needs a token (`allow_remote_admin`): 256 bits in `<data root>/auth/admin-token` (moved there from `<data root>/admin-token`), shown by `blue-onyx-prism admin-token [--rotate]`, sent as `Authorization: Bearer` or through `/login` (RR-S4). Five wrong tokens a minute per address get 429. Detection routes never need it.
-- A request that carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP` is never treated as this machine, so a local reverse proxy cannot skip the token.
+- Admin pages, sign-in pages and `GET /v1/config` refuse a `Host` that is not an IP address, `localhost` or an `allowed_hosts` name (DNS rebinding, RR-S1). A page opened by a name such as `https://nas.local:32169` answers 403 until the name is in `allowed_hosts`.
+- Web UI accounts: Argon2id passwords (15 to 128 characters, a common-password blocklist), server-side sessions in `__Host-` cookies (1 h idle, 12 h at most, ended on the server by Sign out), five wrong attempts a minute per address, a doubling per-account delay after 10 and disabling at 100 (`user unlock`), device cookies so a guesser cannot lock out the account's owner. A damaged accounts file closes sign-in and never reopens setup.
+- The API token (256 bits in `<data root>/auth/admin-token`, moved there from `<data root>/admin-token`, `blue-onyx-prism admin-token [--rotate]`) is for scripts only, as `Authorization: Bearer` over HTTPS (RR-S4). Five wrong tokens a minute per address get 429, counted apart from passwords. Detection routes never need it.
+- CSRF over HTTPS: a state change must come from an `https://` page of the same origin; `Sec-Fetch-Site: same-site` (a plain-HTTP page of the same host) is refused.
+- A request that carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP` is never treated as this machine (the native file dialog, the token's rotation); a forwarded address outside the local network refuses the request.
 - `download_dir`, `onnxruntime_dir` and `openvino_dir` can no longer be changed from the web UI (they choose libraries the service loads). Moving the data folder means editing the config file and restarting.
-- One-off flags (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`) are no longer written to the config file.
+- One-off flags (`--force-cpu`, `--save-ref-image`) are no longer written to the config file.
 - Uploads: 10 s read deadline, a per-address limit on bodies still arriving and a 1 GiB byte budget across in-flight uploads (503 `upload_budget`). Blue Iris's total request count is never capped.
 - URL import refuses internal addresses and hosts, by name and after resolving.
 - Windows installer: protected ACL on the data folder, the service keeps only `SeChangeNotifyPrivilege`, and the firewall rule covers the local subnet on Domain and Private networks. After an upgrade, a PC on a Public network or Blue Iris on another subnet needs the manual rule in `packaging/windows/README.md`.

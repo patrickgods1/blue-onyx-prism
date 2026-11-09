@@ -37,7 +37,6 @@ pub(super) struct ConfigView {
     https_port: String,
     tls_cert_path: String,
     tls_key_path: String,
-    allow_remote_admin: bool,
     allowed_hosts: String,
     allowed_networks: String,
     request_timeout_secs: String,
@@ -97,7 +96,6 @@ impl ConfigView {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            allow_remote_admin: c.allow_remote_admin,
             allowed_hosts: c.allowed_hosts.join(", "),
             allowed_networks: c.allowed_networks.join(", "),
             request_timeout_secs: c.request_timeout_secs.to_string(),
@@ -145,8 +143,6 @@ impl ConfigView {
                 "save_ref_image" => self.save_ref_image = v.is_some(),
                 "auto_download" | "allow_large_downloads"
                     if !form.contains_key("download_settings") => {}
-                "allow_remote_admin" if !form.contains_key("access_settings") => {}
-                "allow_remote_admin" => self.allow_remote_admin = v.is_some(),
                 "auto_download" => self.auto_download = v.is_some(),
                 "drop_person_on_plant" | "static_suppression"
                     if !form.contains_key("night_settings") => {}
@@ -650,50 +646,46 @@ fn timezone_choices(current: &str) -> Vec<TimezoneChoice> {
     out
 }
 
-/// The admin token card while `allow_remote_admin` is on. Never the token.
+/// The API token card (scripts and Prometheus, `Authorization: Bearer` over HTTPS). Never the
+/// token itself.
 pub(super) struct TokenPanel {
-    /// This machine: where the file is and how to read it, and the Rotate button.
-    local: Option<TokenFile>,
-}
-
-pub(super) struct TokenFile {
+    /// Where the file is.
     path: String,
+    /// The command that prints it on the server.
     command: String,
+    /// The Rotate button: only for a browser on the server itself ([`super::direct_local`]).
+    can_rotate: bool,
 }
 
-impl TokenFile {
-    fn of(state: &AppState) -> Self {
+impl TokenPanel {
+    fn of(state: &AppState, can_rotate: bool) -> Self {
         Self {
-            path: crate::admin_token::path(&state.config_read())
+            path: crate::admin_token::path_in(state.auth.data_root())
                 .display()
                 .to_string(),
             command: crate::admin_token::read_command(&state.config_path),
+            can_rotate,
         }
     }
 }
 
-/// The card for this request: a remote peer only gets a sign-out button.
+/// The card for this request.
 fn token_panel(
     state: &AppState,
     peer: Option<SocketAddr>,
     headers: &HeaderMap,
 ) -> Option<TokenPanel> {
-    let on = state.config_read().allow_remote_admin;
-    on.then(|| TokenPanel {
-        local: super::direct_local(peer, headers).then(|| TokenFile::of(state)),
-    })
+    Some(TokenPanel::of(state, super::direct_local(peer, headers)))
 }
 
-/// The Config page after a rotation, at the admin token card. Only this machine gets here.
+/// The Config page after a rotation, at the API token card. Only this machine gets here.
 pub(super) fn token_result(
     state: &AppState,
     message: Option<String>,
     error: Option<String>,
 ) -> Response {
     let mut t = config_template_at(state, message, error, None, "admin-token");
-    t.token_panel = Some(TokenPanel {
-        local: Some(TokenFile::of(state)),
-    });
+    t.token_panel = Some(TokenPanel::of(state, true));
     render(&t)
 }
 
@@ -710,7 +702,7 @@ pub(super) struct ConfigTemplate {
     device_choices: Vec<DeviceChoice>,
     message: Option<String>,
     error: Option<String>,
-    /// The admin token card (Server tab): set where the peer is known ([`token_panel`]).
+    /// The API token card (Server tab): set where the peer is known ([`token_panel`]).
     token_panel: Option<TokenPanel>,
     /// Resources card, grouped (Runtimes, GPU libraries, Models by family).
     pub(super) resource_groups: Vec<crate::resources::status::ResourceGroup>,
@@ -1871,13 +1863,13 @@ mod tests {
             "value=\"dfine-m\" data-confirm=\"Remove dfine-m from the config and delete its files in the models folder? Files outside it and catalog models stay.\" title=\"Remove this entry"
         ), "{html}");
 
-        // A remote peer and a cross-site page are refused; nothing changes.
-        let remote = from_peer(
+        // A request that is not signed in and a cross-site page are refused; nothing changes.
+        let remote = anonymous(from_peer(
             post_form("/config/models/remove", "name=dfine-m", false),
             REMOTE,
-        );
+        ));
         let (s, _, _) = call(&state, remote).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         let mut cross = post_form("/config/models/remove", "name=dfine-m", false);
         cross
             .headers_mut()

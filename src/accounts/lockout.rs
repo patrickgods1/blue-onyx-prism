@@ -124,6 +124,11 @@ impl UnknownNames {
             .map_or(Decision::Allow, |(s, _)| decide(s, now))
     }
 
+    /// The failure state of `name` (no failures when it is not held).
+    pub fn state(&self, name: &str) -> State {
+        self.names.get(name).map(|(s, _)| *s).unwrap_or_default()
+    }
+
     /// Count a failure of `name` at `now`, forgetting the oldest name when full.
     pub fn record_failure(&mut self, name: &str, now: u64) {
         self.seq = self.seq.wrapping_add(1);

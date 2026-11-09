@@ -858,6 +858,8 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
+            // The data root in the temp folder: the signed-in test user lives there.
+            download_dir: Some(dir.clone()),
             ..Default::default()
         };
         Arc::new(AppState::new(

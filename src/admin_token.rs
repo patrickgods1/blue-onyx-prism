@@ -1,8 +1,13 @@
-//! The admin token: what a remote peer shows to use the admin routes while `allow_remote_admin`
-//! is on (`server::auth` checks it). 256 bits of OS randomness ([`crate::secret`]) as hex in
-//! `<data root>/auth/admin-token`, made when first needed: at startup or on a config change with
-//! `allow_remote_admin` on ([`ensure_for`]), or by `blue-onyx-prism admin-token`. Nothing here is
-//! a route: the service only compares, and only the CLI prints.
+//! The API token (called the admin token in file and command names): what scripts and Prometheus
+//! send as `Authorization: Bearer` to the HTTPS port instead of signing in with an account
+//! (`server::auth` checks it). 256 bits of OS randomness ([`crate::secret`]) as hex in
+//! `<data root>/auth/admin-token`, made at every start when missing ([`ensure_for`]) or by
+//! `blue-onyx-prism admin-token`. Nothing here is a route: the service only compares, and only
+//! the CLI prints.
+//!
+//! Earlier versions also accepted it in a `bop_admin` cookie over plain HTTP when
+//! `allow_remote_admin` was on, so it may have been seen on the network: the first start of this
+//! version with that key in the config rotates it once ([`rotate_once_after_remote_admin`]).
 //!
 //! The file is the one source. The service reads it on every check ([`read`]), so a rotation by
 //! another process applies at once and there is no cache to get stale; a file that is missing,
@@ -66,7 +71,13 @@ impl AdminToken {
 /// Where the token of `config` lives: `<data root>/auth/admin-token`, the same for the service
 /// and the CLI. No I/O; [`prepare`] makes the folder and moves an old file.
 pub fn path(config: &Config) -> PathBuf {
-    crate::private_dir::path(&config.data_root()).join(FILE_NAME)
+    path_in(&config.data_root())
+}
+
+/// The token's path under the data root `data_root` (the service checks the one of the data root
+/// it started with, `accounts::Auth::data_root`).
+pub fn path_in(data_root: &Path) -> PathBuf {
+    crate::private_dir::path(data_root).join(FILE_NAME)
 }
 
 /// Where earlier versions kept it: `<data root>/admin-token`.
@@ -177,8 +188,8 @@ fn load(path: &Path) -> Result<Option<AdminToken>> {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
     if !is_token {
         bail!(
-            "{} does not hold an admin token (64 hexadecimal characters), so no remote peer can \
-             sign in; it was probably edited by hand. Replace it with `blue-onyx-prism \
+            "{} does not hold an admin token (64 hexadecimal characters), so no request passes \
+             with the API token; it was probably edited by hand. Replace it with `blue-onyx-prism \
              admin-token --rotate`",
             path.display()
         );
@@ -188,7 +199,7 @@ fn load(path: &Path) -> Result<Option<AdminToken>> {
 
 fn unreadable(path: &Path, e: &std::io::Error) -> anyhow::Error {
     anyhow::anyhow!(
-        "could not read the admin token in {} ({e}), so no remote peer can sign in; run this as \
+        "could not read the admin token in {} ({e}), so no request passes with the API token; run this as \
          the service's account, or replace the file with `blue-onyx-prism admin-token --rotate`",
         path.display()
     )
@@ -199,8 +210,8 @@ pub fn read(path: &Path) -> Result<AdminToken> {
     match load(path)? {
         Some(t) => Ok(t),
         None => bail!(
-            "{} does not exist, so no remote peer can sign in; it is made when \
-             allow_remote_admin is turned on, or by `blue-onyx-prism admin-token`",
+            "{} does not exist, so no request passes with the API token; it is made at the \
+             service's start, or by `blue-onyx-prism admin-token`",
             path.display()
         ),
     }
@@ -234,30 +245,50 @@ pub fn ensure(path: &Path) -> Result<(AdminToken, bool)> {
     Ok((read(path)?, true))
 }
 
-/// Make the token when `config` needs one, and move a token of an earlier version into `auth/`
-/// ([`prepare`]) whatever the setting. A failure is logged and leaves remote administration
-/// closed (the check fails on a missing file); detection and this machine are not affected.
+/// Make the token when there is none, after moving a token of an earlier version into `auth/`
+/// ([`prepare`]). A failure is logged and leaves the token closed (the check fails on a missing
+/// file); sign-in with an account and detection are not affected.
 pub fn ensure_for(config: &Config) {
-    // An old file moves whatever the setting, so no copy stays in the data root; otherwise
-    // nothing is made while remote administration is off.
-    if !config.allow_remote_admin && !old_path(config).exists() {
-        return;
-    }
     let path = match prepare(config) {
         Ok(p) => p,
         Err(e) => {
-            warn!("remote administration stays closed: {e:#}");
+            warn!("the API token is not available (Bearer requests are refused): {e:#}");
             return;
         }
     };
-    if !config.allow_remote_admin {
-        return;
-    }
     match ensure(&path) {
-        Ok((_, true)) => info!(path = %path.display(), "created the admin token"),
+        Ok((_, true)) => info!(path = %path.display(), "created the API token"),
         Ok((_, false)) => {}
-        Err(e) => warn!("remote administration stays closed: {e:#}"),
+        Err(e) => warn!("the API token is not available (Bearer requests are refused): {e:#}"),
     }
+}
+
+/// The marker in `auth/` that the one-time rotation of [`rotate_once_after_remote_admin`] was
+/// done.
+pub const ROTATED_MARKER: &str = ".token-rotated-v1";
+
+/// When `config` (as read from its file) still has the retired `allow_remote_admin: true` and
+/// this data root has no [`ROTATED_MARKER`] yet: rotate the token once (earlier versions sent it
+/// in a cookie over plain HTTP, so it may have been seen on the network), then write the marker.
+/// True when it rotated now. Without that key, or with the marker, nothing happens.
+pub fn rotate_once_after_remote_admin(config: &Config) -> Result<bool> {
+    if !config.allow_remote_admin {
+        return Ok(false);
+    }
+    let path = prepare(config)?;
+    let auth = path
+        .parent()
+        .context("the admin token file has no parent folder")?;
+    if auth.join(ROTATED_MARKER).exists() {
+        return Ok(false);
+    }
+    rotate(&path)?;
+    crate::private_dir::write_file(
+        auth,
+        ROTATED_MARKER,
+        "The API token was rotated once by the upgrade that retired allow_remote_admin.\n",
+    )?;
+    Ok(true)
 }
 
 /// `blue-onyx-prism admin-token [--rotate]` for `config`: the token to print (made when there is
@@ -399,19 +430,53 @@ mod tests {
         assert_eq!(migrate(&d.join("none"), &p).unwrap(), Migrated::Nothing);
     }
 
+    /// The service makes the token at every start, and moves an old one first.
     #[test]
-    fn the_service_moves_an_old_token_even_with_remote_admin_off() {
+    fn the_service_ensures_the_token_and_moves_an_old_one() {
         let d = dir();
-        let mut config = config_in(&d);
+        let config = config_in(&d);
         ensure_for(&config);
-        assert!(!d.join("auth").exists(), "nothing made while off");
+        let made = read(&path(&config)).unwrap();
+        ensure_for(&config);
+        assert_eq!(
+            read(&path(&config)).unwrap().reveal(),
+            made.reveal(),
+            "kept"
+        );
+        let d = dir();
+        let config = config_in(&d);
         std::fs::write(old_path(&config), "ab".repeat(32)).unwrap();
         ensure_for(&config);
         assert!(!old_path(&config).exists());
         assert_eq!(read(&path(&config)).unwrap().reveal(), "ab".repeat(32));
-        config.allow_remote_admin = true;
+    }
+
+    /// An old config with `allow_remote_admin: true` rotates the token once (marker), never again,
+    /// and a config without the key never does.
+    #[test]
+    fn remote_admin_in_an_old_config_rotates_the_token_once() {
+        let d = dir();
+        let mut config = config_in(&d);
+        std::fs::write(old_path(&config), "ab".repeat(32)).unwrap();
         ensure_for(&config);
+        assert!(
+            !rotate_once_after_remote_admin(&config).unwrap(),
+            "key absent"
+        );
         assert_eq!(read(&path(&config)).unwrap().reveal(), "ab".repeat(32));
+        config.allow_remote_admin = true;
+        assert!(rotate_once_after_remote_admin(&config).unwrap());
+        let new = read(&path(&config)).unwrap();
+        assert_ne!(new.reveal(), "ab".repeat(32));
+        let marker = path(&config).parent().unwrap().join(ROTATED_MARKER);
+        assert!(marker.is_file());
+        assert!(
+            !std::fs::read_to_string(&marker)
+                .unwrap()
+                .contains(new.reveal())
+        );
+        assert!(!rotate_once_after_remote_admin(&config).unwrap(), "once");
+        assert_eq!(read(&path(&config)).unwrap().reveal(), new.reveal());
     }
 
     #[test]

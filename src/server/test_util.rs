@@ -82,9 +82,50 @@ pub(super) const PUBLIC: &str = "203.0.113.5:50000";
 /// The `Host` every real HTTP/1.1 client sends; added by [`from_peer`] when a test did not.
 pub(super) const TEST_HOST: &str = "localhost:32168";
 
+/// The account every [`test_state`] has ([`seed_tester`]).
+pub(crate) const TEST_USER: &str = "tester";
+/// Its password.
+pub(crate) const TEST_PASSWORD: &str = "a long test passphrase";
+/// The id of its live session, which [`from_peer`] puts in the cookie of every request unless
+/// the request says otherwise.
+pub(crate) const TEST_SESSION: &str =
+    "7e57c0de7e57c0de7e57c0de7e57c0de7e57c0de7e57c0de7e57c0de7e57c0de";
+
+/// A request extension: [`from_peer`] adds no session cookie.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Anonymous;
+
+/// Under `cfg(test)`, `AppState::new` calls this: when `data_root` is a test's temp folder, it
+/// gets `users.json` with [`TEST_USER`] (a cheap test hash of [`TEST_PASSWORD`], through the real
+/// store) and `auth` a live session [`TEST_SESSION`], so the real session check runs on every
+/// signed-in test request. Any other data root (a state made with `Config::default()`) is left
+/// alone: tests never write outside the temp folder.
+pub(crate) fn seed_tester(data_root: &std::path::Path, auth: &crate::accounts::Auth) {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if !data_root.starts_with(std::env::temp_dir()) {
+        return;
+    }
+    let hash = HASH.get_or_init(|| {
+        let permit = crate::accounts::password::acquire(std::time::Duration::from_secs(60))
+            .expect("a hashing permit");
+        crate::accounts::password::hash(TEST_PASSWORD, &permit).unwrap()
+    });
+    let now = crate::accounts::now();
+    // Made here, so the store finds it existing: on Windows a new `auth` folder gets its ACL from
+    // `icacls`, a process per test state (`private_dir`'s own tests cover that).
+    let _ = std::fs::create_dir_all(crate::private_dir::path(data_root));
+    let store = crate::accounts::Store::open(data_root);
+    if store.load().ok().flatten().is_none() {
+        store.add_hashed(TEST_USER, hash.clone(), now).unwrap();
+    }
+    auth.sessions.insert_known(TEST_SESSION, TEST_USER, 1, now);
+}
+
 /// `req` as if it came from `peer` (what `serve_on` adds), unless it already names one, over
 /// [`Transport::Tls`] unless it is already marked, with a `Host` header when it has none
-/// (hyper's requests always carry one).
+/// (hyper's requests always carry one), and signed in as [`TEST_USER`] (the
+/// [`TEST_SESSION`] cookie) unless it carries a `Cookie` or `Authorization` header already, is
+/// marked [`Anonymous`] or arrives on the plain port.
 pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
     let ext = req.extensions_mut();
     if ext.get::<Transport>().is_none() {
@@ -98,11 +139,94 @@ pub(crate) fn from_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
             peer.parse().unwrap(),
         ));
     }
+    let anonymous =
+        ext.get::<Anonymous>().is_some() || ext.get::<Transport>() == Some(&Transport::Plain);
     if !req.headers().contains_key(header::HOST) {
         req.headers_mut()
             .insert(header::HOST, header::HeaderValue::from_static(TEST_HOST));
     }
+    let shows = req.headers().contains_key(header::COOKIE)
+        || req.headers().contains_key(header::AUTHORIZATION);
+    if !anonymous && !shows {
+        req.headers_mut().insert(
+            header::COOKIE,
+            format!("{}={TEST_SESSION}", crate::accounts::cookies::SESSION)
+                .parse()
+                .unwrap(),
+        );
+    }
     req
+}
+
+/// `req` with no credential: the seeded cookie (and any other) removed, and kept off.
+pub(crate) fn anonymous(mut req: Request<Body>) -> Request<Body> {
+    req.headers_mut().remove(header::COOKIE);
+    req.extensions_mut().insert(Anonymous);
+    req
+}
+
+/// `req` on the plain HTTP port, with no cookie.
+pub(crate) fn plain(mut req: Request<Body>) -> Request<Body> {
+    req.extensions_mut().insert(Transport::Plain);
+    anonymous(req)
+}
+
+/// `req` from `peer` (replacing what it named); [`PUBLIC`] is also [`anonymous`].
+pub(crate) fn as_peer(mut req: Request<Body>, peer: &str) -> Request<Body> {
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(
+            peer.parse().unwrap(),
+        ));
+    if peer == PUBLIC { anonymous(req) } else { req }
+}
+
+/// `req` with the session cookie `id` instead of the seeded one.
+pub(crate) fn with_session(mut req: Request<Body>, id: &str) -> Request<Body> {
+    req.headers_mut().insert(
+        header::COOKIE,
+        format!("{}={id}", crate::accounts::cookies::SESSION)
+            .parse()
+            .unwrap(),
+    );
+    req
+}
+
+/// `req` with `Authorization: Bearer <token>` and no cookie.
+pub(crate) fn bearer(mut req: Request<Body>, token: &str) -> Request<Body> {
+    req.headers_mut().remove(header::COOKIE);
+    req.extensions_mut().insert(Anonymous);
+    req.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    req
+}
+
+/// A router over `state` whose HTTPS listener counts as up on `port` (the plain port's redirect
+/// needs it).
+pub(super) fn router_with_https(state: &Arc<AppState>, port: Option<u16>) -> Router {
+    let shared = Shared::new(state.clone());
+    shared.https_port().set(port);
+    router(shared)
+}
+
+/// `req` through [`router_with_https`].
+pub(super) async fn call_with_https(
+    state: &Arc<AppState>,
+    port: Option<u16>,
+    req: Request<Body>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let resp = router_with_https(state, port)
+        .oneshot(from_peer(req, LOCAL))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, body)
 }
 
 /// `/v1/vision/custom/list` names through `app`.

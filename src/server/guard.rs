@@ -1,20 +1,24 @@
 //! Request guards of the router: the network rule at accept and on every request ([`admit`],
 //! [`network_rule`]; the rule itself is [`super::network`]), the admin routes' cross-site check
-//! (SV-01), their `Host` check against DNS rebinding and the security response headers (SV-09).
+//! (SV-01), their `Host` check against DNS rebinding, the security response headers (SV-09) and
+//! the clearing of the earlier versions' `bop_admin` cookie ([`legacy_cookie`]).
 //!
 //! # Cross-site requests (CSRF)
 //!
-//! A loopback peer needs no login (with `allow_remote_admin`, a remote peer needs the admin
-//! token, which a browser then sends by itself: [`super::auth`]), and may change the config, start
-//! downloads or restart the server. A web page on any site can make
-//! the admin's browser send such a request (an auto-submitted form needs no CORS preflight),
-//! so [`csrf`] refuses a state-changing request (POST/PUT/PATCH/DELETE) that a browser marks as
-//! coming from another site:
+//! A signed-in browser sends its session cookie by itself ([`super::auth`]; `SameSite=Strict`
+//! keeps it off cross-site requests, and this is the second line), and may change the config,
+//! start downloads or restart the server. A web page on any site can make the admin's browser
+//! send such a request (an auto-submitted form needs no CORS preflight), so [`csrf`] refuses a
+//! state-changing request (POST/PUT/PATCH/DELETE) that a browser marks as coming from another
+//! site:
 //!
 //! - `Sec-Fetch-Site: cross-site` (every current browser sends the header);
+//! - over HTTPS, also `Sec-Fetch-Site: same-site`: a plain-HTTP page of the same host (the
+//!   detection port, another service on port 80) is same-site, and anyone on the LAN can inject
+//!   into plain HTTP;
 //! - an `Origin` (else `Referer`) header whose scheme authority is not the request's `Host`
-//!   (`Origin: null` counts as foreign unless the browser marks the request
-//!   `Sec-Fetch-Site: same-origin`; `Host` must be present).
+//!   (over HTTPS the scheme must be `https`; `Origin: null` counts as foreign unless the browser
+//!   marks the request `Sec-Fetch-Site: same-origin`; `Host` must be present).
 //!
 //! A plain HTML form POST from a page served with `Referrer-Policy: no-referrer` carries
 //! `Origin: null` even to its own origin (the Fetch spec ties the serialized origin to the
@@ -35,11 +39,13 @@
 //! to the same site, so it lets the page's scripts read the answers, and every request carries
 //! `Host: rebind.attacker.test:32168` with `Origin: http://rebind.attacker.test:32168`, or
 //! `Sec-Fetch-Site: same-origin`: `Origin` equals `Host` because the two come from the same
-//! lie. The TCP peer is the victim's own machine, so the loopback rule passes too.
+//! lie. The TCP peer is the victim's own machine or LAN, so the network rule passes too. The
+//! session cookie is not sent to the attacker's name, but the page could still use the login
+//! form, or a session it makes there, against the real server.
 //!
 //! Only the name itself gives the attack away: it needs a DNS name the attacker controls. So
 //! [`foreign_host`], applied by `admin_only` to every admin route and every method (and to
-//! `/login` and `/logout`), passes an
+//! `/login`, `/logout` and `/setup`, and by the plain port before it redirects), passes an
 //! IP literal (nothing to rebind, so LAN administration by address keeps working), `localhost`,
 //! and the names listed in `allowed_hosts`, and refuses any other name. It reads the `Host`
 //! header, else the URI authority (HTTP/2). A request with neither passes: a browser always
@@ -72,6 +78,10 @@ pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: blob:; st
 pub(crate) enum CrossSite {
     /// `Sec-Fetch-Site: cross-site`.
     FetchSite,
+    /// `Sec-Fetch-Site: same-site` over HTTPS (a plain-HTTP page of this host).
+    SameSite,
+    /// `Origin`/`Referer` (the field) is not `https` on the HTTPS port.
+    Scheme(String),
     /// `Host` missing.
     NoHost,
     /// `Origin`/`Referer` (first field) names another authority than `Host` (second field).
@@ -82,6 +92,15 @@ impl std::fmt::Display for CrossSite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CrossSite::FetchSite => write!(f, "the browser marked the request as cross-site"),
+            CrossSite::SameSite => write!(
+                f,
+                "the browser marked the request as coming from another page of this host \
+                 (same-site), such as a plain-HTTP one"
+            ),
+            CrossSite::Scheme(origin) => write!(
+                f,
+                "the request comes from a page that is not HTTPS ({origin})"
+            ),
             CrossSite::NoHost => write!(f, "the request has no Host header"),
             CrossSite::Mismatch(origin, host) => write!(
                 f,
@@ -131,11 +150,15 @@ pub(crate) fn fetch_site_cross(headers: &HeaderMap) -> bool {
 }
 
 /// The cross-site decision for the request headers of a state-changing request (see the
-/// module doc). `Ok` passes.
-pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
+/// module doc), `tls` when it arrived on the HTTPS port. `Ok` passes.
+pub(crate) fn cross_site(headers: &HeaderMap, tls: bool) -> Result<(), CrossSite> {
     let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if fetch_site_cross(headers) {
         return Err(CrossSite::FetchSite);
+    }
+    let fetch_site = text("sec-fetch-site").map(str::trim);
+    if tls && fetch_site.is_some_and(|v| v.eq_ignore_ascii_case("same-site")) {
+        return Err(CrossSite::SameSite);
     }
     let Some(host) = text("host").map(str::trim).filter(|h| !h.is_empty()) else {
         return Err(CrossSite::NoHost);
@@ -144,14 +167,16 @@ pub(crate) fn cross_site(headers: &HeaderMap) -> Result<(), CrossSite> {
     let Some(source) = source.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let same_origin =
-        text("sec-fetch-site").is_some_and(|v| v.trim().eq_ignore_ascii_case("same-origin"));
+    let same_origin = fetch_site.is_some_and(|v| v.eq_ignore_ascii_case("same-origin"));
     if source.eq_ignore_ascii_case("null") && same_origin {
         return Ok(());
     }
     let Some((scheme, auth)) = authority(source) else {
         return Err(CrossSite::Mismatch(source.to_string(), host.to_string()));
     };
+    if tls && scheme != "https" {
+        return Err(CrossSite::Scheme(format!("{scheme}://{auth}")));
+    }
     if normalize_authority(&auth, scheme) == normalize_authority(host, scheme) {
         Ok(())
     } else {
@@ -409,7 +434,8 @@ pub(super) async fn csrf(req: axum::extract::Request, next: Next) -> Response {
     ) {
         return next.run(req).await;
     }
-    let why = match cross_site(req.headers()) {
+    let tls = req.extensions().get::<super::Transport>() == Some(&super::Transport::Tls);
+    let why = match cross_site(req.headers(), tls) {
         Ok(()) => return next.run(req).await,
         Err(why) => why,
     };
@@ -420,6 +446,24 @@ pub(super) async fn csrf(req: axum::extract::Request, next: Next) -> Response {
          a non-browser client."
     );
     forbidden(req.headers(), msg)
+}
+
+/// Middleware of the whole router (outside the network rule): every answer on the plain port, and
+/// every HTTPS answer to a request that still sends it, clears the `bop_admin` cookie of earlier
+/// versions (it held the admin token, sent over plain HTTP). It is never read.
+pub(super) async fn legacy_cookie(req: axum::extract::Request, next: Next) -> Response {
+    let plain = req.extensions().get::<super::Transport>() != Some(&super::Transport::Tls);
+    let sent = plain
+        || req.headers().get_all(header::COOKIE).iter().any(|v| {
+            crate::accounts::cookies::value(v.as_bytes(), crate::accounts::cookies::LEGACY_ADMIN)
+                .is_some()
+        });
+    let mut resp = next.run(req).await;
+    if sent && let Ok(v) = HeaderValue::from_str(&crate::accounts::cookies::cleared_legacy_admin())
+    {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    resp
 }
 
 /// `map_response` middleware of the whole router (see the module doc).
@@ -454,6 +498,11 @@ pub(super) async fn security_headers(mut resp: Response) -> Response {
 mod tests {
     use super::*;
 
+    /// [`cross_site`] as on the plain port (the scheme is not checked).
+    fn cross_site_plain(h: &HeaderMap) -> Result<(), CrossSite> {
+        cross_site(h, false)
+    }
+
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
         for (k, v) in pairs {
@@ -468,30 +517,30 @@ mod tests {
     #[test]
     fn same_origin_and_headerless_requests_pass() {
         let host = ("host", "localhost:32168");
-        assert_eq!(cross_site(&headers(&[host])), Ok(()));
+        assert_eq!(cross_site_plain(&headers(&[host])), Ok(()));
         assert_eq!(
-            cross_site(&headers(&[host, ("origin", "http://localhost:32168")])),
+            cross_site_plain(&headers(&[host, ("origin", "http://localhost:32168")])),
             Ok(())
         );
         assert_eq!(
-            cross_site(&headers(&[host, ("origin", "HTTP://LocalHost:32168")])),
+            cross_site_plain(&headers(&[host, ("origin", "HTTP://LocalHost:32168")])),
             Ok(())
         );
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 host,
                 ("referer", "http://localhost:32168/config#models")
             ])),
             Ok(())
         );
         assert_eq!(
-            cross_site(&headers(&[host, ("sec-fetch-site", "same-origin")])),
+            cross_site_plain(&headers(&[host, ("sec-fetch-site", "same-origin")])),
             Ok(())
         );
         // A form POST from a page served with `Referrer-Policy: no-referrer` (an old page):
         // `Origin: null`, but the browser vouches that it is same-origin.
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 host,
                 ("origin", "null"),
                 ("sec-fetch-site", "same-origin")
@@ -500,21 +549,21 @@ mod tests {
         );
         // Default ports: `http://host` is `host:80`; TLS behind a proxy that keeps Host.
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 ("host", "cam.local"),
                 ("origin", "http://cam.local:80")
             ])),
             Ok(())
         );
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 ("host", "cam.local"),
                 ("origin", "https://cam.local:443")
             ])),
             Ok(())
         );
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 ("host", "[::1]:32168"),
                 ("origin", "http://[::1]:32168")
             ])),
@@ -522,7 +571,7 @@ mod tests {
         );
         // Origin wins over Referer.
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 host,
                 ("origin", "http://localhost:32168"),
                 ("referer", "http://evil.example/")
@@ -535,11 +584,11 @@ mod tests {
     fn foreign_requests_are_refused() {
         let host = ("host", "localhost:32168");
         assert_eq!(
-            cross_site(&headers(&[host, ("sec-fetch-site", "cross-site")])),
+            cross_site_plain(&headers(&[host, ("sec-fetch-site", "cross-site")])),
             Err(CrossSite::FetchSite)
         );
         assert_eq!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 host,
                 ("origin", "http://localhost:32168"),
                 ("sec-fetch-site", "Cross-Site")
@@ -547,7 +596,7 @@ mod tests {
             Err(CrossSite::FetchSite)
         );
         assert_eq!(
-            cross_site(&headers(&[host, ("origin", "http://evil.example")])),
+            cross_site_plain(&headers(&[host, ("origin", "http://evil.example")])),
             Err(CrossSite::Mismatch(
                 "evil.example".into(),
                 "localhost:32168".into()
@@ -556,23 +605,96 @@ mod tests {
         // Another port of the same host is another origin; so is `null`; so is another name
         // than the Host. (A DNS-rebound page is not caught here: its Origin equals its Host,
         // see the module doc. `foreign_host` stops it.)
-        assert!(cross_site(&headers(&[host, ("origin", "http://localhost:8080")])).is_err());
-        assert!(cross_site(&headers(&[host, ("origin", "null")])).is_err());
+        assert!(cross_site_plain(&headers(&[host, ("origin", "http://localhost:8080")])).is_err());
+        assert!(cross_site_plain(&headers(&[host, ("origin", "null")])).is_err());
         assert!(
-            cross_site(&headers(&[
+            cross_site_plain(&headers(&[
                 host,
                 ("origin", "null"),
                 ("sec-fetch-site", "same-site")
             ]))
             .is_err()
         );
-        assert!(cross_site(&headers(&[host, ("referer", "http://attacker.test/x")])).is_err());
-        assert!(cross_site(&headers(&[host, ("origin", "file://x")])).is_err());
+        assert!(
+            cross_site_plain(&headers(&[host, ("referer", "http://attacker.test/x")])).is_err()
+        );
+        assert!(cross_site_plain(&headers(&[host, ("origin", "file://x")])).is_err());
         assert_eq!(
-            cross_site(&headers(&[("origin", "http://localhost:32168")])),
+            cross_site_plain(&headers(&[("origin", "http://localhost:32168")])),
             Err(CrossSite::NoHost)
         );
-        assert_eq!(cross_site(&headers(&[])), Err(CrossSite::NoHost));
+        assert_eq!(cross_site_plain(&headers(&[])), Err(CrossSite::NoHost));
+    }
+
+    /// Over HTTPS the page must be HTTPS too, and a same-site page (plain HTTP on this host,
+    /// which anyone on the LAN can inject into) is refused; header-less clients still pass.
+    #[test]
+    fn over_https_the_origin_must_be_https_and_same_site_is_refused() {
+        let host = ("host", "192.168.1.5:32169");
+        let tls = |pairs: &[(&str, &str)]| cross_site(&headers(pairs), true);
+        assert_eq!(
+            tls(&[host, ("origin", "https://192.168.1.5:32169")]),
+            Ok(())
+        );
+        assert_eq!(
+            tls(&[host, ("origin", "HTTPS://192.168.1.5:32169")]),
+            Ok(())
+        );
+        assert_eq!(
+            tls(&[host, ("referer", "https://192.168.1.5:32169/config#x")]),
+            Ok(())
+        );
+        assert_eq!(tls(&[host, ("sec-fetch-site", "same-origin")]), Ok(()));
+        assert_eq!(
+            tls(&[host, ("origin", "null"), ("sec-fetch-site", "same-origin")]),
+            Ok(())
+        );
+        assert_eq!(tls(&[host]), Ok(()));
+        assert_eq!(
+            cross_site(
+                &headers(&[("host", "cam.local"), ("origin", "https://cam.local:443")]),
+                true
+            ),
+            Ok(())
+        );
+        // The same address over plain HTTP, its plain port, or a same-site page: refused.
+        assert_eq!(
+            tls(&[host, ("origin", "http://192.168.1.5:32169")]),
+            Err(CrossSite::Scheme("http://192.168.1.5:32169".into()))
+        );
+        assert!(matches!(
+            tls(&[host, ("referer", "http://192.168.1.5:32168/x")]),
+            Err(CrossSite::Scheme(_))
+        ));
+        assert_eq!(
+            tls(&[host, ("sec-fetch-site", "same-site")]),
+            Err(CrossSite::SameSite)
+        );
+        assert_eq!(
+            tls(&[
+                host,
+                ("origin", "https://192.168.1.5:32169"),
+                ("sec-fetch-site", "Same-Site")
+            ]),
+            Err(CrossSite::SameSite)
+        );
+        // Another HTTPS origin is still a mismatch.
+        assert!(matches!(
+            tls(&[host, ("origin", "https://192.168.1.5:8443")]),
+            Err(CrossSite::Mismatch(..))
+        ));
+        // The plain port keeps the old rule (it never reaches a state-changing route anyway).
+        assert_eq!(
+            cross_site(
+                &headers(&[
+                    ("host", "192.168.1.5:32168"),
+                    ("origin", "http://192.168.1.5:32168"),
+                    ("sec-fetch-site", "same-site")
+                ]),
+                false
+            ),
+            Ok(())
+        );
     }
 
     #[test]

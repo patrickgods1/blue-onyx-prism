@@ -455,12 +455,16 @@ mod tests {
             form("/v1/benchmark/history/delete", "all=1"),
         ] {
             let uri = req.uri().to_string();
-            let req = crate::server::test_util::from_peer(req, "10.0.0.5:40000");
+            // Not signed in (rewritten from "a remote peer": every address needs a sign-in now).
+            let req = crate::server::test_util::anonymous(crate::server::test_util::from_peer(
+                req,
+                "10.0.0.5:40000",
+            ));
             let resp = crate::server::router(st.clone())
                 .oneshot(req)
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
     }
 

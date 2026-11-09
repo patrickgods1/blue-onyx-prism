@@ -35,7 +35,9 @@ cargo build --release --locked --bins
 - Application event log source `BlueOnyxPrism`, firewall rules `Blue Onyx Prism (<PORT>)` and
   `Blue Onyx Prism HTTPS (<HTTPS_PORT>)` (see below), Start Menu shortcuts "Blue Onyx Prism" (the tray icon app) and
   "Blue Onyx Prism Web UI" (`https://localhost:32169/`; the browser warns once about the self-signed certificate, compare
-  its SHA-256 fingerprint with `blue-onyx-prism.exe --config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json tls-fingerprint`).
+  its SHA-256 fingerprint with `blue-onyx-prism.exe --config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json tls-fingerprint`;
+  the first account is created there with the one-time code that the same command with `setup-code` prints, from an
+  administrator terminal).
 - Tray app: `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\BlueOnyxPrismTray` starts it at login for every user.
   A running tray is terminated (WiX `CloseApplication`) before an upgrade or uninstall replaces/removes its exe. The
   installer does not launch it at the end (it starts at the next login or from the Start Menu).

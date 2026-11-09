@@ -1,6 +1,6 @@
 //! Live config for the pages:
-//! - `GET /v1/config`: for an admin peer (this machine, or a remote peer with the admin token while
-//!   `allow_remote_admin` is on; under an allowed `Host`) the effective config, its
+//! - `GET /v1/config`: for a signed-in request over HTTPS (a session or the API token, under an
+//!   allowed `Host`) the effective config, its
 //!   revision and change log, per model what is configured vs what the running worker uses,
 //!   what a restart would apply, and the main form's field values the Config page refreshes
 //!   untouched fields from (ETag / If-None-Match); for anyone else only the revision,
@@ -793,9 +793,10 @@ pub(super) fn answers_built(state: &Arc<AppState>) -> u64 {
 }
 
 /// `GET /v1/config` with a weak ETag over the payload (If-None-Match answers 304). The full
-/// [`build_payload`] for admin peers, [`minimal_payload`] for everyone else (SV-05). Nobody is refused:
-/// the pages' poller reads this route, so a missing or wrong token gets the minimal answer. A
-/// wrong one counts against the peer's limit, or this would be a free way to test tokens, and
+/// [`build_payload`] for a signed-in request over HTTPS (a session or the API token, the same
+/// check as `admin_only`), [`minimal_payload`] for everyone else (SV-05). Nobody is refused:
+/// the pages' poller reads this route, so a missing or wrong credential gets the minimal answer. A
+/// wrong token counts against the peer's limit, or this would be a free way to test tokens, and
 /// over the limit even the right one gets the minimal answer. Both answers are cached until
 /// something they are built from changes ([`Inputs`]), so a poll with no change only compares.
 pub(super) async fn config_json(
@@ -804,31 +805,25 @@ pub(super) async fn config_json(
         axum::extract::ConnectInfo<std::net::SocketAddr>,
         axum::extract::rejection::ExtensionRejection,
     >,
+    transport: Option<axum::Extension<super::Transport>>,
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
     let peer = peer.ok().map(|c| c.0);
     // This route is open, so `admin_only` never runs: the same checks here, or a DNS-rebound
-    // page on this machine could read the admin payload (see `guard`).
-    let (allow_remote, foreign) = {
+    // page could read the admin payload (see `guard`). The plain port never gets it: no
+    // credential is accepted there.
+    let foreign = {
         let c = state.config_read();
-        (
-            c.allow_remote_admin,
-            super::guard::foreign_host(&headers, &uri, &c.allowed_hosts),
-        )
+        super::guard::foreign_host(&headers, &uri, &c.allowed_hosts)
     };
-    let mut stale_cookie = false;
-    let admin = if foreign.is_some() {
-        false
-    } else if super::direct_local(peer, &headers) {
-        true
-    } else if allow_remote {
-        let checked = super::auth::verify(&state, peer, &headers).await;
-        stale_cookie = checked.stale_cookie();
-        checked.verdict == super::auth::Verdict::Valid
-    } else {
-        false
-    };
+    let tls = transport.is_some_and(|t| t.0 == super::Transport::Tls);
+    let admin = tls
+        && foreign.is_none()
+        && matches!(
+            super::auth::authenticate(&state, peer, &headers).await,
+            super::auth::Outcome::SignedIn(_)
+        );
     let answer = if admin {
         // Reads the config file when it changed on disk, `benchmark.json`, and probes devices.
         super::blocking(move || full_answer(&state)).await
@@ -842,7 +837,7 @@ pub(super) async fn config_json(
             v.split(',')
                 .any(|t| t.trim().as_bytes() == answer.etag.as_bytes())
         });
-    let mut resp = if matches {
+    if matches {
         (
             StatusCode::NOT_MODIFIED,
             [
@@ -867,12 +862,7 @@ pub(super) async fn config_json(
         resp.headers_mut()
             .insert("x-config-revision", answer.revision.clone());
         resp
-    };
-    if stale_cookie {
-        resp.headers_mut()
-            .append(header::SET_COOKIE, super::auth::cleared_cookie());
     }
-    resp
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1427,12 +1417,12 @@ pub(super) mod tests {
         changed("a worker's state", &state).await;
     }
 
-    /// The minimal answer (a peer that may not administer) is cached as well, and follows the
+    /// The minimal answer (a request that is not signed in) is cached as well, and follows the
     /// store.
     #[tokio::test]
     async fn minimal_answer_is_cached() {
         let state = test_state();
-        let remote = |etag: Option<&str>| from_peer(config_get(etag), REMOTE);
+        let remote = |etag: Option<&str>| anonymous(from_peer(config_get(etag), REMOTE));
         let (s, h, b) = call(&state, remote(None)).await;
         assert_eq!(s, StatusCode::OK);
         let j: Value = serde_json::from_slice(&b).unwrap();
@@ -1440,7 +1430,11 @@ pub(super) mod tests {
         let etag = h[header::ETAG].to_str().unwrap().to_string();
         let (s, _, _) = call(&state, remote(Some(&etag))).await;
         assert_eq!(s, StatusCode::NOT_MODIFIED);
-        assert_eq!(answers_built(&state), 0, "no full answer for a remote peer");
+        assert_eq!(
+            answers_built(&state),
+            0,
+            "no full answer when not signed in"
+        );
         super::super::save_config(&state, "test", |c| {
             c.port = 4000;
             Ok(())

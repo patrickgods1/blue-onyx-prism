@@ -12,7 +12,11 @@
 //! - open loop (`--rate R --duration S`): request i is due at `i / R` seconds and starts then,
 //!   whatever is still in flight, as cameras do. Latency is measured from the scheduled start, so
 //!   a server that falls behind shows it. Reports p50/p95/p99/max, errors, 503s (overload), and
-//!   the server's resident memory read from its metrics every second (start, peak, end).
+//!   the server's resident memory read from its metrics every second (start, peak, end). The
+//!   metrics need the API token over HTTPS (`--https-port`, `--token-file` or `--config`; never
+//!   on the command line, where `ps` would show it): the client
+//!   pins the server's certificate from its file (`--cert`, or the one `--config` names), or with
+//!   `--insecure` (tests only) accepts any certificate.
 
 #![cfg_attr(
     not(test),
@@ -86,9 +90,95 @@ struct Args {
     /// Open loop: seconds to keep sending (with --rate).
     #[arg(long, requires = "rate")]
     duration: Option<f64>,
-    /// Open loop: metrics path sampled every second for the server's resident memory.
+    /// Open loop: metrics path sampled every second for the server's resident memory, over
+    /// HTTPS on --https-port with the API token.
     #[arg(long, default_value = "/prometheus")]
     metrics_path: String,
+    /// The server's HTTPS port (the metrics need it: the plain port serves detection only).
+    #[arg(long, default_value_t = blue_onyx_prism::DEFAULT_HTTPS_PORT)]
+    https_port: u16,
+    /// A file holding the API token for the metrics (`-`: read one line from stdin, e.g.
+    /// `blue-onyx-prism admin-token | test-blue-onyx-prism --token-file - ...`); default: the
+    /// token file of --config. The token is never taken from the command line itself.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+    /// The server's config file: where its API token and HTTPS certificate are (run as an
+    /// account that may read them).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The HTTPS certificate (PEM) to pin for the metrics; default: the one --config names.
+    #[arg(long)]
+    cert: Option<PathBuf>,
+    /// Accept any HTTPS certificate for the metrics (for tests on throwaway servers only; it
+    /// gives up the protection the pin gives the token).
+    #[arg(long)]
+    insecure: bool,
+}
+
+/// The client and URL that sample the server's metrics over HTTPS, with the API token as a
+/// default header; `Err` says what is missing.
+fn metrics_client(args: &Args) -> Result<(reqwest::Client, String)> {
+    let base = reqwest::Url::parse(&args.url).with_context(|| format!("--url {}", args.url))?;
+    // `host_str` keeps an IPv6 address's brackets.
+    let Some(host) = base.host_str().map(str::to_string) else {
+        bail!("--url {} has no host", args.url);
+    };
+    let config = args
+        .config
+        .as_deref()
+        .map(blue_onyx_prism::config::Config::load)
+        .transpose()?;
+    let token = match (&args.token_file, &config) {
+        (Some(p), _) if p.as_os_str() == "-" => {
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .context("reading the API token from stdin")?;
+            line.trim().to_string()
+        }
+        (Some(p), _) => blue_onyx_prism::admin_token::read(p)?.reveal().to_string(),
+        (None, Some(c)) => {
+            let path = blue_onyx_prism::admin_token::path(c);
+            blue_onyx_prism::admin_token::read(&path)?
+                .reveal()
+                .to_string()
+        }
+        (None, None) => bail!(
+            "the metrics need the API token: pass --token-file <file> (or `-` for stdin) or \
+             --config <the server's config file>"
+        ),
+    };
+    if token.is_empty() {
+        bail!("the API token read for the metrics is empty");
+    }
+    let builder = if args.insecure {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+    } else {
+        let cert = match (&args.cert, &config) {
+            (Some(p), _) => p.clone(),
+            (None, Some(c)) => blue_onyx_prism::tls::cert_path(c),
+            (None, None) => bail!(
+                "the metrics are HTTPS with a self-signed certificate: pass --cert <its PEM \
+                 file> or --config <the server's config file>, or --insecure on a test server"
+            ),
+        };
+        blue_onyx_prism::tls::pinned_client(&cert)?
+    };
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .context("the API token is not a header value")?;
+    auth.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    let client = builder
+        .default_headers(headers)
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    Ok((
+        client,
+        format!("https://{host}:{}{}", args.https_port, args.metrics_path),
+    ))
 }
 
 /// When each open-loop request is due: `i / rate` seconds for every `i` with `i / rate <
@@ -244,7 +334,11 @@ async fn sample_rss(
             _ = stop.cancelled() => break,
             _ = tick.tick() => {}
         }
+        if url.is_empty() {
+            continue;
+        }
         if let Ok(r) = client.get(&url).send().await
+            && r.status().is_success()
             && let Ok(text) = r.text().await
             && let Some(b) = parse_rss(&text)
         {
@@ -288,9 +382,16 @@ async fn run_open_loop(
     // A little ahead, so the first request is not late because tasks were still being made.
     let start = tokio::time::Instant::now() + Duration::from_millis(200);
     let stop = tokio_util::sync::CancellationToken::new();
+    let (metrics, metrics_url) = match metrics_client(args) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("server RSS will not be sampled: {e:#}");
+            (client.clone(), String::new())
+        }
+    };
     let sampler = tokio::spawn(sample_rss(
-        client.clone(),
-        format!("{base}{}", args.metrics_path),
+        metrics,
+        metrics_url.clone(),
         start,
         stop.clone(),
     ));
@@ -373,8 +474,9 @@ async fn run_open_loop(
             mb(last.1)
         ),
         _ => println!(
-            "server RSS: no samples (GET {base}{} gave no process_resident_memory_bytes)",
-            args.metrics_path
+            "server RSS: no samples (GET {metrics_url} with the API token gave no \
+             process_resident_memory_bytes; for {base}'s server pass --https-port and --token-file or \
+             --config)"
         ),
     }
     for o in outcomes.iter().filter(|o| o.ended != Ended::Ok).take(5) {

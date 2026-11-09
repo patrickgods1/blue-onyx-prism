@@ -139,12 +139,12 @@ pub enum Command {
     HfLogin,
     /// Delete the token saved by `hf-login`. `HF_TOKEN` and the `hf` CLI's own login stay.
     HfLogout,
-    /// Print the admin token other machines sign in with while `allow_remote_admin` is on (made
-    /// if there is none). Run it as the service's account, with the service's config. Stdout
-    /// holds the token and nothing else.
+    /// Print the API token scripts and Prometheus send as `Authorization: Bearer` to the HTTPS
+    /// port (made if there is none). Run it as the service's account, with the service's config.
+    /// Stdout holds the token and nothing else.
     AdminToken {
-        /// Replace the token. A running service uses the new one at once; signed-in browsers
-        /// have to sign in again.
+        /// Replace the token. A running service uses the new one at once (scripts need the new
+        /// one; browsers signed in with an account are not affected).
         #[arg(long)]
         rotate: bool,
         /// The service's config file, which says where the token lives (default:
@@ -260,10 +260,9 @@ pub struct Cli {
     /// only).
     #[arg(long)]
     pub bind_address: Option<std::net::IpAddr>,
-    /// Serve the admin pages (Config, Test, Logs, Benchmark, resources) to other machines that
-    /// show the admin token (see `admin-token`), for this run only (not written to the config;
-    /// set `allow_remote_admin` there to keep it; default: loopback clients only).
-    #[arg(long)]
+    /// Retired, accepted and ignored (with a warning): every browser, also on other machines of
+    /// the local network, signs in with an account at the HTTPS port.
+    #[arg(long, hide = true)]
     pub allow_remote_admin: bool,
     /// Model file (.xml OpenVINO IR or .onnx). Replaces the configured model list unless
     /// already present in it.
@@ -324,8 +323,8 @@ pub struct Cli {
 /// defaults), apply every CLI option that was given, validate the result
 /// ([`Config::validate`]; an invalid result is an error and the file is not written) and write
 /// it back when it differs from the file (or the file does not exist yet). The one-off flags
-/// (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`) apply to the returned config
-/// only and are never written back (`without_one_off_flags`).
+/// (`--force-cpu`, `--save-ref-image`) apply to the returned config only and are never written
+/// back (`without_one_off_flags`). The retired `--allow-remote-admin` is ignored with a warning.
 pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     let path = cli
         .config
@@ -339,6 +338,15 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     };
     let loaded = config.clone();
     let base = std::env::current_dir().context("reading current directory")?;
+    if cli.allow_remote_admin {
+        crate::logbuf::early(
+            tracing::Level::WARN,
+            "--allow-remote-admin is no longer used and was ignored: other computers on the local \
+             network sign in with an account at https://<this server>:<https_port>/ (see \
+             `blue-onyx-prism setup-code` for the first one); remove the flag"
+                .to_string(),
+        );
+    }
     merge_cli(&mut config, &cli.absolutized(&base));
     // Same names in memory as in the written file (a `--model` entry gets its file stem).
     config.fill_model_names();
@@ -420,8 +428,8 @@ pub(crate) fn seeded_model_note(name: &str, auto_download: bool) -> String {
 }
 
 /// `config` with the one-off boolean flags ([`Config::one_off_flags`]) put back to their values
-/// in `file`: what a startup write puts on disk. A test run with `--allow-remote-admin` must not
-/// leave the admin surface open on later starts. The running service's writes do the same in
+/// in `file`: what a startup write puts on disk. A test run with `--force-cpu` must not leave
+/// later starts on the CPU. The running service's writes do the same in
 /// [`crate::config_store::ConfigStore::update`].
 fn without_one_off_flags(config: &Config, file: &Config) -> Config {
     let mut out = config.clone();
@@ -430,25 +438,33 @@ fn without_one_off_flags(config: &Config, file: &Config) -> Config {
 }
 
 /// Log the settings of the starting config that widen what the service exposes or does (call
-/// once logging is up, at every start). `allow_remote_admin` is logged at warn, with where its
-/// token is and how to read it. `config_path`: the file this process serves.
+/// once logging is up, at every start). A retired `allow_remote_admin: true` in the file is
+/// logged at warn, with what replaced it. `config_path`: the file this process serves.
 pub fn log_startup_warnings(config: &Config, config_path: &Path) {
     for (what, t) in blocking_thresholds(config) {
         tracing::warn!(
             "{what} is {t}: no detection can reach it, so every request answers 0 objects; set a              threshold below 1 (0.4 to 0.6 is usual)"
         );
     }
-    if config.allow_remote_admin {
-        tracing::warn!(
-            "allow_remote_admin is on: other machines reach the admin pages and actions (config \
-             editor, file browser, downloads, model export, restarts) on port {} with the admin \
-             token, over plain HTTP, so use it only on a trusted network or behind TLS. The token \
-             is in {}; read it on this machine with: {}",
-            config.port,
-            crate::admin_token::path(config).display(),
-            crate::admin_token::read_command(config_path)
-        );
+    if let Some(w) = retired_remote_admin_warning(config, config_path) {
+        tracing::warn!("{w}");
     }
+}
+
+/// The start's warning for a config file that still has the retired `allow_remote_admin: true`
+/// (None without it): what replaced it and to remove the key.
+pub fn retired_remote_admin_warning(config: &Config, config_path: &Path) -> Option<String> {
+    config.allow_remote_admin.then(|| {
+        format!(
+            "allow_remote_admin is no longer used: other computers on the local network sign in \
+             with an account at https://<this server>:{}/ (the first one is created with the \
+             code `{}` prints; the API token is for scripts, over HTTPS only); remove the key \
+             from {}",
+            config.https_port,
+            crate::resources::hf_token::cli_command_for(config_path, "setup-code"),
+            config_path.display()
+        )
+    })
 }
 
 /// The confidence thresholds (global, per enabled model and per device profile of an enabled
@@ -650,9 +666,6 @@ fn merge_cli(config: &mut Config, cli: &Cli) {
     }
     if let Some(v) = cli.bind_address {
         config.bind_address = v;
-    }
-    if cli.allow_remote_admin {
-        config.allow_remote_admin = true;
     }
     if let Some(v) = &cli.default_model {
         config.default_model = Some(v.clone());
@@ -1596,16 +1609,16 @@ mod tests {
         let mut cfg = Config::default();
         merge_cli(&mut cfg, &cli);
         assert_eq!(cfg.bind_address.to_string(), "127.0.0.1");
-        assert!(cfg.allow_remote_admin);
+        // The retired flag still parses (old service units pass it) and changes nothing.
+        assert!(cli.allow_remote_admin);
+        assert!(!cfg.allow_remote_admin);
         // Absent flags keep the config's values.
         let mut cfg = Config {
             bind_address: "::".parse().unwrap(),
-            allow_remote_admin: true,
             ..Default::default()
         };
         merge_cli(&mut cfg, &Cli::default());
         assert_eq!(cfg.bind_address.to_string(), "::");
-        assert!(cfg.allow_remote_admin);
         assert!(Cli::try_parse_from(["x", "--bind-address", "localhost"]).is_err());
     }
 
@@ -1627,12 +1640,18 @@ mod tests {
             ..Default::default()
         };
         let (c, _) = resolve_config(&cli).unwrap();
-        // In memory: applied.
-        assert!(c.allow_remote_admin && c.force_cpu && c.save_ref_image);
+        // In memory: applied (the retired flag is not).
+        assert!(c.force_cpu && c.save_ref_image);
+        assert!(!c.allow_remote_admin);
         // On disk: the ordinary option is written, the one-off flags are not.
         let disk = Config::load(&path).unwrap();
         assert_eq!(disk.port, 5000);
         assert!(!disk.allow_remote_admin && !disk.force_cpu && !disk.save_ref_image);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("allow_remote_admin")
+        );
 
         // Flags alone do not rewrite an existing file; values set in the file stay.
         let file = Config {
@@ -1643,11 +1662,11 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         let cli = Cli {
             config: Some(path.clone()),
-            allow_remote_admin: true,
+            save_ref_image: true,
             ..Default::default()
         };
         let (c, _) = resolve_config(&cli).unwrap();
-        assert!(c.allow_remote_admin && c.force_cpu);
+        assert!(c.save_ref_image && c.force_cpu);
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let _ = std::fs::remove_file(&path);
     }
@@ -1959,7 +1978,7 @@ mod tests {
     /// as the service's start does. Memory keeps them for this run, the file never gets them.
     #[test]
     fn a_first_start_with_one_off_flags_does_not_save_them() {
-        let flags = |c: &Config| (c.allow_remote_admin, c.force_cpu, c.save_ref_image);
+        let flags = |c: &Config| (c.force_cpu, c.save_ref_image);
         for existing in [false, true] {
             let path = temp_cfg();
             if existing {
@@ -1967,39 +1986,48 @@ mod tests {
             }
             let cli = Cli {
                 config: Some(path.clone()),
-                allow_remote_admin: true,
                 force_cpu: true,
                 save_ref_image: true,
                 ..Default::default()
             };
             let (mut c, _) = resolve_config(&cli).unwrap();
             assert!(seed_default_model(&mut c, &path));
-            assert_eq!(flags(&c), (true, true, true), "this run");
+            assert_eq!(flags(&c), (true, true), "this run");
             let disk = Config::load(&path).unwrap();
             assert_eq!(disk.models.len(), 1, "the seed is saved");
-            assert_eq!(flags(&disk), (false, false, false), "existing: {existing}");
+            assert_eq!(flags(&disk), (false, false), "existing: {existing}");
         }
     }
 
-    /// The seed keeps what the file itself says: these are no one-offs.
+    /// The seed keeps what the file itself says: these are no one-offs. A retired
+    /// `allow_remote_admin` of an old file is read, and dropped by the write.
     #[test]
     fn the_seed_keeps_flags_the_file_holds() {
         let path = temp_cfg();
-        Config {
-            allow_remote_admin: true,
-            save_ref_image: true,
-            ..Default::default()
-        }
-        .save(&path)
+        std::fs::write(
+            &path,
+            r#"{"allow_remote_admin": true, "save_ref_image": true, "models": []}"#,
+        )
         .unwrap();
         let cli = Cli {
             config: Some(path.clone()),
             ..Default::default()
         };
-        let (mut c, _) = resolve_config(&cli).unwrap();
+        let (mut c, p) = resolve_config(&cli).unwrap();
+        assert!(
+            c.allow_remote_admin,
+            "read for the start's warning and token rotation"
+        );
+        let w = retired_remote_admin_warning(&c, &p).unwrap();
+        assert!(
+            w.contains("no longer used") && w.contains("setup-code"),
+            "{w}"
+        );
+        assert!(retired_remote_admin_warning(&Config::default(), &p).is_none());
         assert!(seed_default_model(&mut c, &path));
         let disk = Config::load(&path).unwrap();
-        assert!(disk.allow_remote_admin && disk.save_ref_image && !disk.force_cpu);
+        assert!(disk.save_ref_image && !disk.force_cpu);
+        assert!(!disk.allow_remote_admin);
     }
 
     #[test]

@@ -68,7 +68,8 @@ document.addEventListener("click", function (e) {
           if (bar) { if (r.progress !== null && r.progress !== undefined) bar.value = r.progress; else bar.removeAttribute("value"); }
         }
       });
-      if (changed) return swap();
+      // Chained after the poll's answer: still a poll (live.js).
+      if (changed) return PrismPoll.background(swap);
     });
   }
   // Poll while a row is busy (PrismPoll: one request at a time, none while the tab is hidden, backs

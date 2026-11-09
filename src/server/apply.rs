@@ -75,8 +75,6 @@ pub(crate) fn apply_config_locked(
     _held: &std::sync::MutexGuard<'_, ()>,
 ) -> Applied {
     let (revision, current) = state.config.snapshot();
-    // `allow_remote_admin` applies at once, so its token has to exist by then.
-    crate::admin_token::ensure_for(&current);
     let running = state.running();
     let mut next = crate::config_merge::runtime_overlay(&running, &current);
     let names = crate::config_merge::model_reloads(&running, &next);

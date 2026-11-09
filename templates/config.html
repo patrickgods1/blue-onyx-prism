@@ -207,19 +207,17 @@
 <form method="post" action="/config#at-server" class="card" id="server">
   <h2>Server</h2>
   <p class="muted">Each group (or, where its fields differ, each field) says when a change takes effect: <span class="tag now">applies now</span> on save, <span class="tag restart">needs restart</span> after a server restart (the <em>Restart server</em> button), or a restart of the process for the port and the log directory.</p>
-  <input type="hidden" name="access_settings" value="1">
   <input type="hidden" name="download_settings" value="1">
   <input type="hidden" name="inference_settings" value="1">
   <input type="hidden" name="image_settings" value="1">
 
   <fieldset class="group">
-    <legend>Network and access {{ self.badge("port,https_port,bind_address,request_timeout_secs,worker_queue_size,allow_remote_admin")|safe }}</legend>
+    <legend>Network and access {{ self.badge("port,https_port,bind_address,request_timeout_secs,worker_queue_size")|safe }}</legend>
     <label>Port {{ self.badge("port")|safe }} <input type="number" name="port" min="1" max="65535" value="{{ c.port }}" required> <span class="muted">(plain HTTP: Blue Iris and the detection API)</span></label>
     <label>HTTPS port {{ self.badge("https_port")|safe }} <input type="number" name="https_port" min="1" max="65535" value="{{ c.https_port }}" required> <span class="muted">(this web UI over HTTPS; must differ from the port)</span></label>
     <label>Bind address {{ self.badge("bind_address")|safe }} <input type="text" name="bind_address" value="{{ c.bind_address }}" placeholder="0.0.0.0" required></label>
     <label>Request timeout (s) {{ self.badge("request_timeout_secs")|safe }} <input type="number" name="request_timeout_secs" min="1" value="{{ c.request_timeout_secs }}" required></label>
     <label>Worker queue size (0 = auto) {{ self.badge("worker_queue_size")|safe }} <input type="number" name="worker_queue_size" min="0" value="{{ c.worker_queue_size }}" required></label>
-    <label class="check"><input type="checkbox" name="allow_remote_admin"{% if c.allow_remote_admin %} checked{% endif %}> Allow remote administration {{ self.badge("allow_remote_admin")|safe }} <span class="muted">(Config, Test, Logs, Benchmark and resource actions from other machines; off = this machine only. Other machines must sign in with the admin token, which goes over plain HTTP, so use this only on a trusted network or behind TLS)</span></label>
     <label><span>Allowed host names</span> {{ self.badge("allowed_hosts")|safe }} <input type="text" name="allowed_hosts" value="{{ c.allowed_hosts }}" placeholder="nas.local, prism.example.com" autocomplete="off" spellcheck="false"> <span class="muted">(comma separated, names only, no port; the names this page may be opened under, besides IP addresses and localhost. Any other name is refused, which stops a web page from reaching it through DNS rebinding. A browser on another machine that opens the server by name needs that name here to sign in)</span></label>
     <label><span>TLS certificate file</span> <input type="text" data-view="tls_cert_path" readonly value="{{ c.tls_cert_path }}" placeholder="generated: a self-signed certificate in the data root's auth folder"> <span class="muted">(config file only, with <code>tls_key_path</code>; <code>blue-onyx-prism tls-fingerprint</code> prints the fingerprint to compare with the browser's)</span></label>
     <label><span>Allowed networks</span> <input type="text" data-view="allowed_networks" readonly value="{{ c.allowed_networks }}" placeholder="none: this machine and the local network only"> <span class="muted">(config file only: this server answers loopback, private and link-local addresses, and refuses every other client; <code>allowed_networks</code> in the config file adds networks, such as a VPN's)</span></label>
@@ -300,15 +298,15 @@
 </form>
 {% if let Some(t) = token_panel %}
 <div class="card" id="admin-token">
-  <h2>Admin token</h2>
+  <h2>API token</h2>
   {% call notices("admin-token") %}{% endcall %}
-  {% if let Some(f) = t.local %}
-  <p>Other machines sign in with this token, at <code>/login</code> or with <code>Authorization: Bearer</code>. It is stored in <code>{{ f.path }}</code>; this page does not show it. Read it on this machine with:</p>
-  <p><code>{{ f.command }}</code></p>
-  <form method="post" action="/config/admin-token/rotate#admin-token" class="inline"><button type="submit" class="danger small" data-confirm="Replace the admin token? The old one stops working and every signed-in browser has to sign in again.">Rotate token</button></form>
+  <p>Scripts and Prometheus use the admin API with this token instead of an account: send <code>Authorization: Bearer &lt;token&gt;</code> to the HTTPS port (never the plain port, which refuses it). It is stored in <code>{{ t.path }}</code>; this page does not show it. Read it on the server with:</p>
+  <p><code>{{ t.command }}</code></p>
+  <p class="muted">The certificate is self-signed: point the client at it (for curl <code>--cacert</code> with the file <code>blue-onyx-prism tls-fingerprint</code> names) rather than turning verification off.</p>
+  {% if t.can_rotate %}
+  <form method="post" action="/config/admin-token/rotate#admin-token" class="inline"><button type="submit" class="danger small" data-confirm="Replace the API token? The old one stops working at once, so scripts and Prometheus need the new one.">Rotate token</button></form>
   {% else %}
-  <p>You are signed in with the admin token.</p>
-  <form method="post" action="/logout" class="inline"><button type="submit" class="small secondary">Sign out</button></form>
+  <p class="muted">Rotating it is possible from a browser on the server itself, or with <code>blue-onyx-prism admin-token --rotate</code> there.</p>
   {% endif %}
 </div>
 {% endif %}
