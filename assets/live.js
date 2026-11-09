@@ -15,26 +15,49 @@
 // Signed-in requests: every same-origin `fetch` of the pages goes through the wrapper below. A
 // request made by a poll loop (synchronously inside a PrismPoll run, inside
 // PrismPoll.background(fn), or through PrismPoll.fetch) carries `X-Prism-Poll: 1`, so it does not
-// keep the session alive (an unattended tab signs out after the idle hour); a 401 (the session
-// ended) sends the page to /login?next=<this page> instead of backing off. A 503 ("sign-in is
-// closed") stays an error for the page to show. A fetch chained after a poll's answer (inside a
-// `.then`) is no longer synchronous: poll code uses PrismPoll.fetch or PrismPoll.background for
-// it. A page load cannot carry a header, so a reload or navigation a poll makes (not the user)
-// goes through PrismPoll.navigate, which sets the short-lived `__Host-bop_poll` cookie the server
-// reads as the poll mark (and clears in its answer).
+// keep the session alive (an unattended tab signs out after the idle hour), and gives up after
+// POLL_TIMEOUT_MS (a request left hanging by a network switch would stall its loop; the abort is
+// an error, so the loop backs off). A fetch chained after a poll's answer (inside a `.then`) is no
+// longer synchronous: poll code uses PrismPoll.fetch or PrismPoll.background for it. A page load
+// cannot carry a header, so a reload or navigation a poll makes (not the user) goes through
+// PrismPoll.navigate, which sets the short-lived `__Host-bop_poll` cookie the server reads as the
+// poll mark (and clears in its answer). A 503 ("sign-in is closed") stays an error for the page
+// to show.
+// A 401 (the session ended) does not leave the page: one shared sign-in dialog opens (only while
+// the page is visible) and the refused requests wait behind it. Signed in (POST /login answers
+// JSON with the new cookies), each is sent once more and its caller gets that answer, as if the
+// first had passed (the 401 came before the server did anything). While the dialog is open, poll
+// requests are held, not sent, and go out after it. The way to /login?next=<this page, with its
+// #hash> stays for what the dialog cannot do: Cancel (or Esc), a request whose body cannot be
+// sent twice (only none, a string, FormData, URLSearchParams or a Blob can), a 401 again right
+// after signing in, a browser without <dialog>, and the /login and /setup pages themselves (they
+// never send to themselves). Requests left waiting by that redirect get their 401 if the page is
+// still there RELEASE_MS later (a leave prompt kept it), and the next 401 opens the dialog again.
+// PrismPoll.signIn() opens the dialog for a caller that has no request to repeat (the config poll's
+// signed-out answer, a native form; live.js below) and resolves once signed in.
+// PrismDraft: unsaved edits kept in sessionStorage across a tab the browser discarded (phones do,
+// and `beforeunload` does not run there): save / load / drop by key (prefixed with this path),
+// every access in try/catch (no storage, a full one or a refusing one is nothing kept), and
+// `verdict(draft, id, rev)`: "none" (no draft), "other" (another item's), "restore" (the same
+// item at the same revision) or "drop" (it changed since).
 (function (root) {
   "use strict";
-  var polling = 0, signingIn = false, pollFetch = null;
+  var polling = 0, pollFetch = null, realFetch = null;
+  var POLL_TIMEOUT_MS = 15000, RELEASE_MS = 5000, REDIRECT_ONCE_MS = 2000;
   function sameOrigin(url) {
     if (typeof url !== "string") return false;
     if (url.charAt(0) === "/") return url.charAt(1) !== "/" && url.charAt(1) !== "\\";
     var o = root.location && root.location.origin;
     return !!o && url.indexOf(o + "/") === 0;
   }
-  function withPollHeader(init) {
+  function copyOf(init) {
     var out = {}, k;
+    for (k in (init || {})) if (Object.prototype.hasOwnProperty.call(init, k)) out[k] = init[k];
+    return out;
+  }
+  function withPollHeader(init) {
     init = init || {};
-    for (k in init) if (Object.prototype.hasOwnProperty.call(init, k)) out[k] = init[k];
+    var out = copyOf(init), k;
     var h = init.headers;
     if (typeof Headers !== "undefined" && h instanceof Headers) {
       h = new Headers(h); h.set("X-Prism-Poll", "1");
@@ -46,25 +69,215 @@
     out.headers = h;
     return out;
   }
+  // The real fetch; a poll's with its own timeout (a fresh one per send, so a repeat after the
+  // sign-in dialog is not cut short by the first send's clock). A caller's own signal wins.
+  function send(input, init, timed) {
+    if (!timed || typeof root.AbortController !== "function" || (init && init.signal)) return realFetch.call(root, input, init);
+    var c = new root.AbortController(), opts = copyOf(init);
+    opts.signal = c.signal;
+    var t = root.setTimeout(function () { c.abort(); }, POLL_TIMEOUT_MS);
+    var stop = function () { root.clearTimeout(t); };
+    return realFetch.call(root, input, opts).then(function (r) { stop(); return r; }, function (e) { stop(); throw e; });
+  }
+
+  // ---- the sign-in dialog -----------------------------------------------------------------
+  // queue: requests waiting for it ({input, init, poll, response (null: held, never sent),
+  // resolve, reject}); waiters: signIn() callers; parked: requests left by a redirect.
+  var gate = {open: false, ui: null, queue: [], waiters: [], parked: [], redirectedAt: -Infinity, release: null, watching: false};
+  function doc() { return root.document; }
+  function authPage() { var l = root.location; return !l || l.pathname === "/login" || l.pathname === "/setup"; }
+  function pageHidden() { var d = doc(); return !!(d && d.hidden); }
+  function redirect() {
+    var l = root.location;
+    if (!l || authPage()) return;
+    var now = Date.now();
+    if (now - gate.redirectedAt > REDIRECT_ONCE_MS) {
+      gate.redirectedAt = now;
+      l.assign("/login?next=" + encodeURIComponent(l.pathname + (l.search || "") + (l.hash || "")));
+    }
+    if (gate.release === null && typeof root.setTimeout === "function") gate.release = root.setTimeout(release, RELEASE_MS);
+  }
+  // Still on the page after a redirect (a leave prompt kept it): what waited gets its 401 (a held
+  // poll goes out again, through the wrapper), so the page can say so and try again.
+  function release() {
+    gate.release = null;
+    gate.parked.splice(0).forEach(function (e) {
+      if (e.response) e.resolve(e.response);
+      else e.resolve((e.poll ? pollFetch : root.fetch)(e.input, e.init));
+    });
+  }
+  // Give up on the dialog: everything waiting goes with the page.
+  function leave() {
+    gate.parked = gate.parked.concat(gate.queue.splice(0));
+    gate.waiters = [];
+    redirect();
+  }
+  // A body that can be sent a second time.
+  function replayable(input, init) {
+    if (typeof input !== "string") return false;
+    var b = init ? init.body : null;
+    return b === undefined || b === null || typeof b === "string" ||
+      (typeof root.FormData === "function" && b instanceof root.FormData) ||
+      (typeof root.URLSearchParams === "function" && b instanceof root.URLSearchParams) ||
+      (typeof root.Blob === "function" && b instanceof root.Blob);
+  }
+  function canDialog() {
+    var d = doc();
+    return !!(d && typeof d.createElement === "function" && typeof root.HTMLDialogElement === "function" && !authPage());
+  }
+  function say(ui, text, quiet) {
+    ui.msg.textContent = text || "";
+    ui.msg.hidden = !text;
+    ui.msg.className = "signin-msg " + (quiet ? "muted" : "error-text");
+  }
+  function focus(el) { try { el.focus({preventScroll: true}); } catch (e) { try { el.focus(); } catch (e2) { /* not focusable */ } } }
+  // Built once, on the first 401, with the page's own form styles (style.css `dialog.signin-dialog`).
+  // A real <form> with username + current-password fields, so password managers fill it.
+  function build() {
+    var d = doc(), dlg = d.createElement("dialog");
+    if (typeof dlg.showModal !== "function") return null;
+    var make = function (tag, cls, text) {
+      var e = d.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+    var attrs = function (e, map) { Object.keys(map).forEach(function (k) { e.setAttribute(k, map[k]); }); return e; };
+    dlg.className = "signin-dialog";
+    attrs(dlg, {"aria-labelledby": "signin-title", "aria-describedby": "signin-why"});
+    var form = attrs(make("form", "signin-form"), {method: "post", action: "/login", "data-no-auth-check": ""});
+    var title = make("h2", null, "Sign in again"); title.id = "signin-title";
+    var why = make("p", "muted", "Your session ended (signed out, or idle too long). Sign in to carry on: this page and what you changed on it stay as they are.");
+    why.id = "signin-why";
+    var user = attrs(make("input"), {type: "text", name: "username", autocomplete: "username", autocapitalize: "none", autocorrect: "off", spellcheck: "false", maxlength: "32", required: ""});
+    var pass = attrs(make("input"), {type: "password", name: "password", autocomplete: "current-password", maxlength: "512", required: ""});
+    var userLabel = make("label", null, "Username "), passLabel = make("label", null, "Password ");
+    userLabel.appendChild(user); passLabel.appendChild(pass);
+    var msg = attrs(make("p", "signin-msg"), {role: "alert"});
+    msg.hidden = true;
+    var actions = make("div", "actions");
+    var submit = make("button", null, "Sign in"); submit.type = "submit";
+    var cancel = make("button", "secondary", "Cancel"); cancel.type = "button";
+    actions.appendChild(submit); actions.appendChild(cancel);
+    var note = make("p", "muted signin-note", "Cancel opens the sign-in page instead; changes this page has not saved are lost then.");
+    [title, why, userLabel, passLabel, msg, actions, note].forEach(function (e) { form.appendChild(e); });
+    dlg.appendChild(form);
+    var ui = {dlg: dlg, form: form, user: user, pass: pass, msg: msg, submit: submit, cancel: cancel, busy: false};
+    form.addEventListener("submit", function (ev) { ev.preventDefault(); attempt(ui); });
+    cancel.addEventListener("click", function () { cancelDialog(); });
+    // Esc is Cancel (the dialog never closes on its own with requests still waiting).
+    dlg.addEventListener("cancel", function (ev) { ev.preventDefault(); cancelDialog(); });
+    return ui;
+  }
+  function show() {
+    if (gate.open) return;
+    if (!canDialog()) { leave(); return; }
+    if (pageHidden()) { whenVisible(); return; }
+    var ui = gate.ui || (gate.ui = build());
+    if (!ui) { leave(); return; }
+    var d = doc();
+    if (!ui.dlg.parentNode && d.body) d.body.appendChild(ui.dlg);
+    var shown = d.querySelector && d.querySelector(".signed-in");
+    var name = shown ? String(shown.textContent || "").trim() : "";
+    if (name && !ui.user.value) ui.user.value = name;
+    say(ui, "");
+    try { ui.dlg.showModal(); } catch (e) { leave(); return; }
+    gate.open = true;
+    focus(ui.user.value ? ui.pass : ui.user);
+  }
+  // The dialog opens once the page is visible again (a hidden tab's request waits).
+  function whenVisible() {
+    var d = doc();
+    if (gate.watching || !d || typeof d.addEventListener !== "function") return;
+    gate.watching = true;
+    var on = function () {
+      if (pageHidden()) return;
+      d.removeEventListener("visibilitychange", on);
+      gate.watching = false;
+      if (gate.queue.length || gate.waiters.length) show();
+    };
+    d.addEventListener("visibilitychange", on);
+  }
+  function closeDialog() {
+    gate.open = false;
+    var ui = gate.ui;
+    if (!ui) return;
+    ui.pass.value = "";
+    say(ui, "");
+    try { ui.dlg.close(); } catch (e) { /* already closed */ }
+  }
+  function cancelDialog() { closeDialog(); leave(); }
+  function attempt(ui) {
+    if (ui.busy) return;
+    var name = String(ui.user.value || "").trim(), pw = ui.pass.value || "";
+    if (!name || !pw) { say(ui, "Type your username and password."); return; }
+    ui.busy = true; ui.submit.disabled = true;
+    say(ui, "Signing in…", true);
+    realFetch.call(root, "/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+      body: new root.URLSearchParams({username: name, password: pw, next: ""})
+    }).then(function (r) {
+      return r.json().then(null, function () { return null; }).then(function (j) {
+        if (j && j.success) { signedIn(); return; }
+        say(ui, (j && (j.error || j.message)) || ("Not signed in: the server answered HTTP " + r.status + "."));
+        if (r.status === 401) { ui.pass.value = ""; focus(ui.pass); }
+      });
+    }, function () {
+      say(ui, "Not signed in: the server did not answer. Check that it runs, then try again.");
+    }).then(function () { ui.busy = false; ui.submit.disabled = false; });
+  }
+  // Signed in: every waiting request goes out once more; a 401 again leaves for /login.
+  function signedIn() {
+    closeDialog();
+    var q = gate.queue.splice(0), w = gate.waiters.splice(0);
+    q.forEach(function (e) {
+      send(e.input, e.init, e.poll).then(function (r) {
+        if (r && r.status === 401) { e.response = r; gate.parked.push(e); redirect(); return; }
+        e.resolve(r);
+      }, e.reject);
+    });
+    w.forEach(function (resolve) { resolve(); });
+  }
+  // A same-origin 401: wait behind the dialog (or leave for /login, see above).
+  function refused(input, init, response, poll) {
+    return new Promise(function (resolve, reject) {
+      if (authPage()) return;   // never settles: nothing loops back to the login page
+      var e = {input: input, init: init, poll: poll, response: response, resolve: resolve, reject: reject};
+      if (!replayable(input, init) || !canDialog()) { gate.parked.push(e); redirect(); return; }
+      gate.queue.push(e);
+      show();
+    });
+  }
   function signIn() {
-    var loc = root.location;
-    if (signingIn || !loc || loc.pathname === "/login" || loc.pathname === "/setup") return;
-    signingIn = true;
-    loc.assign("/login?next=" + encodeURIComponent(loc.pathname + loc.search));
+    return new Promise(function (resolve) {
+      if (authPage()) return;
+      if (!canDialog()) { redirect(); return; }
+      gate.waiters.push(resolve);
+      show();
+    });
   }
   function wrap(real, poll) {
     return function (input, init) {
       var url = typeof input === "string" ? input : (input && input.url) || "";
       var mine = sameOrigin(url);
-      if (mine && (poll || polling > 0) && typeof input === "string") init = withPollHeader(init);
-      return real.call(root, input, init).then(function (r) {
-        if (mine && r && r.status === 401) { signIn(); return new Promise(function () {}); }
+      var marked = mine && (poll || polling > 0) && typeof input === "string";
+      if (marked) init = withPollHeader(init);
+      // Polls wait while the dialog is open: they go out after it.
+      if (marked && gate.open) {
+        return new Promise(function (resolve, reject) {
+          gate.queue.push({input: input, init: init, poll: true, response: null, resolve: resolve, reject: reject});
+        });
+      }
+      return send(input, init, marked).then(function (r) {
+        if (mine && r && r.status === 401) return refused(input, init, r, marked);
         return r;
       });
     };
   }
   if (typeof root.fetch === "function" && !root.fetch.prismWrapped) {
-    var realFetch = root.fetch;
+    realFetch = root.fetch;
     root.fetch = wrap(realFetch, false);
     root.fetch.prismWrapped = true;
     pollFetch = wrap(realFetch, true);
@@ -92,6 +305,12 @@
     clear: function (id) { clearTimeout(id); },
     onVisible: function (cb) {
       if (typeof document !== "undefined") document.addEventListener("visibilitychange", cb);
+    },
+    // Back from the back-forward cache, or the network is back: worth asking at once.
+    onWake: function (cb) {
+      if (typeof root.addEventListener !== "function") return;
+      root.addEventListener("pageshow", function (e) { if (e && e.persisted) cb(); });
+      root.addEventListener("online", function () { cb(); });
     }
   };
   function create(o) {
@@ -125,6 +344,8 @@
     env.onVisible(function () {
       if (env.hidden()) clear(); else if (!parked) go();
     });
+    // A run in flight answers (or times out) by itself: no second one beside it.
+    if (env.onWake) env.onWake(function () { if (!parked && !busy && !env.hidden()) go(); });
     return {
       start: function () { parked = false; go(); },
       kick: function () { parked = false; go(); },
@@ -139,7 +360,34 @@
     inPoll: function () { return polling > 0; },
     navigate: navigate,
     signIn: signIn,
+    // The dialog is open or requests wait for it (the Test page's upload clock waits too).
+    signingIn: function () { return gate.open || gate.queue.length > 0; },
+    TIMEOUT_MS: POLL_TIMEOUT_MS,
     fetch: function (url, init) { return pollFetch ? pollFetch(url, init) : root.fetch(url, withPollHeader(init)); }
+  };
+
+  // ---- drafts ------------------------------------------------------------------------------
+  function storage() { try { return root.sessionStorage || null; } catch (e) { return null; } }
+  function draftKey(key) { var l = root.location; return "prism:draft:" + ((l && l.pathname) || "") + ":" + key; }
+  root.PrismDraft = {
+    save: function (key, value) {
+      try { var s = storage(); if (!s) return false; s.setItem(draftKey(key), JSON.stringify(value)); return true; } catch (e) { return false; }
+    },
+    load: function (key) {
+      try {
+        var s = storage(); if (!s) return null;
+        var t = s.getItem(draftKey(key));
+        return t === null || t === undefined ? null : JSON.parse(t);
+      } catch (e) { return null; }
+    },
+    drop: function (key) {
+      try { var s = storage(); if (s) s.removeItem(draftKey(key)); } catch (e) { /* nothing kept */ }
+    },
+    verdict: function (draft, id, rev) {
+      if (!draft || typeof draft !== "object") return "none";
+      if (draft.id !== id) return "other";
+      return draft.rev === rev ? "restore" : "drop";
+    }
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 (function () {
@@ -177,6 +425,10 @@
   window.addEventListener("load", scrollCues);
   window.addEventListener("resize", scrollCues);
   var listeners = [], etag = null, last = null, busy = null, failures = 0, timer = null;
+  // The session as the polls last saw it: `lastGood` = when a signed-in answer came (0: none
+  // yet), `signedOut` = the answer turned minimal (the sign-in dialog is asked for).
+  var lastGood = 0, signedOut = false;
+  function fullAnswer(j) { return !!j && j.config !== undefined; }
 
   // Listeners run on a poll's answer: what they ask the server synchronously is a poll too.
   function emit(data, prev) {
@@ -204,10 +456,16 @@
     var h = {"Accept": "application/json"};
     if (etag && !force) h["If-None-Match"] = etag;
     busy = PrismPoll.fetch("/v1/config", {headers: h, cache: "no-store"}).then(function (r) {
-      if (r.status === 304) return last;
+      if (r.status === 304) { if (fullAnswer(last)) lastGood = Date.now(); return last; }
       return json(r).then(function (j) {
         // The full answer turned minimal: the session ended (idle, 12 h, signed out elsewhere).
-        if (last && last.config !== undefined && j.config === undefined) { PrismPoll.signIn(); return last; }
+        // The dialog opens (polls wait meanwhile); signed in, the next poll is the full answer.
+        if (fullAnswer(last) && !fullAnswer(j)) {
+          signedOut = true;
+          PrismPoll.signIn().then(function () { signedOut = false; poll(true).then(schedule); });
+          return last;
+        }
+        if (fullAnswer(j)) { lastGood = Date.now(); signedOut = false; }
         etag = r.headers.get("ETag"); var prev = last; last = j; emit(j, prev); return j;
       });
     }).then(function (j) {
@@ -620,6 +878,63 @@
     submitAjax(form, by);
   });
 
+  // ---- native POST forms -------------------------------------------------------------------
+  // A form that posts by navigating (Accounts, Collect settings, the Train queue, ...) would land on
+  // the login page and lose what was typed when the session has ended. So when the polls last saw
+  // it signed out, or saw no signed-in answer for SESSION_FRESH_MS (a tab that slept), the submit
+  // waits for one poll-style GET /v1/config first: signed in, the form goes on with the same
+  // button (`requestSubmit(submitter)` keeps its name, value and formaction); signed out, the
+  // sign-in dialog opens and the form goes on after it. This runs first (capture on window) and
+  // keeps the first submit from every other listener, so a `data-confirm` on submit asks once,
+  // on the submit that goes on; one on the button's click has asked already. Skipped: forms with
+  // `data-no-auth-check` (Sign out, the dialog's own), the /login and /setup pages, and pages
+  // never signed in (refusal pages).
+  var SESSION_FRESH_MS = 60000;
+  function postForm(f) { return !!(f && f.getAttribute && String(f.getAttribute("method") || "").toLowerCase() === "post"); }
+  function everSignedIn() {
+    if (fullAnswer(last)) return true;
+    var s = document.querySelector(".signed-in");
+    return !!(s && String(s.textContent || "").trim());
+  }
+  function resubmit(form, by) {
+    form._prismPass = true;
+    try {
+      if (typeof form.requestSubmit !== "function") form.submit();
+      else if (!by) form.requestSubmit();
+      else try { form.requestSubmit(by); } catch (e) { form.requestSubmit(); }
+    } finally { form._prismPass = false; }
+  }
+  // Resolves true when signed in, false when signed out; rejects when the server does not answer.
+  function sessionCheck() {
+    if (signedOut) return Promise.resolve(false);
+    return PrismPoll.fetch("/v1/config", {headers: {"Accept": "application/json"}, cache: "no-store"}).then(json).then(function (j) {
+      if (!fullAnswer(j)) { signedOut = true; return false; }
+      lastGood = Date.now();
+      return true;
+    });
+  }
+  window.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!form || form._prismPass || !postForm(form) || form.hasAttribute("data-no-auth-check")) return;
+    if (location.pathname === "/login" || location.pathname === "/setup") return;
+    if (!signedOut && Date.now() - lastGood < SESSION_FRESH_MS) return;
+    if (!everSignedIn()) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    var by = e.submitter || null;
+    sessionCheck().then(function (ok) {
+      if (ok) { resubmit(form, by); return; }
+      PrismPoll.signIn().then(function () {
+        signedOut = false; lastGood = Date.now();
+        resubmit(form, by);
+        poll(true).then(schedule);
+      });
+    }, function () {
+      // No answer: the browser posts as it would have (and shows what it gets).
+      resubmit(form, by);
+    });
+  }, true);
+
   // ---- the restart page (message.html) ---------------------------------------------------------
   // `#restart-status[data-generation]`: poll until the next generation serves, then go to
   // `data-target` (a path on this server; anything else goes home). Gives up after 2 minutes.
@@ -667,6 +982,10 @@
   };
   poll().then(schedule);
   window.addEventListener("focus", function () { if (!document.hidden) poll(); });
+  // Back from the back-forward cache, or the network is back: ask at once (poll() joins one in
+  // flight, so never two).
+  window.addEventListener("pageshow", function (e) { if (e && e.persisted && !document.hidden) poll().then(schedule); });
+  window.addEventListener("online", function () { if (!document.hidden) poll().then(schedule); });
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) { clearTimeout(timer); timer = null; } else poll().then(schedule);
   });

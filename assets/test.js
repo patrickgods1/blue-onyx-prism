@@ -2,6 +2,7 @@
 // Client-side flow: preview, drag-drop / paste, submit to the API with fetch and draw the boxes
 // on a canvas. Without JavaScript the form posts to /test and the server draws the image.
 (function () {
+  var UPLOAD_TIMEOUT_MS = 60000;
   var form = document.getElementById("test-form"), input = document.getElementById("image");
   var preview = document.getElementById("preview"), drop = document.getElementById("drop");
   var file = null, url = null;
@@ -135,13 +136,28 @@
     busy.hidden = false; btn.disabled = true;
     var old = document.getElementById("server-result");
     if (old) old.remove();
+    // An upload that gets no answer in UPLOAD_TIMEOUT_MS is stopped (a network switch can leave
+    // it hanging for good). The clock waits while the sign-in dialog is open (live.js repeats the
+    // upload once signed in).
+    var ctl = window.AbortController ? new AbortController() : null, timer = null, timedOut = false;
+    function arm() {
+      if (!ctl) return;
+      timer = setTimeout(function () {
+        if (window.PrismPoll && PrismPoll.signingIn && PrismPoll.signingIn()) { arm(); return; }
+        timedOut = true; ctl.abort();
+      }, UPLOAD_TIMEOUT_MS);
+    }
+    arm();
     // The header keeps a test upload out of the dataset: it is no camera's frame.
-    fetch(target, {method: "POST", body: fd, headers: {"x-prism-no-collect": "1"}}).then(function (r) { return r.json(); })
+    fetch(target, {method: "POST", body: fd, headers: {"x-prism-no-collect": "1"}, signal: ctl ? ctl.signal : undefined}).then(function (r) { return r.json(); })
       .then(function (j) { show(j, model); })
       .catch(function (ex) {
         var err = document.getElementById("client-error");
-        err.textContent = "Request failed: " + ex; err.hidden = false;
+        err.textContent = timedOut
+          ? "No answer within " + (UPLOAD_TIMEOUT_MS / 1000) + " s, so the upload was stopped. Check that the server runs (and this device's network), then press Detect again."
+          : "Request failed: " + ex;
+        err.hidden = false;
       })
-      .finally(function () { busy.hidden = true; btn.disabled = false; });
+      .finally(function () { clearTimeout(timer); busy.hidden = true; btn.disabled = false; });
   });
 })();

@@ -140,6 +140,27 @@ fn normalize_authority(auth: &str, scheme: &str) -> String {
     }
 }
 
+/// The path and query of the request's `Referer` when that page is on this server: its
+/// authority is `host` (the request's `Host`; case-insensitive, the scheme's default port
+/// ignored). None for another host, no `Referer`, or one that is not an http(s) URL. The caller
+/// still checks the path ([`super::auth::safe_next`]).
+pub(super) fn referer_on_host(headers: &HeaderMap, host: &str) -> Option<String> {
+    let referer = headers.get(header::REFERER)?.to_str().ok()?.trim();
+    let (scheme, auth) = authority(referer)?;
+    if normalize_authority(&auth, scheme) != normalize_authority(host, scheme) {
+        return None;
+    }
+    let rest = referer.split_once("://")?.1;
+    let start = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let tail = rest.get(start..)?;
+    let tail = tail.split('#').next().unwrap_or_default();
+    Some(match tail.chars().next() {
+        None => "/".to_string(),
+        Some('?') => format!("/{tail}"),
+        Some(_) => tail.to_string(),
+    })
+}
+
 /// Whether the browser marked the request `Sec-Fetch-Site: cross-site` (also used by GET
 /// routes whose answer leaks something or whose work is costly, such as the import preview).
 pub(crate) fn fetch_site_cross(headers: &HeaderMap) -> bool {

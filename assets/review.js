@@ -2789,6 +2789,7 @@
       dups = dupGroups();
       suggestions = liveSuggestions();
       if (suggestions.length) selected = suggestionBox(suggestions[0]);
+      var draftNote = restoreDraft(j);
       // Following (`x`): the new frame opens zoomed on its first box.
       if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
       img = new Image();
@@ -2799,8 +2800,48 @@
       refresh();
       revealFrame();
       prefetch();
+      if (draftNote) say(draftNote[0], draftNote[1]);
     }).then(settled, function (e) { settled(); throw e; });
   }
+
+  // ---- drafts: unsaved edits across a discarded tab -------------------------------------------
+  // A phone discards a background tab and reloads it later; `beforeunload` does not run there. So
+  // when the page goes out of view (`pagehide`, hidden) the frame's unsaved edits are kept in
+  // sessionStorage (PrismDraft, live.js) with the frame's revision. The next load opens that frame
+  // and restores them only at the same revision (else nobody's edits would be overwritten
+  // unseen: they are dropped and the page says so). The labels come back as the undo stack holds
+  // them (the `_` page fields such as `_n` and `_checked` too), so they save exactly as if edited
+  // live; one undo step returns to the frame as served. A save or another frame drops the draft.
+  var DRAFT = 'review';
+  var draftWaiting = false;   // the draft's frame is loading: nothing is written or dropped meanwhile
+  function keepDraft() {
+    if (!window.PrismDraft || draftWaiting) return;
+    if (cur && dirty) PrismDraft.save(DRAFT, { id: cur.frame, rev: cur.revision, labels: cur.labels, selected: selected });
+    else PrismDraft.drop(DRAFT);
+  }
+  // In loadFrame, once `cur` is the served frame: [message, isError] when a draft was restored or
+  // dropped, else null.
+  function restoreDraft(j) {
+    if (!window.PrismDraft) return null;
+    // Only the page's first frame takes a draft back; any later load is a frame change (a
+    // reload of this frame included: its edits were let go).
+    if (!draftWaiting) { PrismDraft.drop(DRAFT); return null; }
+    var d = PrismDraft.load(DRAFT), v = PrismDraft.verdict(d, j.frame, j.revision);
+    if (v === 'none') return null;
+    PrismDraft.drop(DRAFT);
+    if (v === 'other') return null;
+    if (v === 'drop' || !d.labels || !Array.isArray(d.labels.boxes)) {
+      return ['Your unsaved edits on this frame were dropped: someone saved it since.', true];
+    }
+    snapshot();   // one undo step back to the frame as served; marks the frame unsaved
+    cur.labels = d.labels;
+    selected = (typeof d.selected === 'number' && d.selected >= 0 && d.selected < boxes().length) ? d.selected : -1;
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    return ['Restored your unsaved edits from before the page was closed.', false];
+  }
+  window.addEventListener('pagehide', keepDraft);
+  document.addEventListener('visibilitychange', function () { if (document.hidden) keepDraft(); });
 
   // The walk of /v1/review/next running ({countsOnly, stale: answer ignored, noLanding: counts
   // only, done: promise}), and the newest intent waiting for it (R.nextPlan decides).
@@ -2959,6 +3000,7 @@
     if (cur.revision != null) url += '&revision=' + encodeURIComponent(cur.revision);
     postJson(url, body).then(function (j) {
       dirty = false;
+      if (window.PrismDraft) PrismDraft.drop(DRAFT);
       if (status === 'reviewed') { noteSaved(body); noteHistory(frame, body, w, h); }
       // After Back: on to the frame Back left (the counts refresh), else the queue's next.
       if (fwdStack.length) {
@@ -3864,5 +3906,18 @@
   }
   filtersFromUrl();
   filtersShown();
-  loadNext();
+  // A draft (above) opens its frame; the queue's counts load beside it. Gone: the queue as usual.
+  var draft0 = window.PrismDraft ? PrismDraft.load(DRAFT) : null;
+  if (draft0 && typeof draft0.id === 'string' && draft0.id) {
+    draftWaiting = true;
+    loadNext(null, null, true);
+    loadFrame(draft0.id).then(function () { draftWaiting = false; }, function () {
+      draftWaiting = false;
+      PrismDraft.drop(DRAFT);
+      say('Your unsaved edits from before the page was closed were dropped: their frame is gone.', true);
+      loadNext();
+    });
+  } else {
+    loadNext();
+  }
 })();

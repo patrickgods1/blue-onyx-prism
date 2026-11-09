@@ -1191,6 +1191,135 @@ fn next_is_a_local_path_or_nothing() {
     assert_eq!(safe_next(&format!("/{}", "a".repeat(5000))), None);
 }
 
+/// A refused browser's way back: a GET is its own; another method's is the page that sent it
+/// (its `Referer`), only when that page is on this host and its path is a safe `next`.
+#[test]
+fn the_way_back_of_a_refused_post_is_its_page_on_this_host() {
+    let post = Method::POST;
+    let uri: Uri = "/config/accounts/add".parse().unwrap();
+    let headers = |pairs: &[(header::HeaderName, &str)]| {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(k.clone(), v.parse().unwrap());
+        }
+        h
+    };
+    let host = |referer: &str| {
+        headers(&[
+            (header::HOST, "192.168.1.5:32169"),
+            (header::REFERER, referer),
+        ])
+    };
+    // The same host (any case), its path and query kept, a fragment never sent but dropped.
+    for (referer, want) in [
+        (
+            "https://192.168.1.5:32169/config?x=1",
+            "/login?next=%2Fconfig%3Fx%3D1",
+        ),
+        (
+            "https://192.168.1.5:32169/train/review",
+            "/login?next=%2Ftrain%2Freview",
+        ),
+        ("https://192.168.1.5:32169", "/login?next=%2F"),
+        ("https://192.168.1.5:32169?a=b", "/login?next=%2F%3Fa%3Db"),
+        (
+            "https://192.168.1.5:32169/config#x",
+            "/login?next=%2Fconfig",
+        ),
+    ] {
+        assert_eq!(login_url(&post, &uri, &host(referer)), want, "{referer}");
+    }
+    let named = headers(&[
+        (header::HOST, "NAS.local:32169"),
+        (header::REFERER, "https://nas.LOCAL:32169/train/jobs"),
+    ]);
+    assert_eq!(
+        login_url(&post, &uri, &named),
+        "/login?next=%2Ftrain%2Fjobs"
+    );
+    // The default port is the same authority.
+    let default_port = headers(&[
+        (header::HOST, "prism.example"),
+        (header::REFERER, "https://prism.example:443/config"),
+    ]);
+    assert_eq!(
+        login_url(&post, &uri, &default_port),
+        "/login?next=%2Fconfig"
+    );
+    // Another host, another port, not http(s), or an unsafe path: no way back.
+    for referer in [
+        "https://evil.test/config",
+        "https://192.168.1.5:9999/config",
+        "https://192.168.1.50:32169/config",
+        "https://192.168.1.5.evil.test:32169/config",
+        "ftp://192.168.1.5:32169/config",
+        "/config",
+        "null",
+        "https://192.168.1.5:32169//evil.test/x",
+        "https://192.168.1.5:32169/\\evil.test",
+        "https://192.168.1.5:32169/caf\u{e9}",
+    ] {
+        let h = HeaderMap::from_iter(
+            [(header::HOST, HeaderValue::from_static("192.168.1.5:32169"))]
+                .into_iter()
+                .chain(
+                    HeaderValue::from_str(referer)
+                        .ok()
+                        .map(|v| (header::REFERER, v)),
+                ),
+        );
+        assert_eq!(login_url(&post, &uri, &h), "/login", "{referer}");
+    }
+    // No Referer, or no Host to compare it with.
+    assert_eq!(
+        login_url(
+            &post,
+            &uri,
+            &headers(&[(header::HOST, "192.168.1.5:32169")])
+        ),
+        "/login"
+    );
+    assert_eq!(
+        login_url(
+            &post,
+            &uri,
+            &headers(&[(header::REFERER, "https://192.168.1.5:32169/config")])
+        ),
+        "/login"
+    );
+    // A GET keeps its own path and query, whatever the Referer says.
+    let get: Uri = "/config?x=1".parse().unwrap();
+    assert_eq!(
+        login_url(&Method::GET, &get, &host("https://192.168.1.5:32169/stats")),
+        "/login?next=%2Fconfig%3Fx%3D1"
+    );
+    assert_eq!(
+        login_url(&Method::GET, &get, &HeaderMap::new()),
+        "/login?next=%2Fconfig%3Fx%3D1"
+    );
+}
+
+/// Through the router: a refused browser POST from a page of this server goes to the login page
+/// with that page as the way back.
+#[tokio::test]
+async fn a_refused_browser_post_keeps_its_page_as_the_way_back() {
+    let state = test_state();
+    let page = format!("https://{TEST_HOST}/config?tab=1");
+    let r = with_header(
+        with_header(
+            anon(REMOTE, "POST", "/config/restart", true),
+            "origin",
+            &format!("https://{TEST_HOST}"),
+        ),
+        "referer",
+        &page,
+    );
+    let (s, h, _) = call(&state, r).await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert_eq!(location(&h), "/login?next=%2Fconfig%3Ftab%3D1");
+    assert!(!state.restart.is_cancelled());
+}
+
 #[tokio::test]
 async fn login_never_redirects_off_this_server() {
     let state = test_state();
