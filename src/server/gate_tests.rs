@@ -228,6 +228,12 @@ async fn open_routes_are_served_on_the_plain_port() {
         "/static/style.css",
         "/static/live.js",
         "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+        "/static/manifest.webmanifest",
+        "/static/icon-192.png",
+        "/static/icon-512.png",
+        "/static/icon-maskable-512.png",
     ] {
         let (s, _, _) = call_with_https(&state, Some(HTTPS), get(uri, "blue-iris-pc", true)).await;
         assert_eq!(s, StatusCode::OK, "{uri}");

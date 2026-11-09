@@ -78,8 +78,8 @@ use devices::{DevicesSnapshot, devices_json, devices_snapshot};
 use listen::HEADER_READ_TIMEOUT;
 pub use listen::{HttpsPlan, HttpsPort, Listeners, bind, serve_on};
 use pages::{
-    favicon, live_js, logs_json, logs_page, prometheus, static_asset, stats_json, stats_page,
-    style_css, test_page, test_submit, update_available, welcome,
+    apple_touch_icon, favicon, live_js, logs_json, logs_page, prometheus, static_asset, stats_json,
+    stats_page, style_css, test_page, test_submit, update_available, welcome,
 };
 use resources::{
     models_add, resources_add_to_config, resources_download, resources_export,
@@ -207,6 +207,8 @@ fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/static/live.js", get(live_js)),
         ("/static/{file}", get(static_asset)),
         ("/favicon.ico", get(favicon)),
+        ("/apple-touch-icon.png", get(apple_touch_icon)),
+        ("/apple-touch-icon-precomposed.png", get(apple_touch_icon)),
     ]
 }
 
@@ -1305,6 +1307,8 @@ mod tests {
             "/v1/status/updateavailable",
             "/v1/config",
             "/favicon.ico",
+            "/apple-touch-icon.png",
+            "/apple-touch-icon-precomposed.png",
         ];
         const LOGIN: &[&str] = &["/login", "/logout", "/setup"];
         const ADMIN: &[&str] = &[
@@ -2024,6 +2028,8 @@ mod tests {
             "/v1/config",
             "/static/style.css",
             "/favicon.ico",
+            "/apple-touch-icon.png",
+            "/static/manifest.webmanifest",
             "/v1/vision/custom/list",
         ] {
             let (s, _, _) = call(&state, anonymous(from(REMOTE, "GET", uri, false))).await;

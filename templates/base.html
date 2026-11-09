@@ -7,13 +7,18 @@
 {% block head %}{% endblock %}
 <title>{% block title %}Blue Onyx Prism{% endblock %} - Blue Onyx Prism</title>
 <link rel="icon" href="/favicon.ico">
+<link rel="manifest" href="/static/manifest.webmanifest?v={{ version }}">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-title" content="Prism">
+<meta name="theme-color" content="#0f2747" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0d12" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/static/style.css?v={{ version }}">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header>
   <a class="brand" href="/">Blue Onyx Prism</a>
-  <nav aria-label="Main" data-scroll-cue>
+  {% if nav != "" %}<nav aria-label="Main" data-scroll-cue>
     <a href="/"{% if nav == "home" %} class="active" aria-current="page"{% endif %}>Home</a>
     <a href="/stats"{% if nav == "stats" %} class="active" aria-current="page"{% endif %}>Stats</a>
     <a href="/test"{% if nav == "test" %} class="active" aria-current="page"{% endif %}>Test</a>
@@ -21,10 +26,10 @@
     <a href="/train"{% if nav == "train" %} class="active" aria-current="page"{% endif %}>Train</a>
     <a href="/config"{% if nav == "config" %} class="active" aria-current="page"{% endif %}>Config</a>
     <a href="/logs"{% if nav == "logs" %} class="active" aria-current="page"{% endif %}>Logs</a>
-  </nav>
+  </nav>{% endif %}
   <span id="live-status" class="live-status" role="status" hidden></span>
-  <span id="pending-restart" class="pending-restart" hidden><a href="/config#models"></a> <button type="button" class="small danger" data-restart>Restart</button></span>
-  {% if nav != "" %}<form method="post" action="/logout" class="signout" data-no-auth-check><span class="signed-in"><!--bop:user--></span> <button type="submit" class="small secondary">Sign out</button></form>{% endif %}
+  {% if nav != "" %}<span id="pending-restart" class="pending-restart" hidden><a href="/config#models"></a> <button type="button" class="small danger" data-restart>Restart</button></span>
+  <form method="post" action="/logout" class="signout" data-no-auth-check><span class="signed-in"><!--bop:user--></span> <button type="submit" class="small secondary">Sign out</button></form>{% endif %}
 </header>
 <script src="/static/live.js?v={{ version }}"></script>
 <main id="main" tabindex="-1">
@@ -32,7 +37,7 @@
 </main>
 <footer>
   <div>Blue Onyx Prism {{ crate::long_version() }} &middot; CodeProject.AI compatible API</div>
-  <div class="endpoints">JSON:
+  {% if nav != "" %}<div class="endpoints">JSON:
     <a href="/stats.json">stats</a> &middot;
     <a href="/v1/config">config</a> &middot;
     <a href="/v1/devices">devices</a> &middot;
@@ -42,7 +47,7 @@
     <a href="/logs.json">logs</a> &middot;
     <a href="/v1/status/updateavailable">update</a> &middot;
     <a href="/prometheus">Prometheus metrics</a>
-  </div>
+  </div>{% endif %}
 </footer>
 </body>
 </html>

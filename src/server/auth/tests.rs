@@ -773,6 +773,10 @@ async fn open_routes_never_need_a_sign_in() {
         "/v1/status/updateavailable",
         "/static/style.css",
         "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+        "/static/manifest.webmanifest",
+        "/static/icon-192.png",
         "/v1/vision/custom/list",
     ] {
         let (s, _, _) = call(&state, anon(REMOTE, "GET", uri, false)).await;
@@ -792,6 +796,26 @@ async fn open_routes_never_need_a_sign_in() {
 // ---------------------------------------------------------------------------------------------
 // /login and /logout
 // ---------------------------------------------------------------------------------------------
+
+/// A page for nobody signed in shows no nav links, JSON links or restart indicator: every one
+/// leads back to `/login` (and a Home Screen app has no address bar to leave a JSON page by). The
+/// brand still goes home, and the head still names the manifest and the touch icon.
+fn assert_leads_nowhere_signed_in(html: &str) {
+    for absent in [
+        "<nav",
+        "href=\"/stats\"",
+        "href=\"/config",
+        "class=\"endpoints\"",
+        "href=\"/v1/",
+        "href=\"/prometheus\"",
+        "id=\"pending-restart\"",
+    ] {
+        assert!(!html.contains(absent), "{absent}: {html}");
+    }
+    assert!(html.contains("<a class=\"brand\" href=\"/\">"), "{html}");
+    assert!(html.contains("rel=\"manifest\""), "{html}");
+    assert!(html.contains("rel=\"apple-touch-icon\""), "{html}");
+}
 
 #[tokio::test]
 async fn the_login_page_is_a_plain_form_with_no_inline_code() {
@@ -833,6 +857,7 @@ async fn the_login_page_is_a_plain_form_with_no_inline_code() {
         !html.contains("action=\"/logout\""),
         "no sign-out form for nobody"
     );
+    assert_leads_nowhere_signed_in(&html);
     // A browser that is signed in already goes on.
     let (s, h, _) = call(&state, req(REMOTE, "GET", "/login?next=/config", true)).await;
     assert_eq!(s, StatusCode::SEE_OTHER);
@@ -1508,6 +1533,7 @@ async fn the_setup_page_explains_and_shows_no_fingerprint() {
         assert!(html.contains(want), "{want}: {html}");
     }
     assert!(!html.contains(&code), "the code is never on the page");
+    assert_leads_nowhere_signed_in(&html);
     assert!(
         !html.contains(" style=") && !html.contains("<script>"),
         "CSP"

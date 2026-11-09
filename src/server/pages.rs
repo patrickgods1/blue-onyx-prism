@@ -77,6 +77,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("review-touch.js", JS),
     asset!("review.js", JS),
     asset!("welcome.js", JS),
+    asset!("manifest.webmanifest", "application/manifest+json"),
 ];
 
 /// `Cache-Control` of a static file. A debug build must show an edit on the next reload.
@@ -114,6 +115,38 @@ pub(super) fn static_file(name: &str) -> Option<&'static str> {
 }
 
 static FAVICON_ICO: &[u8] = include_bytes!("../../assets/favicon.ico");
+
+const PNG: &str = "image/png";
+
+/// `Cache-Control` of the icons: they change with a release at most, and a stale one only looks old.
+const ICON_CACHE: &str = "public, max-age=86400";
+
+/// Binary files served under `/static/<name>` (flat names, `{file}` matches no `/`): name,
+/// Content-Type, body. Always embedded, in a debug build too: they are made by
+/// `scripts/gen_icons.py` (`--check` in CI), never edited by hand. The manifest
+/// (`manifest.webmanifest`) lists the `icon-*` ones; `/apple-touch-icon.png` serves the first.
+pub(super) static STATIC_BINARY: &[(&str, &str, &[u8])] = &[
+    (
+        "apple-touch-icon.png",
+        PNG,
+        include_bytes!("../../assets/icons/apple-touch-icon.png"),
+    ),
+    (
+        "icon-192.png",
+        PNG,
+        include_bytes!("../../assets/icons/icon-192.png"),
+    ),
+    (
+        "icon-512.png",
+        PNG,
+        include_bytes!("../../assets/icons/icon-512.png"),
+    ),
+    (
+        "icon-maskable-512.png",
+        PNG,
+        include_bytes!("../../assets/icons/icon-maskable-512.png"),
+    ),
+];
 
 /// State text for the HTML pages and `/stats`: "Initializing (downloading ...)", "Ready", ...;
 /// a lazy model that has not been requested yet says so.
@@ -830,8 +863,19 @@ pub(super) async fn logs_json(
 // ---------------------------------------------------------------------------------------------
 // Static assets
 
-/// One entry of [`STATIC_FILES`]; 404 (JSON, like the router's fallback) for any other name.
+/// One entry of [`STATIC_FILES`] or [`STATIC_BINARY`]; 404 (JSON, like the router's fallback) for
+/// any other name.
 fn serve_static(name: &str) -> Response {
+    if let Some((_, content_type, body)) = STATIC_BINARY.iter().find(|(n, _, _)| *n == name) {
+        return (
+            [
+                (header::CONTENT_TYPE, *content_type),
+                (header::CACHE_CONTROL, ICON_CACHE),
+            ],
+            *body,
+        )
+            .into_response();
+    }
     let Some((_, content_type, embedded)) = STATIC_FILES.iter().find(|(n, _, _)| *n == name) else {
         return (
             StatusCode::NOT_FOUND,
@@ -865,7 +909,7 @@ fn serve_static(name: &str) -> Response {
     }
 }
 
-/// `GET /static/{file}`: the page scripts and the stylesheet.
+/// `GET /static/{file}`: the page scripts, the stylesheet, the web app manifest and its icons.
 pub(super) async fn static_asset(Path(file): Path<String>) -> Response {
     serve_static(&file)
 }
@@ -878,6 +922,12 @@ pub(super) async fn style_css() -> Response {
 /// (and the pages that listen) up to date.
 pub(super) async fn live_js() -> Response {
     serve_static("live.js")
+}
+
+/// `GET /apple-touch-icon.png` (and `-precomposed`): iOS asks the site's root for it when a page is
+/// added to the Home Screen without a `<link rel="apple-touch-icon">` it could read, so it is open.
+pub(super) async fn apple_touch_icon() -> Response {
+    serve_static("apple-touch-icon.png")
 }
 
 pub(super) async fn favicon() -> Response {
@@ -1138,6 +1188,176 @@ mod tests {
             let (s, _) = get_text(&state, uri).await;
             assert_eq!(s, StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+
+    /// `uri` with no credential: over HTTPS from another machine, or on the plain port.
+    async fn fetch_anonymous(
+        state: &Arc<AppState>,
+        uri: &str,
+        on_plain_port: bool,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let req = from_peer(Request::get(uri).body(Body::empty()).unwrap(), REMOTE);
+        let req = if on_plain_port {
+            plain(req)
+        } else {
+            anonymous(req)
+        };
+        call(state, req).await
+    }
+
+    /// The PNG at `uri`, answered to nobody signed in on both ports: its width and height and
+    /// whether every pixel is opaque.
+    async fn served_png(state: &Arc<AppState>, uri: &str) -> (u32, u32, bool) {
+        let mut seen = None;
+        for on_plain_port in [false, true] {
+            let (s, h, b) = fetch_anonymous(state, uri, on_plain_port).await;
+            assert_eq!(s, StatusCode::OK, "{uri} plain={on_plain_port}");
+            assert_eq!(h[header::CONTENT_TYPE], "image/png", "{uri}");
+            assert_eq!(h[header::CACHE_CONTROL], ICON_CACHE, "{uri}");
+            // No session for nobody (the plain port only ever clears the legacy cookie).
+            if !on_plain_port {
+                assert!(!h.contains_key(header::SET_COOKIE), "{uri}");
+            }
+            if let Some(first) = &seen {
+                assert_eq!(&b, first, "{uri}: the same bytes on both ports");
+            }
+            seen = Some(b);
+        }
+        let png = seen.unwrap();
+        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .unwrap_or_else(|e| panic!("{uri}: {e}"))
+            .to_rgba8();
+        let opaque = img.pixels().all(|p| p.0[3] == 255);
+        (img.width(), img.height(), opaque)
+    }
+
+    /// A Home Screen app: the icons iOS asks the root for, the manifest Chrome reads and every
+    /// icon it lists, all without a sign-in (browsers fetch them without cookies) and on the
+    /// plain port too.
+    #[tokio::test]
+    async fn the_home_screen_icons_and_manifest_are_open() {
+        let state = test_state();
+        for uri in ["/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"] {
+            // Opaque: iOS shows black where an icon is transparent.
+            assert_eq!(served_png(&state, uri).await, (180, 180, true), "{uri}");
+        }
+        assert_eq!(
+            served_png(&state, "/static/apple-touch-icon.png").await,
+            (180, 180, true)
+        );
+
+        let (s, h, b) = fetch_anonymous(&state, "/static/manifest.webmanifest", true).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(h[header::CONTENT_TYPE], "application/manifest+json");
+        let m: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(m["id"], "/");
+        assert_eq!(m["name"], "Blue Onyx Prism");
+        assert_eq!(m["short_name"], "Prism");
+        assert_eq!(m["start_url"], "/");
+        assert_eq!(m["scope"], "/");
+        assert_eq!(m["display"], "standalone");
+        assert_eq!(m["background_color"], "#0f2747");
+        assert_eq!(m["theme_color"], "#0f2747");
+        let icons = m["icons"].as_array().unwrap();
+        let mut purposes = Vec::new();
+        for icon in icons {
+            let src = icon["src"].as_str().unwrap();
+            assert_eq!(icon["type"], "image/png", "{src}");
+            let (w, h, opaque) = served_png(&state, src).await;
+            assert_eq!(icon["sizes"], format!("{w}x{h}"), "{src}");
+            let purpose = icon["purpose"].as_str().unwrap();
+            // A maskable icon is cropped by the launcher: it must have no transparent edge.
+            if purpose == "maskable" {
+                assert!(opaque, "{src}");
+            }
+            purposes.push((purpose.to_string(), w));
+        }
+        for want in [("any", 192), ("any", 512), ("maskable", 512)] {
+            assert!(
+                purposes.contains(&(want.0.to_string(), want.1)),
+                "{want:?}: {purposes:?}"
+            );
+        }
+        // Every binary file is served, and listed or the root icon.
+        for (name, _, _) in STATIC_BINARY {
+            let listed = icons.iter().any(|i| i["src"] == format!("/static/{name}"));
+            assert!(listed || *name == "apple-touch-icon.png", "{name}");
+        }
+    }
+
+    /// Every page links the manifest, the touch icon and a header colour per scheme; signed in,
+    /// the nav and the JSON links are there.
+    #[tokio::test]
+    async fn pages_link_the_manifest_icon_and_theme_colours() {
+        let state = test_state();
+        let (s, home) = get_text(&state, "/").await;
+        assert_eq!(s, StatusCode::OK);
+        for want in [
+            "<link rel=\"manifest\" href=\"/static/manifest.webmanifest?v=",
+            "<link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">",
+            "<meta name=\"apple-mobile-web-app-title\" content=\"Prism\">",
+            "<meta name=\"theme-color\" content=\"#0f2747\" media=\"(prefers-color-scheme: light)\">",
+            "<meta name=\"theme-color\" content=\"#0a0d12\" media=\"(prefers-color-scheme: dark)\">",
+            "<nav aria-label=\"Main\"",
+            "<div class=\"endpoints\">",
+            "id=\"pending-restart\"",
+        ] {
+            assert!(home.contains(want), "{want}");
+        }
+        // The theme colours are the header's (`--head`), light then dark.
+        let css = static_file("style.css").unwrap();
+        let (light, dark) = css
+            .split_once("@media (prefers-color-scheme: dark)")
+            .unwrap();
+        assert!(light.contains("--head: #0f2747;"));
+        assert!(dark.contains("--head: #0a0d12;"));
+        // A Home Screen app has no address bar to come back from raw JSON.
+        assert!(css.contains(
+            "@media (display-mode: standalone) {\n  footer .endpoints { display: none; }\n}"
+        ));
+    }
+
+    /// A page for nobody signed in (login, setup, a refusal) has nothing that leads to a
+    /// sign-in: no nav links, no JSON links, no restart indicator, no sign-out.
+    #[tokio::test]
+    async fn a_page_without_nav_links_nowhere_it_cannot_open() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::ACCEPT, "text/html".parse().unwrap());
+        let page =
+            super::super::guard::refused(StatusCode::FORBIDDEN, &headers, "Forbidden", "no".into());
+        let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<a class=\"brand\" href=\"/\">"), "{html}");
+        assert!(html.contains("rel=\"manifest\""), "{html}");
+        for absent in [
+            "<nav",
+            "href=\"/stats",
+            "href=\"/config",
+            "class=\"endpoints\"",
+            "href=\"/v1/",
+            "pending-restart",
+            "action=\"/logout\"",
+        ] {
+            assert!(!html.contains(absent), "{absent}: {html}");
+        }
+    }
+
+    /// The committed icons are what `scripts/gen_icons.py` draws (CI also runs `--check` in
+    /// `scripts/ci/python_self_tests.sh`); skipped without a Python 3 unless
+    /// `BOP_REQUIRE_PYTHON` is set.
+    #[test]
+    fn the_committed_icons_are_what_gen_icons_draws() {
+        use crate::training::progress::test_python;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = root.join("scripts/gen_icons.py");
+        let Some(py) = test_python::python3("gen_icons.py --check") else {
+            return;
+        };
+        let out = test_python::run(py, &["-I", script.to_str().unwrap(), "--check"], "");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("icons ok"), "{text}");
     }
 
     /// Attribute names of every tag in `html` (quoted values skipped), with the tag text.

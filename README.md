@@ -945,8 +945,9 @@ Blue Iris may run on another machine, so the service listens on every interface 
 ([Local network only](#local-network-only)). What answers where:
 
 - **Plain HTTP, port 32168, is for Blue Iris.** The detection API (`/v1/vision/*`), `/v1/status`,
-  `/v1/status/updateavailable`, the minimal `/v1/config` and the static files answer there with no
-  login, for every client of the local network (Blue Iris can neither sign in nor speak HTTPS).
+  `/v1/status/updateavailable`, the minimal `/v1/config`, the static files and the icons
+  (`/favicon.ico`, `/apple-touch-icon.png`) answer there with no login, for every client of the
+  local network (Blue Iris can neither sign in nor speak HTTPS).
   Anything else: a browser's GET is redirected (308) to the same page on the HTTPS port under the
   address it used; other requests get **403** with JSON naming the HTTPS address (**503** while
   the HTTPS listener is down). No credential is accepted there: a request with `Authorization` is
@@ -1058,6 +1059,34 @@ the three read-only, and `POST /config` refuses a changed value. To change one, 
 file (`--onnxruntime-dir` and `--openvino-dir` work too; `download_dir` has no flag), then restart.
 `onnxruntime_dir` must be a folder: a file there is refused and the search goes on, while
 `ORT_DYLIB_PATH`, which only whoever controls the service can set, may name a file.
+
+### Using it from a phone
+
+The web UI works on a phone or tablet on the same local network, with no app to install.
+
+1. Open `https://<server address>:32169/` (the `https_port`; `blue-onyx-prism tls-fingerprint` on
+   the server lists the addresses). The browser warns about the self-signed certificate, as on a
+   computer ([HTTPS](#https)): before going on, compare the SHA-256 fingerprint the phone shows
+   with the one `blue-onyx-prism tls-fingerprint` prints on the server (with `--config <file>`
+   for the service's config). iOS Safari: **Show Details**, then view the certificate; Android
+   Chrome: the warning icon in the address bar, then the certificate. Installing the certificate
+   on the phone so it stops warning is untested, and a later change may cover it.
+2. Sign in ([Signing in](#signing-in)). The usual session rules apply: an hour without use, 12
+   hours at most.
+3. **Add to Home Screen** (iOS Safari: Share, then *Add to Home Screen*; Android Chrome: the menu,
+   then *Add to Home screen* or *Install app*). It opens as an app named Prism with the service's
+   icon and no address bar. It keeps its own cookies, so it signs in on its own, apart from the
+   browser; if it shows the certificate warning, check the fingerprint the same way. The footer's
+   JSON links are hidden there, since a raw JSON page would leave no way back.
+
+If a session ends while you work, a sign-in dialog opens over the page and keeps it, edits
+included; once you have signed in, the page goes on where it was.
+
+**Review with a finger.** Tap a box to select it; drag its handles to resize it, or inside it to
+move it. Pinch to zoom, and drag with two fingers to pan. Turn on **Draw** to add a box: drag it
+out, or tap two opposite corners. **Redraw** sets the selected box's corners with the next two
+taps. **View** holds zoom in and out, *Hide boxes*, *Labels*, *Spotlight*, brighter and darker,
+and *Reset image*.
 
 ## Running as a service
 
