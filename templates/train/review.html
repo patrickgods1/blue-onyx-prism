@@ -33,7 +33,16 @@
 
 <div class="review-grid">
   <div class="review-stage">
-    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-imgmode" class="small secondary">Image</button><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-fit" class="small secondary" hidden>Fit</button></div>
+    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-imgmode" class="small secondary">Image</button><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-fit" class="small secondary" hidden>Fit</button><button type="button" id="rv-draw" class="small secondary" aria-pressed="false" hidden>Draw</button><button type="button" id="rv-redraw" class="small secondary" aria-pressed="false" hidden>Redraw</button><details id="rv-view-menu" class="rv-view-menu" hidden><summary>View</summary><div class="rv-view-items">
+      <button type="button" class="small secondary" data-view="zoom-in">Zoom in</button>
+      <button type="button" class="small secondary" data-view="zoom-out">Zoom out</button>
+      <button type="button" class="small secondary" data-view="hide" aria-pressed="false">Hide boxes</button>
+      <button type="button" class="small secondary" data-view="labels" aria-pressed="true">Labels</button>
+      <button type="button" class="small secondary" data-view="spotlight" aria-pressed="false">Spotlight</button>
+      <button type="button" class="small secondary" data-view="brighter">Brighter</button>
+      <button type="button" class="small secondary" data-view="darker">Darker</button>
+      <button type="button" class="small secondary" data-view="reset">Reset image</button>
+    </div></details></div>
     <canvas id="rv-canvas" width="640" height="360" tabindex="0" aria-label="The frame with its boxes. Click a box to select it, drag its handles to resize it, drag inside it to move it, drag elsewhere to draw a new one; the wheel zooms."></canvas>
     <p id="rv-none" class="empty" hidden>No frame matches the filters. Send frames to review from the <a href="/train/collect">Collect</a> tab, or show all collected frames.</p>
   </div>
@@ -70,7 +79,7 @@
       <table class="review-keys">
         <tbody><!-- filled by review.js from its key list (also the ? overlay) --></tbody>
       </table>
-      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-likely"></span>&#9733; likely real (outlined; first in the list; needs a decision before saving) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; needs a decision before saving) <span class="swatch sw-unlikely"></span>? flagged, unlikely (quieter, after a run that sorted its boxes) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; the pointer over a box shows its full tag.</p>
+      <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-likely"></span>&#9733; likely real (outlined; first in the list; needs a decision before saving) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; needs a decision before saving) <span class="swatch sw-unlikely"></span>? flagged, unlikely (quieter, after a run that sorted its boxes) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected. Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; <span id="rv-legend-hover">the pointer over a box shows its full tag</span>.</p>
     </details>
     </details>
   </aside>
@@ -140,6 +149,7 @@
 <dialog id="rv-keys-dialog" class="rv-keys-dialog" aria-label="Keyboard"></dialog>
 <script src="/static/class-picker.js?v={{ version }}"></script>
 <script src="/static/review-rules.js?v={{ version }}"></script>
+<script src="/static/review-touch.js?v={{ version }}"></script>
 <script src="/static/review.js?v={{ version }}"></script>
 {% include "train/browse_dialog.html" %}
 {% endblock %}

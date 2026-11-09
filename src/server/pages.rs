@@ -74,6 +74,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("class-picker.js", JS),
     asset!("model-picker.js", JS),
     asset!("review-rules.js", JS),
+    asset!("review-touch.js", JS),
     asset!("review.js", JS),
     asset!("welcome.js", JS),
 ];
@@ -1483,6 +1484,17 @@ mod tests {
             assert!(picker < own, "{uri}");
         }
         let (_, review) = get_text(&state, "/train/review").await;
+        // The finger rules (pinch, two-tap box, one finger's drag) before the page script that
+        // reads them.
+        let touch = review.find("/static/review-touch.js?v=");
+        assert!(
+            touch.is_some() && touch < review.find("/static/review.js?v="),
+            "review-touch.js before review.js"
+        );
+        assert!(static_file("review-touch.js").is_some_and(|js| js.contains("ReviewTouch")));
+        for id in ["rv-draw", "rv-redraw", "rv-view-menu"] {
+            assert!(review.contains(&format!("id=\"{id}\"")), "missing #{id}");
+        }
         assert!(review.contains("id=\"rv-label-picker\""));
         assert!(review.contains("id=\"rv-show-picker\""));
         assert!(review.contains("<option value=\"both\">found by 2+ labelers</option>"));
