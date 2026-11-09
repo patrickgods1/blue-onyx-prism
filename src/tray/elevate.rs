@@ -13,7 +13,6 @@
 //! environment variable, never interpolated into a script.
 
 use crate::service_ctl::Action;
-#[cfg(any(windows, target_os = "macos"))]
 use std::path::Path;
 
 /// How an action ended.
@@ -178,16 +177,13 @@ pub fn failure_text(action: Action, code: Option<i32>, output: &str) -> String {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(windows)]
-fn powershell_exe() -> std::path::PathBuf {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    std::path::PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
-}
-
-#[cfg(windows)]
-fn hidden_powershell(script: &str) -> std::process::Command {
-    use std::os::windows::process::CommandExt as _;
-    let mut c = std::process::Command::new(powershell_exe());
+/// Windows PowerShell running `script` (`-EncodedCommand`) with no window of its own, through
+/// [`crate::system_info::windows_powershell_command`]: no inherited `PSModulePath`, so
+/// `Start-Process` and `Add-Type` load when the tray was started from a PowerShell 7 terminal.
+/// The elevated inner PowerShell needs nothing from a module, and its environment is either a
+/// fresh one or this child's, which 5.1 sets to its own default.
+pub fn powershell_command(powershell: &Path, script: &str) -> std::process::Command {
+    let mut c = crate::system_info::windows_powershell_command(powershell);
     c.args([
         "-NoProfile",
         "-NonInteractive",
@@ -195,8 +191,15 @@ fn hidden_powershell(script: &str) -> std::process::Command {
         "Hidden",
         "-EncodedCommand",
         &ps_encode(script),
-    ])
-    .creation_flags(CREATE_NO_WINDOW);
+    ]);
+    c
+}
+
+#[cfg(windows)]
+fn hidden_powershell(script: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+    let mut c = powershell_command(&crate::system_info::windows_powershell_exe(), script);
+    c.creation_flags(CREATE_NO_WINDOW);
     c
 }
 
@@ -209,7 +212,10 @@ pub fn run_elevated(cli: &Path, action: Action) -> Outcome {
     // The elevated process's output is not captured: it would have to be written to a file
     // the (possibly standard) user controls, from a process running as an administrator.
     let inner = windows_inner_script(&cli.to_string_lossy(), action);
-    let outer = windows_outer_script(&powershell_exe().to_string_lossy(), &inner);
+    let outer = windows_outer_script(
+        &crate::system_info::windows_powershell_exe().to_string_lossy(),
+        &inner,
+    );
     let out = hidden_powershell(&outer).output();
     match out {
         Err(e) => Outcome::Failed(format!("Could not run PowerShell to elevate: {e}")),
@@ -317,6 +323,24 @@ mod tests {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16(&units).unwrap()
+    }
+
+    /// Both the UAC wrapper and the error dialog start Windows PowerShell without the
+    /// inherited `PSModulePath`.
+    #[test]
+    fn powershell_children_get_no_module_path() {
+        let exe = crate::system_info::windows_powershell_exe();
+        for script in [
+            windows_outer_script(&exe.to_string_lossy(), "exit 0"),
+            WINDOWS_ALERT_SCRIPT.to_string(),
+        ] {
+            let c = powershell_command(&exe, &script);
+            assert!(crate::system_info::tests::removes_ps_module_path(&c));
+            assert_eq!(c.get_program(), exe.as_os_str());
+            let args: Vec<_> = c.get_args().collect();
+            let encoded = ps_encode(&script);
+            assert_eq!(args.last().copied(), Some(std::ffi::OsStr::new(&encoded)));
+        }
     }
 
     #[test]
