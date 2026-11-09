@@ -428,15 +428,19 @@ fn a_failed_model_is_gone_before_its_replacement_loads() {
     let f = Fixture::start(&["a"], |_| {});
     let old = f.break_model("a");
     let before = f.loads.tried().len();
-    // What the probe saw when the new worker's load began: None until it ran. The loader records
-    // the try before it runs the probe, so waiting on the try alone could read the flag too soon.
-    let seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
-    let (probe_old, slot) = (old.clone(), seen.clone());
+    // What the probe saw when the new worker's load began, and how long after the reload: None
+    // until it ran. The loader records the try before it runs the probe, so waiting on the try
+    // alone could read the flag too soon (how main's CI failed twice before 242bdfc).
+    let seen: Arc<Mutex<Option<(bool, Duration)>>> = Arc::new(Mutex::new(None));
+    let start: Arc<std::sync::OnceLock<Instant>> = Arc::default();
+    let (probe_old, slot, since) = (old.clone(), seen.clone(), start.clone());
     f.loads.set_probe(move |_| {
         let gone = thread_gone(&probe_old);
-        *slot.lock_recover() = Some(gone);
+        let waited = since.get().map_or(Duration::ZERO, Instant::elapsed);
+        *slot.lock_recover() = Some((gone, waited));
     });
     f.loads.hold_after(before + 1);
+    start.get_or_init(Instant::now);
     f.reg.recover_model("a", &f.config).unwrap();
     // Swapped at once: it was not serving, so nothing is kept for the load.
     let w = f.handle("a");
@@ -444,7 +448,15 @@ fn a_failed_model_is_gone_before_its_replacement_loads() {
     wait_until("the new worker's load to look", || {
         seen.lock_recover().is_some()
     });
-    assert_eq!(*seen.lock_recover(), Some(true), "old thread still running");
+    let (gone, waited) = seen.lock_recover().unwrap_or_default();
+    // The contract (`replace_at_once`): the load waits until the old thread ended, at most
+    // `FREE_WAIT`. An old thread still running is a failure only before that bound ran out, so
+    // an old worker starved past it on a loaded runner is not one.
+    assert!(
+        gone || waited >= FREE_WAIT,
+        "old thread still running {waited:?} after the reload (the load must wait up to \
+         {FREE_WAIT:?})"
+    );
     f.loads.release();
     f.ready("a");
     f.stop();

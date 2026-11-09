@@ -560,8 +560,7 @@ fn host_launcher() -> Result<Launcher, String> {
     }
     #[cfg(windows)]
     {
-        let ps = std::env::var_os("SystemRoot")
-            .map(|r| PathBuf::from(r).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"))
+        let ps = Some(crate::system_info::windows_powershell_exe())
             .filter(|p| p.is_file())
             .map_or_else(
                 || "powershell.exe".to_string(),
@@ -834,16 +833,26 @@ fn wait_for<W: Waitable>(
     }
 }
 
+/// The process of `cmd`: program, argv and extra environment. Windows PowerShell goes through
+/// [`crate::system_info::windows_powershell_command`] (no inherited `PSModulePath`, so
+/// `Add-Type` loads when the service was started from a PowerShell 7 terminal).
+fn process(cmd: &PickCommand) -> Command {
+    let mut c = match cmd.tool {
+        Tool::PowerShell => crate::system_info::windows_powershell_command(&cmd.program),
+        Tool::Osascript | Tool::Zenity | Tool::Kdialog => Command::new(&cmd.program),
+    };
+    c.args(&cmd.args).envs(cmd.env.iter().map(|(k, v)| (k, v)));
+    c
+}
+
 /// Run `cmd` until it exits, `timeout` passes or `abandoned` is set (then it is stopped).
 pub(super) fn run(
     cmd: &PickCommand,
     timeout: Duration,
     abandoned: &AtomicBool,
 ) -> std::io::Result<RunOutput> {
-    let mut c = Command::new(&cmd.program);
-    c.args(&cmd.args)
-        .envs(cmd.env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
+    let mut c = process(cmd);
+    c.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -1090,6 +1099,27 @@ mod tests {
             v.push(kdialog_command(k, start, "/usr/bin/kdialog"));
         }
         v
+    }
+
+    /// Only the PowerShell dialog drops `PSModulePath`; every command keeps its own variables.
+    #[test]
+    fn the_windows_dialog_runs_without_an_inherited_module_path() {
+        for c in all_commands(Some("/tmp")) {
+            let p = process(&c);
+            assert_eq!(
+                crate::system_info::tests::removes_ps_module_path(&p),
+                c.tool == Tool::PowerShell,
+                "{c:?}"
+            );
+            for (k, v) in &c.env {
+                assert!(
+                    p.get_envs()
+                        .any(|(pk, pv)| pk == k.as_str() && pv == Some(std::ffi::OsStr::new(v))),
+                    "{k} in {c:?}"
+                );
+            }
+            assert_eq!(p.get_program(), c.program.as_str());
+        }
     }
 
     #[test]

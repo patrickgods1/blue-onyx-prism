@@ -87,6 +87,46 @@ fn total_memory_bytes() -> Option<u64> {
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
 }
 
+/// Environment variable Windows PowerShell 5.1 finds its modules through.
+pub const PS_MODULE_PATH: &str = "PSModulePath";
+
+/// Windows PowerShell 5.1: `System32\WindowsPowerShell\v1.0\powershell.exe` under
+/// `SystemRoot` (`C:\Windows` when unset), an absolute path, so no `powershell.exe` on the
+/// search path runs instead. Built on every OS (tests).
+pub fn windows_powershell_exe() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    std::path::Path::new(&root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
+/// The one way the product starts Windows PowerShell 5.1 (`program`, usually
+/// [`windows_powershell_exe`]): a `Command` without [`PS_MODULE_PATH`] in the child's
+/// environment.
+///
+/// Why: a process started from a PowerShell 7 terminal inherits 7's `PSModulePath`, whose
+/// PowerShell 7 module folders come first. Windows PowerShell then autoloads 7's copies of its
+/// own modules and fails ("The 'Get-Acl' command was found in the module
+/// 'Microsoft.PowerShell.Security', but the module could not be loaded"; any autoloaded
+/// cmdlet can fail so, such as the `Add-Type`, `Start-Process` and `Get-CimInstance` the
+/// product's scripts use). Without the variable, 5.1 builds its own
+/// default. Seen in CI, where every step runs in PowerShell 7; the service, the console exe and
+/// the tray hit it whenever they were started from a PowerShell 7 terminal. Only for Windows
+/// PowerShell: PowerShell 7 (`pwsh`) children need 7's module path.
+pub fn windows_powershell_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    without_ps_module_path(&mut cmd);
+    cmd
+}
+
+/// Removes [`PS_MODULE_PATH`] from `cmd`'s environment, also when it was set on `cmd` itself
+/// (a later `env_remove` wins over an earlier `env`). Case-insensitive on Windows.
+fn without_ps_module_path(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env_remove(PS_MODULE_PATH)
+}
+
 /// Longest wait for the Windows memory query (CIM can hang on a broken WMI provider).
 #[cfg(windows)]
 const MEMORY_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -105,20 +145,8 @@ fn total_memory_bytes() -> Option<u64> {
 /// path) and with [`MEMORY_QUERY_TIMEOUT`]; a hung or missing PowerShell gives `None` (logged).
 #[cfg(windows)]
 fn total_memory_bytes_powershell() -> Option<u64> {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-    let exe = std::path::Path::new(&root)
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
-    ]);
-    match output_within(cmd, MEMORY_QUERY_TIMEOUT) {
+    let exe = windows_powershell_exe();
+    match output_within(memory_query_command(&exe), MEMORY_QUERY_TIMEOUT) {
         Ok(Some(out)) => String::from_utf8(out).ok()?.trim().parse().ok(),
         Ok(None) => {
             tracing::warn!(
@@ -139,6 +167,19 @@ fn total_memory_bytes_powershell() -> Option<u64> {
             None
         }
     }
+}
+
+/// The CIM query of `total_memory_bytes_powershell` (`Get-CimInstance` is module-autoloaded).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn memory_query_command(exe: &std::path::Path) -> std::process::Command {
+    let mut cmd = windows_powershell_command(exe);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+    ]);
+    cmd
 }
 
 /// Run `cmd` and return its stdout, or `Ok(None)` (the child is killed) when it does not
@@ -184,7 +225,7 @@ pub fn os_description() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn nonempty() {
         assert!(!super::cpu_name().is_empty());
@@ -192,6 +233,62 @@ mod tests {
         let _ = super::total_memory_gb();
         // Cached: the same answer twice.
         assert_eq!(super::total_memory_gb(), super::total_memory_gb());
+    }
+
+    /// `(key, None)` in `get_envs()` = removed from the child's environment.
+    pub(crate) fn removes_ps_module_path(cmd: &std::process::Command) -> bool {
+        cmd.get_envs()
+            .any(|(k, v)| k.eq_ignore_ascii_case(super::PS_MODULE_PATH) && v.is_none())
+    }
+
+    #[test]
+    fn windows_powershell_children_get_no_ps_module_path() {
+        let exe = super::windows_powershell_exe();
+        assert!(exe.ends_with("powershell.exe"), "{}", exe.display());
+        let cmd = super::windows_powershell_command(&exe);
+        assert!(removes_ps_module_path(&cmd));
+        assert_eq!(cmd.get_program(), exe.as_os_str());
+        // Set on the command itself first: the removal still wins.
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.env(super::PS_MODULE_PATH, "bogus");
+        super::without_ps_module_path(&mut cmd);
+        assert!(removes_ps_module_path(&cmd));
+        assert!(removes_ps_module_path(&super::memory_query_command(&exe)));
+    }
+
+    /// The real thing: a bogus module path (a folder with a broken
+    /// `Microsoft.PowerShell.Security` first, as PowerShell 7's is for 5.1) set for the child,
+    /// then removed by the helper, and an autoloaded cmdlet still resolves.
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_loads_its_modules_despite_a_foreign_module_path() {
+        let dir = std::env::temp_dir().join(format!("bop-psmodulepath-{}", std::process::id()));
+        let module = dir.join("Microsoft.PowerShell.Security");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(
+            module.join("Microsoft.PowerShell.Security.psm1"),
+            "throw 'bogus module'\n",
+        )
+        .unwrap();
+        let mut cmd = std::process::Command::new(super::windows_powershell_exe());
+        cmd.env(super::PS_MODULE_PATH, &dir);
+        super::without_ps_module_path(&mut cmd);
+        let out = cmd
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; Get-Command Get-Acl | Out-Null; \
+                 $null = Get-Acl -LiteralPath $PSHOME; 'ok'",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{text}\n{err}");
+        assert_eq!(text.trim(), "ok", "{err}");
     }
 
     #[cfg(unix)]
