@@ -112,11 +112,11 @@
         </div>
         <div class="tr-field" data-al-custom>
           <label for="al-camera">Camera</label>
-          <input type="text" id="al-camera" name="camera" placeholder="any">
+          <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="al-camera" name="camera" placeholder="any">
         </div>
         <div class="tr-field" data-al-custom>
           <label for="al-label">Class</label>
-          <input type="text" id="al-label" name="label" placeholder="any">
+          <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="al-label" name="label" placeholder="any">
         </div>
         <div class="tr-field" data-al-custom>
           <label for="al-auto">Auto-labelled</label>
@@ -124,7 +124,7 @@
         </div>
         <div class="tr-field">
           <label for="al-limit">Limit</label>
-          <input type="number" id="al-limit" name="limit" min="1" max="20000" value="200">
+          <input inputmode="numeric" type="number" id="al-limit" name="limit" min="1" max="20000" value="200">
           <p class="muted small">Most frames, in queue order. Preview says when it cuts a run short.</p>
         </div>
       </div>
@@ -133,7 +133,7 @@
         <summary>Other filters</summary>
         <div class="tr-field">
           <label for="al-frames">Filter text</label>
-          <input type="text" id="al-frames" name="frames" placeholder="bucket=empty,import=any">
+          <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="al-frames" name="frames" placeholder="bucket=empty,import=any">
           <p class="muted small"><code>key=value</code> pairs, comma-separated: <code>bucket</code>, <code>import</code> (an import id, or any), <code>source</code> (queue, all; default all here), and any key above (<code>scene</code> day, night, ir; <code>camera</code>; <code>label</code>; <code>status</code> unreviewed, reviewed, skipped, any; <code>auto</code> review, accept, nothing, none, overlaps, both (a pending box found by 2+ labelers), dismissed (frames with hidden low-score boxes); <code>again=1</code>; <code>limit</code>). A key given here wins over its field.</p>
         </div>
       </details>

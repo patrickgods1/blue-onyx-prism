@@ -7,8 +7,41 @@
   var preview = document.getElementById("preview"), drop = document.getElementById("drop");
   var file = null, url = null;
   var COLORS = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#46f0f0", "#f032e6", "#bcf60c", "#fabebe", "#008080"];
+  var PREVIEW_MAX = 4096; // long side of the preview canvas; the upload keeps its size
+  var pickError = document.getElementById("pick-error");
+  if (window.matchMedia && matchMedia("(pointer: coarse)").matches) {
+    document.getElementById("hint-fine").hidden = true;
+    document.getElementById("hint-touch").hidden = false;
+  }
+  var IMAGE_EXT = /\.(webp|heic|heif|avif|gif|bmp|tiff?)$/i, picks = 0;
+  function isImage(f) { return /^image\//.test(f.type) || (!f.type && IMAGE_EXT.test(f.name || "")); }
+  function complain(text) { pickError.textContent = text; pickError.hidden = !text; }
+  // The server decodes PNG and JPEG only: anything else (WebP, HEIC, GIF, AVIF...) is decoded by
+  // the browser and re-encoded as JPEG before it is used.
+  function toJpeg(f) {
+    var stem = (f.name || "photo").replace(/\.[^.]*$/, "") || "photo";
+    return createImageBitmap(f).then(function (bmp) {
+      var c = document.createElement("canvas");
+      c.width = bmp.width; c.height = bmp.height;
+      c.getContext("2d").drawImage(bmp, 0, 0);
+      if (bmp.close) bmp.close();
+      return new Promise(function (resolve, reject) {
+        c.toBlob(function (b) { if (b) resolve(new File([b], stem + ".jpg", {type: "image/jpeg"})); else reject(new Error("encode")); }, "image/jpeg", 0.92);
+      });
+    });
+  }
   function setFile(f) {
-    if (!f || !/^image\//.test(f.type)) return;
+    if (!f || !isImage(f)) return;
+    var mine = ++picks;
+    complain("");
+    if (f.type === "image/png" || f.type === "image/jpeg") { useFile(f); return; }
+    file = null; preview.hidden = true;
+    if (!window.createImageBitmap) { complain("This browser cannot convert " + (f.type || "that file") + ". Choose a PNG or JPEG photo (the server reads those two formats)."); return; }
+    toJpeg(f).then(function (jpg) { if (mine === picks) useFile(jpg); }, function () {
+      if (mine === picks) complain("This browser could not read " + (f.name || "that file") + " as a picture. The server reads PNG and JPEG only: choose one of those.");
+    });
+  }
+  function useFile(f) {
     file = f;
     if (url) URL.revokeObjectURL(url);
     url = URL.createObjectURL(f);
@@ -39,27 +72,31 @@
   }
   function draw(img, preds) {
     var c = document.getElementById("canvas"), ctx = c.getContext("2d");
-    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    // The preview is at most PREVIEW_MAX px on its long side; the server's boxes are in the
+    // photo's own pixels, so they are scaled by the same factor.
+    var k = Math.min(1, PREVIEW_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+    c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+    var kx = c.width / img.naturalWidth, ky = c.height / img.naturalHeight;
     // style.css sizes the canvas from these, keeping the image's ratio.
     c.style.setProperty("--ar", String(c.width / c.height));
     c.style.setProperty("--nw", c.width + "px");
-    ctx.drawImage(img, 0, 0);
+    ctx.drawImage(img, 0, 0, c.width, c.height);
     var lw = Math.max(2, Math.round(Math.min(c.width, c.height) / 300));
     ctx.lineWidth = lw;
     ctx.font = Math.max(12, lw * 7) + "px system-ui, sans-serif";
     ctx.textBaseline = "top";
     preds.forEach(function (p) {
       var col = colorFor(p.label);
-      var w = p.x_max - p.x_min, h = p.y_max - p.y_min;
+      var x0 = p.x_min * kx, y0 = p.y_min * ky;
       ctx.strokeStyle = col;
-      ctx.strokeRect(p.x_min, p.y_min, w, h);
+      ctx.strokeRect(x0, y0, (p.x_max - p.x_min) * kx, (p.y_max - p.y_min) * ky);
       var text = p.label + " " + (p.confidence * 100).toFixed(0) + "%";
       var tw = ctx.measureText(text).width + 8, th = Math.max(12, lw * 7) + 6;
-      var ty = p.y_min - th >= 0 ? p.y_min - th : p.y_min;
+      var ty = y0 - th >= 0 ? y0 - th : y0;
       ctx.fillStyle = col;
-      ctx.fillRect(p.x_min, ty, tw, th);
+      ctx.fillRect(x0, ty, tw, th);
       ctx.fillStyle = "#fff";
-      ctx.fillText(text, p.x_min + 4, ty + 3);
+      ctx.fillText(text, x0 + 4, ty + 3);
     });
   }
   // `effective_threshold` of src/worker/mod.rs: a request value over 1 is a percentage, over 100
@@ -125,7 +162,7 @@
   }
   form.addEventListener("submit", function (e) {
     if (!window.fetch || !window.FormData) return;
-    if (!file && input.files[0]) setFile(input.files[0]);
+    if (!file && input.files[0]) { e.preventDefault(); if (pickError.hidden) setFile(input.files[0]); return; }
     if (!file) return;
     e.preventDefault();
     var model = document.getElementById("model").value;

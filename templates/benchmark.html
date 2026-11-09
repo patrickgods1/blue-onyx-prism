@@ -42,7 +42,7 @@
       </div>
       {% endfor %}
       </div>
-      <label>Add a folder on the server <span class="with-browse"><input type="text" id="add-folder" placeholder="/path/to/BlueIris/Alerts"><button type="button" class="browse secondary" data-browse="folder" data-target="add-folder" data-title="Choose an image folder" hidden>Browse&hellip;</button></span><span class="muted small">Images, optional COCO JSON / YOLO labels / manifest.json.</span></label>
+      <label>Add a folder on the server <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="add-folder" placeholder="/path/to/BlueIris/Alerts"><button type="button" class="browse secondary" data-browse="folder" data-target="add-folder" data-title="Choose an image folder" hidden>Browse&hellip;</button></span><span class="muted small">Images, optional COCO JSON / YOLO labels / manifest.json.</span></label>
       <details class="help"><summary>About datasets and their licences</summary><p>Selected datasets that are not downloaded are fetched when the run starts (pinned, SHA-256 checked). A folder without labels is scored against the reference model.</p>
         <dl class="ds-licences">{% for d in datasets %}{% if !d.license.is_empty() %}<dt>{{ d.title }}</dt><dd>{{ d.license }}</dd>{% endif %}{% endfor %}</dl></details>
     </fieldset>
@@ -63,9 +63,9 @@
   </div>
   <details class="help run-settings" data-keep="d:run-settings"><summary>Settings: images per dataset, timed runs, warm-up, reference model</summary>
     <div class="bench-settings">
-      <label>Images per dataset (0 = all) <input type="number" name="max_images" min="0" value="{{ max_images }}"><span class="field-hint">Small sets give noisy results: aim for a few hundred images with labelled objects before trusting a difference.</span></label>
-      <label>Timed runs per image <input type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"><span class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</span></label>
-      <label>Warm-up runs <input type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
+      <label>Images per dataset (0 = all) <input inputmode="numeric" type="number" name="max_images" min="0" value="{{ max_images }}"><span class="field-hint">Small sets give noisy results: aim for a few hundred images with labelled objects before trusting a difference.</span></label>
+      <label>Timed runs per image <input inputmode="numeric" type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"><span class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</span></label>
+      <label>Warm-up runs <input inputmode="numeric" type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
       <input type="hidden" name="low_priority" value="0"><label class="check"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run at low priority (keeps the desktop responsive)</label>
       <label>Reference model (stand-in labels for datasets without them)
         <select name="reference_model">
@@ -196,7 +196,7 @@
   <details class="card adv" id="adv-report" data-keep="d:adv-report"><summary>Save report</summary>
     <p class="muted">Writes a standalone HTML report of the saved results (the same report as <code>benchmark --report</code>) into a folder as <code>benchmark-report-&lt;UTC time&gt;.html</code>. The results themselves stay beside the config (<code>{{ results_file }}</code>), where <code>auto</code> device ordering reads them.</p>
     <form id="report-form" class="actions">
-      <label>Folder <span class="with-browse"><input type="text" id="report-dir" name="report_dir" placeholder="/path/to/reports"><button type="button" class="browse secondary" data-browse="folder" data-target="report-dir" data-title="Choose a folder for the report" hidden>Browse&hellip;</button></span></label>
+      <label>Folder <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="report-dir" name="report_dir" placeholder="/path/to/reports"><button type="button" class="browse secondary" data-browse="folder" data-target="report-dir" data-title="Choose a folder for the report" hidden>Browse&hellip;</button></span></label>
       <button type="button" id="report-save">Save report</button>
       <span id="report-msg" class="muted" aria-live="polite"></span>
     </form>

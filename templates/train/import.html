@@ -10,13 +10,13 @@
     </fieldset>
     <div class="tr-field" data-source="path">
       <label for="import-path">Video, image or folder</label>
-      <div class="with-browse tr-browse"><input type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" data-title="Choose a clip or image folder" hidden>Folder&hellip;</button></div>
+      <div class="with-browse tr-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="import-path" name="path" autocomplete="off" placeholder="D:\BlueIris\Clips or clip.mp4"><button type="button" class="browse secondary" data-browse="video" data-target="path" hidden>Video file&hellip;</button><button type="button" class="browse secondary" data-browse="folder" data-target="path" data-title="Choose a clip or image folder" hidden>Folder&hellip;</button></div>
       <p class="muted small" id="import-preview" aria-live="polite" hidden></p>
       <p class="muted small">Blue Iris clip and alert folders work. <code>.bvr</code> clips cannot be read: export them to MP4 in Blue Iris first.</p>
     </div>
     <div class="tr-field" data-source="url">
       <label for="import-url">Video URL</label>
-      <input type="url" id="import-url" name="url" placeholder="https://...">
+      <input autocapitalize="none" autocorrect="off" spellcheck="false" type="url" id="import-url" name="url" placeholder="https://...">
       <p class="muted small">Downloaded with yt-dlp. Sites that list unsecured or private cameras (Insecam and the like) are refused, and live streams are never read.</p>
     </div>
     <div class="tr-field" data-source="dataset">
@@ -32,11 +32,11 @@
     </div>
     <div class="tr-field tr-narrow">
       <label for="import-frames">Frames to keep</label>
-      <input type="number" id="import-frames" name="frames" min="1" max="5000" value="200">
+      <input inputmode="numeric" type="number" id="import-frames" name="frames" min="1" max="5000" value="200">
     </div>
     <div class="tr-field">
       <label for="import-out">Save frames to</label>
-      <div class="with-browse tr-browse"><input type="text" id="import-out" name="out_dir" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose where to save the imported frames" hidden>Folder&hellip;</button></div>
+      <div class="with-browse tr-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="import-out" name="out_dir" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="out_dir" data-title="Choose where to save the imported frames" hidden>Folder&hellip;</button></div>
       <p class="muted small">Empty = the dataset folder, shown on the Collect and Review tabs. Another folder gets the same layout (<code>&lt;scene&gt;/&lt;camera&gt;/&lt;date&gt;/</code>, sidecars, review queue); review them by choosing this folder on the Review tab.</p>
     </div>
     <details class="tr-more">
@@ -59,22 +59,22 @@
         </div>
         <div class="tr-field">
           <label for="import-dedup">Dedup window (s)</label>
-          <input type="number" id="import-dedup" name="dedup_window" min="0" max="86400" step="1" value="10">
+          <input inputmode="numeric" type="number" id="import-dedup" name="dedup_window" min="0" max="86400" step="1" value="10">
           <p class="muted small">Near duplicates (dHash) within this time are dropped.</p>
         </div>
         <div class="tr-field">
           <label for="import-every">One frame every (s)</label>
-          <input type="number" id="import-every" name="every" min="0" max="3600" step="1" value="10">
+          <input inputmode="numeric" type="number" id="import-every" name="every" min="0" max="3600" step="1" value="10">
           <p class="muted small">Also a periodic frame when nothing moves; 0 = off.</p>
         </div>
         <div class="tr-field">
           <label for="import-max-candidates">Candidates per video</label>
-          <input type="number" id="import-max-candidates" name="max_candidates" min="1" max="20000" step="1" placeholder="1500">
+          <input inputmode="numeric" type="number" id="import-max-candidates" name="max_candidates" min="1" max="20000" step="1" placeholder="1500">
           <p class="muted small">At most this many frames read from one video; the 20,000 of an import are shared fairly by cameras, videos and images.</p>
         </div>
         <div class="tr-field">
           <label for="import-camera">Camera folder</label>
-          <input type="text" id="import-camera" name="camera">
+          <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="import-camera" name="camera">
           <p class="muted small">Empty = from the file names.</p>
         </div>
       </div>

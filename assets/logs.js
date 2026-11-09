@@ -2,7 +2,7 @@
 (function () {
   var view = document.getElementById("logview"), status = document.getElementById("log-status");
   var showLevel = document.getElementById("show-level"), search = document.getElementById("search");
-  var follow = document.getElementById("follow"), pauseBtn = document.getElementById("pause");
+  var follow = document.getElementById("follow"), followNote = document.getElementById("follow-note"), pauseBtn = document.getElementById("pause");
   var RANK = {ERROR: 1, WARN: 2, INFO: 3, DEBUG: 4, TRACE: 5};
   var entries = [], cursor = 0, paused = false, MAX = parseInt(view.dataset.capacity, 10) || 2000;
   function line(e) {
@@ -25,18 +25,31 @@
     return d;
   }
   function atBottom() { return view.scrollHeight - view.scrollTop - view.clientHeight < 40; }
+  // Our own scrolls to the end set `ownScroll` so the scroll handler below does not read them as
+  // the user leaving the bottom; it is cleared after the frame that carries the scroll event.
+  var ownScroll = false, noteTimer = null;
+  function toBottom() {
+    ownScroll = true;
+    view.scrollTop = view.scrollHeight;
+    requestAnimationFrame(function () { ownScroll = false; });
+  }
+  function note(text) {
+    followNote.textContent = text;
+    clearTimeout(noteTimer);
+    noteTimer = setTimeout(function () { followNote.textContent = ""; }, 4000);
+  }
   function rerender() {
     var frag = document.createDocumentFragment();
     entries.filter(visible).forEach(function (e) { frag.appendChild(row(e)); });
     view.replaceChildren(frag);
-    if (follow.checked) view.scrollTop = view.scrollHeight;
+    if (follow.checked) toBottom();
   }
   function append(list) {
     var stick = follow.checked || atBottom();
     list.forEach(function (e) { if (visible(e)) view.appendChild(row(e)); });
     var extra = view.children.length - MAX;
     for (var i = 0; i < extra; i++) view.removeChild(view.firstChild);
-    if (stick && follow.checked) view.scrollTop = view.scrollHeight;
+    if (stick && follow.checked) toBottom();
   }
   function poll() {
     return fetch("/logs.json?after=" + cursor, {cache: "no-store", headers: {"Accept": "application/json"}}).then(function (r) {
@@ -59,7 +72,18 @@
   var poller = PrismPoll.create({run: poll, period: 2000});
   showLevel.addEventListener("change", rerender);
   search.addEventListener("input", rerender);
-  follow.addEventListener("change", function () { if (follow.checked) view.scrollTop = view.scrollHeight; });
+  follow.addEventListener("change", function () { if (follow.checked) toBottom(); });
+  // Scrolling up to read stops Follow (the next poll would snap back); returning to the end resumes it.
+  view.addEventListener("scroll", function () {
+    if (ownScroll) return;
+    if (!atBottom() && follow.checked) {
+      follow.checked = false;
+      note("Follow is off while you read; scroll to the end to resume.");
+    } else if (atBottom() && !follow.checked) {
+      follow.checked = true;
+      note("Following new events.");
+    }
+  });
   pauseBtn.addEventListener("click", function () {
     paused = !paused;
     pauseBtn.textContent = paused ? "Resume" : "Pause";
@@ -71,7 +95,7 @@
     (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(function () {
       status.textContent = "copied " + entries.filter(visible).length + " lines";
     }, function () {
-      var ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select();
+      var ta = document.createElement("textarea"); ta.value = t; ta.readOnly = true; ta.setAttribute("inputmode", "none"); document.body.appendChild(ta); ta.select();
       try { document.execCommand("copy"); status.textContent = "copied"; } catch (e) { status.textContent = "copy failed"; }
       ta.remove();
     });

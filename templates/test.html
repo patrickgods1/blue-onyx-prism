@@ -5,7 +5,9 @@
 <form method="post" action="/test#server-result" enctype="multipart/form-data" class="card" id="test-form">
   <div class="drop" id="drop" tabindex="0">
     <label>Image <input type="file" name="image" id="image" accept="image/*" required></label>
-    <p class="muted">Choose a file, drop an image here, or paste one from the clipboard (Ctrl/Cmd+V).</p>
+    <p class="muted" id="hint-fine">Choose a file, drop an image here, or paste one from the clipboard (Ctrl/Cmd+V).</p>
+    <p class="muted" id="hint-touch" hidden>Choose a photo, or take one.</p>
+    <p class="error" id="pick-error" role="alert" hidden></p>
     <img id="preview" alt="selected image preview" hidden>
   </div>
   <label>Model

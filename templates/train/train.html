@@ -10,7 +10,7 @@
   <form method="post" action="/training/dir" class="tr-form" id="training-dir-form">
     <div class="tr-field">
       <label for="training-dir">Training folder</label>
-      <div class="with-browse tr-browse"><input type="text" id="training-dir" name="training_dir" value="{{ training_dir_setting }}" autocomplete="off" placeholder="{{ training_dir_default }}"{% if jobs_busy %} disabled{% endif %}><button type="button" class="browse secondary" data-browse="folder" data-target="training_dir" data-title="Choose the training folder" hidden{% if jobs_busy %} disabled{% endif %}>Folder&hellip;</button><button type="submit" class="secondary"{% if jobs_busy %} disabled{% endif %}>Save</button></div>
+      <div class="with-browse tr-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="training-dir" name="training_dir" value="{{ training_dir_setting }}" autocomplete="off" placeholder="{{ training_dir_default }}"{% if jobs_busy %} disabled{% endif %}><button type="button" class="browse secondary" data-browse="folder" data-target="training_dir" data-title="Choose the training folder" hidden{% if jobs_busy %} disabled{% endif %}>Folder&hellip;</button><button type="submit" class="secondary"{% if jobs_busy %} disabled{% endif %}>Save</button></div>
       <p class="muted small">Now <code>{{ training_dir }}</code>: the run records (<code>runs.json</code>, <code>tasks.json</code>), prepared datasets, held-out sets, logs, import work and the Dataset tab's exports. Empty = <code>{{ training_dir_default }}</code>. A new folder is used at once; runs, imports and exports in the old folder stay there and are not moved.{% if jobs_busy %} It cannot change while a job is queued or running.{% endif %}</p>
     </div>
   </form>
@@ -47,7 +47,7 @@
     <fieldset class="tr-classes" id="train-classes">
       <legend>Classes</legend>
       <div id="train-picker">
-        <input type="text" name="classes" aria-label="Classes" placeholder="person, car, dog, cat, raccoon">
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="classes" aria-label="Classes" placeholder="person, car, dog, cat, raccoon">
         <p class="muted small">Comma-separated, in head order; empty = all of the export. (With scripts: a list of the ticked folders' classes and their boxes.)</p>
       </div>
       <p class="small" id="train-classes-msg" role="status"></p>
@@ -78,7 +78,7 @@
           </div>
           <div class="tr-field">
             <label for="train-bal-max">Max repeat</label>
-            <input type="number" id="train-bal-max" name="balance_max_repeat" min="1" max="{{ balance.most }}" step="1" value="{{ balance.max_repeat }}">
+            <input inputmode="numeric" type="number" id="train-bal-max" name="balance_max_repeat" min="1" max="{{ balance.most }}" step="1" value="{{ balance.max_repeat }}">
             <p class="muted small">Most balancing repeats of one frame (1&ndash;{{ balance.most }}).</p>
           </div>
         </div>
@@ -132,7 +132,7 @@
     <p class="muted small">Datasets are review export folders (YOLO layout: <code>classes.txt</code>, <code>images/</code>, <code>labels/</code>): the saved ones and the Dataset tab's exports under <code>{{ training_dir }}/exports</code>. The export's validation split (whole camera days) becomes the benchmark set; an export of one camera day has none, so a share of its frames is held out instead. Frames that several ticked exports share are used once.</p>
     <div class="tr-field">
       <label for="train-folder">Another folder</label>
-      <div class="with-browse tr-browse"><input type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" data-title="Choose a review export folder" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
+      <div class="with-browse tr-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="train-folder" name="dataset_path" autocomplete="off" placeholder="C:\BlueOnyx\exports\review-2026-10"><button type="button" class="browse secondary" data-browse="folder" data-target="dataset_path" data-title="Choose a review export folder" hidden>Folder&hellip;</button><button type="submit" class="secondary" formaction="/training/datasets" formnovalidate name="save" value="1">Save folder</button></div>
       <p class="muted small">Used by this run when filled; Save folder keeps it in the list above.</p>
     </div>
   {% if available %}
@@ -141,12 +141,12 @@
     <div class="tr-grid">
       <div class="tr-field">
         <label for="train-epochs">Epochs</label>
-        <input type="number" id="train-epochs" name="epochs" min="1" max="1000" value="{{ epochs }}" placeholder="recommended">
+        <input inputmode="numeric" type="number" id="train-epochs" name="epochs" min="1" max="1000" value="{{ epochs }}" placeholder="recommended">
         <p class="muted small">Empty = each family's recommendation (shown under its name). A cap: the run stops once it converges.</p>
       </div>
       <div class="tr-field">
         <label for="train-patience">Patience</label>
-        <input type="number" id="train-patience" name="patience" min="0" max="1000" value="{{ patience }}" placeholder="recommended">
+        <input inputmode="numeric" type="number" id="train-patience" name="patience" min="0" max="1000" value="{{ patience }}" placeholder="recommended">
         <p class="muted small">Epochs without a gain of the metric below before the run stops and keeps its best epoch. Empty = recommended, 0 = off (train every epoch).</p>
       </div>
       <div class="tr-field">
@@ -158,12 +158,12 @@
       </div>
       <div class="tr-field">
         <label for="train-lr">Learning rate</label>
-        <input type="text" id="train-lr" name="lr" inputmode="decimal" autocomplete="off" value="{{ lr }}" placeholder="recommended">
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="train-lr" name="lr" autocomplete="off" value="{{ lr }}" placeholder="recommended">
         <p class="muted small">Empty = each family's default ({{ lr_defaults }}). Lower it (e.g. 5e-5) when the validation mAP jumps between epochs.</p>
       </div>
       <div class="tr-field">
         <label for="train-name">Model name</label>
-        <input type="text" id="train-name" name="name">
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="train-name" name="name">
         <p class="muted small" id="train-name-hint">One run only (one model, one scene); empty = <code>custom-</code>/<code>day-</code>/<code>night-&lt;model&gt;-&lt;date&gt;</code>.</p>
       </div>
       {% if let Some(auto) = gpu_choices.first() %}
@@ -176,7 +176,7 @@
     </div>
     <div class="tr-field">
       <label for="train-install">Install the model in</label>
-      <div class="with-browse tr-browse"><input type="text" id="train-install" name="install_dir" autocomplete="off" placeholder="{{ models_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="install_dir" data-title="Choose where to install the trained model" hidden>Folder&hellip;</button></div>
+      <div class="with-browse tr-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="train-install" name="install_dir" autocomplete="off" placeholder="{{ models_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="install_dir" data-title="Choose where to install the trained model" hidden>Folder&hellip;</button></div>
       <p class="muted small">Empty = the models folder (<code>{{ models_dir }}</code>). The <code>.onnx</code>, its <code>.yaml</code> classes and <code>.provenance.json</code> go there, and the config entry points at that file.</p>
     </div>
     <label class="check"><input type="checkbox" name="night_aug" id="train-night"> Night augmentation</label>
@@ -198,12 +198,12 @@
     <div class="tr-grid">
         <div class="tr-field">
           <label for="train-batch">Batch</label>
-          <input type="number" id="train-batch" name="batch" min="1" max="256">
+          <input inputmode="numeric" type="number" id="train-batch" name="batch" min="1" max="256">
           <p class="muted small">Empty = the suggested batch (at most 16).</p>
         </div>
         <div class="tr-field">
           <label for="train-imgsz">Input size</label>
-          <input type="number" id="train-imgsz" name="imgsz" min="160" max="1536" step="32">
+          <input inputmode="numeric" type="number" id="train-imgsz" name="imgsz" min="160" max="1536" step="32">
           <p class="muted small">Empty = the size's own. 384 is the RF-DETR Nano default. 512 or 640 finds distant people on 4 MP cameras better but costs about 1.8x / 2.8x inference time; check the held-out benchmark's ms on your slowest device.</p>
         </div>
         <div class="tr-field">

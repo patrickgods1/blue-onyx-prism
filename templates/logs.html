@@ -24,12 +24,12 @@
         <option value="error">errors</option>
       </select>
     </label>
-    <label class="inline-label">Search <input type="search" id="search" placeholder="text or target"></label>
+    <label class="inline-label">Search <input enterkeyhint="search" autocapitalize="none" autocorrect="off" spellcheck="false" type="search" id="search" placeholder="text or target"></label>
     <label class="check"><input type="checkbox" id="follow" checked> Follow</label>
     <button type="button" class="secondary" id="pause">Pause</button>
     <button type="button" class="secondary" id="copy">Copy</button>
     <button type="button" class="secondary" id="download">Download .txt</button>
-    <span class="muted" id="log-status"></span>
+    <span class="muted" id="log-status"></span> <span class="muted" id="follow-note" role="status" aria-live="polite"></span>
   </div>
 </div>
 <p class="muted">The last {{ capacity }} events this process logged at the server log level (newest last). Live JSON: <a href="/logs.json"><code>/logs.json?after=&lt;seq&gt;&amp;level=&lt;min&gt;</code></a>.</p>
