@@ -283,8 +283,9 @@ function Assert-WebUi([string]$Log) {
     # redirect even with -SkipHttpErrorCheck. curl does not follow one and reports the status and
     # the resolved Location.
     $r = Get-Redirect "$tls/config"
-    if ($r.Code -ne 303 -or -not $r.Location.StartsWith("$tls/login")) {
-        Fail "$tls/config without a sign-in answered $($r.Code) to '$($r.Location)', expected 303 to the login page" @($Log)
+    # The sign-in page, or the setup page while no account exists (a fresh install).
+    if ($r.Code -ne 303 -or -not ($r.Location.StartsWith("$tls/login") -or $r.Location -eq "$tls/setup")) {
+        Fail "$tls/config without a sign-in answered $($r.Code) to '$($r.Location)', expected 303 to the login or setup page" @($Log)
     }
     Write-Host "GET $tls/config without a sign-in -> 303 $($r.Location)"
     $plain = "http://127.0.0.1:$Port/config"
