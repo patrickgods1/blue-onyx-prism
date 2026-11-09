@@ -918,7 +918,12 @@ mod tests {
         for id in &ids {
             assert_eq!(s.record(id).unwrap().last_active, T + 498);
         }
-        assert!(s.flush(T + 1000, true));
+        // Whether this forced flush still has anything to write depends on the interleaving:
+        // a thread's lazy flush may already have written the last move (a check that finds
+        // `last_active` moved past it by another thread marks nothing). Either way the file
+        // ends up holding the final state.
+        s.flush(T + 1000, true);
+        assert_eq!(file_last_active(&s), vec![T + 498; 4]);
         assert_eq!(Sessions::load(&d.0, T + 1000).len(), 4);
     }
 
