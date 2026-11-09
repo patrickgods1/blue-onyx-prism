@@ -437,6 +437,17 @@ button.browse-item.selected { background: var(--ok-bg); color: var(--ok-fg); }
 .browse-size { color: var(--muted); white-space: nowrap; }
 #browse-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 
+/* Sign-in dialog (live.js): the session ended; signing in here keeps the page and its edits. */
+dialog.signin-dialog { width: min(24rem, calc(100vw - 32px)); max-height: 90vh; max-height: 90dvh; overflow: auto; overscroll-behavior: contain; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 1rem 1.2rem; }
+dialog.signin-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+dialog.signin-dialog h2 { margin: 0 0 0.4rem; font-size: 1.2rem; }
+dialog.signin-dialog p { margin: 0.4rem 0; }
+dialog.signin-dialog input { width: 100%; box-sizing: border-box; }
+.signin-form .actions { display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; margin-top: 0.75rem; }
+.signin-form .actions button { flex: 1 1 8rem; }
+.signin-msg { font-size: 0.9rem; }
+.signin-note { font-size: 0.85rem; }
+
 /* ---- Shared components (UI restructuring) ---------------------------------------------- */
 /* Collapsed help text: one sentence stays in the card, the rest opens on demand. */
 details.help { margin: 0.25rem 0 0.75rem; font-size: 0.9rem; }

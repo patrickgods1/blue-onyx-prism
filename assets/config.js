@@ -434,6 +434,98 @@ document.addEventListener("click", function (e) {
     ev.preventDefault(); ev.returnValue = "";
   });
 
+  // ---- Drafts: unsaved edits across a discarded tab (phones discard background tabs, and
+  // `beforeunload` does not run there). When the page goes out of view, the edited fields of the
+  // Models card, the Server form and the models JSON are kept in sessionStorage (PrismDraft,
+  // live.js) with the config revision the forms show. The next load puts them back only when the
+  // first /v1/config answer is the same revision (same epoch): through `change` / `input` events,
+  // so the page's own handlers run (the device switch rebases the threshold field, the save bars
+  // say "Unsaved changes", leaving asks). Changed since: dropped, and the page says so. Fields
+  // that no longer exist are counted in the notice. Password fields are never kept.
+  var DRAFT = "config", draftDecided = false;
+  function draftForms() { return [card, serverForm, jsonForm].filter(function (f) { return f && f.id; }); }
+  // A field's key in its form: its name, plus the value for a checkbox or radio (`enabled` and
+  // `default_model` repeat per model row), plus "#n" for a later field of the same key.
+  function fieldKeys(form) {
+    var seen = {}, out = [];
+    fields(form).forEach(function (c) {
+      if (c.type === "password") return;
+      var k = c.name + (c.type === "checkbox" || c.type === "radio" ? "\u0000" + c.value : "");
+      seen[k] = (seen[k] || 0) + 1;
+      out.push([seen[k] > 1 ? k + "#" + seen[k] : k, c]);
+    });
+    return out;
+  }
+  function keepDraft() {
+    if (!window.PrismDraft || !draftDecided) return;
+    var forms = {}, any = false;
+    draftForms().forEach(function (f) {
+      var vals = {}, n = 0;
+      fieldKeys(f).forEach(function (p) {
+        var c = p[1];
+        if (!U.edited(c)) return;
+        vals[p[0]] = c.type === "checkbox" || c.type === "radio" ? c.checked : c.value; n++;
+      });
+      if (n) { forms[f.id] = vals; any = true; }
+    });
+    if (any) PrismDraft.save(DRAFT, {id: DRAFT, rev: epoch + ":" + pageRev, forms: forms});
+    else PrismDraft.drop(DRAFT);
+  }
+  // Put the kept values back; returns how many fields were not found.
+  function restoreDraft(saved) {
+    var missing = 0;
+    Object.keys(saved || {}).forEach(function (id) {
+      var form = document.getElementById(id), vals = saved[id] || {};
+      if (!form || draftForms().indexOf(form) < 0) { missing += Object.keys(vals).length; return; }
+      var mapOf = function () { var m = {}; fieldKeys(form).forEach(function (p) { m[p[0]] = p[1]; }); return m; };
+      var choice = function (c) { return c.type === "checkbox" || c.type === "radio" || c.tagName === "SELECT"; };
+      // Choices first (a device switch rebases the threshold field and enables its default
+      // field), then the typed values, found again among the fields that are enabled now.
+      var map = mapOf(), typedKeys = [];
+      Object.keys(vals).forEach(function (k) {
+        var c = map[k];
+        if (!c || !choice(c)) { typedKeys.push(k); return; }
+        if (c.tagName === "SELECT") c.value = String(vals[k]); else c.checked = !!vals[k];
+        c.dispatchEvent(new Event("change", {bubbles: true}));
+      });
+      map = mapOf();
+      typedKeys.forEach(function (k) {
+        var c = map[k];
+        if (!c || choice(c)) { missing++; return; }
+        c.value = String(vals[k]);
+        c.dispatchEvent(new Event("input", {bubbles: true}));
+        c.dispatchEvent(new Event("change", {bubbles: true}));
+      });
+      if (Object.keys(vals).length) say(form, "ok-text", "Restored your unsaved edits from before the page was closed. Save to keep them.");
+    });
+    return missing;
+  }
+  // The first answer decides (after the listener above has brought the forms to it).
+  L.onConfig(function (j) {
+    if (draftDecided) return;
+    draftDecided = true;
+    if (!window.PrismDraft) return;
+    var d = PrismDraft.load(DRAFT), v = PrismDraft.verdict(d, DRAFT, j.epoch + ":" + j.revision);
+    if (v === "none") return;
+    PrismDraft.drop(DRAFT);
+    var ids = d && d.forms ? Object.keys(d.forms) : [];
+    if (v !== "restore") {
+      ids.forEach(function (id) {
+        var f = document.getElementById(id);
+        if (f && draftForms().indexOf(f) >= 0) say(f, "error-text", "Your unsaved edits from before the page was closed were dropped: the configuration changed since.");
+      });
+      return;
+    }
+    var missing = restoreDraft(d.forms);
+    if (missing) {
+      var f0 = document.getElementById(ids[0]);
+      if (f0 && draftForms().indexOf(f0) >= 0) say(f0, "ok-text", "Restored your unsaved edits from before the page was closed, except " + missing + " field(s) no longer on the page. Save to keep them.");
+    }
+    noteUnsaved();
+  });
+  window.addEventListener("pagehide", keepDraft);
+  document.addEventListener("visibilitychange", function () { if (document.hidden) keepDraft(); });
+
   // Save without leaving the page: JSON answers shown next to the button.
   function msgOf(form) { return form.querySelector(".form-msg"); }
   function say(form, cls, text) { var m = msgOf(form); m.className = "form-msg " + cls; m.textContent = text; }

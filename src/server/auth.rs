@@ -514,15 +514,17 @@ pub(super) fn see_other(location: &str) -> Response {
     no_store((StatusCode::SEE_OTHER, [(header::LOCATION, value)]).into_response())
 }
 
-/// Where a refused browser goes: the login page, with the way back. A request that is not a GET
-/// has none: a redirect cannot repeat it, and its path may not take a GET at all.
-fn login_url(method: &Method, uri: &Uri) -> String {
-    let back = uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .filter(|_| matches!(*method, Method::GET | Method::HEAD))
-        .and_then(safe_next);
-    match back {
+/// Where a refused browser goes: the login page, with the way back. For a GET that is the
+/// request itself. Another method cannot be repeated by a redirect (and its path may not take a
+/// GET at all), so the way back is the page that sent it: the `Referer`'s path and query, when
+/// that page is on this server (its authority is the request's `Host`); else none.
+fn login_url(method: &Method, uri: &Uri, headers: &HeaderMap) -> String {
+    let back = if matches!(*method, Method::GET | Method::HEAD) {
+        uri.path_and_query().map(|p| p.as_str().to_string())
+    } else {
+        guard::request_host(headers, uri).and_then(|host| guard::referer_on_host(headers, &host))
+    };
+    match back.as_deref().and_then(safe_next) {
         Some(path) => format!("/login?next={}", encode_uri_component(path)),
         None => "/login".to_string(),
     }
@@ -609,7 +611,7 @@ pub(super) fn refused(
         Outcome::Closed(why) => closed(why, headers),
         Outcome::Anonymous { stale } => {
             let mut resp = if wants_html(headers) {
-                see_other(&login_url(method, uri))
+                see_other(&login_url(method, uri, headers))
             } else {
                 with_bearer_challenge(json_refusal(
                     StatusCode::UNAUTHORIZED,
