@@ -1,5 +1,6 @@
 {
   "port": 32168,
+  "https_port": 32169,
   "allow_remote_admin": false,
   "device": "auto",
   "auto_download": false,

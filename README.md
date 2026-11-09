@@ -186,11 +186,12 @@ internet access the first time, and the web UI shows the download progress.
 | Fedora / RHEL 9+ | `blue-onyx-prism-<version>-1.x86_64.rpm` | `/opt/blue-onyx-prism` | `/var/lib/blue-onyx-prism` |
 | macOS (Apple silicon) | `blue-onyx-prism-<version>-macos-aarch64.pkg` | `/usr/local/blue-onyx-prism` | `/usr/local/var/blue-onyx-prism` |
 
-After installing, open `http://127.0.0.1:32168/`. The installers are not code-signed yet:
+After installing, open `https://localhost:32169/` (the browser warns once about the self-signed
+certificate: see [HTTPS](#https)); Blue Iris uses port 32168. The installers are not code-signed yet:
 
 - **Windows:** SmartScreen may show "Windows protected your PC". Click *More info*, then *Run anyway*.
   The MSI installs the `BlueOnyxPrismService` service (runs as Local Service, starts automatically),
-  a firewall rule for TCP 32168 (`msiexec /i <file>.msi PORT=<n>` for another port's rule; local subnet
+  firewall rules for TCP 32168 and 32169 (`msiexec /i <file>.msi PORT=<n> HTTPS_PORT=<n>` for other ports' rules; local subnet
   on Domain and Private networks only, so Blue Iris on another subnet or a PC on a Public network needs
   the manual rule in [packaging/windows/README.md](packaging/windows/README.md)), and a
   Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn /norestart`. Uninstall from
@@ -305,8 +306,11 @@ it; every key can also be set in the file.
 | Field | Default | Meaning |
 |---|---|---|
 | `format` | `1` | Layout version of the config file, written on every save. Leave it alone: a file with a later `format` (written by a newer version) is refused with a message instead of misread. A file without it is format 1. Integer. Applies: not editable. UI: no |
-| `port` | `32168` | HTTP listen port. Integer 1-65535. Applies: process restart. UI: yes |
-| `bind_address` | `0.0.0.0` | Address to listen on; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
+| `port` | `32168` | Plain HTTP listen port (Blue Iris, the detection API). Integer 1-65535. Applies: process restart. UI: yes |
+| `https_port` | `32169` | HTTPS listen port (the web UI; same routes as `port` for now). Must differ from `port`. Integer 1-65535. Applies: process restart. UI: yes. See [HTTPS](#https) |
+| `tls_cert_path` | not set | Your own HTTPS certificate (PEM, the chain allowed, leaf first) instead of the generated self-signed one; set together with `tls_key_path`. A relative path is under the data root. Used as given, never written. Applies: process restart. UI: read-only; set it in the config file, see [HTTPS](#https) |
+| `tls_key_path` | not set | The private key of `tls_cert_path` (PEM: PKCS#8, PKCS#1 or SEC1). Both or neither. Applies: process restart. UI: no; set it in the config file |
+| `bind_address` | `0.0.0.0` | Address the HTTP and HTTPS listeners bind; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
 | `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `allowed_networks` | `[]` | Networks served besides the local network (loopback, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10`), e.g. a VPN: `["100.64.0.0/10"]` for Tailscale. Every other client is refused on every route. List of up to 32 CIDRs (a bare address = one address), stored in network form; `/0` is refused. Applies: at once. UI: read-only; set it in the config file, see [Local network only](#local-network-only) |
@@ -759,7 +763,9 @@ All of them apply at once: they are read when a benchmark starts.
 
 ## Web UI
 
-Open `http://<host>:32168/` in a browser:
+Open `https://<host>:32169/` in a browser (`https://localhost:32169/` on the server; see
+[HTTPS](#https) for the certificate warning). `http://<host>:32168/` still serves the same pages
+for now; Blue Iris keeps using it:
 
 | Page | What it does |
 |---|---|
@@ -806,8 +812,44 @@ the most uploads allowed in progress, `body_timeout`: an upload took over 10 s t
 - `blue_onyx_prism_process_open_fds`: open file descriptors (Linux only).
 - `blue_onyx_prism_dataset_requests_total`, `blue_onyx_prism_dataset_offered_total`, `blue_onyx_prism_dataset_saved_total`, `blue_onyx_prism_dataset_no_bucket_total`, `blue_onyx_prism_dataset_frames_total{bucket}`, `blue_onyx_prism_dataset_dropped_total{reason="queue_full|rate|dup|disk|error"}`, `blue_onyx_prism_dataset_bytes` and `blue_onyx_prism_dataset_collect_disabled`: the dataset collector (`collect`).
 
-`log_path`, `port` and `bind_address` changes need a full process restart. The UI has no
-TLS, and clients on this machine need no login: do not expose the port beyond your LAN.
+`log_path`, `port`, `https_port`, `tls_cert_path`, `tls_key_path` and `bind_address` changes need
+a full process restart. Clients on this machine need no login: do not expose the ports beyond your
+LAN.
+
+### HTTPS
+
+The service listens twice: plain HTTP on `port` (32168, Blue Iris and the detection API, which
+cannot speak TLS) and HTTPS on `https_port` (32169, the web UI). Both serve the same routes for
+now. HTTP never waits for HTTPS: if the HTTPS port is taken or its certificate does not load, the
+log says why (and what holds the port), HTTP keeps serving, and HTTPS is tried again every 30 s.
+The start-up log names the address and the certificate's fingerprint:
+`HTTPS on https://localhost:32169/ (certificate SHA-256 AB:CD:...)`.
+
+- **The certificate** is self-signed, made on the first start and kept in `<data root>/auth/tls/`
+  (`cert.pem`, `key.pem`; the `auth` folder is readable by the service's account and
+  administrators only: mode 0700/0600 on Unix, a protected ACL without Users on Windows). ECDSA
+  P-256, valid two years, for `localhost`, `127.0.0.1`, `::1`, the computer's name and
+  `<name>.local`, and the addresses the machine had then. It stays the same across restarts and
+  address changes, so the browser asks once; it is renewed by itself 30 days before it ends (the log
+  says so from 60 days), and a damaged pair is replaced with a warning.
+- **Check the fingerprint once.** The browser warns about a certificate no authority signed. Before
+  accepting it, compare the SHA-256 fingerprint it shows (certificate details) with the one the
+  server prints: `blue-onyx-prism tls-fingerprint` (with `--config <file>` for the service's config;
+  run it as the service's account), which also lists the `https://<address>:32169/` URLs. A match
+  means you reached this server and nothing in between.
+- `blue-onyx-prism tls-regenerate` makes a new certificate (after a rename, say, so the new name is
+  in it); a running service switches to it within seconds, and browsers ask once more.
+- **Your own certificate:** set `tls_cert_path` and `tls_key_path` in the config file (PEM; for
+  example from your own CA, or a public one for a name that points at this machine) and restart.
+  The files are used as given and never written; `tls-regenerate` refuses to run. A changed file is
+  picked up without a restart. If the pair does not load, HTTPS stays down with the reason in the
+  log (HTTP keeps working) and the files are read again every 30 s. The Config page shows the path
+  but cannot change it.
+- TLS 1.2 and 1.3, HTTP/1.1, no client certificates. No HSTS: with a self-signed certificate it
+  would make the warning impossible to click through.
+- Each port keeps at most 256 connections open, and 32 per address on HTTPS (an IPv6 client counts
+  by its /64); on HTTP the per-address cap is at least the detection in-flight cap, so a busy Blue
+  Iris gets the detection API's own 503 rather than a closed connection. A TLS handshake has 10 s.
 
 ### Local network only
 
@@ -1033,7 +1075,10 @@ The image contains IPcam-general; the compose file mounts it through the named v
 `deploy/models` and name them in `deploy/config/blue_onyx_prism_config.json` (copied there from
 `deploy/docker-config.json` on first start; edit it, then `docker compose restart`).
 
-The compose file publishes the port on the host's loopback only (`127.0.0.1:32168:32168`). Inside
+The compose file publishes both ports on the host's loopback only (`127.0.0.1:32168:32168` for
+HTTP, `127.0.0.1:32169:32169` for the HTTPS web UI; the certificate lives in the `data` volume, and
+`docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json tls-fingerprint`
+prints its fingerprint). Inside
 Docker every client, the host's browser included, arrives from the bridge network, never from
 loopback, so with the shipped `"allow_remote_admin": false` the admin pages (Config, Test, Logs,
 Benchmark) answer 403 and the detection API works:

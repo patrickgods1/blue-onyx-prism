@@ -30,16 +30,20 @@ cargo build --release --locked --bins
   read (the tray reads the port from the config). Commands that write here, such as `hf-login` or a `fetch` by hand,
   need an elevated terminal. Every install, repair and upgrade sets this again, so an upgrade corrects an older install.
   `tools\hf` has its own protected DACL, because it holds the Hugging Face token of `hf-login`, and Users cannot read it.
-- Application event log source `BlueOnyxPrism`, firewall rule `Blue Onyx Prism (<PORT>)` (see below),
-  Start Menu shortcuts "Blue Onyx Prism" (the tray icon app) and "Blue Onyx Prism Web UI" (`http://127.0.0.1:32168/`).
+  `auth` (the HTTPS certificate's private key, made by the service on its first start) has one too: Administrators/SYSTEM
+  full control, LocalService modify, no Users.
+- Application event log source `BlueOnyxPrism`, firewall rules `Blue Onyx Prism (<PORT>)` and
+  `Blue Onyx Prism HTTPS (<HTTPS_PORT>)` (see below), Start Menu shortcuts "Blue Onyx Prism" (the tray icon app) and
+  "Blue Onyx Prism Web UI" (`https://localhost:32169/`; the browser warns once about the self-signed certificate, compare
+  its SHA-256 fingerprint with `blue-onyx-prism.exe --config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json tls-fingerprint`).
 - Tray app: `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\BlueOnyxPrismTray` starts it at login for every user.
   A running tray is terminated (WiX `CloseApplication`) before an upgrade or uninstall replaces/removes its exe. The
   installer does not launch it at the end (it starts at the next login or from the Start Menu).
 
 ## Firewall
 
-The rule `Blue Onyx Prism (<PORT>)` allows TCP `<PORT>` from the local subnet only, on the Domain and Private network
-profiles. A Blue Iris on the same subnet, or on the same PC, needs nothing more. Two cases do:
+The rules `Blue Onyx Prism (<PORT>)` (plain HTTP, Blue Iris) and `Blue Onyx Prism HTTPS (<HTTPS_PORT>)` (the web UI)
+allow their TCP port from the local subnet only, on the Domain and Private network profiles. A Blue Iris on the same subnet, or on the same PC, needs nothing more. Two cases do:
 
 - **Blue Iris on another subnet or VLAN.** Add your own rule, for that machine's address, in an elevated PowerShell:
 
@@ -55,8 +59,9 @@ profiles. A Blue Iris on the same subnet, or on the same PC, needs nothing more.
 
 ## Properties
 
-`PORT` (default 32168): firewall rule port only; also set `port` in the config if you change it. Example:
-`msiexec /i blue-onyx-prism.msi /qn /norestart PORT=32169` (without `/norestart`, a silent install that finds a file in use may restart the machine). The install folder can be changed in the UI or with `INSTALLFOLDER=`.
+`PORT` (default 32168) and `HTTPS_PORT` (default 32169): firewall rule ports only; also set `port` / `https_port` in the
+config if you change them. They must differ (the install refuses otherwise). Example:
+`msiexec /i blue-onyx-prism.msi /qn /norestart PORT=8080 HTTPS_PORT=8443` (without `/norestart`, a silent install that finds a file in use may restart the machine). The install folder can be changed in the UI or with `INSTALLFOLDER=`.
 
 `REMOVEDATA=1` on uninstall deletes the data folder (below). Only the value `1` does. `KEEPDATA=1` asked for keeping
 that folder before it became the default: it is still accepted, so old scripts work, and wins over `REMOVEDATA=1`.
@@ -94,8 +99,8 @@ The MSI does not change `ServicesPipeTimeout`.
 
 ## CI smoke test
 
-`smoke-test.ps1 -Msi <path> [-Port 32168]` (elevated): installs, checks service/account/HTTP/config, the data folder's
-DACL, the required privileges, the firewall rule's scope and profiles and the tray exe, Run value and shortcuts (the tray
+`smoke-test.ps1 -Msi <path> [-Port 32168] [-HttpsPort 32169]` (elevated): installs, checks service/account/HTTP/config, the
+data folder's DACL, the `auth` folder's protected DACL (no Users), the required privileges, both firewall rules' scope and profiles and the tray exe, Run value and shortcuts (the tray
 is not run), uninstalls, checks cleanup. Four rounds: `REMOVEDATA=1` leaves nothing behind; over the deleted folder, a plain
 uninstall keeps only the data folder, a seeded dataset file included; over that data with an older version's ACL and a
 token, both folders' DACLs are corrected, the data is intact and `KEEPDATA=1` keeps it; a last install and `REMOVEDATA=1`

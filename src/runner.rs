@@ -283,6 +283,9 @@ struct Process {
     /// the process restarts).
     bound_address: std::net::IpAddr,
     bound_port: u16,
+    /// The HTTPS listener's settings at process start (`https_port`, `tls_cert_path`,
+    /// `tls_key_path`): like the port, a change is pending until the process restarts.
+    https: (u16, Option<PathBuf>, Option<PathBuf>),
     /// One benchmark runner for the process, so its last results survive a restart.
     benchmark: Arc<crate::benchmark::service::BenchmarkService>,
     /// Wrong admin tokens per peer: a restart must not forgive them.
@@ -341,6 +344,7 @@ impl Process {
                 // address shows as pending until the process restarts).
                 c.port = self.bound_port;
                 c.bind_address = self.bound_address;
+                (c.https_port, c.tls_cert_path, c.tls_key_path) = self.https.clone();
                 c
             }),
             apply_lock: std::sync::Mutex::new(()),
@@ -398,6 +402,19 @@ impl Process {
                 port = next.port,
                 bind_address = %next.bind_address,
                 "port and bind_address changes take effect after the process is restarted"
+            );
+        }
+        if (next.https_port, &next.tls_cert_path, &next.tls_key_path)
+            != (
+                current.https_port,
+                &current.tls_cert_path,
+                &current.tls_key_path,
+            )
+        {
+            warn!(
+                https_port = next.https_port,
+                "https_port, tls_cert_path and tls_key_path changes take effect after the process \
+                 is restarted (restart the service or the program)"
             );
         }
         next
@@ -648,8 +665,10 @@ fn run_server_inner(
     let started = Instant::now();
     // The listener is bound once and survives generation restarts (a port change in the config
     // applies when the process restarts).
+    // HTTPS starts with the server (`serve_on`) and never holds HTTP up: a port it cannot
+    // bind, or a certificate that does not load, is logged and retried in the background.
     let listeners = match rt.block_on(server::bind(config.bind_address, config.port)) {
-        Ok(l) => l,
+        Ok(l) => l.with_https(server::HttpsPlan::of(&config)),
         Err(e) => {
             let holder = (config.port != 0).then(|| crate::port_holder::lookup(config.port));
             return Err(BindFailed::new(
@@ -693,6 +712,11 @@ fn run_server_inner(
         started,
         bound_address: config.bind_address,
         bound_port: listeners.port(),
+        https: (
+            config.https_port,
+            config.tls_cert_path.clone(),
+            config.tls_key_path.clone(),
+        ),
         store: Arc::new(crate::config_store::ConfigStore::new(
             config.clone(),
             config_path.clone(),

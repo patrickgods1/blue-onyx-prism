@@ -311,7 +311,8 @@ pub struct Server {
 
 impl Server {
     /// Start the production run loop (`runner::run_server_on`) with `config` saved to
-    /// `config_path`. `config.port` is replaced by a free port. Returns once HTTP answers.
+    /// `config_path`. `config.port` and `config.https_port` are replaced by free ports. Returns
+    /// once HTTP answers.
     pub async fn start(config: Config, config_path: PathBuf) -> Self {
         // A port picked by `free_port` can be taken by another process before the server binds
         // it; when the run loop exits early (bind error), retry on a new port.
@@ -319,6 +320,8 @@ impl Server {
         for _ in 0..5 {
             let mut config = config.clone();
             config.port = free_port();
+            // Never the default HTTPS port: a service on this machine may hold it.
+            config.https_port = free_port();
             config.save(&config_path).expect("write config");
             let base = format!("http://127.0.0.1:{}", config.port);
             let token = CancellationToken::new();

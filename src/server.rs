@@ -6,6 +6,9 @@
 //! outside it before reading anything, and the router's outermost middleware
 //! ([`guard::network_rule`]) refuses such a request, or one whose forwarding headers name such a
 //! client, with 403 on every route.
+//!
+//! The listeners ([`listen`]): plain HTTP on `port` and HTTPS on `https_port` serve this same
+//! router; HTTP never depends on HTTPS.
 
 use crate::cli::LogReloadHandle;
 use crate::config::Config;
@@ -24,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 mod apply;
 mod auth;
@@ -37,6 +40,7 @@ mod detect;
 mod devices;
 mod diagnostics;
 mod guard;
+mod listen;
 mod live;
 mod network;
 mod pages;
@@ -65,6 +69,9 @@ pub(crate) use detect::BODY_LIMIT;
 use detect::{custom_list, detection_custom, detection_default};
 use devices::model_selection;
 use devices::{DevicesSnapshot, devices_json, devices_snapshot};
+#[cfg(test)]
+use listen::HEADER_READ_TIMEOUT;
+pub use listen::{HttpsPlan, HttpsPort, Listeners, bind, serve_on};
 use pages::{
     favicon, live_js, logs_json, logs_page, prometheus, static_asset, stats_json, stats_page,
     style_css, test_page, test_submit, update_available, welcome,
@@ -415,17 +422,11 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
 }
 
 /// How a connection reached the server, a request extension the accept loop adds next to
-/// `ConnectInfo`. Every connection is `Plain` HTTP today; nothing decides by it yet.
+/// `ConnectInfo`: the HTTP port (`Plain`) or the HTTPS port (`Tls`, [`listen`]). Both serve the
+/// same routes today; nothing decides by it yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transport {
     Plain,
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the TLS listener adds it; the tests mark requests with it"
-        )
-    )]
     Tls,
 }
 
@@ -700,13 +701,21 @@ pub(crate) fn training_queue_busy() -> bool {
 #[derive(Clone, Debug)]
 pub struct Shared {
     current: Arc<std::sync::RwLock<Arc<AppState>>>,
+    /// The bound HTTPS port of the process ([`listen`]): one for every generation.
+    https: HttpsPort,
 }
 
 impl Shared {
     pub(crate) fn new(state: Arc<AppState>) -> Self {
         Self {
             current: Arc::new(std::sync::RwLock::new(state)),
+            https: HttpsPort::default(),
         }
+    }
+
+    /// The bound HTTPS port of this process (`None` while the HTTPS listener is down).
+    pub fn https_port(&self) -> HttpsPort {
+        self.https.clone()
     }
 
     /// The generation new requests are served by.
@@ -733,169 +742,11 @@ impl axum::extract::FromRef<Shared> for Arc<AppState> {
     }
 }
 
-/// The process's HTTP listeners (bound once, see [`bind`]).
-#[derive(Debug)]
-pub struct Listeners {
-    v4: tokio::net::TcpListener,
-    v6: Option<tokio::net::TcpListener>,
-    port: u16,
-}
-
-impl Listeners {
-    /// The bound port (useful after binding port 0).
-    pub(crate) fn port(&self) -> u16 {
-        self.port
+/// A handler can take `State<HttpsPort>` next to its `State<Arc<AppState>>`.
+impl axum::extract::FromRef<Shared> for HttpsPort {
+    fn from_ref(shared: &Shared) -> Self {
+        shared.https_port()
     }
-}
-
-/// Bind `address:port`; for `0.0.0.0` and `127.0.0.1` also `[::1]:port` (best effort,
-/// `localhost` may resolve to it). Called once per process run: a port in use is a startup
-/// error.
-pub async fn bind(address: std::net::IpAddr, port: u16) -> anyhow::Result<Listeners> {
-    let addr = std::net::SocketAddr::new(address, port);
-    let v4 = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
-        anyhow::anyhow!("binding {addr}: {e} (is another instance running on port {port}?)")
-    })?;
-    let port = v4.local_addr().map(|a| a.port()).unwrap_or(port);
-    // `localhost` may resolve to ::1 first, and some clients do not fall back to 127.0.0.1.
-    let v6 = match address {
-        std::net::IpAddr::V4(a) if a.is_unspecified() || a.is_loopback() => {
-            let loopback6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
-            match tokio::net::TcpListener::bind(loopback6).await {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    warn!("not listening on {loopback6}: {e}");
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
-    info!("listening on {addr}; open http://localhost:{port}/");
-    Ok(Listeners { v4, v6, port })
-}
-
-/// Longest a client may take to send a request head. With hyper 1.x HTTP/1 this timer also
-/// runs while a keep-alive connection waits for its next request (hyper restarts it as soon as
-/// a response is done: `proto/h1/conn.rs`, `poll_read_head`), so it is the idle timeout too: a
-/// connection silent for this long is closed (slowloris and idle keep-alive alike).
-pub(crate) const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long a shutdown waits for in-flight requests to finish before closing their
-/// connections anyway.
-pub(crate) const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10);
-
-/// Pause after an accept error that is not about one connection (e.g. out of file
-/// descriptors), so the loop does not spin.
-const ACCEPT_ERROR_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish,
-/// for at most `GRACEFUL_SHUTDOWN_TIMEOUT`). Runs for the whole process: generation restarts
-/// swap `shared` instead of stopping it. Connections are HTTP/1.1 served by hyper with a
-/// timer, so `HEADER_READ_TIMEOUT` applies to request heads and idle keep-alive waits.
-pub async fn serve_on(
-    listeners: Listeners,
-    shared: Shared,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
-    let app = router(shared.clone());
-    match listeners.v6 {
-        Some(l6) => {
-            tokio::join!(
-                accept_loop(listeners.v4, app.clone(), shared.clone(), shutdown.clone()),
-                accept_loop(l6, app, shared, shutdown)
-            );
-        }
-        None => accept_loop(listeners.v4, app, shared, shutdown).await,
-    }
-    info!("HTTP server stopped");
-    Ok(())
-}
-
-/// The hyper connection builder: HTTP/1.1 only (as before: axum's `http1` feature), keep-alive,
-/// [`HEADER_READ_TIMEOUT`] driven by tokio's timer.
-fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor> {
-    let mut builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .http1_only();
-    builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT)
-        .keep_alive(true);
-    builder
-}
-
-/// Accept connections on `listener` until `shutdown`, then let the open ones finish their
-/// requests (graceful shutdown, at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]). A peer outside the
-/// network rule (read from `shared`'s current config at each accept, [`guard::admit`]) is closed
-/// at once: nothing is read from it or written to it.
-async fn accept_loop(
-    listener: tokio::net::TcpListener,
-    app: Router,
-    shared: Shared,
-    shutdown: CancellationToken,
-) {
-    let builder = connection_builder();
-    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    loop {
-        let (stream, peer) = tokio::select! {
-            () = shutdown.cancelled() => break,
-            accepted = listener.accept() => match accepted {
-                Ok(c) => c,
-                Err(e) if is_connection_error(&e) => continue,
-                Err(e) => {
-                    error!("accepting an HTTP connection: {e}");
-                    tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
-                    continue;
-                }
-            },
-        };
-        if !guard::admit(peer, &shared) {
-            drop(stream);
-            continue;
-        }
-        let router = app.clone();
-        // The peer address feeds the network rule and the admin-route check ([`admin_only`]).
-        let service =
-            hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                let ext = req.extensions_mut();
-                ext.insert(axum::extract::ConnectInfo(peer));
-                ext.insert(Transport::Plain);
-                // `Router` is always ready (its `poll_ready` returns `Ready` at once).
-                tower::Service::call(&mut router.clone(), req)
-            });
-        let conn = builder
-            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-            .into_owned();
-        let conn = graceful.watch(conn);
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!(%peer, "HTTP connection ended: {e}");
-            }
-        });
-    }
-    drop(listener);
-    if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful.shutdown())
-        .await
-        .is_err()
-    {
-        warn!(
-            "HTTP connections still busy {} s after shutdown; closing them",
-            GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
-        );
-    }
-}
-
-/// Accept errors about one connection (the next accept may well succeed), as axum's `serve`.
-fn is_connection_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-    )
 }
 
 /// Run blocking handler work (file reads and walks, runtime library probes, page rendering) on

@@ -179,6 +179,9 @@ fn global_label(k: &str) -> String {
     match k {
         "port" => "Port".into(),
         "bind_address" => "Bind address".into(),
+        "https_port" => "HTTPS port".into(),
+        "tls_cert_path" => "TLS certificate file".into(),
+        "tls_key_path" => "TLS key file".into(),
         "allow_remote_admin" => "Allow remote administration".into(),
         "allowed_hosts" => "Allowed host names".into(),
         "allowed_networks" => "Allowed networks".into(),
@@ -387,10 +390,21 @@ pub struct Pending {
     pub global: Vec<String>,
     /// Reasons per model (normalized name), e.g. "device: auto → openvino:cpu".
     pub models: BTreeMap<String, Vec<String>>,
-    /// Changes only a process restart applies (`port`, `bind_address`, `log_path`,
-    /// `log_format`).
+    /// Changes only a process restart applies ([`PROCESS_GLOBALS`]).
     pub process: Vec<String>,
 }
+
+/// Globals only a process restart applies: the listeners are bound once per process (the
+/// HTTPS one with its certificate source), and the log file is opened once.
+pub const PROCESS_GLOBALS: &[&str] = &[
+    "port",
+    "bind_address",
+    "https_port",
+    "tls_cert_path",
+    "tls_key_path",
+    "log_path",
+    "log_format",
+];
 
 impl Pending {
     pub fn count(&self) -> usize {
@@ -600,7 +614,7 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
             value_text(k, x),
             value_text(k, y)
         );
-        if matches!(g, "port" | "bind_address" | "log_path" | "log_format") {
+        if PROCESS_GLOBALS.contains(&g) {
             out.process
                 .push(format!("{text} (needs a process restart)"));
         } else {
@@ -903,6 +917,15 @@ mod tests {
         }
         let runtime: Vec<(&str, Edit)> = vec![
             ("port", Box::new(|c| c.port = 4000)),
+            ("https_port", Box::new(|c| c.https_port = 4001)),
+            (
+                "tls_cert_path",
+                Box::new(|c| c.tls_cert_path = Some("cert.pem".into())),
+            ),
+            (
+                "tls_key_path",
+                Box::new(|c| c.tls_key_path = Some("key.pem".into())),
+            ),
             (
                 "bind_address",
                 Box::new(|c| c.bind_address = "127.0.0.1".parse().unwrap()),

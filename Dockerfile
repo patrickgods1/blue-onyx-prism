@@ -1,6 +1,6 @@
 # Blue Onyx Prism: Linux x86_64 image with Intel GPU support via /dev/dri.
 # Build:  docker build -t blue-onyx-prism .
-# Run:    docker run --rm -p 127.0.0.1:32168:32168 --device /dev/dri:/dev/dri \
+# Run:    docker run --rm -p 127.0.0.1:32168:32168 -p 127.0.0.1:32169:32169 --device /dev/dri:/dev/dri \
 #           --read-only --tmpfs /tmp -v bop-models:/app/models -v bop-data:/app/data \
 #           -v $PWD/cache:/app/cache -v $PWD/config:/app/config \
 #           --group-add $(getent group render | cut -d: -f3) blue-onyx-prism
@@ -52,7 +52,9 @@ USER openvino
 # worker, collector and runtime threads all touch image-sized buffers, so a long run leaves many
 # fragmented arenas that are rarely returned and resident memory creeps up. Two keep it bounded.
 ENV MALLOC_ARENA_MAX=2
-EXPOSE 32168
+# 32168: plain HTTP (Blue Iris, detection API); 32169: HTTPS (web UI, self-signed certificate in
+# the data volume, `tls-fingerprint` prints its fingerprint).
+EXPOSE 32168 32169
 # GET /v1/status answers 200 when a model is ready (or degraded) and 503 while models download or
 # compile or when none loaded, so `docker ps` shows "starting" until the service can detect. The
 # start period covers the first model download + compile (--start-period only suppresses

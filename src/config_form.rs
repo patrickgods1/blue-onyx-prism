@@ -24,6 +24,7 @@ use tracing::warn;
 pub const FORM_FIELDS: &[&str] = &[
     "port",
     "bind_address",
+    "https_port",
     "allow_remote_admin",
     "allowed_hosts",
     "request_timeout_secs",
@@ -62,9 +63,12 @@ pub const LIBRARY_PATH_SETTINGS: [&str; 3] = ["download_dir", "onnxruntime_dir",
 
 /// Other settings only the config file sets, for the same reason: `allowed_networks` decides
 /// which networks reach the server at all (`server::network`), so a page that could widen it
-/// could open the server to the internet. A form gets [`check_file_only`]; every other writer
-/// starts from the current config, so a save from a page keeps the file's value.
-pub const FILE_ONLY_SETTINGS: [&str; 1] = ["allowed_networks"];
+/// could open the server to the internet; `tls_cert_path` / `tls_key_path` name files the
+/// service loads as its HTTPS identity, so a page that could point them elsewhere could make it
+/// serve a certificate of someone else's choosing (or read a file of the service's account as a
+/// key). A form gets [`check_file_only`]; every other writer starts from the current config, so
+/// a save from a page keeps the file's value.
+pub const FILE_ONLY_SETTINGS: [&str; 3] = ["allowed_networks", "tls_cert_path", "tls_key_path"];
 
 /// The overlap rule behind the Config page's "drop person on potted plant" checkbox.
 pub const PLANT_RULE: (&str, &str) = ("person", "potted plant");
@@ -156,6 +160,12 @@ pub fn parse_config_form(
         c.port = num("port", v)?;
         if c.port == 0 {
             bail!("port: must be 1-65535");
+        }
+    }
+    if let Some(v) = get("https_port") {
+        c.https_port = num("https_port", v)?;
+        if c.https_port == 0 {
+            bail!("https_port: must be 1-65535");
         }
     }
     if let Some(v) = get("bind_address") {
@@ -293,7 +303,21 @@ fn check_library_paths(c: &Config, form: &std::collections::HashMap<String, Stri
 /// Refuse a form that changes a [`FILE_ONLY_SETTINGS`] entry. The list the page shows (any
 /// separators, any spelling of the same networks) is no change, and no field keeps it too.
 fn check_file_only(c: &Config, form: &std::collections::HashMap<String, String>) -> Result<()> {
-    let [networks] = FILE_ONLY_SETTINGS;
+    let [networks, cert, key] = FILE_ONLY_SETTINGS;
+    for (name, current) in [(cert, &c.tls_cert_path), (key, &c.tls_key_path)] {
+        let shown = current.as_ref().map(|p| p.display().to_string());
+        if form
+            .get(name)
+            .is_some_and(|v| v.trim() != shown.as_deref().unwrap_or(""))
+        {
+            anyhow::bail!(
+                "{name}: not changed. It names the file the HTTPS listener loads as its identity, \
+                 so a web form cannot set it. Edit \"{name}\" in the config file on the server \
+                 (with its partner, tls_cert_path and tls_key_path go together), then restart \
+                 the service"
+            );
+        }
+    }
     let Some(v) = form.get(networks) else {
         return Ok(());
     };
@@ -1460,6 +1484,77 @@ mod tests {
         for key in FILE_ONLY_SETTINGS {
             assert!(!FORM_FIELDS.contains(&key), "{key}");
         }
+    }
+
+    /// The TLS files are the HTTPS identity: no form may set, change or clear them; a form that
+    /// shows the current value passes, and every other form keeps them.
+    #[test]
+    fn tls_files_cannot_change_through_a_form() {
+        let mut unset = with_model();
+        for (key, value) in [
+            ("tls_cert_path", "/elsewhere/cert.pem"),
+            ("tls_key_path", "/elsewhere/key.pem"),
+        ] {
+            let mut c = unset.clone();
+            let e = apply_config_form(&mut c, &form(&[(key, value)]))
+                .unwrap_err()
+                .to_string();
+            assert!(e.starts_with(&format!("{key}: not changed")), "{e}");
+            assert!(e.contains("config file"), "{e}");
+            assert_eq!(c, unset);
+        }
+        apply_config_form(&mut unset, &form(&[("tls_cert_path", " ")])).unwrap();
+        assert_eq!(unset.tls_cert_path, None);
+
+        let mut c = with_model();
+        c.tls_cert_path = Some(PathBuf::from("certs").join("prism.pem"));
+        c.tls_key_path = Some(PathBuf::from("certs").join("prism.key"));
+        c.normalize();
+        let before = c.clone();
+        let shown = |p: &Option<PathBuf>| p.as_ref().unwrap().display().to_string();
+        let same = form(&[
+            ("tls_cert_path", &shown(&before.tls_cert_path)),
+            ("tls_key_path", &shown(&before.tls_key_path)),
+        ]);
+        apply_config_form(&mut c, &same).unwrap();
+        assert_eq!(c, before);
+        for clear in ["tls_cert_path", "tls_key_path"] {
+            let mut c = before.clone();
+            assert!(apply_config_form(&mut c, &form(&[(clear, "")])).is_err());
+            assert_eq!(c, before);
+        }
+        apply_config_form(&mut c, &form(&[("port", "4000")])).unwrap();
+        assert_eq!(
+            (&c.tls_cert_path, &c.tls_key_path),
+            (&before.tls_cert_path, &before.tls_key_path)
+        );
+        for key in FILE_ONLY_SETTINGS {
+            assert!(!FORM_FIELDS.contains(&key), "{key}");
+        }
+    }
+
+    /// `https_port` is a form field like `port`, refused when it equals `port`.
+    #[test]
+    fn https_port_field() {
+        let mut c = with_model();
+        apply_config_form(&mut c, &form(&[("https_port", "8443")])).unwrap();
+        assert_eq!(c.https_port, 8443);
+        let before = c.clone();
+        for (value, what) in [
+            ("0", "https_port"),
+            ("70000", "https_port"),
+            ("x", "https_port"),
+            ("32168", "also `port`"),
+        ] {
+            let e = apply_config_form(&mut c, &form(&[("https_port", value)]))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(what), "{value}: {e}");
+            assert_eq!(c, before);
+        }
+        // Swapping both in one post is fine.
+        apply_config_form(&mut c, &form(&[("port", "8443"), ("https_port", "32168")])).unwrap();
+        assert_eq!((c.port, c.https_port), (8443, 32168));
     }
 
     #[test]

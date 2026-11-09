@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Removes the Blue Onyx Prism Windows service, its event log source and firewall rule, and
+    Removes the Blue Onyx Prism Windows service, its event log source and firewall rules, and
     restores the ServicesPipeTimeout that install_service.ps1 recorded before raising it.
 .DESCRIPTION
     Keeps the data, like every uninstall of this program. Here it sits in the install folder with
@@ -9,7 +9,7 @@
     training runs), so there is no switch that removes only the data: the script prints that
     folder and the command that deletes it. A dir the config names outside it stays too.
 #>
-param([int]$Port = 32168)
+param([int]$Port = 32168, [int]$HttpsPort = 32169)
 
 Set-StrictMode -Version Latest
 # Best effort: a failing step warns and the rest of the cleanup still runs.
@@ -40,10 +40,11 @@ if ($svc) {
     Write-Host "Service $ServiceName not installed."
 }
 
-$ruleName = "Blue Onyx Prism ($Port)"
-if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
-    Remove-NetFirewallRule -DisplayName $ruleName
-    Write-Host "Removed firewall rule '$ruleName'."
+foreach ($ruleName in @("Blue Onyx Prism ($Port)", "Blue Onyx Prism HTTPS ($HttpsPort)")) {
+    if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
+        Remove-NetFirewallRule -DisplayName $ruleName
+        Write-Host "Removed firewall rule '$ruleName'."
+    }
 }
 
 # ServicesPipeTimeout: put back the value recorded at install (-1 = it was not set), unless it was

@@ -131,7 +131,8 @@ fn icon(color: IconColor) -> anyhow::Result<Icon> {
 
 /// Everything the event loop tracks besides the widgets.
 struct State {
-    addr: SocketAddr,
+    /// What "Open web UI" opens ([`web_ui_url`]).
+    ui_url: String,
     cli: PathBuf,
     last: Option<Poll>,
     busy: Option<Action>,
@@ -242,10 +243,12 @@ pub(super) fn run(args: TrayArgs) -> ExitCode {
             None
         }
     };
-    let addr = service_addr(args.port, read_service_listen());
+    let listen = read_service_listen();
+    let addr = service_addr(args.port, listen);
+    let ui_url = web_ui_url(addr, args.https_port, listen);
     let cli = cli_path(args.cli.as_deref(), exe_dir().as_deref());
     tracing::info!(
-        "service at http://{addr}/, controlled through {}",
+        "service at http://{addr}/, web UI {ui_url}, controlled through {}",
         cli.display()
     );
 
@@ -272,7 +275,7 @@ pub(super) fn run(args: TrayArgs) -> ExitCode {
     }
 
     let mut state = State {
-        addr,
+        ui_url,
         cli,
         last: None,
         busy: None,
@@ -301,7 +304,7 @@ pub(super) fn run(args: TrayArgs) -> ExitCode {
                     *flow = ControlFlow::Exit;
                     return;
                 } else if e.id == *u.open_ui.id() {
-                    elevate::open_url(&web_ui_url(state.addr));
+                    elevate::open_url(&state.ui_url);
                 } else if e.id == *u.start.id() {
                     state.start_action(Action::Start);
                 } else if e.id == *u.stop.id() {

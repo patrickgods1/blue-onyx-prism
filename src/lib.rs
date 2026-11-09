@@ -26,6 +26,8 @@
 //! - [`panic`]     the panic hook every binary installs: panics go to the log
 //! - [`diagnostics`] the support bundle (`diagnostics` command, `GET /v1/diagnostics`)
 //! - [`port_holder`] which process listens on a port (for a bind failure's message)
+//! - [`private_dir`] `<data root>/auth/`: the folder only the service and administrators may read
+//! - [`tls`]       the HTTPS listener's certificate: generated and kept, or the config's own files
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
 //! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
@@ -84,6 +86,7 @@ pub mod panic;
 pub mod parallel;
 pub mod port_holder;
 pub mod prep;
+pub mod private_dir;
 pub mod profile;
 pub mod registry;
 pub mod resources;
@@ -100,6 +103,7 @@ pub mod storage;
 pub mod supervisor;
 pub mod sync;
 pub mod system_info;
+pub mod tls;
 pub mod training;
 pub mod tray;
 pub mod update;
@@ -127,7 +131,10 @@ pub fn long_version() -> String {
 pub const MODULE_ID: &str = "ObjectDetectionPrism";
 pub const MODULE_NAME: &str = "Object Detection (Prism)";
 pub const PROCESSED_BY: &str = "BlueOnyxPrism";
+/// The plain HTTP port (CodeProject.AI's): Blue Iris and the open routes.
 pub const DEFAULT_PORT: u16 = 32168;
+/// The HTTPS port (`https_port`): the web UI ([`tls`], `server::serve_on`).
+pub const DEFAULT_HTTPS_PORT: u16 = 32169;
 
 /// Directory containing the running executable (falls back to cwd).
 pub fn exe_dir() -> std::path::PathBuf {

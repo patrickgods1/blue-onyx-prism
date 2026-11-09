@@ -342,11 +342,30 @@ mod folder_acl {
     const NETWORK_SERVICE: &str = "*S-1-5-20";
     const FULL: &str = "(OI)(CI)F";
     const READ: &str = "(OI)(CI)RX";
+    const MODIFY: &str = "(OI)(CI)M";
+
+    /// What the service's account gets on a protected folder: read for the Hugging Face token
+    /// (the service never writes it), modify for `<data root>/auth` ([`crate::private_dir`]),
+    /// where the service writes its certificate and, later, accounts and sessions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ServiceAccess {
+        Read,
+        Modify,
+    }
+
+    impl ServiceAccess {
+        fn rights(self) -> &'static str {
+            match self {
+                Self::Read => READ,
+                Self::Modify => MODIFY,
+            }
+        }
+    }
     /// The most of a tool's answer kept in a message.
     const MAX_ANSWER_CHARS: usize = 300;
 
     /// Runs one system tool: its standard output, or why it failed.
-    pub(super) type Run<'a> = &'a dyn Fn(&str, &[OsString]) -> Result<String, String>;
+    pub(crate) type Run<'a> = &'a dyn Fn(&str, &[OsString]) -> Result<String, String>;
 
     /// The name `icacls` should get for the Service Control Manager's account `account`. `None`
     /// for LocalSystem (an empty name means it too), which [`grants`] always lists. The built-in
@@ -367,8 +386,9 @@ mod folder_acl {
         }
     }
 
-    /// The grants of the folder: `me` is the account running this, `service` the service's.
-    pub(super) fn grants(service: Option<&str>, me: &str) -> Vec<String> {
+    /// The grants of the folder: `me` is the account running this, `service` the service's,
+    /// which gets `access`.
+    pub(super) fn grants(service: Option<&str>, me: &str, access: ServiceAccess) -> Vec<String> {
         let mut out = vec![
             format!("{ADMINISTRATORS}:{FULL}"),
             format!("{SYSTEM}:{FULL}"),
@@ -377,7 +397,7 @@ mod folder_acl {
             out.push(format!("{me}:{FULL}"));
         }
         if let Some(service) = service.filter(|s| *s != me && *s != SYSTEM) {
-            out.push(format!("{service}:{READ}"));
+            out.push(format!("{service}:{}", access.rights()));
         }
         out
     }
@@ -411,10 +431,11 @@ mod folder_acl {
     /// Protect `dir`. `service`: the service's account, `None` with no service installed. When
     /// either account is unknown the ACL stays as it is: guessing could lock the service, or the
     /// user, out of the token.
-    pub(super) fn protect(
+    pub(crate) fn protect(
         dir: &Path,
         service: Result<Option<String>, String>,
         run: Run<'_>,
+        access: ServiceAccess,
     ) -> Result<(), String> {
         let service = service.map_err(|e| format!("the service's account is unknown: {e}"))?;
         let whoami = ["/user", "/fo", "csv", "/nh"].map(OsString::from);
@@ -422,7 +443,7 @@ mod folder_acl {
         let me = parse_whoami(&answer)
             .ok_or_else(|| "whoami did not name the current account".to_string())?;
         let principal = service.as_deref().and_then(service_principal);
-        for args in icacls_commands(dir, &grants(principal.as_deref(), &me)) {
+        for args in icacls_commands(dir, &grants(principal.as_deref(), &me, access)) {
             run("icacls.exe", &args)?;
         }
         Ok(())
@@ -434,7 +455,7 @@ mod folder_acl {
         service: Result<Option<String>, String>,
         run: Run<'_>,
     ) -> Option<String> {
-        let why = protect(dir, service, run).err()?;
+        let why = protect(dir, service, run, ServiceAccess::Read).err()?;
         Some(format!(
             "could not restrict {} to the service's account, Administrators and you ({why}). The \
              token is saved, but the folder keeps the permissions of its parent, so other \
@@ -499,17 +520,31 @@ mod folder_acl {
     }
 }
 
+/// Runs a System32 tool by absolute path (see `folder_acl::tool_path`).
+#[cfg(windows)]
+fn run_system_tool(name: &str, args: &[std::ffi::OsString]) -> Result<String, String> {
+    folder_acl::run_at(
+        &folder_acl::tool_path(std::env::var_os("SystemRoot"), name),
+        args,
+    )
+}
+
 /// Protect the token's folder: the warning for the user when that failed.
 #[cfg(windows)]
 fn protect_token_folder(dir: &Path) -> Option<String> {
-    let run = |name: &str, args: &[std::ffi::OsString]| {
-        folder_acl::run_at(
-            &folder_acl::tool_path(std::env::var_os("SystemRoot"), name),
-            args,
-        )
-    };
-    folder_acl::protect_or_warn(dir, folder_acl::service_account(), &run)
+    folder_acl::protect_or_warn(dir, folder_acl::service_account(), &run_system_tool)
 }
+
+/// Give `dir` a protected DACL: Administrators and SYSTEM full control, the account running this
+/// full control, the installed service's account `access`, nothing inherited, no Users. The
+/// shared half of the Hugging Face token's folder and [`crate::private_dir`]. `Err`: why not.
+#[cfg(windows)]
+pub(crate) fn protect_private_folder(dir: &Path, access: ServiceAccess) -> Result<(), String> {
+    folder_acl::protect(dir, folder_acl::service_account(), &run_system_tool, access)
+}
+
+#[cfg(any(windows, test))]
+pub(crate) use folder_acl::ServiceAccess;
 
 /// Unix needs nothing first: the file is 0600 from its first byte, and `hand_over` closes the
 /// folder.
@@ -1280,6 +1315,7 @@ mod tests {
         let grants = folder_acl::grants(
             Some("NT SERVICE\\BlueOnyxPrismService"),
             "*S-1-5-21-1-2-3-1001",
+            ServiceAccess::Read,
         );
         let [reset, protect] = folder_acl::icacls_commands(dir, &grants);
         assert_eq!(strings(&reset), [dir.to_str().unwrap(), "/reset", "/Q"]);
@@ -1298,11 +1334,29 @@ mod tests {
         );
     }
 
+    /// `<data root>/auth` (`private_dir`): the service writes there, so it gets modify.
+    #[test]
+    fn a_folder_the_service_writes_grants_it_modify() {
+        assert_eq!(
+            folder_acl::grants(
+                Some("*S-1-5-19"),
+                "*S-1-5-21-1-2-3-1001",
+                ServiceAccess::Modify
+            ),
+            [
+                "*S-1-5-32-544:(OI)(CI)F",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-21-1-2-3-1001:(OI)(CI)F",
+                "*S-1-5-19:(OI)(CI)M",
+            ]
+        );
+    }
+
     #[test]
     fn an_account_that_already_has_full_control_is_not_granted_twice() {
         // The login ran as the service's account, or as SYSTEM.
         assert_eq!(
-            folder_acl::grants(Some("*S-1-5-19"), "*S-1-5-19"),
+            folder_acl::grants(Some("*S-1-5-19"), "*S-1-5-19", ServiceAccess::Read),
             [
                 "*S-1-5-32-544:(OI)(CI)F",
                 "*S-1-5-18:(OI)(CI)F",
@@ -1310,7 +1364,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            folder_acl::grants(None, "*S-1-5-18"),
+            folder_acl::grants(None, "*S-1-5-18", ServiceAccess::Modify),
             ["*S-1-5-32-544:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]
         );
     }
@@ -1409,7 +1463,13 @@ mod tests {
         let calls = Calls::default();
         let run = recording(&calls);
         let dir = Path::new("hf");
-        let why = folder_acl::protect(dir, Err("the SCM said no".to_string()), &run).unwrap_err();
+        let why = folder_acl::protect(
+            dir,
+            Err("the SCM said no".to_string()),
+            &run,
+            ServiceAccess::Read,
+        )
+        .unwrap_err();
         assert!(why.contains("the SCM said no"), "{why}");
         assert!(calls.borrow().is_empty());
 
@@ -1417,7 +1477,7 @@ mod tests {
             calls.borrow_mut().push((tool.to_string(), strings(args)));
             Ok("not csv".to_string())
         };
-        let why = folder_acl::protect(dir, Ok(None), no_sid).unwrap_err();
+        let why = folder_acl::protect(dir, Ok(None), no_sid, ServiceAccess::Modify).unwrap_err();
         assert!(why.contains("whoami"), "{why}");
         assert!(calls.borrow().iter().all(|(tool, _)| tool == "whoami.exe"));
     }
