@@ -361,8 +361,12 @@ mod tests {
             let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
             base64::engine::general_purpose::STANDARD.encode(bytes)
         };
+        // Without PSModulePath: started from PowerShell 7 (as CI's steps are), Windows
+        // PowerShell inherits 7's module path and cannot load Microsoft.PowerShell.Security
+        // (Get-Acl); without the variable it uses its own default.
         let out = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+            .env_remove("PSModulePath")
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
