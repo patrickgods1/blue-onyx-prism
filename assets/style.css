@@ -90,7 +90,8 @@
   }
 }
 * { box-sizing: border-box; }
-html { color-scheme: light dark; }
+/* No text inflation in landscape (iOS): the layout is already sized for the width. */
+html { color-scheme: light dark; -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   margin: 0;
   background: var(--bg);
@@ -103,6 +104,9 @@ header {
   align-items: center;
   gap: 1rem 2rem;
   padding: 0.75rem 1.5rem;
+  /* viewport-fit=cover (base.html): clear a phone's notch and rounded corners on its side. */
+  padding-left: max(1.5rem, env(safe-area-inset-left));
+  padding-right: max(1.5rem, env(safe-area-inset-right));
   background: var(--head);
   color: var(--head-fg);
 }
@@ -112,8 +116,10 @@ nav a { text-decoration: none; padding: 0.3rem 0.7rem; border-radius: 6px; }
 /* The dimmed look is for the dark header only: tab strips on cards keep their full contrast. */
 header nav a { color: var(--head-fg); opacity: 0.8; }
 header nav a:hover, header nav a.active { opacity: 1; background: rgba(255, 255, 255, 0.12); }
-main { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
-footer { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 2rem 1rem; }
+/* `--main-px`: the page's side padding, at least the notch's inset (edge-to-edge parts such as
+   the Review frame on a phone undo exactly this much). */
+main { --main-px: max(1.5rem, env(safe-area-inset-left), env(safe-area-inset-right)); max-width: 1200px; margin: 0 auto; padding: 1.5rem var(--main-px); }
+footer { text-align: center; color: var(--muted); font-size: 0.85rem; padding: 2rem max(1rem, env(safe-area-inset-right)) 2rem max(1rem, env(safe-area-inset-left)); }
 h1 { font-size: 1.75rem; margin: 0 0 1rem; }
 h2 { font-size: 1.3rem; margin: 1.5rem 0 0.6rem; }
 a { color: var(--accent); }
@@ -208,7 +214,8 @@ nav.toc {
   border-radius: 8px;
 }
 nav.toc a { text-decoration: none; }
-[id] { scroll-margin-top: 3.5rem; }
+/* `--toc-h`: the sticky section tabs' real height (live.js), taller where they wrap on a phone. */
+[id] { scroll-margin-top: max(3.5rem, calc(var(--toc-h, 0px) + 0.5rem)); }
 
 /* State badges (Home: third column; Stats: second) */
 table.models tr > td:nth-child(3), table.stats tr > td:nth-child(2) { font-weight: 600; }
@@ -269,6 +276,7 @@ label.inline-label { flex-direction: row; align-items: center; gap: 0.4rem; marg
   border: 1px solid var(--border);
   border-radius: 6px;
   height: 65vh;
+  height: 65dvh;
   overflow: auto;
   padding: 0.4rem 0.6rem;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -328,7 +336,7 @@ table.bench td .tag { margin-left: 0.35rem; }
 td.actions-cell { white-space: nowrap; }
 details.bd { margin-top: 0.75rem; }
 details.bd h4 { margin: 0.8rem 0 0.3rem; font-size: 0.95rem; }
-dialog#drill { width: min(1200px, 96vw); max-height: 92vh; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--fg); padding: 0.8rem; }
+dialog#drill { width: min(1200px, 96vw); width: min(1200px, 96dvw); max-height: 92vh; max-height: 92dvh; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--fg); padding: 0.8rem; }
 dialog#drill::backdrop { background: rgba(0, 0, 0, 0.5); }
 .drill-head { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; position: sticky; top: 0; background: var(--bg); padding-bottom: 0.5rem; }
 .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0.75rem; }
@@ -414,28 +422,35 @@ table.model-card select { max-width: 22rem; }
 .action-msg { display: inline-block; margin-left: 0.4rem; font-size: 0.85rem; overflow-wrap: anywhere; }
 td .action-msg { display: block; margin: 0.3rem 0 0; max-width: 28rem; }
 /* Targets of the forms' #fragments (no-JS answers land here, below the sticky header). */
-.anchor { scroll-margin-top: 4rem; }
-tr[id^="resource-"], form.card, section.card { scroll-margin-top: 4rem; }
+.anchor { scroll-margin-top: max(4rem, calc(var(--toc-h, 0px) + 0.5rem)); }
+tr[id^="resource-"], form.card, section.card { scroll-margin-top: max(4rem, calc(var(--toc-h, 0px) + 0.5rem)); }
 /* Benchmark "Now" / "Configured" cell: the value, and while a restart is pending what runs. */
 td.thr-now .thr-run { display: block; font-size: 0.75rem; white-space: normal; min-width: 8rem; text-align: right; }
 
 /* Server-side file browser (Config page, "Add a model by path") */
 .with-browse { display: flex; gap: 0.4rem; align-items: center; }
 .with-browse input { flex: 1; min-width: 0; }
-dialog#browse-dialog { width: min(40rem, calc(100vw - 32px)); box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem; }
+/* Within the screen (a phone's too): the listing scrolls inside, Close at the top and Use / Cancel
+   at the bottom stay in view. A column only while open (a closed dialog must stay hidden). */
+dialog#browse-dialog { width: min(40rem, calc(100vw - 32px)); max-height: 90vh; max-height: 90dvh; overflow: auto; overscroll-behavior: contain; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem 0.8rem 0; }
+dialog#browse-dialog[open] { display: flex; flex-direction: column; }
+dialog#browse-dialog > * { flex: none; }
 dialog#browse-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
-dialog#browse-dialog h3 { margin: 0 0 0.5rem; }
+.browse-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin: 0 0 0.5rem; }
+dialog#browse-dialog h3 { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.browse-head button.small { flex: none; margin: 0; min-width: 44px; font-size: 1rem; line-height: 1; }
 .browse-bar { display: flex; gap: 0.4rem; align-items: center; }
 .browse-bar select { flex: 1; min-width: 0; }
 .browse-path { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.85rem; background: var(--code-bg); border-radius: 4px; padding: 0.3rem 0.5rem; margin: 0.5rem 0; overflow-wrap: anywhere; }
-.browse-list { max-height: 60vh; overflow: auto; border: 1px solid var(--border); border-radius: 4px; }
+.browse-list { max-height: 60vh; max-height: 60dvh; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: 4px; }
+dialog#browse-dialog > .browse-list { flex: 0 1 auto; min-height: 6rem; }
 .browse-list:empty { display: none; }
 button.browse-item { display: flex; justify-content: space-between; gap: 0.8rem; width: 100%; text-align: left; background: transparent; color: var(--fg); border: 0; border-bottom: 1px solid var(--border); border-radius: 0; padding: 0.4rem 0.6rem; }
 button.browse-item:hover, button.browse-item:focus-visible { background: var(--code-bg); }
 button.browse-item.selected { background: var(--ok-bg); color: var(--ok-fg); }
 .browse-name { overflow-wrap: anywhere; }
 .browse-size { color: var(--muted); white-space: nowrap; }
-#browse-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+#browse-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; position: sticky; bottom: 0; z-index: 1; padding: 0.5rem 0 0.8rem; background: var(--card); border-top: 1px solid var(--border); }
 
 /* Sign-in dialog (live.js): the session ended; signing in here keeps the page and its edits. */
 dialog.signin-dialog { width: min(24rem, calc(100vw - 32px)); max-height: 90vh; max-height: 90dvh; overflow: auto; overscroll-behavior: contain; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 1rem 1.2rem; }
@@ -806,7 +821,7 @@ table.dt td button.small { padding: 0.12rem 0.5rem; margin: 0; }
 /* The side panel stays in view while the page scrolls; only the box list scrolls inside it. */
 /* A fixed height (the window's) so the box list (flex: 1) takes what the close-up, the decision
    bar and the Save row leave. */
-.review-side { position: sticky; top: 0.5rem; height: calc(100vh - 1rem); overflow-y: auto; display: flex; flex-direction: column; padding: 0.7rem 0.9rem; }
+.review-side { position: sticky; top: 0.5rem; height: calc(100vh - 1rem); height: calc(100dvh - 1rem); overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; padding: 0.7rem 0.9rem; }
 .review-side > * { flex: none; }
 .review-side > .review-boxes { flex: 1 1 0; min-height: 8rem; max-height: none; margin: 0.3rem 0; }
 .review-side > label.check { margin: 0.2rem 0; }
@@ -815,7 +830,7 @@ table.dt td button.small { padding: 0.12rem 0.5rem; margin: 0; }
 @media (max-width: 900px) {
   .review-grid, .review-grid.rv-wide { grid-template-columns: minmax(0, 1fr); }
   .review-side { position: static; height: auto; overflow: visible; }
-  .review-side > .review-boxes { flex: none; max-height: 40vh; }
+  .review-side > .review-boxes { flex: none; max-height: 40vh; max-height: 40dvh; }
 }
 .rv-bar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.2rem 1rem; }
 .rv-bar .review-counts { flex: 1 1 20rem; min-width: 0; }
@@ -844,7 +859,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .review-side.card { margin: 0; min-width: 0; }
 .review-side > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; color: var(--muted); }
 .review-side > label.check { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--fg); margin: 0.4rem 0; }
-.review-boxes { list-style: none; padding: 0; margin: 0.5rem 0; max-height: 52vh; overflow-y: auto; }
+.review-boxes { list-style: none; padding: 0; margin: 0.5rem 0; max-height: 52vh; max-height: 52dvh; overflow-y: auto; }
 .review-boxes li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15rem 0.45rem; align-items: center; padding: 0.35rem 0.45rem; border: 1px solid var(--border); border-radius: 6px; margin: 0 0 0.3rem; cursor: pointer; }
 .review-boxes li.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 /* A box that is not selected: one row. */
@@ -891,7 +906,7 @@ button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 
 .rv-session .rv-chip button.small { margin: 0 0 0 0.2rem; padding: 0 0.35rem; font-size: 0.75rem; }
 details.rv-panel-opts > label.check { flex-direction: row; align-items: center; gap: 0.4rem; color: var(--fg); }
 .review-keys tr.rv-keys-group th { text-align: left; font-size: 0.8rem; color: var(--muted); padding: 0.4rem 0 0.1rem; }
-dialog.rv-keys-dialog { width: min(64rem, calc(100vw - 32px)); max-height: 90vh; overflow: auto; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem 1rem; }
+dialog.rv-keys-dialog { width: min(64rem, calc(100vw - 32px)); max-height: 90vh; max-height: 90dvh; overflow: auto; overscroll-behavior: contain; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem 1rem; }
 dialog.rv-keys-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 .rv-keys-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 0 0 0.4rem; }
 .rv-keys-head h3 { margin: 0; }
@@ -1285,10 +1300,11 @@ ul.thr-profile-list code, .profiles code { font-size: 0.8rem; }
 .model-classes { white-space: normal; min-width: 8rem; }
 .model-classes .of-summary { overflow-wrap: anywhere; }
 .model-classes .of-summary.warn { color: var(--warn-fg); }
-dialog#class-dialog { width: min(46rem, calc(100vw - 32px)); max-height: 90vh; overflow: auto; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem; }
+dialog#class-dialog { width: min(46rem, calc(100vw - 32px)); max-height: 90vh; max-height: 90dvh; overflow: auto; overscroll-behavior: contain; box-sizing: border-box; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--fg); padding: 0.8rem 0.8rem 0; }
 dialog#class-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
 dialog#class-dialog h3 { margin: 0 0 0.5rem; }
-dialog#class-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+/* Use these / Cancel stay in view at the bottom of the dialog while a long class list scrolls. */
+dialog#class-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; position: sticky; bottom: 0; z-index: 1; padding: 0.5rem 0 0.8rem; background: var(--card); border-top: 1px solid var(--border); }
 
 /* Model picker (model-picker.js) on the Review and Training auto-label forms */
 .mp { display: grid; gap: 0.35rem; max-width: 46rem; }
@@ -1428,9 +1444,10 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-actions-more button.small:hover { color: var(--accent); border-color: var(--accent); }
 }
 
-/* Header: one row, the links scroll (live.js keeps the current page in view). */
-@media (max-width: 700px) {
-  header { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 0.5rem; padding: 0 0.75rem; }
+/* Header: one row, the links scroll (live.js keeps the current page in view); also on a phone
+   on its side, where every row of header is a row less of page. */
+@media (max-width: 700px), (max-height: 500px) and (orientation: landscape) {
+  header { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 0.5rem; padding: 0 max(0.75rem, env(safe-area-inset-right)) 0 max(0.75rem, env(safe-area-inset-left)); }
   /* The short name; the full one stays in the link for screen readers. */
   header .brand { font-size: 0; }
   header .brand::after { content: "Prism"; font-size: 1.1rem; }
@@ -1441,10 +1458,19 @@ td.tr-bal-bars { vertical-align: middle; }
   .live-status, .pending-restart { grid-column: 1 / -1; margin: 0 0 0.3rem; justify-self: start; }
   .pending-restart { flex-wrap: wrap; }
   header form.signout { grid-column: 1 / -1; margin: 0 0 0.3rem; justify-self: end; }
-  main { padding: 0.75rem 1rem 1rem; }
+  main { --main-px: max(1rem, env(safe-area-inset-left), env(safe-area-inset-right)); padding: 0.75rem var(--main-px) 1rem; }
+  /* At the bottom, clear of the header's rows (above the sticky bars stuck there: live.js). */
+  .restart-banner { top: auto; bottom: calc(0.75rem + env(safe-area-inset-bottom) + var(--banner-lift, 0px)); }
+}
+/* A phone on its side has the width for Sign out on the links' row: one row of header. */
+@media (max-height: 500px) and (orientation: landscape) {
+  header { grid-template-columns: auto minmax(0, 1fr) auto; }
+  header form.signout { grid-column: 3; grid-row: 1; margin: 0; }
+}
+@media (max-width: 700px) {
   h1 { font-size: 1.45rem; margin-bottom: 0.6rem; }
   .card { padding: 0.75rem 0.85rem; }
-  footer { padding: 1.2rem 1rem; }
+  footer { padding: 1.2rem max(1rem, env(safe-area-inset-right)) 1.2rem max(1rem, env(safe-area-inset-left)); }
   form#models > .actions, form#server > .actions { gap: 0.4rem 0.5rem; margin-left: -0.85rem; margin-right: -0.85rem; padding: 0.4rem 0.85rem calc(0.4rem + env(safe-area-inset-bottom)); }
   form#models > .actions:last-child, form#server > .actions:last-child { margin-bottom: -0.75rem; }
   form#models > .actions button, form#server > .actions button { margin: 0; }
@@ -1635,17 +1661,21 @@ td.tr-bal-bars { vertical-align: middle; }
   #review:not(.rv-info-open) .review-meta { display: none; }
   .rv-bar { margin-bottom: 0.3rem; }
   /* The frame edge to edge, its view buttons under it. */
-  .review-stage { display: flex; flex-direction: column; margin: 0 -1rem; }
+  .review-stage { display: flex; flex-direction: column; margin: 0 calc(-1 * var(--main-px, 1rem)); }
   /* A tall frame leaves room to scroll past it (the frame itself takes every touch). */
   .review-stage canvas { border-radius: 0; width: min(100%, calc(60svh * var(--rv-ar, 1.78))); margin-inline: auto; }
   .review-stage #rv-none { padding: 1rem; }
-  .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; padding: 0.15rem 1rem 0; }
+  .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; padding: 0.15rem var(--main-px, 1rem) 0; }
   .review-meta-row .review-meta { flex: 1 1 100%; margin: 0; }
   .review-meta-row button.small, .rv-view-menu > summary { min-height: 44px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
   .review-grid { gap: 0.25rem; }
   .review-side.card { border: 0; background: none; padding: 0; border-radius: 0; }
-  .rv-actions-main { margin-left: -1rem; margin-right: -1rem; padding-left: 0.6rem; padding-right: 0.6rem; }
+  .rv-actions-main { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
   .review-crop figcaption { display: none; }
   .rv-decide { margin: 0.3rem 0; padding: 0.4rem 0.5rem; background: var(--card); }
   .rv-q-why { -webkit-line-clamp: 1; }
 }
+
+/* An on-screen keyboard is open (live.js `kb-open`): the sticky bars scroll with the page, so they
+   neither hide behind the keyboard nor cover the field being typed in. */
+html.kb-open .rv-actions-main, html.kb-open form#models > .actions, html.kb-open form#server > .actions { position: static; }

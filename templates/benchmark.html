@@ -215,17 +215,7 @@
   <button type="button" id="drill-close">Close</button></div>
   <div id="drill-body" class="thumbs"></div></dialog>
 
-<dialog id="browse-dialog">
-  <h3 id="browse-title">Choose a folder</h3>
-  <div class="browse-bar">
-    <select id="browse-roots" aria-label="Places"></select>
-    <button type="button" id="browse-up" class="small">Up</button>
-  </div>
-  <div id="browse-path" class="browse-path"></div>
-  <div id="browse-list" class="browse-list"></div>
-  <p id="browse-msg" class="muted" role="status"></p>
-  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
-</dialog>
+{% include "file_browser.html" %}
 <script src="/static/bench-glossary.js?v={{ version }}"></script>
 <script src="/static/bench-table.js?v={{ version }}"></script>
 <script src="/static/bench-charts.js?v={{ version }}"></script>

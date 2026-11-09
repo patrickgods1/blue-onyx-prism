@@ -40,6 +40,8 @@
 // every access in try/catch (no storage, a full one or a refusing one is nothing kept), and
 // `verdict(draft, id, rev)`: "none" (no draft), "other" (another item's), "restore" (the same
 // item at the same revision) or "drop" (it changed since).
+// PrismViewport: pure screen rules (whether an on-screen keyboard is open, how far the bottom
+// restart banner rises over the sticky bars); the page part sets `html.kb-open` and `--toc-h`.
 (function (root) {
   "use strict";
   var polling = 0, pollFetch = null, realFetch = null;
@@ -366,6 +368,39 @@
     fetch: function (url, init) { return pollFetch ? pollFetch(url, init) : root.fetch(url, withPollHeader(init)); }
   };
 
+  // ---- the visible screen (pure; wired up below, tested in node) -----------------------------
+  // keyboardOpen: whether an on-screen keyboard covers the bottom of the window, so the sticky
+  // bottom bars (Review, Config) should scroll with the page instead of sitting behind it. iOS
+  // never shrinks the layout viewport (`innerHeight`) for the keyboard, only the visual one; Chrome
+  // on Android shrinks the visual one too (resizes-visual). `scale` is the visual viewport's pinch
+  // zoom: zoomed in, its height in CSS px shrinks without any keyboard. Only a focused text field
+  // (an input of a typing kind, a select or a textarea) counts.
+  var NO_KEYBOARD = {checkbox: 1, radio: 1, range: 1, button: 1, submit: 1, reset: 1, image: 1, file: 1, color: 1, hidden: 1};
+  function typingField(tag, type) {
+    tag = String(tag || "").toLowerCase();
+    if (tag === "select" || tag === "textarea") return true;
+    return tag === "input" && !NO_KEYBOARD[String(type || "text").toLowerCase()];
+  }
+  root.PrismViewport = {
+    KEYBOARD_SHARE: 0.75,
+    typingField: typingField,
+    keyboardOpen: function (vvHeight, innerHeight, tag, type, scale) {
+      var z = typeof scale === "number" && scale > 0 ? scale : 1;
+      if (!(vvHeight > 0) || !(innerHeight > 0)) return false;
+      return typingField(tag, type) && vvHeight * z < innerHeight * root.PrismViewport.KEYBOARD_SHARE;
+    },
+    // How far a banner fixed to the bottom must rise to clear the sticky bars stuck to the bottom
+    // of the window: `bars` are their rects ({top, bottom}, hidden ones left out by the caller).
+    bottomLift: function (bars, innerHeight) {
+      var lift = 0;
+      (bars || []).forEach(function (r) {
+        if (!r || !(r.bottom - r.top > 0)) return;
+        if (r.bottom >= innerHeight - 2 && r.top < innerHeight) lift = Math.max(lift, Math.ceil(innerHeight - r.top));
+      });
+      return lift;
+    }
+  };
+
   // ---- drafts ------------------------------------------------------------------------------
   function storage() { try { return root.sessionStorage || null; } catch (e) { return null; } }
   function draftKey(key) { var l = root.location; return "prism:draft:" + ((l && l.pathname) || "") + ":" + key; }
@@ -526,10 +561,32 @@
   // ---- restart ----------------------------------------------------------------------------------
   // A banner pinned to the top of the window while the server restarts (it does not move the
   // page).
+  // On a phone (and a phone on its side) it sits at the bottom instead (style.css), above the sticky
+  // Save / decision bars when they are stuck there (`--banner-lift`, kept while the page scrolls).
+  var STICKY_BARS = ".rv-actions-main, form#models > .actions, form#server > .actions";
+  function liftBanner(b) {
+    var rects = [];
+    document.querySelectorAll(STICKY_BARS).forEach(function (bar) {
+      if (bar.offsetParent === null || getComputedStyle(bar).position !== "sticky") return;
+      rects.push(bar.getBoundingClientRect());
+    });
+    b.style.setProperty("--banner-lift", PrismViewport.bottomLift(rects, window.innerHeight) + "px");
+  }
   function restarting(text) {
     var b = document.getElementById("restart-banner");
-    if (!b) { b = document.createElement("div"); b.id = "restart-banner"; b.className = "restart-banner"; b.setAttribute("role", "status"); b.setAttribute("aria-live", "polite"); document.body.appendChild(b); }
+    if (!b) {
+      b = document.createElement("div"); b.id = "restart-banner"; b.className = "restart-banner"; b.setAttribute("role", "status"); b.setAttribute("aria-live", "polite"); document.body.appendChild(b);
+      var queued = false;
+      var later = function () {
+        if (queued) return;
+        queued = true;
+        window.requestAnimationFrame(function () { queued = false; liftBanner(b); });
+      };
+      window.addEventListener("scroll", later, {passive: true});
+      window.addEventListener("resize", later);
+    }
     b.textContent = text || "Restarting\u2026 the page reloads (at the same place) when the server answers again.";
+    liftBanner(b);
     return b;
   }
   // Restart buttons back to normal (the restart was refused or did not finish).
@@ -962,6 +1019,43 @@
     setTimeout(tick, 1500);
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restartPage); else restartPage();
+
+  // ---- the on-screen keyboard and the sticky bars -------------------------------------------------
+  // `html.kb-open` while a keyboard covers the bottom of the window (PrismViewport.keyboardOpen):
+  // the sticky Save / decision bars then scroll with the page (style.css) instead of hiding behind
+  // it or covering the field being typed in. Checked once a frame at most, on the visual viewport's
+  // resize and on focus changes.
+  (function keyboard() {
+    var vv = window.visualViewport;
+    if (!vv || !vv.addEventListener) return;
+    var queued = false;
+    function check() {
+      queued = false;
+      var a = document.activeElement;
+      var open = PrismViewport.keyboardOpen(vv.height, window.innerHeight, a && a.tagName, a && a.type, vv.scale);
+      document.documentElement.classList.toggle("kb-open", open);
+    }
+    function later() {
+      if (queued) return;
+      queued = true;
+      window.requestAnimationFrame(check);
+    }
+    vv.addEventListener("resize", later);
+    document.addEventListener("focusin", later);
+    document.addEventListener("focusout", later);
+  })();
+
+  // ---- anchors under the sticky section tabs ------------------------------------------------------
+  // `nav.toc` (Config, Benchmark) sticks to the top and wraps to several rows on a phone: its real
+  // height (`--toc-h`) keeps a #fragment's target below it (style.css scroll-margin-top).
+  function tocHeight() {
+    var toc = document.querySelector("nav.toc");
+    if (!toc || !window.ResizeObserver) return;
+    var set = function () { document.documentElement.style.setProperty("--toc-h", toc.offsetHeight + "px"); };
+    new ResizeObserver(set).observe(toc);
+    set();
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", tocHeight); else tocHeight();
 
   window.PrismLive = {
     onConfig: function (fn) { listeners.push(fn); if (last) fn(last, null); },
