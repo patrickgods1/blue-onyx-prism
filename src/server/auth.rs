@@ -65,7 +65,7 @@ pub(super) const LOGIN_BODY_LIMIT: usize = 4 * 1024;
 /// Longest wait for a hashing permit before answering 503.
 pub(crate) const HASH_WAIT: Duration = Duration::from_secs(2);
 /// `Retry-After` of a 503 for busy hashing.
-const BUSY_RETRY_SECS: u64 = 2;
+pub(super) const BUSY_RETRY_SECS: u64 = 2;
 /// The request header of a page polling on its own (`PrismPoll` in `assets/live.js`).
 pub(crate) const POLL_HEADER: &str = "x-prism-poll";
 /// The cookie a page sets before a reload or navigation a poll makes (`PrismPoll.navigate`): a
@@ -394,7 +394,7 @@ fn judge(
     Verdict::Wrong
 }
 
-fn who(peer: Option<SocketAddr>) -> String {
+pub(super) fn who(peer: Option<SocketAddr>) -> String {
     peer.map_or_else(
         || "unknown".to_string(),
         |a| a.ip().to_canonical().to_string(),
@@ -502,14 +502,14 @@ pub(super) fn no_store(mut resp: Response) -> Response {
 }
 
 /// A `Set-Cookie` value (`sensitive`, so it is never logged by a layer that prints headers).
-fn set_cookie(value: &str) -> Option<HeaderValue> {
+pub(super) fn set_cookie(value: &str) -> Option<HeaderValue> {
     let mut v = HeaderValue::from_str(value).ok()?;
     v.set_sensitive(true);
     Some(v)
 }
 
 /// 303 to `location` (a path of ours: printable ASCII, else the home page).
-fn see_other(location: &str) -> Response {
+pub(super) fn see_other(location: &str) -> Response {
     let value = HeaderValue::from_str(location).unwrap_or(HeaderValue::from_static("/"));
     no_store((StatusCode::SEE_OTHER, [(header::LOCATION, value)]).into_response())
 }
@@ -529,7 +529,7 @@ fn login_url(method: &Method, uri: &Uri) -> String {
 }
 
 /// `status` with the JSON shape of the other refusals.
-fn json_refusal(status: StatusCode, message: &str) -> Response {
+pub(super) fn json_refusal(status: StatusCode, message: &str) -> Response {
     no_store(
         (
             status,
@@ -539,7 +539,7 @@ fn json_refusal(status: StatusCode, message: &str) -> Response {
     )
 }
 
-fn with_retry_after(mut resp: Response, secs: u64) -> Response {
+pub(super) fn with_retry_after(mut resp: Response, secs: u64) -> Response {
     resp.headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from(secs));
     resp
@@ -552,7 +552,7 @@ fn with_bearer_challenge(mut resp: Response) -> Response {
 }
 
 /// Log that sign-in is closed (throttled), with the reason the operator needs.
-fn note_closed(why: &str) {
+pub(super) fn note_closed(why: &str) {
     let dropped = CLOSED_WARNS
         .lock_recover()
         .allow_at(Instant::now(), WARN_EVERY);
@@ -809,7 +809,7 @@ fn unknown_key(typed: &str) -> String {
 }
 
 /// Reserve an attempt for `peer` in the password bucket.
-fn reserve(state: &AppState, peer: Option<SocketAddr>) -> Result<Reserved, u64> {
+pub(super) fn reserve(state: &AppState, peer: Option<SocketAddr>) -> Result<Reserved, u64> {
     let ip = peer.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip());
     state
         .login
@@ -818,7 +818,7 @@ fn reserve(state: &AppState, peer: Option<SocketAddr>) -> Result<Reserved, u64> 
         .reserve(ip, Instant::now())
 }
 
-fn refund(state: &AppState, r: Reserved) {
+pub(super) fn refund(state: &AppState, r: Reserved) {
     state.login.failures.lock_recover().refund(r);
 }
 

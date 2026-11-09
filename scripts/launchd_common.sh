@@ -172,3 +172,17 @@ bop_tray_start() {
   launchctl bootstrap "gui/$uid" "$TRAY_PLIST" >/dev/null 2>&1 || true
   return 0
 }
+
+# bop_print_urls CONFIG EXE: the addresses an install prints. The web UI is HTTPS (self-signed
+# certificate, a sign-in; the first visit creates the first account with the one-time code that
+# `setup-code` prints); Blue Iris uses the plain HTTP port with no account. The ports are the
+# config's when it names them (a pretty config, one key per line), else the defaults.
+bop_print_urls() {
+  local port https
+  port="$(sed -n 's/^[[:space:]]*"port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)"
+  https="$(sed -n 's/^[[:space:]]*"https_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)"
+  echo "Web UI:    https://localhost:${https:-32169}/ (self-signed certificate; on the first visit,"
+  echo "           create the first account with the code that this prints:"
+  echo "           sudo -u $SVC $2 --config $1 setup-code)"
+  echo "Blue Iris: http://<this Mac's IP>:${port:-32168} (plain HTTP, no account)"
+}

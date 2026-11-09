@@ -296,6 +296,78 @@
 
   <div class="actions"><button type="submit">Save</button> <span class="unsaved-note" hidden>Unsaved changes</span> <span class="form-msg" aria-live="polite"></span></div>
 </form>
+<section class="card" id="accounts">
+  <h2>Accounts</h2>
+  {% call notices("accounts") %}{% endcall %}
+  <p class="muted">People sign in to this web UI with an account; every account can do everything here. Adding, removing or unlocking an account, changing your password and signing out everywhere each ask for your current password.</p>
+  {% if let Some(why) = accounts.closed %}<p class="error">{{ why }}</p>{% else %}
+  <div class="scroll">
+  <table class="accounts rcards">
+  <thead><tr><th>Account</th><th>Created</th><th>Password changed</th><th>Wrong passwords</th></tr></thead>
+  <tbody>
+  {% for r in accounts.rows %}
+  <tr>
+    <td class="rc-title"><span class="acct-name">{{ r.name }}</span>{% if r.you %} <span class="tag now">you</span>{% endif %}</td>
+    <td data-label="Created">{{ r.created }}</td>
+    <td data-label="Password changed">{{ r.password_changed }}</td>
+    <td data-label="Wrong passwords"{% if r.warn %} class="error-text"{% endif %}>{{ r.failures }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+  </table>
+  </div>
+  {% endif %}
+  {% if accounts.token %}
+  <p class="muted">You are using the API token, which has no password: account changes need an account. Sign in with one, or use <code>blue-onyx-prism user add|remove|unlock|reset-password</code> on the server.</p>
+  {% else if accounts.closed.is_none() %}
+  <div class="acct-forms">
+  <form method="post" action="/config/accounts/password#accounts" class="acct-form" id="acct-password">
+    <fieldset class="group">
+      <legend>Change my password</legend>
+      {% if let Some(me) = accounts.me %}<input type="text" name="username" value="{{ me }}" autocomplete="username" hidden>{% endif %}
+      <label>Current password <input type="password" name="current" autocomplete="current-password" maxlength="512" required></label>
+      <label>New password <input type="password" name="password" autocomplete="new-password" minlength="15" maxlength="512" required></label>
+      <label>New password again <input type="password" name="password2" autocomplete="new-password" minlength="15" maxlength="512" required></label>
+      <p class="muted">15 to 128 characters; a passphrase of a few words is fine. Every other browser signed in to your account is signed out; this one stays signed in.</p>
+      <div class="actions wide"><button type="submit">Change password</button></div>
+    </fieldset>
+  </form>
+  <form method="post" action="/config/accounts/add#accounts" class="acct-form" id="acct-add">
+    <fieldset class="group">
+      <legend>Add an account</legend>
+      <label>Username <input type="text" name="name" autocomplete="off" autocapitalize="none" spellcheck="false" maxlength="32" required> <span class="muted">(1 to 32 of a-z, 0-9, '.', '_' and '-')</span></label>
+      <label>Its password <input type="password" name="password" autocomplete="new-password" minlength="15" maxlength="512" required></label>
+      <label>Its password again <input type="password" name="password2" autocomplete="new-password" minlength="15" maxlength="512" required></label>
+      <label>Your current password <input type="password" name="current" autocomplete="current-password" maxlength="512" required></label>
+      <div class="actions wide"><button type="submit">Add account</button></div>
+    </fieldset>
+  </form>
+  <form method="post" action="/config/accounts/unlock#accounts" class="acct-form" id="acct-manage">
+    <fieldset class="group">
+      <legend>Unlock or remove an account</legend>
+      <label>Account
+        <select name="name" required>
+        <option value="">choose an account</option>
+        {% for r in accounts.rows %}<option value="{{ r.name }}">{{ r.name }}{% if r.you %} (you){% endif %}</option>{% endfor %}
+        </select>
+      </label>
+      <label>Your current password <input type="password" name="current" autocomplete="current-password" maxlength="512" required></label>
+      <p class="muted">Unlock forgets an account's wrong passwords (after 10 in a row each attempt waits, after 100 it is disabled). Remove signs it out everywhere; the last account cannot be removed, and removing your own signs you out.</p>
+      <div class="actions wide"><button type="submit">Unlock</button> <button type="submit" class="danger" formaction="/config/accounts/remove#accounts" data-confirm="Remove this account? It is signed out everywhere and can no longer sign in.">Remove</button></div>
+    </fieldset>
+  </form>
+  <form method="post" action="/config/accounts/sign-out-everywhere#accounts" class="acct-form" id="acct-everywhere">
+    <fieldset class="group">
+      <legend>Sign out everywhere</legend>
+      <label>Your current password <input type="password" name="current" autocomplete="current-password" maxlength="512" required></label>
+      <p class="muted">Ends every session of your account, on every browser, this one included.</p>
+      <div class="actions wide"><button type="submit" class="danger" data-confirm="Sign out of every browser, this one included?">Sign out everywhere</button></div>
+    </fieldset>
+  </form>
+  </div>
+  {% endif %}
+  <p class="muted acct-reset">A forgotten password is reset on the server (as the service's account): <code>{{ accounts.reset_command }}</code></p>
+</section>
 {% if let Some(t) = token_panel %}
 <div class="card" id="admin-token">
   <h2>API token</h2>

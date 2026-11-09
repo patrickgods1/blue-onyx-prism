@@ -559,6 +559,13 @@ header form.signout button.small { margin: 0; }
 form.auth-form { max-width: 28rem; }
 form.auth-form input { width: 100%; box-sizing: border-box; }
 code.fingerprint { overflow-wrap: anywhere; }
+/* Config page, Accounts card: the list, then its forms side by side (one column on phones). */
+#accounts code { overflow-wrap: anywhere; }
+.acct-forms { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(22rem, 100%), 1fr)); gap: 0 1rem; align-items: start; }
+.acct-forms fieldset.group { grid-template-columns: minmax(0, 1fr); }
+.acct-forms input, .acct-forms select { width: 100%; box-sizing: border-box; }
+.acct-forms .actions { margin-top: 0.4rem; }
+table.accounts .acct-name { font-weight: 600; }
 .restart-banner.gave-up { border-left-color: var(--err-fg); }
 
 /* ---- Benchmark page: step strip, terms, chips, trust, presets, compare charts ---------------- */

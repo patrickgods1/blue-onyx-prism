@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Upgrade test (CI only: it changes the machine, needs passwordless sudo): install the published
-# OLD package, seed what a user has (a config edit, a reviewed label file and its frame, a training
-# runs.json), upgrade to the NEW package and check the service is up on the new binary, answers
-# a detection, and every seeded file and the config edit are still there, unchanged. The label
+# OLD package, seed what a user has (a config edit, `allow_remote_admin: true`, a reviewed label
+# file and its frame, a training runs.json), upgrade to the NEW package and check the service is
+# up on the new binary (the retired `allow_remote_admin` is no reason to refuse the config), the
+# API token was rotated once for it, the web UI answers over HTTPS in setup mode, it answers a
+# detection, and every seeded file and the config edit are still there, unchanged. The label
 # file is seeded root-owned, as `sudo cp` leaves it: the upgrade must hand it to the service user
 # (RR-U6), its content unchanged. Ends with a purge.
 # Linux (.deb, systemd) and macOS (.pkg, launchd). Called by packaging/upgrade-test.sh.
@@ -97,7 +99,15 @@ echo "== seed a user's data (the service stopped)"
 svc_stop
 [ -n "$(timeout_value)" ] || fail "$CONFIG has no request_timeout_secs to edit (the old service writes every key on its first start)"
 sudo sed -i.bak -E "s/\"request_timeout_secs\": *[0-9]+/\"request_timeout_secs\": $TIMEOUT_EDIT/" "$CONFIG"
+# Remote admin on, as many 0.2 installs have it: the new version retires the key (read, warned,
+# never written) and must still start.
+if sudo grep -Eq '"allow_remote_admin": *(true|false)' "$CONFIG"; then
+  sudo sed -i.bak -E 's/"allow_remote_admin": *(true|false)/"allow_remote_admin": true/' "$CONFIG"
+else
+  sudo sed -i.bak -E '1 s/^\{/{ "allow_remote_admin": true,/' "$CONFIG"
+fi
 sudo rm -f "$CONFIG.bak"
+sudo grep -Eq '"allow_remote_admin": *true' "$CONFIG" || fail "could not set allow_remote_admin in $CONFIG"
 sudo install -d -o "$SVC_USER" -g "$SVC_USER" "$DATA/dataset" "$DATA/dataset/upgrade-test" "$DATA/training"
 sudo install -o "$SVC_USER" -g "$SVC_USER" -m 0640 "$IMG" "$FRAME"
 sudo install -o "$SVC_USER" -g "$SVC_USER" -m 0640 "$RUNS_FIXTURE" "$RUNS"
@@ -131,6 +141,14 @@ new_pid="$(svc_pid)"
 [ "$new_pid" != "$old_pid" ] || fail "the service process is still $old_pid: the upgrade did not restart it on the new binary"
 [ "$(svc_restarts)" = 0 ] || fail "the service restarted $(svc_restarts) times after the upgrade"
 echo "service up on the new binary (pid $old_pid -> $new_pid), no restarts"
+
+echo "== the retired allow_remote_admin, the API token and the web UI"
+# The token the old version may have sent over plain HTTP was rotated once (marker), into the
+# protected auth folder; no account exists, so the service is in setup mode (setup code made).
+sudo test -f "$DATA/auth/.token-rotated-v1" || fail "no $DATA/auth/.token-rotated-v1: the API token was not rotated for allow_remote_admin"
+sudo test -f "$DATA/auth/admin-token" || fail "no API token in $DATA/auth"
+sudo test -f "$DATA/auth/setup-code" || fail "no setup code in $DATA/auth: the service is not in setup mode"
+"$ROOT/scripts/ci/check_https.sh" 32168 32169 || fail "the web UI over HTTPS after the upgrade"
 
 echo "== a detection"
 out="$(curl -s --max-time 60 -F image=@"$IMG" -F min_confidence=0.2 "$URL/v1/vision/detection" || true)"

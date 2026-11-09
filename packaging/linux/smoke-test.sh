@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CI smoke test (ubuntu runner with sudo + systemd + docker): install the .deb, check user / unit /
-# HTTP / config; `apt remove` keeps only the data and the user, a seeded dataset file included; a
+# HTTP / HTTPS / setup code / config; `apt remove` keeps only the data and the user, a seeded dataset file included; a
 # reinstall over them, with the user's uid changed, enables and starts the service and hands it the
 # data; `apt purge` leaves nothing behind. Then the .rpm: contents and scriptlets, and in a Fedora
 # container `dnf remove`, which keeps the same things (RPM has no purge), a reinstall the same way,
@@ -14,7 +14,8 @@ if [ $# -ne 2 ]; then
 fi
 DEB="$(realpath "$1")"
 RPM="$(realpath "$2")"
-RETRY="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/scripts/ci/retry.sh"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RETRY="$REPO/scripts/ci/retry.sh"
 UNIT=blue-onyx-prism
 DATA=/var/lib/blue-onyx-prism
 CONFIG="$DATA/blue_onyx_prism_config.json"
@@ -75,6 +76,17 @@ check_service() {
   restarts="$(systemctl show -p NRestarts --value "$UNIT")"
   [ "$restarts" = 0 ] || fail "the service restarted $restarts times"
   echo "service ready, no restarts"
+
+  # The web UI: HTTPS on 32169 behind a sign-in, the plain port sends browsers there.
+  "$REPO/scripts/ci/check_https.sh" 32168 32169 || fail "the HTTPS port"
+  # No account yet: the service made the one-time setup code in its private auth folder, and
+  # `setup-code` (as the service's account, with its config) prints it.
+  [ "$(sudo stat -c '%a %U' "$DATA/auth")" = "700 blueonyx" ] || fail "$DATA/auth is not 0700 blueonyx"
+  [ "$(sudo stat -c '%a %U' "$DATA/auth/setup-code")" = "600 blueonyx" ] || fail "no 0600 setup-code file in $DATA/auth"
+  local out
+  out="$(cd / && sudo -u blueonyx /opt/blue-onyx-prism/blue-onyx-prism --config "$CONFIG" setup-code)" || fail "setup-code failed"
+  echo "$out" | grep -Eq '^Setup code: [A-Z2-7-]{20,}' || fail "setup-code printed no code"
+  echo "setup-code prints a code"
 }
 check_service
 

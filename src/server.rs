@@ -31,6 +31,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
+mod accounts;
 mod apply;
 mod auth;
 mod benchmark;
@@ -260,6 +261,27 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
         ("/config/admin-token/rotate", post(auth::rotate)),
+        (
+            "/config/accounts/add",
+            post(accounts::add).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
+        (
+            "/config/accounts/remove",
+            post(accounts::remove).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
+        (
+            "/config/accounts/unlock",
+            post(accounts::unlock).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
+        (
+            "/config/accounts/password",
+            post(accounts::change_password).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
+        (
+            "/config/accounts/sign-out-everywhere",
+            post(accounts::sign_out_everywhere)
+                .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+        ),
         ("/train", get(train_area::entry)),
         ("/train/collect", get(dataset::page)),
         ("/train/import", get(training::import_tab)),
@@ -1311,6 +1333,11 @@ mod tests {
             "/config/restart",
             "/config/loglevel",
             "/config/admin-token/rotate",
+            "/config/accounts/add",
+            "/config/accounts/remove",
+            "/config/accounts/unlock",
+            "/config/accounts/password",
+            "/config/accounts/sign-out-everywhere",
             "/train",
             "/train/collect",
             "/train/import",

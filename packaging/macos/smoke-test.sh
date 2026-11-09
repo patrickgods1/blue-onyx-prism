@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the pkg, check the daemon answers the uninstaller app and the tray app are in place, uninstall keeping
+# Install the pkg, check the daemon answers (plain HTTP and the web UI's HTTPS, the setup code), the uninstaller app and the tray app are in place, uninstall keeping
 # the data (program and app gone, data kept, a seeded dataset file included), reinstall over it with
 # the account's id changed (the data follows and survives), then purge. For a macOS CI runner
 # (passwordless sudo). Usage: packaging/macos/smoke-test.sh <pkg>
@@ -13,6 +13,7 @@ CONFIG="$DATA/blue_onyx_prism_config.json"
 SEED="$DATA/dataset/smoke-test/frame.labels.json"
 PROG=/usr/local/blue-onyx-prism
 APP="/Applications/Uninstall Blue Onyx Prism.app"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fail() {
   echo "SMOKE TEST FAILED: $*" >&2
   # Why the daemon stopped: a restart count alone says nothing.
@@ -52,6 +53,17 @@ check_daemon() {
   runs="$(sudo launchctl print system/com.blueonyx.prism | awk '/^\truns = / { print $3 }')"
   [ "$runs" = 1 ] || fail "the daemon was started $runs times (expected 1)"
   echo "daemon ready, started once"
+
+  # The web UI: HTTPS on 32169 behind a sign-in, the plain port sends browsers there.
+  "$REPO/scripts/ci/check_https.sh" 32168 32169 || fail "the HTTPS port"
+  # No account yet: the daemon made the one-time setup code in its private auth folder, and
+  # `setup-code` (as the daemon's account, with its config) prints it.
+  [ "$(sudo stat -f '%Lp %Su' "$DATA/auth")" = "700 _blueonyx" ] || fail "$DATA/auth is not 0700 _blueonyx"
+  [ "$(sudo stat -f '%Lp %Su' "$DATA/auth/setup-code")" = "600 _blueonyx" ] || fail "no 0600 setup-code file in $DATA/auth"
+  local out
+  out="$(cd / && sudo -u _blueonyx "$PROG/blue-onyx-prism" --config "$CONFIG" setup-code)" || fail "setup-code failed"
+  echo "$out" | grep -Eq '^Setup code: [A-Z2-7-]{20,}' || fail "setup-code printed no code"
+  echo "setup-code prints a code"
 }
 
 sudo installer -pkg "$PKG" -target / -verbose
@@ -98,17 +110,18 @@ sudo test -f "$SEED" || fail "$SEED deleted by the second uninstall"
 # Then with the account's id changed meanwhile (deleted by hand and made again): the daemon must
 # own and read what the old id wrote. The kernel refuses a bind while a socket of the port belongs
 # to another uid, and the old daemon's closed connections stay in TIME_WAIT (2 MSL, nominally 30 s,
-# longer on a busy VM: a fixed 35 s sleep once lost by a second), so wait until the port has no
-# sockets left: launchd would otherwise restart the daemon until they are gone.
-port_sockets() { netstat -an -p tcp | awk '$4 ~ /[.:]32168$/' | wc -l | tr -d ' '; }
-echo "sockets on port 32168 after the uninstall: $(port_sockets)"
+# longer on a busy VM: a fixed 35 s sleep once lost by a second), so wait until the ports have no
+# sockets left: launchd would otherwise restart the daemon until they are gone (the HTTPS port
+# would only be retried in the background, and the check above waits a minute at most).
+port_sockets() { netstat -an -p tcp | awk '$4 ~ /[.:]3216[89]$/' | wc -l | tr -d ' '; }
+echo "sockets on ports 32168 and 32169 after the uninstall: $(port_sockets)"
 waited=0
 until [ "$(port_sockets)" = 0 ]; do
-  [ "$waited" -lt 120 ] || { netstat -an -p tcp | awk '$4 ~ /[.:]32168$/' >&2; fail "port 32168 still has sockets after ${waited} s"; }
+  [ "$waited" -lt 120 ] || { netstat -an -p tcp | awk '$4 ~ /[.:]3216[89]$/' >&2; fail "ports 32168/32169 still have sockets after ${waited} s"; }
   sleep 1
   waited=$((waited + 1))
 done
-echo "port 32168 free after ${waited} s"
+echo "ports 32168 and 32169 free after ${waited} s"
 new_uid=""
 for i in $(seq 499 -1 300); do
   if ! dscl . -list /Users UniqueID | awk -v id="$i" '$2 == id { f = 1 } END { exit !f }'; then new_uid="$i"; break; fi

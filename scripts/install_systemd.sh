@@ -55,3 +55,4 @@ systemctl restart blue-onyx-prism
 systemctl --no-pager status blue-onyx-prism | head -20 || true
 echo "Config: $CONFIG (data: $DATA_DIR)"
 echo "Logs:   journalctl -u blue-onyx-prism -f"
+bop_print_urls "$CONFIG" "$INSTALL_DIR/blue-onyx-prism"
