@@ -109,18 +109,15 @@ fn service_config(cli: &Cli, config: Option<PathBuf>, what: &str) -> Result<Conf
 }
 
 fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Result<()> {
-    let path = blue_onyx_prism::admin_token::path(&service_config(cli, config, "token")?);
-    let token = if rotate {
-        let token = blue_onyx_prism::admin_token::rotate(&path)?;
+    let config = service_config(cli, config, "token")?;
+    let token = blue_onyx_prism::admin_token::for_command(&config, rotate)?;
+    if rotate {
         eprintln!(
             "Replaced {}. A running service uses the new token at once; signed-in browsers have \
              to sign in again.",
-            path.display()
+            blue_onyx_prism::admin_token::path(&config).display()
         );
-        token
-    } else {
-        blue_onyx_prism::admin_token::ensure(&path)?.0
-    };
+    }
     println!("{}", token.reveal());
     Ok(())
 }
@@ -447,6 +444,25 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::HfLogout) => return resources::hf_token::logout(&read_config(&cli)?),
         Some(Command::AdminToken { rotate, config }) => {
             return admin_token_command(&cli, rotate, config);
+        }
+        Some(Command::User { action, config }) => {
+            let _log = cli::init_logging(LogLevel::Warn, None)?;
+            let config = service_config(&cli, config, "accounts")?;
+            return blue_onyx_prism::accounts::commands::user(
+                &config,
+                &action,
+                &mut blue_onyx_prism::accounts::commands::Terminal,
+                &mut std::io::stdout(),
+            );
+        }
+        Some(Command::SetupCode { config }) => {
+            let _log = cli::init_logging(LogLevel::Warn, None)?;
+            let config = service_config(&cli, config, "accounts")?;
+            print!(
+                "{}",
+                blue_onyx_prism::accounts::commands::setup_code(&config)?
+            );
+            return Ok(());
         }
         Some(Command::TlsFingerprint { config }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;

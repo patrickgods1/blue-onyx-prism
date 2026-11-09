@@ -27,7 +27,7 @@ The release-readiness review (phases 1-10, PRs #121-#131 and this phase), groupe
 
 ### Security
 - Admin pages and `GET /v1/config` refuse a `Host` that is not an IP address, `localhost` or an `allowed_hosts` name (DNS rebinding, RR-S1). An admin page opened by a name such as `http://nas.local:32168` answers 403 until the name is in `allowed_hosts`.
-- Remote administration needs a token (`allow_remote_admin`): 256 bits in `<data root>/admin-token`, shown by `blue-onyx-prism admin-token [--rotate]`, sent as `Authorization: Bearer` or through `/login` (RR-S4). Five wrong tokens a minute per address get 429. Detection routes never need it.
+- Remote administration needs a token (`allow_remote_admin`): 256 bits in `<data root>/auth/admin-token` (moved there from `<data root>/admin-token`), shown by `blue-onyx-prism admin-token [--rotate]`, sent as `Authorization: Bearer` or through `/login` (RR-S4). Five wrong tokens a minute per address get 429. Detection routes never need it.
 - A request that carries `X-Forwarded-For`, `Forwarded` or `X-Real-IP` is never treated as this machine, so a local reverse proxy cannot skip the token.
 - `download_dir`, `onnxruntime_dir` and `openvino_dir` can no longer be changed from the web UI (they choose libraries the service loads). Moving the data folder means editing the config file and restarting.
 - One-off flags (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`) are no longer written to the config file.

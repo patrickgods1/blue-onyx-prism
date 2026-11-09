@@ -311,7 +311,7 @@ it; every key can also be set in the file.
 | `tls_cert_path` | not set | Your own HTTPS certificate (PEM, the chain allowed, leaf first) instead of the generated self-signed one; set together with `tls_key_path`. A relative path is under the data root. Used as given, never written. Applies: process restart. UI: read-only; set it in the config file, see [HTTPS](#https) |
 | `tls_key_path` | not set | The private key of `tls_cert_path` (PEM: PKCS#8, PKCS#1 or SEC1). Both or neither. Applies: process restart. UI: no; set it in the config file |
 | `bind_address` | `0.0.0.0` | Address the HTTP and HTTPS listeners bind; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Remote access](#remote-access) |
-| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
+| `allow_remote_admin` | `false` | Serve the admin pages and actions to other machines that show the admin token (`<data root>/auth/admin-token`, made when this is turned on). Boolean. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Remote access](#remote-access) |
 | `allowed_networks` | `[]` | Networks served besides the local network (loopback, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10`), e.g. a VPN: `["100.64.0.0/10"]` for Tailscale. Every other client is refused on every route. List of up to 32 CIDRs (a bare address = one address), stored in network form; `/0` is refused. Applies: at once. UI: read-only; set it in the config file, see [Local network only](#local-network-only) |
 | `request_timeout_secs` | `15` | Max time a request may wait in the queue plus processing (the only request timeout). Integer 1-3600. Applies: at once. UI: yes |
@@ -880,6 +880,39 @@ minute, with a count of the ones left out.
 - A reverse proxy that adds no forwarding header looks like its own address, so its clients pass
   as the proxy's network. Make it add one (see below).
 
+### Accounts
+
+The web UI gets username-and-password accounts, all of them administrators. They are managed on
+the server with the commands below; signing in to the pages with them comes with a later change
+(until then the rules of [Remote access](#remote-access) apply). Run the commands as the
+service's account, with `--config <file>` when the service has its own config (the Windows
+service, the packages, Docker: `docker exec -it blue-onyx-prism /app/blue-onyx-prism --config
+/app/config/blue_onyx_prism_config.json user list`).
+
+- **The first account:** `blue-onyx-prism setup-code` prints a one-time setup code
+  (`XXXX-XXXX-XXXX-XXXX-XXXX`, 100 random bits; case, spaces and dashes do not matter), the HTTPS
+  addresses and the certificate's fingerprint. The code creates the first account once and is
+  then deleted; once an account exists the command refuses. On the server,
+  `blue-onyx-prism user add <name>` creates an account without a code, the first one included.
+- `user add <name>`, `user remove <name>` (never the last account), `user list` (name, created,
+  password changed, failed attempts, disabled; never the hashes), `user reset-password <name>`,
+  `user unlock <name>`. Names are 1 to 32 characters of `a-z`, `0-9`, `.`, `_`, `-` (upper case
+  is lowered).
+- **Passwords** (NIST SP 800-63B): 15 to 128 characters, counted after Unicode normalization
+  (NFC), no rules about digits or symbols; a passphrase of four or more words works well. Refused:
+  a common password (a list from SecLists), one that contains the account's name, or `blueonyx` /
+  `prism`. On a terminal the commands ask twice without echo; with stdin not a terminal they read
+  one line from it (`printf '%s\n' "$PW" | blue-onyx-prism user add bob`). Never from the command
+  line or the environment.
+- Stored in `<data root>/auth/users.json` as Argon2id hashes (m = 19 MiB, t = 2, p = 1), in the
+  private `auth` folder. After 10 wrong passwords in a row an account waits 1 s before the next
+  try, doubling with each further one up to 15 minutes; at 100 in a row it is disabled until
+  `user unlock` or `user reset-password`.
+- **Recovery:** a forgotten password is reset on the server with `blue-onyx-prism user
+  reset-password <name>` (it also unlocks the account and ends its sessions). If `users.json`
+  cannot be read or is damaged, nobody can sign in and setup does not reopen: restore the file
+  from a backup, or delete it to start over with a new setup code.
+
 ### Remote access
 
 Blue Iris may run on another machine, so the service listens on every interface by default
@@ -896,9 +929,11 @@ static files.
   does the same for one run only: it is not written to the config file, so the next plain start is
   back to loopback-only. The service logs a warning at every start while it is on, with the path
   of the token and the command that prints it.
-- Remote administration needs the **admin token**, 256 random bits in `<data root>/admin-token`
-  (mode 0600 on Unix; on Windows the file inherits the data folder's permissions), made when
-  `allow_remote_admin` is first on. Clients on this machine never need it, and detection and the
+- Remote administration needs the **admin token**, 256 random bits in
+  `<data root>/auth/admin-token` (the private `auth` folder: mode 0700/0600 on Unix, a protected
+  ACL without Users on Windows), made when `allow_remote_admin` is first on. A token that an
+  earlier version kept in `<data root>/admin-token` is moved there at the next start or
+  `admin-token` command. Clients on this machine never need it, and detection and the
   other open routes never look at it.
   - Read it on the server, as the service's account: `blue-onyx-prism admin-token`, with
     `--config <file>` when the service has its own config (the Windows service, the packages,

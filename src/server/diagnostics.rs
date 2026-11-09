@@ -78,7 +78,7 @@ pub(super) async fn download(State(state): State<Arc<AppState>>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use crate::diagnostics::tests::{ADMIN, HF, entries, planted};
+    use crate::diagnostics::tests::{entries, planted, planted_secrets};
     use crate::server::test_util::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -128,7 +128,9 @@ mod tests {
                 .unwrap();
         assert_eq!(devices["runtimes"]["openvino"]["version"], "2026.0.0-test");
         for (name, text) in &all {
-            assert!(!text.contains(ADMIN) && !text.contains(HF), "{name}");
+            for secret in planted_secrets() {
+                assert!(!text.contains(secret), "{name} holds {secret}");
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
 

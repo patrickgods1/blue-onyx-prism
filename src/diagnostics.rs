@@ -12,9 +12,10 @@
 //! `problems.txt` (each part that could not be collected, and why).
 //!
 //! What it never holds: camera frames, label files, datasets, model weights, and the secrets.
-//! The admin token and the Hugging Face token live in their own files and are never read into a
-//! part; as a second line every part is scrubbed of their values ([`known_secrets`]) before it
-//! is written. Camera names and file paths do stay (they are in the config and the logs, and
+//! The admin token, the Hugging Face token and everything in the private `auth` folder (the
+//! accounts' password hashes in `users.json`, `sessions.json`, `devices.json`, the setup code,
+//! the HTTPS key) live in their own files and are never read into a part; as a second line every
+//! part is scrubbed of their values ([`known_secrets`]) before it is written. Camera names and file paths do stay (they are in the config and the logs, and
 //! support needs them); the README's troubleshooting section says so.
 
 use crate::config::Config;
@@ -47,10 +48,15 @@ pub struct Live {
     pub notes: Vec<String>,
 }
 
-/// The values to scrub: the admin token, the token `hf-login` saved, and the Hugging Face token
-/// this process would use (`HF_TOKEN`, the `hf` CLI's file). Never logged, never returned.
+/// The values to scrub: the admin token (in `auth/` and where earlier versions kept it), the
+/// token `hf-login` saved, the Hugging Face token this process would use (`HF_TOKEN`, the `hf`
+/// CLI's file), the setup code (as stored and as printed), the password hashes of `users.json`
+/// and every token-like string of it and of `sessions.json` / `devices.json` ([`token_like`]),
+/// and the lines of the HTTPS key (generated, or the config's own `tls_key_path`). Never logged,
+/// never returned.
 pub fn known_secrets(config: &Config) -> Vec<String> {
     let root = config.data_root();
+    let auth = crate::private_dir::path(&root);
     let mut out = Vec::new();
     let file = |p: PathBuf| {
         std::fs::read_to_string(p)
@@ -58,14 +64,72 @@ pub fn known_secrets(config: &Config) -> Vec<String> {
             .map(|s| s.trim().to_string())
     };
     out.extend(file(crate::admin_token::path(config)));
+    out.extend(file(crate::admin_token::old_path(config)));
     out.extend(file(crate::resources::hf_token::saved_token_path(&root)));
     if let Some(t) = crate::resources::hf_token::lookup(&root).token() {
         out.push(t.secret().to_string());
     }
+    if let Some(code) = file(auth.join(crate::accounts::setup::FILE_NAME)) {
+        let grouped = code
+            .as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join("-");
+        out.push(grouped);
+        out.push(code);
+    }
+    for name in [crate::accounts::FILE_NAME, "sessions.json", "devices.json"] {
+        if let Some(v) = file(auth.join(name)).and_then(|t| serde_json::from_str(&t).ok()) {
+            token_like(&v, &mut out);
+        }
+    }
+    let key = crate::tls::Source::of(config).paths().1;
+    if let Some(pem) = file(key) {
+        let body: Vec<&str> = pem
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+            .collect();
+        out.push(body.concat());
+        out.extend(body.iter().map(|l| (*l).to_string()));
+    }
     out.retain(|s| s.len() >= MIN_SECRET_LEN);
-    out.sort();
+    // Longest first, so a secret that holds another is replaced whole.
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     out.dedup();
     out
+}
+
+/// Strings of at least this length without whitespace count as token-like in the auth files:
+/// longer than any username (32), shorter than a hex SHA-256 (64) or a PHC string.
+const TOKEN_LIKE_LEN: usize = 40;
+
+/// Every token-like string (keys and values) in `v`, and the `$`-separated parts of a PHC
+/// string (its salt and hash) of 16 characters or more.
+fn token_like(v: &serde_json::Value, out: &mut Vec<String>) {
+    let mut push = |s: &str| {
+        if s.len() >= TOKEN_LIKE_LEN && !s.chars().any(char::is_whitespace) {
+            out.push(s.to_string());
+            if s.starts_with('$') {
+                out.extend(s.split('$').filter(|p| p.len() >= 16).map(str::to_string));
+            }
+        }
+    };
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match v {
+            serde_json::Value::String(s) => push(s),
+            serde_json::Value::Array(a) => stack.extend(a),
+            serde_json::Value::Object(o) => {
+                for (k, v) in o {
+                    push(k);
+                    stack.push(v);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `text` with every secret replaced by [`REDACTED`].
@@ -447,17 +511,75 @@ pub(crate) mod tests {
 
     pub(crate) const ADMIN: &str = "admintoken-PLANTED-4f1c9e";
     pub(crate) const HF: &str = "hf_PLANTEDtokenvalue123456";
+    /// An admin token where earlier versions kept it (the data root).
+    pub(crate) const OLD_ADMIN: &str = "oldadmintoken-PLANTED-77aa01";
+    pub(crate) const SETUP: &str = "PLANTEDSETUPCODEQRST";
+    pub(crate) const SETUP_GROUPED: &str = "PLAN-TEDS-ETUP-CODE-QRST";
+    pub(crate) const PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$UExBTlRFRHNhbHRzYWx0MTI$UExBTlRFRGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaDE";
+    pub(crate) const PHC_SALT: &str = "UExBTlRFRHNhbHRzYWx0MTI";
+    pub(crate) const PHC_HASH: &str = "UExBTlRFRGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaDE";
+    pub(crate) const SESSION: &str =
+        "5e55105e55105e55105e55105e55105e55105e55105e55105e55105e55105e55";
+    pub(crate) const DEVICE: &str =
+        "dec1ced0dec1ced0dec1ced0dec1ced0dec1ced0dec1ced0dec1ced0dec1ced0";
+    pub(crate) const KEY_LINE: &str =
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPLANTEDkeyPLANTED";
 
-    /// A data root with both token files planted, a log dir with two days of logs (one line
-    /// of today's quoting both tokens), a frame and a label file in a dataset folder, and a
-    /// config file naming it all.
+    /// Every value [`planted`] hides, for the assertions.
+    pub(crate) fn planted_secrets() -> Vec<&'static str> {
+        vec![
+            ADMIN,
+            HF,
+            OLD_ADMIN,
+            SETUP,
+            SETUP_GROUPED,
+            PHC,
+            PHC_SALT,
+            PHC_HASH,
+            SESSION,
+            DEVICE,
+            KEY_LINE,
+        ]
+    }
+
+    /// A data root with every secret file planted (both token files, an old admin token, the
+    /// auth folder's accounts, sessions, devices, setup code and HTTPS key), a log dir with two
+    /// days of logs (one line of today's quoting each secret), a frame and a label file in a
+    /// dataset folder, and a config file naming it all.
     pub(crate) fn planted(dir: &Path) -> (Config, PathBuf) {
         let config = Config {
             download_dir: Some(dir.to_path_buf()),
             log_path: Some(dir.join("logs")),
             ..Default::default()
         };
+        let auth = crate::private_dir::ensure(dir).unwrap();
         std::fs::write(crate::admin_token::path(&config), format!("{ADMIN}\n")).unwrap();
+        std::fs::write(crate::admin_token::old_path(&config), OLD_ADMIN).unwrap();
+        std::fs::write(auth.join("setup-code"), format!("{SETUP}\n")).unwrap();
+        std::fs::write(
+            auth.join("users.json"),
+            serde_json::json!({"format": 1, "users": [{"name": "alice", "hash": PHC,
+                "created": 1, "password_changed": 1, "generation": 1}]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            auth.join("sessions.json"),
+            serde_json::json!({"format": 1, "sessions": {SESSION: {"user": "alice"}}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            auth.join("devices.json"),
+            serde_json::json!({"format": 1, "devices": [{"id": DEVICE, "user": "alice"}]})
+                .to_string(),
+        )
+        .unwrap();
+        let tls = crate::private_dir::ensure_child(&auth, "tls").unwrap();
+        std::fs::write(
+            tls.join("key.pem"),
+            format!("-----BEGIN PRIVATE KEY-----\n{KEY_LINE}\nAB==\n-----END PRIVATE KEY-----\n"),
+        )
+        .unwrap();
         let hf = crate::resources::hf_token::saved_token_path(dir);
         std::fs::create_dir_all(hf.parent().unwrap()).unwrap();
         std::fs::write(&hf, HF).unwrap();
@@ -470,7 +592,10 @@ pub(crate) mod tests {
         .unwrap();
         std::fs::write(
             logs.join("blue_onyx_prism.log.2026-11-07"),
-            format!("INFO camera FrontDoor\nWARN leaked {ADMIN} and {HF}\n"),
+            format!(
+                "INFO camera FrontDoor\nWARN leaked {ADMIN} and {HF}\nWARN more {}\n",
+                planted_secrets().join(" ")
+            ),
         )
         .unwrap();
         std::fs::write(logs.join("other.txt"), "not a log").unwrap();
@@ -510,14 +635,27 @@ pub(crate) mod tests {
             assert!(names.contains(&want), "{want} missing from {names:?}");
         }
         assert!(!names.iter().any(|n| n.contains("other.txt")), "{names:?}");
+        let mut hidden = planted_secrets();
+        hidden.extend(["JPEGFRAMEBYTES", "LABELFILE"]);
         for (name, text) in &all {
-            for secret in [ADMIN, HF, "JPEGFRAMEBYTES", "LABELFILE"] {
+            for secret in &hidden {
                 assert!(!text.contains(secret), "{name} holds {secret}");
             }
         }
         // The raw zip bytes too (names, comments).
         let raw = String::from_utf8_lossy(&bytes);
-        assert!(!raw.contains(ADMIN) && !raw.contains(HF));
+        for secret in planted_secrets() {
+            assert!(!raw.contains(secret), "{secret}");
+        }
+        // No part is one of the auth folder's files.
+        assert!(
+            !names.iter().any(
+                |n| ["users", "sessions", "setup-code", "key.pem", "admin-token"]
+                    .iter()
+                    .any(|f| n.contains(f))
+            ),
+            "{names:?}"
+        );
         let log = &all
             .iter()
             .find(|(n, _)| n == "logs/blue_onyx_prism.log.2026-11-07")

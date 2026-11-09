@@ -1603,7 +1603,11 @@ mod tests {
                 peer,
             )
         };
-        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        std::fs::write(
+            crate::admin_token::prepare(&state.config_read()).unwrap(),
+            TOKEN,
+        )
+        .unwrap();
         let signed_in = |mut r: axum::http::Request<Body>| {
             r.headers_mut().insert(
                 header::AUTHORIZATION,

@@ -1,30 +1,31 @@
 //! The admin token: what a remote peer shows to use the admin routes while `allow_remote_admin`
-//! is on (`server::auth` checks it). 256 bits of OS randomness as hex in `<data root>/admin-token`,
-//! made when first needed: at startup or on a config change with `allow_remote_admin` on
-//! ([`ensure_for`]), or by `blue-onyx-prism admin-token`. Nothing here is a route: the service only
-//! compares, and only the CLI prints.
+//! is on (`server::auth` checks it). 256 bits of OS randomness ([`crate::secret`]) as hex in
+//! `<data root>/auth/admin-token`, made when first needed: at startup or on a config change with
+//! `allow_remote_admin` on ([`ensure_for`]), or by `blue-onyx-prism admin-token`. Nothing here is
+//! a route: the service only compares, and only the CLI prints.
 //!
 //! The file is the one source. The service reads it on every check ([`read`]), so a rotation by
 //! another process applies at once and there is no cache to get stale; a file that is missing,
 //! unreadable or not exactly one token passes nobody, which also keeps an empty file from ever
 //! matching an empty credential.
 //!
-//! It is written through a temporary file and a rename, with mode 0600 from its first byte on Unix.
-//! On Windows it inherits the data folder's DACL (no ACL of its own): whoever may read that folder
-//! may read the token. On a default install that takes in local accounts, which already administer
-//! the service over loopback without any token.
+//! It lives in the private `auth` folder ([`crate::private_dir`]: 0700/0600 on Unix, a protected
+//! DACL without Users on Windows) and is written through a temporary file there and a rename.
+//! Earlier versions kept it in the data root (`<data root>/admin-token`); [`prepare`], which the
+//! service (at start and on config changes) and the CLI go through, moves such a file into
+//! `auth/` under `auth/.lock` (see [`migrate`]).
 //!
 //! [`AdminToken`] has no `Display` or `Serialize` and its `Debug` hides the value, so it cannot end
 //! up in a log line, an HTTP answer or an error by accident; no error here quotes the file.
 
 use crate::config::Config;
-use crate::resources::{hf_token, manager};
+use crate::resources::hf_token;
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// File name under the data root.
+/// File name in `<data root>/auth/` (and, from earlier versions, in the data root itself).
 pub const FILE_NAME: &str = "admin-token";
 /// Hex characters of a token (256 bits).
 const TOKEN_LEN: usize = 64;
@@ -62,20 +63,100 @@ impl AdminToken {
     }
 }
 
-/// Where the token of `config` lives: the data root, the same for the service and the CLI.
+/// Where the token of `config` lives: `<data root>/auth/admin-token`, the same for the service
+/// and the CLI. No I/O; [`prepare`] makes the folder and moves an old file.
 pub fn path(config: &Config) -> PathBuf {
+    crate::private_dir::path(&config.data_root()).join(FILE_NAME)
+}
+
+/// Where earlier versions kept it: `<data root>/admin-token`.
+pub fn old_path(config: &Config) -> PathBuf {
     config.data_root().join(FILE_NAME)
 }
 
-/// 256 bits from the OS. `uuid` is this crate's source of randomness (`getrandom`, no userspace
-/// generator: the build has neither `fast-rng` nor `rng-rand`); one UUID holds 122 random bits,
-/// so three (366 bits) go through SHA-256.
+/// 256 bits from the OS as 64 hex characters.
 fn generate() -> String {
-    let mut seed = Vec::with_capacity(48);
-    for _ in 0..3 {
-        seed.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    crate::secret::random_hex(TOKEN_LEN / 2)
+}
+
+/// What [`migrate`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Migrated {
+    /// No old file: nothing to do.
+    Nothing,
+    /// The old file was moved into `auth/`.
+    Moved,
+    /// Both exist: the new one counts, the old one was left alone (a warning names it).
+    BothKept,
+}
+
+/// Move a token file from the data root (`old`) to `new` in the auth folder, under
+/// `auth/.lock`: when `new` is missing and `old` exists. On Windows (and wherever a rename
+/// fails) the content is written anew through [`crate::private_dir::write_file`] and the old file
+/// deleted, because a renamed file keeps its own permissions, which on Windows are the data
+/// root's (Users may read) rather than the auth folder's. On Unix a rename keeps the content and
+/// mode 0600 is set again. When both exist the new one wins and the old one is left as it is.
+pub fn migrate(old: &Path, new: &Path) -> Result<Migrated> {
+    let auth = new
+        .parent()
+        .context("the admin token file has no parent folder")?;
+    if !old.exists() {
+        return Ok(Migrated::Nothing);
     }
-    manager::sha256_hex(&seed)
+    let _held = crate::accounts::lock::lock(auth)?;
+    if !old.exists() {
+        return Ok(Migrated::Nothing);
+    }
+    if new.exists() {
+        return Ok(Migrated::BothKept);
+    }
+    let renamed = if cfg!(windows) {
+        false
+    } else {
+        std::fs::rename(old, new).is_ok()
+    };
+    if renamed {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(new, std::fs::Permissions::from_mode(0o600)).with_context(
+                || format!("restricting {} to its owner (mode 0600)", new.display()),
+            )?;
+        }
+        return Ok(Migrated::Moved);
+    }
+    let text = std::fs::read_to_string(old).map_err(|e| unreadable(old, &e))?;
+    crate::private_dir::write_file(auth, FILE_NAME, &text)?;
+    std::fs::remove_file(old).with_context(|| {
+        format!(
+            "removing the old admin token {} after copying it to {}; delete it by hand",
+            old.display(),
+            new.display()
+        )
+    })?;
+    Ok(Migrated::Moved)
+}
+
+/// Make the auth folder of `config` and move an old token into it ([`migrate`]): the token's
+/// path. Both the service and the CLI go through this before they use the token.
+pub fn prepare(config: &Config) -> Result<PathBuf> {
+    crate::private_dir::ensure(&config.data_root())?;
+    let (old, new) = (old_path(config), path(config));
+    match migrate(&old, &new)? {
+        Migrated::Nothing => {}
+        Migrated::Moved => info!(
+            from = %old.display(),
+            to = %new.display(),
+            "moved the admin token into the private auth folder"
+        ),
+        Migrated::BothKept => warn!(
+            "{} is an admin token from an earlier version, but {} exists and is the one in use; \
+             delete the old file (it is not read any more)",
+            old.display(),
+            new.display()
+        ),
+    }
+    Ok(new)
 }
 
 /// The token in `path`; `None` when there is no such file.
@@ -125,53 +206,19 @@ pub fn read(path: &Path) -> Result<AdminToken> {
     }
 }
 
-/// Run as root (`sudo ... admin-token --rotate`), the data root's owner has to own the file, or
-/// the service could not read it and every remote peer would be refused.
-#[cfg(unix)]
-fn hand_over(made: &Path, dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, chown};
-    let me = std::fs::metadata(made)
-        .with_context(|| format!("reading {}", made.display()))?
-        .uid();
-    let root = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
-    if let Some((uid, gid)) = hf_token::chown_to(me, (root.uid(), root.gid())) {
-        chown(made, Some(uid), Some(gid))
-            .with_context(|| format!("giving {} to uid {uid}", made.display()))?;
-    }
-    Ok(())
-}
-
-/// Replace `path` with a new token (a new file: whatever was there, even unusable, goes). A
-/// failure leaves the old token working, and no copy of the new one behind.
+/// Replace `path` with a new token (a new file: whatever was there, even unusable, goes). Its
+/// folder must exist ([`prepare`] makes the real one). A failure leaves the old token working,
+/// and no copy of the new one behind. Run as root, the file goes to the folder's owner.
 pub fn rotate(path: &Path) -> Result<AdminToken> {
     let dir = path
         .parent()
         .context("the admin token file has no parent folder")?;
-    std::fs::create_dir_all(dir).with_context(|| {
-        format!(
-            "creating {}; check that this account may write there",
-            dir.display()
-        )
-    })?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("the admin token file has no name")?;
     let value = generate();
-    let tmp = dir.join(format!(
-        ".{FILE_NAME}.{}.tmp",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let written = hf_token::write_private(&tmp, &format!("{value}\n")).and_then(|()| {
-        #[cfg(unix)]
-        hand_over(&tmp, dir)?;
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!(
-                "replacing {}; check that this account may write there",
-                path.display()
-            )
-        })
-    });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+    crate::private_dir::write_file(dir, name, &format!("{value}\n"))?;
     Ok(AdminToken(value))
 }
 
@@ -187,17 +234,40 @@ pub fn ensure(path: &Path) -> Result<(AdminToken, bool)> {
     Ok((read(path)?, true))
 }
 
-/// Make the token when `config` needs one. A failure is logged and leaves remote administration
+/// Make the token when `config` needs one, and move a token of an earlier version into `auth/`
+/// ([`prepare`]) whatever the setting. A failure is logged and leaves remote administration
 /// closed (the check fails on a missing file); detection and this machine are not affected.
 pub fn ensure_for(config: &Config) {
+    // An old file moves whatever the setting, so no copy stays in the data root; otherwise
+    // nothing is made while remote administration is off.
+    if !config.allow_remote_admin && !old_path(config).exists() {
+        return;
+    }
+    let path = match prepare(config) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("remote administration stays closed: {e:#}");
+            return;
+        }
+    };
     if !config.allow_remote_admin {
         return;
     }
-    let path = path(config);
     match ensure(&path) {
         Ok((_, true)) => info!(path = %path.display(), "created the admin token"),
         Ok((_, false)) => {}
         Err(e) => warn!("remote administration stays closed: {e:#}"),
+    }
+}
+
+/// `blue-onyx-prism admin-token [--rotate]` for `config`: the token to print (made when there is
+/// none, replaced with `rotate`), after an old file was moved ([`prepare`]).
+pub fn for_command(config: &Config, rotate_it: bool) -> Result<AdminToken> {
+    let path = prepare(config)?;
+    if rotate_it {
+        rotate(&path)
+    } else {
+        Ok(ensure(&path)?.0)
     }
 }
 
@@ -260,11 +330,99 @@ mod tests {
         assert_eq!(left.len(), 1, "a temporary file stayed behind");
     }
 
+    fn config_in(root: &Path) -> Config {
+        Config {
+            download_dir: Some(root.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn ensure_makes_the_data_root_when_it_is_missing() {
+    fn prepare_makes_the_private_folder_when_it_is_missing() {
         let d = dir();
-        let p = d.join("not").join("yet").join(FILE_NAME);
+        let config = config_in(&d.join("not").join("yet"));
+        let p = prepare(&config).unwrap();
+        assert_eq!(p, path(&config));
+        assert_eq!(p.parent().unwrap().file_name().unwrap(), "auth");
+        assert!(p.parent().unwrap().is_dir());
         assert!(ensure(&p).unwrap().1);
+    }
+
+    #[test]
+    fn an_old_token_moves_into_the_auth_folder_unchanged() {
+        let d = dir();
+        let config = config_in(&d);
+        let value = "ab".repeat(32);
+        std::fs::write(old_path(&config), format!("{value}\n")).unwrap();
+        let p = prepare(&config).unwrap();
+        assert!(!old_path(&config).exists(), "the old file is gone");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("{value}\n"));
+        assert_eq!(read(&p).unwrap().reveal(), value);
+        // The command prints that same token, and keeps doing so.
+        assert_eq!(for_command(&config, false).unwrap().reveal(), value);
+        assert_eq!(for_command(&config, false).unwrap().reveal(), value);
+        // Nothing is left in either folder but the token, the lock and the auth folder.
+        let mut top: Vec<String> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        top.sort();
+        assert_eq!(top, ["auth"]);
+        let mut inside: Vec<String> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        inside.sort();
+        assert_eq!(inside, [".lock", FILE_NAME]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn with_both_files_the_new_one_wins_and_the_old_stays() {
+        let d = dir();
+        let config = config_in(&d);
+        let (old, new) = ("ab".repeat(32), "cd".repeat(32));
+        let p = prepare(&config).unwrap();
+        std::fs::write(&p, &new).unwrap();
+        std::fs::write(old_path(&config), &old).unwrap();
+        assert_eq!(migrate(&old_path(&config), &p).unwrap(), Migrated::BothKept);
+        prepare(&config).unwrap();
+        assert_eq!(std::fs::read_to_string(old_path(&config)).unwrap(), old);
+        assert_eq!(for_command(&config, false).unwrap().reveal(), new);
+        assert_eq!(migrate(&d.join("none"), &p).unwrap(), Migrated::Nothing);
+    }
+
+    #[test]
+    fn the_service_moves_an_old_token_even_with_remote_admin_off() {
+        let d = dir();
+        let mut config = config_in(&d);
+        ensure_for(&config);
+        assert!(!d.join("auth").exists(), "nothing made while off");
+        std::fs::write(old_path(&config), "ab".repeat(32)).unwrap();
+        ensure_for(&config);
+        assert!(!old_path(&config).exists());
+        assert_eq!(read(&path(&config)).unwrap().reveal(), "ab".repeat(32));
+        config.allow_remote_admin = true;
+        ensure_for(&config);
+        assert_eq!(read(&path(&config)).unwrap().reveal(), "ab".repeat(32));
+    }
+
+    #[test]
+    fn rotating_through_the_command_replaces_the_moved_token() {
+        let d = dir();
+        let config = config_in(&d);
+        std::fs::write(old_path(&config), "ab".repeat(32)).unwrap();
+        let t = for_command(&config, true).unwrap();
+        assert_ne!(t.reveal(), "ab".repeat(32));
+        assert!(!old_path(&config).exists());
+        assert_eq!(read(&path(&config)).unwrap().reveal(), t.reveal());
     }
 
     #[test]
