@@ -1155,6 +1155,28 @@ impl Config {
             m.confidence_threshold = m.confidence_threshold.map(round_threshold);
             m.device_thresholds = normalized_profiles(&m.device_thresholds);
         }
+        self.move_default_https_port();
+    }
+
+    /// `https_port` still at its default ([`crate::DEFAULT_HTTPS_PORT`]) while `port` is that
+    /// same port: moved to the next port up. Configs from before the HTTPS
+    /// listener existed have no `https_port`, and 32169 was a common choice of `port` (the old
+    /// MSI docs suggested it), so without this such an install would refuse to start after an
+    /// upgrade. Any other clash is the user's own two values and stays refused
+    /// ([`validate_https`]).
+    pub fn move_default_https_port(&mut self) {
+        if self.port == crate::DEFAULT_HTTPS_PORT && self.https_port == crate::DEFAULT_HTTPS_PORT {
+            let moved = crate::DEFAULT_HTTPS_PORT + 1;
+            tracing::warn!(
+                port = self.port,
+                https_port = moved,
+                "port is {}, the default HTTPS port, so the web UI's HTTPS listener uses {} \
+                 instead; set \"https_port\" in the config to choose another",
+                self.port,
+                moved
+            );
+            self.https_port = moved;
+        }
     }
 
     /// Give every model entry without a `name` its [`ModelConfig::effective_name`] (the file
@@ -2828,6 +2850,41 @@ mod tests {
         // An old file without the key gets the default.
         let c: Config = serde_json::from_str(r#"{"port": 4000}"#).unwrap();
         assert_eq!(c.https_port, crate::DEFAULT_HTTPS_PORT);
+    }
+
+    /// An install whose `port` is the default HTTPS port (32169) still starts after the upgrade:
+    /// normalizing moves the defaulted `https_port` aside, at load and after the CLI merge.
+    /// Only a clash the user chose stays refused.
+    #[test]
+    fn a_port_on_the_default_https_port_moves_https_aside() {
+        for text in [
+            r#"{"port": 32169}"#,
+            r#"{"port": 32169, "https_port": 32169}"#,
+        ] {
+            let mut c: Config = serde_json::from_str(text).unwrap();
+            c.normalize();
+            assert_eq!(c.port, crate::DEFAULT_HTTPS_PORT, "{text}");
+            assert_eq!(c.https_port, crate::DEFAULT_HTTPS_PORT + 1, "{text}");
+            assert!(validate_https(&c).is_ok(), "{text}");
+        }
+        // `--port 32169` on a default config (the CLI merge path).
+        let mut c = Config {
+            port: crate::DEFAULT_HTTPS_PORT,
+            ..Default::default()
+        };
+        c.move_default_https_port();
+        assert_eq!(c.https_port, crate::DEFAULT_HTTPS_PORT + 1);
+        // Nothing moves without a clash, or for a clash on other ports.
+        let mut c = Config::default();
+        c.normalize();
+        assert_eq!(
+            (c.port, c.https_port),
+            (crate::DEFAULT_PORT, crate::DEFAULT_HTTPS_PORT)
+        );
+        let mut c: Config = serde_json::from_str(r#"{"port": 4000, "https_port": 4000}"#).unwrap();
+        c.normalize();
+        assert_eq!(c.https_port, 4000);
+        assert!(validate_https(&c).is_err());
     }
 
     #[test]
