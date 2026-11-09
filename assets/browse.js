@@ -25,7 +25,12 @@
   function fill(target, path) {
     target.value = path;
     target.dispatchEvent(new Event("input", { bubbles: true }));
-    target.focus();
+    // The field takes the focus only under a mouse or pen: on a phone it would open the keyboard
+    // over the page just to show the picked path.
+    if (finePointer()) target.focus();
+  }
+  function finePointer() {
+    try { return !window.matchMedia || window.matchMedia("(pointer: fine)").matches; } catch (e) { return true; }
   }
 
   // The in-page browser (server-side listing).
@@ -92,6 +97,15 @@
     up.addEventListener("click", function () { if (up.dataset.path) go(up.dataset.path, false); });
     use.addEventListener("click", function () { if (cur) pick(cur.path); });
     $("browse-cancel").addEventListener("click", function () { dlg.close(); });
+    var closeBtn = $("browse-close");
+    if (closeBtn) closeBtn.addEventListener("click", function () { dlg.close(); });
+    // A click on the backdrop (outside the dialog's box; the box's own padding is inside) closes
+    // it, as on the Review page's keys overlay.
+    dlg.addEventListener("click", function (ev) {
+      if (ev.target !== dlg || !dlg.getBoundingClientRect) return;
+      var r = dlg.getBoundingClientRect();
+      if (ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom) dlg.close();
+    });
   }
 
   // The native dialog on the server's screen.

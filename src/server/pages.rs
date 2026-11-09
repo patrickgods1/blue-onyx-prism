@@ -1512,4 +1512,162 @@ mod tests {
         assert!(training.contains("name=\"sam3_threshold\""));
         assert!(training.contains("<option value=\"both\">found by 2+ labelers</option>"));
     }
+
+    /// Phones: the page may use the whole screen (notch insets reach the CSS only with
+    /// `viewport-fit=cover`), follows the system's light / dark choice from the first paint, and
+    /// can always be zoomed (WCAG 1.4.4: never `maximum-scale` or `user-scalable`).
+    #[tokio::test]
+    async fn the_base_page_covers_the_screen_and_stays_zoomable() {
+        let state = test_state();
+        for uri in ["/", "/config", "/train/review", "/benchmark", "/logs"] {
+            let (s, html) = get_text(&state, uri).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+            assert!(
+                html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"),
+                "{uri}"
+            );
+            assert!(
+                html.contains("<meta name=\"color-scheme\" content=\"light dark\">"),
+                "{uri}"
+            );
+            assert!(
+                !html.contains("user-scalable") && !html.contains("maximum-scale"),
+                "{uri}: the page must stay zoomable"
+            );
+        }
+        let css = static_file("style.css").unwrap();
+        // The insets are 0 without `viewport-fit=cover`: every use of them depends on it.
+        assert!(css.contains("env(safe-area-inset-bottom)"));
+        assert!(css.contains("env(safe-area-inset-left)"));
+    }
+
+    /// The declarations of each rule of `css` as (property, value), comments left out. Nested
+    /// blocks (`@media`) give their inner rules; a rule is what follows the last `{` before a `}`.
+    fn css_rules(css: &str) -> Vec<Vec<(String, String)>> {
+        let mut text = String::with_capacity(css.len());
+        let mut rest = css;
+        while let Some(start) = rest.find("/*") {
+            text.push_str(&rest[..start]);
+            rest = rest[start..]
+                .find("*/")
+                .map_or("", |end| &rest[start + end + 2..]);
+        }
+        text.push_str(rest);
+        text.split('}')
+            .filter_map(|chunk| chunk.rsplit_once('{').map(|(_, body)| body))
+            .map(|body| {
+                body.split(';')
+                    .filter_map(|d| d.split_once(':'))
+                    .map(|(p, v)| (p.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Whether `value` holds a plain `vh` length (`65vh`, `100vh`; not `dvh` / `svh` / `lvh`).
+    fn plain_vh(value: &str) -> bool {
+        let b = value.as_bytes();
+        value
+            .match_indices("vh")
+            .any(|(i, _)| i > 0 && b.get(i - 1).is_some_and(u8::is_ascii_digit))
+    }
+
+    #[test]
+    fn css_rules_reads_declarations_inside_media_blocks() {
+        let rules = css_rules(
+            "a { height: 1vh; /* x: 2vh; */ }\n@media (max-width: 1px) { b { max-height: 3vh; max-height: 3dvh } }",
+        );
+        assert_eq!(
+            rules[0],
+            vec![("height".to_string(), "1vh".to_string())],
+            "comments are no declarations"
+        );
+        assert_eq!(rules[1].len(), 2);
+        assert!(plain_vh("calc(100vh - 1rem)") && !plain_vh("90dvh") && !plain_vh("80svh"));
+    }
+
+    /// Phones: `vh` is the tallest viewport (toolbars hidden), so a panel or dialog sized by it
+    /// runs under the browser's toolbars. Each such height is followed by a `dvh` / `svh` one in
+    /// the same rule (the `vh` stays first as the fallback). iOS inflates text in landscape
+    /// unless told not to.
+    #[test]
+    fn heights_follow_the_visible_screen_and_text_keeps_its_size() {
+        let css = static_file("style.css").unwrap();
+        let mut missing = Vec::new();
+        for rule in css_rules(css) {
+            for (i, (prop, value)) in rule.iter().enumerate() {
+                if !matches!(prop.as_str(), "height" | "max-height" | "min-height")
+                    || !plain_vh(value)
+                {
+                    continue;
+                }
+                let followed = rule
+                    .iter()
+                    .skip(i + 1)
+                    .any(|(p, v)| p == prop && (v.contains("dvh") || v.contains("svh")));
+                if !followed {
+                    missing.push(format!("{prop}: {value}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "vh without a dvh/svh after it: {missing:?}"
+        );
+        // The ones the phone pass is about, by name (the parser above could miss a rule).
+        for needle in [
+            "height: calc(100vh - 1rem); height: calc(100dvh - 1rem);",
+            "height: 65vh;\n  height: 65dvh;",
+            "max-height: 92vh; max-height: 92dvh;",
+            ".browse-list { max-height: 60vh; max-height: 60dvh;",
+        ] {
+            assert!(css.contains(needle), "{needle}");
+        }
+        let html_rule = css_rules(css)
+            .into_iter()
+            .find(|r| r.iter().any(|(p, _)| p == "-webkit-text-size-adjust"))
+            .expect("-webkit-text-size-adjust is set");
+        assert!(
+            html_rule
+                .iter()
+                .any(|(p, v)| p == "text-size-adjust" && v == "100%")
+        );
+        // The on-screen keyboard lets the sticky bars scroll away (live.js sets the class).
+        assert!(css.contains("html.kb-open .rv-actions-main, html.kb-open form#models > .actions, html.kb-open form#server > .actions { position: static; }"));
+        assert!(
+            static_file("live.js").is_some_and(|js| js.contains("PrismViewport")
+                && js.contains("\"kb-open\"")
+                && js.contains("\"--toc-h\""))
+        );
+    }
+
+    /// The server-side file browser is one include on every page that has it: Close at the top,
+    /// Use / Cancel at the bottom, and browse.js loaded once.
+    #[tokio::test]
+    async fn every_browse_dialog_has_a_close_button_and_one_script() {
+        let state = test_state();
+        for uri in [
+            "/config",
+            "/benchmark",
+            "/train/review",
+            "/train/dataset",
+            "/train/collect",
+        ] {
+            let (s, html) = get_text(&state, uri).await;
+            assert_eq!(s, StatusCode::OK, "{uri}");
+            assert_eq!(
+                html.matches("<dialog id=\"browse-dialog\">").count(),
+                1,
+                "{uri}"
+            );
+            assert!(
+                html.contains("id=\"browse-close\" class=\"small secondary\" aria-label=\"Close\""),
+                "{uri}"
+            );
+            assert!(html.contains("id=\"browse-cancel\""), "{uri}");
+            assert_eq!(html.matches("/static/browse.js?v=").count(), 1, "{uri}");
+        }
+        let js = static_file("browse.js").unwrap();
+        assert!(js.contains("(pointer: fine)") && js.contains("browse-close"));
+    }
 }

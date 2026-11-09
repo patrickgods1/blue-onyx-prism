@@ -1,0 +1,15 @@
+{# The in-page server-side file browser of every page (assets/browse.js). train/browse_dialog.html adds the script; Config and Benchmark load it after their own scripts. #}
+<dialog id="browse-dialog">
+  <div class="browse-head">
+    <h3 id="browse-title">Choose a folder</h3>
+    <button type="button" id="browse-close" class="small secondary" aria-label="Close" title="Close">&#x2715;</button>
+  </div>
+  <div class="browse-bar">
+    <select id="browse-roots" aria-label="Places"></select>
+    <button type="button" id="browse-up" class="small">Up</button>
+  </div>
+  <div id="browse-path" class="browse-path"></div>
+  <div id="browse-list" class="browse-list"></div>
+  <p id="browse-msg" class="muted" role="status"></p>
+  <div class="actions"><button type="button" id="browse-use" hidden>Use this folder</button><button type="button" id="browse-cancel">Cancel</button></div>
+</dialog>
