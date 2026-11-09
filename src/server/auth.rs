@@ -531,7 +531,7 @@ pub(super) async fn rotate(
         let path = admin_token::path(&state.config_read());
         let command = admin_token::read_command(&state.config_path);
         let html = wants_html(&headers);
-        match admin_token::rotate(&path) {
+        match admin_token::prepare(&state.config_read()).and_then(|p| admin_token::rotate(&p)) {
             Ok(_) => {
                 info!(path = %path.display(), "the admin token was rotated");
                 let msg = format!(

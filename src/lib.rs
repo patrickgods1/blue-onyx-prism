@@ -2,6 +2,7 @@
 //! object detection service on native OpenVINO, with ONNX Runtime as a second runtime.
 //!
 //! Module map (see CLAUDE.md):
+//! - [`accounts`]  the web UI's accounts: `auth/users.json`, password policy, Argon2id, lockout, setup code
 //! - [`admin_token`] the token remote administration needs: its file, creation and rotation
 //! - [`api`]       wire structs for the CodeProject.AI compatible JSON API
 //! - [`config`]    JSON config next to the executable, merged with CLI flags
@@ -27,6 +28,7 @@
 //! - [`diagnostics`] the support bundle (`diagnostics` command, `GET /v1/diagnostics`)
 //! - [`port_holder`] which process listens on a port (for a bind failure's message)
 //! - [`private_dir`] `<data root>/auth/`: the folder only the service and administrators may read
+//! - [`secret`]    random secrets from the OS (tokens, the setup code)
 //! - [`tls`]       the HTTPS listener's certificate: generated and kept, or the config's own files
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
@@ -61,6 +63,7 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 
+pub mod accounts;
 pub mod admin_token;
 pub mod api;
 #[allow(
@@ -93,6 +96,7 @@ pub mod resources;
 pub mod retention;
 pub mod runner;
 pub mod sdnotify;
+pub mod secret;
 pub mod server;
 pub mod service_ctl;
 pub mod setup_onnxruntime;

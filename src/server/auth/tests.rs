@@ -20,7 +20,7 @@ fn token_b() -> String {
 }
 
 fn token_path(state: &AppState) -> PathBuf {
-    state.config_read().data_root().join("admin-token")
+    crate::admin_token::prepare(&state.config_read()).unwrap()
 }
 
 /// Remote administration on, the token file holding [`token_a`].

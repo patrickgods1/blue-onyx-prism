@@ -152,6 +152,27 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Manage the web UI's accounts (all are administrators): add, remove, list, reset a
+    /// password, unlock after too many wrong passwords. Run it on the server as the service's
+    /// account, with the service's config. Passwords are asked without echo (twice), or read as
+    /// one line from stdin when it is not a terminal; never from the command line.
+    User {
+        #[command(subcommand)]
+        action: UserCommand,
+        /// The service's config file (default: <exe_dir>/blue_onyx_prism_config.json;
+        /// `--config` before the subcommand works too).
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
+    /// Print the one-time setup code that creates the first account in the web UI (made when
+    /// there is none), with the HTTPS addresses and the certificate's fingerprint. Refused once
+    /// an account exists. Run it as the service's account, with the service's config.
+    SetupCode {
+        /// The service's config file (default: <exe_dir>/blue_onyx_prism_config.json;
+        /// `--config` before the subcommand works too).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Print the SHA-256 fingerprint of the HTTPS certificate (to compare with what the browser
     /// shows before accepting it) and the HTTPS addresses of the web UI. Makes the generated
     /// certificate when there is none yet; reads `tls_cert_path` when that is set.
@@ -180,6 +201,25 @@ pub enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+}
+
+/// `blue-onyx-prism user ...`.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum UserCommand {
+    /// Add an account (asks for its password). The first account may be made this way too.
+    Add {
+        /// 1 to 32 characters of a-z, 0-9, '.', '_', '-' (upper case is lowered).
+        name: String,
+    },
+    /// Remove an account; never the last one.
+    Remove { name: String },
+    /// List the accounts: name, created, password changed, failed attempts, disabled.
+    List,
+    /// Set a new password (asks for it); ends the account's sessions and unlocks it. The way
+    /// back in when a password is forgotten.
+    ResetPassword { name: String },
+    /// Clear an account's failed attempts after it was delayed or disabled by wrong passwords.
+    Unlock { name: String },
 }
 
 /// `blue-onyx-prism service ...`.
@@ -554,6 +594,13 @@ impl Cli {
             Command::ListModels { dir } => Command::ListModels { dir: abs(&dir) },
             Command::AdminToken { rotate, config } => Command::AdminToken {
                 rotate,
+                config: abs(&config),
+            },
+            Command::User { action, config } => Command::User {
+                action,
+                config: abs(&config),
+            },
+            Command::SetupCode { config } => Command::SetupCode {
                 config: abs(&config),
             },
             Command::TlsFingerprint { config } => Command::TlsFingerprint {
@@ -1315,6 +1362,77 @@ mod tests {
         assert!(Cli::try_parse_from(["bop", "hf-login", "--config", "c.json"]).is_err());
         assert!(Cli::try_parse_from(["bop", "hf-login", "--token", "x"]).is_err());
         assert!(Cli::try_parse_from(["bop", "hf-login", "x"]).is_err());
+    }
+
+    #[test]
+    fn user_and_setup_code_commands_parse() {
+        let base = std::env::temp_dir();
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.absolutized(&base));
+        for (args, want) in [
+            (
+                &["x", "user", "add", "Alice"][..],
+                UserCommand::Add {
+                    name: "Alice".into(),
+                },
+            ),
+            (
+                &["x", "user", "remove", "bob"][..],
+                UserCommand::Remove { name: "bob".into() },
+            ),
+            (&["x", "user", "list"][..], UserCommand::List),
+            (
+                &["x", "user", "reset-password", "bob"][..],
+                UserCommand::ResetPassword { name: "bob".into() },
+            ),
+            (
+                &["x", "user", "unlock", "bob"][..],
+                UserCommand::Unlock { name: "bob".into() },
+            ),
+        ] {
+            let cli = parse(args).unwrap();
+            assert!(
+                matches!(&cli.command, Some(Command::User { action, config: None }) if *action == want),
+                "{args:?}: {:?}",
+                cli.command
+            );
+            // `--config` after the verb, after `user`, or before everything.
+            let mut with: Vec<&str> = args.to_vec();
+            with.extend(["--config", "c.json"]);
+            let cli = parse(&with).unwrap();
+            assert!(
+                matches!(&cli.command, Some(Command::User { config: Some(p), .. }) if *p == base.join("c.json")),
+                "{with:?}"
+            );
+            let mut early: Vec<&str> = vec!["x", "user", "--config", "c.json"];
+            early.extend(&args[2..]);
+            assert!(matches!(
+                parse(&early).unwrap().command,
+                Some(Command::User {
+                    config: Some(_),
+                    ..
+                })
+            ));
+            let mut first: Vec<&str> = vec!["x", "--config", "c.json"];
+            first.extend(&args[1..]);
+            let cli = Cli::try_parse_from(&first).unwrap();
+            assert_eq!(cli.config.as_deref(), Some(Path::new("c.json")));
+        }
+        // No password has a way in through argv.
+        assert!(parse(&["x", "user", "add"]).is_err());
+        assert!(parse(&["x", "user", "add", "bob", "secret-password"]).is_err());
+        assert!(parse(&["x", "user", "add", "bob", "--password", "p"]).is_err());
+        assert!(parse(&["x", "user", "list", "extra"]).is_err());
+        assert!(parse(&["x", "user"]).is_err());
+        let cli = parse(&["x", "setup-code", "--config", "c.json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::SetupCode { config: Some(ref p) }) if *p == base.join("c.json")
+        ));
+        assert!(matches!(
+            parse(&["x", "setup-code"]).unwrap().command,
+            Some(Command::SetupCode { config: None })
+        ));
+        assert!(parse(&["x", "setup-code", "extra"]).is_err());
     }
 
     #[test]

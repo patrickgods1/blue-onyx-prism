@@ -58,6 +58,27 @@ files are kept next to their libraries in the archive.
 - Copyright 2015 The Roboto Mono Project Authors (https://github.com/googlefonts/robotomono).
 - License: Apache License 2.0 (full text below).
 
+### SecLists (common-password list)
+
+- `assets/password-blocklist.txt`: the entries of 15 to 128 characters (NFC-normalized,
+  lowercased, deduplicated, sorted) of `Passwords/Common-Credentials/xato-net-10-million-passwords-1000000.txt`
+  and `Passwords/Common-Credentials/100k-most-used-passwords-NCSC.txt` from SecLists
+  (https://github.com/danielmiessler/SecLists), commit `1a7bb9127eca9e6ff2fc0301c597fe6e16a0cb56`.
+  New account passwords are checked against it (`src/accounts/blocklist.rs`).
+- Copyright (c) 2018 Daniel Miessler.
+- License: MIT. Permission is hereby granted, free of charge, to any person obtaining a copy of
+  this software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify, merge,
+  publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to
+  whom the Software is furnished to do so, subject to the following conditions: The above
+  copyright notice and this permission notice shall be included in all copies or substantial
+  portions of the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR
+  A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+  IN THE SOFTWARE.
+
 ### blue-onyx
 
 - Portions of the code are derived from blue-onyx (https://github.com/xnorpx/blue-onyx),
@@ -114,6 +135,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | anstyle-wincon | 3.0.11 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git |
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
 | arc-swap | 1.9.3 | MIT OR Apache-2.0 | https://github.com/vorner/arc-swap |
+| argon2 | 0.6.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/password-hashes |
 | askama | 0.16.1 | MIT OR Apache-2.0 | https://github.com/askama-rs/askama |
 | askama_derive | 0.16.1 | MIT OR Apache-2.0 | https://github.com/askama-rs/askama |
 | askama_macros | 0.16.1 | MIT OR Apache-2.0 | https://github.com/askama-rs/askama |
@@ -131,9 +153,11 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | axum-core | 0.5.6 | MIT | https://github.com/tokio-rs/axum |
 | base64 | 0.22.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
 | base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 |
+| base64ct | 1.8.3 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
 | bit-vec | 0.9.1 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-vec |
 | bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags |
+| blake2 | 0.11.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes |
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | block2 | 0.6.2 | MIT | https://github.com/madsmtm/objc2 |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | https://github.com/fitzgen/bumpalo |
@@ -155,6 +179,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | clap_derive | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.1 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | cmake | 0.1.58 | MIT OR Apache-2.0 | https://github.com/rust-lang/cmake-rs |
+| cmov | 0.5.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | colorchoice | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git |
 | combine | 4.6.8 | MIT | https://github.com/Marwes/combine |
 | console | 0.16.6 | MIT | https://github.com/console-rs/console |
@@ -169,6 +194,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | crossbeam-channel | 0.5.17 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam |
 | crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
+| ctutils | 0.4.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | data-encoding | 2.11.1 | MIT | https://github.com/ia0/data-encoding |
 | dbus | 0.9.12 | Apache-2.0/MIT | https://github.com/diwic/dbus-rs |
 | defmt | 1.1.1 | MIT OR Apache-2.0 | https://github.com/knurling-rs/defmt |
@@ -347,8 +373,10 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | pango-sys | 0.18.0 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot |
+| password-hash | 0.6.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | pem | 4.0.0 | MIT | https://github.com/jcreekmore/pem-rs.git |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-url/ |
+| phc | 0.6.1 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
 | phf | 0.12.1 | MIT | https://github.com/rust-phf/rust-phf |
 | phf_shared | 0.12.1 | MIT | https://github.com/rust-phf/rust-phf |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project-lite |

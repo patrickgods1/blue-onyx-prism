@@ -1,6 +1,8 @@
 //! `<data root>/auth/`: the folder of the service's secrets, readable by the service's account and
-//! administrators only. Today it holds the HTTPS certificate and its key (`auth/tls/`, see
-//! [`crate::tls`]).
+//! administrators only: the HTTPS certificate and its key (`auth/tls/`, see [`crate::tls`]), the
+//! web UI's accounts and the setup code ([`crate::accounts`]) and the admin token
+//! ([`crate::admin_token`]). Every read-modify-write in it holds `auth/.lock`
+//! ([`crate::accounts::lock`]).
 //!
 //! - **Unix:** the folder and its subfolders are 0700, files 0600 from their first byte
 //!   ([`crate::resources::hf_token::write_private`]). Run as root (a `sudo` CLI command), what is
@@ -100,9 +102,10 @@ fn acl_warning(dir: &Path, why: &str) -> String {
     format!(
         "could not restrict {} to the service's account and Administrators ({why}); the folder \
          keeps the data folder's permissions, so other accounts on this computer may be able to \
-         read the HTTPS key in it. Run the service (or this command) once as an administrator, \
-         or reinstall with the MSI, which protects the folder; on a drive without NTFS \
-         permissions keep the data folder on an NTFS drive instead",
+         read the secrets in it (the HTTPS key, the accounts' password hashes, the admin \
+         token). Run the service (or this command) once as an administrator, or reinstall \
+         with the MSI, which protects the folder; on a drive without NTFS permissions keep the \
+         data folder on an NTFS drive instead",
         dir.display()
     )
 }

@@ -1023,7 +1023,11 @@ mod tests {
             c.allow_remote_admin = true;
             edit(c);
         });
-        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        std::fs::write(
+            crate::admin_token::prepare(&state.config_read()).unwrap(),
+            TOKEN,
+        )
+        .unwrap();
         state
     }
 
@@ -1601,7 +1605,11 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        std::fs::write(
+            crate::admin_token::prepare(&state.config_read()).unwrap(),
+            TOKEN,
+        )
+        .unwrap();
         let req = signed_in(from(REMOTE, "GET", "/v1/config", false));
         let (_, _, b) = call(&state, req).await;
         let j: serde_json::Value = serde_json::from_slice(&b).unwrap();
@@ -1798,7 +1806,11 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        std::fs::write(crate::admin_token::path(&state.config_read()), TOKEN).unwrap();
+        std::fs::write(
+            crate::admin_token::prepare(&state.config_read()).unwrap(),
+            TOKEN,
+        )
+        .unwrap();
         let req = signed_in(from(REMOTE, "GET", "/config", true));
         let (s, _, _) = call(&state, req).await;
         assert_eq!(s, StatusCode::OK);
