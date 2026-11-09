@@ -18,6 +18,15 @@
 //!
 //! User-managed runtimes (`openvino_dir`, `onnxruntime_dir`) have no manifest of ours: they are
 //! never swapped and get no lock file beside them.
+//!
+//! Spawned children: on Unix the lock belongs to the open file, and a child that another thread
+//! is spawning holds a copy of every descriptor from its fork until its exec (close-on-exec acts
+//! only then), so closing the lock file alone can leave the lock held for that moment. An
+//! [`ExclusiveUse`] therefore unlocks when dropped, so neither this process's own shared lock
+//! right after it nor another process's waits on it. The shared locks are held for the life of
+//! the process; a process that exits while one of its threads is spawning can keep its lock for
+//! that moment, and a load that starts within it applies a staged update at the next start
+//! instead, so [`before_load`] does not retry the exclusive lock.
 
 use super::worker::{put_in_place, remove_any, swap_owned};
 use super::*;
@@ -88,7 +97,7 @@ fn open_lock(target: &Path) -> std::io::Result<File> {
 /// Exclusive use of a runtime directory: no process (this one included) has it loaded, and none
 /// can load it until this is dropped.
 pub(super) struct ExclusiveUse {
-    _file: File,
+    file: File,
 }
 
 impl ExclusiveUse {
@@ -96,10 +105,19 @@ impl ExclusiveUse {
     pub(super) fn try_take(target: &Path) -> std::io::Result<Option<Self>> {
         let file = open_lock(target)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(e)) => Err(e),
         }
+    }
+}
+
+impl Drop for ExclusiveUse {
+    /// Unlocked, not only closed: a child that another thread is spawning holds a copy of the
+    /// descriptor until it execs, and on Unix the lock lasts until every copy is closed (see the
+    /// module docs).
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -334,7 +352,10 @@ mod tests {
         assert_eq!(content(&probe), b"p1");
         drop(holder);
 
-        // The other process stopped: the next load applies the update first.
+        // The other process stopped: the next load applies the update first. Unlocked before the
+        // close: other tests spawn processes, and a child forked by another thread holds a copy
+        // of `other` until it execs, which a close alone leaves locked (the module docs).
+        other.unlock().unwrap();
         drop(other);
         before_load(&target);
         assert_eq!(content(&target), b"v2");

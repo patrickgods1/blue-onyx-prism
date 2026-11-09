@@ -1511,6 +1511,11 @@ mod cases {
         from_index(&dir, &f, None);
         let frame = readable(&dir, &rels);
         let day = frame.labels.parent().unwrap().to_path_buf();
+        let index = index_of(&dir).unwrap();
+        // The thread cannot start a pass while this is held. A stale day wakes it, and a pass
+        // reads what is pending (the queue file is new, so racy) and takes the stale days: the
+        // log below would be what is left, not what the writes made of it.
+        let walking = index.walk.lock_recover();
         // As a bulk action would: more label files than the set takes, one of them real.
         for i in 0..DIRTY_MAX + 50 {
             super::super::written(&day.join(format!("20261021T{i:06}999Z_x{LABELS_SUFFIX}")));
@@ -1532,6 +1537,7 @@ mod cases {
                 frame.rel.scene, frame.rel.camera, frame.rel.date
             ))));
         }
+        drop(walking);
         assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
         let skipped = Filters {
             status: StatusFilter::Is(Status::Skipped),
