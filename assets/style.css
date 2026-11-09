@@ -914,6 +914,17 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .review-meta-row .review-meta { flex: 1 1 auto; min-width: 0; }
 .review-meta-row button.small { margin: 0; flex: none; }
 .review-zoom { font-size: 0.85rem; flex: none; }
+/* Touch UI (review.js shows them under max-width: 900px or a coarse pointer): Draw, Redraw, View. */
+.review-meta-row button[aria-pressed=true] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.rv-view-menu { position: relative; flex: none; }
+.rv-view-menu[hidden] { display: none; }
+.rv-view-menu > summary { display: flex; align-items: center; list-style: none; cursor: pointer; box-sizing: border-box; padding: 0.1rem 0.75rem; font-size: 0.85rem; color: var(--accent); background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
+.rv-view-menu > summary::-webkit-details-marker { display: none; }
+.rv-view-menu > summary::after { content: "\25BE"; margin-left: 0.35rem; font-size: 0.75rem; }
+.rv-view-menu[open] > summary { border-color: var(--accent); }
+.rv-view-items { position: absolute; right: 0; top: calc(100% + 0.25rem); z-index: 30; display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; width: max-content; max-width: calc(100vw - 2rem); padding: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); }
+.rv-view-items button.small { margin: 0; }
+.rv-view-items button[aria-pressed=true] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .review-crop { margin: 0 0 0.2rem; }
 .review-crop[hidden] { display: none; }
 /* The close-up: centred on black at the panel's width (its height set by review.js). */
@@ -1586,7 +1597,8 @@ td.tr-bal-bars { vertical-align: middle; }
   /* The bottom bar: sticks to the bottom of the screen while the panel is in view. */
   .rv-actions-main { order: 20; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem -0.6rem 0; padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
   .rv-actions-main button { margin: 0; padding-left: 0.3rem; padding-right: 0.3rem; font-size: 0.88rem; line-height: 1.2; }
-  #rv-accept-likely:not([hidden]) + #rv-accept-all { display: none; }
+  /* Accept proposals sits here when Accept likely takes its place in the bar (review.js placeAcceptAll). */
+  .rv-actions-more #rv-accept-all { flex: 1 1 100%; }
   .rv-box-tools .rv-tool-likely { display: none; }
   .rv-box-tools.rv-only-likely { display: none; }
   .rv-q-btns button.small { min-height: 44px; flex: 1 1 auto; margin: 0; }
@@ -1605,7 +1617,7 @@ td.tr-bal-bars { vertical-align: middle; }
   /* One line over the frame; Details opens the rest. */
   .rv-phone-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin: 0 0 0.25rem; font-size: 0.9rem; }
   .rv-phone-line { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
-  .rv-phone-head button.small { flex: none; margin: 0; min-height: 36px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
+  .rv-phone-head button.small { flex: none; margin: 0; min-height: 44px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
   main:has(#review:not(.rv-info-open)) .train-strip { display: none; }
   #review:not(.rv-info-open):not(:has(#rv-none:not([hidden]))) > .rv-bar,
   #review:not(.rv-info-open):not(:has(#rv-none:not([hidden]))) > #rv-filters-card,
@@ -1613,11 +1625,12 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-bar { margin-bottom: 0.3rem; }
   /* The frame edge to edge, its view buttons under it. */
   .review-stage { display: flex; flex-direction: column; margin: 0 -1rem; }
-  .review-stage canvas { border-radius: 0; }
+  /* A tall frame leaves room to scroll past it (the frame itself takes every touch). */
+  .review-stage canvas { border-radius: 0; width: min(100%, calc(60svh * var(--rv-ar, 1.78))); margin-inline: auto; }
   .review-stage #rv-none { padding: 1rem; }
   .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; padding: 0.15rem 1rem 0; }
   .review-meta-row .review-meta { flex: 1 1 100%; margin: 0; }
-  .review-meta-row button.small { min-height: 36px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
+  .review-meta-row button.small, .rv-view-menu > summary { min-height: 44px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
   .review-grid { gap: 0.25rem; }
   .review-side.card { border: 0; background: none; padding: 0; border-radius: 0; }
   .rv-actions-main { margin-left: -1rem; margin-right: -1rem; padding-left: 0.6rem; padding-right: 0.6rem; }

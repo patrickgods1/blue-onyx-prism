@@ -187,6 +187,9 @@
   var undo = [];        // snapshots of cur.labels
   var dirty = false;
   var gesture = null;   // the pointer gesture in progress (see the canvas input section)
+  var fingers = {};     // pointerId -> canvas point of each finger down on the frame (touch only)
+  var drawMode = false; // the Draw toggle (touch UI): a finger's drag draws, taps set corners
+  var taps = null;      // two-tap box in progress {kind: 'draw' | 'redraw', first: frame point, idx}
   var busy = false;
   var view = { z: 1, ox: 0, oy: 0, follow: false };   // zoom, the frame point at the canvas's top
                                                       // left; `follow`: `x` zooms to each box
@@ -244,7 +247,9 @@
     ['a accepts, r rejects, Shift+R rejects the rest', 'answer each, or Reject the rest'],
     ['a keeps, r rejects, or save again', 'answer each, or save again'], [' (a keep / accept, r reject)', ''],
     ['j selects one', 'tap one'], ['click one, then a accepts it, r rejects it; i puts them away', 'tap one, then answer it'],
-    ['n returns, s saves it and returns', 'Next returns, Save & next saves it and returns']
+    ['n returns, s saves it and returns', 'Next returns, Save & next saves it and returns'],
+    ['Shift+U clears every stack', 'Reject stacked dups (under the question) clears every stack'],
+    ['Shift+A accepts every proposal', 'Accept proposals accepts every proposal']
   ];
 
   function say(text, isError) {
@@ -673,8 +678,11 @@
     if (zoomText) zoomText.textContent = zoomed ? Math.round(view.z * 100) + '%' : '';
     if (imgBtn) {
       imgBtn.textContent = imgLabel();
-      imgBtn.title = 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets';
+      imgBtn.title = touchUi.matches
+        ? 'View only: cycles auto / off / bright / bright + equalised; View has Brighter, Darker and Reset image'
+        : 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets';
     }
+    touchViewUi();
   }
 
   // ---- drawing ------------------------------------------------------------------------------
@@ -687,6 +695,8 @@
   var touchUi = media('(max-width: 900px), (pointer: coarse)');
   // No hover: the keys and "the pointer over a box" mean nothing, the answers name the buttons.
   var noHover = media('(hover: none)');
+  // A finger is the main pointer (phones, tablets).
+  var coarse = media('(pointer: coarse)');
 
   // The box's shorter side as drawn, CSS pixels.
   function boxSideCss(bb) {
@@ -731,7 +741,7 @@
     var src = viewSource();
     if (src) ctx.drawImage(src, 0, 0, W, H);
     drawCrop();
-    if (!cur || hideBoxes) return;
+    if (!cur || hideBoxes) { drawTapMarker(); return; }
     var lw = lineWidth() / z;
     var font = Math.max(12, Math.round(W / 70)) / z;
     var pad = 4 / z;
@@ -853,10 +863,41 @@
       ctx.strokeRect(r[0], r[1], r[2] - r[0], r[3] - r[1]);
       ctx.restore();
     }
+    drawTapMarker();
   }
 
   function norm(d) {
     return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1), Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
+  }
+
+  // The window height the close-up is sized by. A finger screen keeps the one it had until the
+  // width or the orientation changes: iOS fires height-only resizes as its toolbars collapse and
+  // grow while the page scrolls, and a close-up that followed them would make the page jump.
+  var cropWin = null;   // {w, h, landscape}
+  function cropWindowHeight() {
+    var w = window.innerWidth, h = window.innerHeight, land = w > h;
+    if (!coarse.matches || !cropWin || cropWin.w !== w || cropWin.landscape !== land) cropWin = { w: w, h: h, landscape: land };
+    return cropWin.h;
+  }
+
+  // The first corner of a two-tap box (Draw, Redraw): a cross in a ring, the same size on screen
+  // at any zoom.
+  function drawTapMarker() {
+    if (!taps || !taps.first) return;
+    var z = view.z, k = cssScale() / z, p = taps.first, r = 9 * k;
+    ctx.save();
+    ctx.setTransform(z, 0, 0, z, -view.ox * z, -view.oy * z);
+    ctx.lineWidth = 3 * k;
+    ctx.strokeStyle = '#000000';
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], r, 0, 2 * Math.PI);
+    ctx.moveTo(p[0] - 2 * r, p[1]); ctx.lineTo(p[0] + 2 * r, p[1]);
+    ctx.moveTo(p[0], p[1] - 2 * r); ctx.lineTo(p[0], p[1] + 2 * r);
+    ctx.stroke();
+    ctx.lineWidth = 1.5 * k;
+    ctx.strokeStyle = taps.kind === 'redraw' ? '#ffffff' : COLORS.added;
+    ctx.stroke();
+    ctx.restore();
   }
 
   // The close-up: the selected box with a 40% margin, enlarged to the panel's width (a box under
@@ -870,9 +911,10 @@
     var bw = Math.max(1, b.bbox[2] - b.bbox[0]), bh = Math.max(1, b.bbox[3] - b.bbox[1]);
     var aw = Math.max(120, cropWrap.clientWidth || 300);
     // Its height follows the window: the decision bar and the list stay in view under it.
-    var ah = Math.round(Math.max(140, Math.min(wideSide ? 340 : 240, window.innerHeight * (wideSide ? 0.36 : 0.22))));
+    var winH = cropWindowHeight();
+    var ah = Math.round(Math.max(140, Math.min(wideSide ? 340 : 240, winH * (wideSide ? 0.36 : 0.22))));
     // One column: the frame, this and the question share the screen.
-    if (oneColumn.matches) ah = Math.round(Math.max(100, Math.min(240, window.innerHeight * 0.16)));
+    if (oneColumn.matches) ah = Math.round(Math.max(100, Math.min(240, winH * 0.16)));
     var mw = bw * 1.8, mh = bh * 1.8;
     var scale = Math.min(aw / mw, ah / mh);
     if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
@@ -1128,7 +1170,7 @@
     if (unwanted) {
       boxList.appendChild(el('li', 'muted', unwanted + ' box(es) of classes you do not want (hidden or not in the class list) not shown (kept in the file; pending proposals of them are rejected on save).'));
     }
-    if (bs.length === unwanted + putAway && cur) boxList.appendChild(el('li', 'muted', 'No box. Drag on the image to draw one.'));
+    if (bs.length === unwanted + putAway && cur) boxList.appendChild(el('li', 'muted', noHover.matches ? 'No box. Turn on Draw to draw one.' : 'No box. Drag on the image to draw one.'));
     emptyBox.checked = !!(cur && cur.labels.empty_confirmed);
     renderTools();
     renderDecision();
@@ -1147,6 +1189,7 @@
     if (likelyBar) {
       likelyBar.hidden = !likely;
       likelyBar.textContent = 'Accept likely (' + likely + ')';
+      placeAcceptAll();
     }
     if (n) {
       var show = decideButton((dismissedOn ? 'Hide ' : 'Show ') + n + ' hidden', 'i', 'secondary', toggleDismissed);
@@ -1162,7 +1205,7 @@
   function missingText() {
     var n = dismissedOn ? 0 : dismissedCount();
     if (noHover.matches) {
-      return 'Anything missing? Look over the whole frame and drag to draw a missed object' +
+      return 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
         (n ? ' (' + n + ' hidden: Show them under the question)' : '') + '; Save & next saves.';
     }
     return 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
@@ -1198,10 +1241,10 @@
       var off = dismissedOn ? 0 : dismissedCount();
       var tap = noHover.matches;
       decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked
-        ? (tap ? 'No box selected: tap one, or drag on the frame to draw one.' : 'No box selected: j selects the next one, drag on the frame to draw one.')
+        ? (tap ? 'No box selected: tap one, or turn on Draw to draw one.' : 'No box selected: j selects the next one, drag on the frame to draw one.')
         : (missingAsked === cur.frame ? missingText()
           : (p.total ? (tap ? 'Every box decided: Save & next saves.' : 'Every box decided: s saves.')
-            : (tap ? 'No box: drag on the frame to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
+            : (tap ? 'No box: turn on Draw to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
               : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
     } else {
       var i = selected;
@@ -1323,12 +1366,12 @@
       var rr = el('div', 'rv-q-reason');
       // One wrapping row of short chips (the full text is the tooltip): the box list keeps its room.
       var cap = el('span', 'muted', (ri === selected ? 'Why?' : (ri + 1) + ' why?'));
-      cap.title = 'Optional: why box ' + (ri + 1) + ' is wrong (Shift+1-9)';
+      cap.title = 'Optional: why box ' + (ri + 1) + ' is wrong' + (touchUi.matches ? '' : ' (Shift+1-9)');
       rr.appendChild(cap);
       REASONS.forEach(function (r, n) {
         var cb = button('', function () { setReason(n); canvas.focus({ preventScroll: true }); },
           'secondary' + (rb.reject_reason === r[0] ? ' active' : ''));
-        cb.title = r[1] + ' (Shift+' + (n + 1) + ')';
+        cb.title = r[1] + (touchUi.matches ? '' : ' (Shift+' + (n + 1) + ')');
         cb.appendChild(kbd(String(n + 1)));
         cb.appendChild(document.createTextNode(r[2]));
         rr.appendChild(cb);
@@ -1359,7 +1402,9 @@
     if (lapping.length) {
       lapNote = el('span', 'muted', 'Overlap: ' + lapping.slice(0, 3).map(function (o) { return (o[0] + 1) + '+' + (o[1] + 1); }).join(', ') +
         (lapping.length > 3 ? ' +' + (lapping.length - 3) + ' more' : ''));
-      lapNote.title = 'These boxes of one object overlap or sit inside each other. Select one: u rejects it as a duplicate, r rejects it as wrong. Saving with both kept stops flagging the frame.';
+      lapNote.title = 'These boxes of one object overlap or sit inside each other. Select one: ' +
+        (touchUi.matches ? 'Reject as duplicate or No, reject under the question' : 'u rejects it as a duplicate, r rejects it as wrong') +
+        '. Saving with both kept stops flagging the frame.';
     }
     if (p.total || stackBtn || repeatBtn || lapNote) {
       var line = el('div', 'rv-progress');
@@ -1433,6 +1478,9 @@
 
   function select(i, page) {
     selected = (i >= 0 && i < boxes().length) ? i : -1;
+    // Touch: the reason chips stay until the selection moves on; Redraw is of the box it started on.
+    if (reasonAsk && !reasonAsk.timer && selected !== reasonAsk.sel) clearReason(true);
+    if (taps && taps.kind === 'redraw' && selected !== taps.idx) cancelTaps();
     if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
     else panTo(boxes()[selected]);
     refresh();
@@ -1480,7 +1528,7 @@
     ['duplicate', 'duplicate', 'dup']
   ];
   var REASON_MS = 4000;
-  var reasonAsk = null;   // {frame, i, timer}: the chips offered after a rejection
+  var reasonAsk = null;   // {frame, i, sel, timer}: the chips offered after a rejection
 
   function reasonIndex(r) {
     for (var n = 0; n < REASONS.length; n++) if (REASONS[n][0] === r) return n;
@@ -1494,13 +1542,18 @@
 
   function offerReason(i) {
     clearReason(true);
-    reasonAsk = { frame: cur.frame, i: i, timer: setTimeout(function () { clearReason(); }, REASON_MS) };
+    // A finger needs longer than a key: on touch the chips stay until the selection changes or the
+    // frame is saved (select, loadFrame), no timer.
+    reasonAsk = {
+      frame: cur.frame, i: i, sel: selected,
+      timer: touchUi.matches ? null : setTimeout(function () { clearReason(); }, REASON_MS)
+    };
     renderDecision();
   }
 
   function clearReason(quiet) {
     if (!reasonAsk) return;
-    clearTimeout(reasonAsk.timer);
+    if (reasonAsk.timer) clearTimeout(reasonAsk.timer);
     reasonAsk = null;
     if (!quiet) renderDecision();
   }
@@ -2085,13 +2138,147 @@
   }
 
   var lastPointer = null;
+  var T = window.ReviewTouch;
+
+  // A move / resize that already took its undo snapshot is undone exactly: the snapshot it pushed
+  // goes back into the frame (box, `orig_bbox`, state, empty flag as before the gesture) and off
+  // the undo list, and the frame is as dirty as it was. A draw is dropped; a pan keeps its view.
+  function abortGesture() {
+    var g = gesture;
+    gesture = null;
+    if (!g || !g.snapped || !undo.length) return;
+    var u = JSON.parse(undo.pop());
+    cur.labels = u.labels;
+    selected = (u.selected >= 0 && u.selected < boxes().length) ? u.selected : -1;
+    dirty = g.wasDirty;
+    renderSide();
+  }
+
+  // Two fingers down: whatever the first one was doing stops, the view follows both from here.
+  function startPinch(a, b) {
+    abortGesture();
+    gesture = {
+      mode: 'pinch', a: a, b: b,
+      start: { a: fingers[a], b: fingers[b], view: { z: view.z, ox: view.ox, oy: view.oy } }
+    };
+    view.follow = false;
+    draw();
+  }
+
+  function applyPinch() {
+    var g = gesture;
+    var v = T.pinch(g.start, { a: fingers[g.a], b: fingers[g.b] }, { min: 1, max: MAX_ZOOM });
+    view.z = v.z; view.ox = v.ox; view.oy = v.oy;
+    clampView();
+    draw();
+  }
+
+  // A pinch's finger lifted (or cancelled): the pinch ends, the fingers still down do nothing
+  // until they lift, so the view never jumps to one finger's position.
+  function fingerLifted() {
+    gesture = Object.keys(fingers).length ? { mode: 'rest' } : null;
+    draw();
+  }
+
+  // ---- Draw / Redraw by taps (touch UI; any pointer once turned on) ----
+
+  var drawBtn = $('rv-draw');
+  var redrawBtn = $('rv-redraw');
+  var viewMenu = $('rv-view-menu');
+
+  function cancelTaps(note) {
+    if (!taps) return;
+    var was = taps.kind;
+    taps = null;
+    if (note) say(was === 'redraw' ? 'Redraw cancelled.' : 'First corner cleared.');
+    draw();
+  }
+
+  function setDrawMode(on) {
+    drawMode = !!on;
+    if (taps && taps.kind === 'draw') taps = null;
+    say(drawMode ? 'Draw: drag, or tap two corners.' : 'Draw off: a finger selects, and pans a zoomed frame.');
+    draw();
+  }
+
+  // Redraw: the next two taps are the selected box's corners.
+  function startRedraw() {
+    var b = boxes()[selected];
+    if (!b) { say('No box selected: j selects one.'); return; }
+    if (taps && taps.kind === 'redraw') { cancelTaps(true); return; }
+    taps = { kind: 'redraw', idx: selected, first: null };
+    say('Redraw box ' + (selected + 1) + ': tap one corner of the object, then the opposite one.');
+    draw();
+  }
+
+  // A tap while Draw or Redraw waits for corners.
+  function tapCorner(p) {
+    if (!taps) taps = { kind: 'draw', first: null };
+    if (!taps.first) {
+      taps.first = p;
+      say('First corner set: tap the opposite corner' + (taps.kind === 'redraw' ? ' of box ' + (taps.idx + 1) : '') + '.');
+      draw();
+      return;
+    }
+    var r = T.twoTapRect(taps.first, p, MIN_BOX);
+    if (!r) {
+      taps.first = p;
+      say('Too close to the first corner: this tap is the first corner now; tap the opposite one.');
+      draw();
+      return;
+    }
+    var t = taps;
+    taps = null;
+    if (t.kind === 'redraw') {
+      var b = boxes()[t.idx];
+      if (!b) { draw(); return; }
+      // As a drag resize: one undo step, a model / auto box keeps its original and is accepted.
+      snapshot();
+      markEdited(b);
+      b.bbox = r.map(round1);
+      lastNudge = null;
+      selected = t.idx;
+      refresh();
+      say('Box ' + (t.idx + 1) + ' redrawn (z undoes).');
+      return;
+    }
+    addDrawn(r);
+    refresh();
+    say('Box ' + (selected + 1) + ' drawn (z undoes). Tap two more corners for another.');
+  }
+
+  // A drawn box (a drag or two taps), selected.
+  function addDrawn(r) {
+    snapshot();
+    boxes().push({
+      label: classSel.value || classes[0] || 'object',
+      bbox: r.map(round1),
+      source: 'human', state: 'added', _checked: true
+    });
+    cur.labels.empty_confirmed = false;
+    selected = boxes().length - 1;
+  }
 
   canvas.addEventListener('pointerdown', function (ev) {
     if (!cur) return;
-    canvas.focus();
+    canvas.focus({ preventScroll: true });
+    var finger = ev.pointerType === 'touch';
+    if (finger) {
+      // No gesture: no finger is down (a lift the page missed is forgotten here).
+      if (!gesture) fingers = {};
+      fingers[ev.pointerId] = canvasPoint(ev);
+      // A third finger is ignored; a second one starts a pinch (also after a pinch, from `rest`).
+      if (gesture && gesture.mode === 'pinch') return;
+      var ids = Object.keys(fingers);
+      if (ids.length >= 2) {
+        canvas.setPointerCapture(ev.pointerId);
+        startPinch(Number(ids[0]), Number(ids[1]));
+        return;
+      }
+    }
     if (ev.button === 1 || ev.button === 2 || (ev.button === 0 && spaceDown)) {
       ev.preventDefault();
-      gesture = { mode: 'pan', cx: ev.clientX, cy: ev.clientY, ox: view.ox, oy: view.oy, moved: false };
+      gesture = { mode: 'pan', id: ev.pointerId, cx: ev.clientX, cy: ev.clientY, ox: view.ox, oy: view.oy, moved: false };
       view.follow = false;
       canvas.setPointerCapture(ev.pointerId);
       setCursor('grabbing');
@@ -2099,34 +2286,56 @@
     }
     if (ev.button !== 0) return;
     var p = framePoint(ev);
-    var g = { mode: 'draw', cx: ev.clientX, cy: ev.clientY, x0: p[0], y0: p[1], x1: p[0], y1: p[1], moved: false };
-    g.finger = ev.pointerType === 'touch';
+    var g = { mode: 'draw', id: ev.pointerId, cx: ev.clientX, cy: ev.clientY, x0: p[0], y0: p[1], x1: p[0], y1: p[1], moved: false };
+    g.finger = finger;
+    var onHandle = null, inside = false;
     if (!hideBoxes && selected >= 0) {
-      var h = handleAt(p);
-      if (h) { g.mode = 'resize'; g.handle = h; }
-      else if (insideSelected(p)) g.mode = 'move';
-      if (g.mode !== 'draw') { g.idx = selected; g.orig = boxes()[selected].bbox.slice(); }
+      onHandle = handleAt(p);
+      inside = !onHandle && insideSelected(p);
     }
+    if (taps && taps.kind === 'redraw') {
+      // Redraw waits for two taps; a drag in between pans a zoomed frame.
+      g.tap = true;
+      g.mode = view.z > 1 ? 'pan' : 'none';
+    } else {
+      // A mouse or a pen draws on empty frame as always; a finger only with Draw on
+      // (ReviewTouch.touchIntent holds the rules).
+      g.mode = T.touchIntent({ drawMode: drawMode || !finger, zoomed: view.z > 1, onHandle: !!onHandle, insideSelected: inside });
+      g.tap = drawMode;
+    }
+    if (g.mode === 'resize') g.handle = onHandle;
+    if (g.mode === 'move' || g.mode === 'resize') { g.idx = selected; g.orig = boxes()[selected].bbox.slice(); }
+    if (g.mode === 'pan') { g.ox = view.ox; g.oy = view.oy; }
     gesture = g;
     canvas.setPointerCapture(ev.pointerId);
   });
 
   canvas.addEventListener('pointermove', function (ev) {
     lastPointer = ev;
+    if (ev.pointerType === 'touch' && fingers[ev.pointerId]) fingers[ev.pointerId] = canvasPoint(ev);
     var g = gesture;
     if (!g) { hoverCursor(ev); return; }
+    if (g.mode === 'pinch') {
+      if (ev.pointerId === g.a || ev.pointerId === g.b) applyPinch();
+      return;
+    }
+    if (g.mode === 'rest' || ev.pointerId !== g.id) return;
     if (!g.moved) {
       var still = g.finger ? TAP_CSS : CLICK_CSS;
       if (Math.abs(ev.clientX - g.cx) > still || Math.abs(ev.clientY - g.cy) > still) {
         g.moved = true;
         if ((g.mode === 'move' || g.mode === 'resize') && boxes()[g.idx]) {
+          g.wasDirty = dirty;
+          g.snapped = true;
           snapshot();
           markEdited(boxes()[g.idx]);
         }
       }
       if (!g.moved) return;
     }
+    if (g.mode === 'none') return;
     if (g.mode === 'pan') {
+      view.follow = false;
       var k = cssScale() / view.z;
       view.ox = g.ox - (ev.clientX - g.cx) * k;
       view.oy = g.oy - (ev.clientY - g.cy) * k;
@@ -2142,22 +2351,27 @@
   });
 
   canvas.addEventListener('pointerup', function (ev) {
+    if (ev.pointerType === 'touch') delete fingers[ev.pointerId];
     var g = gesture;
     if (!g) return;
+    if (g.mode === 'pinch' || g.mode === 'rest') {
+      if (g.mode === 'rest' || ev.pointerId === g.a || ev.pointerId === g.b || !Object.keys(fingers).length) fingerLifted();
+      return;
+    }
+    if (ev.pointerId !== g.id) return;
     gesture = null;
-    if (g.mode === 'pan') { hoverCursor(ev); draw(); return; }
+    // Draw / Redraw: a tap is a corner.
+    if (g.tap && !g.moved) { tapCorner([g.x0, g.y0]); return; }
+    // A finger's tap where it would pan still selects (below).
+    if (g.mode === 'pan' && (g.moved || !g.finger)) { hoverCursor(ev); draw(); return; }
+    if (g.mode === 'none' && g.moved) { draw(); return; }
     if (g.moved) {
       if (g.mode === 'draw') {
         var r = norm(g);
         if (r[2] - r[0] >= MIN_BOX && r[3] - r[1] >= MIN_BOX) {
-          snapshot();
-          boxes().push({
-            label: classSel.value || classes[0] || 'object',
-            bbox: r.map(round1),
-            source: 'human', state: 'added', _checked: true
-          });
-          cur.labels.empty_confirmed = false;
-          selected = boxes().length - 1;
+          addDrawn(r);
+          // A drag-drawn box replaces a first corner tapped before it.
+          if (taps && taps.kind === 'draw') taps = null;
         }
       } else {
         var b = boxes()[g.idx];
@@ -2176,12 +2390,22 @@
     hoverCursor(ev);
   });
 
-  canvas.addEventListener('pointercancel', function () {
+  canvas.addEventListener('pointercancel', function (ev) {
+    if (ev.pointerType === 'touch') delete fingers[ev.pointerId];
     var g = gesture;
+    if (g && (g.mode === 'pinch' || g.mode === 'rest')) { fingerLifted(); return; }
+    if (g && ev.pointerId !== g.id) return;
     gesture = null;
     // A cancelled move / resize keeps what it did (it is one undo step).
-    if (g && g.moved && g.mode !== 'draw' && g.mode !== 'pan') refresh(); else draw();
+    if (g && g.moved && g.mode !== 'draw' && g.mode !== 'pan' && g.mode !== 'none') refresh(); else draw();
   });
+  // A finger starting at the screen's left or right edge would swipe the browser back or forward
+  // (the frame's `touch-action: none` does not stop that in Safari): those touches stay the page's.
+  // Pointer events have already fired by then, so the gesture above still runs.
+  canvas.addEventListener('touchstart', function (ev) {
+    var t = ev.touches && ev.touches[ev.touches.length - 1];
+    if (t && (t.clientX < 24 || t.clientX > window.innerWidth - 24)) ev.preventDefault();
+  }, { passive: false });
   canvas.addEventListener('pointerenter', function () { overCanvas = true; });
   canvas.addEventListener('pointerleave', function () { overCanvas = false; if (!gesture) setHover(-1); });
   canvas.addEventListener('contextmenu', function (ev) { ev.preventDefault(); });
@@ -2198,8 +2422,106 @@
     var c = canvasPoint(ev);
     zoomAt(c[0], c[1], factor);
   }, { passive: false });
-  if (fitBtn) fitBtn.addEventListener('click', function () { fit(); canvas.focus(); });
-  if (zoomBoxBtn) zoomBoxBtn.addEventListener('click', function () { zoomToSelected(); canvas.focus(); });
+  if (fitBtn) fitBtn.addEventListener('click', function () { fit(); canvas.focus({ preventScroll: true }); });
+  if (zoomBoxBtn) zoomBoxBtn.addEventListener('click', function () { zoomToSelected(); canvas.focus({ preventScroll: true }); });
+  if (drawBtn) drawBtn.addEventListener('click', function () { setDrawMode(!drawMode); });
+  if (redrawBtn) redrawBtn.addEventListener('click', startRedraw);
+
+  // ---- the View menu (touch UI): what the wheel and the view keys do ----
+
+  // `l`, `v`, hold-`h`: one function each for the key and the menu.
+  function toggleTags() { showTags = !showTags; draw(); }
+  function toggleSpotlight() {
+    spotlight = !spotlight;
+    setPref('spotlight', spotlight);
+    say(spotlight ? 'Spotlight on: the selected box stands out.' : 'Spotlight off: every box at full strength.');
+    draw();
+  }
+  function zoomCentre(factor) {
+    if (!cur) return;
+    view.follow = false;
+    zoomAt(canvas.width / 2, canvas.height / 2, factor);
+  }
+  var VIEW_ACTIONS = {
+    'zoom-in': function () { zoomCentre(1.5); },
+    'zoom-out': function () { zoomCentre(1 / 1.5); },
+    hide: function () { hideBoxes = !hideBoxes; draw(); },
+    labels: toggleTags,
+    spotlight: toggleSpotlight,
+    brighter: function () { stepGamma(1); },
+    darker: function () { stepGamma(-1); },
+    reset: function () { setImgView('auto', 1); }
+  };
+  if (viewMenu) {
+    viewMenu.addEventListener('click', function (ev) {
+      var btn = ev.target.closest && ev.target.closest('button[data-view]');
+      var act = btn && VIEW_ACTIONS[btn.getAttribute('data-view')];
+      if (act) act();
+    });
+    // Open, it closes on a tap anywhere else, and on Esc.
+    document.addEventListener('pointerdown', function (ev) {
+      if (viewMenu.open && !viewMenu.contains(ev.target)) viewMenu.open = false;
+    });
+    viewMenu.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && viewMenu.open) { viewMenu.open = false; viewMenu.querySelector('summary').focus(); ev.stopPropagation(); }
+    });
+  }
+
+  // The touch controls show on the touch UI only, with their state; the wording that names keys,
+  // the wheel or a hover follows it too.
+  var canvasLabel = canvas.getAttribute('aria-label') || '';
+  var legendHover = $('rv-legend-hover');
+  var legendText = legendHover ? legendHover.textContent : '';
+  function touchViewUi() {
+    var on = touchUi.matches;
+    if (drawBtn) {
+      drawBtn.hidden = !on;
+      drawBtn.setAttribute('aria-pressed', drawMode ? 'true' : 'false');
+    }
+    if (redrawBtn) {
+      redrawBtn.hidden = !on || !boxes()[selected];
+      redrawBtn.setAttribute('aria-pressed', taps && taps.kind === 'redraw' ? 'true' : 'false');
+    }
+    if (viewMenu) {
+      viewMenu.hidden = !on;
+      var pressed = { hide: hideBoxes, labels: showTags, spotlight: spotlight };
+      Array.prototype.forEach.call(viewMenu.querySelectorAll('button[data-view]'), function (b) {
+        var k = b.getAttribute('data-view');
+        if (k in pressed) b.setAttribute('aria-pressed', pressed[k] ? 'true' : 'false');
+      });
+    }
+  }
+  function touchWords() {
+    var on = touchUi.matches;
+    canvas.setAttribute('aria-label', on
+      ? 'The frame with its boxes. Tap a box to select it, drag its handles to resize it, drag inside it to move it; pinch to zoom, drag a zoomed frame to pan; turn on Draw to draw a new box (drag, or tap two corners).'
+      : canvasLabel);
+    if (legendHover) legendHover.textContent = on ? 'a selected box shows its full tag' : legendText;
+  }
+  function touchUiChanged() {
+    // Off the touch UI the toggles have no button: they go off.
+    if (!touchUi.matches) { drawMode = false; taps = null; if (viewMenu) viewMenu.open = false; }
+    touchWords();
+    placeAcceptAll();
+    if (cur) refresh(); else touchViewUi();
+  }
+  [touchUi, oneColumn].forEach(function (m) {
+    if (m.addEventListener) m.addEventListener('change', touchUiChanged);
+    else if (m.addListener) m.addListener(touchUiChanged);
+  });
+  touchWords();
+  touchViewUi();
+
+  // "Accept proposals" (Shift+A): on one column the bar shows "Accept likely" in its place when
+  // the frame has likely boxes, and it moves to the row of Skip / Back / Next.
+  var acceptAllBtn = $('rv-accept-all');
+  var moreRow = document.querySelector('.rv-actions-more');
+  function placeAcceptAll() {
+    if (!acceptAllBtn || !likelyBar || !moreRow) return;
+    var away = oneColumn.matches && !likelyBar.hidden;
+    if (away && acceptAllBtn.parentNode !== moreRow) moreRow.insertBefore(acceptAllBtn, moreRow.firstChild);
+    else if (!away && acceptAllBtn.parentNode === moreRow) likelyBar.parentNode.insertBefore(acceptAllBtn, likelyBar.nextSibling);
+  }
 
   // "Larger close-up": a wider side panel (per viewer).
   var wideBtn = $('rv-crop-wide');
@@ -2452,7 +2774,7 @@
       loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
-      undo = []; dirty = false; guard = null; lastNudge = null; gesture = null;
+      undo = []; dirty = false; guard = null; lastNudge = null; gesture = null; taps = null;
       emptyBackup = null; missingAsked = null; frameStart = Date.now();
       // Asking for these frames means asking to see those boxes.
       dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
@@ -2971,13 +3293,9 @@
       handled = overCanvas || document.activeElement === canvas;
     } else if (k === 'h') {
       if (!ev.repeat && !hideBoxes) { hideBoxes = true; draw(); }
-    } else if (k === 'l') { showTags = !showTags; draw(); }
-    else if (k === 'v') {
-      spotlight = !spotlight;
-      setPref('spotlight', spotlight);
-      say(spotlight ? 'Spotlight on: the selected box stands out.' : 'Spotlight off: every box at full strength.');
-      draw();
-    } else if (k === 'x') zoomToSelected();
+    } else if (k === 'l') toggleTags();
+    else if (k === 'v') toggleSpotlight();
+    else if (k === 'x') zoomToSelected();
     else if (k === 'f') fit();
     else if (k === 'b') cycleImg();
     else if (k === '[' || k === ']') stepGamma(k === ']' ? 1 : -1);
@@ -3013,7 +3331,10 @@
         if (boxes()[selected].source === 'human') removeBox(selected);
         else rejectWith(selected, null);
       }
-    } else if (k === 'Escape') select(-1);
+    } else if (k === 'Escape') {
+      // A two-tap box waiting for its corners is cancelled first (Draw itself stays on).
+      if (taps) cancelTaps(true); else select(-1);
+    }
     else if (/^[0-9]$/.test(k)) pickClass(k === '0' ? 9 : Number(k) - 1);
     else handled = false;
     if (handled) ev.preventDefault();
