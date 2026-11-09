@@ -112,6 +112,9 @@ pub struct AppState {
     pub(crate) benchmark: Arc<crate::benchmark::service::BenchmarkService>,
     /// Wrong admin tokens per peer (one list for the process, like the config).
     pub(crate) admin_failures: Arc<std::sync::Mutex<FailureLimit>>,
+    /// Accounts, sessions and device cookies (one for the process, like `admin_failures`, so a
+    /// restart signs nobody out). Not read by any route yet.
+    pub(crate) auth: Arc<crate::accounts::Auth>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -121,6 +124,7 @@ impl std::fmt::Debug for AppState {
             .field("config_path", &self.config_path)
             .field("started", &self.started)
             .field("restart", &self.restart)
+            .field("sessions", &self.auth.sessions.len())
             .finish_non_exhaustive()
     }
 }
@@ -135,6 +139,7 @@ impl AppState {
     ) -> Self {
         let mut running = config.clone();
         running.normalize();
+        let auth = crate::accounts::Auth::load(&running.data_root(), crate::accounts::now());
         Self {
             registry,
             metrics,
@@ -152,6 +157,7 @@ impl AppState {
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
             admin_failures: Arc::default(),
+            auth: Arc::new(auth),
         }
     }
 
@@ -830,6 +836,45 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
+
+    /// Sessions belong to the process: the next generation's `AppState` gets the same
+    /// [`crate::accounts::Auth`] (as `runner`'s `state_for` hands it over), so a session made
+    /// before a restart still checks after the swap. `AppState::new` makes its own.
+    #[test]
+    fn sessions_survive_a_generation_swap() {
+        use crate::accounts::sessions::Activity;
+        let now = crate::accounts::now();
+        let users = crate::accounts::Users {
+            format: crate::accounts::FORMAT,
+            users: vec![crate::accounts::User {
+                name: "alice".into(),
+                hash: "$argon2id$x".into(),
+                created: now,
+                password_changed: now,
+                generation: 1,
+                failures: 0,
+                last_failure: None,
+                disabled: false,
+            }],
+        };
+        let first = test_state();
+        let shared = Shared::new(first.clone());
+        let id = shared.current().auth.sessions.create("alice", 1, now);
+        let mut next = Arc::try_unwrap(test_state()).unwrap();
+        assert!(next.auth.sessions.is_empty(), "a fresh state has its own");
+        next.auth = first.auth.clone();
+        drop(first);
+        let old = shared.swap(Arc::new(next));
+        drop(old);
+        let current = shared.current();
+        let valid = current
+            .auth
+            .sessions
+            .check(id.reveal().as_bytes(), &users, now, Activity::User)
+            .unwrap();
+        assert_eq!(valid.user, "alice");
+        assert!(format!("{current:?}").contains("sessions: 1"));
+    }
 
     /// Answers given before the image is used (unknown model, no usable default model) still
     /// read the upload: otherwise hyper closes the connection, and a client that pooled it

@@ -181,17 +181,6 @@ impl Checked {
     }
 }
 
-/// The value of a `name=value` pair in a `Cookie` header.
-fn cookie_value<'a>(header: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    header.split(|b| *b == b';').find_map(|pair| {
-        let pair = pair.trim_ascii();
-        let (key, value) = pair.split_at_checked(name.len())?;
-        (key == name.as_bytes())
-            .then(|| value.strip_prefix(b"="))
-            .flatten()
-    })
-}
-
 /// What the request shows as a token: `Authorization: Bearer`, else the cookie (true). Bytes, so
 /// a value that is not text is a wrong token rather than none; an empty value is none.
 fn presented(headers: &HeaderMap) -> Option<(&[u8], bool)> {
@@ -208,7 +197,7 @@ fn presented(headers: &HeaderMap) -> Option<(&[u8], bool)> {
     headers
         .get_all(header::COOKIE)
         .iter()
-        .find_map(|v| cookie_value(v.as_bytes(), COOKIE).filter(|t| !t.is_empty()))
+        .find_map(|v| crate::accounts::cookies::value(v.as_bytes(), COOKIE))
         .map(|token| (token, true))
 }
 
