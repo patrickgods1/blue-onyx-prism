@@ -79,7 +79,11 @@ pub fn known_secrets(config: &Config) -> Vec<String> {
         out.push(grouped);
         out.push(code);
     }
-    for name in [crate::accounts::FILE_NAME, "sessions.json", "devices.json"] {
+    for name in [
+        crate::accounts::FILE_NAME,
+        crate::accounts::sessions::FILE_NAME,
+        crate::accounts::devices::FILE_NAME,
+    ] {
         if let Some(v) = file(auth.join(name)).and_then(|t| serde_json::from_str(&t).ok()) {
             token_like(&v, &mut out);
         }

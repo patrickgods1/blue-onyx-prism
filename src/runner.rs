@@ -230,6 +230,50 @@ impl Generation {
     }
 }
 
+/// The sessions' flusher ([`crate::accounts::Auth::spawn_flusher`]) of one run: cancelled and
+/// joined on drop, which makes it write once more, forced (a graceful shutdown keeps every
+/// session as it was). Without the thread (the OS refused one), the drop still flushes.
+struct AuthFlusher {
+    auth: Arc<crate::accounts::Auth>,
+    stop: CancellationToken,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AuthFlusher {
+    fn spawn(auth: &Arc<crate::accounts::Auth>, shutdown: &CancellationToken) -> Self {
+        let stop = shutdown.child_token();
+        let join = auth
+            .spawn_flusher(stop.clone())
+            .map_err(|e| {
+                warn!(
+                    "could not start the sessions' flusher ({e}); sessions are saved at sign-in, \
+                     sign-out and shutdown only"
+                );
+            })
+            .ok();
+        Self {
+            auth: auth.clone(),
+            stop,
+            join,
+        }
+    }
+}
+
+impl Drop for AuthFlusher {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        match self.join.take() {
+            Some(j) => {
+                if j.join().is_err() {
+                    warn!("sessions' flusher panicked");
+                    self.auth.flush(crate::accounts::now(), true);
+                }
+            }
+            None => self.auth.flush(crate::accounts::now(), true),
+        }
+    }
+}
+
 /// The retention sweeper thread ([`crate::retention::spawn_sweeper`]) of one run: cancelled and
 /// joined on drop, so a server that stops for any reason takes it along.
 struct Sweeper {
@@ -290,6 +334,8 @@ struct Process {
     benchmark: Arc<crate::benchmark::service::BenchmarkService>,
     /// Wrong admin tokens per peer: a restart must not forgive them.
     admin_failures: Arc<std::sync::Mutex<server::FailureLimit>>,
+    /// Accounts, sessions and device cookies: a restart signs nobody out.
+    auth: Arc<crate::accounts::Auth>,
     /// The live config (revision, change log) is shared by every generation; a restart that
     /// reloads the file (or restores the previous config) adopts it as a logged change.
     store: Arc<crate::config_store::ConfigStore>,
@@ -361,6 +407,7 @@ impl Process {
             }),
             benchmark: self.benchmark.clone(),
             admin_failures: self.admin_failures.clone(),
+            auth: self.auth.clone(),
         })
     }
 
@@ -726,6 +773,10 @@ fn run_server_inner(
         provisioner,
         benchmark: crate::benchmark::service::BenchmarkService::new(),
         admin_failures: Arc::default(),
+        auth: Arc::new(crate::accounts::Auth::load(
+            &config.data_root(),
+            crate::accounts::now(),
+        )),
         metrics: Arc::new(Metrics::new(crate::VERSION)),
     };
     // A benchmark the machine died in names its last device at start, not at the next page view.
@@ -733,6 +784,9 @@ fn run_server_inner(
     // Disk retention (saved images, free-space warning): one sweeper per process, reading the
     // current settings on every tick; stopped and joined when this function returns.
     let _sweeper = Sweeper::spawn(process.store.clone(), &shutdown);
+    // Sessions' lazy writes, and a forced one when this function returns (after `run` below
+    // stopped the server, since locals drop in reverse order).
+    let _auth_flush = AuthFlusher::spawn(&process.auth, &shutdown);
     let mut run = Run {
         rt,
         listeners: Some(listeners),

@@ -6,6 +6,9 @@
 //!   and Argon2id hashing behind a process-wide semaphore. [`blocklist`]: the common passwords.
 //! - [`lockout`]: per-account delays and disabling (pure). [`setup`]: the one-time setup code
 //!   that creates the first account. [`lock`]: `auth/.lock`.
+//! - [`sessions`] and [`devices`]: the web UI's sessions and device cookies (hashes only, in
+//!   `auth/sessions.json` / `auth/devices.json`), [`cookies`]: their names and `Set-Cookie`
+//!   values, [`Auth`] ([`process`]): all of it for one process, shared by its generations.
 //!
 //! **The file** (`users.json`, format [`FORMAT`]):
 //! `{"format": 1, "users": [{"name", "hash", "created", "password_changed", "generation",
@@ -30,10 +33,17 @@
 
 pub mod blocklist;
 pub mod commands;
+pub mod cookies;
+pub mod devices;
 pub mod lock;
 pub mod lockout;
+mod opaque;
 pub mod password;
+pub mod process;
+pub mod sessions;
 pub mod setup;
+
+pub use process::Auth;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
