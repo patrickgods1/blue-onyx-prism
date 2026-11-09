@@ -2402,17 +2402,22 @@
     noneText.hidden = !!indexing;
     pollIndexing();
   }
+  // A request a timer makes, not the reviewer (the poll header of live.js).
+  function background(fn) {
+    return window.PrismPoll && window.PrismPoll.background ? window.PrismPoll.background(fn) : fn();
+  }
   function pollIndexing() {
     stopIndexPoll();
     if (!indexing || document.hidden) return;
     indexTimer = setTimeout(function () {
       indexTimer = null;
-      loadNext(null, null, true);
+      // A poll: it does not keep the session alive (`X-Prism-Poll`, live.js).
+      background(function () { loadNext(null, null, true); });
     }, INDEX_POLL_MS);
   }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) stopIndexPoll();
-    else if (indexing && !indexTimer) loadNext(null, null, true);
+    else if (indexing && !indexTimer) background(function () { loadNext(null, null, true); });
   });
   // Leaving the tab (or the page kept in the back-forward cache): no refresh in the background.
   window.addEventListener('pagehide', stopIndexPoll);
@@ -3058,9 +3063,12 @@
   // without log or result); a server whose answer lacks the field is asked on GET /v1/training
   // from then on.
   var jobsHasTasks = true;
-  function taskRecords(id) {
+  function taskRecords(id, asPoll) {
+    // Asked from a poll (here, or a fallback chained after one's answer): a poll throughout.
+    var poll = asPoll || (window.PrismPoll && window.PrismPoll.inPoll && window.PrismPoll.inPoll());
+    var get = poll && window.PrismPoll.fetch ? window.PrismPoll.fetch : fetch;
     var json = function (url) {
-      return fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' }).then(function (r) {
+      return get(url, { headers: { Accept: 'application/json' }, cache: 'no-store' }).then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
       });
@@ -3072,7 +3080,7 @@
     }
     var key = id ? 'task' : 'tasks';
     return json('/v1/train/jobs?' + (id ? 'task=' + encodeURIComponent(id) : 'tasks=busy')).then(function (j) {
-      if (!j || !(key in j)) { jobsHasTasks = false; return taskRecords(id); }
+      if (!j || !(key in j)) { jobsHasTasks = false; return taskRecords(id, poll); }
       return id ? (j.task ? [j.task] : []) : (j.tasks || []);
     });
   }
@@ -3129,8 +3137,11 @@
       else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see Jobs on the Auto-label tab.')]);
       else report(box, [t.summary ? 'Cancelled: ' + t.summary : 'Cancelled.']);
       box.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
-      if (after) after(t);
-      reloadQueue();
+      // Asked for by the poll's answer, not the reviewer.
+      background(function () {
+        if (after) after(t);
+        reloadQueue();
+      });
       return false;
     });
   }

@@ -15,17 +15,16 @@ use tracing::warn;
 /// JSON). `default_model` and the per-model `enabled` flags are owned by the Models card
 /// (`POST /config/models`, see [`apply_models_selection`]); `apply_config_form` still accepts a
 /// `default_model` field for API clients.
-/// Checkboxes (`force_cpu`, `save_ref_image`, `allow_remote_admin`, `auto_download`,
-/// `allow_large_downloads`) are true when present with any value but `false`/`off`/`0`, and
-/// false when absent (browsers omit unchecked boxes); each is read only when its form's marker
-/// field (`inference_settings`, `image_settings`, `access_settings`, `download_settings`) is
+/// Checkboxes (`force_cpu`, `save_ref_image`, `auto_download`, `allow_large_downloads`) are true
+/// when present with any value but `false`/`off`/`0`, and false when absent (browsers omit
+/// unchecked boxes); each is read only when its form's marker field (`inference_settings`,
+/// `image_settings`, `download_settings`) is
 /// posted too, so a form that does not show the box never clears it. [`LIBRARY_PATH_SETTINGS`]
 /// and [`FILE_ONLY_SETTINGS`] are not here: the page shows them read-only.
 pub const FORM_FIELDS: &[&str] = &[
     "port",
     "bind_address",
     "https_port",
-    "allow_remote_admin",
     "allowed_hosts",
     "request_timeout_secs",
     "worker_queue_size",
@@ -172,11 +171,6 @@ pub fn parse_config_form(
         c.bind_address = v.parse().map_err(|_| {
             anyhow::anyhow!("bind_address: '{v}' is not an IP address (e.g. 0.0.0.0 or 127.0.0.1)")
         })?;
-    }
-    // A checkbox, changed only by forms that show it (hidden `access_settings` field), so other
-    // form posts never turn remote administration off or on by omission.
-    if form.contains_key("access_settings") {
-        c.allow_remote_admin = checkbox("allow_remote_admin");
     }
     // Commas or spaces between names; `normalize` below and `validate_config` do the rest.
     if let Some(v) = get("allowed_hosts") {
@@ -1075,23 +1069,24 @@ mod tests {
         assert_eq!(c.models.len(), 2);
     }
 
+    /// `bind_address` round-trips; `allow_remote_admin` (retired) is read from old files but is no
+    /// form field any more and is never written.
     #[test]
     fn access_settings() {
         let d = Config::default();
         assert_eq!(d.bind_address.to_string(), "0.0.0.0");
-        assert!(!d.allow_remote_admin);
-        // Old files without the fields get the defaults; the values round-trip.
         let c: Config = serde_json::from_str(r#"{"port": 1234}"#).unwrap();
-        assert_eq!(
-            (c.bind_address, c.allow_remote_admin),
-            (d.bind_address, false)
-        );
+        assert_eq!(c.bind_address, d.bind_address);
         let c: Config =
             serde_json::from_str(r#"{"bind_address": "::1", "allow_remote_admin": true}"#).unwrap();
         assert_eq!(c.bind_address.to_string(), "::1");
-        assert!(c.allow_remote_admin);
+        assert!(
+            c.allow_remote_admin,
+            "read, so the start can warn and rotate"
+        );
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["bind_address"], "::1");
+        assert!(v.get("allow_remote_admin").is_none(), "never written: {v}");
 
         let mut c = with_model();
         apply_config_form(
@@ -1104,13 +1099,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.bind_address.to_string(), "127.0.0.1");
-        assert!(c.allow_remote_admin);
-        // A form without the access section leaves the flag alone.
-        apply_config_form(&mut c, &form(&[("port", "4000")])).unwrap();
-        assert!(c.allow_remote_admin);
-        // The access section without the checkbox turns it off.
-        apply_config_form(&mut c, &form(&[("access_settings", "1")])).unwrap();
-        assert!(!c.allow_remote_admin);
+        assert!(!c.allow_remote_admin, "the form does not set it");
+        assert!(!FORM_FIELDS.contains(&"allow_remote_admin"));
     }
 
     #[test]

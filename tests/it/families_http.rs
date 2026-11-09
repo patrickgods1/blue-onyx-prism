@@ -52,11 +52,15 @@ async fn yolo26_and_rtdetr_over_http() {
     let server = Server::start_in_process(config).await;
     let base = server.base.clone();
     let client = reqwest::Client::new();
+    // The home page (model states) is behind sign-in: HTTPS with the API token. Detection stays
+    // on the plain port, as Blue Iris uses it.
+    let admin = server.admin_client().await;
+    let https = server.https_base.clone();
 
     // Wait until every model is compiled (GET / shows one state cell per model).
     let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        if let Ok(r) = client.get(format!("{base}/")).send().await
+        if let Ok(r) = admin.get(format!("{https}/")).send().await
             && let Ok(body) = r.text().await
         {
             assert!(!body.contains("Failed:"), "a model failed to load:\n{body}");

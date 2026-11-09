@@ -23,6 +23,7 @@
   </nav>
   <span id="live-status" class="live-status" role="status" hidden></span>
   <span id="pending-restart" class="pending-restart" hidden><a href="/config#models"></a> <button type="button" class="small danger" data-restart>Restart</button></span>
+  {% if nav != "" %}<form method="post" action="/logout" class="signout"><span class="signed-in"><!--bop:user--></span> <button type="submit" class="small secondary">Sign out</button></form>{% endif %}
 </header>
 <script src="/static/live.js?v={{ version }}"></script>
 <main id="main" tabindex="-1">

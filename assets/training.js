@@ -366,7 +366,10 @@
       remove.disabled = busy || s.in_use;
       remove.title = s.in_use ? "An auto-label run is using it" : "";
       if (timer) { clearTimeout(timer); timer = null; }
-      if (busy) timer = setTimeout(load, 2000);
+      // A poll while it is busy: it does not keep the session alive (live.js).
+      if (busy) timer = setTimeout(function () {
+        if (window.PrismPoll && window.PrismPoll.background) window.PrismPoll.background(load); else load();
+      }, 2000);
     };
     var fail = function (text) {
       msg.textContent = text;
@@ -397,7 +400,7 @@
     $("copy").addEventListener("click", function () {
       var said = function (t) { copied.textContent = t; };
       var byHand = function () {
-        // No clipboard API on plain http from another machine.
+        // No clipboard API outside a secure context (or when the browser refuses it).
         var range = document.createRange();
         range.selectNodeContents(command);
         var sel = window.getSelection();
@@ -1853,8 +1856,9 @@
       renderMetrics(data, false);
       if (!(a || b)) return true;
       // Not reload(): the page may be the answer to a POST, and reloading it would ask to
-      // resubmit (and queue the job again).
-      window.location.assign(window.location.pathname + window.location.hash);
+      // resubmit (and queue the job again). The poll navigates, not the user: no activity.
+      if (window.PrismPoll && window.PrismPoll.navigate) window.PrismPoll.navigate(window.location.pathname + window.location.hash);
+      else window.location.assign(window.location.pathname + window.location.hash);
       return false;
     });
   }

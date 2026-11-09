@@ -69,6 +69,7 @@ async fn disabled_models_are_not_served() {
     };
     let t0 = Instant::now();
     let run = Server::start_in_process(config).await;
+    let admin = run.admin_client().await;
     assert_eq!(run.registry().names(), ["IPcam-general"]);
     assert_eq!(
         run.registry()
@@ -81,7 +82,7 @@ async fn disabled_models_are_not_served() {
 
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
-        let body = get_text(&client, &format!("{}/", run.base)).await;
+        let body = get_text(&admin, &format!("{}/", run.https_base)).await;
         if body.contains("<td>Ready</td>") {
             assert!(!body.contains("off-model"), "{body}");
             break;
@@ -122,7 +123,7 @@ async fn disabled_models_are_not_served() {
     assert_eq!(list["models"], serde_json::json!(["IPcam-general"]));
 
     // The config page still lists the disabled model, unchecked.
-    let cfg = get_text(&client, &format!("{}/config", run.base)).await;
+    let cfg = get_text(&admin, &format!("{}/config", run.https_base)).await;
     assert!(
         cfg.contains("name=\"enabled\" value=\"off-model\" aria-label=\"Load off-model\">"),
         "{cfg}"
@@ -143,11 +144,12 @@ async fn disabled_models_are_not_served() {
         ..base_config
     };
     let run = Server::start_in_process(config).await;
+    let admin = run.admin_client().await;
     assert!(run.registry().names().is_empty());
     assert!(run.registry().default_model().is_none());
-    let home = get_text(&client, &format!("{}/", run.base)).await;
+    let home = get_text(&admin, &format!("{}/", run.https_base)).await;
     assert!(home.contains("No models are enabled"), "{home}");
-    let cfg = get_text(&client, &format!("{}/config", run.base)).await;
+    let cfg = get_text(&admin, &format!("{}/config", run.https_base)).await;
     assert!(cfg.contains("action=\"/config/models#at-models\""));
     let r = post_image(
         &client,
@@ -263,10 +265,11 @@ async fn switch_models_with_restart() {
         ],
         ..base_config(&ov_dir)
     };
-    let client = reqwest::Client::new();
     let t0 = Instant::now();
     let served = Server::start(config, config_path.clone()).await;
-    let base = served.base.clone();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     wait_serving(&client, &base, &["IPcam-general"]).await;
     eprintln!(
         "generation 1 (IPcam-general) ready after {:?}",
@@ -443,13 +446,15 @@ async fn restart_into_zero_enabled_models_keeps_http_up() {
         }],
         ..base_config(&ov_dir)
     };
-    let client = reqwest::Client::new();
     let served = Server::start(config.clone(), config_path.clone()).await;
-    let base = served.base.clone();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     wait_serving(&client, &base, &["IPcam-general"]).await;
 
     // Edit the file on disk (every model disabled), then restart from the web UI.
-    let mut off = config;
+    // The file as the server wrote it (its data root, where the API token lives, included).
+    let mut off = served.config.clone();
     off.models[0].enabled = false;
     off.save(&config_path).unwrap();
     let t0 = Instant::now();

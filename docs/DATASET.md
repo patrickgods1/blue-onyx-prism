@@ -878,8 +878,8 @@ become the frame's complete set of training boxes:
   a symlink. Anything else is a 404.
 - **POST bodies** must be JSON (415 otherwise) and are capped: 256 KiB for labels, 16 KiB for export,
   import and classes (413).
-- **Admin guard:** the routes sit behind the admin guard (loopback only unless `allow_remote_admin`) and
-  the cross-site check (403).
+- **Admin guard:** the routes sit behind sign-in (HTTPS, a session or the API token; 401 or a
+  redirect to `/login` otherwise) and the cross-site check (403).
 - **Folders:** `out_dir` and the import `dir` are checked like the other folder settings (no system
   folders), and must be under a browse root or picked in the native dialog. An `out_dir` that does not
   exist yet must be inside the browse roots or a picked folder.

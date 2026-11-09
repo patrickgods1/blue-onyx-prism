@@ -353,3 +353,140 @@ fn the_http_cap_follows_the_inflight_cap() {
     assert_eq!(plain_per_peer(32, &state), 32);
     const { assert!(crate::server::detect::BODY_READS_PER_PEER <= MAX_CONNECTIONS_PER_PEER) };
 }
+
+/// The pinned client (`tls::pinned_client`, what `diagnostics` and the load-test client use)
+/// completes a real handshake with the service's own certificate, and refuses another
+/// self-signed certificate.
+#[tokio::test]
+async fn the_pinned_client_trusts_the_pinned_certificate_only() {
+    let root = scratch();
+    let running = Running::start(plan(&root, 0), Limits::default()).await;
+    let port = running.https_up(Duration::from_secs(30)).await;
+    let cert = root.0.join("auth").join("tls").join("cert.pem");
+    let client = crate::tls::pinned_client(&cert).unwrap().build().unwrap();
+    for host in ["127.0.0.1", "localhost"] {
+        let r = client
+            .get(format!("https://{host}:{port}/v1/status"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{host}: {e:?}"));
+        assert!(
+            r.status() == reqwest::StatusCode::OK
+                || r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{host}: {}",
+            r.status()
+        );
+    }
+    // An admin route over HTTPS without a credential: refused, as JSON.
+    let r = client
+        .get(format!("https://127.0.0.1:{port}/prometheus"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+    // Pinned to another self-signed certificate: the handshake fails.
+    let other = scratch();
+    let made = crate::tls::generate(
+        &crate::tls::Identity::default(),
+        std::time::SystemTime::now(),
+    )
+    .unwrap();
+    let other_cert = other.0.join("cert.pem");
+    std::fs::write(&other_cert, &made.cert_pem).unwrap();
+    let wrong = crate::tls::pinned_client(&other_cert)
+        .unwrap()
+        .build()
+        .unwrap();
+    let e = wrong
+        .get(format!("https://127.0.0.1:{port}/v1/status"))
+        .send()
+        .await
+        .unwrap_err();
+    assert!(e.is_connect() || e.is_request(), "{e:?}");
+    // A file with no certificate is an error before any connection.
+    let empty = other.0.join("empty.pem");
+    std::fs::write(&empty, "").unwrap();
+    assert!(crate::tls::pinned_client(&empty).is_err());
+    running.stop().await;
+}
+
+/// A browser's way in, over real sockets: the plain port sends it to the same page on HTTPS, the
+/// HTTPS port wants a sign-in, `POST /login` sets the session cookie, and that cookie opens the
+/// page; the API token (Bearer) is refused on the plain port.
+#[tokio::test]
+async fn a_browser_signs_in_by_hand_over_real_sockets() {
+    let root = scratch();
+    let running = Running::start(plan(&root, 0), Limits::default()).await;
+    let port = running.https_up(Duration::from_secs(30)).await;
+    let cert = root.0.join("auth").join("tls").join("cert.pem");
+    let https = crate::tls::pinned_client(&cert)
+        .unwrap()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let plain = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let r = plain
+        .get(format!("http://127.0.0.1:{}/config?x=1", running.http))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        r.headers()["location"],
+        format!("https://127.0.0.1:{port}/config?x=1").as_str()
+    );
+    let r = plain
+        .get(format!("http://127.0.0.1:{}/prometheus", running.http))
+        .bearer_auth("ab".repeat(32))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::FORBIDDEN);
+    let base = format!("https://127.0.0.1:{port}");
+    let r = https
+        .get(format!("{base}/config"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/login?next=%2Fconfig");
+    let r = https
+        .post(format!("{base}/login"))
+        .header("accept", "text/html")
+        .header("origin", base.as_str())
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(format!(
+            "username={TEST_USER}&password={}&next=%2Fconfig",
+            urlencode(TEST_PASSWORD)
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/config");
+    let session = r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| c.strip_prefix("__Host-bop_session="))
+        .and_then(|c| c.split(';').next())
+        .unwrap()
+        .to_string();
+    let r = https
+        .get(format!("{base}/config"))
+        .header("accept", "text/html")
+        .header("cookie", format!("__Host-bop_session={session}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK);
+    assert!(r.text().await.unwrap().contains(TEST_USER));
+    running.stop().await;
+}

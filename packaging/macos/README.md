@@ -43,8 +43,9 @@ click "Open Anyway". Or from Terminal: `sudo installer -pkg <file>.pkg -target /
 
 After install open https://localhost:32169/ (status and configuration; the browser warns once
 about the self-signed certificate: compare its SHA-256 fingerprint with
-`sudo -u _blueonyx /usr/local/blue-onyx-prism/blue-onyx-prism --config /usr/local/var/blue-onyx-prism/blue_onyx_prism_config.json tls-fingerprint`).
-Blue Iris uses http://<this Mac>:32168/.
+`sudo -u _blueonyx /usr/local/blue-onyx-prism/blue-onyx-prism --config /usr/local/var/blue-onyx-prism/blue_onyx_prism_config.json tls-fingerprint`)
+and create the first account with the code the same command with `setup-code` instead of
+`tls-fingerprint` prints. Blue Iris uses http://<this Mac>:32168/ (no account needed).
 
 ## Uninstall
 

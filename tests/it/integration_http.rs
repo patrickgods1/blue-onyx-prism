@@ -33,6 +33,10 @@ async fn detection_over_http() {
     let server = Server::start_in_process(config).await;
     let base = server.base.clone();
     let client = reqwest::Client::new();
+    // The home page (model states) is behind sign-in: HTTPS with the API token. Detection stays
+    // on the plain port, as Blue Iris uses it.
+    let admin = server.admin_client().await;
+    let https = server.https_base.clone();
     let post = |url: String| {
         let (client, image) = (client.clone(), image.clone());
         async move { post_image_with(&client, &url, &image, Some("0.4")).await }
@@ -41,7 +45,7 @@ async fn detection_over_http() {
     // Wait for the model to compile (GET / shows the state).
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
-        if let Ok(r) = client.get(format!("{base}/")).send().await
+        if let Ok(r) = admin.get(format!("{https}/")).send().await
             && let Ok(body) = r.text().await
         {
             if body.contains("<td>Ready</td>") {

@@ -103,10 +103,11 @@ async fn threshold_applies_to_the_next_detection() {
         confidence_threshold: 0.9,
         ..config_with(&ov_dir, vec![ipcam("IPcam-general", &model)])
     };
-    let client = reqwest::Client::new();
     let dir = temp_dir("thr");
     let served = Server::start(config, dir.join("cfg.json")).await;
-    let base = served.base.clone();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     wait_ready(&client, &base, &["IPcam-general"]).await;
     let gen0 = generation(&client, &base).await;
     let detect = format!("{base}/v1/vision/detection");
@@ -167,10 +168,11 @@ async fn disable_and_enable_without_restart() {
         &ov_dir,
         vec![ipcam("ipcam-a", &model), ipcam("ipcam-b", &model)],
     );
-    let client = reqwest::Client::new();
     let dir = temp_dir("enable");
     let served = Server::start(config, dir.join("cfg.json")).await;
-    let base = served.base.clone();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     wait_ready(&client, &base, &["ipcam-a", "ipcam-b"]).await;
     let gen0 = generation(&client, &base).await;
 
@@ -242,10 +244,11 @@ async fn device_change_reloads_only_that_model() {
         &ov_dir,
         vec![ipcam("ipcam-a", &model), ipcam("ipcam-b", &model)],
     );
-    let client = reqwest::Client::new();
     let dir = temp_dir("device");
     let served = Server::start(config, dir.join("cfg.json")).await;
-    let base = served.base.clone();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     wait_ready(&client, &base, &["ipcam-a", "ipcam-b"]).await;
     let gen0 = generation(&client, &base).await;
     let before = stats_of(&client, &base, "ipcam-a").await.unwrap();
@@ -298,10 +301,11 @@ async fn device_change_reloads_only_that_model() {
 async fn reload_model_n_times_does_not_leak() {
     let (model, ov_dir, image) = fixtures();
     let config = config_with(&ov_dir, vec![ipcam("ipcam-a", &model)]);
-    let client = reqwest::Client::new();
     let dir = temp_dir("leak");
     let served = Server::start(config, dir.join("cfg.json")).await;
-    let base = served.base.clone();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     wait_ready(&client, &base, &["ipcam-a"]).await;
 
     // Alternate the device spelling: each change reloads only this model.

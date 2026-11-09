@@ -182,7 +182,6 @@ fn global_label(k: &str) -> String {
         "https_port" => "HTTPS port".into(),
         "tls_cert_path" => "TLS certificate file".into(),
         "tls_key_path" => "TLS key file".into(),
-        "allow_remote_admin" => "Allow remote administration".into(),
         "allowed_hosts" => "Allowed host names".into(),
         "allowed_networks" => "Allowed networks".into(),
         "request_timeout_secs" => "Request timeout".into(),
@@ -423,7 +422,7 @@ impl Pending {
     }
 }
 
-/// Globals a restart does not need: the log level, `allow_remote_admin`, `allowed_hosts` and
+/// Globals a restart does not need: the log level, `allowed_hosts` and
 /// `allowed_networks` apply immediately (read per request, the last also per connection),
 /// the per-request settings go into every worker's live settings
 /// ([`crate::worker::LiveSettings`], through `ModelRegistry::apply_live`), `default_model`
@@ -437,7 +436,6 @@ pub fn live_global(k: &str) -> bool {
             | "log_timezone"
             | "default_model"
             | "previous_default"
-            | "allow_remote_admin"
             | "allowed_hosts"
             | "allowed_networks"
             | "request_timeout_secs"
@@ -895,7 +893,7 @@ mod tests {
             Box::new(|c| c.request_timeout_secs = 3),
             Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
             Box::new(|c| c.log_timezone = "America/Los_Angeles".parse().unwrap()),
-            Box::new(|c| c.allow_remote_admin = true),
+            Box::new(|c| c.allowed_hosts = vec!["nas.home.arpa".into()]),
             Box::new(|c| c.max_image_pixels = 2_000_000),
             Box::new(|c| c.default_model = Some("yolo26s".into())),
             Box::new(|c| c.benchmark.repeat_per_image = 7),
@@ -1015,7 +1013,7 @@ mod tests {
         c.log_path = Some("logs".into());
         c.bind_address = "127.0.0.1".parse().unwrap();
         // Applies at once: never pending.
-        c.allow_remote_admin = true;
+        c.allowed_hosts = vec!["nas.home.arpa".into()];
         let p = pending(&running, &c);
         assert!(p.global.is_empty(), "{:?}", p.global);
         assert_eq!(p.for_model("yolo26s"), ["disabled; still loaded"]);

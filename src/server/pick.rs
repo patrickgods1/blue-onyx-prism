@@ -7,10 +7,10 @@
 //!   dialog and answers `{"path"}` or `{"cancelled": true}` (also after [`DIALOG_TIMEOUT`],
 //!   when the child is killed), else 409 `{"available": false, "message"}` (no desktop, a peer
 //!   that is not this machine, the dialog failed to start) or 409 `{"busy": true, "message"}`
-//!   (one dialog at a time, process-wide). An admin route: loopback only unless
-//!   `allow_remote_admin`, the `Host` check of [`super::guard`] applies, and the POST passes
-//!   the CSRF guard; even with `allow_remote_admin` a
-//!   remote peer gets "unavailable", since the dialog would open on a screen it cannot see. So
+//!   (one dialog at a time, process-wide). An admin route: signed in (a session or the API
+//!   token), the `Host` check of [`super::guard`] applies, and the POST passes the CSRF guard;
+//!   even signed in, a remote peer gets "unavailable", since the dialog would open on a screen it
+//!   cannot see. So
 //!   does a loopback peer reached indirectly: a request carrying `X-Forwarded-For`, `Forwarded`
 //!   or `X-Real-IP` (a reverse proxy on this machine), or whose `Host` is not `localhost`,
 //!   `127.0.0.1` or `[::1]` (any port; a DNS-rebound name, a proxy that keeps the peer local).
@@ -1585,7 +1585,7 @@ mod tests {
         assert!(p.stopped);
     }
 
-    /// Remote peers (even with `allow_remote_admin`) never open a dialog; a held flag answers
+    /// Remote peers (even signed in, with the API token) never open a dialog; a held flag answers
     /// busy before anything is started; bad bodies are 400.
     #[tokio::test]
     async fn handler_refusals() {
@@ -1593,7 +1593,7 @@ mod tests {
         use axum::body::Body;
         use axum::http::{Request, header};
         const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let state = test_state_with(|c| c.allow_remote_admin = true);
+        let state = test_state();
         let post = |peer: &str, body: &str| {
             from_peer(
                 Request::post("/v1/fs/pick")
@@ -1658,8 +1658,8 @@ mod tests {
         drop(g);
         assert!(BusyGuard::acquire().is_some(), "released by the guard");
 
-        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened. A
-        // proxied client is remote, so it gets here only with the token.
+        // Local peers behind a proxy or under a foreign Host: unavailable, nothing opened, also
+        // signed in.
         let mut req = post(LOCAL, r#"{"kind":"folder"}"#);
         req.headers_mut()
             .insert("x-forwarded-for", "10.0.0.5".parse().unwrap());

@@ -1,8 +1,8 @@
 //! Service configuration: a JSON file next to the executable, merged with CLI flags.
 //! Merge rule: a flag given on the command line overrides the file value (`cli::merge_cli`; an
 //! absent flag leaves the file value alone), the result is validated and written back to the
-//! file, except the one-off flags (`--allow-remote-admin`, `--force-cpu`, `--save-ref-image`),
-//! which apply to that run only and are never written back ([`Config::one_off_flags`]).
+//! file, except the one-off flags (`--force-cpu`, `--save-ref-image`), which apply to that run
+//! only and are never written back ([`Config::one_off_flags`]).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -650,10 +650,13 @@ pub struct Config {
     /// The private key (PEM: PKCS#8, PKCS#1 or SEC1) of `tls_cert_path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_key_path: Option<PathBuf>,
-    /// Serve the admin pages and actions (Config, Test, Logs, Benchmark, resources, restart)
-    /// to other machines that show the admin token ([`crate::admin_token`]). Off: only loopback
-    /// clients get them (403 otherwise); detection, `/stats.json`, `/prometheus`, `/v1/devices`
-    /// and `/v1/config` stay open. Applies at once.
+    /// Retired: earlier versions served the admin pages to other machines with the admin token
+    /// when this was true. Read from old files only (never written: `skip_serializing`) and
+    /// otherwise ignored: every browser signs in with an account over HTTPS now. True in the file
+    /// at start means a warning and a one-time rotation of the API token
+    /// ([`crate::admin_token::rotate_once_after_remote_admin`]), whose old value travelled in a
+    /// cookie over plain HTTP.
+    #[serde(default, skip_serializing)]
     pub allow_remote_admin: bool,
     /// Host names (no scheme, port or path; at most [`MAX_ALLOWED_HOSTS`]) the admin routes
     /// answer under, besides IP addresses and `localhost`: the defence against DNS rebinding
@@ -1048,16 +1051,15 @@ impl Config {
         Ok(config)
     }
 
-    /// The switches a command-line flag turns on for one run only (`allow_remote_admin`,
-    /// `force_cpu`, `save_ref_image`): every write of a config that may hold such a flag has to
-    /// put the file's values back ([`Self::set_one_off_flags`]).
-    pub fn one_off_flags(&self) -> [bool; 3] {
-        [self.allow_remote_admin, self.force_cpu, self.save_ref_image]
+    /// The switches a command-line flag turns on for one run only (`force_cpu`,
+    /// `save_ref_image`): every write of a config that may hold such a flag has to put the file's
+    /// values back ([`Self::set_one_off_flags`]).
+    pub fn one_off_flags(&self) -> [bool; 2] {
+        [self.force_cpu, self.save_ref_image]
     }
 
     /// Set the switches of [`Self::one_off_flags`], in that order.
-    pub fn set_one_off_flags(&mut self, [remote, cpu, image]: [bool; 3]) {
-        self.allow_remote_admin = remote;
+    pub fn set_one_off_flags(&mut self, [cpu, image]: [bool; 2]) {
         self.force_cpu = cpu;
         self.save_ref_image = image;
     }

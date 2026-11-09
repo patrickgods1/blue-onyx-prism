@@ -63,7 +63,8 @@ alive() {
 
 for _ in $(seq 1 60); do
   alive
-  http -f "$URL/" >/dev/null && break
+  # An open route: the plain port serves Blue Iris's routes only (`/` is behind sign-in on HTTPS).
+  http -f "$URL/v1/vision/custom/list" >/dev/null && break
   sleep 2
 done
 

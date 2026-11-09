@@ -164,7 +164,7 @@ impl HttpsPort {
         }
     }
 
-    fn set(&self, port: Option<u16>) {
+    pub(crate) fn set(&self, port: Option<u16>) {
         self.0.store(port.unwrap_or(0), Ordering::Release);
     }
 }

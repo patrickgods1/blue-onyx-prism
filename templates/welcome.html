@@ -32,7 +32,7 @@
 </div>
 {% if models.is_empty() %}<p class="error">No models are enabled. Enable one on the <a href="/config">Config</a> page and restart.</p>{% endif %}
 <h2>Usage</h2>
-<p>Point Blue Iris (Settings &rarr; AI) at this server's address and port {{ port }}.</p>
+<p>Point Blue Iris (Settings &rarr; AI) at this server's address and port {{ port }}: plain HTTP, <code>http://&lt;this server's IP address&gt;:{{ port }}</code>, not the HTTPS address of this page (Blue Iris neither signs in nor speaks HTTPS, and needs no account).</p>
 <ul>
   <li><code>POST /v1/vision/detection</code> &mdash; multipart field <code>image</code>, optional <code>min_confidence</code>; served by the default model{% if !default_model.is_empty() %} (<code>{{ default_model }}</code>){% endif %}.</li>
   <li><code>POST /v1/vision/custom/&lt;model&gt;</code> &mdash; same, served by a named model.</li>

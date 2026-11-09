@@ -274,6 +274,40 @@ impl Drop for AuthFlusher {
     }
 }
 
+/// At process start: the one-time rotation of the API token after an upgrade from the retired
+/// `allow_remote_admin` ([`crate::admin_token::rotate_once_after_remote_admin`]), and while no web
+/// UI account exists, the setup code and where to use it (the code itself is never logged).
+fn prepare_sign_in(config: &Config, config_path: &std::path::Path) {
+    match crate::admin_token::rotate_once_after_remote_admin(config) {
+        Ok(true) => warn!(
+            "allow_remote_admin was on, so the API token travelled in a cookie over plain HTTP: it \
+             was replaced by a new one, once. Scripts and Prometheus that use it must read the new \
+             one with: {}",
+            crate::admin_token::read_command(config_path)
+        ),
+        Ok(false) => {}
+        Err(e) => warn!(
+            "the API token could not be rotated after the upgrade from allow_remote_admin \
+             ({e:#}); rotate it by hand with `blue-onyx-prism admin-token --rotate`"
+        ),
+    }
+    use crate::accounts::setup::{Ensured, ensure_code};
+    match ensure_code(&config.data_root()) {
+        Ok(Ensured::Created(_) | Ensured::Existing(_)) => warn!(
+            "no web UI accounts yet: run `{}` on this server and open \
+             https://localhost:{}/setup (or this server's address from another computer of the \
+             local network)",
+            crate::resources::hf_token::cli_command_for(config_path, "setup-code"),
+            config.https_port
+        ),
+        Ok(Ensured::AccountsExist) => {}
+        Err(e) => warn!(
+            "web UI sign-in is closed: {e:#}. Detection is not affected; fix the accounts file \
+             (or restore it from a backup) and nobody needs to restart"
+        ),
+    }
+}
+
 /// The retention sweeper thread ([`crate::retention::spawn_sweeper`]) of one run: cancelled and
 /// joined on drop, so a server that stops for any reason takes it along.
 struct Sweeper {
@@ -332,8 +366,10 @@ struct Process {
     https: (u16, Option<PathBuf>, Option<PathBuf>),
     /// One benchmark runner for the process, so its last results survive a restart.
     benchmark: Arc<crate::benchmark::service::BenchmarkService>,
-    /// Wrong admin tokens per peer: a restart must not forgive them.
+    /// Wrong API tokens per peer: a restart must not forgive them.
     admin_failures: Arc<std::sync::Mutex<server::FailureLimit>>,
+    /// Wrong passwords and setup codes per peer and the hashing permits: the same.
+    login: Arc<server::Logins>,
     /// Accounts, sessions and device cookies: a restart signs nobody out.
     auth: Arc<crate::accounts::Auth>,
     /// The live config (revision, change log) is shared by every generation; a restart that
@@ -407,8 +443,26 @@ impl Process {
             }),
             benchmark: self.benchmark.clone(),
             admin_failures: self.admin_failures.clone(),
+            login: self.login.clone(),
             auth: self.auth.clone(),
         })
+    }
+
+    /// Warn once when `config` names another data root than the one the accounts, sessions,
+    /// setup code and API token were loaded from: those stay where they are until the process
+    /// restarts (a generation restart does not move them).
+    fn note_data_root(&self, config: &Config) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let now = config.data_root();
+        if now != self.auth.data_root() && !WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                accounts = %self.auth.data_root().display(),
+                download_dir = %now.display(),
+                "download_dir changed: the web UI accounts, sessions and API token stay in the old \
+                 data root until the process restarts (restart the service or the program, after \
+                 moving its auth folder there if you want to keep them)"
+            );
+        }
     }
 
     /// The config of the next generation after `POST /config/restart`: the config file again,
@@ -773,6 +827,7 @@ fn run_server_inner(
         provisioner,
         benchmark: crate::benchmark::service::BenchmarkService::new(),
         admin_failures: Arc::default(),
+        login: Arc::default(),
         auth: Arc::new(crate::accounts::Auth::load(
             &config.data_root(),
             crate::accounts::now(),
@@ -787,6 +842,7 @@ fn run_server_inner(
     // Sessions' lazy writes, and a forced one when this function returns (after `run` below
     // stopped the server, since locals drop in reverse order).
     let _auth_flush = AuthFlusher::spawn(&process.auth, &shutdown);
+    prepare_sign_in(&config, &process.config_path);
     let mut run = Run {
         rt,
         listeners: Some(listeners),
@@ -839,7 +895,12 @@ fn run_server_inner(
             loaded_ort = registry.loaded_runtimes().ort;
         }
         let state = process.state_for(&config, &registry, &provision, &generation, loaded_ort);
-        crate::admin_token::ensure_for(&config);
+        process.note_data_root(&config);
+        // The token of the data root the process started with: the one the service checks.
+        crate::admin_token::ensure_for(&Config {
+            download_dir: Some(process.auth.data_root().to_path_buf()),
+            ..config.clone()
+        });
         let resources_restart = Arc::new(AtomicBool::new(false));
         let watcher = spawn_watcher(
             provision.clone(),

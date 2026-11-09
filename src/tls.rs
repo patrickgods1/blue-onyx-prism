@@ -982,5 +982,138 @@ pub fn regenerate_report(config: &Config) -> Result<String> {
     ))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Clients of this service: a pinned certificate
+// ---------------------------------------------------------------------------------------------
+
+/// The SHA-256 of the leaf (first `CERTIFICATE` block) of the PEM file `cert`: what a client of
+/// this service pins ([`PinnedCert`]).
+pub fn pin_of_file(cert: &Path) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let pem = std::fs::read(cert).with_context(|| {
+        format!(
+            "reading the HTTPS certificate {} (it is made when the service first starts \
+             HTTPS; start the service, or check that this account may read the file)",
+            cert.display()
+        )
+    })?;
+    let leaf = CertificateDer::pem_slice_iter(&pem)
+        .next()
+        .with_context(|| {
+            format!(
+                "the HTTPS certificate {} holds no CERTIFICATE block; run `blue-onyx-prism \
+                 tls-regenerate` (or fix tls_cert_path)",
+                cert.display()
+            )
+        })?
+        .with_context(|| format!("the HTTPS certificate {} is not PEM", cert.display()))?;
+    Ok(Sha256::digest(leaf.as_ref()).into())
+}
+
+/// A server-certificate verifier that accepts exactly one end-entity certificate, the one whose
+/// DER has the SHA-256 `pin`, whatever its names, issuer or dates: what a self-signed
+/// certificate's client on the same machine can trust (the CLI's `diagnostics`, the load-test
+/// client, the integration tests). The handshake's signature is still verified with the
+/// aws-lc-rs provider, so only the holder of that certificate's key passes.
+#[derive(Debug)]
+pub struct PinnedCert {
+    pin: [u8; 32],
+    provider: Arc<CryptoProvider>,
+}
+
+impl PinnedCert {
+    /// A verifier pinned to `pin` (SHA-256 of the leaf's DER).
+    pub fn new(pin: [u8; 32]) -> Self {
+        Self {
+            pin,
+            provider: provider(),
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCert {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use sha2::{Digest, Sha256};
+        let got: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        if got == self.pin {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// A rustls client config that trusts only the certificate with SHA-256 `pin` ([`PinnedCert`]),
+/// offering `http/1.1` (all the HTTPS listener speaks).
+pub fn pinned_client_config(pin: [u8; 32]) -> Result<rustls::ClientConfig> {
+    let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .context("setting up TLS for the client")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedCert::new(pin)))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// A reqwest client builder for this service's HTTPS port that trusts only the certificate in
+/// the PEM file `cert` ([`pin_of_file`], [`pinned_client_config`]); no proxy (the service is on
+/// this machine). The caller adds timeouts and headers.
+pub fn pinned_client(cert: &Path) -> Result<reqwest::ClientBuilder> {
+    let config = pinned_client_config(pin_of_file(cert)?)?;
+    Ok(reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .no_proxy())
+}
+
+/// The certificate file a client of the service running `config` pins: the config's own
+/// `tls_cert_path`, else the generated `<data root>/auth/tls/cert.pem`.
+pub fn cert_path(config: &Config) -> PathBuf {
+    Source::of(config).paths().0
+}
+
 #[cfg(test)]
 pub(crate) mod tests;

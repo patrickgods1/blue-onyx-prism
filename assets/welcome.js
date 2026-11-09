@@ -18,7 +18,8 @@
         if (d && m.stateDetail) d.textContent = m.stateDetail;
       });
       // Reload where the user was (PrismLive keeps the scroll position across it).
-      if (changed) { poller.stop(); if (window.PrismLive) PrismLive.reloadKeep(); else location.reload(); }
+      // A reload this poll makes, not the user: no activity (live.js).
+      if (changed) { poller.stop(); if (window.PrismLive) PrismLive.reloadKeep(null, true); else PrismPoll.navigate(null); }
     });
   }});
   poller.start();

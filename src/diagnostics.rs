@@ -395,22 +395,41 @@ pub fn file_name() -> String {
     )
 }
 
-/// What a running service on this machine answers for the live parts, at `port` on loopback
-/// (open routes only: `/v1/devices`, `/prometheus`); None for each part it does not answer.
-async fn fetch_live(port: u16) -> Live {
-    let mut live = Live::default();
-    let client = match reqwest::Client::builder()
+/// The client that asks the service of `config` for the live parts: its HTTPS port on loopback,
+/// pinned to the certificate in its file ([`crate::tls::pinned_client`]), with the API token as
+/// `Authorization: Bearer`. `Err` says what is missing (no token, no certificate yet).
+fn live_client(config: &Config) -> Result<reqwest::Client> {
+    let token = crate::admin_token::read(&crate::admin_token::path(config))
+        .context("the API token is not available")?;
+    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.reveal()))
+        .context("the API token is not a header value")?;
+    auth.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    crate::tls::pinned_client(&crate::tls::cert_path(config))?
+        .default_headers(headers)
         .timeout(std::time::Duration::from_secs(5))
-        .no_proxy()
         .build()
-    {
+        .context("setting up the HTTPS client")
+}
+
+/// What a running service on this machine answers for the live parts (`/v1/devices`,
+/// `/prometheus`), asked over HTTPS on loopback at `config`'s `https_port` with the API token and
+/// the service's own certificate pinned ([`live_client`]); None for each part it does not answer,
+/// with a note why.
+async fn fetch_live(config: &Config) -> Live {
+    let mut live = Live::default();
+    let client = match live_client(config) {
         Ok(c) => c,
         Err(e) => {
-            live.notes.push(format!("could not ask the service: {e}"));
+            live.notes.push(format!(
+                "devices, metrics: not asked ({e:#}); run this as the service's account with \
+                 the service's config (--config), or use the Diagnostics link of its web page"
+            ));
             return live;
         }
     };
-    let base = format!("http://127.0.0.1:{port}");
+    let base = format!("https://127.0.0.1:{}", config.https_port);
     match client.get(format!("{base}/v1/devices")).send().await {
         Ok(r) if r.status().is_success() => live.devices = r.json().await.ok(),
         Ok(r) => live
@@ -459,7 +478,7 @@ pub fn command(config_path: &Path, out: Option<&Path>) -> Result<PathBuf> {
         .enable_all()
         .build()
         .context("building a runtime to ask the service")?;
-    let mut live = rt.block_on(fetch_live(config.port));
+    let mut live = rt.block_on(fetch_live(&config));
     live.notes.splice(0..0, notes);
     let bytes = build(&config, config_path, live)?;
     let dir = match out {
@@ -758,5 +777,34 @@ pub(crate) mod tests {
         let all = entries(&std::fs::read(&path).unwrap());
         let problems = &all.iter().find(|(n, _)| n == "problems.txt").unwrap().1;
         assert!(problems.contains("there is no config file"), "{problems}");
+    }
+
+    /// Without the API token or the certificate the live parts are not asked for, and the
+    /// bundle says why (its other parts are still built); nothing is sent over plain HTTP.
+    #[tokio::test]
+    async fn the_live_parts_say_what_is_missing() {
+        let d = std::env::temp_dir().join(format!("bo_diag_live_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = Config {
+            download_dir: Some(d.clone()),
+            ..Default::default()
+        };
+        let live = fetch_live(&config).await;
+        assert!(live.devices.is_none() && live.metrics.is_none());
+        let note = live.notes.join("\n");
+        assert!(
+            note.contains("not asked") && note.contains("API token"),
+            "{note}"
+        );
+        // With the token but no certificate yet: the certificate is named.
+        crate::admin_token::for_command(&config, false).unwrap();
+        let live = fetch_live(&config).await;
+        let note = live.notes.join("\n");
+        assert!(note.contains("HTTPS certificate"), "{note}");
+        let bytes = build(&config, &d.join("cfg.json"), live).unwrap();
+        let all = entries(&bytes);
+        let problems = &all.iter().find(|(n, _)| n == "problems.txt").unwrap().1;
+        assert!(problems.contains("HTTPS certificate"), "{problems}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

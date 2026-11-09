@@ -1110,13 +1110,13 @@ mod tests {
         let big = format!(r#"{{"dir": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json("/v1/review/import", &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
-        // Remote peers never reach the admin routes.
-        let req = super::super::test_util::from_peer(
+        // A request that is not signed in never reaches the admin routes.
+        let req = super::super::test_util::anonymous(super::super::test_util::from_peer(
             Request::get("/v1/review/next").body(Body::empty()).unwrap(),
             super::super::test_util::REMOTE,
-        );
+        ));
         let (s, _, _) = call(&d.state, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         assert!(
             !d.dir
                 .join("ir/drive/2026-10-21/20261021T010203004Z_a.labels.json")
@@ -2408,12 +2408,12 @@ mod tests {
             .insert("origin", "http://evil.example".parse().unwrap());
         let (s, _, _) = call(&d.state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let req = super::super::test_util::from_peer(
+        let req = super::super::test_util::anonymous(super::super::test_util::from_peer(
             post_json(uri, r#"{"min_score": 0.9}"#),
             super::super::test_util::REMOTE,
-        );
+        ));
         let (s, _, _) = call(&d.state, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         assert_eq!(labels_of(&d.dir, &high).boxes[0].state, BoxState::Pending);
         let big = format!(
             r#"{{"min_score": 0.3, "camera": "{}"}}"#,
@@ -2572,12 +2572,12 @@ mod tests {
             .insert("origin", "http://evil.example".parse().unwrap());
         let (s, _, _) = call(&d.state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let req = super::super::test_util::from_peer(
+        let req = super::super::test_util::anonymous(super::super::test_util::from_peer(
             post_json(uri, "{}"),
             super::super::test_util::REMOTE,
-        );
+        ));
         let (s, _, _) = call(&d.state, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         let big = format!(r#"{{"camera": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json(uri, &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
@@ -2714,12 +2714,12 @@ mod tests {
             .insert("origin", "http://evil.example".parse().unwrap());
         let (s, _, _) = call(&d.state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let req = super::super::test_util::from_peer(
+        let req = super::super::test_util::anonymous(super::super::test_util::from_peer(
             post_json(uri, "{}"),
             super::super::test_util::REMOTE,
-        );
+        ));
         let (s, _, _) = call(&d.state, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         let big = format!(r#"{{"camera": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json(uri, &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
@@ -2892,12 +2892,12 @@ mod tests {
             .insert("origin", "http://evil.example".parse().unwrap());
         let (s, _, _) = call(&d.state, req).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let req = super::super::test_util::from_peer(
+        let req = super::super::test_util::anonymous(super::super::test_util::from_peer(
             post_json(uri, "{}"),
             super::super::test_util::REMOTE,
-        );
+        ));
         let (s, _, _) = call(&d.state, req).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
         let big = format!(r#"{{"limit": 1{}}}"#, " ".repeat(SMALL_BODY_LIMIT));
         let (s, _) = json(&d.state, post_json(uri, &big)).await;
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);

@@ -1114,8 +1114,9 @@ mod tests {
         assert_eq!(s.read().nms_iou, 0.5);
     }
 
-    /// A run with `--allow-remote-admin` (or the other one-off flags) keeps them in memory, and
-    /// a save from a page must not make them permanent.
+    /// A run with `--force-cpu` (or the other one-off flags) keeps them in memory, and a save from
+    /// a page must not make them permanent. The retired `allow_remote_admin` is never written at
+    /// all.
     #[test]
     fn one_off_flags_stay_out_of_every_save() {
         let path = tmp();
@@ -1128,7 +1129,7 @@ mod tests {
             ..file
         };
         let s = ConfigStore::new(merged, path.clone());
-        let flags = |c: &Config| (c.allow_remote_admin, c.force_cpu, c.save_ref_image);
+        let flags = |c: &Config| (c.force_cpu, c.save_ref_image);
 
         s.update("page", |c| {
             c.port = 4000;
@@ -1137,11 +1138,17 @@ mod tests {
         .unwrap();
         let on_disk = Config::load(&path).unwrap();
         assert_eq!(on_disk.port, 4000);
-        assert_eq!(flags(&on_disk), (false, false, false));
+        assert_eq!(flags(&on_disk), (false, false));
+        assert!(!on_disk.allow_remote_admin);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("allow_remote_admin")
+        );
         // This run keeps them, and the watch sees no change in the file.
-        assert_eq!(flags(&s.read()), (true, true, true));
+        assert_eq!(flags(&s.read()), (true, true));
         assert!(s.check_disk().is_none());
-        assert_eq!(flags(&s.read()), (true, true, true));
+        assert_eq!(flags(&s.read()), (true, true));
 
         // Changing one by hand is a real change: that one is saved, the others stay out.
         s.update("page", |c| {
@@ -1154,27 +1161,38 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(flags(&Config::load(&path).unwrap()), (false, true, false));
+        assert_eq!(flags(&Config::load(&path).unwrap()), (true, false));
     }
 
-    /// Flags the file itself holds are no one-off: a save keeps them.
+    /// Flags the file itself holds are no one-off: a save keeps them. The retired
+    /// `allow_remote_admin` of an old file is dropped by the first save.
     #[test]
     fn flags_in_the_file_survive_a_save() {
         let path = tmp();
         let file = Config {
-            allow_remote_admin: true,
             save_ref_image: true,
             ..cfg()
         };
         file.save(&path).unwrap();
-        let s = ConfigStore::new(file, path.clone());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let old = text.replacen('{', "{\n  \"allow_remote_admin\": true,", 1);
+        std::fs::write(&path, old).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.allow_remote_admin, "an old file is read");
+        let s = ConfigStore::new(loaded, path.clone());
         s.update("page", |c| {
             c.port = 4000;
             Ok(())
         })
         .unwrap();
         let on_disk = Config::load(&path).unwrap();
-        assert!(on_disk.allow_remote_admin && on_disk.save_ref_image);
+        assert!(on_disk.save_ref_image);
+        assert!(!on_disk.allow_remote_admin);
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("allow_remote_admin")
+        );
     }
 
     #[test]

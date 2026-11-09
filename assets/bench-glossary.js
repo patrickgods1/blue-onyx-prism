@@ -13,7 +13,7 @@
   function post(url, body) {
     return fetch(url, {method: "POST", body: body, headers: {"Accept": "application/json"}}).then(function (r) {
       return r.json().then(function (j) { j._status = r.status; return j; }, function () {
-        return {success: false, _status: r.status, message: "the server answered HTTP " + r.status + (r.status === 403 ? " (not allowed from here: admin actions answer this computer only)" : r.status === 404 ? " (this server does not have this feature yet; update it)" : "")};
+        return {success: false, _status: r.status, message: "the server answered HTTP " + r.status + (r.status === 403 ? " (refused: admin actions must come from this server's own HTTPS pages, under its address or an allowed host name)" : r.status === 404 ? " (this server does not have this feature yet; update it)" : "")};
       });
     });
   }

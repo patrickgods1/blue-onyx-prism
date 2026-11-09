@@ -46,8 +46,9 @@ async fn edit_on_disk_applies_without_a_page() {
     let dir = temp_dir("disk-edit");
     let path = dir.join("cfg.json");
     let served = Server::start(config, path.clone()).await;
-    let base = served.base.clone();
-    let client = reqwest::Client::new();
+    // The web UI and admin API: HTTPS with the API token (the open routes answer there too).
+    let base = served.https_base.clone();
+    let client = served.admin_client().await;
     let both = vec!["ipcam-a".to_string(), "ipcam-b".to_string()];
     wait_until("both models listed", Duration::from_secs(60), || async {
         list_models(&client, &base).await.as_ref() == Some(&both)

@@ -130,7 +130,7 @@
       var j = res.body;
       if (res.status === 200 && typeof j.path === "string" && j.path) { done(""); fill(t, j.path); return; }
       if (res.status === 200 && j.cancelled) { done(""); return; }
-      // 409 (no desktop, a remote browser, the dialog failed, busy) or anything else: the
+      // 409 (no desktop, a browser on another computer, the dialog failed, busy) or anything else: the
       // in-page browser. Only "busy" may clear up, so only it keeps the native path.
       if (res.status === 409 && j.available === false) native = false;
       done(j.busy && j.message ? " " + j.message : "");

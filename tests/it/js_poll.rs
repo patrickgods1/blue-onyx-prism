@@ -4,7 +4,9 @@
 //! What they pin: a loop never has two requests in flight, never ticks while the tab is hidden,
 //! runs at once when it shows again, backs off after errors, and a refresh of the Train area asks
 //! the running chain instead of starting another (the old code started a second 3 s chain from the
-//! 30 s timer and the `train-area:refresh` event, doubling the requests for good).
+//! 30 s timer and the `train-area:refresh` event, doubling the requests for good). Signed-in
+//! requests: polls carry `X-Prism-Poll: 1` (so they do not keep a session alive) and a 401 sends
+//! the page to the login page once, with the way back, instead of backing off.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
 #![allow(clippy::unwrap_used)]
@@ -278,6 +280,131 @@ const count = (u) => W.log.filter(x => x === u).length;
   console.log('ok');
 })().catch(e => { console.error(e); process.exit(1); });
 "#;
+
+/// The fetch wrapper of `live.js` with a fake `fetch` and `location`.
+const AUTH: &str = r#"
+const assert = require('assert');
+const fs = require('fs'), vm = require('vm');
+const tick = () => new Promise(r => setImmediate(r));
+const sent = [], assigned = [], replies = [];
+const location = {pathname: '/config', search: '?x=1', origin: 'https://192.168.1.5:32169',
+  assign(u) { assigned.push(u); }};
+const sandbox = {
+  console, Promise, Headers, location, setTimeout, clearTimeout,
+  fetch(url, init) {
+    sent.push({url, init});
+    const status = replies.length ? replies.shift() : 200;
+    return Promise.resolve({status, ok: status < 400, json: () => Promise.resolve({})});
+  },
+};
+const ctx = vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const fetch = (u, i) => vm.runInContext('fetch', ctx)(u, i);
+const Poll = vm.runInContext('PrismPoll', ctx);
+const header = (s) => {
+  const h = s.init && s.init.headers;
+  if (!h) return undefined;
+  return typeof h.get === 'function' ? h.get('X-Prism-Poll') : h['X-Prism-Poll'];
+};
+const settled = async (p) => { let done = false; p.then(() => { done = true; }); await tick(); await tick(); return done; };
+
+(async () => {
+  // A request the user makes: no poll header, the caller's headers untouched.
+  const mine = {headers: {Accept: 'application/json'}};
+  await fetch('/v1/training', mine);
+  assert.strictEqual(header(sent.pop()), undefined);
+  assert.deepStrictEqual(mine.headers, {Accept: 'application/json'}, 'the caller\'s object is not changed');
+  // Polls: PrismPoll.fetch, a PrismPoll run, and background().
+  await Poll.fetch('/v1/config', {headers: {Accept: 'application/json'}});
+  let s = sent.pop();
+  assert.strictEqual(header(s), '1');
+  assert.strictEqual(s.init.headers.Accept, 'application/json');
+  const env = {hidden: () => false, set: () => 1, clear() {}, onVisible() {}};
+  const loop = Poll.create({run: () => fetch('/v1/train/jobs'), period: 1000, env});
+  loop.start(); await tick();
+  assert.strictEqual(header(sent.pop()), '1', 'a PrismPoll run is a poll');
+  loop.stop();
+  Poll.background(() => { fetch('/v1/review/next', {headers: new Headers({Accept: 'x'})}); });
+  s = sent.pop();
+  assert.strictEqual(header(s), '1', 'Headers objects too');
+  assert.strictEqual(s.init.headers.get('Accept'), 'x');
+  await fetch('/after');
+  assert.strictEqual(header(sent.pop()), undefined, 'background() ends with its function');
+  // Another origin never gets the header (it would need a CORS preflight).
+  Poll.background(() => { fetch('https://example.test/x'); fetch('//example.test/y'); });
+  assert.strictEqual(header(sent.pop()), undefined);
+  assert.strictEqual(header(sent.pop()), undefined);
+  Poll.background(() => { fetch('https://192.168.1.5:32169/v1/x'); });
+  assert.strictEqual(header(sent.pop()), '1', 'an absolute URL of this origin is a poll');
+
+  // A fetch chained after a poll's answer (inside a `.then`) is not synchronous any more: through
+  // PrismPoll.background (or PrismPoll.fetch) it is still a poll; a bare one is not, which is
+  // why every poll path in the pages uses the helpers.
+  sent.length = 0;
+  const chained = Poll.create({env, period: 1000, run: () => fetch('/v1/benchmark?only=run').then(() => {
+    Poll.background(() => { fetch('/v1/benchmark'); });
+    fetch('/bare');
+    return Poll.fetch('/v1/resources');
+  })});
+  chained.start(); await tick(); await tick(); await tick();
+  chained.stop();
+  const tag = (u) => header(sent.find(x => x.url === u));
+  assert.strictEqual(tag('/v1/benchmark?only=run'), '1');
+  assert.strictEqual(tag('/v1/benchmark'), '1', 'background() inside a .then');
+  assert.strictEqual(tag('/v1/resources'), '1', 'PrismPoll.fetch inside a .then');
+  assert.strictEqual(tag('/bare'), undefined, 'a bare chained fetch is not tagged');
+  // A reload or navigation a poll makes: the poll cookie first, then the load.
+  ctx.document = {cookie: ''};
+  const navs = [];
+  location.reload = () => navs.push('reload');
+  location.replace = (u) => navs.push('replace ' + u);
+  Poll.navigate(null);
+  Poll.navigate('/train/jobs', true);
+  Poll.navigate('/x');
+  assert.ok(/^__Host-bop_poll=1; Secure; SameSite=Strict; Path=\/; Max-Age=\d+$/.test(ctx.document.cookie), ctx.document.cookie);
+  assert.deepStrictEqual(navs, ['reload', 'replace /train/jobs']);
+  assert.deepStrictEqual(assigned.splice(0), ['/x']);
+  delete ctx.document;
+
+  // A 503 (sign-in closed) is the page's to show.
+  replies.push(503);
+  const r = await fetch('/v1/training');
+  assert.strictEqual(r.status, 503);
+  assert.deepStrictEqual(assigned, []);
+  // A 401 elsewhere: no redirect.
+  replies.push(401);
+  assert.strictEqual((await fetch('https://example.test/x')).status, 401);
+  assert.deepStrictEqual(assigned, []);
+  // A 401 of this server: to the login page with the way back, once; the request never
+  // settles, so a poll loop does not back off or report an error meanwhile.
+  replies.push(401, 401);
+  const errors = [];
+  const looped = Poll.create({run: () => fetch('/v1/train/summary'), period: 1000, env,
+    onError: (n) => errors.push(n)});
+  looped.start();
+  assert.strictEqual(await settled(fetch('/v1/config')), false, 'a 401 never settles');
+  await tick();
+  assert.deepStrictEqual(assigned, ['/login?next=%2Fconfig%3Fx%3D1']);
+  assert.deepStrictEqual(errors, [], 'no back-off');
+  assert.strictEqual(looped.state().busy, true, 'the loop waits for the page to go');
+  // On the login page itself nothing loops back to it.
+  const ctx2 = vm.createContext({console, Promise, Headers,
+    location: {pathname: '/login', search: '', origin: 'https://h', assign(u) { assigned.push(u); }},
+    fetch: () => Promise.resolve({status: 401})});
+  vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx2);
+  vm.runInContext('fetch', ctx2)('/v1/x');
+  await tick();
+  assert.strictEqual(assigned.length, 1);
+  console.log('ok');
+})().catch(e => { console.error(e); process.exit(1); });
+"#;
+
+#[test]
+fn polls_carry_the_poll_header_and_a_401_goes_to_the_login_page() {
+    if have_node() {
+        run(AUTH);
+    }
+}
 
 #[test]
 fn the_scheduler_never_overlaps_sleeps_while_hidden_and_backs_off() {
