@@ -29,6 +29,7 @@
     {% for d in datasets %}
     <div class="tr-folder">
       <label class="check" title="{{ d.path }}"><input type="checkbox" name="dataset" value="{{ d.path }}"{% if !d.exists %} disabled{% else if d.saved %} checked{% endif %}> <span>{{ d.when }}{% if let Some(n) = d.frames %} <span class="muted small">{{ n }} frames{% if !d.split.is_empty() %}, {{ d.split }}{% endif %}</span>{% endif %}{% if !d.classes.is_empty() %}<span class="muted small tr-hint">{{ d.classes }}</span>{% endif %}</span>{% if !d.exists %} <span class="error-text small">missing</span>{% endif %}{% if !d.saved %} <span class="muted small">Dataset tab export</span>{% endif %}</label>
+      <button type="button" class="term small muted tr-path" data-tip="{{ d.path }}" aria-label="Folder of the {{ d.when }} dataset">folder</button>
       {% if d.saved %}<button type="submit" class="small secondary" formaction="/training/datasets" formnovalidate name="remove" value="{{ d.path }}">Remove</button>{% endif %}
     </div>
     {% endfor %}

@@ -284,7 +284,9 @@ document.addEventListener("click", function (e) {
       var tr = rows[i];
       upd(tr.querySelector("input[name=enabled]"), m.enabled);
       var rm = tr.querySelector("button.model-remove");
-      if (rm) { rm.disabled = m.enabled; rm.title = m.enabled ? "Enabled: disable it first (untick Load and save), then remove it" : "Remove this entry from the config; its files stay"; }
+      if (rm) { rm.disabled = m.enabled; rm.title = m.enabled ? "Enabled: disable it first (untick Load and save), then remove it" : "Remove this entry from the config and delete its model files in the models folder"; }
+      // Why Remove is off, for a finger and a screen reader too (a disabled button's title shows on hover only).
+      var why = tr.querySelector("button.mc-remove-why"); if (why) why.hidden = !m.enabled;
       var sel = tr.querySelector("td.model-device select");
       upd(sel, m.device || "");
       refreshThreshold(tr, m, j, force);
@@ -294,7 +296,7 @@ document.addEventListener("click", function (e) {
       var keepOpen = !!(old && old.open && fail && old.querySelector("summary").textContent === fail);
       run.replaceChildren(el("span", "run-text", m.running.text));
       if (fail) { var dt = el("details", "run-detail"), sm = el("summary", null, fail); sm.title = fail; dt.appendChild(sm); dt.open = keepOpen; run.appendChild(dt); }
-      var badge = tr.querySelector(".pending-badge"); badge.hidden = !m.restartNeeded; badge.title = m.reasons.join("; ");
+      var badge = tr.querySelector(".pending-badge"); badge.hidden = !m.restartNeeded; badge.dataset.tip = m.reasons.join("; ");
       tr.classList.toggle("pending", m.restartNeeded);
       var bh = tr.querySelector(".bench-hint"); bh.replaceChildren();
       if (m.bench) {
@@ -673,7 +675,13 @@ document.addEventListener("click", function (e) {
     var names = valueNames(v), unknown = own.length ? names.filter(function (n) { return own.indexOf(n) < 0; }) : [];
     out.textContent = v === GLOBAL ? "global" : CU.countText(names, own.length);
     out.classList.toggle("warn", unknown.length > 0);
-    out.title = unknown.length ? unknown.join(", ") + (unknown.length === 1 ? " is" : " are") + " not a class of this model, so " + (unknown.length === 1 ? "it" : "they") + " never match." : "";
+    // Said in the cell, not only in a title (no hover on a phone): which names never match.
+    var why = cell.querySelector(".of-unknown");
+    if (!unknown.length) { if (why) why.remove(); }
+    else {
+      if (!why) { why = document.createElement("span"); why.className = "sub of-unknown"; cell.appendChild(why); }
+      why.textContent = unknown.join(", ") + (unknown.length === 1 ? " is" : " are") + " not a class of this model, so " + (unknown.length === 1 ? "it" : "they") + " never match.";
+    }
     var b = cell.querySelector("button.of-edit");
     if (b) b.hidden = !catalog;
   }

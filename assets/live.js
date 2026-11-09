@@ -42,6 +42,12 @@
 // item at the same revision) or "drop" (it changed since).
 // PrismViewport: pure screen rules (whether an on-screen keyboard is open, how far the bottom
 // restart banner rises over the sticky bars); the page part sets `html.kb-open` and `--toc-h`.
+// PrismPointer: which `svg` / `.keep-hover` element a mouse (or pen) is over, as `data-pointer-in`
+// (PrismLive.view.busy defers a re-render of a section holding one). Not `:hover`, which a tap
+// leaves set on iOS until the next tap elsewhere, so a tapped chart froze its section.
+// PrismTip: the one tooltip bubble of every page for `button.term` (text in `data-tip`, or a
+// Benchmark glossary key in `data-term`): shown while a mouse is over it or it has keyboard
+// focus, kept open by a click / tap until a tap elsewhere or Esc.
 (function (root) {
   "use strict";
   var polling = 0, pollFetch = null, realFetch = null;
@@ -401,6 +407,28 @@
     }
   };
 
+  // ---- what a mouse is over (pure part tested in node) -------------------------------------------
+  // Pointer enter / leave of a mouse or a pen (one that hovers) on an `svg` or a `.keep-hover`
+  // element set / clear `data-pointer-in` on it; a finger never does (no hover to end).
+  var POINTED = "svg, .keep-hover";
+  root.PrismPointer = {
+    ATTR: "data-pointer-in",
+    hovers: function (type) { return type === "mouse" || type === "pen"; },
+    // One pointerenter (`on`) or pointerleave on `target`.
+    note: function (target, type, on) {
+      if (!target || !target.matches || !root.PrismPointer.hovers(type) || !target.matches(POINTED)) return;
+      if (on) target.setAttribute(root.PrismPointer.ATTR, ""); else target.removeAttribute(root.PrismPointer.ATTR);
+    },
+    // The capture listeners on `doc` (pointerenter / pointerleave do not bubble; capture sees each).
+    install: function (doc) {
+      doc.addEventListener("pointerenter", function (e) { root.PrismPointer.note(e.target, e.pointerType, true); }, true);
+      doc.addEventListener("pointerleave", function (e) { root.PrismPointer.note(e.target, e.pointerType, false); }, true);
+    },
+    // Whether a mouse is over a chart or a `.keep-hover` element inside `rootEl`, or a chart
+    // there keeps a readout a finger asked for (bench-charts.js `data-pinned`).
+    within: function (rootEl) { return !!(rootEl && rootEl.querySelector && rootEl.querySelector("[data-pointer-in], svg[data-pinned]")); }
+  };
+
   // ---- drafts ------------------------------------------------------------------------------
   function storage() { try { return root.sessionStorage || null; } catch (e) { return null; } }
   function draftKey(key) { var l = root.location; return "prism:draft:" + ((l && l.pathname) || "") + ":" + key; }
@@ -728,6 +756,7 @@
   // `patch(box, items)` does the same per child (keyed cards): only changed children are
   // rebuilt, in place.
   var pointerIn = null;
+  PrismPointer.install(document);
   document.addEventListener("pointerdown", function (e) { pointerIn = e.target; }, true);
   ["pointerup", "pointercancel", "dragend"].forEach(function (t) { document.addEventListener(t, function () { pointerIn = null; }, true); });
   var KEPT = ".scroll, details, table, [data-keep]";
@@ -744,7 +773,7 @@
     if (pointerIn && root.contains(pointerIn)) return true;
     var s = window.getSelection && window.getSelection();
     if (s && !s.isCollapsed && s.rangeCount && root.contains(s.getRangeAt(0).commonAncestorContainer)) return true;
-    return !!root.querySelector("svg:hover, .keep-hover:hover");
+    return PrismPointer.within(root);
   }
   function capture(root) {
     var st = {els: {}, focus: null};
@@ -1044,6 +1073,81 @@
     document.addEventListener("focusin", later);
     document.addEventListener("focusout", later);
   })();
+
+  // ---- tooltips (PrismTip) ------------------------------------------------------------------------
+  // One bubble in <body> (outside every re-rendered section, so polling never removes it). A
+  // `button.term` opens it while a mouse (or pen) is over it and on keyboard focus, and keeps it
+  // open after a click / tap (again closes it; so does a tap elsewhere or Esc). Not `mouseover`:
+  // iOS turns the first tap on an element whose mouseover changes the page into a hover only, so
+  // the tap never pinned the bubble. The listeners are delegated on the document in the capture
+  // phase, so a term inside a sortable header never reaches the header's click / Enter / Space
+  // handlers. Text: `data-tip`, else the Benchmark glossary entry `data-term` (bench-glossary.js).
+  var tipBubble = null, tipAnchor = null, tipAnchorId = null, tipPinned = false, tipQuiet = null;
+  function ensureBubble() {
+    if (tipBubble) return tipBubble;
+    tipBubble = document.createElement("div"); tipBubble.className = "term-tip"; tipBubble.id = "pb-tip";
+    tipBubble.setAttribute("role", "tooltip"); tipBubble.hidden = true;
+    document.body.appendChild(tipBubble); return tipBubble;
+  }
+  function tipTextOf(b) {
+    if (b.dataset.tip) return b.dataset.tip;
+    var PB = window.PrismBench;
+    return b.dataset.term && PB && PB.tipText ? PB.tipText(b.dataset.term) : "";
+  }
+  function tipPlace() {
+    if (!tipAnchor || !tipBubble) return;
+    if (!tipAnchor.isConnected) { tipRefresh(); return; }
+    var r = tipAnchor.getBoundingClientRect(), vw = document.documentElement.clientWidth || window.innerWidth;
+    tipBubble.style.maxWidth = Math.min(340, vw - 24) + "px";
+    var bw = tipBubble.offsetWidth, bh = tipBubble.offsetHeight;
+    var left = Math.max(8, Math.min(r.left + window.pageXOffset, window.pageXOffset + vw - bw - 8));
+    var top = r.bottom + window.pageYOffset + 6;
+    if (r.bottom + bh + 12 > window.innerHeight && r.top > bh + 12) top = r.top + window.pageYOffset - bh - 6;
+    tipBubble.style.left = left + "px"; tipBubble.style.top = top + "px";
+  }
+  function tipShow(b, stick) {
+    ensureBubble();
+    if (tipAnchor && tipAnchor !== b) { tipAnchor.removeAttribute("aria-describedby"); tipAnchor.setAttribute("aria-expanded", "false"); }
+    tipAnchor = b; tipAnchorId = b.dataset.tipId || null; tipPinned = !!stick;
+    tipBubble.textContent = tipTextOf(b); tipBubble.hidden = false;
+    b.setAttribute("aria-describedby", "pb-tip"); b.setAttribute("aria-expanded", "true");
+    tipPlace();
+  }
+  function tipHide() {
+    if (tipAnchor) { tipAnchor.removeAttribute("aria-describedby"); tipAnchor.setAttribute("aria-expanded", "false"); }
+    tipAnchor = null; tipAnchorId = null; tipPinned = false; if (tipBubble) tipBubble.hidden = true;
+  }
+  // After a re-render: follow the open tooltip to its rebuilt button (same `data-tip-id`), else close.
+  function tipRefresh() {
+    if (!tipAnchor || tipAnchor.isConnected) { tipPlace(); return; }
+    var n = tipAnchorId ? document.querySelector('.term[data-tip-id="' + (window.CSS && CSS.escape ? CSS.escape(tipAnchorId) : tipAnchorId.replace(/"/g, "")) + '"]') : null;
+    if (n) tipShow(n, tipPinned); else tipHide();
+  }
+  function termOf(t) { return t && t.closest ? t.closest(".term") : null; }
+  document.addEventListener("click", function (e) {
+    var b = termOf(e.target);
+    if (b) { e.stopPropagation(); e.preventDefault(); if (tipAnchor === b && tipPinned) tipHide(); else tipShow(b, true); return; }
+    if (tipAnchor && tipBubble && !tipBubble.contains(e.target)) tipHide();
+  }, true);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && tipAnchor) { var a = tipAnchor; tipHide(); if (document.activeElement !== a && a.isConnected) { tipQuiet = a; a.focus(); tipQuiet = null; } return; }
+    var b = termOf(e.target); if (b && (e.key === "Enter" || e.key === " ")) e.stopPropagation();
+  }, true);
+  document.addEventListener("pointerover", function (e) {
+    if (!PrismPointer.hovers(e.pointerType)) return;
+    var b = termOf(e.target); if (b && b !== tipAnchor) tipShow(b, false);
+  }, true);
+  document.addEventListener("pointerout", function (e) {
+    if (!PrismPointer.hovers(e.pointerType)) return;
+    var b = termOf(e.target); if (!b || b !== tipAnchor || tipPinned) return;
+    var to = e.relatedTarget; if (to && (b.contains(to) || (tipBubble && tipBubble.contains(to)))) return;
+    if (document.activeElement !== b) tipHide();
+  }, true);
+  document.addEventListener("focusin", function (e) { var b = termOf(e.target); if (b && b !== tipQuiet) tipShow(b, false); }, true);
+  document.addEventListener("focusout", function (e) { var b = termOf(e.target); if (b && b === tipAnchor && !tipPinned) tipHide(); }, true);
+  window.addEventListener("resize", tipPlace);
+  window.addEventListener("scroll", tipPlace, true);
+  window.PrismTip = {show: tipShow, hide: tipHide, refresh: tipRefresh, place: tipPlace};
 
   // ---- anchors under the sticky section tabs ------------------------------------------------------
   // `nav.toc` (Config, Benchmark) sticks to the top and wraps to several rows on a phone: its real

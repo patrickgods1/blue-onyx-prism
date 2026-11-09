@@ -5,6 +5,12 @@
 // threshold charts built on them. Every chart has <title>/<desc>; series differ in dash pattern
 // as well as color (--series-1..8 in style.css). Colors come from classes, never style
 // attributes (CSP style-src 'self').
+// Touch: a line chart's readout (what a mouse shows while it moves over the plot) shows on a tap
+// and stays (`data-pinned` on the svg; live.js holds a re-render of the section meanwhile) until
+// a tap elsewhere or Esc; a sideways finger drag scrubs it (the svg is `touch-action: pan-y
+// pinch-zoom` in style.css, so an up-down drag still scrolls the page and a pinch zooms it). In a
+// window under 600 px the charts draw a narrower viewBox (fitSize), so their 11-12 px text stays
+// about that size on a phone.
 (function () {
   var PB = window.PrismBench, el = PB.el, has = PB.has, fmt = PB.fmt;
   var SVGNS = "http://www.w3.org/2000/svg", chartId = 0;
@@ -25,6 +31,44 @@
   }
   function niceMax(v) { if (!(v > 0)) return 1; var t = niceTicks(0, v, 5); var last = t[t.length - 1]; return last >= v ? last : last + (t[1] - t[0]); }
 
+  // The viewBox [width, height] of a chart asked for at W x H that shows `avail` CSS px wide. An
+  // svg scales its text with it, so a 560 wide viewBox shown 330 px wide has its 11 px ticks at
+  // about 6.5 px: drawn as wide as it shows (at least 240), never wider than asked, the text keeps
+  // its size; the height shrinks less, so the plot keeps its height. `avail` 0 = as asked.
+  // Pure (node test in tests/it/js_charts.rs).
+  function fitSize(W, H, avail) {
+    if (!(avail > 0)) return [W, H];
+    var w = Math.max(240, Math.round(avail));
+    if (w >= W) return [W, H];
+    return [w, Math.round(H * Math.max(w / W, 0.72))];
+  }
+  // The width a chart drawn now gets: only in a window under NARROW px (a phone; wider windows
+  // draw as before). The holder's own width when block() redraws one in the page (a legend
+  // toggle), else the window less PAD (page, card and details padding: a phone's charts show
+  // 290..335 px wide in a 390 px window; a little narrower than shown only makes the text a
+  // little larger).
+  var NARROW = 600, PAD = 100, holderWidth = 0;
+  function windowWidth() {
+    var d = typeof document !== "undefined" && document.documentElement;
+    return (d && d.clientWidth) || (typeof window !== "undefined" && window.innerWidth) || 0;
+  }
+  function availWidth() {
+    var vw = windowWidth();
+    if (!(vw > 0) || vw >= NARROW) return 0;
+    return holderWidth || vw - PAD;
+  }
+  // A finger (not a mouse): the scatter's hit rings double.
+  function coarse() { return typeof window !== "undefined" && !!window.matchMedia && window.matchMedia("(pointer: coarse)").matches; }
+
+  // The one readout kept after a tap (a chart at a time): {svg, clear}. A tap outside its chart
+  // or Esc clears it.
+  var pinned = null;
+  function unpin() { if (pinned) { var p = pinned; pinned = null; p.clear(); } }
+  if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("pointerdown", function (e) { if (pinned && !(pinned.svg.contains && pinned.svg.contains(e.target))) unpin(); }, true);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") unpin(); });
+  }
+
   // Tooltip box inside an SVG: a <g> with a rect sized to its lines.
   function svgTip(svg) {
     var g = sv("g", {class: "thr-tip", visibility: "hidden"}), bg = sv("rect", {rx: 4, x: -6, y: -13}), tx = sv("text", {});
@@ -35,7 +79,8 @@
         lines.forEach(function (l, i) { tx.appendChild(sv("tspan", {x: 0, dy: i ? 15 : 0}, l)); w = Math.max(w, l.length); });
         var bw = Math.max(80, w * 6.3 + 12); bg.setAttribute("width", bw); bg.setAttribute("height", lines.length * 15 + 8);
         var tx0 = x + bw + 10 > L + pw ? x - bw - 4 : x + 10;
-        g.setAttribute("transform", "translate(" + Math.max(2, tx0) + "," + y + ")"); g.setAttribute("visibility", "visible");
+        // The box starts 6 left of its text: keep all of it inside the chart (narrow on a phone).
+        g.setAttribute("transform", "translate(" + Math.max(8, Math.min(tx0, W - bw + 4)) + "," + y + ")"); g.setAttribute("visibility", "visible");
       },
       hide: function () { g.setAttribute("visibility", "hidden"); }
     };
@@ -43,12 +88,13 @@
 
   // series: [{id, label, cls, dash, points: [{x, y, ...}]}] (y null = a gap in the line);
   // opts: title, desc, width, height, xMin/xMax/yMin/yMax, xTicks/yTicks, xFmt/yFmt (tick
-  // text), xLabel, yLabel, marks [{x, cls, label}], dots [{x, y, cls, label}], diag (chance
+  // text), xLabel, yLabel, marks [{x, cls, label}], dots [{x, y, cls, label, lines}], diag (chance
   // line), hover "x" (nearest x, every series' value) | "xy" (nearest point), tip(hit) -> lines,
   // hidden {id: true}, pointDots (draw each point), xTickText(v) for categorical ticks.
   function lineChart(series, o) {
     o = o || {};
-    var W = o.width || 560, H = o.height || 290, L = o.left || 52, R = 16, T = o.top || 18, B = 44, pw = W - L - R, ph = H - T - B;
+    var size = fitSize(o.width || 560, o.height || 290, availWidth());
+    var W = size[0], H = size[1], L = o.left || 52, R = 16, T = o.top || 18, B = 44, pw = W - L - R, ph = H - T - B;
     var x0 = has(o.xMin) ? o.xMin : 0, x1 = has(o.xMax) ? o.xMax : 1, y0 = has(o.yMin) ? o.yMin : 0, y1 = has(o.yMax) ? o.yMax : 1;
     var X = function (v) { return L + (v - x0) / ((x1 - x0) || 1) * pw; }, Y = function (v) { return T + (1 - (v - y0) / ((y1 - y0) || 1)) * ph; };
     var id = "pb-chart-" + (++chartId), hidden = o.hidden || {};
@@ -85,16 +131,20 @@
       svg.appendChild(sv("line", {x1: X(m.x), x2: X(m.x), y1: T, y2: T + ph, class: m.cls}));
       svg.appendChild(sv("text", {x: Math.min(X(m.x) + 4, L + pw - 96), y: T + 12 + 14 * k, class: "thr-tick"}, m.label));
     });
+    if (o.corner) svg.appendChild(sv("text", {x: L + pw - 4, y: T + ph - 8, "text-anchor": "end", class: "thr-label"}, o.corner));
+    // Hover: the nearest point(s) and their exact values. The hit rect takes the pointer; the
+    // dots above it keep their <title> (desktop hover) and show it as the readout on a tap; the
+    // guide, the hover dot and the readout are on top and let the pointer through (style.css).
+    var hit = sv("rect", {x: L, y: T, width: pw, height: ph, class: "thr-hit"}); svg.appendChild(hit);
+    var dotEls = [];
     (o.dots || []).forEach(function (p) {
       if (!has(p.x) || !has(p.y)) return;
       var c = sv("circle", {cx: X(p.x), cy: Y(p.y), r: 5, class: p.cls}); if (p.label) c.appendChild(sv("title", {}, p.label)); svg.appendChild(c);
+      dotEls.push([c, p]);
     });
-    if (o.corner) svg.appendChild(sv("text", {x: L + pw - 4, y: T + ph - 8, "text-anchor": "end", class: "thr-label"}, o.corner));
-    // Hover: the nearest point(s) and their exact values.
     var guide = sv("line", {y1: T, y2: T + ph, class: "thr-guide", visibility: "hidden"}), hov = sv("circle", {r: 3.5, class: "roc-hover", visibility: "hidden"});
     svg.appendChild(guide); svg.appendChild(hov);
     var tipBox = svgTip(svg);
-    var hit = sv("rect", {x: L, y: T, width: pw, height: ph, class: "thr-hit"}); svg.appendChild(hit);
     function nearest(evt) {
       var r = svg.getBoundingClientRect(); if (!r.width) return null;
       var mx = (evt.clientX - r.left) * W / r.width, my = (evt.clientY - r.top) * H / r.height, best = null;
@@ -108,8 +158,9 @@
       return best;
     }
     function at(s, x) { var b = null; s.points.forEach(function (p) { if (has(p.y) && (!b || Math.abs(p.x - x) < Math.abs(b.x - x))) b = p; }); return b; }
-    hit.addEventListener("pointermove", function (evt) {
-      var h = nearest(evt); if (!h) return;
+    // The readout at the pointer of `evt`; false when there is nothing to show.
+    function readout(evt) {
+      var h = nearest(evt); if (!h) return false;
       var lines;
       if (o.tip) lines = o.tip(h.p, h.s);
       else if (o.hover === "xy") lines = [h.s.label, (o.xName || "x") + " " + (o.xHover || xf)(h.p.x) + ", " + (o.yName || "y") + " " + (o.yHover || yf)(h.p.y)];
@@ -117,13 +168,60 @@
         lines = [(o.xName || "") + " " + (o.xHover || xf)(h.p.x)];
         shown.slice(0, 8).forEach(function (s) { var q = at(s, h.p.x); if (q && Math.abs(q.x - h.p.x) <= (x1 - x0) * 0.03) lines.push(s.label + ": " + (o.yHover || yf)(q.y)); });
       }
-      if (!lines || !lines.length) return;
-      if (o.hover === "xy") { hov.setAttribute("cx", X(h.p.x)); hov.setAttribute("cy", Y(h.p.y)); hov.setAttribute("visibility", "visible"); }
+      if (!lines || !lines.length) return false;
+      if (o.hover === "xy") { hov.setAttribute("cx", X(h.p.x)); hov.setAttribute("cy", Y(h.p.y)); hov.setAttribute("visibility", "visible"); guide.setAttribute("visibility", "hidden"); }
       else { guide.setAttribute("x1", X(h.p.x)); guide.setAttribute("x2", X(h.p.x)); guide.setAttribute("visibility", "visible"); }
       var ty = o.hover === "xy" ? Math.min(Y(h.p.y) + 18, T + ph - lines.length * 15) : T + 30;
       tipBox.show(lines, X(h.p.x), ty, W, L, pw);
+      return true;
+    }
+    function clear() {
+      guide.setAttribute("visibility", "hidden"); hov.setAttribute("visibility", "hidden"); tipBox.hide();
+      svg.removeAttribute("data-pinned");
+      if (pinned && pinned.svg === svg) pinned = null;
+    }
+    // Keep what shows until a tap elsewhere, Esc or a re-render.
+    function pin() {
+      if (pinned && pinned.svg !== svg) unpin();
+      pinned = {svg: svg, clear: clear}; svg.setAttribute("data-pinned", "");
+    }
+    // A finger on the plot: {x, y} where it went down, `scrub` once it moved sideways.
+    var touch = null;
+    hit.addEventListener("pointerdown", function (evt) {
+      if (evt.pointerType === "mouse") return;
+      touch = {x: evt.clientX, y: evt.clientY, scrub: false};
     });
-    hit.addEventListener("pointerleave", function () { guide.setAttribute("visibility", "hidden"); hov.setAttribute("visibility", "hidden"); tipBox.hide(); });
+    hit.addEventListener("pointermove", function (evt) {
+      if (evt.pointerType === "mouse" || !touch) { if (evt.pointerType === "mouse" || !evt.buttons) readout(evt); return; }
+      var dx = Math.abs(evt.clientX - touch.x), dy = Math.abs(evt.clientY - touch.y);
+      if (!touch.scrub && dx > 6 && dx > dy) touch.scrub = true;
+      if (touch.scrub && readout(evt)) pin();
+    });
+    hit.addEventListener("pointerup", function (evt) {
+      if (evt.pointerType === "mouse") return;
+      touch = null;
+      if (readout(evt)) pin(); else clear();
+    });
+    // The page took the gesture (an up-down scroll): a scrub keeps its last readout.
+    hit.addEventListener("pointercancel", function () {
+      var scrubbed = touch && touch.scrub; touch = null;
+      if (!scrubbed) clear();
+    });
+    hit.addEventListener("pointerleave", function (evt) {
+      if (evt.pointerType !== "mouse" && svg.hasAttribute("data-pinned")) return;
+      clear();
+    });
+    // A dot: its text as the readout on a tap (a mouse gets the <title>).
+    dotEls.forEach(function (d) {
+      var c = d[0], p = d[1];
+      c.addEventListener("pointerup", function (evt) {
+        if (evt.pointerType === "mouse") return;
+        var lines = p.lines || (p.label ? [p.label] : []); if (!lines.length) return;
+        guide.setAttribute("visibility", "hidden"); hov.setAttribute("visibility", "hidden");
+        tipBox.show(lines, X(p.x), Math.min(Y(p.y) + 18, T + ph - lines.length * 15), W, L, pw);
+        pin();
+      });
+    });
     return svg;
   }
 
@@ -132,7 +230,8 @@
   // points), selected (key), onPick(key). Each point is a focusable button (click / Enter).
   function scatter(points, o) {
     o = o || {};
-    var W = o.width || 620, H = o.height || 340, L = 52, R = 18, T = 16, B = 46, pw = W - L - R, ph = H - T - B;
+    var size = fitSize(o.width || 620, o.height || 340, availWidth()), ring = coarse() ? 22 : 11;
+    var W = size[0], H = size[1], L = 52, R = 18, T = 16, B = 46, pw = W - L - R, ph = H - T - B;
     var pts = points.filter(function (p) { return has(p.x) && has(p.y); });
     var xmax = niceMax(Math.max.apply(null, pts.map(function (p) { return p.x; }).concat([1])) * 1.08);
     var ys = pts.map(function (p) { return p.y; }), ymin = ys.length ? Math.min.apply(null, ys) : 0, ymax = ys.length ? Math.max.apply(null, ys) : 1;
@@ -164,6 +263,7 @@
     function showLabel(p) {
       var text = p.label + ": " + (o.xHover || fmt.ms)(p.x) + ", " + (o.yHover || function (v) { return fmt.pct(v, 1); })(p.y);
       var w = text.length * 6.3 + 10, x = X(p.x) + w + 12 > L + pw ? X(p.x) - w - 8 : X(p.x) + 10, y = Math.max(T + 12, Y(p.y) - 10);
+      x = Math.max(2, Math.min(x, W - w - 2));
       label.textContent = text; label.setAttribute("x", x + 5); label.setAttribute("y", y + 4); label.setAttribute("visibility", "visible");
       labelBg.setAttribute("x", x); labelBg.setAttribute("y", y - 9); labelBg.setAttribute("width", w); labelBg.setAttribute("height", 18); labelBg.setAttribute("visibility", "visible");
     }
@@ -173,7 +273,7 @@
       if (p.shape === "square") shape = sv("rect", {x: cx - 5, y: cy - 5, width: 10, height: 10});
       else if (p.shape === "triangle") shape = sv("path", {d: "M" + cx + " " + (cy - 6) + "L" + (cx + 6) + " " + (cy + 5) + "L" + (cx - 6) + " " + (cy + 5) + "Z"});
       else shape = sv("circle", {cx: cx, cy: cy, r: 5.5});
-      g.appendChild(sv("circle", {cx: cx, cy: cy, r: 11, class: "pb-pt-ring"}));
+      g.appendChild(sv("circle", {cx: cx, cy: cy, r: ring, class: "pb-pt-ring"}));
       g.appendChild(shape); g.appendChild(sv("title", {}, p.label + ": " + fmt.ms(p.x) + ", " + fmt.pct(p.y, 1) + (p.best ? " (best trade-off)" : "")));
       var pick = function () { showLabel(p); if (o.onPick) o.onPick(p.key); };
       g.addEventListener("click", pick);
@@ -194,7 +294,10 @@
     var box = el("div", "chart-block " + (o.cls || "")), hidden = hiddenBy[o.key] = hiddenBy[o.key] || {};
     box.dataset.keep = "c:" + o.key;
     var holder = el("div", "chart-holder");
-    function redraw() { holder.replaceChildren(o.draw(hidden)); }
+    function redraw() {
+      holderWidth = holder.isConnected ? holder.clientWidth : 0;
+      try { holder.replaceChildren(o.draw(hidden)); } finally { holderWidth = 0; }
+    }
     if (o.legend !== false && o.series && o.series.length > 1) {
       var lg = el("div", "legend"); lg.setAttribute("role", "group"); lg.setAttribute("aria-label", "Show or hide series");
       o.series.forEach(function (s) {
@@ -254,7 +357,11 @@
   function rocSvg(o) {
     var pts = [{t: null, tpr: 0, fpr: 0}].concat(o.curve || []);
     var series = [{id: "roc", label: "ROC", cls: "roc-line", points: pts.map(function (p) { return {x: p.fpr, y: p.tpr, raw: p}; })}];
-    var dot = function (p, cls, name) { var f = p && p.frame; return f && has(f.tpr) && has(f.fpr) ? {x: f.fpr, y: f.tpr, cls: cls, label: name + " " + fmt.thr(p.threshold) + ": alert rate " + pct1(f.tpr) + "%, false alerts " + pct1(f.fpr) + "%"} : null; };
+    var dot = function (p, cls, name) {
+      var f = p && p.frame; if (!(f && has(f.tpr) && has(f.fpr))) return null;
+      var head = name + " " + fmt.thr(p.threshold), rates = "alert rate " + pct1(f.tpr) + "%, false alerts " + pct1(f.fpr) + "%";
+      return {x: f.fpr, y: f.tpr, cls: cls, label: head + ": " + rates, lines: [head, rates]};
+    };
     var dots = [dot(o.configured, "roc-dot-cfg", "now"), dot(o.best, "roc-dot-best", "best")].filter(Boolean);
     return block({
       key: o.key || ("roc:" + o.title), series: series, legend: false, cls: "roc-block",
@@ -271,5 +378,5 @@
     });
   }
 
-  PB.charts = {sv: sv, lineChart: lineChart, scatter: scatter, block: block, chartSvg: chartSvg, rocSvg: rocSvg, dashOf: dashOf, niceTicks: niceTicks, niceMax: niceMax, hidden: hiddenBy};
+  PB.charts = {sv: sv, lineChart: lineChart, scatter: scatter, block: block, chartSvg: chartSvg, rocSvg: rocSvg, dashOf: dashOf, niceTicks: niceTicks, niceMax: niceMax, fitSize: fitSize, unpin: unpin, hidden: hiddenBy};
 })();

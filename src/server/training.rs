@@ -4844,6 +4844,12 @@ pub(super) mod tests {
         let (running, queued) = (row("r9"), row("r8"));
         assert!(running.contains(shown), "{running}");
         assert!(running.contains("Stop after this epoch and keep the best checkpoint"));
+        // What Pause / Resume / Finish now do, for a finger as well as a mouse.
+        assert!(
+            running.contains("class=\"term term-q\" data-tip=\"Pause: its processes stop where they are;")
+                && running.contains("Finish now: it stops after this epoch and keeps the best checkpoint.\" aria-label=\"What Pause, Resume and Finish now do\">?</button>"),
+            "{running}"
+        );
         assert!(
             queued.contains(hidden) && !queued.contains(shown),
             "{queued}"
@@ -4888,11 +4894,17 @@ pub(super) mod tests {
         assert!(card.contains("day + night+ir routed"));
         assert!(card.contains("class=\"num best-val\""));
         assert!(!card.contains("cmp-solo"));
-        assert!(card.contains(">Person R</th>") && card.contains(">False alerts</th>"));
+        // The column help and each cell's detail open on a tap too (a title shows on hover only).
+        assert!(card.contains(
+            "<th class=\"num\"><button type=\"button\" class=\"term\" data-tip=\"Recall of person on every held-out frame at the confidence threshold the model runs with (IoU 0.5)\">Person R</button></th>"
+        ));
+        assert!(card.contains(">False alerts</button></th>"));
+        assert!(!card.contains("<th class=\"num\" title="), "{card}");
         assert!(
-            card.contains("<td class=\"num best-val\" title=\"2 of 40 frames without any object alerted (5.0%) at threshold 0.50\">2/40</td>"),
+            card.contains("<td class=\"num best-val\"><button type=\"button\" class=\"term\" data-tip=\"2 of 40 frames without any object alerted (5.0%) at threshold 0.50\">2/40</button></td>"),
             "{card}"
         );
+        assert!(card.contains("held-out images\">0.600</button>"), "{card}");
         // The Runs checkboxes, Patience, the recommendation and the class picker's fields.
         assert!(page.contains("name=\"scene\" value=\"all\" data-prefix=\"custom\" checked>"));
         assert!(page.contains("name=\"scene\" value=\"night+ir\" data-prefix=\"night\">"));

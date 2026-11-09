@@ -953,6 +953,11 @@ mod tests {
             "<td>Failed:<br><span class=\"detail\">model file not found: x.onnx</span></td>"
         ));
         assert!(home.contains("<tr class=\"st-fail\">"));
+        // A restart badge's reasons open on a tap (live.js PrismTip), not only as a title.
+        assert!(
+            home.contains("<button type=\"button\" class=\"term tag restart pending-badge\" data-model=\"ipcam-general\" data-tip=\""),
+            "{home}"
+        );
         assert!(home.contains("Running on") && home.contains("nothing loaded yet"));
         assert!(home.contains("OpenVINO devices"));
         assert!(!home.contains("Force CPU is on"));
@@ -968,7 +973,13 @@ mod tests {
         assert!(stats.contains("<script src=\"/static/stats.js?v="));
         assert!(static_file("stats.js").is_some_and(|js| js.contains("fetch(\"/stats.json\"")));
         assert!(stats.contains("class=\"stats sticky-first rcards rgrid\""));
-        assert!(stats.contains("ipcam-general") && stats.contains("title=\"CPU\""));
+        // The device spec shows under the provider (it was a title only, which a finger cannot
+        // open).
+        assert!(
+            stats.contains("ipcam-general")
+                && stats.contains("data-label=\"Device\" title=\"not loaded\">not loaded<span class=\"sub\">CPU</span></td>"),
+            "{stats}"
+        );
         assert!(!stats.contains("<b>evil</b>"));
         // Short state, the reason on its own line (as on Home).
         assert!(
@@ -1562,6 +1573,108 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Each style rule's selector in `css` with the at-rule preludes around it (outermost
+    /// first), comments and quoted strings skipped.
+    fn css_selectors(css: &str) -> Vec<(Vec<String>, String)> {
+        let (mut out, mut stack, mut prelude) = (Vec::new(), Vec::<String>::new(), String::new());
+        let mut chars = css.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let mut last = ' ';
+                    for d in chars.by_ref() {
+                        if last == '*' && d == '/' {
+                            break;
+                        }
+                        last = d;
+                    }
+                }
+                '"' | '\'' => {
+                    prelude.push(c);
+                    for d in chars.by_ref() {
+                        prelude.push(d);
+                        if d == c {
+                            break;
+                        }
+                    }
+                }
+                '{' => {
+                    let p = prelude.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !p.starts_with('@') {
+                        out.push((stack.clone(), p.clone()));
+                    }
+                    stack.push(p);
+                    prelude.clear();
+                }
+                '}' => {
+                    stack.pop();
+                    prelude.clear();
+                }
+                ';' => prelude.clear(),
+                _ => prelude.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn css_selectors_know_their_media_blocks() {
+        let got = css_selectors(
+            "a:hover { x: \"}\" } /* b:hover { } */\n@media (hover: hover) { b:hover { y: 1; } }\nc { }",
+        );
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0], (vec![], "a:hover".to_string()));
+        assert_eq!(got[1].0, vec!["@media (hover: hover)".to_string()]);
+        assert_eq!(got[2], (vec![], "c".to_string()));
+    }
+
+    /// Phones and tablets: a tap leaves `:hover` set (iOS until the next tap elsewhere), so a
+    /// hover fill such as `button.danger:hover` stayed red after a tap and a cancelled confirm.
+    /// Every `:hover` rule is inside an `@media` whose condition has `hover: hover`; the
+    /// `:focus-visible` and `[aria-expanded]` twins that shared a rule with one stay outside.
+    #[test]
+    fn hover_styles_apply_only_where_a_pointer_hovers() {
+        let css = static_file("style.css").unwrap();
+        let rules = css_selectors(css);
+        let bare: Vec<&String> = rules
+            .iter()
+            .filter(|(within, sel)| {
+                sel.contains(":hover")
+                    && !within
+                        .iter()
+                        .any(|w| w.starts_with("@media") && w.contains("hover: hover"))
+            })
+            .map(|(_, sel)| sel)
+            .collect();
+        assert!(
+            bare.is_empty(),
+            ":hover outside @media (hover: hover): {bare:?}"
+        );
+        assert!(
+            rules.iter().filter(|(_, s)| s.contains(":hover")).count() >= 20,
+            "the parser finds the hover rules"
+        );
+        for twin in [
+            "header nav a.active",
+            "button.browse-item:focus-visible",
+            "button.term[aria-expanded=\"true\"]",
+            "button.term.chip[aria-expanded=\"true\"]",
+        ] {
+            assert!(
+                rules
+                    .iter()
+                    .any(|(within, s)| s == twin && within.is_empty()),
+                "{twin} applies without hover"
+            );
+        }
+        // A line chart scrolls up and down and pinch-zooms under a finger and scrubs sideways
+        // (on the svg: Chrome ignores touch-action on its shapes).
+        assert!(css.contains(
+            "svg.thr-chart:not(.pb-scatter), .thr-chart .thr-hit { touch-action: pan-y pinch-zoom; }"
+        ));
     }
 
     /// Whether `value` holds a plain `vh` length (`65vh`, `100vh`; not `dvh` / `svh` / `lvh`).
