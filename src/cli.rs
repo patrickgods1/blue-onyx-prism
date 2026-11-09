@@ -302,6 +302,8 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     merge_cli(&mut config, &cli.absolutized(&base));
     // Same names in memory as in the written file (a `--model` entry gets its file stem).
     config.fill_model_names();
+    // `--port 32169` with `https_port` at its default: HTTPS moves aside (see the method).
+    config.move_default_https_port();
     config
         .validate()
         .context("invalid command-line option (the config file was not changed)")?;

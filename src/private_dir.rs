@@ -342,18 +342,29 @@ mod tests {
         let root = scratch();
         let (dir, warning) = ensure_with(&root.0, &protect_new_folder).unwrap();
         assert_eq!(warning, None);
+        // Passed as -EncodedCommand (base64 of UTF-16LE): quotes inside a -Command argument do
+        // not survive Windows' command-line parsing intact. Stop on the first error, so a failed
+        // Get-Acl fails the run with its message instead of printing empty values.
         let script = format!(
-            "$a = Get-Acl -LiteralPath '{}'; \"protected=$($a.AreAccessRulesProtected)\"; \
-             $a.Access | ForEach-Object {{ \
-               $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }}",
+            "$ErrorActionPreference = 'Stop'\n\
+             $a = Get-Acl -LiteralPath '{}'\n\
+             \"protected=$($a.AreAccessRulesProtected)\"\n\
+             foreach ($r in $a.Access) {{ \
+               $r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }}\n",
             dir.display().to_string().replace('\'', "''")
         );
+        let encoded = {
+            use base64::Engine as _;
+            let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        };
         let out = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{out:?}");
         let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{text}\n{err}");
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         assert!(lines.contains(&"protected=True"), "{text}");
         assert!(lines.contains(&"S-1-5-32-544"), "{text}");
