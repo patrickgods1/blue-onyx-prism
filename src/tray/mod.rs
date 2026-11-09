@@ -37,6 +37,10 @@ pub struct TrayArgs {
     /// HTTP port of the service (default: the installed service config's port, else 32168).
     #[arg(long)]
     pub port: Option<u16>,
+    /// HTTPS port of the web UI, which "Open web UI" opens (default: the installed service
+    /// config's `https_port`, else 32169).
+    #[arg(long)]
+    pub https_port: Option<u16>,
     /// The `blue-onyx-prism` CLI used to control the service (default: next to the tray on
     /// Windows, /usr/local/blue-onyx-prism/blue-onyx-prism on macOS).
     #[arg(long)]
@@ -126,7 +130,10 @@ mod tests {
     fn parses_the_command_line() {
         let a = TrayArgs::try_parse_from(["t", "--port", "8080", "--cli", "/x/y"]).unwrap();
         assert_eq!(a.port, Some(8080));
+        assert_eq!(a.https_port, None);
         assert_eq!(a.cli.as_deref(), Some(Path::new("/x/y")));
+        let a = TrayArgs::try_parse_from(["t", "--https-port", "8443"]).unwrap();
+        assert_eq!(a.https_port, Some(8443));
         let a = TrayArgs::try_parse_from(["t"]).unwrap();
         assert_eq!((a.port, a.cli), (None, None));
         assert!(TrayArgs::try_parse_from(["t", "--port", "70000"]).is_err());

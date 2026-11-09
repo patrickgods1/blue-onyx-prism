@@ -634,9 +634,22 @@ pub struct Config {
     /// ([`newer_format_error`]) rather than misread and then written over.
     pub format: u32,
     pub port: u16,
-    /// Address the HTTP listener binds (`0.0.0.0` = every IPv4 interface, plus `[::1]` for
-    /// `localhost`). `127.0.0.1` keeps the service local to this machine. Process restart.
+    /// Address the HTTP and HTTPS listeners bind (`0.0.0.0` = every IPv4 interface, plus
+    /// `[::1]` for `localhost`). `127.0.0.1` keeps the service local to this machine. Process
+    /// restart.
     pub bind_address: std::net::IpAddr,
+    /// Port of the HTTPS listener (web UI; [`crate::tls`]), default
+    /// [`crate::DEFAULT_HTTPS_PORT`]. Must differ from `port`. Process restart.
+    pub https_port: u16,
+    /// The HTTPS listener's own certificate (PEM, the chain allowed: leaf first) instead of the
+    /// generated self-signed one; set together with `tls_key_path`. Used as given, never written;
+    /// a relative path is under the data root. Config file / command line only, never
+    /// web-editable ([`crate::config_form::FILE_ONLY_SETTINGS`]). Process restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert_path: Option<PathBuf>,
+    /// The private key (PEM: PKCS#8, PKCS#1 or SEC1) of `tls_cert_path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_key_path: Option<PathBuf>,
     /// Serve the admin pages and actions (Config, Test, Logs, Benchmark, resources, restart)
     /// to other machines that show the admin token ([`crate::admin_token`]). Off: only loopback
     /// clients get them (403 otherwise); detection, `/stats.json`, `/prometheus`, `/v1/devices`
@@ -944,6 +957,9 @@ impl Default for Config {
             format: CONFIG_FORMAT,
             port: crate::DEFAULT_PORT,
             bind_address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            https_port: crate::DEFAULT_HTTPS_PORT,
+            tls_cert_path: None,
+            tls_key_path: None,
             allow_remote_admin: false,
             allowed_hosts: Vec::new(),
             allowed_networks: Vec::new(),
@@ -1138,6 +1154,28 @@ impl Config {
         for m in &mut self.models {
             m.confidence_threshold = m.confidence_threshold.map(round_threshold);
             m.device_thresholds = normalized_profiles(&m.device_thresholds);
+        }
+        self.move_default_https_port();
+    }
+
+    /// `https_port` still at its default ([`crate::DEFAULT_HTTPS_PORT`]) while `port` is that
+    /// same port: moved to the next port up. Configs from before the HTTPS
+    /// listener existed have no `https_port`, and 32169 was a common choice of `port` (the old
+    /// MSI docs suggested it), so without this such an install would refuse to start after an
+    /// upgrade. Any other clash is the user's own two values and stays refused
+    /// ([`validate_https`]).
+    pub fn move_default_https_port(&mut self) {
+        if self.port == crate::DEFAULT_HTTPS_PORT && self.https_port == crate::DEFAULT_HTTPS_PORT {
+            let moved = crate::DEFAULT_HTTPS_PORT + 1;
+            tracing::warn!(
+                port = self.port,
+                https_port = moved,
+                "port is {}, the default HTTPS port, so the web UI's HTTPS listener uses {} \
+                 instead; set \"https_port\" in the config to choose another",
+                self.port,
+                moved
+            );
+            self.https_port = moved;
         }
     }
 
@@ -1666,6 +1704,7 @@ impl Config {
             return Err(newer_format_error(u64::from(self.format)));
         }
         check_range("port", self.port, 1, u16::MAX)?;
+        validate_https(self)?;
         validate_allowed_hosts(&self.allowed_hosts)?;
         validate_allowed_networks(&self.allowed_networks)?;
         check_range(
@@ -2080,6 +2119,55 @@ impl Config {
 const NO_MODELS: &str = "models: at least one model is required; add one on the Config page \
      (Add a model by path), with `blue-onyx-prism add-model --path <file>`, or fetch the default \
      with `blue-onyx-prism download-models --name IPcam-general --add-to-config`";
+
+/// `https_port` (1-65535, not `port`; the two may only both be 0, as tests bind them) and
+/// `tls_cert_path` / `tls_key_path` (both or neither, neither empty).
+fn validate_https(c: &Config) -> Result<()> {
+    use anyhow::bail;
+    if c.https_port == 0 && c.port != 0 {
+        bail!(
+            "https_port: must be between 1 and 65535, got 0; set the port of the web UI's HTTPS \
+             listener (default {})",
+            crate::DEFAULT_HTTPS_PORT
+        );
+    }
+    if c.https_port == c.port && c.port != 0 {
+        bail!(
+            "https_port: {} is also `port`; the HTTPS listener (web UI) and the HTTP listener \
+             (Blue Iris) need two ports. Set https_port to another port, such as {}",
+            c.https_port,
+            if c.port == crate::DEFAULT_HTTPS_PORT {
+                crate::DEFAULT_PORT
+            } else {
+                crate::DEFAULT_HTTPS_PORT
+            }
+        );
+    }
+    let empty = |p: &Option<PathBuf>| p.as_ref().is_some_and(|p| p.as_os_str().is_empty());
+    for (key, p) in [
+        ("tls_cert_path", &c.tls_cert_path),
+        ("tls_key_path", &c.tls_key_path),
+    ] {
+        if empty(p) {
+            bail!(
+                "{key}: empty; remove the key from the config file to use the generated \
+                 certificate, or name a PEM file"
+            );
+        }
+    }
+    match (&c.tls_cert_path, &c.tls_key_path) {
+        (Some(_), None) => bail!(
+            "tls_key_path: missing; tls_cert_path is set, and its certificate needs its private \
+             key. Set both in the config file, or remove tls_cert_path to use the generated \
+             certificate"
+        ),
+        (None, Some(_)) => bail!(
+            "tls_cert_path: missing; tls_key_path is set, and a key needs its certificate. Set \
+             both in the config file, or remove tls_key_path to use the generated certificate"
+        ),
+        _ => Ok(()),
+    }
+}
 
 /// Checks of a config the server runs with: [`Config::validate`], at least one model, at least
 /// one enabled model and a `default_model` that names a configured model.
@@ -2734,6 +2822,102 @@ mod tests {
     fn validate_port() {
         rejects(|c| c.port = 0, "port", "between 1 and 65535, got 0");
         assert!(check(|c| c.port = 65535).is_ok());
+    }
+
+    #[test]
+    fn validate_https_port() {
+        assert_eq!(Config::default().https_port, crate::DEFAULT_HTTPS_PORT);
+        rejects(|c| c.https_port = c.port, "https_port", "also `port`");
+        rejects(
+            |c| {
+                c.port = 4000;
+                c.https_port = 4000;
+            },
+            "https_port",
+            "such as 32169",
+        );
+        rejects(
+            |c| {
+                c.port = crate::DEFAULT_HTTPS_PORT;
+                c.https_port = crate::DEFAULT_HTTPS_PORT;
+            },
+            "https_port",
+            "such as 32168",
+        );
+        rejects(|c| c.https_port = 0, "https_port", "between 1 and 65535");
+        assert!(check(|c| c.https_port = 443).is_ok());
+        assert!(check(|c| c.https_port = 65535).is_ok());
+        // An old file without the key gets the default.
+        let c: Config = serde_json::from_str(r#"{"port": 4000}"#).unwrap();
+        assert_eq!(c.https_port, crate::DEFAULT_HTTPS_PORT);
+    }
+
+    /// An install whose `port` is the default HTTPS port (32169) still starts after the upgrade:
+    /// normalizing moves the defaulted `https_port` aside, at load and after the CLI merge.
+    /// Only a clash the user chose stays refused.
+    #[test]
+    fn a_port_on_the_default_https_port_moves_https_aside() {
+        for text in [
+            r#"{"port": 32169}"#,
+            r#"{"port": 32169, "https_port": 32169}"#,
+        ] {
+            let mut c: Config = serde_json::from_str(text).unwrap();
+            c.normalize();
+            assert_eq!(c.port, crate::DEFAULT_HTTPS_PORT, "{text}");
+            assert_eq!(c.https_port, crate::DEFAULT_HTTPS_PORT + 1, "{text}");
+            assert!(validate_https(&c).is_ok(), "{text}");
+        }
+        // `--port 32169` on a default config (the CLI merge path).
+        let mut c = Config {
+            port: crate::DEFAULT_HTTPS_PORT,
+            ..Default::default()
+        };
+        c.move_default_https_port();
+        assert_eq!(c.https_port, crate::DEFAULT_HTTPS_PORT + 1);
+        // Nothing moves without a clash, or for a clash on other ports.
+        let mut c = Config::default();
+        c.normalize();
+        assert_eq!(
+            (c.port, c.https_port),
+            (crate::DEFAULT_PORT, crate::DEFAULT_HTTPS_PORT)
+        );
+        let mut c: Config = serde_json::from_str(r#"{"port": 4000, "https_port": 4000}"#).unwrap();
+        c.normalize();
+        assert_eq!(c.https_port, 4000);
+        assert!(validate_https(&c).is_err());
+    }
+
+    #[test]
+    fn validate_tls_files_both_or_neither() {
+        rejects(
+            |c| c.tls_cert_path = Some("cert.pem".into()),
+            "tls_key_path",
+            "missing",
+        );
+        rejects(
+            |c| c.tls_key_path = Some("key.pem".into()),
+            "tls_cert_path",
+            "missing",
+        );
+        rejects(
+            |c| {
+                c.tls_cert_path = Some(PathBuf::new());
+                c.tls_key_path = Some("key.pem".into());
+            },
+            "tls_cert_path",
+            "empty",
+        );
+        assert!(
+            check(|c| {
+                c.tls_cert_path = Some("cert.pem".into());
+                c.tls_key_path = Some("key.pem".into());
+            })
+            .is_ok()
+        );
+        // Unset paths are not written, so a default config's file has neither key.
+        let v = serde_json::to_value(Config::default()).unwrap();
+        assert!(v.get("tls_cert_path").is_none() && v.get("tls_key_path").is_none());
+        assert_eq!(v["https_port"], crate::DEFAULT_HTTPS_PORT);
     }
 
     #[test]

@@ -22,11 +22,14 @@
     <Icon Id="AppIcon.ico" SourceFile="$(var.RepoRoot)\assets\favicon.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
 
-    <!-- Public properties (msiexec /i blue-onyx-prism.msi PORT=32169). An uninstall keeps
+    <!-- Public properties (msiexec /i blue-onyx-prism.msi PORT=8080 HTTPS_PORT=8443). PORT is
+         the plain HTTP port (Blue Iris), HTTPS_PORT the web UI's; both only name the firewall
+         rules: set `port` / `https_port` in the config to the same values. An uninstall keeps
          C:\ProgramData\BlueOnyxPrism; REMOVEDATA=1 on uninstall (msiexec /x blue-onyx-prism.msi
          REMOVEDATA=1) deletes it. KEEPDATA=1 asked for the keeping before it became the default:
          it is still accepted, for old scripts, and wins over REMOVEDATA=1. -->
     <Property Id="PORT" Value="32168" Secure="yes" />
+    <Property Id="HTTPS_PORT" Value="32169" Secure="yes" />
     <Property Id="REMOVEDATA" Secure="yes" />
     <Property Id="KEEPDATA" Secure="yes" />
     <!-- Firewall profiles, NET_FW_PROFILE2 bits: domain (1) + private (2). The Profile attribute
@@ -42,6 +45,8 @@
     <Property Id="MSI_INSTALL_MARKER">
       <RegistrySearch Id="InstallMarkerSearch" Root="HKLM" Key="SOFTWARE\BlueOnyxPrism" Name="Installer" Type="raw" Bitness="always64" />
     </Property>
+    <Launch Condition="Installed OR PORT &lt;&gt; HTTPS_PORT"
+            Message="PORT and HTTPS_PORT are the same port; the service needs two (plain HTTP for Blue Iris, HTTPS for the web UI). Pass two different values, for example PORT=32168 HTTPS_PORT=32169." />
     <Launch Condition="Installed OR WIX_UPGRADE_DETECTED OR (NOT EXISTING_SERVICE_IMAGEPATH) OR MSI_INSTALL_MARKER"
             Message="Blue Onyx Prism is already installed as a service by scripts\install_service.ps1. Run scripts\uninstall_service.ps1 as administrator first, then run this installer again." />
 
@@ -115,6 +120,20 @@
                   Directory="CommonAppDataFolder"
                   ExeCommand="&quot;[System64Folder]icacls.exe&quot; &quot;[CommonAppDataFolder]BlueOnyxPrism\tools\hf&quot; /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-19:(OI)(CI)RX /Q"
                   Execute="deferred" Impersonate="no" Return="ignore" />
+    <!-- <data root>\auth (src/private_dir.rs): the HTTPS certificate's private key, and later the
+         accounts. The data folder's DACL lets Users read, so this folder gets its own protected
+         one: Administrators and SYSTEM full control, LocalService modify (the service writes its
+         certificate there), no Users. Created first (mkdir of an existing folder fails, which is
+         ignored); then Return="check": a folder whose protection failed would hold the key
+         readable by every local account. The service leaves an existing folder's DACL alone. -->
+    <CustomAction Id="EnsureAuthFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]cmd.exe&quot; /c mkdir &quot;[CommonAppDataFolder]BlueOnyxPrism\auth&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="ProtectAuthFolder"
+                  Directory="CommonAppDataFolder"
+                  ExeCommand="&quot;[System64Folder]icacls.exe&quot; &quot;[CommonAppDataFolder]BlueOnyxPrism\auth&quot; /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-19:(OI)(CI)M /Q"
+                  Execute="deferred" Impersonate="no" Return="check" />
     <!-- An uninstall (not the removal of the old version during an upgrade) deletes the program
          folder with whatever the program created in it (e.g. a config or downloads of the console
          exe run from there) when it is the default folder. A folder the user picked may hold
@@ -136,6 +155,8 @@
       <Custom Action="EnsureDataFolder" After="CreateFolders" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="ProtectDataFolder" After="EnsureDataFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="ProtectTokenFolder" After="ProtectDataFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="EnsureAuthFolder" After="ProtectTokenFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="ProtectAuthFolder" After="EnsureAuthFolder" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServiceFailureActions" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServiceFailureFlag" After="SetServiceFailureActions" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServicePrivileges" After="SetServiceFailureFlag" Condition="NOT REMOVE~=&quot;ALL&quot;" />
@@ -176,6 +197,13 @@
                                 Name="Blue Onyx Prism ([PORT])"
                                 Protocol="tcp"
                                 Port="[PORT]"
+                                Scope="localSubnet"
+                                Profile="[BOP_FIREWALL_PROFILES]" />
+        <!-- The web UI's HTTPS port: the same local-subnet scope and profiles. -->
+        <fire:FirewallException Id="BlueOnyxPrismHttpsFirewall"
+                                Name="Blue Onyx Prism HTTPS ([HTTPS_PORT])"
+                                Protocol="tcp"
+                                Port="[HTTPS_PORT]"
                                 Scope="localSubnet"
                                 Profile="[BOP_FIREWALL_PROFILES]" />
       </Component>
@@ -247,7 +275,7 @@
     <ComponentGroup Id="Shortcuts" Directory="StartMenuDir">
       <Component Id="StartMenuComponent" Bitness="always64">
         <Shortcut Id="TrayShortcut" Name="Blue Onyx Prism" Description="Blue Onyx Prism tray icon (start, stop, restart, open the web UI)" Target="[#TrayExe]" WorkingDirectory="INSTALLFOLDER" />
-        <util:InternetShortcut Id="WebUiShortcut" Name="Blue Onyx Prism Web UI" Target="http://127.0.0.1:32168/" />
+        <util:InternetShortcut Id="WebUiShortcut" Name="Blue Onyx Prism Web UI" Target="https://localhost:[HTTPS_PORT]/" />
         <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\BlueOnyxPrism" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
       </Component>

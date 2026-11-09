@@ -1,7 +1,8 @@
 //! Where the tray finds the service: the HTTP port and address (from `--port`, else the
-//! installed service's config when the user can read it, else 32168) and the CLI used to control
-//! the service (`--cli`, else the installed location). The path lookups are thin; the parsing
-//! and address math are pure and unit-tested.
+//! installed service's config when the user can read it, else 32168) it probes, the HTTPS port
+//! of the web UI it opens (`--https-port`, else the config's `https_port`, else 32169), and the
+//! CLI used to control the service (`--cli`, else the installed location). The path lookups are
+//! thin; the parsing and address math are pure and unit-tested.
 
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -9,11 +10,14 @@ use std::path::{Path, PathBuf};
 
 /// Port of the service when nothing says otherwise (CodeProject.AI's).
 pub const DEFAULT_PORT: u16 = 32168;
+/// HTTPS port of the web UI when nothing says otherwise.
+pub const DEFAULT_HTTPS_PORT: u16 = 32169;
 
-/// Port and listen address read from a service config.
+/// Ports and listen address read from a service config.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ServiceListen {
     pub port: Option<u16>,
+    pub https_port: Option<u16>,
     pub bind_address: Option<IpAddr>,
 }
 
@@ -50,17 +54,21 @@ pub fn read_service_listen() -> ServiceListen {
         .unwrap_or_default()
 }
 
-/// `port` and `bind_address` of a config JSON (missing or invalid fields are `None`).
+/// `port`, `https_port` and `bind_address` of a config JSON (missing or invalid fields are
+/// `None`).
 pub fn parse_service_listen(text: &str) -> ServiceListen {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return ServiceListen::default();
     };
-    ServiceListen {
-        port: v
-            .get("port")
+    let port_of = |key: &str| {
+        v.get(key)
             .and_then(Value::as_u64)
             .and_then(|p| u16::try_from(p).ok())
-            .filter(|p| *p != 0),
+            .filter(|p| *p != 0)
+    };
+    ServiceListen {
+        port: port_of("port"),
+        https_port: port_of("https_port"),
         bind_address: v
             .get("bind_address")
             .and_then(Value::as_str)
@@ -81,9 +89,17 @@ pub fn service_addr(arg_port: Option<u16>, listen: ServiceListen) -> SocketAddr 
     SocketAddr::new(ip, port)
 }
 
-/// `http://<addr>/` (IPv6 in brackets).
-pub fn web_ui_url(addr: SocketAddr) -> String {
-    format!("http://{addr}/")
+/// The web UI: `https://localhost:<https port>/` (`localhost` is a name the generated
+/// certificate always holds) when the service listens on loopback or every interface, else
+/// `https://<its address>:<https port>/`. The HTTPS port: `arg`, else the config's, else
+/// [`DEFAULT_HTTPS_PORT`].
+pub fn web_ui_url(addr: SocketAddr, arg: Option<u16>, listen: ServiceListen) -> String {
+    let port = arg.or(listen.https_port).unwrap_or(DEFAULT_HTTPS_PORT);
+    if addr.ip().is_loopback() {
+        format!("https://localhost:{port}/")
+    } else {
+        format!("https://{}/", SocketAddr::new(addr.ip(), port))
+    }
 }
 
 /// File name of the CLI binary.
@@ -124,8 +140,12 @@ mod tests {
 
     #[test]
     fn parses_port_and_bind_address() {
-        let l = parse_service_listen(r#"{"port": 8080, "bind_address": "0.0.0.0", "x": 1}"#);
+        let l = parse_service_listen(
+            r#"{"port": 8080, "https_port": 8443, "bind_address": "0.0.0.0", "x": 1}"#,
+        );
         assert_eq!(l.port, Some(8080));
+        assert_eq!(l.https_port, Some(8443));
+        assert_eq!(parse_service_listen(r#"{"port": 8080}"#).https_port, None);
         assert_eq!(l.bind_address, Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
         assert_eq!(parse_service_listen("not json"), ServiceListen::default());
         assert_eq!(parse_service_listen(r#"{"port": 70000}"#).port, None);
@@ -137,6 +157,7 @@ mod tests {
     fn port_precedence() {
         let cfg = ServiceListen {
             port: Some(9000),
+            https_port: None,
             bind_address: None,
         };
         assert_eq!(service_addr(Some(1234), cfg).port(), 1234);
@@ -154,6 +175,7 @@ mod tests {
                 None,
                 ServiceListen {
                     port: Some(1),
+                    https_port: None,
                     bind_address: Some(b.parse().unwrap()),
                 },
             )
@@ -162,8 +184,32 @@ mod tests {
         assert_eq!(at("::"), "[::1]:1".parse().unwrap());
         assert_eq!(at("127.0.0.1"), "127.0.0.1:1".parse().unwrap());
         assert_eq!(at("192.168.1.5"), "192.168.1.5:1".parse().unwrap());
-        assert_eq!(web_ui_url(at("::")), "http://[::1]:1/");
-        assert_eq!(web_ui_url(at("0.0.0.0")), "http://127.0.0.1:1/");
+        let none = ServiceListen::default();
+        assert_eq!(web_ui_url(at("::"), None, none), "https://localhost:32169/");
+        assert_eq!(
+            web_ui_url(at("0.0.0.0"), None, none),
+            "https://localhost:32169/"
+        );
+        let cfg = ServiceListen {
+            https_port: Some(8443),
+            ..none
+        };
+        assert_eq!(
+            web_ui_url(at("127.0.0.1"), None, cfg),
+            "https://localhost:8443/"
+        );
+        assert_eq!(
+            web_ui_url(at("127.0.0.1"), Some(9443), cfg),
+            "https://localhost:9443/"
+        );
+        assert_eq!(
+            web_ui_url(at("192.168.1.5"), None, cfg),
+            "https://192.168.1.5:8443/"
+        );
+        assert_eq!(
+            web_ui_url(at("fd00::5"), None, none),
+            "https://[fd00::5]:32169/"
+        );
     }
 
     #[test]

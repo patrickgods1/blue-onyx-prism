@@ -19,11 +19,17 @@
     - Restricts the service token: service SID type "unrestricted" (the NT SERVICE\BlueOnyxPrismService
       SID is in the token, so the ACL grants above apply under any account) and required
       privileges SeChangeNotifyPrivilege only (every other privilege is removed from the process)
-    - Configures automatic restart on failure and a firewall rule for the listening port
+    - Creates <data root>\auth (the HTTPS certificate's key) with a protected DACL of its own:
+      Administrators and SYSTEM full control, the service account Modify, no Users
+    - Configures automatic restart on failure and firewall rules for the HTTP and HTTPS ports,
+      both limited to the local subnet
 .PARAMETER InstallDir
     Directory containing blue-onyx-prism-service.exe (default: the parent of this script's folder).
 .PARAMETER Port
-    TCP port to open in Windows Firewall (default 32168).
+    Plain HTTP port (Blue Iris) to open in Windows Firewall (default 32168).
+.PARAMETER HttpsPort
+    HTTPS port of the web UI to open in Windows Firewall (default 32169). Both only name the
+    firewall rules: set `port` / `https_port` in the config to the same values.
 .PARAMETER Account
     Account to run the service as. Default: the virtual account NT SERVICE\BlueOnyxPrismService.
     "LocalSystem" restores the old behavior (full control of the machine; only if GPU access fails
@@ -35,6 +41,7 @@
 param(
     [string]$InstallDir = (Split-Path -Parent $PSScriptRoot),
     [int]$Port = 32168,
+    [int]$HttpsPort = 32169,
     [string]$Account = "",
     [switch]$NoStart
 )
@@ -46,6 +53,9 @@ $DisplayName = "Blue Onyx Prism"
 $EventSource = "BlueOnyxPrism"
 $VirtualAccount = "NT SERVICE\$ServiceName"
 $ConfigName = "blue_onyx_prism_config_service.json"
+if ($HttpsPort -eq $Port) {
+    throw "-Port and -HttpsPort are both $Port; the service needs two ports (plain HTTP for Blue Iris, HTTPS for the web UI). Pass two different values."
+}
 
 # Run sc.exe and fail on a non-zero exit code (sc.exe never throws on its own; it reports
 # errors on stdout, so stderr is not redirected: under "Stop" Windows PowerShell would throw on
@@ -226,10 +236,39 @@ if (-not $useSystem) {
     Write-Host "A save_image_path or log_path added later needs: icacls <dir> /grant `"${svcAcct}:(OI)(CI)M`""
 }
 
-Write-Host "Adding firewall rule for TCP $Port ..."
-$ruleName = "Blue Onyx Prism ($Port)"
-if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow | Out-Null
+# <data root>\auth (src/private_dir.rs): the HTTPS certificate's private key, later the accounts.
+# The install dir lets Users read, so this folder gets a protected DACL of its own (after the
+# reset above, which would otherwise undo it): Administrators and SYSTEM full control, the service
+# account Modify (it writes its certificate there), no Users.
+$dataRoot = $InstallDir
+$cfgFile = Join-Path $InstallDir $ConfigName
+if (Test-Path $cfgFile) {
+    try {
+        $cfgJson = Get-Content -Raw $cfgFile | ConvertFrom-Json
+        $dl = $cfgJson.PSObject.Properties["download_dir"]
+        if ($dl -and $dl.Value) {
+            $dataRoot = if ([System.IO.Path]::IsPathRooted($dl.Value)) { $dl.Value } else { Join-Path $InstallDir $dl.Value }
+        }
+    } catch { Write-Warning "Could not read $cfgFile ($_); protecting $InstallDir\auth." }
+}
+$authDir = Join-Path $dataRoot "auth"
+if (-not (Test-Path $authDir)) { New-Item -ItemType Directory -Force -Path $authDir | Out-Null }
+$authGrants = @("${Admins}:(OI)(CI)F", "${System}:(OI)(CI)F")
+if (-not $useSystem) { $authGrants += "${runAs}:(OI)(CI)M" }
+Invoke-Icacls $authDir /inheritance:r /grant:r @authGrants /Q
+Write-Host "Protected $authDir (Administrators, SYSTEM and the service account only)."
+
+# Both ports, the local subnet only (an existing rule of an older install gets that scope too).
+foreach ($rule in @(
+        @{ Name = "Blue Onyx Prism ($Port)"; Port = $Port },
+        @{ Name = "Blue Onyx Prism HTTPS ($HttpsPort)"; Port = $HttpsPort })) {
+    Write-Host "Firewall rule for TCP $($rule.Port) (local subnet) ..."
+    $existing = Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue
+    if ($existing) {
+        $existing | Set-NetFirewallRule -RemoteAddress LocalSubnet
+    } else {
+        New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Protocol TCP -LocalPort $rule.Port -RemoteAddress LocalSubnet -Action Allow | Out-Null
+    }
 }
 
 if (-not $NoStart) {
@@ -237,7 +276,9 @@ if (-not $NoStart) {
     Start-Service $ServiceName
     Start-Sleep -Seconds 3
     Get-Service $ServiceName | Format-Table -AutoSize
-    Write-Host "First start compiles the models; watch http://127.0.0.1:$Port/ and the Application event log."
+    Write-Host "First start compiles the models; watch https://localhost:$HttpsPort/ (the web UI; the browser warns once"
+    Write-Host "about the self-signed certificate: compare its SHA-256 with 'blue-onyx-prism tls-fingerprint') and the"
+    Write-Host "Application event log. Blue Iris uses http://<this machine>:$Port/."
     Write-Host "If the GPU is not used under $runAs, reinstall with -Account LocalSystem."
 }
 

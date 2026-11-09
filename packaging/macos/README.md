@@ -41,7 +41,10 @@ Gatekeeper blocks a package that is not signed or notarized. Double-click it, di
 then open System Settings > Privacy & Security, scroll to the message about the blocked package and
 click "Open Anyway". Or from Terminal: `sudo installer -pkg <file>.pkg -target /`.
 
-After install open http://127.0.0.1:32168/ (status and configuration).
+After install open https://localhost:32169/ (status and configuration; the browser warns once
+about the self-signed certificate: compare its SHA-256 fingerprint with
+`sudo -u _blueonyx /usr/local/blue-onyx-prism/blue-onyx-prism --config /usr/local/var/blue-onyx-prism/blue_onyx_prism_config.json tls-fingerprint`).
+Blue Iris uses http://<this Mac>:32168/.
 
 ## Uninstall
 

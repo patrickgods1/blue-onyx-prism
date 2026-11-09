@@ -152,6 +152,24 @@ pub enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Print the SHA-256 fingerprint of the HTTPS certificate (to compare with what the browser
+    /// shows before accepting it) and the HTTPS addresses of the web UI. Makes the generated
+    /// certificate when there is none yet; reads `tls_cert_path` when that is set.
+    TlsFingerprint {
+        /// The service's config file (default: <exe_dir>/blue_onyx_prism_config.json;
+        /// `--config` before the subcommand works too).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Replace the generated HTTPS certificate with a new one (a running service switches to
+    /// it by itself; browsers ask once more). Refused when `tls_cert_path` / `tls_key_path` name
+    /// files of your own. Run it as the service's account, with the service's config.
+    TlsRegenerate {
+        /// The service's config file (default: <exe_dir>/blue_onyx_prism_config.json;
+        /// `--config` before the subcommand works too).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Write a diagnostics zip for a bug report: version, OS, devices, resources, the config,
     /// the newest 5 MB of logs, metrics and a benchmark summary (devices and metrics from the
     /// service running on this machine, when it answers). Never frames, labels, datasets or
@@ -284,6 +302,8 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     merge_cli(&mut config, &cli.absolutized(&base));
     // Same names in memory as in the written file (a `--model` entry gets its file stem).
     config.fill_model_names();
+    // `--port 32169` with `https_port` at its default: HTTPS moves aside (see the method).
+    config.move_default_https_port();
     config
         .validate()
         .context("invalid command-line option (the config file was not changed)")?;
@@ -536,6 +556,12 @@ impl Cli {
             Command::ListModels { dir } => Command::ListModels { dir: abs(&dir) },
             Command::AdminToken { rotate, config } => Command::AdminToken {
                 rotate,
+                config: abs(&config),
+            },
+            Command::TlsFingerprint { config } => Command::TlsFingerprint {
+                config: abs(&config),
+            },
+            Command::TlsRegenerate { config } => Command::TlsRegenerate {
                 config: abs(&config),
             },
             Command::Diagnostics { out } => Command::Diagnostics { out: abs(&out) },
@@ -1291,6 +1317,26 @@ mod tests {
         assert!(Cli::try_parse_from(["bop", "hf-login", "--config", "c.json"]).is_err());
         assert!(Cli::try_parse_from(["bop", "hf-login", "--token", "x"]).is_err());
         assert!(Cli::try_parse_from(["bop", "hf-login", "x"]).is_err());
+    }
+
+    #[test]
+    fn tls_commands_take_config_on_either_side() {
+        let base = std::env::temp_dir();
+        for verb in ["tls-fingerprint", "tls-regenerate"] {
+            let cli = Cli::try_parse_from(["x", verb, "--config", "c.json"])
+                .unwrap()
+                .absolutized(&base);
+            let config = match cli.command {
+                Some(Command::TlsFingerprint { config } | Command::TlsRegenerate { config }) => {
+                    config
+                }
+                other => panic!("{verb}: {other:?}"),
+            };
+            assert_eq!(config, Some(base.join("c.json")), "{verb}");
+            let cli = Cli::try_parse_from(["x", "--config", "c.json", verb]).unwrap();
+            assert_eq!(cli.config.as_deref(), Some(Path::new("c.json")));
+            assert!(Cli::try_parse_from(["x", verb, "extra"]).is_err());
+        }
     }
 
     #[test]

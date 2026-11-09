@@ -6,16 +6,20 @@
     keeps only the data folder, a seeded dataset file included; an install over that data with an
     older version's ACL corrects it, and KEEPDATA=1 (old scripts) keeps it again, even with REMOVEDATA=1; a last install
     over it and REMOVEDATA=1 removes everything, the protected token folder too. Each install also
-    checks the data folder's DACL, the service's required privileges, the firewall rule's scope
-    and profiles, and that the service runs on the Visual C++ runtime installed next to it.
+    checks the data folder's DACL, the auth folder's protected DACL, the service's required
+    privileges, both firewall rules' scope and profiles, and that the service runs on the Visual
+    C++ runtime installed next to it.
 .PARAMETER Msi
     Path of the MSI to test.
 .PARAMETER Port
     HTTP port the service listens on (default 32168).
+.PARAMETER HttpsPort
+    HTTPS port of the web UI, for its firewall rule (default 32169).
 #>
 param(
     [Parameter(Mandatory)][string]$Msi,
-    [int]$Port = 32168
+    [int]$Port = 32168,
+    [int]$HttpsPort = 32169
 )
 
 Set-StrictMode -Version Latest
@@ -33,6 +37,8 @@ $Service = "BlueOnyxPrismService"
 $DataDir = Join-Path $env:ProgramData "BlueOnyxPrism"
 $Config = Join-Path $DataDir "blue_onyx_prism_config_service.json"
 $TokenDir = Join-Path $DataDir "tools\hf"
+$AuthDir = Join-Path $DataDir "auth"
+$FirewallRules = @("Blue Onyx Prism ($Port)", "Blue Onyx Prism HTTPS ($HttpsPort)")
 # Stands for what no download brings back (dataset frames, reviewed labels, training runs). In a
 # folder of its own: nothing the service prunes walks it.
 $SeedFile = Join-Path $DataDir "dataset\smoke-test\frame.labels.json"
@@ -155,14 +161,29 @@ function Assert-Hardening([string]$Log) {
     }
     Write-Host "Failure actions apply to non-crash failures."
 
-    $rules = @(Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)")
-    if ($rules.Count -ne 1) { Fail "$($rules.Count) firewall rules named 'Blue Onyx Prism ($Port)', expected 1" @($Log) }
-    $scope = @(($rules[0] | Get-NetFirewallAddressFilter).RemoteAddress)
-    $outside = @($scope | Where-Object { $_ -notlike "LocalSubnet*" })
-    if ($scope.Count -eq 0 -or $outside.Count -gt 0) { Fail "firewall rule remote addresses are '$($scope -join ', ')', expected LocalSubnet" @($Log) }
-    $fwProfiles = "$($rules[0].Profile)"
-    if ($fwProfiles -ne "Domain, Private") { Fail "firewall rule profiles are '$fwProfiles', expected 'Domain, Private'" @($Log) }
-    Write-Host "Firewall rule: $($scope -join ', '), $fwProfiles."
+    # The HTTP port (Blue Iris) and the HTTPS port (web UI): the same scope and profiles.
+    foreach ($name in $FirewallRules) {
+        $rules = @(Get-NetFirewallRule -DisplayName $name)
+        if ($rules.Count -ne 1) { Fail "$($rules.Count) firewall rules named '$name', expected 1" @($Log) }
+        $scope = @(($rules[0] | Get-NetFirewallAddressFilter).RemoteAddress)
+        $outside = @($scope | Where-Object { $_ -notlike "LocalSubnet*" })
+        if ($scope.Count -eq 0 -or $outside.Count -gt 0) { Fail "firewall rule '$name' remote addresses are '$($scope -join ', ')', expected LocalSubnet" @($Log) }
+        $fwProfiles = "$($rules[0].Profile)"
+        if ($fwProfiles -ne "Domain, Private") { Fail "firewall rule '$name' profiles are '$fwProfiles', expected 'Domain, Private'" @($Log) }
+        Write-Host "Firewall rule '$name': $($scope -join ', '), $fwProfiles."
+    }
+
+    # <data root>\auth (HTTPS key): its own protected DACL, nothing for Users.
+    if (-not (Test-Path $AuthDir)) { Fail "$AuthDir was not created" @($Log) }
+    Assert-ExactDacl $AuthDir @{
+        $Administrators = "(OI)(CI)(F)"
+        $LocalSystem    = "(OI)(CI)(F)"
+        $LocalService   = "(OI)(CI)(M)"
+    } @($Log)
+    $authSids = @((Get-Acl -LiteralPath $AuthDir).Access | ForEach-Object {
+        $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value })
+    if ($authSids -contains "S-1-5-32-545") { Fail "$AuthDir has an entry for Users (S-1-5-32-545)" @($Log) }
+    Write-Host "Auth folder DACL is protected; Users have no access."
 }
 
 # What an older version left: the data folder inherits from ProgramData, Users can write, and a
@@ -229,7 +250,7 @@ function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
 
 function Install-AndCheck([string]$Log) {
     Write-Host "Installing $Msi ..."
-    $rc = Run-Msiexec @("/i", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"", "PORT=$Port")
+    $rc = Run-Msiexec @("/i", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"", "PORT=$Port", "HTTPS_PORT=$HttpsPort")
     if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /i exited with $rc" @($Log) }
     Note-RebootWanted $rc $Log
 
@@ -280,8 +301,10 @@ function Install-AndCheck([string]$Log) {
     if (-not (Test-Path $Config)) { Fail "$Config was not created" @($Log) }
     Write-Host "Config present: $Config"
 
-    if (-not (Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)" -ErrorAction SilentlyContinue)) {
-        Fail "firewall rule 'Blue Onyx Prism ($Port)' missing after install" @($Log)
+    foreach ($name in $FirewallRules) {
+        if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
+            Fail "firewall rule '$name' missing after install" @($Log)
+        }
     }
     Assert-Hardening $Log
 
@@ -324,8 +347,10 @@ function Uninstall-AndCheck([string]$Log, [string[]]$Properties = @()) {
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Service $Service -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
     if (Get-Service $Service -ErrorAction SilentlyContinue) { Fail "service $Service still registered after uninstall" @($Log) }
-    if (Get-NetFirewallRule -DisplayName "Blue Onyx Prism ($Port)" -ErrorAction SilentlyContinue) {
-        Fail "firewall rule 'Blue Onyx Prism ($Port)' still present after uninstall" @($Log)
+    foreach ($name in $FirewallRules) {
+        if (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue) {
+            Fail "firewall rule '$name' still present after uninstall" @($Log)
+        }
     }
     if (Test-Path $ProgDir) {
         $left = (Get-ChildItem -Path $ProgDir -Recurse -Force | ForEach-Object { $_.FullName }) -join ", "

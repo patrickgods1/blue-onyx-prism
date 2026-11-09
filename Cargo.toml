@@ -97,6 +97,14 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 ipnet = "=2.12.2"
 # `hf-login` reads the Hugging Face token without echoing it.
 rpassword = "7.5.4"
+# The HTTPS listener (`tls`, `server::serve_on`): rustls with aws-lc-rs, the provider reqwest
+# already builds, installed explicitly. Both are already in the tree through reqwest.
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+# The self-signed certificate of the HTTPS listener (`tls`): ECDSA P-256 through aws-lc-rs.
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+# The dates rcgen takes; already in the tree through rcgen and tracing-appender.
+time = { version = "=0.3.55", default-features = false, features = ["std"] }
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11"

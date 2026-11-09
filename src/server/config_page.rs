@@ -34,6 +34,9 @@ const RESTART_DELAY: Duration = Duration::from_millis(250);
 pub(super) struct ConfigView {
     port: String,
     bind_address: String,
+    https_port: String,
+    tls_cert_path: String,
+    tls_key_path: String,
     allow_remote_admin: bool,
     allowed_hosts: String,
     allowed_networks: String,
@@ -83,6 +86,17 @@ impl ConfigView {
         Self {
             port: c.port.to_string(),
             bind_address: c.bind_address.to_string(),
+            https_port: c.https_port.to_string(),
+            tls_cert_path: c
+                .tls_cert_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            tls_key_path: c
+                .tls_key_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             allow_remote_admin: c.allow_remote_admin,
             allowed_hosts: c.allowed_hosts.join(", "),
             allowed_networks: c.allowed_networks.join(", "),
@@ -746,9 +760,9 @@ pub(super) enum ApplyWhen {
 }
 
 impl ApplyWhen {
-    /// The global config fields only a process restart applies; the same set
-    /// [`crate::config_merge::pending`] reports as "needs a process restart" (a test checks it).
-    const PROCESS: &[&str] = &["port", "bind_address", "log_path", "log_format"];
+    /// The global config fields only a process restart applies: the set
+    /// [`crate::config_merge::pending`] reports as "needs a process restart".
+    const PROCESS: &[&str] = crate::config_merge::PROCESS_GLOBALS;
 
     pub(super) fn of(key: &str) -> Self {
         if crate::config_merge::live_global(key) {
@@ -2126,6 +2140,9 @@ mod tests {
         let mut c = base.clone();
         c.port = base.port.wrapping_add(1);
         c.bind_address = "127.0.0.1".parse().unwrap();
+        c.https_port = base.https_port.wrapping_add(1);
+        c.tls_cert_path = Some("cert.pem".into());
+        c.tls_key_path = Some("key.pem".into());
         c.log_path = Some("logs-elsewhere".into());
         c.log_format = match base.log_format {
             crate::config::LogFormat::Text => crate::config::LogFormat::Json,

@@ -89,7 +89,10 @@ fn service_command(cmd: cli::ServiceCommand) -> Result<i32> {
 
 /// `admin-token`: the token on stdout, nothing else there. No config file means this is not the
 /// service's data root, and a token made here would be one nobody checks, so that is an error.
-fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Result<()> {
+/// The service's config for a command that works on its data root: the subcommand's
+/// `--config`, else the global one, else the default path; it must exist (`what` names what
+/// could not be found otherwise).
+fn service_config(cli: &Cli, config: Option<PathBuf>, what: &str) -> Result<Config> {
     let cli = Cli {
         config: config.or_else(|| cli.config.clone()),
         ..cli.clone()
@@ -97,12 +100,16 @@ fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Resu
     let file = config_path(&cli);
     if !file.is_file() {
         anyhow::bail!(
-            "there is no config file at {}, so the service's token cannot be found; pass the \
+            "there is no config file at {}, so the service's {what} cannot be found; pass the \
              service's config with --config <file> (it is named in the service's start command)",
             file.display()
         );
     }
-    let path = blue_onyx_prism::admin_token::path(&read_config(&cli)?);
+    read_config(&cli)
+}
+
+fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Result<()> {
+    let path = blue_onyx_prism::admin_token::path(&service_config(cli, config, "token")?);
     let token = if rotate {
         let token = blue_onyx_prism::admin_token::rotate(&path)?;
         eprintln!(
@@ -440,6 +447,18 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::HfLogout) => return resources::hf_token::logout(&read_config(&cli)?),
         Some(Command::AdminToken { rotate, config }) => {
             return admin_token_command(&cli, rotate, config);
+        }
+        Some(Command::TlsFingerprint { config }) => {
+            let _log = cli::init_logging(LogLevel::Warn, None)?;
+            let config = service_config(&cli, config, "HTTPS certificate")?;
+            print!("{}", blue_onyx_prism::tls::fingerprint_report(&config)?);
+            return Ok(());
+        }
+        Some(Command::TlsRegenerate { config }) => {
+            let _log = cli::init_logging(LogLevel::Warn, None)?;
+            let config = service_config(&cli, config, "HTTPS certificate")?;
+            print!("{}", blue_onyx_prism::tls::regenerate_report(&config)?);
+            return Ok(());
         }
         Some(Command::Diagnostics { out }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;

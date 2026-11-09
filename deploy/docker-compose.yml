@@ -43,6 +43,12 @@ services:
       # with the admin token, which is in the `data` volume; read it with
       # docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json admin-token
       - "127.0.0.1:32168:32168"
+      # The web UI over HTTPS, on this host only too. The certificate is self-signed and kept in
+      # the `data` volume; compare the browser's SHA-256 fingerprint with the one this prints:
+      # docker exec blue-onyx-prism /app/blue-onyx-prism --config /app/config/blue_onyx_prism_config.json tls-fingerprint
+      # To reach it from your PC, bind a LAN address of this host (`192.168.1.10:32169:32169`)
+      # rather than all interfaces, or use an SSH tunnel.
+      - "127.0.0.1:32169:32169"
       # Blue Iris on another machine: use this line instead. allow_remote_admin then offers the
       # login page to the whole LAN, and the token goes over plain HTTP: keep it false and edit
       # the config file in ./config (then `docker compose restart`), or turn it on only on a
