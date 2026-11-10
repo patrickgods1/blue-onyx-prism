@@ -180,6 +180,41 @@
     keysDialog.className = 'rv-keys-dialog';
     document.body.appendChild(keysDialog);
   }
+  // One column: the overview over the frame while it is zoomed (the whole frame, the boxes, the
+  // part the frame below shows); an older page gets one made here.
+  var overview = $('rv-overview');
+  if (!overview) {
+    overview = document.createElement('canvas');
+    overview.id = 'rv-overview';
+    overview.width = 1;
+    overview.height = 1;
+    overview.hidden = true;
+    overview.setAttribute('aria-label', 'Overview of the whole frame: the outlined part is the one shown below. Tap a box to select it, or tap elsewhere to move the view there.');
+    canvas.parentNode.insertBefore(overview, canvas);
+  }
+  overview.classList.add('rv-overview');
+  var stage = canvas.closest('.review-stage');
+  // One column: the selected box's main answers in the bar at the screen's foot while boxes still
+  // need a decision (renderDecision); empty and hidden otherwise.
+  var decideBar = $('rv-decide-bar');
+  var actionsBox = side && side.querySelector('.rv-actions');
+  if (!decideBar && side) {
+    decideBar = el('div', 'rv-decide-bar');
+    decideBar.id = 'rv-decide-bar';
+    decideBar.hidden = true;
+    side.insertBefore(decideBar, actionsBox ? actionsBox.nextSibling : null);
+  }
+  // One column: "Boxes (N) and options" folds the box list, the session line and Panel options.
+  var listToggle = $('rv-list-toggle');
+  if (!listToggle && emptyBox) {
+    var emptyLabel = emptyBox.closest('label') || emptyBox;
+    listToggle = el('button', 'small secondary rv-list-toggle', 'Boxes and options');
+    listToggle.type = 'button';
+    listToggle.id = 'rv-list-toggle';
+    listToggle.setAttribute('aria-controls', 'rv-boxes');
+    emptyLabel.parentNode.insertBefore(listToggle, emptyLabel.nextSibling);
+  }
+  var listOpen = pref('list', false);
 
   var cur = null;      // answer of GET /v1/review/labels (with `revision`)
   var img = null;       // the frame image
@@ -641,6 +676,10 @@
     clampView();
   }
 
+  // The touch UI's Zoom to box / Fit toggle reads Fit (and fits) while following the selection,
+  // or when there is no box to zoom to.
+  function zoomBoxFits() { return view.follow || !boxes()[selected]; }
+
   // `x`: zoom to the selected box and keep following the selection (Fit, the wheel or a pan stop it).
   function zoomToSelected() {
     var b = boxes()[selected];
@@ -673,9 +712,27 @@
 
   function updateViewUi() {
     var zoomed = view.z > 1;
-    if (fitBtn) fitBtn.hidden = !zoomed;
-    if (zoomBoxBtn) zoomBoxBtn.hidden = !boxes()[selected];
+    var sb = boxes()[selected];
+    if (touchUi.matches) {
+      // One toggle: Fit while following the selection (or with no box to zoom to), else Zoom to box.
+      if (fitBtn) fitBtn.hidden = true;
+      if (zoomBoxBtn) {
+        zoomBoxBtn.textContent = zoomBoxFits() ? 'Fit' : 'Zoom to box';
+        zoomBoxBtn.hidden = !sb && !zoomed;
+        // Its text names what a tap does; no pressed state (a filled "Fit" reads as the main action).
+        zoomBoxBtn.removeAttribute('aria-pressed');
+      }
+    } else {
+      if (fitBtn) fitBtn.hidden = !zoomed;
+      if (zoomBoxBtn) {
+        zoomBoxBtn.textContent = 'Zoom to box';
+        zoomBoxBtn.hidden = !sb;
+        zoomBoxBtn.removeAttribute('aria-pressed');
+      }
+    }
     if (zoomText) zoomText.textContent = zoomed ? Math.round(view.z * 100) + '%' : '';
+    // The touch UI has the image setting in the View menu.
+    if (imgBtn) imgBtn.hidden = touchUi.matches;
     if (imgBtn) {
       imgBtn.textContent = imgLabel();
       imgBtn.title = touchUi.matches
@@ -697,6 +754,9 @@
   var noHover = media('(hover: none)');
   // A finger is the main pointer (phones, tablets).
   var coarse = media('(pointer: coarse)');
+  // One column: the frame below the overview is the editor, so it follows the selected box unless
+  // the viewer chose Fit (`follow`, per viewer; loadFrame takes it again on each frame).
+  if (oneColumn.matches) view.follow = pref('follow', true);
 
   // The box's shorter side as drawn, CSS pixels.
   function boxSideCss(bb) {
@@ -741,11 +801,18 @@
     var src = viewSource();
     if (src) ctx.drawImage(src, 0, 0, W, H);
     drawCrop();
+    drawOverview();
     if (!cur || hideBoxes) { drawTapMarker(); return; }
     var lw = lineWidth() / z;
-    var font = Math.max(12, Math.round(W / 70)) / z;
-    var pad = 4 / z;
+    // Tags keep one size on screen at any zoom; on the touch UI they grow with the zoom up to
+    // 11 CSS px (a large frame on a phone has them tiny at zoom 1).
+    var base = Math.max(12, Math.round(W / 70));
+    var fpx = touchUi.matches ? Math.max(base, Math.min(11 * cssScale(), base * z)) : base;
+    var font = fpx / z;
+    var pad = 4 * fpx / base / z;
     var th = font + pad;
+    // The part of the frame in view: tags are placed against it.
+    var vx0 = view.ox, vy0 = view.oy, vx1 = view.ox + W / z, vy1 = view.oy + H / z;
     ctx.font = font + 'px system-ui, sans-serif';
     ctx.textBaseline = 'bottom';
     var spot = spotlit();
@@ -821,12 +888,10 @@
         var text = (role === 'drop' ? 'drop? ' : (role === 'keep' ? 'keep ' : '')) +
           ((full || b.state === 'pending' || !b._checked) ? tagText(b, i) : String(i + 1));
         var tw = ctx.measureText(text).width + 2 * pad;
-        // Above the box; at the frame top below it when there is room; else inside its top.
-        var top;
-        if (y >= th) top = y - th;
-        else if (b.bbox[3] + th <= H) top = b.bbox[3];
-        else top = y;
-        var tx = clamp(x, 0, Math.max(0, W - tw));
+        // Above the box; at the view's top below it when there is room; else inside its top
+        // (ReviewTouch.tagTop); across, kept in view.
+        var top = window.ReviewTouch.tagTop(b.bbox, vy0, vy1, th);
+        var tx = clamp(x, vx0, Math.max(vx0, vx1 - tw));
         ctx.fillStyle = color;
         ctx.fillRect(tx, top, tw, th);
         ctx.fillStyle = '#000000';
@@ -902,10 +967,12 @@
 
   // The close-up: the selected box with a 40% margin, enlarged to the panel's width (a box under
   // 120 px at least 2x, at most 8x; the view then centres on the box), from the full-size image.
+  // Two columns only: on one column the frame itself is the close-up (it follows the selected box)
+  // and the overview over it shows where that is.
   function drawCrop() {
     if (!cropCanvas) return;
     var b = boxes()[selected];
-    if (!b || !img || !img.complete || !img.naturalWidth) { cropWrap.hidden = true; return; }
+    if (!b || !img || !img.complete || !img.naturalWidth || oneColumn.matches) { cropWrap.hidden = true; return; }
     cropWrap.hidden = false;
     var W = canvas.width, H = canvas.height;
     var bw = Math.max(1, b.bbox[2] - b.bbox[0]), bh = Math.max(1, b.bbox[3] - b.bbox[1]);
@@ -913,8 +980,6 @@
     // Its height follows the window: the decision bar and the list stay in view under it.
     var winH = cropWindowHeight();
     var ah = Math.round(Math.max(140, Math.min(wideSide ? 340 : 240, winH * (wideSide ? 0.36 : 0.22))));
-    // One column: the frame, this and the question share the screen.
-    if (oneColumn.matches) ah = Math.round(Math.max(100, Math.min(240, winH * 0.16)));
     var mw = bw * 1.8, mh = bh * 1.8;
     var scale = Math.min(aw / mw, ah / mh);
     if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
@@ -980,6 +1045,104 @@
     c.font = thin;
     c.fillText(extra, tx + pad + mw, top + th / 2);
   }
+
+  // The overview (one column, while the frame is zoomed): the whole frame at the overview's CSS
+  // width (x devicePixelRatio), every shown box as a thin outline, the selected one thicker on a
+  // white line, and a veil outside the part the frame below shows. Held while a gesture runs: the
+  // frame would move under the fingers of a pinch that crossed zoom 1.
+  var overviewCache = null;   // {img, src, key, w, h, canvas}: the frame at the overview's size
+  function drawOverview() {
+    if (!overview) return;
+    var show = !!(oneColumn.matches && cur && view.z > 1);
+    if (gesture) show = !overview.hidden;
+    if (overview.hidden === show) overview.hidden = !show;
+    if (stage) stage.classList.toggle('rv-ov-on', show);
+    if (!show) return;
+    var W = canvas.width, H = canvas.height;
+    var dpr = window.devicePixelRatio || 1;
+    var cssW = overview.getBoundingClientRect().width || overview.clientWidth || 300;
+    var pw = Math.max(1, Math.round(cssW * dpr)), ph = Math.max(1, Math.round(pw * H / W));
+    if (overview.width !== pw) overview.width = pw;
+    if (overview.height !== ph) overview.height = ph;
+    var c = overview.getContext('2d');
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, pw, ph);
+    var src = viewSource();
+    if (src) {
+      // Scaled down once per frame, setting and size (a pinch redraws this on every move).
+      var vkey = imgMode() + ':' + imgView.gamma;
+      var oc0 = overviewCache;
+      if (!oc0 || oc0.img !== img || oc0.src !== src || oc0.key !== vkey || oc0.w !== pw || oc0.h !== ph) {
+        var oc = (overviewCache && overviewCache.canvas) || document.createElement('canvas');
+        oc.width = pw; oc.height = ph;
+        var occ = oc.getContext('2d');
+        occ.imageSmoothingEnabled = true;
+        occ.imageSmoothingQuality = 'high';
+        occ.drawImage(src, 0, 0, pw, ph);
+        overviewCache = { img: img, src: src, key: vkey, w: pw, h: ph, canvas: oc };
+      }
+      c.drawImage(overviewCache.canvas, 0, 0);
+    }
+    var k = pw / W;
+    var sb = boxes()[selected];
+    if (!hideBoxes) {
+      boxes().forEach(function (b, i) {
+        if (i === selected || !isShown(b)) return;
+        c.lineWidth = 1.25 * dpr;
+        c.strokeStyle = COLORS[look(b)] || '#ffffff';
+        c.strokeRect(b.bbox[0] * k, b.bbox[1] * k, (b.bbox[2] - b.bbox[0]) * k, (b.bbox[3] - b.bbox[1]) * k);
+      });
+      if (sb && !isOff(sb)) {
+        var r = [sb.bbox[0] * k, sb.bbox[1] * k, (sb.bbox[2] - sb.bbox[0]) * k, (sb.bbox[3] - sb.bbox[1]) * k];
+        c.lineWidth = 4.5 * dpr;
+        c.strokeStyle = '#ffffff';
+        c.strokeRect(r[0], r[1], r[2], r[3]);
+        c.lineWidth = 2.25 * dpr;
+        c.strokeStyle = COLORS[look(sb)] || '#ffffff';
+        c.strokeRect(r[0], r[1], r[2], r[3]);
+      }
+    }
+    // The veil outside the part in view, and its outline.
+    var vx = view.ox * k, vy = view.oy * k, vw = W / view.z * k, vh = H / view.z * k;
+    c.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    c.beginPath();
+    c.rect(0, 0, pw, ph);
+    c.rect(vx, vy, vw, vh);
+    c.fill('evenodd');
+    c.lineWidth = 1.5 * dpr;
+    c.strokeStyle = '#ffffff';
+    c.strokeRect(vx, vy, vw, vh);
+  }
+
+  // A tap on the overview selects the smallest shown box there (ReviewTouch.pickBox), else moves
+  // the frame's view to centre on that point at the same zoom. A drag stays the page's (scroll).
+  var overviewDown = null;   // {id, x, y}: the primary pointer down on the overview
+  overview.addEventListener('pointerdown', function (ev) {
+    overviewDown = ev.button === 0 ? { id: ev.pointerId, x: ev.clientX, y: ev.clientY } : null;
+  });
+  overview.addEventListener('pointercancel', function () { overviewDown = null; });
+  overview.addEventListener('pointerup', function (ev) {
+    var d = overviewDown;
+    overviewDown = null;
+    if (!d || d.id !== ev.pointerId || !cur || overview.hidden) return;
+    if (Math.abs(ev.clientX - d.x) > TAP_CSS || Math.abs(ev.clientY - d.y) > TAP_CSS) return;
+    var r = overview.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    var W = canvas.width, H = canvas.height;
+    var x = (ev.clientX - r.left) * W / r.width, y = (ev.clientY - r.top) * H / r.height;
+    var idx = [], rects = [];
+    if (!hideBoxes) {
+      boxes().forEach(function (b, i) { if (isShown(b)) { idx.push(i); rects.push(b.bbox); } });
+    }
+    // A finger on a small overview: a few CSS px of slack around each box.
+    var hit = window.ReviewTouch.pickBox(rects, x, y, 6 * W / r.width);
+    if (hit >= 0) { select(idx[hit], false); return; }
+    view.follow = false;
+    view.ox = x - W / view.z / 2;
+    view.oy = y - H / view.z / 2;
+    clampView();
+    draw();
+  });
 
   // ---- side panel ---------------------------------------------------------------------------
 
@@ -1157,13 +1320,15 @@
     [0, 1, 2, 3].forEach(function (r) {
       bs.forEach(function (b, i) { if (rank(b) === r) order.push(i); });
     });
-    var offScreen = 0, unwanted = 0, putAway = 0;
+    var offScreen = 0, unwanted = 0, putAway = 0, listed = 0;
     order.forEach(function (i) {
       if (isUnwanted(bs[i])) { unwanted++; return; }
       if (isPutAway(bs[i])) { putAway++; return; }
       if (!isShown(bs[i])) { offScreen++; return; }
       boxList.appendChild(boxItem(bs[i], i));
+      listed++;
     });
+    showListToggle(listed);
     if (offScreen) {
       boxList.appendChild(el('li', 'muted', offScreen + ' box(es) of other classes hidden by "Show boxes of" (still saved).'));
     }
@@ -1175,6 +1340,24 @@
     renderTools();
     renderDecision();
   }
+
+  // One column: the fold of the box list, the session line and Panel options (closed by default,
+  // per viewer); `n` boxes in the list.
+  function showListToggle(n) {
+    root.classList.toggle('rv-list-open', listOpen);
+    if (!listToggle) return;
+    listToggle.textContent = 'Boxes (' + n + ') and options ' + (listOpen ? '▴' : '▾');
+    listToggle.setAttribute('aria-expanded', listOpen ? 'true' : 'false');
+  }
+  if (listToggle) {
+    listToggle.addEventListener('click', function () {
+      listOpen = !listOpen;
+      setPref('list', listOpen);
+      renderSide();
+      if (listOpen) revealSelected();
+    });
+  }
+  showListToggle(0);
 
   // "Accept likely (N)" and "Show N hidden" beside the box list.
   function renderTools() {
@@ -1229,9 +1412,21 @@
     return b;
   }
 
+  // One column while a box is selected and boxes still need a decision (or a check): the selected
+  // box's main answers sit in the bar at the screen's foot, Save & next and its row go in the flow.
+  function deciding() {
+    if (!oneColumn.matches || !cur || !boxes()[selected]) return false;
+    var p = progress();
+    return p.undecided + p.unchecked > 0;
+  }
+
   // The decision bar: the selected box's question, its answers, the frame's progress.
   function renderDecision() {
     decide.textContent = '';
+    var inBar = deciding();
+    root.classList.toggle('rv-deciding', inBar);
+    if (decideBar) { decideBar.textContent = ''; decideBar.hidden = !inBar; }
+    placeAcceptAll();
     if (!cur) return;
     var sugBlock = suggestionBlock();
     if (sugBlock) decide.appendChild(sugBlock);
@@ -1276,12 +1471,15 @@
       if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
       var rp = b.state === 'pending' ? repeatOf(b) : null;
       var btns = el('div', 'rv-q-btns');
-      btns.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
-      btns.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
+      // The main answers: in the card, or (one column, deciding) in the bar at the foot, which
+      // leaves the card the other answers as one compact row.
+      var answers = inBar && decideBar ? decideBar : btns;
+      answers.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
+      answers.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
       if (b.source !== 'human') {
         var parked = decideButton('Real, parked', 't', 'ok', parkSelected);
         parked.title = 'A real object that stays put: accept it and remember the spot, so that auto-label runs accept it there (same class, a close match) unless the VLM sees nothing';
-        btns.appendChild(parked);
+        answers.appendChild(parked);
       }
       if (b.auto_label && b.auto_label !== b.label) {
         var al = b.auto_label;
@@ -1439,7 +1637,8 @@
     if (page) {
       var dr = decide.getBoundingClientRect();
       // Over the bottom bar counts as off screen (`scroll-margin-bottom` on the panel keeps it clear).
-      var bar = oneColumn.matches && $('rv-save').parentNode.getBoundingClientRect().height || 0;
+      var sticky = decideBar && !decideBar.hidden ? decideBar : $('rv-save').parentNode;
+      var bar = oneColumn.matches && sticky.getBoundingClientRect().height || 0;
       if (dr.top < 0 || dr.bottom > window.innerHeight - bar) decide.scrollIntoView({ block: 'nearest' });
     }
   }
@@ -2423,7 +2622,20 @@
     zoomAt(c[0], c[1], factor);
   }, { passive: false });
   if (fitBtn) fitBtn.addEventListener('click', function () { fit(); canvas.focus({ preventScroll: true }); });
-  if (zoomBoxBtn) zoomBoxBtn.addEventListener('click', function () { zoomToSelected(); canvas.focus({ preventScroll: true }); });
+  if (zoomBoxBtn) {
+    zoomBoxBtn.addEventListener('click', function () {
+      if (!touchUi.matches) zoomToSelected();
+      else if (zoomBoxFits()) {
+        // One column remembers the choice for the next frames.
+        if (view.follow && oneColumn.matches) setPref('follow', false);
+        fit();
+      } else {
+        zoomToSelected();
+        if (oneColumn.matches) setPref('follow', true);
+      }
+      canvas.focus({ preventScroll: true });
+    });
+  }
   if (drawBtn) drawBtn.addEventListener('click', function () { setDrawMode(!drawMode); });
   if (redrawBtn) redrawBtn.addEventListener('click', startRedraw);
 
@@ -2445,6 +2657,8 @@
   var VIEW_ACTIONS = {
     'zoom-in': function () { zoomCentre(1.5); },
     'zoom-out': function () { zoomCentre(1 / 1.5); },
+    fit: function () { fit(); },
+    image: cycleImg,
     hide: function () { hideBoxes = !hideBoxes; draw(); },
     labels: toggleTags,
     spotlight: toggleSpotlight,
@@ -2452,6 +2666,17 @@
     darker: function () { stepGamma(-1); },
     reset: function () { setImgView('auto', 1); }
   };
+  // Fit whole frame and the image setting (`b`): an older page gets them made here.
+  var viewItems = viewMenu && viewMenu.querySelector('.rv-view-items');
+  if (viewItems) {
+    [['fit', 'Fit whole frame', 'hide'], ['image', 'Image', 'brighter']].forEach(function (v) {
+      if (viewItems.querySelector('button[data-view="' + v[0] + '"]')) return;
+      var vb = el('button', 'small secondary', v[1]);
+      vb.type = 'button';
+      vb.setAttribute('data-view', v[0]);
+      viewItems.insertBefore(vb, viewItems.querySelector('button[data-view="' + v[2] + '"]'));
+    });
+  }
   if (viewMenu) {
     viewMenu.addEventListener('click', function (ev) {
       var btn = ev.target.closest && ev.target.closest('button[data-view]');
@@ -2488,6 +2713,7 @@
       Array.prototype.forEach.call(viewMenu.querySelectorAll('button[data-view]'), function (b) {
         var k = b.getAttribute('data-view');
         if (k in pressed) b.setAttribute('aria-pressed', pressed[k] ? 'true' : 'false');
+        if (k === 'image') b.textContent = imgLabel();
       });
     }
   }
@@ -2513,12 +2739,15 @@
   touchViewUi();
 
   // "Accept proposals" (Shift+A): on one column the bar shows "Accept likely" in its place when
-  // the frame has likely boxes, and it moves to the row of Skip / Back / Next.
+  // the frame has likely boxes, and it moves to the row of Skip / Back / Next (not while deciding:
+  // then the answers have the bar and Accept likely is beside the box list).
   var acceptAllBtn = $('rv-accept-all');
   var moreRow = document.querySelector('.rv-actions-more');
   function placeAcceptAll() {
     if (!acceptAllBtn || !likelyBar || !moreRow) return;
-    var away = oneColumn.matches && !likelyBar.hidden;
+    // While deciding, Accept likely is beside the box list (the bar holds the answers): Accept
+    // proposals keeps its place in the row of Save & next.
+    var away = oneColumn.matches && !likelyBar.hidden && !root.classList.contains('rv-deciding');
     if (away && acceptAllBtn.parentNode !== moreRow) moreRow.insertBefore(acceptAllBtn, moreRow.firstChild);
     else if (!away && acceptAllBtn.parentNode === moreRow) likelyBar.parentNode.insertBefore(acceptAllBtn, likelyBar.nextSibling);
   }
@@ -2782,6 +3011,7 @@
       canvas.height = j.height || 360;
       // The CSS size keeps this ratio (style.css caps a tall frame at the window's height).
       canvas.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
+      overview.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
       view.z = 1; view.ox = 0; view.oy = 0;
       hoverIdx = -1;
       selected = nextUndecided(-1);
@@ -2790,6 +3020,8 @@
       suggestions = liveSuggestions();
       if (suggestions.length) selected = suggestionBox(suggestions[0]);
       var draftNote = restoreDraft(j);
+      // One column: following is the viewer's choice again (a pinch on the last frame stopped it).
+      if (oneColumn.matches) view.follow = pref('follow', true);
       // Following (`x`): the new frame opens zoomed on its first box.
       if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
       img = new Image();

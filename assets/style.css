@@ -919,7 +919,7 @@ button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(
 .rv-q-reason { align-items: center; gap: 0.15rem; font-size: 0.8rem; margin-top: 0.3rem; }
 .rv-q-reason button.small { padding: 0 0.25rem; font-size: 0.72rem; line-height: 1.35; }
 .rv-q-reason > span { margin-right: 0.15rem; }
-.rv-decide kbd, .rv-q-classes kbd, .rv-q-reason kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: normal; padding: 0 0.3rem; border: 1px solid currentColor; border-radius: 3px; }
+.rv-decide kbd, .rv-decide-bar kbd, .rv-q-classes kbd, .rv-q-reason kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: normal; padding: 0 0.3rem; border: 1px solid currentColor; border-radius: 3px; }
 .rv-decide .rv-q-reason kbd { font-size: 0.6rem; padding: 0 0.15rem; margin-right: 0.15rem; border: 0; }
 .rv-progress { display: flex; flex-direction: column; gap: 0.15rem; margin-top: 0.45rem; font-size: 0.8rem; }
 .rv-progress progress { width: 100%; max-width: none; height: 0.45rem; accent-color: #2e9e4f; }
@@ -930,7 +930,9 @@ button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(
 .rv-q-sug .rv-chip { display: block; margin-top: 0.25rem; white-space: normal; }
 .rv-q-spot { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
 .rv-q-spot button.small { margin: 0; padding: 0.1rem 0.45rem; font-size: 0.78rem; }
-.rv-decide button.suggest { box-shadow: 0 0 0 2px currentColor; }
+.rv-decide button.suggest, .rv-decide-bar button.suggest { box-shadow: 0 0 0 2px currentColor; }
+/* One column only (the max-width: 900px block below). */
+.rv-decide-bar, .rv-list-toggle { display: none; }
 .review-side > .rv-session { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; font-size: 0.8rem; margin: 0.2rem 0 0; }
 .review-side > .rv-session:empty { display: none; }
 .rv-session .rv-chip button.small { margin: 0 0 0 0.2rem; padding: 0 0.35rem; font-size: 0.75rem; }
@@ -966,6 +968,9 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .review-stage canvas[data-cursor=nesw] { cursor: nesw-resize; } .review-stage canvas[data-cursor=ns] { cursor: ns-resize; }
 .review-stage canvas[data-cursor=ew] { cursor: ew-resize; }
 .review-stage canvas[hidden] { display: none; }
+/* One column, the frame zoomed: the whole frame over it, a tap selects a box or moves the view
+   there (review.js drawOverview); a drag scrolls the page. Its height is right before it is drawn. */
+.review-stage canvas.rv-overview { width: min(100%, calc(28svh * var(--rv-ar, 1.78))); height: auto; aspect-ratio: var(--rv-ar, 1.78); margin: 0 auto 0.3rem; cursor: pointer; touch-action: manipulation; }
 .review-meta-row { display: flex; align-items: flex-start; gap: 0.5rem; }
 .review-meta-row .review-meta { flex: 1 1 auto; min-width: 0; }
 .review-meta-row button.small { margin: 0; flex: none; }
@@ -980,6 +985,7 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .rv-view-menu[open] > summary { border-color: var(--accent); }
 .rv-view-items { position: absolute; right: 0; top: calc(100% + 0.25rem); z-index: 30; display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; width: max-content; max-width: calc(100vw - 2rem); padding: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); }
 .rv-view-items button.small { margin: 0; }
+.rv-view-items button[data-view=image] { grid-column: 1 / -1; }
 .rv-view-items button[aria-pressed=true] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 .review-crop { margin: 0 0 0.2rem; }
 .review-crop[hidden] { display: none; }
@@ -1652,7 +1658,7 @@ td.tr-bal-bars { vertical-align: middle; }
 
 /* ---- Review: frame, question, answers, Save on one screen ---- */
 @media (hover: none) {
-  .rv-decide kbd, .rv-q-classes kbd, .rv-q-reason kbd { display: none; }
+  .rv-decide kbd, .rv-decide-bar kbd, .rv-q-classes kbd, .rv-q-reason kbd { display: none; }
   .review-stage canvas:focus-visible { outline: none; }
   #rv-keys-open { display: none; }
 }
@@ -1662,13 +1668,16 @@ td.tr-bal-bars { vertical-align: middle; }
   .review-side > #rv-decide { order: 2; scroll-margin-bottom: 5.5rem; }
   .review-side > #rv-msg { order: 3; }
   .rv-actions { display: contents; }
-  .rv-actions-more { order: 4; display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.2rem 0; }
+  .review-side > #rv-box-tools { order: 4; }
+  .rv-actions-more { order: 5; display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.2rem 0; }
   .rv-actions-more button { flex: 1 1 0; margin: 0; }
-  .review-side > #rv-box-tools { order: 5; }
-  .review-side > .review-boxes { order: 6; max-height: none; overflow: visible; }
   .review-side > label.check { order: 7; }
-  .review-side > #rv-session { order: 8; }
-  .review-side > #rv-panel-opts { order: 9; }
+  .review-side > .rv-list-toggle { order: 8; display: block; align-self: stretch; text-align: left; margin: 0.2rem 0; }
+  .review-side > .review-boxes { order: 9; max-height: none; overflow: visible; }
+  .review-side > #rv-session { order: 10; }
+  .review-side > #rv-panel-opts { order: 11; }
+  /* "Boxes (N) and options" folds what is used less (review.js, per viewer). */
+  #review:not(.rv-list-open) .review-side > .review-boxes, #review:not(.rv-list-open) .review-side > #rv-session, #review:not(.rv-list-open) .review-side > #rv-panel-opts { display: none; }
   /* The bottom bar: sticks to the bottom of the screen while the panel is in view. */
   .rv-actions-main { order: 20; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem -0.6rem 0; padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
   .rv-actions-main button { margin: 0; padding-left: 0.3rem; padding-right: 0.3rem; font-size: 0.88rem; line-height: 1.2; }
@@ -1676,6 +1685,19 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-actions-more #rv-accept-all { flex: 1 1 100%; }
   .rv-box-tools .rv-tool-likely { display: none; }
   .rv-box-tools.rv-only-likely { display: none; }
+  /* While a box needs a decision (review.js `rv-deciding`): its main answers are the bottom bar,
+     Save & next and its row stay in the flow under Skip / Back / Next, Accept likely is beside the
+     list, and the card keeps the other answers as one compact row. */
+  .review-side > .rv-decide-bar { order: 20; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem -0.6rem 0; padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
+  #review.rv-deciding .review-side > .rv-decide-bar { display: grid; }
+  .rv-decide-bar button.small { margin: 0; min-height: 52px; padding: 0.2rem 0.3rem; font-size: 0.95rem; font-weight: 600; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
+  #review.rv-deciding .rv-actions-main { order: 6; position: static; margin: 0.2rem 0; padding: 0; background: none; border-top: 0; }
+  #review.rv-deciding #rv-accept-likely { display: none; }
+  #review.rv-deciding .rv-box-tools .rv-tool-likely { display: inline-block; }
+  #review.rv-deciding .rv-box-tools.rv-only-likely { display: flex; }
+  #review.rv-deciding .rv-decide > .rv-q-btns button.small { flex: 1 1 auto; min-height: 44px; font-size: 0.8rem; font-weight: normal; padding-left: 0.4rem; padding-right: 0.4rem; }
+  /* The overview over the frame: the frame shares the screen with it. */
+  .review-stage.rv-ov-on > #rv-canvas { width: min(100%, calc(48svh * var(--rv-ar, 1.78))); margin-inline: auto; }
   .rv-q-btns button.small { min-height: 44px; flex: 1 1 auto; margin: 0; }
   .rv-q-btns button.small { padding-left: 0.4rem; padding-right: 0.4rem; font-size: 0.85rem; }
   .rv-q-btns button.ok:first-child, .rv-q-btns button.bad:nth-child(2) { flex: 1 1 40%; font-size: 1rem; min-height: 48px; }
@@ -1706,9 +1728,14 @@ td.tr-bal-bars { vertical-align: middle; }
   .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; padding: 0.15rem var(--main-px, 1rem) 0; }
   .review-meta-row .review-meta { flex: 1 1 100%; margin: 0; }
   .review-meta-row button.small, .rv-view-menu > summary { min-height: 44px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
+  /* Zoom to box / Fit, Draw, Redraw and View share one row; the zoom is in the overview. */
+  .review-meta-row button.small, .review-meta-row .rv-view-menu { flex: 1 1 auto; }
+  .review-meta-row button.small, .rv-view-menu > summary { padding-left: 0.5rem; padding-right: 0.5rem; justify-content: center; }
+  .review-meta-row .review-zoom { display: none; }
   .review-grid { gap: 0.25rem; }
   .review-side.card { border: 0; background: none; padding: 0; border-radius: 0; }
   .rv-actions-main { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
+  .review-side > .rv-decide-bar { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
   .review-crop figcaption { display: none; }
   .rv-decide { margin: 0.3rem 0; padding: 0.4rem 0.5rem; background: var(--card); }
   .rv-q-why { -webkit-line-clamp: 1; }
@@ -1717,3 +1744,4 @@ td.tr-bal-bars { vertical-align: middle; }
 /* An on-screen keyboard is open (live.js `kb-open`): the sticky bars scroll with the page, so they
    neither hide behind the keyboard nor cover the field being typed in. */
 html.kb-open .rv-actions-main, html.kb-open form#models > .actions, html.kb-open form#server > .actions { position: static; }
+html.kb-open .rv-decide-bar { position: static; }

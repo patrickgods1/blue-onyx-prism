@@ -1,5 +1,6 @@
 //! The Review tab's finger rules (`assets/review-touch.js`): pinch zoom and pan, the two-tap box,
-//! and what one finger's drag does. The page applies these answers to its view and boxes
+//! what one finger's drag does, where a tag sits in the zoomed view and which box an overview tap
+//! picks. The page applies these answers to its view and boxes
 //! (`assets/review.js`), so they are checked here on exact numbers, in Node.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
@@ -21,6 +22,8 @@ console.log(JSON.stringify(req.map((r) => {
   if (r.op === 'pinch') return T.pinch(r.start, r.now, r.limits);
   if (r.op === 'twoTapRect') return T.twoTapRect(r.a, r.b, r.minBox);
   if (r.op === 'touchIntent') return T.touchIntent(r.s);
+  if (r.op === 'tagTop') return T.tagTop(r.bb, r.top, r.bottom, r.th);
+  if (r.op === 'pickBox') return T.pickBox(r.boxes, r.x, r.y, r.pad);
   throw new Error('unknown op ' + r.op);
 })));
 "#;
@@ -293,6 +296,93 @@ fn one_finger_intent_over_every_combination() {
     for w in ["resize", "move", "draw", "pan", "none"] {
         assert!(want.contains(&w), "{w}");
     }
+}
+
+#[test]
+fn a_tag_sits_above_then_below_then_inside_within_the_view() {
+    if !have_node() {
+        return;
+    }
+    let tag = |bb: [f64; 4], top: f64, bottom: f64| json!({ "op": "tagTop", "bb": bb, "top": top, "bottom": bottom, "th": 20.0 });
+    let got = node(&json!([
+        // The whole frame (zoom 1, 0..360): above with room, at the frame's top below, a box
+        // filling the frame inside its top, exactly the tag's height above is still above.
+        tag([10.0, 100.0, 50.0, 200.0], 0.0, 360.0),
+        tag([10.0, 5.0, 50.0, 200.0], 0.0, 360.0),
+        tag([0.0, 5.0, 640.0, 350.0], 0.0, 360.0),
+        tag([10.0, 20.0, 50.0, 200.0], 0.0, 360.0),
+        // Zoomed to rows 100..190: a box whose top is at the view's top gets its tag under it,
+        // above the view's bottom it fits above again, one cut by both edges keeps it in view.
+        tag([10.0, 105.0, 50.0, 150.0], 100.0, 190.0),
+        tag([10.0, 140.0, 50.0, 185.0], 100.0, 190.0),
+        tag([10.0, 60.0, 50.0, 250.0], 100.0, 190.0),
+        // Too tall for either: inside its own top when that is in view.
+        tag([10.0, 110.0, 50.0, 185.0], 100.0, 190.0),
+    ]));
+    let want = [80.0, 200.0, 5.0, 0.0, 150.0, 120.0, 100.0, 110.0];
+    for (g, w) in got.iter().zip(want) {
+        assert!(close(g.as_f64().unwrap(), w), "{got:?} want {want:?}");
+    }
+    // At zoom 1 the rule is the frame's old one (above when y >= th, else below when it fits,
+    // else inside the top), over a grid of boxes.
+    let (h, th) = (360.0, 20.0);
+    let mut req = Vec::new();
+    let mut old = Vec::new();
+    for y0 in [0.0, 5.0, 19.0, 20.0, 21.0, 150.0, 339.0] {
+        for y1 in [y0 + 3.0, y0 + 40.0, 339.0, 340.0, 341.0, 360.0] {
+            if y1 > h || y1 <= y0 {
+                continue;
+            }
+            req.push(tag([0.0, y0, 10.0, y1], 0.0, h));
+            old.push(if y0 >= th {
+                y0 - th
+            } else if y1 + th <= h {
+                y1
+            } else {
+                y0
+            });
+        }
+    }
+    let got = node(&json!(req));
+    for (g, w) in got.iter().zip(&old) {
+        assert!(close(g.as_f64().unwrap(), *w), "{got:?} want {old:?}");
+    }
+}
+
+#[test]
+fn an_overview_tap_picks_the_smallest_box_holding_it() {
+    if !have_node() {
+        return;
+    }
+    let boxes = json!([
+        [0, 0, 100, 100],
+        [20, 20, 60, 60],
+        [30, 30, 50, 50],
+        [200, 200, 210, 210]
+    ]);
+    let pick = |x: f64, y: f64, pad: f64| json!({ "op": "pickBox", "boxes": boxes, "x": x, "y": y, "pad": pad });
+    let got = node(&json!([
+        pick(40.0, 40.0, 0.0),
+        pick(25.0, 25.0, 0.0),
+        pick(90.0, 90.0, 0.0),
+        pick(150.0, 150.0, 0.0),
+        // On the edge counts; just past it only with a pad, which never changes the size.
+        pick(210.0, 205.0, 0.0),
+        pick(212.0, 205.0, 0.0),
+        pick(212.0, 205.0, 3.0),
+        pick(102.0, 50.0, 3.0),
+        // No boxes: none.
+        { "op": "pickBox", "boxes": [], "x": 1, "y": 1 },
+        // Equal boxes: the first.
+        { "op": "pickBox", "boxes": [[0, 0, 10, 10], [0, 0, 10, 10]], "x": 5, "y": 5 },
+    ]));
+    assert_eq!(
+        got,
+        json!([2, 1, 0, -1, 3, -1, 3, 0, -1, 0])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
 }
 
 /// Needs no `node`: the page loads the module before review.js, and it stays pure.

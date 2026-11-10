@@ -1,5 +1,6 @@
 // Review tab, fingers (/train/review; loaded before review.js): the gesture rules of the frame on
-// a touchscreen. Pure: no page, no browser API, no state of its own; review.js passes everything in
+// a touchscreen, where a box's tag sits in the zoomed view, and which box a tap on the overview
+// means. Pure: no page, no browser API, no state of its own; review.js passes everything in
 // and applies the answers. `tests/it/js_review_touch.rs` runs this file in Node.
 //
 // Coordinates are the canvas's buffer pixels (review.js `canvasPoint`: the frame at zoom 1), and a
@@ -53,9 +54,36 @@
     return 'none';
   }
 
+  // Where a box's tag goes, against the part of the frame the canvas shows (frame rows `viewTop`
+  // .. `viewBottom`; the whole frame at zoom 1): the top of a tag `th` high above the box when it
+  // fits in view, else under the box when that fits, else inside the box's top (kept in view, so a
+  // box cut by the view's top edge still shows its tag). `bb` = [x0, y0, x1, y1]. At zoom 1 this
+  // is the rule the frame always had: above, at the frame's top below, else inside.
+  function tagTop(bb, viewTop, viewBottom, th) {
+    if (bb[1] - th >= viewTop) return bb[1] - th;
+    if (bb[3] + th <= viewBottom) return bb[3];
+    return Math.max(bb[1], viewTop);
+  }
+
+  // The overview's tap: the index into `bboxes` (each [x0, y0, x1, y1]) of the smallest box
+  // holding the point (x, y), the first of equal ones; -1 for none. `pad` (default 0) widens each
+  // box on every side for the test only (a finger on a small overview), never for the size.
+  function pickBox(bboxes, x, y, pad) {
+    var m = pad || 0, best = -1, area = Infinity;
+    for (var i = 0; i < bboxes.length; i++) {
+      var b = bboxes[i];
+      if (x < b[0] - m || x > b[2] + m || y < b[1] - m || y > b[3] + m) continue;
+      var a = (b[2] - b[0]) * (b[3] - b[1]);
+      if (a < area) { best = i; area = a; }
+    }
+    return best;
+  }
+
   globalThis.ReviewTouch = {
     pinch: pinch,
     twoTapRect: twoTapRect,
-    touchIntent: touchIntent
+    touchIntent: touchIntent,
+    tagTop: tagTop,
+    pickBox: pickBox
   };
 }());
