@@ -71,7 +71,6 @@
       <button type="button" id="rv-keys-open" class="small secondary">Keys ?</button>
       </div>
     </div>
-    <div id="rv-decide-bar" class="rv-decide-bar" hidden></div>
     <p id="rv-msg" class="form-msg" role="status"></p>
     <p id="rv-session" class="rv-session muted" aria-live="polite"></p>
     <details id="rv-panel-opts" class="rv-panel-opts">
@@ -88,6 +87,8 @@
     </details>
     </details>
   </aside>
+  <!-- One column: the selected box's answers, pinned to the screen's foot over the whole grid (review.js renderDecision). -->
+  <div id="rv-decide-bar" class="rv-decide-bar" hidden><div class="rv-bar-head"></div><div class="rv-bar-btns"></div></div>
 </div>
 
 <details class="card rv-bulk" id="rv-bulk">

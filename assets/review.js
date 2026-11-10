@@ -195,14 +195,27 @@
   overview.classList.add('rv-overview');
   var stage = canvas.closest('.review-stage');
   // One column: the selected box's main answers in the bar at the screen's foot while boxes still
-  // need a decision (renderDecision); empty and hidden otherwise.
+  // need a decision (renderDecision); empty and hidden otherwise. A child of the grid, not of the
+  // panel: stuck to the foot of the screen it may not rise above its container's top, and the
+  // panel starts low on a short screen.
   var decideBar = $('rv-decide-bar');
-  var actionsBox = side && side.querySelector('.rv-actions');
-  if (!decideBar && side) {
+  if (!decideBar && grid) {
     decideBar = el('div', 'rv-decide-bar');
     decideBar.id = 'rv-decide-bar';
     decideBar.hidden = true;
-    side.insertBefore(decideBar, actionsBox ? actionsBox.nextSibling : null);
+    grid.appendChild(decideBar);
+  }
+  // The bar's head (pinned with it): the selected box, the frame's progress as a line along the
+  // bar's top edge and a count; the answers under it.
+  var barHead = decideBar && decideBar.querySelector('.rv-bar-head');
+  var barBtns = decideBar && decideBar.querySelector('.rv-bar-btns');
+  if (decideBar && !barHead) {
+    barHead = el('div', 'rv-bar-head');
+    decideBar.appendChild(barHead);
+  }
+  if (decideBar && !barBtns) {
+    barBtns = el('div', 'rv-bar-btns');
+    decideBar.appendChild(barBtns);
   }
   // One column: "Boxes (N) and options" folds the box list, the session line and Panel options.
   var listToggle = $('rv-list-toggle');
@@ -446,6 +459,9 @@
 
   // Where the frame's review stands, after a decision moved the selection on.
   function sayProgress() {
+    // One column: the bar at the screen's foot says it (a status line under the card that changes
+    // with every answer is one more thing for the page to jump to).
+    if (deciding()) { say(''); return; }
     var u = undecidedCount(), c = uncheckedCount();
     if (u) say(u + ' box(es) still undecided.');
     else if (c) say('Check pass: ' + c + ' accepted / rejected box(es) left to double-check (a keep / accept, r reject).');
@@ -1409,9 +1425,36 @@
 
   function kbd(text) { return el('kbd', null, text); }
 
-  // A decision button with its key; the frame keeps the focus (the bar is rebuilt).
+  // One column: an answer keeps the frame where it was on the screen. Nothing over the frame
+  // changes, yet a browser may move the page once the panel under it is rebuilt (scroll anchoring
+  // to the rewritten card, iOS bringing the changed status lines into view): the page is put back
+  // for a moment after each answer, unless a finger or the wheel moves it, or the page itself
+  // scrolls on purpose (revealSelected, revealFrame).
+  var frameHold = null;   // {top, until}: where the frame's stage was before the answer
+  function holdFrame() {
+    frameHold = oneColumn.matches && stage && !stage.hidden
+      ? { top: stage.getBoundingClientRect().top, until: Date.now() + 700 } : null;
+  }
+  function keepFrame() {
+    if (!frameHold) return;
+    if (Date.now() > frameHold.until) { frameHold = null; return; }
+    var d = stage.getBoundingClientRect().top - frameHold.top;
+    if (Math.abs(d) > 0.5) window.scrollBy(0, d);
+  }
+  function settleFrame() {
+    if (!frameHold) return;
+    keepFrame();
+    requestAnimationFrame(function () { keepFrame(); requestAnimationFrame(keepFrame); });
+    setTimeout(keepFrame, 150);
+    setTimeout(keepFrame, 400);
+  }
+  function releaseFrame() { frameHold = null; }
+  window.addEventListener('scroll', keepFrame, { passive: true });
+  ['touchmove', 'wheel', 'keydown'].forEach(function (t) { window.addEventListener(t, releaseFrame, { passive: true, capture: true }); });
+
+  // A decision button with its key; the frame keeps the focus (the bar is rebuilt) and its place.
   function decideButton(text, key, cls, onClick) {
-    var b = button(text + ' ', function () { onClick(); canvas.focus({ preventScroll: true }); }, cls);
+    var b = button(text + ' ', function () { holdFrame(); onClick(); canvas.focus({ preventScroll: true }); settleFrame(); }, cls);
     if (key) b.appendChild(kbd(key));
     return b;
   }
@@ -1429,13 +1472,14 @@
     decide.textContent = '';
     var inBar = deciding();
     root.classList.toggle('rv-deciding', inBar);
-    if (decideBar) { decideBar.textContent = ''; decideBar.hidden = !inBar; }
+    if (decideBar) { barBtns.textContent = ''; decideBar.hidden = !inBar; }
     placeAcceptAll();
     if (!cur) return;
     var sugBlock = suggestionBlock();
     if (sugBlock) decide.appendChild(sugBlock);
     var p = progress();
     var b = boxes()[selected];
+    if (inBar) renderBarHead(b, p);
     if (!b) {
       var off = dismissedOn ? 0 : dismissedCount();
       var tap = noHover.matches;
@@ -1477,7 +1521,7 @@
       var btns = el('div', 'rv-q-btns');
       // The main answers: in the card, or (one column, deciding) in the bar at the foot, which
       // leaves the card the other answers as one compact row.
-      var answers = inBar && decideBar ? decideBar : btns;
+      var answers = inBar && decideBar ? barBtns : btns;
       answers.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
       answers.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
       if (b.source !== 'human') {
@@ -1608,22 +1652,48 @@
         (touchUi.matches ? 'Reject as duplicate or No, reject under the question' : 'u rejects it as a duplicate, r rejects it as wrong') +
         '. Saving with both kept stops flagging the frame.';
     }
-    if (p.total || stackBtn || repeatBtn || lapNote) {
+    // While the bar at the foot shows the progress, the card keeps only the stack / repeat tools.
+    var showCount = p.total && !inBar;
+    if (showCount || stackBtn || repeatBtn || lapNote) {
       var line = el('div', 'rv-progress');
-      if (p.total) {
+      if (showCount) {
         var bar = el('progress');
         bar.max = p.total;
         bar.value = p.done;
         line.appendChild(bar);
       }
       var row = el('div', 'rv-progress-row');
-      row.appendChild(el('span', 'muted', p.total ? p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '') : ''));
+      row.appendChild(el('span', 'muted', showCount ? p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '') : ''));
       if (lapNote) row.appendChild(lapNote);
       if (stackBtn) row.appendChild(stackBtn);
       if (repeatBtn) row.appendChild(repeatBtn);
       line.appendChild(row);
       decide.appendChild(line);
     }
+  }
+
+  // The bar's head: which box the answers are about and how far the frame is, pinned at the
+  // screen's foot with them (the card with the full question may be under the fold).
+  function renderBarHead(b, p) {
+    barHead.textContent = '';
+    var meter = el('span', 'rv-bar-meter');
+    var fill = el('i');
+    fill.style.width = (p.total ? Math.round(100 * p.done / p.total) : 0) + '%';
+    meter.appendChild(fill);
+    barHead.appendChild(meter);
+    var q = el('span', 'rv-bar-q');
+    if (b) {
+      var putAway = boxes().some(isPutAway);
+      q.appendChild(document.createTextNode('Box ' + (selected + 1) + (putAway ? '' : ' of ' + boxes().length) + ' · '));
+      var state = b.source === 'human' ? 'drawn ' : (b.state === 'accepted' ? 'accepted ' : (b.state === 'rejected' ? 'rejected ' : ''));
+      if (state) q.appendChild(document.createTextNode(state));
+      q.appendChild(el('strong', null, b.label));
+      if (!state) q.appendChild(document.createTextNode('?'));
+    }
+    barHead.appendChild(q);
+    barHead.appendChild(el('span', 'rv-bar-count', p.undecided ? p.undecided + ' to decide'
+      : (p.unchecked ? p.unchecked + ' to check' : 'all done')));
+    barHead.title = p.done + ' of ' + p.total + ' boxes done';
   }
 
   function refresh() { renderSide(); draw(); }
@@ -1644,7 +1714,7 @@
         // The answers are in the bar at the screen's foot while boxes need a decision: the page
         // stays put, so the frame and the buttons are where they were for the next answer. Else
         // only a card scrolled away above (a tap in the box list far below) is brought back.
-        if (!(decideBar && !decideBar.hidden) && dr.top < 0) decide.scrollIntoView({ block: 'start' });
+        if (!(decideBar && !decideBar.hidden) && dr.top < 0) { releaseFrame(); decide.scrollIntoView({ block: 'start' }); }
       } else if (dr.top < 0 || dr.bottom > window.innerHeight) decide.scrollIntoView({ block: 'nearest' });
     }
   }
@@ -1660,6 +1730,7 @@
   // (with its Save row; from the grid's top when they are taller than the window), the box list
   // starts at its top.
   function revealFrame() {
+    releaseFrame();
     boxList.scrollTop = 0;
     fitHead();
     revealSelected();

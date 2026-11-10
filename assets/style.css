@@ -158,6 +158,9 @@ input, select, textarea, button {
 }
 textarea { width: 100%; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.85rem; }
 button { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); cursor: pointer; padding: 0.45rem 1.1rem; }
+/* No double-tap zoom on what takes taps: two quick answers in Review are two answers, and iOS
+   would otherwise zoom or scroll the page on the second. */
+button, summary, a, label, select { touch-action: manipulation; }
 button.secondary { background: var(--card); color: var(--accent); border-color: var(--border); }
 @media (hover: hover) { button.secondary:hover { border-color: var(--accent); } }
 button.danger { background: var(--card); color: var(--danger); border-color: var(--danger); }
@@ -933,6 +936,9 @@ button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(
 .rv-decide button.suggest, .rv-decide-bar button.suggest { box-shadow: 0 0 0 2px currentColor; }
 /* One column only (the max-width: 900px block below). */
 .rv-decide-bar, .rv-list-toggle { display: none; }
+/* The page places the frame itself (review.js revealFrame, and an answer keeps it in place):
+   scroll anchoring to the panel rebuilt under it would move it. */
+html:has(#review) { overflow-anchor: none; }
 .review-side > .rv-session { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; font-size: 0.8rem; margin: 0.2rem 0 0; }
 .review-side > .rv-session:empty { display: none; }
 .rv-session .rv-chip button.small { margin: 0 0 0 0.2rem; padding: 0 0.35rem; font-size: 0.75rem; }
@@ -1693,9 +1699,18 @@ td.tr-bal-bars { vertical-align: middle; }
   /* While a box needs a decision (review.js `rv-deciding`): its main answers are the bottom bar,
      Save & next and its row stay in the flow under Skip / Back / Next, Accept likely is beside the
      list, and the card keeps the other answers as one compact row. */
-  .review-side > .rv-decide-bar { order: 20; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem -0.6rem 0; padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
-  #review.rv-deciding .review-side > .rv-decide-bar { display: grid; }
+  .review-grid > .rv-decide-bar { flex-direction: column; gap: 0.2rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem 0 0; padding: 0.3rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
+  #review.rv-deciding .review-grid > .rv-decide-bar { display: flex; }
+  /* Pinned with the answers: the box they are about, how many are left, the frame's progress as
+     a line along the bar's top edge (review.js renderBarHead). One line, never taller. */
+  .rv-bar-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.5rem; font-size: 0.8rem; line-height: 1.2; white-space: nowrap; }
+  .rv-bar-q { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .rv-bar-count { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .rv-bar-meter { position: absolute; left: 0; right: 0; top: -1px; height: 3px; background: var(--border); }
+  .rv-bar-meter > i { display: block; height: 100%; background: #2e9e4f; }
+  .rv-bar-btns { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; }
   .rv-decide-bar button.small { margin: 0; min-height: 52px; padding: 0.2rem 0.3rem; font-size: 0.95rem; font-weight: 600; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
+  @media (max-height: 600px) { .rv-decide-bar button.small { min-height: 46px; } }
   #review.rv-deciding .rv-actions-main { order: 6; position: static; margin: 0.2rem 0; padding: 0; background: none; border-top: 0; }
   #review.rv-deciding #rv-accept-likely { display: none; }
   #review.rv-deciding .rv-box-tools .rv-tool-likely { display: inline-block; }
@@ -1739,7 +1754,7 @@ td.tr-bal-bars { vertical-align: middle; }
   .review-grid { gap: 0.25rem; }
   .review-side.card { border: 0; background: none; padding: 0; border-radius: 0; }
   .rv-actions-main { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
-  .review-side > .rv-decide-bar { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
+  .review-grid > .rv-decide-bar { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
   .review-crop figcaption { display: none; }
   .rv-decide { margin: 0.3rem 0; padding: 0.4rem 0.5rem; background: var(--card); }
   .rv-q-why { -webkit-line-clamp: 1; }
