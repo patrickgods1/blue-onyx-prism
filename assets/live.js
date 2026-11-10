@@ -591,7 +591,7 @@
   // page).
   // On a phone (and a phone on its side) it sits at the bottom instead (style.css), above the sticky
   // Save / decision bars when they are stuck there (`--banner-lift`, kept while the page scrolls).
-  var STICKY_BARS = ".rv-actions-main, form#models > .actions, form#server > .actions";
+  var STICKY_BARS = ".rv-actions-main, .rv-decide-bar, form#models > .actions, form#server > .actions";
   function liftBanner(b) {
     var rects = [];
     document.querySelectorAll(STICKY_BARS).forEach(function (bar) {
