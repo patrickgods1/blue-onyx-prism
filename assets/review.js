@@ -1046,14 +1046,16 @@
     c.fillText(extra, tx + pad + mw, top + th / 2);
   }
 
-  // The overview (one column, while the frame is zoomed): the whole frame at the overview's CSS
-  // width (x devicePixelRatio), every shown box as a thin outline, the selected one thicker on a
-  // white line, and a veil outside the part the frame below shows. Held while a gesture runs: the
-  // frame would move under the fingers of a pinch that crossed zoom 1.
+  // The overview (one column, while the frame is zoomed or follows the selection): the whole frame
+  // at the overview's CSS width (x devicePixelRatio), every shown box as a thin outline, the
+  // selected one thicker on a white line, and a veil outside the part the frame below shows. Held
+  // while a gesture runs: the frame would move under the fingers of a pinch that crossed zoom 1.
   var overviewCache = null;   // {img, src, key, w, h, canvas}: the frame at the overview's size
   function drawOverview() {
     if (!overview) return;
-    var show = !!(oneColumn.matches && cur && view.z > 1);
+    // Following keeps it shown when a box too big to zoom on comes up (zoom 1): the frame and the
+    // answers under it stay where they were from one decision to the next.
+    var show = !!(oneColumn.matches && cur && (view.z > 1 || view.follow));
     if (gesture) show = !overview.hidden;
     if (overview.hidden === show) overview.hidden = !show;
     if (stage) stage.classList.toggle('rv-ov-on', show);
@@ -1137,6 +1139,8 @@
     // A finger on a small overview: a few CSS px of slack around each box.
     var hit = window.ReviewTouch.pickBox(rects, x, y, 6 * W / r.width);
     if (hit >= 0) { select(idx[hit], false); return; }
+    // Unzoomed there is nothing to move to, and ending the follow would fold the overview away.
+    if (view.z <= 1) return;
     view.follow = false;
     view.ox = x - W / view.z / 2;
     view.oy = y - H / view.z / 2;
@@ -1633,13 +1637,15 @@
     // An entry taller than the list shows from its top (its class select).
     if (lr.top < br.top || lr.height > br.height) boxList.scrollTop += lr.top - br.top - 4;
     else if (lr.bottom > br.bottom) boxList.scrollTop += lr.bottom - br.bottom + 4;
-    // The page too when the decision bar is off screen (one column: the panel does not stick).
+    // The page too when the decision card is off screen (one column: the panel does not stick).
     if (page) {
       var dr = decide.getBoundingClientRect();
-      // Over the bottom bar counts as off screen (`scroll-margin-bottom` on the panel keeps it clear).
-      var sticky = decideBar && !decideBar.hidden ? decideBar : $('rv-save').parentNode;
-      var bar = oneColumn.matches && sticky.getBoundingClientRect().height || 0;
-      if (dr.top < 0 || dr.bottom > window.innerHeight - bar) decide.scrollIntoView({ block: 'nearest' });
+      if (oneColumn.matches) {
+        // The answers are in the bar at the screen's foot while boxes need a decision: the page
+        // stays put, so the frame and the buttons are where they were for the next answer. Else
+        // only a card scrolled away above (a tap in the box list far below) is brought back.
+        if (!(decideBar && !decideBar.hidden) && dr.top < 0) decide.scrollIntoView({ block: 'start' });
+      } else if (dr.top < 0 || dr.bottom > window.innerHeight) decide.scrollIntoView({ block: 'nearest' });
     }
   }
 
@@ -1663,7 +1669,9 @@
     if (oneColumn.matches) {
       var head = phoneHead && phoneHead.getBoundingClientRect().height ? phoneHead : grid;
       top = head.getBoundingClientRect().top;
-      if (Math.abs(top - 4) > 1) window.scrollBy(0, top - 4);
+      // Every frame lands at the same spot, to the pixel: a frame shown 1 px lower than the last
+      // is a frame that moved.
+      if (Math.abs(top - 4) > 0.5) window.scrollBy(0, top - 4);
       return;
     }
     var bottom = Math.max(canvas.getBoundingClientRect().bottom, side ? side.getBoundingClientRect().bottom : 0);

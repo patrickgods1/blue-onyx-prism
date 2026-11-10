@@ -1663,9 +1663,14 @@ td.tr-bal-bars { vertical-align: middle; }
   #rv-keys-open { display: none; }
 }
 @media (max-width: 900px) {
+  /* The frame's details and view buttons under the frame: their height changes with the frame's
+     name and with the buttons shown, and over the frame it would move the frame. */
+  .review-stage { display: flex; flex-direction: column; }
+  .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; margin-top: 0.3rem; }
+  .review-meta-row .review-meta { flex: 1 1 100%; margin: 0; }
   .review-side.card { padding: 0.4rem 0.6rem 0; }
   .review-side > #rv-crop-wrap { order: 1; }
-  .review-side > #rv-decide { order: 2; scroll-margin-bottom: 5.5rem; }
+  .review-side > #rv-decide { order: 2; }
   .review-side > #rv-msg { order: 3; }
   .rv-actions { display: contents; }
   .review-side > #rv-box-tools { order: 4; }
@@ -1721,12 +1726,11 @@ td.tr-bal-bars { vertical-align: middle; }
   #review:not(.rv-info-open) .review-meta { display: none; }
   .rv-bar { margin-bottom: 0.3rem; }
   /* The frame edge to edge, its view buttons under it. */
-  .review-stage { display: flex; flex-direction: column; margin: 0 calc(-1 * var(--main-px, 1rem)); }
+  .review-stage { margin: 0 calc(-1 * var(--main-px, 1rem)); }
   /* A tall frame leaves room to scroll past it (the frame itself takes every touch). */
   .review-stage canvas { border-radius: 0; width: min(100%, calc(60svh * var(--rv-ar, 1.78))); margin-inline: auto; }
   .review-stage #rv-none { padding: 1rem; }
-  .review-meta-row { order: 2; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 0.3rem; padding: 0.15rem var(--main-px, 1rem) 0; }
-  .review-meta-row .review-meta { flex: 1 1 100%; margin: 0; }
+  .review-meta-row { margin-top: 0; padding: 0.15rem var(--main-px, 1rem) 0; }
   .review-meta-row button.small, .rv-view-menu > summary { min-height: 44px; padding-top: 0.1rem; padding-bottom: 0.1rem; }
   /* Zoom to box / Fit, Draw, Redraw and View share one row; the zoom is in the overview. */
   .review-meta-row button.small, .review-meta-row .rv-view-menu { flex: 1 1 auto; }
