@@ -1004,7 +1004,28 @@ pub fn run_filtered(
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
     filter.check(classes)?;
-    let mut selected = reviewed_frames_filtered(dir, classes, &req.split, filter);
+    let selected = reviewed_frames_filtered(dir, classes, &req.split, filter);
+    run_selected(dir, classes, req, filter, selected)
+}
+
+/// [`run_filtered`] of frames selected already ([`reviewed_frames_filtered`]), each with the split
+/// it carries: a caller that needs one label snapshot for several exports, or splits of its own
+/// (the dataset check, `crate::training::refine`, holds out one fold of camera days per export),
+/// selects once and exports a copy each time. `req.split` is not applied here; `filter` is only
+/// recorded (and checks the unreviewed X-AnyLabeling frames). Images are hard links (else
+/// copies) of the dataset's: nothing here writes to them.
+pub fn run_selected(
+    dir: &Path,
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+    selected: Selection,
+) -> Result<ExportReport> {
+    if req.formats.is_empty() {
+        bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
+    }
+    filter.check(classes)?;
+    let mut selected = selected;
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
             unreviewed_queue_frames(dir, classes, &req.hidden_classes, &mut selected.warnings)

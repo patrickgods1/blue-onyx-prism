@@ -190,6 +190,12 @@ pub enum TrainCommand {
     /// and write suggestions for you to confirm on the Review tab. It changes no box, status or
     /// reviewed time.
     Overlaps(OverlapsArgs),
+    /// Check the reviewed frames of the folder under review with short throwaway fold models,
+    /// each trained without whole camera days and run on them, and write suggestions for you to
+    /// confirm on the Review tab (missing boxes, labels to verify, other classes) plus a report
+    /// (<folder under review>/refine/report.json). It changes no box, status, config, model or
+    /// training run.
+    Refine(RefineArgs),
     /// List the runs recorded in the training folder.
     List,
     /// Export a failed run's best checkpoint without training again, then install, add to the
@@ -478,6 +484,50 @@ pub struct OverlapsArgs {
     /// Print the script's output.
     #[arg(long)]
     pub verbose: bool,
+}
+
+/// `train refine`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct RefineArgs {
+    /// Only show what the check would do: frames, what the export leaves out and why, camera
+    /// days, fold sizes, the model and a rough time. Needs no GPU or download and writes nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Folds (2 to 8; fewer when there are fewer camera days). Each fold model trains on the
+    /// other folds' camera days and is asked about its own.
+    #[arg(long, default_value_t = super::refine::DEFAULT_FOLDS)]
+    pub folds: usize,
+    /// Epochs of each fold model (1 to 50); every epoch runs.
+    #[arg(long, default_value_t = super::refine::DEFAULT_EPOCHS)]
+    pub epochs: u32,
+    /// Which reviewed frames: scene=<day|night|ir> and camera=<name> pairs, comma-separated (a
+    /// key may repeat). Default every reviewed frame of the folder under review; a filter
+    /// narrows the training of the fold models too.
+    #[arg(long, default_value = "")]
+    pub frames: String,
+    /// GPU, cuda:N (`train capability` lists the usable ones; default the one with the most
+    /// memory).
+    #[arg(long)]
+    pub gpu: Option<String>,
+    /// Allow downloads over 500 MB (the training environment, the base weights).
+    #[arg(long)]
+    pub allow_large: bool,
+    /// Print the trainer's output.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+/// The request of `train refine` `a`.
+pub fn refine_request(a: &RefineArgs) -> Result<super::refine::RefineRequest> {
+    let r = super::refine::RefineRequest {
+        folds: a.folds,
+        epochs: a.epochs,
+        frames: super::refine::RefineFrames::parse(&a.frames)?,
+        gpu: a.gpu.clone(),
+        allow_large: a.allow_large,
+    };
+    r.validate()?;
+    Ok(r)
 }
 
 fn parse_hwaccel(s: &str) -> Result<super::import::HwAccel, String> {
@@ -1288,6 +1338,22 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             }
             run_task_cli(&config, Box::new(job), a.verbose)
         }
+        TrainCommand::Refine(a) => {
+            let req = refine_request(&a)?;
+            let cap = super::capability_now();
+            if a.dry_run {
+                let p = super::refine::preview(&config, &req, &cap)?;
+                print!("{}", super::refine::preview_text(&p));
+                return Ok(p.refused.is_none());
+            }
+            let job = super::refine::plan_refine(&config, req, &cap)?;
+            eprintln!(
+                "{} in {}",
+                super::task::Task::title(&job),
+                job.dataset_dir.display()
+            );
+            run_task_cli(&config, Box::new(job), a.verbose)
+        }
         TrainCommand::List => {
             let runs = service::load_records(&super::runs_file(&config));
             if runs.is_empty() {
@@ -1948,6 +2014,49 @@ mod tests {
             panic!()
         };
         assert_eq!(d.frames, "");
+    }
+
+    #[test]
+    fn refine_flags_parse() {
+        let TrainCommand::Refine(a) = parse(&[
+            "refine",
+            "--dry-run",
+            "--folds",
+            "3",
+            "--epochs",
+            "5",
+            "--frames",
+            "scene=ir,camera=patio",
+            "--gpu",
+            "cuda:1",
+            "--allow-large",
+            "--verbose",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        assert!(a.dry_run && a.allow_large && a.verbose);
+        let r = refine_request(&a).unwrap();
+        assert_eq!((r.folds, r.epochs), (3, 5));
+        assert_eq!(r.frames.scenes, ["ir"]);
+        assert_eq!(r.frames.cameras, ["patio"]);
+        assert_eq!(r.gpu.as_deref(), Some("cuda:1"));
+        let TrainCommand::Refine(d) = parse(&["refine"]).unwrap() else {
+            panic!()
+        };
+        let r = refine_request(&d).unwrap();
+        assert_eq!(r, super::super::refine::RefineRequest::default());
+        assert!(!d.dry_run);
+        for bad in [
+            vec!["refine", "--folds", "1"],
+            vec!["refine", "--epochs", "0"],
+            vec!["refine", "--frames", "limit=3"],
+        ] {
+            let TrainCommand::Refine(b) = parse(&bad).unwrap() else {
+                panic!()
+            };
+            assert!(refine_request(&b).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
