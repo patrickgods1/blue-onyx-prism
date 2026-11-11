@@ -200,6 +200,24 @@ fn dataset_spelling(flat: &str) -> String {
     strip_source(&s).to_string()
 }
 
+/// Most frames of a check's sample (the first frames written).
+const SAMPLE: usize = 20;
+
+/// Count what writing a fold did (`w`) into the report and the sample.
+fn count_written(rep: &mut RefineReport, sample: &mut Vec<String>, w: &write::Written) {
+    rep.frames_checked += w.checked;
+    rep.frames_written += w.frames;
+    rep.loose += w.loose;
+    rep.found.add += w.found.add;
+    rep.found.verify += w.found.verify;
+    rep.found.relabel += w.found.relabel;
+    rep.written.add += w.written.add;
+    rep.written.verify += w.written.verify;
+    rep.written.relabel += w.written.relabel;
+    let room = SAMPLE.saturating_sub(sample.len());
+    sample.extend(w.sample.iter().take(room).cloned());
+}
+
 /// The hard check before predicting: no frame of the fold is in the fold model's training or
 /// validation lists. One that is would make the check meaningless, so the job fails loudly.
 pub fn check_unseen(data: &Path, fold: &[&ExportFrame]) -> Result<()> {
@@ -249,6 +267,44 @@ impl RefineJob {
             self.request.folds,
             self.min_frames,
         )
+    }
+
+    /// The classes the judge looks at: the class list without the hidden ones.
+    fn wanted(&self) -> Wanted<'_> {
+        Wanted {
+            classes: &self.classes,
+            hidden: &self.hidden,
+        }
+    }
+
+    /// What every frame of the check shares in the judge: the fold models' input size, the
+    /// selection's training boxes per class, this check's id.
+    fn judge_context<'a>(&'a self, wanted: &'a Wanted<'a>, s: &'a Selected) -> Context<'a> {
+        Context {
+            wanted,
+            imgsz: self.train.request.recipe.imgsz,
+            class_boxes: &s.class_boxes,
+            run: &self.id,
+        }
+    }
+
+    /// The report of a check over the selection `s` before any fold ran.
+    fn start_report(&self, s: &Selected) -> RefineReport {
+        let k = s.k;
+        let recipe = &self.train.request.recipe;
+        let mut rep = RefineReport::new(&self.id, k, recipe_info(recipe, &self.recipe_from));
+        rep.camera_days = s.groups.len();
+        rep.frames_selected = s.frames.len();
+        rep.left_out = s.left_out.clone();
+        rep.warnings.clone_from(&s.warnings);
+        if k < self.request.folds {
+            rep.warnings.push(format!(
+                "{} folds asked for, {} camera days: {k} folds",
+                self.request.folds,
+                s.groups.len()
+            ));
+        }
+        rep
     }
 
     fn predictor(&self) -> Arc<dyn FoldPredictor> {
@@ -457,20 +513,7 @@ impl RefineJob {
                 );
             },
         );
-        rep.frames_checked += w.checked;
-        rep.frames_written += w.frames;
-        rep.loose += w.loose;
-        rep.found.add += w.found.add;
-        rep.found.verify += w.found.verify;
-        rep.found.relabel += w.found.relabel;
-        rep.written.add += w.written.add;
-        rep.written.verify += w.written.verify;
-        rep.written.relabel += w.written.relabel;
-        for r in w.sample {
-            if sample.len() < 20 {
-                sample.push(r);
-            }
-        }
+        count_written(rep, sample, &w);
         Self::step(
             report,
             &name,
@@ -512,19 +555,7 @@ impl RefineJob {
         let k = s.k;
         // From here on the count the folds were lowered to ([`Task::steps`] has the asked one).
         let steps = steps_for(k);
-        let recipe = &self.train.request.recipe;
-        let mut rep = RefineReport::new(&self.id, k, recipe_info(recipe, &self.recipe_from));
-        rep.camera_days = s.groups.len();
-        rep.frames_selected = s.frames.len();
-        rep.left_out = s.left_out.clone();
-        rep.warnings.clone_from(&s.warnings);
-        if k < self.request.folds {
-            rep.warnings.push(format!(
-                "{} folds asked for, {} camera days: {k} folds",
-                self.request.folds,
-                s.groups.len()
-            ));
-        }
+        let mut rep = self.start_report(&s);
         Self::step(
             report,
             SELECTING,
@@ -539,16 +570,8 @@ impl RefineJob {
         );
         check(cancel)?;
         // 2. The folds.
-        let wanted = Wanted {
-            classes: &self.classes,
-            hidden: &self.hidden,
-        };
-        let jctx = Context {
-            wanted: &wanted,
-            imgsz: recipe.imgsz,
-            class_boxes: &s.class_boxes,
-            run: &self.id,
-        };
+        let wanted = self.wanted();
+        let jctx = self.judge_context(&wanted, &s);
         let predictor = self.predictor();
         let mut tally = RecallTally::default();
         let mut sample = Vec::new();

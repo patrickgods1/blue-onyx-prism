@@ -1781,8 +1781,8 @@ never saw. Before it runs, the job reads the fold model's `train.txt` and `valid
 error if a frame of its own fold is in either. The fold model is the training run as it is (`train run`'s
 stages), installed in the job's work folder, registered nowhere and benchmarked never.
 
-**The judge** (`refine/judge.rs`, pure) compares the detections of a fold model with the frame's training
-boxes, ignore regions left out. It matches same-object pairs one to one first (best IoU first; car, truck,
+**The judge** (`refine/judge.rs`, pure) compares the detections of a fold model at score 0.15 or more
+with the frame's training boxes, ignore regions left out. It matches same-object pairs one to one first (best IoU first; car, truck,
 bus and van are one object), so a loosely drawn label is not reported as a missing box plus a label to
 verify. Then:
 
@@ -1791,13 +1791,13 @@ verify. Then:
 | Loose label (counted in the report, no suggestion) | A matched pair below IoU 0.75 on a box no reviewer drew, moved or relabelled. |
 | `add`: a box for an object no box labels | An unmatched detection at score 0.5 or more, 10 px or more on its short side at model input, that no live box of its object and no ignore box covers, and no judged reject of its object lies on at IoU 0.5 or more. |
 | `relabel`: another class | A training box no reviewer drew or relabelled, with a detection of another object at score 0.8 or more at IoU 0.7 or more, and no detection of its own object at score 0.3 or more at IoU 0.3 or more. The detection makes no `add`, the box no `verify`. |
-| `verify`: a label no model found | An unmatched training box no reviewer drew or moved, with no detection of its object at IoU 0.3 or more, of a class with 50 training boxes or more in the checked frames, 10 px or more on its short side. |
+| `verify`: a label no model found | An unmatched training box no reviewer drew or moved, with no detection of its object at score 0.15 or more at IoU 0.3 or more, of a class with 50 training boxes or more in the checked frames, 10 px or more on its short side. |
 
 The constants (`judge.rs`):
 
 | Name | Value | Meaning |
 |---|---|---|
-| `MATCH_MIN_SCORE` | 0.05 | Detections below it are not used at all. |
+| `MATCH_MIN_SCORE` | 0.15 | Detections below it are not used at all (no pair, no "found it"); the fold models run with it as their threshold. At 0.05 a fold model's faint guesses overlapped nearly every label and silenced `verify`: 2 of 2,755 training boxes on the first real run, although the fold models missed 304 at score 0.3. Labels whose best detection scored under 0.15 were about half label problems on a by-hand check, those at 0.15-0.3 almost all real, dim objects. |
 | `LOOSE_IOU_MIN` | 0.1 | IoU from which a detection and a training box of one object are a pair. |
 | `GOOD_IOU` | 0.75 | IoU from which a pair is a good label; below it the label is loose. |
 | `ADD_SCORE` | 0.5 | Score from which an unmatched detection is a missing box. |

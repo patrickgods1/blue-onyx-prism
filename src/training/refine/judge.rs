@@ -16,8 +16,9 @@
 //!    at model input, that no box of its object that is not rejected and no ignore box covers
 //!    ([`covers`]), and no judged reject of its object lies on at IoU >= [`REJECT_BLOCK_IOU`].
 //! 5. `verify`: an unmatched training box no reviewer drew or moved, with no same-object detection
-//!    at IoU >= [`VERIFY_IOU`], of a class with [`MIN_CLASS_BOXES`] training boxes or more in the
-//!    checked frames, at least [`FLOOR_PX`] on its short side at model input.
+//!    (at [`MATCH_MIN_SCORE`] or more, as every candidate) at IoU >= [`VERIFY_IOU`], of a class
+//!    with [`MIN_CLASS_BOXES`] training boxes or more in the checked frames, at least
+//!    [`FLOOR_PX`] on its short side at model input.
 //! 6. `relabel`: a training box no reviewer drew or relabelled, on which a detection of another
 //!    object (not [`same_object`]) at [`RELABEL_SCORE`] or more lies at IoU >= [`RELABEL_IOU`], and
 //!    no same-object detection at [`RELABEL_BLOCK_SCORE`] or more at IoU >= [`VERIFY_IOU`]. Such a
@@ -38,9 +39,13 @@ use crate::collect::labels::{BoxState, LabelBox, LabelFile, Source, Status, cove
 use crate::training::autolabel::triage::Det;
 use std::collections::BTreeMap;
 
-/// Detections below this score are noise even for "no model found it": a fold model's weakest
-/// guesses still count as having seen something.
-pub const MATCH_MIN_SCORE: f32 = 0.05;
+/// Detections below this score are not used at all (no candidate, no pair, not "seen"; the fold
+/// models are run with it as their threshold). Measured: under 0.15 a fold model's guesses overlap
+/// nearly every label, which silenced `verify` (2 of 2,755 training boxes on the first real run, at
+/// 0.05, although the fold models missed 304 at 0.3). Labels whose best same-object detection
+/// scores under 0.15 were about half label problems on a by-hand check; those at 0.15-0.3 almost
+/// all real, dim objects.
+pub const MATCH_MIN_SCORE: f32 = 0.15;
 /// IoU from which a detection and a training box of one object are a pair: a loose label still
 /// overlaps its object this much.
 pub const LOOSE_IOU_MIN: f32 = 0.1;
@@ -504,7 +509,7 @@ mod tests {
     /// IoU with [`CAR`] about 0.92.
     const NEAR: [f32; 4] = [102.0, 101.0, 201.0, 182.0];
     const FAR: [f32; 4] = [400.0, 300.0, 460.0, 400.0];
-    /// IoU with [`CAR`] = 0.2 (a loose label of it).
+    /// IoU with [`CAR`] = 0.5 (a loose label of it).
     const LOOSE: [f32; 4] = [100.0, 100.0, 300.0, 180.0];
 
     #[test]
@@ -518,8 +523,9 @@ mod tests {
         // A truck detection on a car box: one object, found too.
         let j = run(&f, &[det("truck", NEAR, 0.9)]);
         assert!(j.suggestions.is_empty() && j.boxes[0].found);
-        // Below the production threshold: not found, but no verify either (the model saw it).
-        let j = run(&f, &[det("car", NEAR, 0.1)]);
+        // Below the production threshold but above the noise floor: not found, but no verify
+        // either (the model saw it): MATCH_MIN_SCORE <= 0.2 < FOUND_SCORE.
+        let j = run(&f, &[det("car", NEAR, 0.2)]);
         assert!(j.suggestions.is_empty() && !j.boxes[0].found);
     }
 
@@ -689,14 +695,52 @@ mod tests {
             kinds(&run(&f, &[det("car", FAR, 0.9)])),
             [Kind::Add, Kind::Verify]
         );
-        // A faint same-object detection at IoU >= 0.3 does.
-        assert!(run(&f, &[det("truck", NEAR, 0.06)]).suggestions.is_empty());
+        // A faint same-object detection at IoU >= 0.3 does, from the noise floor on.
+        assert!(
+            run(&f, &[det("truck", NEAR, MATCH_MIN_SCORE)])
+                .suggestions
+                .is_empty()
+        );
         // A rare class: no verify.
         let mut counts = many();
         counts.insert("car".into(), MIN_CLASS_BOXES - 1);
         assert!(run_with(&f, &[], &counts).suggestions.is_empty());
         counts.insert("car".into(), MIN_CLASS_BOXES);
         assert_eq!(kinds(&run_with(&f, &[], &counts)), [Kind::Verify]);
+    }
+
+    #[test]
+    fn detections_under_the_noise_floor_do_not_silence_a_verify() {
+        // A training box with only a same-object detection on it, IoU about 0.92.
+        assert!(iou(&CAR, &NEAR) > 0.9);
+        let f = reviewed(vec![acc("car", CAR)]);
+        let cases: [(f32, &[Kind]); 5] = [
+            (0.05, &[Kind::Verify]),
+            (0.10, &[Kind::Verify]),
+            (0.149, &[Kind::Verify]),
+            (MATCH_MIN_SCORE, &[]),
+            (0.20, &[]),
+        ];
+        for (score, want) in cases {
+            let j = run(&f, &[det("car", NEAR, score)]);
+            assert_eq!(kinds(&j), want, "score {score}: {j:?}");
+            // Not a pair below the floor, a good one above: never loose, never found at 0.3.
+            assert_eq!(j.loose, 0, "score {score}");
+            assert!(!j.boxes[0].found, "score {score}");
+        }
+        // A loose pair at IoU 0.2 with a confident detection that the label does not cover:
+        // loose, and neither an add (the detection is the label's pair) nor a verify.
+        let big = [100.0, 100.0, 300.0, 300.0];
+        assert!((iou(&CAR, &big) - 0.2).abs() < 1e-6);
+        assert!(!covers(&CAR, &big), "only the pairing keeps the add away");
+        let j = run(&f, &[det("car", big, 0.6)]);
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        assert_eq!(j.loose, 1);
+        // The same detection under the floor is no pair: the label is a verify, and the
+        // detection, too weak for an add, nothing.
+        let j = run(&f, &[det("car", big, 0.1)]);
+        assert_eq!(kinds(&j), [Kind::Verify]);
+        assert_eq!(j.loose, 0);
     }
 
     #[test]

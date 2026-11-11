@@ -1239,3 +1239,183 @@ fn refine_real_on_a_copy() {
         .unwrap();
     println!("{:.1} s: {}", started.elapsed().as_secs_f64(), out.summary);
 }
+
+/// A detection as [`DumpPredictor`] wrote it.
+#[derive(serde::Deserialize)]
+struct ReplayDet {
+    label: String,
+    score: f32,
+    bbox: [f32; 4],
+}
+
+/// The part of a [`DumpLine`] a replay reads.
+#[derive(serde::Deserialize)]
+struct ReplayLine {
+    frame: String,
+    #[serde(default)]
+    dets: Vec<ReplayDet>,
+}
+
+/// The fold models' detections of a dump (`BOP_REFINE_DUMP`) as one [`Detections`], each frame's
+/// filtered to [`judge::MATCH_MIN_SCORE`] as the predictor's threshold would have; how many lines
+/// named a frame again (the later line wins).
+fn read_dump(path: &Path) -> (Detections, usize) {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("reading the dump {}: {e}", path.display()));
+    let mut frames = BTreeMap::new();
+    let mut again = 0;
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let l: ReplayLine = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("{} line {}: {e}", path.display(), i + 1));
+        let dets: Vec<Det> = l
+            .dets
+            .into_iter()
+            .filter(|d| d.score >= judge::MATCH_MIN_SCORE)
+            .map(|d| Det {
+                label: d.label,
+                score: d.score,
+                bbox: d.bbox,
+            })
+            .collect();
+        if frames.insert(l.frame, dets).is_some() {
+            again += 1;
+        }
+    }
+    (
+        Detections {
+            frames,
+            device: "replay".into(),
+            cancelled: false,
+        },
+        again,
+    )
+}
+
+#[test]
+fn a_dump_reads_back_filtered_to_the_noise_floor() {
+    let t = tmp("replay-read");
+    let file = t.0.join("dets.jsonl");
+    let line = |frame: &str, scores: &[f32]| {
+        let dets: Vec<serde_json::Value> = scores
+            .iter()
+            .map(|s| serde_json::json!({"label": "car", "score": s, "bbox": CAR}))
+            .collect();
+        serde_json::json!({"model": "refine-fold-1", "onnx": "m.onnx", "device": "ort:cuda",
+            "frame": frame, "width": 320, "height": 240, "threshold": 0.05, "dets": dets})
+        .to_string()
+    };
+    let text = [
+        line(
+            "ir/a/2026-10-21/x.jpg",
+            &[0.05, 0.149, judge::MATCH_MIN_SCORE, 0.9],
+        ),
+        String::new(),
+        line("ir/a/2026-10-21/y.jpg", &[0.1]),
+        line("ir/a/2026-10-21/y.jpg", &[0.2]),
+    ]
+    .join("\n");
+    std::fs::write(&file, text).unwrap();
+    let (d, again) = read_dump(&file);
+    assert_eq!(again, 1);
+    assert!(!d.cancelled);
+    let scores = |f: &str| -> Vec<f32> { d.frames[f].iter().map(|d| d.score).collect() };
+    assert_eq!(
+        scores("ir/a/2026-10-21/x.jpg"),
+        [judge::MATCH_MIN_SCORE, 0.9]
+    );
+    assert_eq!(scores("ir/a/2026-10-21/y.jpg"), [0.2]);
+    assert_eq!(d.frames["ir/a/2026-10-21/x.jpg"][0].bbox, CAR);
+}
+
+/// The judge and the writes of a check, replayed from a detection dump instead of fold models:
+/// `BOP_REFINE_CONFIG=<config file> BOP_REFINE_REPLAY=<dump of BOP_REFINE_DUMP> cargo test --lib
+/// refine_replay -- --ignored --nocapture`. Selects the reviewed frames as the job does, judges
+/// them with the job's context and writes the label files through [`write::write_fold`] as a
+/// real run does; trains, predicts and downloads nothing. It writes suggestions into the copy
+/// (never point it at a dataset someone is reviewing) and no `report.json`, which would replace
+/// the report of the real run that made the dump.
+#[test]
+#[ignore = "needs a copy of a dataset and a detection dump of refine_real_on_a_copy"]
+fn refine_replay_on_a_copy() {
+    let (Some(path), Some(dump)) = (
+        std::env::var_os("BOP_REFINE_CONFIG").map(PathBuf::from),
+        std::env::var_os("BOP_REFINE_REPLAY").map(PathBuf::from),
+    ) else {
+        println!("skipped: BOP_REFINE_CONFIG and BOP_REFINE_REPLAY must both be set");
+        return;
+    };
+    let started = Instant::now();
+    let cfg = Config::load(&path).unwrap();
+    // Planned as the real test plans it: the same frames, classes, recipe (imgsz) and a new id.
+    let job = plan_refine(
+        &cfg,
+        RefineRequest::default(),
+        &crate::training::capability_now(),
+    )
+    .unwrap();
+    let s = job.select();
+    if let Some(why) = &s.refused {
+        panic!("{why}");
+    }
+    let (found, again) = read_dump(&dump);
+    let wanted = job.wanted();
+    let jctx = job.judge_context(&wanted, &s);
+    let mut rep = job.start_report(&s);
+    let mut tally = RecallTally::default();
+    let mut sample = Vec::new();
+    let frames: Vec<&ExportFrame> = s.frames.iter().collect();
+    let in_dump = frames
+        .iter()
+        .filter(|f| found.frames.contains_key(&f.rel.jpg()))
+        .count();
+    let w = write::write_fold(
+        &job.dataset_dir,
+        &frames,
+        &found,
+        &jctx,
+        &mut tally,
+        &mut rep.warnings,
+        &mut |_, _| {},
+    );
+    count_written(&mut rep, &mut sample, &w);
+    rep.folds_done = rep.folds;
+    rep.finish(&tally);
+    let r = &rep.recall;
+    println!("review folder: {}", job.dataset_dir.display());
+    println!(
+        "run {}; imgsz {}; MATCH_MIN_SCORE {}",
+        job.id,
+        jctx.imgsz,
+        judge::MATCH_MIN_SCORE
+    );
+    println!(
+        "dump: {} frames ({again} named again), {in_dump} of {} selected frames in it",
+        found.frames.len(),
+        s.frames.len()
+    );
+    println!(
+        "frames checked {}, frames changed {}",
+        rep.frames_checked, rep.frames_written
+    );
+    println!(
+        "found: add {}, verify {}, relabel {}",
+        rep.found.add, rep.found.verify, rep.found.relabel
+    );
+    println!(
+        "written: add {}, verify {}, relabel {}",
+        rep.written.add, rep.written.verify, rep.written.relabel
+    );
+    println!("loose {}", rep.loose);
+    println!(
+        "recall {} of {} = {:?} (95% {:.3}-{:.3}) at score {} IoU {}",
+        r.found, r.boxes, r.recall, r.low, r.high, rep.found_score, rep.found_iou
+    );
+    println!("warnings {}", rep.warnings.len());
+    for w in &rep.warnings {
+        println!("  warning: {w}");
+    }
+    println!("{:.1} s", started.elapsed().as_secs_f64());
+}
