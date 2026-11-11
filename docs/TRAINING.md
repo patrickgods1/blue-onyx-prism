@@ -1764,6 +1764,123 @@ and the save records `overlaps_checked`. To turn a suggestion down, do anything 
 yourself, or save with both kept. The twin rules are `liveSuggestions` / `acceptOverlap` in
 `assets/review-rules.js` and `live` / `accept` in `collect/labels/overlaps.rs`.
 
+### Dataset check (cross-check)
+
+`train refine` looks for what the labels of your reviewed frames got wrong or left out: objects no box
+labels, labels no model finds, and a box of another class than the one an independent model sees. It
+exists for the frames every trained model has already seen, which `--with-model --missing-only` cannot
+check (it skips them). It is on the command line and the job queue only. **It changes no box, frame
+status, config entry, model file, `runs.json` or `benchmark.json`**: it writes suggestions to
+`LabelFile.refine` and a report, and a box changes only when a reviewer accepts a suggestion.
+
+**How it works.** The camera days of the reviewed frames (a camera on one date; frames of one day are near
+copies) are split into K folds, whole days at a time (`refine/folds.rs`: largest day first, each into the
+fold with the fewest frames so far, a fixed seed, so a rerun over the same frames uses the same folds).
+For each fold a short model trains on the other folds' frames and is then asked only about the days it
+never saw. Before it runs, the job reads the fold model's `train.txt` and `valid.txt` and stops with an
+error if a frame of its own fold is in either. The fold model is the training run as it is (`train run`'s
+stages), installed in the job's work folder, registered nowhere and benchmarked never.
+
+**The judge** (`refine/judge.rs`, pure) compares the detections of a fold model with the frame's training
+boxes, ignore regions left out. It matches same-object pairs one to one first (best IoU first; car, truck,
+bus and van are one object), so a loosely drawn label is not reported as a missing box plus a label to
+verify. Then:
+
+| Result | When |
+|---|---|
+| Loose label (counted in the report, no suggestion) | A matched pair below IoU 0.75 on a box no reviewer drew, moved or relabelled. |
+| `add`: a box for an object no box labels | An unmatched detection at score 0.5 or more, 10 px or more on its short side at model input, that no live box of its object and no ignore box covers, and no judged reject of its object lies on at IoU 0.5 or more. |
+| `relabel`: another class | A training box no reviewer drew or relabelled, with a detection of another object at score 0.8 or more at IoU 0.7 or more, and no detection of its own object at score 0.3 or more at IoU 0.3 or more. The detection makes no `add`, the box no `verify`. |
+| `verify`: a label no model found | An unmatched training box no reviewer drew or moved, with no detection of its object at IoU 0.3 or more, of a class with 50 training boxes or more in the checked frames, 10 px or more on its short side. |
+
+The constants (`judge.rs`):
+
+| Name | Value | Meaning |
+|---|---|---|
+| `MATCH_MIN_SCORE` | 0.05 | Detections below it are not used at all. |
+| `LOOSE_IOU_MIN` | 0.1 | IoU from which a detection and a training box of one object are a pair. |
+| `GOOD_IOU` | 0.75 | IoU from which a pair is a good label; below it the label is loose. |
+| `ADD_SCORE` | 0.5 | Score from which an unmatched detection is a missing box. |
+| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. |
+| `VERIFY_IOU` | 0.3 | IoU from which a detection of the object has found a training box. |
+| `MIN_CLASS_BOXES` | 50 | Training boxes of a class from which a `verify` is made for it. |
+| `RELABEL_IOU` | 0.7 | IoU from which another object's detection lies on a training box. |
+| `RELABEL_SCORE` | 0.8 | Score from which that detection is evidence for a `relabel`. |
+| `RELABEL_BLOCK_SCORE` | 0.3 | Score from which a detection of the labelled object blocks a `relabel`. |
+| `REJECT_BLOCK_IOU` | 0.5 | IoU from which a judged reject of the object blocks an `add` (`labels::MATCH_IOU`). |
+| `FOUND_SCORE`, `FOUND_IOU` | 0.3, 0.5 | When a detection finds a training box in the report's recall. |
+
+A box "covers" a detection (`labels::covers`) at IoU 0.3 or more, or with at least half of the detection
+inside it, never the other way round. Only suggestions a reviewer would see (`refine::live`) are kept.
+Hidden classes are not judged. Only `reviewed` frames are judged, at write time, under the label write
+lock and on the file as it is then: a frame saved back to unreviewed or skipped meanwhile gets nothing,
+and a confirmed-empty frame can get an `add`.
+
+**What it writes.** `refine::apply` changes `LabelFile.refine` and nothing else: the unanswered suggestions
+of the kinds the check makes (`add`, `verify`, `relabel`) are replaced by what it found; answered ones and
+other kinds stay. A found suggestion is dropped when it is the same finding as an answered one (the same
+`target`; for an `add`, a box of the same object at IoU 0.5 or more) or a weaker copy of another found one.
+A frame holds at most 64, strongest first (`add`, then `relabel`, then `tighten`, then `verify`, then by
+score). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
+page can still save. The file format is in [DATASET.md](DATASET.md#label-file-version-1).
+
+**What a reviewer's answer does** (`refine::accept`, `refine::dismiss`; stale suggestions change nothing):
+
+| Suggestion | Accept | Dismiss |
+|---|---|---|
+| `add` | A new accepted box (`source: auto`, `reason: refine`, the suggestion's class and score) takes the place of the closest unjudged reject of its object at IoU 0.5 or more and removes the other such rejects, so `hard_negatives.json` does not call the real object a false positive (an unjudged reject is `low_score`, auto-dismissed, or a model hint the save default rejected; a reject with a reason, a spot edit or a duplicate is judged and blocks the `add`). The frame is no longer confirmed empty, and `overlaps_checked` ends if the new box is in a stack or an open pair. The suggestion goes. | Answered `dismissed`. |
+| `relabel` | The box takes the class, the old label stays in `model_label`. The suggestion goes. | Answered `dismissed`. |
+| `tighten` | `orig_bbox` keeps the old box, `bbox` becomes the proposal. The suggestion goes. | Answered `dismissed`. |
+| `verify` | Answered `kept`; the label stays. | Answered `dismissed`. |
+
+A dismissal changes no box. Answers are remembered: a rerun does not ask the same question again.
+`tighten` is read and accepted by the code but the check does not make it.
+
+**The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each check;
+the dataset walkers and retention do not look in `refine/`). Fields: `version`, `run`, `created`,
+`cancelled`, `folds`, `folds_done`, `recipe` (`model`, `imgsz`, `epochs`, `batch`, `from`), `camera_days`,
+`frames_selected`, `frames_checked`, `left_out` (`pending`, `off_class_list`, `lost`, `unreadable`,
+`unreadable_folders`, `filtered`), `written` and `found` (`add`, `verify`, `relabel`), `frames_written`,
+`loose`, `found_score`, `found_iou`, `recall`, `recall_by_group` (camera x scene x class), `recall_by_size`
+(short side at model input: under 8, 8-12, 12-24, 24-48, 48+ px) and `warnings`. Each recall has `boxes`,
+`found`, `recall` and a Wilson 95% interval (`low`, `high`): how often a fold model found the labelled
+objects of days it never saw, at score 0.3 and IoU 0.5.
+
+**Frames and recipe.** Every reviewed frame of the folder under review that can be exported (reviewed
+frames with pending boxes or labels off the class list are left out and counted); `--frames` narrows it by
+`scene=` and `camera=`, and then narrows the fold models' training too. At least 40 such frames on at least
+2 camera days are needed; K is lowered to the number of camera days when there are fewer (a warning says
+so). The fold models use the newest finished training run's model, input size, batch and multi-scale choice,
+else RF-DETR nano at the GPU's suggested batch; `--epochs` epochs, early stopping off (every epoch runs, the
+best raw epoch is exported), the default learning rate, no augmentation.
+
+**A run** is a task of the training queue (`TaskKind::Refine`, one job at a time), with the stages
+*selecting the reviewed frames*, one *checking fold N of K* each (export, train, check the fold is unseen,
+run the model, write) and *writing the report*. It needs an NVIDIA GPU or Apple silicon and the training
+environment (a download over 500 MB needs `--allow-large` or `allow_large_downloads`). Each fold's folder
+(`<training dir>/refine/<id>/fold-N`) is deleted when the fold is written, the work folder at the end however
+the run ends; a crashed run's is removed by the storage sweep (`WORK_DIRS`). Pause suspends the training
+processes; the export, prediction and writes of the running fold finish first.
+
+- **Cancel** keeps the suggestions of the finished folds (a fold is written whole or not at all) and ends
+  with a report marked `cancelled` and a summary saying how many folds ran. A cancel before any fold
+  finished is a plain cancel.
+- **A failed fold** (training fails, or the fold's frames are found in its training lists) stops the job and
+  fails it. The folds before keep their suggestions and the report, with a warning that the check stopped.
+  A fold model is throwaway: there is nothing to retry, run the check again.
+- **A rerun** checks every fold again. The folds are the same for the same frames; unanswered suggestions are
+  replaced, answered ones stay.
+
+```sh
+blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
+    [--gpu cuda:N] [--allow-large] [--verbose]
+```
+
+`--folds` is 2 to 8 and `--epochs` 1 to 50 (defaults 4 and 8). `--frames` takes `scene=<day|night|ir>` and
+`camera=<name>` pairs, comma-separated, a key may repeat. `--dry-run` runs the preview: frames, what the
+export leaves out and why, camera days, each fold's size, the model and a rough time (shown only when a GPU
+can train). It needs no GPU or download, writes nothing, and prints `refused:` with the reason when the check would not run.
+
 ### M1 run (MPS)
 
 | Run | Time | Result |
@@ -1809,6 +1926,8 @@ blue-onyx-prism train autolabel --sam3 [--dry-run] [...]   # SAM 3 in MM-Groundi
 blue-onyx-prism hf-login | hf-logout      # Hugging Face token for the SAM 3 download
 blue-onyx-prism train overlaps [--frames "scene=ir,camera=patio,limit=200,again=1"] [--gpu cuda:0] \
     [--allow-large] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
+blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
+    [--gpu cuda:N] [--allow-large] [--verbose]    # dataset check by fold models; changes no box
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
     [--device <spec>] [--accept-score-model 0.8] [--missing-only] [--confirm-license] [--allow-large] \
     [--frames "status=any,..."]

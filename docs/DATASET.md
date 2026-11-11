@@ -36,6 +36,7 @@ folder. Nothing is uploaded anywhere.
 <dir>/                                   collect.dir, default <data root>/dataset
   review-queue.jsonl                     frames sent to review (the review page consumes it)
   spots/<camera>.json                    parked spots of the camera (below, Review labels: Spots)
+  refine/report.json                     report of the last dataset check (TRAINING.md, Dataset check)
   <scene>/                               day | night | ir (src/image_stats.rs)
     <camera>/                            camera folder (see below)
       <YYYY-MM-DD>/                      UTC date
@@ -476,6 +477,37 @@ folder; the collector and the Collect tab keep `collect.dir`.
   drop, 0 if none (`two_objects`: the zoom's scores on `a` and `b`). `low_confidence`: the zoom gave no
   answer, so only the witnesses speak. `weak`: `other_score` >= 0.3, where 6 of 17 judged drops removed a
   real object; the page warns. Kept by saves, merges, X-AnyLabeling imports and every bulk edit.
+- **`refine`** (written only when not empty, at most 64): what the dataset check (`train refine`,
+  [Dataset check](TRAINING.md#dataset-check-cross-check)) suggests. Suggestions only: the check changes no
+  box, status or `reviewed_at`, and nothing but this list.
+
+  ```json
+  {"kind": "add", "bbox": [412.0, 220.5, 498.0, 371.0], "label": "person", "score": 0.82,
+   "why": "a model that never saw this camera-day found a person here, score 0.82", "run": "<check id>"}
+  ```
+
+  `kind`: `add` (a box for an object no box labels: `bbox`, `label`), `relabel` (another class for a
+  training box: `target` and `label`), `verify` (a training box no model found: `target`) or `tighten` (a
+  closer `bbox` for the box `target`; the check does not write it, the file and the page's rules know it).
+  `target` names an existing box by its exact `bbox`: that is the key. `score`: the fold model's score, 0 to
+  1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group name, at most 200
+  bytes. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box moved or went, or
+  that no longer holds (an `add` that a box of its object now covers; a `tighten` or `relabel` on a box a
+  reviewer drew, moved or relabelled; a `relabel` to a class that names the same object), is stale and
+  ignored: staleness is computed when the file is read, never stored, and never an error. So is any
+  suggestion on a skipped frame. `answer`: `kept` (a `verify` the reviewer confirmed: the label stays) or
+  `dismissed` (the reviewer said no); an answered suggestion is never live again and stays in the file, so a
+  rerun does not ask again. Accepting an `add` writes a box (`source: auto`, `state: accepted`, `reason:
+  refine`) in the place of the unjudged rejects it covers; accepting a `tighten` keeps the old box in
+  `orig_bbox`; accepting a `relabel` keeps the old label in `model_label`; accepting any of these three
+  removes the suggestion, accepting a `verify` answers it `kept`.
+
+  A `kind` or an `answer` this build does not know (a newer build's) loads as `unknown`, is never live
+  and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
+  (`add`, `verify`, `relabel`); answered ones and other kinds stay, and when nothing changed the file is not
+  written. Kept by saves. A build from before the dataset check ignores the field
+  and drops it when it rewrites the file; the list is rebuildable by running the check again (answers are
+  lost with it).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
