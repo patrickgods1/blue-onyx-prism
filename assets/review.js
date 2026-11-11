@@ -1755,7 +1755,12 @@
   // ---- edits --------------------------------------------------------------------------------
 
   function select(i, page) {
+    var was = selected;
     selected = (i >= 0 && i < boxes().length) ? i : -1;
+    // One column: the frame is the editor, so another box is zoomed to again even after a pan, a
+    // pinch or an overview tap ended the follow (those hold the view for the box they were made
+    // on; a page scroll started on the frame pans it). Fit stays the viewer's choice (pref).
+    if (oneColumn.matches && selected !== was && boxes()[selected]) view.follow = pref('follow', true);
     // Touch: the reason chips stay until the selection moves on; Redraw is of the box it started on.
     if (reasonAsk && !reasonAsk.timer && selected !== reasonAsk.sel) clearReason(true);
     if (taps && taps.kind === 'redraw' && selected !== taps.idx) cancelTaps();
