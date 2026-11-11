@@ -305,6 +305,35 @@ fn run_cancellable(
     )
 }
 
+/// One stage report: (stage, step, steps, percent, detail).
+type Shown = (String, usize, usize, u8, String);
+
+/// `run`, keeping every stage report.
+fn run_shown(job: &RefineJob, fake: &TrainerFake) -> (Result<TaskOutcome>, Vec<Shown>) {
+    let mut shown = Vec::new();
+    let out = job.run(
+        TaskContext {
+            runner: fake,
+            fetcher: fake,
+        },
+        &mut |r| {
+            if let TaskReport::Stage {
+                stage,
+                step,
+                steps,
+                percent,
+                detail,
+                ..
+            } = r
+            {
+                shown.push((stage.to_string(), step, steps, percent, detail.to_string()));
+            }
+        },
+        &AtomicBool::new(false),
+    );
+    (out, shown)
+}
+
 /// Every file under `dir` with its bytes.
 fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut out = BTreeMap::new();
@@ -588,6 +617,97 @@ fn a_failed_fold_keeps_the_earlier_folds_and_names_itself() {
         !job.work.exists(),
         "the kept checkpoint went with the work folder"
     );
+}
+
+#[test]
+fn a_folds_progress_names_no_config_and_no_benchmark() {
+    let t = tmp("progress");
+    dataset(&t.0.join("dataset"));
+    let predictor = Arc::new(PredictorFake::default());
+    let job = plan(&t.0, &predictor);
+    let (out, shown) = run_shown(&job, &trainer());
+    out.unwrap();
+    let folds: Vec<&Shown> = shown
+        .iter()
+        .filter(|s| s.0.starts_with("checking fold"))
+        .collect();
+    assert!(!folds.is_empty());
+    for (stage, _, _, pct, detail) in &folds {
+        let text = format!("{stage}: {detail}").to_lowercase();
+        for word in ["config", "benchmark", "installing the model files"] {
+            assert!(!text.contains(word), "{pct}% {text}");
+        }
+        // No path of the fold folder either.
+        assert!(
+            !detail.contains(&*job.work.to_string_lossy()),
+            "{pct}% {text}"
+        );
+    }
+    // The fold's training stages still show, the install as the fold model.
+    for want in ["training: ", "preparing the fold model: done"] {
+        assert!(
+            folds
+                .iter()
+                .any(|s| s.0 == "checking fold 2 of 4" && s.4.starts_with(want)),
+            "{want}: {folds:#?}"
+        );
+    }
+    // Percent never goes backwards.
+    let pcts: Vec<u8> = shown.iter().map(|s| s.3).collect();
+    assert!(pcts.windows(2).all(|w| w[0] <= w[1]), "{pcts:?}");
+    // The words of ordinary training runs are unchanged.
+    assert_eq!(
+        TrainStage::Register.label(),
+        "adding the model to the config"
+    );
+    assert_eq!(fold_stage_text(TrainStage::Register, 100, "x"), None);
+    assert_eq!(fold_stage_text(TrainStage::Benchmark, 0, "waiting"), None);
+    assert_eq!(
+        fold_stage_text(TrainStage::Install, 100, "/w/fold-1/model/m.onnx").as_deref(),
+        Some("preparing the fold model: done")
+    );
+    assert_eq!(
+        fold_stage_text(TrainStage::Train, 40, "epoch 2 of 8").as_deref(),
+        Some("training: epoch 2 of 8")
+    );
+    assert_eq!(fold_stage_label(TrainStage::Benchmark), FOLD_MODEL);
+    assert_eq!(
+        fold_stage_label(TrainStage::Dataset),
+        "assembling the dataset"
+    );
+}
+
+#[test]
+fn the_step_count_follows_the_folds_lowered_to_the_camera_days() {
+    let t = tmp("steps");
+    dataset(&t.0.join("dataset"));
+    let predictor = Arc::new(PredictorFake::default());
+    let req = RefineRequest {
+        folds: 8,
+        ..RefineRequest::default()
+    };
+    let mut job = plan_refine(&config(&t.0), req, &host()).unwrap();
+    job.min_frames = 4;
+    job.predictor = Some(predictor.clone());
+    // Queued: the asked count (planning reads no frames).
+    assert_eq!(job.steps(), 10);
+    let (out, shown) = run_shown(&job, &trainer());
+    let out = out.unwrap();
+    assert_eq!(out.result["folds"], 4, "four camera days: four folds");
+    // The first report is before the selection; every later one has the lowered count.
+    assert_eq!((shown[0].1, shown[0].2), (1, 10), "{:?}", shown[0]);
+    assert!(shown[1..].iter().all(|s| s.2 == 6), "{shown:#?}");
+    let last = shown.last().unwrap();
+    assert_eq!(
+        (last.0.as_str(), last.1, last.2, last.3),
+        (REPORTING, 6, 6, 100)
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|s| s.0 == "checking fold 4 of 4" && s.1 == 5)
+    );
+    assert!(!shown.iter().any(|s| s.0.contains("of 8")));
 }
 
 #[test]
@@ -890,10 +1010,189 @@ fn the_queue_runs_it_like_any_other_job() {
     svc.shutdown();
 }
 
+/// One detection of a [`DumpLine`] ([`Det`]'s fields).
+#[derive(Serialize)]
+struct DumpDet<'a> {
+    label: &'a str,
+    score: f32,
+    bbox: [f32; 4],
+}
+
+/// One line of the detection dump: what a fold model found on one frame.
+#[derive(Serialize)]
+struct DumpLine<'a> {
+    /// The fold model's name (`refine-fold-<n>`).
+    model: &'a str,
+    /// Its ONNX file.
+    onnx: &'a Path,
+    /// The device that ran ([`Detections::device`]).
+    device: &'a str,
+    /// The key in [`Detections::frames`] (`<scene>/<camera>/<date>/<stem>.jpg`).
+    frame: &'a str,
+    width: u32,
+    height: u32,
+    /// The threshold the predictor was asked for.
+    threshold: f32,
+    dets: Vec<DumpDet<'a>>,
+}
+
+/// A [`FoldPredictor`] that appends what `inner` found to `file` as JSONL, one line per frame,
+/// flushed per call (a cancelled run keeps the finished folds). Calibration data of
+/// [`refine_real_on_a_copy`] (`BOP_REFINE_DUMP`); test code only.
+struct DumpPredictor {
+    inner: Arc<dyn FoldPredictor>,
+    file: PathBuf,
+}
+
+impl DumpPredictor {
+    /// Lines of `found` for `images`: the frames the inner predictor answered; a frame it has
+    /// no entry for is written with no detections unless the run was cancelled (then it was
+    /// never looked at).
+    fn lines(
+        model: &FoldModel,
+        images: &[Image],
+        threshold: f32,
+        found: &Detections,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for img in images {
+            let dets = match found.frames.get(&img.frame) {
+                Some(d) => d.as_slice(),
+                None if found.cancelled => continue,
+                None => &[],
+            };
+            let line = DumpLine {
+                model: &model.name,
+                onnx: &model.onnx,
+                device: &found.device,
+                frame: &img.frame,
+                width: img.width,
+                height: img.height,
+                threshold,
+                dets: dets
+                    .iter()
+                    .map(|d| DumpDet {
+                        label: &d.label,
+                        score: d.score,
+                        bbox: d.bbox,
+                    })
+                    .collect(),
+            };
+            serde_json::to_writer(&mut out, &line)?;
+            out.push(b'\n');
+        }
+        Ok(out)
+    }
+}
+
+impl FoldPredictor for DumpPredictor {
+    fn predict(
+        &self,
+        model: &FoldModel,
+        images: &[Image],
+        threshold: f32,
+        cancel: &AtomicBool,
+    ) -> Result<Detections> {
+        use std::io::Write as _;
+        let found = self.inner.predict(model, images, threshold, cancel)?;
+        let bytes = Self::lines(model, images, threshold, &found)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file)
+            .with_context(|| format!("opening the dump {}", self.file.display()))?;
+        f.write_all(&bytes)
+            .and_then(|()| f.flush())
+            .and_then(|()| f.sync_data())
+            .with_context(|| format!("writing the dump {}", self.file.display()))?;
+        Ok(found)
+    }
+}
+
+#[test]
+fn the_dump_writes_a_line_per_frame_and_appends() {
+    let t = tmp("dump");
+    let file = t.0.join("dets.jsonl");
+    std::fs::write(&file, "").unwrap();
+    let dump = DumpPredictor {
+        inner: Arc::new(PredictorFake::default()),
+        file: file.clone(),
+    };
+    let model = FoldModel {
+        name: "refine-fold-1".into(),
+        onnx: t.0.join("m.onnx"),
+        yaml: t.0.join("m.yaml"),
+        family: crate::model::ModelFamilyKind::RfDetr,
+        classes: vec!["car".into(), "person".into()],
+    };
+    std::fs::write(&model.onnx, b"x").unwrap();
+    std::fs::write(&model.yaml, b"x").unwrap();
+    let image = |frame: &str| Image {
+        frame: frame.into(),
+        path: PathBuf::new(),
+        width: 320,
+        height: 240,
+    };
+    let cancel = AtomicBool::new(false);
+    let a = [
+        image("ir/alpha/2026-10-21/a.jpg"),
+        image("ir/alpha/2026-10-21/b.jpg"),
+    ];
+    let found = dump
+        .predict(&model, &a, judge::MATCH_MIN_SCORE, &cancel)
+        .unwrap();
+    assert_eq!(found.frames.len(), 2, "the inner answer is passed on");
+    dump.predict(
+        &model,
+        &[image("day/bravo/2026-10-22/c.jpg")],
+        judge::MATCH_MIN_SCORE,
+        &cancel,
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines[0]["model"], "refine-fold-1");
+    assert_eq!(lines[0]["frame"], "ir/alpha/2026-10-21/a.jpg");
+    assert_eq!(lines[2]["frame"], "day/bravo/2026-10-22/c.jpg");
+    assert_eq!(lines[0]["device"], "ort:cuda");
+    let d = &lines[1]["dets"];
+    assert_eq!(d.as_array().unwrap().len(), 2);
+    assert_eq!(d[1]["label"], "person");
+    assert_eq!(d[1]["score"].as_f64().unwrap() as f32, 0.82);
+    let bbox: Vec<f32> = d[1]["bbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap() as f32)
+        .collect();
+    assert_eq!(bbox, FAR);
+    // A cancelled answer writes only the frames it has; an unanswered frame of a finished one,
+    // no detections.
+    let found = Detections {
+        frames: BTreeMap::from([("ir/alpha/2026-10-21/a.jpg".to_string(), Vec::new())]),
+        device: String::new(),
+        cancelled: true,
+    };
+    let b = DumpPredictor::lines(&model, &a, 0.05, &found).unwrap();
+    assert_eq!(String::from_utf8(b).unwrap().lines().count(), 1);
+    let found = Detections {
+        cancelled: false,
+        ..found
+    };
+    let b = String::from_utf8(DumpPredictor::lines(&model, &a, 0.05, &found).unwrap()).unwrap();
+    assert_eq!(b.lines().count(), 2);
+    assert!(b.lines().all(|l| l.contains("\"dets\":[]")), "{b}");
+}
+
 /// The whole check on a copy of a dataset with the real training environment, trainer and
 /// detector: `BOP_REFINE_CONFIG=<config file whose collect.dir / review_dir is the copy>
 /// cargo test --lib refine_real -- --ignored --nocapture`. Never point it at a dataset someone is
-/// reviewing: it writes suggestions into the copy.
+/// reviewing: it writes suggestions into the copy. `BOP_REFINE_DUMP=<file>` also writes what each
+/// fold model found on each frame to that file as JSONL ([`DumpPredictor`]; emptied at the start).
 #[test]
 #[ignore = "needs a GPU, the training environment and a copy of a dataset"]
 fn refine_real_on_a_copy() {
@@ -902,12 +1201,20 @@ fn refine_real_on_a_copy() {
         return;
     };
     let cfg = Config::load(&path).unwrap();
-    let job = plan_refine(
+    let mut job = plan_refine(
         &cfg,
         RefineRequest::default(),
         &crate::training::capability_now(),
     )
     .unwrap();
+    if let Some(file) = std::env::var_os("BOP_REFINE_DUMP").map(PathBuf::from) {
+        std::fs::File::create(&file).unwrap();
+        println!("detections go to {}", file.display());
+        job.predictor = Some(Arc::new(DumpPredictor {
+            inner: job.predictor(),
+            file,
+        }));
+    }
     let runner = crate::resources::export::SystemRunner;
     let fetcher = crate::resources::export::cli_fetcher(&cfg.data_root());
     let started = Instant::now();

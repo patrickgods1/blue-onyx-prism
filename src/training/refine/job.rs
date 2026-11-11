@@ -37,7 +37,7 @@ use crate::config::Config;
 use crate::resources::export::Cancelled;
 use crate::resources::manager;
 use crate::training::autolabel::relabel::Image;
-use crate::training::job::{self, NoHooks, TrainJob, TrainReport};
+use crate::training::job::{self, NoHooks, TrainJob, TrainReport, TrainStage};
 use crate::training::pyenv::{check, is_cancel, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -114,6 +114,35 @@ pub struct RefineResult {
 enum Stop {
     Cancelled,
     Failed(anyhow::Error),
+}
+
+/// What a fold calls the end of its training run: the model files go into the fold's folder.
+const FOLD_MODEL: &str = "preparing the fold model";
+
+/// Steps of a check with `folds` folds: selecting, one per fold, the report.
+const fn steps_for(folds: usize) -> usize {
+    folds + 2
+}
+
+/// What a fold's training run shows of its stage `stage` at `percent` with `detail` (None:
+/// nothing). A fold model is never added to the config nor benchmarked ([`NoHooks`] does neither),
+/// so those two stages are not shown at all, and the install is [`FOLD_MODEL`] without the fold
+/// folder's path. Ordinary training runs keep [`TrainStage::label`]; only this adapter rewords.
+fn fold_stage_text(stage: TrainStage, percent: u8, detail: &str) -> Option<String> {
+    match stage {
+        TrainStage::Register | TrainStage::Benchmark => None,
+        TrainStage::Install if percent >= 100 => Some(format!("{FOLD_MODEL}: done")),
+        TrainStage::Install => Some(format!("{FOLD_MODEL}: {detail}")),
+        s => Some(format!("{}: {detail}", s.label())),
+    }
+}
+
+/// What a fold's failure message names as the stage that failed ([`fold_stage_text`]'s words).
+fn fold_stage_label(stage: TrainStage) -> &'static str {
+    match stage {
+        TrainStage::Install | TrainStage::Register | TrainStage::Benchmark => FOLD_MODEL,
+        s => s.label(),
+    }
 }
 
 /// The training run's failure message without its retry advice ([`KEPT_NOTE`]).
@@ -246,7 +275,7 @@ impl RefineJob {
     ) -> Result<()> {
         let k = s.k;
         let n = i + 1;
-        let steps = k + 2;
+        let steps = steps_for(k);
         let at = i + 2;
         let name = format!("checking fold {n} of {k}");
         let fold_dir = self.work.join(format!("fold-{n}"));
@@ -332,8 +361,10 @@ impl RefineJob {
                     percent,
                     detail,
                 } => {
+                    let Some(d) = fold_stage_text(ts, percent, detail) else {
+                        return;
+                    };
                     let pct = 5 + u32::from(ts.overall(percent)) * 80 / 100;
-                    let d = format!("{}: {detail}", ts.label());
                     Self::step(
                         report,
                         &name,
@@ -356,7 +387,7 @@ impl RefineJob {
             Err(e) => {
                 let during = e
                     .stage
-                    .map(|st| format!(" while {}", st.label()))
+                    .map(|st| format!(" while {}", fold_stage_label(st)))
                     .unwrap_or_default();
                 bail!(
                     "fold {n} of {k}: training its model failed{during}: {}. A fold model is \
@@ -479,7 +510,8 @@ impl RefineJob {
             bail!("{why}");
         }
         let k = s.k;
-        let steps = k + 2;
+        // From here on the count the folds were lowered to ([`Task::steps`] has the asked one).
+        let steps = steps_for(k);
         let recipe = &self.train.request.recipe;
         let mut rep = RefineReport::new(&self.id, k, recipe_info(recipe, &self.recipe_from));
         rep.camera_days = s.groups.len();
@@ -641,8 +673,13 @@ impl Task for RefineJob {
             self.request.frames.describe()
         )
     }
+    /// The steps of the asked fold count. The folds may be lowered to the camera days, which only
+    /// the selection at run time knows (planning reads no frames, and the label snapshot must be
+    /// the one the folds use), so this is the queued record's count until then: every stage
+    /// report carries its own `steps` and the queue takes it from there (the first report still
+    /// this count, every one after the selection [`steps_for`] of the lowered count).
     fn steps(&self) -> usize {
-        self.request.folds + 2
+        steps_for(self.request.folds)
     }
     fn run(
         &self,
