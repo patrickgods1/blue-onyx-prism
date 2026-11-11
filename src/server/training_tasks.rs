@@ -89,6 +89,7 @@ pub(super) fn task_rows(tasks: &[TaskRecord]) -> Vec<TaskRow> {
                 TaskKind::Import => "import",
                 TaskKind::Autolabel => "auto-label",
                 TaskKind::Overlaps => "overlap check",
+                TaskKind::Refine => "dataset check",
             },
             title: r.title.clone(),
             state: r.state.as_str(),

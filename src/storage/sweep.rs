@@ -3,8 +3,9 @@
 //!
 //! In order: cache folders unused for [`super::caches::UNUSED_DAYS`] and the CoreML orphans
 //! ([`super::caches`]); `.<name>.train-staging` folders no running training holds; work folders
-//! of auto-label, import and overlap jobs that crashed ([`super::busy`]), an auto-label's finished
-//! proposals written to their frames first ([`crate::training::autolabel::job::recover_crashed`],
+//! of auto-label, import, overlap and dataset-check jobs that crashed ([`super::busy`]), an
+//! auto-label's finished proposals written to their frames first
+//! ([`crate::training::autolabel::job::recover_crashed`],
 //! the folder kept and the reason logged when that fails); then `review-queue.jsonl` compaction
 //! of the dataset and review folders ([`crate::collect::layout::compact_review`]). Every removal is
 //! logged with its size ([`super::remove_counted`]), and the sweep ends with one summary line.
@@ -19,10 +20,11 @@ use std::time::{Duration, SystemTime};
 pub const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The work folders of the training queue's jobs: `<training dir>/<sub>/<task id>`.
-pub const WORK_DIRS: [(&str, WorkKind); 3] = [
+pub const WORK_DIRS: [(&str, WorkKind); 4] = [
     ("autolabel", WorkKind::Autolabel),
     ("imports", WorkKind::Import),
     ("overlaps", WorkKind::Overlaps),
+    ("refine", WorkKind::Refine),
 ];
 
 /// Whose work folder.
@@ -31,6 +33,8 @@ pub enum WorkKind {
     Autolabel,
     Import,
     Overlaps,
+    /// A dataset check: its fold exports and fold models, all rebuildable.
+    Refine,
 }
 
 impl WorkKind {
@@ -39,6 +43,7 @@ impl WorkKind {
             WorkKind::Autolabel => "auto-label",
             WorkKind::Import => "import",
             WorkKind::Overlaps => "overlap check",
+            WorkKind::Refine => "dataset check",
         }
     }
 }
@@ -313,7 +318,12 @@ pub fn sweep_work(s: &Settings, rep: &mut Report) {
             rep.kept.push(format!("{}: {why}", w.dir.display()));
             continue;
         }
-        let why = format!("work folder of an {} that crashed", w.kind.as_str());
+        let article = if w.kind == WorkKind::Refine {
+            "a"
+        } else {
+            "an"
+        };
+        let why = format!("work folder of {article} {} that crashed", w.kind.as_str());
         if remove_counted(&w.dir, &why, &mut rep.removed) {
             claim.finish();
         }

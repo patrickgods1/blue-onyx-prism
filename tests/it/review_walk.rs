@@ -325,6 +325,7 @@ fn label_file(rng: &mut Rng) -> LabelFile {
         overlaps_checked: false,
         checked_before_reopen: false,
         overlap_suggestions,
+        refine: Vec::new(),
         boxes,
     }
 }

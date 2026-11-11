@@ -483,7 +483,8 @@ pub(super) fn export_row(dir: &Path) -> ExportRow {
 pub(super) const fn task_tab(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Import => IMPORT,
-        TaskKind::Autolabel | TaskKind::Overlaps => AUTOLABEL,
+        // A dataset check gets its own tab later; until then it shows with the auto-label jobs.
+        TaskKind::Autolabel | TaskKind::Overlaps | TaskKind::Refine => AUTOLABEL,
     }
 }
 
@@ -502,6 +503,7 @@ fn current_job(runs: &[RunRecord], tasks: &[crate::training::task::TaskRecord]) 
                 TaskKind::Import => "An import",
                 TaskKind::Autolabel => "An auto-label run",
                 TaskKind::Overlaps => "An overlap check",
+                TaskKind::Refine => "A dataset check",
             },
             tab: task_tab(t.kind),
             paused: s == RunState::Paused,

@@ -187,6 +187,7 @@ const fn task_kind(kind: TaskKind) -> &'static str {
         TaskKind::Import => "Import",
         TaskKind::Autolabel => "Auto-label",
         TaskKind::Overlaps => "Overlap check",
+        TaskKind::Refine => "Dataset check",
     }
 }
 
