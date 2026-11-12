@@ -64,10 +64,12 @@ use crate::collect::labels::refine::{self, Kind, Suggestion};
 use crate::collect::labels::repeats::same_object;
 use crate::collect::labels::statics::{self, Spot};
 use crate::collect::labels::{
-    BoxState, LabelBox, LabelFile, SizeFloor, Source, Status, clamp_box, covers, iou, under_floor,
+    BoxState, LabelBox, LabelFile, SizeFloor, Source, Status, clamp_box, covers, inside_share, iou,
+    stacks, under_floor,
 };
 use crate::model::coco::coco_class;
 use crate::training::autolabel::triage::Det;
+use crate::training::overlaps::zoom::CropPlace;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -125,6 +127,15 @@ pub const TIGHTEN_ZOOM_SCORE: f32 = 0.5;
 /// ([`crate::collect::labels::overlaps::ZOOM_MATCH_IOU`]). Two independent looks that agree with
 /// each other and not with the label outvote it; one look alone does not.
 pub const TIGHTEN_AGREE_IOU: f32 = 0.6;
+/// Share of a second detection of the closer look (of the label's object, not `Z` again) inside the
+/// label from which the label spans that object too ([`NoTighten::SpansTwo`]): the overlap check's
+/// share for a box nested in another ([`stacks::NESTED_SHARE`], 0.8). Moving such a label onto `Z`
+/// would leave the other object unlabelled.
+pub const TIGHTEN_SPAN_INSIDE: f32 = stacks::NESTED_SHARE;
+/// Pixels within which an edge of `Z` lies on an edge of its crop ([`NoTighten::CropEdge`]): the
+/// script's boxes are kept to 0.1 px and its crops are whole pixels, so an object cut by the crop
+/// ends there exactly, give or take the model's last pixel.
+pub const TIGHTEN_EDGE_PX: f32 = 1.0;
 
 /// One frame to judge.
 #[derive(Debug, Clone, Copy)]
@@ -604,32 +615,122 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     out
 }
 
+/// The closer look's answer for one candidate: RF-DETR L's detections on the padded crop of the
+/// pair, in frame coordinates, and where that crop lay (the script's own line; None when it does
+/// not say, which [`NoTighten::CropEdge`] then cannot judge).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Look {
+    pub dets: Vec<ZoomDet>,
+    pub place: Option<CropPlace>,
+}
+
+/// Why the closer look's answer for a candidate proposes nothing ([`tighten_verdict`]), in the
+/// order the rules are asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NoTighten {
+    /// No box of the object agrees with the fold model's (none at all, or (a) fails).
+    NoAgree,
+    /// (b) `Z` fits the label: the fold model was imprecise, the label is fine.
+    LabelFine,
+    /// (e) Another box of the closer look fits the label: it found the label's object as labelled.
+    LabelFound,
+    /// (f) The label spans a second object the closer look tells apart.
+    SpansTwo,
+    /// (c) `Z` is too small to propose.
+    Small,
+    /// (g) `Z` ends on an edge of its crop inside the frame: the object goes on past it.
+    CropEdge,
+    /// (d) `Z` is the neighbour's box.
+    Neighbour,
+    /// The label is no candidate any more (changed, a reviewer's, too small), or the proposal
+    /// would not be live.
+    Other,
+}
+
+impl NoTighten {
+    /// One word for it (the replay's tally).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            NoTighten::NoAgree => "no_agree",
+            NoTighten::LabelFine => "label_fine",
+            NoTighten::LabelFound => "label_found",
+            NoTighten::SpansTwo => "spans_two",
+            NoTighten::Small => "small",
+            NoTighten::CropEdge => "crop_edge",
+            NoTighten::Neighbour => "neighbour",
+            NoTighten::Other => "other",
+        }
+    }
+}
+
+fn area(b: &[f32; 4]) -> f32 {
+    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
+}
+
+/// Whether `z` ends within [`TIGHTEN_EDGE_PX`] of an edge of the crop at `place` that is not the
+/// image's own edge: the object was cut there. False without a place.
+fn cut_by_crop(z: &[f32; 4], place: Option<CropPlace>) -> bool {
+    let Some(p) = place else {
+        return false;
+    };
+    #[allow(clippy::cast_possible_truncation, reason = "pixels")]
+    let c = p.crop.map(|v| v as f32);
+    #[allow(clippy::cast_precision_loss, reason = "pixels")]
+    let (w, h) = (p.size[0] as f32, p.size[1] as f32);
+    let e = TIGHTEN_EDGE_PX;
+    (c[0] > 0.0 && z[0] <= c[0] + e)
+        || (c[1] > 0.0 && z[1] <= c[1] + e)
+        || (c[2] < w && z[2] >= c[2] - e)
+        || (c[3] < h && z[3] >= c[3] - e)
+}
+
+/// The `tighten` the closer look supports for candidate `c` ([`tighten_verdict`]), or None.
+pub fn tighten(
+    frame: &FrameInput<'_>,
+    c: &Loose,
+    look: &Look,
+    ctx: &Context<'_>,
+) -> Option<Suggestion> {
+    tighten_verdict(frame, c, look, ctx).ok()
+}
+
 /// The `tighten` the closer look supports for candidate `c` (a [`Loose`] pair of `frame`, whose
-/// file is the label file as it is now), from `zoom`: RF-DETR L's detections on the padded crop of
-/// the pair, in frame coordinates. Pure. The closer look's box `Z` is its detection of the same
-/// object ([`same_object`]) at [`TIGHTEN_ZOOM_SCORE`] or more with the best IoU to the fold
-/// model's `D` (ties: the higher score, then the earlier detection), clamped to the frame. A
-/// `tighten` to `Z` (score `Z`'s) only when:
+/// file is the label file as it is now), from `look` ([`Look`]), or why none. Pure. The closer
+/// look's boxes of the object are its detections of the same object ([`same_object`]) at
+/// [`TIGHTEN_ZOOM_SCORE`] or more, clamped to the frame; `Z` is the one with the best IoU to the
+/// fold model's `D` (ties: the higher score, then the earlier detection). A `tighten` to `Z` (score
+/// `Z`'s) only when:
 ///
 /// - (a) `Z` agrees with the fold model: IoU(`Z`, `D`) >= [`TIGHTEN_AGREE_IOU`];
 /// - (b) the label is loose against `Z` too: IoU(`L`, `Z`) < [`GOOD_IOU`] (else the label was fine
 ///   and the fold model imprecise);
+/// - (e) no box of the closer look fits the label: none at IoU(`L`, box) >= [`GOOD_IOU`] (it found
+///   the label's object as labelled; `D` and `Z` are then another object, say a car parked behind
+///   the labelled one that the fold model missed);
+/// - (f) the label spans no second object the closer look tells apart: no other box of the closer
+///   look, not `Z` again (IoU with `Z` under [`TIGHTEN_AGREE_IOU`] and not nested in it or around
+///   it, [`TIGHTEN_SPAN_INSIDE`]), lies [`TIGHTEN_SPAN_INSIDE`] or more inside `L` (and is no larger
+///   than `L`) without another box of the object on the frame covering it ([`covers`]): moving
+///   the label onto `Z` would leave that object unlabelled;
 /// - (c) `Z` is a proper box on the frame, not under the size floor nor [`FLOOR_PX`] at the fold
 ///   models' input (rule 4's floor);
+/// - (g) `Z` was not cut by its crop: no edge of `Z` within [`TIGHTEN_EDGE_PX`] of an edge of the
+///   crop that is not the image's edge (the object goes on past the padded union; the script
+///   keeps its boxes to the crop);
 /// - (d) `Z` is not another object's box: no other training box or ignore region of the object on
 ///   the frame overlaps `Z` more than `L` does (the two looks found the neighbour);
 ///
 /// and the label is still a candidate: a training box of the frame, reviewed, no reviewer's box,
-/// not under the floor, and the suggestion is [`refine::live`]. None otherwise, and with no `Z`.
-pub fn tighten(
+/// not under the floor, and the suggestion is [`refine::live`] ([`NoTighten::Other`] otherwise).
+pub fn tighten_verdict(
     frame: &FrameInput<'_>,
     c: &Loose,
-    zoom: &[ZoomDet],
+    look: &Look,
     ctx: &Context<'_>,
-) -> Option<Suggestion> {
+) -> Result<Suggestion, NoTighten> {
     let f = frame.file;
     if f.status != Status::Reviewed || !proper(&c.target) || !proper(&c.det) {
-        return None;
+        return Err(NoTighten::Other);
     }
     let wanted = ctx.wanted;
     let (w, h) = (frame.width, frame.height);
@@ -638,15 +739,19 @@ pub fn tighten(
         |b: &[f32; 4]| under_floor(b, w, h, floor) || short_px(b, w, h, ctx.imgsz) < FLOOR_PX;
     let key = key_of(&c.class, wanted);
     // The label: still a training box no reviewer touched, and big enough to judge.
-    let at = f.boxes.iter().position(|b| {
-        b.bbox == c.target
-            && b.label.trim().eq_ignore_ascii_case(c.target_label.trim())
-            && b.is_training()
-            && !b.is_ignore()
-    })?;
-    let l = f.boxes.get(at)?;
+    let at = f
+        .boxes
+        .iter()
+        .position(|b| {
+            b.bbox == c.target
+                && b.label.trim().eq_ignore_ascii_case(c.target_label.trim())
+                && b.is_training()
+                && !b.is_ignore()
+        })
+        .ok_or(NoTighten::Other)?;
+    let l = f.boxes.get(at).ok_or(NoTighten::Other)?;
     if reviewers(l) || small(&l.bbox) {
-        return None;
+        return Err(NoTighten::Other);
     }
     let fit = |b: [f32; 4]| {
         if w > 0 && h > 0 {
@@ -655,7 +760,9 @@ pub fn tighten(
             b
         }
     };
-    let (_, z, z_score) = zoom
+    // The closer look's boxes of the object.
+    let seen: Vec<(usize, [f32; 4], f32)> = look
+        .dets
         .iter()
         .enumerate()
         .filter_map(|(i, d)| {
@@ -670,24 +777,57 @@ pub fn tighten(
             let b = fit(bbox);
             proper(&b).then_some((i, b, score.min(1.0)))
         })
+        .collect();
+    let (zi, z, z_score) = seen
+        .iter()
+        .copied()
         .max_by(|a, b| {
             iou(&a.1, &c.det)
                 .total_cmp(&iou(&b.1, &c.det))
                 .then(a.2.total_cmp(&b.2))
                 .then(b.0.cmp(&a.0))
-        })?;
+        })
+        .ok_or(NoTighten::NoAgree)?;
     // (a) Two looks agree ...
     if iou(&z, &c.det) < TIGHTEN_AGREE_IOU {
-        return None;
+        return Err(NoTighten::NoAgree);
     }
     // (b) ... and not with the label.
     let lz = iou(&c.target, &z);
     if lz >= GOOD_IOU {
-        return None;
+        return Err(NoTighten::LabelFine);
+    }
+    // (e) The closer look found the label's object as labelled: D and Z are another object.
+    if seen.iter().any(|(_, b, _)| iou(&c.target, b) >= GOOD_IOU) {
+        return Err(NoTighten::LabelFound);
+    }
+    // (f) The label spans a second object that no other box labels.
+    let labelled_elsewhere = |b: &[f32; 4]| {
+        f.boxes.iter().enumerate().any(|(i, x)| {
+            i != at
+                && (x.is_training() || x.is_ignore())
+                && same_object(&key_of(&x.label, wanted), &key)
+                && covers(&x.bbox, b)
+        })
+    };
+    let second = seen.iter().any(|(i, b, _)| {
+        *i != zi
+            && iou(b, &z) < TIGHTEN_AGREE_IOU
+            && inside_share(b, &z) < TIGHTEN_SPAN_INSIDE
+            && area(b) <= area(&c.target)
+            && inside_share(b, &c.target) >= TIGHTEN_SPAN_INSIDE
+            && !labelled_elsewhere(b)
+    });
+    if second {
+        return Err(NoTighten::SpansTwo);
     }
     // (c) A box worth proposing.
     if small(&z) {
-        return None;
+        return Err(NoTighten::Small);
+    }
+    // (g) Not an object cut by its crop.
+    if cut_by_crop(&z, look.place) {
+        return Err(NoTighten::CropEdge);
     }
     // (d) Not the neighbour's box.
     let neighbour = f.boxes.iter().enumerate().any(|(i, b)| {
@@ -697,7 +837,7 @@ pub fn tighten(
             && iou(&b.bbox, &z) > lz
     });
     if neighbour {
-        return None;
+        return Err(NoTighten::Neighbour);
     }
     let s = Suggestion {
         target: Some(c.target),
@@ -717,7 +857,10 @@ pub fn tighten(
     };
     let mut probe = f.clone();
     probe.refine = vec![s.clone()];
-    (!refine::live(&probe, Some(wanted)).is_empty()).then_some(s)
+    if refine::live(&probe, Some(wanted)).is_empty() {
+        return Err(NoTighten::Other);
+    }
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -1621,13 +1764,24 @@ mod tests {
         }
     }
 
-    /// [`tighten`] on `f` (640 x 480, input 640) for `c` with `zoom`, under `floor`.
+    /// [`tighten`] on `f` (640 x 480, input 640) for `c` with `zoom` (no crop place), under `floor`.
     fn refit(
         f: &LabelFile,
         c: &Loose,
         zoom: &[ZoomDet],
         floor: Option<SizeFloor>,
     ) -> Option<Suggestion> {
+        verdict(f, c, zoom, None, floor).ok()
+    }
+
+    /// [`tighten_verdict`] on `f` (640 x 480, input 640) for `c` with `zoom` cut from `place`.
+    fn verdict(
+        f: &LabelFile,
+        c: &Loose,
+        zoom: &[ZoomDet],
+        place: Option<CropPlace>,
+        floor: Option<SizeFloor>,
+    ) -> Result<Suggestion, NoTighten> {
         let cl = classes();
         let w = Wanted {
             classes: &cl,
@@ -1642,7 +1796,7 @@ mod tests {
             spots: None,
             floor,
         };
-        let s = tighten(
+        let s = tighten_verdict(
             &FrameInput {
                 file: f,
                 width: 640,
@@ -1652,10 +1806,13 @@ mod tests {
                 day: "2026-10-01",
             },
             c,
-            zoom,
+            &Look {
+                dets: zoom.to_vec(),
+                place,
+            },
             &ctx,
         );
-        if let Some(s) = &s {
+        if let Ok(s) = &s {
             refine::check(std::slice::from_ref(s)).unwrap();
             assert_eq!(s.run, "r1");
         }
@@ -1793,8 +1950,10 @@ mod tests {
              model (score 0.83) both put this car here; the label overlaps that box at IoU 0.48"
         );
         // A truck of the closer look is the car's box too; the best IoU to D wins, then the
-        // higher score; an unwanted label of another object is no box of it.
-        let off = [140.0, 100.0, 240.0, 180.0];
+        // higher score; an unwanted label of another object is no box of it. (`off` half outside
+        // the label: one mostly inside it would be a second object the label spans.)
+        let off = [140.0, 60.0, 240.0, 140.0];
+        assert!(inside_share(&off, &LOOSE) < TIGHTEN_SPAN_INSIDE);
         let s = refit(
             &f,
             &c,
@@ -1877,6 +2036,201 @@ mod tests {
             let f = reviewed(vec![acc("car", LOOSE), other]);
             assert!(refit(&f, &c, &[zd("car", NEAR, 0.9)], None).is_some());
         }
+    }
+
+    /// The candidate of a car label `l` the fold model found at `d` (score 0.9).
+    fn pair_of(l: [f32; 4], d: [f32; 4]) -> Loose {
+        Loose {
+            target: l,
+            target_label: "car".into(),
+            class: "car".into(),
+            det: d,
+            det_score: 0.9,
+        }
+    }
+
+    #[test]
+    fn a_closer_look_that_finds_the_label_as_labelled_moves_no_label_to_another_object() {
+        // Two overlapping parked cars, only car 1 labelled (correctly). The fold model misses car
+        // 1 and finds car 2, which the one-to-one matching pairs with car 1's label as "loose".
+        let car1 = CAR;
+        let car2 = [150.0, 100.0, 250.0, 180.0];
+        assert!((iou(&car1, &car2) - 1.0 / 3.0).abs() < 1e-4);
+        let f = reviewed(vec![acc("car", car1)]);
+        let j = run(&f, &[det("car", car2, 0.9)]);
+        assert_eq!((j.loose, j.candidates.len()), (1, 1), "{j:?}");
+        assert!(
+            j.suggestions.is_empty(),
+            "car 2's detection is the label's pair: no add"
+        );
+        let c = j.candidates[0].clone();
+        assert_eq!(c, pair_of(car1, car2));
+        // The closer look sees both: Z1 on the label, Z2 on car 2 (the best IoU to D, so `Z`).
+        let z1 = [101.0, 100.0, 201.0, 181.0];
+        let z2 = [151.0, 100.0, 251.0, 180.0];
+        assert!(iou(&z1, &car1) >= GOOD_IOU && iou(&z2, &car2) >= TIGHTEN_AGREE_IOU);
+        assert!(iou(&z2, &car1) < GOOD_IOU);
+        let both = [zd("car", z2, 0.9), zd("car", z1, 0.8)];
+        assert_eq!(
+            verdict(&f, &c, &both, None, None).unwrap_err(),
+            NoTighten::LabelFound
+        );
+        // A truck of the closer look on the label is the car found as labelled too; one under
+        // TIGHTEN_ZOOM_SCORE is no box.
+        let truck = [zd("car", z2, 0.9), zd("truck", z1, 0.6)];
+        assert_eq!(
+            verdict(&f, &c, &truck, None, None).unwrap_err(),
+            NoTighten::LabelFound
+        );
+        let faint = [zd("car", z2, 0.9), zd("car", z1, 0.49)];
+        assert!(verdict(&f, &c, &faint, None, None).is_ok());
+        // Seeing car 2 alone, the closer look cannot tell (the limit of one crop's evidence).
+        assert!(verdict(&f, &c, &both[..1], None, None).is_ok());
+    }
+
+    #[test]
+    fn a_label_around_two_objects_the_closer_look_tells_apart_is_not_moved_onto_one() {
+        // One label drawn around two cars; the fold model finds car 2, the closer look both.
+        let l = LOOSE;
+        let car2 = [200.0, 100.0, 300.0, 180.0];
+        assert!((iou(&l, &car2) - 0.5).abs() < 1e-6);
+        let f = reviewed(vec![acc("car", l)]);
+        let c = pair_of(l, car2);
+        let z2 = [201.0, 100.0, 300.0, 181.0];
+        let z1 = [100.0, 102.0, 195.0, 178.0];
+        assert!(inside_share(&z1, &l) >= TIGHTEN_SPAN_INSIDE);
+        assert!(iou(&z1, &l) < GOOD_IOU, "not the label found as labelled");
+        let zoom = [zd("car", z2, 0.9), zd("car", z1, 0.85)];
+        assert_eq!(
+            verdict(&f, &c, &zoom, None, None).unwrap_err(),
+            NoTighten::SpansTwo
+        );
+        // Car 1 mostly outside the label: not spanned.
+        let out = [40.0, 102.0, 135.0, 178.0];
+        assert!(inside_share(&out, &l) < TIGHTEN_SPAN_INSIDE);
+        let s = verdict(
+            &f,
+            &c,
+            &[zd("car", z2, 0.9), zd("car", out, 0.85)],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.bbox, Some(z2));
+        // Car 1 labelled by a box of its own: the move leaves nothing unlabelled.
+        let own = [100.0, 100.0, 196.0, 180.0];
+        let f2 = reviewed(vec![acc("car", l), acc("car", own)]);
+        assert!(verdict(&f2, &c, &zoom, None, None).is_ok());
+        // A second box of Z's own object (a truck on the same car, or a part of it) is no second
+        // object.
+        for copy in [[200.0, 100.0, 299.0, 180.0], [230.0, 110.0, 290.0, 170.0]] {
+            let zoom = [zd("car", z2, 0.9), zd("truck", copy, 0.8)];
+            assert!(verdict(&f, &c, &zoom, None, None).is_ok(), "{copy:?}");
+        }
+        // Nor is one under TIGHTEN_ZOOM_SCORE, or of another object.
+        for other in [zd("car", z1, 0.4), zd("person", z1, 0.95)] {
+            let zoom = [zd("car", z2, 0.9), other];
+            assert!(verdict(&f, &c, &zoom, None, None).is_ok());
+        }
+        // The share is the overlap check's nested share.
+        assert_eq!(TIGHTEN_SPAN_INSIDE, stacks::NESTED_SHARE);
+    }
+
+    #[test]
+    fn a_box_the_crop_cut_off_is_not_proposed() {
+        let (f, c) = loose_car();
+        let place = |crop: [f64; 4], size: [u32; 2]| Some(CropPlace { crop, size });
+        let zoom = [zd("car", NEAR, 0.9)];
+        // The script's crop: the union [100, 100, 300, 180] padded by 20%.
+        let ok = place([60.0, 84.0, 340.0, 196.0], [640, 480]);
+        assert!(verdict(&f, &c, &zoom, ok, None).is_ok());
+        // NEAR = [102, 101, 201, 182]: an edge within a pixel of a crop edge inside the frame is a
+        // cut; a pixel and more away is not.
+        let cases: [([f64; 4], bool); 6] = [
+            ([101.0, 84.0, 340.0, 196.0], true),
+            ([100.5, 84.0, 340.0, 196.0], false),
+            ([60.0, 100.0, 340.0, 196.0], true),
+            ([60.0, 84.0, 202.0, 196.0], true),
+            ([60.0, 84.0, 340.0, 183.0], true),
+            ([60.0, 84.0, 340.0, 183.5], false),
+        ];
+        for (crop, cut) in cases {
+            let v = verdict(&f, &c, &zoom, place(crop, [640, 480]), None);
+            assert_eq!(v.err(), cut.then_some(NoTighten::CropEdge), "{crop:?}");
+        }
+        // The crop's edge is the image's: no cut. A car at the frame's left edge, the crop from 0.
+        let (l2, d2) = ([0.0, 100.0, 300.0, 180.0], [0.0, 100.0, 190.0, 180.0]);
+        let f2 = reviewed(vec![acc("car", l2)]);
+        let c2 = pair_of(l2, d2);
+        let z = [zd("car", [0.0, 100.0, 195.0, 180.0], 0.9)];
+        assert!(
+            verdict(
+                &f2,
+                &c2,
+                &z,
+                place([0.0, 84.0, 360.0, 196.0], [640, 480]),
+                None
+            )
+            .is_ok()
+        );
+        // Its right edge on the crop's: cut, unless the image ends there.
+        let right = [0.0, 84.0, 195.0, 196.0];
+        assert_eq!(
+            verdict(&f2, &c2, &z, place(right, [640, 480]), None).unwrap_err(),
+            NoTighten::CropEdge
+        );
+        assert!(verdict(&f2, &c2, &z, place(right, [195, 480]), None).is_ok());
+    }
+
+    #[test]
+    fn each_rule_says_why_it_proposes_nothing() {
+        let (f, c) = loose_car();
+        let why = |zoom: &[ZoomDet], f: &LabelFile| verdict(f, &c, zoom, None, None).unwrap_err();
+        assert_eq!(why(&[], &f), NoTighten::NoAgree);
+        assert_eq!(
+            why(&[zd("car", [150.0, 100.0, 250.0, 180.0], 0.9)], &f),
+            NoTighten::NoAgree
+        );
+        assert_eq!(
+            why(&[zd("car", [100.0, 100.0, 250.0, 180.0], 0.9)], &f),
+            NoTighten::LabelFine
+        );
+        let neighbour = reviewed(vec![
+            acc("car", LOOSE),
+            acc("car", [101.0, 100.0, 203.0, 182.0]),
+        ]);
+        assert_eq!(
+            why(&[zd("car", NEAR, 0.9)], &neighbour),
+            NoTighten::Neighbour
+        );
+        let mut drawn = f.clone();
+        drawn.boxes[0].source = Source::Human;
+        assert_eq!(why(&[zd("car", NEAR, 0.9)], &drawn), NoTighten::Other);
+        let words: Vec<&str> = [
+            NoTighten::NoAgree,
+            NoTighten::LabelFine,
+            NoTighten::LabelFound,
+            NoTighten::SpansTwo,
+            NoTighten::Small,
+            NoTighten::CropEdge,
+            NoTighten::Neighbour,
+            NoTighten::Other,
+        ]
+        .map(NoTighten::as_str)
+        .to_vec();
+        assert_eq!(
+            words,
+            [
+                "no_agree",
+                "label_fine",
+                "label_found",
+                "spans_two",
+                "small",
+                "crop_edge",
+                "neighbour",
+                "other"
+            ]
+        );
     }
 
     #[test]

@@ -11,16 +11,19 @@
 //!   ([`super::judge::Judged::candidates`]), with the fold model's detections of the frame, appended to
 //!   `<work>/`[`CANDIDATES_FILE`] as the folds finish. The work folder goes at the end of the
 //!   check however it ends, so a crash leaves them for nobody.
-//! - **The look** runs once, after the last fold, on every candidate of the check, holding the
-//!   training lock the check holds. It is one step of the job ("looking closer at N loose
-//!   labels"), cancellable and pausable like the overlap check (the queue's runner suspends the
-//!   script). A Cancel before it (during the folds) skips it: Cancel means stop.
+//! - **The look** runs once, after the last fold, on the check's candidates, at most
+//!   [`MAX_TIGHTEN_CANDIDATES`] of them (the most confident fold detections, [`bound`]; the rest
+//!   left out with a warning), holding the training lock the check holds. It is one step of the job
+//!   ("looking closer at N loose labels", N the labels it looks at), cancellable and pausable like
+//!   the overlap check (the queue's runner suspends the script). A Cancel before it (during the
+//!   folds) skips it: Cancel means stop.
 //! - **The write** ([`super::write::write_tighten`]) judges each frame afresh under the label
 //!   write lock: the frame still reviewed, its candidates found again from the fold model's
 //!   detections on the file as it is now, each matched to its crop's answer ([`Loose::same_pair`]).
-//!   `tighten` is among the kinds written only for frames whose candidates the look answered, so a
-//!   check without the stage, a failed or cancelled look, or a crop that never finished, never
-//!   deletes an earlier `tighten`; an open one on a label the look did not answer is kept as it is.
+//!   Only the open `tighten` of a label whose candidate the look answered is replaced (by what the
+//!   answer supports, or nothing); an open one on any other label (no candidate this time, left out
+//!   by the bound, its crop unanswered) is kept as it is, so a check without the stage, a failed or
+//!   cancelled look, or a crop that never finished, never deletes an earlier `tighten`.
 //!   An answered `tighten` stays and is not asked again: [`refine::same_finding`] keys a `tighten`
 //!   on its target box (the exact `bbox` and its label), whatever box it proposed.
 //! - **A failure** of the look (the environment, the weights, the memory, the script) keeps the
@@ -30,12 +33,11 @@
 //! [`refine::same_finding`]: crate::collect::labels::refine::same_finding
 
 use super::job::{Acc, RefineJob};
-use super::judge::Loose;
+use super::judge::{Look, Loose};
 use super::write;
-use crate::collect::labels::overlaps::Det as ZoomDet;
 use crate::training::autolabel::triage::Det;
 use crate::training::overlaps::select::{Crop, Selected};
-use crate::training::overlaps::zoom::{self, CropResult};
+use crate::training::overlaps::zoom::{self, CropPlace, CropResult};
 use crate::training::pyenv::{is_cancel, stage};
 use crate::training::task::{TaskContext, TaskReport};
 use anyhow::{Context, Result};
@@ -53,17 +55,88 @@ pub const ZOOM_DIR: &str = "zoom";
 /// GTX 1070 Ti, 3,578 crops in about 5 minutes; its Review page estimate uses 0.08 s).
 pub const ZOOM_S_PER_CROP: f64 = 0.079;
 /// Seconds of the look beyond its crops: the environment check, the script's self-check and
-/// loading RF-DETR L. A rough figure (not measured apart from the crops); the preview says "a few
-/// minutes".
+/// loading RF-DETR L. A rough figure (not measured apart from the crops).
 pub const ZOOM_FIXED_S: f64 = 90.0;
+/// Most loose labels one check looks at closer: those with the most confident fold detections
+/// ([`bound`]); the others are left out with a warning (their open `tighten` stays as it was). At
+/// the measured [`ZOOM_S_PER_CROP`] 2,000 crops take under 3 minutes; on a GPU ten times slower,
+/// about half an hour, which still leaves the folds the larger part of a check. The 851 reviewed
+/// frames measured had 82 candidates.
+pub const MAX_TIGHTEN_CANDIDATES: usize = 2_000;
 
 /// Rough seconds of the look over a check of `frames` frames, before anyone knows how many loose
-/// labels it has: one crop per frame at most (on 851 reviewed frames the fold models found 148
-/// loose labels, fewer of them confident), plus [`ZOOM_FIXED_S`].
+/// labels it has: one crop per frame (on 851 reviewed frames the fold models found 148 loose labels,
+/// 82 of them candidates), at most [`MAX_TIGHTEN_CANDIDATES`], plus [`ZOOM_FIXED_S`]. The preview
+/// words it as a bound per loose label, not a total ([`time_line`]).
 pub fn estimate_seconds(frames: usize) -> f64 {
     #[allow(clippy::cast_precision_loss, reason = "a count of frames")]
-    let n = frames as f64;
+    let n = frames.min(MAX_TIGHTEN_CANDIDATES) as f64;
     ZOOM_FIXED_S + ZOOM_S_PER_CROP * n
+}
+
+/// What the preview says the look adds to a check's time: no promise of minutes, since the count
+/// of loose labels is known only after the folds.
+pub fn time_line() -> String {
+    format!(
+        "the closer look adds a minute or two to set up, then up to about a second per loose label \
+         it looks at (at most {})",
+        crate::training::import::preview::thousands(MAX_TIGHTEN_CANDIDATES)
+    )
+}
+
+/// The candidates of `frames` the look takes: at most `max`, those whose fold detection scores
+/// highest (ties: the frame's `rel`, then the candidate's place in it, so the choice is the same
+/// on every run), in their frames' order; and how many were left out.
+pub fn bound(frames: &[FrameCandidates], max: usize) -> (Vec<FrameCandidates>, usize) {
+    let mut all: Vec<(f32, &str, usize, usize)> = frames
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, f)| {
+            f.loose
+                .iter()
+                .enumerate()
+                .map(move |(li, l)| (l.det_score, f.rel.as_str(), fi, li))
+        })
+        .collect();
+    if all.len() <= max {
+        return (frames.to_vec(), 0);
+    }
+    all.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.cmp(b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    let left = all.len() - max;
+    let keep: std::collections::BTreeSet<(usize, usize)> =
+        all.iter().take(max).map(|t| (t.2, t.3)).collect();
+    let out = frames
+        .iter()
+        .enumerate()
+        .filter_map(|(fi, f)| {
+            let loose: Vec<Loose> = f
+                .loose
+                .iter()
+                .enumerate()
+                .filter(|(li, _)| keep.contains(&(fi, *li)))
+                .map(|(_, l)| l.clone())
+                .collect();
+            (!loose.is_empty()).then(|| FrameCandidates { loose, ..f.clone() })
+        })
+        .collect();
+    (out, left)
+}
+
+/// The warning of a check whose look left `left` candidates out ([`bound`]).
+pub fn left_out_warning(left: usize) -> String {
+    let n = crate::training::import::preview::thousands;
+    format!(
+        "the closer look took the {} loose labels with the most confident fold detections and left \
+         {} out (their open better-fitting boxes stay as they were); a check of part of the frames \
+         (a scene or camera filter) looks at them",
+        n(MAX_TIGHTEN_CANDIDATES),
+        n(left)
+    )
 }
 
 /// The preview's warning when a check runs without the look because RF-DETR L's weights are not
@@ -206,20 +279,21 @@ pub fn crops(frames: &[FrameCandidates]) -> (Vec<Selected>, Vec<(usize, usize)>)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Looked<'a> {
     pub frame: &'a FrameCandidates,
-    /// The answered candidates with the closer look's detections on their crop.
-    pub answers: Vec<(Loose, Vec<ZoomDet>)>,
+    /// The answered candidates with the closer look's detections on their crop and where it lay.
+    pub answers: Vec<(Loose, Look)>,
 }
 
 /// The frames of `frames` with at least one answered crop of `results` (by the ids of
-/// [`crops`]), and how many crops were answered. An unreadable frame's crop is no answer.
+/// [`crops`]; [`zoom::read_answers`]), and how many crops were answered. An unreadable frame's
+/// crop is no answer.
 pub fn looked<'a>(
     frames: &'a [FrameCandidates],
     ids: &[(usize, usize)],
-    results: &BTreeMap<usize, CropResult>,
+    results: &BTreeMap<usize, (CropResult, Option<CropPlace>)>,
 ) -> (Vec<Looked<'a>>, usize) {
-    let mut per: BTreeMap<usize, Vec<(Loose, Vec<ZoomDet>)>> = BTreeMap::new();
+    let mut per: BTreeMap<usize, Vec<(Loose, Look)>> = BTreeMap::new();
     let mut n = 0;
-    for (id, r) in results {
+    for (id, (r, place)) in results {
         let (Some(&(fi, li)), CropResult::Boxes(dets)) = (ids.get(*id), r) else {
             continue;
         };
@@ -227,7 +301,13 @@ pub fn looked<'a>(
             continue;
         };
         n += 1;
-        per.entry(fi).or_default().push((l.clone(), dets.clone()));
+        per.entry(fi).or_default().push((
+            l.clone(),
+            Look {
+                dets: dets.clone(),
+                place: *place,
+            },
+        ));
     }
     let out = per
         .into_iter()
@@ -304,10 +384,11 @@ impl Bar {
     }
 }
 
-/// Run the look of `job` on `frames` as step `step` of `steps`, write what it supports and count
-/// it into `acc` (`tighten_candidates`, `zoomed`, `found.tighten`, `written.tighten`, the frames
-/// changed, the warnings). Never an error: a failure is in [`ZoomEnd::failed`] and the report's
-/// warnings, the folds' suggestions untouched.
+/// Run the look of `job` on `frames` (at most [`MAX_TIGHTEN_CANDIDATES`] of their candidates,
+/// [`bound`]) as step `step` of `steps`, write what it supports and count it into `acc`
+/// (`tighten_candidates`, `tighten_left_out`, `zoomed`, `found.tighten`, `written.tighten`, the
+/// frames changed, the warnings). Never an error: a failure is in [`ZoomEnd::failed`] and the
+/// report's warnings, the folds' suggestions untouched.
 #[allow(
     clippy::too_many_arguments,
     reason = "the job, its work, the report, the stage, cancel"
@@ -321,6 +402,12 @@ pub fn run_stage(
     cancel: &AtomicBool,
     acc: &mut Acc,
 ) -> ZoomEnd {
+    let (bounded, left) = bound(frames, MAX_TIGHTEN_CANDIDATES);
+    let frames = bounded.as_slice();
+    if left > 0 {
+        acc.rep.warnings.push(left_out_warning(left));
+    }
+    acc.rep.tighten_left_out = left;
     let n = count(frames);
     acc.rep.tighten_candidates = n;
     let name = stage_name(n);
@@ -389,7 +476,7 @@ pub fn run_stage(
     };
     end.cancelled = ran.stopped;
     let partial = ran.stopped || ran.failed.is_some();
-    let results = match zoom::read_results(&ran.out, partial, &mut acc.rep.warnings) {
+    let results = match zoom::read_answers(&ran.out, partial, &mut acc.rep.warnings) {
         Ok(r) => r,
         Err(e) => {
             fail(acc, &mut end, e);
@@ -435,6 +522,7 @@ pub fn run_stage(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::collect::labels::overlaps::Det as ZoomDet;
 
     fn frame(rel: &str, loose: Vec<Loose>) -> FrameCandidates {
         FrameCandidates {
@@ -508,25 +596,86 @@ mod tests {
             bbox: [1.0, 1.0, 9.0, 9.0],
             score: 0.7,
         };
+        let place = CropPlace {
+            crop: [0.0, 0.0, 60.0, 80.0],
+            size: [640, 480],
+        };
         let results = BTreeMap::from([
-            (1, CropResult::Boxes(vec![car.clone()])),
-            (2, CropResult::Unreadable),
-            (7, CropResult::Boxes(vec![])),
+            (1, (CropResult::Boxes(vec![car.clone()]), Some(place))),
+            (2, (CropResult::Unreadable, None)),
+            (7, (CropResult::Boxes(vec![]), None)),
         ]);
         let (l, n) = looked(&frames, &ids, &results);
         assert_eq!(n, 1, "an unreadable frame or an unknown id is no answer");
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].frame.rel, "a");
-        assert_eq!(l[0].answers, vec![(pair(100.0), vec![car])]);
+        assert_eq!(
+            l[0].answers,
+            vec![(
+                pair(100.0),
+                Look {
+                    dets: vec![car],
+                    place: Some(place)
+                }
+            )]
+        );
     }
 
     #[test]
-    fn the_estimate_is_a_few_minutes_for_a_real_dataset() {
+    fn the_estimate_is_bounded_and_the_preview_promises_no_minutes() {
         // 851 frames: about 2.6 minutes at most.
         let s = estimate_seconds(851);
         assert!((150.0..200.0).contains(&s), "{s}");
+        // A huge dataset: no more than the bound's crops.
+        assert_eq!(
+            estimate_seconds(10 * MAX_TIGHTEN_CANDIDATES),
+            estimate_seconds(MAX_TIGHTEN_CANDIDATES)
+        );
+        assert_eq!(
+            time_line(),
+            "the closer look adds a minute or two to set up, then up to about a second per loose \
+             label it looks at (at most 2,000)"
+        );
         assert_eq!(stage_name(1), "looking closer at 1 loose label");
         assert_eq!(stage_name(148), "looking closer at 148 loose labels");
         assert!(skipped_warning().contains("--tighten"));
+    }
+
+    #[test]
+    fn the_bound_takes_the_most_confident_fold_detections_in_frame_order() {
+        let scored = |x: f32, s: f32| Loose {
+            det_score: s,
+            ..pair(x)
+        };
+        let frames = vec![
+            frame("b", vec![scored(0.0, 0.6), scored(100.0, 0.9)]),
+            frame("a", vec![scored(0.0, 0.7)]),
+            frame("c", vec![scored(0.0, 0.6), scored(100.0, 0.55)]),
+        ];
+        // Under the bound: all, as they were.
+        assert_eq!(bound(&frames, 5), (frames.clone(), 0));
+        assert_eq!(bound(&frames, 9).1, 0);
+        // Three of five: 0.9, 0.7 and of the two at 0.6 the one of frame "b" (rel order), in the
+        // frames' order; frame "c" goes.
+        let (kept, left) = bound(&frames, 3);
+        assert_eq!(left, 2);
+        let got: Vec<(&str, Vec<f32>)> = kept
+            .iter()
+            .map(|f| {
+                (
+                    f.rel.as_str(),
+                    f.loose.iter().map(|l| l.det_score).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(got, [("b", vec![0.6, 0.9]), ("a", vec![0.7])]);
+        assert_eq!(count(&kept), 3);
+        // The same on every run.
+        assert_eq!(bound(&frames, 3), (kept, 2));
+        assert!(
+            left_out_warning(2).contains("left 2 out"),
+            "{}",
+            left_out_warning(2)
+        );
     }
 }

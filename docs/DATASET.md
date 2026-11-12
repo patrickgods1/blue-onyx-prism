@@ -544,8 +544,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
 
   A `kind` or an `answer` this build does not know (a newer build's) loads as `unknown`, is never live
   and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
-  (`add`, `verify`, `relabel` on every frame it checks; `tighten` only on the frames its closer look
-  answered, and there not on a label the look did not answer); answered ones and other kinds stay, and when
+  (`add`, `verify`, `relabel` on every frame it checks; `tighten` only of the labels its closer look
+  answered); answered ones and other kinds stay (over the 64 a frame holds, a check gives up its own new
+  suggestions, never those), and when
   nothing changed the file is not written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
   frame first). Kept by saves: a save (`POST /v1/review/labels`) whose body has no `refine` key keeps
   the stored list with its answers (a script or client that rebuilds the file from the boxes); a key that

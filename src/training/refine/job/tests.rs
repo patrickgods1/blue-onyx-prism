@@ -1924,10 +1924,39 @@ fn after_a_failed_fold_the_look_still_runs_on_the_finished_folds() {
         *fake.order.lock().unwrap(),
         ["train", "train", "train", "zoom"]
     );
+    let mut looked = 0;
     for rel in &rels {
         let n = tightens(&labels_of(&dir, rel)).len();
         assert_eq!(n, usize::from(folds[rel] < 2), "{rel}");
+        looked += n;
     }
+    // The task's error says what the look wrote too.
+    assert!(looked > 0);
+    assert!(
+        format!("{e:#}").contains(&format!(
+            "the suggestions of the 2 finished fold(s) were saved, and the closer look at their \
+             loose labels then answered {looked} of {looked} and saved {looked} better-fitting \
+             boxes; the report was written to"
+        )),
+        "{e:#}"
+    );
+    // A look that fails after a failed fold says so.
+    let t = tmp("look-failed-fold-and-look");
+    let dir = t.0.join("dataset");
+    loose_dataset(&dir);
+    let fake = TrainerFake {
+        fail_on: Some(3),
+        zoom_fail_after: Some(0),
+        ..trainer()
+    };
+    let e = run(&plan_look(&t.0, &predictor, Some(true)), &fake).unwrap_err();
+    assert!(
+        format!("{e:#}").contains(
+            "were saved, and the closer look at their loose labels then failed (see the \
+             report's warnings); the report"
+        ),
+        "{e:#}"
+    );
 }
 
 #[test]
@@ -2369,18 +2398,26 @@ fn refine_replay_on_a_copy() {
     }
     let (found, again) = read_dump(&dump);
     let wanted = job.wanted();
+    // The answered suggestions per kind and answer, and the open `tighten` (which a check without
+    // the look never touches).
     let answered_in = |files: &mut dyn Iterator<Item = LabelFile>| {
         let mut out: BTreeMap<String, usize> = BTreeMap::new();
         for l in files {
-            for x in l.refine.iter().filter(|x| x.answered()) {
-                *out.entry(format!("{} {:?}", x.kind.as_str(), x.answer))
-                    .or_default() += 1;
+            for x in l.refine.iter() {
+                let key = if x.answered() {
+                    format!("{} {:?}", x.kind.as_str(), x.answer)
+                } else if x.kind == Kind::Tighten {
+                    "tighten open".to_string()
+                } else {
+                    continue;
+                };
+                *out.entry(key).or_default() += 1;
             }
         }
         out
     };
     println!(
-        "answered suggestions before: {:?}",
+        "answered suggestions and open tighten before: {:?}",
         answered_in(&mut s.frames.iter().map(|f| f.labels.clone()))
     );
     let mut acc = Acc::new(job.start_report(&s));
@@ -2467,9 +2504,26 @@ fn refine_replay_on_a_copy() {
             end.failed
         );
         println!(
-            "tighten found {}, written {}",
-            acc.rep.found.tighten, acc.rep.written.tighten
+            "tighten found {}, written {}; candidates sent {}, left out by the bound {}",
+            acc.rep.found.tighten,
+            acc.rep.written.tighten,
+            acc.rep.tighten_candidates,
+            acc.rep.tighten_left_out
         );
+        // Every answered candidate without a proposal, with the rule that stopped it.
+        let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+        for (rel, c, why) in &acc.tighten_reasons {
+            println!(
+                "  no proposal: {} {rel} {} L {:?} D {:?} ({:.2})",
+                why.as_str(),
+                c.target_label,
+                c.target,
+                c.det,
+                c.det_score
+            );
+            *totals.entry(why.as_str()).or_default() += 1;
+        }
+        println!("no proposal, by reason: {totals:?}");
         let ious: Vec<f32> = acc.shapes.iter().map(|s| s.0).collect();
         let areas: Vec<f32> = acc.shapes.iter().map(|s| s.1).collect();
         println!(
@@ -2523,7 +2577,10 @@ fn refine_replay_on_a_copy() {
         let fr = Frame::resolve(&job.dataset_dir, &f.rel.jpg())?;
         labels::read(&fr.labels).ok().flatten()
     });
-    println!("answered suggestions after: {:?}", answered_in(&mut now));
+    println!(
+        "answered suggestions and open tighten after: {:?}",
+        answered_in(&mut now)
+    );
     println!(
         "written: add {}, verify {}, relabel {}, tighten {}",
         rep.written.add, rep.written.verify, rep.written.relabel, rep.written.tighten

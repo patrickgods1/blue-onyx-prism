@@ -630,8 +630,9 @@ struct Refusal {
     /// The folder under review is unplugged.
     folder_missing: bool,
     /// The check would replace open suggestions and the request did not say `replace_open`:
-    /// (open suggestions, frames holding them).
-    needs_confirm: Option<(usize, usize)>,
+    /// (open suggestions of the folds' kinds, open `tighten` the closer look may replace, frames
+    /// holding them).
+    needs_confirm: Option<(usize, usize, usize)>,
 }
 
 impl Refusal {
@@ -648,10 +649,11 @@ impl Refusal {
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
         let body = match self.needs_confirm {
-            Some((open, frames)) => serde_json::json!({
+            Some((open, tightens, frames)) => serde_json::json!({
                 "success": false,
                 "needs_confirm": true,
                 "open_suggestions": open,
+                "open_tightens": tightens,
                 "open_frames": frames,
                 "folder_missing": self.folder_missing,
                 "message": self.message,
@@ -743,16 +745,17 @@ fn start_check(
     if let Some(why) = p.refused {
         return Err(Refusal::bad(format!("Not queued: {}", for_the_page(&why))));
     }
-    // A rerun replaces the open suggestions of the frames it checks: asked once, never silently.
-    if p.open_suggestions > 0 && !replace_open {
+    // A rerun replaces the open suggestions of the frames it checks (with the closer look, also
+    // open `tighten` of the labels it answers): asked once, never silently.
+    if p.open_suggestions + p.open_tightens > 0 && !replace_open {
         return Err(Refusal {
             status: StatusCode::CONFLICT,
             message: format!(
                 "Not queued: {}.",
-                check::replace_warning(p.open_suggestions, p.open_frames)
+                check::replace_warning(p.open_suggestions, p.open_tightens, p.open_frames)
             ),
             folder_missing: false,
-            needs_confirm: Some((p.open_suggestions, p.open_frames)),
+            needs_confirm: Some((p.open_suggestions, p.open_tightens, p.open_frames)),
         });
     }
     let mut job = check::plan_refine(config, request, cap)
@@ -771,9 +774,10 @@ fn start_check(
 /// `GET /v1/train/jobs` and `GET /v1/training` `tasks[]`), or a refusal `{success: false, message,
 /// folder_missing}`: 400 for a bad field, too few frames or a plan that cannot run, 409 for a check
 /// already in the queue, 503 for an unplugged review folder. A check that would replace open
-/// suggestions on the frames it checks is 409 `{success: false, needs_confirm: true,
-/// open_suggestions, open_frames, folder_missing: false, message}` unless `replace_open` is true;
-/// nothing is queued then.
+/// suggestions on the frames it checks (with the closer look, open `tighten` too: `open_tightens`,
+/// a bound) is 409 `{success: false, needs_confirm: true, open_suggestions, open_tightens,
+/// open_frames, folder_missing: false, message}` unless `replace_open` is true; nothing is queued
+/// then.
 pub(super) async fn start(
     State(shared): State<Shared>,
     headers: HeaderMap,
@@ -1754,11 +1758,11 @@ mod tests {
         enough_frames_with_open(&review);
         let e = start_check(&config, req.clone(), false, &host(), &[], None, &never).unwrap_err();
         assert_eq!(e.status, StatusCode::CONFLICT);
-        assert_eq!(e.needs_confirm, Some((3, 2)));
+        assert_eq!(e.needs_confirm, Some((3, 0, 2)));
         assert!(!e.folder_missing);
         assert_eq!(
             e.message,
-            format!("Not queued: {}.", check::replace_warning(3, 2))
+            format!("Not queued: {}.", check::replace_warning(3, 0, 2))
         );
         // Confirmed: queued as before.
         start_check(&config, req.clone(), true, &host(), &[], None, &enqueue).unwrap();
@@ -1775,6 +1779,51 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!((e.status, e.needs_confirm), (StatusCode::CONFLICT, None));
+    }
+
+    #[test]
+    fn a_check_with_the_closer_look_asks_before_replacing_open_better_boxes() {
+        let dir = scratch();
+        let review = dir.join("dataset");
+        let config = host_config(&dir);
+        let queued = Mutex::new(0);
+        let enqueue = |job: RefineJob, _: QueueRule<'_>| {
+            *queued.lock().unwrap() += 1;
+            Ok(job.id.clone())
+        };
+        enough_frames(&review);
+        // An open better box of an earlier look, nothing else open.
+        let tight = [5.0, 5.0, 20.0, 18.0];
+        frame_with(
+            &review,
+            "alpha",
+            "f00",
+            vec![suggestion(Kind::Tighten, Some(CAR), Some(tight))],
+        );
+        let req = |tighten: bool| RefineRequest {
+            folds: 2,
+            epochs: 1,
+            tighten: Some(tighten),
+            ..RefineRequest::default()
+        };
+        // Without the look it is never touched: no question.
+        start_check(&config, req(false), false, &host(), &[], None, &enqueue).unwrap();
+        assert_eq!(*queued.lock().unwrap(), 1);
+        // With the look it may be replaced: asked, counted as a bound.
+        let e = start_check(&config, req(true), false, &host(), &[], None, &never).unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.needs_confirm, Some((0, 1, 1)));
+        assert_eq!(
+            e.message,
+            format!("Not queued: {}.", check::replace_warning(0, 1, 1))
+        );
+        assert!(
+            e.message.contains("up to 1 open proposed box"),
+            "{}",
+            e.message
+        );
+        start_check(&config, req(true), true, &host(), &[], None, &enqueue).unwrap();
+        assert_eq!(*queued.lock().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -1797,9 +1846,10 @@ mod tests {
                 "success": false,
                 "needs_confirm": true,
                 "open_suggestions": 3,
+                "open_tightens": 0,
                 "open_frames": 2,
                 "folder_missing": false,
-                "message": format!("Not queued: {}.", check::replace_warning(3, 2)),
+                "message": format!("Not queued: {}.", check::replace_warning(3, 0, 2)),
             })
         );
         // `replace_open: true` passes the question: what refuses now is the plan (no training
@@ -1854,7 +1904,7 @@ mod tests {
             .iter()
             .map(|w| w.as_str().unwrap())
             .collect();
-        assert_eq!(warnings[0], check::replace_warning(3, 2));
+        assert_eq!(warnings[0], check::replace_warning(3, 0, 2));
         assert!(
             warnings[1].starts_with("1 epoch per fold model is under half"),
             "{warnings:?}"

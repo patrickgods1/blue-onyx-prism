@@ -139,6 +139,39 @@ enum Stop {
 /// What a fold calls the end of its training run: the model files go into the fold's folder.
 const FOLD_MODEL: &str = "preparing the fold model";
 
+/// What the closer look did after a failed fold (`zoom`: how it ended, None when it did not run;
+/// `rep`: its counts), for the task's error: empty without a look.
+fn look_after_failed_fold(zoom: Option<&tighten::ZoomEnd>, rep: &RefineReport) -> String {
+    let n = crate::training::import::preview::thousands;
+    match zoom {
+        None => String::new(),
+        Some(z) if z.failed.is_some() => format!(
+            ", and the closer look at their loose labels then failed (see the report's \
+             warnings){}",
+            if rep.found.tighten > 0 {
+                format!(
+                    " after saving {} better-fitting boxes",
+                    n(rep.found.tighten)
+                )
+            } else {
+                String::new()
+            }
+        ),
+        Some(z) => format!(
+            ", and the closer look at their loose labels {} {} of {} and saved {} better-fitting \
+             boxes",
+            if z.cancelled {
+                "was stopped by Cancel after"
+            } else {
+                "then answered"
+            },
+            n(rep.zoomed),
+            n(rep.tighten_candidates),
+            n(rep.found.tighten)
+        ),
+    }
+}
+
 /// Steps of a check with `folds` folds: selecting, one per fold, the closer look when `tighten`,
 /// the report.
 const fn steps_for(folds: usize, tighten: bool) -> usize {
@@ -305,6 +338,9 @@ pub struct Acc {
     /// IoU(`L`, `Z`) and `Z`'s area over `L`'s of the `tighten` suggestions the closer look
     /// left open (the replay prints their distribution).
     pub shapes: Vec<(f32, f32)>,
+    /// The answered candidates that got no proposal, with why ([`write::Tightened::reasons`]; the
+    /// replay prints them).
+    pub tighten_reasons: Vec<(String, super::judge::Loose, super::judge::NoTighten)>,
 }
 
 impl Acc {
@@ -317,6 +353,7 @@ impl Acc {
             failures_more: 0,
             changed: BTreeSet::new(),
             shapes: Vec::new(),
+            tighten_reasons: Vec::new(),
         }
     }
 
@@ -325,6 +362,7 @@ impl Acc {
         self.rep.found.tighten += w.found;
         self.rep.written.tighten += w.written;
         self.shapes.extend(w.shapes.iter().copied());
+        self.tighten_reasons.extend(w.reasons.iter().cloned());
         let room = SAMPLE.saturating_sub(self.sample.len());
         self.sample.extend(
             w.changed
@@ -1024,9 +1062,18 @@ impl RefineJob {
                     .to_string()
             }
             Some(_) => format!(
-                ", {} of {} sent to a closer look answered",
+                ", {} of {} sent to a closer look answered{}",
                 n(rep.zoomed),
-                n(rep.tighten_candidates)
+                n(rep.tighten_candidates),
+                if rep.tighten_left_out > 0 {
+                    format!(
+                        " ({} more not sent: over the closer look's limit of {})",
+                        n(rep.tighten_left_out),
+                        n(tighten::MAX_TIGHTEN_CANDIDATES)
+                    )
+                } else {
+                    String::new()
+                }
             ),
             None => String::new(),
         };
@@ -1058,12 +1105,13 @@ impl RefineJob {
         };
         if let Some(Stop::Failed(e)) = stop {
             return Err(e.context(format!(
-                "the suggestions of the {} finished fold(s) were saved{}",
+                "the suggestions of the {} finished fold(s) were saved{}{}",
                 result.report.folds_done,
+                look_after_failed_fold(zoom.as_ref(), &result.report),
                 result
                     .report_path
                     .as_ref()
-                    .map(|p| format!(" and the report written to {}", p.display()))
+                    .map(|p| format!("; the report was written to {}", p.display()))
                     .unwrap_or_default()
             )));
         }

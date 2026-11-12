@@ -228,10 +228,14 @@ pub struct Tightened {
     pub changed: Vec<String>,
     /// `tighten` suggestions written now (new since the file's last).
     pub written: usize,
-    /// Open `tighten` suggestions on the frames looked at after the write (new or as before).
+    /// This look's proposals that [`refine::apply`] kept (new, or the same as an open one already
+    /// there); never an earlier check's open `tighten` the write left alone.
     pub found: usize,
     /// Of those, per suggestion: IoU(`L`, `Z`) and `Z`'s area over `L`'s.
     pub shapes: Vec<(f32, f32)>,
+    /// Per answered candidate that got no proposal: the frame, the candidate and why
+    /// ([`judge::NoTighten`]).
+    pub reasons: Vec<(String, judge::Loose, judge::NoTighten)>,
     /// Frames whose write failed, the first [`MAX_FAILURES`] reasons.
     pub failed: usize,
     pub failures: Vec<String>,
@@ -251,9 +255,11 @@ fn same_target(a: Option<[f32; 4]>, label: Option<&str>, c: &judge::Loose) -> bo
 /// each judged afresh under the label write lock ([`labels::update`]): a frame no longer reviewed
 /// gets nothing; its candidates are found again from the fold model's detections on the file as
 /// it is now ([`judge::judge`], `ctx`), and each one the look answered is decided by
-/// [`judge::tighten`]. Only `tighten` changes ([`refine::apply`] of [`TIGHTEN_KINDS`]): open ones
-/// on labels the look did not answer are kept as they are, answered ones stay, and an unchanged
-/// result leaves the file untouched. `progress(done, total)` now and then.
+/// [`judge::tighten_verdict`]. Only `tighten` changes ([`refine::apply`] of [`TIGHTEN_KINDS`]),
+/// and only on the labels the look answered: the open `tighten` of such a label is replaced by
+/// what the answer supports (or goes, when it supports nothing); an open one on any other label
+/// (no candidate now, its crop unanswered, left out of the look) is kept as it is, answered ones
+/// stay, and an unchanged result leaves the file untouched. `progress(done, total)` now and then.
 pub fn write_tighten(
     dir: &Path,
     looked: &[Looked<'_>],
@@ -268,6 +274,7 @@ pub fn write_tighten(
         let f = l.frame;
         let dets: Vec<Det> = f.dets.iter().map(Det::from).collect();
         let mut kept: Vec<(f32, f32)> = Vec::new();
+        let mut reasons: Vec<(judge::Loose, judge::NoTighten)> = Vec::new();
         let mut written = 0;
         let r = Frame::resolve(dir, &f.rel)
             .ok_or_else(|| {
@@ -291,24 +298,29 @@ pub fn write_tighten(
                         camera: &f.camera,
                         day: &f.day,
                     };
-                    let mut found: Vec<Suggestion> = Vec::new();
-                    let mut unanswered: Vec<judge::Loose> = Vec::new();
+                    // This look's proposals, and the labels it answered (whose open `tighten`
+                    // the proposals replace).
+                    let mut proposed: Vec<Suggestion> = Vec::new();
+                    let mut answered: Vec<judge::Loose> = Vec::new();
+                    reasons.clear();
                     for c in judge::judge(&input, ctx).candidates {
-                        match l.answers.iter().find(|(a, _)| a.same_pair(&c)) {
-                            Some((_, zoom)) => {
-                                found.extend(judge::tighten(&input, &c, zoom, ctx));
+                        if let Some((_, look)) = l.answers.iter().find(|(a, _)| a.same_pair(&c)) {
+                            match judge::tighten_verdict(&input, &c, look, ctx) {
+                                Ok(s) => proposed.push(s),
+                                Err(why) => reasons.push((c.clone(), why)),
                             }
-                            None => unanswered.push(c),
+                            answered.push(c);
                         }
                     }
-                    // A label the look did not answer keeps its open `tighten` as it is.
+                    // Every other label keeps its open `tighten` as it is.
+                    let mut found = proposed.clone();
                     found.extend(
                         file.refine
                             .iter()
                             .filter(|s| {
                                 s.kind == Kind::Tighten
                                     && !s.answered()
-                                    && unanswered.iter().any(|c| {
+                                    && !answered.iter().any(|c| {
                                         same_target(s.target, s.target_label.as_deref(), c)
                                     })
                             })
@@ -317,10 +329,13 @@ pub fn write_tighten(
                     let before = file.refine.clone();
                     let applied = refine::apply(&mut file, found, &TIGHTEN_KINDS);
                     written = new_ones(&before, &file.refine).tighten;
+                    // What this look found: its proposals that `apply` kept (an identical open
+                    // one already there counts; the earlier ones carried over do not).
+                    let mine: Vec<Suggestion> = proposed.iter().map(without_run).collect();
                     kept = file
                         .refine
                         .iter()
-                        .filter(|s| s.kind == Kind::Tighten && !s.answered())
+                        .filter(|s| mine.contains(&without_run(s)))
                         .filter_map(|s| {
                             let (t, z) = (s.target?, s.bbox?);
                             let a = area(&t);
@@ -335,6 +350,8 @@ pub fn write_tighten(
                 out.written += written;
                 out.found += kept.len();
                 out.shapes.extend(kept);
+                out.reasons
+                    .extend(reasons.into_iter().map(|(c, why)| (f.rel.clone(), c, why)));
                 if changed {
                     out.changed.push(f.rel.clone());
                 }
@@ -461,6 +478,142 @@ mod tests {
                 again.frames
             ),
             (1, 1, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn car(bbox: [f32; 4]) -> LabelBox {
+        LabelBox {
+            label: "car".into(),
+            bbox,
+            source: Source::Auto,
+            score: Some(0.9),
+            state: BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_look_replaces_only_the_tighten_of_labels_it_answered_and_counts_its_own() {
+        use super::super::judge::{Look, Loose};
+        use crate::collect::labels::overlaps::Det as ZoomDet;
+        let dir = std::env::temp_dir().join(format!("bo_refine_tight_{}", uuid::Uuid::new_v4()));
+        // Two loose car labels on one reviewed frame. The fold model finds A's car at 0.45 (no
+        // candidate) and B's at 0.9 (a candidate the look answers).
+        let (la, da) = (
+            [100.0f32, 100.0, 300.0, 180.0],
+            [100.0f32, 100.0, 200.0, 180.0],
+        );
+        let (lb, db) = (
+            [400.0f32, 100.0, 600.0, 180.0],
+            [400.0f32, 100.0, 500.0, 180.0],
+        );
+        let zb = [401.0f32, 100.0, 501.0, 181.0];
+        let rel = put_frame_at(&dir, "yard", "f1", (640, 480), None, vec![car(la), car(lb)]);
+        let path = Frame::resolve(&dir, &rel).unwrap().labels;
+        // An open better box on A from an earlier check (two looks agreed then).
+        let earlier = |target: [f32; 4], bbox: [f32; 4]| Suggestion {
+            kind: Kind::Tighten,
+            target: Some(target),
+            target_label: Some("car".into()),
+            bbox: Some(bbox),
+            label: None,
+            score: Some(0.7),
+            why: "an earlier look".into(),
+            spot: None,
+            answer: None,
+            run: "old".into(),
+        };
+        let on_a = earlier(la, [102.0, 100.0, 202.0, 180.0]);
+        labels::update(&path, |c| {
+            let mut f = c.unwrap();
+            f.status = Status::Reviewed;
+            f.refine = vec![on_a.clone()];
+            Ok(Some(f))
+        })
+        .unwrap();
+        let classes = vec!["car".to_string(), "person".to_string()];
+        let wanted = Wanted {
+            classes: &classes,
+            hidden: &[],
+        };
+        let counts: BTreeMap<String, usize> = classes.iter().map(|c| (c.clone(), 500)).collect();
+        let ctx = Context {
+            wanted: &wanted,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r2",
+            spots: None,
+            floor: None,
+        };
+        let det = |bbox: [f32; 4], score: f32| SavedDet {
+            label: "car".into(),
+            score,
+            bbox,
+        };
+        let frame = FrameCandidates {
+            rel: rel.clone(),
+            image: dir.join("unused.jpg"),
+            width: 640,
+            height: 480,
+            camera: "yard".into(),
+            day: "2026-10-01".into(),
+            dets: vec![det(da, 0.45), det(db, 0.9)],
+            loose: vec![],
+        };
+        let cand_b = Loose {
+            target: lb,
+            target_label: "car".into(),
+            class: "car".into(),
+            det: db,
+            det_score: 0.9,
+        };
+        let look = |dets: Vec<ZoomDet>| {
+            vec![Looked {
+                frame: &frame,
+                answers: vec![(cand_b.clone(), Look { dets, place: None })],
+            }]
+        };
+        let z = ZoomDet {
+            label: "car".into(),
+            bbox: zb.map(f64::from),
+            score: 0.88,
+        };
+        let w = write_tighten(&dir, &look(vec![z.clone()]), &ctx, &mut |_, _| {});
+        let file = labels::read(&path).unwrap().unwrap();
+        let tight: Vec<&Suggestion> = file
+            .refine
+            .iter()
+            .filter(|s| s.kind == Kind::Tighten)
+            .collect();
+        assert_eq!(tight.len(), 2, "{:?}", file.refine);
+        assert!(
+            file.refine.contains(&on_a),
+            "A was not answered: kept as it was"
+        );
+        let mine = tight.iter().find(|s| s.target == Some(lb)).unwrap();
+        assert_eq!((mine.bbox, mine.run.as_str()), (Some(zb), "r2"));
+        // Found: this look's one proposal, not the earlier one on A.
+        assert_eq!((w.found, w.written, w.shapes.len()), (1, 1, 1), "{w:?}");
+        assert!(w.reasons.is_empty());
+        // Again: the same proposal is found again (written 0), A's still kept.
+        let again = write_tighten(&dir, &look(vec![z]), &ctx, &mut |_, _| {});
+        assert_eq!((again.found, again.written, again.changed.len()), (1, 0, 0));
+        // An answer that supports nothing now replaces B's open one with nothing, says why, and
+        // still leaves A's alone.
+        let none = write_tighten(&dir, &look(vec![]), &ctx, &mut |_, _| {});
+        let file = labels::read(&path).unwrap().unwrap();
+        assert_eq!(file.refine, vec![on_a.clone()]);
+        assert_eq!((none.found, none.written), (0, 0));
+        assert_eq!(
+            none.reasons,
+            vec![(rel.clone(), cand_b.clone(), judge::NoTighten::NoAgree)]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

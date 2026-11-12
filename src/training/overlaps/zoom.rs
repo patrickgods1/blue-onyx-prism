@@ -41,6 +41,23 @@ struct ZoomLine {
     id: usize,
     #[serde(default)]
     boxes: Option<Vec<Det>>,
+    /// The crop the script cut (`crop_box`: the union padded by `--zoom-pad`, clamped to the image,
+    /// whole pixels), with the boxes.
+    #[serde(default)]
+    crop: Option<[f64; 4]>,
+    /// The image's size `[w, h]`, with the boxes.
+    #[serde(default)]
+    size: Option<[u32; 2]>,
+}
+
+/// Where a crop's answer came from ([`read_answers`]): the crop the script cut and the image's
+/// size, both in the script's line beside the boxes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CropPlace {
+    /// `[x0, y0, x1, y1]` in frame pixels.
+    pub crop: [f64; 4],
+    /// `[w, h]` of the image the script read.
+    pub size: [u32; 2],
 }
 
 /// What a crop answered.
@@ -257,6 +274,19 @@ pub fn read_results(
     partial: bool,
     warnings: &mut Vec<String>,
 ) -> Result<BTreeMap<usize, CropResult>> {
+    Ok(read_answers(path, partial, warnings)?
+        .into_iter()
+        .map(|(id, (r, _))| (id, r))
+        .collect())
+}
+
+/// [`read_results`] with where each answer's crop lay ([`CropPlace`]; None when the line does not
+/// say, as for an unreadable frame).
+pub fn read_answers(
+    path: &Path,
+    partial: bool,
+    warnings: &mut Vec<String>,
+) -> Result<BTreeMap<usize, (CropResult, Option<CropPlace>)>> {
     let text = match std::fs::read_to_string(path) {
         Err(e) if partial && e.kind() == std::io::ErrorKind::NotFound => String::new(),
         t => t.with_context(|| format!("reading {}", path.display()))?,
@@ -266,9 +296,16 @@ pub fn read_results(
     for (i, line) in lines.iter().enumerate() {
         match serde_json::from_str::<ZoomLine>(line) {
             Ok(z) => {
+                let place = match (z.crop, z.size) {
+                    (Some(crop), Some(size)) => Some(CropPlace { crop, size }),
+                    _ => None,
+                };
                 out.insert(
                     z.id,
-                    z.boxes.map_or(CropResult::Unreadable, CropResult::Boxes),
+                    (
+                        z.boxes.map_or(CropResult::Unreadable, CropResult::Boxes),
+                        place,
+                    ),
                 );
             }
             Err(_) if partial && i + 1 == lines.len() => {}
@@ -306,6 +343,25 @@ mod tests {
         // A bad line in a finished run: a warning.
         read_results(&p, false, &mut warnings).unwrap();
         assert_eq!(warnings.len(), 1);
+        // The crop and the image's size of the script's line are kept with the answer.
+        std::fs::write(
+            &p,
+            "{\"id\":3,\"frame\":\"f\",\"crop\":[8,9,22,30],\"size\":[100,80],\"boxes\":[]}\n\
+             {\"id\":4,\"frame\":\"f\",\"boxes\":[]}\n",
+        )
+        .unwrap();
+        let got = read_answers(&p, false, &mut warnings).unwrap();
+        assert_eq!(
+            got[&3],
+            (
+                CropResult::Boxes(vec![]),
+                Some(CropPlace {
+                    crop: [8.0, 9.0, 22.0, 30.0],
+                    size: [100, 80]
+                })
+            )
+        );
+        assert_eq!(got[&4], (CropResult::Boxes(vec![]), None));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

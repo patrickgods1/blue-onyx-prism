@@ -1922,6 +1922,9 @@ The constants (`judge.rs`):
 | `TIGHTEN_FOLD_SCORE` | 0.5 | Score from which a fold model's detection of a loose label makes it a candidate for the closer look: weaker finds are too often a short-trained model's guess to spend a crop on (the `add` cut-off). |
 | `TIGHTEN_ZOOM_SCORE` | 0.5 | Score from which a detection of the closer look counts as a box: the overlap check's measured operating point (`overlaps::ZOOM_SCORE`), same model, same crops. |
 | `TIGHTEN_AGREE_IOU` | 0.6 | IoU from which the closer look's box agrees with the fold model's: the overlap check's match IoU (`overlaps::ZOOM_MATCH_IOU`). Two independent looks that agree outvote the label; one alone does not. |
+| `TIGHTEN_SPAN_INSIDE` | 0.8 | Share of a second box of the closer look inside the label from which the label spans that object too, and is not moved onto `Z`: the overlap check's nested share (`stacks::NESTED_SHARE`). |
+| `TIGHTEN_EDGE_PX` | 1 | Pixels within which an edge of `Z` lies on an edge of its crop (inside the image): the object was cut there, no proposal. The script keeps boxes to 0.1 px on whole-pixel crops. |
+| `MAX_TIGHTEN_CANDIDATES` | 2,000 | Most loose labels one check looks at closer, the most confident fold detections first: under 3 minutes at the measured 79 ms per crop, about half an hour on a GPU ten times slower. |
 
 #### Static spots
 
@@ -2054,14 +2057,16 @@ and a confirmed-empty frame can get an `add`.
 
 **What it writes.** `refine::apply` changes `LabelFile.refine` and nothing else: the unanswered suggestions
 of the kinds a fold makes (`add`, `verify`, `relabel`) are replaced by what it found, and the closer look
-replaces the unanswered `tighten` of the frames it answered (see below); answered ones and
+replaces the unanswered `tighten` of the labels it answered (see below); answered ones and
 other kinds stay, except an answered `verify`, `relabel` or `tighten` whose box is gone (moved, relabelled, deleted):
 it could never be live again and is dropped (an answered `add` stays: it keeps the question from coming
 back). A found suggestion is dropped when it is the same finding as an answered one (the same `target` and,
 when both have one, `target_label`; for an `add`, a box of the same object at IoU 0.5 or more), a weaker
 copy of another found one, or outside what a save accepts.
 A frame holds at most 64, strongest first (`add`, then `relabel`, then `tighten`, then `verify`, then by
-score). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
+score). Over 64, a write gives up its own found suggestions, the weakest first: it never pushes out an
+answered one or one of a kind another write owns (the closer look's `tighten` never displaces a fold's
+`verify`, nor a fold's `add` an open `tighten`). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
 page can still save. The file format is in [DATASET.md](DATASET.md#label-file-version-1).
 
 **What a reviewer's answer does** (`refine::accept`, `refine::dismiss`; stale suggestions change nothing):
@@ -2104,7 +2109,9 @@ the dataset walkers and retention do not look in `refine/`). Fields: `version`, 
 `unreadable_folders`, `filtered`), `written` and `found` (`add`, `verify`, `relabel`, `tighten`; `tighten`
 absent in earlier reports, read as 0), `frames_written` (a frame the folds and the closer look both wrote
 counts once), `loose`, `tighten` (the check took the closer look; false in earlier reports),
-`tighten_candidates` (loose labels sent to it), `zoomed` (of those, the crops it answered), `found_score`,
+`tighten_candidates` (loose labels sent to it), `tighten_left_out` (candidates past its limit of 2,000,
+not sent; absent in earlier reports), `zoomed` (of those sent, the crops it answered), `found.tighten`
+(this check's proposals that were kept, not earlier checks' open ones left in place), `found_score`,
 `found_iou`, `recall`, `recall_by_group` (camera x scene x class), `recall_by_size`
 (short side at model input: under 8, 8-12, 12-24, 24-48, 48+ px), `static_spots` (spots of the selection),
 `recall_at_spots` and `recall_elsewhere` (training boxes at a static spot that holds without their
@@ -2159,18 +2166,22 @@ processes; the export, prediction and writes of the running fold finish first.
 **What a rerun replaces.** On every frame it checks, a check replaces the unanswered `add`, `verify` and
 `relabel` suggestions with what its own fold models find: a suggestion they do not find again is gone, even
 when an earlier, stronger check made it. Answered suggestions (kept or dismissed) stay, an unanswered
-`tighten` stays unless the check's closer look answered its frame (then it is replaced by what that look
-supports; a check without the look, `--no-tighten`, never touches one), frames outside the check (another scene or camera of `--frames`, frames left out) are not touched, and no
+`tighten` stays unless the check's closer look answered its label (then it is replaced by what that look
+supports, or goes when it supports nothing; a check without the look, `--no-tighten`, never touches one), frames outside the check (another scene or camera of `--frames`, frames left out) are not touched, and no
 box changes. So a quick check after a good one costs findings: on one dataset a check of 4 folds x 8 epochs
 left 139 open suggestions, and two checks of 2 folds x 1 epoch, whose fold models found almost nothing, cut
 them to 88. The preview counts what a start would replace (`open_suggestions`, `open_frames`: unanswered,
-of those three kinds and live as the Review tab shows them, on the selected frames) and warns *this check
-replaces the N open suggestions on M frames ...*; it also warns when the fold models are short, under half
+of those three kinds and live as the Review tab shows them, on the selected frames; with the closer look
+also `open_tightens`, the live open `tighten` there, a bound since the look replaces only those of the
+labels it answers, and `open_frames` then counts the frames holding either) and warns *this check
+replaces the N open suggestions on M frames ...* (with the look: *... and up to K open proposed boxes for
+loose labels ...*); it also warns when the fold models are short, under half
 the family's recommended minimum epochs (`recipe::recommended(..).min_epochs`, 10 for every family, so 1 to
 4 epochs; `refine::weak_epochs`), since fold models of 1 epoch found no missing box where 8 epochs found
-123. On the Refine tab a start over open suggestions is refused (409 `{success: false, needs_confirm: true,
-open_suggestions, open_frames, folder_missing: false, message}`) and the card asks inline: *Start and
-replace N open suggestions* posts again with `replace_open: true`, *Keep them* starts nothing. Answer them
+123. On the Refine tab a start over open suggestions (with the look, open `tighten` count too) is refused (409
+`{success: false, needs_confirm: true, open_suggestions, open_tightens, open_frames, folder_missing: false,
+message}`) and the card asks inline: *Start and replace N open suggestions* (*up to N* when open `tighten`
+are among them) posts again with `replace_open: true`, *Keep them* starts nothing. Answer them
 on the Review tab first, or confirm to recompute them. `train refine` is an explicit command and asks
 nothing, but prints the same warnings before it starts.
 
@@ -2202,23 +2213,40 @@ look decides, the overlap check's zoom stage (`refine/tighten.rs`):
 2. **The look**, once after the last fold, under the training lock the check holds:
    `scripts/autolabel.py --zoom-pairs` (unchanged; the overlap check's runner, `overlaps::zoom::prepare` and
    `run`) with RF-DETR L on one crop per candidate, the union of the label `L` and `D`, padded by 20%
-   (`--zoom-pad`), at score 0.1, one flushed JSONL line per crop. It is the job's step *looking closer at N
-   loose labels*, and needs what the overlap check needs: the training environment, RF-DETR L's weights
+   (`--zoom-pad`), at score 0.1, one flushed JSONL line per crop (with the crop it cut and the image's size,
+   which rule (g) uses). At most `MAX_TIGHTEN_CANDIDATES` 2,000 candidates are sent, those with the most
+   confident `D` (ties by frame and place, so the same on every run); the rest are left out with a warning
+   in the report and the summary (`tighten_left_out`), and their open `tighten` stays. It is the job's step
+   *looking closer at N loose labels* (N the labels sent; its progress line counts *i of N crops*), and
+   needs what the overlap check needs: the training environment, RF-DETR L's weights
    (0.14 GB, `train-base:rfdetr-large`), about 500 MB of VRAM and on Windows about 2.6 GB of free commit,
    checked before the model loads.
-3. **The decision** (`judge::tighten`, pure): the closer look's box `Z` is its detection of the same object
-   at `TIGHTEN_ZOOM_SCORE` 0.5 or more with the best IoU to `D` (ties: the higher score, then the earlier
-   detection), clamped to the frame. A `tighten` to `Z` (`target` = `L` with its label, `score` = `Z`'s,
-   the reason naming both looks) only when (a) `Z` agrees with the fold model: IoU(`Z`, `D`) >=
-   `TIGHTEN_AGREE_IOU` 0.6; (b) the label is loose against `Z` too: IoU(`L`, `Z`) < 0.75 (else the label
-   was fine and the fold model imprecise: nothing); (c) `Z` is a proper box not under the floor (the `add`
-   floor); (d) `Z` is no other object's box: no other training box or ignore region of the object overlaps
-   `Z` more than `L` does (the two looks found the neighbour). No `Z`: nothing.
+3. **The decision** (`judge::tighten_verdict`, pure): the closer look's boxes of the object are its
+   detections of the same object at `TIGHTEN_ZOOM_SCORE` 0.5 or more, clamped to the frame; `Z` is the one
+   with the best IoU to `D` (ties: the higher score, then the earlier detection). A `tighten` to `Z`
+   (`target` = `L` with its label, `score` = `Z`'s, the reason naming both looks) only when, in this order:
+   (a) `Z` agrees with the fold model: IoU(`Z`, `D`) >= `TIGHTEN_AGREE_IOU` 0.6 (else *no_agree*, also
+   with no `Z`); (b) the label is loose against `Z` too: IoU(`L`, `Z`) < 0.75 (else the label was fine and
+   the fold model imprecise: *label_fine*); (e) no box of the closer look fits the label at IoU 0.75 or
+   more (else it found the label's object as labelled and `D`, `Z` are another object, say a parked car
+   behind the labelled one that the fold model found instead: *label_found*); (f) the label spans no
+   second object the closer look tells apart: no other of its boxes, not `Z` again (IoU with `Z` under
+   0.6 and not nested in or around it), no larger than `L` and lying `TIGHTEN_SPAN_INSIDE` 80% or more
+   inside `L` (the overlap check's nested share), that no other box of the object on the frame covers
+   (else moving the label onto `Z` would leave that object unlabelled: *spans_two*); (c) `Z` is a proper
+   box not under the floor (the `add` floor; *small*); (g) `Z` was not cut by its crop: no edge of `Z`
+   within `TIGHTEN_EDGE_PX` 1 px of an edge of the crop that is not the image's edge (the object goes on
+   past the padded union: *crop_edge*); (d) `Z` is no other object's box: no other training box or ignore
+   region of the object overlaps `Z` more than `L` does (the two looks found the neighbour: *neighbour*).
+   The replay (`refine_replay_on_a_copy` with `BOP_REFINE_ZOOM=1`) prints each answered candidate without
+   a proposal with its word, and the totals.
 4. **The write** judges each frame afresh under the label write lock: the frame still reviewed, the
    candidates found again from the kept fold detections on the file as it is now, each matched to its
-   crop's answer by its exact boxes. `tighten` is among the kinds written only on frames whose candidates the
-   look answered, and there an open `tighten` on a label the look did not answer is kept as it is; so a
-   check without the look, a failed or cancelled look, or an unreadable frame never deletes an earlier one.
+   crop's answer by its exact boxes. Only the open `tighten` of a label whose candidate the look answered
+   is replaced (by what the answer supports, or nothing); an open `tighten` on any other label of the frame
+   (not a candidate this time, its crop unanswered, left out by the limit) is kept as it is; so a check
+   without the look, a failed or cancelled look, or an unreadable frame never deletes an earlier one.
+   `found.tighten` counts this look's proposals that were kept, never the earlier ones left in place.
    An answered `tighten` stays and is not asked again: `refine::same_finding` keys a `tighten` on its target
    box (exact `bbox` and label), whatever box it proposes. Accepting one moves the box and keeps the old one
    in `orig_bbox`, so the label is a reviewer's from then on and is never a candidate again.
@@ -2233,14 +2261,17 @@ counts loose labels only.
 check's). A Cancel during it keeps the crops that finished: their boxes are written, the report is
 `cancelled` and the summary says *stopped by Cancel during the closer look ... after N of M crops*. A Cancel
 during the folds skips it (Cancel means stop; the report says the look did not run). After a failed fold it
-still runs on what the finished folds found. A failure of the look (the environment, the download, the
+still runs on what the finished folds found, and the task's error says what it did (*... and the closer
+look at their loose labels then answered N of M and saved K better-fitting boxes*, or that it failed). A failure of the look (the environment, the download, the
 memory check, the script) keeps every fold's suggestions: the check ends as usual with the failure in its
 summary and in the report's warnings.
 
 **Time.** About 79 ms per crop on a GTX 1070 Ti (the overlap check's measurement) plus the environment
-check, the script's self-check and loading RF-DETR L; the preview adds `90 s + 0.079 s` per selected frame
-(at most one crop per frame on average; 851 frames: about 3 minutes) and says "the closer look adds a few
-minutes". `time_basis` is the folds' as before. Replayed on the 851 frames (kept fold detections,
+check, the script's self-check and loading RF-DETR L; the preview adds `90 s + 0.079 s` per selected frame,
+at most 2,000 (one crop per frame on average; 851 frames: about 3 minutes), and, since the count of loose
+labels is known only after the folds, words it as a bound, not a total: "the closer look adds a minute or
+two to set up, then up to about a second per loose label it looks at (at most 2,000)". `time_basis` is the
+folds' as before. Replayed on the 851 frames (kept fold detections,
 `refine_replay_on_a_copy`): 148 loose pairs, 82 candidates on 74 frames (77 cars, 4 persons, 1 truck).
 
 ### Refine tab

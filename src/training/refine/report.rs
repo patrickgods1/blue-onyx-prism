@@ -224,7 +224,11 @@ pub struct RefineReport {
     /// a class RF-DETR L can see, big enough).
     #[serde(default)]
     pub tighten_candidates: usize,
-    /// Of those, the ones the closer look answered (a crop of a readable frame that finished).
+    /// Candidates past [`super::tighten::MAX_TIGHTEN_CANDIDATES`], not sent (the least confident
+    /// fold detections; a warning says so).
+    #[serde(default)]
+    pub tighten_left_out: usize,
+    /// Of those sent, the ones the closer look answered (a crop of a readable frame that finished).
     #[serde(default)]
     pub zoomed: usize,
     /// The production-like score and IoU at which a box counts as found.
@@ -368,6 +372,7 @@ impl RefineReport {
             loose: 0,
             tighten: false,
             tighten_candidates: 0,
+            tighten_left_out: 0,
             zoomed: 0,
             found_score: FOUND_SCORE,
             found_iou: FOUND_IOU,

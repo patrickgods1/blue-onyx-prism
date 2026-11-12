@@ -616,7 +616,10 @@ fn order(a: &Suggestion, b: &Suggestion) -> Ordering {
 /// answered suggestion of `kinds` whose `target` box is gone (moved, relabelled away, deleted) goes:
 /// it can never be live again and would only take room; an answered `add` stays, it is what keeps
 /// the question from being asked again. The list is sorted strongest first and holds at most
-/// [`MAX_SUGGESTIONS`], answered ones kept first. When the result equals the old list ignoring
+/// [`MAX_SUGGESTIONS`]: over it, found suggestions go, the weakest first, never one the call keeps
+/// (an answered one, or one of a kind outside `kinds`, which another write owns: the closer look's
+/// `tighten` write never pushes out a fold's `verify`, nor a fold's write an open `tighten`); only
+/// a file already over the cap loses kept ones, answered ones last. When the result equals the old list ignoring
 /// `run` (in any order), the file is left exactly as it was and [`Applied::changed`] is false: a
 /// rerun that finds the same things writes nothing, and an open Review page keeps its revision.
 pub fn apply(f: &mut LabelFile, found: Vec<Suggestion>, kinds: &[Kind]) -> Applied {
@@ -648,24 +651,22 @@ pub fn apply(f: &mut LabelFile, found: Vec<Suggestion>, kinds: &[Kind]) -> Appli
         }
         fresh.push(s);
     }
-    let mut list: Vec<(bool, Suggestion)> = kept
-        .into_iter()
-        .map(|s| (false, s))
-        .chain(fresh.into_iter().map(|s| (true, s)))
-        .collect();
-    if list.len() > MAX_SUGGESTIONS {
-        list.sort_by(|a, b| {
-            b.1.answered()
-                .cmp(&a.1.answered())
-                .then_with(|| order(&a.1, &b.1))
-        });
-        done.dropped += list
-            .drain(MAX_SUGGESTIONS..)
-            .filter(|(is_fresh, _)| *is_fresh)
-            .count();
+    // Over the cap, a write gives up its own fresh suggestions first, the weakest first: what it
+    // kept (other kinds, which another write owns, and answers) is never pushed out by it.
+    let mut kept = kept;
+    if kept.len() + fresh.len() > MAX_SUGGESTIONS {
+        fresh.sort_by(order);
+        let room = MAX_SUGGESTIONS.saturating_sub(kept.len());
+        done.dropped += fresh.len().saturating_sub(room);
+        fresh.truncate(room);
+        // A file already over the cap (no check writes one): answers first, then the strongest.
+        if kept.len() > MAX_SUGGESTIONS {
+            kept.sort_by(|a, b| b.answered().cmp(&a.answered()).then_with(|| order(a, b)));
+            kept.truncate(MAX_SUGGESTIONS);
+        }
     }
-    list.sort_by(|a, b| order(&a.1, &b.1));
-    let list: Vec<Suggestion> = list.into_iter().map(|(_, s)| s).collect();
+    let mut list: Vec<Suggestion> = kept.into_iter().chain(fresh).collect();
+    list.sort_by(order);
     let mut old: Vec<&Suggestion> = f.refine.iter().collect();
     for s in &list {
         match old.iter().position(|o| same_but_run(o, s)) {
@@ -1764,6 +1765,74 @@ mod tests {
         );
         let s: Vec<u32> = f.refine.iter().map(strength).collect();
         assert!(s.windows(2).all(|p| p[0] >= p[1]), "{s:?}");
+        check(&f.refine).unwrap();
+    }
+
+    #[test]
+    fn over_the_cap_a_write_drops_its_own_found_ones_never_another_writes() {
+        let row = |i: usize| {
+            let x = 10.0 * i as f32;
+            [x, 100.0, x + 8.0, 120.0]
+        };
+        let low = |i: usize| {
+            let x = 10.0 * i as f32;
+            [x, 300.0, x + 8.0, 320.0]
+        };
+        // 60 open verifies of the folds and one answered one; the closer look writes 10 tightens,
+        // a stronger kind (band 2 over 1): its own weakest go, never a verify.
+        let mut before: Vec<Suggestion> = (0..60).map(|i| verify(row(i))).collect();
+        before.push(answered(verify(row(60)), Answer::Kept));
+        let mut f = file(vec![accepted("car", row(60))], before.clone());
+        let found: Vec<Suggestion> = (0..10)
+            .map(|i| Suggestion {
+                score: Some(0.5 + 0.01 * i as f32),
+                ..tighten(row(i), low(i))
+            })
+            .collect();
+        let a = apply(&mut f, found, &[Kind::Tighten]);
+        assert_eq!(f.refine.len(), MAX_SUGGESTIONS);
+        for s in &before {
+            assert!(f.refine.contains(s), "{s:?}");
+        }
+        assert_eq!((a.written, a.dropped, a.removed), (3, 7, 0));
+        let kept: Vec<i32> = f
+            .refine
+            .iter()
+            .filter(|s| s.kind == Kind::Tighten)
+            .map(|s| (s.score.unwrap() * 100.0).round() as i32)
+            .collect();
+        assert_eq!(kept, [59, 58, 57], "the strongest of its own");
+        check(&f.refine).unwrap();
+        // Mirrored: 60 open tightens of an earlier look; a fold's write of 10 adds (band 4) keeps
+        // them all and gives up its own weakest adds.
+        let before: Vec<Suggestion> = (0..60).map(|i| tighten(row(i), low(i))).collect();
+        let mut f = file(vec![], before.clone());
+        let found: Vec<Suggestion> = (0..10)
+            .map(|i| {
+                let x = 10.0 * i as f32;
+                add("dog", [x, 400.0, x + 8.0, 420.0], 0.5 + 0.01 * i as f32)
+            })
+            .collect();
+        let a = apply(&mut f, found, &[Kind::Add, Kind::Verify, Kind::Relabel]);
+        assert_eq!(f.refine.len(), MAX_SUGGESTIONS);
+        for s in &before {
+            assert!(f.refine.contains(s), "{s:?}");
+        }
+        assert_eq!((a.written, a.dropped, a.removed), (4, 6, 0));
+        assert_eq!(f.refine.iter().filter(|s| s.kind == Kind::Add).count(), 4);
+        // A file already over the cap (none a check writes) keeps the answers, then the strongest.
+        let mut over: Vec<Suggestion> = (0..70)
+            .map(|i| Suggestion {
+                score: Some(0.01 * i as f32),
+                ..tighten(row(i), low(i))
+            })
+            .collect();
+        over[0] = answered(verify(row(0)), Answer::Dismissed);
+        let mut f = file(vec![accepted("car", row(0))], over.clone());
+        let a = apply(&mut f, vec![add("dog", FAR, 0.9)], &[Kind::Add]);
+        assert_eq!(f.refine.len(), MAX_SUGGESTIONS);
+        assert_eq!((a.written, a.dropped), (0, 1));
+        assert!(f.refine.contains(&over[0]));
         check(&f.refine).unwrap();
     }
 

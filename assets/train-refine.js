@@ -241,10 +241,13 @@
   // over open ones (409, needs_confirm) until it is asked again with replace_open: the second
   // step is inline, below the form (no dialog), and goes away when a field changes.
   function hideConfirm() { $('refine-confirm').hidden = true; }
+  // With the closer look, open better boxes (open_tightens) count too, as a bound: the look
+  // replaces only those of the labels it answers.
   function askReplace(b) {
     $('refine-confirm-text').textContent = b.message;
-    $('refine-confirm-start').textContent = 'Start and replace ' +
-      plural(b.open_suggestions, 'open suggestion', 'open suggestions');
+    var tightens = b.open_tightens || 0;
+    $('refine-confirm-start').textContent = 'Start and replace ' + (tightens ? 'up to ' : '') +
+      plural((b.open_suggestions || 0) + tightens, 'open suggestion', 'open suggestions');
     say('');
     $('refine-confirm').hidden = false;
     $('refine-confirm-start').focus();

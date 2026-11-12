@@ -504,10 +504,9 @@ pub struct Selected {
     pub warnings: Vec<String>,
     /// Why a check would not run on this; None = it can.
     pub refused: Option<String>,
-    /// Open suggestions a check of these frames replaces ([`open_to_replace`]).
-    pub open_suggestions: usize,
-    /// Frames holding them.
-    pub open_frames: usize,
+    /// Open suggestions of the folds' kinds a check of these frames replaces, the open `tighten`
+    /// a check with the closer look may replace, and the frames holding them ([`open_to_replace`]).
+    pub open: OpenCounts,
     /// The static spots of `frames` ([`spot_table`]): made once from this label snapshot, every
     /// fold's judge uses it ([`judge::Context::spots`]).
     pub spots: statics::Table,
@@ -519,24 +518,55 @@ pub fn spot_table(frames: &[ExportFrame], wanted: &Wanted<'_>) -> statics::Table
     statics::Table::build(statics::observations(frames, wanted))
 }
 
+/// The open suggestions on a check's frames that it replaces ([`open_to_replace`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenCounts {
+    /// Of the kinds the folds write ([`write::KINDS`]): every one is replaced.
+    pub folds: usize,
+    /// Frames holding them.
+    pub fold_frames: usize,
+    /// Open `tighten`: a check with the closer look replaces those of the labels it answers, at
+    /// most all of them (which, only the look knows).
+    pub tightens: usize,
+    /// Frames holding either.
+    pub any_frames: usize,
+}
+
+impl OpenCounts {
+    /// (open suggestions of the folds' kinds, open `tighten` the check may replace, frames holding
+    /// them) of a check with the closer look (`look`) or without (no `tighten` is touched).
+    pub fn for_check(&self, look: bool) -> (usize, usize, usize) {
+        if look {
+            (self.folds, self.tightens, self.any_frames)
+        } else {
+            (self.folds, 0, self.fold_frames)
+        }
+    }
+}
+
 /// The open suggestions a check of `frames` replaces, and the frames holding them: unanswered
-/// ones of the kinds the check writes ([`write::KINDS`]) that a reviewer would see now
-/// ([`refine::live`] with `wanted`, as the check and the Review tab judge them). Stale ones are
-/// replaced too but nobody sees them, so they are not counted.
-pub fn open_to_replace(frames: &[ExportFrame], wanted: &Wanted<'_>) -> (usize, usize) {
-    let mut open = 0;
-    let mut holding = 0;
+/// ones that a reviewer would see now ([`refine::live`] with `wanted`, as the check and the Review
+/// tab judge them) of the kinds the folds write ([`write::KINDS`]), and the open `tighten` a check
+/// with the closer look may replace. Stale ones are replaced too but nobody sees them, so they are
+/// not counted.
+pub fn open_to_replace(frames: &[ExportFrame], wanted: &Wanted<'_>) -> OpenCounts {
+    let mut out = OpenCounts::default();
     for f in frames {
-        let n = crate::collect::labels::refine::live(&f.labels, Some(wanted))
+        let live = crate::collect::labels::refine::live(&f.labels, Some(wanted));
+        let folds = live
             .iter()
             .filter(|l| write::KINDS.contains(&l.suggestion.kind))
             .count();
-        if n > 0 {
-            open += n;
-            holding += 1;
-        }
+        let tightens = live
+            .iter()
+            .filter(|l| write::TIGHTEN_KINDS.contains(&l.suggestion.kind))
+            .count();
+        out.folds += folds;
+        out.fold_frames += usize::from(folds > 0);
+        out.tightens += tightens;
+        out.any_frames += usize::from(folds + tightens > 0);
     }
-    (open, holding)
+    out
 }
 
 /// `n` `one`, or `n` `many`.
@@ -544,14 +574,34 @@ fn counted(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// The warning of a check that replaces `open` open suggestions on `frames` frames
-/// ([`open_to_replace`]): the preview, the CLI and the start's confirmation say it.
-pub fn replace_warning(open: usize, frames: usize) -> String {
+/// The warning of a check that replaces `open` open suggestions of the folds' kinds and up to
+/// `tightens` open proposed boxes of the closer look on `frames` frames ([`open_to_replace`],
+/// [`OpenCounts::for_check`]): the preview, the CLI and the start's confirmation say it.
+pub fn replace_warning(open: usize, tightens: usize, frames: usize) -> String {
+    let boxes = format!(
+        "up to {} for loose labels",
+        counted(tightens, "open proposed box", "open proposed boxes")
+    );
+    let what = match (open, tightens) {
+        (_, 0) => format!(
+            "the {} on {} with what its fold models find",
+            counted(open, "open suggestion", "open suggestions"),
+            counted(frames, "frame", "frames"),
+        ),
+        (0, _) => format!(
+            "{boxes} on {} with what its closer look finds",
+            counted(frames, "frame", "frames"),
+        ),
+        _ => format!(
+            "the {} on {} with what its fold models find, and {boxes} with what its closer look \
+             finds",
+            counted(open, "open suggestion", "open suggestions"),
+            counted(frames, "frame", "frames"),
+        ),
+    };
     format!(
-        "this check replaces the {} on {} with what its fold models find; answered ones stay. \
-         Answer them on the Review tab first, or run it to recompute them",
-        counted(open, "open suggestion", "open suggestions"),
-        counted(frames, "frame", "frames"),
+        "this check replaces {what}; answered ones stay. Answer them on the Review tab first, or \
+         run it to recompute them"
     )
 }
 
@@ -715,7 +765,7 @@ pub fn select(
             .or_default() += 1;
     }
     out.class_boxes = class_boxes(&out.frames, &wanted);
-    (out.open_suggestions, out.open_frames) = open_to_replace(&out.frames, &wanted);
+    out.open = open_to_replace(&out.frames, &wanted);
     out.spots = spot_table(&out.frames, &wanted);
     // Folded even when refused below, so a preview shows what a check would do.
     match folds::assign(&out.groups, k, FOLD_SEED) {
@@ -766,7 +816,7 @@ pub struct RefinePreview {
     /// Rough time of the whole check, seconds; None without a GPU to train on.
     pub seconds: Option<f64>,
     /// Where `seconds` came from; None with no `seconds`. With `tighten` the seconds include a
-    /// rough few minutes for the closer look ([`tighten::estimate_seconds`]), whatever the basis.
+    /// rough figure for the closer look ([`tighten::estimate_seconds`]), whatever the basis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_basis: Option<TimeBasis>,
     /// The check would look closer at its loose labels ([`tighten_on`]).
@@ -777,7 +827,12 @@ pub struct RefinePreview {
     /// find ([`open_to_replace`]): a start asks first (`POST /v1/refine/check` `replace_open`).
     #[serde(default)]
     pub open_suggestions: usize,
-    /// Frames holding them.
+    /// With the closer look (`tighten`), the open `tighten` on the selected frames it may replace
+    /// (those of the labels it answers: at most this many); 0 without it, which touches none. A
+    /// start asks first for these too.
+    #[serde(default)]
+    pub open_tightens: usize,
+    /// Frames holding them (both kinds counted).
     #[serde(default)]
     pub open_frames: usize,
     /// Why the check would be refused; None = it can run.
@@ -819,16 +874,21 @@ pub fn preview(
         run: recipe_run,
     } = choose(config, request.epochs, cap)?;
     let tighten = tighten_on(config, request);
+    let (open_suggestions, open_tightens, open_frames) = s.open.for_check(tighten);
     // What a start asks about comes first.
     let mut warnings = Vec::new();
-    if s.open_suggestions > 0 {
-        warnings.push(replace_warning(s.open_suggestions, s.open_frames));
+    if open_suggestions + open_tightens > 0 {
+        warnings.push(replace_warning(
+            open_suggestions,
+            open_tightens,
+            open_frames,
+        ));
     }
     if weak_epochs(recipe.family, request.epochs) {
         warnings.push(weak_epochs_warning(
             recipe.family,
             request.epochs,
-            s.open_suggestions,
+            open_suggestions,
         ));
     }
     warnings.extend(s.warnings.iter().cloned());
@@ -946,8 +1006,9 @@ pub fn preview(
         time_basis,
         tighten,
         warnings,
-        open_suggestions: s.open_suggestions,
-        open_frames: s.open_frames,
+        open_suggestions,
+        open_tightens,
+        open_frames,
         refused: s.refused,
         folder_missing: missing.is_some(),
     })
@@ -959,8 +1020,12 @@ pub fn preview(
 /// it runs without the closer look for want of the weights.
 pub fn start_warnings(p: &RefinePreview, family: TrainFamily) -> Vec<String> {
     let mut out = Vec::new();
-    if p.open_suggestions > 0 {
-        out.push(replace_warning(p.open_suggestions, p.open_frames));
+    if p.open_suggestions + p.open_tightens > 0 {
+        out.push(replace_warning(
+            p.open_suggestions,
+            p.open_tightens,
+            p.open_frames,
+        ));
     }
     if weak_epochs(family, p.recipe.epochs) {
         out.push(weak_epochs_warning(
@@ -1029,9 +1094,9 @@ pub fn preview_text(p: &RefinePreview) -> String {
             super::estimate::format_duration(s),
             p.time_basis.unwrap_or(TimeBasis::Guess).describe(),
             if p.tighten {
-                "; the closer look adds a few minutes"
+                format!("; {}", tighten::time_line())
             } else {
-                ""
+                String::new()
             }
         ));
     }
@@ -1402,6 +1467,7 @@ mod tests {
                 tighten: false,
                 warnings: Vec::new(),
                 open_suggestions: 0,
+                open_tightens: 0,
                 open_frames: 0,
                 refused: None,
                 folder_missing: false,
@@ -1569,7 +1635,7 @@ mod tests {
             s.answer = Some(Answer::Dismissed);
             s
         };
-        // Live but of a kind the check does not write: it stays, so it is not counted.
+        // Live, of the closer look's kind: counted apart (only a check with the look touches it).
         let tighten = suggestion(Kind::Tighten, Some(CAR), Some([12.0, 12.0, 58.0, 48.0]));
         // Stale (its box is not there) or of a hidden class: nobody sees them.
         let stale = suggestion(Kind::Verify, Some([1.0, 1.0, 9.0, 9.0]), None);
@@ -1582,13 +1648,30 @@ mod tests {
             frame("b", "d1", "f4", reviewed(vec![stale, hidden_add])),
             frame("b", "d2", "f5", reviewed(vec![])),
         ];
-        assert_eq!(open_to_replace(&frames, &wanted), (3, 2));
-        // The tighten is live: it is the kind that keeps it out.
+        let open = open_to_replace(&frames, &wanted);
+        assert_eq!(
+            open,
+            OpenCounts {
+                folds: 3,
+                fold_frames: 2,
+                tightens: 1,
+                any_frames: 3
+            }
+        );
+        // Without the look the tighten is not touched, so not counted; with it, it is.
+        assert_eq!(open.for_check(false), (3, 0, 2));
+        assert_eq!(open.for_check(true), (3, 1, 3));
         assert_eq!(
             crate::collect::labels::refine::live(&frames[2].labels, Some(&wanted)).len(),
             1
         );
-        assert_eq!(open_to_replace(&[], &wanted), (0, 0));
+        // An answered or stale tighten is not counted.
+        let mut done = tighten.clone();
+        done.answer = Some(Answer::Dismissed);
+        let gone = suggestion(Kind::Tighten, Some([1.0, 1.0, 9.0, 9.0]), Some(FAR));
+        let more = [frame("c", "d1", "f6", reviewed(vec![done, gone]))];
+        assert_eq!(open_to_replace(&more, &wanted), OpenCounts::default());
+        assert_eq!(open_to_replace(&[], &wanted), OpenCounts::default());
     }
 
     #[test]
@@ -1629,14 +1712,28 @@ mod tests {
     #[test]
     fn the_replace_warning_counts_suggestions_and_frames() {
         assert_eq!(
-            replace_warning(139, 52),
+            replace_warning(139, 0, 52),
             "this check replaces the 139 open suggestions on 52 frames with what its fold models \
              find; answered ones stay. Answer them on the Review tab first, or run it to recompute \
              them"
         );
         assert!(
-            replace_warning(1, 1)
+            replace_warning(1, 0, 1)
                 .starts_with("this check replaces the 1 open suggestion on 1 frame with")
+        );
+        // With the closer look: its open proposed boxes, as a bound.
+        assert_eq!(
+            replace_warning(139, 6, 55),
+            "this check replaces the 139 open suggestions on 55 frames with what its fold models \
+             find, and up to 6 open proposed boxes for loose labels with what its closer look \
+             finds; answered ones stay. Answer them on the Review tab first, or run it to \
+             recompute them"
+        );
+        assert_eq!(
+            replace_warning(0, 1, 1),
+            "this check replaces up to 1 open proposed box for loose labels on 1 frame with what \
+             its closer look finds; answered ones stay. Answer them on the Review tab first, or \
+             run it to recompute them"
         );
     }
 
@@ -1690,14 +1787,14 @@ mod tests {
         put("a3", vec![suggestion(Kind::Add, None, Some(FAR))]);
         let p = preview(&c, &RefineRequest::default(), &cap).unwrap();
         assert_eq!((p.open_suggestions, p.open_frames), (3, 2));
-        assert_eq!(p.warnings[0], replace_warning(3, 2), "{:?}", p.warnings);
+        assert_eq!(p.warnings[0], replace_warning(3, 0, 2), "{:?}", p.warnings);
         assert!(
             p.refused.is_some(),
             "3 frames are too few, and still counted"
         );
         let text = preview_text(&p);
         assert!(
-            text.contains(&format!("warning: {}\n", replace_warning(3, 2))),
+            text.contains(&format!("warning: {}\n", replace_warning(3, 0, 2))),
             "{text}"
         );
         // The frame filter narrows what is replaced.
@@ -1727,7 +1824,7 @@ mod tests {
         assert_eq!(
             start_warnings(&p, family),
             vec![
-                replace_warning(3, 2),
+                replace_warning(3, 0, 2),
                 weak_epochs_warning(family, 1, 3),
                 tighten::skipped_warning()
             ]
@@ -1751,6 +1848,45 @@ mod tests {
                 p.warnings
             );
         }
+        // An open better box of an earlier look: counted (as a bound) and warned about only when
+        // the check takes the closer look, which may replace it; without the look it is untouched.
+        put(
+            "a4",
+            vec![suggestion(
+                Kind::Tighten,
+                Some(CAR),
+                Some([12.0, 12.0, 58.0, 48.0]),
+            )],
+        );
+        let with = |tighten: Option<bool>| {
+            preview(
+                &c,
+                &RefineRequest {
+                    tighten,
+                    ..RefineRequest::default()
+                },
+                &cap,
+            )
+            .unwrap()
+        };
+        let p = with(Some(false));
+        assert_eq!(
+            (p.open_suggestions, p.open_tightens, p.open_frames),
+            (3, 0, 2)
+        );
+        assert_eq!(p.warnings[0], replace_warning(3, 0, 2));
+        let p = with(Some(true));
+        assert_eq!(
+            (p.open_suggestions, p.open_tightens, p.open_frames),
+            (3, 1, 3)
+        );
+        assert_eq!(p.warnings[0], replace_warning(3, 1, 3), "{:?}", p.warnings);
+        assert_eq!(start_warnings(&p, family)[0], replace_warning(3, 1, 3));
+        assert!(
+            preview_text(&p).contains("loose labels: a closer look by RF-DETR L"),
+            "{}",
+            preview_text(&p)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1790,7 +1926,8 @@ mod tests {
                 ..req.clone()
             }
         ));
-        // The time line says the look adds a few minutes; the basis stays the folds'.
+        // The time line bounds the look per loose label (no promise of minutes); the basis stays
+        // the folds'.
         let text = |tighten: bool| {
             preview_text(&RefinePreview {
                 dataset_dir: root.clone(),
@@ -1811,6 +1948,7 @@ mod tests {
                 tighten,
                 warnings: Vec::new(),
                 open_suggestions: 0,
+                open_tightens: 0,
                 open_frames: 0,
                 refused: None,
                 folder_missing: false,
@@ -1818,7 +1956,10 @@ mod tests {
         };
         let on = text(true);
         assert!(
-            on.contains("(from your last training run); the closer look adds a few minutes"),
+            on.contains(&format!(
+                "(from your last training run); {}\n",
+                tighten::time_line()
+            )),
             "{on}"
         );
         assert!(
