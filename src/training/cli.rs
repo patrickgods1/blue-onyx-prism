@@ -194,7 +194,8 @@ pub enum TrainCommand {
     /// each trained without whole camera days and run on them, and write suggestions for you to
     /// confirm on the Review tab (missing boxes, labels to verify, other classes) plus a report
     /// (<folder under review>/refine/report.json). It changes no box, status, config, model or
-    /// training run.
+    /// training run. With --with-model, a quick check: a model trained here judges the reviewed
+    /// frames it never trained or validated on, and nothing trains.
     Refine(RefineArgs),
     /// List the runs recorded in the training folder.
     List,
@@ -520,6 +521,11 @@ pub struct RefineArgs {
     /// Count the loose labels only: no closer look, no better-fitting box proposed.
     #[arg(long)]
     pub no_tighten: bool,
+    /// A quick check instead of fold models: this configured model, trained here, judges the
+    /// reviewed frames it never trained or validated on (its training record names them). Nothing
+    /// trains; refused for a model without a training record or whose run folder is gone.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["folds", "epochs"])]
+    pub with_model: Option<String>,
     /// Print the trainer's output.
     #[arg(long)]
     pub verbose: bool,
@@ -538,6 +544,7 @@ pub fn refine_request(a: &RefineArgs) -> Result<super::refine::RefineRequest> {
             (_, true) => Some(false),
             _ => None,
         },
+        model: a.with_model.clone(),
     };
     r.validate()?;
     Ok(r)
@@ -1415,7 +1422,8 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             // (the page asks; `refine::start_warnings`).
             let p = super::refine::preview(&config, &req, &cap)?;
             let job = super::refine::plan_refine(&config, req, &cap)?;
-            for w in super::refine::start_warnings(&p, job.train.request.recipe.family) {
+            let family = job.train.as_ref().map(|t| t.request.recipe.family);
+            for w in super::refine::start_warnings(&p, family) {
                 eprintln!("warning: {w}");
             }
             eprintln!(
@@ -2137,6 +2145,41 @@ mod tests {
             assert_eq!(refine_request(&t).unwrap().tighten, want, "{flag}");
         }
         assert!(parse(&["refine", "--tighten", "--no-tighten"]).is_err());
+        assert_eq!(r.model, None);
+        // --with-model: a quick check; the frame filter, GPU, closer look and dry run as for the
+        // full check, folds and epochs not at all (it trains nothing).
+        let TrainCommand::Refine(q) = parse(&[
+            "refine",
+            "--with-model",
+            "custom-rf-detr-nano-3",
+            "--frames",
+            "camera=patio",
+            "--gpu",
+            "cuda:0",
+            "--no-tighten",
+            "--dry-run",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        let r = refine_request(&q).unwrap();
+        assert_eq!(r.model.as_deref(), Some("custom-rf-detr-nano-3"));
+        assert_eq!(r.quick_model(), Some("custom-rf-detr-nano-3"));
+        assert_eq!(r.frames.cameras, ["patio"]);
+        assert_eq!((r.tighten, r.gpu.as_deref()), (Some(false), Some("cuda:0")));
+        assert!(q.dry_run);
+        for flags in [
+            vec!["refine", "--with-model", "m", "--folds", "3"],
+            vec!["refine", "--with-model", "m", "--epochs", "3"],
+            vec!["refine", "--folds", "3", "--with-model", "m"],
+        ] {
+            let e = parse(&flags).unwrap_err().to_string();
+            assert!(e.contains("cannot be used with"), "{flags:?}: {e}");
+        }
+        let TrainCommand::Refine(empty) = parse(&["refine", "--with-model", " "]).unwrap() else {
+            panic!()
+        };
+        assert!(refine_request(&empty).is_err(), "an empty name");
         for bad in [
             vec!["refine", "--folds", "1"],
             vec!["refine", "--epochs", "0"],

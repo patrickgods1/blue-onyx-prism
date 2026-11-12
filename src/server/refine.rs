@@ -15,6 +15,11 @@
 //!   that would replace open suggestions on the frames it checks asks first: 409 with
 //!   `needs_confirm` and the counts, until the request says `replace_open: true`.
 //!
+//! A quick check (`model` in the preview's query and the start's body, never with folds or epochs;
+//! [`check::quick`]) runs a model trained here on the reviewed frames it never saw: `GET /v1/refine`
+//! `capability.models` lists the usable ones (read from their training records, no frame walk), and
+//! the replace count of its 409 covers only the frames it checks.
+//!
 //! The check writes suggestions and the report only; nothing here changes a box. The Static
 //! objects card's routes (`GET /v1/refine/spots`, `POST /v1/refine/accept-spot`,
 //! `POST /v1/refine/static-cap`) are in [`super::refine_spots`], the one place of this tab that
@@ -352,8 +357,14 @@ pub(super) fn queue_stamp(tasks: &[TaskRecord]) -> String {
 }
 
 /// What the form needs of this machine; `tighten_default`: the closer look's weights are on disk,
-/// so a check looks closer at its loose labels unless told not to.
-fn capability_bits(cap: &Capability, tighten_default: bool) -> serde_json::Value {
+/// so a check looks closer at its loose labels unless told not to. `can_check` is the full check's
+/// (it trains, so it needs a GPU); a quick check runs its model on the model's own device, so
+/// `models` (the configured models a quick check can use, [`check::quick::models`], newest first:
+/// `{name, run, recipe, imgsz, enabled}`) is offered without one, and `unusable` names the models
+/// with a training record it cannot use, with why. The frames each never saw are counted on Preview
+/// (a walk of the label files).
+fn capability_bits(cap: &Capability, tighten_default: bool, config: &Config) -> serde_json::Value {
+    let (models, unusable) = check::quick::models(config);
     serde_json::json!({
         "can_check": cap.accelerator.is_some(),
         "tighten_default": tighten_default,
@@ -362,6 +373,8 @@ fn capability_bits(cap: &Capability, tighten_default: bool) -> serde_json::Value
             .into_iter()
             .map(|g| serde_json::json!({ "value": g.value, "label": g.label }))
             .collect::<Vec<_>>(),
+        "models": models,
+        "unusable": unusable,
     })
 }
 
@@ -379,7 +392,7 @@ fn status_of(state: &AppState, cap: &Capability) -> serde_json::Value {
         "open": null,
         "job": job_of(&runs, &tasks, &training::job_timing),
         "last": last_of(&tasks),
-        "capability": capability_bits(cap, check::tighten_weights_ready(&config)),
+        "capability": capability_bits(cap, check::tighten_weights_ready(&config), &config),
         "limits": {
             "folds": [check::FOLDS.start(), check::FOLDS.end()],
             "epochs": [check::EPOCHS.start(), check::EPOCHS.end()],
@@ -427,16 +440,42 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Response {
 // ---------------------------------------------------------------------------------------------
 // The request
 
-/// A check's request from the page's fields; the bounds are [`RefineRequest::validate`]'s.
-fn build_request(
+/// A check's fields as the page sends them.
+#[derive(Debug, Default)]
+struct Fields<'a> {
     folds: Option<usize>,
     epochs: Option<u32>,
-    scenes: &[String],
-    cameras: &[String],
+    scenes: &'a [String],
+    cameras: &'a [String],
     gpu: Option<String>,
     allow_large: bool,
     tighten: Option<bool>,
-) -> Result<RefineRequest, String> {
+    /// A quick check's model; empty = none.
+    model: Option<String>,
+}
+
+/// A check's request from the page's fields; the bounds are [`RefineRequest::validate`]'s. A quick
+/// check (`model`) trains nothing, so folds or epochs with it are a mistake, said as one.
+fn build_request(f: Fields<'_>) -> Result<RefineRequest, String> {
+    let Fields {
+        folds,
+        epochs,
+        scenes,
+        cameras,
+        gpu,
+        allow_large,
+        tighten,
+        model,
+    } = f;
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    if model.is_some() && (folds.is_some() || epochs.is_some()) {
+        return Err(
+            "folds and epochs are for the full check: a quick check with a model trains nothing"
+                .into(),
+        );
+    }
     let mut frames = RefineFrames::default();
     for s in scenes.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         // The CLI's parse words the error.
@@ -464,6 +503,7 @@ fn build_request(
         gpu: gpu.map(|g| g.trim().to_string()).filter(|g| !g.is_empty()),
         allow_large,
         tighten,
+        model,
     };
     request.validate().map_err(|e| format!("{e:#}"))?;
     Ok(request)
@@ -488,6 +528,9 @@ pub(super) struct PreviewQuery {
     /// `1` / `0`: the closer look at loose labels asked for or not; absent: the check's default.
     #[serde(default)]
     tighten: Option<String>,
+    /// A quick check with this configured model; absent or empty: the full check.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// A yes/no query field: `1`, `true`, `on`, `yes` or `0`, `false`, `off`, `no`; absent or empty:
@@ -518,22 +561,23 @@ fn comma_list(v: Option<&str>) -> Vec<String> {
 
 impl PreviewQuery {
     fn request(&self) -> Result<RefineRequest, String> {
-        build_request(
-            whole("folds", self.folds.as_deref())?,
-            whole("epochs", self.epochs.as_deref())?,
-            &comma_list(self.scene.as_deref()),
-            &comma_list(self.camera.as_deref()),
-            self.gpu.clone(),
-            matches!(
+        build_request(Fields {
+            folds: whole("folds", self.folds.as_deref())?,
+            epochs: whole("epochs", self.epochs.as_deref())?,
+            scenes: &comma_list(self.scene.as_deref()),
+            cameras: &comma_list(self.camera.as_deref()),
+            gpu: self.gpu.clone(),
+            allow_large: matches!(
                 self.allow_large.as_deref().map(str::trim),
                 Some("1" | "true" | "on" | "yes")
             ),
-            yes_no("tighten", self.tighten.as_deref())?,
-        )
+            tighten: yes_no("tighten", self.tighten.as_deref())?,
+            model: self.model.clone(),
+        })
     }
 }
 
-/// `GET /v1/refine/preview?folds=&epochs=&scene=&camera=&gpu=&allow_large=`: 200
+/// `GET /v1/refine/preview?folds=&epochs=&scene=&camera=&gpu=&allow_large=&tighten=&model=`: 200
 /// `{success: true, ...}` ([`check::RefinePreview`]; `refused` says why a start would be refused,
 /// `folder_missing` that the review folder is unplugged), or 400 `{success: false, message}` for a
 /// bad field. Reads every label file of the folder, so the page asks on a click only.
@@ -587,6 +631,10 @@ struct CheckBody {
     /// (the second click after a `needs_confirm` refusal).
     #[serde(default)]
     replace_open: bool,
+    /// A quick check with this configured model (no folds or epochs with it); absent: the full
+    /// check.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// The JSON body of a POST: 413 over the cap, 415 without a JSON content type, 400 when it does
@@ -750,10 +798,7 @@ fn start_check(
     if p.open_suggestions + p.open_tightens > 0 && !replace_open {
         return Err(Refusal {
             status: StatusCode::CONFLICT,
-            message: format!(
-                "Not queued: {}.",
-                check::replace_warning(p.open_suggestions, p.open_tightens, p.open_frames)
-            ),
+            message: format!("Not queued: {}.", p.replace_text()),
             folder_missing: false,
             needs_confirm: Some((p.open_suggestions, p.open_tightens, p.open_frames)),
         });
@@ -788,15 +833,16 @@ pub(super) async fn start(
         Err((status, message)) => return fail(status, message),
     };
     blocking(move || {
-        let request = match build_request(
-            b.folds,
-            b.epochs,
-            &b.scenes,
-            &b.cameras,
-            b.gpu,
-            b.allow_large,
-            b.tighten,
-        ) {
+        let request = match build_request(Fields {
+            folds: b.folds,
+            epochs: b.epochs,
+            scenes: &b.scenes,
+            cameras: &b.cameras,
+            gpu: b.gpu,
+            allow_large: b.allow_large,
+            tighten: b.tighten,
+            model: b.model,
+        }) {
             Ok(r) => r,
             Err(m) => return fail(StatusCode::BAD_REQUEST, m),
         };
@@ -1019,9 +1065,25 @@ mod tests {
             "<input type=\"checkbox\" id=\"refine-tighten\" name=\"tighten\"> Propose better boxes \
              for loose labels</label>",
             "downloads RF-DETR L (0.14 GB) the first time",
+            // The mode choice: the full check by default, the quick check's model select hidden,
+            // folds and epochs the full check's only.
+            "<input type=\"radio\" name=\"check_mode\" value=\"folds\" checked> Full check (fold \
+             models, about an hour)</label>",
+            "<input type=\"radio\" name=\"check_mode\" value=\"model\" id=\"refine-mode-model\"> \
+             Quick check with a model you trained (only frames it never saw)</label>",
+            "<div class=\"tr-field\" id=\"refine-model-field\" hidden>",
+            "<select id=\"refine-model\" name=\"model\"></select>",
         ] {
             assert!(html.contains(want), "{want}");
         }
+        assert_eq!(
+            html.matches("data-full-only").count(),
+            2,
+            "folds and epochs"
+        );
+        let folds = html.find("id=\"refine-folds\"").unwrap();
+        let wrapper = html[..folds].rfind("<div").unwrap();
+        assert!(html[wrapper..folds].contains("data-full-only"));
         // The Static objects card sits between Findings and Coverage.
         let at = |id: &str| html.find(id).unwrap();
         assert!(
@@ -1369,21 +1431,21 @@ mod tests {
 
     #[test]
     fn a_request_is_built_from_the_fields_and_checked() {
-        let r = build_request(
-            None,
-            None,
-            &["ir".into(), " day ".into(), "ir".into()],
-            &["patio".into(), "".into(), "front".into()],
-            Some(" ".into()),
-            true,
-            Some(false),
-        )
+        let r = build_request(Fields {
+            scenes: &["ir".into(), " day ".into(), "ir".into()],
+            cameras: &["patio".into(), "".into(), "front".into()],
+            gpu: Some(" ".into()),
+            allow_large: true,
+            tighten: Some(false),
+            ..Fields::default()
+        })
         .unwrap();
         assert_eq!((r.folds, r.epochs), (4, 8));
         assert_eq!(r.frames.scenes, ["day", "ir"]);
         assert_eq!(r.frames.cameras, ["front", "patio"]);
         assert!(r.gpu.is_none() && r.allow_large);
         assert_eq!(r.tighten, Some(false));
+        assert_eq!(r.model, None);
         for (folds, epochs, scene) in [
             (Some(1), None, "day"),
             (Some(9), None, "day"),
@@ -1391,11 +1453,44 @@ mod tests {
             (None, Some(51), "day"),
             (None, None, "dusk"),
         ] {
+            let scenes = [scene.to_string()];
             assert!(
-                build_request(folds, epochs, &[scene.into()], &[], None, false, None).is_err(),
+                build_request(Fields {
+                    folds,
+                    epochs,
+                    scenes: &scenes,
+                    ..Fields::default()
+                })
+                .is_err(),
                 "{folds:?} {epochs:?} {scene}"
             );
         }
+        // A quick check: the model's name, trimmed; an empty one is the full check; folds or
+        // epochs with a model are refused (it trains nothing).
+        let quick = |model: &str, folds: Option<usize>, epochs: Option<u32>| {
+            build_request(Fields {
+                folds,
+                epochs,
+                model: Some(model.into()),
+                ..Fields::default()
+            })
+        };
+        assert_eq!(
+            quick(" mine ", None, None).unwrap().model.as_deref(),
+            Some("mine")
+        );
+        assert_eq!(quick("  ", None, None).unwrap().model, None);
+        for (f, e) in [(Some(4), None), (None, Some(8))] {
+            let m = quick("mine", f, e).unwrap_err();
+            assert!(m.contains("quick check with a model trains nothing"), "{m}");
+        }
+        assert!(quick(&"x".repeat(300), None, None).is_err());
+        assert!(quick("a\u{7}b", None, None).is_err());
+        let q = PreviewQuery {
+            model: Some("mine".into()),
+            ..PreviewQuery::default()
+        };
+        assert_eq!(q.request().unwrap().model.as_deref(), Some("mine"));
         let q = PreviewQuery {
             folds: Some("3".into()),
             scene: Some("ir,day".into()),
@@ -1964,6 +2059,141 @@ mod tests {
             .unwrap();
         let (s, _) = json(&state, cross).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    // ---- the quick check
+
+    /// A state over the quick check's fixture (a model `mine` trained here, disabled so the test
+    /// registry does not load it).
+    fn quick_state(f: &check::quick::tests::Fixture) -> Arc<AppState> {
+        let fixed = check::quick::tests::config(f);
+        test_state_with(move |c| {
+            c.download_dir.clone_from(&fixed.download_dir);
+            c.collect.dir.clone_from(&fixed.collect.dir);
+            c.collect.classes.clone_from(&fixed.collect.classes);
+            c.models = fixed
+                .models
+                .iter()
+                .map(|m| crate::config::ModelConfig {
+                    enabled: false,
+                    ..m.clone()
+                })
+                .collect();
+        })
+    }
+
+    #[tokio::test]
+    async fn a_quick_check_lists_the_models_trained_here_previews_and_asks_about_its_frames_only() {
+        let f = check::quick::tests::fixture("route", false);
+        let state = quick_state(&f);
+        // GET /v1/refine offers the model, with no frame walk for it.
+        let (s, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let models = v["capability"]["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "{v}");
+        assert_eq!(models[0]["name"], "mine");
+        assert_eq!(models[0]["run"], check::quick::tests::RUN);
+        assert_eq!(models[0]["imgsz"], 384);
+        assert_eq!(models[0]["recipe"], "rfdetr-nano");
+        assert_eq!(v["capability"]["unusable"], serde_json::json!([]));
+        // The preview takes the model; folds or epochs with it are a 400.
+        let (s, v) = json(&state, get("/v1/refine/preview?model=mine")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["mode"], "model");
+        assert_eq!(v["frames"], 4);
+        assert_eq!(v["model"]["trained_on"], 2);
+        assert_eq!(v["model"]["validated_on"], 1);
+        assert_eq!(v["folds"], serde_json::json!([]));
+        assert!(v["refused"].is_null(), "{v}");
+        assert!(
+            v["text"]
+                .as_str()
+                .unwrap()
+                .contains("with mine: 4 frames it never saw"),
+            "{v}"
+        );
+        for q in ["model=mine&folds=2", "model=mine&epochs=3"] {
+            let (s, v) = json(&state, get(&format!("/v1/refine/preview?{q}"))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{q}: {v}");
+        }
+        let (s, v) = json(&state, get("/v1/refine/preview?model=nope")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("no configured model")
+        );
+        // Open suggestions on a frame it trained on are not this check's to replace; those on a
+        // frame it never saw are, and the 409 counts them alone, in the model's words.
+        let open = |rel: &str| {
+            let p = Frame::resolve(&f.dataset, rel).unwrap().labels;
+            let mut l = labels::read(&p).unwrap().unwrap();
+            l.refine = vec![suggestion(
+                Kind::Add,
+                None,
+                Some([200.0, 60.0, 260.0, 200.0]),
+            )];
+            labels::write(&p, &l).unwrap();
+        };
+        open(&f.rels["trained"][0]);
+        open(&f.rels["new"][0]);
+        let (s, v) = json(
+            &state,
+            post_json("/v1/refine/check", r#"{"model":"mine","folds":2}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let (s, v) = json(&state, post_json("/v1/refine/check", r#"{"model":"mine"}"#)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["needs_confirm"], true);
+        assert_eq!(
+            (v["open_suggestions"].as_u64(), v["open_frames"].as_u64()),
+            (Some(1), Some(1)),
+            "{v}"
+        );
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.starts_with(
+                "Not queued: this check replaces the 1 open suggestion on 1 frame with what mine \
+                 finds"
+            ),
+            "{m}"
+        );
+        // Confirmed, and with no GPU at all: planned with the registry's predictor and queued.
+        let config = state.config_read().clone();
+        let mut none = host();
+        none.accelerator = None;
+        none.cuda_options.clear();
+        let seen = Mutex::new(Vec::new());
+        let enqueue = |job: RefineJob, _: QueueRule<'_>| {
+            assert!(job.predictor.is_some());
+            assert!(job.train.is_none() && job.quick.is_some());
+            seen.lock().unwrap().push(Task::title(&job));
+            Ok(job.id.clone())
+        };
+        let req = RefineRequest {
+            model: Some("mine".into()),
+            ..RefineRequest::default()
+        };
+        let (_, title) =
+            start_check(&config, req.clone(), true, &none, &[], None, &enqueue).unwrap();
+        assert_eq!(
+            title,
+            "quick dataset check with mine (4 frames it never saw, all reviewed frames)"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // A model without a training record is refused before anything is queued.
+        std::fs::remove_file(f.root.join("models").join("mine.provenance.json")).unwrap();
+        let e = start_check(&config, req, true, &none, &[], None, &never).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert!(
+            e.message.contains("has no training record"),
+            "{}",
+            e.message
+        );
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(v["capability"]["models"], serde_json::json!([]), "{v}");
     }
 
     /// The model entry list of the Models tab never gets a fold model: nothing in this module

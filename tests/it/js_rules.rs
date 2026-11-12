@@ -2000,6 +2000,78 @@ process.stdout.write(JSON.stringify({
     );
 }
 
+/// A quick check's report never reads as a full check's: the Findings card's last-check line, the
+/// Coverage card's recall sentence and the size table's note name the model and the frames it
+/// never saw (`RefineFloor.lastLine`, `recallOf`, `measuredWith`; report.json `mode: model`).
+#[test]
+fn a_quick_checks_report_names_its_model_and_the_frames_it_never_saw() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+const quick = {
+  mode: 'model', frames_checked: 287, cancelled: false, folds: 0, folds_done: 0,
+  recipe: { model: 'rfdetr-nano', imgsz: 384, epochs: 100, batch: 8 },
+  model: { name: 'custom-rf-detr-nano-3', run: '20261111-020504-cad6', imgsz: 384,
+           trained_on: 564, validated_on: 83, same_day: 12 },
+  size_floor: { px: 10, input: 384 },
+};
+const full = {
+  folds: 4, folds_done: 4, frames_checked: 851, cancelled: true,
+  recipe: { model: 'rfdetr-nano', imgsz: 384, epochs: 8, batch: 8 }, folds_every_label: true,
+};
+process.stdout.write(JSON.stringify({
+  quick_line: F.lastLine(quick, 'T'),
+  full_line: F.lastLine(full, 'T'),
+  quick_recall: F.recallOf(quick),
+  full_recall: F.recallOf(full),
+  quick_measured: F.measuredWith(quick),
+  one: F.lastLine(Object.assign({}, quick, { frames_checked: 1 }), 'T'),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["quick_line"],
+        "Last check: T, quick check with custom-rf-detr-nano-3 (training run 20261111-020504-cad6). \
+         287 frames it never saw checked; 564 frames it trained on and 83 it validated on skipped \
+         (their suggestions stay as they were); rfdetr-nano at 384 px."
+    );
+    assert_eq!(
+        got["full_line"],
+        "Last check: T, 4 of 4 folds done, cancelled. 851 frames checked; rfdetr-nano at 384 px, \
+         8 epochs each."
+    );
+    assert_eq!(
+        got["quick_recall"],
+        "Recall per camera, scene and class over the 287 frames custom-rf-detr-nano-3 never saw: \
+         how often it found a labelled object"
+    );
+    assert!(
+        got["full_recall"]
+            .as_str()
+            .unwrap()
+            .contains("a fold model that never saw that camera day")
+    );
+    assert_eq!(
+        got["quick_measured"],
+        "Measured by custom-rf-detr-nano-3 on 287 frames it never saw, at its own input of 384 px: \
+         what that model finds, not what the recipe can learn; the check treated labels under 10 \
+         px at 384 as ignore regions (counted in this table only)."
+    );
+    assert!(
+        got["one"]
+            .as_str()
+            .unwrap()
+            .contains("1 frame it never saw checked")
+    );
+}
+
 /// The Findings card's line on loose labels (`RefineFloor.looseLine`): with the closer look, how
 /// many got a proposed box; without it (`--no-tighten`, the weights missing, an earlier report),
 /// that none was looked at.

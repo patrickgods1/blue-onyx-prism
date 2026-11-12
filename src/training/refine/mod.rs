@@ -30,16 +30,23 @@
 //! A route plans a check like the overlap check: [`plan_refine`] then the queue's `enqueue_task`;
 //! [`preview`] answers the page's (and `--dry-run`'s) question of what a check would do, without a
 //! GPU, a download or a write.
+//!
+//! **A quick check** ([`quick`], [`RefineRequest::model`]) judges the reviewed frames a model the
+//! user trained here never trained or validated on, with that model instead of fold models: no
+//! training, the same judge and writer, the same promise of changing nothing but suggestions and
+//! the report.
 
 pub mod folds;
 pub mod job;
 pub mod judge;
 pub mod predict;
+pub mod quick;
 pub mod report;
 pub mod tighten;
 pub mod write;
 
 pub use job::RefineJob;
+pub use report::Mode;
 
 use super::capability::Capability;
 use super::dataset::SceneFilter;
@@ -180,7 +187,15 @@ pub struct RefineRequest {
     /// holds the answer ([`plan_refine`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tighten: Option<bool>,
+    /// A quick check with this configured model ([`quick`]): it judges the reviewed frames it never
+    /// trained or validated on, and nothing trains (`folds` and `epochs` are not used). None: the
+    /// fold check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
+
+/// Longest model name a request may carry (a config name; more is no name of the config).
+pub const MAX_MODEL_NAME: usize = 255;
 
 fn default_folds() -> usize {
     DEFAULT_FOLDS
@@ -199,6 +214,7 @@ impl Default for RefineRequest {
             gpu: None,
             allow_large: false,
             tighten: None,
+            model: None,
         }
     }
 }
@@ -238,7 +254,23 @@ impl RefineRequest {
                 self.epochs
             );
         }
+        if let Some(m) = &self.model {
+            let m = m.trim();
+            if m.is_empty() {
+                bail!("the quick check needs the name of a configured model");
+            }
+            if m.len() > MAX_MODEL_NAME || m.chars().any(char::is_control) {
+                bail!(
+                    "a model name is up to {MAX_MODEL_NAME} characters, without control characters"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// The quick check's model, trimmed; None for the fold check.
+    pub fn quick_model(&self) -> Option<&str> {
+        self.model.as_deref().map(str::trim)
     }
 }
 
@@ -440,16 +472,21 @@ pub enum TimeBasis {
     /// The pace the newest finished training run (whose recipe the folds use) measured on this
     /// GPU ([`pace_of`]).
     LastRun,
-    /// The generic training estimate ([`super::estimate::estimate`]): a rough guess.
+    /// The generic training estimate ([`super::estimate::estimate`]), or a quick check's guess
+    /// ([`quick::QUICK_S_PER_FRAME`]): a rough guess.
     Guess,
+    /// A quick check: what the last quick check with the same model measured per frame
+    /// ([`report::RefineReport::predict_s_per_frame`]).
+    LastCheck,
 }
 
 impl TimeBasis {
-    /// `from your last training run`, `a rough guess`.
+    /// `from your last training run`, `a rough guess`, `from the last quick check with this model`.
     pub const fn describe(self) -> &'static str {
         match self {
             TimeBasis::LastRun => "from your last training run",
             TimeBasis::Guess => "a rough guess",
+            TimeBasis::LastCheck => "from the last quick check with this model",
         }
     }
 }
@@ -578,13 +615,19 @@ fn counted(n: usize, one: &str, many: &str) -> String {
 /// `tightens` open proposed boxes of the closer look on `frames` frames ([`open_to_replace`],
 /// [`OpenCounts::for_check`]): the preview, the CLI and the start's confirmation say it.
 pub fn replace_warning(open: usize, tightens: usize, frames: usize) -> String {
+    replace_warning_by(open, tightens, frames, "what its fold models find")
+}
+
+/// [`replace_warning`] of a check whose suggestions come from `finder` (`what its fold models
+/// find`, `what <model> finds`).
+pub fn replace_warning_by(open: usize, tightens: usize, frames: usize, finder: &str) -> String {
     let boxes = format!(
         "up to {} for loose labels",
         counted(tightens, "open proposed box", "open proposed boxes")
     );
     let what = match (open, tightens) {
         (_, 0) => format!(
-            "the {} on {} with what its fold models find",
+            "the {} on {} with {finder}",
             counted(open, "open suggestion", "open suggestions"),
             counted(frames, "frame", "frames"),
         ),
@@ -593,8 +636,7 @@ pub fn replace_warning(open: usize, tightens: usize, frames: usize) -> String {
             counted(frames, "frame", "frames"),
         ),
         _ => format!(
-            "the {} on {} with what its fold models find, and {boxes} with what its closer look \
-             finds",
+            "the {} on {} with {finder}, and {boxes} with what its closer look finds",
             counted(open, "open suggestion", "open suggestions"),
             counted(frames, "frame", "frames"),
         ),
@@ -841,6 +883,30 @@ pub struct RefinePreview {
     /// nothing was counted. Never an empty dataset.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folder_missing: bool,
+    /// Fold models, or a quick check with a model ([`quick`]): then `folds` is empty, `recipe` is
+    /// the model's own, `frames` the reviewed frames it never saw and `open_*` count only those.
+    #[serde(default)]
+    pub mode: Mode,
+    /// A quick check's model: its run, input size, the frames skipped as trained or validated on,
+    /// the classes it lacks, the device it is configured for. Only `name` when its frames could
+    /// not be determined (`refused` says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<report::ModelInfo>,
+}
+
+impl RefinePreview {
+    /// [`replace_warning`] in this check's words (a quick check names its model).
+    pub fn replace_text(&self) -> String {
+        match (&self.mode, &self.model) {
+            (Mode::Model, Some(m)) => replace_warning_by(
+                self.open_suggestions,
+                self.open_tightens,
+                self.open_frames,
+                &format!("what {} finds", m.name),
+            ),
+            _ => replace_warning(self.open_suggestions, self.open_tightens, self.open_frames),
+        }
+    }
 }
 
 /// What a check of `request` on `config` would do: no GPU, login or download needed, nothing
@@ -851,6 +917,9 @@ pub fn preview(
     cap: &Capability,
 ) -> Result<RefinePreview> {
     request.validate()?;
+    if let Some(name) = request.quick_model() {
+        return quick::preview(config, request, cap, name);
+    }
     let dir = config.collect.resolved_review_dir(&config.data_root());
     // An unavailable folder (an unplugged drive) is its own answer, never an empty dataset.
     let missing = config.collect.review_folder_problem(&dir);
@@ -1011,28 +1080,33 @@ pub fn preview(
         open_frames,
         refused: s.refused,
         folder_missing: missing.is_some(),
+        mode: Mode::Folds,
+        model: None,
     })
 }
 
 /// The warnings `train refine` prints before it starts (it is an explicit command: it asks
 /// nothing): [`replace_warning`] when the check replaces open suggestions,
-/// [`weak_epochs_warning`] when its fold models are short, and [`tighten::skipped_warning`] when
-/// it runs without the closer look for want of the weights.
-pub fn start_warnings(p: &RefinePreview, family: TrainFamily) -> Vec<String> {
+/// [`weak_epochs_warning`] when its fold models (of `family`; None for a quick check, which trains
+/// none) are short, a quick check's frames of camera days its model trained on
+/// ([`quick::same_day_warning`]), and [`tighten::skipped_warning`] when it runs without the closer
+/// look for want of the weights.
+pub fn start_warnings(p: &RefinePreview, family: Option<TrainFamily>) -> Vec<String> {
     let mut out = Vec::new();
     if p.open_suggestions + p.open_tightens > 0 {
-        out.push(replace_warning(
-            p.open_suggestions,
-            p.open_tightens,
-            p.open_frames,
-        ));
+        out.push(p.replace_text());
     }
-    if weak_epochs(family, p.recipe.epochs) {
+    if let Some(family) = family
+        && weak_epochs(family, p.recipe.epochs)
+    {
         out.push(weak_epochs_warning(
             family,
             p.recipe.epochs,
             p.open_suggestions,
         ));
+    }
+    if let Some(m) = p.model.as_ref().filter(|m| m.same_day > 0) {
+        out.push(quick::same_day_warning(m.same_day, p.frames, &m.name));
     }
     let skipped = tighten::skipped_warning();
     if p.warnings.contains(&skipped) {
@@ -1043,13 +1117,50 @@ pub fn start_warnings(p: &RefinePreview, family: TrainFamily) -> Vec<String> {
 
 /// The `--dry-run` text of `p`.
 pub fn preview_text(p: &RefinePreview) -> String {
-    let mut t = format!(
-        "dataset check of {} in {}: {} frames on {} camera days\n",
-        p.filter,
-        p.dataset_dir.display(),
-        p.frames,
-        p.camera_days
-    );
+    let quick = p.mode == Mode::Model;
+    let mut t = match (&p.model, quick) {
+        (Some(m), true) => {
+            let mut t = format!(
+                "quick dataset check of {} in {} with {}: {} frames it never saw on {} camera \
+                 days\n",
+                p.filter,
+                p.dataset_dir.display(),
+                m.name,
+                p.frames,
+                p.camera_days
+            );
+            if !m.run.is_empty() {
+                t.push_str(&format!(
+                    "model: {} ({} at {} px, training run {}{}); skipped: {} frames it trained \
+                     on, {} it validated on\n",
+                    m.name,
+                    m.recipe,
+                    m.imgsz,
+                    m.run,
+                    if m.device.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", runs on {}", m.device)
+                    },
+                    m.trained_on,
+                    m.validated_on
+                ));
+                t.push_str(if m.by_source {
+                    "frames matched by name and by the run's record of its image sources\n"
+                } else {
+                    "frames matched by name (the run has no record of its image sources)\n"
+                });
+            }
+            t
+        }
+        _ => format!(
+            "dataset check of {} in {}: {} frames on {} camera days\n",
+            p.filter,
+            p.dataset_dir.display(),
+            p.frames,
+            p.camera_days
+        ),
+    };
     let l = &p.left_out;
     if l.frames() + l.unreadable_folders > 0 {
         t.push_str(&format!(
@@ -1068,30 +1179,39 @@ pub fn preview_text(p: &RefinePreview) -> String {
         ));
     }
     let r = &p.recipe;
-    t.push_str(&format!(
-        "{} folds, each a {} model at {} px trained {} epochs (batch {}; {})\n",
-        p.folds.len(),
-        r.model,
-        r.imgsz,
-        r.epochs,
-        r.batch,
-        r.from
-    ));
+    if !quick {
+        t.push_str(&format!(
+            "{} folds, each a {} model at {} px trained {} epochs (batch {}; {})\n",
+            p.folds.len(),
+            r.model,
+            r.imgsz,
+            r.epochs,
+            r.batch,
+            r.from
+        ));
+    }
     for f in &p.folds {
         t.push_str(&format!(
             "  fold {}: {} frames on {} camera days\n",
             f.fold, f.frames, f.camera_days
         ));
     }
-    t.push_str(if p.tighten {
-        "loose labels: a closer look by RF-DETR L after the last fold proposes better-fitting boxes\n"
-    } else {
-        "loose labels: counted only (no closer look)\n"
+    t.push_str(match (p.tighten, quick) {
+        (true, false) => {
+            "loose labels: a closer look by RF-DETR L after the last fold proposes better-fitting \
+             boxes\n"
+        }
+        (true, true) => {
+            "loose labels: a closer look by RF-DETR L after the model's pass proposes \
+             better-fitting boxes\n"
+        }
+        _ => "loose labels: counted only (no closer look)\n",
     });
     if let Some(s) = p.seconds {
         t.push_str(&format!(
-            "about {} on this GPU ({}){}\n",
+            "about {} {}({}){}\n",
             super::estimate::format_duration(s),
+            if quick { "" } else { "on this GPU " },
             p.time_basis.unwrap_or(TimeBasis::Guess).describe(),
             if p.tighten {
                 format!("; {}", tighten::time_line())
@@ -1119,9 +1239,15 @@ pub fn fold_model_name(k: usize) -> String {
 /// on, the training environment or base weights to download without `allow_large` (or
 /// `allow_large_downloads`). The frames are read when it runs. Work folder:
 /// `<training dir>/refine/<id>`.
+///
+/// With a `model` it plans a quick check instead ([`quick::plan`]): no GPU needed unless the
+/// closer look runs, and the frames are counted now for the title.
 pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) -> Result<RefineJob> {
     let mut request = request;
     request.validate()?;
+    if let Some(name) = request.quick_model().map(str::to_string) {
+        return quick::plan(config, request, cap, &name);
+    }
     let paths = TrainPaths::for_config(config);
     let platform = Platform::current();
     let allow_large = request.allow_large || config.allow_large_downloads;
@@ -1182,7 +1308,8 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
         classes: config.collect.classes.clone(),
         hidden: config.collect.hidden_classes.clone(),
         work,
-        train,
+        train: Some(train),
+        quick: None,
         recipe_from: from,
         predictor: None,
         config: Box::new(config.clone()),
@@ -1471,6 +1598,8 @@ mod tests {
                 open_frames: 0,
                 refused: None,
                 folder_missing: false,
+                mode: Mode::Folds,
+                model: None,
             })
         };
         assert!(
@@ -1822,7 +1951,7 @@ mod tests {
         assert!(!p.tighten);
         assert_eq!(p.warnings.last(), Some(&tighten::skipped_warning()));
         assert_eq!(
-            start_warnings(&p, family),
+            start_warnings(&p, Some(family)),
             vec![
                 replace_warning(3, 0, 2),
                 weak_epochs_warning(family, 1, 3),
@@ -1881,7 +2010,10 @@ mod tests {
             (3, 1, 3)
         );
         assert_eq!(p.warnings[0], replace_warning(3, 1, 3), "{:?}", p.warnings);
-        assert_eq!(start_warnings(&p, family)[0], replace_warning(3, 1, 3));
+        assert_eq!(
+            start_warnings(&p, Some(family))[0],
+            replace_warning(3, 1, 3)
+        );
         assert!(
             preview_text(&p).contains("loose labels: a closer look by RF-DETR L"),
             "{}",
@@ -1952,6 +2084,8 @@ mod tests {
                 open_frames: 0,
                 refused: None,
                 folder_missing: false,
+                mode: Mode::Folds,
+                model: None,
             })
         };
         let on = text(true);

@@ -36,10 +36,20 @@
 //!
 //! The work folder (`<training dir>/refine/<id>`) is held busy for the whole run, so a storage sweep
 //! leaves it alone, and removed at the end however the run ends.
+//!
+//! **A quick check** ([`super::quick`], [`RefineJob::quick`]) has no fold: select the reviewed
+//! frames its model never trained or validated on (one snapshot), take the training lock, run the
+//! model over them once, judge and write them as a fold's frames ([`write::write_fold`]: the frames
+//! it trained on are never passed, so their suggestions stay exactly as they are), then the closer
+//! look (when on) and the report (`mode: model`). Steps: 3, or 4 with the look. A Cancel during the
+//! model's pass writes nothing (a plain cancel, as a cancel before any fold finished); a failed pass
+//! fails the check with nothing written; a Cancel during the closer look keeps what the pass wrote.
+//! Pause holds the closer look's helper only: the model's pass runs in this process.
 
 use super::judge::{self, Context};
 use super::predict::{FoldModel, FoldPredictor, LocalPredictor};
-use super::report::{RecallTally, RefineReport};
+use super::quick::{self, Quick};
+use super::report::{Mode, RecallTally, RefineReport};
 use super::{RefineRequest, Selected, fold_model_name, recipe_info, select, tighten, write};
 use crate::backend::memory::Commit;
 use crate::collect::labels::Frame;
@@ -90,8 +100,10 @@ pub struct RefineJob {
     /// deleted at the end.
     pub work: PathBuf,
     /// The training run every fold copies ([`super::super::plan_job`]): recipe, GPU, paths,
-    /// platform, timeout, workers.
-    pub train: TrainJob,
+    /// platform, timeout, workers. None for a quick check.
+    pub train: Option<TrainJob>,
+    /// A quick check's model ([`super::quick::plan`]); None for the fold check.
+    pub quick: Option<Quick>,
     /// Where the recipe came from ([`super::choose_recipe`]).
     pub recipe_from: String,
     /// Runs a fold model over its frames (None: [`LocalPredictor`] on `config`, its own runtimes;
@@ -341,6 +353,8 @@ pub struct Acc {
     /// The answered candidates that got no proposal, with why ([`write::Tightened::reasons`]; the
     /// replay prints them).
     pub tighten_reasons: Vec<(String, super::judge::Loose, super::judge::NoTighten)>,
+    /// Frames the models answered and the seconds they took ([`Acc::note_predict`]).
+    pub predicted: (usize, f64),
 }
 
 impl Acc {
@@ -354,7 +368,19 @@ impl Acc {
             changed: BTreeSet::new(),
             shapes: Vec::new(),
             tighten_reasons: Vec::new(),
+            predicted: (0, 0.0),
         }
+    }
+
+    /// Note that a model answered `frames` frames in `seconds` (its loading included): the
+    /// report's [`RefineReport::predict_s_per_frame`] over every pass so far.
+    pub fn note_predict(&mut self, frames: usize, seconds: f64) {
+        self.predicted.0 += frames;
+        self.predicted.1 += seconds;
+        let (n, s) = self.predicted;
+        #[allow(clippy::cast_precision_loss, reason = "a count of frames")]
+        let per = (n > 0 && s.is_finite()).then(|| s / n as f64);
+        self.rep.predict_s_per_frame = per.map(|x| (x * 10_000.0).round() / 10_000.0);
     }
 
     /// Count what the closer look's writes did (`w`).
@@ -485,14 +511,55 @@ impl RefineJob {
         self.request.tighten == Some(true)
     }
 
-    /// Where the closer look runs: the fold training's environment and GPU.
-    pub(super) fn zoom_helper(&self) -> crate::training::overlaps::zoom::Helper<'_> {
-        crate::training::overlaps::zoom::Helper {
-            paths: &self.train.paths,
-            platform: self.train.platform,
-            accelerator: &self.train.accelerator,
-            timeout: self.train.timeout,
+    /// Where the closer look runs: the fold training's environment and GPU, or a quick check's
+    /// ([`quick::LookEnv`]). An error when the check has neither (a quick check planned without
+    /// the look).
+    pub(super) fn zoom_helper(&self) -> Result<crate::training::overlaps::zoom::Helper<'_>> {
+        use crate::training::overlaps::zoom::Helper;
+        if let Some(t) = &self.train {
+            return Ok(Helper {
+                paths: &t.paths,
+                platform: t.platform,
+                accelerator: &t.accelerator,
+                timeout: t.timeout,
+            });
         }
+        let l = self
+            .quick
+            .as_ref()
+            .and_then(|q| q.look.as_ref())
+            .ok_or_else(|| {
+                anyhow!("this check was planned without the closer look's GPU and environment")
+            })?;
+        Ok(Helper {
+            paths: &l.paths,
+            platform: l.platform,
+            accelerator: &l.accelerator,
+            timeout: l.timeout,
+        })
+    }
+
+    /// The judge's input size: the fold models' recipe's, or a quick check's model's.
+    pub fn imgsz(&self) -> u32 {
+        match (&self.train, &self.quick) {
+            (Some(t), _) => t.request.recipe.imgsz,
+            (None, Some(q)) => q.imgsz,
+            (None, None) => 0,
+        }
+    }
+
+    /// The training lock this check holds while it runs (the fold training's, or the config's).
+    fn lock_file(&self) -> PathBuf {
+        match &self.train {
+            Some(t) => t.paths.train_lock_file(),
+            None => crate::resources::export::train::TrainPaths::for_config(&self.config)
+                .train_lock_file(),
+        }
+    }
+
+    /// A quick check's model as the judge words it; None for fold models.
+    fn model_judge(&self) -> Option<&judge::ModelJudge> {
+        self.quick.as_ref().map(|q| &q.judge)
     }
 
     /// What the closer look's writes judge with: the folds' context without the class counts and
@@ -504,11 +571,12 @@ impl RefineJob {
     ) -> Context<'a> {
         Context {
             wanted,
-            imgsz: self.train.request.recipe.imgsz,
+            imgsz: self.imgsz(),
             class_boxes,
             run: &self.id,
             spots: None,
             floor: self.config.collect.size_floor,
+            model: self.model_judge(),
         }
     }
 
@@ -524,11 +592,12 @@ impl RefineJob {
     ) -> Context<'a> {
         Context {
             wanted,
-            imgsz: self.train.request.recipe.imgsz,
+            imgsz: self.imgsz(),
             class_boxes,
             run: &self.id,
             spots: Some(spots),
             floor: self.config.collect.size_floor,
+            model: self.model_judge(),
         }
     }
 
@@ -554,17 +623,17 @@ impl RefineJob {
         (held, train, gone)
     }
 
-    /// The report of a check over the selection `s` before any fold ran.
-    fn start_report(&self, s: &Selected) -> RefineReport {
+    /// The report of a check over the selection `s` before any fold of `train` ran.
+    fn start_report(&self, train: &TrainJob, s: &Selected) -> RefineReport {
         let k = s.k;
-        let recipe = &self.train.request.recipe;
+        let recipe = &train.request.recipe;
         let mut rep = RefineReport::new(&self.id, k, recipe_info(recipe, &self.recipe_from));
         // The fold models train on every label; the judge treats boxes under the floor as ignore
         // regions. What the recall by size was measured with.
         rep.folds_every_label = true;
         rep.tighten = self.tighten();
         rep.size_floor = self.config.collect.size_floor;
-        rep.ignore_mode = Some(self.train.options.ignore);
+        rep.ignore_mode = Some(train.options.ignore);
         rep.camera_days = s.groups.len();
         rep.frames_selected = s.frames.len();
         rep.static_spots = s.spots.len();
@@ -637,6 +706,7 @@ impl RefineJob {
     #[allow(clippy::too_many_arguments)]
     fn run_fold(
         &self,
+        train_job: &TrainJob,
         i: usize,
         s: &Selected,
         lock: &TrainLock,
@@ -746,7 +816,7 @@ impl RefineJob {
         }
         check(cancel)?;
         // (b) Train on the other folds.
-        let mut tj = self.train.clone();
+        let mut tj = train_job.clone();
         tj.id = format!("{}-fold{n}", self.id);
         tj.name = fold_model_name(n);
         tj.run_dir.clone_from(&fold_dir);
@@ -831,7 +901,9 @@ impl RefineJob {
             yaml: out.yaml,
             family: out.family,
             classes: out.classes,
+            entry: None,
         };
+        let t0 = Instant::now();
         let found = predictor
             .predict(&model, &images, judge::MATCH_MIN_SCORE, cancel)
             .with_context(|| {
@@ -843,6 +915,7 @@ impl RefineJob {
         if found.cancelled || cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(Cancelled));
         }
+        acc.note_predict(found.frames.len(), t0.elapsed().as_secs_f64());
         // (e, f) Judge and write, under the label write lock (no cancel checks: a fold is written
         // whole).
         let w = self.write_fold_into(n, k, &fold, &found, &jctx, acc, &mut |d, total| {
@@ -889,6 +962,12 @@ impl RefineJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
+        if let Some(q) = &self.quick {
+            return self.stages_quick(q, ctx, report, cancel);
+        }
+        let Some(train_job) = &self.train else {
+            bail!("this dataset check was planned without its fold training run");
+        };
         let started = Instant::now();
         // 1. One label snapshot for every fold.
         Self::step(
@@ -910,12 +989,12 @@ impl RefineJob {
         // The GPU is this check's from the first fold's training to the last fold's writes: held
         // across the folds, so no other process (the service or a `train` command) trains or
         // labels between a fold's training and its prediction, or takes the next fold's turn.
-        let lock = TrainLock::try_acquire(&self.train.paths.train_lock_file())?;
+        let lock = TrainLock::try_acquire(&self.lock_file())?;
         let k = s.k;
         let look = self.tighten();
         // From here on the count the folds were lowered to ([`Task::steps`] has the asked one).
         let steps = steps_for(k, look);
-        let mut acc = Acc::new(self.start_report(&s));
+        let mut acc = Acc::new(self.start_report(train_job, &s));
         Self::step(
             report,
             SELECTING,
@@ -938,6 +1017,7 @@ impl RefineJob {
                 break;
             }
             let r = self.run_fold(
+                train_job,
                 i,
                 &s,
                 &lock,
@@ -1055,28 +1135,7 @@ impl RefineJob {
         } else {
             String::new()
         };
-        let looked = match &zoom {
-            Some(z) if z.failed.is_some() => {
-                "; the closer look at them failed (see the warnings), the other suggestions were \
-                 saved"
-                    .to_string()
-            }
-            Some(_) => format!(
-                ", {} of {} sent to a closer look answered{}",
-                n(rep.zoomed),
-                n(rep.tighten_candidates),
-                if rep.tighten_left_out > 0 {
-                    format!(
-                        " ({} more not sent: over the closer look's limit of {})",
-                        n(rep.tighten_left_out),
-                        n(tighten::MAX_TIGHTEN_CANDIDATES)
-                    )
-                } else {
-                    String::new()
-                }
-            ),
-            None => String::new(),
-        };
+        let looked = looked_text(zoom.as_ref(), &rep);
         summary.push_str(&format!(
             "{} frames checked by {} fold models; suggested: {} missing boxes{at_spots}, {} labels \
              to verify, {} other classes{better} ({} of these suggestions new since the last \
@@ -1122,6 +1181,374 @@ impl RefineJob {
     }
 }
 
+/// The summary's part on the closer look (`zoom`: how it ended, None when it did not run).
+fn looked_text(zoom: Option<&tighten::ZoomEnd>, rep: &RefineReport) -> String {
+    let n = crate::training::import::preview::thousands;
+    match zoom {
+        Some(z) if z.failed.is_some() => {
+            "; the closer look at them failed (see the warnings), the other suggestions were saved"
+                .to_string()
+        }
+        Some(_) => format!(
+            ", {} of {} sent to a closer look answered{}",
+            n(rep.zoomed),
+            n(rep.tighten_candidates),
+            if rep.tighten_left_out > 0 {
+                format!(
+                    " ({} more not sent: over the closer look's limit of {})",
+                    n(rep.tighten_left_out),
+                    n(tighten::MAX_TIGHTEN_CANDIDATES)
+                )
+            } else {
+                String::new()
+            }
+        ),
+        None => String::new(),
+    }
+}
+
+impl RefineJob {
+    /// The report of a quick check by `q`'s model (what it saw: `seen`) over `qs` before its pass.
+    fn quick_report(
+        &self,
+        q: &Quick,
+        seen: &quick::Seen,
+        qs: &quick::QuickSelected,
+    ) -> RefineReport {
+        let recipe = seen.located.as_ref().map_or_else(
+            || super::report::RecipeInfo {
+                model: String::new(),
+                imgsz: q.imgsz,
+                epochs: 0,
+                batch: 0,
+                from: self.recipe_from.clone(),
+            },
+            quick::recipe_info,
+        );
+        let mut rep = RefineReport::new(&self.id, 0, recipe);
+        rep.mode = Mode::Model;
+        let wanted = self.wanted();
+        let missing = quick::classes_missing(&q.judge, &wanted);
+        let name = &q.judge.name;
+        rep.model = Some(quick::model_info(seen, qs, missing.clone()));
+        rep.tighten = self.tighten();
+        rep.size_floor = self.config.collect.size_floor;
+        rep.camera_days = qs.s.groups.len();
+        rep.frames_selected = qs.s.frames.len();
+        rep.static_spots = qs.s.spots.len();
+        rep.left_out = qs.s.left_out.clone();
+        rep.warnings.clone_from(&qs.s.warnings);
+        if qs.same_day > 0 {
+            rep.warnings.push(quick::same_day_warning(
+                qs.same_day,
+                qs.s.frames.len(),
+                name,
+            ));
+        }
+        if !missing.is_empty() {
+            rep.warnings
+                .push(quick::missing_classes_warning(name, &missing));
+        }
+        if let Some(l) = &seen.located {
+            if seen.train_boxes.is_none() {
+                rep.warnings.push(quick::no_counts_warning(l));
+            }
+            if !seen.by_source {
+                rep.warnings.push(quick::by_name_note(l));
+            }
+        }
+        rep
+    }
+
+    /// The quick check's stages (see the module docs): select, the model's pass with the judge and
+    /// the writes, the closer look (when on), the report.
+    fn stages_quick(
+        &self,
+        q: &Quick,
+        ctx: TaskContext<'_>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+    ) -> Result<TaskOutcome> {
+        let started = Instant::now();
+        let look = self.tighten();
+        let steps = self.steps();
+        let name = q.judge.name.clone();
+        let n = crate::training::import::preview::thousands;
+        // 1. One label snapshot.
+        Self::step(
+            report,
+            SELECTING,
+            1,
+            steps,
+            0,
+            &self.request.frames.describe(),
+        );
+        if let Some(why) = self.config.collect.review_folder_problem(&self.dataset_dir) {
+            bail!("{why}");
+        }
+        // What the model saw, read again: its run folder may have gone since it was planned.
+        let seen = quick::seen_of(&self.config, &q.entry)?;
+        let qs = quick::select(
+            &self.dataset_dir,
+            &self.classes,
+            &self.hidden,
+            &self.request.frames,
+            &seen,
+        );
+        if let Some(why) = &qs.s.refused {
+            bail!("{why}");
+        }
+        // The GPU (or the device the model runs on) is this check's until its last write.
+        let lock = TrainLock::try_acquire(&self.lock_file())?;
+        let mut acc = Acc::new(self.quick_report(q, &seen, &qs));
+        Self::step(
+            report,
+            SELECTING,
+            1,
+            steps,
+            100,
+            &format!(
+                "{} frames {name} never saw on {} camera days; {} it trained on and {} it \
+                 validated on left out",
+                n(qs.s.frames.len()),
+                qs.s.groups.len(),
+                n(qs.trained_on),
+                n(qs.validated_on)
+            ),
+        );
+        check(cancel)?;
+        // 2. The model's pass, then the judge and the writes (no cancel checks there: the pass is
+        // written whole).
+        let stage = format!("checking with {name}");
+        let present = |f: &&ExportFrame| {
+            f.image.is_file()
+                && Frame::resolve(&self.dataset_dir, &f.rel.jpg())
+                    .is_some_and(|fr| fr.labels.is_file())
+        };
+        let frames: Vec<&ExportFrame> = qs.s.frames.iter().filter(present).collect();
+        let gone = qs.s.frames.len() - frames.len();
+        if gone > 0 {
+            acc.rep.warnings.push(format!(
+                "{gone} selected frame(s) are gone (deleted or moved since the check started) and \
+                 were not checked"
+            ));
+        }
+        Self::step(
+            report,
+            &stage,
+            2,
+            steps,
+            0,
+            &format!("running {name} on {} frames", n(frames.len())),
+        );
+        let images: Vec<Image> = frames
+            .iter()
+            .map(|f| Image {
+                frame: f.rel.jpg(),
+                path: f.image.clone(),
+                width: f.width,
+                height: f.height,
+            })
+            .collect();
+        let onnx = self.config.data_path(&q.entry.path);
+        let model = FoldModel {
+            name: name.clone(),
+            yaml: q
+                .entry
+                .classes
+                .as_ref()
+                .map_or_else(|| onnx.with_extension("yaml"), |c| self.config.data_path(c)),
+            onnx,
+            family: q.entry.family,
+            classes: seen
+                .located
+                .as_ref()
+                .map(|l| l.classes.clone())
+                .unwrap_or_default(),
+            entry: Some(quick::predict_entry(&q.entry)),
+        };
+        let predictor = self.predictor();
+        let t0 = Instant::now();
+        let found = if images.is_empty() {
+            Detections::default()
+        } else {
+            predictor
+                .predict(&model, &images, judge::MATCH_MIN_SCORE, cancel)
+                .with_context(|| format!("running {name} on the frames it never saw"))?
+        };
+        if found.cancelled || cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!(Cancelled));
+        }
+        acc.note_predict(found.frames.len(), t0.elapsed().as_secs_f64());
+        if let Some(m) = acc.rep.model.as_mut() {
+            m.device.clone_from(&found.device);
+        }
+        let wanted = self.wanted();
+        let jctx = Context {
+            wanted: &wanted,
+            imgsz: q.imgsz,
+            class_boxes: &qs.s.class_boxes,
+            run: &self.id,
+            spots: Some(&qs.s.spots),
+            floor: self.config.collect.size_floor,
+            model: Some(&q.judge),
+        };
+        let w = write::write_fold(
+            &self.dataset_dir,
+            &frames,
+            &found,
+            &jctx,
+            &mut acc.tally,
+            &mut |d, total| {
+                let pct = 50 + d * 50 / total.max(1);
+                Self::step(
+                    report,
+                    &stage,
+                    2,
+                    steps,
+                    u8::try_from(pct).unwrap_or(99),
+                    &format!("writing suggestions: {d} of {total} frames"),
+                );
+            },
+        );
+        acc.note_failures(&w);
+        if w.missing > 0 {
+            acc.rep.warnings.push(format!(
+                "{} frame(s) got no result from {name} (the image is gone or cannot be read); \
+                 they were not checked",
+                w.missing
+            ));
+        }
+        if w.all_failed() {
+            bail!(
+                "none of the {} frames {name} checked could be written ({}); nothing was saved",
+                w.attempted,
+                w.failures.first().map_or("no reason given", String::as_str)
+            );
+        }
+        count_written(&mut acc, &w);
+        if look && let Err(e) = tighten::append(&self.work, &w.candidates) {
+            acc.rep.warnings.push(format!(
+                "its loose labels could not be kept for the closer look ({e:#}); they get no \
+                 better-fitting box in this check"
+            ));
+        }
+        Self::step(
+            report,
+            &stage,
+            2,
+            steps,
+            100,
+            &format!("{} frames checked, {} changed", w.checked, w.frames),
+        );
+        // 3. The closer look, still under the training lock.
+        let mut zoom = None;
+        if look {
+            let frames = match tighten::read(&self.work, &mut acc.rep.warnings) {
+                Ok(f) => f,
+                Err(e) => {
+                    acc.rep.warnings.push(format!(
+                        "the loose labels kept for the closer look could not be read ({e:#}); \
+                         they get no better-fitting box in this check"
+                    ));
+                    Vec::new()
+                }
+            };
+            zoom = Some(tighten::run_stage(
+                self,
+                &frames,
+                ctx,
+                report,
+                (3, steps),
+                cancel,
+                &mut acc,
+            ));
+        }
+        drop(lock);
+        let zoom_cancelled = zoom.as_ref().is_some_and(|z| z.cancelled);
+        // 4. The report.
+        Self::step(report, REPORTING, steps, steps, 0, "");
+        acc.close_failures();
+        let Acc {
+            mut rep,
+            tally,
+            sample,
+            ..
+        } = acc;
+        rep.cancelled = zoom_cancelled;
+        if zoom_cancelled {
+            rep.warnings.push(format!(
+                "the closer look at loose labels was stopped by Cancel after {} of {} crops; the \
+                 better-fitting boxes of those were saved",
+                rep.zoomed, rep.tighten_candidates
+            ));
+        }
+        rep.finish(&tally);
+        let report_path = match rep.write(&self.dataset_dir) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                rep.warnings.push(format!("{e:#}"));
+                None
+            }
+        };
+        Self::step(report, REPORTING, steps, steps, 100, "done");
+        let f = &rep.found;
+        let mut summary = if zoom_cancelled {
+            format!(
+                "stopped by Cancel during the closer look at loose labels, after {} of {} crops; \
+                 what finished was saved; ",
+                n(rep.zoomed),
+                n(rep.tighten_candidates)
+            )
+        } else {
+            String::new()
+        };
+        let at_spots = if rep.adds_at_spots > 0 {
+            format!(" ({} at static spots)", n(rep.adds_at_spots))
+        } else {
+            String::new()
+        };
+        let better = if look {
+            format!(", {} better-fitting boxes for loose labels", n(f.tighten))
+        } else {
+            String::new()
+        };
+        summary.push_str(&format!(
+            "{} frames {name} never saw checked ({} it trained on and {} it validated on left \
+             out); suggested: {} missing boxes{at_spots}, {} labels to verify, {} other \
+             classes{better} ({} of these suggestions new since the last check, on {} frames \
+             written); {} loose labels counted{}. No box was changed: confirm the suggestions on \
+             the Review tab",
+            n(rep.frames_checked),
+            n(qs.trained_on),
+            n(qs.validated_on),
+            n(f.add),
+            n(f.verify),
+            n(f.relabel),
+            n(rep.written.total()),
+            n(rep.frames_written),
+            n(rep.loose),
+            looked_text(zoom.as_ref(), &rep),
+        ));
+        if let Some(p) = &report_path {
+            summary.push_str(&format!("; report: {}", p.display()));
+        }
+        if !rep.warnings.is_empty() {
+            summary.push_str(&format!("; {} warnings", rep.warnings.len()));
+        }
+        let result = RefineResult {
+            report: rep,
+            report_path,
+            sample,
+            seconds: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        };
+        Ok(TaskOutcome {
+            summary,
+            result: serde_json::to_value(&result)?,
+        })
+    }
+}
+
 impl Task for RefineJob {
     fn id(&self) -> &str {
         &self.id
@@ -1130,6 +1557,15 @@ impl Task for RefineJob {
         TaskKind::Refine
     }
     fn title(&self) -> String {
+        if let Some(q) = &self.quick {
+            return format!(
+                "quick dataset check with {} ({} {} it never saw, {})",
+                q.judge.name,
+                crate::training::import::preview::thousands(q.unseen),
+                if q.unseen == 1 { "frame" } else { "frames" },
+                self.request.frames.describe()
+            );
+        }
         format!(
             "dataset check ({} folds x {} {}, {})",
             self.request.folds,
@@ -1148,6 +1584,10 @@ impl Task for RefineJob {
     /// report carries its own `steps` and the queue takes it from there (the first report still
     /// this count, every one after the selection [`steps_for`] of the lowered count).
     fn steps(&self) -> usize {
+        if self.quick.is_some() {
+            // Selecting, the model's pass, the closer look when on, the report.
+            return 3 + usize::from(self.tighten());
+        }
         steps_for(self.request.folds, self.tighten())
     }
     fn run(

@@ -7,20 +7,31 @@
   <h2>Check the dataset</h2>
   <p class="muted">Short throwaway models each learn from most of your reviewed camera days, then look at the days they never saw and say where they disagree with your labels: a box nobody drew, a label no model found, an object that looks like another class. The check changes no box. It only leaves suggestions on the frames for you to confirm on the <a href="/train/review">Review</a> tab. With 4 folds of 8 epochs it takes about an hour on a mid-range GPU, and the GPU is busy meanwhile: other jobs wait their turn.</p>
   <form id="refine-form" class="tr-form">
+    <fieldset id="refine-mode">
+      <legend>How to check</legend>
+      <label class="check"><input type="radio" name="check_mode" value="folds" checked> Full check (fold models, about an hour)</label>
+      <label class="check"><input type="radio" name="check_mode" value="model" id="refine-mode-model"> Quick check with a model you trained (only frames it never saw)</label>
+      <p class="muted small">The quick check trains nothing: a model you trained here looks at the reviewed frames it neither trained nor validated on (frames reviewed since, and its held-out frames), in seconds to minutes. It says less than the full check: one model, and frames of camera days it trained on are near copies of what it learned. Its suggestions on the frames it trained on stay as they are.</p>
+    </fieldset>
     <div class="tr-grid">
-      <div class="tr-field">
+      <div class="tr-field" id="refine-model-field" hidden>
+        <label for="refine-model">Model</label>
+        <select id="refine-model" name="model"></select>
+        <p class="muted small" id="refine-model-note">Models trained here (with their training record). Preview counts the frames each never saw.</p>
+      </div>
+      <div class="tr-field" data-full-only>
         <label for="refine-folds">Folds</label>
         <input inputmode="numeric" type="number" id="refine-folds" name="folds" min="{{ folds_min }}" max="{{ folds_max }}" step="1" value="{{ folds_default }}">
         <p class="muted small">Each fold model trains on the other folds' camera days. More folds train longer for a little more training data.</p>
       </div>
-      <div class="tr-field">
+      <div class="tr-field" data-full-only>
         <label for="refine-epochs">Epochs per fold</label>
         <input inputmode="numeric" type="number" id="refine-epochs" name="epochs" min="{{ epochs_min }}" max="{{ epochs_max }}" step="1" value="{{ epochs_default }}">
       </div>
       <div class="tr-field">
         <label for="refine-scene">Scene</label>
         <select id="refine-scene" name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
-        <p class="muted small">A scene or camera also narrows what the fold models train on.</p>
+        <p class="muted small">A scene or camera also narrows what the fold models train on (a full check).</p>
       </div>
       <div class="tr-field">
         <label for="refine-camera">Camera</label>
@@ -34,7 +45,7 @@
       {% endif %}
     </div>
     <label class="check"><input type="checkbox" id="refine-tighten" name="tighten"{% if tighten_default %} checked{% endif %}> Propose better boxes for loose labels</label>
-    <p class="muted small">After the last fold, a larger model (RF-DETR L, the overlap check's) looks closer at each label a fold model found only partly covering its object. Where both looks agree on another box, you get it as a suggestion; your label stays until you accept it. Adds a few minutes{% if !tighten_default %}, and downloads RF-DETR L (0.14 GB) the first time{% endif %}.</p>
+    <p class="muted small">After the last fold (or the quick check's model), a larger model (RF-DETR L, the overlap check's) looks closer at each label a model found only partly covering its object; it needs an NVIDIA GPU or Apple silicon. Where both looks agree on another box, you get it as a suggestion; your label stays until you accept it. Adds a few minutes{% if !tighten_default %}, and downloads RF-DETR L (0.14 GB) the first time{% endif %}.</p>
     <label class="check tr-confirm"><input type="checkbox" name="allow_large"> Allow downloads over 500 MB (the training environment and the base weights, when they are not set up yet)</label>
     <div class="actions"><button type="button" class="secondary" id="refine-preview-btn">Preview</button> <button type="submit" id="refine-start">Start</button></div>
   </form>

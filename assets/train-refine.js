@@ -1,5 +1,7 @@
 // Refine tab (/train/refine): starts the dataset check and shows what it found. The Check card
-// previews (GET /v1/refine/preview) and starts (POST /v1/refine/check) a check and follows it
+// offers the full check (fold models) or a quick check with a model trained here (`check_mode`,
+// the model select filled from GET /v1/refine `capability.models`; folds and epochs hidden and not
+// sent then), previews (GET /v1/refine/preview) and starts (POST /v1/refine/check) a check and follows it
 // through PrismPoll on GET /v1/train/jobs?tasks=busy (every 3 s while one is listed, every 30 s
 // while none is, so a check started elsewhere shows up), with Pause / Resume / Cancel posted to the
 // queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (the report, the
@@ -55,6 +57,15 @@
     // How the last check's recall by size was measured (report.json): the fold models' labels and
     // the floor its judge used.
     measuredWith: function (r) {
+      if (r && r.mode === 'model') {
+        var m = r.model || {};
+        var floorText = r.size_floor
+          ? 'the check treated labels ' + api.phrase(r.size_floor) + ' as ignore regions (counted in this table only).'
+          : 'no size floor was set.';
+        return 'Measured by ' + (m.name || 'the model') + ' on ' + plural(r.frames_checked || 0, 'frame', 'frames') +
+          ' it never saw, at its own input of ' + (m.imgsz || (r.recipe && r.recipe.imgsz) || '?') +
+          ' px: what that model finds, not what the recipe can learn; ' + floorText;
+      }
       if (!r || !r.folds_every_label) {
         return 'Measured by a check of an earlier version: if a size floor was saved then, its fold models never learned the objects under it, so their recall says little. Run the check again to measure with every label.';
       }
@@ -77,6 +88,37 @@
       if (!r || !r.tighten) return 'Loose labels counted: ' + n + ' (no closer look in this check).';
       var m = (r.found && r.found.tighten) || 0;
       return 'Loose labels counted: ' + n + ', ' + m + ' with a proposed box.';
+    },
+    // The Findings card's "Last check" line of report `r` (`when`: its time as the page prints
+    // it): a full check's folds, or a quick check's model and the frames it skipped, so a quick
+    // check never reads as a full one (report.json `mode`, `model`).
+    lastLine: function (r, when) {
+      var line = 'Last check: ' + when;
+      if (r.mode === 'model') {
+        var m = r.model || {};
+        line += ', quick check with ' + (m.name || 'a model') + (m.run ? ' (training run ' + m.run + ')' : '');
+        if (r.cancelled) line += ', cancelled';
+        line += '. ' + plural(r.frames_checked || 0, 'frame', 'frames') + ' it never saw checked; ' +
+          plural(m.trained_on || 0, 'frame', 'frames') + ' it trained on and ' + (m.validated_on || 0) +
+          ' it validated on skipped (their suggestions stay as they were); ' + (r.recipe ? r.recipe.model : '?') +
+          ' at ' + (m.imgsz || (r.recipe && r.recipe.imgsz) || '?') + ' px.';
+        return line;
+      }
+      line += ', ' + r.folds_done + ' of ' + plural(r.folds, 'fold', 'folds') + ' done';
+      if (r.cancelled) line += ', cancelled';
+      line += '. ' + plural(r.frames_checked, 'frame', 'frames') + ' checked; ' + r.recipe.model + ' at ' +
+        r.recipe.imgsz + ' px, ' + plural(r.recipe.epochs, 'epoch', 'epochs') + ' each.';
+      return line;
+    },
+    // Who the Coverage card's recall is of: the fold models blind to a camera day, or a quick
+    // check's model on the frames it never saw (with their count).
+    recallOf: function (r) {
+      if (r && r.mode === 'model') {
+        var m = r.model || {};
+        return 'Recall per camera, scene and class over the ' + plural(r.frames_checked || 0, 'frame', 'frames') + ' ' +
+          (m.name || 'the model') + ' never saw: how often it found a labelled object';
+      }
+      return 'Recall per camera, scene and class: how often a fold model that never saw that camera day found a labelled object';
     }
   };
   globalThis.RefineFloor = api;
@@ -90,10 +132,10 @@
   var $ = function (id) { return document.getElementById(id); };
   var form = $('refine-form');
   var KINDS = [
-    { kind: 'add', title: 'Missing boxes', text: 'Objects a fold model found that no box labels.', key: 'add' },
-    { kind: 'verify', title: 'Labels no model found', text: 'Boxes the fold models never found: look at them, some are wrong.', key: 'verify' },
-    { kind: 'relabel', title: 'Other class suggested', text: 'Boxes a fold model would give another class.', key: 'relabel' },
-    { kind: 'tighten', title: 'Loose boxes', text: 'Labels that cover their object only partly: a fold model and a closer look by a larger model agree on a better-fitting box.', key: 'tighten' }
+    { kind: 'add', title: 'Missing boxes', text: 'Objects a model that never saw the frame found that no box labels.', key: 'add' },
+    { kind: 'verify', title: 'Labels no model found', text: 'Boxes the checking models never found: look at them, some are wrong.', key: 'verify' },
+    { kind: 'relabel', title: 'Other class suggested', text: 'Boxes a checking model would give another class.', key: 'relabel' },
+    { kind: 'tighten', title: 'Loose boxes', text: 'Labels that cover their object only partly: a checking model and a closer look by a larger model agree on a better-fitting box.', key: 'tighten' }
   ];
 
   function el(tag, cls, text) {
@@ -158,11 +200,18 @@
 
   // ---- the form
 
+  // The check's mode: 'folds' (the full check) or 'model' (a quick check with a model trained
+  // here, which trains nothing: no folds or epochs are sent with it).
+  function mode() {
+    var picked = form.querySelector('input[name="check_mode"]:checked');
+    return picked ? picked.value : 'folds';
+  }
   function values() {
     var f = form.elements;
+    var quick = mode() === 'model';
     var o = {
-      folds: whole(f.folds.value),
-      epochs: whole(f.epochs.value),
+      folds: quick ? null : whole(f.folds.value),
+      epochs: quick ? null : whole(f.epochs.value),
       scenes: f.scene.value ? [f.scene.value] : [],
       cameras: list(f.camera.value),
       allow_large: !!f.allow_large.checked,
@@ -170,12 +219,14 @@
       // sending it always says what the form shows.
       tighten: !!(f.tighten && f.tighten.checked)
     };
+    if (quick) o.model = f.model.value || '';
     if (f.gpu && f.gpu.value) o.gpu = f.gpu.value;
     return o;
   }
   function query(o) {
     var p = [];
     var add = function (k, v) { p.push(encodeURIComponent(k) + '=' + encodeURIComponent(v)); };
+    if (o.model != null) add('model', o.model);
     if (o.folds != null) add('folds', o.folds);
     if (o.epochs != null) add('epochs', o.epochs);
     if (o.scenes.length) add('scene', o.scenes.join(','));
@@ -190,8 +241,19 @@
     var box = $('refine-preview');
     clear(box);
     box.hidden = false;
-    box.appendChild(el('p', null, 'Would check ' + plural(p.frames, 'frame', 'frames') + ' on ' +
-      plural(p.camera_days, 'camera day', 'camera days') + ' (' + p.filter + ').'));
+    var m = p.mode === 'model' ? (p.model || {}) : null;
+    if (m) {
+      box.appendChild(el('p', null, 'Would check the ' + plural(p.frames, 'frame', 'frames') + ' ' + m.name +
+        ' never saw, on ' + plural(p.camera_days, 'camera day', 'camera days') + ' (' + p.filter + ').'));
+      if (m.run) {
+        box.appendChild(el('p', null, 'Skipped: ' + plural(m.trained_on, 'frame', 'frames') + ' it trained on and ' +
+          m.validated_on + ' it validated on (training run ' + m.run + ', ' + m.recipe + ' at ' + m.imgsz + ' px' +
+          (m.device ? ', runs on ' + m.device : '') + '). Their suggestions stay as they are.'));
+      }
+    } else {
+      box.appendChild(el('p', null, 'Would check ' + plural(p.frames, 'frame', 'frames') + ' on ' +
+        plural(p.camera_days, 'camera day', 'camera days') + ' (' + p.filter + ').'));
+    }
     var l = p.left_out || {};
     var out = [];
     if (l.pending) out.push(l.pending + ' with boxes still pending');
@@ -215,8 +277,12 @@
     if (p.seconds != null) {
       // time_basis: last_run = the pace the training run the recipe came from measured on this
       // GPU; else the generic estimate.
-      var basis = p.time_basis === 'last_run' ? 'from your last training run' : 'a rough guess';
-      box.appendChild(el('p', null, 'Time: ' + seconds(p.seconds) + ' on this GPU (' + basis + '). The GPU is busy meanwhile.'));
+      // last_check = what the last quick check with the same model measured per frame.
+      var basis = p.time_basis === 'last_run' ? 'from your last training run'
+        : p.time_basis === 'last_check' ? 'from the last quick check with this model' : 'a rough guess';
+      box.appendChild(el('p', null, m
+        ? 'Time: ' + seconds(p.seconds) + ' (' + basis + '), on the model\'s own device.'
+        : 'Time: ' + seconds(p.seconds) + ' on this GPU (' + basis + '). The GPU is busy meanwhile.'));
     }
     if (p.warnings && p.warnings.length) {
       var w = el('ul', 'warn-list small');
@@ -227,8 +293,16 @@
     else box.appendChild(el('p', 'muted small', 'Nothing was run or written.'));
   }
 
+  // A quick check without a model would be sent as a full one: refused here instead.
+  function noModel() {
+    if (mode() !== 'model' || form.elements.model.value) return false;
+    say('Choose a model for the quick check (none trained here yet: run the full check).', true);
+    return true;
+  }
+
   $('refine-preview-btn').addEventListener('click', function () {
     var btn = $('refine-preview-btn');
+    if (noModel()) return;
     btn.disabled = true;
     say('');
     getJson('/v1/refine/preview?' + query(values()))
@@ -256,6 +330,7 @@
   function start(replace) {
     var btn = $('refine-start');
     var again = $('refine-confirm-start');
+    if (noModel()) return;
     btn.disabled = true;
     again.disabled = true;
     hideConfirm();
@@ -429,11 +504,7 @@
     if (!r) {
       box.appendChild(el('p', 'muted', 'No check has run on this dataset yet. Start one above; its findings appear here.'));
     } else {
-      var line = 'Last check: ' + when(r.created) + ', ' + r.folds_done + ' of ' + plural(r.folds, 'fold', 'folds') + ' done';
-      if (r.cancelled) line += ', cancelled';
-      line += '. ' + plural(r.frames_checked, 'frame', 'frames') + ' checked; ' + r.recipe.model + ' at ' +
-        r.recipe.imgsz + ' px, ' + plural(r.recipe.epochs, 'epoch', 'epochs') + ' each.';
-      box.appendChild(el('p', null, line));
+      box.appendChild(el('p', null, RefineFloor.lastLine(r, when(r.created))));
     }
     if (r || total) {
       var wrap = el('div', 'scroll');
@@ -507,7 +578,7 @@
       box.appendChild(el('p', 'muted', 'No check has run yet. After one, this shows how often a model that never saw a camera day found the objects you labelled there.'));
       return;
     }
-    box.appendChild(el('p', 'muted', 'Recall per camera, scene and class: how often a fold model that never saw that camera day found a labelled object (score of ' +
+    box.appendChild(el('p', 'muted', RefineFloor.recallOf(r) + ' (score of ' +
       num(r.found_score) + ' or more, overlapping the box by ' + num(r.found_iou) + ' or more), with a 95% interval. Few boxes give a wide interval.'));
     if (r.recall && r.recall.boxes) {
       box.appendChild(el('p', null, 'Overall: ' + recallText(r.recall) + ' of ' + plural(r.recall.boxes, 'box', 'boxes') + '.'));
@@ -553,14 +624,63 @@
     ], sizes));
   }
 
-  function drawCapability(state) {
-    var cap = state.capability || {};
-    canCheck = cap.can_check !== false;
+  // The models a quick check can use (GET /v1/refine `capability.models`), kept so a reload of
+  // the state does not lose the choice.
+  var quickModels = [];
+  var fullCan = true;
+  var fullWhy = '';
+
+  function fillModels(cap) {
+    var select = $('refine-model');
+    var keep = select.value;
+    quickModels = cap.models || [];
+    clear(select);
+    quickModels.forEach(function (m) {
+      var o = el('option', null, m.name + ' (' + m.recipe + ' at ' + m.imgsz + ' px, run ' + m.run + ')' +
+        (m.enabled ? '' : ', disabled'));
+      o.value = m.name;
+      select.appendChild(o);
+    });
+    if (keep && quickModels.some(function (m) { return m.name === keep; })) select.value = keep;
+    var note = $('refine-model-note');
+    var bad = cap.unusable || [];
+    var text = quickModels.length
+      ? 'Models trained here (with their training record). Preview counts the frames each never saw.'
+      : 'No configured model was trained here with its training record, so a quick check has nothing to use: run the full check, or train a model on the Train tab.';
+    if (bad.length) {
+      text += ' Not offered: ' + bad.map(function (b) { return b.name + ' (' + b.why + ')'; }).join('; ');
+    }
+    note.textContent = text;
+  }
+
+  // Folds and epochs are the full check's; the model select the quick check's. A full check needs
+  // a GPU to train on, a quick check a model to run.
+  function applyMode() {
+    var quick = mode() === 'model';
+    Array.prototype.forEach.call(form.querySelectorAll('[data-full-only]'), function (n) { n.hidden = quick; });
+    $('refine-model-field').hidden = !quick;
+    canCheck = quick ? quickModels.length > 0 : fullCan;
     var why = $('refine-why');
-    why.hidden = canCheck;
-    why.textContent = canCheck ? '' : (cap.why || 'This machine cannot train the fold models.');
+    var text = quick
+      ? (quickModels.length ? '' : 'No model trained here to run a quick check with.')
+      : (fullCan ? '' : fullWhy);
+    why.hidden = !text;
+    why.textContent = text;
     $('refine-start').disabled = !canCheck;
   }
+
+  function drawCapability(state) {
+    var cap = state.capability || {};
+    fullCan = cap.can_check !== false;
+    fullWhy = cap.why || 'This machine cannot train the fold models.';
+    fillModels(cap);
+    applyMode();
+  }
+
+  Array.prototype.forEach.call(form.querySelectorAll('input[name="check_mode"]'), function (r) {
+    r.addEventListener('change', function () { applyMode(); $('refine-preview').hidden = true; });
+  });
+  $('refine-model').addEventListener('change', function () { $('refine-preview').hidden = true; });
 
   // ---- static objects
 

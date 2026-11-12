@@ -5,7 +5,8 @@
 //! never saved: a fold model never appears in the config, the Config page or `/v1/vision/custom`.
 //! A frame the pipeline cannot read (deleted since the selection, a damaged JPEG) is left out of
 //! the answer instead of failing the fold ([`skipping_unreadable`]); the benchmark and auto-label
-//! paths are unchanged.
+//! paths are unchanged. A quick check ([`super::quick`]) runs its configured model the same way,
+//! with that model's own entry ([`FoldModel::entry`]) instead of a built one.
 
 use crate::backend::{CoreOptions, Runtimes};
 use crate::benchmark::images::SetImage;
@@ -18,16 +19,21 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-/// A trained fold model (from [`crate::training::job::TrainOutput`]).
+/// A trained fold model (from [`crate::training::job::TrainOutput`]), or the model of a quick
+/// check ([`super::quick`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FoldModel {
-    /// `refine-fold-<k>`.
+    /// `refine-fold-<k>`; a quick check's model's configured name.
     pub name: String,
     pub onnx: PathBuf,
     /// Its class file (`<name>.yaml` beside the ONNX).
     pub yaml: PathBuf,
     pub family: ModelFamilyKind,
     pub classes: Vec<String>,
+    /// A quick check: the model's config entry as it is configured (its own family, class file and
+    /// device; [`super::quick::predict_entry`] took off what would hide detections), used instead
+    /// of [`model_entry`]'s. None for a fold model.
+    pub entry: Option<ModelConfig>,
 }
 
 /// Runs a fold model over frames.
@@ -44,9 +50,12 @@ pub trait FoldPredictor: Send + Sync {
     ) -> Result<Detections>;
 }
 
-/// The config entry of `m`: disabled, its own class file, the default device. Used on a copy of the
-/// config only, never saved.
+/// The config entry of `m`: disabled, its own class file, the default device (a quick check's
+/// model: [`FoldModel::entry`]). Used on a copy of the config only, never saved.
 pub fn model_entry(m: &FoldModel) -> ModelConfig {
+    if let Some(e) = &m.entry {
+        return e.clone();
+    }
     ModelConfig {
         name: Some(m.name.clone()),
         path: m.onnx.clone(),
@@ -206,6 +215,7 @@ mod tests {
             yaml: PathBuf::from("/w/fold-2/model/refine-fold-2.yaml"),
             family: ModelFamilyKind::RfDetr,
             classes: vec!["person".into()],
+            entry: None,
         };
         let e = model_entry(&m);
         assert!(!e.enabled);
@@ -217,6 +227,18 @@ mod tests {
         let d = ModelConfig::default();
         assert_eq!(e.device, d.device);
         assert_eq!(e.confidence_threshold, d.confidence_threshold);
+        // A quick check's model: its own entry, as given.
+        let own = ModelConfig {
+            name: Some("mine".into()),
+            path: PathBuf::from("models/mine.onnx"),
+            device: Some("openvino:gpu.0".into()),
+            ..ModelConfig::default()
+        };
+        let q = FoldModel {
+            entry: Some(own.clone()),
+            ..m
+        };
+        assert_eq!(model_entry(&q), own);
     }
 
     fn image(frame: &str, path: PathBuf) -> Image {

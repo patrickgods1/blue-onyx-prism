@@ -1546,12 +1546,25 @@ fn planning_needs_a_gpu_and_a_download_allowed_and_stays_out_of_the_config() {
     assert!(plan_refine(&cfg, bad, &host()).is_err());
     let job = plan_refine(&cfg, RefineRequest::default(), &host()).unwrap();
     // The fold run: in the work folder, installed there, registered nowhere.
-    assert!(job.train.run_dir.starts_with(&job.work));
-    assert!(job.train.install_dir().starts_with(&job.work));
-    assert_eq!(job.train.request.recipe.patience, 0);
-    assert!(job.train.request.benchmark_sets.is_empty());
-    assert!(!job.train.request.include_public);
-    assert!(job.train.request.balance.is_off());
+    assert!(job.train.as_ref().unwrap().run_dir.starts_with(&job.work));
+    assert!(
+        job.train
+            .as_ref()
+            .unwrap()
+            .install_dir()
+            .starts_with(&job.work)
+    );
+    assert_eq!(job.train.as_ref().unwrap().request.recipe.patience, 0);
+    assert!(
+        job.train
+            .as_ref()
+            .unwrap()
+            .request
+            .benchmark_sets
+            .is_empty()
+    );
+    assert!(!job.train.as_ref().unwrap().request.include_public);
+    assert!(job.train.as_ref().unwrap().request.balance.is_off());
     assert_eq!(
         job.config.models, cfg.models,
         "no fold model in the config copy"
@@ -1629,7 +1642,7 @@ fn the_closer_look_runs_once_after_the_last_fold_and_proposes_better_boxes() {
     assert!(job.tighten());
     assert_eq!(job.steps(), 7, "selecting, 4 folds, the look, the report");
     let fake = TrainerFake {
-        lock_file: Some(job.train.paths.train_lock_file()),
+        lock_file: Some(job.train.as_ref().unwrap().paths.train_lock_file()),
         ..trainer()
     };
     let (out, shown) = run_shown(&job, &fake);
@@ -2095,6 +2108,7 @@ fn the_dump_writes_a_line_per_frame_and_appends() {
         yaml: t.0.join("m.yaml"),
         family: crate::model::ModelFamilyKind::RfDetr,
         classes: vec!["car".into(), "person".into()],
+        entry: None,
     };
     std::fs::write(&model.onnx, b"x").unwrap();
     std::fs::write(&model.yaml, b"x").unwrap();
@@ -2420,7 +2434,7 @@ fn refine_replay_on_a_copy() {
         "answered suggestions and open tighten before: {:?}",
         answered_in(&mut s.frames.iter().map(|f| f.labels.clone()))
     );
-    let mut acc = Acc::new(job.start_report(&s));
+    let mut acc = Acc::new(job.start_report(job.train.as_ref().unwrap(), &s));
     let in_dump = s
         .frames
         .iter()
@@ -2468,7 +2482,8 @@ fn refine_replay_on_a_copy() {
     println!("candidates by class: {by_class:?}");
     if zoom {
         // The GPU is the look's, as in a check: refused while anything else trains or labels.
-        let _lock = TrainLock::try_acquire(&job.train.paths.train_lock_file()).unwrap();
+        let _lock =
+            TrainLock::try_acquire(&job.train.as_ref().unwrap().paths.train_lock_file()).unwrap();
         let runner = crate::resources::export::SystemRunner;
         let fetcher = crate::resources::export::cli_fetcher(&cfg.data_root());
         let look = Instant::now();
@@ -2543,7 +2558,7 @@ fn refine_replay_on_a_copy() {
     println!(
         "run {}; imgsz {}; MATCH_MIN_SCORE {}",
         job.id,
-        job.train.request.recipe.imgsz,
+        job.train.as_ref().unwrap().request.recipe.imgsz,
         judge::MATCH_MIN_SCORE
     );
     println!(

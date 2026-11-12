@@ -176,6 +176,49 @@ impl LeftOut {
     }
 }
 
+/// How a check judged the frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Throwaway fold models, each blind to whole camera days (reports of earlier checks too).
+    #[default]
+    Folds,
+    /// A quick check: a model the user trained, on the reviewed frames it never trained or
+    /// validated on ([`super::quick`]).
+    Model,
+}
+
+/// The model of a quick check ([`Mode::Model`]) and what it could not look at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The configured model's name.
+    pub name: String,
+    /// Its training run (`<model>.provenance.json` `run_id`).
+    pub run: String,
+    /// `rfdetr-nano`, `yolo26n`, ... (its recipe).
+    pub recipe: String,
+    /// Its input size (the recipe's `imgsz`): the judge's "short side at model input".
+    pub imgsz: u32,
+    /// Frames of the selection it trained on (its run's `train.txt`): skipped.
+    pub trained_on: usize,
+    /// Frames of the selection it validated on (`valid.txt`; its checkpoint was chosen on them):
+    /// skipped.
+    pub validated_on: usize,
+    /// Of the frames it checks, those of a camera day it trained or validated on: near copies of
+    /// what it learned, so its finds there say less.
+    pub same_day: usize,
+    /// Wanted classes the model does not have: their labels get no `verify` and no `relabel`, and
+    /// are not in the recall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes_missing: Vec<String>,
+    /// The run recorded where each image came from (`image_sources.json`): frames were matched by
+    /// source as well as by name.
+    pub by_source: bool,
+    /// The device that ran it (empty before it ran, and in previews).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+}
+
 /// The recipe the fold models trained with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecipeInfo {
@@ -260,9 +303,23 @@ pub struct RefineReport {
     /// suggestions and the recall but for its size table). None = off, or an earlier report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_floor: Option<SizeFloor>,
-    /// `training.ignore` the fold models trained with. None in reports of earlier checks.
+    /// `training.ignore` the fold models trained with. None in reports of earlier checks and of
+    /// quick checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_mode: Option<IgnoreMode>,
+    /// Fold models or a quick check with a model ([`Mode`]); reports of earlier checks: folds.
+    /// A quick check has `folds` and `folds_done` 0, `recipe` is the model's own, and the counts and
+    /// recall tables cover only the frames it never saw (`model`).
+    #[serde(default)]
+    pub mode: Mode,
+    /// The model of a quick check; None for fold models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelInfo>,
+    /// Seconds the detections took per frame (model loading included, the judge and the writes
+    /// not), over every frame the models ran on: a later preview's time estimate. None in reports
+    /// of earlier checks and when no frame ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict_s_per_frame: Option<f64>,
     pub warnings: Vec<String>,
 }
 
@@ -386,6 +443,9 @@ impl RefineReport {
             folds_every_label: false,
             size_floor: None,
             ignore_mode: None,
+            mode: Mode::Folds,
+            model: None,
+            predict_s_per_frame: None,
             warnings: Vec::new(),
         }
     }
