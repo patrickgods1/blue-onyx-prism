@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}{{ tab_title }}{% endblock %}
+{% block content %}
+{% include "train/tabs.html" %}
+<div class="tr" id="refine-tab">
+<div class="card" id="refine-check">
+  <h2>Check the dataset</h2>
+  <p class="muted">Short throwaway models each learn from most of your reviewed camera days, then look at the days they never saw and say where they disagree with your labels: a box nobody drew, a label no model found, an object that looks like another class. The check changes no box. It only leaves suggestions on the frames for you to confirm on the <a href="/train/review">Review</a> tab. With 4 folds of 8 epochs it takes about an hour on a mid-range GPU, and the GPU is busy meanwhile: other jobs wait their turn.</p>
+  <form id="refine-form" class="tr-form">
+    <fieldset id="refine-mode">
+      <legend>How to check</legend>
+      <label class="check"><input type="radio" name="check_mode" value="folds" checked> Full check (fold models, about an hour)</label>
+      <label class="check"><input type="radio" name="check_mode" value="model" id="refine-mode-model"> Quick check with a model you trained (only frames it never saw)</label>
+      <p class="muted small">The quick check trains nothing: a model you trained here looks at the reviewed frames it neither trained nor validated on (frames reviewed since, and its held-out frames), in seconds to minutes. It says less than the full check: one model, and frames of camera days it trained on are near copies of what it learned. Its suggestions on the frames it trained on stay as they are.</p>
+    </fieldset>
+    <div class="tr-grid">
+      <div class="tr-field" id="refine-model-field" hidden>
+        <label for="refine-model">Model</label>
+        <select id="refine-model" name="model"></select>
+        <p class="muted small" id="refine-model-note">Models trained here (with their training record). Preview counts the frames each never saw.</p>
+      </div>
+      <div class="tr-field" data-full-only>
+        <label for="refine-folds">Folds</label>
+        <input inputmode="numeric" type="number" id="refine-folds" name="folds" min="{{ folds_min }}" max="{{ folds_max }}" step="1" value="{{ folds_default }}">
+        <p class="muted small">Each fold model trains on the other folds' camera days. More folds train longer for a little more training data.</p>
+      </div>
+      <div class="tr-field" data-full-only>
+        <label for="refine-epochs">Epochs per fold</label>
+        <input inputmode="numeric" type="number" id="refine-epochs" name="epochs" min="{{ epochs_min }}" max="{{ epochs_max }}" step="1" value="{{ epochs_default }}">
+      </div>
+      <div class="tr-field">
+        <label for="refine-scene">Scene</label>
+        <select id="refine-scene" name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
+        <p class="muted small">A scene or camera also narrows what the fold models train on (a full check).</p>
+      </div>
+      <div class="tr-field">
+        <label for="refine-camera">Camera</label>
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="refine-camera" name="camera" placeholder="any (comma separated)">
+      </div>
+      {% if let Some(auto) = gpu_choices.first() %}
+      <div class="tr-field">
+        <label for="refine-gpu">GPU</label>
+        <select id="refine-gpu" name="gpu"><option value="">Automatic: {{ auto.label }}</option>{% for g in gpu_choices %}<option value="{{ g.value }}">{{ g.label }}</option>{% endfor %}</select>
+      </div>
+      {% endif %}
+    </div>
+    <label class="check"><input type="checkbox" id="refine-tighten" name="tighten"{% if tighten_default %} checked{% endif %}> Propose better boxes for loose labels</label>
+    <p class="muted small">After the last fold (or the quick check's model), a larger model (RF-DETR L, the overlap check's) looks closer at each label a model found only partly covering its object; it needs an NVIDIA GPU or Apple silicon. Where both looks agree on another box, you get it as a suggestion; your label stays until you accept it. Adds a few minutes{% if !tighten_default %}, and downloads RF-DETR L (0.14 GB) the first time{% endif %}.</p>
+    <label class="check tr-confirm"><input type="checkbox" name="allow_large"> Allow downloads over 500 MB (the training environment and the base weights, when they are not set up yet)</label>
+    <div class="actions"><button type="button" class="secondary" id="refine-preview-btn">Preview</button> <button type="submit" id="refine-start">Start</button></div>
+  </form>
+  <p class="muted small" id="refine-why" role="status" hidden></p>
+  <div id="refine-msg" class="form-msg" role="status"></div>
+  <div id="refine-confirm" class="warn" role="alert" hidden>
+    <p id="refine-confirm-text"></p>
+    <div class="actions"><button type="button" id="refine-confirm-start">Start and replace them</button> <button type="button" class="secondary" id="refine-confirm-keep">Keep them</button></div>
+  </div>
+  <div id="refine-preview" role="status" hidden></div>
+  <div id="jobs" hidden></div>
+</div>
+
+<div class="card" id="refine-findings">
+  <h2>Findings</h2>
+  <div id="refine-findings-body"><p class="muted">Loading&hellip;</p></div>
+</div>
+
+<div class="card" id="refine-statics">
+  <h2>Static objects</h2>
+  <p class="muted">A static spot is a place where the same parked object (a car in the driveway, a boat on its trailer) is labelled in most frames of one camera. A frame that shows nothing else there teaches the model little, so a training run keeps only a set number of such frames per spot (20 by default) and leaves the rest out. The same places are where the dataset check looks hardest for a box nobody drew.</p>
+  <div id="refine-statics-body"><p class="muted">Loading&hellip;</p></div>
+  <div id="refine-spot-confirm" class="warn" role="alert" hidden>
+    <p id="refine-spot-confirm-text"></p>
+    <div class="actions"><button type="button" id="refine-spot-confirm-go">Add them</button> <button type="button" class="secondary" id="refine-spot-confirm-cancel">Cancel</button></div>
+  </div>
+  <div id="refine-spot-result" role="status" hidden></div>
+  <h3>Training cap</h3>
+  <form id="refine-cap-form">
+    <label for="refine-cap">Frames kept per static spot</label>
+    <input inputmode="numeric" type="number" id="refine-cap" name="cap" min="0" max="100000" step="1" value="20">
+    <button type="submit" id="refine-cap-save">Save</button>
+  </form>
+  <p class="muted small">0 turns the cap off: every frame is kept. Applies to the next training run; the pre-flight on the <a href="/train/train">Train</a> tab shows what it leaves out.</p>
+  <div id="refine-cap-msg" class="form-msg" role="status"></div>
+</div>
+
+<div class="card" id="refine-floor">
+  <h2>Too small</h2>
+  <p class="muted">Objects smaller than about one patch of the model's input cannot be learned. With a size floor they are left out of the labels at export (your accepted labels are never changed), and a detection on one counts neither for nor against a model on held-out frames. The one thing here that writes only hides pending proposals under the floor on unreviewed frames, and they can be restored.</p>
+  <div id="refine-floor-recall"></div>
+  <h3>Size floor</h3>
+  <form id="refine-floor-form">
+    <label for="refine-floor-px">Under (px, short side)</label>
+    <input type="number" id="refine-floor-px" name="px" min="1" max="64" step="any" value="10">
+    <label for="refine-floor-input">at a model input of (px)</label>
+    <input inputmode="numeric" type="number" id="refine-floor-input" name="input" min="64" max="4096" step="1" value="384">
+    <button type="button" class="secondary" id="refine-floor-preview">Preview</button>
+    <button type="submit" id="refine-floor-save">Save</button>
+    <button type="button" class="secondary" id="refine-floor-off" hidden>Turn off</button>
+  </form>
+  <p class="muted small" id="refine-floor-state">Loading&hellip;</p>
+  <p class="muted small">Applies to the next export. Held-out scores from before and after a change do not compare, because the held-out labels change.</p>
+  <div id="refine-floor-msg" class="form-msg" role="status"></div>
+  <div id="refine-floor-counts" role="status" hidden></div>
+  <div id="refine-floor-pending" hidden>
+    <button type="button" class="secondary" id="refine-floor-resolve">Hide pending proposals under the floor...</button>
+  </div>
+  <div id="refine-floor-restorable" hidden>
+    <button type="button" class="secondary" id="refine-floor-restore">Restore proposals the floor no longer covers...</button>
+  </div>
+  <div id="refine-small-confirm" class="warn" role="alert" hidden>
+    <p id="refine-small-confirm-text"></p>
+    <div class="actions"><button type="button" id="refine-small-confirm-go">Hide them</button> <button type="button" class="secondary" id="refine-small-confirm-cancel">Cancel</button></div>
+  </div>
+  <div id="refine-small-result" role="status" hidden></div>
+  <h3>Frames with a too-small object</h3>
+  <form id="refine-ignore-form">
+    <label class="check"><input type="radio" name="mode" value="background" checked> Keep the frame, train the object as background (default)</label>
+    <label class="check"><input type="radio" name="mode" value="drop-frame"> Leave the frame out of training</label>
+    <button type="submit" id="refine-ignore-save">Save</button>
+  </form>
+  <p class="muted small">This covers objects under the floor and objects you marked unsure or too small on the Review tab. A frame with nothing else to learn from, and a frame of a day used for validation, is left out in the first mode too. Applies to the next training run; the pre-flight on the <a href="/train/train">Train</a> tab shows what it leaves out.</p>
+  <div id="refine-ignore-msg" class="form-msg" role="status"></div>
+</div>
+
+<div class="card" id="refine-coverage">
+  <h2>Coverage</h2>
+  <div id="refine-coverage-body"><p class="muted">Loading&hellip;</p></div>
+  <h3>Where the data is thin</h3>
+  <p class="muted small">One row per camera and scene of the folder under review: where the model has little to learn from, and where you can add to it. The last check's recall is where it is known.</p>
+  <div id="refine-thin-body"><p class="muted">Loading&hellip;</p></div>
+</div>
+</div>
+<script src="/static/train-refine.js?v={{ version }}"></script>
+{% endblock %}

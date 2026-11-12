@@ -13,6 +13,8 @@
       <label class="check"><input type="checkbox" name="fmt" value="xanylabeling"> X-AnyLabeling</label>
       <label class="check"><input type="checkbox" name="fmt" value="benchmark" checked> Benchmark set</label>
     </div>
+    {% if let Some(line) = size_floor_line %}<p class="muted small" id="export-size-floor">{{ line }}</p>{% endif %}
+    <p class="warn small" id="export-open" role="status" hidden></p>
     <div class="actions"><button type="submit">Export</button></div>
     <details class="tr-more" id="export-advanced">
       <summary>Advanced</summary>

@@ -911,6 +911,9 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         scene: r.request.scene,
         classes: r.request.classes.clone().unwrap_or_default(),
         excluded: r.request.excluded,
+        ignore: p
+            .and_then(|p| p.settings.as_ref())
+            .map(crate::training::progress::RunSettings::ignore_mode),
         balance: r.request.balance.clone(),
         best_epoch: stop
             .map(|s| s.best_epoch)

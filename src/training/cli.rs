@@ -7,7 +7,7 @@
 use super::capability;
 use super::capability::Capability;
 use super::compare::{self, CompareRun};
-use super::dataset::{self, Excluded, SceneFilter};
+use super::dataset::{self, Excluded, IgnoreMode, SceneFilter};
 use super::estimate;
 use super::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
 use super::preflight;
@@ -86,7 +86,7 @@ pub enum TrainCommand {
         #[arg(long = "model", required = true)]
         models: Vec<String>,
         #[command(flatten)]
-        data: DataArgs,
+        data: Box<DataArgs>,
         /// Most epochs (default: the family's recommendation: YOLO 100, RF-DETR 100,
         /// RT-DETRv2 / D-FINE 80; config `training.epochs`).
         #[arg(long)]
@@ -194,7 +194,8 @@ pub enum TrainCommand {
     /// each trained without whole camera days and run on them, and write suggestions for you to
     /// confirm on the Review tab (missing boxes, labels to verify, other classes) plus a report
     /// (<folder under review>/refine/report.json). It changes no box, status, config, model or
-    /// training run.
+    /// training run. With --with-model, a quick check: a model trained here judges the reviewed
+    /// frames it never trained or validated on, and nothing trains.
     Refine(RefineArgs),
     /// List the runs recorded in the training folder.
     List,
@@ -512,6 +513,19 @@ pub struct RefineArgs {
     /// Allow downloads over 500 MB (the training environment, the base weights).
     #[arg(long)]
     pub allow_large: bool,
+    /// After the last fold, look closer at the loose labels (RF-DETR L on a crop of each, the
+    /// overlap check's model; its weights, 0.14 GB, are downloaded when missing) and propose
+    /// better-fitting boxes. Default: on when those weights are downloaded.
+    #[arg(long, conflicts_with = "no_tighten")]
+    pub tighten: bool,
+    /// Count the loose labels only: no closer look, no better-fitting box proposed.
+    #[arg(long)]
+    pub no_tighten: bool,
+    /// A quick check instead of fold models: this configured model, trained here, judges the
+    /// reviewed frames it never trained or validated on (its training record names them). Nothing
+    /// trains; refused for a model without a training record or whose run folder is gone.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["folds", "epochs"])]
+    pub with_model: Option<String>,
     /// Print the trainer's output.
     #[arg(long)]
     pub verbose: bool,
@@ -525,6 +539,12 @@ pub fn refine_request(a: &RefineArgs) -> Result<super::refine::RefineRequest> {
         frames: super::refine::RefineFrames::parse(&a.frames)?,
         gpu: a.gpu.clone(),
         allow_large: a.allow_large,
+        tighten: match (a.tighten, a.no_tighten) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
+        model: a.with_model.clone(),
     };
     r.validate()?;
     Ok(r)
@@ -782,9 +802,41 @@ pub struct DataArgs {
     /// reviewer-confirmed hard negatives and never the last box of a class.
     #[arg(long)]
     pub balance_cap: Option<f32>,
+    /// Most training frames kept per static spot of those showing nothing but objects parked at
+    /// static spots (the same car at the same place frame after frame); 0 keeps them all.
+    /// Default: `training.static_cap` (20).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=super::config::MAX_STATIC_CAP as u64))]
+    pub static_cap: Option<u64>,
+    /// What a training frame with an unsure or too-small object (an ignore region, also a box under
+    /// collect.size_floor) becomes: `background` (it trains with the object unlabelled; a frame of
+    /// nothing else is left out, and validation never holds one) or `drop-frame` (every such frame
+    /// is left out). Held-out frames keep the regions either way. Default: `training.ignore`
+    /// (background).
+    #[arg(long, value_parser = parse_ignore)]
+    pub ignore: Option<IgnoreMode>,
 }
 
 impl DataArgs {
+    /// `config` with `--static-cap` over `training.static_cap` (never saved: only the plan reads
+    /// it).
+    pub fn with_static_cap(&self, config: &Config) -> Config {
+        let mut c = config.clone();
+        if let Some(n) = self.static_cap {
+            c.training.static_cap = usize::try_from(n).unwrap_or(super::config::MAX_STATIC_CAP);
+        }
+        c
+    }
+
+    /// `config` with the plan's flags over the `training` section: `--static-cap`
+    /// ([`Self::with_static_cap`]) and `--ignore` over `training.ignore`. In memory only.
+    pub fn with_plan_flags(&self, config: &Config) -> Config {
+        let mut c = self.with_static_cap(config);
+        if let Some(m) = self.ignore {
+            c.training.ignore = m;
+        }
+        c
+    }
+
     /// The balancing of the run: the flags over `training.balance` (the default when no
     /// `--balance` is given), else off. Validated.
     pub fn balance(&self, config: &Config) -> Result<dataset::Balance> {
@@ -850,6 +902,10 @@ pub struct ClassesArgs {
 
 fn parse_excluded(s: &str) -> Result<Excluded, String> {
     Excluded::parse(s).ok_or_else(|| format!("'{s}' is not background or drop-frame"))
+}
+
+fn parse_ignore(s: &str) -> Result<IgnoreMode, String> {
+    IgnoreMode::parse(s).ok_or_else(|| format!("'{s}' is not background or drop-frame"))
 }
 
 fn parse_scene(s: &str) -> Result<SceneFilter, String> {
@@ -945,9 +1001,16 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let [scene] = data.scenes()[..] else {
                 bail!("prepare takes one --scene (train run compares several)");
             };
+            // `--static-cap` and `--ignore` over the config's (in memory only).
+            let config = data.with_plan_flags(&config);
             if dry_run {
                 let request = preview_request(&config, &data, scene)?;
-                let p = super::preview_parts(&config, &request)?;
+                // No model: the run's input size is not known (its placeholder recipe's is not).
+                let options = dataset::Options {
+                    imgsz: None,
+                    ..super::options_for(&config, &request)
+                };
+                let p = super::preview_with(&config, &request, options)?;
                 println!("{}", dry_run_text(&p.plan, &request.balance));
                 let unreviewed = super::unreviewed_frames(&config);
                 let report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
@@ -971,6 +1034,12 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let (sources, opts) = read_sources(&config, &data, scene)?;
             let plan = preflight::planned(&sources, &opts)?;
             let prepared = dataset::write(&sources, &plan, &opts, &out)?;
+            if let Some(note) = dataset::static_cap_note(&plan.stats, opts.static_cap) {
+                println!("{note}");
+            }
+            if let Some(note) = dataset::static_cap_idle_note(&plan.classes, opts.static_cap) {
+                println!("{note}");
+            }
             println!(
                 "{}: {} training, {} validation, {} held-out images; classes: {}",
                 out.display(),
@@ -1025,6 +1094,9 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
                 bail!("--name needs exactly one --model and one --scene");
             }
+            // `--static-cap` and `--ignore` over the config's (in memory only; the hooks read the
+            // file again).
+            let config = data.with_plan_flags(&config);
             // Several runs of different scenes or seeds are compared on the same held-out frames.
             let group = (scenes.len() as u64 * seeds > 1)
                 .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
@@ -1346,7 +1418,14 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 print!("{}", super::refine::preview_text(&p));
                 return Ok(p.refused.is_none());
             }
+            // An explicit command asks nothing, but says what a rerun replaces before it starts
+            // (the page asks; `refine::start_warnings`).
+            let p = super::refine::preview(&config, &req, &cap)?;
             let job = super::refine::plan_refine(&config, req, &cap)?;
+            let family = job.train.as_ref().map(|t| t.request.recipe.family);
+            for w in super::refine::start_warnings(&p, family) {
+                eprintln!("warning: {w}");
+            }
             eprintln!(
                 "{} in {}",
                 super::task::Task::title(&job),
@@ -1457,6 +1536,11 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 |d| d.classes.clone(),
             ),
             excluded: r.request.excluded,
+            ignore: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.settings.as_ref())
+                .map(super::progress::RunSettings::ignore_mode),
             balance: r.request.balance.clone(),
             best_epoch: r
                 .progress
@@ -1856,6 +1940,11 @@ fn read_sources(
         heldout_share: t.heldout_share,
         oversample: t.oversample,
         balance: data.balance(config)?,
+        static_cap: data.with_static_cap(config).training.static_cap_option(),
+        ignore: data.with_plan_flags(config).training.ignore,
+        size_floor: config.collect.size_floor,
+        // `train prepare` names no model: the input size is not known.
+        imgsz: None,
         ..dataset::Options::default()
     };
     Ok((sources, opts))
@@ -2046,7 +2135,51 @@ mod tests {
         };
         let r = refine_request(&d).unwrap();
         assert_eq!(r, super::super::refine::RefineRequest::default());
+        assert_eq!(r.tighten, None, "the default follows the weights on disk");
         assert!(!d.dry_run);
+        // --tighten / --no-tighten say it, and not both.
+        for (flag, want) in [("--tighten", Some(true)), ("--no-tighten", Some(false))] {
+            let TrainCommand::Refine(t) = parse(&["refine", flag]).unwrap() else {
+                panic!()
+            };
+            assert_eq!(refine_request(&t).unwrap().tighten, want, "{flag}");
+        }
+        assert!(parse(&["refine", "--tighten", "--no-tighten"]).is_err());
+        assert_eq!(r.model, None);
+        // --with-model: a quick check; the frame filter, GPU, closer look and dry run as for the
+        // full check, folds and epochs not at all (it trains nothing).
+        let TrainCommand::Refine(q) = parse(&[
+            "refine",
+            "--with-model",
+            "custom-rf-detr-nano-3",
+            "--frames",
+            "camera=patio",
+            "--gpu",
+            "cuda:0",
+            "--no-tighten",
+            "--dry-run",
+        ])
+        .unwrap() else {
+            panic!()
+        };
+        let r = refine_request(&q).unwrap();
+        assert_eq!(r.model.as_deref(), Some("custom-rf-detr-nano-3"));
+        assert_eq!(r.quick_model(), Some("custom-rf-detr-nano-3"));
+        assert_eq!(r.frames.cameras, ["patio"]);
+        assert_eq!((r.tighten, r.gpu.as_deref()), (Some(false), Some("cuda:0")));
+        assert!(q.dry_run);
+        for flags in [
+            vec!["refine", "--with-model", "m", "--folds", "3"],
+            vec!["refine", "--with-model", "m", "--epochs", "3"],
+            vec!["refine", "--folds", "3", "--with-model", "m"],
+        ] {
+            let e = parse(&flags).unwrap_err().to_string();
+            assert!(e.contains("cannot be used with"), "{flags:?}: {e}");
+        }
+        let TrainCommand::Refine(empty) = parse(&["refine", "--with-model", " "]).unwrap() else {
+            panic!()
+        };
+        assert!(refine_request(&empty).is_err(), "an empty name");
         for bad in [
             vec!["refine", "--folds", "1"],
             vec!["refine", "--epochs", "0"],
@@ -2635,6 +2768,72 @@ mod tests {
             panic!("not prepare")
         };
         data
+    }
+
+    #[test]
+    fn the_static_cap_flag_overrides_the_config_in_memory() {
+        let mut cfg = Config::default();
+        cfg.training.static_cap = 7;
+        let none = prepare_data(&[]);
+        assert_eq!(none.static_cap, None);
+        assert_eq!(none.with_static_cap(&cfg).training.static_cap, 7);
+        let off = prepare_data(&["--static-cap", "0"]);
+        let c = off.with_static_cap(&cfg);
+        assert_eq!(c.training.static_cap_option(), None);
+        assert_eq!(cfg.training.static_cap, 7, "the config itself is unchanged");
+        let five = prepare_data(&["--static-cap", "5"]);
+        assert_eq!(
+            five.with_static_cap(&cfg).training.static_cap_option(),
+            Some(5)
+        );
+        assert!(parse(&["prepare", "--out", "o", "--static-cap", "-1"]).is_err());
+        assert!(parse(&["prepare", "--out", "o", "--static-cap", "100001"]).is_err());
+        // `train run` takes it too.
+        let TrainCommand::Run { data, .. } =
+            parse(&["run", "--model", "yolo26n", "--static-cap", "3"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(data.static_cap, Some(3));
+    }
+
+    #[test]
+    fn the_ignore_flag_overrides_the_config_in_memory() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.training.ignore, IgnoreMode::Background);
+        let none = prepare_data(&[]);
+        assert_eq!(none.ignore, None);
+        assert_eq!(
+            none.with_plan_flags(&cfg).training.ignore,
+            IgnoreMode::Background
+        );
+        let drop = prepare_data(&["--ignore", "drop-frame"]);
+        assert_eq!(
+            drop.with_plan_flags(&cfg).training.ignore,
+            IgnoreMode::DropFrame
+        );
+        assert_eq!(cfg.training.ignore, IgnoreMode::Background, "unchanged");
+        cfg.training.ignore = IgnoreMode::DropFrame;
+        assert_eq!(
+            none.with_plan_flags(&cfg).training.ignore,
+            IgnoreMode::DropFrame,
+            "no flag: the config's"
+        );
+        let back = prepare_data(&["--ignore", "background", "--static-cap", "4"]);
+        let c = back.with_plan_flags(&cfg);
+        assert_eq!(c.training.ignore, IgnoreMode::Background);
+        assert_eq!(c.training.static_cap_option(), Some(4), "both flags apply");
+        assert!(parse(&["prepare", "--out", "o", "--ignore", "skip"]).is_err());
+        assert!(
+            parse(&["prepare", "--out", "o", "--ignore", ""]).is_err(),
+            "an empty value is refused, not read as the default"
+        );
+        let TrainCommand::Run { data, .. } =
+            parse(&["run", "--model", "yolo26n", "--ignore", "drop-frame"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(data.ignore, Some(IgnoreMode::DropFrame));
     }
 
     #[test]

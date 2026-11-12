@@ -95,6 +95,15 @@ impl RunState {
     }
 }
 
+/// Why [`TrainingService::enqueue_task_unless`] did not queue a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotQueued {
+    /// The caller's rule refused it, in the rule's words.
+    Refused(String),
+    /// The queue could not take it (an id already listed, the training thread gone).
+    Failed(String),
+}
+
 /// Dataset counts of a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DatasetCounts {
@@ -670,11 +679,29 @@ impl TrainingService {
 
     /// Queue an import or auto-label task (after the runs and tasks queued before it).
     pub fn enqueue_task(&self, task: Box<dyn Task>) -> Result<String, String> {
+        self.enqueue_task_unless(task, &|_| None)
+            .map_err(|e| match e {
+                NotQueued::Refused(m) | NotQueued::Failed(m) => m,
+            })
+    }
+
+    /// [`Self::enqueue_task`], unless `refuse` answers a reason for the task list as it stands.
+    /// `refuse` runs under the list's own lock, so no other enqueue comes between its decision
+    /// and the queueing: two starts of a job that runs one at a time (the dataset check) cannot
+    /// both pass. `refuse` gets the records only; it must take no lock of this queue.
+    pub fn enqueue_task_unless(
+        &self,
+        task: Box<dyn Task>,
+        refuse: &dyn Fn(&[TaskRecord]) -> Option<String>,
+    ) -> Result<String, NotQueued> {
         let id = task.id().to_string();
         {
             let mut tasks = self.inner.tasks.lock_recover();
+            if let Some(why) = refuse(&tasks) {
+                return Err(NotQueued::Refused(why));
+            }
             if tasks.iter().any(|r| r.id == id) {
-                return Err(format!("job {id} exists"));
+                return Err(NotQueued::Failed(format!("job {id} exists")));
             }
             tasks.push(TaskRecord::new(task.as_ref(), now()));
             task::cap_finished(&mut tasks);
@@ -683,7 +710,7 @@ impl TrainingService {
         self.inner.changed.notify_all();
         self.tx
             .send(Msg::Task(task))
-            .map_err(|_| "the training thread has stopped".to_string())?;
+            .map_err(|_| NotQueued::Failed("the training thread has stopped".to_string()))?;
         Ok(id)
     }
 

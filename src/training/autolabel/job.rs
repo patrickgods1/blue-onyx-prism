@@ -855,7 +855,19 @@ impl AutolabelJob {
                     width: sel.width,
                     height: sel.height,
                 });
-                let a = triage::apply_labelers(file, boxes, self.short_labeler(), &sel.rel, memory);
+                let floor = Some(triage::FloorAt {
+                    floor: self.config.collect.size_floor,
+                    width: sel.width,
+                    height: sel.height,
+                });
+                let a = triage::apply_labelers_at(
+                    file,
+                    boxes,
+                    self.short_labeler(),
+                    &sel.rel,
+                    memory,
+                    floor,
+                );
                 let write = FrameWrite {
                     write: true,
                     queue: a.for_review(),
@@ -1541,7 +1553,13 @@ impl AutolabelJob {
             let mut applied = None;
             let res = self.write_frame(f, rep, changed, |file| {
                 file.auto_run = Some(marker);
-                let t = triage::apply_relabel(file, &d, out.boxes, &plan.name, &self.classes);
+                let floor = Some(triage::FloorAt {
+                    floor: self.config.collect.size_floor,
+                    width: f.width,
+                    height: f.height,
+                });
+                let t =
+                    triage::apply_relabel_at(file, &d, out.boxes, &plan.name, &self.classes, floor);
                 let a = &t.apply;
                 let write = FrameWrite {
                     write: true,

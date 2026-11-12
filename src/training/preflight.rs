@@ -80,9 +80,12 @@ pub fn advice(plan: &Plan, sources: &[Source]) -> Vec<String> {
     for c in &plan.classes {
         let n = plan.stats.train_boxes.get(c).copied().unwrap_or(0);
         if n > 0 && n < MIN_CLASS_BOXES {
+            let capped = dataset::static_cap_clause(&plan.stats, c)
+                .map(|clause| format!(" Also, {clause}."))
+                .unwrap_or_default();
             out.push(format!(
                 "Only {n} training box(es) of '{c}': the model will find it poorly. Review more \
-                 frames with it, or leave the class out."
+                 frames with it, or leave the class out.{capped}"
             ));
         }
     }
@@ -187,8 +190,29 @@ pub struct Report {
     pub own_frames: usize,
     /// Frames of the folder under review not reviewed yet (not in any export); None = unknown.
     pub unreviewed: Option<u64>,
+    /// Frames left out for ignore regions (unsure, too small, under the size floor;
+    /// [`dataset::Stats::ignore_frames`]).
     pub ignore_frames: usize,
+    /// What the plan does with frames with ignore regions (`training.ignore`).
+    pub ignore_mode: dataset::IgnoreMode,
+    /// [`dataset::IgnoreMode::Background`]: training frames trained with an unlabelled object
+    /// ([`dataset::Stats::ignore_kept`]) and their regions per class.
+    pub ignore_kept: usize,
+    pub ignore_boxes_background: BTreeMap<String, usize>,
+    /// Of `ignore_frames` (background): frames with nothing but regions, and frames of camera days
+    /// validated on.
+    pub ignore_only: usize,
+    pub ignore_valid_day: usize,
+    /// Size floor regions given back as labels at the run's input, per label
+    /// ([`dataset::Stats::floor_restored`]); the plan's warnings say the rest of the floor story
+    /// (exports of other floors, an input smaller than the floor's or unknown).
+    pub floor_restored: BTreeMap<String, usize>,
     pub parked_capped: usize,
+    /// Frames showing nothing but objects at static spots left out over the static cap
+    /// ([`dataset::Stats::static_capped`]; the spots in `dataset::Stats::static_caps`).
+    pub static_capped: usize,
+    /// Static spots of the train / valid pool ([`dataset::Stats::static_spots`]).
+    pub static_spots: usize,
     pub duplicates_dropped: usize,
     pub scene_filtered: usize,
     /// Plain sentences beside the counts.
@@ -201,6 +225,9 @@ pub struct Report {
 
 /// The [`Report`] of `plan`.
 pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Option<u64>) -> Report {
+    // The frames as the plan read them (size floor regions given back at the run's input).
+    let at_input = dataset::at_run_input(sources, plan, opts);
+    let sources: &[Source] = &at_input;
     let class_at = |b: usize| plan.classes.get(b);
     let mut classes: BTreeMap<&str, ClassLine> = plan
         .classes
@@ -266,6 +293,12 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
                 .into(),
         ),
     }
+    if let Some(note) = dataset::static_cap_note(s, opts.static_cap) {
+        notes.push(note);
+    }
+    if let Some(note) = dataset::static_cap_idle_note(&plan.classes, opts.static_cap) {
+        notes.push(note);
+    }
     if let Some(n) = unreviewed.filter(|n| *n > 0) {
         notes.push(format!(
             "{n} frame(s) in the folder under review are not reviewed yet, so they are in no \
@@ -289,7 +322,15 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         own_frames: own,
         unreviewed,
         ignore_frames: s.ignore_frames,
+        ignore_mode: opts.ignore,
+        ignore_kept: s.ignore_kept,
+        ignore_boxes_background: s.ignore_boxes_background.clone(),
+        ignore_only: s.ignore_only,
+        ignore_valid_day: s.ignore_valid_day,
+        floor_restored: s.floor_restored.clone(),
         parked_capped: s.parked_capped,
+        static_capped: s.static_capped,
+        static_spots: s.static_spots,
         duplicates_dropped: s.duplicates_dropped,
         scene_filtered: s.scene_filtered,
         notes,
@@ -323,9 +364,50 @@ pub fn text(r: &Report) -> String {
             c.name, c.train, c.valid, c.heldout, s.day, s.night, s.ir
         ));
     }
+    if r.ignore_kept > 0 {
+        let per: Vec<String> = r
+            .ignore_boxes_background
+            .iter()
+            .map(|(c, n)| format!("{c} {n}"))
+            .collect();
+        out.push_str(&format!(
+            "trained with an unsure or too-small object as background: {} frame(s) ({})\n",
+            r.ignore_kept,
+            per.join(", ")
+        ));
+    }
+    if !r.floor_restored.is_empty() {
+        let per: Vec<String> = r
+            .floor_restored
+            .iter()
+            .map(|(c, n)| format!("{c} {n}"))
+            .collect();
+        out.push_str(&format!(
+            "under the export's size floor but not at this run's input, trained as labels: {}\n",
+            per.join(", ")
+        ));
+    }
+    let background = r.ignore_mode == dataset::IgnoreMode::Background;
+    let (ignore_all, ignore_only, ignore_valid) = if background {
+        (0, r.ignore_only, r.ignore_valid_day)
+    } else {
+        (r.ignore_frames, 0, 0)
+    };
     let dropped = [
-        (r.ignore_frames, "with unsure or too-small boxes"),
+        (ignore_all, "with unsure or too-small boxes"),
+        (
+            ignore_only,
+            "with nothing but unsure or too-small objects (no label to train)",
+        ),
+        (
+            ignore_valid,
+            "with unsure or too-small objects on camera days used for validation",
+        ),
         (r.parked_capped, "over the parked-spot cap"),
+        (
+            r.static_capped,
+            "showing nothing but parked objects, over the cap per static spot",
+        ),
         (
             r.duplicates_dropped,
             "that repeat a frame of another export",

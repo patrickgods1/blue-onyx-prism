@@ -32,7 +32,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        # Ubuntu is pinned: `ubuntu-latest` moved to 26.04, for which actions/python-versions has no
+        # 3.11.9 build (setup-python fails: "The version '3.11.9' ... was not found for Ubuntu 26.04").
+        os: [windows-latest, ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The Ubuntu runner reached 793 MB free in this job, which failed tests.
@@ -65,11 +67,11 @@ jobs:
         timeout-minutes: 15
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Clippy (OpenVINO only)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         timeout-minutes: 10
         run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - name: Build (OpenVINO only)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-24.04'
         timeout-minutes: 10
         run: cargo build --locked --no-default-features
       # Fixture-dependent tests are #[ignore]d here; they run in "Integration tests (real models)".
@@ -79,7 +81,7 @@ jobs:
         run: cargo test --locked --no-fail-fast
       # Also after a failure above: the two builds fail for different reasons.
       - name: Unit tests (OpenVINO only)
-        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-24.04' }}
         timeout-minutes: 15
         run: cargo test --locked --no-fail-fast --no-default-features
       - name: Disk space before the release build

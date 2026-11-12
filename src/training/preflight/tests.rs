@@ -22,6 +22,7 @@ fn frame(name: &str, scene: &str, boxes: Vec<YoloBox>, split: SplitHint) -> Fram
         image: PathBuf::from("/export/images").join(format!("{name}.jpg")),
         boxes,
         ignore: Vec::new(),
+        floor_regions: Vec::new(),
         scene: Some(scene.into()),
         camera,
         day,
@@ -42,6 +43,7 @@ fn source(frames: Vec<Frame>) -> Source {
         frames,
         warnings: Vec::new(),
         notes_known: true,
+        size_floor: None,
     }
 }
 
@@ -396,4 +398,163 @@ fn the_gpu_need_is_the_train_tabs_estimate() {
         lane: TrainLane::Cu126,
     };
     assert_eq!(gpu_warning(&recipe, &far), None);
+}
+
+#[test]
+fn frames_over_the_static_cap_are_named_with_their_largest_spot() {
+    // One camera with a car parked at one place on 45 frames over 3 days, and cars passing.
+    let car = || YoloBox {
+        class: "car".into(),
+        ..cat()
+    };
+    let mut v = Vec::new();
+    for i in 0..45 {
+        let name = format!("day.patio.2026-10-0{}.f{i}", i % 3 + 1);
+        v.push(frame(&name, "day", vec![car()], SplitHint::Train));
+    }
+    for i in 0..10 {
+        let name = format!("day.patio.2026-10-0{}.g{i}", i % 3 + 1);
+        let passing = YoloBox {
+            cx: 0.1 + i as f32 * 0.08,
+            cy: 0.2,
+            w: 0.05,
+            h: 0.1,
+            ..car()
+        };
+        v.push(frame(&name, "day", vec![passing], SplitHint::Train));
+    }
+    for i in 0..12 {
+        let name = format!("day.held.2026-11-01.h{i}");
+        v.push(frame(&name, "day", vec![car()], SplitHint::Heldout));
+    }
+    let sources = [Source {
+        classes: vec!["car".into()],
+        ..source(v)
+    }];
+    let p = planned(&sources, &opts()).unwrap();
+    assert_eq!(p.stats.static_capped, 25, "{:?}", p.stats);
+    let r = report(&p, &sources, &opts(), None);
+    assert_eq!((r.static_capped, r.static_spots), (25, 1));
+    let t = text(&r);
+    assert!(
+        t.contains(
+            "left out: 25 frame(s) showing nothing but parked objects, over the cap per static spot"
+        ),
+        "{t}"
+    );
+    assert!(
+        t.contains("a car on camera patio (45 frames, 20 kept)"),
+        "{t}"
+    );
+    // Few car boxes are left to train on: the warning names the cap and how to turn it off.
+    let few = p
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("Only ") && w.contains("'car'"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(
+        few.contains(
+            "the static cap left out 25 box(es) of it on frames showing nothing but parked"
+        ),
+        "{few}"
+    );
+    assert!(few.contains("training.static_cap to 0"), "{few}");
+    assert_eq!(p.stats.static_capped_boxes.get("car"), Some(&25));
+    assert!(!r.notes.iter().any(|n| n.contains("no class of this run")));
+    // The cars renamed into a merged class of their own: no spot can form, one note says so.
+    let merged = Options {
+        rename: [("car".to_string(), "vehicle".to_string())].into(),
+        ..opts()
+    };
+    let p = planned(&sources, &merged).unwrap();
+    assert_eq!((p.stats.static_capped, p.stats.static_spots), (0, 0));
+    let r = report(&p, &sources, &merged, None);
+    let idle: Vec<&String> = r
+        .notes
+        .iter()
+        .filter(|n| n.contains("no class of this run (vehicle)"))
+        .collect();
+    assert_eq!(idle.len(), 1, "{:?}", r.notes);
+    let off = Options {
+        static_cap: None,
+        ..merged
+    };
+    let p = planned(&sources, &off).unwrap();
+    let r = report(&p, &sources, &off, None);
+    assert!(!r.notes.iter().any(|n| n.contains("no class of this run")));
+    // The same frames with a cat: animals never form a spot, nothing is capped.
+    let cats = [source(
+        sources[0]
+            .frames
+            .iter()
+            .cloned()
+            .map(|mut f| {
+                f.boxes.iter_mut().for_each(|b| b.class = "cat".into());
+                f
+            })
+            .collect(),
+    )];
+    let p = planned(&cats, &opts()).unwrap();
+    assert_eq!((p.stats.static_capped, p.stats.static_spots), (0, 0));
+    // Off: no line, no note.
+    let off = Options {
+        static_cap: None,
+        ..opts()
+    };
+    let p = planned(&sources, &off).unwrap();
+    let t = text(&report(&p, &sources, &off, None));
+    assert!(!t.contains("static spot"), "{t}");
+}
+
+#[test]
+fn the_report_says_what_became_of_frames_with_ignore_regions() {
+    let mut s = export(60, 12, "day");
+    // Two training frames with a cat and a tiny unlabelled dog, one with the dog alone.
+    for i in [0, 1, 2] {
+        s.frames[i].ignore.push(YoloBox {
+            class: "dog".into(),
+            cx: 0.9,
+            cy: 0.9,
+            w: 0.01,
+            h: 0.01,
+        });
+    }
+    s.frames[2].boxes.clear();
+    let sources = [s];
+    let o = opts();
+    let p = planned(&sources, &o).unwrap();
+    let r = report(&p, &sources, &o, None);
+    assert_eq!(r.ignore_mode, dataset::IgnoreMode::Background);
+    assert_eq!(r.ignore_only, 1);
+    assert_eq!(r.ignore_kept + r.ignore_valid_day, 2, "{r:?}");
+    assert_eq!(r.ignore_frames, r.ignore_only + r.ignore_valid_day);
+    let t = text(&r);
+    assert!(
+        t.contains("left out: 1 frame(s) with nothing but unsure or too-small objects"),
+        "{t}"
+    );
+    if r.ignore_kept > 0 {
+        assert_eq!(r.ignore_boxes_background.get("dog"), Some(&r.ignore_kept));
+        assert!(
+            t.contains("trained with an unsure or too-small object as background"),
+            "{t}"
+        );
+    }
+    assert!(!t.contains("with unsure or too-small boxes"), "{t}");
+    // Leaving every such frame out, as earlier versions did.
+    let drop = Options {
+        ignore: dataset::IgnoreMode::DropFrame,
+        ..opts()
+    };
+    let p = planned(&sources, &drop).unwrap();
+    let r = report(&p, &sources, &drop, None);
+    assert_eq!((r.ignore_frames, r.ignore_kept, r.ignore_only), (3, 0, 0));
+    let t = text(&r);
+    assert!(
+        t.contains("left out: 3 frame(s) with unsure or too-small boxes"),
+        "{t}"
+    );
+    assert!(!t.contains("as background"), "{t}");
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["ignore_mode"], "drop-frame");
 }

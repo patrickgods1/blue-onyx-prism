@@ -627,6 +627,7 @@ mod tests {
         for reason in [
             super::super::bulk::DISMISSED_REASON,
             super::super::bulk::SPOT_DISMISSED_REASON,
+            super::super::bulk::SIZE_FLOOR_REASON,
             super::super::spots::PARKED_REASON,
             super::super::stacks::DUPLICATE_REASON,
         ] {

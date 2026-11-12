@@ -1,9 +1,9 @@
-//! The Train area: one top-nav entry with eight tabs at their own URLs (Collect, Import,
-//! Auto-label, Review, Dataset, Train, Models, Jobs). This file holds what the tabs share: the tab list,
+//! The Train area: one top-nav entry with nine tabs at their own URLs (Collect, Import,
+//! Auto-label, Review, Refine, Dataset, Train, Models, Jobs). This file holds what the tabs share: the tab list,
 //! `GET /train` (the most useful tab), the redirects of the old `/dataset`, `/review` and
 //! `/training` pages, `GET /v1/train/summary` (the counts of the status strip and the one suggested
 //! next action) with the pure rule [`next_step`], and the Dataset tab. The other tabs render in
-//! [`super::dataset`], [`super::review`] and [`super::training`].
+//! [`super::dataset`], [`super::review`], [`super::refine`] and [`super::training`].
 //!
 //! Nothing here walks the frames on the request path: the walk ([`queue::tally`]) runs on its own
 //! thread and its answer is kept ([`tally_of`]), so a large dataset delays neither the pages (the
@@ -30,17 +30,19 @@ pub(super) const COLLECT: &str = "collect";
 pub(super) const IMPORT: &str = "import";
 pub(super) const AUTOLABEL: &str = "autolabel";
 pub(super) const REVIEW: &str = "review";
+pub(super) const REFINE: &str = "refine";
 pub(super) const DATASET: &str = "dataset";
 pub(super) const TRAIN: &str = "train";
 pub(super) const MODELS: &str = "models";
 pub(super) const JOBS: &str = "jobs";
 
 /// The tabs in nav order: id, title.
-pub(super) const TABS: [(&str, &str); 8] = [
+pub(super) const TABS: [(&str, &str); 9] = [
     (COLLECT, "Collect"),
     (IMPORT, "Import"),
     (AUTOLABEL, "Auto-label"),
     (REVIEW, "Review"),
+    (REFINE, "Refine"),
     (DATASET, "Dataset"),
     (TRAIN, "Train"),
     (MODELS, "Models"),
@@ -50,7 +52,7 @@ pub(super) const TABS: [(&str, &str); 8] = [
 /// The tab the Jobs card's forms came from (their hidden `tab` field), so their answer lands
 /// where they were pressed; `default` for anything else.
 pub(super) fn jobs_tab(field: Option<&str>, default: &'static str) -> &'static str {
-    [IMPORT, AUTOLABEL, TRAIN, MODELS]
+    [IMPORT, AUTOLABEL, REFINE, TRAIN, MODELS]
         .into_iter()
         .find(|t| field == Some(*t))
         .unwrap_or(default)
@@ -483,8 +485,9 @@ pub(super) fn export_row(dir: &Path) -> ExportRow {
 pub(super) const fn task_tab(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Import => IMPORT,
-        // A dataset check gets its own tab later; until then it shows with the auto-label jobs.
-        TaskKind::Autolabel | TaskKind::Overlaps | TaskKind::Refine => AUTOLABEL,
+        // The overlap check is started from Review and shows with the auto-label jobs.
+        TaskKind::Autolabel | TaskKind::Overlaps => AUTOLABEL,
+        TaskKind::Refine => REFINE,
     }
 }
 
@@ -709,6 +712,24 @@ struct DatasetTabTemplate {
     coverage_cameras: Vec<String>,
     coverage_other: bool,
     coverage_scenes: [&'static str; 3],
+    /// "Size floor: ..." when `collect.size_floor` is saved: the export leaves such objects out.
+    size_floor_line: Option<String>,
+}
+
+/// The export card's line about the saved size floor (`collect.size_floor`): an export writes the
+/// objects under it as ignore regions (X-AnyLabeling keeps them as boxes). None for no floor or
+/// one that is off. The pixels print as the Refine tab prints them (`RefineFloor.phrase`): two
+/// decimals at most, the f32's tail dropped.
+fn size_floor_line(floor: Option<crate::collect::labels::SizeFloor>) -> Option<String> {
+    let f = floor.filter(crate::collect::labels::SizeFloor::is_on)?;
+    let px = format!("{:.2}", f.px);
+    let px = px.trim_end_matches('0').trim_end_matches('.');
+    Some(format!(
+        "Size floor: objects under {px} px at {} are exported as ignore regions (out of the YOLO \
+         labels, listed in ignore.json, marked difficult in COCO), while the X-AnyLabeling format \
+         keeps them as boxes.",
+        f.input
+    ))
 }
 
 /// `GET /train/dataset`.
@@ -744,6 +765,7 @@ pub(super) async fn dataset_page(State(state): State<Arc<AppState>>) -> Response
             coverage_cameras: cameras,
             coverage_other: other,
             coverage_scenes: SCENES,
+            size_floor_line: size_floor_line(config.collect.size_floor),
         })
     })
     .await
@@ -1018,9 +1040,29 @@ mod tests {
     fn the_jobs_forms_land_on_their_tab() {
         assert_eq!(jobs_tab(Some("import"), TRAIN), IMPORT);
         assert_eq!(jobs_tab(Some("models"), TRAIN), MODELS);
+        assert_eq!(jobs_tab(Some("refine"), TRAIN), REFINE);
         assert_eq!(jobs_tab(None, MODELS), MODELS);
         assert_eq!(jobs_tab(Some("../x"), TRAIN), TRAIN);
         assert_eq!(jobs_tab(Some("review"), TRAIN), TRAIN);
+    }
+
+    #[test]
+    fn every_kind_of_task_has_its_tab() {
+        assert_eq!(task_tab(TaskKind::Import), IMPORT);
+        assert_eq!(task_tab(TaskKind::Autolabel), AUTOLABEL);
+        assert_eq!(task_tab(TaskKind::Overlaps), AUTOLABEL);
+        assert_eq!(task_tab(TaskKind::Refine), REFINE);
+        // The strip's job link opens the tab with the progress row.
+        let s = Summary {
+            job: Some(Job {
+                what: "A dataset check",
+                tab: task_tab(TaskKind::Refine),
+                paused: false,
+            }),
+            ..counted()
+        };
+        let n = next_step(&s);
+        assert_eq!(n.link, "/train/refine#jobs");
     }
 
     #[test]
@@ -1080,11 +1122,12 @@ mod tests {
     }
 
     /// The tabs' URLs as a server sees them.
-    const PAGES: [(&str, &str); 8] = [
+    const PAGES: [(&str, &str); 9] = [
         ("/train/collect", "collect"),
         ("/train/import", "import"),
         ("/train/autolabel", "autolabel"),
         ("/train/review", "review"),
+        ("/train/refine", "refine"),
         ("/train/dataset", "dataset"),
         ("/train/train", "train"),
         ("/train/models", "models"),
@@ -1120,6 +1163,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_size_floor_line_names_the_floor_or_is_absent() {
+        use crate::collect::labels::SizeFloor;
+        let line = |px: f32, input: u32| size_floor_line(Some(SizeFloor { px, input }));
+        assert_eq!(
+            line(10.0, 384).as_deref(),
+            Some(
+                "Size floor: objects under 10 px at 384 are exported as ignore regions (out of the \
+                 YOLO labels, listed in ignore.json, marked difficult in COCO), while the \
+                 X-AnyLabeling format keeps them as boxes."
+            )
+        );
+        // The f32's tail is dropped, as the Refine tab prints it.
+        assert!(line(7.3, 640).unwrap().contains("under 7.3 px at 640"));
+        assert!(line(7.25, 640).unwrap().contains("under 7.25 px at 640"));
+        assert_eq!(size_floor_line(None), None);
+        assert_eq!(line(0.0, 384), None, "a floor that is off says nothing");
+        assert_eq!(line(10.0, 0), None);
+    }
+
+    #[tokio::test]
+    async fn the_export_card_has_the_open_suggestions_line_and_the_saved_floor() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let (s, html) = get_text(&state, "/train/dataset").await;
+        assert_eq!(s, StatusCode::OK);
+        // The line is there for the script to fill, hidden, before the Export button; no floor,
+        // no floor line.
+        let open = html.find("id=\"export-open\"").expect("open line");
+        let button = html
+            .find("<button type=\"submit\">Export</button>")
+            .unwrap();
+        assert!(open < button);
+        assert!(html[open..button].contains("hidden"));
+        assert!(!html.contains("id=\"export-size-floor\""));
+        assert!(!html.contains("Size floor:"));
+        // A saved floor shows, before the button too.
+        let dir2 = scratch();
+        let state = {
+            let dir = dir2.clone();
+            test_state_with(move |c| {
+                c.download_dir = Some(dir.clone());
+                c.collect.dir = Some(dir.join("dataset"));
+                c.training.dir = Some(dir.join("training"));
+                c.collect.size_floor = Some(crate::collect::labels::SizeFloor {
+                    px: 10.0,
+                    input: 384,
+                });
+            })
+        };
+        let (_, html) = get_text(&state, "/train/dataset").await;
+        let at = html.find("id=\"export-size-floor\"").expect("floor line");
+        let button = html
+            .find("<button type=\"submit\">Export</button>")
+            .unwrap();
+        assert!(at < button);
+        assert!(html.contains(
+            "Size floor: objects under 10 px at 384 are exported as ignore regions (out of the \
+             YOLO labels, listed in ignore.json, marked difficult in COCO), while the \
+             X-AnyLabeling format keeps them as boxes."
+        ));
+        assert!(html.contains("/static/train-dataset.js?v="));
+    }
     async fn status_and_location(state: &Arc<AppState>, url: &str) -> (StatusCode, String) {
         let (s, h, _) = call(state, Request::get(url).body(Body::empty()).unwrap()).await;
         let at = h
@@ -1246,7 +1352,7 @@ mod tests {
     async fn each_tab_holds_its_own_content() {
         let dir = scratch();
         let state = state_in(&dir);
-        let cases: [(&str, &[&str], &[&str]); 7] = [
+        let cases: [(&str, &[&str], &[&str]); 8] = [
             (
                 "/train/collect",
                 &["action=\"/dataset/settings\"", "name=\"enabled\""],
@@ -1276,6 +1382,16 @@ mod tests {
                     "id=\"rv-classes\"",
                     "id=\"jobs\"",
                 ],
+            ),
+            (
+                "/train/refine",
+                &[
+                    "id=\"refine-form\"",
+                    "id=\"refine-findings\"",
+                    "id=\"refine-coverage\"",
+                    "id=\"jobs\"",
+                ],
+                &["id=\"rv-canvas\"", "id=\"autolabel-form\""],
             ),
             (
                 "/train/dataset",

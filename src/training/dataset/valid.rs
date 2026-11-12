@@ -18,7 +18,16 @@ struct ValidGroup {
     frames: Vec<FrameRef>,
     /// Boxes per run class.
     boxes: Vec<usize>,
+    /// Its frames with ignore regions: no validation frame, and out of training when the day
+    /// validates ([`ValidSplit::dropped`]).
+    held: Vec<FrameRef>,
+    /// Boxes per run class of `held`: training loses them with the day.
+    lost: Vec<usize>,
 }
+
+/// What [`whole_groups`] picked: the validation frames, the sorted group keys, and the frames with
+/// ignore regions of those groups ([`ValidSplit::dropped`]).
+type Picked = (Vec<FrameRef>, Vec<String>, Vec<FrameRef>);
 
 /// What [`pick_valid_groups`] chose.
 pub(super) struct ValidSplit {
@@ -28,6 +37,10 @@ pub(super) struct ValidSplit {
     pub(super) groups: Vec<String>,
     /// Why validation fell back to the frame split, when the user can do something about it.
     pub(super) warning: Option<String>,
+    /// Frames of the pool with ignore regions on the camera days chosen (sorted): never validation
+    /// frames (validation cannot ignore a region), and the day is validation's, so they leave
+    /// training too. Empty after the frame split, where such frames simply train.
+    pub(super) dropped: Vec<FrameRef>,
 }
 
 /// Step 6 of [`super::plan`]: the validation split, for the trainer's checkpoint choice.
@@ -42,6 +55,11 @@ pub(super) struct ValidSplit {
 /// see overfitting. When that does not work out, the frames are picked one by one by seeded rank
 /// (never a frame holding the last training box of a class), with a warning; public-only pools
 /// do that silently, nothing about them can be improved.
+///
+/// A frame of `pool` with ignore regions (there with [`super::IgnoreMode::Background`]) is never a
+/// candidate: the trainer's validation cannot ignore a region. It goes with its camera day: when
+/// the day validates, it leaves training too ([`ValidSplit::dropped`]); after the frame split it
+/// trains.
 pub(super) fn pick_valid_groups(
     sources: &[Source],
     pool: &[FrameRef],
@@ -49,14 +67,23 @@ pub(super) fn pick_valid_groups(
     classes: &[String],
 ) -> ValidSplit {
     let frame = |r: FrameRef| sources.get(r.0).and_then(|s| s.frames.get(r.1));
-    let mut cands: Vec<FrameRef> = pool
+    // A frame with ignore regions (in the pool with `IgnoreMode::Background`) never validates.
+    let regions = |r: &FrameRef| frame(*r).is_some_and(|f| !f.ignore.is_empty());
+    let eligible: Vec<FrameRef> = pool.iter().copied().filter(|r| !regions(r)).collect();
+    let mut cands: Vec<FrameRef> = eligible
         .iter()
         .copied()
         .filter(|r| sources.get(r.0).is_some_and(|s| s.public.is_none()))
         .collect();
     let public_only = cands.is_empty();
+    // Own frames in the pool, every one with ignore regions: validation falls to the public ones.
+    let own_all_regions = public_only
+        && !eligible.is_empty()
+        && pool
+            .iter()
+            .any(|r| sources.get(r.0).is_some_and(|s| s.public.is_none()));
     if public_only {
-        cands = pool.to_vec();
+        cands = eligible;
     }
     let n_val = if cands.len() >= 2 {
         let wanted = share_of(cands.len(), opts.val_share).max(opts.min_valid.min(cands.len() / 4));
@@ -84,16 +111,33 @@ pub(super) fn pick_valid_groups(
                 key,
                 frames: Vec::new(),
                 boxes: vec![0; classes.len()],
+                held: Vec::new(),
+                lost: vec![0; classes.len()],
             });
             g.frames.push(r);
             for (t, n) in g.boxes.iter_mut().zip(boxes_of(r)) {
                 *t += n;
             }
         }
+        // Frames with regions go with their day (a day of nothing but them is no group: it
+        // validates nothing, so it trains).
+        for r in pool.iter().copied().filter(|r| regions(r)) {
+            let Some(g) = frame(r).and_then(|f| groups.get_mut(&group_key(f))) else {
+                continue;
+            };
+            g.held.push(r);
+            for (t, n) in g.lost.iter_mut().zip(boxes_of(r)) {
+                *t += n;
+            }
+        }
         whole_groups(groups, opts.seed, n_val, cands.len(), &pool_boxes).map_err(Some)
     };
+    let mut dropped = Vec::new();
     let (mut frames, groups, warning) = match by_groups {
-        Ok((frames, groups)) => (frames, groups, None),
+        Ok((frames, groups, held)) => {
+            dropped = held;
+            (frames, groups, None)
+        }
         Err(warning) => {
             cands.sort_by_cached_key(|&r| {
                 let key = sources
@@ -122,10 +166,21 @@ pub(super) fn pick_valid_groups(
         }
     };
     frames.sort_unstable();
+    dropped.sort_unstable();
+    let warning = warning.or_else(|| {
+        own_all_regions.then(|| {
+            "every training frame of your own shows an unsure or too-small object (an ignore \
+             region), and validation cannot ignore one: the trainer validates on the public frames \
+             only, so its best epoch is picked for them, not your cameras; review frames without \
+             such objects, or turn the size floor down"
+                .to_string()
+        })
+    });
     ValidSplit {
         frames,
         groups,
         warning,
+        dropped,
     }
 }
 
@@ -134,8 +189,9 @@ pub(super) fn pick_valid_groups(
 /// for [`pick_valid_groups`]'s fallback.
 ///
 /// Groups go by seeded rank, those adding a class not yet in validation first. A group is
-/// skipped when validation would then hold more than half of a class's boxes (a rare class stays
-/// in training, and so does its last box). Groups rarely add up to `n_val`: the first pass
+/// skipped when training would then lose more than half of a class's boxes (to validation, or with
+/// the group's frames with ignore regions, [`ValidGroup::lost`]: a rare class stays in training,
+/// and so does its last box). Groups rarely add up to `n_val`: the first pass
 /// accepts a group while the total stays within 1.5 x `n_val`, the second, when that fell short,
 /// within `max(n_val, cands / 4)`. That cap is below the first pass on pools under 300 frames,
 /// where one whole day may then pass a quarter of the pool (at most 37.5%): better than a split
@@ -147,7 +203,7 @@ fn whole_groups(
     n_val: usize,
     cands: usize,
     pool_boxes: &[usize],
-) -> Result<(Vec<FrameRef>, Vec<String>), String> {
+) -> Result<Picked, String> {
     const FRAME_SPLIT: &str = "validation is split frame by frame, so it shares camera days with \
                                training and its mAP reads optimistic";
     by_key.remove(&format!("{UNKNOWN}/{UNKNOWN}"));
@@ -172,16 +228,20 @@ fn whole_groups(
     let cap = n_val.max(cands / 4);
     let mut frames: Vec<FrameRef> = Vec::new();
     let mut keys: Vec<String> = Vec::new();
+    let mut held: Vec<FrameRef> = Vec::new();
     let mut in_valid = vec![0usize; pool_boxes.len()];
+    // Boxes training loses: validation's and those of the chosen days' frames with regions.
+    let mut gone = vec![0usize; pool_boxes.len()];
     for limit in [n_val * 3 / 2, cap] {
         while frames.len() < n_val {
             let fits = |g: &ValidGroup| {
                 frames.len() + g.frames.len() <= limit
                     && g.boxes
                         .iter()
-                        .zip(&in_valid)
+                        .zip(&g.lost)
+                        .zip(&gone)
                         .zip(pool_boxes)
-                        .all(|((n, v), all)| *n == 0 || 2 * (v + n) <= *all)
+                        .all(|(((n, l), v), all)| n + l == 0 || 2 * (v + n + l) <= *all)
             };
             let adds_class = |g: &ValidGroup| {
                 g.boxes
@@ -198,7 +258,11 @@ fn whole_groups(
             for (v, n) in in_valid.iter_mut().zip(&g.boxes) {
                 *v += n;
             }
+            for ((v, n), l) in gone.iter_mut().zip(&g.boxes).zip(&g.lost) {
+                *v += n + l;
+            }
             frames.extend(g.frames);
+            held.extend(g.held);
             keys.push(g.key);
         }
     }
@@ -218,7 +282,7 @@ fn whole_groups(
         ));
     }
     keys.sort_unstable();
-    Ok((frames, keys))
+    Ok((frames, keys, held))
 }
 
 /// Where validation came from, for the logs (None after the frame split).

@@ -2,14 +2,27 @@
 //! [`super::select`], one flushed JSONL line per finished crop (`@overlaps` events carry the
 //! progress). The answers ([`read_results`]) are detections only; every decision is the service's
 //! ([`crate::collect::labels::overlaps`]).
+//!
+//! The dataset check's closer look at loose labels ([`crate::training::refine::tighten`]) runs the
+//! same script on its own crops: [`prepare`] (the environment, the script's self-check, RF-DETR L's
+//! weights) and [`run`] (the script, its progress, how it ended) serve both.
 
+use super::NEEDED_COMMIT_GB;
 use super::select::{Crop, Selected};
+use crate::backend::memory::Commit;
 use crate::collect::labels::overlaps::{Det, ZOOM_FLOOR, ZOOM_PAD};
-use anyhow::{Context, Result};
+use crate::resources::catalog::Platform;
+use crate::resources::export::train::{self as env, TrainPaths};
+use crate::training::capability::Accelerator;
+use crate::training::pyenv::{self, check, is_cancel, stage};
+use crate::training::task::{TaskContext, TaskReport};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// Event tag of the script in this mode.
 pub const TAG: &str = "overlaps";
@@ -28,6 +41,23 @@ struct ZoomLine {
     id: usize,
     #[serde(default)]
     boxes: Option<Vec<Det>>,
+    /// The crop the script cut (`crop_box`: the union padded by `--zoom-pad`, clamped to the image,
+    /// whole pixels), with the boxes.
+    #[serde(default)]
+    crop: Option<[f64; 4]>,
+    /// The image's size `[w, h]`, with the boxes.
+    #[serde(default)]
+    size: Option<[u32; 2]>,
+}
+
+/// Where a crop's answer came from ([`read_answers`]): the crop the script cut and the image's
+/// size, both in the script's line beside the boxes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CropPlace {
+    /// `[x0, y0, x1, y1]` in frame pixels.
+    pub crop: [f64; 4],
+    /// `[w, h]` of the image the script read.
+    pub size: [u32; 2],
 }
 
 /// What a crop answered.
@@ -79,6 +109,163 @@ pub fn args(
     ])
 }
 
+/// Where and how the script runs: the training environment and the GPU of the job.
+#[derive(Debug, Clone, Copy)]
+pub struct Helper<'a> {
+    pub paths: &'a TrainPaths,
+    pub platform: Platform,
+    pub accelerator: &'a Accelerator,
+    pub timeout: Duration,
+}
+
+/// Why `free` cannot hold the script (`what` needs it: "the overlap check", ...), or None (enough,
+/// or off Windows: no fixed limit). Measured: [`NEEDED_COMMIT_GB`].
+pub fn commit_problem(what: &str, free: Option<Commit>) -> Option<String> {
+    let needed = NEEDED_COMMIT_GB * 1024.0 * 1024.0 * 1024.0;
+    let have = free?.available as f64;
+    (have < needed).then(|| {
+        format!(
+            "{what} needs about {NEEDED_COMMIT_GB} GB of free commit for PyTorch and RF-DETR L, \
+             and {:.1} GB is free: close programs or enlarge the paging file",
+            have / (1024.0 * 1024.0 * 1024.0)
+        )
+    })
+}
+
+/// The environment, the script's own check and RF-DETR L's weights (downloaded when missing, the
+/// large-download gate by `allow_large`), reported as stage `step` of `steps` named `name`; the
+/// script and the weights file.
+pub fn prepare(
+    h: &Helper<'_>,
+    allow_large: bool,
+    ctx: TaskContext<'_>,
+    report: &mut dyn FnMut(TaskReport<'_>),
+    (name, step, steps): (&str, usize, usize),
+    cancel: &AtomicBool,
+) -> Result<(PathBuf, PathBuf)> {
+    pyenv::setup(
+        h.paths,
+        h.platform,
+        h.accelerator,
+        ctx.runner,
+        ctx.fetcher,
+        report,
+        (name, step, steps),
+        cancel,
+    )?;
+    let (_, script) = env::write_task_scripts(h.paths)?;
+    stage(report, name, step, steps, 90, "checking the auto-labeler");
+    pyenv::self_check(ctx.runner, h.paths, h.platform, &script, report, cancel)?;
+    check(cancel)?;
+    let weights = [super::rfdetr_weights(h.paths)?];
+    pyenv::check_large(&weights, allow_large)?;
+    pyenv::fetch_missing(ctx.fetcher, &weights, report, (name, step, steps), cancel)?;
+    let [(res, dir)] = weights;
+    let file = res
+        .parts
+        .first()
+        .ok_or_else(|| anyhow!("RF-DETR L has no file"))?
+        .file_name;
+    Ok((script, dir.join(file)))
+}
+
+/// How a [`run`] ended. The finished crops are in `out` whichever way.
+#[derive(Debug)]
+pub struct Ran {
+    /// Stopped by Cancel.
+    pub stopped: bool,
+    /// The failure that stopped it.
+    pub failed: Option<anyhow::Error>,
+    /// The script's output (`zoom.jsonl` in the work folder).
+    pub out: PathBuf,
+}
+
+/// Run the script on the crops of `frames` (`total` of them) in `work` (`crops.jsonl`, `zoom.jsonl`),
+/// RF-DETR L at `weights` seeing `classes`, reporting stage `step` of `steps` named `name` ("RF-DETR
+/// L loaded", "i of N crops"). An error only when the work folder or the crop list cannot be
+/// written; the script's own end is in [`Ran`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper, the work, the model and its classes, the report and its stage, cancel"
+)]
+pub fn run(
+    h: &Helper<'_>,
+    work: &Path,
+    script: &Path,
+    weights: &Path,
+    classes: &[String],
+    frames: &[Selected],
+    total: usize,
+    ctx: TaskContext<'_>,
+    report: &mut dyn FnMut(TaskReport<'_>),
+    (name, step, steps): (&str, usize, usize),
+    cancel: &AtomicBool,
+) -> Result<Ran> {
+    std::fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
+    let list = work.join("crops.jsonl");
+    std::fs::write(&list, crop_list(frames)?)
+        .with_context(|| format!("writing {}", list.display()))?;
+    let out = work.join("zoom.jsonl");
+    let mut cmd = vec![script.as_os_str().to_owned()];
+    cmd.extend(args(
+        &list,
+        &out,
+        weights,
+        classes,
+        &h.accelerator.device_arg(),
+    )?);
+    let mut done_ev = false;
+    let ran = pyenv::run_script(
+        ctx.runner,
+        h.paths,
+        h.platform,
+        work,
+        h.timeout,
+        cmd,
+        TAG,
+        &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
+            Some("crop") => {
+                let i = ev
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let pct =
+                    u8::try_from(i * 100 / u64::try_from(total.max(1)).unwrap_or(1)).unwrap_or(100);
+                stage(
+                    report,
+                    name,
+                    step,
+                    steps,
+                    pct.min(99),
+                    &format!("{i} of {total} crops"),
+                );
+            }
+            Some("model") => stage(report, name, step, steps, 0, "RF-DETR L loaded"),
+            Some("done") => done_ev = true,
+            _ => {}
+        },
+        report,
+        cancel,
+    );
+    let (stopped, failed) = match ran {
+        Err(e) if is_cancel(&e) => (true, None),
+        Err(e) => (false, Some(e.context("the zoom check failed"))),
+        Ok(()) if cancel.load(Ordering::Relaxed) => (true, None),
+        Ok(()) if !done_ev => (
+            false,
+            Some(anyhow!(
+                "the zoom check finished without its summary; the script is damaged"
+            )),
+        ),
+        Ok(()) => (false, None),
+    };
+    Ok(Ran {
+        stopped,
+        failed,
+        out,
+    })
+}
+
 /// The finished crops of `path` by id. `partial`: the run stopped (a cancel, a failure), so the file
 /// may be missing or end in a line cut short; that line is left out. Any other line that does not
 /// parse is a warning: its crop has no answer, and a rerun does it again.
@@ -87,6 +274,19 @@ pub fn read_results(
     partial: bool,
     warnings: &mut Vec<String>,
 ) -> Result<BTreeMap<usize, CropResult>> {
+    Ok(read_answers(path, partial, warnings)?
+        .into_iter()
+        .map(|(id, (r, _))| (id, r))
+        .collect())
+}
+
+/// [`read_results`] with where each answer's crop lay ([`CropPlace`]; None when the line does not
+/// say, as for an unreadable frame).
+pub fn read_answers(
+    path: &Path,
+    partial: bool,
+    warnings: &mut Vec<String>,
+) -> Result<BTreeMap<usize, (CropResult, Option<CropPlace>)>> {
     let text = match std::fs::read_to_string(path) {
         Err(e) if partial && e.kind() == std::io::ErrorKind::NotFound => String::new(),
         t => t.with_context(|| format!("reading {}", path.display()))?,
@@ -96,9 +296,16 @@ pub fn read_results(
     for (i, line) in lines.iter().enumerate() {
         match serde_json::from_str::<ZoomLine>(line) {
             Ok(z) => {
+                let place = match (z.crop, z.size) {
+                    (Some(crop), Some(size)) => Some(CropPlace { crop, size }),
+                    _ => None,
+                };
                 out.insert(
                     z.id,
-                    z.boxes.map_or(CropResult::Unreadable, CropResult::Boxes),
+                    (
+                        z.boxes.map_or(CropResult::Unreadable, CropResult::Boxes),
+                        place,
+                    ),
                 );
             }
             Err(_) if partial && i + 1 == lines.len() => {}
@@ -136,6 +343,25 @@ mod tests {
         // A bad line in a finished run: a warning.
         read_results(&p, false, &mut warnings).unwrap();
         assert_eq!(warnings.len(), 1);
+        // The crop and the image's size of the script's line are kept with the answer.
+        std::fs::write(
+            &p,
+            "{\"id\":3,\"frame\":\"f\",\"crop\":[8,9,22,30],\"size\":[100,80],\"boxes\":[]}\n\
+             {\"id\":4,\"frame\":\"f\",\"boxes\":[]}\n",
+        )
+        .unwrap();
+        let got = read_answers(&p, false, &mut warnings).unwrap();
+        assert_eq!(
+            got[&3],
+            (
+                CropResult::Boxes(vec![]),
+                Some(CropPlace {
+                    crop: [8.0, 9.0, 22.0, 30.0],
+                    size: [100, 80]
+                })
+            )
+        );
+        assert_eq!(got[&4], (CropResult::Boxes(vec![]), None));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

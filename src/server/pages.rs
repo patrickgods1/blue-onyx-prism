@@ -69,6 +69,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("training.js", JS),
     asset!("train-area.js", JS),
     asset!("train-dataset.js", JS),
+    asset!("train-refine.js", JS),
     asset!("train-metrics.js", JS),
     asset!("browse.js", JS),
     asset!("class-picker.js", JS),
@@ -1729,6 +1730,9 @@ mod tests {
         assert!(review.contains("id=\"rv-label-picker\""));
         assert!(review.contains("id=\"rv-show-picker\""));
         assert!(review.contains("<option value=\"both\">found by 2+ labelers</option>"));
+        // The dataset check's suggestions (auto=refine; the Refine tab links here with a kind).
+        assert!(review.contains("<option value=\"refine\">dataset check suggestions</option>"));
+        assert!(review.contains("<select name=\"refine_kind\">"));
         let (_, dataset) = get_text(&state, "/train/dataset").await;
         assert!(dataset.contains("id=\"rv-classes-picker\""));
         let (_, import) = get_text(&state, "/train/import").await;

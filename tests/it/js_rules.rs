@@ -13,9 +13,10 @@
 use blue_onyx_prism::collect::labels::bulk::Wanted;
 use blue_onyx_prism::collect::labels::overlaps::{self, Suggestion, Verdict};
 use blue_onyx_prism::collect::labels::{
-    AutoInfo, BoxState, LabelBox, LabelFile, Origin, ParkedMark, RejectReason, Source, Status,
-    Triage, repeats, resolve_pending, spots, stacks,
+    self, AutoInfo, BoxState, LabelBox, LabelFile, Origin, ParkedMark, RejectReason, Source,
+    Status, Triage, refine, repeats, resolve_pending, spots, stacks,
 };
+use blue_onyx_prism::model::coco;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1062,6 +1063,628 @@ process.stdout.write(JSON.stringify(
     assert_eq!(got, json!(want));
 }
 
+/// The dataset check's twins on one frame each: `liveRefine`, `refineStrength`, `acceptRefine` of
+/// every live suggestion (with what is live after it), `acceptRefine` of every other index, and
+/// `dismissRefine` of every index and one past the end. `process.argv` as [`DRIVER`].
+const REFINE_DRIVER: &str = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const clone = (v) => JSON.parse(JSON.stringify(v));
+const out = req.cases.map((c) => {
+  const classes = c.wanted ? req.classes : null;
+  const hidden = c.wanted ? req.hidden : null;
+  const labels = c.labels;
+  const list = labels.refine || [];
+  const live = R.liveRefine(labels, classes, hidden);
+  const accepted = live.map((l) => {
+    const copy = clone(labels);
+    const ok = R.acceptRefine(copy, l.index, classes, hidden);
+    return { index: l.index, ok: ok, labels: copy, after: R.liveRefine(copy, classes, hidden) };
+  });
+  const refused = list.map((_, i) => i).filter((i) => !live.some((l) => l.index === i)).map((i) => {
+    const copy = clone(labels);
+    const ok = R.acceptRefine(copy, i, classes, hidden);
+    return ok || JSON.stringify(copy) !== JSON.stringify(labels);
+  });
+  const dismissed = list.concat([null]).map((_, i) => {
+    const copy = clone(labels);
+    const ok = R.dismissRefine(copy, i);
+    return { ok: ok, labels: copy };
+  });
+  return {
+    live: live,
+    strengths: list.map(R.refineStrength),
+    accepted: accepted,
+    refused: refused,
+    dismissed: dismissed,
+  };
+});
+console.log(JSON.stringify({
+  constants: {
+    MATCH_IOU: R.MATCH_IOU,
+    COVER_IOU: R.COVER_IOU,
+    COVER_INSIDE: R.COVER_INSIDE,
+    MAX_BOXES: R.MAX_BOXES,
+    MAX_LABEL_LEN: R.MAX_LABEL_LEN,
+    REFINE_REASON: R.REFINE_REASON,
+    COCO_NAMES: R.COCO_NAMES,
+    COCO_ALIASES: R.COCO_ALIASES,
+  },
+  cases: out,
+}));
+"#;
+
+/// One entry of `refine_live` (`GET /v1/review/labels`) and of `liveRefine`, numbers as the f32
+/// they are in the file. Every field named: [`same_fields`] holds the key sets equal, so a field
+/// renamed or dropped on either side fails rather than reading as null.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefineLive {
+    index: usize,
+    kind: String,
+    target: Option<[f32; 4]>,
+    target_label: Option<String>,
+    bbox: Option<[f32; 4]>,
+    label: Option<String>,
+    score: Option<f32>,
+    why: String,
+    spot: Option<String>,
+    run: String,
+    target_box: Option<usize>,
+    replaces: Vec<usize>,
+}
+
+/// [`refine::live`] as the route serves it: [`refine::live_json`], the builder
+/// `GET /v1/review/labels` calls for `refine_live`.
+fn rust_refine_live(f: &LabelFile, w: Option<&Wanted<'_>>) -> Vec<RefineLive> {
+    serde_json::from_value(Value::Array(refine::live_json(f, w))).unwrap()
+}
+
+/// The keys of each entry of `refine_live` for `f` equal those of the page's `liveRefine`
+/// (`js`), entry by entry.
+fn same_fields(f: &LabelFile, w: Option<&Wanted<'_>>, js: &Value, what: &str) {
+    let keys = |v: &Value| -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    let route = refine::live_json(f, w);
+    let page = js.as_array().unwrap();
+    assert_eq!(route.len(), page.len(), "{what}");
+    for (r, p) in route.iter().zip(page) {
+        assert_eq!(
+            keys(r),
+            keys(p),
+            "{what}: the fields of refine_live and liveRefine"
+        );
+    }
+}
+
+fn js_refine_live(v: &Value) -> Vec<RefineLive> {
+    serde_json::from_value(v.clone()).unwrap()
+}
+
+const REFINE_CLASSES: [&str; 9] = [
+    "person",
+    "car",
+    "truck",
+    "bus",
+    "van",
+    "dog",
+    "cat",
+    "motorcycle",
+    "potted plant",
+];
+
+/// Box labels: the list's spellings, other cases, white space, aliases, a hidden class, a class of
+/// no list.
+const REFINE_LABELS: [&str; 16] = [
+    "car",
+    "car",
+    "Car",
+    " truck",
+    "bus",
+    "van",
+    "person",
+    "person",
+    "PERSON",
+    "dog",
+    "cat",
+    "motorbike",
+    "motorcycle",
+    "pottedplant",
+    "clock",
+    "dog\u{2003}",
+];
+
+fn refine_box(r: &mut Rng, bbox: [f32; 4], label: &str) -> LabelBox {
+    let mut b = fresh_box(r, bbox, label);
+    if b.state == BoxState::Rejected {
+        // Every kind of reject: unjudged ones a found object may replace, judged ones that block
+        // the place, ignore regions that cover it.
+        b.reason = r
+            .pick(&[
+                None,
+                Some("low_score"),
+                Some("low_score"),
+                Some("auto_dismissed"),
+                Some("spot_dismissed"),
+                Some("size_floor"),
+                Some("duplicate"),
+                Some("repeat_spot"),
+                Some("night_threshold"),
+            ])
+            .map(String::from);
+        b.reject_reason = match r.below(6) {
+            3 => Some(RejectReason::TooSmall),
+            4 => Some(RejectReason::FalsePositive),
+            5 => Some(RejectReason::Duplicate),
+            _ => None,
+        };
+    }
+    b
+}
+
+/// `label` as a check may have written the target's label: as is, in another case, padded.
+fn respelled(r: &mut Rng, label: &str) -> String {
+    match r.below(3) {
+        0 => label.to_string(),
+        1 => label.to_ascii_uppercase(),
+        _ => format!(" {label} "),
+    }
+}
+
+fn refine_suggestion(r: &mut Rng, boxes: &[LabelBox]) -> refine::Suggestion {
+    let kind = r.pick(&[
+        refine::Kind::Add,
+        refine::Kind::Add,
+        refine::Kind::Add,
+        refine::Kind::Tighten,
+        refine::Kind::Tighten,
+        refine::Kind::Relabel,
+        refine::Kind::Relabel,
+        refine::Kind::Verify,
+        refine::Kind::Verify,
+        refine::Kind::Unknown,
+    ]);
+    let rejected: Vec<&LabelBox> = boxes
+        .iter()
+        .filter(|b| b.state == BoxState::Rejected)
+        .collect();
+    // An add mostly where a box was rejected: a place it may take, or one a reviewer judged.
+    let on = if kind == refine::Kind::Add && !rejected.is_empty() && r.chance(60) {
+        Some(rejected[r.below(rejected.len())].clone())
+    } else {
+        (!boxes.is_empty() && r.chance(85)).then(|| boxes[r.below(boxes.len())].clone())
+    };
+    let target = on.as_ref().map_or_else(|| fresh_bbox(r), |b| b.bbox);
+    let target_label = match (&on, r.below(10)) {
+        (Some(b), 0..=3) => Some(respelled(r, &b.label)),
+        (_, 4) => Some(r.pick(&REFINE_LABELS).to_string()),
+        _ => None,
+    };
+    let add = kind == refine::Kind::Add;
+    refine::Suggestion {
+        kind,
+        target: (!add).then_some(target),
+        target_label: if add { None } else { target_label },
+        bbox: match kind {
+            refine::Kind::Add | refine::Kind::Tighten | refine::Kind::Unknown => {
+                Some(bbox_near(r, target))
+            }
+            _ => None,
+        },
+        label: match (kind, &on) {
+            (refine::Kind::Add, Some(b)) if r.chance(60) => Some(respelled(r, &b.label)),
+            (refine::Kind::Add | refine::Kind::Relabel, _) => {
+                Some(r.pick(&REFINE_LABELS).to_string())
+            }
+            _ => None,
+        },
+        score: r.chance(85).then(|| tenth(r.range(0.0, 1.0))),
+        why: "generated".to_string(),
+        spot: r.chance(20).then(|| "gate:12".to_string()),
+        answer: r
+            .chance(12)
+            .then(|| r.pick(&[refine::Answer::Dismissed, refine::Answer::Kept])),
+        run: "r1".to_string(),
+    }
+}
+
+fn refine_frame(r: &mut Rng) -> LabelFile {
+    let n = r.below(8);
+    let mut boxes: Vec<LabelBox> = Vec::with_capacity(n + 1);
+    for _ in 0..n {
+        let near = (!boxes.is_empty() && r.chance(70)).then(|| boxes[r.below(boxes.len())].clone());
+        let (bbox, label) = match &near {
+            Some(b) => {
+                let label = if r.chance(60) {
+                    b.label.clone()
+                } else {
+                    r.pick(&REFINE_LABELS).to_string()
+                };
+                (bbox_near(r, b.bbox), label)
+            }
+            None => (fresh_bbox(r), r.pick(&REFINE_LABELS).to_string()),
+        };
+        boxes.push(refine_box(r, bbox, &label));
+    }
+    // Rejects no reviewer judged, stacked on one object: an add takes the closest one's place.
+    if r.chance(30) {
+        let base = fresh_bbox(r);
+        let label = r.pick(&["car", "person", "dog", "truck"]);
+        for _ in 0..2 + r.below(2) {
+            let bbox = bbox_near(r, base);
+            let mut b = refine_box(r, bbox, label);
+            b.state = BoxState::Rejected;
+            b.reject_reason = None;
+            b.reason = Some(r.pick(&["low_score", "auto_dismissed"]).to_string());
+            let at = r.below(boxes.len() + 1);
+            boxes.insert(at, b);
+        }
+    }
+    // Two boxes of different objects at one position: only `target_label` tells them apart.
+    if !boxes.is_empty() && r.chance(20) {
+        let mut twin = boxes[r.below(boxes.len())].clone();
+        twin.label = r.pick(&["dog", "person", "truck"]).to_string();
+        twin.state = BoxState::Accepted;
+        twin.source = Source::Auto;
+        twin.orig_bbox = None;
+        twin.model_label = None;
+        let at = r.below(boxes.len() + 1);
+        boxes.insert(at, twin);
+    }
+    let refine: Vec<refine::Suggestion> = (0..1 + r.below(5))
+        .map(|_| refine_suggestion(r, &boxes))
+        .collect();
+    LabelFile {
+        status: r.pick(&[
+            Status::Reviewed,
+            Status::Reviewed,
+            Status::Reviewed,
+            Status::Unreviewed,
+            Status::Skipped,
+        ]),
+        empty_confirmed: r.chance(25),
+        overlaps_checked: r.chance(40),
+        boxes,
+        refine,
+        ..LabelFile::default()
+    }
+}
+
+/// A frame at [`MAX_BOXES`](blue_onyx_prism::collect::labels::MAX_BOXES): an add has no room
+/// unless it takes a reject's place.
+fn full_frame(with_reject: bool) -> LabelFile {
+    let tiny = |i: usize| {
+        let x = f32::from(u16::try_from(i % 40).unwrap()) * 10.0;
+        let y = f32::from(u16::try_from(i / 40).unwrap()) * 10.0;
+        LabelBox {
+            label: "person".to_string(),
+            bbox: [x, y, x + 5.0, y + 5.0],
+            source: Source::Auto,
+            score: Some(0.5),
+            state: BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: AutoInfo::default(),
+        }
+    };
+    let mut boxes: Vec<LabelBox> = (0..blue_onyx_prism::collect::labels::MAX_BOXES)
+        .map(tiny)
+        .collect();
+    let car = [600.0, 600.0, 700.0, 680.0];
+    if with_reject {
+        boxes[0] = LabelBox {
+            label: "car".to_string(),
+            bbox: car,
+            state: BoxState::Rejected,
+            reason: Some("low_score".to_string()),
+            ..tiny(0)
+        };
+    }
+    LabelFile {
+        status: Status::Reviewed,
+        boxes,
+        refine: vec![refine::Suggestion {
+            kind: refine::Kind::Add,
+            target: None,
+            target_label: None,
+            bbox: Some([601.0, 600.0, 700.0, 680.0]),
+            label: Some("car".to_string()),
+            score: Some(0.9),
+            why: String::new(),
+            spot: None,
+            answer: None,
+            run: String::new(),
+        }],
+        ..LabelFile::default()
+    }
+}
+
+#[test]
+fn the_refine_rules_agree_with_their_rust_twins() {
+    if !have_node() {
+        return;
+    }
+    let classes: Vec<String> = REFINE_CLASSES.map(String::from).to_vec();
+    let hidden: Vec<String> = vec!["CAT".to_string()];
+    let w = Wanted {
+        classes: &classes,
+        hidden: &hidden,
+    };
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut cases: Vec<(LabelFile, bool)> = (0..3000)
+        .map(|_| {
+            let f = refine_frame(&mut rng);
+            let wanted = rng.chance(80);
+            (f, wanted)
+        })
+        .collect();
+    cases.push((full_frame(false), true));
+    cases.push((full_frame(true), true));
+    let request: Vec<Value> = cases
+        .iter()
+        .map(|(f, wanted)| json!({"labels": f, "wanted": wanted}))
+        .collect();
+    let answer = node_with(
+        REFINE_DRIVER,
+        &json!({"classes": classes, "hidden": hidden, "cases": request}),
+    );
+    let answers = answer["cases"].as_array().unwrap();
+    assert_eq!(answers.len(), cases.len());
+
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (n, ((f, wanted), a)) in cases.iter().zip(answers).enumerate() {
+        let w = wanted.then_some(&w);
+        let live = rust_refine_live(f, w);
+        assert_eq!(js_refine_live(&a["live"]), live, "frame {n}: live {f:?}");
+        same_fields(f, w, &a["live"], &format!("frame {n}"));
+        let strengths: Vec<u32> = f.refine.iter().map(refine::strength).collect();
+        assert_eq!(
+            a["strengths"],
+            json!(strengths),
+            "frame {n}: strengths {:?}",
+            f.refine
+        );
+
+        for (accepted, l) in a["accepted"].as_array().unwrap().iter().zip(&live) {
+            let mut mine = f.clone();
+            assert!(refine::accept(&mut mine, l.index, w), "frame {n}");
+            assert_eq!(accepted["ok"], true, "frame {n}: accepting {}", l.index);
+            assert_eq!(
+                file_of(&accepted["labels"]),
+                mine,
+                "frame {n}: accepting {} ({}) of {f:?}",
+                l.index,
+                l.kind
+            );
+            assert_eq!(
+                js_refine_live(&accepted["after"]),
+                rust_refine_live(&mine, w),
+                "frame {n}: left after accepting {}",
+                l.index
+            );
+            *seen
+                .entry(match l.kind.as_str() {
+                    "add" => "add accepted",
+                    "tighten" => "tighten accepted",
+                    "relabel" => "relabel accepted",
+                    _ => "verify kept",
+                })
+                .or_default() += 1;
+            if l.replaces.len() >= 2 {
+                *seen.entry("add replaces two or more").or_default() += 1;
+            } else if l.replaces.len() == 1 {
+                *seen.entry("add replaces one").or_default() += 1;
+            }
+            if f.overlaps_checked && !mine.overlaps_checked {
+                *seen.entry("overlaps_checked ended").or_default() += 1;
+            }
+            if f.overlaps_checked && mine.overlaps_checked && l.kind != "verify" {
+                *seen.entry("overlaps_checked kept").or_default() += 1;
+            }
+            if f.empty_confirmed && l.kind == "add" {
+                *seen.entry("empty_confirmed ended").or_default() += 1;
+            }
+            if l.kind == "relabel"
+                && l.label.as_deref() != Some(mine.boxes[l.target_box.unwrap()].label.as_str())
+            {
+                *seen.entry("relabel to the list's spelling").or_default() += 1;
+            }
+            if l.index + 1 < f.refine.len() && l.kind != "verify" {
+                *seen.entry("indices shift after an accept").or_default() += 1;
+            }
+        }
+        assert_eq!(
+            a["accepted"].as_array().unwrap().len(),
+            live.len(),
+            "frame {n}"
+        );
+        // Every other index: refused, nothing changed, as in Rust.
+        let refused: Vec<usize> = (0..f.refine.len())
+            .filter(|i| !live.iter().any(|l| l.index == *i))
+            .collect();
+        for i in &refused {
+            let mut mine = f.clone();
+            assert!(!refine::accept(&mut mine, *i, w), "frame {n}: {i}");
+            assert_eq!(&mine, f);
+        }
+        assert_eq!(
+            a["refused"],
+            json!(vec![false; refused.len()]),
+            "frame {n}: an accept of a suggestion that is not live"
+        );
+        if !refused.is_empty() {
+            *seen.entry("not live").or_default() += 1;
+        }
+        for (i, d) in a["dismissed"].as_array().unwrap().iter().enumerate() {
+            let mut mine = f.clone();
+            let ok = refine::dismiss(&mut mine, i);
+            assert_eq!(d["ok"], ok, "frame {n}: dismissing {i}");
+            assert_eq!(file_of(&d["labels"]), mine, "frame {n}: dismissing {i}");
+            if ok {
+                *seen.entry("dismissed").or_default() += 1;
+            }
+        }
+
+        // What the frames reached.
+        for (key, hit) in [
+            ("live", !live.is_empty()),
+            (
+                "skipped",
+                f.status == Status::Skipped && !f.refine.is_empty(),
+            ),
+            ("no class list", w.is_none() && !live.is_empty()),
+            (
+                "answered",
+                f.refine.iter().any(refine::Suggestion::answered),
+            ),
+            (
+                "unknown kind",
+                f.refine.iter().any(|s| s.kind == refine::Kind::Unknown),
+            ),
+            (
+                "a target_label picks the second box",
+                live.iter().any(|l| {
+                    l.target_box
+                        .is_some_and(|t| f.boxes[..t].iter().any(|b| Some(b.bbox) == l.target))
+                }),
+            ),
+            (
+                "an alias or another spelling",
+                live.iter().any(|l| {
+                    l.label.as_deref().is_some_and(|x| {
+                        [
+                            "Car",
+                            " truck",
+                            "PERSON",
+                            "motorbike",
+                            "pottedplant",
+                            "dog\u{2003}",
+                        ]
+                        .contains(&x)
+                    })
+                }),
+            ),
+        ] {
+            if hit {
+                *seen.entry(key).or_default() += 1;
+            }
+        }
+        // A suggestion about an ignore region (an unsure box, a box rejected as too small) is
+        // never live: the check never judges one. An unsure box that is otherwise a target ends a
+        // suggestion that is live again once the mark is taken back.
+        for (i, s) in f.refine.iter().enumerate() {
+            if s.answered()
+                || !matches!(
+                    s.kind,
+                    refine::Kind::Tighten | refine::Kind::Relabel | refine::Kind::Verify
+                )
+            {
+                continue;
+            }
+            let names = |b: &LabelBox| {
+                s.target == Some(b.bbox)
+                    && s.target_label
+                        .as_deref()
+                        .is_none_or(|l| l.trim().eq_ignore_ascii_case(b.label.trim()))
+            };
+            let Some(at) = f.boxes.iter().position(|b| names(b) && b.is_ignore()) else {
+                continue;
+            };
+            if f.boxes.iter().any(|b| names(b) && !b.is_ignore()) {
+                continue; // another box it names may hold it live
+            }
+            assert!(
+                !live.iter().any(|l| l.index == i),
+                "frame {n}: suggestion {i} about an ignore region is live"
+            );
+            let b = &f.boxes[at];
+            if b.state == BoxState::Rejected && b.reject_reason == Some(RejectReason::TooSmall) {
+                *seen.entry("a target rejected as too small").or_default() += 1;
+            }
+            if b.difficult && b.is_training() {
+                *seen.entry("a target marked unsure").or_default() += 1;
+                let mut sure = f.clone();
+                sure.boxes[at].difficult = false;
+                if rust_refine_live(&sure, w).iter().any(|l| l.index == i) {
+                    *seen.entry("unsure ends a live suggestion").or_default() += 1;
+                }
+            }
+        }
+        // A hidden class or one of no list is never live with the list, and live without one.
+        if w.is_some()
+            && f.refine.iter().any(|s| {
+                !s.answered()
+                    && s.kind == refine::Kind::Add
+                    && s.label
+                        .as_deref()
+                        .is_some_and(|l| ["cat", "clock"].contains(&l))
+            })
+        {
+            *seen.entry("an add of an unwanted class").or_default() += 1;
+        }
+    }
+    // The fixed frames at the box cap: no room, then a reject's place.
+    let full = &answers[cases.len() - 2];
+    assert_eq!(full["live"], json!([]));
+    let full = &answers[cases.len() - 1];
+    assert_eq!(full["live"][0]["replaces"], json!([0]));
+    println!("{seen:?}");
+    for (key, least) in [
+        ("live", 800),
+        ("add accepted", 150),
+        ("tighten accepted", 100),
+        ("relabel accepted", 100),
+        ("verify kept", 100),
+        ("add replaces one", 20),
+        ("add replaces two or more", 5),
+        ("overlaps_checked ended", 20),
+        ("overlaps_checked kept", 50),
+        ("empty_confirmed ended", 30),
+        ("relabel to the list's spelling", 20),
+        ("indices shift after an accept", 100),
+        ("not live", 500),
+        ("dismissed", 1000),
+        ("skipped", 100),
+        ("no class list", 100),
+        ("answered", 200),
+        ("unknown kind", 100),
+        ("a target_label picks the second box", 5),
+        ("an alias or another spelling", 100),
+        ("an add of an unwanted class", 50),
+        ("a target rejected as too small", 40),
+        ("a target marked unsure", 60),
+        ("unsure ends a live suggestion", 20),
+    ] {
+        let n = seen.get(key).copied().unwrap_or(0);
+        assert!(n >= least, "the generator reached \"{key}\" only {n} times");
+    }
+
+    // The constants are the Rust ones.
+    let got = &answer["constants"];
+    for (name, v) in [
+        ("MATCH_IOU", labels::MATCH_IOU),
+        ("COVER_IOU", labels::COVER_IOU),
+        ("COVER_INSIDE", labels::COVER_INSIDE),
+    ] {
+        assert_eq!(got[name].to_string(), v.to_string(), "{name}");
+    }
+    assert_eq!(got["MAX_BOXES"], json!(labels::MAX_BOXES));
+    assert_eq!(got["MAX_LABEL_LEN"], json!(labels::MAX_LABEL_LEN));
+    assert_eq!(got["REFINE_REASON"], json!(refine::REFINE_REASON));
+    assert_eq!(got["COCO_NAMES"], json!(coco::COCO_NAMES.to_vec()));
+    let aliases: Vec<[&str; 2]> = coco::COCO_ALIASES.iter().map(|(a, c)| [*a, *c]).collect();
+    assert_eq!(got["COCO_ALIASES"], json!(aliases));
+}
+
 /// Needs no `node`: the page loads the rules first, and they stay pure.
 #[test]
 fn the_page_loads_the_rules_first_and_they_touch_no_page() {
@@ -1082,4 +1705,617 @@ fn the_page_loads_the_rules_first_and_they_touch_no_page() {
     ] {
         assert!(!js.contains(word), "review-rules.js is pure: {word}");
     }
+}
+
+/// One case of the size floor: box, frame width and height, floor.
+type FloorCase = ([f32; 4], u32, u32, Option<labels::SizeFloor>);
+
+/// `v` moved by `k` f32 steps (`k` < 0: down); `v` positive.
+fn ulps(v: f32, k: i32) -> f32 {
+    f32::from_bits(v.to_bits().checked_add_signed(k).unwrap())
+}
+
+/// The cases of [`the_size_floor_agrees_with_its_rust_twin`]: the boundary of real floors on
+/// non-square frames (exactly there and up to two f32 steps either side, on either axis), boxes at
+/// and past the frame edge, inverted, empty and off-frame boxes, a floor that is off, a frame of
+/// unknown size, and seeded random boxes.
+fn floor_cases() -> Vec<FloorCase> {
+    let floor = |px: f32, input: u32| Some(labels::SizeFloor { px, input });
+    let mut v: Vec<FloorCase> = Vec::new();
+    // A 512 px frame at input 512 maps a side 1:1 exactly: 10 px is exactly at a 10 px floor.
+    for k in -2..=2 {
+        let s = ulps(10.0, k);
+        v.push(([0.0, 0.0, 300.0, s], 512, 512, floor(10.0, 512)));
+        v.push(([0.0, 0.0, s, 300.0], 512, 512, floor(10.0, 512)));
+    }
+    let frames = [
+        (1920, 1080),
+        (640, 480),
+        (2560, 1440),
+        (1280, 720),
+        (704, 576),
+        (480, 640),
+    ];
+    let floors = [
+        (10.0, 384),
+        (8.0, 640),
+        (12.5, 384),
+        (1.0, 64),
+        (64.0, 4096),
+        (9.7, 448),
+    ];
+    for (w, h) in frames {
+        let (wf, hf) = (w as f32, h as f32);
+        for (px, input) in floors {
+            let fl = floor(px, input);
+            // The side that is exactly at the floor on each axis.
+            let (sw, sh) = (px * wf / input as f32, px * hf / input as f32);
+            for k in -2..=2 {
+                let (bw, bh) = (ulps(sw, k), ulps(sh, k));
+                v.push(([0.0, 0.0, wf, bh], w, h, fl));
+                v.push(([0.0, 0.0, bw, hf], w, h, fl));
+                // At the frame's far edge, and past it (clamped to the frame).
+                v.push(([wf - bw, hf - 2.0 * bh, wf, hf], w, h, fl));
+                v.push(([wf - bw, hf - bh, wf + 50.0, hf + 50.0], w, h, fl));
+                v.push(([-30.0, -30.0, bw - 30.0, hf], w, h, fl));
+                // Inverted corners.
+                v.push(([bw, hf, 0.0, 0.0], w, h, fl));
+            }
+            v.push(([5.0, 5.0, 5.0, 50.0], w, h, fl));
+            v.push(([wf + 10.0, 0.0, wf + 50.0, 50.0], w, h, fl));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, h, None));
+            v.push(([0.0, 0.0, 1.0, 1.0], 0, h, fl));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, 0, fl));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, h, floor(0.0, input)));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, h, floor(px, 0)));
+        }
+    }
+    let mut r = Rng(0x5153_e0f1_002d_9a3b);
+    for _ in 0..4000 {
+        let (w, h) = r.pick(&frames);
+        let (px, input) = r.pick(&floors);
+        let (x, y) = (r.range(-40.0, w as f32), r.range(-40.0, h as f32));
+        let (bw, bh) = (r.range(0.0, 60.0), r.range(0.0, 60.0));
+        v.push(([x, y, x + bw, y + bh], w, h, floor(px, input)));
+    }
+    v
+}
+
+/// `labels::under_floor` and the page's `underFloor` agree on every case, f32 for f32 (numbers go to
+/// node as their f32 bits, so no decimal rounding stands between the two).
+#[test]
+fn the_size_floor_agrees_with_its_rust_twin() {
+    if !have_node() {
+        return;
+    }
+    let cases = floor_cases();
+    let rust: Vec<bool> = cases
+        .iter()
+        .map(|(b, w, h, f)| labels::under_floor(b, *w, *h, *f))
+        .collect();
+    let request: Vec<Value> = cases
+        .iter()
+        .map(|(b, w, h, f)| {
+            json!({
+                "b": b.map(f32::to_bits),
+                "w": w,
+                "h": h,
+                "floor": f.map(|f| json!({"px": f.px.to_bits(), "input": f.input})),
+            })
+        })
+        .collect();
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const f32 = (u) => { const d = new DataView(new ArrayBuffer(4)); d.setUint32(0, u); return d.getFloat32(0); };
+const fl = { px: 10, input: 384 };
+process.stdout.write(JSON.stringify({
+  cases: req.map((c) => R.underFloor(c.b.map(f32), c.w, c.h,
+    c.floor === null ? null : { px: f32(c.floor.px), input: c.floor.input })),
+  // What JSON cannot carry: never under.
+  odd: [
+    R.underFloor([NaN, 0, 1, 1], 640, 480, fl),
+    R.underFloor([0, 0, Infinity, 1], 640, 480, fl),
+    R.underFloor([0, 0, 1e39, 1], 640, 480, fl),
+    R.underFloor([0, 0, '1', 1], 640, 480, fl),
+    R.underFloor([0, 0, 1, 1], 640, 480, { px: NaN, input: 384 }),
+    R.underFloor([0, 0, 1, 1], 640, 480, undefined),
+    R.underFloor([0, 0, 1], 640, 480, fl),
+    R.underFloor([0, 0, 1, 1], 640, 480, fl),
+  ],
+}));
+"#;
+    let got = node_with(driver, &json!(request));
+    let js: Vec<bool> = serde_json::from_value(got["cases"].clone()).unwrap();
+    assert_eq!(js.len(), rust.len());
+    let differ: Vec<String> = cases
+        .iter()
+        .zip(rust.iter().zip(&js))
+        .filter(|(_, (r, j))| r != j)
+        .take(10)
+        .map(|(c, (r, j))| format!("{c:?}: rust {r}, page {j}"))
+        .collect();
+    assert!(differ.is_empty(), "{differ:#?}");
+    // Both answers occur, at the boundary too: the cases test something.
+    let under = rust.iter().filter(|u| **u).count();
+    assert!(
+        under > 500 && rust.len() - under > 500,
+        "{under} of {}",
+        rust.len()
+    );
+    assert_eq!(
+        got["odd"],
+        json!([false, false, false, false, false, false, false, true])
+    );
+    // Exactly at the floor is not under; one f32 step below is.
+    let at = |s: f32| labels::under_floor(&[0.0, 0.0, 300.0, s], 512, 512, cases[0].3);
+    assert!(!at(10.0) && at(ulps(10.0, -1)) && !at(ulps(10.0, 1)));
+}
+
+/// What the Review page says of a box under the size floor (`floorNote`): a chip and one line when
+/// a training box is under it, nothing with no floor, a rejected or unsure box or a box over it.
+/// The decision itself is `underFloor`, tested against its Rust twin above.
+#[test]
+fn a_box_under_the_size_floor_gets_a_chip_and_a_line_and_no_floor_gets_none() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const floor = { px: 10, input: 384 };
+// 640 x 480: a box 10 px wide is 6 px at 384, one 200 px wide is 120.
+const tiny = (extra) => Object.assign({ bbox: [100, 100, 110, 300], state: 'accepted', difficult: false }, extra || {});
+const big = { bbox: [100, 100, 300, 300], state: 'accepted', difficult: false };
+process.stdout.write(JSON.stringify({
+  tiny: R.floorNote(tiny(), 640, 480, floor),
+  pending: R.floorNote(tiny({ state: 'pending' }), 640, 480, floor),
+  drawn: R.floorNote(tiny({ state: 'added' }), 640, 480, floor),
+  big: R.floorNote(big, 640, 480, floor),
+  off: R.floorNote(tiny(), 640, 480, null),
+  undef: R.floorNote(tiny(), 640, 480, undefined),
+  badFloor: R.floorNote(tiny(), 640, 480, { px: 0, input: 384 }),
+  rejected: R.floorNote(tiny({ state: 'rejected' }), 640, 480, floor),
+  unsure: R.floorNote(tiny({ difficult: true }), 640, 480, floor),
+  noFrame: R.floorNote(tiny(), 0, 0, floor),
+  noBox: R.floorNote(null, 640, 480, floor),
+  widened: R.floorNote(tiny(), 640, 480, { px: 7.300000190734863, input: 384 }),
+  // Resized to 100 px wide while drawing: 60 px at 384, no longer under.
+  resized: R.floorNote(tiny({ bbox: [100, 100, 200, 300] }), 640, 480, floor),
+}));
+"#;
+    let got = node_with(driver, &json!({}));
+    let line = "Under the size floor (10 px at 384): left out of the labels at export.";
+    for k in ["tiny", "pending", "drawn"] {
+        assert_eq!(got[k], json!({"chip": "too small", "note": line}), "{k}");
+    }
+    for k in [
+        "big", "off", "undef", "badFloor", "rejected", "unsure", "noFrame", "noBox", "resized",
+    ] {
+        assert!(got[k].is_null(), "{k}: {}", got[k]);
+    }
+    // A box 10 px wide is 6 px at 384: under 7.3 too; the f32 floor prints without its tail.
+    assert_eq!(
+        got["widened"]["note"],
+        "Under the size floor (7.3 px at 384): left out of the labels at export."
+    );
+}
+
+/// The Refine tab's pure sentences (`RefineFloor` in `assets/train-refine.js`), loaded in Node
+/// without a page: which classes the floor leaves too few labels, and the question before the rule
+/// writes.
+#[test]
+fn the_too_small_cards_sentences_flag_a_class_the_floor_empties() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+process.stdout.write(JSON.stringify({
+  all: F.classNote({ class: 'motorcycle', boxes: 12, under: 12, left: 0 }),
+  few: F.classNote({ class: 'person', boxes: 300, under: 270, left: 30 }),
+  one: F.classNote({ class: 'bus', boxes: 3, under: 2, left: 1 }),
+  enough: F.classNote({ class: 'car', boxes: 900, under: 100, left: 800 }),
+  edge: F.classNote({ class: 'car', boxes: 100, under: 50, left: 50 }),
+  edge49: F.classNote({ class: 'car', boxes: 99, under: 50, left: 49 }),
+  untouched: F.classNote({ class: 'dog', boxes: 5, under: 0, left: 5 }),
+  nothing: F.classNote(null),
+  phrase: F.phrase({ px: 10, input: 384 }),
+  phraseWide: F.phrase({ px: 7.300000190734863, input: 640 }),
+  one_box: F.resolveText(1, 1),
+  many: F.resolveText(12, 5),
+  back_one: F.restoreText(1, 1),
+  back_many: F.restoreText(7, 3),
+  measured_floor: F.measuredWith({ folds_every_label: true, size_floor: { px: 10, input: 384 } }),
+  measured_none: F.measuredWith({ folds_every_label: true }),
+  measured_old: F.measuredWith({ recipe: { imgsz: 384 } }),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["all"],
+        "every motorcycle label would be left out: the model cannot learn the class from these frames"
+    );
+    assert_eq!(
+        got["few"],
+        "only 30 person labels would be left (under 50): too few to learn the class from"
+    );
+    assert_eq!(
+        got["one"],
+        "only 1 bus label would be left (under 50): too few to learn the class from"
+    );
+    for k in ["enough", "edge", "untouched", "nothing"] {
+        assert_eq!(got[k], "", "{k}");
+    }
+    assert!(
+        got["edge49"]
+            .as_str()
+            .unwrap()
+            .starts_with("only 49 car labels")
+    );
+    assert_eq!(got["phrase"], "under 10 px at 384");
+    assert_eq!(got["phraseWide"], "under 7.3 px at 640");
+    assert_eq!(
+        got["many"],
+        "Hide 12 pending auto-label proposals on 5 unreviewed frames as under the floor. \
+         They are set aside unseen like the auto-labelers' hidden boxes: no label, no negative, not counted as your decisions. \
+         i on the Review tab shows them, and they can be restored here if the floor goes down or off."
+    );
+    assert!(got["one_box"].as_str().unwrap().starts_with(
+        "Hide 1 pending auto-label proposal on 1 unreviewed frame as under the floor"
+    ));
+    assert_eq!(
+        got["back_many"],
+        "Restore 7 hidden proposals on 3 unreviewed frames that the size floor no longer covers: \
+         they become pending again, for you to decide on the Review tab."
+    );
+    assert!(
+        got["back_one"]
+            .as_str()
+            .unwrap()
+            .starts_with("Restore 1 hidden proposal on 1 unreviewed frame that")
+    );
+    assert_eq!(
+        got["measured_floor"],
+        "Measured with fold models trained on every label; the check treated labels under 10 px \
+         at 384 as ignore regions (counted in this table only)."
+    );
+    assert_eq!(
+        got["measured_none"],
+        "Measured with fold models trained on every label; no size floor was set."
+    );
+    assert!(
+        got["measured_old"]
+            .as_str()
+            .unwrap()
+            .starts_with("Measured by a check of an earlier version")
+    );
+}
+
+/// A quick check's report never reads as a full check's: the Findings card's last-check line, the
+/// Coverage card's recall sentence and the size table's note name the model and the frames it
+/// never saw (`RefineFloor.lastLine`, `recallOf`, `measuredWith`; report.json `mode: model`).
+#[test]
+fn a_quick_checks_report_names_its_model_and_the_frames_it_never_saw() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+const quick = {
+  mode: 'model', frames_checked: 287, cancelled: false, folds: 0, folds_done: 0,
+  recipe: { model: 'rfdetr-nano', imgsz: 384, epochs: 100, batch: 8 },
+  model: { name: 'custom-rf-detr-nano-3', run: '20261111-020504-cad6', imgsz: 384,
+           trained_on: 564, validated_on: 83, same_day: 12 },
+  size_floor: { px: 10, input: 384 },
+};
+const full = {
+  folds: 4, folds_done: 4, frames_checked: 851, cancelled: true,
+  recipe: { model: 'rfdetr-nano', imgsz: 384, epochs: 8, batch: 8 }, folds_every_label: true,
+};
+process.stdout.write(JSON.stringify({
+  quick_line: F.lastLine(quick, 'T'),
+  full_line: F.lastLine(full, 'T'),
+  quick_recall: F.recallOf(quick),
+  full_recall: F.recallOf(full),
+  quick_measured: F.measuredWith(quick),
+  one: F.lastLine(Object.assign({}, quick, { frames_checked: 1 }), 'T'),
+  // GET /v1/refine keeps each mode's last report.
+  both_quick_newer: F.reports({ report: Object.assign({ created: '2026-11-10T10:00:00Z' }, full),
+    quick_report: Object.assign({ created: '2026-11-12T10:00:00Z' }, quick) }),
+  both_full_newer: F.reports({ report: Object.assign({ created: '2026-11-12T11:00:00Z' }, full),
+    quick_report: Object.assign({ created: '2026-11-12T10:00:00Z' }, quick) }),
+  quick_only: F.reports({ report: null, quick_report: quick }),
+  full_only: F.reports({ report: full }),
+  none: F.reports({}),
+  other_full: F.otherLine(full, 'W'),
+  other_quick: F.otherLine(quick, 'W'),
+  other_none: F.otherLine(null, 'W'),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["quick_line"],
+        "Last check: T, quick check with custom-rf-detr-nano-3 (training run 20261111-020504-cad6). \
+         287 frames it never saw checked; 564 frames it trained on and 83 it validated on skipped \
+         (their suggestions stay as they were); rfdetr-nano at 384 px."
+    );
+    assert_eq!(
+        got["full_line"],
+        "Last check: T, 4 of 4 folds done, cancelled. 851 frames checked; rfdetr-nano at 384 px, \
+         8 epochs each."
+    );
+    assert_eq!(
+        got["quick_recall"],
+        "Recall per camera, scene and class over the 287 frames custom-rf-detr-nano-3 never saw: \
+         how often it found a labelled object"
+    );
+    assert!(
+        got["full_recall"]
+            .as_str()
+            .unwrap()
+            .contains("a fold model that never saw that camera day")
+    );
+    assert_eq!(
+        got["quick_measured"],
+        "Measured by custom-rf-detr-nano-3 on 287 frames it never saw, at its own input of 384 px: \
+         what that model finds, not what the recipe can learn; the check treated labels under 10 \
+         px at 384 as ignore regions (counted in this table only)."
+    );
+    assert!(
+        got["one"]
+            .as_str()
+            .unwrap()
+            .contains("1 frame it never saw checked")
+    );
+    // The Findings header names the newer report and says the other exists; the recall tables
+    // are the full check's whenever there is one.
+    let mode = |k: &str, part: &str| got[k][part]["mode"].clone();
+    let folds = |k: &str, part: &str| got[k][part]["folds"].clone();
+    assert_eq!(mode("both_quick_newer", "latest"), "model");
+    assert_eq!(folds("both_quick_newer", "other"), 4);
+    assert_eq!(folds("both_quick_newer", "recall"), 4);
+    assert_eq!(folds("both_full_newer", "latest"), 4);
+    assert_eq!(mode("both_full_newer", "other"), "model");
+    assert_eq!(folds("both_full_newer", "recall"), 4);
+    assert_eq!(mode("quick_only", "latest"), "model");
+    assert!(got["quick_only"]["other"].is_null());
+    assert_eq!(mode("quick_only", "recall"), "model");
+    assert_eq!(folds("full_only", "latest"), 4);
+    assert!(got["full_only"]["other"].is_null());
+    assert!(got["none"]["latest"].is_null() && got["none"]["recall"].is_null());
+    assert_eq!(
+        got["other_full"],
+        "Last full check: W (its suggestions are counted above with the others)."
+    );
+    assert_eq!(
+        got["other_quick"],
+        "Last quick check: W (its suggestions are counted above with the others)."
+    );
+    assert_eq!(got["other_none"], "");
+}
+
+/// The Findings card's line on loose labels (`RefineFloor.looseLine`): with the closer look, how
+/// many got a proposed box; without it (`--no-tighten`, the weights missing, an earlier report),
+/// that none was looked at.
+#[test]
+fn the_findings_line_says_how_many_loose_labels_got_a_proposed_box() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+process.stdout.write(JSON.stringify({
+  looked: F.looseLine({ loose: 148, tighten: true, found: { add: 165, tighten: 37 } }),
+  none_found: F.looseLine({ loose: 3, tighten: true, found: { add: 1 } }),
+  no_look: F.looseLine({ loose: 148, tighten: false, found: { add: 165, tighten: 0 } }),
+  earlier: F.looseLine({ loose: 12, found: { add: 2, verify: 1, relabel: 0 } }),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["looked"],
+        "Loose labels counted: 148, 37 with a proposed box."
+    );
+    assert_eq!(
+        got["none_found"],
+        "Loose labels counted: 3, 0 with a proposed box."
+    );
+    assert_eq!(
+        got["no_look"],
+        "Loose labels counted: 148 (no closer look in this check)."
+    );
+    assert_eq!(
+        got["earlier"],
+        "Loose labels counted: 12 (no closer look in this check)."
+    );
+}
+
+/// The Coverage card's "Where the data is thin" rules (`RefineFloor.coverageAdvice`, `coverageUrl`,
+/// `thinRecallNote` in `assets/train-refine.js`): what to do about a camera x scene row, the Review
+/// link under the page's own filters, and who the recall columns are of.
+#[test]
+fn the_thin_data_table_says_what_to_do_about_a_row() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+const ok = { reviewed: 50, persons: 60, empty: 5, empty_confirmed: 3, unreviewed_person_frames: 4, person: null };
+const row = (o) => Object.assign({}, ok, o);
+const quick = { mode: 'model', frames_checked: 287, model: { name: 'custom-1' } };
+process.stdout.write(JSON.stringify({
+  consts: [F.MIN_PERSON_BOXES, F.MIN_RECALL_BOXES, F.MISSED_RECALL_HIGH, F.VEHICLE_FRAME_SHARE],
+  fine: F.coverageAdvice(row({})),
+  // 10 reviewed frames, none empty: 2 with 5 cars each (10 vehicle boxes), 8 with a person only.
+  two_of_ten: F.coverageAdvice(row({ reviewed: 10, empty: 0, empty_confirmed: 0, vehicles: 10, vehicle_frames: 2 })),
+  nine_of_ten: F.coverageAdvice(row({ reviewed: 10, empty: 0, empty_confirmed: 0, vehicles: 9, vehicle_frames: 9 })),
+  eight_of_ten: F.coverageAdvice(row({ reviewed: 10, empty: 0, empty_confirmed: 0, vehicles: 40, vehicle_frames: 8 })),
+  few_review: F.coverageAdvice(row({ persons: 12, unreviewed_person_frames: 7 })),
+  few_one: F.coverageAdvice(row({ persons: 0, unreviewed_person_frames: 1 })),
+  few_collect: F.coverageAdvice(row({ persons: 19, unreviewed_person_frames: 0 })),
+  edge20: F.coverageAdvice(row({ persons: 20, unreviewed_person_frames: 0 })),
+  no_empty: F.coverageAdvice(row({ empty: 0, empty_confirmed: 0 })),
+  no_empty_parked: F.coverageAdvice(row({ empty: 0, empty_confirmed: 0, vehicles: 50, vehicle_frames: 50 })),
+  unticked: F.coverageAdvice(row({ empty: 4, empty_confirmed: 0 })),
+  empty_text: [F.emptyText({ empty: 14, empty_confirmed: 3 }), F.emptyText({ empty: 14, empty_confirmed: 0 }), F.emptyText({ empty: 0 })],
+  nothing_reviewed: F.coverageAdvice(row({ reviewed: 0, persons: 0, empty: 0, empty_confirmed: 0, unreviewed_person_frames: 0 })),
+  missed: F.coverageAdvice(row({ person: { boxes: 40, found: 20, recall: 0.5, low: 0.35, high: 0.65 } })),
+  edge_high: F.coverageAdvice(row({ person: { boxes: 40, found: 28, recall: 0.7, low: 0.55, high: 0.7 } })),
+  few_boxes: F.coverageAdvice(row({ person: { boxes: 19, found: 5, recall: 0.26, low: 0.1, high: 0.5 } })),
+  all_three: F.coverageAdvice(row({ persons: 5, unreviewed_person_frames: 0, empty: 0, empty_confirmed: 0,
+    person: { boxes: 25, found: 10, recall: 0.4, low: 0.2, high: 0.6 } })),
+  url: F.coverageUrl({ camera: 'back yard&1', scene: 'night' }),
+  no_report: F.thinRecallNote(null),
+  full: F.thinRecallNote({ folds: 4 }),
+  quick: F.thinRecallNote(quick),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(got["consts"], json!([20, 20, 0.7, 0.9]));
+    for k in ["fine", "edge20"] {
+        assert_eq!(got[k], "", "{k}");
+    }
+    // Vehicle frames against reviewed frames, never vehicle boxes: 2 of 10 frames with cars is the
+    // ordinary advice however many cars they hold; 9 of 10 (0.9) is a vehicle in about every frame.
+    for k in ["two_of_ten", "eight_of_ten"] {
+        assert_eq!(
+            got[k], "No empty frames: review some frames with nothing in them.",
+            "{k}"
+        );
+    }
+    assert!(
+        got["nine_of_ten"]
+            .as_str()
+            .unwrap()
+            .starts_with("No empty frames: about every frame here shows a vehicle")
+    );
+    assert_eq!(
+        got["few_review"],
+        "Few persons: review the 7 unreviewed frames with a person proposal."
+    );
+    assert_eq!(
+        got["few_one"],
+        "Few persons: review the 1 unreviewed frame with a person proposal."
+    );
+    assert_eq!(got["few_collect"], "Few persons: collect more here.");
+    assert_eq!(
+        got["no_empty"],
+        "No empty frames: review some frames with nothing in them."
+    );
+    // A camera with a vehicle in about every frame cannot have an empty one: it says so.
+    assert_eq!(
+        got["no_empty_parked"],
+        "No empty frames: about every frame here shows a vehicle, so false alerts on empty \
+         frames cannot be measured on this camera."
+    );
+    // Frames with nothing in them count whether or not they were ticked.
+    assert_eq!(got["unticked"], "");
+    assert_eq!(got["empty_text"], json!(["14 (3 confirmed)", "14", "0"]));
+    // Nothing reviewed: no "no empty frames" (nothing to look at yet); few persons stands.
+    assert_eq!(got["nothing_reviewed"], "Few persons: collect more here.");
+    assert_eq!(
+        got["missed"],
+        "Persons are missed here: check the labels and collect more."
+    );
+    // Upper bound exactly 0.7 is not under it; 19 boxes are too few to blame the labels.
+    assert_eq!(got["edge_high"], "");
+    assert_eq!(got["few_boxes"], "");
+    assert_eq!(
+        got["all_three"],
+        "Few persons: collect more here. No empty frames: review some frames with nothing in them. \
+         Persons are missed here: check the labels and collect more."
+    );
+    assert_eq!(
+        got["url"],
+        "/train/review?status=unreviewed&source=all&scene=night&camera=back%20yard%261&label=person"
+    );
+    assert_eq!(
+        got["no_report"],
+        "No check has run yet, so the recall columns show \"-\"."
+    );
+    assert!(got["full"].as_str().unwrap().starts_with(
+        "Recall per camera, scene and class: how often a fold model that never saw that camera day"
+    ));
+    assert!(
+        got["quick"].as_str().unwrap().starts_with(
+            "Recall per camera, scene and class over the 287 frames custom-1 never saw: how often it found a labelled object."
+        )
+    );
+    assert!(
+        got["quick"]
+            .as_str()
+            .unwrap()
+            .ends_with("Vehicles are car, truck, bus, van, motorcycle and bicycle together.")
+    );
+}
+
+/// The Dataset tab's line about the dataset check's open suggestions (`DatasetOpen.line` in
+/// `assets/train-dataset.js`, from the counts of `GET /v1/refine`): the sentence when something is
+/// open, nothing otherwise.
+#[test]
+fn the_export_card_warns_about_open_suggestions_and_is_silent_without() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.dataset);
+const L = globalThis.DatasetOpen.line;
+const text = (o) => { const p = L(o); return p && (p.before + p.link + p.after); };
+process.stdout.write(JSON.stringify({
+  many: text({ add: 12, verify: 5, relabel: 3, tighten: 7, frames: 20 }),
+  one: text({ add: 1, verify: 0, relabel: 0, tighten: 0, frames: 1 }),
+  link: L({ add: 1, frames: 1 }).link,
+  older: text({ add: 2, verify: 1, relabel: 0, frames: 3 }),
+  none: L({ add: 0, verify: 0, relabel: 0, tighten: 0, frames: 0 }),
+  nothing: L(null),
+}));
+"#;
+    let dataset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-dataset.js");
+    let got = node_with(driver, &json!({"dataset": dataset}));
+    assert_eq!(
+        got["many"],
+        "The dataset check has 27 open suggestions (12 missing boxes, 5 labels to verify, 3 other class, 7 better boxes) on 20 frames. \
+         An export uses the labels as they are: answer them on the Refine tab first, or export anyway."
+    );
+    assert_eq!(
+        got["one"],
+        "The dataset check has 1 open suggestion (1 missing boxes, 0 labels to verify, 0 other class, 0 better boxes) on 1 frame. \
+         An export uses the labels as they are: answer them on the Refine tab first, or export anyway."
+    );
+    assert_eq!(got["link"], "Refine tab");
+    assert!(
+        got["older"]
+            .as_str()
+            .unwrap()
+            .contains("(2 missing boxes, 1 labels to verify, 0 other class, 0 better boxes)"),
+        "an answer without tighten counts 0"
+    );
+    assert!(got["none"].is_null() && got["nothing"].is_null());
 }

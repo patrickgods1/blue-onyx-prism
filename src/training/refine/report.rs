@@ -1,4 +1,5 @@
-//! The report of the dataset check, `<review folder>/refine/report.json` ([`REPORT_FILE`]): what
+//! The report of the dataset check, `<review folder>/refine/report.json` ([`REPORT_FILE`]; a quick
+//! check's is `report-quick.json`, [`QUICK_REPORT_FILE`], so each mode keeps its last one): what
 //! was checked, what was suggested, and how often a fold model found the labelled objects of camera
 //! days it never saw (out-of-fold recall) per camera x scene x class and per size at model input,
 //! each with a Wilson 95% interval ([`wilson`]): 57 held-out persons give a recall to about +/- 10
@@ -9,6 +10,8 @@
 //! folders, so they never see it (like `spots/`).
 
 use super::judge::{BoxFact, FOUND_IOU, FOUND_SCORE};
+use crate::collect::labels::SizeFloor;
+use crate::training::dataset::IgnoreMode;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,8 +19,13 @@ use std::path::{Path, PathBuf};
 
 /// Folder of the report in the folder under review.
 pub const REPORT_DIR: &str = "refine";
-/// The report file in [`REPORT_DIR`].
+/// The full check's report file in [`REPORT_DIR`].
 pub const REPORT_FILE: &str = "report.json";
+/// The quick check's report file in [`REPORT_DIR`]: each mode keeps its own last report, so a
+/// quick check never replaces the full check's whole-folder recall (and the recall by size a floor
+/// is chosen from), nor the reverse. A `report.json` with `mode: model` (written by the first
+/// builds of the quick check, never released) reads as what it says.
+pub const QUICK_REPORT_FILE: &str = "report-quick.json";
 /// Version of the report's layout.
 pub const REPORT_VERSION: u32 = 1;
 /// z of a two-sided 95% interval: the 0.975 quantile of the standard normal distribution.
@@ -26,9 +34,22 @@ pub const Z95: f64 = 1.959_963_984_540_054;
 /// bucket has none. 8 and 12: about one RF-DETR patch; 24 and 48: a person far and near.
 pub const SIZE_EDGES: [f32; 4] = [8.0, 12.0, 24.0, 48.0];
 
-/// `<review folder>/refine/report.json`.
+/// `<review folder>/refine/report.json`: the full check's.
 pub fn report_path(review_dir: &Path) -> PathBuf {
     review_dir.join(REPORT_DIR).join(REPORT_FILE)
+}
+
+/// `<review folder>/refine/report-quick.json`: the quick check's.
+pub fn quick_report_path(review_dir: &Path) -> PathBuf {
+    review_dir.join(REPORT_DIR).join(QUICK_REPORT_FILE)
+}
+
+/// The report file of a check of `mode`.
+pub fn report_path_of(review_dir: &Path, mode: Mode) -> PathBuf {
+    match mode {
+        Mode::Folds => report_path(review_dir),
+        Mode::Model => quick_report_path(review_dir),
+    }
 }
 
 /// The Wilson score interval of `found` successes in `n` trials at 95% ([`Z95`]): `(low, high)`
@@ -138,11 +159,15 @@ pub struct KindCounts {
     pub add: usize,
     pub verify: usize,
     pub relabel: usize,
+    /// Better-fitting boxes for loose labels (the zoom stage, [`super::tighten`]). Reports of
+    /// earlier checks: 0.
+    #[serde(default)]
+    pub tighten: usize,
 }
 
 impl KindCounts {
     pub fn total(&self) -> usize {
-        self.add + self.verify + self.relabel
+        self.add + self.verify + self.relabel + self.tighten
     }
 }
 
@@ -168,6 +193,49 @@ impl LeftOut {
     pub fn frames(&self) -> usize {
         self.pending + self.off_class_list + self.lost + self.unreadable + self.filtered
     }
+}
+
+/// How a check judged the frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Throwaway fold models, each blind to whole camera days (reports of earlier checks too).
+    #[default]
+    Folds,
+    /// A quick check: a model the user trained, on the reviewed frames it never trained or
+    /// validated on ([`super::quick`]).
+    Model,
+}
+
+/// The model of a quick check ([`Mode::Model`]) and what it could not look at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The configured model's name.
+    pub name: String,
+    /// Its training run (`<model>.provenance.json` `run_id`).
+    pub run: String,
+    /// `rfdetr-nano`, `yolo26n`, ... (its recipe).
+    pub recipe: String,
+    /// Its input size (the recipe's `imgsz`): the judge's "short side at model input".
+    pub imgsz: u32,
+    /// Frames of the selection it trained on (its run's `train.txt`): skipped.
+    pub trained_on: usize,
+    /// Frames of the selection it validated on (`valid.txt`; its checkpoint was chosen on them):
+    /// skipped.
+    pub validated_on: usize,
+    /// Of the frames it checks, those of a camera day it trained or validated on: near copies of
+    /// what it learned, so its finds there say less.
+    pub same_day: usize,
+    /// Wanted classes the model does not have: their labels get no `verify` and no `relabel`, and
+    /// are not in the recall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes_missing: Vec<String>,
+    /// The run recorded where each image came from (`image_sources.json`): frames were matched by
+    /// source as well as by name.
+    pub by_source: bool,
+    /// The device that ran it (empty before it ran, and in previews).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
 }
 
 /// The recipe the fold models trained with.
@@ -209,12 +277,75 @@ pub struct RefineReport {
     pub frames_written: usize,
     /// Matched pairs below the judge's good IoU (loose labels).
     pub loose: usize,
+    /// The check took a closer look at its loose labels ([`super::tighten`]): `found.tighten` and
+    /// `written.tighten` count its proposals. False when it ran without one (`--no-tighten`, the
+    /// weights missing) and in reports of earlier checks.
+    #[serde(default)]
+    pub tighten: bool,
+    /// Loose labels sent to the closer look ([`super::judge::Loose`]: a confident fold detection,
+    /// a class RF-DETR L can see, big enough).
+    #[serde(default)]
+    pub tighten_candidates: usize,
+    /// Candidates past [`super::tighten::MAX_TIGHTEN_CANDIDATES`], not sent (the least confident
+    /// fold detections; a warning says so).
+    #[serde(default)]
+    pub tighten_left_out: usize,
+    /// Of those sent, the ones the closer look answered (a crop of a readable frame that finished).
+    #[serde(default)]
+    pub zoomed: usize,
     /// The production-like score and IoU at which a box counts as found.
     pub found_score: f32,
     pub found_iou: f32,
     pub recall: Recall,
     pub recall_by_group: Vec<GroupRecall>,
     pub recall_by_size: Vec<SizeRecall>,
+    /// Static spots of the check's selection
+    /// ([`crate::collect::labels::statics`]). Reports of earlier checks: 0.
+    #[serde(default)]
+    pub static_spots: usize,
+    /// Recall of the training boxes at a static spot (one that holds without the frame's
+    /// camera-day, [`super::judge::spot_of`]) ...
+    #[serde(default)]
+    pub recall_at_spots: Recall,
+    /// ... and of the others.
+    #[serde(default)]
+    pub recall_elsewhere: Recall,
+    /// Of `found.add`, the adds at a static spot (from [`super::judge::ADD_SCORE_AT_SPOT`]).
+    #[serde(default)]
+    pub adds_at_spots: usize,
+    /// The fold models trained on every label (their exports apply no size floor), so the recall by
+    /// size measures what a model of the recipe can find. False in reports of earlier checks, whose
+    /// fold exports applied the floor then in force.
+    #[serde(default)]
+    pub folds_every_label: bool,
+    /// `collect.size_floor` in force: the judge's floor (boxes under it were ignore regions for the
+    /// suggestions and the recall but for its size table). None = off, or an earlier report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<SizeFloor>,
+    /// `training.ignore` the fold models trained with. None in reports of earlier checks and of
+    /// quick checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_mode: Option<IgnoreMode>,
+    /// Fold models or a quick check with a model ([`Mode`]); reports of earlier checks: folds.
+    /// A quick check has `folds` and `folds_done` 0, `recipe` is the model's own, and the counts and
+    /// recall tables cover only the frames it never saw (`model`).
+    #[serde(default)]
+    pub mode: Mode,
+    /// The model of a quick check; None for fold models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelInfo>,
+    /// Seconds the detections took per frame, the model's load not included (reading and
+    /// decoding the frame and the model's pass; the judge and the writes not), over every frame the
+    /// models ran on: with [`Self::predict_load_s`], a later quick preview's time estimate. None
+    /// when no frame ran. (Reports of the branch's first quick checks held the load in it; with no
+    /// `predict_load_s` beside it no estimate uses it.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict_s_per_frame: Option<f64>,
+    /// Seconds a model took to load before its first frame (runtime, read, compile and warm-up, as
+    /// the benchmark pipeline measures them), averaged over the models that ran; None when no
+    /// model reported it and in reports of earlier checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict_load_s: Option<f64>,
     pub warnings: Vec<String>,
 }
 
@@ -223,23 +354,47 @@ pub struct RefineReport {
 pub struct RecallTally {
     groups: BTreeMap<(String, String, String), (u64, u64)>,
     sizes: BTreeMap<usize, (u64, u64)>,
+    /// (boxes, found) at a static spot, and elsewhere.
+    at_spots: (u64, u64),
+    elsewhere: (u64, u64),
 }
 
 impl RecallTally {
-    /// Count the training boxes of a frame of `camera` and `scene`.
+    /// Count the training boxes of a frame of `camera` and `scene`. A box under the size floor
+    /// ([`BoxFact::under_floor`]) counts in the recall by size only: an ignore region otherwise.
     pub fn add(&mut self, camera: &str, scene: &str, boxes: &[BoxFact]) {
         for b in boxes {
             let hit = u64::from(b.found);
+            let s = self.sizes.entry(size_bucket(b.short_px)).or_default();
+            s.0 += 1;
+            s.1 += hit;
+            if b.under_floor {
+                continue;
+            }
             let g = self
                 .groups
                 .entry((camera.to_string(), scene.to_string(), b.class.clone()))
                 .or_default();
             g.0 += 1;
             g.1 += hit;
-            let s = self.sizes.entry(size_bucket(b.short_px)).or_default();
-            s.0 += 1;
-            s.1 += hit;
+            let w = if b.at_spot {
+                &mut self.at_spots
+            } else {
+                &mut self.elsewhere
+            };
+            w.0 += 1;
+            w.1 += hit;
         }
+    }
+
+    /// Over the boxes at a static spot.
+    pub fn at_spots(&self) -> Recall {
+        Recall::of(self.at_spots.1, self.at_spots.0)
+    }
+
+    /// Over the boxes at no static spot.
+    pub fn elsewhere(&self) -> Recall {
+        Recall::of(self.elsewhere.1, self.elsewhere.0)
     }
 
     /// Over every box.
@@ -298,11 +453,26 @@ impl RefineReport {
             found: KindCounts::default(),
             frames_written: 0,
             loose: 0,
+            tighten: false,
+            tighten_candidates: 0,
+            tighten_left_out: 0,
+            zoomed: 0,
             found_score: FOUND_SCORE,
             found_iou: FOUND_IOU,
             recall: Recall::default(),
             recall_by_group: Vec::new(),
             recall_by_size: Vec::new(),
+            static_spots: 0,
+            recall_at_spots: Recall::default(),
+            recall_elsewhere: Recall::default(),
+            adds_at_spots: 0,
+            folds_every_label: false,
+            size_floor: None,
+            ignore_mode: None,
+            mode: Mode::Folds,
+            model: None,
+            predict_s_per_frame: None,
+            predict_load_s: None,
             warnings: Vec::new(),
         }
     }
@@ -312,10 +482,13 @@ impl RefineReport {
         self.recall = tally.total();
         self.recall_by_group = tally.by_group();
         self.recall_by_size = tally.by_size();
+        self.recall_at_spots = tally.at_spots();
+        self.recall_elsewhere = tally.elsewhere();
         self.created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     }
 
-    /// Write it to `<review_dir>/refine/report.json` atomically (a reader never sees half of it);
+    /// Write it to its mode's file ([`report_path_of`]: `refine/report.json` for a full check,
+    /// `refine/report-quick.json` for a quick one) atomically (a reader never sees half of it);
     /// returns the path. Refused when the folder under review is not a folder any more (an
     /// unmounted drive: creating it would put the report on the disk below the mount point); only
     /// `refine/` is created.
@@ -327,7 +500,7 @@ impl RefineReport {
                 review_dir.display()
             );
         }
-        let path = report_path(review_dir);
+        let path = report_path_of(review_dir, self.mode);
         let dir = review_dir.join(REPORT_DIR);
         match std::fs::create_dir(&dir) {
             Ok(()) => {}
@@ -433,6 +606,9 @@ mod tests {
             class: class.into(),
             short_px: px,
             found,
+            // The cars stand at a static spot.
+            at_spot: class == "car",
+            under_floor: false,
         };
         t.add(
             "patio",
@@ -458,6 +634,25 @@ mod tests {
         );
         r.finish(&t);
         assert_eq!((r.recall.boxes, r.recall.found), (5, 3));
+        assert_eq!(
+            (r.recall_at_spots.boxes, r.recall_at_spots.found),
+            (2, 1),
+            "the cars"
+        );
+        assert_eq!((r.recall_elsewhere.boxes, r.recall_elsewhere.found), (3, 2));
+        assert_eq!(r.recall_at_spots.recall, Some(0.5));
+        // A report of an earlier check (no spot fields) reads.
+        let mut old = serde_json::to_value(&r).unwrap();
+        for k in [
+            "static_spots",
+            "recall_at_spots",
+            "recall_elsewhere",
+            "adds_at_spots",
+        ] {
+            old.as_object_mut().unwrap().remove(k);
+        }
+        let back: RefineReport = serde_json::from_value(old).unwrap();
+        assert_eq!(back.recall_at_spots, Recall::default());
         let g: Vec<(&str, &str, &str, u64, u64)> = r
             .recall_by_group
             .iter()
@@ -523,5 +718,36 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(dir.join("refine")).unwrap().collect();
         assert_eq!(left.len(), 1, "no temporary file left");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_under_the_size_floor_counts_in_the_size_table_only() {
+        let fact = |px: f32, found: bool, under_floor: bool| BoxFact {
+            class: "person".into(),
+            short_px: px,
+            found,
+            at_spot: false,
+            under_floor,
+        };
+        let mut t = RecallTally::default();
+        t.add(
+            "patio",
+            "night",
+            &[
+                fact(6.0, false, true),
+                fact(7.0, true, true),
+                fact(30.0, true, false),
+            ],
+        );
+        let total = t.total();
+        assert_eq!((total.boxes, total.found), (1, 1), "an ignore region");
+        assert_eq!((t.elsewhere().boxes, t.at_spots().boxes), (1, 0));
+        assert_eq!(t.by_group()[0].recall.boxes, 1);
+        let sizes = t.by_size();
+        assert_eq!(
+            (sizes[0].recall.boxes, sizes[0].recall.found),
+            (2, 1),
+            "the table a floor is chosen from keeps them"
+        );
     }
 }

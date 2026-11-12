@@ -13,9 +13,14 @@
 // and "Reject stacked duplicates" POST /v1/review/reject-stacked
 // (all five: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
-// the frame, and `y` accepts the one on screen. A labelers run sorts its new boxes into tiers
+// the frame, and `y` accepts the one on screen. The dataset check's suggestions (`labels.refine`,
+// `refine_live`; Auto filter "dataset check suggestions", `auto=refine[&refine_kind=]`) come after
+// them, one at a time, strongest first: drawn on the frame (a dashed proposed box, or the box they
+// are about marked and selected), `y` accepts and `w` says no (R.answerRefine), saved with the
+// frame by the ordinary save. A labelers run sorts its new boxes into tiers
 // (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed or, at a
-// spot the reviewer rejected, spot_dismissed) are left off the frame and the list until `i` shows
+// spot the reviewer rejected, spot_dismissed; the Refine tab's size floor rule adds size_floor) are
+// left off the frame and the list until `i` shows
 // them, likely ones come first and `c` accepts them, the other flagged ones are drawn quieter.
 // `t` accepts a real object that stays put and remembers its spot (POST /v1/review/spots/parked);
 // later runs accept it there. GET /v1/review/spots feeds the card's line, and Panel options has
@@ -40,6 +45,7 @@
   var CP = window.ClassPicker || null;
   var CU = CP ? CP.util : null;
   var hiddenClasses = [];  // collect.hidden_classes: not offered by the pickers and shortcuts
+  var sizeFloor = null;    // collect.size_floor {px, input} of the labels answer; null = off
   var catalog = null;      // GET /v1/review/class-catalog
   var shownLabels = [];    // "Show boxes of": empty = every box
   // The pure rules (review-rules.js, tested against their Rust twins by tests/it/js_rules.rs).
@@ -276,10 +282,12 @@
   var viewCache = null;                // {img, key, canvas}: the adjusted frame
   var dups = { groups: [], of: {}, overlaps: [], near: {} };   // dupGroups, as of the last render
   var suggestions = [];                // liveSuggestions, as of the last render
+  var refineCur = null;                // R.refineCurrent ({l, k, n}), as of the last render
+  var refinePutOff = [];               // keys (R.refineKey) put off with Later on this visit
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', unlikely: '#ffa000', likely: '#14d6b0', hint: '#f08c00', accepted: '#2e9e4f',
-    added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff'
+    added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff', ghost: '#b26bff'
   };
   var MAX_ZOOM = 8;
   var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
@@ -332,8 +340,10 @@
 
   function filterParams() {
     var p = new URLSearchParams();
+    var auto = filtersForm.elements.auto ? filtersForm.elements.auto.value : '';
+    // `refine_kind` only with `auto=refine` (R.sendsFilter).
     Array.prototype.forEach.call(filtersForm.elements, function (el) {
-      if (el.name && el.value) p.set(el.name, el.value);
+      if (el.name && R.sendsFilter(el.name, el.value, auto)) p.set(el.name, el.value);
     });
     return p;
   }
@@ -363,12 +373,13 @@
   // `labels::needs_decision`, which refuses the save.
   function mustDecide(b) { return isReview(b) && resolved(b) === 'accepted'; }
 
-  // Set aside by a labelers run for its score or its spot, nobody judged it
-  // (labels::LabelBox::is_dismissed).
+  // Set aside by a labelers run for its score or its spot, or by the size floor rule (Refine tab,
+  // Too small); nobody judged it (labels::LabelBox::is_dismissed).
   function isDismissed(b) { return b.state === 'rejected' && isDismissal(b.reason); }
 
   // Why a dismissed box is hidden, for the card and the box row.
   function hiddenWhy(b) {
+    if (b.reason === 'size_floor') return 'hidden: under the size floor';
     if (b.reason !== 'spot_dismissed') return 'hidden: score below ' + DISMISS_SCORE;
     var n = b.spot_rejections;
     return 'hidden: you rejected this spot ' + (n ? n + ' time' + (n === 1 ? '' : 's') : 'before');
@@ -543,8 +554,13 @@
       : 'Boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + ' kept as two objects (z undoes).';
     dups = dupGroups();
     suggestions = liveSuggestions();
-    var next = suggestions.length ? suggestionBox(suggestions[0]) : nextUndecided(-1);
-    select(next >= 0 ? next : (g.drop >= 0 ? g.keep : g.a), true);
+    // After the last one, a dataset check suggestion of the frame comes up (if any).
+    refineCur = suggestions.length ? null : currentRefine();
+    if (refineCur) focusRefine();
+    else {
+      var next = suggestions.length ? suggestionBox(suggestions[0]) : nextUndecided(-1);
+      select(next >= 0 ? next : (g.drop >= 0 ? g.keep : g.a), true);
+    }
     say(text + (suggestions.length ? ' ' + suggestions.length + ' more suggestion(s) on this frame.' : ''));
   }
 
@@ -566,6 +582,146 @@
     row.appendChild(decideButton(g.drop >= 0 ? 'Accept: drop box ' + (g.drop + 1) : 'Accept: keep both', 'y', 'ok', acceptOverlap));
     if (suggestions.length > 1) row.appendChild(el('span', 'muted', (suggestions.length - 1) + ' more on this frame'));
     box.appendChild(row);
+    return box;
+  }
+
+  // ---- the dataset check's suggestions (labels.refine) --------------------------------------
+  //
+  // One is current at a time (R.refineCurrent): strongest first, and only once no overlap
+  // suggestion is on screen (those keep `y`). Accept (`y`) and No (`w`) are edits like any other:
+  // one undo step, kept in a draft, saved with the frame by the ordinary save. Anything else the
+  // reviewer does leaves the suggestion open; an edit that makes it no longer apply (a rejected,
+  // moved, too-small or unsure box) ends it by itself (R.liveRefine on the frame as it is now).
+
+  function liveRefine() { return cur ? R.liveRefine(cur.labels, classes, hiddenClasses) : []; }
+
+  // The current suggestion, worked out again (reads `suggestions`).
+  function currentRefine() { return R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff); }
+
+  // What the frame shows for the current suggestion (R.refineFocus), null for none.
+  function refineShown() { return cur && refineCur ? R.refineFocus(refineCur.l, boxes()) : null; }
+
+  // The proposed box of the current add / tighten, as a box the drawing and the close-up take.
+  function ghostBox() {
+    var f = refineShown();
+    if (!f || !f.ghost) return null;
+    var t = boxes()[f.mark];
+    return { bbox: f.ghost, label: refineCur.l.label || (t ? t.label : ''), score: refineCur.l.score, state: 'ghost' };
+  }
+
+  // What the view frames: the selected box; the current suggestion's part of the frame when its
+  // box is selected (a tighter box: both boxes), or when nothing is selected and it adds a box.
+  function viewTarget() {
+    var b = boxes()[selected], f = refineShown();
+    if (f && f.focus && (f.mark >= 0 ? selected === f.mark : !b)) return { bbox: f.focus };
+    return b || null;
+  }
+
+  // The current suggestion's kind for box `i` when it is about that box, else ''.
+  function refineRole(i) {
+    var f = refineShown();
+    return f && f.mark >= 0 && f.mark === i ? refineCur.l.kind : '';
+  }
+
+  // Bring the current suggestion up: select its box (nothing for an add) and frame it the way a
+  // selected box is framed (zoomed while following, else panned into view).
+  function focusRefine() {
+    var f = refineShown();
+    if (!f) return;
+    if (f.mark >= 0) { select(f.mark, true); return; }
+    selected = -1;
+    if (oneColumn.matches) view.follow = pref('follow', true);
+    if (f.focus) {
+      var g = { bbox: f.focus };
+      if (view.follow) zoomTo(g); else panTo(g);
+    }
+    refresh();
+    revealSelected(true);
+  }
+
+  // Whether the current suggestion is the one in view (its box selected, or for an add none).
+  function refineInView() {
+    var f = refineShown();
+    return !!f && (f.mark >= 0 ? selected === f.mark : selected < 0);
+  }
+
+  // What key `y` or `w` acts on now (R.suggestionKey); `repeat`: the key is held down.
+  function suggestionRoute(key, repeat) {
+    if (!cur) return R.suggestionKey(key, false, null, repeat);
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    return R.suggestionKey(key, suggestions.length > 0, currentRefine(), repeat);
+  }
+
+  // `y` (yes) / `w` (no) on the current suggestion, one undo step (R.answerRefine). Then the next
+  // suggestion comes up; after the last, the next box to look at. An accepted add leaves its new
+  // box selected, an ordinary box to adjust or relabel.
+  function answerRefine(yes) {
+    if (!cur) return;
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    var c = currentRefine();
+    if (!c) { say('No dataset check suggestion on this frame.'); return; }
+    var l = c.l, card = R.refineCard(l, boxes(), noHover.matches);
+    var was = dirty;
+    snapshot();
+    var r = R.answerRefine(cur.labels, l, yes, classes, hiddenClasses);
+    if (!r.ok) {
+      undo.pop();
+      dirty = was;
+      refresh();
+      say('That suggestion no longer applies.');
+      return;
+    }
+    lastNudge = null;
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    refineCur = currentRefine();
+    if (yes && l.kind === 'add') select(r.box, true);
+    else if (refineCur) focusRefine();
+    else {
+      var next = nextUndecided(-1);
+      select(next >= 0 ? next : r.box, true);
+    }
+    var text = (card ? (yes ? card.said_yes : card.said_no) : 'Answered') + ' (z undoes).';
+    say(text + (refineCur ? ' ' + refineCur.n + ' more suggestion(s) on this frame.' : ' No suggestion left on this frame: s saves.'));
+  }
+
+  // Later: the next suggestion of this frame, this one stays open (after the last: the first).
+  function putOffRefine() {
+    if (!cur) return;
+    refinePutOff = R.refineLater(liveRefine(), suggestions.length > 0, refinePutOff);
+    refineCur = currentRefine();
+    focusRefine();
+  }
+
+  // The card of the current suggestion: what is suggested, why, the score, its place, the
+  // answers (in the bar at the screen's foot while it shows, else here).
+  function refineBlock(inBar) {
+    if (!refineCur) return null;
+    var l = refineCur.l, card = R.refineCard(l, boxes(), noHover.matches);
+    if (!card) return null;
+    var box = el('div', 'rv-q-sug rv-q-refine');
+    box.appendChild(el('div', 'rv-q-sug-head', card.head));
+    if (l.why) box.appendChild(el('div', 'muted', l.why));
+    box.appendChild(el('div', 'muted', ['Dataset check', card.score, refineCur.k + ' of ' + refineCur.n + ' on this frame']
+      .filter(Boolean).join(' · ')));
+    if (card.note) box.appendChild(el('div', 'rv-q-refine-note', card.note));
+    var row = el('div', 'rv-q-btns');
+    var answers = inBar ? barBtns : row;
+    answers.appendChild(decideButton(card.yes, 'y', 'ok', function () { answerRefine(true); }));
+    answers.appendChild(decideButton(card.no, 'w', card.no_bad ? 'bad' : 'secondary', function () { answerRefine(false); }));
+    if (!refineInView()) {
+      var show = decideButton('Show it', null, 'secondary', focusRefine);
+      show.title = 'Select the box this suggestion is about and bring it into view';
+      row.appendChild(show);
+    }
+    if (refineCur.n > 1) {
+      var later = decideButton('Later', null, 'secondary', putOffRefine);
+      later.title = 'The next suggestion of this frame; this one stays open';
+      row.appendChild(later);
+    }
+    if (row.childNodes.length) box.appendChild(row);
     return box;
   }
 
@@ -694,11 +850,12 @@
 
   // The touch UI's Zoom to box / Fit toggle reads Fit (and fits) while following the selection,
   // or when there is no box to zoom to.
-  function zoomBoxFits() { return view.follow || !boxes()[selected]; }
+  function zoomBoxFits() { return view.follow || !viewTarget(); }
 
   // `x`: zoom to the selected box and keep following the selection (Fit, the wheel or a pan stop it).
+  // With a dataset check suggestion on screen, to what viewTarget frames.
   function zoomToSelected() {
-    var b = boxes()[selected];
+    var b = viewTarget();
     if (!b) { say('No box selected: j selects one.'); return; }
     view.follow = true;
     zoomTo(b);
@@ -728,7 +885,7 @@
 
   function updateViewUi() {
     var zoomed = view.z > 1;
-    var sb = boxes()[selected];
+    var sb = viewTarget();
     if (touchUi.matches) {
       // One toggle: Fit while following the selection (or with no box to zoom to), else Zoom to box.
       if (fitBtn) fitBtn.hidden = true;
@@ -796,11 +953,24 @@
       corners[2], ['s', cx, bb[3]], corners[3], ['w', bb[0], cy]];
   }
 
+  // The size floor's word for box `b` (R.floorNote on the frame's size as it is now, so a resize
+  // or a box being drawn follows), null = nothing to say. Information only.
+  function floorOf(b) { return cur ? R.floorNote(b, cur.width, cur.height, sizeFloor) : null; }
+
   function tagText(b, i) {
     var l = look(b);
     return markOf(b) + (b.difficult ? '?! ' : '') + (i + 1) + ' ' + b.label +
       (b.score != null ? ' ' + fmtScore(b.score) : '') +
-      (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '');
+      (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '') +
+      (floorOf(b) ? ' · too small' : '');
+  }
+
+  // The tag's lead for the box the current dataset check suggestion is about (refineRole).
+  function refineTag(kind) {
+    if (kind === 'verify') return 'check? ';
+    if (kind === 'relabel') return '→ ' + refineCur.l.label + '? ';
+    if (kind === 'tighten') return R.tightenWord(refineCur.l, boxes()) === 'tighter' ? 'tighter? ' : 'better box? ';
+    return '';
   }
 
   // Spotlight on: a selected box is the only bright one (veil over the frame, the others dim).
@@ -851,7 +1021,9 @@
       var dashed = l === 'rejected' || isHint(b);
       var sel = i === selected;
       var role = suggestionRole(i);
-      var dim = spot && !sel && !role;
+      // The box the current dataset check suggestion is about (never while an overlap one shows).
+      var rrole = role ? '' : refineRole(i);
+      var dim = spot && !sel && !role && !rrole;
       ctx.save();
       var shown = isShown(b);
       var strong = l === 'review' || l === 'likely';
@@ -886,6 +1058,18 @@
         ctx.strokeRect(x - o, y - o, w + 2 * o, h + 2 * o);
         ctx.strokeStyle = color;
       }
+      if (rrole) {
+        // Outside the box, in the suggestion's colour: a solid line on a dark one.
+        var ro = 2.5 * lw;
+        ctx.setLineDash([]);
+        ctx.lineWidth = lw * 2.5;
+        ctx.strokeStyle = '#000000';
+        ctx.strokeRect(x - ro, y - ro, w + 2 * ro, h + 2 * ro);
+        ctx.lineWidth = lw * 1.5;
+        ctx.strokeStyle = COLORS.ghost;
+        ctx.strokeRect(x - ro, y - ro, w + 2 * ro, h + 2 * ro);
+        ctx.strokeStyle = color;
+      }
       if (l === 'rejected') {
         ctx.setLineDash(dashed ? [lw * 4, lw * 3] : []);
         ctx.lineWidth = lw;
@@ -901,7 +1085,7 @@
       var tag = showTags && shown && (full || !dim);
       if (tag) {
         if (full) ctx.globalAlpha = 1;
-        var text = (role === 'drop' ? 'drop? ' : (role === 'keep' ? 'keep ' : '')) +
+        var text = (role === 'drop' ? 'drop? ' : (role === 'keep' ? 'keep ' : '')) + refineTag(rrole) +
           ((full || b.state === 'pending' || !b._checked) ? tagText(b, i) : String(i + 1));
         var tw = ctx.measureText(text).width + 2 * pad;
         // Above the box; at the view's top below it when there is room; else inside its top
@@ -923,6 +1107,35 @@
     var hb = boxes()[hoverIdx];
     if (hb && hoverIdx !== selected && !isOff(hb)) drawBox(hb, hoverIdx);
     if (sb && !isOff(sb)) drawBox(sb, selected);
+    // The proposed box of the current dataset check suggestion (add, tighten): dashed in its own
+    // colour over a dark dash, a light fill, its own tag; no box of the frame looks like it.
+    var gb = ghostBox();
+    if (gb) {
+      var gx = gb.bbox[0], gy = gb.bbox[1], gw = gb.bbox[2] - gb.bbox[0], gh = gb.bbox[3] - gb.bbox[1];
+      ctx.save();
+      ctx.fillStyle = 'rgba(178, 107, 255, 0.16)';
+      ctx.fillRect(gx, gy, gw, gh);
+      ctx.setLineDash([lw * 5, lw * 3]);
+      ctx.lineWidth = lw * 3;
+      ctx.strokeStyle = '#000000';
+      ctx.strokeRect(gx, gy, gw, gh);
+      ctx.lineWidth = lw * 1.75;
+      ctx.strokeStyle = COLORS.ghost;
+      ctx.strokeRect(gx, gy, gw, gh);
+      ctx.setLineDash([]);
+      if (showTags) {
+        var gt = (refineCur.l.kind === 'add' ? 'add? ' : 'tighter? ') + gb.label +
+          (gb.score != null ? ' ' + fmtScore(gb.score) : '');
+        var gtw = ctx.measureText(gt).width + 2 * pad;
+        var gtop = window.ReviewTouch.tagTop(gb.bbox, vy0, vy1, th);
+        var gtx = clamp(gx, vx0, Math.max(vx0, vx1 - gtw));
+        ctx.fillStyle = COLORS.ghost;
+        ctx.fillRect(gtx, gtop, gtw, th);
+        ctx.fillStyle = '#000000';
+        ctx.fillText(gt, gtx + pad, gtop + th - pad / 2);
+      }
+      ctx.restore();
+    }
     if (sb && !(gesture && gesture.mode === 'draw' && gesture.moved)) {
       var hs = handleCss(sb.bbox) * cssScale() / z;
       ctx.save();
@@ -987,7 +1200,9 @@
   // and the overview over it shows where that is.
   function drawCrop() {
     if (!cropCanvas) return;
-    var b = boxes()[selected];
+    // With no box selected, the proposed box of a dataset check suggestion (an add).
+    var gb = ghostBox();
+    var b = boxes()[selected] || gb;
     if (!b || !img || !img.complete || !img.naturalWidth || oneColumn.matches) { cropWrap.hidden = true; return; }
     cropWrap.hidden = false;
     var W = canvas.width, H = canvas.height;
@@ -1025,9 +1240,16 @@
     c.strokeStyle = COLORS[look(b)] || '#ffffff';
     var rx = (b.bbox[0] - x0) * k - o, ry = (b.bbox[1] - y0) * k - o, rw = bw * k + 2 * o, rh = bh * k + 2 * o;
     c.strokeRect(rx, ry, rw, rh);
+    if (gb && gb !== b && refineRole(selected) === 'tighten') {
+      // A tighter box proposed for the selected one: dashed in the suggestion's colour.
+      c.lineWidth = 2 * dpr;
+      c.setLineDash([6 * dpr, 3 * dpr]);
+      c.strokeStyle = COLORS.ghost;
+      c.strokeRect((gb.bbox[0] - x0) * k, (gb.bbox[1] - y0) * k, (gb.bbox[2] - gb.bbox[0]) * k, (gb.bbox[3] - gb.bbox[1]) * k);
+    }
     c.setLineDash([]);
     cropTag(c, b, rx, ry, rh, pw, ph, dpr);
-    cropCap.textContent = 'Box ' + (selected + 1) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px, ' +
+    cropCap.textContent = (b === gb ? 'Proposed box' : 'Box ' + (selected + 1)) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px, ' +
       (Math.round(scale * 10) / 10) + 'x';
   }
 
@@ -1118,6 +1340,14 @@
         c.lineWidth = 2.25 * dpr;
         c.strokeStyle = COLORS[look(sb)] || '#ffffff';
         c.strokeRect(r[0], r[1], r[2], r[3]);
+      }
+      var og = ghostBox();
+      if (og) {
+        c.lineWidth = 2 * dpr;
+        c.setLineDash([4 * dpr, 2 * dpr]);
+        c.strokeStyle = COLORS.ghost;
+        c.strokeRect(og.bbox[0] * k, og.bbox[1] * k, (og.bbox[2] - og.bbox[0]) * k, (og.bbox[3] - og.bbox[1]) * k);
+        c.setLineDash([]);
       }
     }
     // The veil outside the part in view, and its outline.
@@ -1271,6 +1501,13 @@
     return c;
   }
 
+  // The chip of the box the current dataset check suggestion is about.
+  function refineChip(i) {
+    var c = el('span', 'rv-chip refine', refineTag(refineRole(i)).trim());
+    c.title = 'Dataset check: ' + (refineCur.l.why || 'a suggestion about this box') + ' (the card above answers it)';
+    return c;
+  }
+
   // A box that is not selected: one row (number, class, state, score); a click selects it.
   function boxRow(b, i) {
     var li = el('li', 'compact st-' + b.state + ' lk-' + look(b));
@@ -1289,7 +1526,10 @@
     else if (dups.near[i] != null) li.appendChild(el('span', 'rv-chip warn', 'overlap'));
     var role = suggestionRole(i);
     if (role) li.appendChild(el('span', 'rv-chip ' + (role === 'drop' ? 'bad' : 'ok'), role === 'drop' ? 'drop?' : 'keep'));
+    else if (refineRole(i)) li.appendChild(refineChip(i));
     if (b.difficult) li.appendChild(el('span', 'rv-chip warn', 'unsure'));
+    var small = floorOf(b);
+    if (small) li.appendChild(el('span', 'rv-chip warn', small.chip));
     var rp = b.state === 'pending' ? repeatOf(b) : null;
     if (rp) li.appendChild(repeatChip(rp));
     li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
@@ -1318,11 +1558,15 @@
     else if (dups.near[i] != null) chips.appendChild(el('span', 'rv-chip warn', 'overlap'));
     var role = suggestionRole(i);
     if (role) chips.appendChild(el('span', 'rv-chip ' + (role === 'drop' ? 'bad' : 'ok'), role === 'drop' ? 'drop?' : 'keep'));
+    else if (refineRole(i)) chips.appendChild(refineChip(i));
     if (b.difficult) chips.appendChild(el('span', 'rv-chip warn', 'unsure'));
+    var small = floorOf(b);
+    if (small) chips.appendChild(el('span', 'rv-chip warn', small.chip));
     if (b.state === 'rejected' && b.reject_reason) chips.appendChild(el('span', 'rv-chip bad', reasonText(b.reject_reason)));
     li.appendChild(chips);
     var ev = evidence(b);
     if (ev) li.appendChild(el('span', 'bx-note', ev));
+    if (small) li.appendChild(el('span', 'bx-note', small.note));
     // Accept / reject / keep / delete and "It's a <auto label>" are the decision bar's buttons.
     li.addEventListener('click', function () { select(i, oneColumn.matches); });
     return li;
@@ -1333,6 +1577,7 @@
     var bs = boxes();
     dups = dupGroups();
     suggestions = liveSuggestions();
+    refineCur = currentRefine();
     // Likely boxes first, then the other flagged ones, the dismissed ones last; each keeps its
     // number (the one on the canvas).
     var order = [];
@@ -1397,7 +1642,7 @@
     if (n) {
       var show = decideButton((dismissedOn ? 'Hide ' : 'Show ') + n + ' hidden', 'i', 'secondary', toggleDismissed);
       show.setAttribute('aria-pressed', dismissedOn ? 'true' : 'false');
-      show.title = 'Boxes the auto-labelers set aside, for a score below ' + DISMISS_SCORE + ' (about 5% were real on public sets) or at a spot you keep rejecting. Accept one if it is real.';
+      show.title = 'Boxes set aside unseen: by the auto-labelers for a score below ' + DISMISS_SCORE + ' (about 5% were real on public sets) or at a spot you keep rejecting, or by the size floor as too small. Accept one if it is real.';
       boxTools.appendChild(show);
     }
     boxTools.hidden = !likely && !n;
@@ -1461,8 +1706,11 @@
 
   // One column while a box is selected and boxes still need a decision (or a check): the selected
   // box's main answers sit in the bar at the screen's foot, Save & next and its row go in the flow.
+  // A dataset check suggestion on screen takes the bar with its two answers.
   function deciding() {
-    if (!oneColumn.matches || !cur || !boxes()[selected]) return false;
+    if (!oneColumn.matches || !cur) return false;
+    if (refineCur) return true;
+    if (!boxes()[selected]) return false;
     var p = progress();
     return p.undecided + p.unchecked > 0;
   }
@@ -1477,13 +1725,18 @@
     if (!cur) return;
     var sugBlock = suggestionBlock();
     if (sugBlock) decide.appendChild(sugBlock);
+    // The dataset check's suggestion (none while an overlap suggestion shows): its answers take the
+    // bar, the selected box's go in the card.
+    var refBlock = refineBlock(inBar && !!decideBar);
+    if (refBlock) decide.appendChild(refBlock);
     var p = progress();
     var b = boxes()[selected];
     if (inBar) renderBarHead(b, p);
     if (!b) {
+      // A proposed box (an add) needs no "no box selected": its card says what to do.
       var off = dismissedOn ? 0 : dismissedCount();
       var tap = noHover.matches;
-      decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked
+      if (!refBlock) decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked
         ? (tap ? 'No box selected: tap one, or turn on Draw to draw one.' : 'No box selected: j selects the next one, drag on the frame to draw one.')
         : (missingAsked === cur.frame ? missingText()
           : (p.total ? (tap ? 'Every box decided: Save & next saves.' : 'Every box decided: s saves.')
@@ -1498,7 +1751,7 @@
       var verb, yes, no;
       if (b.source === 'human') { verb = 'Drawn: '; yes = 'Keep'; no = 'Delete'; }
       else if (b.state === 'accepted') { verb = 'Accepted as '; yes = 'Right, keep'; no = 'No, reject'; }
-      else if (isDismissed(b)) { verb = (b.reason === 'spot_dismissed' ? 'Hidden at a spot you rejected: is it a ' : 'Hidden for its score: is it a '); yes = 'Yes, accept'; no = 'No, reject'; }
+      else if (isDismissed(b)) { verb = (b.reason === 'spot_dismissed' ? 'Hidden at a spot you rejected: is it a ' : (b.reason === 'size_floor' ? 'Hidden as under the size floor: is it a ' : 'Hidden for its score: is it a ')); yes = 'Yes, accept'; no = 'No, reject'; }
       else if (b.state === 'rejected') { verb = 'Rejected: is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
       else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
       q.appendChild(document.createTextNode(verb));
@@ -1521,7 +1774,7 @@
       var btns = el('div', 'rv-q-btns');
       // The main answers: in the card, or (one column, deciding) in the bar at the foot, which
       // leaves the card the other answers as one compact row.
-      var answers = inBar && decideBar ? barBtns : btns;
+      var answers = inBar && decideBar && !refBlock ? barBtns : btns;
       answers.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
       answers.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
       if (b.source !== 'human') {
@@ -1682,6 +1935,15 @@
     meter.appendChild(fill);
     barHead.appendChild(meter);
     var q = el('span', 'rv-bar-q');
+    var card = refineCur ? R.refineCard(refineCur.l, boxes(), true) : null;
+    if (card) {
+      // The answers under it are the suggestion's.
+      q.textContent = card.short;
+      barHead.appendChild(q);
+      barHead.appendChild(el('span', 'rv-bar-count', refineCur.k + ' of ' + refineCur.n + ' suggestions'));
+      barHead.title = p.done + ' of ' + p.total + ' boxes done';
+      return;
+    }
     if (b) {
       var putAway = boxes().some(isPutAway);
       q.appendChild(document.createTextNode('Box ' + (selected + 1) + (putAway ? '' : ' of ' + boxes().length) + ' · '));
@@ -1764,8 +2026,10 @@
     // Touch: the reason chips stay until the selection moves on; Redraw is of the box it started on.
     if (reasonAsk && !reasonAsk.timer && selected !== reasonAsk.sel) clearReason(true);
     if (taps && taps.kind === 'redraw' && selected !== taps.idx) cancelTaps();
-    if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
-    else panTo(boxes()[selected]);
+    // The selected box (or a proposed one: viewTarget).
+    var vt = viewTarget();
+    if (view.follow && vt) zoomTo(vt);
+    else panTo(vt);
     refresh();
     revealSelected(page);
   }
@@ -2275,6 +2539,10 @@
     var u = JSON.parse(undo.pop());
     cur.labels = u.labels;
     lastNudge = null;
+    // A suggestion answered in the undone step is back: the view frames it again.
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    refineCur = currentRefine();
     select(u.selected, true);
     sayProgress();
   }
@@ -3087,6 +3355,7 @@
       loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
+      sizeFloor = j.size_floor || null;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null; taps = null;
       emptyBackup = null; missingAsked = null; frameStart = Date.now();
       // Asking for these frames means asking to see those boxes.
@@ -3103,11 +3372,16 @@
       dups = dupGroups();
       suggestions = liveSuggestions();
       if (suggestions.length) selected = suggestionBox(suggestions[0]);
+      // Else a dataset check suggestion opens on its box (none for an added box: the proposal).
+      refinePutOff = [];
+      refineCur = currentRefine();
+      if (refineCur) selected = R.refineFocus(refineCur.l, boxes()).mark;
       var draftNote = restoreDraft(j);
       // One column: following is the viewer's choice again (a pinch on the last frame stopped it).
       if (oneColumn.matches) view.follow = pref('follow', true);
-      // Following (`x`): the new frame opens zoomed on its first box.
-      if (view.follow && boxes()[selected]) zoomTo(boxes()[selected]);
+      // Following (`x`): the new frame opens zoomed on its first box (or the suggestion's place).
+      var opening = viewTarget();
+      if (view.follow && opening) zoomTo(opening);
       img = new Image();
       img.onload = draw;
       img.src = j.image_url;
@@ -3154,6 +3428,7 @@
     selected = (typeof d.selected === 'number' && d.selected >= 0 && d.selected < boxes().length) ? d.selected : -1;
     dups = dupGroups();
     suggestions = liveSuggestions();
+    refineCur = currentRefine();
     return ['Restored your unsaved edits from before the page was closed.', false];
   }
   window.addEventListener('pagehide', keepDraft);
@@ -3290,6 +3565,8 @@
     dropped.forEach(function (k) { markDuplicate(body.boxes[k]); });
     // Proposals of a "don't want" class are not shown: rejected rather than resolved by default.
     (body.overlap_suggestions || []).forEach(function (s) { delete s._done; });
+    // The dataset check's suggestions go back as the page holds them (answers included).
+    R.refineForSave(body);
     body.boxes.forEach(function (b) {
       delete b._checked;
       delete b._relabelled;
@@ -3305,9 +3582,10 @@
     body.classes_version = cur.labels.classes_version || '';
     // Stacks or overlaps still there after the save: the reviewer looked and kept them, so
     // auto=overlaps and the bulk reject leave the frame alone (as saved: hints go to rejected).
+    // Whatever made a pair on this visit, an accepted dataset check suggestion too
+    // (R.overlapsCheckedOnSave says why the save is the look).
     if (status === 'reviewed') {
-      var left = dupGroups(body.boxes.map(function (b) { return Object.assign({}, b, { state: resolved(b) }); }));
-      if (left.groups.length || left.overlaps.length) body.overlaps_checked = true;
+      if (R.overlapsCheckedOnSave(body.boxes, classes, hiddenClasses)) body.overlaps_checked = true;
       else delete body.overlaps_checked;
     }
     var note = dropped.length ? ' Rejected ' + dropped.length + ' pending stacked duplicate(s).' : '';
@@ -3449,13 +3727,19 @@
     if (f.label.value) parts.push(f.label.value.split(',').join(', '));
     if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
     if (f.auto.value) parts.push(name('auto'));
+    if (f.refine_kind && R.sendsFilter('refine_kind', f.refine_kind.value, f.auto.value)) parts.push(name('refine_kind'));
     summary.textContent = parts.join(', ');
+  }
+  // The kind of dataset check suggestion: offered with that Auto filter only.
+  function showRefineKind() {
+    var f = filtersForm.elements, wrap = $('rv-refine-kind');
+    if (wrap) wrap.hidden = !(f.auto && f.auto.value === 'refine');
   }
   // A link's filters: unknown values are left at the default. `auto=overlaps` alone opens what the
   // Auto filter's choice opens.
   function filtersFromUrl() {
     var q = new URLSearchParams(location.search), f = filtersForm.elements;
-    ['bucket', 'scene', 'camera', 'label', 'auto', 'status', 'source'].forEach(function (k) {
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source'].forEach(function (k) {
       var v = q.get(k), e = f[k];
       if (!v || !e) return;
       if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {
@@ -3468,6 +3752,8 @@
       if (e.options && e.value !== v) e.value = was;
     });
     if (q.get('auto') === 'overlaps' && !q.has('status') && !q.has('source')) showOverlaps();
+    if (q.get('auto') === 'refine' && !q.has('status') && !q.has('source')) showRefine();
+    showRefineKind();
   }
   // A filter change with unsaved edits asks first; kept, the frame stays and the counts follow.
   function filterReload() {
@@ -3490,6 +3776,14 @@
     f.status.value = 'any';
     f.source.value = 'all';
   }
+  // The dataset check judges reviewed frames: "dataset check suggestions" opens every status and
+  // every collected frame, as overlapping boxes does.
+  function showRefine() {
+    var f = filtersForm.elements;
+    f.auto.value = 'refine';
+    f.status.value = 'any';
+    f.source.value = 'all';
+  }
   filtersForm.addEventListener('change', function (ev) {
     // The class picker reports through its own onChange (one reload per change).
     if (ev.target && ev.target.closest && ev.target.closest('.cp')) return;
@@ -3497,6 +3791,11 @@
       showOverlaps();
       say('Overlapping boxes: Status set to any and Frames to all collected, so reviewed frames show too.');
     }
+    if (ev.target && ev.target.name === 'auto' && ev.target.value === 'refine') {
+      showRefine();
+      say('Dataset check suggestions: Status set to any and Frames to all collected, so reviewed frames show too.');
+    }
+    showRefineKind();
     filterReload();
   });
   filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); filterReload(); });
@@ -3527,6 +3826,8 @@
     ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps (stacked, nested or partly overlapping)'],
     ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
     ['Decide', 'y', 'overlap suggestion: accept the one on screen (drops the box marked drop?, as a duplicate; or keeps both as two objects). Doing anything else ignores it'],
+    ['Decide', 'y (dataset check)', 'once no overlap suggestion is on screen, accept the dataset check\'s suggestion (strongest first): add the dashed box, take the other class or the tighter box, or keep a label no model found. Doing anything else leaves it open'],
+    ['Decide', 'w', 'dataset check suggestion: no (not an object, keep the label or the box as they are, or dismiss "no model found"); remembered, the next check does not ask again'],
     ['Decide', 'd', 'unsure: a real object you cannot name for sure: kept out of training, its frame goes to held-out only, ignored by the benchmark (?! on the box); again: not unsure'],
     ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate). Too small is also a button in the decision card: a real object too small to label, no negative, treated like unsure'],
     ['Decide', 'c', 'accept likely: every likely (★) box on the frame; the others stay pending'],
@@ -3662,7 +3963,15 @@
     else if (k === 'd') toggleUnsure();
     else if (k === 't') parkSelected();
     else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
-    else if (k === 'y') acceptOverlap();
+    // `y`: the overlap suggestion on screen, else the dataset check's (R.suggestionKey); `w`: no
+    // to the dataset check's, else nothing (the key stays the browser's). Once per press: a held
+    // key ('held') answers nothing more.
+    else if (k === 'y' || k === 'w') {
+      var route = suggestionRoute(k, ev.repeat);
+      if (route === 'accept' || route === 'dismiss') answerRefine(route === 'accept');
+      else if (route === 'overlap') acceptOverlap();
+      else if (route === 'none') handled = false;
+    }
     else if (k === 'c') { if (!ev.shiftKey) acceptLikely(); }
     else if (k === 'i') toggleDismissed();
     else if (k === '?') openKeys();
@@ -4220,6 +4529,10 @@
       refresh();
     });
   }
+  // A link may name one frame (`?frame=<scene>/<camera>/<date>/<stem>.jpg`, the Refine tab's
+  // "Check these"): read before filtersShown rewrites the address without it.
+  var linkFrame = new URLSearchParams(location.search).get('frame');
+  if (!linkFrame || linkFrame.length > 400 || !/\.jpg$/.test(linkFrame)) linkFrame = null;
   filtersFromUrl();
   filtersShown();
   // A draft (above) opens its frame; the queue's counts load beside it. Gone: the queue as usual.
@@ -4231,6 +4544,14 @@
       draftWaiting = false;
       PrismDraft.drop(DRAFT);
       say('Your unsaved edits from before the page was closed were dropped: their frame is gone.', true);
+      loadNext();
+    });
+  } else if (linkFrame) {
+    // The frame the link names, the counts beside it; Next goes on in the link's filters. Gone: the
+    // queue as usual.
+    loadNext(null, null, true);
+    loadFrame(linkFrame).catch(function () {
+      say('The frame in the link is not in the dataset (any more): showing the queue.', true);
       loadNext();
     });
   } else {

@@ -36,6 +36,10 @@ fn tmp(tag: &str) -> Tmp {
 const CAR: [f32; 4] = [100.0, 100.0, 200.0, 180.0];
 /// Where the fake model finds an unlabelled person.
 const FAR: [f32; 4] = [240.0, 120.0, 290.0, 220.0];
+/// A loose label of the car the fake fold model finds at [`CAR`]: IoU 0.625.
+const LOOSE: [f32; 4] = [100.0, 100.0, 260.0, 180.0];
+/// Where the fake closer look puts that car: IoU 0.97 with [`CAR`], 0.62 with [`LOOSE`].
+const Z: [f32; 4] = [101.0, 100.0, 201.0, 181.0];
 const CAMERAS: [&str; 4] = ["alpha", "bravo", "charlie", "delta"];
 const PER_CAMERA: usize = 3;
 
@@ -57,11 +61,93 @@ struct TrainerFake {
     leak_renamed: bool,
     /// What each run trained on: `train.txt` + `valid.txt` names.
     trained: Mutex<Vec<String>>,
+    /// The `export.json` of each run's fold export.
+    exports: Mutex<Vec<serde_json::Value>>,
+    /// The closer look (`autolabel.py --zoom-pairs`): what each crop answers (default: one car
+    /// at [`Z`]).
+    zoom_dets: Option<serde_json::Value>,
+    /// Cancel after this many crops, the next line cut off mid-line.
+    zoom_stop_after: Option<usize>,
+    /// Fail after this many crops.
+    zoom_fail_after: Option<usize>,
+    /// Frames whose rel contains this are unreadable to the script.
+    zoom_unreadable: Option<&'static str>,
+    /// The training lock file: whether another process could take it during the look.
+    lock_file: Option<PathBuf>,
+    lock_free_in_zoom: Mutex<Vec<bool>>,
+    /// The order of the helper runs: `train` and `zoom`.
+    order: Mutex<Vec<&'static str>>,
+    /// The crop lists the script was given (one JSON value per frame line).
+    crop_lists: Mutex<Vec<Vec<serde_json::Value>>>,
+}
+
+impl TrainerFake {
+    /// The fake `autolabel.py`: its self-check and `--zoom-pairs` (one flushed line per crop).
+    fn zoom(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        if cmd.args.iter().any(|a| a == "--self-check") {
+            on_line("@autolabel {\"event\":\"self_test\",\"passed\":68}");
+            return Ok(());
+        }
+        self.order.lock().unwrap().push("zoom");
+        if let Some(lf) = &self.lock_file {
+            self.lock_free_in_zoom
+                .lock()
+                .unwrap()
+                .push(TrainLock::try_acquire(lf).is_ok());
+        }
+        let list = arg_after(cmd, "--zoom-pairs").unwrap();
+        let out = arg_after(cmd, "--out").unwrap();
+        let dets = self
+            .zoom_dets
+            .clone()
+            .unwrap_or_else(|| serde_json::json!([{"label": "car", "bbox": Z, "score": 0.88}]));
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&list)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        self.crop_lists.lock().unwrap().push(lines.clone());
+        let mut text = String::new();
+        let mut n = 0;
+        on_line("@overlaps {\"event\":\"model\",\"name\":\"rfdetr\"}");
+        for f in &lines {
+            for c in f["crops"].as_array().unwrap() {
+                if self.zoom_stop_after == Some(n) {
+                    text.push_str("{\"id\":99,\"fr");
+                    std::fs::write(&out, &text).unwrap();
+                    cancel.store(true, Ordering::SeqCst);
+                    return Err(anyhow!(Cancelled));
+                }
+                if self.zoom_fail_after == Some(n) {
+                    std::fs::write(&out, &text).unwrap();
+                    bail!("the zoom script died");
+                }
+                let unreadable = self
+                    .zoom_unreadable
+                    .is_some_and(|u| f["frame"].as_str().unwrap().contains(u));
+                let line = if unreadable {
+                    serde_json::json!({"id": c["id"], "frame": f["frame"], "error": "broken"})
+                } else {
+                    serde_json::json!({"id": c["id"], "frame": f["frame"], "boxes": dets})
+                };
+                text.push_str(&line.to_string());
+                text.push('\n');
+                n += 1;
+                on_line(&format!("@overlaps {{\"event\":\"crop\",\"index\":{n}}}"));
+            }
+        }
+        std::fs::write(out, text).unwrap();
+        on_line("@overlaps {\"event\":\"done\"}");
+        Ok(())
+    }
 }
 
 impl CommandRunner for TrainerFake {
     fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
         let d = cmd.display();
+        if d.contains("autolabel.py") {
+            return self.zoom(cmd, on_line, cancel);
+        }
         if !d.contains("train_model.py") {
             return self.inner.run(cmd, on_line, cancel);
         }
@@ -72,6 +158,7 @@ impl CommandRunner for TrainerFake {
             return Ok(());
         }
         let n = self.trains.fetch_add(1, Ordering::SeqCst) + 1;
+        self.order.lock().unwrap().push("train");
         if self.cancel_on == Some(n) {
             cancel.store(true, Ordering::SeqCst);
             return Err(anyhow!(Cancelled));
@@ -124,6 +211,13 @@ impl CommandRunner for TrainerFake {
                 .lock()
                 .unwrap()
                 .extend(t.lines().map(str::to_string));
+        }
+        let report = data.parent().unwrap().join("export").join("export.json");
+        if let Ok(b) = std::fs::read(&report) {
+            self.exports
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&b).unwrap());
         }
         on_line(
             r#"@train {"event":"start","device":"cuda:0","train_images":9,"valid_images":3,"epochs":2}"#,
@@ -242,6 +336,7 @@ impl FoldPredictor for PredictorFake {
                 .collect(),
             device: "ort:cuda".into(),
             cancelled: false,
+            load_s: None,
         })
     }
 }
@@ -531,6 +626,49 @@ fn a_check_writes_suggestions_and_the_report_and_nothing_else() {
     // The work folder is gone, and so is its empty parent.
     assert!(!job.work.exists());
     assert!(!t.0.join("training").join("refine").exists());
+}
+
+#[test]
+fn the_fold_models_train_on_every_label_and_the_report_names_the_floor() {
+    let t = tmp("floor-folds");
+    let dir = t.0.join("dataset");
+    let rels = dataset(&dir);
+    // A second car on every frame, 4 px wide of 320: 4.8 px at 384, under a 10 px floor.
+    for rel in &rels {
+        edit(&dir, rel, |l| {
+            l.boxes.push(accepted("car", [250.0, 10.0, 254.0, 60.0]));
+        });
+    }
+    let mut cfg = config(&t.0);
+    cfg.collect.size_floor = Some(crate::collect::labels::SizeFloor {
+        px: 10.0,
+        input: 384,
+    });
+    let predictor = Arc::new(PredictorFake::default());
+    let fake = trainer();
+    let mut job = plan_refine(&cfg, RefineRequest::default(), &host()).unwrap();
+    job.min_frames = 4;
+    job.predictor = Some(predictor.clone());
+    let out = run(&job, &fake).unwrap();
+    let exports = fake.exports.lock().unwrap();
+    assert_eq!(exports.len(), 4);
+    for e in exports.iter() {
+        assert!(
+            e.get("size_floor").is_none() && e.get("under_floor").is_none(),
+            "a fold export applies no floor: {e}"
+        );
+        assert_eq!(e["ignore_boxes"], 0, "{e}");
+    }
+    let r = &out.result;
+    assert_eq!(r["folds_every_label"], true, "{r}");
+    assert_eq!(
+        r["size_floor"],
+        serde_json::json!({"px": 10.0, "input": 384})
+    );
+    assert_eq!(r["ignore_mode"], "background");
+    // The fold models trained on both cars of each frame, so the class counts hold them: the small
+    // car is still no verify (an ignore region for the judge).
+    assert_eq!(r["found"]["verify"], 0, "{r}");
 }
 
 #[test]
@@ -924,6 +1062,28 @@ fn a_verify_needs_the_boxes_its_fold_model_trained_on() {
 }
 
 #[test]
+fn the_title_counts_epochs_in_the_singular_and_the_plural() {
+    let t = tmp("title");
+    let title = |folds: usize, epochs: u32, frames: &str| {
+        let req = RefineRequest {
+            folds,
+            epochs,
+            frames: super::super::RefineFrames::parse(frames).unwrap(),
+            ..RefineRequest::default()
+        };
+        Task::title(&plan_refine(&config(&t.0), req, &host()).unwrap())
+    };
+    assert_eq!(
+        title(2, 1, ""),
+        "dataset check (2 folds x 1 epoch, all reviewed frames)"
+    );
+    assert_eq!(
+        title(4, 8, "scene=ir"),
+        "dataset check (4 folds x 8 epochs, reviewed frames of scene ir)"
+    );
+}
+
+#[test]
 fn the_training_lock_is_held_from_the_first_fold_to_the_last_write() {
     let t = tmp("lock");
     dataset(&t.0.join("dataset"));
@@ -1155,6 +1315,7 @@ fn the_unseen_check_reads_the_datasets_names() {
         buckets: Vec::new(),
         split: Split::Val,
         labels: LabelFile::default(),
+        floor: None,
     };
     let ok = frame("ir.b.2026-10-21.x.jpg");
     let bad = frame("ir.a.2026-10-21.x.jpg");
@@ -1304,10 +1465,60 @@ fn the_preview_counts_frames_folds_and_what_is_left_out() {
     none.accelerator = None;
     let p = super::super::preview(&cfg, &RefineRequest::default(), &none).unwrap();
     assert!(p.seconds.is_none());
+    assert!(p.time_basis.is_none());
     assert!(
         p.warnings
             .iter()
             .any(|w| w.contains("NVIDIA GPU or Apple silicon"))
+    );
+    // No finished run: the time is the generic estimate, said to be a rough guess.
+    let p = super::super::preview(&cfg, &RefineRequest::default(), &host()).unwrap();
+    assert_eq!(p.time_basis, Some(super::super::TimeBasis::Guess));
+    // A finished run on this GPU (its recipe is the folds'), 150 s per epoch of 1,000 + 100
+    // images in its history: the folds' training at that pace, said to come from that run.
+    let gpu = host().resolve_gpu(None).unwrap().unwrap();
+    let run_dir = t.0.join("training").join("run-a");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let history: String = (1..=10_u32)
+        .map(|e| {
+            format!(
+                "{{\"epoch\":{e},\"elapsed_s\":{},\"metrics\":{{}}}}\n",
+                10.0 + 150.0 * f64::from(e)
+            )
+        })
+        .collect();
+    std::fs::write(run_dir.join("history.jsonl"), history).unwrap();
+    let mut recipe = crate::training::recipe::TrainRecipe::new(
+        crate::resources::catalog::TrainFamily::Rfdetr,
+        "nano",
+    )
+    .unwrap();
+    recipe.imgsz = 384;
+    recipe.batch = 8;
+    let runs = serde_json::json!([{
+        "id": "run-a", "created": "2026-11-11T02:05:06Z", "state": "done",
+        "request": {"recipe": recipe},
+        "device": gpu.describe(),
+        "progress": {"epoch": 10, "elapsed_s": 1520.0, "settings": {"gpu": gpu.name()}},
+        "dataset": {"train_images": 1000, "valid_images": 100},
+        "run_dir": run_dir,
+    }]);
+    let runs_file = crate::training::runs_file(&cfg);
+    std::fs::create_dir_all(runs_file.parent().unwrap()).unwrap();
+    std::fs::write(&runs_file, runs.to_string()).unwrap();
+    let before = std::fs::read(&runs_file).unwrap();
+    let p = super::super::preview(&cfg, &RefineRequest::default(), &host()).unwrap();
+    assert_eq!(std::fs::read(&runs_file).unwrap(), before, "read only");
+    assert_eq!(p.time_basis, Some(super::super::TimeBasis::LastRun));
+    assert_eq!((p.recipe.imgsz, p.recipe.batch), (384, 8));
+    // 12 frames in 4 folds of 3: each fold model trains on 9, 8 epochs.
+    let want = 4.0 * (150.0 / 1100.0 * 9.0 * 8.0 + super::super::FOLD_OVERHEAD_S);
+    let got = p.seconds.unwrap();
+    assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    assert!(
+        super::super::preview_text(&p).contains("(from your last training run)"),
+        "{}",
+        super::super::preview_text(&p)
     );
 }
 
@@ -1336,12 +1547,25 @@ fn planning_needs_a_gpu_and_a_download_allowed_and_stays_out_of_the_config() {
     assert!(plan_refine(&cfg, bad, &host()).is_err());
     let job = plan_refine(&cfg, RefineRequest::default(), &host()).unwrap();
     // The fold run: in the work folder, installed there, registered nowhere.
-    assert!(job.train.run_dir.starts_with(&job.work));
-    assert!(job.train.install_dir().starts_with(&job.work));
-    assert_eq!(job.train.request.recipe.patience, 0);
-    assert!(job.train.request.benchmark_sets.is_empty());
-    assert!(!job.train.request.include_public);
-    assert!(job.train.request.balance.is_off());
+    assert!(job.train.as_ref().unwrap().run_dir.starts_with(&job.work));
+    assert!(
+        job.train
+            .as_ref()
+            .unwrap()
+            .install_dir()
+            .starts_with(&job.work)
+    );
+    assert_eq!(job.train.as_ref().unwrap().request.recipe.patience, 0);
+    assert!(
+        job.train
+            .as_ref()
+            .unwrap()
+            .request
+            .benchmark_sets
+            .is_empty()
+    );
+    assert!(!job.train.as_ref().unwrap().request.include_public);
+    assert!(job.train.as_ref().unwrap().request.balance.is_off());
     assert_eq!(
         job.config.models, cfg.models,
         "no fold model in the config copy"
@@ -1374,6 +1598,401 @@ fn the_queue_runs_it_like_any_other_job() {
         assert_eq!(labels_of(&dir, rel).refine.len(), 1, "{rel}");
     }
     svc.shutdown();
+}
+
+// ---- the closer look at loose labels (`tighten`)
+
+/// [`dataset`] with the car labelled loosely ([`LOOSE`]) on every frame.
+fn loose_dataset(dir: &Path) -> Vec<String> {
+    let rels = dataset(dir);
+    for rel in &rels {
+        edit(dir, rel, |l| l.boxes[0].bbox = LOOSE);
+    }
+    rels
+}
+
+/// A check of `root` with the closer look as `tighten` asks.
+fn plan_look(root: &Path, predictor: &Arc<PredictorFake>, tighten: Option<bool>) -> RefineJob {
+    let req = RefineRequest {
+        tighten,
+        ..RefineRequest::default()
+    };
+    let mut job = plan_refine(&config(root), req, &host()).unwrap();
+    job.min_frames = 4;
+    job.predictor = Some(predictor.clone());
+    job.free_commit = || None;
+    job
+}
+
+/// The `tighten` suggestions of a label file.
+fn tightens(l: &LabelFile) -> Vec<&crate::collect::labels::refine::Suggestion> {
+    l.refine
+        .iter()
+        .filter(|s| s.kind == Kind::Tighten)
+        .collect()
+}
+
+#[test]
+fn the_closer_look_runs_once_after_the_last_fold_and_proposes_better_boxes() {
+    let t = tmp("look");
+    let dir = t.0.join("dataset");
+    let rels = loose_dataset(&dir);
+    let before = files(&dir);
+    let predictor = Arc::new(PredictorFake::default());
+    let job = plan_look(&t.0, &predictor, Some(true));
+    assert!(job.tighten());
+    assert_eq!(job.steps(), 7, "selecting, 4 folds, the look, the report");
+    let fake = TrainerFake {
+        lock_file: Some(job.train.as_ref().unwrap().paths.train_lock_file()),
+        ..trainer()
+    };
+    let (out, shown) = run_shown(&job, &fake);
+    let out = out.unwrap();
+    // One look, after the fourth fold, with the training lock still held.
+    assert_eq!(
+        *fake.order.lock().unwrap(),
+        ["train", "train", "train", "train", "zoom"]
+    );
+    assert_eq!(*fake.lock_free_in_zoom.lock().unwrap(), [false]);
+    // One crop per loose label, the union of the label and the fold model's box.
+    let lists = fake.crop_lists.lock().unwrap();
+    let crops: Vec<&serde_json::Value> = lists[0]
+        .iter()
+        .flat_map(|f| f["crops"].as_array().unwrap())
+        .collect();
+    assert_eq!(crops.len(), 12);
+    assert_eq!(crops[0]["union"], serde_json::json!(LOOSE));
+    drop(lists);
+    // Its step: 6 of 7, named for its count.
+    assert!(
+        shown
+            .iter()
+            .any(|s| s.0 == "looking closer at 12 loose labels" && s.1 == 6 && s.2 == 7),
+        "{shown:#?}"
+    );
+    let last = shown.last().unwrap();
+    assert_eq!((last.0.as_str(), last.1, last.2), (REPORTING, 7, 7));
+    // Its parts (setting up and downloading the weights, the crops, the writes) each count from 0,
+    // yet the bar never goes back, from the first fold to the report.
+    let pcts: Vec<u8> = shown.iter().map(|s| s.3).collect();
+    assert!(pcts.windows(2).all(|w| w[0] <= w[1]), "{shown:#?}");
+    assert!(
+        shown
+            .iter()
+            .any(|s| s.0.starts_with("looking closer") && s.4 == "12 of 12 crops"),
+        "{shown:#?}"
+    );
+    let r = &out.result;
+    assert_eq!(r["tighten"], true, "{r}");
+    assert_eq!(r["loose"], 12);
+    assert_eq!(r["tighten_candidates"], 12);
+    assert_eq!(r["zoomed"], 12);
+    assert_eq!(r["found"]["tighten"], 12);
+    assert_eq!(r["written"]["tighten"], 12);
+    assert_eq!(r["found"]["add"], 12);
+    assert_eq!(r["frames_written"], 12, "a frame written twice counts once");
+    assert!(
+        out.summary.contains(
+            "0 other classes, 12 better-fitting boxes for loose labels (24 of these suggestions \
+             new since the last check, on 12 frames written); 12 loose labels counted, 12 of 12 \
+             sent to a closer look answered"
+        ),
+        "{}",
+        out.summary
+    );
+    // Only `refine` changed: the add and the better box, the label untouched.
+    let after = files(&dir);
+    for (p, was) in &before {
+        let now = &after[p];
+        if is_label_file(p) {
+            let l: LabelFile = serde_json::from_slice(now).unwrap();
+            assert_eq!(&bytes_without_refine(&l), was, "{}", p.display());
+            assert_eq!(l.boxes[0].bbox, LOOSE);
+            let kinds: Vec<Kind> = l.refine.iter().map(|s| s.kind).collect();
+            assert_eq!(kinds, [Kind::Add, Kind::Tighten], "{}", p.display());
+            let s = tightens(&l)[0];
+            assert_eq!((s.target, s.bbox), (Some(LOOSE), Some(Z)));
+            assert_eq!(s.target_label.as_deref(), Some("car"));
+            assert_eq!(s.score, Some(0.88));
+            assert_eq!(s.run, job.id);
+            assert!(s.why.contains("closer look"), "{}", s.why);
+        } else {
+            assert_eq!(now, was, "{} changed", p.display());
+        }
+    }
+    let new: Vec<&PathBuf> = after.keys().filter(|p| !before.contains_key(*p)).collect();
+    assert_eq!(new, [&PathBuf::from("refine").join("report.json")]);
+    assert!(!job.work.exists(), "the candidates and the crops went too");
+    assert_eq!(rels.len(), 12);
+}
+
+#[test]
+fn tighten_is_written_only_where_the_look_answered_and_an_answer_is_kept() {
+    let t = tmp("look-answered");
+    let dir = t.0.join("dataset");
+    let rels = loose_dataset(&dir);
+    // An open better box from an earlier check on every frame, of another place.
+    let old = crate::collect::labels::refine::Suggestion {
+        kind: Kind::Tighten,
+        target: Some(LOOSE),
+        target_label: Some("car".into()),
+        bbox: Some([104.0, 100.0, 204.0, 180.0]),
+        label: None,
+        score: Some(0.6),
+        why: "an earlier look".into(),
+        spot: None,
+        answer: None,
+        run: "old".into(),
+    };
+    for rel in &rels {
+        edit(&dir, rel, |l| l.refine = vec![old.clone()]);
+    }
+    let predictor = Arc::new(PredictorFake::default());
+    // The frames of camera alpha cannot be read by the script: no answer there.
+    let fake = TrainerFake {
+        zoom_unreadable: Some("/alpha/"),
+        ..trainer()
+    };
+    let out = run(&plan_look(&t.0, &predictor, Some(true)), &fake).unwrap();
+    assert_eq!(out.result["zoomed"], 9, "{}", out.result);
+    for rel in &rels {
+        let l = labels_of(&dir, rel);
+        let open = tightens(&l);
+        assert_eq!(open.len(), 1, "{rel}");
+        if rel.contains("/alpha/") {
+            assert_eq!(
+                *open[0], old,
+                "not looked at: the earlier one stays as it was"
+            );
+        } else {
+            assert_eq!(open[0].bbox, Some(Z), "{rel}: replaced by this look's");
+        }
+    }
+    // A reviewer says no to one: a rerun keeps the answer and asks nothing new about that label.
+    let first = rels.iter().find(|r| !r.contains("/alpha/")).unwrap();
+    edit(&dir, first, |l| {
+        let i = l
+            .refine
+            .iter()
+            .position(|s| s.kind == Kind::Tighten)
+            .unwrap();
+        assert!(crate::collect::labels::refine::dismiss(l, i));
+    });
+    let out = run(&plan_look(&t.0, &predictor, Some(true)), &trainer()).unwrap();
+    let l = labels_of(&dir, first);
+    let answered = tightens(&l);
+    assert_eq!(answered.len(), 1);
+    assert!(answered[0].answered(), "{answered:?}");
+    assert_eq!(out.result["found"]["tighten"], 11, "{}", out.result);
+    // A check without the look writes none and deletes none.
+    let kept: Vec<Vec<crate::collect::labels::refine::Suggestion>> = rels
+        .iter()
+        .map(|r| tightens(&labels_of(&dir, r)).into_iter().cloned().collect())
+        .collect();
+    let fake = trainer();
+    let out = run(&plan_look(&t.0, &predictor, Some(false)), &fake).unwrap();
+    assert!(!fake.order.lock().unwrap().contains(&"zoom"));
+    assert_eq!(out.result["tighten"], false);
+    assert_eq!(out.result["found"]["tighten"], 0);
+    assert!(!out.summary.contains("better-fitting"), "{}", out.summary);
+    let now: Vec<Vec<crate::collect::labels::refine::Suggestion>> = rels
+        .iter()
+        .map(|r| tightens(&labels_of(&dir, r)).into_iter().cloned().collect())
+        .collect();
+    assert_eq!(now, kept);
+}
+
+#[test]
+fn a_failed_look_keeps_the_folds_suggestions_and_says_so() {
+    let t = tmp("look-fail");
+    let dir = t.0.join("dataset");
+    let rels = loose_dataset(&dir);
+    let predictor = Arc::new(PredictorFake::default());
+    let fake = TrainerFake {
+        zoom_fail_after: Some(0),
+        ..trainer()
+    };
+    let out = run(&plan_look(&t.0, &predictor, Some(true)), &fake).unwrap();
+    assert!(
+        out.summary
+            .contains("the closer look at them failed (see the warnings)"),
+        "{}",
+        out.summary
+    );
+    let r = &out.result;
+    assert_eq!(r["found"]["add"], 12, "{r}");
+    assert_eq!(r["found"]["tighten"], 0);
+    let warnings = warnings_of(r);
+    assert!(
+        warnings.iter().any(|w| w
+            .starts_with("the closer look at loose labels failed: the zoom check failed")
+            && w.contains("the zoom script died")),
+        "{warnings:?}"
+    );
+    for rel in &rels {
+        let l = labels_of(&dir, rel);
+        assert_eq!(l.refine.len(), 1, "{rel}");
+        assert_eq!(l.refine[0].kind, Kind::Add);
+    }
+    // Too little free commit: refused before the model loads, the same way.
+    let mut job = plan_look(&t.0, &predictor, Some(true));
+    job.free_commit = || {
+        Some(Commit {
+            limit: 16 << 30,
+            available: 1 << 30,
+        })
+    };
+    let fake = trainer();
+    let out = run(&job, &fake).unwrap();
+    assert!(!fake.order.lock().unwrap().contains(&"zoom"));
+    let warnings = warnings_of(&out.result);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("needs about 2.6 GB of free commit")),
+        "{warnings:?}"
+    );
+    // The report says so too.
+    let report: report::RefineReport =
+        serde_json::from_slice(&std::fs::read(report::report_path(&dir)).unwrap()).unwrap();
+    assert!(report.tighten);
+    assert!(report.warnings.iter().any(|w| w.contains("closer look")));
+}
+
+#[test]
+fn a_cancel_during_the_look_keeps_what_finished_and_one_before_it_skips_it() {
+    let t = tmp("look-cancel");
+    let dir = t.0.join("dataset");
+    let rels = loose_dataset(&dir);
+    let predictor = Arc::new(PredictorFake::default());
+    let fake = TrainerFake {
+        zoom_stop_after: Some(5),
+        ..trainer()
+    };
+    let cancel = AtomicBool::new(false);
+    let job = plan_look(&t.0, &predictor, Some(true));
+    let out = run_cancellable(&job, &fake, &cancel).unwrap();
+    assert!(
+        out.summary.starts_with(
+            "stopped by Cancel during the closer look at loose labels, after 5 of 12 crops"
+        ),
+        "{}",
+        out.summary
+    );
+    let r = &out.result;
+    assert_eq!(r["cancelled"], true);
+    assert_eq!(r["folds_done"], 4);
+    assert_eq!(
+        (r["zoomed"].as_u64(), r["found"]["tighten"].as_u64()),
+        (Some(5), Some(5))
+    );
+    let with: usize = rels
+        .iter()
+        .filter(|r| !tightens(&labels_of(&dir, r)).is_empty())
+        .count();
+    assert_eq!(with, 5);
+    assert!(
+        rels.iter()
+            .all(|r| labels_of(&dir, r).refine[0].kind == Kind::Add)
+    );
+    assert!(!job.work.exists());
+    // A Cancel during the folds: no look at all (Cancel means stop), and the report says so.
+    let t = tmp("look-cancel-folds");
+    let dir = t.0.join("dataset");
+    loose_dataset(&dir);
+    let fake = TrainerFake {
+        cancel_on: Some(3),
+        ..trainer()
+    };
+    let out = run_cancellable(
+        &plan_look(&t.0, &predictor, Some(true)),
+        &fake,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!fake.order.lock().unwrap().contains(&"zoom"));
+    assert!(
+        warnings_of(&out.result)
+            .iter()
+            .any(|w| w == "the closer look at loose labels did not run: the check was cancelled"),
+        "{}",
+        out.result
+    );
+}
+
+#[test]
+fn after_a_failed_fold_the_look_still_runs_on_the_finished_folds() {
+    let t = tmp("look-failed-fold");
+    let dir = t.0.join("dataset");
+    let rels = loose_dataset(&dir);
+    let predictor = Arc::new(PredictorFake::default());
+    let job = plan_look(&t.0, &predictor, Some(true));
+    let folds = folds_of(&job);
+    let fake = TrainerFake {
+        fail_on: Some(3),
+        ..trainer()
+    };
+    let e = run(&job, &fake).unwrap_err();
+    assert!(format!("{e:#}").contains("fold 3 of 4"), "{e:#}");
+    assert_eq!(
+        *fake.order.lock().unwrap(),
+        ["train", "train", "train", "zoom"]
+    );
+    let mut looked = 0;
+    for rel in &rels {
+        let n = tightens(&labels_of(&dir, rel)).len();
+        assert_eq!(n, usize::from(folds[rel] < 2), "{rel}");
+        looked += n;
+    }
+    // The task's error says what the look wrote too.
+    assert!(looked > 0);
+    assert!(
+        format!("{e:#}").contains(&format!(
+            "the suggestions of the 2 finished fold(s) were saved, and the closer look at their \
+             loose labels then answered {looked} of {looked} and saved {looked} better-fitting \
+             boxes; the report was written to"
+        )),
+        "{e:#}"
+    );
+    // A look that fails after a failed fold says so.
+    let t = tmp("look-failed-fold-and-look");
+    let dir = t.0.join("dataset");
+    loose_dataset(&dir);
+    let fake = TrainerFake {
+        fail_on: Some(3),
+        zoom_fail_after: Some(0),
+        ..trainer()
+    };
+    let e = run(&plan_look(&t.0, &predictor, Some(true)), &fake).unwrap_err();
+    assert!(
+        format!("{e:#}").contains(
+            "were saved, and the closer look at their loose labels then failed (see the \
+             report's warnings); the report"
+        ),
+        "{e:#}"
+    );
+}
+
+#[test]
+fn planning_the_look_follows_the_weights_and_gates_their_download() {
+    let t = tmp("look-plan");
+    let predictor = Arc::new(PredictorFake::default());
+    // Not downloaded: off by default, on when asked.
+    assert!(!plan_look(&t.0, &predictor, None).tighten());
+    assert_eq!(plan_look(&t.0, &predictor, None).steps(), 6);
+    assert!(plan_look(&t.0, &predictor, Some(true)).tighten());
+    // The weights on disk: on by default, off when told.
+    let paths = crate::resources::export::train::TrainPaths::for_config(&config(&t.0));
+    let (res, dir) = crate::training::overlaps::rfdetr_weights(&paths).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    for p in res.parts {
+        std::fs::File::create(dir.join(p.file_name))
+            .unwrap()
+            .set_len(p.size)
+            .unwrap();
+    }
+    assert!(plan_look(&t.0, &predictor, None).tighten());
+    assert!(!plan_look(&t.0, &predictor, Some(false)).tighten());
 }
 
 /// One detection of a [`DumpLine`] ([`Det`]'s fields).
@@ -1490,6 +2109,7 @@ fn the_dump_writes_a_line_per_frame_and_appends() {
         yaml: t.0.join("m.yaml"),
         family: crate::model::ModelFamilyKind::RfDetr,
         classes: vec!["car".into(), "person".into()],
+        entry: None,
     };
     std::fs::write(&model.onnx, b"x").unwrap();
     std::fs::write(&model.yaml, b"x").unwrap();
@@ -1542,6 +2162,7 @@ fn the_dump_writes_a_line_per_frame_and_appends() {
         frames: BTreeMap::from([("ir/alpha/2026-10-21/a.jpg".to_string(), Vec::new())]),
         device: String::new(),
         cancelled: true,
+        load_s: None,
     };
     let b = DumpPredictor::lines(&model, &a, 0.05, &found).unwrap();
     assert_eq!(String::from_utf8(b).unwrap().lines().count(), 1);
@@ -1655,6 +2276,7 @@ fn read_dump(path: &Path) -> (Detections, usize) {
             frames,
             device: "replay".into(),
             cancelled: false,
+            load_s: None,
         },
         again,
     )
@@ -1696,6 +2318,55 @@ fn a_dump_reads_back_filtered_to_the_noise_floor() {
     assert_eq!(d.frames["ir/a/2026-10-21/x.jpg"][0].bbox, CAR);
 }
 
+/// `values` as the replay prints a distribution: count, min, quartiles, p90, max, and a
+/// histogram over `edges` (bucket `[edge_i, edge_i+1)`, the last open).
+fn distribution(values: &[f32], edges: &[f32]) -> String {
+    if values.is_empty() {
+        return "none".into();
+    }
+    let mut v = values.to_vec();
+    v.sort_by(f32::total_cmp);
+    let q = |p: f64| {
+        let i = ((v.len() - 1) as f64 * p).round() as usize;
+        v[i.min(v.len() - 1)]
+    };
+    let mut hist = Vec::new();
+    for (i, lo) in edges.iter().enumerate() {
+        let hi = edges.get(i + 1).copied();
+        let n = v
+            .iter()
+            .filter(|x| **x >= *lo && hi.is_none_or(|h| **x < h))
+            .count();
+        let name = match hi {
+            Some(h) => format!("{lo:.2}-{h:.2}"),
+            None => format!("{lo:.2}+"),
+        };
+        hist.push(format!("{name}: {n}"));
+    }
+    format!(
+        "n {}, min {:.2}, p25 {:.2}, median {:.2}, p75 {:.2}, p90 {:.2}, max {:.2}; {}",
+        v.len(),
+        v[0],
+        q(0.25),
+        q(0.5),
+        q(0.75),
+        q(0.9),
+        v[v.len() - 1],
+        hist.join(", ")
+    )
+}
+
+#[test]
+fn a_distribution_prints_its_quantiles_and_buckets() {
+    assert_eq!(distribution(&[], &[0.0]), "none");
+    let d = distribution(&[0.5, 0.1, 0.3, 0.7, 0.9], &[0.0, 0.5, 0.75]);
+    assert_eq!(
+        d,
+        "n 5, min 0.10, p25 0.30, median 0.50, p75 0.70, p90 0.90, max 0.90; 0.00-0.50: 2, \
+         0.50-0.75: 2, 0.75+: 1"
+    );
+}
+
 /// The judge and the writes of a check, replayed from a detection dump instead of fold models:
 /// `BOP_REFINE_CONFIG=<config file> BOP_REFINE_REPLAY=<dump of BOP_REFINE_DUMP> cargo test --lib
 /// refine_replay -- --ignored --nocapture`. Selects the reviewed frames and folds them as the job
@@ -1704,7 +2375,14 @@ fn a_dump_reads_back_filtered_to_the_noise_floor() {
 /// label files through the job's own [`RefineJob::write_fold_into`]; trains, predicts and
 /// downloads nothing. It writes suggestions into the copy
 /// (never point it at a dataset someone is reviewing) and no `report.json`, which would replace
-/// the report of the real run that made the dump.
+/// the report of the real run that made the dump. It prints the candidates for the closer look at
+/// loose labels the folds collected.
+///
+/// With `BOP_REFINE_ZOOM=1` it then runs the **real** closer look on them
+/// ([`tighten::run_stage`]: the training environment and RF-DETR L under the config's data root,
+/// the GPU; the crop list and the answers in a temporary folder, removed after) and writes the
+/// `tighten` suggestions into the copy, printing what was looked at and found and the distribution
+/// of IoU(L, Z) and of Z's area over L's.
 #[test]
 #[ignore = "needs a copy of a dataset and a detection dump of refine_real_on_a_copy"]
 fn refine_replay_on_a_copy() {
@@ -1715,22 +2393,51 @@ fn refine_replay_on_a_copy() {
         println!("skipped: BOP_REFINE_CONFIG and BOP_REFINE_REPLAY must both be set");
         return;
     };
+    let zoom = std::env::var("BOP_REFINE_ZOOM").as_deref() == Ok("1");
     let started = Instant::now();
     let cfg = Config::load(&path).unwrap();
-    // Planned as the real test plans it: the same frames, classes, recipe (imgsz) and a new id.
-    let job = plan_refine(
+    // Planned as the real test plans it: the same frames, classes, recipe (imgsz) and a new id;
+    // the closer look only when asked for.
+    let mut job = plan_refine(
         &cfg,
-        RefineRequest::default(),
+        RefineRequest {
+            tighten: Some(zoom),
+            ..RefineRequest::default()
+        },
         &crate::training::capability_now(),
     )
     .unwrap();
+    // The look's crop list and answers go to a temporary folder, not the training folder.
+    job.work = std::env::temp_dir().join(format!("bop-refine-replay-{}", job.id));
     let s = job.select();
     if let Some(why) = &s.refused {
         panic!("{why}");
     }
     let (found, again) = read_dump(&dump);
     let wanted = job.wanted();
-    let mut acc = Acc::new(job.start_report(&s));
+    // The answered suggestions per kind and answer, and the open `tighten` (which a check without
+    // the look never touches).
+    let answered_in = |files: &mut dyn Iterator<Item = LabelFile>| {
+        let mut out: BTreeMap<String, usize> = BTreeMap::new();
+        for l in files {
+            for x in l.refine.iter() {
+                let key = if x.answered() {
+                    format!("{} {:?}", x.kind.as_str(), x.answer)
+                } else if x.kind == Kind::Tighten {
+                    "tighten open".to_string()
+                } else {
+                    continue;
+                };
+                *out.entry(key).or_default() += 1;
+            }
+        }
+        out
+    };
+    println!(
+        "answered suggestions and open tighten before: {:?}",
+        answered_in(&mut s.frames.iter().map(|f| f.labels.clone()))
+    );
+    let mut acc = Acc::new(job.start_report(job.train.as_ref().unwrap(), &s));
     let in_dump = s
         .frames
         .iter()
@@ -1738,10 +2445,12 @@ fn refine_replay_on_a_copy() {
         .count();
     // Fold by fold as the job does: the fold's frames still on disk, judged with the class counts
     // of what its model trained on.
+    let mut candidates: Vec<tighten::FrameCandidates> = Vec::new();
     for i in 0..s.k {
         let (held, train, gone) = job.fold_frames(&s, i);
         let class_boxes = super::super::class_boxes(train.iter().copied(), &wanted);
-        let jctx = job.judge_context(&wanted, &class_boxes);
+        // The selection's one spot table, as the job uses it.
+        let jctx = job.judge_context(&wanted, &class_boxes, &s.spots);
         let rare: Vec<&String> = class_boxes
             .iter()
             .filter(|(_, n)| **n < judge::MIN_CLASS_BOXES)
@@ -1755,9 +2464,94 @@ fn refine_replay_on_a_copy() {
             train.len(),
             judge::MIN_CLASS_BOXES
         );
-        job.write_fold_into(i + 1, s.k, &held, &found, &jctx, &mut acc, &mut |_, _| {})
+        let w = job
+            .write_fold_into(i + 1, s.k, &held, &found, &jctx, &mut acc, &mut |_, _| {})
             .unwrap();
+        candidates.extend(w.candidates);
         acc.rep.folds_done += 1;
+    }
+    let n_candidates = tighten::count(&candidates);
+    println!(
+        "loose pairs {}; candidates for the closer look {n_candidates} on {} frames (fold score >= \
+         {}, a class RF-DETR L sees, not under the floor)",
+        acc.rep.loose,
+        candidates.len(),
+        judge::TIGHTEN_FOLD_SCORE
+    );
+    let mut by_class: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in candidates.iter().flat_map(|f| &f.loose) {
+        *by_class.entry(c.class.as_str()).or_default() += 1;
+    }
+    println!("candidates by class: {by_class:?}");
+    if zoom {
+        // The GPU is the look's, as in a check: refused while anything else trains or labels.
+        let _lock =
+            TrainLock::try_acquire(&job.train.as_ref().unwrap().paths.train_lock_file()).unwrap();
+        let runner = crate::resources::export::SystemRunner;
+        let fetcher = crate::resources::export::cli_fetcher(&cfg.data_root());
+        let look = Instant::now();
+        let k = s.k;
+        let end = tighten::run_stage(
+            &job,
+            &candidates,
+            TaskContext {
+                runner: &runner,
+                fetcher: &fetcher,
+            },
+            &mut |r| match r {
+                TaskReport::Stage {
+                    stage,
+                    percent,
+                    detail,
+                    ..
+                } => println!("{percent}% {stage}: {detail}"),
+                TaskReport::Line(l) if !l.trim().is_empty() => println!("{l}"),
+                TaskReport::Line(_) => {}
+            },
+            (k + 2, k + 3),
+            &AtomicBool::new(false),
+            &mut acc,
+        );
+        let _ = std::fs::remove_dir_all(&job.work);
+        println!(
+            "closer look: {:.1} s; zoomed {} of {}; cancelled {}; failed {:?}",
+            look.elapsed().as_secs_f64(),
+            end.done,
+            end.crops,
+            end.cancelled,
+            end.failed
+        );
+        println!(
+            "tighten found {}, written {}; candidates sent {}, left out by the bound {}",
+            acc.rep.found.tighten,
+            acc.rep.written.tighten,
+            acc.rep.tighten_candidates,
+            acc.rep.tighten_left_out
+        );
+        // Every answered candidate without a proposal, with the rule that stopped it.
+        let mut totals: BTreeMap<&str, usize> = BTreeMap::new();
+        for (rel, c, why) in &acc.tighten_reasons {
+            println!(
+                "  no proposal: {} {rel} {} L {:?} D {:?} ({:.2})",
+                why.as_str(),
+                c.target_label,
+                c.target,
+                c.det,
+                c.det_score
+            );
+            *totals.entry(why.as_str()).or_default() += 1;
+        }
+        println!("no proposal, by reason: {totals:?}");
+        let ious: Vec<f32> = acc.shapes.iter().map(|s| s.0).collect();
+        let areas: Vec<f32> = acc.shapes.iter().map(|s| s.1).collect();
+        println!(
+            "IoU(L, Z): {}",
+            distribution(&ious, &[0.0, 0.3, 0.5, 0.6, 0.7])
+        );
+        println!(
+            "area(Z) / area(L): {}",
+            distribution(&areas, &[0.0, 0.5, 0.75, 0.9, 1.0, 1.1, 1.5])
+        );
     }
     acc.close_failures();
     let mut rep = acc.rep;
@@ -1767,7 +2561,7 @@ fn refine_replay_on_a_copy() {
     println!(
         "run {}; imgsz {}; MATCH_MIN_SCORE {}",
         job.id,
-        job.train.request.recipe.imgsz,
+        job.train.as_ref().unwrap().request.recipe.imgsz,
         judge::MATCH_MIN_SCORE
     );
     println!(
@@ -1780,12 +2574,34 @@ fn refine_replay_on_a_copy() {
         rep.frames_checked, rep.frames_written
     );
     println!(
-        "found: add {}, verify {}, relabel {}",
-        rep.found.add, rep.found.verify, rep.found.relabel
+        "found: add {} ({} at static spots, {} elsewhere), verify {}, relabel {}",
+        rep.found.add,
+        rep.adds_at_spots,
+        rep.found.add - rep.adds_at_spots,
+        rep.found.verify,
+        rep.found.relabel
+    );
+    let spot_recall = |name: &str, r: &report::Recall| {
+        println!(
+            "recall {name}: {} of {} = {:?} (95% {:.3}-{:.3})",
+            r.found, r.boxes, r.recall, r.low, r.high
+        );
+    };
+    println!("static spots {}", rep.static_spots);
+    spot_recall("at static spots", &rep.recall_at_spots);
+    spot_recall("elsewhere", &rep.recall_elsewhere);
+    // The answered suggestions of earlier checks survive a rerun.
+    let mut now = s.frames.iter().filter_map(|f| {
+        let fr = Frame::resolve(&job.dataset_dir, &f.rel.jpg())?;
+        labels::read(&fr.labels).ok().flatten()
+    });
+    println!(
+        "answered suggestions and open tighten after: {:?}",
+        answered_in(&mut now)
     );
     println!(
-        "written: add {}, verify {}, relabel {}",
-        rep.written.add, rep.written.verify, rep.written.relabel
+        "written: add {}, verify {}, relabel {}, tighten {}",
+        rep.written.add, rep.written.verify, rep.written.relabel, rep.written.tighten
     );
     println!("loose {}", rep.loose);
     println!(
@@ -1797,4 +2613,416 @@ fn refine_replay_on_a_copy() {
         println!("  warning: {w}");
     }
     println!("{:.1} s", started.elapsed().as_secs_f64());
+}
+
+/// The static spots of a copy of a dataset at several spot IoUs and dwell shares (the measurement
+/// behind [`statics::SPOT_IOU`] and [`statics::MIN_DAY_SHARE`]): `BOP_REFINE_CONFIG=<config file>
+/// cargo test --lib static_spots_measure -- --ignored --nocapture`. Reads the reviewed frames of
+/// the folder under review as the check selects them; writes nothing. With `BOP_PLAN_EXPORT=<a
+/// Dataset tab export>` it also plans a training run on that export (plan only, nothing written)
+/// with the static cap off and at 20, and prints what each trains on.
+#[test]
+#[ignore = "needs a copy of a dataset"]
+fn static_spots_measure_on_a_copy() {
+    use crate::collect::labels::statics::{self, Table};
+    let Some(path) = std::env::var_os("BOP_REFINE_CONFIG").map(PathBuf::from) else {
+        println!("skipped: BOP_REFINE_CONFIG is not set");
+        return;
+    };
+    let cfg = Config::load(&path).unwrap();
+    let dir = cfg.collect.resolved_review_dir(&cfg.data_root());
+    let (classes, hidden) = (&cfg.collect.classes, &cfg.collect.hidden_classes);
+    let s = super::super::select(
+        &dir,
+        classes,
+        hidden,
+        &super::super::RefineFrames::default(),
+        4,
+        0,
+    );
+    let wanted = Wanted { classes, hidden };
+    let obs = statics::observations(&s.frames, &wanted);
+    println!(
+        "{} reviewed frames, {} training boxes of wanted classes",
+        s.frames.len(),
+        obs.len()
+    );
+    let mut all: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_camera: BTreeMap<&str, usize> = BTreeMap::new();
+    for o in &obs {
+        *all.entry(o.label.clone()).or_default() += 1;
+        if statics::may_be_static(&o.label) {
+            *per_camera.entry(o.camera.as_str()).or_default() += 1;
+        }
+    }
+    println!(
+        "boxes that may be static per camera (clustered whole up to {}): {per_camera:?}",
+        statics::MAX_OBS_PER_CAMERA
+    );
+    // The folder's spots as a "Static objects" card lists them (after a check: open adds).
+    for x in statics::overview(&s.frames, &wanted) {
+        println!(
+            "  spot {}: {} on {} frames of {} days ({} stayed) {:?}; labelled frames {}, frames \
+             with an open add {}",
+            x.spot.id,
+            x.spot.label,
+            x.spot.frames,
+            x.spot.days,
+            x.spot.stay_days,
+            x.spot.scenes,
+            x.labelled,
+            x.open_adds
+        );
+    }
+    // Boxes at a spot per class, static-only frames and frames with two boxes at one spot.
+    let describe = |table: &Table| {
+        let mut at: BTreeMap<String, usize> = BTreeMap::new();
+        for o in &obs {
+            if table.spot_at(&o.camera, &o.label, &o.bbox).is_some() {
+                *at.entry(o.label.clone()).or_default() += 1;
+            }
+        }
+        for (c, n) in &all {
+            println!(
+                "  {c}: {} of {n} boxes at a spot",
+                at.get(c).copied().unwrap_or(0)
+            );
+        }
+        let mut static_only = 0;
+        let mut positive = 0;
+        let mut doubles = 0;
+        for f in &s.frames {
+            let boxes: Vec<(String, [f32; 4])> = f
+                .labels
+                .training()
+                .filter(|b| !b.is_ignore())
+                .filter_map(|b| {
+                    let c = wanted.class_of(&b.label)?;
+                    Some((
+                        c.to_string(),
+                        statics::normalised(&b.bbox, f.width, f.height)?,
+                    ))
+                })
+                .collect();
+            if boxes.is_empty() {
+                continue;
+            }
+            positive += 1;
+            let mut hit: BTreeMap<&str, usize> = BTreeMap::new();
+            for (c, b) in &boxes {
+                if let Some(sp) = table.spot_at(&f.rel.camera, c, b) {
+                    *hit.entry(sp.id.as_str()).or_default() += 1;
+                }
+            }
+            doubles += usize::from(hit.values().any(|n| *n > 1));
+            if table.static_only(&f.rel.camera, boxes).is_some() {
+                static_only += 1;
+            }
+        }
+        println!(
+            "  static-only frames: {static_only} of {positive} frames with boxes ({} frames); \
+             frames with two boxes at one spot: {doubles}",
+            s.frames.len()
+        );
+    };
+    // The dwell rule: every spot with its smallest and median day share, at several shares.
+    let base = Table::build_with(obs.clone(), statics::SPOT_IOU, 0.0);
+    for share in [0.0f32, 0.2, 0.3, 0.5] {
+        let started = Instant::now();
+        let table = Table::build_with(obs.clone(), statics::SPOT_IOU, share);
+        let ms = started.elapsed().as_millis();
+        let by_cam: Vec<String> = table
+            .cameras
+            .iter()
+            .map(|(c, v)| format!("{c} {}", v.len()))
+            .collect();
+        println!(
+            "\n=== spot IoU {} dwell share {share}: {} spots ({}), {ms} ms ===",
+            statics::SPOT_IOU,
+            table.len(),
+            by_cam.join(", ")
+        );
+        for sp in table.spots() {
+            let mut shares: Vec<f64> = sp.day_shares().values().copied().collect();
+            shares.sort_by(f64::total_cmp);
+            let min = shares.first().copied().unwrap_or(0.0);
+            let median = shares
+                .get(shares.len().saturating_sub(1) / 2)
+                .copied()
+                .unwrap_or(0.0);
+            println!(
+                "  {} {}: {} frames, {} days ({} stayed), day share min {min:.2} median \
+                 {median:.2}",
+                sp.id, sp.label, sp.frames, sp.days, sp.stay_days
+            );
+        }
+        // Spots of the table without the rule that this one does not have (by place).
+        for sp in base.spots() {
+            let kept = table
+                .camera(&sp.camera)
+                .iter()
+                .any(|x| x.object == sp.object && labels::iou(&x.bbox, &sp.bbox) >= 0.9);
+            if !kept {
+                println!(
+                    "  REMOVED {} {}: {} frames, {} days, {} of them at share >= {share}",
+                    sp.id,
+                    sp.label,
+                    sp.frames,
+                    sp.days,
+                    sp.day_shares()
+                        .values()
+                        .filter(|v| **v >= f64::from(share))
+                        .count()
+                );
+            }
+        }
+        describe(&table);
+    }
+    for t in [0.5f32, 0.7, 0.8] {
+        let started = Instant::now();
+        let table = Table::build_at(obs.clone(), t);
+        let ms = started.elapsed().as_millis();
+        println!(
+            "\n=== spot IoU {t}, dwell share {} ({} spots, {ms} ms) ===",
+            statics::MIN_DAY_SHARE,
+            table.len()
+        );
+        for (cam, spots) in &table.cameras {
+            let mut by_obj: BTreeMap<&str, usize> = BTreeMap::new();
+            for sp in spots {
+                *by_obj.entry(sp.label.as_str()).or_default() += 1;
+            }
+            // Neighbouring spots: the largest IoU between two representatives of one object.
+            let mut max_pair = 0f32;
+            let mut close = 0;
+            for (i, a) in spots.iter().enumerate() {
+                for b in spots.iter().skip(i + 1) {
+                    if a.object == b.object {
+                        let v = labels::iou(&a.bbox, &b.bbox);
+                        max_pair = max_pair.max(v);
+                        close += usize::from(v >= 0.3);
+                    }
+                }
+            }
+            println!(
+                "  camera {cam}: {} spots {by_obj:?}; frames per spot {:?}; max rep-pair IoU \
+                 {max_pair:.2}, pairs >= 0.3: {close}",
+                spots.len(),
+                spots.iter().map(|s| s.frames).collect::<Vec<_>>()
+            );
+        }
+        describe(&table);
+    }
+    // The plan of a training run on an export, with the static cap off and on.
+    let Some(export) = std::env::var_os("BOP_PLAN_EXPORT").map(PathBuf::from) else {
+        return;
+    };
+    let source = crate::training::dataset::read_export(&export).unwrap();
+    let sources = [source];
+    for cap in [None, Some(20)] {
+        let o = crate::training::dataset::Options {
+            negative_share: cfg.training.negative_share,
+            heldout_share: cfg.training.heldout_share,
+            oversample: cfg.training.oversample,
+            static_cap: cap,
+            ..crate::training::dataset::Options::default()
+        };
+        let started = Instant::now();
+        let p = crate::training::preflight::planned(&sources, &o).unwrap();
+        println!(
+            "\n=== plan of {} with static cap {cap:?} ({} ms) ===",
+            export.display(),
+            started.elapsed().as_millis()
+        );
+        println!(
+            "  training frames {} (positives {}, negatives {}), validation {}, held out {}",
+            p.train.len(),
+            p.stats.train_positives,
+            p.stats.train_negatives,
+            p.valid.len(),
+            p.heldout.len()
+        );
+        println!("  training boxes per class {:?}", p.stats.train_boxes);
+        println!(
+            "  static spots {}, frames capped {}, boxes capped {:?}",
+            p.stats.static_spots, p.stats.static_capped, p.stats.static_capped_boxes
+        );
+        for c in &p.stats.static_caps {
+            println!(
+                "    {} {}: {} frames, {} kept",
+                c.id, c.label, c.frames, c.kept
+            );
+        }
+        for w in &p.warnings {
+            println!("  warning: {w}");
+        }
+    }
+}
+
+/// What a size floor does to a copy of a dataset (the measurement behind `collect.size_floor`'s
+/// default being off and the Refine tab's offer): `BOP_REFINE_CONFIG=<config file>
+/// BOP_FLOOR_OUT=<an empty scratch folder outside the dataset> cargo test --lib size_floor_measure
+/// -- --ignored --nocapture`. Reads the reviewed frames of the folder under review; counts the
+/// boxes under the floor (`BOP_FLOOR=<px>,<input>`, default 10,384); then exports the folder into
+/// `BOP_FLOOR_OUT` with the floor off and on (YOLO only, images copied or linked there: never into
+/// the dataset) and plans a training run on each export in both ignore modes (plan only), and the
+/// floor's export for runs at 384 and 640 px (background, static cap off: `floor_restored`). Never
+/// point `BOP_FLOOR_OUT` at a folder someone uses.
+#[test]
+#[ignore = "needs a copy of a dataset"]
+fn size_floor_measure_on_a_copy() {
+    use crate::collect::labels::SizeFloor;
+    use crate::collect::labels::export::{self as ex, ExportRequest, Format};
+    use crate::training::dataset::{self, IgnoreMode};
+    let (Some(path), Some(out)) = (
+        std::env::var_os("BOP_REFINE_CONFIG").map(PathBuf::from),
+        std::env::var_os("BOP_FLOOR_OUT").map(PathBuf::from),
+    ) else {
+        println!("skipped: BOP_REFINE_CONFIG or BOP_FLOOR_OUT is not set");
+        return;
+    };
+    let floor = std::env::var("BOP_FLOOR")
+        .ok()
+        .and_then(|v| {
+            let (px, input) = v.split_once(',')?;
+            Some(SizeFloor {
+                px: px.trim().parse().ok()?,
+                input: input.trim().parse().ok()?,
+            })
+        })
+        .unwrap_or(SizeFloor {
+            px: 10.0,
+            input: 384,
+        });
+    let cfg = Config::load(&path).unwrap();
+    let dir = cfg.collect.resolved_review_dir(&cfg.data_root());
+    let classes = &cfg.collect.classes;
+    let started = Instant::now();
+    let c = ex::floor_counts(&dir, classes, floor);
+    println!(
+        "=== {} at floor {} px / input {} ({} ms) ===",
+        dir.display(),
+        floor.px,
+        floor.input,
+        started.elapsed().as_millis()
+    );
+    println!(
+        "  {} reviewed frames; {} hold a training box under the floor, {} of them nothing else",
+        c.frames, c.frames_with, c.frames_only
+    );
+    for (class, n) in &c.boxes {
+        println!(
+            "  {class}: {} of {n} training boxes under the floor",
+            c.under.get(class).copied().unwrap_or(0)
+        );
+    }
+    for w in c.warnings.iter().take(5) {
+        println!("  warning: {w}");
+    }
+    let t = &cfg.training;
+    for (name, f) in [("off", None), ("on", Some(floor))] {
+        let req = ExportRequest {
+            formats: vec![Format::Yolo],
+            out_dir: out.join(format!("floor-{name}")),
+            split: ex::SplitConfig::default(),
+            benchmark_split: ex::BenchSplit::Val,
+            include_unreviewed: false,
+            hidden_classes: cfg.collect.hidden_classes.clone(),
+            size_floor: f,
+        };
+        let started = Instant::now();
+        let r = ex::run(&dir, classes, &req).unwrap();
+        println!(
+            "\n=== export, floor {name} ({} ms): {} frames ({} train, {} val), ignore regions {}, \
+             under the floor {:?} ===",
+            started.elapsed().as_millis(),
+            r.frames,
+            r.train,
+            r.val,
+            r.ignore_boxes,
+            r.under_floor
+        );
+        let sources = [dataset::read_export(&r.out_dir).unwrap()];
+        for (mode, cap) in [IgnoreMode::DropFrame, IgnoreMode::Background]
+            .into_iter()
+            .flat_map(|m| [(m, t.static_cap_option()), (m, None)])
+        {
+            let o = dataset::Options {
+                negative_share: t.negative_share,
+                heldout_share: t.heldout_share,
+                oversample: t.oversample,
+                static_cap: cap,
+                ignore: mode,
+                ..dataset::Options::default()
+            };
+            let p = crate::training::preflight::planned(&sources, &o).unwrap();
+            let s = &p.stats;
+            println!(
+                "  {}, static cap {cap:?}: training {} (positives {}, negatives {}), validation \
+                 {}, held out {}; boxes {:?}",
+                mode.as_str(),
+                p.train.len(),
+                s.train_positives,
+                s.train_negatives,
+                p.valid.len(),
+                p.heldout.len(),
+                s.train_boxes
+            );
+            println!(
+                "    frames with an ignore region: left out {} (only regions {}, validation days \
+                 {}), trained with it as background {} {:?}; held-out fingerprint {}",
+                s.ignore_frames,
+                s.ignore_only,
+                s.ignore_valid_day,
+                s.ignore_kept,
+                s.ignore_boxes_background,
+                &p.heldout_fingerprint[..12]
+            );
+        }
+        // The floor's export planned for runs of a known input size (background, no static cap):
+        // its regions are judged again at the run's input.
+        if f.is_none() {
+            continue;
+        }
+        for imgsz in [384, 640] {
+            let o = dataset::Options {
+                negative_share: t.negative_share,
+                heldout_share: t.heldout_share,
+                oversample: t.oversample,
+                static_cap: None,
+                ignore: IgnoreMode::Background,
+                imgsz: Some(imgsz),
+                size_floor: Some(floor),
+                ..dataset::Options::default()
+            };
+            let p = crate::training::preflight::planned(&sources, &o).unwrap();
+            let s = &p.stats;
+            println!(
+                "  background at imgsz {imgsz}, static cap off: training {} (positives {}, \
+                 negatives {}), validation {}, held out {}; boxes {:?}",
+                p.train.len(),
+                s.train_positives,
+                s.train_negatives,
+                p.valid.len(),
+                p.heldout.len(),
+                s.train_boxes
+            );
+            println!(
+                "    trained with a region as background {} {:?}; left out {} (only regions {}, \
+                 validation days {}); floor_restored {:?}; negatives trimmed {}; held-out \
+                 fingerprint {}",
+                s.ignore_kept,
+                s.ignore_boxes_background,
+                s.ignore_frames,
+                s.ignore_only,
+                s.ignore_valid_day,
+                s.floor_restored,
+                s.negatives_trimmed,
+                &p.heldout_fingerprint[..12]
+            );
+            for w in p.warnings.iter().filter(|w| w.contains("size floor")) {
+                println!("    warning: {w}");
+            }
+        }
+    }
 }

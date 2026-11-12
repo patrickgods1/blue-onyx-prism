@@ -297,14 +297,19 @@ pub fn workers_now(trainer: catalog::Trainer) -> WorkerChoice {
 }
 
 /// The dataset options of `request` on `config`: the `training` section's assembly defaults
-/// with the request's scene, classes, renames, excluded mode and balance. The job
-/// ([`plan_job`]) and [`preview_plan`] both build them here, so a preview is the run's plan.
+/// (shares, oversampling, static cap, ignore mode), `collect.size_floor` (the exports' floors are
+/// compared with it) and the request's scene, classes, renames, excluded mode, balance and input
+/// size. The job ([`plan_job`]) and [`preview_plan`] both build them here, so a preview is the
+/// run's plan.
 pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options {
     let t = &config.training;
     let base = dataset::Options {
         negative_share: t.negative_share,
         heldout_share: t.heldout_share,
         oversample: t.oversample,
+        static_cap: t.static_cap_option(),
+        ignore: t.ignore,
+        size_floor: config.collect.size_floor,
         ..dataset::Options::default()
     };
     job::request_options(&base, request)
@@ -328,6 +333,16 @@ pub struct Preview {
 
 /// [`preview_plan`] with what it read, for [`preflight::report`] and [`preflight::run_needs`].
 pub fn preview_parts(config: &Config, request: &TrainRequest) -> Result<Preview> {
+    preview_with(config, request, options_for(config, request))
+}
+
+/// [`preview_parts`] with `options` of the caller's: `train prepare --dry-run` has no model, so no
+/// input size ([`dataset::Options::imgsz`] None).
+pub fn preview_with(
+    config: &Config,
+    request: &TrainRequest,
+    options: dataset::Options,
+) -> Result<Preview> {
     request.balance.validate()?;
     let datasets = if request.datasets.is_empty() {
         &config.training.datasets
@@ -345,7 +360,6 @@ pub fn preview_parts(config: &Config, request: &TrainRequest) -> Result<Preview>
     let public_dir = public_subset_dir(&root);
     let public = request.include_public && public_subset_installed(&root);
     let sources = job::read_sources(&datasets, public.then_some(public_dir.as_path()))?;
-    let options = options_for(config, request);
     let mut plan = preflight::planned(&sources, &options)?;
     if request.include_public && !public {
         plan.warnings.insert(

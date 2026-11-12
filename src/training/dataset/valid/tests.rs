@@ -17,6 +17,7 @@ fn frame(camera: &str, day: &str, name: &str, classes: &[&str]) -> Frame {
             })
             .collect(),
         ignore: Vec::new(),
+        floor_regions: Vec::new(),
         parked: Vec::new(),
         scene: Some("day".into()),
         camera: camera.into(),
@@ -54,6 +55,7 @@ fn source(frames: Vec<Frame>) -> Source {
         frames,
         warnings: Vec::new(),
         notes_known: false,
+        size_floor: None,
     }
 }
 
@@ -610,3 +612,53 @@ fn the_heldout_set_is_what_it_was() {
 }
 
 const HELDOUT_GOLDEN: &str = "5b17e6fb416ceb0a73649740a3aba71e85638f1de1c6f11a05d47c447f5b4398";
+
+/// Frames with ignore regions never validate; a validated day takes its own out of training, and
+/// what training loses with them counts toward the half of a class validation may take.
+#[test]
+fn frames_with_regions_never_validate_and_their_boxes_count_for_the_half_rule() {
+    let mut f = days(12, 20);
+    let region = YoloBox {
+        class: "person".into(),
+        cx: 0.9,
+        cy: 0.9,
+        w: 0.01,
+        h: 0.01,
+    };
+    // Three dog frames with a region on cam0, one plain dog frame on cam5.
+    for i in 0..3 {
+        let mut d = frame("cam0", "2026-10-01", &format!("dog{i}"), &["dog"]);
+        d.ignore.push(region.clone());
+        f.push(d);
+    }
+    f.push(frame("cam5", "2026-10-01", "dog", &["dog"]));
+    let s = vec![source(f)];
+    let with_regions = |r: &FrameRef| !s[0].frames[r.1].ignore.is_empty();
+    let mut validated_cam0 = 0;
+    for seed in 0..40 {
+        let o = Options { seed, ..opts() };
+        let p = plan(&s, &o).unwrap();
+        assert!(!p.valid.iter().any(with_regions), "seed {seed}");
+        assert_whole_days(&s, &p);
+        let trained: usize = p
+            .train
+            .iter()
+            .flat_map(|(r, _)| &s[0].frames[r.1].boxes)
+            .filter(|b| b.class == "dog")
+            .count();
+        assert!(trained >= 2, "seed {seed}: {trained} dog boxes train");
+        let cam0 = p
+            .stats
+            .valid_groups
+            .contains(&"cam0/2026-10-01".to_string());
+        if cam0 {
+            validated_cam0 += 1;
+            assert_eq!(p.stats.ignore_valid_day, 3, "seed {seed}");
+            assert!(!p.train.iter().any(|(r, _)| with_regions(r)));
+        } else {
+            assert_eq!(p.stats.ignore_kept, 3, "seed {seed}");
+        }
+    }
+    // Training would lose 3 of the 4 dog boxes with that day.
+    assert_eq!(validated_cam0, 0);
+}

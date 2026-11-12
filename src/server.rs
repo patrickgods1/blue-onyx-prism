@@ -50,6 +50,10 @@ mod live;
 mod network;
 mod pages;
 mod pick;
+mod refine;
+mod refine_coverage;
+mod refine_floor;
+mod refine_spots;
 mod resources;
 mod review;
 mod sam3_access;
@@ -289,6 +293,38 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/train/import", get(training::import_tab)),
         ("/train/autolabel", get(training::autolabel_tab)),
         ("/train/review", get(review::page)),
+        ("/train/refine", get(refine::page)),
+        ("/v1/refine", get(refine::status)),
+        ("/v1/refine/preview", get(refine::preview)),
+        (
+            "/v1/refine/check",
+            post(refine::start).layer(DefaultBodyLimit::max(refine::BODY_LIMIT)),
+        ),
+        ("/v1/refine/spots", get(refine_spots::spots)),
+        ("/v1/refine/coverage", get(refine_coverage::coverage)),
+        (
+            "/v1/refine/accept-spot",
+            post(refine_spots::accept_spot_route)
+                .layer(DefaultBodyLimit::max(refine_spots::BODY_LIMIT)),
+        ),
+        (
+            "/v1/refine/static-cap",
+            post(refine_spots::static_cap).layer(DefaultBodyLimit::max(refine_spots::BODY_LIMIT)),
+        ),
+        ("/v1/refine/floor", get(refine_floor::floor)),
+        (
+            "/v1/refine/size-floor",
+            post(refine_floor::size_floor).layer(DefaultBodyLimit::max(refine_floor::BODY_LIMIT)),
+        ),
+        (
+            "/v1/refine/ignore-mode",
+            post(refine_floor::ignore_mode).layer(DefaultBodyLimit::max(refine_floor::BODY_LIMIT)),
+        ),
+        (
+            "/v1/refine/resolve-small",
+            post(refine_floor::resolve_small)
+                .layer(DefaultBodyLimit::max(refine_floor::BODY_LIMIT)),
+        ),
         ("/train/dataset", get(train_area::dataset_page)),
         ("/train/train", get(training::train_tab)),
         ("/train/models", get(training::models_tab)),
@@ -1347,6 +1383,18 @@ mod tests {
             "/train/import",
             "/train/autolabel",
             "/train/review",
+            "/train/refine",
+            "/v1/refine",
+            "/v1/refine/preview",
+            "/v1/refine/check",
+            "/v1/refine/spots",
+            "/v1/refine/coverage",
+            "/v1/refine/accept-spot",
+            "/v1/refine/static-cap",
+            "/v1/refine/floor",
+            "/v1/refine/size-floor",
+            "/v1/refine/ignore-mode",
+            "/v1/refine/resolve-small",
             "/train/dataset",
             "/train/train",
             "/train/models",

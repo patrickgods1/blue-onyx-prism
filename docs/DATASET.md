@@ -36,7 +36,8 @@ folder. Nothing is uploaded anywhere.
 <dir>/                                   collect.dir, default <data root>/dataset
   review-queue.jsonl                     frames sent to review (the review page consumes it)
   spots/<camera>.json                    parked spots of the camera (below, Review labels: Spots)
-  refine/report.json                     report of the last dataset check (TRAINING.md, Dataset check)
+  refine/report.json                     report of the last full dataset check (TRAINING.md, Dataset check)
+  refine/report-quick.json               report of the last quick check (`mode: model`; each mode keeps its own)
   <scene>/                               day | night | ir (src/image_stats.rs)
     <camera>/                            camera folder (see below)
       <YYYY-MM-DD>/                      UTC date
@@ -384,7 +385,8 @@ folder; the collector and the Collect tab keep `collect.dir`.
     a pending auto box rejected in bulk for its score has `reason: "low_score"`, a box rejected for an
     unwanted class (outside the list, or in `collect.hidden_classes`) `reason: "other_class"`, a box a
     labelers run set aside for its score `reason: "auto_dismissed"`, a box it set aside at a spot you
-    rejected `reason: "spot_dismissed"` (below);
+    rejected `reason: "spot_dismissed"`, a pending proposal the size floor rule set aside
+    `reason: "size_floor"` (below);
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
@@ -421,6 +423,16 @@ folder; the collector and the Collect tab keep `collect.dir`.
   it exactly like `auto_dismissed`: no hard negative, not in the repeats history, `auto=dismissed` finds
   it, a later run may replace it, no bulk save takes its frame. `spot_rejections` holds the frames rejected
   there when the run looked, for the page's *hidden: you rejected this spot N times*.
+- **`reason: "size_floor"`** (a *hidden* box too, *hidden: under the size floor*): the Refine tab's *Too
+  small* rule set aside a pending model or auto proposal under the saved [size floor](#size-floor) on an
+  unreviewed frame. Every reader treats it exactly like `auto_dismissed`: no ignore region (nobody looked,
+  so it is not known to be a real object), no hard negative, not in the repeats history, no reviewer's
+  decision, `auto=dismissed` finds it, no bulk save takes its frame; accepting or rejecting it by hand
+  clears the reason (a reject with *Too small* then makes it an ordinary ignore region). The rule's
+  *Restore* puts those the saved floor no longer covers (all of them when it is off) back to pending on
+  unreviewed frames. A later labelers run brings one back only when what it finds is not under the floor in
+  force. Like the other dismissals it keeps no frame from retention: an unreviewed frame with nothing but
+  dismissals and no reviewer's decision ages out.
 - **`reason: "parked_spot"`** with **`parked`** (`{since, bbox}`, the spot's date and own box): a labelers
   run accepted the box at a parked spot. It stays out of the repeats history, because a rule made the
   decision. The frame stays `unreviewed`, with `repeat_spot` set. Rejecting the box clears both fields,
@@ -455,7 +467,13 @@ folder; the collector and the Collect tab keep `collect.dir`.
 - **`overlaps_checked`** (written only when true): the reviewer saved the frame as reviewed with stacked
   or overlapping boxes still on it, so they looked and kept them (two real nested cars). `auto=overlaps`
   passes the frame over and `POST /v1/review/reject-stacked` leaves it alone. Kept by saves; cleared when
-  a merge adds a box.
+  a merge adds a box. The Review page decides it on every reviewed save: true when a stack or an
+  overlapping pair is left, whatever made it on that visit (a box drawn, moved or relabelled by hand, or
+  an accepted `refine` suggestion, whose accept alone ends the flag on the file). That is sound because
+  the save is the look: the page marks every pair it holds (the `dup` / `overlap` chips, "Overlap: a+b" in
+  the progress line, "Overlaps box N" with `u` on the selected box), and the save's check pass steps
+  through every decided box not looked at on that visit, so the partner of a new pair is shown before the
+  save unless the reviewer looked at it already or saves again past the check.
 - **`checked_before_reopen`** (written only when true): a rerun's new box took `overlaps_checked` off this
   frame. `POST /v1/review/restore-reopened` gives it back; a restore, a save or an accept-spot of a new box
   clears this field.
@@ -476,7 +494,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
   `kept_score`: the zoom's score on the kept box; `other_score`: the best other detection on the box to
   drop, 0 if none (`two_objects`: the zoom's scores on `a` and `b`). `low_confidence`: the zoom gave no
   answer, so only the witnesses speak. `weak`: `other_score` >= 0.3, where 6 of 17 judged drops removed a
-  real object; the page warns. Kept by saves, merges, X-AnyLabeling imports and every bulk edit.
+  real object; the page warns. Kept by saves, merges, X-AnyLabeling imports and every bulk edit; a save
+  whose body has no `overlap_suggestions` key keeps the stored list (a key that is there, `[]` too, is
+  the client's list).
 - **`refine`** (written only when not empty, at most 64): what the dataset check (`train refine`,
   [Dataset check](TRAINING.md#dataset-check-cross-check)) suggests. Suggestions only: the check changes no
   box, status or `reviewed_at`, and nothing but this list.
@@ -488,18 +508,28 @@ folder; the collector and the Collect tab keep `collect.dir`.
 
   `kind`: `add` (a box for an object no box labels: `bbox`, `label`), `relabel` (another class for a
   training box: `target` and `label`), `verify` (a training box no model found: `target`) or `tighten` (a
-  closer `bbox` for the box `target`; the check does not write it, the file and the page's rules know it).
+  better-fitting `bbox` for a loose label `target`, written by the check's closer look: RF-DETR L on a crop
+  of the label and the fold model's box, docs/TRAINING.md "Closer look at loose labels"; `score` is RF-DETR
+  L's, `label` absent; the box may be tighter than the label, larger or shifted).
   `target` names an existing box by its exact `bbox`: that is the key. `target_label` (written by the check
-  for `verify` and `relabel`; same bounds as `label`): the label of that box when the check ran, compared
+  for `verify`, `relabel` and `tighten`; same bounds as `label`): the label of that box when the check ran, compared
   trimmed and case-insensitive, so of two boxes of different objects with the very same `bbox` the suggestion
   names the right one; without it (files of the first checks) the `bbox` alone is the key. `score`: the fold
-  model's score, 0 to 1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group
-  name, at most 200 bytes. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box
+  model's score, 0 to 1 (a quick check's, `train refine --with-model`: its model's). `why`: the evidence in
+  plain words, at most 300 characters (a quick check's names its model: *mine (never trained on this frame)
+  found a person here, score 0.82*). `spot`: an opaque group
+  name, at most 200 bytes; the check writes it on an `add` at a static spot, the spot's id
+  `<camera>/<object>/<x0>-<y0>-<x1>-<y1>` (`collect::labels::statics`, docs/TRAINING.md "Static spots"):
+  the check's evidence, shown with the suggestion. It names a spot of that check's own table; the Refine
+  tab's Static objects card and its bulk accept place an `add` by its box among the folder's spots now,
+  never by this id. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box
   moved, went or was relabelled away from `target_label`, or that no longer holds, is stale and ignored: an
   `add` that a box of its object now covers; a `tighten` on a box a reviewer drew or moved; a `relabel` on a
   box a reviewer drew or relabelled, or to a class that names the same object; a `verify` on a box a reviewer
-  drew or moved. (A `relabel` on a box a reviewer only moved, and a `tighten` on a box a reviewer only
-  relabelled, stay live.) Staleness is computed when the file is read, never stored, and never an error. So
+  drew or moved; a `tighten`, `relabel` or `verify` whose box is an ignore region (marked unsure,
+  `difficult`, or rejected as `too_small`: the check never judges one). (A `relabel` on a box a reviewer
+  only moved, and a `tighten` on a box a reviewer only relabelled, stay live; taking an unsure mark back
+  makes an unanswered suggestion about that box live again.) Staleness is computed when the file is read, never stored, and never an error. So
   is any suggestion on a skipped frame. `answer`: `kept` (a `verify` the reviewer confirmed: the label stays)
   or `dismissed` (the reviewer said no); an answered suggestion is never live again and stays in the file, so
   a rerun does not ask again, until a check finds its `target` box gone (moved, relabelled, deleted): then
@@ -509,11 +539,21 @@ folder; the collector and the Collect tab keep `collect.dir`.
   accepting any of these three removes the suggestion and ends `overlaps_checked` when the box is now in a
   stack or an open pair; accepting a `verify` answers it `kept`.
 
+  `GET /v1/review/labels` serves the live ones as `refine_live`: `[{"index", "kind", "target",
+  "target_label", "bbox", "label", "score", "why", "spot", "run", "target_box", "replaces"}]`, absent fields
+  `null`; `index` is the place in `refine`, `target_box` (the box `target` names, `null` for an `add`) and
+  `replaces` (the unjudged rejects an `add` takes the place of, closest first) are places in `boxes`. The
+  queue finds the frames with `auto=refine` ([Queue](#queue)).
+
   A `kind` or an `answer` this build does not know (a newer build's) loads as `unknown`, is never live
   and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
-  (`add`, `verify`, `relabel`); answered ones and other kinds stay, and when nothing changed the file is not
-  written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
-  frame first). Kept by saves. A build from before the dataset check ignores the field
+  (`add`, `verify`, `relabel` on every frame it checks; `tighten` only of the labels its closer look
+  answered); answered ones and other kinds stay (over the 64 a frame holds, a check gives up its own new
+  suggestions, never those), and when
+  nothing changed the file is not written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
+  frame first). Kept by saves: a save (`POST /v1/review/labels`) whose body has no `refine` key keeps
+  the stored list with its answers (a script or client that rebuilds the file from the boxes); a key that
+  is there, `[]` too, is the client's list (the page always sends it). A build from before the dataset check ignores the field
   and drops it when it rewrites the file; the list is rebuildable by running the check again (answers are
   lost with it).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
@@ -605,7 +645,8 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` 
 | `repeats` | spot edits or parked spots settled every box (`repeat_spot`, nothing pending, no accepted box the VLM said no to) |
 | `overlaps` | stacked or overlapping boxes no reviewer has looked at (no `overlaps_checked`), any review status |
 | `both` | a pending box two or more labelers found (`labelers`), of a wanted class; most such boxes first (item field `agreed_boxes`) |
-| `dismissed` | a box a labelers run dismissed (`reason: "auto_dismissed"` or `"spot_dismissed"`), pending boxes or not. The page shows those boxes on these frames |
+| `dismissed` | a dismissed box (`reason: "auto_dismissed"` or `"spot_dismissed"` from a labelers run, `"size_floor"` from the size floor rule), pending boxes or not. The page shows those boxes on these frames |
+| `refine` | a live suggestion of the dataset check (`refine`, below; `refine::live` with the class list), any review status; never a skipped frame or one without a label file. Strongest first (item fields `refine_strength` and `refine_open`). `refine_kind=add\|tighten\|relabel\|verify` (only with `auto=refine`, else 400) counts that kind alone |
 
 `auto=overlaps` obeys `status` and `source` like the other filters, and most frames with overlaps need
 `status=any&source=all`: a reviewed frame is often not in `review-queue.jsonl`, and reviewed frames need
@@ -638,6 +679,11 @@ Under `auto=overlaps` the frames with a live suggestion come first, strongest fi
 `overlap_strength`; `collect/labels/overlaps.rs` `strength`): drops with no other detection on the box,
 then with one under 0.2, then under 0.3, then two objects, then the weak band, then the witnesses alone,
 each by the zoom's score. Frames with no live suggestion follow in the order above.
+
+Under `auto=refine` every listed frame has a live suggestion; they come strongest first by the frame's
+strongest one (item field `refine_strength`, `refine::strength`: `add` 4, `relabel` 3, `tighten` 2,
+`verify` 1, times 1000, plus the score in thousandths), then in the order above. `refine_open` is how many of
+the frame's suggestions are live (of `refine_kind` when given).
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the
@@ -834,7 +880,7 @@ Click a box to select it. Drag on the image to draw a new one.
                                        bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0,
                                        attributes.difficult on unsure boxes (left out of YOLO)
   hard_negatives.json                  rejected model / auto boxes (frame, label, bbox, origin, reason, reject_reason), without
-                                       duplicate, too_small, auto_dismissed and spot_dismissed ones
+                                       duplicate, too_small and dismissed (auto_dismissed, spot_dismissed, size_floor) ones
   ignore.json                          ignore regions per image, below, and in `parked` the frames whose
                                        training boxes all came from parked spots (for the training cap)
   frames.json                          `empty_confirmed` and `bulk_accepted`: image names, for a training run whichever
@@ -845,11 +891,16 @@ Click a box to select it. Drag on the image to draw a new one.
 ```
 
 <a id="ignore-regions"></a>**Ignore regions.** A real object not to train on, and no negative either: an
-unsure box (`difficult`), or a box rejected with `reject_reason: too_small`. YOLO has no way to say "skip
-this object", and a frame trained with it unlabelled teaches the object as background, so a training run
-takes such a frame out of train and valid (counted, `ignore_frames` in `dataset.json`, with a warning). It
-stays in the held-out set, where the box is `ignore`: a detection on it counts neither way. `ignore.json`
-at the export's root carries them, in the numbers of a YOLO label line, so no pixel size is needed to read it:
+unsure box (`difficult`), a box rejected with `reject_reason: too_small`, or (with `collect.size_floor`
+set) a training box under the size floor, below. YOLO has no way to say "skip this object", so a training
+run decides what such a frame becomes (`training.ignore`, `docs/TRAINING.md` "Ignore regions"): by default
+(`background`) a frame with a label of the run's classes trains with the object unlabelled, a frame of
+nothing but such objects is left out (it is no "nothing here" frame, confirmed empty or not), and
+validation never holds one; `drop-frame` leaves every such frame out of train and valid, as earlier versions
+did. Counted in `dataset.json` (`ignore_frames`, `ignore_only`, `ignore_valid_day`, `ignore_kept`,
+`ignore_boxes_background`) with a warning. It stays in the held-out set, where the box is `ignore`: a
+detection on it counts neither way. `ignore.json` at the export's root carries them, in the numbers of a
+YOLO label line, so no pixel size is needed to read it:
 
 ```json
 { "version": 1,
@@ -861,6 +912,27 @@ Keys are the image file names of `images/<split>/`, a frame without regions is n
 as reviewed even outside the class list. Written with every export format. A folder without the file has no
 regions, so an export from an older version still reads, with those objects unlabelled as before: export
 again to use them. A damaged file stops the run rather than teach them as background.
+
+<a id="size-floor"></a>**Size floor.** `collect.size_floor` (`{"px": 10, "input": 384}`; off by default)
+says how small an object a model of that input size can learn: a training box whose short side at the
+model's input, `min(w / W, h / H) * input` of the box clamped to the frame, is under `px` cannot be
+learned (measured on 851 reviewed frames with fold models that never saw the camera day, at 384 px: under
+8 px found 6% of the time, 8-12 px 37%, 12-24 px 83%, above that 94%). An export then writes such a box
+(accepted or added, not already an ignore region) as an ignore region: out of the YOLO and the benchmark
+ground truth, in `ignore.json` with `"size_floor": true` (and the floor at the file's top, `size_floor`),
+`ignore: true` in the benchmark manifest, `attributes: {"difficult": true, "size_floor": true}` in COCO.
+X-AnyLabeling files keep it as a plain box: an import would otherwise mark it unsure in the label file for
+good. The label file never changes: the person stays "person, accepted", so another floor is just another
+export. `export.json` records `size_floor` and counts `under_floor` (`train` and `val` per class, and
+`frames_only`, frames left with no label but such regions; never "confirmed empty"). Older builds read such
+an export as one with more unsure boxes. Held-out scores before and after a floor change do not compare:
+the held-out set's ignore regions change, and with them its fingerprint (`heldout_fingerprint`). The
+dataset check judges by the same rule (`docs/TRAINING.md`; its fold models train without it), and a
+training run at a larger input than the floor's gives back the regions that are not under it there
+(`docs/TRAINING.md`, Ignore regions). Accepted and added labels are never rewritten for the floor; the
+Refine tab's one rule only hides *pending proposals* under the floor on unreviewed frames (`reason:
+"size_floor"`, a dismissal like `auto_dismissed`, above), and its *Restore* gives back those a lower floor
+or none no longer covers.
 
 **Split.** Frames are split by whole camera days (camera and date folder), so frames of one camera on
 one day never sit on both sides. That does not mean an unseen camera: other days of a held-out camera

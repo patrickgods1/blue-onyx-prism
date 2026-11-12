@@ -205,6 +205,19 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
 A missing label file means "no objects" (the Ultralytics convention). `ignore.json` beside the labels
 lists [ignore regions](#ignore-regions); no file means none.
 
+Before the Export button, the Dataset tab's Export card can show two lines (`assets/train-dataset.js`,
+`train_area::size_floor_line`):
+
+- **Open suggestions.** When the dataset check left open suggestions, one line: *The dataset check has N open
+  suggestions (A missing boxes, V labels to verify, R other class, T better boxes) on M frames. An export uses
+  the labels as they are: answer them on the Refine tab first, or export anyway.*, with a link to
+  `/train/refine`. The counts are `open` of `GET /v1/refine`, which the page fetches once after it loads (that
+  route keeps them 60 s per folder and class list, so the tab walks no label file itself). Nothing is shown for
+  none open, an unavailable review folder or a failed read. The line only warns; the export is not blocked.
+  The sentence is `DatasetOpen.line` (node-tested).
+- **Size floor.** When `collect.size_floor` is saved, *Size floor: objects under N px at M are left out of the
+  labels of this export.* (rendered by the server with the page; a floor that is off says nothing).
+
 ### Assembly (`src/training/dataset.rs`)
 
 1. **Classes**: the run's list (`--classes`, repeated or comma-separated; the page's class picker) in
@@ -251,6 +264,41 @@ lists [ignore regions](#ignore-regions); no file means none.
    (`dataset::PARKED_CAP`). A frame with several spots stays while one of them has room. The rest
    count as `parked_capped` in `dataset.json`, with a warning. Held-out frames are not capped. The
    frame where you pressed *Real, parked* holds a reviewer's box, so it is not capped.
+   **Static cap** (after the parked-spot cap, on the positive frames it left): fixed cameras see the same
+   parked cars at the same pixels in most frames (on one set of 851 reviewed frames, 2,138 of 2,357 car
+   boxes stood at [static spots](#static-spots)), whoever labelled them, so the plan finds the spots itself,
+   by geometry over the training and validation pool's own frames after the scene filter (exports of any
+   version, no `ignore.json` needed; the frames the parked-spot cap took out are in that pool too: they
+   are looks at the place like any other, they only stay out of training): per camera, the places where
+   boxes of one object (car, truck, bus and van are one) sit at IoU 0.6 or more in normalised coordinates
+   on 10 or more frames of 2 or more days on which the object stayed (the dwell rule, see
+   [Static spots](#static-spots)). Only vehicles and other known inanimate COCO classes form spots:
+   **people and animals never do**, so a person or an animal frame is never capped, and neither is a class
+   renamed into a name of its own (a merged `vehicle`: the pre-flight says so once when the cap is on and no
+   class of the run can form a spot). A frame whose every box of the run's classes (after the class
+   mapping) lies at a spot shows nothing but parked objects; of those, at most `training.static_cap`
+   (default 20, `0` = off, `--static-cap N` on `train prepare` / `train run`) per spot **and class of the
+   box there** stay for training and validation together: a pickup labelled `truck` on 2 days at the place
+   of a car labelled on 60 keeps its frames (one quota for the place lost both days about half the time).
+   They are chosen for variety: round-robin over the quota's (scene, day) groups, the scenes alternating,
+   so the first frame of every group goes before the second of any (seeded order of scenes, days and
+   frames). A frame counting toward several quotas stays while one of them has room and then counts toward
+   all of them, so a quota can end over the cap (its frames were kept for another); each keeps at least
+   the cap or all its frames, whichever is fewer. Never capped: a frame with any other box of the run's
+   classes (a person, a car passing; a box of a class the run does not train does not count, so a parked
+   car beside an untrained label is capped), an empty frame or one whose boxes are all of classes the run
+   does not train (a negative), held-out frames (decided before, so `heldout_fingerprint` is the same
+   with the cap on and off), public frames, frames of an `unknown` camera. The negatives (step 4) and the
+   validation split (step 5) follow on what is left, balancing (step 7) after. `dataset.json` counts
+   `static_capped` and `static_spots`, lists `static_caps` (one entry per spot and class: `id` the spot,
+   `camera`, `label` the class of the quota, `frames`: frames of the pool showing nothing but static
+   objects with a box of that class at that spot, `kept`), largest first, and `static_capped_boxes` (boxes
+   per class on the frames left out); the pre-flight and `train prepare` say *N frame(s) showing nothing
+   but objects parked at M static spot(s) were left out (at most 20 kept per spot and class, across scenes
+   and days); the largest: ...*, and a class with no or fewer than 50 training boxes says how many of its
+   boxes the cap left out and how to turn it off. The plan's spots come from its own pool (the train and
+   validation frames of the ticked exports after the scene filter), the Refine tab's Static objects card
+   from every reviewed frame of the folder under review, so the two can differ (in spots and ids).
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped, those a reviewer confirmed empty or rejected a box on kept first
    (`frames.json`, `hard_negatives.json`, so the Benchmark format need not be ticked; a labelers
@@ -335,8 +383,8 @@ Try it with `--dry-run` first, and compare against an unbalanced run on the same
 Above **Queue training** the page shows what the ticked data would give, for each run (the answer of
 `POST /v1/training/balance-preview`; `train prepare --dry-run` prints the same, `src/training/preflight.rs`):
 boxes per class (train, validation, held out, and by scene), training frames per scene, the splits,
-frames confirmed empty or with a rejected box, frames left out (ignore regions, parked-spot cap, frames
-repeated across exports, the scene filter), the share accepted in bulk, frames of the folder under review
+frames confirmed empty or with a rejected box, frames left out (ignore regions, parked-spot cap, static
+cap with its largest spots, frames repeated across exports, the scene filter), the share accepted in bulk, frames of the folder under review
 not reviewed yet, and disk needed against free per volume.
 
 | Check | Limit (`preflight.rs`) | Result |
@@ -364,23 +412,90 @@ training.
 
 ### Ignore regions
 
-An unsure box (Review tab `d`) or a box rejected as too small (the *Too small* button) means "a real
-object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave a box
-out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling makes
-such a box background. So the frame goes, as for a public set's `ignore` objects:
+> **Changed default (this version): `training.ignore` is `background`.** Earlier versions left out of
+> training and validation every frame that held an unsure or too-small object. Now such a frame trains
+> with the object unlabelled when it also holds a label of the run's classes; only a frame of nothing but
+> such objects is left out. Runs on the same data therefore differ from earlier ones: more training
+> frames, other validation days (a validated day takes its frames with such objects out of both sides),
+> and another number of negatives (their target follows the positive frames). To get the old behaviour
+> back, set `training.ignore` to `drop-frame` (the Refine tab's *Too small* card, or `--ignore drop-frame`
+> on `train prepare|run`). Each run records its mode (`progress.settings.ignore`), and the Comparison card
+> warns when the runs it compares differ in it.
 
-- **Train and valid:** frames with a region are left out, counted as `ignore_frames` in `dataset.json`, with
-  a warning. The scene filter comes first, so only in-scope frames count.
+An unsure box (Review tab `d`), a box rejected as too small (the *Too small* button) or, with
+`collect.size_floor` set, a training box under the size floor (`docs/DATASET.md`, Size floor) means "a
+real object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave
+a box out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling
+makes such a box background. So either the object trains as background or its frame goes. Measured on 851
+reviewed frames with fold models that never saw the camera day (384 px input), objects under about one
+patch are found 6% of the time (under 8 px; 37% at 8-12 px), so as background they teach little that is
+wrong, while leaving the frame out cost every other label on it (with the floor at 10 px / 384 on that
+data, `drop-frame` trained on 527 frames with 136 person boxes, `background` on 568 with all 164).
+`training.ignore` (`--ignore` on `train prepare|run`) decides:
+
+- **`background` (default):** a train frame with a region and at least one box of the run's classes trains
+  with the region simply unlabelled (`ignore_kept`, the regions per class in `ignore_boxes_background`). A
+  frame with nothing but regions is left out (`ignore_only`): an image whose only object is unlabelled
+  would teach "nothing here" exactly where something is, so it is neither a positive nor a negative,
+  confirmed empty or not. Validation never holds a frame with a region (the trainer's validation cannot
+  ignore one): when its camera day is picked for validation it leaves both sides (`ignore_valid_day`; the
+  day is validation's), and that day's loss counts toward the rule that validation takes at most half of a
+  class's boxes. Positives that leave this way do not count for the negative target: the training negatives
+  are trimmed to the positives that train or validate (`negatives_trimmed`, also in `negatives_dropped`;
+  validation's negatives stay). The parked and static caps run before validation is chosen and are not run
+  again, so a capped spot may keep one frame fewer than its cap. When every frame of your own has a region
+  and the public subset is mixed in, validation is the public frames only, with a warning. Without a
+  validation split the trainer validates on the training frames without regions.
+- **`drop-frame`:** every train / valid frame with a region is left out, as earlier versions did; one
+  unsure or tiny object takes its whole frame out of training. No frame with a region is in the pool, so
+  nothing leaves with a validation day and no negative is trimmed.
+
+`ignore_frames` in `dataset.json` counts the frames left out for regions (in `background` mode
+`ignore_only + ignore_valid_day`), with a warning; `dataset.json` records the mode in `options.ignore`, and
+the pre-flight report says it (`ignore_mode`, `ignore_kept`, `ignore_only`, `ignore_valid_day`). The
+scene filter comes first, so only in-scope frames count. The held-out set and its fingerprint do not depend
+on the mode.
 - **Held out:** the frames stay. Their `manifest.json` entry has `objects` for every frame: the boxes read
   back from the frame's YOLO lines, so they score exactly as `labels/` did, and the regions with
   `ignore: true`, renamed like the boxes. A region of a label the run has no class for is left out, as
   predictions of that label are not scored. A detection of the region's label that overlaps it at the IoU
   being scored counts neither way (a detection of another label is still a false positive), the region is
   never a miss, and a frame of regions only is scored as empty. A frame with no objects stays an empty list,
-  so it stays scored as empty.
+  so it stays scored as empty. So the benchmark's "empty frames" (false alerts on frames without objects)
+  include frames whose only objects are ignore regions: an alert on such a frame away from the region
+  counts as a false alert, one on it does not count. That was so for unsure boxes before; a size floor adds
+  frames of only tiny objects.
 
 An export from an older version has no `ignore.json`, so its unsure objects stay unlabelled in training:
 export again.
+
+**The size floor at the run's input.** An export applies `collect.size_floor` at the floor's own `input`
+(`ignore.json` holds the floor, and marks each region it made `size_floor`). A run trains at its recipe's
+`imgsz` (`dataset::Options::imgsz`), and the plan compares the two:
+
+- **Larger input** (a floor at 384, a run at 640): every size floor region of a train / valid frame is judged
+  again at the run's input; one that is not under the floor's `px` there is given back as an ordinary box of
+  its label, mapped through the run's classes and renames like any box (`floor_restored` per label in
+  `dataset.json`, the pre-flight's "under the export's size floor but not at this run's input" line, and a
+  warning). A frame whose regions all come back is a plain frame again (it may validate). Held-out frames
+  keep their regions exactly as exported, so the held-out set and its fingerprint do not change, and a
+  detection on such a region still counts neither way.
+- **Smaller input** (a floor at 640, a run at 384): a box cannot be turned into a region by the plan, so it
+  warns: "this run trains at 384 px, but the size floor of `<export>` was applied at 640: objects of 6.0 to
+  10 px at this run's input are still labels (N on its training frames), though it cannot learn them;
+  export again with the floor's input set to 384".
+- **Unknown** (`train prepare` names no model, so `train prepare` and its `--dry-run` plan with no input
+  size): nothing is given back, and a warning names the export's floor and the regions it made.
+
+The plan also compares the exports' floors: exports made with different floors are named together ("the
+exports were made with different size floors: ..."; a frame in two exports keeps the first one's copy), and
+with `collect.size_floor` set, an export made without a floor ("before it was set, or by an older version")
+or with another one is named with "export again". A floor that is off is not compared (`dataset::Options::
+size_floor` None).
+
+A size floor changes what an export marks as ignore regions, held-out frames included, and so the
+held-out set's fingerprint: benchmark scores of runs trained before and after a floor change do not
+compare (the Comparison card says so: their held-out fingerprints differ).
 
 ### Class inventory
 
@@ -1769,7 +1884,9 @@ yourself, or save with both kept. The twin rules are `liveSuggestions` / `accept
 `train refine` looks for what the labels of your reviewed frames got wrong or left out: objects no box
 labels, labels no model finds, and a box of another class than the one an independent model sees. It
 exists for the frames every trained model has already seen, which `--with-model --missing-only` cannot
-check (it skips them). It is on the command line and the job queue only. **It changes no box, frame
+check (it skips them); for the frames reviewed since your last training run, the
+[quick check with a model](#quick-check-with-a-model) asks that model instead and trains nothing. It
+starts from the Refine tab, the command line or the job queue. **It changes no box, frame
 status, config entry, model file, `runs.json` or `benchmark.json`**: it writes suggestions to
 `LabelFile.refine` and a report, and a box changes only when a reviewer accepts a suggestion.
 
@@ -1781,7 +1898,12 @@ never saw. Before it runs, the job reads the fold model's `train.txt` and `valid
 error if a frame of its own fold is in either, by name and by the source the dataset recorded for each
 image (`image_sources.json` beside the lists: the dataset cuts long names and numbers a name taken twice,
 so a name alone could miss one). The fold model is the training run as it is (`train run`'s
-stages), installed in the job's work folder, registered nowhere and benchmarked never.
+stages), installed in the job's work folder, registered nowhere and benchmarked never. Its export applies no
+size floor, whatever `collect.size_floor` says: the fold models try to learn every label, so the recall by
+size measures what a model of the recipe finds (a model trained under the floor would never find what the
+floor left out, and the table would only repeat the floor). The judge still treats a box under the floor
+as an ignore region, and the per-fold class counts behind `verify` count what the fold model trained on,
+boxes under the floor included.
 
 **The judge** (`refine/judge.rs`, pure) compares the detections of a fold model at score 0.15 or more
 with the frame's training boxes, ignore regions left out. It matches same-object pairs one to one first (best IoU first; car, truck,
@@ -1790,8 +1912,8 @@ verify. Then:
 
 | Result | When |
 |---|---|
-| Loose label (counted in the report, no suggestion) | A matched pair below IoU 0.75 on a box no reviewer drew, moved or relabelled. |
-| `add`: a box for an object no box labels | An unmatched detection at score 0.5 or more, 10 px or more on its short side at model input, that no live box of its object and no ignore box covers, and no judged reject of its object lies on at IoU 0.5 or more. |
+| Loose label (counted in the report) | A matched pair below IoU 0.75 on a box no reviewer drew, moved or relabelled. With a detection at score 0.5 or more, of a class RF-DETR L can see, on a label not too small (the `add` floor), it is a candidate for the [closer look](#closer-look-at-loose-labels-tighten), which may propose a `tighten`. |
+| `add`: a box for an object no box labels | An unmatched detection at score 0.5 or more (0.3 or more at a [static spot](#static-spots) that holds without the frame's camera-day), 10 px or more on its short side at model input, that no live box of its object and no ignore box covers, and no judged reject of its object lies on at IoU 0.5 or more. |
 | `relabel`: another class | A training box no reviewer drew or relabelled, with a detection of another object at score 0.8 or more at IoU 0.7 or more, and no detection of its own object at score 0.3 or more at IoU 0.3 or more. The detection makes no `add`, the box no `verify`. |
 | `verify`: a label no model found | An unmatched training box no reviewer drew or moved, with no detection of its object at score 0.15 or more at IoU 0.3 or more, of a class with 50 boxes or more in the frames its fold model trained on, 10 px or more on its short side. |
 
@@ -1803,7 +1925,8 @@ The constants (`judge.rs`):
 | `LOOSE_IOU_MIN` | 0.1 | IoU from which a detection and a training box of one object are a pair. |
 | `GOOD_IOU` | 0.75 | IoU from which a pair is a good label; below it the label is loose. |
 | `ADD_SCORE` | 0.5 | Score from which an unmatched detection is a missing box. |
-| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. |
+| `ADD_SCORE_AT_SPOT` | 0.3 | The same at a static spot (never for people or animals, which form no spot): measured on the kept 8-epoch fold detections of 851 frames, an uncovered detection at a place labelled on 10 or more other frames of its camera is real about 90% of the time down to 0.3, while elsewhere detections at 0.3-0.5 are almost all false. |
+| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. With `collect.size_floor` set, that rule applies as well (the export's, at its own input size; nothing under either is suggested, so a permissive floor never lets through what the fold models cannot see), and a training box under the floor is an ignore region for the check: no `verify`, `relabel` or loose count, out of the recall but for `recall_by_size` (where it still counts, so a floor can be chosen from it), while it still covers detections of its object (no `add` on it). |
 | `VERIFY_IOU` | 0.3 | IoU from which a detection of the object has found a training box. |
 | `MIN_CLASS_BOXES` | 50 | Boxes of a class in what the fold model trained on (the selection without the fold's frames) from which a `verify` is made for it: a camera day that holds most of a class leaves its own fold model few. |
 | `RELABEL_IOU` | 0.7 | IoU from which another object's detection lies on a training box. |
@@ -1811,6 +1934,134 @@ The constants (`judge.rs`):
 | `RELABEL_BLOCK_SCORE` | 0.3 | Score from which a detection of the labelled object blocks a `relabel`. |
 | `REJECT_BLOCK_IOU` | 0.5 | IoU from which a judged reject of the object blocks an `add` (`labels::MATCH_IOU`). |
 | `FOUND_SCORE`, `FOUND_IOU` | 0.3, 0.5 | When a detection finds a training box in the report's recall. |
+| `TIGHTEN_FOLD_SCORE` | 0.5 | Score from which a fold model's detection of a loose label makes it a candidate for the closer look: weaker finds are too often a short-trained model's guess to spend a crop on (the `add` cut-off). |
+| `TIGHTEN_ZOOM_SCORE` | 0.5 | Score from which a detection of the closer look counts as a box: the overlap check's measured operating point (`overlaps::ZOOM_SCORE`), same model, same crops. |
+| `TIGHTEN_AGREE_IOU` | 0.6 | IoU from which the closer look's box agrees with the fold model's: the overlap check's match IoU (`overlaps::ZOOM_MATCH_IOU`). Two independent looks that agree outvote the label; one alone does not. |
+| `TIGHTEN_SPAN_INSIDE` | 0.8 | Share of a second box of the closer look inside the label from which the label spans that object too, and is not moved onto `Z`: the overlap check's nested share (`stacks::NESTED_SHARE`). |
+| `TIGHTEN_EDGE_PX` | 1 | Pixels within which an edge of `Z` lies on an edge of its crop (inside the image): the object was cut there, no proposal. The script keeps boxes to 0.1 px on whole-pixel crops. |
+| `MAX_TIGHTEN_CANDIDATES` | 2,000 | Most loose labels one check looks at closer, the most confident fold detections first: under 3 minutes at the measured 79 ms per crop, about half an hour on a GPU ten times slower. |
+
+#### Static spots
+
+`collect/labels/statics.rs` (pure) finds the places of a fixed camera where the same object is labelled
+frame after frame (a parked car): the training plan caps the frames that show nothing else
+([static cap](#assembly-srctrainingdatasetrs)), and the dataset check accepts a weaker detection there as
+an `add`. A spot is a cluster of training boxes (accepted or added, no ignore region) of one object of one
+camera, in coordinates normalised to the frame, on at least `MIN_FRAMES` 10 distinct frames of at least
+`MIN_DAYS` 2 days on which the object stayed. **Dwell rule** (`MIN_DAY_SHARE` 0.3): a day counts toward
+`MIN_DAYS` only when the spot is labelled on at least 30% of that camera's frames of that day that have any
+training box (of any class: what the reviewer labelled that day; empty frames are left out, their number
+follows the collector's rate limits rather than the place). Visitors' cars stopping at a gate or a
+driveway mouth now and then, among the day's other traffic, are on a small share of its frames; a parked
+car is on most of them. Clustering per camera and object: the boxes are put in a canonical order (box,
+frame, day, scene, label) so the result depends on the set of boxes only; the box with the most support
+(distinct frames with a box at IoU >= `SPOT_IOU` with it) seeds a cluster, its members are, per frame, the
+unassigned box closest to the representative at IoU >= `SPOT_IOU`, and the representative becomes the
+coordinate-wise (lower) median of the members, both taken again until they settle (at most 20 rounds). A
+cluster on enough frames and days is a candidate; one that is not frees its boxes but none of them seeds
+again. Every member lies within `SPOT_IOU` of one representative box, so two neighbouring parking places
+do not chain into one as single linkage would. Then every box (sampled or not, below) is counted once, in
+one pass, at the candidate of its object with the best IoU at `SPOT_IOU` or more (ties to the first id):
+a spot's `frames`, `days`, `stay_days`, `by_day`, `scenes` and label are those boxes' (one per frame, the
+closest), so they are exactly what `statics::spot_at` finds later; a candidate that no longer meets the
+rule on them (a neighbour took its boxes) is dropped and the rest counted again. A box lies at a spot
+(`statics::spot_at`) at IoU >= `SPOT_IOU` with its representative, same object, best IoU first. Ids are
+`<camera>/<object>/<x0>-<y0>-<x1>-<y1>` with the representative in steps of 2% of the frame (`vehicle` for
+every vehicle class): the same labels give the same ids, a rerun after more labels keeps an id unless the
+median crosses a step, two spots that round alike get `~2`.
+
+**Bounds** (`MAX_OBS_PER_CAMERA` 4,000): a camera with more boxes of classes that may be static is
+clustered on the boxes of a fixed sample of its frames (lowest FNV-1a hash of the frame's path first, whole
+frames; the dwell rule uses the sample's own frames per day), then counted on every frame as above. A spot
+needs 10 frames on 2 days, so a place labelled on 1 in 400 of a camera's boxes still shows up. No neighbour
+list is stored: support is counted on demand by a sweep over the boxes sorted by `x0` within the window an
+IoU of `SPOT_IOU` allows (`x0` within `[x0 - (1-t)/t w, x0 + (1-t) w]` for a box of width `w`), kept as an
+upper bound and recounted only when it reaches the top of a max-heap (supports only fall as boxes are
+assigned, so the seed is the one the eager rule picks; a test compares both on the same boxes).
+Clustering a camera costs O(S x W) IoUs for the S <= 4,000 boxes clustered (W the boxes in one window,
+at most S: at most 16 million for one car parked in every frame) and O(S) memory; counting costs O(N x K)
+for N boxes and K spots of their object, O(N) memory. Storing every neighbour pair had cost one jittered
+car in 20,000 frames 21.6 s and 4.1 GB in a release build; now a test builds the tables of that car in
+20,000 and in 40,000 frames (plus scattered boxes) in under 2 s together in a debug build, and bounds the
+IoUs computed (`clustering_is_bounded_by_the_sample_and_counting_is_linear`). The 851 frames below take
+about 60 ms per table in a debug build.
+
+**Only things that park form spots** (`statics::may_be_static`, one place in the code): a vehicle class
+(car, truck, bus, van, bicycle, motorcycle, train, boat, airplane) or another COCO class that is neither a
+person nor an animal (a bench, a potted plant; aliases such as `pottedplant` apply). People and animals
+(`statics::is_animate`: `person` and the auto-labeler's 33 animal names, `autolabel::Category`, a superset of
+the benchmark's COCO `animal` group, with raccoon, opossum, skunk, fox, deer, squirrel and others) are not
+clustered at all: a person or an animal is never parked, their frames are the scarce data a dataset needs
+most, and the 0.3 `add` cut-off was measured on vehicles. So they make no spot, never make a frame
+static-only (a parked car with a person beside it is not static-only), are never capped and never get the
+lower cut-off. A class this build cannot place, a custom name outside those lists (`groundhog`), forms no
+spot either: the safe side, since a missed cap or a missed low-score `add` costs little while a capped-away
+animal frame costs a scarce class; give such a class a COCO name, or accept that its repeats are not
+capped.
+
+`SPOT_IOU` 0.6 was measured on the 851 reviewed frames of one installation (`static_spots_measure_on_a_copy`,
+2,756 training boxes of wanted classes), before people were excluded (the person spots are listed for the
+record; since then they are none, and nothing else changed: 19 spots at 0.6, the same car and truck counts,
+420 static-only frames instead of 453):
+
+| `SPOT_IOU` | Spots (back / front / garage / patio) | Car boxes at a spot | Truck | Person | Static-only frames (of 731 with boxes) | Largest IoU between two representatives | Frames with two boxes at one spot |
+|---|---|---|---|---|---|---|---|
+| 0.5 | 26 (2 / 7 / 3 / 14) | 2,274 of 2,352 | 126 of 129 | 64 of 243 | 513 | 0.36 | 19 |
+| **0.6** | **23 (2 / 7 / 3 / 11)** | **2,206** | **126** | **43** | **453** | **0.49** | **18** |
+| 0.7 | 24 (1 / 8 / 2 / 13) | 2,162 | 126 | 10 | 418 | 0.63 | 18 |
+| 0.8 | 28 (0 / 9 / 3 / 16) | 2,058 | 126 | 0 | 382 | 0.81 | 16 |
+
+Neighbours do not merge at any of them (the frames with two boxes of one object at one spot, 16 to 19, are
+the same few double labels at every IoU). From 0.7 on, one place splits into two or more spots: two
+representatives overlap at IoU 0.62 to 0.81 (the patio camera's two largest places, 373 and 381 frames at
+0.6, become spots of 308, 338 and smaller ones at 0.8), which would give a place twice the cap. 0.6 keeps
+each place one spot (the closest two representatives, 0.49, are two cars of a row seen at an angle), is the
+IoU the dataset check's 90% measurement used, and puts about 94% of the car boxes in spots on all 851 frames
+(the earlier estimate on one run's training split was 1,243 of 1,472, 84%: more frames make more spots).
+
+`MIN_DAY_SHARE` 0.3 was measured on the same frames (a later copy, 2,761 boxes: five accepted `add`s
+more), at `SPOT_IOU` 0.6, every count over all 851 frames (`static_spots_measure_on_a_copy`):
+
+| Dwell share | Spots (front / garage / patio) | Car boxes at a spot (of 2,357) | Truck (of 129) | Static-only frames (of 731) | Spots it removes |
+|---|---|---|---|---|---|
+| none (0) | 19 (7 / 2 / 10) | 2,211 | 126 | 420 | - |
+| 0.2 | 15 (6 / 2 / 7) | 2,138 | 126 | 412 | four: front 41-1-48-9 (19 frames on 4 days, median day share 0.22), patio 21-5-28-10 (21 on 6, 0.04), 40-0-41-1 (19 on 6, 0.03), 42-0-43-1 (23 on 7, 0.12) |
+| **0.3** | **15 (6 / 2 / 7)** | **2,138** | **126** | **412** | **the same four** |
+| 0.5 | 13 (6 / 2 / 5) | 2,035 | 126 | 371 | those and patio 39-4-44-8 (51 on 2 days, 0.38) and 39-0-41-2 (51 on 8, 0.10) |
+
+The four places 0.2 and 0.3 remove are the smallest of the 19 (19 to 23 frames spread over 4 to 7 days,
+on a few percent of each day's frames): cars at the frame's edge now and then, not parked. Every place of
+hundreds of frames stays at any share (patio 373 and 381 frames at a day share of 0.95 or more, front 158 at
+1.0, the garage truck 123 at 0.94 or more, patio 289 and 286 at 0.47 or more). 0.5 also removes two places
+of 51 frames and leaves mid-sized ones on 2 or 3 qualifying days (patio 0-9-2-14, 137 frames: 2), at the
+edge of `MIN_DAYS`; 0.3 keeps them with the same result as 0.2, so it is the value.
+
+The dataset check builds one spot table per check from its selection (`Selected::spots`, the label
+snapshot every fold uses). Its evidence for a frame leaves out the frame's camera-day
+(`Spot::holds_without`: the spot's frames without that day must still reach 10, and the days the object
+stayed without that day 2), since one day's frames are near copies of each other; it does not leave out
+the whole fold, because the evidence is the reviewer's labels, which the fold model's blindness does not
+concern, and other days of the fold are other looks at the place. An `add` at a spot carries `spot` (the
+id: the check's evidence, shown; the Static objects card places a suggestion by its box, not by this id,
+see the Refine tab), its own class from 0.5 up (a clear truck at a car's place is another vehicle parked
+there) and the spot's most common label through the class list below (a truck found at 0.4 where a car is
+labelled becomes a car), and the reason *a car is labelled at this place on N other frames of this camera;
+a model that never saw this camera-day found one here, score 0.xx* (*found a truck here* when its class
+is not the spot's). Its strength is that of any `add` of its score (`refine::strength` is unchanged: the
+same score ranks the same, at a spot or not). The check's counts (`found`, `adds_at_spots`) are what the
+label files keep: `refine::apply` drops a weaker copy of one finding (two detections of one parked vehicle
+both rewritten to the spot's label), and so does the count.
+
+Replayed on the same 851 frames from the kept detections of a 4 folds x 8 epochs check
+(`refine_replay_on_a_copy`, people and animals excluded): 19 spots, all of vehicles; `add` 172 (151 at
+static spots, 21 elsewhere; 123 before the spot rule), `verify` 20, `relabel` 0; a parked pickup labelled
+on 286 frames of its camera gets an `add` on 64 more frames (41 before). Recall at score 0.3: 2,123 of
+2,266 boxes at static spots (93.7%, 95% 92.6-94.6) against 330 of 490 elsewhere (67.3%, 63.1-71.4). The
+answered suggestions (5 dismissed adds, 1 kept verify) stayed. Again with the dwell rule, the kept counts
+and the confident class, on the later copy (six `add`s of the first replay accepted in between): 15 spots;
+`add` 165 (147 at static spots, 18 elsewhere), `verify` 19, `relabel` 0; recall at score 0.3: 2,093 of
+2,198 boxes at static spots (95.2%, 95% 94.2-96.0) against 365 of 563 elsewhere (64.8%, 60.8-68.7); the
+same 6 answered suggestions stayed.
 
 Detection scores are clamped to 0..1 and boxes to the frame first, so a suggestion never holds what a save
 would refuse. A box "covers" a detection (`labels::covers`) at IoU 0.3 or more, or with at least half of the detection
@@ -1820,14 +2071,17 @@ lock and on the file as it is then: a frame saved back to unreviewed or skipped 
 and a confirmed-empty frame can get an `add`.
 
 **What it writes.** `refine::apply` changes `LabelFile.refine` and nothing else: the unanswered suggestions
-of the kinds the check makes (`add`, `verify`, `relabel`) are replaced by what it found; answered ones and
-other kinds stay, except an answered `verify` or `relabel` whose box is gone (moved, relabelled, deleted):
+of the kinds a fold makes (`add`, `verify`, `relabel`) are replaced by what it found, and the closer look
+replaces the unanswered `tighten` of the labels it answered (see below); answered ones and
+other kinds stay, except an answered `verify`, `relabel` or `tighten` whose box is gone (moved, relabelled, deleted):
 it could never be live again and is dropped (an answered `add` stays: it keeps the question from coming
 back). A found suggestion is dropped when it is the same finding as an answered one (the same `target` and,
 when both have one, `target_label`; for an `add`, a box of the same object at IoU 0.5 or more), a weaker
 copy of another found one, or outside what a save accepts.
 A frame holds at most 64, strongest first (`add`, then `relabel`, then `tighten`, then `verify`, then by
-score). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
+score). Over 64, a write gives up its own found suggestions, the weakest first: it never pushes out an
+answered one or one of a kind another write owns (the closer look's `tighten` never displaces a fold's
+`verify`, nor a fold's `add` an open `tighten`). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
 page can still save. The file format is in [DATASET.md](DATASET.md#label-file-version-1).
 
 **What a reviewer's answer does** (`refine::accept`, `refine::dismiss`; stale suggestions change nothing):
@@ -1842,24 +2096,68 @@ page can still save. The file format is in [DATASET.md](DATASET.md#label-file-ve
 A dismissal changes no box. Answers are remembered: a rerun does not ask the same question again. A
 suggestion names its box by `target` and `target_label`, so two boxes of different objects drawn at the
 same place each get their own.
-`tighten` is read and accepted by the code but the check does not make it.
+The reviewer's own edits end a suggestion without an answer (`refine::live`, computed when the file is
+read): a `relabel`, `tighten` or `verify` is stale once its box is rejected (also as too small), marked
+unsure (`d`), deleted, moved (`tighten`, `verify`) or relabelled (`relabel`). An unsure
+or too-small box is an ignore region, which the judge never judges either; taking the unsure mark back
+makes an unanswered suggestion about it live again. An `add` is stale once a box of its object or an ignore
+box covers it, or a judged reject of its object lies on it.
 
-**The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each check;
-the dataset walkers and retention do not look in `refine/`). Fields: `version`, `run`, `created`,
+**Finding them on the Review tab.** `GET /v1/review/next?auto=refine` lists the frames with a live
+suggestion, of any review status (they are mostly reviewed frames, so add `status=any&source=all`),
+strongest first by the frame's strongest suggestion (item fields `refine_strength` and `refine_open`, the
+number of live suggestions); `refine_kind=add|tighten|relabel|verify` (only with `auto=refine`) narrows the
+filter, the order and the count to one kind. A frame without a label file is never listed, a skipped one
+neither. Classes are spelled and filtered through `collect.classes` and `collect.hidden_classes`, as the page
+shows them. `GET /v1/review/labels` answers `refine_live` beside `overlap_live`: the live suggestions, each
+`{index, kind, target, target_label, bbox, label, score, why, spot, run, target_box, replaces}` (`index`
+into `labels.refine`, `target_box` and `replaces` into `labels.boxes`). The page answers them in
+`assets/review-rules.js` (`liveRefine`, `acceptRefine`, `dismissRefine`, twins of `refine::live`, `accept`
+and `dismiss`, compared in `tests/it/js_rules.rs`) and saves the file as usual: an answer is a change to
+the file a save checks (`refine::check`) and keeps; a check that wrote the frame meanwhile makes the save a
+409 like any other write. A big folder answers `auto=refine` from the review index like the other filters.
+
+**The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each full
+check; a [quick check](#quick-check-with-a-model) writes its own `refine/report-quick.json`, so each mode keeps
+its last report and neither replaces the other; the dataset walkers and retention do not look in
+`refine/`). Fields: `version`, `run`, `created`,
 `cancelled`, `folds`, `folds_done`, `recipe` (`model`, `imgsz`, `epochs`, `batch`, `from`), `camera_days`,
 `frames_selected`, `frames_checked`, `left_out` (`pending`, `off_class_list`, `lost`, `unreadable`,
-`unreadable_folders`, `filtered`), `written` and `found` (`add`, `verify`, `relabel`), `frames_written`,
-`loose`, `found_score`, `found_iou`, `recall`, `recall_by_group` (camera x scene x class), `recall_by_size`
-(short side at model input: under 8, 8-12, 12-24, 24-48, 48+ px) and `warnings`. Each recall has `boxes`,
+`unreadable_folders`, `filtered`), `written` and `found` (`add`, `verify`, `relabel`, `tighten`; `tighten`
+absent in earlier reports, read as 0), `frames_written` (a frame the folds and the closer look both wrote
+counts once), `loose`, `tighten` (the check took the closer look; false in earlier reports),
+`tighten_candidates` (loose labels sent to it), `tighten_left_out` (candidates past its limit of 2,000,
+not sent; absent in earlier reports), `zoomed` (of those sent, the crops it answered), `found.tighten`
+(this check's proposals that were kept, not earlier checks' open ones left in place), `found_score`,
+`found_iou`, `recall`, `recall_by_group` (camera x scene x class), `recall_by_size`
+(short side at model input: under 8, 8-12, 12-24, 24-48, 48+ px), `static_spots` (spots of the selection),
+`recall_at_spots` and `recall_elsewhere` (training boxes at a static spot that holds without their
+camera-day, and the others), `adds_at_spots` (of `found.add`, those at a spot; the last four absent in
+reports of earlier checks, read as 0), `folds_every_label` (true: the fold exports applied no size floor, so
+the fold models trained on every label; false in reports of earlier checks, whose fold exports applied the
+floor in force then), `size_floor` (the `collect.size_floor` the judge used; absent when off or in earlier
+reports), `ignore_mode` (`training.ignore` the fold models trained with; absent in earlier reports and in
+quick checks), `mode` (`folds`, or `model` for a [quick check](#quick-check-with-a-model); absent in earlier
+reports, read as `folds`), `model` (a quick check's: `name`, `run`, `recipe`, `imgsz`, `trained_on`,
+`validated_on`, `same_day`, `classes_missing`, `by_source`, `device`; absent for fold models),
+`predict_s_per_frame` (seconds the detections took per frame, the model's load not included: reading and
+decoding the frame and the model's pass), `predict_load_s` (seconds a model took before its first frame:
+the runtime, and the read, compile and warm-up the benchmark pipeline measures as `compile_ms` +
+`warmup_ms`, averaged over the models that ran; both absent in earlier reports; together a later quick
+check's time estimate) and `warnings`. Each recall has `boxes`,
 `found`, `recall` and a Wilson 95% interval (`low`, `high`): how often a fold model found the labelled
-objects of days it never saw, at score 0.3 and IoU 0.5.
+objects of days it never saw, at score 0.3 and IoU 0.5 (in a quick check: how often its model found the
+labelled objects of the frames it never saw). `REPORT_VERSION` stays 1: the new fields are optional. A
+`report.json` with `mode: model` (written by the first builds of the quick check, never released) reads
+as what it says.
 
 **Frames and recipe.** Every reviewed frame of the folder under review that can be exported (reviewed
 frames with pending boxes or labels off the class list are left out and counted); `--frames` narrows it by
 `scene=` and `camera=`, and then narrows the fold models' training too. At least 40 such frames on at least
 2 camera days are needed; K is lowered to the number of camera days when there are fewer (a warning says
-so). The preview and the report warn when a fold holds out more frames than its model trains on (one camera
-day dominates the check: its fold model learns from less than it is asked about) and when a fold model
+so). The preview and the report warn when a fold's model trains on under 90% of the frames the fold holds
+out (one camera day dominates the check: its fold model learns from less than it is asked about; two even
+folds that differ by a frame are no warning) and when a fold model
 trains on fewer than 50 boxes of a class the selection has 50 of (that fold's labels of it get no
 `verify`). A folder under review that is not available (an unplugged drive) refuses the check and the
 preview (`folder_missing`) with the Review page's message, never as an empty dataset, and the report is
@@ -1869,7 +2167,7 @@ best raw epoch is exported), the default learning rate, no augmentation.
 
 **A run** is a task of the training queue (`TaskKind::Refine`, one job at a time), with the stages
 *selecting the reviewed frames*, one *checking fold N of K* each (export, train, check the fold is unseen,
-run the model, write) and *writing the report*. It needs an NVIDIA GPU or Apple silicon and the training
+run the model, write), with the closer look *looking closer at N loose labels*, and *writing the report*. It needs an NVIDIA GPU or Apple silicon and the training
 environment (a download over 500 MB needs `--allow-large` or `allow_large_downloads`). It takes the training
 lock after the selection and holds it to the last fold's writes, as the auto-label and overlap jobs hold it;
 each fold's training uses that hold, so no other process (the service, a `train` command) trains or labels
@@ -1892,15 +2190,444 @@ processes; the export, prediction and writes of the running fold finish first.
 - **A rerun** checks every fold again. The folds are the same for the same frames; unanswered suggestions are
   replaced, answered ones stay (but for those whose box is gone).
 
+**What a rerun replaces.** On every frame it checks, a check replaces the unanswered `add`, `verify` and
+`relabel` suggestions with what its own fold models find: a suggestion they do not find again is gone, even
+when an earlier, stronger check made it. Answered suggestions (kept or dismissed) stay, an unanswered
+`tighten` stays unless the check's closer look answered its label (then it is replaced by what that look
+supports, or goes when it supports nothing; a check without the look, `--no-tighten`, never touches one), frames outside the check (another scene or camera of `--frames`, frames left out) are not touched, and no
+box changes. So a short check after a good one costs findings: on one dataset a check of 4 folds x 8 epochs
+left 139 open suggestions, and two checks of 2 folds x 1 epoch, whose fold models found almost nothing, cut
+them to 88. The preview counts what a start would replace (`open_suggestions`, `open_frames`: unanswered,
+of those three kinds and live as the Review tab shows them, on the selected frames; with the closer look
+also `open_tightens`, the live open `tighten` there, a bound since the look replaces only those of the
+labels it answers, and `open_frames` then counts the frames holding either) and warns *this check
+replaces the N open suggestions on M frames ...* (with the look: *... and up to K open proposed boxes for
+loose labels ...*); it also warns when the fold models are short, under half
+the family's recommended minimum epochs (`recipe::recommended(..).min_epochs`, 10 for every family, so 1 to
+4 epochs; `refine::weak_epochs`), since fold models of 1 epoch found no missing box where 8 epochs found
+123. On the Refine tab a start over open suggestions (with the look, open `tighten` count too) is refused (409
+`{success: false, needs_confirm: true, open_suggestions, open_tightens, open_frames, folder_missing: false,
+message}`) and the card asks inline: *Start and replace N open suggestions* (*up to N* when open `tighten`
+are among them) posts again with `replace_open: true`, *Keep them* starts nothing. Answer them
+on the Review tab first, or confirm to recompute them. `train refine` is an explicit command and asks
+nothing, but prints the same warnings before it starts.
+
 ```sh
 blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
-    [--gpu cuda:N] [--allow-large] [--verbose]
+    [--gpu cuda:N] [--allow-large] [--tighten | --no-tighten] [--verbose]
 ```
 
 `--folds` is 2 to 8 and `--epochs` 1 to 50 (defaults 4 and 8). `--frames` takes `scene=<day|night|ir>` and
 `camera=<name>` pairs, comma-separated, a key may repeat. `--dry-run` runs the preview: frames, what the
-export leaves out and why, camera days, each fold's size, the model and a rough time (shown only when a GPU
-can train). It needs no GPU or download, writes nothing, and prints `refused:` with the reason when the check would not run.
+export leaves out and why, camera days, each fold's size, the model, whether loose labels get the closer
+look, and a rough time (shown only when a GPU can train). It needs no GPU or download, writes nothing, and
+prints `refused:` with the reason when the check would not run. `--tighten` / `--no-tighten`: the closer
+look at loose labels (below); by default it runs when RF-DETR L's weights are downloaded.
+
+#### Closer look at loose labels (`tighten`)
+
+A loose label (an auto-label box half off its object, say) turns a correct detection into a miss plus a
+false alarm when a model is scored, and teaches sloppy boxes. The fold models see them (148 loose pairs
+on the 851 reviewed frames measured), but a fold model's box alone is not precise enough to overrule a
+label: fold models train a few epochs at a small input size (384 px). So a second, independent and sharper
+look decides, the overlap check's zoom stage (`refine/tighten.rs`):
+
+1. **Candidates** (`judge.rs`, pure): each loose pair the judge counts (not a reviewer's box: not drawn,
+   no `orig_bbox`, no `model_label`; not an ignore region, not under the size floor or 10 px at the fold
+   models' input), whose fold detection `D` scores `TIGHTEN_FOLD_SCORE` 0.5 or more, on a label of a class
+   RF-DETR L can see (`coco_class`: a `van` cannot be looked at). Each fold appends its candidates, with the
+   fold model's detections of the frame, to `<work>/tighten-candidates.jsonl` as it finishes.
+2. **The look**, once after the last fold, under the training lock the check holds:
+   `scripts/autolabel.py --zoom-pairs` (unchanged; the overlap check's runner, `overlaps::zoom::prepare` and
+   `run`) with RF-DETR L on one crop per candidate, the union of the label `L` and `D`, padded by 20%
+   (`--zoom-pad`), at score 0.1, one flushed JSONL line per crop (with the crop it cut and the image's size,
+   which rule (g) uses). At most `MAX_TIGHTEN_CANDIDATES` 2,000 candidates are sent, those with the most
+   confident `D` (ties by frame and place, so the same on every run); the rest are left out with a warning
+   in the report and the summary (`tighten_left_out`), and their open `tighten` stays. It is the job's step
+   *looking closer at N loose labels* (N the labels sent; its progress line counts *i of N crops*), and
+   needs what the overlap check needs: the training environment, RF-DETR L's weights
+   (0.14 GB, `train-base:rfdetr-large`), about 500 MB of VRAM and on Windows about 2.6 GB of free commit,
+   checked before the model loads.
+3. **The decision** (`judge::tighten_verdict`, pure): the closer look's boxes of the object are its
+   detections of the same object at `TIGHTEN_ZOOM_SCORE` 0.5 or more, clamped to the frame; `Z` is the one
+   with the best IoU to `D` (ties: the higher score, then the earlier detection). A `tighten` to `Z`
+   (`target` = `L` with its label, `score` = `Z`'s, the reason naming both looks) only when, in this order:
+   (a) `Z` agrees with the fold model: IoU(`Z`, `D`) >= `TIGHTEN_AGREE_IOU` 0.6 (else *no_agree*, also
+   with no `Z`); (b) the label is loose against `Z` too: IoU(`L`, `Z`) < 0.75 (else the label was fine and
+   the fold model imprecise: *label_fine*); (e) no box of the closer look fits the label at IoU 0.75 or
+   more (else it found the label's object as labelled and `D`, `Z` are another object, say a parked car
+   behind the labelled one that the fold model found instead: *label_found*); (f) the label spans no
+   second object the closer look tells apart: no other of its boxes, not `Z` again (IoU with `Z` under
+   0.6 and not nested in or around it), no larger than `L` and lying `TIGHTEN_SPAN_INSIDE` 80% or more
+   inside `L` (the overlap check's nested share), that no other box of the object on the frame covers
+   (else moving the label onto `Z` would leave that object unlabelled: *spans_two*); (c) `Z` is a proper
+   box not under the floor (the `add` floor; *small*); (g) `Z` was not cut by its crop: no edge of `Z`
+   within `TIGHTEN_EDGE_PX` 1 px of an edge of the crop that is not the image's edge (the object goes on
+   past the padded union: *crop_edge*); (d) `Z` is no other object's box: no other training box or ignore
+   region of the object overlaps `Z` more than `L` does (the two looks found the neighbour: *neighbour*).
+   The replay (`refine_replay_on_a_copy` with `BOP_REFINE_ZOOM=1`) prints each answered candidate without
+   a proposal with its word, and the totals.
+4. **The write** judges each frame afresh under the label write lock: the frame still reviewed, the
+   candidates found again from the kept fold detections on the file as it is now, each matched to its
+   crop's answer by its exact boxes. Only the open `tighten` of a label whose candidate the look answered
+   is replaced (by what the answer supports, or nothing); an open `tighten` on any other label of the frame
+   (not a candidate this time, its crop unanswered, left out by the limit) is kept as it is; so a check
+   without the look, a failed or cancelled look, or an unreadable frame never deletes an earlier one.
+   `found.tighten` counts this look's proposals that were kept, never the earlier ones left in place.
+   An answered `tighten` stays and is not asked again: `refine::same_finding` keys a `tighten` on its target
+   box (exact `bbox` and label), whatever box it proposes. Accepting one moves the box and keeps the old one
+   in `orig_bbox`, so the label is a reviewer's from then on and is never a candidate again.
+
+**Default.** On when RF-DETR L's weights are downloaded (the overlap check downloads them, or *Download
+RF-DETR L if missing* on the Review tab); else the check runs without it and the preview says so in one
+warning. Asked for (`--tighten`, the Refine tab's box ticked) the weights come with the check, through the
+same large-download gate as the overlap check's (at 0.14 GB they are under its 500 MB limit). `--no-tighten`
+counts loose labels only.
+
+**Cancel, pause, failure.** The look pauses with the queue (its script is suspended like the overlap
+check's). A Cancel during it keeps the crops that finished: their boxes are written, the report is
+`cancelled` and the summary says *stopped by Cancel during the closer look ... after N of M crops*. A Cancel
+during the folds skips it (Cancel means stop; the report says the look did not run). After a failed fold it
+still runs on what the finished folds found, and the task's error says what it did (*... and the closer
+look at their loose labels then answered N of M and saved K better-fitting boxes*, or that it failed). A failure of the look (the environment, the download, the
+memory check, the script) keeps every fold's suggestions: the check ends as usual with the failure in its
+summary and in the report's warnings.
+
+**Time.** About 79 ms per crop on a GTX 1070 Ti (the overlap check's measurement) plus the environment
+check, the script's self-check and loading RF-DETR L; the preview adds `90 s + 0.079 s` per selected frame,
+at most 2,000 (one crop per frame on average; 851 frames: about 3 minutes), and, since the count of loose
+labels is known only after the folds, words it as a bound, not a total: "the closer look adds a minute or
+two to set up, then up to about a second per loose label it looks at (at most 2,000)". `time_basis` is the
+folds' as before. Replayed on the 851 frames (kept fold detections,
+`refine_replay_on_a_copy`): 148 loose pairs, 82 candidates on 74 frames (77 cars, 4 persons, 1 truck).
+
+#### Quick check with a model
+
+The full check trains throwaway fold models so that every reviewed frame is judged by a model that never
+saw its camera day: about 70 minutes of GPU for 851 frames. After you review a few hundred new frames, the
+custom model you already trained has never seen those either. `train refine --with-model <name>` (the
+Refine tab's *Quick check with a model you trained*) judges them with that model instead: **no training**,
+seconds to minutes, and no GPU unless the closer look runs (the model runs on its own configured device,
+an integrated GPU or the CPU included). It is the same check otherwise (`refine/quick.rs`): the same
+selection, judge, writer, report, queue, lock and promise of changing nothing but `LabelFile.refine` and the
+report.
+
+**Which frames.** The reviewed frames of the selection (the same `--frames` scene and camera filter) minus
+every frame the model trained or validated on. The model's `<stem>.provenance.json` (beside its model file)
+names its training run; the run folder is that run's `run_dir` in `runs.json` of the training folder, else
+`<training dir>/<run id>`. Its `data/train.txt` lists what it trained on and `data/valid.txt` what it
+validated on: a validation frame chose the checkpoint, so it is not unseen. Its held-out frames
+(`data/heldout/`) and frames reviewed since are unseen and are checked. A frame counts as seen when a listed
+image's name is the frame's flat name as the dataset spells it (with each `s<N>-` source prefix the lists
+use; the dataset's 120-byte cut included, so a name the cut made ambiguous leaves out every frame it may
+be), and, for runs that record their image sources (`image_sources.json`, newer runs), when the source's
+file name is the frame's flat name (exact whatever the dataset named the image). The strictest reading
+available wins: a frame matched either way is skipped.
+
+**Refused, never guessed.** A model without a training record (a stock, catalog or downloaded model:
+what it trained on is unknown), a record that does not read or names no run, a model file that is missing
+(also listed under `capability.unusable`), a run folder that is gone, lists that do not read, or a source
+record that does not name a listed image: the check refuses with what is missing, because a model judging
+frames it trained on finds every label "right". So are lists that name **no reviewed frame of the folder
+at all** (the frame filter aside) although they are not empty: the run trained on another folder or on
+renamed copies (a dataset folder made by hand or by another tool), so every frame it saw would pass for
+new (*none of the N images <model> trained or validated on is a reviewed frame of <folder>*). A model
+that truly never saw a frame of this folder is refused the same way: that is the safe side, and the full
+check covers it. Listed images whose names are not this program's frame names (after the `s<N>-` prefix;
+a name the 120-byte cut shortened, an image whose recorded source is a frame name and the run's public
+sets, by their `dataset.json` sources, are not counted) are a warning with the count (`Seen::odd_names`):
+if any is a copy of a frame of this folder, the check judges that frame as never seen. At preview and plan
+time (never for the models list of `GET /v1/refine`) the model file's SHA-256 is compared with the
+record's `onnx_sha256`: another file refuses (*<file> is not the file training run <id> produced
+(replaced since?): the frames it trained on are unknown*); a record without a hash, or an entry that names
+no `.onnx` (the hash is of the ONNX), is a warning that it could not be checked. So is a selection
+with no frame it never saw (`quick::MIN_UNSEEN_FRAMES` is 1: unlike the fold check's 40, which its models
+need to learn from, a trained model can judge any frame it never saw; the preview says how few that is).
+
+**What differs from a fold.** The model runs through the same predictor (`FoldPredictor` /
+`LocalPredictor`, the benchmark's per-image pipeline) with **its own configured entry**: its family, class
+file and device, but no confidence threshold of its own (per device or not) and no object filter
+(`quick::predict_entry`), so it answers from 0.15 like a fold model (its own 0.5 would turn every faint
+find into a `verify`). The judge's input size is the model's (its recipe's `imgsz`). The `verify` guard
+(`MIN_CLASS_BOXES`, 50) counts what that model's run trained on (`dataset.json` `stats.train_boxes`,
+mapped through the class list); without that file no label gets a `verify`. A wanted class the model does
+not have (`collect.classes` it lacks, `classes_missing`; e.g. a model trained on 7 of 14 classes) gets no
+`verify` (its silence on such a label is no miss) and no `relabel` (its detections of another class cannot
+say the label is wrong), is not in the recall, and such a label covers a detection of any class at IoU
+0.5 or more (`judge::UNKNOWN_CLASS_COVER_IOU`: a model names an object it cannot name by another class, so
+no `add` on top of the label; a smaller object inside or beside it, such as a person in front of a labelled
+truck, is another object and still gets its `add`). Its detections of classes
+off the list are not used, as a fold model's. Every `why` names the model (*custom-rf-detr-nano-3 (never
+trained on this frame) found a person here, score 0.82*), never "a model that never saw this camera-day".
+The static spots come from every reviewed frame of the selection, the ones it trained on included: the
+spots are the reviewer's labels, which the model's training does not concern. The size floor applies as
+configured. **Only the frames it checks are written**: the frames it trained or validated on are never
+passed to the writer, so their suggestions, open or answered, stay exactly as they are; the replace count
+and question (`open_to_replace`, the preview, the 409 of `POST /v1/refine/check`) cover only the frames it
+checks. The closer look runs on its loose candidates after the pass, when on (it needs a GPU: asked for
+without one, the check is refused; on by default without one, it is off with a warning).
+
+**What it cannot tell you.** A frame it never saw may be of a camera day it trained or validated on (static
+cameras: near copies of what it learned), so it finds those labels more easily than a fold model blind to
+the whole day; the preview and the report warn with the count (`same_day`). It is one model at its own
+input size, not short models of the recipe, so its recall measures that model on new frames, and its
+`verify` and `relabel` come from a model that learned from your labels, mistakes included. Use the full
+check for the frames every model has seen; the quick check is for what was reviewed since.
+
+**The run.** Steps: *selecting the reviewed frames* (the model's frames read again: a run folder gone since
+the start fails it), *checking with <model>* (the pass, then the judge and the writes), the closer look
+when on, *writing the report*. It takes the training lock after the selection, as a fold check. A Cancel
+during the pass writes nothing (a plain cancel); a failed pass fails the check with nothing written; a
+Cancel during the closer look keeps what the pass wrote. Pause holds the closer look's helper only. The
+title is *quick dataset check with <model> (N frames it never saw, <filter>)*.
+
+**The report** is `refine/report-quick.json`, the quick check's own (a full check's `report.json` stays,
+with its whole-folder recall and the recall by size a floor is chosen from), with `mode: model`, `model`
+and `folds` / `folds_done` 0; its counts and recall tables cover only the frames it checked. The Findings
+card names the newer of the two reports (and says *Last full check: <date>* or *Last quick check: <date>*
+when the other exists); the recall tables of the Coverage and Too small cards and the coverage route's
+recall columns use the full check's report when there is one, else the quick one, each labelled by its
+`mode` (*N frames <model> never saw* for a quick check's).
+
+**Preview** (`--dry-run`, `GET /v1/refine/preview?model=`): the frames it would check and the camera days,
+the frames skipped as trained and validated on, the model, its run, recipe, input size and configured
+device, whether frames were matched by source or by name only, the replace count of those frames, the
+same-day, missing-class, few-boxes, odd-name, model-file and closer-look warnings, and a time: the last
+quick check with the same model measured its load and its time per frame (`report-quick.json`
+`predict_load_s`, `predict_s_per_frame`), so `load + per frame x frames` (`time_basis: last_check`: the
+load once, not once per frame); else a documented guess (`time_basis: guess`): 60 s (loading and compiling
+the model) + 0.25 s per frame (decode and an RF-DETR nano at 384 on an integrated GPU, about 0.11 s, plus
+the judge and the write; a discrete GPU is several times faster), plus the closer look's own bound. Not
+measured.
+
+On the copy of the real dataset (November 2026, read-only preview): `custom-rf-detr-nano-3` (run
+`20261111-020504-cad6`, no image source record, so by name) skips 564 frames it trained on and 83 it
+validated on and would check 204 frames on 19 camera days (its 169 held-out frames and 35 others), 34 of
+them of camera days it trained on; it lacks 7 of the 14 classes (raccoon, opossum, skunk, fox, deer,
+squirrel, bird) and trained on fewer than 50 bicycles, cats, dogs and motorcycles, so only persons, cars and
+trucks can get a `verify`.
+
+```sh
+blue-onyx-prism train refine --with-model <name> [--dry-run] [--frames "scene=ir,camera=patio"] \
+    [--gpu cuda:N] [--allow-large] [--tighten | --no-tighten] [--verbose]
+```
+
+`--with-model` conflicts with `--folds` and `--epochs` (it trains nothing).
+
+### Refine tab
+
+The Train area's Refine tab (`/train/refine`, between Review and Dataset) starts the dataset check from the
+web UI and shows its results; the check itself is the one above and changes no box.
+
+- **Check the dataset** card: *How to check*: *Full check (fold models, about an hour)* (the default) or
+  *Quick check with a model you trained (only frames it never saw)* ([quick check](#quick-check-with-a-model);
+  `check_mode`). The quick check's *Model* select lists the configured models with a training record whose
+  model file, run folder and lists are there (`GET /v1/refine` `capability.models`: `{name, run, recipe,
+  imgsz, enabled}`, newest first; `capability.unusable` names the ones with a record it cannot use, with why,
+  and the note under the select says so; `runs.json` and each record are read once per answer, and the list
+  is kept 5 s while the config revision and the records' size and time are the same; no file is hashed for
+  it). When a reload of the list leaves the chosen model out, the select moves and the preview and the
+  replace question go with it. How many reviewed frames each never saw is counted on *Preview* (a walk
+  of the label files). In quick mode folds and epochs are hidden and not sent (`model` is: `?model=` on the
+  preview, `"model"` in the start; with folds or epochs it is a 400), *Start* needs a model but no GPU
+  (`capability.can_check` is the full check's), and the preview names the model, its run and the frames it
+  skips. Then folds (2 to 8), epochs (1 to 50), a scene and a camera filter, the GPU when
+  there are several, *Propose better boxes for loose labels* (the [closer look](#closer-look-at-loose-labels-tighten);
+  ticked when RF-DETR L's weights are downloaded, `GET /v1/refine` `capability.tighten_default`; the page
+  sends it as `tighten` with the preview, `tighten=1|0`, and the start, `"tighten": true|false`) and *Allow
+  downloads over 500 MB*. *Preview* is `train refine --dry-run`
+  (`GET /v1/refine/preview`: frames, what the export leaves out, camera days, each fold's size, the model,
+  a rough time, warnings, or why a start would be refused). *Start* (`POST /v1/refine/check`) plans the check,
+  gives it the running service's runtimes for the fold models' predictions (no second OpenVINO / ONNX Runtime
+  instance) and queues it on the one-at-a-time queue. It refuses, in the check's own words, when too few
+  reviewed frames can be checked, the folder under review is unplugged (503, `folder_missing`), a large
+  download is not allowed, there is no GPU to train on, or a check is already queued or running (409). A
+  start over open suggestions asks first (409 `needs_confirm`, the inline *Start and replace N open
+  suggestions* button; see "What a rerun replaces" above). While
+  it runs the card shows the check's progress row (step, percent, time left, Pause / Resume / Cancel; the
+  Jobs tab links to it as `#job-<id>`).
+- **Findings**: the open suggestions per kind (*Missing boxes* = `add`, *Labels no model found* = `verify`,
+  *Other class suggested* = `relabel`, *Loose boxes* = `tighten`; `GET /v1/refine` `open`), counted over the label files of the folder under review
+  (`refine::live`: answered and stale ones are not counted; kept 60 s, dropped when a check starts or ends,
+  so a Review save shows within the minute: the card says *Counts refresh within a minute*),
+  each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). `GET /v1/refine`
+  answers both last reports, `report` (the full check's `report.json`) and `quick_report`
+  (`report-quick.json`), each with its own problem (`report_problem`, `quick_report_problem`); the card shows
+  the newer one (`RefineFloor.reports`): its date, folds done of folds (a quick check: *quick check with
+  <model> (training run <id>). N frames it never saw checked; M frames it trained on and V it validated on
+  skipped*, `RefineFloor.lastLine`), `cancelled`, its warnings and *Loose labels counted: N, M with a
+  proposed box* (`loose`, `found.tighten`; *N (no closer look in this check)* without one), and *Last full
+  check: <date>* / *Last quick check: <date>* when the other mode's report exists (`RefineFloor.otherLine`).
+  The recall tables (Coverage and Too small cards) use the full check's report when there is one, else the
+  quick check's (its recall reads *over the N frames <model> never saw*). On the Review tab a `tighten` is
+  *the tighter box* when the proposal lies (95% or more of it) inside the label, else *the better-fitting box*
+  (larger or shifted; `ReviewRules.tightenWord`); the answers stay accept / *Keep my box*. Without a report the card
+  says no check has run; a damaged or newer-format report is shown as a problem, never as an error page.
+- **Static objects** (between Findings and Coverage; `server/refine_spots.rs`): the [static spots](#static-spots)
+  of the reviewed frames of the folder under review (`statics::overview`; kept 60 s, dropped when a check starts
+  or ends and after a bulk accept), the busiest 200 first (most missing boxes, then most frames). Per spot: the
+  camera, what (the label), the place (the newest frame labelled there, `/dataset/image`, cropped around the box
+  with the box drawn over it by the page), frames labelled there, days, and *Missing here* = the dataset check's
+  live `add` suggestions that lie at the spot now (`statics::Table::spot_of_add`: the suggestion's box and
+  class against the card's spots, as `statics::spot_at` places a label). The `spot` id a check stored on a
+  suggestion is that check's evidence only: the check made its spots from its own selection (maybe scene
+  filtered) and the labels as they were then, so its ids can differ from the card's (the 2% rounding, a `~2`
+  suffix); an `add` with another id at this place counts here, one with this id that lies elsewhere does
+  not. Actions: *Review* (`/train/review?auto=refine&refine_kind=add&camera=<camera>`)
+  and, with missing boxes, *Accept the N at this spot...*.
+  - **Accept at a spot** (`POST /v1/refine/accept-spot` `{spot, min_score?, dry_run?, limit?}`, 4 KiB, unknown
+    fields refused): every live `add` suggestion lying at that spot (by geometry, as *Missing here*) scoring
+    `min_score` (default 0.5, 0..=1) or more on the reviewed frames, each through `labels::update` +
+    `refine::accept` (never around it: it replaces unjudged rejects, refuses a stale suggestion, keeps the frame
+    reviewed; the new box is `source: auto`, accepted, `reason: "refine"`; nothing else in the file changes). A
+    frame a reviewer confirmed empty gets nothing in bulk (`accept` would end its "empty", and about 1 in 10 such
+    suggestions is wrong): it is counted in `left_empty` and left for one-by-one review, where a reviewer looks
+    at it; the card's question says *N frames confirmed empty are left for one-by-one review*. At most `limit` frames (default and
+    maximum 500) are written per call; a rerun takes the rest. `dry_run` runs the same code on the files as read
+    and writes nothing, so on an unchanged folder its `accepted` and `frames` are what the apply does, and a
+    second apply accepts 0. The card asks first, inline: the dry run's numbers, "about 1 in 10 such suggestions is
+    wrong", then *Add them* / *Cancel*; after the write it lists up to 10 frames spread over the days under *Check
+    these*, each opening that frame in Review (`/train/review?status=any&source=all&camera=<camera>&frame=<rel>`).
+    Answer: `{success, dry_run, spot, min_score, accepted, frames, eligible, below_score, left_empty, stale,
+    failed, failed_count, sample, message}`: `below_score` = live adds at the spot under `min_score` (or no longer
+    fitting once the others were added), left for one-by-one review; `left_empty` = frames confirmed empty
+    with a live add at the spot (the dry run counts them the same); `eligible` = frames with something to
+    add, also past the limit; `stale` = frames that changed between the look and the write (passed over);
+    `failed` = the first 20 `<frame>: <why>`. A spot id the reviewed frames do not make is 404 (a label change
+    can move or drop a spot: reload the card), an unplugged folder 503 `folder_missing`, a bad field 400.
+  - **Training cap**: the current `training.static_cap` (0 = off, 0..=100000) in a number field with *Save*
+    (`POST /v1/refine/static-cap` `{cap}`, through the config's one writer like the other settings routes).
+    Applies to the next training run; the pre-flight on the Train tab shows what it leaves out (its "Left out of
+    training" list carries the static-cap line, once).
+- **Too small** (between Static objects and Coverage; `server/refine_floor.rs`): the size floor
+  (`collect.size_floor` `{px, input}`: a box whose short side at the model input is under `px` pixels is too
+  small; default off) and the ignore mode (`training.ignore`). Objects below about one patch of the model's
+  input cannot be learned, so with a floor an export writes them as ignore regions (out of the YOLO
+  labels; X-AnyLabeling keeps them as boxes; accepted and added labels are never rewritten) and a
+  detection on one counts neither for nor against a model on held-out
+  frames. The one rule here that writes only hides *pending proposals* under the floor on unreviewed
+  frames, and those can be restored. The card shows, top to bottom:
+  - the **recall by size** of the full check's report, else of the quick check's (`recall_by_size` and its
+    input size; it lives here, not on Coverage, which points to it; a quick check never replaces the full
+    check's table), with how it was measured (a quick check's: "Measured by <model> on N frames it never
+    saw, at its own input of <px> px ..."): "Measured with fold models trained on every
+    label; the check treated labels under N px at <input> as ignore regions (counted in this table only)." (or
+    "no size floor was set."); a report of an earlier check says its fold models may have trained under the
+    floor then saved;
+  - the **floor form**: `px` (1..=64) and `input` (64..=4096), prefilled with the saved floor or, when off, the
+    suggestion (10 px at the input size of the report the recall table shows, else the newest finished
+    training run's, else 384).
+    *Preview* asks `GET /v1/refine/floor?px=&input=` for the form's values and shows, per class, the boxes,
+    those under the floor and what is left, with a sentence where a floor leaves a class nothing ("every
+    motorcycle label would be left out: the model cannot learn the class from these frames") or under 50
+    labels; a class the floor does not touch is never flagged. *Save* and *Turn off* (shown when one is
+    saved) post `POST /v1/refine/size-floor`. Next to them: "Applies to the next export. Held-out scores from
+    before and after a change do not compare, because the held-out labels change.";
+  - with a floor saved and pending proposals under it, *Hide N pending proposals under the floor...*: the rule
+    `POST /v1/refine/resolve-small`, asked inline like the static spots (a dry run, "Hide N pending
+    auto-label proposals on M unreviewed frames as under the floor. They are set aside unseen like the
+    auto-labelers' hidden boxes: no label, no negative, not counted as your decisions. i on the Review tab
+    shows them, and they can be restored here if the floor goes down or off.", then the write);
+  - with hidden proposals the saved floor (or none, when off) no longer covers, *Restore N proposals the floor
+    no longer covers...*: the same route with `restore: true`, asked the same way ("Restore N hidden
+    proposals on M unreviewed frames that the size floor no longer covers: they become pending again, for you
+    to decide on the Review tab.");
+  - the **ignore mode**: *Keep the frame, train the object as background* (default) or *Leave the frame out of
+    training*, with *Save* (`POST /v1/refine/ignore-mode`); see "Ignore regions". The Train tab's pre-flight
+    shows its effect: frames trained with an unlabelled object (`ignore_kept`, per class), frames left out
+    for nothing but ignore regions (`ignore_only`) or because their camera day validates
+    (`ignore_valid_day`), or, in `drop-frame`, every frame with a region (`ignore_frames`), and the size floor
+    regions given back at the run's input (`floor_restored`).
+  - Routes (admin, HTTPS, same-site; POSTs take 4 KiB JSON, unknown fields refused):
+    - `GET /v1/refine/floor[?px=&input=]` answers `{success, folder_missing, message?, saved: {px,input}|null,
+      shown: {px,input}|null, suggested: {px, input, from: "last_check"|"last_run"|"default"}, bounds:
+      {px_min, px_max, input_min, input_max}, counts: {frames, frames_with, frames_only, per_class: [{class,
+      boxes, under, left}], warnings}|null, pending: {boxes, frames}, restorable: {boxes, frames},
+      ignore_mode}`. `shown` is the query's floor, else the saved one (no query); both `px` and `input` or
+      neither, checked like a saved floor (400). `counts` (`export::floor_counts` over the reviewed frames) and
+      `pending` (the rule's dry run for the shown floor) are null / zero with no floor shown; `restorable` is the
+      restore's dry run with the **saved** floor (every size floor dismissal when the floor is off). Off the
+      async workers; kept 60 s per folder, class list, shown and saved floor (at most 8), dropped by a floor
+      save and by the rule's apply.
+    - `POST /v1/refine/size-floor` `{px, input}` or `{off: true}` answers `{success, message, size_floor}`
+      (null when off); 400 out of bounds or for both / neither.
+    - `POST /v1/refine/ignore-mode` `{mode: "background" | "drop-frame"}` answers `{success, message, mode}`.
+    - `POST /v1/refine/resolve-small` `{dry_run?, limit?, restore?}` (`limit` 1..=500, default 500) runs
+      `bulk::bulk_resolve_small` with the **saved** floor (400 when none is saved; 503 `folder_missing`) over
+      the unreviewed frames of the folder under review (the queue and the index files): pending model and
+      auto-labeler boxes under the floor are dismissed (`state: rejected`, `reason: size_floor`, no
+      `reject_reason`), exactly like the labelers' `auto_dismissed` boxes: no ignore region, no hard negative,
+      not in the repeats history, no reviewer's decision, hidden on the Review tab until `i` (`auto=dismissed`
+      finds them), and a frame holding one is never bulk-accepted (`auto=accept`) or repeat-only. Human,
+      moved, unsure and audit boxes, reviewed and skipped frames are never touched and a frame keeps its
+      status. With `restore: true` (no saved floor needed) it runs `bulk::bulk_restore_small`: the size floor
+      dismissals on unreviewed frames that the saved floor no longer covers (all of them when it is off) go
+      back to pending, their reason gone; a reviewed frame keeps its dismissals (it holds no pending box).
+      Answer `{success, dry_run, restore, boxes, frames, eligible, failed, failed_count, message}`: a dry
+      run's `boxes` and `frames` cover every eligible frame, so on an unchanged folder they are what an apply
+      with a large enough limit does, and a second apply finds 0.
+  - A later labelers run that finds a hidden proposal again brings it back only when the floor in force does
+    not cover what it found (`triage::undismiss_found` with the frame's size; a find still under the floor
+    stays hidden, covered by the dismissal); a `--missing-only` run on a reviewed frame overwrites it in place
+    like any unjudged reject. Retention treats a hidden proposal like the other dismissals: an unreviewed
+    frame with nothing but dismissals and no reviewer's decision can be pruned.
+  - On the **Review tab** a box under the saved floor shows a *too small* chip in the box list and on its tag
+    and, when selected, "Under the size floor (N px at <input>): left out of the labels at export." It is
+    computed live in the page (`ReviewRules.floorNote` on `underFloor`, from the frame's size, so a resize or
+    a box being drawn follows), from `size_floor` in the labels answer (`GET|POST /v1/review/labels`, null =
+    off: no chip), read with every frame. A rejected or unsure box (already an ignore region) shows none. It
+    changes no box and saves nothing, and it speaks of the saved floor: an export made before it was saved
+    (or with another) still holds the box as a label until exported again (the training pre-flight names
+    such exports). A hidden proposal reads "hidden: under the size floor".
+  - Not updated by a floor change until the next check: the dataset check's suggestions (`refine::live` knows
+    no frame size, so one made before a floor was set stays until a check replaces it). The Static objects
+    card counts boxes under the floor in its spots, while the training static cap (on the export's YOLO
+    boxes) does not, so the two can differ; and an export's "parked only" frames are judged on the boxes left
+    after the floor (a parked car with a tiny accepted person beside it is parked only there).
+- **Coverage**: the recall per camera, scene and class of the full check's report, else of the quick check's,
+  each with its 95% interval (the per-size table is on the Too small card).
+  A second table on the card, **Where the data is thin** (`server/refine_coverage.rs`, `GET /v1/refine/coverage`),
+  has one row per camera x scene of the review folder (sorted by camera, then day, night, ir): reviewed frames,
+  person boxes, vehicle boxes (car, truck, bus, van, motorcycle, bicycle), empty frames (reviewed, no training box and
+  no ignore region, ticked "empty" or not: the training plan's negatives; an unsure or too-small object is no negative; the
+  cell reads `14 (3 confirmed)`, just the number when none were ticked), the
+  person and vehicle recall there with the 95% interval, from the full check's report, else the quick check's
+  (`-` when the report has no such row; vehicles are the sums
+  of boxes and found over the vehicle classes, the interval recomputed with `report::wilson`; a quick check's report
+  says the recall covers only the frames its model never saw, in the recall table's own words), the unreviewed
+  frames holding a person, and a short "what to do". Boxes are the accepted labels of reviewed frames (ignore
+  regions and unwanted classes not counted). *Unreviewed with a person* is counted by the Review queue itself:
+  `queue::build` with `status=unreviewed&source=all&label=person` (one build for every row, grouped by the
+  scene and camera the queue filters on), so it holds exactly the frames its link
+  `/train/review?status=unreviewed&source=all&scene=<scene>&camera=<camera>&label=person` opens, frames of the
+  review queue and the index files nobody opened yet (no label file: the sidecar's predictions say person)
+  among them; a frame whose sidecar does not read is listed nowhere and counted nowhere (a test builds the queue
+  per row and compares, frames without a label file included). That build reads every candidate's sidecar
+  (synthetic frames of `tests/it/review_walk.rs`, warm: 1.65 s at 50,000 frames on an M1, release build,
+  docs/PRODUCTION_REVIEW.md; on Windows, debug build, 20,000 frames: 3.4 s, against 2.0 s for the label-file
+  walk the table made alone before), kept with the table's other counts. The counts can be up to a minute old after a Review save (the card says so). The rules
+  (`RefineFloor.coverageAdvice`, node-tested; each reason is a named constant):
+  - fewer than `MIN_PERSON_BOXES` 20 person boxes: *Few persons: review the N unreviewed frames with a person
+    proposal* when N > 0, else *Few persons: collect more here* (below 20 the class is a handful of boxes there);
+  - reviewed frames but no empty one (`empty` = 0): *No empty frames: review some frames with nothing in them*; when at least `VEHICLE_FRAME_SHARE` 0.9 of the row's reviewed frames hold a vehicle box (`vehicle_frames`: frames, never boxes, so 2 of 10 frames with 5 cars each is the ordinary advice) it says instead that a parked vehicle is in about every frame: *about every frame here shows a vehicle, so false alerts on empty frames cannot be measured on this camera*;
+  - at least `MIN_RECALL_BOXES` 20 person boxes in the check's recall and its interval's upper bound under
+    `MISSED_RECALL_HIGH` 0.7: *Persons are missed here: check the labels and collect more* (under 20 boxes the
+    interval is too wide to blame the labels; an upper bound under 70% is a miss, not chance).
+
+  The route answers `{success, folder_missing, message?, rows: [{camera, scene, reviewed, persons, vehicles,
+  vehicle_frames, empty, empty_confirmed, unreviewed_person_frames, person: {boxes, found, recall, low, high}|null,
+  vehicle: {...}|null}], totals: {rows, reviewed, persons, vehicles, vehicle_frames, empty, empty_confirmed,
+  unreviewed_person_frames}}`. One walk over the label files (`queue::labelled_map`, status any) and one build
+  of the Review queue, in `server::blocking`, kept 60 s per folder and class list (at most 4 kept), dropped when
+  a check starts or ends and by the Static objects and Too small cards' writes; the report's recall is joined
+  on every request.
+
+`GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
+`quick_report`, `quick_report_problem`, `open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card
+`{success, folder_missing, message?, spots: [{id, camera, object, label, bbox, frames, days, stay_days, scenes,
+by_day, labelled, open_adds, crop, sample, sample_size}], truncated, totals: {spots, labelled_boxes, open_adds},
+static_cap, static_cap_default, static_cap_max}` (`bbox` and `crop` normalised; `sample` is the newest labelled
+frame's rel path, `sample_size` its pixels). The tab has no card for tighter boxes yet.
 
 ### M1 run (MPS)
 
@@ -1924,12 +2651,12 @@ blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene n
     [--classes person,car,dog,cat,raccoon] [--excluded background|drop-frame] \
     [--rename motorbike=motorcycle] [--public [--allow-large]] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
-    (--out <dir> | --dry-run)
+    [--static-cap 20 (0 = off)] (--out <dir> | --dry-run)
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> \
     [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
     [--classes a,b] [--classes c] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
-    [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--select-metric map|map50|f1|f2|f0_5|iou] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
+    [--static-cap 20 (0 = off)] [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--select-metric map|map50|f1|f2|f0_5|iou] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
@@ -1949,6 +2676,8 @@ blue-onyx-prism train overlaps [--frames "scene=ir,camera=patio,limit=200,again=
     [--allow-large] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
 blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
     [--gpu cuda:N] [--allow-large] [--verbose]    # dataset check by fold models; changes no box
+blue-onyx-prism train refine --with-model <name> [--dry-run] [--frames ...] [--no-tighten]   # quick check:
+    # a model trained here judges the reviewed frames it never trained or validated on; no training
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
     [--device <spec>] [--accept-score-model 0.8] [--missing-only] [--confirm-license] [--allow-large] \
     [--frames "status=any,..."]
@@ -1964,7 +2693,8 @@ repeatable: several scenes (or models x scenes) run one after another on the sam
 comparison table is printed at the end. `night` alone is night frames only; use `night+ir` for both.
 `--balance` takes axes comma-separated and/or repeated (no flag: `training.balance`, else off); the
 strength, max repeat and cap flags change that default's values. See [Assembly](#assembly-srctrainingdatasetrs)
-step 7. `prepare --dry-run` writes nothing and prints images per epoch before -> after, boxes and frames per
+step 7. `--static-cap N` (`prepare`, `run`) overrides `training.static_cap` for this command (0 = off; see
+the static cap in step 3). `prepare --dry-run` writes nothing and prints images per epoch before -> after, boxes and frames per
 class, frames per scene, the top cameras (and camera-days), dropped frames and warnings; `prepare` and
 `run` print the balance summary.
 

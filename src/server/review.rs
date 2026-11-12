@@ -206,7 +206,7 @@ fn bulk_limit(given: Option<usize>, default: usize) -> Result<usize, Problem> {
 /// Ends a bulk route's `message` with the `failed` frames it could not change, when there are any:
 /// `" {failed} {not_done} (listed); {fix} them by hand."`. The words are the route's own
 /// (`"frame(s) not changed"`, `"review"`, ...): every message is pinned as it reads.
-fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
+pub(super) fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
     if failed > 0 {
         message.push_str(&format!(
             " {failed} {not_done} (listed); {fix} them by hand."
@@ -217,7 +217,7 @@ fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
 /// Ends a bulk route's `message` with the `eligible` frames past its `limit`, when there are any:
 /// `" {n} {more} beyond the limit of {limit}; run it again."`, `more` in the route's words
 /// (`"more frame(s)"`, `"more eligible"`, `"more"`).
-fn push_past_limit(message: &mut String, eligible: usize, limit: usize, more: &str) {
+pub(super) fn push_past_limit(message: &mut String, eligible: usize, limit: usize, more: &str) {
     if eligible > limit {
         message.push_str(&format!(
             " {} {more} beyond the limit of {limit}; run it again.",
@@ -290,7 +290,8 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&after=`: the most
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&after=`
+/// (`refine_kind` only with `auto=refine`; [`Filters::from_query`]): the most
 /// uncertain frame matching the filters (after `after`, the frame shown now, when given; past
 /// the last one the first again with `wrapped`), its position, the counts and the cameras and
 /// classes for the filter lists. A big folder answers from [`labels::index`], with
@@ -340,6 +341,7 @@ fn labels_answer(
     frame: &Frame,
     classes: &[String],
     hidden: &[String],
+    size_floor: Option<labels::SizeFloor>,
     message: Option<String>,
 ) -> Response {
     let rec = match frame.record() {
@@ -363,6 +365,7 @@ fn labels_answer(
         .iter()
         .map(|l| serde_json::json!({"index": l.index, "a": l.a, "b": l.b}))
         .collect();
+    let refine_live = refine_live(&file, &wanted);
     let q = encode_uri_component(&frame.rel.jpg());
     Json(serde_json::json!({
         "success": true,
@@ -377,9 +380,11 @@ fn labels_answer(
         "stale_classes": is_saved && !file.classes_version.is_empty() && file.classes_version != version,
         "overlap_live": overlap_live,
         "overlap_live_boxes": overlap_live_boxes,
+        "refine_live": refine_live,
         "labels": file,
         "classes": classes,
         "hidden": hidden,
+        "size_floor": size_floor,
         "classes_version": version,
         "record": {
             "id": rec.id,
@@ -399,6 +404,12 @@ fn labels_answer(
     .into_response()
 }
 
+/// The suggestions of the dataset check on `file` a reviewer can act on, as `refine_live` of the
+/// labels answer ([`labels::refine::live_json`], which the page's twin is tested against).
+fn refine_live(file: &LabelFile, wanted: &bulk::Wanted<'_>) -> Vec<serde_json::Value> {
+    labels::refine::live_json(file, Some(wanted))
+}
+
 /// `GET /v1/review/labels?frame=<scene>/<camera>/<date>/<stem>.jpg`.
 pub(super) async fn labels_get(
     State(state): State<Arc<AppState>>,
@@ -408,8 +419,9 @@ pub(super) async fn labels_get(
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
+        let size_floor = state.config_read().collect.size_floor;
         match Frame::resolve(&dir, &rel) {
-            Some(f) => labels_answer(&f, &classes, &hidden, None),
+            Some(f) => labels_answer(&f, &classes, &hidden, size_floor, None),
             None => no_frame(&state, &dir),
         }
     })
@@ -421,11 +433,54 @@ pub(super) const CONFLICT_MESSAGE: &str = "This frame changed since you opened i
      run or another tab saved it). Reload it to see the new boxes; your changes to it were not \
      saved.";
 
+/// Which of the lists the jobs write a save's body named at all. A key left out (a script or
+/// another client that rebuilds the file from the boxes) keeps the stored list; a key present,
+/// even `[]`, is the client's list (the page always sends both).
+#[derive(Debug, Default, Deserialize)]
+struct SentLists {
+    #[serde(default)]
+    refine: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    overlap_suggestions: Option<serde::de::IgnoredAny>,
+}
+
+impl SentLists {
+    /// The keys of `body` (a body that is no JSON object names none: it is refused anyway).
+    fn of(body: &[u8]) -> Self {
+        serde_json::from_slice(body).unwrap_or_default()
+    }
+
+    /// `file` with the stored file's lists in place of those the body left out.
+    fn keep_stored(&self, file: &mut LabelFile, path: &std::path::Path) {
+        if self.refine.is_some() && self.overlap_suggestions.is_some() {
+            return;
+        }
+        let stored = match labels::read(path) {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::debug!(
+                    "review save: the stored label file did not read ({e:#}); its suggestions are not kept"
+                );
+                return;
+            }
+        };
+        if self.refine.is_none() {
+            file.refine = stored.refine;
+        }
+        if self.overlap_suggestions.is_none() {
+            file.overlap_suggestions = stored.overlap_suggestions;
+        }
+    }
+}
+
 /// `POST /v1/review/labels?frame=...[&revision=<rev>]` with a label file as JSON: checked
 /// ([`labels::normalize`]) and saved atomically; answers like the GET. With `revision` (the one
 /// the GET answered; empty = not saved then) the save is refused with 409 and `conflict: true`
 /// when the file changed meanwhile; without it, it always overwrites (X-AnyLabeling and other
-/// clients).
+/// clients). A body without a `refine` or `overlap_suggestions` key keeps the stored file's list
+/// ([`SentLists`]): the suggestions and their answers are the jobs' and the reviewer's, not the
+/// client's to drop by leaving them out.
 pub(super) async fn labels_post(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -435,7 +490,10 @@ pub(super) async fn labels_post(
     let q = query_map(query);
     let rel = frame_param(&q)?;
     let expected = q.get("revision").map(|r| r.trim().to_string());
-    let file: LabelFile = json_body(&headers, body)?;
+    let sent = body
+        .as_ref()
+        .map_or_else(|_| SentLists::default(), |b| SentLists::of(b));
+    let mut file: LabelFile = json_body(&headers, body)?;
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
@@ -447,6 +505,9 @@ pub(super) async fn labels_post(
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
         let status = file.status;
+        // Read before the write, outside its lock: with a revision the write is refused when the
+        // file changed since; without one the save overwrites whatever came between, as always.
+        sent.keep_stored(&mut file, &frame.labels);
         let f = match labels::normalize(file, &classes, rec.width, rec.height, &now()) {
             Ok(f) => f,
             Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}")),
@@ -476,6 +537,7 @@ pub(super) async fn labels_post(
             &frame,
             &classes,
             &hidden,
+            state.config_read().collect.size_floor,
             Some(format!("Saved as {}.", status.as_str())),
         )
     })
@@ -1455,6 +1517,381 @@ mod tests {
         let bad = r#"{"status":"reviewed"}"#;
         let (st, _) = json(&d.state, post_json("/v1/review/suggest-overlaps", bad)).await;
         assert_ne!(st, StatusCode::OK);
+    }
+
+    /// A reviewed frame with one suggestion of the dataset check of every kind (and a dismissed
+    /// one), classes person, car and dog: its labels path and file.
+    fn refine_frame(d: &Ds) -> (String, PathBuf, LabelFile) {
+        use crate::collect::labels::refine::{Answer, Kind, Suggestion};
+        let rel = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let path = d
+            .dir
+            .join("ir/drive/2026-10-21/20261021T010203004Z_a.labels.json");
+        let at = |label: &str, bbox: [f32; 4], state: labels::BoxState| labels::LabelBox {
+            label: label.into(),
+            bbox,
+            source: labels::Source::Auto,
+            score: Some(0.5),
+            state,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: labels::AutoInfo::default(),
+        };
+        let low = labels::LabelBox {
+            reason: Some(labels::bulk::LOW_SCORE_REASON.into()),
+            ..at("car", [30.0, 30.0, 50.0, 44.0], labels::BoxState::Rejected)
+        };
+        let s = |kind: Kind| Suggestion {
+            kind,
+            target: None,
+            target_label: None,
+            bbox: None,
+            label: None,
+            score: Some(0.875),
+            why: "a fold model that never saw the frame found it at 0.88".into(),
+            spot: None,
+            answer: None,
+            run: "refine-1".into(),
+        };
+        let f = LabelFile {
+            status: labels::Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes: vec![
+                low,
+                at("person", [4.0, 4.0, 20.0, 40.0], labels::BoxState::Accepted),
+                at("car", [40.0, 2.0, 60.0, 20.0], labels::BoxState::Accepted),
+            ],
+            refine: vec![
+                Suggestion {
+                    bbox: Some([31.0, 30.0, 50.0, 44.0]),
+                    label: Some("Car".into()),
+                    ..s(Kind::Add)
+                },
+                Suggestion {
+                    target: Some([40.0, 2.0, 60.0, 20.0]),
+                    bbox: Some([41.0, 3.0, 59.0, 19.0]),
+                    ..s(Kind::Tighten)
+                },
+                Suggestion {
+                    target: Some([4.0, 4.0, 20.0, 40.0]),
+                    target_label: Some("person".into()),
+                    score: None,
+                    ..s(Kind::Verify)
+                },
+                Suggestion {
+                    target: Some([4.0, 4.0, 20.0, 40.0]),
+                    label: Some("dog".into()),
+                    spot: Some("drive:gate".into()),
+                    ..s(Kind::Relabel)
+                },
+                Suggestion {
+                    bbox: Some([2.0, 30.0, 12.0, 46.0]),
+                    label: Some("dog".into()),
+                    answer: Some(Answer::Dismissed),
+                    ..s(Kind::Add)
+                },
+            ],
+            ..LabelFile::default()
+        };
+        labels::write(&path, &f).unwrap();
+        (rel, path, f)
+    }
+
+    fn refine_classes(c: &mut crate::config::Config) {
+        c.collect.classes = vec!["person".into(), "car".into(), "dog".into()];
+    }
+
+    /// `refine_open` of `rel` in `auto=refine` (any status, every frame), None when not listed.
+    async fn refine_open_of(d: &Ds, rel: &str) -> Option<u64> {
+        let (s, v) = json(
+            &d.state,
+            get("/v1/review/next?auto=refine&status=any&source=all"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        (v["item"]["frame"] == rel).then(|| v["item"]["refine_open"].as_u64().unwrap_or(0))
+    }
+
+    both_ways!(
+        refine_suggestions_are_served_live_and_a_page_answer_saves_as_rust_answers,
+        refine_suggestions_are_served_live_and_a_page_answer_saves_as_rust_answers_indexed,
+        refine_suggestions_are_served_live_and_a_page_answer_saves_as_rust_answers_in
+    );
+
+    async fn refine_suggestions_are_served_live_and_a_page_answer_saves_as_rust_answers_in(
+        way: Way,
+    ) {
+        use crate::collect::labels::refine::{self, Answer};
+        let d = way.ds_with(refine_classes);
+        let (rel, path, f) = refine_frame(&d);
+        let q = encode_uri_component(&rel);
+        let classes = d.state.config_read().collect.classes.clone();
+        let none: Vec<String> = Vec::new();
+        let w = bulk::Wanted {
+            classes: &classes,
+            hidden: &none,
+        };
+        // (a) Served live: the four open ones, as `refine_live` builds them.
+        let (st, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(st, StatusCode::OK, "{l}");
+        assert_eq!(l["refine_live"], serde_json::json!(refine_live(&f, &w)));
+        let live = l["refine_live"].as_array().unwrap();
+        let brief: Vec<(u64, &str, serde_json::Value, serde_json::Value)> = live
+            .iter()
+            .map(|x| {
+                (
+                    x["index"].as_u64().unwrap(),
+                    x["kind"].as_str().unwrap(),
+                    x["target_box"].clone(),
+                    x["replaces"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            brief,
+            [
+                (0, "add", serde_json::Value::Null, serde_json::json!([0])),
+                (1, "tighten", serde_json::json!(2), serde_json::json!([])),
+                (2, "verify", serde_json::json!(1), serde_json::json!([])),
+                (3, "relabel", serde_json::json!(1), serde_json::json!([])),
+            ]
+        );
+        assert_eq!(live[0]["label"], "Car");
+        assert_eq!(live[2]["score"], serde_json::Value::Null);
+        assert_eq!(live[2]["target_label"], "person");
+        assert_eq!(live[3]["spot"], "drive:gate");
+        assert_eq!(live[3]["run"], "refine-1");
+        assert_eq!(live[1]["why"], f.refine[1].why.as_str());
+        assert_eq!(refine_open_of(&d, &rel).await, Some(4));
+
+        // (b) The page accepts the add as `acceptRefine` does: an accepted auto box with reason
+        // `refine` in the place of the low-score reject, the class in the list's spelling, the
+        // suggestion gone.
+        let mut page = l["labels"].clone();
+        page["boxes"][0] = serde_json::json!({
+            "label": "car",
+            "bbox": page["refine"][0]["bbox"].clone(),
+            "source": "auto",
+            "score": page["refine"][0]["score"].clone(),
+            "state": "accepted",
+            "reason": "refine",
+        });
+        page["refine"].as_array_mut().unwrap().remove(0);
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &page.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let back = labels::read(&path).unwrap().unwrap();
+        let mut want = f.clone();
+        assert!(refine::accept(&mut want, 0, Some(&w)));
+        let mut want = labels::normalize(want, &classes, 64, 48, "t").unwrap();
+        want.reviewed_at.clone_from(&back.reviewed_at);
+        assert_eq!(back, want);
+        assert_eq!(back.boxes[0].reason.as_deref(), Some(refine::REFINE_REASON));
+        // Served again: the indices after the removed one moved down by one.
+        let kinds: Vec<(u64, &str)> = v["refine_live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| (x["index"].as_u64().unwrap(), x["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(kinds, [(0, "tighten"), (1, "verify"), (2, "relabel")]);
+        assert_eq!(refine_open_of(&d, &rel).await, Some(3));
+
+        // (c) A dismissal is the answer on the suggestion, kept through the save.
+        let mut page = v["labels"].clone();
+        page["refine"][1]["answer"] = "dismissed".into();
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            v["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &page.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let back = labels::read(&path).unwrap().unwrap();
+        assert_eq!(back.refine[1].answer, Some(Answer::Dismissed));
+        let mut want = labels::read(&path).unwrap().unwrap();
+        want.refine[1].answer = None;
+        assert!(refine::dismiss(&mut want, 1));
+        assert_eq!(back, want);
+        assert_eq!(v["labels"]["refine"][1]["answer"], "dismissed");
+        let kinds: Vec<u64> = v["refine_live"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(kinds, [0, 2]);
+        assert_eq!(refine_open_of(&d, &rel).await, Some(2));
+        // One kind only: the tighten is there, the dismissed verify is not.
+        let (_, n) = json(
+            &d.state,
+            get("/v1/review/next?auto=refine&refine_kind=verify&status=any&source=all"),
+        )
+        .await;
+        assert_eq!(n["total"], 0, "{n}");
+        let (_, n) = json(
+            &d.state,
+            get("/v1/review/next?auto=refine&refine_kind=tighten&status=any&source=all"),
+        )
+        .await;
+        assert_eq!(
+            (n["total"].as_u64(), n["item"]["refine_open"].as_u64()),
+            (Some(1), Some(1)),
+            "{n}"
+        );
+        // A kind without auto=refine is refused.
+        let (st, n) = json(&d.state, get("/v1/review/next?refine_kind=add")).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{n}");
+        assert!(refine_open_of(&d, &rel).await.is_some());
+    }
+
+    both_ways!(
+        a_check_that_wrote_under_an_open_page_makes_its_save_a_conflict,
+        a_check_that_wrote_under_an_open_page_makes_its_save_a_conflict_indexed,
+        a_check_that_wrote_under_an_open_page_makes_its_save_a_conflict_in
+    );
+
+    async fn a_check_that_wrote_under_an_open_page_makes_its_save_a_conflict_in(way: Way) {
+        use crate::collect::labels::refine::{self, Kind, Suggestion};
+        let d = way.ds_with(refine_classes);
+        let (rel, path, _) = refine_frame(&d);
+        let q = encode_uri_component(&rel);
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(refine_open_of(&d, &rel).await, Some(4));
+        // The check writes under the label write lock while the page is open: suggestions only.
+        let found = Suggestion {
+            kind: Kind::Add,
+            target: None,
+            target_label: None,
+            bbox: Some([44.0, 26.0, 60.0, 46.0]),
+            label: Some("person".into()),
+            score: Some(0.7),
+            why: "found".into(),
+            spot: None,
+            answer: None,
+            run: "refine-2".into(),
+        };
+        let before = labels::read(&path).unwrap().unwrap();
+        let wrote = labels::update(&path, |old| {
+            let mut f = old.unwrap();
+            assert!(refine::apply(&mut f, vec![found.clone()], &[Kind::Add]).changed());
+            Ok(Some(f))
+        })
+        .unwrap();
+        assert!(wrote);
+        let after = labels::read(&path).unwrap().unwrap();
+        assert_eq!(after.boxes, before.boxes, "a check writes suggestions only");
+        // The page saves what it read: refused, and the check's write stays.
+        let mut page = l["labels"].clone();
+        page["refine"][2]["answer"] = "kept".into();
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &page.to_string())).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["conflict"], true);
+        assert_eq!(labels::read(&path).unwrap().unwrap(), after);
+        // The new add is live; the old unanswered add, not found again, went.
+        assert!(after.refine.contains(&found));
+        assert_eq!(refine_open_of(&d, &rel).await, Some(4));
+    }
+
+    both_ways!(
+        a_save_without_the_suggestion_lists_keeps_them_and_a_sent_list_is_the_clients,
+        a_save_without_the_suggestion_lists_keeps_them_and_a_sent_list_is_the_clients_indexed,
+        a_save_without_the_suggestion_lists_keeps_them_and_a_sent_list_is_the_clients_in
+    );
+
+    async fn a_save_without_the_suggestion_lists_keeps_them_and_a_sent_list_is_the_clients_in(
+        way: Way,
+    ) {
+        use crate::collect::labels::overlaps::{Suggestion, Verdict};
+        let d = way.ds_with(refine_classes);
+        let (rel, path, mut stored) = refine_frame(&d);
+        stored.overlap_suggestions = vec![Suggestion {
+            a: [4.0, 4.0, 20.0, 40.0],
+            b: [5.0, 5.0, 20.0, 40.0],
+            verdict: Verdict::Unclear,
+            why: "looked at, no answer".into(),
+            kept_score: None,
+            other_score: None,
+            low_confidence: false,
+            weak: false,
+        }];
+        labels::write(&path, &stored).unwrap();
+        let q = encode_uri_component(&rel);
+        let without_lists = |v: &serde_json::Value| {
+            let mut body = v["labels"].clone();
+            let o = body.as_object_mut().unwrap();
+            assert!(o.remove("refine").is_some() && o.remove("overlap_suggestions").is_some());
+            body
+        };
+        // (a) A client that rebuilds the file from the boxes, no revision (X-AnyLabeling and
+        // scripts): the suggestions, the dismissed one's answer and the overlap answer stay.
+        let (_, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        let uri = format!("/v1/review/labels?frame={q}");
+        let (st, v) = json(&d.state, post_json(&uri, &without_lists(&l).to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let back = labels::read(&path).unwrap().unwrap();
+        assert_eq!(back.refine, stored.refine);
+        assert_eq!(back.overlap_suggestions, stored.overlap_suggestions);
+        assert_eq!(refine_open_of(&d, &rel).await, Some(4));
+        // (b) The same with a revision.
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            v["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &without_lists(&v).to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let back = labels::read(&path).unwrap().unwrap();
+        assert_eq!(back.refine, stored.refine);
+        assert_eq!(back.overlap_suggestions, stored.overlap_suggestions);
+        // (c) A key that is there is the client's list, even an empty one.
+        let mut body = v["labels"].clone();
+        body["refine"] = serde_json::json!([]);
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            v["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &body.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let back = labels::read(&path).unwrap().unwrap();
+        assert!(back.refine.is_empty());
+        assert_eq!(back.overlap_suggestions, stored.overlap_suggestions);
+        let mut body = v["labels"].clone();
+        body["overlap_suggestions"] = serde_json::json!([]);
+        let (st, _) = json(
+            &d.state,
+            post_json(&format!("/v1/review/labels?frame={q}"), &body.to_string()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            labels::read(&path)
+                .unwrap()
+                .unwrap()
+                .overlap_suggestions
+                .is_empty()
+        );
+        // A null list is no list: refused, the file unchanged.
+        let before = labels::read(&path).unwrap().unwrap();
+        let mut body = v["labels"].clone();
+        body["refine"] = serde_json::Value::Null;
+        let (st, _) = json(
+            &d.state,
+            post_json(&format!("/v1/review/labels?frame={q}"), &body.to_string()),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(labels::read(&path).unwrap().unwrap(), before);
+        assert_eq!(refine_open_of(&d, &rel).await, None);
     }
 
     /// The message ends the bulk routes share, in each route's words, byte for byte.

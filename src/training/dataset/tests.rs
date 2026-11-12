@@ -1119,6 +1119,7 @@ fn review_export(
             benchmark_split: Default::default(),
             include_unreviewed: false,
             hidden_classes: Vec::new(),
+            size_floor: None,
         },
     )
     .unwrap()
@@ -1544,6 +1545,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
                     h: 0.2,
                 }],
                 ignore: Vec::new(),
+                floor_regions: Vec::new(),
                 parked: Vec::new(),
                 scene: Some("day".into()),
                 camera: "a".into(),
@@ -1558,6 +1560,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
         ],
         warnings: Vec::new(),
         notes_known: false,
+        size_floor: None,
     }
 }
 
@@ -1654,6 +1657,14 @@ fn name_of(s: &Source, r: FrameRef) -> String {
     file_name(&s.frames[r.1].image)
 }
 
+/// The options of earlier versions for frames with ignore regions: each leaves train and valid.
+fn drop_frame() -> Options {
+    Options {
+        ignore: IgnoreMode::DropFrame,
+        ..Options::default()
+    }
+}
+
 fn used(p: &Plan, r: FrameRef) -> bool {
     p.train.iter().any(|(t, _)| *t == r) || p.valid.contains(&r)
 }
@@ -1740,7 +1751,7 @@ fn with_regions(dir: &Path, opts: &Options) -> (Plan, FrameRef, FrameRef) {
 #[test]
 fn a_frame_with_an_ignore_region_leaves_train_and_valid_and_is_counted() {
     let t = tmp("ignore-plan");
-    let opts = Options::default();
+    let opts = drop_frame();
     let (before, pooled, held) = with_regions(&t.0, &opts);
     let s = read_export(&t.0).unwrap();
     let p = plan(std::slice::from_ref(&s), &opts).unwrap();
@@ -1768,14 +1779,14 @@ fn a_frame_with_an_ignore_region_leaves_train_and_valid_and_is_counted() {
 #[test]
 fn a_frame_left_out_by_the_scene_filter_is_not_counted_as_ignored() {
     let t = tmp("ignore-scene");
-    let opts = Options::default();
+    let opts = drop_frame();
     let (_, pooled, _) = with_regions(&t.0, &opts);
     let s = read_export(&t.0).unwrap();
     let scene = s.frames[pooled.1].scene.clone().unwrap();
     let other = if scene == "day" { "ir" } else { "day" };
     let filtered = Options {
         scene: SceneFilter::parse(other).unwrap(),
-        ..Options::default()
+        ..drop_frame()
     };
     let p = plan(std::slice::from_ref(&s), &filtered).unwrap();
     assert_eq!(p.stats.ignore_frames, 0);
@@ -1793,7 +1804,7 @@ fn every_frame_of_a_class_with_a_region_explains_the_refusal() {
         .collect();
     ignore_json(&t.0, &regions);
     let s = read_export(&t.0).unwrap();
-    let e = plan(&[s], &Options::default()).unwrap_err().to_string();
+    let e = plan(&[s], &drop_frame()).unwrap_err().to_string();
     assert!(e.contains("unsure or too-small"), "{e}");
 }
 
@@ -1977,7 +1988,7 @@ fn a_confirmed_empty_frame_stays_a_hard_negative() {
         serde_json::from_slice(&std::fs::read(t.0.join("manifest.json")).unwrap()).unwrap();
     let opts = Options {
         negative_share: 0.5,
-        ..Options::default()
+        ..drop_frame()
     };
     let p = plan(std::slice::from_ref(&s), &opts).unwrap();
     let empty = *p
@@ -2014,6 +2025,229 @@ fn a_confirmed_empty_frame_stays_a_hard_negative() {
     assert_eq!(p.stats.ignore_frames, 1);
 }
 
+fn region(class: &str) -> YoloBox {
+    YoloBox {
+        class: class.into(),
+        cx: 0.9,
+        cy: 0.9,
+        w: 0.02,
+        h: 0.03,
+    }
+}
+
+/// `s` with an ignore region of `class` on frame `r`.
+fn with_region(s: &Source, r: FrameRef, class: &str) -> Source {
+    let mut s = s.clone();
+    s.frames[r.1].ignore.push(region(class));
+    s
+}
+
+#[test]
+fn without_ignore_regions_both_modes_plan_the_same() {
+    let t = tmp("ignore-modes-same");
+    camera_export(&t.0);
+    let s = [read_export(&t.0).unwrap()];
+    let a = plan(&s, &Options::default()).unwrap();
+    let b = plan(&s, &drop_frame()).unwrap();
+    assert_eq!(a, b);
+    let stats = serde_json::to_value(&a.stats).unwrap();
+    for k in [
+        "ignore_frames",
+        "ignore_only",
+        "ignore_valid_day",
+        "ignore_kept",
+        "ignore_boxes_background",
+    ] {
+        assert!(stats.get(k).is_none(), "{k} is not written when 0: {stats}");
+    }
+}
+
+#[test]
+fn a_frame_with_a_label_and_a_region_trains_with_the_region_as_background() {
+    let t = tmp("ignore-background");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let opts = Options::default();
+    let before = plan(std::slice::from_ref(&s), &opts).unwrap();
+    let pool: Vec<FrameRef> = before
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(before.valid.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (mut kept, mut valid_days, mut only) = (0, 0, 0);
+    for r in pool {
+        let one = [with_region(&s, r, "dog")];
+        let p = plan(&one, &opts).unwrap();
+        let st = &p.stats;
+        assert!(
+            !p.valid.contains(&r),
+            "{r:?}: validation cannot ignore a region"
+        );
+        assert_eq!(p.heldout, before.heldout, "the held-out set does not move");
+        assert_eq!(p.heldout_fingerprint, before.heldout_fingerprint);
+        assert_eq!(st.ignore_frames, st.ignore_only + st.ignore_valid_day);
+        if s.frames[r.1].boxes.is_empty() {
+            // Nothing else on it: neither a positive nor a negative.
+            assert!(!used(&p, r), "{r:?}");
+            assert_eq!((st.ignore_only, st.ignore_kept), (1, 0));
+            only += 1;
+        } else if p.train.iter().any(|(x, _)| *x == r) {
+            assert_eq!(
+                (st.ignore_kept, st.ignore_only, st.ignore_valid_day),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                st.ignore_boxes_background,
+                BTreeMap::from([("dog".to_string(), 1)])
+            );
+            assert!(
+                p.warnings
+                    .iter()
+                    .any(|w| w.starts_with("1 training frame(s) show an unsure or too-small")),
+                "{:?}",
+                p.warnings
+            );
+            kept += 1;
+        } else {
+            // Its camera day validates: out of both sides, counted.
+            assert!(!used(&p, r));
+            assert!(st.valid_groups.contains(&group(&one, r)), "{r:?}");
+            assert_eq!((st.ignore_valid_day, st.ignore_kept), (1, 0));
+            assert!(p.warnings.iter().any(|w| w.contains("used for validation")));
+            valid_days += 1;
+        }
+    }
+    assert!(
+        kept > 0 && valid_days > 0 && only > 0,
+        "every path is taken: kept {kept}, validation days {valid_days}, region only {only}"
+    );
+}
+
+#[test]
+fn a_frame_with_only_a_region_is_no_negative() {
+    let t = tmp("ignore-no-negative");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let opts = Options {
+        negative_share: 0.9,
+        ..Options::default()
+    };
+    let before = plan(std::slice::from_ref(&s), &opts).unwrap();
+    // A frame without boxes that trained as a negative, and one a reviewer confirmed empty.
+    let empty = *before
+        .train
+        .iter()
+        .map(|(r, _)| r)
+        .find(|r| s.frames[r.1].boxes.is_empty())
+        .expect("a negative in training");
+    let mut with = with_region(&s, empty, "cat");
+    with.frames[empty.1].hard_negative = true;
+    let p = plan(&[with], &opts).unwrap();
+    assert!(
+        !used(&p, empty),
+        "an unlabelled object is no 'nothing here', confirmed empty or not"
+    );
+    assert_eq!((p.stats.ignore_only, p.stats.ignore_kept), (1, 0));
+}
+
+#[test]
+fn the_held_out_set_and_its_fingerprint_do_not_depend_on_the_ignore_mode() {
+    let t = tmp("ignore-mode-print");
+    let (_, pooled, held) = with_regions(&t.0, &Options::default());
+    let s = [read_export(&t.0).unwrap()];
+    assert!(!s[0].frames[pooled.1].ignore.is_empty() && !s[0].frames[held.1].ignore.is_empty());
+    let a = plan(&s, &Options::default()).unwrap();
+    let b = plan(&s, &drop_frame()).unwrap();
+    assert_eq!(a.heldout, b.heldout);
+    assert_eq!(a.heldout_fingerprint, b.heldout_fingerprint);
+    assert!(a.heldout.contains(&held) && !used(&a, held) && !used(&b, held));
+}
+
+#[test]
+fn a_trained_frame_writes_its_labels_without_the_region_and_never_validates() {
+    let t = tmp("ignore-write");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let opts = Options::default();
+    let before = plan(std::slice::from_ref(&s), &opts).unwrap();
+    let r = before
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .find(|r| s.frames[r.1].boxes.len() == 2)
+        .unwrap();
+    let s = [with_region(&s, r, "cat")];
+    let p = plan(&s, &opts).unwrap();
+    assert!(p.train.iter().any(|(x, _)| *x == r), "{:?}", p.stats);
+    let dir = t.0.join("prepared");
+    write(&s, &p, &opts, &dir).unwrap();
+    let name = format!("s0-{}", name_of(&s[0], r));
+    let label = std::fs::read_to_string(
+        dir.join("labels")
+            .join(format!("{}.txt", stem(Path::new(&name)))),
+    )
+    .unwrap();
+    assert_eq!(
+        label.lines().count(),
+        2,
+        "its two boxes, no region: {label}"
+    );
+    assert!(!label.contains("0.900000"), "{label}");
+    let train = std::fs::read_to_string(dir.join("train.txt")).unwrap();
+    let valid = std::fs::read_to_string(dir.join("valid.txt")).unwrap();
+    assert!(train.contains(&name) && !valid.contains(&name));
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["options"]["ignore"], "background");
+    assert_eq!(summary["stats"]["ignore_kept"], 1);
+    assert_eq!(summary["stats"]["ignore_boxes_background"]["cat"], 1);
+    let d = drop_frame();
+    let dp = plan(&s, &d).unwrap();
+    let ddir = t.0.join("prepared-drop");
+    write(&s, &dp, &d, &ddir).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ddir.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["options"]["ignore"], "drop-frame");
+    assert_eq!(summary["stats"]["ignore_frames"], 1);
+}
+
+#[test]
+fn neither_validation_fallback_takes_a_frame_with_a_region() {
+    let t = tmp("ignore-fallback");
+    let source = |n: usize| {
+        let mut s = one_image_source(&t.0, n);
+        for (i, f) in s.frames.iter_mut().enumerate() {
+            f.image = t.0.join(format!("{i}.jpg"));
+        }
+        s.frames[0].ignore.push(region("person"));
+        s
+    };
+    let opts = Options {
+        heldout_share: 0.0,
+        val_share: 0.0,
+        min_valid: 0,
+        negative_share: 0.0,
+        static_cap: None,
+        ..Options::default()
+    };
+    // One camera day: validation frame by frame, never the frame with the region; it trains.
+    let p = plan(&[source(6)], &opts).unwrap();
+    assert!(
+        !p.valid.is_empty() && !p.valid.contains(&(0, 0)),
+        "{:?}",
+        p.valid
+    );
+    assert!(p.train.iter().any(|(r, _)| *r == (0, 0)));
+    assert_eq!(p.stats.ignore_kept, 1);
+    // Too few frames for a split: the trainer validates on the training frames without regions.
+    let p = plan(&[source(2)], &opts).unwrap();
+    assert_eq!(p.train.len(), 2);
+    assert_eq!(p.valid, [(0, 1)]);
+}
+
 /// `n` training frames of camera `a` with only the parked spot `spot`, and `free` frames with a
 /// normal box, over two days so that a day can be held out.
 fn parked_source(dir: &Path, n: usize, free: usize, spots: &[&str]) -> Source {
@@ -2030,10 +2264,13 @@ fn parked_source(dir: &Path, n: usize, free: usize, spots: &[&str]) -> Source {
 }
 
 /// Every frame in the pool: a split-hinted export with no held-out frame now gets a held-out share.
+/// The static cap is off: these fixtures repeat one box on every frame of one camera, which is a
+/// static spot, and they test the parked cap alone.
 fn no_negatives() -> Options {
     Options {
         negative_share: 0.0,
         heldout_share: 0.0,
+        static_cap: None,
         ..Options::default()
     }
 }
@@ -2132,6 +2369,7 @@ fn the_export_names_frames_with_only_parked_boxes() {
             vec!["cam/8x8/person/1,1,5,5".to_string()],
         )]
         .into(),
+        size_floor: None,
     };
     std::fs::write(dir.join(IGNORE_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
     let s = read_export(dir).unwrap();
@@ -2410,4 +2648,944 @@ fn a_missing_label_file_is_no_objects_only_outside_our_own_exports() {
     std::fs::write(t.0.join("export.json"), br#"{"formats":["yolo"]}"#).unwrap();
     let e = read_export(&t.0).unwrap_err();
     assert!(format!("{e:#}").contains("a.txt"), "{e:#}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The static cap
+// ---------------------------------------------------------------------------------------------
+
+/// A box of the static cap's tests: (class, cx, cy, w, h).
+type TBox = (&'static str, f32, f32, f32, f32);
+
+/// A frame of camera `patio` for the static cap's tests.
+fn patio_frame(dir: &Path, i: usize, day: usize, scene: &str, boxes: &[TBox]) -> Frame {
+    Frame {
+        image: dir.join(format!("f{i:04}.jpg")),
+        boxes: boxes
+            .iter()
+            .map(|&(class, cx, cy, w, h)| YoloBox {
+                class: class.into(),
+                cx,
+                cy,
+                w,
+                h,
+            })
+            .collect(),
+        ignore: Vec::new(),
+        floor_regions: Vec::new(),
+        parked: Vec::new(),
+        scene: Some(scene.into()),
+        camera: "patio".into(),
+        day: format!("2026-10-{day:02}"),
+        split: SplitHint::Train,
+        hard_negative: false,
+        human_rejected: false,
+        bulk_accepted: false,
+        size: Some((640, 480)),
+    }
+}
+
+/// The parked car of the static tests, jittered by frame.
+fn parked_car(i: usize) -> TBox {
+    let j = (i % 5) as f32 * 0.001;
+    ("car", 0.3 + j, 0.6 - j, 0.2, 0.15)
+}
+
+/// A person walking by: at another place on each frame `k`, never a static spot.
+fn person(k: usize) -> TBox {
+    ("person", 0.5 + k as f32 * 0.04, 0.3, 0.05, 0.2)
+}
+const STATIC_SCENES: [&str; 3] = ["day", "night", "ir"];
+
+fn patio_source(dir: &Path, frames: Vec<Frame>) -> Source {
+    Source {
+        dir: dir.to_path_buf(),
+        public: None,
+        classes: vec!["car".into(), "person".into()],
+        frames,
+        warnings: Vec::new(),
+        notes_known: true,
+        size_floor: None,
+    }
+}
+
+/// Camera `patio`: 60 frames showing only the parked car (6 days, 3 scenes), 10 with the car and
+/// a person, 10 with a car passing (each at another place), 20 empty, and day 7 held out (10
+/// frames with the car only).
+fn static_source(dir: &Path) -> Source {
+    let mut frames = Vec::new();
+    let mut push = |day: usize, scene: &str, boxes: &[TBox]| {
+        let i = frames.len();
+        frames.push(patio_frame(dir, i, day, scene, boxes));
+    };
+    for k in 0..60 {
+        push(k % 6 + 1, STATIC_SCENES[k % 3], &[parked_car(k)]);
+    }
+    for k in 0..10 {
+        push(k % 6 + 1, "day", &[parked_car(k), person(k)]);
+    }
+    for k in 0..10 {
+        let x = 0.05 + k as f32 * 0.09;
+        push(k % 6 + 1, "day", &[("car", x, 0.2, 0.05, 0.05)]);
+    }
+    for k in 0..20 {
+        push(k % 6 + 1, "night", &[]);
+    }
+    for k in 0..10 {
+        push(7, "day", &[parked_car(k)]);
+    }
+    for f in frames.iter_mut().filter(|f| f.day == "2026-10-07") {
+        f.split = SplitHint::Heldout;
+    }
+    patio_source(dir, frames)
+}
+
+/// Train and valid frames of `p`, each once.
+fn used_frames(p: &Plan) -> BTreeSet<FrameRef> {
+    p.train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect()
+}
+
+/// Whether a frame shows the parked car alone.
+fn car_only(f: &Frame) -> bool {
+    f.boxes.len() == 1 && f.boxes[0].class == "car" && (f.boxes[0].cy - 0.6).abs() < 0.01
+}
+
+fn cap_off() -> Options {
+    Options {
+        static_cap: None,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn frames_of_a_static_spot_are_capped_by_geometry_without_parked_info() {
+    let t = tmp("static-cap");
+    let s = [static_source(&t.0)];
+    assert!(
+        s[0].frames.iter().all(|f| f.parked.is_empty()),
+        "no export info"
+    );
+    let p = plan(&s, &Options::default()).unwrap();
+    assert_eq!(p.stats.static_spots, 1, "{:?}", p.stats);
+    assert_eq!(p.stats.static_capped, 40, "{:?}", p.stats);
+    assert_eq!(p.stats.parked_capped, 0);
+    let used = used_frames(&p);
+    let kept_static = used.iter().filter(|r| car_only(&s[0].frames[r.1])).count();
+    assert_eq!(kept_static, PARKED_CAP);
+    let caps = &p.stats.static_caps;
+    assert_eq!(caps.len(), 1);
+    assert_eq!((caps[0].frames, caps[0].kept), (60, PARKED_CAP));
+    assert_eq!(
+        (caps[0].camera.as_str(), caps[0].label.as_str()),
+        ("patio", "car")
+    );
+    assert!(caps[0].id.starts_with("patio/vehicle/"), "{}", caps[0].id);
+    // A frame with a person, and a passing car, are never left out.
+    let other = |f: &Frame| f.day != "2026-10-07" && !f.boxes.is_empty() && !car_only(f);
+    let others: BTreeSet<FrameRef> = (0..s[0].frames.len())
+        .map(|i| (0, i))
+        .filter(|r| other(&s[0].frames[r.1]))
+        .collect();
+    assert_eq!(others.len(), 20);
+    assert!(others.is_subset(&used), "{:?}", others.difference(&used));
+    // The held-out day is whole.
+    assert_eq!(p.heldout.len(), 10);
+    // The note says what went and how to keep it.
+    let note = static_cap_note(&p.stats, Options::default().static_cap).unwrap();
+    assert!(
+        note.starts_with("40 frame(s) showing nothing but objects parked at 1 static spot(s)"),
+        "{note}"
+    );
+    assert!(
+        note.contains("a car on camera patio (60 frames, 20 kept)"),
+        "{note}"
+    );
+    assert!(note.contains("training.static_cap"), "{note}");
+    // dataset.json lists the spot.
+    let v = serde_json::to_value(&p.stats).unwrap();
+    assert_eq!(v["static_capped"], 40);
+    assert_eq!(v["static_caps"][0]["kept"], 20);
+}
+
+#[test]
+fn the_held_out_set_is_the_same_with_the_static_cap_on_and_off() {
+    let t = tmp("static-held");
+    let mut s = static_source(&t.0);
+    // No split from the export: the plan holds out whole camera days itself.
+    for f in &mut s.frames {
+        f.split = SplitHint::None;
+    }
+    let s = [s];
+    let on = plan(&s, &Options::default()).unwrap();
+    let off = plan(&s, &cap_off()).unwrap();
+    assert!(on.stats.static_capped > 0, "{:?}", on.stats);
+    assert!(!on.heldout.is_empty());
+    assert_eq!(on.heldout, off.heldout);
+    assert_eq!(on.heldout_fingerprint, off.heldout_fingerprint);
+    assert_eq!(on.stats.heldout_groups, off.stats.heldout_groups);
+    // Off: nothing of the cap in the plan.
+    assert_eq!(
+        (
+            off.stats.static_capped,
+            off.stats.static_spots,
+            off.stats.static_caps.len()
+        ),
+        (0, 0, 0)
+    );
+    assert!(static_cap_note(&off.stats, None).is_none());
+}
+
+#[test]
+fn a_static_cap_of_zero_is_the_plan_without_it() {
+    let t = tmp("static-zero");
+    let s = [static_source(&t.0)];
+    let none = plan(&s, &cap_off()).unwrap();
+    let zero = plan(
+        &s,
+        &Options {
+            static_cap: Some(0),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(none, zero);
+    let used = used_frames(&none);
+    assert_eq!(
+        used.iter().filter(|r| car_only(&s[0].frames[r.1])).count(),
+        60
+    );
+    // Options of older runs (no key) read as the default cap; a written null stays off.
+    let old: Options = serde_json::from_value(serde_json::json!({
+        "classes": null, "negative_share": 0.15, "heldout_share": 0.2, "val_share": 0.1,
+        "oversample": 3, "seed": 0
+    }))
+    .unwrap();
+    assert_eq!(old.static_cap, Some(PARKED_CAP));
+    let back: Options = serde_json::from_str(&serde_json::to_string(&cap_off()).unwrap()).unwrap();
+    assert_eq!(back.static_cap, None);
+}
+
+#[test]
+fn the_static_plan_does_not_depend_on_the_frame_order() {
+    let t = tmp("static-order");
+    let a = static_source(&t.0);
+    let mut b = a.clone();
+    b.frames.reverse();
+    b.frames.rotate_left(13);
+    let names = |s: &Source, p: &Plan| {
+        let name = |r: &FrameRef| file_name(&s.frames[r.1].image);
+        let mut train: Vec<(String, u32)> = p.train.iter().map(|(r, n)| (name(r), *n)).collect();
+        train.sort();
+        let valid: BTreeSet<String> = p.valid.iter().map(name).collect();
+        let held: BTreeSet<String> = p.heldout.iter().map(name).collect();
+        (train, valid, held)
+    };
+    let o = Options::default();
+    let pa = plan(std::slice::from_ref(&a), &o).unwrap();
+    let pb = plan(std::slice::from_ref(&b), &o).unwrap();
+    assert!(pa.stats.static_capped > 0);
+    assert_eq!(names(&a, &pa), names(&b, &pb));
+    assert_eq!(pa.stats.static_caps, pb.stats.static_caps);
+    assert_eq!(pa.heldout_fingerprint, pb.heldout_fingerprint);
+    // Another seed keeps as many.
+    let seeded = plan(std::slice::from_ref(&a), &Options { seed: 9, ..o }).unwrap();
+    assert_eq!(seeded.stats.static_capped, pa.stats.static_capped);
+}
+
+#[test]
+fn kept_static_frames_span_the_scenes_and_days_first() {
+    let t = tmp("static-variety");
+    let dir = &t.0;
+    // 3 scenes x 6 days, 4 frames each: 18 groups, 72 frames of the car alone.
+    let mut frames = Vec::new();
+    for day in 1..=6 {
+        for scene in STATIC_SCENES {
+            for _ in 0..4 {
+                let i = frames.len();
+                frames.push(patio_frame(dir, i, day, scene, &[parked_car(i)]));
+            }
+        }
+    }
+    // Something else to train on.
+    for k in 0..5 {
+        let i = frames.len();
+        frames.push(patio_frame(dir, i, k % 6 + 1, "day", &[person(k)]));
+    }
+    let s = [patio_source(dir, frames)];
+    let o = Options {
+        heldout_share: 0.0,
+        ..Options::default()
+    };
+    for seed in 0..4 {
+        let p = plan(&s, &Options { seed, ..o.clone() }).unwrap();
+        let mut groups: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for r in used_frames(&p) {
+            let f = &s[0].frames[r.1];
+            if car_only(f) {
+                *groups
+                    .entry((f.scene.clone().unwrap(), f.day.clone()))
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(groups.values().sum::<usize>(), PARKED_CAP, "seed {seed}");
+        assert_eq!(
+            groups.len(),
+            18,
+            "every scene and day before a second frame of any: {groups:?}"
+        );
+        assert!(groups.values().all(|n| *n <= 2), "{groups:?}");
+    }
+    // Two days, three scenes: 6 groups of 10; the 20 kept are 3 or 4 of each, so 6 or 7 per scene.
+    let mut frames: Vec<Frame> = (0..60)
+        .map(|k| {
+            patio_frame(
+                dir,
+                1000 + k,
+                k % 2 + 1,
+                STATIC_SCENES[k % 3],
+                &[parked_car(k)],
+            )
+        })
+        .collect();
+    frames.push(patio_frame(dir, 2000, 1, "day", &[person(0)]));
+    let s2 = [patio_source(dir, frames)];
+    let p = plan(&s2, &o).unwrap();
+    let mut per_scene: BTreeMap<String, usize> = BTreeMap::new();
+    for r in used_frames(&p) {
+        let f = &s2[0].frames[r.1];
+        if car_only(f) {
+            *per_scene.entry(f.scene.clone().unwrap()).or_default() += 1;
+        }
+    }
+    assert_eq!(per_scene.values().sum::<usize>(), PARKED_CAP);
+    assert!(
+        per_scene.values().all(|n| (6..=7).contains(n)),
+        "{per_scene:?}"
+    );
+}
+
+#[test]
+fn a_frame_of_an_unpicked_class_only_is_a_negative_not_static() {
+    let t = tmp("static-excluded");
+    let s = [static_source(&t.0)];
+    // Only persons train: the car frames are negatives (background), never static.
+    let p = plan(
+        &s,
+        &Options {
+            classes: Some(vec!["person".into()]),
+            negative_share: 0.0,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((p.stats.static_capped, p.stats.static_spots), (0, 0));
+    // The car frames are negatives: with room for them all, every one stays.
+    let p = plan(
+        &s,
+        &Options {
+            classes: Some(vec!["person".into()]),
+            negative_share: 0.9,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.stats.static_capped, 0);
+    let used = used_frames(&p);
+    assert_eq!(
+        used.iter().filter(|r| car_only(&s[0].frames[r.1])).count(),
+        60
+    );
+}
+
+#[test]
+fn negatives_follow_the_frames_the_static_cap_left() {
+    let t = tmp("static-negatives");
+    let mut s = static_source(&t.0);
+    for k in 0..100 {
+        let f = patio_frame(&t.0, 5000 + k, k % 6 + 1, "night", &[]);
+        s.frames.push(f);
+    }
+    let s = [s];
+    let o = Options {
+        negative_share: 0.5,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.stats.static_capped, 40);
+    let used = used_frames(&p);
+    let (neg, pos): (Vec<FrameRef>, Vec<FrameRef>) =
+        used.iter().partition(|r| s[0].frames[r.1].boxes.is_empty());
+    // 20 static + 10 with a person + 10 passing cars; as many negatives at a share of 0.5.
+    assert_eq!(pos.len(), 40);
+    assert_eq!(neg.len(), 40);
+}
+
+#[test]
+fn the_parked_cap_runs_first_and_the_static_cap_on_the_rest() {
+    let t = tmp("static-parked");
+    let dir = t.0.clone();
+    let mut frames: Vec<Frame> = (0..80)
+        .map(|k| patio_frame(&dir, k, k % 4 + 1, STATIC_SCENES[k % 3], &[parked_car(k)]))
+        .collect();
+    // The export knew 50 of them as parked-spot frames.
+    for f in frames.iter_mut().take(50) {
+        f.parked = vec!["patio/640x480/car/160,250,290,330".into()];
+    }
+    frames.push(patio_frame(&dir, 100, 1, "day", &[person(0)]));
+    let s = [patio_source(&dir, frames)];
+    let o = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    // 50 parked: 20 kept by the parked cap; then those 20 + 30 static-only: 20 kept.
+    assert_eq!(p.stats.parked_capped, 30);
+    assert_eq!(p.stats.static_capped, 30);
+    assert_eq!(
+        p.stats.static_caps[0].frames, 50,
+        "what the parked cap took out is not counted again"
+    );
+    let used = used_frames(&p);
+    assert_eq!(
+        used.iter().filter(|r| car_only(&s[0].frames[r.1])).count(),
+        PARKED_CAP
+    );
+}
+
+#[test]
+fn a_person_at_one_place_is_never_a_static_spot_nor_capped() {
+    let t = tmp("static-person");
+    let dir = t.0.clone();
+    // Someone sitting at the same place on 40 frames over 4 days, and the parked car on 40
+    // others: the car's frames are capped, the person's never.
+    let sitting: TBox = ("person", 0.7, 0.4, 0.08, 0.25);
+    let mut frames: Vec<Frame> = (0..40)
+        .map(|k| patio_frame(&dir, k, k % 4 + 1, STATIC_SCENES[k % 3], &[sitting]))
+        .collect();
+    frames.extend((0..40).map(|k| patio_frame(&dir, 100 + k, k % 4 + 1, "day", &[parked_car(k)])));
+    let s = [patio_source(&dir, frames)];
+    let o = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.stats.static_spots, 1, "the car's only: {:?}", p.stats);
+    assert_eq!(p.stats.static_capped, 20);
+    assert_eq!(p.stats.static_caps[0].label, "car");
+    let used = used_frames(&p);
+    let persons = used
+        .iter()
+        .filter(|r| s[0].frames[r.1].boxes[0].class == "person")
+        .count();
+    assert_eq!(persons, 40, "every person frame trains");
+}
+
+#[test]
+fn a_minority_class_at_a_spot_keeps_a_quota_of_its_own() {
+    let t = tmp("static-truck");
+    let dir = &t.0;
+    // A car at its place on 60 days (2 frames a day), and a pickup labelled truck parked at the
+    // same place on 2 of those days (2 frames each): one spot (vehicles are one object), two
+    // quotas. With one quota of 20 for the place the truck's 4 frames were lost about half the
+    // time; now they always stay.
+    let mut frames = Vec::new();
+    for day in 1..=60 {
+        for _ in 0..2 {
+            let i = frames.len();
+            frames.push(patio_frame(
+                dir,
+                i,
+                day,
+                STATIC_SCENES[i % 3],
+                &[parked_car(i)],
+            ));
+        }
+    }
+    for day in [10, 40] {
+        for _ in 0..2 {
+            let i = frames.len();
+            let (_, cx, cy, w, h) = parked_car(i);
+            frames.push(patio_frame(dir, i, day, "day", &[("truck", cx, cy, w, h)]));
+        }
+    }
+    for k in 0..5 {
+        let i = frames.len();
+        frames.push(patio_frame(dir, i, k + 1, "day", &[person(k)]));
+    }
+    let s = [Source {
+        classes: vec!["car".into(), "truck".into(), "person".into()],
+        ..patio_source(dir, frames)
+    }];
+    let o = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..o.clone() }).unwrap();
+        let used = used_frames(&p);
+        let trucks = used
+            .iter()
+            .filter(|r| s[0].frames[r.1].boxes[0].class == "truck")
+            .count();
+        assert_eq!(trucks, 4, "seed {seed}: {:?}", p.stats.static_caps);
+        assert_eq!(p.stats.static_spots, 1);
+        // `static_caps`: one entry per (spot, class); `label` is the class of the quota.
+        let caps = &p.stats.static_caps;
+        assert_eq!(caps.len(), 2, "{caps:?}");
+        assert_eq!(caps[0].id, caps[1].id, "one spot");
+        assert_eq!(
+            (caps[0].label.as_str(), caps[0].frames, caps[0].kept),
+            ("car", 120, PARKED_CAP)
+        );
+        assert_eq!(
+            (caps[1].label.as_str(), caps[1].frames, caps[1].kept),
+            ("truck", 4, 4)
+        );
+        assert_eq!(p.stats.static_capped, 100);
+        assert_eq!(
+            p.stats.static_capped_boxes,
+            [("car".to_string(), 100)].into()
+        );
+        // The note counts the place once.
+        let note = static_cap_note(&p.stats, o.static_cap).unwrap();
+        assert!(
+            note.starts_with("100 frame(s) showing nothing but objects parked at 1 static spot(s)"),
+            "{note}"
+        );
+        assert!(note.contains("per spot and class"), "{note}");
+    }
+}
+
+#[test]
+fn a_class_the_cap_took_frames_of_says_so_in_its_warnings() {
+    let mut stats = Stats::default();
+    assert_eq!(static_cap_clause(&stats, "truck"), None);
+    stats.static_capped_boxes.insert("truck".into(), 7);
+    let c = static_cap_clause(&stats, "truck").unwrap();
+    assert!(c.contains("left out 7 box(es)"), "{c}");
+    assert!(c.contains("training.static_cap to 0"), "{c}");
+    assert!(c.contains("--static-cap 0"), "{c}");
+    assert_eq!(static_cap_clause(&stats, "car"), None);
+    // The note of a run whose classes can never be static: only with the cap on.
+    let merged = vec!["vehicle".to_string(), "person".to_string()];
+    assert!(static_cap_idle_note(&merged, Some(20)).is_some());
+    assert!(static_cap_idle_note(&merged, None).is_none());
+    assert!(static_cap_idle_note(&merged, Some(0)).is_none());
+    assert!(static_cap_idle_note(&["car".to_string()], Some(20)).is_none());
+}
+
+// ---- the size floor at the run's input, and the exports' floors
+
+const FLOOR_384: SizeFloor = SizeFloor {
+    px: 10.0,
+    input: 384,
+};
+
+/// A size floor region of `class`: `w` x `h` of the image (10 px at 384 = 0.026 of it).
+fn floor_region(class: &str, w: f32, h: f32) -> YoloBox {
+    YoloBox {
+        class: class.into(),
+        cx: 0.8,
+        cy: 0.8,
+        w,
+        h,
+    }
+}
+
+/// `s` exported with `floor`, and these size floor regions on their frames.
+fn with_floor_regions(s: &Source, floor: SizeFloor, at: &[(FrameRef, YoloBox)]) -> Source {
+    let mut s = s.clone();
+    s.size_floor = Some(floor);
+    for (r, b) in at {
+        let f = &mut s.frames[r.1];
+        f.floor_regions.push(f.ignore.len());
+        f.ignore.push(b.clone());
+    }
+    s
+}
+
+fn at_imgsz(n: Option<u32>) -> Options {
+    Options {
+        imgsz: n,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn ignore_json_names_the_floor_and_its_regions() {
+    let t = tmp("floor-read");
+    camera_export(&t.0);
+    let regions = serde_json::json!({
+        "version": 1,
+        "size_floor": {"px": 10, "input": 384},
+        "images": {"yard-2026-10-01-0.jpg": [
+            {"label": "cat", "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.3},
+            {"label": "dog", "cx": 0.1, "cy": 0.1, "w": 0.02, "h": 0.03, "size_floor": true},
+        ]},
+    });
+    std::fs::write(
+        t.0.join("ignore.json"),
+        serde_json::to_vec(&regions).unwrap(),
+    )
+    .unwrap();
+    let s = read_export(&t.0).unwrap();
+    assert_eq!(s.size_floor, Some(FLOOR_384));
+    let f = s.frames.iter().find(|f| !f.ignore.is_empty()).unwrap();
+    assert_eq!(f.ignore.len(), 2);
+    assert_eq!(
+        f.floor_regions,
+        [1],
+        "only the floor's region; the unsure one is a reviewer's"
+    );
+    // An export of no floor, or from before floors: none.
+    ignore_json(
+        &t.0,
+        &[("yard-2026-10-01-0.jpg", "cat", 0.5, 0.5, 0.3, 0.3)],
+    );
+    let s = read_export(&t.0).unwrap();
+    assert_eq!(s.size_floor, None);
+    assert!(s.frames.iter().all(|f| f.floor_regions.is_empty()));
+}
+
+#[test]
+fn a_run_at_a_larger_input_trains_the_floor_regions_it_can_learn() {
+    let t = tmp("floor-larger");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let before = plan(std::slice::from_ref(&s), &Options::default()).unwrap();
+    let pooled: Vec<FrameRef> = before.train.iter().map(|(r, _)| *r).collect();
+    let (grown, tiny) = (pooled[0], pooled[1]);
+    let held = before.heldout[0];
+    // At 384 both are under 10 px (7.7 and 3.8); at 640 the first is 12.8, the second 6.4.
+    let s = with_floor_regions(
+        &s,
+        FLOOR_384,
+        &[
+            (grown, floor_region("dog", 0.02, 0.03)),
+            (tiny, floor_region("cat", 0.01, 0.03)),
+            (held, floor_region("dog", 0.02, 0.03)),
+        ],
+    );
+    let s = [s];
+    let at384 = plan(&s, &at_imgsz(Some(384))).unwrap();
+    let at640 = plan(&s, &at_imgsz(Some(640))).unwrap();
+    let unknown = plan(&s, &at_imgsz(None)).unwrap();
+    // Held out exactly as exported, at any input.
+    for p in [&at640, &unknown] {
+        assert_eq!(p.heldout, at384.heldout);
+        assert_eq!(p.heldout_fingerprint, at384.heldout_fingerprint);
+    }
+    assert!(at384.stats.floor_restored.is_empty() && unknown.stats.floor_restored.is_empty());
+    assert_eq!(
+        at640.stats.floor_restored,
+        BTreeMap::from([("dog".to_string(), 1)]),
+        "{:?}",
+        at640.stats
+    );
+    assert!(
+        at640.warnings.iter().any(|w| w
+            .starts_with("1 object(s) the export's size floor (10 px at 384) left out")
+            && w.contains("this run's 640 px input")),
+        "{:?}",
+        at640.warnings
+    );
+    // The given-back frame has no region left: it trains or validates as a plain frame.
+    let view = at_run_input(&s, &at640, &at_imgsz(Some(640)));
+    let g = &view[0].frames[grown.1];
+    assert!(g.ignore.is_empty() && g.floor_regions.is_empty());
+    assert_eq!(g.boxes.last().unwrap().class, "dog");
+    assert!(used(&at640, grown));
+    let k = &view[0].frames[tiny.1];
+    assert_eq!((k.ignore.len(), k.floor_regions.as_slice()), (1, &[0][..]));
+    assert_eq!(view[0].frames[held.1].ignore.len(), 1, "held out keeps it");
+    // Written: the dog is a label line of the frame, the held-out one stays an ignore region.
+    let out = t.0.join("prepared");
+    let opts = at_imgsz(Some(640));
+    write(&s, &at640, &opts, &out).unwrap();
+    let name = format!("s0-{}", name_of(&s[0], grown));
+    let label = std::fs::read_to_string(
+        out.join("labels")
+            .join(format!("{}.txt", stem(Path::new(&name)))),
+    )
+    .unwrap();
+    assert!(
+        label.lines().any(|l| l.starts_with("1 0.800000 0.800000")),
+        "{label}"
+    );
+    let m: Manifest =
+        serde_json::from_slice(&std::fs::read(out.join("heldout/manifest.json")).unwrap()).unwrap();
+    assert!(
+        m.images
+            .iter()
+            .flat_map(|i| i.objects.iter().flatten())
+            .any(|o| o.ignore && o.label == "dog")
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["stats"]["floor_restored"]["dog"], 1);
+    assert_eq!(summary["options"]["imgsz"], 640);
+    // The pre-flight counts the frame's dog with the labels.
+    let r = crate::training::preflight::report(&at640, &s, &opts, None);
+    assert_eq!(r.floor_restored, BTreeMap::from([("dog".to_string(), 1)]));
+    let r384 = crate::training::preflight::report(&at384, &s, &at_imgsz(Some(384)), None);
+    let dogs = |r: &crate::training::preflight::Report| {
+        let l = r.classes.iter().find(|c| c.name == "dog").unwrap();
+        l.train + l.valid
+    };
+    assert_eq!(dogs(&r), dogs(&r384) + 1);
+    // A renamed label is counted under its new name, as its box is mapped.
+    let renamed = Options {
+        rename: BTreeMap::from([("dog".to_string(), "canine".to_string())]),
+        ..at_imgsz(Some(640))
+    };
+    let p = plan(&s, &renamed).unwrap();
+    assert_eq!(
+        p.stats.floor_restored,
+        BTreeMap::from([("canine".to_string(), 1)])
+    );
+}
+
+#[test]
+fn a_run_at_a_smaller_or_unknown_input_says_what_the_floor_cannot_do() {
+    let t = tmp("floor-smaller");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let before = plan(std::slice::from_ref(&s), &Options::default()).unwrap();
+    let r = before.train[0].0;
+    let at640 = SizeFloor {
+        px: 10.0,
+        input: 640,
+    };
+    let mut s = with_floor_regions(&s, at640, &[(r, floor_region("dog", 0.01, 0.01))]);
+    // A label of 8 px at 384 (13.4 at 640): over the export's floor, under it at the run's input.
+    s.frames[r.1].boxes.push(floor_region("cat", 0.021, 0.021));
+    let s = [s];
+    let p = plan(&s, &at_imgsz(Some(384))).unwrap();
+    assert!(
+        p.stats.floor_restored.is_empty(),
+        "boxes never become regions"
+    );
+    let w = p
+        .warnings
+        .iter()
+        .find(|w| w.contains("this run trains at 384 px"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(
+        w.contains(
+            "was applied at 640: objects of 6.0 to 10 px at this run's input are still labels \
+             (1 on its training frames)"
+        ) && w.contains("export again with the floor's input set to 384"),
+        "{w}"
+    );
+    // Unknown: a warning that names the floor, nothing given back.
+    let p = plan(&s, &at_imgsz(None)).unwrap();
+    assert!(
+        p.warnings.iter().any(|w| w
+            .contains("left out 1 object(s) under its size floor (10 px at 640)")
+            && w.contains("does not know the size the run trains at")),
+        "{:?}",
+        p.warnings
+    );
+    // The floor's own input: nothing to say.
+    let p = plan(&s, &at_imgsz(Some(640))).unwrap();
+    assert!(
+        p.warnings.iter().all(|w| !w.contains("size floor")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn exports_of_other_floors_than_each_other_or_the_current_one_are_named() {
+    let t = tmp("floor-mixed");
+    let (a, b) = (t.0.join("a"), t.0.join("b"));
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d).unwrap();
+        camera_export(d);
+    }
+    let sa = read_export(&a).unwrap();
+    let sb = read_export(&b).unwrap();
+    let s = [
+        Source {
+            size_floor: Some(FLOOR_384),
+            ..sa.clone()
+        },
+        sb.clone(),
+    ];
+    let p = plan(&s, &Options::default()).unwrap();
+    let mixed = p
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("the exports were made with different size floors"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(
+        mixed.contains(&format!("{} (10 px at 384)", a.display()))
+            && mixed.contains(&format!("{} (no size floor)", b.display())),
+        "{mixed}"
+    );
+    // Against the current floor: the one without, and one of another floor.
+    let now = Options {
+        size_floor: Some(SizeFloor {
+            px: 12.0,
+            input: 384,
+        }),
+        ..Options::default()
+    };
+    let p = plan(&s, &now).unwrap();
+    assert!(
+        p.warnings.iter().any(|w| w.starts_with(&format!(
+            "{} was exported without a size floor (before it was set",
+            b.display()
+        )) && w.contains("under 12 px at 384 still train as labels")),
+        "{:?}",
+        p.warnings
+    );
+    assert!(
+        p.warnings.iter().any(|w| w.starts_with(&format!(
+            "{} was exported with a size floor of 10 px at 384, and the current floor is 12 px \
+             at 384",
+            a.display()
+        ))),
+        "{:?}",
+        p.warnings
+    );
+    // One floor everywhere, the current one: nothing to say; no current floor: no comparison.
+    let same = [
+        Source {
+            size_floor: Some(FLOOR_384),
+            ..sa.clone()
+        },
+        Source {
+            size_floor: Some(FLOOR_384),
+            ..sb.clone()
+        },
+    ];
+    let p = plan(
+        &same,
+        &Options {
+            size_floor: Some(FLOOR_384),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        p.warnings.iter().all(|w| !w.contains("size floor")),
+        "{:?}",
+        p.warnings
+    );
+    let p = plan(&[sa, sb], &Options::default()).unwrap();
+    assert!(p.warnings.iter().all(|w| !w.contains("size floor")));
+}
+
+/// 6 camera days of 2 cats (one with an ignore region) and 6 empty frames each.
+fn many_negatives(dir: &Path) -> Vec<Source> {
+    let mut frames: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut regions: Vec<String> = Vec::new();
+    for cam in ["drive", "yard", "gate"] {
+        for day in ["2026-10-01", "2026-10-02"] {
+            for i in 0..8 {
+                let label = if i < 2 { "0 0.5 0.5 0.2 0.4\n" } else { "" };
+                let name = format!("{cam}-{day}-{i}.jpg");
+                if i == 0 {
+                    regions.push(name.clone());
+                }
+                frames.push((
+                    name,
+                    label.to_string(),
+                    vec!["day".into(), format!("camera:{cam}"), format!("date:{day}")],
+                ));
+            }
+        }
+    }
+    let refs: Vec<(&str, &str, Vec<&str>)> = frames
+        .iter()
+        .map(|(n, l, t)| {
+            (
+                n.as_str(),
+                l.as_str(),
+                t.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    let refs2: Vec<(&str, &str, &[&str])> = refs
+        .iter()
+        .map(|(n, l, t)| (*n, *l, t.as_slice()))
+        .collect();
+    flat_export(dir, &["cat"], &refs2);
+    let at: Vec<(&str, &str, f64, f64, f64, f64)> = regions
+        .iter()
+        .map(|n| (n.as_str(), "cat", 0.9, 0.9, 0.02, 0.02))
+        .collect();
+    ignore_json(dir, &at);
+    vec![read_export(dir).unwrap()]
+}
+
+#[test]
+fn positives_leaving_with_their_validation_day_do_not_count_for_the_negatives() {
+    let t = tmp("valid-day-negatives");
+    let s = many_negatives(&t.0);
+    let positive = |r: &FrameRef| !s[0].frames[r.1].boxes.is_empty();
+    // Half negatives: the target is one negative per positive that trains or validates.
+    let opts = Options {
+        negative_share: 0.5,
+        static_cap: None,
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    assert!(p.stats.ignore_valid_day > 0, "{:?}", p.stats);
+    assert_eq!(
+        p.stats.negatives_trimmed, p.stats.ignore_valid_day,
+        "{:?}",
+        p.stats
+    );
+    let used: BTreeSet<FrameRef> = p
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect();
+    let (pos, neg): (Vec<&FrameRef>, Vec<&FrameRef>) = used.iter().partition(|r| positive(r));
+    assert_eq!(neg.len(), pos.len(), "{:?}", p.stats);
+    // Drop-frame plans never trim: no frame with a region is in the pool to leave.
+    let d = plan(
+        &s,
+        &Options {
+            ignore: IgnoreMode::DropFrame,
+            ..opts.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (d.stats.negatives_trimmed, d.stats.ignore_valid_day),
+        (0, 0)
+    );
+}
+
+#[test]
+fn validation_on_public_frames_only_is_said() {
+    let t = tmp("valid-public-only");
+    let own = t.0.join("own");
+    std::fs::create_dir_all(&own).unwrap();
+    camera_export(&own);
+    let mut s = read_export(&own).unwrap();
+    // Every own frame shows an unsure object: none can validate.
+    for f in &mut s.frames {
+        f.ignore.push(region("dog"));
+    }
+    let public = animal_public(&t.0.join("lila"), 60);
+    let p = plan(&[s, public], &Options::default()).unwrap();
+    assert!(p.valid.iter().all(|r| r.0 == 1), "{:?}", p.valid);
+    assert!(
+        p.warnings.iter().any(|w| w
+            .starts_with("every training frame of your own shows an unsure or too-small object")),
+        "{:?}",
+        p.warnings
+    );
 }

@@ -22,17 +22,28 @@
 //!    drop the copies of a frame that several exports hold (a held-out copy wins); hold out review
 //!    frames by whole camera days (unless the exports already did; one camera day: frame by frame,
 //!    with a warning) from **every** review frame, before any filter, so runs with other scene
-//!    filters are benchmarked on the same frames ([`Plan::heldout_fingerprint`]); then filter the
-//!    train / valid pool by scene
-//!    ([`SceneFilter`]), drop its frames with ignore regions (no trainer here can leave a region
-//!    out of its loss, so the object would train as background; the held-out set keeps them, with
+//!    filters are benchmarked on the same frames ([`Plan::heldout_fingerprint`]); judge the size
+//!    floor regions of the train / valid frames again at the run's input ([`restore_floor`]: one
+//!    not under the export's floor there is a box again) and compare the exports' floors
+//!    ([`floor_warnings`]); then filter the train / valid pool by scene
+//!    ([`SceneFilter`]), handle its frames with ignore regions ([`IgnoreMode`]; no trainer here
+//!    can leave a region out of its loss: by default a frame with a box of the run's classes
+//!    trains with the region as background and a frame of nothing but regions is left out, never
+//!    as a negative; [`IgnoreMode::DropFrame`] leaves every such frame out; validation never holds
+//!    one, so one on a camera day validated on leaves both sides; the held-out set keeps them, with
 //!    the regions `ignore` in its manifest) and, in [`Excluded::DropFrame`] mode, its frames with
 //!    boxes of untrained labels; cap the frames with nothing but parked-spot boxes at
-//!    [`PARKED_CAP`] per spot (the same crop again and again would dominate training); keep about
+//!    [`PARKED_CAP`] per spot (the same crop again and again would dominate training), then, of
+//!    the rest, the frames whose every box of the run's classes lies at a static spot (found by
+//!    geometry over the train / valid pool's own frames, [`statics`]) at [`Options::static_cap`]
+//!    per spot and class, kept across scenes and days ([`over_static_cap`]); held-out frames are
+//!    never capped; keep about
 //!    `negative_share` frames without objects in training (frames a reviewer confirmed empty or
 //!    rejected a box on first), take a
 //!    validation split of `val_share` of the review training frames as whole camera days
-//!    ([`valid`], never a class's last training box), and repeat the review frames
+//!    ([`valid`], never a class's last training box; the positives that leave with a validated
+//!    day for their ignore regions no longer count for the negatives, which are trimmed to
+//!    match), and repeat the review frames
 //!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
 //!    Seeded choices rank a frame by its path relative to its source folder, so the plan is the
 //!    same wherever the folders are (reproducible runs). Step 7, opt-in ([`Balance`],
@@ -54,6 +65,7 @@ use crate::collect::labels::export::{
     FRAMES_FILE, FRAMES_VERSION, FrameNotes, HARD_NEGATIVES_FILE, IGNORE_FILE, IGNORE_VERSION,
     IgnoreBox, IgnoreFile,
 };
+use crate::collect::labels::{SizeFloor, statics};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -264,6 +276,47 @@ impl Excluded {
     }
 }
 
+/// What happens to a train / valid frame with ignore regions ([`Frame::ignore`]: objects a reviewer
+/// marked unsure or too small, or training boxes under the export's size floor). No trainer here
+/// can leave a region out of its loss: either the object trains as background or the frame goes.
+/// Held-out frames keep their regions as ignore regions in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IgnoreMode {
+    /// The frame trains, its regions unlabelled (background), when it holds at least one box of the
+    /// run's classes; a frame with nothing but regions is left out (an image whose only object is
+    /// unlabelled would teach "nothing here" exactly where something is), and so is a frame of a
+    /// camera day validated on (validation cannot ignore a region, and the day is validation's).
+    /// Never a negative: such a frame shows a real object.
+    #[default]
+    Background,
+    /// Every such frame is left out of train and valid (the behaviour of earlier versions): one
+    /// unsure or tiny object takes its whole frame out of training.
+    DropFrame,
+}
+
+impl IgnoreMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IgnoreMode::Background => "background",
+            IgnoreMode::DropFrame => "drop-frame",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "background" => Some(IgnoreMode::Background),
+            "drop-frame" | "drop" => Some(IgnoreMode::DropFrame),
+            _ => None,
+        }
+    }
+
+    /// The default (not written in the config).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// A box, normalized to the image (YOLO: center, size).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct YoloBox {
@@ -290,9 +343,15 @@ pub enum SplitHint {
 pub struct Frame {
     pub image: PathBuf,
     pub boxes: Vec<YoloBox>,
-    /// Real objects not to train on (`ignore.json`): not in `boxes`, so the frame cannot be
-    /// trained on, and `ignore` when the frame is benchmarked.
+    /// Real objects not to train on (`ignore.json`): not in `boxes`, so the frame trains with them
+    /// as background or not at all ([`IgnoreMode`]), never validates, and they are `ignore` when
+    /// the frame is benchmarked.
     pub ignore: Vec<YoloBox>,
+    /// Indices into `ignore` of the regions the export's size floor made ([`IgnoreBox::size_floor`],
+    /// [`Source::size_floor`]): training boxes a run at a larger input may give back
+    /// ([`Options::imgsz`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub floor_regions: Vec<usize>,
     /// `day`, `night` or `ir`; None = unknown.
     pub scene: Option<String>,
     pub camera: String,
@@ -334,6 +393,10 @@ pub struct Source {
     /// The folder says which frames were accepted in bulk ([`FRAMES_FILE`]); exports of older
     /// versions do not.
     pub notes_known: bool,
+    /// The size floor the export applied ([`IgnoreFile::size_floor`]); None = none (or not a
+    /// review export of this version).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<SizeFloor>,
 }
 
 /// Unknown camera / day.
@@ -571,8 +634,11 @@ fn list_file(dir: &Path, names: &[&str]) -> Option<BTreeSet<String>> {
 /// What a folder's [`IGNORE_FILE`] says, by image file name.
 #[derive(Debug, Default)]
 struct IgnoreRead {
-    regions: BTreeMap<String, Vec<YoloBox>>,
+    /// The regions, and which of them the export's size floor made ([`Frame::floor_regions`]).
+    regions: BTreeMap<String, (Vec<YoloBox>, Vec<usize>)>,
     parked: BTreeMap<String, Vec<String>>,
+    /// [`IgnoreFile::size_floor`].
+    size_floor: Option<SizeFloor>,
 }
 
 /// The [`IgnoreRead`] of a folder; no file = nothing (exports of older versions). A file that
@@ -613,9 +679,18 @@ fn read_ignore(dir: &Path) -> Result<IgnoreRead> {
         regions: file
             .images
             .iter()
-            .map(|(name, list)| (name.clone(), list.iter().map(to_box).collect()))
+            .map(|(name, list)| {
+                let floor: Vec<usize> = list
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| b.size_floor)
+                    .map(|(i, _)| i)
+                    .collect();
+                (name.clone(), (list.iter().map(to_box).collect(), floor))
+            })
             .collect(),
         parked: file.parked,
+        size_floor: file.size_floor,
     })
 }
 
@@ -773,6 +848,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
     let every_label_written = wrote_every_label(dir);
     let mut missing = 0usize;
     let mut frames = Vec::with_capacity(entries.len());
+    let size_floor = ignore.size_floor;
     for (img, label, split) in entries {
         let boxes = match std::fs::read_to_string(&label) {
             Ok(t) => {
@@ -804,9 +880,11 @@ pub fn read_export(dir: &Path) -> Result<Source> {
         let name = file_name(&img);
         let m = meta.get(&name).cloned().unwrap_or_default();
         let n = meta_from_name(&stem(&img));
+        let (regions, floor_regions) = ignore.regions.remove(&name).unwrap_or_default();
         frames.push(Frame {
             boxes,
-            ignore: ignore.regions.remove(&name).unwrap_or_default(),
+            ignore: regions,
+            floor_regions,
             parked: ignore.parked.remove(&name).unwrap_or_default(),
             scene: m.scene.or(n.scene),
             camera: m.camera.or(n.camera).unwrap_or_else(|| UNKNOWN.into()),
@@ -832,6 +910,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
         frames,
         warnings,
         notes_known,
+        size_floor,
     })
 }
 
@@ -886,6 +965,7 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
             image: img,
             boxes,
             ignore: Vec::new(),
+            floor_regions: Vec::new(),
             parked: Vec::new(),
             scene: m.scene,
             camera: m.camera.unwrap_or_else(|| manifest.id.clone()),
@@ -914,6 +994,7 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
         frames,
         warnings,
         notes_known: true,
+        size_floor: None,
     })
 }
 
@@ -936,6 +1017,9 @@ pub struct Options {
     /// What a train / valid frame with a box of an untrained label becomes.
     #[serde(default)]
     pub excluded: Excluded,
+    /// What a train / valid frame with ignore regions becomes (`training.ignore`).
+    #[serde(default)]
+    pub ignore: IgnoreMode,
     pub negative_share: f32,
     pub heldout_share: f32,
     /// Share of the training frames used for validation (checkpoint choice), at least one.
@@ -949,6 +1033,19 @@ pub struct Options {
     /// Step 7 (off by default: the plan of older versions).
     #[serde(default, skip_serializing_if = "Balance::is_off")]
     pub balance: Balance,
+    /// The static cap (step 5): most train / valid frames kept per static spot of those showing
+    /// nothing but objects at static spots ([`statics`]); None or 0 = off.
+    #[serde(default = "default_static_cap")]
+    pub static_cap: Option<usize>,
+    /// The run's input size (its recipe's `imgsz`): a size floor region of a train / valid frame is
+    /// judged again at it ([`restore_floor`]). None = not known (`train prepare` without a model):
+    /// the plan only warns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imgsz: Option<u32>,
+    /// `collect.size_floor` now, to compare each export's floor with ([`floor_warnings`]); None =
+    /// no comparison (the floor is off, or a caller that does not say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<SizeFloor>,
 }
 
 /// Default `Options.min_valid`.
@@ -958,6 +1055,11 @@ fn default_min_valid() -> usize {
     MIN_VALID
 }
 
+/// Default `Options.static_cap`: [`PARKED_CAP`].
+pub fn default_static_cap() -> Option<usize> {
+    Some(PARKED_CAP)
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -965,6 +1067,7 @@ impl Default for Options {
             rename: BTreeMap::new(),
             scene: SceneFilter::ALL_SCENES,
             excluded: Excluded::Background,
+            ignore: IgnoreMode::Background,
             negative_share: super::config::DEFAULT_NEGATIVE_SHARE,
             heldout_share: super::config::DEFAULT_HELDOUT_SHARE,
             val_share: 0.1,
@@ -972,6 +1075,9 @@ impl Default for Options {
             oversample: super::config::DEFAULT_OVERSAMPLE,
             seed: 0,
             balance: Balance::default(),
+            static_cap: default_static_cap(),
+            imgsz: None,
+            size_floor: None,
         }
     }
 }
@@ -1007,9 +1113,37 @@ pub struct Stats {
     pub scene_filtered: usize,
     /// Train / valid frames left out for a box of an untrained label ([`Excluded::DropFrame`]).
     pub excluded_frames: usize,
-    /// Train / valid frames left out for an ignore region ([`Frame::ignore`]).
+    /// Train / valid frames left out for ignore regions ([`Frame::ignore`]): every such frame with
+    /// [`IgnoreMode::DropFrame`], else `ignore_only + ignore_valid_day`.
     #[serde(skip_serializing_if = "is_zero")]
     pub ignore_frames: usize,
+    /// [`IgnoreMode::Background`]: frames with ignore regions and no box of the run's classes, left
+    /// out (neither a positive nor a negative).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_only: usize,
+    /// [`IgnoreMode::Background`]: frames with ignore regions on camera days validated on, left out
+    /// of both (validation cannot ignore a region; the day belongs to validation).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_valid_day: usize,
+    /// [`IgnoreMode::Background`]: training frames trained with an unlabelled object (their ignore
+    /// regions as background), repeats counted once.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_kept: usize,
+    /// [`IgnoreMode::Background`]: the regions of those frames per class (renamed like the boxes;
+    /// a label renamed to nothing keeps its own name: the object is just as real).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ignore_boxes_background: BTreeMap<String, usize>,
+    /// Size floor regions of the train and validation frames that are not under the export's
+    /// floor at the run's input ([`Options::imgsz`] above the floor's): given back as boxes of their
+    /// label (mapped through the run's classes like any box), per label renamed like the boxes (a
+    /// label renamed to nothing keeps its own name).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub floor_restored: BTreeMap<String, usize>,
+    /// Of `negatives_dropped`, training negatives left out because positives with ignore regions
+    /// left for their validation day ([`Self::ignore_valid_day`]) after the negative target was set
+    /// from them: the target counts the positives that train.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub negatives_trimmed: usize,
     pub negatives_dropped: usize,
     /// Boxes dropped per label not in the class list.
     pub boxes_dropped: BTreeMap<String, usize>,
@@ -1029,6 +1163,21 @@ pub struct Stats {
     /// Train / valid frames left out over the cap per parked spot ([`PARKED_CAP`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub parked_capped: usize,
+    /// Train / valid frames showing nothing but objects at static spots left out over
+    /// [`Options::static_cap`] per spot and class.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub static_capped: usize,
+    /// Static spots found in the train / valid pool (0 with the cap off).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub static_spots: usize,
+    /// The (spot, class) quotas with frames showing nothing but static objects, most such frames
+    /// first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub static_caps: Vec<StaticCap>,
+    /// Boxes per class (the run's) on the frames the static cap left out: what the warnings of a
+    /// class with few or no training boxes name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub static_capped_boxes: BTreeMap<String, usize>,
     /// Copies of a frame several exports hold, left out ([`frame_identity`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub duplicates_dropped: usize,
@@ -1102,6 +1251,214 @@ fn over_parked_cap(frames: Vec<(u64, FrameRef, &[String])>) -> BTreeSet<FrameRef
     over
 }
 
+/// One quota of the static cap: a static spot of a plan's train / valid pool and one class of the
+/// boxes at it, with frames showing nothing but static objects ([`Stats::static_caps`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticCap {
+    /// [`statics::Spot::id`]: one spot has one entry per class of the boxes at it.
+    pub id: String,
+    pub camera: String,
+    /// The class (the run's) of this quota: frames whose box at the spot is of it.
+    pub label: String,
+    /// Frames of the pool showing nothing but static objects with a box of `label` at the spot.
+    pub frames: usize,
+    /// Of those, frames kept (more than the cap when frames kept for another quota count here
+    /// too; never fewer than the cap or `frames`, whichever is smaller).
+    pub kept: usize,
+}
+
+/// A quota of the static cap: (spot id, class).
+type CapKey = (String, String);
+
+/// A pool frame showing nothing but objects at static spots.
+struct StaticFrame<'a> {
+    r: FrameRef,
+    /// [`frame_key`].
+    key: String,
+    scene: &'a str,
+    day: &'a str,
+    /// The (spot, class of its box there) quotas its boxes count toward, sorted, each once.
+    spots: Vec<CapKey>,
+}
+
+/// The key that orders a frame of a quota for the static cap: (round within its (scene, day)
+/// group, the day's place among the scene's days, the scene's place, the frame's rank, its key).
+type StaticKey = (usize, usize, usize, u64, String);
+
+/// The frames of `frames` to leave out so that at most `cap` of them stand for each (static spot,
+/// class) quota, and per quota (frames, kept). Each class at a place has a quota of its own, so a
+/// pickup labelled `truck` on two days at a car's place keeps its frames whatever the car's
+/// number. Chosen for variety: per quota, round-robin over its (scene, day) groups (the first
+/// frame of every group before the second of any), the scenes alternating (seeded order of scenes,
+/// then of each scene's days, then of each group's frames). A frame with several quotas is placed
+/// by its best key over them and kept while any of them is under the cap; it then counts toward
+/// all of them, so a quota whose frames also show a fuller one can end over the cap. Every quota
+/// keeps at least `min(cap, its frames)`: each of its frames is looked at while it is under the
+/// cap, and kept then.
+fn over_static_cap(
+    frames: &[StaticFrame<'_>],
+    cap: usize,
+    seed: u64,
+) -> (BTreeSet<FrameRef>, BTreeMap<CapKey, (usize, usize)>) {
+    let mut by_spot: BTreeMap<&CapKey, Vec<usize>> = BTreeMap::new();
+    for (i, f) in frames.iter().enumerate() {
+        for s in &f.spots {
+            by_spot.entry(s).or_default().push(i);
+        }
+    }
+    let at = |i: usize| frames.get(i);
+    let mut best: BTreeMap<usize, StaticKey> = BTreeMap::new();
+    for (key, idx) in &by_spot {
+        let spot = format!("{}#{}", key.0, key.1);
+        let mut scenes: Vec<&str> = idx.iter().filter_map(|&i| at(i)).map(|f| f.scene).collect();
+        scenes.sort_unstable();
+        scenes.dedup();
+        scenes.sort_by_key(|s| (rank(seed, &format!("static-scene:{s}")), *s));
+        let mut groups: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+        for &i in idx {
+            if let Some(f) = at(i) {
+                groups.entry((f.scene, f.day)).or_default().push(i);
+            }
+        }
+        let mut day_round: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        for scene in &scenes {
+            let mut days: Vec<&str> = groups
+                .keys()
+                .filter(|(s, _)| s == scene)
+                .map(|(_, d)| *d)
+                .collect();
+            days.sort_by_key(|d| (rank(seed, &format!("static-day:{spot}/{scene}/{d}")), *d));
+            for (n, d) in days.into_iter().enumerate() {
+                day_round.insert((scene, d), n);
+            }
+        }
+        for (g, mut list) in groups {
+            let frame_rank = |i: &usize| at(*i).map_or(0, |f| rank(seed, &f.key));
+            list.sort_by_key(|i| (frame_rank(i), at(*i).map(|f| f.key.clone())));
+            let scene_pos = scenes.iter().position(|s| *s == g.0).unwrap_or(0);
+            let day_pos = day_round.get(&g).copied().unwrap_or(0);
+            for (round, i) in list.into_iter().enumerate() {
+                let Some(f) = at(i) else { continue };
+                let k: StaticKey = (round, day_pos, scene_pos, rank(seed, &f.key), f.key.clone());
+                match best.get(&i) {
+                    Some(b) if *b <= k => {}
+                    _ => {
+                        best.insert(i, k);
+                    }
+                }
+            }
+        }
+    }
+    let mut order: Vec<(StaticKey, FrameRef, usize)> = best
+        .into_iter()
+        .filter_map(|(i, k)| at(i).map(|f| (k, f.r, i)))
+        .collect();
+    order.sort();
+    let mut counts: BTreeMap<CapKey, (usize, usize)> = by_spot
+        .iter()
+        .map(|(s, idx)| ((*s).clone(), (idx.len(), 0)))
+        .collect();
+    let mut over = BTreeSet::new();
+    for (_, r, i) in order {
+        let Some(f) = at(i) else { continue };
+        let room = f
+            .spots
+            .iter()
+            .any(|s| counts.get(s).is_some_and(|(_, kept)| *kept < cap));
+        if room {
+            for s in &f.spots {
+                if let Some((_, kept)) = counts.get_mut(s) {
+                    *kept += 1;
+                }
+            }
+        } else {
+            over.insert(r);
+        }
+    }
+    (over, counts)
+}
+
+/// The boxes of `f` in the run's classes as `(class, normalised [x0, y0, x1, y1])`.
+fn static_boxes<'a>(
+    f: &'a Frame,
+    opts: &'a Options,
+    classes: &'a [String],
+) -> impl Iterator<Item = (&'a str, [f32; 4])> + 'a {
+    mapped_boxes(f, opts, classes).filter_map(move |(i, b)| {
+        let c = classes.get(i)?;
+        let (hw, hh) = (b.w / 2.0, b.h / 2.0);
+        Some((c.as_str(), [b.cx - hw, b.cy - hh, b.cx + hw, b.cy + hh]))
+    })
+}
+
+/// The scene of a frame for the static cap's groups.
+fn scene_name(f: &Frame) -> &str {
+    f.scene.as_deref().unwrap_or(UNKNOWN)
+}
+
+/// The static cap's sentence for a pre-flight and `train prepare`: how many frames showing nothing
+/// but static objects were left out, of how many spots, and the largest; None when none were.
+pub fn static_cap_note(stats: &Stats, cap: Option<usize>) -> Option<String> {
+    if stats.static_capped == 0 {
+        return None;
+    }
+    let capped: Vec<&StaticCap> = stats
+        .static_caps
+        .iter()
+        .filter(|s| s.frames > s.kept)
+        .collect();
+    let spots: BTreeSet<&str> = capped.iter().map(|s| s.id.as_str()).collect();
+    let largest: Vec<String> = capped
+        .iter()
+        .take(3)
+        .map(|s| {
+            format!(
+                "a {} on camera {} ({} frames, {} kept)",
+                s.label, s.camera, s.frames, s.kept
+            )
+        })
+        .collect();
+    Some(format!(
+        "{} frame(s) showing nothing but objects parked at {} static spot(s) were left out (at \
+         most {} kept per spot and class, across scenes and days); the largest: {}. Set \
+         training.static_cap to 0 (or --static-cap 0) to keep them all",
+        stats.static_capped,
+        spots.len(),
+        cap.unwrap_or(PARKED_CAP),
+        largest.join("; ")
+    ))
+}
+
+/// What the warnings of class `class` (few or no training boxes) add when the static cap left out
+/// frames with its boxes ([`Stats::static_capped_boxes`]); None when it took none.
+pub fn static_cap_clause(stats: &Stats, class: &str) -> Option<String> {
+    let n = stats
+        .static_capped_boxes
+        .get(class)
+        .copied()
+        .filter(|n| *n > 0)?;
+    Some(format!(
+        "the static cap left out {n} box(es) of it on frames showing nothing but parked objects \
+         (set training.static_cap to 0, or --static-cap 0, to keep them)"
+    ))
+}
+
+/// The pre-flight's note of a run with the static cap on whose classes can form no static spot
+/// ([`statics::may_be_static`]: a class renamed into a custom merged name such as `vehicle` is
+/// none), so the cap leaves nothing out; None otherwise.
+pub fn static_cap_idle_note(classes: &[String], cap: Option<usize>) -> Option<String> {
+    if cap.is_none_or(|c| c == 0) || classes.iter().any(|c| statics::may_be_static(c)) {
+        return None;
+    }
+    Some(format!(
+        "The static cap is on, but no class of this run ({}) is one parked objects are found for: \
+         only vehicle classes (car, truck, bus, ...) and other inanimate COCO classes form static \
+         spots, so a class renamed into a name of its own (such as 'vehicle') is never capped. \
+         Keep the COCO names to cap frames of parked objects",
+        classes.join(", ")
+    ))
+}
+
 /// The stable identity of a frame for the plan's seeded choices: its image path relative to its
 /// source folder, with `/` separators. Never the absolute path: the plan must not change when
 /// the export folder moves (or a test runs in a fresh temporary folder), so that a run is
@@ -1160,6 +1517,39 @@ fn without_duplicates(sources: &[Source], review: Vec<FrameRef>) -> (Vec<FrameRe
     (out, dropped)
 }
 
+/// The plan's sentence on the frames with ignore regions in [`IgnoreMode::Background`]: how many
+/// train with an unlabelled object, and how many were left out and why; None when there were none.
+pub fn background_warning(s: &Stats) -> Option<String> {
+    if s.ignore_kept + s.ignore_only + s.ignore_valid_day == 0 {
+        return None;
+    }
+    let mut parts = vec![format!(
+        "{} training frame(s) show an unsure or too-small object and train with it unlabelled, as \
+         background (no trainer can leave a region out of its loss; the other objects of the \
+         frame still teach)",
+        s.ignore_kept
+    )];
+    if s.ignore_only > 0 {
+        parts.push(format!(
+            "{} frame(s) with nothing else were left out: an image whose only object is unlabelled \
+             would teach \"nothing here\" exactly where something is",
+            s.ignore_only
+        ));
+    }
+    if s.ignore_valid_day > 0 {
+        parts.push(format!(
+            "{} frame(s) of camera days used for validation were left out of both (validation \
+             cannot ignore a region, and the day is validation's)",
+            s.ignore_valid_day
+        ));
+    }
+    Some(format!(
+        "{}. Held-out frames keep them as ignore regions: detections there do not count. To leave \
+         every such frame out instead, set training.ignore to drop-frame (--ignore drop-frame)",
+        parts.join("; ")
+    ))
+}
+
 /// The `camera/day` group of a frame (held-out and validation splits).
 fn group_key(f: &Frame) -> String {
     format!("{}/{}", f.camera, f.day)
@@ -1200,6 +1590,222 @@ fn fingerprint(keys: impl Iterator<Item = String>) -> String {
         h.update(b"\n");
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A YOLO box's short side at a model input of `input` pixels: `min(w, h) * input` on its numbers
+/// normalised to the image, the size floor's measure ([`crate::collect::labels::under_floor`]).
+fn short_at(b: &YoloBox, input: u32) -> f32 {
+    b.w.min(b.h) * input as f32
+}
+
+/// The sources as a run at its input size trains on them ([`restore_floor`]), and the labels given
+/// back per frame.
+struct AtInput {
+    sources: Vec<Source>,
+    restored: BTreeMap<FrameRef, Vec<String>>,
+}
+
+/// Every size floor region ([`Frame::floor_regions`]) of a frame not in `heldout`, judged again at
+/// the run's input ([`Options::imgsz`]) when that is larger than the input its export's floor was
+/// applied at ([`Source::size_floor`]): a region that is not under the floor's `px` there is given
+/// back as an ordinary box of its label (mapped through the run's classes later, like any box). The
+/// held-out frames keep theirs, so the held-out set and its fingerprint do not change. None when
+/// nothing is given back (no input size, no floor, no larger input, nothing over the floor there).
+fn restore_floor(
+    sources: &[Source],
+    heldout: &BTreeSet<FrameRef>,
+    opts: &Options,
+) -> Option<AtInput> {
+    let imgsz = opts.imgsz?;
+    let mut copy: Option<Vec<Source>> = None;
+    let mut restored: BTreeMap<FrameRef, Vec<String>> = BTreeMap::new();
+    for (si, s) in sources.iter().enumerate() {
+        let Some(floor) = s
+            .size_floor
+            .filter(|f| s.public.is_none() && f.is_on() && imgsz > f.input)
+        else {
+            continue;
+        };
+        for (fi, f) in s.frames.iter().enumerate() {
+            if f.floor_regions.is_empty() || heldout.contains(&(si, fi)) {
+                continue;
+            }
+            let back: BTreeSet<usize> = f
+                .floor_regions
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    f.ignore
+                        .get(i)
+                        .is_some_and(|b| short_at(b, imgsz) >= floor.px)
+                })
+                .collect();
+            if back.is_empty() {
+                continue;
+            }
+            let mut g = f.clone();
+            g.ignore.clear();
+            g.floor_regions.clear();
+            let mut labels = Vec::new();
+            for (i, b) in f.ignore.iter().enumerate() {
+                if back.contains(&i) {
+                    labels.push(b.class.clone());
+                    g.boxes.push(b.clone());
+                } else {
+                    if f.floor_regions.contains(&i) {
+                        g.floor_regions.push(g.ignore.len());
+                    }
+                    g.ignore.push(b.clone());
+                }
+            }
+            let all = copy.get_or_insert_with(|| sources.to_vec());
+            if let Some(slot) = all.get_mut(si).and_then(|s| s.frames.get_mut(fi)) {
+                *slot = g;
+                restored.insert((si, fi), labels);
+            }
+        }
+    }
+    copy.map(|sources| AtInput { sources, restored })
+}
+
+/// `sources` as a run of `plan` trains on them: [`restore_floor`] for the plan's held-out set, as
+/// [`plan`] itself did. What [`write`] and the pre-flight report read.
+pub fn at_run_input<'a>(
+    sources: &'a [Source],
+    plan: &Plan,
+    opts: &Options,
+) -> std::borrow::Cow<'a, [Source]> {
+    let held: BTreeSet<FrameRef> = plan.heldout.iter().copied().collect();
+    match restore_floor(sources, &held, opts) {
+        Some(a) => std::borrow::Cow::Owned(a.sources),
+        None => std::borrow::Cow::Borrowed(sources),
+    }
+}
+
+/// A size floor in words: `10 px at 384`, or `no size floor`.
+fn floor_words(f: Option<SizeFloor>) -> String {
+    f.map_or_else(
+        || "no size floor".to_string(),
+        |f| format!("{} px at {}", f.px, f.input),
+    )
+}
+
+/// What the plan says about the size floors of the exports ([`Source::size_floor`]): exports made
+/// with different floors (an object one leaves out, another trains on), an export whose floor is
+/// not the current one ([`Options::size_floor`]; made before it was set, or with another), and an
+/// export floor applied at another input than the run's ([`Options::imgsz`]): unknown, or smaller,
+/// where the boxes the run cannot learn are still labels (a larger one is [`restore_floor`]'s).
+/// `heldout`: the held-out frames, whose labels are not counted.
+fn floor_warnings(sources: &[Source], heldout: &BTreeSet<FrameRef>, opts: &Options) -> Vec<String> {
+    let mut out = Vec::new();
+    let own: Vec<(usize, &Source)> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.public.is_none())
+        .collect();
+    let floors: Vec<Option<SizeFloor>> = own.iter().map(|(_, s)| s.size_floor).collect();
+    if floors.iter().any(|f| Some(f) != floors.first()) {
+        let list: Vec<String> = own
+            .iter()
+            .map(|(_, s)| format!("{} ({})", s.dir.display(), floor_words(s.size_floor)))
+            .collect();
+        out.push(format!(
+            "the exports were made with different size floors: {}. An object one of them leaves \
+             out as too small trains as a label from another (and a frame in two exports keeps \
+             the first one's copy); export them again with the current floor",
+            list.join(", ")
+        ));
+    }
+    if let Some(now) = opts.size_floor.filter(SizeFloor::is_on) {
+        for (_, s) in &own {
+            match s.size_floor {
+                None => out.push(format!(
+                    "{} was exported without a size floor (before it was set, or by an older \
+                     version), so its objects under {} still train as labels; export again to \
+                     apply the floor",
+                    s.dir.display(),
+                    floor_words(Some(now))
+                )),
+                Some(f) if f != now => out.push(format!(
+                    "{} was exported with a size floor of {}, and the current floor is {}; export \
+                     again to apply the current one",
+                    s.dir.display(),
+                    floor_words(Some(f)),
+                    floor_words(Some(now))
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    for (si, s) in &own {
+        let Some(floor) = s.size_floor.filter(SizeFloor::is_on) else {
+            continue;
+        };
+        match opts.imgsz {
+            None => {
+                let regions: usize = s.frames.iter().map(|f| f.floor_regions.len()).sum();
+                if regions > 0 {
+                    out.push(format!(
+                        "{} left out {regions} object(s) under its size floor ({}), and this plan \
+                         does not know the size the run trains at: at a larger input some of them \
+                         could be learned, at a smaller one some labels are too small for it. A \
+                         run of a model judges them at its own input",
+                        s.dir.display(),
+                        floor_words(Some(floor))
+                    ));
+                }
+            }
+            Some(n) if n < floor.input => {
+                let small = s
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(fi, _)| !heldout.contains(&(*si, *fi)))
+                    .flat_map(|(_, f)| &f.boxes)
+                    .filter(|b| short_at(b, n) < floor.px)
+                    .count();
+                out.push(format!(
+                    "this run trains at {n} px, but the size floor of {} was applied at {}: \
+                     objects of {:.1} to {} px at this run's input are still labels ({small} on \
+                     its training frames), though it cannot learn them; export again with the \
+                     floor's input set to {n}",
+                    s.dir.display(),
+                    floor.input,
+                    floor.px * n as f32 / floor.input as f32,
+                    floor.px,
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    out
+}
+
+/// The plan's sentence on the size floor regions given back at the run's input
+/// ([`Stats::floor_restored`]); None when there are none.
+fn restored_note(s: &Stats, sources: &[Source], opts: &Options) -> Option<String> {
+    let n: usize = s.floor_restored.values().sum();
+    if n == 0 {
+        return None;
+    }
+    let floors: BTreeSet<String> = sources
+        .iter()
+        .filter_map(|x| x.size_floor)
+        .map(|f| floor_words(Some(f)))
+        .collect();
+    let per: Vec<String> = s
+        .floor_restored
+        .iter()
+        .map(|(c, k)| format!("{c} {k}"))
+        .collect();
+    Some(format!(
+        "{n} object(s) the export's size floor ({}) left out are not under it at this run's {} px \
+         input, so they train as labels again ({}); the held-out frames keep them as ignore \
+         regions, so the benchmark is the export's",
+        floors.into_iter().collect::<Vec<_>>().join(", "),
+        opts.imgsz.unwrap_or_default(),
+        per.join(", ")
+    ))
 }
 
 /// Decide the splits (see the module docs). Pure and deterministic for a given `seed`.
@@ -1263,9 +1869,6 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             .zip(frame(r))
             .map(|(s, f)| frame_key(s, f))
             .unwrap_or_default()
-    };
-    let positive = |r: FrameRef| -> bool {
-        frame(r).is_some_and(|f| mapped_boxes(f, opts, &p.classes).next().is_some())
     };
     // 3. Held out, from every review frame before the scene filter, so that runs with other
     // scene filters are benchmarked on the same frames (every scene). The sources' split when it
@@ -1338,9 +1941,32 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             "no frame is held out: the trained model is not benchmarked on your own frames".into(),
         );
     }
+    // The train / valid pool at the run's input size: size floor regions it can learn are given
+    // back as boxes (held-out frames keep theirs), and the exports' floors are compared. From here
+    // on the plan reads these sources; `write` and the pre-flight make the same (`at_run_input`).
+    let held_set: BTreeSet<FrameRef> = p.heldout.iter().copied().collect();
+    p.warnings.extend(floor_warnings(sources, &held_set, opts));
+    let at_input = restore_floor(sources, &held_set, opts);
+    let restored_labels: BTreeMap<FrameRef, Vec<String>> = at_input
+        .as_ref()
+        .map(|a| a.restored.clone())
+        .unwrap_or_default();
+    let sources: &[Source] = at_input.as_ref().map_or(sources, |a| a.sources.as_slice());
+    let frame = |r: FrameRef| -> Option<&Frame> { sources.get(r.0)?.frames.get(r.1) };
+    let key_of = |r: FrameRef| -> String {
+        sources
+            .get(r.0)
+            .zip(frame(r))
+            .map(|(s, f)| frame_key(s, f))
+            .unwrap_or_default()
+    };
+    let positive = |r: FrameRef| -> bool {
+        frame(r).is_some_and(|f| mapped_boxes(f, opts, &p.classes).next().is_some())
+    };
     // 4. Train / valid pool: the rest of the review frames plus the public ones, by scene, then
-    // without frames with ignore regions, and without frames of untrained labels when the run
-    // drops them.
+    // without frames with ignore regions (every one with `IgnoreMode::DropFrame`, else those with
+    // no box of the run's classes), and without frames of untrained labels when the run drops
+    // them.
     let mut in_scope: Vec<FrameRef> = Vec::new();
     let mut unknown_left_out = 0usize;
     for r in pool.into_iter().chain(public.iter().copied()) {
@@ -1368,8 +1994,17 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     for r in in_scope {
         let Some(f) = frame(r) else { continue };
         if !f.ignore.is_empty() {
-            p.stats.ignore_frames += 1;
-            continue;
+            match opts.ignore {
+                IgnoreMode::DropFrame => {
+                    p.stats.ignore_frames += 1;
+                    continue;
+                }
+                IgnoreMode::Background if mapped_boxes(f, opts, &p.classes).next().is_none() => {
+                    p.stats.ignore_only += 1;
+                    continue;
+                }
+                IgnoreMode::Background => {}
+            }
         }
         if opts.excluded == Excluded::DropFrame && f.boxes.iter().any(untrained) {
             p.stats.excluded_frames += 1;
@@ -1382,7 +2017,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             "{} of {scoped} training frame(s) were left out for unsure or too-small boxes: no \
              trainer can skip such a box, so the object would train as background. Held-out \
              frames keep them, and detections on those boxes do not count; to train on a frame \
-             again, give its box a class or reject it with another reason on the Review tab",
+             again, give its box a class or reject it with another reason on the Review tab, or \
+             train such frames with the object as background (training.ignore background, \
+             --ignore background)",
             p.stats.ignore_frames
         ));
     }
@@ -1425,6 +2062,87 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             over.len()
         ));
     }
+    // The static cap, on the positive frames the parked cap left. The spots are found by geometry
+    // over the whole train / valid pool's own review frames (exports of any version are capped):
+    // also the frames the parked cap took out, which are looks at the place like any other, and
+    // the frames with only untrained labels (their boxes are not the run's, so they give no
+    // observation). Only frames whose every box of the run's classes lies at a spot are capped,
+    // per (spot, class of the box there).
+    if let Some(cap) = opts.static_cap.filter(|&c| c > 0) {
+        let own = |r: &FrameRef| -> Option<&Frame> {
+            sources
+                .get(r.0)
+                .filter(|s| s.public.is_none())
+                .and_then(|s| s.frames.get(r.1))
+                .filter(|f| f.camera != UNKNOWN)
+        };
+        let classes = &p.classes;
+        let table = statics::Table::build(pool.iter().flat_map(|r| {
+            let key = key_of(*r);
+            own(r).into_iter().flat_map(move |f| {
+                let key = key.clone();
+                static_boxes(f, opts, classes).map(move |(c, bbox)| statics::Obs {
+                    camera: f.camera.clone(),
+                    frame: key.clone(),
+                    day: f.day.clone(),
+                    scene: scene_name(f).to_string(),
+                    label: c.to_string(),
+                    bbox,
+                })
+            })
+        }));
+        let candidates: Vec<StaticFrame<'_>> = pos
+            .iter()
+            .filter_map(|r| {
+                let f = own(r)?;
+                let mut keys: BTreeSet<CapKey> = BTreeSet::new();
+                for (class, b) in static_boxes(f, opts, classes) {
+                    let s = table.spot_at(&f.camera, class, &b)?;
+                    keys.insert((s.id.clone(), class.to_string()));
+                }
+                (!keys.is_empty()).then(|| StaticFrame {
+                    r: *r,
+                    key: key_of(*r),
+                    scene: scene_name(f),
+                    day: &f.day,
+                    spots: keys.into_iter().collect(),
+                })
+            })
+            .collect();
+        let (over, counts) = over_static_cap(&candidates, cap, opts.seed);
+        pos.retain(|r| !over.contains(r));
+        p.stats.static_capped = over.len();
+        p.stats.static_spots = table.len();
+        for r in &over {
+            if let Some(f) = frame(*r) {
+                for (i, _) in mapped_boxes(f, opts, classes) {
+                    if let Some(c) = classes.get(i) {
+                        *p.stats.static_capped_boxes.entry(c.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut caps: Vec<StaticCap> = counts
+            .into_iter()
+            .filter_map(|((id, class), (frames, kept))| {
+                let s = table.get(&id)?;
+                Some(StaticCap {
+                    camera: s.camera.clone(),
+                    label: class,
+                    id,
+                    frames,
+                    kept,
+                })
+            })
+            .collect();
+        caps.sort_by(|a, b| {
+            b.frames
+                .cmp(&a.frames)
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        p.stats.static_caps = caps;
+    }
     if pos.is_empty() {
         bail!(
             "no training frame has a box of the classes {:?} (after the held-out split, the \
@@ -1434,17 +2152,22 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         );
     }
     let share = f64::from(opts.negative_share.clamp(0.0, 0.9));
-    let want_neg = super::estimate::to_u64(pos.len() as f64 * share / (1.0 - share));
-    let want_neg = usize::try_from(want_neg).unwrap_or(usize::MAX);
+    let want_for = |positives: usize| -> usize {
+        let n = super::estimate::to_u64(positives as f64 * share / (1.0 - share));
+        usize::try_from(n).unwrap_or(usize::MAX)
+    };
+    let want_neg = want_for(pos.len());
+    // Frames a reviewer confirmed empty or rejected a box on first, then by rank.
+    let neg_key = |r: &FrameRef| {
+        let f = frame(*r);
+        (
+            !f.is_some_and(|f| f.hard_negative || f.human_rejected),
+            rank(opts.seed, &key_of(*r)),
+        )
+    };
+    let positives = pos.len();
     if neg.len() > want_neg {
-        // Frames a reviewer confirmed empty or rejected a box on first, then by rank.
-        neg.sort_by_key(|r| {
-            let f = frame(*r);
-            (
-                !f.is_some_and(|f| f.hard_negative || f.human_rejected),
-                rank(opts.seed, &key_of(*r)),
-            )
-        });
+        neg.sort_by_key(neg_key);
         p.stats.negatives_dropped = neg.len() - want_neg;
         neg.truncate(want_neg);
     } else if opts.negative_share > 0.0 && neg.len() < want_neg {
@@ -1457,11 +2180,14 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             share * 100.0
         ));
     }
-    let mut pool: Vec<FrameRef> = pos.into_iter().chain(neg).collect();
+    let mut pool: Vec<FrameRef> = pos.into_iter().chain(neg.iter().copied()).collect();
     pool.sort_unstable();
     // 6. Validation (the trainer's checkpoint choice).
     let split = valid::pick_valid_groups(sources, &pool, opts, &p.classes);
     let valid = split.frames;
+    // Frames with ignore regions of the camera days validated on: out of both.
+    let valid_day: BTreeSet<FrameRef> = split.dropped.iter().copied().collect();
+    p.stats.ignore_valid_day = valid_day.len();
     p.stats.valid_groups = split.groups;
     p.warnings.extend(split.warning);
     if valid.is_empty() {
@@ -1471,6 +2197,26 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         );
     }
     let val_set: BTreeSet<FrameRef> = valid.iter().copied().collect();
+    // The positives that left with their validation day do not train, so the negative target
+    // counts the others: the excess training negatives go, the least wanted first (validation's
+    // stay). Only frames with ignore regions leave this way, so a plan without any (every
+    // drop-frame plan) is the same as before. The caps above are not run again: a capped spot may
+    // keep a frame fewer.
+    let leaving = valid_day.iter().filter(|r| positive(**r)).count();
+    let want_now = want_for(positives.saturating_sub(leaving));
+    let mut trimmed: BTreeSet<FrameRef> = BTreeSet::new();
+    if leaving > 0 && neg.len() > want_now {
+        let mut spare: Vec<FrameRef> = neg
+            .iter()
+            .copied()
+            .filter(|r| !val_set.contains(r))
+            .collect();
+        spare.sort_by_key(neg_key);
+        let excess = neg.len() - want_now;
+        trimmed.extend(spare.iter().rev().take(excess).copied());
+        p.stats.negatives_trimmed = trimmed.len();
+        p.stats.negatives_dropped += trimmed.len();
+    }
     let mixed = !public.is_empty();
     let base = |r: FrameRef| -> u32 {
         let is_public = sources.get(r.0).is_some_and(|s| s.public.is_some());
@@ -1480,7 +2226,10 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             1
         }
     };
-    let train: Vec<FrameRef> = pool.into_iter().filter(|r| !val_set.contains(r)).collect();
+    let train: Vec<FrameRef> = pool
+        .into_iter()
+        .filter(|r| !val_set.contains(r) && !valid_day.contains(r) && !trimmed.contains(r))
+        .collect();
     // 7. Balance (opt-in): repeats per training frame, after the cap.
     let mut repeats: Vec<u32> = train.iter().map(|&r| base(r)).collect();
     let mut keep = vec![true; train.len()];
@@ -1532,15 +2281,61 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                 p.stats.train_negatives += 1;
                 p.stats.hard_negatives += usize::from(f.hard_negative || f.human_rejected);
             }
+            if !f.ignore.is_empty() {
+                p.stats.ignore_kept += 1;
+                for b in &f.ignore {
+                    let name = opts
+                        .rename
+                        .get(&b.class)
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(&b.class);
+                    *p.stats
+                        .ignore_boxes_background
+                        .entry(name.clone())
+                        .or_default() += 1;
+                }
+            }
         }
         p.stats.public_frames += usize::from(is_public);
         p.train.push((r, repeats));
     }
+    // Without a split of its own the trainer validates on its training frames, those with ignore
+    // regions left out (validation cannot ignore a region) unless nothing else is left.
     p.valid = if valid.is_empty() {
-        p.train.iter().map(|(r, _)| *r).collect()
+        let all: Vec<FrameRef> = p.train.iter().map(|(r, _)| *r).collect();
+        let plain: Vec<FrameRef> = all
+            .iter()
+            .copied()
+            .filter(|r| frame(*r).is_none_or(|f| f.ignore.is_empty()))
+            .collect();
+        if plain.is_empty() { all } else { plain }
     } else {
         valid
     };
+    if opts.ignore == IgnoreMode::Background {
+        p.stats.ignore_frames = p.stats.ignore_only + p.stats.ignore_valid_day;
+        if let Some(w) = background_warning(&p.stats) {
+            p.warnings.push(w);
+        }
+    }
+    // Size floor regions given back at the run's input, on the frames it trains or validates on.
+    let used: BTreeSet<FrameRef> = p
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect();
+    for label in used.iter().filter_map(|r| restored_labels.get(r)).flatten() {
+        let name = opts
+            .rename
+            .get(label)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(label);
+        *p.stats.floor_restored.entry(name.clone()).or_default() += 1;
+    }
+    if let Some(w) = restored_note(&p.stats, sources, opts) {
+        p.warnings.push(w);
+    }
     let mut heldout_boxes: BTreeMap<&str, usize> = BTreeMap::new();
     for &r in &p.heldout {
         if let Some(f) = frame(r) {
@@ -1555,18 +2350,23 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         if p.stats.train_boxes.contains_key(c) {
             continue;
         }
+        // Each (spot, class) keeps min(cap, its frames), so the cap alone never takes a class's
+        // last frame; the validation split can take what it kept. Said all the same.
+        let capped = static_cap_clause(&p.stats, c)
+            .map(|clause| format!("; {clause}"))
+            .unwrap_or_default();
         p.warnings.push(match heldout_boxes.get(c.as_str()) {
             Some(n) if hinted => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
                  (the export's val split: camera days held out for the benchmark), so the model \
                  cannot learn it; export again and hold out other cameras or days (Dataset tab \
                  export: holdout cameras / days), or review frames with it from the camera days \
-                 that train"
+                 that train{capped}"
             ),
             Some(n) => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out \
                  frames{}, so the model cannot learn it; review frames with it from other \
-                 cameras or days, or hold out fewer frames (training.heldout_share)",
+                 cameras or days, or hold out fewer frames (training.heldout_share){capped}",
                 if p.stats.heldout_groups.is_empty() {
                     String::new()
                 } else {
@@ -1575,8 +2375,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             ),
             None => format!(
                 "class '{c}' has no training box: no frame has a box of it (after the scene \
-                 filter and the frames left out for unsure or too-small boxes), so the model \
-                 cannot learn it; review frames with it or drop the class"
+                 filter, the frames left out for unsure or too-small boxes and the caps on parked \
+                 and static frames), so the model cannot learn it; review frames with it or drop \
+                 the class{capped}"
             ),
         });
     }
@@ -1742,8 +2543,11 @@ pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter) -> Vec<String> {
     tags
 }
 
-/// Write `plan` into `out` (created; must not exist or be empty).
+/// Write `plan` into `out` (created; must not exist or be empty). The frames as the plan read them
+/// ([`at_run_input`]: size floor regions a run at `opts.imgsz` can learn are boxes).
 pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Result<Prepared> {
+    let at_input = at_run_input(sources, plan, opts);
+    let sources: &[Source] = &at_input;
     if out.exists()
         && std::fs::read_dir(out)
             .with_context(|| format!("reading {}", out.display()))?
