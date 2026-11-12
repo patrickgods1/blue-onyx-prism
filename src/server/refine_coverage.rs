@@ -5,23 +5,28 @@
 //! unreviewed frames hold a person proposal that a review would turn into training boxes. One route:
 //!
 //! - `GET /v1/refine/coverage`: one walk over every label file of the folder
-//!   ([`queue::labelled_map`], status any, off the async workers), kept 60 s per folder and class
-//!   list and dropped when a check starts or ends or a write of the tab changes boxes. The recall is
-//!   joined from the current `refine/report.json` on every request (a small read), so a new report
-//!   shows at once. Boxes of classes that are not wanted (`collect.classes` without the hidden ones)
-//!   count nowhere.
+//!   ([`queue::labelled_map`], status any) and one build of the Review queue for the unreviewed
+//!   person frames ([`queue::build`]), off the async workers, kept 60 s per folder and class list
+//!   and dropped when a check starts or ends or a write of the tab changes boxes (a Review save
+//!   shows within the minute). The recall is joined on every request (a small read) from the full
+//!   check's `refine/report.json`, else the quick check's `refine/report-quick.json`, so a new
+//!   report shows at once. Boxes of classes that are not wanted (`collect.classes` without the
+//!   hidden ones) count nowhere.
 //!
-//! Counting rules: `reviewed` / `persons` / `vehicles` / `empty` are over frames with status
-//! reviewed (training boxes, ignore regions left out, as an export keeps them); `empty` = reviewed frames
-//! with no training box and no ignore region (the training plan's negatives; `empty_confirmed` is how many
-//! of them the reviewer ticked); `unreviewed_person_frames`
-//! is over unreviewed frames holding a box labelled `person` that is not rejected, which is the
-//! Review page's own class filter (`label=person`), so the link the page builds
-//! (`status=unreviewed&source=all&scene=..&camera=..&label=person`) opens exactly those frames. The
-//! vehicle classes are [`VEHICLE_CLASSES`]. A frame of an unknown scene or camera name (not a path
-//! the walkers accept) is in no row.
+//! Counting rules: `reviewed` / `persons` / `vehicles` / `vehicle_frames` / `empty` are over
+//! frames with status reviewed (training boxes, ignore regions left out, as an export keeps them;
+//! `vehicle_frames` = those with at least one vehicle box); `empty` = reviewed frames with no
+//! training box and no ignore region (the training plan's negatives; `empty_confirmed` is how many
+//! of them the reviewer ticked); `unreviewed_person_frames` is what the Review queue lists under
+//! the link the page builds (`status=unreviewed&source=all&scene=..&camera=..&label=person`),
+//! counted by the queue itself: frames of the review queue and the index files, unreviewed (a
+//! frame with no label file yet is), whose classes ([`queue::frame_labels`]: boxes not rejected,
+//! else the sidecar's predictions) include `person`; a frame whose sidecar does not read is not
+//! listed, so not counted. Rows are by the scene and camera the queue filters on. The vehicle
+//! classes are [`VEHICLE_CLASSES`]. A frame of an unknown scene or camera name (not a path the
+//! walkers accept) is in no row.
 
-use super::refine::{queue_stamp, read_report};
+use super::refine::{queue_stamp, recall_report};
 use super::{AppState, blocking, training};
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::queue::{self, Filters};
@@ -56,7 +61,7 @@ const VEHICLE_CLASSES: [&str; 6] = [
     "bicycle",
 ];
 
-/// What one frame adds to its row.
+/// What one label file adds to its row.
 struct Tally {
     camera: String,
     scene: String,
@@ -65,7 +70,6 @@ struct Tally {
     vehicles: usize,
     empty: bool,
     empty_confirmed: bool,
-    unreviewed_person: bool,
 }
 
 /// One camera x scene, counted over its frames.
@@ -76,6 +80,8 @@ pub(super) struct Row {
     pub(super) reviewed: usize,
     pub(super) persons: usize,
     pub(super) vehicles: usize,
+    /// Reviewed frames with at least one vehicle training box.
+    pub(super) vehicle_frames: usize,
     pub(super) empty: usize,
     pub(super) empty_confirmed: usize,
     pub(super) unreviewed_person_frames: usize,
@@ -98,13 +104,6 @@ fn tally_of(rel: &str, file: &LabelFile, wanted: &Wanted<'_>) -> Option<Tally> {
             }
         }
     }
-    // The Review page's class filter: any box of the label that is not rejected.
-    let unreviewed_person = file.status == Status::Unreviewed
-        && file.boxes.iter().any(|b| {
-            b.state != crate::collect::labels::BoxState::Rejected
-                && b.label == PERSON
-                && wanted.class_of(&b.label) == Some(PERSON)
-        });
     Some(Tally {
         camera: r.camera,
         scene: r.scene,
@@ -113,8 +112,22 @@ fn tally_of(rel: &str, file: &LabelFile, wanted: &Wanted<'_>) -> Option<Tally> {
         vehicles,
         empty,
         empty_confirmed: reviewed && file.empty_confirmed && empty,
-        unreviewed_person,
     })
+}
+
+/// The Review queue's filters of the table's link without its scene and camera
+/// (`RefineFloor.coverageUrl`: `status=unreviewed&source=all&label=person`), parsed by the queue
+/// itself, so the count and the link cannot drift apart.
+fn unreviewed_person_filters() -> Filters {
+    let q: BTreeMap<String, String> = [
+        ("status", "unreviewed"),
+        ("source", "all"),
+        ("label", PERSON),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    Filters::from_query(&q).unwrap_or_default()
 }
 
 /// The position of a scene in [`SCENES`] (day, night, ir); unknown ones last.
@@ -125,27 +138,45 @@ fn scene_rank(scene: &str) -> usize {
         .unwrap_or(SCENES.len())
 }
 
-/// A fresh walk of the label files of `dir`: the rows, by camera then scene (day, night, ir).
+/// A fresh walk of `dir`: the rows, by camera then scene (day, night, ir). Two walks: the label
+/// files for the reviewed counts, and the Review queue itself ([`queue::build`] under
+/// [`unreviewed_person_filters`]) for the unreviewed frames with a person, which include frames
+/// with no label file yet (classes from their sidecar's predictions).
 fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Vec<Row> {
     let wanted = Wanted { classes, hidden };
     let tallies = queue::labelled_map(dir, &Filters::default(), &|_| true, &|rel, file| {
         tally_of(rel, &file, &wanted)
     });
     let mut rows: BTreeMap<(String, usize), Row> = BTreeMap::new();
-    for t in tallies {
-        let row = rows
-            .entry((t.camera.clone(), scene_rank(&t.scene)))
+    fn row_of<'a>(
+        rows: &'a mut BTreeMap<(String, usize), Row>,
+        camera: &str,
+        scene: &str,
+    ) -> &'a mut Row {
+        rows.entry((camera.to_string(), scene_rank(scene)))
             .or_insert_with(|| Row {
-                camera: t.camera.clone(),
-                scene: t.scene.clone(),
+                camera: camera.to_string(),
+                scene: scene.to_string(),
                 ..Row::default()
-            });
+            })
+    }
+    for t in tallies {
+        let row = row_of(&mut rows, &t.camera, &t.scene);
         row.reviewed += usize::from(t.reviewed);
         row.persons += t.persons;
         row.vehicles += t.vehicles;
+        row.vehicle_frames += usize::from(t.vehicles > 0);
         row.empty += usize::from(t.empty);
         row.empty_confirmed += usize::from(t.empty_confirmed);
-        row.unreviewed_person_frames += usize::from(t.unreviewed_person);
+    }
+    // A hidden or unlisted person class counts nowhere.
+    if wanted.class_of(PERSON) == Some(PERSON) {
+        for item in queue::build(dir, &unreviewed_person_filters()).items {
+            // The link names the scene, which the queue takes as day, night or ir only.
+            if SCENES.contains(&item.scene.as_str()) {
+                row_of(&mut rows, &item.camera, &item.scene).unreviewed_person_frames += 1;
+            }
+        }
     }
     rows.into_values().collect()
 }
@@ -301,8 +332,7 @@ fn coverage_of(state: &AppState) -> serde_json::Value {
         &config.collect.hidden_classes,
         &stamp,
     );
-    let (report, _) = read_report(&dir);
-    answer(&rows, report.as_ref())
+    answer(&rows, recall_report(&dir).as_ref())
 }
 
 /// The sums over `rows`.
@@ -312,6 +342,7 @@ fn totals(rows: &[Row]) -> serde_json::Value {
         "reviewed": rows.iter().map(|r| r.reviewed).sum::<usize>(),
         "persons": rows.iter().map(|r| r.persons).sum::<usize>(),
         "vehicles": rows.iter().map(|r| r.vehicles).sum::<usize>(),
+        "vehicle_frames": rows.iter().map(|r| r.vehicle_frames).sum::<usize>(),
         "empty": rows.iter().map(|r| r.empty).sum::<usize>(),
         "empty_confirmed": rows.iter().map(|r| r.empty_confirmed).sum::<usize>(),
         "unreviewed_person_frames": rows.iter().map(|r| r.unreviewed_person_frames).sum::<usize>(),
@@ -332,6 +363,7 @@ fn answer(rows: &[Row], report: Option<&RefineReport>) -> serde_json::Value {
                 "reviewed": r.reviewed,
                 "persons": r.persons,
                 "vehicles": r.vehicles,
+                "vehicle_frames": r.vehicle_frames,
                 "empty": r.empty,
                 "empty_confirmed": r.empty_confirmed,
                 "unreviewed_person_frames": r.unreviewed_person_frames,
@@ -466,6 +498,31 @@ mod tests {
             f.reviewed_at = Some("2026-10-22T00:00:00Z".into());
         }
         crate::collect::labels::write(&path, &f).unwrap();
+    }
+
+    /// A frame nobody opened: no label file, its sidecar's `predictions` labelled `labels`; with
+    /// `broken`, a sidecar that does not read.
+    fn unopened(dir: &Path, scene: &str, camera: &str, stem: &str, labels: &[&str], broken: bool) {
+        frame(dir, scene, camera, stem, Status::Unreviewed, false, vec![]);
+        let rel = format!("{scene}/{camera}/2026-10-21/{stem}.jpg");
+        let f = Frame::resolve(dir, &rel).unwrap();
+        std::fs::remove_file(&f.labels).unwrap();
+        let sidecar = f.labels.with_file_name(format!("{stem}.json"));
+        if broken {
+            std::fs::write(&sidecar, b"{ not json").unwrap();
+            return;
+        }
+        let mut r: crate::collect::record::Record =
+            serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+        r.predictions = labels
+            .iter()
+            .map(|l| crate::collect::record::Det {
+                label: (*l).into(),
+                score: 0.8,
+                bbox: [8.0, 8.0, 28.0, 40.0],
+            })
+            .collect();
+        std::fs::write(&sidecar, serde_json::to_vec(&r).unwrap()).unwrap();
     }
 
     /// Two cameras and scenes:
@@ -610,8 +667,9 @@ mod tests {
     /// `(camera, scene, class, boxes, found)`: one recall row of a report.
     type Group = (&'static str, &'static str, &'static str, u64, u64);
 
-    /// A report with the recall rows `groups` (built by the report's own tally), written into
-    /// `review/refine/report.json`; a quick check's when `mode` says so.
+    /// A report with the recall rows `groups` (built by the report's own tally), written where a
+    /// check of `mode` writes it: `review/refine/report.json`, a quick check's
+    /// `review/refine/report-quick.json`.
     fn put_report(review: &Path, mode: Mode, groups: &[Group]) {
         let mut r = RefineReport::new(
             "run1",
@@ -649,9 +707,7 @@ mod tests {
                 ..ModelInfo::default()
             });
         }
-        let path = report::report_path(review);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, serde_json::to_vec(&r).unwrap()).unwrap();
+        r.write(review).unwrap();
     }
 
     #[tokio::test]
@@ -759,8 +815,8 @@ mod tests {
                 ("yard", "day", "truck", 12, 12),
             ],
         );
-        let (report, problem) = read_report(&review);
-        assert!(problem.is_none());
+        let report = recall_report(&review);
+        assert_eq!(report.as_ref().map(|r| r.mode), Some(Mode::Folds));
         let v = answer(&compute(&review, &classes(), &[]), report.as_ref());
         let night = row(&v, "yard", "night");
         assert_eq!(night["person"]["boxes"], 40);
@@ -794,8 +850,13 @@ mod tests {
         assert_eq!(row(&v, "yard", "night")["person"]["found"], 6);
         // The route answers the counts too, through the process cache's own path.
         assert_eq!(row(&v, "yard", "night")["persons"], 3);
-        let (report, _) = read_report(&review);
-        assert_eq!(report.unwrap().mode, Mode::Model);
+        assert!(report::quick_report_path(&review).is_file());
+        assert!(!report::report_path(&review).exists());
+        // A full check's report beside it: the recall columns are the full check's.
+        put_report(&review, Mode::Folds, &[("yard", "night", "person", 40, 30)]);
+        let (_, v) = json(&state, get("/v1/refine/coverage")).await;
+        assert_eq!(row(&v, "yard", "night")["person"]["boxes"], 40);
+        assert_eq!(recall_report(&review).unwrap().mode, Mode::Folds);
     }
 
     #[tokio::test]
@@ -845,13 +906,68 @@ mod tests {
         assert!(cache.kept.lock_recover().len() <= KEEP);
     }
 
+    /// Vehicle frames are frames, never boxes: 2 of 10 reviewed frames with 5 cars each are 10
+    /// vehicle boxes on 2 frames (the page's "a vehicle in about every frame" reads the frames).
+    #[test]
+    fn vehicle_frames_count_frames_with_a_vehicle_not_boxes() {
+        let dir = scratch();
+        let review = dir.join("dataset");
+        let acc = |l: &str| lbox(l, BoxState::Accepted);
+        for i in 0..10 {
+            let boxes = if i < 2 {
+                (0..5).map(|_| acc("car")).collect()
+            } else {
+                vec![acc("person")]
+            };
+            frame(
+                &review,
+                "day",
+                "drive",
+                &format!("f{i}"),
+                Status::Reviewed,
+                false,
+                boxes,
+            );
+        }
+        let v = answer(&compute(&review, &classes(), &[]), None);
+        let r = row(&v, "drive", "day");
+        assert_eq!(
+            (
+                r["reviewed"].as_u64(),
+                r["vehicles"].as_u64(),
+                r["vehicle_frames"].as_u64(),
+                r["empty"].as_u64()
+            ),
+            (Some(10), Some(10), Some(2), Some(0)),
+            "{r}"
+        );
+        assert_eq!(v["totals"]["vehicle_frames"], 2);
+        // The shared folder: n1 (a car) and n2 (a bicycle) by night, d1 (a truck) by day.
+        let review = folder(&scratch());
+        let v = answer(&compute(&review, &classes(), &[]), None);
+        assert_eq!(row(&v, "yard", "night")["vehicle_frames"], 2);
+        assert_eq!(row(&v, "yard", "day")["vehicle_frames"], 1);
+        assert_eq!(v["totals"]["vehicle_frames"], 3);
+    }
+
     /// The link the page builds opens exactly the frames the count names: the Review queue under
-    /// the same query (`RefineFloor.coverageUrl`) lists as many frames as `unreviewed_person_frames`.
+    /// the same query (`RefineFloor.coverageUrl`) lists as many frames as `unreviewed_person_frames`,
+    /// frames nobody opened yet (no label file: the sidecar's predictions) among them.
     #[test]
     fn the_review_link_opens_exactly_the_counted_frames() {
         let dir = scratch();
         let review = folder(&dir);
+        // Collected frames nobody opened: a person detected, a car only, a sidecar that does not
+        // read (the queue cannot list it), and one at the gate.
+        unopened(&review, "night", "yard", "o1", &["person", "car"], false);
+        unopened(&review, "night", "yard", "o2", &["car"], false);
+        unopened(&review, "night", "yard", "o3", &["person"], true);
+        unopened(&review, "ir", "gate", "o4", &["person"], false);
         let v = answer(&compute(&review, &classes(), &[]), None);
+        // u1, u2 and o1 by night; g1 and o4 at the gate.
+        assert_eq!(row(&v, "yard", "night")["unreviewed_person_frames"], 3);
+        assert_eq!(row(&v, "gate", "ir")["unreviewed_person_frames"], 2);
+        assert_eq!(v["totals"]["unreviewed_person_frames"], 5);
         for r in v["rows"].as_array().unwrap() {
             let q: std::collections::BTreeMap<String, String> = [
                 ("status", "unreviewed"),

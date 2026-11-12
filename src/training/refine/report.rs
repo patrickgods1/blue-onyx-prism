@@ -1,4 +1,5 @@
-//! The report of the dataset check, `<review folder>/refine/report.json` ([`REPORT_FILE`]): what
+//! The report of the dataset check, `<review folder>/refine/report.json` ([`REPORT_FILE`]; a quick
+//! check's is `report-quick.json`, [`QUICK_REPORT_FILE`], so each mode keeps its last one): what
 //! was checked, what was suggested, and how often a fold model found the labelled objects of camera
 //! days it never saw (out-of-fold recall) per camera x scene x class and per size at model input,
 //! each with a Wilson 95% interval ([`wilson`]): 57 held-out persons give a recall to about +/- 10
@@ -18,8 +19,13 @@ use std::path::{Path, PathBuf};
 
 /// Folder of the report in the folder under review.
 pub const REPORT_DIR: &str = "refine";
-/// The report file in [`REPORT_DIR`].
+/// The full check's report file in [`REPORT_DIR`].
 pub const REPORT_FILE: &str = "report.json";
+/// The quick check's report file in [`REPORT_DIR`]: each mode keeps its own last report, so a
+/// quick check never replaces the full check's whole-folder recall (and the recall by size a floor
+/// is chosen from), nor the reverse. A `report.json` with `mode: model` (written by the first
+/// builds of the quick check, never released) reads as what it says.
+pub const QUICK_REPORT_FILE: &str = "report-quick.json";
 /// Version of the report's layout.
 pub const REPORT_VERSION: u32 = 1;
 /// z of a two-sided 95% interval: the 0.975 quantile of the standard normal distribution.
@@ -28,9 +34,22 @@ pub const Z95: f64 = 1.959_963_984_540_054;
 /// bucket has none. 8 and 12: about one RF-DETR patch; 24 and 48: a person far and near.
 pub const SIZE_EDGES: [f32; 4] = [8.0, 12.0, 24.0, 48.0];
 
-/// `<review folder>/refine/report.json`.
+/// `<review folder>/refine/report.json`: the full check's.
 pub fn report_path(review_dir: &Path) -> PathBuf {
     review_dir.join(REPORT_DIR).join(REPORT_FILE)
+}
+
+/// `<review folder>/refine/report-quick.json`: the quick check's.
+pub fn quick_report_path(review_dir: &Path) -> PathBuf {
+    review_dir.join(REPORT_DIR).join(QUICK_REPORT_FILE)
+}
+
+/// The report file of a check of `mode`.
+pub fn report_path_of(review_dir: &Path, mode: Mode) -> PathBuf {
+    match mode {
+        Mode::Folds => report_path(review_dir),
+        Mode::Model => quick_report_path(review_dir),
+    }
 }
 
 /// The Wilson score interval of `found` successes in `n` trials at 95% ([`Z95`]): `(low, high)`
@@ -315,11 +334,18 @@ pub struct RefineReport {
     /// The model of a quick check; None for fold models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelInfo>,
-    /// Seconds the detections took per frame (model loading included, the judge and the writes
-    /// not), over every frame the models ran on: a later preview's time estimate. None in reports
-    /// of earlier checks and when no frame ran.
+    /// Seconds the detections took per frame, the model's load not included (reading and
+    /// decoding the frame and the model's pass; the judge and the writes not), over every frame the
+    /// models ran on: with [`Self::predict_load_s`], a later quick preview's time estimate. None
+    /// when no frame ran. (Reports of the branch's first quick checks held the load in it; with no
+    /// `predict_load_s` beside it no estimate uses it.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predict_s_per_frame: Option<f64>,
+    /// Seconds a model took to load before its first frame (runtime, read, compile and warm-up, as
+    /// the benchmark pipeline measures them), averaged over the models that ran; None when no
+    /// model reported it and in reports of earlier checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict_load_s: Option<f64>,
     pub warnings: Vec<String>,
 }
 
@@ -446,6 +472,7 @@ impl RefineReport {
             mode: Mode::Folds,
             model: None,
             predict_s_per_frame: None,
+            predict_load_s: None,
             warnings: Vec::new(),
         }
     }
@@ -460,7 +487,8 @@ impl RefineReport {
         self.created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     }
 
-    /// Write it to `<review_dir>/refine/report.json` atomically (a reader never sees half of it);
+    /// Write it to its mode's file ([`report_path_of`]: `refine/report.json` for a full check,
+    /// `refine/report-quick.json` for a quick one) atomically (a reader never sees half of it);
     /// returns the path. Refused when the folder under review is not a folder any more (an
     /// unmounted drive: creating it would put the report on the disk below the mount point); only
     /// `refine/` is created.
@@ -472,7 +500,7 @@ impl RefineReport {
                 review_dir.display()
             );
         }
-        let path = report_path(review_dir);
+        let path = report_path_of(review_dir, self.mode);
         let dir = review_dir.join(REPORT_DIR);
         match std::fs::create_dir(&dir) {
             Ok(()) => {}

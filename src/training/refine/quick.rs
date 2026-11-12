@@ -15,11 +15,17 @@
 //! came from ([`crate::training::dataset::IMAGE_SOURCES_FILE`], newer runs), when the source's file
 //! name is the frame's flat name. A listed image that record does not name refuses the check.
 //!
-//! **Refused, never guessed** ([`seen_of`]): a model without the record (a stock or downloaded
-//! model: what it trained on is unknown), a record that does not read or names no run, a run folder
-//! that is gone, or lists that do not read. A model judging frames it trained on finds every label
-//! "right", so a check that cannot leave them out says nothing. The run folder is the run's
-//! `run_dir` in `runs.json` of the training folder, else `<training dir>/<run id>`.
+//! **Refused, never guessed** ([`seen_of`], [`select`], [`check_weights`]): a model without the
+//! record (a stock or downloaded model: what it trained on is unknown), a record that does not read
+//! or names no run, a model file that is missing, a run folder that is gone, lists that do not
+//! read, lists that name no reviewed frame of the folder at all (a run on another folder or on
+//! renamed copies; a model that truly never saw a frame of the folder is refused too, the safe
+//! side), and at preview and plan time a model file whose SHA-256 is not the record's
+//! `onnx_sha256` (replaced since; a record without a hash is warned about, not refused). A
+//! model judging frames it trained on finds every label "right", so a check that cannot leave them
+//! out says nothing. Listed images without this program's frame names (public sets aside) are
+//! counted and warned about ([`Seen::odd_names`]). The run folder is the run's `run_dir` in
+//! `runs.json` of the training folder, else `<training dir>/<run id>`.
 //!
 //! **What the model has.** Its classes are the run's (the record's `classes`, else the run's
 //! `data/classes.txt`) in the class list's spelling ([`judge::ModelJudge`]): a wanted class it does
@@ -59,7 +65,7 @@ use std::time::Duration;
 /// never saw can be judged, and one is enough to run (the preview says how few that is).
 pub const MIN_UNSEEN_FRAMES: usize = 1;
 /// The guess of a quick check's fixed cost, seconds, when no quick check with the model measured it
-/// ([`super::report::RefineReport::predict_s_per_frame`]): loading and compiling the model on its
+/// ([`super::report::RefineReport::predict_load_s`]): loading and compiling the model on its
 /// device (an OpenVINO GPU compile without a cache takes the better part of a minute), the
 /// selection walk and the report. Not measured.
 pub const QUICK_FIXED_S: f64 = 60.0;
@@ -85,6 +91,13 @@ pub struct Located {
     pub imgsz: u32,
     /// The run's classes (the record's spelling).
     pub classes: Vec<String>,
+    /// The model file ([`Config::data_path`] of the entry's `path`); it exists when located.
+    pub model_file: PathBuf,
+    /// The SHA-256 of the ONNX its run installed (the record's `onnx_sha256`); None when the record
+    /// has none.
+    pub onnx_sha256: Option<String>,
+    /// When the run made it (the record's `created`), for the newest-first order.
+    pub created: String,
 }
 
 /// What a model's training run shows it saw ([`seen_of`]).
@@ -107,6 +120,10 @@ pub struct Seen {
     pub train_boxes: Option<BTreeMap<String, usize>>,
     /// Camera days (camera, `YYYY-MM-DD`) of the listed images that name a dataset frame.
     days: BTreeSet<(String, String)>,
+    /// Listed images (`train.txt` and `valid.txt`, each name once) that carry no frame name of
+    /// this program ([`odd_name`]): a dataset made by hand or by another tool, or renamed copies.
+    /// Images of the run's public sets (its `dataset.json` sources) are not counted.
+    pub odd_names: usize,
 }
 
 /// How a model saw a frame.
@@ -165,6 +182,36 @@ impl Seen {
     pub fn saw_day(&self, camera: &str, date: &str) -> bool {
         self.days.contains(&(camera.to_string(), date.to_string()))
     }
+
+    /// Image names in the run's lists (`train.txt` and `valid.txt`, each name once per list).
+    pub fn listed(&self) -> usize {
+        self.train.len() + self.valid.len()
+    }
+}
+
+/// Whether the dataset image `name` (of a list, with its `s<N>-` prefix) carries no frame name of
+/// this program: no source prefix, or after it no flat frame name ([`export::parse_flat_name`])
+/// unless the dataset's 120-byte cut ([`spelled`]) took its end; `source` is the file name the
+/// run's record of image sources gives it, when there is one (a frame name there counts).
+fn odd_name(name: &str, source: Option<&str>) -> bool {
+    if source.is_some_and(|s| export::parse_flat_name(s).is_some()) {
+        return false;
+    }
+    match split_prefix(name) {
+        Some((_, rest)) => export::parse_flat_name(rest).is_none() && name.len() < 120,
+        None => true,
+    }
+}
+
+/// The warning of a run whose lists hold `n` of `of` images with no frame name of this program.
+pub fn odd_names_warning(n: usize, of: usize, l: &Located) -> String {
+    format!(
+        "{n} of the {of} images in run {}'s lists do not carry this program's frame names (a \
+         dataset folder made by hand or by another tool, or renamed copies): they cannot be \
+         matched to frames here, so if any is a copy of a frame of this folder, {} is judged on \
+         it as if it never saw it",
+        l.run, l.name
+    )
 }
 
 /// `name` of the config's models, as the model names are compared ([`crate::registry::normalize_name`]).
@@ -205,20 +252,38 @@ fn plain(id: &str) -> bool {
         && Path::new(id).file_name().and_then(|n| n.to_str()) == Some(id)
 }
 
-/// The folder of run `run`: its `run_dir` in `runs.json` of the training folder (read only), else
-/// `<training dir>/<run>`; the first that holds `data/`.
-fn run_folder(config: &Config, run: &str) -> Option<PathBuf> {
-    let recorded = std::fs::read(super::super::runs_file(config))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Vec<serde_json::Value>>(&b).ok())
-        .and_then(|list| {
-            list.into_iter().find_map(|r| {
-                (r.get("id").and_then(serde_json::Value::as_str) == Some(run))
-                    .then(|| r.get("run_dir")?.as_str().map(PathBuf::from))
-                    .flatten()
-            })
-        });
-    recorded
+/// The `run_dir` of every run in `runs.json` of the training folder (read only, once per caller):
+/// run id -> folder. Empty when the file is missing or does not read.
+#[derive(Debug, Clone, Default)]
+pub struct RunDirs(BTreeMap<String, PathBuf>);
+
+impl RunDirs {
+    /// `runs.json` of `config`'s training folder.
+    pub fn read(config: &Config) -> Self {
+        let list = std::fs::read(super::super::runs_file(config))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<serde_json::Value>>(&b).ok())
+            .unwrap_or_default();
+        let mut out = BTreeMap::new();
+        for r in list {
+            if let (Some(id), Some(dir)) = (
+                r.get("id").and_then(serde_json::Value::as_str),
+                r.get("run_dir").and_then(serde_json::Value::as_str),
+            ) {
+                out.entry(id.to_string())
+                    .or_insert_with(|| PathBuf::from(dir));
+            }
+        }
+        Self(out)
+    }
+}
+
+/// The folder of run `run`: its `run_dir` in `runs.json` (`dirs`), else `<training dir>/<run>`;
+/// the first that holds `data/`.
+fn run_folder(config: &Config, dirs: &RunDirs, run: &str) -> Option<PathBuf> {
+    dirs.0
+        .get(run)
+        .cloned()
         .into_iter()
         .chain(std::iter::once(
             super::super::training_dir(config).join(run),
@@ -227,8 +292,14 @@ fn run_folder(config: &Config, run: &str) -> Option<PathBuf> {
 }
 
 /// The model `m` and its training run, from its records (no list read): refused ([`refusal`]) when
-/// it has no record, the record does not read or names no run, or the run folder is gone.
+/// it has no record, the record does not read or names no run, or the run folder is gone; an
+/// error when its model file is missing.
 pub fn locate(config: &Config, m: &ModelConfig) -> Result<Located> {
+    locate_in(config, m, &RunDirs::read(config))
+}
+
+/// [`locate`] with `runs.json` read already (`dirs`).
+pub fn locate_in(config: &Config, m: &ModelConfig, dirs: &RunDirs) -> Result<Located> {
     #[derive(Deserialize)]
     struct Record {
         #[serde(default)]
@@ -237,6 +308,10 @@ pub fn locate(config: &Config, m: &ModelConfig) -> Result<Located> {
         recipe: Option<serde_json::Value>,
         #[serde(default)]
         classes: Vec<String>,
+        #[serde(default)]
+        created: String,
+        #[serde(default)]
+        onnx_sha256: String,
     }
     let name = m.effective_name();
     let record = record_path(config, m);
@@ -267,7 +342,15 @@ pub fn locate(config: &Config, m: &ModelConfig) -> Result<Located> {
             format!("{} names no training run", record.display()),
         ));
     }
-    let run_dir = run_folder(config, &r.run_id).ok_or_else(|| {
+    let model_file = config.data_path(&m.path);
+    if !model_file.is_file() {
+        bail!(
+            "{name}'s model file {} is missing (moved or deleted?), so there is nothing to run; \
+             put it back or choose another model",
+            model_file.display()
+        );
+    }
+    let run_dir = run_folder(config, dirs, &r.run_id).ok_or_else(|| {
         refusal(
             &name,
             format!(
@@ -323,7 +406,52 @@ pub fn locate(config: &Config, m: &ModelConfig) -> Result<Located> {
         run_dir,
         imgsz,
         classes,
+        model_file,
+        onnx_sha256: Some(r.onnx_sha256.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()),
+        created: r.created,
     })
+}
+
+/// Whether the model file of `l` is the one its training run produced: its SHA-256 against the
+/// record's `onnx_sha256` (a hash of the whole file: run at plan and preview time only, never per
+/// `GET /v1/refine`). `Ok(None)`: the same file; `Ok(Some(warning))`: it could not be checked (the
+/// record has no hash, or the entry names no `.onnx`, which the hash is of); `Err`: another file,
+/// or it does not read.
+pub fn check_weights(l: &Located) -> Result<Option<String>> {
+    let Some(want) = &l.onnx_sha256 else {
+        return Ok(Some(format!(
+            "{} names no hash of the model file, so the check cannot tell that {} is the file \
+             training run {} produced",
+            l.record.display(),
+            l.model_file.display(),
+            l.run
+        )));
+    };
+    let is_onnx = l
+        .model_file
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("onnx"));
+    if !is_onnx {
+        return Ok(Some(format!(
+            "{} is no .onnx file, and the record's hash is of the ONNX training run {} \
+             installed, so the check cannot tell that it is that model",
+            l.model_file.display(),
+            l.run
+        )));
+    }
+    let got = crate::resources::manager::sha256_file(&l.model_file)
+        .with_context(|| format!("reading {} to check it", l.model_file.display()))?;
+    if got.eq_ignore_ascii_case(want) {
+        Ok(None)
+    } else {
+        bail!(
+            "{} is not the file training run {} produced (replaced since?): the frames it \
+             trained on are unknown, so the quick check refuses. Run the full check (fold \
+             models), or train the model again",
+            l.model_file.display(),
+            l.run
+        )
+    }
 }
 
 /// The image names of a list file (`./images/<name>` lines, each once).
@@ -361,9 +489,15 @@ pub fn seen_of(config: &Config, m: &ModelConfig) -> Result<Seen> {
         ..Seen::default()
     };
     let sources_file = data.join(crate::training::dataset::IMAGE_SOURCES_FILE);
+    let mut source_names: BTreeMap<String, String> = BTreeMap::new();
     if sources_file.is_file() {
         let sources = crate::training::dataset::read_image_sources(&data)
             .map_err(|e| refusal(&name, format!("{e:#}")))?;
+        for (n, src) in &sources {
+            if let Some(f) = src.file_name() {
+                source_names.insert(n.clone(), f.to_string_lossy().into_owned());
+            }
+        }
         for (names, into) in [
             (&train, &mut out.train_sources),
             (&valid, &mut out.valid_sources),
@@ -399,6 +533,19 @@ pub fn seen_of(config: &Config, m: &ModelConfig) -> Result<Seen> {
             out.days.insert((r.camera, r.date));
         }
     }
+    // The run's public sets (`s<i>-` is its i-th source in dataset.json) carry their own names.
+    let public: BTreeSet<String> = crate::training::dataset::read_summary_sources(&data)
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.kind != "review")
+        .map(|(i, _)| format!("s{i}"))
+        .collect();
+    out.odd_names = train
+        .iter()
+        .chain(&valid)
+        .filter(|n| !split_prefix(n).is_some_and(|(p, _)| public.contains(p)))
+        .filter(|n| odd_name(n, source_names.get(*n).map(String::as_str)))
+        .count();
     out.train = train;
     out.valid = valid;
     out.train_boxes = read_train_boxes(&data);
@@ -482,7 +629,8 @@ pub struct QuickSelected {
 
 /// Select the frames of a quick check of `dataset_dir` (read only) with the model that saw `seen`:
 /// the fold check's selection ([`super::select`]), without the frames the model trained or
-/// validated on. Refused with fewer than [`MIN_UNSEEN_FRAMES`].
+/// validated on. Refused with fewer than [`MIN_UNSEEN_FRAMES`], and when the run's lists are not
+/// empty but name no exportable reviewed frame of the folder, the frame filter aside.
 pub fn select(
     dataset_dir: &Path,
     classes: &[String],
@@ -491,7 +639,7 @@ pub fn select(
     seen: &Seen,
 ) -> QuickSelected {
     // No folds: their count and refusal are of no use here.
-    let mut s = super::select(dataset_dir, classes, hidden, filter, 2, 0);
+    let (mut s, filtered) = super::select_parts(dataset_dir, classes, hidden, filter, 2, 0);
     s.refused = None;
     s.folds.clear();
     s.k = 0;
@@ -527,11 +675,24 @@ pub fn select(
     s.open = open_to_replace(&unseen, &wanted);
     s.class_boxes = model_class_boxes(seen, &wanted);
     s.frames = unseen;
-    if s.frames.len() < MIN_UNSEEN_FRAMES {
-        let name = seen
-            .located
-            .as_ref()
-            .map_or("the model", |l| l.name.as_str());
+    let name = seen
+        .located
+        .as_ref()
+        .map_or("the model", |l| l.name.as_str());
+    // Lists that name no reviewed frame of the folder at all (the frame filter aside): the run
+    // trained on another folder or on renamed copies, and every frame it saw would pass for new.
+    let found_any =
+        out.trained_on + out.validated_on > 0 || filtered.iter().any(|f| seen.saw(f).is_some());
+    if seen.listed() > 0 && !found_any {
+        s.refused = Some(format!(
+            "none of the {} images {name} trained or validated on is a reviewed frame of {}: it \
+             trained on another folder or on renamed copies, so the check cannot tell which \
+             frames it saw. A model that never saw a frame of this folder is refused the same \
+             way (the safe side); run the full check (fold models)",
+            seen.listed(),
+            dataset_dir.display(),
+        ));
+    } else if s.frames.len() < MIN_UNSEEN_FRAMES {
         s.refused = Some(format!(
             "{name} trained or validated on every reviewed frame of {} that can be exported ({} \
              trained on, {} validated on; {} left out: {} with pending boxes, {} with labels off \
@@ -587,6 +748,9 @@ pub struct Quick {
     pub unseen: usize,
     /// Where the closer look runs; None without it.
     pub look: Option<LookEnv>,
+    /// Why the model file could not be checked against its record when planned
+    /// ([`check_weights`]); the report repeats it.
+    pub weights_warning: Option<String>,
 }
 
 /// Whether a quick check of `request` looks closer at its loose labels, and the warning when it
@@ -622,8 +786,11 @@ pub fn look_choice(
 }
 
 /// The time a quick check over `frames` frames takes, seconds, and where it came from: the last
-/// quick check with the same model (`last`, the report in the folder under review) measured its
-/// detections per frame; else the documented guess ([`QUICK_FIXED_S`], [`QUICK_S_PER_FRAME`]).
+/// quick check with the same model (`last`, the quick report in the folder under review) measured
+/// the model's load ([`RefineReport::predict_load_s`]) and its time per frame
+/// ([`RefineReport::predict_s_per_frame`]), so `load + per frame x frames`; else the documented
+/// guess ([`QUICK_FIXED_S`] + [`QUICK_S_PER_FRAME`] x frames). A report without both (an earlier
+/// one, whose time per frame held the load) is no measure.
 pub fn quick_seconds(frames: usize, name: &str, last: Option<&RefineReport>) -> (f64, TimeBasis) {
     #[allow(clippy::cast_precision_loss, reason = "a count of frames")]
     let n = frames as f64;
@@ -634,17 +801,17 @@ pub fn quick_seconds(frames: usize, name: &str, last: Option<&RefineReport>) -> 
                 crate::registry::normalize_name(&m.name) == crate::registry::normalize_name(name)
             })
         })
-        .and_then(|r| r.predict_s_per_frame)
-        .filter(|s| s.is_finite() && *s > 0.0);
+        .and_then(|r| Some((r.predict_load_s?, r.predict_s_per_frame?)))
+        .filter(|(load, per)| load.is_finite() && *load >= 0.0 && per.is_finite() && *per > 0.0);
     match measured {
-        Some(s) => (s * n, TimeBasis::LastCheck),
+        Some((load, per)) => (load + per * n, TimeBasis::LastCheck),
         None => (QUICK_FIXED_S + QUICK_S_PER_FRAME * n, TimeBasis::Guess),
     }
 }
 
-/// The report in the folder under review, when one reads (for its measured pace).
+/// The quick check's report in the folder under review, when one reads (for its measured pace).
 fn last_report(dir: &Path) -> Option<RefineReport> {
-    let b = std::fs::read(super::report::report_path(dir)).ok()?;
+    let b = std::fs::read(super::report::quick_report_path(dir)).ok()?;
     serde_json::from_slice(&b).ok()
 }
 
@@ -675,7 +842,8 @@ fn bare_info(name: &str) -> ModelInfo {
     }
 }
 
-/// The [`ModelInfo`] of a quick check by the model of `seen` over `qs`.
+/// The [`ModelInfo`] of a quick check by the model of `seen` over `qs`. (The odd-name count is a
+/// warning of the preview and the report, [`odd_names_warning`].)
 pub fn model_info(seen: &Seen, qs: &QuickSelected, missing: Vec<String>) -> ModelInfo {
     let l = seen.located.as_ref();
     ModelInfo {
@@ -760,6 +928,14 @@ pub fn preview(
         p.refused = Some(format!("{name}: no training record"));
         return Ok(p);
     };
+    // The file against its record, as a start checks it (one hash of the model file).
+    let weights_warning = match check_weights(&located) {
+        Ok(w) => w,
+        Err(e) => {
+            p.refused = Some(format!("{e:#}"));
+            None
+        }
+    };
     p.recipe = recipe_info(&located);
     let qs = select(&dir, classes, hidden, &request.frames, &seen);
     let judge = model_judge(&seen, &wanted);
@@ -815,6 +991,13 @@ pub fn preview(
     }
     if !seen.by_source {
         p.warnings.push(by_name_note(&located));
+    }
+    if seen.odd_names > 0 {
+        p.warnings
+            .push(odd_names_warning(seen.odd_names, seen.listed(), &located));
+    }
+    if let Some(w) = weights_warning {
+        p.warnings.push(w);
     }
     p.warnings.extend(qs.s.warnings.iter().cloned());
     if let Some(w) = look_warning {
@@ -899,18 +1082,22 @@ pub struct Unusable {
 }
 
 /// The configured models with a training record: those a quick check can use ([`locate`] finds
-/// their run and its lists are there; newest first), and those it cannot, with why. Models without
-/// a record (stock, downloaded) are in neither. Reads the records only, never the lists.
+/// their model file and their run, and its lists are there; newest first), and those it cannot,
+/// with why. Models without a record (stock, downloaded) are in neither. Reads `runs.json` once and
+/// each record once, never the lists or the model files' bytes (no hash: [`check_weights`] runs
+/// when a check is previewed or planned).
 pub fn models(config: &Config) -> (Vec<QuickModel>, Vec<Unusable>) {
     let mut ok = Vec::new();
     let mut bad = Vec::new();
+    let mut dirs: Option<RunDirs> = None;
     for m in &config.models {
         let record = record_path(config, m);
         if !record.is_file() {
             continue;
         }
         let name = m.effective_name();
-        let usable = locate(config, m).and_then(|l| {
+        let dirs = dirs.get_or_insert_with(|| RunDirs::read(config));
+        let usable = locate_in(config, m, dirs).and_then(|l| {
             for list in ["train.txt", "valid.txt"] {
                 let p = l.run_dir.join("data").join(list);
                 if !p.is_file() {
@@ -921,18 +1108,13 @@ pub fn models(config: &Config) -> (Vec<QuickModel>, Vec<Unusable>) {
         });
         match usable {
             Ok(l) => {
-                let created = std::fs::read(&l.record)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                    .and_then(|v| Some(v.get("created")?.as_str()?.to_string()))
-                    .unwrap_or_default();
                 ok.push(QuickModel {
                     name,
                     run: l.run,
                     recipe: l.recipe,
                     imgsz: l.imgsz,
                     enabled: m.enabled,
-                    created,
+                    created: l.created,
                 });
             }
             Err(e) => bad.push(Unusable {
@@ -966,6 +1148,7 @@ pub fn plan(
         .located
         .clone()
         .context("the model's training record")?;
+    let weights_warning = check_weights(&located)?;
     let classes = &config.collect.classes;
     let hidden = &config.collect.hidden_classes;
     let qs = select(&dir, classes, hidden, &request.frames, &seen);
@@ -1022,6 +1205,7 @@ pub fn plan(
             imgsz: located.imgsz,
             unseen: qs.s.frames.len(),
             look: look_env,
+            weights_warning,
         }),
         recipe_from: format!("the model {}, trained in run {}", located.name, located.run),
         predictor: None,

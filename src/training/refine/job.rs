@@ -355,6 +355,8 @@ pub struct Acc {
     pub tighten_reasons: Vec<(String, super::judge::Loose, super::judge::NoTighten)>,
     /// Frames the models answered and the seconds they took ([`Acc::note_predict`]).
     pub predicted: (usize, f64),
+    /// Seconds the models took to load, and how many passes reported it.
+    pub loads: (f64, usize),
 }
 
 impl Acc {
@@ -369,18 +371,30 @@ impl Acc {
             shapes: Vec::new(),
             tighten_reasons: Vec::new(),
             predicted: (0, 0.0),
+            loads: (0.0, 0),
         }
     }
 
-    /// Note that a model answered `frames` frames in `seconds` (its loading included): the
-    /// report's [`RefineReport::predict_s_per_frame`] over every pass so far.
-    pub fn note_predict(&mut self, frames: usize, seconds: f64) {
+    /// Note that a model answered `frames` frames in `seconds`, of which `load` (when the
+    /// predictor measured it, [`crate::training::autolabel::relabel::Detections::load_s`]) went to
+    /// loading it: the report's [`RefineReport::predict_s_per_frame`] (the load taken off) and
+    /// [`RefineReport::predict_load_s`] (the mean load) over every pass so far.
+    pub fn note_predict(&mut self, frames: usize, seconds: f64, load: Option<f64>) {
+        let load = load.filter(|l| l.is_finite() && *l >= 0.0);
         self.predicted.0 += frames;
-        self.predicted.1 += seconds;
+        self.predicted.1 += (seconds - load.unwrap_or(0.0)).max(0.0);
+        if let Some(l) = load {
+            self.loads.0 += l.min(seconds.max(0.0));
+            self.loads.1 += 1;
+        }
+        let four = |x: f64| (x * 10_000.0).round() / 10_000.0;
         let (n, s) = self.predicted;
         #[allow(clippy::cast_precision_loss, reason = "a count of frames")]
         let per = (n > 0 && s.is_finite()).then(|| s / n as f64);
-        self.rep.predict_s_per_frame = per.map(|x| (x * 10_000.0).round() / 10_000.0);
+        self.rep.predict_s_per_frame = per.map(four);
+        #[allow(clippy::cast_precision_loss, reason = "a count of passes")]
+        let mean = (self.loads.1 > 0).then(|| self.loads.0 / self.loads.1 as f64);
+        self.rep.predict_load_s = mean.map(four);
     }
 
     /// Count what the closer look's writes did (`w`).
@@ -915,7 +929,7 @@ impl RefineJob {
         if found.cancelled || cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(Cancelled));
         }
-        acc.note_predict(found.frames.len(), t0.elapsed().as_secs_f64());
+        acc.note_predict(found.frames.len(), t0.elapsed().as_secs_f64(), found.load_s);
         // (e, f) Judge and write, under the label write lock (no cancel checks: a fold is written
         // whole).
         let w = self.write_fold_into(n, k, &fold, &found, &jctx, acc, &mut |d, total| {
@@ -1256,6 +1270,13 @@ impl RefineJob {
             if !seen.by_source {
                 rep.warnings.push(quick::by_name_note(l));
             }
+            if seen.odd_names > 0 {
+                rep.warnings
+                    .push(quick::odd_names_warning(seen.odd_names, seen.listed(), l));
+            }
+        }
+        if let Some(w) = &q.weights_warning {
+            rep.warnings.push(w.clone());
         }
         rep
     }
@@ -1379,7 +1400,7 @@ impl RefineJob {
         if found.cancelled || cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(Cancelled));
         }
-        acc.note_predict(found.frames.len(), t0.elapsed().as_secs_f64());
+        acc.note_predict(found.frames.len(), t0.elapsed().as_secs_f64(), found.load_s);
         if let Some(m) = acc.rep.model.as_mut() {
             m.device.clone_from(&found.device);
         }

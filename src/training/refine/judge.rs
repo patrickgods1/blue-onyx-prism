@@ -63,8 +63,9 @@
 //! input size, `class_boxes` what its run trained on, and a wanted class it does not have
 //! ([`ModelJudge::classes`]) gets no `verify` (step 5), its labels are no `relabel` target (step 6)
 //! and stay out of the recall (its detections of other classes cannot say the label is wrong; its
-//! silence is no miss), and such a label covers ([`covers`]) a detection of any class in step 4
-//! (the model names the object it cannot name by another class: no second box on it). Every `why`
+//! silence is no miss), and such a label covers a detection of any class in step 4 at IoU >=
+//! [`UNKNOWN_CLASS_COVER_IOU`] (the model names the object it cannot name by another class: no
+//! second box on it; a smaller object inside or beside the box is still an add). Every `why`
 //! names the model instead of "a model that never saw this camera-day": it may well have trained
 //! on other frames of that camera-day.
 
@@ -98,6 +99,10 @@ pub const GOOD_IOU: f32 = 0.75;
 /// Score from which an unmatched detection is proposed as a missing box: below it fold models
 /// guess too often for a reviewer's time.
 pub const ADD_SCORE: f32 = 0.5;
+/// IoU from which a label of a wanted class a quick check's model does not have explains a
+/// detection of another class (rule 4): the model names that box's object by a class it has, so the
+/// detection is about the same box; a person standing in front of a labelled truck is not.
+pub const UNKNOWN_CLASS_COVER_IOU: f32 = 0.5;
 /// Score from which an unmatched detection at a static spot is proposed as a missing box (rule 4):
 /// labels at the place on other days make a weaker find worth a look.
 pub const ADD_SCORE_AT_SPOT: f32 = 0.3;
@@ -561,11 +566,12 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         }
         let covered = f.boxes.iter().any(|b| {
             (b.state != BoxState::Rejected || b.is_ignore())
-                && covers(&b.bbox, &d.bbox)
-                && (same_object(&key_of(&b.label, wanted), &d.key)
+                && ((same_object(&key_of(&b.label, wanted), &d.key) && covers(&b.bbox, &d.bbox))
                     // A quick check's model calls an object of a class it does not have by
-                    // another name: a label of such a class explains a detection it covers.
-                    || wanted.class_of(&b.label).is_some_and(|c| !ctx.knows(c)))
+                    // another name: a label of such a class explains a detection on that same
+                    // box, never a smaller object in or beside it.
+                    || (wanted.class_of(&b.label).is_some_and(|c| !ctx.knows(c))
+                        && iou(&b.bbox, &d.bbox) >= UNKNOWN_CLASS_COVER_IOU))
         });
         let blocked = f.boxes.iter().any(|b| {
             b.state == BoxState::Rejected
@@ -1113,6 +1119,46 @@ mod tests {
                 .starts_with("mine (never trained on this frame) sees a person here"),
             "{j:?}"
         );
+    }
+
+    #[test]
+    fn a_label_of_a_class_the_model_lacks_hides_only_a_detection_of_its_own_box() {
+        // A model of person and car; the list also wants truck and dog.
+        let has = ["person", "car"];
+        let truck = [100.0, 50.0, 500.0, 400.0];
+        // A person standing in front of the truck: wholly inside its box, IoU small.
+        let person = [150.0, 150.0, 200.0, 300.0];
+        assert!(iou(&truck, &person) < 0.1 && inside_share(&person, &truck) > 0.99);
+        let f = reviewed(vec![acc("truck", truck)]);
+        let j = run_model(&f, &[det("person", person, 0.9)], &has);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+        assert_eq!(j.suggestions[0].label.as_deref(), Some("person"));
+        // The same for an unsure (ignore) region of such a class.
+        let mut unsure = acc("truck", truck);
+        unsure.difficult = true;
+        let j = run_model(&reviewed(vec![unsure]), &[det("person", person, 0.9)], &has);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+        // A detection about a dog label's own box (the model, without dogs, calls it a person):
+        // no add, on a label or an unsure region alike.
+        let dog = [100.0, 50.0, 500.0, 400.0];
+        let on_it = [110.0, 60.0, 500.0, 400.0];
+        assert!(iou(&dog, &on_it) >= 0.9);
+        let d = reviewed(vec![acc("dog", dog)]);
+        let j = run_model(&d, &[det("person", on_it, 0.9)], &has);
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        let mut unsure_dog = acc("dog", dog);
+        unsure_dog.difficult = true;
+        let j = run_model(
+            &reviewed(vec![unsure_dog]),
+            &[det("person", on_it, 0.9)],
+            &has,
+        );
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        // Under the cut (although half of it and more lies inside the dog's box): another object.
+        let part = [100.0, 50.0, 290.0, 400.0];
+        assert!(iou(&dog, &part) < UNKNOWN_CLASS_COVER_IOU && covers(&dog, &part));
+        let j = run_model(&d, &[det("person", part, 0.9)], &has);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
     }
 
     #[test]

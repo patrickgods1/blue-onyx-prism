@@ -36,6 +36,10 @@ pub struct Detections {
     pub device: String,
     /// The cancel flag stopped the run: `frames` holds the frames finished before it.
     pub cancelled: bool,
+    /// Seconds before the first frame: the runtime, and the model's read, compile and warm-up
+    /// (the benchmark's `compile_ms` + `warmup_ms`). None when not measured (a cancelled run, a
+    /// fake).
+    pub load_s: Option<f64>,
 }
 
 /// Runs a model of the config over frames.
@@ -102,6 +106,7 @@ impl Detector for LocalDetector {
         if images.is_empty() {
             return Ok(Detections::default());
         }
+        let t0 = std::time::Instant::now();
         let model = m.effective_name();
         let job = crate::benchmark::job_for_config(config, m, device)?;
         let set = ImageSet {
@@ -148,12 +153,14 @@ impl Detector for LocalDetector {
         };
         bench.on_image = Some(&sink);
         let rt = self.runtimes()?;
+        let before_run = t0.elapsed().as_secs_f64();
         let run = match bench.run(&rt, &job, &job.device) {
             Err(e) if crate::benchmark::is_cancelled(&e) => {
                 return Ok(Detections {
                     frames: finished.into_inner().unwrap_or_else(|p| p.into_inner()),
                     device: String::new(),
                     cancelled: true,
+                    load_s: None,
                 });
             }
             r => r.with_context(|| format!("running {model} on the frames"))?,
@@ -165,6 +172,9 @@ impl Detector for LocalDetector {
                 images.len()
             );
         }
+        // Everything before the first frame: the runtime above, then the benchmark's own
+        // measure of the model's load (read, compile, request) and warm-up.
+        let load_s = before_run + (run.compile_ms + run.warmup_ms) / 1000.0;
         let device = if run.spec.is_empty() {
             run.device.clone()
         } else {
@@ -182,6 +192,7 @@ impl Detector for LocalDetector {
             frames,
             device,
             cancelled: false,
+            load_s: Some(load_s),
         })
     }
 }

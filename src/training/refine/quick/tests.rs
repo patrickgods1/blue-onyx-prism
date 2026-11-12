@@ -606,6 +606,7 @@ fn the_preview_counts_only_the_frames_it_would_check() {
         },
     );
     last.predict_s_per_frame = Some(0.05);
+    last.predict_load_s = Some(45.0);
     assert_eq!(quick_seconds(4, "mine", Some(&last)).1, TimeBasis::Guess);
     last.mode = Mode::Model;
     last.model = Some(ModelInfo {
@@ -614,8 +615,19 @@ fn the_preview_counts_only_the_frames_it_would_check() {
     });
     let (s, b) = quick_seconds(4, "mine", Some(&last));
     assert_eq!(b, TimeBasis::LastCheck);
-    assert!((s - 0.2).abs() < 1e-9);
+    assert!((s - (45.0 + 0.2)).abs() < 1e-9, "{s}");
     assert_eq!(quick_seconds(4, "other", Some(&last)).1, TimeBasis::Guess);
+    // The load once, the frames each: a 45 s compile measured over 3 frames does not make 3,000
+    // frames 12.5 h, and many frames are not one load per frame.
+    last.predict_s_per_frame = Some(0.1);
+    let (s, _) = quick_seconds(3000, "mine", Some(&last));
+    assert!((s - (45.0 + 300.0)).abs() < 1e-9, "{s}");
+    let (s, _) = quick_seconds(3, "mine", Some(&last));
+    assert!((s - 45.3).abs() < 1e-9, "{s}");
+    // A report without the load beside its time per frame (the first quick checks' held the load
+    // in it) is no measure.
+    last.predict_load_s = None;
+    assert_eq!(quick_seconds(3000, "mine", Some(&last)).1, TimeBasis::Guess);
     // Warnings: the same-day frame, the missing class, the by-name note, the closer look.
     let joined = p.warnings.join("\n");
     assert!(joined.contains("1 of the 4 frames mine never saw are of camera days it trained"));
@@ -734,6 +746,7 @@ impl FoldPredictor for ModelFake {
                 .collect(),
             device: "openvino:cpu".into(),
             cancelled: false,
+            load_s: Some(0.004),
         })
     }
 }
@@ -878,11 +891,11 @@ fn a_quick_check_writes_only_the_frames_it_never_saw_and_nothing_else() {
             assert!(l.refine.contains(&dismissed), "the answered one stays");
         }
     }
-    // The only new file is the report, of a quick check.
+    // The only new file is the quick check's report (the full check's report.json is its own).
     let new_files: Vec<&PathBuf> = after.keys().filter(|p| !before.contains_key(*p)).collect();
-    assert_eq!(new_files, [&PathBuf::from("refine").join("report.json")]);
-    let r: RefineReport =
-        serde_json::from_slice(&after[&PathBuf::from("refine").join("report.json")]).unwrap();
+    let quick_file = PathBuf::from("refine").join("report-quick.json");
+    assert_eq!(new_files, [&quick_file]);
+    let r: RefineReport = serde_json::from_slice(&after[&quick_file]).unwrap();
     assert_eq!(r.mode, Mode::Model);
     assert_eq!((r.folds, r.folds_done), (0, 0));
     assert_eq!((r.frames_selected, r.frames_checked), (4, 4));
@@ -896,8 +909,17 @@ fn a_quick_check_writes_only_the_frames_it_never_saw_and_nothing_else() {
         r.recall.boxes, 4,
         "the recall covers the checked frames only"
     );
-    assert!(r.predict_s_per_frame.is_some());
+    // The load (what the predictor measured) apart from the time per frame.
+    assert_eq!(r.predict_load_s, Some(0.004));
+    let per = r.predict_s_per_frame.unwrap();
+    assert!(per > 0.0 && per < 1.0, "{per}");
     assert!(r.warnings.iter().any(|w| w.contains("does not detect dog")));
+    // The fixture's record has no hash: said, not refused.
+    assert!(
+        r.warnings.iter().any(|w| w.contains("names no hash")),
+        "{:?}",
+        r.warnings
+    );
     // The data root: models, training runs and the config untouched; no work folder left.
     assert_eq!(watched(&f.root), kept);
     assert!(!job.work.exists());
@@ -985,7 +1007,20 @@ fn the_models_list_has_those_trained_here_and_says_why_others_cannot_be_used() {
         r#"{"run_id":"20260101-000000-dead","recipe":{"imgsz":640}}"#,
     )
     .unwrap();
+    std::fs::write(f.root.join("models").join("gone.onnx"), b"onnx").unwrap();
     c.models.push(gone);
+    // A record and its run, but the model file is gone.
+    let models_dir = f.root.join("models");
+    std::fs::copy(
+        models_dir.join("mine.provenance.json"),
+        models_dir.join("lost.provenance.json"),
+    )
+    .unwrap();
+    c.models.push(ModelConfig {
+        name: Some("lost".into()),
+        path: PathBuf::from("models").join("lost.onnx"),
+        ..ModelConfig::default()
+    });
     let (ok, bad) = models(&c);
     assert_eq!(ok.len(), 1);
     assert_eq!(
@@ -993,18 +1028,160 @@ fn the_models_list_has_those_trained_here_and_says_why_others_cannot_be_used() {
         ("mine", RUN, 384)
     );
     assert_eq!(ok[0].recipe, "rfdetr-nano");
-    assert_eq!(bad.len(), 1);
+    assert_eq!(bad.len(), 2);
     assert_eq!(bad[0].name, "gone");
     assert!(
         bad[0].why.contains("whose folder is gone"),
         "{}",
         bad[0].why
     );
+    assert_eq!(bad[1].name, "lost");
+    assert!(
+        bad[1].why.contains("model file") && bad[1].why.contains("lost.onnx"),
+        "{}",
+        bad[1].why
+    );
+    // The plan refuses it naming the file; the preview says the same as a refusal.
+    let req = RefineRequest {
+        model: Some("lost".into()),
+        ..RefineRequest::default()
+    };
+    let e = format!("{:#}", plan_refine(&c, req.clone(), &host()).unwrap_err());
+    assert!(e.contains("lost.onnx") && e.contains("is missing"), "{e}");
+    let p = super::super::preview(&c, &req, &host()).unwrap();
+    assert!(p.refused.unwrap().contains("lost.onnx"));
     let v = serde_json::to_value(&ok[0]).unwrap();
     assert!(v.get("created").is_none(), "{v}");
     // An unknown name names the usable ones.
     let e = no_model(&c, "x").to_string();
     assert!(e.contains("models trained here: mine"), "{e}");
+}
+
+/// Set (or with None, drop) `onnx_sha256` in `mine`'s training record.
+fn set_hash(root: &Path, hash: Option<&str>) {
+    let record = root.join("models").join("mine.provenance.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+    let o = v.as_object_mut().unwrap();
+    match hash {
+        Some(h) => o.insert("onnx_sha256".into(), h.into()),
+        None => o.remove("onnx_sha256"),
+    };
+    std::fs::write(&record, v.to_string()).unwrap();
+}
+
+#[test]
+fn a_model_file_that_is_not_the_one_its_run_produced_is_refused() {
+    let f = fixture("hash", false);
+    let c = config(&f);
+    let req = RefineRequest {
+        model: Some("mine".into()),
+        ..RefineRequest::default()
+    };
+    let onnx = f.root.join("models").join("mine.onnx");
+    let right = crate::resources::manager::sha256_file(&onnx).unwrap();
+    // The record's hash is the file's (in upper case too): planned, no warning about it.
+    set_hash(&f.root, Some(&right.to_ascii_uppercase()));
+    let l = locate(&c, &entry()).unwrap();
+    assert_eq!(check_weights(&l).unwrap(), None);
+    plan_refine(&c, req.clone(), &host()).unwrap();
+    let p = super::super::preview(&c, &req, &host()).unwrap();
+    assert!(p.refused.is_none(), "{:?}", p.refused);
+    assert!(!p.warnings.join("\n").contains("hash"), "{:?}", p.warnings);
+    // The file replaced since: refused at plan and preview time, never by the models list.
+    std::fs::write(&onnx, b"another model").unwrap();
+    let e = format!("{:#}", plan_refine(&c, req.clone(), &host()).unwrap_err());
+    assert!(
+        e.contains("is not the file training run")
+            && e.contains(RUN)
+            && e.contains("the frames it trained on are unknown"),
+        "{e}"
+    );
+    let p = super::super::preview(&c, &req, &host()).unwrap();
+    assert!(
+        p.refused
+            .as_deref()
+            .unwrap()
+            .contains("is not the file training run"),
+        "{:?}",
+        p.refused
+    );
+    assert_eq!(models(&c).0.len(), 1, "the list never hashes");
+    // No hash in the record: a warning, not a refusal.
+    set_hash(&f.root, None);
+    let job = plan_refine(&c, req.clone(), &host()).unwrap();
+    let w = job.quick.unwrap().weights_warning.unwrap();
+    assert!(w.contains("names no hash"), "{w}");
+    let p = super::super::preview(&c, &req, &host()).unwrap();
+    assert!(p.refused.is_none());
+    assert!(p.warnings.contains(&w));
+}
+
+#[test]
+fn listed_names_that_are_no_frame_names_are_counted_and_lists_naming_no_frame_refuse() {
+    let f = fixture("odd", false);
+    let c = config(&f);
+    let data = f.root.join("training").join(RUN).join("data");
+    let req = RefineRequest {
+        model: Some("mine".into()),
+        ..RefineRequest::default()
+    };
+    let seen = seen_of(&c, &entry()).unwrap();
+    assert_eq!((seen.odd_names, seen.listed()), (0, 3));
+    // Hand-made names beside the app's: two with a prefix, one without; a public set's image
+    // (s1 in dataset.json) is not counted; a cut name is no odd name.
+    let mut t = std::fs::read_to_string(data.join("train.txt")).unwrap();
+    t.push_str("./images/s0-IMG_0001.jpg\n./images/frame_17.jpg\n./images/s1-000000123456.jpg\n");
+    t.push_str(&format!(
+        "./images/{}\n",
+        "s0-".to_string() + &"y".repeat(117)
+    ));
+    std::fs::write(data.join("train.txt"), &t).unwrap();
+    let mut v = std::fs::read_to_string(data.join("valid.txt")).unwrap();
+    v.push_str("./images/s0-IMG_0002.jpg\n");
+    std::fs::write(data.join("valid.txt"), &v).unwrap();
+    let summary = data.join("dataset.json");
+    let mut s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&summary).unwrap()).unwrap();
+    s["sources"] = serde_json::json!([
+        {"dir": "/x", "kind": "review", "license": "", "frames": 9, "used_train": 2, "used_heldout": 1},
+        {"dir": "/y", "kind": "train-data:lila-night", "license": "", "frames": 9, "used_train": 1, "used_heldout": 0},
+    ]);
+    std::fs::write(&summary, s.to_string()).unwrap();
+    let seen = seen_of(&c, &entry()).unwrap();
+    assert_eq!((seen.odd_names, seen.listed()), (3, 8));
+    let p = super::super::preview(&c, &req, &host()).unwrap();
+    assert!(p.refused.is_none(), "{:?}", p.refused);
+    let w = p
+        .warnings
+        .iter()
+        .find(|w| w.contains("do not carry this program's frame names"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(w.starts_with("3 of the 8 images in run "), "{w}");
+    // Lists that name no reviewed frame of the folder at all (a run on renamed copies): refused,
+    // even under a frame filter that leaves out every frame it did see.
+    for list in ["train.txt", "valid.txt"] {
+        std::fs::write(data.join(list), "./images/s0-IMG_0003.jpg\n").unwrap();
+    }
+    let p = super::super::preview(&c, &req, &host()).unwrap();
+    let why = p.refused.unwrap();
+    assert!(
+        why.contains("none of the 2 images mine trained or validated on is a reviewed frame")
+            && why.contains("the safe side"),
+        "{why}"
+    );
+    let e = format!("{:#}", plan_refine(&c, req.clone(), &host()).unwrap_err());
+    assert!(e.contains("cannot tell which frames it saw"), "{e}");
+    // A frame filter that leaves out the frames it saw does not make the lists look foreign.
+    let line = |rel: &String| format!("./images/s0-{}\n", flat(rel));
+    std::fs::write(data.join("train.txt"), line(&f.rels["trained"][0])).unwrap();
+    let filtered = RefineRequest {
+        frames: RefineFrames::parse("camera=delta").unwrap(),
+        ..req
+    };
+    let p = super::super::preview(&c, &filtered, &host()).unwrap();
+    assert!(p.refused.is_none(), "{:?}", p.refused);
+    assert_eq!(p.frames, 2);
 }
 
 /// The quick check's preview on a copy of a real dataset, read only (no GPU, nothing written):
@@ -1049,6 +1226,21 @@ fn quick_preview_real_on_a_copy() {
                 seen.valid.len(),
                 seen.train_boxes
             );
+            println!(
+                "listed images without this program's frame names: {} of {}",
+                seen.odd_names,
+                seen.listed()
+            );
+            let hashed = std::time::Instant::now();
+            match check_weights(l) {
+                Ok(None) => println!(
+                    "model file {} matches the record's onnx_sha256 ({:.1} s)",
+                    l.model_file.display(),
+                    hashed.elapsed().as_secs_f64()
+                ),
+                Ok(Some(w)) => println!("model file not checked: {w}"),
+                Err(e) => println!("model file refused: {e:#}"),
+            }
         }
         Err(e) => println!("refused: {e:#}"),
     }

@@ -440,6 +440,7 @@ mod tests {
             frames: BTreeMap::new(),
             device: String::new(),
             cancelled: false,
+            load_s: None,
         };
         found.frames.insert(
             rel.clone(),

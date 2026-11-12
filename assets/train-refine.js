@@ -4,7 +4,8 @@
 // sent then), previews (GET /v1/refine/preview) and starts (POST /v1/refine/check) a check and follows it
 // through PrismPoll on GET /v1/train/jobs?tasks=busy (every 3 s while one is listed, every 30 s
 // while none is, so a check started elsewhere shows up), with Pause / Resume / Cancel posted to the
-// queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (the report, the
+// queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (each mode's last
+// report: `report` of the full check, `quick_report` of the quick one, RefineFloor.reports; the
 // open suggestions per kind) and read again when a check ends. The check changes no box, so
 // nothing here confirms a box: Review does. The one question asked here is whether a start may
 // replace the open suggestions of the frames it checks (inline, after the server's 409). The
@@ -135,6 +136,10 @@
     // A person recall whose interval ends under this (its upper bound) is missed for sure, not
     // by chance: even the best case is below 70%.
     MISSED_RECALL_HIGH: 0.7,
+    // Share of a row's reviewed frames with a vehicle box (`vehicle_frames`, frames, never boxes)
+    // from which "no empty frames" means a parked vehicle is in about every frame, not that none
+    // were reviewed.
+    VEHICLE_FRAME_SHARE: 0.9,
     // The Review link of a row's unreviewed person frames: the page's own filters (unreviewed,
     // all collected frames, the row's scene and camera, class person), which list the same
     // frames the row counts.
@@ -156,8 +161,9 @@
       }
       if ((row.reviewed || 0) > 0 && !(row.empty > 0)) {
         // A camera whose every frame shows a parked vehicle cannot have an empty frame: say so
-        // instead of asking for the impossible.
-        out.push((row.vehicles || 0) >= row.reviewed
+        // instead of asking for the impossible. Frames with a vehicle against reviewed frames
+        // (five cars on two frames are still two frames).
+        out.push((row.vehicle_frames || 0) >= api.VEHICLE_FRAME_SHARE * row.reviewed
           ? 'No empty frames: about every frame here shows a vehicle, so false alerts on empty frames cannot be measured on this camera'
           : 'No empty frames: review some frames with nothing in them');
       }
@@ -172,11 +178,33 @@
       var n = row.empty || 0, c = row.empty_confirmed || 0;
       return c > 0 ? n + " (" + c + " confirmed)" : String(n);
     },
-    // Who the table's recall columns are of (`r` = the last report, or null): the same words as the
-    // recall table above, so a quick check's recall reads as covering only the frames its model never saw.
+    // Who the table's recall columns are of (`r` = the report the recall comes from, or null): the
+    // same words as the recall table above, so a quick check's recall reads as covering only the
+    // frames its model never saw.
     thinRecallNote: function (r) {
       if (!r) return 'No check has run yet, so the recall columns show "-".';
       return api.recallOf(r) + '. Vehicles are car, truck, bus, van, motorcycle and bicycle together.';
+    },
+    // GET /v1/refine keeps each mode's last report: `report` (the full check's, report.json) and
+    // `quick_report` (report-quick.json). `latest`: the newer of the two (the Findings card's);
+    // `other`: the older one, when there is one; `recall`: the one the recall tables are drawn
+    // from (the full check's when there is one: its whole-folder recall and recall by size are
+    // what a floor is chosen from; else the quick check's).
+    reports: function (state) {
+      var full = (state && state.report) || null, quick = (state && state.quick_report) || null;
+      var quickNewer = !!quick && (!full || String(quick.created || '') > String(full.created || ''));
+      return {
+        latest: quickNewer ? quick : full,
+        other: quickNewer ? full : quick,
+        recall: full || quick
+      };
+    },
+    // The line under the Findings header naming the other mode's last report (`when`: its time as
+    // the page prints it); '' without one.
+    otherLine: function (other, when) {
+      if (!other) return '';
+      return (other.mode === 'model' ? 'Last quick check: ' : 'Last full check: ') + when +
+        ' (its suggestions are counted above with the others).';
     }
   };
   globalThis.RefineFloor = api;
@@ -549,12 +577,14 @@
   function drawFindings(state) {
     var box = $('refine-findings-body');
     clear(box);
-    var r = state.report, open = state.open;
+    var picked = RefineFloor.reports(state);
+    var r = picked.latest, open = state.open;
     if (state.folder_missing) {
       box.appendChild(el('p', 'error', state.message || 'The folder under review is not available.'));
       return;
     }
     if (state.report_problem) box.appendChild(el('p', 'error', state.report_problem));
+    if (state.quick_report_problem) box.appendChild(el('p', 'error', state.quick_report_problem));
     if (state.last && state.last.state === 'failed' && state.last.error && !state.job) {
       box.appendChild(el('p', 'error', 'The last check failed: ' + state.last.error));
     }
@@ -563,6 +593,9 @@
       box.appendChild(el('p', 'muted', 'No check has run on this dataset yet. Start one above; its findings appear here.'));
     } else {
       box.appendChild(el('p', null, RefineFloor.lastLine(r, when(r.created))));
+      if (picked.other) {
+        box.appendChild(el('p', 'muted small', RefineFloor.otherLine(picked.other, when(picked.other.created))));
+      }
     }
     if (r || total) {
       var wrap = el('div', 'scroll');
@@ -588,7 +621,7 @@
       box.appendChild(wrap);
       box.appendChild(el('p', 'muted small', 'Open: suggestions nobody answered yet and that still fit the frame' +
         (open ? ' (' + plural(open.frames, 'frame', 'frames') + ').' : '.') +
-        ' Nothing changes until you confirm one on the Review tab.'));
+        ' Nothing changes until you confirm one on the Review tab. Counts refresh within a minute.'));
     }
     if (r) {
       box.appendChild(el('p', null, RefineFloor.looseLine(r)));
@@ -630,9 +663,9 @@
 
   function drawCoverage(state) {
     var box = $('refine-coverage-body');
-    lastReport = state.report || null;
+    var r = RefineFloor.reports(state).recall;
+    lastReport = r;
     clear(box);
-    var r = state.report;
     if (!r) {
       box.appendChild(el('p', 'muted', 'No check has run yet. After one, this shows how often a model that never saw a camera day found the objects you labelled there.'));
       return;
@@ -661,7 +694,8 @@
   }
 
   // "Where the data is thin" (GET /v1/refine/coverage): a camera x scene row per place of the folder
-  // under review, with the counts, the last check's recall there and what to do (RefineFloor).
+  // under review, with the counts, the recall there (the full check's report, else the quick
+  // check's: RefineFloor.reports) and what to do (RefineFloor).
   // Everything from the server goes in through textContent; the one link is built from the row's
   // own names by RefineFloor.coverageUrl.
   var lastReport = null;
@@ -725,7 +759,7 @@
     table.appendChild(body);
     wrap.appendChild(table);
     box.appendChild(wrap);
-    box.appendChild(el('p', 'muted small', 'Boxes are the accepted labels of reviewed frames (unsure and too-small objects left out, hidden classes not counted). Unreviewed with a person: unreviewed frames holding a person box nobody rejected; the number opens them in Review.'));
+    box.appendChild(el('p', 'muted small', 'Boxes are the accepted labels of reviewed frames (unsure and too-small objects left out, hidden classes not counted). Unreviewed with a person: unreviewed frames with a person nobody rejected (a proposal, or the detection of a frame nobody opened yet); the number opens them in Review. Counts refresh within a minute.'));
   }
   function loadThin() {
     return getJson('/v1/refine/coverage')
@@ -742,7 +776,7 @@
   function drawSizeRecall(state) {
     var box = $('refine-floor-recall');
     clear(box);
-    var r = state.report;
+    var r = RefineFloor.reports(state).recall;
     var sizes = r ? (r.recall_by_size || []) : [];
     if (!sizes.length) {
       box.appendChild(el('p', 'muted small', 'After a dataset check, this shows how often a model that never saw the camera day found objects of each size.'));
@@ -766,6 +800,13 @@
   var fullCan = true;
   var fullWhy = '';
 
+  // A preview or the replace question describes the model chosen when it was asked: when the
+  // choice changes, for any reason, they go.
+  function choiceChanged() {
+    $('refine-preview').hidden = true;
+    hideConfirm();
+  }
+
   function fillModels(cap) {
     var select = $('refine-model');
     var keep = select.value;
@@ -778,6 +819,8 @@
       select.appendChild(o);
     });
     if (keep && quickModels.some(function (m) { return m.name === keep; })) select.value = keep;
+    // The chosen model went (a reload of the list): the select now shows another one, or none.
+    if (keep && select.value !== keep) choiceChanged();
     var note = $('refine-model-note');
     var bad = cap.unusable || [];
     var text = quickModels.length
@@ -814,9 +857,9 @@
   }
 
   Array.prototype.forEach.call(form.querySelectorAll('input[name="check_mode"]'), function (r) {
-    r.addEventListener('change', function () { applyMode(); $('refine-preview').hidden = true; });
+    r.addEventListener('change', function () { applyMode(); choiceChanged(); });
   });
-  $('refine-model').addEventListener('change', function () { $('refine-preview').hidden = true; });
+  $('refine-model').addEventListener('change', choiceChanged);
 
   // ---- static objects
 

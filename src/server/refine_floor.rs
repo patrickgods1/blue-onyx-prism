@@ -29,7 +29,7 @@
 //!   pending. A dry run counts what an apply on the unchanged folder does; at most `limit` frames
 //!   (500) are written per call.
 
-use super::refine::{fail, forget_counts, json_body, read_report};
+use super::refine::{fail, forget_counts, json_body, recall_report};
 use super::review::{push_failed, push_past_limit};
 use super::{AppState, blocking, save_config, training};
 use crate::collect::labels::SizeFloor;
@@ -216,11 +216,12 @@ impl Cache {
 // ---------------------------------------------------------------------------------------------
 // GET /v1/refine/floor
 
-/// The input size and where it came from: the last check's recipe, else the newest finished
-/// training run's, else [`SUGGESTED_INPUT`].
+/// The input size and where it came from: the recipe of the check whose recall the cards show
+/// (the full check's, else the quick check's, [`recall_report`]), else the newest finished training
+/// run's, else [`SUGGESTED_INPUT`].
 fn suggested_input(state: &AppState, dir: &Path) -> (u32, &'static str) {
     let ok = |n: u32| (MIN_FLOOR_INPUT..=MAX_FLOOR_INPUT).contains(&n);
-    if let (Some(r), _) = read_report(dir)
+    if let Some(r) = recall_report(dir)
         && ok(r.recipe.imgsz)
     {
         return (r.recipe.imgsz, "last_check");

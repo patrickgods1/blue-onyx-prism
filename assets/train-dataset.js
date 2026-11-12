@@ -1,6 +1,7 @@
-// The export card's line about the dataset check's open suggestions (GET /v1/refine `open`, the
-// counts that route already keeps for 60 s; nothing is walked here): pure, node-tested
-// (tests/it/js_rules.rs), `globalThis.DatasetOpen`.
+// The export card's line about the dataset check's open suggestions (GET /v1/refine `open`: a walk
+// of the folder's label files that route keeps 60 s, so a load within the minute walks nothing
+// and a save shows within it; the route also reads both reports and the trained models' list,
+// kept a few seconds): pure, node-tested (tests/it/js_rules.rs), `globalThis.DatasetOpen`.
 (function () {
   'use strict';
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
@@ -274,9 +275,10 @@
     }).catch(function () { catalog = null; }).then(initPicker);
   }
 
-  // The dataset check's open suggestions, before the Export button: one read of GET /v1/refine (its
-  // counts are kept 60 s there, so this walks nothing new). Nothing is shown for none, an
-  // unavailable folder or a failed read: the line only warns.
+  // The dataset check's open suggestions, before the Export button: one read of GET /v1/refine
+  // (its counts are kept 60 s there: the first load in a minute walks the label files, later
+  // ones within it do not). Nothing is shown for none, an unavailable folder or a failed read:
+  // the line only warns.
   (function () {
     var line = $('export-open');
     if (!line || !window.DatasetOpen) return;

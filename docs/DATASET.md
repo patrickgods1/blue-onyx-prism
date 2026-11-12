@@ -36,7 +36,8 @@ folder. Nothing is uploaded anywhere.
 <dir>/                                   collect.dir, default <data root>/dataset
   review-queue.jsonl                     frames sent to review (the review page consumes it)
   spots/<camera>.json                    parked spots of the camera (below, Review labels: Spots)
-  refine/report.json                     report of the last dataset check, full or quick (`mode`; TRAINING.md, Dataset check)
+  refine/report.json                     report of the last full dataset check (TRAINING.md, Dataset check)
+  refine/report-quick.json               report of the last quick check (`mode: model`; each mode keeps its own)
   <scene>/                               day | night | ir (src/image_stats.rs)
     <camera>/                            camera folder (see below)
       <YYYY-MM-DD>/                      UTC date

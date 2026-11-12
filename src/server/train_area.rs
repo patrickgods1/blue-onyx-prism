@@ -716,16 +716,18 @@ struct DatasetTabTemplate {
     size_floor_line: Option<String>,
 }
 
-/// The export card's line about the saved size floor (`collect.size_floor`): an export leaves the
-/// objects under it out of the labels (they become ignore regions). None for no floor or one that
-/// is off. The pixels print as the Refine tab prints them (`RefineFloor.phrase`): two decimals at
-/// most, the f32's tail dropped.
+/// The export card's line about the saved size floor (`collect.size_floor`): an export writes the
+/// objects under it as ignore regions (X-AnyLabeling keeps them as boxes). None for no floor or
+/// one that is off. The pixels print as the Refine tab prints them (`RefineFloor.phrase`): two
+/// decimals at most, the f32's tail dropped.
 fn size_floor_line(floor: Option<crate::collect::labels::SizeFloor>) -> Option<String> {
     let f = floor.filter(crate::collect::labels::SizeFloor::is_on)?;
     let px = format!("{:.2}", f.px);
     let px = px.trim_end_matches('0').trim_end_matches('.');
     Some(format!(
-        "Size floor: objects under {px} px at {} are left out of the labels of this export.",
+        "Size floor: objects under {px} px at {} are exported as ignore regions (out of the YOLO \
+         labels, listed in ignore.json, marked difficult in COCO), while the X-AnyLabeling format \
+         keeps them as boxes.",
         f.input
     ))
 }
@@ -1168,7 +1170,9 @@ mod tests {
         assert_eq!(
             line(10.0, 384).as_deref(),
             Some(
-                "Size floor: objects under 10 px at 384 are left out of the labels of this export."
+                "Size floor: objects under 10 px at 384 are exported as ignore regions (out of the \
+                 YOLO labels, listed in ignore.json, marked difficult in COCO), while the \
+                 X-AnyLabeling format keeps them as boxes."
             )
         );
         // The f32's tail is dropped, as the Refine tab prints it.
@@ -1216,7 +1220,9 @@ mod tests {
             .unwrap();
         assert!(at < button);
         assert!(html.contains(
-            "Size floor: objects under 10 px at 384 are left out of the labels of this export."
+            "Size floor: objects under 10 px at 384 are exported as ignore regions (out of the \
+             YOLO labels, listed in ignore.json, marked difficult in COCO), while the \
+             X-AnyLabeling format keeps them as boxes."
         ));
         assert!(html.contains("/static/train-dataset.js?v="));
     }

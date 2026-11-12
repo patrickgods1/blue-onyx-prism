@@ -336,6 +336,7 @@ impl FoldPredictor for PredictorFake {
                 .collect(),
             device: "ort:cuda".into(),
             cancelled: false,
+            load_s: None,
         })
     }
 }
@@ -2161,6 +2162,7 @@ fn the_dump_writes_a_line_per_frame_and_appends() {
         frames: BTreeMap::from([("ir/alpha/2026-10-21/a.jpg".to_string(), Vec::new())]),
         device: String::new(),
         cancelled: true,
+        load_s: None,
     };
     let b = DumpPredictor::lines(&model, &a, 0.05, &found).unwrap();
     assert_eq!(String::from_utf8(b).unwrap().lines().count(), 1);
@@ -2274,6 +2276,7 @@ fn read_dump(path: &Path) -> (Detections, usize) {
             frames,
             device: "replay".into(),
             cancelled: false,
+            load_s: None,
         },
         again,
     )

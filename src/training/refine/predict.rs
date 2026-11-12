@@ -118,16 +118,21 @@ impl FoldPredictor for LocalPredictor {
         threshold: f32,
         cancel: &AtomicBool,
     ) -> Result<Detections> {
+        // The runtimes (made on the first call of a CLI check) count toward the model's load.
+        let t0 = std::time::Instant::now();
         let detector = LocalDetector {
             config: self.config.clone(),
             runtimes: Some(self.runtimes()?),
         };
+        let runtimes_s = t0.elapsed().as_secs_f64();
         let entry = model_entry(model);
-        skipping_unreadable(
+        let mut d = skipping_unreadable(
             images,
             &mut |imgs| detector.detect(&self.config, &entry, None, imgs, threshold, cancel),
             &readable,
-        )
+        )?;
+        d.load_s = d.load_s.map(|l| l + runtimes_s);
+        Ok(d)
     }
 }
 
@@ -283,6 +288,7 @@ mod tests {
                 frames: imgs.iter().map(|i| (i.frame.clone(), Vec::new())).collect(),
                 device: "ort:cpu".into(),
                 cancelled: false,
+                load_s: None,
             })
         };
         let d = skipping_unreadable(&images, &mut detect, &readable).unwrap();

@@ -475,8 +475,9 @@ pub enum TimeBasis {
     /// The generic training estimate ([`super::estimate::estimate`]), or a quick check's guess
     /// ([`quick::QUICK_S_PER_FRAME`]): a rough guess.
     Guess,
-    /// A quick check: what the last quick check with the same model measured per frame
-    /// ([`report::RefineReport::predict_s_per_frame`]).
+    /// A quick check: what the last quick check with the same model measured, its load once and
+    /// its time per frame ([`report::RefineReport::predict_load_s`],
+    /// [`report::RefineReport::predict_s_per_frame`]).
     LastCheck,
 }
 
@@ -788,6 +789,19 @@ pub fn select(
     k: usize,
     min_frames: usize,
 ) -> Selected {
+    select_parts(dataset_dir, classes, hidden, filter, k, min_frames).0
+}
+
+/// [`select`], and the exportable reviewed frames its frame filter left out (a quick check asks
+/// whether its model's lists name any frame of the folder at all, filter or not).
+pub(crate) fn select_parts(
+    dataset_dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    filter: &RefineFrames,
+    k: usize,
+    min_frames: usize,
+) -> (Selected, Vec<ExportFrame>) {
     let sel = export::reviewed_frames_filtered(
         dataset_dir,
         classes,
@@ -830,7 +844,7 @@ pub fn select(
             out.left_out.filtered,
         ));
     }
-    out
+    (out, filtered)
 }
 
 /// One fold of a [`RefinePreview`].

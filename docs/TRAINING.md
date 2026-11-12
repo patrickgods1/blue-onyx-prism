@@ -2117,8 +2117,10 @@ and `dismiss`, compared in `tests/it/js_rules.rs`) and saves the file as usual: 
 the file a save checks (`refine::check`) and keeps; a check that wrote the frame meanwhile makes the save a
 409 like any other write. A big folder answers `auto=refine` from the review index like the other filters.
 
-**The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each check;
-the dataset walkers and retention do not look in `refine/`). Fields: `version`, `run`, `created`,
+**The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each full
+check; a [quick check](#quick-check-with-a-model) writes its own `refine/report-quick.json`, so each mode keeps
+its last report and neither replaces the other; the dataset walkers and retention do not look in
+`refine/`). Fields: `version`, `run`, `created`,
 `cancelled`, `folds`, `folds_done`, `recipe` (`model`, `imgsz`, `epochs`, `batch`, `from`), `camera_days`,
 `frames_selected`, `frames_checked`, `left_out` (`pending`, `off_class_list`, `lost`, `unreadable`,
 `unreadable_folders`, `filtered`), `written` and `found` (`add`, `verify`, `relabel`, `tighten`; `tighten`
@@ -2138,12 +2140,16 @@ reports), `ignore_mode` (`training.ignore` the fold models trained with; absent 
 quick checks), `mode` (`folds`, or `model` for a [quick check](#quick-check-with-a-model); absent in earlier
 reports, read as `folds`), `model` (a quick check's: `name`, `run`, `recipe`, `imgsz`, `trained_on`,
 `validated_on`, `same_day`, `classes_missing`, `by_source`, `device`; absent for fold models),
-`predict_s_per_frame` (seconds the detections took per frame, model loading included: a later quick
-check's time estimate; absent in earlier reports) and `warnings`. Each recall has `boxes`,
+`predict_s_per_frame` (seconds the detections took per frame, the model's load not included: reading and
+decoding the frame and the model's pass), `predict_load_s` (seconds a model took before its first frame:
+the runtime, and the read, compile and warm-up the benchmark pipeline measures as `compile_ms` +
+`warmup_ms`, averaged over the models that ran; both absent in earlier reports; together a later quick
+check's time estimate) and `warnings`. Each recall has `boxes`,
 `found`, `recall` and a Wilson 95% interval (`low`, `high`): how often a fold model found the labelled
 objects of days it never saw, at score 0.3 and IoU 0.5 (in a quick check: how often its model found the
-labelled objects of the frames it never saw). `REPORT_VERSION` stays 1: the new fields are optional, so a
-build from before reads a quick check's report as a full one (it shows the counts, not the mode).
+labelled objects of the frames it never saw). `REPORT_VERSION` stays 1: the new fields are optional. A
+`report.json` with `mode: model` (written by the first builds of the quick check, never released) reads
+as what it says.
 
 **Frames and recipe.** Every reviewed frame of the folder under review that can be exported (reviewed
 frames with pending boxes or labels off the class list are left out and counted); `--frames` narrows it by
@@ -2319,9 +2325,22 @@ file name is the frame's flat name (exact whatever the dataset named the image).
 available wins: a frame matched either way is skipped.
 
 **Refused, never guessed.** A model without a training record (a stock, catalog or downloaded model:
-what it trained on is unknown), a record that does not read or names no run, a run folder that is gone,
-lists that do not read, or a source record that does not name a listed image: the check refuses with what
-is missing, because a model judging frames it trained on finds every label "right". So is a selection
+what it trained on is unknown), a record that does not read or names no run, a model file that is missing
+(also listed under `capability.unusable`), a run folder that is gone, lists that do not read, or a source
+record that does not name a listed image: the check refuses with what is missing, because a model judging
+frames it trained on finds every label "right". So are lists that name **no reviewed frame of the folder
+at all** (the frame filter aside) although they are not empty: the run trained on another folder or on
+renamed copies (a dataset folder made by hand or by another tool), so every frame it saw would pass for
+new (*none of the N images <model> trained or validated on is a reviewed frame of <folder>*). A model
+that truly never saw a frame of this folder is refused the same way: that is the safe side, and the full
+check covers it. Listed images whose names are not this program's frame names (after the `s<N>-` prefix;
+a name the 120-byte cut shortened, an image whose recorded source is a frame name and the run's public
+sets, by their `dataset.json` sources, are not counted) are a warning with the count (`Seen::odd_names`):
+if any is a copy of a frame of this folder, the check judges that frame as never seen. At preview and plan
+time (never for the models list of `GET /v1/refine`) the model file's SHA-256 is compared with the
+record's `onnx_sha256`: another file refuses (*<file> is not the file training run <id> produced
+(replaced since?): the frames it trained on are unknown*); a record without a hash, or an entry that names
+no `.onnx` (the hash is of the ONNX), is a warning that it could not be checked. So is a selection
 with no frame it never saw (`quick::MIN_UNSEEN_FRAMES` is 1: unlike the fold check's 40, which its models
 need to learn from, a trained model can judge any frame it never saw; the preview says how few that is).
 
@@ -2334,8 +2353,10 @@ find into a `verify`). The judge's input size is the model's (its recipe's `imgs
 mapped through the class list); without that file no label gets a `verify`. A wanted class the model does
 not have (`collect.classes` it lacks, `classes_missing`; e.g. a model trained on 7 of 14 classes) gets no
 `verify` (its silence on such a label is no miss) and no `relabel` (its detections of another class cannot
-say the label is wrong), is not in the recall, and such a label covers a detection of any class (a model
-names an object it cannot name by another class: no `add` on top of the label). Its detections of classes
+say the label is wrong), is not in the recall, and such a label covers a detection of any class at IoU
+0.5 or more (`judge::UNKNOWN_CLASS_COVER_IOU`: a model names an object it cannot name by another class, so
+no `add` on top of the label; a smaller object inside or beside it, such as a person in front of a labelled
+truck, is another object and still gets its `add`). Its detections of classes
 off the list are not used, as a fold model's. Every `why` names the model (*custom-rf-detr-nano-3 (never
 trained on this frame) found a person here, score 0.82*), never "a model that never saw this camera-day".
 The static spots come from every reviewed frame of the selection, the ones it trained on included: the
@@ -2360,18 +2381,24 @@ during the pass writes nothing (a plain cancel); a failed pass fails the check w
 Cancel during the closer look keeps what the pass wrote. Pause holds the closer look's helper only. The
 title is *quick dataset check with <model> (N frames it never saw, <filter>)*.
 
-**The report** replaces `report.json` like any check (the tab shows the last check), with `mode: model`,
-`model` and `folds` / `folds_done` 0; its counts and recall tables cover only the frames it checked, and the
-Findings and Coverage cards name the model and say *N frames <model> never saw*.
+**The report** is `refine/report-quick.json`, the quick check's own (a full check's `report.json` stays,
+with its whole-folder recall and the recall by size a floor is chosen from), with `mode: model`, `model`
+and `folds` / `folds_done` 0; its counts and recall tables cover only the frames it checked. The Findings
+card names the newer of the two reports (and says *Last full check: <date>* or *Last quick check: <date>*
+when the other exists); the recall tables of the Coverage and Too small cards and the coverage route's
+recall columns use the full check's report when there is one, else the quick one, each labelled by its
+`mode` (*N frames <model> never saw* for a quick check's).
 
 **Preview** (`--dry-run`, `GET /v1/refine/preview?model=`): the frames it would check and the camera days,
 the frames skipped as trained and validated on, the model, its run, recipe, input size and configured
 device, whether frames were matched by source or by name only, the replace count of those frames, the
-same-day, missing-class, few-boxes and closer-look warnings, and a time: what the last quick check with
-the same model measured per frame (`time_basis: last_check`), else a documented guess (`time_basis:
-guess`): 60 s (loading and compiling the model) + 0.25 s per frame (decode and an RF-DETR nano at 384 on
-an integrated GPU, about 0.11 s, plus the judge and the write; a discrete GPU is several times faster),
-plus the closer look's own bound. Not measured.
+same-day, missing-class, few-boxes, odd-name, model-file and closer-look warnings, and a time: the last
+quick check with the same model measured its load and its time per frame (`report-quick.json`
+`predict_load_s`, `predict_s_per_frame`), so `load + per frame x frames` (`time_basis: last_check`: the
+load once, not once per frame); else a documented guess (`time_basis: guess`): 60 s (loading and compiling
+the model) + 0.25 s per frame (decode and an RF-DETR nano at 384 on an integrated GPU, about 0.11 s, plus
+the judge and the write; a discrete GPU is several times faster), plus the closer look's own bound. Not
+measured.
 
 On the copy of the real dataset (November 2026, read-only preview): `custom-rf-detr-nano-3` (run
 `20261111-020504-cad6`, no image source record, so by name) skips 564 frames it trained on and 83 it
@@ -2395,9 +2422,12 @@ web UI and shows its results; the check itself is the one above and changes no b
 - **Check the dataset** card: *How to check*: *Full check (fold models, about an hour)* (the default) or
   *Quick check with a model you trained (only frames it never saw)* ([quick check](#quick-check-with-a-model);
   `check_mode`). The quick check's *Model* select lists the configured models with a training record whose
-  run folder and lists are there (`GET /v1/refine` `capability.models`: `{name, run, recipe, imgsz,
-  enabled}`, newest first; `capability.unusable` names the ones with a record it cannot use, with why, and
-  the note under the select says so); how many reviewed frames each never saw is counted on *Preview* (a walk
+  model file, run folder and lists are there (`GET /v1/refine` `capability.models`: `{name, run, recipe,
+  imgsz, enabled}`, newest first; `capability.unusable` names the ones with a record it cannot use, with why,
+  and the note under the select says so; `runs.json` and each record are read once per answer, and the list
+  is kept 5 s while the config revision and the records' size and time are the same; no file is hashed for
+  it). When a reload of the list leaves the chosen model out, the select moves and the preview and the
+  replace question go with it. How many reviewed frames each never saw is counted on *Preview* (a walk
   of the label files). In quick mode folds and epochs are hidden and not sent (`model` is: `?model=` on the
   preview, `"model"` in the start; with folds or epochs it is a 400), *Start* needs a model but no GPU
   (`capability.can_check` is the full check's), and the preview names the model, its run and the frames it
@@ -2418,15 +2448,21 @@ web UI and shows its results; the check itself is the one above and changes no b
   Jobs tab links to it as `#job-<id>`).
 - **Findings**: the open suggestions per kind (*Missing boxes* = `add`, *Labels no model found* = `verify`,
   *Other class suggested* = `relabel`, *Loose boxes* = `tighten`; `GET /v1/refine` `open`), counted over the label files of the folder under review
-  (`refine::live`: answered and stale ones are not counted; kept 60 s, dropped when a check starts or ends),
-  each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). Also the last report's
-  date, folds done of folds (a quick check: *quick check with <model> (training run <id>). N frames it never
-  saw checked; M frames it trained on and V it validated on skipped*, `RefineFloor.lastLine`; the Coverage
-  card's recall then reads *over the N frames <model> never saw*), `cancelled`, its warnings and *Loose labels counted: N, M with a proposed box*
-  (`loose`, `found.tighten`; *N (no closer look in this check)* without one). On the Review tab a `tighten` is
+  (`refine::live`: answered and stale ones are not counted; kept 60 s, dropped when a check starts or ends,
+  so a Review save shows within the minute: the card says *Counts refresh within a minute*),
+  each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). `GET /v1/refine`
+  answers both last reports, `report` (the full check's `report.json`) and `quick_report`
+  (`report-quick.json`), each with its own problem (`report_problem`, `quick_report_problem`); the card shows
+  the newer one (`RefineFloor.reports`): its date, folds done of folds (a quick check: *quick check with
+  <model> (training run <id>). N frames it never saw checked; M frames it trained on and V it validated on
+  skipped*, `RefineFloor.lastLine`), `cancelled`, its warnings and *Loose labels counted: N, M with a
+  proposed box* (`loose`, `found.tighten`; *N (no closer look in this check)* without one), and *Last full
+  check: <date>* / *Last quick check: <date>* when the other mode's report exists (`RefineFloor.otherLine`).
+  The recall tables (Coverage and Too small cards) use the full check's report when there is one, else the
+  quick check's (its recall reads *over the N frames <model> never saw*). On the Review tab a `tighten` is
   *the tighter box* when the proposal lies (95% or more of it) inside the label, else *the better-fitting box*
   (larger or shifted; `ReviewRules.tightenWord`); the answers stay accept / *Keep my box*. Without a report the card
-  says no check has run; a damaged or newer-format `report.json` is shown as a problem, never as an error page.
+  says no check has run; a damaged or newer-format report is shown as a problem, never as an error page.
 - **Static objects** (between Findings and Coverage; `server/refine_spots.rs`): the [static spots](#static-spots)
   of the reviewed frames of the folder under review (`statics::overview`; kept 60 s, dropped when a check starts
   or ends and after a bulk accept), the busiest 200 first (most missing boxes, then most frames). Per spot: the
@@ -2466,17 +2502,21 @@ web UI and shows its results; the check itself is the one above and changes no b
 - **Too small** (between Static objects and Coverage; `server/refine_floor.rs`): the size floor
   (`collect.size_floor` `{px, input}`: a box whose short side at the model input is under `px` pixels is too
   small; default off) and the ignore mode (`training.ignore`). Objects below about one patch of the model's
-  input cannot be learned, so with a floor they are left out of the labels at export (accepted and added
-  labels are never rewritten) and a detection on one counts neither for nor against a model on held-out
+  input cannot be learned, so with a floor an export writes them as ignore regions (out of the YOLO
+  labels; X-AnyLabeling keeps them as boxes; accepted and added labels are never rewritten) and a
+  detection on one counts neither for nor against a model on held-out
   frames. The one rule here that writes only hides *pending proposals* under the floor on unreviewed
   frames, and those can be restored. The card shows, top to bottom:
-  - the last check's **recall by size** (the report's `recall_by_size` and its input size; it lives here, not on
-    Coverage, which points to it), with how it was measured: "Measured with fold models trained on every
+  - the **recall by size** of the full check's report, else of the quick check's (`recall_by_size` and its
+    input size; it lives here, not on Coverage, which points to it; a quick check never replaces the full
+    check's table), with how it was measured (a quick check's: "Measured by <model> on N frames it never
+    saw, at its own input of <px> px ..."): "Measured with fold models trained on every
     label; the check treated labels under N px at <input> as ignore regions (counted in this table only)." (or
     "no size floor was set."); a report of an earlier check says its fold models may have trained under the
     floor then saved;
   - the **floor form**: `px` (1..=64) and `input` (64..=4096), prefilled with the saved floor or, when off, the
-    suggestion (10 px at the last check's input size, else the newest finished training run's, else 384).
+    suggestion (10 px at the input size of the report the recall table shows, else the newest finished
+    training run's, else 384).
     *Preview* asks `GET /v1/refine/floor?px=&input=` for the form's values and shows, per class, the boxes,
     those under the floor and what is left, with a sentence where a floor leaves a class nothing ("every
     motorcycle label would be left out: the model cannot learn the class from these frames") or under 50
@@ -2544,38 +2584,46 @@ web UI and shows its results; the check itself is the one above and changes no b
     card counts boxes under the floor in its spots, while the training static cap (on the export's YOLO
     boxes) does not, so the two can differ; and an export's "parked only" frames are judged on the boxes left
     after the floor (a parked car with a tiny accepted person beside it is parked only there).
-- **Coverage**: the report's recall per camera, scene and class, each with its 95% interval (the per-size table is
-  on the Too small card).
+- **Coverage**: the recall per camera, scene and class of the full check's report, else of the quick check's,
+  each with its 95% interval (the per-size table is on the Too small card).
   A second table on the card, **Where the data is thin** (`server/refine_coverage.rs`, `GET /v1/refine/coverage`),
   has one row per camera x scene of the review folder (sorted by camera, then day, night, ir): reviewed frames,
   person boxes, vehicle boxes (car, truck, bus, van, motorcycle, bicycle), empty frames (reviewed, no training box and
   no ignore region, ticked "empty" or not: the training plan's negatives; an unsure or too-small object is no negative; the
-  cell reads `14 (3 confirmed)`, just the number when none were ticked), the last check's
-  person and vehicle recall there with the 95% interval (`-` when the report has no such row; vehicles are the sums
+  cell reads `14 (3 confirmed)`, just the number when none were ticked), the
+  person and vehicle recall there with the 95% interval, from the full check's report, else the quick check's
+  (`-` when the report has no such row; vehicles are the sums
   of boxes and found over the vehicle classes, the interval recomputed with `report::wilson`; a quick check's report
   says the recall covers only the frames its model never saw, in the recall table's own words), the unreviewed
   frames holding a person, and a short "what to do". Boxes are the accepted labels of reviewed frames (ignore
-  regions and unwanted classes not counted). *Unreviewed with a person* counts unreviewed frames with a person
-  box that is not rejected: exactly the Review page's class filter, so its number is a link to
-  `/train/review?status=unreviewed&source=all&scene=<scene>&camera=<camera>&label=person` and that link opens
-  the counted frames (a test builds the queue with the same filters and compares). The rules
+  regions and unwanted classes not counted). *Unreviewed with a person* is counted by the Review queue itself:
+  `queue::build` with `status=unreviewed&source=all&label=person` (one build for every row, grouped by the
+  scene and camera the queue filters on), so it holds exactly the frames its link
+  `/train/review?status=unreviewed&source=all&scene=<scene>&camera=<camera>&label=person` opens, frames of the
+  review queue and the index files nobody opened yet (no label file: the sidecar's predictions say person)
+  among them; a frame whose sidecar does not read is listed nowhere and counted nowhere (a test builds the queue
+  per row and compares, frames without a label file included). That build reads every candidate's sidecar
+  (synthetic frames of `tests/it/review_walk.rs`, warm: 1.65 s at 50,000 frames on an M1, release build,
+  docs/PRODUCTION_REVIEW.md; on Windows, debug build, 20,000 frames: 3.4 s, against 2.0 s for the label-file
+  walk the table made alone before), kept with the table's other counts. The counts can be up to a minute old after a Review save (the card says so). The rules
   (`RefineFloor.coverageAdvice`, node-tested; each reason is a named constant):
   - fewer than `MIN_PERSON_BOXES` 20 person boxes: *Few persons: review the N unreviewed frames with a person
     proposal* when N > 0, else *Few persons: collect more here* (below 20 the class is a handful of boxes there);
-  - reviewed frames but no empty one (`empty` = 0): *No empty frames: review some frames with nothing in them*; when the row has at least as many vehicle boxes as reviewed frames (a parked vehicle in about every frame, so no frame can be empty) it says so instead: *about every frame here shows a vehicle, so false alerts on empty frames cannot be measured on this camera*;
+  - reviewed frames but no empty one (`empty` = 0): *No empty frames: review some frames with nothing in them*; when at least `VEHICLE_FRAME_SHARE` 0.9 of the row's reviewed frames hold a vehicle box (`vehicle_frames`: frames, never boxes, so 2 of 10 frames with 5 cars each is the ordinary advice) it says instead that a parked vehicle is in about every frame: *about every frame here shows a vehicle, so false alerts on empty frames cannot be measured on this camera*;
   - at least `MIN_RECALL_BOXES` 20 person boxes in the check's recall and its interval's upper bound under
     `MISSED_RECALL_HIGH` 0.7: *Persons are missed here: check the labels and collect more* (under 20 boxes the
     interval is too wide to blame the labels; an upper bound under 70% is a miss, not chance).
 
   The route answers `{success, folder_missing, message?, rows: [{camera, scene, reviewed, persons, vehicles,
-  empty, empty_confirmed, unreviewed_person_frames, person: {boxes, found, recall, low, high}|null, vehicle: {...}|null}],
-  totals: {rows, reviewed, persons, vehicles, empty, empty_confirmed, unreviewed_person_frames}}`. One walk over the label
-  files (`queue::labelled_map`, status any, in `server::blocking`), kept 60 s per folder and class list (at most 4
-  kept), dropped when a check starts or ends and by the Static objects and Too small cards' writes; the report's
-  recall is joined on every request.
+  vehicle_frames, empty, empty_confirmed, unreviewed_person_frames, person: {boxes, found, recall, low, high}|null,
+  vehicle: {...}|null}], totals: {rows, reviewed, persons, vehicles, vehicle_frames, empty, empty_confirmed,
+  unreviewed_person_frames}}`. One walk over the label files (`queue::labelled_map`, status any) and one build
+  of the Review queue, in `server::blocking`, kept 60 s per folder and class list (at most 4 kept), dropped when
+  a check starts or ends and by the Static objects and Too small cards' writes; the report's recall is joined
+  on every request.
 
 `GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
-`open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card
+`quick_report`, `quick_report_problem`, `open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card
 `{success, folder_missing, message?, spots: [{id, camera, object, label, bbox, frames, days, stay_days, scenes,
 by_day, labelled, open_adds, crop, sample, sample_size}], truncated, totals: {spots, labelled_boxes, open_adds},
 static_cap, static_cap_default, static_cap_max}` (`bbox` and `crop` normalised; `sample` is the newest labelled
