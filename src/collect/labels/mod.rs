@@ -12,14 +12,16 @@
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
-//! boxes on one object (stacks, overlaps) in [`stacks`] and the stored suggestions for overlapping
-//! boxes in [`overlaps`].
+//! boxes on one object (stacks, overlaps) in [`stacks`], the stored suggestions for overlapping
+//! boxes in [`overlaps`] and those of the dataset check in [`refine`]. The cover rule both a
+//! missing-label run and the dataset check use ([`covers`], [`unjudged_reject`]) is here.
 
 pub mod bulk;
 pub mod export;
 pub mod index;
 pub mod overlaps;
 pub mod queue;
+pub mod refine;
 pub mod repeats;
 pub mod spots;
 pub mod stacks;
@@ -516,6 +518,13 @@ pub struct LabelFile {
     /// edit; one whose boxes moved or went is stale and ignored ([`overlaps::live`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlap_suggestions: Vec<overlaps::Suggestion>,
+    /// Suggestions of the dataset check ([`refine`], `train refine`): a missing box, a tighter box,
+    /// another class, a label to verify, each for a reviewer to confirm or dismiss. Round-tripped
+    /// by the Review tab and kept by every edit; a check writes nothing else. One whose box moved
+    /// or went is stale and ignored ([`refine::live`]); an answered one stays so a rerun does not
+    /// ask again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refine: Vec<refine::Suggestion>,
 }
 
 fn labels_version() -> u32 {
@@ -560,6 +569,7 @@ impl Default for LabelFile {
             overlaps_checked: false,
             checked_before_reopen: false,
             overlap_suggestions: Vec::new(),
+            refine: Vec::new(),
         }
     }
 }
@@ -617,6 +627,48 @@ pub fn inside_share(a: &[f32; 4], b: &[f32; 4]) -> f32 {
     } else {
         0.0
     }
+}
+
+/// IoU at or above which a box covers a detection of its object ([`covers`]). Lower than
+/// [`MATCH_IOU`]: a loosely drawn box still labels the object.
+pub const COVER_IOU: f32 = 0.3;
+/// Share of a detection inside a box of its object at which that box covers it ([`covers`]).
+pub const COVER_INSIDE: f32 = 0.5;
+
+/// The area of a `[x0, y0, x1, y1]` box (0 for an empty one).
+fn area(b: &[f32; 4]) -> f32 {
+    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
+}
+
+/// Whether the box `b` covers the detection `p`: IoU >= [`COVER_IOU`], or at least
+/// [`COVER_INSIDE`] of `p` inside `b`. Only that direction: a small box inside a large detection
+/// does not cover it. [`inside_share`] measures the smaller box, which is `p` under the area check;
+/// a `p` larger than `b` with that share of it inside `b` has an IoU of at least 1/3 anyway, so the
+/// check loses nothing. Boxes only: the caller compares boxes of one object
+/// ([`repeats::same_object`]). Used by a missing-label run
+/// (`training::autolabel::triage::apply_missing`) and the dataset check ([`refine::live`]).
+pub fn covers(b: &[f32; 4], p: &[f32; 4]) -> bool {
+    iou(b, p) >= COVER_IOU || (area(p) <= area(b) && inside_share(p, b) >= COVER_INSIDE)
+}
+
+/// A rejected box no reviewer judged: a [`bulk::LOW_SCORE_REASON`] bulk reject, a dismissal
+/// ([`bulk::is_dismissal`]), or a model hint (suppressed, below threshold, verifier find) the page's
+/// save default rejected. A reject reason, a spot edit or a duplicate reject means somebody looked,
+/// whatever the box's origin. A spot edit leaves its mark only on a box without a `reason` of its
+/// own, so a suppressed hint rejected by one cannot be told from the save default. A real object
+/// found later may take such a box's place, so `hard_negatives.json` does not call it a false
+/// positive.
+pub fn unjudged_reject(b: &LabelBox) -> bool {
+    let reason = b.reason.as_deref();
+    b.state == BoxState::Rejected
+        && b.reject_reason.is_none()
+        && !matches!(
+            reason,
+            Some(repeats::REPEAT_SPOT_REASON | stacks::DUPLICATE_REASON)
+        )
+        && (reason == Some(bulk::LOW_SCORE_REASON)
+            || bulk::is_dismissal(reason)
+            || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
 }
 
 /// `b` ordered (`x0 <= x1`, `y0 <= y1`) and clamped to the `w` x `h` frame.
@@ -813,8 +865,9 @@ fn label_ok(l: &str) -> bool {
 /// - a dismissal ([`bulk::is_dismissal`]) cleared unless the box is rejected with no reason of a
 ///   reviewer's; [`spots::PARKED_REASON`] and its mark cleared unless the box is accepted;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
-///   (bounded), `overlaps_checked` and `overlap_suggestions` (bounded, [`overlaps::check`]) kept,
-///   `bulk_accepted` and `checked_before_reopen` cleared;
+///   (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
+///   `refine` (bounded, [`refine::check`]) kept, `bulk_accepted` and `checked_before_reopen`
+///   cleared;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -896,6 +949,7 @@ pub fn normalize(
     f.bulk_accepted = false;
     f.checked_before_reopen = false;
     overlaps::check(&f.overlap_suggestions)?;
+    refine::check(&f.refine)?;
     if let Some(r) = &f.auto_run {
         if [&r.at, &r.labeler]
             .into_iter()

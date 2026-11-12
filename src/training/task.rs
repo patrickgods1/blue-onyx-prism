@@ -1,6 +1,6 @@
 //! Jobs of the training queue other than a training run: footage imports
-//! ([`super::import`]), auto-label runs ([`super::autolabel`]) and overlap checks
-//! ([`super::overlaps`]). They share the queue's one worker thread with the training runs ([`super::service::TrainingService`]), so a GPU or the
+//! ([`super::import`]), auto-label runs ([`super::autolabel`]), overlap checks
+//! ([`super::overlaps`]) and dataset checks ([`TaskKind::Refine`]). They share the queue's one worker thread with the training runs ([`super::service::TrainingService`]), so a GPU or the
 //! training environment is used by one job at a time, and each holds the cross-process
 //! training lock (`tools/.train.lock`) while it runs. A [`Task`] reports numbered stages and
 //! log lines; its [`TaskRecord`] (state, progress, log tail, result) is kept like a run's, in
@@ -54,6 +54,9 @@ pub enum TaskKind {
     Import,
     Autolabel,
     Overlaps,
+    /// The dataset check (cross-check by fold models): writes only refine suggestions
+    /// ([`crate::collect::labels::refine`]).
+    Refine,
 }
 
 impl TaskKind {
@@ -62,6 +65,7 @@ impl TaskKind {
             TaskKind::Import => "import",
             TaskKind::Autolabel => "autolabel",
             TaskKind::Overlaps => "overlaps",
+            TaskKind::Refine => "refine",
         }
     }
 }
@@ -612,6 +616,43 @@ mod tests {
         assert!(r[0].uses.is_empty());
         let json = serde_json::to_string(&r[0]).unwrap();
         assert!(!json.contains("uses"), "{json}");
+    }
+
+    #[test]
+    fn a_dataset_check_round_trips_as_refine_beside_older_records() {
+        assert_eq!(TaskKind::Refine.as_str(), "refine");
+        let mut r = record("c");
+        r.kind = TaskKind::Refine;
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""kind":"refine""#), "{json}");
+        assert_eq!(serde_json::from_str::<TaskRecord>(&json).unwrap(), r);
+        // Each kind's spelling is its serde name.
+        for k in [
+            TaskKind::Import,
+            TaskKind::Autolabel,
+            TaskKind::Overlaps,
+            TaskKind::Refine,
+        ] {
+            assert_eq!(
+                serde_json::to_value(k).unwrap(),
+                serde_json::Value::from(k.as_str())
+            );
+        }
+        // A file of an older build (no format, no uses) with a refine record of this one: all load.
+        let dir = scratch("refine");
+        let p = dir.join(TASKS_FILE);
+        let old = r#"[{"id":"a","kind":"overlaps","title":"t","created":"c","state":"done",
+            "step":1,"steps":1,"percent":100}]"#;
+        let mut list: Vec<serde_json::Value> = serde_json::from_str(old).unwrap();
+        list.push(serde_json::to_value(&r).unwrap());
+        std::fs::write(&p, serde_json::to_vec(&list).unwrap()).unwrap();
+        let back = load_records(&p);
+        assert_eq!(
+            back.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            [TaskKind::Overlaps, TaskKind::Refine]
+        );
+        assert!(asides(&p).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

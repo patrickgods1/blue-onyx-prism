@@ -263,6 +263,7 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
         boxes: out,
         overlaps_checked: base.overlaps_checked,
         overlap_suggestions: base.overlap_suggestions,
+        refine: base.refine,
         ..LabelFile::default()
     }
 }

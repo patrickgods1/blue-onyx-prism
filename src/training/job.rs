@@ -472,6 +472,34 @@ pub fn run_training(
     report: &mut dyn FnMut(TrainReport<'_>),
     cancel: &AtomicBool,
 ) -> Result<RunOutcome, TrainError> {
+    run_training_with(job, None, runner, fetcher, hooks, report, cancel)
+}
+
+/// [`run_training`] for a task that holds the training lock already, across several training runs
+/// and the GPU work between them (the dataset check's folds): the run uses `lock` instead of
+/// taking the lock itself, which would fail against the task's own hold. `lock` must be the lock
+/// of `job.paths` (an error otherwise).
+pub fn run_training_holding(
+    job: &TrainJob,
+    lock: &TrainLock,
+    runner: &dyn CommandRunner,
+    fetcher: &dyn Fetcher,
+    hooks: &dyn Hooks,
+    report: &mut dyn FnMut(TrainReport<'_>),
+    cancel: &AtomicBool,
+) -> Result<RunOutcome, TrainError> {
+    run_training_with(job, Some(lock), runner, fetcher, hooks, report, cancel)
+}
+
+fn run_training_with(
+    job: &TrainJob,
+    held: Option<&TrainLock>,
+    runner: &dyn CommandRunner,
+    fetcher: &dyn Fetcher,
+    hooks: &dyn Hooks,
+    report: &mut dyn FnMut(TrainReport<'_>),
+    cancel: &AtomicBool,
+) -> Result<RunOutcome, TrainError> {
     let mut stage = None;
     let mut unregistered = None;
     let mut watch = |p: TrainReport<'_>| {
@@ -482,7 +510,9 @@ pub fn run_training(
         }
         report(p);
     };
-    let r = stages(job, runner, fetcher, hooks, &mut watch, cancel, &mut stage);
+    let r = stages(
+        job, held, runner, fetcher, hooks, &mut watch, cancel, &mut stage,
+    );
     r.map_err(|e| {
         let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
         let work = super::retry::work_dir(&job.run_dir);
@@ -580,6 +610,7 @@ impl Log {
 #[allow(clippy::too_many_arguments)]
 fn stages(
     job: &TrainJob,
+    held: Option<&TrainLock>,
     runner: &dyn CommandRunner,
     fetcher: &dyn Fetcher,
     hooks: &dyn Hooks,
@@ -634,7 +665,16 @@ fn stages(
         job.accelerator.describe(),
         job.id
     ));
-    let _lock = TrainLock::try_acquire(&paths.train_lock_file())?;
+    // Taken here, or held by the task this run is part of (for the whole task).
+    let _lock = match held {
+        Some(l) if l.path() == paths.train_lock_file() => None,
+        Some(l) => bail!(
+            "the training lock held is {}, not this run's {}",
+            l.path().display(),
+            paths.train_lock_file().display()
+        ),
+        None => Some(TrainLock::try_acquire(&paths.train_lock_file())?),
+    };
 
     // 1. Environment.
     enter!(TrainStage::Setup, 0, "checking the toolchain");

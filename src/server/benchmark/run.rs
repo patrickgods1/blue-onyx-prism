@@ -118,6 +118,7 @@ fn running_job(runs: &[RunRecord], tasks: &[TaskRecord]) -> Option<String> {
                 TaskKind::Import => "Import",
                 TaskKind::Autolabel => "Auto-label run",
                 TaskKind::Overlaps => "Overlap check",
+                TaskKind::Refine => "Dataset check",
             };
             format!("{kind} '{}'", t.title)
         })
@@ -1184,6 +1185,7 @@ mod tests {
             (TaskKind::Import, "Import '900 frames'"),
             (TaskKind::Autolabel, "Auto-label run '900 frames'"),
             (TaskKind::Overlaps, "Overlap check '900 frames'"),
+            (TaskKind::Refine, "Dataset check '900 frames'"),
         ] {
             assert_eq!(
                 running_job(&[], &[task(kind, RunState::Running)]).as_deref(),

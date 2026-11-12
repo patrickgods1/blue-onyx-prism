@@ -16,13 +16,16 @@
 //! ([`labels::spots`]): rejected spots hide boxes, parked spots accept them.
 
 use super::{Category, MISSING_THRESHOLD};
-use crate::collect::labels::repeats::{REPEAT_SPOT_REASON, same_object};
+use crate::collect::labels::repeats::same_object;
 use crate::collect::labels::spots::{CameraMemory, PARKED_REASON};
-use crate::collect::labels::stacks::{DUPLICATE_REASON, STACK_IOU};
+use crate::collect::labels::stacks::STACK_IOU;
 use crate::collect::labels::{
-    self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, Origin, ParkedMark,
-    Source, Status, Triage, VlmCheck, inside_share, iou, merge_proposals,
+    self, AutoInfo, BoxState, LabelBox, LabelFile, MATCH_IOU, MergeReport, ParkedMark, Source,
+    Status, Triage, VlmCheck, iou, merge_proposals,
 };
+// What the tests below take through `use super::*` since the cover rule moved to the labels module.
+#[cfg(test)]
+use crate::collect::labels::{inside_share, stacks::DUPLICATE_REASON};
 pub use crate::model::coco::map_label;
 use crate::model::coco::same_class;
 use crate::resources::catalog::SAM3_KEY;
@@ -33,11 +36,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const ACCEPT_SCORE: f32 = 0.6;
 /// `missing_only`: IoU at or above which a training or pending box of the same object covers a
 /// detection ([`apply_missing`]). Lower than [`MATCH_IOU`]: a loosely drawn box still labels the
-/// object.
-pub const MISSING_IOU: f32 = 0.3;
+/// object. The cover rule's own ([`labels::COVER_IOU`]).
+pub const MISSING_IOU: f32 = labels::COVER_IOU;
 /// `missing_only`: share of a detection inside a training or pending box of the same object at
-/// which that box covers it ([`apply_missing`]).
-pub const MISSING_INSIDE: f32 = 0.5;
+/// which that box covers it ([`apply_missing`]). The cover rule's own ([`labels::COVER_INSIDE`]).
+pub const MISSING_INSIDE: f32 = labels::COVER_INSIDE;
 
 // The tiers of a labelers run's boxes ([`tier`]), measured in `docs/TRAINING.md` "Measuring
 // auto-label". Change them only after running `scripts/research/eval_autolabel.py`.
@@ -603,34 +606,18 @@ impl MissingReport {
     }
 }
 
-fn area(b: &[f32; 4]) -> f32 {
-    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
-}
-
-/// Whether `b` covers the detection `p`: IoU >= [`MISSING_IOU`], or at least [`MISSING_INSIDE`] of
-/// `p` inside `b`. Only that direction: a small box inside a large detection does not cover it.
-/// [`inside_share`] measures the smaller box, which is `p` under the area check; a `p` larger than
-/// `b` with that share of it inside `b` has an IoU of at least 1/3 anyway, so the check loses
-/// nothing.
+/// Whether `b` covers the detection `p`: the labels module's cover rule ([`labels::covers`]: IoU >=
+/// [`MISSING_IOU`], or at least [`MISSING_INSIDE`] of `p` inside `b`), the one definition the
+/// dataset check shares.
 fn covers(b: &LabelBox, p: &LabelBox) -> bool {
-    iou(&b.bbox, &p.bbox) >= MISSING_IOU
-        || (area(&p.bbox) <= area(&b.bbox) && inside_share(&p.bbox, &b.bbox) >= MISSING_INSIDE)
+    labels::covers(&b.bbox, &p.bbox)
 }
 
-/// A rejected box no reviewer judged: a [`labels::bulk::LOW_SCORE_REASON`] bulk reject, a dismissal
-/// ([`labels::bulk::is_dismissal`]), or a model hint (suppressed, below threshold, verifier find)
-/// the page's save default rejected. A reject
-/// reason, a spot edit or a duplicate reject means somebody looked, whatever the box's origin. A
-/// spot edit leaves its mark only on a box without a `reason` of its own, so a suppressed hint
-/// rejected by one cannot be told from the save default.
+/// A rejected box no reviewer judged ([`labels::unjudged_reject`], the one definition the dataset
+/// check shares): a low-score bulk reject, a dismissal, or a model hint the page's save default
+/// rejected.
 fn unjudged_reject(b: &LabelBox) -> bool {
-    let reason = b.reason.as_deref();
-    b.state == BoxState::Rejected
-        && b.reject_reason.is_none()
-        && !matches!(reason, Some(REPEAT_SPOT_REASON | DUPLICATE_REASON))
-        && (reason == Some(labels::bulk::LOW_SCORE_REASON)
-            || labels::bulk::is_dismissal(reason)
-            || (b.source == Source::Model && b.origin != Some(Origin::Prediction)))
+    labels::unjudged_reject(b)
 }
 
 /// The note of a frame with `f`'s pending proposals: who proposed them and how many, within

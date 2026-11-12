@@ -42,8 +42,9 @@
 //! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies), `classes.txt`,
 //!    `train.txt` / `valid.txt`, `data.yaml` (Ultralytics), `train.coco.json` /
 //!    `valid.coco.json` (category ids 0..C-1, for RF-DETR and transformers), the held-out set as
-//!    a benchmark `dir:` set (`heldout/`, every scene, tagged by [`heldout_tags`]), and
-//!    `dataset.json` (what went in, for provenance).
+//!    a benchmark `dir:` set (`heldout/`, every scene, tagged by [`heldout_tags`]),
+//!    `dataset.json` (what went in, for provenance) and [`IMAGE_SOURCES_FILE`] (the source of
+//!    each image in `images/`).
 //!
 //! [`inventory`] counts the boxes per class and scene of the sources (the class picker).
 
@@ -1872,12 +1873,15 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
             .collect();
         Ok(serde_json::json!({"images": imgs, "annotations": anns, "categories": cats}))
     };
+    // Where each image of `images/` came from ([`IMAGE_SOURCES_FILE`]).
+    let mut image_sources: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut train_lines = String::new();
     let mut train_entries = Vec::new();
     for &(r, repeats) in &plan.train {
         let f = frame(r)?;
         let n = name_of(r, f);
         put(r, f, &n, &mut written)?;
+        image_sources.insert(n.clone(), f.image.clone());
         let s = size_of(r, f)?;
         for _ in 0..repeats.max(1) {
             train_lines.push_str(&format!("./images/{n}\n"));
@@ -1890,6 +1894,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         let f = frame(r)?;
         let n = name_of(r, f);
         put(r, f, &n, &mut written)?;
+        image_sources.insert(n.clone(), f.image.clone());
         valid_lines.push_str(&format!("./images/{n}\n"));
         valid_entries.push((r, n.clone(), size_of(r, f)?));
     }
@@ -1902,6 +1907,10 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
     write_text("classes.txt", &class_text)?;
     write_text("train.txt", &train_lines)?;
     write_text("valid.txt", &valid_lines)?;
+    write_text(
+        IMAGE_SOURCES_FILE,
+        &serde_json::to_string_pretty(&image_sources)?,
+    )?;
     let abs = std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf());
     let mut yaml = format!(
         "# Blue Onyx Prism training dataset (Ultralytics)\npath: {}\ntrain: train.txt\nval: valid.txt\nnames:\n",
@@ -2024,6 +2033,20 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         warnings,
         balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
     })
+}
+
+/// The file of a prepared dataset that names, for every image in `images/` (the names
+/// `train.txt` and `valid.txt` list), the source image it was linked or copied from: a JSON object
+/// `{"<name>": "<source path>"}`. The names are not the sources' own (a source prefix, a 120-byte
+/// cut, a `-2` for a name taken twice), so a reader that must know which frame an image is (the
+/// dataset check's unseen check) reads this instead of guessing.
+pub const IMAGE_SOURCES_FILE: &str = "image_sources.json";
+
+/// [`IMAGE_SOURCES_FILE`] of the prepared dataset in `dir`.
+pub fn read_image_sources(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
+    let p = dir.join(IMAGE_SOURCES_FILE);
+    let bytes = std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", p.display()))
 }
 
 /// Read `dataset.json` sources of a prepared dataset (provenance).

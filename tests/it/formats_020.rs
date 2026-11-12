@@ -298,6 +298,14 @@ fn dataset_files_of_0_2_0_load_as_frames_with_their_labels() {
         labels::write(&frame.labels, &lf).unwrap();
         let again = frame.labels().unwrap().unwrap();
         assert_eq!(again, lf);
+        // A file without refine suggestions loads without them and saves without the key.
+        assert!(
+            lf.refine.is_empty()
+                && json(&std::fs::read_to_string(&frame.labels).unwrap())
+                    .get("refine")
+                    .is_none(),
+            "{label_file}: no refine suggestions, no `refine` key written"
+        );
         assert_kept(
             &old,
             &json(&std::fs::read_to_string(&frame.labels).unwrap()),

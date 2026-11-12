@@ -16,6 +16,8 @@
 //! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
+//! - [`refine`]: the dataset check (`train refine`), short fold models that never saw a camera
+//!   day suggest missing boxes, labels to verify and other classes.
 //! - [`finish`]: the steps after an import chain (reject low-scoring auto boxes, accept the
 //!   settled frames, switch the Review folder).
 //! - [`bench`]: the benchmark at the end of a run, and the current default on the same frames.
@@ -44,6 +46,7 @@ pub mod preflight;
 pub mod progress;
 pub mod pyenv;
 pub mod recipe;
+pub mod refine;
 pub mod retry;
 pub mod service;
 pub mod switch;
