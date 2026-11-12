@@ -379,6 +379,28 @@
   // LabelBox::is_ignore: unsure, or rejected as too small.
   function isIgnore(b) { return !!b.difficult || (b.state === 'rejected' && b.reject_reason === 'too_small'); }
 
+  // labels::under_floor: whether `bbox` ([x0, y0, x1, y1], pixels of a `w` x `h` frame) is under the
+  // size floor `floor` ({px, input}, `collect.size_floor`): its short side at the floor's model input,
+  // min(w / W, h / H) * input of the box clamped to the frame, is under `px`, in f32 as the server
+  // computes it. Never under: a frame of unknown size, a non-finite box or one with nothing inside
+  // the frame, a floor that is null or off.
+  function underFloor(bbox, w, h, floor) {
+    if (!floor || typeof floor.px !== 'number' || typeof floor.input !== 'number') return false;
+    var px = f32(floor.px), input = f32(floor.input);
+    if (!(isFinite(px) && px > 0 && input > 0)) return false;
+    if (!(typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0)) return false;
+    if (!bbox || bbox.length !== 4 || !bbox.every(function (v) { return typeof v === 'number'; })) return false;
+    var b = box32(bbox);
+    if (!b.every(function (v) { return isFinite(v); })) return false;
+    var W = f32(w), H = f32(h);
+    var clamp = function (v, hi) { return Math.min(Math.max(v, 0), hi); };
+    var x0 = clamp(Math.min(b[0], b[2]), W), x1 = clamp(Math.max(b[0], b[2]), W);
+    var y0 = clamp(Math.min(b[1], b[3]), H), y1 = clamp(Math.max(b[1], b[3]), H);
+    var bw = f32(x1 - x0), bh = f32(y1 - y0);
+    if (!(bw > 0 && bh > 0)) return false;
+    return f32(Math.min(f32(bw / W), f32(bh / H)) * input) < px;
+  }
+
   // labels::unjudged_reject: a reject no reviewer judged (a bulk low-score reject, a dismissal, a
   // model hint the save default rejected).
   function unjudgedReject(b) {
@@ -837,6 +859,7 @@
     COCO_NAMES: COCO_NAMES,
     COCO_ALIASES: COCO_ALIASES,
     wantedClass: wantedClass,
+    underFloor: underFloor,
     liveRefine: liveRefine,
     refineStrength: refineStrength,
     acceptRefine: acceptRefine,

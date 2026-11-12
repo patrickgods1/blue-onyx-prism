@@ -190,7 +190,19 @@ pub struct Report {
     pub own_frames: usize,
     /// Frames of the folder under review not reviewed yet (not in any export); None = unknown.
     pub unreviewed: Option<u64>,
+    /// Frames left out for ignore regions (unsure, too small, under the size floor;
+    /// [`dataset::Stats::ignore_frames`]).
     pub ignore_frames: usize,
+    /// What the plan does with frames with ignore regions (`training.ignore`).
+    pub ignore_mode: dataset::IgnoreMode,
+    /// [`dataset::IgnoreMode::Background`]: training frames trained with an unlabelled object
+    /// ([`dataset::Stats::ignore_kept`]) and their regions per class.
+    pub ignore_kept: usize,
+    pub ignore_boxes_background: BTreeMap<String, usize>,
+    /// Of `ignore_frames` (background): frames with nothing but regions, and frames of camera days
+    /// validated on.
+    pub ignore_only: usize,
+    pub ignore_valid_day: usize,
     pub parked_capped: usize,
     /// Frames showing nothing but objects at static spots left out over the static cap
     /// ([`dataset::Stats::static_capped`]; the spots in `dataset::Stats::static_caps`).
@@ -303,6 +315,11 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         own_frames: own,
         unreviewed,
         ignore_frames: s.ignore_frames,
+        ignore_mode: opts.ignore,
+        ignore_kept: s.ignore_kept,
+        ignore_boxes_background: s.ignore_boxes_background.clone(),
+        ignore_only: s.ignore_only,
+        ignore_valid_day: s.ignore_valid_day,
         parked_capped: s.parked_capped,
         static_capped: s.static_capped,
         static_spots: s.static_spots,
@@ -339,8 +356,34 @@ pub fn text(r: &Report) -> String {
             c.name, c.train, c.valid, c.heldout, s.day, s.night, s.ir
         ));
     }
+    if r.ignore_kept > 0 {
+        let per: Vec<String> = r
+            .ignore_boxes_background
+            .iter()
+            .map(|(c, n)| format!("{c} {n}"))
+            .collect();
+        out.push_str(&format!(
+            "trained with an unsure or too-small object as background: {} frame(s) ({})\n",
+            r.ignore_kept,
+            per.join(", ")
+        ));
+    }
+    let background = r.ignore_mode == dataset::IgnoreMode::Background;
+    let (ignore_all, ignore_only, ignore_valid) = if background {
+        (0, r.ignore_only, r.ignore_valid_day)
+    } else {
+        (r.ignore_frames, 0, 0)
+    };
     let dropped = [
-        (r.ignore_frames, "with unsure or too-small boxes"),
+        (ignore_all, "with unsure or too-small boxes"),
+        (
+            ignore_only,
+            "with nothing but unsure or too-small objects (no label to train)",
+        ),
+        (
+            ignore_valid,
+            "with unsure or too-small objects on camera days used for validation",
+        ),
         (r.parked_capped, "over the parked-spot cap"),
         (
             r.static_capped,

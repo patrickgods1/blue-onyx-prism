@@ -1705,3 +1705,150 @@ fn the_page_loads_the_rules_first_and_they_touch_no_page() {
         assert!(!js.contains(word), "review-rules.js is pure: {word}");
     }
 }
+
+/// One case of the size floor: box, frame width and height, floor.
+type FloorCase = ([f32; 4], u32, u32, Option<labels::SizeFloor>);
+
+/// `v` moved by `k` f32 steps (`k` < 0: down); `v` positive.
+fn ulps(v: f32, k: i32) -> f32 {
+    f32::from_bits(v.to_bits().checked_add_signed(k).unwrap())
+}
+
+/// The cases of [`the_size_floor_agrees_with_its_rust_twin`]: the boundary of real floors on
+/// non-square frames (exactly there and up to two f32 steps either side, on either axis), boxes at
+/// and past the frame edge, inverted, empty and off-frame boxes, a floor that is off, a frame of
+/// unknown size, and seeded random boxes.
+fn floor_cases() -> Vec<FloorCase> {
+    let floor = |px: f32, input: u32| Some(labels::SizeFloor { px, input });
+    let mut v: Vec<FloorCase> = Vec::new();
+    // A 512 px frame at input 512 maps a side 1:1 exactly: 10 px is exactly at a 10 px floor.
+    for k in -2..=2 {
+        let s = ulps(10.0, k);
+        v.push(([0.0, 0.0, 300.0, s], 512, 512, floor(10.0, 512)));
+        v.push(([0.0, 0.0, s, 300.0], 512, 512, floor(10.0, 512)));
+    }
+    let frames = [
+        (1920, 1080),
+        (640, 480),
+        (2560, 1440),
+        (1280, 720),
+        (704, 576),
+        (480, 640),
+    ];
+    let floors = [
+        (10.0, 384),
+        (8.0, 640),
+        (12.5, 384),
+        (1.0, 64),
+        (64.0, 4096),
+        (9.7, 448),
+    ];
+    for (w, h) in frames {
+        let (wf, hf) = (w as f32, h as f32);
+        for (px, input) in floors {
+            let fl = floor(px, input);
+            // The side that is exactly at the floor on each axis.
+            let (sw, sh) = (px * wf / input as f32, px * hf / input as f32);
+            for k in -2..=2 {
+                let (bw, bh) = (ulps(sw, k), ulps(sh, k));
+                v.push(([0.0, 0.0, wf, bh], w, h, fl));
+                v.push(([0.0, 0.0, bw, hf], w, h, fl));
+                // At the frame's far edge, and past it (clamped to the frame).
+                v.push(([wf - bw, hf - 2.0 * bh, wf, hf], w, h, fl));
+                v.push(([wf - bw, hf - bh, wf + 50.0, hf + 50.0], w, h, fl));
+                v.push(([-30.0, -30.0, bw - 30.0, hf], w, h, fl));
+                // Inverted corners.
+                v.push(([bw, hf, 0.0, 0.0], w, h, fl));
+            }
+            v.push(([5.0, 5.0, 5.0, 50.0], w, h, fl));
+            v.push(([wf + 10.0, 0.0, wf + 50.0, 50.0], w, h, fl));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, h, None));
+            v.push(([0.0, 0.0, 1.0, 1.0], 0, h, fl));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, 0, fl));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, h, floor(0.0, input)));
+            v.push(([0.0, 0.0, 1.0, 1.0], w, h, floor(px, 0)));
+        }
+    }
+    let mut r = Rng(0x5153_e0f1_002d_9a3b);
+    for _ in 0..4000 {
+        let (w, h) = r.pick(&frames);
+        let (px, input) = r.pick(&floors);
+        let (x, y) = (r.range(-40.0, w as f32), r.range(-40.0, h as f32));
+        let (bw, bh) = (r.range(0.0, 60.0), r.range(0.0, 60.0));
+        v.push(([x, y, x + bw, y + bh], w, h, floor(px, input)));
+    }
+    v
+}
+
+/// `labels::under_floor` and the page's `underFloor` agree on every case, f32 for f32 (numbers go to
+/// node as their f32 bits, so no decimal rounding stands between the two).
+#[test]
+fn the_size_floor_agrees_with_its_rust_twin() {
+    if !have_node() {
+        return;
+    }
+    let cases = floor_cases();
+    let rust: Vec<bool> = cases
+        .iter()
+        .map(|(b, w, h, f)| labels::under_floor(b, *w, *h, *f))
+        .collect();
+    let request: Vec<Value> = cases
+        .iter()
+        .map(|(b, w, h, f)| {
+            json!({
+                "b": b.map(f32::to_bits),
+                "w": w,
+                "h": h,
+                "floor": f.map(|f| json!({"px": f.px.to_bits(), "input": f.input})),
+            })
+        })
+        .collect();
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const f32 = (u) => { const d = new DataView(new ArrayBuffer(4)); d.setUint32(0, u); return d.getFloat32(0); };
+const fl = { px: 10, input: 384 };
+process.stdout.write(JSON.stringify({
+  cases: req.map((c) => R.underFloor(c.b.map(f32), c.w, c.h,
+    c.floor === null ? null : { px: f32(c.floor.px), input: c.floor.input })),
+  // What JSON cannot carry: never under.
+  odd: [
+    R.underFloor([NaN, 0, 1, 1], 640, 480, fl),
+    R.underFloor([0, 0, Infinity, 1], 640, 480, fl),
+    R.underFloor([0, 0, 1e39, 1], 640, 480, fl),
+    R.underFloor([0, 0, '1', 1], 640, 480, fl),
+    R.underFloor([0, 0, 1, 1], 640, 480, { px: NaN, input: 384 }),
+    R.underFloor([0, 0, 1, 1], 640, 480, undefined),
+    R.underFloor([0, 0, 1], 640, 480, fl),
+    R.underFloor([0, 0, 1, 1], 640, 480, fl),
+  ],
+}));
+"#;
+    let got = node_with(driver, &json!(request));
+    let js: Vec<bool> = serde_json::from_value(got["cases"].clone()).unwrap();
+    assert_eq!(js.len(), rust.len());
+    let differ: Vec<String> = cases
+        .iter()
+        .zip(rust.iter().zip(&js))
+        .filter(|(_, (r, j))| r != j)
+        .take(10)
+        .map(|(c, (r, j))| format!("{c:?}: rust {r}, page {j}"))
+        .collect();
+    assert!(differ.is_empty(), "{differ:#?}");
+    // Both answers occur, at the boundary too: the cases test something.
+    let under = rust.iter().filter(|u| **u).count();
+    assert!(
+        under > 500 && rust.len() - under > 500,
+        "{under} of {}",
+        rust.len()
+    );
+    assert_eq!(
+        got["odd"],
+        json!([false, false, false, false, false, false, false, true])
+    );
+    // Exactly at the floor is not under; one f32 step below is.
+    let at = |s: f32| labels::under_floor(&[0.0, 0.0, 300.0, s], 512, 512, cases[0].3);
+    assert!(!at(10.0) && at(ulps(10.0, -1)) && !at(ulps(10.0, 1)));
+}

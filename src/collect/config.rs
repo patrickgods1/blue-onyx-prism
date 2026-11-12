@@ -230,6 +230,12 @@ pub struct CollectConfig {
     /// ([`super::labels::bulk::Wanted`]); they stay in the list and keep their YOLO ids.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hidden_classes: Vec<String>,
+    /// The size floor ([`super::labels::SizeFloor`], `{px, input}`): a training box whose short
+    /// side at the model input `input` is under `px` pixels is exported as an ignore region, the
+    /// dataset check judges by it, and the Refine tab's rule can reject pending boxes under it.
+    /// None (default, not written) = off: exports as before. The label files never change for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<super::labels::SizeFloor>,
 }
 
 impl Serialize for CollectConfig {
@@ -268,6 +274,10 @@ fn known_shape() -> serde_json::Value {
         dir: Some("d".into()),
         review_dir: Some("r".into()),
         hidden_classes: vec![DEFAULT_CLASSES[0].to_string()],
+        size_floor: Some(super::labels::SizeFloor {
+            px: 10.0,
+            input: 384,
+        }),
         ..CollectConfig::default()
     };
     for b in Bucket::ALL {
@@ -326,6 +336,7 @@ impl Default for CollectConfig {
             dedup_hamming: DEFAULT_DEDUP_HAMMING,
             classes: default_classes(),
             hidden_classes: Vec::new(),
+            size_floor: None,
         }
     }
 }
@@ -446,6 +457,9 @@ impl CollectConfig {
         )?;
         validate_classes(&self.classes)?;
         validate_hidden(&self.hidden_classes, &self.classes)?;
+        if let Some(f) = &self.size_floor {
+            f.validate("collect.size_floor")?;
+        }
         for b in Bucket::ALL {
             let c = self.buckets.get(b);
             let field = format!("collect.buckets.{}", b.as_str());
@@ -868,6 +882,56 @@ mod tests {
         c.validate().unwrap();
         let text = c.saved_text().unwrap();
         assert!(!text.contains("later_"), "not written back: {text}");
+    }
+
+    #[test]
+    fn the_size_floor_is_off_by_default_round_trips_and_is_bounded() {
+        use super::super::labels::SizeFloor;
+        let c = CollectConfig::default();
+        assert_eq!(c.size_floor, None);
+        assert!(
+            !serde_json::to_string(&c).unwrap().contains("size_floor"),
+            "not written while off: exports and configs of everyone else stay as they were"
+        );
+        let text = r#"{"size_floor": {"px": 10, "input": 384}}"#;
+        let on: CollectConfig = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            on.size_floor,
+            Some(SizeFloor {
+                px: 10.0,
+                input: 384
+            })
+        );
+        assert!(unknown_keys(&serde_json::from_str(text).unwrap()).is_empty());
+        let back: CollectConfig =
+            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert_eq!(back, on);
+        on.validate(Path::new("/data")).unwrap();
+        // A key inside it this version does not know is named, not refused.
+        let later = serde_json::json!({"size_floor": {"px": 10, "input": 384, "later": 1}});
+        assert_eq!(unknown_keys(&later), ["collect.size_floor.later"]);
+        assert!(serde_json::from_value::<CollectConfig>(later).is_ok());
+        let bad = |px: f32, input: u32| {
+            CollectConfig {
+                size_floor: Some(SizeFloor { px, input }),
+                ..CollectConfig::default()
+            }
+            .validate(Path::new("/data"))
+            .map_err(|e| e.to_string())
+        };
+        for (px, input) in [(1.0, 64), (64.0, 4096), (8.5, 640)] {
+            bad(px, input).unwrap();
+        }
+        for (px, input, key) in [
+            (0.5, 384, "collect.size_floor.px"),
+            (64.5, 384, "collect.size_floor.px"),
+            (f32::NAN, 384, "collect.size_floor.px"),
+            (10.0, 63, "collect.size_floor.input"),
+            (10.0, 4097, "collect.size_floor.input"),
+        ] {
+            let e = bad(px, input).unwrap_err();
+            assert!(e.contains(key), "{px} {input}: {e}");
+        }
     }
 
     #[test]

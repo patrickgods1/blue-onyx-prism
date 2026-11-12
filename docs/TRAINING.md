@@ -399,13 +399,28 @@ training.
 
 ### Ignore regions
 
-An unsure box (Review tab `d`) or a box rejected as too small (the *Too small* button) means "a real
-object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave a box
-out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling makes
-such a box background. So the frame goes, as for a public set's `ignore` objects:
+An unsure box (Review tab `d`), a box rejected as too small (the *Too small* button) or, with
+`collect.size_floor` set, a training box under the size floor (`docs/DATASET.md`, Size floor) means "a
+real object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave
+a box out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling
+makes such a box background. `training.ignore` (`--ignore` on `train prepare|run`) decides:
 
-- **Train and valid:** frames with a region are left out, counted as `ignore_frames` in `dataset.json`, with
-  a warning. The scene filter comes first, so only in-scope frames count.
+- **`background` (default):** a train frame with a region and at least one box of the run's classes trains
+  with the region simply unlabelled (`ignore_kept`, the regions per class in `ignore_boxes_background`). A
+  frame with nothing but regions is left out (`ignore_only`): an image whose only object is unlabelled
+  would teach "nothing here" exactly where something is, so it is neither a positive nor a negative,
+  confirmed empty or not. Validation never holds a frame with a region (the trainer's validation cannot
+  ignore one): when its camera day is picked for validation it leaves both sides (`ignore_valid_day`; the
+  day is validation's), and that day's loss counts toward the rule that validation takes at most half of a
+  class's boxes. Without a validation split the trainer validates on the training frames without regions.
+- **`drop-frame`:** every train / valid frame with a region is left out, as earlier versions did; one
+  unsure or tiny object takes its whole frame out of training.
+
+`ignore_frames` in `dataset.json` counts the frames left out for regions (in `background` mode
+`ignore_only + ignore_valid_day`), with a warning; `dataset.json` records the mode in `options.ignore`, and
+the pre-flight report says it (`ignore_mode`, `ignore_kept`, `ignore_only`, `ignore_valid_day`). The
+scene filter comes first, so only in-scope frames count. The held-out set and its fingerprint do not depend
+on the mode.
 - **Held out:** the frames stay. Their `manifest.json` entry has `objects` for every frame: the boxes read
   back from the frame's YOLO lines, so they score exactly as `labels/` did, and the regions with
   `ignore: true`, renamed like the boxes. A region of a label the run has no class for is left out, as
@@ -416,6 +431,10 @@ such a box background. So the frame goes, as for a public set's `ignore` objects
 
 An export from an older version has no `ignore.json`, so its unsure objects stay unlabelled in training:
 export again.
+
+A size floor changes what an export marks as ignore regions, held-out frames included, and so the
+held-out set's fingerprint: benchmark scores of runs trained before and after a floor change do not
+compare (the Comparison card says so: their held-out fingerprints differ).
 
 ### Class inventory
 
@@ -1839,7 +1858,7 @@ The constants (`judge.rs`):
 | `GOOD_IOU` | 0.75 | IoU from which a pair is a good label; below it the label is loose. |
 | `ADD_SCORE` | 0.5 | Score from which an unmatched detection is a missing box. |
 | `ADD_SCORE_AT_SPOT` | 0.3 | The same at a static spot (never for people or animals, which form no spot): measured on the kept 8-epoch fold detections of 851 frames, an uncovered detection at a place labelled on 10 or more other frames of its camera is real about 90% of the time down to 0.3, while elsewhere detections at 0.3-0.5 are almost all false. |
-| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. |
+| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. With `collect.size_floor` set, the floor is that rule instead (the export's, at its own input size), and a training box under it is an ignore region for the check: no `verify`, `relabel` or loose count, out of the recall but for `recall_by_size` (where it still counts, so a floor can be chosen from it), while it still covers detections of its object (no `add` on it). |
 | `VERIFY_IOU` | 0.3 | IoU from which a detection of the object has found a training box. |
 | `MIN_CLASS_BOXES` | 50 | Boxes of a class in what the fold model trained on (the selection without the fold's frames) from which a `verify` is made for it: a camera day that holds most of a class leaves its own fold model few. |
 | `RELABEL_IOU` | 0.7 | IoU from which another object's detection lies on a training box. |

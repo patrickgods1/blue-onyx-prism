@@ -1177,6 +1177,7 @@ fn the_unseen_check_reads_the_datasets_names() {
         buckets: Vec::new(),
         split: Split::Val,
         labels: LabelFile::default(),
+        floor: None,
     };
     let ok = frame("ir.b.2026-10-21.x.jpg");
     let bad = frame("ir.a.2026-10-21.x.jpg");
@@ -1929,6 +1930,7 @@ fn static_spots_measure_on_a_copy() {
         &super::super::RefineFrames::default(),
         4,
         0,
+        cfg.collect.size_floor,
     );
     let wanted = Wanted { classes, hidden };
     let obs = statics::observations(&s.frames, &wanted);
@@ -2145,6 +2147,128 @@ fn static_spots_measure_on_a_copy() {
         }
         for w in &p.warnings {
             println!("  warning: {w}");
+        }
+    }
+}
+
+/// What a size floor does to a copy of a dataset (the measurement behind `collect.size_floor`'s
+/// default being off and the Refine tab's offer): `BOP_REFINE_CONFIG=<config file>
+/// BOP_FLOOR_OUT=<an empty scratch folder outside the dataset> cargo test --lib size_floor_measure
+/// -- --ignored --nocapture`. Reads the reviewed frames of the folder under review; counts the
+/// boxes under the floor (`BOP_FLOOR=<px>,<input>`, default 10,384); then exports the folder into
+/// `BOP_FLOOR_OUT` with the floor off and on (YOLO only, images copied or linked there: never into
+/// the dataset) and plans a training run on each export in both ignore modes (plan only). Never
+/// point `BOP_FLOOR_OUT` at a folder someone uses.
+#[test]
+#[ignore = "needs a copy of a dataset"]
+fn size_floor_measure_on_a_copy() {
+    use crate::collect::labels::SizeFloor;
+    use crate::collect::labels::export::{self as ex, ExportRequest, Format};
+    use crate::training::dataset::{self, IgnoreMode};
+    let (Some(path), Some(out)) = (
+        std::env::var_os("BOP_REFINE_CONFIG").map(PathBuf::from),
+        std::env::var_os("BOP_FLOOR_OUT").map(PathBuf::from),
+    ) else {
+        println!("skipped: BOP_REFINE_CONFIG or BOP_FLOOR_OUT is not set");
+        return;
+    };
+    let floor = std::env::var("BOP_FLOOR")
+        .ok()
+        .and_then(|v| {
+            let (px, input) = v.split_once(',')?;
+            Some(SizeFloor {
+                px: px.trim().parse().ok()?,
+                input: input.trim().parse().ok()?,
+            })
+        })
+        .unwrap_or(SizeFloor {
+            px: 10.0,
+            input: 384,
+        });
+    let cfg = Config::load(&path).unwrap();
+    let dir = cfg.collect.resolved_review_dir(&cfg.data_root());
+    let classes = &cfg.collect.classes;
+    let started = Instant::now();
+    let c = ex::floor_counts(&dir, classes, floor);
+    println!(
+        "=== {} at floor {} px / input {} ({} ms) ===",
+        dir.display(),
+        floor.px,
+        floor.input,
+        started.elapsed().as_millis()
+    );
+    println!(
+        "  {} reviewed frames; {} hold a training box under the floor, {} of them nothing else",
+        c.frames, c.frames_with, c.frames_only
+    );
+    for (class, n) in &c.boxes {
+        println!(
+            "  {class}: {} of {n} training boxes under the floor",
+            c.under.get(class).copied().unwrap_or(0)
+        );
+    }
+    for w in c.warnings.iter().take(5) {
+        println!("  warning: {w}");
+    }
+    let t = &cfg.training;
+    for (name, f) in [("off", None), ("on", Some(floor))] {
+        let req = ExportRequest {
+            formats: vec![Format::Yolo],
+            out_dir: out.join(format!("floor-{name}")),
+            split: ex::SplitConfig::default(),
+            benchmark_split: ex::BenchSplit::Val,
+            include_unreviewed: false,
+            hidden_classes: cfg.collect.hidden_classes.clone(),
+            size_floor: f,
+        };
+        let started = Instant::now();
+        let r = ex::run(&dir, classes, &req).unwrap();
+        println!(
+            "\n=== export, floor {name} ({} ms): {} frames ({} train, {} val), ignore regions {}, \
+             under the floor {:?} ===",
+            started.elapsed().as_millis(),
+            r.frames,
+            r.train,
+            r.val,
+            r.ignore_boxes,
+            r.under_floor
+        );
+        let sources = [dataset::read_export(&r.out_dir).unwrap()];
+        for (mode, cap) in [IgnoreMode::DropFrame, IgnoreMode::Background]
+            .into_iter()
+            .flat_map(|m| [(m, t.static_cap_option()), (m, None)])
+        {
+            let o = dataset::Options {
+                negative_share: t.negative_share,
+                heldout_share: t.heldout_share,
+                oversample: t.oversample,
+                static_cap: cap,
+                ignore: mode,
+                ..dataset::Options::default()
+            };
+            let p = crate::training::preflight::planned(&sources, &o).unwrap();
+            let s = &p.stats;
+            println!(
+                "  {}, static cap {cap:?}: training {} (positives {}, negatives {}), validation \
+                 {}, held out {}; boxes {:?}",
+                mode.as_str(),
+                p.train.len(),
+                s.train_positives,
+                s.train_negatives,
+                p.valid.len(),
+                p.heldout.len(),
+                s.train_boxes
+            );
+            println!(
+                "    frames with an ignore region: left out {} (only regions {}, validation days \
+                 {}), trained with it as background {} {:?}; held-out fingerprint {}",
+                s.ignore_frames,
+                s.ignore_only,
+                s.ignore_valid_day,
+                s.ignore_kept,
+                s.ignore_boxes_background,
+                &p.heldout_fingerprint[..12]
+            );
         }
     }
 }

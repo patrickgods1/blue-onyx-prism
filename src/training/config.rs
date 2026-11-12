@@ -117,6 +117,12 @@ pub struct TrainingConfig {
     /// without the key saves without it).
     #[serde(skip_serializing_if = "is_default_static_cap")]
     pub static_cap: usize,
+    /// What a train / valid frame with ignore regions (unsure, too small, under the export's size
+    /// floor) becomes ([`super::dataset::IgnoreMode`]): `background` (default, not written: the
+    /// frame trains with the object unlabelled, a frame of nothing else is left out, validation
+    /// never holds one) or `drop-frame` (every such frame left out, as earlier versions did).
+    #[serde(skip_serializing_if = "super::dataset::IgnoreMode::is_default")]
+    pub ignore: super::dataset::IgnoreMode,
 }
 
 /// Default `training.static_cap` ([`super::dataset::PARKED_CAP`]).
@@ -149,6 +155,7 @@ impl Default for TrainingConfig {
             workers: None,
             benchmark_devices: Vec::new(),
             static_cap: DEFAULT_STATIC_CAP,
+            ignore: super::dataset::IgnoreMode::Background,
         }
     }
 }
@@ -461,6 +468,27 @@ mod tests {
                 .to_string()
                 .contains("training.static_cap")
         );
+    }
+
+    #[test]
+    fn the_ignore_mode_defaults_to_background_and_is_written_only_when_changed() {
+        use crate::training::dataset::IgnoreMode;
+        let c = TrainingConfig::default();
+        assert_eq!(c.ignore, IgnoreMode::Background);
+        assert!(!serde_json::to_string(&c).unwrap().contains("ignore"));
+        let old: TrainingConfig = serde_json::from_str(r#"{"oversample": 2}"#).unwrap();
+        assert_eq!(old.ignore, IgnoreMode::Background);
+        let drop: TrainingConfig = serde_json::from_str(r#"{"ignore": "drop-frame"}"#).unwrap();
+        assert_eq!(drop.ignore, IgnoreMode::DropFrame);
+        let text = serde_json::to_string(&drop).unwrap();
+        assert!(text.contains(r#""ignore":"drop-frame""#), "{text}");
+        assert_eq!(serde_json::from_str::<TrainingConfig>(&text).unwrap(), drop);
+        assert!(serde_json::from_str::<TrainingConfig>(r#"{"ignore": "skip"}"#).is_err());
+        for m in [IgnoreMode::Background, IgnoreMode::DropFrame] {
+            assert_eq!(IgnoreMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(IgnoreMode::parse("Drop_Frame"), Some(IgnoreMode::DropFrame));
+        assert_eq!(IgnoreMode::parse("x"), None);
     }
 
     #[test]

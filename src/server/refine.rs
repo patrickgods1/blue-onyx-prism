@@ -912,6 +912,7 @@ mod tests {
                 short_px: 30.0,
                 found: true,
                 at_spot: false,
+                under_floor: false,
             }],
         );
         r.finish(&tally);

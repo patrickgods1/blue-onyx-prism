@@ -19,8 +19,21 @@
 //!
 //! Ignore regions ([`LabelBox::is_ignore`]: unsure boxes, boxes rejected as too small) are real
 //! objects not to train on. They stay out of the YOLO labels, so `ignore.json` ([`IgnoreFile`],
-//! at the export's root) names them per image: a training run leaves those frames out of train
-//! and valid instead of teaching the object as background. They are `ignore` in the benchmark set.
+//! at the export's root) names them per image: a training run knows the object is there (it
+//! trains the frame with the object as background, or leaves the frame out:
+//! `training::dataset::IgnoreMode`; validation never holds such a frame). They are `ignore` in
+//! the benchmark set.
+//!
+//! The size floor ([`ExportRequest::size_floor`], `collect.size_floor`, off by default): a
+//! training box whose short side at the floor's model input is under it ([`super::under_floor`])
+//! is exported as an ignore region exactly as an unsure box is (out of YOLO, in `ignore.json`
+//! marked `size_floor`, `ignore` in the benchmark set, `attributes.difficult` + `size_floor` in
+//! COCO); the X-AnyLabeling files keep it as a plain box (an import would otherwise make it
+//! `difficult` in the label file for good). The label file is never changed: a floor change is a
+//! re-export. `export.json` records the floor and counts the boxes under it ([`UnderFloor`]). A
+//! frame whose only training boxes are under the floor has ignore regions and no label, as a frame
+//! of unsure boxes only: an empty YOLO file, listed in `ignore.json`, never "confirmed empty"
+//! (that is the reviewer's flag) and left out of training.
 //!
 //! Frames whose only boxes a labelers run accepted at parked spots ([`ExportFrame::parked_spots`])
 //! are listed in `ignore.json` too (`parked`): identical crops can dominate training, so a training
@@ -43,7 +56,7 @@
 use super::super::layout::{self, Rel, Walker};
 use super::super::record::{Bucket, Record};
 use super::xany;
-use super::{BoxState, Frame, LabelBox, LabelFile, Status, clamp_box, spots};
+use super::{BoxState, Frame, LabelBox, LabelFile, SizeFloor, Status, clamp_box, spots};
 use crate::benchmark::images::{Manifest, ManifestImage, ManifestObject};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -208,6 +221,9 @@ pub struct ExportFrame {
     pub buckets: Vec<Bucket>,
     pub split: Split,
     pub labels: LabelFile,
+    /// The export's size floor ([`ExportRequest::size_floor`], set on every frame by the export;
+    /// None = off): a training box under it is exported as an ignore region ([`Self::under_floor`]).
+    pub floor: Option<SizeFloor>,
 }
 
 impl ExportFrame {
@@ -223,14 +239,31 @@ impl ExportFrame {
             .collect()
     }
 
-    /// Training boxes, clamped to the frame, empty ones left out.
+    /// A training box (accepted or added, no ignore region already) under the frame's size floor
+    /// ([`super::under_floor`]): the export makes it an ignore region, exactly as an unsure box is.
+    /// The label file keeps it as it is. Never with the floor off.
+    pub fn under_floor(&self, b: &LabelBox) -> bool {
+        b.is_training()
+            && !b.is_ignore()
+            && super::under_floor(&b.bbox, self.width, self.height, self.floor)
+    }
+
+    /// Training boxes (unsure ones included: COCO marks them), clamped to the frame, empty ones
+    /// and those under the size floor ([`Self::under_floor`]) left out.
     pub fn boxes(&self) -> Vec<&LabelBox> {
+        self.placed(|b| b.is_training() && !self.under_floor(b))
+    }
+
+    /// Every training box, the size floor regardless (the X-AnyLabeling files: a box left out there
+    /// would come back from an import as a rejected box), clamped to the frame, empty ones left out.
+    pub fn training_boxes(&self) -> Vec<&LabelBox> {
         self.placed(LabelBox::is_training)
     }
 
-    /// Ignore regions ([`LabelBox::is_ignore`]), clamped to the frame, empty ones left out.
+    /// Ignore regions ([`LabelBox::is_ignore`], and the training boxes under the size floor),
+    /// clamped to the frame, empty ones left out.
     pub fn ignore_boxes(&self) -> Vec<&LabelBox> {
-        self.placed(LabelBox::is_ignore)
+        self.placed(|b| b.is_ignore() || self.under_floor(b))
     }
 
     /// The parked spots of a frame whose training boxes all come from one, sorted; empty for any
@@ -271,6 +304,11 @@ pub struct IgnoreBox {
     pub cy: f64,
     pub w: f64,
     pub h: f64,
+    /// A training box the export's size floor made an ignore region ([`ExportFrame::under_floor`]),
+    /// not one a reviewer marked. Written only when true; older builds ignore the key and read the
+    /// region like any other.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub size_floor: bool,
 }
 
 /// [`IGNORE_FILE`]: image file name (the [`flat_name`] of `images/<split>/`) -> its ignore regions.
@@ -284,6 +322,10 @@ pub struct IgnoreFile {
     /// per spot. Absent in exports of older versions, and older builds skip it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parked: BTreeMap<String, Vec<String>>,
+    /// The size floor the export applied ([`ExportRequest::size_floor`]); absent when off (and in
+    /// exports of older versions, which older builds read the same).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<SizeFloor>,
 }
 
 /// File at the root of an export: what a training run needs to know about its frames beyond their
@@ -363,8 +405,9 @@ fn yolo_numbers(b: &LabelBox, f: &ExportFrame) -> [f64; 4] {
     ]
 }
 
-/// The ignore regions of `frames` ([`IgnoreFile`]). Labels are kept as reviewed, in the class list
-/// or not: such a box needs no class id, and the object is just as real.
+/// The ignore regions of `frames` ([`IgnoreFile`]; the training boxes under a frame's size floor
+/// among them, marked `size_floor`). Labels are kept as reviewed, in the class list or not: such a
+/// box needs no class id, and the object is just as real. `size_floor` is left for the caller.
 pub fn ignore_file(frames: &[ExportFrame]) -> IgnoreFile {
     let images = frames
         .iter()
@@ -380,6 +423,7 @@ pub fn ignore_file(frames: &[ExportFrame]) -> IgnoreFile {
                         cy,
                         w,
                         h,
+                        size_floor: f.under_floor(b),
                     }
                 })
                 .collect();
@@ -397,13 +441,15 @@ pub fn ignore_file(frames: &[ExportFrame]) -> IgnoreFile {
         version: IGNORE_VERSION,
         images,
         parked,
+        size_floor: None,
     }
 }
 
 /// COCO instances JSON of `frames` (file names as given): category ids 1..=K in `classes`
 /// order, image and annotation ids 1.. in order, `bbox` `[x, y, w, h]` in pixels (2 decimals),
-/// `area` = w * h, `iscrowd` 0, `attributes.difficult` on unsure boxes. A frame without objects
-/// is an image without annotations.
+/// `area` = w * h, `iscrowd` 0, `attributes.difficult` on unsure boxes, and on the boxes under a
+/// frame's size floor (with `attributes.size_floor`), as on the other ignore regions that are
+/// training boxes. A frame without objects is an image without annotations.
 pub fn coco_json(frames: &[&ExportFrame], classes: &[String]) -> Result<serde_json::Value> {
     use serde_json::json;
     let mut images = Vec::new();
@@ -416,7 +462,7 @@ pub fn coco_json(frames: &[&ExportFrame], classes: &[String]) -> Result<serde_js
             "width": f.width,
             "height": f.height,
         }));
-        for b in f.boxes() {
+        for b in f.training_boxes() {
             let Some(cat) = classes.iter().position(|c| *c == b.label) else {
                 bail!(
                     "{}: label '{}' is not in the class list",
@@ -434,10 +480,15 @@ pub fn coco_json(frames: &[&ExportFrame], classes: &[String]) -> Result<serde_js
                 "area": round_to(w * h, 2),
                 "iscrowd": 0,
             });
-            if b.difficult
+            let attributes = if f.under_floor(b) {
+                Some(json!({"difficult": true, "size_floor": true}))
+            } else {
+                b.difficult.then(|| json!({"difficult": true}))
+            };
+            if let Some(a) = attributes
                 && let Some(o) = ann.as_object_mut()
             {
-                o.insert("attributes".into(), json!({"difficult": true}));
+                o.insert("attributes".into(), a);
             }
             anns.push(ann);
         }
@@ -473,7 +524,8 @@ fn tags(f: &ExportFrame) -> Vec<String> {
 
 /// The benchmark manifest of `frames`: their training boxes as ground truth, scored on
 /// `classes` only (predictions of other labels count neither way); ignore regions
-/// ([`LabelBox::is_ignore`], also the too-small rejects that are no training box) are `ignore`.
+/// ([`LabelBox::is_ignore`], also the too-small rejects that are no training box, and the
+/// training boxes under the size floor, [`ExportFrame::under_floor`]) are `ignore`.
 pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str) -> Manifest {
     Manifest {
         id: id.to_string(),
@@ -497,7 +549,7 @@ pub fn benchmark_manifest(frames: &[&ExportFrame], classes: &[String], id: &str)
                         .map(|b| ManifestObject {
                             label: b.label.clone(),
                             bbox: clamp_box(b.bbox, f.width, f.height),
-                            ignore: b.is_ignore(),
+                            ignore: b.is_ignore() || f.under_floor(b),
                             crowd: false,
                         })
                         .collect(),
@@ -575,6 +627,23 @@ pub struct ExportRequest {
     /// `collect.hidden_classes`: the pre-fill of those unreviewed frames leaves them out
     /// ([`super::prefill`]).
     pub hidden_classes: Vec<String>,
+    /// `collect.size_floor`: training boxes under it are exported as ignore regions
+    /// ([`ExportFrame::under_floor`]; the X-AnyLabeling files keep them as they are). None = off,
+    /// the export as before.
+    pub size_floor: Option<SizeFloor>,
+}
+
+/// The training boxes an export's size floor made ignore regions ([`ExportReport::under_floor`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnderFloor {
+    /// Per class, on frames of the `train` split.
+    pub train: BTreeMap<String, usize>,
+    /// Per class, on held-out (`val`) frames: ignore regions there, detections on them do not
+    /// count.
+    pub val: BTreeMap<String, usize>,
+    /// Frames left with no label but ignore regions because of the floor: a training run leaves
+    /// them out, they are no "nothing here" frame.
+    pub frames_only: usize,
 }
 
 /// What [`run`] wrote.
@@ -611,6 +680,13 @@ pub struct ExportReport {
     pub lost_frames: usize,
     /// Folders of the dataset that could not be listed: their frames are not in this export.
     pub unreadable_folders: usize,
+    /// The size floor applied ([`ExportRequest::size_floor`]); absent when off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<SizeFloor>,
+    /// The training boxes it made ignore regions, per split and class (in `ignore_boxes` too, not
+    /// in `per_class`); absent when off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub under_floor: Option<UnderFloor>,
 }
 
 /// One (camera, date) group of an export.
@@ -773,6 +849,7 @@ pub fn reviewed_frames_filtered(
             buckets: rec.buckets,
             split: Split::Train,
             labels,
+            floor: None,
         });
     }
     let groups: BTreeSet<Group> = frames
@@ -796,6 +873,60 @@ pub fn reviewed_frames_filtered(
         lost_frames: lost.len(),
         unreadable_folders: scan.unreadable.len(),
     }
+}
+
+/// What a size floor would do to the reviewed frames of a folder ([`floor_counts`]): the numbers of
+/// a settings card, before any export.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct FloorCounts {
+    /// Reviewed frames an export would hold.
+    pub frames: usize,
+    /// Their training boxes per class (accepted or added, no ignore region).
+    pub boxes: BTreeMap<String, usize>,
+    /// Of `boxes`, those under the floor: ignore regions in the next export.
+    pub under: BTreeMap<String, usize>,
+    /// Frames holding at least one box under the floor.
+    pub frames_with: usize,
+    /// Of them, frames left with no label but ignore regions (a training run leaves them out).
+    pub frames_only: usize,
+    /// What the walk could not read ([`reviewed_frames_filtered`]).
+    pub warnings: Vec<String>,
+}
+
+/// The training boxes of the reviewed frames of `dir` under `floor`, per class, and the frames they
+/// are on: what an export with that floor would turn into ignore regions. Reads only (the walk of
+/// an export); slow on a large folder, so call it off the async threads (`server::blocking`).
+pub fn floor_counts(dir: &Path, classes: &[String], floor: SizeFloor) -> FloorCounts {
+    let sel = reviewed_frames_filtered(
+        dir,
+        classes,
+        &SplitConfig::default(),
+        &ClassFilter::default(),
+    );
+    let mut out = FloorCounts {
+        frames: sel.frames.len(),
+        warnings: sel.warnings,
+        ..FloorCounts::default()
+    };
+    for f in sel.frames {
+        let f = ExportFrame {
+            floor: Some(floor),
+            ..f
+        };
+        let mut under = 0usize;
+        for b in f.placed(|b| b.is_training() && !b.is_ignore()) {
+            *out.boxes.entry(b.label.clone()).or_default() += 1;
+            if f.under_floor(b) {
+                *out.under.entry(b.label.clone()).or_default() += 1;
+                under += 1;
+            }
+        }
+        if under > 0 {
+            out.frames_with += 1;
+            out.frames_only += usize::from(!f.boxes().iter().any(|b| !b.difficult));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1090,12 +1221,15 @@ fn build_export(
     build: &Path,
 ) -> Result<ExportReport> {
     let Selection {
-        frames,
+        mut frames,
         mut warnings,
         filtered_out,
         lost_frames,
         unreadable_folders,
     } = selected;
+    for f in &mut frames {
+        f.floor = req.size_floor;
+    }
     let mut r = ExportReport {
         out_dir: out.to_path_buf(),
         formats: req.formats.clone(),
@@ -1106,6 +1240,8 @@ fn build_export(
         filtered_out,
         lost_frames,
         unreadable_folders,
+        size_floor: req.size_floor,
+        under_floor: req.size_floor.map(|_| UnderFloor::default()),
         ..ExportReport::default()
     };
     let mut groups: BTreeMap<Group, (Split, usize)> = BTreeMap::new();
@@ -1117,6 +1253,18 @@ fn build_export(
         r.empty_confirmed += usize::from(f.labels.empty_confirmed);
         for b in f.boxes() {
             *r.per_class.entry(b.label.clone()).or_default() += 1;
+        }
+        if let Some(u) = &mut r.under_floor {
+            let under = f.placed(|b| f.under_floor(b));
+            let side = match f.split {
+                Split::Train => &mut u.train,
+                Split::Val => &mut u.val,
+            };
+            for b in &under {
+                *side.entry(b.label.clone()).or_default() += 1;
+            }
+            let labelled = f.boxes().iter().any(|b| !b.difficult);
+            u.frames_only += usize::from(!under.is_empty() && !labelled);
         }
         groups
             .entry((f.rel.camera.clone(), f.rel.date.clone()))
@@ -1199,7 +1347,9 @@ fn build_export(
         std::fs::create_dir_all(&xdir)?;
         for f in &frames {
             link_or_copy(&f.image, &xdir.join(&f.name))?;
-            let x = xany::to_xany(&f.name, f.width, f.height, f.boxes(), true);
+            // Every training box, the floor regardless: an import treats a box missing here as
+            // rejected, and `difficult` on it would stay in the label file for good.
+            let x = xany::to_xany(&f.name, f.width, f.height, f.training_boxes(), true);
             let stem = f.name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
         }
@@ -1279,7 +1429,8 @@ fn build_export(
             &build.join(FRAMES_FILE),
             &json_bytes(&frame_notes(&frames))?,
         )?;
-        let ignore = ignore_file(&frames);
+        let mut ignore = ignore_file(&frames);
+        ignore.size_floor = req.size_floor;
         r.ignore_boxes = ignore.images.values().map(Vec::len).sum();
         write_file(&build.join(IGNORE_FILE), &json_bytes(&ignore)?)?;
     }
@@ -1423,6 +1574,7 @@ mod tests {
                 boxes,
                 ..LabelFile::default()
             },
+            floor: None,
         }
     }
 
@@ -1726,6 +1878,7 @@ mod tests {
             benchmark_split: BenchSplit::All,
             include_unreviewed: false,
             hidden_classes: Vec::new(),
+            size_floor: None,
         };
         let filter = ClassFilter {
             labels: vec!["raccoon".into()],
@@ -1903,6 +2056,7 @@ mod tests {
                     cy: 0.14,
                     w: 0.02,
                     h: 0.08,
+                    size_floor: false,
                 },
                 IgnoreBox {
                     label: "raccoon".into(),
@@ -1910,9 +2064,265 @@ mod tests {
                     cy: 0.25,
                     w: 0.2,
                     h: 0.3,
+                    size_floor: false,
                 },
             ]
         );
+    }
+
+    fn floor_384() -> Option<SizeFloor> {
+        Some(SizeFloor {
+            px: 10.0,
+            input: 384,
+        })
+    }
+
+    #[test]
+    fn a_box_under_the_size_floor_is_exported_as_an_unsure_box_is() {
+        // 200 x 100 at 384: 4 px wide is 7.7 px, under 10; the dog is 77 px.
+        let tiny = lb("person", [100.0, 10.0, 104.0, 30.0], BoxState::Accepted);
+        let dog = lb("dog", [20.0, 10.0, 60.0, 50.0], BoxState::Accepted);
+        let unsure = LabelBox {
+            difficult: true,
+            ..lb("raccoon", [120.0, 10.0, 160.0, 40.0], BoxState::Accepted)
+        };
+        let mut f = frame(vec![dog.clone(), tiny.clone(), unsure.clone()], false);
+        let off = f.clone();
+        f.floor = floor_384();
+        assert!(f.under_floor(&f.labels.boxes[1]));
+        assert!(!f.under_floor(&f.labels.boxes[0]) && !f.under_floor(&f.labels.boxes[2]));
+        assert_eq!(
+            yolo_txt(&f, &classes()).unwrap(),
+            "1 0.200000 0.300000 0.200000 0.400000\n",
+            "out of the labels"
+        );
+        assert_eq!(
+            yolo_txt(&off, &classes()).unwrap(),
+            "1 0.200000 0.300000 0.200000 0.400000\n0 0.510000 0.200000 0.020000 0.200000\n",
+            "the floor off: a label as before"
+        );
+        let file = ignore_file(&[f.clone()]);
+        let regions: Vec<(&str, bool)> = file.images[&f.name]
+            .iter()
+            .map(|b| (b.label.as_str(), b.size_floor))
+            .collect();
+        assert_eq!(regions, [("person", true), ("raccoon", false)]);
+        let text = serde_json::to_string(&ignore_file(std::slice::from_ref(&off))).unwrap();
+        assert!(!text.contains("size_floor"), "{text}");
+        // An older reader of ignore.json reads the marked region like any other.
+        #[derive(Deserialize)]
+        struct OldBox {
+            label: String,
+        }
+        #[derive(Deserialize)]
+        struct OldFile {
+            images: BTreeMap<String, Vec<OldBox>>,
+        }
+        let mut marked = ignore_file(&[f.clone()]);
+        marked.size_floor = floor_384();
+        let old: OldFile = serde_json::from_slice(&json_bytes(&marked).unwrap()).unwrap();
+        assert_eq!(old.images[&f.name][0].label, "person");
+        let coco = coco_json(&[&f], &classes()).unwrap();
+        let attrs: Vec<serde_json::Value> = coco["annotations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.get("attributes").cloned().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            attrs,
+            [
+                serde_json::Value::Null,
+                serde_json::json!({"difficult": true, "size_floor": true}),
+                serde_json::json!({"difficult": true}),
+            ]
+        );
+        assert_eq!(
+            coco_json(&[&off], &classes()).unwrap()["annotations"][1].get("attributes"),
+            None
+        );
+        let m = benchmark_manifest(&[&f], &classes(), "t");
+        let objs: Vec<(&str, bool)> = m.images[0]
+            .objects
+            .iter()
+            .flatten()
+            .map(|o| (o.label.as_str(), o.ignore))
+            .collect();
+        assert_eq!(objs, [("dog", false), ("person", true), ("raccoon", true)]);
+        // X-AnyLabeling keeps every training box as it is.
+        assert_eq!(f.training_boxes().len(), 3);
+        assert_eq!(f.boxes().len(), 2);
+        // A box already an ignore region, or no training box, is not the floor's.
+        let mut rejected = tiny.clone();
+        rejected.state = BoxState::Rejected;
+        let tiny_unsure = LabelBox {
+            difficult: true,
+            ..tiny
+        };
+        assert!(!f.under_floor(&rejected) && !f.under_floor(&tiny_unsure));
+    }
+
+    #[test]
+    fn an_export_with_a_size_floor_changes_no_label_file_and_says_what_it_did() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        // 64 x 48 frames at 384: 1 px wide is 6 px, under the floor of 10.
+        let tiny = |label: &str| lb(label, [1.0, 1.0, 2.0, 9.0], BoxState::Accepted);
+        let big = |label: &str| lb(label, [30.0, 4.0, 60.0, 40.0], BoxState::Accepted);
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "a",
+            vec![big("dog"), tiny("person")],
+            false,
+        );
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "b",
+            vec![tiny("person")],
+            false,
+        );
+        put_reviewed(
+            &dir,
+            "yard",
+            "2026-10-22",
+            "c",
+            vec![tiny("raccoon")],
+            false,
+        );
+        put_reviewed(&dir, "yard", "2026-10-22", "d", vec![big("person")], false);
+        let files: Vec<PathBuf> = [
+            "drive/2026-10-21/a",
+            "drive/2026-10-21/b",
+            "yard/2026-10-22/c",
+        ]
+        .iter()
+        .map(|p| {
+            dir.join("day")
+                .join(format!("{p}{}", super::super::LABELS_SUFFIX))
+        })
+        .collect();
+        let bytes = || {
+            files
+                .iter()
+                .map(|p| std::fs::read(p).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let before = bytes();
+        let req = |out: &str, floor: Option<SizeFloor>| ExportRequest {
+            formats: Format::ALL.to_vec(),
+            out_dir: root.join(out),
+            split: SplitConfig {
+                holdout_cameras: vec!["yard".into()],
+                ..SplitConfig::default()
+            },
+            benchmark_split: BenchSplit::All,
+            include_unreviewed: false,
+            hidden_classes: Vec::new(),
+            size_floor: floor,
+        };
+        let off = run(&dir, &classes(), &req("off", None)).unwrap();
+        let on = run(&dir, &classes(), &req("on", floor_384())).unwrap();
+        assert_eq!(bytes(), before, "the label files are never rewritten");
+        // Off: nothing new in the files.
+        for name in ["export.json", IGNORE_FILE] {
+            let text = std::fs::read_to_string(root.join("off").join(name)).unwrap();
+            assert!(!text.contains("floor"), "{name}: {text}");
+        }
+        assert_eq!((off.size_floor, off.under_floor.as_ref()), (None, None));
+        assert_eq!(off.per_class.get("person"), Some(&3));
+        // On: recorded and counted per split and class.
+        assert_eq!(on.size_floor, floor_384());
+        let u = on.under_floor.clone().unwrap();
+        assert_eq!(u.train, BTreeMap::from([("person".to_string(), 2)]));
+        assert_eq!(u.val, BTreeMap::from([("raccoon".to_string(), 1)]));
+        assert_eq!(
+            u.frames_only, 2,
+            "b and c are left with ignore regions only"
+        );
+        assert_eq!(on.per_class.get("person"), Some(&1));
+        assert_eq!((on.ignore_boxes, off.ignore_boxes), (3, 0));
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("on/export.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            report["size_floor"],
+            serde_json::json!({"px": 10.0, "input": 384})
+        );
+        assert_eq!(report["under_floor"]["train"]["person"], 2);
+        let ignore: IgnoreFile =
+            serde_json::from_slice(&std::fs::read(root.join("on").join(IGNORE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(ignore.size_floor, floor_384());
+        assert!(ignore.images.values().flatten().all(|b| b.size_floor));
+        // A frame of tiny boxes only is no confirmed-empty frame, and its label file is empty.
+        let notes: FrameNotes =
+            serde_json::from_slice(&std::fs::read(root.join("on").join(FRAMES_FILE)).unwrap())
+                .unwrap();
+        assert!(notes.empty_confirmed.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("on/labels/train/day.drive.2026-10-21.b.txt"))
+                .unwrap(),
+            ""
+        );
+        // X-AnyLabeling gets every box as reviewed, so an import changes nothing.
+        let x: xany::XFile = serde_json::from_slice(
+            &std::fs::read(root.join("on/xanylabeling/day.drive.2026-10-21.a.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(x.shapes.len(), 2);
+        assert!(x.shapes.iter().all(|s| !s.difficult));
+        // What a training run reads: the tiny person an ignore region beside the dog.
+        let source = crate::training::dataset::read_export(&root.join("on")).unwrap();
+        let a = source
+            .frames
+            .iter()
+            .find(|f| f.image.ends_with("day.drive.2026-10-21.a.jpg"))
+            .unwrap();
+        assert_eq!((a.boxes.len(), a.ignore.len()), (1, 1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn floor_counts_name_the_boxes_an_export_would_turn_into_ignore_regions() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        let tiny = |label: &str| lb(label, [1.0, 1.0, 2.0, 9.0], BoxState::Accepted);
+        let big = |label: &str| lb(label, [30.0, 4.0, 60.0, 40.0], BoxState::Accepted);
+        let unsure = LabelBox {
+            difficult: true,
+            ..tiny("dog")
+        };
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "a",
+            vec![big("dog"), tiny("person")],
+            false,
+        );
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "b",
+            vec![tiny("person"), unsure],
+            false,
+        );
+        put_reviewed(&dir, "yard", "2026-10-22", "c", vec![big("person")], false);
+        let c = floor_counts(&dir, &classes(), floor_384().unwrap());
+        assert_eq!(c.frames, 3);
+        assert_eq!(
+            c.boxes,
+            BTreeMap::from([("dog".to_string(), 1), ("person".to_string(), 3)]),
+            "an unsure box is an ignore region already"
+        );
+        assert_eq!(c.under, BTreeMap::from([("person".to_string(), 2)]));
+        assert_eq!((c.frames_with, c.frames_only), (2, 1));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1955,6 +2365,7 @@ mod tests {
             benchmark_split: BenchSplit::All,
             include_unreviewed: false,
             hidden_classes: Vec::new(),
+            size_floor: None,
         };
         let r = run(&dir, &classes(), &req).unwrap();
         assert_eq!(
@@ -2072,6 +2483,7 @@ mod tests {
             benchmark_split: BenchSplit::All,
             include_unreviewed: false,
             hidden_classes: Vec::new(),
+            size_floor: None,
         }
     }
 

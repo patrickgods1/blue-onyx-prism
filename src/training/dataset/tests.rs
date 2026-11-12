@@ -1119,6 +1119,7 @@ fn review_export(
             benchmark_split: Default::default(),
             include_unreviewed: false,
             hidden_classes: Vec::new(),
+            size_floor: None,
         },
     )
     .unwrap()
@@ -1654,6 +1655,14 @@ fn name_of(s: &Source, r: FrameRef) -> String {
     file_name(&s.frames[r.1].image)
 }
 
+/// The options of earlier versions for frames with ignore regions: each leaves train and valid.
+fn drop_frame() -> Options {
+    Options {
+        ignore: IgnoreMode::DropFrame,
+        ..Options::default()
+    }
+}
+
 fn used(p: &Plan, r: FrameRef) -> bool {
     p.train.iter().any(|(t, _)| *t == r) || p.valid.contains(&r)
 }
@@ -1740,7 +1749,7 @@ fn with_regions(dir: &Path, opts: &Options) -> (Plan, FrameRef, FrameRef) {
 #[test]
 fn a_frame_with_an_ignore_region_leaves_train_and_valid_and_is_counted() {
     let t = tmp("ignore-plan");
-    let opts = Options::default();
+    let opts = drop_frame();
     let (before, pooled, held) = with_regions(&t.0, &opts);
     let s = read_export(&t.0).unwrap();
     let p = plan(std::slice::from_ref(&s), &opts).unwrap();
@@ -1768,14 +1777,14 @@ fn a_frame_with_an_ignore_region_leaves_train_and_valid_and_is_counted() {
 #[test]
 fn a_frame_left_out_by_the_scene_filter_is_not_counted_as_ignored() {
     let t = tmp("ignore-scene");
-    let opts = Options::default();
+    let opts = drop_frame();
     let (_, pooled, _) = with_regions(&t.0, &opts);
     let s = read_export(&t.0).unwrap();
     let scene = s.frames[pooled.1].scene.clone().unwrap();
     let other = if scene == "day" { "ir" } else { "day" };
     let filtered = Options {
         scene: SceneFilter::parse(other).unwrap(),
-        ..Options::default()
+        ..drop_frame()
     };
     let p = plan(std::slice::from_ref(&s), &filtered).unwrap();
     assert_eq!(p.stats.ignore_frames, 0);
@@ -1793,7 +1802,7 @@ fn every_frame_of_a_class_with_a_region_explains_the_refusal() {
         .collect();
     ignore_json(&t.0, &regions);
     let s = read_export(&t.0).unwrap();
-    let e = plan(&[s], &Options::default()).unwrap_err().to_string();
+    let e = plan(&[s], &drop_frame()).unwrap_err().to_string();
     assert!(e.contains("unsure or too-small"), "{e}");
 }
 
@@ -1977,7 +1986,7 @@ fn a_confirmed_empty_frame_stays_a_hard_negative() {
         serde_json::from_slice(&std::fs::read(t.0.join("manifest.json")).unwrap()).unwrap();
     let opts = Options {
         negative_share: 0.5,
-        ..Options::default()
+        ..drop_frame()
     };
     let p = plan(std::slice::from_ref(&s), &opts).unwrap();
     let empty = *p
@@ -2012,6 +2021,229 @@ fn a_confirmed_empty_frame_stays_a_hard_negative() {
         "still trained on as a frame without objects"
     );
     assert_eq!(p.stats.ignore_frames, 1);
+}
+
+fn region(class: &str) -> YoloBox {
+    YoloBox {
+        class: class.into(),
+        cx: 0.9,
+        cy: 0.9,
+        w: 0.02,
+        h: 0.03,
+    }
+}
+
+/// `s` with an ignore region of `class` on frame `r`.
+fn with_region(s: &Source, r: FrameRef, class: &str) -> Source {
+    let mut s = s.clone();
+    s.frames[r.1].ignore.push(region(class));
+    s
+}
+
+#[test]
+fn without_ignore_regions_both_modes_plan_the_same() {
+    let t = tmp("ignore-modes-same");
+    camera_export(&t.0);
+    let s = [read_export(&t.0).unwrap()];
+    let a = plan(&s, &Options::default()).unwrap();
+    let b = plan(&s, &drop_frame()).unwrap();
+    assert_eq!(a, b);
+    let stats = serde_json::to_value(&a.stats).unwrap();
+    for k in [
+        "ignore_frames",
+        "ignore_only",
+        "ignore_valid_day",
+        "ignore_kept",
+        "ignore_boxes_background",
+    ] {
+        assert!(stats.get(k).is_none(), "{k} is not written when 0: {stats}");
+    }
+}
+
+#[test]
+fn a_frame_with_a_label_and_a_region_trains_with_the_region_as_background() {
+    let t = tmp("ignore-background");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let opts = Options::default();
+    let before = plan(std::slice::from_ref(&s), &opts).unwrap();
+    let pool: Vec<FrameRef> = before
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(before.valid.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let (mut kept, mut valid_days, mut only) = (0, 0, 0);
+    for r in pool {
+        let one = [with_region(&s, r, "dog")];
+        let p = plan(&one, &opts).unwrap();
+        let st = &p.stats;
+        assert!(
+            !p.valid.contains(&r),
+            "{r:?}: validation cannot ignore a region"
+        );
+        assert_eq!(p.heldout, before.heldout, "the held-out set does not move");
+        assert_eq!(p.heldout_fingerprint, before.heldout_fingerprint);
+        assert_eq!(st.ignore_frames, st.ignore_only + st.ignore_valid_day);
+        if s.frames[r.1].boxes.is_empty() {
+            // Nothing else on it: neither a positive nor a negative.
+            assert!(!used(&p, r), "{r:?}");
+            assert_eq!((st.ignore_only, st.ignore_kept), (1, 0));
+            only += 1;
+        } else if p.train.iter().any(|(x, _)| *x == r) {
+            assert_eq!(
+                (st.ignore_kept, st.ignore_only, st.ignore_valid_day),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                st.ignore_boxes_background,
+                BTreeMap::from([("dog".to_string(), 1)])
+            );
+            assert!(
+                p.warnings
+                    .iter()
+                    .any(|w| w.starts_with("1 training frame(s) show an unsure or too-small")),
+                "{:?}",
+                p.warnings
+            );
+            kept += 1;
+        } else {
+            // Its camera day validates: out of both sides, counted.
+            assert!(!used(&p, r));
+            assert!(st.valid_groups.contains(&group(&one, r)), "{r:?}");
+            assert_eq!((st.ignore_valid_day, st.ignore_kept), (1, 0));
+            assert!(p.warnings.iter().any(|w| w.contains("used for validation")));
+            valid_days += 1;
+        }
+    }
+    assert!(
+        kept > 0 && valid_days > 0 && only > 0,
+        "every path is taken: kept {kept}, validation days {valid_days}, region only {only}"
+    );
+}
+
+#[test]
+fn a_frame_with_only_a_region_is_no_negative() {
+    let t = tmp("ignore-no-negative");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let opts = Options {
+        negative_share: 0.9,
+        ..Options::default()
+    };
+    let before = plan(std::slice::from_ref(&s), &opts).unwrap();
+    // A frame without boxes that trained as a negative, and one a reviewer confirmed empty.
+    let empty = *before
+        .train
+        .iter()
+        .map(|(r, _)| r)
+        .find(|r| s.frames[r.1].boxes.is_empty())
+        .expect("a negative in training");
+    let mut with = with_region(&s, empty, "cat");
+    with.frames[empty.1].hard_negative = true;
+    let p = plan(&[with], &opts).unwrap();
+    assert!(
+        !used(&p, empty),
+        "an unlabelled object is no 'nothing here', confirmed empty or not"
+    );
+    assert_eq!((p.stats.ignore_only, p.stats.ignore_kept), (1, 0));
+}
+
+#[test]
+fn the_held_out_set_and_its_fingerprint_do_not_depend_on_the_ignore_mode() {
+    let t = tmp("ignore-mode-print");
+    let (_, pooled, held) = with_regions(&t.0, &Options::default());
+    let s = [read_export(&t.0).unwrap()];
+    assert!(!s[0].frames[pooled.1].ignore.is_empty() && !s[0].frames[held.1].ignore.is_empty());
+    let a = plan(&s, &Options::default()).unwrap();
+    let b = plan(&s, &drop_frame()).unwrap();
+    assert_eq!(a.heldout, b.heldout);
+    assert_eq!(a.heldout_fingerprint, b.heldout_fingerprint);
+    assert!(a.heldout.contains(&held) && !used(&a, held) && !used(&b, held));
+}
+
+#[test]
+fn a_trained_frame_writes_its_labels_without_the_region_and_never_validates() {
+    let t = tmp("ignore-write");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let opts = Options::default();
+    let before = plan(std::slice::from_ref(&s), &opts).unwrap();
+    let r = before
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .find(|r| s.frames[r.1].boxes.len() == 2)
+        .unwrap();
+    let s = [with_region(&s, r, "cat")];
+    let p = plan(&s, &opts).unwrap();
+    assert!(p.train.iter().any(|(x, _)| *x == r), "{:?}", p.stats);
+    let dir = t.0.join("prepared");
+    write(&s, &p, &opts, &dir).unwrap();
+    let name = format!("s0-{}", name_of(&s[0], r));
+    let label = std::fs::read_to_string(
+        dir.join("labels")
+            .join(format!("{}.txt", stem(Path::new(&name)))),
+    )
+    .unwrap();
+    assert_eq!(
+        label.lines().count(),
+        2,
+        "its two boxes, no region: {label}"
+    );
+    assert!(!label.contains("0.900000"), "{label}");
+    let train = std::fs::read_to_string(dir.join("train.txt")).unwrap();
+    let valid = std::fs::read_to_string(dir.join("valid.txt")).unwrap();
+    assert!(train.contains(&name) && !valid.contains(&name));
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["options"]["ignore"], "background");
+    assert_eq!(summary["stats"]["ignore_kept"], 1);
+    assert_eq!(summary["stats"]["ignore_boxes_background"]["cat"], 1);
+    let d = drop_frame();
+    let dp = plan(&s, &d).unwrap();
+    let ddir = t.0.join("prepared-drop");
+    write(&s, &dp, &d, &ddir).unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ddir.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["options"]["ignore"], "drop-frame");
+    assert_eq!(summary["stats"]["ignore_frames"], 1);
+}
+
+#[test]
+fn neither_validation_fallback_takes_a_frame_with_a_region() {
+    let t = tmp("ignore-fallback");
+    let source = |n: usize| {
+        let mut s = one_image_source(&t.0, n);
+        for (i, f) in s.frames.iter_mut().enumerate() {
+            f.image = t.0.join(format!("{i}.jpg"));
+        }
+        s.frames[0].ignore.push(region("person"));
+        s
+    };
+    let opts = Options {
+        heldout_share: 0.0,
+        val_share: 0.0,
+        min_valid: 0,
+        negative_share: 0.0,
+        static_cap: None,
+        ..Options::default()
+    };
+    // One camera day: validation frame by frame, never the frame with the region; it trains.
+    let p = plan(&[source(6)], &opts).unwrap();
+    assert!(
+        !p.valid.is_empty() && !p.valid.contains(&(0, 0)),
+        "{:?}",
+        p.valid
+    );
+    assert!(p.train.iter().any(|(r, _)| *r == (0, 0)));
+    assert_eq!(p.stats.ignore_kept, 1);
+    // Too few frames for a split: the trainer validates on the training frames without regions.
+    let p = plan(&[source(2)], &opts).unwrap();
+    assert_eq!(p.train.len(), 2);
+    assert_eq!(p.valid, [(0, 1)]);
 }
 
 /// `n` training frames of camera `a` with only the parked spot `spot`, and `free` frames with a
@@ -2135,6 +2367,7 @@ fn the_export_names_frames_with_only_parked_boxes() {
             vec!["cam/8x8/person/1,1,5,5".to_string()],
         )]
         .into(),
+        size_floor: None,
     };
     std::fs::write(dir.join(IGNORE_FILE), serde_json::to_vec(&file).unwrap()).unwrap();
     let s = read_export(dir).unwrap();

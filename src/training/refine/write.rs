@@ -287,6 +287,7 @@ mod tests {
             class_boxes: &counts,
             run: "r1",
             spots: Some(&table),
+            floor: None,
         };
         let frames: Vec<&ExportFrame> = sel.frames.iter().collect();
         let mut tally = RecallTally::default();

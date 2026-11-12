@@ -7,7 +7,7 @@
 use super::capability;
 use super::capability::Capability;
 use super::compare::{self, CompareRun};
-use super::dataset::{self, Excluded, SceneFilter};
+use super::dataset::{self, Excluded, IgnoreMode, SceneFilter};
 use super::estimate;
 use super::job::{BenchSummary, Hooks, TrainOutput, TrainRequest};
 use super::preflight;
@@ -787,6 +787,13 @@ pub struct DataArgs {
     /// Default: `training.static_cap` (20).
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=super::config::MAX_STATIC_CAP as u64))]
     pub static_cap: Option<u64>,
+    /// What a training frame with an unsure or too-small object (an ignore region, also a box under
+    /// collect.size_floor) becomes: `background` (it trains with the object unlabelled; a frame of
+    /// nothing else is left out, and validation never holds one) or `drop-frame` (every such frame
+    /// is left out). Held-out frames keep the regions either way. Default: `training.ignore`
+    /// (background).
+    #[arg(long, value_parser = parse_ignore)]
+    pub ignore: Option<IgnoreMode>,
 }
 
 impl DataArgs {
@@ -796,6 +803,16 @@ impl DataArgs {
         let mut c = config.clone();
         if let Some(n) = self.static_cap {
             c.training.static_cap = usize::try_from(n).unwrap_or(super::config::MAX_STATIC_CAP);
+        }
+        c
+    }
+
+    /// `config` with the plan's flags over the `training` section: `--static-cap`
+    /// ([`Self::with_static_cap`]) and `--ignore` over `training.ignore`. In memory only.
+    pub fn with_plan_flags(&self, config: &Config) -> Config {
+        let mut c = self.with_static_cap(config);
+        if let Some(m) = self.ignore {
+            c.training.ignore = m;
         }
         c
     }
@@ -865,6 +882,10 @@ pub struct ClassesArgs {
 
 fn parse_excluded(s: &str) -> Result<Excluded, String> {
     Excluded::parse(s).ok_or_else(|| format!("'{s}' is not background or drop-frame"))
+}
+
+fn parse_ignore(s: &str) -> Result<IgnoreMode, String> {
+    IgnoreMode::parse(s).ok_or_else(|| format!("'{s}' is not background or drop-frame"))
 }
 
 fn parse_scene(s: &str) -> Result<SceneFilter, String> {
@@ -960,8 +981,8 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let [scene] = data.scenes()[..] else {
                 bail!("prepare takes one --scene (train run compares several)");
             };
-            // `--static-cap` over the config's (in memory only).
-            let config = data.with_static_cap(&config);
+            // `--static-cap` and `--ignore` over the config's (in memory only).
+            let config = data.with_plan_flags(&config);
             if dry_run {
                 let request = preview_request(&config, &data, scene)?;
                 let p = super::preview_parts(&config, &request)?;
@@ -1048,8 +1069,9 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
                 bail!("--name needs exactly one --model and one --scene");
             }
-            // `--static-cap` over the config's (in memory only; the hooks read the file again).
-            let config = data.with_static_cap(&config);
+            // `--static-cap` and `--ignore` over the config's (in memory only; the hooks read the
+            // file again).
+            let config = data.with_plan_flags(&config);
             // Several runs of different scenes or seeds are compared on the same held-out frames.
             let group = (scenes.len() as u64 * seeds > 1)
                 .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
@@ -1888,6 +1910,7 @@ fn read_sources(
         oversample: t.oversample,
         balance: data.balance(config)?,
         static_cap: data.with_static_cap(config).training.static_cap_option(),
+        ignore: data.with_plan_flags(config).training.ignore,
         ..dataset::Options::default()
     };
     Ok((sources, opts))
@@ -2694,6 +2717,41 @@ mod tests {
             panic!("not run")
         };
         assert_eq!(data.static_cap, Some(3));
+    }
+
+    #[test]
+    fn the_ignore_flag_overrides_the_config_in_memory() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.training.ignore, IgnoreMode::Background);
+        let none = prepare_data(&[]);
+        assert_eq!(none.ignore, None);
+        assert_eq!(
+            none.with_plan_flags(&cfg).training.ignore,
+            IgnoreMode::Background
+        );
+        let drop = prepare_data(&["--ignore", "drop-frame"]);
+        assert_eq!(
+            drop.with_plan_flags(&cfg).training.ignore,
+            IgnoreMode::DropFrame
+        );
+        assert_eq!(cfg.training.ignore, IgnoreMode::Background, "unchanged");
+        cfg.training.ignore = IgnoreMode::DropFrame;
+        assert_eq!(
+            none.with_plan_flags(&cfg).training.ignore,
+            IgnoreMode::DropFrame,
+            "no flag: the config's"
+        );
+        let back = prepare_data(&["--ignore", "background", "--static-cap", "4"]);
+        let c = back.with_plan_flags(&cfg);
+        assert_eq!(c.training.ignore, IgnoreMode::Background);
+        assert_eq!(c.training.static_cap_option(), Some(4), "both flags apply");
+        assert!(parse(&["prepare", "--out", "o", "--ignore", "skip"]).is_err());
+        let TrainCommand::Run { data, .. } =
+            parse(&["run", "--model", "yolo26n", "--ignore", "drop-frame"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(data.ignore, Some(IgnoreMode::DropFrame));
     }
 
     #[test]

@@ -44,7 +44,7 @@ use super::progress::EpochPoint;
 use super::recipe::TrainRecipe;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{self, ClassFilter, ExportFrame, Selection, SplitConfig};
-use crate::collect::labels::statics;
+use crate::collect::labels::{SizeFloor, statics};
 use crate::config::Config;
 use crate::resources::catalog::{Platform, TrainFamily};
 use crate::resources::export::train::{self as env, TrainPaths};
@@ -579,15 +579,21 @@ fn sort_warnings(sel: &Selection, left_out: &mut LeftOut) -> Vec<String> {
     rest
 }
 
-/// Training boxes per wanted class (the list's spelling) of `frames`, ignore regions left out:
-/// with the frames a fold model trains on, what [`judge::Context::class_boxes`] holds for it.
+/// Training boxes per wanted class (the list's spelling) of `frames`, ignore regions left out (also
+/// the boxes under a frame's size floor, [`ExportFrame::under_floor`]: the fold model's export
+/// makes them ignore regions): with the frames a fold model trains on, what
+/// [`judge::Context::class_boxes`] holds for it.
 pub fn class_boxes<'a>(
     frames: impl IntoIterator<Item = &'a ExportFrame>,
     wanted: &Wanted<'_>,
 ) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
     for f in frames {
-        for b in f.labels.training().filter(|b| !b.is_ignore()) {
+        for b in f
+            .labels
+            .training()
+            .filter(|b| !b.is_ignore() && !f.under_floor(b))
+        {
             if let Some(c) = wanted.class_of(&b.label) {
                 *out.entry(c.to_string()).or_default() += 1;
             }
@@ -656,7 +662,9 @@ impl Selected {
     }
 }
 
-/// Select the frames of a check of `dataset_dir` (read only) and fold them.
+/// Select the frames of a check of `dataset_dir` (read only) and fold them. `floor`
+/// (`collect.size_floor`) goes on every frame ([`ExportFrame::floor`]), as the fold exports apply
+/// it.
 pub fn select(
     dataset_dir: &Path,
     classes: &[String],
@@ -664,6 +672,7 @@ pub fn select(
     filter: &RefineFrames,
     k: usize,
     min_frames: usize,
+    floor: Option<SizeFloor>,
 ) -> Selected {
     let sel = export::reviewed_frames_filtered(
         dataset_dir,
@@ -676,7 +685,10 @@ pub fn select(
     let (frames, filtered): (Vec<ExportFrame>, Vec<ExportFrame>) =
         sel.frames.into_iter().partition(|f| filter.keeps(f));
     out.left_out.filtered = filtered.len();
-    out.frames = frames;
+    out.frames = frames
+        .into_iter()
+        .map(|f| ExportFrame { floor, ..f })
+        .collect();
     let wanted = Wanted { classes, hidden };
     for f in &out.frames {
         *out.groups
@@ -773,6 +785,7 @@ pub fn preview(
             &request.frames,
             request.folds,
             MIN_FRAMES,
+            config.collect.size_floor,
         ),
     };
     if missing.is_some() {
@@ -1369,6 +1382,7 @@ mod tests {
             buckets: Vec::new(),
             split: export::Split::Train,
             labels,
+            floor: None,
         }
     }
 

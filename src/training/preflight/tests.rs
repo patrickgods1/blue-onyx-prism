@@ -503,3 +503,56 @@ fn frames_over_the_static_cap_are_named_with_their_largest_spot() {
     let t = text(&report(&p, &sources, &off, None));
     assert!(!t.contains("static spot"), "{t}");
 }
+
+#[test]
+fn the_report_says_what_became_of_frames_with_ignore_regions() {
+    let mut s = export(60, 12, "day");
+    // Two training frames with a cat and a tiny unlabelled dog, one with the dog alone.
+    for i in [0, 1, 2] {
+        s.frames[i].ignore.push(YoloBox {
+            class: "dog".into(),
+            cx: 0.9,
+            cy: 0.9,
+            w: 0.01,
+            h: 0.01,
+        });
+    }
+    s.frames[2].boxes.clear();
+    let sources = [s];
+    let o = opts();
+    let p = planned(&sources, &o).unwrap();
+    let r = report(&p, &sources, &o, None);
+    assert_eq!(r.ignore_mode, dataset::IgnoreMode::Background);
+    assert_eq!(r.ignore_only, 1);
+    assert_eq!(r.ignore_kept + r.ignore_valid_day, 2, "{r:?}");
+    assert_eq!(r.ignore_frames, r.ignore_only + r.ignore_valid_day);
+    let t = text(&r);
+    assert!(
+        t.contains("left out: 1 frame(s) with nothing but unsure or too-small objects"),
+        "{t}"
+    );
+    if r.ignore_kept > 0 {
+        assert_eq!(r.ignore_boxes_background.get("dog"), Some(&r.ignore_kept));
+        assert!(
+            t.contains("trained with an unsure or too-small object as background"),
+            "{t}"
+        );
+    }
+    assert!(!t.contains("with unsure or too-small boxes"), "{t}");
+    // Leaving every such frame out, as earlier versions did.
+    let drop = Options {
+        ignore: dataset::IgnoreMode::DropFrame,
+        ..opts()
+    };
+    let p = planned(&sources, &drop).unwrap();
+    let r = report(&p, &sources, &drop, None);
+    assert_eq!((r.ignore_frames, r.ignore_kept, r.ignore_only), (3, 0, 0));
+    let t = text(&r);
+    assert!(
+        t.contains("left out: 3 frame(s) with unsure or too-small boxes"),
+        "{t}"
+    );
+    assert!(!t.contains("as background"), "{t}");
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["ignore_mode"], "drop-frame");
+}

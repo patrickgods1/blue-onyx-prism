@@ -24,8 +24,11 @@
 //!    with a warning) from **every** review frame, before any filter, so runs with other scene
 //!    filters are benchmarked on the same frames ([`Plan::heldout_fingerprint`]); then filter the
 //!    train / valid pool by scene
-//!    ([`SceneFilter`]), drop its frames with ignore regions (no trainer here can leave a region
-//!    out of its loss, so the object would train as background; the held-out set keeps them, with
+//!    ([`SceneFilter`]), handle its frames with ignore regions ([`IgnoreMode`]; no trainer here
+//!    can leave a region out of its loss: by default a frame with a box of the run's classes
+//!    trains with the region as background and a frame of nothing but regions is left out, never
+//!    as a negative; [`IgnoreMode::DropFrame`] leaves every such frame out; validation never holds
+//!    one, so one on a camera day validated on leaves both sides; the held-out set keeps them, with
 //!    the regions `ignore` in its manifest) and, in [`Excluded::DropFrame`] mode, its frames with
 //!    boxes of untrained labels; cap the frames with nothing but parked-spot boxes at
 //!    [`PARKED_CAP`] per spot (the same crop again and again would dominate training), then, of
@@ -269,6 +272,47 @@ impl Excluded {
     }
 }
 
+/// What happens to a train / valid frame with ignore regions ([`Frame::ignore`]: objects a reviewer
+/// marked unsure or too small, or training boxes under the export's size floor). No trainer here
+/// can leave a region out of its loss: either the object trains as background or the frame goes.
+/// Held-out frames keep their regions as ignore regions in both modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IgnoreMode {
+    /// The frame trains, its regions unlabelled (background), when it holds at least one box of the
+    /// run's classes; a frame with nothing but regions is left out (an image whose only object is
+    /// unlabelled would teach "nothing here" exactly where something is), and so is a frame of a
+    /// camera day validated on (validation cannot ignore a region, and the day is validation's).
+    /// Never a negative: such a frame shows a real object.
+    #[default]
+    Background,
+    /// Every such frame is left out of train and valid (the behaviour of earlier versions): one
+    /// unsure or tiny object takes its whole frame out of training.
+    DropFrame,
+}
+
+impl IgnoreMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IgnoreMode::Background => "background",
+            IgnoreMode::DropFrame => "drop-frame",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "background" | "" => Some(IgnoreMode::Background),
+            "drop-frame" | "drop" => Some(IgnoreMode::DropFrame),
+            _ => None,
+        }
+    }
+
+    /// The default (not written in the config).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// A box, normalized to the image (YOLO: center, size).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct YoloBox {
@@ -295,8 +339,9 @@ pub enum SplitHint {
 pub struct Frame {
     pub image: PathBuf,
     pub boxes: Vec<YoloBox>,
-    /// Real objects not to train on (`ignore.json`): not in `boxes`, so the frame cannot be
-    /// trained on, and `ignore` when the frame is benchmarked.
+    /// Real objects not to train on (`ignore.json`): not in `boxes`, so the frame trains with them
+    /// as background or not at all ([`IgnoreMode`]), never validates, and they are `ignore` when
+    /// the frame is benchmarked.
     pub ignore: Vec<YoloBox>,
     /// `day`, `night` or `ir`; None = unknown.
     pub scene: Option<String>,
@@ -941,6 +986,9 @@ pub struct Options {
     /// What a train / valid frame with a box of an untrained label becomes.
     #[serde(default)]
     pub excluded: Excluded,
+    /// What a train / valid frame with ignore regions becomes (`training.ignore`).
+    #[serde(default)]
+    pub ignore: IgnoreMode,
     pub negative_share: f32,
     pub heldout_share: f32,
     /// Share of the training frames used for validation (checkpoint choice), at least one.
@@ -979,6 +1027,7 @@ impl Default for Options {
             rename: BTreeMap::new(),
             scene: SceneFilter::ALL_SCENES,
             excluded: Excluded::Background,
+            ignore: IgnoreMode::Background,
             negative_share: super::config::DEFAULT_NEGATIVE_SHARE,
             heldout_share: super::config::DEFAULT_HELDOUT_SHARE,
             val_share: 0.1,
@@ -1022,9 +1071,26 @@ pub struct Stats {
     pub scene_filtered: usize,
     /// Train / valid frames left out for a box of an untrained label ([`Excluded::DropFrame`]).
     pub excluded_frames: usize,
-    /// Train / valid frames left out for an ignore region ([`Frame::ignore`]).
+    /// Train / valid frames left out for ignore regions ([`Frame::ignore`]): every such frame with
+    /// [`IgnoreMode::DropFrame`], else `ignore_only + ignore_valid_day`.
     #[serde(skip_serializing_if = "is_zero")]
     pub ignore_frames: usize,
+    /// [`IgnoreMode::Background`]: frames with ignore regions and no box of the run's classes, left
+    /// out (neither a positive nor a negative).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_only: usize,
+    /// [`IgnoreMode::Background`]: frames with ignore regions on camera days validated on, left out
+    /// of both (validation cannot ignore a region; the day belongs to validation).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_valid_day: usize,
+    /// [`IgnoreMode::Background`]: training frames trained with an unlabelled object (their ignore
+    /// regions as background), repeats counted once.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignore_kept: usize,
+    /// [`IgnoreMode::Background`]: the regions of those frames per class (renamed like the boxes;
+    /// a label renamed to nothing keeps its own name: the object is just as real).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ignore_boxes_background: BTreeMap<String, usize>,
     pub negatives_dropped: usize,
     /// Boxes dropped per label not in the class list.
     pub boxes_dropped: BTreeMap<String, usize>,
@@ -1398,6 +1464,39 @@ fn without_duplicates(sources: &[Source], review: Vec<FrameRef>) -> (Vec<FrameRe
     (out, dropped)
 }
 
+/// The plan's sentence on the frames with ignore regions in [`IgnoreMode::Background`]: how many
+/// train with an unlabelled object, and how many were left out and why; None when there were none.
+pub fn background_warning(s: &Stats) -> Option<String> {
+    if s.ignore_kept + s.ignore_only + s.ignore_valid_day == 0 {
+        return None;
+    }
+    let mut parts = vec![format!(
+        "{} training frame(s) show an unsure or too-small object and train with it unlabelled, as \
+         background (no trainer can leave a region out of its loss; the other objects of the \
+         frame still teach)",
+        s.ignore_kept
+    )];
+    if s.ignore_only > 0 {
+        parts.push(format!(
+            "{} frame(s) with nothing else were left out: an image whose only object is unlabelled \
+             would teach \"nothing here\" exactly where something is",
+            s.ignore_only
+        ));
+    }
+    if s.ignore_valid_day > 0 {
+        parts.push(format!(
+            "{} frame(s) of camera days used for validation were left out of both (validation \
+             cannot ignore a region, and the day is validation's)",
+            s.ignore_valid_day
+        ));
+    }
+    Some(format!(
+        "{}. Held-out frames keep them as ignore regions: detections there do not count. To leave \
+         every such frame out instead, set training.ignore to drop-frame (--ignore drop-frame)",
+        parts.join("; ")
+    ))
+}
+
 /// The `camera/day` group of a frame (held-out and validation splits).
 fn group_key(f: &Frame) -> String {
     format!("{}/{}", f.camera, f.day)
@@ -1577,8 +1676,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         );
     }
     // 4. Train / valid pool: the rest of the review frames plus the public ones, by scene, then
-    // without frames with ignore regions, and without frames of untrained labels when the run
-    // drops them.
+    // without frames with ignore regions (every one with `IgnoreMode::DropFrame`, else those with
+    // no box of the run's classes), and without frames of untrained labels when the run drops
+    // them.
     let mut in_scope: Vec<FrameRef> = Vec::new();
     let mut unknown_left_out = 0usize;
     for r in pool.into_iter().chain(public.iter().copied()) {
@@ -1606,8 +1706,17 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     for r in in_scope {
         let Some(f) = frame(r) else { continue };
         if !f.ignore.is_empty() {
-            p.stats.ignore_frames += 1;
-            continue;
+            match opts.ignore {
+                IgnoreMode::DropFrame => {
+                    p.stats.ignore_frames += 1;
+                    continue;
+                }
+                IgnoreMode::Background if mapped_boxes(f, opts, &p.classes).next().is_none() => {
+                    p.stats.ignore_only += 1;
+                    continue;
+                }
+                IgnoreMode::Background => {}
+            }
         }
         if opts.excluded == Excluded::DropFrame && f.boxes.iter().any(untrained) {
             p.stats.excluded_frames += 1;
@@ -1620,7 +1729,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             "{} of {scoped} training frame(s) were left out for unsure or too-small boxes: no \
              trainer can skip such a box, so the object would train as background. Held-out \
              frames keep them, and detections on those boxes do not count; to train on a frame \
-             again, give its box a class or reject it with another reason on the Review tab",
+             again, give its box a class or reject it with another reason on the Review tab, or \
+             train such frames with the object as background (training.ignore background, \
+             --ignore background)",
             p.stats.ignore_frames
         ));
     }
@@ -1781,6 +1892,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     // 6. Validation (the trainer's checkpoint choice).
     let split = valid::pick_valid_groups(sources, &pool, opts, &p.classes);
     let valid = split.frames;
+    // Frames with ignore regions of the camera days validated on: out of both.
+    let valid_day: BTreeSet<FrameRef> = split.dropped.iter().copied().collect();
+    p.stats.ignore_valid_day = valid_day.len();
     p.stats.valid_groups = split.groups;
     p.warnings.extend(split.warning);
     if valid.is_empty() {
@@ -1799,7 +1913,10 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             1
         }
     };
-    let train: Vec<FrameRef> = pool.into_iter().filter(|r| !val_set.contains(r)).collect();
+    let train: Vec<FrameRef> = pool
+        .into_iter()
+        .filter(|r| !val_set.contains(r) && !valid_day.contains(r))
+        .collect();
     // 7. Balance (opt-in): repeats per training frame, after the cap.
     let mut repeats: Vec<u32> = train.iter().map(|&r| base(r)).collect();
     let mut keep = vec![true; train.len()];
@@ -1851,15 +1968,43 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                 p.stats.train_negatives += 1;
                 p.stats.hard_negatives += usize::from(f.hard_negative || f.human_rejected);
             }
+            if !f.ignore.is_empty() {
+                p.stats.ignore_kept += 1;
+                for b in &f.ignore {
+                    let name = opts
+                        .rename
+                        .get(&b.class)
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(&b.class);
+                    *p.stats
+                        .ignore_boxes_background
+                        .entry(name.clone())
+                        .or_default() += 1;
+                }
+            }
         }
         p.stats.public_frames += usize::from(is_public);
         p.train.push((r, repeats));
     }
+    // Without a split of its own the trainer validates on its training frames, those with ignore
+    // regions left out (validation cannot ignore a region) unless nothing else is left.
     p.valid = if valid.is_empty() {
-        p.train.iter().map(|(r, _)| *r).collect()
+        let all: Vec<FrameRef> = p.train.iter().map(|(r, _)| *r).collect();
+        let plain: Vec<FrameRef> = all
+            .iter()
+            .copied()
+            .filter(|r| frame(*r).is_none_or(|f| f.ignore.is_empty()))
+            .collect();
+        if plain.is_empty() { all } else { plain }
     } else {
         valid
     };
+    if opts.ignore == IgnoreMode::Background {
+        p.stats.ignore_frames = p.stats.ignore_only + p.stats.ignore_valid_day;
+        if let Some(w) = background_warning(&p.stats) {
+            p.warnings.push(w);
+        }
+    }
     let mut heldout_boxes: BTreeMap<&str, usize> = BTreeMap::new();
     for &r in &p.heldout {
         if let Some(f) = frame(r) {

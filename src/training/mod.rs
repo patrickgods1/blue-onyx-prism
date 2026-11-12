@@ -297,7 +297,8 @@ pub fn workers_now(trainer: catalog::Trainer) -> WorkerChoice {
 }
 
 /// The dataset options of `request` on `config`: the `training` section's assembly defaults
-/// with the request's scene, classes, renames, excluded mode and balance. The job
+/// (shares, oversampling, static cap, ignore mode) with the request's scene, classes, renames,
+/// excluded mode and balance. The job
 /// ([`plan_job`]) and [`preview_plan`] both build them here, so a preview is the run's plan.
 pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options {
     let t = &config.training;
@@ -306,6 +307,7 @@ pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options 
         heldout_share: t.heldout_share,
         oversample: t.oversample,
         static_cap: t.static_cap_option(),
+        ignore: t.ignore,
         ..dataset::Options::default()
     };
     job::request_options(&base, request)

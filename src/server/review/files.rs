@@ -254,6 +254,7 @@ pub(in crate::server) async fn export(
             benchmark_split: b.benchmark_split,
             include_unreviewed: b.include_unreviewed,
             hidden_classes: hidden(&state),
+            size_floor: state.config_read().collect.size_floor,
         };
         match export::run_filtered(&dir, &classes, &req, &filter) {
             Ok(r) => {

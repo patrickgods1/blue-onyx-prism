@@ -246,6 +246,80 @@ pub struct LabelBox {
     pub auto: AutoInfo,
 }
 
+/// Smallest [`SizeFloor::px`].
+pub const MIN_FLOOR_PX: f32 = 1.0;
+/// Largest [`SizeFloor::px`].
+pub const MAX_FLOOR_PX: f32 = 64.0;
+/// Smallest [`SizeFloor::input`].
+pub const MIN_FLOOR_INPUT: u32 = 64;
+/// Largest [`SizeFloor::input`].
+pub const MAX_FLOOR_INPUT: u32 = 4096;
+
+/// The size floor (`collect.size_floor`, [`under_floor`]): an object whose short side, at a model
+/// input of `input` pixels, is under `px` pixels is too small for the model family to learn. Measured
+/// on 851 reviewed frames with fold models that never saw the camera day, at 384 px: under 8 px
+/// such objects were found 6% of the time, 8-12 px 37%, 12-24 px 83%, above that 94%. Applied at
+/// export ([`export`]: such a training box is exported as an ignore region), by the dataset check's
+/// judge and by [`bulk::bulk_resolve_small`]; a label file is never rewritten for it, so a floor
+/// change is a re-export.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SizeFloor {
+    /// Short side in pixels at the model's input under which an object is too small.
+    pub px: f32,
+    /// The model's input size (the size the user trains at).
+    pub input: u32,
+}
+
+impl SizeFloor {
+    /// A floor that can say anything: a finite `px` above 0 and an `input` above 0 (a config
+    /// validated by [`Self::validate`] always is). Any other is off.
+    pub fn is_on(&self) -> bool {
+        self.px.is_finite() && self.px > 0.0 && self.input > 0
+    }
+
+    /// `px` in [`MIN_FLOOR_PX`]..=[`MAX_FLOOR_PX`], `input` in
+    /// [`MIN_FLOOR_INPUT`]..=[`MAX_FLOOR_INPUT`]; errors name `key` (`collect.size_floor`).
+    pub fn validate(&self, key: &str) -> Result<()> {
+        if !(self.px.is_finite() && (MIN_FLOOR_PX..=MAX_FLOOR_PX).contains(&self.px)) {
+            bail!(
+                "{key}.px: must be between {MIN_FLOOR_PX} and {MAX_FLOOR_PX} pixels (the short \
+                 side at model input under which an object is too small), got {}",
+                self.px
+            );
+        }
+        if !(MIN_FLOOR_INPUT..=MAX_FLOOR_INPUT).contains(&self.input) {
+            bail!(
+                "{key}.input: must be between {MIN_FLOOR_INPUT} and {MAX_FLOOR_INPUT} pixels (the \
+                 size the model trains at, e.g. 384 or 640), got {}",
+                self.input
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Whether the box `bbox` (`[x0, y0, x1, y1]` in pixels of a `frame_w` x `frame_h` frame) is under
+/// the size floor: its short side at the floor's model input, `min(w / W, h / H) * input` of the box
+/// clamped to the frame ([`clamp_box`]), is under `px`. Computed in f32 like the page's twin
+/// (`underFloor` in `assets/review-rules.js`, parity-tested). Never under: a frame of unknown size
+/// (0), a box with a non-finite coordinate or nothing left inside the frame, a floor that is None
+/// or off ([`SizeFloor::is_on`]).
+pub fn under_floor(bbox: &[f32; 4], frame_w: u32, frame_h: u32, floor: Option<SizeFloor>) -> bool {
+    let Some(floor) = floor.filter(SizeFloor::is_on) else {
+        return false;
+    };
+    if frame_w == 0 || frame_h == 0 || !bbox.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let c = clamp_box(*bbox, frame_w, frame_h);
+    let (bw, bh) = (c[2] - c[0], c[3] - c[1]);
+    if !(bw > 0.0 && bh > 0.0) {
+        return false;
+    }
+    let short = (bw / frame_w as f32).min(bh / frame_h as f32) * floor.input as f32;
+    short < floor.px
+}
+
 /// The auto-labeler's triage of a box ([`crate::training::autolabel`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -385,12 +459,23 @@ impl LabelBox {
             BoxState::Rejected => {
                 !self.is_dismissed()
                     && self.reject_reason != Some(RejectReason::Duplicate)
+                    && !self.is_size_floor_reject()
                     && !matches!(
                         self.reason.as_deref(),
                         Some(bulk::LOW_SCORE_REASON | bulk::OTHER_CLASS_REASON)
                     )
             }
         }
+    }
+
+    /// Rejected as too small by the size floor rule ([`bulk::bulk_resolve_small`]): `reason:
+    /// size_floor` with `reject_reason: too_small`. An ignore region like any too-small reject
+    /// ([`Self::is_ignore`]: no hard negative, not in the repeats history), and no person's
+    /// decision. A reviewer's own verdict on the box ends the mark ([`normalize`]).
+    pub fn is_size_floor_reject(&self) -> bool {
+        self.state == BoxState::Rejected
+            && self.reject_reason == Some(RejectReason::TooSmall)
+            && self.reason.as_deref() == Some(bulk::SIZE_FLOOR_REASON)
     }
 
     /// A reviewer's verdict on an [`AutoInfo::audit`] box: `Some(true)` real, `Some(false)` not,
@@ -866,6 +951,8 @@ fn label_ok(l: &str) -> bool {
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
 /// - a dismissal ([`bulk::is_dismissal`]) cleared unless the box is rejected with no reason of a
 ///   reviewer's; [`spots::PARKED_REASON`] and its mark cleared unless the box is accepted;
+///   [`bulk::SIZE_FLOOR_REASON`] cleared unless the box is still the floor's too-small reject
+///   ([`LabelBox::is_size_floor_reject`]);
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
 ///   `refine` (bounded, [`refine::check`]) kept, `bulk_accepted` and `checked_before_reopen`
@@ -1026,6 +1113,11 @@ pub fn normalize(
             if dismissed || b.reason.as_deref() == Some(REST_REASON) {
                 b.reason = None;
             }
+        }
+        // The size floor's mark stays only on the reject it made: a reviewer who accepted the box
+        // or gave another reason decided it.
+        if b.reason.as_deref() == Some(bulk::SIZE_FLOOR_REASON) && !b.is_size_floor_reject() {
+            b.reason = None;
         }
     }
     if f.status != Status::Unreviewed {
@@ -2294,6 +2386,97 @@ mod tests {
         let neg: Vec<_> = f.hard_negatives().collect();
         assert_eq!(neg.len(), 1);
         assert_eq!(neg[0].reject_reason, Some(RejectReason::FalsePositive));
+    }
+
+    #[test]
+    fn the_size_floor_is_the_short_side_at_model_input() {
+        let floor = Some(SizeFloor {
+            px: 10.0,
+            input: 384,
+        });
+        // 1920 x 1080 at 384: 10 px is 28.125 frame pixels on the short (vertical) scale.
+        let tall = |h: f32| [100.0, 100.0, 300.0, 100.0 + h];
+        assert!(under_floor(&tall(27.0), 1920, 1080, floor));
+        assert!(!under_floor(&tall(29.0), 1920, 1080, floor));
+        // The other axis decides when it is the short one: 50 px wide of 1920 = exactly 10.
+        assert!(!under_floor(&[0.0, 0.0, 50.0, 500.0], 1920, 1080, floor));
+        assert!(under_floor(&[0.0, 0.0, 49.0, 500.0], 1920, 1080, floor));
+        // Exactly at the floor is not under (a 512 frame at input 512 maps a side 1:1).
+        let at = Some(SizeFloor {
+            px: 10.0,
+            input: 512,
+        });
+        let side = |s: f32| [0.0, 0.0, 300.0, s];
+        assert!(!under_floor(&side(10.0), 512, 512, at));
+        assert!(under_floor(
+            &side(f32::from_bits(10f32.to_bits() - 1)),
+            512,
+            512,
+            at
+        ));
+        // Measured inside the frame: a box past the edge counts only its visible part, an inverted
+        // one is ordered.
+        assert!(under_floor(&[505.0, 0.0, 530.0, 300.0], 512, 512, at));
+        assert!(!under_floor(&[300.0, 0.0, 0.0, 10.0], 512, 512, at));
+        // Never under: the floor off, a frame of unknown size, a broken or empty box.
+        let small = [0.0, 0.0, 1.0, 1.0];
+        assert!(under_floor(&small, 512, 512, at));
+        assert!(!under_floor(&small, 512, 512, None));
+        let off = Some(SizeFloor {
+            px: 0.0,
+            input: 512,
+        });
+        assert!(!under_floor(&small, 512, 512, off));
+        assert!(!under_floor(&small, 0, 512, at) && !under_floor(&small, 512, 0, at));
+        assert!(!under_floor(&[f32::NAN, 0.0, 1.0, 1.0], 512, 512, at));
+        assert!(!under_floor(&[0.0, 0.0, f32::INFINITY, 1.0], 512, 512, at));
+        assert!(!under_floor(&[5.0, 5.0, 5.0, 9.0], 512, 512, at));
+        assert!(
+            !under_floor(&[600.0, 0.0, 700.0, 9.0], 512, 512, at),
+            "off the frame"
+        );
+    }
+
+    #[test]
+    fn a_size_floor_reject_is_an_ignore_region_and_no_decision_of_a_person() {
+        let mut b = tests_support::auto_box("person");
+        b.state = BoxState::Rejected;
+        b.reject_reason = Some(RejectReason::TooSmall);
+        b.reason = Some(bulk::SIZE_FLOOR_REASON.into());
+        assert!(b.is_size_floor_reject() && b.is_ignore() && !b.is_dismissed());
+        assert!(!b.has_human_decision(), "a rule made it");
+        assert_eq!(b.audit_verdict(), None);
+        let f = LabelFile {
+            boxes: vec![b.clone()],
+            ..LabelFile::default()
+        };
+        assert_eq!(f.hard_negatives().count(), 0);
+        assert!(!f.has_human_decision());
+        assert!(!unjudged_reject(&b), "a reason was given: it is known real");
+        // A reviewer who rejects it as too small by hand is a person.
+        let mut by_hand = b.clone();
+        by_hand.reason = None;
+        assert!(by_hand.has_human_decision() && by_hand.is_ignore());
+        // A reviewer's own verdict ends the mark at the save: accepted, or another reason.
+        let classes = crate::collect::config::default_classes();
+        let mut accepted = b.clone();
+        accepted.state = BoxState::Accepted;
+        let mut other = b.clone();
+        other.reject_reason = Some(RejectReason::FalsePositive);
+        let saved = normalize(
+            LabelFile {
+                boxes: vec![b.clone(), accepted, other],
+                ..LabelFile::default()
+            },
+            &classes,
+            640,
+            480,
+            "t",
+        )
+        .unwrap();
+        let reasons: Vec<Option<&str>> = saved.boxes.iter().map(|b| b.reason.as_deref()).collect();
+        assert_eq!(reasons, [Some(bulk::SIZE_FLOOR_REASON), None, None]);
+        assert!(saved.boxes[1].has_human_decision() && saved.boxes[2].has_human_decision());
     }
 
     #[test]

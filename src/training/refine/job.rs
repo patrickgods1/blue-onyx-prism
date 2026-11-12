@@ -384,6 +384,7 @@ impl RefineJob {
             &self.request.frames,
             self.request.folds,
             self.min_frames,
+            self.config.collect.size_floor,
         )
     }
 
@@ -411,6 +412,7 @@ impl RefineJob {
             class_boxes,
             run: &self.id,
             spots: Some(spots),
+            floor: self.config.collect.size_floor,
         }
     }
 
@@ -598,6 +600,8 @@ impl RefineJob {
             benchmark_split: BenchSplit::Val,
             include_unreviewed: false,
             hidden_classes: Vec::new(),
+            // The fold models train as a run would on an export of today's settings.
+            size_floor: self.config.collect.size_floor,
         };
         let exported = export::run_selected(
             &self.dataset_dir,

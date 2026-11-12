@@ -43,14 +43,20 @@
 //!    `add`); skipped and unreviewed frames get nothing.
 //!
 //! "Short side at model input" is `min(w / W, h / H) * imgsz` ([`short_px`]), the plan's measure of
-//! too small (the size floor of a later phase uses it too).
+//! too small. With `collect.size_floor` set ([`Context::floor`]) the floor is that one rule instead
+//! ([`under_floor`], at the floor's own input size, as the export and the Review page apply it):
+//! "at least [`FLOOR_PX`]" above reads "not under the floor", and a training box under it is an
+//! ignore region of the export, so the check treats it as one: no candidate in steps 2-6 (no
+//! verify, no relabel, no loose count, out of the recall but for its size table, where it counts
+//! with [`BoxFact::under_floor`]), while it still covers detections of its object in step 4 (no add
+//! lands on it).
 
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
 use crate::collect::labels::repeats::same_object;
 use crate::collect::labels::statics::{self, Spot};
 use crate::collect::labels::{
-    BoxState, LabelBox, LabelFile, Source, Status, clamp_box, covers, iou,
+    BoxState, LabelBox, LabelFile, SizeFloor, Source, Status, clamp_box, covers, iou, under_floor,
 };
 use crate::training::autolabel::triage::Det;
 use std::collections::BTreeMap;
@@ -125,6 +131,10 @@ pub struct Context<'a> {
     pub run: &'a str,
     /// The static spots of the check's selection ([`super::Selected::spots`]); None: no spot rule.
     pub spots: Option<&'a statics::Table>,
+    /// `collect.size_floor`: when set, the judge's floor is this one rule ([`under_floor`], as the
+    /// export and the Review page apply it) instead of [`FLOOR_PX`] at `imgsz`, and a training
+    /// box under it is an ignore region here (see [`judge`]).
+    pub floor: Option<SizeFloor>,
 }
 
 /// A training box as the report's recall counts it.
@@ -138,6 +148,9 @@ pub struct BoxFact {
     pub found: bool,
     /// It lies at a static spot that holds without the frame's camera-day ([`spot_of`]).
     pub at_spot: bool,
+    /// Under the configured size floor ([`Context::floor`]): an ignore region for the check, so
+    /// only the recall by size counts it (that table is what the floor is chosen from).
+    pub under_floor: bool,
 }
 
 /// The static spot of `ctx` a box of `label` at `bbox` (pixels of `frame`) lies at, when that spot
@@ -277,6 +290,15 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     }
     let wanted = ctx.wanted;
     let size = |b: &[f32; 4]| short_px(b, frame.width, frame.height, ctx.imgsz);
+    // Too small to suggest anything about: under the configured size floor (the export's rule),
+    // else under FLOOR_PX at the fold models' input.
+    let floor = ctx.floor.filter(SizeFloor::is_on);
+    let small = |b: &[f32; 4]| match floor {
+        Some(_) => under_floor(b, frame.width, frame.height, floor),
+        None => size(b) < FLOOR_PX,
+    };
+    // A training box under the configured floor is an ignore region of the export: not judged.
+    let ignored = |b: &LabelBox| floor.is_some() && small(&b.bbox);
     // 1. Candidates: scores within 0..=1 and boxes within the frame (a model's raw output can
     // stray past either, and a suggestion must stay within what a save accepts).
     let dets: Vec<D> = frame
@@ -298,7 +320,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             })
         })
         .collect();
-    let train: Vec<T<'_>> = f
+    let all_train: Vec<T<'_>> = f
         .boxes
         .iter()
         .filter(|b| b.is_training() && !b.is_ignore() && proper(&b.bbox))
@@ -308,18 +330,21 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             key: key_of(&b.label, wanted),
         })
         .collect();
-    // The report's recall: its own matching at a production-like score.
-    let (found, _) = matching(&dets, &train, FOUND_IOU, FOUND_SCORE);
-    for (t, hit) in train.iter().zip(&found) {
+    // The report's recall: its own matching at a production-like score, over every training box
+    // (the recall by size is what a floor is chosen from; the others leave out those under it).
+    let (found, _) = matching(&dets, &all_train, FOUND_IOU, FOUND_SCORE);
+    for (t, hit) in all_train.iter().zip(&found) {
         if let Some(class) = &t.class {
             out.boxes.push(BoxFact {
                 class: class.clone(),
                 short_px: size(&t.b.bbox),
                 found: hit.is_some(),
                 at_spot: spot_of(ctx, frame, class, &t.b.bbox).is_some(),
+                under_floor: ignored(t.b),
             });
         }
     }
+    let train: Vec<T<'_>> = all_train.into_iter().filter(|t| !ignored(t.b)).collect();
     // 2. Pairs.
     let (by_box, by_det) = matching(&dets, &train, LOOSE_IOU_MIN, MATCH_MIN_SCORE);
     let mut found_list: Vec<Suggestion> = Vec::new();
@@ -389,7 +414,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         if by_det.get(di).copied().flatten().is_some()
             || evidence.get(di).copied().unwrap_or(false)
             || d.score < ADD_SCORE_AT_SPOT.min(ADD_SCORE)
-            || size(&d.bbox) < FLOOR_PX
+            || small(&d.bbox)
         {
             continue;
         }
@@ -461,7 +486,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             || t.b.source == Source::Human
             || t.b.orig_bbox.is_some()
             || ctx.class_boxes.get(class).copied().unwrap_or(0) < MIN_CLASS_BOXES
-            || size(&t.b.bbox) < FLOOR_PX
+            || small(&t.b.bbox)
         {
             continue;
         }
@@ -551,6 +576,16 @@ mod tests {
 
     /// Judge `f` (640 x 480, input 640) with `dets`; with `counts` per class.
     fn run_with(f: &LabelFile, dets: &[Det], counts: &BTreeMap<String, usize>) -> Judged {
+        run_at(f, dets, counts, None)
+    }
+
+    /// [`run_with`] with the size floor `floor`.
+    fn run_at(
+        f: &LabelFile,
+        dets: &[Det],
+        counts: &BTreeMap<String, usize>,
+        floor: Option<SizeFloor>,
+    ) -> Judged {
         let c = classes();
         let w = Wanted {
             classes: &c,
@@ -562,6 +597,7 @@ mod tests {
             class_boxes: counts,
             run: "r1",
             spots: None,
+            floor,
         };
         let j = judge(
             &FrameInput {
@@ -769,6 +805,74 @@ mod tests {
     }
 
     #[test]
+    fn the_configured_size_floor_is_the_one_rule_and_its_boxes_are_ignore_regions() {
+        // At 384 a 14 px wide box of a 640 frame is 8.4 px: under a 10 px floor, though above
+        // FLOOR_PX at the fold models' 640.
+        let floor = Some(SizeFloor {
+            px: 10.0,
+            input: 384,
+        });
+        let small = [100.0, 100.0, 114.0, 200.0];
+        let big = [300.0, 100.0, 340.0, 200.0];
+        assert!(short_px(&small, 640, 480, 640) >= FLOOR_PX);
+        assert!(under_floor(&small, 640, 480, floor));
+        let many = many();
+        // Without the floor: a verify on the small label, as before.
+        let f = reviewed(vec![acc("person", small), acc("person", big)]);
+        let j = run_with(&f, &[], &many);
+        assert_eq!(kinds(&j), [Kind::Verify, Kind::Verify]);
+        assert!(j.boxes.iter().all(|b| !b.under_floor));
+        // With it: an ignore region, no verify; in the facts only for the size table.
+        let j = run_at(&f, &[], &many, floor);
+        assert_eq!(kinds(&j), [Kind::Verify]);
+        assert_eq!(j.suggestions[0].target, Some(big));
+        assert_eq!(
+            j.boxes.iter().map(|b| b.under_floor).collect::<Vec<_>>(),
+            [true, false]
+        );
+        // A detection under it is no add; one above it is.
+        let empty = reviewed(vec![]);
+        assert!(
+            run_at(&empty, &[det("person", small, 0.99)], &many, floor)
+                .suggestions
+                .is_empty()
+        );
+        assert_eq!(
+            kinds(&run_at(&empty, &[det("person", big, 0.99)], &many, floor)),
+            [Kind::Add]
+        );
+        // The small label still covers its object: a larger detection on it adds nothing. At IoU
+        // 0.58 that pair would be a loose label; an ignore region is never one.
+        let on_it = [100.0, 100.0, 124.0, 200.0];
+        assert!(!under_floor(&on_it, 640, 480, floor));
+        let tiny_label = reviewed(vec![acc("person", small)]);
+        let j = run_at(&tiny_label, &[det("person", on_it, 0.99)], &many, floor);
+        assert!(j.suggestions.is_empty(), "{:?}", j.suggestions);
+        assert_eq!(j.loose, 0, "an ignore region is never a loose label");
+        assert_eq!(
+            run_with(&tiny_label, &[det("person", on_it, 0.99)], &many).loose,
+            1,
+            "without the floor it is one"
+        );
+        // Nor does another object's detection on it relabel it.
+        let car = run_at(&tiny_label, &[det("car", small, 0.95)], &many, floor);
+        assert!(car.suggestions.is_empty(), "{:?}", car.suggestions);
+        assert_eq!(
+            kinds(&run_with(&tiny_label, &[det("car", small, 0.95)], &many)),
+            [Kind::Relabel]
+        );
+        // A floor that is off is no floor: FLOOR_PX at the input again.
+        let off = Some(SizeFloor {
+            px: 0.0,
+            input: 384,
+        });
+        assert_eq!(
+            kinds(&run_at(&f, &[], &many, off)),
+            [Kind::Verify, Kind::Verify]
+        );
+    }
+
+    #[test]
     fn a_label_no_model_found_is_a_verify_unless_the_class_is_rare() {
         let f = reviewed(vec![acc("car", CAR)]);
         let j = run(&f, &[]);
@@ -954,6 +1058,7 @@ mod tests {
             class_boxes: &counts,
             run: "r1",
             spots: None,
+            floor: None,
         };
         let dets = [det("person", [600.0, 400.0, 700.0, 520.0], 0.9)];
         let j = judge(
@@ -1022,6 +1127,7 @@ mod tests {
             class_boxes: &counts,
             run: "r1",
             spots: None,
+            floor: None,
         };
         let f = reviewed(vec![acc("dog", CAR)]);
         let dets = [det("dog", FAR, 0.9)];
@@ -1072,6 +1178,7 @@ mod tests {
             class_boxes: &counts,
             run: "r1",
             spots: Some(spots),
+            floor: None,
         };
         let j = judge(
             &FrameInput {
@@ -1259,6 +1366,7 @@ mod tests {
             class_boxes: &counts,
             run: "r1",
             spots: Some(&ok),
+            floor: None,
         };
         let dets = [det("car", NEAR, 0.35)];
         let j = judge(

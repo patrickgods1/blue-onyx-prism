@@ -243,19 +243,23 @@ pub struct RecallTally {
 }
 
 impl RecallTally {
-    /// Count the training boxes of a frame of `camera` and `scene`.
+    /// Count the training boxes of a frame of `camera` and `scene`. A box under the size floor
+    /// ([`BoxFact::under_floor`]) counts in the recall by size only: an ignore region otherwise.
     pub fn add(&mut self, camera: &str, scene: &str, boxes: &[BoxFact]) {
         for b in boxes {
             let hit = u64::from(b.found);
+            let s = self.sizes.entry(size_bucket(b.short_px)).or_default();
+            s.0 += 1;
+            s.1 += hit;
+            if b.under_floor {
+                continue;
+            }
             let g = self
                 .groups
                 .entry((camera.to_string(), scene.to_string(), b.class.clone()))
                 .or_default();
             g.0 += 1;
             g.1 += hit;
-            let s = self.sizes.entry(size_bucket(b.short_px)).or_default();
-            s.0 += 1;
-            s.1 += hit;
             let w = if b.at_spot {
                 &mut self.at_spots
             } else {
@@ -475,6 +479,7 @@ mod tests {
             found,
             // The cars stand at a static spot.
             at_spot: class == "car",
+            under_floor: false,
         };
         t.add(
             "patio",
@@ -584,5 +589,36 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(dir.join("refine")).unwrap().collect();
         assert_eq!(left.len(), 1, "no temporary file left");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_box_under_the_size_floor_counts_in_the_size_table_only() {
+        let fact = |px: f32, found: bool, under_floor: bool| BoxFact {
+            class: "person".into(),
+            short_px: px,
+            found,
+            at_spot: false,
+            under_floor,
+        };
+        let mut t = RecallTally::default();
+        t.add(
+            "patio",
+            "night",
+            &[
+                fact(6.0, false, true),
+                fact(7.0, true, true),
+                fact(30.0, true, false),
+            ],
+        );
+        let total = t.total();
+        assert_eq!((total.boxes, total.found), (1, 1), "an ignore region");
+        assert_eq!((t.elsewhere().boxes, t.at_spots().boxes), (1, 0));
+        assert_eq!(t.by_group()[0].recall.boxes, 1);
+        let sizes = t.by_size();
+        assert_eq!(
+            (sizes[0].recall.boxes, sizes[0].recall.found),
+            (2, 1),
+            "the table a floor is chosen from keeps them"
+        );
     }
 }

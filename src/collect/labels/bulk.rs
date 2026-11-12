@@ -15,7 +15,9 @@
 //! [`bulk_reject_stacked`] rejects the duplicates of stacked boxes on reviewed and unreviewed
 //! frames (`reason: duplicate`, [`super::stacks`]; `POST /v1/review/reject-stacked`) and
 //! [`bulk_restore_reopened`] puts frames a re-label reopened back to reviewed once nothing on them
-//! is pending (`POST /v1/review/restore-reopened`). Each frame is re-checked under the label write
+//! is pending (`POST /v1/review/restore-reopened`), and [`bulk_resolve_small`] rejects the pending
+//! model and auto boxes under the size floor on unreviewed frames as too small (`reason:
+//! size_floor`, [`resolve_small`]). Each frame is re-checked under the label write
 //! lock ([`super::update`]); counts are exact, frame lists capped at [`LISTED`].
 
 use super::super::layout::Walker;
@@ -49,6 +51,10 @@ pub fn is_dismissal(reason: Option<&str>) -> bool {
 
 /// The reason a box rejected by [`reject_other_class`] carries.
 pub const OTHER_CLASS_REASON: &str = "other_class";
+
+/// The reason a box rejected by [`resolve_small`] carries, beside `reject_reason: too_small`
+/// ([`super::LabelBox::is_size_floor_reject`]): a rule's decision, not a reviewer's.
+pub const SIZE_FLOOR_REASON: &str = "size_floor";
 
 /// What a bulk edit did (or, in a dry run, would do).
 #[derive(Debug, Default, Clone, Serialize)]
@@ -146,6 +152,123 @@ pub fn bulk_reject_below(
         &|l| (count_low(l, min_score), 0),
         &|l| (reject_low(l, min_score), 0),
     )
+}
+
+/// Whether `b` is a box [`resolve_small`] rejects on a `w` x `h` frame: a pending model or
+/// auto-labeler box under `floor` ([`super::under_floor`]) that shows no person's hand (drawn, moved,
+/// relabelled, marked unsure: [`super::LabelBox::has_human_decision`]) and is no audit sample (it
+/// exists to be looked at, as for [`reject_low`]).
+fn is_small(b: &super::LabelBox, w: u32, h: u32, floor: super::SizeFloor) -> bool {
+    b.state == BoxState::Pending
+        && b.source != Source::Human
+        && !b.auto.audit
+        && !b.has_human_decision()
+        && super::under_floor(&b.bbox, w, h, Some(floor))
+}
+
+/// On an unreviewed frame (`w` x `h`, from its sidecar), the pending model and auto-labeler boxes
+/// under `floor` ([`is_small`]) rejected as too small: `reject_reason: too_small`, `reason:
+/// size_floor`. Such a box is an ignore region ([`super::LabelBox::is_ignore`]: a real object, no
+/// hard negative, not in the repeats history) and no person's decision. Reviewed and skipped
+/// frames are untouched; the frame's status is unchanged. Returns the boxes rejected.
+pub fn resolve_small(f: &mut LabelFile, w: u32, h: u32, floor: super::SizeFloor) -> usize {
+    if f.status != Status::Unreviewed {
+        return 0;
+    }
+    let mut n = 0;
+    for b in f.boxes.iter_mut().filter(|b| is_small(b, w, h, floor)) {
+        b.state = BoxState::Rejected;
+        b.reject_reason = Some(super::RejectReason::TooSmall);
+        b.reason = Some(SIZE_FLOOR_REASON.into());
+        n += 1;
+    }
+    n
+}
+
+/// The boxes [`resolve_small`] would reject.
+fn count_small(f: &LabelFile, w: u32, h: u32, floor: super::SizeFloor) -> usize {
+    if f.status != Status::Unreviewed {
+        return 0;
+    }
+    f.boxes.iter().filter(|b| is_small(b, w, h, floor)).count()
+}
+
+/// [`resolve_small`] on the unreviewed frames of `dir` that `filters` select (status forced to
+/// unreviewed; queue order), at most `limit` frames. A frame without a label file is pre-filled
+/// from its sidecar ([`super::prefill`]) when `filters.wanted` names the class list, else passed
+/// over. The frame size is its sidecar's. `dry_run` only counts: its `boxes` (every eligible frame)
+/// is what a run with a `limit` of at least `eligible` changes. Each frame is edited again under
+/// the write lock ([`super::update`]); one that changed meanwhile (reviewed) is passed over.
+pub fn bulk_resolve_small(
+    dir: &Path,
+    filters: &Filters,
+    floor: super::SizeFloor,
+    dry_run: bool,
+    limit: usize,
+) -> BulkOutcome {
+    let mut f = filters.clone();
+    f.status = StatusFilter::Is(Status::Unreviewed);
+    let built = queue::build(dir, &f);
+    let fresh = |rec: &super::super::record::Record| -> Option<LabelFile> {
+        let (classes, hidden) = filters.wanted.as_ref()?;
+        Some(super::prefill(rec, classes, hidden))
+    };
+    // (frame, boxes, frame size)
+    let mut eligible: Vec<(String, usize, (u32, u32))> = Vec::new();
+    let mut walker = Walker::new(dir);
+    for item in built.items {
+        let Some(fr) = Frame::resolve_in(&mut walker, &item.frame) else {
+            continue;
+        };
+        let Ok(rec) = fr.record() else { continue };
+        let labels = match fr.labels() {
+            Ok(Some(l)) => Some(l),
+            Ok(None) => fresh(&rec),
+            Err(_) => None,
+        };
+        let n = labels.map_or(0, |l| count_small(&l, rec.width, rec.height, floor));
+        if n > 0 {
+            eligible.push((item.frame, n, (rec.width, rec.height)));
+        }
+    }
+    let mut out = BulkOutcome {
+        eligible: eligible.len(),
+        ..BulkOutcome::default()
+    };
+    if dry_run {
+        out.boxes = eligible.iter().map(|(_, n, _)| n).sum();
+        out.done = eligible
+            .iter()
+            .take(LISTED)
+            .map(|(r, _, _)| r.clone())
+            .collect();
+        return out;
+    }
+    for (rel, _, (w, h)) in eligible.into_iter().take(limit) {
+        let rel = rel.as_str();
+        let Some(frame) = Frame::resolve_in(&mut walker, rel) else {
+            out.failed(rel, "the frame is gone");
+            continue;
+        };
+        let mut n = 0;
+        let r = super::update(&frame.labels, |cur| {
+            let Some(mut l) = cur.or_else(|| frame.record().ok().and_then(|rec| fresh(&rec)))
+            else {
+                return Ok(None);
+            };
+            n = resolve_small(&mut l, w, h, floor);
+            Ok((n > 0).then_some(l))
+        });
+        match r {
+            Ok(true) => {
+                out.boxes += n;
+                out.done(rel);
+            }
+            Ok(false) => {}
+            Err(e) => out.failed(rel, &format!("{e:#}")),
+        }
+    }
+    out
 }
 
 /// The classes the reviewer wants: `classes` (`collect.classes`) without `hidden`
@@ -1053,6 +1176,148 @@ mod tests {
         assert_eq!(l.status, Status::Unreviewed);
         assert_eq!(l.boxes[0].state, BoxState::Rejected);
         assert!(l.repeat_spot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_boxes_under_the_size_floor_are_rejected_as_too_small_by_the_rule() {
+        let dir = std::env::temp_dir().join(format!("bop-floor-{}", uuid::Uuid::new_v4()));
+        // 64 x 48 frames; at input 384 a box 1 px wide is 6 px, the floor 10.
+        let floor = super::super::SizeFloor {
+            px: 10.0,
+            input: 384,
+        };
+        let tiny = |label: &str| {
+            let mut b = auto_box(label, 0.6, Triage::Review);
+            b.bbox = [2.0, 2.0, 3.0, 30.0];
+            b
+        };
+        let big = auto_box("car", 0.6, Triage::Review);
+        let mut drawn = tiny("car");
+        drawn.source = Source::Human;
+        let mut moved = tiny("car");
+        moved.orig_bbox = Some([2.0, 2.0, 40.0, 40.0]);
+        let mut audit = tiny("car");
+        audit.auto.audit = true;
+        let mut unsure = tiny("car");
+        unsure.difficult = true;
+        let mut prediction = model_box("car", Origin::Prediction);
+        prediction.bbox = [10.0, 10.0, 40.0, 11.0];
+        let mut accepted = tiny("car");
+        accepted.state = BoxState::Accepted;
+        let a = put_frame(
+            &dir,
+            "a",
+            None,
+            vec![
+                tiny("person"),
+                big.clone(),
+                drawn,
+                moved,
+                audit,
+                unsure,
+                prediction,
+                accepted,
+            ],
+        );
+        // Reviewed and skipped frames are never touched (a reviewed one cannot hold a pending box
+        // through a save; a hand-written one shows the rule looks at the status).
+        let reviewed = put_frame(&dir, "r", None, vec![tiny("car")]);
+        let skipped = put_frame(&dir, "s", None, vec![tiny("car")]);
+        for (rel, status) in [(&reviewed, Status::Reviewed), (&skipped, Status::Skipped)] {
+            let mut l = labels_of(&dir, rel);
+            l.status = status;
+            super::super::write(&Frame::resolve(&dir, rel).unwrap().labels, &l).unwrap();
+        }
+        // A frame never opened: its model's tiny car, as the page would pre-fill it.
+        let fresh = put_frame(&dir, "f", None, vec![]);
+        let frame = Frame::resolve(&dir, &fresh).unwrap();
+        std::fs::remove_file(&frame.labels).unwrap();
+        let mut rec = frame.record().unwrap();
+        rec.predictions.push(crate::collect::record::Det {
+            label: "car".into(),
+            score: 0.7,
+            bbox: [40.0, 40.0, 60.0, 41.0],
+        });
+        std::fs::write(
+            frame.labels.with_file_name("f.json"),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+        let cls = vec!["person".to_string(), "car".to_string()];
+        let filters = Filters {
+            wanted: Some((cls.clone(), Vec::new())),
+            ..Filters::default()
+        };
+        let all = [&a, &reviewed, &skipped];
+        let before: Vec<LabelFile> = all.iter().map(|r| labels_of(&dir, r)).collect();
+        let dry = bulk_resolve_small(&dir, &filters, floor, true, 100);
+        assert_eq!((dry.eligible, dry.boxes, dry.done_count), (2, 3, 0));
+        let after: Vec<LabelFile> = all.iter().map(|r| labels_of(&dir, r)).collect();
+        assert_eq!(before, after, "a dry run writes nothing");
+        assert!(frame.labels().unwrap().is_none());
+        // Without the class list a frame never opened is passed over.
+        let bare = bulk_resolve_small(&dir, &Filters::default(), floor, true, 100);
+        assert_eq!((bare.eligible, bare.boxes), (1, 2));
+        let o = bulk_resolve_small(&dir, &filters, floor, false, 100);
+        assert_eq!(
+            (o.boxes, o.done_count, o.failed_count),
+            (dry.boxes, 2, 0),
+            "the dry run's count is what the run does"
+        );
+        let la = labels_of(&dir, &a);
+        let got: Vec<(BoxState, Option<&str>)> = la
+            .boxes
+            .iter()
+            .map(|b| (b.state, b.reason.as_deref()))
+            .collect();
+        let rule = Some(SIZE_FLOOR_REASON);
+        assert_eq!(
+            got,
+            [
+                (BoxState::Rejected, rule),
+                (BoxState::Pending, None),
+                (BoxState::Pending, None),
+                (BoxState::Pending, None),
+                (BoxState::Pending, None),
+                (BoxState::Pending, None),
+                (BoxState::Rejected, rule),
+                (BoxState::Accepted, None),
+            ],
+            "only pending model and auto boxes no person touched, no audit sample"
+        );
+        assert!(la.boxes[0].is_ignore() && la.boxes[0].is_size_floor_reject());
+        assert_eq!(la.status, Status::Unreviewed);
+        assert_eq!(la.hard_negatives().count(), 0, "a real object");
+        assert!(!la.boxes[0].has_human_decision() && !la.boxes[6].has_human_decision());
+        assert_eq!(labels_of(&dir, &reviewed), before[1]);
+        assert_eq!(labels_of(&dir, &skipped), before[2]);
+        let lf = frame.labels().unwrap().unwrap();
+        assert_eq!(lf.boxes[0].state, BoxState::Rejected);
+        assert!(lf.boxes[0].is_size_floor_reject());
+        // Out of the camera's repeats history: no verdict on the spot.
+        let h = super::super::repeats::scan(&dir, "cam", 100);
+        assert!(
+            h.decisions
+                .iter()
+                .all(|d| d.state != BoxState::Rejected || d.frame.ends_with("r.jpg")),
+            "{:?}",
+            h.decisions
+        );
+        // Done: a second run finds nothing.
+        let again = bulk_resolve_small(&dir, &filters, floor, false, 100);
+        assert_eq!((again.eligible, again.boxes), (0, 0));
+        // A limit takes the first frames only; the rest wait.
+        let g = put_frame(&dir, "g", None, vec![tiny("car")]);
+        let h2 = put_frame(&dir, "h", None, vec![tiny("car")]);
+        let one = bulk_resolve_small(&dir, &filters, floor, false, 1);
+        assert_eq!((one.eligible, one.boxes, one.done_count), (2, 1, 1));
+        let left = bulk_resolve_small(&dir, &filters, floor, true, 100);
+        assert_eq!((left.eligible, left.boxes), (1, 1));
+        assert!(
+            labels_of(&dir, &g).boxes[0].is_size_floor_reject()
+                != labels_of(&dir, &h2).boxes[0].is_size_floor_reject()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

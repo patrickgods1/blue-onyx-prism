@@ -873,11 +873,16 @@ Click a box to select it. Drag on the image to draw a new one.
 ```
 
 <a id="ignore-regions"></a>**Ignore regions.** A real object not to train on, and no negative either: an
-unsure box (`difficult`), or a box rejected with `reject_reason: too_small`. YOLO has no way to say "skip
-this object", and a frame trained with it unlabelled teaches the object as background, so a training run
-takes such a frame out of train and valid (counted, `ignore_frames` in `dataset.json`, with a warning). It
-stays in the held-out set, where the box is `ignore`: a detection on it counts neither way. `ignore.json`
-at the export's root carries them, in the numbers of a YOLO label line, so no pixel size is needed to read it:
+unsure box (`difficult`), a box rejected with `reject_reason: too_small`, or (with `collect.size_floor`
+set) a training box under the size floor, below. YOLO has no way to say "skip this object", so a training
+run decides what such a frame becomes (`training.ignore`, `docs/TRAINING.md` "Ignore regions"): by default
+(`background`) a frame with a label of the run's classes trains with the object unlabelled, a frame of
+nothing but such objects is left out (it is no "nothing here" frame, confirmed empty or not), and
+validation never holds one; `drop-frame` leaves every such frame out of train and valid, as earlier versions
+did. Counted in `dataset.json` (`ignore_frames`, `ignore_only`, `ignore_valid_day`, `ignore_kept`,
+`ignore_boxes_background`) with a warning. It stays in the held-out set, where the box is `ignore`: a
+detection on it counts neither way. `ignore.json` at the export's root carries them, in the numbers of a
+YOLO label line, so no pixel size is needed to read it:
 
 ```json
 { "version": 1,
@@ -889,6 +894,24 @@ Keys are the image file names of `images/<split>/`, a frame without regions is n
 as reviewed even outside the class list. Written with every export format. A folder without the file has no
 regions, so an export from an older version still reads, with those objects unlabelled as before: export
 again to use them. A damaged file stops the run rather than teach them as background.
+
+<a id="size-floor"></a>**Size floor.** `collect.size_floor` (`{"px": 10, "input": 384}`; off by default)
+says how small an object a model of that input size can learn: a training box whose short side at the
+model's input, `min(w / W, h / H) * input` of the box clamped to the frame, is under `px` cannot be
+learned (measured on 851 reviewed frames with fold models that never saw the camera day, at 384 px: under
+8 px found 6% of the time, 8-12 px 37%, 12-24 px 83%, above that 94%). An export then writes such a box
+(accepted or added, not already an ignore region) as an ignore region: out of the YOLO and the benchmark
+ground truth, in `ignore.json` with `"size_floor": true` (and the floor at the file's top, `size_floor`),
+`ignore: true` in the benchmark manifest, `attributes: {"difficult": true, "size_floor": true}` in COCO.
+X-AnyLabeling files keep it as a plain box: an import would otherwise mark it unsure in the label file for
+good. The label file never changes: the person stays "person, accepted", so another floor is just another
+export. `export.json` records `size_floor` and counts `under_floor` (`train` and `val` per class, and
+`frames_only`, frames left with no label but such regions; never "confirmed empty"). Older builds read such
+an export as one with more unsure boxes. Held-out scores before and after a floor change do not compare:
+the held-out set's ignore regions change, and with them its fingerprint (`heldout_fingerprint`). The
+dataset check judges by the same rule (`docs/TRAINING.md`), and the Refine tab's rule may reject pending
+model and auto boxes under the floor on unreviewed frames as too small (`reason: size_floor`, an ignore
+region, no reviewer's decision, out of `hard_negatives.json` and the repeats history).
 
 **Split.** Frames are split by whole camera days (camera and date folder), so frames of one camera on
 one day never sit on both sides. That does not mean an unseen camera: other days of a held-out camera
