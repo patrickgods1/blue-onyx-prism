@@ -27,7 +27,9 @@ pub struct Written {
     pub frames: usize,
     /// Suggestions written now, per kind.
     pub written: KindCounts,
-    /// Suggestions found, per kind.
+    /// Suggestions found and kept on the files, per kind: the judged ones [`refine::apply`] did
+    /// not drop (a weaker copy of one finding, the same finding as an answered one, past the
+    /// file's limit), whether new or the same as before.
     pub found: KindCounts,
     /// Of `found.add`, those at a static spot ([`Suggestion::spot`]).
     pub add_at_spots: usize,
@@ -104,6 +106,9 @@ fn write_frame(
     })?;
     let mut judged = None;
     let mut written = KindCounts::default();
+    // The unanswered suggestions of this check's kinds on the file after `apply`: what it kept of
+    // the judged ones (an unchanged file holds the same list, ignoring `run`).
+    let mut kept: Vec<(Kind, bool)> = Vec::new();
     let changed = labels::update(&frame.labels, |cur| {
         let Some(mut file): Option<LabelFile> = cur else {
             return Ok(None);
@@ -126,15 +131,21 @@ fn write_frame(
         let before = file.refine.clone();
         let applied = refine::apply(&mut file, j.suggestions.clone(), &KINDS);
         written = new_ones(&before, &file.refine);
+        kept = file
+            .refine
+            .iter()
+            .filter(|s| !s.answered() && KINDS.contains(&s.kind))
+            .map(|s| (s.kind, s.spot.is_some()))
+            .collect();
         judged = Some(j);
         Ok(applied.changed().then_some(file))
     })?;
     if let Some(j) = judged {
         out.checked += 1;
         out.loose += j.loose;
-        for s in &j.suggestions {
-            bump(&mut out.found, s.kind);
-            out.add_at_spots += usize::from(s.kind == Kind::Add && s.spot.is_some());
+        for (kind, at_spot) in kept {
+            bump(&mut out.found, kind);
+            out.add_at_spots += usize::from(kind == Kind::Add && at_spot);
         }
         out.written.add += written.add;
         out.written.verify += written.verify;
@@ -185,4 +196,119 @@ pub fn write_fold(
         }
     }
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::collect::labels::bulk::Wanted;
+    use crate::collect::labels::bulk::test_support::put_frame_at;
+    use crate::collect::labels::export::{self, ClassFilter, SplitConfig};
+    use crate::collect::labels::statics;
+    use crate::collect::labels::{BoxState, LabelBox, Source, Status};
+    use crate::training::autolabel::triage::Det;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn found_counts_what_apply_kept_not_the_copies_it_dropped() {
+        let dir = std::env::temp_dir().join(format!("bo_refine_write_{}", uuid::Uuid::new_v4()));
+        // A parked car at one place of camera `yard` on 12 other frames of 3 other days.
+        let car_at = [100.0f32, 100.0, 300.0, 250.0];
+        let nb = statics::normalised(&car_at, 640, 480).unwrap();
+        let table = statics::Table::build((0..12).map(|i| statics::Obs {
+            camera: "yard".into(),
+            frame: format!("other/{i}"),
+            day: format!("2026-10-0{}", i % 3 + 1),
+            scene: "day".into(),
+            label: "car".into(),
+            bbox: nb,
+        }));
+        assert_eq!(table.len(), 1);
+        // A reviewed frame without its box, and a person elsewhere.
+        let person = LabelBox {
+            label: "person".into(),
+            bbox: [400.0, 100.0, 450.0, 300.0],
+            source: Source::Auto,
+            score: Some(0.9),
+            state: BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: Default::default(),
+        };
+        let rel = put_frame_at(&dir, "yard", "f1", (640, 480), None, vec![person]);
+        let path = Frame::resolve(&dir, &rel).unwrap().labels;
+        labels::update(&path, |c| {
+            let mut f = c.unwrap();
+            f.status = Status::Reviewed;
+            Ok(Some(f))
+        })
+        .unwrap();
+        let classes = vec!["car".to_string(), "truck".to_string(), "person".to_string()];
+        let wanted = Wanted {
+            classes: &classes,
+            hidden: &[],
+        };
+        let sel = export::reviewed_frames_filtered(
+            &dir,
+            &classes,
+            &SplitConfig::default(),
+            &ClassFilter::default(),
+        );
+        assert_eq!(sel.frames.len(), 1, "{:?}", sel.warnings);
+        // Two weak detections of the one parked car: both become the spot's car at the place, one
+        // finding; apply keeps the stronger.
+        let det = |label: &str, d: f32, score: f32| Det {
+            label: label.into(),
+            score,
+            bbox: [car_at[0] + d, car_at[1], car_at[2] + d, car_at[3]],
+        };
+        let mut found = Detections {
+            frames: BTreeMap::new(),
+            device: String::new(),
+            cancelled: false,
+        };
+        found.frames.insert(
+            rel.clone(),
+            vec![det("car", 0.0, 0.45), det("truck", 4.0, 0.4)],
+        );
+        // Persons too rare for a verify: the frame's one finding is the car's.
+        let counts: BTreeMap<String, usize> = classes
+            .iter()
+            .map(|c| (c.clone(), if c == "person" { 0 } else { 500 }))
+            .collect();
+        let ctx = Context {
+            wanted: &wanted,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r1",
+            spots: Some(&table),
+        };
+        let frames: Vec<&ExportFrame> = sel.frames.iter().collect();
+        let mut tally = RecallTally::default();
+        let w = write_fold(&dir, &frames, &found, &ctx, &mut tally, &mut |_, _| {});
+        let file = labels::read(&path).unwrap().unwrap();
+        assert_eq!(file.refine.len(), 1, "{:?}", file.refine);
+        assert_eq!(
+            (w.found.add, w.add_at_spots, w.written.add),
+            (1, 1, 1),
+            "{w:?}"
+        );
+        // A rerun finds the same: nothing written, still one found.
+        let again = write_fold(&dir, &frames, &found, &ctx, &mut tally, &mut |_, _| {});
+        assert_eq!(
+            (
+                again.found.add,
+                again.add_at_spots,
+                again.written.add,
+                again.frames
+            ),
+            (1, 1, 0, 0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

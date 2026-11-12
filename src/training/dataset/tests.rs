@@ -2848,3 +2848,98 @@ fn a_person_at_one_place_is_never_a_static_spot_nor_capped() {
         .count();
     assert_eq!(persons, 40, "every person frame trains");
 }
+
+#[test]
+fn a_minority_class_at_a_spot_keeps_a_quota_of_its_own() {
+    let t = tmp("static-truck");
+    let dir = &t.0;
+    // A car at its place on 60 days (2 frames a day), and a pickup labelled truck parked at the
+    // same place on 2 of those days (2 frames each): one spot (vehicles are one object), two
+    // quotas. With one quota of 20 for the place the truck's 4 frames were lost about half the
+    // time; now they always stay.
+    let mut frames = Vec::new();
+    for day in 1..=60 {
+        for _ in 0..2 {
+            let i = frames.len();
+            frames.push(patio_frame(
+                dir,
+                i,
+                day,
+                STATIC_SCENES[i % 3],
+                &[parked_car(i)],
+            ));
+        }
+    }
+    for day in [10, 40] {
+        for _ in 0..2 {
+            let i = frames.len();
+            let (_, cx, cy, w, h) = parked_car(i);
+            frames.push(patio_frame(dir, i, day, "day", &[("truck", cx, cy, w, h)]));
+        }
+    }
+    for k in 0..5 {
+        let i = frames.len();
+        frames.push(patio_frame(dir, i, k + 1, "day", &[person(k)]));
+    }
+    let s = [Source {
+        classes: vec!["car".into(), "truck".into(), "person".into()],
+        ..patio_source(dir, frames)
+    }];
+    let o = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..o.clone() }).unwrap();
+        let used = used_frames(&p);
+        let trucks = used
+            .iter()
+            .filter(|r| s[0].frames[r.1].boxes[0].class == "truck")
+            .count();
+        assert_eq!(trucks, 4, "seed {seed}: {:?}", p.stats.static_caps);
+        assert_eq!(p.stats.static_spots, 1);
+        // `static_caps`: one entry per (spot, class); `label` is the class of the quota.
+        let caps = &p.stats.static_caps;
+        assert_eq!(caps.len(), 2, "{caps:?}");
+        assert_eq!(caps[0].id, caps[1].id, "one spot");
+        assert_eq!(
+            (caps[0].label.as_str(), caps[0].frames, caps[0].kept),
+            ("car", 120, PARKED_CAP)
+        );
+        assert_eq!(
+            (caps[1].label.as_str(), caps[1].frames, caps[1].kept),
+            ("truck", 4, 4)
+        );
+        assert_eq!(p.stats.static_capped, 100);
+        assert_eq!(
+            p.stats.static_capped_boxes,
+            [("car".to_string(), 100)].into()
+        );
+        // The note counts the place once.
+        let note = static_cap_note(&p.stats, o.static_cap).unwrap();
+        assert!(
+            note.starts_with("100 frame(s) showing nothing but objects parked at 1 static spot(s)"),
+            "{note}"
+        );
+        assert!(note.contains("per spot and class"), "{note}");
+    }
+}
+
+#[test]
+fn a_class_the_cap_took_frames_of_says_so_in_its_warnings() {
+    let mut stats = Stats::default();
+    assert_eq!(static_cap_clause(&stats, "truck"), None);
+    stats.static_capped_boxes.insert("truck".into(), 7);
+    let c = static_cap_clause(&stats, "truck").unwrap();
+    assert!(c.contains("left out 7 box(es)"), "{c}");
+    assert!(c.contains("training.static_cap to 0"), "{c}");
+    assert!(c.contains("--static-cap 0"), "{c}");
+    assert_eq!(static_cap_clause(&stats, "car"), None);
+    // The note of a run whose classes can never be static: only with the cap on.
+    let merged = vec!["vehicle".to_string(), "person".to_string()];
+    assert!(static_cap_idle_note(&merged, Some(20)).is_some());
+    assert!(static_cap_idle_note(&merged, None).is_none());
+    assert!(static_cap_idle_note(&merged, Some(0)).is_none());
+    assert!(static_cap_idle_note(&["car".to_string()], Some(20)).is_none());
+}

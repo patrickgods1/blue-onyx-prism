@@ -991,6 +991,9 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             if let Some(note) = dataset::static_cap_note(&plan.stats, opts.static_cap) {
                 println!("{note}");
             }
+            if let Some(note) = dataset::static_cap_idle_note(&plan.classes, opts.static_cap) {
+                println!("{note}");
+            }
             println!(
                 "{}: {} training, {} validation, {} held-out images; classes: {}",
                 out.display(),

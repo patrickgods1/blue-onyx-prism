@@ -444,6 +444,42 @@ fn frames_over_the_static_cap_are_named_with_their_largest_spot() {
         t.contains("a car on camera patio (45 frames, 20 kept)"),
         "{t}"
     );
+    // Few car boxes are left to train on: the warning names the cap and how to turn it off.
+    let few = p
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("Only ") && w.contains("'car'"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(
+        few.contains(
+            "the static cap left out 25 box(es) of it on frames showing nothing but parked"
+        ),
+        "{few}"
+    );
+    assert!(few.contains("training.static_cap to 0"), "{few}");
+    assert_eq!(p.stats.static_capped_boxes.get("car"), Some(&25));
+    assert!(!r.notes.iter().any(|n| n.contains("no class of this run")));
+    // The cars renamed into a merged class of their own: no spot can form, one note says so.
+    let merged = Options {
+        rename: [("car".to_string(), "vehicle".to_string())].into(),
+        ..opts()
+    };
+    let p = planned(&sources, &merged).unwrap();
+    assert_eq!((p.stats.static_capped, p.stats.static_spots), (0, 0));
+    let r = report(&p, &sources, &merged, None);
+    let idle: Vec<&String> = r
+        .notes
+        .iter()
+        .filter(|n| n.contains("no class of this run (vehicle)"))
+        .collect();
+    assert_eq!(idle.len(), 1, "{:?}", r.notes);
+    let off = Options {
+        static_cap: None,
+        ..merged
+    };
+    let p = planned(&sources, &off).unwrap();
+    let r = report(&p, &sources, &off, None);
+    assert!(!r.notes.iter().any(|n| n.contains("no class of this run")));
     // The same frames with a cat: animals never form a spot, nothing is capped.
     let cats = [source(
         sources[0]

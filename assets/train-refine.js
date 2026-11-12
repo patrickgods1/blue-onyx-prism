@@ -603,6 +603,11 @@
       var weak = j.below_score > 0
         ? '; ' + j.below_score + ' weaker ' + (j.below_score === 1 ? 'one stays' : 'ones stay') + ' for one-by-one review'
         : '';
+      // A frame a reviewer confirmed empty never gets a box in bulk.
+      if (j.left_empty > 0) {
+        weak += '; ' + plural(j.left_empty, 'frame', 'frames') + ' confirmed empty ' +
+          (j.left_empty === 1 ? 'is' : 'are') + ' left for one-by-one review';
+      }
       var go = $('refine-spot-confirm-go');
       if (j.accepted === 0) {
         text = 'Nothing to add at this spot (' + spotName(s) + ') at a score of ' + num(j.min_score) + ' or more' + weak + '.';

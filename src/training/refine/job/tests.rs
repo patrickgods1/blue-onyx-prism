@@ -1905,10 +1905,12 @@ fn refine_replay_on_a_copy() {
     println!("{:.1} s", started.elapsed().as_secs_f64());
 }
 
-/// The static spots of a copy of a dataset at several spot IoUs (the measurement behind
-/// [`statics::SPOT_IOU`]): `BOP_REFINE_CONFIG=<config file> cargo test --lib static_spots_measure
-/// -- --ignored --nocapture`. Reads the reviewed frames of the folder under review as the check
-/// selects them; writes nothing.
+/// The static spots of a copy of a dataset at several spot IoUs and dwell shares (the measurement
+/// behind [`statics::SPOT_IOU`] and [`statics::MIN_DAY_SHARE`]): `BOP_REFINE_CONFIG=<config file>
+/// cargo test --lib static_spots_measure -- --ignored --nocapture`. Reads the reviewed frames of
+/// the folder under review as the check selects them; writes nothing. With `BOP_PLAN_EXPORT=<a
+/// Dataset tab export>` it also plans a training run on that export (plan only, nothing written)
+/// with the static cap off and at 20, and prints what each trains on.
 #[test]
 #[ignore = "needs a copy of a dataset"]
 fn static_spots_measure_on_a_copy() {
@@ -1936,53 +1938,34 @@ fn static_spots_measure_on_a_copy() {
         obs.len()
     );
     let mut all: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_camera: BTreeMap<&str, usize> = BTreeMap::new();
     for o in &obs {
         *all.entry(o.label.clone()).or_default() += 1;
+        if statics::may_be_static(&o.label) {
+            *per_camera.entry(o.camera.as_str()).or_default() += 1;
+        }
     }
+    println!(
+        "boxes that may be static per camera (clustered whole up to {}): {per_camera:?}",
+        statics::MAX_OBS_PER_CAMERA
+    );
     // The folder's spots as a "Static objects" card lists them (after a check: open adds).
     for x in statics::overview(&s.frames, &wanted) {
         println!(
-            "  spot {}: {} on {} frames of {} days {:?}; labelled frames {}, frames with an open \
-             add {}",
+            "  spot {}: {} on {} frames of {} days ({} stayed) {:?}; labelled frames {}, frames \
+             with an open add {}",
             x.spot.id,
             x.spot.label,
             x.spot.frames,
             x.spot.days,
+            x.spot.stay_days,
             x.spot.scenes,
             x.labelled,
             x.open_adds
         );
     }
-    for t in [0.5f32, 0.6, 0.7, 0.8] {
-        let started = Instant::now();
-        let table = Table::build_at(obs.clone(), t);
-        let ms = started.elapsed().as_millis();
-        println!("\n=== spot IoU {t} ({} spots, {ms} ms) ===", table.len());
-        for (cam, spots) in &table.cameras {
-            let mut by_obj: BTreeMap<&str, usize> = BTreeMap::new();
-            for sp in spots {
-                *by_obj.entry(sp.label.as_str()).or_default() += 1;
-            }
-            // Neighbouring spots: the largest IoU between two representatives of one object.
-            let mut max_pair = 0f32;
-            let mut close = 0;
-            for (i, a) in spots.iter().enumerate() {
-                for b in spots.iter().skip(i + 1) {
-                    if a.object == b.object {
-                        let v = labels::iou(&a.bbox, &b.bbox);
-                        max_pair = max_pair.max(v);
-                        close += usize::from(v >= 0.3);
-                    }
-                }
-            }
-            println!(
-                "  camera {cam}: {} spots {by_obj:?}; frames per spot {:?}; max rep-pair IoU \
-                 {max_pair:.2}, pairs >= 0.3: {close}",
-                spots.len(),
-                spots.iter().map(|s| s.frames).collect::<Vec<_>>()
-            );
-        }
-        // Boxes at a spot (matched against the table, as the cap and the judge do), per class.
+    // Boxes at a spot per class, static-only frames and frames with two boxes at one spot.
+    let describe = |table: &Table| {
         let mut at: BTreeMap<String, usize> = BTreeMap::new();
         for o in &obs {
             if table.spot_at(&o.camera, &o.label, &o.bbox).is_some() {
@@ -1995,8 +1978,6 @@ fn static_spots_measure_on_a_copy() {
                 at.get(c).copied().unwrap_or(0)
             );
         }
-        // Static-only frames, and merged neighbours: frames with two boxes of one object that lie
-        // at the same spot (two cars side by side taken for one place).
         let mut static_only = 0;
         let mut positive = 0;
         let mut doubles = 0;
@@ -2033,5 +2014,137 @@ fn static_spots_measure_on_a_copy() {
              frames with two boxes at one spot: {doubles}",
             s.frames.len()
         );
+    };
+    // The dwell rule: every spot with its smallest and median day share, at several shares.
+    let base = Table::build_with(obs.clone(), statics::SPOT_IOU, 0.0);
+    for share in [0.0f32, 0.2, 0.3, 0.5] {
+        let started = Instant::now();
+        let table = Table::build_with(obs.clone(), statics::SPOT_IOU, share);
+        let ms = started.elapsed().as_millis();
+        let by_cam: Vec<String> = table
+            .cameras
+            .iter()
+            .map(|(c, v)| format!("{c} {}", v.len()))
+            .collect();
+        println!(
+            "\n=== spot IoU {} dwell share {share}: {} spots ({}), {ms} ms ===",
+            statics::SPOT_IOU,
+            table.len(),
+            by_cam.join(", ")
+        );
+        for sp in table.spots() {
+            let mut shares: Vec<f64> = sp.day_shares().values().copied().collect();
+            shares.sort_by(f64::total_cmp);
+            let min = shares.first().copied().unwrap_or(0.0);
+            let median = shares
+                .get(shares.len().saturating_sub(1) / 2)
+                .copied()
+                .unwrap_or(0.0);
+            println!(
+                "  {} {}: {} frames, {} days ({} stayed), day share min {min:.2} median \
+                 {median:.2}",
+                sp.id, sp.label, sp.frames, sp.days, sp.stay_days
+            );
+        }
+        // Spots of the table without the rule that this one does not have (by place).
+        for sp in base.spots() {
+            let kept = table
+                .camera(&sp.camera)
+                .iter()
+                .any(|x| x.object == sp.object && labels::iou(&x.bbox, &sp.bbox) >= 0.9);
+            if !kept {
+                println!(
+                    "  REMOVED {} {}: {} frames, {} days, {} of them at share >= {share}",
+                    sp.id,
+                    sp.label,
+                    sp.frames,
+                    sp.days,
+                    sp.day_shares()
+                        .values()
+                        .filter(|v| **v >= f64::from(share))
+                        .count()
+                );
+            }
+        }
+        describe(&table);
+    }
+    for t in [0.5f32, 0.7, 0.8] {
+        let started = Instant::now();
+        let table = Table::build_at(obs.clone(), t);
+        let ms = started.elapsed().as_millis();
+        println!(
+            "\n=== spot IoU {t}, dwell share {} ({} spots, {ms} ms) ===",
+            statics::MIN_DAY_SHARE,
+            table.len()
+        );
+        for (cam, spots) in &table.cameras {
+            let mut by_obj: BTreeMap<&str, usize> = BTreeMap::new();
+            for sp in spots {
+                *by_obj.entry(sp.label.as_str()).or_default() += 1;
+            }
+            // Neighbouring spots: the largest IoU between two representatives of one object.
+            let mut max_pair = 0f32;
+            let mut close = 0;
+            for (i, a) in spots.iter().enumerate() {
+                for b in spots.iter().skip(i + 1) {
+                    if a.object == b.object {
+                        let v = labels::iou(&a.bbox, &b.bbox);
+                        max_pair = max_pair.max(v);
+                        close += usize::from(v >= 0.3);
+                    }
+                }
+            }
+            println!(
+                "  camera {cam}: {} spots {by_obj:?}; frames per spot {:?}; max rep-pair IoU \
+                 {max_pair:.2}, pairs >= 0.3: {close}",
+                spots.len(),
+                spots.iter().map(|s| s.frames).collect::<Vec<_>>()
+            );
+        }
+        describe(&table);
+    }
+    // The plan of a training run on an export, with the static cap off and on.
+    let Some(export) = std::env::var_os("BOP_PLAN_EXPORT").map(PathBuf::from) else {
+        return;
+    };
+    let source = crate::training::dataset::read_export(&export).unwrap();
+    let sources = [source];
+    for cap in [None, Some(20)] {
+        let o = crate::training::dataset::Options {
+            negative_share: cfg.training.negative_share,
+            heldout_share: cfg.training.heldout_share,
+            oversample: cfg.training.oversample,
+            static_cap: cap,
+            ..crate::training::dataset::Options::default()
+        };
+        let started = Instant::now();
+        let p = crate::training::preflight::planned(&sources, &o).unwrap();
+        println!(
+            "\n=== plan of {} with static cap {cap:?} ({} ms) ===",
+            export.display(),
+            started.elapsed().as_millis()
+        );
+        println!(
+            "  training frames {} (positives {}, negatives {}), validation {}, held out {}",
+            p.train.len(),
+            p.stats.train_positives,
+            p.stats.train_negatives,
+            p.valid.len(),
+            p.heldout.len()
+        );
+        println!("  training boxes per class {:?}", p.stats.train_boxes);
+        println!(
+            "  static spots {}, frames capped {}, boxes capped {:?}",
+            p.stats.static_spots, p.stats.static_capped, p.stats.static_capped_boxes
+        );
+        for c in &p.stats.static_caps {
+            println!(
+                "    {} {}: {} frames, {} kept",
+                c.id, c.label, c.frames, c.kept
+            );
+        }
+        for w in &p.warnings {
+            println!("  warning: {w}");
+        }
     }
 }

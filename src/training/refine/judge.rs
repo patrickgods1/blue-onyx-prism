@@ -19,8 +19,9 @@
 //!    [`statics::Table::spot_at`], that is still a spot without the frame's camera-day,
 //!    [`statics::Spot::holds_without`]; people and animals form no spot,
 //!    [`statics::may_be_static`]) the score may be as low as [`ADD_SCORE_AT_SPOT`]; such an
-//!    add carries the spot's id ([`Suggestion::spot`]), the spot's most common label (through the
-//!    class list) and says where its evidence comes from. Measured on kept fold detections of 851
+//!    add carries the spot's id ([`Suggestion::spot`], the check's evidence: the Static objects
+//!    card places it by geometry), its own class from [`ADD_SCORE`] up and the spot's most common
+//!    label (through the class list) below, and says where its evidence comes from. Measured on kept fold detections of 851
 //!    frames: an uncovered detection at a place labelled on 10 or more other frames of its camera
 //!    is real about 90% of the time down to 0.3, while elsewhere detections at 0.3-0.5 are almost
 //!    all false. The evidence leaves out the frame's camera-day, not the frame's whole fold: it is
@@ -413,11 +414,23 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         }
         let (label, why, spot_id) = match spot {
             Some(s) => {
-                // The spot's own label (a truck found where a car is labelled is that car).
-                let label = wanted.class_of(&s.label).unwrap_or(&d.class).to_string();
+                // A weak find takes the spot's own label (a truck found at 0.4 where a car is
+                // labelled is that car); a confident one keeps its class (a clear truck at a
+                // car's place is a truck: another vehicle parked there).
+                let at_spot = wanted.class_of(&s.label).unwrap_or(&d.class);
+                let label = if d.score >= ADD_SCORE {
+                    d.class.clone()
+                } else {
+                    at_spot.to_string()
+                };
+                let found = if label == at_spot {
+                    "one".to_string()
+                } else {
+                    format!("a {label}")
+                };
                 let why = format!(
-                    "a {label} is labelled at this place on {} other frames of this camera; a \
-                     model that never saw this camera-day found one here, score {:.2}",
+                    "a {at_spot} is labelled at this place on {} other frames of this camera; a \
+                     model that never saw this camera-day found {found} here, score {:.2}",
                     s.frames_without(frame.day),
                     d.score
                 );
@@ -1112,9 +1125,25 @@ mod tests {
         let j = run_spots(&f, &[det("car", elsewhere, 0.55)], &table);
         assert_eq!(kinds(&j), [Kind::Add]);
         assert_eq!(j.suggestions[0].spot, None);
-        // A truck where the car is labelled: the spot's label.
+        // A weak truck where the car is labelled: the spot's label.
         let j = run_spots(&f, &[det("truck", NEAR, 0.4)], &table);
         assert_eq!(j.suggestions[0].label.as_deref(), Some("car"));
+        // A confident truck there is a truck (another vehicle parked at the car's place), and
+        // says so; at exactly ADD_SCORE it is confident.
+        for score in [ADD_SCORE, 0.8] {
+            let j = run_spots(&f, &[det("truck", NEAR, score)], &table);
+            let s = &j.suggestions[0];
+            assert_eq!(s.label.as_deref(), Some("truck"), "{score}");
+            assert_eq!(s.spot.as_deref(), Some(spot.id.as_str()));
+            assert!(
+                s.why.starts_with(
+                    "a car is labelled at this place on 12 other frames of this camera; a model \
+                     that never saw this camera-day found a truck here, score"
+                ),
+                "{}",
+                s.why
+            );
+        }
         // A strong find at the spot says so too, at the same strength as one elsewhere.
         let j = run_spots(&f, &[det("car", NEAR, 0.8)], &table);
         assert_eq!(j.suggestions[0].spot.as_deref(), Some(spot.id.as_str()));

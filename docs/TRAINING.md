@@ -251,30 +251,41 @@ lists [ignore regions](#ignore-regions); no file means none.
    (`dataset::PARKED_CAP`). A frame with several spots stays while one of them has room. The rest
    count as `parked_capped` in `dataset.json`, with a warning. Held-out frames are not capped. The
    frame where you pressed *Real, parked* holds a reviewer's box, so it is not capped.
-   **Static cap** (after the parked-spot cap, on the frames it left; a frame it took out counts for
-   neither): fixed cameras see the same parked cars at the same pixels in most frames (on one set of 851
-   reviewed frames, 2,206 of 2,352 car boxes stood at [static spots](#static-spots)), whoever labelled
-   them, so the plan finds the spots itself, by geometry over the training and validation pool's own
-   frames (exports of any version, no `ignore.json` needed): per camera, the places where boxes of one
-   object (car, truck, bus and van are one) sit at IoU 0.6 or more in normalised coordinates on 10 or
-   more frames of 2 or more days. Only vehicles and other known inanimate COCO classes form spots:
-   **people and animals never do**, so a person or an animal frame is never capped (see
-   [Static spots](#static-spots)). A frame whose every training box (after the run's class mapping) lies
-   at a spot shows nothing but parked objects; of those, at most `training.static_cap` (default 20, `0` =
-   off, `--static-cap N` on `train prepare` / `train run`) per spot stay for training and validation
-   together. They are chosen for variety: round-robin over the spot's (scene, day) groups, the scenes
-   alternating, so the first frame of every group goes before the second of any (seeded order of scenes,
-   days and frames). A frame showing several spots stays while one of them has room and then counts
-   toward all of them, so a spot can end over the cap (its frames were kept for another spot), and one
-   whose frames all show a fuller spot can keep fewer. Never capped: a frame with any other training
-   box (a person, a car passing), an empty frame or one whose boxes are all of classes the run does not
-   train (a negative), held-out frames (decided before, so `heldout_fingerprint` is the same with the
-   cap on and off), public frames, frames of an `unknown` camera. The negatives (step 4) and the
+   **Static cap** (after the parked-spot cap, on the positive frames it left): fixed cameras see the same
+   parked cars at the same pixels in most frames (on one set of 851 reviewed frames, 2,138 of 2,357 car
+   boxes stood at [static spots](#static-spots)), whoever labelled them, so the plan finds the spots itself,
+   by geometry over the training and validation pool's own frames after the scene filter (exports of any
+   version, no `ignore.json` needed; the frames the parked-spot cap took out are in that pool too: they
+   are looks at the place like any other, they only stay out of training): per camera, the places where
+   boxes of one object (car, truck, bus and van are one) sit at IoU 0.6 or more in normalised coordinates
+   on 10 or more frames of 2 or more days on which the object stayed (the dwell rule, see
+   [Static spots](#static-spots)). Only vehicles and other known inanimate COCO classes form spots:
+   **people and animals never do**, so a person or an animal frame is never capped, and neither is a class
+   renamed into a name of its own (a merged `vehicle`: the pre-flight says so once when the cap is on and no
+   class of the run can form a spot). A frame whose every box of the run's classes (after the class
+   mapping) lies at a spot shows nothing but parked objects; of those, at most `training.static_cap`
+   (default 20, `0` = off, `--static-cap N` on `train prepare` / `train run`) per spot **and class of the
+   box there** stay for training and validation together: a pickup labelled `truck` on 2 days at the place
+   of a car labelled on 60 keeps its frames (one quota for the place lost both days about half the time).
+   They are chosen for variety: round-robin over the quota's (scene, day) groups, the scenes alternating,
+   so the first frame of every group goes before the second of any (seeded order of scenes, days and
+   frames). A frame counting toward several quotas stays while one of them has room and then counts toward
+   all of them, so a quota can end over the cap (its frames were kept for another); each keeps at least
+   the cap or all its frames, whichever is fewer. Never capped: a frame with any other box of the run's
+   classes (a person, a car passing; a box of a class the run does not train does not count, so a parked
+   car beside an untrained label is capped), an empty frame or one whose boxes are all of classes the run
+   does not train (a negative), held-out frames (decided before, so `heldout_fingerprint` is the same
+   with the cap on and off), public frames, frames of an `unknown` camera. The negatives (step 4) and the
    validation split (step 5) follow on what is left, balancing (step 7) after. `dataset.json` counts
-   `static_capped` and `static_spots` and lists `static_caps` (`id`, `camera`, `label`, `frames`: frames
-   of the pool showing nothing but static objects at that spot, `kept`), largest first; the pre-flight
-   and `train prepare` say *N frame(s) showing nothing but objects parked at M static spot(s) were left
-   out (at most 20 kept per spot, across scenes and days); the largest: ...*.
+   `static_capped` and `static_spots`, lists `static_caps` (one entry per spot and class: `id` the spot,
+   `camera`, `label` the class of the quota, `frames`: frames of the pool showing nothing but static
+   objects with a box of that class at that spot, `kept`), largest first, and `static_capped_boxes` (boxes
+   per class on the frames left out); the pre-flight and `train prepare` say *N frame(s) showing nothing
+   but objects parked at M static spot(s) were left out (at most 20 kept per spot and class, across scenes
+   and days); the largest: ...*, and a class with no or fewer than 50 training boxes says how many of its
+   boxes the cap left out and how to turn it off. The plan's spots come from its own pool (the train and
+   validation frames of the ticked exports after the scene filter), the Refine tab's Static objects card
+   from every reviewed frame of the folder under review, so the two can differ (in spots and ids).
 4. **Hard negatives**: about `training.negative_share` (15%) of the training frames have no objects:
    extra empty frames are dropped, those a reviewer confirmed empty or rejected a box on kept first
    (`frames.json`, `hard_negatives.json`, so the Benchmark format need not be ticked; a labelers
@@ -1844,18 +1855,43 @@ frame after frame (a parked car): the training plan caps the frames that show no
 ([static cap](#assembly-srctrainingdatasetrs)), and the dataset check accepts a weaker detection there as
 an `add`. A spot is a cluster of training boxes (accepted or added, no ignore region) of one object of one
 camera, in coordinates normalised to the frame, on at least `MIN_FRAMES` 10 distinct frames of at least
-`MIN_DAYS` 2 distinct days. Clustering per camera and object: the boxes are put in a canonical order (box,
+`MIN_DAYS` 2 days on which the object stayed. **Dwell rule** (`MIN_DAY_SHARE` 0.3): a day counts toward
+`MIN_DAYS` only when the spot is labelled on at least 30% of that camera's frames of that day that have any
+training box (of any class: what the reviewer labelled that day; empty frames are left out, their number
+follows the collector's rate limits rather than the place). Visitors' cars stopping at a gate or a
+driveway mouth now and then, among the day's other traffic, are on a small share of its frames; a parked
+car is on most of them. Clustering per camera and object: the boxes are put in a canonical order (box,
 frame, day, scene, label) so the result depends on the set of boxes only; the box with the most support
 (distinct frames with a box at IoU >= `SPOT_IOU` with it) seeds a cluster, its members are, per frame, the
 unassigned box closest to the representative at IoU >= `SPOT_IOU`, and the representative becomes the
 coordinate-wise (lower) median of the members, both taken again until they settle (at most 20 rounds). A
-cluster on enough frames and days is a spot; one that is not frees its boxes but none of them seeds
+cluster on enough frames and days is a candidate; one that is not frees its boxes but none of them seeds
 again. Every member lies within `SPOT_IOU` of one representative box, so two neighbouring parking places
-do not chain into one as single linkage would. A box lies at a spot (`statics::spot_at`) at IoU >=
-`SPOT_IOU` with its representative, same object, best IoU first. Ids are `<camera>/<object>/<x0>-<y0>-<x1>-<y1>`
-with the representative in steps of 2% of the frame (`vehicle` for every vehicle class): the same labels
-give the same ids, a rerun after more labels keeps an id unless the median crosses a step, two spots that
-round alike get `~2`. A camera with more than 20,000 boxes is clustered on a fixed sample of its frames.
+do not chain into one as single linkage would. Then every box (sampled or not, below) is counted once, in
+one pass, at the candidate of its object with the best IoU at `SPOT_IOU` or more (ties to the first id):
+a spot's `frames`, `days`, `stay_days`, `by_day`, `scenes` and label are those boxes' (one per frame, the
+closest), so they are exactly what `statics::spot_at` finds later; a candidate that no longer meets the
+rule on them (a neighbour took its boxes) is dropped and the rest counted again. A box lies at a spot
+(`statics::spot_at`) at IoU >= `SPOT_IOU` with its representative, same object, best IoU first. Ids are
+`<camera>/<object>/<x0>-<y0>-<x1>-<y1>` with the representative in steps of 2% of the frame (`vehicle` for
+every vehicle class): the same labels give the same ids, a rerun after more labels keeps an id unless the
+median crosses a step, two spots that round alike get `~2`.
+
+**Bounds** (`MAX_OBS_PER_CAMERA` 4,000): a camera with more boxes of classes that may be static is
+clustered on the boxes of a fixed sample of its frames (lowest FNV-1a hash of the frame's path first, whole
+frames; the dwell rule uses the sample's own frames per day), then counted on every frame as above. A spot
+needs 10 frames on 2 days, so a place labelled on 1 in 400 of a camera's boxes still shows up. No neighbour
+list is stored: support is counted on demand by a sweep over the boxes sorted by `x0` within the window an
+IoU of `SPOT_IOU` allows (`x0` within `[x0 - (1-t)/t w, x0 + (1-t) w]` for a box of width `w`), kept as an
+upper bound and recounted only when it reaches the top of a max-heap (supports only fall as boxes are
+assigned, so the seed is the one the eager rule picks; a test compares both on the same boxes).
+Clustering a camera costs O(S x W) IoUs for the S <= 4,000 boxes clustered (W the boxes in one window,
+at most S: at most 16 million for one car parked in every frame) and O(S) memory; counting costs O(N x K)
+for N boxes and K spots of their object, O(N) memory. Storing every neighbour pair had cost one jittered
+car in 20,000 frames 21.6 s and 4.1 GB in a release build; now a test builds the tables of that car in
+20,000 and in 40,000 frames (plus scattered boxes) in under 2 s together in a debug build, and bounds the
+IoUs computed (`clustering_is_bounded_by_the_sample_and_counting_is_linear`). The 851 frames below take
+about 60 ms per table in a debug build.
 
 **Only things that park form spots** (`statics::may_be_static`, one place in the code): a vehicle class
 (car, truck, bus, van, bicycle, motorcycle, train, boat, airplane) or another COCO class that is neither a
@@ -1890,23 +1926,49 @@ each place one spot (the closest two representatives, 0.49, are two cars of a ro
 IoU the dataset check's 90% measurement used, and puts about 94% of the car boxes in spots on all 851 frames
 (the earlier estimate on one run's training split was 1,243 of 1,472, 84%: more frames make more spots).
 
+`MIN_DAY_SHARE` 0.3 was measured on the same frames (a later copy, 2,761 boxes: five accepted `add`s
+more), at `SPOT_IOU` 0.6, every count over all 851 frames (`static_spots_measure_on_a_copy`):
+
+| Dwell share | Spots (front / garage / patio) | Car boxes at a spot (of 2,357) | Truck (of 129) | Static-only frames (of 731) | Spots it removes |
+|---|---|---|---|---|---|
+| none (0) | 19 (7 / 2 / 10) | 2,211 | 126 | 420 | - |
+| 0.2 | 15 (6 / 2 / 7) | 2,138 | 126 | 412 | four: front 41-1-48-9 (19 frames on 4 days, median day share 0.22), patio 21-5-28-10 (21 on 6, 0.04), 40-0-41-1 (19 on 6, 0.03), 42-0-43-1 (23 on 7, 0.12) |
+| **0.3** | **15 (6 / 2 / 7)** | **2,138** | **126** | **412** | **the same four** |
+| 0.5 | 13 (6 / 2 / 5) | 2,035 | 126 | 371 | those and patio 39-4-44-8 (51 on 2 days, 0.38) and 39-0-41-2 (51 on 8, 0.10) |
+
+The four places 0.2 and 0.3 remove are the smallest of the 19 (19 to 23 frames spread over 4 to 7 days,
+on a few percent of each day's frames): cars at the frame's edge now and then, not parked. Every place of
+hundreds of frames stays at any share (patio 373 and 381 frames at a day share of 0.95 or more, front 158 at
+1.0, the garage truck 123 at 0.94 or more, patio 289 and 286 at 0.47 or more). 0.5 also removes two places
+of 51 frames and leaves mid-sized ones on 2 or 3 qualifying days (patio 0-9-2-14, 137 frames: 2), at the
+edge of `MIN_DAYS`; 0.3 keeps them with the same result as 0.2, so it is the value.
+
 The dataset check builds one spot table per check from its selection (`Selected::spots`, the label
 snapshot every fold uses). Its evidence for a frame leaves out the frame's camera-day
-(`Spot::holds_without`: the spot's frames and days without that day must still reach 10 and 2), since one
-day's frames are near copies of each other; it does not leave out the whole fold, because the evidence is
-the reviewer's labels, which the fold model's blindness does not concern, and other days of the fold are
-other looks at the place. An `add` at a spot carries `spot` (the id), the spot's most common label through
-the class list (a truck found where a car is labelled becomes a car) and the reason *a car is labelled at
-this place on N other frames of this camera; a model that never saw this camera-day found one here, score
-0.xx*, also from 0.5 up. Its strength is that of any `add` of its score (`refine::strength` is unchanged:
-the same score ranks the same, at a spot or not).
+(`Spot::holds_without`: the spot's frames without that day must still reach 10, and the days the object
+stayed without that day 2), since one day's frames are near copies of each other; it does not leave out
+the whole fold, because the evidence is the reviewer's labels, which the fold model's blindness does not
+concern, and other days of the fold are other looks at the place. An `add` at a spot carries `spot` (the
+id: the check's evidence, shown; the Static objects card places a suggestion by its box, not by this id,
+see the Refine tab), its own class from 0.5 up (a clear truck at a car's place is another vehicle parked
+there) and the spot's most common label through the class list below (a truck found at 0.4 where a car is
+labelled becomes a car), and the reason *a car is labelled at this place on N other frames of this camera;
+a model that never saw this camera-day found one here, score 0.xx* (*found a truck here* when its class
+is not the spot's). Its strength is that of any `add` of its score (`refine::strength` is unchanged: the
+same score ranks the same, at a spot or not). The check's counts (`found`, `adds_at_spots`) are what the
+label files keep: `refine::apply` drops a weaker copy of one finding (two detections of one parked vehicle
+both rewritten to the spot's label), and so does the count.
 
 Replayed on the same 851 frames from the kept detections of a 4 folds x 8 epochs check
 (`refine_replay_on_a_copy`, people and animals excluded): 19 spots, all of vehicles; `add` 172 (151 at
 static spots, 21 elsewhere; 123 before the spot rule), `verify` 20, `relabel` 0; a parked pickup labelled
 on 286 frames of its camera gets an `add` on 64 more frames (41 before). Recall at score 0.3: 2,123 of
 2,266 boxes at static spots (93.7%, 95% 92.6-94.6) against 330 of 490 elsewhere (67.3%, 63.1-71.4). The
-answered suggestions (5 dismissed adds, 1 kept verify) stayed.
+answered suggestions (5 dismissed adds, 1 kept verify) stayed. Again with the dwell rule, the kept counts
+and the confident class, on the later copy (six `add`s of the first replay accepted in between): 15 spots;
+`add` 165 (147 at static spots, 18 elsewhere), `verify` 19, `relabel` 0; recall at score 0.3: 2,093 of
+2,198 boxes at static spots (95.2%, 95% 94.2-96.0) against 365 of 563 elsewhere (64.8%, 60.8-68.7); the
+same 6 answered suggestions stayed.
 
 Detection scores are clamped to 0..1 and boxes to the frame first, so a suggestion never holds what a save
 would refuse. A box "covers" a detection (`labels::covers`) at IoU 0.3 or more, or with at least half of the detection
@@ -2067,21 +2129,30 @@ web UI and shows its results; the check itself is the one above and changes no b
   or ends and after a bulk accept), the busiest 200 first (most missing boxes, then most frames). Per spot: the
   camera, what (the label), the place (the newest frame labelled there, `/dataset/image`, cropped around the box
   with the box drawn over it by the page), frames labelled there, days, and *Missing here* = the dataset check's
-  live `add` suggestions that name the spot (`Suggestion.spot`). Actions: *Review* (`/train/review?auto=refine&refine_kind=add&camera=<camera>`)
+  live `add` suggestions that lie at the spot now (`statics::Table::spot_of_add`: the suggestion's box and
+  class against the card's spots, as `statics::spot_at` places a label). The `spot` id a check stored on a
+  suggestion is that check's evidence only: the check made its spots from its own selection (maybe scene
+  filtered) and the labels as they were then, so its ids can differ from the card's (the 2% rounding, a `~2`
+  suffix); an `add` with another id at this place counts here, one with this id that lies elsewhere does
+  not. Actions: *Review* (`/train/review?auto=refine&refine_kind=add&camera=<camera>`)
   and, with missing boxes, *Accept the N at this spot...*.
   - **Accept at a spot** (`POST /v1/refine/accept-spot` `{spot, min_score?, dry_run?, limit?}`, 4 KiB, unknown
-    fields refused): every live `add` suggestion of that spot id scoring `min_score` (default 0.5, 0..=1) or more
-    on the reviewed frames, each through `labels::update` + `refine::accept` (never around it: it replaces
-    unjudged rejects, refuses a stale suggestion, keeps the frame reviewed; the new box is `source: auto`,
-    accepted, `reason: "refine"`; nothing else in the file changes). At most `limit` frames (default and
+    fields refused): every live `add` suggestion lying at that spot (by geometry, as *Missing here*) scoring
+    `min_score` (default 0.5, 0..=1) or more on the reviewed frames, each through `labels::update` +
+    `refine::accept` (never around it: it replaces unjudged rejects, refuses a stale suggestion, keeps the frame
+    reviewed; the new box is `source: auto`, accepted, `reason: "refine"`; nothing else in the file changes). A
+    frame a reviewer confirmed empty gets nothing in bulk (`accept` would end its "empty", and about 1 in 10 such
+    suggestions is wrong): it is counted in `left_empty` and left for one-by-one review, where a reviewer looks
+    at it; the card's question says *N frames confirmed empty are left for one-by-one review*. At most `limit` frames (default and
     maximum 500) are written per call; a rerun takes the rest. `dry_run` runs the same code on the files as read
     and writes nothing, so on an unchanged folder its `accepted` and `frames` are what the apply does, and a
     second apply accepts 0. The card asks first, inline: the dry run's numbers, "about 1 in 10 such suggestions is
     wrong", then *Add them* / *Cancel*; after the write it lists up to 10 frames spread over the days under *Check
     these*, each opening that frame in Review (`/train/review?status=any&source=all&camera=<camera>&frame=<rel>`).
-    Answer: `{success, dry_run, spot, min_score, accepted, frames, eligible, below_score, stale, failed,
-    failed_count, sample, message}`: `below_score` = live adds at the spot under `min_score` (or no longer
-    fitting once the others were added), left for one-by-one review; `eligible` = frames with something to
+    Answer: `{success, dry_run, spot, min_score, accepted, frames, eligible, below_score, left_empty, stale,
+    failed, failed_count, sample, message}`: `below_score` = live adds at the spot under `min_score` (or no longer
+    fitting once the others were added), left for one-by-one review; `left_empty` = frames confirmed empty
+    with a live add at the spot (the dry run counts them the same); `eligible` = frames with something to
     add, also past the limit; `stale` = frames that changed between the look and the write (passed over);
     `failed` = the first 20 `<frame>: <why>`. A spot id the reviewed frames do not make is 404 (a label change
     can move or drop a spot: reload the card), an unplugged folder 503 `folder_missing`, a bad field 400.
@@ -2094,8 +2165,8 @@ web UI and shows its results; the check itself is the one above and changes no b
 
 `GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
 `open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card
-`{success, folder_missing, message?, spots: [{id, camera, object, label, bbox, frames, days, scenes, by_day,
-labelled, open_adds, crop, sample, sample_size}], truncated, totals: {spots, labelled_boxes, open_adds},
+`{success, folder_missing, message?, spots: [{id, camera, object, label, bbox, frames, days, stay_days, scenes,
+by_day, labelled, open_adds, crop, sample, sample_size}], truncated, totals: {spots, labelled_boxes, open_adds},
 static_cap, static_cap_default, static_cap_max}` (`bbox` and `crop` normalised; `sample` is the newest labelled
 frame's rel path, `sample_size` its pixels). The tab has no card for a size floor or tighter boxes yet.
 

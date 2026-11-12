@@ -80,9 +80,12 @@ pub fn advice(plan: &Plan, sources: &[Source]) -> Vec<String> {
     for c in &plan.classes {
         let n = plan.stats.train_boxes.get(c).copied().unwrap_or(0);
         if n > 0 && n < MIN_CLASS_BOXES {
+            let capped = dataset::static_cap_clause(&plan.stats, c)
+                .map(|clause| format!(" Also, {clause}."))
+                .unwrap_or_default();
             out.push(format!(
                 "Only {n} training box(es) of '{c}': the model will find it poorly. Review more \
-                 frames with it, or leave the class out."
+                 frames with it, or leave the class out.{capped}"
             ));
         }
     }
@@ -272,6 +275,9 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         ),
     }
     if let Some(note) = dataset::static_cap_note(s, opts.static_cap) {
+        notes.push(note);
+    }
+    if let Some(note) = dataset::static_cap_idle_note(&plan.classes, opts.static_cap) {
         notes.push(note);
     }
     if let Some(n) = unreviewed.filter(|n| *n > 0) {

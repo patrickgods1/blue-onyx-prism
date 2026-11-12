@@ -29,9 +29,10 @@
 //!    the regions `ignore` in its manifest) and, in [`Excluded::DropFrame`] mode, its frames with
 //!    boxes of untrained labels; cap the frames with nothing but parked-spot boxes at
 //!    [`PARKED_CAP`] per spot (the same crop again and again would dominate training), then, of
-//!    the rest, the frames whose every box lies at a static spot (found by geometry over the
-//!    pool's own frames, [`statics`]) at [`Options::static_cap`] per spot, kept across scenes and
-//!    days ([`over_static_cap`]); held-out frames are never capped; keep about
+//!    the rest, the frames whose every box of the run's classes lies at a static spot (found by
+//!    geometry over the train / valid pool's own frames, [`statics`]) at [`Options::static_cap`]
+//!    per spot and class, kept across scenes and days ([`over_static_cap`]); held-out frames are
+//!    never capped; keep about
 //!    `negative_share` frames without objects in training (frames a reviewer confirmed empty or
 //!    rejected a box on first), take a
 //!    validation split of `val_share` of the review training frames as whole camera days
@@ -1044,15 +1045,20 @@ pub struct Stats {
     #[serde(skip_serializing_if = "is_zero")]
     pub parked_capped: usize,
     /// Train / valid frames showing nothing but objects at static spots left out over
-    /// [`Options::static_cap`] per spot.
+    /// [`Options::static_cap`] per spot and class.
     #[serde(skip_serializing_if = "is_zero")]
     pub static_capped: usize,
     /// Static spots found in the train / valid pool (0 with the cap off).
     #[serde(skip_serializing_if = "is_zero")]
     pub static_spots: usize,
-    /// The spots with frames showing nothing but static objects, most such frames first.
+    /// The (spot, class) quotas with frames showing nothing but static objects, most such frames
+    /// first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub static_caps: Vec<StaticCap>,
+    /// Boxes per class (the run's) on the frames the static cap left out: what the warnings of a
+    /// class with few or no training boxes name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub static_capped_boxes: BTreeMap<String, usize>,
     /// Copies of a frame several exports hold, left out ([`frame_identity`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub duplicates_dropped: usize,
@@ -1126,21 +1132,24 @@ fn over_parked_cap(frames: Vec<(u64, FrameRef, &[String])>) -> BTreeSet<FrameRef
     over
 }
 
-/// One static spot of a plan's train / valid pool with frames showing nothing but static objects
-/// ([`Stats::static_caps`]).
+/// One quota of the static cap: a static spot of a plan's train / valid pool and one class of the
+/// boxes at it, with frames showing nothing but static objects ([`Stats::static_caps`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaticCap {
-    /// [`statics::Spot::id`].
+    /// [`statics::Spot::id`]: one spot has one entry per class of the boxes at it.
     pub id: String,
     pub camera: String,
-    /// The spot's most common label.
+    /// The class (the run's) of this quota: frames whose box at the spot is of it.
     pub label: String,
-    /// Frames of the pool showing nothing but static objects, this spot's among them.
+    /// Frames of the pool showing nothing but static objects with a box of `label` at the spot.
     pub frames: usize,
-    /// Of those, frames kept (more than the cap when frames kept for another spot show this one
-    /// too).
+    /// Of those, frames kept (more than the cap when frames kept for another quota count here
+    /// too; never fewer than the cap or `frames`, whichever is smaller).
     pub kept: usize,
 }
+
+/// A quota of the static cap: (spot id, class).
+type CapKey = (String, String);
 
 /// A pool frame showing nothing but objects at static spots.
 struct StaticFrame<'a> {
@@ -1149,35 +1158,39 @@ struct StaticFrame<'a> {
     key: String,
     scene: &'a str,
     day: &'a str,
-    /// The spots its boxes lie at, sorted, each once.
-    spots: Vec<String>,
+    /// The (spot, class of its box there) quotas its boxes count toward, sorted, each once.
+    spots: Vec<CapKey>,
 }
 
-/// The key that orders a frame of a spot for the static cap: (round within its (scene, day)
+/// The key that orders a frame of a quota for the static cap: (round within its (scene, day)
 /// group, the day's place among the scene's days, the scene's place, the frame's rank, its key).
 type StaticKey = (usize, usize, usize, u64, String);
 
-/// The frames of `frames` to leave out so that at most `cap` of them stand for each static spot,
-/// and per spot (frames, kept). Chosen for variety: per spot, round-robin over its (scene, day)
-/// groups (the first frame of every group before the second of any), the scenes alternating
-/// (seeded order of scenes, then of each scene's days, then of each group's frames). A frame with
-/// several spots is placed by its best key over them and kept while any of them is under the cap;
-/// it then counts toward all of them, so a spot whose frames also show a fuller spot can end over
-/// the cap, and one whose frames all show a spot that filled first keeps fewer than the cap.
+/// The frames of `frames` to leave out so that at most `cap` of them stand for each (static spot,
+/// class) quota, and per quota (frames, kept). Each class at a place has a quota of its own, so a
+/// pickup labelled `truck` on two days at a car's place keeps its frames whatever the car's
+/// number. Chosen for variety: per quota, round-robin over its (scene, day) groups (the first
+/// frame of every group before the second of any), the scenes alternating (seeded order of scenes,
+/// then of each scene's days, then of each group's frames). A frame with several quotas is placed
+/// by its best key over them and kept while any of them is under the cap; it then counts toward
+/// all of them, so a quota whose frames also show a fuller one can end over the cap. Every quota
+/// keeps at least `min(cap, its frames)`: each of its frames is looked at while it is under the
+/// cap, and kept then.
 fn over_static_cap(
     frames: &[StaticFrame<'_>],
     cap: usize,
     seed: u64,
-) -> (BTreeSet<FrameRef>, BTreeMap<String, (usize, usize)>) {
-    let mut by_spot: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+) -> (BTreeSet<FrameRef>, BTreeMap<CapKey, (usize, usize)>) {
+    let mut by_spot: BTreeMap<&CapKey, Vec<usize>> = BTreeMap::new();
     for (i, f) in frames.iter().enumerate() {
         for s in &f.spots {
-            by_spot.entry(s.as_str()).or_default().push(i);
+            by_spot.entry(s).or_default().push(i);
         }
     }
     let at = |i: usize| frames.get(i);
     let mut best: BTreeMap<usize, StaticKey> = BTreeMap::new();
-    for (spot, idx) in &by_spot {
+    for (key, idx) in &by_spot {
+        let spot = format!("{}#{}", key.0, key.1);
         let mut scenes: Vec<&str> = idx.iter().filter_map(|&i| at(i)).map(|f| f.scene).collect();
         scenes.sort_unstable();
         scenes.dedup();
@@ -1222,9 +1235,9 @@ fn over_static_cap(
         .filter_map(|(i, k)| at(i).map(|f| (k, f.r, i)))
         .collect();
     order.sort();
-    let mut counts: BTreeMap<String, (usize, usize)> = by_spot
+    let mut counts: BTreeMap<CapKey, (usize, usize)> = by_spot
         .iter()
-        .map(|(s, idx)| ((*s).to_string(), (idx.len(), 0)))
+        .map(|(s, idx)| ((*s).clone(), (idx.len(), 0)))
         .collect();
     let mut over = BTreeSet::new();
     for (_, r, i) in order {
@@ -1275,6 +1288,7 @@ pub fn static_cap_note(stats: &Stats, cap: Option<usize>) -> Option<String> {
         .iter()
         .filter(|s| s.frames > s.kept)
         .collect();
+    let spots: BTreeSet<&str> = capped.iter().map(|s| s.id.as_str()).collect();
     let largest: Vec<String> = capped
         .iter()
         .take(3)
@@ -1287,12 +1301,42 @@ pub fn static_cap_note(stats: &Stats, cap: Option<usize>) -> Option<String> {
         .collect();
     Some(format!(
         "{} frame(s) showing nothing but objects parked at {} static spot(s) were left out (at \
-         most {} kept per spot, across scenes and days); the largest: {}. Set training.static_cap \
-         to 0 (or --static-cap 0) to keep them all",
+         most {} kept per spot and class, across scenes and days); the largest: {}. Set \
+         training.static_cap to 0 (or --static-cap 0) to keep them all",
         stats.static_capped,
-        capped.len(),
+        spots.len(),
         cap.unwrap_or(PARKED_CAP),
         largest.join("; ")
+    ))
+}
+
+/// What the warnings of class `class` (few or no training boxes) add when the static cap left out
+/// frames with its boxes ([`Stats::static_capped_boxes`]); None when it took none.
+pub fn static_cap_clause(stats: &Stats, class: &str) -> Option<String> {
+    let n = stats
+        .static_capped_boxes
+        .get(class)
+        .copied()
+        .filter(|n| *n > 0)?;
+    Some(format!(
+        "the static cap left out {n} box(es) of it on frames showing nothing but parked objects \
+         (set training.static_cap to 0, or --static-cap 0, to keep them)"
+    ))
+}
+
+/// The pre-flight's note of a run with the static cap on whose classes can form no static spot
+/// ([`statics::may_be_static`]: a class renamed into a custom merged name such as `vehicle` is
+/// none), so the cap leaves nothing out; None otherwise.
+pub fn static_cap_idle_note(classes: &[String], cap: Option<usize>) -> Option<String> {
+    if cap.is_none_or(|c| c == 0) || classes.iter().any(|c| statics::may_be_static(c)) {
+        return None;
+    }
+    Some(format!(
+        "The static cap is on, but no class of this run ({}) is one parked objects are found for: \
+         only vehicle classes (car, truck, bus, ...) and other inanimate COCO classes form static \
+         spots, so a class renamed into a name of its own (such as 'vehicle') is never capped. \
+         Keep the COCO names to cap frames of parked objects",
+        classes.join(", ")
     ))
 }
 
@@ -1619,8 +1663,12 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             over.len()
         ));
     }
-    // The static cap, on what the parked cap left (a frame it took out counts for neither): the
-    // spots by geometry over the pool's own review frames, so exports of any version are capped.
+    // The static cap, on the positive frames the parked cap left. The spots are found by geometry
+    // over the whole train / valid pool's own review frames (exports of any version are capped):
+    // also the frames the parked cap took out, which are looks at the place like any other, and
+    // the frames with only untrained labels (their boxes are not the run's, so they give no
+    // observation). Only frames whose every box of the run's classes lies at a spot are capped,
+    // per (spot, class of the box there).
     if let Some(cap) = opts.static_cap.filter(|&c| c > 0) {
         let own = |r: &FrameRef| -> Option<&Frame> {
             sources
@@ -1648,13 +1696,17 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             .iter()
             .filter_map(|r| {
                 let f = own(r)?;
-                let spots = table.static_only(&f.camera, static_boxes(f, opts, classes))?;
-                Some(StaticFrame {
+                let mut keys: BTreeSet<CapKey> = BTreeSet::new();
+                for (class, b) in static_boxes(f, opts, classes) {
+                    let s = table.spot_at(&f.camera, class, &b)?;
+                    keys.insert((s.id.clone(), class.to_string()));
+                }
+                (!keys.is_empty()).then(|| StaticFrame {
                     r: *r,
                     key: key_of(*r),
                     scene: scene_name(f),
                     day: &f.day,
-                    spots: spots.into_iter().map(str::to_string).collect(),
+                    spots: keys.into_iter().collect(),
                 })
             })
             .collect();
@@ -1662,20 +1714,34 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         pos.retain(|r| !over.contains(r));
         p.stats.static_capped = over.len();
         p.stats.static_spots = table.len();
+        for r in &over {
+            if let Some(f) = frame(*r) {
+                for (i, _) in mapped_boxes(f, opts, classes) {
+                    if let Some(c) = classes.get(i) {
+                        *p.stats.static_capped_boxes.entry(c.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
         let mut caps: Vec<StaticCap> = counts
             .into_iter()
-            .filter_map(|(id, (frames, kept))| {
+            .filter_map(|((id, class), (frames, kept))| {
                 let s = table.get(&id)?;
                 Some(StaticCap {
                     camera: s.camera.clone(),
-                    label: s.label.clone(),
+                    label: class,
                     id,
                     frames,
                     kept,
                 })
             })
             .collect();
-        caps.sort_by(|a, b| b.frames.cmp(&a.frames).then_with(|| a.id.cmp(&b.id)));
+        caps.sort_by(|a, b| {
+            b.frames
+                .cmp(&a.frames)
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.label.cmp(&b.label))
+        });
         p.stats.static_caps = caps;
     }
     if pos.is_empty() {
@@ -1808,18 +1874,23 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         if p.stats.train_boxes.contains_key(c) {
             continue;
         }
+        // Each (spot, class) keeps min(cap, its frames), so the cap alone never takes a class's
+        // last frame; the validation split can take what it kept. Said all the same.
+        let capped = static_cap_clause(&p.stats, c)
+            .map(|clause| format!("; {clause}"))
+            .unwrap_or_default();
         p.warnings.push(match heldout_boxes.get(c.as_str()) {
             Some(n) if hinted => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
                  (the export's val split: camera days held out for the benchmark), so the model \
                  cannot learn it; export again and hold out other cameras or days (Dataset tab \
                  export: holdout cameras / days), or review frames with it from the camera days \
-                 that train"
+                 that train{capped}"
             ),
             Some(n) => format!(
                 "class '{c}' has no training box: its {n} box(es) are only in the held-out \
                  frames{}, so the model cannot learn it; review frames with it from other \
-                 cameras or days, or hold out fewer frames (training.heldout_share)",
+                 cameras or days, or hold out fewer frames (training.heldout_share){capped}",
                 if p.stats.heldout_groups.is_empty() {
                     String::new()
                 } else {
@@ -1828,8 +1899,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             ),
             None => format!(
                 "class '{c}' has no training box: no frame has a box of it (after the scene \
-                 filter and the frames left out for unsure or too-small boxes), so the model \
-                 cannot learn it; review frames with it or drop the class"
+                 filter, the frames left out for unsure or too-small boxes and the caps on parked \
+                 and static frames), so the model cannot learn it; review frames with it or drop \
+                 the class{capped}"
             ),
         });
     }
