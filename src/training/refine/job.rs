@@ -906,9 +906,14 @@ impl Task for RefineJob {
     }
     fn title(&self) -> String {
         format!(
-            "dataset check ({} folds x {} epochs, {})",
+            "dataset check ({} folds x {} {}, {})",
             self.request.folds,
             self.request.epochs,
+            if self.request.epochs == 1 {
+                "epoch"
+            } else {
+                "epochs"
+            },
             self.request.frames.describe()
         )
     }

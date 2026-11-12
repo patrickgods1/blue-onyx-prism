@@ -473,6 +473,72 @@ pub struct Selected {
     pub warnings: Vec<String>,
     /// Why a check would not run on this; None = it can.
     pub refused: Option<String>,
+    /// Open suggestions a check of these frames replaces ([`open_to_replace`]).
+    pub open_suggestions: usize,
+    /// Frames holding them.
+    pub open_frames: usize,
+}
+
+/// The open suggestions a check of `frames` replaces, and the frames holding them: unanswered
+/// ones of the kinds the check writes ([`write::KINDS`]) that a reviewer would see now
+/// ([`refine::live`] with `wanted`, as the check and the Review tab judge them). Stale ones are
+/// replaced too but nobody sees them, so they are not counted.
+pub fn open_to_replace(frames: &[ExportFrame], wanted: &Wanted<'_>) -> (usize, usize) {
+    let mut open = 0;
+    let mut holding = 0;
+    for f in frames {
+        let n = crate::collect::labels::refine::live(&f.labels, Some(wanted))
+            .iter()
+            .filter(|l| write::KINDS.contains(&l.suggestion.kind))
+            .count();
+        if n > 0 {
+            open += n;
+            holding += 1;
+        }
+    }
+    (open, holding)
+}
+
+/// `n` `one`, or `n` `many`.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The warning of a check that replaces `open` open suggestions on `frames` frames
+/// ([`open_to_replace`]): the preview, the CLI and the start's confirmation say it.
+pub fn replace_warning(open: usize, frames: usize) -> String {
+    format!(
+        "this check replaces the {} on {} with what its fold models find; answered ones stay. \
+         Answer them on the Review tab first, or run it to recompute them",
+        counted(open, "open suggestion", "open suggestions"),
+        counted(frames, "frame", "frames"),
+    )
+}
+
+/// Whether fold models of `family` trained `epochs` epochs are too short to judge labels: under
+/// half of the family's [`super::recipe::Recommended::min_epochs`] (the epochs before which no
+/// training run may stop: still settling). With every family's 10, 1 to 4 epochs. Measured: on the
+/// same 851 frames, 4 folds of 8 epochs found 123 missing boxes and 2 folds of 1 epoch none.
+pub fn weak_epochs(family: TrainFamily, epochs: u32) -> bool {
+    epochs.saturating_mul(2) < super::recipe::recommended(family).min_epochs
+}
+
+/// The warning of [`weak_epochs`]; `open` = the open suggestions the check replaces.
+pub fn weak_epochs_warning(family: TrainFamily, epochs: u32, open: usize) -> String {
+    let min = super::recipe::recommended(family).min_epochs;
+    format!(
+        "{} per fold model is under half the {min} epochs {} training takes before it may stop: \
+         fold models this short find little (on one dataset, fold models of 1 epoch found no \
+         missing box where fold models of 8 epochs found 123), so the check says little about \
+         the labels{}",
+        counted(epochs as usize, "epoch", "epochs"),
+        family.title(),
+        if open > 0 {
+            ", and the open suggestions it replaces likely came from stronger fold models"
+        } else {
+            ""
+        }
+    )
 }
 
 /// Most selection warnings kept in a report.
@@ -531,9 +597,10 @@ impl Selected {
     /// What the selection's folds warn about (the preview and the report say it before any fold
     /// runs):
     ///
-    /// - a fold that holds out more frames than its model trains on (a camera day that large
-    ///   dominates the check: its fold model learns from less than it is asked about, so its
-    ///   misses say more about the model than about the labels);
+    /// - a fold whose model trains on clearly fewer frames than the fold holds out (under 90% of
+    ///   them; two even folds differ by a frame and are no warning): a camera day that large
+    ///   dominates the check, its fold model learns from less than it is asked about, so its
+    ///   misses say more about the model than about the labels;
     /// - a class with [`judge::MIN_CLASS_BOXES`] training boxes or more in the selection but fewer
     ///   in what a fold model trains on: that fold's labels of it get no `verify`.
     pub fn fold_warnings(&self, classes: &[String], hidden: &[String]) -> Vec<String> {
@@ -542,7 +609,7 @@ impl Selected {
         for i in 0..self.k {
             let n = i + 1;
             let (held, train) = self.fold_frames(i);
-            if train.len() < held.len() {
+            if train.len() * 10 < held.len() * 9 {
                 out.push(format!(
                     "fold {n} of {k} holds out {h} frames and its model trains on only {t}: a \
                      camera day this large dominates the check, and what its model misses says \
@@ -605,6 +672,7 @@ pub fn select(
             .or_default() += 1;
     }
     out.class_boxes = class_boxes(&out.frames, &wanted);
+    (out.open_suggestions, out.open_frames) = open_to_replace(&out.frames, &wanted);
     // Folded even when refused below, so a preview shows what a check would do.
     match folds::assign(&out.groups, k, FOLD_SEED) {
         Ok(f) => {
@@ -657,6 +725,13 @@ pub struct RefinePreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_basis: Option<TimeBasis>,
     pub warnings: Vec<String>,
+    /// Open suggestions on the selected frames that the check replaces with what its fold models
+    /// find ([`open_to_replace`]): a start asks first (`POST /v1/refine/check` `replace_open`).
+    #[serde(default)]
+    pub open_suggestions: usize,
+    /// Frames holding them.
+    #[serde(default)]
+    pub open_frames: usize,
     /// Why the check would be refused; None = it can run.
     pub refused: Option<String>,
     /// The folder under review is not available (an unplugged drive): `refused` says so, and
@@ -695,7 +770,19 @@ pub fn preview(
         from,
         run: recipe_run,
     } = choose(config, request.epochs, cap)?;
-    let mut warnings = s.warnings.clone();
+    // What a start asks about comes first.
+    let mut warnings = Vec::new();
+    if s.open_suggestions > 0 {
+        warnings.push(replace_warning(s.open_suggestions, s.open_frames));
+    }
+    if weak_epochs(recipe.family, request.epochs) {
+        warnings.push(weak_epochs_warning(
+            recipe.family,
+            request.epochs,
+            s.open_suggestions,
+        ));
+    }
+    warnings.extend(s.warnings.iter().cloned());
     warnings.extend(s.fold_warnings(&config.collect.classes, &config.collect.hidden_classes));
     let mut folds: Vec<FoldPreview> = (0..s.k)
         .map(|i| FoldPreview {
@@ -802,9 +889,29 @@ pub fn preview(
         seconds,
         time_basis,
         warnings,
+        open_suggestions: s.open_suggestions,
+        open_frames: s.open_frames,
         refused: s.refused,
         folder_missing: missing.is_some(),
     })
+}
+
+/// The warnings `train refine` prints before it starts (it is an explicit command: it asks
+/// nothing): [`replace_warning`] when the check replaces open suggestions, and
+/// [`weak_epochs_warning`] when its fold models are short.
+pub fn start_warnings(p: &RefinePreview, family: TrainFamily) -> Vec<String> {
+    let mut out = Vec::new();
+    if p.open_suggestions > 0 {
+        out.push(replace_warning(p.open_suggestions, p.open_frames));
+    }
+    if weak_epochs(family, p.recipe.epochs) {
+        out.push(weak_epochs_warning(
+            family,
+            p.recipe.epochs,
+            p.open_suggestions,
+        ));
+    }
+    out
 }
 
 /// The `--dry-run` text of `p`.
@@ -1210,6 +1317,8 @@ mod tests {
                 seconds: Some(3893.0),
                 time_basis: basis,
                 warnings: Vec::new(),
+                open_suggestions: 0,
+                open_frames: 0,
                 refused: None,
                 folder_missing: false,
             })
@@ -1223,6 +1332,313 @@ mod tests {
         assert_eq!(
             serde_json::to_value(TimeBasis::LastRun).unwrap(),
             serde_json::json!("last_run")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    use crate::collect::labels::refine::{Answer, Kind, Suggestion};
+    use crate::collect::labels::{BoxState, LabelBox, LabelFile, Source, Status};
+    use crate::collect::layout::Rel;
+
+    /// A frame of `camera` on `date` in memory, with `labels`.
+    fn frame(camera: &str, date: &str, stem: &str, labels: LabelFile) -> ExportFrame {
+        ExportFrame {
+            rel: Rel {
+                scene: "day".into(),
+                camera: camera.into(),
+                date: date.into(),
+                stem: stem.into(),
+            },
+            name: format!("{camera}-{stem}.jpg"),
+            image: PathBuf::from(format!("{stem}.jpg")),
+            width: 320,
+            height: 240,
+            buckets: Vec::new(),
+            split: export::Split::Train,
+            labels,
+        }
+    }
+
+    /// `n` frames of a camera day of `camera` in fold `fold` of `s`.
+    fn day_in_fold(s: &mut Selected, camera: &str, n: usize, fold: usize) {
+        let group = (camera.to_string(), "2026-11-10".to_string());
+        for i in 0..n {
+            s.frames.push(frame(
+                camera,
+                "2026-11-10",
+                &format!("f{i:04}"),
+                LabelFile::default(),
+            ));
+        }
+        s.groups.insert(group.clone(), n);
+        s.folds.insert(group, fold);
+    }
+
+    fn held_warnings(s: &Selected) -> Vec<String> {
+        s.fold_warnings(&[], &[])
+            .into_iter()
+            .filter(|w| w.contains("holds out"))
+            .collect()
+    }
+
+    #[test]
+    fn two_even_folds_are_no_warning_and_a_dominant_day_still_is() {
+        // The real check: 851 frames in two folds of 426 and 425. Each fold model trains on the
+        // other fold; one frame less is no warning.
+        let mut s = Selected {
+            k: 2,
+            ..Selected::default()
+        };
+        day_in_fold(&mut s, "alpha", 426, 0);
+        day_in_fold(&mut s, "bravo", 425, 1);
+        assert_eq!(s.fold_frames(0).0.len(), 426);
+        assert_eq!(s.fold_frames(0).1.len(), 425);
+        assert!(held_warnings(&s).is_empty(), "{:?}", held_warnings(&s));
+        // One camera day of 55 frames against 9 others: still a warning, for that fold only.
+        let mut s = Selected {
+            k: 2,
+            ..Selected::default()
+        };
+        day_in_fold(&mut s, "big", 55, 0);
+        day_in_fold(&mut s, "small", 9, 1);
+        let w = held_warnings(&s);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("fold 1 of 2 holds out 55 frames and its model trains on only 9"),
+            "{w:?}"
+        );
+        // The edge: training on exactly 90% of the held-out frames is fine, one fewer is not.
+        for (train, warns) in [(90, false), (89, true)] {
+            let mut s = Selected {
+                k: 2,
+                ..Selected::default()
+            };
+            day_in_fold(&mut s, "held", 100, 0);
+            day_in_fold(&mut s, "rest", train, 1);
+            assert_eq!(!held_warnings(&s).is_empty(), warns, "{train}");
+        }
+    }
+
+    fn boxed(label: &str, bbox: [f32; 4]) -> LabelBox {
+        LabelBox {
+            label: label.into(),
+            bbox,
+            source: Source::Auto,
+            score: Some(0.8),
+            state: BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: Default::default(),
+        }
+    }
+
+    const CAR: [f32; 4] = [10.0, 10.0, 60.0, 50.0];
+    const FAR: [f32; 4] = [150.0, 100.0, 200.0, 160.0];
+
+    fn suggestion(kind: Kind, target: Option<[f32; 4]>, bbox: Option<[f32; 4]>) -> Suggestion {
+        Suggestion {
+            kind,
+            target,
+            target_label: target.map(|_| "car".into()),
+            bbox,
+            label: Some("car".into()),
+            score: Some(0.7),
+            why: "a fold model disagreed".into(),
+            spot: None,
+            answer: None,
+            run: "r1".into(),
+        }
+    }
+
+    fn reviewed(refine: Vec<Suggestion>) -> LabelFile {
+        LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-11-10T00:00:00Z".into()),
+            boxes: vec![boxed("car", CAR)],
+            refine,
+            ..LabelFile::default()
+        }
+    }
+
+    #[test]
+    fn the_open_suggestions_a_check_replaces_are_its_kinds_unanswered_and_live() {
+        let classes: Vec<String> = ["car", "dog", "person"].map(String::from).to_vec();
+        let hidden = vec!["person".to_string()];
+        let wanted = Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        let add = || suggestion(Kind::Add, None, Some(FAR));
+        let verify = || suggestion(Kind::Verify, Some(CAR), None);
+        let relabel = || {
+            let mut s = suggestion(Kind::Relabel, Some(CAR), None);
+            s.label = Some("dog".into());
+            s
+        };
+        let answered = || {
+            let mut s = add();
+            s.answer = Some(Answer::Dismissed);
+            s
+        };
+        // Live but of a kind the check does not write: it stays, so it is not counted.
+        let tighten = suggestion(Kind::Tighten, Some(CAR), Some([12.0, 12.0, 58.0, 48.0]));
+        // Stale (its box is not there) or of a hidden class: nobody sees them.
+        let stale = suggestion(Kind::Verify, Some([1.0, 1.0, 9.0, 9.0]), None);
+        let mut hidden_add = add();
+        hidden_add.label = Some("person".into());
+        let frames = [
+            frame("a", "d1", "f1", reviewed(vec![add(), verify()])),
+            frame("a", "d1", "f2", reviewed(vec![relabel(), answered()])),
+            frame("b", "d1", "f3", reviewed(vec![answered(), tighten.clone()])),
+            frame("b", "d1", "f4", reviewed(vec![stale, hidden_add])),
+            frame("b", "d2", "f5", reviewed(vec![])),
+        ];
+        assert_eq!(open_to_replace(&frames, &wanted), (3, 2));
+        // The tighten is live: it is the kind that keeps it out.
+        assert_eq!(
+            crate::collect::labels::refine::live(&frames[2].labels, Some(&wanted)).len(),
+            1
+        );
+        assert_eq!(open_to_replace(&[], &wanted), (0, 0));
+    }
+
+    #[test]
+    fn short_fold_models_are_weak_for_every_family() {
+        for family in [
+            TrainFamily::Yolo26,
+            TrainFamily::Yolo11,
+            TrainFamily::Yolov8,
+            TrainFamily::Rfdetr,
+            TrainFamily::Rtdetrv2,
+            TrainFamily::Dfine,
+        ] {
+            let min = super::super::recipe::recommended(family).min_epochs;
+            for e in *EPOCHS.start()..=*EPOCHS.end() {
+                assert_eq!(weak_epochs(family, e), e * 2 < min, "{family:?} {e}");
+            }
+            // The real case (1 epoch) is weak, the default (8) is not.
+            assert!(weak_epochs(family, 1) && !weak_epochs(family, DEFAULT_EPOCHS));
+        }
+        assert!(weak_epochs(TrainFamily::Rfdetr, 4) && !weak_epochs(TrainFamily::Rfdetr, 5));
+        assert_eq!(
+            weak_epochs_warning(TrainFamily::Rfdetr, 1, 0),
+            "1 epoch per fold model is under half the 10 epochs RF-DETR training takes before it \
+             may stop: fold models this short find little (on one dataset, fold models of 1 epoch \
+             found no missing box where fold models of 8 epochs found 123), so the check says \
+             little about the labels"
+        );
+        let w = weak_epochs_warning(TrainFamily::Yolo26, 3, 5);
+        assert!(w.starts_with("3 epochs per fold model"), "{w}");
+        assert!(
+            w.ends_with(
+                ", and the open suggestions it replaces likely came from stronger fold models"
+            ),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn the_replace_warning_counts_suggestions_and_frames() {
+        assert_eq!(
+            replace_warning(139, 52),
+            "this check replaces the 139 open suggestions on 52 frames with what its fold models \
+             find; answered ones stay. Answer them on the Review tab first, or run it to recompute \
+             them"
+        );
+        assert!(
+            replace_warning(1, 1)
+                .starts_with("this check replaces the 1 open suggestion on 1 frame with")
+        );
+    }
+
+    #[test]
+    fn the_preview_counts_the_open_suggestions_and_warns_first() {
+        use crate::collect::labels::bulk::test_support::put_frame_at;
+        let root = std::env::temp_dir().join(format!("bop-refine-open-{}", uuid::Uuid::new_v4()));
+        let mut c = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let dataset = root.join("dataset");
+        c.collect.dir = Some(dataset.clone());
+        let cap = super::super::capability::host_for_tests();
+        let put = |stem: &str, refine: Vec<Suggestion>| {
+            let rel = put_frame_at(
+                &dataset,
+                "patio",
+                stem,
+                (320, 240),
+                None,
+                vec![boxed("car", CAR)],
+            );
+            let path = crate::collect::labels::Frame::resolve(&dataset, &rel)
+                .unwrap()
+                .labels;
+            let mut f = crate::collect::labels::read(&path).unwrap().unwrap();
+            f.status = Status::Reviewed;
+            f.reviewed_at = Some("2026-11-10T00:00:00Z".into());
+            f.refine = refine;
+            crate::collect::labels::write(&path, &f).unwrap();
+        };
+        put("a1", vec![]);
+        // Nothing open: no warning about it, and 8 epochs are not weak.
+        let p = preview(&c, &RefineRequest::default(), &cap).unwrap();
+        assert_eq!((p.open_suggestions, p.open_frames), (0, 0));
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("open suggestion") || w.contains("per fold model")),
+            "{:?}",
+            p.warnings
+        );
+        put(
+            "a2",
+            vec![
+                suggestion(Kind::Add, None, Some(FAR)),
+                suggestion(Kind::Verify, Some(CAR), None),
+            ],
+        );
+        put("a3", vec![suggestion(Kind::Add, None, Some(FAR))]);
+        let p = preview(&c, &RefineRequest::default(), &cap).unwrap();
+        assert_eq!((p.open_suggestions, p.open_frames), (3, 2));
+        assert_eq!(p.warnings[0], replace_warning(3, 2), "{:?}", p.warnings);
+        assert!(
+            p.refused.is_some(),
+            "3 frames are too few, and still counted"
+        );
+        let text = preview_text(&p);
+        assert!(
+            text.contains(&format!("warning: {}\n", replace_warning(3, 2))),
+            "{text}"
+        );
+        // The frame filter narrows what is replaced.
+        let elsewhere = RefineRequest {
+            frames: RefineFrames::parse("camera=front").unwrap(),
+            ..RefineRequest::default()
+        };
+        let p = preview(&c, &elsewhere, &cap).unwrap();
+        assert_eq!((p.open_suggestions, p.open_frames), (0, 0));
+        // One epoch: the second warning, which says the open ones came from stronger models.
+        let short = RefineRequest {
+            epochs: 1,
+            ..RefineRequest::default()
+        };
+        let p = preview(&c, &short, &cap).unwrap();
+        let family = choose_recipe(&c, 1, &cap).unwrap().0.family;
+        assert_eq!(
+            p.warnings[1],
+            weak_epochs_warning(family, 1, 3),
+            "{:?}",
+            p.warnings
+        );
+        assert!(preview_text(&p).contains("warning: 1 epoch per fold model"));
+        assert_eq!(
+            start_warnings(&p, family),
+            vec![replace_warning(3, 2), weak_epochs_warning(family, 1, 3)]
         );
         let _ = std::fs::remove_dir_all(&root);
     }

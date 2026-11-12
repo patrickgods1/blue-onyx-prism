@@ -3,8 +3,9 @@
 // through PrismPoll on GET /v1/train/jobs?tasks=busy, with Pause / Resume / Cancel posted to the
 // queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (the report, the
 // open suggestions per kind) and read again when a check ends. The check changes no box, so
-// nothing here confirms anything: Review does. No inline handlers (CSP); limits come from the
-// inputs' min/max and the server's answers.
+// nothing here confirms a box: Review does. The one question asked here is whether a start may
+// replace the open suggestions of the frames it checks (inline, after the server's 409). No
+// inline handlers (CSP); limits come from the inputs' min/max and the server's answers.
 (function () {
   'use strict';
   var root = document.getElementById('refine-tab');
@@ -154,12 +155,29 @@
       .then(function () { btn.disabled = false; });
   });
 
-  form.addEventListener('submit', function (ev) {
-    ev.preventDefault();
+  // A check replaces the open suggestions of the frames it checks. The server refuses a start
+  // over open ones (409, needs_confirm) until it is asked again with replace_open: the second
+  // step is inline, below the form (no dialog), and goes away when a field changes.
+  function hideConfirm() { $('refine-confirm').hidden = true; }
+  function askReplace(b) {
+    $('refine-confirm-text').textContent = b.message;
+    $('refine-confirm-start').textContent = 'Start and replace ' +
+      plural(b.open_suggestions, 'open suggestion', 'open suggestions');
+    say('');
+    $('refine-confirm').hidden = false;
+    $('refine-confirm-start').focus();
+  }
+
+  function start(replace) {
     var btn = $('refine-start');
+    var again = $('refine-confirm-start');
     btn.disabled = true;
+    again.disabled = true;
+    hideConfirm();
     say('Starting...');
-    postJson('/v1/refine/check', values())
+    var body = values();
+    if (replace) body.replace_open = true;
+    postJson('/v1/refine/check', body)
       .then(function (j) {
         say(j.message);
         $('refine-preview').hidden = true;
@@ -167,9 +185,24 @@
         poller.kick();
         load();
       })
-      .catch(function (e) { say(e.message, true); })
-      .then(function () { btn.disabled = !canCheck; });
+      .catch(function (e) {
+        if (!replace && e.body && e.body.needs_confirm) askReplace(e.body);
+        else say(e.message, true);
+      })
+      .then(function () { btn.disabled = !canCheck; again.disabled = false; });
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    start(false);
   });
+  $('refine-confirm-start').addEventListener('click', function () { start(true); });
+  $('refine-confirm-keep').addEventListener('click', function () {
+    hideConfirm();
+    say('Not started: the open suggestions stay. Answer them on the Review tab, then start the check.');
+  });
+  form.addEventListener('input', hideConfirm);
+  form.addEventListener('change', hideConfirm);
 
   // ---- the check in the queue
 

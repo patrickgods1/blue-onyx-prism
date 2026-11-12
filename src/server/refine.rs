@@ -11,7 +11,9 @@
 //!   write;
 //! - `POST /v1/refine/check`: plans the check, hands it the registry's runtimes for the fold models'
 //!   predictions (no second OpenVINO / ONNX Runtime instance) and queues it on the one-at-a-time
-//!   queue. Refusals come back as `{success: false, message}` in the check's own words.
+//!   queue. Refusals come back as `{success: false, message}` in the check's own words. A check
+//!   that would replace open suggestions on the frames it checks asks first: 409 with
+//!   `needs_confirm` and the counts, until the request says `replace_open: true`.
 //!
 //! The check writes suggestions and the report only; nothing here changes a box.
 
@@ -514,6 +516,10 @@ struct CheckBody {
     gpu: Option<String>,
     #[serde(default)]
     allow_large: bool,
+    /// The user confirmed that the check replaces the open suggestions of the frames it checks
+    /// (the second click after a `needs_confirm` refusal).
+    #[serde(default)]
+    replace_open: bool,
 }
 
 /// The JSON body of a POST: 413 over the cap, 415 without a JSON content type, 400 when it does
@@ -556,6 +562,9 @@ struct Refusal {
     message: String,
     /// The folder under review is unplugged.
     folder_missing: bool,
+    /// The check would replace open suggestions and the request did not say `replace_open`:
+    /// (open suggestions, frames holding them).
+    needs_confirm: Option<(usize, usize)>,
 }
 
 impl Refusal {
@@ -564,21 +573,29 @@ impl Refusal {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             folder_missing: false,
+            needs_confirm: None,
         }
     }
 }
 
 impl IntoResponse for Refusal {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({
+        let body = match self.needs_confirm {
+            Some((open, frames)) => serde_json::json!({
+                "success": false,
+                "needs_confirm": true,
+                "open_suggestions": open,
+                "open_frames": frames,
+                "folder_missing": self.folder_missing,
+                "message": self.message,
+            }),
+            None => serde_json::json!({
                 "success": false,
                 "folder_missing": self.folder_missing,
                 "message": self.message,
-            })),
-        )
-            .into_response()
+            }),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -590,11 +607,14 @@ fn for_the_page(message: &str) -> String {
 /// Plan `request` and queue it through `enqueue`, which gets the job with its predictor set
 /// (`runtimes`: the registry's). Refuses, before anything is queued, when a check is already
 /// queued or running, the folder under review is unplugged, the frames could not be checked
-/// ([`check::preview`]'s `refused`: too few reviewed frames, ...) or the plan fails (no GPU to train
-/// on, a large download not allowed). Returns the task id and title.
+/// ([`check::preview`]'s `refused`: too few reviewed frames, ...), the check would replace open
+/// suggestions without `replace_open` (409 with `needs_confirm`: the preview's count, so no
+/// second walk) or the plan fails (no GPU to train on, a large download not allowed). Returns the
+/// task id and title.
 fn start_check(
     config: &Config,
     request: RefineRequest,
+    replace_open: bool,
     cap: &Capability,
     tasks: &[TaskRecord],
     runtimes: Option<Arc<Mutex<Runtimes>>>,
@@ -617,6 +637,7 @@ fn start_check(
                 t.title
             ),
             folder_missing: false,
+            needs_confirm: None,
         });
     }
     let dir = config.collect.resolved_review_dir(&config.data_root());
@@ -625,12 +646,25 @@ fn start_check(
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!("Not queued: {why}"),
             folder_missing: true,
+            needs_confirm: None,
         });
     }
     let p = check::preview(config, &request, cap)
         .map_err(|e| Refusal::bad(format!("Not queued: {e:#}")))?;
     if let Some(why) = p.refused {
         return Err(Refusal::bad(format!("Not queued: {}", for_the_page(&why))));
+    }
+    // A rerun replaces the open suggestions of the frames it checks: asked once, never silently.
+    if p.open_suggestions > 0 && !replace_open {
+        return Err(Refusal {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "Not queued: {}.",
+                check::replace_warning(p.open_suggestions, p.open_frames)
+            ),
+            folder_missing: false,
+            needs_confirm: Some((p.open_suggestions, p.open_frames)),
+        });
     }
     let mut job = check::plan_refine(config, request, cap)
         .map_err(|e| Refusal::bad(format!("Not queued: {}", for_the_page(&format!("{e:#}")))))?;
@@ -640,11 +674,14 @@ fn start_check(
     Ok((id, title))
 }
 
-/// `POST /v1/refine/check` with `{folds?, epochs?, scenes?, cameras?, gpu?, allow_large?}`: queue
-/// the dataset check; 200 `{success: true, id, message}` (the task id, in `GET /v1/train/jobs` and
-/// `GET /v1/training` `tasks[]`), or a refusal `{success: false, message, folder_missing}`: 400
-/// for a bad field, too few frames or a plan that cannot run, 409 for a check already in the
-/// queue, 503 for an unplugged review folder.
+/// `POST /v1/refine/check` with `{folds?, epochs?, scenes?, cameras?, gpu?, allow_large?,
+/// replace_open?}`: queue the dataset check; 200 `{success: true, id, message}` (the task id, in
+/// `GET /v1/train/jobs` and `GET /v1/training` `tasks[]`), or a refusal `{success: false, message,
+/// folder_missing}`: 400 for a bad field, too few frames or a plan that cannot run, 409 for a check
+/// already in the queue, 503 for an unplugged review folder. A check that would replace open
+/// suggestions on the frames it checks is 409 `{success: false, needs_confirm: true,
+/// open_suggestions, open_frames, folder_missing: false, message}` unless `replace_open` is true;
+/// nothing is queued then.
 pub(super) async fn start(
     State(shared): State<Shared>,
     headers: HeaderMap,
@@ -672,9 +709,15 @@ pub(super) async fn start(
         let tasks = training::tasks(&state);
         let queue = training::service(&shared);
         let runtimes = state.registry.runtimes().cloned();
-        match start_check(&config, request, &cap, &tasks, runtimes, &|job| {
-            queue.enqueue_task(Box::new(job))
-        }) {
+        match start_check(
+            &config,
+            request,
+            b.replace_open,
+            &cap,
+            &tasks,
+            runtimes,
+            &|job| queue.enqueue_task(Box::new(job)),
+        ) {
             Ok((id, title)) => Json(serde_json::json!({
                 "success": true,
                 "id": id,
@@ -1197,7 +1240,8 @@ mod tests {
             epochs: 3,
             ..RefineRequest::default()
         };
-        let (id, title) = start_check(&config, req.clone(), &host(), &[], None, &enqueue).unwrap();
+        let (id, title) =
+            start_check(&config, req.clone(), false, &host(), &[], None, &enqueue).unwrap();
         assert!(
             title.starts_with("Dataset check") || title.to_lowercase().contains("check"),
             "{title}"
@@ -1213,6 +1257,7 @@ mod tests {
             let e = start_check(
                 &config,
                 req.clone(),
+                false,
                 &host(),
                 &[task("t1", state)],
                 None,
@@ -1226,6 +1271,7 @@ mod tests {
             start_check(
                 &config,
                 req,
+                false,
                 &host(),
                 &[task("t1", RunState::Done)],
                 None,
@@ -1245,6 +1291,7 @@ mod tests {
         let e = start_check(
             &config,
             RefineRequest::default(),
+            false,
             &host(),
             &[],
             None,
@@ -1261,8 +1308,16 @@ mod tests {
         // An unplugged folder.
         let mut gone = host_config(&dir);
         gone.collect.review_dir = Some(dir.join("unplugged"));
-        let e =
-            start_check(&gone, RefineRequest::default(), &host(), &[], None, &never).unwrap_err();
+        let e = start_check(
+            &gone,
+            RefineRequest::default(),
+            false,
+            &host(),
+            &[],
+            None,
+            &never,
+        )
+        .unwrap_err();
         assert_eq!(
             (e.status, e.folder_missing),
             (StatusCode::SERVICE_UNAVAILABLE, true)
@@ -1272,6 +1327,7 @@ mod tests {
         let e = start_check(
             &config,
             RefineRequest::default(),
+            false,
             &host(),
             &[],
             None,
@@ -1289,6 +1345,7 @@ mod tests {
         let e = start_check(
             &strict,
             RefineRequest::default(),
+            false,
             &host(),
             &[],
             None,
@@ -1296,6 +1353,163 @@ mod tests {
         )
         .unwrap_err();
         assert!(!e.message.contains("--allow-large"), "{}", e.message);
+    }
+
+    /// [`enough_frames`] with open suggestions on two of them: 3 open on 2 frames, plus an
+    /// answered one (not open).
+    fn enough_frames_with_open(review: &Path) {
+        enough_frames(review);
+        let add = || suggestion(Kind::Add, None, Some(FAR));
+        frame_with(
+            review,
+            "alpha",
+            "f00",
+            vec![add(), suggestion(Kind::Verify, Some(CAR), None)],
+        );
+        frame_with(review, "bravo", "f00", vec![add()]);
+        let mut answered = add();
+        answered.answer = Some(Answer::Dismissed);
+        frame_with(review, "charlie", "f00", vec![answered]);
+    }
+
+    #[test]
+    fn a_check_over_open_suggestions_asks_first_and_queues_with_replace_open() {
+        let dir = scratch();
+        let review = dir.join("dataset");
+        let config = host_config(&dir);
+        let never = |_: RefineJob| -> Result<String, String> { panic!("queued") };
+        let queued = Mutex::new(0);
+        let enqueue = |job: RefineJob| {
+            *queued.lock().unwrap() += 1;
+            Ok(job.id.clone())
+        };
+        let req = RefineRequest {
+            folds: 2,
+            epochs: 1,
+            ..RefineRequest::default()
+        };
+        // Nothing open (an answered suggestion is not): no question, no flag needed.
+        enough_frames(&review);
+        let mut answered = suggestion(Kind::Add, None, Some(FAR));
+        answered.answer = Some(Answer::Dismissed);
+        frame_with(&review, "charlie", "f00", vec![answered]);
+        start_check(&config, req.clone(), false, &host(), &[], None, &enqueue).unwrap();
+        assert_eq!(*queued.lock().unwrap(), 1);
+        // Open ones: refused with the counts, nothing queued.
+        enough_frames_with_open(&review);
+        let e = start_check(&config, req.clone(), false, &host(), &[], None, &never).unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.needs_confirm, Some((3, 2)));
+        assert!(!e.folder_missing);
+        assert_eq!(
+            e.message,
+            format!("Not queued: {}.", check::replace_warning(3, 2))
+        );
+        // Confirmed: queued as before.
+        start_check(&config, req.clone(), true, &host(), &[], None, &enqueue).unwrap();
+        assert_eq!(*queued.lock().unwrap(), 2);
+        // A check already in the queue is said first: the confirmation would not help.
+        let e = start_check(
+            &config,
+            req,
+            false,
+            &host(),
+            &[task("t1", RunState::Running)],
+            None,
+            &never,
+        )
+        .unwrap_err();
+        assert_eq!((e.status, e.needs_confirm), (StatusCode::CONFLICT, None));
+    }
+
+    #[tokio::test]
+    async fn the_route_answers_needs_confirm_and_takes_replace_open() {
+        let dir = scratch();
+        let d = dir.clone();
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(d.clone());
+            c.collect.dir = Some(d.join("dataset"));
+            c.training.dir = Some(d.join("training"));
+            // Nothing can be planned here: a confirmed start stops at the plan, never queued.
+            c.allow_large_downloads = false;
+        });
+        enough_frames_with_open(&dir.join("dataset"));
+        let (s, v) = json(&state, post_json("/v1/refine/check", r#"{"folds":2}"#)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "success": false,
+                "needs_confirm": true,
+                "open_suggestions": 3,
+                "open_frames": 2,
+                "folder_missing": false,
+                "message": format!("Not queued: {}.", check::replace_warning(3, 2)),
+            })
+        );
+        // `replace_open: true` passes the question: what refuses now is the plan (no training
+        // environment, downloads not allowed, or no GPU), never the question again.
+        let (s, v) = json(
+            &state,
+            post_json("/v1/refine/check", r#"{"folds":2,"replace_open":true}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v.get("needs_confirm").is_none(), "{v}");
+        assert!(
+            !training::tasks(&state)
+                .iter()
+                .any(|t| t.kind == TaskKind::Refine),
+            "nothing queued"
+        );
+        // `replace_open: false` is the default; a wrong type or an unknown field is still a 400.
+        let (s, v) = json(
+            &state,
+            post_json("/v1/refine/check", r#"{"replace_open":false}"#),
+        )
+        .await;
+        assert_eq!(
+            (s, v["needs_confirm"].as_bool()),
+            (StatusCode::CONFLICT, Some(true))
+        );
+        for body in [
+            r#"{"replace_open":"yes"}"#,
+            r#"{"replace_open":true,"replace":true}"#,
+        ] {
+            let (s, v) = json(&state, post_json("/v1/refine/check", body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert!(v.get("needs_confirm").is_none(), "{body}: {v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_preview_route_says_what_a_start_would_replace() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        enough_frames_with_open(&dir.join("dataset"));
+        let (s, v) = json(&state, get("/v1/refine/preview?folds=2&epochs=1")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            (v["open_suggestions"].as_u64(), v["open_frames"].as_u64()),
+            (Some(3), Some(2))
+        );
+        let warnings: Vec<&str> = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w.as_str().unwrap())
+            .collect();
+        assert_eq!(warnings[0], check::replace_warning(3, 2));
+        assert!(
+            warnings[1].starts_with("1 epoch per fold model is under half"),
+            "{warnings:?}"
+        );
+        assert!(
+            v["text"]
+                .as_str()
+                .unwrap()
+                .contains("warning: this check replaces the 3")
+        );
     }
 
     #[tokio::test]

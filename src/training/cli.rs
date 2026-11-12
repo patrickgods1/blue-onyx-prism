@@ -1346,7 +1346,13 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 print!("{}", super::refine::preview_text(&p));
                 return Ok(p.refused.is_none());
             }
+            // An explicit command asks nothing, but says what a rerun replaces before it starts
+            // (the page asks; `refine::start_warnings`).
+            let p = super::refine::preview(&config, &req, &cap)?;
             let job = super::refine::plan_refine(&config, req, &cap)?;
+            for w in super::refine::start_warnings(&p, job.train.request.recipe.family) {
+                eprintln!("warning: {w}");
+            }
             eprintln!(
                 "{} in {}",
                 super::task::Task::title(&job),

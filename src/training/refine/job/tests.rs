@@ -924,6 +924,28 @@ fn a_verify_needs_the_boxes_its_fold_model_trained_on() {
 }
 
 #[test]
+fn the_title_counts_epochs_in_the_singular_and_the_plural() {
+    let t = tmp("title");
+    let title = |folds: usize, epochs: u32, frames: &str| {
+        let req = RefineRequest {
+            folds,
+            epochs,
+            frames: super::super::RefineFrames::parse(frames).unwrap(),
+            ..RefineRequest::default()
+        };
+        Task::title(&plan_refine(&config(&t.0), req, &host()).unwrap())
+    };
+    assert_eq!(
+        title(2, 1, ""),
+        "dataset check (2 folds x 1 epoch, all reviewed frames)"
+    );
+    assert_eq!(
+        title(4, 8, "scene=ir"),
+        "dataset check (4 folds x 8 epochs, reviewed frames of scene ir)"
+    );
+}
+
+#[test]
 fn the_training_lock_is_held_from_the_first_fold_to_the_last_write() {
     let t = tmp("lock");
     dataset(&t.0.join("dataset"));

@@ -1878,8 +1878,9 @@ objects of days it never saw, at score 0.3 and IoU 0.5.
 frames with pending boxes or labels off the class list are left out and counted); `--frames` narrows it by
 `scene=` and `camera=`, and then narrows the fold models' training too. At least 40 such frames on at least
 2 camera days are needed; K is lowered to the number of camera days when there are fewer (a warning says
-so). The preview and the report warn when a fold holds out more frames than its model trains on (one camera
-day dominates the check: its fold model learns from less than it is asked about) and when a fold model
+so). The preview and the report warn when a fold's model trains on under 90% of the frames the fold holds
+out (one camera day dominates the check: its fold model learns from less than it is asked about; two even
+folds that differ by a frame are no warning) and when a fold model
 trains on fewer than 50 boxes of a class the selection has 50 of (that fold's labels of it get no
 `verify`). A folder under review that is not available (an unplugged drive) refuses the check and the
 preview (`folder_missing`) with the Review page's message, never as an empty dataset, and the report is
@@ -1912,6 +1913,23 @@ processes; the export, prediction and writes of the running fold finish first.
 - **A rerun** checks every fold again. The folds are the same for the same frames; unanswered suggestions are
   replaced, answered ones stay (but for those whose box is gone).
 
+**What a rerun replaces.** On every frame it checks, a check replaces the unanswered `add`, `verify` and
+`relabel` suggestions with what its own fold models find: a suggestion they do not find again is gone, even
+when an earlier, stronger check made it. Answered suggestions (kept or dismissed) stay, `tighten` stays,
+frames outside the check (another scene or camera of `--frames`, frames left out) are not touched, and no
+box changes. So a quick check after a good one costs findings: on one dataset a check of 4 folds x 8 epochs
+left 139 open suggestions, and two checks of 2 folds x 1 epoch, whose fold models found almost nothing, cut
+them to 88. The preview counts what a start would replace (`open_suggestions`, `open_frames`: unanswered,
+of those three kinds and live as the Review tab shows them, on the selected frames) and warns *this check
+replaces the N open suggestions on M frames ...*; it also warns when the fold models are short, under half
+the family's recommended minimum epochs (`recipe::recommended(..).min_epochs`, 10 for every family, so 1 to
+4 epochs; `refine::weak_epochs`), since fold models of 1 epoch found no missing box where 8 epochs found
+123. On the Refine tab a start over open suggestions is refused (409 `{success: false, needs_confirm: true,
+open_suggestions, open_frames, folder_missing: false, message}`) and the card asks inline: *Start and
+replace N open suggestions* posts again with `replace_open: true`, *Keep them* starts nothing. Answer them
+on the Review tab first, or confirm to recompute them. `train refine` is an explicit command and asks
+nothing, but prints the same warnings before it starts.
+
 ```sh
 blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
     [--gpu cuda:N] [--allow-large] [--verbose]
@@ -1934,7 +1952,9 @@ web UI and shows its results; the check itself is the one above and changes no b
   gives it the running service's runtimes for the fold models' predictions (no second OpenVINO / ONNX Runtime
   instance) and queues it on the one-at-a-time queue. It refuses, in the check's own words, when too few
   reviewed frames can be checked, the folder under review is unplugged (503, `folder_missing`), a large
-  download is not allowed, there is no GPU to train on, or a check is already queued or running (409). While
+  download is not allowed, there is no GPU to train on, or a check is already queued or running (409). A
+  start over open suggestions asks first (409 `needs_confirm`, the inline *Start and replace N open
+  suggestions* button; see "What a rerun replaces" above). While
   it runs the card shows the check's progress row (step, percent, time left, Pause / Resume / Cancel; the
   Jobs tab links to it as `#job-<id>`).
 - **Findings**: the open suggestions per kind (*Missing boxes* = `add`, *Labels no model found* = `verify`,
