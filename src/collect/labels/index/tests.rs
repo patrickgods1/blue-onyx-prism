@@ -1580,8 +1580,10 @@ mod cases {
     #[test]
     fn a_query_during_the_build_answers_from_the_rows_so_far_and_moves_on() {
         let dir = Dir::new();
-        // Under 32 frames: one thread walks, a day at a time, newest first.
-        generate(&dir, 13, 24, false);
+        // Under `WALK_SERIAL_UNDER` frames: one thread walks, a day at a time, newest first (the
+        // anchor frames `generate` adds count too: with 24 + 8 the walk went parallel and the
+        // held build's count raced).
+        generate(&dir, 13, 16, false);
         let days = by_day(&dir);
         let date = |k: &str| k.rsplit('/').next().unwrap().to_string();
         let (first, n) = days
@@ -1590,6 +1592,10 @@ mod cases {
             .map(|(k, n)| (k.clone(), *n))
             .unwrap();
         let total: usize = days.values().sum();
+        assert!(
+            total < crate::parallel::WALK_SERIAL_UNDER,
+            "{total} frames: the walk must be on one thread for this test"
+        );
         let f = all_any();
         let hold = hold_after(&dir, n as u64);
         let started = Instant::now();
