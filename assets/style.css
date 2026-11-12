@@ -931,6 +931,10 @@ button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(
 .rv-q-sug { margin-bottom: 0.5rem; padding: 0.35rem 0.5rem; border-left: 3px solid #ff3df0; font-size: 0.85rem; }
 .rv-q-sug-head { font-weight: 600; }
 .rv-q-sug .rv-chip { display: block; margin-top: 0.25rem; white-space: normal; }
+/* A dataset check suggestion (review.js refineBlock): the colour of its dashed box on the frame. */
+.rv-q-sug.rv-q-refine { border-left-color: #b26bff; }
+.rv-q-refine-note { margin-top: 0.2rem; font-size: 0.8rem; }
+.rv-chip.refine { color: #8d4ee8; border-color: #b26bff; }
 .rv-q-spot { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
 .rv-q-spot button.small { margin: 0; padding: 0.1rem 0.45rem; font-size: 0.78rem; }
 .rv-decide button.suggest, .rv-decide-bar button.suggest { box-shadow: 0 0 0 2px currentColor; }
@@ -965,6 +969,7 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .sw-pending { background: #e8d000; } .sw-review { background: #ffa000; box-shadow: inset 0 0 0 2px #000; } .sw-hint { background: #f08c00; } .sw-accepted { background: #2e9e4f; }
 .sw-added { background: #1f6fe0; } .sw-rejected { background: #e53935; }
 .sw-likely { background: #14d6b0; box-shadow: inset 0 0 0 2px #000; } .sw-unlikely { background: #ffa000; opacity: .55; }
+.sw-ghost { background: rgba(178, 107, 255, 0.25); box-shadow: inset 0 0 0 2px #b26bff; }
 .review-keys td { padding: 0.1rem 0.6rem 0.1rem 0; font-size: 0.85rem; }
 .review-keys td:first-child { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: nowrap; }
 .review-report { font-size: 0.9rem; overflow-wrap: anywhere; }

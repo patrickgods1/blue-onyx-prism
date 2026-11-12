@@ -399,12 +399,13 @@
       (s.target_label == null || sameLabel(b.label, s.target_label));
   }
 
-  // The first box `s` names that is a training box no reviewer drew and that `ok` takes; -1 if none.
+  // The first box `s` names that is a training box, no ignore region (an unsure box: the check
+  // never judges one), no reviewer drew and that `ok` takes; -1 if none.
   function targetBox(f, s, ok) {
     var bs = f.boxes || [];
     for (var i = 0; i < bs.length; i++) {
       var b = bs[i];
-      if (names(s, b) && isTraining(b) && b.source !== 'human' && ok(b)) return i;
+      if (names(s, b) && isTraining(b) && !isIgnore(b) && b.source !== 'human' && ok(b)) return i;
     }
     return -1;
   }
@@ -597,6 +598,171 @@
     return true;
   }
 
+  // ---- How the Review page offers those suggestions (page decisions: no Rust twin;
+  // tests/it/js_review_refine.rs) ----
+  //
+  // `l` below is an entry of `liveRefine` (or `refine_live`): {index, kind, target_box, replaces,
+  // bbox, label, score, why, ...}.
+
+  // Strongest first (`refineStrength`), ties by index: the order the page offers them in.
+  function refineOrder(live) {
+    return (live || []).slice().sort(function (a, b) {
+      var d = refineStrength(b) - refineStrength(a);
+      return d !== 0 ? d : a.index - b.index;
+    });
+  }
+
+  // What names a suggestion across edits: its index moves down when an accepted one before it
+  // leaves the list.
+  function refineKey(l) {
+    var n = function (v) { return v == null ? null : v; };
+    return JSON.stringify([l.kind, n(l.target), n(l.target_label), n(l.bbox), n(l.label)]);
+  }
+
+  // The suggestion the page shows, one at a time: none while an overlap suggestion is on screen
+  // (`overlapShown`: those come first and keep `y`), else the strongest live one the reviewer did
+  // not put off with Later (`later`: keys, refineKey), else the strongest. {l, k, n}: the live
+  // entry, its place in the order (from 1), how many are live; null for none.
+  function refineCurrent(live, overlapShown, later) {
+    if (overlapShown || !live || !live.length) return null;
+    var order = refineOrder(live), skip = later || [];
+    for (var i = 0; i < order.length; i++) {
+      if (skip.indexOf(refineKey(order[i])) < 0) return { l: order[i], k: i + 1, n: order.length };
+    }
+    return { l: order[0], k: 1, n: order.length };
+  }
+
+  // Later: the keys put off once the current suggestion is put off too; past the last one, none
+  // (the strongest again).
+  function refineLater(live, overlapShown, later) {
+    var c = refineCurrent(live, overlapShown, later);
+    if (!c) return (later || []).slice();
+    var out = (later || []).concat([refineKey(c.l)]);
+    var all = live.every(function (l) { return out.indexOf(refineKey(l)) >= 0; });
+    return all ? [] : out;
+  }
+
+  // What key `y` or `w` acts on: 'overlap' (`y` while an overlap suggestion is on screen, and `y`
+  // with no suggestion at all: the overlap handler says there is none, as it always did), 'accept'
+  // / 'dismiss' (the current dataset check suggestion `refine`, refineCurrent), 'none' (`w` with
+  // nothing to answer: the key does nothing).
+  function suggestionKey(key, overlapShown, refine) {
+    if (key === 'y') return !overlapShown && refine ? 'accept' : 'overlap';
+    if (key === 'w') return !overlapShown && refine ? 'dismiss' : 'none';
+    return 'none';
+  }
+
+  function score2(v) { return typeof v === 'number' && isFinite(v) ? v.toFixed(2) : ''; }
+
+  // What the card says about live suggestion `l` on boxes `bs`: {head (the question), short (the
+  // one-column bar's line), yes, no (the buttons, keys y and w), no_bad (the no answer is a
+  // rejection: drawn red), note ('' or a line under the evidence), score ('' or "score 0.82"),
+  // said_yes, said_no (what the status line says after each answer)}. `touch`: the note names
+  // buttons, not keys.
+  function refineCard(l, bs, touch) {
+    var at = l.target_box == null ? -1 : l.target_box;
+    var b = (bs || [])[at];
+    var now = b ? b.label : (l.target_label || '');
+    var n = 'Box ' + (at + 1);
+    var label = l.label == null ? '' : l.label;
+    var c = { head: '', short: '', yes: '', no: '', no_bad: false, note: '', score: '', said_yes: '', said_no: '' };
+    if (score2(l.score)) c.score = 'score ' + score2(l.score);
+    switch (l.kind) {
+      case 'add': {
+        var r = (l.replaces || []).length;
+        c.head = 'Missing box: is the dashed box a ' + label + '?';
+        c.short = 'Missing ' + label + '?';
+        c.yes = 'Accept: add this box';
+        c.no = 'Not an object';
+        c.no_bad = true;
+        if (r) c.note = 'Accepting puts it in the place of ' + r + ' rejected box' + (r === 1 ? '' : 'es') + ' here that nobody judged.';
+        c.said_yes = 'Added a ' + label + ' box';
+        c.said_no = 'Not an object: suggestion dismissed';
+        break;
+      }
+      case 'relabel':
+        c.head = n + ' is labelled ' + now + ': is it a ' + label + '?';
+        c.short = n + ': ' + label + '?';
+        c.yes = 'Accept: it is a ' + label;
+        c.no = 'Keep ' + now;
+        c.said_yes = n + ' is a ' + label + ' now';
+        c.said_no = n + ' stays a ' + now;
+        break;
+      case 'tighten':
+        c.head = n + ' (' + now + '): take the tighter box (dashed)?';
+        c.short = n + ': tighter box?';
+        c.yes = 'Accept the tighter box';
+        c.no = 'Keep my box';
+        c.said_yes = n + ' takes the tighter box';
+        c.said_no = n + ' keeps its box';
+        break;
+      case 'verify':
+        c.head = 'No model found ' + n.toLowerCase() + ' (' + now + '): is the label right?';
+        c.short = n + ': no model found it';
+        c.yes = 'Keep the label';
+        c.no = 'Dismiss';
+        c.note = touch
+          ? 'If it is wrong: No, reject rejects ' + n.toLowerCase() + '; Too small or Unsure marks it. Each ends the suggestion. Dismiss changes nothing and is not asked again.'
+          : 'If it is wrong: r rejects ' + n.toLowerCase() + '; Too small or d (unsure) marks it. Each ends the suggestion. w dismisses: nothing changes, and it is not asked again.';
+        c.said_yes = n + ': label kept';
+        c.said_no = n + ': suggestion dismissed';
+        break;
+      default:
+        return null;
+    }
+    return c;
+  }
+
+  // What the frame shows for live suggestion `l` on boxes `bs`: {ghost: the proposed box (add,
+  // tighten; else null), mark: the box it is about, marked and selected (-1 for an add), focus:
+  // the part of the frame to show (the ghost, the box, or both together for a tighter box)}.
+  function refineFocus(l, bs) {
+    var at = l.target_box == null ? -1 : l.target_box;
+    var t = (bs || [])[at] ? bs[at].bbox : null;
+    var ghost = (l.kind === 'add' || l.kind === 'tighten') && l.bbox ? l.bbox.slice() : null;
+    var focus = ghost && t
+      ? [Math.min(ghost[0], t[0]), Math.min(ghost[1], t[1]), Math.max(ghost[2], t[2]), Math.max(ghost[3], t[3])]
+      : (ghost || (t ? t.slice() : null));
+    return { ghost: ghost, mark: t ? at : -1, focus: focus };
+  }
+
+  // The reviewer's answer to live suggestion `l` on `labels` (the file as the page holds it): yes
+  // = acceptRefine, no = dismissRefine. Then the page flags on the box a yes is about, as the
+  // page's own edits set them: `_checked` (looked at on this visit) and, for a relabel,
+  // `_relabelled` (an overlap suggestion that would drop the box ends, as after a relabel by
+  // hand). A no changes no box and sets no flag. {ok, box}: whether anything changed, and the box
+  // to select after (the new box of an add, else the box the suggestion is about; -1 for none).
+  function answerRefine(labels, l, yes, classes, hidden) {
+    var at = l.target_box == null ? -1 : l.target_box;
+    if (!yes) return { ok: dismissRefine(labels, l.index), box: at };
+    if (l.kind === 'add') {
+      var r = l.replaces || [];
+      at = r.length ? r[0] - r.slice(1).filter(function (g) { return g < r[0]; }).length : (labels.boxes || []).length;
+    }
+    if (!acceptRefine(labels, l.index, classes, hidden)) return { ok: false, box: -1 };
+    var b = labels.boxes[at];
+    if (b) {
+      b._checked = true;
+      if (l.kind === 'relabel') b._relabelled = true;
+    }
+    return { ok: true, box: b ? at : -1 };
+  }
+
+  // Whether the Review queue sends filter `name` = `value` to GET /v1/review/next: a value given,
+  // and `refine_kind` only with `auto=refine` (the server refuses it otherwise).
+  function sendsFilter(name, value, auto) {
+    return !!value && (name !== 'refine_kind' || auto === 'refine');
+  }
+
+  // A save's copy of the file: page-only fields (`_...`) off the dataset check's suggestions.
+  function refineForSave(labels) {
+    ((labels && labels.refine) || []).forEach(function (s) {
+      if (!s) return;
+      Object.keys(s).forEach(function (k) { if (k.charAt(0) === '_') delete s[k]; });
+    });
+    return labels;
+  }
+
   // What a new call of the page's `loadNext` does while `running` ('real', 'counts' or null) and
   // `waiting` (the same, or null) stand; `want` is 'real' or 'counts'. GET /v1/review/next walks the
   // whole folder, seconds on a big one, so at most one real walk runs and the newest intent wins:
@@ -659,6 +825,16 @@
     refineStrength: refineStrength,
     acceptRefine: acceptRefine,
     dismissRefine: dismissRefine,
+    refineOrder: refineOrder,
+    refineKey: refineKey,
+    refineCurrent: refineCurrent,
+    refineLater: refineLater,
+    suggestionKey: suggestionKey,
+    refineCard: refineCard,
+    refineFocus: refineFocus,
+    answerRefine: answerRefine,
+    sendsFilter: sendsFilter,
+    refineForSave: refineForSave,
     nextPlan: nextPlan,
     nextLanding: nextLanding
   };

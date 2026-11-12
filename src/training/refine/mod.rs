@@ -38,6 +38,7 @@ pub use job::RefineJob;
 use super::capability::Capability;
 use super::dataset::SceneFilter;
 use super::job::TrainRequest;
+use super::progress::EpochPoint;
 use super::recipe::TrainRecipe;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{self, ClassFilter, ExportFrame, Selection, SplitConfig};
@@ -66,10 +67,16 @@ pub const FOLD_SEED: u64 = 0;
 /// The default recipe when no training run finished: RF-DETR nano, the model that fits a UHD 630.
 pub const DEFAULT_FAMILY: TrainFamily = TrainFamily::Rfdetr;
 pub const DEFAULT_SIZE: &str = "nano";
-/// Rough fixed cost of a fold (self-check, dataset, ONNX export and its check), seconds.
-pub const FOLD_OVERHEAD_S: f64 = 120.0;
-/// Rough cost of predicting one frame in this process, seconds.
-pub const PREDICT_S_PER_FRAME: f64 = 0.15;
+/// Cost of a fold beyond its training epochs, seconds: the environment self-check, the fold's
+/// dataset export, the wait for memory and the ONNX export with its check, loading the fold model,
+/// its detections on the held-out frames and the writes.
+///
+/// Measured (November 2026, GTX 1070 Ti, RF-DETR nano at 384 px, batch 8, 8 epochs, 851 frames
+/// in 4 folds: 638 training and about 213 held-out frames per fold; two checks of 4,204 s and
+/// 4,096 s): a fold took about 1,010 s, of which the 8 epochs (with their validation) took about
+/// 576 s (72 s each) and everything else about 430 s. The detections are in this one figure: the
+/// measurement does not separate them from the other steps, so no per-frame cost is claimed.
+pub const FOLD_OVERHEAD_S: f64 = 430.0;
 
 /// Which reviewed frames a check looks at (`--frames "scene=ir,camera=patio"`): every reviewed
 /// frame of the folder under review by default. A scene or camera narrows the whole check: the
@@ -208,17 +215,30 @@ impl RefineRequest {
 /// `created` time; None when there is none or the file does not parse. Read only: `runs.json` is
 /// never written, moved or repaired here.
 pub fn newest_done_recipe(text: &str) -> Option<TrainRecipe> {
+    newest_done_run(text).map(|(r, _)| r)
+}
+
+/// [`newest_done_recipe`] with the run's whole record (an entry of `runs.json`, as JSON).
+fn newest_done_run(text: &str) -> Option<(TrainRecipe, serde_json::Value)> {
     let list: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
-    list.iter()
+    list.into_iter()
         .filter(|r| r.get("state").and_then(serde_json::Value::as_str) == Some("done"))
         .filter_map(|r| {
             let created = r.get("created")?.as_str()?.to_string();
             let recipe: TrainRecipe =
                 serde_json::from_value(r.get("request")?.get("recipe")?.clone()).ok()?;
-            Some((created, recipe))
+            Some((created, recipe, r))
         })
         .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, r)| r)
+        .map(|(_, recipe, r)| (recipe, r))
+}
+
+/// The fold models' recipe ([`choose_recipe`]) and, when it is the newest finished run's, that
+/// run's record (for its measured pace, [`pace_of`]).
+struct Chosen {
+    recipe: TrainRecipe,
+    from: String,
+    run: Option<serde_json::Value>,
 }
 
 /// The fold models' recipe and where it came from: the newest finished training run's model, input
@@ -230,21 +250,28 @@ pub fn choose_recipe(
     epochs: u32,
     cap: &Capability,
 ) -> Result<(TrainRecipe, String)> {
+    let c = choose(config, epochs, cap)?;
+    Ok((c.recipe, c.from))
+}
+
+/// [`choose_recipe`], keeping the run record the recipe came from.
+fn choose(config: &Config, epochs: u32, cap: &Capability) -> Result<Chosen> {
     let usable =
         |r: &TrainRecipe| cap.family(r.family).is_none_or(|f| f.available) && r.validate().is_ok();
     let previous = std::fs::read_to_string(super::runs_file(config))
         .ok()
-        .and_then(|t| newest_done_recipe(&t))
-        .filter(usable)
-        .and_then(|p| {
+        .and_then(|t| newest_done_run(&t))
+        .filter(|(p, _)| usable(p))
+        .and_then(|(p, run)| {
             let mut r = TrainRecipe::new(p.family, &p.size).ok()?;
             r.imgsz = p.imgsz;
             r.batch = p.batch;
             r.multi_scale = p.multi_scale;
             r.base_weights = p.base_weights;
-            Some(r)
+            Some((r, run))
         });
-    let (mut r, from) = match previous {
+    let run = previous.as_ref().map(|(_, run)| run.clone());
+    let (mut r, from) = match previous.map(|(r, _)| r) {
         Some(r) => {
             let from = format!("the newest finished training run ({})", r.label());
             (r, from)
@@ -266,7 +293,155 @@ pub fn choose_recipe(
     r.epochs = epochs;
     r.patience = 0;
     r.patience_recommended = false;
-    Ok((r, from))
+    Ok(Chosen {
+        recipe: r,
+        from,
+        run,
+    })
+}
+
+/// What a finished training run measured on its GPU ([`pace_of`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    /// Seconds of one epoch (its training and its validation) per image the epoch went through
+    /// (training and validation images).
+    pub s_per_image: f64,
+}
+
+impl Pace {
+    /// Seconds of `epochs` epochs over `frames` images (a fold model's training frames, which its
+    /// run splits into training and validation).
+    pub fn train_s(self, frames: usize, epochs: u32) -> f64 {
+        self.s_per_image * frames as f64 * f64::from(epochs)
+    }
+}
+
+/// The GPU the run record `run` trained on: `progress.settings.gpu`, else the name that starts its
+/// `device` (`NVIDIA GeForce GTX 1070 Ti (compute capability 6.1, ...)`).
+fn run_gpu(run: &serde_json::Value) -> Option<String> {
+    let settings = run
+        .pointer("/progress/settings/gpu")
+        .and_then(serde_json::Value::as_str);
+    let device = || {
+        let d = run.get("device")?.as_str()?;
+        Some(d.split_once(" (").map_or(d, |(name, _)| name))
+    };
+    settings
+        .or_else(device)
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .map(str::to_string)
+}
+
+/// The median of `v` (sorted here); None when empty.
+fn median(mut v: Vec<f64>) -> Option<f64> {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    match n {
+        0 => None,
+        _ if n % 2 == 1 => v.get(n / 2).copied(),
+        _ => Some((v.get(n / 2 - 1)? + v.get(n / 2)?) / 2.0),
+    }
+}
+
+/// Seconds per epoch of a run's `history` (its `history.jsonl` rows): the median time between
+/// two consecutive epochs, so a pause or a slow first epoch does not count (pauses are not
+/// recorded, and the clock runs through them); with fewer than two such pairs, the last row's
+/// time over its epoch. None for no row with a time.
+fn epoch_s_of(history: &[EpochPoint]) -> Option<f64> {
+    let steps: Vec<f64> = history
+        .windows(2)
+        .filter_map(|w| match w {
+            [a, b] if b.epoch == a.epoch + 1 && b.elapsed_s > a.elapsed_s && a.elapsed_s > 0.0 => {
+                Some(b.elapsed_s - a.elapsed_s)
+            }
+            _ => None,
+        })
+        .collect();
+    if steps.len() >= 2 {
+        return median(steps);
+    }
+    let last = history
+        .iter()
+        .rfind(|p| p.epoch > 0 && p.elapsed_s.is_finite() && p.elapsed_s > 0.0)?;
+    Some(last.elapsed_s / f64::from(last.epoch))
+}
+
+/// The pace the finished run `run` (an entry of `runs.json`) measured, when it trained on the GPU
+/// named `gpu` (another GPU, or one it does not name: None). One epoch's time comes from its
+/// `history` ([`epoch_s_of`]), else from the record (`progress.elapsed_s` over `progress.epoch`);
+/// the images of an epoch are `dataset.train_images` (repeats from balancing included) plus
+/// `dataset.valid_images`. None when anything is missing or not positive.
+pub fn pace_of(run: &serde_json::Value, history: &[EpochPoint], gpu: &str) -> Option<Pace> {
+    if run_gpu(run).as_deref() != Some(gpu.trim()) {
+        return None;
+    }
+    let epoch_s = epoch_s_of(history).or_else(|| {
+        let elapsed = run.pointer("/progress/elapsed_s")?.as_f64()?;
+        let epoch = run.pointer("/progress/epoch")?.as_u64()?;
+        (epoch > 0).then(|| elapsed / epoch as f64)
+    })?;
+    let images = run.pointer("/dataset/train_images")?.as_u64()?
+        + run
+            .pointer("/dataset/valid_images")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+    let s_per_image = epoch_s / images as f64;
+    (images > 0 && s_per_image.is_finite() && s_per_image > 0.0).then_some(Pace { s_per_image })
+}
+
+/// [`pace_of`] of the run record `run`, its history read from `<run_dir>/history.jsonl` (read only).
+fn measured_pace(run: &serde_json::Value, gpu: &str) -> Option<Pace> {
+    let history = run
+        .get("run_dir")
+        .and_then(serde_json::Value::as_str)
+        .map(|d| {
+            super::service::history::read(&super::service::history::history_path(Path::new(d)))
+        })
+        .unwrap_or_default();
+    pace_of(run, &history, gpu)
+}
+
+/// Where a check's time estimate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeBasis {
+    /// The pace the newest finished training run (whose recipe the folds use) measured on this
+    /// GPU ([`pace_of`]).
+    LastRun,
+    /// The generic training estimate ([`super::estimate::estimate`]): a rough guess.
+    Guess,
+}
+
+impl TimeBasis {
+    /// `from your last training run`, `a rough guess`.
+    pub const fn describe(self) -> &'static str {
+        match self {
+            TimeBasis::LastRun => "from your last training run",
+            TimeBasis::Guess => "a rough guess",
+        }
+    }
+}
+
+/// Seconds of a check whose folds train on `train_frames` frames each, `epochs` epochs: per fold
+/// its training (`pace`'s when there is one, else `guess` of the frame count, 0 when that has
+/// none either) plus [`FOLD_OVERHEAD_S`].
+pub fn check_seconds(
+    train_frames: &[usize],
+    epochs: u32,
+    pace: Option<Pace>,
+    guess: impl Fn(usize) -> Option<f64>,
+) -> f64 {
+    train_frames
+        .iter()
+        .map(|&n| {
+            let train = match pace {
+                Some(p) => p.train_s(n, epochs),
+                None => guess(n).unwrap_or(0.0),
+            };
+            train + FOLD_OVERHEAD_S
+        })
+        .sum()
 }
 
 /// [`RecipeInfo`] of `r`.
@@ -478,6 +653,9 @@ pub struct RefinePreview {
     pub recipe: RecipeInfo,
     /// Rough time of the whole check, seconds; None without a GPU to train on.
     pub seconds: Option<f64>,
+    /// Where `seconds` came from; None with no `seconds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_basis: Option<TimeBasis>,
     pub warnings: Vec<String>,
     /// Why the check would be refused; None = it can run.
     pub refused: Option<String>,
@@ -512,7 +690,11 @@ pub fn preview(
     if missing.is_some() {
         s.refused.clone_from(&missing);
     }
-    let (recipe, from) = choose_recipe(config, request.epochs, cap)?;
+    let Chosen {
+        recipe,
+        from,
+        run: recipe_run,
+    } = choose(config, request.epochs, cap)?;
     let mut warnings = s.warnings.clone();
     warnings.extend(s.fold_warnings(&config.collect.classes, &config.collect.hidden_classes));
     let mut folds: Vec<FoldPreview> = (0..s.k)
@@ -537,26 +719,42 @@ pub fn preview(
         ));
     }
     let accelerator = cap.resolve_gpu(request.gpu.as_deref()).ok().flatten();
-    let seconds = match &accelerator {
+    let (seconds, time_basis) = match &accelerator {
         Some(a) => {
             let total = s.frames.len();
-            let mut secs = 0.0;
-            for p in &folds {
-                let train = total.saturating_sub(p.frames);
-                let est = super::estimate::estimate(
+            // Each fold model trains on every frame but its fold's.
+            let train: Vec<usize> = folds
+                .iter()
+                .map(|p| total.saturating_sub(p.frames))
+                .collect();
+            // The run the recipe came from, when it trained on this GPU, says how fast this
+            // machine trains it; else the generic estimate.
+            let pace = recipe_run
+                .as_ref()
+                .and_then(|run| measured_pace(run, a.name()));
+            let guess = |n: usize| {
+                super::estimate::estimate(
                     recipe.family,
                     &recipe.size,
                     recipe.imgsz,
                     recipe.batch,
-                    train,
+                    n,
                     recipe.epochs,
                     a.target(),
-                );
-                secs += est.map_or(0.0, |e| e.total_s)
-                    + FOLD_OVERHEAD_S
-                    + p.frames as f64 * PREDICT_S_PER_FRAME;
+                )
+                .map(|e| e.total_s)
+            };
+            let secs = check_seconds(&train, recipe.epochs, pace, guess);
+            let basis = if pace.is_some() {
+                TimeBasis::LastRun
+            } else {
+                TimeBasis::Guess
+            };
+            if folds.is_empty() {
+                (None, None)
+            } else {
+                (Some(secs), Some(basis))
             }
-            (!folds.is_empty()).then_some(secs)
         }
         None => {
             warnings.push(format!(
@@ -564,7 +762,7 @@ pub fn preview(
                  NVIDIA GPU or Apple silicon: {}",
                 cap.summary()
             ));
-            None
+            (None, None)
         }
     };
     if let Some(a) = &accelerator {
@@ -602,6 +800,7 @@ pub fn preview(
         folds,
         recipe: recipe_info(&recipe, &from),
         seconds,
+        time_basis,
         warnings,
         refused: s.refused,
         folder_missing: missing.is_some(),
@@ -652,8 +851,9 @@ pub fn preview_text(p: &RefinePreview) -> String {
     }
     if let Some(s) = p.seconds {
         t.push_str(&format!(
-            "about {} on this GPU (rough)\n",
-            super::estimate::format_duration(s)
+            "about {} on this GPU ({})\n",
+            super::estimate::format_duration(s),
+            p.time_basis.unwrap_or(TimeBasis::Guess).describe()
         ));
     }
     for w in &p.warnings {
@@ -841,6 +1041,189 @@ mod tests {
         assert_eq!((r.imgsz, r.batch, r.epochs, r.patience), (448, 2, 3, 0));
         assert!(from.contains("rfdetr-small"), "{from}");
         assert_eq!(std::fs::read(&runs_file).unwrap(), before, "read only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const GTX: &str = "NVIDIA GeForce GTX 1070 Ti";
+
+    /// A `runs.json` entry shaped like the real ones (RF-DETR nano at 384 px, batch 8, balanced to
+    /// 1,331 training images per epoch with 83 validation images, stopped after 51 epochs on a
+    /// GTX 1070 Ti; the record holds no history, `history.jsonl` does).
+    fn real_run(run_dir: &str) -> serde_json::Value {
+        let mut recipe = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
+        recipe.imgsz = 384;
+        recipe.batch = 8;
+        recipe.epochs = 100;
+        recipe.patience = 10;
+        serde_json::json!({
+            "format": 1,
+            "id": "20261111-020504-2fff",
+            "name": "rfdetr-nano-s2",
+            "created": "2026-11-11T02:05:06Z",
+            "request": {"recipe": recipe},
+            "device": format!("{GTX} (compute capability 6.1, 7 GB, PyTorch cu126)"),
+            "state": "done",
+            "progress": {
+                "device": "cuda:0", "epoch": 51, "epochs": 100, "batch": 168, "batches": 168,
+                "elapsed_s": 7707.1700769, "eta_s": null, "phase": "export", "history": [],
+                "best": {"metric": "f2", "epoch": 34, "value": 0.67},
+                "batch_size": 8, "imgsz": 384,
+                "settings": {"lr_schedule": "cosine", "select_metric": "f2", "epochs": 100,
+                             "patience": 10, "batch": 8, "workers": 0, "seed": 1,
+                             "scene": "all", "gpu": GTX}
+            },
+            "dataset": {"classes": ["person", "car"], "train_images": 1331, "train_frames": 564,
+                        "valid_images": 83, "heldout_images": 169},
+            "finished": "2026-11-11T06:20:49Z",
+            "run_dir": run_dir
+        })
+    }
+
+    /// History rows of `epochs` epochs at `step` seconds each after a slower first one, with a
+    /// pause of `pause` seconds before epoch 20 (the clock runs through pauses).
+    fn rows(epochs: u32, step: f64, pause: f64) -> Vec<EpochPoint> {
+        (1..=epochs)
+            .map(|e| EpochPoint {
+                epoch: e,
+                elapsed_s: 155.5 + f64::from(e - 1) * step + if e >= 20 { pause } else { 0.0 },
+                metrics: BTreeMap::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_pace_is_the_last_runs_median_epoch_over_its_images() {
+        let run = real_run("");
+        let images = 1331.0 + 83.0;
+        // From the history: the median epoch, untouched by an hour's pause or the first epoch.
+        let p = pace_of(&run, &rows(51, 150.45, 3600.0), GTX).unwrap();
+        assert!((p.s_per_image - 150.45 / images).abs() < 1e-9, "{p:?}");
+        // Without a history: the record's elapsed time over its epochs (pause and all).
+        let p = pace_of(&run, &[], GTX).unwrap();
+        assert!(
+            (p.s_per_image - 7_707.170_076_9 / 51.0 / images).abs() < 1e-9,
+            "{p:?}"
+        );
+        // One history row: its time over its epoch.
+        let one = [EpochPoint {
+            epoch: 4,
+            elapsed_s: 600.0,
+            metrics: BTreeMap::new(),
+        }];
+        let p = pace_of(&run, &one, GTX).unwrap();
+        assert!((p.s_per_image - 150.0 / images).abs() < 1e-9);
+        // Another GPU, or none named: nothing measured here.
+        assert!(pace_of(&run, &[], "NVIDIA GeForce RTX 3060").is_none());
+        let mut nameless = run.clone();
+        nameless["progress"]["settings"]["gpu"] = serde_json::Value::Null;
+        nameless["device"] = serde_json::Value::Null;
+        assert!(pace_of(&nameless, &[], GTX).is_none());
+        // The device names the GPU when the settings do not (records before RunSettings).
+        let mut old = run.clone();
+        old["progress"].as_object_mut().unwrap().remove("settings");
+        assert!(pace_of(&old, &[], GTX).is_some());
+        // No epoch, no images: none.
+        let mut fresh = run.clone();
+        fresh["progress"]["epoch"] = 0.into();
+        assert!(pace_of(&fresh, &[], GTX).is_none());
+        let mut empty = run.clone();
+        empty["dataset"]["train_images"] = 0.into();
+        empty["dataset"]["valid_images"] = 0.into();
+        assert!(pace_of(&empty, &rows(51, 150.45, 0.0), GTX).is_none());
+        let mut no_dataset = run;
+        no_dataset.as_object_mut().unwrap().remove("dataset");
+        assert!(pace_of(&no_dataset, &[], GTX).is_none());
+    }
+
+    #[test]
+    fn the_measured_check_takes_about_what_two_real_checks_took() {
+        // 851 frames in 4 folds (213, 213, 213, 212 held out): each fold model trains on the rest,
+        // 8 epochs, at the last run's pace (150.45 s per epoch of 1,414 images).
+        let held = [213_usize, 213, 213, 212];
+        let train: Vec<usize> = held.iter().map(|h| 851 - h).collect();
+        assert_eq!(train.iter().sum::<usize>(), 3 * 851);
+        let pace = pace_of(&real_run(""), &rows(51, 150.45, 0.0), GTX).unwrap();
+        let none = |_: usize| -> Option<f64> { panic!("the guess is not used with a pace") };
+        let s = check_seconds(&train, 8, Some(pace), none);
+        let want = 150.45 / 1414.0 * 2553.0 * 8.0 + 4.0 * FOLD_OVERHEAD_S;
+        assert!((s - want).abs() < 1e-6, "{s} vs {want}");
+        // About 65 min; the two real checks took 4,204 s and 4,096 s (70 and 68 min).
+        assert!((3850.0..3950.0).contains(&s), "{s}");
+        assert_eq!(super::super::estimate::format_duration(s), "65 min");
+        // The generic estimate when nothing was measured: its training time per fold plus the
+        // fixed cost; a fold it cannot estimate counts the fixed cost only.
+        let s = check_seconds(&train, 8, None, |n| Some(n as f64 * 0.5));
+        assert!((s - (2553.0 * 0.5 + 4.0 * FOLD_OVERHEAD_S)).abs() < 1e-9);
+        assert!((check_seconds(&train, 8, None, |_| None) - 4.0 * FOLD_OVERHEAD_S).abs() < 1e-9);
+        assert!(check_seconds(&[], 8, Some(pace), |_| None).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_preview_says_whether_its_time_was_measured() {
+        let root = std::env::temp_dir().join(format!("bop-refine-pace-{}", uuid::Uuid::new_v4()));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let cap = super::super::capability::host_for_tests();
+        let gpu = cap.resolve_gpu(None).unwrap().unwrap();
+        let req = RefineRequest::default();
+        // No runs.json: the generic estimate (no reviewed frame: no fold, no time either).
+        let p = preview(&c, &req, &cap).unwrap();
+        assert_eq!((p.seconds, p.time_basis), (None, None));
+        // A finished run on this GPU with its history file: its recipe and its pace.
+        let run_dir = root.join("training").join("20261111-020504-2fff");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let lines: String = rows(51, 150.45, 0.0)
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap() + "\n")
+            .collect();
+        std::fs::write(
+            super::super::service::history::history_path(&run_dir),
+            lines,
+        )
+        .unwrap();
+        let mut run = real_run(run_dir.to_str().unwrap());
+        run["progress"]["settings"]["gpu"] = gpu.name().into();
+        let runs_file = super::super::runs_file(&c);
+        std::fs::create_dir_all(runs_file.parent().unwrap()).unwrap();
+        std::fs::write(&runs_file, serde_json::json!([run]).to_string()).unwrap();
+        let chosen = choose(&c, 8, &cap).unwrap();
+        assert_eq!(chosen.recipe.label(), "rfdetr-nano");
+        let pace = measured_pace(chosen.run.as_ref().unwrap(), gpu.name()).unwrap();
+        assert!(
+            (pace.s_per_image - 150.45 / 1414.0).abs() < 1e-9,
+            "{pace:?}"
+        );
+        // The same record from another GPU: not this machine's pace.
+        assert_ne!(gpu.name(), GTX);
+        assert!(measured_pace(chosen.run.as_ref().unwrap(), GTX).is_none());
+        let text = |basis| {
+            preview_text(&RefinePreview {
+                dataset_dir: root.clone(),
+                filter: "all reviewed frames".into(),
+                frames: 851,
+                left_out: LeftOut::default(),
+                camera_days: 12,
+                folds: Vec::new(),
+                recipe: recipe_info(&chosen.recipe, &chosen.from),
+                seconds: Some(3893.0),
+                time_basis: basis,
+                warnings: Vec::new(),
+                refused: None,
+                folder_missing: false,
+            })
+        };
+        assert!(
+            text(Some(TimeBasis::LastRun))
+                .contains("about 65 min on this GPU (from your last training run)")
+        );
+        assert!(text(Some(TimeBasis::Guess)).contains("(a rough guess)"));
+        assert!(text(None).contains("(a rough guess)"));
+        assert_eq!(
+            serde_json::to_value(TimeBasis::LastRun).unwrap(),
+            serde_json::json!("last_run")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

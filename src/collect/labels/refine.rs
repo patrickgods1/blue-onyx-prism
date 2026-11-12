@@ -16,6 +16,11 @@
 //!   between two vehicle classes ([`same_object`]), which name one object.
 //! - **verify**: a training box no model found; accepting keeps the label ([`Answer::Kept`]).
 //!
+//! The target of `tighten`, `relabel` and `verify` is never an ignore region
+//! ([`LabelBox::is_ignore`]): a box marked unsure (or rejected as too small) is no training box
+//! for the check ([`crate::training::refine::judge`] never judges one), so marking it ends the
+//! suggestion like any other edit of the box.
+//!
 //! **Keys.** `target` names an existing box by its exact `bbox`, and by its label too when
 //! `target_label` is set (two boxes of different objects can share a `bbox`). A suggestion whose box
 //! moved, went or changed so the rule above no longer holds is stale and ignored ([`live`]), never
@@ -206,12 +211,13 @@ fn names(s: &Suggestion, b: &LabelBox) -> bool {
             .is_none_or(|l| same_label(&b.label, l))
 }
 
-/// The first box `s` names ([`names`]) that is a training box no reviewer drew and that `ok`
-/// takes.
+/// The first box `s` names ([`names`]) that is a training box, no ignore region
+/// ([`LabelBox::is_ignore`]: an unsure box, which the check never judges), no reviewer drew and
+/// that `ok` takes.
 fn target_box(f: &LabelFile, s: &Suggestion, ok: impl Fn(&LabelBox) -> bool) -> Option<usize> {
-    f.boxes
-        .iter()
-        .position(|b| names(s, b) && b.is_training() && b.source != Source::Human && ok(b))
+    f.boxes.iter().position(|b| {
+        names(s, b) && b.is_training() && !b.is_ignore() && b.source != Source::Human && ok(b)
+    })
 }
 
 /// The kinds that name an existing box by `target`.
@@ -1038,6 +1044,34 @@ mod tests {
         // Rejected or pending: no training box.
         assert!(all(rejected("car", CAR, None, None)).is_empty());
         assert!(all(at("car", CAR)).is_empty());
+        // An ignore region: marked unsure (accepted or added, any source) or rejected as too
+        // small. The check never judges one, so marking it ends every suggestion about it.
+        let unsure = LabelBox {
+            difficult: true,
+            ..accepted("car", CAR)
+        };
+        assert!(unsure.is_training() && unsure.is_ignore());
+        assert!(all(unsure.clone()).is_empty());
+        let model_unsure = LabelBox {
+            source: Source::Model,
+            origin: Some(Origin::Prediction),
+            ..unsure.clone()
+        };
+        assert!(all(model_unsure).is_empty());
+        assert!(all(rejected("car", CAR, None, Some(RejectReason::TooSmall))).is_empty());
+        // ... and no accept goes through: nothing changes.
+        let mut f = file(
+            vec![unsure.clone()],
+            vec![tighten(CAR, TIGHT), verify(CAR), relabel(CAR, "dog")],
+        );
+        let before = f.clone();
+        for i in 0..3 {
+            assert!(!accept(&mut f, i, Some(&w)), "{i}");
+        }
+        assert_eq!(f, before);
+        // Unsure taken back: the suggestions are live again (none was answered).
+        f.boxes[0].difficult = false;
+        assert_eq!(live_at(&f, Some(&w)), [0, 1, 2]);
         // A tighten to the same box, or with no box, proposes nothing.
         let f = file(
             vec![accepted("car", CAR)],

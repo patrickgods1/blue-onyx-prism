@@ -52,6 +52,12 @@
   }
 
   function pct(x) { return Math.round(x * 100) + '%'; }
+  // A score or IoU as the page prints it: two decimals, trailing zeros trimmed (0.3, 0.5, 0.15).
+  // The report's f32 thresholds arrive widened to f64 (0.30000001192092896); never print them raw.
+  function num(x) {
+    var v = x == null ? NaN : Number(x);
+    return isFinite(v) ? String(Number(v.toFixed(2))) : '?';
+  }
   function seconds(s) {
     if (s < 90) return 'under 2 min';
     var m = Math.round(s / 60);
@@ -124,7 +130,10 @@
       box.appendChild(ul);
     }
     if (p.seconds != null) {
-      box.appendChild(el('p', null, 'Time: ' + seconds(p.seconds) + ' on this GPU (a rough guess). The GPU is busy meanwhile.'));
+      // time_basis: last_run = the pace the training run the recipe came from measured on this
+      // GPU; else the generic estimate.
+      var basis = p.time_basis === 'last_run' ? 'from your last training run' : 'a rough guess';
+      box.appendChild(el('p', null, 'Time: ' + seconds(p.seconds) + ' on this GPU (' + basis + '). The GPU is busy meanwhile.'));
     }
     if (p.warnings && p.warnings.length) {
       var w = el('ul', 'warn-list small');
@@ -357,7 +366,7 @@
       return;
     }
     box.appendChild(el('p', 'muted', 'Recall per camera, scene and class: how often a fold model that never saw that camera day found a labelled object (score of ' +
-      r.found_score + ' or more, overlapping the box by ' + r.found_iou + ' or more), with a 95% interval. Few boxes give a wide interval.'));
+      num(r.found_score) + ' or more, overlapping the box by ' + num(r.found_iou) + ' or more), with a 95% interval. Few boxes give a wide interval.'));
     if (r.recall && r.recall.boxes) {
       box.appendChild(el('p', null, 'Overall: ' + recallText(r.recall) + ' of ' + plural(r.recall.boxes, 'box', 'boxes') + '.'));
     }

@@ -1572,6 +1572,47 @@ fn the_refine_rules_agree_with_their_rust_twins() {
                 *seen.entry(key).or_default() += 1;
             }
         }
+        // A suggestion about an ignore region (an unsure box, a box rejected as too small) is
+        // never live: the check never judges one. An unsure box that is otherwise a target ends a
+        // suggestion that is live again once the mark is taken back.
+        for (i, s) in f.refine.iter().enumerate() {
+            if s.answered()
+                || !matches!(
+                    s.kind,
+                    refine::Kind::Tighten | refine::Kind::Relabel | refine::Kind::Verify
+                )
+            {
+                continue;
+            }
+            let names = |b: &LabelBox| {
+                s.target == Some(b.bbox)
+                    && s.target_label
+                        .as_deref()
+                        .is_none_or(|l| l.trim().eq_ignore_ascii_case(b.label.trim()))
+            };
+            let Some(at) = f.boxes.iter().position(|b| names(b) && b.is_ignore()) else {
+                continue;
+            };
+            if f.boxes.iter().any(|b| names(b) && !b.is_ignore()) {
+                continue; // another box it names may hold it live
+            }
+            assert!(
+                !live.iter().any(|l| l.index == i),
+                "frame {n}: suggestion {i} about an ignore region is live"
+            );
+            let b = &f.boxes[at];
+            if b.state == BoxState::Rejected && b.reject_reason == Some(RejectReason::TooSmall) {
+                *seen.entry("a target rejected as too small").or_default() += 1;
+            }
+            if b.difficult && b.is_training() {
+                *seen.entry("a target marked unsure").or_default() += 1;
+                let mut sure = f.clone();
+                sure.boxes[at].difficult = false;
+                if rust_refine_live(&sure, w).iter().any(|l| l.index == i) {
+                    *seen.entry("unsure ends a live suggestion").or_default() += 1;
+                }
+            }
+        }
         // A hidden class or one of no list is never live with the list, and live without one.
         if w.is_some()
             && f.refine.iter().any(|s| {
@@ -1613,6 +1654,9 @@ fn the_refine_rules_agree_with_their_rust_twins() {
         ("a target_label picks the second box", 5),
         ("an alias or another spelling", 100),
         ("an add of an unwanted class", 50),
+        ("a target rejected as too small", 40),
+        ("a target marked unsure", 60),
+        ("unsure ends a live suggestion", 20),
     ] {
         let n = seen.get(key).copied().unwrap_or(0);
         assert!(n >= least, "the generator reached \"{key}\" only {n} times");

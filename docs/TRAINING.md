@@ -1842,6 +1842,12 @@ page can still save. The file format is in [DATASET.md](DATASET.md#label-file-ve
 A dismissal changes no box. Answers are remembered: a rerun does not ask the same question again. A
 suggestion names its box by `target` and `target_label`, so two boxes of different objects drawn at the
 same place each get their own.
+The reviewer's own edits end a suggestion without an answer (`refine::live`, computed when the file is
+read): a `relabel`, `tighten` or `verify` is stale once its box is rejected (also as too small), marked
+unsure (`d`), deleted, moved (`tighten`, `verify`) or relabelled (`relabel`). An unsure
+or too-small box is an ignore region, which the judge never judges either; taking the unsure mark back
+makes an unanswered suggestion about it live again. An `add` is stale once a box of its object or an ignore
+box covers it, or a judged reject of its object lies on it.
 `tighten` is read and accepted by the code but the check does not make it.
 
 **Finding them on the Review tab.** `GET /v1/review/next?auto=refine` lists the frames with a live

@@ -498,8 +498,10 @@ folder; the collector and the Collect tab keep `collect.dir`.
   moved, went or was relabelled away from `target_label`, or that no longer holds, is stale and ignored: an
   `add` that a box of its object now covers; a `tighten` on a box a reviewer drew or moved; a `relabel` on a
   box a reviewer drew or relabelled, or to a class that names the same object; a `verify` on a box a reviewer
-  drew or moved. (A `relabel` on a box a reviewer only moved, and a `tighten` on a box a reviewer only
-  relabelled, stay live.) Staleness is computed when the file is read, never stored, and never an error. So
+  drew or moved; a `tighten`, `relabel` or `verify` whose box is an ignore region (marked unsure,
+  `difficult`, or rejected as `too_small`: the check never judges one). (A `relabel` on a box a reviewer
+  only moved, and a `tighten` on a box a reviewer only relabelled, stay live; taking an unsure mark back
+  makes an unanswered suggestion about that box live again.) Staleness is computed when the file is read, never stored, and never an error. So
   is any suggestion on a skipped frame. `answer`: `kept` (a `verify` the reviewer confirmed: the label stays)
   or `dismissed` (the reviewer said no); an answered suggestion is never live again and stays in the file, so
   a rerun does not ask again, until a check finds its `target` box gone (moved, relabelled, deleted): then

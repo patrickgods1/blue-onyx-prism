@@ -1304,10 +1304,60 @@ fn the_preview_counts_frames_folds_and_what_is_left_out() {
     none.accelerator = None;
     let p = super::super::preview(&cfg, &RefineRequest::default(), &none).unwrap();
     assert!(p.seconds.is_none());
+    assert!(p.time_basis.is_none());
     assert!(
         p.warnings
             .iter()
             .any(|w| w.contains("NVIDIA GPU or Apple silicon"))
+    );
+    // No finished run: the time is the generic estimate, said to be a rough guess.
+    let p = super::super::preview(&cfg, &RefineRequest::default(), &host()).unwrap();
+    assert_eq!(p.time_basis, Some(super::super::TimeBasis::Guess));
+    // A finished run on this GPU (its recipe is the folds'), 150 s per epoch of 1,000 + 100
+    // images in its history: the folds' training at that pace, said to come from that run.
+    let gpu = host().resolve_gpu(None).unwrap().unwrap();
+    let run_dir = t.0.join("training").join("run-a");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let history: String = (1..=10_u32)
+        .map(|e| {
+            format!(
+                "{{\"epoch\":{e},\"elapsed_s\":{},\"metrics\":{{}}}}\n",
+                10.0 + 150.0 * f64::from(e)
+            )
+        })
+        .collect();
+    std::fs::write(run_dir.join("history.jsonl"), history).unwrap();
+    let mut recipe = crate::training::recipe::TrainRecipe::new(
+        crate::resources::catalog::TrainFamily::Rfdetr,
+        "nano",
+    )
+    .unwrap();
+    recipe.imgsz = 384;
+    recipe.batch = 8;
+    let runs = serde_json::json!([{
+        "id": "run-a", "created": "2026-11-11T02:05:06Z", "state": "done",
+        "request": {"recipe": recipe},
+        "device": gpu.describe(),
+        "progress": {"epoch": 10, "elapsed_s": 1520.0, "settings": {"gpu": gpu.name()}},
+        "dataset": {"train_images": 1000, "valid_images": 100},
+        "run_dir": run_dir,
+    }]);
+    let runs_file = crate::training::runs_file(&cfg);
+    std::fs::create_dir_all(runs_file.parent().unwrap()).unwrap();
+    std::fs::write(&runs_file, runs.to_string()).unwrap();
+    let before = std::fs::read(&runs_file).unwrap();
+    let p = super::super::preview(&cfg, &RefineRequest::default(), &host()).unwrap();
+    assert_eq!(std::fs::read(&runs_file).unwrap(), before, "read only");
+    assert_eq!(p.time_basis, Some(super::super::TimeBasis::LastRun));
+    assert_eq!((p.recipe.imgsz, p.recipe.batch), (384, 8));
+    // 12 frames in 4 folds of 3: each fold model trains on 9, 8 epochs.
+    let want = 4.0 * (150.0 / 1100.0 * 9.0 * 8.0 + super::super::FOLD_OVERHEAD_S);
+    let got = p.seconds.unwrap();
+    assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    assert!(
+        super::super::preview_text(&p).contains("(from your last training run)"),
+        "{}",
+        super::super::preview_text(&p)
     );
 }
 
