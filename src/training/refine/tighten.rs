@@ -419,7 +419,6 @@ pub fn run_stage(
         stage(report, &name, step, steps, 100, "no loose label to look at");
         return end;
     }
-    let helper = job.zoom_helper();
     let work = job.work.join(ZOOM_DIR);
     let (sel, ids) = crops(frames);
     let fail = |acc: &mut Acc, end: &mut ZoomEnd, e: anyhow::Error| {
@@ -428,6 +427,13 @@ pub fn run_stage(
             "the closer look at loose labels failed: {why}; the other suggestions were saved"
         ));
         end.failed = Some(why);
+    };
+    let helper = match job.zoom_helper() {
+        Ok(h) => h,
+        Err(e) => {
+            fail(acc, &mut end, e);
+            return end;
+        }
     };
     stage(report, &name, step, steps, 0, "setting up the environment");
     let mut bar = Bar { last: 0 };

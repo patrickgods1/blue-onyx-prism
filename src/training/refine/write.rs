@@ -440,6 +440,7 @@ mod tests {
             frames: BTreeMap::new(),
             device: String::new(),
             cancelled: false,
+            load_s: None,
         };
         found.frames.insert(
             rel.clone(),
@@ -451,6 +452,7 @@ mod tests {
             .map(|c| (c.clone(), if c == "person" { 0 } else { 500 }))
             .collect();
         let ctx = Context {
+            model: None,
             wanted: &wanted,
             imgsz: 640,
             class_boxes: &counts,
@@ -545,6 +547,7 @@ mod tests {
         };
         let counts: BTreeMap<String, usize> = classes.iter().map(|c| (c.clone(), 500)).collect();
         let ctx = Context {
+            model: None,
             wanted: &wanted,
             imgsz: 640,
             class_boxes: &counts,

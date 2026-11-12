@@ -569,6 +569,7 @@ impl Detector for FakeDetector {
                 .collect(),
             device: device.unwrap_or("openvino:cpu").to_string(),
             cancelled: self.stop_after.is_some(),
+            load_s: None,
         })
     }
 }
@@ -3782,6 +3783,7 @@ impl Detector for StallingDetector {
                 .collect(),
             device: device.unwrap_or("openvino:cpu").to_string(),
             cancelled: false,
+            load_s: None,
         })
     }
 }

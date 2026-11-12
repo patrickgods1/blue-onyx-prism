@@ -1,4 +1,5 @@
-//! The report of the dataset check, `<review folder>/refine/report.json` ([`REPORT_FILE`]): what
+//! The report of the dataset check, `<review folder>/refine/report.json` ([`REPORT_FILE`]; a quick
+//! check's is `report-quick.json`, [`QUICK_REPORT_FILE`], so each mode keeps its last one): what
 //! was checked, what was suggested, and how often a fold model found the labelled objects of camera
 //! days it never saw (out-of-fold recall) per camera x scene x class and per size at model input,
 //! each with a Wilson 95% interval ([`wilson`]): 57 held-out persons give a recall to about +/- 10
@@ -18,8 +19,13 @@ use std::path::{Path, PathBuf};
 
 /// Folder of the report in the folder under review.
 pub const REPORT_DIR: &str = "refine";
-/// The report file in [`REPORT_DIR`].
+/// The full check's report file in [`REPORT_DIR`].
 pub const REPORT_FILE: &str = "report.json";
+/// The quick check's report file in [`REPORT_DIR`]: each mode keeps its own last report, so a
+/// quick check never replaces the full check's whole-folder recall (and the recall by size a floor
+/// is chosen from), nor the reverse. A `report.json` with `mode: model` (written by the first
+/// builds of the quick check, never released) reads as what it says.
+pub const QUICK_REPORT_FILE: &str = "report-quick.json";
 /// Version of the report's layout.
 pub const REPORT_VERSION: u32 = 1;
 /// z of a two-sided 95% interval: the 0.975 quantile of the standard normal distribution.
@@ -28,9 +34,22 @@ pub const Z95: f64 = 1.959_963_984_540_054;
 /// bucket has none. 8 and 12: about one RF-DETR patch; 24 and 48: a person far and near.
 pub const SIZE_EDGES: [f32; 4] = [8.0, 12.0, 24.0, 48.0];
 
-/// `<review folder>/refine/report.json`.
+/// `<review folder>/refine/report.json`: the full check's.
 pub fn report_path(review_dir: &Path) -> PathBuf {
     review_dir.join(REPORT_DIR).join(REPORT_FILE)
+}
+
+/// `<review folder>/refine/report-quick.json`: the quick check's.
+pub fn quick_report_path(review_dir: &Path) -> PathBuf {
+    review_dir.join(REPORT_DIR).join(QUICK_REPORT_FILE)
+}
+
+/// The report file of a check of `mode`.
+pub fn report_path_of(review_dir: &Path, mode: Mode) -> PathBuf {
+    match mode {
+        Mode::Folds => report_path(review_dir),
+        Mode::Model => quick_report_path(review_dir),
+    }
 }
 
 /// The Wilson score interval of `found` successes in `n` trials at 95% ([`Z95`]): `(low, high)`
@@ -176,6 +195,49 @@ impl LeftOut {
     }
 }
 
+/// How a check judged the frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Throwaway fold models, each blind to whole camera days (reports of earlier checks too).
+    #[default]
+    Folds,
+    /// A quick check: a model the user trained, on the reviewed frames it never trained or
+    /// validated on ([`super::quick`]).
+    Model,
+}
+
+/// The model of a quick check ([`Mode::Model`]) and what it could not look at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The configured model's name.
+    pub name: String,
+    /// Its training run (`<model>.provenance.json` `run_id`).
+    pub run: String,
+    /// `rfdetr-nano`, `yolo26n`, ... (its recipe).
+    pub recipe: String,
+    /// Its input size (the recipe's `imgsz`): the judge's "short side at model input".
+    pub imgsz: u32,
+    /// Frames of the selection it trained on (its run's `train.txt`): skipped.
+    pub trained_on: usize,
+    /// Frames of the selection it validated on (`valid.txt`; its checkpoint was chosen on them):
+    /// skipped.
+    pub validated_on: usize,
+    /// Of the frames it checks, those of a camera day it trained or validated on: near copies of
+    /// what it learned, so its finds there say less.
+    pub same_day: usize,
+    /// Wanted classes the model does not have: their labels get no `verify` and no `relabel`, and
+    /// are not in the recall.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes_missing: Vec<String>,
+    /// The run recorded where each image came from (`image_sources.json`): frames were matched by
+    /// source as well as by name.
+    pub by_source: bool,
+    /// The device that ran it (empty before it ran, and in previews).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+}
+
 /// The recipe the fold models trained with.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecipeInfo {
@@ -260,9 +322,30 @@ pub struct RefineReport {
     /// suggestions and the recall but for its size table). None = off, or an earlier report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_floor: Option<SizeFloor>,
-    /// `training.ignore` the fold models trained with. None in reports of earlier checks.
+    /// `training.ignore` the fold models trained with. None in reports of earlier checks and of
+    /// quick checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_mode: Option<IgnoreMode>,
+    /// Fold models or a quick check with a model ([`Mode`]); reports of earlier checks: folds.
+    /// A quick check has `folds` and `folds_done` 0, `recipe` is the model's own, and the counts and
+    /// recall tables cover only the frames it never saw (`model`).
+    #[serde(default)]
+    pub mode: Mode,
+    /// The model of a quick check; None for fold models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelInfo>,
+    /// Seconds the detections took per frame, the model's load not included (reading and
+    /// decoding the frame and the model's pass; the judge and the writes not), over every frame the
+    /// models ran on: with [`Self::predict_load_s`], a later quick preview's time estimate. None
+    /// when no frame ran. (Reports of the branch's first quick checks held the load in it; with no
+    /// `predict_load_s` beside it no estimate uses it.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict_s_per_frame: Option<f64>,
+    /// Seconds a model took to load before its first frame (runtime, read, compile and warm-up, as
+    /// the benchmark pipeline measures them), averaged over the models that ran; None when no
+    /// model reported it and in reports of earlier checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict_load_s: Option<f64>,
     pub warnings: Vec<String>,
 }
 
@@ -386,6 +469,10 @@ impl RefineReport {
             folds_every_label: false,
             size_floor: None,
             ignore_mode: None,
+            mode: Mode::Folds,
+            model: None,
+            predict_s_per_frame: None,
+            predict_load_s: None,
             warnings: Vec::new(),
         }
     }
@@ -400,7 +487,8 @@ impl RefineReport {
         self.created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     }
 
-    /// Write it to `<review_dir>/refine/report.json` atomically (a reader never sees half of it);
+    /// Write it to its mode's file ([`report_path_of`]: `refine/report.json` for a full check,
+    /// `refine/report-quick.json` for a quick one) atomically (a reader never sees half of it);
     /// returns the path. Refused when the folder under review is not a folder any more (an
     /// unmounted drive: creating it would put the report on the disk below the mount point); only
     /// `refine/` is created.
@@ -412,7 +500,7 @@ impl RefineReport {
                 review_dir.display()
             );
         }
-        let path = report_path(review_dir);
+        let path = report_path_of(review_dir, self.mode);
         let dir = review_dir.join(REPORT_DIR);
         match std::fs::create_dir(&dir) {
             Ok(()) => {}

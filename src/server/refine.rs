@@ -2,8 +2,10 @@
 //! ([`crate::training::refine`]) and shows what it found. Three JSON routes serve the page
 //! (`assets/train-refine.js`):
 //!
-//! - `GET /v1/refine`: the folder under review, the parsed `refine/report.json` (null when there is
-//!   none, with `report_problem` when it is damaged or newer than this build), the open suggestions
+//! - `GET /v1/refine`: the folder under review, the parsed `refine/report.json` of the last full
+//!   check (`report`; null when there is none, with `report_problem` when it is damaged or newer
+//!   than this build) and `refine/report-quick.json` of the last quick check (`quick_report`,
+//!   `quick_report_problem`), the open suggestions
 //!   per kind (a walk of the label files, off the async workers, kept 60 s per folder and class
 //!   list and dropped when a check starts or ends), the check in the queue, the newest finished one,
 //!   and what the form needs of this machine;
@@ -14,6 +16,12 @@
 //!   queue. Refusals come back as `{success: false, message}` in the check's own words. A check
 //!   that would replace open suggestions on the frames it checks asks first: 409 with
 //!   `needs_confirm` and the counts, until the request says `replace_open: true`.
+//!
+//! A quick check (`model` in the preview's query and the start's body, never with folds or epochs;
+//! [`check::quick`]) runs a model trained here on the reviewed frames it never saw: `GET /v1/refine`
+//! `capability.models` lists the usable ones (read from their training records, no frame walk, kept
+//! a few seconds), and
+//! the replace count of its 409 covers only the frames it checks.
 //!
 //! The check writes suggestions and the report only; nothing here changes a box. The Static
 //! objects card's routes (`GET /v1/refine/spots`, `POST /v1/refine/accept-spot`,
@@ -240,11 +248,27 @@ fn remember(map: &mut BTreeMap<String, Kept>, key: String, kept: Kept) {
     map.insert(key, kept);
 }
 
-/// The report in `dir` and what is wrong with it: `(None, None)` when there is none (never an
-/// error), `(None, Some(why))` when it does not read or is a later build's.
+/// The full check's report in `dir` and what is wrong with it: `(None, None)` when there is none
+/// (never an error), `(None, Some(why))` when it does not read or is a later build's.
 pub(super) fn read_report(dir: &Path) -> (Option<RefineReport>, Option<String>) {
-    let path = report::report_path(dir);
-    let bytes = match std::fs::metadata(&path) {
+    read_report_at(&report::report_path(dir))
+}
+
+/// The quick check's report in `dir` (`refine/report-quick.json`), as [`read_report`] reads.
+pub(super) fn read_quick_report(dir: &Path) -> (Option<RefineReport>, Option<String>) {
+    read_report_at(&report::quick_report_path(dir))
+}
+
+/// The report the recall tables are drawn from (the Coverage and Too small cards, the coverage
+/// route's recall columns, the floor's suggested input): the full check's when one reads, else the
+/// quick check's; each says which it is by its `mode`.
+pub(super) fn recall_report(dir: &Path) -> Option<RefineReport> {
+    read_report(dir).0.or_else(|| read_quick_report(dir).0)
+}
+
+/// The report at `path`, as [`read_report`] reads it.
+fn read_report_at(path: &Path) -> (Option<RefineReport>, Option<String>) {
+    let bytes = match std::fs::metadata(path) {
         Ok(m) if m.len() > MAX_REPORT_BYTES => {
             return (
                 None,
@@ -255,7 +279,7 @@ pub(super) fn read_report(dir: &Path) -> (Option<RefineReport>, Option<String>) 
                 )),
             );
         }
-        Ok(_) => match std::fs::read(&path) {
+        Ok(_) => match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
                 return (
@@ -352,8 +376,19 @@ pub(super) fn queue_stamp(tasks: &[TaskRecord]) -> String {
 }
 
 /// What the form needs of this machine; `tighten_default`: the closer look's weights are on disk,
-/// so a check looks closer at its loose labels unless told not to.
-fn capability_bits(cap: &Capability, tighten_default: bool) -> serde_json::Value {
+/// so a check looks closer at its loose labels unless told not to. `can_check` is the full check's
+/// (it trains, so it needs a GPU); a quick check runs its model on the model's own device, so
+/// `models` (the configured models a quick check can use, [`check::quick::models`], newest first:
+/// `{name, run, recipe, imgsz, enabled}`) is offered without one, and `unusable` names the models
+/// with a training record it cannot use, with why. The frames each never saw are counted on Preview
+/// (a walk of the label files). The list is kept a few seconds ([`quick_models`]).
+fn capability_bits(
+    cap: &Capability,
+    tighten_default: bool,
+    config: &Config,
+    revision: u64,
+) -> serde_json::Value {
+    let (models, unusable) = quick_models(&MODELS, config, revision, MODELS_TTL);
     serde_json::json!({
         "can_check": cap.accelerator.is_some(),
         "tighten_default": tighten_default,
@@ -362,11 +397,69 @@ fn capability_bits(cap: &Capability, tighten_default: bool) -> serde_json::Value
             .into_iter()
             .map(|g| serde_json::json!({ "value": g.value, "label": g.label }))
             .collect::<Vec<_>>(),
+        "models": models,
+        "unusable": unusable,
     })
 }
 
-/// The answer of `GET /v1/refine`.
+/// How long the quick check's models list is kept: `GET /v1/refine` is read on every load of the
+/// Refine and Dataset tabs, and the list reads `runs.json` and every model's training record.
+const MODELS_TTL: Duration = Duration::from_secs(5);
+
+/// The kept models list ([`quick_models`]): one answer, so it stays small.
+struct KeptModels {
+    at: Instant,
+    key: String,
+    value: (Vec<check::quick::QuickModel>, Vec<check::quick::Unusable>),
+}
+
+/// The process's kept models list.
+static MODELS: Mutex<Option<KeptModels>> = Mutex::new(None);
+
+/// What the kept list is valid for: the config's revision and data root, and each configured
+/// model's training record as a stat sees it (size, time), so a record written or removed between
+/// two reads is never served stale (a run folder or model file that goes is, for [`MODELS_TTL`]).
+fn models_key(config: &Config, revision: u64) -> String {
+    let mut key = format!("{revision}\u{1f}{}", config.data_root().display());
+    for m in &config.models {
+        let record = check::quick::record_path(config, m);
+        let stamp = std::fs::metadata(&record)
+            .map(|md| format!("{}:{:?}", md.len(), md.modified().ok()))
+            .unwrap_or_else(|_| "-".into());
+        key.push_str(&format!("\u{1f}{}={stamp}", record.display()));
+    }
+    key
+}
+
+/// [`check::quick::models`] of `config` (at `revision`), kept `ttl` ([`MODELS_TTL`]) in `slot`
+/// while [`models_key`] is the same.
+fn quick_models(
+    slot: &Mutex<Option<KeptModels>>,
+    config: &Config,
+    revision: u64,
+    ttl: Duration,
+) -> (Vec<check::quick::QuickModel>, Vec<check::quick::Unusable>) {
+    let key = models_key(config, revision);
+    if let Some(k) = slot
+        .lock_recover()
+        .as_ref()
+        .filter(|k| k.key == key && k.at.elapsed() < ttl)
+    {
+        return k.value.clone();
+    }
+    let value = check::quick::models(config);
+    *slot.lock_recover() = Some(KeptModels {
+        at: Instant::now(),
+        key,
+        value: value.clone(),
+    });
+    value
+}
+
+/// The answer of `GET /v1/refine`: the full check's report (`report`, `report_problem`) and the
+/// quick check's (`quick_report`, `quick_report_problem`), each its mode's last one.
 fn status_of(state: &AppState, cap: &Capability) -> serde_json::Value {
+    let revision = state.config.revision();
     let config = state.config_read().clone();
     let dir = config.collect.resolved_review_dir(&config.data_root());
     let runs = training::records(state);
@@ -376,10 +469,16 @@ fn status_of(state: &AppState, cap: &Capability) -> serde_json::Value {
         "review_folder": dir.display().to_string(),
         "folder_missing": false,
         "report": null,
+        "quick_report": null,
         "open": null,
         "job": job_of(&runs, &tasks, &training::job_timing),
         "last": last_of(&tasks),
-        "capability": capability_bits(cap, check::tighten_weights_ready(&config)),
+        "capability": capability_bits(
+            cap,
+            check::tighten_weights_ready(&config),
+            &config,
+            revision,
+        ),
         "limits": {
             "folds": [check::FOLDS.start(), check::FOLDS.end()],
             "epochs": [check::EPOCHS.start(), check::EPOCHS.end()],
@@ -394,13 +493,14 @@ fn status_of(state: &AppState, cap: &Capability) -> serde_json::Value {
         o.insert("message".into(), why.into());
         return v;
     }
-    let (report, problem) = read_report(&dir);
-    o.insert(
-        "report".into(),
-        serde_json::to_value(report).unwrap_or_default(),
-    );
-    if let Some(p) = problem {
-        o.insert("report_problem".into(), p.into());
+    for (key, (report, problem)) in [
+        ("report", read_report(&dir)),
+        ("quick_report", read_quick_report(&dir)),
+    ] {
+        o.insert(key.into(), serde_json::to_value(report).unwrap_or_default());
+        if let Some(p) = problem {
+            o.insert(format!("{key}_problem"), p.into());
+        }
     }
     let open = open_counts(
         &dir,
@@ -427,16 +527,42 @@ pub(super) async fn status(State(state): State<Arc<AppState>>) -> Response {
 // ---------------------------------------------------------------------------------------------
 // The request
 
-/// A check's request from the page's fields; the bounds are [`RefineRequest::validate`]'s.
-fn build_request(
+/// A check's fields as the page sends them.
+#[derive(Debug, Default)]
+struct Fields<'a> {
     folds: Option<usize>,
     epochs: Option<u32>,
-    scenes: &[String],
-    cameras: &[String],
+    scenes: &'a [String],
+    cameras: &'a [String],
     gpu: Option<String>,
     allow_large: bool,
     tighten: Option<bool>,
-) -> Result<RefineRequest, String> {
+    /// A quick check's model; empty = none.
+    model: Option<String>,
+}
+
+/// A check's request from the page's fields; the bounds are [`RefineRequest::validate`]'s. A quick
+/// check (`model`) trains nothing, so folds or epochs with it are a mistake, said as one.
+fn build_request(f: Fields<'_>) -> Result<RefineRequest, String> {
+    let Fields {
+        folds,
+        epochs,
+        scenes,
+        cameras,
+        gpu,
+        allow_large,
+        tighten,
+        model,
+    } = f;
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    if model.is_some() && (folds.is_some() || epochs.is_some()) {
+        return Err(
+            "folds and epochs are for the full check: a quick check with a model trains nothing"
+                .into(),
+        );
+    }
     let mut frames = RefineFrames::default();
     for s in scenes.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         // The CLI's parse words the error.
@@ -464,6 +590,7 @@ fn build_request(
         gpu: gpu.map(|g| g.trim().to_string()).filter(|g| !g.is_empty()),
         allow_large,
         tighten,
+        model,
     };
     request.validate().map_err(|e| format!("{e:#}"))?;
     Ok(request)
@@ -488,6 +615,9 @@ pub(super) struct PreviewQuery {
     /// `1` / `0`: the closer look at loose labels asked for or not; absent: the check's default.
     #[serde(default)]
     tighten: Option<String>,
+    /// A quick check with this configured model; absent or empty: the full check.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// A yes/no query field: `1`, `true`, `on`, `yes` or `0`, `false`, `off`, `no`; absent or empty:
@@ -518,22 +648,23 @@ fn comma_list(v: Option<&str>) -> Vec<String> {
 
 impl PreviewQuery {
     fn request(&self) -> Result<RefineRequest, String> {
-        build_request(
-            whole("folds", self.folds.as_deref())?,
-            whole("epochs", self.epochs.as_deref())?,
-            &comma_list(self.scene.as_deref()),
-            &comma_list(self.camera.as_deref()),
-            self.gpu.clone(),
-            matches!(
+        build_request(Fields {
+            folds: whole("folds", self.folds.as_deref())?,
+            epochs: whole("epochs", self.epochs.as_deref())?,
+            scenes: &comma_list(self.scene.as_deref()),
+            cameras: &comma_list(self.camera.as_deref()),
+            gpu: self.gpu.clone(),
+            allow_large: matches!(
                 self.allow_large.as_deref().map(str::trim),
                 Some("1" | "true" | "on" | "yes")
             ),
-            yes_no("tighten", self.tighten.as_deref())?,
-        )
+            tighten: yes_no("tighten", self.tighten.as_deref())?,
+            model: self.model.clone(),
+        })
     }
 }
 
-/// `GET /v1/refine/preview?folds=&epochs=&scene=&camera=&gpu=&allow_large=`: 200
+/// `GET /v1/refine/preview?folds=&epochs=&scene=&camera=&gpu=&allow_large=&tighten=&model=`: 200
 /// `{success: true, ...}` ([`check::RefinePreview`]; `refused` says why a start would be refused,
 /// `folder_missing` that the review folder is unplugged), or 400 `{success: false, message}` for a
 /// bad field. Reads every label file of the folder, so the page asks on a click only.
@@ -587,6 +718,10 @@ struct CheckBody {
     /// (the second click after a `needs_confirm` refusal).
     #[serde(default)]
     replace_open: bool,
+    /// A quick check with this configured model (no folds or epochs with it); absent: the full
+    /// check.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// The JSON body of a POST: 413 over the cap, 415 without a JSON content type, 400 when it does
@@ -750,10 +885,7 @@ fn start_check(
     if p.open_suggestions + p.open_tightens > 0 && !replace_open {
         return Err(Refusal {
             status: StatusCode::CONFLICT,
-            message: format!(
-                "Not queued: {}.",
-                check::replace_warning(p.open_suggestions, p.open_tightens, p.open_frames)
-            ),
+            message: format!("Not queued: {}.", p.replace_text()),
             folder_missing: false,
             needs_confirm: Some((p.open_suggestions, p.open_tightens, p.open_frames)),
         });
@@ -788,15 +920,16 @@ pub(super) async fn start(
         Err((status, message)) => return fail(status, message),
     };
     blocking(move || {
-        let request = match build_request(
-            b.folds,
-            b.epochs,
-            &b.scenes,
-            &b.cameras,
-            b.gpu,
-            b.allow_large,
-            b.tighten,
-        ) {
+        let request = match build_request(Fields {
+            folds: b.folds,
+            epochs: b.epochs,
+            scenes: &b.scenes,
+            cameras: &b.cameras,
+            gpu: b.gpu,
+            allow_large: b.allow_large,
+            tighten: b.tighten,
+            model: b.model,
+        }) {
             Ok(r) => r,
             Err(m) => return fail(StatusCode::BAD_REQUEST, m),
         };
@@ -838,6 +971,7 @@ mod tests {
     use crate::collect::labels::bulk::test_support::put_frame_at;
     use crate::collect::labels::refine::{Answer, Suggestion};
     use crate::collect::labels::{self, BoxState, Frame, LabelBox, Source, Status};
+    use crate::training::refine::report::Mode;
     use axum::body::Body;
     use axum::http::Request;
     use std::path::PathBuf;
@@ -999,6 +1133,8 @@ mod tests {
             "id=\"refine-preview-btn\"",
             "id=\"refine-findings\"",
             "id=\"refine-coverage\"",
+            "id=\"refine-thin-body\"",
+            "<h3>Where the data is thin</h3>",
             "id=\"refine-statics\"",
             "id=\"refine-cap-form\"",
             "name=\"cap\" min=\"0\" max=\"100000\" step=\"1\"",
@@ -1019,9 +1155,25 @@ mod tests {
             "<input type=\"checkbox\" id=\"refine-tighten\" name=\"tighten\"> Propose better boxes \
              for loose labels</label>",
             "downloads RF-DETR L (0.14 GB) the first time",
+            // The mode choice: the full check by default, the quick check's model select hidden,
+            // folds and epochs the full check's only.
+            "<input type=\"radio\" name=\"check_mode\" value=\"folds\" checked> Full check (fold \
+             models, about an hour)</label>",
+            "<input type=\"radio\" name=\"check_mode\" value=\"model\" id=\"refine-mode-model\"> \
+             Quick check with a model you trained (only frames it never saw)</label>",
+            "<div class=\"tr-field\" id=\"refine-model-field\" hidden>",
+            "<select id=\"refine-model\" name=\"model\"></select>",
         ] {
             assert!(html.contains(want), "{want}");
         }
+        assert_eq!(
+            html.matches("data-full-only").count(),
+            2,
+            "folds and epochs"
+        );
+        let folds = html.find("id=\"refine-folds\"").unwrap();
+        let wrapper = html[..folds].rfind("<div").unwrap();
+        assert!(html[wrapper..folds].contains("data-full-only"));
         // The Static objects card sits between Findings and Coverage.
         let at = |id: &str| html.find(id).unwrap();
         assert!(
@@ -1186,6 +1338,106 @@ mod tests {
             v["report_problem"].as_str().unwrap().contains("newer"),
             "{v}"
         );
+    }
+
+    /// A report of `mode` written by `RefineReport::write` (as the job writes it), created at
+    /// `created`, with `boxes` person boxes of the patio by day in its recall.
+    fn written(review: &Path, mode: Mode, created: &str, boxes: u64) {
+        let mut r: RefineReport = serde_json::from_value(report_json()).unwrap();
+        let mut tally = report::RecallTally::default();
+        let facts: Vec<_> = (0..boxes)
+            .map(|_| crate::training::refine::judge::BoxFact {
+                class: "person".into(),
+                short_px: 30.0,
+                found: true,
+                at_spot: false,
+                under_floor: false,
+            })
+            .collect();
+        tally.add("patio", "day", &facts);
+        r.finish(&tally);
+        r.created = created.into();
+        r.mode = mode;
+        r.write(review).unwrap();
+    }
+
+    /// Each mode keeps its own last report: a quick check never replaces the full check's (whose
+    /// recall the cards keep showing), nor the reverse.
+    #[tokio::test]
+    async fn the_full_and_the_quick_check_keep_their_own_last_report() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let review = dir.join("dataset");
+        std::fs::create_dir_all(&review).unwrap();
+        // Quick only.
+        written(&review, Mode::Model, "2026-11-10T10:00:00Z", 3);
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert!(v["report"].is_null(), "{v}");
+        assert_eq!(v["quick_report"]["mode"], "model");
+        assert!(!report::report_path(&review).exists());
+        assert_eq!(recall_report(&review).unwrap().recall.boxes, 3);
+        // Full after quick: both kept; the recall tables are the full check's.
+        written(&review, Mode::Folds, "2026-11-11T10:00:00Z", 40);
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(v["report"]["mode"], "folds");
+        assert_eq!(v["report"]["recall"]["boxes"], 40);
+        assert_eq!(v["quick_report"]["recall"]["boxes"], 3);
+        // Quick after full: still both, and the recall stays the full check's.
+        written(&review, Mode::Model, "2026-11-12T10:00:00Z", 5);
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(v["report"]["recall"]["boxes"], 40, "{v}");
+        assert_eq!(v["quick_report"]["recall"]["boxes"], 5);
+        let r = recall_report(&review).unwrap();
+        assert_eq!((r.mode, r.recall.boxes), (Mode::Folds, 40));
+        // Each has its own problem string.
+        std::fs::write(report::quick_report_path(&review), "{ broken").unwrap();
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert!(v["quick_report"].is_null());
+        assert!(
+            v["quick_report_problem"]
+                .as_str()
+                .unwrap()
+                .contains("report-quick.json"),
+            "{v}"
+        );
+        assert!(v.get("report_problem").is_none());
+        assert_eq!(v["report"]["recall"]["boxes"], 40);
+        // A report.json of a quick check (the first builds wrote it there) reads as what it says.
+        std::fs::remove_file(report::quick_report_path(&review)).unwrap();
+        written(&review, Mode::Folds, "2026-11-12T11:00:00Z", 1);
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report::report_path(&review)).unwrap()).unwrap();
+        old["mode"] = "model".into();
+        std::fs::write(report::report_path(&review), old.to_string()).unwrap();
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(v["report"]["mode"], "model");
+    }
+
+    /// The models list is kept a few seconds per config revision and training records, so the
+    /// Dataset and Refine tabs' loads do not read every record each time.
+    #[test]
+    fn the_models_list_is_kept_until_the_revision_or_a_record_changes() {
+        let f = check::quick::tests::fixture("kept", false);
+        let config = check::quick::tests::config(&f);
+        // A long life: the test never depends on how fast it runs.
+        const HOUR: Duration = Duration::from_secs(3600);
+        let slot = Mutex::new(None);
+        let (first, _) = quick_models(&slot, &config, 1, HOUR);
+        assert_eq!(first.len(), 1);
+        // The run folder goes: still the kept answer (within the few seconds) ...
+        let run = f.root.join("training").join(check::quick::tests::RUN);
+        let moved = f.root.join("moved-run");
+        std::fs::rename(&run, &moved).unwrap();
+        assert_eq!(quick_models(&slot, &config, 1, HOUR).0.len(), 1);
+        // ... until the revision changes.
+        let (ok, bad) = quick_models(&slot, &config, 2, HOUR);
+        assert!(ok.is_empty() && bad.len() == 1, "{ok:?} {bad:?}");
+        std::fs::rename(&moved, &run).unwrap();
+        assert!(quick_models(&slot, &config, 2, HOUR).0.is_empty(), "kept");
+        // A record removed is never served stale.
+        std::fs::remove_file(f.root.join("models").join("mine.provenance.json")).unwrap();
+        let (ok, bad) = quick_models(&slot, &config, 2, HOUR);
+        assert!(ok.is_empty() && bad.is_empty());
     }
 
     /// The format is read alone first: a later build's report that does not parse as this
@@ -1369,21 +1621,21 @@ mod tests {
 
     #[test]
     fn a_request_is_built_from_the_fields_and_checked() {
-        let r = build_request(
-            None,
-            None,
-            &["ir".into(), " day ".into(), "ir".into()],
-            &["patio".into(), "".into(), "front".into()],
-            Some(" ".into()),
-            true,
-            Some(false),
-        )
+        let r = build_request(Fields {
+            scenes: &["ir".into(), " day ".into(), "ir".into()],
+            cameras: &["patio".into(), "".into(), "front".into()],
+            gpu: Some(" ".into()),
+            allow_large: true,
+            tighten: Some(false),
+            ..Fields::default()
+        })
         .unwrap();
         assert_eq!((r.folds, r.epochs), (4, 8));
         assert_eq!(r.frames.scenes, ["day", "ir"]);
         assert_eq!(r.frames.cameras, ["front", "patio"]);
         assert!(r.gpu.is_none() && r.allow_large);
         assert_eq!(r.tighten, Some(false));
+        assert_eq!(r.model, None);
         for (folds, epochs, scene) in [
             (Some(1), None, "day"),
             (Some(9), None, "day"),
@@ -1391,11 +1643,44 @@ mod tests {
             (None, Some(51), "day"),
             (None, None, "dusk"),
         ] {
+            let scenes = [scene.to_string()];
             assert!(
-                build_request(folds, epochs, &[scene.into()], &[], None, false, None).is_err(),
+                build_request(Fields {
+                    folds,
+                    epochs,
+                    scenes: &scenes,
+                    ..Fields::default()
+                })
+                .is_err(),
                 "{folds:?} {epochs:?} {scene}"
             );
         }
+        // A quick check: the model's name, trimmed; an empty one is the full check; folds or
+        // epochs with a model are refused (it trains nothing).
+        let quick = |model: &str, folds: Option<usize>, epochs: Option<u32>| {
+            build_request(Fields {
+                folds,
+                epochs,
+                model: Some(model.into()),
+                ..Fields::default()
+            })
+        };
+        assert_eq!(
+            quick(" mine ", None, None).unwrap().model.as_deref(),
+            Some("mine")
+        );
+        assert_eq!(quick("  ", None, None).unwrap().model, None);
+        for (f, e) in [(Some(4), None), (None, Some(8))] {
+            let m = quick("mine", f, e).unwrap_err();
+            assert!(m.contains("quick check with a model trains nothing"), "{m}");
+        }
+        assert!(quick(&"x".repeat(300), None, None).is_err());
+        assert!(quick("a\u{7}b", None, None).is_err());
+        let q = PreviewQuery {
+            model: Some("mine".into()),
+            ..PreviewQuery::default()
+        };
+        assert_eq!(q.request().unwrap().model.as_deref(), Some("mine"));
         let q = PreviewQuery {
             folds: Some("3".into()),
             scene: Some("ir,day".into()),
@@ -1964,6 +2249,141 @@ mod tests {
             .unwrap();
         let (s, _) = json(&state, cross).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
+    // ---- the quick check
+
+    /// A state over the quick check's fixture (a model `mine` trained here, disabled so the test
+    /// registry does not load it).
+    fn quick_state(f: &check::quick::tests::Fixture) -> Arc<AppState> {
+        let fixed = check::quick::tests::config(f);
+        test_state_with(move |c| {
+            c.download_dir.clone_from(&fixed.download_dir);
+            c.collect.dir.clone_from(&fixed.collect.dir);
+            c.collect.classes.clone_from(&fixed.collect.classes);
+            c.models = fixed
+                .models
+                .iter()
+                .map(|m| crate::config::ModelConfig {
+                    enabled: false,
+                    ..m.clone()
+                })
+                .collect();
+        })
+    }
+
+    #[tokio::test]
+    async fn a_quick_check_lists_the_models_trained_here_previews_and_asks_about_its_frames_only() {
+        let f = check::quick::tests::fixture("route", false);
+        let state = quick_state(&f);
+        // GET /v1/refine offers the model, with no frame walk for it.
+        let (s, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let models = v["capability"]["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1, "{v}");
+        assert_eq!(models[0]["name"], "mine");
+        assert_eq!(models[0]["run"], check::quick::tests::RUN);
+        assert_eq!(models[0]["imgsz"], 384);
+        assert_eq!(models[0]["recipe"], "rfdetr-nano");
+        assert_eq!(v["capability"]["unusable"], serde_json::json!([]));
+        // The preview takes the model; folds or epochs with it are a 400.
+        let (s, v) = json(&state, get("/v1/refine/preview?model=mine")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["mode"], "model");
+        assert_eq!(v["frames"], 4);
+        assert_eq!(v["model"]["trained_on"], 2);
+        assert_eq!(v["model"]["validated_on"], 1);
+        assert_eq!(v["folds"], serde_json::json!([]));
+        assert!(v["refused"].is_null(), "{v}");
+        assert!(
+            v["text"]
+                .as_str()
+                .unwrap()
+                .contains("with mine: 4 frames it never saw"),
+            "{v}"
+        );
+        for q in ["model=mine&folds=2", "model=mine&epochs=3"] {
+            let (s, v) = json(&state, get(&format!("/v1/refine/preview?{q}"))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{q}: {v}");
+        }
+        let (s, v) = json(&state, get("/v1/refine/preview?model=nope")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("no configured model")
+        );
+        // Open suggestions on a frame it trained on are not this check's to replace; those on a
+        // frame it never saw are, and the 409 counts them alone, in the model's words.
+        let open = |rel: &str| {
+            let p = Frame::resolve(&f.dataset, rel).unwrap().labels;
+            let mut l = labels::read(&p).unwrap().unwrap();
+            l.refine = vec![suggestion(
+                Kind::Add,
+                None,
+                Some([200.0, 60.0, 260.0, 200.0]),
+            )];
+            labels::write(&p, &l).unwrap();
+        };
+        open(&f.rels["trained"][0]);
+        open(&f.rels["new"][0]);
+        let (s, v) = json(
+            &state,
+            post_json("/v1/refine/check", r#"{"model":"mine","folds":2}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let (s, v) = json(&state, post_json("/v1/refine/check", r#"{"model":"mine"}"#)).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["needs_confirm"], true);
+        assert_eq!(
+            (v["open_suggestions"].as_u64(), v["open_frames"].as_u64()),
+            (Some(1), Some(1)),
+            "{v}"
+        );
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.starts_with(
+                "Not queued: this check replaces the 1 open suggestion on 1 frame with what mine \
+                 finds"
+            ),
+            "{m}"
+        );
+        // Confirmed, and with no GPU at all: planned with the registry's predictor and queued.
+        let config = state.config_read().clone();
+        let mut none = host();
+        none.accelerator = None;
+        none.cuda_options.clear();
+        let seen = Mutex::new(Vec::new());
+        let enqueue = |job: RefineJob, _: QueueRule<'_>| {
+            assert!(job.predictor.is_some());
+            assert!(job.train.is_none() && job.quick.is_some());
+            seen.lock().unwrap().push(Task::title(&job));
+            Ok(job.id.clone())
+        };
+        let req = RefineRequest {
+            model: Some("mine".into()),
+            ..RefineRequest::default()
+        };
+        let (_, title) =
+            start_check(&config, req.clone(), true, &none, &[], None, &enqueue).unwrap();
+        assert_eq!(
+            title,
+            "quick dataset check with mine (4 frames it never saw, all reviewed frames)"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // A model without a training record is refused before anything is queued.
+        std::fs::remove_file(f.root.join("models").join("mine.provenance.json")).unwrap();
+        let e = start_check(&config, req, true, &none, &[], None, &never).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert!(
+            e.message.contains("has no training record"),
+            "{}",
+            e.message
+        );
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(v["capability"]["models"], serde_json::json!([]), "{v}");
     }
 
     /// The model entry list of the Models tab never gets a fold model: nothing in this module

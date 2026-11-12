@@ -36,7 +36,8 @@ folder. Nothing is uploaded anywhere.
 <dir>/                                   collect.dir, default <data root>/dataset
   review-queue.jsonl                     frames sent to review (the review page consumes it)
   spots/<camera>.json                    parked spots of the camera (below, Review labels: Spots)
-  refine/report.json                     report of the last dataset check (TRAINING.md, Dataset check)
+  refine/report.json                     report of the last full dataset check (TRAINING.md, Dataset check)
+  refine/report-quick.json               report of the last quick check (`mode: model`; each mode keeps its own)
   <scene>/                               day | night | ir (src/image_stats.rs)
     <camera>/                            camera folder (see below)
       <YYYY-MM-DD>/                      UTC date
@@ -514,7 +515,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
   for `verify`, `relabel` and `tighten`; same bounds as `label`): the label of that box when the check ran, compared
   trimmed and case-insensitive, so of two boxes of different objects with the very same `bbox` the suggestion
   names the right one; without it (files of the first checks) the `bbox` alone is the key. `score`: the fold
-  model's score, 0 to 1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group
+  model's score, 0 to 1 (a quick check's, `train refine --with-model`: its model's). `why`: the evidence in
+  plain words, at most 300 characters (a quick check's names its model: *mine (never trained on this frame)
+  found a person here, score 0.82*). `spot`: an opaque group
   name, at most 200 bytes; the check writes it on an `add` at a static spot, the spot's id
   `<camera>/<object>/<x0>-<y0>-<x1>-<y1>` (`collect::labels::statics`, docs/TRAINING.md "Static spots"):
   the check's evidence, shown with the suggestion. It names a spot of that check's own table; the Refine

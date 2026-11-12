@@ -2000,6 +2000,114 @@ process.stdout.write(JSON.stringify({
     );
 }
 
+/// A quick check's report never reads as a full check's: the Findings card's last-check line, the
+/// Coverage card's recall sentence and the size table's note name the model and the frames it
+/// never saw (`RefineFloor.lastLine`, `recallOf`, `measuredWith`; report.json `mode: model`).
+#[test]
+fn a_quick_checks_report_names_its_model_and_the_frames_it_never_saw() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+const quick = {
+  mode: 'model', frames_checked: 287, cancelled: false, folds: 0, folds_done: 0,
+  recipe: { model: 'rfdetr-nano', imgsz: 384, epochs: 100, batch: 8 },
+  model: { name: 'custom-rf-detr-nano-3', run: '20261111-020504-cad6', imgsz: 384,
+           trained_on: 564, validated_on: 83, same_day: 12 },
+  size_floor: { px: 10, input: 384 },
+};
+const full = {
+  folds: 4, folds_done: 4, frames_checked: 851, cancelled: true,
+  recipe: { model: 'rfdetr-nano', imgsz: 384, epochs: 8, batch: 8 }, folds_every_label: true,
+};
+process.stdout.write(JSON.stringify({
+  quick_line: F.lastLine(quick, 'T'),
+  full_line: F.lastLine(full, 'T'),
+  quick_recall: F.recallOf(quick),
+  full_recall: F.recallOf(full),
+  quick_measured: F.measuredWith(quick),
+  one: F.lastLine(Object.assign({}, quick, { frames_checked: 1 }), 'T'),
+  // GET /v1/refine keeps each mode's last report.
+  both_quick_newer: F.reports({ report: Object.assign({ created: '2026-11-10T10:00:00Z' }, full),
+    quick_report: Object.assign({ created: '2026-11-12T10:00:00Z' }, quick) }),
+  both_full_newer: F.reports({ report: Object.assign({ created: '2026-11-12T11:00:00Z' }, full),
+    quick_report: Object.assign({ created: '2026-11-12T10:00:00Z' }, quick) }),
+  quick_only: F.reports({ report: null, quick_report: quick }),
+  full_only: F.reports({ report: full }),
+  none: F.reports({}),
+  other_full: F.otherLine(full, 'W'),
+  other_quick: F.otherLine(quick, 'W'),
+  other_none: F.otherLine(null, 'W'),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["quick_line"],
+        "Last check: T, quick check with custom-rf-detr-nano-3 (training run 20261111-020504-cad6). \
+         287 frames it never saw checked; 564 frames it trained on and 83 it validated on skipped \
+         (their suggestions stay as they were); rfdetr-nano at 384 px."
+    );
+    assert_eq!(
+        got["full_line"],
+        "Last check: T, 4 of 4 folds done, cancelled. 851 frames checked; rfdetr-nano at 384 px, \
+         8 epochs each."
+    );
+    assert_eq!(
+        got["quick_recall"],
+        "Recall per camera, scene and class over the 287 frames custom-rf-detr-nano-3 never saw: \
+         how often it found a labelled object"
+    );
+    assert!(
+        got["full_recall"]
+            .as_str()
+            .unwrap()
+            .contains("a fold model that never saw that camera day")
+    );
+    assert_eq!(
+        got["quick_measured"],
+        "Measured by custom-rf-detr-nano-3 on 287 frames it never saw, at its own input of 384 px: \
+         what that model finds, not what the recipe can learn; the check treated labels under 10 \
+         px at 384 as ignore regions (counted in this table only)."
+    );
+    assert!(
+        got["one"]
+            .as_str()
+            .unwrap()
+            .contains("1 frame it never saw checked")
+    );
+    // The Findings header names the newer report and says the other exists; the recall tables
+    // are the full check's whenever there is one.
+    let mode = |k: &str, part: &str| got[k][part]["mode"].clone();
+    let folds = |k: &str, part: &str| got[k][part]["folds"].clone();
+    assert_eq!(mode("both_quick_newer", "latest"), "model");
+    assert_eq!(folds("both_quick_newer", "other"), 4);
+    assert_eq!(folds("both_quick_newer", "recall"), 4);
+    assert_eq!(folds("both_full_newer", "latest"), 4);
+    assert_eq!(mode("both_full_newer", "other"), "model");
+    assert_eq!(folds("both_full_newer", "recall"), 4);
+    assert_eq!(mode("quick_only", "latest"), "model");
+    assert!(got["quick_only"]["other"].is_null());
+    assert_eq!(mode("quick_only", "recall"), "model");
+    assert_eq!(folds("full_only", "latest"), 4);
+    assert!(got["full_only"]["other"].is_null());
+    assert!(got["none"]["latest"].is_null() && got["none"]["recall"].is_null());
+    assert_eq!(
+        got["other_full"],
+        "Last full check: W (its suggestions are counted above with the others)."
+    );
+    assert_eq!(
+        got["other_quick"],
+        "Last quick check: W (its suggestions are counted above with the others)."
+    );
+    assert_eq!(got["other_none"], "");
+}
+
 /// The Findings card's line on loose labels (`RefineFloor.looseLine`): with the closer look, how
 /// many got a proposed box; without it (`--no-tighten`, the weights missing, an earlier report),
 /// that none was looked at.
@@ -2039,4 +2147,175 @@ process.stdout.write(JSON.stringify({
         got["earlier"],
         "Loose labels counted: 12 (no closer look in this check)."
     );
+}
+
+/// The Coverage card's "Where the data is thin" rules (`RefineFloor.coverageAdvice`, `coverageUrl`,
+/// `thinRecallNote` in `assets/train-refine.js`): what to do about a camera x scene row, the Review
+/// link under the page's own filters, and who the recall columns are of.
+#[test]
+fn the_thin_data_table_says_what_to_do_about_a_row() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+const ok = { reviewed: 50, persons: 60, empty: 5, empty_confirmed: 3, unreviewed_person_frames: 4, person: null };
+const row = (o) => Object.assign({}, ok, o);
+const quick = { mode: 'model', frames_checked: 287, model: { name: 'custom-1' } };
+process.stdout.write(JSON.stringify({
+  consts: [F.MIN_PERSON_BOXES, F.MIN_RECALL_BOXES, F.MISSED_RECALL_HIGH, F.VEHICLE_FRAME_SHARE],
+  fine: F.coverageAdvice(row({})),
+  // 10 reviewed frames, none empty: 2 with 5 cars each (10 vehicle boxes), 8 with a person only.
+  two_of_ten: F.coverageAdvice(row({ reviewed: 10, empty: 0, empty_confirmed: 0, vehicles: 10, vehicle_frames: 2 })),
+  nine_of_ten: F.coverageAdvice(row({ reviewed: 10, empty: 0, empty_confirmed: 0, vehicles: 9, vehicle_frames: 9 })),
+  eight_of_ten: F.coverageAdvice(row({ reviewed: 10, empty: 0, empty_confirmed: 0, vehicles: 40, vehicle_frames: 8 })),
+  few_review: F.coverageAdvice(row({ persons: 12, unreviewed_person_frames: 7 })),
+  few_one: F.coverageAdvice(row({ persons: 0, unreviewed_person_frames: 1 })),
+  few_collect: F.coverageAdvice(row({ persons: 19, unreviewed_person_frames: 0 })),
+  edge20: F.coverageAdvice(row({ persons: 20, unreviewed_person_frames: 0 })),
+  no_empty: F.coverageAdvice(row({ empty: 0, empty_confirmed: 0 })),
+  no_empty_parked: F.coverageAdvice(row({ empty: 0, empty_confirmed: 0, vehicles: 50, vehicle_frames: 50 })),
+  unticked: F.coverageAdvice(row({ empty: 4, empty_confirmed: 0 })),
+  empty_text: [F.emptyText({ empty: 14, empty_confirmed: 3 }), F.emptyText({ empty: 14, empty_confirmed: 0 }), F.emptyText({ empty: 0 })],
+  nothing_reviewed: F.coverageAdvice(row({ reviewed: 0, persons: 0, empty: 0, empty_confirmed: 0, unreviewed_person_frames: 0 })),
+  missed: F.coverageAdvice(row({ person: { boxes: 40, found: 20, recall: 0.5, low: 0.35, high: 0.65 } })),
+  edge_high: F.coverageAdvice(row({ person: { boxes: 40, found: 28, recall: 0.7, low: 0.55, high: 0.7 } })),
+  few_boxes: F.coverageAdvice(row({ person: { boxes: 19, found: 5, recall: 0.26, low: 0.1, high: 0.5 } })),
+  all_three: F.coverageAdvice(row({ persons: 5, unreviewed_person_frames: 0, empty: 0, empty_confirmed: 0,
+    person: { boxes: 25, found: 10, recall: 0.4, low: 0.2, high: 0.6 } })),
+  url: F.coverageUrl({ camera: 'back yard&1', scene: 'night' }),
+  no_report: F.thinRecallNote(null),
+  full: F.thinRecallNote({ folds: 4 }),
+  quick: F.thinRecallNote(quick),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(got["consts"], json!([20, 20, 0.7, 0.9]));
+    for k in ["fine", "edge20"] {
+        assert_eq!(got[k], "", "{k}");
+    }
+    // Vehicle frames against reviewed frames, never vehicle boxes: 2 of 10 frames with cars is the
+    // ordinary advice however many cars they hold; 9 of 10 (0.9) is a vehicle in about every frame.
+    for k in ["two_of_ten", "eight_of_ten"] {
+        assert_eq!(
+            got[k], "No empty frames: review some frames with nothing in them.",
+            "{k}"
+        );
+    }
+    assert!(
+        got["nine_of_ten"]
+            .as_str()
+            .unwrap()
+            .starts_with("No empty frames: about every frame here shows a vehicle")
+    );
+    assert_eq!(
+        got["few_review"],
+        "Few persons: review the 7 unreviewed frames with a person proposal."
+    );
+    assert_eq!(
+        got["few_one"],
+        "Few persons: review the 1 unreviewed frame with a person proposal."
+    );
+    assert_eq!(got["few_collect"], "Few persons: collect more here.");
+    assert_eq!(
+        got["no_empty"],
+        "No empty frames: review some frames with nothing in them."
+    );
+    // A camera with a vehicle in about every frame cannot have an empty one: it says so.
+    assert_eq!(
+        got["no_empty_parked"],
+        "No empty frames: about every frame here shows a vehicle, so false alerts on empty \
+         frames cannot be measured on this camera."
+    );
+    // Frames with nothing in them count whether or not they were ticked.
+    assert_eq!(got["unticked"], "");
+    assert_eq!(got["empty_text"], json!(["14 (3 confirmed)", "14", "0"]));
+    // Nothing reviewed: no "no empty frames" (nothing to look at yet); few persons stands.
+    assert_eq!(got["nothing_reviewed"], "Few persons: collect more here.");
+    assert_eq!(
+        got["missed"],
+        "Persons are missed here: check the labels and collect more."
+    );
+    // Upper bound exactly 0.7 is not under it; 19 boxes are too few to blame the labels.
+    assert_eq!(got["edge_high"], "");
+    assert_eq!(got["few_boxes"], "");
+    assert_eq!(
+        got["all_three"],
+        "Few persons: collect more here. No empty frames: review some frames with nothing in them. \
+         Persons are missed here: check the labels and collect more."
+    );
+    assert_eq!(
+        got["url"],
+        "/train/review?status=unreviewed&source=all&scene=night&camera=back%20yard%261&label=person"
+    );
+    assert_eq!(
+        got["no_report"],
+        "No check has run yet, so the recall columns show \"-\"."
+    );
+    assert!(got["full"].as_str().unwrap().starts_with(
+        "Recall per camera, scene and class: how often a fold model that never saw that camera day"
+    ));
+    assert!(
+        got["quick"].as_str().unwrap().starts_with(
+            "Recall per camera, scene and class over the 287 frames custom-1 never saw: how often it found a labelled object."
+        )
+    );
+    assert!(
+        got["quick"]
+            .as_str()
+            .unwrap()
+            .ends_with("Vehicles are car, truck, bus, van, motorcycle and bicycle together.")
+    );
+}
+
+/// The Dataset tab's line about the dataset check's open suggestions (`DatasetOpen.line` in
+/// `assets/train-dataset.js`, from the counts of `GET /v1/refine`): the sentence when something is
+/// open, nothing otherwise.
+#[test]
+fn the_export_card_warns_about_open_suggestions_and_is_silent_without() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.dataset);
+const L = globalThis.DatasetOpen.line;
+const text = (o) => { const p = L(o); return p && (p.before + p.link + p.after); };
+process.stdout.write(JSON.stringify({
+  many: text({ add: 12, verify: 5, relabel: 3, tighten: 7, frames: 20 }),
+  one: text({ add: 1, verify: 0, relabel: 0, tighten: 0, frames: 1 }),
+  link: L({ add: 1, frames: 1 }).link,
+  older: text({ add: 2, verify: 1, relabel: 0, frames: 3 }),
+  none: L({ add: 0, verify: 0, relabel: 0, tighten: 0, frames: 0 }),
+  nothing: L(null),
+}));
+"#;
+    let dataset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-dataset.js");
+    let got = node_with(driver, &json!({"dataset": dataset}));
+    assert_eq!(
+        got["many"],
+        "The dataset check has 27 open suggestions (12 missing boxes, 5 labels to verify, 3 other class, 7 better boxes) on 20 frames. \
+         An export uses the labels as they are: answer them on the Refine tab first, or export anyway."
+    );
+    assert_eq!(
+        got["one"],
+        "The dataset check has 1 open suggestion (1 missing boxes, 0 labels to verify, 0 other class, 0 better boxes) on 1 frame. \
+         An export uses the labels as they are: answer them on the Refine tab first, or export anyway."
+    );
+    assert_eq!(got["link"], "Refine tab");
+    assert!(
+        got["older"]
+            .as_str()
+            .unwrap()
+            .contains("(2 missing boxes, 1 labels to verify, 0 other class, 0 better boxes)"),
+        "an answer without tighten counts 0"
+    );
+    assert!(got["none"].is_null() && got["nothing"].is_null());
 }

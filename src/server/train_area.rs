@@ -712,6 +712,24 @@ struct DatasetTabTemplate {
     coverage_cameras: Vec<String>,
     coverage_other: bool,
     coverage_scenes: [&'static str; 3],
+    /// "Size floor: ..." when `collect.size_floor` is saved: the export leaves such objects out.
+    size_floor_line: Option<String>,
+}
+
+/// The export card's line about the saved size floor (`collect.size_floor`): an export writes the
+/// objects under it as ignore regions (X-AnyLabeling keeps them as boxes). None for no floor or
+/// one that is off. The pixels print as the Refine tab prints them (`RefineFloor.phrase`): two
+/// decimals at most, the f32's tail dropped.
+fn size_floor_line(floor: Option<crate::collect::labels::SizeFloor>) -> Option<String> {
+    let f = floor.filter(crate::collect::labels::SizeFloor::is_on)?;
+    let px = format!("{:.2}", f.px);
+    let px = px.trim_end_matches('0').trim_end_matches('.');
+    Some(format!(
+        "Size floor: objects under {px} px at {} are exported as ignore regions (out of the YOLO \
+         labels, listed in ignore.json, marked difficult in COCO), while the X-AnyLabeling format \
+         keeps them as boxes.",
+        f.input
+    ))
 }
 
 /// `GET /train/dataset`.
@@ -747,6 +765,7 @@ pub(super) async fn dataset_page(State(state): State<Arc<AppState>>) -> Response
             coverage_cameras: cameras,
             coverage_other: other,
             coverage_scenes: SCENES,
+            size_floor_line: size_floor_line(config.collect.size_floor),
         })
     })
     .await
@@ -1144,6 +1163,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_size_floor_line_names_the_floor_or_is_absent() {
+        use crate::collect::labels::SizeFloor;
+        let line = |px: f32, input: u32| size_floor_line(Some(SizeFloor { px, input }));
+        assert_eq!(
+            line(10.0, 384).as_deref(),
+            Some(
+                "Size floor: objects under 10 px at 384 are exported as ignore regions (out of the \
+                 YOLO labels, listed in ignore.json, marked difficult in COCO), while the \
+                 X-AnyLabeling format keeps them as boxes."
+            )
+        );
+        // The f32's tail is dropped, as the Refine tab prints it.
+        assert!(line(7.3, 640).unwrap().contains("under 7.3 px at 640"));
+        assert!(line(7.25, 640).unwrap().contains("under 7.25 px at 640"));
+        assert_eq!(size_floor_line(None), None);
+        assert_eq!(line(0.0, 384), None, "a floor that is off says nothing");
+        assert_eq!(line(10.0, 0), None);
+    }
+
+    #[tokio::test]
+    async fn the_export_card_has_the_open_suggestions_line_and_the_saved_floor() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let (s, html) = get_text(&state, "/train/dataset").await;
+        assert_eq!(s, StatusCode::OK);
+        // The line is there for the script to fill, hidden, before the Export button; no floor,
+        // no floor line.
+        let open = html.find("id=\"export-open\"").expect("open line");
+        let button = html
+            .find("<button type=\"submit\">Export</button>")
+            .unwrap();
+        assert!(open < button);
+        assert!(html[open..button].contains("hidden"));
+        assert!(!html.contains("id=\"export-size-floor\""));
+        assert!(!html.contains("Size floor:"));
+        // A saved floor shows, before the button too.
+        let dir2 = scratch();
+        let state = {
+            let dir = dir2.clone();
+            test_state_with(move |c| {
+                c.download_dir = Some(dir.clone());
+                c.collect.dir = Some(dir.join("dataset"));
+                c.training.dir = Some(dir.join("training"));
+                c.collect.size_floor = Some(crate::collect::labels::SizeFloor {
+                    px: 10.0,
+                    input: 384,
+                });
+            })
+        };
+        let (_, html) = get_text(&state, "/train/dataset").await;
+        let at = html.find("id=\"export-size-floor\"").expect("floor line");
+        let button = html
+            .find("<button type=\"submit\">Export</button>")
+            .unwrap();
+        assert!(at < button);
+        assert!(html.contains(
+            "Size floor: objects under 10 px at 384 are exported as ignore regions (out of the \
+             YOLO labels, listed in ignore.json, marked difficult in COCO), while the \
+             X-AnyLabeling format keeps them as boxes."
+        ));
+        assert!(html.contains("/static/train-dataset.js?v="));
+    }
     async fn status_and_location(state: &Arc<AppState>, url: &str) -> (StatusCode, String) {
         let (s, h, _) = call(state, Request::get(url).body(Body::empty()).unwrap()).await;
         let at = h

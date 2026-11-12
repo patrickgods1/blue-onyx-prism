@@ -57,6 +57,17 @@
 //! size table, where it counts with [`BoxFact::under_floor`]), while it still covers detections of
 //! its object in step 4 (no add lands on it). The fold models themselves train on every label
 //! (their exports apply no floor), so the size table measures what the recipe can find.
+//!
+//! **A quick check** ([`Context::model`], [`super::quick`]) applies the same rules with a model the
+//! user trained instead of a fold model, on frames it never trained or validated on: `imgsz` is its
+//! input size, `class_boxes` what its run trained on, and a wanted class it does not have
+//! ([`ModelJudge::classes`]) gets no `verify` (step 5), its labels are no `relabel` target (step 6)
+//! and stay out of the recall (its detections of other classes cannot say the label is wrong; its
+//! silence is no miss), and such a label covers a detection of any class in step 4 at IoU >=
+//! [`UNKNOWN_CLASS_COVER_IOU`] (the model names the object it cannot name by another class: no
+//! second box on it; a smaller object inside or beside the box is still an add). Every `why`
+//! names the model instead of "a model that never saw this camera-day": it may well have trained
+//! on other frames of that camera-day.
 
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::overlaps::Det as ZoomDet;
@@ -88,6 +99,10 @@ pub const GOOD_IOU: f32 = 0.75;
 /// Score from which an unmatched detection is proposed as a missing box: below it fold models
 /// guess too often for a reviewer's time.
 pub const ADD_SCORE: f32 = 0.5;
+/// IoU from which a label of a wanted class a quick check's model does not have explains a
+/// detection of another class (rule 4): the model names that box's object by a class it has, so the
+/// detection is about the same box; a person standing in front of a labelled truck is not.
+pub const UNKNOWN_CLASS_COVER_IOU: f32 = 0.5;
 /// Score from which an unmatched detection at a static spot is proposed as a missing box (rule 4):
 /// labels at the place on other days make a weaker find worth a look.
 pub const ADD_SCORE_AT_SPOT: f32 = 0.3;
@@ -151,14 +166,28 @@ pub struct FrameInput<'a> {
     pub day: &'a str,
 }
 
+/// The model of a quick check ([`super::quick`]) as the judge needs it: its name for the `why` of
+/// its suggestions and the wanted classes it has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelJudge {
+    /// The configured model's name.
+    pub name: String,
+    /// Its classes in the class list's spelling ([`Wanted::class_of`] of each), hidden ones too.
+    /// A wanted class it does not have: its labels get no `verify` and no `relabel` (the model
+    /// cannot see the class, so its silence or another class's detection on such a label says
+    /// nothing about it), and are not in the recall.
+    pub classes: std::collections::BTreeSet<String>,
+}
+
 /// What every frame of a check shares.
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
     pub wanted: &'a Wanted<'a>,
-    /// The fold models' input size.
+    /// The fold models' input size; a quick check's model's own.
     pub imgsz: u32,
     /// Training boxes per class (the list's spelling) of the frames the fold model trained on
-    /// (the selection without the fold's frames: [`super::class_boxes`]), ignore regions left out.
+    /// (the selection without the fold's frames: [`super::class_boxes`]), ignore regions left out;
+    /// for a quick check, what its model's run trained on (its `dataset.json`).
     pub class_boxes: &'a BTreeMap<String, usize>,
     /// The check's id ([`Suggestion::run`]).
     pub run: &'a str,
@@ -168,6 +197,24 @@ pub struct Context<'a> {
     /// the Review page apply it) is an ignore region here, and nothing under it is suggested; the
     /// noise rule of [`FLOOR_PX`] at `imgsz` holds as well (see [`judge`]).
     pub floor: Option<SizeFloor>,
+    /// A quick check's model; None: the fold models (each never saw the frame's camera-day).
+    pub model: Option<&'a ModelJudge>,
+}
+
+impl Context<'_> {
+    /// Who looked, as the `why` of a suggestion starts: `a model that never saw this camera-day`,
+    /// or `<model> (never trained on this frame)`.
+    fn who(&self) -> String {
+        match self.model {
+            None => "a model that never saw this camera-day".into(),
+            Some(m) => format!("{} (never trained on this frame)", m.name),
+        }
+    }
+
+    /// Whether the judging model has `class` (a wanted class): fold models have every one.
+    fn knows(&self, class: &str) -> bool {
+        self.model.is_none_or(|m| m.classes.contains(class))
+    }
 }
 
 /// A training box as the report's recall counts it.
@@ -415,7 +462,8 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     // (the recall by size is what a floor is chosen from; the others leave out those under it).
     let (found, _) = matching(&dets, &all_train, FOUND_IOU, FOUND_SCORE);
     for (t, hit) in all_train.iter().zip(&found) {
-        if let Some(class) = &t.class {
+        // A class the quick check's model does not have is no miss of it.
+        if let Some(class) = t.class.as_ref().filter(|c| ctx.knows(c)) {
             out.boxes.push(BoxFact {
                 class: class.clone(),
                 short_px: size(&t.b.bbox),
@@ -456,7 +504,8 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     // 6. Another class (before the adds: its detection is no add).
     for (ti, t) in train.iter().enumerate() {
         let Some(class) = &t.class else { continue };
-        if t.b.source == Source::Human || t.b.model_label.is_some() {
+        // A model without the label's class cannot say it is another one.
+        if t.b.source == Source::Human || t.b.model_label.is_some() || !ctx.knows(class) {
             continue;
         }
         let sees_it = dets.iter().any(|d| {
@@ -493,9 +542,10 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
                     Kind::Relabel,
                     ctx.run,
                     format!(
-                        "a model that never saw this camera-day sees a {} here, score {:.2}, \
-                         and no {class}",
-                        d.class, d.score
+                        "{} sees a {} here, score {:.2}, and no {class}",
+                        ctx.who(),
+                        d.class,
+                        d.score
                     ),
                 )
             });
@@ -516,8 +566,12 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         }
         let covered = f.boxes.iter().any(|b| {
             (b.state != BoxState::Rejected || b.is_ignore())
-                && same_object(&key_of(&b.label, wanted), &d.key)
-                && covers(&b.bbox, &d.bbox)
+                && ((same_object(&key_of(&b.label, wanted), &d.key) && covers(&b.bbox, &d.bbox))
+                    // A quick check's model calls an object of a class it does not have by
+                    // another name: a label of such a class explains a detection on that same
+                    // box, never a smaller object in or beside it.
+                    || (wanted.class_of(&b.label).is_some_and(|c| !ctx.knows(c))
+                        && iou(&b.bbox, &d.bbox) >= UNKNOWN_CLASS_COVER_IOU))
         });
         let blocked = f.boxes.iter().any(|b| {
             b.state == BoxState::Rejected
@@ -546,9 +600,10 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
                     format!("a {label}")
                 };
                 let why = format!(
-                    "a {at_spot} is labelled at this place on {} other frames of this camera; a \
-                     model that never saw this camera-day found {found} here, score {:.2}",
+                    "a {at_spot} is labelled at this place on {} other frames of this camera; {} \
+                     found {found} here, score {:.2}",
                     s.frames_without(frame.day),
+                    ctx.who(),
                     d.score
                 );
                 (label, why, Some(s.id.clone()))
@@ -556,8 +611,10 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             None => (
                 d.class.clone(),
                 format!(
-                    "a model that never saw this camera-day found a {} here, score {:.2}",
-                    d.class, d.score
+                    "{} found a {} here, score {:.2}",
+                    ctx.who(),
+                    d.class,
+                    d.score
                 ),
                 None,
             ),
@@ -577,6 +634,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             || relabelled.get(ti).copied().unwrap_or(false)
             || t.b.source == Source::Human
             || t.b.orig_bbox.is_some()
+            || !ctx.knows(class)
             || ctx.class_boxes.get(class).copied().unwrap_or(0) < MIN_CLASS_BOXES
             || small(&t.b.bbox)
         {
@@ -588,14 +646,14 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         if seen {
             continue;
         }
+        let why = match ctx.model {
+            None => format!("no model that never saw this camera-day found this {class}"),
+            Some(_) => format!("{} did not find this {class}", ctx.who()),
+        };
         found_list.push(Suggestion {
             target: Some(t.b.bbox),
             target_label: Some(t.b.label.clone()),
-            ..suggestion(
-                Kind::Verify,
-                ctx.run,
-                format!("no model that never saw this camera-day found this {class}"),
-            )
+            ..suggestion(Kind::Verify, ctx.run, why)
         });
     }
     // 7. Only what a reviewer would see.
@@ -848,10 +906,14 @@ pub fn tighten_verdict(
             Kind::Tighten,
             ctx.run,
             format!(
-                "a model that never saw this camera-day (score {:.2}) and a closer look by a \
-                 larger model (score {z_score:.2}) both put this {} here; the label overlaps \
-                 that box at IoU {lz:.2}",
-                c.det_score, c.class
+                "{} (score {:.2}) and a closer look by a larger model (score {z_score:.2}) both \
+                 put this {} here; the label overlaps that box at IoU {lz:.2}",
+                match ctx.model {
+                    None => "a model that never saw this camera-day".to_string(),
+                    Some(m) => format!("{}, which never trained on this frame", m.name),
+                },
+                c.det_score,
+                c.class
             ),
         )
     };
@@ -932,6 +994,7 @@ mod tests {
             hidden: &[],
         };
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: counts,
@@ -976,6 +1039,127 @@ mod tests {
     const FAR: [f32; 4] = [400.0, 300.0, 460.0, 400.0];
     /// IoU with [`CAR`] = 0.5 (a loose label of it).
     const LOOSE: [f32; 4] = [100.0, 100.0, 300.0, 180.0];
+
+    /// Judge `f` with `dets` as a quick check's model `mine` that has `has` of [`classes`].
+    fn run_model(f: &LabelFile, dets: &[Det], has: &[&str]) -> Judged {
+        let c = classes();
+        let w = Wanted {
+            classes: &c,
+            hidden: &[],
+        };
+        let m = ModelJudge {
+            name: "mine".into(),
+            classes: has.iter().map(|s| s.to_string()).collect(),
+        };
+        let counts = many();
+        let ctx = Context {
+            model: Some(&m),
+            wanted: &w,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "q1",
+            spots: None,
+            floor: None,
+        };
+        judge(
+            &FrameInput {
+                file: f,
+                width: 640,
+                height: 480,
+                dets,
+                camera: "cam",
+                day: "2026-10-01",
+            },
+            &ctx,
+        )
+    }
+
+    #[test]
+    fn a_quick_checks_model_names_itself_and_says_nothing_of_classes_it_lacks() {
+        // With every class: the same findings as a fold model, in the model's words.
+        let f = reviewed(vec![acc("car", CAR), acc("person", FAR)]);
+        let all = ["person", "car", "truck", "dog"];
+        let j = run_model(&f, &[det("person", [10.0, 10.0, 60.0, 120.0], 0.9)], &all);
+        assert_eq!(kinds(&j), [Kind::Add, Kind::Verify, Kind::Verify], "{j:?}");
+        assert_eq!(
+            j.suggestions[0].why,
+            "mine (never trained on this frame) found a person here, score 0.90"
+        );
+        assert_eq!(
+            j.suggestions[1].why,
+            "mine (never trained on this frame) did not find this car"
+        );
+        assert!(j.suggestions.iter().all(|s| s.run == "q1"));
+        assert_eq!(j.boxes.len(), 2);
+        // A dog label the fold models would relabel as a person ...
+        let dog = reviewed(vec![acc("dog", CAR)]);
+        let person_on_it = [det("person", NEAR, 0.95)];
+        let folds = run(&dog, &person_on_it);
+        assert_eq!(kinds(&folds), [Kind::Relabel], "{folds:?}");
+        // ... is no relabel for a model without dogs, nor an add of a person on top of it, nor a
+        // verify (its silence on a dog is no miss), and not in the recall.
+        let j = run_model(&dog, &person_on_it, &["person", "car", "truck"]);
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        assert!(j.boxes.is_empty(), "{j:?}");
+        let j = run_model(&dog, &[], &["person", "car", "truck"]);
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        // Elsewhere on the frame its person is still an add.
+        let j = run_model(
+            &dog,
+            &[det("person", FAR, 0.9)],
+            &["person", "car", "truck"],
+        );
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+        // A model with dogs but no persons: the relabel needs the label's class only.
+        let j = run_model(&dog, &person_on_it, &["dog"]);
+        assert_eq!(kinds(&j), [Kind::Relabel], "{j:?}");
+        assert!(
+            j.suggestions[0]
+                .why
+                .starts_with("mine (never trained on this frame) sees a person here"),
+            "{j:?}"
+        );
+    }
+
+    #[test]
+    fn a_label_of_a_class_the_model_lacks_hides_only_a_detection_of_its_own_box() {
+        // A model of person and car; the list also wants truck and dog.
+        let has = ["person", "car"];
+        let truck = [100.0, 50.0, 500.0, 400.0];
+        // A person standing in front of the truck: wholly inside its box, IoU small.
+        let person = [150.0, 150.0, 200.0, 300.0];
+        assert!(iou(&truck, &person) < 0.1 && inside_share(&person, &truck) > 0.99);
+        let f = reviewed(vec![acc("truck", truck)]);
+        let j = run_model(&f, &[det("person", person, 0.9)], &has);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+        assert_eq!(j.suggestions[0].label.as_deref(), Some("person"));
+        // The same for an unsure (ignore) region of such a class.
+        let mut unsure = acc("truck", truck);
+        unsure.difficult = true;
+        let j = run_model(&reviewed(vec![unsure]), &[det("person", person, 0.9)], &has);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+        // A detection about a dog label's own box (the model, without dogs, calls it a person):
+        // no add, on a label or an unsure region alike.
+        let dog = [100.0, 50.0, 500.0, 400.0];
+        let on_it = [110.0, 60.0, 500.0, 400.0];
+        assert!(iou(&dog, &on_it) >= 0.9);
+        let d = reviewed(vec![acc("dog", dog)]);
+        let j = run_model(&d, &[det("person", on_it, 0.9)], &has);
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        let mut unsure_dog = acc("dog", dog);
+        unsure_dog.difficult = true;
+        let j = run_model(
+            &reviewed(vec![unsure_dog]),
+            &[det("person", on_it, 0.9)],
+            &has,
+        );
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        // Under the cut (although half of it and more lies inside the dog's box): another object.
+        let part = [100.0, 50.0, 290.0, 400.0];
+        assert!(iou(&dog, &part) < UNKNOWN_CLASS_COVER_IOU && covers(&dog, &part));
+        let j = run_model(&d, &[det("person", part, 0.9)], &has);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+    }
 
     #[test]
     fn a_good_match_gives_nothing_and_counts_as_found() {
@@ -1424,6 +1608,7 @@ mod tests {
         };
         let counts = many();
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: &counts,
@@ -1493,6 +1678,7 @@ mod tests {
         };
         let counts = many();
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: &counts,
@@ -1544,6 +1730,7 @@ mod tests {
         };
         let counts = many();
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: &counts,
@@ -1732,6 +1919,7 @@ mod tests {
         let counts = many();
         let ok = car_spot(12, 0);
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: &counts,
@@ -1789,6 +1977,7 @@ mod tests {
         };
         let counts = many();
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: &counts,
@@ -1906,6 +2095,7 @@ mod tests {
         };
         let counts = many();
         let ctx = Context {
+            model: None,
             wanted: &w,
             imgsz: 640,
             class_boxes: &counts,
