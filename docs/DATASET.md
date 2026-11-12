@@ -455,7 +455,13 @@ folder; the collector and the Collect tab keep `collect.dir`.
 - **`overlaps_checked`** (written only when true): the reviewer saved the frame as reviewed with stacked
   or overlapping boxes still on it, so they looked and kept them (two real nested cars). `auto=overlaps`
   passes the frame over and `POST /v1/review/reject-stacked` leaves it alone. Kept by saves; cleared when
-  a merge adds a box.
+  a merge adds a box. The Review page decides it on every reviewed save: true when a stack or an
+  overlapping pair is left, whatever made it on that visit (a box drawn, moved or relabelled by hand, or
+  an accepted `refine` suggestion, whose accept alone ends the flag on the file). That is sound because
+  the save is the look: the page marks every pair it holds (the `dup` / `overlap` chips, "Overlap: a+b" in
+  the progress line, "Overlaps box N" with `u` on the selected box), and the save's check pass steps
+  through every decided box not looked at on that visit, so the partner of a new pair is shown before the
+  save unless the reviewer looked at it already or saves again past the check.
 - **`checked_before_reopen`** (written only when true): a rerun's new box took `overlaps_checked` off this
   frame. `POST /v1/review/restore-reopened` gives it back; a restore, a save or an accept-spot of a new box
   clears this field.
@@ -476,7 +482,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
   `kept_score`: the zoom's score on the kept box; `other_score`: the best other detection on the box to
   drop, 0 if none (`two_objects`: the zoom's scores on `a` and `b`). `low_confidence`: the zoom gave no
   answer, so only the witnesses speak. `weak`: `other_score` >= 0.3, where 6 of 17 judged drops removed a
-  real object; the page warns. Kept by saves, merges, X-AnyLabeling imports and every bulk edit.
+  real object; the page warns. Kept by saves, merges, X-AnyLabeling imports and every bulk edit; a save
+  whose body has no `overlap_suggestions` key keeps the stored list (a key that is there, `[]` too, is
+  the client's list).
 - **`refine`** (written only when not empty, at most 64): what the dataset check (`train refine`,
   [Dataset check](TRAINING.md#dataset-check-cross-check)) suggests. Suggestions only: the check changes no
   box, status or `reviewed_at`, and nothing but this list.
@@ -521,7 +529,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
   and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
   (`add`, `verify`, `relabel`); answered ones and other kinds stay, and when nothing changed the file is not
   written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
-  frame first). Kept by saves. A build from before the dataset check ignores the field
+  frame first). Kept by saves: a save (`POST /v1/review/labels`) whose body has no `refine` key keeps
+  the stored list with its answers (a script or client that rebuilds the file from the boxes); a key that
+  is there, `[]` too, is the client's list (the page always sends it). A build from before the dataset check ignores the field
   and drops it when it rewrites the file; the list is rebuildable by running the check again (answers are
   lost with it).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the

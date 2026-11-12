@@ -1,6 +1,7 @@
 // Refine tab (/train/refine): starts the dataset check and shows what it found. The Check card
 // previews (GET /v1/refine/preview) and starts (POST /v1/refine/check) a check and follows it
-// through PrismPoll on GET /v1/train/jobs?tasks=busy, with Pause / Resume / Cancel posted to the
+// through PrismPoll on GET /v1/train/jobs?tasks=busy (every 3 s while one is listed, every 30 s
+// while none is, so a check started elsewhere shows up), with Pause / Resume / Cancel posted to the
 // queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (the report, the
 // open suggestions per kind) and read again when a check ends. The check changes no box, so
 // nothing here confirms a box: Review does. The one question asked here is whether a start may
@@ -210,17 +211,29 @@
   var jobId = null;
   var parts = null;
 
-  function post(path, id) {
+  // Pause / Resume / Cancel. A refusal or a network error is said; the job row follows the queue
+  // either way (the next poll shows what the queue did).
+  function post(path, id, what) {
     return fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'text/html' },
       body: 'id=' + encodeURIComponent(id) + '&tab=refine'
+    }).then(function (r) {
+      if (!r.ok) say(what + ' did not go through (HTTP ' + r.status + '). Try again, or see the Jobs tab.', true);
+    }, function (e) {
+      say(what + ' was not sent: ' + ((e && e.message) || 'the network failed') + '. Try again.', true);
     }).then(function () { poller.kick(); });
   }
   function button(label, cls, run) {
     var b = el('button', cls, label);
     b.type = 'button';
-    b.addEventListener('click', function () { b.disabled = true; run().then(function () { b.disabled = false; }); });
+    var enable = function () { b.disabled = false; };
+    b.addEventListener('click', function () {
+      b.disabled = true;
+      var p;
+      try { p = Promise.resolve(run()); } catch (e) { p = Promise.reject(e); }
+      p.then(enable, function (e) { enable(); say((e && e.message) || String(e), true); });
+    });
     return b;
   }
 
@@ -240,11 +253,11 @@
     var detail = el('p', 'muted small', '');
     var time = el('p', 'muted small', '');
     var bar = el('div', 'inline-row');
-    var pause = button('Pause', 'small', function () { return post('/training/pause', j.id); });
-    var resume = button('Resume', 'small', function () { return post('/training/resume', j.id); });
+    var pause = button('Pause', 'small', function () { return post('/training/pause', j.id, 'Pause'); });
+    var resume = button('Resume', 'small', function () { return post('/training/resume', j.id, 'Resume'); });
     var cancel = button('Cancel', 'small danger', function () {
       if (!window.confirm('Cancel the check? Folds that finished keep their suggestions.')) return Promise.resolve();
-      return post('/training/cancel', j.id);
+      return post('/training/cancel', j.id, 'Cancel');
     });
     [pause, resume, cancel].forEach(function (b) { bar.appendChild(b); });
     [head, progress, detail, time, bar].forEach(function (n) { row.appendChild(n); });
@@ -295,6 +308,18 @@
       });
   }
   var poller = window.PrismPoll.create({ run: follow, period: 3000, more: function (again) { return again; } });
+  // The 3 s poll parks itself when no check is listed. While it is parked, one cheap read every
+  // 30 s (none while the tab is hidden), so a check started from another tab or the CLI shows
+  // without a reload; finding one hands it back to the 3 s poll. Its first run is the page's own
+  // load (GET /v1/refine carries the check), so it starts with a wait.
+  var idleRuns = 0;
+  window.PrismPoll.create({
+    period: 30000,
+    run: function () {
+      if (idleRuns++ === 0 || !poller.state().parked) return null;
+      return follow().then(function () { if (jobId !== null) poller.kick(); });
+    }
+  }).start();
 
   // ---- findings and coverage
 

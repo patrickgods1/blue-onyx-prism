@@ -1117,8 +1117,10 @@ console.log(JSON.stringify({
 "#;
 
 /// One entry of `refine_live` (`GET /v1/review/labels`) and of `liveRefine`, numbers as the f32
-/// they are in the file.
+/// they are in the file. Every field named: [`same_fields`] holds the key sets equal, so a field
+/// renamed or dropped on either side fails rather than reading as null.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RefineLive {
     index: usize,
     kind: String,
@@ -1134,28 +1136,30 @@ struct RefineLive {
     replaces: Vec<usize>,
 }
 
-/// [`refine::live`] as the route serves it (`server::review::refine_live`, field for field).
+/// [`refine::live`] as the route serves it: [`refine::live_json`], the builder
+/// `GET /v1/review/labels` calls for `refine_live`.
 fn rust_refine_live(f: &LabelFile, w: Option<&Wanted<'_>>) -> Vec<RefineLive> {
-    refine::live(f, w)
-        .iter()
-        .map(|l| {
-            let s = l.suggestion;
-            RefineLive {
-                index: l.index,
-                kind: s.kind.as_str().to_string(),
-                target: s.target,
-                target_label: s.target_label.clone(),
-                bbox: s.bbox,
-                label: s.label.clone(),
-                score: s.score,
-                why: s.why.clone(),
-                spot: s.spot.clone(),
-                run: s.run.clone(),
-                target_box: l.target,
-                replaces: l.replaces.clone(),
-            }
-        })
-        .collect()
+    serde_json::from_value(Value::Array(refine::live_json(f, w))).unwrap()
+}
+
+/// The keys of each entry of `refine_live` for `f` equal those of the page's `liveRefine`
+/// (`js`), entry by entry.
+fn same_fields(f: &LabelFile, w: Option<&Wanted<'_>>, js: &Value, what: &str) {
+    let keys = |v: &Value| -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    let route = refine::live_json(f, w);
+    let page = js.as_array().unwrap();
+    assert_eq!(route.len(), page.len(), "{what}");
+    for (r, p) in route.iter().zip(page) {
+        assert_eq!(
+            keys(r),
+            keys(p),
+            "{what}: the fields of refine_live and liveRefine"
+        );
+    }
 }
 
 fn js_refine_live(v: &Value) -> Vec<RefineLive> {
@@ -1440,6 +1444,7 @@ fn the_refine_rules_agree_with_their_rust_twins() {
         let w = wanted.then_some(&w);
         let live = rust_refine_live(f, w);
         assert_eq!(js_refine_live(&a["live"]), live, "frame {n}: live {f:?}");
+        same_fields(f, w, &a["live"], &format!("frame {n}"));
         let strengths: Vec<u32> = f.refine.iter().map(refine::strength).collect();
         assert_eq!(
             a["strengths"],

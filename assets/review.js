@@ -642,12 +642,12 @@
     return !!f && (f.mark >= 0 ? selected === f.mark : selected < 0);
   }
 
-  // What key `y` or `w` acts on now (R.suggestionKey).
-  function suggestionRoute(key) {
-    if (!cur) return key === 'y' ? 'overlap' : 'none';
+  // What key `y` or `w` acts on now (R.suggestionKey); `repeat`: the key is held down.
+  function suggestionRoute(key, repeat) {
+    if (!cur) return R.suggestionKey(key, false, null, repeat);
     dups = dupGroups();
     suggestions = liveSuggestions();
-    return R.suggestionKey(key, suggestions.length > 0, currentRefine());
+    return R.suggestionKey(key, suggestions.length > 0, currentRefine(), repeat);
   }
 
   // `y` (yes) / `w` (no) on the current suggestion, one undo step (R.answerRefine). Then the next
@@ -3568,9 +3568,10 @@
     body.classes_version = cur.labels.classes_version || '';
     // Stacks or overlaps still there after the save: the reviewer looked and kept them, so
     // auto=overlaps and the bulk reject leave the frame alone (as saved: hints go to rejected).
+    // Whatever made a pair on this visit, an accepted dataset check suggestion too
+    // (R.overlapsCheckedOnSave says why the save is the look).
     if (status === 'reviewed') {
-      var left = dupGroups(body.boxes.map(function (b) { return Object.assign({}, b, { state: resolved(b) }); }));
-      if (left.groups.length || left.overlaps.length) body.overlaps_checked = true;
+      if (R.overlapsCheckedOnSave(body.boxes, classes, hiddenClasses)) body.overlaps_checked = true;
       else delete body.overlaps_checked;
     }
     var note = dropped.length ? ' Rejected ' + dropped.length + ' pending stacked duplicate(s).' : '';
@@ -3949,9 +3950,14 @@
     else if (k === 't') parkSelected();
     else if (k === 'u') { if (ev.shiftKey) rejectDuplicates(); else rejectDupSelected(); }
     // `y`: the overlap suggestion on screen, else the dataset check's (R.suggestionKey); `w`: no
-    // to the dataset check's, else nothing (the key stays the browser's).
-    else if (k === 'y') { if (suggestionRoute('y') === 'accept') answerRefine(true); else acceptOverlap(); }
-    else if (k === 'w') { if (suggestionRoute('w') === 'dismiss') answerRefine(false); else handled = false; }
+    // to the dataset check's, else nothing (the key stays the browser's). Once per press: a held
+    // key ('held') answers nothing more.
+    else if (k === 'y' || k === 'w') {
+      var route = suggestionRoute(k, ev.repeat);
+      if (route === 'accept' || route === 'dismiss') answerRefine(route === 'accept');
+      else if (route === 'overlap') acceptOverlap();
+      else if (route === 'none') handled = false;
+    }
     else if (k === 'c') { if (!ev.shiftKey) acceptLikely(); }
     else if (k === 'i') toggleDismissed();
     else if (k === '?') openKeys();

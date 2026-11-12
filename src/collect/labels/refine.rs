@@ -304,6 +304,35 @@ pub fn live<'a>(f: &'a LabelFile, wanted: Option<&Wanted<'_>>) -> Vec<Live<'a>> 
         .collect()
 }
 
+/// [`live`] as `refine_live` of `GET /v1/review/labels` serves it, one object per suggestion:
+/// `index` (into [`LabelFile::refine`]), the suggestion's own fields (`kind`, `target`,
+/// `target_label`, `bbox`, `label`, `score`, `why`, `spot`, `run`; absent ones null),
+/// `target_box` (the box `target` names, null for an add) and `replaces` (the unjudged rejects an
+/// add takes the place of), indices into the frame's boxes. The page's `liveRefine`
+/// (`assets/review-rules.js`) answers the same for the same file (`tests/it/js_rules.rs`).
+pub fn live_json(f: &LabelFile, wanted: Option<&Wanted<'_>>) -> Vec<serde_json::Value> {
+    live(f, wanted)
+        .iter()
+        .map(|l| {
+            let s = l.suggestion;
+            serde_json::json!({
+                "index": l.index,
+                "kind": s.kind.as_str(),
+                "target": s.target,
+                "target_label": s.target_label,
+                "bbox": s.bbox,
+                "label": s.label,
+                "score": s.score,
+                "why": s.why,
+                "spot": s.spot,
+                "run": s.run,
+                "target_box": l.target,
+                "replaces": l.replaces,
+            })
+        })
+        .collect()
+}
+
 /// How strong a suggestion is, higher first; 0 for an answered one or one of an unknown kind. The
 /// band by kind (add 4, relabel 3, tighten 2, verify 1), then the score:
 /// `band * 1000 + round(score * 999)`.

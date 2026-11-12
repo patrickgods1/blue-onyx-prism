@@ -55,7 +55,29 @@ console.log(JSON.stringify(req.map((r) => {
     }
     return out;
   }
-  if (r.op === 'key') return R.suggestionKey(r.key, r.overlap, r.refine ? {} : null);
+  if (r.op === 'key') return R.suggestionKey(r.key, r.overlap, r.refine ? {} : null, !!r.repeat);
+  if (r.op === 'pair_on_save') {
+    // A pair made on this visit: by a yes to dataset check suggestion `answer`, by the page's own
+    // edits (`edits`) or by a box drawn by hand (`draw`). What the page shows of it and what a
+    // reviewed save records (assets/review.js `save`).
+    const labels = clone(r.labels);
+    if (r.answer != null) {
+      const l = R.liveRefine(labels, r.classes, r.hidden).find((x) => x.index === r.answer);
+      if (!R.answerRefine(labels, l, true, r.classes, r.hidden).ok) throw new Error('not answered');
+    }
+    (r.edits || []).forEach((e) => edit(labels, e));
+    if (r.draw) labels.boxes.push(Object.assign({ source: 'human', state: 'added', _checked: true }, r.draw));
+    const dups = R.dupGroups(labels.boxes, r.classes, r.hidden);
+    const toCheck = [];
+    labels.boxes.forEach((b, i) => { if (b.state !== 'pending' && !b._checked) toCheck.push(i); });
+    return {
+      file_flag: !!labels.overlaps_checked,
+      overlaps: dups.overlaps,
+      near: dups.near,
+      to_check: toCheck,
+      on_save: R.overlapsCheckedOnSave(saved(clone(labels)).boxes, r.classes, r.hidden),
+    };
+  }
   if (r.op === 'live') {
     const labels = clone(r.labels);
     (r.edits || []).forEach((e) => edit(labels, e));
@@ -260,6 +282,90 @@ fn y_stays_with_an_overlap_and_w_only_answers_the_check() {
     for (c, g) in cases.iter().zip(&got) {
         assert_eq!(g, c.3, "{c:?}");
     }
+}
+
+/// A held `y` or `w` (the keydown's auto-repeat) answers nothing more: each answer is remembered,
+/// so holding `w` must not dismiss every suggestion of the frame. The first press is unchanged.
+#[test]
+fn a_held_y_or_w_answers_once() {
+    if !have_node() {
+        return;
+    }
+    let cases = [
+        ("y", false, true, false, "accept"),
+        ("y", false, true, true, "held"),
+        ("w", false, true, false, "dismiss"),
+        ("w", false, true, true, "held"),
+        // The overlap suggestion's `y` too, and `y` with nothing on screen.
+        ("y", true, false, false, "overlap"),
+        ("y", true, false, true, "held"),
+        ("y", false, false, true, "held"),
+        // A key that does nothing stays nothing.
+        ("w", false, false, true, "none"),
+        ("a", false, true, true, "none"),
+    ];
+    let req: Vec<Value> = cases
+        .iter()
+        .map(|(k, o, r, rep, _)| json!({"op": "key", "key": k, "overlap": o, "refine": r, "repeat": rep}))
+        .collect();
+    let got = node(&Value::Array(req));
+    for (c, g) in cases.iter().zip(&got) {
+        assert_eq!(g, c.4, "{c:?}");
+    }
+}
+
+/// A pair made on this visit by a yes to a dataset check suggestion is treated as one made by
+/// hand: the page shows it (both boxes carry the overlap mark, the box not looked at yet is in
+/// the check pass) and a reviewed save records `overlaps_checked` as it does after a relabel by
+/// hand or a drawn box. The accept alone ends the flag on the file, as the Rust twin does; the
+/// save decides.
+#[test]
+fn a_pair_made_by_an_accepted_suggestion_reaches_the_save_as_one_made_by_hand() {
+    if !have_node() {
+        return;
+    }
+    // Box 1 (a dog) sits inside box 0 (a person): one object once it is a person (an open pair,
+    // IoU 0.625, wholly inside), two objects now. The frame was saved with a pair looked at.
+    let labels = json!({
+        "version": 1, "status": "reviewed", "overlaps_checked": true,
+        "boxes": [
+            {"label": "person", "bbox": [10, 10, 50, 90], "source": "model", "state": "accepted", "score": 0.9},
+            {"label": "dog", "bbox": [10, 10, 50, 60], "source": "model", "state": "accepted", "score": 0.6}
+        ],
+        "refine": [{"kind": "relabel", "target": [10, 10, 50, 60], "target_label": "dog", "label": "person", "score": 0.9}]
+    });
+    let mut plain = labels.clone();
+    plain.as_object_mut().unwrap().remove("refine");
+    let req = |extra: Value| {
+        let mut r =
+            json!({"op": "pair_on_save", "labels": labels, "classes": classes(), "hidden": []});
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    let got = node(&json!([
+        req(json!({"answer": 0})),
+        req(json!({"edits": [{"op": "relabel", "box": 1, "label": "person"}]})),
+        req(json!({"labels": plain, "draw": {"label": "person", "bbox": [10, 10, 50, 60]}})),
+        req(json!({})),
+    ]));
+    let (accepted, by_hand, drawn, untouched) = (&got[0], &got[1], &got[2], &got[3]);
+    for g in [accepted, by_hand] {
+        assert_eq!(g["overlaps"], json!([[0, 1]]), "{g}");
+        assert_eq!(g["near"], json!({"0": 1, "1": 0}), "{g}");
+        assert_eq!(g["on_save"], true, "{g}");
+    }
+    // The accepted box was looked at; its partner is in the check pass.
+    assert_eq!(accepted["to_check"], json!([0]));
+    assert_eq!(accepted["file_flag"], false, "the twin ends the flag");
+    assert_eq!(by_hand["file_flag"], true);
+    assert_eq!(drawn["overlaps"], json!([[0, 2]]), "{drawn}");
+    assert_eq!(drawn["on_save"], true);
+    assert_eq!(drawn["to_check"], json!([0, 1]));
+    // No pair: nothing to record.
+    assert_eq!(untouched["overlaps"], json!([]));
+    assert_eq!(untouched["on_save"], false);
 }
 
 #[test]

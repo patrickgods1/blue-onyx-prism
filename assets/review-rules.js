@@ -645,11 +645,27 @@
   // What key `y` or `w` acts on: 'overlap' (`y` while an overlap suggestion is on screen, and `y`
   // with no suggestion at all: the overlap handler says there is none, as it always did), 'accept'
   // / 'dismiss' (the current dataset check suggestion `refine`, refineCurrent), 'none' (`w` with
-  // nothing to answer: the key does nothing).
-  function suggestionKey(key, overlapShown, refine) {
-    if (key === 'y') return !overlapShown && refine ? 'accept' : 'overlap';
-    if (key === 'w') return !overlapShown && refine ? 'dismiss' : 'none';
-    return 'none';
+  // nothing to answer: the key does nothing), 'held' (`repeat`: the key's auto-repeat while held
+  // down; nothing is done, as for `n` and `s`: every answer is remembered, so a held key must not
+  // answer one suggestion after another).
+  function suggestionKey(key, overlapShown, refine, repeat) {
+    var route = 'none';
+    if (key === 'y') route = !overlapShown && refine ? 'accept' : 'overlap';
+    else if (key === 'w') route = !overlapShown && refine ? 'dismiss' : 'none';
+    return repeat && route !== 'none' ? 'held' : route;
+  }
+
+  // Whether a reviewed save records `overlaps_checked` (assets/review.js `save`): stacks or
+  // overlapping pairs left on boxes `bs` as saved (hints resolved as the save resolves them). The
+  // save is the look: the page shows every pair it holds (the `dup` / `overlap` chips, the
+  // progress line's "Overlap: a+b", the selected box's "Overlaps box N" with `u`) and the save's
+  // check pass steps through the decided boxes not looked at on this visit. What made a pair on
+  // this visit does not matter: a box drawn, moved or relabelled by hand and an accepted dataset
+  // check suggestion (acceptRefine, which ends the flag on the file as its Rust twin does) count
+  // alike.
+  function overlapsCheckedOnSave(bs, classes, hidden) {
+    var left = dupGroups(bs.map(function (b) { return Object.assign({}, b, { state: resolved(b) }); }), classes, hidden);
+    return left.groups.length > 0 || left.overlaps.length > 0;
   }
 
   function score2(v) { return typeof v === 'number' && isFinite(v) ? v.toFixed(2) : ''; }
@@ -830,6 +846,7 @@
     refineCurrent: refineCurrent,
     refineLater: refineLater,
     suggestionKey: suggestionKey,
+    overlapsCheckedOnSave: overlapsCheckedOnSave,
     refineCard: refineCard,
     refineFocus: refineFocus,
     answerRefine: answerRefine,

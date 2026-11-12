@@ -30,7 +30,7 @@ use crate::training::eta::JobTiming;
 use crate::training::refine::predict::LocalPredictor;
 use crate::training::refine::report::{self, REPORT_VERSION, RefineReport};
 use crate::training::refine::{self as check, RefineFrames, RefineJob, RefineRequest};
-use crate::training::service::{RunRecord, RunState};
+use crate::training::service::{NotQueued, RunRecord, RunState};
 use crate::training::task::{Task, TaskKind, TaskRecord};
 use askama::Template;
 use axum::Json;
@@ -49,6 +49,8 @@ use std::time::{Duration, Instant};
 pub(super) const BODY_LIMIT: usize = 16 * 1024;
 /// How long a walk's counts are kept.
 const OPEN_TTL: Duration = Duration::from_secs(60);
+/// Most walks' answers kept at once (folders under review x class lists).
+const OPEN_KEEP: usize = 8;
 /// Largest `report.json` read (a report with this many recall rows is not one this build wrote).
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -194,7 +196,8 @@ fn open_counts(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -
         return k.open.clone();
     }
     let open = count_open(dir, classes, hidden);
-    OPEN.lock_recover().insert(
+    remember(
+        &mut OPEN.lock_recover(),
         key,
         Kept {
             at: Instant::now(),
@@ -203,6 +206,20 @@ fn open_counts(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -
         },
     );
     open
+}
+
+/// Put `kept` in `map` under `key`: answers past [`OPEN_TTL`] go first, then the oldest, so at
+/// most [`OPEN_KEEP`] stay (each folder under review and class list ever asked about would
+/// otherwise stay for the life of the process).
+fn remember(map: &mut BTreeMap<String, Kept>, key: String, kept: Kept) {
+    map.retain(|k, v| *k != key && v.at.elapsed() < OPEN_TTL);
+    while map.len() >= OPEN_KEEP {
+        let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+    map.insert(key, kept);
 }
 
 /// The report in `dir` and what is wrong with it: `(None, None)` when there is none (never an
@@ -237,16 +254,25 @@ pub(super) fn read_report(dir: &Path) -> (Option<RefineReport>, Option<String>) 
             );
         }
     };
-    match serde_json::from_slice::<RefineReport>(&bytes) {
-        Ok(r) if r.version > REPORT_VERSION => (
+    // The format first, alone: a later build's report may not parse as this build's at all, and
+    // is then newer, not damaged.
+    #[derive(Deserialize)]
+    struct Format {
+        version: u64,
+    }
+    if let Ok(Format { version }) = serde_json::from_slice::<Format>(&bytes)
+        && version > u64::from(REPORT_VERSION)
+    {
+        return (
             None,
             Some(format!(
-                "{} was written by a newer version of this program (report format {}, this one \
-                 reads up to {REPORT_VERSION}); update to see it",
+                "{} was written by a newer version of this program (report format {version}, \
+                 this one reads up to {REPORT_VERSION}); update to see it",
                 path.display(),
-                r.version
             )),
-        ),
+        );
+    }
+    match serde_json::from_slice::<RefineReport>(&bytes) {
         Ok(r) => (Some(r), None),
         Err(e) => (
             None,
@@ -604,6 +630,40 @@ fn for_the_page(message: &str) -> String {
     message.replace("--allow-large", "\"Allow downloads over 500 MB\"")
 }
 
+/// The rule a queue checks under its own lock before it takes a job
+/// ([`crate::training::service::TrainingService::enqueue_task_unless`]): a reason to refuse, or
+/// None.
+type QueueRule<'a> = &'a dyn Fn(&[TaskRecord]) -> Option<String>;
+
+/// How [`start_check`] queues a job: with the rule the queue must check under its own lock.
+type Enqueue<'a> = &'a dyn Fn(RefineJob, QueueRule<'_>) -> Result<String, NotQueued>;
+
+/// "A check is already queued or running" for the task list `tasks`, in the page's words; None
+/// when no check is.
+fn busy_message(tasks: &[TaskRecord]) -> Option<String> {
+    let t = tasks
+        .iter()
+        .find(|t| t.kind == TaskKind::Refine && t.state.is_busy())?;
+    Some(format!(
+        "Not queued: a dataset check is already {} ({}). Wait for it, or cancel it first.",
+        if t.state == RunState::Queued {
+            "queued"
+        } else {
+            "running"
+        },
+        t.title
+    ))
+}
+
+fn conflict(message: String) -> Refusal {
+    Refusal {
+        status: StatusCode::CONFLICT,
+        message,
+        folder_missing: false,
+        needs_confirm: None,
+    }
+}
+
 /// Plan `request` and queue it through `enqueue`, which gets the job with its predictor set
 /// (`runtimes`: the registry's). Refuses, before anything is queued, when a check is already
 /// queued or running, the folder under review is unplugged, the frames could not be checked
@@ -611,6 +671,11 @@ fn for_the_page(message: &str) -> String {
 /// suggestions without `replace_open` (409 with `needs_confirm`: the preview's count, so no
 /// second walk) or the plan fails (no GPU to train on, a large download not allowed). Returns the
 /// task id and title.
+///
+/// `tasks` is a copy taken before the walks of the preview and the plan (seconds): a check
+/// another request queued meanwhile is not in it. So "a check is already queued" is asked twice:
+/// first on `tasks` (no walk for nothing), then by the queue itself under its lock, together with
+/// the queueing ([`busy_message`] as the [`QueueRule`]), so two starts at once queue one check.
 fn start_check(
     config: &Config,
     request: RefineRequest,
@@ -618,27 +683,10 @@ fn start_check(
     cap: &Capability,
     tasks: &[TaskRecord],
     runtimes: Option<Arc<Mutex<Runtimes>>>,
-    enqueue: &dyn Fn(RefineJob) -> Result<String, String>,
+    enqueue: Enqueue<'_>,
 ) -> Result<(String, String), Refusal> {
-    if let Some(t) = tasks
-        .iter()
-        .find(|t| t.kind == TaskKind::Refine && t.state.is_busy())
-    {
-        return Err(Refusal {
-            status: StatusCode::CONFLICT,
-            message: format!(
-                "Not queued: a dataset check is already {} ({}). Wait for it, or cancel it \
-                 first.",
-                if t.state == RunState::Queued {
-                    "queued"
-                } else {
-                    "running"
-                },
-                t.title
-            ),
-            folder_missing: false,
-            needs_confirm: None,
-        });
+    if let Some(m) = busy_message(tasks) {
+        return Err(conflict(m));
     }
     let dir = config.collect.resolved_review_dir(&config.data_root());
     if let Some(why) = config.collect.review_folder_problem(&dir) {
@@ -670,7 +718,10 @@ fn start_check(
         .map_err(|e| Refusal::bad(format!("Not queued: {}", for_the_page(&format!("{e:#}")))))?;
     job.predictor = Some(Arc::new(LocalPredictor::new(config.clone(), runtimes)));
     let title = Task::title(&job);
-    let id = enqueue(job).map_err(|e| Refusal::bad(format!("Not queued: {e}")))?;
+    let id = enqueue(job, &busy_message).map_err(|e| match e {
+        NotQueued::Refused(m) => conflict(m),
+        NotQueued::Failed(m) => Refusal::bad(format!("Not queued: {m}")),
+    })?;
     Ok((id, title))
 }
 
@@ -716,7 +767,7 @@ pub(super) async fn start(
             &cap,
             &tasks,
             runtimes,
-            &|job| queue.enqueue_task(Box::new(job)),
+            &|job, rule| queue.enqueue_task_unless(Box::new(job), rule),
         ) {
             Ok((id, title)) => Json(serde_json::json!({
                 "success": true,
@@ -987,6 +1038,43 @@ mod tests {
         );
     }
 
+    /// The format is read alone first: a later build's report that does not parse as this
+    /// build's is newer, not damaged; this format's report that does not parse is damaged.
+    #[test]
+    fn a_newer_report_that_does_not_parse_here_is_newer_and_this_formats_is_damaged() {
+        let dir = scratch();
+        let mut newer = report_json();
+        newer["version"] = (REPORT_VERSION + 1).into();
+        newer["folds"] = "a field of another shape".into();
+        newer.as_object_mut().unwrap().remove("recall_by_size");
+        write_report(&dir, &newer.to_string());
+        let (r, why) = read_report(&dir);
+        let why = why.unwrap();
+        assert!(r.is_none());
+        assert!(
+            why.contains("newer version") && why.contains("update to see it"),
+            "{why}"
+        );
+        assert!(!why.contains("damaged"), "{why}");
+
+        let mut broken = report_json();
+        broken["folds"] = "a field of another shape".into();
+        write_report(&dir, &broken.to_string());
+        let (r, why) = read_report(&dir);
+        assert!(r.is_none());
+        assert!(why.unwrap().contains("damaged"));
+        // No format at all, or not JSON: damaged.
+        for text in [r#"{"folds": 4}"#, r#"{"version": "two"}"#, "[1, 2"] {
+            write_report(&dir, text);
+            let (r, why) = read_report(&dir);
+            assert!(r.is_none(), "{text}");
+            assert!(why.unwrap().contains("damaged"), "{text}");
+        }
+        // This format's report reads.
+        write_report(&dir, &report_json().to_string());
+        assert!(matches!(read_report(&dir), (Some(_), None)));
+    }
+
     #[tokio::test]
     async fn open_suggestions_are_counted_per_kind_and_answered_or_stale_ones_are_not() {
         let dir = scratch();
@@ -1043,6 +1131,39 @@ mod tests {
         assert_eq!(open_counts(&review, &classes, &none, "").add, 1);
         // ... but a check starting or ending drops it.
         assert_eq!(open_counts(&review, &classes, &none, "t1:running").add, 2);
+    }
+
+    #[test]
+    fn at_most_a_handful_of_answers_are_kept_and_the_oldest_go_first() {
+        let mut map = BTreeMap::new();
+        let base = Instant::now();
+        let kept = |secs: u64| Kept {
+            at: base - OPEN_TTL + Duration::from_secs(secs),
+            stamp: String::new(),
+            open: Open::default(),
+        };
+        // One expired answer goes at the next insert whatever the room.
+        map.insert(
+            "expired".to_string(),
+            Kept {
+                at: base - OPEN_TTL - Duration::from_secs(1),
+                ..kept(0)
+            },
+        );
+        for i in 0..(OPEN_KEEP as u64 + 5) {
+            remember(&mut map, format!("k{i:02}"), kept(30 + i));
+            assert!(map.len() <= OPEN_KEEP, "{}", map.len());
+        }
+        assert!(!map.contains_key("expired"));
+        let left: Vec<&String> = map.keys().collect();
+        let want: Vec<String> = (5..(OPEN_KEEP as u64 + 5))
+            .map(|i| format!("k{i:02}"))
+            .collect();
+        assert_eq!(left, want.iter().collect::<Vec<_>>(), "the newest stay");
+        // The same key again replaces its answer, it does not push another out.
+        remember(&mut map, "k12".into(), kept(59));
+        assert_eq!(map.len(), OPEN_KEEP);
+        assert!(map.contains_key("k05"));
     }
 
     #[tokio::test]
@@ -1224,12 +1345,14 @@ mod tests {
         enough_frames(&dir.join("dataset"));
         let config = host_config(&dir);
         let seen = Mutex::new(Vec::new());
-        let enqueue = |job: RefineJob| {
+        let enqueue = |job: RefineJob, rule: &dyn Fn(&[TaskRecord]) -> Option<String>| {
             assert!(
                 job.predictor.is_some(),
                 "the job runs on the registry's predictor"
             );
             assert_eq!(Task::kind(&job), TaskKind::Refine);
+            assert!(rule(&[]).is_none());
+            assert!(rule(&[task("t1", RunState::Running)]).is_some());
             seen.lock()
                 .unwrap()
                 .push((job.request.clone(), job.id.clone()));
@@ -1281,10 +1404,70 @@ mod tests {
         );
     }
 
+    /// A queue in memory that checks the rule under its own lock, as the training queue's
+    /// `enqueue_task_unless` does.
+    struct FakeQueue(Mutex<Vec<TaskRecord>>);
+
+    impl FakeQueue {
+        fn enqueue(&self, job: RefineJob, rule: QueueRule<'_>) -> Result<String, NotQueued> {
+            let mut list = self.0.lock().unwrap();
+            if let Some(why) = rule(&list) {
+                return Err(NotQueued::Refused(why));
+            }
+            list.push(TaskRecord::new(&job, String::new()));
+            Ok(job.id.clone())
+        }
+    }
+
+    fn never(_: RefineJob, _: QueueRule<'_>) -> Result<String, NotQueued> {
+        panic!("queued")
+    }
+
+    /// Two starts at once, both past the first look (the task list each read before its walks
+    /// held no check): the queue's own check lets one through, the other is the 409.
+    #[test]
+    fn two_starts_at_once_queue_one_check_and_the_other_is_refused() {
+        let dir = scratch();
+        enough_frames(&dir.join("dataset"));
+        let config = host_config(&dir);
+        let queue = FakeQueue(Mutex::new(Vec::new()));
+        let req = RefineRequest {
+            folds: 2,
+            epochs: 1,
+            ..RefineRequest::default()
+        };
+        let gate = std::sync::Barrier::new(2);
+        let answers: Vec<Result<(String, String), Refusal>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let (config, queue, gate, req) = (&config, &queue, &gate, req.clone());
+                    s.spawn(move || {
+                        gate.wait();
+                        start_check(config, req, false, &host(), &[], None, &|job, rule| {
+                            queue.enqueue(job, rule)
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(queue.0.lock().unwrap().len(), 1, "exactly one check queued");
+        let refused: Vec<&Refusal> = answers.iter().filter_map(|a| a.as_ref().err()).collect();
+        assert_eq!(refused.len(), 1, "{answers:?}");
+        assert_eq!(refused[0].status, StatusCode::CONFLICT);
+        assert!(
+            refused[0]
+                .message
+                .starts_with("Not queued: a dataset check is already queued"),
+            "{}",
+            refused[0].message
+        );
+        assert_eq!(refused[0].needs_confirm, None);
+    }
+
     #[test]
     fn a_check_that_cannot_run_is_refused_before_it_is_queued() {
         let dir = scratch();
-        let never = |_: RefineJob| -> Result<String, String> { panic!("queued") };
         // Too few frames.
         let config = host_config(&dir);
         frame_with(&dir.join("dataset"), "patio", "a1", vec![]);
@@ -1331,7 +1514,7 @@ mod tests {
             &host(),
             &[],
             None,
-            &|_| Err("the training thread has stopped".into()),
+            &|_, _| Err(NotQueued::Failed("the training thread has stopped".into())),
         )
         .unwrap_err();
         assert!(
@@ -1377,9 +1560,8 @@ mod tests {
         let dir = scratch();
         let review = dir.join("dataset");
         let config = host_config(&dir);
-        let never = |_: RefineJob| -> Result<String, String> { panic!("queued") };
         let queued = Mutex::new(0);
-        let enqueue = |job: RefineJob| {
+        let enqueue = |job: RefineJob, _: QueueRule<'_>| {
             *queued.lock().unwrap() += 1;
             Ok(job.id.clone())
         };

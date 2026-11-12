@@ -617,3 +617,62 @@ fn a_file_that_could_not_be_moved_aside_is_not_written_over() {
     assert_eq!(std::fs::read(&tasks).unwrap(), b"damaged tasks");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `enqueue_task_unless` decides under the task list's lock: eight starts at once of a job that
+/// runs one at a time, each refused while one is busy, queue exactly one; the rest get the rule's
+/// words, and the queue's own refusal (a repeated id) stays a failure.
+#[test]
+fn a_rule_checked_under_the_queues_lock_lets_one_of_many_concurrent_starts_through() {
+    let dir = std::env::temp_dir().join(format!("bop-enqueue-unless-{}", uuid::Uuid::new_v4()));
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    let one_at_a_time = |tasks: &[TaskRecord]| {
+        tasks
+            .iter()
+            .any(|t| t.kind == task::TaskKind::Autolabel && t.state.is_busy())
+            .then(|| "one is already queued".to_string())
+    };
+    let gate = std::sync::Barrier::new(8);
+    let answers: Vec<std::result::Result<String, NotQueued>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (svc, gate) = (&svc, &gate);
+                s.spawn(move || {
+                    gate.wait();
+                    svc.enqueue_task_unless(
+                        Box::new(HoldTask {
+                            id: format!("t{i}"),
+                            keep: false,
+                        }),
+                        &one_at_a_time,
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let queued: Vec<&String> = answers.iter().filter_map(|a| a.as_ref().ok()).collect();
+    assert_eq!(queued.len(), 1, "{answers:?}");
+    assert!(answers.iter().all(|a| match a {
+        Ok(_) => true,
+        Err(e) => *e == NotQueued::Refused("one is already queued".into()),
+    }));
+    assert_eq!(svc.tasks().len(), 1);
+    // The plain enqueue has no rule; a repeated id is the queue's own failure.
+    let again = svc.enqueue_task_unless(
+        Box::new(HoldTask {
+            id: queued[0].clone(),
+            keep: false,
+        }),
+        &|_| None,
+    );
+    assert!(matches!(again, Err(NotQueued::Failed(m)) if m.contains("exists")));
+    assert!(svc.cancel(queued[0]));
+    svc.wait_task(queued[0], Duration::from_secs(10)).unwrap();
+    svc.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
