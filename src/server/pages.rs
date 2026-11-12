@@ -69,6 +69,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("training.js", JS),
     asset!("train-area.js", JS),
     asset!("train-dataset.js", JS),
+    asset!("train-refine.js", JS),
     asset!("train-metrics.js", JS),
     asset!("browse.js", JS),
     asset!("class-picker.js", JS),

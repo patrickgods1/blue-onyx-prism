@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}{{ tab_title }}{% endblock %}
+{% block content %}
+{% include "train/tabs.html" %}
+<div class="tr" id="refine-tab">
+<div class="card" id="refine-check">
+  <h2>Check the dataset</h2>
+  <p class="muted">Short throwaway models each learn from most of your reviewed camera days, then look at the days they never saw and say where they disagree with your labels: a box nobody drew, a label no model found, an object that looks like another class. The check changes no box. It only leaves suggestions on the frames for you to confirm on the <a href="/train/review">Review</a> tab. With 4 folds of 8 epochs it takes about an hour on a mid-range GPU, and the GPU is busy meanwhile: other jobs wait their turn.</p>
+  <form id="refine-form" class="tr-form">
+    <div class="tr-grid">
+      <div class="tr-field">
+        <label for="refine-folds">Folds</label>
+        <input inputmode="numeric" type="number" id="refine-folds" name="folds" min="{{ folds_min }}" max="{{ folds_max }}" step="1" value="{{ folds_default }}">
+        <p class="muted small">Each fold model trains on the other folds' camera days. More folds train longer for a little more training data.</p>
+      </div>
+      <div class="tr-field">
+        <label for="refine-epochs">Epochs per fold</label>
+        <input inputmode="numeric" type="number" id="refine-epochs" name="epochs" min="{{ epochs_min }}" max="{{ epochs_max }}" step="1" value="{{ epochs_default }}">
+      </div>
+      <div class="tr-field">
+        <label for="refine-scene">Scene</label>
+        <select id="refine-scene" name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
+        <p class="muted small">A scene or camera also narrows what the fold models train on.</p>
+      </div>
+      <div class="tr-field">
+        <label for="refine-camera">Camera</label>
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="refine-camera" name="camera" placeholder="any (comma separated)">
+      </div>
+      {% if let Some(auto) = gpu_choices.first() %}
+      <div class="tr-field">
+        <label for="refine-gpu">GPU</label>
+        <select id="refine-gpu" name="gpu"><option value="">Automatic: {{ auto.label }}</option>{% for g in gpu_choices %}<option value="{{ g.value }}">{{ g.label }}</option>{% endfor %}</select>
+      </div>
+      {% endif %}
+    </div>
+    <label class="check tr-confirm"><input type="checkbox" name="allow_large"> Allow downloads over 500 MB (the training environment and the base weights, when they are not set up yet)</label>
+    <div class="actions"><button type="button" class="secondary" id="refine-preview-btn">Preview</button> <button type="submit" id="refine-start">Start</button></div>
+  </form>
+  <p class="muted small" id="refine-why" role="status" hidden></p>
+  <div id="refine-msg" class="form-msg" role="status"></div>
+  <div id="refine-preview" role="status" hidden></div>
+  <div id="jobs" hidden></div>
+</div>
+
+<div class="card" id="refine-findings">
+  <h2>Findings</h2>
+  <div id="refine-findings-body"><p class="muted">Loading&hellip;</p></div>
+</div>
+
+<div class="card" id="refine-coverage">
+  <h2>Coverage</h2>
+  <div id="refine-coverage-body"><p class="muted">Loading&hellip;</p></div>
+</div>
+</div>
+<script src="/static/train-refine.js?v={{ version }}"></script>
+{% endblock %}

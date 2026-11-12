@@ -372,6 +372,7 @@ mod tests {
         let tasks = [
             task("i", TaskKind::Import, RunState::Running),
             task("o", TaskKind::Overlaps, RunState::Paused),
+            task("f", TaskKind::Refine, RunState::Running),
         ];
         let runs = [run("r", RunState::Running)];
         let v = view(&runs, &tasks, &NO_CLOCK);
@@ -381,7 +382,8 @@ mod tests {
             [
                 "/train/train#job-r",
                 "/train/import#job-i",
-                "/train/autolabel#job-o"
+                "/train/autolabel#job-o",
+                "/train/refine#job-f"
             ]
         );
         assert!(v.active[2].paused);

@@ -50,6 +50,7 @@ mod live;
 mod network;
 mod pages;
 mod pick;
+mod refine;
 mod resources;
 mod review;
 mod sam3_access;
@@ -289,6 +290,13 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/train/import", get(training::import_tab)),
         ("/train/autolabel", get(training::autolabel_tab)),
         ("/train/review", get(review::page)),
+        ("/train/refine", get(refine::page)),
+        ("/v1/refine", get(refine::status)),
+        ("/v1/refine/preview", get(refine::preview)),
+        (
+            "/v1/refine/check",
+            post(refine::start).layer(DefaultBodyLimit::max(refine::BODY_LIMIT)),
+        ),
         ("/train/dataset", get(train_area::dataset_page)),
         ("/train/train", get(training::train_tab)),
         ("/train/models", get(training::models_tab)),
@@ -1347,6 +1355,10 @@ mod tests {
             "/train/import",
             "/train/autolabel",
             "/train/review",
+            "/train/refine",
+            "/v1/refine",
+            "/v1/refine/preview",
+            "/v1/refine/check",
             "/train/dataset",
             "/train/train",
             "/train/models",

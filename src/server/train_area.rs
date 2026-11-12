@@ -1,9 +1,9 @@
-//! The Train area: one top-nav entry with eight tabs at their own URLs (Collect, Import,
-//! Auto-label, Review, Dataset, Train, Models, Jobs). This file holds what the tabs share: the tab list,
+//! The Train area: one top-nav entry with nine tabs at their own URLs (Collect, Import,
+//! Auto-label, Review, Refine, Dataset, Train, Models, Jobs). This file holds what the tabs share: the tab list,
 //! `GET /train` (the most useful tab), the redirects of the old `/dataset`, `/review` and
 //! `/training` pages, `GET /v1/train/summary` (the counts of the status strip and the one suggested
 //! next action) with the pure rule [`next_step`], and the Dataset tab. The other tabs render in
-//! [`super::dataset`], [`super::review`] and [`super::training`].
+//! [`super::dataset`], [`super::review`], [`super::refine`] and [`super::training`].
 //!
 //! Nothing here walks the frames on the request path: the walk ([`queue::tally`]) runs on its own
 //! thread and its answer is kept ([`tally_of`]), so a large dataset delays neither the pages (the
@@ -30,17 +30,19 @@ pub(super) const COLLECT: &str = "collect";
 pub(super) const IMPORT: &str = "import";
 pub(super) const AUTOLABEL: &str = "autolabel";
 pub(super) const REVIEW: &str = "review";
+pub(super) const REFINE: &str = "refine";
 pub(super) const DATASET: &str = "dataset";
 pub(super) const TRAIN: &str = "train";
 pub(super) const MODELS: &str = "models";
 pub(super) const JOBS: &str = "jobs";
 
 /// The tabs in nav order: id, title.
-pub(super) const TABS: [(&str, &str); 8] = [
+pub(super) const TABS: [(&str, &str); 9] = [
     (COLLECT, "Collect"),
     (IMPORT, "Import"),
     (AUTOLABEL, "Auto-label"),
     (REVIEW, "Review"),
+    (REFINE, "Refine"),
     (DATASET, "Dataset"),
     (TRAIN, "Train"),
     (MODELS, "Models"),
@@ -50,7 +52,7 @@ pub(super) const TABS: [(&str, &str); 8] = [
 /// The tab the Jobs card's forms came from (their hidden `tab` field), so their answer lands
 /// where they were pressed; `default` for anything else.
 pub(super) fn jobs_tab(field: Option<&str>, default: &'static str) -> &'static str {
-    [IMPORT, AUTOLABEL, TRAIN, MODELS]
+    [IMPORT, AUTOLABEL, REFINE, TRAIN, MODELS]
         .into_iter()
         .find(|t| field == Some(*t))
         .unwrap_or(default)
@@ -483,8 +485,9 @@ pub(super) fn export_row(dir: &Path) -> ExportRow {
 pub(super) const fn task_tab(kind: TaskKind) -> &'static str {
     match kind {
         TaskKind::Import => IMPORT,
-        // A dataset check gets its own tab later; until then it shows with the auto-label jobs.
-        TaskKind::Autolabel | TaskKind::Overlaps | TaskKind::Refine => AUTOLABEL,
+        // The overlap check is started from Review and shows with the auto-label jobs.
+        TaskKind::Autolabel | TaskKind::Overlaps => AUTOLABEL,
+        TaskKind::Refine => REFINE,
     }
 }
 
@@ -1018,9 +1021,29 @@ mod tests {
     fn the_jobs_forms_land_on_their_tab() {
         assert_eq!(jobs_tab(Some("import"), TRAIN), IMPORT);
         assert_eq!(jobs_tab(Some("models"), TRAIN), MODELS);
+        assert_eq!(jobs_tab(Some("refine"), TRAIN), REFINE);
         assert_eq!(jobs_tab(None, MODELS), MODELS);
         assert_eq!(jobs_tab(Some("../x"), TRAIN), TRAIN);
         assert_eq!(jobs_tab(Some("review"), TRAIN), TRAIN);
+    }
+
+    #[test]
+    fn every_kind_of_task_has_its_tab() {
+        assert_eq!(task_tab(TaskKind::Import), IMPORT);
+        assert_eq!(task_tab(TaskKind::Autolabel), AUTOLABEL);
+        assert_eq!(task_tab(TaskKind::Overlaps), AUTOLABEL);
+        assert_eq!(task_tab(TaskKind::Refine), REFINE);
+        // The strip's job link opens the tab with the progress row.
+        let s = Summary {
+            job: Some(Job {
+                what: "A dataset check",
+                tab: task_tab(TaskKind::Refine),
+                paused: false,
+            }),
+            ..counted()
+        };
+        let n = next_step(&s);
+        assert_eq!(n.link, "/train/refine#jobs");
     }
 
     #[test]
@@ -1080,11 +1103,12 @@ mod tests {
     }
 
     /// The tabs' URLs as a server sees them.
-    const PAGES: [(&str, &str); 8] = [
+    const PAGES: [(&str, &str); 9] = [
         ("/train/collect", "collect"),
         ("/train/import", "import"),
         ("/train/autolabel", "autolabel"),
         ("/train/review", "review"),
+        ("/train/refine", "refine"),
         ("/train/dataset", "dataset"),
         ("/train/train", "train"),
         ("/train/models", "models"),
@@ -1246,7 +1270,7 @@ mod tests {
     async fn each_tab_holds_its_own_content() {
         let dir = scratch();
         let state = state_in(&dir);
-        let cases: [(&str, &[&str], &[&str]); 7] = [
+        let cases: [(&str, &[&str], &[&str]); 8] = [
             (
                 "/train/collect",
                 &["action=\"/dataset/settings\"", "name=\"enabled\""],
@@ -1276,6 +1300,16 @@ mod tests {
                     "id=\"rv-classes\"",
                     "id=\"jobs\"",
                 ],
+            ),
+            (
+                "/train/refine",
+                &[
+                    "id=\"refine-form\"",
+                    "id=\"refine-findings\"",
+                    "id=\"refine-coverage\"",
+                    "id=\"jobs\"",
+                ],
+                &["id=\"rv-canvas\"", "id=\"autolabel-form\""],
             ),
             (
                 "/train/dataset",

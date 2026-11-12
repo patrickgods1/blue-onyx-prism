@@ -1769,7 +1769,7 @@ yourself, or save with both kept. The twin rules are `liveSuggestions` / `accept
 `train refine` looks for what the labels of your reviewed frames got wrong or left out: objects no box
 labels, labels no model finds, and a box of another class than the one an independent model sees. It
 exists for the frames every trained model has already seen, which `--with-model --missing-only` cannot
-check (it skips them). It is on the command line and the job queue only. **It changes no box, frame
+check (it skips them). It starts from the Refine tab, the command line or the job queue. **It changes no box, frame
 status, config entry, model file, `runs.json` or `benchmark.json`**: it writes suggestions to
 `LabelFile.refine` and a report, and a box changes only when a reviewer accepts a suggestion.
 
@@ -1844,6 +1844,20 @@ suggestion names its box by `target` and `target_label`, so two boxes of differe
 same place each get their own.
 `tighten` is read and accepted by the code but the check does not make it.
 
+**Finding them on the Review tab.** `GET /v1/review/next?auto=refine` lists the frames with a live
+suggestion, of any review status (they are mostly reviewed frames, so add `status=any&source=all`),
+strongest first by the frame's strongest suggestion (item fields `refine_strength` and `refine_open`, the
+number of live suggestions); `refine_kind=add|tighten|relabel|verify` (only with `auto=refine`) narrows the
+filter, the order and the count to one kind. A frame without a label file is never listed, a skipped one
+neither. Classes are spelled and filtered through `collect.classes` and `collect.hidden_classes`, as the page
+shows them. `GET /v1/review/labels` answers `refine_live` beside `overlap_live`: the live suggestions, each
+`{index, kind, target, target_label, bbox, label, score, why, spot, run, target_box, replaces}` (`index`
+into `labels.refine`, `target_box` and `replaces` into `labels.boxes`). The page answers them in
+`assets/review-rules.js` (`liveRefine`, `acceptRefine`, `dismissRefine`, twins of `refine::live`, `accept`
+and `dismiss`, compared in `tests/it/js_rules.rs`) and saves the file as usual: an answer is a change to
+the file a save checks (`refine::check`) and keeps; a check that wrote the frame meanwhile makes the save a
+409 like any other write. A big folder answers `auto=refine` from the review index like the other filters.
+
 **The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each check;
 the dataset walkers and retention do not look in `refine/`). Fields: `version`, `run`, `created`,
 `cancelled`, `folds`, `folds_done`, `recipe` (`model`, `imgsz`, `epochs`, `batch`, `from`), `camera_days`,
@@ -1901,6 +1915,34 @@ blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "sce
 `camera=<name>` pairs, comma-separated, a key may repeat. `--dry-run` runs the preview: frames, what the
 export leaves out and why, camera days, each fold's size, the model and a rough time (shown only when a GPU
 can train). It needs no GPU or download, writes nothing, and prints `refused:` with the reason when the check would not run.
+
+### Refine tab
+
+The Train area's Refine tab (`/train/refine`, between Review and Dataset) starts the dataset check from the
+web UI and shows its results; the check itself is the one above and changes no box.
+
+- **Check the dataset** card: folds (2 to 8), epochs (1 to 50), a scene and a camera filter, the GPU when
+  there are several, and *Allow downloads over 500 MB*. *Preview* is `train refine --dry-run`
+  (`GET /v1/refine/preview`: frames, what the export leaves out, camera days, each fold's size, the model,
+  a rough time, warnings, or why a start would be refused). *Start* (`POST /v1/refine/check`) plans the check,
+  gives it the running service's runtimes for the fold models' predictions (no second OpenVINO / ONNX Runtime
+  instance) and queues it on the one-at-a-time queue. It refuses, in the check's own words, when too few
+  reviewed frames can be checked, the folder under review is unplugged (503, `folder_missing`), a large
+  download is not allowed, there is no GPU to train on, or a check is already queued or running (409). While
+  it runs the card shows the check's progress row (step, percent, time left, Pause / Resume / Cancel; the
+  Jobs tab links to it as `#job-<id>`).
+- **Findings**: the open suggestions per kind (*Missing boxes* = `add`, *Labels no model found* = `verify`,
+  *Other class suggested* = `relabel`), counted over the label files of the folder under review
+  (`refine::live`: answered and stale ones are not counted; kept 60 s, dropped when a check starts or ends),
+  each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). Also the last report's
+  date, folds done of folds, `cancelled`, its warnings and the loose labels counted. Without a report the card
+  says no check has run; a damaged or newer-format `report.json` is shown as a problem, never as an error page.
+- **Coverage**: the report's recall per camera, scene and class and per size at model input, each with its
+  95% interval, and a note that objects under about 10 px are rarely found.
+
+`GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
+`open`, `job`, `last`, `capability`, `limits`). The tab has no card for static objects, a size floor or tighter
+boxes yet.
 
 ### M1 run (MPS)
 
