@@ -12,8 +12,51 @@
 // question, then the write; the answer names frames to look at in Review) and the training cap
 // (POST /v1/refine/static-cap). No inline handlers (CSP); limits come from the inputs' min/max and
 // the server's answers.
+// The Too small card (GET /v1/refine/floor, POST /v1/refine/size-floor, /ignore-mode and
+// /resolve-small) shows what the size floor does per class, saves the floor and the ignore mode and
+// has the one rule that writes boxes: pending proposals under the floor become too-small ignore
+// regions (a dry run, the inline question, then the write, as the Static objects card does). The
+// last check's recall by size is drawn there too. The pure sentences are in `RefineFloor`, tested
+// in Node (tests/it/js_rules.rs). No inline handlers (CSP); limits come from the server's answers.
 (function () {
   'use strict';
+  // The fewest boxes of a class a run wants to learn it from (the dataset check's MIN_CLASS_BOXES).
+  var MIN_CLASS_BOXES = 50;
+  function num(x) {
+    var v = x == null ? NaN : Number(x);
+    return isFinite(v) ? String(Number(v.toFixed(2))) : '?';
+  }
+  function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+  var api = {
+    MIN_CLASS_BOXES: MIN_CLASS_BOXES,
+    // A floor as a phrase: "under 10 px at 384".
+    phrase: function (f) { return 'under ' + num(f.px) + ' px at ' + f.input; },
+    // What a floor does to one class row ({class, boxes, under, left}), in words; '' when it
+    // touches none of the class's boxes (then the floor is not to blame for a small class).
+    classNote: function (c) {
+      if (!c || !(c.under > 0)) return '';
+      if (c.left === 0) {
+        return 'every ' + c.class + ' label would be left out: the model cannot learn the class from these frames';
+      }
+      if (c.left < MIN_CLASS_BOXES) {
+        return 'only ' + plural(c.left, c.class + ' label', c.class + ' labels') + ' would be left (under ' +
+          MIN_CLASS_BOXES + '): too few to learn the class from';
+      }
+      return '';
+    },
+    // The question before the rule writes: `boxes` pending proposals on `frames` unreviewed frames.
+    resolveText: function (boxes, frames) {
+      return 'Reject ' + plural(boxes, 'pending auto-label proposal', 'pending auto-label proposals') + ' on ' +
+        plural(frames, 'unreviewed frame', 'unreviewed frames') + ' as too small (under the floor). ' +
+        'They become ignore regions, are not counted as your decisions, and you can accept one again on the Review tab.';
+    }
+  };
+  globalThis.RefineFloor = api;
+})();
+
+(function () {
+  'use strict';
+  if (typeof document === 'undefined') return; // Node: the pure helpers above only
   var root = document.getElementById('refine-tab');
   if (!root) return;
   var $ = function (id) { return document.getElementById(id); };
@@ -446,17 +489,31 @@
     } else {
       box.appendChild(el('p', 'muted', 'The report holds no labelled boxes.'));
     }
-    var sizes = r.recall_by_size || [];
-    if (sizes.length) {
-      box.appendChild(el('h3', null, 'By size'));
-      box.appendChild(el('p', 'muted small', 'Size is the box\'s short side in pixels at the model\'s input. Objects below about 10 px are rarely found by any model, so a low recall there says little about your labels.'));
-      box.appendChild(recallTable([
-        { title: 'Size (px)', value: function (s) { return s.bucket; } },
-        { title: 'Boxes', num: true, value: function (s) { return String(s.boxes); } },
-        { title: 'Found', num: true, value: function (s) { return String(s.found); } },
-        { title: 'Recall (95%)', num: true, value: recallText }
-      ], sizes));
+    if ((r.recall_by_size || []).length) {
+      box.appendChild(el('p', 'muted small', 'Recall by size is on the Too small card above.'));
     }
+  }
+
+  // The last check's recall by box size, on the Too small card: where models stop finding objects
+  // is where a size floor belongs.
+  function drawSizeRecall(state) {
+    var box = $('refine-floor-recall');
+    clear(box);
+    var r = state.report;
+    var sizes = r ? (r.recall_by_size || []) : [];
+    if (!sizes.length) {
+      box.appendChild(el('p', 'muted small', 'After a dataset check, this shows how often a model that never saw the camera day found objects of each size.'));
+      return;
+    }
+    box.appendChild(el('h3', null, 'Recall by size'));
+    box.appendChild(el('p', 'muted small', 'Size is the box\'s short side in pixels at the model\'s input (' + r.recipe.imgsz +
+      ' px in the last check). Objects below about 10 px are rarely found by any model, so a low recall there says little about your labels.'));
+    box.appendChild(recallTable([
+      { title: 'Size (px)', value: function (s) { return s.bucket; } },
+      { title: 'Boxes', num: true, value: function (s) { return String(s.boxes); } },
+      { title: 'Found', num: true, value: function (s) { return String(s.found); } },
+      { title: 'Recall (95%)', num: true, value: recallText }
+    ], sizes));
   }
 
   function drawCapability(state) {
@@ -692,6 +749,247 @@
       .then(function () { btn.disabled = false; });
   });
 
+  // ---- too small
+
+  var RF = globalThis.RefineFloor;
+  var floorDirty = false;
+  var floorSeq = 0;
+  var modeDirty = false;
+  var savedFloor = null;
+  var smallPending = null;
+
+  function formMsg(id, text, bad) {
+    var m = $(id);
+    m.textContent = text || '';
+    m.className = bad ? 'form-msg error' : 'form-msg';
+  }
+
+  // The floor the form holds, or null with the reason said (the same bounds the server checks).
+  function formFloor() {
+    var pxEl = $('refine-floor-px'), inEl = $('refine-floor-input');
+    var px = whole(pxEl.value), input = whole(inEl.value);
+    var pxMin = Number(pxEl.min), pxMax = Number(pxEl.max), inMin = Number(inEl.min), inMax = Number(inEl.max);
+    if (px === null || !isFinite(px) || px < pxMin || px > pxMax) {
+      formMsg('refine-floor-msg', 'Give the short side in pixels, from ' + pxMin + ' to ' + pxMax + '.', true);
+      return null;
+    }
+    if (input === null || !isFinite(input) || input !== Math.floor(input) || input < inMin || input > inMax) {
+      formMsg('refine-floor-msg', 'Give the model input as a whole number of pixels, from ' + inMin + ' to ' + inMax + '.', true);
+      return null;
+    }
+    return { px: px, input: input };
+  }
+
+  // The per-class table of a floor answer: boxes, under the floor, left, and in words where the
+  // floor would leave a class too few labels.
+  function drawFloorCounts(j) {
+    var box = $('refine-floor-counts');
+    clear(box);
+    var c = j.counts, f = j.shown;
+    if (j.folder_missing) {
+      box.appendChild(el('p', 'error', j.message || 'The folder under review is not available.'));
+      box.hidden = false;
+      return;
+    }
+    if (!c || !f) { box.hidden = true; return; }
+    box.hidden = false;
+    var under = c.per_class.reduce(function (n, x) { return n + x.under; }, 0);
+    box.appendChild(el('p', null, 'A floor ' + RF.phrase(f) + ' leaves out ' + plural(under, 'label', 'labels') + ' on ' +
+      plural(c.frames_with, 'frame', 'frames') + ' of the ' + plural(c.frames, 'reviewed frame', 'reviewed frames') +
+      (c.frames_only ? '; ' + plural(c.frames_only, 'frame', 'frames') + ' would keep no label to train (a training run leaves ' +
+        (c.frames_only === 1 ? 'it' : 'them') + ' out)' : '') + '.'));
+    if (c.per_class.length) {
+      var wrap = el('div', 'scroll');
+      var table = el('table', 'rcards');
+      var head = el('thead');
+      var hr = el('tr');
+      ['Class', 'Boxes', 'Under the floor', 'Left', ''].forEach(function (h, i) {
+        hr.appendChild(el('th', i >= 1 && i <= 3 ? 'num' : null, h));
+      });
+      head.appendChild(hr);
+      table.appendChild(head);
+      var body = el('tbody');
+      c.per_class.forEach(function (x) {
+        var tr = el('tr');
+        tr.appendChild(el('td', 'rc-title', x.class));
+        tr.appendChild(el('td', 'num', String(x.boxes))).setAttribute('data-label', 'Boxes');
+        tr.appendChild(el('td', 'num', String(x.under))).setAttribute('data-label', 'Under the floor');
+        tr.appendChild(el('td', 'num', String(x.left))).setAttribute('data-label', 'Left');
+        var note = RF.classNote(x);
+        var td = el('td', note ? 'error small' : 'small', note);
+        tr.appendChild(td);
+        body.appendChild(tr);
+      });
+      table.appendChild(body);
+      wrap.appendChild(table);
+      box.appendChild(wrap);
+    } else {
+      box.appendChild(el('p', 'muted small', 'No reviewed frame holds a labelled box yet.'));
+    }
+    if (c.warnings && c.warnings.length) {
+      var ul = el('ul', 'warn-list small');
+      c.warnings.forEach(function (t) { ul.appendChild(el('li', null, t)); });
+      box.appendChild(ul);
+    }
+    box.appendChild(el('p', 'muted small', 'Boxes are the accepted and added ones of reviewed frames. Nothing was written.'));
+  }
+
+  // The saved floor's answer: the form, the state line, the counts, the rule's button.
+  function drawFloor(j) {
+    savedFloor = j.saved;
+    var shown = j.saved || j.suggested;
+    var pxEl = $('refine-floor-px'), inEl = $('refine-floor-input');
+    if (j.bounds) {
+      pxEl.min = j.bounds.px_min; pxEl.max = j.bounds.px_max;
+      inEl.min = j.bounds.input_min; inEl.max = j.bounds.input_max;
+    }
+    if (!floorDirty) { pxEl.value = num(shown.px); inEl.value = shown.input; }
+    $('refine-floor-off').hidden = !j.saved;
+    var state = $('refine-floor-state');
+    if (j.saved) {
+      state.textContent = 'Saved: objects ' + RF.phrase(j.saved) + ' are too small.';
+    } else {
+      var from = j.suggested.from === 'last_check' ? 'the last dataset check\'s input size'
+        : (j.suggested.from === 'last_run' ? 'your last training run\'s input size' : 'a common input size');
+      state.textContent = 'No floor is saved: nothing is left out for size. The form holds a suggestion (10 px, ' + from + ').';
+    }
+    drawFloorCounts(j);
+    var open = j.saved && j.pending && j.pending.boxes > 0;
+    $('refine-floor-pending').hidden = !open;
+    if (open) {
+      $('refine-floor-resolve').textContent = 'Resolve ' + plural(j.pending.boxes, 'pending proposal', 'pending proposals') + ' as too small...';
+    }
+    var mode = j.ignore_mode === 'drop-frame' ? 'drop-frame' : 'background';
+    if (!modeDirty) {
+      Array.prototype.forEach.call($('refine-ignore-form').elements.mode, function (r) { r.checked = r.value === mode; });
+    }
+  }
+
+  // The last read asked for wins (a read started before a save may land after it).
+  function loadFloor() {
+    var seq = ++floorSeq;
+    return getJson('/v1/refine/floor')
+      .then(function (j) { if (seq === floorSeq) drawFloor(j); })
+      .catch(function (e) {
+        if (seq !== floorSeq) return;
+        formMsg('refine-floor-msg', e.message, true);
+        $('refine-floor-state').textContent = '';
+      });
+  }
+
+  ['refine-floor-px', 'refine-floor-input'].forEach(function (id) {
+    $(id).addEventListener('input', function () { floorDirty = true; });
+  });
+
+  $('refine-floor-preview').addEventListener('click', function () {
+    var f = formFloor();
+    if (!f) return;
+    var btn = $('refine-floor-preview');
+    btn.disabled = true;
+    formMsg('refine-floor-msg', '');
+    getJson('/v1/refine/floor?px=' + encodeURIComponent(f.px) + '&input=' + encodeURIComponent(f.input))
+      .then(drawFloorCounts)
+      .catch(function (e) { formMsg('refine-floor-msg', e.message, true); })
+      .then(function () { btn.disabled = false; });
+  });
+
+  function saveFloor(body) {
+    var btn = $('refine-floor-save'), off = $('refine-floor-off');
+    btn.disabled = true;
+    off.disabled = true;
+    formMsg('refine-floor-msg', '');
+    hideSmallConfirm();
+    $('refine-small-result').hidden = true;
+    return postJson('/v1/refine/size-floor', body)
+      .then(function (j) {
+        floorDirty = false;
+        formMsg('refine-floor-msg', j.message);
+        return loadFloor();
+      })
+      .catch(function (e) { formMsg('refine-floor-msg', e.message, true); })
+      .then(function () { btn.disabled = false; off.disabled = false; });
+  }
+  $('refine-floor-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var f = formFloor();
+    if (f) saveFloor(f);
+  });
+  $('refine-floor-off').addEventListener('click', function () { saveFloor({ off: true }); });
+
+  // The rule: pending proposals under the saved floor become too-small ignore regions. A dry run
+  // says what would happen, the box under the card asks (inline, no dialog), the second step writes.
+  function hideSmallConfirm() {
+    $('refine-small-confirm').hidden = true;
+    smallPending = null;
+  }
+  function smallSay(text, bad) {
+    var box = $('refine-small-result');
+    clear(box);
+    box.appendChild(el('p', bad ? 'error' : null, text));
+    box.hidden = false;
+    return box;
+  }
+  $('refine-floor-resolve').addEventListener('click', function () {
+    var btn = $('refine-floor-resolve');
+    btn.disabled = true;
+    hideSmallConfirm();
+    $('refine-small-result').hidden = true;
+    postJson('/v1/refine/resolve-small', { dry_run: true }).then(function (j) {
+      var go = $('refine-small-confirm-go');
+      var text;
+      if (j.boxes === 0) {
+        text = 'Nothing to reject: no pending proposal is under the floor any more.';
+        go.hidden = true;
+      } else {
+        text = RF.resolveText(j.boxes, j.eligible);
+        if (j.eligible > 500) text += ' One run does at most 500 frames: run it again after.';
+        go.hidden = false;
+      }
+      $('refine-small-confirm-text').textContent = text;
+      $('refine-small-confirm').hidden = false;
+      smallPending = { boxes: j.boxes };
+      (go.hidden ? $('refine-small-confirm-cancel') : go).focus();
+    }).catch(function (e) { smallSay(e.message, true); })
+      .then(function () { btn.disabled = false; });
+  });
+  $('refine-small-confirm-go').addEventListener('click', function () {
+    if (!smallPending) return;
+    var go = $('refine-small-confirm-go');
+    go.disabled = true;
+    postJson('/v1/refine/resolve-small', {}).then(function (j) {
+      hideSmallConfirm();
+      var box = smallSay(j.message);
+      if (j.failed && j.failed.length) {
+        var bad = el('ul', 'warn-list small');
+        j.failed.forEach(function (t) { bad.appendChild(el('li', null, t)); });
+        box.appendChild(bad);
+      }
+      return loadFloor();
+    }).catch(function (e) {
+      hideSmallConfirm();
+      smallSay(e.message, true);
+      return loadFloor();
+    }).then(function () { go.disabled = false; });
+  });
+  $('refine-small-confirm-cancel').addEventListener('click', function () {
+    hideSmallConfirm();
+    $('refine-small-result').hidden = true;
+  });
+
+  // The ignore mode: saved as the config's own setting, read by the next training run.
+  $('refine-ignore-form').addEventListener('change', function () { modeDirty = true; });
+  $('refine-ignore-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var btn = $('refine-ignore-save');
+    var mode = $('refine-ignore-form').elements.mode.value;
+    btn.disabled = true;
+    formMsg('refine-ignore-msg', '');
+    postJson('/v1/refine/ignore-mode', { mode: mode })
+      .then(function (j) { modeDirty = false; formMsg('refine-ignore-msg', j.message); })
+      .catch(function (e) { formMsg('refine-ignore-msg', e.message, true); })
+      .then(function () { btn.disabled = false; });
+  });
+
   // The state of the page: one read at load, another when a check starts or ends.
   function load() {
     return getJson('/v1/refine')
@@ -699,9 +997,11 @@
         drawCapability(state);
         drawFindings(state);
         drawCoverage(state);
+        drawSizeRecall(state);
         if (state.job) { drawJob(state.job); poller.kick(); } else if (jobId !== null) { clearJob(); }
         // The spots walk the reviewed frames: after the first paint, not before it.
         loadSpots();
+        loadFloor();
       })
       .catch(function (e) {
         var box = $('refine-findings-body');

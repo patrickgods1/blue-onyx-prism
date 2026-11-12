@@ -51,6 +51,7 @@ mod network;
 mod pages;
 mod pick;
 mod refine;
+mod refine_floor;
 mod refine_spots;
 mod resources;
 mod review;
@@ -307,6 +308,20 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         (
             "/v1/refine/static-cap",
             post(refine_spots::static_cap).layer(DefaultBodyLimit::max(refine_spots::BODY_LIMIT)),
+        ),
+        ("/v1/refine/floor", get(refine_floor::floor)),
+        (
+            "/v1/refine/size-floor",
+            post(refine_floor::size_floor).layer(DefaultBodyLimit::max(refine_floor::BODY_LIMIT)),
+        ),
+        (
+            "/v1/refine/ignore-mode",
+            post(refine_floor::ignore_mode).layer(DefaultBodyLimit::max(refine_floor::BODY_LIMIT)),
+        ),
+        (
+            "/v1/refine/resolve-small",
+            post(refine_floor::resolve_small)
+                .layer(DefaultBodyLimit::max(refine_floor::BODY_LIMIT)),
         ),
         ("/train/dataset", get(train_area::dataset_page)),
         ("/train/train", get(training::train_tab)),
@@ -1373,6 +1388,10 @@ mod tests {
             "/v1/refine/spots",
             "/v1/refine/accept-spot",
             "/v1/refine/static-cap",
+            "/v1/refine/floor",
+            "/v1/refine/size-floor",
+            "/v1/refine/ignore-mode",
+            "/v1/refine/resolve-small",
             "/train/dataset",
             "/train/train",
             "/train/models",

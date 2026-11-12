@@ -401,6 +401,20 @@
     return f32(Math.min(f32(bw / W), f32(bh / H)) * input) < px;
   }
 
+  // What the page says of a box under the size floor, or null: a box a reviewer rejected or marked
+  // unsure is no training box (nothing is left out for it), and with no floor (null) or a box over
+  // it nothing is said. {chip, note}: the box list's and tag's word, and the selected box's line.
+  // Information only: it changes no box and is never saved.
+  function floorNote(b, w, h, floor) {
+    if (!b || b.state === 'rejected' || b.difficult) return null;
+    if (!underFloor(b.bbox, w, h, floor)) return null;
+    var px = String(Number(Number(floor.px).toFixed(2)));
+    return {
+      chip: 'too small',
+      note: 'Under the size floor (' + px + ' px at ' + floor.input + '): left out of the labels at export.'
+    };
+  }
+
   // labels::unjudged_reject: a reject no reviewer judged (a bulk low-score reject, a dismissal, a
   // model hint the save default rejected).
   function unjudgedReject(b) {
@@ -860,6 +874,7 @@
     COCO_ALIASES: COCO_ALIASES,
     wantedClass: wantedClass,
     underFloor: underFloor,
+    floorNote: floorNote,
     liveRefine: liveRefine,
     refineStrength: refineStrength,
     acceptRefine: acceptRefine,

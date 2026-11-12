@@ -2179,15 +2179,67 @@ web UI and shows its results; the check itself is the one above and changes no b
     (`POST /v1/refine/static-cap` `{cap}`, through the config's one writer like the other settings routes).
     Applies to the next training run; the pre-flight on the Train tab shows what it leaves out (its "Left out of
     training" list carries the static-cap line, once).
-- **Coverage**: the report's recall per camera, scene and class and per size at model input, each with its
-  95% interval, and a note that objects under about 10 px are rarely found.
+- **Too small** (between Static objects and Coverage; `server/refine_floor.rs`): the size floor
+  (`collect.size_floor` `{px, input}`: a box whose short side at the model input is under `px` pixels is too
+  small; default off) and the ignore mode (`training.ignore`). Objects below about one patch of the model's
+  input cannot be learned, so with a floor they are left out of the labels at export (the label files are
+  never changed) and a detection on one counts neither for nor against a model on held-out frames. The card
+  shows, top to bottom:
+  - the last check's **recall by size** (the report's `recall_by_size` and its input size; it lives here, not on
+    Coverage, which points to it);
+  - the **floor form**: `px` (1..=64) and `input` (64..=4096), prefilled with the saved floor or, when off, the
+    suggestion (10 px at the last check's input size, else the newest finished training run's, else 384).
+    *Preview* asks `GET /v1/refine/floor?px=&input=` for the form's values and shows, per class, the boxes,
+    those under the floor and what is left, with a sentence where a floor leaves a class nothing ("every
+    motorcycle label would be left out: the model cannot learn the class from these frames") or under 50
+    labels; a class the floor does not touch is never flagged. *Save* and *Turn off* (shown when one is
+    saved) post `POST /v1/refine/size-floor`. Next to them: "Applies to the next export. Held-out scores from
+    before and after a change do not compare, because the held-out labels change.";
+  - with a floor saved and pending proposals under it, *Resolve N pending proposals as too small...*: the rule
+    `POST /v1/refine/resolve-small`, asked inline like the static spots (a dry run, "Reject N pending
+    auto-label proposals on M unreviewed frames as too small (under the floor). They become ignore regions,
+    are not counted as your decisions, and you can accept one again on the Review tab.", then the write);
+  - the **ignore mode**: *Keep the frame, train the object as background* (default) or *Leave the frame out of
+    training*, with *Save* (`POST /v1/refine/ignore-mode`); see "Ignore regions". The Train tab's pre-flight
+    shows its effect: frames trained with an unlabelled object (`ignore_kept`, per class), frames left out
+    for nothing but ignore regions (`ignore_only`) or because their camera day validates
+    (`ignore_valid_day`), or, in `drop-frame`, every frame with a region (`ignore_frames`).
+  - Routes (admin, HTTPS, same-site; POSTs take 4 KiB JSON, unknown fields refused):
+    - `GET /v1/refine/floor[?px=&input=]` answers `{success, folder_missing, message?, saved: {px,input}|null,
+      shown: {px,input}|null, suggested: {px, input, from: "last_check"|"last_run"|"default"}, bounds:
+      {px_min, px_max, input_min, input_max}, counts: {frames, frames_with, frames_only, per_class: [{class,
+      boxes, under, left}], warnings}|null, pending: {boxes, frames}, ignore_mode}`. `shown` is the query's
+      floor, else the saved one (no query); both `px` and `input` or neither, checked like a saved floor (400).
+      `counts` (`export::floor_counts` over the reviewed frames) and `pending` (the rule's dry run for the shown
+      floor) are null / zero with no floor shown. Off the async workers; kept 60 s per folder, class list and
+      floor (at most 8), dropped by a floor save and by the rule's apply.
+    - `POST /v1/refine/size-floor` `{px, input}` or `{off: true}` answers `{success, message, size_floor}`
+      (null when off); 400 out of bounds or for both / neither.
+    - `POST /v1/refine/ignore-mode` `{mode: "background" | "drop-frame"}` answers `{success, message, mode}`.
+    - `POST /v1/refine/resolve-small` `{dry_run?, limit?}` (`limit` 1..=500, default 500) runs
+      `bulk::bulk_resolve_small` with the **saved** floor (400 when none is saved; 503 `folder_missing`) over
+      the unreviewed frames of the folder under review (the queue and the index files): pending model and
+      auto-labeler boxes under the floor become rejected `too_small` (`reason: size_floor`), which are ignore
+      regions, out of the hard negatives and of the repeats history. Human, moved, unsure and audit boxes,
+      reviewed and skipped frames are never touched and a frame keeps its status. Answer `{success, dry_run,
+      boxes, frames, eligible, failed, failed_count, message}`: a dry run's `boxes` and `frames` cover every
+      eligible frame, so on an unchanged folder they are what an apply with a large enough limit does, and a
+      second apply finds 0.
+  - On the **Review tab** a box under the saved floor shows a *too small* chip in the box list and on its tag
+    and, when selected, "Under the size floor (N px at <input>): left out of the labels at export." It is
+    computed live in the page (`ReviewRules.floorNote` on `underFloor`, from the frame's size, so a resize or
+    a box being drawn follows), from `size_floor` in the labels answer (`GET|POST /v1/review/labels`, null =
+    off: no chip), read with every frame. A rejected or unsure box (already an ignore region) shows none. It
+    changes no box and saves nothing.
+- **Coverage**: the report's recall per camera, scene and class, each with its 95% interval (the per-size table is
+  on the Too small card).
 
 `GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
 `open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card
 `{success, folder_missing, message?, spots: [{id, camera, object, label, bbox, frames, days, stay_days, scenes,
 by_day, labelled, open_adds, crop, sample, sample_size}], truncated, totals: {spots, labelled_boxes, open_adds},
 static_cap, static_cap_default, static_cap_max}` (`bbox` and `crop` normalised; `sample` is the newest labelled
-frame's rel path, `sample_size` its pixels). The tab has no card for a size floor or tighter boxes yet.
+frame's rel path, `sample_size` its pixels). The tab has no card for tighter boxes yet.
 
 ### M1 run (MPS)
 

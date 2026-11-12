@@ -966,6 +966,16 @@ mod tests {
             "id=\"refine-cap-form\"",
             "name=\"cap\" min=\"0\" max=\"100000\" step=\"1\"",
             "id=\"refine-spot-confirm\"",
+            "id=\"refine-floor\"",
+            "id=\"refine-floor-form\"",
+            "name=\"px\" min=\"1\" max=\"64\"",
+            "name=\"input\" min=\"64\" max=\"4096\" step=\"1\"",
+            "id=\"refine-floor-preview\"",
+            "id=\"refine-floor-off\"",
+            "id=\"refine-small-confirm\"",
+            "id=\"refine-ignore-form\"",
+            "name=\"mode\" value=\"background\"",
+            "name=\"mode\" value=\"drop-frame\"",
             "/static/train-refine.js?v=",
         ] {
             assert!(html.contains(want), "{want}");
@@ -974,12 +984,11 @@ mod tests {
         let at = |id: &str| html.find(id).unwrap();
         assert!(
             at("id=\"refine-findings\"") < at("id=\"refine-statics\"")
-                && at("id=\"refine-statics\"") < at("id=\"refine-coverage\""),
+                && at("id=\"refine-statics\"") < at("id=\"refine-floor\"")
+                && at("id=\"refine-floor\"") < at("id=\"refine-coverage\""),
         );
         // No cards for what comes later.
-        for gone in ["size floor", "Tighten"] {
-            assert!(!html.contains(gone), "{gone}");
-        }
+        assert!(!html.contains("Tighten"));
         let anon = super::super::test_util::anonymous(get("/train/refine"));
         let (s, h, _) = call(&state, anon).await;
         assert!(

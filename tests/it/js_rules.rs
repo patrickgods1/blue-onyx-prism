@@ -1852,3 +1852,120 @@ process.stdout.write(JSON.stringify({
     let at = |s: f32| labels::under_floor(&[0.0, 0.0, 300.0, s], 512, 512, cases[0].3);
     assert!(!at(10.0) && at(ulps(10.0, -1)) && !at(ulps(10.0, 1)));
 }
+
+/// What the Review page says of a box under the size floor (`floorNote`): a chip and one line when
+/// a training box is under it, nothing with no floor, a rejected or unsure box or a box over it.
+/// The decision itself is `underFloor`, tested against its Rust twin above.
+#[test]
+fn a_box_under_the_size_floor_gets_a_chip_and_a_line_and_no_floor_gets_none() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const floor = { px: 10, input: 384 };
+// 640 x 480: a box 10 px wide is 6 px at 384, one 200 px wide is 120.
+const tiny = (extra) => Object.assign({ bbox: [100, 100, 110, 300], state: 'accepted', difficult: false }, extra || {});
+const big = { bbox: [100, 100, 300, 300], state: 'accepted', difficult: false };
+process.stdout.write(JSON.stringify({
+  tiny: R.floorNote(tiny(), 640, 480, floor),
+  pending: R.floorNote(tiny({ state: 'pending' }), 640, 480, floor),
+  drawn: R.floorNote(tiny({ state: 'added' }), 640, 480, floor),
+  big: R.floorNote(big, 640, 480, floor),
+  off: R.floorNote(tiny(), 640, 480, null),
+  undef: R.floorNote(tiny(), 640, 480, undefined),
+  badFloor: R.floorNote(tiny(), 640, 480, { px: 0, input: 384 }),
+  rejected: R.floorNote(tiny({ state: 'rejected' }), 640, 480, floor),
+  unsure: R.floorNote(tiny({ difficult: true }), 640, 480, floor),
+  noFrame: R.floorNote(tiny(), 0, 0, floor),
+  noBox: R.floorNote(null, 640, 480, floor),
+  widened: R.floorNote(tiny(), 640, 480, { px: 7.300000190734863, input: 384 }),
+  // Resized to 100 px wide while drawing: 60 px at 384, no longer under.
+  resized: R.floorNote(tiny({ bbox: [100, 100, 200, 300] }), 640, 480, floor),
+}));
+"#;
+    let got = node_with(driver, &json!({}));
+    let line = "Under the size floor (10 px at 384): left out of the labels at export.";
+    for k in ["tiny", "pending", "drawn"] {
+        assert_eq!(got[k], json!({"chip": "too small", "note": line}), "{k}");
+    }
+    for k in [
+        "big", "off", "undef", "badFloor", "rejected", "unsure", "noFrame", "noBox", "resized",
+    ] {
+        assert!(got[k].is_null(), "{k}: {}", got[k]);
+    }
+    // A box 10 px wide is 6 px at 384: under 7.3 too; the f32 floor prints without its tail.
+    assert_eq!(
+        got["widened"]["note"],
+        "Under the size floor (7.3 px at 384): left out of the labels at export."
+    );
+}
+
+/// The Refine tab's pure sentences (`RefineFloor` in `assets/train-refine.js`), loaded in Node
+/// without a page: which classes the floor leaves too few labels, and the question before the rule
+/// writes.
+#[test]
+fn the_too_small_cards_sentences_flag_a_class_the_floor_empties() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+process.stdout.write(JSON.stringify({
+  all: F.classNote({ class: 'motorcycle', boxes: 12, under: 12, left: 0 }),
+  few: F.classNote({ class: 'person', boxes: 300, under: 270, left: 30 }),
+  one: F.classNote({ class: 'bus', boxes: 3, under: 2, left: 1 }),
+  enough: F.classNote({ class: 'car', boxes: 900, under: 100, left: 800 }),
+  edge: F.classNote({ class: 'car', boxes: 100, under: 50, left: 50 }),
+  edge49: F.classNote({ class: 'car', boxes: 99, under: 50, left: 49 }),
+  untouched: F.classNote({ class: 'dog', boxes: 5, under: 0, left: 5 }),
+  nothing: F.classNote(null),
+  phrase: F.phrase({ px: 10, input: 384 }),
+  phraseWide: F.phrase({ px: 7.300000190734863, input: 640 }),
+  one_box: F.resolveText(1, 1),
+  many: F.resolveText(12, 5),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["all"],
+        "every motorcycle label would be left out: the model cannot learn the class from these frames"
+    );
+    assert_eq!(
+        got["few"],
+        "only 30 person labels would be left (under 50): too few to learn the class from"
+    );
+    assert_eq!(
+        got["one"],
+        "only 1 bus label would be left (under 50): too few to learn the class from"
+    );
+    for k in ["enough", "edge", "untouched", "nothing"] {
+        assert_eq!(got[k], "", "{k}");
+    }
+    assert!(
+        got["edge49"]
+            .as_str()
+            .unwrap()
+            .starts_with("only 49 car labels")
+    );
+    assert_eq!(got["phrase"], "under 10 px at 384");
+    assert_eq!(got["phraseWide"], "under 7.3 px at 640");
+    assert_eq!(
+        got["many"],
+        "Reject 12 pending auto-label proposals on 5 unreviewed frames as too small (under the floor). \
+         They become ignore regions, are not counted as your decisions, and you can accept one again on the Review tab."
+    );
+    assert!(
+        got["one_box"]
+            .as_str()
+            .unwrap()
+            .starts_with("Reject 1 pending auto-label proposal on 1 unreviewed frame as too small")
+    );
+}

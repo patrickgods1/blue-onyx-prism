@@ -44,6 +44,7 @@
   var CP = window.ClassPicker || null;
   var CU = CP ? CP.util : null;
   var hiddenClasses = [];  // collect.hidden_classes: not offered by the pickers and shortcuts
+  var sizeFloor = null;    // collect.size_floor {px, input} of the labels answer; null = off
   var catalog = null;      // GET /v1/review/class-catalog
   var shownLabels = [];    // "Show boxes of": empty = every box
   // The pure rules (review-rules.js, tested against their Rust twins by tests/it/js_rules.rs).
@@ -950,11 +951,16 @@
       corners[2], ['s', cx, bb[3]], corners[3], ['w', bb[0], cy]];
   }
 
+  // The size floor's word for box `b` (R.floorNote on the frame's size as it is now, so a resize
+  // or a box being drawn follows), null = nothing to say. Information only.
+  function floorOf(b) { return cur ? R.floorNote(b, cur.width, cur.height, sizeFloor) : null; }
+
   function tagText(b, i) {
     var l = look(b);
     return markOf(b) + (b.difficult ? '?! ' : '') + (i + 1) + ' ' + b.label +
       (b.score != null ? ' ' + fmtScore(b.score) : '') +
-      (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '');
+      (b.source === 'auto' && b.triage === 'accept' && b.state !== 'rejected' ? ' ✓' : '') +
+      (floorOf(b) ? ' · too small' : '');
   }
 
   // The tag's lead for the box the current dataset check suggestion is about (refineRole).
@@ -1520,6 +1526,8 @@
     if (role) li.appendChild(el('span', 'rv-chip ' + (role === 'drop' ? 'bad' : 'ok'), role === 'drop' ? 'drop?' : 'keep'));
     else if (refineRole(i)) li.appendChild(refineChip(i));
     if (b.difficult) li.appendChild(el('span', 'rv-chip warn', 'unsure'));
+    var small = floorOf(b);
+    if (small) li.appendChild(el('span', 'rv-chip warn', small.chip));
     var rp = b.state === 'pending' ? repeatOf(b) : null;
     if (rp) li.appendChild(repeatChip(rp));
     li.appendChild(el('span', 'bx-score muted', fmtScore(b.score)));
@@ -1550,10 +1558,13 @@
     if (role) chips.appendChild(el('span', 'rv-chip ' + (role === 'drop' ? 'bad' : 'ok'), role === 'drop' ? 'drop?' : 'keep'));
     else if (refineRole(i)) chips.appendChild(refineChip(i));
     if (b.difficult) chips.appendChild(el('span', 'rv-chip warn', 'unsure'));
+    var small = floorOf(b);
+    if (small) chips.appendChild(el('span', 'rv-chip warn', small.chip));
     if (b.state === 'rejected' && b.reject_reason) chips.appendChild(el('span', 'rv-chip bad', reasonText(b.reject_reason)));
     li.appendChild(chips);
     var ev = evidence(b);
     if (ev) li.appendChild(el('span', 'bx-note', ev));
+    if (small) li.appendChild(el('span', 'bx-note', small.note));
     // Accept / reject / keep / delete and "It's a <auto label>" are the decision bar's buttons.
     li.addEventListener('click', function () { select(i, oneColumn.matches); });
     return li;
@@ -3342,6 +3353,7 @@
       loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
+      sizeFloor = j.size_floor || null;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null; taps = null;
       emptyBackup = null; missingAsked = null; frameStart = Date.now();
       // Asking for these frames means asking to see those boxes.

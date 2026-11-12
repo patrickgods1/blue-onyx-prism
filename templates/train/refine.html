@@ -70,6 +70,42 @@
   <div id="refine-cap-msg" class="form-msg" role="status"></div>
 </div>
 
+<div class="card" id="refine-floor">
+  <h2>Too small</h2>
+  <p class="muted">Objects smaller than about one patch of the model's input cannot be learned. With a size floor they are left out of the labels at export (your labels are not changed), and a detection on one counts neither for nor against a model on held-out frames.</p>
+  <div id="refine-floor-recall"></div>
+  <h3>Size floor</h3>
+  <form id="refine-floor-form">
+    <label for="refine-floor-px">Under (px, short side)</label>
+    <input type="number" id="refine-floor-px" name="px" min="1" max="64" step="any" value="10">
+    <label for="refine-floor-input">at a model input of (px)</label>
+    <input inputmode="numeric" type="number" id="refine-floor-input" name="input" min="64" max="4096" step="1" value="384">
+    <button type="button" class="secondary" id="refine-floor-preview">Preview</button>
+    <button type="submit" id="refine-floor-save">Save</button>
+    <button type="button" class="secondary" id="refine-floor-off" hidden>Turn off</button>
+  </form>
+  <p class="muted small" id="refine-floor-state">Loading&hellip;</p>
+  <p class="muted small">Applies to the next export. Held-out scores from before and after a change do not compare, because the held-out labels change.</p>
+  <div id="refine-floor-msg" class="form-msg" role="status"></div>
+  <div id="refine-floor-counts" role="status" hidden></div>
+  <div id="refine-floor-pending" hidden>
+    <button type="button" class="secondary" id="refine-floor-resolve">Resolve pending proposals as too small...</button>
+  </div>
+  <div id="refine-small-confirm" class="warn" role="alert" hidden>
+    <p id="refine-small-confirm-text"></p>
+    <div class="actions"><button type="button" id="refine-small-confirm-go">Reject them as too small</button> <button type="button" class="secondary" id="refine-small-confirm-cancel">Cancel</button></div>
+  </div>
+  <div id="refine-small-result" role="status" hidden></div>
+  <h3>Frames with a too-small object</h3>
+  <form id="refine-ignore-form">
+    <label class="check"><input type="radio" name="mode" value="background" checked> Keep the frame, train the object as background (default)</label>
+    <label class="check"><input type="radio" name="mode" value="drop-frame"> Leave the frame out of training</label>
+    <button type="submit" id="refine-ignore-save">Save</button>
+  </form>
+  <p class="muted small">This covers objects under the floor and objects you marked unsure or too small on the Review tab. A frame with nothing else to learn from, and a frame of a day used for validation, is left out in the first mode too. Applies to the next training run; the pre-flight on the <a href="/train/train">Train</a> tab shows what it leaves out.</p>
+  <div id="refine-ignore-msg" class="form-msg" role="status"></div>
+</div>
+
 <div class="card" id="refine-coverage">
   <h2>Coverage</h2>
   <div id="refine-coverage-body"><p class="muted">Loading&hellip;</p></div>

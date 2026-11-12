@@ -1287,14 +1287,24 @@
         wrap.appendChild(t);
         d.appendChild(wrap);
       }
+      // Frames with ignore regions (unsure, too small, under the size floor), by the run's mode
+      // (`training.ignore`, set on the Refine tab): background keeps a frame with a label left and
+      // drops the rest, drop-frame drops every one. Same split as the CLI's text (preflight.rs).
+      var background = p.ignore_mode !== "drop-frame";
       var left = [
-        [p.ignore_frames, "with unsure or too-small boxes"],
+        [background ? 0 : p.ignore_frames, "with unsure or too-small boxes (mode: leave the frame out; change it on the Refine tab)"],
+        [background ? p.ignore_only : 0, "with nothing but unsure or too-small objects (no label to train)"],
+        [background ? p.ignore_valid_day : 0, "with unsure or too-small objects on camera days used for validation"],
         [p.parked_capped, "over the parked-spot cap"],
         [p.static_capped, "showing nothing but parked objects, over the cap per static spot (" + p.static_spots + " spot" + (p.static_spots === 1 ? "" : "s") + " in the data; change the cap on the Refine tab)"],
         [p.duplicates_dropped, "that repeat a frame of another export"],
         [p.scene_filtered, "outside this run's scenes"]
       ].filter(function (x) { return x[0] > 0; }).map(function (x) { return x[0] + " " + x[1]; });
       if (left.length) d.appendChild(mk("p", "muted small", "Left out of training: " + left.join("; ") + "."));
+      if (p.ignore_kept > 0) {
+        var per = Object.keys(p.ignore_boxes_background || {}).sort().map(function (k) { return k + " " + p.ignore_boxes_background[k]; });
+        d.appendChild(mk("p", "muted small", "Trained with an unsure or too-small object left unlabelled (as background): " + p.ignore_kept + " frame" + (p.ignore_kept === 1 ? "" : "s") + (per.length ? " (" + per.join(", ") + ")" : "") + "."));
+      }
       if (p.hard_negatives > 0) d.appendChild(mk("p", "muted small", p.hard_negatives + " of the frames without objects were confirmed empty or had a box rejected on the Review tab."));
       // The static cap is said once, in the list above: its note (the same count, for the CLI's
       // text) names training.static_cap, which no other note does.

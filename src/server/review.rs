@@ -341,6 +341,7 @@ fn labels_answer(
     frame: &Frame,
     classes: &[String],
     hidden: &[String],
+    size_floor: Option<labels::SizeFloor>,
     message: Option<String>,
 ) -> Response {
     let rec = match frame.record() {
@@ -383,6 +384,7 @@ fn labels_answer(
         "labels": file,
         "classes": classes,
         "hidden": hidden,
+        "size_floor": size_floor,
         "classes_version": version,
         "record": {
             "id": rec.id,
@@ -417,8 +419,9 @@ pub(super) async fn labels_get(
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
+        let size_floor = state.config_read().collect.size_floor;
         match Frame::resolve(&dir, &rel) {
-            Some(f) => labels_answer(&f, &classes, &hidden, None),
+            Some(f) => labels_answer(&f, &classes, &hidden, size_floor, None),
             None => no_frame(&state, &dir),
         }
     })
@@ -534,6 +537,7 @@ pub(super) async fn labels_post(
             &frame,
             &classes,
             &hidden,
+            state.config_read().collect.size_floor,
             Some(format!("Saved as {}.", status.as_str())),
         )
     })
