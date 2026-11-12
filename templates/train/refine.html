@@ -51,6 +51,25 @@
   <div id="refine-findings-body"><p class="muted">Loading&hellip;</p></div>
 </div>
 
+<div class="card" id="refine-statics">
+  <h2>Static objects</h2>
+  <p class="muted">A static spot is a place where the same parked object (a car in the driveway, a boat on its trailer) is labelled in most frames of one camera. A frame that shows nothing else there teaches the model little, so a training run keeps only a set number of such frames per spot (20 by default) and leaves the rest out. The same places are where the dataset check looks hardest for a box nobody drew.</p>
+  <div id="refine-statics-body"><p class="muted">Loading&hellip;</p></div>
+  <div id="refine-spot-confirm" class="warn" role="alert" hidden>
+    <p id="refine-spot-confirm-text"></p>
+    <div class="actions"><button type="button" id="refine-spot-confirm-go">Add them</button> <button type="button" class="secondary" id="refine-spot-confirm-cancel">Cancel</button></div>
+  </div>
+  <div id="refine-spot-result" role="status" hidden></div>
+  <h3>Training cap</h3>
+  <form id="refine-cap-form">
+    <label for="refine-cap">Frames kept per static spot</label>
+    <input inputmode="numeric" type="number" id="refine-cap" name="cap" min="0" max="100000" step="1" value="20">
+    <button type="submit" id="refine-cap-save">Save</button>
+  </form>
+  <p class="muted small">0 turns the cap off: every frame is kept. Applies to the next training run; the pre-flight on the <a href="/train/train">Train</a> tab shows what it leaves out.</p>
+  <div id="refine-cap-msg" class="form-msg" role="status"></div>
+</div>
+
 <div class="card" id="refine-coverage">
   <h2>Coverage</h2>
   <div id="refine-coverage-body"><p class="muted">Loading&hellip;</p></div>

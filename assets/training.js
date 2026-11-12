@@ -1290,12 +1290,16 @@
       var left = [
         [p.ignore_frames, "with unsure or too-small boxes"],
         [p.parked_capped, "over the parked-spot cap"],
+        [p.static_capped, "showing nothing but parked objects, over the cap per static spot (" + p.static_spots + " spot" + (p.static_spots === 1 ? "" : "s") + " in the data; change the cap on the Refine tab)"],
         [p.duplicates_dropped, "that repeat a frame of another export"],
         [p.scene_filtered, "outside this run's scenes"]
       ].filter(function (x) { return x[0] > 0; }).map(function (x) { return x[0] + " " + x[1]; });
       if (left.length) d.appendChild(mk("p", "muted small", "Left out of training: " + left.join("; ") + "."));
       if (p.hard_negatives > 0) d.appendChild(mk("p", "muted small", p.hard_negatives + " of the frames without objects were confirmed empty or had a box rejected on the Review tab."));
-      if ((p.notes || []).length) d.appendChild(list(p.notes, "muted small"));
+      // The static cap is said once, in the list above: its note (the same count, for the CLI's
+      // text) names training.static_cap, which no other note does.
+      var notes = (p.notes || []).filter(function (n) { return !(p.static_capped > 0 && n.indexOf("training.static_cap") >= 0); });
+      if (notes.length) d.appendChild(list(notes, "muted small"));
       if ((p.warnings || []).length) d.appendChild(list(p.warnings, "warn-list small"));
       return d;
     };

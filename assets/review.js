@@ -4515,6 +4515,10 @@
       refresh();
     });
   }
+  // A link may name one frame (`?frame=<scene>/<camera>/<date>/<stem>.jpg`, the Refine tab's
+  // "Check these"): read before filtersShown rewrites the address without it.
+  var linkFrame = new URLSearchParams(location.search).get('frame');
+  if (!linkFrame || linkFrame.length > 400 || !/\.jpg$/.test(linkFrame)) linkFrame = null;
   filtersFromUrl();
   filtersShown();
   // A draft (above) opens its frame; the queue's counts load beside it. Gone: the queue as usual.
@@ -4526,6 +4530,14 @@
       draftWaiting = false;
       PrismDraft.drop(DRAFT);
       say('Your unsaved edits from before the page was closed were dropped: their frame is gone.', true);
+      loadNext();
+    });
+  } else if (linkFrame) {
+    // The frame the link names, the counts beside it; Next goes on in the link's filters. Gone: the
+    // queue as usual.
+    loadNext(null, null, true);
+    loadFrame(linkFrame).catch(function () {
+      say('The frame in the link is not in the dataset (any more): showing the queue.', true);
       loadNext();
     });
   } else {

@@ -5,8 +5,13 @@
 // queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (the report, the
 // open suggestions per kind) and read again when a check ends. The check changes no box, so
 // nothing here confirms a box: Review does. The one question asked here is whether a start may
-// replace the open suggestions of the frames it checks (inline, after the server's 409). No
-// inline handlers (CSP); limits come from the inputs' min/max and the server's answers.
+// replace the open suggestions of the frames it checks (inline, after the server's 409). The
+// Static objects card (GET /v1/refine/spots) lists the places where one parked object sits across
+// a camera's frames, with the one bulk action of this tab: "Accept the N at this spot" adds the
+// check's missing boxes there (POST /v1/refine/accept-spot: a dry run first, then the inline
+// question, then the write; the answer names frames to look at in Review) and the training cap
+// (POST /v1/refine/static-cap). No inline handlers (CSP); limits come from the inputs' min/max and
+// the server's answers.
 (function () {
   'use strict';
   var root = document.getElementById('refine-tab');
@@ -463,6 +468,225 @@
     $('refine-start').disabled = !canCheck;
   }
 
+  // ---- static objects
+
+  var spotsById = {};
+  var capDirty = false;
+  var spotsSeq = 0;
+
+  function reviewUrl(camera, extra) {
+    return '/train/review?' + extra + (camera ? '&camera=' + encodeURIComponent(camera) : '');
+  }
+
+  // The place of a spot: the newest frame labelled there, cropped around the box (`crop`, all
+  // normalised), the box drawn over it. Placed with style properties (the CSP has no inline style).
+  function thumb(s) {
+    if (!s.sample || !s.sample_size || !s.crop) return el('span', 'muted small spot-thumb-none', 'no frame to show');
+    var c = s.crop, cw = c[2] - c[0], ch = c[3] - c[1];
+    if (!(cw > 0 && ch > 0)) return el('span', 'muted small spot-thumb-none', 'no frame to show');
+    var wrap = el('div', 'spot-thumb');
+    wrap.style.aspectRatio = (cw * s.sample_size[0]) + ' / ' + (ch * s.sample_size[1]);
+    var img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = 'A ' + s.label + ' parked on camera ' + s.camera;
+    img.src = '/dataset/image?path=' + encodeURIComponent(s.sample);
+    img.style.width = (100 / cw) + '%';
+    img.style.height = (100 / ch) + '%';
+    img.style.left = (-c[0] / cw * 100) + '%';
+    img.style.top = (-c[1] / ch * 100) + '%';
+    wrap.appendChild(img);
+    var b = s.bbox, box = el('div', 'spot-box');
+    box.style.left = ((b[0] - c[0]) / cw * 100) + '%';
+    box.style.top = ((b[1] - c[1]) / ch * 100) + '%';
+    box.style.width = ((b[2] - b[0]) / cw * 100) + '%';
+    box.style.height = ((b[3] - b[1]) / ch * 100) + '%';
+    wrap.appendChild(box);
+    return wrap;
+  }
+
+  function drawSpots(j) {
+    var box = $('refine-statics-body');
+    clear(box);
+    if (!capDirty) $('refine-cap').value = j.static_cap;
+    $('refine-cap').max = j.static_cap_max;
+    spotsById = {};
+    if (j.folder_missing) {
+      box.appendChild(el('p', 'error', j.message || 'The folder under review is not available.'));
+      return;
+    }
+    var t = j.totals || {};
+    if (!j.spots.length) {
+      box.appendChild(el('p', 'muted', 'No static spots yet. A spot needs the same kind of object at the same place on at least 10 reviewed frames of one camera, from at least 2 days.'));
+      return;
+    }
+    box.appendChild(el('p', null, plural(t.spots, 'static spot', 'static spots') + ' on ' +
+      plural(t.labelled_boxes, 'labelled box', 'labelled boxes') + '; ' +
+      plural(t.open_adds, 'missing box', 'missing boxes') + ' suggested there by the dataset check.' +
+      (j.truncated ? ' The busiest ' + j.spots.length + ' are listed.' : '')));
+    var wrap = el('div', 'scroll');
+    var table = el('table', 'rcards');
+    var head = el('thead');
+    var hr = el('tr');
+    ['Camera', 'What', 'Place', 'Frames', 'Days', 'Missing here', ''].forEach(function (h) {
+      hr.appendChild(el('th', /^(Frames|Days|Missing here)$/.test(h) ? 'num' : null, h));
+    });
+    head.appendChild(hr);
+    table.appendChild(head);
+    var body = el('tbody');
+    j.spots.forEach(function (s) {
+      spotsById[s.id] = s;
+      var tr = el('tr');
+      tr.appendChild(el('td', 'rc-title', s.camera));
+      tr.appendChild(el('td', null, s.label)).setAttribute('data-label', 'What');
+      var place = el('td');
+      place.setAttribute('data-label', 'Place');
+      place.appendChild(thumb(s));
+      tr.appendChild(place);
+      tr.appendChild(el('td', 'num', String(s.labelled))).setAttribute('data-label', 'Frames');
+      tr.appendChild(el('td', 'num', String(s.days))).setAttribute('data-label', 'Days');
+      tr.appendChild(el('td', 'num', String(s.open_adds))).setAttribute('data-label', 'Missing here');
+      var act = el('td', 'rc-action');
+      var a = el('a', 'small', 'Review');
+      a.href = reviewUrl(s.camera, 'auto=refine&refine_kind=add');
+      act.appendChild(a);
+      if (s.open_adds > 0) {
+        act.appendChild(document.createTextNode(' '));
+        act.appendChild(button('Accept the ' + s.open_adds + ' at this spot...', 'small secondary', function () { return askSpot(s.id); }));
+      }
+      tr.appendChild(act);
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+    box.appendChild(el('p', 'muted small', 'Frames: reviewed frames with a labelled box at the spot. Missing here: suggestions of the dataset check for a box nobody drew at the spot; nothing is added until you confirm.'));
+  }
+
+  // The last read asked for wins (a read started before an accept may land after it).
+  function loadSpots() {
+    var seq = ++spotsSeq;
+    return getJson('/v1/refine/spots')
+      .then(function (j) { if (seq === spotsSeq) drawSpots(j); })
+      .catch(function (e) {
+        if (seq !== spotsSeq) return;
+        var box = $('refine-statics-body');
+        clear(box);
+        box.appendChild(el('p', 'error', e.message));
+      });
+  }
+
+  // A line under the card's table: the dry run's or the accept's answer, or why it failed.
+  function spotSay(text, bad) {
+    var box = $('refine-spot-result');
+    clear(box);
+    box.appendChild(el('p', bad ? 'error' : null, text));
+    box.hidden = false;
+    return box;
+  }
+
+  // Accepting the open adds of a spot: a dry run says what would happen, the box under the card
+  // asks (inline, no dialog), the second step applies it. Both steps name the spot's id, never a
+  // list of frames: the server judges every frame afresh.
+  var pending = null;
+  function hideSpotConfirm() {
+    $('refine-spot-confirm').hidden = true;
+    pending = null;
+  }
+  function spotName(s) { return 'a ' + s.label + ' on camera ' + s.camera; }
+
+  function askSpot(id) {
+    var s = spotsById[id];
+    hideSpotConfirm();
+    $('refine-spot-result').hidden = true;
+    return postJson('/v1/refine/accept-spot', { spot: id, dry_run: true }).then(function (j) {
+      var text;
+      var weak = j.below_score > 0
+        ? '; ' + j.below_score + ' weaker ' + (j.below_score === 1 ? 'one stays' : 'ones stay') + ' for one-by-one review'
+        : '';
+      var go = $('refine-spot-confirm-go');
+      if (j.accepted === 0) {
+        text = 'Nothing to add at this spot (' + spotName(s) + ') at a score of ' + num(j.min_score) + ' or more' + weak + '.';
+        go.hidden = true;
+      } else {
+        var look = Math.min(10, j.frames);
+        text = 'Add ' + plural(j.accepted, 'box', 'boxes') + ' on ' + plural(j.frames, 'frame', 'frames') +
+          ' at this spot (' + spotName(s) + ', score ' + num(j.min_score) + ' or more' + weak + '). About 1 in 10 such suggestions is wrong: you will get ' +
+          (j.frames > look ? look + ' of the frames' : 'the frames') + ' to look at afterwards.';
+        if (j.eligible > j.frames) text += ' ' + (j.eligible - j.frames) + ' more frame(s) are beyond the limit of one run: run it again after.';
+        go.hidden = false;
+        go.textContent = 'Add them';
+      }
+      $('refine-spot-confirm-text').textContent = text;
+      $('refine-spot-confirm').hidden = false;
+      pending = { id: id, accepted: j.accepted };
+      (go.hidden ? $('refine-spot-confirm-cancel') : go).focus();
+    }).catch(function (e) { spotSay(e.message, true); });
+  }
+
+  function applySpot() {
+    if (!pending) return;
+    var go = $('refine-spot-confirm-go');
+    var s = spotsById[pending.id];
+    var id = pending.id;
+    go.disabled = true;
+    postJson('/v1/refine/accept-spot', { spot: id }).then(function (j) {
+      hideSpotConfirm();
+      var box = spotSay(j.message);
+      if (j.sample && j.sample.length && s) {
+        box.appendChild(el('p', null, 'Check these:'));
+        var ul = el('ul', 'small spot-sample');
+        j.sample.forEach(function (rel) {
+          var li = el('li');
+          var a = el('a', null, rel);
+          a.href = reviewUrl(s.camera, 'status=any&source=all&frame=' + encodeURIComponent(rel));
+          li.appendChild(a);
+          ul.appendChild(li);
+        });
+        box.appendChild(ul);
+      }
+      if (j.failed && j.failed.length) {
+        var bad = el('ul', 'warn-list small');
+        j.failed.forEach(function (t) { bad.appendChild(el('li', null, t)); });
+        box.appendChild(bad);
+      }
+      return load();
+    }).catch(function (e) {
+      hideSpotConfirm();
+      spotSay(e.message, true);
+      return loadSpots();
+    }).then(function () { go.disabled = false; });
+  }
+
+  $('refine-spot-confirm-go').addEventListener('click', applySpot);
+  $('refine-spot-confirm-cancel').addEventListener('click', function () {
+    hideSpotConfirm();
+    $('refine-spot-result').hidden = true;
+  });
+
+  // The training cap: saved as the config's own setting (0 = off).
+  $('refine-cap').addEventListener('input', function () { capDirty = true; });
+  $('refine-cap-form').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var msg = $('refine-cap-msg');
+    var btn = $('refine-cap-save');
+    var n = whole($('refine-cap').value);
+    msg.textContent = '';
+    msg.className = 'form-msg';
+    if (n === null || !isFinite(n) || n < 0 || n !== Math.floor(n)) {
+      msg.textContent = 'Not saved: give a whole number, 0 or more (0 turns the cap off).';
+      msg.className = 'form-msg error';
+      return;
+    }
+    btn.disabled = true;
+    postJson('/v1/refine/static-cap', { cap: n })
+      .then(function (j) {
+        capDirty = false;
+        msg.textContent = j.message;
+      })
+      .catch(function (e) { msg.textContent = e.message; msg.className = 'form-msg error'; })
+      .then(function () { btn.disabled = false; });
+  });
+
   // The state of the page: one read at load, another when a check starts or ends.
   function load() {
     return getJson('/v1/refine')
@@ -471,6 +695,8 @@
         drawFindings(state);
         drawCoverage(state);
         if (state.job) { drawJob(state.job); poller.kick(); } else if (jobId !== null) { clearJob(); }
+        // The spots walk the reviewed frames: after the first paint, not before it.
+        loadSpots();
       })
       .catch(function (e) {
         var box = $('refine-findings-body');

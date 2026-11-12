@@ -206,7 +206,7 @@ fn bulk_limit(given: Option<usize>, default: usize) -> Result<usize, Problem> {
 /// Ends a bulk route's `message` with the `failed` frames it could not change, when there are any:
 /// `" {failed} {not_done} (listed); {fix} them by hand."`. The words are the route's own
 /// (`"frame(s) not changed"`, `"review"`, ...): every message is pinned as it reads.
-fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
+pub(super) fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
     if failed > 0 {
         message.push_str(&format!(
             " {failed} {not_done} (listed); {fix} them by hand."
@@ -217,7 +217,7 @@ fn push_failed(message: &mut String, failed: usize, not_done: &str, fix: &str) {
 /// Ends a bulk route's `message` with the `eligible` frames past its `limit`, when there are any:
 /// `" {n} {more} beyond the limit of {limit}; run it again."`, `more` in the route's words
 /// (`"more frame(s)"`, `"more eligible"`, `"more"`).
-fn push_past_limit(message: &mut String, eligible: usize, limit: usize, more: &str) {
+pub(super) fn push_past_limit(message: &mut String, eligible: usize, limit: usize, more: &str) {
     if eligible > limit {
         message.push_str(&format!(
             " {} {more} beyond the limit of {limit}; run it again.",

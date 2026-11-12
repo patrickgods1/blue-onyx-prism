@@ -2062,12 +2062,42 @@ web UI and shows its results; the check itself is the one above and changes no b
   each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). Also the last report's
   date, folds done of folds, `cancelled`, its warnings and the loose labels counted. Without a report the card
   says no check has run; a damaged or newer-format `report.json` is shown as a problem, never as an error page.
+- **Static objects** (between Findings and Coverage; `server/refine_spots.rs`): the [static spots](#static-spots)
+  of the reviewed frames of the folder under review (`statics::overview`; kept 60 s, dropped when a check starts
+  or ends and after a bulk accept), the busiest 200 first (most missing boxes, then most frames). Per spot: the
+  camera, what (the label), the place (the newest frame labelled there, `/dataset/image`, cropped around the box
+  with the box drawn over it by the page), frames labelled there, days, and *Missing here* = the dataset check's
+  live `add` suggestions that name the spot (`Suggestion.spot`). Actions: *Review* (`/train/review?auto=refine&refine_kind=add&camera=<camera>`)
+  and, with missing boxes, *Accept the N at this spot...*.
+  - **Accept at a spot** (`POST /v1/refine/accept-spot` `{spot, min_score?, dry_run?, limit?}`, 4 KiB, unknown
+    fields refused): every live `add` suggestion of that spot id scoring `min_score` (default 0.5, 0..=1) or more
+    on the reviewed frames, each through `labels::update` + `refine::accept` (never around it: it replaces
+    unjudged rejects, refuses a stale suggestion, keeps the frame reviewed; the new box is `source: auto`,
+    accepted, `reason: "refine"`; nothing else in the file changes). At most `limit` frames (default and
+    maximum 500) are written per call; a rerun takes the rest. `dry_run` runs the same code on the files as read
+    and writes nothing, so on an unchanged folder its `accepted` and `frames` are what the apply does, and a
+    second apply accepts 0. The card asks first, inline: the dry run's numbers, "about 1 in 10 such suggestions is
+    wrong", then *Add them* / *Cancel*; after the write it lists up to 10 frames spread over the days under *Check
+    these*, each opening that frame in Review (`/train/review?status=any&source=all&camera=<camera>&frame=<rel>`).
+    Answer: `{success, dry_run, spot, min_score, accepted, frames, eligible, below_score, stale, failed,
+    failed_count, sample, message}`: `below_score` = live adds at the spot under `min_score` (or no longer
+    fitting once the others were added), left for one-by-one review; `eligible` = frames with something to
+    add, also past the limit; `stale` = frames that changed between the look and the write (passed over);
+    `failed` = the first 20 `<frame>: <why>`. A spot id the reviewed frames do not make is 404 (a label change
+    can move or drop a spot: reload the card), an unplugged folder 503 `folder_missing`, a bad field 400.
+  - **Training cap**: the current `training.static_cap` (0 = off, 0..=100000) in a number field with *Save*
+    (`POST /v1/refine/static-cap` `{cap}`, through the config's one writer like the other settings routes).
+    Applies to the next training run; the pre-flight on the Train tab shows what it leaves out (its "Left out of
+    training" list carries the static-cap line, once).
 - **Coverage**: the report's recall per camera, scene and class and per size at model input, each with its
   95% interval, and a note that objects under about 10 px are rarely found.
 
 `GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
-`open`, `job`, `last`, `capability`, `limits`). The tab has no card for static objects, a size floor or tighter
-boxes yet.
+`open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card
+`{success, folder_missing, message?, spots: [{id, camera, object, label, bbox, frames, days, scenes, by_day,
+labelled, open_adds, crop, sample, sample_size}], truncated, totals: {spots, labelled_boxes, open_adds},
+static_cap, static_cap_default, static_cap_max}` (`bbox` and `crop` normalised; `sample` is the newest labelled
+frame's rel path, `sample_size` its pixels). The tab has no card for a size floor or tighter boxes yet.
 
 ### M1 run (MPS)
 

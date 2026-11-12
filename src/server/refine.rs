@@ -15,7 +15,10 @@
 //!   that would replace open suggestions on the frames it checks asks first: 409 with
 //!   `needs_confirm` and the counts, until the request says `replace_open: true`.
 //!
-//! The check writes suggestions and the report only; nothing here changes a box.
+//! The check writes suggestions and the report only; nothing here changes a box. The Static
+//! objects card's routes (`GET /v1/refine/spots`, `POST /v1/refine/accept-spot`,
+//! `POST /v1/refine/static-cap`) are in [`super::refine_spots`], the one place of this tab that
+//! writes boxes (through [`suggestions::accept`]) or the config.
 
 use super::train_area::{REFINE, tab_title};
 use super::{AppState, Shared, blocking, render, training};
@@ -54,7 +57,7 @@ const OPEN_KEEP: usize = 8;
 /// Largest `report.json` read (a report with this many recall rows is not one this build wrote).
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 
-fn fail(status: StatusCode, message: impl Into<String>) -> Response {
+pub(super) fn fail(status: StatusCode, message: impl Into<String>) -> Response {
     (
         status,
         Json(serde_json::json!({ "success": false, "message": message.into() })),
@@ -208,6 +211,12 @@ fn open_counts(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -
     open
 }
 
+/// Drop every kept count: a label write (the static spots' bulk accept) changed what a walk
+/// would find, so the next read walks again.
+pub(super) fn forget_counts() {
+    OPEN.lock_recover().clear();
+}
+
 /// Put `kept` in `map` under `key`: answers past [`OPEN_TTL`] go first, then the oldest, so at
 /// most [`OPEN_KEEP`] stay (each folder under review and class list ever asked about would
 /// otherwise stay for the life of the process).
@@ -324,7 +333,7 @@ fn last_of(tasks: &[TaskRecord]) -> Option<serde_json::Value> {
 }
 
 /// Ids and states of the checks on the queue: the kept counts are dropped when it changes.
-fn queue_stamp(tasks: &[TaskRecord]) -> String {
+pub(super) fn queue_stamp(tasks: &[TaskRecord]) -> String {
     tasks
         .iter()
         .filter(|t| t.kind == TaskKind::Refine)
@@ -550,7 +559,7 @@ struct CheckBody {
 
 /// The JSON body of a POST: 413 over the cap, 415 without a JSON content type, 400 when it does
 /// not parse (as the Review routes' own reader).
-fn json_body<T: for<'de> Deserialize<'de>>(
+pub(super) fn json_body<T: for<'de> Deserialize<'de>>(
     headers: &HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<T, (StatusCode, String)> {
@@ -952,12 +961,22 @@ mod tests {
             "id=\"refine-preview-btn\"",
             "id=\"refine-findings\"",
             "id=\"refine-coverage\"",
+            "id=\"refine-statics\"",
+            "id=\"refine-cap-form\"",
+            "name=\"cap\" min=\"0\" max=\"100000\" step=\"1\"",
+            "id=\"refine-spot-confirm\"",
             "/static/train-refine.js?v=",
         ] {
             assert!(html.contains(want), "{want}");
         }
+        // The Static objects card sits between Findings and Coverage.
+        let at = |id: &str| html.find(id).unwrap();
+        assert!(
+            at("id=\"refine-findings\"") < at("id=\"refine-statics\"")
+                && at("id=\"refine-statics\"") < at("id=\"refine-coverage\""),
+        );
         // No cards for what comes later.
-        for gone in ["static object", "size floor", "Tighten"] {
+        for gone in ["size floor", "Tighten"] {
             assert!(!html.contains(gone), "{gone}");
         }
         let anon = super::super::test_util::anonymous(get("/train/refine"));
