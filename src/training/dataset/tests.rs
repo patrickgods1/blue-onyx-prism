@@ -267,6 +267,21 @@ fn class_lists_are_mapped_by_name_across_sources() {
     );
     let lb = std::fs::read_to_string(dir.join("labels/s1-b1.txt")).unwrap();
     assert_eq!(lb, "0 0.500000 0.500000 0.200000 0.200000\n");
+    // Every image the lists name, with the source it came from.
+    let sources = read_image_sources(&dir).unwrap();
+    let listed: BTreeSet<String> = ["train.txt", "valid.txt"]
+        .iter()
+        .flat_map(|l| {
+            std::fs::read_to_string(dir.join(l))
+                .unwrap()
+                .lines()
+                .map(|x| x.trim_start_matches("./images/").to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(sources.keys().cloned().collect::<BTreeSet<_>>(), listed);
+    assert_eq!(sources["s0-a1.jpg"].file_name().unwrap(), "a1.jpg");
+    assert_eq!(sources["s1-b1.jpg"].file_name().unwrap(), "b1.jpg");
     let coco: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("train.coco.json")).unwrap()).unwrap();
     let cats: Vec<(i64, String)> = coco["categories"]

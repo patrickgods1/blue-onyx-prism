@@ -1778,7 +1778,9 @@ copies) are split into K folds, whole days at a time (`refine/folds.rs`: largest
 fold with the fewest frames so far, a fixed seed, so a rerun over the same frames uses the same folds).
 For each fold a short model trains on the other folds' frames and is then asked only about the days it
 never saw. Before it runs, the job reads the fold model's `train.txt` and `valid.txt` and stops with an
-error if a frame of its own fold is in either. The fold model is the training run as it is (`train run`'s
+error if a frame of its own fold is in either, by name and by the source the dataset recorded for each
+image (`image_sources.json` beside the lists: the dataset cuts long names and numbers a name taken twice,
+so a name alone could miss one). The fold model is the training run as it is (`train run`'s
 stages), installed in the job's work folder, registered nowhere and benchmarked never.
 
 **The judge** (`refine/judge.rs`, pure) compares the detections of a fold model at score 0.15 or more
@@ -1791,7 +1793,7 @@ verify. Then:
 | Loose label (counted in the report, no suggestion) | A matched pair below IoU 0.75 on a box no reviewer drew, moved or relabelled. |
 | `add`: a box for an object no box labels | An unmatched detection at score 0.5 or more, 10 px or more on its short side at model input, that no live box of its object and no ignore box covers, and no judged reject of its object lies on at IoU 0.5 or more. |
 | `relabel`: another class | A training box no reviewer drew or relabelled, with a detection of another object at score 0.8 or more at IoU 0.7 or more, and no detection of its own object at score 0.3 or more at IoU 0.3 or more. The detection makes no `add`, the box no `verify`. |
-| `verify`: a label no model found | An unmatched training box no reviewer drew or moved, with no detection of its object at score 0.15 or more at IoU 0.3 or more, of a class with 50 training boxes or more in the checked frames, 10 px or more on its short side. |
+| `verify`: a label no model found | An unmatched training box no reviewer drew or moved, with no detection of its object at score 0.15 or more at IoU 0.3 or more, of a class with 50 boxes or more in the frames its fold model trained on, 10 px or more on its short side. |
 
 The constants (`judge.rs`):
 
@@ -1803,14 +1805,15 @@ The constants (`judge.rs`):
 | `ADD_SCORE` | 0.5 | Score from which an unmatched detection is a missing box. |
 | `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. |
 | `VERIFY_IOU` | 0.3 | IoU from which a detection of the object has found a training box. |
-| `MIN_CLASS_BOXES` | 50 | Training boxes of a class from which a `verify` is made for it. |
+| `MIN_CLASS_BOXES` | 50 | Boxes of a class in what the fold model trained on (the selection without the fold's frames) from which a `verify` is made for it: a camera day that holds most of a class leaves its own fold model few. |
 | `RELABEL_IOU` | 0.7 | IoU from which another object's detection lies on a training box. |
 | `RELABEL_SCORE` | 0.8 | Score from which that detection is evidence for a `relabel`. |
 | `RELABEL_BLOCK_SCORE` | 0.3 | Score from which a detection of the labelled object blocks a `relabel`. |
 | `REJECT_BLOCK_IOU` | 0.5 | IoU from which a judged reject of the object blocks an `add` (`labels::MATCH_IOU`). |
 | `FOUND_SCORE`, `FOUND_IOU` | 0.3, 0.5 | When a detection finds a training box in the report's recall. |
 
-A box "covers" a detection (`labels::covers`) at IoU 0.3 or more, or with at least half of the detection
+Detection scores are clamped to 0..1 and boxes to the frame first, so a suggestion never holds what a save
+would refuse. A box "covers" a detection (`labels::covers`) at IoU 0.3 or more, or with at least half of the detection
 inside it, never the other way round. Only suggestions a reviewer would see (`refine::live`) are kept.
 Hidden classes are not judged. Only `reviewed` frames are judged, at write time, under the label write
 lock and on the file as it is then: a frame saved back to unreviewed or skipped meanwhile gets nothing,
@@ -1818,8 +1821,11 @@ and a confirmed-empty frame can get an `add`.
 
 **What it writes.** `refine::apply` changes `LabelFile.refine` and nothing else: the unanswered suggestions
 of the kinds the check makes (`add`, `verify`, `relabel`) are replaced by what it found; answered ones and
-other kinds stay. A found suggestion is dropped when it is the same finding as an answered one (the same
-`target`; for an `add`, a box of the same object at IoU 0.5 or more) or a weaker copy of another found one.
+other kinds stay, except an answered `verify` or `relabel` whose box is gone (moved, relabelled, deleted):
+it could never be live again and is dropped (an answered `add` stays: it keeps the question from coming
+back). A found suggestion is dropped when it is the same finding as an answered one (the same `target` and,
+when both have one, `target_label`; for an `add`, a box of the same object at IoU 0.5 or more), a weaker
+copy of another found one, or outside what a save accepts.
 A frame holds at most 64, strongest first (`add`, then `relabel`, then `tighten`, then `verify`, then by
 score). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
 page can still save. The file format is in [DATASET.md](DATASET.md#label-file-version-1).
@@ -1829,11 +1835,13 @@ page can still save. The file format is in [DATASET.md](DATASET.md#label-file-ve
 | Suggestion | Accept | Dismiss |
 |---|---|---|
 | `add` | A new accepted box (`source: auto`, `reason: refine`, the suggestion's class and score) takes the place of the closest unjudged reject of its object at IoU 0.5 or more and removes the other such rejects, so `hard_negatives.json` does not call the real object a false positive (an unjudged reject is `low_score`, auto-dismissed, or a model hint the save default rejected; a reject with a reason, a spot edit or a duplicate is judged and blocks the `add`). The frame is no longer confirmed empty, and `overlaps_checked` ends if the new box is in a stack or an open pair. The suggestion goes. | Answered `dismissed`. |
-| `relabel` | The box takes the class, the old label stays in `model_label`. The suggestion goes. | Answered `dismissed`. |
-| `tighten` | `orig_bbox` keeps the old box, `bbox` becomes the proposal. The suggestion goes. | Answered `dismissed`. |
+| `relabel` | The box takes the class, the old label stays in `model_label`; `overlaps_checked` ends if the box is now in a stack or an open pair. The suggestion goes. | Answered `dismissed`. |
+| `tighten` | `orig_bbox` keeps the old box, `bbox` becomes the proposal; `overlaps_checked` ends if the box is now in a stack or an open pair. The suggestion goes. | Answered `dismissed`. |
 | `verify` | Answered `kept`; the label stays. | Answered `dismissed`. |
 
-A dismissal changes no box. Answers are remembered: a rerun does not ask the same question again.
+A dismissal changes no box. Answers are remembered: a rerun does not ask the same question again. A
+suggestion names its box by `target` and `target_label`, so two boxes of different objects drawn at the
+same place each get their own.
 `tighten` is read and accepted by the code but the check does not make it.
 
 **The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each check;
@@ -1850,14 +1858,27 @@ objects of days it never saw, at score 0.3 and IoU 0.5.
 frames with pending boxes or labels off the class list are left out and counted); `--frames` narrows it by
 `scene=` and `camera=`, and then narrows the fold models' training too. At least 40 such frames on at least
 2 camera days are needed; K is lowered to the number of camera days when there are fewer (a warning says
-so). The fold models use the newest finished training run's model, input size, batch and multi-scale choice,
+so). The preview and the report warn when a fold holds out more frames than its model trains on (one camera
+day dominates the check: its fold model learns from less than it is asked about) and when a fold model
+trains on fewer than 50 boxes of a class the selection has 50 of (that fold's labels of it get no
+`verify`). A folder under review that is not available (an unplugged drive) refuses the check and the
+preview (`folder_missing`) with the Review page's message, never as an empty dataset, and the report is
+never written into a folder that is gone (only `refine/` is created). The fold models use the newest finished training run's model, input size, batch and multi-scale choice,
 else RF-DETR nano at the GPU's suggested batch; `--epochs` epochs, early stopping off (every epoch runs, the
 best raw epoch is exported), the default learning rate, no augmentation.
 
 **A run** is a task of the training queue (`TaskKind::Refine`, one job at a time), with the stages
 *selecting the reviewed frames*, one *checking fold N of K* each (export, train, check the fold is unseen,
 run the model, write) and *writing the report*. It needs an NVIDIA GPU or Apple silicon and the training
-environment (a download over 500 MB needs `--allow-large` or `allow_large_downloads`). Each fold's folder
+environment (a download over 500 MB needs `--allow-large` or `allow_large_downloads`). It takes the training
+lock after the selection and holds it to the last fold's writes, as the auto-label and overlap jobs hold it;
+each fold's training uses that hold, so no other process (the service, a `train` command) trains or labels
+between a fold's training and its prediction or between two folds, and a lock already held elsewhere
+refuses the check before anything trains. The selection is one snapshot for every fold: a frame whose image
+or label file went since is left out of the fold's training and check, and a frame the fold model cannot
+read (a damaged JPEG) gets no result; both are counted in a warning and the fold goes on. A frame whose
+suggestions cannot be written is a warning (the first 20 named, the rest counted in one line); a fold none
+of whose frames could be written counts as failed. Each fold's folder
 (`<training dir>/refine/<id>/fold-N`) is deleted when the fold is written, the work folder at the end however
 the run ends; a crashed run's is removed by the storage sweep (`WORK_DIRS`). Pause suspends the training
 processes; the export, prediction and writes of the running fold finish first.
@@ -1865,11 +1886,11 @@ processes; the export, prediction and writes of the running fold finish first.
 - **Cancel** keeps the suggestions of the finished folds (a fold is written whole or not at all) and ends
   with a report marked `cancelled` and a summary saying how many folds ran. A cancel before any fold
   finished is a plain cancel.
-- **A failed fold** (training fails, or the fold's frames are found in its training lists) stops the job and
-  fails it. The folds before keep their suggestions and the report, with a warning that the check stopped.
+- **A failed fold** (training fails, the fold's frames are found in its training lists, none of its frames
+  could be written, or the folder under review went) stops the job and fails it. The folds before keep their suggestions and the report, with a warning that the check stopped.
   A fold model is throwaway: there is nothing to retry, run the check again.
 - **A rerun** checks every fold again. The folds are the same for the same frames; unanswered suggestions are
-  replaced, answered ones stay.
+  replaced, answered ones stay (but for those whose box is gone).
 
 ```sh
 blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \

@@ -7,11 +7,19 @@
 //! Steps: 1 selecting, then one per fold, then the report (K + 2; K may be lowered to the camera
 //! days, and the reports then carry the lower count).
 //!
-//! **Fold training** reuses the training run as it is ([`run_training`]): a copy of the planned
-//! [`TrainJob`] per fold with its run folder, dataset and install folder inside the work folder,
-//! [`NoHooks`] (registers nothing, benchmarks nothing), and no record in `runs.json` (only the
-//! queue writes those, and this calls the stage machine directly). It takes the training lock
-//! itself, per fold: this job must not hold it.
+//! **Fold training** reuses the training run as it is ([`job::run_training_holding`]): a copy of
+//! the planned [`TrainJob`] per fold with its run folder, dataset and install folder inside the work
+//! folder, [`NoHooks`] (registers nothing, benchmarks nothing), and no record in `runs.json` (only
+//! the queue writes those, and this calls the stage machine directly). The check takes the training
+//! lock once, after the selection, and holds it to the last fold's writes (like the auto-label and
+//! overlap jobs hold it for their GPU work); each fold's training uses that hold, so no other
+//! process trains or labels between a fold's training and its prediction or between two folds.
+//!
+//! **Frames gone meanwhile.** The selection is one snapshot; each fold leaves out the frames whose
+//! image or label file went since ([`RefineJob::fold_frames`]), and a frame the fold model cannot
+//! read gets no result ([`super::predict::skipping_unreadable`]): both are counted in a warning, the
+//! fold goes on. A folder under review that is not available stops the check with the Review
+//! page's words.
 //!
 //! **Cancel** between or inside folds keeps the suggestions of the finished folds (a fold is
 //! written whole or not at all) and ends with a partial report and summary (`Ok`; a cancel before
@@ -23,11 +31,11 @@
 //! The work folder (`<training dir>/refine/<id>`) is held busy for the whole run, so a storage sweep
 //! leaves it alone, and removed at the end however the run ends.
 
-use super::folds::Group;
 use super::judge::{self, Context};
 use super::predict::{FoldModel, FoldPredictor, LocalPredictor};
 use super::report::{RecallTally, RefineReport};
 use super::{RefineRequest, Selected, fold_model_name, recipe_info, select, write};
+use crate::collect::labels::Frame;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{
     self, BenchSplit, ClassFilter, ExportFrame, ExportRequest, Format, Selection, Split,
@@ -35,14 +43,16 @@ use crate::collect::labels::export::{
 };
 use crate::config::Config;
 use crate::resources::export::Cancelled;
+use crate::resources::export::train::TrainLock;
 use crate::resources::manager;
-use crate::training::autolabel::relabel::Image;
+use crate::training::autolabel::relabel::{Detections, Image};
+use crate::training::dataset;
 use crate::training::job::{self, NoHooks, TrainJob, TrainReport, TrainStage};
 use crate::training::pyenv::{check, is_cancel, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,9 +160,9 @@ fn without_kept_note(message: &str) -> &str {
     message.find(KEPT_NOTE).map_or(message, |at| &message[..at])
 }
 
-/// The flat names in `<data>/train.txt` and `valid.txt` (the training dataset's image lines,
-/// `./images/s<source>-<flat name>`), back to flat names as the export wrote them.
-fn trained_names(data: &Path) -> Result<BTreeSet<String>> {
+/// The image lines of `<data>/train.txt` and `valid.txt` (`./images/s<source>-<flat name>`, a
+/// line per repeat), each once.
+fn trained_lines(data: &Path) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for list in ["train.txt", "valid.txt"] {
         let path = data.join(list);
@@ -162,12 +172,58 @@ fn trained_names(data: &Path) -> Result<BTreeSet<String>> {
                 path.display()
             )
         })?;
-        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let name = line.rsplit(['/', '\\']).next().unwrap_or(line);
-            out.insert(strip_source(name).to_string());
-        }
+        out.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string),
+        );
     }
     Ok(out)
+}
+
+/// The flat names of trained `lines`, back to flat names as the export wrote them.
+fn trained_names(lines: &BTreeSet<String>) -> BTreeSet<String> {
+    lines
+        .iter()
+        .map(|line| {
+            let name = line.rsplit(['/', '\\']).next().unwrap_or(line);
+            strip_source(name).to_string()
+        })
+        .collect()
+}
+
+/// The fold frames among the sources of the images the lists `lines` name, by the dataset's own
+/// record of where each image came from ([`dataset::IMAGE_SOURCES_FILE`] in `data`): a source is
+/// an image of the fold's export, whose file name is the frame's flat name. Exact whatever the
+/// dataset named the image (its 120-byte cut, a `-2` for a name taken twice). A listed image the
+/// record does not name, or no record, is an error: the check cannot be made.
+fn by_provenance<'f>(
+    data: &Path,
+    lines: &BTreeSet<String>,
+    fold: &[&'f ExportFrame],
+) -> Result<Vec<&'f ExportFrame>> {
+    let sources = dataset::read_image_sources(data)
+        .context("reading where the fold model's training images came from")?;
+    let mut trained: BTreeSet<String> = BTreeSet::new();
+    for line in lines {
+        let name = line.rsplit(['/', '\\']).next().unwrap_or(line);
+        let Some(src) = sources.get(name) else {
+            bail!(
+                "{name} in the fold model's training lists is not in {}: the check cannot tell \
+                 which frame it is",
+                data.join(dataset::IMAGE_SOURCES_FILE).display()
+            );
+        };
+        if let Some(n) = src.file_name() {
+            trained.insert(n.to_string_lossy().into_owned());
+        }
+    }
+    Ok(fold
+        .iter()
+        .filter(|f| trained.contains(&f.name))
+        .copied()
+        .collect())
 }
 
 /// `name` without the dataset's `s<digits>-` source prefix.
@@ -218,15 +274,75 @@ fn count_written(rep: &mut RefineReport, sample: &mut Vec<String>, w: &write::Wr
     sample.extend(w.sample.iter().take(room).cloned());
 }
 
+/// What the folds of a check add up: the report, the recall tally, the sample, and how many
+/// per-frame write failures the report names ([`write::MAX_FAILURES`] over the whole check; the
+/// rest are counted in one line, so `report.json` and the task record stay small).
+#[derive(Debug)]
+pub struct Acc {
+    pub rep: RefineReport,
+    pub tally: RecallTally,
+    pub sample: Vec<String>,
+    /// Write failures named in `rep.warnings`.
+    pub failures_shown: usize,
+    /// Write failures not named.
+    pub failures_more: usize,
+}
+
+impl Acc {
+    pub fn new(rep: RefineReport) -> Self {
+        Self {
+            rep,
+            tally: RecallTally::default(),
+            sample: Vec::new(),
+            failures_shown: 0,
+            failures_more: 0,
+        }
+    }
+
+    /// Name the write failures of `w` in the report while fewer than [`write::MAX_FAILURES`] are,
+    /// count the others.
+    pub fn note_failures(&mut self, w: &write::Written) {
+        for f in &w.failures {
+            if self.failures_shown < write::MAX_FAILURES {
+                self.rep.warnings.push(f.clone());
+                self.failures_shown += 1;
+            } else {
+                self.failures_more += 1;
+            }
+        }
+        self.failures_more += w.failed.saturating_sub(w.failures.len());
+    }
+
+    /// The one line for the failures not named, when there are any (at the end of a check).
+    pub fn close_failures(&mut self) {
+        if self.failures_more > 0 {
+            self.rep.warnings.push(format!(
+                "... and {} more frames whose suggestions could not be written",
+                self.failures_more
+            ));
+            self.failures_more = 0;
+        }
+    }
+}
+
 /// The hard check before predicting: no frame of the fold is in the fold model's training or
-/// validation lists. One that is would make the check meaningless, so the job fails loudly.
+/// validation lists (`<data>/train.txt`, `valid.txt`): by name, then by the source the dataset
+/// recorded for every image they list ([`by_provenance`]: the dataset's own names can differ from
+/// the export's). One that is would make the check meaningless, so the job fails loudly.
 pub fn check_unseen(data: &Path, fold: &[&ExportFrame]) -> Result<()> {
-    let trained = trained_names(data)?;
-    let leaked: Vec<&str> = fold
+    let lines = trained_lines(data)?;
+    let trained = trained_names(&lines);
+    let mut leaked: Vec<&str> = fold
         .iter()
         .filter(|f| trained.contains(&dataset_spelling(&f.name)) || trained.contains(&f.name))
         .map(|f| f.name.as_str())
         .collect();
+    if leaked.is_empty() {
+        leaked = by_provenance(data, &lines, fold)?
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+    }
     if !leaked.is_empty() {
         bail!(
             "{} frame(s) of the held-out fold are in the fold model's training or validation \
@@ -277,15 +393,42 @@ impl RefineJob {
         }
     }
 
-    /// What every frame of the check shares in the judge: the fold models' input size, the
-    /// selection's training boxes per class, this check's id.
-    fn judge_context<'a>(&'a self, wanted: &'a Wanted<'a>, s: &'a Selected) -> Context<'a> {
+    /// What every frame of a fold shares in the judge: the fold models' input size, the training
+    /// boxes per class of what this fold's model trained on (`class_boxes`,
+    /// [`super::class_boxes`]), this check's id.
+    fn judge_context<'a>(
+        &'a self,
+        wanted: &'a Wanted<'a>,
+        class_boxes: &'a BTreeMap<String, usize>,
+    ) -> Context<'a> {
         Context {
             wanted,
             imgsz: self.train.request.recipe.imgsz,
-            class_boxes: &s.class_boxes,
+            class_boxes,
             run: &self.id,
         }
+    }
+
+    /// The frames of fold `i` of `s` still on disk, as the fold uses them: (held out, trained on,
+    /// gone). The selection is one snapshot for every fold, and a fold may start an hour after it:
+    /// a frame whose image or label file was deleted or moved since is left out of both sides
+    /// (the export would fail on it), and counted.
+    pub fn fold_frames<'s>(
+        &self,
+        s: &'s Selected,
+        i: usize,
+    ) -> (Vec<&'s ExportFrame>, Vec<&'s ExportFrame>, usize) {
+        let present = |f: &&ExportFrame| {
+            f.image.is_file()
+                && Frame::resolve(&self.dataset_dir, &f.rel.jpg())
+                    .is_some_and(|fr| fr.labels.is_file())
+        };
+        let (held, train) = s.fold_frames(i);
+        let all = held.len() + train.len();
+        let held: Vec<&ExportFrame> = held.into_iter().filter(present).collect();
+        let train: Vec<&ExportFrame> = train.into_iter().filter(present).collect();
+        let gone = all - held.len() - train.len();
+        (held, train, gone)
     }
 
     /// The report of a check over the selection `s` before any fold ran.
@@ -304,7 +447,52 @@ impl RefineJob {
                 s.groups.len()
             ));
         }
+        rep.warnings
+            .extend(s.fold_warnings(&self.classes, &self.hidden));
         rep
+    }
+
+    /// Write fold `n` of `k`'s suggestions for its `held` frames from `found` (judged with `jctx`)
+    /// and count them into `acc`; an error when every frame with a result failed to write (then
+    /// nothing of the fold was saved, and it does not count as done). The real fold and the replay
+    /// test share it.
+    #[allow(clippy::too_many_arguments)]
+    fn write_fold_into(
+        &self,
+        n: usize,
+        k: usize,
+        held: &[&ExportFrame],
+        found: &Detections,
+        jctx: &Context<'_>,
+        acc: &mut Acc,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<write::Written> {
+        let w = write::write_fold(
+            &self.dataset_dir,
+            held,
+            found,
+            jctx,
+            &mut acc.tally,
+            progress,
+        );
+        acc.note_failures(&w);
+        if w.missing > 0 && !found.cancelled {
+            acc.rep.warnings.push(format!(
+                "fold {n} of {k}: {} frame(s) got no result from the fold model (the image is \
+                 gone or cannot be read); they were not checked",
+                w.missing
+            ));
+        }
+        if w.all_failed() {
+            bail!(
+                "fold {n} of {k}: none of its {} frames could be written ({}); nothing of this \
+                 fold was saved",
+                w.attempted,
+                w.failures.first().map_or("no reason given", String::as_str)
+            );
+        }
+        count_written(&mut acc.rep, &mut acc.sample, &w);
+        Ok(w)
     }
 
     fn predictor(&self) -> Arc<dyn FoldPredictor> {
@@ -314,20 +502,19 @@ impl RefineJob {
     }
 
     /// One fold (0-based `i` of `s.k`): export, train, check, predict, write, clean up. Its
-    /// suggestions are written only once the fold model's results are complete.
+    /// suggestions are written only once the fold model's results are complete. `lock` is the
+    /// training lock the check holds for its whole run (the fold's training uses it).
     #[allow(clippy::too_many_arguments)]
     fn run_fold(
         &self,
         i: usize,
         s: &Selected,
-        jctx: &Context<'_>,
+        lock: &TrainLock,
         predictor: &dyn FoldPredictor,
         ctx: TaskContext<'_>,
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
-        tally: &mut RecallTally,
-        rep: &mut RefineReport,
-        sample: &mut Vec<String>,
+        acc: &mut Acc,
     ) -> Result<()> {
         let k = s.k;
         let n = i + 1;
@@ -335,11 +522,30 @@ impl RefineJob {
         let at = i + 2;
         let name = format!("checking fold {n} of {k}");
         let fold_dir = self.work.join(format!("fold-{n}"));
-        let fold_of = |f: &ExportFrame| -> Option<usize> {
-            let g: Group = (f.rel.camera.clone(), f.rel.date.clone());
-            s.folds.get(&g).copied()
-        };
-        let fold: Vec<&ExportFrame> = s.frames.iter().filter(|f| fold_of(f) == Some(i)).collect();
+        // The folder under review may have gone since the last fold (an unplugged drive): that is
+        // no fold of gone frames.
+        if let Some(why) = self.config.collect.review_folder_problem(&self.dataset_dir) {
+            bail!("fold {n} of {k}: {why}");
+        }
+        let (fold, train, gone) = self.fold_frames(s, i);
+        if gone > 0 {
+            acc.rep.warnings.push(format!(
+                "fold {n} of {k}: {gone} selected frame(s) are gone (deleted or moved since the \
+                 check started) and were left out of its training and its check"
+            ));
+        }
+        if fold.is_empty() {
+            acc.rep.warnings.push(format!(
+                "fold {n} of {k}: every frame it holds out is gone; nothing to check"
+            ));
+            return Ok(());
+        }
+        if train.is_empty() {
+            bail!("fold {n} of {k}: every frame its model would train on is gone");
+        }
+        let wanted = self.wanted();
+        let class_boxes = super::class_boxes(train.iter().copied(), &wanted);
+        let jctx = self.judge_context(&wanted, &class_boxes);
         // (a) Export with the fold held out.
         Self::step(
             report,
@@ -350,24 +556,31 @@ impl RefineJob {
             &format!(
                 "exporting: {} frames held out, {} to train on",
                 fold.len(),
-                s.frames.len() - fold.len()
+                train.len()
             ),
         );
         manager::remove_any(&fold_dir)?;
         std::fs::create_dir_all(&fold_dir)
             .with_context(|| format!("creating {}", fold_dir.display()))?;
         let export_dir = fold_dir.join("export");
+        let rels =
+            |v: &[&ExportFrame]| -> BTreeSet<String> { v.iter().map(|f| f.rel.jpg()).collect() };
+        let (held_rels, train_rels) = (rels(&fold), rels(&train));
         let selection = Selection {
+            // The selection's order, gone frames left out.
             frames: s
                 .frames
                 .iter()
-                .map(|f| ExportFrame {
-                    split: if fold_of(f) == Some(i) {
+                .filter_map(|f| {
+                    let rel = f.rel.jpg();
+                    let split = if held_rels.contains(&rel) {
                         Split::Val
-                    } else {
+                    } else if train_rels.contains(&rel) {
                         Split::Train
-                    },
-                    ..f.clone()
+                    } else {
+                        return None;
+                    };
+                    Some(ExportFrame { split, ..f.clone() })
                 })
                 .collect(),
             ..Selection::default()
@@ -406,8 +619,9 @@ impl RefineJob {
         tj.request.install_dir = Some(fold_dir.join("model"));
         tj.keep_work = false;
         tj.export_only = None;
-        let trained = job::run_training(
+        let trained = job::run_training_holding(
             &tj,
+            lock,
             ctx.runner,
             ctx.fetcher,
             &NoHooks,
@@ -494,26 +708,17 @@ impl RefineJob {
         }
         // (e, f) Judge and write, under the label write lock (no cancel checks: a fold is written
         // whole).
-        let w = write::write_fold(
-            &self.dataset_dir,
-            &fold,
-            &found,
-            jctx,
-            tally,
-            &mut rep.warnings,
-            &mut |d, total| {
-                let pct = 95 + d * 5 / total.max(1);
-                Self::step(
-                    report,
-                    &name,
-                    at,
-                    steps,
-                    u8::try_from(pct).unwrap_or(99),
-                    &format!("writing suggestions: {d} of {total} frames"),
-                );
-            },
-        );
-        count_written(rep, sample, &w);
+        let w = self.write_fold_into(n, k, &fold, &found, &jctx, acc, &mut |d, total| {
+            let pct = 95 + d * 5 / total.max(1);
+            Self::step(
+                report,
+                &name,
+                at,
+                steps,
+                u8::try_from(pct).unwrap_or(99),
+                &format!("writing suggestions: {d} of {total} frames"),
+            );
+        })?;
         Self::step(
             report,
             &name,
@@ -548,14 +753,22 @@ impl RefineJob {
             0,
             &self.request.frames.describe(),
         );
+        // An unavailable folder (an unplugged drive) is its own answer, never an empty dataset.
+        if let Some(why) = self.config.collect.review_folder_problem(&self.dataset_dir) {
+            bail!("{why}");
+        }
         let s = self.select();
         if let Some(why) = &s.refused {
             bail!("{why}");
         }
+        // The GPU is this check's from the first fold's training to the last fold's writes: held
+        // across the folds, so no other process (the service or a `train` command) trains or
+        // labels between a fold's training and its prediction, or takes the next fold's turn.
+        let lock = TrainLock::try_acquire(&self.train.paths.train_lock_file())?;
         let k = s.k;
         // From here on the count the folds were lowered to ([`Task::steps`] has the asked one).
         let steps = steps_for(k);
-        let mut rep = self.start_report(&s);
+        let mut acc = Acc::new(self.start_report(&s));
         Self::step(
             report,
             SELECTING,
@@ -570,11 +783,7 @@ impl RefineJob {
         );
         check(cancel)?;
         // 2. The folds.
-        let wanted = self.wanted();
-        let jctx = self.judge_context(&wanted, &s);
         let predictor = self.predictor();
-        let mut tally = RecallTally::default();
-        let mut sample = Vec::new();
         let mut stop = None;
         for i in 0..k {
             if cancel.load(Ordering::Relaxed) {
@@ -584,17 +793,15 @@ impl RefineJob {
             let r = self.run_fold(
                 i,
                 &s,
-                &jctx,
+                &lock,
                 predictor.as_ref(),
                 ctx,
                 report,
                 cancel,
-                &mut tally,
-                &mut rep,
-                &mut sample,
+                &mut acc,
             );
             match r {
-                Ok(()) => rep.folds_done += 1,
+                Ok(()) => acc.rep.folds_done += 1,
                 Err(e) if is_cancel(&e) || cancel.load(Ordering::Relaxed) => {
                     stop = Some(Stop::Cancelled);
                     break;
@@ -605,7 +812,8 @@ impl RefineJob {
                 }
             }
         }
-        if rep.folds_done == 0 {
+        drop(lock);
+        if acc.rep.folds_done == 0 {
             match stop {
                 Some(Stop::Cancelled) => return Err(anyhow!(Cancelled)),
                 Some(Stop::Failed(e)) => return Err(e),
@@ -614,6 +822,13 @@ impl RefineJob {
         }
         // 3. The report (also of a stopped check: what its finished folds found).
         Self::step(report, REPORTING, steps, steps, 0, "");
+        acc.close_failures();
+        let Acc {
+            mut rep,
+            tally,
+            sample,
+            ..
+        } = acc;
         rep.cancelled = matches!(stop, Some(Stop::Cancelled));
         if let Some(Stop::Failed(e)) = &stop {
             rep.warnings.push(format!("the check stopped: {e:#}"));
@@ -639,17 +854,18 @@ impl RefineJob {
             _ => String::new(),
         };
         summary.push_str(&format!(
-            "{} frames checked by {} fold models: {} missing boxes, {} labels to verify, {} other \
-             classes suggested ({} new), {} loose labels; {} frames changed. No box was changed: \
-             confirm them on the Review tab",
+            "{} frames checked by {} fold models; suggested: {} missing boxes, {} labels to \
+             verify, {} other classes ({} of these suggestions new since the last check, on {} \
+             frames written); {} loose labels counted. No box was changed: confirm the \
+             suggestions on the Review tab",
             n(rep.frames_checked),
             rep.folds_done,
             n(f.add),
             n(f.verify),
             n(f.relabel),
             n(w.total()),
-            n(rep.loose),
             n(rep.frames_written),
+            n(rep.loose),
         ));
         if let Some(p) = &report_path {
             summary.push_str(&format!("; report: {}", p.display()));

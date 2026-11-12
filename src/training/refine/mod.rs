@@ -326,6 +326,82 @@ fn sort_warnings(sel: &Selection, left_out: &mut LeftOut) -> Vec<String> {
     rest
 }
 
+/// Training boxes per wanted class (the list's spelling) of `frames`, ignore regions left out:
+/// with the frames a fold model trains on, what [`judge::Context::class_boxes`] holds for it.
+pub fn class_boxes<'a>(
+    frames: impl IntoIterator<Item = &'a ExportFrame>,
+    wanted: &Wanted<'_>,
+) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for f in frames {
+        for b in f.labels.training().filter(|b| !b.is_ignore()) {
+            if let Some(c) = wanted.class_of(&b.label) {
+                *out.entry(c.to_string()).or_default() += 1;
+            }
+        }
+    }
+    out
+}
+
+impl Selected {
+    /// The frames of fold `i` (0-based): (held out, trained on), in the selection's order.
+    pub fn fold_frames(&self, i: usize) -> (Vec<&ExportFrame>, Vec<&ExportFrame>) {
+        self.frames.iter().partition(|f| {
+            self.folds
+                .get(&(f.rel.camera.clone(), f.rel.date.clone()))
+                .is_some_and(|&k| k == i)
+        })
+    }
+
+    /// What the selection's folds warn about (the preview and the report say it before any fold
+    /// runs):
+    ///
+    /// - a fold that holds out more frames than its model trains on (a camera day that large
+    ///   dominates the check: its fold model learns from less than it is asked about, so its
+    ///   misses say more about the model than about the labels);
+    /// - a class with [`judge::MIN_CLASS_BOXES`] training boxes or more in the selection but fewer
+    ///   in what a fold model trains on: that fold's labels of it get no `verify`.
+    pub fn fold_warnings(&self, classes: &[String], hidden: &[String]) -> Vec<String> {
+        let wanted = Wanted { classes, hidden };
+        let mut out = Vec::new();
+        for i in 0..self.k {
+            let n = i + 1;
+            let (held, train) = self.fold_frames(i);
+            if train.len() < held.len() {
+                out.push(format!(
+                    "fold {n} of {k} holds out {h} frames and its model trains on only {t}: a \
+                     camera day this large dominates the check, and what its model misses says \
+                     more about the model than about the labels; review frames of other camera \
+                     days to balance it",
+                    k = self.k,
+                    h = held.len(),
+                    t = train.len(),
+                ));
+            }
+            let fold = class_boxes(train, &wanted);
+            let rare: Vec<String> = self
+                .class_boxes
+                .iter()
+                .filter(|(_, all)| **all >= judge::MIN_CLASS_BOXES)
+                .filter_map(|(c, _)| {
+                    let k = fold.get(c).copied().unwrap_or(0);
+                    (k < judge::MIN_CLASS_BOXES).then(|| format!("{c} ({k})"))
+                })
+                .collect();
+            if !rare.is_empty() {
+                out.push(format!(
+                    "fold {n} of {k} trains on fewer than {min} boxes of {list}: its frames' \
+                     labels of these classes get no verify suggestion",
+                    k = self.k,
+                    min = judge::MIN_CLASS_BOXES,
+                    list = rare.join(", "),
+                ));
+            }
+        }
+        out
+    }
+}
+
 /// Select the frames of a check of `dataset_dir` (read only) and fold them.
 pub fn select(
     dataset_dir: &Path,
@@ -352,12 +428,8 @@ pub fn select(
         *out.groups
             .entry((f.rel.camera.clone(), f.rel.date.clone()))
             .or_default() += 1;
-        for b in f.labels.training().filter(|b| !b.is_ignore()) {
-            if let Some(c) = wanted.class_of(&b.label) {
-                *out.class_boxes.entry(c.to_string()).or_default() += 1;
-            }
-        }
     }
+    out.class_boxes = class_boxes(&out.frames, &wanted);
     // Folded even when refused below, so a preview shows what a check would do.
     match folds::assign(&out.groups, k, FOLD_SEED) {
         Ok(f) => {
@@ -409,6 +481,10 @@ pub struct RefinePreview {
     pub warnings: Vec<String>,
     /// Why the check would be refused; None = it can run.
     pub refused: Option<String>,
+    /// The folder under review is not available (an unplugged drive): `refused` says so, and
+    /// nothing was counted. Never an empty dataset.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder_missing: bool,
 }
 
 /// What a check of `request` on `config` would do: no GPU, login or download needed, nothing
@@ -420,16 +496,25 @@ pub fn preview(
 ) -> Result<RefinePreview> {
     request.validate()?;
     let dir = config.collect.resolved_review_dir(&config.data_root());
-    let s = select(
-        &dir,
-        &config.collect.classes,
-        &config.collect.hidden_classes,
-        &request.frames,
-        request.folds,
-        MIN_FRAMES,
-    );
+    // An unavailable folder (an unplugged drive) is its own answer, never an empty dataset.
+    let missing = config.collect.review_folder_problem(&dir);
+    let mut s = match &missing {
+        Some(_) => Selected::default(),
+        None => select(
+            &dir,
+            &config.collect.classes,
+            &config.collect.hidden_classes,
+            &request.frames,
+            request.folds,
+            MIN_FRAMES,
+        ),
+    };
+    if missing.is_some() {
+        s.refused.clone_from(&missing);
+    }
     let (recipe, from) = choose_recipe(config, request.epochs, cap)?;
     let mut warnings = s.warnings.clone();
+    warnings.extend(s.fold_warnings(&config.collect.classes, &config.collect.hidden_classes));
     let mut folds: Vec<FoldPreview> = (0..s.k)
         .map(|i| FoldPreview {
             fold: i + 1,
@@ -519,6 +604,7 @@ pub fn preview(
         seconds,
         warnings,
         refused: s.refused,
+        folder_missing: missing.is_some(),
     })
 }
 

@@ -113,28 +113,11 @@ fn success(fields: serde_json::Value) -> Response {
     Json(v).into_response()
 }
 
-/// Why the folder under review `dir` cannot be used, as the page words it; None when it can. A
-/// folder that does not exist, an unmounted drive first of all, would otherwise look like an empty
-/// dataset. Only the dataset folder may be absent, when its parent is there: nothing was collected
-/// yet (a parent that is gone too is an unplugged drive). A chosen `review_dir` must exist.
+/// Why the folder under review `dir` cannot be used, as the page words it; None when it can
+/// ([`crate::collect::CollectConfig::review_folder_problem`]: an absent folder is not an empty
+/// dataset).
 pub(super) fn folder_problem(state: &AppState, dir: &std::path::Path) -> Option<String> {
-    let e = std::fs::read_dir(dir).err()?;
-    let collect = &state.config_read().collect;
-    if e.kind() == std::io::ErrorKind::NotFound
-        && collect.review_dir.is_none()
-        && (collect.dir.is_none() || dir.parent().is_some_and(std::path::Path::is_dir))
-    {
-        return None;
-    }
-    let why = match e.kind() {
-        std::io::ErrorKind::NotFound => String::new(),
-        _ => format!(" ({e})"),
-    };
-    Some(format!(
-        "The folder under review is not available: {}{why}; connect the drive or choose another \
-         folder.",
-        dir.display()
-    ))
+    state.config_read().collect.review_folder_problem(dir)
 }
 
 /// The answer of a route that needs the folder under review while it is unavailable.

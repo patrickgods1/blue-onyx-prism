@@ -16,11 +16,13 @@
 //!   between two vehicle classes ([`same_object`]), which name one object.
 //! - **verify**: a training box no model found; accepting keeps the label ([`Answer::Kept`]).
 //!
-//! **Keys.** `target` names an existing box by its exact `bbox`. A suggestion whose box moved, went
-//! or changed so the rule above no longer holds is stale and ignored ([`live`]), never an error. An
-//! answered suggestion ([`Suggestion::answer`]) is never live again; a kind or an answer this build
-//! does not know (a newer build's) loads as `Unknown`, is never live, and stays in the file. A frame
-//! holds at most [`MAX_SUGGESTIONS`], strongest first ([`strength`]).
+//! **Keys.** `target` names an existing box by its exact `bbox`, and by its label too when
+//! `target_label` is set (two boxes of different objects can share a `bbox`). A suggestion whose box
+//! moved, went or changed so the rule above no longer holds is stale and ignored ([`live`]), never
+//! an error. An answered suggestion ([`Suggestion::answer`]) is never live again; one whose box is
+//! gone is dropped by the next check ([`apply`]); a kind or an answer this build does not know (a
+//! newer build's) loads as `Unknown`, is never live, and stays in the file. A frame holds at most
+//! [`MAX_SUGGESTIONS`], strongest first ([`strength`]).
 //!
 //! The Review tab will state [`live`], [`accept`] and [`dismiss`] in JavaScript: keep them in step.
 
@@ -111,6 +113,12 @@ pub struct Suggestion {
     /// The existing box (`tighten`, `relabel`, `verify`), by its exact `bbox`: the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<[f32; 4]>,
+    /// The label of the box `target` names, as it was when the check wrote it (trimmed,
+    /// case-insensitive): with it the key is the `bbox` and the label, so of two boxes of
+    /// different objects at the very same place the suggestion names the right one. None (files
+    /// of the first checks): the `bbox` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_label: Option<String>,
     /// The proposed box (`add`, `tighten`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bbox: Option<[f32; 4]>,
@@ -184,12 +192,31 @@ fn one_object(a: &str, b: &str) -> bool {
     )
 }
 
-/// The first box `s.target` names that is a training box no reviewer drew and that `ok` takes.
+/// Two labels written alike: trimmed, case-insensitive.
+fn same_label(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Whether `b` is the box `s` names: its exact `bbox`, and its label when `s` has one
+/// ([`Suggestion::target_label`]). False without a `target`.
+fn names(s: &Suggestion, b: &LabelBox) -> bool {
+    s.target.is_some_and(|t| b.bbox == t)
+        && s.target_label
+            .as_deref()
+            .is_none_or(|l| same_label(&b.label, l))
+}
+
+/// The first box `s` names ([`names`]) that is a training box no reviewer drew and that `ok`
+/// takes.
 fn target_box(f: &LabelFile, s: &Suggestion, ok: impl Fn(&LabelBox) -> bool) -> Option<usize> {
-    let t = s.target?;
     f.boxes
         .iter()
-        .position(|b| b.bbox == t && b.is_training() && b.source != Source::Human && ok(b))
+        .position(|b| names(s, b) && b.is_training() && b.source != Source::Human && ok(b))
+}
+
+/// The kinds that name an existing box by `target`.
+const fn has_target(k: Kind) -> bool {
+    matches!(k, Kind::Tighten | Kind::Relabel | Kind::Verify)
 }
 
 /// Where an `add` goes: None when it is not live, else the rejects it replaces ([`Live::replaces`]).
@@ -307,16 +334,11 @@ pub fn open_count(f: &LabelFile, wanted: Option<&Wanted<'_>>) -> u32 {
 }
 
 /// Whether the box at `at` is in a stack or an open pair of `f` ([`stacks`]): a reviewer's earlier
-/// look at the frame's overlaps did not cover it.
+/// look at the frame's overlaps did not cover it. `wanted` None: every label wanted.
 fn in_open_pair(f: &LabelFile, at: usize, wanted: Option<&Wanted<'_>>) -> bool {
-    // Without a class list there is no stack to look for: a live `add` has no box of its object
-    // that is not rejected at IoU >= COVER_IOU (0.3), and a stack needs STACK_IOU (0.7).
-    let stacked = wanted.is_some_and(|w| {
-        stacks::stacks(&f.boxes, w)
-            .iter()
-            .any(|s| s.members.contains(&at))
-    });
-    stacked
+    stacks::groups(&f.boxes, wanted)
+        .iter()
+        .any(|s| s.members.contains(&at))
         || stacks::overlap_pairs(&f.boxes, wanted)
             .iter()
             .any(|&(i, j)| i == at || j == at)
@@ -331,8 +353,10 @@ fn in_open_pair(f: &LabelFile, at: usize, wanted: Option<&Wanted<'_>>) -> bool {
 ///   confirmed empty, and [`LabelFile::overlaps_checked`] ends when the new box is in a stack or an
 ///   open pair; the suggestion goes;
 /// - tighten: `orig_bbox` keeps the old box (unless set), `bbox` becomes the proposal (clamping is
-///   the caller's: no frame size here); the suggestion goes;
-/// - relabel: the new class, the old label kept in `model_label`; the suggestion goes;
+///   the caller's: no frame size here); `overlaps_checked` ends when the box is now in a stack or
+///   an open pair; the suggestion goes;
+/// - relabel: the new class, the old label kept in `model_label`; `overlaps_checked` ends as for
+///   a tighten; the suggestion goes;
 /// - verify: answered [`Answer::Kept`] and kept, so a rerun does not ask again.
 pub fn accept(f: &mut LabelFile, index: usize, wanted: Option<&Wanted<'_>>) -> bool {
     let Some((target, replaces, s)) = live(f, wanted)
@@ -393,22 +417,36 @@ pub fn accept(f: &mut LabelFile, index: usize, wanted: Option<&Wanted<'_>>) -> b
             }
         }
         Kind::Tighten => {
-            let (Some(bbox), Some(b)) = (s.bbox, target.and_then(|t| f.boxes.get_mut(t))) else {
+            let (Some(bbox), Some(t)) = (s.bbox, target) else {
+                return false;
+            };
+            let Some(b) = f.boxes.get_mut(t) else {
                 return false;
             };
             if b.orig_bbox.is_none() {
                 b.orig_bbox = Some(b.bbox);
             }
             b.bbox = bbox;
+            // The new box may now overlap another nobody looked at.
+            if f.overlaps_checked && in_open_pair(f, t, wanted) {
+                f.overlaps_checked = false;
+            }
         }
         Kind::Relabel => {
             let Some(to) = s.label.as_deref().and_then(|l| class_of(l, wanted)) else {
                 return false;
             };
-            let Some(b) = target.and_then(|t| f.boxes.get_mut(t)) else {
+            let Some(t) = target else {
+                return false;
+            };
+            let Some(b) = f.boxes.get_mut(t) else {
                 return false;
             };
             rename_to_class(b, &to);
+            // Of another object now: it may stack with a box of that object.
+            if f.overlaps_checked && in_open_pair(f, t, wanted) {
+                f.overlaps_checked = false;
+            }
         }
         Kind::Verify => {
             return match f.refine.get_mut(index) {
@@ -450,7 +488,7 @@ pub struct Applied {
     /// answered one, a weaker copy of another found one, or past [`MAX_SUGGESTIONS`].
     pub dropped: usize,
     /// Suggestions the file held that went: unanswered ones of `kinds` not found again (ignoring
-    /// `run`), or past [`MAX_SUGGESTIONS`].
+    /// `run`), answered ones of `kinds` whose box is gone, or past [`MAX_SUGGESTIONS`].
     pub removed: usize,
 }
 
@@ -461,8 +499,9 @@ impl Applied {
     }
 }
 
-/// Two suggestions of one finding: the same kind and the same exact `target`; for `add`, boxes of
-/// one object ([`same_object`]) at IoU >= [`ADD_SAME_IOU`].
+/// Two suggestions of one finding: the same kind and the same exact `target`, and the same
+/// `target_label` when both have one (a suggestion without one, of the first checks, names the
+/// place alone); for `add`, boxes of one object ([`same_object`]) at IoU >= [`ADD_SAME_IOU`].
 pub fn same_finding(a: &Suggestion, b: &Suggestion) -> bool {
     if a.kind != b.kind {
         return false;
@@ -472,7 +511,14 @@ pub fn same_finding(a: &Suggestion, b: &Suggestion) -> bool {
             (Some(x), Some(y), Some(l), Some(m)) => one_object(l, m) && iou(&x, &y) >= ADD_SAME_IOU,
             _ => false,
         },
-        _ => a.target.is_some() && a.target == b.target,
+        _ => {
+            a.target.is_some()
+                && a.target == b.target
+                && match (a.target_label.as_deref(), b.target_label.as_deref()) {
+                    (Some(x), Some(y)) => same_label(x, y),
+                    _ => true,
+                }
+        }
     }
 }
 
@@ -481,6 +527,7 @@ fn same_but_run(a: &Suggestion, b: &Suggestion) -> bool {
     let bits = |v: &Option<[f32; 4]>| v.map(|x| x.map(f32::to_bits));
     a.kind == b.kind
         && bits(&a.target) == bits(&b.target)
+        && a.target_label == b.target_label
         && bits(&a.bbox) == bits(&b.bbox)
         && a.label == b.label
         && a.score.map(f32::to_bits) == b.score.map(f32::to_bits)
@@ -515,6 +562,7 @@ fn order(a: &Suggestion, b: &Suggestion) -> Ordering {
         .then_with(|| a.answered().cmp(&b.answered()))
         .then_with(|| a.kind.cmp(&b.kind))
         .then_with(|| cmp_box(&a.target, &b.target))
+        .then_with(|| a.target_label.cmp(&b.target_label))
         .then_with(|| cmp_box(&a.bbox, &b.bbox))
         .then_with(|| a.label.cmp(&b.label))
         .then_with(|| a.answer.cmp(&b.answer))
@@ -528,17 +576,26 @@ fn order(a: &Suggestion, b: &Suggestion) -> Ordering {
 /// `kinds` are replaced by `found`; answered suggestions and those of other kinds stay. A found
 /// suggestion is dropped when it is of a kind outside `kinds`, carries an answer (only a reviewer
 /// answers), is the same finding as an answered one
-/// ([`same_finding`]: the reviewer answered it), or the same as a stronger found one. The list is
-/// sorted strongest first and holds at most [`MAX_SUGGESTIONS`], answered ones kept first. When the
-/// result equals the old list ignoring `run` (in any order), the file is left exactly as it was and
-/// [`Applied::changed`] is false: a rerun that finds the same things writes nothing, and an open
-/// Review page keeps its revision.
+/// ([`same_finding`]: the reviewer answered it), the same as a stronger found one, or outside the
+/// bounds a save checks ([`check`]: so a check never writes a file a Review save would refuse). An
+/// answered suggestion of `kinds` whose `target` box is gone (moved, relabelled away, deleted) goes:
+/// it can never be live again and would only take room; an answered `add` stays, it is what keeps
+/// the question from being asked again. The list is sorted strongest first and holds at most
+/// [`MAX_SUGGESTIONS`], answered ones kept first. When the result equals the old list ignoring
+/// `run` (in any order), the file is left exactly as it was and [`Applied::changed`] is false: a
+/// rerun that finds the same things writes nothing, and an open Review page keeps its revision.
 pub fn apply(f: &mut LabelFile, found: Vec<Suggestion>, kinds: &[Kind]) -> Applied {
     let mut done = Applied::default();
+    let target_gone = |s: &Suggestion| {
+        s.answered()
+            && has_target(s.kind)
+            && kinds.contains(&s.kind)
+            && !f.boxes.iter().any(|b| names(s, b))
+    };
     let kept: Vec<Suggestion> = f
         .refine
         .iter()
-        .filter(|s| s.answered() || !kinds.contains(&s.kind))
+        .filter(|s| (s.answered() || !kinds.contains(&s.kind)) && !target_gone(s))
         .cloned()
         .collect();
     let mut found = found;
@@ -547,6 +604,7 @@ pub fn apply(f: &mut LabelFile, found: Vec<Suggestion>, kinds: &[Kind]) -> Appli
     for s in found {
         if !kinds.contains(&s.kind)
             || s.answered()
+            || check_one(0, &s).is_err()
             || kept.iter().any(|k| k.answered() && same_finding(k, &s))
             || fresh.iter().any(|k| same_finding(k, &s))
         {
@@ -598,50 +656,55 @@ pub fn check(list: &[Suggestion]) -> Result<()> {
             list.len()
         );
     }
-    let text_ok = |t: &str, max: usize| t.len() <= max && !t.chars().any(char::is_control);
     for (i, s) in list.iter().enumerate() {
-        let n = i + 1;
-        if !s
-            .target
-            .iter()
-            .chain(&s.bbox)
-            .flatten()
-            .all(|v| v.is_finite())
-        {
-            bail!("refine suggestion {n}: the coordinates are not finite numbers");
-        }
-        if s.why.chars().count() > MAX_WHY_LEN || s.why.chars().any(char::is_control) {
-            bail!(
-                "refine suggestion {n}: the reason is longer than {MAX_WHY_LEN} characters or \
-                 holds control characters"
-            );
-        }
-        if let Some(l) = &s.label
-            && !super::label_ok(l)
-        {
+        check_one(i + 1, s)?;
+    }
+    Ok(())
+}
+
+/// The bounds of [`check`] on one suggestion, the `n`-th of its list (1-based, for the message).
+fn check_one(n: usize, s: &Suggestion) -> Result<()> {
+    let text_ok = |t: &str, max: usize| t.len() <= max && !t.chars().any(char::is_control);
+    if !s
+        .target
+        .iter()
+        .chain(&s.bbox)
+        .flatten()
+        .all(|v| v.is_finite())
+    {
+        bail!("refine suggestion {n}: the coordinates are not finite numbers");
+    }
+    if s.why.chars().count() > MAX_WHY_LEN || s.why.chars().any(char::is_control) {
+        bail!(
+            "refine suggestion {n}: the reason is longer than {MAX_WHY_LEN} characters or holds \
+             control characters"
+        );
+    }
+    for l in s.label.iter().chain(&s.target_label) {
+        if !super::label_ok(l) {
             bail!(
                 "refine suggestion {n}: '{}' is not a valid label (1 to {} characters)",
                 l.escape_debug(),
                 super::MAX_LABEL_LEN
             );
         }
-        if let Some(v) = s.score
-            && !(v.is_finite() && (0.0..=1.0).contains(&v))
-        {
-            bail!("refine suggestion {n}: score {v} is not between 0 and 1");
-        }
-        if s.spot.as_deref().is_some_and(|t| !text_ok(t, MAX_SPOT_LEN)) {
-            bail!(
-                "refine suggestion {n}: the spot is longer than {MAX_SPOT_LEN} bytes or holds \
-                 control characters"
-            );
-        }
-        if !text_ok(&s.run, MAX_RUN_LEN) {
-            bail!(
-                "refine suggestion {n}: the run id is longer than {MAX_RUN_LEN} bytes or holds \
-                 control characters"
-            );
-        }
+    }
+    if let Some(v) = s.score
+        && !(v.is_finite() && (0.0..=1.0).contains(&v))
+    {
+        bail!("refine suggestion {n}: score {v} is not between 0 and 1");
+    }
+    if s.spot.as_deref().is_some_and(|t| !text_ok(t, MAX_SPOT_LEN)) {
+        bail!(
+            "refine suggestion {n}: the spot is longer than {MAX_SPOT_LEN} bytes or holds control \
+             characters"
+        );
+    }
+    if !text_ok(&s.run, MAX_RUN_LEN) {
+        bail!(
+            "refine suggestion {n}: the run id is longer than {MAX_RUN_LEN} bytes or holds control \
+             characters"
+        );
     }
     Ok(())
 }
@@ -716,6 +779,7 @@ mod tests {
         Suggestion {
             kind,
             target: None,
+            target_label: None,
             bbox: None,
             label: None,
             score: Some(0.8),
@@ -1131,6 +1195,20 @@ mod tests {
             serde_json::to_string(&s).unwrap(),
             r#"{"kind":"verify","target":[100.0,100.0,200.0,180.0],"why":"a fold model that never saw the frame found it at 0.80"}"#
         );
+        // With the target's label: after the target, and read back as written.
+        let t = labelled(s.clone(), "car");
+        let text = serde_json::to_string(&t).unwrap();
+        assert_eq!(
+            text,
+            r#"{"kind":"verify","target":[100.0,100.0,200.0,180.0],"target_label":"car","why":"a fold model that never saw the frame found it at 0.80"}"#
+        );
+        assert_eq!(serde_json::from_str::<Suggestion>(&text).unwrap(), t);
+        // A suggestion of the first checks (no target_label) loads as one.
+        let old: Suggestion = serde_json::from_str(
+            r#"{"kind":"verify","target":[100.0,100.0,200.0,180.0],"why":"w","run":"r0"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.target_label, None);
     }
 
     #[test]
@@ -1245,6 +1323,174 @@ mod tests {
         // A saved frame keeps them.
         let n = normalize(f.clone(), &c, 640, 480, "now").unwrap();
         assert_eq!(n.refine, f.refine);
+    }
+
+    fn labelled(s: Suggestion, label: &str) -> Suggestion {
+        Suggestion {
+            target_label: Some(label.into()),
+            ..s
+        }
+    }
+
+    #[test]
+    fn a_target_label_tells_two_boxes_at_one_place_apart() {
+        let c = classes();
+        let w = wanted(&c);
+        // A car and a dog labelled with the very same box.
+        let boxes = vec![accepted("car", CAR), accepted("dog", CAR)];
+        let targets = |s: Suggestion| -> Vec<Option<usize>> {
+            live(&file(boxes.clone(), vec![s]), Some(&w))
+                .iter()
+                .map(|l| l.target)
+                .collect()
+        };
+        // Without a label (the files of the first checks): the first box at the place.
+        assert_eq!(targets(verify(CAR)), [Some(0)]);
+        assert_eq!(targets(labelled(verify(CAR), "dog")), [Some(1)]);
+        assert_eq!(targets(labelled(verify(CAR), " Dog ")), [Some(1)]);
+        assert_eq!(
+            targets(labelled(verify(CAR), "person")),
+            Vec::<Option<usize>>::new()
+        );
+        // A relabel of the dog to a person changes the dog, not the car.
+        let mut f = file(boxes.clone(), vec![labelled(relabel(CAR, "person"), "dog")]);
+        assert!(accept(&mut f, 0, Some(&w)));
+        assert_eq!(
+            (f.boxes[0].label.as_str(), f.boxes[1].label.as_str()),
+            ("car", "person")
+        );
+        // A tighten too.
+        let mut f = file(boxes.clone(), vec![labelled(tighten(CAR, TIGHT), "dog")]);
+        assert!(accept(&mut f, 0, Some(&w)));
+        assert_eq!((f.boxes[0].bbox, f.boxes[1].bbox), (CAR, TIGHT));
+        // One finding per box: two verifies at one place are two findings, a labelled and an
+        // unlabelled one of one place the same.
+        let (vc, vd) = (labelled(verify(CAR), "car"), labelled(verify(CAR), "dog"));
+        assert!(!same_finding(&vc, &vd));
+        assert!(same_finding(&vc, &verify(CAR)) && same_finding(&verify(CAR), &vd));
+        let mut f = file(boxes.clone(), vec![]);
+        let a = apply(&mut f, vec![vc.clone(), vd.clone()], &ALL);
+        assert_eq!((a.written, a.dropped), (2, 0));
+        let got: Vec<Option<usize>> = live(&f, Some(&w)).iter().map(|l| l.target).collect();
+        assert_eq!(got, [Some(0), Some(1)]);
+        // A dismissed verify of the dog keeps the dog's question away, not the car's.
+        let mut f = file(boxes, vec![answered(vd.clone(), Answer::Dismissed)]);
+        let a = apply(&mut f, vec![vc.clone(), vd], &ALL);
+        assert_eq!((a.written, a.dropped), (1, 1));
+        assert!(f.refine.contains(&vc));
+        // Bounded like `label`.
+        let mut bad = vc;
+        bad.target_label = Some(" ".into());
+        assert!(check(std::slice::from_ref(&bad)).is_err());
+    }
+
+    #[test]
+    fn answered_suggestions_whose_box_is_gone_go_at_the_next_check() {
+        let c = classes();
+        let w = wanted(&c);
+        let kept = answered(verify(CAR), Answer::Kept);
+        let moved = answered(relabel(MAN, "dog"), Answer::Dismissed);
+        let other = answered(labelled(verify(CAR), "dog"), Answer::Dismissed);
+        let add_no = answered(add("dog", FAR, 0.7), Answer::Dismissed);
+        let unknown = Suggestion {
+            kind: Kind::Unknown,
+            ..answered(verify(MAN), Answer::Dismissed)
+        };
+        let tight = answered(tighten(MAN, TIGHT), Answer::Dismissed);
+        let mut f = file(
+            vec![accepted("car", CAR)],
+            vec![
+                kept.clone(),
+                moved.clone(),
+                other.clone(),
+                add_no.clone(),
+                unknown.clone(),
+                tight.clone(),
+            ],
+        );
+        let a = apply(&mut f, vec![], &write_kinds());
+        // The person moved away and the dog never was at CAR: their answers go. The car's answer,
+        // the add's (it has no box: it keeps the question away), an unknown kind and a kind the
+        // check does not make stay.
+        assert_eq!((a.removed, a.kept_answers, a.changed()), (2, 4, true));
+        for s in [&kept, &add_no, &unknown, &tight] {
+            assert!(f.refine.contains(s), "{s:?}");
+        }
+        assert!(!f.refine.contains(&moved) && !f.refine.contains(&other));
+        // Nothing left to drop: the next check writes nothing.
+        assert!(!apply(&mut f, vec![], &write_kinds()).changed());
+        assert!(live(&f, Some(&w)).is_empty());
+        // 64 answered ones on boxes that went do not block a new finding.
+        let gone: Vec<Suggestion> = (0..MAX_SUGGESTIONS)
+            .map(|i| {
+                let x = 5.0 * i as f32;
+                answered(verify([x, 0.0, x + 4.0, 4.0]), Answer::Kept)
+            })
+            .collect();
+        let mut f = file(vec![accepted("car", CAR)], gone);
+        let a = apply(&mut f, vec![add("dog", FAR, 0.9)], &write_kinds());
+        assert_eq!((a.written, a.removed), (1, MAX_SUGGESTIONS));
+        assert_eq!(f.refine, [add("dog", FAR, 0.9)]);
+    }
+
+    /// The kinds a check writes (`training::refine::write::KINDS`).
+    fn write_kinds() -> [Kind; 3] {
+        [Kind::Add, Kind::Verify, Kind::Relabel]
+    }
+
+    #[test]
+    fn accepting_a_relabel_or_tighten_ends_a_look_at_the_overlaps_it_makes() {
+        let c = classes();
+        let w = wanted(&c);
+        for wanted in [Some(&w), None] {
+            // A person box on the car: relabelled to car, it stacks with the car.
+            let mut f = file(
+                vec![accepted("car", CAR), accepted("person", NEAR)],
+                vec![relabel(NEAR, "car")],
+            );
+            f.overlaps_checked = true;
+            assert!(accept(&mut f, 0, wanted));
+            assert!(!f.overlaps_checked, "{wanted:?}");
+            // A car far away, tightened onto the other car.
+            let mut f = file(
+                vec![accepted("car", CAR), accepted("car", FAR)],
+                vec![tighten(FAR, NEAR)],
+            );
+            f.overlaps_checked = true;
+            assert!(accept(&mut f, 0, wanted));
+            assert!(!f.overlaps_checked, "{wanted:?}");
+            // A relabel or tighten that makes no overlap keeps the look.
+            let mut f = file(
+                vec![accepted("car", CAR), accepted("person", MAN)],
+                vec![relabel(MAN, "dog"), tighten(CAR, TIGHT)],
+            );
+            f.overlaps_checked = true;
+            assert!(accept(&mut f, 0, wanted));
+            assert!(accept(&mut f, 0, wanted));
+            assert!(f.overlaps_checked, "{wanted:?}");
+        }
+    }
+
+    #[test]
+    fn a_check_never_writes_what_a_save_would_refuse() {
+        let mut f = file(vec![], vec![]);
+        let over = add("person", MAN, 1.5);
+        let nan_box = Suggestion {
+            bbox: Some([f32::NAN, 0.0, 1.0, 1.0]),
+            ..add("dog", FAR, 0.5)
+        };
+        let long = Suggestion {
+            why: "x".repeat(MAX_WHY_LEN + 1),
+            ..add("car", CAR, 0.5)
+        };
+        let a = apply(
+            &mut f,
+            vec![over, nan_box, long, add("car", [0.0, 0.0, 20.0, 20.0], 0.6)],
+            &write_kinds(),
+        );
+        assert_eq!((a.written, a.dropped), (1, 3));
+        check(&f.refine).unwrap();
+        normalize(f, &classes(), 640, 480, "now").unwrap();
     }
 
     #[test]
@@ -1696,9 +1942,17 @@ mod tests {
             n if r.chance(80) => Some(boxes[r.below(n)].bbox),
             _ => r.chance(50).then(|| r.bbox()),
         };
+        // Mostly the label of the box at the target, sometimes another one (two boxes at one place).
+        let target_label = (kind != Kind::Add && r.chance(50)).then(|| {
+            match boxes.iter().find(|b| Some(b.bbox) == target) {
+                Some(b) if r.chance(80) => b.label.clone(),
+                _ => r.pick(&LABELS).to_string(),
+            }
+        });
         Suggestion {
             kind,
             target: (kind != Kind::Add).then_some(target).flatten(),
+            target_label,
             bbox: (kind != Kind::Verify && r.chance(90)).then(|| r.bbox()),
             label: r.chance(90).then(|| r.pick(&LABELS).to_string()),
             score: r.chance(90).then(|| r.score()),
@@ -1804,9 +2058,13 @@ mod tests {
                     "round {round}: unchanged = untouched"
                 );
             }
-            // Answered suggestions are never lost, unknown kinds neither unless replaced.
+            // Answered suggestions are never lost but for those of `kinds` whose box is gone;
+            // unknown kinds neither unless replaced.
             for s in before.refine.iter().filter(|s| s.answered()) {
-                assert!(f.refine.contains(s), "round {round}: lost {s:?}");
+                let gone = has_target(s.kind)
+                    && kinds.contains(&s.kind)
+                    && !before.boxes.iter().any(|b| names(s, b));
+                assert_eq!(!f.refine.contains(s), gone, "round {round}: {s:?}");
             }
             for s in before.refine.iter().filter(|s| !kinds.contains(&s.kind)) {
                 assert!(f.refine.contains(s), "round {round}: lost {s:?}");

@@ -489,23 +489,31 @@ folder; the collector and the Collect tab keep `collect.dir`.
   `kind`: `add` (a box for an object no box labels: `bbox`, `label`), `relabel` (another class for a
   training box: `target` and `label`), `verify` (a training box no model found: `target`) or `tighten` (a
   closer `bbox` for the box `target`; the check does not write it, the file and the page's rules know it).
-  `target` names an existing box by its exact `bbox`: that is the key. `score`: the fold model's score, 0 to
-  1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group name, at most 200
-  bytes. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box moved or went, or
-  that no longer holds (an `add` that a box of its object now covers; a `tighten` or `relabel` on a box a
-  reviewer drew, moved or relabelled; a `relabel` to a class that names the same object), is stale and
-  ignored: staleness is computed when the file is read, never stored, and never an error. So is any
-  suggestion on a skipped frame. `answer`: `kept` (a `verify` the reviewer confirmed: the label stays) or
-  `dismissed` (the reviewer said no); an answered suggestion is never live again and stays in the file, so a
-  rerun does not ask again. Accepting an `add` writes a box (`source: auto`, `state: accepted`, `reason:
-  refine`) in the place of the unjudged rejects it covers; accepting a `tighten` keeps the old box in
-  `orig_bbox`; accepting a `relabel` keeps the old label in `model_label`; accepting any of these three
-  removes the suggestion, accepting a `verify` answers it `kept`.
+  `target` names an existing box by its exact `bbox`: that is the key. `target_label` (written by the check
+  for `verify` and `relabel`; same bounds as `label`): the label of that box when the check ran, compared
+  trimmed and case-insensitive, so of two boxes of different objects with the very same `bbox` the suggestion
+  names the right one; without it (files of the first checks) the `bbox` alone is the key. `score`: the fold
+  model's score, 0 to 1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group
+  name, at most 200 bytes. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box
+  moved, went or was relabelled away from `target_label`, or that no longer holds, is stale and ignored: an
+  `add` that a box of its object now covers; a `tighten` on a box a reviewer drew or moved; a `relabel` on a
+  box a reviewer drew or relabelled, or to a class that names the same object; a `verify` on a box a reviewer
+  drew or moved. (A `relabel` on a box a reviewer only moved, and a `tighten` on a box a reviewer only
+  relabelled, stay live.) Staleness is computed when the file is read, never stored, and never an error. So
+  is any suggestion on a skipped frame. `answer`: `kept` (a `verify` the reviewer confirmed: the label stays)
+  or `dismissed` (the reviewer said no); an answered suggestion is never live again and stays in the file, so
+  a rerun does not ask again, until a check finds its `target` box gone (moved, relabelled, deleted): then
+  it is dropped (an answered `add` has no target and stays). Accepting an `add` writes a box (`source:
+  auto`, `state: accepted`, `reason: refine`) in the place of the unjudged rejects it covers; accepting a
+  `tighten` keeps the old box in `orig_bbox`; accepting a `relabel` keeps the old label in `model_label`;
+  accepting any of these three removes the suggestion and ends `overlaps_checked` when the box is now in a
+  stack or an open pair; accepting a `verify` answers it `kept`.
 
   A `kind` or an `answer` this build does not know (a newer build's) loads as `unknown`, is never live
   and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
   (`add`, `verify`, `relabel`); answered ones and other kinds stay, and when nothing changed the file is not
-  written. Kept by saves. A build from before the dataset check ignores the field
+  written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
+  frame first). Kept by saves. A build from before the dataset check ignores the field
   and drops it when it rewrites the file; the list is rebuildable by running the check again (answers are
   lost with it).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the

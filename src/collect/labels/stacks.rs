@@ -71,7 +71,7 @@ fn root(parent: &[usize], mut x: usize) -> usize {
 }
 
 /// [`stacks`], with a class list or without one (every label wanted).
-fn groups(boxes: &[LabelBox], wanted: Option<&Wanted<'_>>) -> Vec<Stack> {
+pub(super) fn groups(boxes: &[LabelBox], wanted: Option<&Wanted<'_>>) -> Vec<Stack> {
     let items: Vec<(usize, &LabelBox)> = boxes
         .iter()
         .enumerate()

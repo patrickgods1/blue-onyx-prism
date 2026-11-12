@@ -17,7 +17,7 @@
 //!    ([`covers`]), and no judged reject of its object lies on at IoU >= [`REJECT_BLOCK_IOU`].
 //! 5. `verify`: an unmatched training box no reviewer drew or moved, with no same-object detection
 //!    (at [`MATCH_MIN_SCORE`] or more, as every candidate) at IoU >= [`VERIFY_IOU`], of a class
-//!    with [`MIN_CLASS_BOXES`] training boxes or more in the checked frames, at least
+//!    with [`MIN_CLASS_BOXES`] boxes or more in what the fold model trained on, at least
 //!    [`FLOOR_PX`] on its short side at model input.
 //! 6. `relabel`: a training box no reviewer drew or relabelled, on which a detection of another
 //!    object (not [`same_object`]) at [`RELABEL_SCORE`] or more lies at IoU >= [`RELABEL_IOU`], and
@@ -35,7 +35,9 @@
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
 use crate::collect::labels::repeats::same_object;
-use crate::collect::labels::{BoxState, LabelBox, LabelFile, Source, Status, covers, iou};
+use crate::collect::labels::{
+    BoxState, LabelBox, LabelFile, Source, Status, clamp_box, covers, iou,
+};
 use crate::training::autolabel::triage::Det;
 use std::collections::BTreeMap;
 
@@ -59,8 +61,9 @@ pub const ADD_SCORE: f32 = 0.5;
 pub const FLOOR_PX: f32 = 10.0;
 /// IoU from which a same-object detection counts as having found a training box (no `verify`).
 pub const VERIFY_IOU: f32 = 0.3;
-/// Training boxes of a class in the checked frames from which a fold model is expected to find
-/// the class at all: rarer classes would make every box a `verify`.
+/// Boxes of a class the fold model trained on from which it is expected to find the class at all:
+/// rarer classes would make every box a `verify` (counted per fold: a dominant camera day held out
+/// can leave its fold model few boxes of a class the whole selection has many of).
 pub const MIN_CLASS_BOXES: usize = 50;
 /// IoU from which another object's detection lies on a training box (`relabel`).
 pub const RELABEL_IOU: f32 = 0.7;
@@ -95,7 +98,8 @@ pub struct Context<'a> {
     pub wanted: &'a Wanted<'a>,
     /// The fold models' input size.
     pub imgsz: u32,
-    /// Training boxes per class (the list's spelling) in the checked frames.
+    /// Training boxes per class (the list's spelling) of the frames the fold model trained on
+    /// (the selection without the fold's frames: [`super::class_boxes`]), ignore regions left out.
     pub class_boxes: &'a BTreeMap<String, usize>,
     /// The check's id ([`Suggestion::run`]).
     pub run: &'a str,
@@ -212,6 +216,7 @@ fn suggestion(kind: Kind, run: &str, why: String) -> Suggestion {
     Suggestion {
         kind,
         target: None,
+        target_label: None,
         bbox: None,
         label: None,
         score: None,
@@ -231,18 +236,24 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     }
     let wanted = ctx.wanted;
     let size = |b: &[f32; 4]| short_px(b, frame.width, frame.height, ctx.imgsz);
-    // 1. Candidates.
+    // 1. Candidates: scores within 0..=1 and boxes within the frame (a model's raw output can
+    // stray past either, and a suggestion must stay within what a save accepts).
     let dets: Vec<D> = frame
         .dets
         .iter()
         .filter(|d| d.score.is_finite() && d.score >= MATCH_MIN_SCORE && proper(&d.bbox))
         .filter_map(|d| {
             let class = wanted.class_of(&d.label)?;
-            Some(D {
+            let bbox = if frame.width > 0 && frame.height > 0 {
+                clamp_box(d.bbox, frame.width, frame.height)
+            } else {
+                d.bbox
+            };
+            proper(&bbox).then(|| D {
                 class: class.to_string(),
                 key: class.trim().to_ascii_lowercase(),
-                bbox: d.bbox,
-                score: d.score,
+                bbox,
+                score: d.score.clamp(0.0, 1.0),
             })
         })
         .collect();
@@ -316,6 +327,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             }
             found_list.push(Suggestion {
                 target: Some(t.b.bbox),
+                target_label: Some(t.b.label.clone()),
                 label: Some(d.class.clone()),
                 score: Some(d.score),
                 ..suggestion(
@@ -388,6 +400,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         }
         found_list.push(Suggestion {
             target: Some(t.b.bbox),
+            target_label: Some(t.b.label.clone()),
             ..suggestion(
                 Kind::Verify,
                 ctx.run,
@@ -833,6 +846,86 @@ mod tests {
             let j = run(&f, &[det("person", FAR, 0.9)]);
             assert_eq!(j, Judged::default(), "{status:?}");
         }
+    }
+
+    #[test]
+    fn scores_and_boxes_out_of_range_are_clamped_so_a_save_accepts_them() {
+        // 640 x 480: a box past the right and bottom edges, a score over 1.
+        let f = reviewed(vec![]);
+        let j = run(&f, &[det("person", [600.0, 400.0, 700.0, 520.0], 1.2)]);
+        assert_eq!(kinds(&j), [Kind::Add]);
+        let s = &j.suggestions[0];
+        assert_eq!(s.bbox, Some([600.0, 400.0, 640.0, 480.0]));
+        assert_eq!(s.score, Some(1.0));
+        assert!(s.why.contains("score 1.00"), "{}", s.why);
+        refine::check(&j.suggestions).unwrap();
+        // A detection wholly outside the frame is no box once clamped: nothing.
+        assert!(
+            run(&f, &[det("person", [650.0, 10.0, 700.0, 90.0], 0.9)])
+                .suggestions
+                .is_empty()
+        );
+        // A frame of unknown size: the box as it came.
+        let c = classes();
+        let w = Wanted {
+            classes: &c,
+            hidden: &[],
+        };
+        let counts = many();
+        let ctx = Context {
+            wanted: &w,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r1",
+        };
+        let dets = [det("person", [600.0, 400.0, 700.0, 520.0], 0.9)];
+        let j = judge(
+            &FrameInput {
+                file: &f,
+                width: 0,
+                height: 0,
+                dets: &dets,
+            },
+            &ctx,
+        );
+        assert_eq!(j.suggestions[0].bbox, Some([600.0, 400.0, 700.0, 520.0]));
+    }
+
+    #[test]
+    fn two_labels_at_one_place_each_get_their_own_suggestion() {
+        // A car and a dog labelled with the very same box, no model finds either.
+        let f = reviewed(vec![acc("car", CAR), acc("dog", CAR)]);
+        let j = run(&f, &[]);
+        assert_eq!(kinds(&j), [Kind::Verify, Kind::Verify]);
+        let labels: Vec<Option<&str>> = j
+            .suggestions
+            .iter()
+            .map(|s| s.target_label.as_deref())
+            .collect();
+        assert_eq!(labels, [Some("car"), Some("dog")]);
+        // Written, both stay and name their own box.
+        let mut g = f.clone();
+        let a = refine::apply(
+            &mut g,
+            j.suggestions,
+            &[Kind::Add, Kind::Verify, Kind::Relabel],
+        );
+        assert_eq!(a.written, 2);
+        let c = classes();
+        let w = Wanted {
+            classes: &c,
+            hidden: &[],
+        };
+        let targets: Vec<Option<usize>> = refine::live(&g, Some(&w))
+            .iter()
+            .map(|l| l.target)
+            .collect();
+        assert_eq!(targets, [Some(0), Some(1)]);
+        // A relabel names its box too: a person seen on the dog's box only.
+        let f = reviewed(vec![acc("dog", CAR)]);
+        let j = run(&f, &[det("person", NEAR, 0.9)]);
+        assert_eq!(kinds(&j), [Kind::Relabel]);
+        assert_eq!(j.suggestions[0].target_label.as_deref(), Some("dog"));
     }
 
     #[test]

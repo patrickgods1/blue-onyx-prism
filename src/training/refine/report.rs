@@ -9,7 +9,7 @@
 //! folders, so they never see it (like `spots/`).
 
 use super::judge::{BoxFact, FOUND_IOU, FOUND_SCORE};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -316,16 +316,30 @@ impl RefineReport {
     }
 
     /// Write it to `<review_dir>/refine/report.json` atomically (a reader never sees half of it);
-    /// returns the path.
+    /// returns the path. Refused when the folder under review is not a folder any more (an
+    /// unmounted drive: creating it would put the report on the disk below the mount point); only
+    /// `refine/` is created.
     pub fn write(&self, review_dir: &Path) -> Result<PathBuf> {
+        if !review_dir.is_dir() {
+            bail!(
+                "the folder under review {} is not available (an unplugged drive?), so the report \
+                 was not written; the suggestions written before are in the label files",
+                review_dir.display()
+            );
+        }
         let path = report_path(review_dir);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| {
-                format!(
-                    "creating {} (is the folder under review writable?)",
-                    dir.display()
-                )
-            })?;
+        let dir = review_dir.join(REPORT_DIR);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "creating {} (is the folder under review writable?)",
+                        dir.display()
+                    )
+                });
+            }
         }
         let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
@@ -492,7 +506,14 @@ mod tests {
         assert_eq!(r.recall_by_size[4].max_px, None);
         // The JSON reads back as it was, and the file is written whole.
         let dir = std::env::temp_dir().join(format!("bop-refine-report-{}", uuid::Uuid::new_v4()));
+        // A folder under review that is not there (an unmounted drive) is not created.
+        let e = r.write(&dir).unwrap_err().to_string();
+        assert!(e.contains("is not available"), "{e}");
+        assert!(!dir.exists(), "the vanished folder was created again");
+        std::fs::create_dir_all(&dir).unwrap();
         let path = r.write(&dir).unwrap();
+        // A second write replaces it in the existing refine/ folder.
+        assert_eq!(r.write(&dir).unwrap(), path);
         assert_eq!(path, dir.join("refine").join("report.json"));
         let back: RefineReport = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(back, r);

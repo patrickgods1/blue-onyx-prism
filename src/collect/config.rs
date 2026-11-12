@@ -359,6 +359,31 @@ impl CollectConfig {
         }
     }
 
+    /// Why the folder under review `dir` cannot be used, in the Review page's words; None when it
+    /// can. A folder that does not exist, an unmounted drive first of all, would otherwise look like
+    /// an empty dataset. Only the dataset folder may be absent, when its parent is there: nothing
+    /// was collected yet (a parent that is gone too is an unplugged drive). A chosen `review_dir`
+    /// must exist. The Review routes answer it as `folder_missing`; the dataset check refuses with
+    /// it.
+    pub fn review_folder_problem(&self, dir: &Path) -> Option<String> {
+        let e = std::fs::read_dir(dir).err()?;
+        if e.kind() == std::io::ErrorKind::NotFound
+            && self.review_dir.is_none()
+            && (self.dir.is_none() || dir.parent().is_some_and(Path::is_dir))
+        {
+            return None;
+        }
+        let why = match e.kind() {
+            std::io::ErrorKind::NotFound => String::new(),
+            _ => format!(" ({e})"),
+        };
+        Some(format!(
+            "The folder under review is not available: {}{why}; connect the drive or choose another \
+             folder.",
+            dir.display()
+        ))
+    }
+
     /// `hidden_classes` without the names `classes` no longer lists (after a class list
     /// change), in the spelling of `classes`.
     pub fn prune_hidden(&mut self) {

@@ -51,6 +51,10 @@ struct TrainerFake {
     cancel_on: Option<usize>,
     /// Put a held-out frame into train.txt.
     leak: bool,
+    /// Put a held-out frame into train.txt under another name, as the dataset would after
+    /// cutting a long name or numbering a name taken twice, with its source in the dataset's
+    /// record.
+    leak_renamed: bool,
     /// What each run trained on: `train.txt` + `valid.txt` names.
     trained: Mutex<Vec<String>>,
 }
@@ -87,6 +91,32 @@ impl CommandRunner for TrainerFake {
             // Held-out images carry the dataset's own `s0-` name already.
             t.push_str(&format!("./images/{}\n", held.to_string_lossy()));
             std::fs::write(data.join("train.txt"), t).unwrap();
+        }
+        if self.leak_renamed {
+            let held = std::fs::read_dir(data.join("heldout").join("images"))
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap()
+                .path();
+            let flat = held
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches("s0-")
+                .to_string();
+            let name = "s0-ir.renamed-2.jpg";
+            std::fs::copy(&held, data.join("images").join(name)).unwrap();
+            let mut t = std::fs::read_to_string(data.join("train.txt")).unwrap();
+            t.push_str(&format!("./images/{name}\n"));
+            std::fs::write(data.join("train.txt"), t).unwrap();
+            let record = data.join(crate::training::dataset::IMAGE_SOURCES_FILE);
+            let mut m: BTreeMap<String, PathBuf> =
+                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            // The fold's export holds its held-out frames under images/val.
+            let export = data.parent().unwrap().join("export");
+            m.insert(name.into(), export.join("images").join("val").join(flat));
+            std::fs::write(&record, serde_json::to_vec(&m).unwrap()).unwrap();
         }
         for list in ["train.txt", "valid.txt"] {
             let t = std::fs::read_to_string(data.join(list)).unwrap();
@@ -157,6 +187,8 @@ fn trainer() -> TrainerFake {
 }
 
 type Meanwhile = Box<dyn FnOnce(&[Image]) + Send>;
+/// A [`PredictorFake::on_call`] hook.
+type OnCall = Box<dyn FnMut(&[Image]) + Send>;
 
 /// The fake fold model: on every frame the labelled car and an unlabelled person.
 #[derive(Default)]
@@ -166,6 +198,8 @@ struct PredictorFake {
     asked: Mutex<Vec<(FoldModel, Vec<String>)>>,
     /// Called during the first call: a reviewer saving frames while the check runs.
     meanwhile: Mutex<Option<Meanwhile>>,
+    /// Called during every call.
+    on_call: Mutex<Option<OnCall>>,
 }
 
 impl FoldPredictor for PredictorFake {
@@ -184,6 +218,9 @@ impl FoldPredictor for PredictorFake {
             images.iter().map(|i| i.frame.clone()).collect(),
         ));
         if let Some(f) = self.meanwhile.lock().unwrap().take() {
+            f(images);
+        }
+        if let Some(f) = self.on_call.lock().unwrap().as_mut() {
             f(images);
         }
         let dets = vec![
@@ -417,6 +454,15 @@ fn a_check_writes_suggestions_and_the_report_and_nothing_else() {
     let out = run(&job, &fake).unwrap();
     assert!(
         out.summary.contains("No box was changed"),
+        "{}",
+        out.summary
+    );
+    // The new count covers every kind, not the last one named.
+    assert!(
+        out.summary.contains(
+            "12 missing boxes, 0 labels to verify, 0 other classes (12 of these suggestions new \
+             since the last check, on 12 frames written)"
+        ),
         "{}",
         out.summary
     );
@@ -779,6 +825,288 @@ fn a_fold_frame_in_the_training_lists_fails_loudly() {
 }
 
 #[test]
+fn a_fold_frame_trained_on_under_another_name_fails_loudly() {
+    let t = tmp("leak-renamed");
+    dataset(&t.0.join("dataset"));
+    let predictor = Arc::new(PredictorFake::default());
+    let job = plan(&t.0, &predictor);
+    let fake = TrainerFake {
+        leak_renamed: true,
+        ..trainer()
+    };
+    let e = format!("{:#}", run(&job, &fake).unwrap_err());
+    assert!(
+        e.contains("held-out fold are in the fold model's training or validation lists"),
+        "{e}"
+    );
+    assert_eq!(predictor.calls.load(Ordering::SeqCst), 0, "never predicted");
+}
+
+/// Accepted boxes `label` at `bbox` and a car, on `n` reviewed frames of `camera`.
+fn reviewed_frames(dir: &Path, camera: &str, n: usize, extra: Option<(&str, [f32; 4])>) {
+    for i in 0..n {
+        let mut boxes = vec![accepted("car", CAR)];
+        if let Some((label, bbox)) = extra {
+            boxes.push(accepted(label, bbox));
+        }
+        let rel = put_frame_at(dir, camera, &format!("f{i:02}"), (320, 240), None, boxes);
+        edit(dir, &rel, |l| {
+            l.status = Status::Reviewed;
+            l.reviewed_at = Some("2026-10-22T00:00:00Z".into());
+        });
+    }
+}
+
+/// The warnings of a check's result.
+fn warnings_of(r: &serde_json::Value) -> Vec<String> {
+    r["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_verify_needs_the_boxes_its_fold_model_trained_on() {
+    let t = tmp("per-fold");
+    let dir = t.0.join("dataset");
+    // One camera day with 55 dogs, three small ones with 5 between them: 60 dogs in all. The
+    // fake model finds no dog anywhere.
+    const DOG: [f32; 4] = [20.0, 20.0, 60.0, 60.0];
+    reviewed_frames(&dir, "big", 55, Some(("dog", DOG)));
+    reviewed_frames(&dir, "alpha", 3, Some(("dog", DOG)));
+    reviewed_frames(&dir, "bravo", 2, Some(("dog", DOG)));
+    reviewed_frames(&dir, "charlie", 4, None);
+    let predictor = Arc::new(PredictorFake::default());
+    let req = RefineRequest {
+        folds: 2,
+        ..RefineRequest::default()
+    };
+    let mut job = plan_refine(&config(&t.0), req.clone(), &host()).unwrap();
+    job.min_frames = 4;
+    job.predictor = Some(predictor.clone());
+    let folds = folds_of(&job);
+    assert!(
+        folds
+            .iter()
+            .filter(|(r, _)| r.contains("/big/"))
+            .all(|(_, f)| *f == 0)
+    );
+    assert!(
+        folds
+            .iter()
+            .filter(|(r, _)| !r.contains("/big/"))
+            .all(|(_, f)| *f == 1)
+    );
+    // The preview says so before anything runs.
+    let p = super::super::preview(&config(&t.0), &req, &host()).unwrap();
+    let says = |ws: &[String], what: &str| ws.iter().any(|w| w.contains(what));
+    for want in [
+        "fold 1 of 2 holds out 55 frames and its model trains on only 9",
+        "fold 1 of 2 trains on fewer than 50 boxes of car (9), dog (5)",
+    ] {
+        assert!(says(&p.warnings, want), "{want}: {:?}", p.warnings);
+    }
+    assert!(!says(&p.warnings, "fold 2 of 2"), "{:?}", p.warnings);
+    let out = run(&job, &trainer()).unwrap();
+    // The big day's model trained on 5 dogs: its 55 dogs get no verify. The small days' model
+    // trained on 55: their 5 dogs do.
+    assert_eq!(out.result["found"]["verify"], 5, "{}", out.result);
+    for (rel, fold) in &folds {
+        let l = labels_of(&dir, rel);
+        let verifies = l.refine.iter().filter(|s| s.kind == Kind::Verify).count();
+        let has_dog = l.boxes.iter().any(|b| b.label == "dog");
+        assert_eq!(verifies, usize::from(*fold == 1 && has_dog), "{rel}");
+    }
+    let ws = warnings_of(&out.result);
+    assert!(says(&ws, "fold 1 of 2 holds out 55 frames"), "{ws:?}");
+}
+
+#[test]
+fn the_training_lock_is_held_from_the_first_fold_to_the_last_write() {
+    let t = tmp("lock");
+    dataset(&t.0.join("dataset"));
+    let lock_file =
+        crate::resources::export::train::TrainPaths::for_config(&config(&t.0)).train_lock_file();
+    let held: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let (h, lf) = (held.clone(), lock_file.clone());
+    let predictor = Arc::new(PredictorFake {
+        // Another process asking for the lock while a fold model predicts.
+        on_call: Mutex::new(Some(Box::new(move |_: &[Image]| {
+            h.lock().unwrap().push(TrainLock::try_acquire(&lf).is_err());
+        }))),
+        ..PredictorFake::default()
+    });
+    let fake = trainer();
+    run(&plan(&t.0, &predictor), &fake).unwrap();
+    assert_eq!(*held.lock().unwrap(), [true; 4], "held during every fold");
+    assert_eq!(fake.trains.load(Ordering::SeqCst), 4);
+    // Released at the end.
+    drop(TrainLock::try_acquire(&lock_file).unwrap());
+    // Held by another process before the check: refused, nothing trained.
+    let other = TrainLock::try_acquire(&lock_file).unwrap();
+    let fake = trainer();
+    let e = run(&plan(&t.0, &Arc::new(PredictorFake::default())), &fake)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is training a model and holds"), "{e}");
+    assert_eq!(fake.trains.load(Ordering::SeqCst), 0);
+    drop(other);
+}
+
+#[test]
+fn frames_gone_since_the_selection_are_left_out_with_a_warning() {
+    let t = tmp("gone");
+    let dir = t.0.join("dataset");
+    dataset(&dir);
+    let job0 = plan(&t.0, &Arc::new(PredictorFake::default()));
+    let folds = folds_of(&job0);
+    let of = |k: usize| -> Vec<String> {
+        folds
+            .iter()
+            .filter(|(_, f)| **f == k)
+            .map(|(r, _)| r.clone())
+            .collect()
+    };
+    // While fold 1 predicts: an image of fold 2 and a label file of fold 3 go.
+    let (img, lab) = (of(1)[0].clone(), of(2)[0].clone());
+    let d = dir.clone();
+    let (img2, lab2) = (img.clone(), lab.clone());
+    let predictor = Arc::new(PredictorFake {
+        meanwhile: Mutex::new(Some(Box::new(move |_: &[Image]| {
+            let f = Frame::resolve(&d, &img2).unwrap();
+            std::fs::remove_file(&f.jpg).unwrap();
+            let f = Frame::resolve(&d, &lab2).unwrap();
+            std::fs::remove_file(&f.labels).unwrap();
+        }))),
+        ..PredictorFake::default()
+    });
+    let job = plan(&t.0, &predictor);
+    let out = run(&job, &trainer()).unwrap();
+    assert_eq!(out.result["folds_done"], 4, "{}", out.result);
+    assert_eq!(out.result["frames_checked"], 10, "{}", out.result);
+    let asked = predictor.asked.lock().unwrap().clone();
+    let all: Vec<&String> = asked.iter().flat_map(|(_, f)| f).collect();
+    assert!(!all.contains(&&img) && !all.contains(&&lab), "{all:?}");
+    let ws = warnings_of(&out.result);
+    for n in 2..=4 {
+        assert!(
+            ws.iter().any(|w| w.starts_with(&format!("fold {n} of 4: "))
+                && w.contains("are gone (deleted or moved since the check started)")),
+            "fold {n}: {ws:?}"
+        );
+    }
+}
+
+#[test]
+fn a_fold_whose_writes_all_fail_is_not_done() {
+    let t = tmp("unwritable");
+    let dir = t.0.join("dataset");
+    let rels = dataset(&dir);
+    let d = dir.clone();
+    // Every frame of fold 1 goes while its model predicts: nothing of it can be written.
+    let predictor = Arc::new(PredictorFake {
+        meanwhile: Mutex::new(Some(Box::new(move |images: &[Image]| {
+            for i in images {
+                std::fs::remove_file(&Frame::resolve(&d, &i.frame).unwrap().jpg).unwrap();
+            }
+        }))),
+        ..PredictorFake::default()
+    });
+    let job = plan(&t.0, &predictor);
+    let e = format!("{:#}", run(&job, &trainer()).unwrap_err());
+    assert!(
+        e.contains("fold 1 of 4: none of its 3 frames could be written"),
+        "{e}"
+    );
+    assert!(e.contains("the frame is gone"), "{e}");
+    assert!(
+        !report::report_path(&dir).exists(),
+        "no fold done, no report"
+    );
+    assert_eq!(
+        predictor.calls.load(Ordering::SeqCst),
+        1,
+        "the check stopped"
+    );
+    let written = rels
+        .iter()
+        .filter(|r| Frame::resolve(&dir, r).is_some())
+        .filter(|r| !labels_of(&dir, r).refine.is_empty())
+        .count();
+    assert_eq!(written, 0);
+}
+
+#[test]
+fn write_failures_are_named_up_to_a_cap_and_counted_beyond_it() {
+    let recipe = report::RecipeInfo {
+        model: "rfdetr-nano".into(),
+        imgsz: 384,
+        epochs: 8,
+        batch: 4,
+        from: "default".into(),
+    };
+    let mut acc = Acc::new(RefineReport::new("r", 2, recipe));
+    let fold = |failed: usize, kept: usize| write::Written {
+        attempted: failed + 1,
+        failed,
+        failures: (0..kept).map(|i| format!("f{i}: boom")).collect(),
+        ..write::Written::default()
+    };
+    acc.note_failures(&fold(15, 15));
+    acc.note_failures(&fold(40, write::MAX_FAILURES));
+    acc.close_failures();
+    let ws = &acc.rep.warnings;
+    assert_eq!(ws.len(), write::MAX_FAILURES + 1, "{ws:?}");
+    assert_eq!(
+        ws.last().unwrap(),
+        "... and 35 more frames whose suggestions could not be written"
+    );
+    // Nothing more: no line.
+    let mut acc = Acc::new(acc.rep.clone());
+    acc.rep.warnings.clear();
+    acc.note_failures(&fold(2, 2));
+    acc.close_failures();
+    assert_eq!(acc.rep.warnings.len(), 2);
+}
+
+#[test]
+fn an_unavailable_review_folder_is_not_an_empty_dataset() {
+    let t = tmp("unplugged");
+    dataset(&t.0.join("dataset"));
+    let mut cfg = config(&t.0);
+    let gone = t.0.join("unplugged-drive").join("review");
+    cfg.collect.review_dir = Some(gone.clone());
+    let p = super::super::preview(&cfg, &RefineRequest::default(), &host()).unwrap();
+    assert!(p.folder_missing);
+    let why = p.refused.clone().unwrap();
+    assert!(
+        why.starts_with("The folder under review is not available"),
+        "{why}"
+    );
+    assert!(!why.contains("review more frames"), "{why}");
+    assert!(super::super::preview_text(&p).contains("is not available"));
+    let mut job = plan_refine(&cfg, RefineRequest::default(), &host()).unwrap();
+    job.min_frames = 4;
+    job.predictor = Some(Arc::new(PredictorFake::default()));
+    let fake = trainer();
+    let e = run(&job, &fake).unwrap_err().to_string();
+    assert!(
+        e.starts_with("The folder under review is not available"),
+        "{e}"
+    );
+    assert_eq!(fake.trains.load(Ordering::SeqCst), 0);
+    assert!(
+        !gone.exists() && !t.0.join("unplugged-drive").exists(),
+        "nothing created"
+    );
+    // The folder there: a check runs.
+    let p = super::super::preview(&config(&t.0), &RefineRequest::default(), &host()).unwrap();
+    assert!(!p.folder_missing);
+}
+
+#[test]
 fn the_unseen_check_reads_the_datasets_names() {
     assert_eq!(
         strip_source("s0-day.cam.2026-10-01.x.jpg"),
@@ -797,8 +1125,22 @@ fn the_unseen_check_reads_the_datasets_names() {
     );
     assert_eq!(without_kept_note("boom"), "boom");
     let t = tmp("unseen");
+    let export = t.0.join("export").join("images");
+    // The dataset's record: its image name -> the export image it came from.
+    let sources = |pairs: &[(&str, &str)]| {
+        let m: BTreeMap<&str, PathBuf> = pairs
+            .iter()
+            .map(|(n, src)| (*n, export.join(src)))
+            .collect();
+        std::fs::write(
+            t.0.join(crate::training::dataset::IMAGE_SOURCES_FILE),
+            serde_json::to_string(&m).unwrap(),
+        )
+        .unwrap();
+    };
     std::fs::write(t.0.join("train.txt"), "./images/s0-ir.a.2026-10-21.x.jpg\n").unwrap();
     std::fs::write(t.0.join("valid.txt"), "").unwrap();
+    sources(&[("s0-ir.a.2026-10-21.x.jpg", "train/ir.a.2026-10-21.x.jpg")]);
     let frame = |name: &str| ExportFrame {
         rel: crate::collect::layout::parse_rel(&format!(
             "ir/{}/2026-10-21/{}",
@@ -819,7 +1161,31 @@ fn the_unseen_check_reads_the_datasets_names() {
     check_unseen(&t.0, &[&ok]).unwrap();
     let e = check_unseen(&t.0, &[&ok, &bad]).unwrap_err().to_string();
     assert!(e.contains("ir.a.2026-10-21.x.jpg"), "{e}");
+    // A frame the dataset wrote under another name (its 120-byte cut, a `-2` of a name taken
+    // twice): no name says so, the record does.
+    std::fs::write(
+        t.0.join("train.txt"),
+        "./images/s0-ir.a.2026-10-21.x.jpg\n./images/s0-ir.b.2026-10-2-2.jpg\n",
+    )
+    .unwrap();
+    sources(&[
+        ("s0-ir.a.2026-10-21.x.jpg", "train/ir.a.2026-10-21.x.jpg"),
+        ("s0-ir.b.2026-10-2-2.jpg", "val/ir.b.2026-10-21.x.jpg"),
+    ]);
+    let e = check_unseen(&t.0, &[&ok]).unwrap_err().to_string();
+    assert!(e.contains("ir.b.2026-10-21.x.jpg"), "{e}");
+    // A listed image the record does not name, or no record: the check cannot be made.
+    sources(&[("s0-ir.a.2026-10-21.x.jpg", "train/ir.a.2026-10-21.x.jpg")]);
+    let e = check_unseen(&t.0, &[&frame("ir.c.2026-10-21.x.jpg")])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("cannot tell which frame"), "{e}");
+    std::fs::remove_file(t.0.join(crate::training::dataset::IMAGE_SOURCES_FILE)).unwrap();
+    std::fs::write(t.0.join("train.txt"), "./images/s0-ir.a.2026-10-21.x.jpg\n").unwrap();
+    assert!(check_unseen(&t.0, &[&ok]).is_err());
     // A list that cannot be read fails too: no check, no prediction.
+    sources(&[("s0-ir.a.2026-10-21.x.jpg", "train/ir.a.2026-10-21.x.jpg")]);
+    check_unseen(&t.0, &[&ok]).unwrap();
     std::fs::remove_file(t.0.join("valid.txt")).unwrap();
     assert!(check_unseen(&t.0, &[&ok]).is_err());
 }
@@ -1332,9 +1698,11 @@ fn a_dump_reads_back_filtered_to_the_noise_floor() {
 
 /// The judge and the writes of a check, replayed from a detection dump instead of fold models:
 /// `BOP_REFINE_CONFIG=<config file> BOP_REFINE_REPLAY=<dump of BOP_REFINE_DUMP> cargo test --lib
-/// refine_replay -- --ignored --nocapture`. Selects the reviewed frames as the job does, judges
-/// them with the job's context and writes the label files through [`write::write_fold`] as a
-/// real run does; trains, predicts and downloads nothing. It writes suggestions into the copy
+/// refine_replay -- --ignored --nocapture`. Selects the reviewed frames and folds them as the job
+/// does ([`folds::assign`](super::super::folds::assign) through the selection), judges each fold's
+/// frames with that fold's context (the class counts of what its model trained on) and writes the
+/// label files through the job's own [`RefineJob::write_fold_into`]; trains, predicts and
+/// downloads nothing. It writes suggestions into the copy
 /// (never point it at a dataset someone is reviewing) and no `report.json`, which would replace
 /// the report of the real run that made the dump.
 #[test]
@@ -1362,33 +1730,44 @@ fn refine_replay_on_a_copy() {
     }
     let (found, again) = read_dump(&dump);
     let wanted = job.wanted();
-    let jctx = job.judge_context(&wanted, &s);
-    let mut rep = job.start_report(&s);
-    let mut tally = RecallTally::default();
-    let mut sample = Vec::new();
-    let frames: Vec<&ExportFrame> = s.frames.iter().collect();
-    let in_dump = frames
+    let mut acc = Acc::new(job.start_report(&s));
+    let in_dump = s
+        .frames
         .iter()
         .filter(|f| found.frames.contains_key(&f.rel.jpg()))
         .count();
-    let w = write::write_fold(
-        &job.dataset_dir,
-        &frames,
-        &found,
-        &jctx,
-        &mut tally,
-        &mut rep.warnings,
-        &mut |_, _| {},
-    );
-    count_written(&mut rep, &mut sample, &w);
-    rep.folds_done = rep.folds;
-    rep.finish(&tally);
+    // Fold by fold as the job does: the fold's frames still on disk, judged with the class counts
+    // of what its model trained on.
+    for i in 0..s.k {
+        let (held, train, gone) = job.fold_frames(&s, i);
+        let class_boxes = super::super::class_boxes(train.iter().copied(), &wanted);
+        let jctx = job.judge_context(&wanted, &class_boxes);
+        let rare: Vec<&String> = class_boxes
+            .iter()
+            .filter(|(_, n)| **n < judge::MIN_CLASS_BOXES)
+            .map(|(c, _)| c)
+            .collect();
+        println!(
+            "fold {} of {}: {} held out, {} trained on, {gone} gone; classes under {}: {rare:?}",
+            i + 1,
+            s.k,
+            held.len(),
+            train.len(),
+            judge::MIN_CLASS_BOXES
+        );
+        job.write_fold_into(i + 1, s.k, &held, &found, &jctx, &mut acc, &mut |_, _| {})
+            .unwrap();
+        acc.rep.folds_done += 1;
+    }
+    acc.close_failures();
+    let mut rep = acc.rep;
+    rep.finish(&acc.tally);
     let r = &rep.recall;
     println!("review folder: {}", job.dataset_dir.display());
     println!(
         "run {}; imgsz {}; MATCH_MIN_SCORE {}",
         job.id,
-        jctx.imgsz,
+        job.train.request.recipe.imgsz,
         judge::MATCH_MIN_SCORE
     );
     println!(

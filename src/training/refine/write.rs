@@ -33,6 +33,25 @@ pub struct Written {
     pub loose: usize,
     /// The first frames written (`<scene>/<camera>/<date>/<stem>.jpg`).
     pub sample: Vec<String>,
+    /// Frames with a result from the fold model that were judged and written, or tried to be.
+    pub attempted: usize,
+    /// Of those, frames whose write failed.
+    pub failed: usize,
+    /// The first [`MAX_FAILURES`] of those failures, `<rel>: <why>`.
+    pub failures: Vec<String>,
+    /// Frames without a result from the fold model (it could not read them): not judged.
+    pub missing: usize,
+}
+
+/// Most failure messages one fold keeps ([`Written::failures`]); the job keeps as many over the
+/// whole check and counts the rest.
+pub const MAX_FAILURES: usize = 20;
+
+impl Written {
+    /// Every frame with a result failed to write: nothing of the fold was saved.
+    pub fn all_failed(&self) -> bool {
+        self.attempted > 0 && self.failed == self.attempted
+    }
 }
 
 fn bump(c: &mut KindCounts, kind: Kind) {
@@ -121,8 +140,9 @@ fn write_frame(
 }
 
 /// Write the suggestions of a fold's `frames` from `found` (the fold model's detections; a frame
-/// without a result is passed over, never judged as "nothing found"), counting the recall into
-/// `tally`, calling `progress(done, total)` now and then. A frame that fails is a warning: the
+/// without a result is passed over and counted in [`Written::missing`], never judged as "nothing
+/// found"), counting the recall into `tally`, calling `progress(done, total)` now and then. A frame
+/// that fails is counted ([`Written::failed`], the first [`MAX_FAILURES`] messages kept): the
 /// others go on.
 pub fn write_fold(
     dir: &Path,
@@ -130,20 +150,19 @@ pub fn write_fold(
     found: &Detections,
     ctx: &Context<'_>,
     tally: &mut RecallTally,
-    warnings: &mut Vec<String>,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Written {
     let mut out = Written::default();
-    let mut missing = 0usize;
     for (i, f) in frames.iter().enumerate() {
         if i % 25 == 0 {
             progress(i, frames.len());
         }
         let rel = f.rel.jpg();
         let Some(dets) = found.frames.get(&rel) else {
-            missing += 1;
+            out.missing += 1;
             continue;
         };
+        out.attempted += 1;
         match write_frame(dir, f, dets, ctx, tally, &mut out) {
             Ok(true) => {
                 out.frames += 1;
@@ -152,14 +171,13 @@ pub fn write_fold(
                 }
             }
             Ok(false) => {}
-            Err(e) => warnings.push(format!("{rel}: {e:#}")),
+            Err(e) => {
+                out.failed += 1;
+                if out.failures.len() < MAX_FAILURES {
+                    out.failures.push(format!("{rel}: {e:#}"));
+                }
+            }
         }
-    }
-    if missing > 0 && !found.cancelled {
-        warnings.push(format!(
-            "{missing} frame(s) got no result from the fold model (unreadable images?); they \
-             were not checked"
-        ));
     }
     out
 }

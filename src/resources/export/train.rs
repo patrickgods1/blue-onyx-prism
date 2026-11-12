@@ -282,9 +282,15 @@ pub const LOCK_GRACE: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub struct TrainLock {
     _file: std::fs::File,
+    path: PathBuf,
 }
 
 impl TrainLock {
+    /// The lock file this holds.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Take the lock, or fail within [`LOCK_GRACE`] naming the holder's likely identity.
     ///
     /// A child process this process spawns at the moment a lock file is open shares that open
@@ -312,7 +318,10 @@ impl TrainLock {
             res = file.try_lock();
         }
         match res {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self {
+                _file: file,
+                path: path.to_path_buf(),
+            }),
             Err(std::fs::TryLockError::WouldBlock) => bail!(
                 "another process (the service or a `blue-onyx-prism train` command) is training \
                  a model and holds {}; wait for it to finish or cancel it, then try again",
