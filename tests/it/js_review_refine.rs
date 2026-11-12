@@ -470,6 +470,58 @@ fn the_card_says_what_each_kind_suggests() {
     assert_eq!(tighten["yes"], "Accept the tighter box");
     assert_eq!(tighten["no"], "Keep my box");
     assert_eq!(tighten["short"], "Box 5: tighter box?");
+    assert_eq!(tighten["said_yes"], "Box 5 takes the tighter box");
+}
+
+/// The closer look's box of a `tighten` can be larger than the label or shifted: "tighter" only
+/// when it lies (almost) inside the label box, else "better-fitting"; the buttons stay accept /
+/// keep my box.
+#[test]
+fn a_tighten_is_tighter_only_inside_the_label_and_else_better_fitting() {
+    if !have_node() {
+        return;
+    }
+    // Box 4 is [600, 300, 700, 500] (100 x 200).
+    let with = |bbox: Value| {
+        let mut f = frame();
+        f["refine"][3]["bbox"] = bbox;
+        json!({"op": "cards", "labels": f, "classes": classes(), "hidden": []})
+    };
+    let got = node(&json!([
+        // Inside: tighter.
+        with(json!([610, 310, 690, 490])),
+        // 2 px past the right edge on an 82 x 180 box: 2.4% outside, still tighter.
+        with(json!([620, 310, 702, 490])),
+        // Larger than the label.
+        with(json!([590, 290, 710, 510])),
+        // Shifted: a fifth of it outside.
+        with(json!([620, 300, 720, 500])),
+    ]));
+    let words: Vec<(&str, &str, &str, &str)> = got
+        .iter()
+        .map(|cards| {
+            let t = &cards.as_array().unwrap()[3];
+            (
+                t["head"].as_str().unwrap(),
+                t["short"].as_str().unwrap(),
+                t["yes"].as_str().unwrap(),
+                t["no"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let tighter = (
+        "Box 5 (person): take the tighter box (dashed)?",
+        "Box 5: tighter box?",
+        "Accept the tighter box",
+        "Keep my box",
+    );
+    let better = (
+        "Box 5 (person): take the better-fitting box (dashed)?",
+        "Box 5: better-fitting box?",
+        "Accept the better-fitting box",
+        "Keep my box",
+    );
+    assert_eq!(words, [tighter, tighter, better, better]);
 }
 
 #[test]

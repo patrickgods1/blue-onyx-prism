@@ -7,22 +7,22 @@
 //! answer. A cancel returns `Ok` with a "stopped by Cancel" summary; a failure returns its error, with
 //! how many crops were kept.
 
+use super::OverlapsRequest;
 use super::select::{self, Selection};
 use super::write::{self, Written};
 use super::zoom::{self, CropResult};
-use super::{NEEDED_COMMIT_GB, OverlapsRequest, rfdetr_weights};
 use crate::backend::memory::Commit;
 use crate::collect::labels::bulk::Wanted;
 use crate::resources::catalog::Platform;
-use crate::resources::export::train::{self as env, TrainPaths};
+use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
-use crate::training::pyenv::{self, check, is_cancel, stage};
+use crate::training::pyenv::{check, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 /// Stages of a run.
@@ -82,22 +82,23 @@ pub struct OverlapsReport {
 
 /// The refusal when `free` cannot hold the check; None off Windows (no fixed limit).
 pub fn commit_problem(free: Option<Commit>) -> Option<String> {
-    let needed = NEEDED_COMMIT_GB * 1024.0 * 1024.0 * 1024.0;
-    let have = free?.available as f64;
-    (have < needed).then(|| {
-        format!(
-            "the overlap check needs about {NEEDED_COMMIT_GB} GB of free commit for PyTorch and \
-             RF-DETR L, and {:.1} GB is free: close programs or enlarge the paging file, then run \
-             it again (nothing was changed)",
-            have / (1024.0 * 1024.0 * 1024.0)
-        )
-    })
+    zoom::commit_problem("the overlap check", free)
+        .map(|why| format!("{why}, then run it again (nothing was changed)"))
 }
 
 impl OverlapsJob {
     fn step(&self, report: &mut dyn FnMut(TaskReport<'_>), n: usize, pct: u8, detail: &str) {
         let name = STAGES.get(n.saturating_sub(1)).copied().unwrap_or("");
         stage(report, name, n, STAGES.len(), pct, detail);
+    }
+
+    fn helper(&self) -> zoom::Helper<'_> {
+        zoom::Helper {
+            paths: &self.paths,
+            platform: self.platform,
+            accelerator: &self.accelerator,
+            timeout: self.timeout,
+        }
     }
 
     /// Stage 1: the work of this run ([`select::select`]).
@@ -120,43 +121,14 @@ impl OverlapsJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<(PathBuf, PathBuf)> {
-        pyenv::setup(
-            &self.paths,
-            self.platform,
-            &self.accelerator,
-            ctx.runner,
-            ctx.fetcher,
+        zoom::prepare(
+            &self.helper(),
+            self.request.allow_large,
+            ctx,
             report,
             (STAGES[1], 2, STAGES.len()),
             cancel,
-        )?;
-        let (_, script) = env::write_task_scripts(&self.paths)?;
-        self.step(report, 2, 90, "checking the auto-labeler");
-        pyenv::self_check(
-            ctx.runner,
-            &self.paths,
-            self.platform,
-            &script,
-            report,
-            cancel,
-        )?;
-        check(cancel)?;
-        let weights = [rfdetr_weights(&self.paths)?];
-        pyenv::check_large(&weights, self.request.allow_large)?;
-        pyenv::fetch_missing(
-            ctx.fetcher,
-            &weights,
-            report,
-            (STAGES[1], 2, STAGES.len()),
-            cancel,
-        )?;
-        let [(res, dir)] = weights;
-        let file = res
-            .parts
-            .first()
-            .ok_or_else(|| anyhow!("RF-DETR L has no file"))?
-            .file_name;
-        Ok((script, dir.join(file)))
+        )
     }
 
     /// Stage 3: run the script. `Ok` (whether a cancel stopped it, the failure that stopped it): the
@@ -173,67 +145,20 @@ impl OverlapsJob {
         if let Some(why) = commit_problem((self.free_commit)()) {
             bail!(why);
         }
-        std::fs::create_dir_all(&self.work)
-            .with_context(|| format!("creating {}", self.work.display()))?;
-        let list = self.work.join("crops.jsonl");
-        std::fs::write(&list, zoom::crop_list(&selection.frames)?)
-            .with_context(|| format!("writing {}", list.display()))?;
-        let out = self.work.join("zoom.jsonl");
-        let mut args = vec![script.as_os_str().to_owned()];
-        args.extend(zoom::args(
-            &list,
-            &out,
+        let ran = zoom::run(
+            &self.helper(),
+            &self.work,
+            script,
             weights,
             &self.classes,
-            &self.accelerator.device_arg(),
-        )?);
-        let total = selection.crops;
-        let mut done_ev = false;
-        let ran = pyenv::run_script(
-            ctx.runner,
-            &self.paths,
-            self.platform,
-            &self.work,
-            self.timeout,
-            args,
-            zoom::TAG,
-            &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
-                Some("crop") => {
-                    let i = ev
-                        .get("index")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    let pct = u8::try_from(i * 100 / u64::try_from(total.max(1)).unwrap_or(1))
-                        .unwrap_or(100);
-                    stage(
-                        report,
-                        STAGES[2],
-                        3,
-                        STAGES.len(),
-                        pct.min(99),
-                        &format!("{i} of {total} crops"),
-                    );
-                }
-                Some("model") => stage(report, STAGES[2], 3, STAGES.len(), 0, "RF-DETR L loaded"),
-                Some("done") => done_ev = true,
-                _ => {}
-            },
+            &selection.frames,
+            selection.crops,
+            ctx,
             report,
+            (STAGES[2], 3, STAGES.len()),
             cancel,
-        );
-        Ok(match ran {
-            Err(e) if is_cancel(&e) => (true, None, out),
-            Err(e) => (false, Some(e.context("the zoom check failed")), out),
-            Ok(()) if cancel.load(Ordering::Relaxed) => (true, None, out),
-            Ok(()) if !done_ev => (
-                false,
-                Some(anyhow!(
-                    "the zoom check finished without its summary; the script is damaged"
-                )),
-                out,
-            ),
-            Ok(()) => (false, None, out),
-        })
+        )?;
+        Ok((ran.stopped, ran.failed, ran.out))
     }
 
     fn stages(

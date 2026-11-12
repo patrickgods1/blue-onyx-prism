@@ -1999,3 +1999,44 @@ process.stdout.write(JSON.stringify({
             .starts_with("Measured by a check of an earlier version")
     );
 }
+
+/// The Findings card's line on loose labels (`RefineFloor.looseLine`): with the closer look, how
+/// many got a proposed box; without it (`--no-tighten`, the weights missing, an earlier report),
+/// that none was looked at.
+#[test]
+fn the_findings_line_says_how_many_loose_labels_got_a_proposed_box() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+process.stdout.write(JSON.stringify({
+  looked: F.looseLine({ loose: 148, tighten: true, found: { add: 165, tighten: 37 } }),
+  none_found: F.looseLine({ loose: 3, tighten: true, found: { add: 1 } }),
+  no_look: F.looseLine({ loose: 148, tighten: false, found: { add: 165, tighten: 0 } }),
+  earlier: F.looseLine({ loose: 12, found: { add: 2, verify: 1, relabel: 0 } }),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    assert_eq!(
+        got["looked"],
+        "Loose labels counted: 148, 37 with a proposed box."
+    );
+    assert_eq!(
+        got["none_found"],
+        "Loose labels counted: 3, 0 with a proposed box."
+    );
+    assert_eq!(
+        got["no_look"],
+        "Loose labels counted: 148 (no closer look in this check)."
+    );
+    assert_eq!(
+        got["earlier"],
+        "Loose labels counted: 12 (no closer look in this check)."
+    );
+}

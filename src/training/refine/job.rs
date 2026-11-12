@@ -4,9 +4,14 @@
 //! fold frame, run it on the fold's frames, write the suggestions, delete the fold's folder -> the
 //! report. See [`super`] for what it may change: suggestions and the report, nothing else.
 //!
-//! Steps: 1 selecting, then one per fold, then the report (K + 2; K may be lowered to the camera
-//! days, and the reports then carry the lower count). The selection also makes the check's static
-//! spots ([`super::Selected::spots`]) from the same snapshot; every fold's judge uses that one table.
+//! Steps: 1 selecting, then one per fold, then (with `tighten`) the closer look at the loose labels
+//! ([`super::tighten`]), then the report (K + 2, or K + 3 with the look; K may be lowered to the
+//! camera days, and the reports then carry the lower count). The selection also makes the check's
+//! static spots ([`super::Selected::spots`]) from the same snapshot; every fold's judge uses that
+//! one table. Each fold appends its candidates for the look to the work folder as it finishes; the
+//! look runs once after the last fold, under the same training lock, also after a failed fold (on
+//! what the finished folds found), never after a Cancel. A failed look keeps everything the folds
+//! wrote: the check ends as usual with the failure in its summary and the report's warnings.
 //!
 //! **Fold training** reuses the training run as it is ([`job::run_training_holding`]): a copy of
 //! the planned [`TrainJob`] per fold with its run folder, dataset and install folder inside the work
@@ -35,7 +40,8 @@
 use super::judge::{self, Context};
 use super::predict::{FoldModel, FoldPredictor, LocalPredictor};
 use super::report::{RecallTally, RefineReport};
-use super::{RefineRequest, Selected, fold_model_name, recipe_info, select, write};
+use super::{RefineRequest, Selected, fold_model_name, recipe_info, select, tighten, write};
+use crate::backend::memory::Commit;
 use crate::collect::labels::Frame;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{
@@ -95,6 +101,9 @@ pub struct RefineJob {
     pub config: Box<Config>,
     /// Fewest frames a check runs on ([`super::MIN_FRAMES`]; tests lower it).
     pub min_frames: usize,
+    /// The free commit now, checked before the closer look loads RF-DETR L
+    /// ([`crate::system_info::commit`]; tests fake it).
+    pub free_commit: fn() -> Option<Commit>,
 }
 
 impl std::fmt::Debug for RefineJob {
@@ -130,9 +139,10 @@ enum Stop {
 /// What a fold calls the end of its training run: the model files go into the fold's folder.
 const FOLD_MODEL: &str = "preparing the fold model";
 
-/// Steps of a check with `folds` folds: selecting, one per fold, the report.
-const fn steps_for(folds: usize) -> usize {
-    folds + 2
+/// Steps of a check with `folds` folds: selecting, one per fold, the closer look when `tighten`,
+/// the report.
+const fn steps_for(folds: usize, tighten: bool) -> usize {
+    folds + 2 + if tighten { 1 } else { 0 }
 }
 
 /// What a fold's training run shows of its stage `stage` at `percent` with `detail` (None:
@@ -261,9 +271,9 @@ fn dataset_spelling(flat: &str) -> String {
 const SAMPLE: usize = 20;
 
 /// Count what writing a fold did (`w`) into the report and the sample.
-fn count_written(rep: &mut RefineReport, sample: &mut Vec<String>, w: &write::Written) {
+fn count_written(acc: &mut Acc, w: &write::Written) {
+    let rep = &mut acc.rep;
     rep.frames_checked += w.checked;
-    rep.frames_written += w.frames;
     rep.loose += w.loose;
     rep.found.add += w.found.add;
     rep.found.verify += w.found.verify;
@@ -272,8 +282,10 @@ fn count_written(rep: &mut RefineReport, sample: &mut Vec<String>, w: &write::Wr
     rep.written.add += w.written.add;
     rep.written.verify += w.written.verify;
     rep.written.relabel += w.written.relabel;
-    let room = SAMPLE.saturating_sub(sample.len());
-    sample.extend(w.sample.iter().take(room).cloned());
+    acc.changed.extend(w.changed.iter().cloned());
+    acc.rep.frames_written = acc.changed.len();
+    let room = SAMPLE.saturating_sub(acc.sample.len());
+    acc.sample.extend(w.sample.iter().take(room).cloned());
 }
 
 /// What the folds of a check add up: the report, the recall tally, the sample, and how many
@@ -288,6 +300,11 @@ pub struct Acc {
     pub failures_shown: usize,
     /// Write failures not named.
     pub failures_more: usize,
+    /// Frames whose label file changed (a fold's write and the closer look's count once).
+    pub changed: BTreeSet<String>,
+    /// IoU(`L`, `Z`) and `Z`'s area over `L`'s of the `tighten` suggestions the closer look
+    /// left open (the replay prints their distribution).
+    pub shapes: Vec<(f32, f32)>,
 }
 
 impl Acc {
@@ -298,7 +315,36 @@ impl Acc {
             sample: Vec::new(),
             failures_shown: 0,
             failures_more: 0,
+            changed: BTreeSet::new(),
+            shapes: Vec::new(),
         }
+    }
+
+    /// Count what the closer look's writes did (`w`).
+    pub fn note_tighten(&mut self, w: &write::Tightened) {
+        self.rep.found.tighten += w.found;
+        self.rep.written.tighten += w.written;
+        self.shapes.extend(w.shapes.iter().copied());
+        let room = SAMPLE.saturating_sub(self.sample.len());
+        self.sample.extend(
+            w.changed
+                .iter()
+                .filter(|r| !self.changed.contains(*r))
+                .take(room)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        self.changed.extend(w.changed.iter().cloned());
+        self.rep.frames_written = self.changed.len();
+        for f in &w.failures {
+            if self.failures_shown < write::MAX_FAILURES {
+                self.rep.warnings.push(f.clone());
+                self.failures_shown += 1;
+            } else {
+                self.failures_more += 1;
+            }
+        }
+        self.failures_more += w.failed.saturating_sub(w.failures.len());
     }
 
     /// Name the write failures of `w` in the report while fewer than [`write::MAX_FAILURES`] are,
@@ -388,10 +434,43 @@ impl RefineJob {
     }
 
     /// The classes the judge looks at: the class list without the hidden ones.
-    fn wanted(&self) -> Wanted<'_> {
+    pub(super) fn wanted(&self) -> Wanted<'_> {
         Wanted {
             classes: &self.classes,
             hidden: &self.hidden,
+        }
+    }
+
+    /// Whether this check takes a closer look at its loose labels ([`super::tighten`]): the
+    /// request as planned ([`super::plan_refine`] settles the default).
+    pub fn tighten(&self) -> bool {
+        self.request.tighten == Some(true)
+    }
+
+    /// Where the closer look runs: the fold training's environment and GPU.
+    pub(super) fn zoom_helper(&self) -> crate::training::overlaps::zoom::Helper<'_> {
+        crate::training::overlaps::zoom::Helper {
+            paths: &self.train.paths,
+            platform: self.train.platform,
+            accelerator: &self.train.accelerator,
+            timeout: self.train.timeout,
+        }
+    }
+
+    /// What the closer look's writes judge with: the folds' context without the class counts and
+    /// the spots, which only `verify` and `add` read (the candidates do not depend on them).
+    pub(super) fn tighten_context<'a>(
+        &'a self,
+        wanted: &'a Wanted<'a>,
+        class_boxes: &'a BTreeMap<String, usize>,
+    ) -> Context<'a> {
+        Context {
+            wanted,
+            imgsz: self.train.request.recipe.imgsz,
+            class_boxes,
+            run: &self.id,
+            spots: None,
+            floor: self.config.collect.size_floor,
         }
     }
 
@@ -399,7 +478,7 @@ impl RefineJob {
     /// boxes per class of what this fold's model trained on (`class_boxes`,
     /// [`super::class_boxes`]), this check's id, and the check's static spots (`spots`, made once
     /// from the selection: [`Selected::spots`]).
-    fn judge_context<'a>(
+    pub(super) fn judge_context<'a>(
         &'a self,
         wanted: &'a Wanted<'a>,
         class_boxes: &'a BTreeMap<String, usize>,
@@ -445,6 +524,7 @@ impl RefineJob {
         // The fold models train on every label; the judge treats boxes under the floor as ignore
         // regions. What the recall by size was measured with.
         rep.folds_every_label = true;
+        rep.tighten = self.tighten();
         rep.size_floor = self.config.collect.size_floor;
         rep.ignore_mode = Some(self.train.options.ignore);
         rep.camera_days = s.groups.len();
@@ -503,7 +583,7 @@ impl RefineJob {
                 w.failures.first().map_or("no reason given", String::as_str)
             );
         }
-        count_written(&mut acc.rep, &mut acc.sample, &w);
+        count_written(acc, &w);
         Ok(w)
     }
 
@@ -530,7 +610,7 @@ impl RefineJob {
     ) -> Result<()> {
         let k = s.k;
         let n = i + 1;
-        let steps = steps_for(k);
+        let steps = steps_for(k, self.tighten());
         let at = i + 2;
         let name = format!("checking fold {n} of {k}");
         let fold_dir = self.work.join(format!("fold-{n}"));
@@ -738,6 +818,15 @@ impl RefineJob {
                 &format!("writing suggestions: {d} of {total} frames"),
             );
         })?;
+        // Its loose labels wait for the closer look after the last fold.
+        if self.tighten()
+            && let Err(e) = tighten::append(&self.work, &w.candidates)
+        {
+            acc.rep.warnings.push(format!(
+                "fold {n} of {k}: its loose labels could not be kept for the closer look \
+                 ({e:#}); they get no better-fitting box in this check"
+            ));
+        }
         Self::step(
             report,
             &name,
@@ -785,8 +874,9 @@ impl RefineJob {
         // labels between a fold's training and its prediction, or takes the next fold's turn.
         let lock = TrainLock::try_acquire(&self.train.paths.train_lock_file())?;
         let k = s.k;
+        let look = self.tighten();
         // From here on the count the folds were lowered to ([`Task::steps`] has the asked one).
-        let steps = steps_for(k);
+        let steps = steps_for(k, look);
         let mut acc = Acc::new(self.start_report(&s));
         Self::step(
             report,
@@ -831,15 +921,47 @@ impl RefineJob {
                 }
             }
         }
-        drop(lock);
         if acc.rep.folds_done == 0 {
+            // (Returning releases the lock.)
             match stop {
                 Some(Stop::Cancelled) => return Err(anyhow!(Cancelled)),
                 Some(Stop::Failed(e)) => return Err(e),
                 None => {}
             }
         }
-        // 3. The report (also of a stopped check: what its finished folds found).
+        // 3. The closer look at the loose labels, still under the training lock: also after a
+        // failed fold (what the finished folds found), never after a Cancel.
+        let mut zoom = None;
+        if look {
+            if matches!(stop, Some(Stop::Cancelled)) {
+                acc.rep.warnings.push(
+                    "the closer look at loose labels did not run: the check was cancelled".into(),
+                );
+            } else {
+                let frames = match tighten::read(&self.work, &mut acc.rep.warnings) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        acc.rep.warnings.push(format!(
+                            "the loose labels kept for the closer look could not be read ({e:#}); \
+                             they get no better-fitting box in this check"
+                        ));
+                        Vec::new()
+                    }
+                };
+                zoom = Some(tighten::run_stage(
+                    self,
+                    &frames,
+                    ctx,
+                    report,
+                    (k + 2, steps),
+                    cancel,
+                    &mut acc,
+                ));
+            }
+        }
+        drop(lock);
+        let zoom_cancelled = zoom.as_ref().is_some_and(|z| z.cancelled);
+        // 4. The report (also of a stopped check: what its finished folds found).
         Self::step(report, REPORTING, steps, steps, 0, "");
         acc.close_failures();
         let Acc {
@@ -848,9 +970,16 @@ impl RefineJob {
             sample,
             ..
         } = acc;
-        rep.cancelled = matches!(stop, Some(Stop::Cancelled));
+        rep.cancelled = matches!(stop, Some(Stop::Cancelled)) || zoom_cancelled;
         if let Some(Stop::Failed(e)) = &stop {
             rep.warnings.push(format!("the check stopped: {e:#}"));
+        }
+        if zoom_cancelled {
+            rep.warnings.push(format!(
+                "the closer look at loose labels was stopped by Cancel after {} of {} crops; the \
+                 better-fitting boxes of those were saved",
+                rep.zoomed, rep.tighten_candidates
+            ));
         }
         rep.finish(&tally);
         let report_path = match rep.write(&self.dataset_dir) {
@@ -870,6 +999,12 @@ impl RefineJob {
                  rerun checks every fold again; ",
                 rep.folds_done
             ),
+            _ if zoom_cancelled => format!(
+                "stopped by Cancel during the closer look at loose labels, after {} of {} crops; \
+                 what finished was saved and a rerun checks every fold again; ",
+                n(rep.zoomed),
+                n(rep.tighten_candidates)
+            ),
             _ => String::new(),
         };
         let at_spots = if rep.adds_at_spots > 0 {
@@ -877,11 +1012,29 @@ impl RefineJob {
         } else {
             String::new()
         };
+        let better = if look {
+            format!(", {} better-fitting boxes for loose labels", n(f.tighten))
+        } else {
+            String::new()
+        };
+        let looked = match &zoom {
+            Some(z) if z.failed.is_some() => {
+                "; the closer look at them failed (see the warnings), the other suggestions were \
+                 saved"
+                    .to_string()
+            }
+            Some(_) => format!(
+                ", {} of {} sent to a closer look answered",
+                n(rep.zoomed),
+                n(rep.tighten_candidates)
+            ),
+            None => String::new(),
+        };
         summary.push_str(&format!(
             "{} frames checked by {} fold models; suggested: {} missing boxes{at_spots}, {} labels \
-             to verify, {} other classes ({} of these suggestions new since the last check, on {} \
-             frames written); {} loose labels counted. No box was changed: confirm the \
-             suggestions on the Review tab",
+             to verify, {} other classes{better} ({} of these suggestions new since the last \
+             check, on {} frames written); {} loose labels counted{looked}. No box was changed: \
+             confirm the suggestions on the Review tab",
             n(rep.frames_checked),
             rep.folds_done,
             n(f.add),
@@ -947,7 +1100,7 @@ impl Task for RefineJob {
     /// report carries its own `steps` and the queue takes it from there (the first report still
     /// this count, every one after the selection [`steps_for`] of the lowered count).
     fn steps(&self) -> usize {
-        steps_for(self.request.folds)
+        steps_for(self.request.folds, self.tighten())
     }
     fn run(
         &self,

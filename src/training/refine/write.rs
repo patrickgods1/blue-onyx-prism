@@ -7,16 +7,20 @@
 
 use super::judge::{self, Context, FrameInput};
 use super::report::{KindCounts, RecallTally};
+use super::tighten::{FrameCandidates, Looked, SavedDet};
 use crate::collect::labels::export::ExportFrame;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
-use crate::collect::labels::{self, Frame, LabelFile};
+use crate::collect::labels::{self, Frame, LabelFile, iou};
 use crate::training::autolabel::relabel::Detections;
+use crate::training::autolabel::triage::Det;
 use anyhow::{Result, anyhow};
 use std::path::Path;
 
-/// The kinds a check writes (and replaces when not found again): `tighten` belongs to a later
-/// stage and is left alone.
+/// The kinds a fold writes (and replaces when not found again). `tighten` is the zoom stage's
+/// ([`TIGHTEN_KINDS`], [`write_tighten`]) and a fold leaves it alone.
 pub const KINDS: [Kind; 3] = [Kind::Add, Kind::Verify, Kind::Relabel];
+/// The kinds the zoom stage writes, on the frames it looked at only.
+pub const TIGHTEN_KINDS: [Kind; 1] = [Kind::Tighten];
 
 /// What writing one fold did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -45,6 +49,11 @@ pub struct Written {
     pub failures: Vec<String>,
     /// Frames without a result from the fold model (it could not read them): not judged.
     pub missing: usize,
+    /// Every frame whose label file changed (`<scene>/<camera>/<date>/<stem>.jpg`): a frame the
+    /// zoom stage writes again counts once in the report.
+    pub changed: Vec<String>,
+    /// The judged frames with loose labels worth a closer look ([`judge::Judged::candidates`]).
+    pub candidates: Vec<FrameCandidates>,
 }
 
 /// Most failure messages one fold keeps ([`Written::failures`]); the job keeps as many over the
@@ -63,7 +72,8 @@ fn bump(c: &mut KindCounts, kind: Kind) {
         Kind::Add => c.add += 1,
         Kind::Verify => c.verify += 1,
         Kind::Relabel => c.relabel += 1,
-        Kind::Tighten | Kind::Unknown => {}
+        Kind::Tighten => c.tighten += 1,
+        Kind::Unknown => {}
     }
 }
 
@@ -151,6 +161,18 @@ fn write_frame(
         out.written.verify += written.verify;
         out.written.relabel += written.relabel;
         tally.add(&f.rel.camera, &f.rel.scene, &j.boxes);
+        if !j.candidates.is_empty() {
+            out.candidates.push(FrameCandidates {
+                rel: f.rel.jpg(),
+                image: f.image.clone(),
+                width: f.width,
+                height: f.height,
+                camera: f.rel.camera.clone(),
+                day: f.rel.date.clone(),
+                dets: dets.iter().map(SavedDet::from).collect(),
+                loose: j.candidates,
+            });
+        }
     }
     Ok(changed)
 }
@@ -183,14 +205,144 @@ pub fn write_fold(
             Ok(true) => {
                 out.frames += 1;
                 if out.sample.len() < 20 {
-                    out.sample.push(rel);
+                    out.sample.push(rel.clone());
                 }
+                out.changed.push(rel);
             }
             Ok(false) => {}
             Err(e) => {
                 out.failed += 1;
                 if out.failures.len() < MAX_FAILURES {
                     out.failures.push(format!("{rel}: {e:#}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What [`write_tighten`] did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tightened {
+    /// Frames whose label file changed.
+    pub changed: Vec<String>,
+    /// `tighten` suggestions written now (new since the file's last).
+    pub written: usize,
+    /// Open `tighten` suggestions on the frames looked at after the write (new or as before).
+    pub found: usize,
+    /// Of those, per suggestion: IoU(`L`, `Z`) and `Z`'s area over `L`'s.
+    pub shapes: Vec<(f32, f32)>,
+    /// Frames whose write failed, the first [`MAX_FAILURES`] reasons.
+    pub failed: usize,
+    pub failures: Vec<String>,
+}
+
+fn area(b: &[f32; 4]) -> f32 {
+    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
+}
+
+/// `a` and `b` name the same label: exact box, label alike.
+fn same_target(a: Option<[f32; 4]>, label: Option<&str>, c: &judge::Loose) -> bool {
+    a.map(|t| t.map(f32::to_bits)) == Some(c.target.map(f32::to_bits))
+        && label.is_none_or(|l| l.trim().eq_ignore_ascii_case(c.target_label.trim()))
+}
+
+/// Write the `tighten` suggestions the closer look supports on the frames it answered (`looked`),
+/// each judged afresh under the label write lock ([`labels::update`]): a frame no longer reviewed
+/// gets nothing; its candidates are found again from the fold model's detections on the file as
+/// it is now ([`judge::judge`], `ctx`), and each one the look answered is decided by
+/// [`judge::tighten`]. Only `tighten` changes ([`refine::apply`] of [`TIGHTEN_KINDS`]): open ones
+/// on labels the look did not answer are kept as they are, answered ones stay, and an unchanged
+/// result leaves the file untouched. `progress(done, total)` now and then.
+pub fn write_tighten(
+    dir: &Path,
+    looked: &[Looked<'_>],
+    ctx: &Context<'_>,
+    progress: &mut dyn FnMut(usize, usize),
+) -> Tightened {
+    let mut out = Tightened::default();
+    for (i, l) in looked.iter().enumerate() {
+        if i % 25 == 0 {
+            progress(i, looked.len());
+        }
+        let f = l.frame;
+        let dets: Vec<Det> = f.dets.iter().map(Det::from).collect();
+        let mut kept: Vec<(f32, f32)> = Vec::new();
+        let mut written = 0;
+        let r = Frame::resolve(dir, &f.rel)
+            .ok_or_else(|| {
+                anyhow!(
+                    "the frame is gone (deleted or moved during the check); nothing was written"
+                )
+            })
+            .and_then(|frame| {
+                labels::update(&frame.labels, |cur| {
+                    let Some(mut file): Option<LabelFile> = cur else {
+                        return Ok(None);
+                    };
+                    if file.status != labels::Status::Reviewed {
+                        return Ok(None);
+                    }
+                    let input = FrameInput {
+                        file: &file,
+                        width: f.width,
+                        height: f.height,
+                        dets: &dets,
+                        camera: &f.camera,
+                        day: &f.day,
+                    };
+                    let mut found: Vec<Suggestion> = Vec::new();
+                    let mut unanswered: Vec<judge::Loose> = Vec::new();
+                    for c in judge::judge(&input, ctx).candidates {
+                        match l.answers.iter().find(|(a, _)| a.same_pair(&c)) {
+                            Some((_, zoom)) => {
+                                found.extend(judge::tighten(&input, &c, zoom, ctx));
+                            }
+                            None => unanswered.push(c),
+                        }
+                    }
+                    // A label the look did not answer keeps its open `tighten` as it is.
+                    found.extend(
+                        file.refine
+                            .iter()
+                            .filter(|s| {
+                                s.kind == Kind::Tighten
+                                    && !s.answered()
+                                    && unanswered.iter().any(|c| {
+                                        same_target(s.target, s.target_label.as_deref(), c)
+                                    })
+                            })
+                            .cloned(),
+                    );
+                    let before = file.refine.clone();
+                    let applied = refine::apply(&mut file, found, &TIGHTEN_KINDS);
+                    written = new_ones(&before, &file.refine).tighten;
+                    kept = file
+                        .refine
+                        .iter()
+                        .filter(|s| s.kind == Kind::Tighten && !s.answered())
+                        .filter_map(|s| {
+                            let (t, z) = (s.target?, s.bbox?);
+                            let a = area(&t);
+                            Some((iou(&t, &z), if a > 0.0 { area(&z) / a } else { 0.0 }))
+                        })
+                        .collect();
+                    Ok(applied.changed().then_some(file))
+                })
+            });
+        match r {
+            Ok(changed) => {
+                out.written += written;
+                out.found += kept.len();
+                out.shapes.extend(kept);
+                if changed {
+                    out.changed.push(f.rel.clone());
+                }
+            }
+            Err(e) => {
+                out.failed += 1;
+                if out.failures.len() < MAX_FAILURES {
+                    out.failures.push(format!("{}: {e:#}", f.rel));
                 }
             }
         }

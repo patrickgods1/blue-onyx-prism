@@ -20,8 +20,11 @@
 //! - [`folds`]: whole camera days per fold, pure;
 //! - [`job`]: the stage machine ([`RefineJob`], a task of the training queue);
 //! - [`predict`]: a fold model over its frames, in this process ([`predict::FoldPredictor`]);
-//! - [`judge`]: one frame's labels against the detections, pure;
+//! - [`judge`]: one frame's labels against the detections, pure (and [`judge::tighten`], the
+//!   decision on a loose label from two looks);
 //! - [`write`]: the suggestions, re-judged under the label write lock;
+//! - [`tighten`]: the zoom stage after the last fold, a closer look at the loose labels by RF-DETR
+//!   L on a crop of each (the overlap check's script), proposing better-fitting boxes;
 //! - [`report`]: the report and its Wilson intervals.
 //!
 //! A route plans a check like the overlap check: [`plan_refine`] then the queue's `enqueue_task`;
@@ -33,6 +36,7 @@ pub mod job;
 pub mod judge;
 pub mod predict;
 pub mod report;
+pub mod tighten;
 pub mod write;
 
 pub use job::RefineJob;
@@ -169,6 +173,13 @@ pub struct RefineRequest {
     /// weights).
     #[serde(default)]
     pub allow_large: bool,
+    /// A closer look at the loose labels after the last fold ([`tighten`]), proposing
+    /// better-fitting boxes. None: on when RF-DETR L's weights are downloaded
+    /// ([`tighten_weights_ready`]), else off with a warning; `Some(true)` asks for it (the weights
+    /// downloaded with the check like the overlap check's), `Some(false)` never. A planned job
+    /// holds the answer ([`plan_refine`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tighten: Option<bool>,
 }
 
 fn default_folds() -> usize {
@@ -187,8 +198,25 @@ impl Default for RefineRequest {
             frames: RefineFrames::default(),
             gpu: None,
             allow_large: false,
+            tighten: None,
         }
     }
+}
+
+/// Whether the closer look's weights (RF-DETR L, the overlap check's model) are on disk: then a
+/// check looks closer at its loose labels unless told not to.
+pub fn tighten_weights_ready(config: &Config) -> bool {
+    let paths = TrainPaths::for_config(config);
+    crate::training::overlaps::rfdetr_weights(&paths)
+        .is_ok_and(|w| super::pyenv::missing_bytes(&[w]) == 0)
+}
+
+/// Whether a check of `request` on `config` looks closer at its loose labels: the request's
+/// answer, else [`tighten_weights_ready`].
+pub fn tighten_on(config: &Config, request: &RefineRequest) -> bool {
+    request
+        .tighten
+        .unwrap_or_else(|| tighten_weights_ready(config))
 }
 
 impl RefineRequest {
@@ -737,9 +765,13 @@ pub struct RefinePreview {
     pub recipe: RecipeInfo,
     /// Rough time of the whole check, seconds; None without a GPU to train on.
     pub seconds: Option<f64>,
-    /// Where `seconds` came from; None with no `seconds`.
+    /// Where `seconds` came from; None with no `seconds`. With `tighten` the seconds include a
+    /// rough few minutes for the closer look ([`tighten::estimate_seconds`]), whatever the basis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_basis: Option<TimeBasis>,
+    /// The check would look closer at its loose labels ([`tighten_on`]).
+    #[serde(default)]
+    pub tighten: bool,
     pub warnings: Vec<String>,
     /// Open suggestions on the selected frames that the check replaces with what its fold models
     /// find ([`open_to_replace`]): a start asks first (`POST /v1/refine/check` `replace_open`).
@@ -786,6 +818,7 @@ pub fn preview(
         from,
         run: recipe_run,
     } = choose(config, request.epochs, cap)?;
+    let tighten = tighten_on(config, request);
     // What a start asks about comes first.
     let mut warnings = Vec::new();
     if s.open_suggestions > 0 {
@@ -847,7 +880,10 @@ pub fn preview(
                 )
                 .map(|e| e.total_s)
             };
-            let secs = check_seconds(&train, recipe.epochs, pace, guess);
+            let mut secs = check_seconds(&train, recipe.epochs, pace, guess);
+            if tighten {
+                secs += tighten::estimate_seconds(total);
+            }
             let basis = if pace.is_some() {
                 TimeBasis::LastRun
             } else {
@@ -894,6 +930,10 @@ pub fn preview(
             rare.join(", ")
         ));
     }
+    // Off by default only for want of the weights: say so, and how to get them.
+    if !tighten && request.tighten.is_none() {
+        warnings.push(tighten::skipped_warning());
+    }
     Ok(RefinePreview {
         dataset_dir: dir,
         filter: request.frames.describe(),
@@ -904,6 +944,7 @@ pub fn preview(
         recipe: recipe_info(&recipe, &from),
         seconds,
         time_basis,
+        tighten,
         warnings,
         open_suggestions: s.open_suggestions,
         open_frames: s.open_frames,
@@ -913,8 +954,9 @@ pub fn preview(
 }
 
 /// The warnings `train refine` prints before it starts (it is an explicit command: it asks
-/// nothing): [`replace_warning`] when the check replaces open suggestions, and
-/// [`weak_epochs_warning`] when its fold models are short.
+/// nothing): [`replace_warning`] when the check replaces open suggestions,
+/// [`weak_epochs_warning`] when its fold models are short, and [`tighten::skipped_warning`] when
+/// it runs without the closer look for want of the weights.
 pub fn start_warnings(p: &RefinePreview, family: TrainFamily) -> Vec<String> {
     let mut out = Vec::new();
     if p.open_suggestions > 0 {
@@ -926,6 +968,10 @@ pub fn start_warnings(p: &RefinePreview, family: TrainFamily) -> Vec<String> {
             p.recipe.epochs,
             p.open_suggestions,
         ));
+    }
+    let skipped = tighten::skipped_warning();
+    if p.warnings.contains(&skipped) {
+        out.push(skipped);
     }
     out
 }
@@ -972,11 +1018,21 @@ pub fn preview_text(p: &RefinePreview) -> String {
             f.fold, f.frames, f.camera_days
         ));
     }
+    t.push_str(if p.tighten {
+        "loose labels: a closer look by RF-DETR L after the last fold proposes better-fitting boxes\n"
+    } else {
+        "loose labels: counted only (no closer look)\n"
+    });
     if let Some(s) = p.seconds {
         t.push_str(&format!(
-            "about {} on this GPU ({})\n",
+            "about {} on this GPU ({}){}\n",
             super::estimate::format_duration(s),
-            p.time_basis.unwrap_or(TimeBasis::Guess).describe()
+            p.time_basis.unwrap_or(TimeBasis::Guess).describe(),
+            if p.tighten {
+                "; the closer look adds a few minutes"
+            } else {
+                ""
+            }
         ));
     }
     for w in &p.warnings {
@@ -1022,6 +1078,16 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
     let (recipe, from) = choose_recipe(config, request.epochs, cap)?;
     let base = recipe.base()?;
     super::pyenv::check_large(&[(base, paths.weights_dir(base))], allow_large)?;
+    // The closer look: on by default only when its weights are here; asked for, they come with
+    // the check under the same gate as the overlap check's.
+    let tighten = tighten_on(config, &request);
+    if tighten {
+        super::pyenv::check_large(
+            &[crate::training::overlaps::rfdetr_weights(&paths)?],
+            allow_large,
+        )?;
+    }
+    request.tighten = Some(tighten);
     request.allow_large = allow_large;
     let id = super::service::new_run_id();
     let work = super::training_dir(config).join("refine").join(&id);
@@ -1056,6 +1122,7 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
         predictor: None,
         config: Box::new(config.clone()),
         min_frames: MIN_FRAMES,
+        free_commit: crate::system_info::commit,
         id,
         request,
     })
@@ -1332,6 +1399,7 @@ mod tests {
                 recipe: recipe_info(&chosen.recipe, &chosen.from),
                 seconds: Some(3893.0),
                 time_basis: basis,
+                tighten: false,
                 warnings: Vec::new(),
                 open_suggestions: 0,
                 open_frames: 0,
@@ -1653,10 +1721,111 @@ mod tests {
             p.warnings
         );
         assert!(preview_text(&p).contains("warning: 1 epoch per fold model"));
+        // RF-DETR L's weights are not here: no closer look, said once, last.
+        assert!(!p.tighten);
+        assert_eq!(p.warnings.last(), Some(&tighten::skipped_warning()));
         assert_eq!(
             start_warnings(&p, family),
-            vec![replace_warning(3, 2), weak_epochs_warning(family, 1, 3)]
+            vec![
+                replace_warning(3, 2),
+                weak_epochs_warning(family, 1, 3),
+                tighten::skipped_warning()
+            ]
         );
+        assert!(preview_text(&p).contains("loose labels: counted only (no closer look)"));
+        // Asked for, or told not to: no such warning.
+        for asked in [Some(true), Some(false)] {
+            let p = preview(
+                &c,
+                &RefineRequest {
+                    tighten: asked,
+                    ..short.clone()
+                },
+                &cap,
+            )
+            .unwrap();
+            assert_eq!(p.tighten, asked == Some(true));
+            assert!(
+                !p.warnings.contains(&tighten::skipped_warning()),
+                "{:?}",
+                p.warnings
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_closer_look_is_on_by_default_only_with_its_weights_and_its_time_is_said() {
+        let root =
+            std::env::temp_dir().join(format!("bop-refine-tighten-{}", uuid::Uuid::new_v4()));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            allow_large_downloads: true,
+            ..Config::default()
+        };
+        let req = RefineRequest::default();
+        assert!(!tighten_weights_ready(&c));
+        assert!(!tighten_on(&c, &req));
+        assert!(tighten_on(
+            &c,
+            &RefineRequest {
+                tighten: Some(true),
+                ..req.clone()
+            }
+        ));
+        // The weights on disk (every part at its pinned size): on unless told not to.
+        let paths = TrainPaths::for_config(&c);
+        let (res, dir) = crate::training::overlaps::rfdetr_weights(&paths).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        for p in res.parts {
+            let f = std::fs::File::create(dir.join(p.file_name)).unwrap();
+            f.set_len(p.size).unwrap();
+        }
+        assert!(tighten_weights_ready(&c));
+        assert!(tighten_on(&c, &req));
+        assert!(!tighten_on(
+            &c,
+            &RefineRequest {
+                tighten: Some(false),
+                ..req.clone()
+            }
+        ));
+        // The time line says the look adds a few minutes; the basis stays the folds'.
+        let text = |tighten: bool| {
+            preview_text(&RefinePreview {
+                dataset_dir: root.clone(),
+                filter: "all reviewed frames".into(),
+                frames: 851,
+                left_out: LeftOut::default(),
+                camera_days: 12,
+                folds: Vec::new(),
+                recipe: RecipeInfo {
+                    model: "rfdetr-nano".into(),
+                    imgsz: 384,
+                    epochs: 8,
+                    batch: 8,
+                    from: "the default".into(),
+                },
+                seconds: Some(4100.0),
+                time_basis: Some(TimeBasis::LastRun),
+                tighten,
+                warnings: Vec::new(),
+                open_suggestions: 0,
+                open_frames: 0,
+                refused: None,
+                folder_missing: false,
+            })
+        };
+        let on = text(true);
+        assert!(
+            on.contains("(from your last training run); the closer look adds a few minutes"),
+            "{on}"
+        );
+        assert!(
+            on.contains("loose labels: a closer look by RF-DETR L"),
+            "{on}"
+        );
+        assert!(!text(false).contains("closer look adds"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

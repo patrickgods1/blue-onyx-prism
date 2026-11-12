@@ -969,7 +969,7 @@
   function refineTag(kind) {
     if (kind === 'verify') return 'check? ';
     if (kind === 'relabel') return '→ ' + refineCur.l.label + '? ';
-    if (kind === 'tighten') return 'tighten? ';
+    if (kind === 'tighten') return R.tightenWord(refineCur.l, boxes()) === 'tighter' ? 'tighter? ' : 'better box? ';
     return '';
   }
 

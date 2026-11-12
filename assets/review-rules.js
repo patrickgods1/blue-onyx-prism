@@ -706,6 +706,23 @@
 
   function score2(v) { return typeof v === 'number' && isFinite(v) ? v.toFixed(2) : ''; }
 
+  // Share of a `tighten`'s proposed box inside the box it is about from which it is "the tighter
+  // box": a few pixels past an edge still read as tighter. Below it the proposal is larger than
+  // the label or shifted, so the card calls it "the better-fitting box".
+  var TIGHTER_INSIDE = 0.95;
+
+  // 'tighter' when the proposed box of live `tighten` `l` lies (almost) inside the box it is about
+  // (on boxes `bs`), else 'better-fitting'.
+  function tightenWord(l, bs) {
+    var at = l.target_box == null ? -1 : l.target_box;
+    var t = (bs || [])[at] ? bs[at].bbox : l.target;
+    var z = l.bbox;
+    if (!t || !z) return 'better-fitting';
+    var inter = Math.max(0, Math.min(t[2], z[2]) - Math.max(t[0], z[0])) * Math.max(0, Math.min(t[3], z[3]) - Math.max(t[1], z[1]));
+    var az = Math.max(0, z[2] - z[0]) * Math.max(0, z[3] - z[1]);
+    return az > 0 && inter / az >= TIGHTER_INSIDE ? 'tighter' : 'better-fitting';
+  }
+
   // What the card says about live suggestion `l` on boxes `bs`: {head (the question), short (the
   // one-column bar's line), yes, no (the buttons, keys y and w), no_bad (the no answer is a
   // rejection: drawn red), note ('' or a line under the evidence), score ('' or "score 0.82"),
@@ -740,14 +757,17 @@
         c.said_yes = n + ' is a ' + label + ' now';
         c.said_no = n + ' stays a ' + now;
         break;
-      case 'tighten':
-        c.head = n + ' (' + now + '): take the tighter box (dashed)?';
-        c.short = n + ': tighter box?';
-        c.yes = 'Accept the tighter box';
+      case 'tighten': {
+        // The closer look's box can also be larger than the label or shifted (tightenWord).
+        var w = tightenWord(l, bs);
+        c.head = n + ' (' + now + '): take the ' + w + ' box (dashed)?';
+        c.short = n + ': ' + w + ' box?';
+        c.yes = 'Accept the ' + w + ' box';
         c.no = 'Keep my box';
-        c.said_yes = n + ' takes the tighter box';
+        c.said_yes = n + ' takes the ' + w + ' box';
         c.said_no = n + ' keeps its box';
         break;
+      }
       case 'verify':
         c.head = 'No model found ' + n.toLowerCase() + ' (' + now + '): is the label right?';
         c.short = n + ': no model found it';
@@ -886,6 +906,8 @@
     suggestionKey: suggestionKey,
     overlapsCheckedOnSave: overlapsCheckedOnSave,
     refineCard: refineCard,
+    TIGHTER_INSIDE: TIGHTER_INSIDE,
+    tightenWord: tightenWord,
     refineFocus: refineFocus,
     answerRefine: answerRefine,
     sendsFilter: sendsFilter,

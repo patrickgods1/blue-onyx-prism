@@ -140,11 +140,15 @@ pub struct KindCounts {
     pub add: usize,
     pub verify: usize,
     pub relabel: usize,
+    /// Better-fitting boxes for loose labels (the zoom stage, [`super::tighten`]). Reports of
+    /// earlier checks: 0.
+    #[serde(default)]
+    pub tighten: usize,
 }
 
 impl KindCounts {
     pub fn total(&self) -> usize {
-        self.add + self.verify + self.relabel
+        self.add + self.verify + self.relabel + self.tighten
     }
 }
 
@@ -211,6 +215,18 @@ pub struct RefineReport {
     pub frames_written: usize,
     /// Matched pairs below the judge's good IoU (loose labels).
     pub loose: usize,
+    /// The check took a closer look at its loose labels ([`super::tighten`]): `found.tighten` and
+    /// `written.tighten` count its proposals. False when it ran without one (`--no-tighten`, the
+    /// weights missing) and in reports of earlier checks.
+    #[serde(default)]
+    pub tighten: bool,
+    /// Loose labels sent to the closer look ([`super::judge::Loose`]: a confident fold detection,
+    /// a class RF-DETR L can see, big enough).
+    #[serde(default)]
+    pub tighten_candidates: usize,
+    /// Of those, the ones the closer look answered (a crop of a readable frame that finished).
+    #[serde(default)]
+    pub zoomed: usize,
     /// The production-like score and IoU at which a box counts as found.
     pub found_score: f32,
     pub found_iou: f32,
@@ -350,6 +366,9 @@ impl RefineReport {
             found: KindCounts::default(),
             frames_written: 0,
             loose: 0,
+            tighten: false,
+            tighten_candidates: 0,
+            zoomed: 0,
             found_score: FOUND_SCORE,
             found_iou: FOUND_IOU,
             recall: Recall::default(),

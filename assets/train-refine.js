@@ -68,6 +68,15 @@
       return 'Restore ' + plural(boxes, 'hidden proposal', 'hidden proposals') + ' on ' +
         plural(frames, 'unreviewed frame', 'unreviewed frames') + ' that the size floor no longer covers: ' +
         'they become pending again, for you to decide on the Review tab.';
+    },
+    // The Findings card's line on loose labels of report `r`: how many the last check counted and,
+    // when it looked closer at them, how many got a proposed box (report.json `tighten`,
+    // `found.tighten`).
+    looseLine: function (r) {
+      var n = (r && r.loose) || 0;
+      if (!r || !r.tighten) return 'Loose labels counted: ' + n + ' (no closer look in this check).';
+      var m = (r.found && r.found.tighten) || 0;
+      return 'Loose labels counted: ' + n + ', ' + m + ' with a proposed box.';
     }
   };
   globalThis.RefineFloor = api;
@@ -83,7 +92,8 @@
   var KINDS = [
     { kind: 'add', title: 'Missing boxes', text: 'Objects a fold model found that no box labels.', key: 'add' },
     { kind: 'verify', title: 'Labels no model found', text: 'Boxes the fold models never found: look at them, some are wrong.', key: 'verify' },
-    { kind: 'relabel', title: 'Other class suggested', text: 'Boxes a fold model would give another class.', key: 'relabel' }
+    { kind: 'relabel', title: 'Other class suggested', text: 'Boxes a fold model would give another class.', key: 'relabel' },
+    { kind: 'tighten', title: 'Loose boxes', text: 'Labels that cover their object only partly: a fold model and a closer look by a larger model agree on a better-fitting box.', key: 'tighten' }
   ];
 
   function el(tag, cls, text) {
@@ -155,7 +165,10 @@
       epochs: whole(f.epochs.value),
       scenes: f.scene.value ? [f.scene.value] : [],
       cameras: list(f.camera.value),
-      allow_large: !!f.allow_large.checked
+      allow_large: !!f.allow_large.checked,
+      // The box starts as the check's default (ticked when RF-DETR L's weights are here), so
+      // sending it always says what the form shows.
+      tighten: !!(f.tighten && f.tighten.checked)
     };
     if (f.gpu && f.gpu.value) o.gpu = f.gpu.value;
     return o;
@@ -169,6 +182,7 @@
     if (o.cameras.length) add('camera', o.cameras.join(','));
     if (o.gpu) add('gpu', o.gpu);
     if (o.allow_large) add('allow_large', '1');
+    add('tighten', o.tighten ? '1' : '0');
     return p.join('&');
   }
 
@@ -408,7 +422,7 @@
     if (state.last && state.last.state === 'failed' && state.last.error && !state.job) {
       box.appendChild(el('p', 'error', 'The last check failed: ' + state.last.error));
     }
-    var total = open ? open.add + open.verify + open.relabel : 0;
+    var total = open ? open.add + open.verify + open.relabel + (open.tighten || 0) : 0;
     if (!r) {
       box.appendChild(el('p', 'muted', 'No check has run on this dataset yet. Start one above; its findings appear here.'));
     } else {
@@ -430,7 +444,7 @@
       KINDS.forEach(function (k) {
         var tr = el('tr');
         tr.appendChild(el('td', 'rc-title', k.title));
-        tr.appendChild(el('td', 'num', open ? String(open[k.key]) : '?')).setAttribute('data-label', 'Open');
+        tr.appendChild(el('td', 'num', open ? String(open[k.key] || 0) : '?')).setAttribute('data-label', 'Open');
         tr.appendChild(el('td', null, k.text)).setAttribute('data-label', 'What it means');
         var act = el('td', 'rc-action');
         act.appendChild(reviewLink(k.kind));
@@ -445,7 +459,7 @@
         ' Nothing changes until you confirm one on the Review tab.'));
     }
     if (r) {
-      box.appendChild(el('p', null, 'Loose labels counted: ' + r.loose));
+      box.appendChild(el('p', null, RefineFloor.looseLine(r)));
       if (r.warnings && r.warnings.length) {
         var ul = el('ul', 'warn-list small');
         r.warnings.forEach(function (w) { ul.appendChild(el('li', null, w)); });

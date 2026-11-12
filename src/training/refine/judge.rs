@@ -11,7 +11,13 @@
 //!    IoU first. Without it a loose label (IoU 0.1-0.3 to its detection) would yield an `add` on top
 //!    of the object plus a `verify` on the label.
 //! 3. A matched pair at IoU >= [`GOOD_IOU`], or on a box a reviewer drew, moved or relabelled: fine.
-//!    Below: `loose`, counted for the report only (a later phase proposes the tighter box).
+//!    Below: `loose`, counted for the report. A loose pair whose detection scores
+//!    [`TIGHTEN_FOLD_SCORE`] or more, on a label of a wanted class RF-DETR L can see
+//!    ([`coco_class`]) that is not too small (the floor of rule 4), is a candidate for a closer
+//!    look ([`Judged::candidates`], [`Loose`]): the zoom stage of the check
+//!    ([`super::tighten`]) runs RF-DETR L on a crop of the pair, and [`tighten`] decides from
+//!    both looks whether a better-fitting box is proposed (`tighten`). A fold model's box alone
+//!    never overrules a label: fold models are short-trained at a small input size.
 //! 4. `add`: an unmatched detection at [`ADD_SCORE`] or more, at least [`FLOOR_PX`] on its short side
 //!    at model input, that no box of its object that is not rejected and no ignore box covers
 //!    ([`covers`]), and no judged reject of its object lies on at IoU >= [`REJECT_BLOCK_IOU`].
@@ -53,13 +59,16 @@
 //! (their exports apply no floor), so the size table measures what the recipe can find.
 
 use crate::collect::labels::bulk::Wanted;
+use crate::collect::labels::overlaps::Det as ZoomDet;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
 use crate::collect::labels::repeats::same_object;
 use crate::collect::labels::statics::{self, Spot};
 use crate::collect::labels::{
     BoxState, LabelBox, LabelFile, SizeFloor, Source, Status, clamp_box, covers, iou, under_floor,
 };
+use crate::model::coco::coco_class;
 use crate::training::autolabel::triage::Det;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Detections below this score are not used at all (no candidate, no pair, not "seen"; the fold
@@ -104,6 +113,18 @@ pub const REJECT_BLOCK_IOU: f32 = crate::collect::labels::MATCH_IOU;
 pub const FOUND_SCORE: f32 = 0.3;
 /// IoU from which a detection finds a training box in the report's recall (the benchmark's AP50).
 pub const FOUND_IOU: f32 = 0.5;
+/// Score from which a fold model's detection of a loose label makes the pair a candidate for the
+/// closer look ([`Loose`]): weaker finds are too often a short-trained model's guess to spend a
+/// crop on (the same cut-off as an `add`, [`ADD_SCORE`]).
+pub const TIGHTEN_FOLD_SCORE: f32 = 0.5;
+/// Score from which a detection of the closer look counts as a box at all: the overlap check's
+/// measured operating point ([`crate::collect::labels::overlaps::ZOOM_SCORE`]), same model, same
+/// crops.
+pub const TIGHTEN_ZOOM_SCORE: f32 = 0.5;
+/// IoU from which the closer look's box agrees with the fold model's: the overlap check's match IoU
+/// ([`crate::collect::labels::overlaps::ZOOM_MATCH_IOU`]). Two independent looks that agree with
+/// each other and not with the label outvote it; one look alone does not.
+pub const TIGHTEN_AGREE_IOU: f32 = 0.6;
 
 /// One frame to judge.
 #[derive(Debug, Clone, Copy)]
@@ -178,8 +199,51 @@ pub struct Judged {
     pub suggestions: Vec<Suggestion>,
     /// Matched pairs below [`GOOD_IOU`] on boxes no reviewer drew, moved or relabelled.
     pub loose: usize,
+    /// Of those, the candidates for the closer look (rule 3).
+    pub candidates: Vec<Loose>,
     /// The frame's training boxes of wanted classes, for the recall.
     pub boxes: Vec<BoxFact>,
+}
+
+/// A loose label worth a closer look (rule 3): the label box `L` and the fold model's detection
+/// `D` of the same object. The zoom stage crops their union ([`Loose::union`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Loose {
+    /// The label box `L`, exactly as in the file (the key of a `tighten`).
+    pub target: [f32; 4],
+    /// Its label as written ([`Suggestion::target_label`]).
+    pub target_label: String,
+    /// Its class (the list's spelling).
+    pub class: String,
+    /// The fold model's detection `D`, clamped to the frame.
+    pub det: [f32; 4],
+    /// `D`'s score.
+    pub det_score: f32,
+}
+
+impl Loose {
+    /// The union of `L` and `D`: the crop the closer look pads and runs on.
+    pub fn union(&self) -> [f32; 4] {
+        let (l, d) = (self.target, self.det);
+        [
+            l[0].min(d[0]),
+            l[1].min(d[1]),
+            l[2].max(d[2]),
+            l[3].max(d[3]),
+        ]
+    }
+
+    /// Whether `other` is this pair (exact boxes, the label alike): a candidate of a judgement
+    /// made again under the label write lock finds the closer look made for it.
+    pub fn same_pair(&self, other: &Loose) -> bool {
+        let bits = |b: &[f32; 4]| b.map(f32::to_bits);
+        bits(&self.target) == bits(&other.target)
+            && bits(&self.det) == bits(&other.det)
+            && self
+                .target_label
+                .trim()
+                .eq_ignore_ascii_case(other.target_label.trim())
+    }
 }
 
 /// Finite coordinates of a box with a positive size.
@@ -267,6 +331,11 @@ fn matching(dets: &[D], train: &[T<'_>], min_iou: f32, min_score: f32) -> (ByBox
     (by_box, by_det)
 }
 
+/// A box a reviewer drew, moved or relabelled: never loose, never refitted.
+fn reviewers(b: &LabelBox) -> bool {
+    b.source == Source::Human || b.orig_bbox.is_some() || b.model_label.is_some()
+}
+
 fn suggestion(kind: Kind, run: &str, why: String) -> Suggestion {
     Suggestion {
         kind,
@@ -351,15 +420,26 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     let mut found_list: Vec<Suggestion> = Vec::new();
     let mut evidence = vec![false; dets.len()];
     let mut relabelled = vec![false; train.len()];
-    // 3. Loose labels.
+    // 3. Loose labels, and the candidates for a closer look among them.
     for (t, m) in train.iter().zip(&by_box) {
-        let reviewer =
-            t.b.source == Source::Human || t.b.orig_bbox.is_some() || t.b.model_label.is_some();
-        if let Some((_, v)) = m
+        if let Some((di, v)) = m
             && *v < GOOD_IOU
-            && !reviewer
+            && !reviewers(t.b)
         {
             out.loose += 1;
+            if let (Some(class), Some(d)) = (&t.class, dets.get(*di))
+                && d.score >= TIGHTEN_FOLD_SCORE
+                && !small(&t.b.bbox)
+                && coco_class(class).is_some()
+            {
+                out.candidates.push(Loose {
+                    target: t.b.bbox,
+                    target_label: t.b.label.clone(),
+                    class: class.clone(),
+                    det: d.bbox,
+                    det_score: d.score,
+                });
+            }
         }
     }
     // 6. Another class (before the adds: its detection is no add).
@@ -522,6 +602,122 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         .map(|(_, s)| s)
         .collect();
     out
+}
+
+/// The `tighten` the closer look supports for candidate `c` (a [`Loose`] pair of `frame`, whose
+/// file is the label file as it is now), from `zoom`: RF-DETR L's detections on the padded crop of
+/// the pair, in frame coordinates. Pure. The closer look's box `Z` is its detection of the same
+/// object ([`same_object`]) at [`TIGHTEN_ZOOM_SCORE`] or more with the best IoU to the fold
+/// model's `D` (ties: the higher score, then the earlier detection), clamped to the frame. A
+/// `tighten` to `Z` (score `Z`'s) only when:
+///
+/// - (a) `Z` agrees with the fold model: IoU(`Z`, `D`) >= [`TIGHTEN_AGREE_IOU`];
+/// - (b) the label is loose against `Z` too: IoU(`L`, `Z`) < [`GOOD_IOU`] (else the label was fine
+///   and the fold model imprecise);
+/// - (c) `Z` is a proper box on the frame, not under the size floor nor [`FLOOR_PX`] at the fold
+///   models' input (rule 4's floor);
+/// - (d) `Z` is not another object's box: no other training box or ignore region of the object on
+///   the frame overlaps `Z` more than `L` does (the two looks found the neighbour);
+///
+/// and the label is still a candidate: a training box of the frame, reviewed, no reviewer's box,
+/// not under the floor, and the suggestion is [`refine::live`]. None otherwise, and with no `Z`.
+pub fn tighten(
+    frame: &FrameInput<'_>,
+    c: &Loose,
+    zoom: &[ZoomDet],
+    ctx: &Context<'_>,
+) -> Option<Suggestion> {
+    let f = frame.file;
+    if f.status != Status::Reviewed || !proper(&c.target) || !proper(&c.det) {
+        return None;
+    }
+    let wanted = ctx.wanted;
+    let (w, h) = (frame.width, frame.height);
+    let floor = ctx.floor.filter(SizeFloor::is_on);
+    let small =
+        |b: &[f32; 4]| under_floor(b, w, h, floor) || short_px(b, w, h, ctx.imgsz) < FLOOR_PX;
+    let key = key_of(&c.class, wanted);
+    // The label: still a training box no reviewer touched, and big enough to judge.
+    let at = f.boxes.iter().position(|b| {
+        b.bbox == c.target
+            && b.label.trim().eq_ignore_ascii_case(c.target_label.trim())
+            && b.is_training()
+            && !b.is_ignore()
+    })?;
+    let l = f.boxes.get(at)?;
+    if reviewers(l) || small(&l.bbox) {
+        return None;
+    }
+    let fit = |b: [f32; 4]| {
+        if w > 0 && h > 0 {
+            clamp_box(b, w, h)
+        } else {
+            b
+        }
+    };
+    let (_, z, z_score) = zoom
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| {
+            #[allow(clippy::cast_possible_truncation, reason = "a score and pixels")]
+            let (score, bbox) = (d.score as f32, d.bbox.map(|v| v as f32));
+            if !(score.is_finite() && score >= TIGHTEN_ZOOM_SCORE && proper(&bbox)) {
+                return None;
+            }
+            if !same_object(&key_of(&d.label, wanted), &key) {
+                return None;
+            }
+            let b = fit(bbox);
+            proper(&b).then_some((i, b, score.min(1.0)))
+        })
+        .max_by(|a, b| {
+            iou(&a.1, &c.det)
+                .total_cmp(&iou(&b.1, &c.det))
+                .then(a.2.total_cmp(&b.2))
+                .then(b.0.cmp(&a.0))
+        })?;
+    // (a) Two looks agree ...
+    if iou(&z, &c.det) < TIGHTEN_AGREE_IOU {
+        return None;
+    }
+    // (b) ... and not with the label.
+    let lz = iou(&c.target, &z);
+    if lz >= GOOD_IOU {
+        return None;
+    }
+    // (c) A box worth proposing.
+    if small(&z) {
+        return None;
+    }
+    // (d) Not the neighbour's box.
+    let neighbour = f.boxes.iter().enumerate().any(|(i, b)| {
+        i != at
+            && (b.is_training() || b.is_ignore())
+            && same_object(&key_of(&b.label, wanted), &key)
+            && iou(&b.bbox, &z) > lz
+    });
+    if neighbour {
+        return None;
+    }
+    let s = Suggestion {
+        target: Some(c.target),
+        target_label: Some(c.target_label.clone()),
+        bbox: Some(z),
+        score: Some(z_score),
+        ..suggestion(
+            Kind::Tighten,
+            ctx.run,
+            format!(
+                "a model that never saw this camera-day (score {:.2}) and a closer look by a \
+                 larger model (score {z_score:.2}) both put this {} here; the label overlaps \
+                 that box at IoU {lz:.2}",
+                c.det_score, c.class
+            ),
+        )
+    };
+    let mut probe = f.clone();
+    probe.refine = vec![s.clone()];
+    (!refine::live(&probe, Some(wanted)).is_empty()).then_some(s)
 }
 
 #[cfg(test)]
@@ -1413,5 +1609,323 @@ mod tests {
             &ctx,
         );
         assert!(j.suggestions.is_empty());
+    }
+
+    // ---- the closer look (`tighten`)
+
+    fn zd(label: &str, bbox: [f32; 4], score: f64) -> ZoomDet {
+        ZoomDet {
+            label: label.into(),
+            bbox: bbox.map(f64::from),
+            score,
+        }
+    }
+
+    /// [`tighten`] on `f` (640 x 480, input 640) for `c` with `zoom`, under `floor`.
+    fn refit(
+        f: &LabelFile,
+        c: &Loose,
+        zoom: &[ZoomDet],
+        floor: Option<SizeFloor>,
+    ) -> Option<Suggestion> {
+        let cl = classes();
+        let w = Wanted {
+            classes: &cl,
+            hidden: &[],
+        };
+        let counts = many();
+        let ctx = Context {
+            wanted: &w,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r1",
+            spots: None,
+            floor,
+        };
+        let s = tighten(
+            &FrameInput {
+                file: f,
+                width: 640,
+                height: 480,
+                dets: &[],
+                camera: "cam",
+                day: "2026-10-01",
+            },
+            c,
+            zoom,
+            &ctx,
+        );
+        if let Some(s) = &s {
+            refine::check(std::slice::from_ref(s)).unwrap();
+            assert_eq!(s.run, "r1");
+        }
+        s
+    }
+
+    /// The loose label [`LOOSE`] (a car) and the fold model's [`CAR`] at 0.9: IoU 0.5.
+    fn loose_car() -> (LabelFile, Loose) {
+        let f = reviewed(vec![acc("car", LOOSE)]);
+        let j = run(&f, &[det("car", CAR, 0.9)]);
+        assert_eq!(j.loose, 1);
+        assert_eq!(j.candidates.len(), 1, "{j:?}");
+        (f, j.candidates[0].clone())
+    }
+
+    #[test]
+    fn a_loose_pair_with_a_confident_detection_is_a_candidate() {
+        let (_, c) = loose_car();
+        assert_eq!(
+            c,
+            Loose {
+                target: LOOSE,
+                target_label: "car".into(),
+                class: "car".into(),
+                det: CAR,
+                det_score: 0.9,
+            }
+        );
+        assert_eq!(c.union(), [100.0, 100.0, 300.0, 180.0]);
+        // The fold model's score decides: at TIGHTEN_FOLD_SCORE yes, under it loose only.
+        let f = reviewed(vec![acc("car", LOOSE)]);
+        let j = run(&f, &[det("car", CAR, TIGHTEN_FOLD_SCORE)]);
+        assert_eq!((j.loose, j.candidates.len()), (1, 1));
+        let j = run(&f, &[det("car", CAR, 0.49)]);
+        assert_eq!((j.loose, j.candidates.len()), (1, 0), "low fold score");
+        // A truck detection of a car label is one object: its pair, kept with the label's class.
+        let j = run(&f, &[det("truck", CAR, 0.9)]);
+        assert_eq!(j.candidates[0].class, "car");
+        // A good label is no candidate.
+        let j = run(&reviewed(vec![acc("car", CAR)]), &[det("car", NEAR, 0.9)]);
+        assert!(j.candidates.is_empty());
+        // A reviewer's box is never one.
+        for edit in [
+            |b: &mut LabelBox| b.source = Source::Human,
+            |b: &mut LabelBox| b.orig_bbox = Some([0.0, 0.0, 9.0, 9.0]),
+            |b: &mut LabelBox| b.model_label = Some("truck".into()),
+        ] {
+            let mut f = reviewed(vec![acc("car", LOOSE)]);
+            edit(&mut f.boxes[0]);
+            let j = run(&f, &[det("car", CAR, 0.95)]);
+            assert!(j.candidates.is_empty(), "{f:?}");
+        }
+        // An unreviewed frame has none.
+        let mut f = reviewed(vec![acc("car", LOOSE)]);
+        f.status = Status::Unreviewed;
+        assert!(run(&f, &[det("car", CAR, 0.9)]).candidates.is_empty());
+    }
+
+    #[test]
+    fn a_small_label_an_ignore_region_or_a_class_rf_detr_cannot_see_is_no_candidate() {
+        // Under FLOOR_PX at the fold models' input: loose, no candidate.
+        let label = [100.0, 100.0, 109.0, 200.0];
+        let d = [100.0, 100.0, 109.0, 150.0];
+        assert!(short_px(&label, 640, 480, 640) < FLOOR_PX);
+        let j = run(
+            &reviewed(vec![acc("person", label)]),
+            &[det("person", d, 0.9)],
+        );
+        assert_eq!((j.loose, j.candidates.len()), (1, 0));
+        // Under the configured floor: an ignore region, not even loose.
+        let floor = Some(SizeFloor {
+            px: 10.0,
+            input: 384,
+        });
+        let label = [100.0, 100.0, 114.0, 200.0];
+        let d = [100.0, 100.0, 124.0, 200.0];
+        let f = reviewed(vec![acc("person", label)]);
+        let j = run_at(&f, &[det("person", d, 0.99)], &many(), floor);
+        assert_eq!((j.loose, j.candidates.len()), (0, 0));
+        assert_eq!(
+            run_with(&f, &[det("person", d, 0.99)], &many())
+                .candidates
+                .len(),
+            1
+        );
+        // A class outside RF-DETR L's label space: the closer look cannot see it.
+        let cl: Vec<String> = ["van", "car"].map(String::from).to_vec();
+        let w = Wanted {
+            classes: &cl,
+            hidden: &[],
+        };
+        let counts = many();
+        let ctx = Context {
+            wanted: &w,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r1",
+            spots: None,
+            floor: None,
+        };
+        let at = |label: &str| {
+            let f = reviewed(vec![acc(label, LOOSE)]);
+            let dets = [det(label, CAR, 0.9)];
+            judge(
+                &FrameInput {
+                    file: &f,
+                    width: 640,
+                    height: 480,
+                    dets: &dets,
+                    camera: "cam",
+                    day: "2026-10-01",
+                },
+                &ctx,
+            )
+        };
+        assert!(coco_class("van").is_none());
+        let van = at("van");
+        assert_eq!((van.loose, van.candidates.len()), (1, 0));
+        assert_eq!(at("car").candidates.len(), 1);
+    }
+
+    #[test]
+    fn two_looks_that_agree_propose_the_closer_looks_box() {
+        let (f, c) = loose_car();
+        let s = refit(&f, &c, &[zd("car", NEAR, 0.83)], None).unwrap();
+        assert_eq!(s.kind, Kind::Tighten);
+        assert_eq!(s.target, Some(LOOSE));
+        assert_eq!(s.target_label.as_deref(), Some("car"));
+        assert_eq!(s.bbox, Some(NEAR));
+        assert_eq!(s.score, Some(0.83));
+        assert_eq!(s.label, None);
+        assert_eq!(
+            s.why,
+            "a model that never saw this camera-day (score 0.90) and a closer look by a larger \
+             model (score 0.83) both put this car here; the label overlaps that box at IoU 0.48"
+        );
+        // A truck of the closer look is the car's box too; the best IoU to D wins, then the
+        // higher score; an unwanted label of another object is no box of it.
+        let off = [140.0, 100.0, 240.0, 180.0];
+        let s = refit(
+            &f,
+            &c,
+            &[
+                zd("truck", off, 0.99),
+                zd("person", CAR, 0.99),
+                zd("car", NEAR, 0.6),
+                zd("truck", NEAR, 0.7),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!((s.bbox, s.score), (Some(NEAR), Some(0.7)));
+        // A box past the frame's edge is clamped onto it.
+        let (l2, d2) = ([0.0, 100.0, 300.0, 180.0], [0.0, 100.0, 190.0, 180.0]);
+        let (wide, clamped) = ([-10.0, 100.0, 195.0, 180.0], [0.0, 100.0, 195.0, 180.0]);
+        assert!(iou(&clamped, &d2) >= TIGHTEN_AGREE_IOU && iou(&clamped, &l2) < GOOD_IOU);
+        let f2 = reviewed(vec![acc("car", l2)]);
+        let c2 = Loose {
+            target: l2,
+            det: d2,
+            ..c.clone()
+        };
+        let s = refit(&f2, &c2, &[zd("car", wide, 0.9)], None).unwrap();
+        assert_eq!(s.bbox, Some(clamped));
+    }
+
+    #[test]
+    fn no_proposal_without_a_closer_look_that_agrees_with_the_fold_model() {
+        let (f, c) = loose_car();
+        // No detection, too weak, of another object.
+        assert!(refit(&f, &c, &[], None).is_none());
+        assert!(refit(&f, &c, &[zd("car", NEAR, 0.49)], None).is_none());
+        assert!(refit(&f, &c, &[zd("person", NEAR, 0.95)], None).is_none());
+        // One that disagrees with D: IoU under TIGHTEN_AGREE_IOU.
+        let half = [150.0, 100.0, 250.0, 180.0];
+        assert!(iou(&half, &CAR) < TIGHTEN_AGREE_IOU);
+        assert!(refit(&f, &c, &[zd("car", half, 0.95)], None).is_none());
+        // The constants are the overlap check's, the same model on the same crops.
+        use crate::collect::labels::overlaps::{ZOOM_MATCH_IOU, ZOOM_SCORE};
+        assert_eq!(f64::from(TIGHTEN_ZOOM_SCORE), ZOOM_SCORE);
+        assert!((f64::from(TIGHTEN_AGREE_IOU) - ZOOM_MATCH_IOU).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_closer_look_that_agrees_with_the_label_says_the_label_was_fine() {
+        let (f, c) = loose_car();
+        // IoU 0.667 with D (agrees with the fold model) and 0.75 with L: the label is fine.
+        let z = [100.0, 100.0, 250.0, 180.0];
+        assert!(iou(&z, &CAR) >= TIGHTEN_AGREE_IOU);
+        assert!((iou(&z, &LOOSE) - GOOD_IOU).abs() < 1e-6);
+        assert!(refit(&f, &c, &[zd("car", z, 0.9)], None).is_none());
+        // Just under GOOD_IOU: proposed.
+        let z = [100.0, 100.0, 249.0, 180.0];
+        assert!(iou(&z, &LOOSE) < GOOD_IOU);
+        assert!(refit(&f, &c, &[zd("car", z, 0.9)], None).is_some());
+    }
+
+    #[test]
+    fn the_neighbours_box_is_not_proposed() {
+        // A second car labelled where the closer look's box is: it fits that box better than the
+        // loose label does, so the two looks found the neighbour.
+        let neighbour = [101.0, 100.0, 203.0, 182.0];
+        let (_, c) = loose_car();
+        let f = reviewed(vec![acc("car", LOOSE), acc("car", neighbour)]);
+        assert!(iou(&neighbour, &NEAR) > iou(&LOOSE, &NEAR));
+        assert!(refit(&f, &c, &[zd("car", NEAR, 0.9)], None).is_none());
+        // An unsure box there counts as the neighbour too; a rejected one or another object's
+        // does not.
+        let unsure = LabelBox {
+            difficult: true,
+            ..acc("truck", neighbour)
+        };
+        let f = reviewed(vec![acc("car", LOOSE), unsure]);
+        assert!(refit(&f, &c, &[zd("car", NEAR, 0.9)], None).is_none());
+        for other in [
+            b("car", neighbour, BoxState::Rejected),
+            acc("person", neighbour),
+        ] {
+            let f = reviewed(vec![acc("car", LOOSE), other]);
+            assert!(refit(&f, &c, &[zd("car", NEAR, 0.9)], None).is_some());
+        }
+    }
+
+    #[test]
+    fn a_reviewers_box_a_changed_label_or_a_small_box_gets_no_proposal() {
+        let (_, c) = loose_car();
+        let z = [zd("car", NEAR, 0.9)];
+        for edit in [
+            |b: &mut LabelBox| b.source = Source::Human,
+            |b: &mut LabelBox| b.orig_bbox = Some([0.0, 0.0, 9.0, 9.0]),
+            |b: &mut LabelBox| b.model_label = Some("truck".into()),
+            |b: &mut LabelBox| b.bbox = CAR,
+            |b: &mut LabelBox| b.label = "dog".into(),
+            |b: &mut LabelBox| b.difficult = true,
+            |b: &mut LabelBox| b.state = BoxState::Rejected,
+        ] {
+            let mut f = reviewed(vec![acc("car", LOOSE)]);
+            edit(&mut f.boxes[0]);
+            assert!(refit(&f, &c, &z, None).is_none(), "{f:?}");
+        }
+        let mut f = reviewed(vec![acc("car", LOOSE)]);
+        f.status = Status::Skipped;
+        assert!(refit(&f, &c, &z, None).is_none());
+        // The closer look's box under the floor: nothing. Here a thin person label, 30 px wide,
+        // whose closer look is 14 px wide (8.4 px at 384, under a 10 px floor).
+        let label = [100.0, 100.0, 130.0, 300.0];
+        let d = [100.0, 100.0, 116.0, 300.0];
+        let thin = [100.0, 100.0, 114.0, 300.0];
+        let f = reviewed(vec![acc("person", label)]);
+        let j = run(&f, &[det("person", d, 0.9)]);
+        let c = j.candidates[0].clone();
+        let z = [zd("person", thin, 0.9)];
+        let floor = Some(SizeFloor {
+            px: 10.0,
+            input: 384,
+        });
+        assert!(refit(&f, &c, &z, None).is_some());
+        assert!(refit(&f, &c, &z, floor).is_none());
+        // A label that became too small under a floor set since is no candidate either.
+        let small = [100.0, 100.0, 113.0, 300.0];
+        let f = reviewed(vec![acc("person", small)]);
+        let c = Loose { target: small, ..c };
+        assert!(
+            refit(
+                &f,
+                &c,
+                &[zd("person", [100.0, 100.0, 140.0, 300.0], 0.9)],
+                floor
+            )
+            .is_none()
+        );
     }
 }

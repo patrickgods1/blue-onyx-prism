@@ -512,6 +512,14 @@ pub struct RefineArgs {
     /// Allow downloads over 500 MB (the training environment, the base weights).
     #[arg(long)]
     pub allow_large: bool,
+    /// After the last fold, look closer at the loose labels (RF-DETR L on a crop of each, the
+    /// overlap check's model; its weights, 0.14 GB, are downloaded when missing) and propose
+    /// better-fitting boxes. Default: on when those weights are downloaded.
+    #[arg(long, conflicts_with = "no_tighten")]
+    pub tighten: bool,
+    /// Count the loose labels only: no closer look, no better-fitting box proposed.
+    #[arg(long)]
+    pub no_tighten: bool,
     /// Print the trainer's output.
     #[arg(long)]
     pub verbose: bool,
@@ -525,6 +533,11 @@ pub fn refine_request(a: &RefineArgs) -> Result<super::refine::RefineRequest> {
         frames: super::refine::RefineFrames::parse(&a.frames)?,
         gpu: a.gpu.clone(),
         allow_large: a.allow_large,
+        tighten: match (a.tighten, a.no_tighten) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
     };
     r.validate()?;
     Ok(r)
@@ -2114,7 +2127,16 @@ mod tests {
         };
         let r = refine_request(&d).unwrap();
         assert_eq!(r, super::super::refine::RefineRequest::default());
+        assert_eq!(r.tighten, None, "the default follows the weights on disk");
         assert!(!d.dry_run);
+        // --tighten / --no-tighten say it, and not both.
+        for (flag, want) in [("--tighten", Some(true)), ("--no-tighten", Some(false))] {
+            let TrainCommand::Refine(t) = parse(&["refine", flag]).unwrap() else {
+                panic!()
+            };
+            assert_eq!(refine_request(&t).unwrap().tighten, want, "{flag}");
+        }
+        assert!(parse(&["refine", "--tighten", "--no-tighten"]).is_err());
         for bad in [
             vec!["refine", "--folds", "1"],
             vec!["refine", "--epochs", "0"],

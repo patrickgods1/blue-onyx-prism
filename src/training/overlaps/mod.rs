@@ -72,8 +72,9 @@ impl OverlapsRequest {
     }
 }
 
-/// RF-DETR L's training base pin and where it is installed.
-fn rfdetr_weights(paths: &TrainPaths) -> Result<(&'static Resource, PathBuf)> {
+/// RF-DETR L's training base pin and where it is installed (the overlap check's and the dataset
+/// check's closer look, [`zoom::prepare`]).
+pub fn rfdetr_weights(paths: &TrainPaths) -> Result<(&'static Resource, PathBuf)> {
     let res = res_catalog::base_weights(TrainFamily::Rfdetr, "large")
         .ok_or_else(|| anyhow!("no RF-DETR L pin in this build"))?;
     Ok((res, pyenv::weights_dir(paths, res)))

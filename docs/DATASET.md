@@ -507,9 +507,11 @@ folder; the collector and the Collect tab keep `collect.dir`.
 
   `kind`: `add` (a box for an object no box labels: `bbox`, `label`), `relabel` (another class for a
   training box: `target` and `label`), `verify` (a training box no model found: `target`) or `tighten` (a
-  closer `bbox` for the box `target`; the check does not write it, the file and the page's rules know it).
+  better-fitting `bbox` for a loose label `target`, written by the check's closer look: RF-DETR L on a crop
+  of the label and the fold model's box, docs/TRAINING.md "Closer look at loose labels"; `score` is RF-DETR
+  L's, `label` absent; the box may be tighter than the label, larger or shifted).
   `target` names an existing box by its exact `bbox`: that is the key. `target_label` (written by the check
-  for `verify` and `relabel`; same bounds as `label`): the label of that box when the check ran, compared
+  for `verify`, `relabel` and `tighten`; same bounds as `label`): the label of that box when the check ran, compared
   trimmed and case-insensitive, so of two boxes of different objects with the very same `bbox` the suggestion
   names the right one; without it (files of the first checks) the `bbox` alone is the key. `score`: the fold
   model's score, 0 to 1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group
@@ -542,8 +544,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
 
   A `kind` or an `answer` this build does not know (a newer build's) loads as `unknown`, is never live
   and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
-  (`add`, `verify`, `relabel`); answered ones and other kinds stay, and when nothing changed the file is not
-  written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
+  (`add`, `verify`, `relabel` on every frame it checks; `tighten` only on the frames its closer look
+  answered, and there not on a label the look did not answer); answered ones and other kinds stay, and when
+  nothing changed the file is not written. It never writes a suggestion a save would refuse (scores are clamped to 0..1 and boxes to the
   frame first). Kept by saves: a save (`POST /v1/review/labels`) whose body has no `refine` key keeps
   the stored list with its answers (a script or client that rebuilds the file from the boxes); a key that
   is there, `[]` too, is the client's list (the page always sends it). A build from before the dataset check ignores the field

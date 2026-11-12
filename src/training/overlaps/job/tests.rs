@@ -11,8 +11,10 @@ use crate::resources::export::fake::{Fake, arg_after};
 use crate::resources::export::{Cmd, CommandRunner, Fetcher};
 use crate::training::capability::{self, Capability};
 use crate::training::overlaps::{OverlapsRequest, plan_overlaps};
+use crate::training::pyenv::is_cancel;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 struct Tmp(PathBuf);
 

@@ -33,6 +33,8 @@
       </div>
       {% endif %}
     </div>
+    <label class="check"><input type="checkbox" id="refine-tighten" name="tighten"{% if tighten_default %} checked{% endif %}> Propose better boxes for loose labels</label>
+    <p class="muted small">After the last fold, a larger model (RF-DETR L, the overlap check's) looks closer at each label a fold model found only partly covering its object. Where both looks agree on another box, you get it as a suggestion; your label stays until you accept it. Adds a few minutes{% if !tighten_default %}, and downloads RF-DETR L (0.14 GB) the first time{% endif %}.</p>
     <label class="check tr-confirm"><input type="checkbox" name="allow_large"> Allow downloads over 500 MB (the training environment and the base weights, when they are not set up yet)</label>
     <div class="actions"><button type="button" class="secondary" id="refine-preview-btn">Preview</button> <button type="submit" id="refine-start">Start</button></div>
   </form>

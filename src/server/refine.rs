@@ -103,12 +103,16 @@ struct RefineTemplate {
     epochs_min: u32,
     epochs_max: u32,
     epochs_default: u32,
+    /// The "Propose better boxes for loose labels" box starts ticked: RF-DETR L's weights are on
+    /// disk ([`check::tighten_weights_ready`]), the check's own default.
+    tighten_default: bool,
 }
 
 /// `GET /train/refine`. The cards are filled by `assets/train-refine.js` from `GET /v1/refine`,
 /// so the page never waits for a walk of the label files.
-pub(super) async fn page() -> Response {
-    blocking(|| {
+pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
+    blocking(move || {
+        let config = state.config_read().clone();
         render(&RefineTemplate {
             nav: "train",
             tab: REFINE,
@@ -122,6 +126,7 @@ pub(super) async fn page() -> Response {
             epochs_min: *check::EPOCHS.start(),
             epochs_max: *check::EPOCHS.end(),
             epochs_default: check::DEFAULT_EPOCHS,
+            tighten_default: check::tighten_weights_ready(&config),
         })
     })
     .await
@@ -136,6 +141,8 @@ pub(super) struct Open {
     pub(super) add: usize,
     pub(super) verify: usize,
     pub(super) relabel: usize,
+    /// Better-fitting boxes for loose labels (the check's closer look).
+    pub(super) tighten: usize,
     /// Frames holding at least one.
     pub(super) frames: usize,
 }
@@ -149,13 +156,14 @@ pub(super) fn count_open(dir: &Path, classes: &[String], hidden: &[String]) -> O
         if live.is_empty() {
             return None;
         }
-        let mut n = [0usize; 3];
+        let mut n = [0usize; 4];
         for l in &live {
             match l.suggestion.kind {
                 Kind::Add => n[0] += 1,
                 Kind::Verify => n[1] += 1,
                 Kind::Relabel => n[2] += 1,
-                Kind::Tighten | Kind::Unknown => {}
+                Kind::Tighten => n[3] += 1,
+                Kind::Unknown => {}
             }
         }
         (n.iter().sum::<usize>() > 0).then_some(n)
@@ -165,6 +173,7 @@ pub(super) fn count_open(dir: &Path, classes: &[String], hidden: &[String]) -> O
         open.add += n[0];
         open.verify += n[1];
         open.relabel += n[2];
+        open.tighten += n[3];
         open.frames += 1;
     }
     open
@@ -342,10 +351,12 @@ pub(super) fn queue_stamp(tasks: &[TaskRecord]) -> String {
         .join(",")
 }
 
-/// What the form needs of this machine.
-fn capability_bits(cap: &Capability) -> serde_json::Value {
+/// What the form needs of this machine; `tighten_default`: the closer look's weights are on disk,
+/// so a check looks closer at its loose labels unless told not to.
+fn capability_bits(cap: &Capability, tighten_default: bool) -> serde_json::Value {
     serde_json::json!({
         "can_check": cap.accelerator.is_some(),
+        "tighten_default": tighten_default,
         "why": cap.accelerator.is_none().then(|| cap.summary()),
         "gpus": gpu_options(cap)
             .into_iter()
@@ -368,7 +379,7 @@ fn status_of(state: &AppState, cap: &Capability) -> serde_json::Value {
         "open": null,
         "job": job_of(&runs, &tasks, &training::job_timing),
         "last": last_of(&tasks),
-        "capability": capability_bits(cap),
+        "capability": capability_bits(cap, check::tighten_weights_ready(&config)),
         "limits": {
             "folds": [check::FOLDS.start(), check::FOLDS.end()],
             "epochs": [check::EPOCHS.start(), check::EPOCHS.end()],
@@ -424,6 +435,7 @@ fn build_request(
     cameras: &[String],
     gpu: Option<String>,
     allow_large: bool,
+    tighten: Option<bool>,
 ) -> Result<RefineRequest, String> {
     let mut frames = RefineFrames::default();
     for s in scenes.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -451,6 +463,7 @@ fn build_request(
         frames,
         gpu: gpu.map(|g| g.trim().to_string()).filter(|g| !g.is_empty()),
         allow_large,
+        tighten,
     };
     request.validate().map_err(|e| format!("{e:#}"))?;
     Ok(request)
@@ -472,6 +485,20 @@ pub(super) struct PreviewQuery {
     gpu: Option<String>,
     #[serde(default)]
     allow_large: Option<String>,
+    /// `1` / `0`: the closer look at loose labels asked for or not; absent: the check's default.
+    #[serde(default)]
+    tighten: Option<String>,
+}
+
+/// A yes/no query field: `1`, `true`, `on`, `yes` or `0`, `false`, `off`, `no`; absent or empty:
+/// None; anything else an error naming `field`.
+fn yes_no(field: &str, v: Option<&str>) -> Result<Option<bool>, String> {
+    match v.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some("1" | "true" | "on" | "yes") => Ok(Some(true)),
+        Some("0" | "false" | "off" | "no") => Ok(Some(false)),
+        Some(v) => Err(format!("{field} must be 1 or 0, got '{v}'")),
+    }
 }
 
 fn whole<T: std::str::FromStr>(field: &str, v: Option<&str>) -> Result<Option<T>, String> {
@@ -501,6 +528,7 @@ impl PreviewQuery {
                 self.allow_large.as_deref().map(str::trim),
                 Some("1" | "true" | "on" | "yes")
             ),
+            yes_no("tighten", self.tighten.as_deref())?,
         )
     }
 }
@@ -551,6 +579,10 @@ struct CheckBody {
     gpu: Option<String>,
     #[serde(default)]
     allow_large: bool,
+    /// The closer look at loose labels (`true` / `false`); absent: the check's default (on when
+    /// RF-DETR L's weights are on disk).
+    #[serde(default)]
+    tighten: Option<bool>,
     /// The user confirmed that the check replaces the open suggestions of the frames it checks
     /// (the second click after a `needs_confirm` refusal).
     #[serde(default)]
@@ -759,6 +791,7 @@ pub(super) async fn start(
             &b.cameras,
             b.gpu,
             b.allow_large,
+            b.tighten,
         ) {
             Ok(r) => r,
             Err(m) => return fail(StatusCode::BAD_REQUEST, m),
@@ -978,6 +1011,10 @@ mod tests {
             "name=\"mode\" value=\"background\"",
             "name=\"mode\" value=\"drop-frame\"",
             "/static/train-refine.js?v=",
+            // RF-DETR L's weights are not here: the box starts unticked and says it downloads them.
+            "<input type=\"checkbox\" id=\"refine-tighten\" name=\"tighten\"> Propose better boxes \
+             for loose labels</label>",
+            "downloads RF-DETR L (0.14 GB) the first time",
         ] {
             assert!(html.contains(want), "{want}");
         }
@@ -1004,6 +1041,82 @@ mod tests {
         }
     }
 
+    /// RF-DETR L's weights on disk under `dir` (every part at its pinned size).
+    fn put_zoom_weights(dir: &Path) {
+        let config = Config {
+            download_dir: Some(dir.to_path_buf()),
+            ..Config::default()
+        };
+        let paths = crate::resources::export::train::TrainPaths::for_config(&config);
+        let (res, at) = crate::training::overlaps::rfdetr_weights(&paths).unwrap();
+        std::fs::create_dir_all(&at).unwrap();
+        for p in res.parts {
+            std::fs::File::create(at.join(p.file_name))
+                .unwrap()
+                .set_len(p.size)
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_look_is_ticked_when_its_weights_are_here_and_the_routes_take_the_field() {
+        let dir = scratch();
+        put_zoom_weights(&dir);
+        let state = state_in(&dir);
+        let (_, html) = get_text(&state, "/train/refine").await;
+        assert!(
+            html.contains(
+                "<input type=\"checkbox\" id=\"refine-tighten\" name=\"tighten\" checked> \
+                 Propose better boxes for loose labels"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("downloads RF-DETR L"));
+        let (_, v) = json(&state, get("/v1/refine")).await;
+        assert_eq!(v["capability"]["tighten_default"], true, "{v}");
+        // The preview follows the default, or the field.
+        enough_frames(&dir.join("dataset"));
+        let (_, v) = json(&state, get("/v1/refine/preview?folds=2")).await;
+        assert_eq!(v["tighten"], true, "{v}");
+        let (_, v) = json(&state, get("/v1/refine/preview?folds=2&tighten=0")).await;
+        assert_eq!(v["tighten"], false, "{v}");
+        assert!(
+            v["text"]
+                .as_str()
+                .unwrap()
+                .contains("loose labels: counted only")
+        );
+        let (s, _) = json(&state, get("/v1/refine/preview?tighten=maybe")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // A start takes a boolean, nothing else.
+        let (s, v) = json(
+            &state,
+            post_json("/v1/refine/check", r#"{"tighten":"yes"}"#),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let config = host_config(&dir);
+        let seen = Mutex::new(Vec::new());
+        let enqueue = |job: RefineJob, _: QueueRule<'_>| {
+            seen.lock().unwrap().push(job.request.tighten);
+            Ok(job.id.clone())
+        };
+        for asked in [None, Some(false), Some(true)] {
+            let req = RefineRequest {
+                folds: 2,
+                epochs: 3,
+                tighten: asked,
+                ..RefineRequest::default()
+            };
+            start_check(&config, req, true, &host(), &[], None, &enqueue).unwrap();
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [Some(true), Some(false), Some(true)],
+            "the planned job holds the answer"
+        );
+    }
+
     // ---- GET /v1/refine
 
     #[tokio::test]
@@ -1020,8 +1133,10 @@ mod tests {
         assert_eq!(v["folder_missing"], false);
         assert_eq!(
             v["open"],
-            serde_json::json!({"add":0,"verify":0,"relabel":0,"frames":0})
+            serde_json::json!({"add":0,"verify":0,"relabel":0,"tighten":0,"frames":0})
         );
+        // RF-DETR L's weights are not here: the form's box starts unticked.
+        assert_eq!(v["capability"]["tighten_default"], false);
         assert_eq!(v["limits"]["folds"], serde_json::json!([2, 8]));
         assert!(v["capability"]["can_check"].is_boolean());
         assert!(v["review_folder"].as_str().unwrap().ends_with("dataset"));
@@ -1119,7 +1234,15 @@ mod tests {
             s
         };
         frame_with(&review, "patio", "a1", vec![add(), verify()]);
-        frame_with(&review, "patio", "a2", vec![relabel()]);
+        frame_with(
+            &review,
+            "patio",
+            "a2",
+            vec![
+                relabel(),
+                suggestion(Kind::Tighten, Some(CAR), Some([5.0, 5.0, 23.0, 19.0])),
+            ],
+        );
         // Answered: not open.
         let mut done = add();
         done.answer = Some(Answer::Dismissed);
@@ -1134,7 +1257,7 @@ mod tests {
         let (_, v) = json(&state, get("/v1/refine")).await;
         assert_eq!(
             v["open"],
-            serde_json::json!({"add": 1, "verify": 1, "relabel": 1, "frames": 2}),
+            serde_json::json!({"add": 1, "verify": 1, "relabel": 1, "tighten": 1, "frames": 2}),
             "{v}"
         );
     }
@@ -1249,12 +1372,14 @@ mod tests {
             &["patio".into(), "".into(), "front".into()],
             Some(" ".into()),
             true,
+            Some(false),
         )
         .unwrap();
         assert_eq!((r.folds, r.epochs), (4, 8));
         assert_eq!(r.frames.scenes, ["day", "ir"]);
         assert_eq!(r.frames.cameras, ["front", "patio"]);
         assert!(r.gpu.is_none() && r.allow_large);
+        assert_eq!(r.tighten, Some(false));
         for (folds, epochs, scene) in [
             (Some(1), None, "day"),
             (Some(9), None, "day"),
@@ -1263,7 +1388,7 @@ mod tests {
             (None, None, "dusk"),
         ] {
             assert!(
-                build_request(folds, epochs, &[scene.into()], &[], None, false).is_err(),
+                build_request(folds, epochs, &[scene.into()], &[], None, false, None).is_err(),
                 "{folds:?} {epochs:?} {scene}"
             );
         }
@@ -1278,6 +1403,23 @@ mod tests {
         assert_eq!(r.folds, 3);
         assert_eq!(r.frames.cameras, ["a", "b"]);
         assert!(r.allow_large);
+        assert_eq!(r.tighten, None, "absent: the check's default");
+        for (v, want) in [("1", Some(true)), ("0", Some(false)), ("", None)] {
+            let q = PreviewQuery {
+                tighten: Some(v.into()),
+                ..PreviewQuery::default()
+            };
+            assert_eq!(q.request().unwrap().tighten, want, "{v}");
+        }
+        let bad = PreviewQuery {
+            tighten: Some("maybe".into()),
+            ..PreviewQuery::default()
+        };
+        assert!(
+            bad.request()
+                .unwrap_err()
+                .contains("tighten must be 1 or 0")
+        );
         let bad = PreviewQuery {
             folds: Some("x".into()),
             ..PreviewQuery::default()
