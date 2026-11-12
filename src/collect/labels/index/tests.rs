@@ -275,6 +275,7 @@ mod cases {
     use super::super::super::bulk::{self, Wanted};
     use super::super::super::overlaps::{Suggestion, Verdict};
     use super::super::super::queue::{self, AutoFilter, Filters, QueueSource, StatusFilter};
+    use super::super::super::refine;
     use super::super::super::{
         AutoInfo, AutoRun, BoxState, Frame, LABELS_SUFFIX, LabelBox, LabelFile, Origin,
         RejectReason, Source, Status, Triage, VlmCheck,
@@ -541,6 +542,13 @@ mod cases {
                 weak: rng.one_in(4),
             });
         }
+        // From a generator of their own, so the folders of the other cases stay as they were.
+        let mut own = Rng::new(rng.0 ^ 0x5eed);
+        let refine = if own.one_in(2) {
+            suggestions_for(&mut own, &boxes)
+        } else {
+            Vec::new()
+        };
         let status = rng.pick(&[
             Status::Unreviewed,
             Status::Unreviewed,
@@ -573,8 +581,54 @@ mod cases {
             repeat_spot,
             overlaps_checked: rng.one_in(8),
             overlap_suggestions: suggestions,
+            refine,
             ..LabelFile::default()
         }
+    }
+
+    /// Suggestions of the dataset check on `boxes`: every kind, on a box or at a place, some with
+    /// the target's label, some answered, some stale, some of an unwanted class.
+    fn suggestions_for(rng: &mut Rng, boxes: &[LabelBox]) -> Vec<refine::Suggestion> {
+        let mut out = Vec::new();
+        for _ in 0..1 + rng.below(3) {
+            let kind = rng.pick(&[
+                refine::Kind::Add,
+                refine::Kind::Add,
+                refine::Kind::Tighten,
+                refine::Kind::Tighten,
+                refine::Kind::Relabel,
+                refine::Kind::Relabel,
+                refine::Kind::Relabel,
+                refine::Kind::Verify,
+                refine::Kind::Verify,
+            ]);
+            let on = (!boxes.is_empty() && !rng.one_in(6)).then(|| rng.pick(boxes));
+            let target = on.as_ref().map_or_else(|| rng.pick(&PLACES), |b| b.bbox);
+            let add = kind == refine::Kind::Add;
+            out.push(refine::Suggestion {
+                kind,
+                target: (!add).then_some(target),
+                target_label: (!add && rng.one_in(2)).then(|| {
+                    on.as_ref()
+                        .map_or_else(|| "car".into(), |b| b.label.clone())
+                }),
+                bbox: match kind {
+                    refine::Kind::Add => Some(rng.pick(&PLACES)),
+                    refine::Kind::Tighten => Some(rng.pick(&PLACES)),
+                    _ => None,
+                },
+                label: matches!(kind, refine::Kind::Add | refine::Kind::Relabel)
+                    .then(|| rng.pick(&CLASSES).into()),
+                score: (!rng.one_in(5)).then(|| rng.score()),
+                why: "x".into(),
+                spot: None,
+                answer: rng
+                    .one_in(5)
+                    .then(|| rng.pick(&[refine::Answer::Dismissed, refine::Answer::Kept])),
+                run: "r1".into(),
+            });
+        }
+        out
     }
 
     /// Label files every folder has, whatever the seed: what a random one rarely is.
@@ -630,7 +684,59 @@ mod cases {
             boxes: vec![sure],
             ..LabelFile::default()
         };
-        vec![reviewed.clone(), reviewed, both, accept.clone(), accept]
+        // One live suggestion of every kind, and a frame where only a verify is.
+        let s = |kind: refine::Kind, target: Option<[f32; 4]>, bbox, label: Option<&str>| {
+            refine::Suggestion {
+                kind,
+                target,
+                target_label: None,
+                bbox,
+                label: label.map(String::from),
+                score: Some(0.6),
+                why: "x".into(),
+                spot: None,
+                answer: None,
+                run: "r1".into(),
+            }
+        };
+        let checked = LabelFile {
+            boxes: vec![
+                b(BoxState::Accepted, false),
+                LabelBox {
+                    label: "person".into(),
+                    bbox: PLACES[4],
+                    ..b(BoxState::Accepted, false)
+                },
+            ],
+            refine: vec![
+                s(refine::Kind::Add, None, Some(PLACES[0]), Some("dog")),
+                s(
+                    refine::Kind::Tighten,
+                    Some(PLACES[3]),
+                    Some(PLACES[1]),
+                    None,
+                ),
+                s(refine::Kind::Relabel, Some(PLACES[4]), None, Some("dog")),
+                s(refine::Kind::Verify, Some(PLACES[3]), None, None),
+            ],
+            ..reviewed.clone()
+        };
+        let verify_only = LabelFile {
+            refine: vec![s(refine::Kind::Verify, Some(PLACES[3]), None, None)],
+            ..checked.clone()
+        };
+        vec![
+            reviewed.clone(),
+            reviewed,
+            both,
+            accept.clone(),
+            accept,
+            // Copies: strength ties only the timestamp and the path break.
+            checked.clone(),
+            checked.clone(),
+            checked,
+            verify_only,
+        ]
     }
 
     fn review_line(rel: &str, scene: &str, camera: &str, buckets: &[Bucket]) -> String {
@@ -783,6 +889,7 @@ mod cases {
             Some(AutoFilter::Overlaps),
             Some(AutoFilter::Both),
             Some(AutoFilter::Dismissed),
+            Some(AutoFilter::Refine),
         ];
         let statuses = [
             StatusFilter::Is(Status::Unreviewed),
@@ -849,8 +956,29 @@ mod cases {
             auto: Some(AutoFilter::Overlaps),
             ..all.clone()
         });
+        for kind in REFINE_KINDS {
+            out.push(Filters {
+                auto: Some(AutoFilter::Refine),
+                refine_kind: Some(kind),
+                ..all.clone()
+            });
+        }
+        out.push(Filters {
+            status: StatusFilter::Is(Status::Unreviewed),
+            camera: Some("gate".into()),
+            auto: Some(AutoFilter::Refine),
+            refine_kind: Some(refine::Kind::Verify),
+            ..all.clone()
+        });
         out
     }
+
+    const REFINE_KINDS: [refine::Kind; 4] = [
+        refine::Kind::Add,
+        refine::Kind::Tighten,
+        refine::Kind::Relabel,
+        refine::Kind::Verify,
+    ];
 
     fn json(a: &Answer) -> serde_json::Value {
         serde_json::to_value(a).unwrap()
@@ -941,6 +1069,7 @@ mod cases {
             AutoFilter::Overlaps,
             AutoFilter::Both,
             AutoFilter::Dismissed,
+            AutoFilter::Refine,
         ] {
             let f = Filters {
                 auto: Some(auto),
@@ -954,6 +1083,35 @@ mod cases {
             if auto == AutoFilter::Both {
                 assert!(items.iter().any(|i| i.uncertainty.agreed_boxes > 1));
             }
+            if auto == AutoFilter::Refine {
+                assert!(items.iter().all(|i| i.uncertainty.refine_open > 0));
+                assert!(items.iter().any(|i| i.uncertainty.refine_open > 1));
+                // Unreviewed, reviewed and skipped-but-stale frames: a skipped one is never listed.
+                assert!(items.iter().any(|i| i.status == Status::Unreviewed));
+                assert!(items.iter().all(|i| i.status != Status::Skipped));
+                // Strength ties for the path to break.
+                assert!(
+                    items.windows(2).any(|w| {
+                        w[0].uncertainty.refine_strength == w[1].uncertainty.refine_strength
+                    }),
+                    "{:?}",
+                    items
+                        .iter()
+                        .map(|i| (&i.frame, i.uncertainty.refine_strength))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for kind in REFINE_KINDS {
+            let f = Filters {
+                auto: Some(AutoFilter::Refine),
+                refine_kind: Some(kind),
+                ..all.clone()
+            };
+            assert!(
+                queue::build(dir, &f).items.len() >= 2,
+                "too few for refine_kind={kind:?}"
+            );
         }
         assert!(layout::damaged_lines(dir, true) >= 2);
     }
@@ -1011,15 +1169,16 @@ mod cases {
         let rel = rng.pick(&live);
         let frame = Frame::resolve(dir, &rel).unwrap();
         super::super::super::write(&frame.labels, &a_label_file(rng)).unwrap();
+        let w = Wanted {
+            classes: &wanted.0,
+            hidden: &wanted.1,
+        };
+        refine_writes(dir, rng, &live, &w);
         let all = Filters {
             source: QueueSource::All,
             status: StatusFilter::Any,
             wanted: Some(wanted.clone()),
             ..Filters::default()
-        };
-        let w = Wanted {
-            classes: &wanted.0,
-            hidden: &wanted.1,
         };
         bulk::bulk_reject_below(dir, &all, 0.4, usize::MAX, false, &|_| true);
         bulk::bulk_reject_stacked(dir, &all, &w, usize::MAX, false, &|_| true);
@@ -1064,6 +1223,69 @@ mod cases {
         }
         // Retention: the unprotected frames go, through `unless_protected` and `rewrite_index`.
         crate::retention::prune_dataset(dir, 0, 1).unwrap();
+    }
+
+    /// What the dataset check and a reviewer do to suggestions, through the label writer: a check
+    /// writes some (only `refine` changes), a reviewer dismisses one, accepts one (a box changes,
+    /// or a verify is answered) and a rerun takes the unanswered ones away.
+    fn refine_writes(dir: &Path, rng: &mut Rng, live: &[String], w: &Wanted<'_>) {
+        let kinds = [
+            refine::Kind::Add,
+            refine::Kind::Tighten,
+            refine::Kind::Relabel,
+            refine::Kind::Verify,
+        ];
+        let labelled: Vec<Frame> = live
+            .iter()
+            .filter_map(|r| Frame::resolve(dir, r))
+            .filter(|f| f.labels().is_ok_and(|l| l.is_some()))
+            .collect();
+        for (n, frame) in labelled.iter().take(16).enumerate() {
+            let found = {
+                let l = frame.labels().unwrap().unwrap();
+                suggestions_for(rng, &l.boxes)
+                    .into_iter()
+                    .map(|s| refine::Suggestion { answer: None, ..s })
+                    .collect::<Vec<_>>()
+            };
+            let _ = super::super::super::update(&frame.labels, |old| {
+                let Some(mut l) = old else { return Ok(None) };
+                let before = l.clone();
+                match n % 4 {
+                    // A check writes what it found.
+                    0 | 1 => {
+                        if !refine::apply(&mut l, found, &kinds).changed() {
+                            return Ok(None);
+                        }
+                    }
+                    // A reviewer answers no.
+                    2 => {
+                        let Some(i) = refine::live(&l, Some(w)).first().map(|x| x.index) else {
+                            return Ok(None);
+                        };
+                        assert!(refine::dismiss(&mut l, i));
+                    }
+                    // A reviewer answers yes.
+                    _ => {
+                        let Some(i) = refine::live(&l, Some(w)).last().map(|x| x.index) else {
+                            return Ok(None);
+                        };
+                        assert!(refine::accept(&mut l, i, Some(w)));
+                    }
+                }
+                assert_ne!(l, before);
+                Ok(Some(l))
+            });
+        }
+        // A rerun that finds nothing: the unanswered suggestions go, the answered ones stay.
+        for frame in labelled.iter().skip(16).take(4) {
+            let _ = super::super::super::update(&frame.labels, |old| {
+                let Some(mut l) = old else { return Ok(None) };
+                Ok(refine::apply(&mut l, Vec::new(), &kinds)
+                    .changed()
+                    .then_some(l))
+            });
+        }
     }
 
     /// Edits no writer of this process tells the index about: they show after a scan.
@@ -1150,10 +1372,20 @@ mod cases {
             covers_every_case(&dir);
             same_answers(&dir, &a, &rels, &format!("seed {seed}, built"));
             same_order(&dir, &all_any(), &format!("seed {seed}, built"));
+            let refine_all = Filters {
+                auto: Some(AutoFilter::Refine),
+                ..all_any()
+            };
+            same_order(&dir, &refine_all, &format!("seed {seed}, built, refine"));
             assert!(index_of(&dir).is_some());
 
             real_writes(&dir, &mut rng, &mut rels, &a);
             same_answers(&dir, &a, &rels, &format!("seed {seed}, real writes"));
+            same_order(
+                &dir,
+                &refine_all,
+                &format!("seed {seed}, real writes, refine"),
+            );
 
             // Another class list: another index, built anew.
             let before = index_of(&dir).unwrap();
@@ -1420,7 +1652,9 @@ mod cases {
     fn an_idle_index_goes_with_its_thread() {
         let dir = Dir::new();
         generate(&dir, 19, 10, false);
-        set_timing(&dir, |t| t.idle = Duration::from_millis(100));
+        // Longer than a build of these 20 frames takes while the other tests load the machine: an
+        // index whose build outlasts it is idle before its first answer, which then walks.
+        set_timing(&dir, |t| t.idle = Duration::from_secs(1));
         let f = all_any();
         from_index(&dir, &f, None);
         let first = index_of(&dir).unwrap();
@@ -1603,6 +1837,87 @@ mod cases {
         );
         assert_eq!(log.rel_of(&dir.join("ir/gate/2026-10-21/s.json")), None);
         assert_eq!(log.rel_of(&dir.join(format!("s{LABELS_SUFFIX}"))), None);
+    }
+
+    /// A label write that changes only the suggestions (a check's, then a reviewer's answer) moves
+    /// the frame into `auto=refine` and out again, as the walk sees it.
+    #[test]
+    fn a_write_of_suggestions_alone_moves_a_frame_in_and_out_of_auto_refine() {
+        let dir = Dir::new();
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        let rels = generate(&dir, 89, 20, false);
+        let frame = readable(&dir, &rels);
+        let car = LabelBox {
+            bbox: PLACES[3],
+            state: BoxState::Accepted,
+            ..super::super::super::tests_support::auto_box("car")
+        };
+        let plain = LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes: vec![car],
+            ..LabelFile::default()
+        };
+        super::super::super::write(&frame.labels, &plain).unwrap();
+        let mut f = all_any();
+        f.auto = Some(AutoFilter::Refine);
+        // How many frames the index lists, the walk's answer checked whole.
+        let listed = |f: &Filters| {
+            let a = from_index(&dir, f, None);
+            assert_eq!(json(&a), walk(&dir, f, None), "{f:?}");
+            a.total
+        };
+        let (before, verify_before, add_before) = (
+            listed(&f),
+            listed(&Filters {
+                refine_kind: Some(refine::Kind::Verify),
+                ..f.clone()
+            }),
+            listed(&Filters {
+                refine_kind: Some(refine::Kind::Add),
+                ..f.clone()
+            }),
+        );
+        let verify = refine::Suggestion {
+            kind: refine::Kind::Verify,
+            target: Some(PLACES[3]),
+            target_label: Some("car".into()),
+            bbox: None,
+            label: None,
+            score: None,
+            why: "no fold model found it".into(),
+            spot: None,
+            answer: None,
+            run: "r1".into(),
+        };
+        let wrote = super::super::super::update(&frame.labels, |old| {
+            let mut l = old.unwrap();
+            let done = refine::apply(&mut l, vec![verify.clone()], &[refine::Kind::Verify]);
+            assert_eq!(done.written, 1);
+            Ok(Some(l))
+        })
+        .unwrap();
+        assert!(wrote);
+        assert_eq!(listed(&f), before + 1, "a check's suggestions alone");
+        let verify_only = Filters {
+            refine_kind: Some(refine::Kind::Verify),
+            ..f.clone()
+        };
+        assert_eq!(listed(&verify_only), verify_before + 1);
+        let adds = Filters {
+            refine_kind: Some(refine::Kind::Add),
+            ..f.clone()
+        };
+        assert_eq!(listed(&adds), add_before);
+        super::super::super::update(&frame.labels, |old| {
+            let mut l = old.unwrap();
+            assert!(refine::accept(&mut l, 0, None));
+            Ok(Some(l))
+        })
+        .unwrap();
+        assert_eq!(listed(&f), before, "answered: kept");
+        assert_eq!(listed(&verify_only), verify_before);
+        assert!(served(&dir));
     }
 
     #[test]

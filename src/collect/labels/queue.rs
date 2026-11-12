@@ -12,6 +12,7 @@
 use super::super::layout::{self, REVIEW_QUEUE_FILE, ReviewLine, Walker};
 use super::super::record::{Bucket, IndexLine, Record};
 use super::bulk::Wanted;
+use super::refine::Kind as RefineKind;
 use super::{BoxState, Frame, LabelFile, Status, Triage};
 use crate::parallel;
 use serde::Serialize;
@@ -75,6 +76,13 @@ pub enum AutoFilter {
     /// At least one box a labelers run dismissed ([`LabelBox::is_dismissed`]), pending boxes or
     /// not: a frame left with only such boxes has nothing else to find it by.
     Dismissed,
+    /// A suggestion of the dataset check a reviewer can act on ([`super::refine::live`]), any
+    /// review status; of [`Filters::refine_kind`] only when that is set. Strongest first
+    /// ([`super::refine::frame_strength`], item fields `refine_strength` and `refine_open`). With
+    /// a class list ([`Filters::wanted`]) classes are spelled and filtered through it, as the
+    /// Review tab shows them; [`AutoFilter::matches`] has none, so there every label counts. A
+    /// frame without a label file is not listed: a check writes only to label files.
+    Refine,
 }
 
 /// How many labelers make a box agreed ([`AutoFilter::Both`]).
@@ -91,6 +99,7 @@ impl AutoFilter {
             "overlaps" => Some(AutoFilter::Overlaps),
             "both" => Some(AutoFilter::Both),
             "dismissed" => Some(AutoFilter::Dismissed),
+            "refine" => Some(AutoFilter::Refine),
             _ => None,
         }
     }
@@ -110,8 +119,36 @@ impl AutoFilter {
             AutoFilter::Dismissed => {
                 labels.is_some_and(|l| l.boxes.iter().any(super::LabelBox::is_dismissed))
             }
+            AutoFilter::Refine => labels.is_some_and(|l| refine_open(l, None, None).0 > 0),
         }
     }
+}
+
+/// The kinds `refine_kind=` names ([`Filters::refine_kind`]): every kind a check writes and a
+/// reviewer can act on.
+const REFINE_KINDS: [(&str, RefineKind); 4] = [
+    ("add", RefineKind::Add),
+    ("tighten", RefineKind::Tighten),
+    ("relabel", RefineKind::Relabel),
+    ("verify", RefineKind::Verify),
+];
+
+/// The live suggestions of `l` ([`super::refine::live`], with `wanted` when given), of `kind`
+/// only when given: how many, and the strongest one's [`super::refine::strength`] (0 for none).
+pub(crate) fn refine_open(
+    l: &LabelFile,
+    wanted: Option<&Wanted<'_>>,
+    kind: Option<RefineKind>,
+) -> (u32, u32) {
+    super::refine::live(l, wanted)
+        .iter()
+        .filter(|x| kind.is_none_or(|k| x.suggestion.kind == k))
+        .fold((0u32, 0u32), |(n, top), x| {
+            (
+                n.saturating_add(1),
+                top.max(super::refine::strength(x.suggestion)),
+            )
+        })
 }
 
 /// A pending box triaged `review`.
@@ -143,16 +180,21 @@ pub struct Filters {
     pub source: QueueSource,
     /// Only frames in this auto-label state.
     pub auto: Option<AutoFilter>,
-    /// `collect.classes` and `collect.hidden_classes`, for [`AutoFilter::Overlaps`] and
-    /// [`AutoFilter::Both`] (not from the query: the caller's config). None = every label is wanted.
+    /// `collect.classes` and `collect.hidden_classes`, for [`AutoFilter::Overlaps`],
+    /// [`AutoFilter::Both`] and [`AutoFilter::Refine`] (not from the query: the caller's config).
+    /// None = every label is wanted.
     pub wanted: Option<(Vec<String>, Vec<String>)>,
+    /// With [`AutoFilter::Refine`] only (`refine_kind=`): the suggestions of this kind alone count,
+    /// for the filter, the order and `refine_open`. None = every kind.
+    pub refine_kind: Option<RefineKind>,
 }
 
 impl Filters {
     /// From query parameters (`bucket`, `scene`, `camera`, `label` = a comma list, any of
     /// them, empty items ignored, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
-    /// overlaps|both|dismissed`); empty values mean "any". Errors name the field.
+    /// overlaps|both|dismissed|refine`, `refine_kind` = `add|tighten|relabel|verify`, only with
+    /// `auto=refine`); empty values mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -202,10 +244,29 @@ impl Filters {
             None => None,
             Some(a) => Some(AutoFilter::parse(a).ok_or_else(|| {
                 format!(
-                    "auto: '{a}' is not review, accept, nothing, none, repeats, overlaps, both \
-                     or dismissed"
+                    "auto: '{a}' is not review, accept, nothing, none, repeats, overlaps, both, \
+                     dismissed or refine"
                 )
             })?),
+        };
+        let refine_kind = match get("refine_kind") {
+            None => None,
+            Some(k) => {
+                let kind = REFINE_KINDS
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, kind)| *kind)
+                    .ok_or_else(|| {
+                        format!("refine_kind: '{k}' is not add, tighten, relabel or verify")
+                    })?;
+                if auto != Some(AutoFilter::Refine) {
+                    return Err(format!(
+                        "refine_kind: '{k}' needs auto=refine (it narrows the dataset check's \
+                         suggestions)"
+                    ));
+                }
+                Some(kind)
+            }
         };
         Ok(Self {
             bucket,
@@ -216,6 +277,7 @@ impl Filters {
             source,
             auto,
             wanted: None,
+            refine_kind,
         })
     }
 
@@ -237,7 +299,20 @@ impl Filters {
             Some(AutoFilter::Both) => {
                 labels.is_some_and(|l| agreed_boxes(l, self.wanted().as_ref()) > 0)
             }
+            Some(AutoFilter::Refine) => self.refine_open(labels).0 > 0,
             Some(a) => a.matches(labels),
+        }
+    }
+
+    /// The live suggestions of a frame with `labels` under `auto=refine` ([`refine_open`] for
+    /// [`Self::wanted`] and [`Self::refine_kind`]): how many, and the strongest one's strength;
+    /// (0, 0) under any other filter (no effect on the order) and without a label file.
+    pub(super) fn refine_open(&self, labels: Option<&LabelFile>) -> (u32, u32) {
+        match (self.auto, labels) {
+            (Some(AutoFilter::Refine), Some(l)) => {
+                refine_open(l, self.wanted().as_ref(), self.refine_kind)
+            }
+            _ => (0, 0),
         }
     }
 
@@ -326,6 +401,15 @@ pub struct Uncertainty {
     /// frames come first, most agreed boxes first.
     #[serde(skip_serializing_if = "is_zero")]
     pub agreed_boxes: u32,
+    /// `auto=refine` only: the strongest live suggestion of the dataset check on the frame
+    /// ([`super::refine::strength`], of `refine_kind` when given; 0 = none). These frames come
+    /// first, strongest first.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub refine_strength: u32,
+    /// `auto=refine` only: how many suggestions of the dataset check on the frame are live (of
+    /// `refine_kind` when given).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub refine_open: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -359,6 +443,8 @@ impl Uncertainty {
             repeats_only: false,
             overlap_strength: 0,
             agreed_boxes: 0,
+            refine_strength: 0,
+            refine_open: 0,
         }
     }
 
@@ -387,7 +473,8 @@ impl Uncertainty {
     }
 
     /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only), the
-    /// most agreed boxes (`auto=both` only), repeat-only frames last of all, then a re-label
+    /// most agreed boxes (`auto=both` only), the strongest suggestion of the dataset check
+    /// (`auto=refine` only), repeat-only frames last of all, then a re-label
     /// disagreement, then the most likely boxes, fewer flagged boxes (17 flagged boxes on a frame
     /// with no likely one are mostly false: an empty yard must not open the queue), then the margin
     /// in hundredths (no box last), verifier disagreement, more suppressed boxes.
@@ -403,6 +490,7 @@ impl Uncertainty {
         (
             std::cmp::Reverse(self.overlap_strength),
             std::cmp::Reverse(self.agreed_boxes),
+            std::cmp::Reverse(self.refine_strength),
             self.repeats_only,
             self.relabel.is_none(),
             std::cmp::Reverse(self.likely_boxes),
@@ -416,6 +504,7 @@ impl Uncertainty {
 
 /// What [`Uncertainty::key`] sorts by: a lexicographic key reads best as one tuple.
 pub(super) type SortKey = (
+    std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
     bool,
@@ -676,9 +765,12 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
         if !f.auto_keeps(labels.as_ref()) {
             continue;
         }
+        let (refine_open, refine_strength) = f.refine_open(labels.as_ref());
         let uncertainty = Uncertainty {
             overlap_strength: f.overlap_strength(labels.as_ref()),
             agreed_boxes: f.agreed_boxes(labels.as_ref()),
+            refine_strength,
+            refine_open,
             ..Uncertainty::of(&rec).with_labels(labels.as_ref())
         };
         q.items.push(Item {
@@ -1018,6 +1110,8 @@ mod tests {
             repeats_only: false,
             overlap_strength: 0,
             agreed_boxes: 0,
+            refine_strength: 0,
+            refine_open: 0,
         }
     }
 
@@ -1602,6 +1696,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A suggestion of the dataset check of `kind` at `score`, on the box at `target` (`add`: a new
+    /// box there).
+    fn refine_at(
+        kind: RefineKind,
+        target: [f32; 4],
+        label: &str,
+        score: f32,
+    ) -> super::super::refine::Suggestion {
+        let add = kind == RefineKind::Add;
+        super::super::refine::Suggestion {
+            kind,
+            target: (!add).then_some(target),
+            target_label: None,
+            bbox: match kind {
+                RefineKind::Add => Some(target),
+                RefineKind::Tighten => Some([
+                    target[0] + 1.0,
+                    target[1] + 1.0,
+                    target[2] - 1.0,
+                    target[3] - 1.0,
+                ]),
+                _ => None,
+            },
+            label: matches!(kind, RefineKind::Add | RefineKind::Relabel).then(|| label.into()),
+            score: Some(score),
+            why: "x".into(),
+            spot: None,
+            answer: None,
+            run: "r1".into(),
+        }
+    }
+
+    #[test]
+    fn the_refine_filter_parses_and_its_kind_needs_it() {
+        let q = |pairs: &[(&str, &str)]| {
+            Filters::from_query(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            q(&[("auto", "refine")]).unwrap().auto,
+            Some(AutoFilter::Refine)
+        );
+        assert_eq!(q(&[("auto", "refine")]).unwrap().refine_kind, None);
+        for (name, kind) in REFINE_KINDS {
+            let f = q(&[("auto", "refine"), ("refine_kind", name)]).unwrap();
+            assert_eq!(f.refine_kind, Some(kind), "{name}");
+        }
+        assert_eq!(
+            q(&[("auto", "refine"), ("refine_kind", " ")])
+                .unwrap()
+                .refine_kind,
+            None,
+            "empty is any"
+        );
+        let e = q(&[("auto", "refine"), ("refine_kind", "unknown")]).unwrap_err();
+        assert!(e.starts_with("refine_kind:"), "{e}");
+        let e = q(&[("refine_kind", "add")]).unwrap_err();
+        assert!(e.contains("needs auto=refine"), "{e}");
+        let e = q(&[("auto", "overlaps"), ("refine_kind", "add")]).unwrap_err();
+        assert!(e.contains("needs auto=refine"), "{e}");
+        assert!(q(&[("auto", "x")]).unwrap_err().contains("refine"));
+        // In the item only when set.
+        let v = serde_json::to_value(u(None, false, 0)).unwrap();
+        assert!(v.get("refine_open").is_none() && v.get("refine_strength").is_none());
+    }
+
+    #[test]
+    fn auto_refine_lists_live_suggestions_strongest_first_of_any_status() {
+        use super::super::bulk::test_support::put_frame;
+        use super::super::refine::Answer;
+        use super::super::{LabelBox, tests_support::auto_box, write};
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let (car, man, far) = (
+            [2.0, 2.0, 20.0, 20.0],
+            [30.0, 2.0, 40.0, 40.0],
+            [44.0, 30.0, 60.0, 46.0],
+        );
+        let at = |label: &str, bbox: [f32; 4]| LabelBox {
+            bbox,
+            state: BoxState::Accepted,
+            ..auto_box(label)
+        };
+        let put = |stem: &str, status: Status, s: Vec<super::super::refine::Suggestion>| {
+            let rel = put_frame(&dir, stem, None, vec![at("car", car), at("person", man)]);
+            let frame = Frame::resolve(&dir, &rel).unwrap();
+            let mut l = frame.labels().unwrap().unwrap();
+            l.status = status;
+            l.refine = s;
+            write(&frame.labels, &l).unwrap();
+            rel
+        };
+        // Names that the path alone would sort the other way round.
+        let verify = put(
+            "averify",
+            Status::Reviewed,
+            vec![refine_at(RefineKind::Verify, car, "", 0.9)],
+        );
+        let tighten = put(
+            "btighten",
+            Status::Unreviewed,
+            vec![
+                refine_at(RefineKind::Tighten, car, "", 0.6),
+                refine_at(RefineKind::Verify, man, "", 0.2),
+            ],
+        );
+        let add = put(
+            "cadd",
+            Status::Reviewed,
+            vec![
+                refine_at(RefineKind::Add, far, "dog", 0.7),
+                refine_at(RefineKind::Relabel, man, "dog", 0.95),
+            ],
+        );
+        let dismissed = put("ddismissed", Status::Reviewed, {
+            let mut s = refine_at(RefineKind::Add, far, "dog", 0.9);
+            s.answer = Some(Answer::Dismissed);
+            vec![s]
+        });
+        let stale = put(
+            "estale",
+            Status::Reviewed,
+            vec![refine_at(RefineKind::Verify, [1.0, 1.0, 2.0, 2.0], "", 0.9)],
+        );
+        let skipped = put(
+            "fskipped",
+            Status::Skipped,
+            vec![refine_at(RefineKind::Verify, car, "", 0.9)],
+        );
+        // A class no longer wanted: its add is not live, so the frame is not listed.
+        let hidden = put(
+            "ghidden",
+            Status::Reviewed,
+            vec![refine_at(RefineKind::Add, far, "cat", 0.9)],
+        );
+        let classes: Vec<String> = ["car", "person", "dog", "cat"].map(String::from).to_vec();
+        let mut f = Filters {
+            status: StatusFilter::Any,
+            auto: Some(AutoFilter::Refine),
+            wanted: Some((classes.clone(), vec!["CAT".to_string()])),
+            ..Filters::default()
+        };
+        let listed = |f: &Filters| -> Vec<(String, u32, u32)> {
+            build(&dir, f)
+                .items
+                .into_iter()
+                .map(|i| {
+                    (
+                        i.frame,
+                        i.uncertainty.refine_open,
+                        i.uncertainty.refine_strength,
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            listed(&f),
+            [
+                (add.clone(), 2, 4699),
+                (tighten.clone(), 2, 2599),
+                (verify.clone(), 1, 1899)
+            ],
+            "{dismissed} {stale} {skipped} {hidden}"
+        );
+        // Without the class list every label is wanted: the cat's add is live.
+        let mut plain = f.clone();
+        plain.wanted = None;
+        assert!(listed(&plain).iter().any(|(r, _, _)| *r == hidden));
+        assert!(
+            AutoFilter::Refine.matches(Some(
+                &Frame::resolve(&dir, &hidden)
+                    .unwrap()
+                    .labels()
+                    .unwrap()
+                    .unwrap()
+            ))
+        );
+        // One kind: only its suggestions count, for the filter, the order and the count.
+        f.refine_kind = Some(RefineKind::Verify);
+        assert_eq!(
+            listed(&f),
+            [(verify.clone(), 1, 1899), (tighten.clone(), 1, 1200)]
+        );
+        f.refine_kind = Some(RefineKind::Relabel);
+        assert_eq!(listed(&f), [(add.clone(), 1, 3949)]);
+        f.refine_kind = None;
+        f.status = StatusFilter::Is(Status::Unreviewed);
+        assert_eq!(listed(&f), [(tighten, 2, 2599)], "the status filter holds");
+        // Another queue shows no strength and no count.
+        let any = Filters {
+            status: StatusFilter::Any,
+            ..Filters::default()
+        };
+        assert!(
+            build(&dir, &any)
+                .items
+                .iter()
+                .all(|i| i.uncertainty.refine_open == 0 && i.uncertainty.refine_strength == 0)
+        );
+        assert!(!AutoFilter::Refine.matches(None), "no label file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rejected_duplicates_are_not_counted_as_hard_negatives() {
         use super::super::{RejectReason, tests_support::auto_box};
@@ -1884,9 +2184,12 @@ mod tests {
             if !f.auto_keeps(labels.as_ref()) {
                 continue;
             }
+            let (refine_open, refine_strength) = f.refine_open(labels.as_ref());
             let uncertainty = Uncertainty {
                 overlap_strength: f.overlap_strength(labels.as_ref()),
                 agreed_boxes: f.agreed_boxes(labels.as_ref()),
+                refine_strength,
+                refine_open,
                 ..Uncertainty::of(&rec).with_labels(labels.as_ref())
             };
             q.items.push(Item {

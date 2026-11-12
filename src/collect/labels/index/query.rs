@@ -52,6 +52,8 @@ struct Compiled {
     class: Vec<bool>,
     status: StatusFilter,
     auto: Option<AutoFilter>,
+    /// By refine summary: the live suggestions of the query's `refine_kind` and their strength.
+    refine: Vec<(u32, u32)>,
 }
 
 impl Compiled {
@@ -71,7 +73,23 @@ impl Compiled {
                 .collect(),
             status: f.status,
             auto: f.auto,
+            refine: if f.auto == Some(AutoFilter::Refine) {
+                names.refine_by_summary(f.refine_kind)
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    /// The live suggestions of `r` that the query counts, and the strongest one's strength:
+    /// [`Filters::refine_open`]. (0, 0) under any filter but `auto=refine`.
+    fn refine_of(&self, r: &Row) -> (u32, u32) {
+        r.part
+            .refine
+            .checked_sub(1)
+            .and_then(|id| self.refine.get(id as usize))
+            .copied()
+            .unwrap_or((0, 0))
     }
 
     /// In the candidates of the query's source.
@@ -104,7 +122,12 @@ impl Compiled {
         {
             return false;
         }
-        self.auto.is_none_or(|a| r.part.auto & auto_bit(a) != 0)
+        match self.auto {
+            // Of the query's kind: the summary, not a bit.
+            Some(AutoFilter::Refine) => self.refine_of(r).0 > 0,
+            Some(a) => r.part.auto & auto_bit(a) != 0,
+            None => true,
+        }
     }
 
     /// Whether the queue lists `r`.
@@ -119,8 +142,12 @@ impl Compiled {
 
     /// What sorts `r`. No note text: the sort only asks whether there is one.
     fn key(&self, r: &Row) -> SortKey {
-        r.uncertainty(self.auto, (r.part.note != 0).then(String::new))
-            .key()
+        r.uncertainty(
+            self.auto,
+            self.refine_of(r),
+            (r.part.note != 0).then(String::new),
+        )
+        .key()
     }
 }
 
@@ -278,7 +305,7 @@ fn pivot<'a>(state: &'a State, q: &Compiled, after: Option<&str>) -> Option<Hit<
     })
 }
 
-fn item(hit: &Hit<'_>, auto: Option<AutoFilter>, names: &Names) -> Item {
+fn item(hit: &Hit<'_>, q: &Compiled, names: &Names) -> Item {
     let r = hit.row;
     Item {
         frame: hit.shard.rel(r),
@@ -289,7 +316,11 @@ fn item(hit: &Hit<'_>, auto: Option<AutoFilter>, names: &Names) -> Item {
         buckets: names.buckets(r.cand.buckets).to_vec(),
         status: r.part.status,
         queued: r.queued,
-        uncertainty: r.uncertainty(auto, hit.shard.note(r).map(str::to_string)),
+        uncertainty: r.uncertainty(
+            q.auto,
+            q.refine_of(r),
+            hit.shard.note(r).map(str::to_string),
+        ),
     }
 }
 
@@ -350,7 +381,7 @@ pub(super) fn answer(
     } else {
         (first.0, 1, pivot.is_some())
     };
-    let found = hits.first().map(|h| item(h, f.auto, names));
+    let found = hits.first().map(|h| item(h, &q, names));
     let upcoming: Vec<String> = hits
         .iter()
         .skip(1)

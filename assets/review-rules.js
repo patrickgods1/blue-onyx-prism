@@ -2,7 +2,7 @@
 // go as duplicates and which suggestions stand, so what reaches the exports. Pure: no page, no
 // browser API, no state of its own; everything comes in as an argument. `tests/it/js_rules.rs` runs
 // this file in Node against its Rust twins (labels/stacks.rs, labels/overlaps.rs, labels/repeats.rs,
-// labels::resolve_pending), so a change here needs the same change there.
+// labels/refine.rs, labels::resolve_pending), so a change here needs the same change there.
 (function () {
   'use strict';
 
@@ -247,6 +247,356 @@
     if (labels.empty_confirmed) labels.empty_confirmed = false;
   }
 
+  // ---- The dataset check's suggestions (`labels.refine`; twin of labels/refine.rs) ----
+  //
+  // Unlike the rules above these compute as the server does, so the twins differ nowhere: numbers
+  // in f32 (`Math.fround` after every step, which gives exactly the f32 result
+  // of + - * /), labels trimmed of Unicode white space as Rust's `trim`, compared ignoring ASCII case
+  // only, and class names mapped onto the list with the COCO / VOC aliases (model/coco.rs). The
+  // class list and hidden classes come as the other rules take them (`classes`, `hidden`); a null
+  // `classes` means every label is wanted, compared as written.
+
+  var f32 = Math.fround;
+  var MATCH_IOU = 0.5, COVER_IOU = 0.3, COVER_INSIDE = 0.5;   // labels/mod.rs
+  var MAX_BOXES = 500, MAX_LABEL_LEN = 64, REFINE_REASON = 'refine';
+  var MATCH32 = f32(MATCH_IOU), COVER_IOU32 = f32(COVER_IOU), COVER_INSIDE32 = f32(COVER_INSIDE);
+  var OVERLAP32 = f32(OVERLAP_IOU), NESTED32 = f32(NESTED_SHARE);
+
+  // model/coco.rs COCO_NAMES and COCO_ALIASES.
+  var COCO_NAMES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog',
+    'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+    'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+    'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle',
+    'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
+    'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors',
+    'teddy bear', 'hair drier', 'toothbrush'
+  ];
+  var COCO_ALIASES = [
+    ['motorbike', 'motorcycle'], ['people', 'person'], ['pedestrian', 'person'], ['bike', 'bicycle'],
+    ['sofa', 'couch'], ['tvmonitor', 'tv'], ['aeroplane', 'airplane'],
+    ['pottedplant', 'potted plant'], ['diningtable', 'dining table']
+  ];
+
+  // Rust's `char::is_whitespace` (Unicode White_Space), which `str::trim` removes.
+  var WS = '[\\u0009-\\u000D\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]';
+  var TRIM = new RegExp('^' + WS + '+|' + WS + '+$', 'g');
+  function rtrim(s) { return String(s).replace(TRIM, ''); }
+  function asciiLower(s) { return String(s).replace(/[A-Z]/g, function (c) { return c.toLowerCase(); }); }
+  // `eq_ignore_ascii_case`.
+  function sameAscii(a, b) { return asciiLower(a) === asciiLower(b); }
+
+  // The COCO name of a class, aliases applied (model/coco.rs `coco_class`), or null.
+  function cocoClass(label) {
+    var l = String(label).toLowerCase();
+    COCO_ALIASES.some(function (a) { if (a[0] === l) { l = a[1]; return true; } return false; });
+    return COCO_NAMES.indexOf(l) >= 0 ? l : null;
+  }
+
+  function sameClass(a, b) {
+    var c = cocoClass(a);
+    return sameAscii(a, b) || (c !== null && cocoClass(b) === c);
+  }
+
+  // The class of `classes` a label is: the same name, else ignoring case, else through the aliases
+  // (model/coco.rs `map_label`); null when none.
+  function mapLabel(label, classes) {
+    var l = rtrim(label), i;
+    for (i = 0; i < classes.length; i++) if (classes[i] === l) return classes[i];
+    for (i = 0; i < classes.length; i++) if (sameAscii(classes[i], l)) return classes[i];
+    for (i = 0; i < classes.length; i++) if (sameClass(classes[i], l)) return classes[i];
+    return null;
+  }
+
+  // The wanted class a label is, in the list's spelling, null for an unwanted one
+  // (labels::wanted_class; `hidden` compared ignoring ASCII case).
+  function wantedClass(label, classes, hidden) {
+    var c = mapLabel(label, classes);
+    if (c === null) return null;
+    var t = rtrim(c);
+    return (hidden || []).some(function (h) { return sameAscii(h, t); }) ? null : c;
+  }
+
+  // refine.rs `class_of`: with a list, the wanted class; without, the trimmed label (null if blank).
+  function refineClassOf(label, classes, hidden) {
+    if (classes) return wantedClass(label, classes, hidden);
+    var t = rtrim(label);
+    return t ? t : null;
+  }
+
+  function boxClass(b, classes, hidden) {
+    var c = refineClassOf(b.label, classes, hidden);
+    return c === null ? rtrim(b.label) : c;
+  }
+
+  // Two class names of one object (refine.rs `one_object`).
+  function oneObject(a, b) { return sameObject(asciiLower(rtrim(a)), asciiLower(rtrim(b))); }
+
+  function sameLabel(a, b) { return sameAscii(rtrim(a), rtrim(b)); }
+
+  function box32(b) { return [f32(b[0]), f32(b[1]), f32(b[2]), f32(b[3])]; }
+
+  function area32(r) { return f32(Math.max(f32(r[2] - r[0]), 0) * Math.max(f32(r[3] - r[1]), 0)); }
+
+  // The overlap's width and height of two f32 boxes.
+  function overlap32(a, b) {
+    return [
+      Math.max(f32(Math.min(a[2], b[2]) - Math.max(a[0], b[0])), 0),
+      Math.max(f32(Math.min(a[3], b[3]) - Math.max(a[1], b[1])), 0)
+    ];
+  }
+
+  // labels::iou in f32.
+  function iou32(a, b) {
+    var A = box32(a), B = box32(b), o = overlap32(A, B);
+    var inter = f32(o[0] * o[1]);
+    var union = f32(f32(area32(A) + area32(B)) - inter);
+    return union > 0 ? f32(inter / union) : 0;
+  }
+
+  // labels::inside_share in f32.
+  function insideShare32(a, b) {
+    var A = box32(a), B = box32(b), o = overlap32(A, B);
+    var smaller = Math.min(area32(A), area32(B));
+    return smaller > 0 ? f32(f32(o[0] * o[1]) / smaller) : 0;
+  }
+
+  // labels::covers: box `b` covers the detection `p`.
+  function covers32(b, p) {
+    return iou32(b, p) >= COVER_IOU32 ||
+      (area32(box32(p)) <= area32(box32(b)) && insideShare32(p, b) >= COVER_INSIDE32);
+  }
+
+  function sameBbox32(a, b) {
+    return f32(a[0]) === f32(b[0]) && f32(a[1]) === f32(b[1]) && f32(a[2]) === f32(b[2]) && f32(a[3]) === f32(b[3]);
+  }
+
+  function isTraining(b) { return b.state === 'accepted' || b.state === 'added'; }
+
+  // LabelBox::is_ignore: unsure, or rejected as too small.
+  function isIgnore(b) { return !!b.difficult || (b.state === 'rejected' && b.reject_reason === 'too_small'); }
+
+  // labels::unjudged_reject: a reject no reviewer judged (a bulk low-score reject, a dismissal, a
+  // model hint the save default rejected).
+  function unjudgedReject(b) {
+    var reason = b.reason == null ? null : b.reason;
+    return b.state === 'rejected' && b.reject_reason == null &&
+      reason !== 'repeat_spot' && reason !== 'duplicate' &&
+      (reason === 'low_score' || isDismissal(reason) || (b.source === 'model' && b.origin !== 'prediction'));
+  }
+
+  function proper(b) {
+    return !!b && b.length === 4 && b.every(function (v) { return typeof v === 'number' && isFinite(v); }) &&
+      f32(b[2]) > f32(b[0]) && f32(b[3]) > f32(b[1]);
+  }
+
+  // Whether `b` is the box suggestion `s` names: its exact bbox, and its label when `s` has one.
+  function names(s, b) {
+    return s.target != null && sameBbox32(b.bbox, s.target) &&
+      (s.target_label == null || sameLabel(b.label, s.target_label));
+  }
+
+  // The first box `s` names that is a training box no reviewer drew and that `ok` takes; -1 if none.
+  function targetBox(f, s, ok) {
+    var bs = f.boxes || [];
+    for (var i = 0; i < bs.length; i++) {
+      var b = bs[i];
+      if (names(s, b) && isTraining(b) && b.source !== 'human' && ok(b)) return i;
+    }
+    return -1;
+  }
+
+  // Where an `add` goes: null when it is not live, else the rejects it replaces, closest first.
+  function addPlace(f, s, classes, hidden) {
+    if (!proper(s.bbox) || s.label == null) return null;
+    var cls = refineClassOf(s.label, classes, hidden);
+    if (cls === null) return null;
+    var bs = f.boxes || [], rep = [];
+    for (var i = 0; i < bs.length; i++) {
+      var b = bs[i];
+      if (!oneObject(boxClass(b, classes, hidden), cls)) continue;
+      if (b.state !== 'rejected' || isIgnore(b)) {
+        if (covers32(b.bbox, s.bbox)) return null;
+        continue;
+      }
+      var v = iou32(b.bbox, s.bbox);
+      if (v >= MATCH32) {
+        if (!unjudgedReject(b)) return null;
+        rep.push([i, v]);
+      }
+    }
+    if (!rep.length && bs.length >= MAX_BOXES) return null;
+    rep.sort(function (x, y) { return x[1] !== y[1] ? y[1] - x[1] : x[0] - y[0]; });
+    return rep.map(function (x) { return x[0]; });
+  }
+
+  // refine.rs `place`: null when `s` is not live, else {target, replaces} (target -1 for an add).
+  function refinePlace(f, s, classes, hidden) {
+    if (s.answer != null) return null;
+    var t;
+    switch (s.kind) {
+      case 'add': {
+        var r = addPlace(f, s, classes, hidden);
+        return r === null ? null : { target: -1, replaces: r };
+      }
+      case 'tighten':
+        if (!proper(s.bbox)) return null;
+        t = targetBox(f, s, function (b) { return b.orig_bbox == null && !sameBbox32(b.bbox, s.bbox); });
+        break;
+      case 'relabel': {
+        if (s.label == null) return null;
+        var to = refineClassOf(s.label, classes, hidden);
+        if (to === null) return null;
+        t = targetBox(f, s, function (b) {
+          return b.model_label == null && !oneObject(boxClass(b, classes, hidden), to);
+        });
+        break;
+      }
+      case 'verify':
+        t = targetBox(f, s, function (b) { return b.orig_bbox == null; });
+        break;
+      default:
+        return null;
+    }
+    return t < 0 ? null : { target: t, replaces: [] };
+  }
+
+  function orNull(v) { return v == null ? null : v; }
+  function copyBox(v) { return v == null ? null : v.slice(); }
+
+  // The suggestions of the dataset check on `labels` a reviewer can act on: none on a skipped
+  // frame, never an answered one or one of a kind this page does not know, never one whose box
+  // moved, went or changed so it no longer applies. Each {index (into labels.refine), kind,
+  // target, target_label, bbox, label, score, why, spot, run, target_box, replaces} (target_box:
+  // the index of the box `target` names, null for an add; replaces: the unjudged rejects an add
+  // takes the place of, closest first). Equal to `refine_live` of GET /v1/review/labels for the
+  // same file. Twin of labels/refine.rs `live`: keep the two in step.
+  function liveRefine(labels, classes, hidden) {
+    var list = labels && labels.refine;
+    if (!list || !list.length || labels.status === 'skipped') return [];
+    var out = [];
+    list.forEach(function (s, index) {
+      if (!s) return;
+      var p = refinePlace(labels, s, classes, hidden);
+      if (p === null) return;
+      out.push({
+        index: index,
+        kind: s.kind,
+        target: copyBox(s.target),
+        target_label: orNull(s.target_label),
+        bbox: copyBox(s.bbox),
+        label: orNull(s.label),
+        score: orNull(s.score),
+        why: s.why == null ? '' : s.why,
+        spot: orNull(s.spot),
+        run: s.run == null ? '' : s.run,
+        target_box: p.target < 0 ? null : p.target,
+        replaces: p.replaces
+      });
+    });
+    return out;
+  }
+
+  // How strong a suggestion is, higher first (labels/refine.rs `strength`): add 4, relabel 3,
+  // tighten 2, verify 1, times 1000, plus the score in thousandths; 0 when answered or unknown.
+  function refineStrength(s) {
+    var band = s.kind === 'add' ? 4 : s.kind === 'relabel' ? 3 : s.kind === 'tighten' ? 2 : s.kind === 'verify' ? 1 : 0;
+    if (!band || s.answer != null) return 0;
+    var v = (typeof s.score === 'number' && isFinite(s.score)) ? f32(s.score) : 0;
+    return band * 1000 + Math.round(Math.min(Math.max(v, 0), 1) * 999);
+  }
+
+  // Whether box `at` is in a stack or an open pair (labels/stacks.rs `groups` / `overlap_pairs`,
+  // refine.rs `in_open_pair`): it and another live box of one object at IoU >= OVERLAP_IOU, or the
+  // smaller >= NESTED_SHARE inside the larger. (A stack's link is such a pair too, and a pair in one
+  // stack is a stack, so this is the two rules together.)
+  function inOpenPair(bs, at, classes, hidden) {
+    var live = function (b) {
+      return b.state !== 'rejected' && (!classes || wantedClass(b.label, classes, hidden || []) !== null);
+    };
+    var a = bs[at];
+    if (!a || !live(a)) return false;
+    return bs.some(function (b, j) {
+      return j !== at && live(b) && sameObject(a.label, b.label) &&
+        (iou32(a.bbox, b.bbox) >= OVERLAP32 || insideShare32(a.bbox, b.bbox) >= NESTED32);
+    });
+  }
+
+  // labels::rename_to_class: the class list's spelling, the old label kept in `model_label`.
+  function renameToClass(b, cls) {
+    if (cls === b.label) return;
+    if (b.model_label == null && !sameAscii(cls, rtrim(b.label))) {
+      b.model_label = Array.from(String(b.label)).slice(0, MAX_LABEL_LEN).join('');
+    }
+    b.label = cls;
+  }
+
+  // The reviewer's yes to suggestion `index` of `labels` (the file as the page holds it); false,
+  // changing nothing, when it is not live. add: a new accepted `auto` box (the class in the list's
+  // spelling, reason 'refine') in the place of the first box of `replaces`, the others removed, the
+  // frame no longer confirmed empty; tighten: `orig_bbox` keeps the old box, `bbox` the proposal
+  // (unclamped: the save clamps); relabel: the new class, the old one in `model_label`. Those three
+  // remove the suggestion (later indices move down by one) and end `overlaps_checked` when the box
+  // is now in a stack or an open pair. verify: answered 'kept', it stays. Page flags (`_checked`,
+  // `_relabelled`) are the caller's. Twin of labels/refine.rs `accept`: keep the two in step.
+  function acceptRefine(labels, index, classes, hidden) {
+    var l = liveRefine(labels, classes, hidden).filter(function (x) { return x.index === index; })[0];
+    if (!l) return false;
+    var s = labels.refine[index], bs = labels.boxes, at = l.target_box, b;
+    switch (s.kind) {
+      case 'add': {
+        var cls = refineClassOf(s.label, classes, hidden);
+        if (cls === null) return false;
+        var nb = { label: cls, bbox: s.bbox.slice(), source: 'auto', state: 'accepted', reason: REFINE_REASON };
+        if (s.score != null) nb.score = s.score;
+        if (l.replaces.length) {
+          at = l.replaces[0];
+          bs[at] = nb;
+        } else {
+          bs.push(nb);
+          at = bs.length - 1;
+        }
+        var gone = l.replaces.slice(1).sort(function (x, y) { return y - x; });
+        gone.forEach(function (g) { bs.splice(g, 1); });
+        at -= gone.filter(function (g) { return g < at; }).length;
+        labels.empty_confirmed = false;
+        break;
+      }
+      case 'tighten':
+        b = bs[at];
+        if (b.orig_bbox == null) b.orig_bbox = b.bbox.slice();
+        b.bbox = s.bbox.slice();
+        break;
+      case 'relabel': {
+        var to = refineClassOf(s.label, classes, hidden);
+        if (to === null) return false;
+        renameToClass(bs[at], to);
+        break;
+      }
+      case 'verify':
+        s.answer = 'kept';
+        return true;
+      default:
+        return false;
+    }
+    if (labels.overlaps_checked && inOpenPair(bs, at, classes, hidden)) labels.overlaps_checked = false;
+    labels.refine.splice(index, 1);
+    return true;
+  }
+
+  // The reviewer's no to suggestion `index`: answered 'dismissed', so a rerun does not ask again;
+  // no box changes. False when there is no such suggestion or it is answered already. Twin of
+  // labels/refine.rs `dismiss`.
+  function dismissRefine(labels, index) {
+    var s = labels && labels.refine && labels.refine[index];
+    if (!s || s.answer != null) return false;
+    s.answer = 'dismissed';
+    return true;
+  }
+
   // What a new call of the page's `loadNext` does while `running` ('real', 'counts' or null) and
   // `waiting` (the same, or null) stand; `want` is 'real' or 'counts'. GET /v1/review/next walks the
   // whole folder, seconds on a big one, so at most one real walk runs and the newest intent wins:
@@ -296,6 +646,19 @@
     markRejected: markRejected,
     markDuplicate: markDuplicate,
     acceptOverlap: acceptOverlap,
+    MATCH_IOU: MATCH_IOU,
+    COVER_IOU: COVER_IOU,
+    COVER_INSIDE: COVER_INSIDE,
+    MAX_BOXES: MAX_BOXES,
+    MAX_LABEL_LEN: MAX_LABEL_LEN,
+    REFINE_REASON: REFINE_REASON,
+    COCO_NAMES: COCO_NAMES,
+    COCO_ALIASES: COCO_ALIASES,
+    wantedClass: wantedClass,
+    liveRefine: liveRefine,
+    refineStrength: refineStrength,
+    acceptRefine: acceptRefine,
+    dismissRefine: dismissRefine,
     nextPlan: nextPlan,
     nextLanding: nextLanding
   };

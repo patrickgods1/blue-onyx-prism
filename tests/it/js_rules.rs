@@ -13,9 +13,10 @@
 use blue_onyx_prism::collect::labels::bulk::Wanted;
 use blue_onyx_prism::collect::labels::overlaps::{self, Suggestion, Verdict};
 use blue_onyx_prism::collect::labels::{
-    AutoInfo, BoxState, LabelBox, LabelFile, Origin, ParkedMark, RejectReason, Source, Status,
-    Triage, repeats, resolve_pending, spots, stacks,
+    self, AutoInfo, BoxState, LabelBox, LabelFile, Origin, ParkedMark, RejectReason, Source,
+    Status, Triage, refine, repeats, resolve_pending, spots, stacks,
 };
+use blue_onyx_prism::model::coco;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1060,6 +1061,578 @@ process.stdout.write(JSON.stringify(
     let got = node_with(driver, &json!(request));
     let want: Vec<&str> = table.iter().map(|t| t.3).collect();
     assert_eq!(got, json!(want));
+}
+
+/// The dataset check's twins on one frame each: `liveRefine`, `refineStrength`, `acceptRefine` of
+/// every live suggestion (with what is live after it), `acceptRefine` of every other index, and
+/// `dismissRefine` of every index and one past the end. `process.argv` as [`DRIVER`].
+const REFINE_DRIVER: &str = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const clone = (v) => JSON.parse(JSON.stringify(v));
+const out = req.cases.map((c) => {
+  const classes = c.wanted ? req.classes : null;
+  const hidden = c.wanted ? req.hidden : null;
+  const labels = c.labels;
+  const list = labels.refine || [];
+  const live = R.liveRefine(labels, classes, hidden);
+  const accepted = live.map((l) => {
+    const copy = clone(labels);
+    const ok = R.acceptRefine(copy, l.index, classes, hidden);
+    return { index: l.index, ok: ok, labels: copy, after: R.liveRefine(copy, classes, hidden) };
+  });
+  const refused = list.map((_, i) => i).filter((i) => !live.some((l) => l.index === i)).map((i) => {
+    const copy = clone(labels);
+    const ok = R.acceptRefine(copy, i, classes, hidden);
+    return ok || JSON.stringify(copy) !== JSON.stringify(labels);
+  });
+  const dismissed = list.concat([null]).map((_, i) => {
+    const copy = clone(labels);
+    const ok = R.dismissRefine(copy, i);
+    return { ok: ok, labels: copy };
+  });
+  return {
+    live: live,
+    strengths: list.map(R.refineStrength),
+    accepted: accepted,
+    refused: refused,
+    dismissed: dismissed,
+  };
+});
+console.log(JSON.stringify({
+  constants: {
+    MATCH_IOU: R.MATCH_IOU,
+    COVER_IOU: R.COVER_IOU,
+    COVER_INSIDE: R.COVER_INSIDE,
+    MAX_BOXES: R.MAX_BOXES,
+    MAX_LABEL_LEN: R.MAX_LABEL_LEN,
+    REFINE_REASON: R.REFINE_REASON,
+    COCO_NAMES: R.COCO_NAMES,
+    COCO_ALIASES: R.COCO_ALIASES,
+  },
+  cases: out,
+}));
+"#;
+
+/// One entry of `refine_live` (`GET /v1/review/labels`) and of `liveRefine`, numbers as the f32
+/// they are in the file.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+struct RefineLive {
+    index: usize,
+    kind: String,
+    target: Option<[f32; 4]>,
+    target_label: Option<String>,
+    bbox: Option<[f32; 4]>,
+    label: Option<String>,
+    score: Option<f32>,
+    why: String,
+    spot: Option<String>,
+    run: String,
+    target_box: Option<usize>,
+    replaces: Vec<usize>,
+}
+
+/// [`refine::live`] as the route serves it (`server::review::refine_live`, field for field).
+fn rust_refine_live(f: &LabelFile, w: Option<&Wanted<'_>>) -> Vec<RefineLive> {
+    refine::live(f, w)
+        .iter()
+        .map(|l| {
+            let s = l.suggestion;
+            RefineLive {
+                index: l.index,
+                kind: s.kind.as_str().to_string(),
+                target: s.target,
+                target_label: s.target_label.clone(),
+                bbox: s.bbox,
+                label: s.label.clone(),
+                score: s.score,
+                why: s.why.clone(),
+                spot: s.spot.clone(),
+                run: s.run.clone(),
+                target_box: l.target,
+                replaces: l.replaces.clone(),
+            }
+        })
+        .collect()
+}
+
+fn js_refine_live(v: &Value) -> Vec<RefineLive> {
+    serde_json::from_value(v.clone()).unwrap()
+}
+
+const REFINE_CLASSES: [&str; 9] = [
+    "person",
+    "car",
+    "truck",
+    "bus",
+    "van",
+    "dog",
+    "cat",
+    "motorcycle",
+    "potted plant",
+];
+
+/// Box labels: the list's spellings, other cases, white space, aliases, a hidden class, a class of
+/// no list.
+const REFINE_LABELS: [&str; 16] = [
+    "car",
+    "car",
+    "Car",
+    " truck",
+    "bus",
+    "van",
+    "person",
+    "person",
+    "PERSON",
+    "dog",
+    "cat",
+    "motorbike",
+    "motorcycle",
+    "pottedplant",
+    "clock",
+    "dog\u{2003}",
+];
+
+fn refine_box(r: &mut Rng, bbox: [f32; 4], label: &str) -> LabelBox {
+    let mut b = fresh_box(r, bbox, label);
+    if b.state == BoxState::Rejected {
+        // Every kind of reject: unjudged ones a found object may replace, judged ones that block
+        // the place, ignore regions that cover it.
+        b.reason = r
+            .pick(&[
+                None,
+                Some("low_score"),
+                Some("low_score"),
+                Some("auto_dismissed"),
+                Some("spot_dismissed"),
+                Some("duplicate"),
+                Some("repeat_spot"),
+                Some("night_threshold"),
+            ])
+            .map(String::from);
+        b.reject_reason = match r.below(6) {
+            3 => Some(RejectReason::TooSmall),
+            4 => Some(RejectReason::FalsePositive),
+            5 => Some(RejectReason::Duplicate),
+            _ => None,
+        };
+    }
+    b
+}
+
+/// `label` as a check may have written the target's label: as is, in another case, padded.
+fn respelled(r: &mut Rng, label: &str) -> String {
+    match r.below(3) {
+        0 => label.to_string(),
+        1 => label.to_ascii_uppercase(),
+        _ => format!(" {label} "),
+    }
+}
+
+fn refine_suggestion(r: &mut Rng, boxes: &[LabelBox]) -> refine::Suggestion {
+    let kind = r.pick(&[
+        refine::Kind::Add,
+        refine::Kind::Add,
+        refine::Kind::Add,
+        refine::Kind::Tighten,
+        refine::Kind::Tighten,
+        refine::Kind::Relabel,
+        refine::Kind::Relabel,
+        refine::Kind::Verify,
+        refine::Kind::Verify,
+        refine::Kind::Unknown,
+    ]);
+    let rejected: Vec<&LabelBox> = boxes
+        .iter()
+        .filter(|b| b.state == BoxState::Rejected)
+        .collect();
+    // An add mostly where a box was rejected: a place it may take, or one a reviewer judged.
+    let on = if kind == refine::Kind::Add && !rejected.is_empty() && r.chance(60) {
+        Some(rejected[r.below(rejected.len())].clone())
+    } else {
+        (!boxes.is_empty() && r.chance(85)).then(|| boxes[r.below(boxes.len())].clone())
+    };
+    let target = on.as_ref().map_or_else(|| fresh_bbox(r), |b| b.bbox);
+    let target_label = match (&on, r.below(10)) {
+        (Some(b), 0..=3) => Some(respelled(r, &b.label)),
+        (_, 4) => Some(r.pick(&REFINE_LABELS).to_string()),
+        _ => None,
+    };
+    let add = kind == refine::Kind::Add;
+    refine::Suggestion {
+        kind,
+        target: (!add).then_some(target),
+        target_label: if add { None } else { target_label },
+        bbox: match kind {
+            refine::Kind::Add | refine::Kind::Tighten | refine::Kind::Unknown => {
+                Some(bbox_near(r, target))
+            }
+            _ => None,
+        },
+        label: match (kind, &on) {
+            (refine::Kind::Add, Some(b)) if r.chance(60) => Some(respelled(r, &b.label)),
+            (refine::Kind::Add | refine::Kind::Relabel, _) => {
+                Some(r.pick(&REFINE_LABELS).to_string())
+            }
+            _ => None,
+        },
+        score: r.chance(85).then(|| tenth(r.range(0.0, 1.0))),
+        why: "generated".to_string(),
+        spot: r.chance(20).then(|| "gate:12".to_string()),
+        answer: r
+            .chance(12)
+            .then(|| r.pick(&[refine::Answer::Dismissed, refine::Answer::Kept])),
+        run: "r1".to_string(),
+    }
+}
+
+fn refine_frame(r: &mut Rng) -> LabelFile {
+    let n = r.below(8);
+    let mut boxes: Vec<LabelBox> = Vec::with_capacity(n + 1);
+    for _ in 0..n {
+        let near = (!boxes.is_empty() && r.chance(70)).then(|| boxes[r.below(boxes.len())].clone());
+        let (bbox, label) = match &near {
+            Some(b) => {
+                let label = if r.chance(60) {
+                    b.label.clone()
+                } else {
+                    r.pick(&REFINE_LABELS).to_string()
+                };
+                (bbox_near(r, b.bbox), label)
+            }
+            None => (fresh_bbox(r), r.pick(&REFINE_LABELS).to_string()),
+        };
+        boxes.push(refine_box(r, bbox, &label));
+    }
+    // Rejects no reviewer judged, stacked on one object: an add takes the closest one's place.
+    if r.chance(30) {
+        let base = fresh_bbox(r);
+        let label = r.pick(&["car", "person", "dog", "truck"]);
+        for _ in 0..2 + r.below(2) {
+            let bbox = bbox_near(r, base);
+            let mut b = refine_box(r, bbox, label);
+            b.state = BoxState::Rejected;
+            b.reject_reason = None;
+            b.reason = Some(r.pick(&["low_score", "auto_dismissed"]).to_string());
+            let at = r.below(boxes.len() + 1);
+            boxes.insert(at, b);
+        }
+    }
+    // Two boxes of different objects at one position: only `target_label` tells them apart.
+    if !boxes.is_empty() && r.chance(20) {
+        let mut twin = boxes[r.below(boxes.len())].clone();
+        twin.label = r.pick(&["dog", "person", "truck"]).to_string();
+        twin.state = BoxState::Accepted;
+        twin.source = Source::Auto;
+        twin.orig_bbox = None;
+        twin.model_label = None;
+        let at = r.below(boxes.len() + 1);
+        boxes.insert(at, twin);
+    }
+    let refine: Vec<refine::Suggestion> = (0..1 + r.below(5))
+        .map(|_| refine_suggestion(r, &boxes))
+        .collect();
+    LabelFile {
+        status: r.pick(&[
+            Status::Reviewed,
+            Status::Reviewed,
+            Status::Reviewed,
+            Status::Unreviewed,
+            Status::Skipped,
+        ]),
+        empty_confirmed: r.chance(25),
+        overlaps_checked: r.chance(40),
+        boxes,
+        refine,
+        ..LabelFile::default()
+    }
+}
+
+/// A frame at [`MAX_BOXES`](blue_onyx_prism::collect::labels::MAX_BOXES): an add has no room
+/// unless it takes a reject's place.
+fn full_frame(with_reject: bool) -> LabelFile {
+    let tiny = |i: usize| {
+        let x = f32::from(u16::try_from(i % 40).unwrap()) * 10.0;
+        let y = f32::from(u16::try_from(i / 40).unwrap()) * 10.0;
+        LabelBox {
+            label: "person".to_string(),
+            bbox: [x, y, x + 5.0, y + 5.0],
+            source: Source::Auto,
+            score: Some(0.5),
+            state: BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: AutoInfo::default(),
+        }
+    };
+    let mut boxes: Vec<LabelBox> = (0..blue_onyx_prism::collect::labels::MAX_BOXES)
+        .map(tiny)
+        .collect();
+    let car = [600.0, 600.0, 700.0, 680.0];
+    if with_reject {
+        boxes[0] = LabelBox {
+            label: "car".to_string(),
+            bbox: car,
+            state: BoxState::Rejected,
+            reason: Some("low_score".to_string()),
+            ..tiny(0)
+        };
+    }
+    LabelFile {
+        status: Status::Reviewed,
+        boxes,
+        refine: vec![refine::Suggestion {
+            kind: refine::Kind::Add,
+            target: None,
+            target_label: None,
+            bbox: Some([601.0, 600.0, 700.0, 680.0]),
+            label: Some("car".to_string()),
+            score: Some(0.9),
+            why: String::new(),
+            spot: None,
+            answer: None,
+            run: String::new(),
+        }],
+        ..LabelFile::default()
+    }
+}
+
+#[test]
+fn the_refine_rules_agree_with_their_rust_twins() {
+    if !have_node() {
+        return;
+    }
+    let classes: Vec<String> = REFINE_CLASSES.map(String::from).to_vec();
+    let hidden: Vec<String> = vec!["CAT".to_string()];
+    let w = Wanted {
+        classes: &classes,
+        hidden: &hidden,
+    };
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut cases: Vec<(LabelFile, bool)> = (0..3000)
+        .map(|_| {
+            let f = refine_frame(&mut rng);
+            let wanted = rng.chance(80);
+            (f, wanted)
+        })
+        .collect();
+    cases.push((full_frame(false), true));
+    cases.push((full_frame(true), true));
+    let request: Vec<Value> = cases
+        .iter()
+        .map(|(f, wanted)| json!({"labels": f, "wanted": wanted}))
+        .collect();
+    let answer = node_with(
+        REFINE_DRIVER,
+        &json!({"classes": classes, "hidden": hidden, "cases": request}),
+    );
+    let answers = answer["cases"].as_array().unwrap();
+    assert_eq!(answers.len(), cases.len());
+
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (n, ((f, wanted), a)) in cases.iter().zip(answers).enumerate() {
+        let w = wanted.then_some(&w);
+        let live = rust_refine_live(f, w);
+        assert_eq!(js_refine_live(&a["live"]), live, "frame {n}: live {f:?}");
+        let strengths: Vec<u32> = f.refine.iter().map(refine::strength).collect();
+        assert_eq!(
+            a["strengths"],
+            json!(strengths),
+            "frame {n}: strengths {:?}",
+            f.refine
+        );
+
+        for (accepted, l) in a["accepted"].as_array().unwrap().iter().zip(&live) {
+            let mut mine = f.clone();
+            assert!(refine::accept(&mut mine, l.index, w), "frame {n}");
+            assert_eq!(accepted["ok"], true, "frame {n}: accepting {}", l.index);
+            assert_eq!(
+                file_of(&accepted["labels"]),
+                mine,
+                "frame {n}: accepting {} ({}) of {f:?}",
+                l.index,
+                l.kind
+            );
+            assert_eq!(
+                js_refine_live(&accepted["after"]),
+                rust_refine_live(&mine, w),
+                "frame {n}: left after accepting {}",
+                l.index
+            );
+            *seen
+                .entry(match l.kind.as_str() {
+                    "add" => "add accepted",
+                    "tighten" => "tighten accepted",
+                    "relabel" => "relabel accepted",
+                    _ => "verify kept",
+                })
+                .or_default() += 1;
+            if l.replaces.len() >= 2 {
+                *seen.entry("add replaces two or more").or_default() += 1;
+            } else if l.replaces.len() == 1 {
+                *seen.entry("add replaces one").or_default() += 1;
+            }
+            if f.overlaps_checked && !mine.overlaps_checked {
+                *seen.entry("overlaps_checked ended").or_default() += 1;
+            }
+            if f.overlaps_checked && mine.overlaps_checked && l.kind != "verify" {
+                *seen.entry("overlaps_checked kept").or_default() += 1;
+            }
+            if f.empty_confirmed && l.kind == "add" {
+                *seen.entry("empty_confirmed ended").or_default() += 1;
+            }
+            if l.kind == "relabel"
+                && l.label.as_deref() != Some(mine.boxes[l.target_box.unwrap()].label.as_str())
+            {
+                *seen.entry("relabel to the list's spelling").or_default() += 1;
+            }
+            if l.index + 1 < f.refine.len() && l.kind != "verify" {
+                *seen.entry("indices shift after an accept").or_default() += 1;
+            }
+        }
+        assert_eq!(
+            a["accepted"].as_array().unwrap().len(),
+            live.len(),
+            "frame {n}"
+        );
+        // Every other index: refused, nothing changed, as in Rust.
+        let refused: Vec<usize> = (0..f.refine.len())
+            .filter(|i| !live.iter().any(|l| l.index == *i))
+            .collect();
+        for i in &refused {
+            let mut mine = f.clone();
+            assert!(!refine::accept(&mut mine, *i, w), "frame {n}: {i}");
+            assert_eq!(&mine, f);
+        }
+        assert_eq!(
+            a["refused"],
+            json!(vec![false; refused.len()]),
+            "frame {n}: an accept of a suggestion that is not live"
+        );
+        if !refused.is_empty() {
+            *seen.entry("not live").or_default() += 1;
+        }
+        for (i, d) in a["dismissed"].as_array().unwrap().iter().enumerate() {
+            let mut mine = f.clone();
+            let ok = refine::dismiss(&mut mine, i);
+            assert_eq!(d["ok"], ok, "frame {n}: dismissing {i}");
+            assert_eq!(file_of(&d["labels"]), mine, "frame {n}: dismissing {i}");
+            if ok {
+                *seen.entry("dismissed").or_default() += 1;
+            }
+        }
+
+        // What the frames reached.
+        for (key, hit) in [
+            ("live", !live.is_empty()),
+            (
+                "skipped",
+                f.status == Status::Skipped && !f.refine.is_empty(),
+            ),
+            ("no class list", w.is_none() && !live.is_empty()),
+            (
+                "answered",
+                f.refine.iter().any(refine::Suggestion::answered),
+            ),
+            (
+                "unknown kind",
+                f.refine.iter().any(|s| s.kind == refine::Kind::Unknown),
+            ),
+            (
+                "a target_label picks the second box",
+                live.iter().any(|l| {
+                    l.target_box
+                        .is_some_and(|t| f.boxes[..t].iter().any(|b| Some(b.bbox) == l.target))
+                }),
+            ),
+            (
+                "an alias or another spelling",
+                live.iter().any(|l| {
+                    l.label.as_deref().is_some_and(|x| {
+                        [
+                            "Car",
+                            " truck",
+                            "PERSON",
+                            "motorbike",
+                            "pottedplant",
+                            "dog\u{2003}",
+                        ]
+                        .contains(&x)
+                    })
+                }),
+            ),
+        ] {
+            if hit {
+                *seen.entry(key).or_default() += 1;
+            }
+        }
+        // A hidden class or one of no list is never live with the list, and live without one.
+        if w.is_some()
+            && f.refine.iter().any(|s| {
+                !s.answered()
+                    && s.kind == refine::Kind::Add
+                    && s.label
+                        .as_deref()
+                        .is_some_and(|l| ["cat", "clock"].contains(&l))
+            })
+        {
+            *seen.entry("an add of an unwanted class").or_default() += 1;
+        }
+    }
+    // The fixed frames at the box cap: no room, then a reject's place.
+    let full = &answers[cases.len() - 2];
+    assert_eq!(full["live"], json!([]));
+    let full = &answers[cases.len() - 1];
+    assert_eq!(full["live"][0]["replaces"], json!([0]));
+    println!("{seen:?}");
+    for (key, least) in [
+        ("live", 800),
+        ("add accepted", 150),
+        ("tighten accepted", 100),
+        ("relabel accepted", 100),
+        ("verify kept", 100),
+        ("add replaces one", 20),
+        ("add replaces two or more", 5),
+        ("overlaps_checked ended", 20),
+        ("overlaps_checked kept", 50),
+        ("empty_confirmed ended", 30),
+        ("relabel to the list's spelling", 20),
+        ("indices shift after an accept", 100),
+        ("not live", 500),
+        ("dismissed", 1000),
+        ("skipped", 100),
+        ("no class list", 100),
+        ("answered", 200),
+        ("unknown kind", 100),
+        ("a target_label picks the second box", 5),
+        ("an alias or another spelling", 100),
+        ("an add of an unwanted class", 50),
+    ] {
+        let n = seen.get(key).copied().unwrap_or(0);
+        assert!(n >= least, "the generator reached \"{key}\" only {n} times");
+    }
+
+    // The constants are the Rust ones.
+    let got = &answer["constants"];
+    for (name, v) in [
+        ("MATCH_IOU", labels::MATCH_IOU),
+        ("COVER_IOU", labels::COVER_IOU),
+        ("COVER_INSIDE", labels::COVER_INSIDE),
+    ] {
+        assert_eq!(got[name].to_string(), v.to_string(), "{name}");
+    }
+    assert_eq!(got["MAX_BOXES"], json!(labels::MAX_BOXES));
+    assert_eq!(got["MAX_LABEL_LEN"], json!(labels::MAX_LABEL_LEN));
+    assert_eq!(got["REFINE_REASON"], json!(refine::REFINE_REASON));
+    assert_eq!(got["COCO_NAMES"], json!(coco::COCO_NAMES.to_vec()));
+    let aliases: Vec<[&str; 2]> = coco::COCO_ALIASES.iter().map(|(a, c)| [*a, *c]).collect();
+    assert_eq!(got["COCO_ALIASES"], json!(aliases));
 }
 
 /// Needs no `node`: the page loads the rules first, and they stay pure.

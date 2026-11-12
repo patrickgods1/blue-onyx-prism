@@ -1,7 +1,8 @@
 //! The index's rows: what [`super::super::queue::build`] reads of one frame, in about 80 bytes
 //! plus its text. Names, bucket lists and class sets are interned ([`Names`]), text sits in its day
-//! shard's arena ([`Shard`]), and box geometry is not kept: `auto=overlaps` and `auto=both` are
-//! worked out with the real functions when a row is encoded, for the index's wanted classes.
+//! shard's arena ([`Shard`]), and box geometry is not kept: `auto=overlaps`, `auto=both` and
+//! `auto=refine` (per `refine_kind`, [`Names::refine`]) are worked out with the real functions
+//! when a row is encoded, for the index's wanted classes.
 //!
 //! A row has three parts because they change apart: [`Cand`] comes from the review line or index
 //! line, [`Side`] from the sidecar, [`Part`] from the label file. Encoding goes through the real
@@ -15,6 +16,7 @@
 use super::super::super::layout::{self, Walker};
 use super::super::super::record::{Bucket, Record};
 use super::super::queue::{self, AutoFilter, Candidate, Filters, Uncertainty};
+use super::super::refine::Kind as RefineKind;
 use super::super::{Frame, LabelBox, LabelFile, MAX_LABEL_FILE_BYTES, MAX_SIDECAR_BYTES, Status};
 use crate::sync::RwLockExt as _;
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +37,32 @@ const _: () = assert!(MAX_SIDECAR_BYTES <= u32::MAX as u64);
 fn box_count(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
+
+/// Fewest bytes a suggestion of the dataset check takes in a label file (`{"kind":"add"},`): with
+/// it, a label file at its size cap holds fewer suggestions than a `u16` counts.
+const MIN_SUGGESTION_JSON_BYTES: u64 = 15;
+const _: () = assert!(MAX_LABEL_FILE_BYTES / MIN_SUGGESTION_JSON_BYTES <= u16::MAX as u64);
+/// The strongest a suggestion can be: [`super::super::overlaps::strength`] has bands under 8,
+/// [`super::super::refine::strength`] under 5, each times 1000 plus at most 999. So a frame
+/// strength fits a `u16`.
+const MAX_STRENGTH: u32 = 7 * 1000 + 999;
+const _: () = assert!(MAX_STRENGTH <= u16::MAX as u32);
+
+/// A strength ([`MAX_STRENGTH`]) or a count of suggestions ([`MIN_SUGGESTION_JSON_BYTES`]) of one
+/// label file, which fits.
+fn small(n: u32) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// The kinds `auto=refine` narrows to, each with its place in a frame's refine summary
+/// ([`Names::refine`]); None = every kind.
+const REFINE_KINDS: [Option<RefineKind>; 5] = [
+    None,
+    Some(RefineKind::Add),
+    Some(RefineKind::Tighten),
+    Some(RefineKind::Relabel),
+    Some(RefineKind::Verify),
+];
 
 /// The auto filters, each with its bit in [`Part::auto`].
 const AUTOS: [AutoFilter; 8] = [
@@ -126,6 +154,9 @@ pub(super) struct Names {
     classes: Table<[Name]>,
     /// The training boxes of a frame, per class with their count.
     training: Table<[(Name, u32)]>,
+    /// What `auto=refine` reads of a frame: per entry of [`REFINE_KINDS`], its live suggestions and
+    /// the strongest one's strength ([`queue::refine_open`]). Empty: none live, the common case.
+    refine: Table<[(u16, u16)]>,
 }
 
 impl Names {
@@ -165,8 +196,25 @@ impl Names {
         self.training.get(id).unwrap_or_default()
     }
 
+    /// Per refine summary id ([`Part::refine`] minus one): the live suggestions of `kind` (None =
+    /// every kind) and the strongest one's strength, as [`Filters::refine_open`] counts them.
+    pub(super) fn refine_by_summary(&self, kind: Option<RefineKind>) -> Vec<(u32, u32)> {
+        let at = REFINE_KINDS.iter().position(|k| *k == kind);
+        self.refine
+            .iter()
+            .map(|summary| {
+                at.and_then(|at| summary.get(at))
+                    .map_or((0, 0), |&(n, s)| (u32::from(n), u32::from(s)))
+            })
+            .collect()
+    }
+
     pub(super) fn bytes(&self) -> usize {
-        self.names.bytes() + self.buckets.bytes() + self.classes.bytes() + self.training.bytes()
+        self.names.bytes()
+            + self.buckets.bytes()
+            + self.classes.bytes()
+            + self.training.bytes()
+            + self.refine.bytes()
     }
 }
 
@@ -199,10 +247,14 @@ pub(super) struct Part {
     /// The frame's classes, of its label file. Meaningless without `has_file`.
     pub classes: u32,
     pub training: u32,
-    /// [`super::super::overlaps::frame_strength`] for the index's wanted classes.
-    pub strength: u32,
     /// [`Shard::note`]'s number plus one, 0 = no re-label note.
     pub note: u32,
+    /// The id of the frame's refine summary ([`Names::refine`]) plus one, 0 = no live suggestion
+    /// of the dataset check.
+    pub refine: u32,
+    /// [`super::super::overlaps::frame_strength`] for the index's wanted classes
+    /// ([`MAX_STRENGTH`]).
+    pub strength: u16,
     pub auto_review: u16,
     pub likely: u16,
     /// Agreed boxes for the index's wanted classes.
@@ -224,8 +276,9 @@ impl Default for Part {
         Self {
             classes: 0,
             training: 0,
-            strength: 0,
             note: 0,
+            refine: 0,
+            strength: 0,
             auto_review: 0,
             likely: 0,
             agreed: 0,
@@ -280,13 +333,20 @@ impl Row {
         self.gone || !self.side.ok
     }
 
-    /// The uncertainty of the row. `relabel` is the note's text; a caller that only sorts passes
-    /// `Some(String::new())` when there is a note: the sort only asks whether there is one.
+    /// The uncertainty of the row. `refine` is the row's live suggestions and their strength for
+    /// the query's `refine_kind` (looked up by the caller in [`Names::refine_by_summary`]).
+    /// `relabel` is the note's text; a caller that only sorts passes `Some(String::new())` when
+    /// there is a note: the sort only asks whether there is one.
     pub(super) fn uncertainty(
         &self,
         auto: Option<AutoFilter>,
+        refine: (u32, u32),
         relabel: Option<String>,
     ) -> Uncertainty {
+        let (refine_open, refine_strength) = match auto {
+            Some(AutoFilter::Refine) => refine,
+            _ => (0, 0),
+        };
         Uncertainty {
             margin: self.side.has_margin.then_some(self.side.margin),
             disagreement: self.side.disagreement,
@@ -296,13 +356,15 @@ impl Row {
             likely_boxes: u32::from(self.part.likely),
             repeats_only: self.part.auto & auto_bit(AutoFilter::Repeats) != 0,
             overlap_strength: match auto {
-                Some(AutoFilter::Overlaps) => self.part.strength,
+                Some(AutoFilter::Overlaps) => u32::from(self.part.strength),
                 _ => 0,
             },
             agreed_boxes: match auto {
                 Some(AutoFilter::Both) => u32::from(self.part.agreed),
                 _ => 0,
             },
+            refine_strength,
+            refine_open,
         }
     }
 }
@@ -470,18 +532,23 @@ impl Shard {
 pub(super) struct Derive {
     /// One filter per auto filter, in [`AUTOS`]' order, with the index's wanted classes.
     filters: Vec<Filters>,
+    /// `auto=refine` once per entry of [`REFINE_KINDS`], with the index's wanted classes.
+    refine: Vec<Filters>,
 }
 
 impl Derive {
     pub(super) fn new(wanted: Option<&(Vec<String>, Vec<String>)>) -> Self {
+        let with = |auto: AutoFilter, refine_kind: Option<RefineKind>| Filters {
+            auto: Some(auto),
+            wanted: wanted.cloned(),
+            refine_kind,
+            ..Filters::default()
+        };
         Self {
-            filters: AUTOS
+            filters: AUTOS.iter().map(|a| with(*a, None)).collect(),
+            refine: REFINE_KINDS
                 .iter()
-                .map(|a| Filters {
-                    auto: Some(*a),
-                    wanted: wanted.cloned(),
-                    ..Filters::default()
-                })
+                .map(|k| with(AutoFilter::Refine, *k))
                 .collect(),
         }
     }
@@ -500,10 +567,18 @@ impl Derive {
         let auto = self.filters.iter().enumerate().fold(0u8, |bits, (at, f)| {
             bits | u8::from(f.auto_keeps(labels)) << at
         });
+        let refine: Vec<(u16, u16)> = self
+            .refine
+            .iter()
+            .map(|f| {
+                let (n, s) = f.refine_open(labels);
+                (small(n), small(s))
+            })
+            .collect();
         let mut part = Part {
             strength: self
                 .of(AutoFilter::Overlaps)
-                .map_or(0, |f| f.overlap_strength(labels)),
+                .map_or(0, |f| small(f.overlap_strength(labels))),
             auto_review: box_count(u.auto_review),
             likely: box_count(u.likely_boxes as usize),
             agreed: self
@@ -528,6 +603,11 @@ impl Derive {
             *training.entry(b.label.as_str()).or_default() += 1;
         }
         let mut names = names.write_recover();
+        // Every kind's count is 0 when the whole count is: a frame with nothing live interns
+        // nothing.
+        if refine.first().is_some_and(|(n, _)| *n > 0) {
+            part.refine = names.refine.intern(&refine).saturating_add(1);
+        }
         part.classes = names.class_set_of(classes.iter().map(String::as_str));
         let per_class: Vec<(Name, u32)> = training
             .into_iter()

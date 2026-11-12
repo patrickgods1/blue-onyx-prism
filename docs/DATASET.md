@@ -509,6 +509,12 @@ folder; the collector and the Collect tab keep `collect.dir`.
   accepting any of these three removes the suggestion and ends `overlaps_checked` when the box is now in a
   stack or an open pair; accepting a `verify` answers it `kept`.
 
+  `GET /v1/review/labels` serves the live ones as `refine_live`: `[{"index", "kind", "target",
+  "target_label", "bbox", "label", "score", "why", "spot", "run", "target_box", "replaces"}]`, absent fields
+  `null`; `index` is the place in `refine`, `target_box` (the box `target` names, `null` for an `add`) and
+  `replaces` (the unjudged rejects an `add` takes the place of, closest first) are places in `boxes`. The
+  queue finds the frames with `auto=refine` ([Queue](#queue)).
+
   A `kind` or an `answer` this build does not know (a newer build's) loads as `unknown`, is never live
   and is written back as `unknown`. A check rewrites only the unanswered suggestions of the kinds it makes
   (`add`, `verify`, `relabel`); answered ones and other kinds stay, and when nothing changed the file is not
@@ -606,6 +612,7 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` 
 | `overlaps` | stacked or overlapping boxes no reviewer has looked at (no `overlaps_checked`), any review status |
 | `both` | a pending box two or more labelers found (`labelers`), of a wanted class; most such boxes first (item field `agreed_boxes`) |
 | `dismissed` | a box a labelers run dismissed (`reason: "auto_dismissed"` or `"spot_dismissed"`), pending boxes or not. The page shows those boxes on these frames |
+| `refine` | a live suggestion of the dataset check (`refine`, below; `refine::live` with the class list), any review status; never a skipped frame or one without a label file. Strongest first (item fields `refine_strength` and `refine_open`). `refine_kind=add\|tighten\|relabel\|verify` (only with `auto=refine`, else 400) counts that kind alone |
 
 `auto=overlaps` obeys `status` and `source` like the other filters, and most frames with overlaps need
 `status=any&source=all`: a reviewed frame is often not in `review-queue.jsonl`, and reviewed frames need
@@ -638,6 +645,11 @@ Under `auto=overlaps` the frames with a live suggestion come first, strongest fi
 `overlap_strength`; `collect/labels/overlaps.rs` `strength`): drops with no other detection on the box,
 then with one under 0.2, then under 0.3, then two objects, then the weak band, then the witnesses alone,
 each by the zoom's score. Frames with no live suggestion follow in the order above.
+
+Under `auto=refine` every listed frame has a live suggestion; they come strongest first by the frame's
+strongest one (item field `refine_strength`, `refine::strength`: `add` 4, `relabel` 3, `tighten` 2,
+`verify` 1, times 1000, plus the score in thousandths), then in the order above. `refine_open` is how many of
+the frame's suggestions are live (of `refine_kind` when given).
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the
