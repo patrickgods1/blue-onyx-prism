@@ -189,6 +189,11 @@ pub struct Report {
     pub unreviewed: Option<u64>,
     pub ignore_frames: usize,
     pub parked_capped: usize,
+    /// Frames showing nothing but objects at static spots left out over the static cap
+    /// ([`dataset::Stats::static_capped`]; the spots in `dataset::Stats::static_caps`).
+    pub static_capped: usize,
+    /// Static spots of the train / valid pool ([`dataset::Stats::static_spots`]).
+    pub static_spots: usize,
     pub duplicates_dropped: usize,
     pub scene_filtered: usize,
     /// Plain sentences beside the counts.
@@ -266,6 +271,9 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
                 .into(),
         ),
     }
+    if let Some(note) = dataset::static_cap_note(s, opts.static_cap) {
+        notes.push(note);
+    }
     if let Some(n) = unreviewed.filter(|n| *n > 0) {
         notes.push(format!(
             "{n} frame(s) in the folder under review are not reviewed yet, so they are in no \
@@ -290,6 +298,8 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         unreviewed,
         ignore_frames: s.ignore_frames,
         parked_capped: s.parked_capped,
+        static_capped: s.static_capped,
+        static_spots: s.static_spots,
         duplicates_dropped: s.duplicates_dropped,
         scene_filtered: s.scene_filtered,
         notes,
@@ -326,6 +336,10 @@ pub fn text(r: &Report) -> String {
     let dropped = [
         (r.ignore_frames, "with unsure or too-small boxes"),
         (r.parked_capped, "over the parked-spot cap"),
+        (
+            r.static_capped,
+            "showing nothing but parked objects, over the cap per static spot",
+        ),
         (
             r.duplicates_dropped,
             "that repeat a frame of another export",

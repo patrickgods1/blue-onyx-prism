@@ -12,8 +12,9 @@
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
-//! boxes on one object (stacks, overlaps) in [`stacks`], the stored suggestions for overlapping
-//! boxes in [`overlaps`] and those of the dataset check in [`refine`]. The cover rule both a
+//! boxes on one object (stacks, overlaps) in [`stacks`], the static spots of fixed cameras (the
+//! same object labelled at one place on many frames) in [`statics`], the stored suggestions for
+//! overlapping boxes in [`overlaps`] and those of the dataset check in [`refine`]. The cover rule both a
 //! missing-label run and the dataset check use ([`covers`], [`unjudged_reject`]) is here.
 
 pub mod bulk;
@@ -25,6 +26,7 @@ pub mod refine;
 pub mod repeats;
 pub mod spots;
 pub mod stacks;
+pub mod statics;
 pub mod xany;
 
 use super::layout::{self, Rel};

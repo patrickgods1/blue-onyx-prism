@@ -29,6 +29,8 @@ pub struct Written {
     pub written: KindCounts,
     /// Suggestions found, per kind.
     pub found: KindCounts,
+    /// Of `found.add`, those at a static spot ([`Suggestion::spot`]).
+    pub add_at_spots: usize,
     /// Loose labels.
     pub loose: usize,
     /// The first frames written (`<scene>/<camera>/<date>/<stem>.jpg`).
@@ -116,6 +118,8 @@ fn write_frame(
                 width: f.width,
                 height: f.height,
                 dets,
+                camera: &f.rel.camera,
+                day: &f.rel.date,
             },
             ctx,
         );
@@ -130,6 +134,7 @@ fn write_frame(
         out.loose += j.loose;
         for s in &j.suggestions {
             bump(&mut out.found, s.kind);
+            out.add_at_spots += usize::from(s.kind == Kind::Add && s.spot.is_some());
         }
         out.written.add += written.add;
         out.written.verify += written.verify;

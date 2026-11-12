@@ -86,7 +86,7 @@ pub enum TrainCommand {
         #[arg(long = "model", required = true)]
         models: Vec<String>,
         #[command(flatten)]
-        data: DataArgs,
+        data: Box<DataArgs>,
         /// Most epochs (default: the family's recommendation: YOLO 100, RF-DETR 100,
         /// RT-DETRv2 / D-FINE 80; config `training.epochs`).
         #[arg(long)]
@@ -782,9 +782,24 @@ pub struct DataArgs {
     /// reviewer-confirmed hard negatives and never the last box of a class.
     #[arg(long)]
     pub balance_cap: Option<f32>,
+    /// Most training frames kept per static spot of those showing nothing but objects parked at
+    /// static spots (the same car at the same place frame after frame); 0 keeps them all.
+    /// Default: `training.static_cap` (20).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=super::config::MAX_STATIC_CAP as u64))]
+    pub static_cap: Option<u64>,
 }
 
 impl DataArgs {
+    /// `config` with `--static-cap` over `training.static_cap` (never saved: only the plan reads
+    /// it).
+    pub fn with_static_cap(&self, config: &Config) -> Config {
+        let mut c = config.clone();
+        if let Some(n) = self.static_cap {
+            c.training.static_cap = usize::try_from(n).unwrap_or(super::config::MAX_STATIC_CAP);
+        }
+        c
+    }
+
     /// The balancing of the run: the flags over `training.balance` (the default when no
     /// `--balance` is given), else off. Validated.
     pub fn balance(&self, config: &Config) -> Result<dataset::Balance> {
@@ -945,6 +960,8 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let [scene] = data.scenes()[..] else {
                 bail!("prepare takes one --scene (train run compares several)");
             };
+            // `--static-cap` over the config's (in memory only).
+            let config = data.with_static_cap(&config);
             if dry_run {
                 let request = preview_request(&config, &data, scene)?;
                 let p = super::preview_parts(&config, &request)?;
@@ -971,6 +988,9 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let (sources, opts) = read_sources(&config, &data, scene)?;
             let plan = preflight::planned(&sources, &opts)?;
             let prepared = dataset::write(&sources, &plan, &opts, &out)?;
+            if let Some(note) = dataset::static_cap_note(&plan.stats, opts.static_cap) {
+                println!("{note}");
+            }
             println!(
                 "{}: {} training, {} validation, {} held-out images; classes: {}",
                 out.display(),
@@ -1025,6 +1045,8 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
                 bail!("--name needs exactly one --model and one --scene");
             }
+            // `--static-cap` over the config's (in memory only; the hooks read the file again).
+            let config = data.with_static_cap(&config);
             // Several runs of different scenes or seeds are compared on the same held-out frames.
             let group = (scenes.len() as u64 * seeds > 1)
                 .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
@@ -1862,6 +1884,7 @@ fn read_sources(
         heldout_share: t.heldout_share,
         oversample: t.oversample,
         balance: data.balance(config)?,
+        static_cap: data.with_static_cap(config).training.static_cap_option(),
         ..dataset::Options::default()
     };
     Ok((sources, opts))
@@ -2641,6 +2664,33 @@ mod tests {
             panic!("not prepare")
         };
         data
+    }
+
+    #[test]
+    fn the_static_cap_flag_overrides_the_config_in_memory() {
+        let mut cfg = Config::default();
+        cfg.training.static_cap = 7;
+        let none = prepare_data(&[]);
+        assert_eq!(none.static_cap, None);
+        assert_eq!(none.with_static_cap(&cfg).training.static_cap, 7);
+        let off = prepare_data(&["--static-cap", "0"]);
+        let c = off.with_static_cap(&cfg);
+        assert_eq!(c.training.static_cap_option(), None);
+        assert_eq!(cfg.training.static_cap, 7, "the config itself is unchanged");
+        let five = prepare_data(&["--static-cap", "5"]);
+        assert_eq!(
+            five.with_static_cap(&cfg).training.static_cap_option(),
+            Some(5)
+        );
+        assert!(parse(&["prepare", "--out", "o", "--static-cap", "-1"]).is_err());
+        assert!(parse(&["prepare", "--out", "o", "--static-cap", "100001"]).is_err());
+        // `train run` takes it too.
+        let TrainCommand::Run { data, .. } =
+            parse(&["run", "--model", "yolo26n", "--static-cap", "3"]).unwrap()
+        else {
+            panic!("not run")
+        };
+        assert_eq!(data.static_cap, Some(3));
     }
 
     #[test]

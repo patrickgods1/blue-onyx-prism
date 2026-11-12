@@ -502,7 +502,9 @@ folder; the collector and the Collect tab keep `collect.dir`.
   trimmed and case-insensitive, so of two boxes of different objects with the very same `bbox` the suggestion
   names the right one; without it (files of the first checks) the `bbox` alone is the key. `score`: the fold
   model's score, 0 to 1. `why`: the evidence in plain words, at most 300 characters. `spot`: an opaque group
-  name, at most 200 bytes. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box
+  name, at most 200 bytes; the check writes it on an `add` at a static spot, the spot's id
+  `<camera>/<object>/<x0>-<y0>-<x1>-<y1>` (`collect::labels::statics`, docs/TRAINING.md "Static spots"),
+  which groups the adds of one place. `run`: the id of the check that wrote it, at most 64 bytes. A suggestion whose box
   moved, went or was relabelled away from `target_label`, or that no longer holds, is stale and ignored: an
   `add` that a box of its object now covers; a `tighten` on a box a reviewer drew or moved; a `relabel` on a
   box a reviewer drew or relabelled, or to a class that names the same object; a `verify` on a box a reviewer

@@ -305,6 +305,7 @@ pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options 
         negative_share: t.negative_share,
         heldout_share: t.heldout_share,
         oversample: t.oversample,
+        static_cap: t.static_cap_option(),
         ..dataset::Options::default()
     };
     job::request_options(&base, request)

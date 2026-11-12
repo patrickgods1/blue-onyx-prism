@@ -4,7 +4,9 @@
 //! (the existing training run, [`crate::training::job::run_training`], in the job's work folder),
 //! runs on the fold's frames it never saw ([`predict`]), and [`judge`] compares what it found with
 //! the labels: missing boxes (`add`), labels no model found (`verify`), another class (`relabel`),
-//! loose labels (counted). The suggestions go on the label files for a reviewer to confirm
+//! loose labels (counted); an `add` at a static spot of the selection (the same object labelled at
+//! the place on other days, [`crate::collect::labels::statics`], [`Selected::spots`]) is made from
+//! a lower score. The suggestions go on the label files for a reviewer to confirm
 //! ([`crate::collect::labels::refine`]); the recall per camera, scene, class and size goes to
 //! `<review folder>/refine/report.json` ([`report`]).
 //!
@@ -42,6 +44,7 @@ use super::progress::EpochPoint;
 use super::recipe::TrainRecipe;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{self, ClassFilter, ExportFrame, Selection, SplitConfig};
+use crate::collect::labels::statics;
 use crate::config::Config;
 use crate::resources::catalog::{Platform, TrainFamily};
 use crate::resources::export::train::{self as env, TrainPaths};
@@ -477,6 +480,15 @@ pub struct Selected {
     pub open_suggestions: usize,
     /// Frames holding them.
     pub open_frames: usize,
+    /// The static spots of `frames` ([`spot_table`]): made once from this label snapshot, every
+    /// fold's judge uses it ([`judge::Context::spots`]).
+    pub spots: statics::Table,
+}
+
+/// The static spots of a check's `frames`, per camera ([`statics::observations`]: the training
+/// boxes of wanted classes that are no ignore region, normalised; [`statics::Table::build`]).
+pub fn spot_table(frames: &[ExportFrame], wanted: &Wanted<'_>) -> statics::Table {
+    statics::Table::build(statics::observations(frames, wanted))
 }
 
 /// The open suggestions a check of `frames` replaces, and the frames holding them: unanswered
@@ -673,6 +685,7 @@ pub fn select(
     }
     out.class_boxes = class_boxes(&out.frames, &wanted);
     (out.open_suggestions, out.open_frames) = open_to_replace(&out.frames, &wanted);
+    out.spots = spot_table(&out.frames, &wanted);
     // Folded even when refused below, so a preview shows what a check would do.
     match folds::assign(&out.groups, k, FOLD_SEED) {
         Ok(f) => {

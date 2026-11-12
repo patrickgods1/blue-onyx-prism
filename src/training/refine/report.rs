@@ -215,6 +215,20 @@ pub struct RefineReport {
     pub recall: Recall,
     pub recall_by_group: Vec<GroupRecall>,
     pub recall_by_size: Vec<SizeRecall>,
+    /// Static spots of the check's selection
+    /// ([`crate::collect::labels::statics`]). Reports of earlier checks: 0.
+    #[serde(default)]
+    pub static_spots: usize,
+    /// Recall of the training boxes at a static spot (one that holds without the frame's
+    /// camera-day, [`super::judge::spot_of`]) ...
+    #[serde(default)]
+    pub recall_at_spots: Recall,
+    /// ... and of the others.
+    #[serde(default)]
+    pub recall_elsewhere: Recall,
+    /// Of `found.add`, the adds at a static spot (from [`super::judge::ADD_SCORE_AT_SPOT`]).
+    #[serde(default)]
+    pub adds_at_spots: usize,
     pub warnings: Vec<String>,
 }
 
@@ -223,6 +237,9 @@ pub struct RefineReport {
 pub struct RecallTally {
     groups: BTreeMap<(String, String, String), (u64, u64)>,
     sizes: BTreeMap<usize, (u64, u64)>,
+    /// (boxes, found) at a static spot, and elsewhere.
+    at_spots: (u64, u64),
+    elsewhere: (u64, u64),
 }
 
 impl RecallTally {
@@ -239,7 +256,24 @@ impl RecallTally {
             let s = self.sizes.entry(size_bucket(b.short_px)).or_default();
             s.0 += 1;
             s.1 += hit;
+            let w = if b.at_spot {
+                &mut self.at_spots
+            } else {
+                &mut self.elsewhere
+            };
+            w.0 += 1;
+            w.1 += hit;
         }
+    }
+
+    /// Over the boxes at a static spot.
+    pub fn at_spots(&self) -> Recall {
+        Recall::of(self.at_spots.1, self.at_spots.0)
+    }
+
+    /// Over the boxes at no static spot.
+    pub fn elsewhere(&self) -> Recall {
+        Recall::of(self.elsewhere.1, self.elsewhere.0)
     }
 
     /// Over every box.
@@ -303,6 +337,10 @@ impl RefineReport {
             recall: Recall::default(),
             recall_by_group: Vec::new(),
             recall_by_size: Vec::new(),
+            static_spots: 0,
+            recall_at_spots: Recall::default(),
+            recall_elsewhere: Recall::default(),
+            adds_at_spots: 0,
             warnings: Vec::new(),
         }
     }
@@ -312,6 +350,8 @@ impl RefineReport {
         self.recall = tally.total();
         self.recall_by_group = tally.by_group();
         self.recall_by_size = tally.by_size();
+        self.recall_at_spots = tally.at_spots();
+        self.recall_elsewhere = tally.elsewhere();
         self.created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     }
 
@@ -433,6 +473,8 @@ mod tests {
             class: class.into(),
             short_px: px,
             found,
+            // The cars stand at a static spot.
+            at_spot: class == "car",
         };
         t.add(
             "patio",
@@ -458,6 +500,25 @@ mod tests {
         );
         r.finish(&t);
         assert_eq!((r.recall.boxes, r.recall.found), (5, 3));
+        assert_eq!(
+            (r.recall_at_spots.boxes, r.recall_at_spots.found),
+            (2, 1),
+            "the cars"
+        );
+        assert_eq!((r.recall_elsewhere.boxes, r.recall_elsewhere.found), (3, 2));
+        assert_eq!(r.recall_at_spots.recall, Some(0.5));
+        // A report of an earlier check (no spot fields) reads.
+        let mut old = serde_json::to_value(&r).unwrap();
+        for k in [
+            "static_spots",
+            "recall_at_spots",
+            "recall_elsewhere",
+            "adds_at_spots",
+        ] {
+            old.as_object_mut().unwrap().remove(k);
+        }
+        let back: RefineReport = serde_json::from_value(old).unwrap();
+        assert_eq!(back.recall_at_spots, Recall::default());
         let g: Vec<(&str, &str, &str, u64, u64)> = r
             .recall_by_group
             .iter()

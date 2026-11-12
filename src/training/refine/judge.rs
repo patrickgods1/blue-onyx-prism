@@ -15,6 +15,18 @@
 //! 4. `add`: an unmatched detection at [`ADD_SCORE`] or more, at least [`FLOOR_PX`] on its short side
 //!    at model input, that no box of its object that is not rejected and no ignore box covers
 //!    ([`covers`]), and no judged reject of its object lies on at IoU >= [`REJECT_BLOCK_IOU`].
+//!    **At a static spot** ([`spot_of`]: the detection lies at a spot of the check's table,
+//!    [`statics::Table::spot_at`], that is still a spot without the frame's camera-day,
+//!    [`statics::Spot::holds_without`]; people and animals form no spot,
+//!    [`statics::may_be_static`]) the score may be as low as [`ADD_SCORE_AT_SPOT`]; such an
+//!    add carries the spot's id ([`Suggestion::spot`]), the spot's most common label (through the
+//!    class list) and says where its evidence comes from. Measured on kept fold detections of 851
+//!    frames: an uncovered detection at a place labelled on 10 or more other frames of its camera
+//!    is real about 90% of the time down to 0.3, while elsewhere detections at 0.3-0.5 are almost
+//!    all false. The evidence leaves out the frame's camera-day, not the frame's whole fold: it is
+//!    the reviewer's labels, which the fold model's blindness does not concern (it never saw
+//!    those frames either way), and other days of the fold are other looks at the place; only
+//!    frames of the same day are near copies of this one.
 //! 5. `verify`: an unmatched training box no reviewer drew or moved, with no same-object detection
 //!    (at [`MATCH_MIN_SCORE`] or more, as every candidate) at IoU >= [`VERIFY_IOU`], of a class
 //!    with [`MIN_CLASS_BOXES`] boxes or more in what the fold model trained on, at least
@@ -35,6 +47,7 @@
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
 use crate::collect::labels::repeats::same_object;
+use crate::collect::labels::statics::{self, Spot};
 use crate::collect::labels::{
     BoxState, LabelBox, LabelFile, Source, Status, clamp_box, covers, iou,
 };
@@ -56,6 +69,9 @@ pub const GOOD_IOU: f32 = 0.75;
 /// Score from which an unmatched detection is proposed as a missing box: below it fold models
 /// guess too often for a reviewer's time.
 pub const ADD_SCORE: f32 = 0.5;
+/// Score from which an unmatched detection at a static spot is proposed as a missing box (rule 4):
+/// labels at the place on other days make a weaker find worth a look.
+pub const ADD_SCORE_AT_SPOT: f32 = 0.3;
 /// Short side at model input (pixels) under which neither an `add` nor a `verify` is proposed:
 /// RF-DETR cannot see below about one 10-12 px patch.
 pub const FLOOR_PX: f32 = 10.0;
@@ -90,6 +106,9 @@ pub struct FrameInput<'a> {
     pub height: u32,
     /// The fold model's detections on it.
     pub dets: &'a [Det],
+    /// Its camera and day (`YYYY-MM-DD`): the static spots it may use ([`spot_of`]).
+    pub camera: &'a str,
+    pub day: &'a str,
 }
 
 /// What every frame of a check shares.
@@ -103,6 +122,8 @@ pub struct Context<'a> {
     pub class_boxes: &'a BTreeMap<String, usize>,
     /// The check's id ([`Suggestion::run`]).
     pub run: &'a str,
+    /// The static spots of the check's selection ([`super::Selected::spots`]); None: no spot rule.
+    pub spots: Option<&'a statics::Table>,
 }
 
 /// A training box as the report's recall counts it.
@@ -114,6 +135,25 @@ pub struct BoxFact {
     pub short_px: f32,
     /// A same-object detection at [`FOUND_SCORE`] found it at IoU >= [`FOUND_IOU`] (one to one).
     pub found: bool,
+    /// It lies at a static spot that holds without the frame's camera-day ([`spot_of`]).
+    pub at_spot: bool,
+}
+
+/// The static spot of `ctx` a box of `label` at `bbox` (pixels of `frame`) lies at, when that spot
+/// is still one without the frame's camera-day ([`statics::Spot::holds_without`]: one day's
+/// frames are near copies, so a spot that day alone makes is no evidence for its frames). None
+/// without a spot table, for a frame of unknown size, or at no such spot.
+pub fn spot_of<'c>(
+    ctx: &Context<'c>,
+    frame: &FrameInput<'_>,
+    label: &str,
+    bbox: &[f32; 4],
+) -> Option<&'c Spot> {
+    let table = ctx.spots?;
+    let nb = statics::normalised(bbox, frame.width, frame.height)?;
+    table
+        .spot_at(frame.camera, label, &nb)
+        .filter(|s| s.holds_without(frame.day))
 }
 
 /// What [`judge`] made of a frame.
@@ -275,6 +315,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
                 class: class.clone(),
                 short_px: size(&t.b.bbox),
                 found: hit.is_some(),
+                at_spot: spot_of(ctx, frame, class, &t.b.bbox).is_some(),
             });
         }
     }
@@ -342,13 +383,17 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             });
         }
     }
-    // 4. Missing boxes.
+    // 4. Missing boxes (from a lower score at a static spot).
     for (di, d) in dets.iter().enumerate() {
         if by_det.get(di).copied().flatten().is_some()
             || evidence.get(di).copied().unwrap_or(false)
-            || d.score < ADD_SCORE
+            || d.score < ADD_SCORE_AT_SPOT.min(ADD_SCORE)
             || size(&d.bbox) < FLOOR_PX
         {
+            continue;
+        }
+        let spot = spot_of(ctx, frame, &d.class, &d.bbox);
+        if spot.is_none() && d.score < ADD_SCORE {
             continue;
         }
         let covered = f.boxes.iter().any(|b| {
@@ -366,18 +411,33 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
         if covered || blocked {
             continue;
         }
-        found_list.push(Suggestion {
-            bbox: Some(d.bbox),
-            label: Some(d.class.clone()),
-            score: Some(d.score),
-            ..suggestion(
-                Kind::Add,
-                ctx.run,
+        let (label, why, spot_id) = match spot {
+            Some(s) => {
+                // The spot's own label (a truck found where a car is labelled is that car).
+                let label = wanted.class_of(&s.label).unwrap_or(&d.class).to_string();
+                let why = format!(
+                    "a {label} is labelled at this place on {} other frames of this camera; a \
+                     model that never saw this camera-day found one here, score {:.2}",
+                    s.frames_without(frame.day),
+                    d.score
+                );
+                (label, why, Some(s.id.clone()))
+            }
+            None => (
+                d.class.clone(),
                 format!(
                     "a model that never saw this camera-day found a {} here, score {:.2}",
                     d.class, d.score
                 ),
-            )
+                None,
+            ),
+        };
+        found_list.push(Suggestion {
+            bbox: Some(d.bbox),
+            label: Some(label),
+            score: Some(d.score),
+            spot: spot_id,
+            ..suggestion(Kind::Add, ctx.run, why)
         });
     }
     // 5. Labels no model found.
@@ -488,6 +548,7 @@ mod tests {
             imgsz: 640,
             class_boxes: counts,
             run: "r1",
+            spots: None,
         };
         let j = judge(
             &FrameInput {
@@ -495,6 +556,8 @@ mod tests {
                 width: 640,
                 height: 480,
                 dets,
+                camera: "cam",
+                day: "2026-10-01",
             },
             &ctx,
         );
@@ -877,6 +940,7 @@ mod tests {
             imgsz: 640,
             class_boxes: &counts,
             run: "r1",
+            spots: None,
         };
         let dets = [det("person", [600.0, 400.0, 700.0, 520.0], 0.9)];
         let j = judge(
@@ -885,6 +949,8 @@ mod tests {
                 width: 0,
                 height: 0,
                 dets: &dets,
+                camera: "cam",
+                day: "2026-10-01",
             },
             &ctx,
         );
@@ -942,6 +1008,7 @@ mod tests {
             imgsz: 640,
             class_boxes: &counts,
             run: "r1",
+            spots: None,
         };
         let f = reviewed(vec![acc("dog", CAR)]);
         let dets = [det("dog", FAR, 0.9)];
@@ -951,9 +1018,231 @@ mod tests {
                 width: 640,
                 height: 480,
                 dets: &dets,
+                camera: "cam",
+                day: "2026-10-01",
             },
             &ctx,
         );
         assert_eq!(j, Judged::default());
+    }
+
+    /// A spot table with a car labelled at [`CAR`] (of a 640 x 480 frame) on `frames` frames of
+    /// camera `cam`: `on_day` of them on 2026-10-01 (the judged frames' day), the others spread
+    /// over 2026-10-02 to -04.
+    fn car_spot(frames: usize, on_day: usize) -> statics::Table {
+        let nb = statics::normalised(&CAR, 640, 480).unwrap();
+        statics::Table::build((0..frames).map(|i| statics::Obs {
+            camera: "cam".into(),
+            frame: format!("cam/{i}"),
+            day: if i < on_day {
+                "2026-10-01".to_string()
+            } else {
+                format!("2026-10-0{}", i % 3 + 2)
+            },
+            scene: "day".into(),
+            label: if i % 4 == 0 { "truck" } else { "car" }.into(),
+            bbox: nb,
+        }))
+    }
+
+    /// Judge `f` (640 x 480, camera `cam`, 2026-10-01) with `dets` and the spot table `spots`.
+    fn run_spots(f: &LabelFile, dets: &[Det], spots: &statics::Table) -> Judged {
+        let c = classes();
+        let w = Wanted {
+            classes: &c,
+            hidden: &[],
+        };
+        let counts = many();
+        let ctx = Context {
+            wanted: &w,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r1",
+            spots: Some(spots),
+        };
+        let j = judge(
+            &FrameInput {
+                file: f,
+                width: 640,
+                height: 480,
+                dets,
+                camera: "cam",
+                day: "2026-10-01",
+            },
+            &ctx,
+        );
+        let mut probe = f.clone();
+        probe.refine = j.suggestions.clone();
+        assert_eq!(refine::live(&probe, Some(&w)).len(), j.suggestions.len());
+        refine::check(&j.suggestions).unwrap();
+        j
+    }
+
+    #[test]
+    fn a_detection_at_a_static_spot_is_an_add_from_a_lower_score() {
+        let table = car_spot(12, 0);
+        let spot = &table.camera("cam")[0];
+        assert!(spot.holds_without("2026-10-01"));
+        let f = reviewed(vec![]);
+        // 0.35 at the spot: an add with the spot's id and its own words.
+        let j = run_spots(&f, &[det("car", NEAR, 0.35)], &table);
+        assert_eq!(kinds(&j), [Kind::Add], "{j:?}");
+        let s = &j.suggestions[0];
+        assert_eq!(s.spot.as_deref(), Some(spot.id.as_str()));
+        assert_eq!((s.label.as_deref(), s.score), (Some("car"), Some(0.35)));
+        assert_eq!(
+            s.why,
+            "a car is labelled at this place on 12 other frames of this camera; a model that \
+             never saw this camera-day found one here, score 0.35"
+        );
+        // Without the table, or under 0.3: nothing.
+        assert!(run(&f, &[det("car", NEAR, 0.35)]).suggestions.is_empty());
+        assert!(
+            run_spots(&f, &[det("car", NEAR, ADD_SCORE_AT_SPOT - 0.01)], &table)
+                .suggestions
+                .is_empty()
+        );
+        // Elsewhere the cut-off stays 0.5.
+        let elsewhere = [300.0, 300.0, 380.0, 360.0];
+        assert!(
+            run_spots(&f, &[det("car", elsewhere, 0.45)], &table)
+                .suggestions
+                .is_empty()
+        );
+        let j = run_spots(&f, &[det("car", elsewhere, 0.55)], &table);
+        assert_eq!(kinds(&j), [Kind::Add]);
+        assert_eq!(j.suggestions[0].spot, None);
+        // A truck where the car is labelled: the spot's label.
+        let j = run_spots(&f, &[det("truck", NEAR, 0.4)], &table);
+        assert_eq!(j.suggestions[0].label.as_deref(), Some("car"));
+        // A strong find at the spot says so too, at the same strength as one elsewhere.
+        let j = run_spots(&f, &[det("car", NEAR, 0.8)], &table);
+        assert_eq!(j.suggestions[0].spot.as_deref(), Some(spot.id.as_str()));
+        assert!(
+            j.suggestions[0]
+                .why
+                .starts_with("a car is labelled at this place")
+        );
+        let plain = run(&f, &[det("car", NEAR, 0.8)]);
+        assert_eq!(
+            refine::strength(&j.suggestions[0]),
+            refine::strength(&plain.suggestions[0])
+        );
+        // A person at the car's place is another object: no spot for it.
+        assert!(
+            run_spots(&reviewed(vec![]), &[det("person", NEAR, 0.4)], &table)
+                .suggestions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_person_labelled_at_one_place_lowers_no_cut_off() {
+        // A person labelled at CAR's place on 12 frames of 3 days: no spot (people never park).
+        let nb = statics::normalised(&CAR, 640, 480).unwrap();
+        let persons = statics::Table::build((0..12).map(|i| statics::Obs {
+            camera: "cam".into(),
+            frame: format!("cam/{i}"),
+            day: format!("2026-10-0{}", i % 3 + 2),
+            scene: "day".into(),
+            label: "person".into(),
+            bbox: nb,
+        }));
+        assert!(persons.is_empty(), "{persons:?}");
+        let f = reviewed(vec![]);
+        assert!(
+            run_spots(&f, &[det("person", NEAR, 0.35)], &persons)
+                .suggestions
+                .is_empty()
+        );
+        // From 0.5 it is an ordinary add, with no spot.
+        let j = run_spots(&f, &[det("person", NEAR, 0.6)], &persons);
+        assert_eq!(kinds(&j), [Kind::Add]);
+        assert_eq!(j.suggestions[0].spot, None);
+        // A person's training box is never counted at a spot, the car's still is.
+        let j = run_spots(&reviewed(vec![acc("person", CAR)]), &[], &car_spot(12, 0));
+        assert!(!j.boxes[0].at_spot);
+        let j = run_spots(&reviewed(vec![acc("car", CAR)]), &[], &car_spot(12, 0));
+        assert!(j.boxes[0].at_spot);
+    }
+
+    #[test]
+    fn the_add_rules_still_hold_at_a_spot() {
+        let table = car_spot(12, 0);
+        // Labelled: a match, no add.
+        let f = reviewed(vec![acc("car", CAR)]);
+        let j = run_spots(&f, &[det("car", NEAR, 0.35)], &table);
+        assert!(j.suggestions.is_empty(), "{j:?}");
+        assert!(j.boxes[0].at_spot);
+        // A judged reject at the place blocks it.
+        let fp = LabelBox {
+            reject_reason: Some(RejectReason::FalsePositive),
+            ..b("car", CAR, BoxState::Rejected)
+        };
+        assert!(
+            run_spots(&reviewed(vec![fp]), &[det("car", NEAR, 0.35)], &table)
+                .suggestions
+                .is_empty()
+        );
+        // Too small at model input: nothing, wherever.
+        let tiny = [100.0, 100.0, 108.0, 160.0];
+        assert!(
+            run_spots(&reviewed(vec![]), &[det("car", tiny, 0.9)], &table)
+                .suggestions
+                .is_empty()
+        );
+        // A box elsewhere is not at a spot.
+        let j = run_spots(&reviewed(vec![acc("car", FAR)]), &[], &table);
+        assert!(!j.boxes[0].at_spot);
+    }
+
+    #[test]
+    fn a_spot_made_by_the_frames_own_day_is_no_evidence() {
+        // 12 frames, 9 of them of the judged frame's day: without that day 3 frames are left.
+        let table = car_spot(12, 9);
+        let spot = &table.camera("cam")[0];
+        assert!(!spot.holds_without("2026-10-01"));
+        let f = reviewed(vec![]);
+        assert!(
+            run_spots(&f, &[det("car", NEAR, 0.35)], &table)
+                .suggestions
+                .is_empty()
+        );
+        // A strong find is an ordinary add.
+        let j = run_spots(&f, &[det("car", NEAR, 0.6)], &table);
+        assert_eq!(kinds(&j), [Kind::Add]);
+        assert_eq!(j.suggestions[0].spot, None);
+        assert!(j.suggestions[0].why.starts_with("a model that never saw"));
+        // Its training box there does not count as at a spot either.
+        let j = run_spots(&reviewed(vec![acc("car", CAR)]), &[], &table);
+        assert!(!j.boxes[0].at_spot);
+        // Another camera has no spot.
+        let c = classes();
+        let w = Wanted {
+            classes: &c,
+            hidden: &[],
+        };
+        let counts = many();
+        let ok = car_spot(12, 0);
+        let ctx = Context {
+            wanted: &w,
+            imgsz: 640,
+            class_boxes: &counts,
+            run: "r1",
+            spots: Some(&ok),
+        };
+        let dets = [det("car", NEAR, 0.35)];
+        let j = judge(
+            &FrameInput {
+                file: &f,
+                width: 640,
+                height: 480,
+                dets: &dets,
+                camera: "drive",
+                day: "2026-10-01",
+            },
+            &ctx,
+        );
+        assert!(j.suggestions.is_empty());
     }
 }

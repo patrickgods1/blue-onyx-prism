@@ -111,6 +111,21 @@ pub struct TrainingConfig {
     /// Saved from the Train form; a queued run keeps the list it was queued with.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub benchmark_devices: Vec<String>,
+    /// Most train / valid frames kept per static spot of those showing nothing but objects at
+    /// static spots (a parked car frame after frame; [`super::dataset::Options::static_cap`]);
+    /// 0 = off. Default [`DEFAULT_STATIC_CAP`], not written while it is the default (a config
+    /// without the key saves without it).
+    #[serde(skip_serializing_if = "is_default_static_cap")]
+    pub static_cap: usize,
+}
+
+/// Default `training.static_cap` ([`super::dataset::PARKED_CAP`]).
+pub const DEFAULT_STATIC_CAP: usize = super::dataset::PARKED_CAP;
+/// Largest `training.static_cap`.
+pub const MAX_STATIC_CAP: usize = 100_000;
+
+fn is_default_static_cap(n: &usize) -> bool {
+    *n == DEFAULT_STATIC_CAP
 }
 
 impl Default for TrainingConfig {
@@ -133,6 +148,7 @@ impl Default for TrainingConfig {
             balance: None,
             workers: None,
             benchmark_devices: Vec::new(),
+            static_cap: DEFAULT_STATIC_CAP,
         }
     }
 }
@@ -161,6 +177,12 @@ pub fn benchmark_devices(specs: &[impl AsRef<str>]) -> anyhow::Result<Vec<String
 impl TrainingConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// [`Self::static_cap`] as the plan takes it ([`super::dataset::Options::static_cap`]): None
+    /// when 0 (off).
+    pub fn static_cap_option(&self) -> Option<usize> {
+        (self.static_cap > 0).then_some(self.static_cap)
     }
 
     /// The training folder for the data root `root`.
@@ -310,6 +332,12 @@ impl TrainingConfig {
         if let Some(b) = &self.balance {
             b.validate().map_err(|e| anyhow::anyhow!("training.{e}"))?;
         }
+        if self.static_cap > MAX_STATIC_CAP {
+            anyhow::bail!(
+                "training.static_cap must be between 0 (off) and {MAX_STATIC_CAP}, got {}",
+                self.static_cap
+            );
+        }
         for (class, phrases) in &self.synonyms {
             let ok = |s: &str| {
                 !s.trim().is_empty()
@@ -390,6 +418,48 @@ mod tests {
             serde_json::from_str::<TrainingConfig>(&serde_json::to_string(&forced).unwrap())
                 .unwrap(),
             forced
+        );
+    }
+
+    #[test]
+    fn the_static_cap_is_written_only_when_changed() {
+        let c = TrainingConfig::default();
+        assert_eq!(c.static_cap, DEFAULT_STATIC_CAP);
+        assert_eq!(c.static_cap_option(), Some(20));
+        assert!(!serde_json::to_string(&c).unwrap().contains("static_cap"));
+        // A config without the key: the default, and a save leaves it out.
+        let old: TrainingConfig = serde_json::from_str(r#"{"oversample": 2}"#).unwrap();
+        assert_eq!(old.static_cap, DEFAULT_STATIC_CAP);
+        assert!(!serde_json::to_string(&old).unwrap().contains("static_cap"));
+        // Off, and another value: written and read back.
+        for n in [0, 5] {
+            let c = TrainingConfig {
+                static_cap: n,
+                ..TrainingConfig::default()
+            };
+            let text = serde_json::to_string(&c).unwrap();
+            assert!(text.contains(&format!(r#""static_cap":{n}"#)), "{text}");
+            assert_eq!(serde_json::from_str::<TrainingConfig>(&text).unwrap(), c);
+            c.validate().unwrap();
+        }
+        assert_eq!(
+            TrainingConfig {
+                static_cap: 0,
+                ..TrainingConfig::default()
+            }
+            .static_cap_option(),
+            None
+        );
+        let too_many = TrainingConfig {
+            static_cap: MAX_STATIC_CAP + 1,
+            ..TrainingConfig::default()
+        };
+        assert!(
+            too_many
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("training.static_cap")
         );
     }
 

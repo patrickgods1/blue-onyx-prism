@@ -5,7 +5,8 @@
 //! report. See [`super`] for what it may change: suggestions and the report, nothing else.
 //!
 //! Steps: 1 selecting, then one per fold, then the report (K + 2; K may be lowered to the camera
-//! days, and the reports then carry the lower count).
+//! days, and the reports then carry the lower count). The selection also makes the check's static
+//! spots ([`super::Selected::spots`]) from the same snapshot; every fold's judge uses that one table.
 //!
 //! **Fold training** reuses the training run as it is ([`job::run_training_holding`]): a copy of
 //! the planned [`TrainJob`] per fold with its run folder, dataset and install folder inside the work
@@ -267,6 +268,7 @@ fn count_written(rep: &mut RefineReport, sample: &mut Vec<String>, w: &write::Wr
     rep.found.add += w.found.add;
     rep.found.verify += w.found.verify;
     rep.found.relabel += w.found.relabel;
+    rep.adds_at_spots += w.add_at_spots;
     rep.written.add += w.written.add;
     rep.written.verify += w.written.verify;
     rep.written.relabel += w.written.relabel;
@@ -395,17 +397,20 @@ impl RefineJob {
 
     /// What every frame of a fold shares in the judge: the fold models' input size, the training
     /// boxes per class of what this fold's model trained on (`class_boxes`,
-    /// [`super::class_boxes`]), this check's id.
+    /// [`super::class_boxes`]), this check's id, and the check's static spots (`spots`, made once
+    /// from the selection: [`Selected::spots`]).
     fn judge_context<'a>(
         &'a self,
         wanted: &'a Wanted<'a>,
         class_boxes: &'a BTreeMap<String, usize>,
+        spots: &'a crate::collect::labels::statics::Table,
     ) -> Context<'a> {
         Context {
             wanted,
             imgsz: self.train.request.recipe.imgsz,
             class_boxes,
             run: &self.id,
+            spots: Some(spots),
         }
     }
 
@@ -438,6 +443,7 @@ impl RefineJob {
         let mut rep = RefineReport::new(&self.id, k, recipe_info(recipe, &self.recipe_from));
         rep.camera_days = s.groups.len();
         rep.frames_selected = s.frames.len();
+        rep.static_spots = s.spots.len();
         rep.left_out = s.left_out.clone();
         rep.warnings.clone_from(&s.warnings);
         if k < self.request.folds {
@@ -545,7 +551,7 @@ impl RefineJob {
         }
         let wanted = self.wanted();
         let class_boxes = super::class_boxes(train.iter().copied(), &wanted);
-        let jctx = self.judge_context(&wanted, &class_boxes);
+        let jctx = self.judge_context(&wanted, &class_boxes, &s.spots);
         // (a) Export with the fold held out.
         Self::step(
             report,
@@ -853,9 +859,14 @@ impl RefineJob {
             ),
             _ => String::new(),
         };
+        let at_spots = if rep.adds_at_spots > 0 {
+            format!(" ({} at static spots)", n(rep.adds_at_spots))
+        } else {
+            String::new()
+        };
         summary.push_str(&format!(
-            "{} frames checked by {} fold models; suggested: {} missing boxes, {} labels to \
-             verify, {} other classes ({} of these suggestions new since the last check, on {} \
+            "{} frames checked by {} fold models; suggested: {} missing boxes{at_spots}, {} labels \
+             to verify, {} other classes ({} of these suggestions new since the last check, on {} \
              frames written); {} loose labels counted. No box was changed: confirm the \
              suggestions on the Review tab",
             n(rep.frames_checked),

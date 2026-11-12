@@ -902,6 +902,7 @@ mod tests {
                 class: "person".into(),
                 short_px: 30.0,
                 found: true,
+                at_spot: false,
             }],
         );
         r.finish(&tally);

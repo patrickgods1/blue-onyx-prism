@@ -397,3 +397,73 @@ fn the_gpu_need_is_the_train_tabs_estimate() {
     };
     assert_eq!(gpu_warning(&recipe, &far), None);
 }
+
+#[test]
+fn frames_over_the_static_cap_are_named_with_their_largest_spot() {
+    // One camera with a car parked at one place on 45 frames over 3 days, and cars passing.
+    let car = || YoloBox {
+        class: "car".into(),
+        ..cat()
+    };
+    let mut v = Vec::new();
+    for i in 0..45 {
+        let name = format!("day.patio.2026-10-0{}.f{i}", i % 3 + 1);
+        v.push(frame(&name, "day", vec![car()], SplitHint::Train));
+    }
+    for i in 0..10 {
+        let name = format!("day.patio.2026-10-0{}.g{i}", i % 3 + 1);
+        let passing = YoloBox {
+            cx: 0.1 + i as f32 * 0.08,
+            cy: 0.2,
+            w: 0.05,
+            h: 0.1,
+            ..car()
+        };
+        v.push(frame(&name, "day", vec![passing], SplitHint::Train));
+    }
+    for i in 0..12 {
+        let name = format!("day.held.2026-11-01.h{i}");
+        v.push(frame(&name, "day", vec![car()], SplitHint::Heldout));
+    }
+    let sources = [Source {
+        classes: vec!["car".into()],
+        ..source(v)
+    }];
+    let p = planned(&sources, &opts()).unwrap();
+    assert_eq!(p.stats.static_capped, 25, "{:?}", p.stats);
+    let r = report(&p, &sources, &opts(), None);
+    assert_eq!((r.static_capped, r.static_spots), (25, 1));
+    let t = text(&r);
+    assert!(
+        t.contains(
+            "left out: 25 frame(s) showing nothing but parked objects, over the cap per static spot"
+        ),
+        "{t}"
+    );
+    assert!(
+        t.contains("a car on camera patio (45 frames, 20 kept)"),
+        "{t}"
+    );
+    // The same frames with a cat: animals never form a spot, nothing is capped.
+    let cats = [source(
+        sources[0]
+            .frames
+            .iter()
+            .cloned()
+            .map(|mut f| {
+                f.boxes.iter_mut().for_each(|b| b.class = "cat".into());
+                f
+            })
+            .collect(),
+    )];
+    let p = planned(&cats, &opts()).unwrap();
+    assert_eq!((p.stats.static_capped, p.stats.static_spots), (0, 0));
+    // Off: no line, no note.
+    let off = Options {
+        static_cap: None,
+        ..opts()
+    };
+    let p = planned(&sources, &off).unwrap();
+    let t = text(&report(&p, &sources, &off, None));
+    assert!(!t.contains("static spot"), "{t}");
+}

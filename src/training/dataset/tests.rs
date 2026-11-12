@@ -2030,10 +2030,13 @@ fn parked_source(dir: &Path, n: usize, free: usize, spots: &[&str]) -> Source {
 }
 
 /// Every frame in the pool: a split-hinted export with no held-out frame now gets a held-out share.
+/// The static cap is off: these fixtures repeat one box on every frame of one camera, which is a
+/// static spot, and they test the parked cap alone.
 fn no_negatives() -> Options {
     Options {
         negative_share: 0.0,
         heldout_share: 0.0,
+        static_cap: None,
         ..Options::default()
     }
 }
@@ -2410,4 +2413,438 @@ fn a_missing_label_file_is_no_objects_only_outside_our_own_exports() {
     std::fs::write(t.0.join("export.json"), br#"{"formats":["yolo"]}"#).unwrap();
     let e = read_export(&t.0).unwrap_err();
     assert!(format!("{e:#}").contains("a.txt"), "{e:#}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The static cap
+// ---------------------------------------------------------------------------------------------
+
+/// A box of the static cap's tests: (class, cx, cy, w, h).
+type TBox = (&'static str, f32, f32, f32, f32);
+
+/// A frame of camera `patio` for the static cap's tests.
+fn patio_frame(dir: &Path, i: usize, day: usize, scene: &str, boxes: &[TBox]) -> Frame {
+    Frame {
+        image: dir.join(format!("f{i:04}.jpg")),
+        boxes: boxes
+            .iter()
+            .map(|&(class, cx, cy, w, h)| YoloBox {
+                class: class.into(),
+                cx,
+                cy,
+                w,
+                h,
+            })
+            .collect(),
+        ignore: Vec::new(),
+        parked: Vec::new(),
+        scene: Some(scene.into()),
+        camera: "patio".into(),
+        day: format!("2026-10-{day:02}"),
+        split: SplitHint::Train,
+        hard_negative: false,
+        human_rejected: false,
+        bulk_accepted: false,
+        size: Some((640, 480)),
+    }
+}
+
+/// The parked car of the static tests, jittered by frame.
+fn parked_car(i: usize) -> TBox {
+    let j = (i % 5) as f32 * 0.001;
+    ("car", 0.3 + j, 0.6 - j, 0.2, 0.15)
+}
+
+/// A person walking by: at another place on each frame `k`, never a static spot.
+fn person(k: usize) -> TBox {
+    ("person", 0.5 + k as f32 * 0.04, 0.3, 0.05, 0.2)
+}
+const STATIC_SCENES: [&str; 3] = ["day", "night", "ir"];
+
+fn patio_source(dir: &Path, frames: Vec<Frame>) -> Source {
+    Source {
+        dir: dir.to_path_buf(),
+        public: None,
+        classes: vec!["car".into(), "person".into()],
+        frames,
+        warnings: Vec::new(),
+        notes_known: true,
+    }
+}
+
+/// Camera `patio`: 60 frames showing only the parked car (6 days, 3 scenes), 10 with the car and
+/// a person, 10 with a car passing (each at another place), 20 empty, and day 7 held out (10
+/// frames with the car only).
+fn static_source(dir: &Path) -> Source {
+    let mut frames = Vec::new();
+    let mut push = |day: usize, scene: &str, boxes: &[TBox]| {
+        let i = frames.len();
+        frames.push(patio_frame(dir, i, day, scene, boxes));
+    };
+    for k in 0..60 {
+        push(k % 6 + 1, STATIC_SCENES[k % 3], &[parked_car(k)]);
+    }
+    for k in 0..10 {
+        push(k % 6 + 1, "day", &[parked_car(k), person(k)]);
+    }
+    for k in 0..10 {
+        let x = 0.05 + k as f32 * 0.09;
+        push(k % 6 + 1, "day", &[("car", x, 0.2, 0.05, 0.05)]);
+    }
+    for k in 0..20 {
+        push(k % 6 + 1, "night", &[]);
+    }
+    for k in 0..10 {
+        push(7, "day", &[parked_car(k)]);
+    }
+    for f in frames.iter_mut().filter(|f| f.day == "2026-10-07") {
+        f.split = SplitHint::Heldout;
+    }
+    patio_source(dir, frames)
+}
+
+/// Train and valid frames of `p`, each once.
+fn used_frames(p: &Plan) -> BTreeSet<FrameRef> {
+    p.train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect()
+}
+
+/// Whether a frame shows the parked car alone.
+fn car_only(f: &Frame) -> bool {
+    f.boxes.len() == 1 && f.boxes[0].class == "car" && (f.boxes[0].cy - 0.6).abs() < 0.01
+}
+
+fn cap_off() -> Options {
+    Options {
+        static_cap: None,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn frames_of_a_static_spot_are_capped_by_geometry_without_parked_info() {
+    let t = tmp("static-cap");
+    let s = [static_source(&t.0)];
+    assert!(
+        s[0].frames.iter().all(|f| f.parked.is_empty()),
+        "no export info"
+    );
+    let p = plan(&s, &Options::default()).unwrap();
+    assert_eq!(p.stats.static_spots, 1, "{:?}", p.stats);
+    assert_eq!(p.stats.static_capped, 40, "{:?}", p.stats);
+    assert_eq!(p.stats.parked_capped, 0);
+    let used = used_frames(&p);
+    let kept_static = used.iter().filter(|r| car_only(&s[0].frames[r.1])).count();
+    assert_eq!(kept_static, PARKED_CAP);
+    let caps = &p.stats.static_caps;
+    assert_eq!(caps.len(), 1);
+    assert_eq!((caps[0].frames, caps[0].kept), (60, PARKED_CAP));
+    assert_eq!(
+        (caps[0].camera.as_str(), caps[0].label.as_str()),
+        ("patio", "car")
+    );
+    assert!(caps[0].id.starts_with("patio/vehicle/"), "{}", caps[0].id);
+    // A frame with a person, and a passing car, are never left out.
+    let other = |f: &Frame| f.day != "2026-10-07" && !f.boxes.is_empty() && !car_only(f);
+    let others: BTreeSet<FrameRef> = (0..s[0].frames.len())
+        .map(|i| (0, i))
+        .filter(|r| other(&s[0].frames[r.1]))
+        .collect();
+    assert_eq!(others.len(), 20);
+    assert!(others.is_subset(&used), "{:?}", others.difference(&used));
+    // The held-out day is whole.
+    assert_eq!(p.heldout.len(), 10);
+    // The note says what went and how to keep it.
+    let note = static_cap_note(&p.stats, Options::default().static_cap).unwrap();
+    assert!(
+        note.starts_with("40 frame(s) showing nothing but objects parked at 1 static spot(s)"),
+        "{note}"
+    );
+    assert!(
+        note.contains("a car on camera patio (60 frames, 20 kept)"),
+        "{note}"
+    );
+    assert!(note.contains("training.static_cap"), "{note}");
+    // dataset.json lists the spot.
+    let v = serde_json::to_value(&p.stats).unwrap();
+    assert_eq!(v["static_capped"], 40);
+    assert_eq!(v["static_caps"][0]["kept"], 20);
+}
+
+#[test]
+fn the_held_out_set_is_the_same_with_the_static_cap_on_and_off() {
+    let t = tmp("static-held");
+    let mut s = static_source(&t.0);
+    // No split from the export: the plan holds out whole camera days itself.
+    for f in &mut s.frames {
+        f.split = SplitHint::None;
+    }
+    let s = [s];
+    let on = plan(&s, &Options::default()).unwrap();
+    let off = plan(&s, &cap_off()).unwrap();
+    assert!(on.stats.static_capped > 0, "{:?}", on.stats);
+    assert!(!on.heldout.is_empty());
+    assert_eq!(on.heldout, off.heldout);
+    assert_eq!(on.heldout_fingerprint, off.heldout_fingerprint);
+    assert_eq!(on.stats.heldout_groups, off.stats.heldout_groups);
+    // Off: nothing of the cap in the plan.
+    assert_eq!(
+        (
+            off.stats.static_capped,
+            off.stats.static_spots,
+            off.stats.static_caps.len()
+        ),
+        (0, 0, 0)
+    );
+    assert!(static_cap_note(&off.stats, None).is_none());
+}
+
+#[test]
+fn a_static_cap_of_zero_is_the_plan_without_it() {
+    let t = tmp("static-zero");
+    let s = [static_source(&t.0)];
+    let none = plan(&s, &cap_off()).unwrap();
+    let zero = plan(
+        &s,
+        &Options {
+            static_cap: Some(0),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(none, zero);
+    let used = used_frames(&none);
+    assert_eq!(
+        used.iter().filter(|r| car_only(&s[0].frames[r.1])).count(),
+        60
+    );
+    // Options of older runs (no key) read as the default cap; a written null stays off.
+    let old: Options = serde_json::from_value(serde_json::json!({
+        "classes": null, "negative_share": 0.15, "heldout_share": 0.2, "val_share": 0.1,
+        "oversample": 3, "seed": 0
+    }))
+    .unwrap();
+    assert_eq!(old.static_cap, Some(PARKED_CAP));
+    let back: Options = serde_json::from_str(&serde_json::to_string(&cap_off()).unwrap()).unwrap();
+    assert_eq!(back.static_cap, None);
+}
+
+#[test]
+fn the_static_plan_does_not_depend_on_the_frame_order() {
+    let t = tmp("static-order");
+    let a = static_source(&t.0);
+    let mut b = a.clone();
+    b.frames.reverse();
+    b.frames.rotate_left(13);
+    let names = |s: &Source, p: &Plan| {
+        let name = |r: &FrameRef| file_name(&s.frames[r.1].image);
+        let mut train: Vec<(String, u32)> = p.train.iter().map(|(r, n)| (name(r), *n)).collect();
+        train.sort();
+        let valid: BTreeSet<String> = p.valid.iter().map(name).collect();
+        let held: BTreeSet<String> = p.heldout.iter().map(name).collect();
+        (train, valid, held)
+    };
+    let o = Options::default();
+    let pa = plan(std::slice::from_ref(&a), &o).unwrap();
+    let pb = plan(std::slice::from_ref(&b), &o).unwrap();
+    assert!(pa.stats.static_capped > 0);
+    assert_eq!(names(&a, &pa), names(&b, &pb));
+    assert_eq!(pa.stats.static_caps, pb.stats.static_caps);
+    assert_eq!(pa.heldout_fingerprint, pb.heldout_fingerprint);
+    // Another seed keeps as many.
+    let seeded = plan(std::slice::from_ref(&a), &Options { seed: 9, ..o }).unwrap();
+    assert_eq!(seeded.stats.static_capped, pa.stats.static_capped);
+}
+
+#[test]
+fn kept_static_frames_span_the_scenes_and_days_first() {
+    let t = tmp("static-variety");
+    let dir = &t.0;
+    // 3 scenes x 6 days, 4 frames each: 18 groups, 72 frames of the car alone.
+    let mut frames = Vec::new();
+    for day in 1..=6 {
+        for scene in STATIC_SCENES {
+            for _ in 0..4 {
+                let i = frames.len();
+                frames.push(patio_frame(dir, i, day, scene, &[parked_car(i)]));
+            }
+        }
+    }
+    // Something else to train on.
+    for k in 0..5 {
+        let i = frames.len();
+        frames.push(patio_frame(dir, i, k % 6 + 1, "day", &[person(k)]));
+    }
+    let s = [patio_source(dir, frames)];
+    let o = Options {
+        heldout_share: 0.0,
+        ..Options::default()
+    };
+    for seed in 0..4 {
+        let p = plan(&s, &Options { seed, ..o.clone() }).unwrap();
+        let mut groups: BTreeMap<(String, String), usize> = BTreeMap::new();
+        for r in used_frames(&p) {
+            let f = &s[0].frames[r.1];
+            if car_only(f) {
+                *groups
+                    .entry((f.scene.clone().unwrap(), f.day.clone()))
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(groups.values().sum::<usize>(), PARKED_CAP, "seed {seed}");
+        assert_eq!(
+            groups.len(),
+            18,
+            "every scene and day before a second frame of any: {groups:?}"
+        );
+        assert!(groups.values().all(|n| *n <= 2), "{groups:?}");
+    }
+    // Two days, three scenes: 6 groups of 10; the 20 kept are 3 or 4 of each, so 6 or 7 per scene.
+    let mut frames: Vec<Frame> = (0..60)
+        .map(|k| {
+            patio_frame(
+                dir,
+                1000 + k,
+                k % 2 + 1,
+                STATIC_SCENES[k % 3],
+                &[parked_car(k)],
+            )
+        })
+        .collect();
+    frames.push(patio_frame(dir, 2000, 1, "day", &[person(0)]));
+    let s2 = [patio_source(dir, frames)];
+    let p = plan(&s2, &o).unwrap();
+    let mut per_scene: BTreeMap<String, usize> = BTreeMap::new();
+    for r in used_frames(&p) {
+        let f = &s2[0].frames[r.1];
+        if car_only(f) {
+            *per_scene.entry(f.scene.clone().unwrap()).or_default() += 1;
+        }
+    }
+    assert_eq!(per_scene.values().sum::<usize>(), PARKED_CAP);
+    assert!(
+        per_scene.values().all(|n| (6..=7).contains(n)),
+        "{per_scene:?}"
+    );
+}
+
+#[test]
+fn a_frame_of_an_unpicked_class_only_is_a_negative_not_static() {
+    let t = tmp("static-excluded");
+    let s = [static_source(&t.0)];
+    // Only persons train: the car frames are negatives (background), never static.
+    let p = plan(
+        &s,
+        &Options {
+            classes: Some(vec!["person".into()]),
+            negative_share: 0.0,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((p.stats.static_capped, p.stats.static_spots), (0, 0));
+    // The car frames are negatives: with room for them all, every one stays.
+    let p = plan(
+        &s,
+        &Options {
+            classes: Some(vec!["person".into()]),
+            negative_share: 0.9,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(p.stats.static_capped, 0);
+    let used = used_frames(&p);
+    assert_eq!(
+        used.iter().filter(|r| car_only(&s[0].frames[r.1])).count(),
+        60
+    );
+}
+
+#[test]
+fn negatives_follow_the_frames_the_static_cap_left() {
+    let t = tmp("static-negatives");
+    let mut s = static_source(&t.0);
+    for k in 0..100 {
+        let f = patio_frame(&t.0, 5000 + k, k % 6 + 1, "night", &[]);
+        s.frames.push(f);
+    }
+    let s = [s];
+    let o = Options {
+        negative_share: 0.5,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.stats.static_capped, 40);
+    let used = used_frames(&p);
+    let (neg, pos): (Vec<FrameRef>, Vec<FrameRef>) =
+        used.iter().partition(|r| s[0].frames[r.1].boxes.is_empty());
+    // 20 static + 10 with a person + 10 passing cars; as many negatives at a share of 0.5.
+    assert_eq!(pos.len(), 40);
+    assert_eq!(neg.len(), 40);
+}
+
+#[test]
+fn the_parked_cap_runs_first_and_the_static_cap_on_the_rest() {
+    let t = tmp("static-parked");
+    let dir = t.0.clone();
+    let mut frames: Vec<Frame> = (0..80)
+        .map(|k| patio_frame(&dir, k, k % 4 + 1, STATIC_SCENES[k % 3], &[parked_car(k)]))
+        .collect();
+    // The export knew 50 of them as parked-spot frames.
+    for f in frames.iter_mut().take(50) {
+        f.parked = vec!["patio/640x480/car/160,250,290,330".into()];
+    }
+    frames.push(patio_frame(&dir, 100, 1, "day", &[person(0)]));
+    let s = [patio_source(&dir, frames)];
+    let o = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    // 50 parked: 20 kept by the parked cap; then those 20 + 30 static-only: 20 kept.
+    assert_eq!(p.stats.parked_capped, 30);
+    assert_eq!(p.stats.static_capped, 30);
+    assert_eq!(
+        p.stats.static_caps[0].frames, 50,
+        "what the parked cap took out is not counted again"
+    );
+    let used = used_frames(&p);
+    assert_eq!(
+        used.iter().filter(|r| car_only(&s[0].frames[r.1])).count(),
+        PARKED_CAP
+    );
+}
+
+#[test]
+fn a_person_at_one_place_is_never_a_static_spot_nor_capped() {
+    let t = tmp("static-person");
+    let dir = t.0.clone();
+    // Someone sitting at the same place on 40 frames over 4 days, and the parked car on 40
+    // others: the car's frames are capped, the person's never.
+    let sitting: TBox = ("person", 0.7, 0.4, 0.08, 0.25);
+    let mut frames: Vec<Frame> = (0..40)
+        .map(|k| patio_frame(&dir, k, k % 4 + 1, STATIC_SCENES[k % 3], &[sitting]))
+        .collect();
+    frames.extend((0..40).map(|k| patio_frame(&dir, 100 + k, k % 4 + 1, "day", &[parked_car(k)])));
+    let s = [patio_source(&dir, frames)];
+    let o = Options {
+        heldout_share: 0.0,
+        negative_share: 0.0,
+        ..Options::default()
+    };
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.stats.static_spots, 1, "the car's only: {:?}", p.stats);
+    assert_eq!(p.stats.static_capped, 20);
+    assert_eq!(p.stats.static_caps[0].label, "car");
+    let used = used_frames(&p);
+    let persons = used
+        .iter()
+        .filter(|r| s[0].frames[r.1].boxes[0].class == "person")
+        .count();
+    assert_eq!(persons, 40, "every person frame trains");
 }

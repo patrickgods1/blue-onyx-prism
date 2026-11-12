@@ -1802,6 +1802,20 @@ fn refine_replay_on_a_copy() {
     }
     let (found, again) = read_dump(&dump);
     let wanted = job.wanted();
+    let answered_in = |files: &mut dyn Iterator<Item = LabelFile>| {
+        let mut out: BTreeMap<String, usize> = BTreeMap::new();
+        for l in files {
+            for x in l.refine.iter().filter(|x| x.answered()) {
+                *out.entry(format!("{} {:?}", x.kind.as_str(), x.answer))
+                    .or_default() += 1;
+            }
+        }
+        out
+    };
+    println!(
+        "answered suggestions before: {:?}",
+        answered_in(&mut s.frames.iter().map(|f| f.labels.clone()))
+    );
     let mut acc = Acc::new(job.start_report(&s));
     let in_dump = s
         .frames
@@ -1813,7 +1827,8 @@ fn refine_replay_on_a_copy() {
     for i in 0..s.k {
         let (held, train, gone) = job.fold_frames(&s, i);
         let class_boxes = super::super::class_boxes(train.iter().copied(), &wanted);
-        let jctx = job.judge_context(&wanted, &class_boxes);
+        // The selection's one spot table, as the job uses it.
+        let jctx = job.judge_context(&wanted, &class_boxes, &s.spots);
         let rare: Vec<&String> = class_boxes
             .iter()
             .filter(|(_, n)| **n < judge::MIN_CLASS_BOXES)
@@ -1852,9 +1867,28 @@ fn refine_replay_on_a_copy() {
         rep.frames_checked, rep.frames_written
     );
     println!(
-        "found: add {}, verify {}, relabel {}",
-        rep.found.add, rep.found.verify, rep.found.relabel
+        "found: add {} ({} at static spots, {} elsewhere), verify {}, relabel {}",
+        rep.found.add,
+        rep.adds_at_spots,
+        rep.found.add - rep.adds_at_spots,
+        rep.found.verify,
+        rep.found.relabel
     );
+    let spot_recall = |name: &str, r: &report::Recall| {
+        println!(
+            "recall {name}: {} of {} = {:?} (95% {:.3}-{:.3})",
+            r.found, r.boxes, r.recall, r.low, r.high
+        );
+    };
+    println!("static spots {}", rep.static_spots);
+    spot_recall("at static spots", &rep.recall_at_spots);
+    spot_recall("elsewhere", &rep.recall_elsewhere);
+    // The answered suggestions of earlier checks survive a rerun.
+    let mut now = s.frames.iter().filter_map(|f| {
+        let fr = Frame::resolve(&job.dataset_dir, &f.rel.jpg())?;
+        labels::read(&fr.labels).ok().flatten()
+    });
+    println!("answered suggestions after: {:?}", answered_in(&mut now));
     println!(
         "written: add {}, verify {}, relabel {}",
         rep.written.add, rep.written.verify, rep.written.relabel
@@ -1869,4 +1903,135 @@ fn refine_replay_on_a_copy() {
         println!("  warning: {w}");
     }
     println!("{:.1} s", started.elapsed().as_secs_f64());
+}
+
+/// The static spots of a copy of a dataset at several spot IoUs (the measurement behind
+/// [`statics::SPOT_IOU`]): `BOP_REFINE_CONFIG=<config file> cargo test --lib static_spots_measure
+/// -- --ignored --nocapture`. Reads the reviewed frames of the folder under review as the check
+/// selects them; writes nothing.
+#[test]
+#[ignore = "needs a copy of a dataset"]
+fn static_spots_measure_on_a_copy() {
+    use crate::collect::labels::statics::{self, Table};
+    let Some(path) = std::env::var_os("BOP_REFINE_CONFIG").map(PathBuf::from) else {
+        println!("skipped: BOP_REFINE_CONFIG is not set");
+        return;
+    };
+    let cfg = Config::load(&path).unwrap();
+    let dir = cfg.collect.resolved_review_dir(&cfg.data_root());
+    let (classes, hidden) = (&cfg.collect.classes, &cfg.collect.hidden_classes);
+    let s = super::super::select(
+        &dir,
+        classes,
+        hidden,
+        &super::super::RefineFrames::default(),
+        4,
+        0,
+    );
+    let wanted = Wanted { classes, hidden };
+    let obs = statics::observations(&s.frames, &wanted);
+    println!(
+        "{} reviewed frames, {} training boxes of wanted classes",
+        s.frames.len(),
+        obs.len()
+    );
+    let mut all: BTreeMap<String, usize> = BTreeMap::new();
+    for o in &obs {
+        *all.entry(o.label.clone()).or_default() += 1;
+    }
+    // The folder's spots as a "Static objects" card lists them (after a check: open adds).
+    for x in statics::overview(&s.frames, &wanted) {
+        println!(
+            "  spot {}: {} on {} frames of {} days {:?}; labelled frames {}, frames with an open \
+             add {}",
+            x.spot.id,
+            x.spot.label,
+            x.spot.frames,
+            x.spot.days,
+            x.spot.scenes,
+            x.labelled,
+            x.open_adds
+        );
+    }
+    for t in [0.5f32, 0.6, 0.7, 0.8] {
+        let started = Instant::now();
+        let table = Table::build_at(obs.clone(), t);
+        let ms = started.elapsed().as_millis();
+        println!("\n=== spot IoU {t} ({} spots, {ms} ms) ===", table.len());
+        for (cam, spots) in &table.cameras {
+            let mut by_obj: BTreeMap<&str, usize> = BTreeMap::new();
+            for sp in spots {
+                *by_obj.entry(sp.label.as_str()).or_default() += 1;
+            }
+            // Neighbouring spots: the largest IoU between two representatives of one object.
+            let mut max_pair = 0f32;
+            let mut close = 0;
+            for (i, a) in spots.iter().enumerate() {
+                for b in spots.iter().skip(i + 1) {
+                    if a.object == b.object {
+                        let v = labels::iou(&a.bbox, &b.bbox);
+                        max_pair = max_pair.max(v);
+                        close += usize::from(v >= 0.3);
+                    }
+                }
+            }
+            println!(
+                "  camera {cam}: {} spots {by_obj:?}; frames per spot {:?}; max rep-pair IoU \
+                 {max_pair:.2}, pairs >= 0.3: {close}",
+                spots.len(),
+                spots.iter().map(|s| s.frames).collect::<Vec<_>>()
+            );
+        }
+        // Boxes at a spot (matched against the table, as the cap and the judge do), per class.
+        let mut at: BTreeMap<String, usize> = BTreeMap::new();
+        for o in &obs {
+            if table.spot_at(&o.camera, &o.label, &o.bbox).is_some() {
+                *at.entry(o.label.clone()).or_default() += 1;
+            }
+        }
+        for (c, n) in &all {
+            println!(
+                "  {c}: {} of {n} boxes at a spot",
+                at.get(c).copied().unwrap_or(0)
+            );
+        }
+        // Static-only frames, and merged neighbours: frames with two boxes of one object that lie
+        // at the same spot (two cars side by side taken for one place).
+        let mut static_only = 0;
+        let mut positive = 0;
+        let mut doubles = 0;
+        for f in &s.frames {
+            let boxes: Vec<(String, [f32; 4])> = f
+                .labels
+                .training()
+                .filter(|b| !b.is_ignore())
+                .filter_map(|b| {
+                    let c = wanted.class_of(&b.label)?;
+                    Some((
+                        c.to_string(),
+                        statics::normalised(&b.bbox, f.width, f.height)?,
+                    ))
+                })
+                .collect();
+            if boxes.is_empty() {
+                continue;
+            }
+            positive += 1;
+            let mut hit: BTreeMap<&str, usize> = BTreeMap::new();
+            for (c, b) in &boxes {
+                if let Some(sp) = table.spot_at(&f.rel.camera, c, b) {
+                    *hit.entry(sp.id.as_str()).or_default() += 1;
+                }
+            }
+            doubles += usize::from(hit.values().any(|n| *n > 1));
+            if table.static_only(&f.rel.camera, boxes).is_some() {
+                static_only += 1;
+            }
+        }
+        println!(
+            "  static-only frames: {static_only} of {positive} frames with boxes ({} frames); \
+             frames with two boxes at one spot: {doubles}",
+            s.frames.len()
+        );
+    }
 }
