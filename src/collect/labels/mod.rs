@@ -259,9 +259,11 @@ pub const MAX_FLOOR_INPUT: u32 = 4096;
 /// input of `input` pixels, is under `px` pixels is too small for the model family to learn. Measured
 /// on 851 reviewed frames with fold models that never saw the camera day, at 384 px: under 8 px
 /// such objects were found 6% of the time, 8-12 px 37%, 12-24 px 83%, above that 94%. Applied at
-/// export ([`export`]: such a training box is exported as an ignore region), by the dataset check's
-/// judge and by [`bulk::bulk_resolve_small`]; a label file is never rewritten for it, so a floor
-/// change is a re-export.
+/// export ([`export`]: such a training box is exported as an ignore region) and by the dataset
+/// check's judge; an accepted or added label is never rewritten for it, so a floor change is a
+/// re-export. The one rule that writes, [`bulk::bulk_resolve_small`], only dismisses *pending
+/// proposals* on unreviewed frames ([`bulk::SIZE_FLOOR_REASON`]), and [`bulk::bulk_restore_small`]
+/// gives back those a later floor no longer covers.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SizeFloor {
     /// Short side in pixels at the model's input under which an object is too small.
@@ -433,9 +435,9 @@ impl LabelBox {
                 && self.reject_reason == Some(RejectReason::TooSmall))
     }
 
-    /// Set aside by a labelers run, for its score or for its spot ([`bulk::is_dismissal`]):
-    /// rejected, so no label and no live box, but nobody judged it, so no negative and no decision
-    /// either. A reviewer's own verdict clears the reason ([`normalize`]).
+    /// Set aside by a labelers run, for its score or for its spot, or by the size floor rule
+    /// ([`bulk::is_dismissal`]): rejected, so no label and no live box, but nobody judged it, so no
+    /// negative and no decision either. A reviewer's own verdict clears the reason ([`normalize`]).
     pub fn is_dismissed(&self) -> bool {
         self.state == BoxState::Rejected && bulk::is_dismissal(self.reason.as_deref())
     }
@@ -459,7 +461,6 @@ impl LabelBox {
             BoxState::Rejected => {
                 !self.is_dismissed()
                     && self.reject_reason != Some(RejectReason::Duplicate)
-                    && !self.is_size_floor_reject()
                     && !matches!(
                         self.reason.as_deref(),
                         Some(bulk::LOW_SCORE_REASON | bulk::OTHER_CLASS_REASON)
@@ -468,14 +469,12 @@ impl LabelBox {
         }
     }
 
-    /// Rejected as too small by the size floor rule ([`bulk::bulk_resolve_small`]): `reason:
-    /// size_floor` with `reject_reason: too_small`. An ignore region like any too-small reject
-    /// ([`Self::is_ignore`]: no hard negative, not in the repeats history), and no person's
-    /// decision. A reviewer's own verdict on the box ends the mark ([`normalize`]).
-    pub fn is_size_floor_reject(&self) -> bool {
-        self.state == BoxState::Rejected
-            && self.reject_reason == Some(RejectReason::TooSmall)
-            && self.reason.as_deref() == Some(bulk::SIZE_FLOOR_REASON)
+    /// A dismissal ([`Self::is_dismissed`]) by the size floor rule ([`bulk::resolve_small`],
+    /// [`bulk::SIZE_FLOOR_REASON`]): a pending proposal under the floor set aside unseen, which
+    /// [`bulk::restore_small`] gives back when the floor no longer covers it. Like every dismissal a
+    /// reviewer's own verdict ends the mark ([`normalize`]).
+    pub fn is_size_floor_dismissal(&self) -> bool {
+        self.is_dismissed() && self.reason.as_deref() == Some(bulk::SIZE_FLOOR_REASON)
     }
 
     /// A reviewer's verdict on an [`AutoInfo::audit`] box: `Some(true)` real, `Some(false)` not,
@@ -949,10 +948,9 @@ fn label_ok(l: &str) -> bool {
 ///   `classes`, and a frame confirmed empty must have none; `reviewed_at` = `now`;
 /// - `skipped`: `reviewed_at` = `now`; `unreviewed`: no `reviewed_at`;
 /// - `reject_reason` kept on rejected boxes only, `difficult` on the others;
-/// - a dismissal ([`bulk::is_dismissal`]) cleared unless the box is rejected with no reason of a
-///   reviewer's; [`spots::PARKED_REASON`] and its mark cleared unless the box is accepted;
-///   [`bulk::SIZE_FLOOR_REASON`] cleared unless the box is still the floor's too-small reject
-///   ([`LabelBox::is_size_floor_reject`]);
+/// - a dismissal ([`bulk::is_dismissal`], the size floor's too) cleared unless the box is rejected
+///   with no reason of a reviewer's; [`spots::PARKED_REASON`] and its mark cleared unless the box is
+///   accepted;
 /// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
 ///   (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
 ///   `refine` (bounded, [`refine::check`]) kept, `bulk_accepted` and `checked_before_reopen`
@@ -1113,11 +1111,6 @@ pub fn normalize(
             if dismissed || b.reason.as_deref() == Some(REST_REASON) {
                 b.reason = None;
             }
-        }
-        // The size floor's mark stays only on the reject it made: a reviewer who accepted the box
-        // or gave another reason decided it.
-        if b.reason.as_deref() == Some(bulk::SIZE_FLOOR_REASON) && !b.is_size_floor_reject() {
-            b.reason = None;
         }
     }
     if f.status != Status::Unreviewed {
@@ -2438,34 +2431,39 @@ mod tests {
     }
 
     #[test]
-    fn a_size_floor_reject_is_an_ignore_region_and_no_decision_of_a_person() {
+    fn a_size_floor_dismissal_is_no_ignore_region_and_no_decision_of_a_person() {
         let mut b = tests_support::auto_box("person");
         b.state = BoxState::Rejected;
-        b.reject_reason = Some(RejectReason::TooSmall);
         b.reason = Some(bulk::SIZE_FLOOR_REASON.into());
-        assert!(b.is_size_floor_reject() && b.is_ignore() && !b.is_dismissed());
+        assert!(b.is_size_floor_dismissal() && b.is_dismissed());
+        assert!(
+            !b.is_ignore(),
+            "an unseen proposal is no real object: its frame may still be a negative"
+        );
         assert!(!b.has_human_decision(), "a rule made it");
         assert_eq!(b.audit_verdict(), None);
         let f = LabelFile {
             boxes: vec![b.clone()],
             ..LabelFile::default()
         };
-        assert_eq!(f.hard_negatives().count(), 0);
+        assert_eq!(f.hard_negatives().count(), 0, "nobody judged it");
         assert!(!f.has_human_decision());
-        assert!(!unjudged_reject(&b), "a reason was given: it is known real");
-        // A reviewer who rejects it as too small by hand is a person.
+        assert!(unjudged_reject(&b), "a found object may take its place");
+        // A reviewer who rejects it as too small by hand is a person, and that is a region.
         let mut by_hand = b.clone();
         by_hand.reason = None;
+        by_hand.reject_reason = Some(RejectReason::TooSmall);
         assert!(by_hand.has_human_decision() && by_hand.is_ignore());
-        // A reviewer's own verdict ends the mark at the save: accepted, or another reason.
+        // A reviewer's own verdict ends the mark at the save, as for every dismissal: accepted,
+        // or a reason of their own.
         let classes = crate::collect::config::default_classes();
         let mut accepted = b.clone();
         accepted.state = BoxState::Accepted;
-        let mut other = b.clone();
-        other.reject_reason = Some(RejectReason::FalsePositive);
+        let mut too_small = b.clone();
+        too_small.reject_reason = Some(RejectReason::TooSmall);
         let saved = normalize(
             LabelFile {
-                boxes: vec![b.clone(), accepted, other],
+                boxes: vec![b.clone(), accepted, too_small],
                 ..LabelFile::default()
             },
             &classes,
@@ -2477,6 +2475,10 @@ mod tests {
         let reasons: Vec<Option<&str>> = saved.boxes.iter().map(|b| b.reason.as_deref()).collect();
         assert_eq!(reasons, [Some(bulk::SIZE_FLOOR_REASON), None, None]);
         assert!(saved.boxes[1].has_human_decision() && saved.boxes[2].has_human_decision());
+        assert!(
+            saved.boxes[2].is_ignore(),
+            "the reviewer's too small is a region"
+        );
     }
 
     #[test]
@@ -2998,6 +3000,7 @@ mod tests {
             bulk::OTHER_CLASS_REASON,
             bulk::DISMISSED_REASON,
             bulk::SPOT_DISMISSED_REASON,
+            bulk::SIZE_FLOOR_REASON,
             stacks::DUPLICATE_REASON,
         ] {
             let mut f = rejected(why);

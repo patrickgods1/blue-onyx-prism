@@ -43,13 +43,14 @@
 //!    `add`); skipped and unreviewed frames get nothing.
 //!
 //! "Short side at model input" is `min(w / W, h / H) * imgsz` ([`short_px`]), the plan's measure of
-//! too small. With `collect.size_floor` set ([`Context::floor`]) the floor is that one rule instead
+//! too small. With `collect.size_floor` set ([`Context::floor`]) that rule applies too
 //! ([`under_floor`], at the floor's own input size, as the export and the Review page apply it):
-//! "at least [`FLOOR_PX`]" above reads "not under the floor", and a training box under it is an
-//! ignore region of the export, so the check treats it as one: no candidate in steps 2-6 (no
-//! verify, no relabel, no loose count, out of the recall but for its size table, where it counts
-//! with [`BoxFact::under_floor`]), while it still covers detections of its object in step 4 (no add
-//! lands on it).
+//! "at least [`FLOOR_PX`]" above reads "at least [`FLOOR_PX`] and not under the floor", and a
+//! training box under the floor is an ignore region of the export, so the check treats it as one:
+//! no candidate in steps 2-6 (no verify, no relabel, no loose count, out of the recall but for its
+//! size table, where it counts with [`BoxFact::under_floor`]), while it still covers detections of
+//! its object in step 4 (no add lands on it). The fold models themselves train on every label
+//! (their exports apply no floor), so the size table measures what the recipe can find.
 
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
@@ -131,9 +132,9 @@ pub struct Context<'a> {
     pub run: &'a str,
     /// The static spots of the check's selection ([`super::Selected::spots`]); None: no spot rule.
     pub spots: Option<&'a statics::Table>,
-    /// `collect.size_floor`: when set, the judge's floor is this one rule ([`under_floor`], as the
-    /// export and the Review page apply it) instead of [`FLOOR_PX`] at `imgsz`, and a training
-    /// box under it is an ignore region here (see [`judge`]).
+    /// `collect.size_floor`: when set, a training box under it ([`under_floor`], as the export and
+    /// the Review page apply it) is an ignore region here, and nothing under it is suggested; the
+    /// noise rule of [`FLOOR_PX`] at `imgsz` holds as well (see [`judge`]).
     pub floor: Option<SizeFloor>,
 }
 
@@ -290,15 +291,15 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     }
     let wanted = ctx.wanted;
     let size = |b: &[f32; 4]| short_px(b, frame.width, frame.height, ctx.imgsz);
-    // Too small to suggest anything about: under the configured size floor (the export's rule),
-    // else under FLOOR_PX at the fold models' input.
+    // A training box under the configured size floor (the export's rule) is an ignore region of
+    // the export: not judged.
     let floor = ctx.floor.filter(SizeFloor::is_on);
-    let small = |b: &[f32; 4]| match floor {
-        Some(_) => under_floor(b, frame.width, frame.height, floor),
-        None => size(b) < FLOOR_PX,
-    };
-    // A training box under the configured floor is an ignore region of the export: not judged.
-    let ignored = |b: &LabelBox| floor.is_some() && small(&b.bbox);
+    let under = |b: &[f32; 4]| under_floor(b, frame.width, frame.height, floor);
+    let ignored = |b: &LabelBox| under(&b.bbox);
+    // Too small to suggest anything about: under that floor, or under FLOOR_PX at the fold
+    // models' input, whichever is larger (a permissive floor does not let through what the fold
+    // models cannot see).
+    let small = |b: &[f32; 4]| under(b) || size(b) < FLOOR_PX;
     // 1. Candidates: scores within 0..=1 and boxes within the frame (a model's raw output can
     // stray past either, and a suggestion must stay within what a save accepts).
     let dets: Vec<D> = frame
@@ -869,6 +870,37 @@ mod tests {
         assert_eq!(
             kinds(&run_at(&f, &[], &many, off)),
             [Kind::Verify, Kind::Verify]
+        );
+    }
+
+    #[test]
+    fn a_permissive_floor_keeps_the_noise_rule_of_the_fold_models_input() {
+        // 9 px wide on a 640 frame: 9 px at the fold models' 640, under FLOOR_PX, but over a
+        // permissive floor of 8 px at 640.
+        let permissive = Some(SizeFloor {
+            px: 8.0,
+            input: 640,
+        });
+        let thin = [100.0, 100.0, 109.0, 300.0];
+        assert!(short_px(&thin, 640, 480, 640) < FLOOR_PX);
+        assert!(!under_floor(&thin, 640, 480, permissive));
+        let many = many();
+        // A label no model found: no verify, with or without the floor.
+        let f = reviewed(vec![acc("person", thin)]);
+        assert!(run_with(&f, &[], &many).suggestions.is_empty());
+        let j = run_at(&f, &[], &many, permissive);
+        assert!(j.suggestions.is_empty(), "{:?}", j.suggestions);
+        assert_eq!(
+            j.boxes.iter().map(|b| b.under_floor).collect::<Vec<_>>(),
+            [false],
+            "not an ignore region: the floor alone decides that"
+        );
+        // A detection that thin: no add either.
+        let empty = reviewed(vec![]);
+        assert!(
+            run_at(&empty, &[det("person", thin, 0.99)], &many, permissive)
+                .suggestions
+                .is_empty()
         );
     }
 

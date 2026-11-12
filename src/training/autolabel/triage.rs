@@ -550,6 +550,19 @@ pub fn apply_relabel(
     model: &str,
     classes: &[String],
 ) -> RelabelReport {
+    apply_relabel_at(f, dets, boxes, model, classes, None)
+}
+
+/// [`apply_relabel`] knowing the size floor on this frame (`floor`; None = not known), as
+/// [`apply_labelers_at`].
+pub fn apply_relabel_at(
+    f: &mut LabelFile,
+    dets: &[Det],
+    boxes: Vec<LabelBox>,
+    model: &str,
+    classes: &[String],
+    floor: Option<FloorAt>,
+) -> RelabelReport {
     if labelers_path(f) == LabelersPath::Closed {
         let votes = vote(f, &boxes, f.boxes.len());
         return RelabelReport {
@@ -559,7 +572,7 @@ pub fn apply_relabel(
         };
     }
     let why = disagreement(f, dets, model, classes);
-    undismiss_found(f, &boxes);
+    undismiss_found(f, &boxes, floor);
     let existing = f.boxes.len();
     let merged = apply(f, boxes.clone());
     let votes = vote(f, &boxes, existing);
@@ -1122,16 +1135,33 @@ fn apply_spots(
     }
 }
 
+/// The size floor now and the frame's size, for a size floor dismissal a run finds again
+/// ([`undismiss_found`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloorAt {
+    /// `collect.size_floor` (None = off).
+    pub floor: Option<labels::SizeFloor>,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Take away the dismissed boxes of `f` that one of `proposals` found again, same label at IoU >=
 /// [`MATCH_IOU`]: nobody decided on them, so [`merge_proposals`] must not drop the proposal as
 /// covered. It comes back as new, and a labelers run tiers it afresh: the same box scores the same
-/// and is dismissed again, a stronger find or SAM 3's stays visible.
-fn undismiss_found(f: &mut LabelFile, proposals: &[LabelBox]) {
+/// and is dismissed again, a stronger find or SAM 3's stays visible. A size floor dismissal
+/// ([`LabelBox::is_size_floor_dismissal`]) is about size, not score: it goes only for a find that
+/// `floor` (the floor now on this frame) does not cover, and never when `floor` is None (not
+/// known); otherwise it stays and covers the find, which [`merge_proposals`] then drops.
+fn undismiss_found(f: &mut LabelFile, proposals: &[LabelBox], floor: Option<FloorAt>) {
+    let brings_back = |b: &LabelBox, p: &LabelBox| {
+        !b.is_size_floor_dismissal()
+            || floor.is_some_and(|at| !labels::under_floor(&p.bbox, at.width, at.height, at.floor))
+    };
     f.boxes.retain(|b| {
         !b.is_dismissed()
-            || !proposals
-                .iter()
-                .any(|p| p.label == b.label && iou(&b.bbox, &p.bbox) >= MATCH_IOU)
+            || !proposals.iter().any(|p| {
+                p.label == b.label && iou(&b.bbox, &p.bbox) >= MATCH_IOU && brings_back(b, p)
+            })
     });
 }
 
@@ -1158,10 +1188,23 @@ pub fn apply_labelers(
     frame: &str,
     spots: Option<FrameSpots<'_>>,
 ) -> LabelersReport {
+    apply_labelers_at(f, boxes, name, frame, spots, None)
+}
+
+/// [`apply_labelers`] knowing the size floor on this frame (`floor`; None = not known): a size
+/// floor dismissal comes back only for a find the floor does not cover ([`undismiss_found`]).
+pub fn apply_labelers_at(
+    f: &mut LabelFile,
+    boxes: Vec<LabelBox>,
+    name: &str,
+    frame: &str,
+    spots: Option<FrameSpots<'_>>,
+    floor: Option<FloorAt>,
+) -> LabelersReport {
     let mut r = LabelersReport::default();
     let path = labelers_path(f);
     if path == LabelersPath::Merge {
-        undismiss_found(f, &boxes);
+        undismiss_found(f, &boxes, floor);
     }
     let existing = f.boxes.len();
     match path {
@@ -3492,6 +3535,66 @@ mod tests {
         // The same object: a labelers run leaves a rejected box alone, dismissed or not.
         let car = boxes(&[sam("car", CAR, 0.9)]);
         assert_eq!(gate_drop(&f, &car[0]), Some(GateDrop::OnReject));
+    }
+
+    #[test]
+    fn a_size_floor_dismissal_comes_back_only_for_a_find_over_the_floor() {
+        // 640 x 480: at 384 a 60 x 80 box is 36 px on its short side, under a 40 px floor and over
+        // a 30 px one.
+        let at = place("car", false);
+        let floor = |px: f32| FloorAt {
+            floor: Some(labels::SizeFloor { px, input: 384 }),
+            width: 640,
+            height: 480,
+        };
+        let file = || LabelFile {
+            boxes: vec![LabelBox {
+                reason: Some(labels::bulk::SIZE_FLOOR_REASON.into()),
+                ..dismissed("car", at)
+            }],
+            ..LabelFile::default()
+        };
+        let find = || boxes(&[fused("car", at, 0.4, YES)]);
+        // Still under the floor: the dismissal stays and covers the find.
+        let mut f = file();
+        let r = apply_labelers_at(&mut f, find(), "gdino", REL, None, Some(floor(40.0)));
+        assert_eq!((r.apply.merge.added, f.boxes.len()), (0, 1));
+        assert!(f.boxes[0].is_size_floor_dismissal());
+        // A caller that does not know the floor brings none back.
+        let mut g = file();
+        let r = apply_labelers(&mut g, find(), "gdino", REL);
+        assert_eq!((r.apply.merge.added, g.boxes.len()), (0, 1));
+        assert!(g.boxes[0].is_size_floor_dismissal());
+        // A floor that no longer covers the find, or none: it comes in as new, tiered afresh.
+        let off = FloorAt {
+            floor: None,
+            ..floor(40.0)
+        };
+        for at_now in [floor(30.0), off] {
+            let mut h = file();
+            let r = apply_labelers_at(&mut h, find(), "gdino", REL, None, Some(at_now));
+            assert_eq!((r.apply.merge.added, h.boxes.len()), (1, 1), "{at_now:?}");
+            assert!(!h.boxes[0].is_dismissed() && h.boxes[0].state == BoxState::Pending);
+        }
+        // A run with a model the same way.
+        let dets = [Det {
+            label: "car".into(),
+            score: 0.9,
+            bbox: at,
+        }];
+        let run = ModelRun {
+            model: "nano",
+            classes: &classes(),
+            scene: "day",
+            accept_score: None,
+        };
+        let b = || model_boxes(&dets, &run, 640, 480).boxes;
+        let mut m = file();
+        apply_relabel_at(&mut m, &dets, b(), "nano", &classes(), Some(floor(40.0)));
+        assert!(m.boxes.iter().any(LabelBox::is_size_floor_dismissal));
+        let mut n = file();
+        apply_relabel_at(&mut n, &dets, b(), "nano", &classes(), Some(floor(30.0)));
+        assert!(!n.boxes.iter().any(LabelBox::is_dismissed));
     }
 
     #[test]

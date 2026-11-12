@@ -6,23 +6,28 @@
 //!   for the values in the query (a preview before saving; both are needed and checked with
 //!   [`SizeFloor::validate`], 400 otherwise). `counts` ([`export::floor_counts`] over the reviewed
 //!   frames: per class the training boxes, those under the floor and what is left) and `pending`
-//!   ([`bulk::bulk_resolve_small`] as a dry run: the pending proposals the rule would reject) are
-//!   null / zero when no floor is shown. The walk runs off the async workers and is kept 60 s per
-//!   folder, class list and floor, at most [`KEEP`] answers; a floor save and the rule's apply
-//!   drop it. `suggested` is the input size of the last dataset check's recipe, else the newest
-//!   finished training run's, else 384, with 10 px (the measured knee: under 8 px such objects
-//!   were found 6% of the time at 384).
+//!   ([`bulk::bulk_resolve_small`] as a dry run: the pending proposals the rule would hide) are
+//!   null / zero when no floor is shown; `restorable` ([`bulk::bulk_restore_small`] as a dry run
+//!   with the **saved** floor, or none when off) counts the size floor dismissals a restore gives
+//!   back. The walks run off the async workers and are kept 60 s per folder, class list, shown and
+//!   saved floor, at most [`KEEP`] answers; a floor save and the rule's apply drop them.
+//!   `suggested` is the input size of the last dataset check's recipe, else the newest finished
+//!   training run's, else 384, with 10 px (the measured knee: under 8 px such objects were found 6%
+//!   of the time at 384).
 //! - `POST /v1/refine/size-floor` `{px, input}` or `{off: true}`: saves `collect.size_floor`
-//!   through [`save_config`], like the static cap. The label files never change for it: it applies
-//!   at the next export, by the dataset check and by the rule below.
+//!   through [`save_config`], like the static cap. Accepted and added labels never change for it:
+//!   it applies at the next export and in the dataset check; only the rule below writes.
 //! - `POST /v1/refine/ignore-mode` `{mode: "background" | "drop-frame"}`: saves `training.ignore`
 //!   (what a training frame with ignore regions becomes), read by the next training run.
-//! - `POST /v1/refine/resolve-small` `{dry_run?, limit?}`: [`bulk::bulk_resolve_small`] with the
-//!   **saved** floor over the unreviewed frames of the folder under review (the queue and the index
-//!   files): pending model and auto-labeler boxes under it become rejected `too_small` ignore
-//!   regions (`reason: size_floor`), no person's decision. Human, moved, unsure and audit boxes,
-//!   reviewed and skipped frames are never touched, and a frame keeps its status. A dry run counts
-//!   what an apply on the unchanged folder does; at most `limit` frames (500) are written per call.
+//! - `POST /v1/refine/resolve-small` `{dry_run?, limit?, restore?}`: [`bulk::bulk_resolve_small`]
+//!   with the **saved** floor over the unreviewed frames of the folder under review (the queue and
+//!   the index files): pending model and auto-labeler boxes under it are dismissed (`reason:
+//!   size_floor`, [`bulk::SIZE_FLOOR_REASON`]: hidden, no ignore region, no person's decision).
+//!   Human, moved, unsure and audit boxes, reviewed and skipped frames are never touched, and a frame
+//!   keeps its status. With `restore: true` it runs [`bulk::bulk_restore_small`] instead (no saved
+//!   floor needed): the dismissals the saved floor (or none, when off) no longer covers go back to
+//!   pending. A dry run counts what an apply on the unchanged folder does; at most `limit` frames
+//!   (500) are written per call.
 
 use super::refine::{fail, forget_counts, json_body, read_report};
 use super::review::{push_failed, push_past_limit};
@@ -79,10 +84,15 @@ fn floor_opt(f: Option<SizeFloor>) -> serde_json::Value {
 
 /// What one walk knows about a floor.
 struct Computed {
-    counts: FloorCounts,
-    /// Pending proposals the rule would reject, and the unreviewed frames they are on.
+    /// None with no floor shown.
+    counts: Option<FloorCounts>,
+    /// Pending proposals the rule would dismiss under the shown floor, and the unreviewed frames
+    /// they are on.
     pending_boxes: usize,
     pending_frames: usize,
+    /// Size floor dismissals the saved floor (or none) no longer covers: what a restore gives back.
+    restorable_boxes: usize,
+    restorable_frames: usize,
 }
 
 /// The filters of the rule: every unreviewed frame of the folder (the queue and the index files),
@@ -95,14 +105,36 @@ fn rule_filters(classes: &[String], hidden: &[String]) -> Filters {
     }
 }
 
-fn compute(dir: &Path, classes: &[String], hidden: &[String], floor: SizeFloor) -> Computed {
-    let counts = export::floor_counts(dir, classes, floor);
-    let dry = bulk::bulk_resolve_small(dir, &rule_filters(classes, hidden), floor, true, 1);
+/// The walks of one answer: `shown` (the floor asked for or saved; None = none) and `saved` (what a
+/// restore compares with; None = off).
+fn compute(
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    shown: Option<SizeFloor>,
+    saved: Option<SizeFloor>,
+) -> Computed {
+    let filters = rule_filters(classes, hidden);
+    let (counts, pending) = match shown {
+        Some(floor) => (
+            Some(export::floor_counts(dir, classes, floor)),
+            bulk::bulk_resolve_small(dir, &filters, floor, true, 1),
+        ),
+        None => (None, bulk::BulkOutcome::default()),
+    };
+    let back = bulk::bulk_restore_small(dir, &filters, saved, true, 1);
     Computed {
         counts,
-        pending_boxes: dry.boxes,
-        pending_frames: dry.eligible,
+        pending_boxes: pending.boxes,
+        pending_frames: pending.eligible,
+        restorable_boxes: back.boxes,
+        restorable_frames: back.eligible,
     }
+}
+
+/// A floor as part of a cache key (`-` for none).
+fn key_of(f: Option<SizeFloor>) -> String {
+    f.map_or_else(|| "-".into(), |f| format!("{}@{}", f.px.to_bits(), f.input))
 }
 
 struct Kept {
@@ -142,15 +174,16 @@ impl Cache {
         dir: &Path,
         classes: &[String],
         hidden: &[String],
-        floor: SizeFloor,
+        shown: Option<SizeFloor>,
+        saved: Option<SizeFloor>,
     ) -> Arc<Computed> {
         let key = format!(
             "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             dir.display(),
             classes.join("\u{1e}"),
             hidden.join("\u{1e}"),
-            floor.px.to_bits(),
-            floor.input
+            key_of(shown),
+            key_of(saved)
         );
         let fresh = |k: &Kept| k.at.elapsed() < KEEP_FOR;
         if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
@@ -160,7 +193,7 @@ impl Cache {
         if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
             return k.value.clone();
         }
-        let value = Arc::new(compute(dir, classes, hidden, floor));
+        let value = Arc::new(compute(dir, classes, hidden, shown, saved));
         let mut map = self.kept.lock_recover();
         map.retain(|k, v| *k != key && v.at.elapsed() < KEEP_FOR);
         while map.len() >= KEEP {
@@ -244,6 +277,7 @@ fn floor_of(state: &AppState, asked: Option<SizeFloor>) -> serde_json::Value {
         },
         "counts": null,
         "pending": { "boxes": 0, "frames": 0 },
+        "restorable": { "boxes": 0, "frames": 0 },
         "ignore_mode": config.training.ignore.as_str(),
     });
     let Some(o) = v.as_object_mut() else {
@@ -260,21 +294,25 @@ fn floor_of(state: &AppState, asked: Option<SizeFloor>) -> serde_json::Value {
         "suggested".into(),
         serde_json::json!({ "px": SUGGESTED_PX, "input": input, "from": from }),
     );
-    let Some(floor) = shown else {
-        return v;
-    };
     let all = CACHE.computed(
         &dir,
         &config.collect.classes,
         &config.collect.hidden_classes,
-        floor,
+        shown,
+        saved,
     );
-    let per_class: Vec<serde_json::Value> = all
-        .counts
+    o.insert(
+        "restorable".into(),
+        serde_json::json!({ "boxes": all.restorable_boxes, "frames": all.restorable_frames }),
+    );
+    let Some(counts) = &all.counts else {
+        return v;
+    };
+    let per_class: Vec<serde_json::Value> = counts
         .boxes
         .iter()
         .map(|(class, boxes)| {
-            let under = all.counts.under.get(class).copied().unwrap_or(0);
+            let under = counts.under.get(class).copied().unwrap_or(0);
             serde_json::json!({
                 "class": class,
                 "boxes": boxes,
@@ -286,11 +324,11 @@ fn floor_of(state: &AppState, asked: Option<SizeFloor>) -> serde_json::Value {
     o.insert(
         "counts".into(),
         serde_json::json!({
-            "frames": all.counts.frames,
-            "frames_with": all.counts.frames_with,
-            "frames_only": all.counts.frames_only,
+            "frames": counts.frames,
+            "frames_with": counts.frames_with,
+            "frames_only": counts.frames_only,
             "per_class": per_class,
-            "warnings": all.counts.warnings,
+            "warnings": counts.warnings,
         }),
     );
     o.insert(
@@ -425,12 +463,15 @@ struct ResolveBody {
     dry_run: bool,
     #[serde(default)]
     limit: Option<usize>,
+    /// Give back the size floor dismissals the saved floor (or none) no longer covers, instead.
+    #[serde(default)]
+    restore: bool,
 }
 
-/// `POST /v1/refine/resolve-small` with `{dry_run?, limit?}`: see the module docs. 200 `{success,
-/// dry_run, boxes, frames, eligible, failed, failed_count, message}` (`boxes` and `frames`: what a
-/// dry run would change over every eligible frame, what an apply changed), 400 for no saved floor
-/// or a bad field, 503 for an unplugged review folder.
+/// `POST /v1/refine/resolve-small` with `{dry_run?, limit?, restore?}`: see the module docs. 200
+/// `{success, dry_run, restore, boxes, frames, eligible, failed, failed_count, message}` (`boxes` and
+/// `frames`: what a dry run would change over every eligible frame, what an apply changed), 400 for
+/// no saved floor (not with `restore`) or a bad field, 503 for an unplugged review folder.
 pub(super) async fn resolve_small(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -447,15 +488,16 @@ pub(super) async fn resolve_small(
             format!("limit: must be between 1 and {RESOLVE_LIMIT}, got {limit}"),
         );
     }
-    let dry_run = b.dry_run;
+    let (dry_run, restore) = (b.dry_run, b.restore);
     blocking(move || {
         let config = state.config_read().clone();
-        let Some(floor) = config.collect.size_floor else {
+        let saved = config.collect.size_floor;
+        if saved.is_none() && !restore {
             return fail(
                 StatusCode::BAD_REQUEST,
                 "Not run: no size floor is saved. Set one in the Too small card and save it first.",
             );
-        };
+        }
         let dir = config.collect.resolved_review_dir(&config.data_root());
         if let Some(why) = config.collect.review_folder_problem(&dir) {
             return (
@@ -467,7 +509,12 @@ pub(super) async fn resolve_small(
                 .into_response();
         }
         let filters = rule_filters(&config.collect.classes, &config.collect.hidden_classes);
-        let o = bulk::bulk_resolve_small(&dir, &filters, floor, dry_run, limit);
+        let o = match saved {
+            Some(floor) if !restore => {
+                bulk::bulk_resolve_small(&dir, &filters, floor, dry_run, limit)
+            }
+            _ => bulk::bulk_restore_small(&dir, &filters, saved, dry_run, limit),
+        };
         let frames = if dry_run { o.eligible } else { o.done_count };
         if !dry_run {
             // Label writes tell the Review index and the repeats cache themselves; the tab's own
@@ -475,21 +522,35 @@ pub(super) async fn resolve_small(
             forget_counts();
             forget();
         }
-        let mut message = if o.boxes == 0 {
-            "No pending proposals under the size floor on the unreviewed frames.".to_string()
-        } else if dry_run {
-            format!(
-                "Would reject {} pending proposal(s) under the size floor on {} unreviewed \
-                 frame(s) as too small (the frames stay unreviewed).",
+        let mut message = match (restore, o.boxes == 0, dry_run) {
+            (false, true, _) => {
+                "No pending proposals under the size floor on the unreviewed frames.".to_string()
+            }
+            (false, false, true) => format!(
+                "Would hide {} pending proposal(s) under the size floor on {} unreviewed \
+                 frame(s) (the frames stay unreviewed).",
                 o.boxes, o.eligible
-            )
-        } else {
-            format!(
-                "Rejected {} pending proposal(s) under the size floor on {} unreviewed frame(s) \
-                 as too small (ignore regions, not counted as your decisions; the frames stay \
-                 unreviewed).",
+            ),
+            (false, false, false) => format!(
+                "Hid {} pending proposal(s) under the size floor on {} unreviewed frame(s): set \
+                 aside unseen, not counted as your decisions (i shows them on the Review tab); \
+                 the frames stay unreviewed.",
                 o.boxes, o.done_count
-            )
+            ),
+            (true, true, _) => {
+                "No hidden proposal is waiting for a lower size floor on the unreviewed frames."
+                    .to_string()
+            }
+            (true, false, true) => format!(
+                "Would restore {} proposal(s) the size floor no longer covers on {} unreviewed \
+                 frame(s) (back to pending).",
+                o.boxes, o.eligible
+            ),
+            (true, false, false) => format!(
+                "Restored {} proposal(s) the size floor no longer covers on {} unreviewed \
+                 frame(s): pending again, for you to decide on the Review tab.",
+                o.boxes, o.done_count
+            ),
         };
         push_failed(
             &mut message,
@@ -504,12 +565,15 @@ pub(super) async fn resolve_small(
                 frames = o.done_count,
                 failed = o.failed_count,
                 eligible = o.eligible,
-                "refine: pending proposals under the size floor rejected as too small"
+                restore,
+                "refine: pending proposals under the size floor {}",
+                if restore { "restored" } else { "hidden" }
             );
         }
         Json(serde_json::json!({
             "success": true,
             "dry_run": dry_run,
+            "restore": restore,
             "boxes": o.boxes,
             "frames": frames,
             "eligible": o.eligible,
@@ -716,6 +780,7 @@ mod tests {
                     r#"{"limit":501}"#,
                     r#"{"x":1}"#,
                     r#"{"dry_run":"yes"}"#,
+                    r#"{"restore":"yes"}"#,
                 ],
             ),
         ] {
@@ -853,25 +918,27 @@ mod tests {
         };
         // A cache of its own: other tests clear the process's at any time.
         let cache = Cache::new();
-        let first = cache.computed(&review, &classes, &none, f10);
-        let again = cache.computed(&review, &classes, &none, f10);
+        let first = cache.computed(&review, &classes, &none, Some(f10), None);
+        let again = cache.computed(&review, &classes, &none, Some(f10), None);
         assert!(Arc::ptr_eq(&first, &again), "kept");
         forget();
         assert!(Arc::ptr_eq(
             &first,
-            &cache.computed(&review, &classes, &none, f10)
+            &cache.computed(&review, &classes, &none, Some(f10), None)
         ));
-        let other = cache.computed(&review, &classes, &none, f20);
+        let other = cache.computed(&review, &classes, &none, Some(f20), None);
         assert!(!Arc::ptr_eq(&first, &other), "another floor");
+        let saved = cache.computed(&review, &classes, &none, Some(f10), Some(f10));
+        assert!(!Arc::ptr_eq(&first, &saved), "another saved floor");
         let hid = vec!["car".to_string()];
         assert!(!Arc::ptr_eq(
             &first,
-            &cache.computed(&review, &classes, &hid, f10)
+            &cache.computed(&review, &classes, &hid, Some(f10), None)
         ));
         cache.forget();
         assert!(!Arc::ptr_eq(
             &first,
-            &cache.computed(&review, &classes, &none, f10)
+            &cache.computed(&review, &classes, &none, Some(f10), None)
         ));
         // Bounded: many floors never keep more than KEEP answers.
         for px in 1..=20 {
@@ -879,10 +946,11 @@ mod tests {
                 &review,
                 &classes,
                 &none,
-                SizeFloor {
+                Some(SizeFloor {
                     px: px as f32,
                     input: 384,
-                },
+                }),
+                None,
             );
         }
         assert!(cache.kept.lock_recover().len() <= KEEP);
@@ -1035,9 +1103,11 @@ mod tests {
             (Some(3), Some(2), Some(2))
         );
         assert_eq!(dry["dry_run"], true);
-        assert!(dry["message"].as_str().unwrap().starts_with(
-            "Would reject 3 pending proposal(s) under the size floor on 2 unreviewed"
-        ));
+        assert!(
+            dry["message"].as_str().unwrap().starts_with(
+                "Would hide 3 pending proposal(s) under the size floor on 2 unreviewed"
+            )
+        );
         let same: Vec<labels::LabelFile> = names.iter().map(|n| file(&review, &rel(n))).collect();
         assert_eq!(same, before, "a dry run writes nothing");
 
@@ -1057,7 +1127,7 @@ mod tests {
             done["message"]
                 .as_str()
                 .unwrap()
-                .starts_with("Rejected 3 pending proposal(s)")
+                .starts_with("Hid 3 pending proposal(s)")
         );
         let after: Vec<labels::LabelFile> = names.iter().map(|n| file(&review, &rel(n))).collect();
         for (i, (b, a)) in before.iter().zip(&after).enumerate() {
@@ -1078,11 +1148,11 @@ mod tests {
                         ],
                         "the big proposal waits"
                     );
-                    assert!(a.boxes[0].is_ignore() && a.boxes[0].is_size_floor_reject());
+                    assert!(!a.boxes[0].is_ignore() && a.boxes[0].is_size_floor_dismissal());
                 }
                 "u2" => {
                     assert_eq!(a.boxes[0].state, BoxState::Rejected);
-                    assert!(a.boxes[0].is_size_floor_reject());
+                    assert!(a.boxes[0].is_size_floor_dismissal());
                 }
                 // Reviewed frames, and a frame with a drawn box, are untouched.
                 _ => assert_eq!(a, b, "{} is untouched", names[i]),
@@ -1114,6 +1184,98 @@ mod tests {
             serde_json::json!({"boxes": 0, "frames": 0}),
             "the kept answer was dropped by the apply"
         );
+        assert_eq!(
+            card["restorable"],
+            serde_json::json!({"boxes": 0, "frames": 0}),
+            "the saved floor still covers them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lower_floor_or_none_gives_the_hidden_proposals_back() {
+        let dir = scratch();
+        let review = folder(&dir);
+        let state = state_in(&dir);
+        let save = |body: &'static str| {
+            let state = state.clone();
+            async move {
+                let (s, v) = json(&state, post_json("/v1/refine/size-floor", body)).await;
+                assert_eq!(s, StatusCode::OK, "{v}");
+            }
+        };
+        save(r#"{"px":10,"input":384}"#).await;
+        json(&state, post_json("/v1/refine/resolve-small", "{}")).await;
+        let u1 = || file(&review, "ir/yard/2026-10-21/u1.jpg");
+        let hidden = u1();
+        assert!(hidden.boxes[0].is_size_floor_dismissal());
+        // 6 px boxes: a 6 px floor no longer covers them (not under 6).
+        save(r#"{"px":6,"input":384}"#).await;
+        let (_, card) = json(&state, get("/v1/refine/floor")).await;
+        assert_eq!(
+            card["restorable"],
+            serde_json::json!({"boxes": 3, "frames": 2}),
+            "{card}"
+        );
+        let (s, dry) = json(
+            &state,
+            post_json(
+                "/v1/refine/resolve-small",
+                r#"{"restore":true,"dry_run":true}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{dry}");
+        assert_eq!(
+            (
+                dry["boxes"].as_u64(),
+                dry["frames"].as_u64(),
+                dry["restore"].as_bool()
+            ),
+            (Some(3), Some(2), Some(true))
+        );
+        assert_eq!(u1(), hidden, "a dry run writes nothing");
+        let (_, done) = json(
+            &state,
+            post_json("/v1/refine/resolve-small", r#"{"restore":true}"#),
+        )
+        .await;
+        assert_eq!(
+            (done["boxes"].as_u64(), done["frames"].as_u64()),
+            (dry["boxes"].as_u64(), dry["frames"].as_u64()),
+            "dry run = apply: {done}"
+        );
+        assert!(
+            done["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Restored 3 proposal(s)")
+        );
+        let back = u1();
+        assert_eq!(
+            back.boxes
+                .iter()
+                .map(|b| (b.state, b.reason.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (BoxState::Pending, None),
+                (BoxState::Pending, None),
+                (BoxState::Pending, None)
+            ]
+        );
+        // Hidden again under the old floor, then the floor off: a restore needs no saved floor.
+        save(r#"{"px":10,"input":384}"#).await;
+        json(&state, post_json("/v1/refine/resolve-small", "{}")).await;
+        save(r#"{"off":true}"#).await;
+        let (_, card) = json(&state, get("/v1/refine/floor")).await;
+        assert_eq!(card["restorable"]["boxes"], 3, "{card}");
+        let (s, done) = json(
+            &state,
+            post_json("/v1/refine/resolve-small", r#"{"restore":true}"#),
+        )
+        .await;
+        assert_eq!((s, done["boxes"].as_u64()), (StatusCode::OK, Some(3)));
+        let (_, card) = json(&state, get("/v1/refine/floor")).await;
+        assert_eq!(card["restorable"]["boxes"], 0, "{card}");
     }
 
     #[tokio::test]

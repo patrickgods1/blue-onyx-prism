@@ -384,7 +384,6 @@ impl RefineJob {
             &self.request.frames,
             self.request.folds,
             self.min_frames,
-            self.config.collect.size_floor,
         )
     }
 
@@ -443,6 +442,11 @@ impl RefineJob {
         let k = s.k;
         let recipe = &self.train.request.recipe;
         let mut rep = RefineReport::new(&self.id, k, recipe_info(recipe, &self.recipe_from));
+        // The fold models train on every label; the judge treats boxes under the floor as ignore
+        // regions. What the recall by size was measured with.
+        rep.folds_every_label = true;
+        rep.size_floor = self.config.collect.size_floor;
+        rep.ignore_mode = Some(self.train.options.ignore);
         rep.camera_days = s.groups.len();
         rep.frames_selected = s.frames.len();
         rep.static_spots = s.spots.len();
@@ -600,8 +604,11 @@ impl RefineJob {
             benchmark_split: BenchSplit::Val,
             include_unreviewed: false,
             hidden_classes: Vec::new(),
-            // The fold models train as a run would on an export of today's settings.
-            size_floor: self.config.collect.size_floor,
+            // No size floor: the fold models try to learn every label, as in the measurement the
+            // floor is chosen from (models trained under a floor would never find what it left
+            // out, and the recall by size would only repeat the floor). The judge still treats
+            // a box under the floor as an ignore region.
+            size_floor: None,
         };
         let exported = export::run_selected(
             &self.dataset_dir,
@@ -629,6 +636,8 @@ impl RefineJob {
         tj.request.install_dir = Some(fold_dir.join("model"));
         tj.keep_work = false;
         tj.export_only = None;
+        // Its export has no floor on purpose: no warning that it differs from the current one.
+        tj.options.size_floor = None;
         let trained = job::run_training_holding(
             &tj,
             lock,

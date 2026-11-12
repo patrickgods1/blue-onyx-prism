@@ -57,6 +57,8 @@ struct TrainerFake {
     leak_renamed: bool,
     /// What each run trained on: `train.txt` + `valid.txt` names.
     trained: Mutex<Vec<String>>,
+    /// The `export.json` of each run's fold export.
+    exports: Mutex<Vec<serde_json::Value>>,
 }
 
 impl CommandRunner for TrainerFake {
@@ -124,6 +126,13 @@ impl CommandRunner for TrainerFake {
                 .lock()
                 .unwrap()
                 .extend(t.lines().map(str::to_string));
+        }
+        let report = data.parent().unwrap().join("export").join("export.json");
+        if let Ok(b) = std::fs::read(&report) {
+            self.exports
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&b).unwrap());
         }
         on_line(
             r#"@train {"event":"start","device":"cuda:0","train_images":9,"valid_images":3,"epochs":2}"#,
@@ -531,6 +540,49 @@ fn a_check_writes_suggestions_and_the_report_and_nothing_else() {
     // The work folder is gone, and so is its empty parent.
     assert!(!job.work.exists());
     assert!(!t.0.join("training").join("refine").exists());
+}
+
+#[test]
+fn the_fold_models_train_on_every_label_and_the_report_names_the_floor() {
+    let t = tmp("floor-folds");
+    let dir = t.0.join("dataset");
+    let rels = dataset(&dir);
+    // A second car on every frame, 4 px wide of 320: 4.8 px at 384, under a 10 px floor.
+    for rel in &rels {
+        edit(&dir, rel, |l| {
+            l.boxes.push(accepted("car", [250.0, 10.0, 254.0, 60.0]));
+        });
+    }
+    let mut cfg = config(&t.0);
+    cfg.collect.size_floor = Some(crate::collect::labels::SizeFloor {
+        px: 10.0,
+        input: 384,
+    });
+    let predictor = Arc::new(PredictorFake::default());
+    let fake = trainer();
+    let mut job = plan_refine(&cfg, RefineRequest::default(), &host()).unwrap();
+    job.min_frames = 4;
+    job.predictor = Some(predictor.clone());
+    let out = run(&job, &fake).unwrap();
+    let exports = fake.exports.lock().unwrap();
+    assert_eq!(exports.len(), 4);
+    for e in exports.iter() {
+        assert!(
+            e.get("size_floor").is_none() && e.get("under_floor").is_none(),
+            "a fold export applies no floor: {e}"
+        );
+        assert_eq!(e["ignore_boxes"], 0, "{e}");
+    }
+    let r = &out.result;
+    assert_eq!(r["folds_every_label"], true, "{r}");
+    assert_eq!(
+        r["size_floor"],
+        serde_json::json!({"px": 10.0, "input": 384})
+    );
+    assert_eq!(r["ignore_mode"], "background");
+    // The fold models trained on both cars of each frame, so the class counts hold them: the small
+    // car is still no verify (an ignore region for the judge).
+    assert_eq!(r["found"]["verify"], 0, "{r}");
 }
 
 #[test]
@@ -1930,7 +1982,6 @@ fn static_spots_measure_on_a_copy() {
         &super::super::RefineFrames::default(),
         4,
         0,
-        cfg.collect.size_floor,
     );
     let wanted = Wanted { classes, hidden };
     let obs = statics::observations(&s.frames, &wanted);
@@ -2157,7 +2208,8 @@ fn static_spots_measure_on_a_copy() {
 /// -- --ignored --nocapture`. Reads the reviewed frames of the folder under review; counts the
 /// boxes under the floor (`BOP_FLOOR=<px>,<input>`, default 10,384); then exports the folder into
 /// `BOP_FLOOR_OUT` with the floor off and on (YOLO only, images copied or linked there: never into
-/// the dataset) and plans a training run on each export in both ignore modes (plan only). Never
+/// the dataset) and plans a training run on each export in both ignore modes (plan only), and the
+/// floor's export for runs at 384 and 640 px (background, static cap off: `floor_restored`). Never
 /// point `BOP_FLOOR_OUT` at a folder someone uses.
 #[test]
 #[ignore = "needs a copy of a dataset"]
@@ -2269,6 +2321,51 @@ fn size_floor_measure_on_a_copy() {
                 s.ignore_boxes_background,
                 &p.heldout_fingerprint[..12]
             );
+        }
+        // The floor's export planned for runs of a known input size (background, no static cap):
+        // its regions are judged again at the run's input.
+        if f.is_none() {
+            continue;
+        }
+        for imgsz in [384, 640] {
+            let o = dataset::Options {
+                negative_share: t.negative_share,
+                heldout_share: t.heldout_share,
+                oversample: t.oversample,
+                static_cap: None,
+                ignore: IgnoreMode::Background,
+                imgsz: Some(imgsz),
+                size_floor: Some(floor),
+                ..dataset::Options::default()
+            };
+            let p = crate::training::preflight::planned(&sources, &o).unwrap();
+            let s = &p.stats;
+            println!(
+                "  background at imgsz {imgsz}, static cap off: training {} (positives {}, \
+                 negatives {}), validation {}, held out {}; boxes {:?}",
+                p.train.len(),
+                s.train_positives,
+                s.train_negatives,
+                p.valid.len(),
+                p.heldout.len(),
+                s.train_boxes
+            );
+            println!(
+                "    trained with a region as background {} {:?}; left out {} (only regions {}, \
+                 validation days {}); floor_restored {:?}; negatives trimmed {}; held-out \
+                 fingerprint {}",
+                s.ignore_kept,
+                s.ignore_boxes_background,
+                s.ignore_frames,
+                s.ignore_only,
+                s.ignore_valid_day,
+                s.floor_restored,
+                s.negatives_trimmed,
+                &p.heldout_fingerprint[..12]
+            );
+            for w in p.warnings.iter().filter(|w| w.contains("size floor")) {
+                println!("    warning: {w}");
+            }
         }
     }
 }

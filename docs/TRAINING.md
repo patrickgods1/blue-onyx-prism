@@ -399,11 +399,26 @@ training.
 
 ### Ignore regions
 
+> **Changed default (this version): `training.ignore` is `background`.** Earlier versions left out of
+> training and validation every frame that held an unsure or too-small object. Now such a frame trains
+> with the object unlabelled when it also holds a label of the run's classes; only a frame of nothing but
+> such objects is left out. Runs on the same data therefore differ from earlier ones: more training
+> frames, other validation days (a validated day takes its frames with such objects out of both sides),
+> and another number of negatives (their target follows the positive frames). To get the old behaviour
+> back, set `training.ignore` to `drop-frame` (the Refine tab's *Too small* card, or `--ignore drop-frame`
+> on `train prepare|run`). Each run records its mode (`progress.settings.ignore`), and the Comparison card
+> warns when the runs it compares differ in it.
+
 An unsure box (Review tab `d`), a box rejected as too small (the *Too small* button) or, with
 `collect.size_floor` set, a training box under the size floor (`docs/DATASET.md`, Size floor) means "a
 real object, do not train on it" (`docs/DATASET.md`, Ignore regions). None of the trainers here can leave
 a box out of its loss: Ultralytics and transformers show no ignore support and RF-DETR's crowd handling
-makes such a box background. `training.ignore` (`--ignore` on `train prepare|run`) decides:
+makes such a box background. So either the object trains as background or its frame goes. Measured on 851
+reviewed frames with fold models that never saw the camera day (384 px input), objects under about one
+patch are found 6% of the time (under 8 px; 37% at 8-12 px), so as background they teach little that is
+wrong, while leaving the frame out cost every other label on it (with the floor at 10 px / 384 on that
+data, `drop-frame` trained on 527 frames with 136 person boxes, `background` on 568 with all 164).
+`training.ignore` (`--ignore` on `train prepare|run`) decides:
 
 - **`background` (default):** a train frame with a region and at least one box of the run's classes trains
   with the region simply unlabelled (`ignore_kept`, the regions per class in `ignore_boxes_background`). A
@@ -412,9 +427,15 @@ makes such a box background. `training.ignore` (`--ignore` on `train prepare|run
   confirmed empty or not. Validation never holds a frame with a region (the trainer's validation cannot
   ignore one): when its camera day is picked for validation it leaves both sides (`ignore_valid_day`; the
   day is validation's), and that day's loss counts toward the rule that validation takes at most half of a
-  class's boxes. Without a validation split the trainer validates on the training frames without regions.
+  class's boxes. Positives that leave this way do not count for the negative target: the training negatives
+  are trimmed to the positives that train or validate (`negatives_trimmed`, also in `negatives_dropped`;
+  validation's negatives stay). The parked and static caps run before validation is chosen and are not run
+  again, so a capped spot may keep one frame fewer than its cap. When every frame of your own has a region
+  and the public subset is mixed in, validation is the public frames only, with a warning. Without a
+  validation split the trainer validates on the training frames without regions.
 - **`drop-frame`:** every train / valid frame with a region is left out, as earlier versions did; one
-  unsure or tiny object takes its whole frame out of training.
+  unsure or tiny object takes its whole frame out of training. No frame with a region is in the pool, so
+  nothing leaves with a validation day and no negative is trimmed.
 
 `ignore_frames` in `dataset.json` counts the frames left out for regions (in `background` mode
 `ignore_only + ignore_valid_day`), with a warning; `dataset.json` records the mode in `options.ignore`, and
@@ -427,10 +448,37 @@ on the mode.
   predictions of that label are not scored. A detection of the region's label that overlaps it at the IoU
   being scored counts neither way (a detection of another label is still a false positive), the region is
   never a miss, and a frame of regions only is scored as empty. A frame with no objects stays an empty list,
-  so it stays scored as empty.
+  so it stays scored as empty. So the benchmark's "empty frames" (false alerts on frames without objects)
+  include frames whose only objects are ignore regions: an alert on such a frame away from the region
+  counts as a false alert, one on it does not count. That was so for unsure boxes before; a size floor adds
+  frames of only tiny objects.
 
 An export from an older version has no `ignore.json`, so its unsure objects stay unlabelled in training:
 export again.
+
+**The size floor at the run's input.** An export applies `collect.size_floor` at the floor's own `input`
+(`ignore.json` holds the floor, and marks each region it made `size_floor`). A run trains at its recipe's
+`imgsz` (`dataset::Options::imgsz`), and the plan compares the two:
+
+- **Larger input** (a floor at 384, a run at 640): every size floor region of a train / valid frame is judged
+  again at the run's input; one that is not under the floor's `px` there is given back as an ordinary box of
+  its label, mapped through the run's classes and renames like any box (`floor_restored` per label in
+  `dataset.json`, the pre-flight's "under the export's size floor but not at this run's input" line, and a
+  warning). A frame whose regions all come back is a plain frame again (it may validate). Held-out frames
+  keep their regions exactly as exported, so the held-out set and its fingerprint do not change, and a
+  detection on such a region still counts neither way.
+- **Smaller input** (a floor at 640, a run at 384): a box cannot be turned into a region by the plan, so it
+  warns: "this run trains at 384 px, but the size floor of `<export>` was applied at 640: objects of 6.0 to
+  10 px at this run's input are still labels (N on its training frames), though it cannot learn them;
+  export again with the floor's input set to 384".
+- **Unknown** (`train prepare` names no model, so `train prepare` and its `--dry-run` plan with no input
+  size): nothing is given back, and a warning names the export's floor and the regions it made.
+
+The plan also compares the exports' floors: exports made with different floors are named together ("the
+exports were made with different size floors: ..."; a frame in two exports keeps the first one's copy), and
+with `collect.size_floor` set, an export made without a floor ("before it was set, or by an older version")
+or with another one is named with "export again". A floor that is off is not compared (`dataset::Options::
+size_floor` None).
 
 A size floor changes what an export marks as ignore regions, held-out frames included, and so the
 held-out set's fingerprint: benchmark scores of runs trained before and after a floor change do not
@@ -1835,7 +1883,12 @@ never saw. Before it runs, the job reads the fold model's `train.txt` and `valid
 error if a frame of its own fold is in either, by name and by the source the dataset recorded for each
 image (`image_sources.json` beside the lists: the dataset cuts long names and numbers a name taken twice,
 so a name alone could miss one). The fold model is the training run as it is (`train run`'s
-stages), installed in the job's work folder, registered nowhere and benchmarked never.
+stages), installed in the job's work folder, registered nowhere and benchmarked never. Its export applies no
+size floor, whatever `collect.size_floor` says: the fold models try to learn every label, so the recall by
+size measures what a model of the recipe finds (a model trained under the floor would never find what the
+floor left out, and the table would only repeat the floor). The judge still treats a box under the floor
+as an ignore region, and the per-fold class counts behind `verify` count what the fold model trained on,
+boxes under the floor included.
 
 **The judge** (`refine/judge.rs`, pure) compares the detections of a fold model at score 0.15 or more
 with the frame's training boxes, ignore regions left out. It matches same-object pairs one to one first (best IoU first; car, truck,
@@ -1858,7 +1911,7 @@ The constants (`judge.rs`):
 | `GOOD_IOU` | 0.75 | IoU from which a pair is a good label; below it the label is loose. |
 | `ADD_SCORE` | 0.5 | Score from which an unmatched detection is a missing box. |
 | `ADD_SCORE_AT_SPOT` | 0.3 | The same at a static spot (never for people or animals, which form no spot): measured on the kept 8-epoch fold detections of 851 frames, an uncovered detection at a place labelled on 10 or more other frames of its camera is real about 90% of the time down to 0.3, while elsewhere detections at 0.3-0.5 are almost all false. |
-| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. With `collect.size_floor` set, the floor is that rule instead (the export's, at its own input size), and a training box under it is an ignore region for the check: no `verify`, `relabel` or loose count, out of the recall but for `recall_by_size` (where it still counts, so a floor can be chosen from it), while it still covers detections of its object (no `add` on it). |
+| `FLOOR_PX` | 10 | Short side `min(w / W, h / H) * imgsz` under which no `add` or `verify` is made. With `collect.size_floor` set, that rule applies as well (the export's, at its own input size; nothing under either is suggested, so a permissive floor never lets through what the fold models cannot see), and a training box under the floor is an ignore region for the check: no `verify`, `relabel` or loose count, out of the recall but for `recall_by_size` (where it still counts, so a floor can be chosen from it), while it still covers detections of its object (no `add` on it). |
 | `VERIFY_IOU` | 0.3 | IoU from which a detection of the object has found a training box. |
 | `MIN_CLASS_BOXES` | 50 | Boxes of a class in what the fold model trained on (the selection without the fold's frames) from which a `verify` is made for it: a camera day that holds most of a class leaves its own fold model few. |
 | `RELABEL_IOU` | 0.7 | IoU from which another object's detection lies on a training box. |
@@ -2050,7 +2103,11 @@ the dataset walkers and retention do not look in `refine/`). Fields: `version`, 
 (short side at model input: under 8, 8-12, 12-24, 24-48, 48+ px), `static_spots` (spots of the selection),
 `recall_at_spots` and `recall_elsewhere` (training boxes at a static spot that holds without their
 camera-day, and the others), `adds_at_spots` (of `found.add`, those at a spot; the last four absent in
-reports of earlier checks, read as 0) and `warnings`. Each recall has `boxes`,
+reports of earlier checks, read as 0), `folds_every_label` (true: the fold exports applied no size floor, so
+the fold models trained on every label; false in reports of earlier checks, whose fold exports applied the
+floor in force then), `size_floor` (the `collect.size_floor` the judge used; absent when off or in earlier
+reports), `ignore_mode` (`training.ignore` the fold models trained with; absent in earlier reports) and
+`warnings`. Each recall has `boxes`,
 `found`, `recall` and a Wilson 95% interval (`low`, `high`): how often a fold model found the labelled
 objects of days it never saw, at score 0.3 and IoU 0.5.
 
@@ -2182,11 +2239,15 @@ web UI and shows its results; the check itself is the one above and changes no b
 - **Too small** (between Static objects and Coverage; `server/refine_floor.rs`): the size floor
   (`collect.size_floor` `{px, input}`: a box whose short side at the model input is under `px` pixels is too
   small; default off) and the ignore mode (`training.ignore`). Objects below about one patch of the model's
-  input cannot be learned, so with a floor they are left out of the labels at export (the label files are
-  never changed) and a detection on one counts neither for nor against a model on held-out frames. The card
-  shows, top to bottom:
+  input cannot be learned, so with a floor they are left out of the labels at export (accepted and added
+  labels are never rewritten) and a detection on one counts neither for nor against a model on held-out
+  frames. The one rule here that writes only hides *pending proposals* under the floor on unreviewed
+  frames, and those can be restored. The card shows, top to bottom:
   - the last check's **recall by size** (the report's `recall_by_size` and its input size; it lives here, not on
-    Coverage, which points to it);
+    Coverage, which points to it), with how it was measured: "Measured with fold models trained on every
+    label; the check treated labels under N px at <input> as ignore regions (counted in this table only)." (or
+    "no size floor was set."); a report of an earlier check says its fold models may have trained under the
+    floor then saved;
   - the **floor form**: `px` (1..=64) and `input` (64..=4096), prefilled with the saved floor or, when off, the
     suggestion (10 px at the last check's input size, else the newest finished training run's, else 384).
     *Preview* asks `GET /v1/refine/floor?px=&input=` for the form's values and shows, per class, the boxes,
@@ -2195,42 +2256,67 @@ web UI and shows its results; the check itself is the one above and changes no b
     labels; a class the floor does not touch is never flagged. *Save* and *Turn off* (shown when one is
     saved) post `POST /v1/refine/size-floor`. Next to them: "Applies to the next export. Held-out scores from
     before and after a change do not compare, because the held-out labels change.";
-  - with a floor saved and pending proposals under it, *Resolve N pending proposals as too small...*: the rule
-    `POST /v1/refine/resolve-small`, asked inline like the static spots (a dry run, "Reject N pending
-    auto-label proposals on M unreviewed frames as too small (under the floor). They become ignore regions,
-    are not counted as your decisions, and you can accept one again on the Review tab.", then the write);
+  - with a floor saved and pending proposals under it, *Hide N pending proposals under the floor...*: the rule
+    `POST /v1/refine/resolve-small`, asked inline like the static spots (a dry run, "Hide N pending
+    auto-label proposals on M unreviewed frames as under the floor. They are set aside unseen like the
+    auto-labelers' hidden boxes: no label, no negative, not counted as your decisions. i on the Review tab
+    shows them, and they can be restored here if the floor goes down or off.", then the write);
+  - with hidden proposals the saved floor (or none, when off) no longer covers, *Restore N proposals the floor
+    no longer covers...*: the same route with `restore: true`, asked the same way ("Restore N hidden
+    proposals on M unreviewed frames that the size floor no longer covers: they become pending again, for you
+    to decide on the Review tab.");
   - the **ignore mode**: *Keep the frame, train the object as background* (default) or *Leave the frame out of
     training*, with *Save* (`POST /v1/refine/ignore-mode`); see "Ignore regions". The Train tab's pre-flight
     shows its effect: frames trained with an unlabelled object (`ignore_kept`, per class), frames left out
     for nothing but ignore regions (`ignore_only`) or because their camera day validates
-    (`ignore_valid_day`), or, in `drop-frame`, every frame with a region (`ignore_frames`).
+    (`ignore_valid_day`), or, in `drop-frame`, every frame with a region (`ignore_frames`), and the size floor
+    regions given back at the run's input (`floor_restored`).
   - Routes (admin, HTTPS, same-site; POSTs take 4 KiB JSON, unknown fields refused):
     - `GET /v1/refine/floor[?px=&input=]` answers `{success, folder_missing, message?, saved: {px,input}|null,
       shown: {px,input}|null, suggested: {px, input, from: "last_check"|"last_run"|"default"}, bounds:
       {px_min, px_max, input_min, input_max}, counts: {frames, frames_with, frames_only, per_class: [{class,
-      boxes, under, left}], warnings}|null, pending: {boxes, frames}, ignore_mode}`. `shown` is the query's
-      floor, else the saved one (no query); both `px` and `input` or neither, checked like a saved floor (400).
-      `counts` (`export::floor_counts` over the reviewed frames) and `pending` (the rule's dry run for the shown
-      floor) are null / zero with no floor shown. Off the async workers; kept 60 s per folder, class list and
-      floor (at most 8), dropped by a floor save and by the rule's apply.
+      boxes, under, left}], warnings}|null, pending: {boxes, frames}, restorable: {boxes, frames},
+      ignore_mode}`. `shown` is the query's floor, else the saved one (no query); both `px` and `input` or
+      neither, checked like a saved floor (400). `counts` (`export::floor_counts` over the reviewed frames) and
+      `pending` (the rule's dry run for the shown floor) are null / zero with no floor shown; `restorable` is the
+      restore's dry run with the **saved** floor (every size floor dismissal when the floor is off). Off the
+      async workers; kept 60 s per folder, class list, shown and saved floor (at most 8), dropped by a floor
+      save and by the rule's apply.
     - `POST /v1/refine/size-floor` `{px, input}` or `{off: true}` answers `{success, message, size_floor}`
       (null when off); 400 out of bounds or for both / neither.
     - `POST /v1/refine/ignore-mode` `{mode: "background" | "drop-frame"}` answers `{success, message, mode}`.
-    - `POST /v1/refine/resolve-small` `{dry_run?, limit?}` (`limit` 1..=500, default 500) runs
+    - `POST /v1/refine/resolve-small` `{dry_run?, limit?, restore?}` (`limit` 1..=500, default 500) runs
       `bulk::bulk_resolve_small` with the **saved** floor (400 when none is saved; 503 `folder_missing`) over
       the unreviewed frames of the folder under review (the queue and the index files): pending model and
-      auto-labeler boxes under the floor become rejected `too_small` (`reason: size_floor`), which are ignore
-      regions, out of the hard negatives and of the repeats history. Human, moved, unsure and audit boxes,
-      reviewed and skipped frames are never touched and a frame keeps its status. Answer `{success, dry_run,
-      boxes, frames, eligible, failed, failed_count, message}`: a dry run's `boxes` and `frames` cover every
-      eligible frame, so on an unchanged folder they are what an apply with a large enough limit does, and a
-      second apply finds 0.
+      auto-labeler boxes under the floor are dismissed (`state: rejected`, `reason: size_floor`, no
+      `reject_reason`), exactly like the labelers' `auto_dismissed` boxes: no ignore region, no hard negative,
+      not in the repeats history, no reviewer's decision, hidden on the Review tab until `i` (`auto=dismissed`
+      finds them), and a frame holding one is never bulk-accepted (`auto=accept`) or repeat-only. Human,
+      moved, unsure and audit boxes, reviewed and skipped frames are never touched and a frame keeps its
+      status. With `restore: true` (no saved floor needed) it runs `bulk::bulk_restore_small`: the size floor
+      dismissals on unreviewed frames that the saved floor no longer covers (all of them when it is off) go
+      back to pending, their reason gone; a reviewed frame keeps its dismissals (it holds no pending box).
+      Answer `{success, dry_run, restore, boxes, frames, eligible, failed, failed_count, message}`: a dry
+      run's `boxes` and `frames` cover every eligible frame, so on an unchanged folder they are what an apply
+      with a large enough limit does, and a second apply finds 0.
+  - A later labelers run that finds a hidden proposal again brings it back only when the floor in force does
+    not cover what it found (`triage::undismiss_found` with the frame's size; a find still under the floor
+    stays hidden, covered by the dismissal); a `--missing-only` run on a reviewed frame overwrites it in place
+    like any unjudged reject. Retention treats a hidden proposal like the other dismissals: an unreviewed
+    frame with nothing but dismissals and no reviewer's decision can be pruned.
   - On the **Review tab** a box under the saved floor shows a *too small* chip in the box list and on its tag
     and, when selected, "Under the size floor (N px at <input>): left out of the labels at export." It is
     computed live in the page (`ReviewRules.floorNote` on `underFloor`, from the frame's size, so a resize or
     a box being drawn follows), from `size_floor` in the labels answer (`GET|POST /v1/review/labels`, null =
     off: no chip), read with every frame. A rejected or unsure box (already an ignore region) shows none. It
-    changes no box and saves nothing.
+    changes no box and saves nothing, and it speaks of the saved floor: an export made before it was saved
+    (or with another) still holds the box as a label until exported again (the training pre-flight names
+    such exports). A hidden proposal reads "hidden: under the size floor".
+  - Not updated by a floor change until the next check: the dataset check's suggestions (`refine::live` knows
+    no frame size, so one made before a floor was set stays until a check replaces it). The Static objects
+    card counts boxes under the floor in its spots, while the training static cap (on the export's YOLO
+    boxes) does not, so the two can differ; and an export's "parked only" frames are judged on the boxes left
+    after the floor (a parked car with a tiny accepted person beside it is parked only there).
 - **Coverage**: the report's recall per camera, scene and class, each with its 95% interval (the per-size table is
   on the Too small card).
 

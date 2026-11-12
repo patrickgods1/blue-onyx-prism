@@ -232,8 +232,9 @@ pub struct CollectConfig {
     pub hidden_classes: Vec<String>,
     /// The size floor ([`super::labels::SizeFloor`], `{px, input}`): a training box whose short
     /// side at the model input `input` is under `px` pixels is exported as an ignore region, the
-    /// dataset check judges by it, and the Refine tab's rule can reject pending boxes under it.
-    /// None (default, not written) = off: exports as before. The label files never change for it.
+    /// dataset check judges by it, and the Refine tab's rule can hide (dismiss) pending proposals
+    /// under it on unreviewed frames, and restore them. None (default, not written) = off: exports
+    /// as before. Accepted and added labels never change for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_floor: Option<super::labels::SizeFloor>,
 }

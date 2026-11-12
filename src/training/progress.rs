@@ -753,6 +753,17 @@ pub struct RunSettings {
     pub scene: Option<String>,
     /// The GPU's name.
     pub gpu: Option<String>,
+    /// What its train / valid frames with ignore regions became (`training.ignore`). None in
+    /// records from before the setting, whose runs left every such frame out (`drop-frame`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<super::dataset::IgnoreMode>,
+}
+
+impl RunSettings {
+    /// [`Self::ignore`], earlier versions' `drop-frame` for a record without it.
+    pub fn ignore_mode(&self) -> super::dataset::IgnoreMode {
+        self.ignore.unwrap_or(super::dataset::IgnoreMode::DropFrame)
+    }
 }
 
 /// What the run reports while the script trains.
@@ -1872,6 +1883,7 @@ mod tests {
             seed: Some(2),
             scene: Some("night+ir".into()),
             gpu: Some("NVIDIA GeForce GTX 1070 Ti".into()),
+            ignore: None,
         };
         let v = serde_json::to_value(TrainProgress {
             settings: Some(s.clone()),
@@ -3071,6 +3083,7 @@ print("RESULT: " + json.dumps(out))
             seed: None,
             scene: None,
             gpu: None,
+            ignore: None,
         }
     }
 

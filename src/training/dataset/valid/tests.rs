@@ -17,6 +17,7 @@ fn frame(camera: &str, day: &str, name: &str, classes: &[&str]) -> Frame {
             })
             .collect(),
         ignore: Vec::new(),
+        floor_regions: Vec::new(),
         parked: Vec::new(),
         scene: Some("day".into()),
         camera: camera.into(),
@@ -54,6 +55,7 @@ fn source(frames: Vec<Frame>) -> Source {
         frames,
         warnings: Vec::new(),
         notes_known: false,
+        size_floor: None,
     }
 }
 

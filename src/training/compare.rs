@@ -10,7 +10,7 @@
 //! training seed (`--seeds`, "Repeat with N seeds") also get a "mean of N seeds" summary
 //! ([`SeedSummary`]: mean and range per column; never the best of a column).
 
-use super::dataset::{Balance, Excluded, SceneFilter};
+use super::dataset::{Balance, Excluded, IgnoreMode, SceneFilter};
 use super::job::{BenchSummary, SceneAp};
 use super::recipe::SelectMetric;
 use serde::Serialize;
@@ -27,6 +27,9 @@ pub struct CompareRun {
     /// The run's classes (head order).
     pub classes: Vec<String>,
     pub excluded: Excluded,
+    /// What its training frames with ignore regions became (`RunSettings::ignore_mode`); None
+    /// while the run has not started training.
+    pub ignore: Option<IgnoreMode>,
     /// How the run balanced its training frames (off for older runs).
     pub balance: Balance,
     /// Best epoch (1-based) and the epoch training stopped at, when known.
@@ -336,6 +339,21 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
                     .into(),
             );
         }
+        let mut modes: Vec<IgnoreMode> = Vec::new();
+        for m in runs.iter().filter_map(|r| r.ignore) {
+            if !modes.contains(&m) {
+                modes.push(m);
+            }
+        }
+        if modes.len() > 1 {
+            let names: Vec<&str> = modes.iter().map(|m| m.as_str()).collect();
+            c.warnings.push(format!(
+                "the runs treat frames with an unsure or too-small object differently ({}): \
+                 their training and validation frames differ, so AP differences may come from \
+                 that",
+                names.join(" / ")
+            ));
+        }
         let mut thresholds: Vec<f32> = Vec::new();
         for t in runs
             .iter()
@@ -626,6 +644,7 @@ mod tests {
             scene,
             classes: vec!["person".into()],
             excluded: Excluded::Background,
+            ignore: Some(IgnoreMode::Background),
             balance: Balance::default(),
             best_epoch: Some(12),
             stopped_epoch: Some(27),
@@ -842,6 +861,22 @@ mod tests {
             c.render_text()
                 .contains("warning: the runs were benchmarked")
         );
+        // The ignore mode differs: said once; a run not started yet (no mode) says nothing.
+        let mut d = run("night-b", SceneFilter::NIGHT_IR, 0.3, 0.5, 0.4, 11.0);
+        d.ignore = Some(IgnoreMode::DropFrame);
+        let mut queued = run("night-c", SceneFilter::NIGHT_IR, 0.3, 0.5, 0.4, 11.0);
+        queued.ignore = None;
+        let day = run("day-a", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0);
+        let c = compare(&[day.clone(), d, queued.clone()]);
+        assert_eq!(
+            c.warnings,
+            [
+                "the runs treat frames with an unsure or too-small object differently \
+              (background / drop-frame): their training and validation frames differ, so AP \
+              differences may come from that"
+            ]
+        );
+        assert!(compare(&[day, queued]).warnings.is_empty());
         // A run without a benchmark is a row of dashes and never the best.
         let mut x = run("x", SceneFilter::DAY, 0.9, 0.9, 0.9, 1.0);
         x.bench = None;

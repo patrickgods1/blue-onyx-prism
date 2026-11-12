@@ -203,6 +203,10 @@ pub struct Report {
     /// validated on.
     pub ignore_only: usize,
     pub ignore_valid_day: usize,
+    /// Size floor regions given back as labels at the run's input, per label
+    /// ([`dataset::Stats::floor_restored`]); the plan's warnings say the rest of the floor story
+    /// (exports of other floors, an input smaller than the floor's or unknown).
+    pub floor_restored: BTreeMap<String, usize>,
     pub parked_capped: usize,
     /// Frames showing nothing but objects at static spots left out over the static cap
     /// ([`dataset::Stats::static_capped`]; the spots in `dataset::Stats::static_caps`).
@@ -221,6 +225,9 @@ pub struct Report {
 
 /// The [`Report`] of `plan`.
 pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Option<u64>) -> Report {
+    // The frames as the plan read them (size floor regions given back at the run's input).
+    let at_input = dataset::at_run_input(sources, plan, opts);
+    let sources: &[Source] = &at_input;
     let class_at = |b: usize| plan.classes.get(b);
     let mut classes: BTreeMap<&str, ClassLine> = plan
         .classes
@@ -320,6 +327,7 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         ignore_boxes_background: s.ignore_boxes_background.clone(),
         ignore_only: s.ignore_only,
         ignore_valid_day: s.ignore_valid_day,
+        floor_restored: s.floor_restored.clone(),
         parked_capped: s.parked_capped,
         static_capped: s.static_capped,
         static_spots: s.static_spots,
@@ -365,6 +373,17 @@ pub fn text(r: &Report) -> String {
         out.push_str(&format!(
             "trained with an unsure or too-small object as background: {} frame(s) ({})\n",
             r.ignore_kept,
+            per.join(", ")
+        ));
+    }
+    if !r.floor_restored.is_empty() {
+        let per: Vec<String> = r
+            .floor_restored
+            .iter()
+            .map(|(c, n)| format!("{c} {n}"))
+            .collect();
+        out.push_str(&format!(
+            "under the export's size floor but not at this run's input, trained as labels: {}\n",
             per.join(", ")
         ));
     }

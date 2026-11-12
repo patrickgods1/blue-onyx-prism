@@ -22,6 +22,7 @@ fn frame(name: &str, scene: &str, boxes: Vec<YoloBox>, split: SplitHint) -> Fram
         image: PathBuf::from("/export/images").join(format!("{name}.jpg")),
         boxes,
         ignore: Vec::new(),
+        floor_regions: Vec::new(),
         scene: Some(scene.into()),
         camera,
         day,
@@ -42,6 +43,7 @@ fn source(frames: Vec<Frame>) -> Source {
         frames,
         warnings: Vec::new(),
         notes_known: true,
+        size_floor: None,
     }
 }
 

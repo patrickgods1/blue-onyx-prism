@@ -985,7 +985,12 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let config = data.with_plan_flags(&config);
             if dry_run {
                 let request = preview_request(&config, &data, scene)?;
-                let p = super::preview_parts(&config, &request)?;
+                // No model: the run's input size is not known (its placeholder recipe's is not).
+                let options = dataset::Options {
+                    imgsz: None,
+                    ..super::options_for(&config, &request)
+                };
+                let p = super::preview_with(&config, &request, options)?;
                 println!("{}", dry_run_text(&p.plan, &request.balance));
                 let unreviewed = super::unreviewed_frames(&config);
                 let report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
@@ -1510,6 +1515,11 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 |d| d.classes.clone(),
             ),
             excluded: r.request.excluded,
+            ignore: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.settings.as_ref())
+                .map(super::progress::RunSettings::ignore_mode),
             balance: r.request.balance.clone(),
             best_epoch: r
                 .progress
@@ -1911,6 +1921,9 @@ fn read_sources(
         balance: data.balance(config)?,
         static_cap: data.with_static_cap(config).training.static_cap_option(),
         ignore: data.with_plan_flags(config).training.ignore,
+        size_floor: config.collect.size_floor,
+        // `train prepare` names no model: the input size is not known.
+        imgsz: None,
         ..dataset::Options::default()
     };
     Ok((sources, opts))
@@ -2746,6 +2759,10 @@ mod tests {
         assert_eq!(c.training.ignore, IgnoreMode::Background);
         assert_eq!(c.training.static_cap_option(), Some(4), "both flags apply");
         assert!(parse(&["prepare", "--out", "o", "--ignore", "skip"]).is_err());
+        assert!(
+            parse(&["prepare", "--out", "o", "--ignore", ""]).is_err(),
+            "an empty value is refused, not read as the default"
+        );
         let TrainCommand::Run { data, .. } =
             parse(&["run", "--model", "yolo26n", "--ignore", "drop-frame"]).unwrap()
         else {

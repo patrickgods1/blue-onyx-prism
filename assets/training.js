@@ -1305,6 +1305,11 @@
         var per = Object.keys(p.ignore_boxes_background || {}).sort().map(function (k) { return k + " " + p.ignore_boxes_background[k]; });
         d.appendChild(mk("p", "muted small", "Trained with an unsure or too-small object left unlabelled (as background): " + p.ignore_kept + " frame" + (p.ignore_kept === 1 ? "" : "s") + (per.length ? " (" + per.join(", ") + ")" : "") + "."));
       }
+      var back = Object.keys(p.floor_restored || {}).sort();
+      if (back.length) {
+        d.appendChild(mk("p", "muted small", "Under the export's size floor but not at this run's input, so trained as labels: " +
+          back.map(function (k) { return k + " " + p.floor_restored[k]; }).join(", ") + "."));
+      }
       if (p.hard_negatives > 0) d.appendChild(mk("p", "muted small", p.hard_negatives + " of the frames without objects were confirmed empty or had a box rejected on the Review tab."));
       // The static cap is said once, in the list above: its note (the same count, for the CLI's
       // text) names training.static_cap, which no other note does.
@@ -1715,6 +1720,8 @@
     var seed = s && isNum(s.seed) ? s.seed : r.request && isNum(r.request.train_seed) ? r.request.train_seed : null;
     if (seed !== null) out.push("seed " + seed);
     if (s && typeof s.scene === "string" && s.scene && s.scene !== "all") out.push(s.scene);
+    // training.ignore: said only when it is not the default (records before it are drop-frame).
+    if (s && s.ignore === "drop-frame") out.push("frames with a too-small object left out");
     if (s && isNum(s.workers)) out.push("workers " + s.workers);
     return out;
   }

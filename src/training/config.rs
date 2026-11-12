@@ -489,6 +489,9 @@ mod tests {
         }
         assert_eq!(IgnoreMode::parse("Drop_Frame"), Some(IgnoreMode::DropFrame));
         assert_eq!(IgnoreMode::parse("x"), None);
+        // An empty `--ignore` is a mistake, not a choice of the default.
+        assert_eq!(IgnoreMode::parse(""), None);
+        assert_eq!(IgnoreMode::parse("  "), None);
     }
 
     #[test]

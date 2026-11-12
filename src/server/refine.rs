@@ -973,6 +973,7 @@ mod tests {
             "id=\"refine-floor-preview\"",
             "id=\"refine-floor-off\"",
             "id=\"refine-small-confirm\"",
+            "id=\"refine-floor-restore\"",
             "id=\"refine-ignore-form\"",
             "name=\"mode\" value=\"background\"",
             "name=\"mode\" value=\"drop-frame\"",

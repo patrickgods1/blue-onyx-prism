@@ -384,7 +384,8 @@ folder; the collector and the Collect tab keep `collect.dir`.
     a pending auto box rejected in bulk for its score has `reason: "low_score"`, a box rejected for an
     unwanted class (outside the list, or in `collect.hidden_classes`) `reason: "other_class"`, a box a
     labelers run set aside for its score `reason: "auto_dismissed"`, a box it set aside at a spot you
-    rejected `reason: "spot_dismissed"` (below);
+    rejected `reason: "spot_dismissed"`, a pending proposal the size floor rule set aside
+    `reason: "size_floor"` (below);
   - `pending`: not decided yet. Only `unreviewed` and `skipped` files have pending boxes.
 - **`origin`** (model boxes): `prediction` (the reply), `suppressed` (with the rule in `reason`),
   `below_threshold`, or `verify_found` (a box the frame-mode verifier found that matches nothing else).
@@ -421,6 +422,16 @@ folder; the collector and the Collect tab keep `collect.dir`.
   it exactly like `auto_dismissed`: no hard negative, not in the repeats history, `auto=dismissed` finds
   it, a later run may replace it, no bulk save takes its frame. `spot_rejections` holds the frames rejected
   there when the run looked, for the page's *hidden: you rejected this spot N times*.
+- **`reason: "size_floor"`** (a *hidden* box too, *hidden: under the size floor*): the Refine tab's *Too
+  small* rule set aside a pending model or auto proposal under the saved [size floor](#size-floor) on an
+  unreviewed frame. Every reader treats it exactly like `auto_dismissed`: no ignore region (nobody looked,
+  so it is not known to be a real object), no hard negative, not in the repeats history, no reviewer's
+  decision, `auto=dismissed` finds it, no bulk save takes its frame; accepting or rejecting it by hand
+  clears the reason (a reject with *Too small* then makes it an ordinary ignore region). The rule's
+  *Restore* puts those the saved floor no longer covers (all of them when it is off) back to pending on
+  unreviewed frames. A later labelers run brings one back only when what it finds is not under the floor in
+  force. Like the other dismissals it keeps no frame from retention: an unreviewed frame with nothing but
+  dismissals and no reviewer's decision ages out.
 - **`reason: "parked_spot"`** with **`parked`** (`{since, bbox}`, the spot's date and own box): a labelers
   run accepted the box at a parked spot. It stays out of the repeats history, because a rule made the
   decision. The frame stays `unreviewed`, with `repeat_spot` set. Rejecting the box clears both fields,
@@ -627,7 +638,7 @@ frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` 
 | `repeats` | spot edits or parked spots settled every box (`repeat_spot`, nothing pending, no accepted box the VLM said no to) |
 | `overlaps` | stacked or overlapping boxes no reviewer has looked at (no `overlaps_checked`), any review status |
 | `both` | a pending box two or more labelers found (`labelers`), of a wanted class; most such boxes first (item field `agreed_boxes`) |
-| `dismissed` | a box a labelers run dismissed (`reason: "auto_dismissed"` or `"spot_dismissed"`), pending boxes or not. The page shows those boxes on these frames |
+| `dismissed` | a dismissed box (`reason: "auto_dismissed"` or `"spot_dismissed"` from a labelers run, `"size_floor"` from the size floor rule), pending boxes or not. The page shows those boxes on these frames |
 | `refine` | a live suggestion of the dataset check (`refine`, below; `refine::live` with the class list), any review status; never a skipped frame or one without a label file. Strongest first (item fields `refine_strength` and `refine_open`). `refine_kind=add\|tighten\|relabel\|verify` (only with `auto=refine`, else 400) counts that kind alone |
 
 `auto=overlaps` obeys `status` and `source` like the other filters, and most frames with overlaps need
@@ -862,7 +873,7 @@ Click a box to select it. Drag on the image to draw a new one.
                                        bbox [x, y, w, h] px (2 decimals), area = w * h, iscrowd 0,
                                        attributes.difficult on unsure boxes (left out of YOLO)
   hard_negatives.json                  rejected model / auto boxes (frame, label, bbox, origin, reason, reject_reason), without
-                                       duplicate, too_small, auto_dismissed and spot_dismissed ones
+                                       duplicate, too_small and dismissed (auto_dismissed, spot_dismissed, size_floor) ones
   ignore.json                          ignore regions per image, below, and in `parked` the frames whose
                                        training boxes all came from parked spots (for the training cap)
   frames.json                          `empty_confirmed` and `bulk_accepted`: image names, for a training run whichever
@@ -909,9 +920,12 @@ export. `export.json` records `size_floor` and counts `under_floor` (`train` and
 `frames_only`, frames left with no label but such regions; never "confirmed empty"). Older builds read such
 an export as one with more unsure boxes. Held-out scores before and after a floor change do not compare:
 the held-out set's ignore regions change, and with them its fingerprint (`heldout_fingerprint`). The
-dataset check judges by the same rule (`docs/TRAINING.md`), and the Refine tab's rule may reject pending
-model and auto boxes under the floor on unreviewed frames as too small (`reason: size_floor`, an ignore
-region, no reviewer's decision, out of `hard_negatives.json` and the repeats history).
+dataset check judges by the same rule (`docs/TRAINING.md`; its fold models train without it), and a
+training run at a larger input than the floor's gives back the regions that are not under it there
+(`docs/TRAINING.md`, Ignore regions). Accepted and added labels are never rewritten for the floor; the
+Refine tab's one rule only hides *pending proposals* under the floor on unreviewed frames (`reason:
+"size_floor"`, a dismissal like `auto_dismissed`, above), and its *Restore* gives back those a lower floor
+or none no longer covers.
 
 **Split.** Frames are split by whole camera days (camera and date folder), so frames of one camera on
 one day never sit on both sides. That does not mean an unseen camera: other days of a held-out camera

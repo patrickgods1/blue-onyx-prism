@@ -9,6 +9,8 @@
 //! folders, so they never see it (like `spots/`).
 
 use super::judge::{BoxFact, FOUND_IOU, FOUND_SCORE};
+use crate::collect::labels::SizeFloor;
+use crate::training::dataset::IgnoreMode;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -229,6 +231,18 @@ pub struct RefineReport {
     /// Of `found.add`, the adds at a static spot (from [`super::judge::ADD_SCORE_AT_SPOT`]).
     #[serde(default)]
     pub adds_at_spots: usize,
+    /// The fold models trained on every label (their exports apply no size floor), so the recall by
+    /// size measures what a model of the recipe can find. False in reports of earlier checks, whose
+    /// fold exports applied the floor then in force.
+    #[serde(default)]
+    pub folds_every_label: bool,
+    /// `collect.size_floor` in force: the judge's floor (boxes under it were ignore regions for the
+    /// suggestions and the recall but for its size table). None = off, or an earlier report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_floor: Option<SizeFloor>,
+    /// `training.ignore` the fold models trained with. None in reports of earlier checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_mode: Option<IgnoreMode>,
     pub warnings: Vec<String>,
 }
 
@@ -345,6 +359,9 @@ impl RefineReport {
             recall_at_spots: Recall::default(),
             recall_elsewhere: Recall::default(),
             adds_at_spots: 0,
+            folds_every_label: false,
+            size_floor: None,
+            ignore_mode: None,
             warnings: Vec::new(),
         }
     }

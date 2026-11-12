@@ -76,6 +76,12 @@ pub(super) fn pick_valid_groups(
         .filter(|r| sources.get(r.0).is_some_and(|s| s.public.is_none()))
         .collect();
     let public_only = cands.is_empty();
+    // Own frames in the pool, every one with ignore regions: validation falls to the public ones.
+    let own_all_regions = public_only
+        && !eligible.is_empty()
+        && pool
+            .iter()
+            .any(|r| sources.get(r.0).is_some_and(|s| s.public.is_none()));
     if public_only {
         cands = eligible;
     }
@@ -161,6 +167,15 @@ pub(super) fn pick_valid_groups(
     };
     frames.sort_unstable();
     dropped.sort_unstable();
+    let warning = warning.or_else(|| {
+        own_all_regions.then(|| {
+            "every training frame of your own shows an unsure or too-small object (an ignore \
+             region), and validation cannot ignore one: the trainer validates on the public frames \
+             only, so its best epoch is picked for them, not your cameras; review frames without \
+             such objects, or turn the size floor down"
+                .to_string()
+        })
+    });
     ValidSplit {
         frames,
         groups,

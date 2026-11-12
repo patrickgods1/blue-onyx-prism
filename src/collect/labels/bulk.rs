@@ -15,9 +15,10 @@
 //! [`bulk_reject_stacked`] rejects the duplicates of stacked boxes on reviewed and unreviewed
 //! frames (`reason: duplicate`, [`super::stacks`]; `POST /v1/review/reject-stacked`) and
 //! [`bulk_restore_reopened`] puts frames a re-label reopened back to reviewed once nothing on them
-//! is pending (`POST /v1/review/restore-reopened`), and [`bulk_resolve_small`] rejects the pending
-//! model and auto boxes under the size floor on unreviewed frames as too small (`reason:
-//! size_floor`, [`resolve_small`]). Each frame is re-checked under the label write
+//! is pending (`POST /v1/review/restore-reopened`), [`bulk_resolve_small`] dismisses the pending
+//! model and auto boxes under the size floor on unreviewed frames (`reason: size_floor`, a
+//! dismissal, [`resolve_small`]) and [`bulk_restore_small`] gives back those the floor no longer
+//! covers (`POST /v1/refine/resolve-small`). Each frame is re-checked under the label write
 //! lock ([`super::update`]); counts are exact, frame lists capped at [`LISTED`].
 
 use super::super::layout::Walker;
@@ -43,18 +44,25 @@ pub const DISMISSED_REASON: &str = "auto_dismissed";
 /// through [`is_dismissal`]; only the Review tab's wording differs.
 pub const SPOT_DISMISSED_REASON: &str = "spot_dismissed";
 
-/// Whether `reason` marks a dismissal ([`DISMISSED_REASON`], [`SPOT_DISMISSED_REASON`]): the one
-/// place that lists them, so the two cannot drift apart. Twin of the page's `isDismissal`.
+/// The reason of a pending proposal the size floor rule set aside ([`resolve_small`],
+/// [`super::LabelBox::is_size_floor_dismissal`]): a dismissal like [`DISMISSED_REASON`], so every
+/// reader treats it as one (no ignore region, no reviewer's decision, no hard negative, not in the
+/// repeats history, hidden on the Review tab until `i`); [`bulk_restore_small`] puts it back to
+/// pending once the floor no longer covers it.
+pub const SIZE_FLOOR_REASON: &str = "size_floor";
+
+/// Whether `reason` marks a dismissal ([`DISMISSED_REASON`], [`SPOT_DISMISSED_REASON`],
+/// [`SIZE_FLOOR_REASON`]): the one place that lists them, so they cannot drift apart. Twin of the
+/// page's `isDismissal`.
 pub fn is_dismissal(reason: Option<&str>) -> bool {
-    matches!(reason, Some(DISMISSED_REASON | SPOT_DISMISSED_REASON))
+    matches!(
+        reason,
+        Some(DISMISSED_REASON | SPOT_DISMISSED_REASON | SIZE_FLOOR_REASON)
+    )
 }
 
 /// The reason a box rejected by [`reject_other_class`] carries.
 pub const OTHER_CLASS_REASON: &str = "other_class";
-
-/// The reason a box rejected by [`resolve_small`] carries, beside `reject_reason: too_small`
-/// ([`super::LabelBox::is_size_floor_reject`]): a rule's decision, not a reviewer's.
-pub const SIZE_FLOOR_REASON: &str = "size_floor";
 
 /// What a bulk edit did (or, in a dry run, would do).
 #[derive(Debug, Default, Clone, Serialize)]
@@ -154,7 +162,7 @@ pub fn bulk_reject_below(
     )
 }
 
-/// Whether `b` is a box [`resolve_small`] rejects on a `w` x `h` frame: a pending model or
+/// Whether `b` is a box [`resolve_small`] dismisses on a `w` x `h` frame: a pending model or
 /// auto-labeler box under `floor` ([`super::under_floor`]) that shows no person's hand (drawn, moved,
 /// relabelled, marked unsure: [`super::LabelBox::has_human_decision`]) and is no audit sample (it
 /// exists to be looked at, as for [`reject_low`]).
@@ -167,10 +175,11 @@ fn is_small(b: &super::LabelBox, w: u32, h: u32, floor: super::SizeFloor) -> boo
 }
 
 /// On an unreviewed frame (`w` x `h`, from its sidecar), the pending model and auto-labeler boxes
-/// under `floor` ([`is_small`]) rejected as too small: `reject_reason: too_small`, `reason:
-/// size_floor`. Such a box is an ignore region ([`super::LabelBox::is_ignore`]: a real object, no
-/// hard negative, not in the repeats history) and no person's decision. Reviewed and skipped
-/// frames are untouched; the frame's status is unchanged. Returns the boxes rejected.
+/// under `floor` ([`is_small`]) dismissed: `state: rejected`, `reason: size_floor`, no
+/// `reject_reason` ([`SIZE_FLOOR_REASON`]). Nobody looked at such a proposal, so it is neither a
+/// real object (no ignore region) nor a false positive (no hard negative), and no person's decision;
+/// [`bulk_restore_small`] undoes it. Reviewed and skipped frames are untouched; the frame's status is
+/// unchanged. Returns the boxes dismissed.
 pub fn resolve_small(f: &mut LabelFile, w: u32, h: u32, floor: super::SizeFloor) -> usize {
     if f.status != Status::Unreviewed {
         return 0;
@@ -178,14 +187,50 @@ pub fn resolve_small(f: &mut LabelFile, w: u32, h: u32, floor: super::SizeFloor)
     let mut n = 0;
     for b in f.boxes.iter_mut().filter(|b| is_small(b, w, h, floor)) {
         b.state = BoxState::Rejected;
-        b.reject_reason = Some(super::RejectReason::TooSmall);
+        b.reject_reason = None;
         b.reason = Some(SIZE_FLOOR_REASON.into());
         n += 1;
     }
     n
 }
 
-/// The boxes [`resolve_small`] would reject.
+/// Whether `b` is a box [`restore_small`] gives back on a `w` x `h` frame: a size floor dismissal
+/// ([`super::LabelBox::is_size_floor_dismissal`]) that `floor` (the floor now; None = off) no longer
+/// covers.
+fn is_restorable(b: &super::LabelBox, w: u32, h: u32, floor: Option<super::SizeFloor>) -> bool {
+    b.is_size_floor_dismissal() && !super::under_floor(&b.bbox, w, h, floor)
+}
+
+/// On an unreviewed frame (`w` x `h`), the size floor dismissals that `floor` (None = off) no longer
+/// covers ([`is_restorable`]) back to pending, their reason gone: the floor was lowered or turned
+/// off since [`resolve_small`] set them aside. Reviewed and skipped frames are untouched (a
+/// reviewed frame holds no pending box); the frame's status is unchanged. Returns the boxes
+/// restored.
+pub fn restore_small(f: &mut LabelFile, w: u32, h: u32, floor: Option<super::SizeFloor>) -> usize {
+    if f.status != Status::Unreviewed {
+        return 0;
+    }
+    let mut n = 0;
+    for b in f.boxes.iter_mut().filter(|b| is_restorable(b, w, h, floor)) {
+        b.state = BoxState::Pending;
+        b.reason = None;
+        n += 1;
+    }
+    n
+}
+
+/// The boxes [`restore_small`] would give back.
+fn count_restorable(f: &LabelFile, w: u32, h: u32, floor: Option<super::SizeFloor>) -> usize {
+    if f.status != Status::Unreviewed {
+        return 0;
+    }
+    f.boxes
+        .iter()
+        .filter(|b| is_restorable(b, w, h, floor))
+        .count()
+}
+
+/// The boxes [`resolve_small`] would dismiss.
 fn count_small(f: &LabelFile, w: u32, h: u32, floor: super::SizeFloor) -> usize {
     if f.status != Status::Unreviewed {
         return 0;
@@ -205,6 +250,52 @@ pub fn bulk_resolve_small(
     floor: super::SizeFloor,
     dry_run: bool,
     limit: usize,
+) -> BulkOutcome {
+    edit_small(
+        dir,
+        filters,
+        dry_run,
+        limit,
+        &|l, w, h| count_small(l, w, h, floor),
+        &|l, w, h| resolve_small(l, w, h, floor),
+    )
+}
+
+/// [`restore_small`] on the unreviewed frames of `dir` that `filters` select (status forced to
+/// unreviewed; queue order), at most `limit` frames: the size floor dismissals that `floor` (the
+/// floor now; None = off, so every one) no longer covers go back to pending. `dry_run` only
+/// counts, exactly as [`bulk_resolve_small`]'s does. A frame never opened holds none.
+pub fn bulk_restore_small(
+    dir: &Path,
+    filters: &Filters,
+    floor: Option<super::SizeFloor>,
+    dry_run: bool,
+    limit: usize,
+) -> BulkOutcome {
+    let mut f = filters.clone();
+    // A frame without a label file holds no dismissal: no pre-fill.
+    f.wanted = None;
+    edit_small(
+        dir,
+        &f,
+        dry_run,
+        limit,
+        &|l, w, h| count_restorable(l, w, h, floor),
+        &|l, w, h| restore_small(l, w, h, floor),
+    )
+}
+
+/// What [`bulk_resolve_small`] and [`bulk_restore_small`] share: the unreviewed frames of `dir` that
+/// `filters` select, `count` boxes per frame (its label file, or the pre-fill of a frame never
+/// opened when `filters.wanted` names the class list) on the frame's size, then `apply` under the
+/// write lock on at most `limit` of them; `dry_run` stops after counting.
+fn edit_small(
+    dir: &Path,
+    filters: &Filters,
+    dry_run: bool,
+    limit: usize,
+    count: &dyn Fn(&LabelFile, u32, u32) -> usize,
+    apply: &dyn Fn(&mut LabelFile, u32, u32) -> usize,
 ) -> BulkOutcome {
     let mut f = filters.clone();
     f.status = StatusFilter::Is(Status::Unreviewed);
@@ -226,7 +317,7 @@ pub fn bulk_resolve_small(
             Ok(None) => fresh(&rec),
             Err(_) => None,
         };
-        let n = labels.map_or(0, |l| count_small(&l, rec.width, rec.height, floor));
+        let n = labels.map_or(0, |l| count(&l, rec.width, rec.height));
         if n > 0 {
             eligible.push((item.frame, n, (rec.width, rec.height)));
         }
@@ -256,7 +347,7 @@ pub fn bulk_resolve_small(
             else {
                 return Ok(None);
             };
-            n = resolve_small(&mut l, w, h, floor);
+            n = apply(&mut l, w, h);
             Ok((n > 0).then_some(l))
         });
         match r {
@@ -1180,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_boxes_under_the_size_floor_are_rejected_as_too_small_by_the_rule() {
+    fn pending_boxes_under_the_size_floor_are_dismissed_by_the_rule() {
         let dir = std::env::temp_dir().join(format!("bop-floor-{}", uuid::Uuid::new_v4()));
         // 64 x 48 frames; at input 384 a box 1 px wide is 6 px, the floor 10.
         let floor = super::super::SizeFloor {
@@ -1286,15 +1377,23 @@ mod tests {
             ],
             "only pending model and auto boxes no person touched, no audit sample"
         );
-        assert!(la.boxes[0].is_ignore() && la.boxes[0].is_size_floor_reject());
+        // A dismissal: nobody looked, so no real object (no ignore region), no false positive.
+        let d = &la.boxes[0];
+        assert!(d.is_dismissed() && d.is_size_floor_dismissal());
+        assert!(!d.is_ignore() && d.reject_reason.is_none());
+        assert!(super::super::unjudged_reject(d));
         assert_eq!(la.status, Status::Unreviewed);
-        assert_eq!(la.hard_negatives().count(), 0, "a real object");
+        assert_eq!(la.hard_negatives().count(), 0, "nobody judged it");
         assert!(!la.boxes[0].has_human_decision() && !la.boxes[6].has_human_decision());
+        assert!(
+            !super::super::auto_accept_eligible(&la),
+            "a frame holding a dismissal is never saved unseen"
+        );
         assert_eq!(labels_of(&dir, &reviewed), before[1]);
         assert_eq!(labels_of(&dir, &skipped), before[2]);
         let lf = frame.labels().unwrap().unwrap();
         assert_eq!(lf.boxes[0].state, BoxState::Rejected);
-        assert!(lf.boxes[0].is_size_floor_reject());
+        assert!(lf.boxes[0].is_size_floor_dismissal());
         // Out of the camera's repeats history: no verdict on the spot.
         let h = super::super::repeats::scan(&dir, "cam", 100);
         assert!(
@@ -1315,9 +1414,64 @@ mod tests {
         let left = bulk_resolve_small(&dir, &filters, floor, true, 100);
         assert_eq!((left.eligible, left.boxes), (1, 1));
         assert!(
-            labels_of(&dir, &g).boxes[0].is_size_floor_reject()
-                != labels_of(&dir, &h2).boxes[0].is_size_floor_reject()
+            labels_of(&dir, &g).boxes[0].is_size_floor_dismissal()
+                != labels_of(&dir, &h2).boxes[0].is_size_floor_dismissal()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn size_floor_dismissals_the_floor_no_longer_covers_come_back_pending() {
+        let dir = std::env::temp_dir().join(format!("bop-floor-back-{}", uuid::Uuid::new_v4()));
+        // 64 x 48 frames at input 384: 1 px wide is 6 px, 2 px wide 12 px.
+        let floor = |px: f32| super::super::SizeFloor { px, input: 384 };
+        let at = |label: &str, w: f32| {
+            let mut b = auto_box(label, 0.6, Triage::Review);
+            b.bbox = [2.0, 2.0, 2.0 + w, 30.0];
+            b
+        };
+        let a = put_frame(&dir, "a", None, vec![at("person", 1.0), at("car", 1.5)]);
+        let r = put_frame(&dir, "r", None, vec![at("car", 1.0)]);
+        // A box a labelers run dismissed for its score is not the rule's to give back.
+        let mut scored = at("dog", 1.0);
+        scored.state = BoxState::Rejected;
+        scored.reason = Some(DISMISSED_REASON.into());
+        let s = put_frame(&dir, "s", None, vec![scored]);
+        let filters = Filters::default();
+        let o = bulk_resolve_small(&dir, &filters, floor(12.0), false, 100);
+        assert_eq!((o.boxes, o.done_count), (3, 2));
+        // The frame was reviewed since: it holds no pending box, so it keeps its dismissal.
+        let mut lr = labels_of(&dir, &r);
+        lr.status = Status::Reviewed;
+        super::super::write(&Frame::resolve(&dir, &r).unwrap().labels, &lr).unwrap();
+        let before = labels_of(&dir, &a);
+        // The same floor covers them all: nothing to give back.
+        let same = bulk_restore_small(&dir, &filters, Some(floor(12.0)), true, 100);
+        assert_eq!((same.eligible, same.boxes), (0, 0));
+        // A lower floor: the 9 px car is no longer under 8 px, the 6 px person still is.
+        let lower = bulk_restore_small(&dir, &filters, Some(floor(8.0)), true, 100);
+        assert_eq!((lower.eligible, lower.boxes), (1, 1));
+        assert_eq!(labels_of(&dir, &a), before, "a dry run writes nothing");
+        let o = bulk_restore_small(&dir, &filters, Some(floor(8.0)), false, 100);
+        assert_eq!((o.boxes, o.done_count), (lower.boxes, 1), "dry run = apply");
+        let la = labels_of(&dir, &a);
+        assert_eq!(
+            la.boxes
+                .iter()
+                .map(|b| (b.state, b.reason.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (BoxState::Rejected, Some(SIZE_FLOOR_REASON)),
+                (BoxState::Pending, None)
+            ]
+        );
+        assert_eq!(la.status, Status::Unreviewed);
+        // The floor off: every one of them, never another dismissal or a reviewed frame's.
+        let off = bulk_restore_small(&dir, &filters, None, false, 100);
+        assert_eq!((off.boxes, off.done_count), (1, 1));
+        assert_eq!(labels_of(&dir, &a).boxes[0].state, BoxState::Pending);
+        assert!(labels_of(&dir, &s).boxes[0].is_dismissed());
+        assert_eq!(labels_of(&dir, &r), lr);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1211,6 +1211,7 @@ fn refine_box(r: &mut Rng, bbox: [f32; 4], label: &str) -> LabelBox {
                 Some("low_score"),
                 Some("auto_dismissed"),
                 Some("spot_dismissed"),
+                Some("size_floor"),
                 Some("duplicate"),
                 Some("repeat_spot"),
                 Some("night_threshold"),
@@ -1930,6 +1931,11 @@ process.stdout.write(JSON.stringify({
   phraseWide: F.phrase({ px: 7.300000190734863, input: 640 }),
   one_box: F.resolveText(1, 1),
   many: F.resolveText(12, 5),
+  back_one: F.restoreText(1, 1),
+  back_many: F.restoreText(7, 3),
+  measured_floor: F.measuredWith({ folds_every_label: true, size_floor: { px: 10, input: 384 } }),
+  measured_none: F.measuredWith({ folds_every_label: true }),
+  measured_old: F.measuredWith({ recipe: { imgsz: 384 } }),
 }));
 "#;
     let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
@@ -1959,13 +1965,37 @@ process.stdout.write(JSON.stringify({
     assert_eq!(got["phraseWide"], "under 7.3 px at 640");
     assert_eq!(
         got["many"],
-        "Reject 12 pending auto-label proposals on 5 unreviewed frames as too small (under the floor). \
-         They become ignore regions, are not counted as your decisions, and you can accept one again on the Review tab."
+        "Hide 12 pending auto-label proposals on 5 unreviewed frames as under the floor. \
+         They are set aside unseen like the auto-labelers' hidden boxes: no label, no negative, not counted as your decisions. \
+         i on the Review tab shows them, and they can be restored here if the floor goes down or off."
+    );
+    assert!(got["one_box"].as_str().unwrap().starts_with(
+        "Hide 1 pending auto-label proposal on 1 unreviewed frame as under the floor"
+    ));
+    assert_eq!(
+        got["back_many"],
+        "Restore 7 hidden proposals on 3 unreviewed frames that the size floor no longer covers: \
+         they become pending again, for you to decide on the Review tab."
     );
     assert!(
-        got["one_box"]
+        got["back_one"]
             .as_str()
             .unwrap()
-            .starts_with("Reject 1 pending auto-label proposal on 1 unreviewed frame as too small")
+            .starts_with("Restore 1 hidden proposal on 1 unreviewed frame that")
+    );
+    assert_eq!(
+        got["measured_floor"],
+        "Measured with fold models trained on every label; the check treated labels under 10 px \
+         at 384 as ignore regions (counted in this table only)."
+    );
+    assert_eq!(
+        got["measured_none"],
+        "Measured with fold models trained on every label; no size floor was set."
+    );
+    assert!(
+        got["measured_old"]
+            .as_str()
+            .unwrap()
+            .starts_with("Measured by a check of an earlier version")
     );
 }

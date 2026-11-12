@@ -181,7 +181,8 @@ pub fn read_sources(datasets: &[PathBuf], public: Option<&Path>) -> Result<Vec<d
 }
 
 /// `base` (the config's assembly defaults, [`TrainJob::options`]) with the request's own choices:
-/// scene filter, classes, renames, excluded mode and balance.
+/// scene filter, classes, renames, excluded mode, balance and the recipe's input size (the size
+/// floor regions are judged at it, [`dataset::Options::imgsz`]).
 pub fn request_options(base: &dataset::Options, request: &TrainRequest) -> dataset::Options {
     dataset::Options {
         scene: request.scene,
@@ -189,6 +190,7 @@ pub fn request_options(base: &dataset::Options, request: &TrainRequest) -> datas
         rename: request.rename.clone(),
         excluded: request.excluded,
         balance: request.balance.clone(),
+        imgsz: Some(request.recipe.imgsz),
         ..base.clone()
     }
 }
@@ -1174,6 +1176,7 @@ fn stages(
                 seed: job.request.train_seed,
                 scene: Some(job.request.scene.as_str().to_string()),
                 gpu: Some(job.accelerator.name().to_string()),
+                ignore: Some(opts.ignore),
             }),
             ..TrainProgress::default()
         };

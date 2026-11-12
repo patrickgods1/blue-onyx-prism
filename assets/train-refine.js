@@ -14,9 +14,10 @@
 // the server's answers.
 // The Too small card (GET /v1/refine/floor, POST /v1/refine/size-floor, /ignore-mode and
 // /resolve-small) shows what the size floor does per class, saves the floor and the ignore mode and
-// has the one rule that writes boxes: pending proposals under the floor become too-small ignore
-// regions (a dry run, the inline question, then the write, as the Static objects card does). The
-// last check's recall by size is drawn there too. The pure sentences are in `RefineFloor`, tested
+// has the one rule that writes boxes: pending proposals under the floor are hidden (dismissed,
+// `reason: size_floor`), and those a lower floor or none no longer covers are restored (each a dry
+// run, the inline question, then the write, as the Static objects card does). The last check's
+// recall by size is drawn there too. The pure sentences are in `RefineFloor`, tested
 // in Node (tests/it/js_rules.rs). No inline handlers (CSP); limits come from the server's answers.
 (function () {
   'use strict';
@@ -46,9 +47,27 @@
     },
     // The question before the rule writes: `boxes` pending proposals on `frames` unreviewed frames.
     resolveText: function (boxes, frames) {
-      return 'Reject ' + plural(boxes, 'pending auto-label proposal', 'pending auto-label proposals') + ' on ' +
-        plural(frames, 'unreviewed frame', 'unreviewed frames') + ' as too small (under the floor). ' +
-        'They become ignore regions, are not counted as your decisions, and you can accept one again on the Review tab.';
+      return 'Hide ' + plural(boxes, 'pending auto-label proposal', 'pending auto-label proposals') + ' on ' +
+        plural(frames, 'unreviewed frame', 'unreviewed frames') + ' as under the floor. ' +
+        'They are set aside unseen like the auto-labelers\' hidden boxes: no label, no negative, not counted as your decisions. ' +
+        'i on the Review tab shows them, and they can be restored here if the floor goes down or off.';
+    },
+    // How the last check's recall by size was measured (report.json): the fold models' labels and
+    // the floor its judge used.
+    measuredWith: function (r) {
+      if (!r || !r.folds_every_label) {
+        return 'Measured by a check of an earlier version: if a size floor was saved then, its fold models never learned the objects under it, so their recall says little. Run the check again to measure with every label.';
+      }
+      var floor = r.size_floor
+        ? 'the check treated labels ' + api.phrase(r.size_floor) + ' as ignore regions (counted in this table only).'
+        : 'no size floor was set.';
+      return 'Measured with fold models trained on every label; ' + floor;
+    },
+    // The question before a restore: `boxes` hidden proposals the saved floor no longer covers.
+    restoreText: function (boxes, frames) {
+      return 'Restore ' + plural(boxes, 'hidden proposal', 'hidden proposals') + ' on ' +
+        plural(frames, 'unreviewed frame', 'unreviewed frames') + ' that the size floor no longer covers: ' +
+        'they become pending again, for you to decide on the Review tab.';
     }
   };
   globalThis.RefineFloor = api;
@@ -508,6 +527,7 @@
     box.appendChild(el('h3', null, 'Recall by size'));
     box.appendChild(el('p', 'muted small', 'Size is the box\'s short side in pixels at the model\'s input (' + r.recipe.imgsz +
       ' px in the last check). Objects below about 10 px are rarely found by any model, so a low recall there says little about your labels.'));
+    box.appendChild(el('p', 'muted small', RF.measuredWith(r)));
     box.appendChild(recallTable([
       { title: 'Size (px)', value: function (s) { return s.bucket; } },
       { title: 'Boxes', num: true, value: function (s) { return String(s.boxes); } },
@@ -857,7 +877,12 @@
     var open = j.saved && j.pending && j.pending.boxes > 0;
     $('refine-floor-pending').hidden = !open;
     if (open) {
-      $('refine-floor-resolve').textContent = 'Resolve ' + plural(j.pending.boxes, 'pending proposal', 'pending proposals') + ' as too small...';
+      $('refine-floor-resolve').textContent = 'Hide ' + plural(j.pending.boxes, 'pending proposal', 'pending proposals') + ' under the floor...';
+    }
+    var back = j.restorable && j.restorable.boxes > 0;
+    $('refine-floor-restorable').hidden = !back;
+    if (back) {
+      $('refine-floor-restore').textContent = 'Restore ' + plural(j.restorable.boxes, 'proposal', 'proposals') + ' the floor no longer covers...';
     }
     var mode = j.ignore_mode === 'drop-frame' ? 'drop-frame' : 'background';
     if (!modeDirty) {
@@ -929,34 +954,39 @@
     box.hidden = false;
     return box;
   }
-  $('refine-floor-resolve').addEventListener('click', function () {
-    var btn = $('refine-floor-resolve');
+  // `restore`: the dismissals the saved floor no longer covers, back to pending; else the hide.
+  function askSmall(restore) {
+    var btn = $(restore ? 'refine-floor-restore' : 'refine-floor-resolve');
     btn.disabled = true;
     hideSmallConfirm();
     $('refine-small-result').hidden = true;
-    postJson('/v1/refine/resolve-small', { dry_run: true }).then(function (j) {
+    postJson('/v1/refine/resolve-small', { dry_run: true, restore: restore }).then(function (j) {
       var go = $('refine-small-confirm-go');
       var text;
       if (j.boxes === 0) {
-        text = 'Nothing to reject: no pending proposal is under the floor any more.';
+        text = restore ? 'Nothing to restore: the floor still covers every hidden proposal.'
+          : 'Nothing to hide: no pending proposal is under the floor any more.';
         go.hidden = true;
       } else {
-        text = RF.resolveText(j.boxes, j.eligible);
+        text = restore ? RF.restoreText(j.boxes, j.eligible) : RF.resolveText(j.boxes, j.eligible);
         if (j.eligible > 500) text += ' One run does at most 500 frames: run it again after.';
         go.hidden = false;
       }
+      go.textContent = restore ? 'Restore them' : 'Hide them';
       $('refine-small-confirm-text').textContent = text;
       $('refine-small-confirm').hidden = false;
-      smallPending = { boxes: j.boxes };
+      smallPending = { boxes: j.boxes, restore: restore };
       (go.hidden ? $('refine-small-confirm-cancel') : go).focus();
     }).catch(function (e) { smallSay(e.message, true); })
       .then(function () { btn.disabled = false; });
-  });
+  }
+  $('refine-floor-resolve').addEventListener('click', function () { askSmall(false); });
+  $('refine-floor-restore').addEventListener('click', function () { askSmall(true); });
   $('refine-small-confirm-go').addEventListener('click', function () {
     if (!smallPending) return;
     var go = $('refine-small-confirm-go');
     go.disabled = true;
-    postJson('/v1/refine/resolve-small', {}).then(function (j) {
+    postJson('/v1/refine/resolve-small', { restore: smallPending.restore }).then(function (j) {
       hideSmallConfirm();
       var box = smallSay(j.message);
       if (j.failed && j.failed.length) {

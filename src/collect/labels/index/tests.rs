@@ -472,6 +472,7 @@ mod cases {
                     None,
                     Some(bulk::DISMISSED_REASON),
                     Some(bulk::SPOT_DISMISSED_REASON),
+                    Some(bulk::SIZE_FLOOR_REASON),
                     Some(bulk::LOW_SCORE_REASON),
                     Some(bulk::OTHER_CLASS_REASON),
                 ])

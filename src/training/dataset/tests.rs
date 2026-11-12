@@ -1545,6 +1545,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
                     h: 0.2,
                 }],
                 ignore: Vec::new(),
+                floor_regions: Vec::new(),
                 parked: Vec::new(),
                 scene: Some("day".into()),
                 camera: "a".into(),
@@ -1559,6 +1560,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
         ],
         warnings: Vec::new(),
         notes_known: false,
+        size_floor: None,
     }
 }
 
@@ -2670,6 +2672,7 @@ fn patio_frame(dir: &Path, i: usize, day: usize, scene: &str, boxes: &[TBox]) ->
             })
             .collect(),
         ignore: Vec::new(),
+        floor_regions: Vec::new(),
         parked: Vec::new(),
         scene: Some(scene.into()),
         camera: "patio".into(),
@@ -2702,6 +2705,7 @@ fn patio_source(dir: &Path, frames: Vec<Frame>) -> Source {
         frames,
         warnings: Vec::new(),
         notes_known: true,
+        size_floor: None,
     }
 }
 
@@ -3175,4 +3179,413 @@ fn a_class_the_cap_took_frames_of_says_so_in_its_warnings() {
     assert!(static_cap_idle_note(&merged, None).is_none());
     assert!(static_cap_idle_note(&merged, Some(0)).is_none());
     assert!(static_cap_idle_note(&["car".to_string()], Some(20)).is_none());
+}
+
+// ---- the size floor at the run's input, and the exports' floors
+
+const FLOOR_384: SizeFloor = SizeFloor {
+    px: 10.0,
+    input: 384,
+};
+
+/// A size floor region of `class`: `w` x `h` of the image (10 px at 384 = 0.026 of it).
+fn floor_region(class: &str, w: f32, h: f32) -> YoloBox {
+    YoloBox {
+        class: class.into(),
+        cx: 0.8,
+        cy: 0.8,
+        w,
+        h,
+    }
+}
+
+/// `s` exported with `floor`, and these size floor regions on their frames.
+fn with_floor_regions(s: &Source, floor: SizeFloor, at: &[(FrameRef, YoloBox)]) -> Source {
+    let mut s = s.clone();
+    s.size_floor = Some(floor);
+    for (r, b) in at {
+        let f = &mut s.frames[r.1];
+        f.floor_regions.push(f.ignore.len());
+        f.ignore.push(b.clone());
+    }
+    s
+}
+
+fn at_imgsz(n: Option<u32>) -> Options {
+    Options {
+        imgsz: n,
+        ..Options::default()
+    }
+}
+
+#[test]
+fn ignore_json_names_the_floor_and_its_regions() {
+    let t = tmp("floor-read");
+    camera_export(&t.0);
+    let regions = serde_json::json!({
+        "version": 1,
+        "size_floor": {"px": 10, "input": 384},
+        "images": {"yard-2026-10-01-0.jpg": [
+            {"label": "cat", "cx": 0.5, "cy": 0.5, "w": 0.3, "h": 0.3},
+            {"label": "dog", "cx": 0.1, "cy": 0.1, "w": 0.02, "h": 0.03, "size_floor": true},
+        ]},
+    });
+    std::fs::write(
+        t.0.join("ignore.json"),
+        serde_json::to_vec(&regions).unwrap(),
+    )
+    .unwrap();
+    let s = read_export(&t.0).unwrap();
+    assert_eq!(s.size_floor, Some(FLOOR_384));
+    let f = s.frames.iter().find(|f| !f.ignore.is_empty()).unwrap();
+    assert_eq!(f.ignore.len(), 2);
+    assert_eq!(
+        f.floor_regions,
+        [1],
+        "only the floor's region; the unsure one is a reviewer's"
+    );
+    // An export of no floor, or from before floors: none.
+    ignore_json(
+        &t.0,
+        &[("yard-2026-10-01-0.jpg", "cat", 0.5, 0.5, 0.3, 0.3)],
+    );
+    let s = read_export(&t.0).unwrap();
+    assert_eq!(s.size_floor, None);
+    assert!(s.frames.iter().all(|f| f.floor_regions.is_empty()));
+}
+
+#[test]
+fn a_run_at_a_larger_input_trains_the_floor_regions_it_can_learn() {
+    let t = tmp("floor-larger");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let before = plan(std::slice::from_ref(&s), &Options::default()).unwrap();
+    let pooled: Vec<FrameRef> = before.train.iter().map(|(r, _)| *r).collect();
+    let (grown, tiny) = (pooled[0], pooled[1]);
+    let held = before.heldout[0];
+    // At 384 both are under 10 px (7.7 and 3.8); at 640 the first is 12.8, the second 6.4.
+    let s = with_floor_regions(
+        &s,
+        FLOOR_384,
+        &[
+            (grown, floor_region("dog", 0.02, 0.03)),
+            (tiny, floor_region("cat", 0.01, 0.03)),
+            (held, floor_region("dog", 0.02, 0.03)),
+        ],
+    );
+    let s = [s];
+    let at384 = plan(&s, &at_imgsz(Some(384))).unwrap();
+    let at640 = plan(&s, &at_imgsz(Some(640))).unwrap();
+    let unknown = plan(&s, &at_imgsz(None)).unwrap();
+    // Held out exactly as exported, at any input.
+    for p in [&at640, &unknown] {
+        assert_eq!(p.heldout, at384.heldout);
+        assert_eq!(p.heldout_fingerprint, at384.heldout_fingerprint);
+    }
+    assert!(at384.stats.floor_restored.is_empty() && unknown.stats.floor_restored.is_empty());
+    assert_eq!(
+        at640.stats.floor_restored,
+        BTreeMap::from([("dog".to_string(), 1)]),
+        "{:?}",
+        at640.stats
+    );
+    assert!(
+        at640.warnings.iter().any(|w| w
+            .starts_with("1 object(s) the export's size floor (10 px at 384) left out")
+            && w.contains("this run's 640 px input")),
+        "{:?}",
+        at640.warnings
+    );
+    // The given-back frame has no region left: it trains or validates as a plain frame.
+    let view = at_run_input(&s, &at640, &at_imgsz(Some(640)));
+    let g = &view[0].frames[grown.1];
+    assert!(g.ignore.is_empty() && g.floor_regions.is_empty());
+    assert_eq!(g.boxes.last().unwrap().class, "dog");
+    assert!(used(&at640, grown));
+    let k = &view[0].frames[tiny.1];
+    assert_eq!((k.ignore.len(), k.floor_regions.as_slice()), (1, &[0][..]));
+    assert_eq!(view[0].frames[held.1].ignore.len(), 1, "held out keeps it");
+    // Written: the dog is a label line of the frame, the held-out one stays an ignore region.
+    let out = t.0.join("prepared");
+    let opts = at_imgsz(Some(640));
+    write(&s, &at640, &opts, &out).unwrap();
+    let name = format!("s0-{}", name_of(&s[0], grown));
+    let label = std::fs::read_to_string(
+        out.join("labels")
+            .join(format!("{}.txt", stem(Path::new(&name)))),
+    )
+    .unwrap();
+    assert!(
+        label.lines().any(|l| l.starts_with("1 0.800000 0.800000")),
+        "{label}"
+    );
+    let m: Manifest =
+        serde_json::from_slice(&std::fs::read(out.join("heldout/manifest.json")).unwrap()).unwrap();
+    assert!(
+        m.images
+            .iter()
+            .flat_map(|i| i.objects.iter().flatten())
+            .any(|o| o.ignore && o.label == "dog")
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["stats"]["floor_restored"]["dog"], 1);
+    assert_eq!(summary["options"]["imgsz"], 640);
+    // The pre-flight counts the frame's dog with the labels.
+    let r = crate::training::preflight::report(&at640, &s, &opts, None);
+    assert_eq!(r.floor_restored, BTreeMap::from([("dog".to_string(), 1)]));
+    let r384 = crate::training::preflight::report(&at384, &s, &at_imgsz(Some(384)), None);
+    let dogs = |r: &crate::training::preflight::Report| {
+        let l = r.classes.iter().find(|c| c.name == "dog").unwrap();
+        l.train + l.valid
+    };
+    assert_eq!(dogs(&r), dogs(&r384) + 1);
+    // A renamed label is counted under its new name, as its box is mapped.
+    let renamed = Options {
+        rename: BTreeMap::from([("dog".to_string(), "canine".to_string())]),
+        ..at_imgsz(Some(640))
+    };
+    let p = plan(&s, &renamed).unwrap();
+    assert_eq!(
+        p.stats.floor_restored,
+        BTreeMap::from([("canine".to_string(), 1)])
+    );
+}
+
+#[test]
+fn a_run_at_a_smaller_or_unknown_input_says_what_the_floor_cannot_do() {
+    let t = tmp("floor-smaller");
+    camera_export(&t.0);
+    let s = read_export(&t.0).unwrap();
+    let before = plan(std::slice::from_ref(&s), &Options::default()).unwrap();
+    let r = before.train[0].0;
+    let at640 = SizeFloor {
+        px: 10.0,
+        input: 640,
+    };
+    let mut s = with_floor_regions(&s, at640, &[(r, floor_region("dog", 0.01, 0.01))]);
+    // A label of 8 px at 384 (13.4 at 640): over the export's floor, under it at the run's input.
+    s.frames[r.1].boxes.push(floor_region("cat", 0.021, 0.021));
+    let s = [s];
+    let p = plan(&s, &at_imgsz(Some(384))).unwrap();
+    assert!(
+        p.stats.floor_restored.is_empty(),
+        "boxes never become regions"
+    );
+    let w = p
+        .warnings
+        .iter()
+        .find(|w| w.contains("this run trains at 384 px"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(
+        w.contains(
+            "was applied at 640: objects of 6.0 to 10 px at this run's input are still labels \
+             (1 on its training frames)"
+        ) && w.contains("export again with the floor's input set to 384"),
+        "{w}"
+    );
+    // Unknown: a warning that names the floor, nothing given back.
+    let p = plan(&s, &at_imgsz(None)).unwrap();
+    assert!(
+        p.warnings.iter().any(|w| w
+            .contains("left out 1 object(s) under its size floor (10 px at 640)")
+            && w.contains("does not know the size the run trains at")),
+        "{:?}",
+        p.warnings
+    );
+    // The floor's own input: nothing to say.
+    let p = plan(&s, &at_imgsz(Some(640))).unwrap();
+    assert!(
+        p.warnings.iter().all(|w| !w.contains("size floor")),
+        "{:?}",
+        p.warnings
+    );
+}
+
+#[test]
+fn exports_of_other_floors_than_each_other_or_the_current_one_are_named() {
+    let t = tmp("floor-mixed");
+    let (a, b) = (t.0.join("a"), t.0.join("b"));
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d).unwrap();
+        camera_export(d);
+    }
+    let sa = read_export(&a).unwrap();
+    let sb = read_export(&b).unwrap();
+    let s = [
+        Source {
+            size_floor: Some(FLOOR_384),
+            ..sa.clone()
+        },
+        sb.clone(),
+    ];
+    let p = plan(&s, &Options::default()).unwrap();
+    let mixed = p
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("the exports were made with different size floors"))
+        .unwrap_or_else(|| panic!("{:?}", p.warnings));
+    assert!(
+        mixed.contains(&format!("{} (10 px at 384)", a.display()))
+            && mixed.contains(&format!("{} (no size floor)", b.display())),
+        "{mixed}"
+    );
+    // Against the current floor: the one without, and one of another floor.
+    let now = Options {
+        size_floor: Some(SizeFloor {
+            px: 12.0,
+            input: 384,
+        }),
+        ..Options::default()
+    };
+    let p = plan(&s, &now).unwrap();
+    assert!(
+        p.warnings.iter().any(|w| w.starts_with(&format!(
+            "{} was exported without a size floor (before it was set",
+            b.display()
+        )) && w.contains("under 12 px at 384 still train as labels")),
+        "{:?}",
+        p.warnings
+    );
+    assert!(
+        p.warnings.iter().any(|w| w.starts_with(&format!(
+            "{} was exported with a size floor of 10 px at 384, and the current floor is 12 px \
+             at 384",
+            a.display()
+        ))),
+        "{:?}",
+        p.warnings
+    );
+    // One floor everywhere, the current one: nothing to say; no current floor: no comparison.
+    let same = [
+        Source {
+            size_floor: Some(FLOOR_384),
+            ..sa.clone()
+        },
+        Source {
+            size_floor: Some(FLOOR_384),
+            ..sb.clone()
+        },
+    ];
+    let p = plan(
+        &same,
+        &Options {
+            size_floor: Some(FLOOR_384),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        p.warnings.iter().all(|w| !w.contains("size floor")),
+        "{:?}",
+        p.warnings
+    );
+    let p = plan(&[sa, sb], &Options::default()).unwrap();
+    assert!(p.warnings.iter().all(|w| !w.contains("size floor")));
+}
+
+/// 6 camera days of 2 cats (one with an ignore region) and 6 empty frames each.
+fn many_negatives(dir: &Path) -> Vec<Source> {
+    let mut frames: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut regions: Vec<String> = Vec::new();
+    for cam in ["drive", "yard", "gate"] {
+        for day in ["2026-10-01", "2026-10-02"] {
+            for i in 0..8 {
+                let label = if i < 2 { "0 0.5 0.5 0.2 0.4\n" } else { "" };
+                let name = format!("{cam}-{day}-{i}.jpg");
+                if i == 0 {
+                    regions.push(name.clone());
+                }
+                frames.push((
+                    name,
+                    label.to_string(),
+                    vec!["day".into(), format!("camera:{cam}"), format!("date:{day}")],
+                ));
+            }
+        }
+    }
+    let refs: Vec<(&str, &str, Vec<&str>)> = frames
+        .iter()
+        .map(|(n, l, t)| {
+            (
+                n.as_str(),
+                l.as_str(),
+                t.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    let refs2: Vec<(&str, &str, &[&str])> = refs
+        .iter()
+        .map(|(n, l, t)| (*n, *l, t.as_slice()))
+        .collect();
+    flat_export(dir, &["cat"], &refs2);
+    let at: Vec<(&str, &str, f64, f64, f64, f64)> = regions
+        .iter()
+        .map(|n| (n.as_str(), "cat", 0.9, 0.9, 0.02, 0.02))
+        .collect();
+    ignore_json(dir, &at);
+    vec![read_export(dir).unwrap()]
+}
+
+#[test]
+fn positives_leaving_with_their_validation_day_do_not_count_for_the_negatives() {
+    let t = tmp("valid-day-negatives");
+    let s = many_negatives(&t.0);
+    let positive = |r: &FrameRef| !s[0].frames[r.1].boxes.is_empty();
+    // Half negatives: the target is one negative per positive that trains or validates.
+    let opts = Options {
+        negative_share: 0.5,
+        static_cap: None,
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    assert!(p.stats.ignore_valid_day > 0, "{:?}", p.stats);
+    assert_eq!(
+        p.stats.negatives_trimmed, p.stats.ignore_valid_day,
+        "{:?}",
+        p.stats
+    );
+    let used: BTreeSet<FrameRef> = p
+        .train
+        .iter()
+        .map(|(r, _)| *r)
+        .chain(p.valid.iter().copied())
+        .collect();
+    let (pos, neg): (Vec<&FrameRef>, Vec<&FrameRef>) = used.iter().partition(|r| positive(r));
+    assert_eq!(neg.len(), pos.len(), "{:?}", p.stats);
+    // Drop-frame plans never trim: no frame with a region is in the pool to leave.
+    let d = plan(
+        &s,
+        &Options {
+            ignore: IgnoreMode::DropFrame,
+            ..opts.clone()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (d.stats.negatives_trimmed, d.stats.ignore_valid_day),
+        (0, 0)
+    );
+}
+
+#[test]
+fn validation_on_public_frames_only_is_said() {
+    let t = tmp("valid-public-only");
+    let own = t.0.join("own");
+    std::fs::create_dir_all(&own).unwrap();
+    camera_export(&own);
+    let mut s = read_export(&own).unwrap();
+    // Every own frame shows an unsure object: none can validate.
+    for f in &mut s.frames {
+        f.ignore.push(region("dog"));
+    }
+    let public = animal_public(&t.0.join("lila"), 60);
+    let p = plan(&[s, public], &Options::default()).unwrap();
+    assert!(p.valid.iter().all(|r| r.0 == 1), "{:?}", p.valid);
+    assert!(
+        p.warnings.iter().any(|w| w
+            .starts_with("every training frame of your own shows an unsure or too-small object")),
+        "{:?}",
+        p.warnings
+    );
 }

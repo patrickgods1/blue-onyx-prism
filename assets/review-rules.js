@@ -16,7 +16,7 @@
   }
 
   // A reason that marks a dismissal (labels::bulk::is_dismissal).
-  function isDismissal(reason) { return reason === 'auto_dismissed' || reason === 'spot_dismissed'; }
+  function isDismissal(reason) { return reason === 'auto_dismissed' || reason === 'spot_dismissed' || reason === 'size_floor'; }
 
   // A reviewer's decision ends a dismissal: then the box is a label or a negative like any other
   // (labels::normalize does the same).

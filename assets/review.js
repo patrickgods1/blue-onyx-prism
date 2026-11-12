@@ -19,7 +19,8 @@
 // are about marked and selected), `y` accepts and `w` says no (R.answerRefine), saved with the
 // frame by the ordinary save. A labelers run sorts its new boxes into tiers
 // (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed or, at a
-// spot the reviewer rejected, spot_dismissed) are left off the frame and the list until `i` shows
+// spot the reviewer rejected, spot_dismissed; the Refine tab's size floor rule adds size_floor) are
+// left off the frame and the list until `i` shows
 // them, likely ones come first and `c` accepts them, the other flagged ones are drawn quieter.
 // `t` accepts a real object that stays put and remembers its spot (POST /v1/review/spots/parked);
 // later runs accept it there. GET /v1/review/spots feeds the card's line, and Panel options has
@@ -372,12 +373,13 @@
   // `labels::needs_decision`, which refuses the save.
   function mustDecide(b) { return isReview(b) && resolved(b) === 'accepted'; }
 
-  // Set aside by a labelers run for its score or its spot, nobody judged it
-  // (labels::LabelBox::is_dismissed).
+  // Set aside by a labelers run for its score or its spot, or by the size floor rule (Refine tab,
+  // Too small); nobody judged it (labels::LabelBox::is_dismissed).
   function isDismissed(b) { return b.state === 'rejected' && isDismissal(b.reason); }
 
   // Why a dismissed box is hidden, for the card and the box row.
   function hiddenWhy(b) {
+    if (b.reason === 'size_floor') return 'hidden: under the size floor';
     if (b.reason !== 'spot_dismissed') return 'hidden: score below ' + DISMISS_SCORE;
     var n = b.spot_rejections;
     return 'hidden: you rejected this spot ' + (n ? n + ' time' + (n === 1 ? '' : 's') : 'before');
@@ -1640,7 +1642,7 @@
     if (n) {
       var show = decideButton((dismissedOn ? 'Hide ' : 'Show ') + n + ' hidden', 'i', 'secondary', toggleDismissed);
       show.setAttribute('aria-pressed', dismissedOn ? 'true' : 'false');
-      show.title = 'Boxes the auto-labelers set aside, for a score below ' + DISMISS_SCORE + ' (about 5% were real on public sets) or at a spot you keep rejecting. Accept one if it is real.';
+      show.title = 'Boxes set aside unseen: by the auto-labelers for a score below ' + DISMISS_SCORE + ' (about 5% were real on public sets) or at a spot you keep rejecting, or by the size floor as too small. Accept one if it is real.';
       boxTools.appendChild(show);
     }
     boxTools.hidden = !likely && !n;
@@ -1749,7 +1751,7 @@
       var verb, yes, no;
       if (b.source === 'human') { verb = 'Drawn: '; yes = 'Keep'; no = 'Delete'; }
       else if (b.state === 'accepted') { verb = 'Accepted as '; yes = 'Right, keep'; no = 'No, reject'; }
-      else if (isDismissed(b)) { verb = (b.reason === 'spot_dismissed' ? 'Hidden at a spot you rejected: is it a ' : 'Hidden for its score: is it a '); yes = 'Yes, accept'; no = 'No, reject'; }
+      else if (isDismissed(b)) { verb = (b.reason === 'spot_dismissed' ? 'Hidden at a spot you rejected: is it a ' : (b.reason === 'size_floor' ? 'Hidden as under the size floor: is it a ' : 'Hidden for its score: is it a ')); yes = 'Yes, accept'; no = 'No, reject'; }
       else if (b.state === 'rejected') { verb = 'Rejected: is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
       else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
       q.appendChild(document.createTextNode(verb));

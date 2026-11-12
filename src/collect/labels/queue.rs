@@ -73,8 +73,9 @@ pub enum AutoFilter {
     /// of unwanted classes do not count either; [`AutoFilter::matches`] has none, so there every
     /// label counts.
     Both,
-    /// At least one box a labelers run dismissed ([`LabelBox::is_dismissed`]), pending boxes or
-    /// not: a frame left with only such boxes has nothing else to find it by.
+    /// At least one box a labelers run or the size floor rule dismissed
+    /// ([`LabelBox::is_dismissed`]), pending boxes or not: a frame left with only such boxes has
+    /// nothing else to find it by.
     Dismissed,
     /// A suggestion of the dataset check a reviewer can act on ([`super::refine::live`]), any
     /// review status; of [`Filters::refine_kind`] only when that is set. Strongest first
