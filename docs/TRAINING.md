@@ -205,6 +205,19 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
 A missing label file means "no objects" (the Ultralytics convention). `ignore.json` beside the labels
 lists [ignore regions](#ignore-regions); no file means none.
 
+Before the Export button, the Dataset tab's Export card can show two lines (`assets/train-dataset.js`,
+`train_area::size_floor_line`):
+
+- **Open suggestions.** When the dataset check left open suggestions, one line: *The dataset check has N open
+  suggestions (A missing boxes, V labels to verify, R other class, T better boxes) on M frames. An export uses
+  the labels as they are: answer them on the Refine tab first, or export anyway.*, with a link to
+  `/train/refine`. The counts are `open` of `GET /v1/refine`, which the page fetches once after it loads (that
+  route keeps them 60 s per folder and class list, so the tab walks no label file itself). Nothing is shown for
+  none open, an unavailable review folder or a failed read. The line only warns; the export is not blocked.
+  The sentence is `DatasetOpen.line` (node-tested).
+- **Size floor.** When `collect.size_floor` is saved, *Size floor: objects under N px at M are left out of the
+  labels of this export.* (rendered by the server with the page; a floor that is off says nothing).
+
 ### Assembly (`src/training/dataset.rs`)
 
 1. **Classes**: the run's list (`--classes`, repeated or comma-separated; the page's class picker) in
@@ -2533,6 +2546,33 @@ web UI and shows its results; the check itself is the one above and changes no b
     after the floor (a parked car with a tiny accepted person beside it is parked only there).
 - **Coverage**: the report's recall per camera, scene and class, each with its 95% interval (the per-size table is
   on the Too small card).
+  A second table on the card, **Where the data is thin** (`server/refine_coverage.rs`, `GET /v1/refine/coverage`),
+  has one row per camera x scene of the review folder (sorted by camera, then day, night, ir): reviewed frames,
+  person boxes, vehicle boxes (car, truck, bus, van, motorcycle, bicycle), empty frames (reviewed, no training box and
+  no ignore region, ticked "empty" or not: the training plan's negatives; an unsure or too-small object is no negative; the
+  cell reads `14 (3 confirmed)`, just the number when none were ticked), the last check's
+  person and vehicle recall there with the 95% interval (`-` when the report has no such row; vehicles are the sums
+  of boxes and found over the vehicle classes, the interval recomputed with `report::wilson`; a quick check's report
+  says the recall covers only the frames its model never saw, in the recall table's own words), the unreviewed
+  frames holding a person, and a short "what to do". Boxes are the accepted labels of reviewed frames (ignore
+  regions and unwanted classes not counted). *Unreviewed with a person* counts unreviewed frames with a person
+  box that is not rejected: exactly the Review page's class filter, so its number is a link to
+  `/train/review?status=unreviewed&source=all&scene=<scene>&camera=<camera>&label=person` and that link opens
+  the counted frames (a test builds the queue with the same filters and compares). The rules
+  (`RefineFloor.coverageAdvice`, node-tested; each reason is a named constant):
+  - fewer than `MIN_PERSON_BOXES` 20 person boxes: *Few persons: review the N unreviewed frames with a person
+    proposal* when N > 0, else *Few persons: collect more here* (below 20 the class is a handful of boxes there);
+  - reviewed frames but no empty one (`empty` = 0): *No empty frames: review some frames with nothing in them*; when the row has at least as many vehicle boxes as reviewed frames (a parked vehicle in about every frame, so no frame can be empty) it says so instead: *about every frame here shows a vehicle, so false alerts on empty frames cannot be measured on this camera*;
+  - at least `MIN_RECALL_BOXES` 20 person boxes in the check's recall and its interval's upper bound under
+    `MISSED_RECALL_HIGH` 0.7: *Persons are missed here: check the labels and collect more* (under 20 boxes the
+    interval is too wide to blame the labels; an upper bound under 70% is a miss, not chance).
+
+  The route answers `{success, folder_missing, message?, rows: [{camera, scene, reviewed, persons, vehicles,
+  empty, empty_confirmed, unreviewed_person_frames, person: {boxes, found, recall, low, high}|null, vehicle: {...}|null}],
+  totals: {rows, reviewed, persons, vehicles, empty, empty_confirmed, unreviewed_person_frames}}`. One walk over the label
+  files (`queue::labelled_map`, status any, in `server::blocking`), kept 60 s per folder and class list (at most 4
+  kept), dropped when a check starts or ends and by the Static objects and Too small cards' writes; the report's
+  recall is joined on every request.
 
 `GET /v1/refine` carries all of it for the page (`review_folder`, `folder_missing`, `report`, `report_problem`,
 `open`, `job`, `last`, `capability`, `limits`). `GET /v1/refine/spots` answers the Static objects card

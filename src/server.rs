@@ -51,6 +51,7 @@ mod network;
 mod pages;
 mod pick;
 mod refine;
+mod refine_coverage;
 mod refine_floor;
 mod refine_spots;
 mod resources;
@@ -300,6 +301,7 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             post(refine::start).layer(DefaultBodyLimit::max(refine::BODY_LIMIT)),
         ),
         ("/v1/refine/spots", get(refine_spots::spots)),
+        ("/v1/refine/coverage", get(refine_coverage::coverage)),
         (
             "/v1/refine/accept-spot",
             post(refine_spots::accept_spot_route)
@@ -1386,6 +1388,7 @@ mod tests {
             "/v1/refine/preview",
             "/v1/refine/check",
             "/v1/refine/spots",
+            "/v1/refine/coverage",
             "/v1/refine/accept-spot",
             "/v1/refine/static-cap",
             "/v1/refine/floor",

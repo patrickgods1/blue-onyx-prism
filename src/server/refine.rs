@@ -1045,6 +1045,8 @@ mod tests {
             "id=\"refine-preview-btn\"",
             "id=\"refine-findings\"",
             "id=\"refine-coverage\"",
+            "id=\"refine-thin-body\"",
+            "<h3>Where the data is thin</h3>",
             "id=\"refine-statics\"",
             "id=\"refine-cap-form\"",
             "name=\"cap\" min=\"0\" max=\"100000\" step=\"1\"",

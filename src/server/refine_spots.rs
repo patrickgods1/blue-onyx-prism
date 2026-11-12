@@ -624,6 +624,7 @@ pub(super) async fn accept_spot_route(
             // answers are dropped here.
             forget_counts();
             forget();
+            super::refine_coverage::forget();
         }
         let weak = score_text(min);
         let mut message = if dry_run {

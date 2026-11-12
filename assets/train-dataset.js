@@ -1,12 +1,40 @@
+// The export card's line about the dataset check's open suggestions (GET /v1/refine `open`, the
+// counts that route already keeps for 60 s; nothing is walked here): pure, node-tested
+// (tests/it/js_rules.rs), `globalThis.DatasetOpen`.
+(function () {
+  'use strict';
+  function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
+  globalThis.DatasetOpen = {
+    // `open` = {add, verify, relabel, tighten, frames}: the sentence in three parts (before the
+    // link, the link's text, after it), or null when nothing is open.
+    line: function (open) {
+      if (!open) return null;
+      var a = open.add || 0, v = open.verify || 0, r = open.relabel || 0, t = open.tighten || 0;
+      var total = a + v + r + t;
+      if (!(total > 0)) return null;
+      return {
+        before: 'The dataset check has ' + plural(total, 'open suggestion', 'open suggestions') + ' (' +
+          a + ' missing boxes, ' + v + ' labels to verify, ' + r + ' other class, ' + t + ' better boxes) on ' +
+          plural(open.frames || 0, 'frame', 'frames') +
+          '. An export uses the labels as they are: answer them on the ',
+        link: 'Refine tab',
+        after: ' first, or export anyway.'
+      };
+    }
+  };
+})();
+
 // Dataset tab (/train/dataset): the Export form (POST /v1/review/export), the X-AnyLabeling import
 // (POST /v1/review/import) and the Classes card (POST /v1/review/classes, the class picker of
 // class-picker.js: the list in order, "hide" (don't want: hide + reject) per class =
 // collect.hidden_classes). A class save that leaves reviewed frames with accepted boxes of unwanted
 // classes asks, then POST /v1/review/reject-unwanted-reviewed. After an export the Exports and
-// coverage cards are read again from the page's own URL. No inline handlers (CSP); server values
+// coverage cards are read again from the page's own URL. The export card warns when the dataset check left
+// open suggestions (`DatasetOpen`, GET /v1/refine). No inline handlers (CSP); server values
 // come from data-*.
 (function () {
   'use strict';
+  if (typeof document === 'undefined') return; // Node: the pure helper above only
   var root = document.getElementById('dataset-tab');
   if (!root) return;
   var classes = [];
@@ -245,4 +273,26 @@
       hiddenClasses = Array.isArray(c.hidden) ? c.hidden : [];
     }).catch(function () { catalog = null; }).then(initPicker);
   }
+
+  // The dataset check's open suggestions, before the Export button: one read of GET /v1/refine (its
+  // counts are kept 60 s there, so this walks nothing new). Nothing is shown for none, an
+  // unavailable folder or a failed read: the line only warns.
+  (function () {
+    var line = $('export-open');
+    if (!line || !window.DatasetOpen) return;
+    fetch('/v1/refine', { headers: { Accept: 'application/json' }, cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || j.success === false || j.folder_missing) return;
+        var parts = window.DatasetOpen.line(j.open);
+        if (!parts) return;
+        line.textContent = parts.before;
+        var a = el('a', null, parts.link);
+        a.href = '/train/refine';
+        line.appendChild(a);
+        line.appendChild(document.createTextNode(parts.after));
+        line.hidden = false;
+      })
+      .catch(function () { /* the line only warns */ });
+  })();
 })();

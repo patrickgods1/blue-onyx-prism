@@ -521,6 +521,7 @@ pub(super) async fn resolve_small(
             // answers are dropped here.
             forget_counts();
             forget();
+            super::refine_coverage::forget();
         }
         let mut message = match (restore, o.boxes == 0, dry_run) {
             (false, true, _) => {

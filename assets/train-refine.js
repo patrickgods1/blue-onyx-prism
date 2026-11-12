@@ -21,6 +21,11 @@
 // run, the inline question, then the write, as the Static objects card does). The last check's
 // recall by size is drawn there too. The pure sentences are in `RefineFloor`, tested
 // in Node (tests/it/js_rules.rs). No inline handlers (CSP); limits come from the server's answers.
+// The Coverage card's second table, "Where the data is thin" (GET /v1/refine/coverage), is a row per
+// camera x scene of the folder under review: reviewed frames, person / vehicle boxes, frames
+// confirmed empty, the last check's recall there, unreviewed frames with a person (a link into Review
+// under the page's own filters) and a short "what to do"; the rules and thresholds are in
+// `RefineFloor` (node-tested).
 (function () {
   'use strict';
   // The fewest boxes of a class a run wants to learn it from (the dataset check's MIN_CLASS_BOXES).
@@ -119,6 +124,59 @@
           (m.name || 'the model') + ' never saw: how often it found a labelled object';
       }
       return 'Recall per camera, scene and class: how often a fold model that never saw that camera day found a labelled object';
+    },
+    // The Coverage card's "Where the data is thin" table (GET /v1/refine/coverage).
+    // Fewest person boxes of one camera and scene a model can be expected to learn people there
+    // from: below this the class is a handful of boxes (the whole run wants MIN_CLASS_BOXES).
+    MIN_PERSON_BOXES: 20,
+    // Fewest person boxes in the last check's recall for a camera and scene before its interval is
+    // trusted to say "missed": under this the 95% interval is too wide to blame the labels.
+    MIN_RECALL_BOXES: 20,
+    // A person recall whose interval ends under this (its upper bound) is missed for sure, not
+    // by chance: even the best case is below 70%.
+    MISSED_RECALL_HIGH: 0.7,
+    // The Review link of a row's unreviewed person frames: the page's own filters (unreviewed,
+    // all collected frames, the row's scene and camera, class person), which list the same
+    // frames the row counts.
+    coverageUrl: function (row) {
+      return '/train/review?status=unreviewed&source=all&scene=' + encodeURIComponent(row.scene) +
+        '&camera=' + encodeURIComponent(row.camera) + '&label=person';
+    },
+    // What to do about a row, in words ('' when there is nothing to say): few persons (review the
+    // proposals there when there are some, else collect), no empty frame (reviewed, nothing in it; on a camera with
+    // reviewed frames), persons missed (the recall interval's upper bound under MISSED_RECALL_HIGH
+    // with MIN_RECALL_BOXES boxes behind it).
+    coverageAdvice: function (row) {
+      var out = [];
+      var n = row.unreviewed_person_frames || 0;
+      if ((row.persons || 0) < api.MIN_PERSON_BOXES) {
+        out.push(n > 0
+          ? 'Few persons: review the ' + plural(n, 'unreviewed frame', 'unreviewed frames') + ' with a person proposal'
+          : 'Few persons: collect more here');
+      }
+      if ((row.reviewed || 0) > 0 && !(row.empty > 0)) {
+        // A camera whose every frame shows a parked vehicle cannot have an empty frame: say so
+        // instead of asking for the impossible.
+        out.push((row.vehicles || 0) >= row.reviewed
+          ? 'No empty frames: about every frame here shows a vehicle, so false alerts on empty frames cannot be measured on this camera'
+          : 'No empty frames: review some frames with nothing in them');
+      }
+      var p = row.person;
+      if (p && p.boxes >= api.MIN_RECALL_BOXES && p.high < api.MISSED_RECALL_HIGH) {
+        out.push('Persons are missed here: check the labels and collect more');
+      }
+      return out.length ? out.join('. ') + '.' : '';
+    },
+    // The Empty frames cell: reviewed frames with nothing in them, and how many the reviewer ticked.
+    emptyText: function (row) {
+      var n = row.empty || 0, c = row.empty_confirmed || 0;
+      return c > 0 ? n + " (" + c + " confirmed)" : String(n);
+    },
+    // Who the table's recall columns are of (`r` = the last report, or null): the same words as the
+    // recall table above, so a quick check's recall reads as covering only the frames its model never saw.
+    thinRecallNote: function (r) {
+      if (!r) return 'No check has run yet, so the recall columns show "-".';
+      return api.recallOf(r) + '. Vehicles are car, truck, bus, van, motorcycle and bicycle together.';
     }
   };
   globalThis.RefineFloor = api;
@@ -572,6 +630,7 @@
 
   function drawCoverage(state) {
     var box = $('refine-coverage-body');
+    lastReport = state.report || null;
     clear(box);
     var r = state.report;
     if (!r) {
@@ -599,6 +658,83 @@
     if ((r.recall_by_size || []).length) {
       box.appendChild(el('p', 'muted small', 'Recall by size is on the Too small card above.'));
     }
+  }
+
+  // "Where the data is thin" (GET /v1/refine/coverage): a camera x scene row per place of the folder
+  // under review, with the counts, the last check's recall there and what to do (RefineFloor).
+  // Everything from the server goes in through textContent; the one link is built from the row's
+  // own names by RefineFloor.coverageUrl.
+  var lastReport = null;
+  function thinRecall(x) {
+    if (!x || x.recall == null) return '-';
+    return recallText(x) + ' of ' + plural(x.boxes, 'box', 'boxes');
+  }
+  function drawThin(j) {
+    var box = $('refine-thin-body');
+    clear(box);
+    if (!j) return;
+    if (j.folder_missing) {
+      box.appendChild(el('p', 'error', j.message || 'The folder under review is not available.'));
+      return;
+    }
+    var rows = j.rows || [];
+    if (!rows.length) {
+      box.appendChild(el('p', 'muted', 'No frames in the folder under review yet.'));
+      return;
+    }
+    box.appendChild(el('p', 'muted small', RefineFloor.thinRecallNote(lastReport)));
+    var wrap = el('div', 'scroll');
+    var table = el('table', 'rcards');
+    var head = el('thead');
+    var hr = el('tr');
+    var cols = [
+      ['Camera', false], ['Scene', false], ['Reviewed frames', true], ['Person boxes', true], ['Vehicle boxes', true],
+      ['Empty frames', true], ['Person recall (95%)', true], ['Vehicle recall (95%)', true],
+      ['Unreviewed with a person', true], ['What to do', false]
+    ];
+    cols.forEach(function (c) { hr.appendChild(el('th', c[1] ? 'num' : null, c[0])); });
+    head.appendChild(hr);
+    table.appendChild(head);
+    var body = el('tbody');
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      var cell = function (i, cls, text) {
+        var td = el('td', cls, text);
+        if (i > 0) td.setAttribute('data-label', cols[i][0]);
+        tr.appendChild(td);
+        return td;
+      };
+      cell(0, 'rc-title', r.camera);
+      cell(1, null, r.scene);
+      cell(2, 'num', String(r.reviewed));
+      cell(3, 'num', String(r.persons));
+      cell(4, 'num', String(r.vehicles));
+      cell(5, 'num', RefineFloor.emptyText(r));
+      cell(6, 'num', thinRecall(r.person));
+      cell(7, 'num', thinRecall(r.vehicle));
+      var un = cell(8, 'num', r.unreviewed_person_frames > 0 ? null : '0');
+      if (r.unreviewed_person_frames > 0) {
+        var a = el('a', null, String(r.unreviewed_person_frames));
+        a.href = RefineFloor.coverageUrl(r);
+        a.title = 'Open these frames in Review';
+        un.appendChild(a);
+      }
+      cell(9, 'rc-block', RefineFloor.coverageAdvice(r));
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    wrap.appendChild(table);
+    box.appendChild(wrap);
+    box.appendChild(el('p', 'muted small', 'Boxes are the accepted labels of reviewed frames (unsure and too-small objects left out, hidden classes not counted). Unreviewed with a person: unreviewed frames holding a person box nobody rejected; the number opens them in Review.'));
+  }
+  function loadThin() {
+    return getJson('/v1/refine/coverage')
+      .then(drawThin)
+      .catch(function (e) {
+        var box = $('refine-thin-body');
+        clear(box);
+        box.appendChild(el('p', 'error', e.message));
+      });
   }
 
   // The last check's recall by box size, on the Too small card: where models stop finding objects
@@ -1169,6 +1305,7 @@
         // The spots walk the reviewed frames: after the first paint, not before it.
         loadSpots();
         loadFloor();
+        loadThin();
       })
       .catch(function (e) {
         var box = $('refine-findings-body');
