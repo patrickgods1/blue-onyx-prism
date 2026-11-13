@@ -365,6 +365,7 @@ impl Row {
             },
             refine_strength,
             refine_open,
+            balance: None,
         }
     }
 }

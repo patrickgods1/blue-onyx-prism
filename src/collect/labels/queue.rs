@@ -169,6 +169,196 @@ fn agreed_boxes(l: &LabelFile, wanted: Option<&Wanted<'_>>) -> usize {
         .count()
 }
 
+/// What `balance=` puts first ([`Filters::balance`]): frames of the classes, scenes and cameras
+/// the fewest reviewed frames have, so the next reviews even out the dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct Balance {
+    pub class: bool,
+    pub scene: bool,
+    pub camera: bool,
+}
+
+impl Balance {
+    /// From a comma list of `class`, `scene` and `camera` (empty items ignored): None when it names
+    /// none. An unknown item is an error naming it.
+    pub fn parse(s: &str) -> Result<Option<Self>, String> {
+        let mut b = Self::default();
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "class" => b.class = true,
+                "scene" => b.scene = true,
+                "camera" => b.camera = true,
+                other => {
+                    return Err(format!(
+                        "balance: '{}' is not class, scene or camera",
+                        other.escape_debug()
+                    ));
+                }
+            }
+        }
+        Ok((b != Self::default()).then_some(b))
+    }
+}
+
+/// The most a dimension of [`Balance`] adds to [`BalanceNeed::score`]: a value with no reviewed
+/// frame while another has some.
+pub const BALANCE_NEED_MAX: u32 = 1000;
+
+/// How much `n` reviewed frames lack against `most`, the most any value of the dimension has:
+/// [`BALANCE_NEED_MAX`] x (1 - n / most), rounded down; 0 when nothing is reviewed (every value
+/// is as rare as the others).
+fn lack(n: u64, most: u64) -> u32 {
+    if most == 0 {
+        return 0;
+    }
+    let short = most - n.min(most);
+    u32::try_from(short * u64::from(BALANCE_NEED_MAX) / most).unwrap_or(BALANCE_NEED_MAX)
+}
+
+/// Reviewed frames per class, scene and camera: what [`Filters::balance`] weighs a frame against.
+/// Over the frames [`Counts`] counts (the filters keep them, status and auto filters aside).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct BalanceTally {
+    /// Reviewed frames with a training box of each wanted class (the class list's spelling).
+    pub classes: BTreeMap<String, u64>,
+    /// Reviewed frames with no training box of a wanted class: the negatives.
+    pub empty: u64,
+    pub scenes: BTreeMap<String, u64>,
+    pub cameras: BTreeMap<String, u64>,
+}
+
+/// The class part of a frame's [`BalanceNeed`]: its wanted class with the fewest reviewed frames.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ClassNeed {
+    pub need: u32,
+    /// None: no wanted class on the frame, weighed as an empty frame.
+    pub class: Option<String>,
+    pub reviewed: u64,
+}
+
+impl BalanceTally {
+    /// Add `n` reviewed frames of `scene` and `camera` whose training boxes have the wanted
+    /// classes `classes`.
+    pub(super) fn add(&mut self, n: u64, scene: &str, camera: &str, classes: &BTreeSet<String>) {
+        for c in classes {
+            *self.classes.entry(c.clone()).or_default() += n;
+        }
+        if classes.is_empty() {
+            self.empty += n;
+        }
+        *self.scenes.entry(scene.to_string()).or_default() += n;
+        *self.cameras.entry(camera.to_string()).or_default() += n;
+    }
+
+    fn merge(&mut self, other: Self) {
+        let Self {
+            classes,
+            empty,
+            scenes,
+            cameras,
+        } = other;
+        for (k, n) in classes {
+            *self.classes.entry(k).or_default() += n;
+        }
+        self.empty += empty;
+        for (k, n) in scenes {
+            *self.scenes.entry(k).or_default() += n;
+        }
+        for (k, n) in cameras {
+            *self.cameras.entry(k).or_default() += n;
+        }
+    }
+
+    /// The class part for a frame with the wanted classes `classes`: the one with the fewest
+    /// reviewed frames (the first by name on a tie), or the empty frames' count with none. The
+    /// empty frames are a value of the class dimension: a dataset of reviewed cars and no negatives
+    /// needs empty frames.
+    pub(super) fn class_need(&self, classes: &BTreeSet<String>) -> ClassNeed {
+        let most = self
+            .classes
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(self.empty);
+        let mut best: Option<ClassNeed> = None;
+        for c in classes {
+            let reviewed = self.classes.get(c).copied().unwrap_or(0);
+            if best.as_ref().is_none_or(|b| reviewed < b.reviewed) {
+                best = Some(ClassNeed {
+                    need: lack(reviewed, most),
+                    class: Some(c.clone()),
+                    reviewed,
+                });
+            }
+        }
+        best.unwrap_or_else(|| ClassNeed {
+            need: lack(self.empty, most),
+            class: None,
+            reviewed: self.empty,
+        })
+    }
+
+    /// The need and reviewed frames of `value` in `of` (scenes or cameras).
+    fn value_need(of: &BTreeMap<String, u64>, value: &str) -> (u32, u64) {
+        let most = of.values().copied().max().unwrap_or(0);
+        let n = of.get(value).copied().unwrap_or(0);
+        (lack(n, most), n)
+    }
+
+    pub(super) fn scene_need(&self, scene: &str) -> (u32, u64) {
+        Self::value_need(&self.scenes, scene)
+    }
+
+    pub(super) fn camera_need(&self, camera: &str) -> (u32, u64) {
+        Self::value_need(&self.cameras, camera)
+    }
+
+    /// The need of a frame of `scene` and `camera` with the class part `class` (Some when `by`
+    /// balances classes): each dimension of `by` adds its need.
+    pub(super) fn need(
+        &self,
+        by: Balance,
+        class: Option<ClassNeed>,
+        scene: &str,
+        camera: &str,
+    ) -> BalanceNeed {
+        let class = class.filter(|_| by.class);
+        let scene = by.scene.then(|| self.scene_need(scene));
+        let camera = by.camera.then(|| self.camera_need(camera));
+        BalanceNeed {
+            score: class.as_ref().map_or(0, |c| c.need)
+                + scene.map_or(0, |s| s.0)
+                + camera.map_or(0, |c| c.0),
+            class_reviewed: class.as_ref().map(|c| c.reviewed),
+            class: class.and_then(|c| c.class),
+            scene_reviewed: scene.map(|s| s.1),
+            camera_reviewed: camera.map(|c| c.1),
+        }
+    }
+}
+
+/// Why `balance=` places a frame where it does ([`BalanceTally::need`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct BalanceNeed {
+    /// Higher first: per dimension balanced by, [`BALANCE_NEED_MAX`] x (1 - the frame's value's
+    /// reviewed frames / the most reviewed value's), summed.
+    pub score: u32,
+    /// Balancing classes: the frame's wanted class with the fewest reviewed frames; absent with
+    /// `class_reviewed` = the frame has no wanted class and counts as an empty frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// Reviewed frames of [`Self::class`] (of empty frames without one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_reviewed: Option<u64>,
+    /// Reviewed frames of the frame's scene, balancing scenes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_reviewed: Option<u64>,
+    /// Reviewed frames of the frame's camera, balancing cameras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_reviewed: Option<u64>,
+}
+
 /// Queue filters (`GET /v1/review/next?...`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filters {
@@ -188,6 +378,10 @@ pub struct Filters {
     /// With [`AutoFilter::Refine`] only (`refine_kind=`): the suggestions of this kind alone count,
     /// for the filter, the order and `refine_open`. None = every kind.
     pub refine_kind: Option<RefineKind>,
+    /// `balance=`: frames whose class, scene or camera has the fewest reviewed frames first
+    /// ([`BalanceTally`], [`Uncertainty::balance`]); the usual order breaks ties. None = the usual
+    /// order. Lists nothing more or less.
+    pub balance: Option<Balance>,
 }
 
 impl Filters {
@@ -195,7 +389,8 @@ impl Filters {
     /// them, empty items ignored, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
     /// overlaps|both|dismissed|refine`, `refine_kind` = `add|tighten|relabel|verify`, only with
-    /// `auto=refine`); empty values mean "any". Errors name the field.
+    /// `auto=refine`, `balance` = a comma list of `class|scene|camera`, [`Balance::parse`]);
+    /// empty values mean "any". Errors name the field.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -269,6 +464,7 @@ impl Filters {
                 Some(kind)
             }
         };
+        let balance = Balance::parse(get("balance").unwrap_or(""))?;
         Ok(Self {
             bucket,
             scene,
@@ -279,6 +475,7 @@ impl Filters {
             auto,
             wanted: None,
             refine_kind,
+            balance,
         })
     }
 
@@ -287,6 +484,23 @@ impl Filters {
         self.wanted
             .as_ref()
             .map(|(classes, hidden)| Wanted { classes, hidden })
+    }
+
+    /// The wanted classes among `labels`, in the class list's spelling (aliases mapped, unwanted
+    /// ones left out); every label without a class list. What [`Self::balance`] counts by.
+    pub(super) fn wanted_of<'a>(
+        &self,
+        labels: impl IntoIterator<Item = &'a str>,
+    ) -> BTreeSet<String> {
+        let wanted = self.wanted();
+        labels
+            .into_iter()
+            .filter_map(|l| match &wanted {
+                Some(w) => w.class_of(l),
+                None => Some(l),
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// Whether a frame with `labels` passes the auto filter.
@@ -411,6 +625,11 @@ pub struct Uncertainty {
     /// `refine_kind` when given).
     #[serde(skip_serializing_if = "is_zero")]
     pub refine_open: u32,
+    /// `balance=` only: how much the frame's class, scene and camera lack reviewed frames
+    /// ([`BalanceTally::need`]). Higher scores come first, after the auto filters' own orders and
+    /// before everything else but repeat-only frames, which stay last.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceNeed>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -446,6 +665,7 @@ impl Uncertainty {
             agreed_boxes: 0,
             refine_strength: 0,
             refine_open: 0,
+            balance: None,
         }
     }
 
@@ -475,8 +695,8 @@ impl Uncertainty {
 
     /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only), the
     /// most agreed boxes (`auto=both` only), the strongest suggestion of the dataset check
-    /// (`auto=refine` only), repeat-only frames last of all, then a re-label
-    /// disagreement, then the most likely boxes, fewer flagged boxes (17 flagged boxes on a frame
+    /// (`auto=refine` only), repeat-only frames last of all, then the highest balance need
+    /// (`balance=` only), then a re-label disagreement, then the most likely boxes, fewer flagged boxes (17 flagged boxes on a frame
     /// with no likely one are mostly false: an empty yard must not open the queue), then the margin
     /// in hundredths (no box last), verifier disagreement, more suppressed boxes.
     pub(super) fn key(&self) -> SortKey {
@@ -493,6 +713,7 @@ impl Uncertainty {
             std::cmp::Reverse(self.agreed_boxes),
             std::cmp::Reverse(self.refine_strength),
             self.repeats_only,
+            std::cmp::Reverse(self.balance.as_ref().map_or(0, |b| b.score)),
             self.relabel.is_none(),
             std::cmp::Reverse(self.likely_boxes),
             self.auto_review,
@@ -509,6 +730,7 @@ pub(super) type SortKey = (
     std::cmp::Reverse<u32>,
     std::cmp::Reverse<u32>,
     bool,
+    std::cmp::Reverse<u32>,
     bool,
     std::cmp::Reverse<u32>,
     usize,
@@ -641,6 +863,8 @@ pub struct Queue {
     pub labels: Vec<String>,
     /// Frames left out: unreadable sidecar or label file.
     pub unreadable: u64,
+    /// With [`Filters::balance`]: the reviewed frames the order weighed against.
+    pub balance: Option<BalanceTally>,
 }
 
 /// Add the frames of review lines `lines` to `out`, each once with those in `seen`.
@@ -737,6 +961,9 @@ struct DayQueue {
     counts: Counts,
     labels: BTreeSet<String>,
     unreadable: u64,
+    /// With [`Filters::balance`]: the reviewed frames counted, and per item its wanted classes.
+    balance: BalanceTally,
+    wanted: Vec<BTreeSet<String>>,
 }
 
 /// The candidates of one day folder, read: the part of [`build`] that touches files.
@@ -752,11 +979,20 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
         };
         let classes = frame_labels(&rec, labels.as_ref());
         let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
+        let wanted = f
+            .balance
+            .map(|_| f.wanted_of(classes.iter().map(String::as_str)));
         q.labels.extend(classes);
         if !keep {
             continue;
         }
         q.counts.add(labels.as_ref());
+        if f.balance.is_some()
+            && let Some(l) = labels.as_ref().filter(|l| l.status == Status::Reviewed)
+        {
+            let trained = f.wanted_of(l.training().map(|b| b.label.as_str()));
+            q.balance.add(1, &c.scene, &c.camera, &trained);
+        }
         let status = labels.as_ref().map_or(Status::Unreviewed, |l| l.status);
         if let StatusFilter::Is(s) = f.status
             && s != status
@@ -785,8 +1021,18 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
             queued: c.queued,
             uncertainty,
         });
+        q.wanted.extend(wanted);
     }
     q
+}
+
+/// Each item's [`Uncertainty::balance`] against `tally`; `wanted` holds the items' wanted classes,
+/// in their order.
+fn weigh(items: &mut [Item], wanted: &[BTreeSet<String>], tally: &BalanceTally, by: Balance) {
+    for (item, classes) in items.iter_mut().zip(wanted) {
+        let class = by.class.then(|| tally.class_need(classes));
+        item.uncertainty.balance = Some(tally.need(by, class, &item.scene, &item.camera));
+    }
 }
 
 /// Build the queue of `dir` for `f`. Frames whose image or sidecar is gone (retention) are
@@ -818,11 +1064,18 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
         build_day(walker.clone(), day, f)
     });
     let mut seen_labels = BTreeSet::new();
+    let (mut tally, mut wanted) = (BalanceTally::default(), Vec::new());
     for part in parts {
         q.items.extend(part.items);
         q.counts.merge(part.counts);
         seen_labels.extend(part.labels);
         q.unreadable += part.unreadable;
+        tally.merge(part.balance);
+        wanted.extend(part.wanted);
+    }
+    if let Some(by) = f.balance {
+        weigh(&mut q.items, &wanted, &tally, by);
+        q.balance = Some(tally);
     }
     sort_items(&mut q.items);
     q.cameras = cameras.into_iter().collect();
@@ -1113,6 +1366,7 @@ mod tests {
             agreed_boxes: 0,
             refine_strength: 0,
             refine_open: 0,
+            balance: None,
         }
     }
 
@@ -2146,6 +2400,186 @@ mod tests {
         assert_eq!(person.by_scene["day"], 2);
         assert_eq!(person.by_camera["gate"], 2);
         assert!(!t.coverage.contains_key("car"), "a pending box is no label");
+    }
+
+    #[test]
+    fn balance_parses_a_list_and_names_what_it_does_not_know() {
+        assert_eq!(Balance::parse(""), Ok(None));
+        assert_eq!(Balance::parse(" , "), Ok(None));
+        assert_eq!(
+            Balance::parse("class, camera"),
+            Ok(Some(Balance {
+                class: true,
+                scene: false,
+                camera: true,
+            }))
+        );
+        let e = Balance::parse("class,time").unwrap_err();
+        assert!(e.starts_with("balance:") && e.contains("'time'"), "{e}");
+        let q = |v: &str| BTreeMap::from([("balance".to_string(), v.to_string())]);
+        assert_eq!(
+            Filters::from_query(&q("scene")).unwrap().balance,
+            Some(Balance {
+                scene: true,
+                ..Balance::default()
+            })
+        );
+        assert_eq!(Filters::from_query(&q("")).unwrap().balance, None);
+        assert!(Filters::from_query(&q("dusk")).is_err());
+    }
+
+    #[test]
+    fn the_need_is_what_a_value_lacks_against_the_most_reviewed_one() {
+        assert_eq!(lack(0, 10), BALANCE_NEED_MAX);
+        assert_eq!(lack(10, 10), 0);
+        assert_eq!(lack(5, 10), 500);
+        assert_eq!(lack(1, 3), 666, "rounded down");
+        assert_eq!(lack(0, 0), 0, "nothing reviewed: nothing is rarer");
+        let set = |l: &[&str]| l.iter().map(|s| (*s).to_string()).collect::<BTreeSet<_>>();
+        let mut t = BalanceTally::default();
+        t.add(10, "day", "gate", &set(&["car"]));
+        t.add(2, "ir", "gate", &set(&["car", "truck"]));
+        t.add(4, "day", "back", &set(&[]));
+        // car 12, truck 2, empty 4; day 14, ir 2; gate 12, back 4.
+        let truck = t.class_need(&set(&["car", "truck"]));
+        assert_eq!(
+            truck.class.as_deref(),
+            Some("truck"),
+            "the rarest class decides"
+        );
+        assert_eq!((truck.need, truck.reviewed), (833, 2));
+        let bus = t.class_need(&set(&["bus", "car"]));
+        assert_eq!(
+            (bus.class.as_deref(), bus.need),
+            (Some("bus"), BALANCE_NEED_MAX)
+        );
+        let empty = t.class_need(&set(&[]));
+        assert_eq!((empty.class, empty.need, empty.reviewed), (None, 666, 4));
+        assert_eq!(t.scene_need("ir"), (857, 2));
+        assert_eq!(t.camera_need("nowhere"), (BALANCE_NEED_MAX, 0));
+        let by = Balance {
+            class: true,
+            scene: true,
+            camera: false,
+        };
+        let need = t.need(by, Some(truck), "ir", "back");
+        assert_eq!(need.score, 833 + 857, "camera is not balanced");
+        assert_eq!(need.class_reviewed, Some(2));
+        assert_eq!(need.scene_reviewed, Some(2));
+        assert_eq!(need.camera_reviewed, None);
+    }
+
+    #[test]
+    fn balance_puts_the_rarest_class_and_camera_first_and_lists_the_same_frames() {
+        use super::super::bulk::test_support::put_frame_at;
+        use super::super::tests_support::auto_box;
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let put = |cam: &str, stem: &str, labels: &[&str]| {
+            let boxes = labels.iter().map(|l| auto_box(l)).collect();
+            put_frame_at(&dir, cam, stem, (64, 48), None, boxes)
+        };
+        let reviewed = |cam: &str, stem: &str, label: &str| {
+            let mut b = auto_box(label);
+            b.state = BoxState::Accepted;
+            let rel = put(cam, stem, &[]);
+            let frame = Frame::resolve(&dir, &rel).unwrap();
+            let l = LabelFile {
+                status: Status::Reviewed,
+                boxes: vec![b],
+                ..LabelFile::default()
+            };
+            super::super::write(&frame.labels, &l).unwrap();
+        };
+        // Reviewed: car 3 on camera a, truck 1 on camera b, no empty frame.
+        for stem in ["r1", "r2", "r3"] {
+            reviewed("a", stem, "car");
+        }
+        reviewed("b", "r4", "truck");
+        let car = put("a", "u_car", &["car"]);
+        let carb = put("b", "u_carb", &["car"]);
+        let truck = put("a", "u_truck", &["truck", "car"]);
+        let empty = put("a", "u_empty", &[]);
+        // Only an unwanted class: weighed as an empty frame.
+        let dog = put("a", "u_dog", &["dog"]);
+        let f = |by: &str| Filters {
+            balance: Balance::parse(by).unwrap(),
+            wanted: Some((["car", "truck"].map(String::from).to_vec(), Vec::new())),
+            ..Filters::default()
+        };
+        let frames = |f: &Filters| -> Vec<String> {
+            build(&dir, f).items.into_iter().map(|i| i.frame).collect()
+        };
+        // Ties fall to the usual order, here the path.
+        let usual = frames(&f(""));
+        assert_eq!(
+            usual,
+            [
+                car.clone(),
+                dog.clone(),
+                empty.clone(),
+                truck.clone(),
+                carb.clone()
+            ]
+        );
+        assert_eq!(
+            frames(&f("class")),
+            [
+                dog.clone(),
+                empty.clone(),
+                truck.clone(),
+                car.clone(),
+                carb.clone()
+            ],
+            "no empty frame reviewed yet, then truck (1 of 3), then car"
+        );
+        assert_eq!(
+            frames(&f("camera")),
+            [
+                carb.clone(),
+                car.clone(),
+                dog.clone(),
+                empty.clone(),
+                truck.clone()
+            ]
+        );
+        assert_eq!(
+            frames(&f("class,camera")),
+            [dog.clone(), empty, truck.clone(), carb, car],
+            "truck and the car of camera b tie at 666: the path decides"
+        );
+        let q = build(&dir, &f("class,camera"));
+        let tally = q.balance.as_ref().unwrap();
+        assert_eq!(
+            tally.classes,
+            BTreeMap::from([("car".into(), 3), ("truck".into(), 1)])
+        );
+        assert_eq!(
+            (tally.empty, tally.cameras["a"], tally.cameras["b"]),
+            (0, 3, 1)
+        );
+        let need = |rel: &str| {
+            q.items
+                .iter()
+                .find(|i| i.frame == rel)
+                .and_then(|i| i.uncertainty.balance.clone())
+                .unwrap()
+        };
+        let t = need(&truck);
+        assert_eq!(
+            (t.class.as_deref(), t.class_reviewed),
+            (Some("truck"), Some(1))
+        );
+        assert_eq!(
+            (t.camera_reviewed, t.scene_reviewed, t.score),
+            (Some(3), None, 666)
+        );
+        let d = need(&dog);
+        assert_eq!((d.class, d.class_reviewed, d.score), (None, Some(0), 1000));
+        // Off: no score on the items, no tally.
+        let plain = build(&dir, &f(""));
+        assert!(plain.balance.is_none());
+        assert!(plain.items.iter().all(|i| i.uncertainty.balance.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// [`build`] as one loop over one frame at a time, [`Frame::resolve`] per frame: what the day

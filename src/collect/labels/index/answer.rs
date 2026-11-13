@@ -3,7 +3,7 @@
 //! nothing else, so the two cannot differ in the JSON's fields.
 
 use super::super::super::layout;
-use super::super::queue::{self, Counts, Filters, Item, Queue, QueueSource};
+use super::super::queue::{self, BalanceTally, Counts, Filters, Item, Queue, QueueSource};
 use serde::Serialize;
 use std::path::Path;
 
@@ -34,6 +34,9 @@ pub struct Answer {
     pub upcoming: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexing: Option<Indexing>,
+    /// With `balance=`: the reviewed frames per class, scene and camera the order weighed against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceTally>,
 }
 
 /// How many frames [`Answer::upcoming`] lists.
@@ -67,6 +70,7 @@ impl Answer {
             labels: built.labels,
             unreadable: built.unreadable + damaged,
             indexing: None,
+            balance: built.balance,
         }
     }
 }

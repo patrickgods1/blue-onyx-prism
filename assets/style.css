@@ -991,10 +991,12 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 /* One column, the frame zoomed: the whole frame over it, a tap selects a box or moves the view
    there (review.js drawOverview); a drag scrolls the page. Its height is right before it is drawn. */
 .review-stage canvas.rv-overview { width: min(100%, calc(28svh * var(--rv-ar, 1.78))); height: auto; aspect-ratio: var(--rv-ar, 1.78); margin: 0 auto 0.3rem; cursor: pointer; touch-action: manipulation; }
-/* Two columns: the overview lies in the frame's top right corner while it is zoomed (review.js
-   drawOverview), out of the flow, so the frame never moves when it comes or goes. `--rv-cw` is the
-   frame's CSS width (the 701px rule below; `--rv-head` is set on the stage), so the overview
-   follows the frame's right edge when the frame is narrower than the column. */
+/* Two columns: the overview lies over a corner of the frame while it is zoomed (review.js
+   drawOverview), out of the flow, so the frame never moves when it comes or goes. This places it
+   top right; review.js placeOverview then sets `left`/`top` to the corner that leaves the selected
+   box in sight. `--rv-cw` is the frame's CSS width (the 701px rule below; `--rv-head` is set on
+   the stage), so the overview follows the frame's right edge when the frame is narrower than the
+   column. */
 @media (min-width: 901px) {
   .review-stage { position: relative; }
   .review-stage canvas.rv-overview {

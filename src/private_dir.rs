@@ -189,8 +189,10 @@ fn give_to_folder_owner(made: &Path, dir: &Path) -> Result<()> {
 }
 
 /// `rename(from, to)`, tried `attempts` times `pause` apart while the error is a Windows sharing
-/// violation ([`is_sharing_violation`]); any other error at once.
-fn rename_retrying(
+/// violation ([`is_sharing_violation`]); any other error at once. Also used for folders: a
+/// folder whose new files a virus scanner or the search indexer still holds open is refused with
+/// ERROR_ACCESS_DENIED for a moment after they were written.
+pub(crate) fn rename_retrying(
     from: &Path,
     to: &Path,
     attempts: u32,
@@ -212,7 +214,7 @@ fn rename_retrying(
 /// Whether `e` is Windows saying another process has the file open: ERROR_ACCESS_DENIED (5, a
 /// file open without delete sharing), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33).
 /// Never on other systems, where a rename over an open file works.
-fn is_sharing_violation(e: &std::io::Error) -> bool {
+pub(crate) fn is_sharing_violation(e: &std::io::Error) -> bool {
     cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
 }
 
