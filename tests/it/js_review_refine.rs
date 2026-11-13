@@ -23,7 +23,7 @@ const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 const clone = (v) => JSON.parse(JSON.stringify(v));
 // What a save strips (assets/review.js `save`).
 const saved = (labels) => {
-  labels.boxes.forEach((b) => { delete b._checked; delete b._relabelled; delete b._n; });
+  labels.boxes.forEach((b) => { delete b._checked; delete b._relabelled; delete b._adjusting; delete b._n; });
   return R.refineForSave(labels);
 };
 const brief = (c) => (c ? { index: c.l.index, k: c.k, n: c.n } : null);
@@ -136,6 +136,42 @@ console.log(JSON.stringify(req.map((r) => {
     const l = R.liveRefine(labels, r.classes, r.hidden).find((x) => x.kind === 'relabel');
     R.answerRefine(labels, l, true, r.classes, r.hidden);
     return [before, sugs()];
+  }
+  if (r.op === 'adjust') {
+    // A yes to the add, then what the page does while its box is fitted (assets/review.js
+    // `answerRefine`, a move, undo, save, `finishAdjust`).
+    const labels = clone(r.labels);
+    const live = (ls) => R.liveRefine(ls, r.classes, r.hidden);
+    const before = JSON.stringify(labels);   // the undo snapshot of the accept
+    const res = R.answerRefine(labels, live(labels).find((x) => x.kind === 'add'), true, r.classes, r.hidden);
+    const out = { box: res.box, adjusting: R.adjustingBox(labels.boxes), next: brief(R.refineCurrent(live(labels), false, [])) };
+    out.keys = [
+      R.suggestionKey('y', false, out.next ? {} : null, false, true),
+      R.suggestionKey('w', false, out.next ? {} : null, false, true),
+      R.suggestionKey('y', false, out.next ? {} : null, true, true),
+      R.suggestionKey('y', true, null, false, true),
+    ];
+    const accepted = JSON.stringify(labels);   // the snapshot of a move
+    labels.boxes[res.box].bbox = labels.boxes[res.box].bbox.map((v) => v + 3);
+    out.after_move = R.adjustingBox(labels.boxes);
+    out.undo_move = R.adjustingBox(JSON.parse(accepted).boxes);
+    const undone = JSON.parse(before);
+    out.undo_accept = { adjusting: R.adjustingBox(undone.boxes), add_live: live(undone).some((x) => x.kind === 'add') };
+    const body = saved(clone(labels));
+    out.saved_mark = body.boxes.some((b) => '_adjusting' in b);
+    out.saved_bbox = body.boxes[res.box].bbox;
+    const rejected = clone(labels);
+    R.markRejected(rejected.boxes[res.box]);
+    out.rejected = R.adjustingBox(rejected.boxes);
+    R.endAdjust(labels.boxes);
+    out.done = R.adjustingBox(labels.boxes);
+    out.done_key = R.suggestionKey('y', false, {}, false, false);
+    // Any other yes marks nothing to fit.
+    const other = clone(r.labels);
+    const t = live(other).find((x) => x.kind === 'tighten');
+    R.answerRefine(other, t, true, r.classes, r.hidden);
+    out.tighten = R.adjustingBox(other.boxes);
+    return out;
   }
   if (r.op === 'sends') return R.sendsFilter(r.name, r.value, r.auto);
   if (r.op === 'for_save') return R.refineForSave(clone(r.labels));
@@ -312,6 +348,38 @@ fn a_held_y_or_w_answers_once() {
     for (c, g) in cases.iter().zip(&got) {
         assert_eq!(g, c.4, "{c:?}");
     }
+}
+
+/// A yes to an add holds the next suggestion back while the new box is fitted: the box is marked,
+/// `y` is Accept box (`w` nothing, a held `y` nothing, an overlap on screen keeps its `y`), a move
+/// and its undo keep the mark, undoing the accept takes the box and the mark and the add is live
+/// again, the mark never reaches a save (the moved box does), rejecting the box or Accept box ends
+/// it, and the next suggestion is the current one again. Another kind's yes marks nothing.
+#[test]
+fn an_accepted_add_is_fitted_before_the_next_suggestion() {
+    if !have_node() {
+        return;
+    }
+    let got =
+        node(&json!([{"op": "adjust", "labels": frame(), "classes": classes(), "hidden": []}]));
+    let a = &got[0];
+    // Box 3 (the unjudged reject exactly at the add) takes the new box and box 1 goes: box 2.
+    assert_eq!(a["box"], 2);
+    assert_eq!(a["adjusting"], 2);
+    assert_eq!(a["keys"], json!(["done", "none", "held", "overlap"]));
+    assert_eq!((&a["after_move"], &a["undo_move"]), (&json!(2), &json!(2)));
+    assert_eq!(a["undo_accept"], json!({"adjusting": -1, "add_live": true}));
+    assert_eq!(a["saved_mark"], false);
+    assert_eq!(a["saved_bbox"], json!([14, 14, 114, 214]));
+    assert_eq!(a["rejected"], -1);
+    assert_eq!(a["done"], -1);
+    assert_eq!(
+        a["done_key"], "accept",
+        "the next suggestion answers to y again"
+    );
+    // The relabel (strength band 3) is what Accept box brings up.
+    assert_eq!(a["next"], json!({"index": 1, "k": 1, "n": 3}));
+    assert_eq!(a["tighten"], -1);
 }
 
 /// A pair made on this visit by a yes to a dataset check suggestion is treated as one made by

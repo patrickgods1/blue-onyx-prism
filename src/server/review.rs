@@ -290,9 +290,9 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&after=`
-/// (`refine_kind` only with `auto=refine`; [`Filters::from_query`]): the most
-/// uncertain frame matching the filters (after `after`, the frame shown now, when given; past
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&after=`
+/// (`refine_kind` only with `auto=refine`; `balance` = `class,scene,camera` or some of them puts the
+/// least reviewed first; [`Filters::from_query`]): the most uncertain frame matching the filters (after `after`, the frame shown now, when given; past
 /// the last one the first again with `wrapped`), its position, the counts and the cameras and
 /// classes for the filter lists. A big folder answers from [`labels::index`], with
 /// `indexing: {done, total}` while its rows are still coming in; a small one is walked.

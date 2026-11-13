@@ -1011,6 +1011,22 @@ fn prepare_out(dir: &Path, out: &Path, now: std::time::SystemTime) -> Result<Pat
     }
 }
 
+/// How many times publishing an export is tried while Windows refuses it as in use, and how far
+/// apart: thousands of new files are scanned by Defender / indexed for a few seconds after they are
+/// written, and a folder holding one of them open cannot be renamed meanwhile ("Access is denied",
+/// which once failed a dataset check's last fold).
+const PUBLISH_ATTEMPTS: u32 = 40;
+const PUBLISH_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `rename` retried for [`PUBLISH_ATTEMPTS`] x [`PUBLISH_PAUSE`] on a Windows sharing violation.
+/// Windows also answers "Access is denied" when `to` is taken, which no wait cures: then one try.
+fn rename_patiently(from: &Path, to: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(to).is_ok() {
+        return std::fs::rename(from, to);
+    }
+    crate::private_dir::rename_retrying(from, to, PUBLISH_ATTEMPTS, PUBLISH_PAUSE)
+}
+
 /// Files published last from an existing folder ([`Staging::publish`]), `classes.txt` and
 /// `data.yaml` being what makes a folder look like an export.
 const PUBLISHED_LAST: [&str; 3] = ["classes.txt", "data.yaml", "export.json"];
@@ -1086,7 +1102,7 @@ impl Staging {
         };
         names.sort_by_key(rank);
         for name in names {
-            std::fs::rename(self.build.join(&name), self.target.join(&name))?;
+            rename_patiently(&self.build.join(&name), &self.target.join(&name))?;
         }
         Ok(())
     }
@@ -1097,7 +1113,7 @@ impl Staging {
         let moved = if self.inside {
             self.move_up()
         } else {
-            std::fs::rename(&self.build, &self.target)
+            rename_patiently(&self.build, &self.target)
         };
         moved.with_context(|| {
             format!(
@@ -2696,6 +2712,37 @@ mod tests {
         assert!(e.contains(&*target.to_string_lossy()), "{e}");
         assert!(s.build.join("export.json").is_file(), "kept");
         assert!(target.join("x.txt").is_file(), "what was there stays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A scanner holding a new file open (no delete sharing) refuses the folder's rename with
+    /// "Access is denied" for a moment; the publish waits it out instead of failing the job.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_held_open_for_a_moment_is_still_published() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let target = root.join("exports/new");
+        let s = Staging::new(&target).unwrap();
+        write_file(&s.build.join("export.json"), b"{}").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(s.build.join("export.json"))
+            .unwrap();
+        let refused = std::fs::rename(&s.build, &target).unwrap_err();
+        assert!(
+            crate::private_dir::is_sharing_violation(&refused),
+            "{refused:?}"
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(held);
+        });
+        s.publish().unwrap();
+        release.join().unwrap();
+        assert!(target.join("export.json").is_file());
+        assert!(!s.scratch.exists(), "the scratch folder is gone");
         let _ = std::fs::remove_dir_all(&root);
     }
 

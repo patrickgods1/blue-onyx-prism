@@ -680,15 +680,39 @@
 
   // What key `y` or `w` acts on: 'overlap' (`y` while an overlap suggestion is on screen, and `y`
   // with no suggestion at all: the overlap handler says there is none, as it always did), 'accept'
-  // / 'dismiss' (the current dataset check suggestion `refine`, refineCurrent), 'none' (`w` with
-  // nothing to answer: the key does nothing), 'held' (`repeat`: the key's auto-repeat while held
-  // down; nothing is done, as for `n` and `s`: every answer is remembered, so a held key must not
-  // answer one suggestion after another).
-  function suggestionKey(key, overlapShown, refine, repeat) {
+  // / 'dismiss' (the current dataset check suggestion `refine`, refineCurrent), 'done' (`y` while
+  // the box of an accepted add is being adjusted, `adjusting`: adjustingBox; `w` does nothing
+  // then), 'none' (`w` with nothing to answer: the key does nothing), 'held' (`repeat`: the key's
+  // auto-repeat while held down; nothing is done, as for `n` and `s`: every answer is remembered,
+  // so a held key must not answer one suggestion after another, nor accept the adjusted box the
+  // moment it was added).
+  function suggestionKey(key, overlapShown, refine, repeat, adjusting) {
     var route = 'none';
-    if (key === 'y') route = !overlapShown && refine ? 'accept' : 'overlap';
-    else if (key === 'w') route = !overlapShown && refine ? 'dismiss' : 'none';
+    if (key === 'y') route = overlapShown ? 'overlap' : (adjusting ? 'done' : (refine ? 'accept' : 'overlap'));
+    else if (key === 'w') route = !overlapShown && !adjusting && refine ? 'dismiss' : 'none';
     return repeat && route !== 'none' ? 'held' : route;
+  }
+
+  // ---- Adjusting the box of an accepted add (page decision) ----
+  //
+  // A yes to an `add` does not move on at once: answerRefine marks the new box `_adjusting`
+  // (page-only, never saved), the page keeps it selected for the reviewer to move or resize, and
+  // `y` again (Accept box, endAdjust) brings the next suggestion. The flag lives on the box, so
+  // the undo snapshots carry it: undoing past the accept takes the box and the step away and the
+  // suggestion is current again; rejecting the box ends the step too.
+
+  // The box being adjusted on boxes `bs`: the index of a box marked `_adjusting` and not rejected;
+  // -1 for none.
+  function adjustingBox(bs) {
+    for (var i = 0; i < (bs || []).length; i++) {
+      if (bs[i] && bs[i]._adjusting && bs[i].state !== 'rejected') return i;
+    }
+    return -1;
+  }
+
+  // The adjusting is done: the mark off every box (a rejected one's too).
+  function endAdjust(bs) {
+    (bs || []).forEach(function (b) { if (b) delete b._adjusting; });
   }
 
   // Whether a reviewed save records `overlaps_checked` (assets/review.js `save`): stacks or
@@ -800,9 +824,10 @@
 
   // The reviewer's answer to live suggestion `l` on `labels` (the file as the page holds it): yes
   // = acceptRefine, no = dismissRefine. Then the page flags on the box a yes is about, as the
-  // page's own edits set them: `_checked` (looked at on this visit) and, for a relabel,
-  // `_relabelled` (an overlap suggestion that would drop the box ends, as after a relabel by
-  // hand). A no changes no box and sets no flag. {ok, box}: whether anything changed, and the box
+  // page's own edits set them: `_checked` (looked at on this visit), for a relabel `_relabelled`
+  // (an overlap suggestion that would drop the box ends, as after a relabel by hand), and for an
+  // add `_adjusting` (the reviewer fits the new box before the next suggestion: adjustingBox).
+  // A no changes no box and sets no flag. {ok, box}: whether anything changed, and the box
   // to select after (the new box of an add, else the box the suggestion is about; -1 for none).
   function answerRefine(labels, l, yes, classes, hidden) {
     var at = l.target_box == null ? -1 : l.target_box;
@@ -816,6 +841,7 @@
     if (b) {
       b._checked = true;
       if (l.kind === 'relabel') b._relabelled = true;
+      if (l.kind === 'add') b._adjusting = true;
     }
     return { ok: true, box: b ? at : -1 };
   }
@@ -910,6 +936,8 @@
     tightenWord: tightenWord,
     refineFocus: refineFocus,
     answerRefine: answerRefine,
+    adjustingBox: adjustingBox,
+    endAdjust: endAdjust,
     sendsFilter: sendsFilter,
     refineForSave: refineForSave,
     nextPlan: nextPlan,

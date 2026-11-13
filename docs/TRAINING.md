@@ -2117,6 +2117,13 @@ and `dismiss`, compared in `tests/it/js_rules.rs`) and saves the file as usual: 
 the file a save checks (`refine::check`) and keeps; a check that wrote the frame meanwhile makes the save a
 409 like any other write. A big folder answers `auto=refine` from the review index like the other filters.
 
+**Fitting an accepted missing box.** *Accept: add this box* (`y`) adds the box and keeps it selected and in
+view; the next suggestion waits. Drag the box or its handles to fit the object, then *Accept box* (`y` again)
+brings the next suggestion (after the last: *s saves*). Meanwhile `w` does nothing, `z` undoes the moves one by
+one and then the accept itself (the suggestion is back), and rejecting the box ends the step. Only adds work
+this way; a tighter box, a relabel or a kept label moves on at once. The page marks the box `_adjusting`
+(`ReviewRules.adjustingBox` / `endAdjust`, page-only, never saved; `tests/it/js_review_refine.rs`).
+
 **The report** is `<folder under review>/refine/report.json` (written atomically, replaced by each full
 check; a [quick check](#quick-check-with-a-model) writes its own `refine/report-quick.json`, so each mode keeps
 its last report and neither replaces the other; the dataset walkers and retention do not look in

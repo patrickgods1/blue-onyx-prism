@@ -17,7 +17,8 @@
 // `refine_live`; Auto filter "dataset check suggestions", `auto=refine[&refine_kind=]`) come after
 // them, one at a time, strongest first: drawn on the frame (a dashed proposed box, or the box they
 // are about marked and selected), `y` accepts and `w` says no (R.answerRefine), saved with the
-// frame by the ordinary save. A labelers run sorts its new boxes into tiers
+// frame by the ordinary save. An accepted add stays selected for adjusting, and `y` again (Accept
+// box) brings the next suggestion (R.adjustingBox). A labelers run sorts its new boxes into tiers
 // (training/autolabel/triage.rs): dismissed ones (state rejected, reason auto_dismissed or, at a
 // spot the reviewer rejected, spot_dismissed; the Refine tab's size floor rule adds size_floor) are
 // left off the frame and the list until `i` shows
@@ -595,8 +596,15 @@
 
   function liveRefine() { return cur ? R.liveRefine(cur.labels, classes, hiddenClasses) : []; }
 
-  // The current suggestion, worked out again (reads `suggestions`).
-  function currentRefine() { return R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff); }
+  // The box of an accepted add the reviewer is still fitting (R.adjustingBox), -1 for none.
+  function adjusting() { return cur ? R.adjustingBox(boxes()) : -1; }
+
+  // The current suggestion, worked out again (reads `suggestions`): none while an accepted add's
+  // box is being adjusted, so the next one waits for its Accept box.
+  function currentRefine() {
+    if (adjusting() >= 0) return null;
+    return R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff);
+  }
 
   // What the frame shows for the current suggestion (R.refineFocus), null for none.
   function refineShown() { return cur && refineCur ? R.refineFocus(refineCur.l, boxes()) : null; }
@@ -650,13 +658,13 @@
     if (!cur) return R.suggestionKey(key, false, null, repeat);
     dups = dupGroups();
     suggestions = liveSuggestions();
-    return R.suggestionKey(key, suggestions.length > 0, currentRefine(), repeat);
+    return R.suggestionKey(key, suggestions.length > 0, currentRefine(), repeat, adjusting() >= 0);
   }
 
-  // `y` (yes) / `w` (no) on the current suggestion, one undo step (R.answerRefine). Then the next
-  // suggestion comes up, selected and brought into view, whatever the answer (an accepted add
-  // too: its new box is an ordinary box, a click away). After the last, an accepted add leaves
-  // its new box selected, to adjust or relabel; any other answer, the next box to look at.
+  // `y` (yes) / `w` (no) on the current suggestion, one undo step (R.answerRefine). An accepted
+  // add leaves its new box selected and in view to move or resize: the next suggestion waits for
+  // `y` again (Accept box, finishAdjust). Any other answer brings the next suggestion up, selected
+  // and brought into view; after the last, the next box to look at.
   function answerRefine(yes) {
     if (!cur) return;
     dups = dupGroups();
@@ -678,14 +686,62 @@
     dups = dupGroups();
     suggestions = liveSuggestions();
     refineCur = currentRefine();
+    if (adjusting() >= 0) {
+      select(adjusting(), true);
+      say((card ? card.said_yes : 'Added') + ': ' + (noHover.matches
+        ? 'drag it or its handles to fit, then Accept box.'
+        : 'drag it or its handles to fit, then y (Accept box).') + ' z undoes.');
+      return;
+    }
     if (refineCur) focusRefine();
-    else if (yes && l.kind === 'add') select(r.box, true);
     else {
       var next = nextUndecided(-1);
       select(next >= 0 ? next : r.box, true);
     }
     var text = (card ? (yes ? card.said_yes : card.said_no) : 'Answered') + ' (z undoes).';
-    say(text + (refineCur ? ' ' + refineCur.n + ' more suggestion(s) on this frame.' : ' No suggestion left on this frame: s saves.'));
+    say(text + refineLeft());
+  }
+
+  // What the status line adds about the suggestions left on the frame.
+  function refineLeft() {
+    return refineCur ? ' ' + refineCur.n + ' more suggestion(s) on this frame.' : ' No suggestion left on this frame: s saves.';
+  }
+
+  // `y` (Accept box) on an accepted add's box: the adjusting is done (R.endAdjust; no undo step,
+  // the edits were theirs) and the next suggestion comes up, else the box stays selected.
+  function finishAdjust() {
+    if (!cur) return;
+    var at = adjusting();
+    R.endAdjust(boxes());
+    lastNudge = null;
+    dups = dupGroups();
+    suggestions = liveSuggestions();
+    refineCur = currentRefine();
+    if (refineCur) focusRefine();
+    else refresh();
+    say((at >= 0 ? 'Box ' + (at + 1) + ' accepted.' : 'Accepted.') + refineLeft());
+  }
+
+  // The card while an accepted add's box is being adjusted: what to do, and Accept box (`y`),
+  // which brings the next suggestion.
+  function adjustBlock(inBar) {
+    var at = adjusting(), b = boxes()[at];
+    if (!b) return null;
+    var box = el('div', 'rv-q-sug rv-q-refine');
+    box.appendChild(el('div', 'rv-q-sug-head', 'Fit the new ' + b.label + ' box (box ' + (at + 1) + ')'));
+    var rest = R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff);
+    box.appendChild(el('div', 'muted', (noHover.matches ? 'Drag it or its handles to fit the object, then Accept box' : 'Drag it or its handles to fit the object, then Accept box (y)') +
+      (rest ? ': the next suggestion follows (' + rest.n + ' left).' : ': no suggestion left on this frame.') + ' z undoes.'));
+    var row = el('div', 'rv-q-btns');
+    var answers = inBar ? barBtns : row;
+    answers.appendChild(decideButton('Accept box', 'y', 'ok', finishAdjust));
+    if (selected !== at) {
+      var show = decideButton('Show it', null, 'secondary', function () { select(at, true); });
+      show.title = 'Select the new box and bring it into view';
+      row.appendChild(show);
+    }
+    if (row.childNodes.length) box.appendChild(row);
+    return box;
   }
 
   // Later: the next suggestion of this frame, this one stays open (after the last: the first).
@@ -699,6 +755,7 @@
   // The card of the current suggestion: what is suggested, why, the score, its place, the
   // answers (in the bar at the screen's foot while it shows, else here).
   function refineBlock(inBar) {
+    if (adjusting() >= 0) return adjustBlock(inBar);
     if (!refineCur) return null;
     var l = refineCur.l, card = R.refineCard(l, boxes(), noHover.matches);
     if (!card) return null;
@@ -1303,6 +1360,48 @@
   // selected one thicker on a white line, and a veil outside the part the frame shows. Held
   // while a gesture runs: the frame would move under the fingers of a pinch that crossed zoom 1.
   var overviewCache = null;   // {img, src, key, w, h, canvas}: the frame at the overview's size
+
+  // Two columns: the overview lies over the zoomed frame, so it takes the corner that leaves the
+  // selected box, its handles and tag (and a proposed or half-drawn box) in sight
+  // (ReviewTouch.overviewCorner; it stays put while its corner covers none of them). style.css
+  // places it top right until this runs; one column keeps it in the flow.
+  var ovCorner = 'tr';
+  var OV_INSET = 8;   // CSS px from the frame's edges (style.css: 0.5rem)
+  function placeOverview() {
+    var st = overview.style;
+    if (oneColumn.matches || !stage) {
+      if (st.left || st.top) { st.left = ''; st.top = ''; st.right = ''; }
+      return;
+    }
+    var cr = canvas.getBoundingClientRect(), sr = stage.getBoundingClientRect();
+    var or = overview.getBoundingClientRect();
+    if (!cr.width || !cr.height || !or.width) return;
+    // Frame point -> CSS px in the shown frame.
+    var k = view.z * cr.width / canvas.width;
+    function css(bb, side, top) {
+      return [(bb[0] - view.ox) * k - side, (bb[1] - view.oy) * k - top,
+        (bb[2] - view.ox) * k + side, (bb[3] - view.oy) * k + side];
+    }
+    var keep = [], others = [];
+    if (cur && !hideBoxes) {
+      var sb = boxes()[selected];
+      // The handles' hit area (HANDLE_CSS + 2) on every side, and room for a tag above.
+      if (sb && !isOff(sb)) keep.push(css(sb.bbox, HANDLE_CSS + 4, 20));
+      var og = ghostBox();
+      if (og) keep.push(css(og.bbox, HANDLE_CSS + 4, 20));
+      boxes().forEach(function (b, i) { if (i !== selected && isShown(b)) others.push(css(b.bbox, 0, 0)); });
+    }
+    if (gesture && gesture.mode === 'draw' && gesture.moved) keep.push(css(norm(gesture), HANDLE_CSS + 4, 20));
+    ovCorner = window.ReviewTouch.overviewCorner(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET, keep, others);
+    var at = window.ReviewTouch.cornerRect(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET);
+    // Relative to the stage's padding box (it is the overview's containing block).
+    var left = Math.round(cr.left - sr.left - stage.clientLeft + at[0]) + 'px';
+    var top = Math.round(cr.top - sr.top - stage.clientTop + at[1]) + 'px';
+    if (st.left !== left) st.left = left;
+    if (st.top !== top) st.top = top;
+    if (st.right !== 'auto') st.right = 'auto';
+  }
+
   function drawOverview() {
     if (!overview) return;
     // One column: following keeps it shown when a box too big to zoom on comes up (zoom 1): the
@@ -1313,6 +1412,7 @@
     if (overview.hidden === show) overview.hidden = !show;
     if (stage) stage.classList.toggle('rv-ov-on', show);
     if (!show) return;
+    placeOverview();
     var W = canvas.width, H = canvas.height;
     var dpr = window.devicePixelRatio || 1;
     var cssW = overview.getBoundingClientRect().width || overview.clientWidth || 300;
@@ -1724,7 +1824,7 @@
   // A dataset check suggestion on screen takes the bar with its two answers.
   function deciding() {
     if (!oneColumn.matches || !cur) return false;
-    if (refineCur) return true;
+    if (refineCur || adjusting() >= 0) return true;
     if (!boxes()[selected]) return false;
     var p = progress();
     return p.undecided + p.unchecked > 0;
@@ -3196,6 +3296,7 @@
     var per = c.per_class || {};
     var keys = Object.keys(per);
     add('Per class', keys.length ? keys.map(function (k) { return k + ' ' + per[k]; }).join(', ') : 'none yet');
+    if (j.balance) add('Reviewed frames', balanceCounts(j.balance));
     add('Matching', j.position ? (j.position + ' of ' + j.total) : (j.total || 0));
     if (j.unreadable) add('Unreadable', j.unreadable);
     queuePlace = j.position ? (j.position + ' of ' + j.total) : '';
@@ -3206,6 +3307,33 @@
 
   // Phones: one line over the frame; Details opens the counts, the filters and the frame's facts.
   var queuePlace = '', phoneIndexing = '';
+  // The queue's item of the frame it last landed on (GET /v1/review/next), for what only the
+  // queue knows: why `balance=` put it there.
+  var queueItem = null;
+
+  // `balance=`: the reviewed frames the order weighs against, of the dimensions the Order filter
+  // balances (the answer's `balance`).
+  function balanceCounts(b) {
+    var by = (filtersForm.elements.balance && filtersForm.elements.balance.value) || '';
+    var list = function (o) { return Object.keys(o || {}).map(function (k) { return k + ' ' + o[k]; }).join(', ') || 'none'; };
+    var parts = [];
+    if (by.indexOf('class') >= 0) parts.push(list(b.classes) + ', empty ' + (b.empty || 0));
+    if (by.indexOf('scene') >= 0) parts.push(list(b.scenes));
+    if (by.indexOf('camera') >= 0) parts.push(list(b.cameras));
+    return parts.join(' · ');
+  }
+
+  // Why `balance=` put this frame where it is: the reviewed frames of its rarest class, its scene
+  // and its camera (the item's `balance`).
+  function balanceNote(item) {
+    var b = item.balance, parts = [];
+    if (b.class_reviewed != null) {
+      parts.push(b.class != null ? b.class + ' (' + b.class_reviewed + ' reviewed)' : 'no wanted class (' + b.class_reviewed + ' empty frames reviewed)');
+    }
+    if (b.scene_reviewed != null) parts.push(item.scene + ' (' + b.scene_reviewed + ')');
+    if (b.camera_reviewed != null) parts.push('camera ' + item.camera + ' (' + b.camera_reviewed + ')');
+    return parts.length ? 'balancing: ' + parts.join(', ') : '';
+  }
   function setPhoneLine() {
     if (!phoneLine) return;
     var r = (cur && cur.record) || {};
@@ -3285,6 +3413,7 @@
     if (cur.labels && cur.labels.bulk_accepted) parts.push('bulk accepted');
     if (cur.stale_classes) parts.push('reviewed with another class list');
     if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
+    if (queueItem && queueItem.frame === cur.frame && queueItem.balance) parts.push(balanceNote(queueItem));
     m.textContent = parts.filter(Boolean).join(' · ');
     setPhoneLine();
   }
@@ -3513,6 +3642,7 @@
         showNone(true); setMeta(); refresh();
         return;
       }
+      queueItem = j.item;
       return loadFrame(j.item.frame);
     }).catch(function (e) {
       if (run.stale) return;
@@ -3598,6 +3728,7 @@
     body.boxes.forEach(function (b) {
       delete b._checked;
       delete b._relabelled;
+      delete b._adjusting;
       delete b._n;
       if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
         b.state = 'rejected';
@@ -3756,6 +3887,7 @@
     if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
     if (f.auto.value) parts.push(name('auto'));
     if (f.refine_kind && R.sendsFilter('refine_kind', f.refine_kind.value, f.auto.value)) parts.push(name('refine_kind'));
+    if (f.balance && f.balance.value) parts.push(name('balance'));
     summary.textContent = parts.join(', ');
   }
   // The kind of dataset check suggestion: offered with that Auto filter only.
@@ -3767,7 +3899,7 @@
   // Auto filter's choice opens.
   function filtersFromUrl() {
     var q = new URLSearchParams(location.search), f = filtersForm.elements;
-    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source'].forEach(function (k) {
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source', 'balance'].forEach(function (k) {
       var v = q.get(k), e = f[k];
       if (!v || !e) return;
       if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {
@@ -3996,7 +4128,8 @@
     // key ('held') answers nothing more.
     else if (k === 'y' || k === 'w') {
       var route = suggestionRoute(k, ev.repeat);
-      if (route === 'accept' || route === 'dismiss') answerRefine(route === 'accept');
+      if (route === 'done') finishAdjust();
+      else if (route === 'accept' || route === 'dismiss') answerRefine(route === 'accept');
       else if (route === 'overlap') acceptOverlap();
       else if (route === 'none') handled = false;
     }

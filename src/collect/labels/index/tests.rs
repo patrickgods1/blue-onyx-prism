@@ -971,7 +971,34 @@ mod cases {
             refine_kind: Some(refine::Kind::Verify),
             ..all.clone()
         });
+        for by in ["class", "scene", "camera", "class,scene,camera"] {
+            let balance = queue::Balance::parse(by).unwrap();
+            out.push(Filters {
+                balance,
+                ..all.clone()
+            });
+            out.push(Filters {
+                balance,
+                source: QueueSource::Queue,
+                status: StatusFilter::Is(Status::Unreviewed),
+                ..all.clone()
+            });
+        }
+        out.push(Filters {
+            balance: queue::Balance::parse("class,scene").unwrap(),
+            label: ["person".to_string()].into(),
+            auto: Some(AutoFilter::Overlaps),
+            ..all.clone()
+        });
         out
+    }
+
+    /// Every filter's whole order: `all_any` balanced by everything.
+    fn balance_all() -> Filters {
+        Filters {
+            balance: queue::Balance::parse("class,scene,camera").unwrap(),
+            ..all_any()
+        }
     }
 
     const REFINE_KINDS: [refine::Kind; 4] = [
@@ -1378,10 +1405,29 @@ mod cases {
                 ..all_any()
             };
             same_order(&dir, &refine_all, &format!("seed {seed}, built, refine"));
+            same_order(
+                &dir,
+                &balance_all(),
+                &format!("seed {seed}, built, balance"),
+            );
+            let scores: std::collections::BTreeSet<u32> = queue::build(&dir, &balance_all())
+                .items
+                .iter()
+                .filter_map(|i| i.uncertainty.balance.as_ref().map(|b| b.score))
+                .collect();
+            assert!(
+                scores.len() > 2,
+                "seed {seed}: a trivial balance order {scores:?}"
+            );
             assert!(index_of(&dir).is_some());
 
             real_writes(&dir, &mut rng, &mut rels, &a);
             same_answers(&dir, &a, &rels, &format!("seed {seed}, real writes"));
+            same_order(
+                &dir,
+                &balance_all(),
+                &format!("seed {seed}, real writes, balance"),
+            );
             same_order(
                 &dir,
                 &refine_all,

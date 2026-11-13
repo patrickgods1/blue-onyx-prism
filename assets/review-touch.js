@@ -1,6 +1,6 @@
 // Review tab, fingers (/train/review; loaded before review.js): the gesture rules of the frame on
-// a touchscreen, where a box's tag sits in the zoomed view, and which box a tap on the overview
-// means. Pure: no page, no browser API, no state of its own; review.js passes everything in
+// a touchscreen, where a box's tag sits in the zoomed view, which box a tap on the overview
+// means and which corner of the zoomed frame the overview takes. Pure: no page, no browser API, no state of its own; review.js passes everything in
 // and applies the answers. `tests/it/js_review_touch.rs` runs this file in Node.
 //
 // Coordinates are the canvas's buffer pixels (review.js `canvasPoint`: the frame at zoom 1), and a
@@ -79,11 +79,50 @@
     return best;
   }
 
+  // The overview's corner over the zoomed frame (two columns): 'tr', 'tl', 'br' or 'bl'. In CSS
+  // pixels of the frame as shown: `frame` = [w, h], `size` = the overview's [w, h], `inset` its
+  // distance from the frame's edges; `keep` = rects [x0, y0, x1, y1] it must not cover (the
+  // selected box with its handles and tag, a proposed or half-drawn box), `others` = rects it
+  // would rather not cover (the other boxes). It stays at `current` while that covers nothing of
+  // `keep`, so it never moves for nothing; else the corner covering least of `keep`, then least
+  // of `others`, ties in the order tr, tl, br, bl.
+  var CORNERS = ['tr', 'tl', 'br', 'bl'];
+
+  function cornerRect(corner, frame, size, inset) {
+    var x0 = corner.charAt(1) === 'l' ? inset : frame[0] - inset - size[0];
+    var y0 = corner.charAt(0) === 't' ? inset : frame[1] - inset - size[1];
+    return [x0, y0, x0 + size[0], y0 + size[1]];
+  }
+
+  function coveredArea(r, rects) {
+    var a = 0;
+    for (var i = 0; i < rects.length; i++) {
+      var b = rects[i];
+      var w = Math.min(r[2], b[2]) - Math.max(r[0], b[0]), h = Math.min(r[3], b[3]) - Math.max(r[1], b[1]);
+      if (w > 0 && h > 0) a += w * h;
+    }
+    return a;
+  }
+
+  function overviewCorner(current, frame, size, inset, keep, others) {
+    var k = keep || [], o = others || [];
+    if (CORNERS.indexOf(current) >= 0 && coveredArea(cornerRect(current, frame, size, inset), k) === 0) return current;
+    var best = 'tr', bk = Infinity, bo = Infinity;
+    for (var i = 0; i < CORNERS.length; i++) {
+      var r = cornerRect(CORNERS[i], frame, size, inset);
+      var ck = coveredArea(r, k), co = coveredArea(r, o);
+      if (ck < bk || (ck === bk && co < bo)) { best = CORNERS[i]; bk = ck; bo = co; }
+    }
+    return best;
+  }
+
   globalThis.ReviewTouch = {
     pinch: pinch,
     twoTapRect: twoTapRect,
     touchIntent: touchIntent,
     tagTop: tagTop,
-    pickBox: pickBox
+    pickBox: pickBox,
+    overviewCorner: overviewCorner,
+    cornerRect: cornerRect
   };
 }());

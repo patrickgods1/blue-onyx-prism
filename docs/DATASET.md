@@ -634,7 +634,7 @@ training and pending boxes, and proposals may replace rejected boxes no reviewer
 
 `GET /v1/review/next` lists the frames of `review-queue.jsonl`, or with `source=all` also every indexed
 frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` (default
-`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`:
+`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`, and the order `balance` (below):
 
 | `auto=` | Frames |
 |---|---|
@@ -684,6 +684,26 @@ Under `auto=refine` every listed frame has a live suggestion; they come stronges
 strongest one (item field `refine_strength`, `refine::strength`: `add` 4, `relabel` 3, `tighten` 2,
 `verify` 1, times 1000, plus the score in thousandths), then in the order above. `refine_open` is how many of
 the frame's suggestions are live (of `refine_kind` when given).
+
+**Balancing the dataset.** `balance=` takes a comma list of `class`, `scene` and `camera` (page: Filters >
+**Order**, *balance classes, scenes, cameras* or one of them; empty = the usual order, an unknown item = 400).
+It changes the order only, never which frames are listed. Over the frames the counts count (every filter but
+`status` and `auto`), it counts the **reviewed** frames per wanted class (frames with a training box of it,
+aliases mapped through `collect.classes`, unwanted classes left out), per scene and per camera. A frame with no
+wanted training class is an *empty* frame: the empty frames are one more value of the class dimension, so a
+dataset with no reviewed negatives brings empty frames up. Each dimension then gives a frame a need of
+`1000 x (1 - n / most)`, rounded down, where `n` is the reviewed frames of the frame's value and `most` that of
+the most reviewed value (0 when nothing is reviewed yet). A frame's class is its wanted class with the fewest
+reviewed frames, of its boxes that are not rejected (pending ones too), or of the sidecar's predictions without
+a label file; ties go to the first by name. The needs of the chosen dimensions add up (0..=3000) and the frames
+come highest first, right after the `overlaps`, `both` and `refine` orders and before everything above but
+repeat-only frames, which stay last; equal needs keep the usual order. The counts are worked out again on
+every request, so the order follows each save. The item carries `balance: {score, class, class_reviewed,
+scene_reviewed, camera_reviewed}` (each `_reviewed` only for a dimension balanced by; `class` absent with
+`class_reviewed` = an empty frame), and the answer `balance: {classes, empty, scenes, cameras}`, the reviewed
+counts weighed against. The page shows them in the frame's details (*balancing: truck (4 reviewed), ir (12),
+camera gate (30)*) and the counts (*Reviewed frames*). A pending box can be a false detection, so a rare class
+brings up its false detections too; the likely-box order inside a need keeps real ones ahead.
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
 After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the

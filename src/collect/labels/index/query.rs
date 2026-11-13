@@ -8,12 +8,16 @@
 //! The steps of the pass are those of `queue::build`, in its order. Only the found frame and the
 //! ones after it become strings.
 
-use super::super::queue::{AutoFilter, Counts, Filters, Item, QueueSource, SortKey, StatusFilter};
+use super::super::Status;
+use super::super::queue::{
+    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, Filters, Item, QueueSource,
+    SortKey, StatusFilter,
+};
 use super::State;
 use super::answer::{Answer, UPCOMING};
 use super::row::{Name, Names, Row, Shard, auto_bit, stem_of};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 /// A name filter, over ids.
 enum Want {
@@ -54,6 +58,95 @@ struct Compiled {
     auto: Option<AutoFilter>,
     /// By refine summary: the live suggestions of the query's `refine_kind` and their strength.
     refine: Vec<(u32, u32)>,
+    /// With `balance=`: what the rows weigh against ([`Weigh::new`], before anything sorts).
+    weigh: Option<Weigh>,
+}
+
+/// What `balance=` weighs a row by: [`BalanceTally`] of the rows the query counts, and each class
+/// set's, scene's and camera's part of the need, by id. The parts are [`BalanceTally::need`]'s, so
+/// a score is the walk's.
+struct Weigh {
+    by: Balance,
+    tally: BalanceTally,
+    /// By class set id ([`Row::classes`]).
+    class: Vec<ClassNeed>,
+    /// By name id: (need, reviewed frames) as a scene, and as a camera.
+    scene: Vec<(u32, u64)>,
+    camera: Vec<(u32, u64)>,
+}
+
+impl Weigh {
+    fn new(by: Balance, f: &Filters, state: &State, q: &Compiled, names: &Names) -> Self {
+        // Reviewed rows by (training set, scene, camera): a few groups, so few strings.
+        let mut groups: HashMap<(u32, Name, Name), u64> = HashMap::new();
+        for shard in state.shards.values() {
+            for row in &shard.rows {
+                if q.counts(row) && row.part.status == Status::Reviewed {
+                    let key = (row.part.training, row.cand.scene, row.cand.camera);
+                    *groups.entry(key).or_default() += 1;
+                }
+            }
+        }
+        let mut sorted: Vec<_> = groups.into_iter().collect();
+        sorted.sort_unstable();
+        let mut tally = BalanceTally::default();
+        let mut trained: HashMap<u32, BTreeSet<String>> = HashMap::new();
+        for ((training, scene, camera), n) in sorted {
+            let classes = trained.entry(training).or_insert_with(|| {
+                f.wanted_of(names.training(training).iter().map(|(c, _)| names.name(*c)))
+            });
+            tally.add(n, names.name(scene), names.name(camera), classes);
+        }
+        let class = names
+            .class_sets()
+            .map(|set| tally.class_need(&f.wanted_of(set.iter().map(|c| names.name(*c)))))
+            .collect();
+        let ids = 0..u32::try_from(names.name_count()).unwrap_or(u32::MAX);
+        let scene = ids
+            .clone()
+            .map(|id| tally.scene_need(names.name(id)))
+            .collect();
+        let camera = ids.map(|id| tally.camera_need(names.name(id))).collect();
+        Self {
+            by,
+            tally,
+            class,
+            scene,
+            camera,
+        }
+    }
+
+    fn class_of(&self, r: &Row) -> Option<&ClassNeed> {
+        self.class.get(r.classes() as usize)
+    }
+
+    /// [`BalanceNeed::score`] of `r`, without building the rest.
+    fn score(&self, r: &Row) -> u32 {
+        let part = |on: bool, of: &[(u32, u64)], id: Name| {
+            if on {
+                of.get(id as usize).map_or(0, |p| p.0)
+            } else {
+                0
+            }
+        };
+        let class = if self.by.class {
+            self.class_of(r).map_or(0, |c| c.need)
+        } else {
+            0
+        };
+        class
+            + part(self.by.scene, &self.scene, r.cand.scene)
+            + part(self.by.camera, &self.camera, r.cand.camera)
+    }
+
+    fn need(&self, r: &Row, names: &Names) -> BalanceNeed {
+        self.tally.need(
+            self.by,
+            self.class_of(r).cloned(),
+            names.name(r.cand.scene),
+            names.name(r.cand.camera),
+        )
+    }
 }
 
 impl Compiled {
@@ -78,6 +171,7 @@ impl Compiled {
             } else {
                 Vec::new()
             },
+            weigh: None,
         }
     }
 
@@ -130,24 +224,28 @@ impl Compiled {
         }
     }
 
+    /// Whether [`Counts`] counts `r`: every filter but status and auto keeps it.
+    fn counts(&self, r: &Row) -> bool {
+        self.in_source(r) && self.by_line(r) && !r.gone && r.readable() && self.by_class(r)
+    }
+
     /// Whether the queue lists `r`.
     fn lists(&self, r: &Row) -> bool {
-        self.in_source(r)
-            && self.by_line(r)
-            && !r.gone
-            && r.readable()
-            && self.by_class(r)
-            && self.by_state(r)
+        self.counts(r) && self.by_state(r)
     }
 
     /// What sorts `r`. No note text: the sort only asks whether there is one.
     fn key(&self, r: &Row) -> SortKey {
-        r.uncertainty(
+        let mut u = r.uncertainty(
             self.auto,
             self.refine_of(r),
             (r.part.note != 0).then(String::new),
-        )
-        .key()
+        );
+        u.balance = self.weigh.as_ref().map(|w| BalanceNeed {
+            score: w.score(r),
+            ..BalanceNeed::default()
+        });
+        u.key()
     }
 }
 
@@ -307,6 +405,12 @@ fn pivot<'a>(state: &'a State, q: &Compiled, after: Option<&str>) -> Option<Hit<
 
 fn item(hit: &Hit<'_>, q: &Compiled, names: &Names) -> Item {
     let r = hit.row;
+    let mut uncertainty = r.uncertainty(
+        q.auto,
+        q.refine_of(r),
+        hit.shard.note(r).map(str::to_string),
+    );
+    uncertainty.balance = q.weigh.as_ref().map(|w| w.need(r, names));
     Item {
         frame: hit.shard.rel(r),
         timestamp: hit.shard.timestamp(r).to_string(),
@@ -316,11 +420,7 @@ fn item(hit: &Hit<'_>, q: &Compiled, names: &Names) -> Item {
         buckets: names.buckets(r.cand.buckets).to_vec(),
         status: r.part.status,
         queued: r.queued,
-        uncertainty: r.uncertainty(
-            q.auto,
-            q.refine_of(r),
-            hit.shard.note(r).map(str::to_string),
-        ),
+        uncertainty,
     }
 }
 
@@ -332,7 +432,11 @@ pub(super) fn answer(
     f: &Filters,
     after: Option<&str>,
 ) -> (Answer, Vec<String>) {
-    let q = Compiled::new(f, names);
+    let mut q = Compiled::new(f, names);
+    // Before anything sorts: the pivot's place needs the scores too.
+    if let Some(by) = f.balance {
+        q.weigh = Some(Weigh::new(by, f, state, &q, names));
+    }
     let pivot = pivot(state, &q, after);
     let mut tally = Tally::new(names);
     let (mut first, mut next) = (Top(Vec::new()), Top(Vec::new()));
@@ -403,6 +507,7 @@ pub(super) fn answer(
         unreadable,
         upcoming,
         indexing: None,
+        balance: q.weigh.map(|w| w.tally),
     };
     (answer, shown)
 }

@@ -33,7 +33,7 @@ const clone = (v) => JSON.parse(JSON.stringify(v));
 // What a save strips from the file (assets/review.js `save`).
 const saved = (labels) => {
   (labels.overlap_suggestions || []).forEach((s) => { delete s._done; });
-  labels.boxes.forEach((b) => { delete b._checked; delete b._relabelled; delete b._n; });
+  labels.boxes.forEach((b) => { delete b._checked; delete b._relabelled; delete b._adjusting; delete b._n; });
   return labels;
 };
 // `served`: what GET /v1/review/labels says is live (`overlap_live`, `overlap_live_boxes`).

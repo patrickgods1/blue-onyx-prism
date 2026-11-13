@@ -1,6 +1,6 @@
 //! The Review tab's finger rules (`assets/review-touch.js`): pinch zoom and pan, the two-tap box,
-//! what one finger's drag does, where a tag sits in the zoomed view and which box an overview tap
-//! picks. The page applies these answers to its view and boxes
+//! what one finger's drag does, where a tag sits in the zoomed view, which box an overview tap
+//! picks and which corner the overview takes. The page applies these answers to its view and boxes
 //! (`assets/review.js`), so they are checked here on exact numbers, in Node.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
@@ -24,6 +24,7 @@ console.log(JSON.stringify(req.map((r) => {
   if (r.op === 'touchIntent') return T.touchIntent(r.s);
   if (r.op === 'tagTop') return T.tagTop(r.bb, r.top, r.bottom, r.th);
   if (r.op === 'pickBox') return T.pickBox(r.boxes, r.x, r.y, r.pad);
+  if (r.op === 'overviewCorner') return T.overviewCorner(r.current, r.frame, r.size, r.inset, r.keep, r.others);
   throw new Error('unknown op ' + r.op);
 })));
 "#;
@@ -379,6 +380,55 @@ fn an_overview_tap_picks_the_smallest_box_holding_it() {
     assert_eq!(
         got,
         json!([2, 1, 0, -1, 3, -1, 3, 0, -1, 0])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
+fn the_overview_leaves_the_selected_box_in_sight() {
+    if !have_node() {
+        return;
+    }
+    // A 1000 x 600 frame, a 200 x 120 overview 8 px in: top right covers x 792..992, y 8..128.
+    let corner = |current: &str, keep: Value, others: Value| {
+        json!({ "op": "overviewCorner", "current": current, "frame": [1000, 600],
+                "size": [200, 120], "inset": 8, "keep": keep, "others": others })
+    };
+    let got = node(&json!([
+        // Nothing to keep in sight: it stays where it is.
+        corner("tr", json!([]), json!([])),
+        corner("bl", json!([]), json!([[0, 400, 300, 600]])),
+        // The selected box in the top right corner: the next free corner, top left.
+        corner("tr", json!([[850, 20, 950, 100]]), json!([])),
+        // Top left would cover another box: bottom right, which covers nothing.
+        corner(
+            "tr",
+            json!([[850, 20, 950, 100]]),
+            json!([[0, 0, 100, 100]])
+        ),
+        // Where it is covers nothing of the box: it does not move for the other boxes.
+        corner(
+            "tl",
+            json!([[850, 20, 950, 100]]),
+            json!([[0, 0, 100, 100]])
+        ),
+        // Only a handle's margin reaches the corner: still covered, still moves.
+        corner("tr", json!([[600, 120, 795, 300]]), json!([])),
+        // A box over every corner and another over the top ones: the bottom corners cover least,
+        // and of those bottom right comes first.
+        corner(
+            "tr",
+            json!([[0, 0, 1000, 600], [0, 0, 1000, 200]]),
+            json!([])
+        ),
+        // An unknown current corner is never kept.
+        corner("middle", json!([]), json!([])),
+    ]));
+    assert_eq!(
+        got,
+        json!(["tr", "bl", "tl", "br", "tl", "tl", "br", "tr"])
             .as_array()
             .unwrap()
             .clone()
