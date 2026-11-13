@@ -991,6 +991,21 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 /* One column, the frame zoomed: the whole frame over it, a tap selects a box or moves the view
    there (review.js drawOverview); a drag scrolls the page. Its height is right before it is drawn. */
 .review-stage canvas.rv-overview { width: min(100%, calc(28svh * var(--rv-ar, 1.78))); height: auto; aspect-ratio: var(--rv-ar, 1.78); margin: 0 auto 0.3rem; cursor: pointer; touch-action: manipulation; }
+/* Two columns: the overview lies in the frame's top right corner while it is zoomed (review.js
+   drawOverview), out of the flow, so the frame never moves when it comes or goes. `--rv-cw` is the
+   frame's CSS width (the 701px rule below; `--rv-head` is set on the stage), so the overview
+   follows the frame's right edge when the frame is narrower than the column. */
+@media (min-width: 901px) {
+  .review-stage { position: relative; }
+  .review-stage canvas.rv-overview {
+    --rv-cw: min(100%, calc((100svh - 2rem - var(--rv-head, 0px)) * var(--rv-ar, 1.78)));
+    position: absolute; z-index: 5; margin: 0;
+    top: calc(var(--rv-head, 0px) + 0.5rem);
+    right: calc((100% - var(--rv-cw)) / 2 + 0.5rem);
+    width: clamp(120px, calc(var(--rv-cw) * 0.22), 260px);
+    border: 1px solid rgba(255, 255, 255, 0.75); border-radius: 4px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
+  }
+}
 .review-meta-row { display: flex; align-items: flex-start; gap: 0.5rem; }
 .review-meta-row .review-meta { flex: 1 1 auto; min-width: 0; }
 .review-meta-row button.small { margin: 0; flex: none; }
