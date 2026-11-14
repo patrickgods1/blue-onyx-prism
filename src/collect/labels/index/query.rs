@@ -99,7 +99,10 @@ impl Weigh {
         }
         let class = names
             .class_sets()
-            .map(|set| tally.class_need(&f.wanted_of(set.iter().map(|c| names.name(*c)))))
+            .map(|set| {
+                tally
+                    .class_need(&f.wanted_confidence(set.iter().map(|(c, s)| (names.name(*c), *s))))
+            })
             .collect();
         let ids = 0..u32::try_from(names.name_count()).unwrap_or(u32::MAX);
         let scene = ids
@@ -162,7 +165,7 @@ impl Compiled {
                 .collect(),
             class: names
                 .class_sets()
-                .map(|set| f.label.is_empty() || set.iter().any(|c| wanted.contains(c)))
+                .map(|set| f.label.is_empty() || set.iter().any(|(c, _)| wanted.contains(c)))
                 .collect(),
             status: f.status,
             auto: f.auto,
@@ -375,7 +378,7 @@ impl Tally {
         let labels: BTreeSet<&str> = on(&self.class_sets)
             .into_iter()
             .flat_map(|set| names.class_set(set).iter())
-            .map(|c| names.name(*c))
+            .map(|(c, _)| names.name(*c))
             .collect();
         let cameras: BTreeSet<&str> = on(&self.cameras)
             .into_iter()

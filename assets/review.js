@@ -3328,7 +3328,9 @@
   function balanceNote(item) {
     var b = item.balance, parts = [];
     if (b.class_reviewed != null) {
-      parts.push(b.class != null ? b.class + ' (' + b.class_reviewed + ' reviewed)' : 'no wanted class (' + b.class_reviewed + ' empty frames reviewed)');
+      // The class part is weighed by how sure the frame is of the class (`class_score`).
+      var sure = b.class_score != null && b.class_score < 1 ? ', score ' + b.class_score.toFixed(2) : '';
+      parts.push(b.class != null ? b.class + ' (' + b.class_reviewed + ' reviewed' + sure + ')' : 'no wanted class (' + b.class_reviewed + ' empty frames reviewed)');
     }
     if (b.scene_reviewed != null) parts.push(item.scene + ' (' + b.scene_reviewed + ')');
     if (b.camera_reviewed != null) parts.push('camera ' + item.camera + ' (' + b.camera_reviewed + ')');
