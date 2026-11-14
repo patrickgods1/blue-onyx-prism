@@ -150,8 +150,9 @@ pub(super) struct Names {
     names: Table<str>,
     /// Bucket lists as their line holds them: the order is shown, and a bucket can repeat.
     buckets: Table<[Bucket]>,
-    /// Sets of class names ([`queue::frame_labels`]), sorted.
-    classes: Table<[Name]>,
+    /// Sets of class names ([`queue::frame_labels`]), sorted, each with how sure the frame is of
+    /// it in hundredths ([`queue::frame_confidence`]).
+    classes: Table<[(Name, u8)]>,
     /// The training boxes of a frame, per class with their count.
     training: Table<[(Name, u32)]>,
     /// What `auto=refine` reads of a frame: per entry of [`REFINE_KINDS`], its live suggestions and
@@ -180,11 +181,11 @@ impl Names {
         self.buckets.iter()
     }
 
-    pub(super) fn class_sets(&self) -> impl Iterator<Item = &[Name]> {
+    pub(super) fn class_sets(&self) -> impl Iterator<Item = &[(Name, u8)]> {
         self.classes.iter()
     }
 
-    pub(super) fn class_set(&self, id: u32) -> &[Name] {
+    pub(super) fn class_set(&self, id: u32) -> &[(Name, u8)] {
         self.classes.get(id).unwrap_or_default()
     }
 
@@ -598,7 +599,7 @@ impl Derive {
         let verdicts = || l.boxes.iter().filter_map(LabelBox::audit_verdict);
         part.audit_accepted = box_count(verdicts().filter(|v| *v).count());
         part.audit_rejected = box_count(verdicts().filter(|v| !*v).count());
-        let classes = queue::file_labels(l);
+        let classes = queue::file_confidence(l);
         let mut training: BTreeMap<&str, u32> = BTreeMap::new();
         for b in l.training() {
             *training.entry(b.label.as_str()).or_default() += 1;
@@ -609,7 +610,7 @@ impl Derive {
         if refine.first().is_some_and(|(n, _)| *n > 0) {
             part.refine = names.refine.intern(&refine).saturating_add(1);
         }
-        part.classes = names.class_set_of(classes.iter().map(String::as_str));
+        part.classes = names.class_set_of(classes.iter().map(|(c, s)| (c.as_str(), *s)));
         let per_class: Vec<(Name, u32)> = training
             .into_iter()
             .map(|(class, n)| (names.names.intern(class), n))
@@ -620,9 +621,9 @@ impl Derive {
 }
 
 impl Names {
-    /// The id of the class set of `classes`, sorted distinct names.
-    fn class_set_of<'a>(&mut self, classes: impl Iterator<Item = &'a str>) -> u32 {
-        let set: Vec<Name> = classes.map(|c| self.names.intern(c)).collect();
+    /// The id of the class set of `classes`, sorted distinct names with their confidence.
+    fn class_set_of<'a>(&mut self, classes: impl Iterator<Item = (&'a str, u8)>) -> u32 {
+        let set: Vec<(Name, u8)> = classes.map(|(c, s)| (self.names.intern(c), s)).collect();
         self.classes.intern(&set)
     }
 }
@@ -646,13 +647,13 @@ impl Encoder<'_> {
 
     pub(super) fn side(&self, rec: &Record) -> (Side, String) {
         let u = Uncertainty::of(rec);
-        let reply = queue::frame_labels(rec, None);
+        let reply = queue::reply_confidence(rec);
         let mut names = self.names.write_recover();
         let side = Side {
             model: names.names.intern(&rec.model),
             margin: u.margin.unwrap_or(0.0),
             suppressed: u32::try_from(u.suppressed).unwrap_or(u32::MAX),
-            reply: names.class_set_of(reply.iter().map(String::as_str)),
+            reply: names.class_set_of(reply.iter().map(|(c, s)| (c.as_str(), *s))),
             has_margin: u.margin.is_some(),
             disagreement: u.disagreement,
             ok: true,

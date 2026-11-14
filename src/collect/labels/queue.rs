@@ -227,13 +227,17 @@ pub struct BalanceTally {
     pub cameras: BTreeMap<String, u64>,
 }
 
-/// The class part of a frame's [`BalanceNeed`]: its wanted class with the fewest reviewed frames.
+/// The class part of a frame's [`BalanceNeed`]: its wanted class whose need, weighed by how sure
+/// the frame is of it, is the highest.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ClassNeed {
+    /// What the class lacks ([`lack`]) x [`Self::confidence`] / 100, rounded down.
     pub need: u32,
     /// None: no wanted class on the frame, weighed as an empty frame.
     pub class: Option<String>,
     pub reviewed: u64,
+    /// How sure the frame is of [`Self::class`], in hundredths (100 without a class).
+    pub confidence: u8,
 }
 
 impl BalanceTally {
@@ -269,11 +273,13 @@ impl BalanceTally {
         }
     }
 
-    /// The class part for a frame with the wanted classes `classes`: the one with the fewest
-    /// reviewed frames (the first by name on a tie), or the empty frames' count with none. The
-    /// empty frames are a value of the class dimension: a dataset of reviewed cars and no negatives
-    /// needs empty frames.
-    pub(super) fn class_need(&self, classes: &BTreeSet<String>) -> ClassNeed {
+    /// The class part for a frame with the wanted classes `classes` (each with how sure the frame
+    /// is of it, in hundredths): the class whose need ([`lack`]) x confidence is the highest, so
+    /// a likely box of a rare class comes before an unlikely one (a review of a false box adds
+    /// nothing to the class); on a tie the one with fewer reviewed frames, then the first by name.
+    /// With no wanted class, the empty frames' count: the empty frames are a value of the class
+    /// dimension, a dataset of reviewed cars and no negatives needs empty frames.
+    pub(super) fn class_need(&self, classes: &BTreeMap<String, u8>) -> ClassNeed {
         let most = self
             .classes
             .values()
@@ -282,13 +288,18 @@ impl BalanceTally {
             .unwrap_or(0)
             .max(self.empty);
         let mut best: Option<ClassNeed> = None;
-        for c in classes {
+        for (c, &sure) in classes {
+            let sure = sure.min(100);
             let reviewed = self.classes.get(c).copied().unwrap_or(0);
-            if best.as_ref().is_none_or(|b| reviewed < b.reviewed) {
+            let need = lack(reviewed, most) * u32::from(sure) / 100;
+            if best.as_ref().is_none_or(|b| {
+                (need, std::cmp::Reverse(reviewed)) > (b.need, std::cmp::Reverse(b.reviewed))
+            }) {
                 best = Some(ClassNeed {
-                    need: lack(reviewed, most),
+                    need,
                     class: Some(c.clone()),
                     reviewed,
+                    confidence: sure,
                 });
             }
         }
@@ -296,6 +307,7 @@ impl BalanceTally {
             need: lack(self.empty, most),
             class: None,
             reviewed: self.empty,
+            confidence: 100,
         })
     }
 
@@ -331,6 +343,10 @@ impl BalanceTally {
                 + scene.map_or(0, |s| s.0)
                 + camera.map_or(0, |c| c.0),
             class_reviewed: class.as_ref().map(|c| c.reviewed),
+            class_score: class
+                .as_ref()
+                .filter(|c| c.class.is_some())
+                .map(|c| f32::from(c.confidence) / 100.0),
             class: class.and_then(|c| c.class),
             scene_reviewed: scene.map(|s| s.1),
             camera_reviewed: camera.map(|c| c.1),
@@ -342,15 +358,22 @@ impl BalanceTally {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct BalanceNeed {
     /// Higher first: per dimension balanced by, [`BALANCE_NEED_MAX`] x (1 - the frame's value's
-    /// reviewed frames / the most reviewed value's), summed.
+    /// reviewed frames / the most reviewed value's), summed; the class's part also x how sure
+    /// the frame is of the class ([`Self::class_score`]).
     pub score: u32,
-    /// Balancing classes: the frame's wanted class with the fewest reviewed frames; absent with
-    /// `class_reviewed` = the frame has no wanted class and counts as an empty frame.
+    /// Balancing classes: the frame's wanted class with the highest need x confidence
+    /// ([`BalanceTally::class_need`]); absent with `class_reviewed` = the frame has no wanted class
+    /// and counts as an empty frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
     /// Reviewed frames of [`Self::class`] (of empty frames without one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub class_reviewed: Option<u64>,
+    /// How sure the frame is of [`Self::class`], 0..=1 in hundredths: the best score of its
+    /// pending boxes of the class, 1 for a decided box ([`file_confidence`]), the best prediction
+    /// without a label file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_score: Option<f32>,
     /// Reviewed frames of the frame's scene, balancing scenes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene_reviewed: Option<u64>,
@@ -503,6 +526,26 @@ impl Filters {
             .collect()
     }
 
+    /// [`Self::wanted_of`] with how sure the frame is of each wanted class (hundredths): the best
+    /// of the labels that map to it.
+    pub(super) fn wanted_confidence<'a>(
+        &self,
+        labels: impl IntoIterator<Item = (&'a str, u8)>,
+    ) -> BTreeMap<String, u8> {
+        let wanted = self.wanted();
+        let mut of = BTreeMap::new();
+        for (label, sure) in labels {
+            let class = match &wanted {
+                Some(w) => w.class_of(label),
+                None => Some(label),
+            };
+            if let Some(class) = class {
+                keep_best(&mut of, class, sure);
+            }
+        }
+        of
+    }
+
     /// Whether a frame with `labels` passes the auto filter.
     pub(super) fn auto_keeps(&self, labels: Option<&LabelFile>) -> bool {
         match self.auto {
@@ -561,6 +604,56 @@ pub(super) fn file_labels(l: &LabelFile) -> BTreeSet<String> {
         .filter(|b| b.state != super::BoxState::Rejected)
         .map(|b| b.label.clone())
         .collect()
+}
+
+/// A score in 0..=1 as hundredths, 0..=100.
+fn hundredths(score: f32) -> u8 {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped to 0..=1, so 0..=100"
+    )]
+    let h = (score.clamp(0.0, 1.0) * 100.0).round() as u8;
+    h
+}
+
+fn keep_best(of: &mut BTreeMap<String, u8>, label: &str, sure: u8) {
+    let best = of.entry(label.to_string()).or_insert(0);
+    *best = (*best).max(sure);
+}
+
+/// How sure the label file `l` is of each of its classes ([`file_labels`]), in hundredths: the
+/// best of the boxes that are not rejected, a pending box by its score, a decided one (accepted,
+/// added) or a pending one with no score counting 100.
+pub(super) fn file_confidence(l: &LabelFile) -> BTreeMap<String, u8> {
+    let mut of = BTreeMap::new();
+    for b in l.boxes.iter().filter(|b| b.state != BoxState::Rejected) {
+        let sure = match b.state {
+            BoxState::Pending => b.score.map_or(100, hundredths),
+            _ => 100,
+        };
+        keep_best(&mut of, &b.label, sure);
+    }
+    of
+}
+
+/// How sure the reply of `rec` is of each class of its `predictions`, in hundredths (the best
+/// score of each).
+pub(super) fn reply_confidence(rec: &Record) -> BTreeMap<String, u8> {
+    let mut of = BTreeMap::new();
+    for d in &rec.predictions {
+        keep_best(&mut of, &d.label, hundredths(d.score));
+    }
+    of
+}
+
+/// [`frame_labels`] with how sure the frame is of each: [`file_confidence`], else
+/// [`reply_confidence`]. What `balance=` weighs a class's need by.
+pub(super) fn frame_confidence(rec: &Record, labels: Option<&LabelFile>) -> BTreeMap<String, u8> {
+    match labels {
+        Some(l) => file_confidence(l),
+        None => reply_confidence(rec),
+    }
 }
 
 /// The object classes of a frame: with a label file, the labels of its boxes that are not
@@ -963,7 +1056,7 @@ struct DayQueue {
     unreadable: u64,
     /// With [`Filters::balance`]: the reviewed frames counted, and per item its wanted classes.
     balance: BalanceTally,
-    wanted: Vec<BTreeSet<String>>,
+    wanted: Vec<BTreeMap<String, u8>>,
 }
 
 /// The candidates of one day folder, read: the part of [`build`] that touches files.
@@ -979,9 +1072,10 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
         };
         let classes = frame_labels(&rec, labels.as_ref());
         let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
-        let wanted = f
-            .balance
-            .map(|_| f.wanted_of(classes.iter().map(String::as_str)));
+        let wanted = f.balance.map(|_| {
+            let sure = frame_confidence(&rec, labels.as_ref());
+            f.wanted_confidence(sure.iter().map(|(c, s)| (c.as_str(), *s)))
+        });
         q.labels.extend(classes);
         if !keep {
             continue;
@@ -1026,9 +1120,9 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
     q
 }
 
-/// Each item's [`Uncertainty::balance`] against `tally`; `wanted` holds the items' wanted classes,
-/// in their order.
-fn weigh(items: &mut [Item], wanted: &[BTreeSet<String>], tally: &BalanceTally, by: Balance) {
+/// Each item's [`Uncertainty::balance`] against `tally`; `wanted` holds the items' wanted classes
+/// with how sure each frame is of them, in their order.
+fn weigh(items: &mut [Item], wanted: &[BTreeMap<String, u8>], tally: &BalanceTally, by: Balance) {
     for (item, classes) in items.iter_mut().zip(wanted) {
         let class = by.class.then(|| tally.class_need(classes));
         item.uncertainty.balance = Some(tally.need(by, class, &item.scene, &item.camera));
@@ -2441,20 +2535,32 @@ mod tests {
         t.add(2, "ir", "gate", &set(&["car", "truck"]));
         t.add(4, "day", "back", &set(&[]));
         // car 12, truck 2, empty 4; day 14, ir 2; gate 12, back 4.
-        let truck = t.class_need(&set(&["car", "truck"]));
+        let sure = |l: &[(&str, u8)]| {
+            l.iter()
+                .map(|(c, s)| ((*c).to_string(), *s))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let truck = t.class_need(&sure(&[("car", 100), ("truck", 100)]));
         assert_eq!(
             truck.class.as_deref(),
             Some("truck"),
             "the rarest class decides"
         );
         assert_eq!((truck.need, truck.reviewed), (833, 2));
-        let bus = t.class_need(&set(&["bus", "car"]));
+        let bus = t.class_need(&sure(&[("bus", 100), ("car", 100)]));
         assert_eq!(
             (bus.class.as_deref(), bus.need),
             (Some("bus"), BALANCE_NEED_MAX)
         );
-        let empty = t.class_need(&set(&[]));
+        let empty = t.class_need(&sure(&[]));
         assert_eq!((empty.class, empty.need, empty.reviewed), (None, 666, 4));
+        // Weighed by how sure the frame is: a 0.3 truck (833 x 0.3 = 249) loses to a sure bus (1000).
+        let unsure = t.class_need(&sure(&[("bus", 100), ("truck", 30)]));
+        assert_eq!((unsure.class.as_deref(), unsure.need), (Some("bus"), 1000));
+        let weak = t.class_need(&sure(&[("truck", 30)]));
+        assert_eq!((weak.need, weak.confidence), (249, 30));
+        let strong = t.class_need(&sure(&[("truck", 90)]));
+        assert_eq!(strong.need, 749, "the likelier truck needs more");
         assert_eq!(t.scene_need("ir"), (857, 2));
         assert_eq!(t.camera_need("nowhere"), (BALANCE_NEED_MAX, 0));
         let by = Balance {
@@ -2544,8 +2650,8 @@ mod tests {
         );
         assert_eq!(
             frames(&f("class,camera")),
-            [dog.clone(), empty, truck.clone(), carb, car],
-            "truck and the car of camera b tie at 666: the path decides"
+            [dog.clone(), empty, carb, truck.clone(), car],
+            "the car of camera b (666) before the 0.5 truck (666 x 0.5 = 333)"
         );
         let q = build(&dir, &f("class,camera"));
         let tally = q.balance.as_ref().unwrap();
@@ -2570,15 +2676,74 @@ mod tests {
             (Some("truck"), Some(1))
         );
         assert_eq!(
-            (t.camera_reviewed, t.scene_reviewed, t.score),
-            (Some(3), None, 666)
+            (t.camera_reviewed, t.scene_reviewed, t.score, t.class_score),
+            (Some(3), None, 333, Some(0.5))
         );
         let d = need(&dog);
-        assert_eq!((d.class, d.class_reviewed, d.score), (None, Some(0), 1000));
+        assert_eq!(
+            (d.class, d.class_reviewed, d.score, d.class_score),
+            (None, Some(0), 1000, None)
+        );
         // Off: no score on the items, no tally.
         let plain = build(&dir, &f(""));
         assert!(plain.balance.is_none());
         assert!(plain.items.iter().all(|i| i.uncertainty.balance.is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn balance_puts_a_likely_box_of_the_rare_class_before_an_unlikely_one() {
+        use super::super::bulk::test_support::put_frame_at;
+        use super::super::tests_support::auto_box;
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let put = |stem: &str, boxes: &[(&str, f32)]| {
+            let boxes = boxes
+                .iter()
+                .map(|(l, s)| super::super::LabelBox {
+                    score: Some(*s),
+                    ..auto_box(l)
+                })
+                .collect();
+            put_frame_at(&dir, "a", stem, (64, 48), None, boxes)
+        };
+        let rel = put("r1", &[]);
+        let mut car = auto_box("car");
+        car.state = BoxState::Accepted;
+        let l = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![car],
+            ..LabelFile::default()
+        };
+        super::super::write(&Frame::resolve(&dir, &rel).unwrap().labels, &l).unwrap();
+        // Truck has no reviewed frame: 1000 x confidence. A 0.48 truck sits closest to the 0.5
+        // threshold, so the usual order opens on it.
+        let unlikely = put("u1", &[("truck", 0.48)]);
+        let likely = put("u2", &[("truck", 0.95), ("car", 0.9)]);
+        let middling = put("u3", &[("truck", 0.6)]);
+        let f = |by: &str| Filters {
+            balance: Balance::parse(by).unwrap(),
+            wanted: Some((["car", "truck"].map(String::from).to_vec(), Vec::new())),
+            status: StatusFilter::Is(Status::Unreviewed),
+            ..Filters::default()
+        };
+        let q = build(&dir, &f("class"));
+        let order: Vec<_> = q.items.iter().map(|i| i.frame.clone()).collect();
+        assert_eq!(order, [likely.clone(), middling, unlikely.clone()]);
+        let first = q.items[0].uncertainty.balance.clone().unwrap();
+        assert_eq!(
+            (first.class.as_deref(), first.score, first.class_score),
+            (Some("truck"), 950, Some(0.95))
+        );
+        let usual: Vec<_> = build(&dir, &f(""))
+            .items
+            .into_iter()
+            .map(|i| i.frame)
+            .collect();
+        assert_eq!(
+            usual.first(),
+            Some(&unlikely),
+            "the usual order is the uncertain one"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
