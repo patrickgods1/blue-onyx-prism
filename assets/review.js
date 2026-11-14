@@ -4106,6 +4106,14 @@
       ev.preventDefault();
       return;
     }
+    // Keys that decide a box act once per press: most move on to the next undecided box, so a
+    // held one (key repeat) would decide every box of the frame (a held `4` once relabelled a
+    // frame's pots, slippers and gate ornaments as motorcycles and accepted them), and the
+    // toggles would flip back and forth.
+    if (ev.repeat && (/^[0-9]$/.test(k) || /^[acdetru]$/.test(k) || k === 'Delete' || k === 'Backspace')) {
+      ev.preventDefault();
+      return;
+    }
     var handled = true;
     if (k === ' ') {
       spaceDown = true;
@@ -4149,7 +4157,8 @@
       if (ev.shiftKey) rejectRest(); else rejectSelected();
     }
     // Held keys: `n` and `s` once per press (each costs a walk of the folder, and a second `s` is
-    // what passes the save's "are you sure" steps); the arrows above keep repeating.
+    // what passes the save's "are you sure" steps), like the decision keys above; the arrows
+    // keep repeating.
     else if (k === 'n') { if (!ev.repeat) skipToNext(); }
     else if (k === 'e') confirmEmpty(!(cur && cur.labels.empty_confirmed));
     else if (k === 'z') doUndo();
