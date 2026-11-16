@@ -556,6 +556,15 @@ folder; the collector and the Collect tab keep `collect.dir`.
   is there, `[]` too, is the client's list (the page always sends it). A build from before the dataset check ignores the field
   and drops it when it rewrites the file; the list is rebuildable by running the check again (answers are
   lost with it).
+- **`review_pick`** (written only when set): how the Review tab chose the frame the reviewer saved.
+  `"random"` = it was served as a **random pick** (below, *Random picks*): a frame of the fixed pool, served in
+  its slot whatever it shows, so results can be checked on frames nobody chose. The page sends it on every save
+  of such a frame (reviewed or skipped) and sends a loaded value back as it was; a save body without the key
+  keeps the stored value, a key that is there (`null` too) is the client's. The server drops `"random"` from a
+  frame that is not in the pool (`recommend::in_pool`), so a forged or mistaken mark cannot put a chosen frame
+  among the random ones. A value this build does not know loads as `unknown` and is written back as `unknown`;
+  X-AnyLabeling imports and the other edits keep it. A build from before random picks ignores the field and drops
+  it when it rewrites the file.
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
@@ -689,6 +698,33 @@ So diversity leads while the counts are uneven, and uncertainty takes over as th
 (*Most uncertain first*) is the order below; an `auto=` or `balance=` filter keeps its own order whatever `order`
 says; any other `order` is 400. Only this route reads `order`: bulk actions, previews, the auto-label `select`,
 the Coverage card and spots keep the uncertainty order.
+
+**Random picks.** An order that always serves hard and rare frames first would fill the held-out set (drawn from
+reviewed frames) with hard frames, and its scores and thresholds would stop reflecting normal traffic. So in the
+Review tab's default view, one served slot in five (`RANDOM_EVERY`) is a **random pick** (item field
+`random_pick: true`; the page shows a *random pick* chip and saves the frame with `review_pick: "random"`):
+
+- **The pool** is fixed by the frame's path alone: FNV-1a 64 of `bop-random-pick-v1/` (`RANDOM_SALT`) followed
+  by `<scene>/<camera>/<date>/<stem>.jpg` (the item's `frame`), a multiple of 5 = in the pool
+  (`recommend::in_pool`), about one frame in five. Nothing a model or a reviewer does moves a frame in or out. A
+  reopened frame (a re-label disagreement) takes no random slot: it keeps its place first.
+- **The slots** (`recommend::interleave`): slot `i` of the served list (0-based) is random when
+  `(decided + i) % 5 == 4`, with `decided` = the counted frames reviewed or skipped (the answer's
+  `counts.reviewed + counts.skipped`). A random slot takes the pool frame of the lowest hash (then path); every
+  other slot takes the next frame of the Recommended order above, of the frames out of the pool. When one side
+  runs out the other fills its slots; a pool frame is a random pick whichever slot it fills. A save or a skip of
+  the frame shown adds one to `decided` and takes the frame out, so every frame after it keeps its slot and the
+  frames the page loaded ahead stay the ones served.
+- **Only the default view** has them (`recommend::random_slots`): the Recommended order, `status=unreviewed`
+  and no `scene`, `camera`, `label`, `bucket`, `auto` or `balance` filter, each of which would make the picks
+  depend on what the frames show. `source` (`queue` or `all`) is allowed: it is the population the picks are
+  random among. In any other view pool frames sort like the rest and are not marked.
+- They are random among the frames **sent to review** (the review folder's queue, or every indexed frame with
+  `source=all`), not among everything the cameras saw: the collector's buckets, rate limits and dedup chose
+  those first. A skipped pick is just skipped (it leaves the slot pattern as a save does); skipping the hard ones
+  would bias what is left, so review them like any other. *Anything missing?* is always asked on a random pick,
+  whatever the preference, because these frames score models: a missed object there is a false miss. A frame
+  confirmed empty is not asked again (confirming it was that look).
 
 **Most uncertain first** (`order=uncertain`, every `auto=` filter, bulk actions, auto-label runs):
 

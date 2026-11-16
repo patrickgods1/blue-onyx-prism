@@ -553,6 +553,19 @@ pub const MAX_AUTO_RUN_LEN: usize = 200;
 /// Most classes in [`AutoRun::classes`].
 pub const MAX_AUTO_RUN_CLASSES: usize = super::config::MAX_CLASSES;
 
+/// How the Review tab chose the frame a reviewer saved ([`LabelFile::review_pick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPick {
+    /// A random pick ([`recommend::interleave`]): a frame of the fixed pool
+    /// ([`recommend::in_pool`]) served in its slot whatever it shows, so results can be checked on
+    /// frames nobody chose. The save keeps it only on a pool frame.
+    Random,
+    /// A value this build does not know (a newer build's): kept, written back as `unknown`.
+    #[serde(other)]
+    Unknown,
+}
+
 /// `<stem>.labels.json` (see the module doc).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelFile {
@@ -612,6 +625,11 @@ pub struct LabelFile {
     /// ask again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refine: Vec<refine::Suggestion>,
+    /// The Review tab served the frame as a random pick ([`ReviewPick::Random`]) when it was
+    /// saved. Kept by every edit; a save body without the key keeps the stored value, and the
+    /// route drops `random` from a frame out of the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_pick: Option<ReviewPick>,
 }
 
 fn labels_version() -> u32 {
@@ -657,6 +675,7 @@ impl Default for LabelFile {
             checked_before_reopen: false,
             overlap_suggestions: Vec::new(),
             refine: Vec::new(),
+            review_pick: None,
         }
     }
 }
@@ -1753,6 +1772,36 @@ pub(crate) mod tests_support {
 mod tests {
     use super::super::record::{Det, Suppressed, VerifyInfo, empty_record};
     use super::*;
+
+    #[test]
+    fn review_pick_round_trips_and_is_absent_by_default() {
+        let plain = serde_json::to_value(LabelFile::default()).unwrap();
+        assert!(plain.get("review_pick").is_none(), "{plain}");
+        let f: LabelFile = serde_json::from_value(plain).unwrap();
+        assert_eq!(f.review_pick, None);
+        let random = LabelFile {
+            review_pick: Some(ReviewPick::Random),
+            ..LabelFile::default()
+        };
+        let v = serde_json::to_value(&random).unwrap();
+        assert_eq!(v["review_pick"], "random");
+        assert_eq!(serde_json::from_value::<LabelFile>(v).unwrap(), random);
+        // A newer build's value loads, and is written back as `unknown`.
+        let newer: LabelFile =
+            serde_json::from_str(r#"{"version": 1, "review_pick": "stratified"}"#).unwrap();
+        assert_eq!(newer.review_pick, Some(ReviewPick::Unknown));
+        let back = serde_json::to_value(&newer).unwrap();
+        assert_eq!(back["review_pick"], "unknown");
+        assert_eq!(
+            serde_json::from_value::<LabelFile>(back)
+                .unwrap()
+                .review_pick,
+            Some(ReviewPick::Unknown)
+        );
+        // A save keeps it.
+        let saved = normalize(random, &[], 640, 480, "2026-11-16T00:00:00Z").unwrap();
+        assert_eq!(saved.review_pick, Some(ReviewPick::Random));
+    }
 
     fn det(label: &str, score: f32, b: [f32; 4]) -> Det {
         Det {

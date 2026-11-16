@@ -14,11 +14,17 @@
 //! does not split as its frames are reviewed: a frame's event rank is the decided frames of its
 //! event that the queue does not list, plus the listed frames of its event ahead of it.
 //!
-//! Pure: both the walk ([`super::queue::build`]) and the review index call [`Events::add_day`]
-//! and [`arrange`] on what they read, so their orders are one. [`arrange`] returns the order as
-//! indices, for later slots on top of it.
+//! Random picks: one served slot in [`RANDOM_EVERY`] is a frame of a fixed pool chosen by a hash
+//! of its path alone ([`in_pool`]), whatever it shows, so the held-out frames drawn from reviewed
+//! ones include frames nobody chose. Only the Review tab's default view has them
+//! ([`random_slots`]); [`interleave`] places them on top of the order [`arrange`] gives the rest.
+//!
+//! Pure: both the walk ([`super::queue::build`]) and the review index call [`Events::add_day`],
+//! [`arrange`] and [`interleave`] on what they read, so their orders are one. [`arrange`] returns
+//! the order as indices, for the random slots on top of it.
 
-use super::queue::Uncertainty;
+use super::Status;
+use super::queue::{Filters, Order, StatusFilter, Uncertainty};
 use std::cmp::{Ordering, Reverse};
 
 /// Most seconds between two frames of one event.
@@ -251,6 +257,123 @@ pub fn arrange(
             .then_with(|| tie(a, b))
     });
     order.into_iter().map(|i| (i, rank(i))).collect()
+}
+
+/// One served slot in this many is a random pick ([`interleave`]), and one frame in this many is
+/// in the pool ([`in_pool`]).
+pub const RANDOM_EVERY: u64 = 5;
+/// Hashed before a frame's path ([`pool_hash`]): another salt is another pool, so it changes only
+/// for a reviewed reason (the frames already marked would no longer be pool frames).
+pub const RANDOM_SALT: &str = "bop-random-pick-v1/";
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64 of [`RANDOM_SALT`] and then the bytes `rel` of a frame's path
+/// (`<scene>/<camera>/<date>/<stem>.jpg`, forward slashes, as `Item.frame`), for a caller that
+/// builds no string: [`pool_hash`] of the same path.
+pub fn pool_hash_bytes(rel: impl IntoIterator<Item = u8>) -> u64 {
+    RANDOM_SALT.bytes().chain(rel).fold(FNV_OFFSET, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+/// [`pool_hash_bytes`] of the frame path `rel`.
+pub fn pool_hash(rel: &str) -> u64 {
+    pool_hash_bytes(rel.bytes())
+}
+
+/// The frame `rel` is in the random-pick pool: its [`pool_hash`] is a multiple of
+/// [`RANDOM_EVERY`]. Fixed by the path alone, so nothing a model or a reviewer does moves a frame
+/// in or out. A reopened frame of the pool still takes no random slot ([`is_pool_frame`]).
+pub fn in_pool(rel: &str) -> bool {
+    pool_hash(rel).is_multiple_of(RANDOM_EVERY)
+}
+
+/// A listed frame of [`pool_hash`] `hash` takes the random slots: in the pool and not `reopened`
+/// (a re-label disagreement keeps its place first in the order).
+pub fn is_pool_frame(hash: u64, reopened: bool) -> bool {
+    !reopened && hash.is_multiple_of(RANDOM_EVERY)
+}
+
+/// The queue `f` has random slots: the Review tab's default view alone, the Recommended order of
+/// the unreviewed frames with no scene, camera, class, bucket, auto or balance filter. Any of
+/// those would make the picks depend on what the frames show. `source` (the review queue, or
+/// every frame) is allowed: it is the population the picks are random among, not a choice by
+/// content.
+pub fn random_slots(f: &Filters) -> bool {
+    f.order == Order::Recommended
+        && f.status == StatusFilter::Is(Status::Unreviewed)
+        && f.bucket.is_none()
+        && f.scene.is_none()
+        && f.camera.is_none()
+        && f.label.is_empty()
+        && f.auto.is_none()
+        && f.refine_kind.is_none()
+        && f.balance.is_none()
+}
+
+/// The served order of `rest` (the listed frames out of the pool, in [`arrange`]'s order) and
+/// `pool` (the pool frames, by ascending [`pool_hash`], then path) when `decided` frames of the
+/// counted ones are reviewed or skipped: slot `i` (0-based) is a random slot when
+/// `(decided + i) % RANDOM_EVERY == RANDOM_EVERY - 1`. A random slot takes the next pool frame,
+/// any other slot the next of `rest`; when one side runs out, the other fills its slots. Each
+/// index comes with whether it is a pool frame, a random pick whichever slot it fills: its hash
+/// chose it either way.
+///
+/// A save or a skip of the first frame removes it and adds one to `decided`, so every frame after
+/// it keeps its slot: the frames the page loaded ahead stay the ones served.
+pub fn interleave(rest: &[usize], pool: &[usize], decided: u64) -> Vec<(usize, bool)> {
+    let mut out = Vec::with_capacity(rest.len() + pool.len());
+    let (mut rest, mut pool) = (rest.iter().copied(), pool.iter().copied());
+    let mut phase = decided % RANDOM_EVERY;
+    loop {
+        let (from_rest, from_pool) = if phase == RANDOM_EVERY - 1 {
+            (None, pool.next())
+        } else {
+            (rest.next(), None)
+        };
+        let next = from_rest
+            .map(|i| (i, false))
+            .or_else(|| from_pool.map(|i| (i, true)))
+            .or_else(|| rest.next().map(|i| (i, false)))
+            .or_else(|| pool.next().map(|i| (i, true)));
+        let Some(slot) = next else {
+            return out;
+        };
+        out.push(slot);
+        phase = (phase + 1) % RANDOM_EVERY;
+    }
+}
+
+/// [`arrange`]'s `order` with the random slots ([`interleave`]): `pool_hash_of` is the
+/// [`pool_hash`] of a listed frame that takes them ([`is_pool_frame`]), None for any other, and
+/// `path` orders two pool frames of the same hash. Each index with its event rank and whether it
+/// is a random pick.
+pub fn with_random_slots(
+    order: &[(usize, u32)],
+    pool_hash_of: &dyn Fn(usize) -> Option<u64>,
+    path: &dyn Fn(usize, usize) -> Ordering,
+    decided: u64,
+) -> Vec<(usize, u32, bool)> {
+    // `order` holds the indices 0..order.len(), each once.
+    let mut rank = vec![0u32; order.len()];
+    let (mut rest, mut pool) = (Vec::with_capacity(order.len()), Vec::new());
+    for &(i, r) in order {
+        if let Some(at) = rank.get_mut(i) {
+            *at = r;
+        }
+        match pool_hash_of(i) {
+            Some(h) => pool.push((h, i)),
+            None => rest.push(i),
+        }
+    }
+    pool.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| path(a.1, b.1)));
+    let pool: Vec<usize> = pool.into_iter().map(|(_, i)| i).collect();
+    interleave(&rest, &pool, decided)
+        .into_iter()
+        .map(|(i, random)| (i, rank.get(i).copied().unwrap_or(0), random))
+        .collect()
 }
 
 #[cfg(test)]
@@ -489,5 +612,215 @@ mod tests {
         e.add_day(&mut members);
         let keys: Vec<Key> = us.iter().map(|u| key(u, 0)).collect();
         assert_eq!(arrange(&e, &keys, &|a, b| a.cmp(&b)), got);
+    }
+
+    #[test]
+    fn the_pool_hash_is_pinned() {
+        // FNV-1a 64 itself: of nothing, the offset basis; of "a", the published value.
+        let fnv = |bytes: &[u8]| {
+            bytes.iter().fold(FNV_OFFSET, |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(FNV_PRIME)
+            })
+        };
+        assert_eq!(fnv(b""), 14_695_981_039_346_656_037);
+        assert_eq!(fnv(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(RANDOM_SALT, "bop-random-pick-v1/");
+        assert_eq!(RANDOM_EVERY, 5);
+        // A changed salt or hash would move every frame in or out of the pool: the frames already
+        // marked would no longer be pool frames.
+        let a = "day/drive/2026-10-21/20261021T010203004Z_a.jpg";
+        assert_eq!(pool_hash(a), 3_014_258_616_504_270_761);
+        assert_eq!(pool_hash(a), fnv(format!("{RANDOM_SALT}{a}").as_bytes()));
+        assert_eq!(pool_hash_bytes(a.bytes()), pool_hash(a));
+        assert!(!in_pool(a));
+        let b = "day/drive/2026-10-21/20261021T010203004Z_b.jpg";
+        assert_eq!(pool_hash(b), 8_372_720_720_226_647_124);
+        // About one frame in five, by path alone.
+        let n = 10_000;
+        let pooled = (0..n)
+            .filter(|i| in_pool(&format!("day/cam/2026-10-21/f{i}.jpg")))
+            .count();
+        assert!((1_800..=2_200).contains(&pooled), "{pooled}");
+        // A reopened frame takes no random slot.
+        let h = (0..)
+            .map(|i| pool_hash(&format!("day/cam/2026-10-21/f{i}.jpg")))
+            .find(|h| h.is_multiple_of(RANDOM_EVERY))
+            .unwrap();
+        assert!(is_pool_frame(h, false));
+        assert!(!is_pool_frame(h, true));
+        assert!(!is_pool_frame(h + 1, false));
+    }
+
+    /// The served list as text: `r<i>` for rest, `P<i>` for pool.
+    fn served(rest: usize, pool: usize, decided: u64) -> Vec<String> {
+        let r: Vec<usize> = (0..rest).collect();
+        let p: Vec<usize> = (100..100 + pool).collect();
+        interleave(&r, &p, decided)
+            .into_iter()
+            .map(|(i, random)| {
+                assert_eq!(random, i >= 100);
+                if random {
+                    format!("P{}", i - 100)
+                } else {
+                    format!("r{i}")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_fifth_slot_is_random_from_the_decided_count() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            served(8, 3, 0),
+            s(&[
+                "r0", "r1", "r2", "r3", "P0", "r4", "r5", "r6", "r7", "P1", "P2"
+            ])
+        );
+        assert_eq!(served(4, 2, 4), s(&["P0", "r0", "r1", "r2", "r3", "P1"]));
+        assert_eq!(served(4, 2, 2), s(&["r0", "r1", "P0", "r2", "r3", "P1"]));
+        // Only the phase counts: 7 decided is 2 decided.
+        assert_eq!(served(4, 2, 7), served(4, 2, 2));
+        assert_eq!(served(4, 2, u64::MAX), served(4, 2, u64::MAX % 5));
+        for decided in 0..20u64 {
+            let got = served(40, 40, decided);
+            assert_eq!(got.len(), 80);
+            for (i, x) in got.iter().take(45).enumerate() {
+                let random = (decided + i as u64) % RANDOM_EVERY == RANDOM_EVERY - 1;
+                assert_eq!(x.starts_with('P'), random, "{decided}: slot {i} of {got:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn when_one_side_runs_out_the_other_fills() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        // No pool frame left: the random slots take the rest.
+        assert_eq!(served(3, 0, 4), s(&["r0", "r1", "r2"]));
+        assert_eq!(
+            served(7, 1, 0),
+            s(&["r0", "r1", "r2", "r3", "P0", "r4", "r5", "r6"])
+        );
+        // Nothing but pool frames: in hash order, all random picks.
+        assert_eq!(served(0, 3, 0), s(&["P0", "P1", "P2"]));
+        assert_eq!(served(1, 4, 0), s(&["r0", "P0", "P1", "P2", "P3"]));
+        assert!(served(0, 0, 3).is_empty());
+    }
+
+    #[test]
+    fn the_frames_ahead_keep_their_slots_across_a_save_or_a_skip() {
+        // A save or a skip of the frame shown (the first) takes it out and adds one decided
+        // frame: what the page loaded ahead is still what comes, whichever side it was.
+        for decided in 0..10u64 {
+            let rest: Vec<usize> = (0..12).collect();
+            let pool: Vec<usize> = (100..106).collect();
+            let before = interleave(&rest, &pool, decided);
+            let (first, _) = before[0];
+            let rest2: Vec<usize> = rest.iter().copied().filter(|i| *i != first).collect();
+            let pool2: Vec<usize> = pool.iter().copied().filter(|i| *i != first).collect();
+            assert_eq!(
+                interleave(&rest2, &pool2, decided + 1),
+                before[1..],
+                "decided {decided}"
+            );
+        }
+        // Next without a save changes nothing: the same list, one place on.
+        assert_eq!(served(5, 5, 3), served(5, 5, 3));
+    }
+
+    #[test]
+    fn random_slots_hold_pool_frames_and_the_rest_keeps_its_order() {
+        // Six listed frames in arrange's order 5, 3, 1, 0, 2, 4 (ranks = index); 1 and 4 are pool
+        // frames, 4 of the smaller hash.
+        let order: Vec<(usize, u32)> = [5, 3, 1, 0, 2, 4]
+            .iter()
+            .map(|&i| (i, u32::try_from(i).unwrap()))
+            .collect();
+        let hash = |i: usize| match i {
+            1 => Some(10),
+            4 => Some(5),
+            _ => None,
+        };
+        let got = with_random_slots(&order, &hash, &|a, b| a.cmp(&b), 3);
+        assert_eq!(
+            got,
+            [
+                (5, 5, false),
+                (4, 4, true),
+                (3, 3, false),
+                (0, 0, false),
+                (2, 2, false),
+                (1, 1, true),
+            ]
+        );
+        // Pool and rest are disjoint, and every frame comes once.
+        let mut seen: Vec<usize> = got.iter().map(|x| x.0).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, [0, 1, 2, 3, 4, 5]);
+        // A hash tie: the path decides.
+        let tie = |i: usize| (i == 1 || i == 4).then_some(5);
+        let got = with_random_slots(&order, &tie, &|a, b| b.cmp(&a), 0);
+        let pool: Vec<usize> = got.iter().filter(|x| x.2).map(|x| x.0).collect();
+        assert_eq!(pool, [4, 1]);
+    }
+
+    #[test]
+    fn only_the_default_view_has_random_slots() {
+        let default = Filters {
+            order: Order::Recommended,
+            ..Filters::default()
+        };
+        assert!(random_slots(&default));
+        // The source is the population: allowed.
+        assert!(random_slots(&Filters {
+            source: super::super::queue::QueueSource::All,
+            ..default.clone()
+        }));
+        let not = [
+            Filters {
+                order: Order::Uncertain,
+                ..default.clone()
+            },
+            Filters {
+                status: StatusFilter::Any,
+                ..default.clone()
+            },
+            Filters {
+                status: StatusFilter::Is(Status::Skipped),
+                ..default.clone()
+            },
+            Filters {
+                camera: Some("gate".into()),
+                ..default.clone()
+            },
+            Filters {
+                scene: Some("night".into()),
+                ..default.clone()
+            },
+            Filters {
+                label: ["person".to_string()].into(),
+                ..default.clone()
+            },
+            Filters {
+                bucket: Some(crate::collect::Bucket::Positive),
+                ..default.clone()
+            },
+            Filters {
+                auto: Some(super::super::queue::AutoFilter::Review),
+                ..default.clone()
+            },
+            Filters {
+                balance: super::super::queue::Balance::parse("class").unwrap(),
+                ..default.clone()
+            },
+        ];
+        for f in not {
+            assert!(!random_slots(&f), "{f:?}");
+        }
+        // The class list the route adds is no filter.
+        assert!(random_slots(&Filters {
+            wanted: Some((vec!["person".into()], vec![])),
+            ..default
+        }));
     }
 }

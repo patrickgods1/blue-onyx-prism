@@ -1005,6 +1005,11 @@ pub struct Item {
     /// event to review ([`super::recommend`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_rank: Option<u32>,
+    /// A random pick ([`super::recommend::random_slots`]: the Review tab's default view only): a
+    /// frame of the fixed pool, served in its slot whatever it shows. The page saves it with
+    /// `review_pick: random` ([`super::ReviewPick`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub random_pick: bool,
 }
 
 /// Sort most uncertain first ([`Uncertainty::key`]), then newest, then by path.
@@ -1285,6 +1290,7 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
             queued: c.queued,
             uncertainty,
             event_rank: None,
+            random_pick: false,
         });
         q.wanted.extend(wanted);
     }
@@ -1351,7 +1357,12 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
     }
     match f.order {
         Order::Uncertain => sort_items(&mut q.items),
-        Order::Recommended => q.items = recommended(std::mem::take(&mut q.items), &events),
+        Order::Recommended => {
+            // The random slots move by one with each frame decided (reviewed or skipped).
+            let decided = recommend::random_slots(f)
+                .then(|| q.counts.reviewed.saturating_add(q.counts.skipped));
+            q.items = recommended(std::mem::take(&mut q.items), &events, decided);
+        }
     }
     q.cameras = cameras.into_iter().collect();
     q.labels = seen_labels.into_iter().collect();
@@ -1359,8 +1370,10 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
 }
 
 /// `items` (weighed, [`weigh`]) in the Recommended order of `events`, each with its event rank
-/// ([`recommend::arrange`]; ties as [`sort_items`]: newest, then by path).
-fn recommended(items: Vec<Item>, events: &recommend::Events) -> Vec<Item> {
+/// ([`recommend::arrange`]; ties as [`sort_items`]: newest, then by path). With `decided` (the
+/// view has random slots, [`recommend::random_slots`]): the pool frames in their slots, marked
+/// [`Item::random_pick`] ([`recommend::with_random_slots`]).
+fn recommended(items: Vec<Item>, events: &recommend::Events, decided: Option<u64>) -> Vec<Item> {
     let keys: Vec<recommend::Key> = items
         .iter()
         .map(|i| recommend::key(&i.uncertainty, 0))
@@ -1373,12 +1386,28 @@ fn recommended(items: Vec<Item>, events: &recommend::Events) -> Vec<Item> {
         _ => a.cmp(&b),
     };
     let order = recommend::arrange(events, &keys, &tie);
+    let served: Vec<(usize, u32, bool)> = match decided {
+        Some(decided) => {
+            let pool_hash_of = |i: usize| {
+                let item = items.get(i)?;
+                let hash = recommend::pool_hash(&item.frame);
+                recommend::is_pool_frame(hash, item.uncertainty.relabel.is_some()).then_some(hash)
+            };
+            let path = |a: usize, b: usize| match (items.get(a), items.get(b)) {
+                (Some(a), Some(b)) => a.frame.cmp(&b.frame),
+                _ => a.cmp(&b),
+            };
+            recommend::with_random_slots(&order, &pool_hash_of, &path, decided)
+        }
+        None => order.into_iter().map(|(i, r)| (i, r, false)).collect(),
+    };
     let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
-    order
+    served
         .into_iter()
-        .filter_map(|(i, rank)| {
+        .filter_map(|(i, rank, random)| {
             let mut item = slots.get_mut(i)?.take()?;
             item.event_rank = Some(rank);
+            item.random_pick = random;
             Some(item)
         })
         .collect()
@@ -1652,6 +1681,7 @@ mod tests {
             queued: true,
             uncertainty: u,
             event_rank: None,
+            random_pick: false,
         }
     }
 
@@ -3253,6 +3283,7 @@ mod tests {
                 queued: c.queued,
                 uncertainty,
                 event_rank: None,
+                random_pick: false,
             });
         }
         sort_items(&mut q.items);

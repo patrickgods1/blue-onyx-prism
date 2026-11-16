@@ -1401,6 +1401,7 @@ mod cases {
         assert_eq!(first.len(), 10, "{first:?}");
         assert_eq!(first.iter().min(), Some(&3), "{first:?}");
         assert_eq!(rank(&unreviewed.items, &chain[13]), Some(0));
+        covers_random_slots(dir);
         // Ties of the whole key and the time, which only the path breaks.
         let keys: Vec<recommend::Key> = items
             .iter()
@@ -1415,6 +1416,69 @@ mod cases {
         );
     }
 
+    /// The default view has random slots, and the folder gives it some: pool frames alone, never
+    /// a reopened one, each in its slot until a side runs out. Any other view has none.
+    fn covers_random_slots(dir: &Path) {
+        let unreviewed_all = Filters {
+            status: StatusFilter::Is(Status::Unreviewed),
+            ..recommended_all()
+        };
+        for f in [recommended_default(), unreviewed_all] {
+            assert!(recommend::random_slots(&f), "{f:?}");
+            let built = queue::build(dir, &f);
+            let decided = built.counts.reviewed + built.counts.skipped;
+            let pool = built.items.iter().filter(|i| i.random_pick).count();
+            let rest = built.items.len() - pool;
+            assert!(
+                pool >= 3 && rest >= 3 * pool,
+                "{pool} of {}",
+                built.items.len()
+            );
+            let (mut used_pool, mut used_rest) = (0, 0);
+            for (slot, item) in built.items.iter().enumerate() {
+                assert_eq!(
+                    item.random_pick,
+                    recommend::in_pool(&item.frame) && item.uncertainty.relabel.is_none(),
+                    "{}",
+                    item.frame
+                );
+                if used_pool < pool && used_rest < rest {
+                    let random = (decided + slot as u64) % recommend::RANDOM_EVERY
+                        == recommend::RANDOM_EVERY - 1;
+                    assert_eq!(item.random_pick, random, "slot {slot}, {decided} decided");
+                }
+                if item.random_pick {
+                    used_pool += 1;
+                } else {
+                    used_rest += 1;
+                }
+            }
+            // A reopened frame of the pool keeps its place first.
+            assert!(
+                built
+                    .items
+                    .iter()
+                    .any(|i| i.uncertainty.relabel.is_some() && !i.random_pick),
+            );
+        }
+        for f in [
+            recommended_all(),
+            Filters {
+                camera: Some("gate".into()),
+                ..recommended_default()
+            },
+            Filters {
+                order: Order::Uncertain,
+                ..recommended_default()
+            },
+        ] {
+            assert!(!recommend::random_slots(&f), "{f:?}");
+            let built = queue::build(dir, &f);
+            assert!(!built.items.is_empty(), "{f:?}");
+            assert!(built.items.iter().all(|i| !i.random_pick), "{f:?}");
+        }
+    }
+
     /// Next after next through the whole queue: the index's order is the walk's, ties included.
     fn same_order(dir: &Path, f: &Filters, round: &str) {
         let built = queue::build(dir, f);
@@ -1425,6 +1489,7 @@ mod cases {
                 .item
                 .unwrap_or_else(|| panic!("{round}: nothing at {at}"));
             assert_eq!(item.frame, want.frame, "{round}: place {at} of {f:?}");
+            assert_eq!(item.random_pick, want.random_pick, "{round}: place {at}");
             assert_eq!(got.position, Some(at + 1), "{round}");
             after = Some(item.frame);
         }

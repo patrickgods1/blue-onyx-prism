@@ -458,6 +458,7 @@ fn item(shard: &Shard, r: &Row, q: &Compiled, names: &Names) -> Item {
         queued: r.queued,
         uncertainty,
         event_rank: None,
+        random_pick: false,
     }
 }
 
@@ -512,10 +513,14 @@ pub(super) fn answer(
     let mut tally = Tally::new(names);
     let placed = match f.order {
         Order::Uncertain => uncertain(state, &q, &mut tally, pivot.as_ref()),
-        Order::Recommended => recommended(state, &q, names, &mut tally, pivot.as_ref()),
+        Order::Recommended => {
+            let random = recommend::random_slots(f);
+            recommended(state, &q, names, &mut tally, pivot.as_ref(), random)
+        }
     };
-    let found = placed.found.map(|(shard, row, rank)| Item {
+    let found = placed.found.map(|(shard, row, rank, random_pick)| Item {
         event_rank: rank,
+        random_pick,
         ..item(shard, row, &q, names)
     });
     let upcoming: Vec<String> = placed
@@ -543,10 +548,11 @@ pub(super) fn answer(
     (answer, shown)
 }
 
-/// Where `next_after` lands: the frame (with its event rank under the Recommended order), its
-/// 1-based position, whether it wrapped, the frames after it and how many are listed.
+/// Where `next_after` lands: the frame (with its event rank under the Recommended order, and
+/// whether it is a random pick), its 1-based position, whether it wrapped, the frames after it
+/// and how many are listed.
 struct Placed<'a> {
-    found: Option<(&'a Shard, &'a Row, Option<u32>)>,
+    found: Option<(&'a Shard, &'a Row, Option<u32>, bool)>,
     position: usize,
     wrapped: bool,
     upcoming: Vec<(&'a Shard, &'a Row)>,
@@ -590,7 +596,7 @@ fn uncertain<'a>(
         (first.0, 1, pivot.is_some())
     };
     Placed {
-        found: hits.first().map(|h| (h.shard, h.row, None)),
+        found: hits.first().map(|h| (h.shard, h.row, None, false)),
         position,
         wrapped,
         upcoming: hits
@@ -605,13 +611,16 @@ fn uncertain<'a>(
 
 /// The Recommended order: events need every counted row of a day folder and ranks need their
 /// event's other listed rows, so this sorts what it lists ([`recommend::arrange`], as the walk
-/// does) and finds the pivot in it.
+/// does) and finds the pivot in it. With `random` (the view has random slots,
+/// [`recommend::random_slots`]), the pool frames in their slots as the walk places them
+/// ([`recommend::with_random_slots`], the hash over [`Shard::rel_bytes`]).
 fn recommended<'a>(
     state: &'a State,
     q: &Compiled,
     names: &Names,
     tally: &mut Tally,
     pivot: Option<&Hit<'a>>,
+    random: bool,
 ) -> Placed<'a> {
     let import = names.find_name(recommend::IMPORT_MODEL);
     let mut members: Vec<recommend::Member> = Vec::new();
@@ -644,12 +653,28 @@ fn recommended<'a>(
         _ => a.cmp(&b),
     };
     let order = recommend::arrange(&events, &keys, &tie);
+    let order: Vec<(usize, u32, bool)> = if random {
+        // As the walk: one more with each frame reviewed or skipped of those counted.
+        let decided = tally.counts.reviewed.saturating_add(tally.counts.skipped);
+        let pool_hash_of = |i: usize| {
+            let (shard, row) = listed.get(i)?;
+            let hash = recommend::pool_hash_bytes(shard.rel_bytes(row));
+            recommend::is_pool_frame(hash, row.part.note != 0).then_some(hash)
+        };
+        let path = |a: usize, b: usize| match (listed.get(a), listed.get(b)) {
+            (Some((sa, ra)), Some((sb, rb))) => sa.rel_bytes(ra).cmp(sb.rel_bytes(rb)),
+            _ => a.cmp(&b),
+        };
+        recommend::with_random_slots(&order, &pool_hash_of, &path, decided)
+    } else {
+        order.into_iter().map(|(i, r)| (i, r, false)).collect()
+    };
     let at = |i: usize| listed.get(i).copied();
     // As `next_after`: past `after`, past the last back to the first, no `after` from the first.
     let pos = pivot.and_then(|p| {
         order
             .iter()
-            .position(|(i, _)| at(*i).is_some_and(|(_, r)| std::ptr::eq(r, p.row)))
+            .position(|(i, _, _)| at(*i).is_some_and(|(_, r)| std::ptr::eq(r, p.row)))
     });
     let (from, wrapped) = match pos {
         Some(p) if p + 1 < order.len() => (p + 1, false),
@@ -659,14 +684,14 @@ fn recommended<'a>(
     Placed {
         found: order
             .get(from)
-            .and_then(|(i, rank)| at(*i).map(|(s, r)| (s, r, Some(*rank)))),
+            .and_then(|(i, rank, random)| at(*i).map(|(s, r)| (s, r, Some(*rank), *random))),
         position: from + 1,
         wrapped,
         upcoming: order
             .iter()
             .skip(from + 1)
             .take(UPCOMING)
-            .filter_map(|(i, _)| at(*i))
+            .filter_map(|(i, _, _)| at(*i))
             .collect(),
         total: order.len(),
     }

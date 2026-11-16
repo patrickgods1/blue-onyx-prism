@@ -459,15 +459,33 @@ pub(super) const CONFLICT_MESSAGE: &str = "This frame changed since you opened i
      run or another tab saved it). Reload it to see the new boxes; your changes to it were not \
      saved.";
 
-/// Which of the lists the jobs write a save's body named at all. A key left out (a script or
-/// another client that rebuilds the file from the boxes) keeps the stored list; a key present,
-/// even `[]`, is the client's list (the page always sends both).
+/// Which of the lists the jobs write, and whether `review_pick`, a save's body named at all. A
+/// key left out (a script or another client that rebuilds the file from the boxes) keeps the
+/// stored value; a key present, even `[]`, is the client's list (the page always sends both), and
+/// a `review_pick` present, even `null`, is the client's (the page sends the frame's own).
 #[derive(Debug, Default, Deserialize)]
 struct SentLists {
     #[serde(default)]
     refine: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     overlap_suggestions: Option<serde::de::IgnoredAny>,
+    #[serde(default, deserialize_with = "key_present")]
+    review_pick: bool,
+}
+
+/// True for a key that is there, whatever its value (`null` too).
+fn key_present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| true)
+}
+
+/// `file` without a `review_pick: random` the frame `rel` cannot have: only a pool frame
+/// ([`labels::recommend::in_pool`]) is ever served as a random pick, so a forged or mistaken mark
+/// on another frame would put a chosen frame among the random ones. Any other value stays.
+fn drop_foreign_pick(file: &mut LabelFile, rel: &str) {
+    if file.review_pick == Some(labels::ReviewPick::Random) && !labels::recommend::in_pool(rel) {
+        tracing::debug!(frame = %rel, "review save: review_pick random dropped, the frame is not in the random-pick pool");
+        file.review_pick = None;
+    }
 }
 
 impl SentLists {
@@ -476,9 +494,9 @@ impl SentLists {
         serde_json::from_slice(body).unwrap_or_default()
     }
 
-    /// `file` with the stored file's lists in place of those the body left out.
+    /// `file` with the stored file's lists and `review_pick` in place of those the body left out.
     fn keep_stored(&self, file: &mut LabelFile, path: &std::path::Path) {
-        if self.refine.is_some() && self.overlap_suggestions.is_some() {
+        if self.refine.is_some() && self.overlap_suggestions.is_some() && self.review_pick {
             return;
         }
         let stored = match labels::read(path) {
@@ -497,6 +515,9 @@ impl SentLists {
         if self.overlap_suggestions.is_none() {
             file.overlap_suggestions = stored.overlap_suggestions;
         }
+        if !self.review_pick {
+            file.review_pick = stored.review_pick;
+        }
     }
 }
 
@@ -506,7 +527,8 @@ impl SentLists {
 /// when the file changed meanwhile; without it, it always overwrites (X-AnyLabeling and other
 /// clients). A body without a `refine` or `overlap_suggestions` key keeps the stored file's list
 /// ([`SentLists`]): the suggestions and their answers are the jobs' and the reviewer's, not the
-/// client's to drop by leaving them out.
+/// client's to drop by leaving them out. So does one without `review_pick`; `random` on a frame
+/// out of the random-pick pool is dropped ([`drop_foreign_pick`]).
 pub(super) async fn labels_post(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -534,6 +556,7 @@ pub(super) async fn labels_post(
         // Read before the write, outside its lock: with a revision the write is refused when the
         // file changed since; without one the save overwrites whatever came between, as always.
         sent.keep_stored(&mut file, &frame.labels);
+        drop_foreign_pick(&mut file, &frame.rel.jpg());
         let f = match labels::normalize(file, &classes, rec.width, rec.height, &now()) {
             Ok(f) => f,
             Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}")),
@@ -3661,6 +3684,181 @@ mod tests {
         assert_eq!(reviewed, [settled(0), settled(6)]);
         // The default Next of the indexed folder answers from the index.
         next_of(&d, &[]).await;
+    }
+
+    /// Frames of one camera, each on its own day (an event of its own, all equally uncertain):
+    /// `rest` out of the random-pick pool and `pool` in it, by the path's hash alone.
+    fn put_pool_frames(d: &Ds, rest: usize, pool: usize) -> (Vec<String>, Vec<String>) {
+        let (mut out, mut inside) = (Vec::new(), Vec::new());
+        for k in 0..336 {
+            if out.len() == rest && inside.len() == pool {
+                break;
+            }
+            let date = format!("2026-{:02}-{:02}", 1 + k / 28, 1 + k % 28);
+            let stem = format!("{}T010203004Z_p{k}", date.replace('-', ""));
+            let rel = format!("ir/yard/{date}/{stem}.jpg");
+            let (side, want) = if labels::recommend::in_pool(&rel) {
+                (&mut inside, pool)
+            } else {
+                (&mut out, rest)
+            };
+            if side.len() < want {
+                assert_eq!(put_frame(&d.dir, "yard", &date, &stem, 0.6), rel);
+                side.push(rel);
+            }
+        }
+        assert_eq!((out.len(), inside.len()), (rest, pool));
+        (out, inside)
+    }
+
+    /// The default Next, Next after Next until it wraps: each frame with its `random_pick`.
+    async fn served_picks(d: &Ds) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut p: Vec<(&str, &str)> = Vec::new();
+            if let Some(a) = &after {
+                p.push(("after", a));
+            }
+            let v = next_of(d, &p).await;
+            if v["wrapped"] == true || v["item"].is_null() {
+                return out;
+            }
+            let frame = v["item"]["frame"].as_str().unwrap().to_string();
+            out.push((frame.clone(), v["item"]["random_pick"] == true));
+            assert!(out.len() < 50, "never wraps");
+            after = Some(frame);
+        }
+    }
+
+    /// Save `rel` as `status` from its served labels, `edit`ed.
+    async fn save_frame(
+        d: &Ds,
+        rel: &str,
+        status: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) {
+        let q = encode_uri_component(rel);
+        let (_, v) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        let mut body = v["labels"].clone();
+        let o = body.as_object_mut().unwrap();
+        o.insert("status".into(), status.into());
+        edit(o);
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            v["revision"].as_str().unwrap_or("")
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &body.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    both_ways!(
+        the_default_next_serves_one_random_pick_in_five,
+        the_default_next_serves_one_random_pick_in_five_indexed,
+        the_default_next_serves_one_random_pick_in_five_in
+    );
+
+    /// Every fifth slot of the default view is a pool frame, marked `random_pick`; the frames
+    /// ahead keep their slots across a save and a skip; a filtered view has none.
+    async fn the_default_next_serves_one_random_pick_in_five_in(way: Way) {
+        let d = way.ds();
+        let (rest, pool) = put_pool_frames(&d, 9, 3);
+        let before = served_picks(&d).await;
+        assert_eq!(before.len(), 12);
+        let flags: Vec<bool> = before.iter().map(|x| x.1).collect();
+        // Nothing decided: slots 4 and 9 (0-based), then the last pool frame fills slot 11.
+        let mut want = vec![false; 12];
+        for i in [4, 9, 11] {
+            want[i] = true;
+        }
+        assert_eq!(flags, want, "{before:?}");
+        for (frame, random) in &before {
+            assert_eq!(*random, pool.contains(frame), "{frame}");
+            assert_eq!(!*random, rest.contains(frame), "{frame}");
+        }
+        // Slot 0 is no pick: the key is left out.
+        let v = next_of(&d, &[]).await;
+        assert!(v["item"].get("random_pick").is_none(), "{v}");
+        assert_eq!(v["upcoming"].as_array().unwrap().len(), 5);
+
+        // A save of the first frame: what follows is unchanged, flags included.
+        save_frame(&d, &before[0].0, "reviewed", |_| {}).await;
+        let after_save = served_picks(&d).await;
+        assert_eq!(after_save, before[1..], "after a save");
+        let v = next_of(&d, &[("after", &before[0].0)]).await;
+        assert_eq!(v["item"]["frame"], before[1].0.as_str(), "{v}");
+        assert_eq!(v["position"], 1);
+        // A skip too.
+        save_frame(&d, &before[1].0, "skipped", |_| {}).await;
+        assert_eq!(served_picks(&d).await, before[2..], "after a skip");
+
+        // A filtered view, or another status, has no random slot.
+        for params in [
+            &[("camera", "yard")][..],
+            &[("status", "any")],
+            &[("order", "uncertain")],
+        ] {
+            let v = next_of(&d, params).await;
+            assert!(v["item"].is_object(), "{params:?}: {v}");
+            let mut after = String::new();
+            for _ in 0..12 {
+                let mut p = params.to_vec();
+                p.push(("after", &after));
+                let v = next_of(&d, &p).await;
+                assert!(v["item"].get("random_pick").is_none(), "{params:?}: {v}");
+                after = v["item"]["frame"].as_str().unwrap().to_string();
+            }
+        }
+    }
+
+    both_ways!(
+        a_save_keeps_a_random_pick_only_on_a_pool_frame,
+        a_save_keeps_a_random_pick_only_on_a_pool_frame_indexed,
+        a_save_keeps_a_random_pick_only_on_a_pool_frame_in
+    );
+
+    /// `review_pick: random` is kept on a pool frame and dropped on any other (a forged or
+    /// mistaken mark); a body without the key keeps the stored value, `null` clears it, and a
+    /// newer build's value is kept as `unknown`.
+    async fn a_save_keeps_a_random_pick_only_on_a_pool_frame_in(way: Way) {
+        let d = way.ds();
+        let (rest, pool) = put_pool_frames(&d, 1, 1);
+        let stored = |rel: &str| {
+            Frame::resolve(&d.dir, rel)
+                .unwrap()
+                .labels()
+                .unwrap()
+                .unwrap()
+                .review_pick
+        };
+        let random = |o: &mut serde_json::Map<String, serde_json::Value>| {
+            o.insert("review_pick".into(), "random".into());
+        };
+        save_frame(&d, &rest[0], "reviewed", random).await;
+        assert_eq!(stored(&rest[0]), None, "forged");
+        save_frame(&d, &pool[0], "reviewed", random).await;
+        assert_eq!(stored(&pool[0]), Some(labels::ReviewPick::Random));
+        // The served labels carry it, so the page's next save sends it back.
+        let q = encode_uri_component(&pool[0]);
+        let (_, v) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(v["labels"]["review_pick"], "random", "{v}");
+        // A client that leaves the key out keeps it.
+        save_frame(&d, &pool[0], "reviewed", |o| {
+            o.remove("review_pick");
+        })
+        .await;
+        assert_eq!(stored(&pool[0]), Some(labels::ReviewPick::Random));
+        // A key present is the client's: null clears it.
+        save_frame(&d, &pool[0], "reviewed", |o| {
+            o.insert("review_pick".into(), serde_json::Value::Null);
+        })
+        .await;
+        assert_eq!(stored(&pool[0]), None);
+        save_frame(&d, &rest[0], "reviewed", |o| {
+            o.insert("review_pick".into(), "stratified".into());
+        })
+        .await;
+        assert_eq!(stored(&rest[0]), Some(labels::ReviewPick::Unknown));
     }
 
     // ---- the review index behind `GET /v1/review/next` ----------------------------------------

@@ -1011,6 +1011,7 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .review-meta-row { display: flex; align-items: flex-start; gap: 0.5rem; }
 .review-meta-row .review-meta { flex: 1 1 auto; min-width: 0; }
 .review-meta-row button.small { margin: 0; flex: none; }
+.review-meta-row .rv-pick { flex: none; white-space: nowrap; font-size: 0.75rem; padding: 0 0.4rem; border: 1px solid var(--border); border-radius: 4px; } /* a term (tap for the tip) drawn as a chip */
 .review-zoom { font-size: 0.85rem; flex: none; }
 /* Touch UI (review.js shows them under max-width: 900px or a coarse pointer): Draw, Redraw, View. */
 .review-meta-row button[aria-pressed=true] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }

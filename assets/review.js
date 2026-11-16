@@ -1810,11 +1810,12 @@
   // The "Anything missing?" question, with the frame's dismissed boxes when they are off.
   function missingText() {
     var n = dismissedOn ? 0 : dismissedCount();
+    var pick = isRandomPick() ? 'A random pick scores models, so it must be complete. ' : '';
     if (noHover.matches) {
-      return 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
+      return pick + 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
         (n ? ' (' + n + ' hidden: Show them under the question)' : '') + '; Save & next saves.';
     }
-    return 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
+    return pick + 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
       (n ? n + ' hidden: i shows them; ' : '') + 's saves.';
   }
 
@@ -3355,8 +3356,16 @@
   // Phones: one line over the frame; Details opens the counts, the filters and the frame's facts.
   var queuePlace = '', phoneIndexing = '';
   // The queue's item of the frame it last landed on (GET /v1/review/next), for what only the
-  // queue knows: why `balance=` put it there.
+  // queue knows: why `balance=` put it there, and whether it is a random pick.
   var queueItem = null;
+
+  // A random pick (the item's `random_pick`: 1 frame in 5 of the default view, a fixed pool by
+  // the path's hash): saved with `review_pick: 'random'` (the server keeps it on pool frames
+  // alone), so held-out scores can be read on frames nobody chose. On the labels, so a draft
+  // carries it and a saved pick shows again; a label file's own value goes back as loaded.
+  function isRandomPick() {
+    return !!(cur && cur.labels && cur.labels.review_pick === 'random');
+  }
 
   // `balance=` and Recommended: the reviewed frames the order weighs against, of the dimensions
   // the Order filter balances (the answer's `balance`).
@@ -3390,7 +3399,7 @@
   function setPhoneLine() {
     if (!phoneLine) return;
     var r = (cur && cur.record) || {};
-    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', phoneIndexing, r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
+    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', phoneIndexing, isRandomPick() ? 'random pick' : '', r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
     phoneLine.title = $('rv-meta').textContent;
   }
 
@@ -3449,6 +3458,7 @@
 
   function setMeta() {
     var m = $('rv-meta');
+    $('rv-pick').hidden = !isRandomPick();
     if (!cur) { m.textContent = ''; return; }
     var r = cur.record || {};
     var p = r.provenance;
@@ -3561,6 +3571,7 @@
         if (backStack.length > 200) backStack.shift();
       }
       cur = j;
+      if (queueItem && queueItem.frame === j.frame && queueItem.random_pick && j.labels) j.labels.review_pick = 'random';
       // Suggestions keep to the boxes the server named (`overlap_live_boxes`).
       R.markServed(j.labels);
       loadHistory(camOf(j.frame));
@@ -3762,7 +3773,9 @@
       }
       // Then once per frame: missed objects are the commonest label error. The whole frame,
       // every box at full strength (no selection, no zoom; `x` keeps following on the next).
-      if (askMissing && missingAsked !== cur.frame && !cur.labels.empty_confirmed) {
+      // Always on a random pick, whatever the preference: those frames score models, so a
+      // missed object there is a false miss. A frame confirmed empty was looked over already.
+      if ((askMissing || isRandomPick()) && missingAsked !== cur.frame && !cur.labels.empty_confirmed) {
         missingAsked = cur.frame;
         selected = -1;
         view.z = 1; view.ox = 0; view.oy = 0;
