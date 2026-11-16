@@ -823,18 +823,90 @@ fn the_heldout_set_is_the_same_for_every_scene_filter() {
 #[test]
 fn heldout_tags_name_the_scene_and_the_scope() {
     assert_eq!(
-        heldout_tags(Some("ir"), SceneFilter::NIGHT_IR),
+        heldout_tags(Some("ir"), SceneFilter::NIGHT_IR, false),
         ["ir", "heldout:ir", "heldout:all", "heldout:in-scope"]
     );
     assert_eq!(
-        heldout_tags(Some("day"), SceneFilter::NIGHT_IR),
+        heldout_tags(Some("day"), SceneFilter::NIGHT_IR, false),
         ["day", "heldout:day", "heldout:all"]
     );
     assert_eq!(
-        heldout_tags(None, SceneFilter::ALL_SCENES),
+        heldout_tags(None, SceneFilter::ALL_SCENES, false),
         ["heldout:all", "heldout:in-scope"]
     );
-    assert_eq!(heldout_tags(None, SceneFilter::DAY), ["heldout:all"]);
+    assert_eq!(heldout_tags(None, SceneFilter::DAY, false), ["heldout:all"]);
+    // A random pick of the Review queue: one more tag, last.
+    assert_eq!(
+        heldout_tags(Some("day"), SceneFilter::DAY, true),
+        [
+            "day",
+            "heldout:day",
+            "heldout:all",
+            "heldout:in-scope",
+            "heldout:random"
+        ]
+    );
+    assert_eq!(
+        heldout_tags(None, SceneFilter::DAY, true),
+        ["heldout:all", HELDOUT_RANDOM]
+    );
+}
+
+#[test]
+fn held_out_random_picks_are_tagged_and_leave_the_fingerprint_alone() {
+    let (t, out) = (tmp("random-picks"), tmp("random-picks-out"));
+    let train: Vec<String> = (0..6)
+        .map(|i| format!("day.yard.2026-10-01.p{i}"))
+        .collect();
+    let held: Vec<String> = (0..3)
+        .map(|i| format!("day.gate.2026-10-02.h{i}"))
+        .collect();
+    let tr: Vec<&str> = train.iter().map(String::as_str).collect();
+    let he: Vec<&str> = held.iter().map(String::as_str).collect();
+    split_export(&t.0, &tr, &he);
+    let jpg_of = |s: &str| format!("{s}.jpg");
+    let notes = |random: Vec<String>| {
+        std::fs::write(
+            t.0.join(FRAMES_FILE),
+            serde_json::to_vec(&FrameNotes {
+                version: FRAMES_VERSION,
+                empty_confirmed: Vec::new(),
+                bulk_accepted: Vec::new(),
+                random_pick: random,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    let o = Options::default();
+    notes(Vec::new());
+    let s_plain = [read_export(&t.0).unwrap()];
+    assert!(s_plain[0].frames.iter().all(|f| !f.random_pick));
+    let plain = plan(&s_plain, &o).unwrap();
+    // One held-out and one training frame picked at random.
+    notes(vec![jpg_of(&held[1]), jpg_of(&train[0])]);
+    let s = [read_export(&t.0).unwrap()];
+    let picked: Vec<String> = s[0]
+        .frames
+        .iter()
+        .filter(|f| f.random_pick)
+        .map(|f| file_name(&f.image))
+        .collect();
+    assert_eq!(picked.len(), 2, "{picked:?}");
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.heldout, plain.heldout, "the flag chooses no frame");
+    assert_eq!(
+        p.heldout_fingerprint, plain.heldout_fingerprint,
+        "the flag is no part of the held-out set's identity"
+    );
+    // Only the held-out random pick is tagged in the held-out manifest.
+    let w = write(&s, &p, &o, &out.0.join("data")).unwrap();
+    let (set, _) = images::load_dir(&w.heldout_dir.unwrap(), None, Some("heldout")).unwrap();
+    assert_eq!(set.images.len(), 3);
+    for i in &set.images {
+        let tagged = i.tags.iter().any(|t| t == HELDOUT_RANDOM);
+        assert_eq!(tagged, i.file.ends_with(&jpg_of(&held[1])), "{:?}", i);
+    }
 }
 
 /// A flat export with a `heldout.txt`: cats, cats with a dog, a dog alone, an empty frame; two
@@ -1554,6 +1626,7 @@ fn one_image_source(dir: &Path, n: usize) -> Source {
                 hard_negative: false,
                 human_rejected: false,
                 bulk_accepted: false,
+                random_pick: false,
                 size: Some((8, 8)),
             };
             n
@@ -2533,6 +2606,7 @@ fn negatives_rank_reviewer_evidence_first_whatever_the_formats() {
             version: FRAMES_VERSION,
             empty_confirmed: vec![jpg_of(&empties[29])],
             bulk_accepted: Vec::new(),
+            random_pick: Vec::new(),
         })
         .unwrap(),
     )
@@ -2681,6 +2755,7 @@ fn patio_frame(dir: &Path, i: usize, day: usize, scene: &str, boxes: &[TBox]) ->
         hard_negative: false,
         human_rejected: false,
         bulk_accepted: false,
+        random_pick: false,
         size: Some((640, 480)),
     }
 }

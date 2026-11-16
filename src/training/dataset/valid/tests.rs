@@ -26,6 +26,7 @@ fn frame(camera: &str, day: &str, name: &str, classes: &[&str]) -> Frame {
         hard_negative: false,
         human_rejected: false,
         bulk_accepted: false,
+        random_pick: false,
         size: Some((64, 48)),
     }
 }

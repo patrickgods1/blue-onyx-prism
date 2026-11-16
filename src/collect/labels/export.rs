@@ -40,8 +40,10 @@
 //! run caps them per spot. They train normally otherwise.
 //!
 //! `frames.json` ([`FrameNotes`], at the export's root, every format): the frames a reviewer
-//! confirmed empty and the frames accepted in bulk, so a training run knows them whichever formats
-//! were ticked. `hard_negatives.json` lists the rejected boxes.
+//! confirmed empty, the frames accepted in bulk and the Review queue's random picks
+//! ([`ReviewPick::Random`]), so a training run knows them whichever formats were ticked (it scores
+//! the held-out random picks apart, `heldout:random`). The benchmark manifest tags a random pick
+//! `random`. `hard_negatives.json` lists the rejected boxes.
 //!
 //! Pure builders ([`yolo_txt`], [`coco_json`], [`benchmark_manifest`], [`ignore_file`],
 //! [`frame_notes`]) plus
@@ -56,7 +58,9 @@
 use super::super::layout::{self, Rel, Walker};
 use super::super::record::{Bucket, Record};
 use super::xany;
-use super::{BoxState, Frame, LabelBox, LabelFile, SizeFloor, Status, clamp_box, spots};
+use super::{
+    BoxState, Frame, LabelBox, LabelFile, ReviewPick, SizeFloor, Status, clamp_box, spots,
+};
 use crate::benchmark::images::{Manifest, ManifestImage, ManifestObject};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -346,6 +350,10 @@ pub struct FrameNotes {
     /// Accepted in bulk: nobody looked at the frame on its own.
     #[serde(default)]
     pub bulk_accepted: Vec<String>,
+    /// Served by the Review queue as a random pick ([`ReviewPick::Random`]): chosen whatever it
+    /// shows. Added within version 1: older builds ignore it, older files have none.
+    #[serde(default)]
+    pub random_pick: Vec<String>,
 }
 
 /// The [`FrameNotes`] of `frames`.
@@ -363,6 +371,7 @@ pub fn frame_notes(frames: &[ExportFrame]) -> FrameNotes {
         version: FRAMES_VERSION,
         empty_confirmed: names(&|l| l.empty_confirmed),
         bulk_accepted: names(&|l| l.bulk_accepted),
+        random_pick: names(&|l| l.review_pick == Some(ReviewPick::Random)),
     }
 }
 
@@ -518,6 +527,9 @@ fn tags(f: &ExportFrame) -> Vec<String> {
     t.extend(f.buckets.iter().map(|b| format!("bucket:{}", b.as_str())));
     if f.labels.empty_confirmed {
         t.push("hard-negative".into());
+    }
+    if f.labels.review_pick == Some(ReviewPick::Random) {
+        t.push("random".into());
     }
     t
 }
@@ -1707,6 +1719,49 @@ mod tests {
         assert!(m.has_ground_truth());
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(Manifest::parse(&text).unwrap(), m);
+        // A random pick of the Review queue is tagged `random`; an unknown pick is not.
+        let mut r = frame(vec![], true);
+        r.labels.review_pick = Some(ReviewPick::Random);
+        let mut u = frame(vec![], true);
+        u.labels.review_pick = Some(ReviewPick::Unknown);
+        let m = benchmark_manifest(&[&f, &r, &u], &classes(), "review-x");
+        assert_eq!(m.images[1].tags.last().map(String::as_str), Some("random"));
+        for i in [0, 2] {
+            assert!(!m.images[i].tags.iter().any(|t| t == "random"), "{i}");
+        }
+    }
+
+    #[test]
+    fn frame_notes_list_the_random_picks_and_read_without_them() {
+        let named = |name: &str, pick: Option<ReviewPick>, bulk: bool| {
+            let mut f = frame(vec![], false);
+            f.name = name.into();
+            f.labels.review_pick = pick;
+            f.labels.bulk_accepted = bulk;
+            f
+        };
+        let frames = [
+            named("c.jpg", Some(ReviewPick::Random), false),
+            named("a.jpg", Some(ReviewPick::Random), true),
+            named("b.jpg", None, true),
+            named("d.jpg", Some(ReviewPick::Unknown), false),
+        ];
+        let notes = frame_notes(&frames);
+        assert_eq!(notes.version, FRAMES_VERSION);
+        assert_eq!(notes.version, 1, "an added list, no new version");
+        assert_eq!(notes.random_pick, ["a.jpg", "c.jpg"], "sorted");
+        assert_eq!(notes.bulk_accepted, ["a.jpg", "b.jpg"]);
+        let v = serde_json::to_value(&notes).unwrap();
+        assert_eq!(v["random_pick"], serde_json::json!(["a.jpg", "c.jpg"]));
+        let back: FrameNotes = serde_json::from_value(v).unwrap();
+        assert_eq!(back, notes);
+        // A frames.json of an earlier build has no such key: no random picks.
+        let old: FrameNotes = serde_json::from_str(
+            r#"{"version": 1, "empty_confirmed": ["e.jpg"], "bulk_accepted": []}"#,
+        )
+        .unwrap();
+        assert!(old.random_pick.is_empty());
+        assert_eq!(old.empty_confirmed, ["e.jpg"]);
     }
 
     #[test]

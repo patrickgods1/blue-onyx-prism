@@ -207,10 +207,12 @@ then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only
   (`TrainRecipe::convergence_patience`); a stop point with the training loss still falling (>2%, `loss_falling`) becomes a
   `converge_point` extension, at most 2, shown on the page with Stop now = Finish now) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
   day/night/ir set (`night` alone = night only); the held-out set is chosen from all review frames before the scene
-  filter (tags `heldout:<scene>|all|in-scope`, `heldout_fingerprint`), so runs queued with several scenes share a
+  filter (tags `heldout:<scene>|all|in-scope|random`, `heldout_fingerprint`; `heldout:random` = Review random picks, from
+  `frames.json` `random_pick`, never in the fingerprint), so runs queued with several scenes share a
   `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`; columns also
   person/vehicle recall + false alerts on empty frames at the model's threshold, from `BenchSummary` `person_recall`,
-  `vehicle_recall`, `empty_frames`/`empty_frame_alerts`, `threshold`). RF-DETR: cosine LR schedule (min_factor 0.1) and lr
+  `vehicle_recall`, `empty_frames`/`empty_frame_alerts`, `threshold`; *Random picks* = AP50-95 of `BenchSummary.random`,
+  shown only when every benchmarked run has >= `MIN_RANDOM_HELDOUT` 50, differing counts warn). RF-DETR: cosine LR schedule (min_factor 0.1) and lr
   5e-5 / lr_encoder 7.5e-5 under 1000 unique train frames, not repeats (`TrainRecipe::effective_lr`, `Prepared.train_frames`); anneal-then-stop at a stop point
   (`--anneal`, max(5, ceil(patience/2)) epochs, Rust twin `progress::convergence_run`). Validation split (`dataset/valid.rs`) = 10% but at
   least 50 frames, at most 25% of the pool as a target (`Options.min_valid`), taken as whole camera days never shared with training:

@@ -530,6 +530,8 @@ struct CompareRowView {
     ms_best: bool,
     /// Person recall, vehicle recall, false alerts ([`ALERT_COLUMNS`]).
     alerts: Vec<AlertCell>,
+    /// AP50-95 on the held-out random picks (shown with [`CompareCard::random`]).
+    random: AlertCell,
 }
 
 /// The "mean of N seeds" row of a Comparison card.
@@ -537,7 +539,8 @@ struct SeedSummaryView {
     label: String,
     model: String,
     scene: String,
-    /// Day, night, IR, all, in scope, p50 ms, person R, vehicle R, false alerts: `mean (min-max)`.
+    /// Day, night, IR, all, in scope, random picks (only with [`CompareCard::random`]), p50 ms,
+    /// person R, vehicle R, false alerts: `mean (min-max)`.
     cells: Vec<String>,
 }
 
@@ -557,25 +560,61 @@ fn spread_text(s: Option<&compare::Spread>, decimals: usize, scale: f64, unit: &
     )
 }
 
-fn seed_summary_view(sm: &compare::SeedSummary) -> SeedSummaryView {
+fn seed_summary_view(sm: &compare::SeedSummary, random: bool) -> SeedSummaryView {
     let col =
         |c: &str, d: usize, scale: f64, unit: &str| spread_text(sm.columns.get(c), d, scale, unit);
+    let mut cells = vec![
+        col("day", 3, 1.0, ""),
+        col("night", 3, 1.0, ""),
+        col("ir", 3, 1.0, ""),
+        col("all", 3, 1.0, ""),
+        "\u{2014}".into(),
+        col("ms_p50", 1, 1.0, ""),
+        col("person_recall", 2, 1.0, ""),
+        col("vehicle_recall", 2, 1.0, ""),
+        col("false_alerts", 1, 100.0, "%"),
+    ];
+    if random {
+        // After `in scope`, as in the table's head.
+        cells.insert(5, col("random", 3, 1.0, ""));
+    }
     SeedSummaryView {
         label: sm.label.clone(),
         model: sm.model.clone(),
         scene: sm.scene.clone(),
-        cells: vec![
-            col("day", 3, 1.0, ""),
-            col("night", 3, 1.0, ""),
-            col("ir", 3, 1.0, ""),
-            col("all", 3, 1.0, ""),
-            "\u{2014}".into(),
-            col("ms_p50", 1, 1.0, ""),
-            col("person_recall", 2, 1.0, ""),
-            col("vehicle_recall", 2, 1.0, ""),
-            col("false_alerts", 1, 100.0, "%"),
-        ],
+        cells,
     }
+}
+
+/// Text and hover text of a comparison row's random-picks cell: AP50-95, and what it covers.
+fn random_cell(row: &compare::Row) -> (String, String) {
+    let Some(s) = row.random.filter(|s| s.ap50_95.is_some_and(f64::is_finite)) else {
+        return ("\u{2014}".into(), String::new());
+    };
+    let mut title = format!(
+        "AP50-95 on {} held-out frames picked at random ({} objects)",
+        s.images, s.gt
+    );
+    if let Some(a) = s.ap50.filter(|a| a.is_finite()) {
+        title.push_str(&format!(", AP50 {a:.3}"));
+    }
+    if let Some(r) = s.recall.filter(|r| r.is_finite()) {
+        let at = row
+            .threshold
+            .map_or_else(String::new, |t| format!(" at threshold {t:.2}"));
+        title.push_str(&format!(", recall {r:.2}{at}"));
+    }
+    (ap_text(s.ap50_95), title)
+}
+
+/// The tip of the Comparison card's random-picks column head (`frames`, `objects` of the first
+/// run that has them; runs whose counts differ are warned about).
+fn random_tip(frames: usize, objects: usize) -> String {
+    format!(
+        "AP50-95 on held-out frames the queue picked at random ({frames} frames, {objects} \
+         objects): nobody chose them, so this is the least biased score. Hidden under {} frames.",
+        compare::MIN_RANDOM_HELDOUT
+    )
 }
 
 /// One alerting cell of a comparison row: `0.39`, `3/130`, a dash when unknown.
@@ -599,6 +638,10 @@ struct CompareCard {
     rows: Vec<CompareRowView>,
     /// "Mean of N seeds" rows (runs that differ only by training seed).
     seed_summaries: Vec<SeedSummaryView>,
+    /// The random-picks column is shown ([`compare::Comparison::random_column`]).
+    random: bool,
+    /// Its head's tip ([`random_tip`]); empty when hidden.
+    random_tip: String,
 }
 
 /// One axis checkbox of the Train form's Balance fieldset.
@@ -1026,16 +1069,36 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                                 }
                             })
                             .collect(),
+                        random: {
+                            let (text, title) = random_cell(row);
+                            AlertCell {
+                                text,
+                                title,
+                                best: !row.routed && best(k, "random"),
+                            }
+                        },
                     }
                 })
                 .collect();
+            let random_tip = c
+                .rows
+                .iter()
+                .find_map(|r| r.random)
+                .filter(|_| c.random_column)
+                .map_or_else(String::new, |s| random_tip(s.images, s.gt));
             CompareCard {
                 group,
                 open: i == 0 || Some(i) == with_results,
                 comparable: c.comparable,
                 warnings: c.warnings,
                 rows,
-                seed_summaries: c.seed_summaries.iter().map(seed_summary_view).collect(),
+                seed_summaries: c
+                    .seed_summaries
+                    .iter()
+                    .map(|sm| seed_summary_view(sm, c.random_column))
+                    .collect(),
+                random: c.random_column,
+                random_tip,
             }
         })
         .collect()
@@ -4466,6 +4529,7 @@ pub(super) mod tests {
             vehicle_recall: None,
             empty_frames: Some(40),
             empty_frame_alerts: Some((10.0 * n).round() as usize),
+            random: None,
         });
         RunRecord {
             baseline: None,
@@ -4711,6 +4775,106 @@ pub(super) mod tests {
         assert_eq!(v["comparable"], true);
         assert_eq!(v["rows"][0]["day"]["ap50_95"], 0.5);
         assert_eq!(v["best_per_column"]["night"], 1);
+        assert_eq!(v["random_column"], false);
+        // No random picks: no column.
+        assert!(!cards[0].random && cards[0].random_tip.is_empty());
+    }
+
+    /// `group_records` with `n` held-out random picks on the benchmarked runs of `cmp-new`.
+    fn records_with_random_picks(n: usize) -> Vec<RunRecord> {
+        let mut recs = group_records();
+        for (id, ap) in [("a", 0.31), ("b", 0.42)] {
+            let r = recs.iter_mut().find(|r| r.id == id).unwrap();
+            r.benchmark.as_mut().unwrap().random = Some(crate::training::job::SubsetScore {
+                images: n,
+                gt: 85,
+                ap50: Some(ap + 0.2),
+                ap50_95: Some(ap),
+                recall: Some(0.7),
+            });
+        }
+        recs
+    }
+
+    #[test]
+    fn the_random_picks_column_follows_the_fifty_frame_rule() {
+        let cards = compare_cards(&records_with_random_picks(60));
+        let card = &cards[0];
+        assert!(card.random);
+        assert_eq!(
+            card.random_tip,
+            "AP50-95 on held-out frames the queue picked at random (60 frames, 85 objects): \
+             nobody chose them, so this is the least biased score. Hidden under 50 frames."
+        );
+        let (a, b) = (&card.rows[0].random, &card.rows[1].random);
+        assert_eq!((a.text.as_str(), b.text.as_str()), ("0.310", "0.420"));
+        assert!(!a.best && b.best);
+        assert_eq!(
+            a.title,
+            "AP50-95 on 60 held-out frames picked at random (85 objects), AP50 0.510, recall 0.70 \
+             at threshold 0.50"
+        );
+        // The running run and the routed row: dashes, never the best.
+        for r in &card.rows[2..] {
+            assert_eq!(r.random.text, "\u{2014}");
+            assert!(r.random.title.is_empty() && !r.random.best);
+        }
+        // Under 50 in a run: hidden.
+        let cards = compare_cards(&records_with_random_picks(49));
+        assert!(!cards[0].random && cards[0].random_tip.is_empty());
+        assert!(!cards[0].rows[1].random.best);
+    }
+
+    #[tokio::test]
+    async fn the_comparison_card_draws_the_random_picks_column_only_when_shown() {
+        use crate::server::test_util::test_state_with;
+        use askama::Template;
+        let root = std::env::temp_dir().join(format!("bop-train-rnd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let render = |recs: Vec<RunRecord>| {
+            let page = view_with(
+                &state,
+                MODELS,
+                None,
+                None,
+                recs,
+                crate::training::capability::host_for_tests(),
+            )
+            .render()
+            .unwrap();
+            let i = page.find("id=\"compare\"").expect("the Comparison card");
+            page[i..].to_string()
+        };
+        let shown = render(records_with_random_picks(60));
+        assert!(
+            shown.contains(
+                "<th class=\"num\"><button type=\"button\" class=\"term\" data-tip=\"AP50-95 on \
+                 held-out frames the queue picked at random (60 frames, 85 objects): nobody chose \
+                 them, so this is the least biased score. Hidden under 50 frames.\">Random \
+                 picks</button></th>"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "<td class=\"num best-val\"><button type=\"button\" class=\"term\" \
+                 data-tip=\"AP50-95 on 60 held-out frames picked at random (85 objects), AP50 \
+                 0.620, recall 0.70 at threshold 0.50\">0.420</button></td>"
+            ),
+            "{shown}"
+        );
+        // The header and the run rows keep the same number of cells.
+        let section = shown.split("cmp-old").next().unwrap();
+        let heads = section.matches("<th>").count() + section.matches("<th class").count();
+        let row = section.split("<tbody>").nth(1).unwrap();
+        let first = row.split("</tr>").next().unwrap();
+        assert_eq!(first.matches("<td").count(), heads, "{first}");
+        let hidden = render(records_with_random_picks(49));
+        assert!(!hidden.contains(">Random picks</button>"), "{hidden}");
+        assert!(!hidden.contains("picked at random ("), "{hidden}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

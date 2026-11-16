@@ -328,6 +328,24 @@ pub struct BenchSummary {
     /// [`crate::benchmark::report::ModelResult::trained_on_share`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trained_on_share: Option<f64>,
+    /// The score on the held-out frames the Review queue picked at random
+    /// ([`dataset::HELDOUT_RANDOM`]): nobody chose them, so it is the least biased score. None
+    /// without such frames (and for runs of older versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub random: Option<SubsetScore>,
+}
+
+/// The score on a tagged subset of the held-out frames ([`BenchSummary::random`]), from the
+/// benchmark's per-tag breakdown: AP over the scored classes, recall at the benchmark's threshold
+/// ([`BenchSummary::threshold`], IoU 0.5).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct SubsetScore {
+    pub images: usize,
+    /// Scored ground-truth objects.
+    pub gt: usize,
+    pub ap50: Option<f64>,
+    pub ap50_95: Option<f64>,
+    pub recall: Option<f64>,
 }
 
 /// The current default model on the frames of a run's benchmark ([`Hooks::baseline`]): what the

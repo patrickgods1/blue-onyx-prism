@@ -186,9 +186,9 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
      images/val/...                             held out by the export, whole camera days
      labels/train/<same stem>.txt               YOLO `class cx cy w h`, normalized; empty = no objects
      labels/val/...
-     benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative
+     benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative, random
      ignore.json                                ignore regions per image, frames with only parked-spot boxes
-     frames.json                                frames confirmed empty, frames accepted in bulk
+     frames.json                                frames confirmed empty, frames accepted in bulk, random picks
      hard_negatives.json                        rejected boxes
    ```
 
@@ -252,6 +252,12 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
    run's benchmark summary; the held-out
    `manifest.json` tags each frame with its scene plus `heldout:<scene>`, `heldout:all` and, for a
    frame of the run's scenes, `heldout:in-scope`, which the benchmark summary reads for per-scene AP.
+   A frame the Review queue served as a random pick (`review_pick: random` on its label file, listed in
+   the export's `frames.json` `random_pick`) is also tagged `heldout:random`; the benchmark summary
+   keeps that tag's score as `random` (`images`, `gt`, `ap50`, `ap50_95`, `recall` at the threshold).
+   Nobody chose those frames, while the rest of the reviewed set leans to the hard and rare frames the
+   queue order puts first, so their score is the least biased one ([Comparison](#comparing-day-nightir-and-mixed-models)).
+   The flag is not part of `heldout_fingerprint`: marking a frame changes no held-out frame.
 3. **Scene filter** (training and validation frames only): `all`, or any combination of `day`,
    `night` and `ir` joined by `+` (`day`, `night`, `ir`, `day+night`, `day+ir`, `night+ir`; the
    page's checkboxes). Frames without a scene tag are left out by every filter but `all`, with a
@@ -1043,6 +1049,21 @@ detection at or above the threshold, of all such frames; a detection inside an i
 count). The best value of each column is marked (`*` in the CLI): highest AP and recall, lowest time
 and false-alert rate. Runs of older versions show a dash in the new columns. Runs that differ in
 classes, excluded mode or threshold get a warning.
+
+**Random picks.** One reviewed frame in five comes from the Review queue's random pool (Recommended
+order): it was reviewed because its slot came up, whatever it shows. The rest of the reviewed set leans
+to what the queue puts first (likely boxes, rare classes, uncertain frames), so AP on it is skewed; AP
+on the held-out random picks (`heldout:random`, benchmark summary `random`) is the least biased score.
+The **Random picks** column (CLI `random`, after in-scope; higher is better) shows it, and its head's tip
+gives the frame and object counts. AP over a few dozen frames moves a lot from frame to frame, so the
+column is shown only when **every** benchmarked run of the group has at least 50 held-out random picks
+(`compare::MIN_RANDOM_HELDOUT`); otherwise it is hidden everywhere, best mark and seed means included
+(a run still queued or running hides nothing; a run of an older version, with no `random`, hides it).
+Picks are random among the frames sent to review, not among everything the cameras saw. The held-out
+set is shared by the group, so the counts should match; when they differ the label files changed
+between the runs' exports and the card warns that the random-pick scores are not comparable. Person
+and vehicle recall on the random picks alone are not computed (they would need the alerting figures per
+tag).
 
 The same figures close each run's benchmark line on the page (`person recall 0.39 · vehicle recall
 0.67 · false alerts 4/130 empty frames @ 0.50`) and are stored in its benchmark summary (`threshold`,

@@ -564,7 +564,8 @@ folder; the collector and the Collect tab keep `collect.dir`.
   frame that is not in the pool (`recommend::in_pool`), so a forged or mistaken mark cannot put a chosen frame
   among the random ones. A value this build does not know loads as `unknown` and is written back as `unknown`;
   X-AnyLabeling imports and the other edits keep it. A build from before random picks ignores the field and drops
-  it when it rewrites the file.
+  it when it rewrites the file. Exports list such frames in `frames.json` `random_pick` and tag them `random` in
+  the benchmark manifest; a training run scores its held-out random picks apart (`heldout:random`).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
@@ -979,8 +980,10 @@ Click a box to select it. Drag on the image to draw a new one.
                                        duplicate, too_small and dismissed (auto_dismissed, spot_dismissed, size_floor) ones
   ignore.json                          ignore regions per image, below, and in `parked` the frames whose
                                        training boxes all came from parked spots (for the training cap)
-  frames.json                          `empty_confirmed` and `bulk_accepted`: image names, for a training run whichever
-                                       formats were ticked (absent in older exports)
+  frames.json                          `empty_confirmed`, `bulk_accepted` and `random_pick` (frames saved with
+                                       `review_pick: "random"`): image names, for a training run whichever
+                                       formats were ticked (absent in older exports; `random_pick` was added within
+                                       version 1, older files have no key and older builds ignore it)
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
   export.json                          the report, written last
@@ -1045,7 +1048,9 @@ regions (too-small rejects included) as `ignore` objects. `scored_labels`
 is the class list, so predictions of other labels count neither way. The tags are:
 
 - `<scene>`, `camera:<c>`, `date:<d>`, `split:<s>`, and `bucket:<b>` for each bucket;
-- `hard-negative` for a frame confirmed empty.
+- `hard-negative` for a frame confirmed empty;
+- `random` for a random pick of the Review queue (`review_pick: "random"`). A training run tags its held-out
+  random picks `heldout:random` and scores them apart (docs/TRAINING.md, "Random picks").
 
 `benchmark_split` (`all`, `val`, `train`) picks the frames. Run the set with
 `blue-onyx-prism benchmark --dataset dir:<out>/benchmark`.
