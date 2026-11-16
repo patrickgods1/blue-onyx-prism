@@ -1177,6 +1177,11 @@ fn stages(
                 scene: Some(job.request.scene.as_str().to_string()),
                 gpu: Some(job.accelerator.name().to_string()),
                 ignore: Some(opts.ignore),
+                negative_share: Some(opts.negative_share),
+                static_cap: Some(
+                    opts.static_cap
+                        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+                ),
             }),
             ..TrainProgress::default()
         };

@@ -1029,6 +1029,8 @@ group is benchmarked on the same frames, all scenes included. The fingerprint in
 summary proves it. If the fingerprints differ (an export was edited between queuing and running) the
 comparison shows a warning instead of comparing.
 
+Runs trained with different shares of empty frames (`training.negative_share`) or different static caps (`training.static_cap`) are flagged with a warning; runs from before these were recorded say nothing.
+
 **The table.** The Comparison card of the Models tab (one per group) and, at the end of a
 `train run` with several scenes, the CLI table have one row per run: model, scene filter, best epoch
 (with "by F2" when not selected by mAP; a warning when runs of a group differ) and the epoch it

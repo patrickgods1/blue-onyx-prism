@@ -30,6 +30,12 @@ pub struct CompareRun {
     /// What its training frames with ignore regions became (`RunSettings::ignore_mode`); None
     /// while the run has not started training.
     pub ignore: Option<IgnoreMode>,
+    /// The share of empty training frames it kept (`RunSettings::negative_share`); None =
+    /// unknown (not started, or a record from before it was recorded).
+    pub negative_share: Option<f32>,
+    /// The most frames per static spot (`RunSettings::static_cap`, `Some(0)` = off); None =
+    /// unknown.
+    pub static_cap: Option<u32>,
     /// How the run balanced its training frames (off for older runs).
     pub balance: Balance,
     /// Best epoch (1-based) and the epoch training stopped at, when known.
@@ -354,6 +360,41 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
                 names.join(" / ")
             ));
         }
+        let mut shares: Vec<String> = Vec::new();
+        for n in runs.iter().filter_map(|r| r.negative_share) {
+            let pct = format!("{:.0}%", n * 100.0);
+            if !shares.contains(&pct) {
+                shares.push(pct);
+            }
+        }
+        if shares.len() > 1 {
+            c.warnings.push(format!(
+                "the runs keep different shares of empty training frames ({}): their training frames differ, so differences in false alerts may come from that",
+                shares.join(" / ")
+            ));
+        }
+        let mut caps: Vec<u32> = Vec::new();
+        for n in runs.iter().filter_map(|r| r.static_cap) {
+            if !caps.contains(&n) {
+                caps.push(n);
+            }
+        }
+        if caps.len() > 1 {
+            let list: Vec<String> = caps
+                .iter()
+                .map(|n| {
+                    if *n == 0 {
+                        "off".to_string()
+                    } else {
+                        n.to_string()
+                    }
+                })
+                .collect();
+            c.warnings.push(format!(
+                "the runs cap static objects differently ({}): their training frames differ, so AP differences may come from that",
+                list.join(" / ")
+            ));
+        }
         let mut thresholds: Vec<f32> = Vec::new();
         for t in runs
             .iter()
@@ -645,6 +686,8 @@ mod tests {
             classes: vec!["person".into()],
             excluded: Excluded::Background,
             ignore: Some(IgnoreMode::Background),
+            negative_share: Some(0.15),
+            static_cap: Some(20),
             balance: Balance::default(),
             best_epoch: Some(12),
             stopped_epoch: Some(27),
@@ -876,7 +919,27 @@ mod tests {
               differences may come from that"
             ]
         );
-        assert!(compare(&[day, queued]).warnings.is_empty());
+        assert!(compare(&[day.clone(), queued.clone()]).warnings.is_empty());
+        // Empty-frame share and static cap: said once each, only when known values differ.
+        let mut s25 = run("day-b", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0);
+        s25.negative_share = Some(0.25);
+        s25.static_cap = Some(0);
+        let c = compare(&[day.clone(), s25.clone()]);
+        assert_eq!(
+            c.warnings,
+            [
+                "the runs keep different shares of empty training frames (15% / 25%): their training frames differ, so differences in false alerts may come from that",
+                "the runs cap static objects differently (20 / off): their training frames differ, so AP differences may come from that"
+            ]
+        );
+        let mut unknown = day.clone();
+        unknown.negative_share = None;
+        unknown.static_cap = None;
+        assert!(compare(&[unknown.clone(), day.clone()]).warnings.is_empty());
+        assert!(compare(&[unknown, s25]).warnings.is_empty());
+        let mut same = day.clone();
+        same.name = "day-c".into();
+        assert!(compare(&[day, same]).warnings.is_empty());
         // A run without a benchmark is a row of dashes and never the best.
         let mut x = run("x", SceneFilter::DAY, 0.9, 0.9, 0.9, 1.0);
         x.bench = None;

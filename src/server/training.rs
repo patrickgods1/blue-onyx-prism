@@ -914,6 +914,12 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         ignore: p
             .and_then(|p| p.settings.as_ref())
             .map(crate::training::progress::RunSettings::ignore_mode),
+        negative_share: p
+            .and_then(|p| p.settings.as_ref())
+            .and_then(|s| s.negative_share),
+        static_cap: p
+            .and_then(|p| p.settings.as_ref())
+            .and_then(|s| s.static_cap),
         balance: r.request.balance.clone(),
         best_epoch: stop
             .map(|s| s.best_epoch)
