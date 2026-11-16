@@ -347,9 +347,37 @@
     var auto = filtersForm.elements.auto ? filtersForm.elements.auto.value : '';
     // `refine_kind` only with `auto=refine` (R.sendsFilter).
     Array.prototype.forEach.call(filtersForm.elements, function (el) {
+      if (el.name === 'order') {
+        var o = orderParam(el.value);
+        if (o) p.set(o[0], o[1]);
+        return;
+      }
       if (el.name && R.sendsFilter(el.name, el.value, auto)) p.set(el.name, el.value);
     });
     return p;
+  }
+
+  // The Order select as a query parameter: '' (Recommended, the server's default) sends none,
+  // 'uncertain' `order=uncertain`, 'balance:<dims>' `balance=<dims>`.
+  function orderParam(v) {
+    if (!v) return null;
+    if (v.indexOf('balance:') === 0) return ['balance', v.slice(8)];
+    return ['order', v];
+  }
+
+  // The Order select's value for a link's `order` and `balance` (unknown values: Recommended).
+  function orderOf(q) {
+    var b = q.get('balance');
+    if (b) return 'balance:' + b;
+    return q.get('order') === 'uncertain' ? 'uncertain' : '';
+  }
+
+  // The dimensions the queue's order balances by: a `balance:` choice's, every one under
+  // Recommended (no Auto filter: that filter's own order then), else none.
+  function balanceBy() {
+    var f = filtersForm.elements, v = (f.order && f.order.value) || '';
+    if (v.indexOf('balance:') === 0) return v.slice(8);
+    return v === '' && !(f.auto && f.auto.value) ? 'class,scene,camera' : '';
   }
 
   // ---- state helpers ------------------------------------------------------------------------
@@ -3330,10 +3358,10 @@
   // queue knows: why `balance=` put it there.
   var queueItem = null;
 
-  // `balance=`: the reviewed frames the order weighs against, of the dimensions the Order filter
-  // balances (the answer's `balance`).
+  // `balance=` and Recommended: the reviewed frames the order weighs against, of the dimensions
+  // the Order filter balances (the answer's `balance`).
   function balanceCounts(b) {
-    var by = (filtersForm.elements.balance && filtersForm.elements.balance.value) || '';
+    var by = balanceBy();
     var list = function (o) { return Object.keys(o || {}).map(function (k) { return k + ' ' + o[k]; }).join(', ') || 'none'; };
     var parts = [];
     if (by.indexOf('class') >= 0) parts.push(list(b.classes) + ', empty ' + (b.empty || 0));
@@ -3438,6 +3466,8 @@
     if (cur.labels && cur.labels.bulk_accepted) parts.push('bulk accepted');
     if (cur.stale_classes) parts.push('reviewed with another class list');
     if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
+    // Recommended: the frame's place in its event (one camera's activity), 1 = its first.
+    if (queueItem && queueItem.frame === cur.frame && queueItem.event_rank != null) parts.push('event: frame ' + (queueItem.event_rank + 1));
     if (queueItem && queueItem.frame === cur.frame && queueItem.balance) parts.push(balanceNote(queueItem));
     m.textContent = parts.filter(Boolean).join(' · ');
     setPhoneLine();
@@ -3913,7 +3943,8 @@
     if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
     if (f.auto.value) parts.push(name('auto'));
     if (f.refine_kind && R.sendsFilter('refine_kind', f.refine_kind.value, f.auto.value)) parts.push(name('refine_kind'));
-    if (f.balance && f.balance.value) parts.push(name('balance'));
+    // The order, unless an Auto filter's own order replaces Recommended.
+    if (f.order && (f.order.value || !f.auto.value)) parts.push(name('order').toLowerCase());
     summary.textContent = parts.join(', ');
   }
   // The kind of dataset check suggestion: offered with that Auto filter only.
@@ -3925,7 +3956,11 @@
   // Auto filter's choice opens.
   function filtersFromUrl() {
     var q = new URLSearchParams(location.search), f = filtersForm.elements;
-    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source', 'balance'].forEach(function (k) {
+    if (f.order) {
+      f.order.value = orderOf(q);
+      if (f.order.value !== orderOf(q)) f.order.value = '';
+    }
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source'].forEach(function (k) {
       var v = q.get(k), e = f[k];
       if (!v || !e) return;
       if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {

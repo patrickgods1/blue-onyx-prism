@@ -47,7 +47,7 @@ use super::{AppState, blocking, encode_uri_component, render};
 use crate::collect::CollectSettings;
 #[cfg(test)]
 use crate::collect::labels::bulk::accept_one;
-use crate::collect::labels::queue::Filters;
+use crate::collect::labels::queue::{Filters, Order};
 use crate::collect::labels::{self, Frame, LabelFile, bulk};
 use crate::collect::{Bucket, layout};
 use askama::Template;
@@ -290,18 +290,24 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&after=`
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=`
 /// (`refine_kind` only with `auto=refine`; `balance` = `class,scene,camera` or some of them puts the
-/// least reviewed first; [`Filters::from_query`]): the most uncertain frame matching the filters (after `after`, the frame shown now, when given; past
-/// the last one the first again with `wrapped`), its position, the counts and the cameras and
-/// classes for the filter lists. A big folder answers from [`labels::index`], with
-/// `indexing: {done, total}` while its rows are still coming in; a small one is walked.
+/// least reviewed first; [`Filters::from_query`]): the first frame matching the filters in the
+/// queue's order (after `after`, the frame shown now, when given; past the last one the first
+/// again with `wrapped`), its position, the counts and the cameras and classes for the filter
+/// lists. The order ([`next_order`]): Recommended by default (one frame per event first, then the
+/// balance in bands, then the most uncertain, [`labels::recommend`]); `order=uncertain` = the most
+/// uncertain first; an `auto=` or `balance=` filter keeps its own order, whatever `order` says.
+/// Only this route reads `order`: bulk actions and auto-label runs keep the uncertainty order. A big
+/// folder answers from [`labels::index`], with `indexing: {done, total}` while its rows are still
+/// coming in; a small one is walked.
 pub(super) async fn next(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
 ) -> Answer {
     let q = query_map(query);
     let mut filters = filters(&q)?;
+    filters.order = next_order(&q, &filters)?;
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         filters.wanted = Some((classes, hidden(&state)));
@@ -321,6 +327,26 @@ pub(super) async fn next(
         Json(answer).into_response()
     })
     .await)
+}
+
+/// The order `GET /v1/review/next` sorts by: `order` absent, empty or `recommended` is
+/// [`Order::Recommended`] unless `f` has an `auto=` or `balance=` filter (those keep their own
+/// order, which is the uncertainty order's); `uncertain` is [`Order::Uncertain`]; anything else
+/// is 400.
+fn next_order(q: &BTreeMap<String, String>, f: &Filters) -> Result<Order, Problem> {
+    match q.get("order").map(|o| o.trim()).filter(|o| !o.is_empty()) {
+        None | Some("recommended") if f.auto.is_none() && f.balance.is_none() => {
+            Ok(Order::Recommended)
+        }
+        None | Some("recommended" | "uncertain") => Ok(Order::Uncertain),
+        Some(o) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "order: '{}' is not recommended or uncertain",
+                o.escape_debug()
+            ),
+        )),
+    }
 }
 
 fn frame_param(q: &BTreeMap<String, String>) -> Result<String, Problem> {
@@ -3506,6 +3532,137 @@ mod tests {
         assert!(v.get("folder_missing").is_none(), "{v}");
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// The frames `GET /v1/review/next` with `params` goes through, Next after Next until it
+    /// wraps, each with its `event_rank`.
+    async fn order_of(d: &Ds, params: &[(&str, &str)]) -> Vec<(String, Option<u64>)> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut p: Vec<(&str, &str)> = params.to_vec();
+            if let Some(a) = &after {
+                p.push(("after", a));
+            }
+            let v = next_of(d, &p).await;
+            if v["wrapped"] == true || v["item"].is_null() {
+                return out;
+            }
+            let frame = v["item"]["frame"].as_str().unwrap().to_string();
+            out.push((frame.clone(), v["item"]["event_rank"].as_u64()));
+            assert!(out.len() < 50, "{params:?} never wraps");
+            after = Some(frame);
+        }
+    }
+
+    both_ways!(
+        next_is_recommended_unless_asked_otherwise,
+        next_is_recommended_unless_asked_otherwise_indexed,
+        next_is_recommended_unless_asked_otherwise_in
+    );
+
+    /// Recommended by default: a and b are one event (one camera, the same time), so c comes
+    /// before b although b is more uncertain. `order=uncertain`, `balance=` and `auto=` keep the
+    /// uncertainty order; another `order` is refused.
+    async fn next_is_recommended_unless_asked_otherwise_in(way: Way) {
+        let d = way.ds();
+        let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
+        let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.51);
+        let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.6);
+        let (s, v) = json(&d.state, get("/v1/review/next?order=newest")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("order") && m.contains("newest"), "{m}");
+
+        let ranked = vec![
+            (a.clone(), Some(0)),
+            (c.clone(), Some(0)),
+            (b.clone(), Some(1)),
+        ];
+        assert_eq!(order_of(&d, &[]).await, ranked);
+        assert_eq!(order_of(&d, &[("order", "recommended")]).await, ranked);
+        // The balance it weighs by is in the answer, every dimension, for the page's note.
+        let v = next_of(&d, &[]).await;
+        assert!(v["balance"]["scenes"].is_object(), "{v}");
+        assert!(v["item"]["balance"].is_object(), "{v}");
+
+        let plain = vec![(a.clone(), None), (b.clone(), None), (c.clone(), None)];
+        assert_eq!(order_of(&d, &[("order", "uncertain")]).await, plain);
+        assert!(next_of(&d, &[("order", "uncertain")]).await["balance"].is_null());
+        for params in [
+            &[("balance", "class")][..],
+            &[("balance", "class"), ("order", "recommended")],
+        ] {
+            assert_eq!(order_of(&d, params).await, plain, "{params:?}");
+            assert!(next_of(&d, params).await["balance"].is_object());
+        }
+        // Not auto-labelled: every frame, in the auto filter's order.
+        assert_eq!(order_of(&d, &[("auto", "none")]).await, plain);
+        assert_eq!(
+            order_of(&d, &[("auto", "none"), ("order", "recommended")]).await,
+            plain
+        );
+    }
+
+    both_ways!(
+        a_limited_bulk_accept_keeps_the_uncertainty_order,
+        a_limited_bulk_accept_keeps_the_uncertainty_order_indexed,
+        a_limited_bulk_accept_keeps_the_uncertainty_order_in
+    );
+
+    /// A bulk action with a limit takes the first frames of the uncertainty order, never the
+    /// Recommended one: the four frames the triage settles are two per camera, all at one time,
+    /// so the Recommended order puts one of each camera first, the uncertainty order both of
+    /// drive.
+    async fn a_limited_bulk_accept_keeps_the_uncertainty_order_in(way: Way) {
+        let d = way.ds();
+        let rels = put_auto_frames(&d.dir);
+        let settled = |i: usize| rels[i].clone();
+        let uncertain: Vec<String> = order_of(&d, &[("auto", "accept"), ("order", "uncertain")])
+            .await
+            .into_iter()
+            .map(|x| x.0)
+            .collect();
+        assert_eq!(uncertain, [settled(0), settled(6), settled(3), settled(9)]);
+        let mut f = Filters {
+            auto: Some(labels::queue::AutoFilter::Accept),
+            order: Order::Recommended,
+            ..Filters::default()
+        };
+        f.wanted = Some((context(&d.state).1, hidden(&d.state)));
+        let recommended: Vec<String> = labels::queue::build(&d.dir, &f)
+            .items
+            .into_iter()
+            .map(|i| i.frame)
+            .collect();
+        assert_eq!(
+            recommended,
+            [settled(0), settled(3), settled(6), settled(9)]
+        );
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/accept-auto",
+                r#"{"dry_run": false, "limit": 2}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["accepted"], 2, "{v}");
+        let reviewed: Vec<String> = rels
+            .iter()
+            .filter(|r| {
+                Frame::resolve(&d.dir, r)
+                    .unwrap()
+                    .labels()
+                    .unwrap()
+                    .is_some_and(|l| l.status == labels::Status::Reviewed)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(reviewed, [settled(0), settled(6)]);
+        // The default Next of the indexed folder answers from the index.
+        next_of(&d, &[]).await;
+    }
+
     // ---- the review index behind `GET /v1/review/next` ----------------------------------------
 
     /// `GET /v1/review/next` with `params`.
@@ -3527,6 +3684,7 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let mut f = Filters::from_query(&q).unwrap();
+        f.order = next_order(&q, &f).unwrap();
         let (dir, classes, _) = context(&d.state);
         f.wanted = Some((classes, hidden(&d.state)));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
@@ -3551,7 +3709,7 @@ mod tests {
     }
 
     /// Filters a Next is asked with, for answers compared whole with the walk's.
-    const VIEWS: [&[(&str, &str)]; 7] = [
+    const VIEWS: [&[(&str, &str)]; 9] = [
         &[],
         &[("status", "any")],
         &[("status", "reviewed")],
@@ -3559,6 +3717,8 @@ mod tests {
         &[("auto", "accept")],
         &[("auto", "review")],
         &[("camera", "yard"), ("status", "any")],
+        &[("order", "uncertain")],
+        &[("balance", "class"), ("order", "recommended")],
     ];
 
     /// Every view of [`VIEWS`], and after its first frame, answered as the walk answers it.

@@ -634,7 +634,7 @@ training and pending boxes, and proposals may replace rejected boxes no reviewer
 
 `GET /v1/review/next` lists the frames of `review-queue.jsonl`, or with `source=all` also every indexed
 frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` (default
-`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`, and the order `balance` (below):
+`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`, and the orders `order` and `balance` (below):
 
 | `auto=` | Frames |
 |---|---|
@@ -663,7 +663,34 @@ that are not rejected (accepted, added and pending ones). Without one, they are 
 `predictions`. The value must be a valid class name (1 to 64 characters, no control characters). It
 need not be in the class list, so a model label such as `class_7` works too. The answer's `labels`
 lists the classes of the frames the other filters keep, for the page's **Class** list (which also
-holds `collect.classes`). The auto-label form passes it on like the other filters. Frames are sorted most uncertain first:
+holds `collect.classes`). The auto-label form passes it on like the other filters.
+
+**Recommended (default).** With no `auto=` and no `balance=`, `GET /v1/review/next` sorts by
+`collect/labels/recommend.rs` (`order=recommended`, or no `order`; page: Filters > **Order**, *Recommended*).
+Labelling neighbouring frames of one clip teaches a model little more than one of them, and an uncertainty order
+alone keeps serving such neighbours; frames of rare classes, scenes and cameras matter most while the counts are
+uneven. So:
+
+1. a re-label disagreement first, repeat-only frames last (as below);
+2. the **event rank** (item field `event_rank`, 0 = the event's first frame to review; the page's details show
+   *event: frame N*): the first frame of every event comes before any second one. An event is one camera's
+   activity: frames of one day folder (`<scene>/<camera>/<date>`, so an event ends at UTC midnight and at a scene
+   change) at most 60 s apart (`EVENT_GAP_S`), at most 600 s from its first frame (`EVENT_MAX_S`). A frame whose
+   time does not parse, and an imported frame (sidecar `model: "import"`: image-folder imports carry file times,
+   and import already spread its frames out), is an event of its own. Events are built over the frames the counts
+   count (every filter but `status` and `auto`), so they do not split as frames get reviewed: a frame's rank is
+   the decided (reviewed or skipped) frames of its event the queue does not list, plus the listed frames of its
+   event ahead of it in this order without the rank;
+3. the balance of class, scene and camera (`balance=class,scene,camera`, below, the answer's `balance` too) in
+   bands of 250 (`BALANCE_BAND`), highest first, so the most uncertain frames lead within a band;
+4. the uncertainty order below, from more likely boxes on; then newest, then by path.
+
+So diversity leads while the counts are uneven, and uncertainty takes over as they even out. `order=uncertain`
+(*Most uncertain first*) is the order below; an `auto=` or `balance=` filter keeps its own order whatever `order`
+says; any other `order` is 400. Only this route reads `order`: bulk actions, previews, the auto-label `select`,
+the Coverage card and spots keep the uncertainty order.
+
+**Most uncertain first** (`order=uncertain`, every `auto=` filter, bulk actions, auto-label runs):
 
 1. a re-label disagreement (the label file's `disagreement`, item field `relabel`);
 2. more pending likely boxes (item field `likely_boxes`), so a frame with one comes before a frame with none;

@@ -2,7 +2,9 @@
 //! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]), review
 //! status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
-//! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest. Also the counts the Review tab shows, and
+//! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest; or,
+//! with [`Order::Recommended`] (the Review tab's default, set by its route alone), one frame per
+//! event first ([`super::recommend`]). Also the counts the Review tab shows, and
 //! [`labelled`], every label file those filters select whichever queue it is in.
 //!
 //! The walks read a day folder at a time ([`by_day`], [`over_days`], one [`Walker`] per day folder)
@@ -12,6 +14,7 @@
 use super::super::layout::{self, REVIEW_QUEUE_FILE, ReviewLine, Walker};
 use super::super::record::{Bucket, IndexLine, Record};
 use super::bulk::Wanted;
+use super::recommend;
 use super::refine::Kind as RefineKind;
 use super::{BoxState, Frame, LabelFile, Status, Triage};
 use crate::parallel;
@@ -179,6 +182,13 @@ pub struct Balance {
 }
 
 impl Balance {
+    /// Every dimension: what the Recommended order ([`Order::Recommended`]) balances by.
+    pub const ALL: Self = Self {
+        class: true,
+        scene: true,
+        camera: true,
+    };
+
     /// From a comma list of `class`, `scene` and `camera` (empty items ignored): None when it names
     /// none. An unknown item is an error naming it.
     pub fn parse(s: &str) -> Result<Option<Self>, String> {
@@ -466,6 +476,20 @@ pub struct BalanceNeed {
     pub camera_reviewed: Option<u64>,
 }
 
+/// How the queue sorts what it lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Order {
+    /// Most uncertain first ([`Uncertainty::key`], [`sort_items`]), after the auto filters' own
+    /// orders and `balance=`: what bulk actions, auto-label runs, previews and the CLI take.
+    #[default]
+    Uncertain,
+    /// The first frame of each event before any second one, then the balance of class, scene and
+    /// camera in bands, then the uncertainty ([`super::recommend`]). Only `GET /v1/review/next`
+    /// asks for it, without `auto=` and `balance=`; [`Filters::from_query`] never does.
+    Recommended,
+}
+
 /// Queue filters (`GET /v1/review/next?...`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filters {
@@ -489,6 +513,9 @@ pub struct Filters {
     /// ([`BalanceTally`], [`Uncertainty::balance`]); the usual order breaks ties. None = the usual
     /// order. Lists nothing more or less.
     pub balance: Option<Balance>,
+    /// How the listed frames are sorted. Not from the query ([`Self::from_query`] leaves it
+    /// [`Order::Uncertain`]): the Review tab's route sets it. Lists nothing more or less.
+    pub order: Order,
 }
 
 impl Filters {
@@ -497,7 +524,8 @@ impl Filters {
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
     /// overlaps|both|dismissed|refine`, `refine_kind` = `add|tighten|relabel|verify`, only with
     /// `auto=refine`, `balance` = a comma list of `class|scene|camera`, [`Balance::parse`]);
-    /// empty values mean "any". Errors name the field.
+    /// empty values mean "any". Errors name the field. Never reads `order`: the order is
+    /// [`Order::Uncertain`] for every caller but `GET /v1/review/next`, which sets it itself.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
@@ -583,7 +611,17 @@ impl Filters {
             wanted: None,
             refine_kind,
             balance,
+            order: Order::Uncertain,
         })
+    }
+
+    /// What the order balances by: every dimension under [`Order::Recommended`], else
+    /// [`Self::balance`].
+    pub fn balance_by(&self) -> Option<Balance> {
+        match self.order {
+            Order::Recommended => Some(Balance::ALL),
+            Order::Uncertain => self.balance,
+        }
     }
 
     /// [`Self::wanted`] as [`Wanted`].
@@ -900,6 +938,17 @@ impl Uncertainty {
         self
     }
 
+    /// [`Self::margin`] in hundredths, [`u32::MAX`] without a box: what the orders sort by.
+    pub(super) fn margin_hundredths(&self) -> u32 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a margin is a difference of scores in 0..=1, so 0..=100 hundredths"
+        )]
+        self.margin
+            .map_or(u32::MAX, |m| (m.clamp(0.0, 1.0) * 100.0).round() as u32)
+    }
+
     /// Sort key, most uncertain first: the strongest overlap suggestion (`auto=overlaps` only), the
     /// most agreed boxes (`auto=both` only), the strongest suggestion of the dataset check
     /// (`auto=refine` only), repeat-only frames last of all, then the highest balance need
@@ -907,14 +956,7 @@ impl Uncertainty {
     /// with no likely one are mostly false: an empty yard must not open the queue), then the margin
     /// in hundredths (no box last), verifier disagreement, more suppressed boxes.
     pub(super) fn key(&self) -> SortKey {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a margin is a difference of scores in 0..=1, so 0..=100 hundredths"
-        )]
-        let m = self
-            .margin
-            .map_or(u32::MAX, |m| (m.clamp(0.0, 1.0) * 100.0).round() as u32);
+        let m = self.margin_hundredths();
         (
             std::cmp::Reverse(self.overlap_strength),
             std::cmp::Reverse(self.agreed_boxes),
@@ -959,6 +1001,10 @@ pub struct Item {
     pub queued: bool,
     #[serde(flatten)]
     pub uncertainty: Uncertainty,
+    /// [`Order::Recommended`] only: the frame's place in its event, 0 = the first frame of the
+    /// event to review ([`super::recommend`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_rank: Option<u32>,
 }
 
 /// Sort most uncertain first ([`Uncertainty::key`]), then newest, then by path.
@@ -1168,14 +1214,18 @@ struct DayQueue {
     counts: Counts,
     labels: BTreeSet<String>,
     unreadable: u64,
-    /// With [`Filters::balance`]: the reviewed frames counted, and per item its wanted classes.
+    /// With [`Filters::balance_by`]: the reviewed frames counted, and per item its wanted classes.
     balance: BalanceTally,
     wanted: Vec<BTreeMap<String, u8>>,
+    /// [`Order::Recommended`]: every counted frame, listed ones by their index in `items`.
+    members: Vec<recommend::Member>,
 }
 
 /// The candidates of one day folder, read: the part of [`build`] that touches files.
 fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue {
     let mut q = DayQueue::default();
+    let balance = f.balance_by();
+    let recommended = f.order == Order::Recommended;
     for c in day {
         let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
             continue;
@@ -1186,7 +1236,7 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
         };
         let classes = frame_labels(&rec, labels.as_ref());
         let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
-        let wanted = f.balance.map(|_| {
+        let wanted = balance.map(|_| {
             let sure = frame_confidence(&rec, labels.as_ref());
             f.wanted_confidence(sure.iter().map(|(c, s)| (c.as_str(), *s)))
         });
@@ -1195,7 +1245,7 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
             continue;
         }
         q.counts.add(labels.as_ref());
-        if f.balance.is_some()
+        if balance.is_some()
             && let Some(l) = labels.as_ref().filter(|l| l.status == Status::Reviewed)
         {
             let trained = f.wanted_of(l.training().map(|b| b.label.as_str()));
@@ -1203,12 +1253,17 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
             q.balance.add(1, &c.scene, &c.camera, &trained, &proposed);
         }
         let status = labels.as_ref().map_or(Status::Unreviewed, |l| l.status);
-        if let StatusFilter::Is(s) = f.status
-            && s != status
-        {
-            continue;
+        let listed = !matches!(f.status, StatusFilter::Is(s) if s != status)
+            && f.auto_keeps(labels.as_ref());
+        if recommended {
+            q.members.push(recommend::Member {
+                ms: recommend::event_ms(&rec.timestamp),
+                import: rec.model == recommend::IMPORT_MODEL,
+                decided: status != Status::Unreviewed,
+                listed: listed.then_some(q.items.len()),
+            });
         }
-        if !f.auto_keeps(labels.as_ref()) {
+        if !listed {
             continue;
         }
         let (refine_open, refine_strength) = f.refine_open(labels.as_ref());
@@ -1229,6 +1284,7 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
             status,
             queued: c.queued,
             uncertainty,
+            event_rank: None,
         });
         q.wanted.extend(wanted);
     }
@@ -1274,7 +1330,14 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
     });
     let mut seen_labels = BTreeSet::new();
     let (mut tally, mut wanted) = (BalanceTally::default(), Vec::new());
-    for part in parts {
+    let mut events = recommend::Events::default();
+    for mut part in parts {
+        // Each part is one day folder: its members' indices move by the items before it.
+        let at = q.items.len();
+        for m in &mut part.members {
+            m.listed = m.listed.map(|i| i + at);
+        }
+        events.add_day(&mut part.members);
         q.items.extend(part.items);
         q.counts.merge(part.counts);
         seen_labels.extend(part.labels);
@@ -1282,14 +1345,43 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
         tally.merge(part.balance);
         wanted.extend(part.wanted);
     }
-    if let Some(by) = f.balance {
+    if let Some(by) = f.balance_by() {
         weigh(&mut q.items, &wanted, &tally, by);
         q.balance = Some(tally);
     }
-    sort_items(&mut q.items);
+    match f.order {
+        Order::Uncertain => sort_items(&mut q.items),
+        Order::Recommended => q.items = recommended(std::mem::take(&mut q.items), &events),
+    }
     q.cameras = cameras.into_iter().collect();
     q.labels = seen_labels.into_iter().collect();
     q
+}
+
+/// `items` (weighed, [`weigh`]) in the Recommended order of `events`, each with its event rank
+/// ([`recommend::arrange`]; ties as [`sort_items`]: newest, then by path).
+fn recommended(items: Vec<Item>, events: &recommend::Events) -> Vec<Item> {
+    let keys: Vec<recommend::Key> = items
+        .iter()
+        .map(|i| recommend::key(&i.uncertainty, 0))
+        .collect();
+    let tie = |a: usize, b: usize| match (items.get(a), items.get(b)) {
+        (Some(a), Some(b)) => b
+            .timestamp
+            .cmp(&a.timestamp)
+            .then_with(|| a.frame.cmp(&b.frame)),
+        _ => a.cmp(&b),
+    };
+    let order = recommend::arrange(events, &keys, &tie);
+    let mut slots: Vec<Option<Item>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|(i, rank)| {
+            let mut item = slots.get_mut(i)?.take()?;
+            item.event_rank = Some(rank);
+            Some(item)
+        })
+        .collect()
 }
 
 /// Reviewed boxes of one class ([`Tally::coverage`]).
@@ -1559,6 +1651,7 @@ mod tests {
             status: Status::Unreviewed,
             queued: true,
             uncertainty: u,
+            event_rank: None,
         }
     }
 
@@ -1704,6 +1797,14 @@ mod tests {
             )
         };
         assert_eq!(q(&[]).unwrap(), Filters::default());
+        // `order` is the Review tab route's alone: bulk actions and auto-label runs that pass
+        // a page's query on keep the uncertainty order, and a bad value refuses nothing here.
+        for order in ["recommended", "uncertain", "nonsense"] {
+            let f = q(&[("order", order)]).unwrap();
+            assert_eq!(f.order, Order::Uncertain, "{order}");
+            assert_eq!(f, Filters::default(), "{order}");
+        }
+        assert_eq!(Filters::default().order, Order::Uncertain);
         let f = q(&[
             ("bucket", "near_threshold"),
             ("scene", "ir"),
@@ -3151,6 +3252,7 @@ mod tests {
                 status,
                 queued: c.queued,
                 uncertainty,
+                event_rank: None,
             });
         }
         sort_items(&mut q.items);

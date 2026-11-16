@@ -1343,7 +1343,8 @@ deleted automatically; confirmed empty frames (hard negatives) come only from th
 `status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
 `label=person|car` = frames with any of these classes; the queue's `label=` takes a comma list;
 docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
-queue's order (most uncertain first). The Review tab's button sends its own filters.
+queue's uncertainty order (most uncertain first), not the Review tab's default *Recommended* order, which only
+`GET /v1/review/next` uses. The Review tab's button sends its own filters.
 
 **Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler, classes}` in its label
 file (a frame without one gets its pre-fill plus the marker). Only frames whose boxes changed are queued

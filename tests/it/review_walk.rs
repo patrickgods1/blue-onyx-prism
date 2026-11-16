@@ -26,7 +26,7 @@ use blue_onyx_prism::collect::labels::bulk::{self, Wanted};
 use blue_onyx_prism::collect::labels::index;
 use blue_onyx_prism::collect::labels::overlaps::{Suggestion, Verdict};
 use blue_onyx_prism::collect::labels::queue::{
-    self, AutoFilter, Candidate, Filters, QueueSource, StatusFilter,
+    self, AutoFilter, Candidate, Filters, Order, QueueSource, StatusFilter,
 };
 use blue_onyx_prism::collect::labels::{
     self, AutoInfo, AutoRun, BoxState, LabelBox, LabelFile, MAX_LABEL_FILE_BYTES,
@@ -438,11 +438,20 @@ fn walks(dir: &Path) -> Vec<Walk<'_>> {
         camera: Some(CAMERAS[0].to_string()),
         ..default.clone()
     };
+    // What the Review tab opens on: the Recommended order of the default filters.
+    let recommended = Filters {
+        order: Order::Recommended,
+        ..default.clone()
+    };
     vec![
         ("build", Box::new(move || next(dir, &default))),
         ("build_all", Box::new(move || next(dir, &every))),
         ("build_overlaps", Box::new(move || next(dir, &overlaps))),
         ("build_one_camera", Box::new(move || next(dir, &one_camera))),
+        (
+            "build_recommended",
+            Box::new(move || next(dir, &recommended)),
+        ),
         ("tally", Box::new(move || queue::tally(dir).frames as usize)),
         ("scan", Box::new(move || Summary::scan(dir).frames as usize)),
         (
@@ -737,12 +746,28 @@ fn indexed(dir: &Path, every: &Filters) {
         camera: Some(CAMERAS[0].to_string()),
         ..every.clone()
     };
+    // The Recommended order sorts every listed frame: the default page (queue, unreviewed) and wider.
+    let recommended = |f: Filters| Filters {
+        order: Order::Recommended,
+        ..f
+    };
+    let unreviewed_again = unreviewed.clone();
+    let recommended_page = recommended(Filters {
+        wanted: every.wanted.clone(),
+        ..Filters::default()
+    });
     let queries = [
         ("status unreviewed", unreviewed),
         ("status any", every.clone()),
         ("auto=overlaps", with_auto(AutoFilter::Overlaps)),
         ("auto=both", with_auto(AutoFilter::Both)),
         ("one camera", one_camera),
+        ("recommended, page default", recommended_page),
+        (
+            "recommended, status unreviewed",
+            recommended(unreviewed_again),
+        ),
+        ("recommended, status any", recommended(every.clone())),
     ];
     println!("\n| index query | first ms | warm ms | frames listed |\n|---|---|---|---|");
     for (name, f) in &queries {
@@ -750,6 +775,22 @@ fn indexed(dir: &Path, every: &Filters) {
         let n = a.as_ref().map_or(0, |a| a.total);
         let rest = warm(|| ask(dir, f, None).0);
         println!("| {name} | {:.2} | {:.2} | {n} |", ms(first), ms(rest));
+    }
+    // Next on the default page: after its first frame (the pivot is looked up in the order).
+    let page = recommended(Filters {
+        wanted: every.wanted.clone(),
+        ..Filters::default()
+    });
+    if let Some(first) = ask(dir, &page, None)
+        .1
+        .and_then(|a| a.item)
+        .map(|i| i.frame)
+    {
+        let rest = warm(|| ask(dir, &page, Some(&first)).0);
+        println!(
+            "| recommended, page default, after its first | - | {:.2} | - |",
+            ms(rest)
+        );
     }
     let walked = timed(|| index::Answer::walk(dir, every, None)).0;
     println!(

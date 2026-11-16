@@ -274,7 +274,8 @@ pub(super) fn walk_point(dir: &Path) {
 mod cases {
     use super::super::super::bulk::{self, Wanted};
     use super::super::super::overlaps::{Suggestion, Verdict};
-    use super::super::super::queue::{self, AutoFilter, Filters, QueueSource, StatusFilter};
+    use super::super::super::queue::{self, AutoFilter, Filters, Order, QueueSource, StatusFilter};
+    use super::super::super::recommend;
     use super::super::super::refine;
     use super::super::super::{
         AutoInfo, AutoRun, BoxState, Frame, LABELS_SUFFIX, LabelBox, LabelFile, Origin,
@@ -370,6 +371,20 @@ mod cases {
         [200.0, 10.0, 260.0, 90.0],
     ];
 
+    /// The sidecar times of the made-up frames ([`sidecar`]).
+    const TIMES: [&str; 10] = [
+        "2026-10-21T00:00:00Z",
+        "2026-10-21T00:00:01Z",
+        "2026-10-21T00:00:01Z",
+        "2026-10-21T00:00:40.500Z",
+        "2026-10-21T00:02:00Z",
+        "2026-10-21T00:02:30Z",
+        "2026-10-21T03:00:00Z",
+        "2026-10-21T03:00:59.999Z",
+        "2026-10-21T23:59:59Z",
+        "half past nine",
+    ];
+
     fn wanted_a() -> (Vec<String>, Vec<String>) {
         let classes = ["person", "car", "dog", "truck", "motorcycle"];
         (classes.map(String::from).to_vec(), Vec::new())
@@ -395,10 +410,15 @@ mod cases {
         r.id = stem.into();
         r.scene = scene.into();
         r.camera = camera.into();
-        // Few values: ties that only the path breaks.
-        r.timestamp = format!("2026-10-21T00:00:0{}Z", rng.below(4));
+        // Few values: ties that only the path breaks, and events of the Recommended order: frames
+        // seconds apart, gaps of over a minute, hours apart, a time that does not parse.
+        r.timestamp = TIMES[rng.below(TIMES.len())].into();
         r.threshold = 0.5;
-        r.model = format!("m{}", rng.below(3));
+        // Now and then an imported frame: an event of its own.
+        r.model = match rng.below(12) {
+            11 => recommend::IMPORT_MODEL.into(),
+            n => format!("m{}", n % 3),
+        };
         let n = rng.below(4);
         r.buckets = (0..n).map(|_| rng.pick(&Bucket::ALL)).collect();
         if rng.one_in(8) {
@@ -932,6 +952,76 @@ mod cases {
         (on_drive, on_lane)
     }
 
+    /// A camera's steady activity for the Recommended order: 14 frames 50 s apart on one day
+    /// folder, queued and indexed, so the first 13 span 600 s and the 14th starts another event;
+    /// the 1st and 4th reviewed, the 6th skipped, the others unreviewed. The frames, in time order.
+    fn event_frames(dir: &Path, seed: u64, rels: &mut Vec<String>) -> Vec<String> {
+        let mut rng = Rng::new(seed ^ 0xe7e);
+        let mut index = String::new();
+        let mut chain = Vec::new();
+        for i in 0..14u32 {
+            let status = match i {
+                0 | 3 => Status::Reviewed,
+                5 => Status::Skipped,
+                _ => Status::Unreviewed,
+            };
+            let f = LabelFile {
+                status,
+                reviewed_at: (status != Status::Unreviewed).then(|| "2026-10-22T00:00:00Z".into()),
+                ..LabelFile::default()
+            };
+            // Stems out of time order: the event is by time, not by name.
+            let rel = format!(
+                "night/street/2026-10-21/20261021T{:06}000Z_e{i}.jpg",
+                (i * 7) % 14
+            );
+            let mut rec = put(dir, &mut rng, &rel, Some(&f));
+            let secs = 5 * 3600 + 50 * i;
+            rec.timestamp = format!(
+                "2026-10-21T{:02}:{:02}:{:02}.000Z",
+                secs / 3600,
+                secs / 60 % 60,
+                secs % 60
+            );
+            rec.model = "m0".into();
+            let frame = Frame::resolve(dir, &rel).unwrap();
+            std::fs::write(&frame.sidecar, serde_json::to_vec(&rec).unwrap()).unwrap();
+            index.push_str(&index_line(&rec));
+            index.push('\n');
+            rels.push(rel.clone());
+            chain.push(rel);
+        }
+        std::fs::write(dir.join("night/street/2026-10-21").join(INDEX_FILE), index).unwrap();
+        layout::append_review(dir, &chain).unwrap();
+        // Twins, each alone in its day folder: the same key and time, only the path tells them
+        // apart.
+        let mut twin = sidecar(&mut rng, "night", "street", "20261021T090000000Z_twin");
+        twin.timestamp = "2026-10-21T09:00:00.000Z".into();
+        twin.model = "m1".into();
+        let mut twins = Vec::new();
+        for date in ["2026-10-22", "2026-10-23"] {
+            let rel = format!("night/street/{date}/{}.jpg", twin.id);
+            let day = dir.join("night/street").join(date);
+            std::fs::create_dir_all(&day).unwrap();
+            std::fs::write(day.join(format!("{}.jpg", twin.id)), b"x").unwrap();
+            std::fs::write(
+                day.join(format!("{}.json", twin.id)),
+                serde_json::to_vec(&twin).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                day.join(format!("{}{LABELS_SUFFIX}", twin.id)),
+                serde_json::to_vec(&LabelFile::default()).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(day.join(INDEX_FILE), format!("{}\n", index_line(&twin))).unwrap();
+            rels.push(rel.clone());
+            twins.push(rel);
+        }
+        layout::append_review(dir, &twins).unwrap();
+        chain
+    }
+
     /// The filters the comparison runs: every source x status x auto filter, and each other
     /// filter on its own, with `wanted`.
     fn grid(wanted: &(Vec<String>, Vec<String>)) -> Vec<Filters> {
@@ -1045,7 +1135,62 @@ mod cases {
             auto: Some(AutoFilter::Overlaps),
             ..all.clone()
         });
+        // The Recommended order: every source x status, and with each other filter.
+        let recommended = Filters {
+            order: Order::Recommended,
+            ..all.clone()
+        };
+        for source in [QueueSource::Queue, QueueSource::All] {
+            for status in statuses {
+                out.push(Filters {
+                    source,
+                    status,
+                    ..recommended.clone()
+                });
+            }
+        }
+        for camera in ["street", "gate", "elsewhere"] {
+            out.push(Filters {
+                camera: Some(camera.into()),
+                status: StatusFilter::Is(Status::Unreviewed),
+                ..recommended.clone()
+            });
+        }
+        for labels in [&["person"][..], &["car", "dog"]] {
+            out.push(Filters {
+                label: labels.iter().map(|l| (*l).to_string()).collect(),
+                ..recommended.clone()
+            });
+        }
+        for b in [Bucket::Positive, Bucket::Empty, Bucket::NearThreshold] {
+            out.push(Filters {
+                bucket: Some(b),
+                source: QueueSource::Queue,
+                status: StatusFilter::Is(Status::Unreviewed),
+                ..recommended.clone()
+            });
+        }
+        out.push(Filters {
+            scene: Some("night".into()),
+            ..recommended
+        });
         out
+    }
+
+    /// The Recommended order of `all_any`, and of what the Review tab opens on by default.
+    fn recommended_all() -> Filters {
+        Filters {
+            order: Order::Recommended,
+            ..all_any()
+        }
+    }
+
+    fn recommended_default() -> Filters {
+        Filters {
+            order: Order::Recommended,
+            wanted: Some(wanted_a()),
+            ..Filters::default()
+        }
     }
 
     /// Every filter's whole order: `all_any` balanced by everything.
@@ -1116,7 +1261,8 @@ mod cases {
     /// The folder holds what the comparison is meant to cover: every auto filter lists frames,
     /// there are unreadable frames, gone frames whose camera still counts, ties only the path
     /// breaks, queued and unqueued frames, every status, notes and frames of several pages.
-    fn covers_every_case(dir: &Path) {
+    fn covers_every_case(dir: &Path, chain: &[String]) {
+        covers_events(dir, chain);
         let all = all_any();
         let built = queue::build(dir, &all);
         assert!(built.items.len() > 60, "{}", built.items.len());
@@ -1197,6 +1343,76 @@ mod cases {
             );
         }
         assert!(layout::damaged_lines(dir, true) >= 2);
+    }
+
+    /// The folder holds what the Recommended order is about: imported frames and frames with no
+    /// time (events of their own), a day folder with several events of chained frames, an event
+    /// the span cap ends ([`event_frames`]), decided frames that raise the rank of their event's
+    /// listed ones, and ties of key and time.
+    fn covers_events(dir: &Path, chain: &[String]) {
+        let built = queue::build(dir, &recommended_all());
+        let items = &built.items;
+        assert!(items.iter().all(|i| i.event_rank.is_some()));
+        assert!(items.iter().any(|i| i.model == recommend::IMPORT_MODEL));
+        assert!(
+            items
+                .iter()
+                .any(|i| recommend::event_ms(&i.timestamp).is_none())
+        );
+        // A day folder with two or more events of frames that chain.
+        let mut firsts: BTreeMap<&str, usize> = BTreeMap::new();
+        for i in items {
+            if i.event_rank == Some(0)
+                && i.model != recommend::IMPORT_MODEL
+                && recommend::event_ms(&i.timestamp).is_some()
+            {
+                *firsts.entry(queue::day_of(&i.frame)).or_default() += 1;
+            }
+        }
+        assert!(
+            firsts
+                .iter()
+                .any(|(day, n)| *n >= 2 && !day.contains("street")),
+            "{firsts:?}"
+        );
+        // Every frame of the chain is listed: 13 in the first event, the 14th alone.
+        let rank = |items: &[queue::Item], rel: &str| {
+            items
+                .iter()
+                .find(|i| i.frame == rel)
+                .and_then(|i| i.event_rank)
+        };
+        let ranks: Vec<u32> = chain.iter().filter_map(|r| rank(items, r)).collect();
+        assert_eq!(ranks.len(), 14);
+        assert_eq!(ranks[13], 0, "the span cap starts an event: {ranks:?}");
+        assert_eq!(ranks[..13].iter().max(), Some(&12), "{ranks:?}");
+        // Unreviewed only: the three decided frames of the first event come before its others.
+        let unreviewed = queue::build(
+            dir,
+            &Filters {
+                status: StatusFilter::Is(Status::Unreviewed),
+                ..recommended_all()
+            },
+        );
+        let first: Vec<u32> = chain[..13]
+            .iter()
+            .filter_map(|r| rank(&unreviewed.items, r))
+            .collect();
+        assert_eq!(first.len(), 10, "{first:?}");
+        assert_eq!(first.iter().min(), Some(&3), "{first:?}");
+        assert_eq!(rank(&unreviewed.items, &chain[13]), Some(0));
+        // Ties of the whole key and the time, which only the path breaks.
+        let keys: Vec<recommend::Key> = items
+            .iter()
+            .map(|i| recommend::key(&i.uncertainty, i.event_rank.unwrap()))
+            .collect();
+        assert!(
+            items
+                .windows(2)
+                .zip(keys.windows(2))
+                .any(|(w, k)| k[0] == k[1] && w[0].timestamp == w[1].timestamp),
+            "no tie for the path to break"
+        );
     }
 
     /// Next after next through the whole queue: the index's order is the walk's, ties included.
@@ -1451,11 +1667,22 @@ mod cases {
             let foreign = seed == 3;
             let mut rels = generate(&dir, seed, 120, foreign);
             let (on_drive, on_lane) = precision_frames(&dir, seed, &mut rels);
+            let chain = event_frames(&dir, seed, &mut rels);
             let mut rng = Rng::new(seed ^ 0xabc);
             let (a, b) = (wanted_a(), wanted_b());
-            covers_every_case(&dir);
+            covers_every_case(&dir, &chain);
             same_answers(&dir, &a, &rels, &format!("seed {seed}, built"));
             same_order(&dir, &all_any(), &format!("seed {seed}, built"));
+            same_order(
+                &dir,
+                &recommended_all(),
+                &format!("seed {seed}, built, recommended"),
+            );
+            same_order(
+                &dir,
+                &recommended_default(),
+                &format!("seed {seed}, built, default"),
+            );
             let refine_all = Filters {
                 auto: Some(AutoFilter::Refine),
                 ..all_any()
@@ -1506,6 +1733,16 @@ mod cases {
                 &refine_all,
                 &format!("seed {seed}, real writes, refine"),
             );
+            same_order(
+                &dir,
+                &recommended_all(),
+                &format!("seed {seed}, real writes, recommended"),
+            );
+            same_order(
+                &dir,
+                &recommended_default(),
+                &format!("seed {seed}, real writes, default"),
+            );
 
             // Another class list: another index, built anew.
             let before = index_of(&dir).unwrap();
@@ -1527,6 +1764,16 @@ mod cases {
             index_of(&dir).unwrap().pass(Pass::Full, &|| {});
             same_answers(&dir, &a, &rels, &format!("seed {seed}, full pass"));
             same_order(&dir, &all_any(), &format!("seed {seed}, full pass"));
+            same_order(
+                &dir,
+                &recommended_all(),
+                &format!("seed {seed}, full pass, recommended"),
+            );
+            same_order(
+                &dir,
+                &recommended_default(),
+                &format!("seed {seed}, full pass, default"),
+            );
         }
     }
 

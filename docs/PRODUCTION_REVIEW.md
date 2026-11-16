@@ -3948,6 +3948,24 @@ So the 64 MB budget holds about 370,000 frames and the 128 MB ceiling about 740,
 
 A synthetic 300k folder in `index/tests.rs` is 37 MB (123 bytes a frame), under the 64 MB budget. The rows hold no box geometry: `auto=overlaps`, `auto=both` and the overlap strength are computed for the wanted classes at index time, and a class change rebuilds. Process memory (RR-P4) is not the index alone.
 
+### Recommended order (dataset defaults, P4)
+
+*Windows 11, the dev box (GTX 1070 Ti Blue Iris machine), NTFS in the temp folder, release build, 2026-11-16. `BOP_WALK_FRAMES=10000,50000 cargo test --release --test it review_walk -- --ignored --nocapture`. Same generator: its times are uniform over each day, so most events are one frame; the cost is the sort, not the event shape.*
+
+The Recommended order (`collect/labels/recommend.rs`) cannot use the index's one-pass top-K: a frame's event rank depends on the other frames of its event. So its query keeps every counted row's time and every listed row's key, builds the events per day folder and sorts the listed rows twice (by event, then by the whole key), then finds `after` in that order.
+
+| | 10k | 50k |
+|---|---|---|
+| Next, page default (queue, unreviewed), uncertainty order, from the index | 4.0 ms | 9.9 ms |
+| Next, page default, Recommended, from the index | 15.6 ms | 77.7 ms |
+| the same after its first frame (`after` looked up in the order) | 15.5 ms | 77.5 ms |
+| Next, any status, Recommended, from the index | 17.1 ms | 83.7 ms |
+| `queue::build`, page default, uncertainty order, warm | 1064 ms | 5096 ms |
+| `queue::build`, page default, Recommended, warm | 1103 ms | 5218 ms |
+| index build, in the background | 1.2 s | 5.6 s |
+
+So a Next is about 8 times dearer than in the uncertainty order and still under the 300 ms goal at 50k; at 200k it would be about 0.3 to 0.4 s if it grows linearly with a little extra for the sort. The walk barely changes (+2%): its sort was already there, and the file work dominates.
+
 ### Build times
 
 *Same machine, private target folder, `cargo` 1.99, default `ld`, 2026-11-06. Each row is the range of 3 or 4 runs.*
