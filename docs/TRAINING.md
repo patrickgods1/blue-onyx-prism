@@ -2675,6 +2675,50 @@ Per frame on the M1 (from the script's `ms` per frame): MM-Grounding-DINO tiny 1
 0.17-0.8 s, Qwen3-VL 2B 1-3 s per frame with checked crops, SigLIP 2 about 1.8 s for the first frame
 with animals (the text prompts are computed once).
 
+## Train area
+
+### Next step
+
+The strip under the Train area's tabs (`GET /v1/train/summary`, `train_area::next_step`) shows the counts and
+one suggested action, the first rule that applies: a job on the queue, the folder under review missing, a
+finished model nobody decided about, nothing collected yet, then:
+
+1. **Answer the dataset check** (`answer_check`): open `relabel` and `add` suggestions on reviewed frames,
+   e.g. *The dataset check found 5 likely fixes on reviewed frames (2 wrong classes, 3 missing boxes). Answer
+   them before you export: wrong classes hurt a model most.* (a zero part is left out), linking
+   `/train/review?auto=refine`. It comes before both export rules: a wrong class costs a model the most per
+   error, a missing box is the commonest error, and both would reach the export as they are. Verify and
+   tighten suggestions get no nudge. The count is the Refine tab's `open` (`server::refine::open_cached`):
+   the strip never waits for its walk; it shows the kept count, however old, and a missing or stale one
+   starts a walk on its own thread (one per folder and class list, never two walks at once), so the step
+   appears on a later poll.
+2. Enough new reviewed frames to export (50), then frames to auto-label or review. The review step counts
+   effort in boxes: *M boxes on N frames to review.* when every frame to review has a label file, else *N
+   frames (M boxes) to review.*, since boxes only a sidecar proposes are not counted (`Tally.unfiled_to_review`).
+3. **Run the dataset check** (`run_check`), once nothing is left to review: when this machine can train, at
+   least `refine::MIN_FRAMES` (40) reviewed frames on 2 camera days or more (`Tally::reviewed_camera_days`,
+   (camera, date) from the frame's path as the check groups them), and no check yet or the last one selected
+   under three quarters of the reviewed frames (`frames_selected` of the newer of `refine/report.json` and
+   `refine/report-quick.json` by `created`): *N reviewed frames since the last dataset check. A check finds
+   some wrong labels before you train.* With a model trained here that the quick check can use, the link is
+   *Quick check* (`/train/refine#quick-check` opens the form on it) and the text adds that it takes minutes;
+   else *Run the check* (`/train/refine#refine-check`).
+4. Any reviewed frames not exported, a failed run, an export not trained on, and otherwise *All caught up*.
+
+The link is hidden on its own tab unless it asks for a list or card the page is not on (Review's
+`?auto=refine`, Refine's `#quick-check`).
+
+### Review pace in boxes
+
+The Review tab's session line counts effort in boxes, since active-learning gains largely vanish when
+effort is counted in boxes rather than images: *Session 23 frames · 64 boxes, 2.8 a minute · 82% accepted
+· 37 min*. Boxes = boxes pending when the frame was served that the save decides, a box made by accepting a
+suggestion, and boxes drawn by hand (`ReviewRules.boxDecisions`, node-tested); a box decided before the
+visit (a frame seen again with `p`), a duplicate, a too-small box, a dismissal, a parked spot's accept and a
+"don't want" box the save rejects unseen are no decision. A minute is the frames' own time (load to save,
+at most 10 min each), so breaks do not count. *% accepted* is over the same decided boxes. The *Going fast*
+note (the last 10 frames much faster while accepting more) and the break note every 45 min are unchanged.
+
 ## Command line
 
 ```sh

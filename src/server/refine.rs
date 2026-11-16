@@ -7,8 +7,9 @@
 //!   than this build) and `refine/report-quick.json` of the last quick check (`quick_report`,
 //!   `quick_report_problem`), the open suggestions
 //!   per kind (a walk of the label files, off the async workers, kept 60 s per folder and class
-//!   list and dropped when a check starts or ends), the check in the queue, the newest finished one,
-//!   and what the form needs of this machine;
+//!   list and dropped when a check starts or ends; the Train area's strip reads them through
+//!   [`open_cached`], which never waits for a walk), the check in the queue, the newest finished
+//!   one, and what the form needs of this machine;
 //! - `GET /v1/refine/preview`: what a check would do ([`refine::preview`]), no GPU, download or
 //!   write;
 //! - `POST /v1/refine/check`: plans the check, hands it the registry's runtimes for the fold models'
@@ -51,7 +52,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -201,12 +202,7 @@ static WALKING: Mutex<()> = Mutex::new(());
 /// [`count_open`], kept [`OPEN_TTL`]. `stamp` names the checks on the queue (ids and states): when
 /// one starts, ends or is cancelled the kept answer is dropped.
 fn open_counts(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -> Open {
-    let key = format!(
-        "{}\u{1f}{}\u{1f}{}",
-        dir.display(),
-        classes.join("\u{1e}"),
-        hidden.join("\u{1e}")
-    );
+    let key = open_key(dir, classes, hidden);
     let fresh = |k: &Kept| k.at.elapsed() < OPEN_TTL && k.stamp == stamp;
     if let Some(k) = OPEN.lock_recover().get(&key).filter(|k| fresh(k)) {
         return k.open.clone();
@@ -226,6 +222,71 @@ fn open_counts(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -
         },
     );
     open
+}
+
+/// The key of a walk's answer in [`OPEN`]: the folder and both class lists.
+fn open_key(dir: &Path, classes: &[String], hidden: &[String]) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        dir.display(),
+        classes.join("\u{1e}"),
+        hidden.join("\u{1e}")
+    )
+}
+
+/// Keys whose walk [`open_cached`] started and that has not ended: one background walk per key.
+static REFRESHING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Takes `key` out of [`REFRESHING`] when dropped, panic included, so a failed walk does not stop
+/// the next one.
+struct Refreshed(String);
+
+impl Drop for Refreshed {
+    fn drop(&mut self) {
+        REFRESHING.lock_recover().remove(&self.0);
+    }
+}
+
+/// [`open_counts`] for a caller that must not wait (the Train area's strip): the kept answer,
+/// however old or whatever the queue did since (None before the first walk); when it is missing or
+/// no longer fresh, a walk starts on its own thread, at most one per key, and it still waits its turn
+/// on [`WALKING`], so never two walks at once. The next call finds its answer.
+pub(super) fn open_cached(
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    stamp: &str,
+) -> Option<Open> {
+    let key = open_key(dir, classes, hidden);
+    let kept = OPEN.lock_recover().get(&key).map(|k| {
+        (
+            k.open.clone(),
+            k.at.elapsed() < OPEN_TTL && k.stamp == stamp,
+        )
+    });
+    if kept.as_ref().is_some_and(|(_, fresh)| *fresh) {
+        return kept.map(|(open, _)| open);
+    }
+    if REFRESHING.lock_recover().insert(key.clone()) {
+        // Moved into the thread; dropped with the closure when the thread does not start.
+        let done = Refreshed(key);
+        let (dir, classes, hidden, stamp) = (
+            dir.to_path_buf(),
+            classes.to_vec(),
+            hidden.to_vec(),
+            stamp.to_string(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("refine-open".into())
+            .spawn(move || {
+                let _done = done;
+                open_counts(&dir, &classes, &hidden, &stamp);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("could not start counting the dataset check's open suggestions: {e}");
+        }
+    }
+    kept.map(|(open, _)| open)
 }
 
 /// Drop every kept count: a label write (the static spots' bulk accept) changed what a walk
@@ -264,6 +325,32 @@ pub(super) fn read_quick_report(dir: &Path) -> (Option<RefineReport>, Option<Str
 /// quick check's; each says which it is by its `mode`.
 pub(super) fn recall_report(dir: &Path) -> Option<RefineReport> {
     read_report(dir).0.or_else(|| read_quick_report(dir).0)
+}
+
+/// The frames the last check of `dir` selected (`frames_selected` of the newer of the full and the
+/// quick check's reports, by `created`, as the Findings card picks it: `RefineFloor.reports`);
+/// None when neither reads.
+pub(super) fn check_covered(dir: &Path) -> Option<u64> {
+    let (full, quick) = (read_report(dir).0, read_quick_report(dir).0);
+    let newer = match (full, quick) {
+        (Some(f), Some(q)) => {
+            if q.created > f.created {
+                q
+            } else {
+                f
+            }
+        }
+        (Some(r), None) | (None, Some(r)) => r,
+        (None, None) => return None,
+    };
+    Some(newer.frames_selected as u64)
+}
+
+/// A configured model a quick check can use exists ([`quick_models`], kept [`MODELS_TTL`]).
+pub(super) fn quick_model_ready(config: &Config, revision: u64) -> bool {
+    !quick_models(&MODELS, config, revision, MODELS_TTL)
+        .0
+        .is_empty()
 }
 
 /// The report at `path`, as [`read_report`] reads it.
@@ -1541,6 +1628,88 @@ mod tests {
         assert_eq!(open_counts(&review, &classes, &none, "").add, 1);
         // ... but a check starting or ending drops it.
         assert_eq!(open_counts(&review, &classes, &none, "t1:running").add, 2);
+    }
+
+    /// [`open_cached`] until it answers `want` (a walk on its own thread), at most a minute.
+    fn cached_until(review: &Path, classes: &[String], stamp: &str, want: usize) -> Open {
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(o) = open_cached(review, classes, &[], stamp).filter(|o| o.add == want) {
+                return o;
+            }
+            assert!(Instant::now() < until, "no count of {want} in 60 s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The strip's read never waits: nothing before the first walk, then the kept answer, and a
+    /// stale one at once while the next walk runs on its own thread.
+    #[test]
+    fn the_cached_counts_never_wait_and_a_stale_answer_starts_a_walk() {
+        let dir = scratch();
+        let review = dir.join("dataset");
+        frame_with(
+            &review,
+            "patio",
+            "c1",
+            vec![suggestion(Kind::Add, None, Some(FAR))],
+        );
+        let classes = vec!["car".to_string()];
+        let first = open_cached(&review, &classes, &[], "").map(|o| o.add);
+        assert!(matches!(first, Some(1) | None), "{first:?}");
+        assert_eq!(cached_until(&review, &classes, "", 1).frames, 1);
+        frame_with(
+            &review,
+            "patio",
+            "c2",
+            vec![suggestion(Kind::Add, None, Some(FAR))],
+        );
+        // Fresh: the kept answer, no walk (None only when another test dropped every kept count:
+        // `forget_counts` is process-wide).
+        let fresh = open_cached(&review, &classes, &[], "").map(|o| o.add);
+        assert!(matches!(fresh, Some(1) | None), "{fresh:?}");
+        // A check started: the old answer at once, the new one once its walk is done.
+        let stale = open_cached(&review, &classes, &[], "t1:running").map(|o| o.add);
+        assert!(matches!(stale, Some(1 | 2) | None), "{stale:?}");
+        assert_eq!(cached_until(&review, &classes, "t1:running", 2).add, 2);
+        // Many readers at once: none waits for a walk, and the one walk they start answers.
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let (review, classes) = (review.clone(), classes.clone());
+                std::thread::spawn(move || open_cached(&review, &classes, &[], "t1:done"))
+            })
+            .collect();
+        for r in readers {
+            let got = r.join().unwrap().map(|o| o.add);
+            assert!(matches!(got, Some(2) | None), "{got:?}");
+        }
+        assert_eq!(cached_until(&review, &classes, "t1:done", 2).add, 2);
+    }
+
+    /// The covered count is the newer report's selection, whichever mode wrote it.
+    #[test]
+    fn the_last_check_covers_the_newer_reports_frames() {
+        let dir = scratch();
+        let review = dir.join("dataset");
+        std::fs::create_dir_all(&review).unwrap();
+        assert_eq!(check_covered(&review), None);
+        let put = |mode: Mode, created: &str, frames: usize| {
+            let mut r: RefineReport = serde_json::from_value(report_json()).unwrap();
+            r.created = created.into();
+            r.mode = mode;
+            r.frames_selected = frames;
+            r.write(&review).unwrap();
+        };
+        put(Mode::Folds, "2026-11-11T10:00:00Z", 120);
+        assert_eq!(check_covered(&review), Some(120));
+        put(Mode::Model, "2026-11-10T10:00:00Z", 30);
+        assert_eq!(check_covered(&review), Some(120), "the full check is newer");
+        put(Mode::Model, "2026-11-12T10:00:00Z", 150);
+        assert_eq!(
+            check_covered(&review),
+            Some(150),
+            "the quick check is newer"
+        );
     }
 
     #[test]

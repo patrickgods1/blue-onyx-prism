@@ -145,6 +145,40 @@
     ((labels && labels.boxes) || []).forEach(function (b, i) { b._n = i; });
   }
 
+  // A saved box that is no verdict on an object, left out of the session's box count and
+  // acceptance: a duplicate or a too-small box, a dismissal nobody judged, a parked spot's
+  // automatic accept, and a box of a "don't want" class the save rejected unseen (`other_class`).
+  function noVerdict(b) {
+    return b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' ||
+      isDismissal(b.reason) || b.reason === 'parked_spot' || b.reason === 'other_class';
+  }
+
+  // The reviewer's box decisions on one visit, for the session line (no Rust twin; page only).
+  // `served`: the boxes as GET /v1/review/labels served them (marked by `markServed`), `saved`:
+  // the boxes as the save sends them, `_n` still on them. Decided = a box pending when served
+  // that the save accepts or rejects (`resolved`), plus a new box the page made from a
+  // suggestion (no `_n`, not drawn); drawn = a new box drawn by hand (`source: human`, no `_n`).
+  // A box decided before this visit is not counted again. {decided, accepted, rejected, drawn}.
+  function boxDecisions(served, saved) {
+    var out = { decided: 0, accepted: 0, rejected: 0, drawn: 0 };
+    (saved || []).forEach(function (b) {
+      var isNew = typeof b._n !== 'number';
+      if (isNew && b.source === 'human') {
+        if (resolved(b) === 'added') out.drawn++;
+        return;
+      }
+      if (b.source === 'human' || noVerdict(b)) return;
+      var was = isNew ? null : (served || [])[b._n];
+      if (!isNew && !(was && was.state === 'pending')) return;
+      var r = resolved(b);
+      if (r === 'accepted') out.accepted++;
+      else if (r === 'rejected') out.rejected++;
+      else return;
+      out.decided++;
+    });
+    return out;
+  }
+
   // Where the box served at index `n` is now, -1 if it went.
   function servedAt(bs, n) {
     for (var k = 0; k < bs.length; k++) if (bs[k]._n === n) return k;
@@ -906,6 +940,7 @@
     dupDrops: dupDrops,
     pendingDupDrops: pendingDupDrops,
     markServed: markServed,
+    boxDecisions: boxDecisions,
     liveSuggestions: liveSuggestions,
     markRejected: markRejected,
     markDuplicate: markDuplicate,

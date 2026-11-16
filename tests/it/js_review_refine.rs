@@ -3,7 +3,8 @@
 //! `refineFocus`, `answerRefine`, `sendsFilter`, `refineForSave`). `assets/review.js` applies these
 //! answers to its canvas, card and keys, so they are checked here in Node: which suggestion is
 //! current, what `y` and `w` act on, what the card says per kind, what an answer does to the file
-//! and the page flags, and that the reviewer's own edits end a suggestion by themselves.
+//! and the page flags, and that the reviewer's own edits end a suggestion by themselves. Also the
+//! session line's other page decision without a twin, `boxDecisions` (effort counted in boxes).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -172,6 +173,24 @@ console.log(JSON.stringify(req.map((r) => {
     R.answerRefine(other, t, true, r.classes, r.hidden);
     out.tighten = R.adjustingBox(other.boxes);
     return out;
+  }
+  if (r.op === 'box_decisions') {
+    // What the page does: mark the served boxes, keep a copy, apply the visit's edits, then count
+    // on the save's copy (assets/review.js `loadFrame`, `save`).
+    const labels = clone(r.labels);
+    R.markServed(labels);
+    const served = clone(labels.boxes);
+    (r.edits || []).forEach((e) => edit(labels, e));
+    (r.accept || []).forEach((i) => { labels.boxes[i].state = 'accepted'; });
+    if (r.answer != null) {
+      const l = R.liveRefine(labels, r.classes, r.hidden).find((x) => x.index === r.answer);
+      if (!R.answerRefine(labels, l, true, r.classes, r.hidden).ok) throw new Error('not answered');
+    }
+    (r.draw || []).forEach((d) => labels.boxes.push(Object.assign({ source: 'human', state: 'added', _checked: true }, d)));
+    (r.duplicate || []).forEach((i) => R.markDuplicate(labels.boxes[i]));
+    // A pending box of a "don't want" class, as the save rejects it.
+    (r.hide || []).forEach((i) => { labels.boxes[i].state = 'rejected'; labels.boxes[i].reason = 'other_class'; });
+    return R.boxDecisions(served, labels.boxes);
   }
   if (r.op === 'sends') return R.sendsFilter(r.name, r.value, r.auto);
   if (r.op === 'for_save') return R.refineForSave(clone(r.labels));
@@ -851,4 +870,74 @@ fn a_save_keeps_answers_and_drops_page_fields_of_suggestions() {
     );
     // A file without suggestions goes as it was.
     assert_eq!(got[1], json!({"version": 1, "boxes": []}));
+}
+
+/// The session line counts effort in boxes (`boxDecisions`): boxes pending when served that the
+/// save decides, a box made by accepting a suggestion, and boxes drawn by hand. A box decided
+/// before the visit, a duplicate, a too-small box, a dismissal and a box of a "don't want" class
+/// the save rejected unseen are no decision of the reviewer's.
+#[test]
+fn the_session_counts_the_boxes_decided_and_drawn_on_this_visit() {
+    if !have_node() {
+        return;
+    }
+    let pending = |label: &str, extra: Value| {
+        let mut b = json!({"label": label, "bbox": [0, 0, 50, 50], "source": "auto", "state": "pending", "score": 0.6});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+    let labels = json!({
+        "version": 1,
+        "status": "unreviewed",
+        "boxes": [
+            // 0: left pending, a prediction: the save accepts it.
+            pending("person", json!({"source": "model", "origin": "prediction"})),
+            // 1: rejected by the reviewer.
+            pending("car", json!({})),
+            // 2: a stacked duplicate the save rejects.
+            pending("dog", json!({})),
+            // 3: accepted before this visit.
+            pending("person", json!({"state": "accepted"})),
+            // 4: dismissed by a run, never judged.
+            pending("person", json!({"state": "rejected", "reason": "auto_dismissed"})),
+            // 5: a hidden class the save rejects unseen.
+            pending("cat", json!({})),
+            // 6: a human box from an earlier visit.
+            pending("person", json!({"source": "human", "state": "added"})),
+            // 7: rejected as too small.
+            pending("truck", json!({})),
+            // 8: accepted by the reviewer.
+            pending("car", json!({})),
+        ]
+    });
+    let edits = json!([{"box": 1, "op": "reject"}, {"box": 7, "op": "too_small"}]);
+    let got = node(&json!([
+        {"op": "box_decisions", "labels": labels, "edits": edits, "accept": [8], "duplicate": [2], "hide": [5],
+         "draw": [{"label": "person", "bbox": [1, 1, 9, 9]}, {"label": "car", "bbox": [2, 2, 8, 8]}]},
+        // A frame seen again (Back): nothing is pending any more, nothing counts.
+        {"op": "box_decisions", "labels": frame()},
+        // A yes to the dataset check's add: a new box, accepted.
+        {"op": "box_decisions", "labels": frame(), "answer": 1, "classes": classes(), "hidden": []},
+        // Nothing to count.
+        {"op": "box_decisions", "labels": {"version": 1, "boxes": []}},
+    ]));
+    assert_eq!(
+        got[0],
+        json!({"decided": 3, "accepted": 2, "rejected": 1, "drawn": 2}),
+        "0 and 8 accepted, 1 rejected; 2, 3, 4, 5, 6 and 7 are no decision of this visit"
+    );
+    assert_eq!(
+        got[1],
+        json!({"decided": 0, "accepted": 0, "rejected": 0, "drawn": 0})
+    );
+    assert_eq!(
+        got[2],
+        json!({"decided": 1, "accepted": 1, "rejected": 0, "drawn": 0})
+    );
+    assert_eq!(
+        got[3],
+        json!({"decided": 0, "accepted": 0, "rejected": 0, "drawn": 0})
+    );
 }

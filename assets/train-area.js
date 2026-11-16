@@ -83,7 +83,10 @@
     nextText.textContent = n.text;
     nextLink.textContent = n.label;
     nextLink.href = n.link;
-    nextLink.hidden = n.tab === tab;
+    // On its own tab the link is hidden, unless it asks for a list or a card the page is not on
+    // (Review's `?auto=refine`, Refine's `#quick-check`).
+    var at = n.link.search(/[?#]/), more = at < 0 ? "" : n.link.slice(at);
+    nextLink.hidden = n.tab === tab && (!more || more === location.search + location.hash);
     // The Jobs tab shows the job itself.
     nextLine.hidden = n.key === "job" && tab === "jobs";
     strip.hidden = false;

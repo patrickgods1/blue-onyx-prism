@@ -268,8 +268,9 @@
   var missingAsked = null;             // the frame "Anything missing?" was asked on
   var askMissing = pref('askMissing', true);
   var frameStart = 0;                  // when the frame was loaded (session pace)
+  var servedBoxes = [];                // the frame's boxes as served (session box count)
   var session = {
-    start: Date.now(), frames: [],     // per saved frame {s, acc, rej}
+    start: Date.now(), frames: [],     // per saved frame {s, acc, rej, boxes}
     breakAt: Date.now() + 45 * 60000   // the next break note
   };
   // View-only image setting: `mode` auto (bright + equalised on night / IR frames, else off), off,
@@ -3574,6 +3575,7 @@
       if (queueItem && queueItem.frame === j.frame && queueItem.random_pick && j.labels) j.labels.review_pick = 'random';
       // Suggestions keep to the boxes the server named (`overlap_live_boxes`).
       R.markServed(j.labels);
+      servedBoxes = JSON.parse(JSON.stringify((j.labels && j.labels.boxes) || []));
       loadHistory(camOf(j.frame));
       loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
@@ -3795,14 +3797,18 @@
     // The dataset check's suggestions go back as the page holds them (answers included).
     R.refineForSave(body);
     body.boxes.forEach(function (b) {
-      delete b._checked;
-      delete b._relabelled;
-      delete b._adjusting;
-      delete b._n;
       if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
         b.state = 'rejected';
         b.reason = 'other_class';
       }
+    });
+    // The session's box count, while the boxes still carry their served index (`_n`).
+    var decisions = R.boxDecisions(servedBoxes, body.boxes);
+    body.boxes.forEach(function (b) {
+      delete b._checked;
+      delete b._relabelled;
+      delete b._adjusting;
+      delete b._n;
     });
     body.version = body.version || 1;
     body.status = status;
@@ -3823,7 +3829,7 @@
     postJson(url, body).then(function (j) {
       dirty = false;
       if (window.PrismDraft) PrismDraft.drop(DRAFT);
-      if (status === 'reviewed') { noteSaved(body); noteHistory(frame, body, w, h); }
+      if (status === 'reviewed') { noteSaved(decisions); noteHistory(frame, body, w, h); }
       // After Back: on to the frame Back left (the counts refresh), else the queue's next.
       if (fwdStack.length) {
         say((j.message || 'Saved.') + note);
@@ -3873,29 +3879,40 @@
 
   function seconds(fs) { return fs.map(function (f) { return f.s; }); }
 
-  // A saved frame: its time (load to save, at most 10 min) and what saving made of its model boxes.
-  function noteSaved(body) {
-    var acc = 0, rej = 0;
-    body.boxes.forEach(function (b) {
-      // A duplicate or a too-small box is no verdict on an object, and nobody judged a dismissed
-      // one: it would read as a false positive here.
-      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' || isDismissal(b.reason) || b.reason === 'parked_spot') return;
-      var r = resolved(b);
-      if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
-    });
-    session.frames.push({ s: Math.min(600, (Date.now() - frameStart) / 1000), acc: acc, rej: rej });
+  // A saved frame: its time (load to save, at most 10 min) and the reviewer's box decisions on it
+  // (`R.boxDecisions`: boxes pending when served and now decided, plus boxes drawn; a duplicate,
+  // a too-small box, a dismissal or a parked accept is no verdict on an object).
+  function noteSaved(d) {
+    session.frames.push({ s: Math.min(600, (Date.now() - frameStart) / 1000), acc: d.accepted, rej: d.rejected, boxes: d.decided + d.drawn });
     showSession();
   }
 
-  // "Session 23 frames · 41 s/frame · 82% accepted · 37 min", a note when the last 10 frames went
-  // much faster while accepting more (rubber-stamping), and a break note every 45 min.
+  // Boxes a minute of review: the frames' own (capped) times, so a break or a frame left open
+  // does not count; '' before a second of it.
+  function boxesPerMinute(fs) {
+    var n = 0, s = 0;
+    fs.forEach(function (f) { n += f.boxes || 0; s += f.s; });
+    if (s < 1) return '';
+    var r = n * 60 / s;
+    return r >= 10 ? String(Math.round(r)) : r.toFixed(1);
+  }
+
+  // "Session 23 frames · 64 boxes, 2.8 a minute · 82% accepted · 37 min" (effort in boxes: a
+  // frame of one box and one of twelve are not the same work), a note when the last 10 frames
+  // went much faster while accepting more (rubber-stamping), and a break note every 45 min.
   function showSession() {
     if (!sessionLine) return;
     var fs = session.frames, min = Math.floor((Date.now() - session.start) / 60000);
     sessionLine.textContent = '';
     if (!fs.length) return;
     var rate = acceptRate(fs);
-    var parts = ['Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'), Math.round(median(seconds(fs))) + ' s/frame'];
+    var nb = 0;
+    fs.forEach(function (f) { nb += f.boxes || 0; });
+    var pace = boxesPerMinute(fs);
+    var parts = [
+      'Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'),
+      nb + ' box' + (nb === 1 ? '' : 'es') + (nb && pace ? ', ' + pace + ' a minute' : '')
+    ];
     if (rate != null) parts.push(Math.round(rate * 100) + '% accepted');
     parts.push(min + ' min');
     sessionLine.appendChild(el('span', null, parts.join(' · ')));

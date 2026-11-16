@@ -868,6 +868,13 @@
     r.addEventListener('change', function () { applyMode(); choiceChanged(); });
   });
   $('refine-model').addEventListener('change', choiceChanged);
+  // The Train area's "Quick check" link (/train/refine#quick-check): the form opens on the quick
+  // check; the model list fills in once GET /v1/refine answers.
+  if (location.hash === '#quick-check') {
+    $('refine-mode-model').checked = true;
+    applyMode();
+    if ($('refine-check').scrollIntoView) $('refine-check').scrollIntoView();
+  }
 
   // ---- static objects
 

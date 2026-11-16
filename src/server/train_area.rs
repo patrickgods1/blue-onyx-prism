@@ -117,6 +117,19 @@ pub(crate) struct Summary {
     pub(crate) can_autolabel: bool,
     /// Why the folder under review cannot be used (an unplugged drive), as the page words it.
     pub(crate) folder_problem: Option<String>,
+    /// Frames to review with no label file: their boxes are in sidecars only, so
+    /// `boxes_to_review` undercounts while this is above 0.
+    pub(crate) unfiled_to_review: u64,
+    /// Distinct (camera, date) among the reviewed frames: a check needs 2.
+    pub(crate) reviewed_camera_days: u64,
+    /// The dataset check's open `relabel` and `add` suggestions (the fixes that matter most); None
+    /// while they are not counted yet (the count runs on its own thread, never on this route).
+    pub(crate) open_relabel_add: Option<(u64, u64)>,
+    /// Frames the last check selected (the newer of the full and the quick check's reports); None
+    /// when no check has run.
+    pub(crate) check_covered: Option<u64>,
+    /// A model trained here can run the quick check.
+    pub(crate) quick_model: bool,
 }
 
 /// The one suggested action: a plain sentence, the link that does it. Never an order: every tab
@@ -145,12 +158,23 @@ fn step(key: &'static str, tab: &'static str, text: String, link: String, label:
 
 /// `n frames` / `1 frame`.
 fn frames(n: u64) -> String {
-    format!("{n} frame{}", if n == 1 { "" } else { "s" })
+    counted_noun(n, "frame", "frames")
 }
 
+/// `n <one>` / `n <many>`.
+fn counted_noun(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Reviewed frames the last check left unchecked before a new one is suggested: a check covering
+/// under this share of them is old.
+const CHECK_COVER_NUM: u64 = 3;
+const CHECK_COVER_DEN: u64 = 4;
+
 /// The next step of `s`, the first rule that applies: a job in progress, a finished model nobody
-/// decided about, nothing to work on yet, enough new reviewed frames to export, frames to label
-/// and review, an export not trained on, a failed run, and otherwise nothing to do.
+/// decided about, nothing to work on yet, the dataset check's likely fixes to answer, enough new
+/// reviewed frames to export, frames to label and review, a dataset check over the frames reviewed
+/// since the last one, an export not trained on, a failed run, and otherwise nothing to do.
 pub(crate) fn next_step(s: &Summary) -> NextStep {
     if let Some(j) = &s.job {
         let verb = if j.paused { "paused" } else { "running" };
@@ -199,6 +223,9 @@ pub(crate) fn next_step(s: &Summary) -> NextStep {
     if none_yet && s.frames_to_review + s.frames_reviewed == 0 {
         return collect_or_import(s);
     }
+    if let Some(n) = answer_check(s) {
+        return n;
+    }
     let unexported = s.frames_reviewed.saturating_sub(s.exported_frames);
     if s.frames_reviewed >= ENOUGH_TO_EXPORT && unexported >= ENOUGH_TO_EXPORT {
         return export_step(unexported);
@@ -217,23 +244,32 @@ pub(crate) fn next_step(s: &Summary) -> NextStep {
                 "Auto-label",
             );
         }
-        let boxes = if s.boxes_to_review > 0 {
-            format!(" ({} boxes)", s.boxes_to_review)
+        // Effort is boxes more than frames; the count is whole only when every frame to review
+        // has a label file (a sidecar's boxes are not read by the walk).
+        let text = if s.boxes_to_review > 0 && s.unfiled_to_review == 0 {
+            format!(
+                "{} on {} to review.",
+                counted_noun(s.boxes_to_review, "box", "boxes"),
+                frames(s.frames_to_review)
+            )
+        } else if s.boxes_to_review > 0 {
+            format!(
+                "{} ({} boxes) to review.",
+                frames(s.frames_to_review),
+                s.boxes_to_review
+            )
         } else {
-            String::new()
+            format!("{} to review.", frames(s.frames_to_review))
         };
         let link = if s.frames_queued > 0 {
             "/train/review".to_string()
         } else {
             "/train/review?source=all".to_string()
         };
-        return step(
-            "review",
-            REVIEW,
-            format!("{}{boxes} to review.", frames(s.frames_to_review)),
-            link,
-            "Review them",
-        );
+        return step("review", REVIEW, text, link, "Review them");
+    }
+    if let Some(n) = run_check(s) {
+        return n;
     }
     if unexported > 0 {
         return export_step(unexported);
@@ -305,6 +341,97 @@ fn collect_or_import(s: &Summary) -> NextStep {
             "Turn on collecting",
         )
     }
+}
+
+/// The dataset check's open wrong-class (`relabel`) and missing-box (`add`) suggestions, before any
+/// export: a wrong class costs a model the most per error and a missing box is the commonest error,
+/// and both would reach the export as they are. Verify and tighten suggestions wait on the Review
+/// tab without a nudge.
+fn answer_check(s: &Summary) -> Option<NextStep> {
+    let (relabel, add) = s.open_relabel_add?;
+    let total = relabel + add;
+    if total == 0 {
+        return None;
+    }
+    let parts: Vec<String> = [
+        (
+            relabel,
+            counted_noun(relabel, "wrong class", "wrong classes"),
+        ),
+        (add, counted_noun(add, "missing box", "missing boxes")),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(_, t)| t)
+    .collect();
+    let why = if relabel > 0 {
+        "wrong classes hurt a model most"
+    } else {
+        "a missing box teaches a model that the object is background"
+    };
+    Some(step(
+        "answer_check",
+        REVIEW,
+        format!(
+            "The dataset check found {} on reviewed frames ({}). Answer them before you export: \
+             {why}.",
+            counted_noun(total, "likely fix", "likely fixes"),
+            parts.join(", ")
+        ),
+        "/train/review?auto=refine".to_string(),
+        "Answer them",
+    ))
+}
+
+/// A dataset check over the reviewed frames, once nothing is left to review: when this machine
+/// can train, there are enough reviewed frames on 2 camera days for a check
+/// ([`crate::training::refine::MIN_FRAMES`]), and no check has run or the last one covered under
+/// three quarters of them. A model trained here makes it the quick check, minutes instead of an
+/// hour.
+fn run_check(s: &Summary) -> Option<NextStep> {
+    let reviewed = s.frames_reviewed;
+    let enough = s.can_train
+        && reviewed >= crate::training::refine::MIN_FRAMES as u64
+        && s.reviewed_camera_days >= 2;
+    let old = s
+        .check_covered
+        .is_none_or(|c| c * CHECK_COVER_DEN < reviewed * CHECK_COVER_NUM);
+    if !(enough && old) {
+        return None;
+    }
+    let since = match s.check_covered {
+        Some(c) => format!(
+            "{} since the last dataset check.",
+            counted_noun(
+                reviewed.saturating_sub(c),
+                "reviewed frame",
+                "reviewed frames"
+            )
+        ),
+        None => format!(
+            "{} and no dataset check yet.",
+            counted_noun(reviewed, "reviewed frame", "reviewed frames")
+        ),
+    };
+    let (quick, label) = if s.quick_model {
+        (
+            " A quick check with a model you trained takes minutes.",
+            "Quick check",
+        )
+    } else {
+        ("", "Run the check")
+    };
+    Some(step(
+        "run_check",
+        REFINE,
+        format!("{since} A check finds some wrong labels before you train.{quick}"),
+        if s.quick_model {
+            "/train/refine#quick-check".to_string()
+        } else {
+            "/train/refine#refine-check".to_string()
+        },
+        label,
+    ))
 }
 
 fn export_step(unexported: u64) -> NextStep {
@@ -553,9 +680,29 @@ pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<A
         .filter(|d| !exports.contains(d))
         .count();
     let t = tally.as_deref();
+    let folder_problem = super::review::folder_problem(state, &review_dir);
+    // Nothing is read from a folder that is not there; the counts never wait for a walk.
+    let (open, covered) = if folder_problem.is_none() {
+        (
+            super::refine::open_cached(
+                &review_dir,
+                &config.collect.classes,
+                &config.collect.hidden_classes,
+                &super::refine::queue_stamp(&tasks),
+            ),
+            super::refine::check_covered(&review_dir),
+        )
+    } else {
+        (None, None)
+    };
     (
         Summary {
-            folder_problem: super::review::folder_problem(state, &review_dir),
+            unfiled_to_review: t.map_or(0, |t| t.unfiled_to_review),
+            reviewed_camera_days: t.map_or(0, Tally::reviewed_camera_days),
+            open_relabel_add: open.map(|o| (o.relabel as u64, o.add as u64)),
+            check_covered: covered,
+            quick_model: super::refine::quick_model_ready(&config, state.config.revision()),
+            folder_problem,
             collecting: config.collect.enabled,
             // A folder under review holds frames of its own, and imports count once indexed.
             frames_collected: brief.summary.frames.max(t.map_or(0, |t| t.frames)),
@@ -865,13 +1012,213 @@ mod tests {
         };
         let n = next_step(&s);
         assert_eq!((n.key, n.link.as_str()), ("review", "/train/review"));
-        assert_eq!(n.text, "12 frames (30 boxes) to review.");
+        // Every frame to review has a label file: the box count is whole, and effort is boxes.
+        assert_eq!(n.text, "30 boxes on 12 frames to review.");
+        let one = Summary {
+            frames_to_review: 1,
+            boxes_to_review: 1,
+            ..s.clone()
+        };
+        assert_eq!(next_step(&one).text, "1 box on 1 frame to review.");
+        // Frames with only sidecar predictions: their boxes are not counted, so frames lead.
+        let unfiled = Summary {
+            unfiled_to_review: 2,
+            ..s.clone()
+        };
+        assert_eq!(next_step(&unfiled).text, "12 frames (30 boxes) to review.");
+        let no_boxes = Summary {
+            boxes_to_review: 0,
+            ..s.clone()
+        };
+        assert_eq!(next_step(&no_boxes).text, "12 frames to review.");
         // Collected but never sent to review: the default list would be empty.
         let n = next_step(&Summary {
             frames_queued: 0,
             ..s
         });
         assert_eq!(n.link, "/train/review?source=all");
+    }
+
+    /// Reviewed frames, nothing left to review, few enough unexported that no export is due: what a
+    /// dataset check is suggested on.
+    fn checkable() -> Summary {
+        Summary {
+            frames_collected: 60,
+            frames_reviewed: 60,
+            exported_frames: 30,
+            exports: 1,
+            reviewed_camera_days: 2,
+            ..counted()
+        }
+    }
+
+    #[test]
+    fn the_checks_likely_fixes_come_before_any_export_and_say_what_they_are() {
+        // Enough new reviewed frames for an export and frames to review: the fixes come first.
+        let s = Summary {
+            frames_collected: 300,
+            frames_to_review: 100,
+            frames_reviewed: 60,
+            open_relabel_add: Some((2, 3)),
+            ..counted()
+        };
+        let n = next_step(&s);
+        assert_eq!((n.key, n.tab), ("answer_check", REVIEW));
+        assert_eq!(
+            n.text,
+            "The dataset check found 5 likely fixes on reviewed frames (2 wrong classes, 3 missing \
+             boxes). Answer them before you export: wrong classes hurt a model most."
+        );
+        assert_eq!(
+            (n.link.as_str(), n.label.as_str()),
+            ("/train/review?auto=refine", "Answer them")
+        );
+        // A zero part is left out, one is singular.
+        let one = Summary {
+            open_relabel_add: Some((1, 0)),
+            ..s.clone()
+        };
+        assert_eq!(
+            next_step(&one).text,
+            "The dataset check found 1 likely fix on reviewed frames (1 wrong class). Answer them \
+             before you export: wrong classes hurt a model most."
+        );
+        let adds = Summary {
+            open_relabel_add: Some((0, 1)),
+            ..s.clone()
+        };
+        let t = next_step(&adds).text;
+        assert!(
+            t.starts_with(
+                "The dataset check found 1 likely fix on reviewed frames (1 missing box)."
+            ),
+            "{t}"
+        );
+        assert!(!t.contains("wrong class"), "{t}");
+        // Nothing open, or not counted yet: the export as before.
+        for open in [Some((0, 0)), None] {
+            let s = Summary {
+                open_relabel_add: open,
+                ..s.clone()
+            };
+            assert_eq!(key(&s), "export", "{open:?}");
+        }
+        // Nothing to export and nothing to review: still the fixes.
+        let done = Summary {
+            open_relabel_add: Some((0, 2)),
+            ..checkable()
+        };
+        assert_eq!(key(&done), "answer_check");
+        // A job, a missing folder and a finished model still come first.
+        let model = Summary {
+            unused_model: Some("m".into()),
+            ..s.clone()
+        };
+        assert_eq!(key(&model), "use_model");
+        let gone = Summary {
+            folder_problem: Some("gone".into()),
+            ..s
+        };
+        assert_eq!(key(&gone), "folder_missing");
+    }
+
+    #[test]
+    fn a_dataset_check_is_suggested_once_the_review_is_done_and_the_last_one_is_old() {
+        let n = next_step(&checkable());
+        assert_eq!((n.key, n.tab), ("run_check", REFINE));
+        assert_eq!(
+            n.text,
+            "60 reviewed frames and no dataset check yet. A check finds some wrong labels before \
+             you train."
+        );
+        assert_eq!(
+            (n.link.as_str(), n.label.as_str()),
+            ("/train/refine#refine-check", "Run the check")
+        );
+        // A check over under three quarters of the reviewed frames is old: 44 of 60.
+        let old = Summary {
+            check_covered: Some(44),
+            ..checkable()
+        };
+        let n = next_step(&old);
+        assert_eq!(n.key, "run_check");
+        assert!(
+            n.text
+                .starts_with("16 reviewed frames since the last dataset check. A check finds"),
+            "{}",
+            n.text
+        );
+        // 45 of 60 is three quarters: no check; the export comes next.
+        let recent = Summary {
+            check_covered: Some(45),
+            ..checkable()
+        };
+        assert_eq!(key(&recent), "export");
+        // Too few frames, one camera day, no GPU to train on: no check.
+        for s in [
+            Summary {
+                frames_reviewed: crate::training::refine::MIN_FRAMES as u64 - 1,
+                exported_frames: 0,
+                ..checkable()
+            },
+            Summary {
+                reviewed_camera_days: 1,
+                ..checkable()
+            },
+            Summary {
+                can_train: false,
+                ..checkable()
+            },
+        ] {
+            assert_eq!(key(&s), "export", "{s:?}");
+        }
+        assert_eq!(
+            key(&Summary {
+                frames_reviewed: crate::training::refine::MIN_FRAMES as u64,
+                exported_frames: crate::training::refine::MIN_FRAMES as u64 - 1,
+                ..checkable()
+            }),
+            "run_check"
+        );
+        // Frames to review come first; enough new reviewed frames for an export too.
+        let review = Summary {
+            frames_to_review: 5,
+            ..checkable()
+        };
+        assert_eq!(key(&review), "review");
+        let export = Summary {
+            frames_reviewed: 200,
+            exported_frames: 100,
+            ..checkable()
+        };
+        assert_eq!(key(&export), "export");
+        // Everything exported: the check before training.
+        let exported = Summary {
+            exported_frames: 60,
+            ..checkable()
+        };
+        assert_eq!(key(&exported), "run_check");
+        let checked = Summary {
+            check_covered: Some(60),
+            ..exported
+        };
+        assert_eq!(key(&checked), "train");
+        // With a model trained here, the quick check.
+        let quick = Summary {
+            quick_model: true,
+            ..checkable()
+        };
+        let n = next_step(&quick);
+        assert_eq!(
+            (n.key, n.link.as_str(), n.label.as_str()),
+            ("run_check", "/train/refine#quick-check", "Quick check")
+        );
+        assert!(
+            n.text
+                .ends_with(" A quick check with a model you trained takes minutes."),
+            "{}",
+            n.text
+        );
     }
 
     #[test]
@@ -1028,6 +1375,15 @@ mod tests {
             Summary {
                 frames_reviewed: 3,
                 ..counted()
+            },
+            Summary {
+                open_relabel_add: Some((1, 1)),
+                ..checkable()
+            },
+            checkable(),
+            Summary {
+                quick_model: true,
+                ..checkable()
             },
         ] {
             let n = next_step(&s);

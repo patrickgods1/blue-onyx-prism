@@ -1438,12 +1438,20 @@ pub struct Tally {
     /// Pending boxes on the frames to review. Boxes only a sidecar proposes (a frame with no
     /// label file) are not counted: reading every sidecar is what this walk avoids.
     pub pending_boxes: u64,
+    /// Frames to review with no label file (only their sidecar's predictions): while this is above
+    /// 0, `pending_boxes` undercounts the boxes to review.
+    pub unfiled_to_review: u64,
     /// Frames to review that no auto-label run has looked at ([`AutoFilter::Never`]).
     pub never_auto_labelled: u64,
     /// Training boxes of reviewed frames, per class.
     pub coverage: BTreeMap<String, ClassCoverage>,
     /// Frames left out: unreadable label file.
     pub unreadable: u64,
+    /// The (camera, date) of every reviewed frame, from its path (`<scene>/<camera>/<date>/...`,
+    /// as the exports and the dataset check group frames): one camera's day in two scene folders
+    /// is one. Sent as its count, [`Tally::reviewed_camera_days`].
+    #[serde(skip)]
+    pub reviewed_days: BTreeSet<(String, String)>,
 }
 
 impl ClassCoverage {
@@ -1473,9 +1481,11 @@ impl Tally {
             to_review,
             queued_to_review,
             pending_boxes,
+            unfiled_to_review,
             never_auto_labelled,
             coverage,
             unreadable,
+            reviewed_days,
         } = other;
         self.frames += frames;
         self.reviewed += reviewed;
@@ -1483,28 +1493,43 @@ impl Tally {
         self.to_review += to_review;
         self.queued_to_review += queued_to_review;
         self.pending_boxes += pending_boxes;
+        self.unfiled_to_review += unfiled_to_review;
         self.never_auto_labelled += never_auto_labelled;
         for (class, row) in coverage {
             self.coverage.entry(class).or_default().merge(row);
         }
         self.unreadable += unreadable;
+        self.reviewed_days.extend(reviewed_days);
+    }
+
+    /// Distinct (camera, date) among the reviewed frames: the dataset check's groups.
+    pub fn reviewed_camera_days(&self) -> u64 {
+        self.reviewed_days.len() as u64
     }
 
     fn add(&mut self, c: &Candidate, labels: Option<&LabelFile>) {
         self.frames += 1;
         match labels.map(|l| l.status) {
-            Some(Status::Reviewed) => self.reviewed += 1,
+            Some(Status::Reviewed) => {
+                self.reviewed += 1;
+                if let Some(day) = camera_day(&c.rel) {
+                    self.reviewed_days.insert(day);
+                }
+            }
             Some(Status::Skipped) => self.skipped += 1,
             _ => {
                 self.to_review += 1;
                 self.queued_to_review += u64::from(c.queued);
                 self.never_auto_labelled += u64::from(AutoFilter::Never.matches(labels));
-                if let Some(l) = labels {
-                    self.pending_boxes += l
-                        .boxes
-                        .iter()
-                        .filter(|b| b.state == BoxState::Pending)
-                        .count() as u64;
+                match labels {
+                    Some(l) => {
+                        self.pending_boxes += l
+                            .boxes
+                            .iter()
+                            .filter(|b| b.state == BoxState::Pending)
+                            .count() as u64;
+                    }
+                    None => self.unfiled_to_review += 1,
                 }
             }
         }
@@ -1517,6 +1542,16 @@ impl Tally {
             }
         }
     }
+}
+
+/// The (camera, date) of frame `rel` (`<scene>/<camera>/<date>/<stem>.jpg`); None for another
+/// shape.
+fn camera_day(rel: &str) -> Option<(String, String)> {
+    let mut parts = rel.split('/');
+    let (_scene, camera, date, _file) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (parts.next().is_none() && !camera.is_empty() && !date.is_empty())
+        .then(|| (camera.to_string(), date.to_string()))
 }
 
 /// The [`Tally`] of `dir`. Reads the label files, never the sidecars, so it costs about one small
@@ -2740,6 +2775,57 @@ mod tests {
         assert_eq!(person.by_scene["day"], 2);
         assert_eq!(person.by_camera["gate"], 2);
         assert!(!t.coverage.contains_key("car"), "a pending box is no label");
+        assert_eq!(
+            t.unfiled_to_review, 1,
+            "the frame to review with no label file"
+        );
+    }
+
+    /// Frames to review with no label file are counted apart (their boxes are only in sidecars, so
+    /// `pending_boxes` misses them), and the reviewed frames' camera days are counted once each,
+    /// across scene folders and merged walk parts.
+    #[test]
+    fn the_tally_counts_unfiled_frames_and_reviewed_camera_days() {
+        let cand = |rel: &str| Candidate {
+            rel: rel.into(),
+            scene: rel.split('/').next().unwrap_or_default().into(),
+            camera: rel.split('/').nth(1).unwrap_or_default().into(),
+            buckets: vec![],
+            queued: false,
+        };
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        let pending = LabelFile::default();
+        let mut a = Tally::default();
+        a.add(&cand("day/gate/2026-11-01/a.jpg"), Some(&reviewed));
+        a.add(&cand("day/gate/2026-11-01/b.jpg"), Some(&reviewed));
+        // The same camera's day in the night folder: the same camera day.
+        a.add(&cand("night/gate/2026-11-01/c.jpg"), Some(&reviewed));
+        a.add(&cand("day/gate/2026-11-02/d.jpg"), None);
+        a.add(&cand("day/gate/2026-11-02/e.jpg"), Some(&pending));
+        let mut b = Tally::default();
+        b.add(&cand("day/gate/2026-11-02/f.jpg"), Some(&reviewed));
+        b.add(&cand("ir/back/2026-11-01/g.jpg"), Some(&reviewed));
+        b.add(&cand("ir/back/2026-11-01/h.jpg"), None);
+        // Another part of the walk with a day already seen merges into one.
+        b.add(&cand("night/gate/2026-11-01/i.jpg"), Some(&reviewed));
+        // A path of another shape is no camera day.
+        b.add(&cand("odd.jpg"), Some(&reviewed));
+        assert_eq!((a.unfiled_to_review, a.reviewed_camera_days()), (1, 1));
+        a.merge(b);
+        assert_eq!(a.reviewed, 7);
+        assert_eq!(a.to_review, 3);
+        assert_eq!(a.unfiled_to_review, 2);
+        assert_eq!(a.pending_boxes, 0);
+        assert_eq!(a.reviewed_camera_days(), 3, "{:?}", a.reviewed_days);
+        assert_eq!(camera_day("a/b/c"), None);
+        assert_eq!(camera_day("a/b/c/d/e.jpg"), None);
+        assert_eq!(
+            camera_day("day/gate/2026-11-01/x.jpg"),
+            Some(("gate".into(), "2026-11-01".into()))
+        );
     }
 
     #[test]
