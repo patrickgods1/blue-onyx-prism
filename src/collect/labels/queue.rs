@@ -2206,9 +2206,9 @@ mod tests {
         assert_eq!(
             listed(&f),
             [
-                (add.clone(), 2, 4699),
-                (tighten.clone(), 2, 2599),
-                (verify.clone(), 1, 1899)
+                (add.clone(), 2, 4949),
+                (verify.clone(), 1, 2899),
+                (tighten.clone(), 2, 2200)
             ],
             "{dismissed} {stale} {skipped} {hidden}"
         );
@@ -2229,13 +2229,13 @@ mod tests {
         f.refine_kind = Some(RefineKind::Verify);
         assert_eq!(
             listed(&f),
-            [(verify.clone(), 1, 1899), (tighten.clone(), 1, 1200)]
+            [(verify.clone(), 1, 2899), (tighten.clone(), 1, 2200)]
         );
         f.refine_kind = Some(RefineKind::Relabel);
-        assert_eq!(listed(&f), [(add.clone(), 1, 3949)]);
+        assert_eq!(listed(&f), [(add.clone(), 1, 4949)]);
         f.refine_kind = None;
         f.status = StatusFilter::Is(Status::Unreviewed);
-        assert_eq!(listed(&f), [(tighten, 2, 2599)], "the status filter holds");
+        assert_eq!(listed(&f), [(tighten, 2, 2200)], "the status filter holds");
         // Another queue shows no strength and no count.
         let any = Filters {
             status: StatusFilter::Any,

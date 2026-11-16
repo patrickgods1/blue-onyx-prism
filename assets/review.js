@@ -285,6 +285,9 @@
   var suggestions = [];                // liveSuggestions, as of the last render
   var refineCur = null;                // R.refineCurrent ({l, k, n}), as of the last render
   var refinePutOff = [];               // keys (R.refineKey) put off with Later on this visit
+  var refineDoneOn = null;             // the frame whose last dataset check suggestion was answered
+  // Under the card once the last suggestion is answered: no suggestion left is not a complete frame.
+  var REFINE_MISSES = 'The check finds some errors, not all: small, dark or partly hidden objects most often slip past it.';
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', unlikely: '#ffa000', likely: '#14d6b0', hint: '#f08c00', accepted: '#2e9e4f',
@@ -695,6 +698,7 @@
     }
     if (refineCur) focusRefine();
     else {
+      refineDoneOn = cur.frame;
       var next = nextUndecided(-1);
       select(next >= 0 ? next : r.box, true);
     }
@@ -718,7 +722,7 @@
     suggestions = liveSuggestions();
     refineCur = currentRefine();
     if (refineCur) focusRefine();
-    else refresh();
+    else { refineDoneOn = cur.frame; refresh(); }
     say((at >= 0 ? 'Box ' + (at + 1) + ' accepted.' : 'Accepted.') + refineLeft());
   }
 
@@ -732,6 +736,7 @@
     var rest = R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff);
     box.appendChild(el('div', 'muted', (noHover.matches ? 'Drag it or its handles to fit the object, then Accept box' : 'Drag it or its handles to fit the object, then Accept box (y)') +
       (rest ? ': the next suggestion follows (' + rest.n + ' left).' : ': no suggestion left on this frame.') + ' z undoes.'));
+    if (!rest) box.appendChild(el('div', 'muted', REFINE_MISSES));
     var row = el('div', 'rv-q-btns');
     var answers = inBar ? barBtns : row;
     answers.appendChild(decideButton('Accept box', 'y', 'ok', finishAdjust));
@@ -741,6 +746,16 @@
       row.appendChild(show);
     }
     if (row.childNodes.length) box.appendChild(row);
+    return box;
+  }
+
+  // In the card's place once the reviewer answered the last suggestion of this frame (none while
+  // another is current or a box is being fitted): what is left is not known to be complete.
+  function refineDoneBlock() {
+    if (!cur || refineDoneOn !== cur.frame || refineCur || adjusting() >= 0) return null;
+    var box = el('div', 'rv-q-sug rv-q-refine');
+    box.appendChild(el('div', 'muted', 'Dataset check: no suggestion left on this frame.'));
+    box.appendChild(el('div', 'muted', REFINE_MISSES));
     return box;
   }
 
@@ -1844,6 +1859,10 @@
     // bar, the selected box's go in the card.
     var refBlock = refineBlock(inBar && !!decideBar);
     if (refBlock) decide.appendChild(refBlock);
+    else if (!sugBlock) {
+      var done = refineDoneBlock();
+      if (done) decide.appendChild(done);
+    }
     var p = progress();
     var b = boxes()[selected];
     if (inBar) renderBarHead(b, p);
@@ -3533,6 +3552,7 @@
       if (suggestions.length) selected = suggestionBox(suggestions[0]);
       // Else a dataset check suggestion opens on its box (none for an added box: the proposal).
       refinePutOff = [];
+      refineDoneOn = null;
       refineCur = currentRefine();
       if (refineCur) selected = R.refineFocus(refineCur.l, boxes()).mark;
       var draftNote = restoreDraft(j);

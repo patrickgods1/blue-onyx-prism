@@ -2078,8 +2078,8 @@ it could never be live again and is dropped (an answered `add` stays: it keeps t
 back). A found suggestion is dropped when it is the same finding as an answered one (the same `target` and,
 when both have one, `target_label`; for an `add`, a box of the same object at IoU 0.5 or more), a weaker
 copy of another found one, or outside what a save accepts.
-A frame holds at most 64, strongest first (`add`, then `relabel`, then `tighten`, then `verify`, then by
-score). Over 64, a write gives up its own found suggestions, the weakest first: it never pushes out an
+A frame holds at most 64, strongest first (`relabel`, then `add`, then `verify`, then `tighten`, then by
+score): per error, a wrong class costs a detector the most, then a missing box, then a loose one. Over 64, a write gives up its own found suggestions, the weakest first: it never pushes out an
 answered one or one of a kind another write owns (the closer look's `tighten` never displaces a fold's
 `verify`, nor a fold's `add` an open `tighten`). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
 page can still save. The file format is in [DATASET.md](DATASET.md#label-file-version-1).
@@ -2453,8 +2453,8 @@ web UI and shows its results; the check itself is the one above and changes no b
   suggestions* button; see "What a rerun replaces" above). While
   it runs the card shows the check's progress row (step, percent, time left, Pause / Resume / Cancel; the
   Jobs tab links to it as `#job-<id>`).
-- **Findings**: the open suggestions per kind (*Missing boxes* = `add`, *Labels no model found* = `verify`,
-  *Other class suggested* = `relabel`, *Loose boxes* = `tighten`; `GET /v1/refine` `open`), counted over the label files of the folder under review
+- **Findings**: the open suggestions per kind, in the Review tab's order (*Other class suggested* = `relabel`,
+  *Missing boxes* = `add`, *Labels no model found* = `verify`, *Loose boxes* = `tighten`; `GET /v1/refine` `open`), counted over the label files of the folder under review
   (`refine::live`: answered and stale ones are not counted; kept 60 s, dropped when a check starts or ends,
   so a Review save shows within the minute: the card says *Counts refresh within a minute*),
   each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). `GET /v1/refine`
@@ -2465,6 +2465,9 @@ web UI and shows its results; the check itself is the one above and changes no b
   skipped*, `RefineFloor.lastLine`), `cancelled`, its warnings and *Loose labels counted: N, M with a
   proposed box* (`loose`, `found.tighten`; *N (no closer look in this check)* without one), and *Last full
   check: <date>* / *Last quick check: <date>* when the other mode's report exists (`RefineFloor.otherLine`).
+  Under any report a muted line says *The check finds some errors, not all: small, dark or partly hidden
+  objects most often slip past it.* (`RefineFloor.missesLine`); the Review card says the same once the last
+  suggestion of a frame is answered: no suggestion left does not make a frame complete.
   The recall tables (Coverage and Too small cards) use the full check's report when there is one, else the
   quick check's (its recall reads *over the N frames <model> never saw*). On the Review tab a `tighten` is
   *the tighter box* when the proposal lies (95% or more of it) inside the label, else *the better-fitting box*

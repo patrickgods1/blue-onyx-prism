@@ -537,10 +537,10 @@
     return out;
   }
 
-  // How strong a suggestion is, higher first (labels/refine.rs `strength`): add 4, relabel 3,
-  // tighten 2, verify 1, times 1000, plus the score in thousandths; 0 when answered or unknown.
+  // How strong a suggestion is, higher first (labels/refine.rs `strength`): relabel 4, add 3,
+  // verify 2, tighten 1, times 1000, plus the score in thousandths; 0 when answered or unknown.
   function refineStrength(s) {
-    var band = s.kind === 'add' ? 4 : s.kind === 'relabel' ? 3 : s.kind === 'tighten' ? 2 : s.kind === 'verify' ? 1 : 0;
+    var band = s.kind === 'relabel' ? 4 : s.kind === 'add' ? 3 : s.kind === 'verify' ? 2 : s.kind === 'tighten' ? 1 : 0;
     if (!band || s.answer != null) return 0;
     var v = (typeof s.score === 'number' && isFinite(s.score)) ? f32(s.score) : 0;
     return band * 1000 + Math.round(Math.min(Math.max(v, 0), 1) * 999);

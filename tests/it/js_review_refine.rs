@@ -231,7 +231,7 @@ fn classes() -> Value {
 }
 
 /// A reviewed frame with one suggestion of each kind (file order: verify, add, relabel, tighten;
-/// strength order: add 4899, relabel 3849, tighten 2699, verify 1200).
+/// strength order: relabel 4849, add 3899, verify 2000, tighten 1699).
 ///
 /// Boxes: 0 person (relabel target), 1 person rejected low_score near the add, 2 car (verify
 /// target), 3 person rejected low_score exactly at the add, 4 person (tighten target).
@@ -277,20 +277,21 @@ fn the_current_suggestion_is_the_strongest_after_any_overlap() {
         // An overlap suggestion on screen comes first: none is current.
         {"op": "current", "live": list, "overlap": true},
         {"op": "current", "live": [], "overlap": false},
-        // The first of two equal adds put off (Later): the second, place 2.
-        {"op": "current", "live": list, "overlap": false, "later_of": [1]},
+        // The relabel and the first of two equal adds put off (Later): the second add, place 3.
+        {"op": "current", "live": list, "overlap": false, "later_of": [2, 1]},
         // All put off: the strongest again.
         {"op": "current", "live": list, "overlap": false, "later_of": [0, 1, 2, 3, 4]},
     ]));
-    // Adds first (band 4), equal scores by index; then relabel, tighten, verify.
-    assert_eq!(got[0], json!({"index": 1, "k": 1, "n": 5}));
+    // The relabel first (band 4), then the adds (band 3, equal scores by index), verify, tighten:
+    // what costs a model most per error first, whatever the score.
+    assert_eq!(got[0], json!({"index": 2, "k": 1, "n": 5}));
     assert_eq!(got[1], Value::Null);
     assert_eq!(got[2], Value::Null);
-    assert_eq!(got[3], json!({"index": 3, "k": 2, "n": 5}));
-    assert_eq!(got[4], json!({"index": 1, "k": 1, "n": 5}));
+    assert_eq!(got[3], json!({"index": 3, "k": 3, "n": 5}));
+    assert_eq!(got[4], json!({"index": 2, "k": 1, "n": 5}));
     // Later walks the strength order and wraps after the last one.
     let walk = node(&json!([{"op": "later", "live": list, "steps": 6}]));
-    assert_eq!(walk[0], json!([1, 3, 2, 4, 0, 1, 3]));
+    assert_eq!(walk[0], json!([2, 1, 3, 0, 4, 2, 1]));
 }
 
 #[test]
@@ -377,7 +378,7 @@ fn an_accepted_add_is_fitted_before_the_next_suggestion() {
         a["done_key"], "accept",
         "the next suggestion answers to y again"
     );
-    // The relabel (strength band 3) is what Accept box brings up.
+    // The relabel (strength band 4) is what Accept box brings up.
     assert_eq!(a["next"], json!({"index": 1, "k": 1, "n": 3}));
     assert_eq!(a["tighten"], -1);
 }

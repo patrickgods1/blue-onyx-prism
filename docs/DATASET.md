@@ -681,8 +681,9 @@ then with one under 0.2, then under 0.3, then two objects, then the weak band, t
 each by the zoom's score. Frames with no live suggestion follow in the order above.
 
 Under `auto=refine` every listed frame has a live suggestion; they come strongest first by the frame's
-strongest one (item field `refine_strength`, `refine::strength`: `add` 4, `relabel` 3, `tighten` 2,
-`verify` 1, times 1000, plus the score in thousandths), then in the order above. `refine_open` is how many of
+strongest one (item field `refine_strength`, `refine::strength`: `relabel` 4, `add` 3, `verify` 2,
+`tighten` 1, times 1000, plus the score in thousandths; per error a wrong class costs a detector the most,
+then a missing box, then a loose one), then in the order above. `refine_open` is how many of
 the frame's suggestions are live (of `refine_kind` when given).
 
 **Balancing the dataset.** `balance=` takes a comma list of `class`, `scene` and `camera` (page: Filters >

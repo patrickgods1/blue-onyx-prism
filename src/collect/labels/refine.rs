@@ -85,13 +85,14 @@ impl Kind {
         }
     }
 
-    /// The band of [`strength`]: what a reviewer gains most from first.
+    /// The band of [`strength`]: what costs a model most per error first. A wrong class, then a
+    /// missing object, then a label no model found, then a loose box.
     const fn band(self) -> u32 {
         match self {
-            Kind::Add => 4,
-            Kind::Relabel => 3,
-            Kind::Tighten => 2,
-            Kind::Verify => 1,
+            Kind::Relabel => 4,
+            Kind::Add => 3,
+            Kind::Verify => 2,
+            Kind::Tighten => 1,
             Kind::Unknown => 0,
         }
     }
@@ -334,7 +335,7 @@ pub fn live_json(f: &LabelFile, wanted: Option<&Wanted<'_>>) -> Vec<serde_json::
 }
 
 /// How strong a suggestion is, higher first; 0 for an answered one or one of an unknown kind. The
-/// band by kind (add 4, relabel 3, tighten 2, verify 1), then the score:
+/// band by kind (relabel 4, add 3, verify 2, tighten 1), then the score:
 /// `band * 1000 + round(score * 999)`.
 pub fn strength(s: &Suggestion) -> u32 {
     let band = s.kind.band();
@@ -913,7 +914,7 @@ mod tests {
                 ]
             );
             assert_eq!(open_count(&f, wanted), 4);
-            assert_eq!(frame_strength(&f, wanted), 4000 + 899);
+            assert_eq!(frame_strength(&f, wanted), 4000 + 799, "the relabel");
         }
         // A pending box is no training box: nothing to tighten, relabel or verify.
         let mut pending = f.clone();
@@ -1721,7 +1722,7 @@ mod tests {
         assert_eq!((a.written, a.removed, a.dropped), (1, 1, 2));
         assert_eq!(
             f.refine,
-            [add("person", MAN, 0.9), tighten(CAR, TIGHT), verify(CAR)]
+            [add("person", MAN, 0.9), verify(CAR), tighten(CAR, TIGHT)]
         );
         // A found suggestion carrying an answer is no finding.
         let a = apply(
@@ -1778,8 +1779,8 @@ mod tests {
             let x = 10.0 * i as f32;
             [x, 300.0, x + 8.0, 320.0]
         };
-        // 60 open verifies of the folds and one answered one; the closer look writes 10 tightens,
-        // a stronger kind (band 2 over 1): its own weakest go, never a verify.
+        // 60 open verifies of the folds and one answered one; the closer look writes 10 tightens
+        // (band 1 under verify's 2): its own weakest go, never a verify.
         let mut before: Vec<Suggestion> = (0..60).map(|i| verify(row(i))).collect();
         before.push(answered(verify(row(60)), Answer::Kept));
         let mut f = file(vec![accepted("car", row(60))], before.clone());
@@ -1803,8 +1804,8 @@ mod tests {
             .collect();
         assert_eq!(kept, [59, 58, 57], "the strongest of its own");
         check(&f.refine).unwrap();
-        // Mirrored: 60 open tightens of an earlier look; a fold's write of 10 adds (band 4) keeps
-        // them all and gives up its own weakest adds.
+        // Mirrored: 60 open tightens of an earlier look; a fold's write of 10 adds, a stronger kind
+        // (band 3 over 1), keeps them all and gives up its own weakest adds.
         let before: Vec<Suggestion> = (0..60).map(|i| tighten(row(i), low(i))).collect();
         let mut f = file(vec![], before.clone());
         let found: Vec<Suggestion> = (0..10)
@@ -1838,21 +1839,24 @@ mod tests {
 
     #[test]
     fn strength_orders_kinds_then_scores() {
+        // What costs a model most per error first: a wrong class, a missing object, a label no
+        // model found, a loose box.
         let order = [
+            relabel(CAR, "person"),
             add("car", CAR, 0.9),
             add("car", CAR, 0.1),
-            relabel(CAR, "person"),
-            tighten(CAR, TIGHT),
             verify(CAR),
+            tighten(CAR, TIGHT),
         ];
         let got: Vec<u32> = order.iter().map(strength).collect();
         assert!(got.windows(2).all(|p| p[0] > p[1]), "{got:?}");
-        assert_eq!(strength(&add("car", CAR, 1.0)), 4999);
-        assert_eq!(strength(&add("car", CAR, 0.0)), 4000);
-        assert_eq!(strength(&verify(CAR)), 1000, "no score");
+        assert_eq!(got, [4799, 3899, 3100, 2000, 1799]);
+        assert_eq!(strength(&add("car", CAR, 1.0)), 3999);
+        assert_eq!(strength(&add("car", CAR, 0.0)), 3000);
+        assert_eq!(strength(&verify(CAR)), 2000, "no score");
         let mut nan = add("car", CAR, 0.5);
         nan.score = Some(f32::NAN);
-        assert_eq!(strength(&nan), 4000);
+        assert_eq!(strength(&nan), 3000);
         assert_eq!(strength(&answered(add("car", CAR, 0.9), Answer::Kept)), 0);
         assert_eq!(
             strength(&Suggestion {
