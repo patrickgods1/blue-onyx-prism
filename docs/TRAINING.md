@@ -1440,7 +1440,9 @@ in `training/autolabel/triage.rs`; change them only after measuring again.
 - **Hidden boxes are recoverable.** They stay in the label file. *Show N hidden* or `i` shows a frame's
   boxes dimmed, `auto=dismissed` finds the frames, and accepting one makes it a label. They are no hard
   negatives and teach no spot memory, since nobody judged them. Before you save, *Anything missing?* says
-  how many are hidden. No bulk save takes a frame with hidden boxes: a saved frame claims it is complete,
+  how many are hidden; `q` (or *Look in quarters*) then zooms to each quarter of the frame in turn
+  (`QUARTER_SHARE` 0.55 of each side, so an object on a centre line is whole in one; Esc or a fifth
+  press shows the whole frame), because missed objects are mostly small or distant. No bulk save takes a frame with hidden boxes: a saved frame claims it is complete,
   so a real object nobody looked at would train as background.
 - **The filter is checked.** About 2% of the boxes that would be hidden stay visible, marked *audit sample:
   normally hidden*. The same box gets the same answer on a rerun. Your verdicts show on the Review tab

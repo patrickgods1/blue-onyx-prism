@@ -267,6 +267,9 @@
   var backStack = [], fwdStack = [];   // frames left by Back (`p`) / by moving on, for `p` and `n`
   var missingAsked = null;             // the frame "Anything missing?" was asked on
   var askMissing = pref('askMissing', true);
+  var quarter = -1;                    // `q` while "Anything missing?" is open: the quarter shown
+                                       // (0..3, ReviewTouch.quarterView), -1 the whole frame
+  var quarterFollow = false;           // view.follow before the look (restored after it)
   var frameStart = 0;                  // when the frame was loaded (session pace)
   var servedBoxes = [];                // the frame's boxes as served (session box count)
   var session = {
@@ -295,6 +298,9 @@
     added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff', ghost: '#b26bff'
   };
   var MAX_ZOOM = 8;
+  // The quarter look's share of the frame's width and height: neighbours overlap by 10%, so an
+  // object on a centre line is whole in one quarter.
+  var QUARTER_SHARE = 0.55;
   var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
   var CLICK_CSS = 4;    // a pointer that moves less than this is a click
   var TAP_CSS = 10;     // the same for a finger, which is never still
@@ -936,8 +942,46 @@
 
   function fit() {
     view.z = 1; view.ox = 0; view.oy = 0; view.follow = false;
+    quarter = -1;
     draw();
   }
+
+  // ---- "Anything missing?" in quarters (`q`, the question's Look in quarters button) ----------
+  // Missed objects are mostly small or distant, and the question shows the whole frame: each step
+  // zooms to the next quarter (ReviewTouch.quarterView: top left, top right, bottom left, bottom
+  // right, each QUARTER_SHARE of the frame's sides), the fifth back to the whole frame. Following
+  // the selection is off during the look (a drawn box is not zoomed to) and comes back after it,
+  // without touching the saved preference. Only while the question is open on this frame.
+  function quarterOpen() { return !!cur && missingAsked === cur.frame; }
+
+  function lookQuarter() {
+    if (!quarterOpen()) return false;
+    if (quarter < 0) quarterFollow = view.follow;
+    var next = quarter + 1;
+    if (next > 3) { endQuarters(); return true; }
+    var r = window.ReviewTouch.quarterView(next, canvas.width, canvas.height, QUARTER_SHARE);
+    quarter = next;
+    view.follow = false;
+    view.z = canvas.width / (r[2] - r[0]);
+    view.ox = r[0]; view.oy = r[1];
+    clampView();
+    refresh();
+    say(missingText());
+    return true;
+  }
+
+  // Back to the whole frame (the fifth `q`, Esc, Fit): following as it was before the look.
+  function endQuarters() {
+    if (quarter < 0) return false;
+    quarter = -1;
+    view.follow = quarterFollow;
+    view.z = 1; view.ox = 0; view.oy = 0;
+    refresh();
+    if (quarterOpen()) say(missingText());
+    return true;
+  }
+
+  var QUARTER_NAMES = ['Top left', 'Top right', 'Bottom left', 'Bottom right'];
 
   // Zoom so the box `b` with a margin fills about 60% of the view, centred on it.
   function zoomTo(b) {
@@ -960,6 +1004,7 @@
   function zoomToSelected() {
     var b = viewTarget();
     if (!b) { say('No box selected: j selects one.'); return false; }
+    quarter = -1;
     view.follow = true;
     zoomTo(b);
     draw();
@@ -969,7 +1014,11 @@
   // The viewer's choice (`x`, `f`, the Zoom to box / Fit toggle, View's Fit whole frame): kept
   // for the next frames (followPref). The wheel, a pinch or a pan only hold this frame's view.
   function chooseZoom() { if (zoomToSelected()) setFollowPref(true); }
-  function chooseFit() { setFollowPref(false); fit(); }
+  // During the quarter look Fit ends the look: the whole frame, the preference as it was.
+  function chooseFit() {
+    if (endQuarters()) return;
+    setFollowPref(false); fit();
+  }
 
   // Zoom by `factor` keeping the canvas point (cx, cy) on the same frame point.
   function zoomAt(cx, cy, factor) {
@@ -1812,12 +1861,26 @@
   function missingText() {
     var n = dismissedOn ? 0 : dismissedCount();
     var pick = isRandomPick() ? 'A random pick scores models, so it must be complete. ' : '';
+    // In a quarter: which one, and that the look goes on.
+    var where = quarter >= 0 ? QUARTER_NAMES[quarter] + ' quarter (' + (quarter + 1) + ' of 4). ' : '';
     if (noHover.matches) {
-      return pick + 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
+      return where + pick + 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
         (n ? ' (' + n + ' hidden: Show them under the question)' : '') + '; Save & next saves.';
     }
-    return pick + 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
-      (n ? n + ' hidden: i shows them; ' : '') + 's saves.';
+    return where + pick + 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
+      (n ? n + ' hidden: i shows them; ' : '') + 'q looks in four zoomed quarters' +
+      (quarter >= 0 ? ' (Esc: whole frame)' : '') + '; s saves.';
+  }
+
+  // The question's quarter look as a button (the touch UI has no `q`): Look in quarters, Next
+  // quarter, and from the last one back to the whole frame.
+  function quarterButtons() {
+    var row = el('div', 'rv-q-btns');
+    var text = quarter < 0 ? 'Look in quarters' : (quarter < 3 ? 'Next quarter' : 'Whole frame');
+    var look = decideButton(text, 'q', 'secondary', lookQuarter);
+    look.title = 'Small and distant objects are the ones most often missed: zoom to each quarter of the frame in turn (top left, top right, bottom left, bottom right), then the whole frame again';
+    row.appendChild(look);
+    return row;
   }
 
   // The frame's progress: the boxes the reviewer sees, undecided / decided but not checked / done.
@@ -1906,6 +1969,7 @@
           : (p.total ? (tap ? 'Every box decided: Save & next saves.' : 'Every box decided: s saves.')
             : (tap ? 'No box: turn on Draw to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
               : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
+      if (!refBlock && !p.undecided && !p.unchecked && quarterOpen()) decide.appendChild(quarterButtons());
     } else {
       var i = selected;
       var q = el('div', 'rv-q');
@@ -1964,6 +2028,8 @@
         btns.appendChild(small);
       }
       decide.appendChild(btns);
+      // A box drawn (or selected) during the quarter look: the look goes on from here.
+      if (quarter >= 0 && quarterOpen()) decide.appendChild(quarterButtons());
       var mate = dupPartner(i);
       if (mate >= 0) {
         var mb = boxes()[mate];
@@ -2187,7 +2253,8 @@
     // One column: the frame is the editor, so another box is zoomed to again even after a pan, a
     // pinch or an overview tap ended the follow (those hold the view for the box they were made
     // on; a page scroll started on the frame pans it). Fit stays the viewer's choice (pref).
-    if (oneColumn.matches && selected !== was && boxes()[selected]) view.follow = pref('follow', true);
+    // The quarter look holds its view (following is off until it ends).
+    if (oneColumn.matches && selected !== was && boxes()[selected] && quarter < 0) view.follow = pref('follow', true);
     // Touch: the reason chips stay until the selection moves on; Redraw is of the box it started on.
     if (reasonAsk && !reasonAsk.timer && selected !== reasonAsk.sel) clearReason(true);
     if (taps && taps.kind === 'redraw' && selected !== taps.idx) cancelTaps();
@@ -3254,8 +3321,8 @@
     // Off the touch UI the toggles have no button: they go off.
     if (!touchUi.matches) { drawMode = false; taps = null; }
     if (viewMenu) viewMenu.open = false;
-    // Each layout keeps its own Zoom to box / Fit choice.
-    view.follow = followPref();
+    // Each layout keeps its own Zoom to box / Fit choice (after the quarter look, if one is on).
+    if (quarter >= 0) quarterFollow = followPref(); else view.follow = followPref();
     touchWords();
     placeAcceptAll();
     if (cur) refresh(); else touchViewUi();
@@ -3582,7 +3649,7 @@
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       sizeFloor = j.size_floor || null;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null; taps = null;
-      emptyBackup = null; missingAsked = null; frameStart = Date.now();
+      emptyBackup = null; missingAsked = null; quarter = -1; frameStart = Date.now();
       // Asking for these frames means asking to see those boxes.
       dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
       canvas.width = j.width || 640;
@@ -4092,11 +4159,12 @@
     ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
     ['Decide', '', 'The next box is the next likely (★) one, then the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
     ['Navigate', 'j / k', 'select the next / previous box'],
-    ['Navigate', 'Esc', 'no box selected'],
+    ['Navigate', 'Esc', 'no box selected (during the quarter look: the whole frame first)'],
     ['Navigate', 'n', 'next frame without saving (after Back: the frame you came from)'],
     ['Navigate', 'p', 'back to the previous frame of this session (as saved)'],
     ['Navigate', 'x', 'zoom to the selected box and follow the selection (the next box, the next frame) until f, the wheel or a pan'],
     ['Navigate', 'f', 'fit (zoom out)'],
+    ['Navigate', 'q', 'while "Anything missing?" asks: zoom to the top-left, top-right, bottom-left and bottom-right quarter in turn, then the whole frame again (small, distant objects are the ones most often missed; drawing works there, s saves)'],
     ['Navigate', 'wheel', 'zoom about the pointer (up to 8x)'],
     ['Navigate', 'right / middle drag, Space + drag', 'pan'],
     ['View', 'b', 'image (view only): auto, off, bright, bright + equalised; auto = bright + equalised on night / IR frames'],
@@ -4234,6 +4302,8 @@
     }
     else if (k === 'c') { if (!ev.shiftKey) acceptLikely(); }
     else if (k === 'i') toggleDismissed();
+    // `q`: the next quarter of "Anything missing?" (once per press; the browser's key otherwise).
+    else if (k === 'q') handled = quarterOpen() && (ev.repeat || lookQuarter());
     else if (k === '?') openKeys();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
@@ -4260,8 +4330,11 @@
         else rejectWith(selected, null);
       }
     } else if (k === 'Escape') {
-      // A two-tap box waiting for its corners is cancelled first (Draw itself stays on).
-      if (taps) cancelTaps(true); else select(-1);
+      // The quarter look goes back to the whole frame first; then a two-tap box waiting for its
+      // corners is cancelled (Draw itself stays on), else no box is selected.
+      if (!endQuarters()) {
+        if (taps) cancelTaps(true); else select(-1);
+      }
     }
     else if (/^[0-9]$/.test(k)) pickClass(k === '0' ? 9 : Number(k) - 1);
     else handled = false;
