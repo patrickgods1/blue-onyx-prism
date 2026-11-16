@@ -225,6 +225,27 @@ pub struct BalanceTally {
     pub empty: u64,
     pub scenes: BTreeMap<String, u64>,
     pub cameras: BTreeMap<String, u64>,
+    /// Per camera, per wanted class: the reviewed frames a model or auto-labeler proposed the class
+    /// on ([`proposed_labels`]), and how many of them kept it as a training box. A rejected
+    /// proposal adds nothing to [`Self::classes`], so without this a camera that keeps proposing a
+    /// false rare class would keep its frames first ([`Self::class_need`]).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub precision: BTreeMap<String, BTreeMap<String, Kept>>,
+}
+
+/// Reviewed frames on which a class was proposed, and those that kept it ([`BalanceTally::precision`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Kept {
+    pub kept: u64,
+    pub proposed: u64,
+}
+
+impl Kept {
+    /// Below 1: the class need is weighed by `(kept + 2) / (proposed + 2)`, which is 1 exactly with
+    /// no proposal and with every proposal kept.
+    fn lowers(self) -> bool {
+        self.kept < self.proposed
+    }
 }
 
 /// The class part of a frame's [`BalanceNeed`]: its wanted class whose need, weighed by how sure
@@ -238,12 +259,21 @@ pub(super) struct ClassNeed {
     pub reviewed: u64,
     /// How sure the frame is of [`Self::class`], in hundredths (100 without a class).
     pub confidence: u8,
+    /// The camera's proposals of [`Self::class`] when they lowered the need (some were not kept).
+    pub kept: Option<Kept>,
 }
 
 impl BalanceTally {
     /// Add `n` reviewed frames of `scene` and `camera` whose training boxes have the wanted
-    /// classes `classes`.
-    pub(super) fn add(&mut self, n: u64, scene: &str, camera: &str, classes: &BTreeSet<String>) {
+    /// classes `classes`, on which a model or auto-labeler proposed the wanted classes `proposed`.
+    pub(super) fn add(
+        &mut self,
+        n: u64,
+        scene: &str,
+        camera: &str,
+        classes: &BTreeSet<String>,
+        proposed: &BTreeSet<String>,
+    ) {
         for c in classes {
             *self.classes.entry(c.clone()).or_default() += n;
         }
@@ -252,6 +282,16 @@ impl BalanceTally {
         }
         *self.scenes.entry(scene.to_string()).or_default() += n;
         *self.cameras.entry(camera.to_string()).or_default() += n;
+        if !proposed.is_empty() {
+            let of = self.precision.entry(camera.to_string()).or_default();
+            for c in proposed {
+                let k = of.entry(c.clone()).or_default();
+                k.proposed += n;
+                if classes.contains(c) {
+                    k.kept += n;
+                }
+            }
+        }
     }
 
     fn merge(&mut self, other: Self) {
@@ -260,6 +300,7 @@ impl BalanceTally {
             empty,
             scenes,
             cameras,
+            precision,
         } = other;
         for (k, n) in classes {
             *self.classes.entry(k).or_default() += n;
@@ -271,15 +312,36 @@ impl BalanceTally {
         for (k, n) in cameras {
             *self.cameras.entry(k).or_default() += n;
         }
+        for (camera, of) in precision {
+            let mine = self.precision.entry(camera).or_default();
+            for (c, k) in of {
+                let m = mine.entry(c).or_default();
+                m.kept += k.kept;
+                m.proposed += k.proposed;
+            }
+        }
     }
 
-    /// The class part for a frame with the wanted classes `classes` (each with how sure the frame
-    /// is of it, in hundredths): the class whose need ([`lack`]) x confidence is the highest, so
-    /// a likely box of a rare class comes before an unlikely one (a review of a false box adds
-    /// nothing to the class); on a tie the one with fewer reviewed frames, then the first by name.
-    /// With no wanted class, the empty frames' count: the empty frames are a value of the class
-    /// dimension, a dataset of reviewed cars and no negatives needs empty frames.
-    pub(super) fn class_need(&self, classes: &BTreeMap<String, u8>) -> ClassNeed {
+    /// The proposals of `class` on `camera`'s reviewed frames (none: zero both).
+    fn kept(&self, camera: &str, class: &str) -> Kept {
+        self.precision
+            .get(camera)
+            .and_then(|of| of.get(class))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The class part for a frame of `camera` with the wanted classes `classes` (each with how
+    /// sure the frame is of it, in hundredths): the class whose need ([`lack`]) x confidence x the
+    /// camera's kept share of its proposals is the highest, so a likely box of a rare class comes
+    /// before an unlikely one (a review of a false box adds nothing to the class), and a camera
+    /// whose proposals of the class were rejected stops putting its frames first; on a tie the one
+    /// with fewer reviewed frames, then the first by name. The kept share is
+    /// `(kept + 2) / (proposed + 2)` ([`Self::precision`]): 1 with no proposal reviewed, so a
+    /// camera starts unweighed and a few rejects only lower it a little. Integer math, rounded
+    /// down once. With no wanted class, the empty frames' count: the empty frames are a value of
+    /// the class dimension, a dataset of reviewed cars and no negatives needs empty frames.
+    pub(super) fn class_need(&self, classes: &BTreeMap<String, u8>, camera: &str) -> ClassNeed {
         let most = self
             .classes
             .values()
@@ -291,7 +353,8 @@ impl BalanceTally {
         for (c, &sure) in classes {
             let sure = sure.min(100);
             let reviewed = self.classes.get(c).copied().unwrap_or(0);
-            let need = lack(reviewed, most) * u32::from(sure) / 100;
+            let kept = self.kept(camera, c);
+            let need = weighed_need(lack(reviewed, most), sure, kept);
             if best.as_ref().is_none_or(|b| {
                 (need, std::cmp::Reverse(reviewed)) > (b.need, std::cmp::Reverse(b.reviewed))
             }) {
@@ -300,6 +363,7 @@ impl BalanceTally {
                     class: Some(c.clone()),
                     reviewed,
                     confidence: sure,
+                    kept: kept.lowers().then_some(kept),
                 });
             }
         }
@@ -308,6 +372,7 @@ impl BalanceTally {
             class: None,
             reviewed: self.empty,
             confidence: 100,
+            kept: None,
         })
     }
 
@@ -347,6 +412,8 @@ impl BalanceTally {
                 .as_ref()
                 .filter(|c| c.class.is_some())
                 .map(|c| f32::from(c.confidence) / 100.0),
+            class_kept: class.as_ref().and_then(|c| c.kept).map(|k| k.kept),
+            class_proposed: class.as_ref().and_then(|c| c.kept).map(|k| k.proposed),
             class: class.and_then(|c| c.class),
             scene_reviewed: scene.map(|s| s.1),
             camera_reviewed: camera.map(|c| c.1),
@@ -354,12 +421,22 @@ impl BalanceTally {
     }
 }
 
+/// A class's `lack` x `sure` / 100 x `(kept + 2) / (proposed + 2)`, rounded down once: the class
+/// part of [`BalanceTally::class_need`]. Exactly `lack x sure / 100` with no proposal or every
+/// proposal kept.
+fn weighed_need(lack: u32, sure: u8, kept: Kept) -> u32 {
+    let num = u128::from(lack) * u128::from(sure) * (u128::from(kept.kept) + 2);
+    let den = 100 * (u128::from(kept.proposed) + 2);
+    u32::try_from(num / den).unwrap_or(BALANCE_NEED_MAX)
+}
+
 /// Why `balance=` places a frame where it does ([`BalanceTally::need`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct BalanceNeed {
     /// Higher first: per dimension balanced by, [`BALANCE_NEED_MAX`] x (1 - the frame's value's
     /// reviewed frames / the most reviewed value's), summed; the class's part also x how sure
-    /// the frame is of the class ([`Self::class_score`]).
+    /// the frame is of the class ([`Self::class_score`]) and x the camera's kept share of the
+    /// class's proposals ([`Self::class_kept`]).
     pub score: u32,
     /// Balancing classes: the frame's wanted class with the highest need x confidence
     /// ([`BalanceTally::class_need`]); absent with `class_reviewed` = the frame has no wanted class
@@ -374,6 +451,13 @@ pub struct BalanceNeed {
     /// without a label file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub class_score: Option<f32>,
+    /// Of the reviewed frames of the frame's camera on which a model or auto-labeler proposed
+    /// [`Self::class`] ([`Self::class_proposed`]), those that kept it: both only when some were
+    /// not kept, which lowered the class part by `(kept + 2) / (proposed + 2)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_kept: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_proposed: Option<u64>,
     /// Reviewed frames of the frame's scene, balancing scenes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene_reviewed: Option<u64>,
@@ -604,6 +688,36 @@ pub(super) fn file_labels(l: &LabelFile) -> BTreeSet<String> {
         .filter(|b| b.state != super::BoxState::Rejected)
         .map(|b| b.label.clone())
         .collect()
+}
+
+/// The label a model or auto-labeler proposed with `b`, when a reviewer decided on it: an accepted
+/// or rejected model or auto box, its `model_label` when the reviewer relabelled it to another class
+/// (a truck proposal kept as a car was no truck). None for a box drawn by hand, one still pending,
+/// a dismissal ([`super::bulk::is_dismissal`]: nobody judged it), a duplicate (a second box on an
+/// object says nothing about the class) and an ignore region ([`super::LabelBox::is_ignore`]).
+fn proposed_label(b: &super::LabelBox) -> Option<&str> {
+    let decided = matches!(b.state, BoxState::Accepted | BoxState::Rejected);
+    let duplicate = b.reject_reason == Some(super::RejectReason::Duplicate)
+        || b.reason.as_deref() == Some(super::stacks::DUPLICATE_REASON);
+    if b.source == super::Source::Human
+        || !decided
+        || duplicate
+        || b.is_ignore()
+        || super::bulk::is_dismissal(b.reason.as_deref())
+    {
+        return None;
+    }
+    Some(match b.model_label.as_deref() {
+        Some(m) if !crate::model::coco::same_class(m, &b.label) => m,
+        _ => b.label.as_str(),
+    })
+}
+
+/// The labels models and auto-labelers proposed on `l` and a reviewer decided on
+/// ([`proposed_label`]), as written: [`Filters::wanted_of`] makes them the wanted classes
+/// [`BalanceTally::precision`] counts by.
+pub(super) fn proposed_labels(l: &LabelFile) -> BTreeSet<&str> {
+    l.boxes.iter().filter_map(proposed_label).collect()
 }
 
 /// A score in 0..=1 as hundredths, 0..=100.
@@ -1085,7 +1199,8 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
             && let Some(l) = labels.as_ref().filter(|l| l.status == Status::Reviewed)
         {
             let trained = f.wanted_of(l.training().map(|b| b.label.as_str()));
-            q.balance.add(1, &c.scene, &c.camera, &trained);
+            let proposed = f.wanted_of(proposed_labels(l));
+            q.balance.add(1, &c.scene, &c.camera, &trained, &proposed);
         }
         let status = labels.as_ref().map_or(Status::Unreviewed, |l| l.status);
         if let StatusFilter::Is(s) = f.status
@@ -1124,7 +1239,7 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
 /// with how sure each frame is of them, in their order.
 fn weigh(items: &mut [Item], wanted: &[BTreeMap<String, u8>], tally: &BalanceTally, by: Balance) {
     for (item, classes) in items.iter_mut().zip(wanted) {
-        let class = by.class.then(|| tally.class_need(classes));
+        let class = by.class.then(|| tally.class_need(classes, &item.camera));
         item.uncertainty.balance = Some(tally.need(by, class, &item.scene, &item.camera));
     }
 }
@@ -2531,35 +2646,36 @@ mod tests {
         assert_eq!(lack(0, 0), 0, "nothing reviewed: nothing is rarer");
         let set = |l: &[&str]| l.iter().map(|s| (*s).to_string()).collect::<BTreeSet<_>>();
         let mut t = BalanceTally::default();
-        t.add(10, "day", "gate", &set(&["car"]));
-        t.add(2, "ir", "gate", &set(&["car", "truck"]));
-        t.add(4, "day", "back", &set(&[]));
+        // No proposal counted: the kept share is 1, the needs are those without it.
+        t.add(10, "day", "gate", &set(&["car"]), &set(&[]));
+        t.add(2, "ir", "gate", &set(&["car", "truck"]), &set(&[]));
+        t.add(4, "day", "back", &set(&[]), &set(&[]));
         // car 12, truck 2, empty 4; day 14, ir 2; gate 12, back 4.
         let sure = |l: &[(&str, u8)]| {
             l.iter()
                 .map(|(c, s)| ((*c).to_string(), *s))
                 .collect::<BTreeMap<_, _>>()
         };
-        let truck = t.class_need(&sure(&[("car", 100), ("truck", 100)]));
+        let truck = t.class_need(&sure(&[("car", 100), ("truck", 100)]), "gate");
         assert_eq!(
             truck.class.as_deref(),
             Some("truck"),
             "the rarest class decides"
         );
         assert_eq!((truck.need, truck.reviewed), (833, 2));
-        let bus = t.class_need(&sure(&[("bus", 100), ("car", 100)]));
+        let bus = t.class_need(&sure(&[("bus", 100), ("car", 100)]), "gate");
         assert_eq!(
             (bus.class.as_deref(), bus.need),
             (Some("bus"), BALANCE_NEED_MAX)
         );
-        let empty = t.class_need(&sure(&[]));
+        let empty = t.class_need(&sure(&[]), "gate");
         assert_eq!((empty.class, empty.need, empty.reviewed), (None, 666, 4));
         // Weighed by how sure the frame is: a 0.3 truck (833 x 0.3 = 249) loses to a sure bus (1000).
-        let unsure = t.class_need(&sure(&[("bus", 100), ("truck", 30)]));
+        let unsure = t.class_need(&sure(&[("bus", 100), ("truck", 30)]), "gate");
         assert_eq!((unsure.class.as_deref(), unsure.need), (Some("bus"), 1000));
-        let weak = t.class_need(&sure(&[("truck", 30)]));
+        let weak = t.class_need(&sure(&[("truck", 30)]), "gate");
         assert_eq!((weak.need, weak.confidence), (249, 30));
-        let strong = t.class_need(&sure(&[("truck", 90)]));
+        let strong = t.class_need(&sure(&[("truck", 90)]), "gate");
         assert_eq!(strong.need, 749, "the likelier truck needs more");
         assert_eq!(t.scene_need("ir"), (857, 2));
         assert_eq!(t.camera_need("nowhere"), (BALANCE_NEED_MAX, 0));
@@ -2573,6 +2689,239 @@ mod tests {
         assert_eq!(need.class_reviewed, Some(2));
         assert_eq!(need.scene_reviewed, Some(2));
         assert_eq!(need.camera_reviewed, None);
+    }
+
+    #[test]
+    fn a_cameras_rejected_proposals_of_a_class_lower_its_need() {
+        let set = |l: &[&str]| l.iter().map(|s| (*s).to_string()).collect::<BTreeSet<_>>();
+        let mut t = BalanceTally::default();
+        // car on 20 frames of gate, every proposal kept.
+        t.add(20, "day", "gate", &set(&["car"]), &set(&["car"]));
+        // bush proposed a bicycle on 10 reviewed frames and none was one.
+        t.add(10, "day", "bush", &set(&[]), &set(&["bicycle"]));
+        // yard: a bicycle proposed and kept.
+        t.add(1, "day", "yard", &set(&["bicycle"]), &set(&["bicycle"]));
+        // hill: 2 of 5 kept.
+        t.add(2, "day", "hill", &set(&["bicycle"]), &set(&["bicycle"]));
+        t.add(3, "day", "hill", &set(&[]), &set(&["bicycle"]));
+        let k = |kept, proposed| Kept { kept, proposed };
+        assert_eq!(t.precision["bush"]["bicycle"], k(0, 10));
+        assert_eq!(t.precision["hill"]["bicycle"], k(2, 5));
+        assert_eq!(t.precision["gate"]["car"], k(20, 20));
+        assert!(!t.precision.contains_key("lane"));
+        // car 20, bicycle 3, empty 13: the bicycle lacks 850.
+        let bike = BTreeMap::from([("bicycle".to_string(), 60_u8)]);
+        let plain = t.class_need(&bike, "lane");
+        assert_eq!((plain.need, plain.kept), (510, None), "no data: 850 x 0.6");
+        let bush = t.class_need(&bike, "bush");
+        assert_eq!(
+            (bush.need, bush.kept),
+            (85, Some(k(0, 10))),
+            "850 x 0.6 x 2 / 12"
+        );
+        assert!(bush.need < plain.need);
+        let yard = t.class_need(&bike, "yard");
+        assert_eq!(
+            (yard.need, yard.kept),
+            (510, None),
+            "a kept proposal lowers nothing: (1 + 2) / (1 + 2)"
+        );
+        let hill = t.class_need(&bike, "hill");
+        assert_eq!((hill.need, hill.kept), (291, Some(k(2, 5))), "510 x 4 / 7");
+        // Another class of the frame wins once the bush's bicycle is weighed down.
+        let both = BTreeMap::from([("bicycle".to_string(), 60_u8), ("car".to_string(), 100)]);
+        assert_eq!(
+            t.class_need(&both, "bush").class.as_deref(),
+            Some("bicycle")
+        );
+        let by = Balance {
+            class: true,
+            ..Balance::default()
+        };
+        let need = t.need(by, Some(bush), "day", "bush");
+        assert_eq!(
+            (need.score, need.class_kept, need.class_proposed),
+            (85, Some(0), Some(10))
+        );
+        let json = serde_json::to_value(&need).unwrap();
+        assert_eq!(json["class_proposed"], 10);
+        let lane = t.need(by, Some(plain), "day", "lane");
+        let json = serde_json::to_value(&lane).unwrap();
+        assert!(json.get("class_kept").is_none() && json.get("class_proposed").is_none());
+        // Additive: two halves merged are the whole.
+        let mut a = BalanceTally::default();
+        let mut b = BalanceTally::default();
+        a.add(3, "day", "hill", &set(&[]), &set(&["bicycle"]));
+        b.add(2, "day", "hill", &set(&["bicycle"]), &set(&["bicycle"]));
+        a.merge(b);
+        assert_eq!(a.precision["hill"]["bicycle"], k(2, 5));
+    }
+
+    #[test]
+    fn the_kept_share_is_integer_math_rounded_down_once() {
+        let k = |kept, proposed| Kept { kept, proposed };
+        // 950 x 61 x 4 / 700 = 331.14; rounding 950 x 61 / 100 first would give 579 x 4 / 7 = 330.
+        assert_eq!(weighed_need(950, 61, k(2, 5)), 331);
+        // No data and all kept: exactly lack x sure / 100.
+        for (lack, sure) in [(950, 61), (1000, 100), (1, 99), (0, 50), (333, 3)] {
+            let plain = lack * u32::from(sure) / 100;
+            assert_eq!(weighed_need(lack, sure, k(0, 0)), plain);
+            assert_eq!(weighed_need(lack, sure, k(7, 7)), plain);
+        }
+        assert_eq!(weighed_need(1000, 100, k(0, 10)), 166, "1000 x 2 / 12");
+        assert_eq!(weighed_need(1000, 100, k(0, u64::MAX - 2)), 0);
+        assert_eq!(weighed_need(1000, 100, k(u64::MAX - 2, u64::MAX - 2)), 1000);
+    }
+
+    #[test]
+    fn proposed_labels_are_decided_machine_boxes() {
+        use super::super::tests_support::auto_box;
+        use super::super::{LabelBox, RejectReason, Source};
+        let b = |label: &str, state: BoxState| LabelBox {
+            state,
+            ..auto_box(label)
+        };
+        let human = LabelBox {
+            source: Source::Human,
+            ..b("person", BoxState::Added)
+        };
+        let human_rejected = LabelBox {
+            source: Source::Human,
+            ..b("horse", BoxState::Rejected)
+        };
+        let dismissed = LabelBox {
+            reason: Some(super::super::bulk::DISMISSED_REASON.into()),
+            ..b("cow", BoxState::Rejected)
+        };
+        let duplicate = LabelBox {
+            reject_reason: Some(RejectReason::Duplicate),
+            ..b("sheep", BoxState::Rejected)
+        };
+        let small = LabelBox {
+            reject_reason: Some(RejectReason::TooSmall),
+            ..b("cat", BoxState::Rejected)
+        };
+        let unsure = LabelBox {
+            difficult: true,
+            ..b("bird", BoxState::Accepted)
+        };
+        // Relabelled by the reviewer: the proposal was a truck.
+        let relabelled = LabelBox {
+            model_label: Some("truck".into()),
+            ..b("car", BoxState::Accepted)
+        };
+        // The model's spelling of the same class: the box's label.
+        let spelled = LabelBox {
+            model_label: Some("motorbike".into()),
+            ..b("motorcycle", BoxState::Accepted)
+        };
+        let l = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![
+                b("bicycle", BoxState::Rejected),
+                b("dog", BoxState::Accepted),
+                b("bus", BoxState::Pending),
+                human,
+                human_rejected,
+                dismissed,
+                duplicate,
+                small,
+                unsure,
+                relabelled,
+                spelled,
+            ],
+            ..LabelFile::default()
+        };
+        assert_eq!(
+            proposed_labels(&l),
+            BTreeSet::from(["bicycle", "dog", "motorcycle", "truck"])
+        );
+    }
+
+    #[test]
+    fn balance_sinks_a_camera_whose_proposals_of_the_class_were_rejected() {
+        use super::super::bulk::test_support::put_frame_at;
+        use super::super::tests_support::auto_box;
+        use super::super::{LabelBox, RejectReason};
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        let reviewed = |cam: &str, stem: &str, boxes: Vec<LabelBox>| {
+            let rel = put_frame_at(&dir, cam, stem, (64, 48), None, Vec::new());
+            let frame = Frame::resolve(&dir, &rel).unwrap();
+            let l = LabelFile {
+                status: Status::Reviewed,
+                boxes,
+                ..LabelFile::default()
+            };
+            super::super::write(&frame.labels, &l).unwrap();
+        };
+        // The most reviewed class: cars on gate.
+        for i in 0..12 {
+            let car = LabelBox {
+                state: BoxState::Accepted,
+                ..auto_box("car")
+            };
+            reviewed("gate", &format!("r_car{i:02}"), vec![car]);
+        }
+        // A bush the model calls a bicycle: proposed and rejected on 10 reviewed frames of bush.
+        for i in 0..10 {
+            let bush = LabelBox {
+                state: BoxState::Rejected,
+                reject_reason: Some(RejectReason::FalsePositive),
+                ..auto_box("bicycle")
+            };
+            reviewed("bush", &format!("r_bush{i:02}"), vec![bush]);
+        }
+        let pending = |cam: &str| {
+            let bike = LabelBox {
+                score: Some(0.6),
+                ..auto_box("bicycle")
+            };
+            put_frame_at(&dir, cam, "u_bike", (64, 48), None, vec![bike])
+        };
+        // The same frame on both cameras.
+        let on_bush = pending("bush");
+        let on_lane = pending("lane");
+        let f = Filters {
+            balance: Balance::parse("class").unwrap(),
+            status: StatusFilter::Is(Status::Unreviewed),
+            source: QueueSource::All,
+            wanted: Some((["car", "bicycle"].map(String::from).to_vec(), Vec::new())),
+            ..Filters::default()
+        };
+        let q = build(&dir, &f);
+        let frames: Vec<&str> = q.items.iter().map(|i| i.frame.as_str()).collect();
+        assert_eq!(frames, [on_lane.as_str(), on_bush.as_str()]);
+        let need = |rel: &str| {
+            q.items
+                .iter()
+                .find(|i| i.frame == rel)
+                .and_then(|i| i.uncertainty.balance.clone())
+                .unwrap()
+        };
+        let (lane, bush) = (need(&on_lane), need(&on_bush));
+        // bicycle: 0 of 12 reviewed, so 1000 x 0.6; on bush x 2 / 12.
+        assert_eq!((lane.score, lane.class_proposed), (600, None));
+        assert_eq!(
+            (bush.score, bush.class_kept, bush.class_proposed),
+            (100, Some(0), Some(10))
+        );
+        assert_eq!(bush.class.as_deref(), Some("bicycle"));
+        let tally = q.balance.unwrap();
+        assert_eq!(
+            tally.precision["bush"]["bicycle"],
+            Kept {
+                kept: 0,
+                proposed: 10
+            }
+        );
+        assert_eq!(
+            tally.precision["gate"]["car"],
+            Kept {
+                kept: 12,
+                proposed: 12
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -877,6 +877,61 @@ mod cases {
         rels
     }
 
+    /// Frames that make `balance=class` weigh a camera's proposals: on `drive`, reviewed frames that
+    /// kept a car and rejected a dog proposal each; one unreviewed likely dog on `drive` and the
+    /// same on `lane`, a camera with no history. The two unreviewed ones, (drive, lane).
+    fn precision_frames(dir: &Path, seed: u64, rels: &mut Vec<String>) -> (String, String) {
+        let mut rng = Rng::new(seed ^ 0xd09);
+        let b = |label: &str, state: BoxState, at: usize| LabelBox {
+            label: label.into(),
+            bbox: PLACES[at],
+            source: Source::Auto,
+            score: Some(0.9),
+            state,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: (state == BoxState::Rejected).then_some(RejectReason::FalsePositive),
+            auto: AutoInfo::default(),
+        };
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes: vec![
+                b("car", BoxState::Accepted, 3),
+                b("dog", BoxState::Rejected, 4),
+            ],
+            ..LabelFile::default()
+        };
+        let pending = LabelFile {
+            boxes: vec![b("dog", BoxState::Pending, 4)],
+            ..LabelFile::default()
+        };
+        let mut index: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let mut put_one = |camera: &str, i: usize, f: &LabelFile| {
+            let rel = format!("day/{camera}/2026-10-20/20261021T{i:06}000Z_p{i}.jpg");
+            let rec = put(dir, &mut rng, &rel, Some(f));
+            let r = layout::parse_rel(&rel).unwrap();
+            let day = dir.join(&r.scene).join(&r.camera).join(&r.date);
+            let text = index.entry(day.join(INDEX_FILE)).or_default();
+            text.push_str(&index_line(&rec));
+            text.push('\n');
+            rels.push(rel.clone());
+            rel
+        };
+        for i in 0..24 {
+            put_one("drive", 500 + i, &reviewed);
+        }
+        let on_drive = put_one("drive", 600, &pending);
+        let on_lane = put_one("lane", 601, &pending);
+        for (path, text) in index {
+            std::fs::write(path, text).unwrap();
+        }
+        (on_drive, on_lane)
+    }
+
     /// The filters the comparison runs: every source x status x auto filter, and each other
     /// filter on its own, with `wanted`.
     fn grid(wanted: &(Vec<String>, Vec<String>)) -> Vec<Filters> {
@@ -1395,6 +1450,7 @@ mod cases {
             set_clock_ahead(&dir, Duration::from_secs(3600));
             let foreign = seed == 3;
             let mut rels = generate(&dir, seed, 120, foreign);
+            let (on_drive, on_lane) = precision_frames(&dir, seed, &mut rels);
             let mut rng = Rng::new(seed ^ 0xabc);
             let (a, b) = (wanted_a(), wanted_b());
             covers_every_case(&dir);
@@ -1419,6 +1475,23 @@ mod cases {
                 scores.len() > 2,
                 "seed {seed}: a trivial balance order {scores:?}"
             );
+            // The camera's rejected dog proposals moved its likely dog below the same on a camera
+            // with no history: the kept share is in the order, not a no-op.
+            let by_class = Filters {
+                balance: queue::Balance::parse("class").unwrap(),
+                ..all_any()
+            };
+            let built = queue::build(&dir, &by_class);
+            let place = |rel: &str| built.items.iter().position(|i| i.frame == rel).unwrap();
+            let need = |rel: &str| built.items[place(rel)].uncertainty.balance.clone().unwrap();
+            let (drive, lane) = (need(&on_drive), need(&on_lane));
+            assert_eq!(drive.class.as_deref(), Some("dog"), "seed {seed}");
+            assert_eq!(drive.class_kept, Some(0), "seed {seed}");
+            assert!(drive.class_proposed >= Some(24), "seed {seed}: {drive:?}");
+            assert_eq!(lane.class_proposed, None, "seed {seed}");
+            assert!(drive.score < lane.score, "seed {seed}: {drive:?} {lane:?}");
+            assert!(place(&on_lane) < place(&on_drive), "seed {seed}");
+            same_order(&dir, &by_class, &format!("seed {seed}, built, by class"));
             assert!(index_of(&dir).is_some());
 
             real_writes(&dir, &mut rng, &mut rels, &a);
@@ -1979,8 +2052,8 @@ mod cases {
         // A field that grows the row grows a 300,000 frame index by 300 kB a byte: say so here.
         assert_eq!(size_of::<Cand>(), 12);
         assert_eq!(size_of::<Side>(), 20);
-        assert_eq!(size_of::<Part>(), 36);
-        assert_eq!(size_of::<Row>(), 80);
+        assert_eq!(size_of::<Part>(), 40);
+        assert_eq!(size_of::<Row>(), 84);
     }
 
     #[test]

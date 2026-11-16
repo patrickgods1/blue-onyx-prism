@@ -3350,6 +3350,10 @@
       // The class part is weighed by how sure the frame is of the class (`class_score`).
       var sure = b.class_score != null && b.class_score < 1 ? ', score ' + b.class_score.toFixed(2) : '';
       parts.push(b.class != null ? b.class + ' (' + b.class_reviewed + ' reviewed' + sure + ')' : 'no wanted class (' + b.class_reviewed + ' empty frames reviewed)');
+      // And by the camera's kept share of the class's proposals, when some were not kept.
+      if (b.class != null && b.class_proposed != null) {
+        parts.push(b.class + ' on this camera: ' + (b.class_kept || 0) + ' of ' + b.class_proposed + ' proposals kept');
+      }
     }
     if (b.scene_reviewed != null) parts.push(item.scene + ' (' + b.scene_reviewed + ')');
     if (b.camera_reviewed != null) parts.push('camera ' + item.camera + ' (' + b.camera_reviewed + ')');

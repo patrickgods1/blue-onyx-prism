@@ -698,15 +698,23 @@ the most reviewed value (0 when nothing is reviewed yet). The class need is weig
 of the class: x its confidence, the best score of its pending boxes of the class (an accepted or added box, or a
 pending one with no score, counts 1), or of the sidecar's predictions without a label file. Reviewing a likely box
 of a rare class adds to that class; an unlikely one is mostly rejected and adds nothing, so a 0.95 truck comes
-before a 0.3 one. A frame's class is its wanted class with the highest weighed need, of its boxes that are not
+before a 0.3 one. It is also weighed by the camera's kept share of the class's proposals, `(kept + 2) /
+(proposed + 2)`: of the camera's reviewed frames on which a model or auto-labeler proposed the class (an accepted
+or rejected machine box of it, a relabelled one by its old label; not a dismissal, a duplicate or an ignore
+region), those that kept a training box of it. A rejected proposal never adds to the class, so without it a
+camera that keeps calling a bush a bicycle would keep its frames first however often the bicycle is rejected;
+with no proposal reviewed, or all of them kept, the share is 1. The class part is `lack x score x share`, rounded
+down once. A frame's class is its wanted class with the highest weighed need, of its boxes that are not
 rejected (pending ones too); ties go to fewer reviewed frames, then the first by name. The page's balancing note
 shows the score when it is under 1. The needs of the chosen dimensions add up (0..=3000) and the frames
 come highest first, right after the `overlaps`, `both` and `refine` orders and before everything above but
 repeat-only frames, which stay last; equal needs keep the usual order. The counts are worked out again on
 every request, so the order follows each save. The item carries `balance: {score, class, class_reviewed,
-class_score, scene_reviewed, camera_reviewed}` (each `_reviewed` only for a dimension balanced by; `class` absent with
-`class_reviewed` = an empty frame), and the answer `balance: {classes, empty, scenes, cameras}`, the reviewed
-counts weighed against. The page shows them in the frame's details (*balancing: truck (4 reviewed), ir (12),
+class_score, class_kept, class_proposed, scene_reviewed, camera_reviewed}` (each `_reviewed` only for a dimension
+balanced by; `class` absent with `class_reviewed` = an empty frame; `class_kept` / `class_proposed` only when some
+proposals were not kept), and the answer `balance: {classes, empty, scenes, cameras, precision}`, the reviewed
+counts weighed against (`precision`: camera -> class -> `{kept, proposed}`, absent when empty). The page shows them
+in the frame's details (*balancing: truck (4 reviewed), truck on this camera: 2 of 11 proposals kept, ir (12),
 camera gate (30)*) and the counts (*Reviewed frames*). A pending box can be a false detection, so a rare class
 brings up its false detections too; the likely-box order inside a need keeps real ones ahead.
 

@@ -17,7 +17,7 @@ use super::State;
 use super::answer::{Answer, UPCOMING};
 use super::row::{Name, Names, Row, Shard, auto_bit, stem_of};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A name filter, over ids.
 enum Want {
@@ -63,13 +63,14 @@ struct Compiled {
 }
 
 /// What `balance=` weighs a row by: [`BalanceTally`] of the rows the query counts, and each class
-/// set's, scene's and camera's part of the need, by id. The parts are [`BalanceTally::need`]'s, so
-/// a score is the walk's.
+/// set's (per camera), scene's and camera's part of the need, by id. The parts are
+/// [`BalanceTally::need`]'s, so a score is the walk's.
 struct Weigh {
     by: Balance,
     tally: BalanceTally,
-    /// By class set id ([`Row::classes`]).
-    class: Vec<ClassNeed>,
+    /// Balancing classes, by (class set id ([`Row::classes`]), camera id) of the listed rows: the
+    /// class part depends on the camera through [`BalanceTally::precision`].
+    class: HashMap<(u32, Name), ClassNeed>,
     /// By name id: (need, reviewed frames) as a scene, and as a camera.
     scene: Vec<(u32, u64)>,
     camera: Vec<(u32, u64)>,
@@ -77,13 +78,26 @@ struct Weigh {
 
 impl Weigh {
     fn new(by: Balance, f: &Filters, state: &State, q: &Compiled, names: &Names) -> Self {
-        // Reviewed rows by (training set, scene, camera): a few groups, so few strings.
-        let mut groups: HashMap<(u32, Name, Name), u64> = HashMap::new();
+        // Reviewed rows by (training set, proposed labels, scene, camera): a few groups, so few
+        // strings. And the (class set, camera) pairs of the listed rows, whose class part is asked.
+        let mut groups: HashMap<(u32, u32, Name, Name), u64> = HashMap::new();
+        let mut listed: BTreeSet<(u32, Name)> = BTreeSet::new();
         for shard in state.shards.values() {
             for row in &shard.rows {
-                if q.counts(row) && row.part.status == Status::Reviewed {
-                    let key = (row.part.training, row.cand.scene, row.cand.camera);
+                if !q.counts(row) {
+                    continue;
+                }
+                if row.part.status == Status::Reviewed {
+                    let key = (
+                        row.part.training,
+                        row.part.proposed,
+                        row.cand.scene,
+                        row.cand.camera,
+                    );
                     *groups.entry(key).or_default() += 1;
+                }
+                if by.class && q.by_state(row) {
+                    listed.insert((row.classes(), row.cand.camera));
                 }
             }
         }
@@ -91,17 +105,30 @@ impl Weigh {
         sorted.sort_unstable();
         let mut tally = BalanceTally::default();
         let mut trained: HashMap<u32, BTreeSet<String>> = HashMap::new();
-        for ((training, scene, camera), n) in sorted {
+        let mut proposed: HashMap<u32, BTreeSet<String>> = HashMap::new();
+        for ((training, offered, scene, camera), n) in sorted {
             let classes = trained.entry(training).or_insert_with(|| {
                 f.wanted_of(names.training(training).iter().map(|(c, _)| names.name(*c)))
             });
-            tally.add(n, names.name(scene), names.name(camera), classes);
+            let offered = proposed.entry(offered).or_insert_with(|| {
+                f.wanted_of(names.proposed(offered).iter().map(|c| names.name(*c)))
+            });
+            tally.add(n, names.name(scene), names.name(camera), classes, offered);
         }
-        let class = names
-            .class_sets()
-            .map(|set| {
-                tally
-                    .class_need(&f.wanted_confidence(set.iter().map(|(c, s)| (names.name(*c), *s))))
+        let mut sure: HashMap<u32, BTreeMap<String, u8>> = HashMap::new();
+        let class = listed
+            .into_iter()
+            .map(|(set, camera)| {
+                let classes = sure.entry(set).or_insert_with(|| {
+                    f.wanted_confidence(
+                        names
+                            .class_set(set)
+                            .iter()
+                            .map(|(c, s)| (names.name(*c), *s)),
+                    )
+                });
+                let need = tally.class_need(classes, names.name(camera));
+                ((set, camera), need)
             })
             .collect();
         let ids = 0..u32::try_from(names.name_count()).unwrap_or(u32::MAX);
@@ -119,8 +146,9 @@ impl Weigh {
         }
     }
 
+    /// The class part of a listed row (None when not balancing classes).
     fn class_of(&self, r: &Row) -> Option<&ClassNeed> {
-        self.class.get(r.classes() as usize)
+        self.class.get(&(r.classes(), r.cand.camera))
     }
 
     /// [`BalanceNeed::score`] of `r`, without building the rest.
