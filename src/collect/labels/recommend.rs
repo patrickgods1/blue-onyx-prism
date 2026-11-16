@@ -8,8 +8,10 @@
 //! An event is one camera's activity: the frames of one day folder (`<scene>/<camera>/<date>`, so
 //! an event ends at UTC midnight and at a scene change) whose times are at most [`EVENT_GAP_S`]
 //! apart, spanning at most [`EVENT_MAX_S`] from its first frame. A frame with no readable time,
-//! and an imported frame ([`IMPORT_MODEL`]: an image-folder import carries file times, and its
-//! frames were already spread out when chosen), is an event of its own. Events are built over the
+//! and an imported frame without a real time within its source ([`own_event`]: an image-folder
+//! import carries file times, and its frames were already spread out when chosen), is an event of
+//! its own; a frame of an imported video has a real time (the video's start plus its offset) and
+//! joins events like a collected one. Events are built over the
 //! frames the queue counts (every filter but status and auto), not those it lists, so an event
 //! does not split as its frames are reviewed: a frame's event rank is the decided frames of its
 //! event that the queue does not list, plus the listed frames of its event ahead of it.
@@ -25,6 +27,7 @@
 
 use super::Status;
 use super::queue::{Filters, Order, StatusFilter, Uncertainty};
+use crate::collect::record::Record;
 use std::cmp::{Ordering, Reverse};
 
 /// Most seconds between two frames of one event.
@@ -34,8 +37,24 @@ pub const EVENT_MAX_S: i64 = 600;
 /// Balance scores ([`super::queue::BalanceNeed::score`]) in one band compare equal: uncertainty
 /// orders the frames of a band.
 pub const BALANCE_BAND: u32 = 250;
-/// The sidecar `model` of an imported frame (`training::import`): an event of its own.
+/// The sidecar `model` of an imported frame (`training::import`): an event of its own unless it
+/// has a real time within its source ([`own_event`]).
 pub const IMPORT_MODEL: &str = "import";
+/// The `provenance.kind` of a frame imported from an image folder: its time is the file's.
+pub const IMAGE_KIND: &str = "image";
+
+/// The frame of sidecar `rec` is an event of its own: an import ([`IMPORT_MODEL`]) without a real
+/// time within its source. An image import's time is the file's modification time, and an import
+/// with no provenance or no `time_offset_s` says nothing better; a frame of a video (also a URL or
+/// a dataset import) with an offset has the video's start plus the offset, a real time. The walk
+/// and the review index both call this, so they agree.
+pub fn own_event(rec: &Record) -> bool {
+    rec.model == IMPORT_MODEL
+        && rec
+            .provenance
+            .as_ref()
+            .is_none_or(|p| p.kind == IMAGE_KIND || p.time_offset_s.is_none())
+}
 
 const GAP_MS: i64 = EVENT_GAP_S * 1000;
 const MAX_MS: i64 = EVENT_MAX_S * 1000;
@@ -120,8 +139,8 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 pub struct Member {
     /// [`event_ms`] of its sidecar's time.
     pub ms: Option<i64>,
-    /// Imported ([`IMPORT_MODEL`]): an event of its own.
-    pub import: bool,
+    /// An event of its own ([`own_event`]).
+    pub alone: bool,
     /// Reviewed or skipped.
     pub decided: bool,
     /// Its index among the listed frames, when the queue lists it.
@@ -141,11 +160,11 @@ impl Events {
     /// Add the events of one day folder's counted frames (reordered here).
     pub fn add_day(&mut self, members: &mut [Member]) {
         // Frames that chain first, by time; the ones alone after them, in any order.
-        members.sort_unstable_by_key(|m| (m.import || m.ms.is_none(), m.ms));
+        members.sort_unstable_by_key(|m| (m.alone || m.ms.is_none(), m.ms));
         // (first, last) time of the open event.
         let mut open: Option<(i64, i64)> = None;
         for m in members.iter() {
-            let ms = m.ms.filter(|_| !m.import);
+            let ms = m.ms.filter(|_| !m.alone);
             let joins = match (ms, open) {
                 (Some(t), Some((first, last))) => {
                     t.saturating_sub(last) <= GAP_MS && t.saturating_sub(first) <= MAX_MS
@@ -432,7 +451,7 @@ mod tests {
     fn at(s: i64) -> Member {
         Member {
             ms: Some(s * 1000),
-            import: false,
+            alone: false,
             decided: false,
             listed: None,
         }
@@ -485,7 +504,7 @@ mod tests {
     #[test]
     fn imports_and_unknown_times_are_alone_and_split_nothing() {
         let import = Member {
-            import: true,
+            alone: true,
             ..at(30)
         };
         let unknown = Member { ms: None, ..at(0) };
@@ -496,6 +515,75 @@ mod tests {
         alone.dedup();
         assert_eq!(alone.len(), 4, "{of:?}");
         assert!(!alone.contains(&of[0]));
+    }
+
+    /// The sidecar of an imported frame: `kind` with `offset` seconds from the video's start, or
+    /// no provenance at all for `None`.
+    fn imported(kind: Option<&str>, offset: Option<f64>) -> Record {
+        let mut r = crate::collect::record::empty_record();
+        r.model = IMPORT_MODEL.into();
+        r.provenance = kind.map(|kind| crate::collect::record::Provenance {
+            import_id: "20261027-170500-abcd".into(),
+            kind: kind.into(),
+            path: Some("Garage.20261027_170000_1.mp4".into()),
+            time_offset_s: offset,
+            ..crate::collect::record::Provenance::default()
+        });
+        r
+    }
+
+    /// The ranks [`arrange`] gives two listed frames of sidecars `a` and `b`, `secs` apart, of one
+    /// day folder and equal keys.
+    fn ranks_of_two(a: &Record, b: &Record, secs: i64) -> Vec<u32> {
+        let mut members = [
+            Member {
+                alone: own_event(a),
+                listed: Some(0),
+                ..at(0)
+            },
+            Member {
+                alone: own_event(b),
+                listed: Some(1),
+                ..at(secs)
+            },
+        ];
+        let mut e = Events::default();
+        e.add_day(&mut members);
+        let keys = [key(&u(0.2), 0); 2];
+        let mut got: Vec<(usize, u32)> = arrange(&e, &keys, &|a, b| a.cmp(&b));
+        got.sort_unstable();
+        got.into_iter().map(|(_, r)| r).collect()
+    }
+
+    #[test]
+    fn frames_of_an_imported_video_chain_and_imported_images_stand_alone() {
+        // Two frames of one Blue Iris clip 10 s apart (offsets 0 and 10.034 s): one event.
+        let first = imported(Some("video"), Some(0.0));
+        let second = imported(Some("video"), Some(10.034));
+        assert!(!own_event(&first) && !own_event(&second));
+        assert_eq!(ranks_of_two(&first, &second, 10), [0, 1]);
+        // A URL or a dataset import is a video too.
+        for kind in ["url", "dataset"] {
+            let f = imported(Some(kind), Some(3.0));
+            assert!(!own_event(&f), "{kind}");
+            assert_eq!(ranks_of_two(&first, &f, 10), [0, 1], "{kind}");
+        }
+        // Two images of a folder 10 s apart: file times, two events.
+        let image = imported(Some(IMAGE_KIND), None);
+        assert!(own_event(&image));
+        assert_eq!(ranks_of_two(&image, &image, 10), [0, 0]);
+        // An image with an offset (none is written) is still an image.
+        assert!(own_event(&imported(Some(IMAGE_KIND), Some(1.0))));
+        // A video frame without an offset, or an import without provenance: alone.
+        let no_offset = imported(Some("video"), None);
+        assert!(own_event(&no_offset));
+        assert_eq!(ranks_of_two(&first, &no_offset, 10), [0, 0]);
+        assert!(own_event(&imported(None, None)));
+        assert_eq!(ranks_of_two(&first, &imported(None, None), 10), [0, 0]);
+        // A collected frame is never alone, provenance or not.
+        let mut collected = imported(Some(IMAGE_KIND), None);
+        collected.model = "m0".into();
+        assert!(!own_event(&collected));
     }
 
     fn u(margin: f32) -> Uncertainty {

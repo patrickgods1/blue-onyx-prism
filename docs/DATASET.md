@@ -690,8 +690,11 @@ uneven. So:
    *event: frame N*): the first frame of every event comes before any second one. An event is one camera's
    activity: frames of one day folder (`<scene>/<camera>/<date>`, so an event ends at UTC midnight and at a scene
    change) at most 60 s apart (`EVENT_GAP_S`), at most 600 s from its first frame (`EVENT_MAX_S`). A frame whose
-   time does not parse, and an imported frame (sidecar `model: "import"`: image-folder imports carry file times,
-   and import already spread its frames out), is an event of its own. Events are built over the frames the counts
+   time does not parse, and an imported frame without a real time within its source (sidecar `model: "import"`
+   with no `provenance`, `provenance.kind: "image"` or no `provenance.time_offset_s`: image-folder imports carry
+   file times, and import already spread its frames out), is an event of its own (`recommend::own_event`). A frame
+   of an imported video (also a URL or dataset import) with an offset has a real time, the video's start plus the
+   offset, and joins events like a collected frame. Events are built over the frames the counts
    count (every filter but `status` and `auto`), so they do not split as frames get reviewed: a frame's rank is
    the decided (reviewed or skipped) frames of its event the queue does not list, plus the listed frames of its
    event ahead of it in this order without the rank;

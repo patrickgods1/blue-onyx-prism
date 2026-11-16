@@ -515,7 +515,7 @@ pub(super) fn answer(
         Order::Uncertain => uncertain(state, &q, &mut tally, pivot.as_ref()),
         Order::Recommended => {
             let random = recommend::random_slots(f);
-            recommended(state, &q, names, &mut tally, pivot.as_ref(), random)
+            recommended(state, &q, &mut tally, pivot.as_ref(), random)
         }
     };
     let found = placed.found.map(|(shard, row, rank, random_pick)| Item {
@@ -617,12 +617,10 @@ fn uncertain<'a>(
 fn recommended<'a>(
     state: &'a State,
     q: &Compiled,
-    names: &Names,
     tally: &mut Tally,
     pivot: Option<&Hit<'a>>,
     random: bool,
 ) -> Placed<'a> {
-    let import = names.find_name(recommend::IMPORT_MODEL);
     let mut members: Vec<recommend::Member> = Vec::new();
     let mut events = recommend::Events::default();
     let mut listed: Vec<(&'a Shard, &'a Row)> = Vec::new();
@@ -631,7 +629,7 @@ fn recommended<'a>(
         Step::Counted(shard, row, lists) => {
             members.push(recommend::Member {
                 ms: recommend::event_ms(shard.timestamp(row)),
-                import: import.is_some_and(|id| id == row.side.model),
+                alone: row.side.alone,
                 decided: row.part.status != Status::Unreviewed,
                 listed: lists.then_some(listed.len()),
             });

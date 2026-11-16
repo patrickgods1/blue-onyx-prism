@@ -1269,7 +1269,7 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
         if recommended {
             q.members.push(recommend::Member {
                 ms: recommend::event_ms(&rec.timestamp),
-                import: rec.model == recommend::IMPORT_MODEL,
+                alone: recommend::own_event(&rec),
                 decided: status != Status::Unreviewed,
                 listed: listed.then_some(q.items.len()),
             });

@@ -287,7 +287,8 @@ mod cases {
     use super::*;
     use crate::collect::layout::{self, INDEX_FILE, REVIEW_QUEUE_FILE};
     use crate::collect::record::{
-        Bucket, Det, IndexLine, Record, Suppressed, VerifyCandidate, VerifyInfo, empty_record,
+        Bucket, Det, IndexLine, Provenance, Record, Suppressed, VerifyCandidate, VerifyInfo,
+        empty_record,
     };
     use crate::sync::RwLockExt as _;
     use std::collections::BTreeMap;
@@ -405,6 +406,20 @@ mod cases {
         }
     }
 
+    /// What an import writes ([`crate::training::import`]): `kind` with `offset` seconds from
+    /// the video's start.
+    fn import_provenance(kind: &str, offset: Option<f64>) -> Provenance {
+        Provenance {
+            import_id: "20261021-000000-abcd".into(),
+            kind: kind.into(),
+            path: Some("Garage.20261021_050000_1.mp4".into()),
+            license: "own".into(),
+            license_confirmed: true,
+            time_offset_s: offset,
+            ..Provenance::default()
+        }
+    }
+
     fn sidecar(rng: &mut Rng, scene: &str, camera: &str, stem: &str) -> Record {
         let mut r = empty_record();
         r.id = stem.into();
@@ -414,11 +429,22 @@ mod cases {
         // seconds apart, gaps of over a minute, hours apart, a time that does not parse.
         r.timestamp = TIMES[rng.below(TIMES.len())].into();
         r.threshold = 0.5;
-        // Now and then an imported frame: an event of its own.
+        // Now and then an imported frame: of an image folder or with no time within its source an
+        // event of its own, of a video one that chains.
         r.model = match rng.below(12) {
             11 => recommend::IMPORT_MODEL.into(),
             n => format!("m{}", n % 3),
         };
+        if r.model == recommend::IMPORT_MODEL {
+            // By the stem, not `rng`: the other frames stay what they were. FNV-1a mixes its high
+            // bits best.
+            r.provenance = match (recommend::pool_hash(stem) >> 32) % 4 {
+                0 => None,
+                1 => Some(import_provenance("image", None)),
+                2 => Some(import_provenance("video", None)),
+                n => Some(import_provenance("video", Some(n as f64 * 2.5))),
+            };
+        }
         let n = rng.below(4);
         r.buckets = (0..n).map(|_| rng.pick(&Bucket::ALL)).collect();
         if rng.one_in(8) {
@@ -983,7 +1009,13 @@ mod cases {
                 secs / 60 % 60,
                 secs % 60
             );
-            rec.model = "m0".into();
+            // Two frames of an imported video: real times, so they chain like the rest.
+            if i == 2 || i == 9 {
+                rec.model = recommend::IMPORT_MODEL.into();
+                rec.provenance = Some(import_provenance("video", Some(f64::from(i) * 50.034)));
+            } else {
+                rec.model = "m0".into();
+            }
             let frame = Frame::resolve(dir, &rel).unwrap();
             std::fs::write(&frame.sidecar, serde_json::to_vec(&rec).unwrap()).unwrap();
             index.push_str(&index_line(&rec));
@@ -991,8 +1023,32 @@ mod cases {
             rels.push(rel.clone());
             chain.push(rel);
         }
+        // Imports amid the chain's times with none within their source: two images of a folder
+        // 10 s apart and a video frame without an offset, each an event of its own. Their own
+        // `rng`: the twins below stay what they were.
+        let mut alone_rng = Rng::new(seed ^ 0xa10e);
+        let mut alone = Vec::new();
+        for (name, secs, kind) in [
+            ("img0", 20, Some("image")),
+            ("img1", 30, Some("image")),
+            ("vid", 60, Some("video")),
+            ("bare", 70, None),
+        ] {
+            let rel = format!("night/street/2026-10-21/20261021T0500{secs:02}000Z_{name}.jpg");
+            let mut rec = put(dir, &mut alone_rng, &rel, Some(&LabelFile::default()));
+            rec.timestamp = format!("2026-10-21T05:00:{secs:02}.000Z");
+            rec.model = recommend::IMPORT_MODEL.into();
+            rec.provenance = kind.map(|k| import_provenance(k, None));
+            let frame = Frame::resolve(dir, &rel).unwrap();
+            std::fs::write(&frame.sidecar, serde_json::to_vec(&rec).unwrap()).unwrap();
+            index.push_str(&index_line(&rec));
+            index.push('\n');
+            rels.push(rel.clone());
+            alone.push(rel);
+        }
         std::fs::write(dir.join("night/street/2026-10-21").join(INDEX_FILE), index).unwrap();
         layout::append_review(dir, &chain).unwrap();
+        layout::append_review(dir, &alone).unwrap();
         // Twins, each alone in its day folder: the same key and time, only the path tells them
         // apart.
         let mut twin = sidecar(&mut rng, "night", "street", "20261021T090000000Z_twin");
@@ -1385,7 +1441,39 @@ mod cases {
         let ranks: Vec<u32> = chain.iter().filter_map(|r| rank(items, r)).collect();
         assert_eq!(ranks.len(), 14);
         assert_eq!(ranks[13], 0, "the span cap starts an event: {ranks:?}");
-        assert_eq!(ranks[..13].iter().max(), Some(&12), "{ranks:?}");
+        // The two frames of an imported video (2 and 9) are in the event: one rank each.
+        let mut first_event = ranks[..13].to_vec();
+        first_event.sort_unstable();
+        assert_eq!(first_event, (0..13).collect::<Vec<u32>>(), "{ranks:?}");
+        for at in [2, 9] {
+            let item = items.iter().find(|i| i.frame == chain[at]).unwrap();
+            assert_eq!(item.model, recommend::IMPORT_MODEL);
+        }
+        // Imports with no time within their source amid the chain: alone, rank 0.
+        for name in ["img0", "img1", "vid", "bare"] {
+            let item = items
+                .iter()
+                .find(|i| i.frame.ends_with(&format!("_{name}.jpg")))
+                .unwrap();
+            assert_eq!(item.model, recommend::IMPORT_MODEL);
+            assert_eq!(item.event_rank, Some(0), "{name}");
+        }
+        // Both kinds of import, with a real time and alone, also among the made-up frames.
+        let imports = |alone: bool| {
+            items
+                .iter()
+                .filter(|i| {
+                    i.model == recommend::IMPORT_MODEL && !i.frame.contains("street/2026-10-21/")
+                })
+                .filter_map(|i| Frame::resolve(dir, &i.frame)?.record().ok())
+                .filter(|rec| recommend::own_event(rec) == alone)
+                .count()
+        };
+        let (timed, alone) = (imports(false), imports(true));
+        assert!(
+            timed > 0 && alone > 0,
+            "imports timed {timed}, alone {alone}"
+        );
         // Unreviewed only: the three decided frames of the first event come before its others.
         let unreviewed = queue::build(
             dir,

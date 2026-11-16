@@ -16,6 +16,7 @@
 use super::super::super::layout::{self, Walker};
 use super::super::super::record::{Bucket, Record};
 use super::super::queue::{self, AutoFilter, Candidate, Filters, Uncertainty};
+use super::super::recommend;
 use super::super::refine::Kind as RefineKind;
 use super::super::{Frame, LabelBox, LabelFile, MAX_LABEL_FILE_BYTES, MAX_SIDECAR_BYTES, Status};
 use crate::sync::RwLockExt as _;
@@ -249,6 +250,8 @@ pub(super) struct Side {
     pub reply: u32,
     pub has_margin: bool,
     pub disagreement: bool,
+    /// [`recommend::own_event`]: an event of its own in the Recommended order.
+    pub alone: bool,
     /// False: it did not read, the frame counts as unreadable.
     pub ok: bool,
 }
@@ -675,6 +678,7 @@ impl Encoder<'_> {
             reply: names.class_set_of(reply.iter().map(|(c, s)| (c.as_str(), *s))),
             has_margin: u.margin.is_some(),
             disagreement: u.disagreement,
+            alone: recommend::own_event(rec),
             ok: true,
         };
         (side, rec.timestamp.clone())
