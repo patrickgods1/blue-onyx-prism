@@ -4,392 +4,472 @@ Cross-platform object-detection HTTP service for Blue Iris (CodeProject.AI-compa
 written in Rust on **native OpenVINO** via the `openvino` crate (runtime-linking), with
 **ONNX Runtime** (`ort` crate, load-dynamic) as a second runtime for NVIDIA (CUDA/TensorRT),
 DirectML and CoreML. Modeled on [blue-onyx](https://github.com/xnorpx/blue-onyx) (MIT), with
-multi-model support and `auto` device selection by detected hardware (see `docs/PLAN.md`, phase 6).
+multi-model support, `auto` device selection by detected hardware, and a dataset collector, review,
+auto-labelling and training pipeline for custom models.
 
 Primary target: Windows 11, Intel i5-8500 + UHD 630 iGPU. Must also build/run on Linux x86_64 and macOS arm64.
+
+Where detail lives: `README.md` (users: install, every config key, HTTPS / accounts / network rule, devices, API,
+benchmark), `docs/TRAINING.md` (import, auto-label, overlaps, dataset check, Refine tab, Train area, training, CLI),
+`docs/DATASET.md` (collector layout, sidecar and label file formats, Review queue, export), `docs/NIGHT_IR.md`,
+`docs/BENCH_IMAGES.md`, `docs/RELEASE_CHECKLIST.md`, `docs/PRODUCTION_REVIEW.md` (audit findings, measurements).
+`docs/PLAN.md` and `docs/REVIEW_PLAN.md` are history and may not match the code. Every source file starts with a
+`//!` doc stating its responsibility (constants and their rationale are documented there); `src/lib.rs` has the module map.
 
 ## Build & run
 
 ```powershell
 cargo build --release
-cargo run -- setup-openvino                 # downloads OpenVINO runtime libs into ./openvino (next to exe)
+cargo run -- setup-openvino                 # OpenVINO runtime libs into ./openvino (next to exe)
 cargo run -- setup-onnxruntime [--flavor auto|cpu|cuda|directml] [--dir <d>]   # ORT libs into ./onnxruntime
 cargo run -- list-devices                    # runnable device options and the `auto` pick
 cargo run -- download-models --name IPcam-general
-cargo run -- add-model --path <file|dir> [--name n] [--family rfdetr] [--classes c.yaml]   # custom model (config page: Add a model by path)
+cargo run -- add-model --path <file|dir> [--name n] [--family rfdetr] [--classes c.yaml]   # custom model
 cargo run -- fetch [--for-config] [--resource <id>] [--all-for-platform] [--allow-large]   # pre-download what the config needs
-cargo run -- list-resources [--check-urls]   # installed / needed / available; --check-urls checks every pinned URL (weekly CI)
-python3 -I scripts/ci/check_deps.py consistency|upstream|audit|conflicts   # pins agree (CI) / due upstream bumps (2+ weeks old, Python 3.11, within other pins' Requires-Dist) / OSV advisories of the Python locks (weekly CI issues) / pins vs each other's Requires-Dist (gen_train_locks.sh); docs/RELEASE_CHECKLIST.md
 cargo run -- fetch --resource model:yolo26s --allow-large   # on-demand model export (pinned uv + Python env in <data root>/tools)
+cargo run -- list-resources [--check-urls]   # installed / needed / available; --check-urls checks every pinned URL (weekly CI)
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --force-cpu
 cargo run -- --model models/IPcam-general.onnx --family yolo5 --device ort:cpu
-cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]   # grade models x devices; benchmark.json next to the config
+cargo run -- benchmark --all-devices [--apply] [--report r.html] [--dataset coco-cctv|bmd45-cctv|exdark-night|dir:<p>] [--max-images 20]
 cargo run -- benchmark --list-datasets       # built-in image sets (assets/bench/*.json, resource bench:<id>)
-cargo run -- train overlaps [--frames "scene=ir,limit=200,again=1"] [--dry-run] [--allow-large]   # suggestions for overlapping boxes; changes no box
-cargo run -- train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] [--gpu cuda:N] [--allow-large]   # dataset check: fold models judge reviewed frames, suggestions only (docs/TRAINING.md, "Dataset check")
-python scripts/research/eval_autolabel.py --self-test   # scores auto-label proposals against known boxes: truth / yesno / score (docs/TRAINING.md, "Measuring auto-label")
-cargo run -- train retry-export <run> [--no-register] [--no-benchmark]   # a failed run's kept checkpoint: export, install, benchmark again
-cargo run -- admin-token [--rotate] [--config <file>]   # prints the API token scripts/Prometheus send as Bearer over HTTPS (`<data root>/auth/admin-token`, an old `<data root>/admin-token` is moved there; stdout holds nothing else)
-cargo run -- user add|remove|reset-password|unlock <name> | user list [--config <file>]   # web UI accounts (`<data root>/auth/users.json`); passwords without echo (twice) or one stdin line, never argv
-cargo run -- setup-code [--config <file>]   # one-time code for the first account, with the HTTPS URLs and fingerprint; refused once an account exists
-cargo run -- tls-fingerprint [--config <file>]       # SHA-256 of the HTTPS certificate + https:// URLs (makes the generated one if missing, never replaces it)
-cargo run -- tls-regenerate [--config <file>]        # new self-signed HTTPS certificate (refused with tls_cert_path/tls_key_path); a running service switches within 10 s
-cargo run -- hf-login                        # saves a Hugging Face token for gated downloads (no-echo prompt or stdin, never argv); `hf-logout` deletes it
-cargo run -- train autolabel --sam3 [--sam3-threshold 0.3] [--frames "status=reviewed,auto=overlaps"] [--dry-run]   # SAM 3 in gdino's seat; --dry-run previews frames and a rough time, runs nothing
+cargo run -- train refine [--dry-run] [--with-model <name>]   # every `train` subcommand: docs/TRAINING.md, "Command line"
+cargo run -- train autolabel --sam3 [--dry-run]   # --dry-run previews frames and a rough time, runs nothing
+cargo run -- train retry-export <run>        # a failed run's kept checkpoint: export, install, benchmark again
+cargo run -- admin-token [--rotate] [--config <file>]   # API token for scripts / Prometheus (stdout holds nothing else)
+cargo run -- user add|remove|reset-password|unlock <name> | user list   # web UI accounts; passwords never in argv
+cargo run -- setup-code | tls-fingerprint | tls-regenerate   # first-account code; cert SHA-256 + URLs; new self-signed cert
+cargo run -- hf-login | hf-logout            # Hugging Face token for gated downloads (no echo or stdin, never argv)
 cargo run -- service status|start|stop|restart   # control the installed service (start/stop/restart need admin)
+cargo run -- diagnostics                     # bug-report zip (never tokens, frames or labels)
 cargo run --bin blue-onyx-prism-tray -- [--port n] [--cli <path>]   # tray / menu bar app (Windows, macOS)
-cargo run -- --version                      # <version> (<git sha>, <build date>): BLUE_ONYX_PRISM_GIT_SHA / _BUILD_DATE at build time (release.yml), `unknown` locally
+cargo run --bin test-blue-onyx-prism -- --rate <r/s> --duration <s>   # load test
+cargo run -- --version                       # BLUE_ONYX_PRISM_GIT_SHA / _BUILD_DATE set at build time by release.yml, `unknown` locally
 cargo build --no-default-features            # OpenVINO-only build (drops the `onnxruntime` feature / `ort`)
 cargo test                                   # unit tests need no OpenVINO
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+python3 -I scripts/ci/check_deps.py consistency|upstream|audit|conflicts   # Python pins (docs/RELEASE_CHECKLIST.md)
+python scripts/research/eval_autolabel.py --self-test   # auto-label scoring (docs/TRAINING.md, "Measuring auto-label")
 ```
 
-On-demand model export (`src/resources/export/`, the only code that runs downloaded programs; user-triggered
-only, never by `auto_download`): `tool:uv` + `scripts/model-export/locks/*.txt` (hashed; regenerate with
-`scripts/model-export/gen_locks.sh`) + the embedded `scripts/export_model.py`; everything under `<data root>/tools/`.
-Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (`.pt`, AGPL-3.0), RF-DETR L (transformers,
-safetensors, 704 px), DEIMv2 (official code `tool:deimv2-src` pinned to the last Apache-2.0 commit + safetensors; marked non-commercial / personal use, the upstream license now covers the weights);
-all offline, static-shape ONNX checked against PyTorch with ONNX Runtime, stamped with `COREML_CACHE_KEY` (ORT's
-CoreML cache is otherwise keyed by path). A manifest of another version = "needs export" (not loaded), except one by an earlier exporter listed in `catalog::EARLIER_EXPORTERS`. `catalog::F32_MODELS`
-(RF-DETR L, DEIMv2 L/X) overflow f16: OpenVINO compiles them with f32 on CPU and GPU.
+Commands that act on a service (`admin-token`, `user`, `setup-code`, `tls-*`, `hf-login`) take `--config <file>` and
+must run as the service's account.
 
-Python export env (models -> ONNX + OpenVINO IR, by hand): `.venv` (Python 3.11; `scripts/requirements-export.txt` = `-r requirements-model-export.txt`, the exact `==` pins the service uses, plus `openvino==`; the hashed per-platform locks in `scripts/model-export/locks/` are the stricter option), created with `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt`;
-run `.venv/bin/python scripts/export_model.py --name yolo26s` (Windows: `.venv/Scripts/python.exe`).
+**Runtimes and libraries.**
+- OpenVINO is found through `openvino-finder`: `OPENVINO_INSTALL_DIR` (Windows; on Unix `backend/libs.rs` loads
+  `openvino_c` by path) pointing at `<download root>/openvino` when present, else the OS library path.
+- ONNX Runtime: `onnxruntime_dir` in the config, else `ORT_DYLIB_PATH`, else `onnxruntime/<flavor>/` named by
+  `onnxruntime/active.txt`, else the old flat `onnxruntime/`, else any flavor dir. A process loads one ORT flavor only.
+  `onnxruntime/cuda-libs` (opt-in NVIDIA wheels, ~1.9 GB) is preloaded by path before the CUDA provider loads.
+- Pins are per flavor in `src/resources/catalog/` (`ONNXRUNTIME_VERSION` for cpu/directml/coreml: the last release with
+  a DirectML package; `ONNXRUNTIME_CUDA_VERSION` for cuda; `DIRECTML_VERSION`; `CUDNN_VERSION`, which must stay < 9.11
+  while the CUDA 12 lane covers Pascal, a test checks it). Which compute capabilities each ORT CUDA build has kernels for:
+  `catalog::ORT_CUDA_BUILDS` (by OS and version).
+- The `ort` crate is built without an `api-NN` feature, so any ORT 1.17+ library loads; never add one above the
+  oldest pinned flavor.
+- Updates: an outdated runtime is updated in place, or, while a process has it loaded, staged as
+  `<parent>/.<name>.pending` and swapped in by the next process before it loads (`manager::in_use`: every loader holds a
+  shared lock on `.<name>.in-use`; covers OpenVINO, ORT flavors and `cuda-libs`). A pin bump reaches existing installs
+  (OpenVINO and cuda-libs record their version; the old one stays usable; a large one without `allow_large_downloads` is
+  only offered); a catalog model whose manifest names another version is re-downloaded; a model without a manifest stays.
 
-OpenVINO libs are discovered through `openvino-finder`: `OPENVINO_INSTALL_DIR` (Windows; on Unix
-`backend/libs.rs` loads `openvino_c` by path) pointing at `<download root>/openvino` when present, or the OS library path.
+**On-demand resources.** Pins, URLs, SHA-256 and sizes of everything downloadable live in `src/resources/catalog/`;
+change them only in reviewed commits. The service downloads what config + hardware need at startup (`auto_download`,
+default true; `allow_large_downloads`, default false, gates > 500 MB; `download_dir`, default the exe dir).
 
-On-demand resources: pins, URLs, SHA-256 and sizes of everything downloadable (OpenVINO, ONNX Runtime
-flavors, DirectML, `nvidia-cuda-libs`, models) live in `src/resources/catalog/`; change them only in
-reviewed commits. The service downloads what the config + hardware need at startup (`auto_download`, default
-true; `allow_large_downloads`, default false, gates > 500 MB; `download_dir`, default the exe dir).
+**Model export** (`src/resources/export/`, the only code that runs downloaded programs; user-triggered only, never by
+`auto_download`): `tool:uv` + hashed `scripts/model-export/locks/*.txt` (regenerate with `gen_locks.sh` /
+`gen_train_locks.sh`) + the embedded `scripts/export_model.py`, all under `<data root>/tools/`.
+- Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (AGPL-3.0), RF-DETR L, DEIMv2 (code pinned to
+  the last Apache-2.0 commit; marked non-commercial, the upstream licence now covers the weights), MegaDetector v6, the
+  ExDark RF-DETRs. Static-shape ONNX checked against PyTorch with ONNX Runtime, stamped with `COREML_CACHE_KEY` (ORT's
+  CoreML cache is otherwise keyed by path).
+- A manifest of another exporter version = "needs export" (not loaded), except one listed in
+  `catalog::EARLIER_EXPORTERS`. `catalog::F32_MODELS` overflow f16: OpenVINO compiles them in f32 on CPU and GPU.
+- By hand: `uv venv --python 3.11 .venv && uv pip install -r scripts/requirements-export.txt` (the service's `==` pins
+  plus `openvino`), then `.venv/bin/python scripts/export_model.py --name yolo26s` (Windows: `.venv/Scripts/python.exe`).
 
-ONNX Runtime libs: `onnxruntime_dir` in the config, else `ORT_DYLIB_PATH`, else `onnxruntime/<flavor>/` named by
-`onnxruntime/active.txt`, else the old flat `onnxruntime/`, else any flavor dir. Versions are per flavor in the
-catalog: `ONNXRUNTIME_VERSION` 1.24.4 for cpu/directml/coreml (the last release with a DirectML package),
-`ONNXRUNTIME_CUDA_VERSION` 1.31.0 for cuda (`gpu_cuda12` archives; its Windows build has Pascal `sm_61` kernels
-again), `DIRECTML_VERSION`, `CUDNN_VERSION` 9.10.2.21 (the last cuDNN with Pascal kernels; must stay < 9.11 while the
-CUDA 12 lane covers Pascal, a test checks it). The `ort` crate is built without an `api-NN` feature, so any ORT 1.17+
-library loads; never add one above the oldest pinned flavor. A process loads one ORT flavor only; an outdated flavor
-is updated in place, or, while a process has it loaded, staged as `<parent>/.<name>.pending` and swapped in by the next process before it loads (`manager::in_use`: every loader holds a shared lock on `.<name>.in-use`; covers OpenVINO, ORT flavors and `cuda-libs`). A catalog pin bump reaches existing installs: OpenVINO and cuda-libs record their version, an outdated one is an update (the old one stays usable; a large one without `allow_large_downloads` is only offered), a catalog model whose own manifest names another version is re-downloaded, a model file without a manifest stays as is. `onnxruntime/cuda-libs` (opt-in NVIDIA wheels, ~1.9 GB) is
-preloaded by path before the CUDA provider loads.
+**Device spec** (`device` in config / model entry, `--device`): `auto` (default), `openvino:gpu[.N]`, `openvino:cpu`,
+`openvino:npu`, `ort:cuda[:N]`, `ort:tensorrt[:N]`, `ort:directml[:N]`, `ort:coreml`, `ort:cpu`; legacy `GPU`/`GPU.N`/`CPU`
+mean `openvino:*`. The `auto` ranking (discrete GPUs by VRAM, then integrated, CoreML, CPU last; CUDA skipped for a GPU the
+build has no kernels for) is in README "Hardware and device selection". A model with results in `benchmark.json`
+orders its `auto` devices by measured speed. NPU is never auto. ORT needs `.onnx` files. `OrtProbe.version` is the
+loaded library's version (the resolver's hypothetical probe carries the version the plan installs).
+- CPU inference uses all physical cores but one (`backend/cpu_threads.rs`); ORT thread pools do not spin; benchmarks
+  and training helpers run below normal priority (`backend/priority.rs`).
+- Windows CPUs with AMX but no AMX-FP16 get `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` unless set (OpenVINO's AMX kernels
+  raise #UD there; `backend/cpu_isa.rs`). RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim
+  aborts MPSGraph).
 
-Device spec (`device` in config/model entry, `--device`): `auto` (default), `openvino:gpu[.N]`,
-`openvino:cpu`, `openvino:npu`, `ort:cuda[:N]`, `ort:tensorrt[:N]`, `ort:directml[:N]`, `ort:coreml`,
-`ort:cpu`; legacy `GPU`/`GPU.N`/`CPU` mean `openvino:*`. `auto` ranks: discrete GPUs first (larger VRAM
-first), each with its runtimes in order (NVIDIA: `ort:cuda`, `ort:tensorrt` when its libs load, `ort:directml` on
-Windows; Intel Arc: `openvino:gpu.N`, then `ort:directml`; AMD/other: `ort:directml` on Windows), then integrated
-GPUs (Intel via OpenVINO, else DirectML), macOS arm64 (CoreML), CPU (`openvino:cpu`, else `ort:cpu`). An NVIDIA
-GPU whose compute capability has no kernels in the ORT CUDA build that will load (`catalog::ORT_CUDA_BUILDS`, keyed by
-OS and version: 1.31.0 Windows = 6.1/7.5/8.6/8.9/12.0, Linux = 6.0..12.0 without 10.0) skips CUDA; TensorRT needs 7.5+;
-a driver below CUDA 12 skips both. `OrtProbe.version` is the loaded library's version (the resolver's hypothetical
-probe carries the version the plan installs). CPU inference uses all physical cores but one by default
-(`backend/cpu_threads.rs`), ORT thread pools do not spin, benchmarks run at below-normal priority (`backend/priority.rs`);
-on Windows a CPU with AMX but no AMX-FP16 (Sapphire/Emerald Rapids) gets `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` unless set
-(OpenVINO's AMX kernels raise #UD there; `backend/cpu_isa.rs`).
-A model with results in `benchmark.json` orders its `auto` devices by measured speed (fastest eligible first,
-then the static order, CPU last). NPU is never auto. RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim aborts MPSGraph in ORT 1.24.4). ORT needs `.onnx` files.
+## Architecture
 
-## Architecture (see the plan in the repo history / README for detail)
+- **Layout.** Large modules are directories split by concern (`benchmark/`, `server/`, `resources/`, `training/`,
+  `collect/labels/`, `backend/onnx_rewrite/`, `worker/`, ...).
 
-- Large modules are directories split by concern (`src/benchmark/{run,scoring,sweep}.rs`, `benchmark/cli/`,
-  `benchmark/report/`, `benchmark/lineup/`, `server/benchmark/`, `resources/{export,manager,catalog,extract}/`, `registry/`,
-  `backend/onnx_rewrite/`, `backend/memory.rs`); each file starts with a `//!` doc stating its responsibility.
-- `src/server.rs` axum HTTP (2-thread tokio runtime; fs-heavy handlers run in `server::blocking`). The
-  listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable current
-  `AppState`; only the local network is answered (`server/network.rs`: loopback, RFC 1918, link-local, ULA, plus config-file-only `allowed_networks`; closed at accept by `guard::admit`, else 403 from the outermost middleware `guard::network_rule`; forwarding headers can only refuse); two listeners (`server/listen.rs`): plain HTTP on `port` (startup error, `/v1/status`, `READY=1` and the Windows service's Running follow it) and HTTPS on `https_port` (32169, retried every 30 s while its port or certificate fails; bound port in `Shared::https_port`), both the same router, marked `Transport::{Plain,Tls}` (none = plain); at accept `guard::admit`, then caps (256 per listener; 32 per address on HTTPS, `max(32, in-flight cap)` on HTTP), then the TLS handshake in the connection task under 10 s; certificate in `tls.rs` (self-signed ECDSA P-256 in `<data root>/auth/tls/`, `private_dir.rs`: 0700/0600, protected DACL; stable, renewed under 30 days left; own `tls_cert_path`/`tls_key_path` config-file only, never written; `ArcSwap` resolver reloaded on file change; `tls::pinned_client` = reqwest pinned to the cert's SHA-256 for the CLI's `diagnostics`, the load-test client and `tests/common`'s `admin_client`). The plain port serves `open_routes` only (`server::plain_gate`: browser GET/HEAD 308 to `https://<Host>:<bound https port><safe_next path>`, foreign host 403, HTTPS down 503, else 403 JSON; `Authorization` there refused uncounted; `guard::legacy_cookie` clears `bop_admin` on every plain answer and on TLS answers to requests sending it; no HSTS). Everything else is HTTPS and signed in, every address alike (`admin_only` → `auth::authenticate`): a `__Host-bop_session` cookie (`X-Prism-Poll: 1` = `Activity::Poll`, idle clock untouched) or `Authorization: Bearer <API token>` (`admin_token.rs`, read per check, own `admin_failures` bucket); `users.json` missing → browsers 303 `/setup`, broken → 503, never setup; anonymous browsers 303 `/login?next=`, others 401 + `WWW-Authenticate: Bearer`; `SignedIn` extension, HTML pages get the name at `<!--bop:user-->` (`auth::show_user`); unauthenticated answers `no-store`. `/login`, `/logout`, `/setup` (`login_routes`, `Host` + CSRF checked): per-address `FailureLimit::reserve` before hashing (refund on success; two tiers: 5/min per exact address, 30/min per IPv6 /64), lockout decided with in-flight attempts counted as failures (`accounts::Attempts::reserve`, one key per typed name, the users file read under its lock; a trusted device cookie skips only the delay but takes a slot), `Logins` permit within 2 s else 503, the result written after the answer by `auth::record_later` (holding the slot until it lands), a new session id each time; setup with the code, then signs in. The Config page's Accounts card (`server/accounts.rs`: `POST /config/accounts/{add,remove,unlock,password,sign-out-everywhere}`, 4 KiB bodies) re-checks the signed-in account's current password through the same reservation, attempt slot and permit (`server::accounts::reauth`; wrong = 403, never 401, counted against that account; the API token is refused); a password change ends the other sessions and rotates this one's id, removal ends the account's sessions and devices. Every auth file (accounts, sessions, devices, setup code, API token) is under `Auth::data_root()`, the start's data root (a generation restart that changes `download_dir` warns, `runner::Process::note_data_root`), never `running()`. `direct_local` (loopback, no `X-Forwarded-For` / `Forwarded` / `X-Real-IP`, the one list in `guard::proxy_header`) is only an extra condition: `/v1/fs/pick`, token rotation. Routes answer only under an IP address, `localhost` or an `allowed_hosts` name (`guard::foreign_host`, DNS rebinding; `GET /v1/config` is open and applies the Host check and sign-in itself: minimal answer otherwise). CSRF on TLS: `Origin`/`Referer` must be `https://<Host>`, `Sec-Fetch-Site: same-site` refused. Accounts (`src/accounts/`): `auth/users.json` fails closed (only a missing file is setup mode, `auth/setup-code`, made and announced at start by `runner::prepare_sign_in`), NFC + 15..=128 code points + SecLists blocklist, Argon2id behind a hashing semaphore (`Permit`), pure lockout, every `auth/` read-modify-write under `auth/.lock` and never while hashing. Sessions and device cookies (`accounts/sessions.rs`, `devices.rs`, names and `Set-Cookie` in `cookies.rs`): ids are 64 hex in `__Host-` cookies, only their SHA-256 in `auth/sessions.json` / `devices.json`; `IDLE_SECS` 1 h, `ABSOLUTE_SECS` 12 h, `MAX_PER_USER` 20, a generation bump ends them, lazy `last_active` writes every `FLUSH_EVERY_SECS` 120 s; devices `MAX_AGE_SECS` 180 days, `DEVICE_FAILURE_BUDGET` 10; one `accounts::Auth` and one `Logins` per process (`runner`, beside `admin_failures`), flushed at shutdown. `allow_remote_admin` is retired (read, `skip_serializing`, warned; true at start = one API token rotation, marker `auth/.token-rotated-v1`). JS: `assets/live.js` wraps `fetch` (polls send `X-Prism-Poll: 1`: PrismPoll runs, `PrismPoll.background`, `PrismPoll.fetch`, also for fetches chained in a poll's `.then`; reloads a poll makes go through `PrismPoll.navigate`, which sets the `__Host-bop_poll` cookie the server reads as a poll and clears; a same-origin 401 opens an in-page sign-in dialog (`POST /login` as JSON), then repeats each waiting request once (string URL, replayable body); cancel, no `<dialog>`, a second 401 or a non-replayable body go to `/login?next=<path+query+hash>`; native POST forms check the session first unless `data-no-auth-check`; `PrismDraft` keeps Review and Config edits in sessionStorage across a discarded tab, restored only at the same revision; polls time out after 15 s and wake on `pageshow`/`online`). A refused non-GET browser request's `next` is its same-host `Referer` page (`guard::referer_on_host`, then `safe_next`). No page shows the TLS fingerprint (it would prove nothing); users compare the browser's with `tls-fingerprint` / `setup-code` output. Unit tests: `test_util::from_peer` adds `Transport::Tls` and the seeded `TEST_SESSION` of `tester` (`seed_tester`, temp data roots only) unless `anonymous`/`plain`/`bearer`/`as_peer(PUBLIC)`. One-off flags (`Config::one_off_flags`) are kept out of every write: `cli::without_one_off_flags` at startup, `ConfigStore::update` while running. `download_dir`, `onnxruntime_dir` and `openvino_dir` choose libraries the service loads, so they are config-file or CLI only, never web-editable. Blue Iris calls
-  `POST /v1/vision/detection` (default model) and `POST /v1/vision/custom/{model}` (named model),
-  `POST /v1/vision/custom/list`. Responses use `api.rs` structs (camelCase; `Prediction` snake_case).
-- `src/registry.rs` loads N models from config sequentially on one `Core`; each model gets its own
-  worker thread (`worker.rs`) and bounded crossbeam channel. `startup.rs` tracks Initializing/Ready/Failed
-  so HTTP serves immediately while models compile.
-- `src/backend/` runtimes behind a `Backend` enum (`OpenVino | Ort`): OpenVINO wrapper (`Core`,
-  `CompiledModel`, `InferRequest`, properties CACHE_DIR/LATENCY/f16 on GPU, tensor IO); `spec.rs` parses
-  device specs; `detect.rs` finds GPUs (DXGI / sysfs / Apple); `select.rs` builds the ranked, pure
-  `DeviceOption` list and the `auto` pick; `plan.rs` turns it into per-model load candidates (compile +
-  warm-up, falling down the list, CPU last); `ort.rs` is the ONNX Runtime backend (all `ort` code lives here).
-  `onnx_rewrite.rs`: `ort:coreml` loads a cached copy without HardSigmoid/HardSwish/opset<13 Split (protobuf wire-level, `cache/coreml/<stem>-<sha16>-v<N>.onnx`, `BOP_COREML_REWRITE=0` off).
-  `GET /v1/status` (readiness, 200/503; Docker HEALTHCHECK, systemd `Type=notify` + watchdog via `sdnotify.rs`); a process-wide in-flight cap on detections answers 503 (`metrics.rs`, `requests_rejected_total`), and uploads still arriving have a 10 s deadline and a per-address limit (`BODY_READS_PER_PEER`, never a cap on one Blue Iris's total requests); `retention.rs` prunes saved images and warns on low disk.
-  Also `GET /v1/devices` and the config-page device dropdown; Browse... buttons (`assets/browse.js`, every page) first try `GET|POST /v1/fs/pick` (`server/pick.rs`: native dialog on the server's screen via osascript / PowerShell WinForms / zenity|kdialog; loopback only, one at a time, killed after 10 min; no desktop, e.g. the Windows service in session 0 -> 409) and fall back to `GET /v1/fs/browse` (`server/browse.rs`, in-page, roots only: data root, models, downloads, home, and mounted drives: Windows letters, mount points under `/Volumes`, `/media`, `/run/media`, `/mnt`, never a symlink such as `/Volumes/Macintosh HD`). A natively picked path (and what is under it) passes `browse::allowed_path` for 1 h even outside the roots.
-- `src/model/` model families: `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS),
-  `yolo8` (YOLOv8/9/11/12 `[1,4+C,8400]` + NMS), `detr` (D-FINE: `pixel_values` -> `logits/pred_boxes`), `rfdetr` (same, ImageNet-normalized, COCO-91 head), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`; input size from the model's static dims).
-  Preprocess = letterbox (YOLO) or stretch (RT-DETR) to 640x640 RGB f32 0..1, CHW.
-- Night / IR: `image_stats.rs` (per-request `Scene` day|night|ir from a 64x64 sample: IR = chroma or tint spread < 3,
-  dark = BT.601 luma < 50, computed in `prep.rs` after decode), `model/filters.rs` (night/per-label thresholds, person
-  aspect, min area, overlap suppression; all default off, applied in `worker::run::finish` before `to_predictions`),
-  `static_memory.rs` (per-camera static-box suppression, key from the upload file name). Bench sets `exdark-ir`
-  (grayscale transform of exdark-night, `images_from`) and `nir-night` (LILA camera traps, night IR, no persons: person
-  scores only as FP; wildlife GT a model cannot emit becomes an animal ignore region) are opt-in (`DEFAULT_SET_IDS`).
-  `model/enhance.rs` (`preprocess`/`night_preprocess`: none|grayscale|gamma|clahe, in `prep.rs`; the kept frame is
-  always the original). `night_model` routes night/IR frames, decoded, to another model's worker
-  (`WorkItem::DetectDecoded`, `worker::Peers` of weak handles published by the registry; never re-forwarded; falls back
-  to the model itself); `night_threshold` instead keeps the model and replaces its threshold on night/IR frames (can lower it;
-  `LiveSettings::threshold_for_scene`, Models card `@self`). `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the
-  service. Results and defaults: `docs/NIGHT_IR.md`.
-  `verify` (`src/verify.rs` pure decision, `worker/verify.rs` per-worker continuation lane): night person candidates
-  re-checked by another model (crop or frame), fail-open, never blocks the inference thread; MegaDetector v6 and the
-  ExDark RF-DETRs are export recipes (ExDark ones in `F32_MODELS`, non-commercial); benchmark `animal` class group.
-- `src/collect/` dataset collector (`collect` config, default off, live): after the reply, the worker `try_send`s the
-  original upload + a v1 sidecar record (raw/suppressed boxes, scene, camera, verify outcomes) to one collector thread
-  (buckets positive/empty/suppressed/verify_*/near_threshold/disagreement, per-camera rate limits, dHash dedup (`Bucket::skips_dedup`: all but positive and empty skip it, at most `DEDUP_SKIPS_PER_CAMERA` a minute), `collect/health.rs` (`collection` and `usage` on `GET /v1/dataset`), a disk stop re-arms itself, atomic
-  writes under `<data root>/dataset/<scene>/<camera>/<date>/`, `retention::prune_dataset`, disk guard); admin `/dataset`
-  page (frames by detected class; Review queue and export filter by class) and `review-queue.jsonl`; format in `docs/DATASET.md`. OpenVINO CACHE_DIR is `<cache>/openvino-<device>-<prec>`
-  (the CPU cache hash ignores precision); `config_store::spawn_disk_watch` applies on-disk config edits within 2 s.
-- Training protection: a failed run keeps `work` (`training/retry.rs`, `train_model.py --export-only`, YOLO, RF-DETR, RT-DETRv2 / D-FINE via `hf-best/`; training itself does not resume), an OOM restarts only before 3 finished epochs. `training/preflight.rs` is the one report behind the page's panel, `balance-preview` and `train prepare --dry-run`: an empty held-out set is refused, `MIN_CLASS_BOXES` etc. warn; `check_disk` refuses up front. Exports write `frames.json` (`empty_confirmed`, `bulk_accepted`); negatives rank by it and `hard_negatives.json`; frames are deduplicated across exports by flat name, held-out wins.
-- Model switch (`training/switch.rs`, `server/training_switch.rs`, `GET /v1/training/switch-preview`, `POST /training/revert`): the Use card shows a settings diff (a lost class loudly), copies per-model behaviour by default (not classes, device, `device_thresholds`), suggests a held-out threshold; `previous_default` holds what the switch changed, so Revert swaps it and a second Revert redoes it (one level). A verifier is replaced only with `replace_verifier` naming it. `Hooks::baseline` benchmarks the current default on the same frames into `<run>/baseline/` (`RunRecord.baseline`), never into `benchmark.json`. `benchmark/trained_on.rs`: `ModelResult.trained_on_share`, backfilled when served, warns where a score includes training frames. The export's benchmark set defaults to held-out (`BenchSplit::Val`).
-- Data safety: a failed label write keeps the job's `work` and is in its summary; `task::load_or_move_aside` moves damaged `runs.json` / `tasks.json` to `.corrupt-<time>` and leaves an unreadable one alone, unwritten; JSONL reads are lossy per line and appends repair a torn tail (`layout::read_lines`); exports are built hidden, then renamed; `<dataset root>/.labels.lock` (`fs4`, waits 30 s; a held lock is never given up on, only one that cannot work falls back to the process lock) covers CLI and service label writes; an unavailable review folder is `folder_missing`, never an empty dataset. Uninstall keeps data unless `REMOVEDATA=1` / `--purge` / `apt purge`; `KEEPDATA=1` wins.
-- Review (`src/collect/labels/`, `/train/review`, `assets/review.js`, `assets/review-rules.js`; export, classes and coverage are on the Dataset tab, `assets/train-dataset.js`): per-frame `<stem>.labels.json` (v1; states pending/
-  accepted/rejected/added; `merge_proposals` + `triage::apply` for auto-labels: evidence, class suggestions
-  `auto_label`, `auto_run` marker; a confirmed hint is accepted on save; `revision` check (409) on save; bulk
-  accept of `auto=accept` frames `POST /v1/review/accept-auto`; bulk reject of pending auto boxes below a score `POST /v1/review/reject-low`, `reason: low_score`; all in `collect/labels/bulk.rs`); box `difficult` (page `d`, "unsure") and `too_small` rejects are ignore regions (`LabelBox::is_ignore`: out of YOLO, in `ignore.json`, the frame leaves train and valid and stays held-out with the region `ignore: true`; COCO attribute,
-  X-AnyLabeling `difficult`); `collect.size_floor` (`{px, input}`, default off, `labels::SizeFloor` / `labels::under_floor`, JS twin `underFloor`, parity in `tests/it/js_rules.rs`): `min(w / W, h / H) * input` of the box clamped to the frame under `px` = too small; applied at export only (`ExportFrame::under_floor`: out of YOLO, `ignore.json` `size_floor`, manifest `ignore`, COCO `difficult` + `size_floor`; X-AnyLabeling unchanged; `export.json` `size_floor` / `under_floor`; `export::floor_counts`), by the dataset check's judge (its fold exports apply none) and at a training run's input (`dataset::restore_floor`); the only writer, `bulk::bulk_resolve_small`, dismisses pending model/auto proposals under it on unreviewed frames (`reason: size_floor`, `bulk::SIZE_FLOOR_REASON` in `bulk::is_dismissal`, `LabelBox::is_size_floor_dismissal`: no ignore region, no hard negative, no decision, hidden until `i`), and `bulk::bulk_restore_small` (`POST /v1/refine/resolve-small` `{restore: true}`, `GET /v1/refine/floor` `restorable`) puts back those the saved floor (or none) no longer covers; a labelers rerun brings one back only for a find not under the floor in force (`triage::FloorAt`, `apply_labelers_at`); accepted/added labels are never rewritten for it, so a floor change is a re-export, and held-out scores before and after one do not compare (fingerprint changes; measured at 10 px / 384: 72 of 2,751 accepted boxes, all training motorcycles among them); and `reject_reason` (enum, rejected boxes only, Shift+1-9, into `hard_negatives.json`, except `too_small` and duplicates;
-  `reason` stays provenance; an unknown one loads as `RejectReason::Other` and round-trips); repeats of fixed cameras
-  (`collect/labels/repeats.rs`): `GET /v1/review/history?camera=` (the reviewer's own decisions per camera, cached per
-  folder+camera, dropped by every label write, 60 s TTL) drives the page's "rejected here N times" hint and "Reject N
-  repeats"; `POST /v1/review/reject-spot|accept-spot` (`bulk::bulk_spot`: pending model/auto boxes at IoU >= 0.6 / 0.8,
-  same object class (vehicles one class) / same label, unreviewed frames of that camera and size, `skip_frame`, file
-  marker `repeat_spot`) and `POST /v1/review/accept-repeats` (repeat-only frames, nothing pending, sorted last,
-  `auto=repeats`); queue sorted by likely boxes, then fewer flagged, then uncertainty (`auto=` filter, wraps); `GET /v1/review/next` alone defaults to Recommended (`queue::Order`, `collect/labels/recommend.rs`; `order=recommended|uncertain`, read by `server::review::next_order` only, never `Filters::from_query`; `auto=` / `balance=` keep their orders, other values 400): reopened first, then `event_rank` (events = counted frames of one day folder <= 60 s apart, <= 600 s long; untimed and `model: import` frames alone; rank = the event's unlisted decided frames + listed ones ahead), then balance class+scene+camera in bands of 250, then uncertainty; the index sorts it with `recommend::arrange` (no top-K); in the default view only (`recommend::random_slots`: unreviewed, no scene/camera/label/bucket filter, `source` allowed) 1 slot in 5 is a random pick (`recommend::interleave`, slot `i` random when `(reviewed + skipped + i) % 5 == 4`; pool = FNV-1a of salt + rel path % 5 == 0, `in_pool`, reopened frames out; item `random_pick`, the page saves `LabelFile.review_pick: random` on every frame the queue served as one that session (`ReviewRules.servedPicks` / `servedAsPick`, kept in sessionStorage; Back and reloads keep the mark), an unknown value round-trips (`ReviewPick::Other`), kept when the body has no key, dropped by the server on a non-pool frame; "Anything missing?" always asked on one); bulk actions, auto-label `select`, coverage and spots keep the uncertainty order; `balance=class,scene,camera` (page: Filters > Order; `queue::Balance`, `BalanceTally`, `Uncertainty.balance`, index twin `index/query.rs` `Weigh`, in the equivalence grid) puts first the frames whose rarest wanted class (empty frames are a value), scene and camera have the fewest reviewed frames among those the counts count, `1000 x (1 - n / most)` per dimension summed, the class part x the frame's confidence in that class x the camera's kept share of that class's proposals (`(kept+2)/(proposed+2)` over its reviewed frames, `queue::proposed_labels`: judged machine boxes, no `labels::unjudged_reject`, parked-spot accept, duplicate or ignore region; `BalanceTally.precision`, rounded down once) (`queue::frame_confidence`: best pending score, decided or unscored box 1, else predictions; index class sets hold `(Name, u8)` hundredths; the class chosen = highest weighed need), after the `auto=` orders and before all else but repeat-only frames; order only, recomputed per request, exports YOLO / COCO /
-  X-AnyLabeling / benchmark `dir:` with a camera+day split; frames with a human decision or boxes awaiting review are never pruned (`labels::is_protected`), a label file with nothing left to look at goes with its frame. The page reviews `collect.review_dir`
-  (default `collect.dir`; *Folder under review*, `POST /v1/review/folder`), e.g. an import saved with `train import --out-dir`;
-  auto-label runs follow it. Unwanted classes = labels mapping to no `collect.classes` entry (aliases such as `pottedplant` map) ∪
-  `collect.hidden_classes` (Review "don't want (hide + reject)"; class ids and exports unchanged): left out of `prefill` and of auto-label
-  runs (`autolabel::without_hidden`; the job also rejects pending unwanted boxes in files it writes), not drawn on the page (a page save
-  rejects their pending proposals). A `POST /v1/review/classes` that makes classes newly unwanted rejects their pending model/auto boxes
-  on every unreviewed label file of the review folder (`bulk::bulk_reject_unwanted`, `reason: other_class`) and answers `auto_rejected`
-  + `reviewed_with_unwanted`; reviewed frames change only when the user confirms (`POST /v1/review/reject-unwanted-reviewed`, frames
-  stay reviewed). *Reject boxes of unwanted classes* (`POST /v1/review/reject-other-class`, unreviewed, queue filters) does the same
-  by hand; the auto-label form asks to hide classes left unticked. Duplicate boxes (`collect/labels/stacks.rs`, twin of the page's
-  `dupGroups`): stacks = live boxes of one object at IoU >= 0.7 (keeper: drawn > edited > accepted > pending > hint, then score; human
-  boxes never dropped), rejected on reviewed and unreviewed frames by `POST /v1/review/reject-stacked` (`bulk_reject_stacked`, walks the
-  label files via `queue::labelled`, `source` does not narrow; `reject_reason: duplicate`, frames keep their status, `overlaps_left`,
-  `overlaps_left_reviewed`), and at save / Shift+A / `accept_frame` for pending boxes; nested or partial overlaps (IoU >= 0.5, or >= 80%
-  inside, `inside_share`) go to a human, never a bulk action: `auto=overlaps`, `u`, and `overlaps_checked` on the file once a reviewer
-  saved with them kept (the bulk skips such a frame; a merged-in box clears it). A duplicate is no negative: out of `hard_negatives.json`
-  (`LabelFile::hard_negatives`), `rejected_boxes` and the repeats history. Overlap suggestions (`collect/labels/overlaps.rs`, pure, ported
-  from `scripts/research/eval_overlaps.py`, which was never committed; `tests/data/overlaps_parity.json` holds its answers and is frozen: it cannot be regenerated, so a difference is a change in the code, never a reason to edit the fixture; job `training/overlaps/`, `train overlaps`, Review
-  *Suggest overlaps...*, `POST /v1/review/suggest-overlaps`): assist mode, because a blind test failed the automatic rule (13 of 99 drops removed a real
-  object). `TaskKind::Overlaps`: select pairs -> env -> zoom (`scripts/autolabel.py --zoom-pairs`: RF-DETR L on the pair's padded union, one flushed JSONL
-  line per crop, detections only; ~2.6 GB free commit) -> write. **Only ever writes `LabelFile.overlap_suggestions`** (`overlaps::apply` under `labels::update`,
-  re-judged there; no box state, status, `reviewed_at` or `overlaps_checked`; reviewed and unreviewed frames, not skipped or checked). `suggest`: zoom match
-  IoU 0.6 + score 0.5 (constants in one place) and `witnesses` (independent detectors at IoU >= 0.7); no zoom answer = witnesses, `low_confidence`; `other_score`
-  >= 0.3 = `weak`, the page warns; `unclear` records a looked-at pair so a rerun resumes. Keyed by both bboxes, stale ones ignored (`overlaps::live`, also
-  `overlap_live` of `GET /v1/review/labels`), at most 64 per frame. Guards on the dropped box: human, `orig_bbox`, a `model_label` of another class (a
-  mapped spelling such as `motorbike` on `motorcycle` does not guard). `auto=overlaps` sorts by `overlaps::strength`; choosing it on the page sets
-  status any + frames all. Key `y` (`acceptOverlap`, twin `overlaps::accept`; `liveSuggestions` twin of `live`): rejects as `Duplicate`, promotes a hint keeper so the
-  save cannot leave the object with no box; a two-object accept keeps both. Class selection: a run may pick a subset of the wanted classes
-  (`AutoRun.classes`; skipped only when the same labelers already covered every picked class), `GET /v1/review/class-catalog`
-  (`training/autolabel/catalog.rs`, `coco_class` parity-tested against `scripts/autolabel.py`, default picks = classes the enabled models'
-  `object_filter`s keep; `assets/class-picker.js`, also the Config page's per-model Classes column).
-- Dataset check (`train refine`, `src/training/refine/`, CLI, job queue and the Refine tab; docs `docs/TRAINING.md` "Dataset check (cross-check)", `docs/DATASET.md` `refine`): fold models that never saw a camera day judge its reviewed frames' labels; **writes only `LabelFile.refine`** (`collect/labels/refine.rs`, pure: `Suggestion`, `Kind` add|tighten|relabel|verify + `Unknown`, `Answer` kept|dismissed + `Unknown`; at most `MAX_SUGGESTIONS` 64, strongest first by `strength` band x 1000 + score, bands relabel > add > verify > tighten (what costs a model most per error); over it `apply` drops the write's own fresh suggestions, weakest first, never an answered one or one of a kind outside `kinds`) through `refine::apply(file, found, &write::KINDS)` under `labels::update` (kinds `add`, `verify`, `relabel`; `tighten` only by the closer look, below): unanswered suggestions of those kinds are replaced, answered ones and other kinds stay, a same-finding as an answered one (`same_finding`: same kind + exact `target`, `add` = one object at IoU >= `ADD_SAME_IOU` 0.5) is dropped, an unchanged result leaves the file and its revision untouched (`Applied::changed`). A rerun replaces the open (unanswered, live) `add`/`verify`/`relabel` suggestions of the frames it checks, and with the closer look the open `tighten` of the labels the look answers; `preview` counts them (`open_suggestions`, `open_tightens` (only with the look: the live open `tighten`, a bound), `open_frames`; `refine::open_to_replace` -> `OpenCounts::for_check(look)`, from the selection's own read) and warns (`replace_warning(open, tightens, frames)`), and warns on short fold models (`weak_epochs`: epochs x 2 < `recipe::recommended(..).min_epochs`, i.e. 1..=4); `train refine` prints both before starting (`start_warnings`), never asks; a frame no longer `reviewed` gets nothing. `live` computes staleness at read time (box moved/gone, a target that is an ignore region (unsure / too small; `target_box` skips `is_ignore`), an `add` a box covers, answered, skipped frame, `Unknown` = never live, never an error), `accept` (add: new `source: auto` accepted box, `reason: refine`, in the place of the closest of `Live::replaces` = unjudged rejects of its object at IoU >= `MATCH_IOU` via `labels::unjudged_reject`, the others removed, `empty_confirmed` off, `overlaps_checked` off when in a stack / open pair; tighten keeps `orig_bbox`; relabel keeps `model_label`; verify answers `Kept`), `dismiss` (answer `Dismissed`, no box changes; remembered across reruns); the cover rule is `labels::covers` (IoU >= `COVER_IOU` 0.3 or >= `COVER_INSIDE` 0.5 of the detection inside the box, one direction; also used by `triage::apply_missing`); `refine::check` bounds a round-tripped list (`normalize`); an older build rewriting the file drops the list. `Suggestion.target_label` names the target box together with its bbox (absent = bbox only); `apply` drops answered suggestions of its kinds whose box is gone and anything `check` would refuse; each fold drops frames gone since the selection (warning), an unreadable image is left out of the fold's answer, an unavailable review folder is `folder_missing` (`CollectConfig::review_folder_problem`), write failures are named up to 20. Folds: `folds::assign` whole (camera, day) groups, largest first into the smallest fold, `FOLD_SEED` 0, `FOLDS` 2..=8, default 4, `EPOCHS` 1..=50, default 8, `MIN_FRAMES` 40, at least 2 camera days; frames from `export::reviewed_frames_filtered` (one snapshot for all folds, `RefineFrames` scene/camera filter narrows training too). Each fold: `export::run_selected` with the fold as `Split::Val` into `<work>/fold-N/export`, then `job::run_training_holding` + `NoHooks` (registers nothing, benchmarks nothing, no `runs.json` record; the check takes the training lock after the selection and holds it to the last fold's writes, fold training reuses it) with `install_dir` in the fold folder, recipe by `choose_recipe` (newest done run's model/imgsz/batch, else RF-DETR nano; patience 0, every epoch runs), then `check_unseen` (hard fail when a fold frame is in the model's `data/train.txt` or `valid.txt`, by name and by the dataset's `image_sources.json`, `dataset::IMAGE_SOURCES_FILE`), `predict::FoldPredictor` (`LocalPredictor` through `LocalDetector`, a never-saved config copy), `write::write_fold` (judged afresh under the label write lock), fold folder deleted. `judge.rs` constants: `MATCH_MIN_SCORE` 0.15 (measured: at 0.05 faint detections silenced `verify`), `LOOSE_IOU_MIN` 0.1, `GOOD_IOU` 0.75, `ADD_SCORE` 0.5, `FLOOR_PX` 10 (short side at `imgsz`), `VERIFY_IOU` 0.3, `MIN_CLASS_BOXES` 50 (counted per fold, on what that fold's model trained on), `RELABEL_IOU` 0.7, `RELABEL_SCORE` 0.8, `RELABEL_BLOCK_SCORE` 0.3, `REJECT_BLOCK_IOU` = `MATCH_IOU`, `FOUND_SCORE` 0.3 / `FOUND_IOU` 0.5 (report recall); one-to-one matching first so a loose label is no add + verify; only what `refine::live` shows is returned. `Selected::spots` (one `statics::Table` per check, from the selection snapshot) reaches the judge as `Context::spots`: an unmatched, uncovered detection at a spot that still holds without the frame's camera-day (`Spot::holds_without`) is an `add` from `ADD_SCORE_AT_SPOT` 0.3 (elsewhere 0.5; measured about 90% real at spots, almost all false elsewhere), with `spot: Some(id)` (the check's evidence only), its own class from `ADD_SCORE` up and the spot's majority label below, and its own `why`; `found` / `adds_at_spots` count what `refine::apply` kept; people and animals form no spot, so their cut-off stays 0.5. The report gains `static_spots`, `recall_at_spots`, `recall_elsewhere`, `adds_at_spots` (serde default). `statics::overview` and `statics::live_adds_at` serve the Static objects card and the bulk accept. With `collect.size_floor` set, training boxes under it are ignore regions for the judge (only `recall_by_size` counts them, `BoxFact.under_floor`) and nothing under it or under `FLOOR_PX` at `imgsz` is suggested; fold exports apply no floor (fold models train on every label, `class_boxes` counts them), and `report.json` records `folds_every_label`, `size_floor`, `ignore_mode`. Closer look at loose labels (`refine/tighten.rs`, `RefineRequest.tighten`, `train refine --tighten|--no-tighten`, default on when RF-DETR L's weights are on disk, else a preview warning): each fold appends its candidates (`judge::Loose`: loose pairs with a fold detection >= `TIGHTEN_FOLD_SCORE` 0.5, a class `coco_class` knows, not small) to `<work>/tighten-candidates.jsonl`; after the last fold one `scripts/autolabel.py --zoom-pairs` run on at most `tighten::MAX_TIGHTEN_CANDIDATES` 2,000 of them (most confident D first, `tighten::bound`; the rest `tighten_left_out` + a warning; the overlap check's `overlaps::zoom::{prepare,run}`, unchanged script) crops the union of L and D, under the check's training lock, step *looking closer at N loose labels*; `judge::tighten_verdict` proposes Z (same object, >= `TIGHTEN_ZOOM_SCORE` 0.5, best IoU to D) only when IoU(Z,D) >= `TIGHTEN_AGREE_IOU` 0.6, IoU(L,Z) < `GOOD_IOU`, no zoom box of the object fits L at >= `GOOD_IOU` (`label_found`: the closer look found the label's object as labelled), L spans no second zoom box of the object (>= `TIGHTEN_SPAN_INSIDE` 0.8 inside L, uncovered by another box: `spans_two`), Z not small, no edge of Z within `TIGHTEN_EDGE_PX` 1 px of a crop edge inside the image (`overlaps::zoom::read_answers` keeps the script's `crop`/`size`: `crop_edge`), and no other box or ignore region of the object fits Z better than L; otherwise a `NoTighten` reason, which the zoom replay tallies (measured on the user's frames: 148 loose labels, 82 candidates, 58 s on a GTX 1070 Ti, 5 proposals, all better by eye; no proposal: 42 the two looks disagree, 34 the label was fine, 1 label found). `write::write_tighten` re-judges under the label write lock and replaces only the open `tighten` of labels whose crop was answered (every other open tighten is carried over as is); `found.tighten` counts this look's kept proposals only; a Cancel during the folds skips the look, a failed fold still zooms (the task's error says what the look saved), a failed look keeps the folds' suggestions (summary + warnings); report `tighten`, `tighten_candidates`, `tighten_left_out`, `zoomed`, `found|written.tighten`; the preview's time line is a bound (about a second per loose label, at most 2,000); Refine tab `open.tighten` (Findings: *Loose boxes*), `capability.tighten_default`, checkbox *Propose better boxes for loose labels*; the Review card says *tighter box* only when >= 95% of Z lies inside L (`ReviewRules.tightenWord`), else *better-fitting box*. `TaskKind::Refine` on the one-at-a-time queue (`RefineJob`, `plan_refine`, work folder `<training dir>/refine/<id>` held with `storage::Busy`, removed at the end, `storage::sweep::WORK_DIRS` covers `refine` for crashes); Cancel keeps finished folds and writes a partial report (a cancel before any fold is a plain cancel), a failed fold stops the job after the finished folds' writes; report `<review folder>/refine/report.json` (a quick check's: `refine/report-quick.json`; `report.rs`, `REPORT_VERSION` 1, recall with Wilson 95% intervals per camera x scene x class and size bucket; outside the scene folders like `spots/`); `preview` / `--dry-run` needs no GPU or download and writes nothing; its time is per fold `FOLD_OVERHEAD_S` 430 s (measured) plus training at the newest finished run's pace on this GPU (`pace_of`: median epoch of its `history.jsonl` over `train_images + valid_images`), else the generic estimate (`time_basis` `last_run|guess`). Quick check (`train refine --with-model <name>`, `RefineRequest.model`, `refine/quick.rs`, the Check card's *Quick check with a model you trained*, conflicts with `--folds`/`--epochs`): no training; the configured model (its family, class file, device; `quick::predict_entry` drops its thresholds and object filter, so it answers from `MATCH_MIN_SCORE`) judges the reviewed frames of the selection it never trained or validated on (`quick::seen_of`: `<stem>.provenance.json` -> run folder (`runs.json` `run_dir`, else `<training dir>/<run>`) -> `data/train.txt` + `valid.txt`, by the dataset's spelling of the flat name with each `s<N>-` prefix, 120-byte cut included, and by `image_sources.json` where the run has it; held-out and newer frames are checked); refused, never guessed, without the record, a readable run id, the model file, the run folder or its lists, when non-empty lists name no reviewed frame of the folder (frame filter aside; a model that never saw the folder is refused too, the safe side), and at preview and plan time when the file's SHA-256 is not the record's `onnx_sha256` (`quick::check_weights`; no hash = a warning) (`MIN_UNSEEN_FRAMES` 1); listed names that are no frame names of this program (public sets aside) are a warning with the count (`Seen::odd_names`). `judge::Context::model` (`ModelJudge`): `imgsz` and `class_boxes` (run's `dataset.json` `stats.train_boxes`; none = no verify) are the model's; a wanted class it lacks gets no verify, no relabel, no recall row, and its label covers a detection of any class only at IoU >= `judge::UNKNOWN_CLASS_COVER_IOU` 0.5 (a person in front of a labelled truck still gets its add); `why` names the model. Only checked frames are written; `open_to_replace` / the 409 count those only (`RefinePreview::replace_text`); spots from every reviewed frame of the selection; steps 3 (+1 closer look, which needs a GPU: `quick::look_choice`), training lock as folds, a Cancel in the pass is a plain cancel. The report is its own `refine/report-quick.json` (`report::QUICK_REPORT_FILE`; the full check keeps `report.json`, neither replaces the other) with `mode: model`, `model` (`trained_on`, `validated_on`, `same_day`, `classes_missing`, `by_source`, `device`), `folds` 0; `predict_load_s` (before the first frame: runtime + the benchmark's `compile_ms` + `warmup_ms`, `Detections::load_s`) and `predict_s_per_frame` (load excluded) give the next quick preview's time as load + per frame x frames (`TimeBasis::LastCheck`, both needed; else 60 s + 0.25 s/frame). `GET /v1/refine` `capability.models` / `unusable` (records only: `runs.json` and each record read once, the model file must exist, no hash; kept 5 s per config revision and the records' size and time, `server::refine::quick_models`); preview and start take `model` (with folds/epochs: 400); `RefineFloor.lastLine` / `recallOf` / `measuredWith` word a quick report (measured on the user's frames with custom-rf-detr-nano-3: 204 of 851 frames never seen, about 2 min, 37 adds, only `refine` changed). The Review tab finds suggestions with `auto=refine` (`AutoFilter::Refine`, any status, `refine::live` with the class list, strongest first; item fields `refine_strength`, `refine_open`; `refine_kind=add|tighten|relabel|verify` only with `auto=refine`, else 400), and `GET /v1/review/labels` serves `refine_live` (`{index, kind, target, target_label, bbox, label, score, why, spot, run, target_box, replaces}`, positions in the file as served). JS twins `liveRefine` / `acceptRefine` / `dismissRefine` (`classes, hidden` arguments, f32 arithmetic, the COCO aliases) in `assets/review-rules.js`, parity in `tests/it/js_rules.rs`; a page answer is saved by the ordinary label save (revision check). The Review page offers them one at a time (`ReviewRules.refineCurrent`: none while an overlap suggestion is live, then strongest first, ties by index, Later puts one off; `refineCard`, `refineFocus`, `answerRefine`, `suggestionKey`, `sendsFilter`, `refineForSave` are page decisions with no Rust twin, tested in `tests/it/js_review_refine.rs`). An add or a tighter box is drawn as a dashed violet proposal; a verify, relabel or tighten marks and selects its box. `y` accepts (it stays the overlap suggestion's while one is on screen), `w` says no (dismiss); an accepted add's box stays selected marked `_adjusting` (page-only, stripped at save; `ReviewRules.adjustingBox` / `endAdjust`, `suggestionKey` route `done`) for the reviewer to fit, and `y` again (*Accept box*) brings the next suggestion; on one column the bar holds the suggestion's two answers. Answers are undo steps, kept in drafts and saved by the ordinary save; there is no auto-save after the last one. Auto filter `refine` (status any, frames all) and a kind select (`refine_kind`, sent only with `auto=refine`). `y` / `w` act once per press (`suggestionKey` `'held'`). The page's reviewed save decides `overlaps_checked` (`ReviewRules.overlapsCheckedOnSave`: true when a stack or open pair is left, whatever made it on that visit, an accepted suggestion included; the accept alone ends the flag as `refine::accept` does): the save is the look, since every pair is marked and the check pass steps through the boxes not looked at. `POST /v1/review/labels` keeps the stored `refine` and `overlap_suggestions` when the body has no such key (`server::review::SentLists`; a present key, `[]` too, is the client's list). `refine_live` is `refine::live_json`, parity-tested key for key.
-- Refine tab (`server/refine.rs`, `templates/train/refine.html`, `assets/train-refine.js`, docs `docs/TRAINING.md` "Refine tab"): `GET /v1/refine` (`report` from `<review folder>/refine/report.json` and `quick_report` from `refine/report-quick.json`, each null with its own `report_problem` / `quick_report_problem` when damaged or newer; the Findings card shows the newer (`RefineFloor.reports`, `otherLine` names the other); the recall tables, the coverage route's recall and the floor's suggested input use the full report, else the quick one (`server::refine::recall_report`); `open` = `refine::live` counts per kind over the label files, `queue::labelled_map`, kept 60 s and dropped when a refine task changes state; `job`, `last`, `capability`, `limits`), `GET /v1/refine/preview` (`refine::preview`), `POST /v1/refine/check` (`start_check`: 409 for a check already queued or running, 503 `folder_missing`, the preview's `refused`, 409 `{needs_confirm: true, open_suggestions, open_tightens, open_frames}` when the check would replace open suggestions (with the look also open `tighten`) and the body lacks `replace_open: true` (the page asks inline, `#refine-confirm`, *Start and replace [up to] N open suggestions*), then `plan_refine`; sets `job.predictor` to a `LocalPredictor` on the registry's runtimes; `enqueue_task`). The start re-checks "a check is already queued" under the queue's lock (`TrainingService::enqueue_task_unless`, `NotQueued`), so two starts at once queue one. `task_tab(TaskKind::Refine)` is the Refine tab, its job row `#job-<id>` inside `#jobs`; the tab polls the jobs list every 3 s while a check is listed, else every 30 s. A report of a newer format is "newer", never "damaged" (`version` read first). Static objects card (`server/refine_spots.rs`): `GET /v1/refine/spots` (`statics::overview` of the review folder's reviewed frames in `server::blocking`, kept 60 s and dropped when a check changes state or an accept writes; per spot `crop`, `sample` = newest labelled frame via `/dataset/image`, `sample_size`; busiest 200, `truncated`; `static_cap`), `POST /v1/refine/accept-spot` (`{spot, min_score?=0.5, dry_run?, limit?<=500}`, 4 KiB, unknown fields refused: every live `add` lying at the spot by geometry (`statics::Table::spot_of_add`; the stored `Suggestion.spot` is never matched) at `score >= min_score` through `labels::update` + `refine::accept` on reviewed frames only, never on `empty_confirmed` ones (counted in `left_empty`); the dry run runs the same `accept_at_spot` on the file as read, so its counts are the apply's; answer `accepted`, `frames`, `eligible`, `below_score`, `stale`, `failed`, `sample` of 10 spread over the days; 404 unknown spot) and `POST /v1/refine/static-cap` (`{cap}` 0..=100000 through `save_config`). The page asks inline (`#refine-spot-confirm`) after the dry run. `/train/review?frame=<rel>` opens that frame (filters from the same link; a gone frame shows the queue). The web pre-flight lists the static cap under "Left out of training" and hides the duplicate note; its list follows `ignore_mode` (`ignore_only` and `ignore_valid_day` in background, `ignore_frames` in drop-frame) with a line for `ignore_kept` and `ignore_boxes_background`. Too small card (`server/refine_floor.rs`): `GET /v1/refine/floor[?px=&input=]` (saved or previewed `collect.size_floor` with per-class `{boxes, under, left}` from `export::floor_counts`, the pending count from `bulk_resolve_small` as a dry run, `suggested` input = the last check's imgsz, else the newest done run's, else 384; kept 60 s per folder + classes + floor, dropped by a save and by the rule), `POST /v1/refine/size-floor` `{px,input}|{off:true}`, `POST /v1/refine/ignore-mode` `{mode}` (`training.ignore`), `POST /v1/refine/resolve-small` `{dry_run?, limit?, restore?}` over unreviewed frames of the queue and the index files (hide with the saved floor, 400 without one; `restore` needs none; `GET /v1/refine/floor` answers `restorable`). The recall by size of the full report, else the quick one, is drawn on this card, not on Coverage. Pure sentences `globalThis.RefineFloor` in `assets/train-refine.js`, node-tested. The labels answer carries `size_floor` (`{px,input}|null`); the Review page shows a *too small* chip (list, tag, selected line) from `ReviewRules.floorNote` (live, information only, none for rejected or unsure boxes or with no floor). Coverage card, second table "Where the data is thin" (`server/refine_coverage.rs`, `GET /v1/refine/coverage`): one row per camera x scene of the review folder (`{camera, scene, reviewed, persons, vehicles, vehicle_frames, empty, empty_confirmed, unreviewed_person_frames, person, vehicle}`; `empty` = reviewed frames with no training box and no ignore region, the training plan's negatives, ticked or not, `empty_confirmed` = how many of them were ticked; person / vehicle = the full report's recall, else the quick one's, with Wilson interval or null; vehicles = car, truck, bus, van, motorcycle, bicycle summed and the interval recomputed), one `queue::labelled_map` walk plus one `queue::build` kept 60 s per folder + class list (4 kept, dropped when a check changes state and by the spots accept and resolve-small writes; the report is joined per request). `unreviewed_person_frames` is counted by `queue::build` under the link's own filters (`/train/review?status=unreviewed&source=all&scene=..&camera=..&label=person`, grouped by the queue's scene and camera), so frames without a label file count by their sidecar's predictions and an unreadable sidecar counts nowhere (tested per row). Advice rules in `RefineFloor.coverageAdvice` (`MIN_PERSON_BOXES` 20, `MIN_RECALL_BOXES` 20, `MISSED_RECALL_HIGH` 0.7; on `empty == 0` with reviewed frames *No empty frames: review some frames with nothing in them*, or, where `vehicle_frames` (reviewed frames with a vehicle box) >= `VEHICLE_FRAME_SHARE` 0.9 x reviewed frames, that a vehicle is in about every frame so false alerts on empty frames cannot be measured there; node-tested).
-- Train area (`server/train_area.rs`, `templates/train/`, `assets/train-area.js`): one nav entry, nine tabs `/train/{collect,import,autolabel,review,refine,dataset,train,models,jobs}`, old `/dataset`, `/review`, `/training` redirect (307); `GET /v1/train/summary` and `train_area::next_step` fill the strip (`queue::tally` on its own thread, a stale answer is served while a walk runs). Steps `answer_check` (open relabel + add suggestions, before both exports, `/train/review?auto=refine`; count from `server::refine::open_cached`: a kept answer up to `STRIP_OPEN_TTL` 10 min, none after a review save around an unanswered suggestion (`save_changes_open` -> `forget_counts`) or a queue change, else a walk on its own thread (one started a minute per key), never waited for) and `run_check` (after review, before the second export: can train, >= `refine::MIN_FRAMES` reviewed on >= 2 camera days (`Tally::reviewed_camera_days`), no report or the newer report's `frames_checked` (judged, not selected; `check_covered` re-reads only on a report's length/mtime change) < 3/4 of reviewed; *Quick check* `#quick-check` when `quick_model_ready`); the review step reads *M boxes on N frames* only when `Tally.unfiled_to_review == 0`. Review's session line counts boxes decided + drawn per minute of capped frame time (`ReviewRules.boxDecisions`, docs/TRAINING.md "Train area"). Import chains an auto-label with the last run's settings (browser storage). Dataset tab export card: one warning line from `GET /v1/refine` `open` ("The dataset check has N open suggestions (...)", `DatasetOpen.line`, hidden when none or the folder is unavailable) and, with `collect.size_floor` saved, a server-rendered "Size floor: objects under N px at M ..." line (`train_area::size_floor_line`). Jobs tab (`server/train_jobs.rs`, `templates/train/running.html`, `GET /v1/train/jobs`, polled every 3 s on that tab, memory only; every tab's label shows the count): every running and queued job with step, percent, time left and a link to its row on its own tab (`#job-<id>`); `training/eta.rs` `JobClock` (service memory, pauses left out, measured from a step's first gain), a training ETA is a range (`TrainProgress::time_left`: early stop to epoch cap), any other estimate covers its step only.
-- Training (`src/training/`, tabs Train and Models, `blue-onyx-prism train ...`, `scripts/train_model.py`): user-triggered only;
-  `capability` gates by GPU (CUDA lanes cu126/cu130 by compute capability + driver; MPS on Apple, D-FINE CUDA-only),
-  separate `tools/train-env` from `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR n..l,
-  RT-DETRv2, D-FINE (base pins in `catalog/train.rs`); head rows initialised from the base's COCO rows; static ONNX
-  export + ORT check, install, benchmark on the held-out split; `epoch`/`eval` events carry every scalar `metrics`
-  (raw keys -> ids by `progress::canonical`, F-beta sweeps, `mem_gb`, `img_s`), kept as `progress.history` + `best`,
-  table columns in `training.metric_columns` (`POST /v1/training/metric-columns`); an early GPU OOM retries at half the
-  batch (MPS watermark 1.0, RF-DETR memory at its multi-scale side); data loader workers are sized at the train stage
-  by free commit on Windows (`training::workers_for`, ~1.4 GB per spawned worker x loaders; `training.workers` overrides)
-  and a host OOM (WinError 1455, `DefaultCPUAllocator`, which also wins over a WDDM "CUDA out of memory") halves the
-  workers, never the batch; training-env helpers (train, import, auto-label: `train_python_cmd`) run below normal
-  priority (`Cmd::low_priority`, Windows creation flag / Unix nice >= 10, `backend::priority`), and between training and
-  export `train_model.py` `prepare_export` frees the training state (DataLoader workers via gc, trainer, one RF-DETR model at
-  a time), caps CPU threads (`BOP_EXPORT_THREADS`) and waits up to 5 min for 3 GB RAM / 4 GB commit; docs in `docs/TRAINING.md`.
-  `training.ignore` / `--ignore` (`dataset::IgnoreMode`, default `background`): a train frame with ignore regions and a box of the run's classes trains with the regions unlabelled, one with only regions is left out (never a negative), validation never holds one (a validated day takes it out of both; its boxes count for the half rule); `drop-frame` = the old behaviour; `Stats` `ignore_only`/`ignore_valid_day`/`ignore_kept`/`ignore_boxes_background`, `dataset.json` `options.ignore`; the held-out set and its fingerprint do not depend on it. A changed default (upgrade note in docs/TRAINING.md "Ignore regions"); `RunSettings.ignore` records it (None = drop-frame) and `compare.rs` warns on mixed modes; `RunSettings` also records `negative_share` and `static_cap` (None = older record, `Some(0)` = off) and `compare.rs` warns on mixed known values; positives leaving with their validation day trim the training negatives (`negatives_trimmed`; caps not re-run); `IgnoreMode::parse("")` is refused. `dataset::Options.imgsz` (the recipe's; None for `train prepare`) re-judges the `ignore.json` `size_floor` regions of train/valid frames at the run's input (`restore_floor`, `Stats.floor_restored`, `at_run_input` for `write` and the pre-flight; held-out unchanged; measured: a floor of 10 px at 384 and a run at 640 gives 42 objects back); a smaller or unknown input, and exports whose floors differ from each other or from `Options.size_floor` (`collect.size_floor`), warn (`floor_warnings`).
-  Starting points per family in `recipe::recommended` (epochs cap, patience, min epochs, min_delta; `training.epochs`/
-  `.patience` None = recommended, a stored legacy 50 = None); learning rate `training.lr` / `.lr_schedule` (cosine|linear|step, per family `recipe::lr_schedules`) / `.lr_min_factor` (form or CLI value, else config where the family takes it, `TrainingConfig::apply_lr`, else the family default; `--lr-scheduler` / `--lr-min-factor` passed only when set), `batch` events carry the main group's `lr` and `progress` has `lr`, `stop_epoch`, `batch_size`, `imgsz`, `settings` (`RunSettings`); one convergence rule for every trainer (`Convergence` in
-  `train_model.py`, Rust twin `progress::convergence_run`, parity-tested; native early stopping off; best raw epoch of the selected metric
-  exported (`training.select_metric`, `recipe::SELECT_METRICS`, `--select-metric`, default `map`: drives both the rule and the checkpoint; a failed source falls back to mAP for the run, `select_fallback`); gains judged on a `smooth`-epoch mean (3); a recommended patience doubles under 50 validation images
-  (`TrainRecipe::convergence_patience`); a stop point with the training loss still falling (>2%, `loss_falling`) becomes a
-  `converge_point` extension, at most 2, shown on the page with Stop now = Finish now) and Finish now (`POST /training/finish` -> `<run dir>/work/stop-request`, `stop` event). `SceneFilter` is a
-  day/night/ir set (`night` alone = night only); the held-out set is chosen from all review frames before the scene
-  filter (tags `heldout:<scene>|all|in-scope|random`, `heldout_fingerprint`; `heldout:random` = Review random picks, from
-  `frames.json` `random_pick`, never in the fingerprint), so runs queued with several scenes share a
-  `compare_group` and compare per scene (`training/compare.rs`, Comparison card, `GET /v1/training/compare`; columns also
-  person/vehicle recall + false alerts on empty frames at the model's threshold, from `BenchSummary` `person_recall`,
-  `vehicle_recall`, `empty_frames`/`empty_frame_alerts`, `threshold`; *Random picks* = AP50-95 of `BenchSummary.random`,
-  shown only when every benchmarked run has >= `MIN_RANDOM_HELDOUT` 50, differing counts warn). RF-DETR: cosine LR schedule (min_factor 0.1) and lr
-  5e-5 / lr_encoder 7.5e-5 under 1000 unique train frames, not repeats (`TrainRecipe::effective_lr`, `Prepared.train_frames`); anneal-then-stop at a stop point
-  (`--anneal`, max(5, ceil(patience/2)) epochs, Rust twin `progress::convergence_run`). Validation split (`dataset/valid.rs`) = 10% but at
-  least 50 frames, at most 25% of the pool as a target (`Options.min_valid`), taken as whole camera days never shared with training:
-  seeded rank, class-adding days first, at most half of a class's boxes, up to 1.5x the target, then up to the 25% cap. It falls back to
-  the frame split with a warning under 3 days, under half the target, no group with a box, or no camera/day tags (`Stats.valid_groups`).
-  "Repeat with N seeds" (form `seeds` 1-3, `train run
-  --seeds`): `TrainRequest.train_seed` is the trainer's `--seed` only (dataset assembly seed unchanged, so same frames),
-  names get `-s<i>`, one compare group, and the Comparison card adds "mean of N seeds" rows (mean + range, never best). Class
-  filter: `dataset::inventory` (`train classes`, `GET /v1/training/dataset-classes`, the page's picker) and
-  `Excluded` (background | drop-frame for objects of unpicked classes). Balancing `dataset::balance` (step 7 of
-  `dataset::plan`, opt-in: class / scene / camera / camera-day repeat factors capped at max repeat, optional cap of
-  dominant groups, negative share kept, held-out/valid untouched; `training::preview_plan`,
-  `POST /v1/training/balance-preview`, `train prepare --dry-run`). Static cap (`dataset::plan` step 5, after the parked-spot cap on what it left): `collect/labels/statics.rs` (pure) finds per-camera static spots by geometry over the train/valid pool's own frames. Only things that park form spots (`statics::may_be_static`): vehicle classes and COCO classes that are not animate; `statics::is_animate` (`person` plus `autolabel::Category`'s animals) and classes outside those lists are never clustered, so person and animal frames are never static-only or capped. A spot needs `SPOT_IOU` 0.6 in normalised coordinates (measured: 0.8 split one parking place into several), `MIN_FRAMES` 10 on `MIN_DAYS` 2; canonical-order seed and a median representative, independent of order; ids `<camera>/<object>/<x0>-<y0>-<x1>-<y1>` in 2% steps. Spots are found on a frame-hash sample of at most `MAX_OBS_PER_CAMERA` 4,000 boxes per camera, with a lazy-heap seed and an `x0`-window sweep (no neighbour lists; O(S·W) IoUs, O(S) memory); every box is then counted against the candidates in one pass, so counts are exact. Dwell rule `MIN_DAY_SHARE` 0.3: a day counts toward `MIN_DAYS` only when the spot is labelled on 30% of the camera's frames that day that have any training box (visitors stopping at a gate are no spot; measured: removes 4 small spots of 19-23 frames). A frame whose every box of the run's classes lies at a spot keeps at most `training.static_cap` per (spot, class of the box there) (default 20, 0 = off, not written while default; `--static-cap N` on `train prepare|run`), chosen round-robin over (scene, day). Held-out, public, unknown-camera and negative frames, and frames with any other box of the run's classes, are never capped (measured on the user's export: 564 -> 370 training frames, car boxes 1,472 -> 943, truck 80 -> 50, persons and held-out unchanged). The spots come from the train/valid pool after the scene filter (parked-capped frames included), so they can differ from the Refine card's; a class the cap took frames of says so in its warnings (`static_cap_clause`). `Stats.static_capped|static_spots|static_caps` go into `dataset.json`; `dataset::static_cap_note` feeds the pre-flight and `train prepare`.
-  `train import` (`training/import/`: video / image folder / URL via yt-dlp / pinned `import-data:meva-sample` into the
-  dataset folder, scene change + dHash + SigLIP k-center, licence confirmed; the 20k candidate budget split per camera then
-  per video before extraction (`select::budget`), videos extracted in parallel (`import/parallel.rs`, `--workers`, results
-  in video order), analysis on all cores but one, `--hwaccel auto|off` (D3D11VA / CUDA / VAAPI, software on macOS where
-  VideoToolbox measured slower); two-pass extraction (640 px candidates, then only the kept frames at full resolution) with a free-space
-  preflight and running guard (`import/disk.rs`, ENOSPC -> one actionable error, work folder removed); `GET /v1/training/import/preview` backs the page's preview line) and `train autolabel` (`training/autolabel/`:
-  MM-Grounding-DINO + RF-DETR L, Qwen3-VL (`vlm_question`, per-class yes/no, `expected: "yes"`; older files hold the seven-way answer; a no never hides a box, on public sets 40% of them were real) / SigLIP 2 checks, pending `auto` boxes; `--with-model` self-training re-label;
-  `--with-model <id> --missing-only` (`triage::apply_missing`, `autolabel::trained_frames`) proposes unlabelled real objects on reviewed
-  frames, bypassing `triage::apply` and `merge_proposals`: frames the model trained on are skipped (`<model>.provenance.json` ->
-  `<training dir>/<run_id>/data/train.txt`), a same-object training or pending box at IoU >= 0.3 or holding 50% of the detection covers
-  it, judged rejects block at IoU >= 0.5, unjudged ones (`low_score`, hints rejected by the save default) are overwritten in place; only
-  frames that gain a box are written (`unreviewed` + `disagreement`, so out of exports until saved); no `auto_run` marker, so models run in turn;
-  run options: batched VLM check, `--vlm-min-score`, prefetch; a Cancel keeps the finished frames, a rerun resumes)
-  are `task::Task`s on the same one-at-a-time queue (an import can queue an auto-label of its frames: `Task::after`, skipped unless the import is Done with new frames; post-steps reject-low / accept / review folder in `training/finish.rs`), recorded in `<training dir>/tasks.json` beside `runs.json`; pins in
-  `catalog/autolabel.rs`. A running job pauses / resumes (`PausableRunner`: SIGSTOP/SIGCONT of the helper's process group,
-  Windows: the job object's threads suspended; paused time does not count toward the timeout). Split Blue Iris exports
-  (`Cam.<time>_N.mp4`) get per-part start times (`source::segment_offsets`). Several NVIDIA GPUs: `--gpu cuda:N` / the
-  page's GPU select (`Capability::cuda_options`). The public night subset (`train-data:lila-night`, 926 MB) and other > 500 MB downloads need
-  `--allow-large` / the page's box / `allow_large_downloads`.
-- SAM 3 (`facebook/sam3`, SAM License, gated, 3.4 GB, pin `autolabel:sam3` in `catalog/autolabel.rs`) is an opt-in labeler: it takes
-  gdino's seat in fusion (`--sam3`, form `gdino=sam3`; refused with `with_model`); the default stays gdino and
-  nothing here claims it is better, its full evaluation has not run. `--sam3-threshold` (needs `--sam3`) / form `sam3_threshold` (Training
-  and Review cards, shown and posted only while SAM 3 is chosen, `al.sam3_threshold` through an import, ignored for other labelers) is SAM 3's
-  own score before fusion, 0.01..=1 by `validate`, default 0.3, in the run summary; the marker does not hold it, so a rerun at a new value
-  needs `again=1` (the preview warns). `scripts/autolabel.py` `Sam3` (masks off, phrases cached, f32,
-  loaded first), `participants_of` generalises the fusion seats, `labeler()` names it so gdino markers do not skip its frames, and
-  `--self-check` imports `Sam3Model` before the download. **SAM 3 boxes never triage `accept`** (`ACCEPT_SCORE` 0.6 was tuned for
-  gdino + RF-DETR and a bulk accept reaches exports). Cost: ~2 s + 0.2 s x phrases per frame on a GTX 1070 Ti (about 5 s with 22
-  phrases; gdino 0.55 s), unmeasured on Apple GPUs. Gated download: `resources/hf_token.rs` looks the token up as `HF_TOKEN`, then
-  `<data root>/tools/hf/token` (`hf-login`; 0600 on Unix, chowned to the data root's owner; on Windows a protected DACL on `tools\hf`), then the `hf` CLI's file
-  (`HF_TOKEN_PATH`, `HF_HOME/token`, `~/.cache/huggingface/token`), with a source label; the value is never logged, returned by a
-  route or passed to Python (`inherited()` drops `HF_*`). `catalog::GATED` (by resource id: repo page, license) marks gated
-  resources (exempt from the Apache test; the weekly URL check counts 401 + `GatedRepo` as OK). The manager sends the bearer only to
-  huggingface.co (re-read each attempt; reqwest drops it on cross-host redirects); a 401/403 from there, or with `X-Error-Code:
-  GatedRepo`, is a typed non-retryable refusal (`Refusal::NeedsLogin|NeedsAccess`; a CDN 403 stays an ordinary failure), and
-  `without_url()` keeps signed CDN URLs out of logs and `State::Failed`. `src/server/sam3_access.rs` (admin): `GET /v1/autolabel/sam3`
-  (state not_requested|needs_login|token_unreadable|needs_access|checking|downloading|installed|failed, token source, login command),
-  `POST .../download` (the "I have access" click: files already at their pinned sizes are adopted by hash with no token or
-  large-download gate, else one `config.json` probe answers needs_login / needs_access at once, then free space, then the queue),
-  `POST .../remove` (deletes the whole weights folder; refused while a run uses it: `Task::uses` / `TaskRecord::uses` narrow it to
-  runs using SAM 3). The login command names the sibling CLI exe by full path with `--config` before `hf-login`, `sudo -u <account>`
-  on Unix. `plan_autolabel` fails fast with it when SAM 3 is missing, there is no token and the parts are not on disk.
-- Tiers (`triage::tier`, only on the Merge path of a labelers run, constants in `triage.rs`, docs "Likely, unlikely and hidden boxes"): dismissed = pending auto box
-  at fused < 0.15, not `truck`, never on a SAM 3 run: `state: rejected`, `reason: auto_dismissed` (`bulk::DISMISSED_REASON`; "hidden" in code means unwanted classes), out of
-  `hard_negatives` and the repeats history (`bulk::is_dismissal` also holds `spot_dismissed` and `size_floor`, the size floor rule), `undismiss_found` lets a stronger find through, frames with one are refused by bulk accept and `repeats_only`; 1 in 50 stays visible as
-  `auto.audit`; likely = fused >= 0.25 with a yes-contract VLM yes (`auto.likely`, triage stays `review`). A VLM no ranks, never hides. Page keys `c` (Accept likely), `i` (show hidden), `Shift+R` (`REST_REASON`), `auto=dismissed`; `labels::needs_decision` refuses a save holding a flagged box that would become a label.
-- Spots (`collect/labels/spots.rs`, `triage::apply_spots`, Rust only, after tiering): rejected spots come from `repeats::scan`, snapshotted once per camera at job start (`Reject the rest` counts), and dismiss new auto boxes as `spot_dismissed` (same readers as `auto_dismissed`, one list: `bulk::is_dismissal`), never at fused >= 0.5, a likely box, an audit sample, or on a SAM 3 run, within 30 days of the frame. Parked spots (`t`, `<review_dir>/spots/<camera>.json`, own mutex, never under the label write lock, `moved_at`, `GET /v1/review/spots`, `POST .../spots/{parked,retire,moved}`) auto-accept the exact label at IoU >= 0.8 unless the VLM said no (`reason: parked_spot`); exports list them in `ignore.json` `parked`, `PARKED_CAP` 20 per spot in `dataset::plan`. `Source::Model` boxes are not covered.
-- Labelers reruns (`training/autolabel/triage.rs`): `triage::apply_labelers(f, boxes, name, frame)` decides under the write lock by the
-  frame's status at write time: unreviewed = `apply` + votes; reviewed, or sent back by a re-label (unreviewed with `disagreement` and
-  `reviewed_at`) = votes, the confidence gate (`gate_drop`), then `apply_missing`; `empty_confirmed` on any status, and skipped = votes
-  and the marker only (a save refuses a box on a confirmed-empty frame; a skipped frame must not come back and reach exports by a bulk
-  accept). The gate keeps a proposal only if the labelers agree or a source score is >= `MISSING_THRESHOLD` 0.5 (the fused score halves
-  single-labeler boxes), no VLM / SigLIP objection, it is on no decided box of another label nor a reject, and a box one labeler found
-  has a VLM yes (`vlm.ok`; a check that never ran is no evidence, so `--vlm off`, `vlm_skipped` and a class the VLM is never asked
-  about, `Category::Object`, count as `filtered_unchecked`: with the checks off a real run reopened 22 of 41 reviewed frames, mostly on
-  false boxes, with them on 0 of 16); survivors get a `why` and triage `review`, and a frame that gains one goes back to
-  unreviewed with a `disagreement` note naming `sam3` and loses `bulk_accepted`; `reopened` and the filtered counts are in the summary
-  with `REOPENED_WARNING`. Votes: the new labeler's score joins a same-object box's `auto.labelers` at IoU >= `STACK_IOU` 0.7 (best
-  match, `or_insert`, `labels::MAX_LABELERS`) so it can witness overlap suggestions; nothing else on the box changes, a vote-only
-  write is `queue: false`. A `--with-model` run votes too (`apply_relabel`: `apply`, then `vote`, the model's name as the key, `votes` in
-  its summary), with no change to status, `disagreement` or `annotated`; `--missing-only` never votes. `auto=both` (`AutoFilter::Both`, page *found
-  by 2+ labelers*): a pending box with 2+ `labelers` of a wanted class (`Filters::wanted`, as `auto=overlaps`), most such boxes first (item field
-  `agreed_boxes`); a decided box never counts. `POST /v1/review/restore-reopened` (`bulk::bulk_restore_reopened`; filters, `dry_run`, `limit` 500) puts
-  unreviewed frames with `disagreement`, a `reviewed_at` and nothing pending back to reviewed (the undo; reopened frames stay out of
-  exports until saved or restored, exports already made are unaffected). `overlaps_checked` comes back with it: `apply_missing` moves
-  a true one to `checked_before_reopen`, which a restore or `accept-repeats` gives back, holds `reject-stacked` back while set, and a spot accept of a new box or a save ends. A failed labelers run with a readable `proposals.jsonl`
-  writes its finished frames like a Cancel, then still fails; a rerun resumes through the marker. Choosing frames: the Training
-  card's *Which frames* presets (unreviewed, reviewed, each with `auto=overlaps`, all, custom; they cooperate with `#al-preset`),
-  `autolabel/preview.rs` (`POST /training/autolabel/preview`, `train autolabel --dry-run`; through `server::blocking`, no GPU /
-  download / login gate; shares `AutolabelJob::preview`'s walk, which does not stop at `limit`: matched, taken, skipped by marker, split
-  by status, a rough time from 2 s + 0.2 s x phrases for SAM 3 or 0.55 s for gdino before the VLM, warnings that reviewed frames may
-  reopen, that with the VLM off lone finds cannot, or that `limit` makes the run partial); `select` sets `wanted` like the Review page. *Suggest overlaps...* has *Ask again*
-  (`again`): answered pairs are otherwise kept, so a rerun's new votes reach only unchecked frames and unanswered pairs.
-- Memory and storage (phase 7): `src/storage/` sweeps only rebuildable files, 30 s after start then daily (`retention` sweeper): cache folders (`openvino-*`, `coreml`, `tensorrt`) unused 60 days by a `.last-used` marker (`storage::touch`, from `backend/device.rs` and `ort.rs` `cache_subdir`; no marker = the clock starts, nothing deleted on a guess), coreml rewrites and compiled models of gone or changed models, train staging and job `work` whose `<folder>.busy` marker (`storage::busy`, fs4, held by every running job) is no longer locked; a crashed auto-label's `proposals.jsonl` is written through the job's own path first (`autolabel::job::recover_crashed`), kept on failure; `layout::compact_review` drops duplicate and gone-frame lines of `review-queue.jsonl` under `.review-queue.lock` (cross-process, appends take it too). Never labels, datasets, exports, models, runs, a failed run's `work` (the retry checkpoint) or logs. Storage card on Config > Resources (`GET /v1/storage`, `POST /v1/storage/clear`, `POST /v1/storage/exports/remove`: refused while a busy run or `training.datasets` uses the export). `training::retry::disk_use` counts a hard-linked file once on every OS. Training history is `<run dir>/history.jsonl` (`training/service/history.rs`; `runs.json` keeps `best` and the latest values, an old one migrates at start), progress saved at most every 5 min, `tasks.json` keeps 200 finished tasks, runs are never dropped. Uploads in flight share a 1 GiB byte budget (`server/body_budget.rs`, charged per chunk, `upload_budget` reject reason); `image_name` / `camera_key` capped at 255 bytes; the collector forgets cameras idle a day (at most 1024). Logs: service default Info; `cli::log_files` keeps 14 days, 500 MB total, 200 MB a day (then one WARN and silence until tomorrow), today's file never deleted. `PREDS_CACHE` / `SAVED_CACHE` drop after 10 idle minutes (`search::IdleCache`); benchmark preds stream. `MALLOC_ARENA_MAX=2` in the systemd unit and the Docker image. GPU memory: `backend::vram` reads free memory live (NVML by PCI bus id, DXGI `QueryVideoMemoryInfo` by LUID, amdgpu sysfs; never a CUDA context; integrated GPUs are `shared`), shown in `GET /v1/devices` `gpuMemory`, metrics `gpu_memory_{total,free}_bytes`, and the model load line; loaded models register as holders (`vram::hold`). Jobs warn, never refuse, on short free memory (training preview and start, auto-label preview and start, import embeddings), naming the models holding it; a labeler that alone cannot fit the card's total is refused (`autolabel::memory::too_big`, page options carry `data-need-mb`). ORT CUDA: `kSameAsRequested`, `HEURISTIC`, optional `ort_gpu_mem_limit_mb`; the second ORT session goes to the default model only (`ort_sessions` overrides). SigLIP runs on CPU in auto-label when other models use the GPU (not loaded under 2 animal classes); import embeddings load the vision tower only, f16 on CUDA 7.0+.
-- Release readiness (phase 10): `panic::install()` first in every binary (logs through tracing); the Windows service reports Running on `Event::Bound` only, gives up after `runner::BIND_GIVE_UP` (60 s) with exit code 3/4/1, `sc failureflag 1` makes its failure actions apply, the MSI does not wait for the start; `port_holder` names what holds a port. `blue-onyx-prism diagnostics` / `GET /v1/diagnostics` (`src/diagnostics.rs`): never token files, every part scrubbed of known tokens, never frames or labels. Formats: `Config.format` (`CONFIG_FORMAT`; later = refused at load, by the disk check and by `ConfigStore::update`), `task::RECORD_FORMAT` per runs/tasks record; `collect.*` warns on unknown keys instead of refusing; frozen fixtures in `tests/data/0.2.0/` (like overlaps_parity.json: a difference is a code change). `check_updates` (default true) turns the GitHub update check off. Packaging: app-local VC++ DLLs (`packaging/windows/stage-vcruntime.ps1`), release.yml `ci-green` gate (`packaging/release/ci_green.py --self-test`), upgrade test from the latest release in packaging.yml, `packaging/linux/glibc-floor` (2.34). `THIRD_PARTY_LICENSES.md` crate table: `python3 -I scripts/gen_third_party.py` (CI `--check`). Load test: `test-blue-onyx-prism --rate <r/s> --duration <s>`.
-- Structure (phase 9): `model/name.rs` (`normalize_name`) and `model/coco.rs` (COCO tables, `coco_class`, `same_class`, `map_label`) are std-only leaves, re-exported at their old paths; parity tests cover `scripts/autolabel.py`, `train_model.py` (one extra alias on purpose), `export_model.py` and `assets/coco_classes.yaml`. `server/review.rs` keeps the page, `next` and labels; bulk routes, spots and folder/export routes live in `server/review/`; handlers return `Answer` (`Refused` via `?`), messages built by `push_failed` / `push_past_limit` with each route's own words. `GET /v1/review/labels` also answers `overlap_live_boxes` and the page keeps to those boxes (`R.markServed`, `_n` tags never saved). The verify lane reads `VisionDetectionResponse.dropped` (`#[serde(skip)]`), never the message text. CLI benchmark sweeps write `benchmark-breadcrumb.json` and need `--confirm-gpus` over two or more GPU devices (`gpu_gate`). Install scripts re-own the data root when anything in it has another owner (`bop_own_data_root`, `bop_own_kept_dirs`).
-- Polling (phase 8): pages poll through `PrismPoll` in `assets/live.js` (chained, never two in flight, nothing while hidden, at once on visible, backoff; tests in `tests/it/js_poll.rs`). `GET /v1/training?poll=1&have=<id>:<last epoch>:<prefix key>:<full key>,...` (`server/training/poll.rs`, merged by `TrainMetrics.poll` in `assets/train-metrics.js`, node parity test) sends only missing history rows; `training::records` = runs without history for every reader that does not draw charts. `/v1/train/jobs?task=<id>|tasks=busy` is how Review follows a task. `GET /v1/benchmark?only=run&models=<tag>` (`server/benchmark/poll.rs`) is the 1 s run poll; the full answer has an ETag and keeps its bytes. Config: `ConfigStore` publishes an `Arc<Published>` through `ArcSwap` after each committed change (`config_read()` = one atomic load, never waits for a save's fsync; writers serialize on `writer`, taken after `apply_lock`, never before); `/v1/config` bodies and ETags are cached while `live::Inputs` are the same.
-- Review index (`src/collect/labels/index/`): `GET /v1/review/next` alone answers from it, for a review folder of `MIN_INDEXED_FRAMES` (2,000) frames or more; smaller ones, bulk actions, previews and the CLI walk the files (`queue::build`, which the index must equal: `index/tests.rs` `equivalence` compares the whole answer over 84 filters after builds, real writers, a class change, scans and full passes; review route tests run both ways, `both_ways!`, and the indexed ones assert `index::tests::served`). One folder and one wanted-class list (a class change rebuilds); compact rows, no box geometry (`Part` 40 bytes, `Row` 84; `Part.proposed` is an interned label set in `Names.proposed`; `Part.refine` is an interned per-kind (count, strength) summary in `Names.refine`, `Part.strength` u16). `index::written` (beside `repeats::written`, only a push under the label write lock) makes the next query re-read the file; `append_review` / `rewrite_index` mark the queue / a day; a stat pass every 60 s, a full pass every 30 min, idle drop after 10 min, `INDEX_CEILING_BYTES` 128 MB then walking. While building, answers carry `indexing {done,total}` (only while done < total) and the page polls every 2 s (`R.nextLanding`). Walks: `layout::Walker` canonicalizes each day folder once (same answers as `layout::resolve`), `crate::parallel::map_all` with `walk_threads()` (cores - 1, at most 4); label writes stay on one thread.
-- Debug builds read `assets/` from the source tree per request (`no-cache`, no rebuild for a JS or CSS edit; `embedded!` in `server/pages.rs`), so a debug binary moved off its tree answers 500 on `/static/*`; release embeds them. `review_walk` in `tests/it/` measures the review queue (`BOP_WALK_FRAMES=10000,50000`, `--ignored`); results in `docs/PRODUCTION_REVIEW.md`.
-- Disk trap: `cargo clean` wipes data roots under `target/` (here `target/release` holds the OpenVINO / ORT libs, the training env,
-  weights such as SAM 3's 3.4 GB, the config; a dataset or training folder placed there too). Do not run it without moving them first.
-- `src/benchmark/history/`: `benchmark-history.json` beside `benchmark.json` (last 20 runs per model + one pinned
-  baseline, seeded from `benchmark.json`; every finished model of a service or CLI run is appended, failed ones never;
-  a write failure only warns). `ModelResult.run_id` = the run's start time. Pure `comparable`/`compare` (speed counts at
-  >= max(5%, 0.5 ms), accuracy past 2 standard errors, a threshold inside the old plateau is rounding), `trust`, `pareto`;
-  `GET /v1/benchmark` carries `latest_run_id`, `noise`, per model `this_run`/`trust`/`changes`, `points`. Admin routes
-  `GET /v1/benchmark/history[/compare]`, `POST /v1/benchmark/history/{pin,delete}`; `POST /v1/benchmark/settings`
-  re-ranks the saved results (`benchmark/rescore.rs`, exact advice from `benchmark-preds.json`).
-  Confidence profiles: `ModelConfig.device_thresholds` (canonical spec -> threshold) win over `confidence_threshold`
-  for the device the model actually loaded on (`LiveSettings::threshold_for(eng.device)`, so `auto`/fallback follow);
-  `POST /v1/benchmark/apply-profiles` / `--apply-threshold` save `ThresholdAdvice.by_device`; `GET /v1/benchmark`
-  `profiles` (`server/benchmark/profiles.rs`). The page's tabs are Compare (`assets/bench-lineup.js`), Run, Tune (`assets/bench-profiles.js`), History, Details;
-  the Config page's device dropdown swaps the threshold field to that device's profile / benchmark best.
-- `src/benchmark/lineup/` (`sets`, `score`, `comparable`, `verdict`): `lineup` in `GET /v1/benchmark` puts models side by side on exactly the same images, rescored from `benchmark-preds.json` on the classes they share; `comparable_models` is the model-vs-model rule (hardware and runtime flag only speed), a set with training frames leaves that row out of "best", a sentence needs `MIN_OBJECTS_TO_CALL`; `?set=<id>` opens a set.
-- `src/resources/` on-demand resources: `catalog` (pins), `resolve` (pure needs from config + hardware +
-  installed), `manager` (one download thread, Range resume, SHA-256, staging + atomic rename, `.installed.json`,
-  `.downloads.lock`, backoff), `extract` (whitelist-only, nothing executed), `provision` (startup: models wait
-  with progress; a new runtime starts a new registry generation), `status` (`/v1/resources` + UI actions),
-  `commands` (`fetch`, `list-resources`), `export` (model export: stages uv -> Python -> packages -> weights ->
-  export -> install, fake-able `CommandRunner`/`Fetcher`, one at a time, cancellable).
-- `src/config.rs` JSON config next to the exe; CLI overrides only non-default values and writes back.
-  The server holds it in `config_store.rs` (revision + change log, detects edits on disk); every UI writer goes
-  through `save_config` (last write wins). Resources Remove of a model also drops its disabled config entries (an enabled
-  one blocks it); the Models card's Remove (`POST /config/models/remove`, `name`) drops a disabled entry, then deletes its files (model, `.bin`, `<stem>.yaml`, `<stem>.provenance.json`, classes) when inside `models_dir`, not a catalog model and unused by other entries. A save applies live: per-request settings (thresholds, filters, timeout,
-  image saving, default model) swap into the workers (`LiveSettings`), structural model changes (enable/disable,
-  device, family, classes) reload only that model (`ModelRegistry::reload_model`), and only runtime-level fields
-  (port, bind address, runtime dirs, cache, threads, profile/concurrency) stay pending until a restart
-  (`config_merge::pending`).
-- Native installers in `packaging/` (WiX v7 MSI, cargo-deb/cargo-generate-rpm with metadata in Cargo.toml, pkgbuild pkg),
-  built and smoke-tested (install, `/v1/status`, uninstall) by `packaging/build-installers.sh` / `smoke-test-installers.sh`
-  The MSI sets a protected DACL on the data folder (`icacls`, not `util:PermissionEx`, which merges), keeps only `SeChangeNotifyPrivilege`, and scopes the firewall rule to the local subnet on Domain and Private profiles.
-  in `release.yml` and `packaging.yml`; unsigned; runtimes are downloaded on first start. The MSI runs the service as
-  LocalService with `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json` (a service config created
-  outside the exe dir seeds `download_dir`/`cache_dir`/`log_path` beside it). The deb/rpm and pkg share
-  `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts. The pkg also installs
-  `/Applications/Uninstall Blue Onyx Prism.app` (`packaging/macos/uninstaller.applescript`, osacompile, not relocatable),
-  which only runs `uninstall_launchd.sh` as root; that script removes the program dir too (`--keep-program` to keep it).
-- `src/service_ctl/` queries and starts/stops/restarts the installed service (Windows SCM, `launchctl`, `systemctl`;
-  pure output parsers tested everywhere) for `blue-onyx-prism service ...`. `src/tray/` + `src/bin/blue_onyx_prism_tray.rs`
-  is the tray / menu bar app (tray-icon + tao, Windows and macOS only; pure model/probe/icon/config/elevate parts are
-  tested on every OS): polls `service_ctl::query` and `/v1/status`, and runs `<cli> service <verb>` elevated (UAC via
-  PowerShell `-Verb RunAs`, macOS `osascript ... with administrator privileges`). Installed by the MSI (HKLM Run key,
-  Start Menu) and the pkg (`/Applications/Blue Onyx Prism.app`, LaunchAgent `com.blueonyx.prism.tray`).
-- Windows service in `src/bin/blue_onyx_prism_service.rs` (cfg windows). systemd/launchd/Docker in `deploy/`.
-  Install/uninstall scripts in `scripts/` (`uninstall_systemd.sh`, `uninstall_launchd.sh`, `*_service.ps1`); the Docker
-  image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). `THIRD_PARTY_LICENSES.md` ships in
-  every release archive; the release workflow attests the archives (`actions/attest-build-provenance`).
-- Operability: `log_format: text|json` (file appender only), per-request debug log with `model/device/request_id/
-  inference_ms/process_ms/round_trip_ms` and an `X-Request-Id` response header; a model whose inference never returns is
-  marked Failed("inference stuck ...") after a second request timeout (`worker::collect_watched`); 5 inference errors in a
-  row or 25 all-zero/NaN outputs in a row (a reset GPU) mark it Failed("inference broken ...") (`worker::run::note_health`),
-  and a model that failed while serving (stuck, broken, or a dead ORT session) is reloaded by the generation's `supervisor`
-  thread with a doubling backoff
-  (10 s .. 1 h, reset after 10 min of service); a warm-up that does not finish in 3 min (`worker::WARMUP_TIMEOUT`) abandons
-  that device (backend leaked, next candidate tried); a compile over 5 min warns; the "queue full" warning is throttled;
-  downloads give up after 12 attempts in the service (`manager::SERVICE_MAX_ATTEMPTS`); a config with no models is seeded with
-  IPcam-general. Error messages state what happened, the likely cause and the next action.
+- **HTTP** (`src/server.rs` + `src/server/`): axum on a 2-thread tokio runtime (`runner.rs`); fs-heavy handlers run in
+  `server::blocking`. The listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable
+  current `AppState`, so it survives generation restarts.
+  - Blue Iris calls `POST /v1/vision/detection` (default model), `POST /v1/vision/custom/{model}`,
+    `POST /v1/vision/custom/list`. Responses use `api.rs` structs (camelCase; `Prediction` snake_case), byte-compatible
+    with CodeProject.AI (see Conventions).
+  - Overload: a process-wide in-flight cap answers 503 (`metrics.rs`, `requests_rejected_total`; overload 503s drain the
+    upload, `OVERLOAD_DRAINS`); uploads still arriving have a 10 s deadline, a per-address read limit
+    (`BODY_READS_PER_PEER`, never a cap on one Blue Iris's total requests) and a shared byte budget
+    (`server/body_budget.rs`). `GET /v1/status` is readiness (200/503; Docker HEALTHCHECK, systemd `Type=notify` +
+    watchdog via `sdnotify.rs`).
 
-- Reloads: a healthy reload or restart loads the replacement beside the old worker, which serves until it is Ready (`Registry` `pending`, `finish_replacement`; `beside` leaves the stats alone until the swap); a memory failure retires the old worker and tries again (`LoadFailure` in `backend/plan.rs`, `make_room`). A Failed or stuck model is retired first. A model on a fallback after a memory or device-lost failure retries the better candidate (5 min .. 1 h, `retry_better`), others never. `worker/reap.rs`: at most 4 reaper threads free abandoned backends. Overload 503s drain the upload (`OVERLOAD_DRAINS` 8). A runtime that lost a listed file is not installed (`manager::install_damage`). A benchmark runs each model's own device by default, several GPUs need `confirm_gpus=1`, a queue job refuses it (409), and `benchmark-breadcrumb.json` names the last device after a hang.
-- Phones: `assets/style.css` section *Phones and tablets*: `table.rcards` (`data-label`; `rc-title`, `rc-block`, `rc-action`; `rgrid` = 3 columns) stacks under 700 px, `table.model-card` under 900 px. Review on one column: the frame is the editor (no close-up; it follows the selected box, pref `follow`; a pan / pinch / overview tap holds the view for that box only, `select` of another box takes the pref again; one Zoom to box / Fit toggle (`rv-zoombox`, every layout; with a mouse it also reads Fit while zoomed), image mode and Fit whole frame in View), `#rv-overview` over it while zoomed (whole frame, view veil; a tap selects or recentres). Two columns share the View menu (items titled with their keys), the overview (absolute over a corner of the frame while zoomed: top right, else the corner `ReviewTouch.overviewCorner` picks so the selected box, its handles and tag stay in sight, `placeOverview`; `--rv-cw`, `--rv-head` on the stage) and the remembered choice (`followPref`: `follow` on one column, default on, `follow-wide` on two, default off; set by `x`, `f`, the toggle and View's Fit, never by the wheel or a pinch); the sticky bar is `#rv-decide-bar` (a child of `.review-grid`, not the panel, so it pins on short screens; head = box, label, count left, progress line on its top edge (`renderBarHead`); the selected box's yes / no / parked, `#review.rv-deciding`; the card and `#rv-msg` leave the progress to it) while boxes need a decision, else `.rv-actions-main`; an answer holds the frame's screen position for 700 ms (`holdFrame`/`settleFrame`, released by touchmove / wheel / keydown and the page's own reveals), `html:has(#review)` has `overflow-anchor: none`, and buttons, links, summaries, labels and selects are `touch-action: manipulation` (no double-tap zoom); `#rv-list-toggle` folds the box list, session and Panel options (pref `list`); Details toggle `#rv-info-toggle`, handles scale with box size (`handleCss`, `handlePoints`; desktop unchanged). Fingers on the Review frame (`assets/review-touch.js`, pure, node-tested in `tests/it/js_review_touch.rs`: `pinch`, `twoTapRect`, `touchIntent`, `tagTop` (tags placed against the view), `pickBox`): two fingers pinch / pan (a second finger aborts a move and pops its undo snapshot), one finger selects, moves / resizes the selected box, pans a zoomed frame and draws only with the Draw toggle (drag or two taps); Redraw = two taps for the selected box's corners; View menu = the view keys; mouse and pen unchanged. Viewport: `viewport-fit=cover` (never `maximum-scale`/`user-scalable`), side paddings `max(<pad>, env(safe-area-inset-*))`, `main`'s `--main-px` (edge-to-edge parts undo exactly it), every `vh` height followed by `dvh`/`svh` (a pages.rs test checks), the one-row header also for `(max-height: 500px) and (orientation: landscape)`; `PrismViewport` in live.js sets `html.kb-open` (sticky bottom bars go static under a keyboard), `--toc-h` and the restart banner's `--banner-lift`; one Browse dialog, `templates/file_browser.html` (not named browse_dialog.html: askama would include `train/browse_dialog.html` into itself). Hover: every `:hover` rule sits in `@media (hover: hover)` (a pages.rs test checks; iOS keeps `:hover` after a tap); `PrismPointer` (live.js) marks `svg` / `.keep-hover` under a mouse or pen with `data-pointer-in` for `busyIn` (a pinned chart, `svg[data-pinned]`, also holds re-renders); `PrismTip` (live.js, every page) is the tap-to-pin bubble of `button.term` (`data-tip` or the benchmark glossary's `data-term`): information only in a `title` needs one. Charts (`bench-charts.js` `lineChart`): a tap pins the readout, a sideways finger drag scrubs (`touch-action: pan-y pinch-zoom` on the svg: Chrome ignores it on shapes), `fitSize` narrows the viewBox under 600 px. Selects clip their text on touch widths (`overflow: hidden`): WebKit otherwise spills a long option past the select and widens the page. Home Screen: `assets/manifest.webmanifest` (`STATIC_FILES`) and PNG icons drawn by `scripts/gen_icons.py` (stdlib, deterministic; `--check` runs in a test and CI) in `assets/icons/`, served flat from `STATIC_BINARY` (`/static/icon-*.png`) and at `/apple-touch-icon.png` / `-precomposed.png`: all open routes (browsers fetch them without cookies); pages with `nav == ""` show no nav links, footer endpoints or restart indicator; `display-mode: standalone` hides the footer endpoints. Page tests assert `<td>name</td>`, `<td class="state">` and the Stats table's class string, so add classes there with care.
+- **Network, TLS and sign-in** (security boundary; user view in README "HTTPS", "Local network only", "Accounts",
+  "Signing in").
+  - Only the local network is answered (`server/network.rs`: loopback, RFC 1918, link-local, ULA, plus config-file-only
+    `allowed_networks`): closed at accept by `guard::admit`, else 403 from the outermost middleware
+    `guard::network_rule`. Forwarding headers (the one list in `guard::proxy_header`) can only refuse.
+  - Two listeners (`server/listen.rs`), one router, marked `Transport::{Plain,Tls}` (none = plain): plain HTTP on `port`
+    (startup error, `/v1/status`, `READY=1` and the Windows service's Running follow it) and HTTPS on `https_port`
+    (retried every 30 s while its port or certificate fails; bound port in `Shared::https_port`). At accept:
+    `guard::admit`, then connection caps, then the TLS handshake (10 s) in the connection task.
+  - Plain serves `open_routes` only (`server::plain_gate`: browser GET/HEAD 308 to HTTPS, foreign host 403, HTTPS down
+    503, else 403 JSON; `Authorization` there is refused uncounted; `guard::legacy_cookie` clears `bop_admin`; no HSTS).
+    Every redirect target goes through `safe_next` (a refused non-GET's `next` is its same-host `Referer`,
+    `guard::referer_on_host`). Icons and the manifest stay open routes: browsers fetch them without cookies.
+  - Everything else is HTTPS and signed in, every address alike (`admin_only` -> `auth::authenticate`): a
+    `__Host-bop_session` cookie or `Authorization: Bearer <API token>` (`admin_token.rs`, read per check, own
+    `admin_failures` bucket). `X-Prism-Poll: 1` (or the `__Host-bop_poll` cookie) marks a poll that leaves the idle
+    clock alone. `users.json` missing -> browsers 303 `/setup`; broken -> 503, never setup. Unauthenticated answers are
+    `no-store`; HTML pages get the user name at `<!--bop:user-->` (`auth::show_user`).
+  - Routes answer only under an IP address, `localhost` or an `allowed_hosts` name (`guard::foreign_host`, DNS
+    rebinding; `GET /v1/config` is open and applies the Host check and sign-in itself). CSRF on TLS: `Origin`/`Referer`
+    must be `https://<Host>`, `Sec-Fetch-Site: same-site` refused. `direct_local` (loopback, no forwarding header) is
+    only an extra condition, for `/v1/fs/pick` and token rotation.
+  - `/login`, `/logout`, `/setup` (`login_routes`): per-address `FailureLimit::reserve` before hashing, lockout decided
+    with in-flight attempts counted as failures (`accounts::process::Attempts`), a `Logins` permit, the result written
+    after the answer (`auth::record_later`), a new session id each time. The Config page's Accounts card
+    (`server/accounts.rs`) re-checks the current password through the same path (`server::accounts::reauth`; wrong =
+    403, never 401; the API token is refused).
+  - Accounts (`src/accounts/`): `auth/users.json` fails closed (only a missing file is setup mode), Argon2id behind a
+    hashing semaphore, every `auth/` read-modify-write under `auth/.lock` and never while hashing. Sessions and device
+    cookies (`accounts/sessions.rs`, `devices.rs`, `cookies.rs`) store only SHA-256 of their ids. One `accounts::Auth`
+    and one `Logins` per process (`runner`), flushed at shutdown.
+  - Every auth file (accounts, sessions, devices, setup code, API token) is under `Auth::data_root()`, the start's data
+    root, never `running()` (a generation restart that changes `download_dir` only warns).
+  - TLS (`tls.rs`): self-signed ECDSA P-256 in `<data root>/auth/tls/` (`private_dir.rs`: 0700/0600, protected DACL),
+    stable, renewed under 30 days left, reloaded on file change; own `tls_cert_path`/`tls_key_path` are config-file only
+    and never written. `tls::pinned_client` (reqwest pinned to the cert's SHA-256) serves the CLI's `diagnostics`, the
+    load test and `tests/common`'s `admin_client`. No page shows the fingerprint (it would prove nothing).
+  - `allow_remote_admin` is retired (read, `skip_serializing`, warned; true at start = one token rotation, marker
+    `auth/.token-rotated-v1`).
+  - Unit tests: `test_util::from_peer` adds `Transport::Tls` and the seeded `TEST_SESSION` (`seed_tester`, temp data
+    roots only) unless `anonymous` / `plain` / `bearer` / `as_peer(PUBLIC)`.
+
+- **Registry and workers** (`src/registry.rs`, `src/worker/`, `startup.rs`, `supervisor.rs`).
+  - The registry loads every enabled model through shared `Runtimes` (one OpenVINO `Core`, one ORT library), in config
+    order, one compile at a time; each model gets its own worker thread and bounded crossbeam channel. `startup.rs`
+    tracks Initializing/Ready/Failed so HTTP serves while models compile.
+  - A reload or restart loads the replacement beside the old worker, which serves until it is Ready (`Slots::pending`,
+    `finish_replacement`); a memory failure retires the old worker and tries again (`LoadFailure` in
+    `backend/plan.rs`, `make_room`). A Failed or stuck model is retired first. A model on a fallback after a memory or
+    device-lost failure retries the better candidate (`retry_better`). `worker/reap.rs` frees abandoned backends.
+  - Health: inference that never returns -> Failed("inference stuck ...") (`worker::watch::collect_watched`); repeated
+    errors or all-zero/NaN outputs (a reset GPU) -> Failed("inference broken ...") (`note_health` in `worker/run.rs`);
+    the generation's `supervisor` reloads models that failed while serving, with a doubling backoff. A warm-up past
+    `worker::run::WARMUP_TIMEOUT` abandons that device (backend leaked, next candidate tried).
+  - Logs: per-request debug line (`model/device/request_id/inference_ms/process_ms/round_trip_ms`) and an
+    `X-Request-Id` header; `log_format: text|json` (file appender only); `cli::log_files` caps size and age, today's
+    file never deleted. Error messages state what happened, the likely cause and the next action.
+
+- **Backend** (`src/backend/`, the only place `unsafe` is allowed): runtimes behind a `Backend` enum
+  (`OpenVino | Ort`). OpenVINO wrapper (properties CACHE_DIR / LATENCY / f16 on GPU; cache dir
+  `<cache>/openvino-<device>-<prec>`, the CPU cache hash ignores precision); `ort.rs` holds all `ort` code; `spec.rs`
+  parses device specs; `detect.rs` finds GPUs (DXGI / sysfs / Apple); `select.rs` builds the ranked, pure `DeviceOption`
+  list and the `auto` pick; `plan.rs` turns it into per-model load candidates (compile + warm-up, falling down the list,
+  CPU last); `vram.rs` reads free GPU memory live (NVML / DXGI / amdgpu sysfs, never a CUDA context); `memory.rs` the
+  commit charge.
+  - `onnx_rewrite/`: `ort:coreml` loads a cached copy without HardSigmoid/HardSwish/opset<13 Split (protobuf
+    wire-level, `cache/coreml/`, `BOP_COREML_REWRITE=0` off).
+
+- **Model families** (`src/model/`): `yolo26` (YOLO26/YOLOv10 end-to-end `[1,300,6]`), `yolo5` (`[1,N,5+C]` + NMS), `yolo8`
+  (YOLOv8/9/11/12 `[1,4+C,A]` + NMS), `detr` (D-FINE, RT-DETRv2 trained here: `pixel_values` -> `logits/pred_boxes`), `rfdetr`
+  (same ports, ImageNet-normalized), `rtdetr` (RT-DETRv2, DEIMv2: `images` + i64 `orig_target_sizes`; `labels/boxes/scores`),
+  `auto` (picked from the output shapes).
+  - Preprocess: letterbox (YOLO) or stretch (DETRs) to the model's input size, RGB f32 0..1, CHW. Static input dims win;
+    dynamic ones use `model::dynamic_input_size` (catalog hint, HF `preprocessor_config.json`, RF-DETR 560, else 640).
+  - `model/name.rs` (`normalize_name`) and `model/coco.rs` (`coco_class`, `same_class`, `map_label`) are std-only leaves;
+    parity tests cover `scripts/autolabel.py`, `train_model.py` (one extra alias on purpose), `export_model.py` and
+    `assets/coco_classes.yaml`.
+
+- **Night / IR and verify** (docs/NIGHT_IR.md).
+  - `image_stats.rs` gives each request a `Scene` (day|night|ir, computed in `prep.rs` after decode); `model/filters.rs`
+    (night / per-label thresholds, aspect, min area, overlap suppression; all default off, applied in
+    `worker::run::finish` before `to_predictions`); `static_memory.rs` (per-camera static-box suppression);
+    `model/enhance.rs` (`preprocess` / `night_preprocess`; the kept frame is always the original).
+  - `night_model` routes night/IR frames, decoded, to another model's worker (`WorkItem::DetectDecoded`, weak
+    `worker::Peers`; never re-forwarded; falls back to itself); `night_threshold` keeps the model and replaces its
+    threshold (`LiveSettings::threshold_for_scene`).
+  - `verify` (`src/verify.rs` pure decision, `worker/verify.rs` per-worker lane): night person candidates re-checked by
+    another model, fail-open, never blocks the inference thread; reads `VisionDetectionResponse.dropped`, never message
+    text. `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the service.
+
+- **Config** (`src/config.rs`, `config_store.rs`, `config_merge.rs`): JSON next to the exe; CLI overrides only non-default
+  values and writes back. Every UI writer goes through `save_config` (last write wins).
+  - `ConfigStore` publishes an `Arc<Published>` through `ArcSwap` (`config_read()` = one atomic load, never waits for a
+    save's fsync; writers serialize on `writer`, taken after `apply_lock`, never before); `config_store::spawn_disk_watch`
+    applies on-disk edits within 2 s.
+  - A save applies live: per-request settings swap into workers (`LiveSettings`), structural model changes reload only
+    that model (`ModelRegistry::reload_model`), runtime-level fields wait for a restart (`config_merge::pending`).
+  - One-off flags (`Config::one_off_flags`) are kept out of every write (`cli::without_one_off_flags`,
+    `ConfigStore::update`). `download_dir`, `onnxruntime_dir`, `openvino_dir`, `allowed_networks` and the TLS paths are
+    config-file / CLI only, never web-editable (a loaded library runs with the service's rights).
+  - Formats: `Config.format` (`CONFIG_FORMAT`; a later one is refused at load, by the disk check and by
+    `ConfigStore::update`), `task::RECORD_FORMAT` per runs/tasks record; `collect.*` warns on unknown keys.
+  - Confidence: `ModelConfig.device_thresholds` win over `confidence_threshold` for the device the model actually loaded
+    on (`LiveSettings::threshold_for`, so `auto` and fallbacks follow). A config with no models is seeded with
+    IPcam-general.
+  - Removing models: Resources Remove also drops the model's disabled config entries (an enabled one blocks it); the
+    Models card's Remove (`POST /config/models/remove`) drops a disabled entry, then deletes its files only inside
+    `models_dir`, never a catalog model or one other entries use.
+
+- **Resources** (`src/resources/`): `catalog` (pins), `resolve` (pure needs from config + hardware + installed),
+  `manager` (one download thread, Range resume, SHA-256, staging + atomic rename, `.installed.json`, `.downloads.lock`,
+  backoff, `SERVICE_MAX_ATTEMPTS`; a runtime missing a listed file is not installed, `manager::install_damage`),
+  `extract` (whitelist-only, nothing executed), `provision` (models wait with progress; a new runtime starts a new
+  registry generation), `status` (`/v1/resources`), `commands` (`fetch`, `list-resources`), `export` (fake-able
+  `CommandRunner` / `Fetcher`, one at a time, cancellable).
+  - Gated downloads (SAM 3; `catalog::GATED`): `resources/hf_token.rs` finds the token (`HF_TOKEN`,
+    `<data root>/tools/hf/token`, the `hf` CLI's file). The value is never logged, returned by a route or passed to
+    Python (`inherited()` drops `HF_*`); the bearer goes only to huggingface.co; a 401/403 there is a typed refusal
+    (`Refusal::NeedsLogin|NeedsAccess`); `without_url()` keeps signed CDN URLs out of logs and state.
+
+- **Collector** (`src/collect/`, `collect` config, default off; docs/DATASET.md): after the reply the worker `try_send`s the
+  upload + a v1 sidecar to one collector thread (buckets, per-camera rate limits, dHash dedup that most buckets skip,
+  disk guard that re-arms; atomic writes under `<data root>/dataset/<scene>/<camera>/<date>/`;
+  `retention::prune_dataset`). `collect/health.rs` feeds `GET /v1/dataset`. Collect tab `/train/collect`.
+
+- **Data safety** (applies to every writer of user data).
+  - One label write path: `labels::update` under `<dataset root>/.labels.lock` (`fs4`, CLI and service alike; a held
+    lock is never given up on, only one that cannot work falls back to the process lock). A failed label write keeps the
+    job's `work` and is named in its summary.
+  - `task::load_or_move_aside` moves a damaged `runs.json` / `tasks.json` to `.corrupt-<time>` and leaves an unreadable
+    one alone, unwritten. Runs are never dropped. JSONL reads are lossy per line and appends repair a torn tail
+    (`layout::read_lines`); `layout::compact_review` and appends to `review-queue.jsonl` share `.review-queue.lock`.
+  - Exports are built hidden, then renamed. A crashed auto-label's `proposals.jsonl` is written through the job's own
+    path first (`autolabel::job::recover_crashed`) and kept on failure.
+  - An unavailable review folder is `folder_missing`, never an empty dataset. Uninstall keeps data unless asked.
+
+- **Review labels** (`src/collect/labels/`, `/train/review`, `assets/review.js`; formats and rules in docs/DATASET.md
+  "Review labels", tiers and labelers in docs/TRAINING.md "Auto-label").
+  - Per-frame `<stem>.labels.json` (v1), written only through `labels::update`. A save checks `revision` (409). A save whose
+    body lacks `refine`, `overlap_suggestions` or `review_pick` keeps the stored value (`server::review::SentLists`); a
+    present key, `[]` included, is the client's.
+  - Frames with a human decision or boxes awaiting review are never pruned (`labels::is_protected`). Reopened frames
+    (`disagreement` + `reviewed_at`) stay out of exports until saved or restored.
+  - Ignore regions (`LabelBox::is_ignore`: `difficult` / unsure and `too_small` rejects) are out of YOLO and listed in
+    `ignore.json`. `collect.size_floor` (`labels::under_floor`, JS twin `underFloor`) applies at export, in the dataset
+    check's judge and at a run's input only; accepted/added labels are never rewritten for it, so a floor change is a
+    re-export and held-out scores across it do not compare. Its only writer is `bulk::bulk_resolve_small` (undo
+    `bulk_restore_small`).
+  - Dismissals (`bulk::is_dismissal`: `auto_dismissed`, `spot_dismissed`, `size_floor`) and duplicates are no negatives:
+    out of `hard_negatives.json`, `rejected_boxes` and the repeats history. `reject_reason` is an enum (unknown =
+    `RejectReason::Other`, round-trips); `reason` stays provenance.
+  - Unwanted classes = labels mapping to no `collect.classes` entry plus `collect.hidden_classes`: out of prefill and
+    auto-label runs, not drawn; making a class unwanted rejects pending model/auto boxes on unreviewed frames only
+    (`bulk::bulk_reject_unwanted`); reviewed frames change only on the user's confirmation.
+  - Duplicates (`stacks.rs`, twin of the page's `dupGroups`): human boxes are never dropped; nested or partial overlaps
+    go to a human (`auto=overlaps`), never a bulk action; `overlaps_checked` marks a reviewer's look
+    (`ReviewRules.overlapsCheckedOnSave`).
+  - Queue (`queue.rs`): `queue::build` is the reference walk for bulk actions, previews, the CLI, coverage and spots
+    (uncertainty order). `GET /v1/review/next` alone defaults to Recommended (`recommend.rs`: reopened, event rank,
+    balance bands, uncertainty; `order` is read by `server::review::next_order` only, never `Filters::from_query`);
+    `auto=` and `balance=` keep their own orders. Balance weighs each camera's kept share of a class's proposals
+    (`queue::proposed_labels`, `BalanceTally.precision`).
+  - Random picks: in the default view only (`recommend::random_slots`) one slot in `RANDOM_EVERY` is a frame of a fixed
+    hash pool (`recommend::in_pool`; nothing a model or reviewer does moves a frame in or out). The page saves
+    `LabelFile.review_pick: random` on frames served as one (`ReviewRules.servedPicks`); the server drops the mark on
+    a non-pool frame; an unknown value round-trips (`ReviewPick::Other`). Training scores them apart (`heldout:random`).
+  - Index (`labels/index/`): only `GET /v1/review/next`, for folders of `MIN_INDEXED_FRAMES` or more, answers from it;
+    it must equal `queue::build` (`index/tests.rs` `equivalence` over the filter grid; review route tests run both ways,
+    `both_ways!`). `index::written` (pushed only under the label write lock) makes the next query re-read a file;
+    `INDEX_CEILING_BYTES`, then walking. Walks use `layout::Walker` and `crate::parallel::map_all`; label writes stay on
+    one thread. Its row sizes are asserted in tests (keep them compact).
+  - Repeats (`repeats.rs`), rejected spots (`spots.rs`, `triage::apply_spots`) and parked spots (`<review_dir>/spots/`,
+    own mutex, never under the label write lock): docs/TRAINING.md "Spot memory of fixed cameras".
+  - Server routes: `server/review.rs` (page, `next`, labels) and `server/review/` (bulk, spots, folder, export);
+    handlers return `Answer` (`Refused` via `?`). The review folder is `collect.review_dir` (default `collect.dir`);
+    auto-label runs follow it.
+  - Page-only decisions with no Rust twin (`refineCurrent`, `suggestionKey`, `refineForSave`, `adjustingBox`, ...) are
+    tested in `tests/it/js_review_refine.rs`; `q` looks in zoomed quarters (`ReviewTouch.quarterView`).
+
+- **Overlap suggestions** (`collect/labels/overlaps.rs`, job `training/overlaps/`, `train overlaps`; docs/TRAINING.md
+  "Overlap suggestions"): assist mode only, because a blind test of automatic drops removed a real object 13 of 99
+  times. **Only ever writes `LabelFile.overlap_suggestions`** (`overlaps::apply` under `labels::update`; no box state,
+  status, `reviewed_at` or `overlaps_checked`). The page's `y` (`acceptOverlap`, twin `overlaps::accept`) rejects as
+  `Duplicate` and never leaves the object without a box. Ported from `scripts/research/eval_overlaps.py`, which was never
+  committed: `tests/data/overlaps_parity.json` is frozen and cannot be regenerated, so a difference is a change in the
+  code, never a reason to edit the fixture.
+
+- **Dataset check / Refine** (`src/training/refine/`, `train refine`, Refine tab; docs/TRAINING.md "Dataset check
+  (cross-check)", "Quick check with a model", "Closer look at loose labels", "Refine tab"; field format docs/DATASET.md).
+  - Fold models that never saw a camera day judge its reviewed frames (`refine/judge.rs`, pure, constants documented in
+    TRAINING.md); a quick check (`--with-model`, `refine/quick.rs`) judges with a trained model the frames it never
+    trained or validated on, refused rather than guessed when that cannot be proven (`quick::seen_of`,
+    `quick::check_weights`).
+  - **Writes only `LabelFile.refine`** (`collect/labels/refine.rs`, pure) through `refine::apply` under
+    `labels::update`; answered suggestions and other kinds are kept, an unchanged result leaves the file untouched. At most
+    `refine::MAX_SUGGESTIONS`, strongest first: bands relabel > add > verify > tighten (what costs a model most per
+    error), then score.
+  - Fold safety: `check_unseen` hard-fails when a fold frame is in the fold model's train/valid lists (by name and by
+    `image_sources.json`). Fold training registers and benchmarks nothing (`NoHooks`); the check holds the training lock
+    from after the selection to the last fold's write. `tighten` comes only from the closer look (`refine/tighten.rs`).
+  - `refine::live` decides staleness at read time; `accept` / `dismiss` are pure; JS twins `liveRefine` / `acceptRefine`
+    / `dismissRefine` in `assets/review-rules.js`, and `refine::live_json` key for key, are parity-tested in
+    `tests/it/js_rules.rs`.
+  - Reports: `<review folder>/refine/report.json` (full) and `refine/report-quick.json` (quick); neither replaces the
+    other; a newer format is "newer", never "damaged". Server: `server/refine.rs`, `refine_spots.rs`,
+    `refine_floor.rs`, `refine_coverage.rs`; pure page sentences in `globalThis.RefineFloor` (`assets/train-refine.js`,
+    node-tested).
+
+- **Train area** (`server/train_area.rs`, `templates/train/`, `assets/train-area.js`; docs/TRAINING.md "Train area"):
+  nine tabs `/train/{collect,import,autolabel,review,refine,dataset,train,models,jobs}`; old `/dataset`, `/review`,
+  `/training` redirect (307). `GET /v1/train/summary` + `train_area::next_step` fill the strip (`queue::tally` on its own
+  thread, a stale answer served while it walks; the check steps' counts come from `server::refine::open_cached`, never
+  waited for). Jobs tab: `server/train_jobs.rs`, `training/eta.rs` (`JobClock`, memory only).
+
+- **Training** (`src/training/`, `scripts/train_model.py`; docs/TRAINING.md): user-triggered only; `capability` gates by
+  GPU (CUDA lanes by compute capability + driver, MPS on Apple); a separate `tools/train-env` from
+  `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR, RT-DETRv2, D-FINE.
+  - Dataset assembly (`training/dataset.rs`, `dataset/`): held-out chosen from all review frames before the scene filter
+    (`heldout_fingerprint`; random picks never in it), validation as whole camera days (`dataset/valid.rs`), ignore
+    mode (`dataset::IgnoreMode`), static cap (`collect/labels/statics.rs`, pure: persons and animals never form spots),
+    parked cap, opt-in balancing, size-floor restore at the run's input. `training/preflight.rs` is the one report
+    behind the page, `balance-preview` and `train prepare --dry-run`.
+  - One convergence rule for every trainer: `Convergence` in `train_model.py`, Rust twin `progress::convergence_run`,
+    parity-tested. `RunSettings` records what changes results (ignore mode, negative share, static cap) and
+    `compare.rs` warns on mixed values.
+  - Protection: a failed run keeps `work` (`training/retry.rs`, `train retry-export`; training itself does not resume);
+    an OOM restarts only before 3 finished epochs; an early GPU OOM retries at half the batch, a host OOM halves the
+    loader workers, never the batch (`training::workers_for`); `check_disk` refuses up front.
+  - Model switch (`training/switch.rs`): Revert swaps `previous_default` (one level); a verifier is replaced only when
+    named (`replace_verifier`); `Hooks::baseline` benchmarks into the run folder, never `benchmark.json`.
+  - Jobs: import, auto-label, overlaps and refine are `task::Task`s on the one-at-a-time queue, recorded in
+    `<training dir>/tasks.json` beside `runs.json`. A running job pauses / resumes (`PausableRunner`); paused time does
+    not count toward timeouts. Epoch history is `<run dir>/history.jsonl`; readers that draw no charts use
+    `TrainingService::records` (runs without history).
+
+- **Import and auto-label** (`training/import/`, `training/autolabel/`; docs/TRAINING.md "Footage import",
+  "Auto-label"): import selects frames by scene change + dHash + SigLIP k-center, licence confirmed, free-space checked.
+  Auto-label proposes pending `auto` boxes (MM-Grounding-DINO + RF-DETR L, VLM / SigLIP checks); a VLM no ranks, never
+  hides.
+  - Reruns (`triage::apply_labelers`) decide under the write lock by the frame's status at write time: reviewed frames
+    only get votes and gated missing objects (a check that never ran is no evidence), confirmed-empty and skipped frames
+    only votes and the marker. `--with-model --missing-only` (`triage::apply_missing`) skips frames the model trained
+    on. Undo: `bulk::bulk_restore_reopened`.
+  - SAM 3 (opt-in, gated, `catalog/autolabel.rs`) takes gdino's seat; nothing here claims it is better (its full
+    evaluation has not run). **SAM 3 boxes never triage `accept`** (`ACCEPT_SCORE` was tuned for gdino + RF-DETR and a
+    bulk accept reaches exports), are never dismissed by tier or spot. Access UI: `server/sam3_access.rs`.
+  - Tiers (`triage::tier`, constants in `triage.rs`): dismissed boxes are `state: rejected` with a dismissal reason;
+    `labels::needs_decision` refuses a save that would turn a flagged box into a label.
+
+- **Storage and memory** (`src/storage/`): the sweeper deletes only rebuildable files (caches unused 60 days by a
+  `.last-used` marker, no marker = the clock starts; stale compiled models; staging and job `work` whose `.busy` marker,
+  `storage::busy`, is unlocked). Never labels, datasets, exports, models, runs, a failed run's `work` (the retry
+  checkpoint) or logs. GPU memory: jobs warn, never refuse, on short free memory (except a labeler that cannot fit the
+  card at all, `autolabel::memory::too_big`); loaded models register as holders (`vram::hold`). `MALLOC_ARENA_MAX=2` in
+  the systemd unit and the Docker image.
+
+- **Benchmark** (`src/benchmark/`, `server/benchmark/`): grades models x devices into `benchmark.json` next to the config
+  (preds in `benchmark-preds.json`).
+  - `history/`: `benchmark-history.json` (recent runs per model + one pinned baseline; failed runs never recorded); pure
+    `comparable` / `compare` / `trust` with the noise rules as named constants in `history/compare.rs`.
+  - `lineup/`: models side by side on exactly the same images, rescored on shared classes; `comparable_models` is the
+    model-vs-model rule; a set with training frames is left out of "best" (`trained_on.rs`).
+  - Profiles: `POST /v1/benchmark/apply-profiles` / `--apply-threshold` save `device_thresholds`. Re-ranking saved
+    results: `benchmark/rescore.rs`.
+  - A benchmark runs each model's own device by default; a sweep over two or more GPU devices needs `--confirm-gpus` / `confirm_gpus=1` (a sweep has hung a machine; a
+    queue job refuses it); `benchmark-breadcrumb.json` names the last device after a hang.
+
+- **Web UI assets** (`assets/`, `templates/`, askama): debug builds read `assets/` from the source tree per request
+  (`embedded!` in `server/pages.rs`; a debug binary moved off its tree answers 500 on `/static/*`); release embeds them.
+  - `assets/live.js`: `PrismPoll` (chained, never two in flight, nothing while hidden; `tests/it/js_poll.rs`; polls send
+    `X-Prism-Poll: 1`, reloads they make go through `PrismPoll.navigate`), the in-page sign-in dialog on a 401 that
+    replays waiting requests once (native POST forms check the session first unless `data-no-auth-check`),
+    `PrismDraft` (sessionStorage drafts restored only at the same revision), `PrismViewport`, `PrismPointer`,
+    `PrismTip` (information only in a `title` needs a tap-to-pin `button.term`, touch has no hover). Incremental polls: `server/training/poll.rs`
+    (`TrainMetrics.poll`, node parity test), `server/benchmark/poll.rs`.
+  - Pure modules are node-tested from `tests/it/`: `review-rules.js` (`js_rules.rs`), `review-touch.js`
+    (`js_review_touch.rs`), charts, viewport, poll.
+  - Phones (`assets/style.css`, *Phones and tablets*): every `vh` height is followed by `dvh`/`svh` and every `:hover`
+    rule sits in `@media (hover: hover)` (pages.rs tests check both; iOS keeps `:hover` after a tap);
+    `viewport-fit=cover`, never `maximum-scale` / `user-scalable`; side paddings `max(<pad>, env(safe-area-inset-*))`.
+    Wide tables become cards under 700 px with `table.rcards` + `data-label`. Selects clip their text on touch widths
+    (WebKit otherwise widens the page). The
+    Browse dialog is `templates/file_browser.html`, not `browse_dialog.html` (askama would include
+    `train/browse_dialog.html` into itself). Page tests assert `<td>name</td>`, `<td class="state">` and the Stats
+    table's class string, so add classes there with care. Icons: `scripts/gen_icons.py` (`--check` in a test and CI).
+  - Browse: `/v1/fs/pick` (`server/pick.rs`, native dialog, loopback only, 409 without a desktop) falls back to
+    `/v1/fs/browse` (`server/browse.rs`, roots only: data root, models, downloads, home, mounted drives, never a
+    symlinked mount); a natively picked path passes `browse::allowed_path` for 1 h.
+
+- **Packaging and services**: Windows service `src/bin/blue_onyx_prism_service.rs` (reports Running on `Event::Bound`
+  only, gives up after `runner::BIND_GIVE_UP`); systemd / launchd / Docker in `deploy/`; install scripts in `scripts/`
+  (re-own the data root, `bop_own_data_root`); native installers in `packaging/` (WiX MSI, cargo-deb /
+  cargo-generate-rpm metadata in Cargo.toml, pkgbuild pkg; built and smoke-tested by `packaging/build-installers.sh` /
+  `smoke-test-installers.sh` in `release.yml` and `packaging.yml`; unsigned).
+  - The MSI sets a protected DACL with `icacls` (not `util:PermissionEx`, which merges), keeps only
+    `SeChangeNotifyPrivilege`, scopes the firewall rule to the local subnet, sets `sc failureflag 1` (failure actions
+    apply to an error exit) and runs the service as LocalService with
+    `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json`; a service config outside the exe dir
+    seeds `download_dir` / `cache_dir` / `log_path` beside it. `port_holder` names what holds a port.
+  - deb/rpm and pkg share `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts;
+    the Docker image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). Uninstall keeps
+    data unless asked (README "Uninstalling keeps your data").
+  - `src/service_ctl/` (SCM / `launchctl` / `systemctl`, pure parsers tested everywhere) backs `service ...`;
+    `src/tray/` + `src/bin/blue_onyx_prism_tray.rs` (Windows and macOS only; pure parts tested on every OS).
+  - Release: `panic::install()` first in every binary; `blue-onyx-prism diagnostics` / `GET /v1/diagnostics`
+    (`src/diagnostics.rs`) scrub known tokens and never include token files, frames or labels; app-local VC++ DLLs
+    (`packaging/windows/stage-vcruntime.ps1`); `ci-green` gate (`packaging/release/ci_green.py`); glibc floor in
+    `packaging/linux/glibc-floor`; `THIRD_PARTY_LICENSES.md` from `python3 -I scripts/gen_third_party.py` (CI `--check`).
+    Steps in docs/RELEASE_CHECKLIST.md.
 
 ## Conventions
 
-- Edition 2024, `anyhow` for app errors, `tracing` for logs. No `build.rs`. No `unsafe` outside `backend/`.
+- Edition 2024, `anyhow` for app errors, `tracing` for logs. No `build.rs`. No `unsafe` outside `backend/`
+  (`#![deny(unsafe_code)]` elsewhere).
 - Everything portable unless it must be `#[cfg(windows)]` (service, event log, DXGI).
-- Copy ideas and API shapes from the blue-onyx reference freely (MIT, attributed in LICENSE),
-  including its ONNX Runtime usage. Keep all `ort` code in `src/backend/ort.rs`.
-- Model weights, `models/`, `cache/`, `openvino/` and `*_config*.json` are git-ignored. Never commit weights
-  (YOLO26 is AGPL-3.0).
+- Copy ideas and API shapes from the blue-onyx reference freely (MIT, attributed in LICENSE), including its ONNX
+  Runtime usage. Keep all `ort` code in `src/backend/ort.rs`.
+- Model weights, `models/`, `cache/`, `openvino/` and `*_config*.json` are git-ignored. Never commit weights (YOLO26 is
+  AGPL-3.0).
 - Keep the Blue Iris response shape byte-compatible with CodeProject.AI: `success, message, error,
-  predictions[{x_min,y_min,x_max,y_max,confidence,label}], count, command, moduleId, executionProvider,
-  canUseGPU, inferenceMs, processMs, analysisRoundTripMs`.
-- CI sets `BOP_REQUIRE_PYTHON=1` and `BOP_REQUIRE_NODE=1`: a test that would skip for a missing Python, numpy or node fails there, while local runs still skip. Tests run scripts through `progress::test_python`. CI installs Python 3.11.9 and `scripts/ci/requirements-test.txt` (base install, because tests use `-I`) and runs `scripts/ci/python_self_tests.sh`. Review rules that decide what reaches exports are in `assets/review-rules.js` (pure, no DOM; `globalThis.ReviewRules`), checked against the Rust twins through `node` by `tests/it/js_rules.rs`. When proving a test can fail, mutate a private copy with its own target dir, never a checkout other agents build from.
-- Tests: integration tests are one binary, `tests/it/` (`cargo test --test it`; `tests/pipeline.rs` stays apart, it installs a global tracing subscriber): pure post-processing tests in `tests/it/postprocess.rs` with synthetic tensors; the HTTP and backend
-  tests (`tests/it/*_http.rs`, `backend_*.rs`, ...) are `#[ignore]`d and need the fixtures described in
+  predictions[{x_min,y_min,x_max,y_max,confidence,label}], count, command, moduleId, executionProvider, canUseGPU,
+  inferenceMs, processMs, analysisRoundTripMs`.
+- A new config key needs a `| `key` |` row in README.md's config tables: tests in `src/config.rs`,
+  `src/training/config.rs` and `src/collect/config.rs` fail on a missing one.
+- Twins must stay equal: rules that decide what reaches exports live in `assets/review-rules.js` (pure, no DOM,
+  `globalThis.ReviewRules`) with Rust twins, checked through `node` by `tests/it/js_rules.rs`; Python twins
+  (`Convergence`, COCO tables) have parity tests.
+- Frozen fixtures: `tests/data/overlaps_parity.json` and `tests/data/0.2.0/`. A difference is a change in the code,
+  never a reason to edit them.
+- CI sets `BOP_REQUIRE_PYTHON=1` and `BOP_REQUIRE_NODE=1`: a test that would skip for a missing Python, numpy or node
+  fails there (local runs skip). Tests run scripts through `progress::test_python`. CI installs Python 3.11.9 and
+  `scripts/ci/requirements-test.txt` (base install, because tests use `-I`) and runs `scripts/ci/python_self_tests.sh`.
+- Tests: integration tests are one binary, `tests/it/` (`cargo test --test it`; `tests/pipeline.rs` stays apart, it
+  installs a global tracing subscriber). Pure post-processing tests use synthetic tensors (`tests/it/postprocess.rs`).
+  HTTP and backend tests (`tests/it/*_http.rs`, `backend_*.rs`, ...) are `#[ignore]`d and need the fixtures in
   `tests/common/mod.rs` (`models/IPcam-general.*`, `openvino/`, `onnxruntime/`; run with
-  `cargo test -- --ignored --test-threads=1`). `common::temp_dir` returns a guard that removes the folder
-  (keep with `BOP_KEEP_TEST_DIRS=1`).
+  `cargo test -- --ignored --test-threads=1`). `common::temp_dir` returns a guard that removes the folder (keep with
+  `BOP_KEEP_TEST_DIRS=1`). `review_walk` (`BOP_WALK_FRAMES=10000,50000`, `--ignored`) measures the review queue.
+- When proving a test can fail, mutate a private copy with its own target dir, never a checkout other agents build from.
+- Disk trap: `cargo clean` wipes data roots under `target/` (here `target/release` holds the OpenVINO / ORT libs, the
+  training env, weights such as SAM 3's 3.4 GB, the config, and any dataset or training folder placed there). Do not
+  run it without moving them first.
 
 ## Working style for agents
 
-- The main agent orchestrates; implementation work is delegated to subagents (Sonnet for well-specified
-  porting/boilerplate, Opus for inference/backend/concurrency code). Parallel agents own disjoint files
-  and build against the shared interfaces in `src/lib.rs`, `src/api.rs`, `src/config.rs`, `src/model/mod.rs`.
-- Every subagent must finish with `cargo build` and `cargo test` passing for its files (cargo's target
-  lock serializes concurrent builds; that is fine).
-- Commit at the end of each phase with a message ending in `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- The main agent orchestrates; implementation is delegated to the subagents in `.claude/agents/`: `porter`
+  (well-specified porting and boilerplate with a reference to follow) and `engineer` (backend, inference math,
+  worker/registry concurrency, benchmarking); each file's frontmatter sets its model. Parallel agents own disjoint
+  files and build against the shared interfaces in `src/lib.rs`, `src/api.rs`, `src/config.rs`, `src/model/mod.rs`,
+  `src/backend/mod.rs`, which they edit only when the task allows.
+- Every subagent finishes with `cargo build`, `cargo test` and `cargo clippy --all-targets -- -D warnings` passing for
+  the whole crate (cargo's target lock serializes concurrent builds; that is fine).
+- Commit at the end of each phase. A commit message ends with `Co-Authored-By: Claude <model> <noreply@anthropic.com>`
+  naming the model that actually made the commit (e.g. `Claude Opus 5.5`; see the agent files for which model a
+  subagent runs), never a model that did not write it.
