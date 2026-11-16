@@ -554,16 +554,44 @@ pub const MAX_AUTO_RUN_LEN: usize = 200;
 pub const MAX_AUTO_RUN_CLASSES: usize = super::config::MAX_CLASSES;
 
 /// How the Review tab chose the frame a reviewer saved ([`LabelFile::review_pick`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPick {
     /// A random pick ([`recommend::interleave`]): a frame of the fixed pool
     /// ([`recommend::in_pool`]) served in its slot whatever it shows, so results can be checked on
     /// frames nobody chose. The save keeps it only on a pool frame.
     Random,
-    /// A value this build does not know (a newer build's): kept, written back as `unknown`.
-    #[serde(other)]
-    Unknown,
+    /// A value this build does not know (a newer build's): kept and written back as it was
+    /// (checked by [`normalize`]), as [`RejectReason::Other`] is, so a save or an X-AnyLabeling
+    /// import here does not lose it. Never a random pick.
+    Other(String),
+}
+
+impl ReviewPick {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ReviewPick::Random => "random",
+            ReviewPick::Other(s) => s,
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "random" => ReviewPick::Random,
+            other => ReviewPick::Other(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for ReviewPick {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewPick {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(d)?))
+    }
 }
 
 /// `<stem>.labels.json` (see the module doc).
@@ -975,6 +1003,8 @@ fn label_ok(l: &str) -> bool {
 ///   (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
 ///   `refine` (bounded, [`refine::check`]) kept, `bulk_accepted` and `checked_before_reopen`
 ///   cleared;
+/// - a `review_pick` this build does not know ([`ReviewPick::Other`]) kept, checked like an
+///   unknown reject reason;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -992,6 +1022,13 @@ pub fn normalize(
     }
     if f.boxes.len() > MAX_BOXES {
         bail!("{} boxes; at most {MAX_BOXES} per frame", f.boxes.len());
+    }
+    if let Some(ReviewPick::Other(p)) = &f.review_pick
+        && (p.is_empty() || p.chars().count() > MAX_LABEL_LEN || p.chars().any(char::is_control))
+    {
+        bail!(
+            "the review pick is empty, longer than {MAX_LABEL_LEN} characters or holds control characters"
+        );
     }
     let mut boxes = Vec::with_capacity(f.boxes.len());
     for (i, mut b) in std::mem::take(&mut f.boxes).into_iter().enumerate() {
@@ -1786,21 +1823,36 @@ mod tests {
         let v = serde_json::to_value(&random).unwrap();
         assert_eq!(v["review_pick"], "random");
         assert_eq!(serde_json::from_value::<LabelFile>(v).unwrap(), random);
-        // A newer build's value loads, and is written back as `unknown`.
+        // A newer build's value loads, and is written back as it was, through a save too.
         let newer: LabelFile =
             serde_json::from_str(r#"{"version": 1, "review_pick": "stratified"}"#).unwrap();
-        assert_eq!(newer.review_pick, Some(ReviewPick::Unknown));
-        let back = serde_json::to_value(&newer).unwrap();
-        assert_eq!(back["review_pick"], "unknown");
+        let stratified = Some(ReviewPick::Other("stratified".into()));
+        assert_eq!(newer.review_pick, stratified);
+        assert!(
+            serde_json::to_string(&newer)
+                .unwrap()
+                .contains(r#""review_pick":"stratified""#)
+        );
+        let saved = normalize(newer, &[], 640, 480, "2026-11-16T00:00:00Z").unwrap();
+        assert_eq!(saved.review_pick, stratified);
+        let back = serde_json::to_value(&saved).unwrap();
+        assert_eq!(back["review_pick"], "stratified");
         assert_eq!(
             serde_json::from_value::<LabelFile>(back)
                 .unwrap()
                 .review_pick,
-            Some(ReviewPick::Unknown)
+            stratified
         );
-        // A save keeps it.
+        // A save keeps a random pick, and refuses a value no build writes.
         let saved = normalize(random, &[], 640, 480, "2026-11-16T00:00:00Z").unwrap();
         assert_eq!(saved.review_pick, Some(ReviewPick::Random));
+        for bad in ["", "a\u{7}"] {
+            let f = LabelFile {
+                review_pick: Some(ReviewPick::Other(bad.into())),
+                ..LabelFile::default()
+            };
+            assert!(normalize(f, &[], 640, 480, "now").is_err(), "{bad:?}");
+        }
     }
 
     fn det(label: &str, score: f32, b: [f32; 4]) -> Det {

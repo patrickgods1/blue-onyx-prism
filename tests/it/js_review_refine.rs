@@ -4,7 +4,8 @@
 //! answers to its canvas, card and keys, so they are checked here in Node: which suggestion is
 //! current, what `y` and `w` act on, what the card says per kind, what an answer does to the file
 //! and the page flags, and that the reviewer's own edits end a suggestion by themselves. Also the
-//! session line's other page decision without a twin, `boxDecisions` (effort counted in boxes).
+//! session line's other page decision without a twin, `boxDecisions` (effort counted in boxes),
+//! and which frames a save marks as random picks (`servedPicks`, `servedAsPick`).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -191,6 +192,16 @@ console.log(JSON.stringify(req.map((r) => {
     // A pending box of a "don't want" class, as the save rejects it.
     (r.hide || []).forEach((i) => { labels.boxes[i].state = 'rejected'; labels.boxes[i].reason = 'other_class'; });
     return R.boxDecisions(served, labels.boxes);
+  }
+  if (r.op === 'served_picks') {
+    // The queue serves `items` in turn (assets/review.js `runNext`: `noteRandomPick`), then the
+    // page loads `loads` (Back, a reload, a link): the `review_pick` each save sends.
+    let picks = R.servedPicks(r.stored, null, r.max);
+    (r.items || []).forEach((it) => { picks = R.servedPicks(picks, it, r.max); });
+    return {
+      picks: picks,
+      saves: (r.loads || []).map((l) => (R.servedAsPick(picks, l.frame) ? 'random' : (l.own === undefined ? null : l.own))),
+    };
   }
   if (r.op === 'sends') return R.sendsFilter(r.name, r.value, r.auto);
   if (r.op === 'for_save') return R.refineForSave(clone(r.labels));
@@ -940,4 +951,41 @@ fn the_session_counts_the_boxes_decided_and_drawn_on_this_visit() {
         got[3],
         json!({"decided": 0, "accepted": 0, "rejected": 0, "drawn": 0})
     );
+}
+
+/// A frame the queue served as a random pick keeps its mark however the reviewer comes back to it
+/// (passed with Next, saved after Back or a reload), and a frame never served as one is never
+/// marked: its own value goes back as loaded.
+#[test]
+fn a_served_random_pick_is_marked_on_every_save_of_the_session() {
+    if !have_node() {
+        return;
+    }
+    let item = |frame: &str, random: bool| json!({"frame": frame, "random_pick": random});
+    let got = node(&json!([
+        {"op": "served_picks", "max": 10,
+         "items": [item("a", true), item("b", false), item("c", true), item("a", true), {"frame": "d"}],
+         "loads": [{"frame": "a"}, {"frame": "b"}, {"frame": "c", "own": "random"},
+                   {"frame": "d", "own": "stratified"}, {"frame": "e"}]},
+        // A reload: the list kept in sessionStorage (junk dropped), nothing served since.
+        {"op": "served_picks", "max": 10, "stored": ["a", 7, null, "c"],
+         "loads": [{"frame": "a"}, {"frame": "x", "own": "random"}]},
+        // Nothing stored or a damaged value: an empty list.
+        {"op": "served_picks", "max": 10, "stored": {"a": true}, "loads": [{"frame": "a"}]},
+        // At most `max`, the oldest go.
+        {"op": "served_picks", "max": 2,
+         "items": [item("a", true), item("b", true), item("c", true)],
+         "loads": [{"frame": "a"}, {"frame": "c"}]},
+    ]));
+    assert_eq!(got[0]["picks"], json!(["a", "c"]));
+    assert_eq!(
+        got[0]["saves"],
+        json!(["random", null, "random", "stratified", null]),
+        "a after Back is still a pick; b, d and e were never served as one"
+    );
+    assert_eq!(got[1]["picks"], json!(["a", "c"]));
+    assert_eq!(got[1]["saves"], json!(["random", "random"]));
+    assert_eq!(got[2], json!({"picks": [], "saves": [null]}));
+    assert_eq!(got[3]["picks"], json!(["b", "c"]));
+    assert_eq!(got[3]["saves"], json!([null, "random"]));
 }

@@ -125,8 +125,9 @@ pub(crate) struct Summary {
     /// The dataset check's open `relabel` and `add` suggestions (the fixes that matter most); None
     /// while they are not counted yet (the count runs on its own thread, never on this route).
     pub(crate) open_relabel_add: Option<(u64, u64)>,
-    /// Frames the last check selected (the newer of the full and the quick check's reports); None
-    /// when no check has run.
+    /// Frames the last check judged (`frames_checked` of the newer of the full and the quick
+    /// check's reports: a quick check judges only the frames its model never saw, a cancelled check
+    /// only its finished folds); None when no check has run.
     pub(crate) check_covered: Option<u64>,
     /// A model trained here can run the quick check.
     pub(crate) quick_model: bool,
@@ -373,8 +374,7 @@ fn answer_check(s: &Summary) -> Option<NextStep> {
         "answer_check",
         REVIEW,
         format!(
-            "The dataset check found {} on reviewed frames ({}). Answer them before you export: \
-             {why}.",
+            "The dataset check found {} ({}). Answer them before you export: {why}.",
             counted_noun(total, "likely fix", "likely fixes"),
             parts.join(", ")
         ),
@@ -385,9 +385,9 @@ fn answer_check(s: &Summary) -> Option<NextStep> {
 
 /// A dataset check over the reviewed frames, once nothing is left to review: when this machine
 /// can train, there are enough reviewed frames on 2 camera days for a check
-/// ([`crate::training::refine::MIN_FRAMES`]), and no check has run or the last one covered under
-/// three quarters of them. A model trained here makes it the quick check, minutes instead of an
-/// hour.
+/// ([`crate::training::refine::MIN_FRAMES`]), and no check has run or the last one judged under
+/// three quarters of them ([`Summary::check_covered`]: the frames it judged, not those it
+/// selected). A model trained here makes it the quick check, minutes instead of an hour.
 fn run_check(s: &Summary) -> Option<NextStep> {
     let reviewed = s.frames_reviewed;
     let enough = s.can_train
@@ -401,7 +401,7 @@ fn run_check(s: &Summary) -> Option<NextStep> {
     }
     let since = match s.check_covered {
         Some(c) => format!(
-            "{} since the last dataset check.",
+            "{} the last dataset check did not judge.",
             counted_noun(
                 reviewed.saturating_sub(c),
                 "reviewed frame",
@@ -1066,8 +1066,8 @@ mod tests {
         assert_eq!((n.key, n.tab), ("answer_check", REVIEW));
         assert_eq!(
             n.text,
-            "The dataset check found 5 likely fixes on reviewed frames (2 wrong classes, 3 missing \
-             boxes). Answer them before you export: wrong classes hurt a model most."
+            "The dataset check found 5 likely fixes (2 wrong classes, 3 missing boxes). Answer them \
+             before you export: wrong classes hurt a model most."
         );
         assert_eq!(
             (n.link.as_str(), n.label.as_str()),
@@ -1080,8 +1080,8 @@ mod tests {
         };
         assert_eq!(
             next_step(&one).text,
-            "The dataset check found 1 likely fix on reviewed frames (1 wrong class). Answer them \
-             before you export: wrong classes hurt a model most."
+            "The dataset check found 1 likely fix (1 wrong class). Answer them before you export: \
+             wrong classes hurt a model most."
         );
         let adds = Summary {
             open_relabel_add: Some((0, 1)),
@@ -1089,9 +1089,7 @@ mod tests {
         };
         let t = next_step(&adds).text;
         assert!(
-            t.starts_with(
-                "The dataset check found 1 likely fix on reviewed frames (1 missing box)."
-            ),
+            t.starts_with("The dataset check found 1 likely fix (1 missing box)."),
             "{t}"
         );
         assert!(!t.contains("wrong class"), "{t}");
@@ -1135,7 +1133,7 @@ mod tests {
             (n.link.as_str(), n.label.as_str()),
             ("/train/refine#refine-check", "Run the check")
         );
-        // A check over under three quarters of the reviewed frames is old: 44 of 60.
+        // A check that judged under three quarters of the reviewed frames is old: 44 of 60.
         let old = Summary {
             check_covered: Some(44),
             ..checkable()
@@ -1144,7 +1142,7 @@ mod tests {
         assert_eq!(n.key, "run_check");
         assert!(
             n.text
-                .starts_with("16 reviewed frames since the last dataset check. A check finds"),
+                .starts_with("16 reviewed frames the last dataset check did not judge. A check"),
             "{}",
             n.text
         );

@@ -148,6 +148,8 @@
   // A saved box that is no verdict on an object, left out of the session's box count and
   // acceptance: a duplicate or a too-small box, a dismissal nobody judged, a parked spot's
   // automatic accept, and a box of a "don't want" class the save rejected unseen (`other_class`).
+  // Neither this nor the balance's kept share (labels/queue.rs `proposed_label`, which also leaves
+  // out the rejects nobody judged) counts a parked spot's accept as a reviewer's decision.
   function noVerdict(b) {
     return b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' ||
       isDismissal(b.reason) || b.reason === 'parked_spot' || b.reason === 'other_class';
@@ -177,6 +179,27 @@
       out.decided++;
     });
     return out;
+  }
+
+  // The frames GET /v1/review/next served as random picks in this page session (no Rust twin; page
+  // only): `list` (oldest first) with `item`'s frame added when the item is one (`random_pick`),
+  // at most `max` kept (the oldest go). A new array; `list` is not changed.
+  function servedPicks(list, item, max) {
+    var out = Array.isArray(list) ? list.filter(function (f) { return typeof f === 'string'; }) : [];
+    if (item && item.random_pick === true && typeof item.frame === 'string' && out.indexOf(item.frame) < 0) {
+      out.push(item.frame);
+    }
+    var keep = max > 0 ? max : 0;
+    return out.length > keep ? out.slice(out.length - keep) : out;
+  }
+
+  // Whether `frame` goes to the save as a random pick (`review_pick: 'random'`): the queue served
+  // it as one in this page session (`picks`, from `servedPicks`), however the reviewer came back
+  // to it (Back after passing it with Next, a reload). Marking on the way the reviewer moves
+  // would bias the random set by those choices. A frame never served as one is never marked here
+  // (its label file's own value goes back as loaded; the server drops `random` off the pool).
+  function servedAsPick(picks, frame) {
+    return Array.isArray(picks) && typeof frame === 'string' && picks.indexOf(frame) >= 0;
   }
 
   // Where the box served at index `n` is now, -1 if it went.
@@ -941,6 +964,8 @@
     pendingDupDrops: pendingDupDrops,
     markServed: markServed,
     boxDecisions: boxDecisions,
+    servedPicks: servedPicks,
+    servedAsPick: servedAsPick,
     liveSuggestions: liveSuggestions,
     markRejected: markRejected,
     markDuplicate: markDuplicate,

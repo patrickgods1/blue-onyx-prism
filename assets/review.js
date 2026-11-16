@@ -3430,7 +3430,18 @@
   // A random pick (the item's `random_pick`: 1 frame in 5 of the default view, a fixed pool by
   // the path's hash): saved with `review_pick: 'random'` (the server keeps it on pool frames
   // alone), so held-out scores can be read on frames nobody chose. On the labels, so a draft
-  // carries it and a saved pick shows again; a label file's own value goes back as loaded.
+  // carries it and a saved pick shows again; a label file's own value goes back as loaded. Every
+  // frame the queue served as one in this page session is remembered (`randomPicks`, also in
+  // sessionStorage for a reload), so one passed with Next and saved after Back keeps its mark:
+  // which picks lost it would otherwise follow the reviewer's choices.
+  var RANDOM_PICKS = 'review-random-picks', RANDOM_PICKS_MAX = 2000;
+  var randomPicks = R.servedPicks(window.PrismDraft ? PrismDraft.load(RANDOM_PICKS) : null, null, RANDOM_PICKS_MAX);
+  function noteRandomPick(item) {
+    var next = R.servedPicks(randomPicks, item, RANDOM_PICKS_MAX);
+    if (next.length === randomPicks.length && next[next.length - 1] === randomPicks[randomPicks.length - 1]) return;
+    randomPicks = next;
+    if (window.PrismDraft) PrismDraft.save(RANDOM_PICKS, randomPicks);
+  }
   function isRandomPick() {
     return !!(cur && cur.labels && cur.labels.review_pick === 'random');
   }
@@ -3639,7 +3650,7 @@
         if (backStack.length > 200) backStack.shift();
       }
       cur = j;
-      if (queueItem && queueItem.frame === j.frame && queueItem.random_pick && j.labels) j.labels.review_pick = 'random';
+      if (j.labels && R.servedAsPick(randomPicks, j.frame)) j.labels.review_pick = 'random';
       // Suggestions keep to the boxes the server named (`overlap_live_boxes`).
       R.markServed(j.labels);
       servedBoxes = JSON.parse(JSON.stringify((j.labels && j.labels.boxes) || []));
@@ -3779,6 +3790,7 @@
         return;
       }
       queueItem = j.item;
+      noteRandomPick(j.item);
       return loadFrame(j.item.frame);
     }).catch(function (e) {
       if (run.stale) return;
@@ -3855,6 +3867,8 @@
     }
     busy = true;
     var body = JSON.parse(JSON.stringify(cur.labels));   // keeps auto_run, bulk_accepted, ...
+    // Served as a random pick in this session: marked whatever the undo stack or a draft holds.
+    if (R.servedAsPick(randomPicks, cur.frame)) body.review_pick = 'random';
     // A pending box stacked on a better one must not be accepted by the save (on the copy: a
     // refused save loses nothing).
     var dropped = status === 'reviewed' ? pendingDupDrops(dupGroups()) : [];

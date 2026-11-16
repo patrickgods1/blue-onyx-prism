@@ -559,11 +559,15 @@ folder; the collector and the Collect tab keep `collect.dir`.
 - **`review_pick`** (written only when set): how the Review tab chose the frame the reviewer saved.
   `"random"` = it was served as a **random pick** (below, *Random picks*): a frame of the fixed pool, served in
   its slot whatever it shows, so results can be checked on frames nobody chose. The page sends it on every save
-  of such a frame (reviewed or skipped) and sends a loaded value back as it was; a save body without the key
+  of a frame the queue served as one in that page session (reviewed or skipped), also one passed with Next and
+  saved after Back or a reload (the session's picks are kept in sessionStorage: which picks lost the mark would
+  otherwise follow the reviewer's choices), never on a frame not served as one, and sends a loaded value back as
+  it was; a save body without the key
   keeps the stored value, a key that is there (`null` too) is the client's. The server drops `"random"` from a
   frame that is not in the pool (`recommend::in_pool`), so a forged or mistaken mark cannot put a chosen frame
-  among the random ones. A value this build does not know loads as `unknown` and is written back as `unknown`;
-  X-AnyLabeling imports and the other edits keep it. A build from before random picks ignores the field and drops
+  among the random ones. A value this build does not know (a later build's) loads and is written back as it was
+  (`ReviewPick::Other`, checked like an unknown reject reason; never a random pick); X-AnyLabeling imports and
+  the other edits keep it. A build from before random picks ignores the field and drops
   it when it rewrites the file. Exports list such frames in `frames.json` `random_pick` and tag them `random` in
   the benchmark manifest; a training run scores its held-out random picks apart (`heldout:random`).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
@@ -763,9 +767,10 @@ of the class: x its confidence, the best score of its pending boxes of the class
 pending one with no score, counts 1), or of the sidecar's predictions without a label file. Reviewing a likely box
 of a rare class adds to that class; an unlikely one is mostly rejected and adds nothing, so a 0.95 truck comes
 before a 0.3 one. It is also weighed by the camera's kept share of the class's proposals, `(kept + 2) /
-(proposed + 2)`: of the camera's reviewed frames on which a model or auto-labeler proposed the class (an accepted
-or rejected machine box of it, a relabelled one by its old label; not a dismissal, a duplicate or an ignore
-region), those that kept a training box of it. A rejected proposal never adds to the class, so without it a
+(proposed + 2)`: of the camera's reviewed frames on which a model or auto-labeler proposed the class and a
+reviewer judged the proposal (an accepted or rejected machine box of it, a relabelled one by its old label; not a
+duplicate, an ignore region, or a box nobody judged: a dismissal, a bulk reject by score, a model hint the page's
+save rejected by default, a labelers run's parked-spot accept), those that kept a training box of it. A rejected proposal never adds to the class, so without it a
 camera that keeps calling a bush a bicycle would keep its frames first however often the bicycle is rejected;
 with no proposal reviewed, or all of them kept, the share is 1. The class part is `lack x score x share`, rounded
 down once. A frame's class is its wanted class with the highest weighed need, of its boxes that are not

@@ -728,20 +728,26 @@ pub(super) fn file_labels(l: &LabelFile) -> BTreeSet<String> {
         .collect()
 }
 
-/// The label a model or auto-labeler proposed with `b`, when a reviewer decided on it: an accepted
+/// The label a model or auto-labeler proposed with `b`, when a reviewer judged it: an accepted
 /// or rejected model or auto box, its `model_label` when the reviewer relabelled it to another class
 /// (a truck proposal kept as a car was no truck). None for a box drawn by hand, one still pending,
-/// a dismissal ([`super::bulk::is_dismissal`]: nobody judged it), a duplicate (a second box on an
-/// object says nothing about the class) and an ignore region ([`super::LabelBox::is_ignore`]).
+/// a reject nobody judged ([`super::unjudged_reject`]: a dismissal, a bulk reject by score, a model
+/// hint the page's save default rejected), an accept nobody judged (a labelers run's parked-spot
+/// accept, [`super::spots::PARKED_REASON`]), a duplicate (a second box on an object says nothing
+/// about the class) and an ignore region ([`super::LabelBox::is_ignore`]).
 fn proposed_label(b: &super::LabelBox) -> Option<&str> {
     let decided = matches!(b.state, BoxState::Accepted | BoxState::Rejected);
     let duplicate = b.reject_reason == Some(super::RejectReason::Duplicate)
         || b.reason.as_deref() == Some(super::stacks::DUPLICATE_REASON);
+    let parked =
+        b.state == BoxState::Accepted && b.reason.as_deref() == Some(super::spots::PARKED_REASON);
     if b.source == super::Source::Human
         || !decided
         || duplicate
+        || parked
         || b.is_ignore()
         || super::bulk::is_dismissal(b.reason.as_deref())
+        || super::unjudged_reject(b)
     {
         return None;
     }
@@ -751,7 +757,7 @@ fn proposed_label(b: &super::LabelBox) -> Option<&str> {
     })
 }
 
-/// The labels models and auto-labelers proposed on `l` and a reviewer decided on
+/// The labels models and auto-labelers proposed on `l` and a reviewer judged
 /// ([`proposed_label`]), as written: [`Filters::wanted_of`] makes them the wanted classes
 /// [`BalanceTally::precision`] counts by.
 pub(super) fn proposed_labels(l: &LabelFile) -> BTreeSet<&str> {
@@ -2991,7 +2997,7 @@ mod tests {
     }
 
     #[test]
-    fn proposed_labels_are_decided_machine_boxes() {
+    fn proposed_labels_are_judged_machine_boxes() {
         use super::super::tests_support::auto_box;
         use super::super::{LabelBox, RejectReason, Source};
         let b = |label: &str, state: BoxState| LabelBox {
@@ -3032,6 +3038,34 @@ mod tests {
             model_label: Some("motorbike".into()),
             ..b("motorcycle", BoxState::Accepted)
         };
+        // Rejects and accepts nobody judged: a bulk reject by score, a model hint the page's save
+        // default rejected, a labelers run's parked-spot accept.
+        let low_score = LabelBox {
+            reason: Some(super::super::bulk::LOW_SCORE_REASON.into()),
+            ..b("giraffe", BoxState::Rejected)
+        };
+        let hint = |label: &str, state: BoxState| LabelBox {
+            source: Source::Model,
+            origin: Some(super::super::Origin::Suppressed),
+            ..b(label, state)
+        };
+        let hint_defaulted = hint("zebra", BoxState::Rejected);
+        let parked = LabelBox {
+            reason: Some(super::super::spots::PARKED_REASON.into()),
+            ..b("bear", BoxState::Accepted)
+        };
+        // Judged: a hint the reviewer kept, one rejected with a reason, a reply's prediction
+        // rejected.
+        let hint_kept = hint("kite", BoxState::Accepted);
+        let hint_judged = LabelBox {
+            reject_reason: Some(RejectReason::FalsePositive),
+            ..hint("umbrella", BoxState::Rejected)
+        };
+        let prediction_rejected = LabelBox {
+            source: Source::Model,
+            origin: Some(super::super::Origin::Prediction),
+            ..b("elephant", BoxState::Rejected)
+        };
         let l = LabelFile {
             status: Status::Reviewed,
             boxes: vec![
@@ -3046,12 +3080,26 @@ mod tests {
                 unsure,
                 relabelled,
                 spelled,
+                low_score,
+                hint_defaulted,
+                parked,
+                hint_kept,
+                hint_judged,
+                prediction_rejected,
             ],
             ..LabelFile::default()
         };
         assert_eq!(
             proposed_labels(&l),
-            BTreeSet::from(["bicycle", "dog", "motorcycle", "truck"])
+            BTreeSet::from([
+                "bicycle",
+                "dog",
+                "elephant",
+                "kite",
+                "motorcycle",
+                "truck",
+                "umbrella"
+            ])
         );
     }
 

@@ -528,7 +528,8 @@ impl SentLists {
 /// clients). A body without a `refine` or `overlap_suggestions` key keeps the stored file's list
 /// ([`SentLists`]): the suggestions and their answers are the jobs' and the reviewer's, not the
 /// client's to drop by leaving them out. So does one without `review_pick`; `random` on a frame
-/// out of the random-pick pool is dropped ([`drop_foreign_pick`]).
+/// out of the random-pick pool is dropped ([`drop_foreign_pick`]). A save around an unanswered
+/// suggestion drops the kept open counts ([`super::refine::save_changes_open`]).
 pub(super) async fn labels_post(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -555,12 +556,14 @@ pub(super) async fn labels_post(
         let status = file.status;
         // Read before the write, outside its lock: with a revision the write is refused when the
         // file changed since; without one the save overwrites whatever came between, as always.
+        let stored = labels::read(&frame.labels).ok().flatten();
         sent.keep_stored(&mut file, &frame.labels);
         drop_foreign_pick(&mut file, &frame.rel.jpg());
         let f = match labels::normalize(file, &classes, rec.width, rec.height, &now()) {
             Ok(f) => f,
             Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}")),
         };
+        let open_changes = super::refine::save_changes_open(stored.as_ref(), &f);
         let written = match &expected {
             Some(rev) => labels::write_checked(&frame.labels, &f, rev),
             None => labels::write(&frame.labels, &f).map(Ok),
@@ -580,6 +583,11 @@ pub(super) async fn labels_post(
                     .into_response();
             }
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}")),
+        }
+        // The dataset check's open count may have changed (an answer, a box moved under a
+        // suggestion): the Train strip shows none until the next walk.
+        if open_changes {
+            super::refine::forget_counts();
         }
         tracing::debug!(frame = %rel, status = status.as_str(), boxes = f.boxes.len(), "review labels saved");
         labels_answer(
@@ -1663,6 +1671,38 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         (v["item"]["frame"] == rel).then(|| v["item"]["refine_open"].as_u64().unwrap_or(0))
+    }
+
+    /// A save that answers a dataset-check suggestion drops the kept open count, so the Train
+    /// strip shows none rather than one that counts the answered suggestion.
+    #[tokio::test]
+    async fn a_save_answering_a_suggestion_drops_the_kept_open_count() {
+        let d = ds_with(refine_classes);
+        let (rel, _, _) = refine_frame(&d);
+        let q = encode_uri_component(&rel);
+        let classes = d.state.config_read().collect.classes.clone();
+        let hidden = d.state.config_read().collect.hidden_classes.clone();
+        let (st, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(st, StatusCode::OK, "{l}");
+        // Other tests drop every kept count now and then: keep one until it stays.
+        let kept = (0..50).any(|_| super::super::refine::keep_open_now(&d.dir, &classes, &hidden));
+        assert!(kept, "no count kept");
+        assert_eq!(
+            super::super::refine::kept_open(&d.dir, &classes, &hidden).map(|o| o.relabel),
+            Some(1)
+        );
+        let mut page = l["labels"].clone();
+        page["refine"][3]["answer"] = "dismissed".into();
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &page.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            super::super::refine::kept_open(&d.dir, &classes, &hidden),
+            None
+        );
     }
 
     both_ways!(
@@ -3819,7 +3859,7 @@ mod tests {
 
     /// `review_pick: random` is kept on a pool frame and dropped on any other (a forged or
     /// mistaken mark); a body without the key keeps the stored value, `null` clears it, and a
-    /// newer build's value is kept as `unknown`.
+    /// newer build's value is kept as written.
     async fn a_save_keeps_a_random_pick_only_on_a_pool_frame_in(way: Way) {
         let d = way.ds();
         let (rest, pool) = put_pool_frames(&d, 1, 1);
@@ -3858,7 +3898,11 @@ mod tests {
             o.insert("review_pick".into(), "stratified".into());
         })
         .await;
-        assert_eq!(stored(&rest[0]), Some(labels::ReviewPick::Unknown));
+        assert_eq!(
+            stored(&rest[0]),
+            Some(labels::ReviewPick::Other("stratified".into())),
+            "kept as written"
+        );
     }
 
     // ---- the review index behind `GET /v1/review/next` ----------------------------------------

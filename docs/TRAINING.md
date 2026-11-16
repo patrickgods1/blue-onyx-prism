@@ -2685,24 +2685,27 @@ The strip under the Train area's tabs (`GET /v1/train/summary`, `train_area::nex
 one suggested action, the first rule that applies: a job on the queue, the folder under review missing, a
 finished model nobody decided about, nothing collected yet, then:
 
-1. **Answer the dataset check** (`answer_check`): open `relabel` and `add` suggestions on reviewed frames,
-   e.g. *The dataset check found 5 likely fixes on reviewed frames (2 wrong classes, 3 missing boxes). Answer
-   them before you export: wrong classes hurt a model most.* (a zero part is left out), linking
+1. **Answer the dataset check** (`answer_check`): open `relabel` and `add` suggestions (every label file's
+   live ones, as the Refine tab counts them), e.g. *The dataset check found 5 likely fixes (2 wrong classes,
+   3 missing boxes). Answer them before you export: wrong classes hurt a model most.* (a zero part is left out), linking
    `/train/review?auto=refine`. It comes before both export rules: a wrong class costs a model the most per
    error, a missing box is the commonest error, and both would reach the export as they are. Verify and
    tighten suggestions get no nudge. The count is the Refine tab's `open` (`server::refine::open_cached`):
-   the strip never waits for its walk; it shows the kept count, however old, and a missing or stale one
-   starts a walk on its own thread (one per folder and class list, never two walks at once), so the step
-   appears on a later poll.
+   the strip never waits for its walk. It takes a kept count up to 10 minutes old (`STRIP_OPEN_TTL`; the
+   strip polls every 30 s on every Train tab), shows none once a review save changed a frame's unanswered
+   suggestions (`save_changes_open` drops the kept counts) or a check started or ended, and an older or
+   missing one starts a walk on its own thread (one per folder and class list, at most one started a
+   minute, never two walks at once), so the step appears on a later poll.
 2. Enough new reviewed frames to export (50), then frames to auto-label or review. The review step counts
    effort in boxes: *M boxes on N frames to review.* when every frame to review has a label file, else *N
    frames (M boxes) to review.*, since boxes only a sidecar proposes are not counted (`Tally.unfiled_to_review`).
 3. **Run the dataset check** (`run_check`), once nothing is left to review: when this machine can train, at
    least `refine::MIN_FRAMES` (40) reviewed frames on 2 camera days or more (`Tally::reviewed_camera_days`,
-   (camera, date) from the frame's path as the check groups them), and no check yet or the last one selected
-   under three quarters of the reviewed frames (`frames_selected` of the newer of `refine/report.json` and
-   `refine/report-quick.json` by `created`): *N reviewed frames since the last dataset check. A check finds
-   some wrong labels before you train.* With a model trained here that the quick check can use, the link is
+   (camera, date) from the frame's path as the check groups them), and no check yet or the last one judged
+   under three quarters of the reviewed frames (`frames_checked` of the newer of `refine/report.json` and
+   `refine/report-quick.json` by `created`: a quick check judges only the frames its model never saw, a
+   cancelled check only its finished folds; the reports are read again only when one changes):
+   *N reviewed frames the last dataset check did not judge. A check finds some wrong labels before you train.* With a model trained here that the quick check can use, the link is
    *Quick check* (`/train/refine#quick-check` opens the form on it) and the text adds that it takes minutes;
    else *Run the check* (`/train/refine#refine-check`).
 4. Any reviewed frames not exported, a failed run, an export not trained on, and otherwise *All caught up*.

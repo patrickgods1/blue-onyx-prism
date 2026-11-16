@@ -7,8 +7,9 @@
 //!   than this build) and `refine/report-quick.json` of the last quick check (`quick_report`,
 //!   `quick_report_problem`), the open suggestions
 //!   per kind (a walk of the label files, off the async workers, kept 60 s per folder and class
-//!   list and dropped when a check starts or ends; the Train area's strip reads them through
-//!   [`open_cached`], which never waits for a walk), the check in the queue, the newest finished
+//!   list and dropped when a check starts or ends or a save changes a frame's suggestions; the
+//!   Train area's strip reads them through [`open_cached`], which never waits for a walk and takes
+//!   a kept count up to 10 min old), the check in the queue, the newest finished
 //!   one, and what the form needs of this machine;
 //! - `GET /v1/refine/preview`: what a check would do ([`refine::preview`]), no GPU, download or
 //!   write;
@@ -32,6 +33,7 @@
 use super::train_area::{REFINE, tab_title};
 use super::{AppState, Shared, blocking, render, training};
 use crate::backend::Runtimes;
+use crate::collect::labels::LabelFile;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::queue::{self, Filters};
 use crate::collect::labels::refine::{self as suggestions, Kind};
@@ -54,13 +56,20 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Largest request body of `POST /v1/refine/check`.
 pub(super) const BODY_LIMIT: usize = 16 * 1024;
-/// How long a walk's counts are kept.
+/// How long a walk's counts answer the Refine tab.
 const OPEN_TTL: Duration = Duration::from_secs(60);
+/// How long a walk's counts answer the Train area's strip without a new walk: it polls every 30 s
+/// on every Train tab, and a drop ([`forget_counts`]) or a change of the queue's checks ends the
+/// count sooner.
+const STRIP_OPEN_TTL: Duration = Duration::from_secs(10 * 60);
+/// The strip starts at most one walk per key in this long.
+const STRIP_WALK_EVERY: Duration = Duration::from_secs(60);
 /// Most walks' answers kept at once (folders under review x class lists).
 const OPEN_KEEP: usize = 8;
 /// Largest `report.json` read (a report with this many recall rows is not one this build wrote).
@@ -194,33 +203,99 @@ struct Kept {
     open: Open,
 }
 
-/// The walks' answers per folder and class list.
-static OPEN: Mutex<BTreeMap<String, Kept>> = Mutex::new(BTreeMap::new());
-/// One walk at a time: a second caller waits and finds the first one's answer.
-static WALKING: Mutex<()> = Mutex::new(());
+/// The walks' answers per folder and class list, and what keeps their walks in check. One per
+/// process ([`OPEN`]); tests make their own.
+pub(super) struct OpenStore {
+    /// The kept answers, by [`open_key`].
+    kept: Mutex<BTreeMap<String, Kept>>,
+    /// One walk at a time: a second caller waits and finds the first one's answer.
+    walking: Mutex<()>,
+    /// Keys whose walk [`open_cached`] started and that has not ended: one background walk per key.
+    refreshing: Mutex<BTreeSet<String>>,
+    /// When [`open_cached`] last started a walk, per key: at most one per [`STRIP_WALK_EVERY`].
+    started: Mutex<BTreeMap<String, Instant>>,
+    /// Bumped by [`forget_counts`]: a walk that began before a drop keeps its answer to itself.
+    generation: AtomicU64,
+    /// Walks run (tests).
+    walks: AtomicUsize,
+}
+
+impl OpenStore {
+    const fn new() -> Self {
+        Self {
+            kept: Mutex::new(BTreeMap::new()),
+            walking: Mutex::new(()),
+            refreshing: Mutex::new(BTreeSet::new()),
+            started: Mutex::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
+            walks: AtomicUsize::new(0),
+        }
+    }
+
+    /// Drop every kept answer.
+    fn forget(&self) {
+        // Under the map's lock: a walk storing its answer checks the generation under it too.
+        let mut kept = self.kept.lock_recover();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        kept.clear();
+    }
+}
+
+/// The process's walks.
+static OPEN: OpenStore = OpenStore::new();
 
 /// [`count_open`], kept [`OPEN_TTL`]. `stamp` names the checks on the queue (ids and states): when
 /// one starts, ends or is cancelled the kept answer is dropped.
 fn open_counts(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -> Open {
+    open_counts_in(&OPEN, dir, classes, hidden, stamp)
+}
+
+fn open_counts_in(
+    store: &OpenStore,
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    stamp: &str,
+) -> Open {
+    open_counts_with(store, dir, classes, hidden, stamp, || {
+        count_open(dir, classes, hidden)
+    })
+}
+
+/// [`open_counts_in`] with its walk (`count`).
+fn open_counts_with(
+    store: &OpenStore,
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    stamp: &str,
+    count: impl FnOnce() -> Open,
+) -> Open {
     let key = open_key(dir, classes, hidden);
     let fresh = |k: &Kept| k.at.elapsed() < OPEN_TTL && k.stamp == stamp;
-    if let Some(k) = OPEN.lock_recover().get(&key).filter(|k| fresh(k)) {
+    if let Some(k) = store.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
         return k.open.clone();
     }
-    let _walking = WALKING.lock_recover();
-    if let Some(k) = OPEN.lock_recover().get(&key).filter(|k| fresh(k)) {
+    let _walking = store.walking.lock_recover();
+    if let Some(k) = store.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
         return k.open.clone();
     }
-    let open = count_open(dir, classes, hidden);
-    remember(
-        &mut OPEN.lock_recover(),
-        key,
-        Kept {
-            at: Instant::now(),
-            stamp: stamp.to_string(),
-            open: open.clone(),
-        },
-    );
+    let generation = store.generation.load(Ordering::SeqCst);
+    store.walks.fetch_add(1, Ordering::SeqCst);
+    let open = count();
+    let mut kept = store.kept.lock_recover();
+    // A drop since the walk began: what it counted may be the file before a save.
+    if store.generation.load(Ordering::SeqCst) == generation {
+        remember(
+            &mut kept,
+            key,
+            Kept {
+                at: Instant::now(),
+                stamp: stamp.to_string(),
+                open: open.clone(),
+            },
+        );
+    }
     open
 }
 
@@ -234,42 +309,65 @@ fn open_key(dir: &Path, classes: &[String], hidden: &[String]) -> String {
     )
 }
 
-/// Keys whose walk [`open_cached`] started and that has not ended: one background walk per key.
-static REFRESHING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-/// Takes `key` out of [`REFRESHING`] when dropped, panic included, so a failed walk does not stop
-/// the next one.
-struct Refreshed(String);
+/// Takes its key out of [`OpenStore::refreshing`] when dropped, panic included, so a failed walk
+/// does not stop the next one.
+struct Refreshed(&'static OpenStore, String);
 
 impl Drop for Refreshed {
     fn drop(&mut self) {
-        REFRESHING.lock_recover().remove(&self.0);
+        self.0.refreshing.lock_recover().remove(&self.1);
     }
 }
 
-/// [`open_counts`] for a caller that must not wait (the Train area's strip): the kept answer,
-/// however old or whatever the queue did since (None before the first walk); when it is missing or
-/// no longer fresh, a walk starts on its own thread, at most one per key, and it still waits its turn
-/// on [`WALKING`], so never two walks at once. The next call finds its answer.
+/// [`open_counts`] for a caller that must not wait (the Train area's strip, which polls every 30 s
+/// on every Train tab): the kept answer of the same queue, None before the first walk, after a drop
+/// ([`forget_counts`]) and once the queue's checks changed. An answer under [`STRIP_OPEN_TTL`] old
+/// is given with no walk; otherwise a walk starts on its own thread (at most one per key at a time
+/// and one started per key per [`STRIP_WALK_EVERY`]), which still waits its turn on the one walk at
+/// a time, so never two walks at once, and a later call finds its answer. An older answer of the
+/// same queue is given meanwhile.
 pub(super) fn open_cached(
     dir: &Path,
     classes: &[String],
     hidden: &[String],
     stamp: &str,
 ) -> Option<Open> {
+    open_cached_in(&OPEN, dir, classes, hidden, stamp)
+}
+
+fn open_cached_in(
+    store: &'static OpenStore,
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    stamp: &str,
+) -> Option<Open> {
     let key = open_key(dir, classes, hidden);
-    let kept = OPEN.lock_recover().get(&key).map(|k| {
-        (
-            k.open.clone(),
-            k.at.elapsed() < OPEN_TTL && k.stamp == stamp,
-        )
-    });
-    if kept.as_ref().is_some_and(|(_, fresh)| *fresh) {
+    // Another queue: the answer is of the checks before, and no number is better than its.
+    let kept = store
+        .kept
+        .lock_recover()
+        .get(&key)
+        .filter(|k| k.stamp == stamp)
+        .map(|k| (k.open.clone(), k.at.elapsed() < STRIP_OPEN_TTL));
+    if kept.as_ref().is_some_and(|(_, young)| *young) {
         return kept.map(|(open, _)| open);
     }
-    if REFRESHING.lock_recover().insert(key.clone()) {
+    let may_start = {
+        let mut started = store.started.lock_recover();
+        started.retain(|_, at| at.elapsed() < STRIP_WALK_EVERY);
+        if started.contains_key(&key) {
+            false
+        } else if store.refreshing.lock_recover().insert(key.clone()) {
+            started.insert(key.clone(), Instant::now());
+            true
+        } else {
+            false
+        }
+    };
+    if may_start {
         // Moved into the thread; dropped with the closure when the thread does not start.
-        let done = Refreshed(key);
+        let done = Refreshed(store, key);
         let (dir, classes, hidden, stamp) = (
             dir.to_path_buf(),
             classes.to_vec(),
@@ -280,7 +378,7 @@ pub(super) fn open_cached(
             .name("refine-open".into())
             .spawn(move || {
                 let _done = done;
-                open_counts(&dir, &classes, &hidden, &stamp);
+                open_counts_in(store, &dir, &classes, &hidden, &stamp);
             });
         if let Err(e) = spawned {
             tracing::warn!("could not start counting the dataset check's open suggestions: {e}");
@@ -289,17 +387,41 @@ pub(super) fn open_cached(
     kept.map(|(open, _)| open)
 }
 
-/// Drop every kept count: a label write (the static spots' bulk accept) changed what a walk
-/// would find, so the next read walks again.
+/// Drop every kept count: a label write (the static spots' bulk accept, a review save that
+/// answered or changed suggestions) changed what a walk would find, so the strip shows no count
+/// until the next walk and the Refine tab walks again.
 pub(super) fn forget_counts() {
-    OPEN.lock_recover().clear();
+    OPEN.forget();
 }
 
-/// Put `kept` in `map` under `key`: answers past [`OPEN_TTL`] go first, then the oldest, so at
-/// most [`OPEN_KEEP`] stay (each folder under review and class list ever asked about would
+/// Count the open suggestions of `dir` now and keep the answer, as the Refine tab does; whether
+/// it was kept (a drop elsewhere during the walk keeps nothing). Tests of other modules.
+#[cfg(test)]
+pub(super) fn keep_open_now(dir: &Path, classes: &[String], hidden: &[String]) -> bool {
+    open_counts(dir, classes, hidden, "");
+    kept_open(dir, classes, hidden).is_some()
+}
+
+/// The kept open count of `dir`, whatever the queue. Tests of other modules.
+#[cfg(test)]
+pub(super) fn kept_open(dir: &Path, classes: &[String], hidden: &[String]) -> Option<Open> {
+    let key = open_key(dir, classes, hidden);
+    OPEN.kept.lock_recover().get(&key).map(|k| k.open.clone())
+}
+
+/// Whether a review save of `before` (the stored file, None when there was none) as `after` can
+/// change the open count ([`count_open`]): either holds an unanswered suggestion. Answered ones are
+/// never open, so a frame whose suggestions were all answered before and after changes nothing.
+pub(super) fn save_changes_open(before: Option<&LabelFile>, after: &LabelFile) -> bool {
+    let unanswered = |f: &LabelFile| f.refine.iter().any(|s| !s.answered());
+    before.is_some_and(unanswered) || unanswered(after)
+}
+
+/// Put `kept` in `map` under `key`: answers past [`STRIP_OPEN_TTL`] go first, then the oldest, so
+/// at most [`OPEN_KEEP`] stay (each folder under review and class list ever asked about would
 /// otherwise stay for the life of the process).
 fn remember(map: &mut BTreeMap<String, Kept>, key: String, kept: Kept) {
-    map.retain(|k, v| *k != key && v.at.elapsed() < OPEN_TTL);
+    map.retain(|k, v| *k != key && v.at.elapsed() < STRIP_OPEN_TTL);
     while map.len() >= OPEN_KEEP {
         let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {
             break;
@@ -327,23 +449,72 @@ pub(super) fn recall_report(dir: &Path) -> Option<RefineReport> {
     read_report(dir).0.or_else(|| read_quick_report(dir).0)
 }
 
-/// The frames the last check of `dir` selected (`frames_selected` of the newer of the full and the
-/// quick check's reports, by `created`, as the Findings card picks it: `RefineFloor.reports`);
-/// None when neither reads.
+/// The frames the last check of `dir` judged (`frames_checked` of the newer of the full and the
+/// quick check's reports, by `created`, as the Findings card picks it: `RefineFloor.reports`); None
+/// when neither reads. Judged, not selected: a quick check judges only the frames its model never
+/// saw, and a cancelled or failed full check only its finished folds' frames. Read again only when
+/// either file changed ([`COVERED`]): the strip asks on every poll.
 pub(super) fn check_covered(dir: &Path) -> Option<u64> {
-    let (full, quick) = (read_report(dir).0, read_quick_report(dir).0);
-    let newer = match (full, quick) {
-        (Some(f), Some(q)) => {
-            if q.created > f.created {
-                q
-            } else {
-                f
-            }
-        }
-        (Some(r), None) | (None, Some(r)) => r,
-        (None, None) => return None,
+    check_covered_in(&COVERED, dir, &|p| read_report_at(p).0)
+}
+
+/// A report file as [`COVERED`] keys it: not there, or its length and modification time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStamp {
+    Missing,
+    File(u64, SystemTime),
+}
+
+/// The stamp of `path`; None when it cannot be told (then nothing is kept).
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    match std::fs::metadata(path) {
+        Ok(m) => Some(FileStamp::File(m.len(), m.modified().ok()?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(FileStamp::Missing),
+        Err(_) => None,
+    }
+}
+
+/// [`check_covered`]'s answer per review folder, with the stamps of the two reports it was read
+/// from (full, quick).
+type CoveredCache = Mutex<BTreeMap<std::path::PathBuf, ([FileStamp; 2], Option<u64>)>>;
+
+/// The process's [`check_covered`] answers.
+static COVERED: CoveredCache = Mutex::new(BTreeMap::new());
+/// Most folders whose answer is kept.
+const COVERED_KEEP: usize = 8;
+
+/// [`check_covered`] with its cache and its reader (`read`: the report at a path, None when it is
+/// not there, damaged or newer): stamps first, then the reads, so a file changed between the two is
+/// kept under its older stamp and read again next time.
+fn check_covered_in(
+    cache: &CoveredCache,
+    dir: &Path,
+    read: &dyn Fn(&Path) -> Option<RefineReport>,
+) -> Option<u64> {
+    let paths = [report::report_path(dir), report::quick_report_path(dir)];
+    let stamps = match (file_stamp(&paths[0]), file_stamp(&paths[1])) {
+        (Some(f), Some(q)) => Some([f, q]),
+        _ => None,
     };
-    Some(newer.frames_selected as u64)
+    if let Some(st) = stamps
+        && let Some((_, frames)) = cache.lock_recover().get(dir).filter(|(k, _)| *k == st)
+    {
+        return *frames;
+    }
+    let newer = match (read(&paths[0]), read(&paths[1])) {
+        (Some(f), Some(q)) => Some(if q.created > f.created { q } else { f }),
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (None, None) => None,
+    };
+    let frames = newer.map(|r| r.frames_checked as u64);
+    if let Some(st) = stamps {
+        let mut kept = cache.lock_recover();
+        if kept.len() >= COVERED_KEEP && !kept.contains_key(dir) {
+            kept.clear();
+        }
+        kept.insert(dir.to_path_buf(), (st, frames));
+    }
+    frames
 }
 
 /// A configured model a quick check can use exists ([`quick_models`], kept [`MODELS_TTL`]).
@@ -1630,11 +1801,24 @@ mod tests {
         assert_eq!(open_counts(&review, &classes, &none, "t1:running").add, 2);
     }
 
-    /// [`open_cached`] until it answers `want` (a walk on its own thread), at most a minute.
-    fn cached_until(review: &Path, classes: &[String], stamp: &str, want: usize) -> Open {
+    /// A store of its own: the process's is shared by every test.
+    fn store() -> &'static OpenStore {
+        Box::leak(Box::new(OpenStore::new()))
+    }
+
+    /// [`open_cached_in`] until it answers `want` (a walk on its own thread), at most a minute.
+    fn cached_until(
+        store: &'static OpenStore,
+        review: &Path,
+        classes: &[String],
+        stamp: &str,
+        want: usize,
+    ) -> Open {
         let until = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Some(o) = open_cached(review, classes, &[], stamp).filter(|o| o.add == want) {
+            if let Some(o) =
+                open_cached_in(store, review, classes, &[], stamp).filter(|o| o.add == want)
+            {
                 return o;
             }
             assert!(Instant::now() < until, "no count of {want} in 60 s");
@@ -1642,10 +1826,25 @@ mod tests {
         }
     }
 
-    /// The strip's read never waits: nothing before the first walk, then the kept answer, and a
-    /// stale one at once while the next walk runs on its own thread.
+    /// As if the strip's last walk of every key started `ago`.
+    fn started_ago(store: &OpenStore, ago: Duration) {
+        for at in store.started.lock_recover().values_mut() {
+            *at = Instant::now() - ago;
+        }
+    }
+
+    /// As if every kept answer were `ago` old.
+    fn kept_ago(store: &OpenStore, ago: Duration) {
+        for k in store.kept.lock_recover().values_mut() {
+            k.at = Instant::now() - ago;
+        }
+    }
+
+    /// The strip's read never waits: nothing before the first walk, then the kept answer, nothing
+    /// once the queue's checks changed while the next walk runs on its own thread.
     #[test]
-    fn the_cached_counts_never_wait_and_a_stale_answer_starts_a_walk() {
+    fn the_cached_counts_never_wait_and_a_changed_queue_starts_a_walk() {
+        let store = store();
         let dir = scratch();
         let review = dir.join("dataset");
         frame_with(
@@ -1655,40 +1854,152 @@ mod tests {
             vec![suggestion(Kind::Add, None, Some(FAR))],
         );
         let classes = vec!["car".to_string()];
-        let first = open_cached(&review, &classes, &[], "").map(|o| o.add);
+        let first = open_cached_in(store, &review, &classes, &[], "").map(|o| o.add);
         assert!(matches!(first, Some(1) | None), "{first:?}");
-        assert_eq!(cached_until(&review, &classes, "", 1).frames, 1);
+        assert_eq!(cached_until(store, &review, &classes, "", 1).frames, 1);
         frame_with(
             &review,
             "patio",
             "c2",
             vec![suggestion(Kind::Add, None, Some(FAR))],
         );
-        // Fresh: the kept answer, no walk (None only when another test dropped every kept count:
-        // `forget_counts` is process-wide).
-        let fresh = open_cached(&review, &classes, &[], "").map(|o| o.add);
-        assert!(matches!(fresh, Some(1) | None), "{fresh:?}");
-        // A check started: the old answer at once, the new one once its walk is done.
-        let stale = open_cached(&review, &classes, &[], "t1:running").map(|o| o.add);
-        assert!(matches!(stale, Some(1 | 2) | None), "{stale:?}");
-        assert_eq!(cached_until(&review, &classes, "t1:running", 2).add, 2);
+        // Fresh: the kept answer, no walk.
+        let fresh = open_cached_in(store, &review, &classes, &[], "").map(|o| o.add);
+        assert_eq!(fresh, Some(1));
+        // A check started: no number, and a walk once the last one is a minute old.
+        started_ago(store, STRIP_WALK_EVERY);
+        let stale = open_cached_in(store, &review, &classes, &[], "t1:running").map(|o| o.add);
+        assert_eq!(stale, None, "the count of the queue before");
+        assert_eq!(
+            cached_until(store, &review, &classes, "t1:running", 2).add,
+            2
+        );
         // Many readers at once: none waits for a walk, and the one walk they start answers.
+        started_ago(store, STRIP_WALK_EVERY);
+        let walks = store.walks.load(Ordering::SeqCst);
         let readers: Vec<_> = (0..8)
             .map(|_| {
                 let (review, classes) = (review.clone(), classes.clone());
-                std::thread::spawn(move || open_cached(&review, &classes, &[], "t1:done"))
+                std::thread::spawn(move || open_cached_in(store, &review, &classes, &[], "t1:done"))
             })
             .collect();
         for r in readers {
             let got = r.join().unwrap().map(|o| o.add);
             assert!(matches!(got, Some(2) | None), "{got:?}");
         }
-        assert_eq!(cached_until(&review, &classes, "t1:done", 2).add, 2);
+        assert_eq!(cached_until(store, &review, &classes, "t1:done", 2).add, 2);
+        assert_eq!(store.walks.load(Ordering::SeqCst), walks + 1, "one walk");
     }
 
-    /// The covered count is the newer report's selection, whichever mode wrote it.
+    /// The strip polls every 30 s on every Train tab: a kept count of the same queue answers it
+    /// with no walk up to [`STRIP_OPEN_TTL`] old, and the strip starts at most one walk a minute.
     #[test]
-    fn the_last_check_covers_the_newer_reports_frames() {
+    fn the_strip_walks_only_for_a_count_past_its_age_and_at_most_once_a_minute() {
+        let store = store();
+        let dir = scratch();
+        let review = dir.join("dataset");
+        frame_with(
+            &review,
+            "patio",
+            "d1",
+            vec![suggestion(Kind::Add, None, Some(FAR))],
+        );
+        let classes = vec!["car".to_string()];
+        assert_eq!(open_counts_in(store, &review, &classes, &[], "").add, 1);
+        assert_eq!(store.walks.load(Ordering::SeqCst), 1);
+        // Past the Refine tab's minute, inside the strip's age: the count, no walk.
+        kept_ago(store, STRIP_OPEN_TTL - Duration::from_secs(30));
+        for _ in 0..3 {
+            let got = open_cached_in(store, &review, &classes, &[], "").map(|o| o.add);
+            assert_eq!(got, Some(1));
+        }
+        assert!(store.started.lock_recover().is_empty(), "no walk started");
+        assert!(store.refreshing.lock_recover().is_empty());
+        assert_eq!(store.walks.load(Ordering::SeqCst), 1);
+        // Past it: the old count while one walk runs.
+        kept_ago(store, STRIP_OPEN_TTL);
+        let old = open_cached_in(store, &review, &classes, &[], "").map(|o| o.add);
+        assert_eq!(old, Some(1));
+        let until = Instant::now() + Duration::from_secs(60);
+        while store.walks.load(Ordering::SeqCst) < 2 || !store.refreshing.lock_recover().is_empty()
+        {
+            assert!(Instant::now() < until, "no walk in 60 s");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Dropped (a save answered a suggestion): nothing, and no second walk inside the minute.
+        store.forget();
+        for _ in 0..3 {
+            assert_eq!(open_cached_in(store, &review, &classes, &[], ""), None);
+        }
+        assert!(store.refreshing.lock_recover().is_empty());
+        assert_eq!(store.walks.load(Ordering::SeqCst), 2);
+        // A minute on, the next read starts one.
+        started_ago(store, STRIP_WALK_EVERY);
+        assert_eq!(cached_until(store, &review, &classes, "", 1).add, 1);
+        assert_eq!(store.walks.load(Ordering::SeqCst), 3);
+    }
+
+    /// A walk that began before a drop keeps its answer to itself: it may have read a frame
+    /// before the save that caused the drop.
+    #[test]
+    fn a_walk_from_before_a_drop_is_not_kept() {
+        let store = store();
+        let review = scratch().join("dataset");
+        let classes = vec!["car".to_string()];
+        let mid_walk = || {
+            store.forget();
+            Open {
+                add: 5,
+                ..Open::default()
+            }
+        };
+        assert_eq!(
+            open_counts_with(store, &review, &classes, &[], "", mid_walk).add,
+            5
+        );
+        assert!(store.kept.lock_recover().is_empty(), "not kept");
+        let walk = || Open {
+            add: 7,
+            ..Open::default()
+        };
+        assert_eq!(
+            open_counts_with(store, &review, &classes, &[], "", walk).add,
+            7
+        );
+        assert_eq!(
+            open_counts_in(store, &review, &classes, &[], "").add,
+            7,
+            "kept"
+        );
+    }
+
+    /// A save changes the open count only when the file held, or holds, an unanswered suggestion.
+    #[test]
+    fn a_save_drops_the_count_only_around_unanswered_suggestions() {
+        let open = || suggestion(Kind::Add, None, Some(FAR));
+        let answered = || {
+            let mut s = open();
+            s.answer = Some(Answer::Dismissed);
+            s
+        };
+        let file = |list: Vec<Suggestion>| LabelFile {
+            refine: list,
+            ..LabelFile::default()
+        };
+        let (none, done, live) = (file(vec![]), file(vec![answered()]), file(vec![open()]));
+        assert!(!save_changes_open(None, &none));
+        assert!(!save_changes_open(Some(&none), &none));
+        assert!(!save_changes_open(Some(&done), &done), "all answered");
+        assert!(save_changes_open(Some(&live), &done), "answered now");
+        assert!(save_changes_open(Some(&live), &live), "a box moved");
+        assert!(save_changes_open(Some(&none), &live));
+        assert!(save_changes_open(None, &live));
+    }
+
+    /// The covered count is the newer report's judged frames (not its selection), whichever mode
+    /// wrote it.
+    #[test]
+    fn the_last_check_covers_the_newer_reports_judged_frames() {
         let dir = scratch();
         let review = dir.join("dataset");
         std::fs::create_dir_all(&review).unwrap();
@@ -1697,7 +2008,8 @@ mod tests {
             let mut r: RefineReport = serde_json::from_value(report_json()).unwrap();
             r.created = created.into();
             r.mode = mode;
-            r.frames_selected = frames;
+            r.frames_selected = frames + 1000;
+            r.frames_checked = frames;
             r.write(&review).unwrap();
         };
         put(Mode::Folds, "2026-11-11T10:00:00Z", 120);
@@ -1712,12 +2024,60 @@ mod tests {
         );
     }
 
+    /// The strip asks on every poll: the reports are read again only when one changed (length or
+    /// time), a missing one appeared, or one went.
+    #[test]
+    fn the_covered_count_reads_the_reports_only_when_one_changed() {
+        let dir = scratch();
+        let review = dir.join("dataset");
+        std::fs::create_dir_all(&review).unwrap();
+        let cache: CoveredCache = Mutex::new(BTreeMap::new());
+        let reads = std::cell::Cell::new(0usize);
+        let read = |p: &Path| {
+            reads.set(reads.get() + 1);
+            read_report_at(p).0
+        };
+        let covered = || check_covered_in(&cache, &review, &read);
+        assert_eq!(covered(), None);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(covered(), None);
+        assert_eq!(reads.get(), 2, "nothing changed");
+        let put = |frames: usize| {
+            let mut r: RefineReport = serde_json::from_value(report_json()).unwrap();
+            r.mode = Mode::Folds;
+            r.frames_checked = frames;
+            r.write(&review).unwrap();
+        };
+        put(120);
+        assert_eq!(covered(), Some(120));
+        assert_eq!(reads.get(), 4);
+        assert_eq!(covered(), Some(120));
+        assert_eq!(reads.get(), 4, "the report did not change");
+        // Same length, another time.
+        let path = report::report_path(&review);
+        put(130);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+        assert_eq!(covered(), Some(130));
+        assert_eq!(reads.get(), 6);
+        // Damaged: read once, None, kept.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(covered(), None);
+        assert_eq!(covered(), None);
+        assert_eq!(reads.get(), 8);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(covered(), None);
+        assert_eq!(reads.get(), 10, "the file went");
+    }
+
     #[test]
     fn at_most_a_handful_of_answers_are_kept_and_the_oldest_go_first() {
         let mut map = BTreeMap::new();
         let base = Instant::now();
         let kept = |secs: u64| Kept {
-            at: base - OPEN_TTL + Duration::from_secs(secs),
+            at: base - STRIP_OPEN_TTL + Duration::from_secs(secs),
             stamp: String::new(),
             open: Open::default(),
         };
@@ -1725,7 +2085,7 @@ mod tests {
         map.insert(
             "expired".to_string(),
             Kept {
-                at: base - OPEN_TTL - Duration::from_secs(1),
+                at: base - STRIP_OPEN_TTL - Duration::from_secs(1),
                 ..kept(0)
             },
         );

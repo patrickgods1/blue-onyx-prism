@@ -1723,7 +1723,7 @@ mod tests {
         let mut r = frame(vec![], true);
         r.labels.review_pick = Some(ReviewPick::Random);
         let mut u = frame(vec![], true);
-        u.labels.review_pick = Some(ReviewPick::Unknown);
+        u.labels.review_pick = Some(ReviewPick::Other("stratified".into()));
         let m = benchmark_manifest(&[&f, &r, &u], &classes(), "review-x");
         assert_eq!(m.images[1].tags.last().map(String::as_str), Some("random"));
         for i in [0, 2] {
@@ -1744,7 +1744,7 @@ mod tests {
             named("c.jpg", Some(ReviewPick::Random), false),
             named("a.jpg", Some(ReviewPick::Random), true),
             named("b.jpg", None, true),
-            named("d.jpg", Some(ReviewPick::Unknown), false),
+            named("d.jpg", Some(ReviewPick::Other("stratified".into())), false),
         ];
         let notes = frame_notes(&frames);
         assert_eq!(notes.version, FRAMES_VERSION);
