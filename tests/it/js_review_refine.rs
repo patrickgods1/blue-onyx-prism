@@ -5,7 +5,8 @@
 //! current, what `y` and `w` act on, what the card says per kind, what an answer does to the file
 //! and the page flags, and that the reviewer's own edits end a suggestion by themselves. Also the
 //! session line's other page decision without a twin, `boxDecisions` (effort counted in boxes),
-//! and which frames a save marks as random picks (`servedPicks`, `servedAsPick`).
+//! which frames a save marks as random picks (`servedPicks`, `servedAsPick`), and when the Details
+//! line may say the last auto-label run found nothing (`autoRunFoundNothing`).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -203,6 +204,7 @@ console.log(JSON.stringify(req.map((r) => {
       saves: (r.loads || []).map((l) => (R.servedAsPick(picks, l.frame) ? 'random' : (l.own === undefined ? null : l.own))),
     };
   }
+  if (r.op === 'found_nothing') return R.autoRunFoundNothing(r.labels);
   if (r.op === 'sends') return R.sendsFilter(r.name, r.value, r.auto);
   if (r.op === 'for_save') return R.refineForSave(clone(r.labels));
   throw new Error('unknown op ' + r.op);
@@ -988,4 +990,51 @@ fn a_served_random_pick_is_marked_on_every_save_of_the_session() {
     assert_eq!(got[2], json!({"picks": [], "saves": [null]}));
     assert_eq!(got[3]["picks"], json!(["b", "c"]));
     assert_eq!(got[3]["saves"], json!([null, "random"]));
+}
+
+/// "auto-label found nothing of: ..." only when the last run neither proposed a box nor voted on
+/// one: a re-label (`model:<name>@<device>`) or a labelers run that found an object somebody had
+/// boxed already annotates that box (`labelers`), and saying it found nothing was false there.
+#[test]
+fn auto_run_found_nothing_counts_the_boxes_it_voted_on() {
+    if !have_node() {
+        return;
+    }
+    let model_run =
+        json!({"at": "t", "labeler": "model:mine-4@ort:cuda:0", "classes": ["person", "car"]});
+    let labelers_run =
+        json!({"at": "t", "labeler": "mm-gdino-tiny + rfdetr-large", "classes": ["car"]});
+    let model_box = |labelers: Value| json!({"label": "car", "bbox": [0.0, 0.0, 10.0, 10.0], "source": "model", "state": "pending", "labelers": labelers});
+    let got = node(&json!([
+        // A re-label that voted on the model's box: it found it.
+        {"op": "found_nothing", "labels": {"auto_run": model_run, "boxes": [model_box(json!({"mine-4": 0.9}))]}},
+        // A vote of another model (an earlier run) is not this run's.
+        {"op": "found_nothing", "labels": {"auto_run": model_run, "boxes": [model_box(json!({"other": 0.9}))]}},
+        // A labelers run's votes are keyed by labeler (`gdino`, `rfdetr`).
+        {"op": "found_nothing", "labels": {"auto_run": labelers_run, "boxes": [model_box(json!({"rfdetr": 0.7}))]}},
+        // A box the run proposed.
+        {"op": "found_nothing", "labels": {"auto_run": labelers_run, "boxes": [
+            {"label": "car", "bbox": [0.0, 0.0, 10.0, 10.0], "source": "auto", "state": "pending"}]}},
+        // Nothing at all, and boxes without votes.
+        {"op": "found_nothing", "labels": {"auto_run": labelers_run, "boxes": []}},
+        {"op": "found_nothing", "labels": {"auto_run": model_run, "boxes": [model_box(json!({}))]}},
+        // No run, a run of the time before class lists: nothing said. An empty key is no vote.
+        {"op": "found_nothing", "labels": {"boxes": []}},
+        {"op": "found_nothing", "labels": {"auto_run": {"at": "t", "labeler": "x"}, "boxes": []}},
+        {"op": "found_nothing", "labels": {"auto_run": model_run, "boxes": [model_box(json!({"": 0.5}))]}},
+    ]));
+    assert_eq!(
+        got,
+        vec![
+            json!(false),
+            json!(true),
+            json!(false),
+            json!(false),
+            json!(true),
+            json!(true),
+            json!(false),
+            json!(false),
+            json!(true)
+        ]
+    );
 }
