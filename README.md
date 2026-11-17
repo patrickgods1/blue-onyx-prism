@@ -659,7 +659,7 @@ per row or **Apply recommended devices to all models** (offers a restart). Bench
 competes for the CPU/GPU with live requests. Results go to `benchmark.json` next to the config file;
 the CLI and the UI read and write the same file (it stays there: `auto` device ordering reads it).
 **Advanced > Save report** writes the same standalone HTML report as `--report` into a folder you choose
-(Browse...) as `benchmark-report-<UTC time>.html`; a folder added as a dataset must also be browsable or picked.
+(Browse...) as `benchmark-report-<YYYYMMDD-HHMMSS>.html` (wall time in `timezone`); a folder added as a dataset must also be browsable or picked.
 
 - **Datasets** (`benchmark.datasets`, CLI `--dataset`): the built-in, pinned and SHA-256-checked sets
   `coco-cctv` (COCO val2017 CCTV-relevant subset, 180 images), `bmd45-cctv` (real 1080p CCTV,
@@ -1278,7 +1278,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
 | POST | `/v1/benchmark/datasets/remove` | `dataset`: the saved folder dataset to drop from `benchmark.datasets` (e.g. `dir:/srv/alerts`; the list may end up empty); 404 for a built-in id or a folder that is not saved |
-| POST | `/v1/benchmark/report` | `dir`: write the HTML report of the saved results there as `benchmark-report-<UTC time>.html` (folder inside the browsable folders or natively picked); `{success, path}`, 404 without results |
+| POST | `/v1/benchmark/report` | `dir`: write the HTML report of the saved results there as `benchmark-report-<YYYYMMDD-HHMMSS>.html`, wall time in `timezone` (folder inside the browsable folders or natively picked); `{success, path}`, 404 without results |
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the best confidence of every measured device, `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |

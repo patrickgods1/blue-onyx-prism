@@ -2488,7 +2488,7 @@ mod tests {
         use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame};
         use labels::{BoxState, Triage};
         let d = ds();
-        let today = crate::collect::utc_date(std::time::SystemTime::now());
+        let today = crate::clock::display_date(chrono::Utc::now());
         // Decisions dated today: put_frame's fixed date would fall out of the window.
         let dated = |stem: &str| {
             let rel = put_frame(

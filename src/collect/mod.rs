@@ -61,20 +61,6 @@ pub fn utc_rfc3339(t: SystemTime) -> String {
         .to_string()
 }
 
-/// Day folder name (UTC `YYYY-MM-DD`).
-pub fn utc_date(t: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t)
-        .format("%Y-%m-%d")
-        .to_string()
-}
-
-/// File-name timestamp (`20261022T123456789Z`, UTC, milliseconds).
-pub fn utc_file_ts(t: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t)
-        .format("%Y%m%dT%H%M%S%3fZ")
-        .to_string()
-}
-
 fn round1(x: f32) -> f32 {
     (x * 10.0).round() / 10.0
 }
@@ -502,8 +488,6 @@ mod tests {
     fn timestamps() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_millis(1_790_000_000_123);
         assert_eq!(utc_rfc3339(t), "2026-09-21T14:13:20.123Z");
-        assert_eq!(utc_date(t), "2026-09-21");
-        assert_eq!(utc_file_ts(t), "20260921T141320123Z");
     }
 
     /// M2: a long upload name is cut before it reaches the sidecar (the camera folder has its own,

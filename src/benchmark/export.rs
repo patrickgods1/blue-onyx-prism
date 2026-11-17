@@ -463,7 +463,7 @@ fn machine_section(r: &BenchmarkResults) -> Section {
                     .map(|f| format!(" ({f})"))
                     .unwrap_or_default(),
                 r.version,
-                crate::collect::health::when_text(crate::clock::zone(), &r.timestamp)
+                crate::clock::display_stored(&r.timestamp)
             ),
         ],
         tables: vec![],
@@ -564,7 +564,7 @@ fn model_section(m: &ModelResult) -> Section {
         m.images,
         m.repeat,
         m.warmup,
-        crate::collect::health::when_text(crate::clock::zone(), &m.timestamp)
+        crate::clock::display_stored(&m.timestamp)
     )];
     if let Some(e) = &m.error {
         paragraphs.push(format!("Not benchmarked: {e}"));

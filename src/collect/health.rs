@@ -121,12 +121,6 @@ pub fn home_line(enabled: bool, stopped: bool, frames: u64) -> String {
     format!("{state}, {frames} {unit} so far")
 }
 
-/// A stored UTC time (RFC 3339) as people read it in `zone` ([`crate::clock::Zone::display`]),
-/// `raw` itself when it is not one. Stored values stay UTC; pages show this.
-pub fn when_text(zone: crate::clock::Zone, raw: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(raw).map_or_else(|_| raw.to_string(), |t| zone.display(t))
-}
-
 /// The newest frame's time: the last one saved by this process, else the newest in the folder.
 fn last_frame_at(s: &Status) -> Option<String> {
     s.last_saved_at.clone().or_else(|| {
@@ -164,8 +158,8 @@ impl Health {
         let last_frame_at = last_frame_at(s);
         let last_error_at = s.last_error.as_ref().map(|e| e.at.clone());
         Self {
-            last_frame_when: last_frame_at.as_deref().map(|t| when_text(zone, t)),
-            last_error_when: last_error_at.as_deref().map(|t| when_text(zone, t)),
+            last_frame_when: last_frame_at.as_deref().map(|t| zone.display_stored(t)),
+            last_error_when: last_error_at.as_deref().map(|t| zone.display_stored(t)),
             note: note(
                 enabled,
                 s.disabled.is_some(),
@@ -184,20 +178,6 @@ impl Health {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stored_times_are_shown_in_the_zone() {
-        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
-        assert_eq!(
-            when_text(la, "2026-11-16T22:02:11.583Z"),
-            "2026-11-16 14:02 PST"
-        );
-        assert_eq!(
-            when_text(crate::clock::Zone::Utc, "2026-11-16T22:02:11Z"),
-            "2026-11-16 22:02 UTC"
-        );
-        assert_eq!(when_text(la, "yesterday"), "yesterday");
-    }
 
     fn counts(requests: u64, offered: u64, saved: u64) -> Counts {
         Counts {

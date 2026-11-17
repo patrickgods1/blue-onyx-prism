@@ -279,7 +279,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
             name: name.clone(),
             frames: t.frames,
             mb: format!("{:.1}", t.bytes as f64 / MB),
-            newest: crate::collect::health::when_text(zone, &t.newest),
+            newest: zone.display_stored(&t.newest),
         })
         .collect();
     let groups = Bucket::ALL
@@ -301,7 +301,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
                         sidecar_url: format!("/dataset/sidecar?path={q}"),
                         caption: format!(
                             "{} \u{b7} {} \u{b7} {} \u{b7} {labels}",
-                            crate::collect::health::when_text(zone, &f.timestamp),
+                            zone.display_stored(&f.timestamp),
                             f.camera,
                             f.scene
                         ),

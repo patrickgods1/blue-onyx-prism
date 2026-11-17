@@ -1459,7 +1459,7 @@ fn view_with(
                 finished: r
                     .finished
                     .as_deref()
-                    .map(|t| crate::collect::health::when_text(crate::clock::zone(), t))
+                    .map(crate::clock::display_stored)
                     .unwrap_or_default(),
                 in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
                 warnings: warnings_of(r),

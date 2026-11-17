@@ -58,8 +58,7 @@ impl ImportLine {
     /// `created` (stored UTC) for people, in `zone` ([`Zone::display`], `2026-11-16 14:02 PST`);
     /// the stored text when it is not RFC 3339.
     pub fn created_in(&self, zone: Zone) -> String {
-        chrono::DateTime::parse_from_rfc3339(&self.created)
-            .map_or_else(|_| self.created.clone(), |t| zone.display(t))
+        zone.display_stored(&self.created)
     }
 
     /// [`Self::created_in`] the process-wide zone, for the import lists of the Import and

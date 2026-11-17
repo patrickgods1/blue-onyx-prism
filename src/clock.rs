@@ -194,6 +194,19 @@ impl Zone {
         )
     }
 
+    /// A stored time (RFC 3339, UTC or any offset) as [`Self::display`] shows it; `raw` itself
+    /// when it is not one. Stored record timestamps stay UTC; pages, the CLI and reports show this.
+    ///
+    /// ```
+    /// # use blue_onyx_prism::clock::Zone;
+    /// let la: Zone = "America/Los_Angeles".parse().unwrap();
+    /// assert_eq!(la.display_stored("2026-11-16T22:02:11.583Z"), "2026-11-16 14:02 PST");
+    /// assert_eq!(la.display_stored("yesterday"), "yesterday");
+    /// ```
+    pub fn display_stored(self, raw: &str) -> String {
+        DateTime::parse_from_rfc3339(raw).map_or_else(|_| raw.to_string(), |t| self.display(t))
+    }
+
     /// The date of `t` in this zone, `YYYY-MM-DD`.
     ///
     /// ```
@@ -473,6 +486,11 @@ pub fn display(t: impl Into<DateTime<Utc>>) -> String {
     zone().display(t)
 }
 
+/// [`Zone::display_stored`] in the process-wide zone.
+pub fn display_stored(raw: &str) -> String {
+    zone().display_stored(raw)
+}
+
 /// [`Zone::display_date`] in the process-wide zone.
 pub fn display_date(t: impl Into<DateTime<Utc>>) -> String {
     zone().display_date(t)
@@ -641,7 +659,7 @@ mod tests {
     #[test]
     fn frame_stamps_round_trip() {
         let t = at("2026-11-16T22:02:11.583Z");
-        // UTC: exactly the old `collect::utc_file_ts` form.
+        // UTC: exactly the form collector stems had before the zone setting (`...123Z`).
         assert_eq!(Zone::Utc.frame_stamp(t), "20261116T220211583Z");
         assert_eq!(
             Zone::Utc.frame_stamp(t),
