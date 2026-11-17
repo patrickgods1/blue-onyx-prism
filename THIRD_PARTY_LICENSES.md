@@ -134,7 +134,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | anstyle-query | 1.1.5 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git |
 | anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
-| arc-swap | 1.9.3 | MIT OR Apache-2.0 | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.5 | MIT OR Apache-2.0 | https://github.com/vorner/arc-swap |
 | argon2 | 0.6.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/password-hashes |
 | askama | 0.16.1 | MIT OR Apache-2.0 | https://github.com/askama-rs/askama |
 | askama_derive | 0.16.1 | MIT OR Apache-2.0 | https://github.com/askama-rs/askama |
@@ -184,6 +184,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | combine | 4.6.8 | MIT | https://github.com/Marwes/combine |
 | console | 0.16.6 | MIT | https://github.com/console-rs/console |
 | const-oid | 0.10.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
+| constant_time_eq | 0.6.1 | CC0-1.0 OR MIT-0 OR Apache-2.0 | https://codeberg.org/cesarb/constant_time_eq |
 | core-foundation | 0.10.1 | MIT OR Apache-2.0 | https://github.com/servo/core-foundation-rs |
 | core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 | https://github.com/servo/core-foundation-rs |
 | core-graphics | 0.25.0 | MIT OR Apache-2.0 | https://github.com/servo/core-foundation-rs |
@@ -223,7 +224,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | field-offset | 0.3.6 | MIT OR Apache-2.0 | https://github.com/Diggsey/rust-field-offset |
 | filetime | 0.2.29 | MIT/Apache-2.0 | https://github.com/alexcrichton/filetime |
 | find-msvc-tools | 0.1.14 | MIT OR Apache-2.0 | https://github.com/rust-lang/cc-rs |
-| flate2 | 1.1.10 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs |
+| flate2 | 1.1.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs |
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv |
 | foreign-types | 0.5.0 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types |
 | foreign-types-macros | 0.2.4 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types |
@@ -272,13 +273,13 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | hyper-util | 0.1.21 | MIT | https://github.com/hyperium/hyper-util |
 | iana-time-zone | 0.1.65 | MIT OR Apache-2.0 | https://github.com/strawlab/iana-time-zone |
 | iana-time-zone-haiku | 0.1.2 | MIT OR Apache-2.0 | https://github.com/strawlab/iana-time-zone |
-| icu_collections | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| icu_locale_core | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| icu_normalizer | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| icu_normalizer_data | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| icu_properties | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| icu_properties_data | 2.3.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| icu_provider | 2.3.1 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_collections | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_locale_core | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_normalizer | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_normalizer_data | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_properties | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_properties_data | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| icu_provider | 2.4.0 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | idna | 1.1.0 | MIT OR Apache-2.0 | https://github.com/servo/rust-url/ |
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT | https://github.com/hsivonen/idna_adapter |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image |
@@ -412,7 +413,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex |
 | reqwest | 0.13.1 | MIT OR Apache-2.0 | https://github.com/seanmonstar/reqwest |
 | ring | 0.17.14 | Apache-2.0 AND ISC | https://github.com/briansmith/ring |
-| rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
+| rpassword | 7.5.5 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
 | rtoolbox | 0.0.6 | Apache-2.0 | https://github.com/conradkleinespel/rtoolbox |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | https://github.com/rust-lang/rustc-hash |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 | https://github.com/djc/rustc-version-rs |
@@ -474,7 +475,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | time | 0.3.55 | MIT OR Apache-2.0 | https://github.com/time-rs/time |
 | time-core | 0.1.9 | MIT OR Apache-2.0 | https://github.com/time-rs/time |
 | time-macros | 0.2.32 | MIT OR Apache-2.0 | https://github.com/time-rs/time |
-| tinystr | 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| tinystr | 0.8.5 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/tinyvec |
 | tokio | 1.54.1 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-macros | 2.7.2 | MIT | https://github.com/tokio-rs/tokio |
@@ -515,7 +516,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | url | 2.5.8 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | https://github.com/hsivonen/utf8_iter |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | https://github.com/alacritty/vte |
-| uuid | 1.29.0 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.2 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
 | valuable | 0.1.1 | MIT | https://github.com/tokio-rs/valuable |
 | version-compare | 0.2.1 | MIT | https://gitlab.com/timvisee/version-compare |
 | version_check | 0.9.5 | MIT/Apache-2.0 | https://github.com/SergioBenitez/version_check |
@@ -587,15 +588,16 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | x509-parser | 0.18.1 | MIT OR Apache-2.0 | https://github.com/rusticata/x509-parser.git |
 | xattr | 1.6.1 | MIT OR Apache-2.0 | https://github.com/Stebalien/xattr |
 | yasna | 0.6.0 | MIT OR Apache-2.0 | https://github.com/qnighy/yasna.rs |
-| yoke | 0.8.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| yoke | 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | yoke-derive | 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerofrom | 0.1.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerofrom-derive | 0.1.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zeroize | 1.9.1 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
+| zeroize_derive | 1.5.0 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | zerotrie | 0.2.5 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| zerovec | 0.11.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| zerovec-derive | 0.11.6 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| zip | 9.2.2 | MIT | https://github.com/zip-rs/zip2 |
+| zerovec | 0.11.9 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| zerovec-derive | 0.11.7 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| zip | 9.5.1 | MIT | https://github.com/zip-rs/zip2 |
 | zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij |
 | zopfli | 0.8.3 | Apache-2.0 | https://github.com/zopfli-rs/zopfli |
