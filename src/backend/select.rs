@@ -177,7 +177,7 @@ pub struct OrtProbe {
     pub error: Option<String>,
     /// Installed package flavor ("cpu", "gpu", "directml", "coreml"), when known.
     pub flavor: Option<String>,
-    /// Version of the library the statuses come from ("1.31.0"), when known. A hypothetical
+    /// Version of the library the statuses come from ("1.31.1"), when known. A hypothetical
     /// probe (resolver) carries the version of the CUDA flavor it assumes, so the compute
     /// capability gate judges the build that would actually load.
     pub version: Option<String>,
@@ -1104,7 +1104,7 @@ mod tests {
             o.reason.as_deref(),
             Some(
                 "NVIDIA GeForce GTX 1070 Ti is compute capability 6.1; the installed ONNX \
-                 Runtime 1.24.4 CUDA build needs 7.5+; ONNX Runtime 1.31.0 has kernels for it: \
+                 Runtime 1.24.4 CUDA build needs 7.5+; ONNX Runtime 1.31.1 has kernels for it: \
                  update onnxruntime-cuda (Resources on the Config page, or `blue-onyx-prism \
                  fetch --resource onnxruntime-cuda`) and restart"
             )
@@ -1158,7 +1158,7 @@ mod tests {
             let reason = ort_cuda_unsupported(&hw, &hw.gpus[0], None).unwrap();
             assert!(
                 reason.contains(
-                    "the ONNX Runtime 1.31.0 CUDA build has kernels for 6.1, 7.5, 8.6, 8.9, \
+                    "the ONNX Runtime 1.31.1 CUDA build has kernels for 6.1, 7.5, 8.6, 8.9, \
                      12.0 only; use ort:directml or OpenVINO"
                 ),
                 "{reason}"
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(
             ort_cuda_unsupported(&hw, &hw.gpus[0], None).as_deref(),
             Some(
-                "NVIDIA GeForce GTX 980 is compute capability 5.2; the ONNX Runtime 1.31.0 CUDA \
+                "NVIDIA GeForce GTX 980 is compute capability 5.2; the ONNX Runtime 1.31.1 CUDA \
                  build needs 6.1+; use ort:directml or OpenVINO"
             )
         );

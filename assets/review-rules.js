@@ -193,6 +193,23 @@
     return out.length > keep ? out.slice(out.length - keep) : out;
   }
 
+  // Whether the file's last auto-label run (`auto_run`, with the classes it looked for) found
+  // nothing, so the page may say so (no Rust twin; page only). A run that found an object
+  // somebody had boxed already does not add a box: it annotates that one (`apply` merges a
+  // same-object proposal) and votes on it (`labelers`, keyed `gdino`, `rfdetr`, `sam3` or a
+  // trained model's name, each named in the run's `labeler`: `mm-gdino-tiny + rfdetr-large`,
+  // `model:<name>@<device>`). So a box it proposed (`source: auto`) or one holding a vote of a
+  // labeler of the run counts as found; only with neither did it find nothing.
+  function autoRunFoundNothing(labels) {
+    var ar = labels && labels.auto_run;
+    if (!ar || !Array.isArray(ar.classes) || !ar.classes.length) return false;
+    var run = typeof ar.labeler === 'string' ? ar.labeler : '';
+    return !(labels.boxes || []).some(function (b) {
+      if (b.source === 'auto') return true;
+      return Object.keys(b.labelers || {}).some(function (k) { return k !== '' && run.indexOf(k) >= 0; });
+    });
+  }
+
   // Whether `frame` goes to the save as a random pick (`review_pick: 'random'`): the queue served
   // it as one in this page session (`picks`, from `servedPicks`), however the reviewer came back
   // to it (Back after passing it with Next, a reload). Marking on the way the reviewer moves
@@ -964,6 +981,7 @@
     pendingDupDrops: pendingDupDrops,
     markServed: markServed,
     boxDecisions: boxDecisions,
+    autoRunFoundNothing: autoRunFoundNothing,
     servedPicks: servedPicks,
     servedAsPick: servedAsPick,
     liveSuggestions: liveSuggestions,

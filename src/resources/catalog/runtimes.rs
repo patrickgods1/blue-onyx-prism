@@ -202,11 +202,11 @@ pub(crate) static ONNXRUNTIME: &[Resource] = &[
         Platform::WINDOWS_X64,
         Flavor::Cuda,
         &[ort_release!(
-            "1.31.0",
-            "onnxruntime-win-x64-gpu_cuda12-1.31.0.zip",
+            "1.31.1",
+            "onnxruntime-win-x64-gpu_cuda12-1.31.1.zip",
             ArchiveKind::Zip,
-            "fa79097fa478961cbd31c297671ac169eb0d3f1dfdc9e8481e091850f8c4810b",
-            392994831
+            "5cbf65edc93dc7bb3296249b1b6e1b2228e575902af64d6163d0da2103cef9d5",
+            392924457
         )],
         "ONNX Runtime CUDA/TensorRT (CUDA 12)",
     ),
@@ -247,11 +247,11 @@ pub(crate) static ONNXRUNTIME: &[Resource] = &[
         Platform::LINUX_X64,
         Flavor::Cuda,
         &[ort_release!(
-            "1.31.0",
-            "onnxruntime-linux-x64-gpu_cuda12-1.31.0.tgz",
+            "1.31.1",
+            "onnxruntime-linux-x64-gpu_cuda12-1.31.1.tgz",
             ArchiveKind::TarGz,
-            "62d3af5269af2143b5d37494337573f1ffb8885f3ad7477ae0cb1cc79c8dedfd",
-            450228883
+            "57cd51f677eca19a269cdba31b0c16c15d73a8feea41f170aa8b750447ab1f70",
+            450233079
         )],
         "ONNX Runtime CUDA/TensorRT (CUDA 12)",
     ),
@@ -339,10 +339,10 @@ const fn cuda_libs(platform: Platform, parts: &'static [Part]) -> Resource {
 }
 
 /// `nvidia-cuda-libs`: what ONNX Runtime's CUDA provider uses: cudart, cuBLAS/cuBLASLt, cuRAND
-/// and NVRTC are linked (import tables of the 1.31.0 provider libraries), cuDNN 9 and cuFFT are
-/// loaded at run time (linked in 1.24.4), plus nvJitLink (cuFFT's dependency). cuDNN stays at
-/// 9.10 (`CUDNN_VERSION`): the last with Pascal kernels. The driver's `libcuda` / `nvcuda.dll` is
-/// not included.
+/// and NVRTC are linked (import tables of the 1.31.0 and 1.31.1 provider libraries), cuDNN 9
+/// and cuFFT are loaded at run time (linked in 1.24.4), plus nvJitLink (cuFFT's dependency).
+/// cuDNN stays at 9.10 (`CUDNN_VERSION`): the last with Pascal kernels. The driver's `libcuda` /
+/// `nvcuda.dll` is not included.
 pub(crate) static CUDA_LIBS: &[Resource] = &[
     cuda_libs(
         Platform::WINDOWS_X64,

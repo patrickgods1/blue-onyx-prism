@@ -64,7 +64,7 @@ pub const ONNXRUNTIME_VERSION: &str = "1.24.4";
 /// from the CUDA 13 ones since 1.25). Newer than the other flavors on purpose: 1.23 through 1.27
 /// built the Windows package for Turing (7.5) and up, 1.28+ builds it with Pascal (`sm_61`)
 /// kernels again, so GTX 10-series cards run CUDA (see [`ORT_CUDA_BUILDS`]).
-pub const ONNXRUNTIME_CUDA_VERSION: &str = "1.31.0";
+pub const ONNXRUNTIME_CUDA_VERSION: &str = "1.31.1";
 
 /// Pinned ONNX Runtime version of `flavor`.
 pub const fn onnxruntime_version(flavor: Flavor) -> &'static str {
@@ -206,6 +206,24 @@ pub(crate) static ORT_CUDA_BUILDS: &[OrtCudaBuild] = &[
             ptx: &[],
         },
     },
+    // Windows x64, 1.31.1 (`onnxruntime-win-x64-gpu_cuda12-1.31.1.zip`, the catalog's): the same
+    // GPU code as 1.31.0. The shipped `onnxruntime_providers_cuda.dll` was scanned without
+    // cuobjdump (fatbinary headers, magic 0xBA55ED50, every entry walked to the container's end;
+    // the same scan of the 1.31.0 DLL gives the identical tally): 607 fatbinaries, 175 of them
+    // the general kernels with SASS sm_61, sm_75, sm_86, sm_89 and sm_120; the rest are
+    // architecture-specific (290 sm_90 only, 91 sm_86/89/120, 38 sm_75/86/89 + PTX compute_120,
+    // 9 sm_120, 4 sm_75/86/89/120), none adds a GPU below 6.1 or makes 7.0, 8.0, 9.0 or 10.0
+    // runnable. Imports the same CUDA libraries as 1.31.0. Run on a GTX 1070 Ti with cuDNN 9.8
+    // (RF-DETR nano, YOLOv5): same detections as the CPU and as 1.31.0, same speed.
+    OrtCudaBuild {
+        os: "windows",
+        lane: CudaLane::Cuda12,
+        version: "1.31.1",
+        archs: CudaArchs {
+            sass: &[cc(6, 1), cc(7, 5), cc(8, 6), cc(8, 9), cc(12, 0)],
+            ptx: &[],
+        },
+    },
     // Linux x64, 1.24.4 (`onnxruntime-linux-x64-gpu-1.24.4.tgz`): `CUDA_ARCHS="60-real;70-real;
     // 75-real;80-real;90a-real;90-virtual"` for CUDA 12.8 in
     // `tools/ci_build/github/linux/build_cuda_c_api_package.sh` on rel-1.24.4 (`sm_90a` runs on
@@ -228,6 +246,28 @@ pub(crate) static ORT_CUDA_BUILDS: &[OrtCudaBuild] = &[
         os: "linux",
         lane: CudaLane::Cuda12,
         version: "1.31.0",
+        archs: CudaArchs {
+            sass: &[
+                cc(6, 0),
+                cc(7, 0),
+                cc(7, 5),
+                cc(8, 0),
+                cc(8, 6),
+                cc(8, 9),
+                cc(9, 0),
+                cc(12, 0),
+            ],
+            ptx: &[],
+        },
+    },
+    // Linux x64, 1.31.1 (`onnxruntime-linux-x64-gpu_cuda12-1.31.1.tgz`, the catalog's): the
+    // shipped `libonnxruntime_providers_cuda.so` scanned as the Windows row: 609 fatbinaries, 175
+    // general ones with SASS sm_60, 70, 75, 80, 86, 89, 90 and 120, the rest architecture-specific
+    // subsets of those (292 sm_90 only); no PTX. Same list as 1.31.0, minimum 6.0.
+    OrtCudaBuild {
+        os: "linux",
+        lane: CudaLane::Cuda12,
+        version: "1.31.1",
         archs: CudaArchs {
             sass: &[
                 cc(6, 0),
@@ -295,8 +335,8 @@ pub(crate) const TOOL_ID_PREFIX: &str = "tool:";
 pub const UV_ID: &str = "tool:uv";
 /// Install directory of `tool:uv` under the download root.
 pub const UV_DEST: &str = "tools/uv";
-/// Pinned uv release (2026-10-22).
-pub const UV_VERSION: &str = "0.13.5";
+/// Pinned uv release (2026-10-27).
+pub const UV_VERSION: &str = "0.13.6";
 /// `(os, arch)` as in `std::env::consts::{OS, ARCH}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Platform {
@@ -887,6 +927,9 @@ mod tests {
                 false, true, true, true, true, true, true, true, true, true, true, false, true
             ]
         );
+        // 1.31.1: the same GPU code as 1.31.0 on both OSes.
+        assert_eq!(archs("windows", "1.31.1"), win);
+        assert_eq!(archs("linux", "1.31.1"), linux);
         assert!(TENSORRT_MIN_CC > cc(6, 1) && TENSORRT_MIN_CC <= cc(7, 5));
     }
 
@@ -953,7 +996,7 @@ mod tests {
         );
         assert_eq!(
             find("onnxruntime-cuda", "windows", "x86_64").unwrap().parts[0].file_name,
-            "onnxruntime-win-x64-gpu_cuda12-1.31.0.zip"
+            "onnxruntime-win-x64-gpu_cuda12-1.31.1.zip"
         );
         assert!(find("onnxruntime-cuda", "macos", "aarch64").is_none());
     }

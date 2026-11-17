@@ -167,7 +167,7 @@ The input is `HardwareInfo` (detected GPUs) plus `RuntimeProbe` (OpenVINO `avail
    Intel Arc → `openvino:gpu.N` (`DEVICE_TYPE=discrete`), then `ort:directml:<idx>`;
    AMD or other → `ort:directml:<idx>` (Windows). An NVIDIA GPU whose compute capability the ORT CUDA
    build has no kernels for (`catalog::ORT_CUDA_BUILDS`: the loaded CUDA flavor's version, else the
-   catalog's 1.31.0 whose Windows build covers 6.1/7.5/8.6/8.9/12.0) is not runnable on CUDA, one below
+   catalog's 1.31.1 whose Windows build covers 6.1/7.5/8.6/8.9/12.0) is not runnable on CUDA, one below
    7.5 not on TensorRT 10, and a driver below CUDA 12 runs neither; such a card starts at DirectML. An
    installed older CUDA build is reported with an update hint and re-planned by the resolver.
 2. **Integrated GPUs**: Intel via OpenVINO (`openvino:gpu`), then DirectML on Windows for the ones
@@ -215,7 +215,7 @@ The result is shown on the welcome page.
 
 ### Getting ORT libraries (`src/setup_onnxruntime.rs`, `setup-onnxruntime` subcommand)
 
-The pins live in `src/resources/catalog/`: ORT 1.24.4 (with DirectML 1.15.4) for the cpu/directml/coreml flavors, because the DirectML package stops at 1.24.4 (1.25+ ships no DirectML provider), and ORT 1.31.0 for the cuda flavor (`gpu_cuda12` archives), whose Windows build has Pascal kernels again (1.23-1.27 were Turing+). The `ort` crate is built without an `api-NN` feature (floor 1.17), so flavors of different versions load.
+The pins live in `src/resources/catalog/`: ORT 1.24.4 (with DirectML 1.15.4) for the cpu/directml/coreml flavors, because the DirectML package stops at 1.24.4 (1.25+ ships no DirectML provider), and ORT 1.31.1 for the cuda flavor (`gpu_cuda12` archives), whose Windows build has Pascal kernels again (1.23-1.27 were Turing+). The `ort` crate is built without an `api-NN` feature (floor 1.17), so flavors of different versions load.
 
 This mirrors `setup_openvino.rs`: a pinned version constant, whitelisted extraction, and nothing executed. It installs to `<exe_dir>/onnxruntime`. A process can load only one ORT library, so `--flavor auto|cpu|cuda|directml` picks the package from `HardwareInfo`:
 - **Windows**: NVIDIA → `onnxruntime-win-x64-gpu` (CPU, CUDA and TensorRT). Otherwise the `Microsoft.ML.OnnxRuntime.DirectML` nupkg plus `DirectML.dll`.
