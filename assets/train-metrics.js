@@ -55,9 +55,7 @@
   }
   // Wall-clock time `eta_s` seconds from now ("14:20"; "Sat 09:05" when over 20 h away).
   function doneAt(etaS) {
-    var d = new Date(Date.now() + etaS * 1000);
-    var t = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    return etaS > 20 * 3600 ? d.toLocaleDateString([], { weekday: "short" }) + " " + t : t;
+    return globalThis.PrismTime ? globalThis.PrismTime.doneAt(etaS, Date.now()) : "";
   }
 
   // id -> {id, label, short, hb, format} from the server's list; raw keys describe themselves.

@@ -3544,11 +3544,11 @@
     var origin = p
       ? 'imported (' + (p.url || p.dataset || p.path || r.source) + (p.time_offset_s != null ? ' at ' + p.time_offset_s + ' s' : '') + '; licence ' + (p.license || '?') + ')'
       : r.model + ' on ' + r.device;
-    var parts = [cur.frame, r.timestamp, r.scene, r.camera, origin,
+    var parts = [cur.frame, globalThis.PrismTime ? PrismTime.when(r.timestamp) : r.timestamp, r.scene, r.camera, origin,
       p ? '' : 'threshold ' + fmtScore(r.threshold), (r.buckets || []).join(', '),
       cur.saved ? ('saved: ' + cur.labels.status) : 'not reviewed yet'];
     var ar = cur.labels && cur.labels.auto_run;
-    if (ar) parts.push('auto-labelled' + (ar.labeler ? ' by ' + ar.labeler : '') + (ar.at ? ' ' + ar.at : ''));
+    if (ar) parts.push('auto-labelled' + (ar.labeler ? ' by ' + ar.labeler : '') + (ar.at ? ' ' + (globalThis.PrismTime ? PrismTime.when(ar.at) : ar.at) : ''));
     if (R.autoRunFoundNothing(cur.labels)) {
       parts.push('auto-label found nothing of: ' + ar.classes.join(', '));
     }

@@ -357,7 +357,7 @@ document.addEventListener("click", function (e) {
     if (!list || box.hidden) { box.replaceChildren(); box.append(el("strong", null, "Changed elsewhere \u2014 the page now shows the new values (your unsaved edits are kept and marked):")); list = el("ul"); box.append(list);
       var x = el("button", "small", "Dismiss"); x.type = "button"; x.addEventListener("click", function () { box.hidden = true; }); box.append(x); }
     news.forEach(function (c) {
-      list.append(el("li", null, sourceLabel(c.source) + ": " + (c.summary || "no visible change") + " (revision " + c.revision + ", " + new Date(c.time).toLocaleTimeString() + ")"));
+      list.append(el("li", null, sourceLabel(c.source) + ": " + (c.summary || "no visible change") + " (revision " + c.revision + ", " + PrismTime.clock(c.time) + ")"));
       (c.fields || []).forEach(function (f) {
         var m = /^model:[^:]*:(.*)$/.exec(f.key);
         var row = m && card.querySelector('tr[data-model="' + CSS.escape(m[1]) + '"]');

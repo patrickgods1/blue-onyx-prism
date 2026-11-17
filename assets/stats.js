@@ -73,7 +73,7 @@
           else if (a.title !== b.title) a.title = b.title;
         }
       });
-      live.textContent = "updated " + new Date().toLocaleTimeString();
+      live.textContent = "updated " + PrismTime.clock(Date.now());
     }).catch(function (e) {
       live.textContent = "server not answering" + (e && /^HTTP /.test(e.message) ? " (" + e.message + ")" : "");
       throw e; // the poller backs off

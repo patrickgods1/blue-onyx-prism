@@ -279,8 +279,7 @@
     return 'about ' + (Math.round(s / 360) / 10) + ' h';
   }
   function when(iso) {
-    var d = new Date(iso);
-    return isNaN(d.getTime()) ? String(iso || '') : d.toLocaleString();
+    return globalThis.PrismTime ? globalThis.PrismTime.when(iso) : String(iso || '');
   }
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
   function list(text) {
