@@ -3549,7 +3549,7 @@
       cur.saved ? ('saved: ' + cur.labels.status) : 'not reviewed yet'];
     var ar = cur.labels && cur.labels.auto_run;
     if (ar) parts.push('auto-labelled' + (ar.labeler ? ' by ' + ar.labeler : '') + (ar.at ? ' ' + ar.at : ''));
-    if (ar && ar.classes && ar.classes.length && !cur.labels.boxes.some(function (b) { return b.source === 'auto'; })) {
+    if (R.autoRunFoundNothing(cur.labels)) {
       parts.push('auto-label found nothing of: ' + ar.classes.join(', '));
     }
     if (cur.labels && cur.labels.bulk_accepted) parts.push('bulk accepted');
