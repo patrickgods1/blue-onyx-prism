@@ -113,7 +113,7 @@
     decideMore.className = 'rv-decide-more';
     decide.parentNode.insertBefore(decideMore, decide.nextSibling);
   }
-  // "Accept likely" and "Show N hidden", beside the box list.
+  // "Show N hidden", right under the card.
   var boxTools = $('rv-box-tools');
   if (!boxTools) {
     boxTools = document.createElement('div');
@@ -345,18 +345,76 @@
 
   // The message slot under the side panel: one line in the same place always (the full text in its
   // title), green for a save (`ok`), red for an error. After MSG_DIM_MS a message (not an error) dims
-  // in place: nothing moves when it comes or goes.
-  var MSG_DIM_MS = 4000;
-  var msgTimer = null;
+  // in place: nothing moves when it comes or goes. A message longer than the line opens over the
+  // panel above it (`rv-msg-open`: a copy of the line, `.rv-msg-full`, out of the flow, grows upward
+  // from the slot, so nothing moves, not even the line, and the buttons under the slot stay
+  // uncovered) until the next key, tap or frame, or MSG_OPEN_MS; it dims once it is back on its
+  // line. The content sits in one inner line (`msgLine`); the copy's buttons (Reload frame) press
+  // the line's.
+  var MSG_DIM_MS = 4000, MSG_OPEN_MS = 8000;
+  var msgTimer = null, msgOpenTimer = null, msgDim = false;
+  function msgLine() {
+    var line = msg.querySelector(':scope > .rv-msg-in');
+    if (!line) { line = el('span', 'rv-msg-in'); msg.appendChild(line); }
+    return line;
+  }
   function say(text, isError, ok) {
     if (text && noHover.matches) TOUCH_WORDS.forEach(function (w) { text = text.replace(w[0], w[1]); });
+    closeMsg(true);
+    msgSeq++;
     msg.textContent = '';
-    if (text) msg.appendChild(el('span', 'rv-msg-text', text));
+    if (text) msgLine().appendChild(el('span', 'rv-msg-text', text));
     msg.title = text || '';
     msg.className = 'form-msg' + (isError ? ' error-text' : (ok ? ' ok-text' : ''));
     if (msgTimer) clearTimeout(msgTimer);
-    msgTimer = text && !isError ? setTimeout(function () { msgTimer = null; msg.classList.add('rv-msg-old'); }, MSG_DIM_MS) : null;
+    msgDim = false;
+    msgTimer = text && !isError ? setTimeout(function () {
+      msgTimer = null;
+      msgDim = true;
+      if (!msg.classList.contains('rv-msg-open')) msg.classList.add('rv-msg-old');
+    }, MSG_DIM_MS) : null;
+    if (text) fitMsg();
   }
+  // Opens the message when its line cuts it (after the buttons a caller adds: call again then).
+  function fitMsg() {
+    var t = msg.querySelector('.rv-msg-text');
+    if (!t || msg.classList.contains('rv-msg-open')) return;
+    var line = msgLine();
+    if (t.scrollWidth <= t.clientWidth + 1 && line.scrollWidth <= line.clientWidth + 1) return;
+    var full = el('div', 'rv-msg-full');
+    var copy = line.cloneNode(true);
+    var mine = line.querySelectorAll('button'), theirs = copy.querySelectorAll('button');
+    Array.prototype.forEach.call(theirs, function (b, n) {
+      b.addEventListener('click', function (ev) { ev.stopPropagation(); if (mine[n]) mine[n].click(); });
+    });
+    full.appendChild(copy);
+    msg.appendChild(full);
+    msg.classList.add('rv-msg-open');
+    msg.classList.remove('rv-msg-old');
+    msgOpenTimer = setTimeout(function () { msgOpenTimer = null; closeMsg(); }, MSG_OPEN_MS);
+  }
+  // Back to one line (`quiet`: a new message comes, no dimming).
+  function closeMsg(quiet) {
+    if (msgOpenTimer) { clearTimeout(msgOpenTimer); msgOpenTimer = null; }
+    if (!msg.classList.contains('rv-msg-open')) return;
+    msg.classList.remove('rv-msg-open');
+    var full = msg.querySelector('.rv-msg-full');
+    if (full) full.remove();
+    if (!quiet && msgDim) msg.classList.add('rv-msg-old');
+  }
+  // The next key or tap closes an open message: before what it does says something new. A tap on a
+  // button the message carries acts first (the message moves when it closes).
+  document.addEventListener('keydown', function () { closeMsg(); }, true);
+  document.addEventListener('pointerdown', function (ev) {
+    if (!msg.classList.contains('rv-msg-open')) return;
+    if (ev.target && ev.target.closest && ev.target.closest('#rv-msg button')) return;
+    closeMsg();
+  }, true);
+  var msgSeq = 0, msgSeqAtClick = -1;
+  msg.addEventListener('click', function () { msgSeqAtClick = msgSeq; }, true);
+  msg.addEventListener('click', function (ev) {
+    if (ev.target && ev.target.closest && ev.target.closest('button') && msgSeq === msgSeqAtClick) closeMsg();
+  });
 
   // An error that keeps the answer: `status`, `conflict` and the JSON body (`body`).
   function api(url, opts) {
@@ -636,25 +694,47 @@
     say(text + (suggestions.length ? ' ' + suggestions.length + ' more suggestion(s) on this frame.' : ''));
   }
 
-  // The decision bar's block: what is suggested, why, a warning in the weak band, the key.
-  function suggestionBlock() {
+  // The card's block for the suggestion on screen: a one-line head (what is suggested, how many),
+  // its answer (in the bar at the screen's foot while it shows: `inBar`), then why and the warnings,
+  // which may take any height under the answer.
+  function suggestionText(g) {
+    return g.drop >= 0 ? 'Drop box ' + (g.drop + 1) + ', keep box ' + (g.keep + 1) + '?'
+      : 'Two objects: keep boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + '?';
+  }
+  function suggestionBlock(inBar) {
     var g = shownSuggestion();
     if (!g) return null;
     var s = g.s, box = el('div', 'rv-q-sug');
-    box.appendChild(el('div', 'rv-q-sug-head', g.drop >= 0
+    box.appendChild(sugHead(g.drop >= 0
       ? 'Suggested: drop box ' + (g.drop + 1) + ', keep box ' + (g.keep + 1) + '.'
-      : 'Suggested: two objects, keep boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + '.'));
+      : 'Suggested: two objects, keep boxes ' + (g.a + 1) + ' and ' + (g.b + 1) + '.',
+      suggestions.length > 1 ? (suggestions.indexOf(g) + 1) + ' of ' + suggestions.length : ''));
+    var yes = decideButton(g.drop >= 0 ? 'Accept: drop box ' + (g.drop + 1) : 'Accept: keep both', 'y', 'ok', acceptOverlap);
+    if (inBar) barBtns.appendChild(yes);
+    else {
+      var row = el('div', 'rv-q-btns rv-q-sug-btns');
+      row.appendChild(yes);
+      box.appendChild(row);
+    }
+    // The whole suggestion when its line cuts it (a phone shows no title).
+    box.appendChild(el('div', 'rv-q-sug-full', box.firstChild.title));
     if (s.why) box.appendChild(el('div', 'muted', s.why + '.'));
     if (s.low_confidence) box.appendChild(el('div', 'rv-chip warn', 'Lower confidence: the closer look gave no answer, only the detectors count.'));
     if (s.weak) {
       box.appendChild(el('div', 'rv-chip bad', 'Look closely: something (' + fmtScore(s.other_score) +
         ') was seen on the box to drop. 6 of 17 such drops removed a real object.'));
     }
-    var row = el('div', 'rv-q-btns');
-    row.appendChild(decideButton(g.drop >= 0 ? 'Accept: drop box ' + (g.drop + 1) : 'Accept: keep both', 'y', 'ok', acceptOverlap));
-    if (suggestions.length > 1) row.appendChild(el('span', 'muted', (suggestions.length - 1) + ' more on this frame'));
-    box.appendChild(row);
     return box;
+  }
+
+  // A suggestion block's first line: the suggestion, cut to one line (the whole of it in the
+  // title), and where it is among the frame's (`count`), so the answers under it keep their place.
+  function sugHead(text, count) {
+    var h = el('div', 'rv-q-sug-head');
+    h.appendChild(el('span', 'rv-q-sug-q', text));
+    if (count) h.appendChild(el('span', 'rv-q-sug-n muted', count));
+    h.title = text;
+    return h;
   }
 
   // ---- the dataset check's suggestions (labels.refine) --------------------------------------
@@ -800,12 +880,10 @@
     var at = adjusting(), b = boxes()[at];
     if (!b) return null;
     var box = el('div', 'rv-q-sug rv-q-refine');
-    box.appendChild(el('div', 'rv-q-sug-head', 'Fit the new ' + b.label + ' box (box ' + (at + 1) + ')'));
     var rest = R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff);
-    box.appendChild(el('div', 'muted', (noHover.matches ? 'Drag it or its handles to fit the object, then Accept box' : 'Drag it or its handles to fit the object, then Accept box (y)') +
-      (rest ? ': the next suggestion follows (' + rest.n + ' left).' : ': no suggestion left on this frame.') + ' z undoes.'));
-    if (!rest) box.appendChild(el('div', 'muted', REFINE_MISSES));
-    var row = el('div', 'rv-q-btns');
+    box.appendChild(sugHead('Fit the new ' + b.label + ' box (box ' + (at + 1) + ')', rest ? rest.n + ' left' : ''));
+    // The answers right under the head line (their place does not depend on the text under them).
+    var row = el('div', 'rv-q-btns rv-q-sug-btns');
     var answers = inBar ? barBtns : row;
     answers.appendChild(decideButton('Accept box', 'y', 'ok', finishAdjust));
     if (selected !== at) {
@@ -814,6 +892,9 @@
       row.appendChild(show);
     }
     if (row.childNodes.length) box.appendChild(row);
+    box.appendChild(el('div', 'muted', (noHover.matches ? 'Drag it or its handles to fit the object, then Accept box' : 'Drag it or its handles to fit the object, then Accept box (y)') +
+      (rest ? ': the next suggestion follows (' + rest.n + ' left).' : ': no suggestion left on this frame.') + ' z undoes.'));
+    if (!rest) box.appendChild(el('div', 'muted', REFINE_MISSES));
     return box;
   }
 
@@ -843,15 +924,17 @@
     var l = refineCur.l, card = R.refineCard(l, boxes(), noHover.matches);
     if (!card) return null;
     var box = el('div', 'rv-q-sug rv-q-refine');
-    box.appendChild(el('div', 'rv-q-sug-head', card.head));
-    if (l.why) box.appendChild(el('div', 'muted', l.why));
-    box.appendChild(el('div', 'muted', ['Dataset check', card.score, refineCur.k + ' of ' + refineCur.n + ' on this frame']
-      .filter(Boolean).join(' · ')));
-    if (card.note) box.appendChild(el('div', 'rv-q-refine-note', card.note));
-    var row = el('div', 'rv-q-btns');
+    // One line (the question, cut; whole in the title), the answers, then the evidence, which may
+    // take any height: the answers keep their place from one suggestion to the next.
+    box.appendChild(sugHead(card.head, refineCur.k + ' of ' + refineCur.n));
+    var row = el('div', 'rv-q-btns rv-q-sug-btns');
     var answers = inBar ? barBtns : row;
-    answers.appendChild(decideButton(card.yes, 'y', 'ok', function () { answerRefine(true); }));
-    answers.appendChild(decideButton(card.no, 'w', card.no_bad ? 'bad' : 'secondary', function () { answerRefine(false); }));
+    var yesB = decideButton(card.yes, 'y', 'ok', function () { answerRefine(true); });
+    var noB = decideButton(card.no, 'w', card.no_bad ? 'bad' : 'secondary', function () { answerRefine(false); });
+    // Their cells may cut a long answer: the whole of it in the title.
+    yesB.title = card.yes; noB.title = card.no;
+    answers.appendChild(yesB);
+    answers.appendChild(noB);
     if (!refineInView()) {
       var show = decideButton('Show it', null, 'secondary', focusRefine);
       show.title = 'Select the box this suggestion is about and bring it into view';
@@ -863,6 +946,12 @@
       row.appendChild(later);
     }
     if (row.childNodes.length) box.appendChild(row);
+    // The whole question when its line cuts it (a phone shows no title).
+    box.appendChild(el('div', 'rv-q-sug-full', card.head));
+    if (l.why) box.appendChild(el('div', 'muted', l.why));
+    box.appendChild(el('div', 'muted', ['Dataset check', card.score, refineCur.k + ' of ' + refineCur.n + ' on this frame']
+      .filter(Boolean).join(' · ')));
+    if (card.note) box.appendChild(el('div', 'rv-q-refine-note', card.note));
     return box;
   }
 
@@ -1895,15 +1984,11 @@
   }
   showListToggle(0);
 
-  // "Accept likely (N)" and "Show N hidden" beside the box list.
+  // "Show N hidden" under the card ("Accept likely" is in the card or the dock's Save row).
   function renderTools() {
     boxTools.textContent = '';
     var likely = boxes().filter(isLikely).length, n = dismissedCount();
-    if (likely) {
-      var acc = decideButton('Accept likely (' + likely + ')', 'c', 'ok rv-tool-likely', acceptLikely);
-      acc.title = 'Accept every likely box (★) on this frame; the other boxes stay pending';
-      boxTools.appendChild(acc);
-    }
+    // (Accept likely itself is in the card's row under the answers, renderDecision.)
     // The bottom bar's copy (phones and tablets).
     if (likelyBar) {
       likelyBar.hidden = !likely;
@@ -1916,8 +2001,7 @@
       show.title = 'Boxes set aside unseen: by the auto-labelers for a score below ' + DISMISS_SCORE + ' (about 5% were real on public sets) or at a spot you keep rejecting, or by the size floor as too small. Accept one if it is real.';
       boxTools.appendChild(show);
     }
-    boxTools.hidden = !likely && !n;
-    boxTools.classList.toggle('rv-only-likely', !!likely && !n);
+    boxTools.hidden = !n;
   }
 
   // The "Anything missing?" question, with the frame's dismissed boxes when they are off.
@@ -1992,10 +2076,11 @@
 
   // One column while a box is selected and boxes still need a decision (or a check): the selected
   // box's main answers sit in the bar at the screen's foot, Save & next and its row go in the flow.
-  // A dataset check suggestion on screen takes the bar with its two answers.
+  // A suggestion on screen takes the bar with its answers (a dataset check's two, an overlap's
+  // one): the card under the fold would hide them.
   function deciding() {
     if (!oneColumn.matches || !cur) return false;
-    if (refineCur || adjusting() >= 0) return true;
+    if (refineCur || adjusting() >= 0 || shownSuggestion()) return true;
     if (!boxes()[selected]) return false;
     var p = progress();
     return p.undecided + p.unchecked > 0;
@@ -2071,11 +2156,28 @@
     if (n) n.textContent = !cur ? '' : (p.undecided ? p.undecided + ' to decide' : (p.unchecked ? p.unchecked + ' to check' : (p.total ? 'all done' : '')));
   }
 
-  // The decision bar: the selected box's question, its answers, the frame's progress.
+  // The decision card: the selected box's question, its answers, the frame's progress. Top to
+  // bottom, each answer at the same place for every box and frame:
+  // - the question's line (qHead, one line), then the answers in a fixed grid right under it (no
+  //   box: a note of the grid's height in its place, two columns);
+  // - a suggestion's block (overlap or dataset check: its one-line head, then its answers, then its
+  //   evidence); one column: its answers are in the bar at the screen's foot, the block takes the
+  //   card's second row (between the main answers and the others) when they are in the card;
+  // - the row of what comes and goes after an answer: "It's a <class>" of the labelers, the class
+  //   grid (two columns; one column: a sheet over the screen's foot), the reason chips after a
+  //   rejection, one column Accept likely (while the bar holds the answers);
+  // - the "why" text, which may take any height (two columns: the card keeps a minimum height,
+  //   so the box list under it stays put).
   function renderDecision() {
     decide.textContent = '';
     decideMore.textContent = '';
+    // The card itself inside its slot (#rv-decide keeps the slot's minimum height, so the room a
+    // short card leaves is under its border, not inside it).
+    var card = el('div', 'rv-card');
+    decide.appendChild(card);
+    if (classSheet) classSheet.hidden = true;
     var more = decideMore;
+    var oneCol = oneColumn.matches;
     var inBar = deciding();
     // The dock changes from the answers to the Save row (or back): taps on it wait a moment.
     if (root.classList.contains('rv-deciding') !== inBar) guardDock();
@@ -2088,44 +2190,45 @@
     renderDockHead(p0);
     if (!cur) {
       // The card keeps its size while the first frame comes (nothing under it moves then).
-      if (oneColumn.matches) return;
-      decide.appendChild(qHead('', [document.createTextNode(noneShown ? 'No frame' : 'Loading…')], '', null));
-      decide.appendChild(el('div', 'rv-q-body'));
-      decide.appendChild(el('div', 'rv-q-reason-slot'));
+      if (oneCol) { decide.textContent = ''; return; }
+      card.appendChild(qHead('', [document.createTextNode(noneShown ? 'No frame' : 'Loading…')], '', null));
+      card.appendChild(el('div', 'rv-q-body rv-q-none'));
       return;
     }
-    var sugBlock = suggestionBlock();
-    if (sugBlock) decide.appendChild(sugBlock);
-    // The dataset check's suggestion (none while an overlap suggestion shows): its answers take the
-    // bar, the selected box's go in the card.
-    var refBlock = refineBlock(inBar && !!decideBar);
-    if (refBlock) decide.appendChild(refBlock);
-    else if (!sugBlock) {
-      var done = refineDoneBlock();
-      if (done) decide.appendChild(done);
-    }
+    // The suggestion on screen (an overlap one first; a dataset check's only when none shows): its
+    // answers take the bar while it shows one.
+    var sugInBar = inBar && !!decideBar;
+    var sugBlock = suggestionBlock(sugInBar);
+    var refBlock = refineBlock(sugInBar);
+    var block = sugBlock || refBlock || refineDoneBlock();
+    var blockHasBar = sugInBar && !!(sugBlock || refBlock);
     var p = p0;
     var b = boxes()[selected];
     if (inBar) renderBarHead(b, p);
+    var tap = noHover.matches;
+    // What comes and goes under the answers (the order of the comment above).
+    var tools = el('div', 'rv-q-tools');
+    var why = [];
+    var body = el('div', 'rv-q-body');
+    var btns = null;
     if (!b) {
-      // A proposed box (an add) needs no "no box selected": its card says what to do.
       var off = dismissedOn ? 0 : dismissedCount();
-      var tap = noHover.matches;
-      if (!refBlock) {
-        // The card's line says where the frame is; the text under it what to do.
-        var title = p.undecided || p.unchecked ? 'No box selected'
-          : (missingAsked === cur.frame ? 'Anything missing?' : (p.total ? 'Every box decided' : 'No box'));
-        decide.appendChild(qHead('', [document.createTextNode(title)], '', null));
-        var body = el('div', 'rv-q-body');
-        body.appendChild(el('div', 'rv-q-note', p.undecided || p.unchecked
+      // The card's line says where the frame is; the text in the answers' place what to do.
+      var title = refBlock ? 'No box selected'
+        : (p.undecided || p.unchecked ? 'No box selected'
+          : (missingAsked === cur.frame ? 'Anything missing?' : (p.total ? 'Every box decided' : 'No box')));
+      card.appendChild(qHead('', [document.createTextNode(title)], '', null));
+      body.classList.add('rv-q-none');
+      body.appendChild(el('div', 'rv-q-note', refBlock
+        ? 'The dataset check proposes a box (dashed): ' + (blockHasBar ? 'its answers are at the foot of the screen.' : 'answer it below.')
+        : (p.undecided || p.unchecked
           ? (tap ? 'Tap one, or turn on Draw to draw one.' : 'j selects the next one; drag on the frame to draw one.')
           : (missingAsked === cur.frame ? missingText()
             : (p.total ? (tap ? 'Save & next saves.' : 's saves.')
               : (tap ? 'Turn on Draw to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
-                : 'Drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
-        if (!p.undecided && !p.unchecked && quarterOpen()) body.appendChild(quarterButtons());
-        decide.appendChild(body);
-      }
+                : 'Drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : '')))))));
+      if (!refBlock && !p.undecided && !p.unchecked && quarterOpen()) body.appendChild(quarterButtons());
+      card.appendChild(body);
     } else {
       var i = selected;
       // Put-away boxes are not counted: box numbers keep their place, so the total would mislead.
@@ -2139,12 +2242,10 @@
       else if (b.state === 'rejected') { verb = 'Is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
       else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
       var ask = verb.indexOf('Is') === 0 || verb.indexOf('is it') >= 0 ? '?' : '';
-      decide.appendChild(qHead('Box ' + (i + 1) + (putAway ? '' : ' / ' + boxes().length),
+      card.appendChild(qHead('Box ' + (i + 1) + (putAway ? '' : ' / ' + boxes().length),
         [document.createTextNode(verb), el('strong', null, b.label), document.createTextNode(ask)],
         b.score != null ? fmtScore(b.score) : '', tierChip(b)));
-      var body = el('div', 'rv-q-body');
-      decide.appendChild(body);
-      var why = [];
+      card.appendChild(body);
       if (isDismissed(b)) why.push(b.reason === 'spot_dismissed' ? 'hidden at a spot you rejected' : (b.reason === 'size_floor' ? 'hidden as under the size floor' : 'hidden for its score'));
       if (b.auto_label && b.auto_label !== b.label) {
         why.push('auto-labelers say ' + b.auto_label + (b.auto_score != null ? ' (' + fmtScore(b.auto_score) + ')' : ''));
@@ -2156,18 +2257,15 @@
       if (b.difficult) why.unshift('marked unsure: kept out of training, its frame goes to held-out only, ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason === 'too_small') why.unshift('too small: a real object, no negative; its frame goes to held-out only, ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason) why.unshift('why: ' + reasonText(b.reject_reason));
-      // The "why" slot: two lines (one on a phone), there even when empty.
-      var whyLine = el('div', 'rv-q-why muted', why.length ? why.join(' · ') : ' ');
-      if (why.length) whyLine.title = why.join(' · ');
-      body.appendChild(whyLine);
       var rp = b.state === 'pending' ? repeatOf(b) : null;
       // The answers in a fixed grid: Yes | No, Real, parked | It's a…, Unsure | Too small; a
       // missing one keeps its cell (an invisible stand-in), so the others never move.
-      var btns = el('div', 'rv-q-btns rv-q-answers');
+      btns = el('div', 'rv-q-btns rv-q-answers');
       var hold = function () { var h = el('span', 'rv-q-ph'); h.setAttribute('aria-hidden', 'true'); return h; };
       // The main answers: in the card, or (one column, deciding) in the bar at the foot, which
       // leaves the card the other answers as one compact row.
-      var answers = inBar && decideBar && !refBlock ? barBtns : btns;
+      var answers = inBar && decideBar && !blockHasBar ? barBtns : btns;
+      if (answers === btns) btns.classList.add('rv-q-all');
       answers.appendChild(decideButton(yes, 'a', 'ok' + (rp && rp.verdict === 'accepted' ? ' suggest' : ''), acceptSelected));
       answers.appendChild(decideButton(no, 'r', 'bad' + (rp && rp.verdict === 'rejected' ? ' suggest' : ''), rejectSelected));
       if (b.source !== 'human') {
@@ -2188,13 +2286,27 @@
           '): rejected but never a negative, its frame goes to held-out only, ignored by the benchmark';
         btns.appendChild(small);
       } else btns.appendChild(hold());
-      // The labelers' class: a row of its own after the fixed cells.
+      body.appendChild(btns);
+      // The labelers' class: one column with the answers in the bar, a cell of the card's row (it
+      // has the room); else first under the fixed cells.
       if (b.auto_label && b.auto_label !== b.label) {
         var al = b.auto_label;
         var alb = decideButton('It\'s a ' + al, null, 'ok rv-q-wide', function () { relabelNext(i, al); });
-        if (answers === btns) btns.appendChild(alb); else btns.insertBefore(alb, btns.firstChild);
+        if (answers !== btns) btns.insertBefore(alb, btns.firstChild); else tools.appendChild(alb);
       }
-      body.appendChild(btns);
+      // The class grid: two columns under the answers; one column a sheet over the screen's foot
+      // (fourteen classes are rows the card has no room for under the fold).
+      if (classGrid) {
+        var g = el('div', 'rv-q-classes');
+        visible().forEach(function (c, n) {
+          var cb = button('', function () { classGrid = false; relabelNext(i, c); canvas.focus({ preventScroll: true }); }, 'secondary' + (c === b.label ? ' active' : ''));
+          if (n < 10) cb.appendChild(kbd(String((n + 1) % 10)));
+          cb.appendChild(document.createTextNode(' ' + c));
+          g.appendChild(cb);
+        });
+        if (oneCol && classSheet) showClassSheet(g, b, i);
+        else tools.appendChild(g);
+      }
       // A box drawn (or selected) during the quarter look: the look goes on from here.
       if (quarter >= 0 && quarterOpen()) more.appendChild(quarterButtons());
       var mate = dupPartner(i);
@@ -2244,28 +2356,21 @@
         }
         if (sl.childNodes.length) more.appendChild(sl);
       }
-      if (classGrid) {
-        var g = el('div', 'rv-q-classes');
-        visible().forEach(function (c, n) {
-          var cb = button('', function () { classGrid = false; relabelNext(i, c); canvas.focus({ preventScroll: true }); }, 'secondary' + (c === b.label ? ' active' : ''));
-          if (n < 10) cb.appendChild(kbd(String((n + 1) % 10)));
-          cb.appendChild(document.createTextNode(' ' + c));
-          g.appendChild(cb);
-        });
-        more.appendChild(g);
-      }
     }
-    // Why the box just rejected (or the selected rejected box) was wrong: optional chips.
+    // Accept likely in the card's row under the answers: two columns always, one column while the
+    // bar holds the answers (the dock's Save row has it otherwise).
+    var likely = boxes().filter(isLikely).length;
+    if (likely && (!oneCol || inBar)) {
+      var acc = decideButton('Accept likely (' + likely + ')', 'c', 'ok rv-q-likely', acceptLikely);
+      acc.title = 'Accept every likely box (★) on this frame; the other boxes stay pending';
+      tools.appendChild(acc);
+    }
+    // Why the box just rejected (or the selected rejected box) was wrong: optional chips, one row
+    // (the full text is the tooltip; it scrolls sideways when they do not fit).
     var ri = reasonTarget();
-    // Two columns: a slot of one row in the card, there with or without chips, so what is under
-    // the card stays put when they come and go. One column: after the card.
-    var reasonSlot = !oneColumn.matches && !refBlock ? el('div', 'rv-q-reason-slot') : null;
-    if (reasonSlot) decide.appendChild(reasonSlot);
     if (ri >= 0) {
       var rb = boxes()[ri];
       var rr = el('div', 'rv-q-reason');
-      // One row of short chips (the full text is the tooltip; it scrolls sideways when they do not
-      // fit): the box list keeps its room.
       var cap = el('span', 'muted', (ri === selected ? 'Why?' : (ri + 1) + ' why?'));
       cap.title = 'Optional: why box ' + (ri + 1) + ' is wrong' + (touchUi.matches ? '' : ' (Shift+1-9)');
       rr.appendChild(cap);
@@ -2277,11 +2382,54 @@
         cb.appendChild(document.createTextNode(r[2]));
         rr.appendChild(cb);
       });
-      (reasonSlot || more).appendChild(rr);
-      // On a phone the chips are one row that scrolls: fade the edge with more chips past it.
+      tools.appendChild(rr);
       rr.setAttribute('data-scroll-cue', '');
-      if (window.PrismLive && window.PrismLive.scrollCue) window.PrismLive.scrollCue(rr);
     }
+    var whyLine = null;
+    if (why.length) {
+      whyLine = el('div', 'rv-q-why muted', why.join(' · '));
+      whyLine.title = why.join(' · ');
+    }
+    // One column, a box selected: the card's second row (`rv-q-slot`, one row high, on screen above
+    // the row of Back / Skip / Next) holds, with the main answers in the card, the suggestion's
+    // block (between them and the other answers); else the tools; else the why text, or what found
+    // the box (the box list is folded there). The rest follows, under the fold.
+    if (oneCol && b) {
+      var inGrid = btns.classList.contains('rv-q-all');
+      var slot = el('div', 'rv-q-slot');
+      // The suggestion in one row: its head line and the first line of its evidence (the whole
+      // block follows the other answers).
+      var mini = inGrid && block ? miniBlock(block) : null;
+      var put = mini || (tools.childNodes.length ? tools : null);
+      if (!put) {
+        put = whyLine || el('div', 'rv-q-why muted', evidence(b));
+        put.classList.add('rv-q-clamp');
+      }
+      slot.appendChild(put);
+      if (inGrid) btns.appendChild(slot); else body.appendChild(slot);
+      if (block) card.appendChild(block);
+      if (put !== tools && tools.childNodes.length) card.appendChild(tools);
+      if (put !== whyLine && whyLine) card.appendChild(whyLine);
+    } else if (oneCol) {
+      // No box: the tools under the note, then the suggestion.
+      if (tools.childNodes.length) card.appendChild(tools);
+      if (block) card.appendChild(block);
+      if (whyLine) card.appendChild(whyLine);
+    } else {
+      // Two columns: the suggestion's answers right under the box's, then the rest.
+      if (block) card.appendChild(block);
+      if (tools.childNodes.length) card.appendChild(tools);
+      if (whyLine) card.appendChild(whyLine);
+    }
+    if (ri >= 0 && window.PrismLive && window.PrismLive.scrollCue) {
+      var rrow = decide.querySelector('.rv-q-reason');
+      if (rrow) window.PrismLive.scrollCue(rrow);
+    }
+    // A suggestion's whole question under its answers when its one line cuts it.
+    Array.prototype.forEach.call(decide.querySelectorAll('.rv-q-sug-full'), function (f) {
+      var q = f.parentNode.querySelector('.rv-q-sug-q');
+      f.hidden = !q || q.scrollWidth <= q.clientWidth + 1;
+    });
     // Stacked boxes on the frame (in the progress line): keep the best of each stack, the rest
     // go as duplicates.
     var repeats = repeatRejects().length;
@@ -2319,6 +2467,42 @@
     }
   }
 
+  // One column: a suggestion block in one row of the card (the slot between the main answers and
+  // the others): its head line, then the first line of what it says.
+  function miniBlock(block) {
+    var m = el('div', block.className + ' rv-q-sug-mini');
+    m.setAttribute('aria-hidden', 'true');
+    var head = block.querySelector('.rv-q-sug-head');
+    if (head) m.appendChild(head.cloneNode(true));
+    var text = block.querySelector(':scope > .muted');
+    if (text) m.appendChild(el('div', 'muted rv-q-sug-line', text.textContent));
+    return m;
+  }
+
+  // One column: the class grid as a sheet over the screen's foot, its bottom on the row of Back /
+  // Skip / Next (out of the flow: nothing moves). A class, Close, It's a… again or Esc ends it.
+  var classSheet = null;
+  if (root) {
+    classSheet = el('div', 'rv-class-sheet');
+    classSheet.hidden = true;
+    classSheet.setAttribute('role', 'dialog');
+    classSheet.setAttribute('aria-label', 'Choose the class');
+    root.appendChild(classSheet);
+  }
+  function showClassSheet(g, b, i) {
+    classSheet.textContent = '';
+    var head = el('div', 'rv-class-sheet-head');
+    head.appendChild(el('span', null, 'Box ' + (i + 1) + ' (' + b.label + ') is a…'));
+    var close = button('Close', function () { classGrid = false; renderDecision(); canvas.focus({ preventScroll: true }); }, 'secondary');
+    head.appendChild(close);
+    classSheet.appendChild(head);
+    classSheet.appendChild(g);
+    var nav = moreRow ? moreRow.getBoundingClientRect() : null;
+    var foot = nav && nav.height ? window.innerHeight - nav.top : 0;
+    classSheet.style.bottom = Math.max(0, Math.round(foot)) + 'px';
+    classSheet.hidden = false;
+  }
+
   // The bar's head: which box the answers are about and how far the frame is, pinned at the
   // screen's foot with them (the card with the full question may be under the fold).
   function renderBarHead(b, p) {
@@ -2329,6 +2513,15 @@
     meter.appendChild(fill);
     barHead.appendChild(meter);
     var q = el('span', 'rv-bar-q');
+    // An overlap suggestion's answer is under it: what it suggests.
+    var g = shownSuggestion();
+    if (g) {
+      q.textContent = suggestionText(g);
+      barHead.appendChild(q);
+      barHead.appendChild(el('span', 'rv-bar-count', suggestions.length > 1 ? (suggestions.indexOf(g) + 1) + ' of ' + suggestions.length + ' suggestions' : 'overlap check'));
+      barHead.title = p.done + ' of ' + p.total + ' boxes done';
+      return;
+    }
     var card = refineCur ? R.refineCard(refineCur.l, boxes(), true) : null;
     if (card) {
       // The answers under it are the suggestion's.
@@ -2382,7 +2575,9 @@
   // height. Two columns: the stylesheet sizes the box (the window under the HUD).
   var STAGE_CAP = 0.6, MIN_STAGE = 0.4, OV_SHARE = 0.26, FRAME_SHARE_OV = 0.48, FRAME_SHARE = 0.6, OV_GAP = 4.8;
   var STAGE_AR = 4 / 3;
-  var CARD_PEEK = 104, DOCK_MIN = 86;   // CSS px: the card's question, why and row of answers; the dock
+  // CSS px: the card's question line and two rows under it (the answers, then Accept likely / the
+  // reason chips / a suggestion, or the main answers and that row); the dock.
+  var CARD_PEEK = 136, DOCK_MIN = 86;
   var stageAr = parseFloat((function () { try { return window.localStorage.getItem('bop.review.stage-ar'); } catch (e) { return null; } })()) || 0;
   var svhProbe = el('div', 'rv-svh-probe');
   svhProbe.setAttribute('aria-hidden', 'true');
@@ -2726,7 +2921,7 @@
       reloadSpots(cam);
       say(j.new ? 'Parked spot saved: auto-label runs accept ' + label + ' here from now on. ' : 'This spot was already marked parked, since ' + j.spot.from + '.');
       // Right here: `t` moved on to the next box, and z undoes the accept but not the spot.
-      if (j.new) msg.appendChild(button('Forget this spot', function () { forgetSpot(j.spot); }, 'small secondary'));
+      if (j.new) { msgLine().appendChild(button('Forget this spot', function () { forgetSpot(j.spot); }, 'small secondary')); fitMsg(); }
     }).catch(function (e) { say('Accepted, but the spot was not saved: ' + e.message, true); });
     setState(i, 'accepted');
   }
@@ -3953,6 +4148,7 @@
         if (backStack.length > 200) backStack.shift();
       }
       cur = j;
+      closeMsg();
       if (j.labels && R.servedAsPick(randomPicks, j.frame)) j.labels.review_pick = 'random';
       // Suggestions keep to the boxes the server named (`overlap_live_boxes`).
       R.markServed(j.labels);
@@ -4140,11 +4336,12 @@
   function showConflict(text) {
     say(text, true);
     var frame = cur && cur.frame;
-    msg.appendChild(button('Reload frame', function () {
+    msgLine().appendChild(button('Reload frame', function () {
       if (!frame) return;
       loadFrame(frame).then(function () { say('Reloaded the frame; your edits were dropped.'); })
         .catch(function (e) { say(e.message, true); });
     }));
+    fitMsg();
   }
 
   function save(status) {
@@ -4701,8 +4898,10 @@
       }
     } else if (k === 'Escape') {
       // The quarter look goes back to the whole frame first; then a two-tap box waiting for its
-      // corners is cancelled (Draw itself stays on), else no box is selected.
-      if (root.classList.contains('rv-info-open') && !oneColumn.matches) showDetails(false);
+      // corners is cancelled (Draw itself stays on), else no box is selected. The class sheet
+      // (one column) closes before anything else.
+      if (classSheet && !classSheet.hidden) { classGrid = false; renderDecision(); }
+      else if (root.classList.contains('rv-info-open') && !oneColumn.matches) showDetails(false);
       else if (!endQuarters()) {
         if (taps) cancelTaps(true); else select(-1);
       }
