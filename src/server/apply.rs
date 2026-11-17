@@ -124,6 +124,12 @@ pub(crate) fn apply_config_locked(
         }
     }
     out.live = state.registry.apply_live(&next);
+    // The time zone is process-wide and live: a UI save and an edit of the file by hand both
+    // pass here. Only a difference from what runs is applied, so an unrelated save never
+    // resets it.
+    if next.timezone != running.timezone {
+        crate::clock::change(next.timezone);
+    }
     state.running.store(Arc::new(next));
     state
         .applied_revision

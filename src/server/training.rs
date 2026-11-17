@@ -1456,7 +1456,11 @@ fn view_with(
                     .unwrap_or_default(),
                 is_default: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name))
                     && o.name.eq_ignore_ascii_case(&current),
-                finished: r.finished.clone().unwrap_or_default(),
+                finished: r
+                    .finished
+                    .as_deref()
+                    .map(|t| crate::collect::health::when_text(crate::clock::zone(), t))
+                    .unwrap_or_default(),
                 in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
                 warnings: warnings_of(r),
                 confirm: RunFiles::of(r).confirm(r),
@@ -1840,8 +1844,12 @@ pub(crate) fn requests_from_form(
     }
     // Several scenes or seeds: one comparison group for every run (same held-out frames, one
     // table).
-    let compare_group = (scenes.len() as u64 * seeds > 1)
-        .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let compare_group = (scenes.len() as u64 * seeds > 1).then(|| {
+        format!(
+            "cmp-{}",
+            crate::clock::name_stamp(std::time::SystemTime::now())
+        )
+    });
     let sets: Vec<String> = all(f, "benchmark_set")
         .into_iter()
         .filter(|s| EXTRA_SETS.contains(s))
@@ -2519,7 +2527,10 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
             let svc = service(&shared);
             // Default names, made unique here: a comparison queued again within the minute
             // (the stamp's resolution) gets `-2`, ... instead of a refusal.
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+            let stamp = crate::clock::zone()
+                .wall(std::time::SystemTime::now())
+                .format("%Y%m%d-%H%M")
+                .to_string();
             let busy: Vec<String> = svc
                 .runs()
                 .into_iter()

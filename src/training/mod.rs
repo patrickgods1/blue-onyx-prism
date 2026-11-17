@@ -500,7 +500,10 @@ pub fn plan_job(
         .iter()
         .map(|d| config.data_path(d))
         .collect();
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+    let stamp = crate::clock::zone()
+        .wall(std::time::SystemTime::now())
+        .format("%Y%m%d-%H%M")
+        .to_string();
     let name = name
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())

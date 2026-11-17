@@ -996,13 +996,24 @@ pub struct RevertView {
     pub blocked: Option<String>,
 }
 
+/// The day of the RFC 3339 `at` in `zone`; the first 10 characters when it is not one.
+fn switch_day(zone: crate::clock::Zone, at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(at)
+        .map_or_else(|_| at.chars().take(10).collect(), |t| zone.display_date(t))
+}
+
 /// The view of `c`'s record; None without one or when it is stale.
 pub fn revert_view(c: &Config) -> Option<RevertView> {
+    revert_view_in(crate::clock::zone(), c)
+}
+
+/// [`revert_view`] with the switch's day in `zone`.
+pub fn revert_view_in(zone: crate::clock::Zone, c: &Config) -> Option<RevertView> {
     let p = c.previous_default.as_ref().filter(|p| applies(c, p))?;
     Some(RevertView {
         to: p.model.clone(),
         from: p.switched_to.clone(),
-        at: p.at.chars().take(10).collect(),
+        at: switch_day(zone, &p.at),
         restores: p
             .changed
             .iter()

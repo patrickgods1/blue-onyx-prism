@@ -23,8 +23,8 @@
     <div><span class="k">Review queue</span> {{ queued }} frame(s)</div>
     <div><span class="k">Requests seen</span> {{ health.counts.requests_seen }} since this service started</div>
     <div><span class="k">Frames saved</span> {{ health.counts.frames_saved }} since this service started</div>
-    <div><span class="k">Last frame</span> {% if let Some(t) = health.last_frame_at %}{{ t }}{% else %}none yet{% endif %}</div>
-    <div><span class="k">Last error</span> {% if let Some(e) = health.last_error %}<span class="error">{{ e }}</span>{% if let Some(t) = health.last_error_at %} <span class="muted">({{ t }})</span>{% endif %}{% else %}none{% endif %}</div>
+    <div><span class="k">Last frame</span> {% if let Some(t) = health.last_frame_when %}{{ t }}{% else %}none yet{% endif %}</div>
+    <div><span class="k">Last error</span> {% if let Some(e) = health.last_error %}<span class="error">{{ e }}</span>{% if let Some(t) = health.last_error_when %} <span class="muted">({{ t }})</span>{% endif %}{% else %}none{% endif %}</div>
   </div>
   {% if drops.is_empty() %}<p class="muted">No frames dropped since this service started.</p>{% else %}
   <h3>Frames not saved since this service started</h3>
@@ -102,9 +102,9 @@
   <h2>Cameras</h2>
   {% if cameras.is_empty() %}<p class="muted">No frames yet.</p>{% else %}
   <table class="rcards">
-    <thead><tr><th>Camera</th><th class="num">Frames</th><th class="num">MB</th><th>Newest (UTC)</th></tr></thead>
+    <thead><tr><th>Camera</th><th class="num">Frames</th><th class="num">MB</th><th>Newest</th></tr></thead>
     <tbody>
-    {% for c in cameras %}<tr><td class="rc-title">{{ c.name }}</td><td class="num" data-label="Frames">{{ c.frames }}</td><td class="num" data-label="MB">{{ c.mb }}</td><td data-label="Newest (UTC)">{{ c.newest }}</td></tr>{% endfor %}
+    {% for c in cameras %}<tr><td class="rc-title">{{ c.name }}</td><td class="num" data-label="Frames">{{ c.frames }}</td><td class="num" data-label="MB">{{ c.mb }}</td><td data-label="Newest">{{ c.newest }}</td></tr>{% endfor %}
     </tbody>
   </table>
   {% endif %}

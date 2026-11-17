@@ -990,7 +990,7 @@ pub(super) fn config_template(
         let last = match (*bench).as_ref() {
             Some(r) => {
                 let when = chrono::DateTime::parse_from_rfc3339(&r.timestamp)
-                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .map(crate::clock::display)
                     .unwrap_or_else(|_| r.timestamp.clone());
                 format!(
                     "Last benchmark: {}, {when}.",

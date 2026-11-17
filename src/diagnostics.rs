@@ -341,7 +341,7 @@ pub fn build(config: &Config, config_path: &Path, live: Live) -> Result<Vec<u8>>
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let mut options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    if let Some(t) = zip_time(chrono::Utc::now()) {
+    if let Some(t) = zip_time(crate::clock::zone(), chrono::Utc::now()) {
         options = options.last_modified_time(t);
     }
     for (name, text) in parts {
@@ -356,9 +356,11 @@ pub fn build(config: &Config, config_path: &Path, live: Live) -> Result<Vec<u8>>
         .into_inner())
 }
 
-/// `now` as a zip entry time (UTC; zip times have no zone), None outside 1980..=2107.
-fn zip_time(now: chrono::DateTime<chrono::Utc>) -> Option<zip::DateTime> {
+/// `now` as a zip entry time: the wall time in `zone` (DOS times have no zone), None outside
+/// 1980..=2107.
+fn zip_time(zone: crate::clock::Zone, now: chrono::DateTime<chrono::Utc>) -> Option<zip::DateTime> {
     use chrono::{Datelike, Timelike};
+    let now = zone.wall(now);
     let small = |v: u32| u8::try_from(v).ok();
     zip::DateTime::from_date_and_time(
         u16::try_from(now.year()).ok()?,
@@ -387,11 +389,11 @@ fn readme() -> String {
     )
 }
 
-/// File name of a bundle made now: `blue-onyx-prism-diagnostics-<UTC time>.zip`.
+/// File name of a bundle made now: `blue-onyx-prism-diagnostics-<time zone wall time>.zip`.
 pub fn file_name() -> String {
     format!(
         "blue-onyx-prism-diagnostics-{}.zip",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        crate::clock::name_stamp(std::time::SystemTime::now())
     )
 }
 

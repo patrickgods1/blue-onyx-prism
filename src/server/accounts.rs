@@ -78,15 +78,17 @@ pub(super) struct AccountsPanel {
     pub(super) reset_command: String,
 }
 
-/// `secs` (unix) as `YYYY-MM-DD HH:MM UTC`.
+/// `secs` (unix) in the process-wide zone, `YYYY-MM-DD HH:MM PST`.
 fn when(secs: u64) -> String {
+    when_in(crate::clock::zone(), secs)
+}
+
+/// [`when`] in `zone`.
+fn when_in(zone: crate::clock::Zone, secs: u64) -> String {
     i64::try_from(secs)
         .ok()
         .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-        .map_or_else(
-            || secs.to_string(),
-            |t| t.format("%Y-%m-%d %H:%M UTC").to_string(),
-        )
+        .map_or_else(|| secs.to_string(), |t| zone.display(t))
 }
 
 /// The failures column of `u`.

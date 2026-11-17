@@ -502,9 +502,12 @@ fn the_view_says_what_a_revert_restores() {
     let mut c = config();
     let opts = switch_opts(&c, true);
     apply_switch(&mut c, "new", opts).unwrap();
-    let v = revert_view(&c).unwrap();
+    let v = revert_view_in(crate::clock::Zone::Utc, &c).unwrap();
     assert_eq!((v.to.as_str(), v.from.as_str()), ("old", "new"));
     assert_eq!(v.at, "2026-11-05");
+    // The day is the zone's: 10:00 UTC is already the next day at +14:00.
+    let east = revert_view_in("+14:00".parse().unwrap(), &c).unwrap();
+    assert_eq!(east.at, "2026-11-06");
     assert!(v.restores.contains("threshold") && v.restores.contains("night model"));
     assert_eq!(v.blocked, None);
 }

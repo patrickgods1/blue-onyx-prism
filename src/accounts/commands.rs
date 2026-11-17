@@ -171,21 +171,30 @@ fn list(store: &Store, out: &mut dyn Write) -> Result<()> {
     }
     writeln!(
         out,
-        "{:<32}  {:<20}  {:<20}  {:>8}  DISABLED",
+        "{:<32}  {:<22}  {:<22}  {:>8}  DISABLED",
         "NAME", "CREATED", "PASSWORD CHANGED", "FAILURES"
     )?;
+    let zone = crate::clock::zone();
     for u in &users.users {
         writeln!(
             out,
-            "{:<32}  {:<20}  {:<20}  {:>8}  {}",
+            "{:<32}  {:<22}  {:<22}  {:>8}  {}",
             u.name,
-            super::rfc3339(u.created),
-            super::rfc3339(u.password_changed),
+            shown(zone, u.created),
+            shown(zone, u.password_changed),
             u.failures,
             if u.disabled { "yes" } else { "no" }
         )?;
     }
     Ok(())
+}
+
+/// `secs` (unix) as a time in `zone` (`2026-11-16 14:02 PST`).
+fn shown(zone: crate::clock::Zone, secs: u64) -> String {
+    i64::try_from(secs)
+        .ok()
+        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
+        .map_or_else(|| secs.to_string(), |t| zone.display(t))
 }
 
 /// `setup-code`: the code (made when needed) and how to reach the web UI, or why there is none.

@@ -1098,8 +1098,12 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             // file again).
             let config = data.with_plan_flags(&config);
             // Several runs of different scenes or seeds are compared on the same held-out frames.
-            let group = (scenes.len() as u64 * seeds > 1)
-                .then(|| format!("cmp-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+            let group = (scenes.len() as u64 * seeds > 1).then(|| {
+                format!(
+                    "cmp-{}",
+                    crate::clock::name_stamp(std::time::SystemTime::now())
+                )
+            });
             // A chosen GPU: its lane, memory and suggested batches.
             let cap = super::capability_now().for_gpu(gpu.as_deref())?;
             eprintln!("{}", cap.summary());
@@ -1779,7 +1783,10 @@ fn seed_run_name(
         return name.map(str::to_string);
     }
     let base = name.map(str::to_string).unwrap_or_else(|| {
-        let stamp = chrono::Local::now().format("%Y%m%d-%H%M").to_string();
+        let stamp = crate::clock::zone()
+            .wall(std::time::SystemTime::now())
+            .format("%Y%m%d-%H%M")
+            .to_string();
         recipe.default_name(scene.label(), &stamp)
     });
     Some(format!("{base}-s{i}"))

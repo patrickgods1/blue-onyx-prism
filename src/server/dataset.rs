@@ -264,6 +264,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
             }
         })
         .collect();
+    let zone = crate::clock::zone();
     let scenes = SCENES
         .into_iter()
         .map(|s| SceneRow {
@@ -278,7 +279,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
             name: name.clone(),
             frames: t.frames,
             mb: format!("{:.1}", t.bytes as f64 / MB),
-            newest: t.newest.clone(),
+            newest: crate::collect::health::when_text(zone, &t.newest),
         })
         .collect();
     let groups = Bucket::ALL
@@ -300,7 +301,9 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
                         sidecar_url: format!("/dataset/sidecar?path={q}"),
                         caption: format!(
                             "{} \u{b7} {} \u{b7} {} \u{b7} {labels}",
-                            f.timestamp, f.camera, f.scene
+                            crate::collect::health::when_text(zone, &f.timestamp),
+                            f.camera,
+                            f.scene
                         ),
                     }
                 })

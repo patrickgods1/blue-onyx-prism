@@ -105,7 +105,7 @@ pub(super) fn task_rows(tasks: &[TaskRecord]) -> Vec<TaskRow> {
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n"),
-            created: r.created.clone(),
+            created: crate::collect::health::when_text(crate::clock::zone(), &r.created),
         })
         .collect()
 }

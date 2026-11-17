@@ -99,7 +99,7 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
     .ok()
     .flatten();
     crate::benchmark::current::rebase(&mut r, preds.as_deref(), &now);
-    let path = report_path(&dir, chrono::Utc::now());
+    let path = report_path(&dir, crate::clock::zone(), chrono::Utc::now());
     let html = crate::benchmark::export::html(&r);
     if let Err(e) = crate::collect::layout::write_atomic(&path, html.as_bytes()) {
         return json_error(
@@ -120,12 +120,9 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
     .into_response()
 }
 
-/// `<dir>/benchmark-report-<YYYYMMDD-HHMMSS>Z.html`.
-fn report_path(dir: &Path, at: chrono::DateTime<chrono::Utc>) -> PathBuf {
-    dir.join(format!(
-        "benchmark-report-{}.html",
-        at.format("%Y%m%d-%H%M%SZ")
-    ))
+/// `<dir>/benchmark-report-<YYYYMMDD-HHMMSS>.html`, the wall time in `zone`.
+fn report_path(dir: &Path, zone: crate::clock::Zone, at: chrono::DateTime<chrono::Utc>) -> PathBuf {
+    dir.join(format!("benchmark-report-{}.html", zone.name_stamp(at)))
 }
 
 #[cfg(test)]
@@ -153,12 +150,17 @@ mod tests {
     }
 
     #[test]
-    fn report_file_name_is_utc_stamped() {
+    fn report_file_name_is_zone_stamped() {
         use chrono::TimeZone;
         let at = chrono::Utc.with_ymd_and_hms(2026, 10, 25, 9, 3, 7).unwrap();
         assert_eq!(
-            report_path(Path::new("out"), at),
-            Path::new("out").join("benchmark-report-20261025-090307Z.html")
+            report_path(Path::new("out"), crate::clock::Zone::Utc, at),
+            Path::new("out").join("benchmark-report-20261025-090307.html")
+        );
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        assert_eq!(
+            report_path(Path::new("out"), la, at),
+            Path::new("out").join("benchmark-report-20261025-020307.html")
         );
     }
 
@@ -196,7 +198,7 @@ mod tests {
         assert_eq!(path.parent(), Some(out.as_path()));
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(
-            name.starts_with("benchmark-report-") && name.ends_with("Z.html"),
+            name.starts_with("benchmark-report-") && name.ends_with(".html") && !name.contains('Z'),
             "{name}"
         );
         let html = std::fs::read_to_string(&path).unwrap();

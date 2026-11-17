@@ -369,7 +369,7 @@ fn aside_path(path: &Path) -> PathBuf {
     let mut base = path.file_name().unwrap_or_default().to_os_string();
     base.push(format!(
         ".corrupt-{}",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        crate::clock::name_stamp(std::time::SystemTime::now())
     ));
     let free = (0..)
         .map(|i| {

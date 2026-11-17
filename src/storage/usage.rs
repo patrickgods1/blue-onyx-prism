@@ -268,7 +268,12 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
         data.push(
             Item::new(
                 format!("export:{name}"),
-                format!("Export {name}"),
+                // A frame-stamp name (a time) is shown as one, in the configured zone.
+                format!(
+                    "Export {}",
+                    crate::clock::parse_frame_stamp(&name)
+                        .map_or_else(|| name.clone(), crate::clock::display)
+                ),
                 &e,
                 crate::training::retry::disk_use(&e),
             )
