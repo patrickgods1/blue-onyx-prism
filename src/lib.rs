@@ -83,6 +83,7 @@ pub mod download;
 pub mod image;
 pub mod image_stats;
 pub mod logbuf;
+pub mod main_thread;
 pub mod metrics;
 pub mod model;
 pub mod panic;

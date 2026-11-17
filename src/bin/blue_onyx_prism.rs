@@ -33,6 +33,11 @@ use tracing::{error, info};
 
 fn main() -> ExitCode {
     blue_onyx_prism::panic::install();
+    // A debug build's clap parsing alone needs more than Windows' 1 MiB main-thread stack.
+    blue_onyx_prism::main_thread::run(cli_main)
+}
+
+fn cli_main() -> ExitCode {
     // Paths typed on the command line are relative to the cwd (config-file paths are
     // relative to the exe dir), so make them absolute before anything uses them.
     let cli = Cli::parse();
