@@ -354,6 +354,29 @@ fn run(job: &ImportJob, fake: &ImportFake) -> (Result<TaskOutcome>, Vec<String>)
     (r, stages)
 }
 
+/// The process-wide zone set to `zone` while held, under `clock::TEST_LOCK`; the old one is put
+/// back on drop (a failed assertion included).
+struct ZoneSet {
+    old: crate::clock::Zone,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ZoneSet {
+    fn new(zone: &str) -> Self {
+        let lock = crate::clock::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = crate::clock::set(zone.parse().unwrap());
+        Self { old, _lock: lock }
+    }
+}
+
+impl Drop for ZoneSet {
+    fn drop(&mut self) {
+        crate::clock::set(self.old);
+    }
+}
+
 fn records(dir: &Path) -> Vec<crate::collect::Record> {
     crate::collect::labels::queue::candidates(
         dir,
@@ -371,6 +394,8 @@ fn records(dir: &Path) -> Vec<crate::collect::Record> {
 
 #[test]
 fn a_folder_import_extracts_dedups_selects_and_writes_reviewable_frames() {
+    // Blue Iris names are wall time in the configured zone, and so are the frames' names.
+    let _zone = ZoneSet::new("-07:00");
     let t = tmp("folder");
     let root = &t.0;
     let clips = root.join("BlueIris");
@@ -442,11 +467,26 @@ fn a_folder_import_extracts_dedups_selects_and_writes_reviewable_frames() {
         .expect("a video frame");
     let p = video_frame.provenance.as_ref().unwrap();
     assert!(p.time_offset_s.unwrap() >= 0.5);
+    // 08:30:12 at -07:00, stored UTC; the stem names the wall time with its offset.
     assert!(
-        video_frame.timestamp.starts_with("2024-03-15T08:"),
+        video_frame.timestamp.starts_with("2024-03-15T15:30:"),
         "{}",
         video_frame.timestamp
     );
+    assert!(
+        video_frame.id.starts_with("20240315T0830") && video_frame.id.contains("-0700_imp-"),
+        "{}",
+        video_frame.id
+    );
+    // The alert image, when the selection kept it.
+    if let Some(porch) = recs.iter().find(|r| r.camera == "porch") {
+        assert!(
+            porch.id.starts_with("20240316T220000000-0700_imp-"),
+            "{}",
+            porch.id
+        );
+        assert_eq!(porch.timestamp, "2024-03-17T05:00:00.000Z");
+    }
     let imports = write::read_imports(&dir);
     assert_eq!(imports.len(), 1);
     assert_eq!(imports[0].frames, 4);
@@ -680,6 +720,8 @@ fn videos_are_extracted_in_parallel_and_reassembled_in_video_order() {
 
 #[test]
 fn the_parts_of_a_segmented_blue_iris_recording_are_not_duplicates_of_each_other() {
+    // The names' wall time read as UTC, so the stored times below are the names' own.
+    let _zone = ZoneSet::new("utc");
     let t = tmp("segments");
     let root = &t.0;
     let clips = root.join("clips");

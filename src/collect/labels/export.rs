@@ -1011,7 +1011,7 @@ fn prepare_out(dir: &Path, out: &Path, now: std::time::SystemTime) -> Result<Pat
     }
     match std::fs::read_dir(out).map(|mut rd| rd.next().is_some()) {
         Ok(true) => {
-            let t = out.join(format!("export-{}", crate::collect::utc_file_ts(now)));
+            let t = out.join(format!("export-{}", crate::clock::frame_stamp(now)));
             if t.exists() {
                 bail!("{} already exists; export again in a moment", t.display());
             }
@@ -2490,13 +2490,15 @@ mod tests {
         );
         std::fs::create_dir_all(&new).unwrap();
         assert_eq!(prepare_out(&dir, &new, now).unwrap(), new);
-        // A non-empty one gets a new export-<UTC time> folder inside it.
+        // A non-empty one gets a new export-<frame stamp> folder inside it.
         std::fs::write(new.join("x.txt"), b"x").unwrap();
         let sub = prepare_out(&dir, &new, now).unwrap();
-        assert_eq!(
-            sub,
-            new.join(format!("export-{}", crate::collect::utc_file_ts(now)))
-        );
+        assert_eq!(sub.parent(), Some(new.as_path()));
+        let name = sub.file_name().unwrap().to_string_lossy().into_owned();
+        let stamp = name.strip_prefix("export-").expect("export- prefix");
+        let parsed = crate::clock::parse_frame_stamp(stamp).expect("a frame stamp");
+        let want: chrono::DateTime<chrono::Utc> = now.into();
+        assert_eq!(parsed.timestamp(), want.timestamp());
         std::fs::create_dir_all(&sub).unwrap();
         assert!(
             prepare_out(&dir, &new, now).is_err(),

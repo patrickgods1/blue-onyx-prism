@@ -255,7 +255,7 @@ fn spot_box(label: &str, bbox: [f32; 4], width: u32, height: u32) -> Result<[f32
 }
 
 /// `GET /v1/review/spots?camera=<c>`: the camera's parked spots (every frame size, retired ones
-/// too), its rejected spots as of today, derived from the history
+/// too), its rejected spots as of today (in the configured zone), derived from the history
 /// ([`labels::spots::CameraMemory::rejected_spots`]), `moved_at`, and how many spots
 /// "Camera moved" would forget (`live`).
 pub(in crate::server) async fn spots(
@@ -269,7 +269,8 @@ pub(in crate::server) async fn spots(
             Ok(s) => s,
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
-        let today = chrono::Utc::now().date_naive();
+        // Today in the configured zone (new day folders are named in it).
+        let today = crate::clock::day(chrono::Utc::now());
         let memory =
             labels::spots::CameraMemory::new(&labels::repeats::history(&dir, &camera), store);
         let rejected = memory.rejected_spots(today);
@@ -367,7 +368,7 @@ pub(in crate::server) async fn spots_retire(
             label: &b.label,
             bbox,
         };
-        let today = crate::collect::utc_date(std::time::SystemTime::now());
+        let today = crate::clock::display_date(chrono::Utc::now());
         match labels::spots::retire(&dir, &at, &today) {
             Ok(true) => success(serde_json::json!({})),
             Ok(false) => fail(StatusCode::NOT_FOUND, "no parked spot there"),
@@ -396,7 +397,7 @@ pub(in crate::server) async fn spots_moved(
     Ok(blocking(move || {
         let (dir, _, _) = context(&state);
         let at = now();
-        match labels::spots::camera_moved(&dir, &camera, &at) {
+        match labels::spots::camera_moved(&dir, &camera, &at, crate::clock::zone()) {
             Ok(retired) => {
                 tracing::info!(camera, retired, "review: camera moved, spots forgotten");
                 success(serde_json::json!({ "retired": retired, "moved_at": at }))

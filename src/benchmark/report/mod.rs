@@ -761,10 +761,10 @@ where
     Ok((head, items, warnings))
 }
 
-/// Rename `path` aside to `<name>.bad-<YYYYmmddTHHMMSS>` (local time) in the same directory;
+/// Rename `path` aside to `<name>.bad-<YYYYmmdd-HHMMSS>` (time zone wall time) in the same directory;
 /// returns the new path.
 pub(crate) fn move_aside(path: &Path) -> Result<PathBuf> {
-    let ts = chrono::Local::now().format("%Y%m%dT%H%M%S");
+    let ts = crate::clock::name_stamp(std::time::SystemTime::now());
     let mut name = path
         .file_name()
         .with_context(|| format!("{} has no file name", path.display()))?

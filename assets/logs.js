@@ -103,7 +103,7 @@
   document.getElementById("download").addEventListener("click", function () {
     var a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([text()], {type: "text/plain"}));
-    a.download = "blue_onyx_prism_" + new Date().toISOString().replace(/[:.]/g, "-") + ".txt";
+    a.download = "blue_onyx_prism_" + PrismTime.stamp(Date.now()) + ".txt";
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
   });

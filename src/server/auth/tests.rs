@@ -1799,6 +1799,82 @@ async fn the_config_page_shows_the_api_token_card_and_the_signed_in_user() {
     assert!(text(&b).contains("<span class=\"signed-in\"><!--bop:user--></span>"));
 }
 
+/// The `data-tz` value of a page: what [`crate::clock::browser_name`] gives, so no exact value
+/// (the process-wide zone is shared by every test thread), only that it is filled and safe.
+fn page_zone(html: &str) -> String {
+    let at = html.find("data-tz=\"").expect("base.html has data-tz") + "data-tz=\"".len();
+    let end = html[at..].find('"').unwrap();
+    html[at..at + end].to_string()
+}
+
+fn assert_zone_filled(html: &str, what: &str) {
+    assert!(!html.contains(TZ_MARKER), "{what}: the marker is left");
+    let zone = page_zone(html);
+    assert!(!zone.is_empty(), "{what}");
+    assert!(
+        zone.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '+' | ':' | '-')),
+        "{what}: {zone}"
+    );
+}
+
+/// The markers are filled with filtered values: the name only when given, the zone always (by ""
+/// when nothing safe is left); a page without markers is not rewritten.
+#[test]
+fn fill_markers_fills_and_filters() {
+    let page = format!("<html data-tz=\"{TZ_MARKER}\"><span>{USER_MARKER}</span>");
+    assert_eq!(
+        fill_markers(&page, Some("tester"), "America/Los_Angeles").unwrap(),
+        "<html data-tz=\"America/Los_Angeles\"><span>tester</span>"
+    );
+    assert_eq!(
+        fill_markers(&page, None, "+08:00").unwrap(),
+        format!("<html data-tz=\"+08:00\"><span>{USER_MARKER}</span>")
+    );
+    assert_eq!(
+        fill_markers(&page, Some("a<b>\"c"), "Etc/GMT+5\"><script>").unwrap(),
+        "<html data-tz=\"Etc/GMT+5script\"><span>abc</span>"
+    );
+    assert_eq!(
+        fill_markers(&page, None, "\"<>").unwrap(),
+        format!("<html data-tz=\"\"><span>{USER_MARKER}</span>")
+    );
+    // Only a user marker: filled; none at all: nothing to do.
+    assert_eq!(
+        fill_markers(USER_MARKER, Some("tester"), "UTC").as_deref(),
+        Some("tester")
+    );
+    assert_eq!(fill_markers("<p>hi</p>", Some("tester"), "UTC"), None);
+    assert_eq!(fill_markers(USER_MARKER, None, "UTC"), None);
+}
+
+/// Every page built on `base.html` carries the zone: signed in, over the API token, and without
+/// a session (sign-in, setup, the 404 page).
+#[tokio::test]
+async fn every_page_carries_the_time_zone() {
+    let state = token_state();
+    let (s, _, b) = call(&state, req(LOCAL, "GET", "/config", true)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_zone_filled(&text(&b), "signed in");
+    let r = bearer(req(REMOTE, "GET", "/config", true), &token_a());
+    let (s, _, b) = call(&state, r).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_zone_filled(&text(&b), "API token");
+    let (s, _, b) = call(&state, anon(REMOTE, "GET", "/login", true)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_zone_filled(&text(&b), "login");
+    let (s, _, b) = call(&state, req(LOCAL, "GET", "/no-such-page", true)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let html = text(&b);
+    if html.contains("data-tz") {
+        assert_zone_filled(&html, "404");
+    }
+    std::fs::remove_file(Store::open(&root(&state)).path()).unwrap();
+    let (s, _, b) = call(&state, anon(LOCAL, "GET", "/setup", true)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_zone_filled(&text(&b), "setup");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Peers
 // ---------------------------------------------------------------------------------------------

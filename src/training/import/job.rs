@@ -195,13 +195,14 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// When a file was recorded: the time in a Blue Iris or MEVA name, else its modification time.
-fn base_time(p: &Path) -> SystemTime {
+/// When a file was recorded: the time in a Blue Iris name (wall time in `zone`) or a MEVA name
+/// (UTC), else its modification time.
+fn base_time(p: &Path, zone: crate::clock::Zone) -> SystemTime {
     let name = p
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    source::blue_iris_time(&name)
+    source::blue_iris_time(&name, zone)
         .or_else(|| source::meva_time(&name))
         .map(SystemTime::from)
         .or_else(|| mtime(p))
@@ -412,6 +413,7 @@ impl ImportJob {
     /// `imports.jsonl`; returns the frames per scene and the cameras.
     fn record_written(
         &self,
+        zone: crate::clock::Zone,
         frames: &[write::Frame],
         rels: &[String],
         license: &str,
@@ -424,7 +426,7 @@ impl ImportJob {
         let mut cameras: Vec<String> = Vec::new();
         for f in frames.iter().filter(|f| {
             rels.iter()
-                .any(|r| r.contains(&crate::collect::utc_file_ts(f.time)) && r.contains(&f.camera))
+                .any(|r| r.contains(&write::stamp(zone, f.time)) && r.contains(&f.camera))
         }) {
             *scenes
                 .entry(f.stats.scene().as_str().to_string())
@@ -649,6 +651,9 @@ impl ImportJob {
         let r = &self.request;
         let mut warnings: Vec<String> = Vec::new();
         let mut license = self.license.clone();
+        // One zone for the whole import: Blue Iris names are read in it, and the frames' day
+        // folders and stems are named and matched in it (a config change meanwhile waits).
+        let zone = crate::clock::zone();
 
         // 1. The source.
         self.step(report, 1, 0, &r.source.describe());
@@ -661,7 +666,7 @@ impl ImportJob {
                 for v in d.videos {
                     videos.push(Video {
                         camera: source::camera_of(&v, r.camera.as_deref()),
-                        base: base_time(&v),
+                        base: base_time(&v, zone),
                         path: v,
                         kind: "video",
                     });
@@ -779,7 +784,7 @@ impl ImportJob {
                 let v = dir.join(p.file_name);
                 videos.push(Video {
                     camera: source::camera_of(&v, r.camera.as_deref()),
-                    base: base_time(&v),
+                    base: base_time(&v, zone),
                     path: v,
                     kind: "video",
                 });
@@ -1076,7 +1081,7 @@ impl ImportJob {
                 origin: img.clone(),
                 image_name: file_name(img),
                 camera: source::camera_of(img, r.camera.as_deref()),
-                base: base_time(img),
+                base: base_time(img, zone),
                 offset: None,
                 kind: "image",
                 at: None,
@@ -1356,8 +1361,12 @@ impl ImportJob {
         let n_write = frames.len();
         self.step(report, 7, 60, &format!("writing {n_write} frames"));
         let full_dir = self.work.join("full");
-        let written =
-            write::write_frames_with(&self.dataset_dir, &self.id, &frames, &mut |st| match st {
+        let written = write::write_frames_with(
+            &self.dataset_dir,
+            zone,
+            &self.id,
+            &frames,
+            &mut |st| match st {
                 write::Step::Before(k) => {
                     if k % 10 == 0 {
                         guard.check_dataset();
@@ -1373,7 +1382,8 @@ impl ImportJob {
                     }
                     Ok(())
                 }
-            });
+            },
+        );
         let kind = match &r.source {
             ImportSource::Path(_) => "path",
             ImportSource::Url(_) => "url",
@@ -1384,8 +1394,14 @@ impl ImportJob {
             Ok(x) => x,
             Err(p) => {
                 if !p.rels.is_empty() {
-                    let queued =
-                        self.record_written(&frames, &p.rels, &license, kind, attribution.clone());
+                    let queued = self.record_written(
+                        zone,
+                        &frames,
+                        &p.rels,
+                        &license,
+                        kind,
+                        attribution.clone(),
+                    );
                     crate::collect::global().rescan_if_running(&self.dataset_dir);
                     guard.note(format!(
                         "{} frame(s) were written to {} before it stopped{}",
@@ -1407,7 +1423,8 @@ impl ImportJob {
                  skipped"
             ));
         }
-        let (scenes, cameras) = self.record_written(&frames, &rels, &license, kind, attribution)?;
+        let (scenes, cameras) =
+            self.record_written(zone, &frames, &rels, &license, kind, attribution)?;
         crate::collect::global().rescan_if_running(&self.dataset_dir);
         if !r.keep_work {
             let _ = crate::resources::manager::remove_any(&self.work);

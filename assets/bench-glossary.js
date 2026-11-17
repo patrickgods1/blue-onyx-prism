@@ -43,11 +43,11 @@
     // A difference of two fractions in percentage points: "+3.1 points".
     points: function (d, dp) { return has(d) ? (d > 0 ? "+" : d < 0 ? "−" : "±") + Math.abs(d * 100).toFixed(dp === undefined ? 1 : dp) + " points" : "-"; },
     signedMs: function (d) { return has(d) ? (d > 0 ? "+" : d < 0 ? "−" : "±") + Math.abs(d).toFixed(1) + " ms" : "-"; },
-    // "16 Oct 2026, 14:02" in the browser's time zone (results store RFC 3339 UTC).
-    when: function (ts) { var d = ts ? new Date(ts) : null; return d && !isNaN(d) ? d.toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : (ts || ""); },
-    // "13 Oct": short tags in tables (the full date and time go in the tooltip).
-    date: function (ts) { var d = ts ? new Date(ts) : null; return d && !isNaN(d) ? d.toLocaleDateString([], {day: "numeric", month: "short"}) : (ts || ""); },
-    day: function (ts) { var d = ts ? new Date(ts) : null; return d && !isNaN(d) ? d.toLocaleString([], {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"}) : (ts || ""); },
+    // "2026-11-16 14:02 PST" in the configured time zone (results store RFC 3339 UTC).
+    when: function (ts) { return PrismTime.when(ts); },
+    // "2026-10-13": short tags in tables (the full date and time go in the tooltip).
+    date: function (ts) { return PrismTime.date(ts); },
+    day: function (ts) { return PrismTime.day(ts); },
     duration: function (s) { if (!has(s)) return "-"; s = Math.max(1, Math.round(s)); if (s < 90) return s + " s"; var m = Math.round(s / 60); if (m < 90) return m + " min"; return (m / 60).toFixed(1) + " h"; }
   };
 

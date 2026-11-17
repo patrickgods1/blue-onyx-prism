@@ -141,25 +141,34 @@ pub struct Health {
     pub counts: Counts,
     /// UTC, RFC 3339.
     pub last_frame_at: Option<String>,
+    /// [`Self::last_frame_at`] in the configured time zone, for pages.
+    pub last_frame_when: Option<String>,
     pub last_error: Option<String>,
     /// UTC, RFC 3339.
     pub last_error_at: Option<String>,
+    /// [`Self::last_error_at`] in the configured time zone, for pages.
+    pub last_error_when: Option<String>,
     /// [`note`].
     pub note: Option<String>,
 }
 
 impl Health {
     pub fn of(enabled: bool, s: &Status, counts: Counts) -> Self {
+        let zone = crate::clock::zone();
+        let last_frame_at = last_frame_at(s);
+        let last_error_at = s.last_error.as_ref().map(|e| e.at.clone());
         Self {
+            last_frame_when: last_frame_at.as_deref().map(|t| zone.display_stored(t)),
+            last_error_when: last_error_at.as_deref().map(|t| zone.display_stored(t)),
             note: note(
                 enabled,
                 s.disabled.is_some(),
                 &counts,
                 s.last_error.as_ref(),
             ),
-            last_frame_at: last_frame_at(s),
+            last_frame_at,
             last_error: s.last_error.as_ref().map(|e| e.message.clone()),
-            last_error_at: s.last_error.as_ref().map(|e| e.at.clone()),
+            last_error_at,
             counts,
         }
     }

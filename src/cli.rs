@@ -1,6 +1,6 @@
 //! Command line, config resolution and logging setup.
 
-use crate::config::{Config, LogFormat, LogLevel, LogTimezone, ModelConfig};
+use crate::config::{Config, LogFormat, LogLevel, ModelConfig};
 use crate::model::ModelFamilyKind;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -894,8 +894,6 @@ pub struct LogReloadHandle {
     level: Arc<std::sync::Mutex<LogLevel>>,
     /// The in-memory ring behind the web UI's Logs page.
     buffer: crate::logbuf::LogBuffer,
-    /// The zone of log timestamps (shared with the timers and the buffer).
-    timezone: crate::logbuf::SharedTimezone,
     _guard: Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
     /// Keeps the filter layer of a [`Self::detached`] handle alive (reloads need it).
     _detached: Option<Arc<reload::Layer<EnvFilter, Registry>>>,
@@ -947,25 +945,6 @@ impl LogReloadHandle {
         Ok(())
     }
 
-    /// Change the time zone of log timestamps (file, console and the Logs page); applies to the
-    /// next event. A change is logged at info.
-    pub fn set_timezone(&self, tz: LogTimezone) {
-        let from = self.timezone();
-        if from == tz {
-            return;
-        }
-        *self
-            .timezone
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = tz;
-        tracing::info!(from = %from, to = %tz, "log time zone changed from {from} to {tz}");
-    }
-
-    /// The time zone of log timestamps now.
-    pub fn timezone(&self) -> LogTimezone {
-        crate::logbuf::current_timezone(&self.timezone)
-    }
-
     /// The level the filter has now.
     pub fn level(&self) -> LogLevel {
         use crate::sync::LockExt;
@@ -985,7 +964,6 @@ impl LogReloadHandle {
         Self {
             handle,
             level: Arc::new(std::sync::Mutex::new(level)),
-            timezone: buffer.timezone(),
             buffer,
             _guard: None,
             _detached: Some(Arc::new(layer)),
@@ -1025,7 +1003,7 @@ pub fn init_logging_with(
     log_path: Option<&Path>,
     extra: Option<ExtraLogLayer>,
 ) -> Result<LogReloadHandle> {
-    init_logging_opts(level, log_path, LogFormat::Text, LogTimezone::Utc, extra)
+    init_logging_opts(level, log_path, LogFormat::Text, extra)
 }
 
 /// The daily log files under `dir` (created when missing), lines in `format`.
@@ -1037,11 +1015,13 @@ fn file_appender(dir: &Path, format: LogFormat) -> Result<log_files::LogFiles> {
         log_files::Limits::default(),
         format == LogFormat::Json,
         Box::new(std::time::SystemTime::now),
+        Box::new(crate::clock::zone),
     )
     .with_context(|| format!("could not open a log file in {}", dir.display()))
 }
 
-/// The file log: `blue_onyx_prism.log.<UTC date>`, one file a day (the names
+/// The file log: `blue_onyx_prism.log.<date>`, one file a day, dated in the
+/// process-wide zone ([`crate::clock`]; a change of zone starts the new date's file; the names
 /// `tracing_appender`'s daily rotation used, so older files are counted and pruned too). Bounded
 /// three ways, so a long-running service cannot fill the disk with logs: the newest
 /// [`MAX_LOG_FILES`] days are kept, the oldest go first while all of them hold more than
@@ -1053,6 +1033,8 @@ pub(crate) mod log_files {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
+
+    use chrono::NaiveDate;
 
     /// File names start with this, then `.` and the date.
     pub(crate) const PREFIX: &str = "blue_onyx_prism.log";
@@ -1079,14 +1061,18 @@ pub(crate) mod log_files {
 
     /// The clock (tests pass their own).
     pub(crate) type Clock = Box<dyn Fn() -> SystemTime + Send>;
+    /// The zone whose calendar day names the files, read at every write (a config change applies
+    /// to the next line; tests pass their own).
+    pub(crate) type ZoneFn = Box<dyn Fn() -> crate::clock::Zone + Send>;
 
     pub(crate) struct LogFiles {
         dir: PathBuf,
         limits: Limits,
         json: bool,
         clock: Clock,
-        /// Days since 1970 of the open file.
-        day: i64,
+        zone: ZoneFn,
+        /// The date (in the zone) of the open file.
+        day: NaiveDate,
         file: Option<File>,
         /// Bytes in the open file.
         size: u64,
@@ -1095,25 +1081,9 @@ pub(crate) mod log_files {
         since_check: u64,
     }
 
-    /// Days since 1970-01-01 (UTC) of `t`.
-    fn day_of(t: SystemTime) -> i64 {
-        let secs = match t.duration_since(SystemTime::UNIX_EPOCH) {
-            Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-            Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
-        };
-        secs.div_euclid(86_400)
-    }
-
-    /// `YYYY-MM-DD` of a day number.
-    fn date_of(day: i64) -> String {
-        chrono::DateTime::from_timestamp(day.saturating_mul(86_400), 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "unknown-date".into())
-    }
-
     /// The file of `day` under `dir`.
-    pub(crate) fn path_of(dir: &Path, day: i64) -> PathBuf {
-        dir.join(format!("{PREFIX}.{}", date_of(day)))
+    pub(crate) fn path_of(dir: &Path, day: NaiveDate) -> PathBuf {
+        dir.join(format!("{PREFIX}.{}", day.format("%Y-%m-%d")))
     }
 
     impl LogFiles {
@@ -1123,13 +1093,15 @@ pub(crate) mod log_files {
             limits: Limits,
             json: bool,
             clock: Clock,
+            zone: ZoneFn,
         ) -> std::io::Result<Self> {
-            let day = day_of(clock());
+            let day = zone().day(clock());
             let mut me = Self {
                 dir: dir.to_path_buf(),
                 limits,
                 json,
                 clock,
+                zone,
                 day,
                 file: None,
                 size: 0,
@@ -1140,7 +1112,7 @@ pub(crate) mod log_files {
             Ok(me)
         }
 
-        fn open_day(&mut self, day: i64) -> std::io::Result<()> {
+        fn open_day(&mut self, day: NaiveDate) -> std::io::Result<()> {
             self.day = day;
             self.file = None;
             self.since_check = 0;
@@ -1159,7 +1131,7 @@ pub(crate) mod log_files {
 
         /// The line written once when today's file reaches its cap.
         fn cap_line(&self) -> String {
-            let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            let at = crate::clock::log_stamp(chrono::Utc::now());
             let text = format!(
                 "this log file reached {} MB, so the rest of today's lines are dropped; logging \
                  goes on in tomorrow's file. Something logs far more than usual: look at the lines \
@@ -1218,7 +1190,7 @@ pub(crate) mod log_files {
 
     impl Write for LogFiles {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let day = day_of((self.clock)());
+            let day = (self.zone)().day((self.clock)());
             if day != self.day || self.file.is_none() {
                 // A file that cannot be opened drops the line; the next one tries again.
                 if self.open_day(day).is_err() {
@@ -1259,8 +1231,9 @@ pub(crate) mod log_files {
 /// Install the global subscriber: the reloadable level filter (which also governs `extra` and
 /// the in-memory [`crate::logbuf::LogBuffer`] behind [`LogReloadHandle::buffer`]; `extra` may
 /// add its own per-layer filter on top), then either a daily rolling file in `log_path` in
-/// `format` (`json`: one object per line) or stdout (always text). Timestamps are in
-/// `timezone` (changeable later with [`LogReloadHandle::set_timezone`]).
+/// `format` (`json`: one object per line) or stdout (always text). Timestamps are in the
+/// process-wide zone ([`crate::clock`]): set it from the config before this call
+/// ([`crate::clock::set`]); [`crate::clock::change`] applies a later one to the next event.
 ///
 /// A `log_path` that cannot be created or opened does not stop the program (CO-11): logging
 /// falls back to stdout with a warning. Messages kept by [`crate::logbuf::early`] before this
@@ -1269,16 +1242,11 @@ pub fn init_logging_opts(
     level: LogLevel,
     log_path: Option<&Path>,
     format: LogFormat,
-    timezone: LogTimezone,
     extra: Option<ExtraLogLayer>,
 ) -> Result<LogReloadHandle> {
     let (filter, handle) = reload::Layer::new(filter_for(level));
     let buffer = crate::logbuf::LogBuffer::default();
-    let tz_cell = buffer.timezone();
-    *tz_cell
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = timezone;
-    let timer = crate::logbuf::LogTimer(tz_cell.clone());
+    let timer = crate::logbuf::LogTimer;
     let registry = tracing_subscriber::registry()
         .with(filter)
         .with(extra)
@@ -1310,13 +1278,13 @@ pub fn init_logging_opts(
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let file_layer = match format {
                 LogFormat::Text => tracing_subscriber::fmt::layer()
-                    .with_timer(timer.clone())
+                    .with_timer(timer)
                     .with_writer(writer)
                     .with_ansi(false)
                     .boxed(),
                 LogFormat::Json => tracing_subscriber::fmt::layer()
                     .json()
-                    .with_timer(timer.clone())
+                    .with_timer(timer)
                     .with_writer(writer)
                     .with_ansi(false)
                     .boxed(),
@@ -1337,7 +1305,6 @@ pub fn init_logging_opts(
         handle,
         level: Arc::new(std::sync::Mutex::new(level)),
         buffer,
-        timezone: tz_cell,
         _guard: guard.map(Arc::new),
         _detached: None,
     })
@@ -2310,16 +2277,26 @@ mod tests {
         }
 
         const DAY: u64 = 86_400;
-        /// Day number of the tests' "today" (2026-11-07).
-        const TODAY: i64 = 20_764;
+        /// Day number (since 1970) of the tests' "today" (2026-11-07).
+        const TODAY_NUM: i64 = 20_764;
 
-        /// A clock at `TODAY` + the seconds in the returned cell.
+        /// The date `n` days from the tests' "today" (the UTC zone's).
+        fn day(n: i64) -> chrono::NaiveDate {
+            chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()
+                + chrono::TimeDelta::days(TODAY_NUM + n)
+        }
+
+        fn utc() -> log_files::ZoneFn {
+            Box::new(|| crate::clock::Zone::Utc)
+        }
+
+        /// A clock at `TODAY_NUM` + the seconds in the returned cell.
         fn clock() -> (log_files::Clock, Arc<AtomicU64>) {
             let offset = Arc::new(AtomicU64::new(3600));
             let o = offset.clone();
             let clock: log_files::Clock = Box::new(move || {
                 SystemTime::UNIX_EPOCH
-                    + Duration::from_secs(TODAY as u64 * DAY + o.load(Ordering::Relaxed))
+                    + Duration::from_secs(TODAY_NUM as u64 * DAY + o.load(Ordering::Relaxed))
             });
             (clock, offset)
         }
@@ -2345,7 +2322,7 @@ mod tests {
         #[test]
         fn todays_file_has_the_dated_name() {
             assert_eq!(
-                path_of(Path::new("x"), TODAY),
+                path_of(Path::new("x"), day(0)),
                 Path::new("x").join("blue_onyx_prism.log.2026-11-07")
             );
             assert_eq!(PREFIX, "blue_onyx_prism.log");
@@ -2357,12 +2334,12 @@ mod tests {
         fn the_oldest_files_go_past_the_count_and_the_total() {
             let d = dir();
             for back in 1..=20 {
-                std::fs::write(path_of(&d.0, TODAY - back), [b'x'; 10]).unwrap();
+                std::fs::write(path_of(&d.0, day(-back)), [b'x'; 10]).unwrap();
             }
             std::fs::write(d.0.join("stdout.log"), "keep").unwrap();
             std::fs::write(d.0.join(PREFIX), "keep").unwrap();
             let (c, _) = clock();
-            let _f = LogFiles::open(&d.0, limits(5, 1_000_000, 1000), false, c).unwrap();
+            let _f = LogFiles::open(&d.0, limits(5, 1_000_000, 1000), false, c, utc()).unwrap();
             let want: Vec<String> = [
                 PREFIX.to_string(),
                 format!("{PREFIX}.2026-11-03"),
@@ -2376,18 +2353,18 @@ mod tests {
             assert_eq!(names(&d.0), want);
 
             // By size: today (10 bytes) + two days of 10 fit in 35, a third does not.
-            std::fs::write(path_of(&d.0, TODAY), [b'x'; 10]).unwrap();
+            std::fs::write(path_of(&d.0, day(0)), [b'x'; 10]).unwrap();
             let (c, _) = clock();
-            let _f = LogFiles::open(&d.0, limits(14, 35, 1000), false, c).unwrap();
+            let _f = LogFiles::open(&d.0, limits(14, 35, 1000), false, c, utc()).unwrap();
             assert_eq!(names(&d.0).len(), 3 + 2, "{:?}", names(&d.0));
-            assert!(path_of(&d.0, TODAY - 2).exists() && !path_of(&d.0, TODAY - 3).exists());
+            assert!(path_of(&d.0, day(-2)).exists() && !path_of(&d.0, day(-3)).exists());
 
             // Today alone over the total: kept, everything older goes.
-            std::fs::write(path_of(&d.0, TODAY), [b'x'; 100]).unwrap();
+            std::fs::write(path_of(&d.0, day(0)), [b'x'; 100]).unwrap();
             let (c, _) = clock();
-            let _f = LogFiles::open(&d.0, limits(14, 35, 1000), false, c).unwrap();
-            assert!(path_of(&d.0, TODAY).exists());
-            assert!(!path_of(&d.0, TODAY - 1).exists());
+            let _f = LogFiles::open(&d.0, limits(14, 35, 1000), false, c, utc()).unwrap();
+            assert!(path_of(&d.0, day(0)).exists());
+            assert!(!path_of(&d.0, day(-1)).exists());
         }
 
         /// M8: one day's file stops at its cap with one line saying so, also across a restart,
@@ -2396,7 +2373,7 @@ mod tests {
         fn a_day_file_stops_at_its_cap_and_the_next_day_starts_fresh() {
             let d = dir();
             let (c, offset) = clock();
-            let mut f = LogFiles::open(&d.0, limits(14, 1_000_000, 100), false, c).unwrap();
+            let mut f = LogFiles::open(&d.0, limits(14, 1_000_000, 100), false, c, utc()).unwrap();
             let line = [b'a'; 29].iter().chain(b"\n").copied().collect::<Vec<u8>>();
             for _ in 0..5 {
                 assert_eq!(
@@ -2406,7 +2383,7 @@ mod tests {
                 );
             }
             f.flush().unwrap();
-            let today = std::fs::read_to_string(path_of(&d.0, TODAY)).unwrap();
+            let today = std::fs::read_to_string(path_of(&d.0, day(0))).unwrap();
             let lines: Vec<&str> = today.lines().collect();
             assert_eq!(lines.len(), 4, "{today}");
             assert!(
@@ -2417,25 +2394,54 @@ mod tests {
 
             // A restart the same day: still full.
             let (c, _) = clock();
-            let mut again = LogFiles::open(&d.0, limits(14, 1_000_000, 100), false, c).unwrap();
+            let mut again =
+                LogFiles::open(&d.0, limits(14, 1_000_000, 100), false, c, utc()).unwrap();
             again.write_all(&line).unwrap();
-            assert_eq!(std::fs::read(path_of(&d.0, TODAY)).unwrap().len(), size);
+            assert_eq!(std::fs::read(path_of(&d.0, day(0))).unwrap().len(), size);
 
             // Tomorrow: a new file, yesterday's untouched.
             offset.store(DAY + 60, Ordering::Relaxed);
             f.write_all(&line).unwrap();
             f.flush().unwrap();
-            assert_eq!(std::fs::read(path_of(&d.0, TODAY + 1)).unwrap(), line);
-            assert_eq!(std::fs::read(path_of(&d.0, TODAY)).unwrap().len(), size);
+            assert_eq!(std::fs::read(path_of(&d.0, day(1))).unwrap(), line);
+            assert_eq!(std::fs::read(path_of(&d.0, day(0))).unwrap().len(), size);
+        }
+
+        /// The file's date is the zone's: 22:00 UTC is already tomorrow in +08:00, and a change of
+        /// zone starts that date's file; today's (the open) file is never pruned.
+        #[test]
+        fn the_file_date_follows_the_zone() {
+            let d = dir();
+            let (c, offset) = clock();
+            offset.store(22 * 3600, Ordering::Relaxed);
+            let zone = Arc::new(std::sync::Mutex::new(crate::clock::Zone::Utc));
+            let z = zone.clone();
+            let mut f = LogFiles::open(
+                &d.0,
+                limits(1, 1_000_000, 1000),
+                false,
+                c,
+                Box::new(move || *z.lock().unwrap()),
+            )
+            .unwrap();
+            f.write_all(b"utc\n").unwrap();
+            assert_eq!(std::fs::read(path_of(&d.0, day(0))).unwrap(), b"utc\n");
+            *zone.lock().unwrap() = "+08:00".parse().unwrap();
+            f.write_all(b"east\n").unwrap();
+            f.flush().unwrap();
+            assert_eq!(std::fs::read(path_of(&d.0, day(1))).unwrap(), b"east\n");
+            // One file kept: the open one stays, the older goes at the next check.
+            f.prune();
+            assert!(path_of(&d.0, day(1)).exists() && !path_of(&d.0, day(0)).exists());
         }
 
         #[test]
         fn the_cap_line_of_a_json_log_is_json() {
             let d = dir();
             let (c, _) = clock();
-            let mut f = LogFiles::open(&d.0, limits(14, 1_000_000, 10), true, c).unwrap();
+            let mut f = LogFiles::open(&d.0, limits(14, 1_000_000, 10), true, c, utc()).unwrap();
             f.write_all(&[b'{'; 20]).unwrap();
-            let text = std::fs::read_to_string(path_of(&d.0, TODAY)).unwrap();
+            let text = std::fs::read_to_string(path_of(&d.0, day(0))).unwrap();
             let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
             assert_eq!(v["level"], "WARN");
             assert!(v["fields"]["message"].as_str().unwrap().contains("dropped"));

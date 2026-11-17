@@ -36,6 +36,15 @@ The release-readiness review (phases 1-10, PRs #121-#131 and this phase), groupe
   one record of a kind it does not know (an overlaps task, say) makes it see an empty list, and its
   next save writes over the file. Copy the training folder (`<data root>/training`) first if you
   may go back.
+- **`log_timezone` becomes `timezone`, default `local`.** One setting now covers log timestamps,
+  file and folder names (run folders, exports, reports, diagnostics zips, daily log files, and the
+  day folders and frame names of newly collected or imported frames) and every time shown on
+  pages, in the CLI and in reports. An old `log_timezone` is read once and saved as `timezone`; its
+  old default `"utc"` counts as unset, so existing installs switch to this computer's zone (pick
+  UTC on the Config page to keep it). Timestamps stored inside records stay UTC, and so does the
+  Blue Iris `timestampUTC`. Existing UTC day folders are kept: on the day of the switch, a UTC
+  folder and a local one can share a date (docs/DATASET.md, "Time zone"). Blue Iris clip names
+  are now read as local time in that zone (they were read as UTC).
 
 ### Added
 

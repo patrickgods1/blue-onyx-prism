@@ -459,7 +459,7 @@
           return C.lineChart(series, {
             title: (TRENDS.find(function (t) { return t[0] === S.trend; }) || TRENDS[0])[1] + " over the last " + ordered.length + " runs of " + S.runModel,
             desc: "One line per device; runs not comparable with the latest are gaps.", pointDots: true,
-            xMin: ordered.length > 1 ? 0 : -1, xMax: Math.max(1, ordered.length - 1), yMin: lo, yMax: hi, xTicks: ticks, xTickText: function (k) { var e = ordered[k]; return e ? fmt.day(e.timestamp).replace(/,.*$/, "") : ""; },
+            xMin: ordered.length > 1 ? 0 : -1, xMax: Math.max(1, ordered.length - 1), yMin: lo, yMax: hi, xTicks: ticks, xTickText: function (k) { var e = ordered[k]; return e ? fmt.day(e.timestamp).replace(/ dd:dd$/, "") : ""; },
             yFmt: isMs ? function (v) { return v.toFixed(0); } : S.trend === "threshold" ? function (v) { return v.toFixed(2); } : function (v) { return (v * 100).toFixed(0); },
             yLabel: isMs ? "ms (lower is better)" : S.trend === "threshold" ? "confidence" : "%", xName: "run",
             xHover: function (k) { var e = ordered[Math.round(k)]; return e ? fmt.day(e.timestamp) : ""; },

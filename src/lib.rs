@@ -5,6 +5,7 @@
 //! - [`accounts`]  the web UI's accounts: `auth/users.json`, password policy, Argon2id, lockout, setup code
 //! - [`admin_token`] the token remote administration needs: its file, creation and rotation
 //! - [`api`]       wire structs for the CodeProject.AI compatible JSON API
+//! - [`clock`]     the configured time zone (`timezone`): log stamps, file names, times shown to people
 //! - [`config`]    JSON config next to the executable, merged with CLI flags
 //! - [`config_form`] applying the web UI's forms (config page, models, devices, thresholds) to a `Config`
 //! - [`config_store`] the live config with a revision and change log (every writer goes through it)
@@ -73,6 +74,7 @@ pub mod api;
 pub mod backend;
 pub mod benchmark;
 pub mod cli;
+pub mod clock;
 pub mod collect;
 pub mod config;
 pub mod config_form;

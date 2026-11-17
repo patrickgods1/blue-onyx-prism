@@ -60,6 +60,9 @@ tracing-appender = "0.2"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
+# The computer's IANA zone name for `timezone: "local"` (clock::Zone::browser_name); already in
+# the tree through chrono's `clock` feature, same version.
+iana-time-zone = "0.1.65"
 uuid = { version = "1", features = ["v4"] }
 fast_image_resize = { version = "6", features = ["image"] }
 zune-jpeg = "0.5"

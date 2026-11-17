@@ -524,7 +524,7 @@ pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
 /// One review export folder, for the Dataset tab, the Train tab's list and the summary.
 pub(super) struct ExportRow {
     pub(super) path: String,
-    /// "2026-11-06 06:47 UTC", or the folder's name.
+    /// "2026-11-06 06:47 PST" (the zone's time), or the folder's name.
     pub(super) when: String,
     /// `frames` of its `export.json`; None without one.
     pub(super) frames: Option<u64>,
@@ -537,25 +537,16 @@ pub(super) struct ExportRow {
     pub(super) train_link: String,
 }
 
-/// `20261106T064704883Z` as a date, the folder's name for any other.
+/// An export folder's name as a time in the process-wide zone ([`export_when_in`]).
 fn export_when(name: &str) -> String {
-    let digits = |r: std::ops::Range<usize>| {
-        name.get(r)
-            .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
-    };
-    match (
-        digits(0..4),
-        digits(4..6),
-        digits(6..8),
-        name.get(8..9),
-        digits(9..11),
-        digits(11..13),
-    ) {
-        (Some(y), Some(mo), Some(d), Some("T"), Some(h), Some(mi)) => {
-            format!("{y}-{mo}-{d} {h}:{mi} UTC")
-        }
-        _ => name.to_string(),
-    }
+    export_when_in(crate::clock::zone(), name)
+}
+
+/// The export folder `name` (a frame stamp such as `20261106T064704883Z` from before the time
+/// zone setting, or `20261106T064704883-0800` since; [`crate::clock::parse_frame_stamp`]) as a
+/// time in `zone`; the folder's name for any other.
+fn export_when_in(zone: crate::clock::Zone, name: &str) -> String {
+    crate::clock::parse_frame_stamp(name).map_or_else(|| name.to_string(), |t| zone.display(t))
 }
 
 /// The row of export folder `dir`, its report read when it has one.
@@ -1431,7 +1422,21 @@ mod tests {
         )
         .unwrap();
         let r = export_row(&e);
-        assert_eq!(r.when, "2026-11-06 06:47 UTC");
+        assert_eq!(
+            export_when_in(crate::clock::Zone::Utc, "20261106T064704883Z"),
+            "2026-11-06 06:47 UTC"
+        );
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        assert_eq!(
+            export_when_in(la, "20261106T064704883Z"),
+            "2026-11-05 22:47 PST"
+        );
+        assert_eq!(
+            export_when_in(la, "20261105T224704883-0800"),
+            "2026-11-05 22:47 PST"
+        );
+        assert_eq!(export_when_in(la, "my-export"), "my-export");
+        assert!(r.when.starts_with("2026-11-0"), "{}", r.when);
         assert_eq!(r.frames, Some(26));
         assert_eq!(r.split, "17 train, 9 held out");
         assert_eq!(r.classes, "person 27, bicycle 1");

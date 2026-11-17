@@ -317,7 +317,9 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
    but at least 50 frames when the pool has them (`Options.min_valid`; never more than a quarter of the
    pool, so 100 frames give 25, 241 give 50, 1000 give 100; always at least one), for the trainer's checkpoint choice.
    **Whole camera days** (`dataset/valid.rs`, always on): frames of one camera on one day are
-   near-duplicates, so validation takes whole `camera/day` groups, never one that also trains.
+   near-duplicates, so validation takes whole `camera/day` groups, never one that also trains. The day
+   is the day folder: the date in the configured `timezone` for frames collected or imported since that
+   key, the UTC date before it (docs/DATASET.md, "Time zone"; at the switch one folder name can hold both).
    Groups go by seeded rank, those adding a class validation lacks first, until the size is reached:
    the first pass accepts a group while the total stays within 1.5x that size, the second, when
    short, within `max(size, a quarter of the frames)`, so a day of 74 frames can stand in for 50 and a
@@ -1175,7 +1177,7 @@ dialog, like the source path.
 | Source | How | Licence |
 |---|---|---|
 | A video (`.mp4`, `.mkv`, `.avi`, `.mov`), an image, or a folder of them | `--path`; the page's *Browse...* lists folders and videos (`GET /v1/fs/browse?kind=video`). Folders are walked 6 levels deep, up to 20 000 files. | You confirm it (`--confirm-license`; default text "own footage") |
-| Blue Iris clip and alert folders | the same `--path`: `Cam.20240315_083012.mp4` clips and `Cam.20240315_083012.123456.jpg` alert snapshots. The camera folder and the recording time come from the file name. `.bvr` clips cannot be read (Blue Iris's own format): they are counted and the report says to export them to MP4 in Blue Iris. | You confirm it |
+| Blue Iris clip and alert folders | the same `--path`: `Cam.20240315_083012.mp4` clips and `Cam.20240315_083012.123456.jpg` alert snapshots. The camera folder and the recording time come from the file name (wall time, read in the configured `timezone`). `.bvr` clips cannot be read (Blue Iris's own format): they are counted and the report says to export them to MP4 in Blue Iris. | You confirm it |
 | A video URL | `--url`, downloaded with yt-dlp (pinned in the environment): loopback, private and other internal addresses are refused, by name and after resolving it (a redirect to one is not checked, because yt-dlp follows redirects itself); no playlists, no live streams, a video-only format up to 1080 p (so no ffmpeg binary is needed to merge streams), at most 2 GB. What the site reports (title, uploader, page URL, licence) goes into the provenance next to your confirmation; a different site licence is a warning. | `--license` (required) and `--confirm-license` |
 | Pinned open footage | `--dataset meva-sample`: six five-minute MEVA clips (Kitware / IARPA, mevadata.org, **CC BY 4.0**; fixed outdoor cameras: a night IR camera, two thermal cameras, a lit night camera, two day cameras; 307 MB), SHA-256 pinned, downloaded by the download manager into `<data root>/train-data/meva-sample`. Frames carry the attribution. The full MEVA corpus (328 h, 516 GB, `s3://mevadata-public-01/drops-123-r13/`) is not pinned; more clips can be added to the catalog the same way. | Pinned (CC BY 4.0) |
 
@@ -1287,16 +1289,19 @@ dataset.
    (water-filled when a scene has fewer frames) unless `--no-balance`. `--select dhash` runs k-center
    on the dHash Hamming distance instead (no embeddings; an image-folder import then needs no Python,
    no GPU and no download).
-5. **Writing**: each frame becomes `<scene>/<camera>/<date>/<UTC ms>_imp-<id>-<n>.jpg` (the JPEG copied
-   as is) with a version-1 sidecar without detections, `source: "import:<id>"` and its
+5. **Writing**: each frame becomes `<scene>/<camera>/<date>/<ts>_imp-<id>-<n>.jpg`, the date and
+   `<ts>` (`20240315T083012500-0700`) in the configured `timezone` (the JPEG copied as is), with a
+   version-1 sidecar without detections, `source: "import:<id>"` and its
    `provenance` (docs/DATASET.md, "Imported frames"), an `index.jsonl` line, a `review-queue.jsonl`
    line and the import's line in `<dataset>/imports.jsonl`. The date is the recording time (Blue Iris
-   / MEVA file names, else the file's modification time; a URL: the import time). The parts of a
-   Blue Iris recording exported in segments (`Back.20261010_160000_1.mp4`, `_2`, ...: every part
-   named after the recording's start) follow each other in part order, each after the lengths of
-   the lower parts present, so they neither claim the same minute nor dedup each other away. A frame imported
-   before (same camera, millisecond and dHash) is skipped. The extracted candidates
-   (`<training dir>/imports/<id>`) are deleted (`--keep-work` keeps them).
+   / MEVA file names, else the file's modification time; a URL: the import time). A Blue Iris name is
+   its computer's wall time and is read in the configured `timezone`, so set that to Blue Iris's zone
+   (imports before the key read it as UTC); a MEVA name is UTC. The parts of a Blue Iris recording
+   exported in segments (`Back.20261010_160000_1.mp4`, `_2`, ...: every part named after the
+   recording's start) follow each other in part order, each after the lengths of the lower parts
+   present, so they neither claim the same minute nor dedup each other away. A frame imported before
+   (same camera, millisecond and dHash) is skipped, also when it was named in another zone or in UTC.
+   The extracted candidates (`<training dir>/imports/<id>`) are deleted (`--keep-work` keeps them).
 
 Imported frames count against `collect.max_gb` and age out after `collect.max_age_days` like collected
 ones until they are reviewed (a reviewed frame or one with a human decision is never pruned; a label
@@ -1475,7 +1480,9 @@ a spot is hidden with `reason: "spot_dismissed"`, which every reader treats like
 the page says *hidden: you rejected this spot N times*.
 
 - Only rejections of the 30 days up to the frame's date count (`spots::REJECTED_WINDOW_DAYS`). One dated
-  after the frame does not.
+  after the frame does not. Dates are day folders; the Review tab's list of rejected spots is as of today in
+  the configured `timezone` and also takes a folder dated the day after (a UTC folder named before the
+  `timezone` key, on an evening west of UTC).
 - A place where a box of that object was ever accepted is no spot, however often you rejected it there.
 - A box with a fused score of 0.5 or more stays visible, and so does a likely box (0.25 or more with a
   VLM yes): a real object at a bad spot on an unlucky frame must not disappear.
@@ -1497,9 +1504,11 @@ another class suggested are not. A model box from the pre-fill stays pending, ev
 confirm it.
 
 **The camera moved.** *Camera moved: forget spots* in Panel options retires every parked spot and sets
-`moved_at`, so that rejections and accepts from frames before that moment stop counting. On the day of the
-move the frame's time decides; a frame name with no time counts as before the move. A run reads the spots
-once, at its start, so a run already going keeps what it read. It also learns nothing from its own writes.
+`moved_at`, so that rejections and accepts from frames before that moment stop counting. The time in the
+frame's name decides, an old UTC name and a name in the configured `timezone` alike; a frame name with no
+time counts as before the move unless its day folder is later than the move's date (UTC and zone both).
+A run reads the spots once, at its start, so a run already going keeps what it read. It also learns
+nothing from its own writes.
 
 The run's summary and report give `spot_dismissed` (left out of `added`) and `parked_accepted`.
 

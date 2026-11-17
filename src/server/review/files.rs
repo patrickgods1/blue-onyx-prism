@@ -236,7 +236,7 @@ pub(in crate::server) async fn export(
         };
         let out_dir = match b.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => {
-                exports_dir(&state).join(crate::collect::utc_file_ts(std::time::SystemTime::now()))
+                exports_dir(&state).join(crate::clock::frame_stamp(std::time::SystemTime::now()))
             }
             Some(raw) => match export_folder(&state, raw, &root) {
                 Ok(p) => p,

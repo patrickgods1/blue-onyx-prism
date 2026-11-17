@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-tz="<!--bop:tz-->">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -31,6 +31,7 @@
   {% if nav != "" %}<span id="pending-restart" class="pending-restart" hidden><a href="/config#models"></a> <button type="button" class="small danger" data-restart>Restart</button></span>
   <form method="post" action="/logout" class="signout" data-no-auth-check><span class="signed-in"><!--bop:user--></span> <button type="submit" class="small secondary">Sign out</button></form>{% endif %}
 </header>
+<script src="/static/time.js?v={{ version }}"></script>
 <script src="/static/live.js?v={{ version }}"></script>
 <main id="main" tabindex="-1">
 {% block content %}{% endblock %}

@@ -287,7 +287,7 @@ pub fn new_run_id() -> String {
     let u = uuid::Uuid::new_v4().simple().to_string();
     format!(
         "{}-{}",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+        crate::clock::name_stamp(std::time::SystemTime::now()),
         u.get(..4).unwrap_or("0000")
     )
 }

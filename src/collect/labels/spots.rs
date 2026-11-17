@@ -20,9 +20,10 @@ use super::repeats::{
     same_object,
 };
 use super::{BoxState, LabelBox, iou, read_capped};
+use crate::clock::Zone;
 use crate::collect::layout;
 use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,10 @@ pub const SPOTS_DIR: &str = "spots";
 pub const SPOTS_VERSION: u32 = 1;
 /// Rejections older than this many days before a frame's date do not hide its boxes.
 pub const REJECTED_WINDOW_DAYS: i64 = 30;
+/// Days a folder date may be after "today" and still be in [`CameraMemory::rejected_spots`]'s
+/// window: a day folder named before the `timezone` key is a UTC date, at most one day after the
+/// date in a zone west of UTC.
+pub const FOLDER_AHEAD_DAYS: i64 = 1;
 /// The reason of a box a run accepted at a parked spot, kept as evidence.
 pub const PARKED_REASON: &str = "parked_spot";
 /// Most entries, live or retired, of one frame size in a store file.
@@ -48,7 +53,7 @@ pub struct Parked {
     pub bbox: [f32; 4],
     /// The date of the frame it was marked on (`YYYY-MM-DD`).
     pub from: String,
-    /// When it stopped counting (`YYYY-MM-DD`).
+    /// When it stopped counting (`YYYY-MM-DD`, the date in the configured zone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired: Option<String>,
 }
@@ -222,10 +227,13 @@ pub fn retire(dir: &Path, at: &Place<'_>, today: &str) -> Result<bool> {
     })
 }
 
-/// The camera moved at `now` (RFC 3339, UTC): every live parked spot retires and `moved_at` is set.
-/// Returns how many spots retired.
-pub fn camera_moved(dir: &Path, camera: &str, now: &str) -> Result<usize> {
-    let today = now.get(..10).unwrap_or(now).to_string();
+/// The camera moved at `now` (RFC 3339, UTC, stored as given): every live parked spot retires, on
+/// the date of `now` in `zone`, and `moved_at` is set. Returns how many spots retired.
+pub fn camera_moved(dir: &Path, camera: &str, now: &str, zone: Zone) -> Result<usize> {
+    let today = DateTime::parse_from_rfc3339(now).map_or_else(
+        |_| now.get(..10).unwrap_or(now).to_string(),
+        |t| zone.display_date(t),
+    );
     update(dir, camera, |s| {
         let mut n = 0;
         for p in s.parked.values_mut().flatten() {
@@ -243,31 +251,21 @@ fn parse_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
 }
 
-/// Whether a frame `rel` was taken after `moved_at` (RFC 3339, UTC). On the day of the move only a
-/// stem that gives the time can say (`20261105T102030123Z_<id>`); without it the frame counts as
-/// before: a rejection of the old view must not hide boxes of the new one.
-fn after_move(rel: &layout::Rel, moved_at: &str) -> bool {
-    let Some(day) = moved_at.get(..10) else {
+/// Whether a frame `rel` was taken after `moved_at` (RFC 3339, UTC). A stem that gives the time
+/// ([`crate::clock::parse_frame_stamp`]: `20261105T102030123Z_<id>`, or `-0800` / `p0530` for
+/// frames named in the configured zone) is compared as an instant. Without one only the day folder
+/// can say, and it may be a UTC date (folders named before the `timezone` key) or a date in
+/// `zone`, so the frame is after the move only when its folder date is after both dates of
+/// `moved_at`; otherwise it counts as before: a rejection of the old view must not hide boxes of
+/// the new one. An unreadable `moved_at` puts every frame before it.
+fn after_move(rel: &layout::Rel, moved_at: &str, zone: Zone) -> bool {
+    let Ok(moved) = DateTime::parse_from_rfc3339(moved_at).map(|t| t.to_utc()) else {
         return false;
     };
-    match rel.date.as_str().cmp(day) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        std::cmp::Ordering::Equal => {
-            let moved: String = moved_at
-                .chars()
-                .filter(|c| c.is_ascii_digit() || *c == 'T')
-                .take(18)
-                .collect();
-            let stamp = rel.stem.get(..18).filter(|s| {
-                s.as_bytes().get(8) == Some(&b'T')
-                    && s.bytes()
-                        .enumerate()
-                        .all(|(i, c)| i == 8 || c.is_ascii_digit())
-            });
-            stamp.is_some_and(|s| s >= moved.as_str())
-        }
+    if let Some(taken) = crate::clock::parse_frame_stamp(&rel.stem) {
+        return taken >= moved;
     }
+    parse_date(&rel.date).is_some_and(|d| d > moved.date_naive() && d > zone.day(moved))
 }
 
 /// A rejected spot as the Review tab lists it ([`CameraMemory::rejected_spots`]).
@@ -293,9 +291,9 @@ struct Seen {
 }
 
 impl Seen {
-    fn of(d: &Decision, camera: &str, moved_at: Option<&str>) -> Option<Self> {
+    fn of(d: &Decision, camera: &str, moved_at: Option<&str>, zone: Zone) -> Option<Self> {
         let rel = layout::parse_rel(&d.frame)?;
-        if moved_at.is_some_and(|m| !after_move(&rel, m)) {
+        if moved_at.is_some_and(|m| !after_move(&rel, m, zone)) {
             return None;
         }
         Some(Self {
@@ -331,13 +329,19 @@ pub struct CameraMemory {
 
 impl CameraMemory {
     /// From `history` ([`repeats::scan`]) and the camera's store; decisions before
-    /// [`CameraSpots::moved_at`] are left out, accepted ones with them.
+    /// [`CameraSpots::moved_at`] are left out, accepted ones with them. Frames without a time in
+    /// their name are placed by their folder date in the process-wide zone ([`Self::in_zone`]).
     pub fn new(history: &History, store: CameraSpots) -> Self {
+        Self::in_zone(history, store, crate::clock::zone())
+    }
+
+    /// [`Self::new`] with folder dates of frames without a time in their name read in `zone`.
+    pub fn in_zone(history: &History, store: CameraSpots, zone: Zone) -> Self {
         let moved = store.moved_at.clone();
         let seen = history
             .decisions
             .iter()
-            .filter_map(|d| Seen::of(d, &history.camera, moved.as_deref()))
+            .filter_map(|d| Seen::of(d, &history.camera, moved.as_deref(), zone))
             .collect();
         Self {
             camera: history.camera.clone(),
@@ -410,9 +414,11 @@ impl CameraMemory {
         })
     }
 
-    /// The camera's rejected spots as of `today`, for the page: rejected decisions in the window
-    /// grouped around the newest at a place, without mixed places and parked ones. A view of the
-    /// same rule as [`Self::rejections_at`], which compares each new box with every decision.
+    /// The camera's rejected spots as of `today` (the date in the configured zone), for the page:
+    /// rejected decisions in the window grouped around the newest at a place, without mixed places
+    /// and parked ones. A view of the same rule as [`Self::rejections_at`], which compares each new
+    /// box with every decision. A folder date up to [`FOLDER_AHEAD_DAYS`] after `today` is in the
+    /// window (a UTC folder of a frame taken this evening west of UTC).
     pub fn rejected_spots(&self, today: NaiveDate) -> Vec<RejectedSpot> {
         struct Group<'a> {
             seed: &'a Spot,
@@ -428,7 +434,9 @@ impl CameraMemory {
             .seen
             .iter()
             .filter(|s| !s.accepted())
-            .filter(|s| (0..=REJECTED_WINDOW_DAYS).contains(&(today - s.date).num_days()))
+            .filter(|s| {
+                (-FOLDER_AHEAD_DAYS..=REJECTED_WINDOW_DAYS).contains(&(today - s.date).num_days())
+            })
             .collect();
         rejected.sort_by_key(|s| std::cmp::Reverse(s.date));
         let mut groups: Vec<Group<'_>> = Vec::new();
@@ -536,7 +544,7 @@ mod tests {
 
     fn decision(day: &str, n: u32, label: &str, state: BoxState) -> Decision {
         Decision {
-            frame: format!("day/cam/{day}/20261001T00000000{n}Z_a.jpg"),
+            frame: format!("day/cam/{day}/{}T00000000{n}Z_a.jpg", day.replace('-', "")),
             label: label.into(),
             bbox: AT,
             state,
@@ -552,7 +560,7 @@ mod tests {
             decisions,
             truncated: false,
         };
-        CameraMemory::new(&h, store)
+        CameraMemory::in_zone(&h, store, Zone::Utc)
     }
 
     fn rejected(days: &[&str]) -> Vec<Decision> {
@@ -653,9 +661,118 @@ mod tests {
         let rel =
             |stem: &str| layout::parse_rel(&format!("day/cam/2026-10-05/{stem}.jpg")).unwrap();
         let moved = "2026-10-05T12:00:00.000Z";
-        assert!(!after_move(&rel("20261005T115959999Z_a"), moved));
-        assert!(after_move(&rel("20261005T120000000Z_a"), moved));
-        assert!(!after_move(&rel("cam-0001"), moved));
+        assert!(!after_move(&rel("20261005T115959999Z_a"), moved, Zone::Utc));
+        assert!(after_move(&rel("20261005T120000000Z_a"), moved, Zone::Utc));
+        assert!(!after_move(&rel("cam-0001"), moved, Zone::Utc));
+    }
+
+    fn at(day: &str, stem: &str) -> layout::Rel {
+        layout::parse_rel(&format!("day/cam/{day}/{stem}.jpg")).unwrap()
+    }
+
+    #[test]
+    fn old_utc_and_new_zone_stems_are_compared_as_instants() {
+        let la: Zone = "America/Los_Angeles".parse().unwrap();
+        // 2026-11-16 19:00 PST: the 17th in UTC, the 16th in Los Angeles.
+        let moved = "2026-11-17T03:00:00.000Z";
+        for zone in [la, Zone::Utc, "+14:00".parse().unwrap()] {
+            let after = |day: &str, stem: &str| after_move(&at(day, stem), moved, zone);
+            // Old stems in UTC folders.
+            assert!(!after("2026-11-17", "20261117T025959999Z_a"));
+            assert!(after("2026-11-17", "20261117T030000000Z_a"));
+            // New stems in Los Angeles folders: the folder is the day before the move's UTC
+            // date, and only the instant counts.
+            assert!(!after("2026-11-16", "20261116T185959999-0800_a"));
+            assert!(after("2026-11-16", "20261116T190000000-0800_a"));
+            // Named at +05:30.
+            assert!(!after("2026-11-17", "20261117T082959999p0530_a"));
+            assert!(after("2026-11-17", "20261117T083000000p0530_a"));
+            // An import's stem.
+            assert!(after(
+                "2026-11-16",
+                "20261116T190000001-0800_imp-ab12-00003"
+            ));
+            // An unreadable `moved_at` puts every frame before it.
+            assert!(!after_move(
+                &at("2026-12-01", "20261201T000000000Z_a"),
+                "moved",
+                zone
+            ));
+        }
+    }
+
+    #[test]
+    fn without_a_time_in_the_name_the_folder_must_be_after_both_dates_of_the_move() {
+        let la: Zone = "America/Los_Angeles".parse().unwrap();
+        let east: Zone = "+14:00".parse().unwrap();
+        let after =
+            |day: &str, moved: &str, zone: Zone| after_move(&at(day, "cam-0001"), moved, zone);
+        // 2026-11-17T03:00Z: the 17th in UTC, the 16th in Los Angeles, the 17th at +14:00.
+        let moved = "2026-11-17T03:00:00.000Z";
+        for zone in [la, Zone::Utc, east] {
+            assert!(!after("2026-11-16", moved, zone), "{zone}");
+            assert!(!after("2026-11-17", moved, zone), "{zone}: the UTC date");
+            assert!(after("2026-11-18", moved, zone), "{zone}");
+        }
+        // 2026-11-17T12:00Z is the 18th at +14:00: a folder of the 18th may be from before.
+        let moved = "2026-11-17T12:00:00.000Z";
+        assert!(!after("2026-11-18", moved, east));
+        assert!(after("2026-11-19", moved, east));
+        assert!(after("2026-11-18", moved, la));
+        // A camera memory places such frames the same way.
+        let d = |frame: &str| Decision {
+            frame: frame.into(),
+            label: "car".into(),
+            bbox: AT,
+            state: BoxState::Rejected,
+            reject_reason: None,
+            width: 640,
+            height: 480,
+        };
+        let h = History {
+            camera: "cam".into(),
+            decisions: vec![
+                d("day/cam/2026-10-15/20261015T025959999Z_a.jpg"),
+                d("day/cam/2026-10-14/20261014T200000000-0700_b.jpg"),
+                d("day/cam/2026-10-15/20261015T083000000p0530_c.jpg"),
+                d("day/cam/2026-10-15/cam-0001.jpg"),
+                d("day/cam/2026-10-16/cam-0002.jpg"),
+            ],
+            truncated: false,
+        };
+        let store = CameraSpots {
+            moved_at: Some("2026-10-15T03:00:00.000Z".into()),
+            ..CameraSpots::default()
+        };
+        let m = CameraMemory::in_zone(&h, store, la);
+        let mut kept: Vec<&str> = m.seen.iter().map(|s| s.frame.as_str()).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            [
+                "day/cam/2026-10-14/20261014T200000000-0700_b.jpg",
+                "day/cam/2026-10-15/20261015T083000000p0530_c.jpg",
+                "day/cam/2026-10-16/cam-0002.jpg",
+            ]
+        );
+        assert_eq!(hits(&m, "car"), 3);
+    }
+
+    #[test]
+    fn the_page_window_takes_a_utc_folder_one_day_ahead_of_today() {
+        // Rejections on two frames of a UTC folder dated the day after the zone's today (an
+        // evening west of UTC, before the `timezone` key).
+        let m = memory(
+            rejected(&["2026-10-21", "2026-10-21"]),
+            CameraSpots::default(),
+        );
+        let today = NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        assert_eq!(m.rejected_spots(today).len(), 1);
+        let m = memory(
+            rejected(&["2026-10-22", "2026-10-22"]),
+            CameraSpots::default(),
+        );
+        assert!(m.rejected_spots(today).is_empty(), "two days ahead");
     }
 
     #[test]
@@ -728,13 +845,36 @@ mod tests {
         assert_eq!(back.from, "2026-10-11");
         // The move retires what is live and remembers when.
         assert_eq!(
-            camera_moved(&dir, "cam", "2026-10-12T01:02:03.004Z").unwrap(),
+            camera_moved(
+                &dir,
+                "cam",
+                "2026-10-12T01:02:03.004Z",
+                "America/Los_Angeles".parse().unwrap()
+            )
+            .unwrap(),
             2
         );
         let s = read(&dir, "cam").unwrap();
         assert_eq!(s.live_count(), 0);
+        // `moved_at` stays UTC; the spots retire on the date in the zone (18:02 PDT the 11th).
         assert_eq!(s.moved_at.as_deref(), Some("2026-10-12T01:02:03.004Z"));
-        assert_eq!(s.parked["640x480"].len(), 3, "kept, retired");
+        let retired: Vec<Option<&str>> = s.parked["640x480"]
+            .iter()
+            .map(|p| p.retired.as_deref())
+            .collect();
+        assert_eq!(
+            retired,
+            [Some("2026-10-10"), Some("2026-10-11"), Some("2026-10-11")],
+            "kept, retired"
+        );
+        // A `now` that is not RFC 3339 keeps its first ten characters, as before.
+        add_parked(&dir, &place("car", AT), "2026-10-13").unwrap();
+        camera_moved(&dir, "cam", "2026-10-14", Zone::Utc).unwrap();
+        let s = read(&dir, "cam").unwrap();
+        assert_eq!(
+            s.parked["640x480"][3].retired.as_deref(),
+            Some("2026-10-14")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -21,6 +21,7 @@ mod js_poll;
 mod js_review_refine;
 mod js_review_touch;
 mod js_rules;
+mod js_time;
 mod js_viewport;
 mod live_config;
 mod multi_model_http;

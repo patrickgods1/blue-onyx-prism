@@ -6,12 +6,11 @@
 //! receives what is new. `cli::init_logging_with` always installs it under the reloadable level
 //! filter, so it holds exactly what the configured level emits.
 
-use crate::config::LogTimezone;
 use crate::sync::LockExt;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
@@ -54,8 +53,8 @@ fn entry_bytes(e: &LogEntry) -> usize {
 pub struct LogEntry {
     /// 1-based, increasing by one per event (also across evictions).
     pub seq: u64,
-    /// RFC 3339 with milliseconds in the log time zone at the time of the event (`...Z` for
-    /// UTC, else the numeric offset).
+    /// RFC 3339 with milliseconds in the process-wide zone ([`crate::clock`]) at the time of the
+    /// event (`...Z` for UTC, else the numeric offset).
     pub ts: String,
     /// `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`.
     pub level: &'static str,
@@ -78,26 +77,17 @@ struct Ring {
 #[derive(Debug, Clone)]
 pub struct LogBuffer {
     inner: Arc<Mutex<Ring>>,
-    tz: SharedTimezone,
 }
 
-/// The time zone of log timestamps, shared by the log timers and the [`LogBuffer`] so a config
-/// change applies to all of them at once.
-pub type SharedTimezone = Arc<RwLock<LogTimezone>>;
-
-/// The zone in `tz` (a poisoned lock still holds a valid value).
-pub fn current_timezone(tz: &SharedTimezone) -> LogTimezone {
-    *tz.read().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// `tracing_subscriber` timer printing `now` in the shared time zone: `...580Z` for UTC, else
-/// RFC 3339 with milliseconds and the numeric offset.
-#[derive(Debug, Clone)]
-pub struct LogTimer(pub SharedTimezone);
+/// `tracing_subscriber` timer printing `now` in the process-wide zone ([`crate::clock::zone`],
+/// so a config change applies to every sink and the [`LogBuffer`] at once): `...580Z` for UTC,
+/// else RFC 3339 with milliseconds and the numeric offset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogTimer;
 
 impl tracing_subscriber::fmt::time::FormatTime for LogTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        w.write_str(&current_timezone(&self.0).format(chrono::Utc::now()))
+        w.write_str(&crate::clock::log_stamp(chrono::Utc::now()))
     }
 }
 
@@ -145,13 +135,7 @@ impl LogBuffer {
                 last_seq: 0,
                 bytes: 0,
             })),
-            tz: SharedTimezone::default(),
         }
-    }
-
-    /// The shared time zone this buffer stamps entries with (set it to change the zone).
-    pub fn timezone(&self) -> SharedTimezone {
-        self.tz.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Ring> {
@@ -160,7 +144,7 @@ impl LogBuffer {
 
     /// Append an entry (evicting the oldest when full); returns its sequence number.
     pub fn push(&self, level: Level, target: &str, message: String) -> u64 {
-        let ts = current_timezone(&self.tz).format(chrono::Utc::now());
+        let ts = crate::clock::log_stamp(chrono::Utc::now());
         let entry = LogEntry {
             seq: 0,
             ts,
@@ -385,15 +369,20 @@ mod tests {
         assert_eq!(p.entries[0].level, "INFO");
         assert_eq!(p.entries[1].target, "custom");
         assert_eq!(p.entries[1].message, "plain");
-        assert!(p.entries[0].ts.ends_with('Z'));
+        assert!(chrono::DateTime::parse_from_rfc3339(&p.entries[0].ts).is_ok());
     }
 
     #[test]
-    fn entries_follow_the_shared_time_zone() {
+    fn entries_follow_the_process_time_zone() {
+        let _g = crate::clock::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = crate::clock::set(crate::clock::Zone::Utc);
         let b = LogBuffer::new(10);
         b.push(Level::INFO, "t", "utc".into());
-        *b.timezone().write().unwrap() = "+08:00".parse().unwrap();
+        crate::clock::set("+08:00".parse().unwrap());
         b.push(Level::INFO, "t", "plus8".into());
+        crate::clock::set(before);
         let p = b.since(0, None, 10);
         assert!(p.entries[0].ts.ends_with('Z'), "{}", p.entries[0].ts);
         assert!(p.entries[1].ts.ends_with("+08:00"), "{}", p.entries[1].ts);

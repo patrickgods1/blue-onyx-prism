@@ -135,7 +135,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     `__Host-bop_session` cookie or `Authorization: Bearer <API token>` (`admin_token.rs`, read per check, own
     `admin_failures` bucket). `X-Prism-Poll: 1` (or the `__Host-bop_poll` cookie) marks a poll that leaves the idle
     clock alone. `users.json` missing -> browsers 303 `/setup`; broken -> 503, never setup. Unauthenticated answers are
-    `no-store`; HTML pages get the user name at `<!--bop:user-->` (`auth::show_user`).
+    `no-store`; HTML pages get the user name at `<!--bop:user-->` and the zone at `<html data-tz="<!--bop:tz-->">`
+    (`auth::personalize`; the outermost `auth::fill_zone` fills the zone on pages without a session).
   - Routes answer only under an IP address, `localhost` or an `allowed_hosts` name (`guard::foreign_host`, DNS
     rebinding; `GET /v1/config` is open and applies the Host check and sign-in itself). CSRF on TLS: `Origin`/`Referer`
     must be `https://<Host>`, `Sec-Fetch-Site: same-site` refused. `direct_local` (loopback, no forwarding header) is
@@ -207,6 +208,13 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - `verify` (`src/verify.rs` pure decision, `worker/verify.rs` per-worker lane): night person candidates re-checked by
     another model, fail-open, never blocks the inference thread; reads `VisionDetectionResponse.dropped`, never message
     text. `benchmark --variants` (`benchmark/variant.rs`) runs stats -> enhance -> filters like the service.
+
+- **Time zone** (`src/clock.rs`, std + chrono leaf): config `timezone` (default `local`; the retired `log_timezone` is
+  read, `"utc"` = unset) for log stamps, file / folder names (run ids, dataset day folders and frame stems, exports,
+  reports, log files) and every time shown (pages via `PrismTime` in `assets/time.js`, CLI, reports). Stored record
+  timestamps stay UTC, and so does the Blue Iris `timestampUTC`. Pure `Zone` methods (`display`, `day`, `frame_stamp`,
+  ...) plus wrappers over the process-wide zone (`clock::set` / `change` / `zone`); tests use the methods and never
+  assert text from the global.
 
 - **Config** (`src/config.rs`, `config_store.rs`, `config_merge.rs`): JSON next to the exe; CLI overrides only non-default
   values and writes back. Every UI writer goes through `save_config` (last write wins).

@@ -562,6 +562,7 @@ pub(crate) fn router(state: impl Into<Shared>) -> Router {
         ))
         .layer(axum::middleware::from_fn(guard::legacy_cookie))
         .layer(axum::middleware::from_fn(catch_panic))
+        .layer(axum::middleware::map_response(auth::fill_zone))
         .layer(axum::middleware::map_response(guard::security_headers))
         .with_state(shared)
 }
@@ -729,10 +730,7 @@ pub(super) async fn admin_only(
             let poll_load = auth::cookie(req.headers(), auth::POLL_COOKIE).is_some();
             req.extensions_mut().insert(signed);
             let resp = next.run(req).await;
-            let mut resp = match user {
-                Some(user) => auth::show_user(resp, &user).await,
-                None => resp,
-            };
+            let mut resp = auth::personalize(resp, user.as_deref()).await;
             if poll_load {
                 auth::clear_poll_cookie(&mut resp);
             }

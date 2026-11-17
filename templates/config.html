@@ -211,6 +211,16 @@
   <input type="hidden" name="inference_settings" value="1">
   <input type="hidden" name="image_settings" value="1">
 
+  <fieldset class="group" id="general">
+    <legend>General {{ self.badge("timezone")|safe }}</legend>
+    <label>Time zone
+      <select name="timezone" title="Used for log lines, file and folder names, and every time shown here, in the command line and in reports. Other IANA names (Europe/Paris) or offsets (+08:00) can be set as timezone in the config file">
+      {% for t in timezones %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <p class="muted">Log lines, new file and folder names (dataset days and frames, runs, reports) and the times on these pages follow it. Times stored inside records stay UTC; the Blue Iris API's <code>timestampUTC</code> stays UTC.</p>
+  </fieldset>
+
   <fieldset class="group">
     <legend>Network and access {{ self.badge("port,https_port,bind_address,request_timeout_secs,worker_queue_size")|safe }}</legend>
     <label>Port {{ self.badge("port")|safe }} <input inputmode="numeric" type="number" name="port" min="1" max="65535" value="{{ c.port }}" required> <span class="muted">(plain HTTP: Blue Iris and the detection API)</span></label>
@@ -275,15 +285,10 @@
   </fieldset>
 
   <fieldset class="group" id="logging">
-    <legend>Logging and images {{ self.badge("log_level,log_timezone,log_path,save_image_path,save_image_max_age_days,save_image_max_mb,save_ref_image")|safe }}</legend>
+    <legend>Logging and images {{ self.badge("log_level,log_path,save_image_path,save_image_max_age_days,save_image_max_mb,save_ref_image")|safe }}</legend>
     <label>Log level {{ self.badge("log_level")|safe }}
       <select name="log_level">
       {% for l in log_levels %}<option value="{{ l.value }}"{% if l.selected %} selected{% endif %}>{{ l.value }}</option>{% endfor %}
-      </select>
-    </label>
-    <label>Log timestamp time zone {{ self.badge("log_timezone")|safe }}
-      <select name="log_timezone" title="Other IANA names (America/Los_Angeles) or offsets (+08:00) can be set as log_timezone in the config file">
-      {% for t in log_timezones %}<option value="{{ t.value }}"{% if t.selected %} selected{% endif %}>{{ t.label }}</option>{% endfor %}
       </select>
     </label>
     <label>Log directory (empty = stdout) {{ self.badge("log_path")|safe }} <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="log_path" value="{{ c.log_path }}"><button type="button" class="browse secondary" data-browse="folder" data-target="log_path" data-title="Choose the log folder" hidden>Browse&hellip;</button></span></label>
