@@ -115,6 +115,9 @@ pub struct Store {
     /// Tests: make the next writes fail with this error kind.
     #[cfg(test)]
     pub(super) fail_writes: Option<std::io::ErrorKind>,
+    /// Tests: the zone of day folders and stems instead of the process-wide one.
+    #[cfg(test)]
+    pub(super) zone: Option<crate::clock::Zone>,
 }
 
 impl std::fmt::Debug for Store {
@@ -194,6 +197,8 @@ impl Store {
             free_probe,
             #[cfg(test)]
             fail_writes: None,
+            #[cfg(test)]
+            zone: None,
         }
     }
 
@@ -534,11 +539,16 @@ impl Store {
         if let Some(kind) = self.fail_writes {
             return Err(std::io::Error::from(kind));
         }
+        // Day folder and stem in the configured zone as of this write (a zone change takes effect
+        // with the next frame); the sidecar's `timestamp` stays UTC.
+        let zone = crate::clock::zone();
+        #[cfg(test)]
+        let zone = self.zone.unwrap_or(zone);
         let r = &mut frame.record;
-        let date = super::utc_date(frame.at);
+        let date = layout::day_folder(zone, frame.at);
         let stem = format!(
             "{}_{}",
-            super::utc_file_ts(frame.at),
+            zone.frame_stamp(frame.at),
             layout::safe_id(&r.request_id)
         );
         let rel = layout::Rel {
@@ -747,6 +757,45 @@ mod tests {
         // The summary rebuilt from disk equals the live one.
         assert_eq!(Summary::scan(&tmp.0), st.summary);
         assert_eq!(st.summary.count("day", Bucket::Positive), 1);
+    }
+
+    #[test]
+    fn day_folders_and_stems_follow_the_zone() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let mut st = store();
+        // 2026-09-22T00:13:20Z: still the 21st in Los Angeles (PDT), the 22nd in UTC and India.
+        let at = t(10 * 3600);
+        let saved = |st: &mut Store, camera: &str, rid: &str, seed: u32| {
+            let out = st.handle(frame(&s, positive(camera, rid, at), seed));
+            let Handled::Saved { rel, .. } = out else {
+                panic!("{out:?}")
+            };
+            rel
+        };
+        st.zone = Some("America/Los_Angeles".parse().unwrap());
+        let la = saved(&mut st, "a", "r1", 1);
+        assert_eq!(la, "day/a/2026-09-21/20260921T171320000-0700_r1.jpg");
+        st.zone = Some(crate::clock::Zone::Utc);
+        let utc = saved(&mut st, "b", "r2", 2);
+        assert_eq!(utc, "day/b/2026-09-22/20260922T001320000Z_r2.jpg");
+        st.zone = Some("+05:30".parse().unwrap());
+        let ist = saved(&mut st, "c", "r3", 3);
+        assert_eq!(ist, "day/c/2026-09-22/20260922T054320000p0530_r3.jpg");
+        for rel in [&la, &utc, &ist] {
+            let r = layout::parse_rel(rel).unwrap();
+            assert_eq!(
+                crate::clock::parse_frame_stamp(&r.stem),
+                Some(at.into()),
+                "{rel}"
+            );
+            let jpg = layout::resolve(&tmp.0, rel, "jpg").unwrap();
+            let side: Record =
+                serde_json::from_slice(&std::fs::read(jpg.with_extension("json")).unwrap())
+                    .unwrap();
+            assert_eq!(side.id, r.stem);
+        }
+        assert_eq!(Summary::scan(&tmp.0), st.summary);
     }
 
     #[test]

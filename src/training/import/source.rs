@@ -4,7 +4,8 @@
 //! explained, never read), [`check_url`] refuses URLs of unsecured-camera aggregators, internal
 //! hosts and anything but http(s), [`check_resolved`] refuses names that resolve to an internal
 //! address, [`check_license`] enforces the per-import licence confirmation, and
-//! [`blue_iris_time`] / [`camera_of`] read Blue Iris file names (`Driveway.20240315_083012.mp4`).
+//! [`blue_iris_time`] (wall time in the configured zone) / [`camera_of`] read Blue Iris file names
+//! (`Driveway.20240315_083012.mp4`).
 
 use anyhow::{Result, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -639,9 +640,13 @@ pub fn check_license(
 }
 
 /// The recording time of a Blue Iris file name (`Driveway.20240315_083012.mp4`,
-/// `Cam1.20240315_083012.123456.3-1.jpg`): the first `.YYYYMMDD_HHMMSS` part, as local time
-/// is unknown taken as UTC.
-pub fn blue_iris_time(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+/// `Cam1.20240315_083012.123456.3-1.jpg`): the first `.YYYYMMDD_HHMMSS` part. Blue Iris names
+/// files by the wall clock of its computer, so the time is read in `zone` (the configured
+/// `timezone`, [`crate::clock::Zone::parse_wall`]: the earlier hour at a DST fold).
+pub fn blue_iris_time(
+    name: &str,
+    zone: crate::clock::Zone,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     for part in file.split('.').skip(1) {
         let b = part.as_bytes();
@@ -653,7 +658,7 @@ pub fn blue_iris_time(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         {
             let s = part.get(..15)?;
             if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y%m%d_%H%M%S") {
-                return Some(t.and_utc());
+                return zone.parse_wall(t);
             }
         }
     }
@@ -718,7 +723,8 @@ pub fn segment_offsets(videos: &[(&str, Option<f64>)]) -> Vec<f64> {
     out
 }
 
-/// The recording time of a MEVA clip name (`2018-03-11.23-55-00.00-00-00.school.G639.r13.avi`).
+/// The recording time of a MEVA clip name (`2018-03-11.23-55-00.00-00-00.school.G639.r13.avi`),
+/// UTC: a public dataset's times, not the user's cameras.
 pub fn meva_time(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let mut parts = file.split('.');
@@ -1072,18 +1078,43 @@ mod tests {
 
     #[test]
     fn blue_iris_and_meva_names() {
-        let t = blue_iris_time("Driveway.20240315_083012.mp4").unwrap();
+        use crate::clock::Zone;
+        let utc = Zone::Utc;
+        let t = blue_iris_time("Driveway.20240315_083012.mp4", utc).unwrap();
         assert_eq!(t.to_rfc3339(), "2024-03-15T08:30:12+00:00");
-        assert!(
-            blue_iris_time("D:\\BlueIris\\Alerts\\Cam1.20240315_083012.123456.3-1.jpg").is_some()
+        // Blue Iris writes its computer's wall time: read in the configured zone.
+        let la: Zone = "America/Los_Angeles".parse().unwrap();
+        let t = blue_iris_time("Driveway.20240315_083012.mp4", la).unwrap();
+        assert_eq!(t.to_rfc3339(), "2024-03-15T15:30:12+00:00", "PDT, -07:00");
+        let t = blue_iris_time("Driveway.20240115_083012.mp4", la).unwrap();
+        assert_eq!(t.to_rfc3339(), "2024-01-15T16:30:12+00:00", "PST, -08:00");
+        let ist: Zone = "+05:30".parse().unwrap();
+        let t = blue_iris_time("Driveway.20240315_083012.mp4", ist).unwrap();
+        assert_eq!(t.to_rfc3339(), "2024-03-15T03:00:12+00:00");
+        // The fold night (01:30 twice): the earlier, PDT; the gap night's 02:30 is 03:30 PDT.
+        let t = blue_iris_time("Cam.20261101_013000.mp4", la).unwrap();
+        assert_eq!(t.to_rfc3339(), "2026-11-01T08:30:00+00:00");
+        let t = blue_iris_time("Cam.20260308_023000.mp4", la).unwrap();
+        assert_eq!(t.to_rfc3339(), "2026-03-08T10:30:00+00:00");
+        // The frame's stem names the same wall time back.
+        assert_eq!(
+            la.frame_stamp(blue_iris_time("Cam.20261116_140211.mp4", la).unwrap()),
+            "20261116T140211000-0800"
         );
         assert!(
-            blue_iris_time("Cam1.20241315_083012.mp4").is_none(),
+            blue_iris_time(
+                "D:\\BlueIris\\Alerts\\Cam1.20240315_083012.123456.3-1.jpg",
+                utc
+            )
+            .is_some()
+        );
+        assert!(
+            blue_iris_time("Cam1.20241315_083012.mp4", utc).is_none(),
             "month 13"
         );
-        assert!(blue_iris_time("clip.mp4").is_none());
+        assert!(blue_iris_time("clip.mp4", utc).is_none());
         let seg = "/v/Export/Back.20261010_160000_12.mp4";
-        assert!(blue_iris_time(seg).is_some());
+        assert!(blue_iris_time(seg, la).is_some());
         assert_eq!(
             blue_iris_segment(seg),
             Some(("/v/Export/Back.20261010_160000", 12))

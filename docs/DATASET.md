@@ -40,14 +40,23 @@ folder. Nothing is uploaded anywhere.
   refine/report-quick.json               report of the last quick check (`mode: model`; each mode keeps its own)
   <scene>/                               day | night | ir (src/image_stats.rs)
     <camera>/                            camera folder (see below)
-      <YYYY-MM-DD>/                      UTC date
+      <YYYY-MM-DD>/                      date in the configured `timezone` (UTC before that key)
         index.jsonl                      one line per frame of this folder
         <ts>_<request_id>.jpg            the frame
         <ts>_<request_id>.json           its sidecar
 ```
 
-- **`<ts>`** is the UTC time in milliseconds: `20261022T123456789Z`. `<request_id>` is the request's id
-  from the logs and the `X-Request-Id` header, limited to `[A-Za-z0-9_-]` and at most 32 characters.
+- **`<ts>`** is the frame's time to the millisecond, as wall time in the configured `timezone` followed by
+  its offset from UTC: `YYYYMMDDTHHMMSSmmm` + `-hhmm` west of UTC (`20261022T053456789-0700`), `phhmm` east
+  of it (`20261022T180456789p0530`; `p`, because a stem allows only `[A-Za-z0-9_-]` and `+` is a space in a
+  URL), `Z` at offset 0 (`20261022T123456789Z`). Its first 8 digits are always the day folder's date.
+  `<request_id>` is the request's id from the logs and the `X-Request-Id` header, limited to
+  `[A-Za-z0-9_-]` and at most 32 characters.
+- **Time zone.** Frames written before the `timezone` key have UTC day folders and `...Z` stems; they stay
+  where they are, and every reader takes both forms (`clock::parse_frame_stamp`). Only new frames follow the
+  zone, and a change of `timezone` applies from the next frame. At the switch, a UTC folder and a folder
+  of the zone can have the same name and then hold frames of both: this moves at most one day boundary of
+  each camera, by the zone's offset. The sidecar's `timestamp` and the index's stay UTC.
 - **`<camera>`** is the camera part of `static_memory::camera_key`: the upload's file name up to the
   first `.`, without trailing digits, `_` and `-`, lowercase. So `Driveway.20240101_120000.jpg` becomes
   `driveway`.
@@ -177,8 +186,9 @@ the version. Readers ignore unknown fields and skip records with a newer `versio
 ### Imported frames
 
 Frames of a footage import (`train import`, docs/TRAINING.md "Footage import") use the same layout,
-file names `<UTC ms>_imp-<import id>-<n>.jpg`, and a version-1 sidecar with no detections (`raw`,
-`predictions`, `suppressed` empty, `buckets` empty, `model: "import"`, `threshold: 0`) plus:
+file names `<ts>_imp-<import id>-<n>.jpg` (`<ts>` and the day folder in the configured `timezone`, as
+above), and a version-1 sidecar with no detections (`raw`, `predictions`, `suppressed` empty, `buckets`
+empty, `model: "import"`, `threshold: 0`) plus:
 
 ```json
 {
@@ -200,8 +210,12 @@ file names `<UTC ms>_imp-<import id>-<n>.jpg`, and a version-1 sidecar with no d
   `attribution`; nothing to confirm).
 - `time_offset_s`: seconds from the start of the video (absent for an image). `timestamp` is the
   recording time when the file name has one (Blue Iris, MEVA), else the file's modification time.
-  A Blue Iris name holds local time and is stored as if it were UTC, while collected frames use real
-  UTC, so frames of the same hour from the two sources can land in different day folders.
+  A Blue Iris name holds its computer's wall time and is read in the configured `timezone` (at a
+  daylight-saving fold, the earlier of the two hours); a MEVA name is UTC. Set `timezone` to Blue Iris's
+  zone, so imported and collected frames of one hour share a day folder. Imports made before the key
+  read Blue Iris names as UTC. Importing the same footage again skips its frames (same camera,
+  millisecond and dHash) also when the earlier copy was named in another zone or in UTC, except a Blue
+  Iris clip imported before the key: its time was read differently.
 - The camera folder is `--camera`, else the Blue Iris camera of the file name, `meva-<site>-<camera>`
   for MEVA, a URL's host, or `import`.
 - The import appends its frames to `review-queue.jsonl` and one line to `<dir>/imports.jsonl` (id,
@@ -688,8 +702,9 @@ uneven. So:
 1. a re-label disagreement first, repeat-only frames last (as below);
 2. the **event rank** (item field `event_rank`, 0 = the event's first frame to review; the page's details show
    *event: frame N*): the first frame of every event comes before any second one. An event is one camera's
-   activity: frames of one day folder (`<scene>/<camera>/<date>`, so an event ends at UTC midnight and at a scene
-   change) at most 60 s apart (`EVENT_GAP_S`), at most 600 s from its first frame (`EVENT_MAX_S`). A frame whose
+   activity: frames of one day folder (`<scene>/<camera>/<date>`, so an event ends at midnight of the zone the
+   folder was named in, and at a scene change) at most 60 s apart (`EVENT_GAP_S`), at most 600 s from its first
+   frame (`EVENT_MAX_S`). A frame whose
    time does not parse, and an imported frame without a real time within its source (sidecar `model: "import"`
    with no `provenance`, `provenance.kind: "image"` or no `provenance.time_offset_s`: image-folder imports carry
    file times, and import already spread its frames out), is an event of its own (`recommend::own_event`). A frame
@@ -914,9 +929,12 @@ this time, with a warning.
 ```
 
 - **`from`:** the date of the frame where you pressed *Real, parked*.
-- **`retired`** (optional): the date the spot stopped counting. The entry stays as a record.
-- **`moved_at`** (optional): when you pressed *Camera moved: forget spots*. Decisions on frames from before
-  it no longer count.
+- **`retired`** (optional): the date the spot stopped counting, in the configured `timezone`. The entry
+  stays as a record.
+- **`moved_at`** (optional): when you pressed *Camera moved: forget spots* (RFC 3339, UTC). Decisions on
+  frames from before it no longer count: a frame's time comes from its name, compared as an instant
+  whether the name is UTC (`...Z`) or carries an offset; a name without a time counts as after the move only
+  when its day folder is later than both the UTC date and the zone's date of `moved_at`.
 
 Rejected spots are not stored: they are derived from your decisions in the label files. What a run does
 with both kinds is in [docs/TRAINING.md](TRAINING.md#spot-memory-of-fixed-cameras).
@@ -960,7 +978,8 @@ Click a box to select it. Drag on the image to draw a new one.
 ```
 
 - **`formats`** (or `format`): one name, a list, or `all`. Default: all formats.
-- **`out_dir`:** a new or empty folder. Default: `<data root>/training/exports/<UTC time>`.
+- **`out_dir`:** a new or empty folder. Default: `<data root>/training/exports/<ts>` (a frame time as
+  above, in the configured `timezone`).
 - **`labels`** (default empty = every class): export only the frames with a training box (accepted or
   added) of one of these classes. The other boxes of a kept frame stay labelled, and class ids still
   follow `collect.classes`. Every name must be in `collect.classes`; another one is a 400 that names

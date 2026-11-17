@@ -1,6 +1,9 @@
 //! On-disk layout of the dataset folder (`docs/DATASET.md`):
 //! `<dir>/<scene>/<camera>/<YYYY-MM-DD>/<ts>_<request_id>.{jpg,json}`, one `index.jsonl` per day
-//! folder, and `<dir>/review-queue.jsonl`. Names, the relative-path check every served or
+//! folder, and `<dir>/review-queue.jsonl`. A new frame's day folder ([`day_folder`]) and `<ts>`
+//! ([`crate::clock::Zone::frame_stamp`], `20261116T140211583-0800`) are in the configured
+//! `timezone`; frames written before that key have UTC folders and `...Z` stems, and both read
+//! alike ([`crate::clock::parse_frame_stamp`]). Names, the relative-path check every served or
 //! queued path goes through ([`parse_rel`], [`resolve`], and [`Walker`] for a walk over many
 //! frames), the summary rebuilt from the index files ([`Summary::scan`]) and the review queue
 //! ([`append_review`]; [`compact_review`] drops its duplicate and dangling lines, both under the
@@ -67,6 +70,13 @@ pub fn safe_id(id: &str) -> String {
         .take(MAX_ID_LEN)
         .collect();
     if s.is_empty() { "req".into() } else { s }
+}
+
+/// The day folder (`YYYY-MM-DD`) of a frame taken at `t`: its date in `zone`, the same date as
+/// the first 8 digits of its stem ([`crate::clock::Zone::frame_stamp`]). The collector and the
+/// import both name folders through this.
+pub fn day_folder(zone: crate::clock::Zone, t: impl Into<chrono::DateTime<chrono::Utc>>) -> String {
+    zone.day(t).format("%Y-%m-%d").to_string()
 }
 
 /// A frame's path relative to the dataset folder, checked.
@@ -850,6 +860,64 @@ mod tests {
         ] {
             assert!(parse_rel(bad).is_none(), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn stems_of_every_zone_are_valid_paths() {
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let zone = |s: &str| s.parse::<crate::clock::Zone>().unwrap();
+        // The new stems, with the longest request id, and the old UTC one.
+        let id = "x".repeat(MAX_ID_LEN);
+        for ok in [
+            format!("day/cam/2026-11-16/20261116T140211583-0800_{id}.jpg"),
+            format!("day/cam/2026-11-17/20261117T033211583p0530_{id}.json"),
+            "day/cam/2026-11-16/20261116T220211583Z_abc.jpg".to_string(),
+            "day/cam/2026-11-16/20261116T140211583-0800_imp-abcd1234-00001.jpg".to_string(),
+        ] {
+            let r = parse_rel(&ok).unwrap_or_else(|| panic!("{ok} refused"));
+            assert!(crate::clock::parse_frame_stamp(&r.stem).is_some(), "{ok}");
+        }
+        // `+` is never written; a path holding one is refused.
+        assert!(parse_rel("day/cam/2026-11-17/20261117T033211583+0530_a.jpg").is_none());
+        // The folder is the stem's date, in every zone, across midnight edges.
+        let instants = [
+            "2026-11-17T07:59:59.999Z",
+            "2026-11-17T08:00:00.000Z",
+            "2026-11-16T18:29:59.999Z",
+            "2026-11-16T18:30:00.000Z",
+            "2026-11-16T23:59:59.999Z",
+            "2026-03-08T10:00:00.000Z",
+            "2026-11-01T08:30:00.000Z",
+        ];
+        for z in [
+            "utc",
+            "local",
+            "America/Los_Angeles",
+            "Asia/Kolkata",
+            "+14:00",
+            "-12:00",
+        ] {
+            for i in instants {
+                let (z, t) = (zone(z), at(i));
+                let date = day_folder(z, t);
+                let stem = format!("{}_{}", z.frame_stamp(t), safe_id("req-1"));
+                let rel = format!("night/cam/{date}/{stem}.jpg");
+                let r = parse_rel(&rel).unwrap_or_else(|| panic!("{rel} refused"));
+                assert_eq!(
+                    Some(r.date.replace('-', "").as_str()),
+                    r.stem.get(..8),
+                    "{rel}"
+                );
+                assert_eq!(crate::clock::parse_frame_stamp(&r.stem), Some(t), "{rel}");
+            }
+        }
+        let la = zone("America/Los_Angeles");
+        assert_eq!(day_folder(la, at("2026-11-17T07:59:59.999Z")), "2026-11-16");
+        assert_eq!(day_folder(la, at("2026-11-17T08:00:00Z")), "2026-11-17");
+        assert_eq!(
+            day_folder(crate::clock::Zone::Utc, at("2026-11-17T07:59:59Z")),
+            "2026-11-17"
+        );
     }
 
     #[test]

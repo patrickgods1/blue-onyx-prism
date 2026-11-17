@@ -7,6 +7,7 @@
 //! the frame's files are removed again, so a frame is either complete or absent. A write that
 //! stops part way ([`write_frames_with`]) answers the frames written so far.
 
+use crate::clock::Zone;
 use crate::collect::layout::{self, Rel};
 use crate::collect::record::{self, ImageInfo, IndexLine, Provenance, Record, Stats};
 use crate::image_stats::ImageStats;
@@ -53,13 +54,34 @@ pub struct ImportLine {
     pub scenes: std::collections::BTreeMap<String, usize>,
 }
 
+impl ImportLine {
+    /// `created` (stored UTC) for people, in `zone` ([`Zone::display`], `2026-11-16 14:02 PST`);
+    /// the stored text when it is not RFC 3339.
+    pub fn created_in(&self, zone: Zone) -> String {
+        chrono::DateTime::parse_from_rfc3339(&self.created)
+            .map_or_else(|_| self.created.clone(), |t| zone.display(t))
+    }
+
+    /// [`Self::created_in`] the process-wide zone, for the import lists of the Import and
+    /// Collect tabs.
+    pub fn created_shown(&self) -> String {
+        self.created_in(crate::clock::zone())
+    }
+}
+
 /// The imports listed in `dir` (newest last; lines that do not parse are skipped).
 pub fn read_imports(dir: &Path) -> Vec<ImportLine> {
     layout::read_lines(&dir.join(IMPORTS_FILE)).lines
 }
 
-fn stem_of(time: SystemTime, id4: &str, n: usize) -> String {
-    format!("{}_imp-{id4}-{n:05}", crate::collect::utc_file_ts(time))
+/// The timestamp an imported frame's stem starts with: [`crate::clock::Zone::frame_stamp`] of its
+/// recording time in `zone` (the import job matches written frames by it, so both use this).
+pub fn stamp(zone: Zone, time: SystemTime) -> String {
+    zone.frame_stamp(time)
+}
+
+fn stem_of(zone: Zone, time: SystemTime, id4: &str, n: usize) -> String {
+    format!("{}_imp-{id4}-{n:05}", stamp(zone, time))
 }
 
 /// The record of an imported frame (no detections).
@@ -91,16 +113,40 @@ fn record_of(f: &Frame, rel: &Rel, import_id: &str, bytes: u64, original: bool) 
     r
 }
 
-/// Whether `day` already holds an imported frame of this millisecond (`<ts>_imp-*.jpg`) with
-/// the dHash `hash`: the same footage imported again.
-fn already_imported(day: &Path, ts: &str, hash: u64) -> bool {
+/// Whether the camera folder `camera_dir` already holds an imported frame (`<stamp>_imp-*.json`)
+/// of the millisecond `ts` (a frame stamp) with the dHash `hash`: the same footage imported
+/// again. Stamps are compared as instants, so a frame imported before the `timezone` key (UTC
+/// names) or in another zone is found: it looks in the day folder of `ts` in `zone`, then in the
+/// UTC day and the days either side of it (every zone's date is one of those three).
+fn already_imported(camera_dir: &Path, zone: Zone, ts: &str, hash: u64) -> bool {
+    let Some(at) = crate::clock::parse_frame_stamp(ts) else {
+        return false;
+    };
+    let utc = at.date_naive();
+    let mut days = vec![zone.day(at)];
+    for d in [utc.pred_opt(), Some(utc), utc.succ_opt()]
+        .into_iter()
+        .flatten()
+    {
+        if !days.contains(&d) {
+            days.push(d);
+        }
+    }
+    days.iter().any(|day| {
+        let folder = day.format("%Y-%m-%d").to_string();
+        imported_in(&camera_dir.join(folder), at, hash)
+    })
+}
+
+/// [`already_imported`] in one day folder.
+fn imported_in(day: &Path, at: chrono::DateTime<chrono::Utc>, hash: u64) -> bool {
     let Ok(rd) = std::fs::read_dir(day) else {
         return false;
     };
-    let prefix = format!("{ts}_imp-");
     rd.flatten().any(|e| {
         let name = e.file_name().to_string_lossy().into_owned();
-        name.starts_with(&prefix)
+        crate::clock::parse_frame_stamp(&name) == Some(at)
+            && name.contains("_imp-")
             && name.ends_with(".json")
             && !name.ends_with(crate::collect::labels::LABELS_SUFFIX)
             && std::fs::read(e.path())
@@ -115,7 +161,14 @@ fn already_imported(day: &Path, ts: &str, hash: u64) -> bool {
 /// skipped as already imported (the same camera, millisecond and dHash). Frames of one import at
 /// the same millisecond get distinct numbers; an existing file is never overwritten.
 pub fn write_frames(dir: &Path, import_id: &str, frames: &[Frame]) -> Result<(Vec<String>, usize)> {
-    write_frames_with(dir, import_id, frames, &mut |_| Ok(())).map_err(|p| p.error)
+    write_frames_with(
+        dir,
+        crate::clock::zone(),
+        import_id,
+        frames,
+        &mut |_| Ok(()),
+    )
+    .map_err(|p| p.error)
 }
 
 /// What [`write_frames_with`] tells its caller around each frame.
@@ -135,16 +188,18 @@ pub struct Partial {
     pub error: anyhow::Error,
 }
 
-/// [`write_frames`] with `hook` called before and after each frame (free-space checks, cleanup).
+/// [`write_frames`] with the day folders and stems in `zone` (the process-wide zone for
+/// [`write_frames`]) and `hook` called before and after each frame (free-space checks, cleanup).
 pub fn write_frames_with(
     dir: &Path,
+    zone: Zone,
     import_id: &str,
     frames: &[Frame],
     hook: &mut dyn FnMut(Step) -> Result<()>,
 ) -> std::result::Result<(Vec<String>, usize), Partial> {
     let mut out = Vec::with_capacity(frames.len());
     let mut skipped = 0;
-    match write_into(dir, import_id, frames, hook, &mut out, &mut skipped) {
+    match write_into(dir, zone, import_id, frames, hook, &mut out, &mut skipped) {
         Ok(()) => Ok((out, skipped)),
         Err(error) => Err(Partial {
             rels: out,
@@ -156,6 +211,7 @@ pub fn write_frames_with(
 
 fn write_into(
     dir: &Path,
+    zone: Zone,
     import_id: &str,
     frames: &[Frame],
     hook: &mut dyn FnMut(Step) -> Result<()>,
@@ -173,9 +229,9 @@ fn write_into(
     for (n, f) in frames.iter().enumerate() {
         hook(Step::Before(n))?;
         let scene = f.stats.scene().as_str().to_string();
-        let date = crate::collect::utc_date(f.time);
-        let ts = crate::collect::utc_file_ts(f.time);
-        if already_imported(&dir.join(&scene).join(&f.camera).join(&date), &ts, f.dhash) {
+        let date = layout::day_folder(zone, f.time);
+        let ts = stamp(zone, f.time);
+        if already_imported(&dir.join(&scene).join(&f.camera), zone, &ts, f.dhash) {
             *skipped += 1;
             continue;
         }
@@ -185,7 +241,7 @@ fn write_into(
                 scene: scene.clone(),
                 camera: f.camera.clone(),
                 date: date.clone(),
-                stem: stem_of(f.time, &id4, k),
+                stem: stem_of(zone, f.time, &id4, k),
             };
             if !rel.to_path(dir, "jpg").exists() && !rel.to_path(dir, "json").exists() {
                 break rel;
@@ -271,6 +327,73 @@ mod tests {
         crate::image::encode_jpeg(&img, 90).unwrap()
     }
 
+    /// [`write_frames`] with UTC folders and stems (never the process-wide zone, which other
+    /// tests may change).
+    fn utc(dir: &Path, import_id: &str, frames: &[Frame]) -> Result<(Vec<String>, usize)> {
+        write_frames_with(dir, Zone::Utc, import_id, frames, &mut |_| Ok(())).map_err(|p| p.error)
+    }
+
+    #[test]
+    fn folders_and_stems_follow_the_zone_and_a_reimport_in_another_zone_is_skipped() {
+        let root = std::env::temp_dir().join(format!("bop-import-zone-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("f.jpg");
+        let bytes = jpeg(false);
+        std::fs::write(&src, &bytes).unwrap();
+        let img = crate::image::decode(&bytes).unwrap();
+        // 2018-03-11T23:55:00Z + 12.5 s: 16:55 PDT the same day, 13:55 the next day at +14:00.
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_520_812_500);
+        let frame = |dhash: u64| Frame {
+            file: src.clone(),
+            image_name: "c.mp4".into(),
+            camera: "cam".into(),
+            time: frame_time(base, Some(12.5)),
+            width: img.width,
+            height: img.height,
+            stats: ImageStats::compute(&img),
+            dhash,
+            provenance: Provenance::default(),
+        };
+        let write = |zone: &str, id: &str, f: Frame| {
+            let zone: Zone = zone.parse().unwrap();
+            write_frames_with(&dir, zone, id, &[f], &mut |_| Ok(())).unwrap()
+        };
+        let (la, _) = write("America/Los_Angeles", "20261022-120000-ab12", frame(1));
+        assert_eq!(
+            la,
+            ["day/cam/2018-03-11/20180311T165512500-0700_imp-ab12-00000.jpg"]
+        );
+        let (east, _) = write("+14:00", "20261022-120000-cd34", frame(2));
+        assert_eq!(
+            east,
+            ["day/cam/2018-03-12/20180312T135512500p1400_imp-cd34-00000.jpg"]
+        );
+        // The sidecar's time stays UTC; the record's id is the stem.
+        let rec = LabelFrame::resolve(&dir, &la[0]).unwrap().record().unwrap();
+        assert_eq!(rec.timestamp, "2018-03-11T23:55:12.500Z");
+        assert_eq!(rec.id, "20180311T165512500-0700_imp-ab12-00000");
+        // The same footage again, in a zone whose folder is another day: still skipped, both
+        // the frame named in Los Angeles and the one named at +14:00.
+        for (zone, dhash) in [("utc", 1), ("Asia/Tokyo", 1), ("utc", 2), ("-08:00", 2)] {
+            let (rels, skipped) = write(zone, "20261023-000000-ef56", frame(dhash));
+            assert_eq!((rels.len(), skipped), (0, 1), "{zone} {dhash}");
+        }
+        // Another picture at that millisecond is not the same footage.
+        let (rels, skipped) = write("utc", "20261023-000000-ef56", frame(3));
+        assert_eq!(
+            (rels, skipped),
+            (
+                vec!["day/cam/2018-03-11/20180311T235512500Z_imp-ef56-00000.jpg".to_string()],
+                0
+            )
+        );
+        // The matching helper of the import job gives the stem's start.
+        let la_zone: Zone = "America/Los_Angeles".parse().unwrap();
+        assert!(la[0].contains(&stamp(la_zone, frame_time(base, Some(12.5)))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn frames_land_in_the_dataset_layout_with_provenance() {
         let root = std::env::temp_dir().join(format!("bop-import-write-{}", uuid::Uuid::new_v4()));
@@ -305,10 +428,10 @@ mod tests {
         let mut other = f.clone();
         other.dhash = 0x1234;
         let (rels, skipped) =
-            write_frames(&dir, "20261022-120000-ab12", &[f.clone(), other.clone()]).unwrap();
+            utc(&dir, "20261022-120000-ab12", &[f.clone(), other.clone()]).unwrap();
         assert_eq!((rels.len(), skipped), (2, 0));
         // The same footage again: skipped.
-        let (again, skipped) = write_frames(&dir, "20261023-000000-cd34", &[f, other]).unwrap();
+        let (again, skipped) = utc(&dir, "20261023-000000-cd34", &[f, other]).unwrap();
         assert_eq!((again.len(), skipped), (0, 2));
         assert_ne!(rels[0], rels[1], "same time: distinct numbers");
         assert!(
@@ -381,7 +504,7 @@ mod tests {
             })
             .collect();
         let mut steps = Vec::new();
-        let p = write_frames_with(&dir, "20261022-120000-ab12", &frames, &mut |s| {
+        let p = write_frames_with(&dir, Zone::Utc, "20261022-120000-ab12", &frames, &mut |s| {
             steps.push(s);
             if s == Step::Before(2) {
                 anyhow::bail!(std::io::Error::from(std::io::ErrorKind::StorageFull));
@@ -466,7 +589,7 @@ mod tests {
             dhash: u64::from(i + 1) * 0x0101_0101,
             provenance: Provenance::default(),
         };
-        let (rels, _) = write_frames(&dir, "20261022-120000-ab12", &[frame(0)]).unwrap();
+        let (rels, _) = utc(&dir, "20261022-120000-ab12", &[frame(0)]).unwrap();
         let index = LabelFrame::resolve(&dir, &rels[0])
             .unwrap()
             .jpg
@@ -477,7 +600,7 @@ mod tests {
         let mut text = std::fs::read(&index).unwrap();
         text.extend_from_slice(b"{\"id\":\"half");
         std::fs::write(&index, &text).unwrap();
-        write_frames(&dir, "20261022-120000-ab12", &[frame(1)]).unwrap();
+        utc(&dir, "20261022-120000-ab12", &[frame(1)]).unwrap();
         let read = layout::read_lines::<IndexLine>(&index);
         assert_eq!((read.lines.len(), read.damaged), (2, 1));
         let _ = std::fs::remove_dir_all(&root);

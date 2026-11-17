@@ -578,7 +578,9 @@ fn meta_from_tags(tags: &[String]) -> Meta {
 }
 
 /// Scene, camera and day from a review export's flat name (`<scene>.<camera>.<date>.<stem>`) or
-/// a collector stem (`20261022T123456789Z_<id>`: the date only).
+/// a collector stem (the date only): the stem's first 8 digits are the date of its day folder,
+/// UTC in an old stem (`20261022T123456789Z_<id>`) and the configured zone's in a new one
+/// (`20261022T053456789-0700_<id>`, `...p0530_<id>`), so the camera day matches the folder.
 fn meta_from_name(stem: &str) -> Meta {
     let parts: Vec<&str> = stem.split('.').collect();
     if let [scene, camera, date, _] = parts.as_slice()

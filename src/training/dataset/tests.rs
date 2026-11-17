@@ -663,6 +663,40 @@ fn scene_filters_parse() {
     assert_eq!(meta.camera, None);
 }
 
+#[test]
+fn a_stem_named_in_the_zone_gives_its_folder_date() {
+    // 2026-10-22T03:00Z: the 21st in Los Angeles, the 22nd in UTC and at +05:30. The stem's date
+    // is the day folder's (`collect::layout::day_folder`) in every zone.
+    let t = chrono::DateTime::parse_from_rfc3339("2026-10-22T03:00:00.123Z").unwrap();
+    for (zone, day) in [
+        ("America/Los_Angeles", "2026-10-21"),
+        ("utc", "2026-10-22"),
+        ("+05:30", "2026-10-22"),
+        ("-12:00", "2026-10-21"),
+    ] {
+        let zone: crate::clock::Zone = zone.parse().unwrap();
+        let stem = format!("{}_ab12", zone.frame_stamp(t));
+        let meta = meta_from_name(&stem);
+        assert_eq!(meta.day.as_deref(), Some(day), "{stem}");
+        assert_eq!(
+            meta.day.as_deref(),
+            Some(crate::collect::layout::day_folder(zone, t).as_str())
+        );
+        assert_eq!((meta.scene, meta.camera), (None, None));
+    }
+    let meta = meta_from_name("20261021T200000123-0700_imp-ab12-00001");
+    assert_eq!(meta.day.as_deref(), Some("2026-10-21"));
+    let meta = meta_from_name("ir.porch.2026-10-21.20261021T200000123-0700_ab12");
+    assert_eq!(
+        (
+            meta.scene.as_deref(),
+            meta.camera.as_deref(),
+            meta.day.as_deref()
+        ),
+        (Some("ir"), Some("porch"), Some("2026-10-21"))
+    );
+}
+
 /// 5 cameras x 3 days (day 1 day, day 2 night, day 3 IR), 4 frames each (cat, dog + cat, dog,
 /// empty).
 fn scene_export(dir: &Path) {
