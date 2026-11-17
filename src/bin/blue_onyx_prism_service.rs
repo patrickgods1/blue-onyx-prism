@@ -352,8 +352,12 @@ mod service {
         let server = {
             let stop = stop.clone();
             let tx = tx.clone();
+            // The CLI's stack for the same server path (`main_thread`): a debug build needs
+            // more than the 1 MiB that `service_main`'s dispatcher thread has, which its own
+            // config and log setup (about 256 KiB measured) fit in.
             std::thread::Builder::new()
                 .name("server".into())
+                .stack_size(blue_onyx_prism::main_thread::STACK_BYTES)
                 .spawn(move || {
                     // Sent on return and on a panic (unwinding drops it).
                     let signal =

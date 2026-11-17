@@ -597,27 +597,24 @@ mod tests {
         }
     }
 
-    /// Every `training.*` key has a row in the README's configuration table.
+    /// Every `training.*` key has a row in the README's configuration table: serde's field list
+    /// ([`crate::config::serde_fields`]), so keys written only while set are covered too.
     #[test]
     fn readme_documents_every_training_key() {
         let readme = include_str!("../../README.md");
         assert!(readme.contains("| `training` |"));
+        let fields = crate::config::serde_fields(TrainingConfig::deserialize);
         let c = TrainingConfig {
             dir: Some("x".into()),
-            synonyms: [("raccoon".to_string(), vec!["raccoon".to_string()])].into(),
-            metric_columns: vec!["map".into()],
-            epochs: Some(30),
-            patience: Some(5),
-            lr: Some(1e-4),
-            lr_schedule: Some(crate::training::recipe::LrSchedule::Cosine),
-            lr_min_factor: Some(0.1),
             balance: Some(Default::default()),
             ..TrainingConfig::default()
         };
         let v = serde_json::to_value(c).unwrap();
-        let keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
-        assert!(keys.contains(&"dir".to_string()));
-        let missing: Vec<&String> = keys
+        for k in v.as_object().unwrap().keys() {
+            assert!(fields.contains(&k.as_str()), "{k} is not in {fields:?}");
+        }
+        assert!(fields.contains(&"dir") && fields.contains(&"lr_schedule"));
+        let missing: Vec<&&str> = fields
             .iter()
             .filter(|k| !readme.contains(&format!("| `training.{k}` |")))
             .collect();

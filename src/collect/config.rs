@@ -812,20 +812,22 @@ mod tests {
     #[test]
     fn readme_documents_every_collect_key() {
         let readme = include_str!("../../README.md");
-        let c = CollectConfig {
-            dir: Some("d".into()),
-            ..CollectConfig::default()
-        };
-        let serde_json::Value::Object(m) = serde_json::to_value(&c).unwrap() else {
+        // serde's field list of the derived (`remote = "Self"`) deserializer, so keys written
+        // only while set are covered too; it holds every key of a fully set section.
+        let fields = crate::config::serde_fields(CollectConfig::deserialize);
+        let serde_json::Value::Object(m) = known_shape() else {
             panic!("not an object")
         };
-        assert!(readme.contains("| `collect` |"));
         for k in m.keys() {
-            assert!(
-                readme.contains(&format!("| `collect.{k}` |")),
-                "README lacks collect.{k}"
-            );
+            assert!(fields.contains(&k.as_str()), "{k} is not in {fields:?}");
         }
+        assert!(fields.contains(&"size_floor") && fields.contains(&"review_dir"));
+        assert!(readme.contains("| `collect` |"));
+        let missing: Vec<&&str> = fields
+            .iter()
+            .filter(|k| !readme.contains(&format!("| `collect.{k}` |")))
+            .collect();
+        assert!(missing.is_empty(), "README lacks collect.{missing:?}");
         for b in Bucket::ALL {
             assert!(
                 readme.contains(&format!("`{}`", b.as_str())),

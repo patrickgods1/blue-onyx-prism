@@ -2196,6 +2196,70 @@ pub fn validate_config(c: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The key names a derived `Deserialize` of the struct `T` reads (serde's own field list,
+/// renames applied), so a test can hold every key against the README, including the ones the
+/// serializer leaves out while they are unset or default (`skip_serializing_if`,
+/// `skip_serializing`). Only for structs whose `deserialize` asks for a struct (no `flatten`).
+#[cfg(test)]
+pub(crate) fn serde_fields<T, F>(deserialize: F) -> &'static [&'static str]
+where
+    F: FnOnce(test_fields::FieldsOf) -> Result<T, test_fields::Fields>,
+{
+    match deserialize(test_fields::FieldsOf) {
+        Err(test_fields::Fields(fields)) if !fields.is_empty() => fields,
+        _ => panic!("the deserializer did not ask for a struct with fields"),
+    }
+}
+
+/// The deserializer behind [`serde_fields`]: it answers a struct request with its field list
+/// (as the error) and anything else with an empty one.
+#[cfg(test)]
+pub(crate) mod test_fields {
+    /// The fields a `deserialize_struct` asked for (empty for any other request).
+    #[derive(Debug)]
+    pub struct Fields(pub &'static [&'static str]);
+
+    impl std::fmt::Display for Fields {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fields {:?}", self.0)
+        }
+    }
+
+    impl std::error::Error for Fields {}
+
+    impl serde::de::Error for Fields {
+        fn custom<T: std::fmt::Display>(_msg: T) -> Self {
+            Fields(&[])
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct FieldsOf;
+
+    impl<'de> serde::Deserializer<'de> for FieldsOf {
+        type Error = Fields;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(self, _v: V) -> Result<V::Value, Fields> {
+            Err(Fields(&[]))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _v: V,
+        ) -> Result<V::Value, Fields> {
+            Err(Fields(fields))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+            option unit unit_struct newtype_struct seq tuple tuple_struct map enum identifier
+            ignored_any
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -3694,41 +3758,45 @@ mod tests {
     }
 
     /// Every config key (top level, model entry, `benchmark.*`) has a row `| `key` |` in the
-    /// README's configuration tables.
+    /// README's configuration tables. The keys are serde's field lists ([`serde_fields`]), so a
+    /// key written only while set (`skip_serializing_if`) or never written (a retired one still
+    /// read) is covered too.
     #[test]
     fn readme_documents_every_config_key() {
         let readme = include_str!("../README.md");
-        let keys = |v: serde_json::Value| -> Vec<String> {
-            match v {
-                serde_json::Value::Object(m) => m.keys().cloned().collect(),
-                _ => panic!("not an object"),
-            }
-        };
         let mut missing = Vec::new();
         let mut check = |key: String| {
             if !readme.contains(&format!("| `{key}` |")) {
                 missing.push(key);
             }
         };
-        let top = keys(serde_json::to_value(night_rules_config()).unwrap());
-        assert!(top.contains(&"log_format".to_string()));
-        assert!(top.contains(&"static_suppression".to_string()));
-        for k in top {
-            check(k);
-        }
-        // `Some` for the fields serialized only when set.
-        let model = ModelConfig {
-            inflight: Some(1),
-            night_model: Some("night".into()),
-            verify: Some(crate::verify::VerifyConfig::with_model("night")),
-            ..night_rules_model()
+        let top = serde_fields(Config::deserialize);
+        let model = serde_fields(ModelConfig::deserialize);
+        let bench = serde_fields(BenchmarkConfig::deserialize);
+        // The lists are the real ones: they hold every key a fully set value serializes, and the
+        // keys left out while unset.
+        let holds_written = |fields: &[&str], v: serde_json::Value| {
+            for k in v.as_object().expect("an object").keys() {
+                assert!(fields.contains(&k.as_str()), "{k} is not in {fields:?}");
+            }
         };
-        let model_keys = keys(serde_json::to_value(model).unwrap());
-        assert!(model_keys.contains(&"inflight".to_string()));
-        for k in model_keys {
-            check(k);
+        holds_written(top, serde_json::to_value(night_rules_config()).unwrap());
+        holds_written(model, serde_json::to_value(night_rules_model()).unwrap());
+        holds_written(
+            bench,
+            serde_json::to_value(BenchmarkConfig::default()).unwrap(),
+        );
+        let unset = [
+            "ort_gpu_mem_limit_mb",
+            "tls_cert_path",
+            "allow_remote_admin",
+        ];
+        assert!(unset.iter().all(|k| top.contains(k)), "{top:?}");
+        assert!(model.contains(&"inflight") && model.contains(&"verify"));
+        for k in top.iter().chain(model) {
+            check((*k).to_string());
         }
-        for k in keys(serde_json::to_value(BenchmarkConfig::default()).unwrap()) {
+        for k in bench {
             check(format!("benchmark.{k}"));
         }
         assert!(

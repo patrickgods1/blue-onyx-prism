@@ -422,7 +422,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     data unless asked (README "Uninstalling keeps your data").
   - `src/service_ctl/` (SCM / `launchctl` / `systemctl`, pure parsers tested everywhere) backs `service ...`;
     `src/tray/` + `src/bin/blue_onyx_prism_tray.rs` (Windows and macOS only; pure parts tested on every OS).
-  - Release: `panic::install()` first in every binary; `blue-onyx-prism diagnostics` / `GET /v1/diagnostics`
+  - Release: `panic::install()` first in every binary, then the CLI's body runs on an 8 MiB thread named `main`
+    (`main_thread::run`; the service's server thread gets the same stack): a debug build's clap parse alone
+    overflows Windows' 1 MiB main stack; `blue-onyx-prism diagnostics` / `GET /v1/diagnostics`
     (`src/diagnostics.rs`) scrub known tokens and never include token files, frames or labels; app-local VC++ DLLs
     (`packaging/windows/stage-vcruntime.ps1`); `ci-green` gate (`packaging/release/ci_green.py`); glibc floor in
     `packaging/linux/glibc-floor`; `THIRD_PARTY_LICENSES.md` from `python3 -I scripts/gen_third_party.py` (CI `--check`).
