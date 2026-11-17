@@ -17,7 +17,10 @@ when a bump is due, each in one issue kept current:
   runtime and the Python pins with a release that is due: newer than the pin, from before the day two
   weeks ago (what a lock cutoff of that day admits) and, for Python, one that installs on the
   environments' Python 3.11 and fits what the other pins declare (Requires-Dist, e.g. rfdetr's
-  `train` extra caps torchmetrics, hotcoco and vernier). Newer releases that are not due yet are listed
+  `train` extra caps torchmetrics, hotcoco and vernier); torch and torchvision, which the CUDA train
+  locks take from download.pytorch.org, also need a cp311 wheel on every lane of those locks (`cu126`,
+  `cu130`, read from their file names) for each platform the lane's locks cover, so a release built only for
+  newer CUDA (torch 2.15) waits, while a patch that ships for the lanes is due. Newer releases that are not due yet are listed
   with the reason and the day they become due, and do not keep the issue open. Pins held back on
   purpose (`HOLDS`: ONNX Runtime 1.24.x for DirectML, cuDNN < 9.11 for Pascal, the VC++ runtime at
   14.44 until 14.5x is checked on Windows) are listed apart.

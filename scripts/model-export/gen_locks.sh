@@ -16,7 +16,7 @@
 #   identical (checked below). macOS x86_64 has no PyTorch 2.14 wheels and is not supported.
 set -eu
 UV="$1"
-EXCLUDE_NEWER="${2:-2026-10-24T00:00:00Z}"
+EXCLUDE_NEWER="${2:-2026-11-02T00:00:00Z}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 IN="$DIR/../requirements-model-export.txt"
 OUT="$DIR/locks"

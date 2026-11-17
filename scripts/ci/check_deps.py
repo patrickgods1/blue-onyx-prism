@@ -23,7 +23,10 @@ consistency checks:
 
 upstream calls a release due when it is newer than the pin, at least MIN_AGE_DAYS old and (Python)
 runs on the environments' Python (Requires-Python) and (Python) fits what the other pins declare
-(Requires-Dist, with the extras we install: USED_EXTRAS); newer releases that are not due yet are listed apart,
+(Requires-Dist, with the extras we install: USED_EXTRAS) and (pins the train locks take from a PyTorch index,
+torch / torchvision: the `+<lane>` builds in `train-<lane>-<os>-<arch>.txt`) has a wheel for that Python on
+download.pytorch.org for every lane, on every platform the locks of that lane cover (LaneWheels; each index
+page read once a run, an unreadable one is "Could not check"); newer releases that are not due yet are listed apart,
 with the reason, and do not keep the issue open. Pins held back on purpose (HOLDS) are listed apart too.
 
 upstream and audit exit 0 with nothing to report, 10 when the report lists something (the workflow then
@@ -31,12 +34,14 @@ opens or updates an issue), 2 when a source could not be read at all.
 """
 import argparse
 import datetime as dt
+import functools
 import json
 import os
 import re
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -271,6 +276,123 @@ def nuget_releases(name):
     return out
 
 
+# PyTorch's own wheel indexes, one per build lane (`cu126`, `cu130`, `cpu`, ...): https://download.pytorch.org/whl/<lane>/<package>/
+TORCH_INDEX = "https://download.pytorch.org/whl"
+# The platform of a lock file name (`train-cu126-windows-x86_64.txt`) -> its wheel platform tags.
+WHEEL_PLATFORMS = {
+    ("windows", "x86_64"): r"win_amd64",
+    ("linux", "x86_64"): r"(many|musl)?linux\w*_x86_64",
+    ("linux", "aarch64"): r"(many|musl)?linux\w*_aarch64",
+}
+
+
+def index_lanes(root):
+    """{package: {lane: {(os, arch)}}} of the pins the train locks take from a PyTorch index. uv's
+    `--torch-backend <lane>` gives those a local suffix (`torch==2.14.1+cu126`), and the lock of a lane
+    is `train-<lane>-<os>-<arch>.txt` (gen_train_locks.sh); a suffix the file name does not name is an
+    error rather than a guess."""
+    out = {}
+    for lock in sorted((root / LOCKS).glob("train-*.txt")):
+        m = re.fullmatch(r"train-([a-z]+\d+)-([a-z]+)-([a-z0-9_]+)\.txt", lock.name)
+        for name, ver in requirement_pins(lock.read_text(encoding="utf-8")).items():
+            if "+" not in ver:
+                continue
+            lane = ver.split("+", 1)[1]
+            if m is None or m.group(1) != lane:
+                raise ValueError(f"{LOCKS}/{lock.name}: {name}=={ver} is a {lane} build, but the file name "
+                                 f"is not train-{lane}-<os>-<arch>.txt")
+            out.setdefault(name, {}).setdefault(lane, set()).add((m.group(2), m.group(3)))
+    return out
+
+
+def wheel_runs_on(py_tags, abi_tags, py=PYTHON):
+    """Whether a wheel's python / ABI tags (`cp311` / `cp311`, `py3` / `none`, `cp39` / `abi3`, dotted
+    sets allowed) install on the environments' Python."""
+    cp, major, minor = f"cp{py[0]}{py[1]}", py[0], py[1]
+    for t in py_tags.split("."):
+        for a in abi_tags.split("."):
+            if t == cp and a in (cp, "abi3", "none"):
+                return True
+            if t in (f"py{major}", f"py{major}{minor}") and a == "none":
+                return True
+            m = re.fullmatch(rf"cp{major}(\d+)", t)
+            if m and a == "abi3" and int(m.group(1)) <= minor:
+                return True
+    return False
+
+
+def wheels_of(page, package):
+    """{(release key, platform tag)} of `package`'s wheels for the environments' Python on a simple
+    index page (PEP 503 HTML: one anchor per file, its text the file name); ValueError when the page
+    lists no wheel of it at all (a changed page format must not pass as "no build")."""
+    out, listed = set(), 0
+    for text in re.findall(r">\s*([^<>\s]+\.whl)\s*<", page):
+        parts = urllib.parse.unquote(text.rsplit("/", 1)[-1])[:-4].split("-")
+        if len(parts) not in (5, 6) or norm_name(parts[0]) != norm_name(package):
+            continue
+        listed += 1
+        key = version_key(parts[1])
+        if key is None or not wheel_runs_on(parts[-3], parts[-2]):
+            continue
+        out.update((key, p) for p in parts[-1].split("."))
+    if not listed:
+        raise ValueError(f"no {package} wheels listed on the PyTorch index page")
+    return out
+
+
+def fetch_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def torch_index_wheels(lane, package):
+    """`wheels_of` the PyTorch index page of `package` on `lane` (read on every call: cache it)."""
+    url = f"{TORCH_INDEX}/{lane}/{norm_name(package)}/"
+    try:
+        page = fetch_text(url)
+    except urllib.error.URLError as e:
+        raise urllib.error.URLError(f"{url}: {getattr(e, 'reason', e)}") from e
+    return wheels_of(page, package)
+
+
+class LaneWheels:
+    """A constraint (`spec_ok` calls it) that a release of a package taken from a PyTorch index has a
+    wheel for the environments' Python on each lane of the train locks, for each platform the locks of
+    that lane cover. `wheels(lane, package)` is `torch_index_wheels` (or a fake in the self-test); a
+    failure to read it propagates, so the row lands under "Could not check", never passes."""
+
+    def __init__(self, package, lanes, wheels):
+        self.package, self.lanes, self.wheels = package, lanes, wheels
+        cuda = all(re.fullmatch(r"cu\d+", lane) for lane in lanes)
+        self.who = f"the {'CUDA' if cuda else 'PyTorch'} training lanes"
+
+    def __call__(self, version):
+        key = version_key(version)
+        for lane, platforms in sorted(self.lanes.items()):
+            have = self.wheels(lane, self.package)
+            for os_name, arch in sorted(platforms):
+                tag = WHEEL_PLATFORMS.get((os_name, arch))
+                if tag is None:
+                    raise ValueError(f"no wheel platform tag known for {os_name}-{arch} (WHEEL_PLATFORMS)")
+                if not any(k == key and re.fullmatch(tag, p) for k, p in have):
+                    return False
+        return True
+
+    def __str__(self):
+        return f"a cp{PYTHON[0]}{PYTHON[1]} wheel on {', '.join(sorted(self.lanes))} at download.pytorch.org"
+
+
+def lane_constraints(root, pins, wheels):
+    """{package: [(LaneWheels, who)]} for the pinned packages the train locks take from a PyTorch index."""
+    out = {}
+    for name, lanes in sorted(index_lanes(root).items()):
+        if name in pins:
+            c = LaneWheels(name, lanes, wheels)
+            out[name] = [(c, c.who)]
+    return out
+
+
 def python_ok(spec, py=PYTHON):
     """Whether a Requires-Python specifier (`>=3.10`, `>=3.9,<3.14`, `!=3.0.*`, `~=3.8`) admits the
     Python of the environments; a missing one admits it."""
@@ -280,7 +402,9 @@ def python_ok(spec, py=PYTHON):
 def spec_ok(spec, version):
     """Whether a version specifier (`<1.9.0,>=1.8.2`, `==1.0.1`, `!=3.0.*`, `~=3.8`) admits `version`
     (a tuple of ints, or a release string); an empty one admits everything, clauses that are not
-    plain release versions are skipped."""
+    plain release versions are skipped. A callable spec (`LaneWheels`) is asked with the release string."""
+    if callable(spec):
+        return spec(version if isinstance(version, str) else ".".join(map(str, version)))
     if not spec:
         return True
     if isinstance(version, str):
@@ -391,7 +515,9 @@ def due_release(rows, today, constraints=()):
     if due != newest[0]:
         blocked = [(s, who) for s, who in constraints if not spec_ok(s, newest[0])]
         if blocked:
-            why = f"{newest[0]} is outside what {blocked[0][1]} requires ({blocked[0][0]})"
+            spec, who = blocked[0]
+            verb = "require" if isinstance(spec, LaneWheels) else "requires"
+            why = f"{newest[0]} is outside what {who} {verb} ({spec})"
         elif not python_ok(newest[2]):
             why = f"{newest[0]} needs Python {newest[2]}; the environments run Python {'.'.join(map(str, PYTHON[:2]))}"
         else:
@@ -493,9 +619,18 @@ def upstream(root, today):
         failures += 1
         rows.append(dict(component="Requirements of the pinned Python packages", pinned="?", due=None,
                          newest=None, why=f"could not read PyPI: {e}", hold=""))
+    try:
+        # Each index page is read once per run (lru_cache keeps answers, not failures).
+        lanes = lane_constraints(root, pins, functools.lru_cache(maxsize=None)(torch_index_wheels))
+    except ValueError as e:
+        lanes = {}
+        failures += 1
+        rows.append(dict(component="PyTorch index lanes of the train locks", pinned="?", due=None,
+                         newest=None, why=str(e), hold=""))
     for name, pinned in sorted(pins.items()):
+        # The lane constraint first: its why names what keeps a release out, not a pin that moves with it.
         add(f"{name} (Python)", pinned, lambda n=name: pypi_releases(n), HOLDS.get(name, ""),
-            cons.get(name, ()))
+            lanes.get(name, []) + list(cons.get(name, ())))
     text, any_due = upstream_report(rows)
     code = UNREADABLE if failures == len(rows) else (REPORT if any_due else 0)
     return text, code
@@ -623,6 +758,85 @@ def self_test():
     text, any_due = upstream_report([row("onnx (Python)", "1.23.2", "1.23.2", "1.23.2")])
     assert not any_due and text == "Every pin is at its latest upstream release.\n", text
 
+    # PyTorch index lanes: a release is due only with a cp311 wheel on every lane, for every platform.
+    page = ('<html><body>\n'
+            '<a href="/whl/cu126/torch-2.14.1%2Bcu126-cp311-cp311-win_amd64.whl#sha256=aa">torch-2.14.1+cu126-cp311-cp311-win_amd64.whl</a><br/>\n'
+            '<a href="/whl/cu126/torch-2.14.1%2Bcu126-cp311-cp311-manylinux_2_28_x86_64.whl">torch-2.14.1+cu126-cp311-cp311-manylinux_2_28_x86_64.whl</a>\n'
+            '<a href="/whl/cu126/torch-2.15.0%2Bcu126-cp312-cp312-win_amd64.whl">torch-2.15.0+cu126-cp312-cp312-win_amd64.whl</a>\n'
+            '<a href="/whl/cu126/torch-2.16.0.dev1%2Bcu126-cp311-cp311-win_amd64.whl">torch-2.16.0.dev1+cu126-cp311-cp311-win_amd64.whl</a>\n'
+            '<a href="/whl/cu126/torchvision-0.30.0-cp311-cp311-win_amd64.whl">torchvision-0.30.0-cp311-cp311-win_amd64.whl</a>\n'
+            '</body></html>')
+    assert wheels_of(page, "torch") == {((2, 14, 1), "win_amd64"), ((2, 14, 1), "manylinux_2_28_x86_64")}, wheels_of(page, "torch")
+    try:
+        wheels_of("<html>moved</html>", "torch")
+        raise AssertionError("a page without wheels must not read as 'no build'")
+    except ValueError:
+        pass
+    assert wheel_runs_on("cp311", "cp311") and wheel_runs_on("py3", "none") and wheel_runs_on("cp39", "abi3")
+    assert not wheel_runs_on("cp312", "cp312") and not wheel_runs_on("cp312", "abi3") and not wheel_runs_on("cp311", "cp311t")
+
+    linux, win = "manylinux_2_28_x86_64", "win_amd64"
+    index = {("cu126", "torch"): {((2, 14, 1), win), ((2, 14, 1), linux), ((2, 14, 2), win), ((2, 14, 2), linux),
+                                  ((2, 14, 3), win)},
+             ("cu130", "torch"): {((2, 14, 1), win), ((2, 14, 1), linux), ((2, 14, 2), win), ((2, 14, 2), linux),
+                                  ((2, 14, 3), win), ((2, 14, 3), linux)}}
+    reads = []
+
+    def fake_wheels(lane, package):
+        reads.append((lane, package))
+        return index[(lane, package)]
+    both = {("windows", "x86_64"), ("linux", "x86_64")}
+    lanes = LaneWheels("torch", {"cu126": both, "cu130": both}, fake_wheels)
+    assert str(lanes) == "a cp311 wheel on cu126, cu130 at download.pytorch.org" and lanes.who == "the CUDA training lanes"
+    assert spec_ok(lanes, "2.14.2") and spec_ok(lanes, "2.14.1") and spec_ok(lanes, (2, 14, 1))
+    assert not spec_ok(lanes, "2.14.3"), "missing on cu126 linux"
+    assert not spec_ok(lanes, "2.15.0"), "on no lane"
+    torch_rel = [("2.14.1", d("2026-08-01"), ">=3.10"), ("2.14.2", d("2026-09-01"), ">=3.10"),
+                 ("2.14.3", d("2026-09-20"), ">=3.10"), ("2.15.0", d("2026-10-01"), ">=3.10")]
+    cons_t = [(lanes, lanes.who), (">=2.0.0", "torchmetrics 1.8.2")]
+    why = "2.15.0 is outside what the CUDA training lanes require (a cp311 wheel on cu126, cu130 at download.pytorch.org)"
+    assert due_release(torch_rel, day, cons_t) == ("2.14.2", "2.15.0", why), due_release(torch_rel, day, cons_t)
+    assert due_release(torch_rel[:1] + torch_rel[3:], day, cons_t) == ("2.14.1", "2.15.0", why)
+    assert due_release(torch_rel[:2], day, cons_t) == ("2.14.2", "2.14.2", None)
+    text, any_due = upstream_report([row("torch (Python)", "2.14.1", "2.14.1", "2.15.0", why)])
+    assert not any_due and text.startswith("No pin is due for a bump.\n\nNewer, but not due yet:"), text
+    assert f"| torch (Python) | 2.14.1 | 2.15.0 | {why} |" in text, text
+    text, any_due = upstream_report([row("torch (Python)", "2.14.1", "2.14.2", "2.15.0", why)])
+    assert any_due and "| torch (Python) | 2.14.1 | 2.14.2 | 2.15.0 |" in text and f"- torch (Python): {why}" in text, text
+    cached = functools.lru_cache(maxsize=None)(fake_wheels)
+    reads.clear()
+    lanes = LaneWheels("torch", {"cu126": both, "cu130": both}, cached)
+    due_release(torch_rel, day, [(lanes, lanes.who)])
+    assert sorted(reads) == [("cu126", "torch"), ("cu130", "torch")], reads
+
+    def unreadable(lane, package):
+        raise urllib.error.URLError(f"{TORCH_INDEX}/{lane}/{package}/: Not Found")
+    try:
+        due_release(torch_rel, day, [(LaneWheels("torch", {"cu126": both}, unreadable), "x")])
+        raise AssertionError("an unreadable index must not pass")
+    except urllib.error.URLError:
+        pass
+    try:
+        LaneWheels("torch", {"cu126": {("freebsd", "x86_64")}}, fake_wheels)("2.14.1")
+        raise AssertionError("an unknown platform must not pass")
+    except ValueError:
+        pass
+
+    # The lanes come from the train locks' file names and local suffixes; in this repository they are
+    # the lanes gen_train_locks.sh resolves, and each is a pin the upstream check reads.
+    real = index_lanes(ROOT)
+    gen_lanes = re.search(r"^for cu in ([^;]+); do", read(ROOT, GEN_SCRIPTS[1]), re.M)
+    assert gen_lanes, "gen_train_locks.sh: no `for cu in ...` loop (renamed? update this test)"
+    gen_lanes = set(gen_lanes.group(1).split())
+    assert {"torch", "torchvision"} <= set(real), real
+    for name, by_lane in real.items():
+        assert set(by_lane) == gen_lanes, (name, by_lane, gen_lanes)
+        assert name in python_pins(ROOT), name
+        for lane, platforms in by_lane.items():
+            assert platforms and all(p in WHEEL_PLATFORMS for p in platforms), (name, lane, platforms)
+    real_cons = lane_constraints(ROOT, python_pins(ROOT), fake_wheels)
+    assert set(real_cons) == set(real) and "torch-hungarian" not in real_cons, real_cons
+
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
 
@@ -668,6 +882,23 @@ def self_test():
         pk = lock_packages(root)
         assert pk[("torch", "2.14.0")] == ["macos-arm64.txt", "train-macos-arm64.txt"], pk
         assert pk[("numpy", "2.4.6")] == ["requirements-test.txt"], pk
+
+        put(f"{LOCKS}/train-macos-arm64.txt", "torch==2.14.1 \\\n    --hash=sha256:aa\ntorchvision==0.29.1\n")
+        assert index_lanes(root) == {}, "the macOS lock takes nothing from a PyTorch index"
+        for lane, plat in (("cu126", "windows-x86_64"), ("cu126", "linux-x86_64"), ("cu131", "linux-aarch64")):
+            put(f"{LOCKS}/train-{lane}-{plat}.txt",
+                f"torch==2.14.1+{lane} \\\n    --hash=sha256:aa\ntorchvision==0.29.1+{lane}\ntriton==3.8.0\n")
+        assert index_lanes(root) == {
+            "torch": {"cu126": {("windows", "x86_64"), ("linux", "x86_64")}, "cu131": {("linux", "aarch64")}},
+            "torchvision": {"cu126": {("windows", "x86_64"), ("linux", "x86_64")}, "cu131": {("linux", "aarch64")}},
+        }, index_lanes(root)
+        assert set(lane_constraints(root, {"torch": "2.14.1"}, None)) == {"torch"}
+        put(f"{LOCKS}/train-cu999-linux-x86_64.txt", "torch==2.14.1+cu130\n")
+        try:
+            index_lanes(root)
+            raise AssertionError("a lock whose suffix its file name does not name must be refused")
+        except ValueError as e:
+            assert "train-cu999-linux-x86_64.txt: torch==2.14.1+cu130" in str(e), e
     print("check_deps self-test ok")
 
 

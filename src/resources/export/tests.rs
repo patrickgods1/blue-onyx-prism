@@ -973,6 +973,9 @@ fn sanitized_variables_and_package_progress() {
         "NO_PROXY",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        // Python's `platform.machine()` on Windows; polars refuses to import without it.
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_ARCHITEW6432",
         // The GPU ordinals of `--device cuda:N` must mean what the service's CUDA probe saw.
         "CUDA_VISIBLE_DEVICES",
         "CUDA_DEVICE_ORDER",
