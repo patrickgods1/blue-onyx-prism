@@ -300,7 +300,7 @@ fn nvidia_and_intel_igpu_with_cuda() {
 
 #[test]
 fn pascal_dgpu_uses_cuda_then_directml_before_the_igpu() {
-    // GTX 1070 Ti (6.1): the catalog's CUDA build (1.31.0) has kernels for it, TensorRT 10 not.
+    // GTX 1070 Ti (6.1): the catalog's CUDA build (1.31.1) has kernels for it, TensorRT 10 not.
     let gtx = with_cuda(
         gpu(
             GpuVendor::Nvidia,

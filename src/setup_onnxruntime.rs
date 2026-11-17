@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(auto_flavor(&hw("linux", "aarch64", &[n])), Flavor::Cpu);
         assert_eq!(auto_flavor(&hw("macos", "aarch64", &[])), Flavor::CoreMl);
 
-        // An NVIDIA GPU the catalog's CUDA build has no kernels for: not CUDA. The 1.31.0
+        // An NVIDIA GPU the catalog's CUDA build has no kernels for: not CUDA. The 1.31.1
         // Windows build covers 6.1, 7.5, 8.6, 8.9 and 12.0; Linux 6.0 and up (10.0 excepted).
         let with_cc = |os: &str, major: u32, minor: u32| {
             let mut h = hw(os, "x86_64", &[i, n]);
