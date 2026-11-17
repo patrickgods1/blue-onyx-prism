@@ -1,4 +1,4 @@
-//! The index's rows: what [`super::super::queue::build`] reads of one frame, in about 80 bytes
+//! The index's rows: what [`super::super::queue::build`] reads of one frame, in about 84 bytes
 //! plus its text. Names, bucket lists and class sets are interned ([`Names`]), text sits in its day
 //! shard's arena ([`Shard`]), and box geometry is not kept: `auto=overlaps`, `auto=both` and
 //! `auto=refine` (per `refine_kind`, [`Names::refine`]) are worked out with the real functions
@@ -16,6 +16,7 @@
 use super::super::super::layout::{self, Walker};
 use super::super::super::record::{Bucket, Record};
 use super::super::queue::{self, AutoFilter, Candidate, Filters, Uncertainty};
+use super::super::recommend;
 use super::super::refine::Kind as RefineKind;
 use super::super::{Frame, LabelBox, LabelFile, MAX_LABEL_FILE_BYTES, MAX_SIDECAR_BYTES, Status};
 use crate::sync::RwLockExt as _;
@@ -158,6 +159,9 @@ pub(super) struct Names {
     /// What `auto=refine` reads of a frame: per entry of [`REFINE_KINDS`], its live suggestions and
     /// the strongest one's strength ([`queue::refine_open`]). Empty: none live, the common case.
     refine: Table<[(u16, u16)]>,
+    /// The labels models and auto-labelers proposed on a frame and a reviewer decided on
+    /// ([`queue::proposed_labels`]), in label order: what `balance=` weighs a camera's class by.
+    proposed: Table<[Name]>,
 }
 
 impl Names {
@@ -197,6 +201,13 @@ impl Names {
         self.training.get(id).unwrap_or_default()
     }
 
+    /// The proposed labels of [`Part::proposed`] (0: none).
+    pub(super) fn proposed(&self, id: u32) -> &[Name] {
+        id.checked_sub(1)
+            .and_then(|id| self.proposed.get(id))
+            .unwrap_or_default()
+    }
+
     /// Per refine summary id ([`Part::refine`] minus one): the live suggestions of `kind` (None =
     /// every kind) and the strongest one's strength, as [`Filters::refine_open`] counts them.
     pub(super) fn refine_by_summary(&self, kind: Option<RefineKind>) -> Vec<(u32, u32)> {
@@ -216,6 +227,7 @@ impl Names {
             + self.classes.bytes()
             + self.training.bytes()
             + self.refine.bytes()
+            + self.proposed.bytes()
     }
 }
 
@@ -238,6 +250,8 @@ pub(super) struct Side {
     pub reply: u32,
     pub has_margin: bool,
     pub disagreement: bool,
+    /// [`recommend::own_event`]: an event of its own in the Recommended order.
+    pub alone: bool,
     /// False: it did not read, the frame counts as unreadable.
     pub ok: bool,
 }
@@ -253,6 +267,8 @@ pub(super) struct Part {
     /// The id of the frame's refine summary ([`Names::refine`]) plus one, 0 = no live suggestion
     /// of the dataset check.
     pub refine: u32,
+    /// The id of the frame's proposed labels ([`Names::proposed`]) plus one, 0 = none.
+    pub proposed: u32,
     /// [`super::super::overlaps::frame_strength`] for the index's wanted classes
     /// ([`MAX_STRENGTH`]).
     pub strength: u16,
@@ -279,6 +295,7 @@ impl Default for Part {
             training: 0,
             note: 0,
             refine: 0,
+            proposed: 0,
             strength: 0,
             auto_review: 0,
             likely: 0,
@@ -616,6 +633,11 @@ impl Derive {
             .map(|(class, n)| (names.names.intern(class), n))
             .collect();
         part.training = names.training.intern(&per_class);
+        let proposed = queue::proposed_labels(l);
+        if !proposed.is_empty() {
+            let set: Vec<Name> = proposed.iter().map(|p| names.names.intern(p)).collect();
+            part.proposed = names.proposed.intern(&set).saturating_add(1);
+        }
         (part, u.relabel)
     }
 }
@@ -656,6 +678,7 @@ impl Encoder<'_> {
             reply: names.class_set_of(reply.iter().map(|(c, s)| (c.as_str(), *s))),
             has_margin: u.margin.is_some(),
             disagreement: u.disagreement,
+            alone: recommend::own_event(rec),
             ok: true,
         };
         (side, rec.timestamp.clone())

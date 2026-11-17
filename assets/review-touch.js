@@ -1,6 +1,7 @@
 // Review tab, fingers (/train/review; loaded before review.js): the gesture rules of the frame on
 // a touchscreen, where a box's tag sits in the zoomed view, which box a tap on the overview
-// means and which corner of the zoomed frame the overview takes. Pure: no page, no browser API, no state of its own; review.js passes everything in
+// means, which corner of the zoomed frame the overview takes and the quarters of the
+// "Anything missing?" look. Pure: no page, no browser API, no state of its own; review.js passes everything in
 // and applies the answers. `tests/it/js_review_touch.rs` runs this file in Node.
 //
 // Coordinates are the canvas's buffer pixels (review.js `canvasPoint`: the frame at zoom 1), and a
@@ -116,7 +117,23 @@
     return best;
   }
 
+  // "Anything missing?" in quarters (`q`): the part of a `w` x `h` frame step `i` shows, as
+  // [x0, y0, x1, y1] in frame pixels. Steps 0..3 are the top-left, top-right, bottom-left and
+  // bottom-right corners, each `share` of the frame's width and height (clamped to 0.5..1), so
+  // two neighbours overlap by (2 x share - 1) of the side and an object on a centre line is whole
+  // in one of them; any other step is the whole frame. The same share both ways keeps the frame's
+  // aspect, so the page shows a rect at zoom w / (x1 - x0) from its top-left corner.
+  function quarterView(i, w, h, share) {
+    if (!(i >= 0 && i <= 3) || i !== Math.floor(i)) return [0, 0, w, h];
+    var s = Math.min(1, Math.max(0.5, share));
+    var sw = w * s, sh = h * s;
+    var right = i % 2 === 1, bottom = i >= 2;
+    // The far edges are the frame's own (never an ulp past it).
+    return [right ? w - sw : 0, bottom ? h - sh : 0, right ? w : sw, bottom ? h : sh];
+  }
+
   globalThis.ReviewTouch = {
+    quarterView: quarterView,
     pinch: pinch,
     twoTapRect: twoTapRect,
     touchIntent: touchIntent,

@@ -145,6 +145,63 @@
     ((labels && labels.boxes) || []).forEach(function (b, i) { b._n = i; });
   }
 
+  // A saved box that is no verdict on an object, left out of the session's box count and
+  // acceptance: a duplicate or a too-small box, a dismissal nobody judged, a parked spot's
+  // automatic accept, and a box of a "don't want" class the save rejected unseen (`other_class`).
+  // Neither this nor the balance's kept share (labels/queue.rs `proposed_label`, which also leaves
+  // out the rejects nobody judged) counts a parked spot's accept as a reviewer's decision.
+  function noVerdict(b) {
+    return b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' ||
+      isDismissal(b.reason) || b.reason === 'parked_spot' || b.reason === 'other_class';
+  }
+
+  // The reviewer's box decisions on one visit, for the session line (no Rust twin; page only).
+  // `served`: the boxes as GET /v1/review/labels served them (marked by `markServed`), `saved`:
+  // the boxes as the save sends them, `_n` still on them. Decided = a box pending when served
+  // that the save accepts or rejects (`resolved`), plus a new box the page made from a
+  // suggestion (no `_n`, not drawn); drawn = a new box drawn by hand (`source: human`, no `_n`).
+  // A box decided before this visit is not counted again. {decided, accepted, rejected, drawn}.
+  function boxDecisions(served, saved) {
+    var out = { decided: 0, accepted: 0, rejected: 0, drawn: 0 };
+    (saved || []).forEach(function (b) {
+      var isNew = typeof b._n !== 'number';
+      if (isNew && b.source === 'human') {
+        if (resolved(b) === 'added') out.drawn++;
+        return;
+      }
+      if (b.source === 'human' || noVerdict(b)) return;
+      var was = isNew ? null : (served || [])[b._n];
+      if (!isNew && !(was && was.state === 'pending')) return;
+      var r = resolved(b);
+      if (r === 'accepted') out.accepted++;
+      else if (r === 'rejected') out.rejected++;
+      else return;
+      out.decided++;
+    });
+    return out;
+  }
+
+  // The frames GET /v1/review/next served as random picks in this page session (no Rust twin; page
+  // only): `list` (oldest first) with `item`'s frame added when the item is one (`random_pick`),
+  // at most `max` kept (the oldest go). A new array; `list` is not changed.
+  function servedPicks(list, item, max) {
+    var out = Array.isArray(list) ? list.filter(function (f) { return typeof f === 'string'; }) : [];
+    if (item && item.random_pick === true && typeof item.frame === 'string' && out.indexOf(item.frame) < 0) {
+      out.push(item.frame);
+    }
+    var keep = max > 0 ? max : 0;
+    return out.length > keep ? out.slice(out.length - keep) : out;
+  }
+
+  // Whether `frame` goes to the save as a random pick (`review_pick: 'random'`): the queue served
+  // it as one in this page session (`picks`, from `servedPicks`), however the reviewer came back
+  // to it (Back after passing it with Next, a reload). Marking on the way the reviewer moves
+  // would bias the random set by those choices. A frame never served as one is never marked here
+  // (its label file's own value goes back as loaded; the server drops `random` off the pool).
+  function servedAsPick(picks, frame) {
+    return Array.isArray(picks) && typeof frame === 'string' && picks.indexOf(frame) >= 0;
+  }
+
   // Where the box served at index `n` is now, -1 if it went.
   function servedAt(bs, n) {
     for (var k = 0; k < bs.length; k++) if (bs[k]._n === n) return k;
@@ -537,10 +594,10 @@
     return out;
   }
 
-  // How strong a suggestion is, higher first (labels/refine.rs `strength`): add 4, relabel 3,
-  // tighten 2, verify 1, times 1000, plus the score in thousandths; 0 when answered or unknown.
+  // How strong a suggestion is, higher first (labels/refine.rs `strength`): relabel 4, add 3,
+  // verify 2, tighten 1, times 1000, plus the score in thousandths; 0 when answered or unknown.
   function refineStrength(s) {
-    var band = s.kind === 'add' ? 4 : s.kind === 'relabel' ? 3 : s.kind === 'tighten' ? 2 : s.kind === 'verify' ? 1 : 0;
+    var band = s.kind === 'relabel' ? 4 : s.kind === 'add' ? 3 : s.kind === 'verify' ? 2 : s.kind === 'tighten' ? 1 : 0;
     if (!band || s.answer != null) return 0;
     var v = (typeof s.score === 'number' && isFinite(s.score)) ? f32(s.score) : 0;
     return band * 1000 + Math.round(Math.min(Math.max(v, 0), 1) * 999);
@@ -906,6 +963,9 @@
     dupDrops: dupDrops,
     pendingDupDrops: pendingDupDrops,
     markServed: markServed,
+    boxDecisions: boxDecisions,
+    servedPicks: servedPicks,
+    servedAsPick: servedAsPick,
     liveSuggestions: liveSuggestions,
     markRejected: markRejected,
     markDuplicate: markDuplicate,

@@ -264,6 +264,7 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
         overlaps_checked: base.overlaps_checked,
         overlap_suggestions: base.overlap_suggestions,
         refine: base.refine,
+        review_pick: base.review_pick,
         ..LabelFile::default()
     }
 }
@@ -503,6 +504,13 @@ mod tests {
         assert!(
             apply_import(checked, &rects).overlaps_checked,
             "the reviewer's look survives the rebuild"
+        );
+        let mut picked = base.clone();
+        picked.review_pick = Some(super::super::ReviewPick::Random);
+        assert_eq!(
+            apply_import(picked, &rects).review_pick,
+            Some(super::super::ReviewPick::Random),
+            "how the frame was chosen survives the rebuild"
         );
         let empty = apply_import(base, &[]);
         assert!(empty.empty_confirmed);

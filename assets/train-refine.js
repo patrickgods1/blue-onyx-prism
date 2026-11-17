@@ -95,6 +95,12 @@
       var m = (r.found && r.found.tighten) || 0;
       return 'Loose labels counted: ' + n + ', ' + m + ' with a proposed box.';
     },
+    // The Findings card's muted line under any report (`r`; '' without one): no suggestion on a
+    // frame does not make it complete (checkers like this one miss many real errors, mostly
+    // small or occluded objects with no box).
+    missesLine: function (r) {
+      return r ? 'The check finds some errors, not all: small, dark or partly hidden objects most often slip past it.' : '';
+    },
     // The Findings card's "Last check" line of report `r` (`when`: its time as the page prints
     // it): a full check's folds, or a quick check's model and the frames it skipped, so a quick
     // check never reads as a full one (report.json `mode`, `model`).
@@ -217,10 +223,11 @@
   if (!root) return;
   var $ = function (id) { return document.getElementById(id); };
   var form = $('refine-form');
+  // In the Review tab's order (refine.rs `Kind::band`): what costs a model most per error first.
   var KINDS = [
+    { kind: 'relabel', title: 'Other class suggested', text: 'Boxes a checking model would give another class.', key: 'relabel' },
     { kind: 'add', title: 'Missing boxes', text: 'Objects a model that never saw the frame found that no box labels.', key: 'add' },
     { kind: 'verify', title: 'Labels no model found', text: 'Boxes the checking models never found: look at them, some are wrong.', key: 'verify' },
-    { kind: 'relabel', title: 'Other class suggested', text: 'Boxes a checking model would give another class.', key: 'relabel' },
     { kind: 'tighten', title: 'Loose boxes', text: 'Labels that cover their object only partly: a checking model and a closer look by a larger model agree on a better-fitting box.', key: 'tighten' }
   ];
 
@@ -625,6 +632,7 @@
     }
     if (r) {
       box.appendChild(el('p', null, RefineFloor.looseLine(r)));
+      box.appendChild(el('p', 'muted small', RefineFloor.missesLine(r)));
       if (r.warnings && r.warnings.length) {
         var ul = el('ul', 'warn-list small');
         r.warnings.forEach(function (w) { ul.appendChild(el('li', null, w)); });
@@ -860,6 +868,13 @@
     r.addEventListener('change', function () { applyMode(); choiceChanged(); });
   });
   $('refine-model').addEventListener('change', choiceChanged);
+  // The Train area's "Quick check" link (/train/refine#quick-check): the form opens on the quick
+  // check; the model list fills in once GET /v1/refine answers.
+  if (location.hash === '#quick-check') {
+    $('refine-mode-model').checked = true;
+    applyMode();
+    if ($('refine-check').scrollIntoView) $('refine-check').scrollIntoView();
+  }
 
   // ---- static objects
 

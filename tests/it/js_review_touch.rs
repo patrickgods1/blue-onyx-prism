@@ -1,7 +1,8 @@
 //! The Review tab's finger rules (`assets/review-touch.js`): pinch zoom and pan, the two-tap box,
 //! what one finger's drag does, where a tag sits in the zoomed view, which box an overview tap
-//! picks and which corner the overview takes. The page applies these answers to its view and boxes
-//! (`assets/review.js`), so they are checked here on exact numbers, in Node.
+//! picks, which corner the overview takes and the quarters of the "Anything missing?" look. The
+//! page applies these answers to its view and boxes (`assets/review.js`), so they are checked here
+//! on exact numbers, in Node.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -25,6 +26,7 @@ console.log(JSON.stringify(req.map((r) => {
   if (r.op === 'tagTop') return T.tagTop(r.bb, r.top, r.bottom, r.th);
   if (r.op === 'pickBox') return T.pickBox(r.boxes, r.x, r.y, r.pad);
   if (r.op === 'overviewCorner') return T.overviewCorner(r.current, r.frame, r.size, r.inset, r.keep, r.others);
+  if (r.op === 'quarterView') return T.quarterView(r.i, r.w, r.h, r.share);
   throw new Error('unknown op ' + r.op);
 })));
 "#;
@@ -433,6 +435,96 @@ fn the_overview_leaves_the_selected_box_in_sight() {
             .unwrap()
             .clone()
     );
+}
+
+fn quarter(i: f64, w: f64, h: f64, share: f64) -> Value {
+    json!({ "op": "quarterView", "i": i, "w": w, "h": h, "share": share })
+}
+
+fn rect_of(v: &Value) -> [f64; 4] {
+    let a = v.as_array().unwrap();
+    assert_eq!(a.len(), 4, "{v}");
+    [
+        a[0].as_f64().unwrap(),
+        a[1].as_f64().unwrap(),
+        a[2].as_f64().unwrap(),
+        a[3].as_f64().unwrap(),
+    ]
+}
+
+fn within(r: [f64; 4], b: [f64; 4]) -> bool {
+    r[0] >= b[0] && r[1] >= b[1] && r[2] <= b[2] && r[3] <= b[3]
+}
+
+#[test]
+fn the_quarter_look_steps_through_overlapping_corners_then_the_whole_frame() {
+    // The page's share, checked below on an even frame and on odd ones.
+    assert!(include_str!("../../assets/review.js").contains("var QUARTER_SHARE = 0.55;"));
+    if !have_node() {
+        return;
+    }
+    let share = 0.55;
+    for (w, h) in [
+        (1000.0, 600.0),
+        (641.0, 359.0),
+        (1921.0, 1081.0),
+        (3.0, 7.0),
+    ] {
+        let got = node(&json!(
+            (0..6)
+                .map(|i| quarter(f64::from(i), w, h, share))
+                .collect::<Vec<_>>()
+        ));
+        let q: Vec<[f64; 4]> = got.iter().map(rect_of).collect();
+        let (sw, sh) = (w * share, h * share);
+        // Corners in order: top left, top right, bottom left, bottom right, each anchored to its
+        // own corner exactly (the far edges are the frame's own, never past it).
+        assert_eq!(q[0][0], 0.0, "{w}x{h}: {:?}", q[0]);
+        assert_eq!(q[0][1], 0.0, "{w}x{h}: {:?}", q[0]);
+        assert_eq!(q[1][2], w, "{w}x{h}: {:?}", q[1]);
+        assert_eq!(q[1][1], 0.0, "{w}x{h}: {:?}", q[1]);
+        assert_eq!(q[2][0], 0.0, "{w}x{h}: {:?}", q[2]);
+        assert_eq!(q[2][3], h, "{w}x{h}: {:?}", q[2]);
+        assert_eq!(q[3][2], w, "{w}x{h}: {:?}", q[3]);
+        assert_eq!(q[3][3], h, "{w}x{h}: {:?}", q[3]);
+        for r in &q[..4] {
+            // Inside the frame, `share` of each side, so one zoom keeps the frame's aspect.
+            assert!(within(*r, [0.0, 0.0, w, h]), "{w}x{h}: {r:?}");
+            assert!(
+                close(r[2] - r[0], sw) && close(r[3] - r[1], sh),
+                "{w}x{h}: {r:?}"
+            );
+            assert!(
+                close(w / (r[2] - r[0]), h / (r[3] - r[1])),
+                "{w}x{h}: {r:?}"
+            );
+        }
+        // Neighbours overlap by (2 x share - 1) of the side: 10% at 0.55.
+        let (ox, oy) = ((2.0 * share - 1.0) * w, (2.0 * share - 1.0) * h);
+        assert!(close(q[0][2] - q[1][0], ox), "{w}x{h}: {q:?}");
+        assert!(close(q[2][2] - q[3][0], ox), "{w}x{h}: {q:?}");
+        assert!(close(q[0][3] - q[2][1], oy), "{w}x{h}: {q:?}");
+        assert!(close(q[1][3] - q[3][1], oy), "{w}x{h}: {q:?}");
+        // Step 4 (and on) is the whole frame.
+        assert_eq!(q[4], [0.0, 0.0, w, h], "{w}x{h}");
+        assert_eq!(q[5], [0.0, 0.0, w, h], "{w}x{h}");
+    }
+    // An object on a centre line, up to the overlap wide, is whole in one quarter.
+    let got = node(&json!([quarter(0.0, 1000.0, 600.0, share)]));
+    assert!(within([455.0, 100.0, 545.0, 150.0], rect_of(&got[0])));
+    // Steps that are no quarter show the whole frame; the share is held to 0.5..1 (0.5: the
+    // quarters meet exactly, 1: each is the whole frame).
+    let got = node(&json!([
+        quarter(-1.0, 800.0, 400.0, share),
+        quarter(1.5, 800.0, 400.0, share),
+        quarter(3.0, 800.0, 400.0, 0.2),
+        quarter(3.0, 800.0, 400.0, 1.5),
+    ]));
+    let r: Vec<[f64; 4]> = got.iter().map(rect_of).collect();
+    assert_eq!(r[0], [0.0, 0.0, 800.0, 400.0]);
+    assert_eq!(r[1], [0.0, 0.0, 800.0, 400.0]);
+    assert_eq!(r[2], [400.0, 200.0, 800.0, 400.0]);
+    assert_eq!(r[3], [0.0, 0.0, 800.0, 400.0]);
 }
 
 /// Needs no `node`: the page loads the module before review.js, and it stays pure.

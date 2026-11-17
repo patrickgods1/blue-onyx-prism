@@ -3,7 +3,9 @@
 //! `refineFocus`, `answerRefine`, `sendsFilter`, `refineForSave`). `assets/review.js` applies these
 //! answers to its canvas, card and keys, so they are checked here in Node: which suggestion is
 //! current, what `y` and `w` act on, what the card says per kind, what an answer does to the file
-//! and the page flags, and that the reviewer's own edits end a suggestion by themselves.
+//! and the page flags, and that the reviewer's own edits end a suggestion by themselves. Also the
+//! session line's other page decision without a twin, `boxDecisions` (effort counted in boxes),
+//! and which frames a save marks as random picks (`servedPicks`, `servedAsPick`).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -173,6 +175,34 @@ console.log(JSON.stringify(req.map((r) => {
     out.tighten = R.adjustingBox(other.boxes);
     return out;
   }
+  if (r.op === 'box_decisions') {
+    // What the page does: mark the served boxes, keep a copy, apply the visit's edits, then count
+    // on the save's copy (assets/review.js `loadFrame`, `save`).
+    const labels = clone(r.labels);
+    R.markServed(labels);
+    const served = clone(labels.boxes);
+    (r.edits || []).forEach((e) => edit(labels, e));
+    (r.accept || []).forEach((i) => { labels.boxes[i].state = 'accepted'; });
+    if (r.answer != null) {
+      const l = R.liveRefine(labels, r.classes, r.hidden).find((x) => x.index === r.answer);
+      if (!R.answerRefine(labels, l, true, r.classes, r.hidden).ok) throw new Error('not answered');
+    }
+    (r.draw || []).forEach((d) => labels.boxes.push(Object.assign({ source: 'human', state: 'added', _checked: true }, d)));
+    (r.duplicate || []).forEach((i) => R.markDuplicate(labels.boxes[i]));
+    // A pending box of a "don't want" class, as the save rejects it.
+    (r.hide || []).forEach((i) => { labels.boxes[i].state = 'rejected'; labels.boxes[i].reason = 'other_class'; });
+    return R.boxDecisions(served, labels.boxes);
+  }
+  if (r.op === 'served_picks') {
+    // The queue serves `items` in turn (assets/review.js `runNext`: `noteRandomPick`), then the
+    // page loads `loads` (Back, a reload, a link): the `review_pick` each save sends.
+    let picks = R.servedPicks(r.stored, null, r.max);
+    (r.items || []).forEach((it) => { picks = R.servedPicks(picks, it, r.max); });
+    return {
+      picks: picks,
+      saves: (r.loads || []).map((l) => (R.servedAsPick(picks, l.frame) ? 'random' : (l.own === undefined ? null : l.own))),
+    };
+  }
   if (r.op === 'sends') return R.sendsFilter(r.name, r.value, r.auto);
   if (r.op === 'for_save') return R.refineForSave(clone(r.labels));
   throw new Error('unknown op ' + r.op);
@@ -231,7 +261,7 @@ fn classes() -> Value {
 }
 
 /// A reviewed frame with one suggestion of each kind (file order: verify, add, relabel, tighten;
-/// strength order: add 4899, relabel 3849, tighten 2699, verify 1200).
+/// strength order: relabel 4849, add 3899, verify 2000, tighten 1699).
 ///
 /// Boxes: 0 person (relabel target), 1 person rejected low_score near the add, 2 car (verify
 /// target), 3 person rejected low_score exactly at the add, 4 person (tighten target).
@@ -277,20 +307,21 @@ fn the_current_suggestion_is_the_strongest_after_any_overlap() {
         // An overlap suggestion on screen comes first: none is current.
         {"op": "current", "live": list, "overlap": true},
         {"op": "current", "live": [], "overlap": false},
-        // The first of two equal adds put off (Later): the second, place 2.
-        {"op": "current", "live": list, "overlap": false, "later_of": [1]},
+        // The relabel and the first of two equal adds put off (Later): the second add, place 3.
+        {"op": "current", "live": list, "overlap": false, "later_of": [2, 1]},
         // All put off: the strongest again.
         {"op": "current", "live": list, "overlap": false, "later_of": [0, 1, 2, 3, 4]},
     ]));
-    // Adds first (band 4), equal scores by index; then relabel, tighten, verify.
-    assert_eq!(got[0], json!({"index": 1, "k": 1, "n": 5}));
+    // The relabel first (band 4), then the adds (band 3, equal scores by index), verify, tighten:
+    // what costs a model most per error first, whatever the score.
+    assert_eq!(got[0], json!({"index": 2, "k": 1, "n": 5}));
     assert_eq!(got[1], Value::Null);
     assert_eq!(got[2], Value::Null);
-    assert_eq!(got[3], json!({"index": 3, "k": 2, "n": 5}));
-    assert_eq!(got[4], json!({"index": 1, "k": 1, "n": 5}));
+    assert_eq!(got[3], json!({"index": 3, "k": 3, "n": 5}));
+    assert_eq!(got[4], json!({"index": 2, "k": 1, "n": 5}));
     // Later walks the strength order and wraps after the last one.
     let walk = node(&json!([{"op": "later", "live": list, "steps": 6}]));
-    assert_eq!(walk[0], json!([1, 3, 2, 4, 0, 1, 3]));
+    assert_eq!(walk[0], json!([2, 1, 3, 0, 4, 2, 1]));
 }
 
 #[test]
@@ -377,7 +408,7 @@ fn an_accepted_add_is_fitted_before_the_next_suggestion() {
         a["done_key"], "accept",
         "the next suggestion answers to y again"
     );
-    // The relabel (strength band 3) is what Accept box brings up.
+    // The relabel (strength band 4) is what Accept box brings up.
     assert_eq!(a["next"], json!({"index": 1, "k": 1, "n": 3}));
     assert_eq!(a["tighten"], -1);
 }
@@ -850,4 +881,111 @@ fn a_save_keeps_answers_and_drops_page_fields_of_suggestions() {
     );
     // A file without suggestions goes as it was.
     assert_eq!(got[1], json!({"version": 1, "boxes": []}));
+}
+
+/// The session line counts effort in boxes (`boxDecisions`): boxes pending when served that the
+/// save decides, a box made by accepting a suggestion, and boxes drawn by hand. A box decided
+/// before the visit, a duplicate, a too-small box, a dismissal and a box of a "don't want" class
+/// the save rejected unseen are no decision of the reviewer's.
+#[test]
+fn the_session_counts_the_boxes_decided_and_drawn_on_this_visit() {
+    if !have_node() {
+        return;
+    }
+    let pending = |label: &str, extra: Value| {
+        let mut b = json!({"label": label, "bbox": [0, 0, 50, 50], "source": "auto", "state": "pending", "score": 0.6});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+    let labels = json!({
+        "version": 1,
+        "status": "unreviewed",
+        "boxes": [
+            // 0: left pending, a prediction: the save accepts it.
+            pending("person", json!({"source": "model", "origin": "prediction"})),
+            // 1: rejected by the reviewer.
+            pending("car", json!({})),
+            // 2: a stacked duplicate the save rejects.
+            pending("dog", json!({})),
+            // 3: accepted before this visit.
+            pending("person", json!({"state": "accepted"})),
+            // 4: dismissed by a run, never judged.
+            pending("person", json!({"state": "rejected", "reason": "auto_dismissed"})),
+            // 5: a hidden class the save rejects unseen.
+            pending("cat", json!({})),
+            // 6: a human box from an earlier visit.
+            pending("person", json!({"source": "human", "state": "added"})),
+            // 7: rejected as too small.
+            pending("truck", json!({})),
+            // 8: accepted by the reviewer.
+            pending("car", json!({})),
+        ]
+    });
+    let edits = json!([{"box": 1, "op": "reject"}, {"box": 7, "op": "too_small"}]);
+    let got = node(&json!([
+        {"op": "box_decisions", "labels": labels, "edits": edits, "accept": [8], "duplicate": [2], "hide": [5],
+         "draw": [{"label": "person", "bbox": [1, 1, 9, 9]}, {"label": "car", "bbox": [2, 2, 8, 8]}]},
+        // A frame seen again (Back): nothing is pending any more, nothing counts.
+        {"op": "box_decisions", "labels": frame()},
+        // A yes to the dataset check's add: a new box, accepted.
+        {"op": "box_decisions", "labels": frame(), "answer": 1, "classes": classes(), "hidden": []},
+        // Nothing to count.
+        {"op": "box_decisions", "labels": {"version": 1, "boxes": []}},
+    ]));
+    assert_eq!(
+        got[0],
+        json!({"decided": 3, "accepted": 2, "rejected": 1, "drawn": 2}),
+        "0 and 8 accepted, 1 rejected; 2, 3, 4, 5, 6 and 7 are no decision of this visit"
+    );
+    assert_eq!(
+        got[1],
+        json!({"decided": 0, "accepted": 0, "rejected": 0, "drawn": 0})
+    );
+    assert_eq!(
+        got[2],
+        json!({"decided": 1, "accepted": 1, "rejected": 0, "drawn": 0})
+    );
+    assert_eq!(
+        got[3],
+        json!({"decided": 0, "accepted": 0, "rejected": 0, "drawn": 0})
+    );
+}
+
+/// A frame the queue served as a random pick keeps its mark however the reviewer comes back to it
+/// (passed with Next, saved after Back or a reload), and a frame never served as one is never
+/// marked: its own value goes back as loaded.
+#[test]
+fn a_served_random_pick_is_marked_on_every_save_of_the_session() {
+    if !have_node() {
+        return;
+    }
+    let item = |frame: &str, random: bool| json!({"frame": frame, "random_pick": random});
+    let got = node(&json!([
+        {"op": "served_picks", "max": 10,
+         "items": [item("a", true), item("b", false), item("c", true), item("a", true), {"frame": "d"}],
+         "loads": [{"frame": "a"}, {"frame": "b"}, {"frame": "c", "own": "random"},
+                   {"frame": "d", "own": "stratified"}, {"frame": "e"}]},
+        // A reload: the list kept in sessionStorage (junk dropped), nothing served since.
+        {"op": "served_picks", "max": 10, "stored": ["a", 7, null, "c"],
+         "loads": [{"frame": "a"}, {"frame": "x", "own": "random"}]},
+        // Nothing stored or a damaged value: an empty list.
+        {"op": "served_picks", "max": 10, "stored": {"a": true}, "loads": [{"frame": "a"}]},
+        // At most `max`, the oldest go.
+        {"op": "served_picks", "max": 2,
+         "items": [item("a", true), item("b", true), item("c", true)],
+         "loads": [{"frame": "a"}, {"frame": "c"}]},
+    ]));
+    assert_eq!(got[0]["picks"], json!(["a", "c"]));
+    assert_eq!(
+        got[0]["saves"],
+        json!(["random", null, "random", "stratified", null]),
+        "a after Back is still a pick; b, d and e were never served as one"
+    );
+    assert_eq!(got[1]["picks"], json!(["a", "c"]));
+    assert_eq!(got[1]["saves"], json!(["random", "random"]));
+    assert_eq!(got[2], json!({"picks": [], "saves": [null]}));
+    assert_eq!(got[3]["picks"], json!(["b", "c"]));
+    assert_eq!(got[3]["saves"], json!([null, "random"]));
 }

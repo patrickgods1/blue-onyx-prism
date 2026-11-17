@@ -1,23 +1,28 @@
-//! The answer from the rows: one pass over them, no sort. `next_after` needs a place in the sorted
-//! queue and the few frames after it, which counting the rows before `after` and keeping the
-//! smallest few gives in one pass; a sort would build the order of every other frame to throw it
-//! away. The order is the one of [`super::super::queue::sort_items`]: [`Uncertainty::key`], then
-//! the newest, then the path. It has no ties, paths being unique, so what the pass finds is what
-//! the sort would put there.
+//! The answer from the rows. In the uncertainty order ([`Order::Uncertain`]): one pass over them,
+//! no sort. `next_after` needs a place in the sorted queue and the few frames after it, which
+//! counting the rows before `after` and keeping the smallest few gives in one pass; a sort would
+//! build the order of every other frame to throw it away. The order is the one of
+//! [`super::super::queue::sort_items`]: [`Uncertainty::key`], then the newest, then the path. It
+//! has no ties, paths being unique, so what the pass finds is what the sort would put there.
+//!
+//! The Recommended order ([`Order::Recommended`]) is no key of a row alone: a row's event rank
+//! depends on the other rows of its event. Its pass gathers the counted rows per day folder and
+//! the listed ones' keys, and [`recommend::arrange`] sorts them as the walk does.
 //!
 //! The steps of the pass are those of `queue::build`, in its order. Only the found frame and the
 //! ones after it become strings.
 
 use super::super::Status;
 use super::super::queue::{
-    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, Filters, Item, QueueSource,
-    SortKey, StatusFilter,
+    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, Filters, Item, Order,
+    QueueSource, SortKey, StatusFilter, Uncertainty,
 };
+use super::super::recommend;
 use super::State;
 use super::answer::{Answer, UPCOMING};
 use super::row::{Name, Names, Row, Shard, auto_bit, stem_of};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A name filter, over ids.
 enum Want {
@@ -63,13 +68,14 @@ struct Compiled {
 }
 
 /// What `balance=` weighs a row by: [`BalanceTally`] of the rows the query counts, and each class
-/// set's, scene's and camera's part of the need, by id. The parts are [`BalanceTally::need`]'s, so
-/// a score is the walk's.
+/// set's (per camera), scene's and camera's part of the need, by id. The parts are
+/// [`BalanceTally::need`]'s, so a score is the walk's.
 struct Weigh {
     by: Balance,
     tally: BalanceTally,
-    /// By class set id ([`Row::classes`]).
-    class: Vec<ClassNeed>,
+    /// Balancing classes, by (class set id ([`Row::classes`]), camera id) of the listed rows: the
+    /// class part depends on the camera through [`BalanceTally::precision`].
+    class: HashMap<(u32, Name), ClassNeed>,
     /// By name id: (need, reviewed frames) as a scene, and as a camera.
     scene: Vec<(u32, u64)>,
     camera: Vec<(u32, u64)>,
@@ -77,13 +83,26 @@ struct Weigh {
 
 impl Weigh {
     fn new(by: Balance, f: &Filters, state: &State, q: &Compiled, names: &Names) -> Self {
-        // Reviewed rows by (training set, scene, camera): a few groups, so few strings.
-        let mut groups: HashMap<(u32, Name, Name), u64> = HashMap::new();
+        // Reviewed rows by (training set, proposed labels, scene, camera): a few groups, so few
+        // strings. And the (class set, camera) pairs of the listed rows, whose class part is asked.
+        let mut groups: HashMap<(u32, u32, Name, Name), u64> = HashMap::new();
+        let mut listed: BTreeSet<(u32, Name)> = BTreeSet::new();
         for shard in state.shards.values() {
             for row in &shard.rows {
-                if q.counts(row) && row.part.status == Status::Reviewed {
-                    let key = (row.part.training, row.cand.scene, row.cand.camera);
+                if !q.counts(row) {
+                    continue;
+                }
+                if row.part.status == Status::Reviewed {
+                    let key = (
+                        row.part.training,
+                        row.part.proposed,
+                        row.cand.scene,
+                        row.cand.camera,
+                    );
                     *groups.entry(key).or_default() += 1;
+                }
+                if by.class && q.by_state(row) {
+                    listed.insert((row.classes(), row.cand.camera));
                 }
             }
         }
@@ -91,17 +110,30 @@ impl Weigh {
         sorted.sort_unstable();
         let mut tally = BalanceTally::default();
         let mut trained: HashMap<u32, BTreeSet<String>> = HashMap::new();
-        for ((training, scene, camera), n) in sorted {
+        let mut proposed: HashMap<u32, BTreeSet<String>> = HashMap::new();
+        for ((training, offered, scene, camera), n) in sorted {
             let classes = trained.entry(training).or_insert_with(|| {
                 f.wanted_of(names.training(training).iter().map(|(c, _)| names.name(*c)))
             });
-            tally.add(n, names.name(scene), names.name(camera), classes);
+            let offered = proposed.entry(offered).or_insert_with(|| {
+                f.wanted_of(names.proposed(offered).iter().map(|c| names.name(*c)))
+            });
+            tally.add(n, names.name(scene), names.name(camera), classes, offered);
         }
-        let class = names
-            .class_sets()
-            .map(|set| {
-                tally
-                    .class_need(&f.wanted_confidence(set.iter().map(|(c, s)| (names.name(*c), *s))))
+        let mut sure: HashMap<u32, BTreeMap<String, u8>> = HashMap::new();
+        let class = listed
+            .into_iter()
+            .map(|(set, camera)| {
+                let classes = sure.entry(set).or_insert_with(|| {
+                    f.wanted_confidence(
+                        names
+                            .class_set(set)
+                            .iter()
+                            .map(|(c, s)| (names.name(*c), *s)),
+                    )
+                });
+                let need = tally.class_need(classes, names.name(camera));
+                ((set, camera), need)
             })
             .collect();
         let ids = 0..u32::try_from(names.name_count()).unwrap_or(u32::MAX);
@@ -119,8 +151,9 @@ impl Weigh {
         }
     }
 
+    /// The class part of a listed row (None when not balancing classes).
     fn class_of(&self, r: &Row) -> Option<&ClassNeed> {
-        self.class.get(r.classes() as usize)
+        self.class.get(&(r.classes(), r.cand.camera))
     }
 
     /// [`BalanceNeed::score`] of `r`, without building the rest.
@@ -239,6 +272,11 @@ impl Compiled {
 
     /// What sorts `r`. No note text: the sort only asks whether there is one.
     fn key(&self, r: &Row) -> SortKey {
+        self.uncertainty(r).key()
+    }
+
+    /// What the orders read of `r`: its uncertainty with the balance score alone and no note text.
+    fn uncertainty(&self, r: &Row) -> Uncertainty {
         let mut u = r.uncertainty(
             self.auto,
             self.refine_of(r),
@@ -248,7 +286,7 @@ impl Compiled {
             score: w.score(r),
             ..BalanceNeed::default()
         });
-        u.key()
+        u
     }
 }
 
@@ -406,17 +444,12 @@ fn pivot<'a>(state: &'a State, q: &Compiled, after: Option<&str>) -> Option<Hit<
     })
 }
 
-fn item(hit: &Hit<'_>, q: &Compiled, names: &Names) -> Item {
-    let r = hit.row;
-    let mut uncertainty = r.uncertainty(
-        q.auto,
-        q.refine_of(r),
-        hit.shard.note(r).map(str::to_string),
-    );
+fn item(shard: &Shard, r: &Row, q: &Compiled, names: &Names) -> Item {
+    let mut uncertainty = r.uncertainty(q.auto, q.refine_of(r), shard.note(r).map(str::to_string));
     uncertainty.balance = q.weigh.as_ref().map(|w| w.need(r, names));
     Item {
-        frame: hit.shard.rel(r),
-        timestamp: hit.shard.timestamp(r).to_string(),
+        frame: shard.rel(r),
+        timestamp: shard.timestamp(r).to_string(),
         scene: names.name(r.cand.scene).to_string(),
         camera: names.name(r.cand.camera).to_string(),
         model: names.name(r.side.model).to_string(),
@@ -424,26 +457,21 @@ fn item(hit: &Hit<'_>, q: &Compiled, names: &Names) -> Item {
         status: r.part.status,
         queued: r.queued,
         uncertainty,
+        event_rank: None,
+        random_pick: false,
     }
 }
 
-/// The answer of `state` for `f` and `after`, with the frames it shows: [`Answer::indexing`] is the
-/// caller's.
-pub(super) fn answer(
-    state: &State,
-    names: &Names,
-    f: &Filters,
-    after: Option<&str>,
-) -> (Answer, Vec<String>) {
-    let mut q = Compiled::new(f, names);
-    // Before anything sorts: the pivot's place needs the scores too.
-    if let Some(by) = f.balance {
-        q.weigh = Some(Weigh::new(by, f, state, &q, names));
-    }
-    let pivot = pivot(state, &q, after);
-    let mut tally = Tally::new(names);
-    let (mut first, mut next) = (Top(Vec::new()), Top(Vec::new()));
-    let (mut total, mut before) = (0usize, 0usize);
+/// What [`pass`] hands on: a row the query counts, with whether it lists it, or the end of a
+/// shard (a day folder).
+enum Step<'a> {
+    Counted(&'a Shard, &'a Row, bool),
+    DayDone,
+}
+
+/// The steps of `queue::build` over every row, in its order: `tally` takes the cameras, classes,
+/// counts and unreadable frames, `each` every counted row and the end of each shard.
+fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn FnMut(Step<'a>)) {
     for shard in state.shards.values() {
         for row in &shard.rows {
             if !q.in_source(row) {
@@ -462,48 +490,53 @@ pub(super) fn answer(
                 continue;
             }
             tally.count(row);
-            if !q.by_state(row) {
-                continue;
-            }
-            total += 1;
-            let hit = Hit {
-                key: q.key(row),
-                shard,
-                row,
-            };
-            first.offer(hit);
-            if let Some(p) = &pivot {
-                match hit.order(p) {
-                    Ordering::Less => before += 1,
-                    Ordering::Equal => {}
-                    Ordering::Greater => next.offer(hit),
-                }
-            }
+            each(Step::Counted(shard, row, q.by_state(row)));
         }
+        each(Step::DayDone);
     }
-    // As `next_after`: past `after`, past the last back to the first, no `after` from the first.
-    let past_pivot = pivot.is_some() && before + 1 < total;
-    let (hits, position, wrapped) = if past_pivot {
-        (next.0, before + 2, false)
-    } else {
-        (first.0, 1, pivot.is_some())
+}
+
+/// The answer of `state` for `f` and `after`, with the frames it shows: [`Answer::indexing`] is the
+/// caller's.
+pub(super) fn answer(
+    state: &State,
+    names: &Names,
+    f: &Filters,
+    after: Option<&str>,
+) -> (Answer, Vec<String>) {
+    let mut q = Compiled::new(f, names);
+    // Before anything sorts: the pivot's place needs the scores too.
+    if let Some(by) = f.balance_by() {
+        q.weigh = Some(Weigh::new(by, f, state, &q, names));
+    }
+    let pivot = pivot(state, &q, after);
+    let mut tally = Tally::new(names);
+    let placed = match f.order {
+        Order::Uncertain => uncertain(state, &q, &mut tally, pivot.as_ref()),
+        Order::Recommended => {
+            let random = recommend::random_slots(f);
+            recommended(state, &q, &mut tally, pivot.as_ref(), random)
+        }
     };
-    let found = hits.first().map(|h| item(h, &q, names));
-    let upcoming: Vec<String> = hits
+    let found = placed.found.map(|(shard, row, rank, random_pick)| Item {
+        event_rank: rank,
+        random_pick,
+        ..item(shard, row, &q, names)
+    });
+    let upcoming: Vec<String> = placed
+        .upcoming
         .iter()
-        .skip(1)
-        .take(UPCOMING)
-        .map(|h| h.shard.rel(h.row))
+        .map(|(shard, row)| shard.rel(row))
         .collect();
     let mut shown = upcoming.clone();
     shown.extend(found.iter().map(|i| i.frame.clone()));
     let unreadable = tally.unreadable + state.damaged(f.source == QueueSource::All);
     let (counts, cameras, labels) = tally.finish(names);
     let answer = Answer {
-        position: found.as_ref().map(|_| position),
-        wrapped: found.is_some() && wrapped,
+        position: found.as_ref().map(|_| placed.position),
+        wrapped: found.is_some() && placed.wrapped,
         item: found,
-        total,
+        total: placed.total,
         counts,
         cameras,
         labels,
@@ -513,4 +546,151 @@ pub(super) fn answer(
         balance: q.weigh.map(|w| w.tally),
     };
     (answer, shown)
+}
+
+/// Where `next_after` lands: the frame (with its event rank under the Recommended order, and
+/// whether it is a random pick), its 1-based position, whether it wrapped, the frames after it
+/// and how many are listed.
+struct Placed<'a> {
+    found: Option<(&'a Shard, &'a Row, Option<u32>, bool)>,
+    position: usize,
+    wrapped: bool,
+    upcoming: Vec<(&'a Shard, &'a Row)>,
+    total: usize,
+}
+
+/// The uncertainty order in one pass, no sort: the rows before the pivot are counted and the
+/// first few of the queue and after the pivot kept.
+fn uncertain<'a>(
+    state: &'a State,
+    q: &Compiled,
+    tally: &mut Tally,
+    pivot: Option<&Hit<'a>>,
+) -> Placed<'a> {
+    let (mut first, mut next) = (Top(Vec::new()), Top(Vec::new()));
+    let (mut total, mut before) = (0usize, 0usize);
+    pass(state, q, tally, &mut |step| {
+        let Step::Counted(shard, row, true) = step else {
+            return;
+        };
+        total += 1;
+        let hit = Hit {
+            key: q.key(row),
+            shard,
+            row,
+        };
+        first.offer(hit);
+        if let Some(p) = pivot {
+            match hit.order(p) {
+                Ordering::Less => before += 1,
+                Ordering::Equal => {}
+                Ordering::Greater => next.offer(hit),
+            }
+        }
+    });
+    // As `next_after`: past `after`, past the last back to the first, no `after` from the first.
+    let past_pivot = pivot.is_some() && before + 1 < total;
+    let (hits, position, wrapped) = if past_pivot {
+        (next.0, before + 2, false)
+    } else {
+        (first.0, 1, pivot.is_some())
+    };
+    Placed {
+        found: hits.first().map(|h| (h.shard, h.row, None, false)),
+        position,
+        wrapped,
+        upcoming: hits
+            .iter()
+            .skip(1)
+            .take(UPCOMING)
+            .map(|h| (h.shard, h.row))
+            .collect(),
+        total,
+    }
+}
+
+/// The Recommended order: events need every counted row of a day folder and ranks need their
+/// event's other listed rows, so this sorts what it lists ([`recommend::arrange`], as the walk
+/// does) and finds the pivot in it. With `random` (the view has random slots,
+/// [`recommend::random_slots`]), the pool frames in their slots as the walk places them
+/// ([`recommend::with_random_slots`], the hash over [`Shard::rel_bytes`]).
+fn recommended<'a>(
+    state: &'a State,
+    q: &Compiled,
+    tally: &mut Tally,
+    pivot: Option<&Hit<'a>>,
+    random: bool,
+) -> Placed<'a> {
+    let mut members: Vec<recommend::Member> = Vec::new();
+    let mut events = recommend::Events::default();
+    let mut listed: Vec<(&'a Shard, &'a Row)> = Vec::new();
+    let mut keys: Vec<recommend::Key> = Vec::new();
+    pass(state, q, tally, &mut |step| match step {
+        Step::Counted(shard, row, lists) => {
+            members.push(recommend::Member {
+                ms: recommend::event_ms(shard.timestamp(row)),
+                alone: row.side.alone,
+                decided: row.part.status != Status::Unreviewed,
+                listed: lists.then_some(listed.len()),
+            });
+            if lists {
+                keys.push(recommend::key(&q.uncertainty(row), 0));
+                listed.push((shard, row));
+            }
+        }
+        Step::DayDone => {
+            events.add_day(&mut members);
+            members.clear();
+        }
+    });
+    let tie = |a: usize, b: usize| match (listed.get(a), listed.get(b)) {
+        (Some((sa, ra)), Some((sb, rb))) => sb
+            .timestamp(rb)
+            .cmp(sa.timestamp(ra))
+            .then_with(|| sa.rel_bytes(ra).cmp(sb.rel_bytes(rb))),
+        _ => a.cmp(&b),
+    };
+    let order = recommend::arrange(&events, &keys, &tie);
+    let order: Vec<(usize, u32, bool)> = if random {
+        // As the walk: one more with each frame reviewed or skipped of those counted.
+        let decided = tally.counts.reviewed.saturating_add(tally.counts.skipped);
+        let pool_hash_of = |i: usize| {
+            let (shard, row) = listed.get(i)?;
+            let hash = recommend::pool_hash_bytes(shard.rel_bytes(row));
+            recommend::is_pool_frame(hash, row.part.note != 0).then_some(hash)
+        };
+        let path = |a: usize, b: usize| match (listed.get(a), listed.get(b)) {
+            (Some((sa, ra)), Some((sb, rb))) => sa.rel_bytes(ra).cmp(sb.rel_bytes(rb)),
+            _ => a.cmp(&b),
+        };
+        recommend::with_random_slots(&order, &pool_hash_of, &path, decided)
+    } else {
+        order.into_iter().map(|(i, r)| (i, r, false)).collect()
+    };
+    let at = |i: usize| listed.get(i).copied();
+    // As `next_after`: past `after`, past the last back to the first, no `after` from the first.
+    let pos = pivot.and_then(|p| {
+        order
+            .iter()
+            .position(|(i, _, _)| at(*i).is_some_and(|(_, r)| std::ptr::eq(r, p.row)))
+    });
+    let (from, wrapped) = match pos {
+        Some(p) if p + 1 < order.len() => (p + 1, false),
+        Some(_) => (0, true),
+        None => (0, false),
+    };
+    Placed {
+        found: order
+            .get(from)
+            .and_then(|(i, rank, random)| at(*i).map(|(s, r)| (s, r, Some(*rank), *random))),
+        position: from + 1,
+        wrapped,
+        upcoming: order
+            .iter()
+            .skip(from + 1)
+            .take(UPCOMING)
+            .filter_map(|(i, _, _)| at(*i))
+            .collect(),
+        total: order.len(),
+    }
 }

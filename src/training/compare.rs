@@ -8,10 +8,13 @@
 //! on frames without any object (best = highest recall, lowest false-alert rate). Pure; the
 //! Train tab and `train run --scene ... --scene ...` render it. Runs that differ only by
 //! training seed (`--seeds`, "Repeat with N seeds") also get a "mean of N seeds" summary
-//! ([`SeedSummary`]: mean and range per column; never the best of a column).
+//! ([`SeedSummary`]: mean and range per column; never the best of a column). A "random picks"
+//! column holds AP50-95 on the held-out frames the Review queue picked at random
+//! ([`BenchSummary::random`], the least biased score), shown only when every benchmarked run has
+//! at least [`MIN_RANDOM_HELDOUT`] of them ([`Comparison::random_column`]).
 
 use super::dataset::{Balance, Excluded, IgnoreMode, SceneFilter};
-use super::job::{BenchSummary, SceneAp};
+use super::job::{BenchSummary, SceneAp, SubsetScore};
 use super::recipe::SelectMetric;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -30,6 +33,12 @@ pub struct CompareRun {
     /// What its training frames with ignore regions became (`RunSettings::ignore_mode`); None
     /// while the run has not started training.
     pub ignore: Option<IgnoreMode>,
+    /// The share of empty training frames it kept (`RunSettings::negative_share`); None =
+    /// unknown (not started, or a record from before it was recorded).
+    pub negative_share: Option<f32>,
+    /// The most frames per static spot (`RunSettings::static_cap`, `Some(0)` = off); None =
+    /// unknown.
+    pub static_cap: Option<u32>,
     /// How the run balanced its training frames (off for older runs).
     pub balance: Balance,
     /// Best epoch (1-based) and the epoch training stopped at, when known.
@@ -94,6 +103,10 @@ pub struct Row {
     pub vehicle_recall: Option<f64>,
     /// False alerts on held-out frames without any object.
     pub false_alerts: Option<FalseAlerts>,
+    /// The held-out frames the Review queue picked at random ([`BenchSummary::random`]; None for a
+    /// routed row, a run without any and runs of older versions). Its AP50-95 is the `random`
+    /// column, shown only with [`Comparison::random_column`].
+    pub random: Option<SubsetScore>,
 }
 
 /// Empty frames (no scored object) that alerted at the threshold, of all empty frames.
@@ -132,7 +145,7 @@ pub enum Better {
 
 /// Column ids of [`Comparison::best_per_column`] and the direction each improves in. A new
 /// column is one entry here plus its arm in [`value`].
-pub const COLUMNS: [(&str, Better); 12] = [
+pub const COLUMNS: [(&str, Better); 13] = [
     ("day", Better::Higher),
     ("night", Better::Higher),
     ("ir", Better::Higher),
@@ -146,7 +159,13 @@ pub const COLUMNS: [(&str, Better); 12] = [
     ("vehicle_recall", Better::Higher),
     // The false-alert rate (alerts / empty frames).
     ("false_alerts", Better::Lower),
+    // AP50-95 on the held-out random picks (only with `Comparison::random_column`).
+    ("random", Better::Higher),
 ];
+
+/// Fewest held-out random picks ([`BenchSummary::random`]) every benchmarked run needs before the
+/// Comparison shows its `random` column: AP over fewer frames moves too much from frame to frame.
+pub const MIN_RANDOM_HELDOUT: usize = 50;
 
 /// Mean and range of one column over the runs of a [`SeedSummary`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -169,7 +188,7 @@ pub struct SeedSummary {
     pub columns: BTreeMap<String, Spread>,
 }
 
-fn seed_summaries(rows: &[Row]) -> Vec<SeedSummary> {
+fn seed_summaries(rows: &[Row], random_column: bool) -> Vec<SeedSummary> {
     let mut keys: Vec<(&str, &str)> = Vec::new();
     for r in rows.iter().filter(|r| !r.routed && r.seed.is_some()) {
         let k = (r.model.as_str(), r.scene.as_str());
@@ -187,7 +206,10 @@ fn seed_summaries(rows: &[Row]) -> Vec<SeedSummary> {
             continue;
         }
         let mut columns = BTreeMap::new();
-        for (col, _) in COLUMNS {
+        for (col, _) in COLUMNS
+            .into_iter()
+            .filter(|(c, _)| random_column || *c != "random")
+        {
             let vals: Vec<f64> = set.iter().filter_map(|r| value(r, col)).collect();
             if vals.is_empty() {
                 continue;
@@ -225,6 +247,10 @@ pub struct Comparison {
     pub seed_summaries: Vec<SeedSummary>,
     /// False when the runs were not benchmarked on the same held-out frames.
     pub comparable: bool,
+    /// Whether the `random` column is shown: every benchmarked run has at least
+    /// [`MIN_RANDOM_HELDOUT`] held-out random picks. Without it the column is neither shown nor
+    /// in `best_per_column` or the seed summaries (the rows still carry `random`).
+    pub random_column: bool,
     pub warnings: Vec<String>,
 }
 
@@ -259,6 +285,7 @@ fn row_of(r: &CompareRun) -> Row {
         person_recall: r.bench.as_ref().and_then(|b| b.person_recall),
         vehicle_recall: r.bench.as_ref().and_then(|b| b.vehicle_recall),
         false_alerts: r.bench.as_ref().and_then(FalseAlerts::of),
+        random: r.bench.as_ref().and_then(|b| b.random),
     }
 }
 
@@ -286,6 +313,7 @@ fn value(r: &Row, c: &str) -> Option<f64> {
         "person_recall" => r.person_recall,
         "vehicle_recall" => r.vehicle_recall,
         "false_alerts" => r.false_alerts.and_then(|f| f.rate()),
+        "random" => r.random.and_then(|s| s.ap50_95),
         _ => None,
     }
     .filter(|v| v.is_finite())
@@ -354,6 +382,41 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
                 names.join(" / ")
             ));
         }
+        let mut shares: Vec<String> = Vec::new();
+        for n in runs.iter().filter_map(|r| r.negative_share) {
+            let pct = format!("{:.0}%", n * 100.0);
+            if !shares.contains(&pct) {
+                shares.push(pct);
+            }
+        }
+        if shares.len() > 1 {
+            c.warnings.push(format!(
+                "the runs keep different shares of empty training frames ({}): their training frames differ, so differences in false alerts may come from that",
+                shares.join(" / ")
+            ));
+        }
+        let mut caps: Vec<u32> = Vec::new();
+        for n in runs.iter().filter_map(|r| r.static_cap) {
+            if !caps.contains(&n) {
+                caps.push(n);
+            }
+        }
+        if caps.len() > 1 {
+            let list: Vec<String> = caps
+                .iter()
+                .map(|n| {
+                    if *n == 0 {
+                        "off".to_string()
+                    } else {
+                        n.to_string()
+                    }
+                })
+                .collect();
+            c.warnings.push(format!(
+                "the runs cap static objects differently ({}): their training frames differ, so AP differences may come from that",
+                list.join(" / ")
+            ));
+        }
         let mut thresholds: Vec<f32> = Vec::new();
         for t in runs
             .iter()
@@ -366,7 +429,8 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
         if thresholds.len() > 1 {
             let list: Vec<String> = thresholds.iter().map(|t| format!("{t:.2}")).collect();
             c.warnings.push(format!(
-                "the runs were benchmarked at different confidence thresholds ({}): their                  recall and false alerts are not comparable",
+                "the runs were benchmarked at different confidence thresholds ({}): their \
+                 recall and false alerts are not comparable",
                 list.join(" / ")
             ));
         }
@@ -399,7 +463,38 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
         }
     }
     c.rows = runs.iter().map(row_of).collect();
+    // The random picks: shown when every benchmarked run has enough; counts that differ mean
+    // the exports marked other frames as picks (the frames themselves are the fingerprint's).
+    let picks: Vec<Option<SubsetScore>> = c
+        .rows
+        .iter()
+        .zip(runs)
+        .filter(|(_, r)| r.bench.is_some())
+        .map(|(row, _)| row.random)
+        .collect();
+    c.random_column = !picks.is_empty()
+        && picks
+            .iter()
+            .all(|p| p.is_some_and(|p| p.images >= MIN_RANDOM_HELDOUT));
+    let mut counts: Vec<usize> = Vec::new();
+    for n in picks.iter().flatten().map(|p| p.images) {
+        if !counts.contains(&n) {
+            counts.push(n);
+        }
+    }
+    if counts.len() > 1 {
+        let list: Vec<String> = counts.iter().map(usize::to_string).collect();
+        c.warnings.push(format!(
+            "the runs have different numbers of random picks among their held-out frames ({}): \
+             the label files changed between their exports, so their random-pick scores are not \
+             comparable; queue the comparison again",
+            list.join(" / ")
+        ));
+    }
     for (col, better) in COLUMNS {
+        if col == "random" && !c.random_column {
+            continue;
+        }
         let lower = better == Better::Lower;
         let mut best: Option<(usize, f64)> = None;
         for (i, r) in c.rows.iter().enumerate() {
@@ -417,7 +512,7 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             c.best_per_column.insert(col.to_string(), i);
         }
     }
-    c.seed_summaries = seed_summaries(&c.rows);
+    c.seed_summaries = seed_summaries(&c.rows, c.random_column);
     // Routed rows, per model: the day run's day AP, the night run's night / IR AP.
     let mut models: Vec<&str> = Vec::new();
     for r in runs {
@@ -457,6 +552,7 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             person_recall: None,
             vehicle_recall: None,
             false_alerts: None,
+            random: None,
         });
     }
     c
@@ -468,29 +564,37 @@ fn fmt_ap(v: Option<f64>) -> String {
 
 impl Comparison {
     /// A plain-text table (the CLI): AP50-95 per scene (`*` = best of the column), in-scope AP,
-    /// p50 time, then the warnings.
+    /// AP50-95 on the random picks (with [`Comparison::random_column`]), p50 time, then the
+    /// warnings.
     pub fn render_text(&self) -> String {
         let best = |i: usize, col: &str| self.best_per_column.get(col) == Some(&i);
-        let mut table: Vec<Vec<String>> = vec![
-            [
-                "run",
-                "model",
-                "scene",
-                "epochs",
-                "day",
-                "night",
-                "ir",
-                "all",
-                "in-scope",
-                "p50 ms",
-                "person R",
-                "vehicle R",
-                "false alerts",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        ];
+        // The random picks' column goes after `in-scope` when shown.
+        const RANDOM_AT: usize = 9;
+        let with_random = |mut cells: Vec<String>, random: String| {
+            if self.random_column {
+                cells.insert(RANDOM_AT, random);
+            }
+            cells
+        };
+        let header = [
+            "run",
+            "model",
+            "scene",
+            "epochs",
+            "day",
+            "night",
+            "ir",
+            "all",
+            "in-scope",
+            "p50 ms",
+            "person R",
+            "vehicle R",
+            "false alerts",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut table: Vec<Vec<String>> = vec![with_random(header, "random".into())];
         for (i, r) in self.rows.iter().enumerate() {
             let mark = |col: &str| if !r.routed && best(i, col) { "*" } else { "" };
             let ap = |col: &str, v: Option<f64>| format!("{}{}", fmt_ap(v), mark(col));
@@ -515,21 +619,25 @@ impl Comparison {
                 Some(seed) => format!("{} (seed {seed})", r.name),
                 None => r.name.clone(),
             };
-            table.push(vec![
-                name,
-                r.model.clone(),
-                r.scene.clone(),
-                epochs,
-                ap("day", r.day.ap50_95),
-                ap("night", r.night.ap50_95),
-                ap("ir", r.ir.ap50_95),
-                ap("all", r.all.ap50_95),
-                fmt_ap(r.in_scope),
-                ms,
-                recall("person_recall", r.person_recall),
-                recall("vehicle_recall", r.vehicle_recall),
-                alerts,
-            ]);
+            let random = ap("random", r.random.and_then(|s| s.ap50_95));
+            table.push(with_random(
+                vec![
+                    name,
+                    r.model.clone(),
+                    r.scene.clone(),
+                    epochs,
+                    ap("day", r.day.ap50_95),
+                    ap("night", r.night.ap50_95),
+                    ap("ir", r.ir.ap50_95),
+                    ap("all", r.all.ap50_95),
+                    fmt_ap(r.in_scope),
+                    ms,
+                    recall("person_recall", r.person_recall),
+                    recall("vehicle_recall", r.vehicle_recall),
+                    alerts,
+                ],
+                random,
+            ));
         }
         for sm in &self.seed_summaries {
             let ap = |col: &str| {
@@ -561,21 +669,24 @@ impl Comparison {
                 || "-".into(),
                 |s| format!("{:.1} ({:.1}-{:.1})", s.mean, s.min, s.max),
             );
-            table.push(vec![
-                sm.label.clone(),
-                sm.model.clone(),
-                sm.scene.clone(),
-                "-".into(),
-                ap("day"),
-                ap("night"),
-                ap("ir"),
-                ap("all"),
-                "-".into(),
-                ms,
-                recall("person_recall"),
-                recall("vehicle_recall"),
-                pct("false_alerts"),
-            ]);
+            table.push(with_random(
+                vec![
+                    sm.label.clone(),
+                    sm.model.clone(),
+                    sm.scene.clone(),
+                    "-".into(),
+                    ap("day"),
+                    ap("night"),
+                    ap("ir"),
+                    ap("all"),
+                    "-".into(),
+                    ms,
+                    recall("person_recall"),
+                    recall("vehicle_recall"),
+                    pct("false_alerts"),
+                ],
+                ap("random"),
+            ));
         }
         let widths: Vec<usize> = (0..table.first().map_or(0, Vec::len))
             .map(|k| {
@@ -645,6 +756,8 @@ mod tests {
             classes: vec!["person".into()],
             excluded: Excluded::Background,
             ignore: Some(IgnoreMode::Background),
+            negative_share: Some(0.15),
+            static_cap: Some(20),
             balance: Balance::default(),
             best_epoch: Some(12),
             stopped_epoch: Some(27),
@@ -803,9 +916,9 @@ mod tests {
         other[1].bench.as_mut().unwrap().threshold = Some(0.4);
         let c = compare(&other);
         assert!(
-            c.warnings
-                .iter()
-                .any(|w| w.contains("different confidence thresholds (0.50 / 0.40)")),
+            c.warnings.iter().any(|w| w
+                == "the runs were benchmarked at different confidence thresholds \
+                               (0.50 / 0.40): their recall and false alerts are not comparable"),
             "{:?}",
             c.warnings
         );
@@ -876,7 +989,27 @@ mod tests {
               differences may come from that"
             ]
         );
-        assert!(compare(&[day, queued]).warnings.is_empty());
+        assert!(compare(&[day.clone(), queued.clone()]).warnings.is_empty());
+        // Empty-frame share and static cap: said once each, only when known values differ.
+        let mut s25 = run("day-b", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0);
+        s25.negative_share = Some(0.25);
+        s25.static_cap = Some(0);
+        let c = compare(&[day.clone(), s25.clone()]);
+        assert_eq!(
+            c.warnings,
+            [
+                "the runs keep different shares of empty training frames (15% / 25%): their training frames differ, so differences in false alerts may come from that",
+                "the runs cap static objects differently (20 / off): their training frames differ, so AP differences may come from that"
+            ]
+        );
+        let mut unknown = day.clone();
+        unknown.negative_share = None;
+        unknown.static_cap = None;
+        assert!(compare(&[unknown.clone(), day.clone()]).warnings.is_empty());
+        assert!(compare(&[unknown, s25]).warnings.is_empty());
+        let mut same = day.clone();
+        same.name = "day-c".into();
+        assert!(compare(&[day, same]).warnings.is_empty());
         // A run without a benchmark is a row of dashes and never the best.
         let mut x = run("x", SceneFilter::DAY, 0.9, 0.9, 0.9, 1.0);
         x.bench = None;
@@ -884,6 +1017,102 @@ mod tests {
         assert!(c.comparable);
         assert_eq!(c.best_per_column["day"], 1);
         assert_eq!(c.rows[0].day.ap50_95, None);
+    }
+
+    /// `run` with `n` held-out random picks scored at AP50-95 `ap`.
+    fn picked(mut r: CompareRun, n: usize, ap: f64) -> CompareRun {
+        r.bench.as_mut().unwrap().random = Some(SubsetScore {
+            images: n,
+            gt: 2 * n,
+            ap50: Some(ap + 0.2),
+            ap50_95: Some(ap),
+            recall: Some(0.8),
+        });
+        r
+    }
+
+    #[test]
+    fn the_random_picks_column_needs_enough_frames_in_every_run() {
+        let a = || run("day-a", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0);
+        let b = || run("all-a", SceneFilter::ALL_SCENES, 0.5, 0.4, 0.5, 9.0);
+        // Every run at 50 or more: shown, with a best.
+        let c = compare(&[picked(a(), 60, 0.31), picked(b(), 60, 0.42)]);
+        assert!(c.random_column);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(c.best_per_column["random"], 1);
+        assert_eq!(c.rows[0].random.unwrap().images, 60);
+        let t = c.render_text();
+        assert!(t.contains("in-scope  random"), "{t}");
+        assert!(t.contains("0.420*"), "{t}");
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["random_column"], true);
+        assert_eq!(v["rows"][1]["random"]["ap50_95"], 0.42);
+        // Exactly the minimum is enough.
+        let c = compare(&[
+            picked(a(), MIN_RANDOM_HELDOUT, 0.31),
+            picked(b(), MIN_RANDOM_HELDOUT, 0.42),
+        ]);
+        assert!(c.random_column);
+        // One run under it: hidden everywhere, the rows keep their figures.
+        let c = compare(&[picked(a(), 60, 0.31), picked(b(), 49, 0.42)]);
+        assert!(!c.random_column);
+        assert!(!c.best_per_column.contains_key("random"));
+        let t = c.render_text();
+        assert!(
+            t.lines().nth(1).is_some_and(|h| !h.contains("random")),
+            "{t}"
+        );
+        assert!(!t.contains("0.420"), "{t}");
+        assert_eq!(c.rows[1].random.unwrap().images, 49);
+        assert_eq!(c.warnings.len(), 1, "60 / 49 differ: {:?}", c.warnings);
+        // A run without any (an older version, or no random pick held out): hidden.
+        let c = compare(&[picked(a(), 60, 0.31), b()]);
+        assert!(!c.random_column);
+        assert!(!compare(&[a(), b()]).random_column);
+        // A run not benchmarked yet hides nothing; the routed row has none.
+        let mut queued = b();
+        queued.bench = None;
+        let night = picked(
+            run("night-a", SceneFilter::NIGHT_IR, 0.3, 0.5, 0.45, 11.0),
+            60,
+            0.2,
+        );
+        let c = compare(&[picked(a(), 60, 0.31), night, queued]);
+        assert!(c.random_column);
+        let routed = c.rows.last().unwrap();
+        assert!(routed.routed && routed.random.is_none());
+        assert_eq!(c.best_per_column["random"], 0);
+        // Seed repeats: the column joins their mean only when shown.
+        let seeded = |n: usize, seed: u64, ap: f64| {
+            let mut r = picked(a(), n, ap);
+            r.seed = Some(seed);
+            r
+        };
+        let c = compare(&[seeded(60, 0, 0.3), seeded(60, 1, 0.4)]);
+        let spread = c.seed_summaries[0].columns["random"];
+        assert!((spread.mean - 0.35).abs() < 1e-9, "{spread:?}");
+        let c = compare(&[seeded(60, 0, 0.3), seeded(40, 1, 0.4)]);
+        assert!(!c.seed_summaries[0].columns.contains_key("random"));
+    }
+
+    #[test]
+    fn differing_random_pick_counts_warn() {
+        let a = picked(run("day-a", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0), 60, 0.3);
+        let b = picked(run("day-b", SceneFilter::DAY, 0.5, 0.2, 0.1, 10.0), 58, 0.4);
+        let c = compare(&[a.clone(), b]);
+        assert_eq!(
+            c.warnings,
+            [
+                "the runs have different numbers of random picks among their held-out frames \
+                 (60 / 58): the label files changed between their exports, so their random-pick \
+                 scores are not comparable; queue the comparison again"
+            ]
+        );
+        assert!(c.comparable, "the rest of the table still compares");
+        assert!(c.random_column, "both have enough: shown, with the warning");
+        // A run without random picks is no count.
+        let plain = run("day-c", SceneFilter::DAY, 0.5, 0.2, 0.1, 10.0);
+        assert!(compare(&[a, plain]).warnings.is_empty());
     }
 
     #[test]

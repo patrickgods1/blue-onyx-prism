@@ -267,9 +267,13 @@
   var backStack = [], fwdStack = [];   // frames left by Back (`p`) / by moving on, for `p` and `n`
   var missingAsked = null;             // the frame "Anything missing?" was asked on
   var askMissing = pref('askMissing', true);
+  var quarter = -1;                    // `q` while "Anything missing?" is open: the quarter shown
+                                       // (0..3, ReviewTouch.quarterView), -1 the whole frame
+  var quarterFollow = false;           // view.follow before the look (restored after it)
   var frameStart = 0;                  // when the frame was loaded (session pace)
+  var servedBoxes = [];                // the frame's boxes as served (session box count)
   var session = {
-    start: Date.now(), frames: [],     // per saved frame {s, acc, rej}
+    start: Date.now(), frames: [],     // per saved frame {s, acc, rej, boxes}
     breakAt: Date.now() + 45 * 60000   // the next break note
   };
   // View-only image setting: `mode` auto (bright + equalised on night / IR frames, else off), off,
@@ -285,12 +289,18 @@
   var suggestions = [];                // liveSuggestions, as of the last render
   var refineCur = null;                // R.refineCurrent ({l, k, n}), as of the last render
   var refinePutOff = [];               // keys (R.refineKey) put off with Later on this visit
+  var refineDoneOn = null;             // the frame whose last dataset check suggestion was answered
+  // Under the card once the last suggestion is answered: no suggestion left is not a complete frame.
+  var REFINE_MISSES = 'The check finds some errors, not all: small, dark or partly hidden objects most often slip past it.';
 
   var COLORS = {
     pending: '#e8d000', review: '#ffa000', unlikely: '#ffa000', likely: '#14d6b0', hint: '#f08c00', accepted: '#2e9e4f',
     added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff', ghost: '#b26bff'
   };
   var MAX_ZOOM = 8;
+  // The quarter look's share of the frame's width and height: neighbours overlap by 10%, so an
+  // object on a centre line is whole in one quarter.
+  var QUARTER_SHARE = 0.55;
   var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
   var CLICK_CSS = 4;    // a pointer that moves less than this is a click
   var TAP_CSS = 10;     // the same for a finger, which is never still
@@ -344,9 +354,37 @@
     var auto = filtersForm.elements.auto ? filtersForm.elements.auto.value : '';
     // `refine_kind` only with `auto=refine` (R.sendsFilter).
     Array.prototype.forEach.call(filtersForm.elements, function (el) {
+      if (el.name === 'order') {
+        var o = orderParam(el.value);
+        if (o) p.set(o[0], o[1]);
+        return;
+      }
       if (el.name && R.sendsFilter(el.name, el.value, auto)) p.set(el.name, el.value);
     });
     return p;
+  }
+
+  // The Order select as a query parameter: '' (Recommended, the server's default) sends none,
+  // 'uncertain' `order=uncertain`, 'balance:<dims>' `balance=<dims>`.
+  function orderParam(v) {
+    if (!v) return null;
+    if (v.indexOf('balance:') === 0) return ['balance', v.slice(8)];
+    return ['order', v];
+  }
+
+  // The Order select's value for a link's `order` and `balance` (unknown values: Recommended).
+  function orderOf(q) {
+    var b = q.get('balance');
+    if (b) return 'balance:' + b;
+    return q.get('order') === 'uncertain' ? 'uncertain' : '';
+  }
+
+  // The dimensions the queue's order balances by: a `balance:` choice's, every one under
+  // Recommended (no Auto filter: that filter's own order then), else none.
+  function balanceBy() {
+    var f = filtersForm.elements, v = (f.order && f.order.value) || '';
+    if (v.indexOf('balance:') === 0) return v.slice(8);
+    return v === '' && !(f.auto && f.auto.value) ? 'class,scene,camera' : '';
   }
 
   // ---- state helpers ------------------------------------------------------------------------
@@ -695,6 +733,7 @@
     }
     if (refineCur) focusRefine();
     else {
+      refineDoneOn = cur.frame;
       var next = nextUndecided(-1);
       select(next >= 0 ? next : r.box, true);
     }
@@ -718,7 +757,7 @@
     suggestions = liveSuggestions();
     refineCur = currentRefine();
     if (refineCur) focusRefine();
-    else refresh();
+    else { refineDoneOn = cur.frame; refresh(); }
     say((at >= 0 ? 'Box ' + (at + 1) + ' accepted.' : 'Accepted.') + refineLeft());
   }
 
@@ -732,6 +771,7 @@
     var rest = R.refineCurrent(liveRefine(), suggestions.length > 0, refinePutOff);
     box.appendChild(el('div', 'muted', (noHover.matches ? 'Drag it or its handles to fit the object, then Accept box' : 'Drag it or its handles to fit the object, then Accept box (y)') +
       (rest ? ': the next suggestion follows (' + rest.n + ' left).' : ': no suggestion left on this frame.') + ' z undoes.'));
+    if (!rest) box.appendChild(el('div', 'muted', REFINE_MISSES));
     var row = el('div', 'rv-q-btns');
     var answers = inBar ? barBtns : row;
     answers.appendChild(decideButton('Accept box', 'y', 'ok', finishAdjust));
@@ -741,6 +781,16 @@
       row.appendChild(show);
     }
     if (row.childNodes.length) box.appendChild(row);
+    return box;
+  }
+
+  // In the card's place once the reviewer answered the last suggestion of this frame (none while
+  // another is current or a box is being fitted): what is left is not known to be complete.
+  function refineDoneBlock() {
+    if (!cur || refineDoneOn !== cur.frame || refineCur || adjusting() >= 0) return null;
+    var box = el('div', 'rv-q-sug rv-q-refine');
+    box.appendChild(el('div', 'muted', 'Dataset check: no suggestion left on this frame.'));
+    box.appendChild(el('div', 'muted', REFINE_MISSES));
     return box;
   }
 
@@ -892,8 +942,46 @@
 
   function fit() {
     view.z = 1; view.ox = 0; view.oy = 0; view.follow = false;
+    quarter = -1;
     draw();
   }
+
+  // ---- "Anything missing?" in quarters (`q`, the question's Look in quarters button) ----------
+  // Missed objects are mostly small or distant, and the question shows the whole frame: each step
+  // zooms to the next quarter (ReviewTouch.quarterView: top left, top right, bottom left, bottom
+  // right, each QUARTER_SHARE of the frame's sides), the fifth back to the whole frame. Following
+  // the selection is off during the look (a drawn box is not zoomed to) and comes back after it,
+  // without touching the saved preference. Only while the question is open on this frame.
+  function quarterOpen() { return !!cur && missingAsked === cur.frame; }
+
+  function lookQuarter() {
+    if (!quarterOpen()) return false;
+    if (quarter < 0) quarterFollow = view.follow;
+    var next = quarter + 1;
+    if (next > 3) { endQuarters(); return true; }
+    var r = window.ReviewTouch.quarterView(next, canvas.width, canvas.height, QUARTER_SHARE);
+    quarter = next;
+    view.follow = false;
+    view.z = canvas.width / (r[2] - r[0]);
+    view.ox = r[0]; view.oy = r[1];
+    clampView();
+    refresh();
+    say(missingText());
+    return true;
+  }
+
+  // Back to the whole frame (the fifth `q`, Esc, Fit): following as it was before the look.
+  function endQuarters() {
+    if (quarter < 0) return false;
+    quarter = -1;
+    view.follow = quarterFollow;
+    view.z = 1; view.ox = 0; view.oy = 0;
+    refresh();
+    if (quarterOpen()) say(missingText());
+    return true;
+  }
+
+  var QUARTER_NAMES = ['Top left', 'Top right', 'Bottom left', 'Bottom right'];
 
   // Zoom so the box `b` with a margin fills about 60% of the view, centred on it.
   function zoomTo(b) {
@@ -916,6 +1004,7 @@
   function zoomToSelected() {
     var b = viewTarget();
     if (!b) { say('No box selected: j selects one.'); return false; }
+    quarter = -1;
     view.follow = true;
     zoomTo(b);
     draw();
@@ -925,7 +1014,11 @@
   // The viewer's choice (`x`, `f`, the Zoom to box / Fit toggle, View's Fit whole frame): kept
   // for the next frames (followPref). The wheel, a pinch or a pan only hold this frame's view.
   function chooseZoom() { if (zoomToSelected()) setFollowPref(true); }
-  function chooseFit() { setFollowPref(false); fit(); }
+  // During the quarter look Fit ends the look: the whole frame, the preference as it was.
+  function chooseFit() {
+    if (endQuarters()) return;
+    setFollowPref(false); fit();
+  }
 
   // Zoom by `factor` keeping the canvas point (cx, cy) on the same frame point.
   function zoomAt(cx, cy, factor) {
@@ -1767,12 +1860,27 @@
   // The "Anything missing?" question, with the frame's dismissed boxes when they are off.
   function missingText() {
     var n = dismissedOn ? 0 : dismissedCount();
+    var pick = isRandomPick() ? 'A random pick scores models, so it must be complete. ' : '';
+    // In a quarter: which one, and that the look goes on.
+    var where = quarter >= 0 ? QUARTER_NAMES[quarter] + ' quarter (' + (quarter + 1) + ' of 4). ' : '';
     if (noHover.matches) {
-      return 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
+      return where + pick + 'Anything missing? Look over the whole frame and draw a missed object with Draw' +
         (n ? ' (' + n + ' hidden: Show them under the question)' : '') + '; Save & next saves.';
     }
-    return 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
-      (n ? n + ' hidden: i shows them; ' : '') + 's saves.';
+    return where + pick + 'Anything missing? Look over the whole frame and drag to draw a missed object; ' +
+      (n ? n + ' hidden: i shows them; ' : '') + 'q looks in four zoomed quarters' +
+      (quarter >= 0 ? ' (Esc: whole frame)' : '') + '; s saves.';
+  }
+
+  // The question's quarter look as a button (the touch UI has no `q`): Look in quarters, Next
+  // quarter, and from the last one back to the whole frame.
+  function quarterButtons() {
+    var row = el('div', 'rv-q-btns');
+    var text = quarter < 0 ? 'Look in quarters' : (quarter < 3 ? 'Next quarter' : 'Whole frame');
+    var look = decideButton(text, 'q', 'secondary', lookQuarter);
+    look.title = 'Small and distant objects are the ones most often missed: zoom to each quarter of the frame in turn (top left, top right, bottom left, bottom right), then the whole frame again';
+    row.appendChild(look);
+    return row;
   }
 
   // The frame's progress: the boxes the reviewer sees, undecided / decided but not checked / done.
@@ -1844,6 +1952,10 @@
     // bar, the selected box's go in the card.
     var refBlock = refineBlock(inBar && !!decideBar);
     if (refBlock) decide.appendChild(refBlock);
+    else if (!sugBlock) {
+      var done = refineDoneBlock();
+      if (done) decide.appendChild(done);
+    }
     var p = progress();
     var b = boxes()[selected];
     if (inBar) renderBarHead(b, p);
@@ -1857,6 +1969,7 @@
           : (p.total ? (tap ? 'Every box decided: Save & next saves.' : 'Every box decided: s saves.')
             : (tap ? 'No box: turn on Draw to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
               : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
+      if (!refBlock && !p.undecided && !p.unchecked && quarterOpen()) decide.appendChild(quarterButtons());
     } else {
       var i = selected;
       var q = el('div', 'rv-q');
@@ -1915,6 +2028,8 @@
         btns.appendChild(small);
       }
       decide.appendChild(btns);
+      // A box drawn (or selected) during the quarter look: the look goes on from here.
+      if (quarter >= 0 && quarterOpen()) decide.appendChild(quarterButtons());
       var mate = dupPartner(i);
       if (mate >= 0) {
         var mb = boxes()[mate];
@@ -2138,7 +2253,8 @@
     // One column: the frame is the editor, so another box is zoomed to again even after a pan, a
     // pinch or an overview tap ended the follow (those hold the view for the box they were made
     // on; a page scroll started on the frame pans it). Fit stays the viewer's choice (pref).
-    if (oneColumn.matches && selected !== was && boxes()[selected]) view.follow = pref('follow', true);
+    // The quarter look holds its view (following is off until it ends).
+    if (oneColumn.matches && selected !== was && boxes()[selected] && quarter < 0) view.follow = pref('follow', true);
     // Touch: the reason chips stay until the selection moves on; Redraw is of the box it started on.
     if (reasonAsk && !reasonAsk.timer && selected !== reasonAsk.sel) clearReason(true);
     if (taps && taps.kind === 'redraw' && selected !== taps.idx) cancelTaps();
@@ -3205,8 +3321,8 @@
     // Off the touch UI the toggles have no button: they go off.
     if (!touchUi.matches) { drawMode = false; taps = null; }
     if (viewMenu) viewMenu.open = false;
-    // Each layout keeps its own Zoom to box / Fit choice.
-    view.follow = followPref();
+    // Each layout keeps its own Zoom to box / Fit choice (after the quarter look, if one is on).
+    if (quarter >= 0) quarterFollow = followPref(); else view.follow = followPref();
     touchWords();
     placeAcceptAll();
     if (cur) refresh(); else touchViewUi();
@@ -3308,13 +3424,32 @@
   // Phones: one line over the frame; Details opens the counts, the filters and the frame's facts.
   var queuePlace = '', phoneIndexing = '';
   // The queue's item of the frame it last landed on (GET /v1/review/next), for what only the
-  // queue knows: why `balance=` put it there.
+  // queue knows: why `balance=` put it there, and whether it is a random pick.
   var queueItem = null;
 
-  // `balance=`: the reviewed frames the order weighs against, of the dimensions the Order filter
-  // balances (the answer's `balance`).
+  // A random pick (the item's `random_pick`: 1 frame in 5 of the default view, a fixed pool by
+  // the path's hash): saved with `review_pick: 'random'` (the server keeps it on pool frames
+  // alone), so held-out scores can be read on frames nobody chose. On the labels, so a draft
+  // carries it and a saved pick shows again; a label file's own value goes back as loaded. Every
+  // frame the queue served as one in this page session is remembered (`randomPicks`, also in
+  // sessionStorage for a reload), so one passed with Next and saved after Back keeps its mark:
+  // which picks lost it would otherwise follow the reviewer's choices.
+  var RANDOM_PICKS = 'review-random-picks', RANDOM_PICKS_MAX = 2000;
+  var randomPicks = R.servedPicks(window.PrismDraft ? PrismDraft.load(RANDOM_PICKS) : null, null, RANDOM_PICKS_MAX);
+  function noteRandomPick(item) {
+    var next = R.servedPicks(randomPicks, item, RANDOM_PICKS_MAX);
+    if (next.length === randomPicks.length && next[next.length - 1] === randomPicks[randomPicks.length - 1]) return;
+    randomPicks = next;
+    if (window.PrismDraft) PrismDraft.save(RANDOM_PICKS, randomPicks);
+  }
+  function isRandomPick() {
+    return !!(cur && cur.labels && cur.labels.review_pick === 'random');
+  }
+
+  // `balance=` and Recommended: the reviewed frames the order weighs against, of the dimensions
+  // the Order filter balances (the answer's `balance`).
   function balanceCounts(b) {
-    var by = (filtersForm.elements.balance && filtersForm.elements.balance.value) || '';
+    var by = balanceBy();
     var list = function (o) { return Object.keys(o || {}).map(function (k) { return k + ' ' + o[k]; }).join(', ') || 'none'; };
     var parts = [];
     if (by.indexOf('class') >= 0) parts.push(list(b.classes) + ', empty ' + (b.empty || 0));
@@ -3331,6 +3466,10 @@
       // The class part is weighed by how sure the frame is of the class (`class_score`).
       var sure = b.class_score != null && b.class_score < 1 ? ', score ' + b.class_score.toFixed(2) : '';
       parts.push(b.class != null ? b.class + ' (' + b.class_reviewed + ' reviewed' + sure + ')' : 'no wanted class (' + b.class_reviewed + ' empty frames reviewed)');
+      // And by the camera's kept share of the class's proposals, when some were not kept.
+      if (b.class != null && b.class_proposed != null) {
+        parts.push(b.class + ' on this camera: ' + (b.class_kept || 0) + ' of ' + b.class_proposed + ' proposals kept');
+      }
     }
     if (b.scene_reviewed != null) parts.push(item.scene + ' (' + b.scene_reviewed + ')');
     if (b.camera_reviewed != null) parts.push('camera ' + item.camera + ' (' + b.camera_reviewed + ')');
@@ -3339,7 +3478,7 @@
   function setPhoneLine() {
     if (!phoneLine) return;
     var r = (cur && cur.record) || {};
-    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', phoneIndexing, r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
+    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', phoneIndexing, isRandomPick() ? 'random pick' : '', r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
     phoneLine.title = $('rv-meta').textContent;
   }
 
@@ -3398,6 +3537,7 @@
 
   function setMeta() {
     var m = $('rv-meta');
+    $('rv-pick').hidden = !isRandomPick();
     if (!cur) { m.textContent = ''; return; }
     var r = cur.record || {};
     var p = r.provenance;
@@ -3415,6 +3555,8 @@
     if (cur.labels && cur.labels.bulk_accepted) parts.push('bulk accepted');
     if (cur.stale_classes) parts.push('reviewed with another class list');
     if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
+    // Recommended: the frame's place in its event (one camera's activity), 1 = its first.
+    if (queueItem && queueItem.frame === cur.frame && queueItem.event_rank != null) parts.push('event: frame ' + (queueItem.event_rank + 1));
     if (queueItem && queueItem.frame === cur.frame && queueItem.balance) parts.push(balanceNote(queueItem));
     m.textContent = parts.filter(Boolean).join(' · ');
     setPhoneLine();
@@ -3508,15 +3650,17 @@
         if (backStack.length > 200) backStack.shift();
       }
       cur = j;
+      if (j.labels && R.servedAsPick(randomPicks, j.frame)) j.labels.review_pick = 'random';
       // Suggestions keep to the boxes the server named (`overlap_live_boxes`).
       R.markServed(j.labels);
+      servedBoxes = JSON.parse(JSON.stringify((j.labels && j.labels.boxes) || []));
       loadHistory(camOf(j.frame));
       loadSpots(camOf(j.frame));
       if (Array.isArray(j.classes)) classes = j.classes;
       if (Array.isArray(j.hidden)) hiddenClasses = j.hidden;
       sizeFloor = j.size_floor || null;
       undo = []; dirty = false; guard = null; lastNudge = null; gesture = null; taps = null;
-      emptyBackup = null; missingAsked = null; frameStart = Date.now();
+      emptyBackup = null; missingAsked = null; quarter = -1; frameStart = Date.now();
       // Asking for these frames means asking to see those boxes.
       dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
       canvas.width = j.width || 640;
@@ -3533,6 +3677,7 @@
       if (suggestions.length) selected = suggestionBox(suggestions[0]);
       // Else a dataset check suggestion opens on its box (none for an added box: the proposal).
       refinePutOff = [];
+      refineDoneOn = null;
       refineCur = currentRefine();
       if (refineCur) selected = R.refineFocus(refineCur.l, boxes()).mark;
       var draftNote = restoreDraft(j);
@@ -3645,6 +3790,7 @@
         return;
       }
       queueItem = j.item;
+      noteRandomPick(j.item);
       return loadFrame(j.item.frame);
     }).catch(function (e) {
       if (run.stale) return;
@@ -3708,7 +3854,9 @@
       }
       // Then once per frame: missed objects are the commonest label error. The whole frame,
       // every box at full strength (no selection, no zoom; `x` keeps following on the next).
-      if (askMissing && missingAsked !== cur.frame && !cur.labels.empty_confirmed) {
+      // Always on a random pick, whatever the preference: those frames score models, so a
+      // missed object there is a false miss. A frame confirmed empty was looked over already.
+      if ((askMissing || isRandomPick()) && missingAsked !== cur.frame && !cur.labels.empty_confirmed) {
         missingAsked = cur.frame;
         selected = -1;
         view.z = 1; view.ox = 0; view.oy = 0;
@@ -3719,6 +3867,8 @@
     }
     busy = true;
     var body = JSON.parse(JSON.stringify(cur.labels));   // keeps auto_run, bulk_accepted, ...
+    // Served as a random pick in this session: marked whatever the undo stack or a draft holds.
+    if (R.servedAsPick(randomPicks, cur.frame)) body.review_pick = 'random';
     // A pending box stacked on a better one must not be accepted by the save (on the copy: a
     // refused save loses nothing).
     var dropped = status === 'reviewed' ? pendingDupDrops(dupGroups()) : [];
@@ -3728,14 +3878,18 @@
     // The dataset check's suggestions go back as the page holds them (answers included).
     R.refineForSave(body);
     body.boxes.forEach(function (b) {
-      delete b._checked;
-      delete b._relabelled;
-      delete b._adjusting;
-      delete b._n;
       if (b.state === 'pending' && b.source !== 'human' && isHiddenClass(b.label)) {
         b.state = 'rejected';
         b.reason = 'other_class';
       }
+    });
+    // The session's box count, while the boxes still carry their served index (`_n`).
+    var decisions = R.boxDecisions(servedBoxes, body.boxes);
+    body.boxes.forEach(function (b) {
+      delete b._checked;
+      delete b._relabelled;
+      delete b._adjusting;
+      delete b._n;
     });
     body.version = body.version || 1;
     body.status = status;
@@ -3756,7 +3910,7 @@
     postJson(url, body).then(function (j) {
       dirty = false;
       if (window.PrismDraft) PrismDraft.drop(DRAFT);
-      if (status === 'reviewed') { noteSaved(body); noteHistory(frame, body, w, h); }
+      if (status === 'reviewed') { noteSaved(decisions); noteHistory(frame, body, w, h); }
       // After Back: on to the frame Back left (the counts refresh), else the queue's next.
       if (fwdStack.length) {
         say((j.message || 'Saved.') + note);
@@ -3806,29 +3960,40 @@
 
   function seconds(fs) { return fs.map(function (f) { return f.s; }); }
 
-  // A saved frame: its time (load to save, at most 10 min) and what saving made of its model boxes.
-  function noteSaved(body) {
-    var acc = 0, rej = 0;
-    body.boxes.forEach(function (b) {
-      // A duplicate or a too-small box is no verdict on an object, and nobody judged a dismissed
-      // one: it would read as a false positive here.
-      if (b.source === 'human' || b.reject_reason === 'duplicate' || b.reject_reason === 'too_small' || isDismissal(b.reason) || b.reason === 'parked_spot') return;
-      var r = resolved(b);
-      if (r === 'accepted') acc++; else if (r === 'rejected') rej++;
-    });
-    session.frames.push({ s: Math.min(600, (Date.now() - frameStart) / 1000), acc: acc, rej: rej });
+  // A saved frame: its time (load to save, at most 10 min) and the reviewer's box decisions on it
+  // (`R.boxDecisions`: boxes pending when served and now decided, plus boxes drawn; a duplicate,
+  // a too-small box, a dismissal or a parked accept is no verdict on an object).
+  function noteSaved(d) {
+    session.frames.push({ s: Math.min(600, (Date.now() - frameStart) / 1000), acc: d.accepted, rej: d.rejected, boxes: d.decided + d.drawn });
     showSession();
   }
 
-  // "Session 23 frames · 41 s/frame · 82% accepted · 37 min", a note when the last 10 frames went
-  // much faster while accepting more (rubber-stamping), and a break note every 45 min.
+  // Boxes a minute of review: the frames' own (capped) times, so a break or a frame left open
+  // does not count; '' before a second of it.
+  function boxesPerMinute(fs) {
+    var n = 0, s = 0;
+    fs.forEach(function (f) { n += f.boxes || 0; s += f.s; });
+    if (s < 1) return '';
+    var r = n * 60 / s;
+    return r >= 10 ? String(Math.round(r)) : r.toFixed(1);
+  }
+
+  // "Session 23 frames · 64 boxes, 2.8 a minute · 82% accepted · 37 min" (effort in boxes: a
+  // frame of one box and one of twelve are not the same work), a note when the last 10 frames
+  // went much faster while accepting more (rubber-stamping), and a break note every 45 min.
   function showSession() {
     if (!sessionLine) return;
     var fs = session.frames, min = Math.floor((Date.now() - session.start) / 60000);
     sessionLine.textContent = '';
     if (!fs.length) return;
     var rate = acceptRate(fs);
-    var parts = ['Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'), Math.round(median(seconds(fs))) + ' s/frame'];
+    var nb = 0;
+    fs.forEach(function (f) { nb += f.boxes || 0; });
+    var pace = boxesPerMinute(fs);
+    var parts = [
+      'Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'),
+      nb + ' box' + (nb === 1 ? '' : 'es') + (nb && pace ? ', ' + pace + ' a minute' : '')
+    ];
     if (rate != null) parts.push(Math.round(rate * 100) + '% accepted');
     parts.push(min + ' min');
     sessionLine.appendChild(el('span', null, parts.join(' · ')));
@@ -3889,7 +4054,8 @@
     if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
     if (f.auto.value) parts.push(name('auto'));
     if (f.refine_kind && R.sendsFilter('refine_kind', f.refine_kind.value, f.auto.value)) parts.push(name('refine_kind'));
-    if (f.balance && f.balance.value) parts.push(name('balance'));
+    // The order, unless an Auto filter's own order replaces Recommended.
+    if (f.order && (f.order.value || !f.auto.value)) parts.push(name('order').toLowerCase());
     summary.textContent = parts.join(', ');
   }
   // The kind of dataset check suggestion: offered with that Auto filter only.
@@ -3901,7 +4067,11 @@
   // Auto filter's choice opens.
   function filtersFromUrl() {
     var q = new URLSearchParams(location.search), f = filtersForm.elements;
-    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source', 'balance'].forEach(function (k) {
+    if (f.order) {
+      f.order.value = orderOf(q);
+      if (f.order.value !== orderOf(q)) f.order.value = '';
+    }
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source'].forEach(function (k) {
       var v = q.get(k), e = f[k];
       if (!v || !e) return;
       if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {
@@ -4003,11 +4173,12 @@
     ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
     ['Decide', '', 'The next box is the next likely (★) one, then the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
     ['Navigate', 'j / k', 'select the next / previous box'],
-    ['Navigate', 'Esc', 'no box selected'],
+    ['Navigate', 'Esc', 'no box selected (during the quarter look: the whole frame first)'],
     ['Navigate', 'n', 'next frame without saving (after Back: the frame you came from)'],
     ['Navigate', 'p', 'back to the previous frame of this session (as saved)'],
     ['Navigate', 'x', 'zoom to the selected box and follow the selection (the next box, the next frame) until f, the wheel or a pan'],
     ['Navigate', 'f', 'fit (zoom out)'],
+    ['Navigate', 'q', 'while "Anything missing?" asks: zoom to the top-left, top-right, bottom-left and bottom-right quarter in turn, then the whole frame again (small, distant objects are the ones most often missed; drawing works there, s saves)'],
     ['Navigate', 'wheel', 'zoom about the pointer (up to 8x)'],
     ['Navigate', 'right / middle drag, Space + drag', 'pan'],
     ['View', 'b', 'image (view only): auto, off, bright, bright + equalised; auto = bright + equalised on night / IR frames'],
@@ -4145,6 +4316,8 @@
     }
     else if (k === 'c') { if (!ev.shiftKey) acceptLikely(); }
     else if (k === 'i') toggleDismissed();
+    // `q`: the next quarter of "Anything missing?" (once per press; the browser's key otherwise).
+    else if (k === 'q') handled = quarterOpen() && (ev.repeat || lookQuarter());
     else if (k === '?') openKeys();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
@@ -4171,8 +4344,11 @@
         else rejectWith(selected, null);
       }
     } else if (k === 'Escape') {
-      // A two-tap box waiting for its corners is cancelled first (Draw itself stays on).
-      if (taps) cancelTaps(true); else select(-1);
+      // The quarter look goes back to the whole frame first; then a two-tap box waiting for its
+      // corners is cancelled (Draw itself stays on), else no box is selected.
+      if (!endQuarters()) {
+        if (taps) cancelTaps(true); else select(-1);
+      }
     }
     else if (/^[0-9]$/.test(k)) pickClass(k === '0' ? 9 : Number(k) - 1);
     else handled = false;

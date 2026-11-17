@@ -2149,6 +2149,34 @@ process.stdout.write(JSON.stringify({
     );
 }
 
+/// Under any report the Findings card says the check misses errors (`RefineFloor.missesLine`):
+/// a frame with no suggestion is not known to be complete. Nothing without a report.
+#[test]
+fn the_findings_card_says_the_check_misses_errors() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.refine);
+const F = globalThis.RefineFloor;
+process.stdout.write(JSON.stringify({
+  full: F.missesLine({ folds: 4, folds_done: 4 }),
+  quick: F.missesLine({ mode: 'model', folds: 0 }),
+  none: F.missesLine(null),
+}));
+"#;
+    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let got = node_with(driver, &json!({"refine": refine}));
+    let line = "The check finds some errors, not all: small, dark or partly hidden objects most \
+                often slip past it.";
+    assert_eq!(got["full"], line);
+    assert_eq!(got["quick"], line);
+    assert_eq!(got["none"], "");
+}
+
 /// The Coverage card's "Where the data is thin" rules (`RefineFloor.coverageAdvice`, `coverageUrl`,
 /// `thinRecallNote` in `assets/train-refine.js`): what to do about a camera x scene row, the Review
 /// link under the page's own filters, and who the recall columns are of.

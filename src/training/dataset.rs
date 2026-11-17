@@ -16,7 +16,8 @@
 //!    export, which writes one per image; a file that cannot be read is an error. `ignore.json`
 //!    ([`IgnoreFile`]) lists real objects not to train on (unsure, too small) and the frames with
 //!    nothing but parked-spot boxes; no file = none. `frames.json` ([`FrameNotes`]) names the
-//!    frames confirmed empty or accepted in bulk and `hard_negatives.json` the rejected boxes,
+//!    frames confirmed empty or accepted in bulk and the Review queue's random picks (held out,
+//!    they are scored apart, [`HELDOUT_RANDOM`]), and `hard_negatives.json` the rejected boxes,
 //!    whichever formats the export wrote.
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
 //!    drop the copies of a frame that several exports hold (a held-out copy wins); hold out review
@@ -367,6 +368,11 @@ pub struct Frame {
     /// Accepted in bulk ([`FrameNotes::bulk_accepted`]): nobody looked at this frame on its own.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub bulk_accepted: bool,
+    /// A random pick of the Review queue ([`FrameNotes::random_pick`]): reviewed because its slot
+    /// came up, whatever it shows. Held out, it is also tagged [`HELDOUT_RANDOM`]; never part of
+    /// the held-out fingerprint.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub random_pick: bool,
     /// `(width, height)` when the source knows it.
     pub size: Option<(u32, u32)>,
     /// The parked spots of a frame with nothing but parked-spot boxes ([`IgnoreFile::parked`]).
@@ -788,6 +794,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
     };
     let empty_confirmed = names_of(|n| &n.empty_confirmed);
     let bulk_accepted = names_of(|n| &n.bulk_accepted);
+    let random_pick = names_of(|n| &n.random_pick);
     let rejected = read_rejected(dir, &mut warnings);
     // (image, label file, hint)
     let mut entries: Vec<(PathBuf, PathBuf, SplitHint)> = Vec::new();
@@ -893,6 +900,7 @@ pub fn read_export(dir: &Path) -> Result<Source> {
             hard_negative: m.hard_negative || empty_confirmed.contains(name.as_str()),
             human_rejected: rejected.contains(&name),
             bulk_accepted: bulk_accepted.contains(name.as_str()),
+            random_pick: random_pick.contains(name.as_str()),
             size: m.size,
             image: img,
         });
@@ -974,6 +982,7 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
             hard_negative: m.hard_negative || i.tags.iter().any(|t| t == "empty"),
             human_rejected: false,
             bulk_accepted: false,
+            random_pick: false,
             size: Some(size),
         });
     }
@@ -2525,12 +2534,16 @@ pub const HELDOUT_TAG: &str = "heldout:";
 pub const HELDOUT_ALL: &str = "heldout:all";
 /// Held-out tag of the images in the run's scene filter.
 pub const HELDOUT_IN_SCOPE: &str = "heldout:in-scope";
+/// Held-out tag of the Review queue's random picks ([`Frame::random_pick`]): the held-out frames
+/// nobody chose, the least biased score ([`super::job::BenchSummary::random`]).
+pub const HELDOUT_RANDOM: &str = "heldout:random";
 
 /// Benchmark tags of a held-out frame of `scene` for a run filtered by `filter`: the bare scene
-/// (the benchmark's own scene views), `heldout:<scene>`, `heldout:all` and, when the run
-/// trained on its scene, `heldout:in-scope` (so [`super::bench::summarize`] reads exact AP per
-/// scene and over the run's scenes from `accuracy.by_tag`).
-pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter) -> Vec<String> {
+/// (the benchmark's own scene views), `heldout:<scene>`, `heldout:all`, when the run trained on
+/// its scene `heldout:in-scope`, and for a random pick of the Review queue `heldout:random` (so
+/// [`super::bench::summarize`] reads exact AP per scene, over the run's scenes and over the random
+/// picks from `accuracy.by_tag`).
+pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter, random_pick: bool) -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
     if let Some(s) = scene {
         tags.push(s.to_string());
@@ -2539,6 +2552,9 @@ pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter) -> Vec<String> {
     tags.push(HELDOUT_ALL.into());
     if filter.keeps(scene) {
         tags.push(HELDOUT_IN_SCOPE.into());
+    }
+    if random_pick {
+        tags.push(HELDOUT_RANDOM.into());
     }
     tags
 }
@@ -2762,7 +2778,7 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(&n))));
             std::fs::write(&txt, label_text(f))?;
-            let mut tags = heldout_tags(f.scene.as_deref(), opts.scene);
+            let mut tags = heldout_tags(f.scene.as_deref(), opts.scene, f.random_pick);
             tags.push(format!("camera:{}", f.camera));
             tags.push(format!("date:{}", f.day));
             if f.hard_negative {

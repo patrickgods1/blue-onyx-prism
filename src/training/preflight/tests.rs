@@ -30,6 +30,7 @@ fn frame(name: &str, scene: &str, boxes: Vec<YoloBox>, split: SplitHint) -> Fram
         hard_negative: false,
         human_rejected: false,
         bulk_accepted: false,
+        random_pick: false,
         size: Some((64, 48)),
         parked: Vec::new(),
     }

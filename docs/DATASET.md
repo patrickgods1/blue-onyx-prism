@@ -556,6 +556,20 @@ folder; the collector and the Collect tab keep `collect.dir`.
   is there, `[]` too, is the client's list (the page always sends it). A build from before the dataset check ignores the field
   and drops it when it rewrites the file; the list is rebuildable by running the check again (answers are
   lost with it).
+- **`review_pick`** (written only when set): how the Review tab chose the frame the reviewer saved.
+  `"random"` = it was served as a **random pick** (below, *Random picks*): a frame of the fixed pool, served in
+  its slot whatever it shows, so results can be checked on frames nobody chose. The page sends it on every save
+  of a frame the queue served as one in that page session (reviewed or skipped), also one passed with Next and
+  saved after Back or a reload (the session's picks are kept in sessionStorage: which picks lost the mark would
+  otherwise follow the reviewer's choices), never on a frame not served as one, and sends a loaded value back as
+  it was; a save body without the key
+  keeps the stored value, a key that is there (`null` too) is the client's. The server drops `"random"` from a
+  frame that is not in the pool (`recommend::in_pool`), so a forged or mistaken mark cannot put a chosen frame
+  among the random ones. A value this build does not know (a later build's) loads and is written back as it was
+  (`ReviewPick::Other`, checked like an unknown reject reason; never a random pick); X-AnyLabeling imports and
+  the other edits keep it. A build from before random picks ignores the field and drops
+  it when it rewrites the file. Exports list such frames in `frames.json` `random_pick` and tag them `random` in
+  the benchmark manifest; a training run scores its held-out random picks apart (`heldout:random`).
 - **Auto-labeler fields** (`source: auto` boxes, and existing boxes an auto proposal confirmed), on the
   box itself, all optional:
 
@@ -634,7 +648,7 @@ training and pending boxes, and proposals may replace rejected boxes no reviewer
 
 `GET /v1/review/next` lists the frames of `review-queue.jsonl`, or with `source=all` also every indexed
 frame. It accepts these filters: `bucket`, `scene`, `camera`, `label`, `status` (default
-`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`, and the order `balance` (below):
+`unreviewed`; also `reviewed`, `skipped`, `any`) and `auto`, and the orders `order` and `balance` (below):
 
 | `auto=` | Frames |
 |---|---|
@@ -663,7 +677,64 @@ that are not rejected (accepted, added and pending ones). Without one, they are 
 `predictions`. The value must be a valid class name (1 to 64 characters, no control characters). It
 need not be in the class list, so a model label such as `class_7` works too. The answer's `labels`
 lists the classes of the frames the other filters keep, for the page's **Class** list (which also
-holds `collect.classes`). The auto-label form passes it on like the other filters. Frames are sorted most uncertain first:
+holds `collect.classes`). The auto-label form passes it on like the other filters.
+
+**Recommended (default).** With no `auto=` and no `balance=`, `GET /v1/review/next` sorts by
+`collect/labels/recommend.rs` (`order=recommended`, or no `order`; page: Filters > **Order**, *Recommended*).
+Labelling neighbouring frames of one clip teaches a model little more than one of them, and an uncertainty order
+alone keeps serving such neighbours; frames of rare classes, scenes and cameras matter most while the counts are
+uneven. So:
+
+1. a re-label disagreement first, repeat-only frames last (as below);
+2. the **event rank** (item field `event_rank`, 0 = the event's first frame to review; the page's details show
+   *event: frame N*): the first frame of every event comes before any second one. An event is one camera's
+   activity: frames of one day folder (`<scene>/<camera>/<date>`, so an event ends at UTC midnight and at a scene
+   change) at most 60 s apart (`EVENT_GAP_S`), at most 600 s from its first frame (`EVENT_MAX_S`). A frame whose
+   time does not parse, and an imported frame without a real time within its source (sidecar `model: "import"`
+   with no `provenance`, `provenance.kind: "image"` or no `provenance.time_offset_s`: image-folder imports carry
+   file times, and import already spread its frames out), is an event of its own (`recommend::own_event`). A frame
+   of an imported video (also a URL or dataset import) with an offset has a real time, the video's start plus the
+   offset, and joins events like a collected frame. Events are built over the frames the counts
+   count (every filter but `status` and `auto`), so they do not split as frames get reviewed: a frame's rank is
+   the decided (reviewed or skipped) frames of its event the queue does not list, plus the listed frames of its
+   event ahead of it in this order without the rank;
+3. the balance of class, scene and camera (`balance=class,scene,camera`, below, the answer's `balance` too) in
+   bands of 250 (`BALANCE_BAND`), highest first, so the most uncertain frames lead within a band;
+4. the uncertainty order below, from more likely boxes on; then newest, then by path.
+
+So diversity leads while the counts are uneven, and uncertainty takes over as they even out. `order=uncertain`
+(*Most uncertain first*) is the order below; an `auto=` or `balance=` filter keeps its own order whatever `order`
+says; any other `order` is 400. Only this route reads `order`: bulk actions, previews, the auto-label `select`,
+the Coverage card and spots keep the uncertainty order.
+
+**Random picks.** An order that always serves hard and rare frames first would fill the held-out set (drawn from
+reviewed frames) with hard frames, and its scores and thresholds would stop reflecting normal traffic. So in the
+Review tab's default view, one served slot in five (`RANDOM_EVERY`) is a **random pick** (item field
+`random_pick: true`; the page shows a *random pick* chip and saves the frame with `review_pick: "random"`):
+
+- **The pool** is fixed by the frame's path alone: FNV-1a 64 of `bop-random-pick-v1/` (`RANDOM_SALT`) followed
+  by `<scene>/<camera>/<date>/<stem>.jpg` (the item's `frame`), a multiple of 5 = in the pool
+  (`recommend::in_pool`), about one frame in five. Nothing a model or a reviewer does moves a frame in or out. A
+  reopened frame (a re-label disagreement) takes no random slot: it keeps its place first.
+- **The slots** (`recommend::interleave`): slot `i` of the served list (0-based) is random when
+  `(decided + i) % 5 == 4`, with `decided` = the counted frames reviewed or skipped (the answer's
+  `counts.reviewed + counts.skipped`). A random slot takes the pool frame of the lowest hash (then path); every
+  other slot takes the next frame of the Recommended order above, of the frames out of the pool. When one side
+  runs out the other fills its slots; a pool frame is a random pick whichever slot it fills. A save or a skip of
+  the frame shown adds one to `decided` and takes the frame out, so every frame after it keeps its slot and the
+  frames the page loaded ahead stay the ones served.
+- **Only the default view** has them (`recommend::random_slots`): the Recommended order, `status=unreviewed`
+  and no `scene`, `camera`, `label`, `bucket`, `auto` or `balance` filter, each of which would make the picks
+  depend on what the frames show. `source` (`queue` or `all`) is allowed: it is the population the picks are
+  random among. In any other view pool frames sort like the rest and are not marked.
+- They are random among the frames **sent to review** (the review folder's queue, or every indexed frame with
+  `source=all`), not among everything the cameras saw: the collector's buckets, rate limits and dedup chose
+  those first. A skipped pick is just skipped (it leaves the slot pattern as a save does); skipping the hard ones
+  would bias what is left, so review them like any other. *Anything missing?* is always asked on a random pick,
+  whatever the preference, because these frames score models: a missed object there is a false miss. A frame
+  confirmed empty is not asked again (confirming it was that look).
+
+**Most uncertain first** (`order=uncertain`, every `auto=` filter, bulk actions, auto-label runs):
 
 1. a re-label disagreement (the label file's `disagreement`, item field `relabel`);
 2. more pending likely boxes (item field `likely_boxes`), so a frame with one comes before a frame with none;
@@ -681,8 +752,9 @@ then with one under 0.2, then under 0.3, then two objects, then the weak band, t
 each by the zoom's score. Frames with no live suggestion follow in the order above.
 
 Under `auto=refine` every listed frame has a live suggestion; they come strongest first by the frame's
-strongest one (item field `refine_strength`, `refine::strength`: `add` 4, `relabel` 3, `tighten` 2,
-`verify` 1, times 1000, plus the score in thousandths), then in the order above. `refine_open` is how many of
+strongest one (item field `refine_strength`, `refine::strength`: `relabel` 4, `add` 3, `verify` 2,
+`tighten` 1, times 1000, plus the score in thousandths; per error a wrong class costs a detector the most,
+then a missing box, then a loose one), then in the order above. `refine_open` is how many of
 the frame's suggestions are live (of `refine_kind` when given).
 
 **Balancing the dataset.** `balance=` takes a comma list of `class`, `scene` and `camera` (page: Filters >
@@ -697,15 +769,24 @@ the most reviewed value (0 when nothing is reviewed yet). The class need is weig
 of the class: x its confidence, the best score of its pending boxes of the class (an accepted or added box, or a
 pending one with no score, counts 1), or of the sidecar's predictions without a label file. Reviewing a likely box
 of a rare class adds to that class; an unlikely one is mostly rejected and adds nothing, so a 0.95 truck comes
-before a 0.3 one. A frame's class is its wanted class with the highest weighed need, of its boxes that are not
+before a 0.3 one. It is also weighed by the camera's kept share of the class's proposals, `(kept + 2) /
+(proposed + 2)`: of the camera's reviewed frames on which a model or auto-labeler proposed the class and a
+reviewer judged the proposal (an accepted or rejected machine box of it, a relabelled one by its old label; not a
+duplicate, an ignore region, or a box nobody judged: a dismissal, a bulk reject by score, a model hint the page's
+save rejected by default, a labelers run's parked-spot accept), those that kept a training box of it. A rejected proposal never adds to the class, so without it a
+camera that keeps calling a bush a bicycle would keep its frames first however often the bicycle is rejected;
+with no proposal reviewed, or all of them kept, the share is 1. The class part is `lack x score x share`, rounded
+down once. A frame's class is its wanted class with the highest weighed need, of its boxes that are not
 rejected (pending ones too); ties go to fewer reviewed frames, then the first by name. The page's balancing note
 shows the score when it is under 1. The needs of the chosen dimensions add up (0..=3000) and the frames
 come highest first, right after the `overlaps`, `both` and `refine` orders and before everything above but
 repeat-only frames, which stay last; equal needs keep the usual order. The counts are worked out again on
 every request, so the order follows each save. The item carries `balance: {score, class, class_reviewed,
-class_score, scene_reviewed, camera_reviewed}` (each `_reviewed` only for a dimension balanced by; `class` absent with
-`class_reviewed` = an empty frame), and the answer `balance: {classes, empty, scenes, cameras}`, the reviewed
-counts weighed against. The page shows them in the frame's details (*balancing: truck (4 reviewed), ir (12),
+class_score, class_kept, class_proposed, scene_reviewed, camera_reviewed}` (each `_reviewed` only for a dimension
+balanced by; `class` absent with `class_reviewed` = an empty frame; `class_kept` / `class_proposed` only when some
+proposals were not kept), and the answer `balance: {classes, empty, scenes, cameras, precision}`, the reviewed
+counts weighed against (`precision`: camera -> class -> `{kept, proposed}`, absent when empty). The page shows them
+in the frame's details (*balancing: truck (4 reviewed), truck on this camera: 2 of 11 proposals kept, ir (12),
 camera gate (30)*) and the counts (*Reviewed frames*). A pending box can be a false detection, so a rare class
 brings up its false detections too; the likely-box order inside a need keeps real ones ahead.
 
@@ -907,8 +988,10 @@ Click a box to select it. Drag on the image to draw a new one.
                                        duplicate, too_small and dismissed (auto_dismissed, spot_dismissed, size_floor) ones
   ignore.json                          ignore regions per image, below, and in `parked` the frames whose
                                        training boxes all came from parked spots (for the training cap)
-  frames.json                          `empty_confirmed` and `bulk_accepted`: image names, for a training run whichever
-                                       formats were ticked (absent in older exports)
+  frames.json                          `empty_confirmed`, `bulk_accepted` and `random_pick` (frames saved with
+                                       `review_pick: "random"`): image names, for a training run whichever
+                                       formats were ticked (absent in older exports; `random_pick` was added within
+                                       version 1, older files have no key and older builds ignore it)
   xanylabeling/<name>.jpg + .json      X-AnyLabeling files (below)
   benchmark/images/<name>.jpg + manifest.json   a benchmark `dir:` set
   export.json                          the report, written last
@@ -973,7 +1056,9 @@ regions (too-small rejects included) as `ignore` objects. `scored_labels`
 is the class list, so predictions of other labels count neither way. The tags are:
 
 - `<scene>`, `camera:<c>`, `date:<d>`, `split:<s>`, and `bucket:<b>` for each bucket;
-- `hard-negative` for a frame confirmed empty.
+- `hard-negative` for a frame confirmed empty;
+- `random` for a random pick of the Review queue (`review_pick: "random"`). A training run tags its held-out
+  random picks `heldout:random` and scores them apart (docs/TRAINING.md, "Random picks").
 
 `benchmark_split` (`all`, `val`, `train`) picks the frames. Run the set with
 `blue-onyx-prism benchmark --dataset dir:<out>/benchmark`.

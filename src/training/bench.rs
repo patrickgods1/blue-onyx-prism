@@ -9,7 +9,9 @@
 //! ([`dataset::heldout_tags`]: `heldout:day|night|ir|all|in-scope`), which are exact AP over
 //! those images and never mix in the built-in sets run beside it (their bare `day` / `night` tags
 //! would). Held-out sets of older versions only carry the bare scene tags: they are read when the
-//! held-out set was the only dataset of the run, and give no `in_scope`.
+//! held-out set was the only dataset of the run, and give no `in_scope`. The Review queue's random
+//! picks among the held-out frames (`heldout:random`) are read the same way into
+//! [`BenchSummary::random`].
 //!
 //! The current default model then runs on the same sets and devices ([`baseline_skip`] says when
 //! it cannot), so the Use card compares like with like ([`compare_text`]). Its results stay in
@@ -17,7 +19,7 @@
 //! benchmark, its threshold advice or its `auto` device order.
 
 use super::dataset;
-use super::job::{Baseline, BenchSummary, SceneAp};
+use super::job::{Baseline, BenchSummary, SceneAp, SubsetScore};
 use crate::backend::DeviceSpec;
 use crate::benchmark::Breakdown;
 use crate::benchmark::report::ModelResult;
@@ -307,6 +309,19 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
             },
         );
     }
+    // The Review queue's random picks among the held-out frames: their own breakdown, so the
+    // same AP as the scene columns, and the recall over every scored class at the threshold.
+    let random = tags
+        .iter()
+        .find(|b| b.key == dataset::HELDOUT_RANDOM)
+        .filter(|b| b.images > 0)
+        .map(|b| SubsetScore {
+            images: b.images,
+            gt: b.gt,
+            ap50: b.ap50,
+            ap50_95: b.ap50_95,
+            recall: b.recall,
+        });
     // Alerting at the configured threshold, from the overall score (scored CCTV classes).
     let o = acc.map(|a| &a.overall);
     BenchSummary {
@@ -325,6 +340,7 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         in_scope,
         heldout_fingerprint: None,
         trained_on_share: m.trained_on_share,
+        random,
     }
 }
 
@@ -570,6 +586,45 @@ mod tests {
         )
         .unwrap();
         assert!(back.by_scene.is_empty());
+    }
+
+    #[test]
+    fn summarize_reads_the_random_picks_from_their_heldout_tag() {
+        let mut random = breakdown("heldout:random", 60, 0.38);
+        random.gt = 85;
+        random.recall = Some(0.71);
+        let tags = vec![
+            breakdown("heldout:all", 300, 0.45),
+            breakdown("heldout:day", 300, 0.45),
+            // A bare `random` tag (the Dataset tab's benchmark set) beside it is not this one.
+            breakdown("random", 90, 0.9),
+            random,
+        ];
+        let b = summarize(&result(tags, true));
+        assert_eq!(
+            b.random,
+            Some(SubsetScore {
+                images: 60,
+                gt: 85,
+                ap50: Some(0.38 + 0.2),
+                ap50_95: Some(0.38),
+                recall: Some(0.71),
+            })
+        );
+        let j = serde_json::to_value(&b).unwrap();
+        assert_eq!(j["random"]["images"], 60);
+        assert_eq!(j["random"]["ap50_95"], 0.38);
+        let back: BenchSummary = serde_json::from_value(j).unwrap();
+        assert_eq!(back.random, b.random);
+        // No random pick among the held-out frames: none, and not serialized.
+        let b = summarize(&result(vec![breakdown("heldout:all", 300, 0.45)], false));
+        assert_eq!(b.random, None);
+        assert!(serde_json::to_value(&b).unwrap().get("random").is_none());
+        let old: BenchSummary = serde_json::from_str(
+            r#"{"datasets":[],"device":null,"ms_p50":null,"ap50":0.5,"ap50_95":null,"images":3}"#,
+        )
+        .unwrap();
+        assert_eq!(old.random, None);
     }
 
     #[test]

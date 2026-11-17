@@ -1541,6 +1541,16 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 .as_ref()
                 .and_then(|p| p.settings.as_ref())
                 .map(super::progress::RunSettings::ignore_mode),
+            negative_share: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.settings.as_ref())
+                .and_then(|s| s.negative_share),
+            static_cap: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.settings.as_ref())
+                .and_then(|s| s.static_cap),
             balance: r.request.balance.clone(),
             best_epoch: r
                 .progress

@@ -8,7 +8,7 @@
 //! ([`LabelBox::is_dismissed`]). IO: [`Frame::resolve`], [`Frame::resolve_in`] on a walk (every frame reference goes through
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
-//! review queue is in [`queue`], with a background index of it for the Review tab in [`index`], the bulk accept and the low-score and unwanted-class rejects in
+//! review queue is in [`queue`] (its default order, Recommended, in [`recommend`]), with a background index of it for the Review tab in [`index`], the bulk accept and the low-score and unwanted-class rejects in
 //! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
@@ -22,6 +22,7 @@ pub mod export;
 pub mod index;
 pub mod overlaps;
 pub mod queue;
+pub mod recommend;
 pub mod refine;
 pub mod repeats;
 pub mod spots;
@@ -552,6 +553,47 @@ pub const MAX_AUTO_RUN_LEN: usize = 200;
 /// Most classes in [`AutoRun::classes`].
 pub const MAX_AUTO_RUN_CLASSES: usize = super::config::MAX_CLASSES;
 
+/// How the Review tab chose the frame a reviewer saved ([`LabelFile::review_pick`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewPick {
+    /// A random pick ([`recommend::interleave`]): a frame of the fixed pool
+    /// ([`recommend::in_pool`]) served in its slot whatever it shows, so results can be checked on
+    /// frames nobody chose. The save keeps it only on a pool frame.
+    Random,
+    /// A value this build does not know (a newer build's): kept and written back as it was
+    /// (checked by [`normalize`]), as [`RejectReason::Other`] is, so a save or an X-AnyLabeling
+    /// import here does not lose it. Never a random pick.
+    Other(String),
+}
+
+impl ReviewPick {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ReviewPick::Random => "random",
+            ReviewPick::Other(s) => s,
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "random" => ReviewPick::Random,
+            other => ReviewPick::Other(other.to_string()),
+        }
+    }
+}
+
+impl Serialize for ReviewPick {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewPick {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::parse(&String::deserialize(d)?))
+    }
+}
+
 /// `<stem>.labels.json` (see the module doc).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabelFile {
@@ -611,6 +653,11 @@ pub struct LabelFile {
     /// ask again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refine: Vec<refine::Suggestion>,
+    /// The Review tab served the frame as a random pick ([`ReviewPick::Random`]) when it was
+    /// saved. Kept by every edit; a save body without the key keeps the stored value, and the
+    /// route drops `random` from a frame out of the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_pick: Option<ReviewPick>,
 }
 
 fn labels_version() -> u32 {
@@ -656,6 +703,7 @@ impl Default for LabelFile {
             checked_before_reopen: false,
             overlap_suggestions: Vec::new(),
             refine: Vec::new(),
+            review_pick: None,
         }
     }
 }
@@ -955,6 +1003,8 @@ fn label_ok(l: &str) -> bool {
 ///   (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
 ///   `refine` (bounded, [`refine::check`]) kept, `bulk_accepted` and `checked_before_reopen`
 ///   cleared;
+/// - a `review_pick` this build does not know ([`ReviewPick::Other`]) kept, checked like an
+///   unknown reject reason;
 /// - `version` and `classes_version` set.
 pub fn normalize(
     mut f: LabelFile,
@@ -972,6 +1022,13 @@ pub fn normalize(
     }
     if f.boxes.len() > MAX_BOXES {
         bail!("{} boxes; at most {MAX_BOXES} per frame", f.boxes.len());
+    }
+    if let Some(ReviewPick::Other(p)) = &f.review_pick
+        && (p.is_empty() || p.chars().count() > MAX_LABEL_LEN || p.chars().any(char::is_control))
+    {
+        bail!(
+            "the review pick is empty, longer than {MAX_LABEL_LEN} characters or holds control characters"
+        );
     }
     let mut boxes = Vec::with_capacity(f.boxes.len());
     for (i, mut b) in std::mem::take(&mut f.boxes).into_iter().enumerate() {
@@ -1752,6 +1809,51 @@ pub(crate) mod tests_support {
 mod tests {
     use super::super::record::{Det, Suppressed, VerifyInfo, empty_record};
     use super::*;
+
+    #[test]
+    fn review_pick_round_trips_and_is_absent_by_default() {
+        let plain = serde_json::to_value(LabelFile::default()).unwrap();
+        assert!(plain.get("review_pick").is_none(), "{plain}");
+        let f: LabelFile = serde_json::from_value(plain).unwrap();
+        assert_eq!(f.review_pick, None);
+        let random = LabelFile {
+            review_pick: Some(ReviewPick::Random),
+            ..LabelFile::default()
+        };
+        let v = serde_json::to_value(&random).unwrap();
+        assert_eq!(v["review_pick"], "random");
+        assert_eq!(serde_json::from_value::<LabelFile>(v).unwrap(), random);
+        // A newer build's value loads, and is written back as it was, through a save too.
+        let newer: LabelFile =
+            serde_json::from_str(r#"{"version": 1, "review_pick": "stratified"}"#).unwrap();
+        let stratified = Some(ReviewPick::Other("stratified".into()));
+        assert_eq!(newer.review_pick, stratified);
+        assert!(
+            serde_json::to_string(&newer)
+                .unwrap()
+                .contains(r#""review_pick":"stratified""#)
+        );
+        let saved = normalize(newer, &[], 640, 480, "2026-11-16T00:00:00Z").unwrap();
+        assert_eq!(saved.review_pick, stratified);
+        let back = serde_json::to_value(&saved).unwrap();
+        assert_eq!(back["review_pick"], "stratified");
+        assert_eq!(
+            serde_json::from_value::<LabelFile>(back)
+                .unwrap()
+                .review_pick,
+            stratified
+        );
+        // A save keeps a random pick, and refuses a value no build writes.
+        let saved = normalize(random, &[], 640, 480, "2026-11-16T00:00:00Z").unwrap();
+        assert_eq!(saved.review_pick, Some(ReviewPick::Random));
+        for bad in ["", "a\u{7}"] {
+            let f = LabelFile {
+                review_pick: Some(ReviewPick::Other(bad.into())),
+                ..LabelFile::default()
+            };
+            assert!(normalize(f, &[], 640, 480, "now").is_err(), "{bad:?}");
+        }
+    }
 
     fn det(label: &str, score: f32, b: [f32; 4]) -> Det {
         Det {

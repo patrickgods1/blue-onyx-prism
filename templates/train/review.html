@@ -11,7 +11,7 @@
 <progress id="rv-al-progress" max="100" value="0" hidden></progress>
 <div id="rv-al-status" class="review-report" role="status"></div>
 <details class="rv-filters-card" id="rv-filters-card">
-  <summary><span class="muted">Filters:</span> <span id="rv-filter-summary">unreviewed, sent to review</span>{% if custom_dir %} <span class="muted">in <code>{{ dir }}</code></span>{% endif %}</summary>
+  <summary><span class="muted">Filters:</span> <span id="rv-filter-summary">unreviewed, sent to review, recommended</span>{% if custom_dir %} <span class="muted">in <code>{{ dir }}</code></span>{% endif %}</summary>
   <form id="rv-filters" class="inline-row review-filters">
     <label>Bucket <select name="bucket"><option value="">any</option>{% for b in buckets %}<option value="{{ b }}">{{ b }}</option>{% endfor %}</select></label>
     <label>Scene <select name="scene"><option value="">any</option>{% for s in scenes %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select></label>
@@ -21,7 +21,7 @@
     <label id="rv-refine-kind" hidden>Suggestions <select name="refine_kind"><option value="">all</option><option value="add">missing boxes</option><option value="verify">labels no model found</option><option value="relabel">other class</option><option value="tighten">tighter box</option></select></label>
     <label>Status <select name="status"><option value="unreviewed">unreviewed</option><option value="reviewed">reviewed</option><option value="skipped">skipped</option><option value="any">any</option></select></label>
     <label>Frames <select name="source"><option value="queue">sent to review</option><option value="all">all collected</option></select></label>
-    <span class="rv-order"><label>Order <select name="balance" id="rv-balance"><option value="">most uncertain first</option><option value="class,scene,camera">balance classes, scenes, cameras</option><option value="class">balance classes</option><option value="scene">balance scenes</option><option value="camera">balance cameras</option></select></label> <button type="button" class="term" data-tip="Balance: frames whose class, scene or camera has the fewest reviewed frames come first, so the next reviews even out the dataset. A frame's class is its rarest wanted class (its boxes, or the model's detections), weighed by its score: a likely box of a rare class comes before an unlikely one. A frame with none counts as an empty frame. Counted over the frames these filters show, any status, and worked out again for every frame. Ties keep the usual order.">?</button></span>
+    <span class="rv-order"><label>Order <select name="order" id="rv-order"><option value="" selected>Recommended</option><option value="uncertain">Most uncertain first</option><option value="balance:class,scene,camera">balance classes, scenes, cameras</option><option value="balance:class">balance classes</option><option value="balance:scene">balance scenes</option><option value="balance:camera">balance cameras</option></select></label> <button type="button" class="term" data-tip="Recommended: the first frame of each event (one camera's activity, gaps under a minute, at most 10 min) comes before any second one; among those, frames of the classes, scenes and cameras with the fewest reviewed frames, then the most uncertain. Reopened frames come first. With an Auto filter, that filter's own order. Balance: frames whose class, scene or camera has the fewest reviewed frames come first, so the next reviews even out the dataset. A frame's class is its rarest wanted class (its boxes, or the model's detections), weighed by its score: a likely box of a rare class comes before an unlikely one. A frame with none counts as an empty frame. Counted over the frames these filters show, any status, and worked out again for every frame. Ties keep the most uncertain first.">?</button></span>
   </form>
   <form id="rv-folder" class="inline-row">
     <label class="grow">Folder under review <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="dir" value="{{ dir }}" list="rv-folders" autocomplete="off" placeholder="{{ dataset_dir }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the folder of imported frames" hidden>Browse&hellip;</button></span></label>
@@ -35,7 +35,7 @@
 
 <div class="review-grid">
   <div class="review-stage">
-    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-imgmode" class="small secondary">Image</button><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-draw" class="small secondary" aria-pressed="false" hidden>Draw</button><button type="button" id="rv-redraw" class="small secondary" aria-pressed="false" hidden>Redraw</button><details id="rv-view-menu" class="rv-view-menu" hidden><summary>View</summary><div class="rv-view-items">
+    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><button type="button" id="rv-pick" class="term rv-chip rv-pick" data-tip="1 frame in 5 is picked at random, whatever it shows, so results can be checked on frames nobody chose. Review it like any other." hidden>random pick</button><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-imgmode" class="small secondary">Image</button><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-draw" class="small secondary" aria-pressed="false" hidden>Draw</button><button type="button" id="rv-redraw" class="small secondary" aria-pressed="false" hidden>Redraw</button><details id="rv-view-menu" class="rv-view-menu" hidden><summary>View</summary><div class="rv-view-items">
       <button type="button" class="small secondary" data-view="zoom-in">Zoom in</button>
       <button type="button" class="small secondary" data-view="zoom-out">Zoom out</button>
       <button type="button" class="small secondary" data-view="fit">Fit whole frame</button>
@@ -150,7 +150,7 @@
     <li>An object cut by the frame edge only if you can still recognise it.</li>
     <li>Dark frames: look at them brightened (<kbd>b</kbd>) before deciding. A real object you still cannot name for sure is <em>unsure</em> (<kbd>d</kbd>): kept, left out of YOLO training, ignored by the benchmark set. Reject what is not an object at all.</li>
     <li>Why a box was wrong is optional: after <kbd>r</kbd>, <kbd>Shift</kbd>+<kbd>1</kbd>-<kbd>9</kbd> (insect / web, IR glare, reflection, ...) marks it for hard-negative mining.</li>
-    <li>Before saving, look over the whole frame for objects the model missed: they are the commonest label error.</li>
+    <li>Before saving, look over the whole frame for objects the model missed: they are the commonest label error. Small and distant ones are the easiest to miss: at <em>Anything missing?</em>, <kbd>q</kbd> (or <em>Look in quarters</em>) zooms to each quarter of the frame in turn.</li>
   </ul>
 </details>
 

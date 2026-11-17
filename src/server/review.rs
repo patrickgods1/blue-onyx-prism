@@ -47,7 +47,7 @@ use super::{AppState, blocking, encode_uri_component, render};
 use crate::collect::CollectSettings;
 #[cfg(test)]
 use crate::collect::labels::bulk::accept_one;
-use crate::collect::labels::queue::Filters;
+use crate::collect::labels::queue::{Filters, Order};
 use crate::collect::labels::{self, Frame, LabelFile, bulk};
 use crate::collect::{Bucket, layout};
 use askama::Template;
@@ -290,18 +290,24 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&after=`
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=`
 /// (`refine_kind` only with `auto=refine`; `balance` = `class,scene,camera` or some of them puts the
-/// least reviewed first; [`Filters::from_query`]): the most uncertain frame matching the filters (after `after`, the frame shown now, when given; past
-/// the last one the first again with `wrapped`), its position, the counts and the cameras and
-/// classes for the filter lists. A big folder answers from [`labels::index`], with
-/// `indexing: {done, total}` while its rows are still coming in; a small one is walked.
+/// least reviewed first; [`Filters::from_query`]): the first frame matching the filters in the
+/// queue's order (after `after`, the frame shown now, when given; past the last one the first
+/// again with `wrapped`), its position, the counts and the cameras and classes for the filter
+/// lists. The order ([`next_order`]): Recommended by default (one frame per event first, then the
+/// balance in bands, then the most uncertain, [`labels::recommend`]); `order=uncertain` = the most
+/// uncertain first; an `auto=` or `balance=` filter keeps its own order, whatever `order` says.
+/// Only this route reads `order`: bulk actions and auto-label runs keep the uncertainty order. A big
+/// folder answers from [`labels::index`], with `indexing: {done, total}` while its rows are still
+/// coming in; a small one is walked.
 pub(super) async fn next(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
 ) -> Answer {
     let q = query_map(query);
     let mut filters = filters(&q)?;
+    filters.order = next_order(&q, &filters)?;
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         filters.wanted = Some((classes, hidden(&state)));
@@ -321,6 +327,26 @@ pub(super) async fn next(
         Json(answer).into_response()
     })
     .await)
+}
+
+/// The order `GET /v1/review/next` sorts by: `order` absent, empty or `recommended` is
+/// [`Order::Recommended`] unless `f` has an `auto=` or `balance=` filter (those keep their own
+/// order, which is the uncertainty order's); `uncertain` is [`Order::Uncertain`]; anything else
+/// is 400.
+fn next_order(q: &BTreeMap<String, String>, f: &Filters) -> Result<Order, Problem> {
+    match q.get("order").map(|o| o.trim()).filter(|o| !o.is_empty()) {
+        None | Some("recommended") if f.auto.is_none() && f.balance.is_none() => {
+            Ok(Order::Recommended)
+        }
+        None | Some("recommended" | "uncertain") => Ok(Order::Uncertain),
+        Some(o) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "order: '{}' is not recommended or uncertain",
+                o.escape_debug()
+            ),
+        )),
+    }
 }
 
 fn frame_param(q: &BTreeMap<String, String>) -> Result<String, Problem> {
@@ -433,15 +459,33 @@ pub(super) const CONFLICT_MESSAGE: &str = "This frame changed since you opened i
      run or another tab saved it). Reload it to see the new boxes; your changes to it were not \
      saved.";
 
-/// Which of the lists the jobs write a save's body named at all. A key left out (a script or
-/// another client that rebuilds the file from the boxes) keeps the stored list; a key present,
-/// even `[]`, is the client's list (the page always sends both).
+/// Which of the lists the jobs write, and whether `review_pick`, a save's body named at all. A
+/// key left out (a script or another client that rebuilds the file from the boxes) keeps the
+/// stored value; a key present, even `[]`, is the client's list (the page always sends both), and
+/// a `review_pick` present, even `null`, is the client's (the page sends the frame's own).
 #[derive(Debug, Default, Deserialize)]
 struct SentLists {
     #[serde(default)]
     refine: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     overlap_suggestions: Option<serde::de::IgnoredAny>,
+    #[serde(default, deserialize_with = "key_present")]
+    review_pick: bool,
+}
+
+/// True for a key that is there, whatever its value (`null` too).
+fn key_present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| true)
+}
+
+/// `file` without a `review_pick: random` the frame `rel` cannot have: only a pool frame
+/// ([`labels::recommend::in_pool`]) is ever served as a random pick, so a forged or mistaken mark
+/// on another frame would put a chosen frame among the random ones. Any other value stays.
+fn drop_foreign_pick(file: &mut LabelFile, rel: &str) {
+    if file.review_pick == Some(labels::ReviewPick::Random) && !labels::recommend::in_pool(rel) {
+        tracing::debug!(frame = %rel, "review save: review_pick random dropped, the frame is not in the random-pick pool");
+        file.review_pick = None;
+    }
 }
 
 impl SentLists {
@@ -450,9 +494,9 @@ impl SentLists {
         serde_json::from_slice(body).unwrap_or_default()
     }
 
-    /// `file` with the stored file's lists in place of those the body left out.
+    /// `file` with the stored file's lists and `review_pick` in place of those the body left out.
     fn keep_stored(&self, file: &mut LabelFile, path: &std::path::Path) {
-        if self.refine.is_some() && self.overlap_suggestions.is_some() {
+        if self.refine.is_some() && self.overlap_suggestions.is_some() && self.review_pick {
             return;
         }
         let stored = match labels::read(path) {
@@ -471,6 +515,9 @@ impl SentLists {
         if self.overlap_suggestions.is_none() {
             file.overlap_suggestions = stored.overlap_suggestions;
         }
+        if !self.review_pick {
+            file.review_pick = stored.review_pick;
+        }
     }
 }
 
@@ -480,7 +527,9 @@ impl SentLists {
 /// when the file changed meanwhile; without it, it always overwrites (X-AnyLabeling and other
 /// clients). A body without a `refine` or `overlap_suggestions` key keeps the stored file's list
 /// ([`SentLists`]): the suggestions and their answers are the jobs' and the reviewer's, not the
-/// client's to drop by leaving them out.
+/// client's to drop by leaving them out. So does one without `review_pick`; `random` on a frame
+/// out of the random-pick pool is dropped ([`drop_foreign_pick`]). A save around an unanswered
+/// suggestion drops the kept open counts ([`super::refine::save_changes_open`]).
 pub(super) async fn labels_post(
     State(state): State<Arc<AppState>>,
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
@@ -507,11 +556,14 @@ pub(super) async fn labels_post(
         let status = file.status;
         // Read before the write, outside its lock: with a revision the write is refused when the
         // file changed since; without one the save overwrites whatever came between, as always.
+        let stored = labels::read(&frame.labels).ok().flatten();
         sent.keep_stored(&mut file, &frame.labels);
+        drop_foreign_pick(&mut file, &frame.rel.jpg());
         let f = match labels::normalize(file, &classes, rec.width, rec.height, &now()) {
             Ok(f) => f,
             Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}")),
         };
+        let open_changes = super::refine::save_changes_open(stored.as_ref(), &f);
         let written = match &expected {
             Some(rev) => labels::write_checked(&frame.labels, &f, rev),
             None => labels::write(&frame.labels, &f).map(Ok),
@@ -531,6 +583,11 @@ pub(super) async fn labels_post(
                     .into_response();
             }
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}")),
+        }
+        // The dataset check's open count may have changed (an answer, a box moved under a
+        // suggestion): the Train strip shows none until the next walk.
+        if open_changes {
+            super::refine::forget_counts();
         }
         tracing::debug!(frame = %rel, status = status.as_str(), boxes = f.boxes.len(), "review labels saved");
         labels_answer(
@@ -1614,6 +1671,38 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         (v["item"]["frame"] == rel).then(|| v["item"]["refine_open"].as_u64().unwrap_or(0))
+    }
+
+    /// A save that answers a dataset-check suggestion drops the kept open count, so the Train
+    /// strip shows none rather than one that counts the answered suggestion.
+    #[tokio::test]
+    async fn a_save_answering_a_suggestion_drops_the_kept_open_count() {
+        let d = ds_with(refine_classes);
+        let (rel, _, _) = refine_frame(&d);
+        let q = encode_uri_component(&rel);
+        let classes = d.state.config_read().collect.classes.clone();
+        let hidden = d.state.config_read().collect.hidden_classes.clone();
+        let (st, l) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(st, StatusCode::OK, "{l}");
+        // Other tests drop every kept count now and then: keep one until it stays.
+        let kept = (0..50).any(|_| super::super::refine::keep_open_now(&d.dir, &classes, &hidden));
+        assert!(kept, "no count kept");
+        assert_eq!(
+            super::super::refine::kept_open(&d.dir, &classes, &hidden).map(|o| o.relabel),
+            Some(1)
+        );
+        let mut page = l["labels"].clone();
+        page["refine"][3]["answer"] = "dismissed".into();
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            l["revision"].as_str().unwrap()
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &page.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            super::super::refine::kept_open(&d.dir, &classes, &hidden),
+            None
+        );
     }
 
     both_ways!(
@@ -3506,6 +3595,316 @@ mod tests {
         assert!(v.get("folder_missing").is_none(), "{v}");
         let _ = std::fs::remove_dir_all(&root);
     }
+    /// The frames `GET /v1/review/next` with `params` goes through, Next after Next until it
+    /// wraps, each with its `event_rank`.
+    async fn order_of(d: &Ds, params: &[(&str, &str)]) -> Vec<(String, Option<u64>)> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut p: Vec<(&str, &str)> = params.to_vec();
+            if let Some(a) = &after {
+                p.push(("after", a));
+            }
+            let v = next_of(d, &p).await;
+            if v["wrapped"] == true || v["item"].is_null() {
+                return out;
+            }
+            let frame = v["item"]["frame"].as_str().unwrap().to_string();
+            out.push((frame.clone(), v["item"]["event_rank"].as_u64()));
+            assert!(out.len() < 50, "{params:?} never wraps");
+            after = Some(frame);
+        }
+    }
+
+    both_ways!(
+        next_is_recommended_unless_asked_otherwise,
+        next_is_recommended_unless_asked_otherwise_indexed,
+        next_is_recommended_unless_asked_otherwise_in
+    );
+
+    /// Recommended by default: a and b are one event (one camera, the same time), so c comes
+    /// before b although b is more uncertain. `order=uncertain`, `balance=` and `auto=` keep the
+    /// uncertainty order; another `order` is refused.
+    async fn next_is_recommended_unless_asked_otherwise_in(way: Way) {
+        let d = way.ds();
+        let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
+        let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.51);
+        let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.6);
+        let (s, v) = json(&d.state, get("/v1/review/next?order=newest")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("order") && m.contains("newest"), "{m}");
+
+        let ranked = vec![
+            (a.clone(), Some(0)),
+            (c.clone(), Some(0)),
+            (b.clone(), Some(1)),
+        ];
+        assert_eq!(order_of(&d, &[]).await, ranked);
+        assert_eq!(order_of(&d, &[("order", "recommended")]).await, ranked);
+        // The balance it weighs by is in the answer, every dimension, for the page's note.
+        let v = next_of(&d, &[]).await;
+        assert!(v["balance"]["scenes"].is_object(), "{v}");
+        assert!(v["item"]["balance"].is_object(), "{v}");
+
+        let plain = vec![(a.clone(), None), (b.clone(), None), (c.clone(), None)];
+        assert_eq!(order_of(&d, &[("order", "uncertain")]).await, plain);
+        assert!(next_of(&d, &[("order", "uncertain")]).await["balance"].is_null());
+        for params in [
+            &[("balance", "class")][..],
+            &[("balance", "class"), ("order", "recommended")],
+        ] {
+            assert_eq!(order_of(&d, params).await, plain, "{params:?}");
+            assert!(next_of(&d, params).await["balance"].is_object());
+        }
+        // Not auto-labelled: every frame, in the auto filter's order.
+        assert_eq!(order_of(&d, &[("auto", "none")]).await, plain);
+        assert_eq!(
+            order_of(&d, &[("auto", "none"), ("order", "recommended")]).await,
+            plain
+        );
+    }
+
+    both_ways!(
+        a_limited_bulk_accept_keeps_the_uncertainty_order,
+        a_limited_bulk_accept_keeps_the_uncertainty_order_indexed,
+        a_limited_bulk_accept_keeps_the_uncertainty_order_in
+    );
+
+    /// A bulk action with a limit takes the first frames of the uncertainty order, never the
+    /// Recommended one: the four frames the triage settles are two per camera, all at one time,
+    /// so the Recommended order puts one of each camera first, the uncertainty order both of
+    /// drive.
+    async fn a_limited_bulk_accept_keeps_the_uncertainty_order_in(way: Way) {
+        let d = way.ds();
+        let rels = put_auto_frames(&d.dir);
+        let settled = |i: usize| rels[i].clone();
+        let uncertain: Vec<String> = order_of(&d, &[("auto", "accept"), ("order", "uncertain")])
+            .await
+            .into_iter()
+            .map(|x| x.0)
+            .collect();
+        assert_eq!(uncertain, [settled(0), settled(6), settled(3), settled(9)]);
+        let mut f = Filters {
+            auto: Some(labels::queue::AutoFilter::Accept),
+            order: Order::Recommended,
+            ..Filters::default()
+        };
+        f.wanted = Some((context(&d.state).1, hidden(&d.state)));
+        let recommended: Vec<String> = labels::queue::build(&d.dir, &f)
+            .items
+            .into_iter()
+            .map(|i| i.frame)
+            .collect();
+        assert_eq!(
+            recommended,
+            [settled(0), settled(3), settled(6), settled(9)]
+        );
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/accept-auto",
+                r#"{"dry_run": false, "limit": 2}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["accepted"], 2, "{v}");
+        let reviewed: Vec<String> = rels
+            .iter()
+            .filter(|r| {
+                Frame::resolve(&d.dir, r)
+                    .unwrap()
+                    .labels()
+                    .unwrap()
+                    .is_some_and(|l| l.status == labels::Status::Reviewed)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(reviewed, [settled(0), settled(6)]);
+        // The default Next of the indexed folder answers from the index.
+        next_of(&d, &[]).await;
+    }
+
+    /// Frames of one camera, each on its own day (an event of its own, all equally uncertain):
+    /// `rest` out of the random-pick pool and `pool` in it, by the path's hash alone.
+    fn put_pool_frames(d: &Ds, rest: usize, pool: usize) -> (Vec<String>, Vec<String>) {
+        let (mut out, mut inside) = (Vec::new(), Vec::new());
+        for k in 0..336 {
+            if out.len() == rest && inside.len() == pool {
+                break;
+            }
+            let date = format!("2026-{:02}-{:02}", 1 + k / 28, 1 + k % 28);
+            let stem = format!("{}T010203004Z_p{k}", date.replace('-', ""));
+            let rel = format!("ir/yard/{date}/{stem}.jpg");
+            let (side, want) = if labels::recommend::in_pool(&rel) {
+                (&mut inside, pool)
+            } else {
+                (&mut out, rest)
+            };
+            if side.len() < want {
+                assert_eq!(put_frame(&d.dir, "yard", &date, &stem, 0.6), rel);
+                side.push(rel);
+            }
+        }
+        assert_eq!((out.len(), inside.len()), (rest, pool));
+        (out, inside)
+    }
+
+    /// The default Next, Next after Next until it wraps: each frame with its `random_pick`.
+    async fn served_picks(d: &Ds) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut p: Vec<(&str, &str)> = Vec::new();
+            if let Some(a) = &after {
+                p.push(("after", a));
+            }
+            let v = next_of(d, &p).await;
+            if v["wrapped"] == true || v["item"].is_null() {
+                return out;
+            }
+            let frame = v["item"]["frame"].as_str().unwrap().to_string();
+            out.push((frame.clone(), v["item"]["random_pick"] == true));
+            assert!(out.len() < 50, "never wraps");
+            after = Some(frame);
+        }
+    }
+
+    /// Save `rel` as `status` from its served labels, `edit`ed.
+    async fn save_frame(
+        d: &Ds,
+        rel: &str,
+        status: &str,
+        edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) {
+        let q = encode_uri_component(rel);
+        let (_, v) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        let mut body = v["labels"].clone();
+        let o = body.as_object_mut().unwrap();
+        o.insert("status".into(), status.into());
+        edit(o);
+        let uri = format!(
+            "/v1/review/labels?frame={q}&revision={}",
+            v["revision"].as_str().unwrap_or("")
+        );
+        let (st, v) = json(&d.state, post_json(&uri, &body.to_string())).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    both_ways!(
+        the_default_next_serves_one_random_pick_in_five,
+        the_default_next_serves_one_random_pick_in_five_indexed,
+        the_default_next_serves_one_random_pick_in_five_in
+    );
+
+    /// Every fifth slot of the default view is a pool frame, marked `random_pick`; the frames
+    /// ahead keep their slots across a save and a skip; a filtered view has none.
+    async fn the_default_next_serves_one_random_pick_in_five_in(way: Way) {
+        let d = way.ds();
+        let (rest, pool) = put_pool_frames(&d, 9, 3);
+        let before = served_picks(&d).await;
+        assert_eq!(before.len(), 12);
+        let flags: Vec<bool> = before.iter().map(|x| x.1).collect();
+        // Nothing decided: slots 4 and 9 (0-based), then the last pool frame fills slot 11.
+        let mut want = vec![false; 12];
+        for i in [4, 9, 11] {
+            want[i] = true;
+        }
+        assert_eq!(flags, want, "{before:?}");
+        for (frame, random) in &before {
+            assert_eq!(*random, pool.contains(frame), "{frame}");
+            assert_eq!(!*random, rest.contains(frame), "{frame}");
+        }
+        // Slot 0 is no pick: the key is left out.
+        let v = next_of(&d, &[]).await;
+        assert!(v["item"].get("random_pick").is_none(), "{v}");
+        assert_eq!(v["upcoming"].as_array().unwrap().len(), 5);
+
+        // A save of the first frame: what follows is unchanged, flags included.
+        save_frame(&d, &before[0].0, "reviewed", |_| {}).await;
+        let after_save = served_picks(&d).await;
+        assert_eq!(after_save, before[1..], "after a save");
+        let v = next_of(&d, &[("after", &before[0].0)]).await;
+        assert_eq!(v["item"]["frame"], before[1].0.as_str(), "{v}");
+        assert_eq!(v["position"], 1);
+        // A skip too.
+        save_frame(&d, &before[1].0, "skipped", |_| {}).await;
+        assert_eq!(served_picks(&d).await, before[2..], "after a skip");
+
+        // A filtered view, or another status, has no random slot.
+        for params in [
+            &[("camera", "yard")][..],
+            &[("status", "any")],
+            &[("order", "uncertain")],
+        ] {
+            let v = next_of(&d, params).await;
+            assert!(v["item"].is_object(), "{params:?}: {v}");
+            let mut after = String::new();
+            for _ in 0..12 {
+                let mut p = params.to_vec();
+                p.push(("after", &after));
+                let v = next_of(&d, &p).await;
+                assert!(v["item"].get("random_pick").is_none(), "{params:?}: {v}");
+                after = v["item"]["frame"].as_str().unwrap().to_string();
+            }
+        }
+    }
+
+    both_ways!(
+        a_save_keeps_a_random_pick_only_on_a_pool_frame,
+        a_save_keeps_a_random_pick_only_on_a_pool_frame_indexed,
+        a_save_keeps_a_random_pick_only_on_a_pool_frame_in
+    );
+
+    /// `review_pick: random` is kept on a pool frame and dropped on any other (a forged or
+    /// mistaken mark); a body without the key keeps the stored value, `null` clears it, and a
+    /// newer build's value is kept as written.
+    async fn a_save_keeps_a_random_pick_only_on_a_pool_frame_in(way: Way) {
+        let d = way.ds();
+        let (rest, pool) = put_pool_frames(&d, 1, 1);
+        let stored = |rel: &str| {
+            Frame::resolve(&d.dir, rel)
+                .unwrap()
+                .labels()
+                .unwrap()
+                .unwrap()
+                .review_pick
+        };
+        let random = |o: &mut serde_json::Map<String, serde_json::Value>| {
+            o.insert("review_pick".into(), "random".into());
+        };
+        save_frame(&d, &rest[0], "reviewed", random).await;
+        assert_eq!(stored(&rest[0]), None, "forged");
+        save_frame(&d, &pool[0], "reviewed", random).await;
+        assert_eq!(stored(&pool[0]), Some(labels::ReviewPick::Random));
+        // The served labels carry it, so the page's next save sends it back.
+        let q = encode_uri_component(&pool[0]);
+        let (_, v) = json(&d.state, get(&format!("/v1/review/labels?frame={q}"))).await;
+        assert_eq!(v["labels"]["review_pick"], "random", "{v}");
+        // A client that leaves the key out keeps it.
+        save_frame(&d, &pool[0], "reviewed", |o| {
+            o.remove("review_pick");
+        })
+        .await;
+        assert_eq!(stored(&pool[0]), Some(labels::ReviewPick::Random));
+        // A key present is the client's: null clears it.
+        save_frame(&d, &pool[0], "reviewed", |o| {
+            o.insert("review_pick".into(), serde_json::Value::Null);
+        })
+        .await;
+        assert_eq!(stored(&pool[0]), None);
+        save_frame(&d, &rest[0], "reviewed", |o| {
+            o.insert("review_pick".into(), "stratified".into());
+        })
+        .await;
+        assert_eq!(
+            stored(&rest[0]),
+            Some(labels::ReviewPick::Other("stratified".into())),
+            "kept as written"
+        );
+    }
+
     // ---- the review index behind `GET /v1/review/next` ----------------------------------------
 
     /// `GET /v1/review/next` with `params`.
@@ -3527,6 +3926,7 @@ mod tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         let mut f = Filters::from_query(&q).unwrap();
+        f.order = next_order(&q, &f).unwrap();
         let (dir, classes, _) = context(&d.state);
         f.wanted = Some((classes, hidden(&d.state)));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
@@ -3551,7 +3951,7 @@ mod tests {
     }
 
     /// Filters a Next is asked with, for answers compared whole with the walk's.
-    const VIEWS: [&[(&str, &str)]; 7] = [
+    const VIEWS: [&[(&str, &str)]; 9] = [
         &[],
         &[("status", "any")],
         &[("status", "reviewed")],
@@ -3559,6 +3959,8 @@ mod tests {
         &[("auto", "accept")],
         &[("auto", "review")],
         &[("camera", "yard"), ("status", "any")],
+        &[("order", "uncertain")],
+        &[("balance", "class"), ("order", "recommended")],
     ];
 
     /// Every view of [`VIEWS`], and after its first frame, answered as the walk answers it.

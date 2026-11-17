@@ -757,6 +757,14 @@ pub struct RunSettings {
     /// records from before the setting, whose runs left every such frame out (`drop-frame`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore: Option<super::dataset::IgnoreMode>,
+    /// The share of empty training frames the plan kept (`training.negative_share`, 0..1). None
+    /// = a record from before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_share: Option<f32>,
+    /// The most frames kept per static spot (`training.static_cap`); `Some(0)` = the cap was
+    /// off. None = a record from before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_cap: Option<u32>,
 }
 
 impl RunSettings {
@@ -1884,6 +1892,8 @@ mod tests {
             scene: Some("night+ir".into()),
             gpu: Some("NVIDIA GeForce GTX 1070 Ti".into()),
             ignore: None,
+            negative_share: None,
+            static_cap: None,
         };
         let v = serde_json::to_value(TrainProgress {
             settings: Some(s.clone()),
@@ -3084,6 +3094,8 @@ print("RESULT: " + json.dumps(out))
             scene: None,
             gpu: None,
             ignore: None,
+            negative_share: None,
+            static_cap: None,
         }
     }
 

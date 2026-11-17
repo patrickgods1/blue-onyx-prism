@@ -186,9 +186,9 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
      images/val/...                             held out by the export, whole camera days
      labels/train/<same stem>.txt               YOLO `class cx cy w h`, normalized; empty = no objects
      labels/val/...
-     benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative
+     benchmark/manifest.json                    tags: scene, camera:<c>, date:<d>, hard-negative, random
      ignore.json                                ignore regions per image, frames with only parked-spot boxes
-     frames.json                                frames confirmed empty, frames accepted in bulk
+     frames.json                                frames confirmed empty, frames accepted in bulk, random picks
      hard_negatives.json                        rejected boxes
    ```
 
@@ -252,6 +252,12 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
    run's benchmark summary; the held-out
    `manifest.json` tags each frame with its scene plus `heldout:<scene>`, `heldout:all` and, for a
    frame of the run's scenes, `heldout:in-scope`, which the benchmark summary reads for per-scene AP.
+   A frame the Review queue served as a random pick (`review_pick: random` on its label file, listed in
+   the export's `frames.json` `random_pick`) is also tagged `heldout:random`; the benchmark summary
+   keeps that tag's score as `random` (`images`, `gt`, `ap50`, `ap50_95`, `recall` at the threshold).
+   Nobody chose those frames, while the rest of the reviewed set leans to the hard and rare frames the
+   queue order puts first, so their score is the least biased one ([Comparison](#comparing-day-nightir-and-mixed-models)).
+   The flag is not part of `heldout_fingerprint`: marking a frame changes no held-out frame.
 3. **Scene filter** (training and validation frames only): `all`, or any combination of `day`,
    `night` and `ir` joined by `+` (`day`, `night`, `ir`, `day+night`, `day+ir`, `night+ir`; the
    page's checkboxes). Frames without a scene tag are left out by every filter but `all`, with a
@@ -1029,6 +1035,8 @@ group is benchmarked on the same frames, all scenes included. The fingerprint in
 summary proves it. If the fingerprints differ (an export was edited between queuing and running) the
 comparison shows a warning instead of comparing.
 
+Runs trained with different shares of empty frames (`training.negative_share`) or different static caps (`training.static_cap`) are flagged with a warning; runs from before these were recorded say nothing.
+
 **The table.** The Comparison card of the Models tab (one per group) and, at the end of a
 `train run` with several scenes, the CLI table have one row per run: model, scene filter, best epoch
 (with "by F2" when not selected by mAP; a warning when runs of a group differ) and the epoch it
@@ -1041,6 +1049,21 @@ detection at or above the threshold, of all such frames; a detection inside an i
 count). The best value of each column is marked (`*` in the CLI): highest AP and recall, lowest time
 and false-alert rate. Runs of older versions show a dash in the new columns. Runs that differ in
 classes, excluded mode or threshold get a warning.
+
+**Random picks.** One reviewed frame in five comes from the Review queue's random pool (Recommended
+order): it was reviewed because its slot came up, whatever it shows. The rest of the reviewed set leans
+to what the queue puts first (likely boxes, rare classes, uncertain frames), so AP on it is skewed; AP
+on the held-out random picks (`heldout:random`, benchmark summary `random`) is the least biased score.
+The **Random picks** column (CLI `random`, after in-scope; higher is better) shows it, and its head's tip
+gives the frame and object counts. AP over a few dozen frames moves a lot from frame to frame, so the
+column is shown only when **every** benchmarked run of the group has at least 50 held-out random picks
+(`compare::MIN_RANDOM_HELDOUT`); otherwise it is hidden everywhere, best mark and seed means included
+(a run still queued or running hides nothing; a run of an older version, with no `random`, hides it).
+Picks are random among the frames sent to review, not among everything the cameras saw. The held-out
+set is shared by the group, so the counts should match; when they differ the label files changed
+between the runs' exports and the card warns that the random-pick scores are not comparable. Person
+and vehicle recall on the random picks alone are not computed (they would need the alerting figures per
+tag).
 
 The same figures close each run's benchmark line on the page (`person recall 0.39 · vehicle recall
 0.67 · false alerts 4/130 empty frames @ 0.50`) and are stored in its benchmark summary (`threshold`,
@@ -1341,7 +1364,8 @@ deleted automatically; confirmed empty frames (hard negatives) come only from th
 `status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
 `label=person|car` = frames with any of these classes; the queue's `label=` takes a comma list;
 docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
-queue's order (most uncertain first). The Review tab's button sends its own filters.
+queue's uncertainty order (most uncertain first), not the Review tab's default *Recommended* order, which only
+`GET /v1/review/next` uses. The Review tab's button sends its own filters.
 
 **Marker**: every frame the labelers return (boxes or not) gets `auto_run: {at, labeler, classes}` in its label
 file (a frame without one gets its pre-fill plus the marker). Only frames whose boxes changed are queued
@@ -1416,7 +1440,9 @@ in `training/autolabel/triage.rs`; change them only after measuring again.
 - **Hidden boxes are recoverable.** They stay in the label file. *Show N hidden* or `i` shows a frame's
   boxes dimmed, `auto=dismissed` finds the frames, and accepting one makes it a label. They are no hard
   negatives and teach no spot memory, since nobody judged them. Before you save, *Anything missing?* says
-  how many are hidden. No bulk save takes a frame with hidden boxes: a saved frame claims it is complete,
+  how many are hidden; `q` (or *Look in quarters*) then zooms to each quarter of the frame in turn
+  (`QUARTER_SHARE` 0.55 of each side, so an object on a centre line is whole in one; Esc or a fifth
+  press shows the whole frame), because missed objects are mostly small or distant. No bulk save takes a frame with hidden boxes: a saved frame claims it is complete,
   so a real object nobody looked at would train as background.
 - **The filter is checked.** About 2% of the boxes that would be hidden stay visible, marked *audit sample:
   normally hidden*. The same box gets the same answer on a rerun. Your verdicts show on the Review tab
@@ -2078,8 +2104,8 @@ it could never be live again and is dropped (an answered `add` stays: it keeps t
 back). A found suggestion is dropped when it is the same finding as an answered one (the same `target` and,
 when both have one, `target_label`; for an `add`, a box of the same object at IoU 0.5 or more), a weaker
 copy of another found one, or outside what a save accepts.
-A frame holds at most 64, strongest first (`add`, then `relabel`, then `tighten`, then `verify`, then by
-score). Over 64, a write gives up its own found suggestions, the weakest first: it never pushes out an
+A frame holds at most 64, strongest first (`relabel`, then `add`, then `verify`, then `tighten`, then by
+score): per error, a wrong class costs a detector the most, then a missing box, then a loose one. Over 64, a write gives up its own found suggestions, the weakest first: it never pushes out an
 answered one or one of a kind another write owns (the closer look's `tighten` never displaces a fold's
 `verify`, nor a fold's `add` an open `tighten`). A frame whose suggestions come out the same is not written, so its revision stays and an open Review
 page can still save. The file format is in [DATASET.md](DATASET.md#label-file-version-1).
@@ -2453,8 +2479,8 @@ web UI and shows its results; the check itself is the one above and changes no b
   suggestions* button; see "What a rerun replaces" above). While
   it runs the card shows the check's progress row (step, percent, time left, Pause / Resume / Cancel; the
   Jobs tab links to it as `#job-<id>`).
-- **Findings**: the open suggestions per kind (*Missing boxes* = `add`, *Labels no model found* = `verify`,
-  *Other class suggested* = `relabel`, *Loose boxes* = `tighten`; `GET /v1/refine` `open`), counted over the label files of the folder under review
+- **Findings**: the open suggestions per kind, in the Review tab's order (*Other class suggested* = `relabel`,
+  *Missing boxes* = `add`, *Labels no model found* = `verify`, *Loose boxes* = `tighten`; `GET /v1/refine` `open`), counted over the label files of the folder under review
   (`refine::live`: answered and stale ones are not counted; kept 60 s, dropped when a check starts or ends,
   so a Review save shows within the minute: the card says *Counts refresh within a minute*),
   each with a link to the Review tab (`/train/review?auto=refine&refine_kind=<kind>`). `GET /v1/refine`
@@ -2465,6 +2491,9 @@ web UI and shows its results; the check itself is the one above and changes no b
   skipped*, `RefineFloor.lastLine`), `cancelled`, its warnings and *Loose labels counted: N, M with a
   proposed box* (`loose`, `found.tighten`; *N (no closer look in this check)* without one), and *Last full
   check: <date>* / *Last quick check: <date>* when the other mode's report exists (`RefineFloor.otherLine`).
+  Under any report a muted line says *The check finds some errors, not all: small, dark or partly hidden
+  objects most often slip past it.* (`RefineFloor.missesLine`); the Review card says the same once the last
+  suggestion of a frame is answered: no suggestion left does not make a frame complete.
   The recall tables (Coverage and Too small cards) use the full check's report when there is one, else the
   quick check's (its recall reads *over the N frames <model> never saw*). On the Review tab a `tighten` is
   *the tighter box* when the proposal lies (95% or more of it) inside the label, else *the better-fitting box*
@@ -2647,6 +2676,53 @@ frame's rel path, `sample_size` its pixels). The tab has no card for tighter box
 Per frame on the M1 (from the script's `ms` per frame): MM-Grounding-DINO tiny 1.3-2.8 s, RF-DETR L
 0.17-0.8 s, Qwen3-VL 2B 1-3 s per frame with checked crops, SigLIP 2 about 1.8 s for the first frame
 with animals (the text prompts are computed once).
+
+## Train area
+
+### Next step
+
+The strip under the Train area's tabs (`GET /v1/train/summary`, `train_area::next_step`) shows the counts and
+one suggested action, the first rule that applies: a job on the queue, the folder under review missing, a
+finished model nobody decided about, nothing collected yet, then:
+
+1. **Answer the dataset check** (`answer_check`): open `relabel` and `add` suggestions (every label file's
+   live ones, as the Refine tab counts them), e.g. *The dataset check found 5 likely fixes (2 wrong classes,
+   3 missing boxes). Answer them before you export: wrong classes hurt a model most.* (a zero part is left out), linking
+   `/train/review?auto=refine`. It comes before both export rules: a wrong class costs a model the most per
+   error, a missing box is the commonest error, and both would reach the export as they are. Verify and
+   tighten suggestions get no nudge. The count is the Refine tab's `open` (`server::refine::open_cached`):
+   the strip never waits for its walk. It takes a kept count up to 10 minutes old (`STRIP_OPEN_TTL`; the
+   strip polls every 30 s on every Train tab), shows none once a review save changed a frame's unanswered
+   suggestions (`save_changes_open` drops the kept counts) or a check started or ended, and an older or
+   missing one starts a walk on its own thread (one per folder and class list, at most one started a
+   minute, never two walks at once), so the step appears on a later poll.
+2. Enough new reviewed frames to export (50), then frames to auto-label or review. The review step counts
+   effort in boxes: *M boxes on N frames to review.* when every frame to review has a label file, else *N
+   frames (M boxes) to review.*, since boxes only a sidecar proposes are not counted (`Tally.unfiled_to_review`).
+3. **Run the dataset check** (`run_check`), once nothing is left to review: when this machine can train, at
+   least `refine::MIN_FRAMES` (40) reviewed frames on 2 camera days or more (`Tally::reviewed_camera_days`,
+   (camera, date) from the frame's path as the check groups them), and no check yet or the last one judged
+   under three quarters of the reviewed frames (`frames_checked` of the newer of `refine/report.json` and
+   `refine/report-quick.json` by `created`: a quick check judges only the frames its model never saw, a
+   cancelled check only its finished folds; the reports are read again only when one changes):
+   *N reviewed frames the last dataset check did not judge. A check finds some wrong labels before you train.* With a model trained here that the quick check can use, the link is
+   *Quick check* (`/train/refine#quick-check` opens the form on it) and the text adds that it takes minutes;
+   else *Run the check* (`/train/refine#refine-check`).
+4. Any reviewed frames not exported, a failed run, an export not trained on, and otherwise *All caught up*.
+
+The link is hidden on its own tab unless it asks for a list or card the page is not on (Review's
+`?auto=refine`, Refine's `#quick-check`).
+
+### Review pace in boxes
+
+The Review tab's session line counts effort in boxes, since active-learning gains largely vanish when
+effort is counted in boxes rather than images: *Session 23 frames · 64 boxes, 2.8 a minute · 82% accepted
+· 37 min*. Boxes = boxes pending when the frame was served that the save decides, a box made by accepting a
+suggestion, and boxes drawn by hand (`ReviewRules.boxDecisions`, node-tested); a box decided before the
+visit (a frame seen again with `p`), a duplicate, a too-small box, a dismissal, a parked spot's accept and a
+"don't want" box the save rejects unseen are no decision. A minute is the frames' own time (load to save,
+at most 10 min each), so breaks do not count. *% accepted* is over the same decided boxes. The *Going fast*
+note (the last 10 frames much faster while accepting more) and the break note every 45 min are unchanged.
 
 ## Command line
 
