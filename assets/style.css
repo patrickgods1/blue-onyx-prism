@@ -918,6 +918,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-empty { color: var(--muted); opacity: 0.6; }
 .rv-off { visibility: hidden; }
 .rv-hud-pos { font-size: 1.3rem; font-weight: 650; letter-spacing: -0.01em; }
+.rv-hud-left { margin-left: 0.3rem; font-size: 0.8rem; font-weight: 400; letter-spacing: 0; color: var(--muted); }
 .rv-hud-meter { flex: none; width: 2.6rem; height: 0.45rem; margin-right: 0.45rem; background: var(--border); border-radius: 3px; overflow: hidden; }
 .rv-hud-meter > i { display: block; width: 0; height: 100%; background: #2e9e4f; }
 .rv-hud-chip { padding: 0 0.5rem; border: 1px solid var(--border); border-radius: 999px; font-size: 0.8rem; line-height: 1.55; }

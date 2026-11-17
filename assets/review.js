@@ -3635,7 +3635,11 @@
     add('Matching', j.position ? (j.position + ' of ' + j.total) : (j.total || 0));
     if (j.unreadable) add('Unreadable', j.unreadable);
     // The place of the frame the answer landed on (the HUD shows it once that frame is on screen).
-    queuePlace = { frame: j.item ? j.item.frame : null, text: j.position ? j.position + ' / ' + j.total : '' };
+    // Recommended and `balance:` re-sort the queue after every save, so a place in it jumps
+    // (15, then 25, then 11): the HUD says how many frames are left instead.
+    var left = reSorting();
+    queuePlace = { frame: j.item ? j.item.frame : null, left: left,
+      text: left ? (j.item ? String(j.total || 0) : '') : (j.position ? j.position + ' / ' + j.total : '') };
     // The counts are behind Details on a phone: the HUD's title says the order is still filling in.
     queueIndexing = !!j.indexing;
     setHudPos(true);
@@ -3643,7 +3647,7 @@
 
   // The queue's place of the frame its last answer landed on ({frame, text}), and whether the
   // folder's index is still filling in.
-  var queuePlace = { frame: null, text: '' }, queueIndexing = false;
+  var queuePlace = { frame: null, text: '', left: false }, queueIndexing = false;
   // The queue's item of the frame it last landed on (GET /v1/review/next), for what only the
   // queue knows: why `balance=` put it there, and whether it is a random pick.
   var queueItem = null;
@@ -3699,14 +3703,22 @@
   // The HUD's queue slot: "15 / 250" for the frame on screen. A frame the queue did not land on
   // (Back) shows a dash. `fromCounts`: a counts answer, whose frame may still be on its way (its
   // own render shows the place then; nothing flickers meanwhile).
+  // A re-sorting order shows "249 left": the queue's, whatever frame is on screen.
   function setHudPos(fromCounts) {
     if (!hudEl.pos) return;
-    var on = !!cur && queuePlace.frame === cur.frame && !!queuePlace.text;
+    var q = queuePlace;
+    var on = !!cur && !!q.text && (q.left || q.frame === cur.frame);
     if (fromCounts && !on && cur) return;
-    hudSet(hudEl.pos, on ? queuePlace.text : '');
-    hudEl.pos.parentNode.title = on ? 'Frame ' + queuePlace.text.replace(' / ', ' of ') + ' of the queue' + (queueIndexing ? ' (the folder is still being indexed: counts and order are filling in)' : '')
+    hudSet(hudEl.pos, on ? q.text : '', on && q.left ? [el('span', 'rv-hud-left', 'left')] : null);
+    var indexingNote = queueIndexing ? ' (the folder is still being indexed: counts and order are filling in)' : '';
+    hudEl.pos.parentNode.title = on
+      ? (q.left ? q.text + ' frames left. This order is worked out again after every save, so a frame has no fixed place in it.'
+        : 'Frame ' + q.text.replace(' / ', ' of ') + ' of the queue') + indexingNote
       : (cur ? 'This frame is not where the queue is (an earlier frame)' : 'The place of the frame in the queue');
   }
+
+  // Orders worked out again after every save: Recommended and `balance:` (balanceBy).
+  function reSorting() { return balanceBy() !== ''; }
 
   var SCENE_ICONS = { day: '☀', night: '☾', ir: '◐' };
   // The HUD's frame slots: queue place, camera, scene, time, random pick (setHudBoxes does the box
