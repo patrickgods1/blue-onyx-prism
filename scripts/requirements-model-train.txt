@@ -17,7 +17,9 @@
 # torch stays on 2.14.x (torchvision 0.29.1): 2.15 is built for CUDA 13.2 / 13.4 only (`cu132`, `cu134`;
 # no `cu126` or `cu130` wheels, Turing and newer, driver 580+), so the `cu126` lane, the one that runs
 # Pascal (GTX 10xx) and CUDA 12 drivers, cannot resolve it; torchvision 0.29.2 has no cu126 / cu130 build
-# either.
+# either. No HOLDS entry: `scripts/ci/check_deps.py upstream` counts a torch / torchvision release due only
+# with a cp311 wheel on every lane of the train locks, so these wait and a 2.14.x / 0.29.x patch that ships
+# for cu126 and cu130 is still reported.
 #
 # The shared pins (ultralytics, torch, onnx, onnxruntime, transformers, ...) are the model export's
 # (requirements-model-export.txt), so a trained model is exported exactly like a downloaded one.

@@ -7,7 +7,8 @@
 #   every platform. Hashes are pinned in the binary; this catches moved or deleted files before users
 #   hit them. Issue "Catalog URL check failed" (a comment per failed run).
 # - upstream: pins with a newer upstream release that is due (catalog runtimes, uv, the Python
-#   export/train pins; at least two weeks old, on Python 3.11, within the other pins' requirements),
+#   export/train pins; at least two weeks old, on Python 3.11, within the other pins' requirements,
+#   torch / torchvision with a wheel on every CUDA lane of the train locks),
 #   with releases not due yet and the pins held back on purpose (scripts/ci/check_deps.py HOLDS)
 #   listed apart. Issue "Upstream updates available", kept current; closed once no pin is due.
 # - advisories: RustSec advisories against Cargo.lock on main (CI runs them only on push / PR, so an

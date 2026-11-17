@@ -144,7 +144,8 @@ benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on
   `torch.cuda.get_arch_list()`; YOLO26n and RF-DETR nano ran end to end); the Linux and `cu130` locks
   have not been installed on a machine yet.
 - Contents: torch 2.14.1 / torchvision 0.29.1 (2.14 is the last PyTorch with CUDA 12.6 builds and Pascal
-  kernels: 2.15 ships `cu132` / `cu134` only, Turing and newer), ultralytics 8.4.197, transformers 5.22.1, accelerate
+  kernels: 2.15 ships `cu132` / `cu134` only, Turing and newer; the weekly upstream check reports a
+  torch / torchvision release only once it has wheels on `cu126` and `cu130`), ultralytics 8.4.197, transformers 5.22.1, accelerate
   1.15.0, rfdetr 1.11.2 with its training extra except `roboflow` (only for uploading to Roboflow; it
   pins a second OpenCV build that would overwrite Ultralytics' `cv2`), onnx, onnxruntime, onnxslim;
   for the footage import and auto-labelling (below) PyAV 18.1.0 (`av`; 19 needs Python 3.12) and yt-dlp 2026.10.26.
