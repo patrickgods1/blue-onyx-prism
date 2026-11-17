@@ -107,3 +107,11 @@ is not run), uninstalls, checks cleanup. Four rounds: `REMOVEDATA=1` leaves noth
 uninstall keeps only the data folder, a seeded dataset file included; over that data with an older version's ACL and a
 token, both folders' DACLs are corrected, the data is intact and `KEEPDATA=1` keeps it; a last install and `REMOVEDATA=1`
 remove everything, the protected token folder too.
+
+Every program the smoke and upgrade tests start (msiexec, icacls, the CLI) runs through `bounded.ps1`'s `Invoke-Bounded`:
+stdin closed and a time limit (msiexec 5 min); a hang prints `Show-Diagnostics` (service and Windows Installer state, whether
+an installation holds the `_MSIExecute` mutex, processes, free memory, who holds the ports, the msiexec log and the service log
+tails, recent events), kills the process tree and fails naming what hung. `packaging/smoke-test-installers.sh` also runs the
+whole smoke test under `timeout` (`SMOKE_TEST_TIMEOUT`, default 20 min, under the step's 25), then `diagnose.ps1` into
+`dist/smoke-diagnostics.log`. None of this helps when the runner itself dies ("The hosted runner lost communication with
+the server": no step log, no artifacts), which is how the stuck Windows smoke tests of 2026-11-09, -14 and -16 ended.

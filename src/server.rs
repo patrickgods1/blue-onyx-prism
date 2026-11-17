@@ -2027,11 +2027,12 @@ mod tests {
             ("POST", "/config"),
             ("GET", "/v1/fs/browse"),
             ("POST", "/v1/resources/export"),
-            ("POST", "/config/restart"),
             ("GET", "/"),
             ("GET", "/stats.json"),
             ("GET", "/prometheus"),
             ("GET", "/v1/devices"),
+            // Last: signed in, it really restarts (the token is cancelled `RESTART_DELAY` later).
+            ("POST", "/config/restart"),
         ];
         for (method, uri) in admin {
             for peer in [REMOTE, LOCAL, "[::1]:50000"] {
@@ -2061,6 +2062,12 @@ mod tests {
                 }
                 assert_eq!(h[header::CACHE_CONTROL], "no-store");
             }
+            if uri == "/config/restart" {
+                // A refused restart schedules nothing: past the delay a scheduled one waits, the
+                // token is still whole. (Checked before the signed-in call, which does restart.)
+                tokio::time::sleep(config_page::RESTART_DELAY * 2).await;
+                assert!(!state.restart.is_cancelled(), "a refused restart restarted");
+            }
             // Signed in: the route, from another machine too.
             let (s, _, b) = call(&state, from(REMOTE, method, uri, true)).await;
             assert!(
@@ -2069,7 +2076,13 @@ mod tests {
                 String::from_utf8_lossy(&b)
             );
         }
-        assert!(!state.restart.is_cancelled());
+        // The signed-in restart did restart.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            state.restart.cancelled(),
+        )
+        .await
+        .expect("the signed-in POST /config/restart cancels the generation's token");
 
         // Blue Iris's routes, the readiness probe and static files stay open to remote clients.
         for uri in [

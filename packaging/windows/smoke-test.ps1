@@ -26,6 +26,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Invoke-Bounded, Show-Diagnostics: every program this test starts has a time limit, and a hang or
+# a failed check prints the machine's state before the test fails.
+. (Join-Path $PSScriptRoot "bounded.ps1")
 
 # The HTTP status of a failed Invoke-WebRequest, 0 when there was none (refused, timed out,
 # connection closed). Under StrictMode a missing .Response property would throw instead.
@@ -48,34 +51,29 @@ $SeedText = "reviewed labels"
 $InstallLog = Join-Path (Get-Location) "msi-install.log"
 $UninstallLog = Join-Path (Get-Location) "msi-uninstall.log"
 
-function Show-LogTail([string]$Path) {
-    if (Test-Path $Path) {
-        Write-Host "---- tail of $Path ----"
-        Get-Content $Path -Tail 80 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-        Write-Host "---- end ----"
-    }
-}
-
 function Fail([string]$Message, [string[]]$Logs = @()) {
     Write-Host "SMOKE TEST FAILED: $Message"
-    foreach ($l in $Logs) { Show-LogTail $l }
-    Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "BlueOnyxPrism" } -MaxEvents 20 -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Host "[event] $($_.TimeCreated) $($_.Message)" }
+    Show-Diagnostics -Logs $Logs -Service $Service -Ports @($Port, $HttpsPort) -DataDir $DataDir
     exit 1
 }
 
 # Every call passes /norestart: without it a silent msiexec that finds a file in use may restart the
-# machine on its own, which ends the job with no log.
-function Run-Msiexec([string[]]$MsiArgs) {
-    $p = Start-Process -FilePath msiexec.exe -ArgumentList $MsiArgs -Wait -PassThru
-    return $p.ExitCode
+# machine on its own, which ends the job with no log. A normal install or uninstall takes seconds;
+# one still running after $MsiexecSeconds is a hang (Windows Installer busy with another
+# installation, a custom action or a service that does not return): diagnostics, then it is
+# killed and the test fails naming it, well before the step's timeout.
+$MsiexecSeconds = 300
+function Run-Msiexec([string]$What, [string[]]$MsiArgs, [string]$Log) {
+    $r = Invoke-Bounded -What "msiexec $What" -File "msiexec.exe" -Arguments $MsiArgs -Seconds $MsiexecSeconds -Logs @($Log)
+    if ($r.TimedOut) { Fail "msiexec $What did not finish within $MsiexecSeconds s (killed; its log and the machine's state are above)" @($Log) }
+    return [int]$r.ExitCode
 }
 
 # 3010 is success with a restart held back: a file was in use. Say so, with the log.
 function Note-RebootWanted([int]$Code, [string]$Log) {
     if ($Code -eq 3010) {
         Write-Host "msiexec exited with 3010: it wanted a restart, so a file was in use."
-        Show-LogTail $Log
+        Show-FileTail $Log
     }
 }
 
@@ -97,8 +95,10 @@ $BuiltinUsers = Get-AccountName "S-1-5-32-545"
 
 # The ACEs of $Path as icacls prints them: `<account>:(OI)(CI)(RX)`, the first one after the path.
 function Get-Aces([string]$Path, [string[]]$Logs) {
-    $out = @(& icacls.exe $Path)
-    if ($LASTEXITCODE -ne 0) { Fail "icacls '$Path' exited with $LASTEXITCODE`: $out" $Logs }
+    $r = Invoke-Bounded -What "icacls '$Path'" -File "icacls.exe" -Arguments @($Path) -Seconds 60 -Capture -Logs $Logs
+    if ($r.TimedOut) { Fail "icacls '$Path' did not finish within 60 s (killed)" $Logs }
+    $out = @($r.Output)
+    if ($r.ExitCode -ne 0) { Fail "icacls '$Path' exited with $($r.ExitCode)`: $($out + $r.Errors)" $Logs }
     Write-Host ($out -join "`n")
     $aces = @()
     foreach ($line in $out) {
@@ -191,8 +191,9 @@ function Assert-Hardening([string]$Log) {
 # What an older version left: the data folder inherits from ProgramData, Users can write, and a
 # saved token sits in a folder with no ACL of its own.
 function Set-OlderVersionData {
-    $out = @(& icacls.exe $DataDir /inheritance:e /grant "*S-1-5-32-545:(OI)(CI)M" /Q)
-    if ($LASTEXITCODE -ne 0) { Fail "icacls '$DataDir' exited with $LASTEXITCODE`: $out" }
+    $r = Invoke-Bounded -What "icacls '$DataDir' (older ACL)" -File "icacls.exe" -Arguments @($DataDir, "/inheritance:e", "/grant", "*S-1-5-32-545:(OI)(CI)M", "/Q") -Seconds 60 -Capture
+    if ($r.TimedOut) { Fail "icacls '$DataDir' did not finish within 60 s (killed)" }
+    if ($r.ExitCode -ne 0) { Fail "icacls '$DataDir' exited with $($r.ExitCode)`: $($r.Output + $r.Errors)" }
     New-Item -ItemType Directory -Force -Path $TokenDir | Out-Null
     Set-Content -Path (Join-Path $TokenDir "token") -Value "not-a-real-token"
 }
@@ -253,7 +254,7 @@ function Assert-VcRuntime([int]$ProcessId, [string]$Log) {
 # The status and the resolved Location of a browser GET of $Url, redirects not followed and the
 # certificate not checked (the service's own self-signed one).
 function Get-Redirect([string]$Url) {
-    $out = & curl.exe -s -k -o NUL -H "Accept: text/html" --max-time 10 -w '%{http_code} %{redirect_url}' $Url
+    $out = & curl.exe -s -k -o NUL -H "Accept: text/html" --connect-timeout 5 --max-time 10 -w '%{http_code} %{redirect_url}' $Url
     $parts = "$out".Split(' ', 2)
     [pscustomobject]@{ Code = [int]$parts[0]; Location = $(if ($parts.Count -gt 1) { $parts[1].Trim() } else { "" }) }
 }
@@ -301,19 +302,21 @@ function Assert-WebUi([string]$Log) {
         $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value })
     if ($codeSids -contains "S-1-5-32-545") { Fail "$codeFile has an entry for Users (S-1-5-32-545)" @($Log) }
     $cli = Join-Path $ProgDir "blue-onyx-prism.exe"
-    $out = @(& $cli --config $Config setup-code)
-    if ($LASTEXITCODE -ne 0) { Fail "setup-code exited with $LASTEXITCODE" @($Log) }
+    $r = Invoke-Bounded -What "blue-onyx-prism setup-code" -File $cli -Arguments @("--config", $Config, "setup-code") -Seconds 120 -Capture -Logs @($Log)
+    if ($r.TimedOut) { Fail "setup-code did not finish within 120 s (killed)" @($Log) }
+    if ($r.ExitCode -ne 0) { Fail "setup-code exited with $($r.ExitCode)`: $($r.Errors -join ' ')" @($Log) }
+    $out = @($r.Output)
     if (-not (($out -join "`n") -match '(?m)^Setup code: [A-Z2-7-]{20,}')) { Fail "setup-code printed no setup code" @($Log) }
     Write-Host "setup-code prints a code; $codeFile has no entry for Users."
 }
 
 function Install-AndCheck([string]$Log) {
     Write-Host "Installing $Msi ..."
-    $rc = Run-Msiexec @("/i", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"", "PORT=$Port", "HTTPS_PORT=$HttpsPort")
-    if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /i exited with $rc" @($Log) }
+    $rc = Run-Msiexec "/i" @("/i", $Msi, "/qn", "/norestart", "/l*v", $Log, "PORT=$Port", "HTTPS_PORT=$HttpsPort") $Log
+    if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /i exited with $rc $(Get-MsiexecMeaning $rc)" @($Log) }
     Note-RebootWanted $rc $Log
 
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$Service'"
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$Service'" -OperationTimeoutSec 30
     if (-not $svc) { Fail "service $Service does not exist after install" @($Log) }
     if ($svc.StartName -ne "NT AUTHORITY\LocalService") { Fail "service runs as '$($svc.StartName)', expected NT AUTHORITY\LocalService" @($Log) }
     Write-Host "Service registered: $($svc.PathName) as $($svc.StartName)"
@@ -322,7 +325,7 @@ function Install-AndCheck([string]$Log) {
     while ((Get-Service $Service).Status -ne "Running" -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
     if ((Get-Service $Service).Status -ne "Running") { Fail "service is $((Get-Service $Service).Status), expected Running within 60 s" @($Log) }
     Write-Host "Service is Running."
-    $pidRunning = (Get-CimInstance Win32_Service -Filter "Name='$Service'").ProcessId
+    $pidRunning = (Get-CimInstance Win32_Service -Filter "Name='$Service'" -OperationTimeoutSec 30).ProcessId
 
     # /v1/status answers 200 (ready) or 503 (models still initializing/downloading); only the listener matters.
     $url = "http://127.0.0.1:$Port/v1/status"
@@ -352,7 +355,7 @@ function Install-AndCheck([string]$Log) {
         }
     }
     if ($code -ne 200) { Fail "$url not ready (200) within 6 min (last: $code)" @($Log) }
-    $pidNow = (Get-CimInstance Win32_Service -Filter "Name='$Service'").ProcessId
+    $pidNow = (Get-CimInstance Win32_Service -Filter "Name='$Service'" -OperationTimeoutSec 30).ProcessId
     if ($pidNow -ne $pidRunning) { Fail "the service process changed ($pidRunning -> $pidNow): it was restarted" @($Log) }
     Write-Host "Service ready, same process."
     Assert-VcRuntime $pidNow $Log
@@ -400,8 +403,8 @@ function Assert-DataKept([string]$Log) {
 # $Properties: what is passed to msiexec. Only REMOVEDATA=1 may delete the data folder.
 function Uninstall-AndCheck([string]$Log, [string[]]$Properties = @()) {
     Write-Host "Uninstalling ($($Properties -join ' ')) ..."
-    $rc = Run-Msiexec (@("/x", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"") + $Properties)
-    if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /x exited with $rc" @($Log) }
+    $rc = Run-Msiexec "/x $($Properties -join ' ')" (@("/x", $Msi, "/qn", "/norestart", "/l*v", $Log) + $Properties) $Log
+    if ($rc -ne 0 -and $rc -ne 3010) { Fail "msiexec /x exited with $rc $(Get-MsiexecMeaning $rc)" @($Log) }
     Note-RebootWanted $rc $Log
 
     $deadline = (Get-Date).AddSeconds(30)

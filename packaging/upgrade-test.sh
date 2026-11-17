@@ -92,8 +92,10 @@ case "$(uname -s)" in
       pwsh -NoProfile -File packaging/windows/build-msi.ps1 -Version "$STAND_IN" -BinDir "$(winpath "$BIN")" \
         -OutFile "$(winpath "$NEW")"
     fi
-    pwsh -NoProfile -File packaging/windows/upgrade-test.ps1 -OldMsi "$(winpath "$OLD")" -NewMsi "$(winpath "$NEW")" \
-      -NewServiceExe "$(winpath "$BIN/blue-onyx-prism-service.exe")" -LogDir "$(winpath "$DIST")"
+    # -NonInteractive and stdin from /dev/null: nothing waits on a prompt or the runner's stdin.
+    pwsh -NoProfile -NonInteractive -File packaging/windows/upgrade-test.ps1 -OldMsi "$(winpath "$OLD")" \
+      -NewMsi "$(winpath "$NEW")" -NewServiceExe "$(winpath "$BIN/blue-onyx-prism-service.exe")" \
+      -LogDir "$(winpath "$DIST")" </dev/null
     ;;
   Linux)
     packaging/upgrade-test-unix.sh "$OLD" "$(one "$DIST/*.deb")" "$BIN/blue-onyx-prism"

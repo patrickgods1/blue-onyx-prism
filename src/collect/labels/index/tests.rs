@@ -203,6 +203,17 @@ pub(super) fn clock_ahead(dir: &Path) -> Option<Duration> {
     with(dir, |f| f.ahead).flatten()
 }
 
+/// Make `index` idle now, as if its last query were longer ago than its `idle` time, and wake its
+/// thread. The flag is set under the hub's lock, which the thread holds from its idle check until
+/// it waits on `CHANGED`, so the wake cannot fall between the two.
+pub(super) fn make_idle(index: &super::Index) {
+    {
+        let _hub = super::HUB.lock_recover();
+        index.idle_now.store(true, Ordering::Release);
+    }
+    super::CHANGED.notify_all();
+}
+
 /// Frames the walks of `dir` read so far.
 pub(super) fn frames_walked(dir: &Path) -> u64 {
     with(dir, |f| f.frames.load(Ordering::Acquire)).unwrap_or(0)
@@ -2178,15 +2189,16 @@ mod cases {
     fn an_idle_index_goes_with_its_thread() {
         let dir = Dir::new();
         generate(&dir, 19, 10, false);
-        // Longer than a build of these 20 frames takes while the other tests load the machine: an
-        // index whose build outlasts it is idle before its first answer, which then walks.
-        set_timing(&dir, |t| t.idle = Duration::from_secs(1));
         let f = all_any();
         from_index(&dir, &f, None);
         let first = index_of(&dir).unwrap();
-        let until = Instant::now() + Duration::from_secs(10);
+        // Idle by the flag, not by a short `idle` time: the idle clock starts at the query, before
+        // the build it waits for, so on a loaded machine a build (or the next answer) could outlast
+        // any short time and the index went before the test looked at it.
+        make_idle(&first);
+        let until = Instant::now() + Duration::from_secs(30);
         while index_of(&dir).is_some() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(5));
         }
         assert!(index_of(&dir).is_none(), "dropped when idle");
         assert!(first.cancelled());

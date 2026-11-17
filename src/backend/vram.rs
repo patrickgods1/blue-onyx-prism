@@ -214,6 +214,10 @@ pub fn adapter_for_cuda(hw: &HardwareInfo, ordinal: u32) -> Option<u32> {
 
 /// Every adapter with a reading, at most [`MAX_AGE`] old.
 pub fn readings() -> Vec<VramReading> {
+    #[cfg(test)]
+    if let Some(cards) = test_cards::cards() {
+        return cards.into_iter().map(|c| c.reading).collect();
+    }
     static CACHE: Mutex<Option<(Instant, Vec<VramReading>)>> = Mutex::new(None);
     let mut c = CACHE
         .lock()
@@ -235,6 +239,13 @@ pub fn reading(index: u32) -> Option<VramReading> {
 
 /// The reading of adapter `index` taken now (the load line's before and after).
 pub fn reading_now(index: u32) -> Option<VramReading> {
+    #[cfg(test)]
+    if let Some(cards) = test_cards::cards() {
+        return cards
+            .into_iter()
+            .map(|c| c.reading)
+            .find(|r| r.index == index);
+    }
     let hw = detect::hardware();
     let ids = detect::adapter_ids();
     let at = hw.gpus.iter().position(|g| g.index == index)?;
@@ -709,6 +720,13 @@ pub fn job_warning(need: &JobNeed, r: Option<&VramReading>, holders: &[Holder]) 
 
 /// [`job_warning`] for a job on CUDA device `ordinal`, against the card as it is now.
 pub fn check_cuda_job(ordinal: u32, need: &JobNeed) -> Option<String> {
+    #[cfg(test)]
+    if let Some(cards) = test_cards::cards() {
+        let card = cards
+            .into_iter()
+            .find(|c| c.cuda_ordinal == Some(ordinal))?;
+        return job_warning(need, Some(&card.reading), &card.holders);
+    }
     let adapter = adapter_for_cuda(detect::hardware(), ordinal)?;
     job_warning(need, reading_now(adapter).as_ref(), &holders_on(adapter))
 }
@@ -726,6 +744,61 @@ pub fn set_ort_session_limit_mb(mb: Option<u64>) {
 /// [`set_ort_session_limit_mb`]'s value.
 pub fn ort_session_limit_mb() -> Option<u64> {
     Some(ORT_SESSION_LIMIT_MB.load(Ordering::Relaxed)).filter(|&mb| mb > 0)
+}
+
+/// The cards a test's thread sees. A unit test must not depend on what other programs hold on
+/// this machine's GPU (a job's "may run out of GPU memory" warning did), so under `cfg(test)`
+/// [`readings`], [`reading_now`] and [`check_cuda_job`] read the cards set here: none unless the
+/// thread called [`test_cards::set`] (no reading, so no warning), and the machine's own only after
+/// [`test_cards::live`].
+#[cfg(test)]
+pub(crate) mod test_cards {
+    use super::{Holder, VramReading};
+    use std::cell::RefCell;
+
+    /// A card as [`super::check_cuda_job`] and the readings see it.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Card {
+        /// Its CUDA device number, None for a card CUDA does not see.
+        pub(crate) cuda_ordinal: Option<u32>,
+        pub(crate) reading: VramReading,
+        /// The models of this service holding memory on it.
+        pub(crate) holders: Vec<Holder>,
+    }
+
+    thread_local! {
+        /// None: the machine's own cards ([`live`]).
+        static CARDS: RefCell<Option<Vec<Card>>> = const { RefCell::new(Some(Vec::new())) };
+    }
+
+    /// Until the guard drops, this thread sees `cards` (and nothing else).
+    #[must_use = "the cards go back to none when this is dropped"]
+    pub(crate) fn set(cards: Vec<Card>) -> Reset {
+        CARDS.with(|c| *c.borrow_mut() = Some(cards));
+        Reset
+    }
+
+    /// Until the guard drops, this thread reads the machine's own cards.
+    #[must_use = "the cards go back to none when this is dropped"]
+    pub(crate) fn live() -> Reset {
+        CARDS.with(|c| *c.borrow_mut() = None);
+        Reset
+    }
+
+    /// What this thread sees: Some(cards), or None for the machine's own.
+    pub(super) fn cards() -> Option<Vec<Card>> {
+        CARDS.with(|c| c.borrow().clone())
+    }
+
+    /// Back to no card.
+    #[derive(Debug)]
+    pub(crate) struct Reset;
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CARDS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1009,6 +1082,32 @@ mod tests {
         assert!(holders_on(905).is_empty());
     }
 
+    /// Tests see no card unless they set one, whatever this machine's GPU holds.
+    #[test]
+    fn tests_read_only_the_cards_they_set() {
+        let need = JobNeed {
+            what: "this test run".into(),
+            need_mb: 4096,
+            detail: "a test".into(),
+            smaller: "less".into(),
+        };
+        assert!(readings().is_empty());
+        assert_eq!(reading_now(0), None);
+        assert_eq!(check_cuda_job(0, &need), None);
+        let short = test_cards::set(vec![test_cards::Card {
+            cuda_ordinal: Some(0),
+            reading: reading(1024, 8192, MemoryKind::Dedicated),
+            holders: vec![],
+        }]);
+        assert_eq!(readings().len(), 1);
+        assert_eq!(reading_now(0).map(|r| r.free_mb), Some(1024));
+        let w = check_cuda_job(0, &need).expect("short of memory");
+        assert!(w.contains("may run out of GPU memory"), "{w}");
+        assert_eq!(check_cuda_job(1, &need), None, "another CUDA device");
+        drop(short);
+        assert_eq!(check_cuda_job(0, &need), None, "back to no card");
+    }
+
     #[test]
     fn session_limit_round_trips() {
         set_ort_session_limit_mb(Some(1536));
@@ -1021,6 +1120,7 @@ mod tests {
 
     #[test]
     fn readings_on_this_machine_never_panic_and_are_consistent() {
+        let _live = test_cards::live();
         let all = readings();
         for r in &all {
             assert!(r.free_mb <= r.total_mb, "{r:?}");
