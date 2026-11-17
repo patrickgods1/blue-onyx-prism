@@ -53,7 +53,7 @@ Bumping a pin:
 2. Update `version` in `Cargo.toml` (and `Cargo.lock`) and merge to `main`. The tag must equal that
    version, or the release workflow fails.
 3. Manual NVIDIA check (CUDA/TensorRT cannot run on hosted runners). The pinned CUDA build of ONNX
-   Runtime (1.31.0, `catalog::ORT_CUDA_BUILDS`) has kernels for compute capability 6.1, 7.5, 8.6, 8.9 and
+   Runtime (1.31.1, `catalog::ORT_CUDA_BUILDS`) has kernels for compute capability 6.1, 7.5, 8.6, 8.9 and
    12.0 on Windows (6.0-12.0 without 10.0 on Linux), so the GTX 1070 Ti (Pascal, 6.1) is the Windows
    check; TensorRT needs Turing or newer. When bumping the pin, re-check the shipped provider library's
    fatbinaries (see the catalog comments) and that the cuDNN pin stays below 9.11 while Pascal is listed.

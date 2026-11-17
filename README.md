@@ -43,7 +43,7 @@ fails, and always ends on the CPU. Ranking: discrete GPUs first (larger VRAM fir
 runtimes in order: NVIDIA `ort:cuda`, `ort:tensorrt`, then `ort:directml` (Windows); Intel Arc
 `openvino:gpu.N`, then `ort:directml`; AMD/other `ort:directml` (Windows). Then integrated GPUs (Intel
 via OpenVINO; DirectML on Windows for the others), Apple silicon (CoreML), and the CPU (`openvino:cpu`,
-else `ort:cpu`). An NVIDIA GPU the ONNX Runtime CUDA build has no kernels for skips CUDA: the 1.31.0 CUDA 12
+else `ort:cpu`). An NVIDIA GPU the ONNX Runtime CUDA build has no kernels for skips CUDA: the 1.31.1 CUDA 12
 build covers compute capability 6.1 (GTX 10-series), 7.5, 8.6, 8.9 and 12.0 on Windows, and 6.0 through
 12.0 (10.0 excepted) on Linux; `list-devices` and the device dropdown show the reason, and an installed
 older build that lacks the kernels is offered as an update. TensorRT 10 needs 7.5+ (Turing or newer), and
@@ -58,7 +58,7 @@ the models are (re)loaded. `list-devices` marks such a model's order "(benchmark
 | OS | GPU | `auto` picks | Setup | Notes |
 |---|---|---|---|---|
 | Windows | Intel iGPU/Arc | `openvino:gpu` | `setup-openvino` | Primary target. `ort:directml` is selectable. |
-| Windows | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12.8 and cuDNN 9.10 come from `nvidia-cuda-libs` (1.9 GB, `allow_large_downloads`) or your own install. Without them, or with the DirectML flavor loaded, `auto` is `ort:directml`, ahead of an Intel iGPU. GTX 10-series (Pascal, 6.1) cards run CUDA since the 1.31.0 build; TensorRT needs Turing or newer. |
+| Windows | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12.8 and cuDNN 9.10 come from `nvidia-cuda-libs` (1.9 GB, `allow_large_downloads`) or your own install. Without them, or with the DirectML flavor loaded, `auto` is `ort:directml`, ahead of an Intel iGPU. GTX 10-series (Pascal, 6.1) cards run CUDA with the 1.31 builds; TensorRT needs Turing or newer. |
 | Windows | AMD / other DX12 | `ort:directml` | `setup-onnxruntime --flavor directml` | |
 | Linux | Intel | `openvino:gpu` | `setup-openvino` | `intel-opencl-icd`, `render` group. |
 | Linux | NVIDIA | `ort:cuda` | `setup-onnxruntime --flavor cuda` | CUDA 12.8 + cuDNN 9.10 from `nvidia-cuda-libs` or your own install; Pascal (6.0) and newer. |
@@ -155,7 +155,7 @@ blue-onyx-prism fetch --all-for-platform  # everything for this OS/arch (large o
   choosing one and saving starts the download and switches when it is installed.
 - **Versions:** the `cpu`, `directml` and `coreml` flavors are ONNX Runtime 1.24.4, the last release
   Microsoft publishes with the DirectML provider (the 1.25+ Windows packages have none; DirectML itself is
-  in sustained engineering). The `cuda` flavor is 1.31.0 (the `gpu_cuda12` archive), whose Windows build
+  in sustained engineering). The `cuda` flavor is 1.31.1 (the `gpu_cuda12` archive), whose Windows build
   has Pascal kernels again. A process loads one flavor, so the versions need not match; an installed
   flavor older than the catalog's shows *update to ...* on the Resources card and `list-resources`.
 - **NVIDIA CUDA libraries (opt-in):** `ort:cuda` needs CUDA 12.8 and cuDNN 9. If they are not

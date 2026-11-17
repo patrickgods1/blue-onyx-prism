@@ -476,7 +476,7 @@ fn pascal(index: u32) -> GpuAdapter {
 
 #[test]
 fn pascal_gpu_plans_cuda_on_windows() {
-    // GTX 1070 Ti + UHD 630: the catalog's 1.31.0 CUDA build has Pascal kernels, so with large
+    // GTX 1070 Ti + UHD 630: the catalog's 1.31.1 CUDA build has Pascal kernels, so with large
     // downloads allowed the NVIDIA GPU runs CUDA; TensorRT 10 never does (7.5+).
     let mut cfg = ipcam();
     cfg.allow_large_downloads = true;
@@ -506,7 +506,7 @@ fn pascal_gpu_plans_cuda_on_windows() {
         .unwrap();
     assert!(
         cuda.summary().starts_with(
-            "will download ONNX Runtime CUDA/TensorRT (CUDA 12) 1.31.0 (393 MB), NVIDIA CUDA 12 \
+            "will download ONNX Runtime CUDA/TensorRT (CUDA 12) 1.31.1 (393 MB), NVIDIA CUDA 12 \
              + cuDNN 9.10 libraries"
         ),
         "{}",
@@ -604,7 +604,7 @@ fn outdated_cuda_flavor_is_updated() {
     assert!(n.after_restart);
     assert!(n.reason.ends_with("(update from 1.24.4)"), "{}", n.reason);
     assert!(inst.outdated(n.resource));
-    assert_eq!(n.resource.version, "1.31.0");
+    assert_eq!(n.resource.version, "1.31.1");
     // The current version installed: nothing to download.
     let current = inst
         .clone()
