@@ -46,7 +46,8 @@
 //!    each through a temporary file and a rename. System32 is only read.
 //! 2. **Minimal environment** (RS-07): the child starts from `env_clear()`; it inherits only
 //!    `PATH`, `HOME`/`USERPROFILE`, `SystemRoot` and the other Windows basics (`COMSPEC`,
-//!    `PATHEXT`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMDATA`), `TEMP`/`TMP`/`TMPDIR`, `LANG`/`LC_*`,
+//!    `PATHEXT`, `APPDATA`, `LOCALAPPDATA`, `PROGRAMDATA`, `PROCESSOR_ARCHITECTURE`/`W6432`, which
+//!    Python's `platform.machine()` reads), `TEMP`/`TMP`/`TMPDIR`, `LANG`/`LC_*`,
 //!    the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, any case) and
 //!    `SSL_CERT_FILE`/`SSL_CERT_DIR` when the operator set them (a private CA for that proxy);
 //!    see `inherited`. Everything else (`PYTHON*`, `UV_*`, `PIP_*`, `CONDA_*`, `LD_*`,

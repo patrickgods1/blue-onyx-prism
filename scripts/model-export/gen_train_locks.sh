@@ -24,7 +24,7 @@
 # (without roboflow), so uv never sees its ranges (torchmetrics, hotcoco, vernier, ...).
 set -eu
 UV="$1"
-EXCLUDE_NEWER="${2:-2026-10-24T00:00:00Z}"
+EXCLUDE_NEWER="${2:-2026-11-02T00:00:00Z}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 IN="$DIR/../requirements-model-train.txt"
 OUT="$DIR/locks"

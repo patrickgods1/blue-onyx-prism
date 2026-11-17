@@ -440,12 +440,12 @@ impl ExportRecipe {
 }
 
 /// Ultralytics package version the export environment pins (`requirements-model-export.txt`).
-pub const ULTRALYTICS_VERSION: &str = "8.4.184";
+pub const ULTRALYTICS_VERSION: &str = "8.4.197";
 /// Ultralytics `assets` release with the YOLO weights (v8 to 26 are all in it).
 pub const ULTRALYTICS_ASSETS_RELEASE: &str = "v8.4.0";
 /// Version recorded for an Ultralytics export: exporter version + weights release. Exports made by
 /// an earlier exporter stay valid ([`EARLIER_EXPORTERS`]).
-pub const ULTRALYTICS_EXPORT_VERSION: &str = "ultralytics-8.4.184+assets-v8.4.0";
+pub const ULTRALYTICS_EXPORT_VERSION: &str = "ultralytics-8.4.197+assets-v8.4.0";
 /// License of the Ultralytics weights and exporter.
 pub(crate) const ULTRALYTICS_LICENSE: &str = "AGPL-3.0";
 const ULTRALYTICS_NOTICE: &str = "Ultralytics YOLO weights and the Ultralytics exporter are \
@@ -453,7 +453,7 @@ const ULTRALYTICS_NOTICE: &str = "Ultralytics YOLO weights and the Ultralytics e
     official weights (Ultralytics' GitHub release; MegaDetector from Microsoft's Zenodo record, \
     SHA-256 pinned) and runs Ultralytics' exporter on this machine in its own Python environment.";
 /// transformers version of the export environment (RF-DETR).
-pub const TRANSFORMERS_VERSION: &str = "5.20.2";
+pub const TRANSFORMERS_VERSION: &str = "5.22.1";
 /// `Roboflow/rf-detr-large` commit of the RF-DETR L weights.
 pub const RFDETR_LARGE_REVISION: &str = "f62f7dd5252b61097cbace33886045816dadbde9";
 const RFDETR_NOTICE: &str = "RF-DETR (Apache-2.0) is published as safetensors only: on your \
@@ -474,7 +474,7 @@ const DEIMV2_NOTICE: &str = "DEIMv2 is exported on this machine from Intellindus
     License for the backbone.";
 
 /// Version recorded for a MegaDetector v6 Ultralytics export.
-pub(crate) const MDV6_ULTRALYTICS_VERSION: &str = "ultralytics-8.4.184+zenodo-15398270";
+pub(crate) const MDV6_ULTRALYTICS_VERSION: &str = "ultralytics-8.4.197+zenodo-15398270";
 
 /// Exporter bumps that keep earlier exports valid: `(current prefix, earlier prefix)` of an export
 /// version. An export's manifest records the exporter it was made with, and an export of another
@@ -484,8 +484,10 @@ pub(crate) const MDV6_ULTRALYTICS_VERSION: &str = "ultralytics-8.4.184+zenodo-15
 /// export writes (opset, graph, outputs) must not be listed: its earlier exports then need a new
 /// export.
 pub const EARLIER_EXPORTERS: &[(&str, &str)] = &[
-    ("ultralytics-8.4.184+", "ultralytics-8.4.163+"),
-    ("transformers-5.20.2+", "transformers-5.17.0+"),
+    ("ultralytics-8.4.197+", "ultralytics-8.4.184+"),
+    ("ultralytics-8.4.197+", "ultralytics-8.4.163+"),
+    ("transformers-5.22.1+", "transformers-5.20.2+"),
+    ("transformers-5.22.1+", "transformers-5.17.0+"),
 ];
 
 /// An export recorded as `found` is an export of a resource of version `current`: the same
@@ -635,7 +637,7 @@ macro_rules! exdark_rfdetr {
         Resource {
             id: concat!("model:", $name),
             kind: ResourceKind::ExportModel,
-            version: concat!("transformers-5.20.2+", $name, "-", $rev),
+            version: concat!("transformers-5.22.1+", $name, "-", $rev),
             platform: None,
             parts: &[
                 hf_part!(
@@ -967,7 +969,7 @@ pub static EXPORT_MODELS: &[Resource] = &[
     Resource {
         id: "model:rfdetr-large",
         kind: ResourceKind::ExportModel,
-        version: "transformers-5.20.2+rf-detr-large-f62f7dd5252b61097cbace33886045816dadbde9",
+        version: "transformers-5.22.1+rf-detr-large-f62f7dd5252b61097cbace33886045816dadbde9",
         platform: None,
         parts: &[
             hf_part!(
