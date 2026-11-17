@@ -290,12 +290,15 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=`
+/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=&then=`
 /// (`refine_kind` only with `auto=refine`; `balance` = `class,scene,camera` or some of them puts the
 /// least reviewed first; [`Filters::from_query`]): the first frame matching the filters in the
 /// queue's order (after `after`, the frame shown now, when given; past the last one the first
-/// again with `wrapped`), its position, the counts and the cameras and classes for the filter
-/// lists. The order ([`next_order`]): Recommended by default (one frame per event first, then the
+/// again with `wrapped`). When `after` is not listed (a save just took it out of the filters),
+/// `then`, the frame that was next after it, is the answer itself when it is listed, so the
+/// position stays where the reviewer was; `then` alone gives the place of the frame on screen
+/// ([`labels::queue::next_after`]). With the frame: its position, the counts and the cameras and
+/// classes for the filter lists. The order ([`next_order`]): Recommended by default (one frame per event first, then the
 /// balance in bands, then the most uncertain, [`labels::recommend`]); `order=uncertain` = the most
 /// uncertain first; an `auto=` or `balance=` filter keeps its own order, whatever `order` says.
 /// Only this route reads `order`: bulk actions and auto-label runs keep the uncertainty order. A big
@@ -312,8 +315,9 @@ pub(super) async fn next(
         let (dir, classes, _) = context(&state);
         filters.wanted = Some((classes, hidden(&state)));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
-        let found = labels::index::answer(&dir, &filters, after)
-            .unwrap_or_else(|| labels::index::Answer::walk(&dir, &filters, after));
+        let then = q.get("then").map(String::as_str).filter(|t| !t.is_empty());
+        let found = labels::index::answer(&dir, &filters, after, then)
+            .unwrap_or_else(|| labels::index::Answer::walk(&dir, &filters, after, then));
         let mut answer = serde_json::json!(found);
         if let Some(fields) = answer.as_object_mut() {
             fields.insert("success".into(), true.into());
@@ -3930,7 +3934,8 @@ mod tests {
         let (dir, classes, _) = context(&d.state);
         f.wanted = Some((classes, hidden(&d.state)));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
-        let mut v = serde_json::json!(labels::index::Answer::walk(&dir, &f, after));
+        let then = q.get("then").map(String::as_str).filter(|t| !t.is_empty());
+        let mut v = serde_json::json!(labels::index::Answer::walk(&dir, &f, after, then));
         v["success"] = true.into();
         v
     }
@@ -3963,7 +3968,8 @@ mod tests {
         &[("balance", "class"), ("order", "recommended")],
     ];
 
-    /// Every view of [`VIEWS`], and after its first frame, answered as the walk answers it.
+    /// Every view of [`VIEWS`], after its first frame, and on its second frame (`then`, after a
+    /// frame not listed), answered as the walk answers it.
     async fn same_as_the_walk(d: &Ds, when: &str) {
         for view in VIEWS {
             let got = next_of(d, view).await;
@@ -3976,7 +3982,90 @@ mod tests {
                     "{when}, {after:?}"
                 );
             }
+            if let Some(second) = got["upcoming"][0].as_str() {
+                let then = [
+                    view,
+                    &[("after", "ir/gone/2026-01-01/x.jpg"), ("then", second)],
+                ]
+                .concat();
+                let v = next_of(d, &then).await;
+                assert_eq!(v["item"]["frame"], second, "{when}, {then:?}");
+                assert_eq!(v, walked(d, &then), "{when}, {then:?}");
+            }
         }
+    }
+
+    both_ways!(
+        then_keeps_the_place_after_a_save,
+        then_keeps_the_place_after_a_save_indexed,
+        then_keeps_the_place_after_a_save_in
+    );
+
+    /// The frame shown is saved out of the list: `after=<saved>&then=<the frame that was next>`
+    /// lands on that frame at the saved frame's place, one fewer in total (without `then`, the
+    /// first frame again); `then` gone too gives the first; `then` alone gives the place of the
+    /// frame on screen; where the saved frame is still listed (`status=any`), `after` wins.
+    async fn then_keeps_the_place_after_a_save_in(way: Way) {
+        let d = way.ds();
+        let (frames, _) = put_pool_frames(&d, 10, 0);
+        let frame = |v: &serde_json::Value| v["item"]["frame"].as_str().unwrap().to_string();
+        let views: [&[(&str, &str)]; 2] = [&[], &[("order", "uncertain")]];
+        for view in views {
+            let first = asked(&d, view, &[]).await;
+            let total = first["total"].as_u64().unwrap();
+            assert!(total >= 6, "{first}");
+            // Next three times: the fourth frame.
+            let mut shown = first.clone();
+            for _ in 0..3 {
+                shown = asked(&d, view, &[("after", &frame(&shown))]).await;
+            }
+            assert_eq!(shown["position"], 4, "{shown}");
+            let saved = frame(&shown);
+            let ahead = shown["upcoming"].as_array().unwrap().clone();
+            let then = ahead[0].as_str().unwrap().to_string();
+            // `then` alone: where the frame on screen stands.
+            let v = asked(&d, view, &[("then", &saved)]).await;
+            assert_eq!(frame(&v), saved, "{v}");
+            assert_eq!(v["position"], 4, "{v}");
+            assert_eq!(v["upcoming"], shown["upcoming"], "{v}");
+
+            save_frame(&d, &saved, "reviewed", |_| {}).await;
+            let v = asked(&d, view, &[("after", &saved), ("then", &then)]).await;
+            assert_eq!(frame(&v), then, "{v}");
+            assert_eq!(v["position"], 4, "the saved frame's place: {v}");
+            assert_eq!(v["total"], total - 1, "{v}");
+            assert_eq!(v["wrapped"], false, "{v}");
+            let upcoming = v["upcoming"].as_array().unwrap();
+            assert_eq!(upcoming[..ahead.len() - 1], ahead[1..], "{v}");
+            // Without `then` (the old answer), or with `then` gone too: the first frame.
+            let gone = "ir/yard/2026-12-31/20261231T010203004Z_gone.jpg";
+            for more in [
+                &[("after", saved.as_str())][..],
+                &[("after", saved.as_str()), ("then", gone)],
+            ] {
+                let v = asked(&d, view, more).await;
+                assert_eq!(frame(&v), frame(&first), "{more:?}: {v}");
+                assert_eq!(v["position"], 1, "{more:?}: {v}");
+                assert_eq!(v["wrapped"], false, "{more:?}: {v}");
+            }
+            // `status=any` still lists the saved frame: `after` wins over a listed `then`.
+            let any = [view, &[("status", "any"), ("after", saved.as_str())]].concat();
+            let plain = asked(&d, &any, &[]).await;
+            let other = frames.iter().find(|f| **f != frame(&plain)).unwrap();
+            let v = asked(&d, &any, &[("then", other)]).await;
+            assert_eq!(v, plain, "then {other} ignored");
+        }
+    }
+
+    /// [`next_of`] for `view` and `more`, checked against [`walked`] (through text, as the
+    /// route's answer comes: serde_json's default float parse can land an f32 margin one ulp off).
+    async fn asked(d: &Ds, view: &[(&str, &str)], more: &[(&str, &str)]) -> serde_json::Value {
+        let params = [view, more].concat();
+        let got = next_of(d, &params).await;
+        let want: serde_json::Value =
+            serde_json::from_str(&walked(d, &params).to_string()).unwrap();
+        assert_eq!(got, want, "{params:?}");
+        got
     }
 
     /// Twelve queued frames of cameras drive and yard, each with one pending auto car scoring

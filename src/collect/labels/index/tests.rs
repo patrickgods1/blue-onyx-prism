@@ -1281,7 +1281,12 @@ mod cases {
 
     /// The index's answer, which must be complete.
     fn from_index(dir: &Path, f: &Filters, after: Option<&str>) -> Answer {
-        let a = super::super::answer(dir, f, after).expect("the folder is indexed");
+        from_index_then(dir, f, after, None)
+    }
+
+    /// [`from_index`] with a `then`.
+    fn from_index_then(dir: &Path, f: &Filters, after: Option<&str>, then: Option<&str>) -> Answer {
+        let a = super::super::answer(dir, f, after, then).expect("the folder is indexed");
         assert_eq!(
             a.indexing, None,
             "{f:?}: a forced answer waits for the build"
@@ -1289,8 +1294,9 @@ mod cases {
         a
     }
 
-    /// For every filter of `grid(wanted)` and several `after`s, the index answers what the walk
-    /// does, compared whole. `rels`: frames to try as `after` too.
+    /// For every filter of `grid(wanted)` and several `after`s, and `then`s with an `after` that
+    /// is listed, not listed or absent, the index answers what the walk does, compared whole.
+    /// `rels`: frames to try as `after` and `then` too.
     fn same_answers(dir: &Path, wanted: &(Vec<String>, Vec<String>), rels: &[String], round: &str) {
         let filters = grid(wanted);
         // The walks are the slow part: on threads, as the route's queries come.
@@ -1310,17 +1316,41 @@ mod cases {
                 afters.extend(listed.get(at).map(|r| Some((*r).to_string())));
             }
             // Frames not listed: of other filters, gone, unreadable.
-            afters.extend(
-                rels.iter()
-                    .filter(|r| !listed.contains(&r.as_str()))
-                    .take(2)
-                    .map(|r| Some(r.clone())),
-            );
+            let unlisted: Vec<String> = rels
+                .iter()
+                .filter(|r| !listed.contains(&r.as_str()))
+                .take(2)
+                .cloned()
+                .collect();
+            afters.extend(unlisted.iter().map(|r| Some(r.clone())));
             afters.dedup();
-            for after in afters {
-                let want = Answer::of(built.clone(), damaged, after.as_deref());
-                let got = from_index(dir, f, after.as_deref());
-                assert_eq!(json(&got), json(&want), "{round}: {f:?} after {after:?}");
+            let mut asks: Vec<(Option<String>, Option<String>)> =
+                afters.into_iter().map(|a| (a, None)).collect();
+            // `then`: listed (first, middle, last), not listed, junk; after nothing, a frame
+            // not listed (a save took it out) and a listed one (which wins).
+            let mut thens: Vec<String> = [0, listed.len() / 2, listed.len().saturating_sub(1)]
+                .iter()
+                .filter_map(|at| listed.get(*at).map(|r| (*r).to_string()))
+                .collect();
+            thens.extend(unlisted.first().cloned());
+            thens.push("junk".into());
+            thens.dedup();
+            let mut then_afters: Vec<Option<String>> = vec![None, Some("junk".into())];
+            then_afters.extend(unlisted.last().map(|r| Some(r.clone())));
+            then_afters.extend(listed.get(1).map(|r| Some((*r).to_string())));
+            for after in &then_afters {
+                for then in &thens {
+                    asks.push((after.clone(), Some(then.clone())));
+                }
+            }
+            for (after, then) in asks {
+                let want = Answer::of(built.clone(), damaged, after.as_deref(), then.as_deref());
+                let got = from_index_then(dir, f, after.as_deref(), then.as_deref());
+                assert_eq!(
+                    json(&got),
+                    json(&want),
+                    "{round}: {f:?} after {after:?} then {then:?}"
+                );
             }
         });
     }
@@ -1951,7 +1981,7 @@ mod cases {
     }
 
     fn walk(dir: &Path, f: &Filters, after: Option<&str>) -> serde_json::Value {
-        json(&Answer::walk(dir, f, after))
+        json(&Answer::walk(dir, f, after, None))
     }
 
     /// Make `day` look changed to a scan, also where folder times are coarse: its index file
@@ -2129,9 +2159,9 @@ mod cases {
         let f = all_any();
         let hold = hold_after(&dir, n as u64);
         let started = Instant::now();
-        let _ = super::super::answer(&dir, &f, None).unwrap();
+        let _ = super::super::answer(&dir, &f, None, None).unwrap();
         assert!(hold.reached(), "the build stops after the first day");
-        let a = super::super::answer(&dir, &f, None).unwrap();
+        let a = super::super::answer(&dir, &f, None, None).unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "a held build does not hold queries"
@@ -2153,13 +2183,14 @@ mod cases {
         assert!(item.frame.starts_with(&first), "{} of {first}", item.frame);
         let mut after = item.frame.clone();
         for _ in 0..a.total + 1 {
-            let next = super::super::answer(&dir, &f, Some(&after)).unwrap();
+            let next = super::super::answer(&dir, &f, Some(&after), None).unwrap();
             let shown = next.item.expect("Next always shows a frame");
             assert!(shown.frame.starts_with(&first));
             after = shown.frame;
         }
         // A frame the rows do not have yet: the first again.
-        let elsewhere = super::super::answer(&dir, &f, Some("ir/gate/2026-10-20/x.jpg")).unwrap();
+        let elsewhere =
+            super::super::answer(&dir, &f, Some("ir/gate/2026-10-20/x.jpg"), None).unwrap();
         assert_eq!(elsewhere.position, Some(1));
         drop(hold);
         let done = from_index(&dir, &f, None);
@@ -2175,10 +2206,10 @@ mod cases {
         let f = all_any();
         let hold = hold(&dir);
         // The first answer, which may come before the thread read a line, knows the total.
-        let first = super::super::answer(&dir, &f, None).unwrap();
+        let first = super::super::answer(&dir, &f, None, None).unwrap();
         assert_eq!(first.indexing, Some(Indexing { done: 0, total }));
         assert!(hold.reached());
-        let a = super::super::answer(&dir, &f, None).unwrap();
+        let a = super::super::answer(&dir, &f, None, None).unwrap();
         assert_eq!(a.indexing, Some(Indexing { done: 0, total }));
         assert!(a.item.is_none() && a.total == 0);
         hold.release();
@@ -2214,13 +2245,13 @@ mod cases {
         force_together(&[&dir, &other]);
         set_timing(&dir, |t| t.ceiling = 1);
         let f = all_any();
-        assert!(super::super::answer(&dir, &f, None).is_none(), "walk");
+        assert!(super::super::answer(&dir, &f, None, None).is_none(), "walk");
         assert!(index_of(&dir).is_none());
         let walked = frames_walked(&dir);
-        assert!(super::super::answer(&dir, &f, None).is_none());
+        assert!(super::super::answer(&dir, &f, None, None).is_none());
         assert_eq!(frames_walked(&dir), walked, "not tried again");
         // Another folder, then this one again: it is tried again.
-        assert!(super::super::answer(&other, &f, None).is_some());
+        assert!(super::super::answer(&other, &f, None, None).is_some());
         set_timing(&dir, |t| t.ceiling = INDEX_CEILING);
         assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
         assert!(index_of(&other).is_none(), "one folder at a time");
@@ -2235,12 +2266,12 @@ mod cases {
         panic_at(&dir, 2);
         let f = all_any();
         let started = Instant::now();
-        assert!(super::super::answer(&dir, &f, None).is_none());
+        assert!(super::super::answer(&dir, &f, None, None).is_none());
         assert!(started.elapsed() < Duration::from_secs(10), "no hang");
         assert!(index_of(&dir).is_none());
         let walked = frames_walked(&dir);
         assert!(
-            super::super::answer(&dir, &f, None).is_none(),
+            super::super::answer(&dir, &f, None, None).is_none(),
             "walks for now"
         );
         assert_eq!(frames_walked(&dir), walked);
@@ -2271,7 +2302,7 @@ mod cases {
         let f = all_any();
         from_index(&dir, &f, None);
         std::fs::remove_dir_all(&*dir).unwrap();
-        assert!(super::super::answer(&dir, &f, None).is_none());
+        assert!(super::super::answer(&dir, &f, None, None).is_none());
         assert!(index_of(&dir).is_none());
     }
 
@@ -2615,7 +2646,7 @@ mod cases {
             .unwrap();
         let f = all_any();
         let hold = hold_after(&dir, n as u64);
-        let _ = super::super::answer(&dir, &f, None).unwrap();
+        let _ = super::super::answer(&dir, &f, None, None).unwrap();
         assert!(hold.reached());
         // One frame of the day already in, one of a day still to come.
         let frames: Vec<Frame> = existing(&dir, &rels)
@@ -2640,7 +2671,7 @@ mod cases {
             )
             .unwrap();
         }
-        let during = super::super::answer(&dir, &f, None).unwrap();
+        let during = super::super::answer(&dir, &f, None, None).unwrap();
         assert!(during.indexing.is_some());
         hold.release();
         assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
@@ -2659,7 +2690,7 @@ mod cases {
         let hold = hold(&dir);
         super::super::day_written(&day);
         assert!(hold.reached(), "the thread walks a stale day at once");
-        let a = super::super::answer(&dir, &f, None).unwrap();
+        let a = super::super::answer(&dir, &f, None, None).unwrap();
         let rows = queue::candidates(&dir, QueueSource::All).len() as u64;
         let i = a.indexing.unwrap();
         assert_eq!(i.total, rows);

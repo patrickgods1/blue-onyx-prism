@@ -36,6 +36,12 @@
 // pending proposals of hidden classes), and the server rejects their pending boxes when a class
 // becomes unwanted. When the reject button leaves reviewed frames with accepted boxes of unwanted
 // classes, the page asks, then POST /v1/review/reject-unwanted-reviewed. Class ids never change.
+// A save goes on in place: GET /v1/review/next?after=<saved>&then=<the frame that was next> lands on
+// that frame (and its place) rather than the queue's start; a counts refresh passes `then` = the
+// frame on screen. The next frame's image and labels are fetched ahead (prefetch) and a frame is
+// shown only once its image is decoded. The layout is still from frame to frame (a HUD of fixed
+// slots over a frame box of one size, the side panel's foot pinned, one-column docks of one
+// height): setHud, sizeStage, revealFrame.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
   'use strict';
@@ -66,9 +72,17 @@
   var fitBtn = $('rv-fit');
   var zoomText = $('rv-zoom');
   var cropWrap = $('rv-crop-wrap');
-  var phoneHead = $('rv-phone-head');
-  var phoneLine = $('rv-phone-line');
   var likelyBar = $('rv-accept-likely');
+  // The HUD over the frame (setHud): one element per value, each in a slot of a fixed size.
+  var hud = root.querySelector('.rv-hud');
+  var hudEl = {
+    pos: $('rv-hud-pos'), done: $('rv-hud-done'), meter: $('rv-hud-meter'), todo: $('rv-hud-todo'),
+    camera: $('rv-hud-camera'), scene: $('rv-hud-scene'), time: $('rv-hud-time'), pace: $('rv-hud-pace')
+  };
+  var detailsPace = $('rv-details-pace');
+  // The box the frame keeps its place in (one size for every frame; sizeStage on one column).
+  var frameBox = canvas.closest('.rv-frame-box');
+  var saveBtn = $('rv-save');
   var cropCanvas = $('rv-crop');
   var cropCap = $('rv-crop-cap');
   var grid = canvas.closest('.review-grid');
@@ -90,6 +104,15 @@
     boxList.parentNode.insertBefore(decide, boxList);
   }
   decide.classList.add('rv-decide');
+  // What only some boxes have (reasons, duplicate, spot, the class grid, stack tools): after the
+  // card, so the answers in it keep their place.
+  var decideMore = $('rv-decide-more');
+  if (!decideMore) {
+    decideMore = document.createElement('div');
+    decideMore.id = 'rv-decide-more';
+    decideMore.className = 'rv-decide-more';
+    decide.parentNode.insertBefore(decideMore, decide.nextSibling);
+  }
   // "Accept likely" and "Show N hidden", beside the box list.
   var boxTools = $('rv-box-tools');
   if (!boxTools) {
@@ -197,7 +220,8 @@
     overview.height = 1;
     overview.hidden = true;
     overview.setAttribute('aria-label', 'Overview of the whole frame: the outlined part is the one shown below. Tap a box to select it, or tap elsewhere to move the view there.');
-    canvas.parentNode.insertBefore(overview, canvas);
+    if (frameBox) frameBox.insertBefore(overview, frameBox.firstChild);
+    else canvas.parentNode.insertBefore(overview, canvas);
   }
   overview.classList.add('rv-overview');
   var stage = canvas.closest('.review-stage');
@@ -319,10 +343,19 @@
     ['Shift+A accepts every proposal', 'Accept proposals accepts every proposal']
   ];
 
-  function say(text, isError) {
+  // The message slot under the side panel: one line in the same place always (the full text in its
+  // title), green for a save (`ok`), red for an error. After MSG_DIM_MS a message (not an error) dims
+  // in place: nothing moves when it comes or goes.
+  var MSG_DIM_MS = 4000;
+  var msgTimer = null;
+  function say(text, isError, ok) {
     if (text && noHover.matches) TOUCH_WORDS.forEach(function (w) { text = text.replace(w[0], w[1]); });
-    msg.textContent = text || '';
-    msg.className = 'form-msg' + (isError ? ' error-text' : '');
+    msg.textContent = '';
+    if (text) msg.appendChild(el('span', 'rv-msg-text', text));
+    msg.title = text || '';
+    msg.className = 'form-msg' + (isError ? ' error-text' : (ok ? ' ok-text' : ''));
+    if (msgTimer) clearTimeout(msgTimer);
+    msgTimer = text && !isError ? setTimeout(function () { msgTimer = null; msg.classList.add('rv-msg-old'); }, MSG_DIM_MS) : null;
   }
 
   // An error that keeps the answer: `status`, `conflict` and the JSON body (`body`).
@@ -1051,15 +1084,16 @@
       zoomBoxBtn.textContent = fits ? 'Fit' : 'Zoom to box';
       zoomBoxBtn.title = touchUi.matches ? ''
         : (fits ? 'Show the whole frame (f)' : 'Zoom to the selected box and follow the selection (x)');
-      zoomBoxBtn.hidden = !sb && !zoomed;
+      // Its slot stays: shown and hidden in place.
+      zoomBoxBtn.classList.toggle('rv-off', !sb && !zoomed);
       // Its text names what a click does; no pressed state (a filled "Fit" reads as the main action).
       zoomBoxBtn.removeAttribute('aria-pressed');
     }
     if (zoomText) zoomText.textContent = zoomed ? Math.round(view.z * 100) + '%' : '';
-    // The touch UI has the image setting in the View menu.
-    if (imgBtn) imgBtn.hidden = touchUi.matches;
+    // The touch UI has the image setting in the View menu (style.css drops its slot there).
     if (imgBtn) {
-      imgBtn.textContent = imgLabel();
+      var il = imgLabel();
+      if (imgBtn.textContent !== il) imgBtn.textContent = il;
       imgBtn.title = touchUi.matches
         ? 'View only: cycles auto / off / bright / bright + equalised; View has Brighter, Darker and Reset image'
         : 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets';
@@ -1077,8 +1111,6 @@
   var touchUi = media('(max-width: 900px), (pointer: coarse)');
   // No hover: the keys and "the pointer over a box" mean nothing, the answers name the buttons.
   var noHover = media('(hover: none)');
-  // A finger is the main pointer (phones, tablets).
-  var coarse = media('(pointer: coarse)');
   // Whether the frame follows the selected box (Zoom to box) or shows whole (Fit): the viewer's last
   // choice, kept per layout (loadFrame takes it again on each frame). One column: the frame below
   // the overview is the editor, so it follows by default (`follow`); beside the side panel and its
@@ -1320,15 +1352,6 @@
     return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1), Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
   }
 
-  // The window height the close-up is sized by. A finger screen keeps the one it had until the
-  // width or the orientation changes: iOS fires height-only resizes as its toolbars collapse and
-  // grow while the page scrolls, and a close-up that followed them would make the page jump.
-  var cropWin = null;   // {w, h, landscape}
-  function cropWindowHeight() {
-    var w = window.innerWidth, h = window.innerHeight, land = w > h;
-    if (!coarse.matches || !cropWin || cropWin.w !== w || cropWin.landscape !== land) cropWin = { w: w, h: h, landscape: land };
-    return cropWin.h;
-  }
 
   // The first corner of a two-tap box (Draw, Redraw): a cross in a ring, the same size on screen
   // at any zoom.
@@ -1353,67 +1376,103 @@
   // The close-up: the selected box with a 40% margin, enlarged to the panel's width (a box under
   // 120 px at least 2x, at most 8x; the view then centres on the box), from the full-size image.
   // Two columns only: on one column the frame itself is the close-up (it follows the selected box)
-  // and the overview over it shows where that is.
+  // and the overview over it shows where that is. Its slot keeps one size (the panel's width, a
+  // height from the window): the crop is centred on black in it, and with no box selected it shows
+  // the whole frame dimmed under "No box selected", so nothing under it moves.
   var CROP_TAG_FONT = 14, CROP_TAG_PAD = 5, CROP_TAG_H = CROP_TAG_FONT + 2 * CROP_TAG_PAD;   // the tag, CSS px
   function drawCrop() {
     if (!cropCanvas) return;
+    if (oneColumn.matches || noneShown) { cropWrap.hidden = true; return; }
+    cropWrap.hidden = false;
+    var aw = Math.max(120, cropWrap.clientWidth || 300);
+    // Its height follows the window (style.css, in `svh`: iOS toolbars coming and going do not
+    // move it), so the decision card and the list stay in view under it.
+    var area = cropCanvas.parentNode;
+    var ah = Math.max(60, Math.round(area.clientHeight || 140));
+    var dpr = window.devicePixelRatio || 1;
+    var PW = Math.max(1, Math.round(aw * dpr)), PH = Math.max(1, Math.round(ah * dpr));
+    if (cropCanvas.width !== PW) cropCanvas.width = PW;
+    if (cropCanvas.height !== PH) cropCanvas.height = PH;
+    var sw0 = aw + 'px', sh0 = ah + 'px';
+    if (cropCanvas.style.width !== sw0) cropCanvas.style.width = sw0;
+    if (cropCanvas.style.height !== sh0) cropCanvas.style.height = sh0;
+    var c = cropCanvas.getContext('2d');
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, PW, PH);
+    c.fillStyle = '#000000';
+    c.fillRect(0, 0, PW, PH);
+    c.imageSmoothingEnabled = true;
+    c.imageSmoothingQuality = 'high';
     // With no box selected, the proposed box of a dataset check suggestion (an add).
     var gb = ghostBox();
     var b = boxes()[selected] || gb;
-    if (!b || !img || !img.complete || !img.naturalWidth || oneColumn.matches) { cropWrap.hidden = true; return; }
-    cropWrap.hidden = false;
+    var ready = !!(img && img.complete && img.naturalWidth);
+    if (!b || !ready) {
+      if (ready) {
+        // The whole frame, dimmed, fitted in the slot.
+        var fk = Math.min(PW / img.naturalWidth, PH / img.naturalHeight);
+        var fw = img.naturalWidth * fk, fh = img.naturalHeight * fk;
+        c.globalAlpha = 0.35;
+        c.drawImage(viewSource() || img, (PW - fw) / 2, (PH - fh) / 2, fw, fh);
+        c.globalAlpha = 1;
+      }
+      var text = cur ? 'No box selected' : '';
+      if (text) {
+        c.font = '600 ' + (14 * dpr) + 'px system-ui, sans-serif';
+        c.textAlign = 'center';
+        c.textBaseline = 'middle';
+        c.fillStyle = 'rgba(255, 255, 255, 0.85)';
+        c.fillText(text, PW / 2, PH / 2);
+        c.textAlign = 'start';
+      }
+      cropCap.textContent = text;
+      return;
+    }
     var W = canvas.width, H = canvas.height;
     var bw = Math.max(1, b.bbox[2] - b.bbox[0]), bh = Math.max(1, b.bbox[3] - b.bbox[1]);
-    var aw = Math.max(120, cropWrap.clientWidth || 300);
-    // Its height follows the window: the decision bar and the list stay in view under it.
-    var winH = cropWindowHeight();
-    var ah = Math.round(Math.max(140, Math.min(wideSide ? 340 : 240, winH * (wideSide ? 0.36 : 0.22))));
     var mw = bw * 1.8, mh = bh * 1.8;
-    var scale = Math.min(aw / mw, ah / mh);
-    if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
-    scale = Math.min(scale, 8);
-    var cw = Math.min(aw, mw * scale), ch = Math.min(ah, mh * scale);
-    var sw = Math.min(W, cw / scale), sh = Math.min(H, ch / scale);
-    cw = sw * scale; ch = sh * scale;
-    var x0 = clamp((b.bbox[0] + b.bbox[2]) / 2 - sw / 2, 0, W - sw);
-    var y0 = clamp((b.bbox[1] + b.bbox[3]) / 2 - sh / 2, 0, H - sh);
-    var dpr = window.devicePixelRatio || 1;
-    var pw = Math.max(1, Math.round(cw * dpr)), ph = Math.max(1, Math.round(ch * dpr));
-    // The box's outline (a thin dashed line just outside the box: the object's edges stay
-    // visible), in device pixels of the image part.
-    var k = scale * dpr, o = 2 * dpr;
-    var rx = (b.bbox[0] - x0) * k - o, ry = (b.bbox[1] - y0) * k - o, rw = bw * k + 2 * o, rh = bh * k + 2 * o;
+    var k = 0, o = 2 * dpr, th = CROP_TAG_H * dpr;
+    // The crop in `avail` CSS px of height, from `top0` down: its scale, source and place.
+    function layout(avail, top0) {
+      var scale = Math.min(aw / mw, avail / mh);
+      if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
+      scale = Math.min(scale, 8);
+      var cw = Math.min(aw, mw * scale), ch = Math.min(avail, mh * scale);
+      var sw = Math.min(W, cw / scale), sh = Math.min(H, ch / scale);
+      cw = sw * scale; ch = sh * scale;
+      var x0 = clamp((b.bbox[0] + b.bbox[2]) / 2 - sw / 2, 0, W - sw);
+      var y0 = clamp((b.bbox[1] + b.bbox[3]) / 2 - sh / 2, 0, H - sh);
+      var ox = (aw - cw) / 2, oy = top0 + (avail - ch) / 2;
+      k = scale * dpr;
+      // The box's outline (a thin dashed line just outside the box: the object's edges stay
+      // visible), in device pixels of the slot.
+      return {
+        scale: scale, cw: cw, ch: ch, sw: sw, sh: sh, x0: x0, y0: y0, ox: ox, oy: oy,
+        rx: ox * dpr + (b.bbox[0] - x0) * k - o, ry: oy * dpr + (b.bbox[1] - y0) * k - o, rw: bw * k + 2 * o, rh: bh * k + 2 * o
+      };
+    }
+    var L = layout(ah, 0);
     // The tag never covers the object: when it fits neither above nor below the outline (a box
-    // about as tall as the close-up), a black strip over the image holds it.
-    var th = CROP_TAG_H * dpr;
-    var band = (ry - th < 0 && ry + rh + th > ph) ? Math.ceil(th - ry) : 0;
-    if (cropCanvas.width !== pw) cropCanvas.width = pw;
-    if (cropCanvas.height !== ph + band) cropCanvas.height = ph + band;
-    cropCanvas.style.width = Math.round(cw) + 'px';
-    cropCanvas.style.height = Math.round(ch + band / dpr) + 'px';
-    var c = cropCanvas.getContext('2d');
+    // about as tall as the close-up), the crop gives up a strip at the top for it.
+    if (L.ry - th < 0 && L.ry + L.rh + th > PH) L = layout(Math.max(20, ah - CROP_TAG_H - 2), CROP_TAG_H + 2);
     var kx = img.naturalWidth / W, ky = img.naturalHeight / H;
-    c.setTransform(1, 0, 0, 1, 0, 0);
-    c.clearRect(0, 0, pw, ph + band);
-    c.imageSmoothingEnabled = true;
-    c.imageSmoothingQuality = 'high';
-    c.drawImage(viewSource() || img, x0 * kx, y0 * ky, sw * kx, sh * ky, 0, band, pw, ph);
-    ry += band;
+    c.drawImage(viewSource() || img, L.x0 * kx, L.y0 * ky, L.sw * kx, L.sh * ky,
+      L.ox * dpr, L.oy * dpr, L.cw * dpr, L.ch * dpr);
     c.lineWidth = 1.5 * dpr;
     c.setLineDash(b.difficult ? [2 * dpr, 3 * dpr] : [5 * dpr, 3 * dpr]);
     c.strokeStyle = COLORS[look(b)] || '#ffffff';
-    c.strokeRect(rx, ry, rw, rh);
+    c.strokeRect(L.rx, L.ry, L.rw, L.rh);
     if (gb && gb !== b && refineRole(selected) === 'tighten') {
       // A tighter box proposed for the selected one: dashed in the suggestion's colour.
       c.lineWidth = 2 * dpr;
       c.setLineDash([6 * dpr, 3 * dpr]);
       c.strokeStyle = COLORS.ghost;
-      c.strokeRect((gb.bbox[0] - x0) * k, (gb.bbox[1] - y0) * k + band, (gb.bbox[2] - gb.bbox[0]) * k, (gb.bbox[3] - gb.bbox[1]) * k);
+      c.strokeRect(L.ox * dpr + (gb.bbox[0] - L.x0) * k, L.oy * dpr + (gb.bbox[1] - L.y0) * k, (gb.bbox[2] - gb.bbox[0]) * k, (gb.bbox[3] - gb.bbox[1]) * k);
     }
     c.setLineDash([]);
-    cropTag(c, b, rx, ry, rh, pw, ph + band, dpr);
+    cropTag(c, b, L.rx, L.ry, L.rh, PW, PH, dpr);
     cropCap.textContent = (b === gb ? 'Proposed box' : 'Box ' + (selected + 1)) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px, ' +
-      (Math.round(scale * 10) / 10) + 'x';
+      (Math.round(L.scale * 10) / 10) + 'x';
   }
 
   // The close-up's tag: the class at a glance (bold), the score, the decision so far (? flagged,
@@ -1462,11 +1521,13 @@
   var OV_INSET = 8;   // CSS px from the frame's edges (style.css: 0.5rem)
   function placeOverview() {
     var st = overview.style;
-    if (oneColumn.matches || !stage) {
+    // Its containing block: the frame box (style.css), else the stage of an older page.
+    var holder = frameBox || stage;
+    if (oneColumn.matches || !holder) {
       if (st.left || st.top) { st.left = ''; st.top = ''; st.right = ''; }
       return;
     }
-    var cr = canvas.getBoundingClientRect(), sr = stage.getBoundingClientRect();
+    var cr = canvas.getBoundingClientRect(), sr = holder.getBoundingClientRect();
     var or = overview.getBoundingClientRect();
     if (!cr.width || !cr.height || !or.width) return;
     // Frame point -> CSS px in the shown frame.
@@ -1487,9 +1548,9 @@
     if (gesture && gesture.mode === 'draw' && gesture.moved) keep.push(css(norm(gesture), HANDLE_CSS + 4, 20));
     ovCorner = window.ReviewTouch.overviewCorner(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET, keep, others);
     var at = window.ReviewTouch.cornerRect(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET);
-    // Relative to the stage's padding box (it is the overview's containing block).
-    var left = Math.round(cr.left - sr.left - stage.clientLeft + at[0]) + 'px';
-    var top = Math.round(cr.top - sr.top - stage.clientTop + at[1]) + 'px';
+    // Relative to the frame box's padding box (it is the overview's containing block).
+    var left = Math.round(cr.left - sr.left - holder.clientLeft + at[0]) + 'px';
+    var top = Math.round(cr.top - sr.top - holder.clientTop + at[1]) + 'px';
     if (st.left !== left) st.left = left;
     if (st.top !== top) st.top = top;
     if (st.right !== 'auto') st.right = 'auto';
@@ -1500,7 +1561,9 @@
     // One column: following keeps it shown when a box too big to zoom on comes up (zoom 1): the
     // frame and the answers under it stay where they were from one decision to the next. Two
     // columns: it lies over the frame, so it comes and goes with the zoom alone.
-    var show = !!(cur && (view.z > 1 || (oneColumn.matches && view.follow)));
+    // One column before the first frame: shown already when it will be (following), so the frame
+    // does not move down under it when the frame comes.
+    var show = !!((cur || (oneColumn.matches && !noneShown)) && (view.z > 1 || (oneColumn.matches && view.follow)));
     if (gesture) show = !overview.hidden;
     if (overview.hidden === show) overview.hidden = !show;
     if (stage) stage.classList.toggle('rv-ov-on', show);
@@ -1938,14 +2001,99 @@
     return p.undecided + p.unchecked > 0;
   }
 
+  // The card's first line, in fixed slots: `num` (Box 3 / 8), the question (`nodes`, one line,
+  // cut with an ellipsis; the whole of it in the title), the score and the box's tier (`chip`).
+  function qHead(num, nodes, score, chip) {
+    var h = el('div', 'rv-q rv-q-head');
+    h.appendChild(el('span', 'rv-q-num', num));
+    var q = el('span', 'rv-q-text');
+    nodes.forEach(function (n) { q.appendChild(n); });
+    h.title = q.textContent;
+    h.appendChild(q);
+    h.appendChild(el('span', 'rv-q-score', score));
+    var t = el('span', 'rv-q-tier');
+    if (chip) t.appendChild(chip);
+    h.appendChild(t);
+    return h;
+  }
+
+  // The selected box's tier at a glance (the colours of the legend): likely, flagged, unsure,
+  // small, or what was decided.
+  function tierChip(b) {
+    var small = Math.min(b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]) < 24;
+    var c = b.difficult ? ['unsure', 'warn'] : (b.source === 'human' ? ['drawn', 'drawn']
+      : (isDismissed(b) ? ['hidden', ''] : (b.state === 'rejected' ? ['rejected', 'bad'] : (b.state === 'accepted' ? ['accepted', 'ok']
+        : (isLikely(b) ? ['likely ★', 'likely'] : (isReview(b) ? ['flagged ?', 'warn'] : (small ? ['small', ''] : null)))))));
+    return c ? el('span', 'rv-chip' + (c[1] ? ' ' + c[1] : ''), c[0]) : null;
+  }
+
+  // One column: the dock just changed (answers <-> Save row) or a new frame came: taps on it wait
+  // DOCK_GUARD_MS, so a quick second tap on the last answer never lands on Save & next.
+  var DOCK_GUARD_MS = 350, dockTimer = null;
+  function guardDock() {
+    if (!oneColumn.matches) return;
+    root.classList.add('rv-dock-guard');
+    if (dockTimer) clearTimeout(dockTimer);
+    dockTimer = setTimeout(function () { dockTimer = null; root.classList.remove('rv-dock-guard'); }, DOCK_GUARD_MS);
+  }
+
+  // The HUD's box slots: "3 / 8 done" with its meter, and what is left (amber), all done (green).
+  function setHudBoxes(p) {
+    if (!hud) return;
+    var has = !!cur;
+    hudSet(hudEl.done, has ? p.done + ' / ' + p.total : '', has ? [el('span', 'rv-hud-unit', ' done')] : null);
+    if (hudEl.meter) hudEl.meter.style.width = (has && p.total ? Math.round(100 * p.done / p.total) : 0) + '%';
+    var todo = !has ? ['', ''] : (p.undecided ? [p.undecided + ' to decide', 'todo']
+      : (p.unchecked ? [p.unchecked + ' to check', 'todo'] : (p.total ? ['all done', 'done'] : ['no boxes', ''])));
+    hudSet(hudEl.todo, todo[0]);
+    if (hudEl.todo) {
+      hudEl.todo.classList.toggle('todo', todo[1] === 'todo');
+      hudEl.todo.classList.toggle('done', todo[1] === 'done');
+    }
+  }
+
+  // A HUD value in its slot: the text (and `extra` nodes after it), or a dim dash when empty.
+  function hudSet(e, text, extra) {
+    if (!e) return;
+    var empty = text == null || text === '';
+    e.textContent = empty ? '—' : text;
+    if (!empty && extra) extra.forEach(function (n) { e.appendChild(n); });
+    e.classList.toggle('rv-empty', empty);
+  }
+
+  // One column, Save mode: the dock's head line (like the answers' one, so the dock keeps its height).
+  function renderDockHead(p) {
+    var head = saveBtn && saveBtn.parentNode.querySelector('.rv-dock-head');
+    if (!head) return;
+    var q = head.querySelector('.rv-bar-q'), n = head.querySelector('.rv-bar-count'), fill = head.querySelector('.rv-bar-meter > i');
+    if (fill) fill.style.width = (p.total ? Math.round(100 * p.done / p.total) : 0) + '%';
+    if (q) q.textContent = !cur ? '' : (p.undecided || p.unchecked ? 'No box selected: tap one' : (p.total ? 'Every box decided' : 'No box on this frame'));
+    if (n) n.textContent = !cur ? '' : (p.undecided ? p.undecided + ' to decide' : (p.unchecked ? p.unchecked + ' to check' : (p.total ? 'all done' : '')));
+  }
+
   // The decision bar: the selected box's question, its answers, the frame's progress.
   function renderDecision() {
     decide.textContent = '';
+    decideMore.textContent = '';
+    var more = decideMore;
     var inBar = deciding();
+    // The dock changes from the answers to the Save row (or back): taps on it wait a moment.
+    if (root.classList.contains('rv-deciding') !== inBar) guardDock();
     root.classList.toggle('rv-deciding', inBar);
     if (decideBar) { barBtns.textContent = ''; decideBar.hidden = !inBar; }
     placeAcceptAll();
-    if (!cur) return;
+    placeSave(inBar);
+    var p0 = progress();
+    setHudBoxes(p0);
+    renderDockHead(p0);
+    if (!cur) {
+      // The card keeps its size while the first frame comes (nothing under it moves then).
+      if (oneColumn.matches) return;
+      decide.appendChild(qHead('', [document.createTextNode(noneShown ? 'No frame' : 'Loading…')], '', null));
+      decide.appendChild(el('div', 'rv-q-body'));
+      decide.appendChild(el('div', 'rv-q-reason-slot'));
+      return;
+    }
     var sugBlock = suggestionBlock();
     if (sugBlock) decide.appendChild(sugBlock);
     // The dataset check's suggestion (none while an overlap suggestion shows): its answers take the
@@ -1956,50 +2104,67 @@
       var done = refineDoneBlock();
       if (done) decide.appendChild(done);
     }
-    var p = progress();
+    var p = p0;
     var b = boxes()[selected];
     if (inBar) renderBarHead(b, p);
     if (!b) {
       // A proposed box (an add) needs no "no box selected": its card says what to do.
       var off = dismissedOn ? 0 : dismissedCount();
       var tap = noHover.matches;
-      if (!refBlock) decide.appendChild(el('div', 'rv-q', p.undecided || p.unchecked
-        ? (tap ? 'No box selected: tap one, or turn on Draw to draw one.' : 'No box selected: j selects the next one, drag on the frame to draw one.')
-        : (missingAsked === cur.frame ? missingText()
-          : (p.total ? (tap ? 'Every box decided: Save & next saves.' : 'Every box decided: s saves.')
-            : (tap ? 'No box: turn on Draw to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
-              : 'No box: drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
-      if (!refBlock && !p.undecided && !p.unchecked && quarterOpen()) decide.appendChild(quarterButtons());
+      if (!refBlock) {
+        // The card's line says where the frame is; the text under it what to do.
+        var title = p.undecided || p.unchecked ? 'No box selected'
+          : (missingAsked === cur.frame ? 'Anything missing?' : (p.total ? 'Every box decided' : 'No box'));
+        decide.appendChild(qHead('', [document.createTextNode(title)], '', null));
+        var body = el('div', 'rv-q-body');
+        body.appendChild(el('div', 'rv-q-note', p.undecided || p.unchecked
+          ? (tap ? 'Tap one, or turn on Draw to draw one.' : 'j selects the next one; drag on the frame to draw one.')
+          : (missingAsked === cur.frame ? missingText()
+            : (p.total ? (tap ? 'Save & next saves.' : 's saves.')
+              : (tap ? 'Turn on Draw to draw one, or tick Confirmed empty below.' + (off ? ' ' + off + ' hidden.' : '')
+                : 'Drag on the frame to draw one, or e confirms it empty.' + (off ? ' ' + off + ' hidden: i shows them.' : ''))))));
+        if (!p.undecided && !p.unchecked && quarterOpen()) body.appendChild(quarterButtons());
+        decide.appendChild(body);
+      }
     } else {
       var i = selected;
-      var q = el('div', 'rv-q');
       // Put-away boxes are not counted: box numbers keep their place, so the total would mislead.
       var putAway = boxes().some(isPutAway);
-      q.appendChild(el('span', 'rv-q-num', 'Box ' + (i + 1) + (putAway ? '' : ' of ' + boxes().length) + ' · '));
       var verb, yes, no;
       if (b.source === 'human') { verb = 'Drawn: '; yes = 'Keep'; no = 'Delete'; }
       else if (b.state === 'accepted') { verb = 'Accepted as '; yes = 'Right, keep'; no = 'No, reject'; }
-      else if (isDismissed(b)) { verb = (b.reason === 'spot_dismissed' ? 'Hidden at a spot you rejected: is it a ' : (b.reason === 'size_floor' ? 'Hidden as under the size floor: is it a ' : 'Hidden for its score: is it a ')); yes = 'Yes, accept'; no = 'No, reject'; }
-      else if (b.state === 'rejected') { verb = 'Rejected: is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
+      // The line is short so the class always shows; the state is the chip at its end, why a box
+      // was hidden the first thing on the "why" line.
+      else if (isDismissed(b)) { verb = 'Is it a '; yes = 'Yes, accept'; no = 'No, reject'; }
+      else if (b.state === 'rejected') { verb = 'Is it a '; yes = 'Yes, accept'; no = 'Keep rejected'; }
       else { verb = 'Is this a '; yes = 'Yes, ' + b.label; no = 'No, reject'; }
-      q.appendChild(document.createTextNode(verb));
-      q.appendChild(el('strong', null, b.label));
-      q.appendChild(document.createTextNode(verb.indexOf('Is') === 0 || verb.indexOf('is it') >= 0 ? '?' : ''));
-      decide.appendChild(q);
+      var ask = verb.indexOf('Is') === 0 || verb.indexOf('is it') >= 0 ? '?' : '';
+      decide.appendChild(qHead('Box ' + (i + 1) + (putAway ? '' : ' / ' + boxes().length),
+        [document.createTextNode(verb), el('strong', null, b.label), document.createTextNode(ask)],
+        b.score != null ? fmtScore(b.score) : '', tierChip(b)));
+      var body = el('div', 'rv-q-body');
+      decide.appendChild(body);
       var why = [];
+      if (isDismissed(b)) why.push(b.reason === 'spot_dismissed' ? 'hidden at a spot you rejected' : (b.reason === 'size_floor' ? 'hidden as under the size floor' : 'hidden for its score'));
       if (b.auto_label && b.auto_label !== b.label) {
         why.push('auto-labelers say ' + b.auto_label + (b.auto_score != null ? ' (' + fmtScore(b.auto_score) + ')' : ''));
       }
+      // (The score has its own slot on the line above.)
       if (b.triage === 'review' && b.why && b.why.length) why.push(b.why.join('; '));
-      else if (b.score != null) why.push('score ' + fmtScore(b.score));
       // Most verification errors are on small objects: say so (the close-up is at least 2x).
       if (Math.min(b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]) < 24) why.unshift('small: check closely');
       if (b.difficult) why.unshift('marked unsure: kept out of training, its frame goes to held-out only, ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason === 'too_small') why.unshift('too small: a real object, no negative; its frame goes to held-out only, ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason) why.unshift('why: ' + reasonText(b.reject_reason));
-      if (why.length) decide.appendChild(el('div', 'rv-q-why muted', why.join(' · ')));
+      // The "why" slot: two lines (one on a phone), there even when empty.
+      var whyLine = el('div', 'rv-q-why muted', why.length ? why.join(' · ') : ' ');
+      if (why.length) whyLine.title = why.join(' · ');
+      body.appendChild(whyLine);
       var rp = b.state === 'pending' ? repeatOf(b) : null;
-      var btns = el('div', 'rv-q-btns');
+      // The answers in a fixed grid: Yes | No, Real, parked | It's a…, Unsure | Too small; a
+      // missing one keeps its cell (an invisible stand-in), so the others never move.
+      var btns = el('div', 'rv-q-btns rv-q-answers');
+      var hold = function () { var h = el('span', 'rv-q-ph'); h.setAttribute('aria-hidden', 'true'); return h; };
       // The main answers: in the card, or (one column, deciding) in the bar at the foot, which
       // leaves the card the other answers as one compact row.
       var answers = inBar && decideBar && !refBlock ? barBtns : btns;
@@ -2009,11 +2174,7 @@
         var parked = decideButton('Real, parked', 't', 'ok', parkSelected);
         parked.title = 'A real object that stays put: accept it and remember the spot, so that auto-label runs accept it there (same class, a close match) unless the VLM sees nothing';
         answers.appendChild(parked);
-      }
-      if (b.auto_label && b.auto_label !== b.label) {
-        var al = b.auto_label;
-        btns.appendChild(decideButton('It\'s a ' + al, null, 'ok', function () { relabelNext(i, al); }));
-      }
+      } else if (answers === btns) btns.appendChild(hold());
       var other = decideButton('It\'s a…', '1-9', 'secondary', function () { classGrid = !classGrid; renderDecision(); });
       other.setAttribute('aria-expanded', classGrid ? 'true' : 'false');
       btns.appendChild(other);
@@ -2026,10 +2187,16 @@
         small.title = 'A real object too small to label (same as reason ' + (reasonIndex('too_small') + 1) + ', Shift+' + (reasonIndex('too_small') + 1) +
           '): rejected but never a negative, its frame goes to held-out only, ignored by the benchmark';
         btns.appendChild(small);
+      } else btns.appendChild(hold());
+      // The labelers' class: a row of its own after the fixed cells.
+      if (b.auto_label && b.auto_label !== b.label) {
+        var al = b.auto_label;
+        var alb = decideButton('It\'s a ' + al, null, 'ok rv-q-wide', function () { relabelNext(i, al); });
+        if (answers === btns) btns.appendChild(alb); else btns.insertBefore(alb, btns.firstChild);
       }
-      decide.appendChild(btns);
+      body.appendChild(btns);
       // A box drawn (or selected) during the quarter look: the look goes on from here.
-      if (quarter >= 0 && quarterOpen()) decide.appendChild(quarterButtons());
+      if (quarter >= 0 && quarterOpen()) more.appendChild(quarterButtons());
       var mate = dupPartner(i);
       if (mate >= 0) {
         var mb = boxes()[mate];
@@ -2037,7 +2204,7 @@
         dl.appendChild(el('span', null, 'Overlaps box ' + (mate + 1) + ' (' + mb.label + (mb.score != null ? ' ' + fmtScore(mb.score) : '') + ')' +
           (dups.of[i] ? (dups.of[i].keeper === i ? ', this one kept as the best' : '') : ', not near-identical: keep both if they are two objects')));
         dl.appendChild(decideButton('Reject as duplicate', 'u', 'bad', function () { rejectWith(i, 'duplicate'); }));
-        decide.appendChild(dl);
+        more.appendChild(dl);
       }
       // Repeats: what the reviewer decided at this spot before, and the spot on every frame.
       if (b.source !== 'human') {
@@ -2075,7 +2242,7 @@
             (everywhere === 'reject' ? 'rejected' : 'accepted (a closer match: IoU 0.8, the same class)') + '. Counts first and asks.';
           sl.appendChild(eb);
         }
-        if (sl.childNodes.length) decide.appendChild(sl);
+        if (sl.childNodes.length) more.appendChild(sl);
       }
       if (classGrid) {
         var g = el('div', 'rv-q-classes');
@@ -2085,15 +2252,20 @@
           cb.appendChild(document.createTextNode(' ' + c));
           g.appendChild(cb);
         });
-        decide.appendChild(g);
+        more.appendChild(g);
       }
     }
     // Why the box just rejected (or the selected rejected box) was wrong: optional chips.
     var ri = reasonTarget();
+    // Two columns: a slot of one row in the card, there with or without chips, so what is under
+    // the card stays put when they come and go. One column: after the card.
+    var reasonSlot = !oneColumn.matches && !refBlock ? el('div', 'rv-q-reason-slot') : null;
+    if (reasonSlot) decide.appendChild(reasonSlot);
     if (ri >= 0) {
       var rb = boxes()[ri];
       var rr = el('div', 'rv-q-reason');
-      // One wrapping row of short chips (the full text is the tooltip): the box list keeps its room.
+      // One row of short chips (the full text is the tooltip; it scrolls sideways when they do not
+      // fit): the box list keeps its room.
       var cap = el('span', 'muted', (ri === selected ? 'Why?' : (ri + 1) + ' why?'));
       cap.title = 'Optional: why box ' + (ri + 1) + ' is wrong' + (touchUi.matches ? '' : ' (Shift+1-9)');
       rr.appendChild(cap);
@@ -2105,7 +2277,7 @@
         cb.appendChild(document.createTextNode(r[2]));
         rr.appendChild(cb);
       });
-      decide.appendChild(rr);
+      (reasonSlot || more).appendChild(rr);
       // On a phone the chips are one row that scrolls: fade the edge with more chips past it.
       rr.setAttribute('data-scroll-cue', '');
       if (window.PrismLive && window.PrismLive.scrollCue) window.PrismLive.scrollCue(rr);
@@ -2135,23 +2307,15 @@
         (touchUi.matches ? 'Reject as duplicate or No, reject under the question' : 'u rejects it as a duplicate, r rejects it as wrong') +
         '. Saving with both kept stops flagging the frame.';
     }
-    // While the bar at the foot shows the progress, the card keeps only the stack / repeat tools.
-    var showCount = p.total && !inBar;
-    if (showCount || stackBtn || repeatBtn || lapNote) {
+    // The HUD over the frame and the dock show the progress: the card keeps the stack / repeat tools.
+    if (stackBtn || repeatBtn || lapNote) {
       var line = el('div', 'rv-progress');
-      if (showCount) {
-        var bar = el('progress');
-        bar.max = p.total;
-        bar.value = p.done;
-        line.appendChild(bar);
-      }
       var row = el('div', 'rv-progress-row');
-      row.appendChild(el('span', 'muted', showCount ? p.done + '/' + p.total + ' done · ' + p.undecided + ' undecided' + (p.unchecked ? ' · ' + p.unchecked + ' to check' : '') : ''));
       if (lapNote) row.appendChild(lapNote);
       if (stackBtn) row.appendChild(stackBtn);
       if (repeatBtn) row.appendChild(repeatBtn);
       line.appendChild(row);
-      decide.appendChild(line);
+      more.appendChild(line);
     }
   }
 
@@ -2211,38 +2375,66 @@
     }
   }
 
-  // Wide screens: the frame's CSS height is capped at the window less the line over it
-  // (style.css reads `--rv-head`), so the line and the whole frame fit together.
-  var metaRow = document.querySelector('.review-meta-row');
-  function fitHead() {
-    // On the stage: the overview's place over the frame reads it too.
-    if (metaRow) (stage || canvas).style.setProperty('--rv-head', metaRow.offsetHeight + 'px');
+  // One column: the frame box's height (`--rv-stage-h`) is the tallest frame's this viewer has
+  // seen (its ratio kept in storage, `stage-ar`), so a frame of a wider ratio letterboxes and the
+  // HUD, the buttons and the card under it never move: the overview (shown while following, the
+  // default) and the frame at the stylesheet's sizes, at most STAGE_CAP of the small viewport
+  // height. Two columns: the stylesheet sizes the box (the window under the HUD).
+  var STAGE_CAP = 0.6, MIN_STAGE = 0.4, OV_SHARE = 0.26, FRAME_SHARE_OV = 0.48, FRAME_SHARE = 0.6, OV_GAP = 4.8;
+  var STAGE_AR = 4 / 3;
+  var CARD_PEEK = 104, DOCK_MIN = 86;   // CSS px: the card's question, why and row of answers; the dock
+  var stageAr = parseFloat((function () { try { return window.localStorage.getItem('bop.review.stage-ar'); } catch (e) { return null; } })()) || 0;
+  var svhProbe = el('div', 'rv-svh-probe');
+  svhProbe.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(svhProbe);
+  function sizeStage() {
+    if (!frameBox) return;
+    if (!oneColumn.matches) {
+      if (frameBox.style.getPropertyValue('--rv-stage-h')) frameBox.style.removeProperty('--rv-stage-h');
+      return;
+    }
+    var ar = canvas.width / canvas.height;
+    if (cur && ar > 0 && (!stageAr || ar < stageAr)) {
+      stageAr = ar;
+      try { window.localStorage.setItem('bop.review.stage-ar', String(Math.round(ar * 1000) / 1000)); } catch (e) { /* not kept */ }
+    }
+    // At least a 4:3 frame's height (with 16:9 the commonest camera ratio): a session mixing the
+    // two never grows the box.
+    var a = Math.min(stageAr || ar, ar, STAGE_AR);
+    var w = frameBox.clientWidth || window.innerWidth, svh = svhProbe.offsetHeight || window.innerHeight;
+    var h = followPref()
+      ? Math.round(Math.min(w / a, OV_SHARE * svh)) + OV_GAP + Math.min(w / a, FRAME_SHARE_OV * svh)
+      : Math.min(w / a, FRAME_SHARE * svh);
+    // The cap also leaves the HUD, the view buttons, the message line, the top of the card, the
+    // row of Back / Skip / Next and the dock on one screen (their heights are the layout's own).
+    var hh = function (e) { return e ? e.getBoundingClientRect().height : 0; };
+    var tools = root.querySelector('.rv-tools');
+    var dock = Math.max(hh(decideBar), hh(saveBtn && saveBtn.closest('.rv-actions-main')), DOCK_MIN);
+    var box = frameBox.getBoundingClientRect(), hudTop = hud ? hud.getBoundingClientRect().top : box.top;
+    // From the frame box's foot to the card's top (the view buttons, gaps, the message line), as
+    // laid out, while the card is there; else the sum of what is known.
+    var between = decide.offsetParent ? decide.getBoundingClientRect().top - box.bottom : hh(tools) + 5 + hh(msg) + 12;
+    var rest = 4 + (box.top - hudTop) + between + CARD_PEEK + hh(moreRow) + dock;
+    var cap = Math.max(MIN_STAGE * svh, Math.min(STAGE_CAP * svh, svh - rest));
+    var px = Math.round(Math.min(h, cap)) + 'px';
+    var ov = Math.round(Math.min(w / a, OV_SHARE * svh)) + 'px';
+    if (frameBox.style.getPropertyValue('--rv-ov-h') !== ov) frameBox.style.setProperty('--rv-ov-h', ov);
+    if (frameBox.style.getPropertyValue('--rv-stage-h') !== px) frameBox.style.setProperty('--rv-stage-h', px);
   }
 
-  // A new frame: the page scrolls as little as needed to show the whole frame and the side panel
-  // (with its Save row; from the grid's top when they are taller than the window), the box list
-  // starts at its top.
+  // A new frame lands at the same place, to the pixel: one column with the HUD 4 px under the
+  // window's top, two columns with the grid 8 px under it (the frame box and the side panel fill
+  // the window from there). The box list starts at its top.
   function revealFrame() {
     releaseFrame();
     boxList.scrollTop = 0;
-    fitHead();
+    sizeStage();
     revealSelected();
     if (!grid) return;
-    var top = grid.getBoundingClientRect().top;
-    // One column: from the line over the frame (or the frame); the panel may go on below the screen.
-    if (oneColumn.matches) {
-      var head = phoneHead && phoneHead.getBoundingClientRect().height ? phoneHead : grid;
-      top = head.getBoundingClientRect().top;
-      // Every frame lands at the same spot, to the pixel: a frame shown 1 px lower than the last
-      // is a frame that moved.
-      if (Math.abs(top - 4) > 0.5) window.scrollBy(0, top - 4);
-      return;
-    }
-    var bottom = Math.max(canvas.getBoundingClientRect().bottom, side ? side.getBoundingClientRect().bottom : 0);
-    var by = 0;
-    if (top < 0) by = top - 8;
-    else if (bottom > window.innerHeight) by = Math.min(top - 8, bottom - window.innerHeight + 8);
-    if (by) window.scrollBy(0, by);
+    var head = oneColumn.matches && hud && hud.getBoundingClientRect().height ? hud : grid;
+    var at = oneColumn.matches ? 4 : 8;
+    var top = head.getBoundingClientRect().top;
+    if (Math.abs(top - at) > 0.5) window.scrollBy(0, top - at);
   }
 
   // ---- edits --------------------------------------------------------------------------------
@@ -2625,7 +2817,7 @@
         // Short: the panel's message line sits above the box list.
         say(verb + 'ed ' + (r.boxes || 0) + ' ' + b.label + ' box(es) here on ' + (r.changed || 0) + ' ' + cam + ' frame(s)' +
           (n ? ', ' + n + ' more on this one' : '') + ((r.failed || []).length ? '; ' + r.failed.length + ' not changed' : '') + '.');
-        return loadNext(null, null, true);
+        return loadNext(null, null, true, cur && cur.frame);
       });
     }).catch(function (e) { say(e.message, true); });
   }
@@ -3288,12 +3480,16 @@
   var legendText = legendHover ? legendHover.textContent : '';
   function touchViewUi() {
     var on = touchUi.matches;
+    // The touch UI's slots (Draw, Redraw; the image setting goes in View): style.css by `rv-touch`.
+    root.classList.toggle('rv-touch', on);
     if (drawBtn) {
       drawBtn.hidden = !on;
       drawBtn.setAttribute('aria-pressed', drawMode ? 'true' : 'false');
     }
     if (redrawBtn) {
-      redrawBtn.hidden = !on || !boxes()[selected];
+      // Its slot stays while no box is selected: shown and hidden in place.
+      redrawBtn.hidden = !on;
+      redrawBtn.classList.toggle('rv-off', !boxes()[selected]);
       redrawBtn.setAttribute('aria-pressed', taps && taps.kind === 'redraw' ? 'true' : 'false');
     }
     if (viewMenu) {
@@ -3334,19 +3530,42 @@
   touchWords();
   touchViewUi();
 
-  // "Accept proposals" (Shift+A): on one column the bar shows "Accept likely" in its place when
-  // the frame has likely boxes, and it moves to the row of Skip / Back / Next (not while deciding:
-  // then the answers have the bar and Accept likely is beside the box list).
+  // "Accept proposals" (Shift+A) keeps its cell in the Save row on every layout: on one column the
+  // dock shows "Accept likely" beside it when the frame has likely boxes (the row has one more
+  // cell, the dock the same height), so nothing moves when they come or go.
   var acceptAllBtn = $('rv-accept-all');
   var moreRow = document.querySelector('.rv-actions-more');
   function placeAcceptAll() {
     if (!acceptAllBtn || !likelyBar || !moreRow) return;
-    // While deciding, Accept likely is beside the box list (the bar holds the answers): Accept
-    // proposals keeps its place in the row of Save & next.
-    var away = oneColumn.matches && !likelyBar.hidden && !root.classList.contains('rv-deciding');
-    if (away && acceptAllBtn.parentNode !== moreRow) moreRow.insertBefore(acceptAllBtn, moreRow.firstChild);
-    else if (!away && acceptAllBtn.parentNode === moreRow) likelyBar.parentNode.insertBefore(acceptAllBtn, likelyBar.nextSibling);
+    if (acceptAllBtn.parentNode === moreRow) likelyBar.parentNode.insertBefore(acceptAllBtn, likelyBar.nextSibling);
   }
+
+  // One column while the dock holds the answers: Save & next in the fifth cell of the row of Back /
+  // Skip / Next / Undo, Accept proposals and Reject the rest under the card. These are copies of the
+  // dock's buttons (style.css shows them in that mode only, hidden in place otherwise): the dock's own
+  // never move from one container to another, so nothing on the screen jumps when the mode changes.
+  var copies = root.querySelectorAll('.rv-nav-save, .rv-flow-acts button');
+  Array.prototype.forEach.call(copies, function (b) {
+    b.addEventListener('click', function () {
+      var act = b.getAttribute('data-act');
+      if (act === 'save') save('reviewed');
+      else if (act === 'accept-all') acceptProposals();
+      else if (act === 'reject-rest') rejectRest();
+    });
+  });
+  // They are answers to the screen as it is (`aria-hidden` while hidden, focusable while shown).
+  function placeSave(inBar) {
+    if (!copies) return;
+    var on = oneColumn.matches && inBar;
+    Array.prototype.forEach.call(copies, function (b) {
+      if (on) { b.removeAttribute('aria-hidden'); b.removeAttribute('tabindex'); } else { b.setAttribute('aria-hidden', 'true'); b.tabIndex = -1; }
+      var p = b.parentNode;
+      if (p.classList.contains('rv-flow-acts')) { if (on) p.removeAttribute('aria-hidden'); else p.setAttribute('aria-hidden', 'true'); }
+    });
+  }
+
+  // The frame box's size before the first frame comes (one column): nothing moves when it does.
+  sizeStage();
 
   // "Larger close-up": a wider side panel (per viewer).
   var wideBtn = $('rv-crop-wide');
@@ -3376,7 +3595,7 @@
   var resizeTimer = null;
   window.addEventListener('resize', function () {
     if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () { resizeTimer = null; fitHead(); draw(); }, 100);
+    resizeTimer = setTimeout(function () { resizeTimer = null; sizeStage(); draw(); }, 100);
   });
 
   // ---- loading and saving -------------------------------------------------------------------
@@ -3415,14 +3634,20 @@
     if (j.balance) add('Reviewed frames', balanceCounts(j.balance));
     add('Matching', j.position ? (j.position + ' of ' + j.total) : (j.total || 0));
     if (j.unreadable) add('Unreadable', j.unreadable);
-    queuePlace = j.position ? (j.position + ' of ' + j.total) : '';
-    // The counts are behind Details on a phone: the line says the order is still filling in.
-    phoneIndexing = j.indexing ? 'indexing' : '';
-    setPhoneLine();
+    // The place of the frame the answer landed on (the HUD shows it once that frame is on screen).
+    // Recommended and `balance:` re-sort the queue after every save, so a place in it jumps
+    // (15, then 25, then 11): the HUD says how many frames are left instead.
+    var left = reSorting();
+    queuePlace = { frame: j.item ? j.item.frame : null, left: left,
+      text: left ? (j.item ? String(j.total || 0) : '') : (j.position ? j.position + ' / ' + j.total : '') };
+    // The counts are behind Details on a phone: the HUD's title says the order is still filling in.
+    queueIndexing = !!j.indexing;
+    setHudPos(true);
   }
 
-  // Phones: one line over the frame; Details opens the counts, the filters and the frame's facts.
-  var queuePlace = '', phoneIndexing = '';
+  // The queue's place of the frame its last answer landed on ({frame, text}), and whether the
+  // folder's index is still filling in.
+  var queuePlace = { frame: null, text: '', left: false }, queueIndexing = false;
   // The queue's item of the frame it last landed on (GET /v1/review/next), for what only the
   // queue knows: why `balance=` put it there, and whether it is a random pick.
   var queueItem = null;
@@ -3475,11 +3700,43 @@
     if (b.camera_reviewed != null) parts.push('camera ' + item.camera + ' (' + b.camera_reviewed + ')');
     return parts.length ? 'balancing: ' + parts.join(', ') : '';
   }
-  function setPhoneLine() {
-    if (!phoneLine) return;
+  // The HUD's queue slot: "15 / 250" for the frame on screen. A frame the queue did not land on
+  // (Back) shows a dash. `fromCounts`: a counts answer, whose frame may still be on its way (its
+  // own render shows the place then; nothing flickers meanwhile).
+  // A re-sorting order shows "249 left": the queue's, whatever frame is on screen.
+  function setHudPos(fromCounts) {
+    if (!hudEl.pos) return;
+    var q = queuePlace;
+    var on = !!cur && !!q.text && (q.left || q.frame === cur.frame);
+    if (fromCounts && !on && cur) return;
+    hudSet(hudEl.pos, on ? q.text : '', on && q.left ? [el('span', 'rv-hud-left', 'left')] : null);
+    var indexingNote = queueIndexing ? ' (the folder is still being indexed: counts and order are filling in)' : '';
+    hudEl.pos.parentNode.title = on
+      ? (q.left ? q.text + ' frames left. This order is worked out again after every save, so a frame has no fixed place in it.'
+        : 'Frame ' + q.text.replace(' / ', ' of ') + ' of the queue') + indexingNote
+      : (cur ? 'This frame is not where the queue is (an earlier frame)' : 'The place of the frame in the queue');
+  }
+
+  // Orders worked out again after every save: Recommended and `balance:` (balanceBy).
+  function reSorting() { return balanceBy() !== ''; }
+
+  var SCENE_ICONS = { day: '☀', night: '☾', ir: '◐' };
+  // The HUD's frame slots: queue place, camera, scene, time, random pick (setHudBoxes does the box
+  // slots, showSession the pace).
+  function setHud() {
+    if (!hud) return;
     var r = (cur && cur.record) || {};
-    phoneLine.textContent = [queuePlace ? 'Frame ' + queuePlace : '', phoneIndexing, isRandomPick() ? 'random pick' : '', r.scene, r.camera].filter(Boolean).join(' · ') || 'Review';
-    phoneLine.title = $('rv-meta').textContent;
+    setHudPos(false);
+    hudSet(hudEl.camera, cur ? r.camera : '');
+    if (hudEl.scene) {
+      hudSet(hudEl.scene, cur && r.scene ? (r.scene === 'ir' ? 'IR' : r.scene) : '');
+      if (cur && r.scene && SCENE_ICONS[r.scene]) hudEl.scene.insertBefore(el('span', 'sc', SCENE_ICONS[r.scene]), hudEl.scene.firstChild);
+    }
+    var P = globalThis.PrismTime;
+    hudSet(hudEl.time, cur && r.timestamp ? (P ? P.day(r.timestamp) : r.timestamp) : '');
+    if (hudEl.time) hudEl.time.parentNode.title = cur && r.timestamp ? 'Taken ' + (P ? P.when(r.timestamp) : r.timestamp) : 'When the frame was taken';
+    var pick = $('rv-pick');
+    if (pick) pick.classList.toggle('rv-off', !isRandomPick());
   }
 
   function fillCameras(list) {
@@ -3537,8 +3794,7 @@
 
   function setMeta() {
     var m = $('rv-meta');
-    $('rv-pick').hidden = !isRandomPick();
-    if (!cur) { m.textContent = ''; return; }
+    if (!cur) { m.textContent = ''; setHud(); return; }
     var r = cur.record || {};
     var p = r.provenance;
     var origin = p
@@ -3559,13 +3815,23 @@
     if (queueItem && queueItem.frame === cur.frame && queueItem.event_rank != null) parts.push('event: frame ' + (queueItem.event_rank + 1));
     if (queueItem && queueItem.frame === cur.frame && queueItem.balance) parts.push(balanceNote(queueItem));
     m.textContent = parts.filter(Boolean).join(' · ');
-    setPhoneLine();
+    setHud();
   }
 
+  // The workspace shows (style.css `rv-ready`) once its first frame, or "no frame", is in; at the
+  // latest after READY_MS (an answer that never comes: the page's messages must be seen).
+  var READY_MS = 4000;
+  function ready() { root.classList.add('rv-ready'); }
+  setTimeout(ready, READY_MS);
+
+  var noneShown = false;   // "no frame matches" (or the folder is gone) in place of the frame
   function showNone(on) {
+    noneShown = on;
+    if (on) ready();
     $('rv-none').hidden = !on || !!missingNote.textContent;
     missingNote.hidden = !on || !missingNote.textContent;
     canvas.hidden = on;
+    if (frameBox) frameBox.hidden = on;
     if (on && cropWrap) cropWrap.hidden = true;
   }
 
@@ -3616,22 +3882,47 @@
     indexTimer = setTimeout(function () {
       indexTimer = null;
       // A poll: it does not keep the session alive (`X-Prism-Poll`, live.js).
-      background(function () { loadNext(null, null, true); });
+      background(function () { loadNext(null, null, true, cur && cur.frame); });
     }, INDEX_POLL_MS);
   }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) stopIndexPoll();
-    else if (indexing && !indexTimer) background(function () { loadNext(null, null, true); });
+    else if (indexing && !indexTimer) background(function () { loadNext(null, null, true, cur && cur.frame); });
   });
   // Leaving the tab (or the page kept in the back-forward cache): no refresh in the background.
   window.addEventListener('pagehide', stopIndexPoll);
   window.addEventListener('pageshow', function (e) { if (e.persisted) pollIndexing(); });
 
+  // The queue's next frame, before it is asked for: its image (decoded by the browser) and its
+  // labels (GET /v1/review/labels), so Save & next shows it at once. The labels are used for
+  // PREFETCH_MAX_MS only; a save still sends the revision they came with, so labels someone changed
+  // meanwhile are refused (409) rather than overwritten.
+  var PREFETCH_MAX_MS = 60000;
+  var prefetched = null;   // {frame, at, labels: promise of the answer or null}
   function prefetch() {
     var next = upcoming[0];
     if (!next || (cur && next === cur.frame)) return;
+    if (prefetched && prefetched.frame === next && Date.now() - prefetched.at < PREFETCH_MAX_MS) return;
     prefetchImg = new Image();
     prefetchImg.src = '/dataset/image?path=' + encodeURIComponent(next);
+    if (prefetchImg.decode) prefetchImg.decode().catch(function () { /* loadFrame asks again */ });
+    prefetched = {
+      frame: next, at: Date.now(),
+      labels: api('/v1/review/labels?frame=' + encodeURIComponent(next)).catch(function () { return null; })
+    };
+  }
+
+  // The frame's image, decoded before it is shown (the prefetched one when it is the same URL),
+  // so a frame change swaps the old frame for the new one in one paint, never through black.
+  function decodedImage(url) {
+    var abs = url;
+    try { abs = new URL(url, location.href).href; } catch (e) { /* as given */ }
+    var im = prefetchImg && prefetchImg.src === abs ? prefetchImg : null;
+    if (!im) { im = new Image(); im.src = url; }
+    var ready = im.decode ? im.decode()
+      : new Promise(function (res, rej) { if (im.complete) res(); else { im.onload = res; im.onerror = rej; } });
+    // A frame that does not decode is shown as it comes (black until it does, if ever).
+    return ready.then(function () { return im; }, function () { return im; });
   }
 
   // Frames on their way to the screen (`loadFrame`): a counts refresh does not land over one.
@@ -3639,11 +3930,23 @@
 
   // `nav`: 'back' (`p`) or 'forward' (`n` after Back); else a move on, which forgets the frames
   // Back left.
+  // The frame stays on screen until the new one's labels and decoded image are both in, then
+  // everything changes in one go (a newer loadFrame wins over one still on its way).
+  var frameSeq = 0;
   function loadFrame(frame, nav) {
     clearReason(true);
     framesLoading++;
+    var seq = ++frameSeq;
     var settled = function () { framesLoading--; };
-    return api('/v1/review/labels?frame=' + encodeURIComponent(frame)).then(function (j) {
+    var url = '/v1/review/labels?frame=' + encodeURIComponent(frame);
+    var pre = prefetched && prefetched.frame === frame && Date.now() - prefetched.at < PREFETCH_MAX_MS ? prefetched : null;
+    if (pre) prefetched = null;
+    var labels = pre ? pre.labels.then(function (j) { return j || api(url); }) : api(url);
+    return labels.then(function (j) {
+      return decodedImage(j.image_url).then(function (im) { return [j, im]; });
+    }).then(function (got) {
+      if (seq !== frameSeq) return;
+      var j = got[0];
       if (cur && cur.frame !== j.frame) {
         if (nav === 'back') fwdStack.push(cur.frame);
         else { backStack.push(cur.frame); if (nav !== 'forward') fwdStack = []; }
@@ -3665,9 +3968,10 @@
       dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
       canvas.width = j.width || 640;
       canvas.height = j.height || 360;
-      // The CSS size keeps this ratio (style.css caps a tall frame at the window's height).
+      // The CSS size keeps this ratio inside the frame box (style.css).
       canvas.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
       overview.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
+      sizeStage();
       view.z = 1; view.ox = 0; view.oy = 0;
       hoverIdx = -1;
       selected = nextUndecided(-1);
@@ -3686,13 +3990,14 @@
       // Following (`x`): the new frame opens zoomed on its first box (or the suggestion's place).
       var opening = viewTarget();
       if (view.follow && opening) zoomTo(opening);
-      img = new Image();
-      img.onload = draw;
-      img.src = j.image_url;
+      img = got[1];
+      if (!img.complete) img.onload = draw;
       showNone(false);
       setMeta();
       refresh();
       revealFrame();
+      ready();
+      guardDock();
       prefetch();
       if (draftNote) say(draftNote[0], draftNote[1]);
     }).then(settled, function (e) { settled(); throw e; });
@@ -3748,10 +4053,14 @@
   }
 
   // The next frame after `after` (the first without), `note` said first; `countsOnly` refreshes
-  // the counts and lists and keeps the frame on screen (and its edits). At most one walk at a time
-  // for a real Next; the promise ends once what this call asked for, or what replaced it, is done.
-  function loadNext(after, note, countsOnly) {
-    var want = { after: after, note: note, countsOnly: !!countsOnly };
+  // the counts and lists and keeps the frame on screen (and its edits). `then`: where to land when
+  // `after` is no longer listed (a save took it out of the view): on `then` while it is listed, so a
+  // save goes on to the frame that was next (and its place, 15 of 250 -> 15 of 249) instead of the
+  // queue's start; a counts refresh passes the frame on screen, so the place shown is its own. At
+  // most one walk at a time for a real Next; the promise ends once what this call asked for, or what
+  // replaced it, is done.
+  function loadNext(after, note, countsOnly, then) {
+    var want = { after: after, note: note, countsOnly: !!countsOnly, then: then || null };
     var kind = function (w) { return w ? (w.countsOnly ? 'counts' : 'real') : null; };
     var plan = R.nextPlan(kind(nextRun), kind(nextWaiting), kind(want));
     if (plan === 'drop') return nextRun.done;
@@ -3764,25 +4073,39 @@
     return runNext(want);
   }
 
+  // The counts and the filters over the grid change height (a class's count wraps to a new line):
+  // while the page shows the grid (landed on it, revealFrame), it is kept where it was on the screen.
+  function keepGrid(fn) {
+    var before = grid && !oneColumn.matches ? grid.getBoundingClientRect().top : null;
+    fn();
+    if (before == null || before > 8.5) return;
+    var d = grid.getBoundingClientRect().top - before;
+    if (Math.abs(d) > 0.5) window.scrollBy(0, d);
+  }
+
   function runNext(want) {
     var run = { countsOnly: want.countsOnly, stale: false, noLanding: false, done: null };
     var after = want.after, note = want.note, countsOnly = want.countsOnly;
     nextRun = run;
     var p = filterParams();
     if (after) p.set('after', after);
+    if (want.then) p.set('then', want.then);
     run.done = api('/v1/review/next?' + p.toString()).then(function (j) {
       if (run.stale) return;
-      showCounts(j);
-      fillCameras(j.cameras);
-      fillLabels(j.labels);
-      noteMissing(j.folder_missing ? j.message : '');
-      followIndexing(j.indexing);
+      keepGrid(function () {
+        showCounts(j);
+        fillCameras(j.cameras);
+        fillLabels(j.labels);
+        noteMissing(j.folder_missing ? j.message : '');
+        followIndexing(j.indexing);
+      });
       var shown = !!cur || framesLoading > 0;
       if (R.nextLanding(countsOnly ? 'counts' : 'real', run.noLanding, shown) === 'counts') return;
       upcoming = Array.isArray(j.upcoming) ? j.upcoming : [];
       var text = note || '';
       if (j.wrapped) text = (text ? text + ' ' : '') + 'Back to the first frame of the queue.';
-      if (text || note === '') say(text);
+      // A save's note (green: it went through); Next's '' clears the line.
+      if (text || note === '') say(text, false, !!note);
       if (!j.item) {
         if (cur) backStack.push(cur.frame);
         cur = null; img = null; undo = []; dirty = false; selected = -1;
@@ -3794,6 +4117,7 @@
       return loadFrame(j.item.frame);
     }).catch(function (e) {
       if (run.stale) return;
+      ready();
       say(e.message, true);
       // A failed refresh does not end the indexing message: the next one may answer.
       if (indexing) pollIndexing();
@@ -3809,14 +4133,12 @@
 
   // After a job or a bulk accept: a frame with unsaved edits stays, else the queue reloads.
   function reloadQueue() {
-    if (cur && dirty) return loadNext(null, null, true);
+    if (cur && dirty) return loadNext(null, null, true, cur.frame);
     return loadNext();
   }
 
   function showConflict(text) {
-    msg.textContent = '';
-    msg.className = 'form-msg error-text';
-    msg.appendChild(document.createTextNode(text + ' '));
+    say(text, true);
     var frame = cur && cur.frame;
     msg.appendChild(button('Reload frame', function () {
       if (!frame) return;
@@ -3907,21 +4229,37 @@
     var frame = cur.frame, w = cur.width, h = cur.height;
     var url = '/v1/review/labels?frame=' + encodeURIComponent(frame);
     if (cur.revision != null) url += '&revision=' + encodeURIComponent(cur.revision);
+    // The frame that was next when this one was served: the save goes on there (`then`).
+    var then = upcoming[0] !== frame ? upcoming[0] : null;
+    if (prefetched && prefetched.frame === frame) prefetched = null;
+    saveBusy(true);
     postJson(url, body).then(function (j) {
       dirty = false;
       if (window.PrismDraft) PrismDraft.drop(DRAFT);
       if (status === 'reviewed') { noteSaved(decisions); noteHistory(frame, body, w, h); }
-      // After Back: on to the frame Back left (the counts refresh), else the queue's next.
+      // After Back: on to the frame Back left (the counts refresh with its place), else the queue's
+      // next.
       if (fwdStack.length) {
-        say((j.message || 'Saved.') + note);
-        loadNext(null, null, true);
-        return loadFrame(fwdStack.pop(), 'forward');
+        var to = fwdStack.pop();
+        say((j.message || 'Saved.') + note, false, true);
+        loadNext(null, null, true, to);
+        return loadFrame(to, 'forward');
       }
-      return loadNext(frame, (j.message || 'Saved.') + note);
+      return loadNext(frame, (j.message || 'Saved.') + note, false, then);
     }).catch(function (e) {
       if (e.conflict) showConflict(e.message);
       else say(e.message, true);
-    }).then(function () { busy = false; });
+    }).then(function () { busy = false; saveBusy(false); });
+  }
+
+  // Save & next while a save is on its way: a busy look at the same size (a second press is ignored
+  // by `busy`).
+  function saveBusy(on) {
+    [saveBtn, root.querySelector('.rv-nav-save')].forEach(function (b) {
+      if (!b) return;
+      b.classList.toggle('rv-busy', on);
+      if (on) b.setAttribute('aria-busy', 'true'); else b.removeAttribute('aria-busy');
+    });
   }
 
   // `n`: the next frame without saving; after Back, the frame Back left.
@@ -3985,11 +4323,17 @@
     if (!sessionLine) return;
     var fs = session.frames, min = Math.floor((Date.now() - session.start) / 60000);
     sessionLine.textContent = '';
-    if (!fs.length) return;
+    if (!fs.length) {
+      hudSet(hudEl.pace, '');
+      if (detailsPace) detailsPace.textContent = '';
+      return;
+    }
     var rate = acceptRate(fs);
     var nb = 0;
     fs.forEach(function (f) { nb += f.boxes || 0; });
     var pace = boxesPerMinute(fs);
+    // The HUD's pace slot (Details holds the whole line where the HUD has no room for it).
+    hudSet(hudEl.pace, nb + ' box' + (nb === 1 ? '' : 'es') + (nb && pace ? ' · ' + pace + '/min' : ''));
     var parts = [
       'Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'),
       nb + ' box' + (nb === 1 ? '' : 'es') + (nb && pace ? ', ' + pace + ' a minute' : '')
@@ -3997,6 +4341,7 @@
     if (rate != null) parts.push(Math.round(rate * 100) + '% accepted');
     parts.push(min + ' min');
     sessionLine.appendChild(el('span', null, parts.join(' · ')));
+    if (detailsPace) detailsPace.textContent = parts.join(' · ');
     if (fs.length >= 15) {
       var last = fs.slice(-10), lr = acceptRate(last);
       if (median(seconds(last)) < 0.4 * median(seconds(fs)) && lr != null && rate != null && lr > rate) {
@@ -4020,11 +4365,22 @@
   if (likelyBar) likelyBar.addEventListener('click', acceptLikely);
   var infoBtn = $('rv-info-toggle');
   if (infoBtn) {
-    infoBtn.addEventListener('click', function () {
-      var open = $('review').classList.toggle('rv-info-open');
-      infoBtn.textContent = open ? 'Hide' : 'Details';
-      infoBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    infoBtn.addEventListener('click', function () { showDetails(!root.classList.contains('rv-info-open')); });
+    // Two columns: Details lies over the frame, so a click anywhere else closes it (one column
+    // keeps it open with the counts and filters it shows above the frame).
+    document.addEventListener('pointerdown', function (ev) {
+      if (!root.classList.contains('rv-info-open') || oneColumn.matches) return;
+      var box = $('rv-details');
+      if ((box && box.contains(ev.target)) || infoBtn.contains(ev.target)) return;
+      showDetails(false);
     });
+  }
+  // Details: the frame's full facts (and on one column the counts and the filters) open or closed.
+  function showDetails(open) {
+    root.classList.toggle('rv-info-open', open);
+    if (!infoBtn) return;
+    infoBtn.textContent = open ? 'Hide' : 'Details';
+    infoBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
   }
   $('rv-reject-rest').addEventListener('click', rejectRest);
   if (imgBtn) imgBtn.addEventListener('click', function () { cycleImg(); canvas.focus({ preventScroll: true }); });
@@ -4091,7 +4447,7 @@
   function filterReload() {
     filtersShown();
     if (leaveOk()) { loadNext(); return; }
-    loadNext(null, null, true);
+    loadNext(null, null, true, cur && cur.frame);
     say('Kept this frame with its unsaved changes; the new filters apply from the next frame.');
   }
   var filterTimer = null;
@@ -4346,7 +4702,8 @@
     } else if (k === 'Escape') {
       // The quarter look goes back to the whole frame first; then a two-tap box waiting for its
       // corners is cancelled (Draw itself stays on), else no box is selected.
-      if (!endQuarters()) {
+      if (root.classList.contains('rv-info-open') && !oneColumn.matches) showDetails(false);
+      else if (!endQuarters()) {
         if (taps) cancelTaps(true); else select(-1);
       }
     }
@@ -4887,7 +5244,7 @@
   var draft0 = window.PrismDraft ? PrismDraft.load(DRAFT) : null;
   if (draft0 && typeof draft0.id === 'string' && draft0.id) {
     draftWaiting = true;
-    loadNext(null, null, true);
+    loadNext(null, null, true, draft0.id);
     loadFrame(draft0.id).then(function () { draftWaiting = false; }, function () {
       draftWaiting = false;
       PrismDraft.drop(DRAFT);
@@ -4897,7 +5254,7 @@
   } else if (linkFrame) {
     // The frame the link names, the counts beside it; Next goes on in the link's filters. Gone: the
     // queue as usual.
-    loadNext(null, null, true);
+    loadNext(null, null, true, linkFrame);
     loadFrame(linkFrame).catch(function () {
       say('The frame in the link is not in the dataset (any more): showing the queue.', true);
       loadNext();

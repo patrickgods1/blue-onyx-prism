@@ -44,15 +44,16 @@ pub(super) const UPCOMING: usize = 5;
 
 impl Answer {
     /// The answer from the files: [`queue::build`], [`queue::next_after`] and
-    /// [`layout::damaged_lines`]. What the index has to equal.
-    pub fn walk(dir: &Path, f: &Filters, after: Option<&str>) -> Self {
+    /// [`layout::damaged_lines`]. What the index has to equal. `after` and `then` as
+    /// [`queue::next_after`] reads them.
+    pub fn walk(dir: &Path, f: &Filters, after: Option<&str>, then: Option<&str>) -> Self {
         let damaged = layout::damaged_lines(dir, f.source == QueueSource::All);
-        Self::of(queue::build(dir, f), damaged, after)
+        Self::of(queue::build(dir, f), damaged, after, then)
     }
 
     /// The answer of a built queue with `damaged` lines left out of it.
-    pub(super) fn of(built: Queue, damaged: u64, after: Option<&str>) -> Self {
-        let found = queue::next_after(&built.items, after);
+    pub(super) fn of(built: Queue, damaged: u64, after: Option<&str>, then: Option<&str>) -> Self {
+        let found = queue::next_after(&built.items, after, then);
         Self {
             item: found.map(|(_, i, _)| i.clone()),
             position: found.map(|(p, _, _)| p + 1),

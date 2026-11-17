@@ -806,7 +806,11 @@ camera gate (30)*) and the counts (*Reviewed frames*). A pending box can be a fa
 brings up its false detections too; the likely-box order inside a need keeps real ones ahead.
 
 `after=<frame>` returns the frame after the one shown, which is how **Next** skips a frame without saving.
-After the last frame it returns the first one again with `"wrapped": true`. The answer also carries the
+After the last frame it returns the first one again with `"wrapped": true`. A save usually takes the
+frame shown out of the list, so `after` names a frame that is no longer listed; `then=<frame>`, the frame
+that was next after it, is then the answer itself, at the saved frame's old position (`queue::next_after`).
+A listed `after` wins over `then`, and with neither listed the answer is the first frame. `then` alone gives
+the position of the frame on screen. The answer also carries the
 counts: reviewed, remaining, skipped, confirmed empty, rejected boxes, accepted boxes per class, and the
 frames to review (`auto_review`) and accept-ready (`auto_accept`) by the `auto` rules. `audit_accepted`
 and `audit_rejected` count the audit boxes of reviewed frames a reviewer found real or not; a bulk reject

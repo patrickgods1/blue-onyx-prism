@@ -3,7 +3,6 @@
 {% block content %}
 {% include "train/tabs.html" %}
 <div id="review" data-classes="{{ classes_json }}">
-<div id="rv-phone-head" class="rv-phone-head"><span id="rv-phone-line" class="rv-phone-line">Review</span> <button type="button" id="rv-info-toggle" class="small secondary" aria-expanded="false">Details</button></div>
 <div class="rv-bar">
   <div id="rv-counts" class="review-counts" role="status">Loading...</div>
   <a id="rv-autolabel-link" class="rv-al-link" href="/train/autolabel">Auto-label these frames</a>
@@ -35,45 +34,54 @@
 
 <div class="review-grid">
   <div class="review-stage">
-    <div class="review-meta-row"><div id="rv-meta" class="muted review-meta"></div><button type="button" id="rv-pick" class="term rv-chip rv-pick" data-tip="1 frame in 5 is picked at random, whatever it shows, so results can be checked on frames nobody chose. Review it like any other." hidden>random pick</button><span id="rv-zoom" class="muted review-zoom"></span><button type="button" id="rv-imgmode" class="small secondary">Image</button><button type="button" id="rv-zoombox" class="small secondary" hidden>Zoom to box</button><button type="button" id="rv-draw" class="small secondary" aria-pressed="false" hidden>Draw</button><button type="button" id="rv-redraw" class="small secondary" aria-pressed="false" hidden>Redraw</button><details id="rv-view-menu" class="rv-view-menu" hidden><summary>View</summary><div class="rv-view-items">
-      <button type="button" class="small secondary" data-view="zoom-in">Zoom in</button>
-      <button type="button" class="small secondary" data-view="zoom-out">Zoom out</button>
-      <button type="button" class="small secondary" data-view="fit">Fit whole frame</button>
-      <button type="button" class="small secondary" data-view="hide" aria-pressed="false">Hide boxes</button>
-      <button type="button" class="small secondary" data-view="labels" aria-pressed="true">Labels</button>
-      <button type="button" class="small secondary" data-view="spotlight" aria-pressed="false">Spotlight</button>
-      <button type="button" class="small secondary" data-view="image">Image</button>
-      <button type="button" class="small secondary" data-view="brighter">Brighter</button>
-      <button type="button" class="small secondary" data-view="darker">Darker</button>
-      <button type="button" class="small secondary" data-view="reset">Reset image</button>
-    </div></details></div>
-    <canvas id="rv-overview" class="rv-overview" width="1" height="1" hidden aria-label="Overview of the whole frame: the outlined part is the one the frame shows. Tap or click a box to select it, or elsewhere to move the view there."></canvas>
-    <canvas id="rv-canvas" width="640" height="360" tabindex="0" aria-label="The frame with its boxes. Click a box to select it, drag its handles to resize it, drag inside it to move it, drag elsewhere to draw a new one; the wheel zooms."></canvas>
+    <!-- The HUD (review.js setHud): every value in a slot of its own and of a fixed size, so a value
+         changes in place and nothing around it moves. An empty value shows a dim dash. -->
+    <div class="rv-head">
+      <div class="rv-hud" role="group" aria-label="This frame">
+        <span class="rv-slot rv-hud-pos" data-slot="pos" title="The frame's place in the queue"><span id="rv-hud-pos" class="rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-progress" data-slot="progress" title="Boxes done on this frame"><span class="rv-hud-meter" aria-hidden="true"><i id="rv-hud-meter"></i></span><span id="rv-hud-done" class="rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-todo" data-slot="todo"><span id="rv-hud-todo" class="rv-hud-chip rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-camera" data-slot="camera" title="Camera"><span id="rv-hud-camera" class="rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-scene" data-slot="scene" title="Scene"><span id="rv-hud-scene" class="rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-time" data-slot="time" title="When the frame was taken"><span id="rv-hud-time" class="rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-pick" data-slot="pick"><button type="button" id="rv-pick" class="term rv-chip rv-pick rv-off" data-tip="1 frame in 5 is picked at random, whatever it shows, so results can be checked on frames nobody chose. Review it like any other.">random pick</button></span>
+        <span class="rv-slot rv-hud-pace" data-slot="pace" title="This session: boxes decided and boxes a minute"><span id="rv-hud-pace" class="rv-empty">&mdash;</span></span>
+        <span class="rv-slot rv-hud-details" data-slot="details"><button type="button" id="rv-info-toggle" class="small secondary" aria-expanded="false" aria-controls="rv-details">Details</button></span>
+      </div>
+      <div class="review-meta-row rv-tools"><span class="rv-slot rv-tool-zoom" data-slot="zoom"><span id="rv-zoom" class="muted review-zoom"></span></span><span class="rv-slot rv-tool-zoombox" data-slot="zoombox"><button type="button" id="rv-zoombox" class="small secondary rv-off">Zoom to box</button></span><span class="rv-slot rv-tool-image" data-slot="image"><button type="button" id="rv-imgmode" class="small secondary">Image</button></span><span class="rv-slot rv-tool-draw" data-slot="draw"><button type="button" id="rv-draw" class="small secondary" aria-pressed="false">Draw</button></span><span class="rv-slot rv-tool-redraw" data-slot="redraw"><button type="button" id="rv-redraw" class="small secondary rv-off" aria-pressed="false">Redraw</button></span><span class="rv-slot rv-tool-view" data-slot="view"><details id="rv-view-menu" class="rv-view-menu"><summary>View</summary><div class="rv-view-items">
+        <button type="button" class="small secondary" data-view="zoom-in">Zoom in</button>
+        <button type="button" class="small secondary" data-view="zoom-out">Zoom out</button>
+        <button type="button" class="small secondary" data-view="fit">Fit whole frame</button>
+        <button type="button" class="small secondary" data-view="hide" aria-pressed="false">Hide boxes</button>
+        <button type="button" class="small secondary" data-view="labels" aria-pressed="true">Labels</button>
+        <button type="button" class="small secondary" data-view="spotlight" aria-pressed="false">Spotlight</button>
+        <button type="button" class="small secondary" data-view="image">Image</button>
+        <button type="button" class="small secondary" data-view="brighter">Brighter</button>
+        <button type="button" class="small secondary" data-view="darker">Darker</button>
+        <button type="button" class="small secondary" data-view="reset">Reset image</button>
+      </div></details></span></div>
+    </div>
+    <!-- Details: the frame's full facts, over the frame (out of the flow). -->
+    <div id="rv-details" class="rv-details"><div id="rv-meta" class="review-meta"></div><div id="rv-details-pace" class="rv-details-pace muted"></div></div>
+    <!-- One size for every frame: the frame keeps its ratio inside it (top-aligned, centred). -->
+    <div class="rv-frame-box">
+      <canvas id="rv-overview" class="rv-overview" width="1" height="1" hidden aria-label="Overview of the whole frame: the outlined part is the one the frame shows. Tap or click a box to select it, or elsewhere to move the view there."></canvas>
+      <div class="rv-canvas-fit"><canvas id="rv-canvas" width="640" height="360" tabindex="0" aria-label="The frame with its boxes. Click a box to select it, drag its handles to resize it, drag inside it to move it, drag elsewhere to draw a new one; the wheel zooms."></canvas></div>
+    </div>
     <p id="rv-none" class="empty" hidden>No frame matches the filters. Send frames to review from the <a href="/train/collect">Collect</a> tab, or show all collected frames.</p>
   </div>
   <aside class="review-side card">
-    <figure id="rv-crop-wrap" class="review-crop" hidden><div class="rv-crop-area"><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas></div><figcaption><span id="rv-crop-cap" class="muted"></span> <button type="button" id="rv-crop-wide" class="small secondary rv-crop-wide">Larger close-up</button></figcaption></figure>
+    <div class="rv-side-body">
+    <figure id="rv-crop-wrap" class="review-crop"><div class="rv-crop-area"><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas></div><figcaption><span id="rv-crop-cap" class="muted">No box selected</span> <button type="button" id="rv-crop-wide" class="small secondary rv-crop-wide">Larger close-up</button></figcaption></figure>
     <div id="rv-decide" class="rv-decide" aria-live="polite"></div>
+    <!-- One column while the dock holds the answers: the frame's other actions under the card (the
+         same as the dock's in Save mode; hidden in place otherwise, so nothing under them moves). -->
+    <div class="rv-flow-acts" aria-hidden="true"><button type="button" class="small secondary" data-act="accept-all" tabindex="-1">Accept proposals</button><button type="button" class="small secondary" data-act="reject-rest" tabindex="-1">Reject the rest</button></div>
+    <div id="rv-decide-more" class="rv-decide-more"></div>
     <div id="rv-box-tools" class="rv-box-tools" hidden></div>
     <ol id="rv-boxes" class="review-boxes" aria-label="Boxes"></ol>
     <label class="check"><input type="checkbox" id="rv-empty"> Confirmed empty (no object of any class)</label>
     <button type="button" id="rv-list-toggle" class="small secondary rv-list-toggle" aria-expanded="false" aria-controls="rv-boxes">Boxes and options</button>
-    <div class="inline-row rv-actions">
-      <div class="rv-actions-main">
-      <button type="button" id="rv-save">Save &amp; next</button>
-      <button type="button" id="rv-accept-likely" class="small secondary" title="Accept every likely box (&#9733;) on this frame; the other boxes stay pending" hidden>Accept likely</button>
-      <button type="button" id="rv-accept-all" class="small secondary">Accept proposals</button>
-      <button type="button" id="rv-reject-rest" class="small secondary">Reject the rest</button>
-      </div>
-      <div class="rv-actions-more">
-      <button type="button" id="rv-skip" class="small secondary">Skip</button>
-      <button type="button" id="rv-back" class="small secondary">Back</button>
-      <button type="button" id="rv-next" class="small secondary">Next</button>
-      <button type="button" id="rv-undo" class="small secondary">Undo</button>
-      <button type="button" id="rv-keys-open" class="small secondary">Keys ?</button>
-      </div>
-    </div>
-    <p id="rv-msg" class="form-msg" role="status"></p>
     <p id="rv-session" class="rv-session muted" aria-live="polite"></p>
     <details id="rv-panel-opts" class="rv-panel-opts">
       <summary>Panel options</summary>
@@ -88,10 +96,34 @@
       <p class="small-print"><span class="swatch sw-pending"></span>pending (accepted on save) <span class="swatch sw-likely"></span>&#9733; likely real (outlined; first in the list; needs a decision before saving) <span class="swatch sw-review"></span>? flagged by the auto-labeler (outlined; needs a decision before saving) <span class="swatch sw-unlikely"></span>? flagged, unlikely (quieter, after a run that sorted its boxes) <span class="swatch sw-hint"></span>suppressed / below threshold (dashed; rejected on save unless accepted) <span class="swatch sw-accepted"></span>accepted <span class="swatch sw-added"></span>drawn <span class="swatch sw-rejected"></span>rejected <span class="swatch sw-ghost"></span>a box the dataset check proposes (dashed, violet; not a box until you accept it; a box it asks about is outlined in violet). Auto boxes say <em>auto: accept</em> (both labelers agree, 0.6 or more, no objection; a check mark on the label) or <em>auto: review</em> with the reason; a moved or resized box is accepted; frames a trained model disagrees with come first. A decided and checked box shows only its number; <span id="rv-legend-hover">the pointer over a box shows its full tag</span>.</p>
     </details>
     </details>
+    </div>
+    <!-- Pinned to the panel's foot (out of the scrolling part): the last message on one line, then the
+         frame's actions, in the same place on every frame. -->
+    <div class="rv-side-foot">
+    <p id="rv-msg" class="form-msg" role="status"></p>
+    <div class="rv-actions">
+      <div class="rv-actions-main">
+      <div class="rv-dock-head" aria-hidden="true"><span class="rv-bar-meter"><i></i></span><span class="rv-bar-q"></span><span class="rv-bar-count"></span></div>
+      <button type="button" id="rv-save">Save &amp; next</button>
+      <button type="button" id="rv-accept-likely" class="small secondary" title="Accept every likely box (&#9733;) on this frame; the other boxes stay pending" hidden>Accept likely</button>
+      <button type="button" id="rv-accept-all" class="small secondary">Accept proposals</button>
+      <button type="button" id="rv-reject-rest" class="small secondary">Reject the rest</button>
+      </div>
+      <div class="rv-actions-more">
+      <button type="button" id="rv-back" class="small secondary">Back</button>
+      <button type="button" id="rv-skip" class="small secondary">Skip</button>
+      <button type="button" id="rv-next" class="small secondary">Next</button>
+      <button type="button" id="rv-undo" class="small secondary">Undo</button>
+      <button type="button" id="rv-keys-open" class="small secondary">Keys ?</button>
+      <button type="button" class="rv-nav-save" data-act="save" tabindex="-1" aria-hidden="true">Save &amp; next</button>
+      </div>
+    </div>
+    </div>
   </aside>
   <!-- One column: the selected box's answers, pinned to the screen's foot over the whole grid (review.js renderDecision). -->
   <div id="rv-decide-bar" class="rv-decide-bar" hidden><div class="rv-bar-head"></div><div class="rv-bar-btns"></div></div>
 </div>
+
 
 <details class="card rv-bulk" id="rv-bulk">
   <summary>Bulk tools <span class="muted small">act on the frames the filters select</span></summary>

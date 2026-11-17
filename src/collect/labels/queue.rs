@@ -1692,15 +1692,24 @@ pub fn labelled_map<T: Send>(
     })
 }
 
-/// The item after `after` in `items` with its index: the first one when `after` is None or
-/// not listed; when `after` is the last one, the first again with `wrapped` = true (even
-/// `after` itself in a one-item list). None only for an empty list.
-pub fn next_after<'a>(items: &'a [Item], after: Option<&str>) -> Option<(usize, &'a Item, bool)> {
-    let pos = after.and_then(|a| items.iter().position(|i| i.frame == a));
-    match pos {
+/// The item after `after` in `items` with its index: when `after` is the last one, the first
+/// again with `wrapped` = true (even `after` itself in a one-item list). When `after` is None or
+/// not listed: `then` itself when it is listed (the frame that was next after one a save took
+/// out of the list, so the reviewer keeps their place), else the first one. None only for an
+/// empty list.
+pub fn next_after<'a>(
+    items: &'a [Item],
+    after: Option<&str>,
+    then: Option<&str>,
+) -> Option<(usize, &'a Item, bool)> {
+    let find = |name: Option<&str>| name.and_then(|n| items.iter().position(|i| i.frame == n));
+    match find(after) {
         Some(p) if p + 1 < items.len() => items.get(p + 1).map(|i| (p + 1, i, false)),
         Some(_) => items.first().map(|i| (0, i, true)),
-        None => items.first().map(|i| (0, i, false)),
+        None => match find(then) {
+            Some(p) => items.get(p).map(|i| (p, i, false)),
+            None => items.first().map(|i| (0, i, false)),
+        },
     }
 }
 
@@ -1810,25 +1819,51 @@ mod tests {
                 "none"
             ]
         );
-        assert_eq!(next_after(&items, None).unwrap().1.frame, "closest");
-        assert_eq!(next_after(&items, Some("far")).unwrap().0, 6);
-        let (i, it, wrapped) = next_after(&items, Some("none")).unwrap();
+        assert_eq!(next_after(&items, None, None).unwrap().1.frame, "closest");
+        assert_eq!(next_after(&items, Some("far"), None).unwrap().0, 6);
+        let (i, it, wrapped) = next_after(&items, Some("none"), None).unwrap();
         assert_eq!(
             (i, it.frame.as_str(), wrapped),
             (0, "closest", true),
             "wraps"
         );
         assert_eq!(
-            next_after(&items, Some("gone")).unwrap(),
+            next_after(&items, Some("gone"), None).unwrap(),
             (0, &items[0], false)
         );
         let one = &items[..1];
         assert_eq!(
-            next_after(one, Some("closest")).unwrap(),
+            next_after(one, Some("closest"), None).unwrap(),
             (0, &one[0], true)
         );
-        assert!(next_after(&[], None).is_none());
-        assert!(next_after(&[], Some("x")).is_none());
+        assert!(next_after(&[], None, None).is_none());
+        assert!(next_after(&[], Some("x"), None).is_none());
+    }
+
+    #[test]
+    fn then_keeps_the_place_of_a_frame_a_save_took_out() {
+        let items: Vec<Item> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|f| item(f, "0", u(None, false, 0)))
+            .collect();
+        let at = |after: Option<&str>, then: Option<&str>| {
+            let (i, it, wrapped) = next_after(&items, after, then).unwrap();
+            (i, it.frame.clone(), wrapped)
+        };
+        // `after` listed: next after it, `then` ignored, wrapping as before.
+        assert_eq!(at(Some("b"), Some("a")), (2, "c".into(), false));
+        assert_eq!(at(Some("d"), Some("b")), (0, "a".into(), true));
+        // `after` gone (saved out of the list), `then` listed: on `then` itself, never wrapped.
+        assert_eq!(at(Some("saved"), Some("c")), (2, "c".into(), false));
+        assert_eq!(at(Some("saved"), Some("d")), (3, "d".into(), false));
+        assert_eq!(at(Some("saved"), Some("a")), (0, "a".into(), false));
+        // `then` alone: the place of the frame on screen.
+        assert_eq!(at(None, Some("b")), (1, "b".into(), false));
+        // Neither listed: the first.
+        assert_eq!(at(Some("saved"), Some("gone")), (0, "a".into(), false));
+        assert_eq!(at(None, Some("gone")), (0, "a".into(), false));
+        assert_eq!(at(None, None), (0, "a".into(), false));
+        assert!(next_after(&[], Some("x"), Some("y")).is_none());
     }
 
     #[test]
