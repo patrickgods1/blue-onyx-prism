@@ -36,8 +36,8 @@ pub const FORM_FIELDS: &[&str] = &[
     "confidence_threshold",
     "nms_iou",
     "object_filter",
+    "timezone",
     "log_level",
-    "log_timezone",
     "log_path",
     "save_image_path",
     "save_ref_image",
@@ -230,8 +230,8 @@ pub fn parse_config_form(
     if let Some(v) = get("log_path") {
         c.log_path = dir("log_path", v)?;
     }
-    if let Some(v) = get("log_timezone") {
-        c.log_timezone = v.parse()?;
+    if let Some(v) = get("timezone") {
+        c.timezone = v.parse()?;
     }
     // Not on the Config page (not in `FORM_FIELDS`); accepted from API clients.
     if let Some(v) = get("log_format") {
@@ -1244,12 +1244,15 @@ mod tests {
     }
 
     #[test]
-    fn log_timezone_is_parsed_from_the_form() {
+    fn timezone_is_parsed_from_the_form() {
         let mut c = Config::default();
-        parse_config_form(&mut c, &form(&[("log_timezone", " America/New_York ")])).unwrap();
-        assert_eq!(c.log_timezone.to_string(), "America/New_York");
-        let err = parse_config_form(&mut c, &form(&[("log_timezone", "mars")])).unwrap_err();
-        assert!(format!("{err:#}").contains("log_timezone"), "{err:#}");
+        parse_config_form(&mut c, &form(&[("timezone", " America/New_York ")])).unwrap();
+        assert_eq!(c.timezone.to_string(), "America/New_York");
+        let err = parse_config_form(&mut c, &form(&[("timezone", "mars")])).unwrap_err();
+        assert!(format!("{err:#}").contains("timezone"), "{err:#}");
+        // The retired name is not a form field.
+        parse_config_form(&mut c, &form(&[("log_timezone", "utc")])).unwrap();
+        assert_eq!(c.timezone.to_string(), "America/New_York");
     }
 
     #[test]

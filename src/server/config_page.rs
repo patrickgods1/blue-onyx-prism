@@ -52,8 +52,8 @@ pub(super) struct ConfigView {
     confidence_threshold: String,
     nms_iou: String,
     object_filter: String,
+    timezone: String,
     log_level: String,
-    log_timezone: String,
     log_path: String,
     save_image_path: String,
     save_ref_image: bool,
@@ -112,8 +112,8 @@ impl ConfigView {
                 .to_string(),
             nms_iou: crate::config::clean_f32(c.nms_iou).to_string(),
             object_filter: c.object_filter.join(", "),
+            timezone: c.timezone.to_string(),
             log_level: c.log_level.as_str().to_string(),
-            log_timezone: c.log_timezone.to_string(),
             log_path: path(&c.log_path),
             save_image_path: path(&c.save_image_path),
             save_ref_image: c.save_ref_image,
@@ -165,7 +165,7 @@ impl ConfigView {
                         "nms_iou" => &mut self.nms_iou,
                         "object_filter" => &mut self.object_filter,
                         "log_level" => &mut self.log_level,
-                        "log_timezone" => &mut self.log_timezone,
+                        "timezone" => &mut self.timezone,
                         "log_path" => &mut self.log_path,
                         "save_image_path" => &mut self.save_image_path,
                         "save_image_max_age_days" => &mut self.save_image_max_age_days,
@@ -589,17 +589,17 @@ pub(super) struct LevelChoice {
     pub(super) selected: bool,
 }
 
-/// An option of the "Log timestamp time zone" dropdown.
+/// An option of the "Time zone" dropdown.
 struct TimezoneChoice {
     value: String,
     label: String,
     selected: bool,
 }
 
-/// Time zones offered by the dropdown: `(log_timezone value, label)`.
-const LOG_TIMEZONES: &[(&str, &str)] = &[
-    ("utc", "UTC"),
+/// Time zones offered by the dropdown: `(timezone value, label)`.
+const TIMEZONES: &[(&str, &str)] = &[
     ("local", "Local (this computer's time zone)"),
+    ("utc", "UTC"),
     ("America/Los_Angeles", "Pacific (Los Angeles)"),
     ("America/Denver", "Mountain (Denver)"),
     ("America/Phoenix", "Arizona (Phoenix, no DST)"),
@@ -619,13 +619,13 @@ const LOG_TIMEZONES: &[(&str, &str)] = &[
     ("Pacific/Auckland", "New Zealand (Auckland)"),
 ];
 
-/// The dropdown's options with `current` selected. A value not in [`LOG_TIMEZONES`] (an offset or
+/// The dropdown's options with `current` selected. A value not in [`TIMEZONES`] (an offset or
 /// another IANA name set in the config file, or a rejected submission) is kept as a first
 /// "Custom" option so saving the page does not change it.
 fn timezone_choices(current: &str) -> Vec<TimezoneChoice> {
     let current = current.trim();
-    let current = if current.is_empty() { "utc" } else { current };
-    let mut out: Vec<TimezoneChoice> = LOG_TIMEZONES
+    let current = if current.is_empty() { "local" } else { current };
+    let mut out: Vec<TimezoneChoice> = TIMEZONES
         .iter()
         .map(|&(value, label)| TimezoneChoice {
             value: value.to_string(),
@@ -726,7 +726,7 @@ pub(super) struct ConfigTemplate {
     c: ConfigView,
     models: Vec<ModelSelectRow>,
     log_levels: Vec<LevelChoice>,
-    log_timezones: Vec<TimezoneChoice>,
+    timezones: Vec<TimezoneChoice>,
     device_choices: Vec<DeviceChoice>,
     message: Option<String>,
     error: Option<String>,
@@ -957,7 +957,7 @@ pub(super) fn config_template(
         c.overlay(form);
     }
     let log_levels = level_choices(&c.log_level);
-    let log_timezones = timezone_choices(&c.log_timezone);
+    let timezones = timezone_choices(&c.timezone);
     let device_choices = device_choices(&snap, &c.device, &c.gpu_index);
     let resource_groups = crate::resources::status::grouped(
         crate::resources::status::rows(state.resources.as_ref(), &cfg),
@@ -1045,7 +1045,7 @@ pub(super) fn config_template(
         c,
         models,
         log_levels,
-        log_timezones,
+        timezones,
         device_choices,
         message,
         error,
@@ -1142,11 +1142,9 @@ pub(super) fn save_config(
     if pending.restart_needed() {
         msg.push_str(" Restart the server to apply the other changes.");
     }
-    let tz = state.config_read().log_timezone;
-    if tz != up.before.log_timezone
-        && let Some(h) = &state.log_reload
-    {
-        h.set_timezone(tz);
+    let tz = state.config_read().timezone;
+    if tz != up.before.timezone {
+        crate::clock::change(tz);
     }
     if let Some(level) = level {
         match apply_log_level(state, level) {
@@ -1552,10 +1550,15 @@ mod tests {
                 .collect()
         };
         assert_eq!(selected("utc"), ["utc|UTC"]);
-        assert_eq!(selected(""), ["utc|UTC"]);
+        assert_eq!(selected(""), ["local|Local (this computer's time zone)"]);
         assert_eq!(
             selected("local"),
             ["local|Local (this computer's time zone)"]
+        );
+        assert_eq!(
+            timezone_choices("")[0].value,
+            "local",
+            "the default comes first"
         );
         assert_eq!(
             selected("America/Los_Angeles"),
@@ -1568,9 +1571,9 @@ mod tests {
         assert!(custom[0].selected);
         assert_eq!(custom.iter().filter(|t| t.selected).count(), 1);
         // Every offered value is accepted by the config parser.
-        for (value, _) in LOG_TIMEZONES {
+        for (value, _) in TIMEZONES {
             value
-                .parse::<crate::config::LogTimezone>()
+                .parse::<crate::clock::Zone>()
                 .unwrap_or_else(|e| panic!("{value}: {e:#}"));
         }
     }
@@ -1818,6 +1821,33 @@ mod tests {
         assert!(
             html.contains("benchmark best 0.34</span> <span class=\"muted\">set</span>"),
             "{html}"
+        );
+    }
+
+    /// A saved `timezone` becomes the process-wide zone at once (logs, names, pages).
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the test lock serializes the tests that set the process-wide zone"
+    )]
+    async fn a_saved_time_zone_applies_at_once() {
+        let _g = crate::clock::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = crate::clock::set(crate::clock::Zone::Utc);
+        let state = test_state();
+        let body = format!("timezone={}", urlencode("Asia/Tokyo"));
+        let (s, _, b) = call(&state, post_form("/config", &body, true)).await;
+        let now = crate::clock::zone();
+        crate::clock::set(before);
+        let page = String::from_utf8(b).unwrap();
+        assert_eq!(s, StatusCode::OK);
+        assert!(page.contains("Applied now: Time zone"), "{page}");
+        assert_eq!(now, "Asia/Tokyo".parse().unwrap());
+        assert_eq!(state.config_read().timezone, now);
+        assert!(
+            page.contains("<option value=\"Asia/Tokyo\" selected>"),
+            "{page}"
         );
     }
 

@@ -100,6 +100,16 @@ fn config_of_0_2_0_loads_with_every_setting_and_saves_in_the_current_format() {
     assert_eq!(c.format, CONFIG_FORMAT);
     assert_eq!(c.models.len(), 3);
     assert!(c.collect.enabled && c.collect.hidden_classes == ["squirrel"]);
+    // The one key whose value moves on purpose: the retired `log_timezone` is read into
+    // `timezone`, and 0.2.0's "utc" (the default every save wrote) means "local".
+    let mut old = old;
+    let retired = old.as_object_mut().unwrap().remove("log_timezone");
+    assert_eq!(
+        retired,
+        Some(Value::from("utc")),
+        "the fixture names log_timezone"
+    );
+    assert_eq!(c.timezone, blue_onyx_prism::clock::Zone::Local);
     assert_kept(&old, &serde_json::to_value(&c).unwrap(), "config");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -111,6 +121,11 @@ fn config_of_0_2_0_loads_with_every_setting_and_saves_in_the_current_format() {
     let saved = json(&std::fs::read_to_string(&path).unwrap());
     assert_eq!(saved["format"], CONFIG_FORMAT);
     assert_kept(&old, &saved, "saved config");
+    assert!(
+        saved.get("log_timezone").is_none(),
+        "the retired key is not written"
+    );
+    assert_eq!(saved["timezone"], "local");
     assert_eq!(Config::load(&path).unwrap(), c);
 
     // The same file with remote administration on (retired): it loads, the start can see the key

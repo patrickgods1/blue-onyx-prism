@@ -147,111 +147,6 @@ impl std::str::FromStr for LogFormat {
     }
 }
 
-/// Time zone of log timestamps (`log_timezone`). Stored in the config as a string: `"utc"`
-/// (the default), `"local"` (the computer's zone), an IANA name (`"America/Los_Angeles"`) or a
-/// fixed offset (`"+08:00"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LogTimezone {
-    /// UTC, `2026-10-16T00:54:59.580Z` (the default).
-    #[default]
-    Utc,
-    /// The computer's time zone.
-    Local,
-    /// An IANA zone (follows its daylight saving rules).
-    Named(chrono_tz::Tz),
-    /// A fixed offset from UTC.
-    Fixed(chrono::FixedOffset),
-}
-
-impl LogTimezone {
-    /// `t` as a timestamp: `...580Z` in UTC, else RFC 3339 with milliseconds and the numeric
-    /// offset (`2026-10-15T17:54:59.580-07:00`).
-    pub fn format(&self, t: chrono::DateTime<chrono::Utc>) -> String {
-        use chrono::SecondsFormat::Millis;
-        match self {
-            LogTimezone::Utc => t.to_rfc3339_opts(Millis, true),
-            LogTimezone::Local => t
-                .with_timezone(&chrono::Local)
-                .to_rfc3339_opts(Millis, false),
-            LogTimezone::Named(tz) => t.with_timezone(tz).to_rfc3339_opts(Millis, false),
-            LogTimezone::Fixed(o) => t.with_timezone(o).to_rfc3339_opts(Millis, false),
-        }
-    }
-}
-
-impl std::fmt::Display for LogTimezone {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogTimezone::Utc => f.write_str("utc"),
-            LogTimezone::Local => f.write_str("local"),
-            LogTimezone::Named(tz) => f.write_str(tz.name()),
-            LogTimezone::Fixed(o) => {
-                let secs = o.local_minus_utc();
-                let (sign, a) = if secs < 0 { ('-', -secs) } else { ('+', secs) };
-                write!(f, "{sign}{:02}:{:02}", a / 3600, a % 3600 / 60)
-            }
-        }
-    }
-}
-
-impl std::str::FromStr for LogTimezone {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        let t = s.trim();
-        let bad = || {
-            anyhow::anyhow!(
-                "log_timezone: '{t}' is not a time zone. Use \"utc\", \"local\" (this computer's                  zone), an IANA name such as \"America/Los_Angeles\" or a fixed offset such as                  \"+08:00\" or \"-05:30\"; fix the value in the config file or on the Config page"
-            )
-        };
-        match t.to_ascii_lowercase().as_str() {
-            "utc" => return Ok(LogTimezone::Utc),
-            "local" => return Ok(LogTimezone::Local),
-            _ => {}
-        }
-        if let Some(sign @ ('+' | '-')) = t.chars().next() {
-            let digits = t.get(1..).unwrap_or_default().as_bytes();
-            let &[h1, h2, b':', m1, m2] = digits else {
-                return Err(bad());
-            };
-            if ![h1, h2, m1, m2].iter().all(u8::is_ascii_digit) {
-                return Err(bad());
-            }
-            let two = |a: u8, b: u8| i32::from(a - b'0') * 10 + i32::from(b - b'0');
-            let (h, m) = (two(h1, h2), two(m1, m2));
-            if h > 23 || m > 59 {
-                return Err(bad());
-            }
-            let secs = (h * 3600 + m * 60) * if sign == '-' { -1 } else { 1 };
-            return chrono::FixedOffset::east_opt(secs)
-                .map(LogTimezone::Fixed)
-                .ok_or_else(bad);
-        }
-        t.parse::<chrono_tz::Tz>()
-            .map(LogTimezone::Named)
-            .map_err(|_| bad())
-    }
-}
-
-impl TryFrom<String> for LogTimezone {
-    type Error = anyhow::Error;
-    fn try_from(s: String) -> Result<Self> {
-        s.parse()
-    }
-}
-
-impl Serialize for LogTimezone {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for LogTimezone {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
 impl std::str::FromStr for LogLevel {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -626,8 +521,11 @@ impl ModelConfig {
     }
 }
 
+/// `remote = "Self"`: the derives become the inherent `Config::serialize` / `Config::deserialize`,
+/// and the trait impls below wrap them (the deserializer resolves `timezone` against the retired
+/// `log_timezone`). Call `serde_json` and friends, never the inherent functions, outside tests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, remote = "Self")]
 pub struct Config {
     /// Layout version of the file ([`CONFIG_FORMAT`]; absent = the current one). Every save
     /// writes the current one; a file of a later format is refused at load
@@ -768,10 +666,20 @@ pub struct Config {
     /// per line, for log shippers); the console stays text. An unknown value is a parse error
     /// naming the key. Process restart.
     pub log_format: LogFormat,
-    /// Time zone of log timestamps: `"utc"` (default), `"local"`, an IANA name
-    /// (`"America/Los_Angeles"`) or a fixed offset (`"+08:00"`). An unknown value is a parse
-    /// error naming the key. Applies at once.
-    pub log_timezone: LogTimezone,
+    /// The time zone of log timestamps, file and folder names and every time shown to people
+    /// ([`crate::clock`]): `"local"` (default, this computer's zone), `"utc"`, an IANA name
+    /// (`"America/Los_Angeles"`) or a fixed offset (`"+08:00"`). Timestamps stored inside
+    /// records stay UTC. An unknown value is a parse error naming the key. Applies at once
+    /// ([`crate::clock::change`]). A file without it takes the retired `log_timezone`, except
+    /// that key's old default `"utc"` (every save wrote it), which means `"local"` (the
+    /// `Deserialize` impl).
+    #[serde(default = "timezone_unset")]
+    pub timezone: crate::clock::Zone,
+    /// Retired: the zone of log timestamps only, before `timezone` covered names and views.
+    /// Read from old files only (never written: `skip_serializing`) and folded into `timezone`
+    /// while the file is read; always None afterwards.
+    #[serde(default, skip_serializing)]
+    pub log_timezone: Option<crate::clock::Zone>,
     /// Save annotated images here (optional).
     pub save_image_path: Option<PathBuf>,
     pub save_ref_image: bool,
@@ -992,7 +900,8 @@ impl Default for Config {
             log_level: LogLevel::Info,
             log_path: None,
             log_format: LogFormat::Text,
-            log_timezone: LogTimezone::Utc,
+            timezone: crate::clock::Zone::Local,
+            log_timezone: None,
             save_image_path: None,
             save_ref_image: false,
             save_image_max_age_days: DEFAULT_SAVE_IMAGE_MAX_AGE_DAYS,
@@ -1014,6 +923,38 @@ impl Default for Config {
             models: Vec::new(),
             benchmark: BenchmarkConfig::default(),
         }
+    }
+}
+
+/// What a file without `timezone` deserializes to before [`Config::deserialize`] resolves it: an
+/// offset of 23:59:59, which no `timezone` value parses to (offsets are whole minutes up to
+/// 23:59), so it can only mean "absent". It never leaves deserialization.
+fn timezone_unset() -> crate::clock::Zone {
+    const SECS: i32 = 24 * 3600 - 1;
+    chrono::FixedOffset::east_opt(SECS)
+        .map(crate::clock::Zone::Fixed)
+        .unwrap_or_default()
+}
+
+impl Serialize for Config {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        Config::serialize(self, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    /// The derived fields, then `timezone`: the file's value when present; else the retired
+    /// `log_timezone` unless that is `"utc"` (the old default, which every save wrote, so it
+    /// says nothing about a choice); else `"local"`. `log_timezone` is None afterwards.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let mut c = Config::deserialize(d)?;
+        let legacy = c.log_timezone.take();
+        if c.timezone == timezone_unset() {
+            c.timezone = legacy
+                .filter(|z| *z != crate::clock::Zone::Utc)
+                .unwrap_or_default();
+        }
+        Ok(c)
     }
 }
 
@@ -2263,79 +2204,92 @@ pub(crate) mod test_fields {
 #[cfg(test)]
 mod tests {
 
+    /// `timezone` defaults to local, round-trips, and a bad value names the key.
     #[test]
-    fn log_timezone_parses_every_form() {
-        assert_eq!(" UTC ".parse::<LogTimezone>().unwrap(), LogTimezone::Utc);
-        assert_eq!("Local".parse::<LogTimezone>().unwrap(), LogTimezone::Local);
-        let la: LogTimezone = "America/Los_Angeles".parse().unwrap();
-        assert!(matches!(la, LogTimezone::Named(_)));
-        assert_eq!(la.to_string(), "America/Los_Angeles");
-        for (s, shown) in [
-            ("+08:00", "+08:00"),
-            ("-05:30", "-05:30"),
-            ("+00:00", "+00:00"),
-        ] {
-            assert_eq!(s.parse::<LogTimezone>().unwrap().to_string(), shown);
-        }
-        for bad in [
-            "",
-            "mars",
-            "+8",
-            "+25:00",
-            "+08:60",
-            "08:00",
-            "+0800",
-            "Nowhere/City",
-        ] {
-            let e = bad.parse::<LogTimezone>().unwrap_err().to_string();
-            assert!(
-                e.contains("log_timezone") && e.contains("IANA"),
-                "{bad}: {e}"
-            );
-        }
-    }
-
-    #[test]
-    fn log_timezone_formats_a_fixed_instant() {
-        use chrono::TimeZone;
-        let t = chrono::Utc
-            .with_ymd_and_hms(2026, 10, 16, 0, 54, 59)
-            .unwrap()
-            + chrono::Duration::milliseconds(580);
-        let f = |s: &str| s.parse::<LogTimezone>().unwrap().format(t);
-        assert_eq!(f("utc"), "2026-10-16T00:54:59.580Z");
-        assert_eq!(f("+08:00"), "2026-10-16T08:54:59.580+08:00");
-        assert_eq!(f("-05:30"), "2026-10-15T19:24:59.580-05:30");
-        // DST: PDT (-07:00) in October, PST (-08:00) in January.
-        assert_eq!(f("America/Los_Angeles"), "2026-10-15T17:54:59.580-07:00");
-        let winter = chrono::Utc.with_ymd_and_hms(2026, 1, 16, 0, 0, 0).unwrap();
-        assert_eq!(
-            "America/Los_Angeles"
-                .parse::<LogTimezone>()
-                .unwrap()
-                .format(winter),
-            "2026-01-15T16:00:00.000-08:00"
-        );
-        assert!(chrono::DateTime::parse_from_rfc3339(&f("local")).is_ok());
-    }
-
-    #[test]
-    fn log_timezone_config_round_trip() {
+    fn timezone_config_round_trip() {
+        use crate::clock::Zone;
+        assert_eq!(Config::default().timezone, Zone::Local);
         let c: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(c.log_timezone, LogTimezone::Utc);
-        let c: Config = serde_json::from_str(r#"{"log_timezone":"Europe/Berlin"}"#).unwrap();
+        assert_eq!(c.timezone, Zone::Local);
+        let c: Config = serde_json::from_str(r#"{"timezone":"Europe/Berlin"}"#).unwrap();
         let text = serde_json::to_string(&c).unwrap();
-        assert!(text.contains(r#""log_timezone":"Europe/Berlin""#), "{text}");
+        assert!(text.contains(r#""timezone":"Europe/Berlin""#), "{text}");
+        assert!(!text.contains("log_timezone"), "{text}");
         let back: Config = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.log_timezone, c.log_timezone);
+        assert_eq!(back.timezone, c.timezone);
+        assert_eq!(back, c);
+        // The default is written too.
+        let text = Config::default().saved_text().unwrap();
+        assert!(text.contains(r#""timezone": "local""#), "{text}");
+        let err = serde_json::from_str::<Config>(r#"{"timezone":"mars"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timezone") && err.contains("mars"), "{err}");
+    }
+
+    /// The retired `log_timezone`: its old default `"utc"` (written by every save) means local,
+    /// any other value becomes `timezone`, `timezone` wins when both are there, and the key is
+    /// never written back.
+    #[test]
+    fn log_timezone_is_read_into_timezone() {
+        use crate::clock::Zone;
+        let read = |text: &str| serde_json::from_str::<Config>(text).unwrap();
+        let berlin: Zone = "Europe/Berlin".parse().unwrap();
+        for (text, want) in [
+            (r#"{"log_timezone":"utc"}"#, Zone::Local),
+            (r#"{"log_timezone":" UTC "}"#, Zone::Local),
+            (r#"{"log_timezone":"Europe/Berlin"}"#, berlin),
+            (r#"{"log_timezone":"local"}"#, Zone::Local),
+            (r#"{"log_timezone":"+08:00"}"#, "+08:00".parse().unwrap()),
+            (
+                r#"{"timezone":"utc","log_timezone":"Europe/Berlin"}"#,
+                Zone::Utc,
+            ),
+            (
+                r#"{"log_timezone":"Europe/Berlin","timezone":"local"}"#,
+                Zone::Local,
+            ),
+            (
+                r#"{"timezone":"Europe/Berlin","log_timezone":"utc"}"#,
+                berlin,
+            ),
+        ] {
+            let c = read(text);
+            assert_eq!(c.timezone, want, "{text}");
+            assert_eq!(c.log_timezone, None, "{text}");
+            let saved = c.saved_text().unwrap();
+            assert!(!saved.contains("log_timezone"), "{saved}");
+            assert_eq!(read(&saved).timezone, want, "{text}");
+        }
+        // A bad retired value is still an error that names it (the file needs fixing).
         let err = serde_json::from_str::<Config>(r#"{"log_timezone":"mars"}"#)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("log_timezone") && err.contains("mars"),
-            "{err}"
-        );
+        assert!(err.contains("mars"), "{err}");
+        // Through `serde_json::Value` (config_merge) and `parse_file` alike.
+        let v = serde_json::json!({"log_timezone": "Asia/Tokyo"});
+        let c: Config = serde_json::from_value(v).unwrap();
+        assert_eq!(c.timezone, "Asia/Tokyo".parse().unwrap());
+        let dir = std::env::temp_dir().join(format!("bop-cfg-tz-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        std::fs::write(&path, r#"{"log_timezone":"Asia/Tokyo"}"#).unwrap();
+        let parsed = Config::parse_file(&path).map(|c| c.timezone);
+        let loaded = Config::load(&path).map(|c| c.timezone);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(parsed, Some("Asia/Tokyo".parse().unwrap()));
+        assert_eq!(loaded.unwrap(), "Asia/Tokyo".parse().unwrap());
     }
+
+    /// The sentinel for an absent `timezone` is no value a file can hold.
+    #[test]
+    fn the_unset_timezone_cannot_be_parsed() {
+        let unset = super::timezone_unset();
+        assert_ne!(unset, crate::clock::Zone::default());
+        assert!(unset.to_string().parse::<crate::clock::Zone>().unwrap() != unset);
+        assert!("+23:59".parse::<crate::clock::Zone>().unwrap() != unset);
+    }
+
     #[test]
     fn dir_setting_accepts_own_folders() {
         use super::validate_dir_setting;

@@ -195,7 +195,7 @@ fn global_label(k: &str) -> String {
         "object_filter" => "Object filter".into(),
         "log_level" => "Log level".into(),
         "log_path" => "Log directory".into(),
-        "log_timezone" => "Log timestamp time zone".into(),
+        "timezone" => "Time zone".into(),
         "log_format" => "Log file format".into(),
         "save_image_path" => "Save annotated images to".into(),
         "save_ref_image" => "Save the unannotated image".into(),
@@ -422,7 +422,8 @@ impl Pending {
     }
 }
 
-/// Globals a restart does not need: the log level, `allowed_hosts` and
+/// Globals a restart does not need: the log level, the time zone ([`crate::clock::change`]),
+/// `allowed_hosts` and
 /// `allowed_networks` apply immediately (read per request, the last also per connection),
 /// the per-request settings go into every worker's live settings
 /// ([`crate::worker::LiveSettings`], through `ModelRegistry::apply_live`), `default_model`
@@ -433,7 +434,7 @@ pub fn live_global(k: &str) -> bool {
     matches!(
         k,
         "log_level"
-            | "log_timezone"
+            | "timezone"
             | "default_model"
             | "previous_default"
             | "allowed_hosts"
@@ -892,7 +893,7 @@ mod tests {
             Box::new(|c| c.save_image_max_mb = 100),
             Box::new(|c| c.request_timeout_secs = 3),
             Box::new(|c| c.log_level = crate::config::LogLevel::Trace),
-            Box::new(|c| c.log_timezone = "America/Los_Angeles".parse().unwrap()),
+            Box::new(|c| c.timezone = "America/Los_Angeles".parse().unwrap()),
             Box::new(|c| c.allowed_hosts = vec!["nas.home.arpa".into()]),
             Box::new(|c| c.max_image_pixels = 2_000_000),
             Box::new(|c| c.default_model = Some("yolo26s".into())),
@@ -1044,12 +1045,13 @@ mod tests {
     }
 
     #[test]
-    fn log_timezone_is_live() {
+    fn timezone_is_live() {
         let running = cfg();
         let mut c = running.clone();
-        c.log_timezone = "+08:00".parse().unwrap();
+        c.timezone = "+08:00".parse().unwrap();
         assert!(!pending(&running, &c).restart_needed());
-        assert!(live_global("log_timezone"));
+        assert!(live_global("timezone"));
+        assert_eq!(global_label("timezone"), "Time zone");
     }
 
     #[test]

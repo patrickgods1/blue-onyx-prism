@@ -79,10 +79,13 @@ pub(crate) const TOKEN_USER: &str = "api-token";
 /// At most one log line per this long for refused tokens: a guessing client would write one per
 /// request.
 const WARN_EVERY: Duration = Duration::from_secs(60);
-/// The place in `templates/base.html` where the signed-in name goes ([`show_user`]).
+/// The place in `templates/base.html` where the signed-in name goes ([`personalize`]).
 pub(super) const USER_MARKER: &str = "<!--bop:user-->";
-/// Largest page [`show_user`] rewrites (every page of the UI is far smaller).
-const SHOW_USER_LIMIT: usize = 8 * 1024 * 1024;
+/// The place in `templates/base.html` (`<html data-tz="...">`) where the configured time zone
+/// goes, for the page's scripts ([`personalize`], [`crate::clock::browser_name`]).
+pub(super) const TZ_MARKER: &str = "<!--bop:tz-->";
+/// Largest page [`personalize`] rewrites (every page of the UI is far smaller).
+const PERSONALIZE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// The refused-token warnings of this process.
 static WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
@@ -654,10 +657,49 @@ pub(super) fn refused(
     }
 }
 
-/// Put the signed-in `user` into an HTML page at [`USER_MARKER`] (`templates/base.html`'s
-/// header). Other answers, and pages over [`SHOW_USER_LIMIT`], pass as they are.
-pub(super) async fn show_user(resp: Response, user: &str) -> Response {
+/// Marks a response [`personalize`] has seen, so the router's outer pass ([`fill_zone`]) does
+/// not read the page again.
+#[derive(Debug, Clone, Copy)]
+struct Personalized;
+
+/// `text` with its markers filled: the account name `user` at [`USER_MARKER`] (None leaves the
+/// marker, an HTML comment in the header) and `zone` at [`TZ_MARKER`] (inside an attribute, so
+/// always replaced, by "" when nothing is left of `zone`). Both are cut to their safe alphabets
+/// (names `[a-z0-9._-]`, zones `[A-Za-z0-9_/+:-]`), so nothing needs escaping. None when the
+/// page has neither marker.
+pub(super) fn fill_markers(text: &str, user: Option<&str>, zone: &str) -> Option<String> {
+    let user = user.filter(|_| text.contains(USER_MARKER));
+    let has_zone = text.contains(TZ_MARKER);
+    if user.is_none() && !has_zone {
+        return None;
+    }
+    let mut page = text.to_string();
+    if let Some(user) = user {
+        // Account names are [a-z0-9._-] only; filtered anyway.
+        let name: String = user
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .collect();
+        page = page.replacen(USER_MARKER, &name, 1);
+    }
+    if has_zone {
+        let zone: String = zone
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '+' | ':' | '-'))
+            .collect();
+        page = page.replacen(TZ_MARKER, &zone, 1);
+    }
+    Some(page)
+}
+
+/// Fill an HTML page's markers ([`fill_markers`]): the signed-in `user` (`templates/base.html`'s
+/// header) and the process-wide time zone ([`crate::clock::browser_name`]). Other answers, pages
+/// over [`PERSONALIZE_LIMIT`] and pages already personalized pass as they are.
+pub(super) async fn personalize(resp: Response, user: Option<&str>) -> Response {
     use axum::body::HttpBody as _;
+    if resp.extensions().get::<Personalized>().is_some() {
+        return resp;
+    }
     let html = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -667,26 +709,30 @@ pub(super) async fn show_user(resp: Response, user: &str) -> Response {
         .body()
         .size_hint()
         .exact()
-        .is_some_and(|n| n <= SHOW_USER_LIMIT as u64);
+        .is_some_and(|n| n <= PERSONALIZE_LIMIT as u64);
     if !html || !small {
         return resp;
     }
     let (mut parts, body) = resp.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, SHOW_USER_LIMIT).await else {
+    parts.extensions.insert(Personalized);
+    let Ok(bytes) = axum::body::to_bytes(body, PERSONALIZE_LIMIT).await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "page could not be read").into_response();
     };
     let text = String::from_utf8_lossy(&bytes);
-    if !text.contains(USER_MARKER) {
-        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    match fill_markers(&text, user, &crate::clock::browser_name()) {
+        None => Response::from_parts(parts, axum::body::Body::from(bytes)),
+        Some(page) => {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, axum::body::Body::from(page))
+        }
     }
-    // Account names are [a-z0-9._-] only; escaped anyway.
-    let name: String = user
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        .collect();
-    let page = text.replacen(USER_MARKER, &name, 1);
-    parts.headers.remove(header::CONTENT_LENGTH);
-    Response::from_parts(parts, axum::body::Body::from(page))
+}
+
+/// The router's outer pass: [`personalize`] without an account name for every page the signed-in
+/// path did not fill (sign-in, setup, refusals, 404, the API token's pages), so `data-tz` is
+/// never left as a raw marker.
+pub(super) async fn fill_zone(resp: Response) -> Response {
+    personalize(resp, None).await
 }
 
 // ---------------------------------------------------------------------------------------------

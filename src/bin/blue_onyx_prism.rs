@@ -134,6 +134,22 @@ fn config_path(cli: &Cli) -> PathBuf {
         .unwrap_or_else(Config::default_config_path)
 }
 
+/// The config file a command works with: its own `--config` (the commands acting on a service),
+/// else the global one, else the default path.
+fn command_config_path(cli: &Cli) -> PathBuf {
+    let own = match &cli.command {
+        Some(
+            Command::AdminToken { config, .. }
+            | Command::User { config, .. }
+            | Command::SetupCode { config }
+            | Command::TlsFingerprint { config }
+            | Command::TlsRegenerate { config },
+        ) => config.clone(),
+        _ => None,
+    };
+    own.unwrap_or_else(|| config_path(cli))
+}
+
 /// The config file (`--config` or the default path) if it exists, else defaults. Read-only.
 /// A file that exists but cannot be read or parsed is an error (the message names the path).
 fn read_config(cli: &Cli) -> Result<Config> {
@@ -285,6 +301,12 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Every command (training, benchmark, accounts, diagnostics, the server) shows times and
+    // names files in the config's `timezone`, from its first log line on. A file that does not
+    // parse leaves `local`; the command itself reports it when it reads the config.
+    if let Some(c) = Config::parse_file(&command_config_path(&cli)) {
+        blue_onyx_prism::clock::set(c.timezone);
+    }
     match cli.command.clone() {
         Some(Command::SetupOpenvino {
             dest,
@@ -503,6 +525,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let (mut config, config_path) = cli::resolve_config(&cli)?;
+    blue_onyx_prism::clock::set(config.timezone);
     // CO-05: no models -> the default catalog model, so the UI comes up (and it downloads).
     cli::seed_default_model(&mut config, &config_path);
     // Initialized once; later level changes go through the reload handle (web UI, restart).
@@ -517,7 +540,6 @@ fn run(cli: Cli) -> Result<()> {
         config.log_level,
         log_path.as_deref(),
         config.log_format,
-        config.log_timezone,
         None,
     )?;
     cli::log_startup_warnings(&config, &config_path);
