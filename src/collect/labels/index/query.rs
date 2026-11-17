@@ -1,9 +1,10 @@
 //! The answer from the rows. In the uncertainty order ([`Order::Uncertain`]): one pass over them,
 //! no sort. `next_after` needs a place in the sorted queue and the few frames after it, which
-//! counting the rows before `after` and keeping the smallest few gives in one pass; a sort would
-//! build the order of every other frame to throw it away. The order is the one of
-//! [`super::super::queue::sort_items`]: [`Uncertainty::key`], then the newest, then the path. It
-//! has no ties, paths being unique, so what the pass finds is what the sort would put there.
+//! counting the rows before `after` (or `then`, the frame it lands on) and keeping the smallest
+//! few gives in one pass; a sort would build the order of every other frame to throw it away.
+//! The order is the one of [`super::super::queue::sort_items`]: [`Uncertainty::key`], then the
+//! newest, then the path. It has no ties, paths being unique, so what the pass finds is what the
+//! sort would put there.
 //!
 //! The Recommended order ([`Order::Recommended`]) is no key of a row alone: a row's event rank
 //! depends on the other rows of its event. Its pass gathers the counted rows per day folder and
@@ -430,9 +431,27 @@ impl Tally {
     }
 }
 
-/// The row `after` names, when it is listed.
-fn pivot<'a>(state: &'a State, q: &Compiled, after: Option<&str>) -> Option<Hit<'a>> {
-    let rel = after?;
+/// Where the placement starts from, as [`super::super::queue::next_after`] reads `after` and
+/// `then`: the listed row `after` names, past which it lands, else the listed row `then` names,
+/// on which it lands (`on`).
+#[derive(Clone, Copy)]
+struct Pivot<'a> {
+    hit: Hit<'a>,
+    on: bool,
+}
+
+impl<'a> Pivot<'a> {
+    fn of(state: &'a State, q: &Compiled, after: Option<&str>, then: Option<&str>) -> Option<Self> {
+        match listed(state, q, after) {
+            Some(hit) => Some(Self { hit, on: false }),
+            None => listed(state, q, then).map(|hit| Self { hit, on: true }),
+        }
+    }
+}
+
+/// The row `rel` names, when it is listed.
+fn listed<'a>(state: &'a State, q: &Compiled, rel: Option<&str>) -> Option<Hit<'a>> {
+    let rel = rel?;
     let (stem, json) = stem_of(rel)?;
     let (day, _) = rel.rsplit_once('/')?;
     let shard = state.shards.get(day)?;
@@ -496,20 +515,21 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
     }
 }
 
-/// The answer of `state` for `f` and `after`, with the frames it shows: [`Answer::indexing`] is the
-/// caller's.
+/// The answer of `state` for `f`, `after` and `then`, with the frames it shows:
+/// [`Answer::indexing`] is the caller's.
 pub(super) fn answer(
     state: &State,
     names: &Names,
     f: &Filters,
     after: Option<&str>,
+    then: Option<&str>,
 ) -> (Answer, Vec<String>) {
     let mut q = Compiled::new(f, names);
     // Before anything sorts: the pivot's place needs the scores too.
     if let Some(by) = f.balance_by() {
         q.weigh = Some(Weigh::new(by, f, state, &q, names));
     }
-    let pivot = pivot(state, &q, after);
+    let pivot = Pivot::of(state, &q, after, then);
     let mut tally = Tally::new(names);
     let placed = match f.order {
         Order::Uncertain => uncertain(state, &q, &mut tally, pivot.as_ref()),
@@ -560,12 +580,12 @@ struct Placed<'a> {
 }
 
 /// The uncertainty order in one pass, no sort: the rows before the pivot are counted and the
-/// first few of the queue and after the pivot kept.
+/// first few of the queue and after the pivot (from it, when the answer lands on it) kept.
 fn uncertain<'a>(
     state: &'a State,
     q: &Compiled,
     tally: &mut Tally,
-    pivot: Option<&Hit<'a>>,
+    pivot: Option<&Pivot<'a>>,
 ) -> Placed<'a> {
     let (mut first, mut next) = (Top(Vec::new()), Top(Vec::new()));
     let (mut total, mut before) = (0usize, 0usize);
@@ -581,19 +601,20 @@ fn uncertain<'a>(
         };
         first.offer(hit);
         if let Some(p) = pivot {
-            match hit.order(p) {
+            match hit.order(&p.hit) {
                 Ordering::Less => before += 1,
-                Ordering::Equal => {}
-                Ordering::Greater => next.offer(hit),
+                Ordering::Equal if !p.on => {}
+                Ordering::Equal | Ordering::Greater => next.offer(hit),
             }
         }
     });
-    // As `next_after`: past `after`, past the last back to the first, no `after` from the first.
-    let past_pivot = pivot.is_some() && before + 1 < total;
-    let (hits, position, wrapped) = if past_pivot {
-        (next.0, before + 2, false)
-    } else {
-        (first.0, 1, pivot.is_some())
+    // As `next_after`: past `after`, past the last back to the first, on `then`, else from the
+    // first.
+    let (hits, position, wrapped) = match pivot {
+        Some(p) if p.on => (next.0, before + 1, false),
+        Some(_) if before + 1 < total => (next.0, before + 2, false),
+        Some(_) => (first.0, 1, true),
+        None => (first.0, 1, false),
     };
     Placed {
         found: hits.first().map(|h| (h.shard, h.row, None, false)),
@@ -618,7 +639,7 @@ fn recommended<'a>(
     state: &'a State,
     q: &Compiled,
     tally: &mut Tally,
-    pivot: Option<&Hit<'a>>,
+    pivot: Option<&Pivot<'a>>,
     random: bool,
 ) -> Placed<'a> {
     let mut members: Vec<recommend::Member> = Vec::new();
@@ -668,14 +689,17 @@ fn recommended<'a>(
         order.into_iter().map(|(i, r)| (i, r, false)).collect()
     };
     let at = |i: usize| listed.get(i).copied();
-    // As `next_after`: past `after`, past the last back to the first, no `after` from the first.
+    // As `next_after`: past `after`, past the last back to the first, on `then`, else from the
+    // first.
     let pos = pivot.and_then(|p| {
         order
             .iter()
-            .position(|(i, _, _)| at(*i).is_some_and(|(_, r)| std::ptr::eq(r, p.row)))
+            .position(|(i, _, _)| at(*i).is_some_and(|(_, r)| std::ptr::eq(r, p.hit.row)))
+            .map(|found| (found, p.on))
     });
     let (from, wrapped) = match pos {
-        Some(p) if p + 1 < order.len() => (p + 1, false),
+        Some((p, true)) => (p, false),
+        Some((p, false)) if p + 1 < order.len() => (p + 1, false),
         Some(_) => (0, true),
         None => (0, false),
     };

@@ -695,7 +695,7 @@ fn one_frame(
 
 /// A query through the index: the answer, and how long it took.
 fn ask(dir: &Path, f: &Filters, after: Option<&str>) -> (Duration, Option<index::Answer>) {
-    timed(|| index::answer(dir, f, after))
+    timed(|| index::answer(dir, f, after, None))
 }
 
 /// The review index at its real entry: build time (first query until `indexing` is gone), the
@@ -793,7 +793,7 @@ fn indexed(dir: &Path, every: &Filters) {
             ms(rest)
         );
     }
-    let walked = timed(|| index::Answer::walk(dir, every, None)).0;
+    let walked = timed(|| index::Answer::walk(dir, every, None, None)).0;
     println!(
         "\nThe same `status any` answer by walking the files: {:.0} ms",
         ms(walked)
@@ -875,7 +875,7 @@ fn settle_after_forget() {
 fn build_index(dir: &Path, every: &Filters) -> Option<usize> {
     let start = Instant::now();
     loop {
-        match index::answer(dir, every, None) {
+        match index::answer(dir, every, None, None) {
             None => return None,
             Some(a) if a.indexing.is_none() => break,
             Some(_) => {}
@@ -919,7 +919,7 @@ fn index_memory(dir: &Path) {
     index::forget();
     settle_after_forget();
     memory_row("dropped again", base);
-    let (t, a) = timed(|| index::Answer::walk(dir, &every, None));
+    let (t, a) = timed(|| index::Answer::walk(dir, &every, None, None));
     memory_row(
         &format!("after a walk without index ({:.0} ms)", ms(t)),
         base,

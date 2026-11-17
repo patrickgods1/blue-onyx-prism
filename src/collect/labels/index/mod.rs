@@ -303,12 +303,17 @@ impl Index {
     }
 
     /// The answer of the rows as they are, with the frames it shows.
-    fn read(self: &Arc<Self>, f: &Filters, after: Option<&str>) -> (Answer, Vec<String>) {
+    fn read(
+        self: &Arc<Self>,
+        f: &Filters,
+        after: Option<&str>,
+        then: Option<&str>,
+    ) -> (Answer, Vec<String>) {
         // Taken first: an answer without it must have nothing behind it.
         let indexing = self.indexing();
         let state = self.state.read_recover();
         let names = self.names.read_recover();
-        let (mut answer, shown) = query::answer(&state, &names, f, after);
+        let (mut answer, shown) = query::answer(&state, &names, f, after, then);
         answer.indexing = indexing;
         (answer, shown)
     }
@@ -618,15 +623,16 @@ fn open(dir: &Path, f: &Filters) -> Option<Arc<Index>> {
 }
 
 /// The answer to `GET /v1/review/next` from the index. None: walk ([`Answer::walk`]), because the
-/// folder is small, its index was dropped or there is no folder.
-pub fn answer(dir: &Path, f: &Filters, after: Option<&str>) -> Option<Answer> {
-    let out = answer_of(dir, f, after);
+/// folder is small, its index was dropped or there is no folder. `after` and `then` as
+/// [`queue::next_after`] reads them.
+pub fn answer(dir: &Path, f: &Filters, after: Option<&str>, then: Option<&str>) -> Option<Answer> {
+    let out = answer_of(dir, f, after, then);
     #[cfg(test)]
     tests::note_served(dir, out.is_some());
     out
 }
 
-fn answer_of(dir: &Path, f: &Filters, after: Option<&str>) -> Option<Answer> {
+fn answer_of(dir: &Path, f: &Filters, after: Option<&str>, then: Option<&str>) -> Option<Answer> {
     if !dir.is_dir() {
         HUB.lock_recover().clear_where(|i| i.dir == dir);
         return None;
@@ -640,7 +646,7 @@ fn answer_of(dir: &Path, f: &Filters, after: Option<&str>) -> Option<Answer> {
     index.settle(until);
     let mut tries = RESOLVE_TRIES;
     loop {
-        let (answer, shown) = index.read(f, after);
+        let (answer, shown) = index.read(f, after, then);
         if index.cancelled() {
             return None;
         }
