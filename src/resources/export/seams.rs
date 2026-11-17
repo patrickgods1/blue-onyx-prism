@@ -105,7 +105,10 @@ pub(crate) const MAX_OUTPUT_LINES: usize = 2000;
 /// `SSL_CERT_FILE`/`SSL_CERT_DIR` pass through when the operator set them (a private CA for the
 /// proxy); nothing sets them by default. `CUDA_VISIBLE_DEVICES`/`CUDA_DEVICE_ORDER` pass through
 /// so PyTorch numbers the GPUs as the service's CUDA probe did: the training GPU picker hands the
-/// child `--device cuda:N` with the probe's ordinal.
+/// child `--device cuda:N` with the probe's ordinal. `PROCESSOR_ARCHITECTURE` (and the WOW64
+/// `PROCESSOR_ARCHITEW6432`) pass through because Python's `platform.machine()` reads them on
+/// Windows: without them it is `''`, and polars (imported by Ultralytics when it saves a training
+/// checkpoint) then refuses to load ("unknown feature flag: 'sse3'").
 pub(super) fn inherited(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
     matches!(
@@ -117,6 +120,8 @@ pub(super) fn inherited(key: &str) -> bool {
             | "SYSTEMDRIVE"
             | "COMSPEC"
             | "PATHEXT"
+            | "PROCESSOR_ARCHITECTURE"
+            | "PROCESSOR_ARCHITEW6432"
             | "APPDATA"
             | "LOCALAPPDATA"
             | "PROGRAMDATA"

@@ -1213,19 +1213,25 @@ mod tests {
             ULTRALYTICS_EXPORT_VERSION,
             format!("ultralytics-{ULTRALYTICS_VERSION}+assets-v8.4.0")
         );
-        assert!(export_version_matches(
-            ULTRALYTICS_EXPORT_VERSION,
-            "ultralytics-8.4.163+assets-v8.4.0"
-        ));
-        assert!(export_version_matches(
-            MDV6_ULTRALYTICS_VERSION,
-            "ultralytics-8.4.163+zenodo-15398270"
-        ));
+        for before in ["8.4.163", "8.4.184"] {
+            assert!(export_version_matches(
+                ULTRALYTICS_EXPORT_VERSION,
+                &format!("ultralytics-{before}+assets-v8.4.0")
+            ));
+            assert!(export_version_matches(
+                MDV6_ULTRALYTICS_VERSION,
+                &format!("ultralytics-{before}+zenodo-15398270")
+            ));
+        }
         let rf = export_model("rfdetr-large").unwrap();
-        assert!(export_version_matches(
-            rf.version,
-            "transformers-5.17.0+rf-detr-large-f62f7dd5252b61097cbace33886045816dadbde9"
-        ));
+        for before in ["5.17.0", "5.20.2"] {
+            assert!(export_version_matches(
+                rf.version,
+                &format!(
+                    "transformers-{before}+rf-detr-large-f62f7dd5252b61097cbace33886045816dadbde9"
+                )
+            ));
+        }
         // Other weights, another recipe, or the old onnx-community download: not a match.
         assert!(!export_version_matches(
             ULTRALYTICS_EXPORT_VERSION,
