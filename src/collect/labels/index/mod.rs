@@ -166,6 +166,9 @@ struct Index {
     started: Instant,
     /// Milliseconds from `started` to the last query.
     last_query: AtomicU64,
+    /// A test made it idle now ([`tests::make_idle`]), whatever the clock says.
+    #[cfg(test)]
+    idle_now: AtomicBool,
 }
 
 impl Index {
@@ -186,6 +189,8 @@ impl Index {
             total: AtomicU64::new(0),
             started: Instant::now(),
             last_query: AtomicU64::new(0),
+            #[cfg(test)]
+            idle_now: AtomicBool::new(false),
         }
     }
 
@@ -211,6 +216,10 @@ impl Index {
 
     /// How long ago the last query was.
     fn idle_for(&self) -> Duration {
+        #[cfg(test)]
+        if self.idle_now.load(Ordering::Acquire) {
+            return Duration::MAX;
+        }
         self.started.elapsed().saturating_sub(Duration::from_millis(
             self.last_query.load(Ordering::Relaxed),
         ))

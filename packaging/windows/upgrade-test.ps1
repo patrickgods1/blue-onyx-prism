@@ -34,6 +34,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# Invoke-Bounded, Show-Diagnostics: msiexec runs with a time limit (smoke-test.ps1 does the same).
+. (Join-Path $PSScriptRoot "bounded.ps1")
 
 $OldMsi = (Resolve-Path $OldMsi).Path
 $NewMsi = (Resolve-Path $NewMsi).Path
@@ -59,9 +61,18 @@ function Fail([string]$Message) {
             Get-Content $l -Tail 60 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
         }
     }
-    Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "BlueOnyxPrism" } -MaxEvents 20 -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Host "[event] $($_.TimeCreated) $($_.Message)" }
+    Show-Diagnostics -Service $Service -Ports @($Port, $HttpsPort) -DataDir $DataDir
     exit 1
+}
+
+# msiexec, at most $MsiexecSeconds (a normal run takes seconds): a hang gets the diagnostics, is
+# killed, and fails the test naming it.
+$MsiexecSeconds = 300
+function Invoke-Msiexec([string]$What, [string[]]$MsiArgs, [string]$Log) {
+    $r = Invoke-Bounded -What "msiexec $What" -File "msiexec.exe" -Arguments $MsiArgs -Seconds $MsiexecSeconds -Logs @($Log)
+    if ($r.TimedOut) { Fail "msiexec $What did not finish within $MsiexecSeconds s (killed; the machine's state is above)" }
+    $code = [int]$r.ExitCode
+    if ($code -ne 0 -and $code -ne 3010) { Fail "msiexec $What exited with $code $(Get-MsiexecMeaning $code)" }
 }
 
 function Get-HttpCode($err) {
@@ -88,14 +99,13 @@ function Wait-Ready([string]$When) {
 function Install-Msi([string]$Msi, [string]$Log) {
     $script:Logs += $Log
     Write-Host "Installing $Msi ..."
-    $p = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @("/i", "`"$Msi`"", "/qn", "/norestart", "/l*v", "`"$Log`"", "PORT=$Port")
-    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Fail "msiexec /i $Msi exited with $($p.ExitCode)" }
+    Invoke-Msiexec "/i $Msi" @("/i", $Msi, "/qn", "/norestart", "/l*v", $Log, "PORT=$Port") $Log
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Service $Service -ErrorAction SilentlyContinue).Status -ne "Running" -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
     if ((Get-Service $Service -ErrorAction SilentlyContinue).Status -ne "Running") { Fail "service not Running within 60 s after installing $Msi" }
 }
 
-function Get-ServicePid { return (Get-CimInstance Win32_Service -Filter "Name='$Service'").ProcessId }
+function Get-ServicePid { return (Get-CimInstance Win32_Service -Filter "Name='$Service'" -OperationTimeoutSec 30).ProcessId }
 
 function Get-TimeoutValue {
     $m = [regex]::Match((Get-Content -LiteralPath $Config -Raw), '"request_timeout_secs":\s*(\d+)')
@@ -199,6 +209,5 @@ Write-Host "Config edit kept; label file, frame and runs.json unchanged."
 Write-Host "== uninstall (REMOVEDATA=1)"
 $log = Join-Path $here "msi-upgrade-uninstall.log"
 $script:Logs += $log
-$p = Start-Process -FilePath msiexec.exe -Wait -PassThru -ArgumentList @("/x", "`"$NewMsi`"", "/qn", "/norestart", "/l*v", "`"$log`"", "REMOVEDATA=1")
-if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { Fail "msiexec /x exited with $($p.ExitCode)" }
+Invoke-Msiexec "/x $NewMsi" @("/x", $NewMsi, "/qn", "/norestart", "/l*v", $log, "REMOVEDATA=1") $log
 Write-Host "UPGRADE TEST PASSED ($(Split-Path -Leaf $OldMsi) -> $(Split-Path -Leaf $NewMsi))"

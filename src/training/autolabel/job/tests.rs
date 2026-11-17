@@ -1640,6 +1640,44 @@ fn a_cancelled_labelers_run_keeps_the_finished_frames_and_a_rerun_resumes() {
     }
 }
 
+/// The run's GPU note comes from the card's free memory as `backend::vram` reads it; in tests that
+/// is the card the test sets, never this machine's (whatever other programs hold on it).
+#[test]
+fn a_labelers_run_on_a_card_short_of_memory_says_so() {
+    use crate::backend::detect::GpuVendor;
+    use crate::backend::vram::{MemoryKind, Source as VramSource, VramReading, test_cards};
+    let t = tmp("short-card");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let Some(capability::Accelerator::Cuda { ordinal, .. }) = job.accelerator.clone() else {
+        // Apple silicon: unified memory, no free-memory note.
+        return;
+    };
+    let _card = test_cards::set(vec![test_cards::Card {
+        cuda_ordinal: Some(ordinal),
+        reading: VramReading {
+            index: 0,
+            name: "NVIDIA GeForce RTX 3060".into(),
+            vendor: GpuVendor::Nvidia,
+            kind: MemoryKind::Dedicated,
+            total_mb: 12288,
+            free_mb: 300,
+            source: VramSource::Nvml,
+        },
+        holders: vec![],
+    }]);
+    let out = run_job(&job, &LabelFake::default()).unwrap();
+    let warnings = out.result["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("may run out of GPU memory")),
+        "{}",
+        out.result
+    );
+}
+
 #[test]
 fn a_cancelled_run_without_keep_on_cancel_writes_nothing() {
     let t = tmp("discard");

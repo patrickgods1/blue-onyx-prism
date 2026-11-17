@@ -23,7 +23,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 /// Delay between answering `POST /config/restart` and stopping the server, so the reply gets out.
-const RESTART_DELAY: Duration = Duration::from_millis(250);
+pub(super) const RESTART_DELAY: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------------------------
 // Config page
