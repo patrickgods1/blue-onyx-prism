@@ -776,7 +776,7 @@ pub struct DataArgs {
     #[arg(long, default_value = "background", value_parser = parse_excluded)]
     pub excluded: Excluded,
     /// Rename a label, `from=to` (empty `to` drops it), repeatable.
-    #[arg(long, value_parser = parse_rename)]
+    #[arg(long, value_parser = dataset::parse_rename)]
     pub rename: Vec<(String, String)>,
     /// Mix in the pinned public night subset (train-data:lila-night).
     #[arg(long)]
@@ -893,7 +893,7 @@ pub struct ClassesArgs {
     #[arg(long, value_parser = parse_scene)]
     pub scene: Option<SceneFilter>,
     /// Rename a label, `from=to` (empty `to` drops it), repeatable.
-    #[arg(long, value_parser = parse_rename)]
+    #[arg(long, value_parser = dataset::parse_rename)]
     pub rename: Vec<(String, String)>,
     /// Print JSON.
     #[arg(long)]
@@ -911,13 +911,6 @@ fn parse_ignore(s: &str) -> Result<IgnoreMode, String> {
 fn parse_scene(s: &str) -> Result<SceneFilter, String> {
     SceneFilter::parse(s)
         .ok_or_else(|| format!("'{s}' is not all or scenes joined by + (day, night, ir)"))
-}
-
-fn parse_rename(s: &str) -> Result<(String, String), String> {
-    s.split_once('=')
-        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
-        .filter(|(a, _)| !a.is_empty())
-        .ok_or_else(|| format!("'{s}' is not from=to"))
 }
 
 /// Run a `train` subcommand.
@@ -1539,6 +1532,7 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 || r.request.classes.clone().unwrap_or_default(),
                 |d| d.classes.clone(),
             ),
+            rename: r.request.rename.clone(),
             excluded: r.request.excluded,
             ignore: r
                 .progress
@@ -2584,14 +2578,14 @@ mod tests {
     #[test]
     fn flags_parse() {
         assert_eq!(
-            parse_rename("motorbike=motorcycle").unwrap(),
+            dataset::parse_rename("motorbike=motorcycle").unwrap(),
             ("motorbike".into(), "motorcycle".into())
         );
         assert_eq!(
-            parse_rename("tree=").unwrap(),
+            dataset::parse_rename("tree=").unwrap(),
             ("tree".into(), String::new())
         );
-        assert!(parse_rename("=x").is_err());
+        assert!(dataset::parse_rename("=x").is_err());
         assert_eq!(parse_scene("night+ir").unwrap(), SceneFilter::NIGHT_IR);
         assert_eq!(
             parse_scene("night").unwrap(),

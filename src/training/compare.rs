@@ -32,6 +32,8 @@ pub struct CompareRun {
     pub scene: SceneFilter,
     /// The run's classes (head order).
     pub classes: Vec<String>,
+    /// Its class merges (`TrainRequest.rename`; an empty target drops the label).
+    pub rename: BTreeMap<String, String>,
     pub excluded: Excluded,
     /// What its training frames with ignore regions became (`RunSettings::ignore_mode`); None
     /// while the run has not started training.
@@ -400,6 +402,37 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             c.warnings.push(
                 "the runs train different classes: AP is averaged over different classes".into(),
             );
+        }
+        if runs.iter().any(|r| r.rename != first.rename) {
+            let mut seen: Vec<(&String, &String)> = Vec::new();
+            for r in runs {
+                for e in &r.rename {
+                    if !seen.contains(&e) {
+                        seen.push(e);
+                    }
+                }
+            }
+            let parts: Vec<String> = seen
+                .iter()
+                .filter_map(|(from, to)| {
+                    let n = runs
+                        .iter()
+                        .filter(|r| r.rename.get(*from) == Some(*to))
+                        .count();
+                    (n < runs.len()).then(|| {
+                        let to = if to.is_empty() {
+                            "dropped"
+                        } else {
+                            to.as_str()
+                        };
+                        format!("{from} \u{2192} {to} on {n} of {}", runs.len())
+                    })
+                })
+                .collect();
+            c.warnings.push(format!(
+                "the runs merge classes differently ({})",
+                parts.join(", ")
+            ));
         }
         if runs.iter().any(|r| r.excluded != first.excluded) {
             c.warnings.push(
@@ -844,6 +877,7 @@ mod tests {
             model: "yolo26n".into(),
             scene,
             classes: vec!["person".into()],
+            rename: BTreeMap::new(),
             excluded: Excluded::Background,
             ignore: Some(IgnoreMode::Background),
             negative_share: Some(0.15),
