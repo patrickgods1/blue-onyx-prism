@@ -33,7 +33,7 @@ use score::{Cell, Objects, SCENES, Scorable, Scored};
 use serde::Serialize;
 use sets::{Candidate, CompareSet, SetRole, compare_sets, default_set};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use verdict::{Column, Contender, Headline, headline, mark_best};
+use verdict::{Column, Contender, Headline, best_order, headline, mark_best};
 
 /// A configured model, for the "Not on these images" list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +94,9 @@ pub struct Row {
     pub alerts: usize,
     /// Time per image, ms.
     pub speed: Cell,
+    /// Its place in the view's "Best first" order, 1-based ([`verdict::best_order`]): the
+    /// table's `data-best`.
+    pub best: usize,
 }
 
 /// The table of a set at one kind of confidence.
@@ -411,6 +414,7 @@ fn contender(r: &Row) -> Contender {
             .objects
             .get("all")
             .and_then(|o| Some((o.correct.all.value?, o.correct.all.n))),
+        false_alerts: r.false_alerts.value,
     }
 }
 
@@ -446,6 +450,7 @@ fn row_of(
         false_alerts,
         alerts,
         speed: score::speed(set, p.run),
+        best: 0,
     }
 }
 
@@ -527,6 +532,11 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
                 .collect();
             mark_columns(&mut rows, speed.comparable);
             let contenders: Vec<Contender> = rows.iter().map(contender).collect();
+            for (place, i) in best_order(&contenders).into_iter().enumerate() {
+                if let Some(r) = rows.get_mut(i) {
+                    r.best = place + 1;
+                }
+            }
             View {
                 confidence: kind.to_string(),
                 headline: headline(&contenders, set.images.len(), unit),

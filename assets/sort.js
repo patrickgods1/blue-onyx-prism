@@ -26,7 +26,10 @@
 //   "follow" keeps a row right behind the row before it (detail rows), "top" / "bottom" pins a
 //   group to the start / end in its own order (zero-state and total rows), "last" sorts a group
 //   among the other "last" ones after every ordinary group (Compare's models that trained on the
-//   images).
+//   images). "group" leads a section: the rows after it, up to the next "group" row, are arranged
+//   among themselves (with the roles above), each section keeps its place and its lead row stays
+//   at its top (the Models tab's held-out groups: scores compare only inside one). Rows before the
+//   first "group" row are a section of their own.
 // - parseState(json): stored state, the current `[{col, dir}, ...]` or the Benchmark page's old
 //   `{col, dir}` (also inside `{sort: {col, dir}}`, as PrismBench.dataTable kept it), as a clean
 //   list; null when there is nothing to use. serialize(keys) is its inverse.
@@ -43,8 +46,9 @@
 // name are named by their leaf index; a column whose header has no text is not sortable. Headers
 // of several rows (colSpan / rowSpan) work: a leaf is the header over one column in the last row.
 // Rows: `data-sort-follow` (stays behind the row before), `data-sort-pin="top|bottom"`,
-// `tr.lineup-out` (last), `data-best` (ordinal of the `best` pseudo-column; filled by Rust, never by
-// a JS ranking). JS adds a `button.th-sort` (arrow and rank) at the end of each sortable <th>, so a
+// `tr.lineup-out` (last), `data-sort-group` (a section's lead row: the rows up to the next one sort
+// among themselves, sections keep their order), `data-best` (ordinal of the `best` pseudo-column;
+// filled by Rust, never by a JS ranking; so no real column may be named `best`). JS adds a `button.th-sort` (arrow and rank) at the end of each sortable <th>, so a
 // `button.term` there keeps its tooltip (PrismTip stops its clicks in the capture phase); `aria-sort`
 // on the first key's <th>; one polite status line announces each change. State per browser per
 // table: localStorage `prism.sort:<pathname>:<key>` (every access in try/catch: without storage the
@@ -162,6 +166,20 @@
   function arrange(items, keys, get, role) {
     get = get || defaultGet;
     role = role || function (it) { return (it && it.role) || ""; };
+    var sections = [{lead: null, rows: []}];
+    (items || []).forEach(function (it) {
+      if (role(it) === "group") sections.push({lead: it, rows: []});
+      else sections[sections.length - 1].rows.push(it);
+    });
+    var all = [];
+    sections.forEach(function (s) {
+      if (s.lead) all.push(s.lead);
+      arrangeSection(s.rows, keys, get, role).forEach(function (r) { all.push(r); });
+    });
+    return all;
+  }
+  // arrange() within one section (no "group" rows in `items`).
+  function arrangeSection(items, keys, get, role) {
     var units = [], cur = null;
     (items || []).forEach(function (it) {
       var r = role(it);
@@ -456,6 +474,7 @@
 
   // ---- the rows --------------------------------------------------------------------------------
   function roleOf(tr) {
+    if (tr.hasAttribute("data-sort-group")) return "group";
     if (tr.hasAttribute("data-sort-follow")) return "follow";
     var p = tr.getAttribute("data-sort-pin");
     if (p === "top" || p === "bottom") return p;

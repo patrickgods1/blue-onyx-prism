@@ -590,4 +590,15 @@ fn the_contract_of_a_cell_is_null_not_zero() {
     assert_eq!(v["defaultSet"], "own");
     assert_eq!(v["sets"][0]["views"][0]["rows"][0]["isDefault"], false);
     assert_eq!(v["sets"][0]["views"][0]["headline"]["call"], "clear");
+    // Every row has its 1-based place in the view's Best first order (the table's data-best).
+    for view in l.sets[0].views.iter() {
+        let mut places: Vec<usize> = view.rows.iter().map(|r| r.best).collect();
+        places.sort_unstable();
+        assert_eq!(places, (1..=view.rows.len()).collect::<Vec<_>>());
+    }
+    assert!(
+        v["sets"][0]["views"][0]["rows"][0]["best"]
+            .as_u64()
+            .is_some()
+    );
 }

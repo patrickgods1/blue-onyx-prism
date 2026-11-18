@@ -6,7 +6,9 @@
 // state and the sort in PrismSort's (both remembered per browser; an old saved sort here moved to
 // PrismSort once), so the 1 s polling re-render of a section rebuilds the table as the user left
 // it. tableFilter(table, key) adds the text filter and the count to an existing table (the expert
-// tables under "More detail").
+// tables under "More detail"). pointRank(j, model, device) is the Best first place of a model on a
+// device: its `rank` in the status's `points` (every model on every device that ran, ranked by
+// the server, BenchmarkResults::points); null when it has none.
 // Loaded after bench-glossary.js (uses PB.el, PB.store, PB.head).
 (function () {
   var PB = window.PrismBench, el = PB.el, has = PB.has;
@@ -36,7 +38,9 @@
   // (returns text / node or fills td), num, label (mobile card label), first ("desc")}],
   // rows, filters {model(row), device(row), runtime(row), thisRun(row)} (each optional),
   // text(row) (what the text filter searches), sort {col, dir} (the default order; none = the
-  // rows' own order), rowAttrs(row, tr),
+  // rows' own order; {col: "best"} = Best first by best(row)), best(row) (the row's data-best: its
+  // place in the server's ranking, e.g. PB.pointRank; null = none, after the ranked rows; no
+  // column may have the id "best"), rowAttrs(row, tr),
   // empty (text when nothing matches), note.
   function dataTable(o) {
     var st = stateOf(o.key), f = o.filters || {};
@@ -101,6 +105,8 @@
           if (out !== undefined && out !== null) { if (typeof out === "string" || typeof out === "number") td.appendChild(document.createTextNode(String(out))); else td.appendChild(out); }
           tr.appendChild(td);
         });
+        var b = o.best ? o.best(r) : null;
+        if (typeof b === "number" && isFinite(b)) tr.setAttribute("data-best", String(b));
         if (o.rowAttrs) o.rowAttrs(r, tr);
         tb.appendChild(tr);
       });
@@ -131,5 +137,16 @@
     return tools;
   }
 
-  PB.dataTable = dataTable; PB.tableFilter = tableFilter; PB.tableState = states;
+  var ranks = {j: null, by: {}};
+  function pointRank(j, model, device) {
+    if (!j || !model || !device) return null;
+    if (ranks.j !== j) {
+      ranks.j = j; ranks.by = {};
+      (j.points || []).forEach(function (p) { if (p && p.model && p.device && typeof p.rank === "number") ranks.by[String(p.model).toLowerCase() + "|" + p.device] = p.rank; });
+    }
+    var r = ranks.by[String(model).toLowerCase() + "|" + device];
+    return r === undefined ? null : r;
+  }
+
+  PB.dataTable = dataTable; PB.tableFilter = tableFilter; PB.tableState = states; PB.pointRank = pointRank;
 })();

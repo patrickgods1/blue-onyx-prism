@@ -1,8 +1,9 @@
 // Blue Onyx Prism: Benchmark page, Compare tab (PrismBench.lineup): the models side by side on one
 // set of images. The server (`lineup` of GET /v1/benchmark, benchmark::lineup) decides everything
 // that is a judgement: which models are on a set, the shared objects, what is best past the noise,
-// the plain sentence, who is not on these images and why. This file only draws it. The choices are
-// remembered per browser; `?set=<id>` in the URL opens a set (links from the Train area).
+// the rows' Best first order, the plain sentence, who is not on these images and why. This file
+// only draws it. The choices are remembered per browser; `?set=<id>` in the URL opens a set
+// (links from the Train area).
 // Loaded after bench-glossary.js, before benchmark.js, which calls render(status) on every poll
 // (ES5, no build step, CSP script-src 'self').
 (function () {
@@ -102,6 +103,8 @@
   }
   function row(s, r, kind) {
     var tr = el("tr");
+    // The server's Best first place (the headline's rule as an order, lineup::verdict::best_order).
+    if (r.best) tr.setAttribute("data-best", String(r.best));
     if (r.excluded) { tr.classList.add("lineup-out"); tr.title = "Not counted for best: it trained on some of these frames"; }
     tr.appendChild(modelCell(r));
     var o = (r.objects || {})[kind] || (r.objects || {}).all || {finds: {}, correct: {}};
@@ -122,8 +125,9 @@
   function table(s, v, kind) {
     var t = el("table", "bench stack lineup-table"); t.appendChild(headRow(s));
     var body = el("tbody"); v.rows.forEach(function (r) { body.appendChild(row(s, r, kind)); }); t.appendChild(body);
-    // Sortable (sort.js); models that trained on these images stay last (`tr.lineup-out`).
-    if (window.PrismSort) PrismSort.attach(t, {key: "lineup"});
+    // Sortable (sort.js), best first by default; models that trained on these images stay last
+    // (`tr.lineup-out`).
+    if (window.PrismSort) PrismSort.attach(t, {key: "lineup", defaultKeys: [{col: "best", dir: "asc"}]});
     var w = el("div", "scroll lineup-scroll"); w.dataset.keep = "w:lineup"; w.appendChild(t);
     return w;
   }

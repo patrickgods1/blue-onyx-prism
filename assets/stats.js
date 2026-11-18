@@ -2,6 +2,7 @@
 // Update the table in place from /stats.json (keeps scroll position, no flicker). Rows are
 // matched by `data-model` (the table may be sorted, sort.js): the same models are patched where
 // they are and the user's sort is applied again; only another set of models replaces the rows.
+// `best` (the benchmark rank, from the server) is each row's `data-best`: the default order.
 (function () {
   var body = document.getElementById("stats-body"), live = document.getElementById("live");
   var table = body && body.closest("table");
@@ -34,6 +35,7 @@
         var tr = document.createElement("tr");
         tr.className = "st-" + m.stateClass;
         tr.setAttribute("data-model", m.name);
+        if (m.best !== null && m.best !== undefined) tr.setAttribute("data-best", String(m.best));
         var name = td(m.name, "rc-title");
         if (m.default) {
           var t = document.createElement("span");
@@ -73,6 +75,8 @@
       else fresh.forEach(function (tr) {
         var old = byName[tr.getAttribute("data-model")];
         if (old.className !== tr.className) old.className = tr.className;
+        var best = tr.getAttribute("data-best");
+        if (old.getAttribute("data-best") !== best) { if (best === null) old.removeAttribute("data-best"); else old.setAttribute("data-best", best); }
         for (var k = 0; k < tr.cells.length; k++) {
           var a = old.cells[k], b = tr.cells[k];
           if (a.innerHTML !== b.innerHTML) a.replaceWith(b.cloneNode(true));

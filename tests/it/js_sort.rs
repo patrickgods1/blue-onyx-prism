@@ -1,9 +1,10 @@
 //! The table sorter of every page, `assets/sort.js` (`PrismSort`), its pure part run in `node`:
 //! the sort value of a cell (numbers, units, ratios, dashes, times, `data-v`), a cell's text, the
 //! stable multi-key order with empties last in both directions, the `best` pseudo-column, row
-//! groups (detail rows that follow, pinned and "last" rows), what a click or Shift-click does, and
-//! the stored state, including both old shapes of the Benchmark page; then the page part on a
-//! small stub DOM (headers, clicks, the phones' select, Default order, re-renders, migration).
+//! groups (detail rows that follow, pinned and "last" rows, `data-sort-group` sections), what a
+//! click or Shift-click does, and the stored state, including both old shapes of the Benchmark
+//! page; then the page part on a small stub DOM (headers, clicks, the phones' select, Default
+//! order, re-renders, migration, sections).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
 #![allow(clippy::unwrap_used)]
@@ -230,6 +231,30 @@ assert.deepStrictEqual(names(S.arrange([{name: 'x', role: 'follow', keys: {0: 2}
 const trs = [{id: 1, v: 5}, {id: 2, v: 0, f: true}, {id: 3, v: 1}];
 const out = S.arrange(trs, [{col: 'v', dir: 'asc'}], (r, c) => r[c], (r) => r.f ? 'follow' : '');
 assert.deepStrictEqual(plain(out.map((r) => r.id)), [3, 1, 2]);
+
+// Sections (`data-sort-group`): rows sort only among the rows of their section, the sections and
+// their lead rows keep their places, roles work inside each; rows before the first lead are a
+// section of their own.
+const grouped = [
+  {name: 'loose', keys: {0: 7}},
+  {name: 'g1', role: 'group', best: 1, keys: {0: 0}},
+  {name: 'a', best: 2, keys: {0: 3}},
+  {name: 'a-detail', role: 'follow'},
+  {name: 'b', best: 1, keys: {0: 1}},
+  {name: 'b-detail', role: 'follow', keys: {0: 100}},
+  {name: 'g2', role: 'group', keys: {0: 99}},
+  {name: 'c', keys: {0: 9}},
+  {name: 'pinned', role: 'top', keys: {0: 50}},
+  {name: 'd', best: 1, keys: {0: 2}},
+  {name: 'g3', role: 'group'},
+];
+assert.deepStrictEqual(names(S.arrange(grouped, [{col: 'best', dir: 'asc'}])),
+  ['loose', 'g1', 'b', 'b-detail', 'a', 'a-detail', 'g2', 'pinned', 'd', 'c', 'g3']);
+assert.deepStrictEqual(names(S.arrange(grouped, [{col: '0', dir: 'desc'}])),
+  ['loose', 'g1', 'a', 'a-detail', 'b', 'b-detail', 'g2', 'pinned', 'c', 'd', 'g3']);
+// No keys: as given, but for the pinned row at the top of its own section.
+assert.deepStrictEqual(names(S.arrange(grouped, [])),
+  ['loose', 'g1', 'a', 'a-detail', 'b', 'b-detail', 'g2', 'pinned', 'c', 'd', 'g3']);
 "#);
 }
 
@@ -505,6 +530,25 @@ Promise.resolve().then(() => {
   doc.body.appendChild(t7); S.scan(doc);
   assert.deepStrictEqual(names(t7), ['a', 'b', 'c']);
   assert.strictEqual(t7._prismSort.reset.textContent, 'Best first');
+  // Sections: a click sorts inside each `data-sort-group` section, Best first puts them back.
+  const t8 = el('table', {'data-sort': 'sections', 'data-sort-default': 'best'}, [el('thead', {}, [el('tr', {}, [el('th', {text: 'N'}), el('th', {text: 'R'})])]), el('tbody', {}, [
+    el('tr', {'data-sort-group': ''}, [el('td', {text: 'set A'})]),
+    el('tr', {'data-best': '2'}, [el('td', {text: 'a1'}), el('td', {text: '0.9'})]),
+    el('tr', {'data-sort-follow': ''}, [el('td', {text: 'a1-detail'})]),
+    el('tr', {'data-best': '1'}, [el('td', {text: 'a2'}), el('td', {text: '0.5'})]),
+    el('tr', {'data-sort-group': ''}, [el('td', {text: 'set B'})]),
+    el('tr', {'data-best': '1'}, [el('td', {text: 'b1'}), el('td', {text: '0.1'})]),
+    el('tr', {'data-best': '2'}, [el('td', {text: 'b2'}), el('td', {text: '0.95'})]),
+  ])]);
+  doc.body.appendChild(t8); S.scan(doc);
+  assert.deepStrictEqual(names(t8), ['set A', 'a2', 'a1', 'a1-detail', 'set B', 'b1', 'b2'], 'best first in each section');
+  const rTh = t8.tHead.rows[0].cells[1];
+  rTh.dispatch('click', {target: rTh});
+  assert.deepStrictEqual(names(t8), ['set A', 'a2', 'a1', 'a1-detail', 'set B', 'b1', 'b2'], 'R ascending in each section');
+  rTh.dispatch('click', {target: rTh});
+  assert.deepStrictEqual(names(t8), ['set A', 'a1', 'a1-detail', 'a2', 'set B', 'b2', 'b1'], 'R descending, the sections stay');
+  t8._prismSort.reset.dispatch('click');
+  assert.deepStrictEqual(names(t8), ['set A', 'a2', 'a1', 'a1-detail', 'set B', 'b1', 'b2']);
   console.log('dom ok');
 }).catch((e) => { console.error(e); process.exit(1); });
 "#;

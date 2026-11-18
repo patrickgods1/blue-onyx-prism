@@ -3,17 +3,23 @@
   {% include "revert.html" %}
   {% if results.is_empty() %}<p class="muted">No trained model yet: finished runs from the <a href="/train/train">Train</a> tab show here, with their held-out benchmark.</p>{% else %}
   <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark#tab-compare">Benchmark</a> page.</p>
+  <p class="muted small">Grouped by held-out set: runs scored on the same held-out frames with the same classes and merges, newest group first. Scores compare only inside a group; each group lists its best run first (person recall, then vehicle recall, then AP50-95).</p>
   <div class="scroll">
-  <table class="rcards" data-sort="results" data-sort-cols=",,,,,-">
-    <thead><tr><th>Model</th><th>Family</th><th>Licence</th><th>Classes</th><th>Held-out benchmark</th><th>Use as</th></tr></thead>
+  <table class="rcards tr-results" data-sort="results" data-sort-default="best" data-sort-cols=",,,,,,,,-">
+    <thead><tr><th>Model</th><th>Family</th><th>Licence</th><th>Classes</th><th>Held-out benchmark</th><th class="num"><button type="button" class="term" data-tip="Recall of person on every held-out frame at the confidence threshold the model runs with (IoU 0.5)">Person R</button></th><th class="num"><button type="button" class="term" data-tip="Recall of vehicles (car, truck, bus merged) on every held-out frame at the threshold">Vehicle R</button></th><th class="num"><button type="button" class="term" data-tip="AP50-95 on every held-out frame">AP50-95</button></th><th>Use as</th></tr></thead>
     <tbody>
-    {% for r in results %}
-    <tr>
+    {% for g in results %}
+    <tr class="tr-group" data-sort-group><td colspan="9">{{ g.head }}</td></tr>
+    {% for r in g.rows %}
+    <tr data-best="{{ r.best }}">
       <td class="rc-title-plain"><code>{{ r.name }}</code>{% if !r.in_config %} <span class="muted">(not in config)</span>{% endif %}<br><span class="muted small">{{ r.finished }}</span></td>
       <td data-label="Family">{{ r.family }}</td>
       <td data-label="Licence">{{ r.license }}</td>
       <td data-label="Classes">{{ r.classes }}{% if !r.merges.is_empty() %}<br><small>{{ r.merges }}</small>{% endif %}</td>
       <td class="rc-block" data-label="Held-out benchmark">{{ r.benchmark }} <a class="small" href="{{ r.compare_href }}">Compare on these images</a>{% if !r.trained_on.is_empty() %} <button type="button" class="term tag restart" data-tip="A score on frames a model trained on says little about the frames it will see next.">{{ r.trained_on }}</button>{% endif %}{% if !r.compare.is_empty() %}<p class="tr-compare">{{ r.compare }}</p>{% endif %}{% if !r.warnings.is_empty() %}<ul class="warn-list small">{% for w in r.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}{% if !r.files.text.is_empty() %}<p class="muted small tr-files">{{ r.files.text }}.</p>{% endif %}</td>
+      <td class="num" data-label="Person R">{{ r.person_r }}</td>
+      <td class="num" data-label="Vehicle R">{{ r.vehicle_r }}</td>
+      <td class="num" data-label="AP50-95">{{ r.ap }}</td>
       <td class="rc-action">
         {% if r.is_default %}<span class="tag now">Default now</span>{% endif %}
         <form method="post" action="/training/use" class="inline" data-switch="{{ r.id }}"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="role" value="default"><input type="hidden" name="copy" value="1"><button type="submit" class="small">{% if r.is_default %}Threshold&hellip;{% else %}Use as default&hellip;{% endif %}</button></form>
@@ -26,8 +32,9 @@
         {% if !r.files.size.is_empty() %}<form method="post" action="/training/remove" class="inline" data-confirm="{{ r.confirm }}"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="tab" value="{{ tab }}"><input type="hidden" name="delete_files" value="1"><button type="submit" class="small danger">Remove and delete files ({{ r.files.size }})</button></form>{% endif %}
       </td>
     </tr>
-    <tr class="tr-switch-row" data-sort-follow hidden><td colspan="6"><div class="tr-switch" data-run="{{ r.id }}"></div></td></tr>
-    <tr class="tr-metrics-row" data-sort-follow hidden><td colspan="6"><h3 class="sr-only">Training of {{ r.name }}</h3><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
+    <tr class="tr-switch-row" data-sort-follow hidden><td colspan="9"><div class="tr-switch" data-run="{{ r.id }}"></div></td></tr>
+    <tr class="tr-metrics-row" data-sort-follow hidden><td colspan="9"><h3 class="sr-only">Training of {{ r.name }}</h3><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
+    {% endfor %}
     {% endfor %}
     </tbody>
   </table>
@@ -44,11 +51,11 @@
     {% if !g.comparable %}<p class="warn small">Not comparable: the held-out frames differ.</p>{% endif %}
     {% if !g.warnings.is_empty() %}<ul class="warn-list small">{% for w in g.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
     <div class="scroll">
-    <table class="tr-ctable" data-sort="compare" data-sort-cols="run,scene,day,night,ir,all,in_scope,{% if g.random %}random,{% endif %}p50_ms,person_r,vehicle_r,false_alerts,person_fa,epochs">
+    <table class="tr-ctable" data-sort="compare" data-sort-default="best" data-sort-cols="run,scene,day,night,ir,all,in_scope,{% if g.random %}random,{% endif %}p50_ms,person_r,vehicle_r,false_alerts,person_fa,epochs">
       <thead><tr><th>Run</th><th>Scene</th><th class="num"><button type="button" class="term" data-tip="AP50-95 on the day frames of the held-out set (AP50 beneath)">Day</button></th><th class="num"><button type="button" class="term" data-tip="AP50-95 on the night frames">Night</button></th><th class="num"><button type="button" class="term" data-tip="AP50-95 on the IR frames">IR</button></th><th class="num"><button type="button" class="term" data-tip="AP50-95 on every held-out frame">All</button></th><th class="num"><button type="button" class="term" data-tip="AP50-95 on the held-out frames of the scenes the run trained on">In scope</button></th>{% if g.random %}<th class="num"><button type="button" class="term" data-tip="{{ g.random_tip }}">Random picks</button></th>{% endif %}<th class="num"><button type="button" class="term" data-tip="Time per image, median">p50 ms</button></th><th class="num"><button type="button" class="term" data-tip="Recall of person on every held-out frame at the confidence threshold the model runs with (IoU 0.5)">Person R</button></th><th class="num"><button type="button" class="term" data-tip="Recall of vehicles (car, truck, bus merged: a car found as a truck counts) on every held-out frame at the threshold">Vehicle R</button></th><th class="num"><button type="button" class="term" data-tip="Held-out frames without any object that alerted at the threshold / all such frames; best = the lowest rate">False alerts</button></th><th class="num"><button type="button" class="term" data-tip="Held-out frames without a person (parked cars and other objects allowed) that got a person detection at the threshold / all such frames; best = the lowest rate">Person FA</button></th><th>Epochs</th></tr></thead>
       <tbody>
       {% for r in g.rows %}
-      <tr{% if r.routed %} class="tr-routed" data-sort-pin="bottom"{% endif %}>
+      <tr{% if r.routed %} class="tr-routed" data-sort-pin="bottom"{% endif %}{% if let Some(b) = r.best %} data-best="{{ b }}"{% endif %}>
         <td><code>{{ r.name }}</code><br><span class="muted small">{{ r.model }}{% if let Some(sd) = r.seed %} &middot; seed {{ sd }}{% endif %}{% if !r.state.is_empty() %} &middot; {{ r.state }}{% endif %}</span></td>
         <td>{{ r.scene }}</td>
         {% for c in r.cells %}<td class="num{% if c.best %} best-val{% endif %}">{% if c.images > 0 %}<button type="button" class="term" data-tip="{{ c.images }} held-out images">{{ c.ap }}</button>{% else %}{{ c.ap }}{% endif %}{% if !c.ap50.is_empty() %}<br><span class="muted small">AP50 {{ c.ap50 }}</span>{% endif %}</td>{% endfor %}

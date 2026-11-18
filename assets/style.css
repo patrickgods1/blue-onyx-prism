@@ -1609,6 +1609,8 @@ table.tr-ctable th:last-child, table.tr-ctable td:last-child { padding-left: 1re
 table.tr-ctable td:first-child { min-width: 13rem; }
 table.tr-ctable td.best-val { font-weight: 700; background: var(--ok-bg); color: var(--ok-fg); }
 table.tr-ctable tr.tr-routed td { font-style: italic; background: var(--code-bg); border-top: 2px dashed var(--border); }
+/* The Models tab's results list: the header row of each held-out group (scores compare only inside one). */
+table.tr-results tr.tr-group > td { padding-top: 0.7rem; background: var(--code-bg); color: var(--muted); font-size: 0.85rem; font-weight: 600; white-space: normal; }
 
 /* Train form: the Balance fieldset and its before / after preview (bars sized by script). */
 details.tr-balance > summary { cursor: pointer; font-weight: 600; }
@@ -1798,6 +1800,8 @@ td.tr-bal-bars { vertical-align: middle; }
   table.rcards td .detail { display: block; overflow-wrap: anywhere; }
   table.rcards > tbody > tr[hidden] { display: none; }
   table.rcards > tbody > tr.tr-metrics-row, table.rcards > tbody > tr.tr-switch-row { padding: 0.4rem 0.5rem; }
+  table.rcards > tbody > tr.tr-group { background: none; border: 0; padding: 0.4rem 0 0.1rem; margin: 0.8rem 0 0.3rem; }
+  table.rcards > tbody > tr.tr-group > td { background: none; padding: 0; }
   .tr-metrics { max-width: 100%; }
 
   /* rgrid: label over value, three to a row (rc-title and rc-wide take the whole row). */

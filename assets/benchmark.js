@@ -134,8 +134,9 @@
   // model's table of that kind. A term tooltip button inside a header does not sort (PrismTip
   // stops its clicks).
   var L = window.PrismLive, T = L && L.tabs(document.querySelector("nav.tabs"));
-  function sortable(table, key) {
-    if (window.PrismSort) PrismSort.attach(table, {key: key});
+  // `defaults`: the table's own order (none = as built; [{col: "best"}] = by each row's data-best).
+  function sortable(table, key, defaults) {
+    if (window.PrismSort) PrismSort.attach(table, defaults ? {key: key, defaultKeys: defaults} : {key: key});
     return table;
   }
   PB.sortable = sortable;
@@ -852,12 +853,14 @@
     if (picked.some(function (r) { return r.cp.other; })) box.appendChild(el("p", "warn stale-notice", STALE));
     var usable = function (b) { return b && b.met && b.point && b.point.tp > 0 && !findsNothing(b); };
     box.appendChild(PB.dataTable({
-      key: "confidence", cls: "stack conf-table", rows: picked, filters: FILTERS, sort: {col: "model", dir: "asc"},
+      key: "confidence", cls: "stack conf-table", rows: picked, filters: FILTERS,
+      // Best first: the server's ranking of model x device (points).
+      sort: {col: "best", dir: "asc"}, best: function (r) { return PB.pointRank(j, r.model, r.device); },
       text: function (r) { return r.model + " " + r.device + " " + r.runtime; }, empty: "No confidence results on " + selName() + ": choose another device.",
       columns: [
         {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) { return el("span", "nowrap", r.model + (r.relative ? " *" : "")); }},
         {id: "device", head: "@device", value: function (r) { return r.device; }, render: deviceCell},
-        {id: "best", head: "@best_conf", num: true, value: function (r) { return r.b ? r.b.threshold : null; }, render: function (r, td) {
+        {id: "best_conf", head: "@best_conf", num: true, value: function (r) { return r.b ? r.b.threshold : null; }, render: function (r, td) {
           if (r.cp.pending) return "searching…";
           if (!r.b) return r.cp.missing ? "not searched" : "-";
           if (findsNothing(r.b)) { td.title = FINDS_NOTHING; td.classList.add("warn-cell"); return "finds no objects"; }
@@ -972,7 +975,7 @@
   // patched in place: only cards whose data changed are rebuilt (keeping their scroll offsets,
   // open <details> and sort order). The first card (or the one the URL names) starts open; a
   // rebuilt card keeps its open state.
-  function renderModels(models, cfg, ranking) {
+  function renderModels(models, cfg, ranking, j) {
     var box = $("models");
     $("no-models").hidden = models.length > 0;
     var cfgByName = {}; (cfg.models || []).forEach(function (c) { cfgByName[c.name.toLowerCase()] = c; });
@@ -981,11 +984,13 @@
       var c = cfgByName[m.model.toLowerCase()] || {}, id = "d-" + encodeURIComponent(m.model);
       var rk = (ranking || []).find(function (r) { return r.model === m.model; }), metric = rk && rk.metric === "roc_auc" ? "roc_auc" : "ap50";
       var was = document.getElementById(id), open = was ? was.open : (named ? id === hashId : i === 0);
-      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel, metric]), build: function () { var d = modelCard(m, c, cfg, metric); d.open = open; return d; }};
+      // Each device's Best first place (the server's ranking of model x device, points).
+      var best = (m.devices || []).map(function (d) { return PB.pointRank(j, m.model, d.device); });
+      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel, metric, best]), build: function () { var d = modelCard(m, c, cfg, metric, best); d.open = open; return d; }};
     }));
     if (named && !box.dataset.scrolled) { var t2 = document.getElementById(hashId); if (t2) { openTo(hashId); t2.scrollIntoView(); box.dataset.scrolled = "1"; } }
   }
-  function modelCard(m, c, cfg, metric) {
+  function modelCard(m, c, cfg, metric, best) {
     var det2 = el("details", "card model"), key = m.model.toLowerCase(); det2.id = "d-" + encodeURIComponent(m.model);
     var card = el("div", "body");
     // The device the config resolves to now (not when the benchmark ran) and the loaded one.
@@ -1017,11 +1022,12 @@
     } else if (m.changes && m.changes.baseline && !m.changes.comparable) {
       card.appendChild(el("p", "muted", "⚠ Not compared with the run of " + when(m.changes.baseline.timestamp) + ": " + ((m.changes.reasons || []).join("; ") || "the runs differ") + "."));
     }
-    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]), "devices");
+    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]), "devices", [{col: "best", dir: "asc"}]);
     var okRuns = m.devices.filter(function (d) { return d.run && !d.run.fell_back; });
     var fastest = okRuns.reduce(function (a, d) { return !a || d.run.stages_ms.total.p50 < a.run.stages_ms.total.p50 ? d : a; }, null);
-    m.devices.forEach(function (d) {
+    m.devices.forEach(function (d, k) {
       var tr = el("tr"), r = d.run, name = cell(tr, d.device, undefined, "Device");
+      if (best && typeof best[k] === "number") tr.setAttribute("data-best", String(best[k]));
       name.title = d.label;
       if (d === fastest && okRuns.length > 1) { tr.classList.add("fastest"); name.appendChild(el("span", "tag", "fastest")); }
       if (d.device === m.recommended) name.appendChild(el("span", "tag rec", "Recommended"));
@@ -1189,7 +1195,7 @@
       // A link to a tab or into one (#m-<model> = a profile card, #d-<model> = a Details card)
       // opens it; without one the page opens on Compare when there are results, else on Run.
       var target = location.hash.slice(1);
-      if (target) renderModels(models, j.config, j.ranking);
+      if (target) renderModels(models, j.config, j.ranking, j);
       if (T && target && T.show(target)) { openTo(target); var te = $(target); if (te && te.getAttribute("role") !== "tabpanel") te.scrollIntoView(); }
       else if (T) T.show(hasResults ? "tab-compare" : "tab-run");
     }
@@ -1207,7 +1213,7 @@
     L.keep($("conf-pick"), JSON.stringify([savedObjective(j), conf.obj, objs, running, devicesOf(models), selDevice]), function () { renderConfPick(j); });
     L.keep($("conf-best"), sm + sc + sp + conf.obj + sel + running + Object.keys(conf.cache).join(","), function () { renderConfBest(j, models); });
     L.keep($("thresholds"), sm + sc + JSON.stringify(j.profiles || null), function () { renderThresholds(models); });
-    renderModels(models, j.config, j.ranking);
+    renderModels(models, j.config, j.ranking, j);
     if (PB.compare) PB.compare.render(j, models);
     estimate();
     $("apply-thr-bar").hidden = running || !models.some(function (m) { return applicable(m.threshold); });

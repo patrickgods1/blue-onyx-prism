@@ -558,6 +558,41 @@ pub(super) fn file_stamp(p: &std::path::Path) -> Option<(Option<std::time::Syste
         .map(|m| (m.modified().ok(), m.len()))
 }
 
+/// Each benchmarked model's place in the cross-model ranking ([`BenchmarkResults::ranking`],
+/// [`crate::benchmark::grade::Grades::rank_cmp`]), keyed by normalized model name: the `best`
+/// ordinal of the Home and Stats tables (`data-best`, `/stats.json` `best`). A model without a
+/// graded result on its recommended device has none.
+fn ranks_of(ranking: &[crate::benchmark::report::RankRow]) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    for r in ranking {
+        out.entry(crate::registry::normalize_name(&r.model))
+            .or_insert(r.rank);
+    }
+    out
+}
+
+/// The last [`ranks_of`] of the saved results, keyed by the results file and its stamp: the Stats
+/// poll (every 5 s) parses the file again only after a benchmark rewrote it.
+static RANKS_CACHE: crate::benchmark::search::IdleCache<String, Arc<HashMap<String, usize>>> =
+    crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE);
+
+/// [`ranks_of`] of the results beside `config_path` (empty without results). Blocking: it may
+/// parse the file.
+pub(in crate::server) fn model_ranks(config_path: &std::path::Path) -> Arc<HashMap<String, usize>> {
+    let path = results_path(config_path);
+    let Some(stamp) = file_stamp(&path) else {
+        return Arc::default();
+    };
+    let key = format!("{}|{stamp:?}", path.display());
+    RANKS_CACHE.get_or_insert_with(key, || {
+        Arc::new(
+            BenchmarkResults::load_or_warn(&path)
+                .map(|r| ranks_of(&r.ranking()))
+                .unwrap_or_default(),
+        )
+    })
+}
+
 /// `results`, `ranking`, `points` and `latest_run_id` of `GET /v1/benchmark`: the saved results
 /// rebased on the config now, with the history-derived fields
 /// ([`crate::benchmark::history::view`]). The trees are kept serialized: a poll copies their
