@@ -366,6 +366,8 @@ struct Process {
     https: (u16, Option<PathBuf>, Option<PathBuf>),
     /// One benchmark runner for the process, so its last results survive a restart.
     benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    /// The running exports and imports the Jobs tab lists: a restart must not hide them.
+    side_jobs: Arc<server::side_jobs::SideJobs>,
     /// Wrong API tokens per peer: a restart must not forgive them.
     admin_failures: Arc<std::sync::Mutex<server::FailureLimit>>,
     /// Wrong passwords and setup codes per peer and the hashing permits: the same.
@@ -442,6 +444,7 @@ impl Process {
                 ort_loaded: loaded_ort,
             }),
             benchmark: self.benchmark.clone(),
+            side_jobs: self.side_jobs.clone(),
             admin_failures: self.admin_failures.clone(),
             login: self.login.clone(),
             auth: self.auth.clone(),
@@ -826,6 +829,7 @@ fn run_server_inner(
         log,
         provisioner,
         benchmark: crate::benchmark::service::BenchmarkService::new(),
+        side_jobs: Arc::default(),
         admin_failures: Arc::default(),
         login: Arc::default(),
         auth: Arc::new(crate::accounts::Auth::load(

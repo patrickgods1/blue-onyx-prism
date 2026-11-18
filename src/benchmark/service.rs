@@ -300,6 +300,17 @@ pub struct Status {
     pub finished_at: Option<String>,
 }
 
+/// A run in progress, briefly ([`BenchmarkService::running`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Running {
+    /// The request's models; empty = the enabled models.
+    pub models: Vec<String>,
+    /// None until the run reports.
+    pub progress: Option<ProgressView>,
+    /// When the run started.
+    pub started: Option<Instant>,
+}
+
 /// Refused start: a run is in progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("a benchmark is already running")]
@@ -316,6 +327,8 @@ struct Inner {
     error: Option<String>,
     warnings: Vec<String>,
     started_at: Option<String>,
+    /// `started_at` on the monotonic clock, for an elapsed time.
+    started: Option<Instant>,
     finished_at: Option<String>,
     /// Bumped per run, so a finished thread of an old run cannot overwrite a newer one.
     run_id: u64,
@@ -347,6 +360,7 @@ impl BenchmarkService {
                 error: None,
                 warnings: Vec::new(),
                 started_at: None,
+                started: None,
                 finished_at: None,
                 run_id: 0,
                 interrupted: None,
@@ -379,6 +393,22 @@ impl BenchmarkService {
 
     pub fn is_running(&self) -> bool {
         self.lock().state == RunState::Running
+    }
+
+    /// The running run's models, progress and start, without its results ([`Self::status`]
+    /// clones them): what the Jobs tab of the Train area lists, every few seconds. None when no
+    /// run is in progress.
+    pub fn running(&self) -> Option<Running> {
+        let g = self.lock();
+        (g.state == RunState::Running).then(|| Running {
+            models: g
+                .request
+                .as_ref()
+                .map(|r| r.models.clone())
+                .unwrap_or_default(),
+            progress: g.progress.clone(),
+            started: g.started,
+        })
     }
 
     /// Ask a running benchmark to stop (it stops at the next iteration, device or dataset
@@ -419,6 +449,7 @@ impl BenchmarkService {
             g.error = None;
             g.warnings.clear();
             g.started_at = Some(now());
+            g.started = Some(Instant::now());
             g.finished_at = None;
             g.run_id
         };
