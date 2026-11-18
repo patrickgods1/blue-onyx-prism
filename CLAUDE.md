@@ -404,6 +404,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     `PrismDraft` (sessionStorage drafts restored only at the same revision), `PrismViewport`, `PrismPointer`,
     `PrismTip` (information only in a `title` needs a tap-to-pin `button.term`, touch has no hover). Incremental polls: `server/training/poll.rs`
     (`TrainMetrics.poll`, node parity test), `server/benchmark/poll.rs`.
+  - `PrismSort` (`assets/sort.js`, node-tested in `tests/it/js_sort.rs`) is the one table sorter (`data-sort="<key>"`
+    or `PrismSort.attach`; re-renders call `PrismSort.apply`); ranked defaults come from Rust `data-best`, never
+    a JS ranking twin.
   - Pure modules are node-tested from `tests/it/`: `review-rules.js` (`js_rules.rs`), `review-touch.js`
     (`js_review_touch.rs`), charts, viewport, poll.
   - Phones (`assets/style.css`, *Phones and tablets*): every `vh` height is followed by `dvh`/`svh` and every `:hover`
