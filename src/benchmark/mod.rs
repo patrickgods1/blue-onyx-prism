@@ -70,7 +70,7 @@ use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use grade::{Grades, Weights};
 use images::{GroundTruth, ImageSet};
-use metrics::{ClassMap, Counts, EvalImage, GtBox, PredBox, Summary};
+use metrics::{ApBasis, ClassMap, Counts, EvalImage, GtBox, PredBox, Summary};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -259,6 +259,10 @@ pub struct Breakdown {
     /// Frame-level ROC AUC (macro over classes, see [`roc`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roc_auc: Option<f64>,
+    /// The classes `ap50` / `ap50_95` average ([`Summary::ap_basis`]; None in results of older
+    /// versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_basis: Option<ApBasis>,
 }
 
 impl Breakdown {
@@ -274,6 +278,7 @@ impl Breakdown {
             ap50_95: s.ap50_95,
             relative,
             roc_auc,
+            ap_basis: s.ap_basis.clone(),
         }
     }
 }
@@ -339,8 +344,12 @@ impl AccuracyReport {
 pub struct AllClasses {
     /// Classes with ground truth in the images.
     pub classes: usize,
+    /// Mean over the classes of `ap_basis` (see [`Summary::ap50`]).
     pub ap50: Option<f64>,
     pub ap50_95: Option<f64>,
+    /// The classes `ap50` / `ap50_95` average (None in results of older versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_basis: Option<ApBasis>,
 }
 
 /// The scored classes a dataset annotates: every class of `map`, or those of the set's

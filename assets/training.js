@@ -1715,7 +1715,12 @@
     var pat = s && isNum(s.patience) ? s.patience : p.patience;
     if (isNum(pat)) out.push(pat > 0 ? "patience " + pat + (s && s.patience_doubled ? " (×2, small val)" : "") : "early stop off");
     var select = s ? s.select_metric : rec.select_metric;
+    // "selected by F2 over car, person": the classes with enough validation boxes (the support
+    // event, TrainMetrics.selectedBy); an older record names the metric only.
+    var TM = window.TrainMetrics;
+    var by = !p.select_fallback && TM && TM.selectedBy ? TM.selectedBy(p, function (id) { return { short: metricShort(id) }; }) : "";
     if (p.select_fallback) out.push("selected by mAP (" + metricShort(p.select_fallback.metric) + " failed at epoch " + p.select_fallback.epoch + ")");
+    else if (by) out.push("selected " + by);
     else if (select && select !== "map") out.push("selected by " + metricShort(select));
     var seed = s && isNum(s.seed) ? s.seed : r.request && isNum(r.request.train_seed) ? r.request.train_seed : null;
     if (seed !== null) out.push("seed " + seed);

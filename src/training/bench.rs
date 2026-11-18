@@ -199,7 +199,8 @@ pub fn trained_chip(share: f64) -> Option<String> {
     })
 }
 
-/// `91% of people, 84% of vehicles, 3 false alerts on 120 empty frames (threshold 0.50)`.
+/// `finds 91% of people, 84% of vehicles, false alerts 3 on 120 empty frames, person alerts 2 on
+/// 210 frames without a person (threshold 0.50)`.
 fn finds_text(b: &BenchSummary) -> String {
     let pct = |v: Option<f64>| {
         v.filter(|v| v.is_finite())
@@ -220,6 +221,15 @@ fn finds_text(b: &BenchSummary) -> String {
     match (b.empty_frame_alerts, b.empty_frames.filter(|e| *e > 0)) {
         (Some(a), Some(e)) => s.push_str(&format!(", false alerts {a} on {e} empty frames")),
         _ => s.push_str(", false alerts n/a (no empty frames)"),
+    }
+    // Frames with a parked car are not empty: false person alerts show here.
+    if let (Some(a), Some(f)) = (
+        b.person_false_alerts,
+        b.person_free_frames.filter(|f| *f > 0),
+    ) {
+        s.push_str(&format!(
+            ", person alerts {a} on {f} frames without a person"
+        ));
     }
     if let Some(t) = b.threshold {
         s.push_str(&format!(" (threshold {t:.2})"));
@@ -257,8 +267,9 @@ pub fn compare_text(new: Option<&BenchSummary>, baseline: Option<&Baseline>) -> 
 /// The Train tab's view of a benchmark result: the recommended device (else the first that
 /// ran), its p50 time and AP50 (over every class of the model when the set annotates others),
 /// and the alerting figures of its overall score (person / vehicle recall, false alerts on empty
-/// frames) at the benchmark's configured threshold. Like the overall AP, those cover every
-/// dataset of the run (the held-out set and any built-in set run beside it).
+/// frames, false person alerts on frames without a person) at the benchmark's configured
+/// threshold. Like the overall AP, those cover every dataset of the run (the held-out set and any
+/// built-in set run beside it). Each AP carries the classes it averages (`ap_basis`).
 pub fn summarize(m: &ModelResult) -> BenchSummary {
     let dev = m
         .devices
@@ -268,18 +279,23 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
     let acc = dev
         .and_then(|d| d.run.as_ref())
         .and_then(|r| r.accuracy.as_ref());
-    let (ap50, ap50_95) = match acc {
+    let (ap50, ap50_95, ap_basis) = match acc {
         Some(a) => match &a.all_classes {
-            Some(all) if all.ap50.is_some() => (all.ap50, all.ap50_95),
-            _ => (a.overall.ap50, a.overall.ap50_95),
+            Some(all) if all.ap50.is_some() => (all.ap50, all.ap50_95, all.ap_basis.clone()),
+            _ => (
+                a.overall.ap50,
+                a.overall.ap50_95,
+                a.overall.ap_basis.clone(),
+            ),
         },
-        None => (None, None),
+        None => (None, None, None),
     };
     let tags: &[Breakdown] = acc.map(|a| a.by_tag.as_slice()).unwrap_or_default();
     let ap = |b: &Breakdown| SceneAp {
         ap50: b.ap50,
         ap50_95: b.ap50_95,
         images: b.images,
+        ap_basis: b.ap_basis.clone(),
     };
     let tagged = |key: &str| tags.iter().find(|b| b.key == key).map(ap);
     let mut by_scene = std::collections::BTreeMap::new();
@@ -306,6 +322,7 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
                 ap50: a.overall.ap50,
                 ap50_95: a.overall.ap50_95,
                 images: a.overall.images,
+                ap_basis: a.overall.ap_basis.clone(),
             },
         );
     }
@@ -321,9 +338,11 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
             ap50: b.ap50,
             ap50_95: b.ap50_95,
             recall: b.recall,
+            ap_basis: b.ap_basis.clone(),
         });
     // Alerting at the configured threshold, from the overall score (scored CCTV classes).
     let o = acc.map(|a| &a.overall);
+    let person = o.and_then(|o| o.class_alert("person"));
     BenchSummary {
         datasets: m.datasets.clone(),
         device: dev.map(|d| d.device.clone()),
@@ -341,6 +360,9 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         heldout_fingerprint: None,
         trained_on_share: m.trained_on_share,
         random,
+        ap_basis,
+        person_free_frames: person.map(|p| p.frames_without),
+        person_false_alerts: person.map(|p| p.alerts),
     }
 }
 
@@ -511,6 +533,7 @@ mod tests {
             ap50_95: Some(ap),
             relative: false,
             roc_auc: None,
+            ap_basis: None,
         }
     }
 
@@ -548,6 +571,88 @@ mod tests {
         m
     }
 
+    /// False person alerts and the AP's classes reach the summary and the Use card's words.
+    #[test]
+    fn person_alerts_and_the_ap_basis_reach_the_summary_and_the_text() {
+        use crate::benchmark::metrics::{ApBasis, ClassAlerts};
+        let basis = ApBasis {
+            min_gt: 20,
+            classes: vec!["car".into(), "person".into()],
+            fell_back: false,
+        };
+        let mut m = result(vec![], false);
+        let acc = m.devices[0]
+            .run
+            .as_mut()
+            .unwrap()
+            .accuracy
+            .as_mut()
+            .unwrap();
+        acc.overall.ap_basis = Some(basis.clone());
+        acc.overall.class_alerts = vec![
+            ClassAlerts {
+                class: "person".into(),
+                frames_without: 210,
+                alerts: 3,
+            },
+            ClassAlerts {
+                class: "car".into(),
+                frames_without: 5,
+                alerts: 1,
+            },
+        ];
+        let b = summarize(&m);
+        assert_eq!(b.ap_basis.as_ref(), Some(&basis));
+        assert_eq!(
+            (b.person_free_frames, b.person_false_alerts),
+            (Some(210), Some(3))
+        );
+        let j = serde_json::to_value(&b).unwrap();
+        assert_eq!(j["person_false_alerts"], 3);
+        assert_eq!(j["ap_basis"]["classes"][1], "person");
+        // The all-classes AP brings its own basis.
+        let all_basis = ApBasis {
+            classes: vec!["car".into()],
+            ..basis.clone()
+        };
+        m.devices[0]
+            .run
+            .as_mut()
+            .unwrap()
+            .accuracy
+            .as_mut()
+            .unwrap()
+            .all_classes = Some(crate::benchmark::AllClasses {
+            classes: 3,
+            ap50: Some(0.5),
+            ap50_95: Some(0.3),
+            ap_basis: Some(all_basis.clone()),
+        });
+        assert_eq!(summarize(&m).ap_basis, Some(all_basis));
+        // The words: after the empty-frame alerts, before the threshold.
+        let mut s = summary(0.91, 3);
+        s.person_free_frames = Some(210);
+        s.person_false_alerts = Some(2);
+        assert_eq!(
+            finds_text(&s),
+            "finds 91% of people, 80% of vehicles, false alerts 3 on 120 empty frames, person \
+             alerts 2 on 210 frames without a person (threshold 0.50)"
+        );
+        // No frame without a person: nothing said.
+        s.person_free_frames = Some(0);
+        assert!(!finds_text(&s).contains("person alerts"));
+        // A record of an older version loads without them.
+        let old: BenchSummary = serde_json::from_str(
+            r#"{"datasets":[],"device":null,"ms_p50":null,"ap50":0.5,"ap50_95":null,"images":3,
+               "by_scene":{"day":{"ap50":0.5,"ap50_95":0.3,"images":3}},
+               "random":{"images":1,"gt":1,"ap50":null,"ap50_95":null,"recall":null}}"#,
+        )
+        .unwrap();
+        assert_eq!((old.ap_basis, old.person_free_frames), (None, None));
+        assert_eq!(old.by_scene["day"].ap_basis, None);
+        assert_eq!(old.random.unwrap().ap_basis, None);
+    }
+
     #[test]
     fn summarize_reads_ap_per_scene_from_the_heldout_tags() {
         // Bare tags mix in a built-in set run beside; the `heldout:` ones do not.
@@ -563,7 +668,7 @@ mod tests {
         ];
         let b = summarize(&result(tags, true));
         assert_eq!(b.by_scene.len(), 4);
-        let day = b.by_scene["day"];
+        let day = &b.by_scene["day"];
         assert_eq!(
             (day.ap50_95, day.ap50, day.images),
             (Some(0.6), Some(0.8), 10)
@@ -609,6 +714,7 @@ mod tests {
                 ap50: Some(0.38 + 0.2),
                 ap50_95: Some(0.38),
                 recall: Some(0.71),
+                ap_basis: None,
             })
         );
         let j = serde_json::to_value(&b).unwrap();

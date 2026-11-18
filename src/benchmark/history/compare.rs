@@ -7,10 +7,20 @@
 //! - speed: a change counts at `|delta| >= max(SPEED_REL * before, SPEED_ABS_MS)` (frames per
 //!   second: the relative part only). [`SPEED_REL`] is the device-keep rule of the
 //!   recommendation (`report::NOISE_MARGIN`);
-//! - precision, recall, F1, AP, ROC AUC: a change counts past `SE_FACTOR` standard errors of a
+//! - precision, recall, F1, ROC AUC: a change counts past `SE_FACTOR` standard errors of a
 //!   proportion, `SE_FACTOR * sqrt(p (1 - p) / n)` with `p` the earlier value and `n` the
 //!   objects behind it, and never below one object's worth (`1 / n`, so a perfect earlier score
 //!   does not make every single miss count). Rough: the counts are not independent samples;
+//! - AP50 and AP50-95 are class averages (over the classes with at least
+//!   [`crate::benchmark::metrics::MIN_CLASS_GT`] objects, [`DeviceSnap::ap_classes`]): a change
+//!   counts past [`macro_noise`] of the earlier run's per-class values, the standard error of a
+//!   mean of `K` proportions, `SE_FACTOR * sqrt(sum p (1 - p) / n) / K`, never below one object
+//!   of the smallest class (`1 / (K min n)`). Judging it by every object instead let a dog of
+//!   2 boxes flipping from missed to found read as "better". Two runs that average other classes
+//!   (another class set or minimum) are not comparable on AP alone, the rest still is; two
+//!   entries of older versions (no `ap_min_gt`) keep the proportion rule over every object;
+//! - false person alerts on frames without a person ([`DeviceSnap::person_free_frames`]): the
+//!   proportion rule over those frames, lower is better; counted with the accuracy measures;
 //! - the best confidence threshold: no real change when the new value lies inside the earlier
 //!   run's near-optimal range (it is that range's midpoint rounded down to 0.01, so small
 //!   confidence shifts move it across a 0.01 boundary); otherwise better or worse by the best
@@ -41,7 +51,7 @@ pub enum Verdict {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricChange {
     /// `p50_ms`, `infer_p50_ms`, `fps`, `ap50`, `ap50_95`, `roc_auc`, `precision`, `recall`,
-    /// `f1`, `threshold`.
+    /// `f1`, `person_false_alerts` (a rate), `threshold`.
     pub metric: String,
     /// None for `threshold` (model level).
     pub device: Option<String>,
@@ -289,6 +299,49 @@ pub fn proportion_change(
     n: Option<usize>,
     unit: &str,
 ) -> MetricChange {
+    directed_proportion_change(metric, device, before, after, n, unit, true)
+}
+
+/// [`proportion_change`] of a rate where lower is better (false alerts).
+pub fn lower_proportion_change(
+    metric: &str,
+    device: &str,
+    before: Option<f64>,
+    after: Option<f64>,
+    n: Option<usize>,
+    unit: &str,
+) -> MetricChange {
+    directed_proportion_change(metric, device, before, after, n, unit, false)
+}
+
+fn directed_proportion_change(
+    metric: &str,
+    device: &str,
+    before: Option<f64>,
+    after: Option<f64>,
+    n: Option<usize>,
+    unit: &str,
+    higher_better: bool,
+) -> MetricChange {
+    let name = metric_name(metric);
+    judged(metric, device, before, after, higher_better, |b| {
+        let n = n
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("no {unit} behind the {name}, so a change cannot be judged"))?;
+        Ok((proportion_noise(b, n), format!("for {n} {unit}")))
+    })
+}
+
+/// A metric change judged against a noise: `noise(before)` gives the noise and the words of what
+/// it is "for" (`for 300 objects`), or why no noise can be judged (verdict Same).
+fn judged(
+    metric: &str,
+    device: &str,
+    before: Option<f64>,
+    after: Option<f64>,
+    higher_better: bool,
+    noise: impl FnOnce(f64) -> Result<(f64, String), String>,
+) -> MetricChange {
     let mut c = MetricChange {
         metric: metric.to_string(),
         device: Some(device.to_string()),
@@ -312,26 +365,28 @@ pub fn proportion_change(
     };
     let delta = a - b;
     c.delta = Some(delta);
-    let Some(n) = n.filter(|n| *n > 0) else {
-        c.why = format!("no {unit} behind the {name}, so a change cannot be judged");
-        return c;
+    let (noise, scope) = match noise(b) {
+        Ok(x) => x,
+        Err(why) => {
+            c.why = why;
+            return c;
+        }
     };
-    let noise = proportion_noise(b, n);
     let dir = if delta > 0.0 { "up" } else { "down" };
     if delta.abs() > noise {
-        c.verdict = if delta > 0.0 {
+        c.verdict = if (delta > 0.0) == higher_better {
             Verdict::Better
         } else {
             Verdict::Worse
         };
         c.why = format!(
-            "{name} {dir} {} points (more than the normal variation of {} points for {n} {unit})",
+            "{name} {dir} {} points (more than the normal variation of {} points {scope})",
             points(delta.abs()),
             points(noise)
         );
     } else {
         c.why = format!(
-            "within normal variation for {n} {unit} ({name} {dir} {} points, noise {} points)",
+            "within normal variation {scope} ({name} {dir} {} points, noise {} points)",
             points(delta.abs()),
             points(noise)
         );
@@ -346,6 +401,106 @@ pub fn proportion_noise(p: f64, n: usize) -> f64 {
     (SE_FACTOR * (p * (1.0 - p) / n).sqrt()).max(1.0 / n)
 }
 
+/// The noise of a mean of `K` per-class proportions `(p, n)` (a class average such as AP50):
+/// `max(SE_FACTOR * sqrt(sum p (1 - p) / n) / K, 1 / (K * min n))`. The standard error of a mean
+/// of independent proportions is `sqrt(sum p (1 - p) / n) / K`; the floor is one object of the
+/// smallest class, which moves the mean by `1 / (K n)`. Classes with `n` 0 are left out; 0
+/// without any class.
+pub fn macro_noise(classes: &[(f64, usize)]) -> f64 {
+    let used: Vec<(f64, f64)> = classes
+        .iter()
+        .filter(|(p, n)| *n > 0 && p.is_finite())
+        .map(|&(p, n)| (p.clamp(0.0, 1.0), n as f64))
+        .collect();
+    let Some(min_n) = used.iter().map(|u| u.1).reduce(f64::min) else {
+        return 0.0;
+    };
+    let k = used.len() as f64;
+    let var: f64 = used.iter().map(|(p, n)| p * (1.0 - p) / n).sum();
+    (SE_FACTOR * var.sqrt() / k).max(1.0 / (k * min_n))
+}
+
+/// What an AP of `s` averages, in words: `every class` (an entry of an older version), `car,
+/// person`, or `dog, cat (none had 20 objects)`.
+fn basis_words(s: &DeviceSnap) -> String {
+    match s.ap_min_gt {
+        None => "every class".into(),
+        Some(min) => {
+            let names: Vec<&str> = s.ap_classes.iter().map(|c| c.class.as_str()).collect();
+            if s.ap_fell_back {
+                format!("every class ({}; none had {min} objects)", names.join(", "))
+            } else {
+                names.join(", ")
+            }
+        }
+    }
+}
+
+/// The classes of `s`'s AP average, sorted (None: an entry of an older version).
+fn basis_key(s: &DeviceSnap) -> Option<(usize, bool, Vec<&str>)> {
+    let min = s.ap_min_gt?;
+    let mut names: Vec<&str> = s.ap_classes.iter().map(|c| c.class.as_str()).collect();
+    names.sort_unstable();
+    Some((min, s.ap_fell_back, names))
+}
+
+/// An AP change (`ap50` or `ap50_95`, `before` / `after` its values in `a` / `b`). Two entries of
+/// older versions: [`proportion_change`] behind every object. One that averages other classes
+/// (another [`DeviceSnap::ap_min_gt`] or class set): not comparable. The same classes: judged by
+/// [`macro_noise`] over the earlier run's per-class values and objects.
+fn ap_change(metric: &str, a: &DeviceSnap, b: &DeviceSnap) -> MetricChange {
+    let pick = |s: &DeviceSnap| if metric == "ap50" { s.ap50 } else { s.ap50_95 };
+    let (before, after) = (pick(a), pick(b));
+    let dev = b.device.as_str();
+    let (ka, kb) = (basis_key(a), basis_key(b));
+    if ka.is_none() && kb.is_none() {
+        return proportion_change(metric, dev, before, after, a.ground_truth, "objects");
+    }
+    let name = metric_name(metric);
+    if ka != kb {
+        let (wa, wb) = (basis_words(a), basis_words(b));
+        let why = if wa == wb {
+            format!(
+                "{name} averaged over classes with at least {} objects -> at least {} objects",
+                a.ap_min_gt.map_or_else(|| "any".into(), |m| m.to_string()),
+                b.ap_min_gt.map_or_else(|| "any".into(), |m| m.to_string())
+            )
+        } else {
+            format!("{name} averaged over other classes ({wa} -> {wb})")
+        };
+        return MetricChange {
+            metric: metric.to_string(),
+            device: Some(dev.to_string()),
+            before,
+            after,
+            delta: None,
+            rel: None,
+            verdict: Verdict::NotComparable,
+            why,
+        };
+    }
+    let classes: Vec<(f64, usize, &str)> = a
+        .ap_classes
+        .iter()
+        .filter_map(|c| {
+            let p = if metric == "ap50" { c.ap50 } else { c.ap50_95 };
+            Some((p?, c.gt, c.class.as_str()))
+        })
+        .filter(|(p, n, _)| *n > 0 && p.is_finite())
+        .collect();
+    if classes.is_empty() {
+        return proportion_change(metric, dev, before, after, a.ground_truth, "objects");
+    }
+    judged(metric, dev, before, after, true, |_| {
+        let noise = macro_noise(&classes.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>());
+        let list: Vec<String> = classes
+            .iter()
+            .map(|(_, n, name)| format!("{name} ({n} objects)"))
+            .collect();
+        Ok((noise, format!("for the average of {}", list.join(", "))))
+    })
+}
+
 fn metric_name(metric: &str) -> &'static str {
     match metric {
         "p50_ms" => "time per image (p50)",
@@ -357,6 +512,7 @@ fn metric_name(metric: &str) -> &'static str {
         "precision" => "precision",
         "recall" => "recall",
         "f1" => "F1",
+        "person_false_alerts" => "person false-alert rate",
         "threshold" => "best confidence threshold",
         _ => "value",
     }
@@ -375,9 +531,18 @@ fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
         speed_change("infer_p50_ms", dev, a.infer_p50_ms, b.infer_p50_ms, false),
         speed_change("fps", dev, a.fps, b.fps, true),
     ];
+    for m in ["ap50", "ap50_95"] {
+        let (x, y) = if m == "ap50" {
+            (a.ap50, b.ap50)
+        } else {
+            (a.ap50_95, b.ap50_95)
+        };
+        // A metric neither run has (no ground truth) says nothing.
+        if x.is_some() || y.is_some() {
+            v.push(ap_change(m, a, b));
+        }
+    }
     let acc = [
-        ("ap50", a.ap50, b.ap50, objects, "objects"),
-        ("ap50_95", a.ap50_95, b.ap50_95, objects, "objects"),
         (
             "roc_auc",
             a.roc_auc,
@@ -405,6 +570,18 @@ fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
             continue;
         }
         v.push(proportion_change(m, dev, x, y, n, unit));
+    }
+    // False person alerts on frames without a person: a rate, lower is better.
+    let (ra, rb) = (a.person_alert_rate(), b.person_alert_rate());
+    if ra.is_some() || rb.is_some() {
+        v.push(lower_proportion_change(
+            "person_false_alerts",
+            dev,
+            ra,
+            rb,
+            a.person_free_frames,
+            "frames without a person",
+        ));
     }
     v
 }
@@ -560,7 +737,13 @@ fn summary(b: &HistoryEntry, metrics: &[MetricChange]) -> String {
     }
     let acc: Vec<&MetricChange> = metrics
         .iter()
-        .filter(|m| on(m) && matches!(m.metric.as_str(), "ap50" | "precision" | "recall" | "f1"))
+        .filter(|m| {
+            on(m)
+                && matches!(
+                    m.metric.as_str(),
+                    "ap50" | "precision" | "recall" | "f1" | "person_false_alerts"
+                )
+        })
         .collect();
     if !acc.is_empty() {
         let better = acc.iter().any(|m| m.verdict == Verdict::Better);

@@ -640,6 +640,9 @@ fn accuracy_tables(
         a.classes.join(", "),
         a.threshold
     ));
+    if let Some(b) = &a.overall.ap_basis {
+        paragraphs.push(ap_basis_note(b));
+    }
     tables.push(breakdown_table("By dataset", &a.by_dataset));
     tables.push(breakdown_table("By tag", &a.by_tag));
     tables.push(Table {
@@ -672,6 +675,12 @@ fn accuracy_tables(
             roc.positives,
             roc.negatives
         ));
+        if let Some(b) = &roc.auc_basis {
+            paragraphs.push(format!(
+                "The macro ROC AUC averages {} (counted in frames with the class).",
+                b.describe()
+            ));
+        }
         tables.push(Table {
             title: "Frame-level ROC by class".into(),
             head: ["class", "frames with", "frames without", "ROC AUC"]
@@ -701,6 +710,22 @@ fn accuracy_tables(
             .map(|b| vec![b.bucket.clone(), b.gt.to_string(), pct(b.recall)])
             .collect(),
     });
+}
+
+/// The footnote naming the classes AP50 / AP50-95 average.
+fn ap_basis_note(b: &super::metrics::ApBasis) -> String {
+    if b.fell_back {
+        format!(
+            "AP50 and AP50-95 average {}, so they rest on few objects.",
+            b.describe()
+        )
+    } else {
+        format!(
+            "AP50 and AP50-95 average {}; classes with fewer objects are scored in the By class \
+             table only.",
+            b.describe()
+        )
+    }
 }
 
 /// Speed per resolution bucket of `run` (every bucket; one without images is n/a).
@@ -757,12 +782,14 @@ fn grades_section(metric: AccuracyMetric) -> Section {
                 metric.label()
             ),
             format!(
-                "Accuracy, AP50 metric: AP@0.5 over the CCTV classes the model has (person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse; IPcam 'vehicle' = car/truck/bus), blended {:.0}% with small-object recall when there are small objects: A >= {:.2}, B >= {:.2}, C >= {:.2}, D >= {:.2}, else F. * = relative to a reference model, not ground truth.",
+                "Accuracy, AP50 metric: AP@0.5 over the CCTV classes the model has (person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse; IPcam 'vehicle' = car/truck/bus), averaged over the classes with at least {} ground-truth objects (every class when none has that many; rarer classes are scored per class only), blended {:.0}% with small-object recall when there are small objects: A >= {:.2}, B >= {:.2}, C >= {:.2}, D >= {:.2}, else F. * = relative to a reference model, not ground truth.",
+                super::metrics::MIN_CLASS_GT,
                 SMALL_RECALL_WEIGHT * 100.0,
                 ACCURACY_THRESHOLDS[0], ACCURACY_THRESHOLDS[1], ACCURACY_THRESHOLDS[2], ACCURACY_THRESHOLDS[3]
             ),
             format!(
-                "Accuracy, ROC AUC metric: macro frame-level ROC AUC over the same classes (no small-object component): A >= {:.2}, B >= {:.2}, C >= {:.2}, D >= {:.2}, else F (0.5 is chance).",
+                "Accuracy, ROC AUC metric: macro frame-level ROC AUC over the same classes (those with at least {} frames with the class; no small-object component): A >= {:.2}, B >= {:.2}, C >= {:.2}, D >= {:.2}, else F (0.5 is chance).",
+                super::metrics::MIN_CLASS_GT,
                 ROC_AUC_THRESHOLDS[0], ROC_AUC_THRESHOLDS[1], ROC_AUC_THRESHOLDS[2], ROC_AUC_THRESHOLDS[3]
             ),
             "Overall: weighted mean of the grade points (A=4 .. F=0), default 60% accuracy, 40% speed (config benchmark.weights). Devices whose detections disagree with the CPU reference are never recommended.".into(),
@@ -917,6 +944,57 @@ pub fn write(r: &BenchmarkResults, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report names the classes AP and the macro ROC AUC average.
+    #[test]
+    fn accuracy_paragraphs_name_the_averaged_classes() {
+        use super::super::metrics::{ApBasis, Summary};
+        let run = super::super::report::test_support::run("openvino:cpu", 10.0, vec![]);
+        let basis = |classes: &[&str], fell_back: bool| ApBasis {
+            min_gt: 20,
+            classes: classes.iter().map(|c| c.to_string()).collect(),
+            fell_back,
+        };
+        let a = AccuracyReport {
+            ground_truth: "ground truth".into(),
+            relative: false,
+            classes: vec!["person".into(), "car".into(), "dog".into()],
+            threshold: 0.5,
+            overall: Summary {
+                ap_basis: Some(basis(&["person", "car"], false)),
+                ..Default::default()
+            },
+            by_dataset: vec![],
+            by_tag: vec![],
+            all_classes: None,
+            sweep: None,
+            frame_roc: Some(super::super::roc::FrameRoc {
+                auc_basis: Some(basis(&["person", "dog"], true)),
+                ..Default::default()
+            }),
+        };
+        let (mut paragraphs, mut tables) = (Vec::new(), Vec::new());
+        accuracy_tables(&run, &a, &mut paragraphs, &mut tables);
+        let text = paragraphs.join("\n");
+        assert!(
+            text.contains(
+                "AP50 and AP50-95 average over person, car (\u{2265} 20 objects each); classes \
+                 with fewer objects are scored in the By class table only."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "The macro ROC AUC averages every class: none had 20 objects (counted in frames \
+                 with the class)."
+            ),
+            "{text}"
+        );
+        assert!(
+            grades_section(AccuracyMetric::Ap50).paragraphs[2]
+                .contains("at least 20 ground-truth objects")
+        );
+    }
 
     #[test]
     fn reports_render_and_escape() {

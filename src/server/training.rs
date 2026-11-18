@@ -540,7 +540,7 @@ struct SeedSummaryView {
     model: String,
     scene: String,
     /// Day, night, IR, all, in scope, random picks (only with [`CompareCard::random`]), p50 ms,
-    /// person R, vehicle R, false alerts: `mean (min-max)`.
+    /// person R, vehicle R, false alerts, person false alerts: `mean (min-max)`.
     cells: Vec<String>,
 }
 
@@ -573,6 +573,7 @@ fn seed_summary_view(sm: &compare::SeedSummary, random: bool) -> SeedSummaryView
         col("person_recall", 2, 1.0, ""),
         col("vehicle_recall", 2, 1.0, ""),
         col("false_alerts", 1, 100.0, "%"),
+        col("person_false_alerts", 1, 100.0, "%"),
     ];
     if random {
         // After `in scope`, as in the table's head.
@@ -588,7 +589,11 @@ fn seed_summary_view(sm: &compare::SeedSummary, random: bool) -> SeedSummaryView
 
 /// Text and hover text of a comparison row's random-picks cell: AP50-95, and what it covers.
 fn random_cell(row: &compare::Row) -> (String, String) {
-    let Some(s) = row.random.filter(|s| s.ap50_95.is_some_and(f64::is_finite)) else {
+    let Some(s) = row
+        .random
+        .as_ref()
+        .filter(|s| s.ap50_95.is_some_and(f64::is_finite))
+    else {
         return ("\u{2014}".into(), String::new());
     };
     let mut title = format!(
@@ -626,7 +631,12 @@ struct AlertCell {
 }
 
 /// The alerting columns of the Comparison card, in table order ([`compare::COLUMNS`] ids).
-const ALERT_COLUMNS: [&str; 3] = ["person_recall", "vehicle_recall", "false_alerts"];
+const ALERT_COLUMNS: [&str; 4] = [
+    "person_recall",
+    "vehicle_recall",
+    "false_alerts",
+    "person_false_alerts",
+];
 
 /// The Comparison card of one `compare_group`.
 struct CompareCard {
@@ -866,8 +876,12 @@ fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
     match (b, err) {
         (Some(b), _) => {
             let mut s = format!(
-                "AP50 {} \u{b7} {} on {} \u{b7} {} images ({})",
+                "AP50 {}{} \u{b7} {} on {} \u{b7} {} images ({})",
                 b.ap50.map_or_else(|| "n/a".into(), |a| format!("{a:.3}")),
+                b.ap_basis
+                    .as_ref()
+                    .filter(|_| b.ap50.is_some())
+                    .map_or_else(String::new, basis_short),
                 b.ms_p50
                     .map_or_else(|| "?".into(), |m| format!("{m:.1} ms")),
                 b.device.as_deref().unwrap_or("?"),
@@ -899,6 +913,12 @@ fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
             if let (Some(a), Some(e)) = (b.empty_frame_alerts, b.empty_frames.filter(|e| *e > 0)) {
                 alerting.push(format!("false alerts {a}/{e} empty frames"));
             }
+            if let (Some(a), Some(f)) = (
+                b.person_false_alerts,
+                b.person_free_frames.filter(|f| *f > 0),
+            ) {
+                alerting.push(format!("person alerts {a}/{f} frames without a person"));
+            }
             if !alerting.is_empty() {
                 s.push_str(&format!(" \u{b7} {}", alerting.join(" \u{b7} ")));
                 if let Some(t) = b.threshold {
@@ -909,6 +929,15 @@ fn bench_text(b: Option<&BenchSummary>, err: Option<&str>) -> String {
         }
         (None, Some(e)) => format!("benchmark failed: {e}"),
         (None, None) => "not benchmarked".into(),
+    }
+}
+
+/// ` (car, person)`: the classes an AP averages, or ` (every class: none had 20 objects)`.
+fn basis_short(b: &crate::benchmark::metrics::ApBasis) -> String {
+    if b.fell_back {
+        format!(" ({})", b.describe())
+    } else {
+        format!(" ({})", b.classes.join(", "))
     }
 }
 
@@ -974,6 +1003,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         }),
         seed: r.request.train_seed,
         select_metric: r.select_metric(),
+        select_classes: crate::training::progress::selected_classes(p),
         bench: r.benchmark.clone(),
     }
 }
@@ -1083,7 +1113,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
             let random_tip = c
                 .rows
                 .iter()
-                .find_map(|r| r.random)
+                .find_map(|r| r.random.as_ref())
                 .filter(|_| c.random_column)
                 .map_or_else(String::new, |s| random_tip(s.images, s.gt));
             CompareCard {
@@ -1122,6 +1152,18 @@ fn alert_cell(row: &compare::Row, col: &str) -> (String, String) {
                 (format!("{v:.2}"), format!("recall{at}, IoU 0.5"))
             })
         }
+        "person_false_alerts" => row.person_false_alerts.map_or_else(dash, |f| {
+            let rate = f
+                .rate()
+                .map_or_else(String::new, |r| format!(" ({:.1}%)", r * 100.0));
+            (
+                f.text(),
+                format!(
+                    "{} of {} frames without a person had a person detection{rate}{at}",
+                    f.alerts, f.frames
+                ),
+            )
+        }),
         "false_alerts" => row.false_alerts.map_or_else(dash, |f| {
             let rate = f
                 .rate()
@@ -4487,6 +4529,7 @@ pub(super) mod tests {
             ap50: Some(v + 0.2),
             ap50_95: Some(v),
             images: 10,
+            ap_basis: None,
         }
     }
 
@@ -4541,6 +4584,9 @@ pub(super) mod tests {
             empty_frames: Some(40),
             empty_frame_alerts: Some((10.0 * n).round() as usize),
             random: None,
+            ap_basis: None,
+            person_free_frames: None,
+            person_false_alerts: None,
         });
         RunRecord {
             baseline: None,
@@ -4759,11 +4805,12 @@ pub(super) mod tests {
         assert_eq!(r[2].cells[0].ap, "\u{2014}");
         assert_eq!(r[2].state, "running");
         assert!(r[3].routed && !r[3].cells[1].best);
-        // Alerting columns: person recall, vehicle recall (none recorded), false alerts.
+        // Alerting columns: person recall, vehicle recall (none recorded), false alerts, false
+        // person alerts (none recorded).
         let texts =
             |k: usize| -> Vec<&str> { r[k].alerts.iter().map(|a| a.text.as_str()).collect() };
-        assert_eq!(texts(0), ["0.60", "\u{2014}", "2/40"]);
-        assert_eq!(texts(1), ["0.30", "\u{2014}", "5/40"]);
+        assert_eq!(texts(0), ["0.60", "\u{2014}", "2/40", "\u{2014}"]);
+        assert_eq!(texts(1), ["0.30", "\u{2014}", "5/40", "\u{2014}"]);
         assert!(r[0].alerts[0].best && r[0].alerts[2].best && !r[0].alerts[1].best);
         assert!(!r[1].alerts[0].best && !r[1].alerts[2].best);
         assert_eq!(r[0].alerts[0].title, "recall at threshold 0.50, IoU 0.5");
@@ -4771,8 +4818,24 @@ pub(super) mod tests {
             r[0].alerts[2].title,
             "2 of 40 frames without any object alerted (5.0%) at threshold 0.50"
         );
-        assert_eq!(texts(2), ["\u{2014}"; 3], "the running run");
-        assert_eq!(texts(3), ["\u{2014}"; 3], "the routed row");
+        assert_eq!(texts(2), ["\u{2014}"; 4], "the running run");
+        assert_eq!(texts(3), ["\u{2014}"; 4], "the routed row");
+        // False person alerts, when recorded: the count and what it covers.
+        let mut with_person = recs.clone();
+        // Records `a` and `b` of the newest group.
+        for (k, (a, f)) in [(2, (2, 210)), (3, (5, 200))] {
+            let b = with_person[k].benchmark.as_mut().unwrap();
+            b.person_false_alerts = Some(a);
+            b.person_free_frames = Some(f);
+        }
+        let cards = compare_cards(&with_person);
+        let pr = &cards[0].rows;
+        assert_eq!(pr[0].alerts[3].text, "2/210");
+        assert_eq!(
+            pr[0].alerts[3].title,
+            "2 of 210 frames without a person had a person detection (1.0%) at threshold 0.50"
+        );
+        assert!(pr[0].alerts[3].best && !pr[1].alerts[3].best);
         assert!(r[3].alerts.iter().all(|a| !a.best && a.title.is_empty()));
         // A different held-out set: not comparable, said so.
         let mut recs = recs;
@@ -4802,6 +4865,7 @@ pub(super) mod tests {
                 ap50: Some(ap + 0.2),
                 ap50_95: Some(ap),
                 recall: Some(0.7),
+                ap_basis: None,
             });
         }
         recs
@@ -5174,6 +5238,25 @@ pub(super) mod tests {
             "AP50 0.500 \u{b7} 12.3 ms on openvino:cpu \u{b7} 20 images (heldout-x)"
         );
         assert_eq!(bench_text(None, Some("x")), "benchmark failed: x");
+        // The classes the AP averages, when recorded.
+        let mut based = b.clone();
+        based.ap_basis = Some(crate::benchmark::metrics::ApBasis {
+            min_gt: 20,
+            classes: vec!["car".into(), "person".into()],
+            fell_back: false,
+        });
+        assert!(
+            bench_text(Some(&based), None).starts_with("AP50 0.500 (car, person) \u{b7} 12.3 ms"),
+            "{}",
+            bench_text(Some(&based), None)
+        );
+        based.ap_basis.as_mut().unwrap().fell_back = true;
+        assert!(
+            bench_text(Some(&based), None)
+                .starts_with("AP50 0.500 (every class: none had 20 objects) \u{b7}"),
+            "{}",
+            bench_text(Some(&based), None)
+        );
         // Per scene (only scenes with held-out frames) and in scope.
         let mut b = b;
         b.by_scene.insert("day".into(), scene_ap(0.61));
@@ -5212,6 +5295,18 @@ pub(super) mod tests {
             "{}",
             bench_text(Some(&b), None)
         );
+        // False person alerts on frames without a person (a parked car does not hide them).
+        b.person_free_frames = Some(210);
+        b.person_false_alerts = Some(3);
+        assert!(
+            bench_text(Some(&b), None).ends_with(
+                "false alerts 0/130 empty frames \u{b7} person alerts 3/210 frames without a person \
+                 @ 0.50"
+            ),
+            "{}",
+            bench_text(Some(&b), None)
+        );
+        b.person_free_frames = None;
         // No empty frames: no false-alert part.
         b.empty_frames = Some(0);
         assert!(bench_text(Some(&b), None).ends_with("vehicle recall 0.67 @ 0.50"));

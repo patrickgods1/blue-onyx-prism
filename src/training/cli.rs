@@ -1568,6 +1568,7 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 .map(|s| s.epoch),
             seed: r.request.train_seed,
             select_metric: r.select_metric(),
+            select_classes: super::progress::selected_classes(r.progress.as_ref()),
             bench: r.benchmark.clone(),
         })
         .collect();
