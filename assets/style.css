@@ -868,10 +868,17 @@ main:has(#review), main:has(> nav.train-tabs > a.active[href="/train/review"]) {
 .rv-side-body > label.check { margin: 0.2rem 0; }
 .rv-side-foot { flex: none; padding: 0.4rem 0.9rem 0.7rem; border-top: 1px solid var(--border); }
 /* The message slot: one line, always there (the full text in its title), green for a save, red for
-   an error; it dims after a few seconds (review.js say) without moving anything. */
-.review-side #rv-msg { display: flex; align-self: stretch; align-items: center; gap: 0.4rem; height: 1.6rem; margin: 0 0 0.35rem; overflow: hidden; white-space: nowrap; font-size: 0.85rem; transition: opacity 0.6s; }
+   an error; it dims after a few seconds (review.js say) without moving anything. A message its line
+   cuts opens (`rv-msg-open`): a copy of the line (`.rv-msg-full`), out of the flow, grows upward
+   from the slot's foot over the panel, so nothing moves and the buttons under it stay uncovered;
+   the next key, tap or frame (or 8 s) removes it. */
+.review-side #rv-msg { position: relative; display: flex; align-self: stretch; align-items: center; height: 1.6rem; margin: 0 0 0.35rem; white-space: nowrap; font-size: 0.85rem; transition: opacity 0.6s; }
+#rv-msg > .rv-msg-in { display: flex; align-items: center; gap: 0.4rem; flex: 1 1 auto; min-width: 0; height: 100%; overflow: hidden; }
 #rv-msg .rv-msg-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 #rv-msg.rv-msg-old { opacity: 0.45; color: var(--muted); }
+#rv-msg > .rv-msg-full { position: absolute; z-index: 40; left: -0.45rem; right: -0.45rem; bottom: 0; max-height: 50vh; max-height: 50dvh; overflow-y: auto; padding: 0.3rem 0.45rem; background: var(--card); border: 1px solid currentColor; border-radius: 6px; box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.22); white-space: normal; line-height: 1.35; cursor: pointer; }
+#rv-msg > .rv-msg-full > .rv-msg-in { height: auto; flex-wrap: wrap; overflow: visible; }
+#rv-msg > .rv-msg-full .rv-msg-text { overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
 #rv-msg button.small { flex: none; margin: 0; padding: 0 0.4rem; font-size: 0.75rem; }
 @media (max-width: 900px) {
   .review-grid, .review-grid.rv-wide { grid-template-columns: minmax(0, 1fr); }
@@ -984,32 +991,42 @@ button.ok { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--o
 button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(--err-fg); }
 @media (hover: hover) { button.ok:hover, button.bad:hover { filter: brightness(0.95); box-shadow: 0 0 0 1px currentColor; } }
 /* The decision bar: the selected box's question and answers, the frame's progress. */
-.rv-decide { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; margin: 0.4rem 0; background: var(--bg); }
+.rv-decide { margin: 0.4rem 0; }
 .rv-decide:empty { display: none; }
+/* The card in its slot: #rv-decide keeps a minimum height (below), so what a short card leaves is
+   room under its border, never an empty band inside it. */
+.rv-decide > .rv-card { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.6rem; background: var(--bg); }
 .rv-q { font-size: 1.02rem; line-height: 1.35; }
 .rv-q strong { font-size: 1.1rem; }
 .rv-q-num { color: var(--muted); font-size: 0.9rem; }
 /* The selected box's line (review.js renderDecision): Box 3 / 8 · the question · score · its tier, in
-   fixed slots, one line; then a two-line "why" slot and the answers in a fixed grid, so Yes / No /
-   Real, parked sit at the same place for every box. What only some boxes have comes after them. */
+   fixed slots, one line; right under it the answers in a fixed grid, so Yes / No / Real, parked sit
+   at the same place for every box. What only some boxes have comes after them: a suggestion's block
+   (its one-line head, its answers, its evidence), the row of what comes and goes after an answer
+   (rv-q-tools), the "why" text. Two columns: the card's slot keeps a minimum height (the card's old
+   one), so the box list under it stays put whatever the text under the answers. */
 .rv-q-head { display: grid; grid-template-columns: 4.8rem minmax(0, 1fr) 2.4rem 4.6rem; column-gap: 0.35rem; align-items: baseline; height: 1.6rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .rv-q-head > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .rv-q-head strong { font-size: 1.02rem; }
 .rv-q-head .rv-q-score { font-size: 0.85rem; color: var(--muted); text-align: right; }
 .rv-q-head .rv-q-tier { font-size: 0.75rem; justify-self: end; max-width: 100%; }
 .rv-q-head .rv-q-tier .rv-chip { white-space: nowrap; }
-.rv-q-body { min-height: 9.6rem; }
+.rv-q-body.rv-q-none { display: flow-root; min-height: 7.6rem; }
+@media (min-width: 901px) { .rv-decide { min-height: calc(14.35rem + 2px); } }
 .rv-q-note { font-size: 0.9rem; margin-top: 0.15rem; overflow-wrap: anywhere; }
-.rv-q-why { font-size: 0.8rem; line-height: 1.3; min-height: 2.6em; margin-top: 0.1rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.rv-q-why { font-size: 0.8rem; line-height: 1.3; margin-top: 0.35rem; overflow-wrap: anywhere; }
+.rv-q-tools { display: flex; flex-direction: column; align-items: stretch; gap: 0.35rem; margin-top: 0.35rem; }
+.rv-q-tools > button.small { margin: 0; }
+.rv-q-tools > .rv-q-wide { min-height: 2.15rem; font-weight: 600; }
 .rv-q-btns { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.45rem; }
 .rv-q-btns button.small { margin: 0; padding: 0.3rem 0.55rem; font-size: 0.9rem; font-weight: 600; }
 .rv-q-btns.rv-q-answers { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.35rem; }
 .rv-q-answers > button.small { min-width: 0; min-height: 2.15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rv-q-answers > .rv-q-wide { grid-column: 1 / -1; }
 .rv-q-answers > .rv-q-ph { visibility: hidden; min-height: 2.15rem; }
-.rv-q-reason-slot { height: 1.6rem; margin-top: 0.35rem; overflow: hidden; }
-.rv-q-reason-slot > .rv-q-reason { margin: 0; height: 100%; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; white-space: nowrap; }
-.rv-q-reason-slot > .rv-q-reason button.small { flex: none; }
+.rv-q-tools > .rv-q-reason { margin: 0; min-height: 1.6rem; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; white-space: nowrap; }
+.rv-q-tools > .rv-q-reason button.small { flex: none; }
+.rv-q-tools > .rv-q-classes { margin: 0; }
 .rv-decide-more:empty { display: none; }
 .rv-decide-more { margin: -0.1rem 0 0.3rem; }
 .rv-decide-more > :first-child { margin-top: 0; }
@@ -1024,8 +1041,19 @@ button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(
 .rv-progress progress { width: 100%; max-width: none; height: 0.45rem; accent-color: #2e9e4f; }
 .rv-q-dup { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
 .rv-q-dup button.small { margin: 0; padding: 0.15rem 0.5rem; }
-.rv-q-sug { margin-bottom: 0.5rem; padding: 0.35rem 0.5rem; border-left: 3px solid #ff3df0; font-size: 0.85rem; }
-.rv-q-sug-head { font-weight: 600; }
+.rv-q-sug { margin: 0.45rem 0 0; padding: 0.35rem 0.5rem; border-left: 3px solid #ff3df0; font-size: 0.85rem; }
+/* A suggestion's first line: one line, cut (the whole of it in the title, and under the answers
+   when cut: rv-q-sug-full), so its answers sit at the same place for every suggestion. */
+.rv-q-sug-head { display: flex; align-items: baseline; gap: 0.5rem; height: 1.35rem; font-weight: 600; white-space: nowrap; }
+.rv-q-sug-q { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rv-q-sug-n { flex: none; font-weight: normal; font-size: 0.8rem; }
+/* Its answers in fixed cells: yes | no, then Show it | Later, whatever their text. */
+.rv-q-sug > .rv-q-sug-btns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.35rem; margin: 0.2rem 0 0.25rem; }
+.rv-q-sug > .rv-q-sug-btns > button.small { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* An overlap suggestion has one answer (y): it takes the whole row, so its key chip is never cut. */
+.rv-q-sug > .rv-q-sug-btns > button.small:only-child { grid-column: 1 / -1; }
+.rv-q-sug-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-q-sug-full[hidden] { display: none; }
 .rv-q-sug .rv-chip { display: block; margin-top: 0.25rem; white-space: normal; }
 /* A dataset check suggestion (review.js refineBlock): the colour of its dashed box on the frame. */
 .rv-q-sug.rv-q-refine { border-left-color: #b26bff; }
@@ -1043,6 +1071,14 @@ button.bad { background: var(--err-bg); color: var(--err-fg); border-color: var(
 .rv-q-spot { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.4rem; font-size: 0.85rem; }
 .rv-q-spot button.small { margin: 0; padding: 0.1rem 0.45rem; font-size: 0.78rem; }
 .rv-decide button.suggest, .rv-decide-bar button.suggest { box-shadow: 0 0 0 2px currentColor; }
+/* One column: the class grid ("It's a…") as a sheet over the screen's foot, its bottom on the row of
+   Back / Skip / Next (review.js showClassSheet sets `bottom`), out of the flow. */
+.rv-class-sheet { position: fixed; z-index: 30; left: 0; right: 0; max-height: 60vh; max-height: 60svh; overflow-y: auto; overscroll-behavior: contain; padding: 0.5rem max(0.6rem, env(safe-area-inset-right)) 0.6rem max(0.6rem, env(safe-area-inset-left)); background: var(--card); border-top: 1px solid var(--border); box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.28); }
+.rv-class-sheet[hidden] { display: none; }
+.rv-class-sheet-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.4rem; font-weight: 600; font-size: 0.95rem; }
+.rv-class-sheet-head button { margin: 0; }
+.rv-class-sheet .rv-q-classes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.35rem; margin: 0; }
+.rv-class-sheet .rv-q-classes button { margin: 0; min-width: 0; padding: 0.2rem 0.3rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* One column only (the max-width: 900px block below). */
 .rv-decide-bar, .rv-list-toggle { display: none; }
 /* The page places the frame itself (review.js revealFrame, and an answer keeps it in place):
@@ -1875,11 +1911,9 @@ td.tr-bal-bars { vertical-align: middle; }
     .rv-actions-main > button, .rv-decide-bar button.small { height: 46px; }
     #review { --rv-dock-h: calc(1.9rem + 47px + env(safe-area-inset-bottom)); }
   }
-  .rv-box-tools .rv-tool-likely { display: none; }
-  .rv-box-tools.rv-only-likely { display: none; }
   /* While a box needs a decision (review.js `rv-deciding`): its main answers are the dock, Save & next
-     and its row sit right under the card (whose height is fixed then: one line of question, one of
-     why, one row of the other answers), Accept likely is beside the list. */
+     and its row sit right under the card (whose height is fixed then: one line of question, one row
+     of the other answers, one row for Accept likely, the reason chips or the why text). */
   .review-grid > .rv-decide-bar { flex-direction: column; gap: 0.2rem; position: sticky; bottom: 0; z-index: 10; margin: 0.3rem 0 0; padding: 0.3rem 0.6rem calc(0.4rem + env(safe-area-inset-bottom)); background: var(--card); border-top: 1px solid var(--border); }
   #review.rv-deciding .review-grid > .rv-decide-bar { display: flex; }
   /* Pinned with the answers: the box they are about, how many are left, the frame's progress as
@@ -1892,8 +1926,6 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-bar-btns { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.35rem; }
   .rv-decide-bar button.small { margin: 0; padding: 0.2rem 0.3rem; font-size: 0.95rem; font-weight: 600; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; }
   #review.rv-deciding .rv-actions-main { display: none; }
-  #review.rv-deciding .rv-box-tools .rv-tool-likely { display: inline-block; }
-  #review.rv-deciding .rv-box-tools.rv-only-likely { display: flex; }
   /* A dock that just changed (answers to Save row) or a new frame: taps wait a moment (review.js
      guardDock), so a double tap on the last answer never lands on what replaced it. */
   #review.rv-dock-guard .rv-decide-bar, #review.rv-dock-guard .rv-actions-main { pointer-events: none; }
@@ -1901,9 +1933,26 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-q-btns.rv-q-answers { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .rv-q-answers > .rv-q-ph { display: none; }
   .rv-q-answers > button.small { min-height: 44px; font-size: 0.85rem; padding-left: 0.4rem; padding-right: 0.4rem; }
-  #review.rv-deciding .rv-decide .rv-q-answers { display: flex; flex-wrap: nowrap; }
-  #review.rv-deciding .rv-decide .rv-q-answers > button.small { flex: 1 1 0; height: 44px; font-size: 0.8rem; font-weight: normal; }
-  .rv-q-why { -webkit-line-clamp: 1; min-height: 1.3em; }
+  #review.rv-deciding .rv-decide .rv-q-answers:not(.rv-q-all) { display: flex; flex-wrap: nowrap; }
+  #review.rv-deciding .rv-decide .rv-q-answers:not(.rv-q-all) > button.small { flex: 1 1 0; height: 44px; font-size: 0.8rem; font-weight: normal; }
+  .rv-q-body.rv-q-none { min-height: 0; }
+  /* The card's second row (review.js renderDecision, one row high): with the main answers in the
+     card, a cell of the grid's whole width between them and the other answers (a suggestion's head
+     and first line, else the tools, else the why text); with them in the dock, the row under the
+     other answers. Either way on screen over the row of Back / Skip / Next (sizeStage CARD_PEEK). */
+  .rv-q-slot { min-width: 0; height: 44px; overflow: hidden; margin-top: 0.35rem; }
+  .rv-q-slot > .rv-q-sug-mini { height: 100%; padding: 0.1rem 0.5rem; }
+  .rv-q-answers > .rv-q-slot { grid-column: 1 / -1; grid-row: 2; margin: 0; }
+  .rv-q-slot > .rv-q-sug, .rv-q-slot > .rv-q-tools, .rv-q-slot > .rv-q-why { margin: 0; }
+  .rv-q-slot > .rv-q-why.rv-q-clamp { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; padding-top: 0.15rem; }
+  /* The card's slot is three rows high at least in every mode (the third under the row of Back /
+     Skip / Next): what is under it does not move when the dock switches or a box has no answers. */
+  .rv-decide { min-height: calc(3.75rem + 136px); }
+  .rv-q-tools { flex-direction: row; flex-wrap: nowrap; align-items: center; }
+  .rv-q-tools > * { flex: none; }
+  .rv-q-tools > .rv-q-reason { flex: 1 1 auto; min-width: 0; min-height: 44px; }
+  .rv-q-tools > button.small { min-height: 44px; }
+  .rv-q-tools > .rv-q-wide { flex: 1 1 auto; }
   .rv-q-btns button.small { min-height: 44px; flex: 1 1 auto; margin: 0; }
   .rv-q-btns button.small { padding-left: 0.4rem; padding-right: 0.4rem; font-size: 0.85rem; }
   /* The optional reasons: one row that scrolls sideways, not a block of buttons. */
@@ -1932,7 +1981,8 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-actions-main, .rv-actions-more { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
   .review-grid > .rv-decide-bar { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
   .review-crop figcaption { display: none; }
-  .rv-decide { margin: 0.3rem 0; padding: 0.4rem 0.5rem; background: var(--card); }
+  .rv-decide { margin: 0.3rem 0; }
+  .rv-decide > .rv-card { padding: 0.4rem 0.5rem; background: var(--card); }
 }
 
 /* An on-screen keyboard is open (live.js `kb-open`): the sticky bars scroll with the page, so they

@@ -73,12 +73,14 @@
   <aside class="review-side card">
     <div class="rv-side-body">
     <figure id="rv-crop-wrap" class="review-crop"><div class="rv-crop-area"><canvas id="rv-crop" width="1" height="1" aria-label="The selected box, enlarged"></canvas></div><figcaption><span id="rv-crop-cap" class="muted">No box selected</span> <button type="button" id="rv-crop-wide" class="small secondary rv-crop-wide">Larger close-up</button></figcaption></figure>
+    <!-- The card: the question's line, the answers right under it, then what varies (review.js renderDecision). -->
     <div id="rv-decide" class="rv-decide" aria-live="polite"></div>
+    <!-- Show N hidden right under the card (Accept likely is in the card, or the dock on one column). -->
+    <div id="rv-box-tools" class="rv-box-tools" hidden></div>
     <!-- One column while the dock holds the answers: the frame's other actions under the card (the
          same as the dock's in Save mode; hidden in place otherwise, so nothing under them moves). -->
     <div class="rv-flow-acts" aria-hidden="true"><button type="button" class="small secondary" data-act="accept-all" tabindex="-1">Accept proposals</button><button type="button" class="small secondary" data-act="reject-rest" tabindex="-1">Reject the rest</button></div>
     <div id="rv-decide-more" class="rv-decide-more"></div>
-    <div id="rv-box-tools" class="rv-box-tools" hidden></div>
     <ol id="rv-boxes" class="review-boxes" aria-label="Boxes"></ol>
     <label class="check"><input type="checkbox" id="rv-empty"> Confirmed empty (no object of any class)</label>
     <button type="button" id="rv-list-toggle" class="small secondary rv-list-toggle" aria-expanded="false" aria-controls="rv-boxes">Boxes and options</button>
