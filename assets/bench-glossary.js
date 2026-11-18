@@ -59,7 +59,7 @@
   }
 
   // ---- noise constants (from status.noise; defaults match the Rust constants) -------------------
-  var noise = {speed_rel: 0.05, speed_abs_ms: 0.5, se_factor: 2, plateau_points: 0.2, trust_low_objects: 100, trust_medium_objects: 300};
+  var noise = {speed_rel: 0.05, speed_abs_ms: 0.5, se_factor: 2, plateau_points: 0.2, trust_low_objects: 100, trust_medium_objects: 300, min_class_gt: 20};
   function setNoise(n) { if (n && typeof n === "object") Object.keys(noise).forEach(function (k) { if (typeof n[k] === "number") noise[k] = n[k]; }); }
 
   // ---- the vocabulary ------------------------------------------------------------------------
@@ -76,11 +76,13 @@
     recall: {name: "Finds objects", term: "recall", better: "higher", meaning: "Of the real objects in the images, the share the model found. 87% means it missed 13 in 100."},
     f1: {name: "Balance score", term: "F1", better: "higher", meaning: "Precision and recall combined with equal weight (their harmonic mean): high only when both are high."},
     f2: {name: "Miss-fewer score", term: "F2", better: "higher", meaning: "Like F1, but finding objects (recall) counts four times as much as precision: favors fewer missed objects."},
-    ap50: {name: "Detection quality", term: "AP50 (AP@0.5)", better: "higher", meaning: "Average precision over every confidence threshold; a detection counts when its box overlaps the real object by at least 50% (IoU 0.5). The standard detector score."},
-    ap50_95: {name: "Box accuracy", term: "AP50-95", better: "higher", meaning: "AP averaged over overlap requirements from 50% to 95%: also rewards tight, well-placed boxes."},
+    ap50: {name: "Detection quality", term: "AP50 (AP@0.5)", better: "higher", meaning: function () { return "Average precision over every confidence threshold; a detection counts when its box overlaps the real object by at least 50% (IoU 0.5). The standard detector score. The number shown is the average over the classes with at least " + noise.min_class_gt + " labelled objects (every class when none has that many): a class of 2 dogs would otherwise weigh as much as hundreds of cars. Rarer classes keep their own AP in By class, marked too few to judge."; }},
+    ap50_95: {name: "Box accuracy", term: "AP50-95", better: "higher", meaning: function () { return "AP averaged over overlap requirements from 50% to 95%: also rewards tight, well-placed boxes. Averaged over the same classes as AP50 (at least " + noise.min_class_gt + " labelled objects each)."; }},
     roc_auc: {name: "Alert separation", term: "ROC AUC (frame level)", better: "higher", meaning: "How well a frame's top confidence separates frames with an object from frames without one: 100% is perfect, 50% is chance. This is the alert decision Blue Iris makes."},
     tpr: {name: "Alert rate", term: "TPR (true-positive rate, frame level)", better: "higher", meaning: "Of the frames with an object, the share that would alert at this threshold."},
     false_alerts: {name: "False alerts", term: "false alerts on empty frames", better: "lower", meaning: "Of the frames with nothing to find, how many would still alert, per 100 frames. A dash means the set has no empty frames."},
+    person_false_alerts: {name: "Person false alerts", term: "false alerts on frames without a person", better: "lower", meaning: "Of the frames with no person in them (parked cars and other objects allowed), the share where the model still reported a person at the confidence threshold. A camera that always sees a parked car has no empty frames, so this is where its false person alerts show."},
+    class_alerts: {name: "False alerts by class", term: "false alerts per class", better: "lower", meaning: "Per class: the frames without that class (other objects allowed), and how many of them still got a detection of it at the confidence threshold. A frame whose only box of the class is an unsure region is left out."},
     fpr: {name: "False-alert rate", term: "FPR (false-positive rate, frame level)", better: "lower", meaning: "Of the frames without an object, the share that would still alert at this threshold."},
     youden: {name: "Alert minus false alert", term: "Youden's J", better: "higher", meaning: "Alert rate minus false-alert rate; the threshold that maximizes it separates the two best."},
     p50: {name: "Time per image", term: "p50 (median)", better: "lower", meaning: "The typical time for one image: half of the images took less. Whole request: decode, resize, inference and post-processing."},
@@ -180,9 +182,10 @@
     p50_ms: ["faster", "slower"], infer_p50_ms: ["faster model", "slower model"], fps: ["more images/s", "fewer images/s"],
     ap50: ["more accurate", "less accurate"], ap50_95: ["tighter boxes", "looser boxes"], roc_auc: ["separates better", "separates worse"],
     precision: ["fewer false detections", "more false detections"], recall: ["finds more", "finds less"], f1: ["better balance", "worse balance"],
+    person_false_alerts: ["fewer false person alerts", "more false person alerts"],
     threshold: ["better confidence", "worse confidence"]
   };
-  var METRIC_NAMES = {p50_ms: "Time per image (p50)", infer_p50_ms: "Model-only time (infer p50)", fps: "Images per second", ap50: "Detection quality (AP50)", ap50_95: "Box accuracy (AP50-95)", roc_auc: "Alert separation (ROC AUC)", precision: "Correct detections (precision)", recall: "Finds objects (recall)", f1: "Balance (F1)", threshold: "Best confidence"};
+  var METRIC_NAMES = {p50_ms: "Time per image (p50)", infer_p50_ms: "Model-only time (infer p50)", fps: "Images per second", ap50: "Detection quality (AP50)", ap50_95: "Box accuracy (AP50-95)", roc_auc: "Alert separation (ROC AUC)", precision: "Correct detections (precision)", recall: "Finds objects (recall)", f1: "Balance (F1)", person_false_alerts: "Person false alerts (frames without a person)", threshold: "Best confidence"};
   function metricChip(mc) {
     if (!mc) return chip("same");
     var w = WORDS[mc.metric], word = mc.verdict === "better" && w ? w[0] : mc.verdict === "worse" && w ? w[1] : null;
@@ -242,7 +245,7 @@
   }
 
   // ---- glossary list (the no-hover fallback) -------------------------------------------------
-  var GLOSSARY_ORDER = ["threshold", "recall", "precision", "f1", "f2", "ap50", "ap50_95", "roc_auc", "tpr", "fpr", "false_alerts", "youden", "frame", "iou", "fp_per_image", "p50", "p95", "mean", "infer", "load_ms", "fps", "grade", "relative", "agreement", "reference", "objective", "plateau", "trust", "best_tradeoff", "same", "not_comparable", "points"];
+  var GLOSSARY_ORDER = ["threshold", "recall", "precision", "f1", "f2", "ap50", "ap50_95", "roc_auc", "tpr", "fpr", "false_alerts", "person_false_alerts", "class_alerts", "youden", "frame", "iou", "fp_per_image", "p50", "p95", "mean", "infer", "load_ms", "fps", "grade", "relative", "agreement", "reference", "objective", "plateau", "trust", "best_tradeoff", "same", "not_comparable", "points"];
   var PLAIN_ORDER = ["finds", "correct", "false_alerts", "speed", "best_conf", "profile"];
   // `order`: "plain" (the Profiles words) or a list of keys; default every expert term.
   function glossaryDetails(key, order) {
@@ -257,6 +260,26 @@
     });
     d.appendChild(dl); return d;
   }
+
+  // What a class average covers (an ApBasis of the results): "over car, person (≥ 20 objects
+  // each)", or "every class: none had 20 objects"; "" for results of older versions.
+  function basisText(b) {
+    if (!b || !b.classes) return "";
+    if (b.fell_back) return "every class: none had " + b.min_gt + " objects";
+    return "over " + b.classes.join(", ") + " (≥ " + b.min_gt + " objects each)";
+  }
+  // A value with the tap-to-pin tooltip of its class average (plain text without a basis).
+  function withBasis(text, b, what, scope) {
+    var t = basisText(b);
+    if (!t) return document.createTextNode(text);
+    return tip(text, (what || "Average") + " " + t + (b.fell_back ? "." : "; rarer classes are scored per class only."), "", scope || "basis");
+  }
+  // A class-average key to compare runs by: "" for older entries (every class with objects).
+  function basisKey(minGt, classes, fellBack) {
+    if (!has(minGt)) return "";
+    return minGt + "|" + (fellBack ? "1" : "0") + "|" + (classes || []).slice().sort().join(",");
+  }
+  PB.basisText = basisText; PB.withBasis = withBasis; PB.basisKey = basisKey;
 
   // Runtime of a device spec: "openvino" | "onnxruntime".
   function runtimeOf(device, given) { return given || (/^ort:/.test(device || "") ? "onnxruntime" : "openvino"); }

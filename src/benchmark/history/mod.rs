@@ -15,7 +15,9 @@ pub mod compare;
 pub mod trust;
 pub mod view;
 
-pub use compare::{Changes, MetricChange, Verdict, comparable, compare, compare_with_history};
+pub use compare::{
+    Changes, MetricChange, Verdict, comparable, compare, compare_with_history, macro_noise,
+};
 pub use trust::{Trust, TrustLevel, pareto};
 
 use super::images::GroundTruth;
@@ -146,9 +148,46 @@ pub struct DeviceSnap {
     pub recommended: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// [`crate::benchmark::metrics::MIN_CLASS_GT`] of the class average behind `ap50` /
+    /// `ap50_95`; None for entries of older versions (`ap50` then averages every class with
+    /// ground truth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_min_gt: Option<usize>,
+    /// The classes `ap50` / `ap50_95` average, with their per-class values (the noise of a
+    /// change is judged from them, [`compare::macro_noise`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ap_classes: Vec<ClassAp>,
+    /// No class reached `ap_min_gt`: every class with ground truth was averaged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ap_fell_back: bool,
+    /// Frames without a person ([`crate::benchmark::metrics::ClassAlerts`]) and, of those, the
+    /// ones with a person detection at the configured threshold (false person alerts). None for
+    /// entries of older versions and models without a `person` class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_free_frames: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_false_alerts: Option<usize>,
+}
+
+/// One class of a [`DeviceSnap`]'s AP average.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassAp {
+    pub class: String,
+    /// Non-ignored ground-truth objects of the class.
+    pub gt: usize,
+    #[serde(default)]
+    pub ap50: Option<f64>,
+    #[serde(default)]
+    pub ap50_95: Option<f64>,
 }
 
 impl DeviceSnap {
+    /// The share of person-free frames with a false person alert (None without such frames).
+    pub fn person_alert_rate(&self) -> Option<f64> {
+        let (a, n) = (self.person_false_alerts?, self.person_free_frames?);
+        (n > 0).then(|| a as f64 / n as f64)
+    }
+
     /// The device ran (on itself) and has timings.
     pub fn ran(&self) -> bool {
         self.error.is_none() && !self.fell_back && self.total_p50_ms.is_some()
@@ -280,6 +319,27 @@ fn device_snap(m: &ModelResult, d: &DeviceResult) -> DeviceSnap {
             .map(|r| r.positives + r.negatives)
             .filter(|n| *n > 0);
         s.relative = a.relative;
+        if let Some(b) = &o.ap_basis {
+            s.ap_min_gt = Some(b.min_gt);
+            s.ap_fell_back = b.fell_back;
+            s.ap_classes = b
+                .classes
+                .iter()
+                .map(|name| {
+                    let c = o.per_class.iter().find(|c| c.class == *name);
+                    ClassAp {
+                        class: name.clone(),
+                        gt: c.map_or(0, |c| c.gt),
+                        ap50: c.and_then(|c| c.ap50),
+                        ap50_95: c.and_then(|c| c.ap50_95),
+                    }
+                })
+                .collect();
+        }
+        if let Some(p) = o.class_alert("person") {
+            s.person_free_frames = Some(p.frames_without);
+            s.person_false_alerts = Some(p.alerts);
+        }
     }
     s
 }

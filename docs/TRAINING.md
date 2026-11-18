@@ -686,7 +686,8 @@ its display twin is `progress::convergence_run`, parity-tested), and the trainer
 is switched off so only this one decides:
 
 - The value is the **selected metric** (see *Select best by* below; by default the validation
-  **mAP50-95**, else mAP50 when the trainer reports no mAP50-95), **averaged over the last `smooth`
+  **mAP50-95**, else mAP50 when the trainer reports no mAP50-95, averaged over the classes with at
+  least 20 validation boxes, or over every class when none has), **averaged over the last `smooth`
   epochs** (3; fewer at the start; `--smooth 1` = each epoch's value). A single noisy peak no longer starts the countdown: run `20261030-010233-b69d` (RF-DETR
   nano, 16 validation images) stopped at epoch 15 on its epoch-5 peak with the raw value, while its
   3-epoch mean still gained at epochs 7, 9 and 15.
@@ -742,46 +743,77 @@ while selecting on something else. The one list with labels and hints is `recipe
 | `iou` | Mean IoU | Box tightness of the matched boxes only: **it ignores missed objects, so it can prefer a model that misses more** |
 
 `f1`, `f2` and `f0_5` are macro averages over the classes at the one confidence threshold that
-maximizes that average, so they are not person or vehicle specific: a rare class counts as much as
-`person`. `iou` is pooled over the matched boxes of all classes, at no threshold. All are on a 0..1
-scale, so `min_delta` stays 0.001.
+maximizes that average, so they are not person or vehicle specific. `iou` is pooled over the matched
+boxes of all classes, at no threshold. All are on a 0..1 scale, so `min_delta` stays 0.001.
 
-**A small validation split makes any choice but mAP noisier**: F-beta and IoU take the best threshold
-of few objects, and a single box moves them. Whatever a run selects by, **the held-out benchmark stays
-the number to trust**; two runs that differ only in this setting are compared there (the Comparison
-card shows "best 12 by F2" and warns when runs of a group were selected by different metrics).
+**Only well-supported classes count.** Every choice but `iou` is averaged over the classes with at
+least 20 boxes in the validation split (`MIN_CLASS_BOXES` in `train_model.py`, twin of the benchmark's
+`metrics::MIN_CLASS_GT`, parity-tested). A plain macro average let one box decide: run nano-5's
+validation had car 428, person 34, truck 7, bicycle 1, motorcycle 1 and cat 1 boxes, so its F2 and mAP50
+moved about 1/6 whenever a single bicycle or cat box flipped (0.459 -> 0.635 at epoch 3; nano-4 0.736 ->
+0.531 at epoch 36), and the best epoch and the stop point followed that noise. The rare classes are
+still reported per class (`class/<name>/ap50`, `class/<name>/ap`, `class/<name>/recall`, the Train
+tab's per-class table marks them "too few to judge"); when no class has 20 boxes, the average is
+over every class with boxes, as the trainer reports it.
 
-How each trainer follows it (`Selection` and `pick_metric` in `train_model.py`; with `map` every trainer
-keeps its own path, byte for byte):
+The script decides the classes once, at the first validation (`Selection.decide`, from the boxes per
+class its matching saw), logs "selecting by F2 over car, person (>=20 validation boxes each); too few to
+judge: truck 7, bicycle 1, motorcycle 1, cat 1" and prints
+`@train {"event":"support","min_boxes":20,"boxes":{"car":428,...},"classes":["car","person"],"fell_back":false,"key":"f2_sup","reason":null}`.
+`key` is what the run selects by from then on: `map_sup`, `map50_sup`, `f1_sup`, `f2_sup`, `f0_5_sup`
+(the averages over `classes`, `class_metrics`), or with `fell_back` (and for `iou`) the metric's own
+all-class value. `map_sup` averages the trainer's own per-class AP 50-95 (Ultralytics
+`validator.metrics.box.all_ap` by `ap_class_index`, torchmetrics `map_per_class`, rfdetr's
+`val/AP/<name>` with `log_per_class_metrics=True`); without it `map_sup` falls to `map50_sup`, as `map`
+falls to `map50`. `map50_sup` is the script's own AP50 per class (`ap_from_matches`, 101-point COCO
+interpolation, at most 100 detections per image and class: the benchmark's `average_precision` and
+`MAX_DETS`, parity-tested bit for bit), and the F values are the script's sweep (`pr_sweep`,
+`fbeta_sweep`) over the same rows, all from one greedy IoU-0.5 matching of the validator's own
+predictions (`ClassMeter`, fed by the hooks that also give the mean IoU). The service reads the event
+(`progress.support`, kept in the stored record) and `TrainProgress::rule_key` follows the same key, so
+`progress.best`, the countdown and the notices ("best epoch 12, F2 (≥20) 0.734") agree with the script;
+the page says "by F2 over car, person".
+
+**A small validation split makes any choice noisier**: F-beta and IoU take the best threshold of few
+objects, and a single box moves them. Whatever a run selects by, **the held-out benchmark stays the
+number to trust**; two runs that differ only in this setting are compared there (the Comparison card
+shows "best 12 by F2" and warns when runs of a group were selected by different metrics).
+
+How each trainer follows it (`Selection` and `pick_metric` in `train_model.py`). Only a run whose key is
+`map` (mAP over all classes: no class has 20 boxes, or after a fall-back) keeps the trainer's own
+choice; `map_sup` goes the same way as any other metric:
 
 - **Ultralytics**: `NightTrainer.validate` restores `best_fitness` after Ultralytics' `validate` and
-  applies the same comparison to the selected value, computed there from `validator.metrics.box` and
-  a peek at the IoU data (`on_fit_epoch_end`, which reports them, runs later). `best.pt` follows it,
-  and `conv.step` gets the same number. `save_model` also writes on a tie, so a tie returns a fitness
-  a hair below the best: the earlier epoch stays, as in the rule. Ultralytics' own stopper never fires
-  (its patience is above the epochs), and a NaN mAP fitness stays Ultralytics' NaN recovery's.
+  applies the same comparison to the selected value, computed there from `validator.metrics.box`, the
+  class averages and a peek at the IoU data (`on_fit_epoch_end`, which reports them, runs later).
+  `best.pt` follows it, and `conv.step` gets the same number. `save_model` also writes on a tie, so a
+  tie returns a fitness a hair below the best: the earlier epoch stays, as in the rule. Ultralytics' own
+  stopper never fires (its patience is above the epochs), and a NaN mAP fitness stays Ultralytics' NaN
+  recovery's.
 - **RF-DETR**: `BestModelCallback` writes `checkpoint_best_total.pth` and knows only mAP / mAR. For its
-  `on_validation_end` the script hands it a view of the trainer whose `callback_metrics` has the
-  selected value (same dtype and device) under `monitor` and `_monitor_ema`. Writing into
-  `trainer.callback_metrics` itself, as rfdetr's `smooth_alpha` does, has no effect: Lightning's
-  property refreshes that dict from the logged results on every read until the validation loop resets
-  them, and `val/ema_mAP_50_95` is logged. The real metrics are never changed, so nothing reaches
-  `metrics.csv`, the epoch event or the `map` columns. With EMA (rfdetr's default) validation scores
-  only the EMA model, the sweep and the IoU included, and the EMA track is the only one. rfdetr's
-  high-water mark starts at 0.0 with a strict `>`, and it would backfill the final weights if nothing
-  beat it; a non-default run starts it at -1, so a metric of exactly 0.0 at every epoch keeps epoch 1,
-  as the rule and the page say. (A default run keeps rfdetr's behaviour: all-zero mAP exports the
-  final EMA weights.)
+  `on_validation_end` (after the first validation's decision) the script hands it a view of the trainer
+  whose `callback_metrics` has the selected value (same dtype and device) under `monitor` and
+  `_monitor_ema`. Writing into `trainer.callback_metrics` itself, as rfdetr's `smooth_alpha` does, has
+  no effect: Lightning's property refreshes that dict from the logged results on every read until the
+  validation loop resets them, and `val/ema_mAP_50_95` is logged. The real metrics are never changed, so
+  nothing reaches `metrics.csv`, the epoch event or the `map` columns. With EMA (rfdetr's default)
+  validation scores only the EMA model, the sweep, the per-class matching and the IoU included, and the
+  EMA track is the only one. rfdetr's high-water mark starts at 0.0 with a strict `>`, and it would
+  backfill the final weights if nothing beat it; a run on another key starts it at -1, so a metric of
+  exactly 0.0 at every epoch keeps epoch 1, as the rule and the page say. (A run on `map` keeps rfdetr's
+  behaviour: all-zero mAP exports the final EMA weights.)
 - **RT-DETRv2 / D-FINE**: the rule's `improved` already keeps the weights, so only the value changes.
 
-An F or the IoU missing at an epoch means nothing matched and counts as 0.0 (`pick_metric`, Rust twin
-`progress::rule_values`). If the source itself failed (the F-beta sweep raised, a changed library
-internal took the IoU hook, or rfdetr's callback cannot be wrapped) the script logs it once, prints
-`@train {"event":"select_fallback","metric":"f2","epoch":E,"reason":"..."}` and selects by mAP for the
-whole run; it never fails a run for this. Values on another scale cannot be compared, so the rule and
-the trainer's best start again at epoch E, and the page's best epoch and settings line follow.
-`progress.best`, the Best tile, the "best epoch" text and the Stop now / Continue notices follow the
-selected metric. Records from before the setting read as `map`.
+An F or the IoU missing at an epoch means nothing matched and counts as 0.0, the `_sup` ones too
+(`pick_metric`, Rust twin `progress::rule_values_by`). If the source itself failed (the F-beta sweep
+raised, a changed library internal took the IoU or per-class hook, or rfdetr's callback cannot be
+wrapped) the script logs it once, prints
+`@train {"event":"select_fallback","metric":"f2_sup","epoch":E,"reason":"..."}` and selects by mAP over
+all classes for the whole run; it never fails a run for this. Values on another scale cannot be
+compared, so the rule and the trainer's best start again at epoch E, and the page's best epoch and
+settings line follow. `progress.best`, the Best tile, the "best epoch" text and the Stop now / Continue
+notices follow the selected key. Records from before the setting read as `map`, records from before the
+support rule (no `support`) as the metric's all-class value.
 
 **Finish now.** A run in its train stage can be stopped after the current epoch, keeping the best
 checkpoint (it then exports, installs and benchmarks as usual): the **Finish now** button beside Cancel
@@ -1001,14 +1033,15 @@ own key, plus the script's own:
 
 | Trainer | Keys (examples) |
 |---|---|
-| RF-DETR (rfdetr 1.11 Lightning `callback_metrics`) | `val/mAP_50_95`, `val/mAP_50`, `val/mAP_75`, `val/mAR` (the EMA model by default), `val/ema_*`, `val/F1`, `val/precision`, `val/recall` (at the best macro-F1 confidence), `train/loss`, `train/lr`, `train/loss_ce`, ... |
+| RF-DETR (rfdetr 1.11 Lightning `callback_metrics`) | `val/mAP_50_95`, `val/mAP_50`, `val/mAP_75`, `val/mAR` (the EMA model by default), `val/ema_*`, `val/F1`, `val/precision`, `val/recall` (at the best macro-F1 confidence), `train/loss`, `train/lr`, `train/loss_ce`, ...; its per-class AP 50-95 (`val/AP/<name>`, `val/ema_AP/<name>`, `log_per_class_metrics=True`) comes back as `class/<name>/ap` |
 | Ultralytics (`trainer.metrics`, `tloss`, `lr`) | `metrics/mAP50-95(B)`, `metrics/mAP50(B)`, `metrics/precision(B)`, `metrics/recall(B)`, `val/box_loss`, `train/cls_loss`, `lr/pg0`, ...; `val_loss` = the sum of the `val/*_loss` |
 | transformers (RT-DETRv2, D-FINE) | `eval_loss`, `learning_rate`, and a detection evaluation after each `evaluate` (an extra pass over the validation split): mAP 50-95 / 50 / 75 and mAR@100 with torchmetrics (COCO rules), P / R / F-beta from a greedy IoU-0.5 matching swept over 101 confidences |
-| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); `iou` (mean IoU of the matched boxes, below); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded) |
+| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); the same over the classes with at least 20 validation boxes, `map50_sup`, `map_sup`, `f1_sup`, `f2_sup`, `f0_5_sup` with their `_thr`, `_precision`, `_recall` (*Select best by*; left out when no class has 20); per class with validation boxes `class/<name>/ap50`, `class/<name>/ap` (the trainer's AP 50-95) and `class/<name>/recall` (at the best threshold of the selected F, else of F1); `iou` (mean IoU of the matched boxes, below); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded) |
 
 F2 weighs recall four times precision ("don't miss a person"), F0.5 the other way; the `*_thr` columns
 are a starting confidence threshold for the trained model. NaN, infinite and non-numeric values are
-dropped; at most 64 metrics per epoch (the shortest keys first).
+dropped; at most 96 metrics per epoch (`MAX_METRICS`, the service's `MAX_METRICS_PER_EPOCH`; past that,
+keys with two slashes such as `class/car/ap50` are dropped first, then the longest).
 
 `iou` is the same measurement for every family, taken at each validation on the validator's own
 predictions (all scores, so no confidence threshold): COCO-style greedy matching, highest score first,
@@ -1020,19 +1053,22 @@ not comparable with it. By default it is display only; `--select-metric iou` mak
 
 The service maps the keys to stable ids (`src/training/progress.rs` `canonical`): `map`, `map50`,
 `map75`, `mar`, `iou`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
-`f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, and `ema_map` ... for rfdetr's
-`val/ema_*`; unknown keys keep their raw name (`val/AP/raccoon`, `train/loss_ce`), so nothing is lost
-when a library renames one. Each run's `progress` in `GET /v1/training` has
+`f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, the `_sup` twins (`map_sup`, `f2_sup`,
+`f2_sup_thr`, ..., labelled "F2 (≥20)"), and `ema_map` ... for rfdetr's `val/ema_*`; unknown keys keep
+their raw name (`class/raccoon/ap50`, `train/loss_ce`), so nothing is lost when a library renames one. Each run's `progress` in `GET /v1/training` has
 `history` (kept in `<run dir>/history.jsonl`, one line per new or changed epoch, so `runs.json` holds only `best` and the latest values; an older `runs.json` that still holds history is moved into the files at start; one point per epoch: `epoch`, `elapsed_s`, `metrics`; an `eval` event fills its epoch's
-point; at most 1000 points) and `best` (`{metric, epoch, value}` on the selected metric, by default
-`map`, else `map50`, else the lowest `val_loss`), which the stage text shows as "best mAP50-95 0.711 @ epoch 3". `GET /v1/training`
+point; at most 1000 points), `support` (the `support` event) and `best` (`{metric, epoch, value}` on the
+selected key, `TrainProgress::rule_key`: by default `map_sup` once some class has 20 validation boxes,
+else `map`, else `map50`, else the lowest `val_loss`), which the stage text shows as "best mAP50-95 0.711 @ epoch 3". `GET /v1/training`
 also has `metrics` (label, short label, `higher_better`, `format` of every id) and `metric_columns`.
 Records written before this keep loading (no `history`: the page shows no metrics block).
 
 **The metrics view** (Jobs card and Models tab, every run with a history, running or finished): KPI tiles
-(epoch, ETA, best primary metric with its epoch, latest loss, validation loss and mean IoU with the
+(epoch, ETA, the convergence countdown with what it follows, "by F2 over car, person", best of the selected key with its epoch, latest loss, validation loss and mean IoU with the
 change from the previous epoch), curves of the losses and of the quality metrics with the best epoch marked,
-and a per-epoch table, newest first. **Columns** picks the table's columns from every metric in the
+a per-epoch table, newest first (led by the selected key when it is a `_sup` average no chosen column
+shows), and the per-class values of the best epoch (validation boxes, AP50, AP50-95, recall; classes
+under 20 boxes marked "too few to judge"; a card per class on a phone). **Columns** picks the table's columns from every metric in the
 run's history (known ids by label, raw keys by name) and their order; the choice is saved as
 `training.metric_columns` (`POST /v1/training/metric-columns` with `{"columns": [...]}`: at most 20
 distinct names of 1-64 characters, known ids or raw names; answers the saved list, 400 otherwise) and
@@ -1073,9 +1109,14 @@ run's headline), the p50 time, and what alerting sees at the model's confidence 
 held-out frame: **Person R** (person recall), **Vehicle R** (vehicle recall, car / truck / bus merged,
 so a car found as a truck counts) and **False alerts** (`3/130`: frames without any object that got a
 detection at or above the threshold, of all such frames; a detection inside an ignore region does not
-count). The best value of each column is marked (`*` in the CLI): highest AP and recall, lowest time
-and false-alert rate. Runs of older versions show a dash in the new columns. Runs that differ in
-classes, excluded mode or threshold get a warning.
+count) and **Person FA** (`2/210`: frames without a person, parked cars and other objects allowed,
+that got a person detection at the threshold, of all such frames; a camera that always sees a parked
+car has no empty frame, so its false person alerts show only here; CLI `person FA`). The best value
+of each column is marked (`*` in the CLI): highest AP and recall, lowest time and false-alert rates.
+Runs of older versions show a dash in the new columns. Runs that differ in classes, excluded mode or
+threshold get a warning, and so do runs whose AP averages different classes: AP50 and AP50-95 average
+only the classes with at least 20 held-out objects (`MIN_CLASS_GT`; every class when none has 20), so a
+class that crossed 20 objects in one run's held-out frames changes what its AP means.
 
 **Random picks.** One reviewed frame in five comes from the Review queue's random pool (Recommended
 order): it was reviewed because its slot came up, whatever it shows. The rest of the reviewed set leans
@@ -1093,11 +1134,15 @@ and vehicle recall on the random picks alone are not computed (they would need t
 tag).
 
 The same figures close each run's benchmark line on the page (`person recall 0.39 · vehicle recall
-0.67 · false alerts 4/130 empty frames @ 0.50`) and are stored in its benchmark summary (`threshold`,
-`person_recall`, `vehicle_recall`, `empty_frames`, `empty_frame_alerts`), from the benchmark's overall
-score (`benchmark.json` `accuracy.overall` has the same four fields; IoU 0.5, same matching as its
+0.67 · false alerts 4/130 empty frames · person alerts 2/210 frames without a person @ 0.50`; the line
+starts with the AP50 and the classes it averages, `AP50 0.951 (car, person)`) and are stored in its
+benchmark summary (`threshold`, `person_recall`, `vehicle_recall`, `empty_frames`,
+`empty_frame_alerts`, `person_free_frames`, `person_false_alerts`, and `ap_basis`, the averaged
+classes, also per scene), from the benchmark's overall score (`benchmark.json` `accuracy.overall` has
+the same fields, the per-class false alerts as `class_alerts`; IoU 0.5, same matching as its
 precision / recall). Like the overall AP, they cover every dataset of the run, built-in sets added to
-the held-out set included.
+the held-out set included. The Use card's comparison with the current default says the same
+("..., false alerts 3 on 120 empty frames, person alerts 2 on 210 frames without a person").
 
 **The routed row.** When the group has a day run and a night or IR run, a **day + night routed** row
 puts the day run's day AP beside the night run's night / IR AP, which is what a service with

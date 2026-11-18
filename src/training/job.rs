@@ -26,6 +26,7 @@ use super::dataset::{self, Prepared, SceneFilter};
 use super::preflight;
 use super::progress::{self, TrainEvent, TrainProgress};
 use super::recipe::TrainRecipe;
+use crate::benchmark::metrics::ApBasis;
 use crate::model::ModelFamilyKind;
 use crate::resources::catalog::{self, Platform, Resource, TrainFamily};
 use crate::resources::export::train::{self as env, TrainLock, TrainPaths};
@@ -333,12 +334,25 @@ pub struct BenchSummary {
     /// without such frames (and for runs of older versions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub random: Option<SubsetScore>,
+    /// The classes `ap50` / `ap50_95` average (`benchmark::metrics::ApBasis`: those with at
+    /// least `MIN_CLASS_GT` objects, else every class with objects); None for runs of older
+    /// versions, whose AP averaged every class with objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_basis: Option<ApBasis>,
+    /// Benchmarked frames without a person (a parked car does not make a frame "with an
+    /// object" here) and, of those, the frames with a person detection at `threshold`: false
+    /// person alerts (`benchmark::metrics::ClassAlerts`). None for runs of older versions and
+    /// models without a `person` class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_free_frames: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_false_alerts: Option<usize>,
 }
 
 /// The score on a tagged subset of the held-out frames ([`BenchSummary::random`]), from the
 /// benchmark's per-tag breakdown: AP over the scored classes, recall at the benchmark's threshold
 /// ([`BenchSummary::threshold`], IoU 0.5).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SubsetScore {
     pub images: usize,
     /// Scored ground-truth objects.
@@ -346,6 +360,9 @@ pub struct SubsetScore {
     pub ap50: Option<f64>,
     pub ap50_95: Option<f64>,
     pub recall: Option<f64>,
+    /// The classes its AP averages (None for runs of older versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_basis: Option<ApBasis>,
 }
 
 /// The current default model on the frames of a run's benchmark ([`Hooks::baseline`]): what the
@@ -363,11 +380,14 @@ pub struct Baseline {
 }
 
 /// AP of a subset of the held-out frames.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SceneAp {
     pub ap50: Option<f64>,
     pub ap50_95: Option<f64>,
     pub images: usize,
+    /// The classes its AP averages (None for runs of older versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_basis: Option<ApBasis>,
 }
 
 /// What the caller does for a run.

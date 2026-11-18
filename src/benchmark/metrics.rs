@@ -17,8 +17,15 @@
 //! detection that only overlaps an `ignore` region (crowd, "other" class) is neither a true nor
 //! a false positive (a COCO crowd region by intersection over the detection's area, like
 //! pycocotools; other ignore regions by IoU); ignored ground truth is never a miss. AP is the mean, over the 101 recall
-//! points 0, 0.01, .., 1, of the interpolated (monotone envelope) precision; classes without
-//! ground truth are left out of the mean.
+//! points 0, 0.01, .., 1, of the interpolated (monotone envelope) precision. The headline AP
+//! ([`Summary::ap50`]) is the mean over the classes with at least [`MIN_CLASS_GT`] ground-truth
+//! boxes ([`supported`], recorded in [`Summary::ap_basis`]); when none has that many, over every
+//! class with ground truth. Rarer classes keep their per-class AP; the mean over every class with
+//! ground truth stays in [`Summary::ap50_all`]. A set of 950 cars, 180 persons and 2 cats would
+//! otherwise let the 2 cats decide a third of the number.
+//!
+//! False alerts per class ([`ClassAlerts`]): frames without any box of a class that still get a
+//! detection of it at the threshold (see [`AlertStats`]).
 //!
 //! Threshold sweep ([`SweepImage`], [`threshold_curve`]): TP / FP / FN, precision, recall, F1,
 //! F2 and false positives per image at every confidence threshold of [`SWEEP_THRESHOLDS`],
@@ -190,6 +197,73 @@ pub const MAX_DETS: usize = 100;
 /// COCO object-size buckets (box area in original-image pixels): small < 32^2 <= medium < 96^2.
 pub const SMALL_AREA: f32 = 32.0 * 32.0;
 pub const MEDIUM_AREA: f32 = 96.0 * 96.0;
+
+/// A class counts in a class average (AP, F-scores, frame ROC AUC, the trainer's checkpoint choice)
+/// only with at least this many ground-truth boxes in the evaluated set. With fewer, one box moves
+/// the class by more than 5 points, and a class of 1-7 boxes (a dog, a cat, a bicycle) would
+/// weigh as much as hundreds of persons. Twin: `MIN_CLASS_BOXES` in `scripts/train_model.py`.
+pub const MIN_CLASS_GT: usize = 20;
+
+/// The indexes of the classes a class average is taken over: those with at least `min`
+/// ground-truth boxes; when none has, every class with ground truth and `true` (fell back).
+/// Twin: `supported_rows` in `scripts/train_model.py`.
+pub fn supported(gts: &[usize], min: usize) -> (Vec<usize>, bool) {
+    let with = |keep: &dyn Fn(usize) -> bool| -> Vec<usize> {
+        gts.iter()
+            .enumerate()
+            .filter(|&(_, &n)| keep(n))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let strong = with(&|n| n >= min.max(1));
+    if strong.is_empty() {
+        (with(&|n| n > 0), true)
+    } else {
+        (strong, false)
+    }
+}
+
+/// Which classes a class average was taken over ([`supported`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApBasis {
+    /// The [`MIN_CLASS_GT`] in force.
+    pub min_gt: usize,
+    /// The averaged classes.
+    pub classes: Vec<String>,
+    /// No class reached `min_gt`: every class with ground truth was averaged.
+    #[serde(default)]
+    pub fell_back: bool,
+}
+
+impl ApBasis {
+    /// The basis of `names` with ground-truth counts `gts` (same order).
+    pub fn of(names: &[&str], gts: &[usize]) -> (Self, Vec<usize>) {
+        let (idx, fell_back) = supported(gts, MIN_CLASS_GT);
+        let basis = ApBasis {
+            min_gt: MIN_CLASS_GT,
+            classes: idx
+                .iter()
+                .filter_map(|&i| names.get(i).map(|n| n.to_string()))
+                .collect(),
+            fell_back,
+        };
+        (basis, idx)
+    }
+
+    /// What the average covers, in plain words: `over car, person (>= 20 objects each)`, or
+    /// `every class: none had 20 objects` (CLI, reports, the page's tooltips say the same).
+    pub fn describe(&self) -> String {
+        if self.fell_back {
+            format!("every class: none had {} objects", self.min_gt)
+        } else {
+            format!(
+                "over {} (\u{2265} {} objects each)",
+                self.classes.join(", "),
+                self.min_gt
+            )
+        }
+    }
+}
 
 /// Lowercase, trimmed, with VOC/YOLO spellings mapped to COCO's.
 pub fn canonical_label(label: &str) -> String {
@@ -594,7 +668,10 @@ pub struct Summary {
     pub precision: Option<f64>,
     pub recall: Option<f64>,
     pub f1: Option<f64>,
-    /// Mean over classes with ground truth.
+    /// Mean over the [`supported`] classes ([`Summary::ap_basis`]): those with at least
+    /// [`MIN_CLASS_GT`] ground-truth boxes, else every class with ground truth. Results of older
+    /// versions (no `ap_basis`) hold the mean over every class with ground truth; they are never
+    /// recomputed on load.
     pub ap50: Option<f64>,
     pub ap50_95: Option<f64>,
     pub per_class: Vec<ClassMetrics>,
@@ -609,6 +686,47 @@ pub struct Summary {
     pub empty_frames: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub empty_frame_alerts: Option<usize>,
+    /// The classes `ap50` / `ap50_95` average (None: results of older versions, or no ground
+    /// truth at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap_basis: Option<ApBasis>,
+    /// AP50 / AP50-95 averaged over every class with ground truth (the headline before
+    /// [`MIN_CLASS_GT`]); None in results of older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap50_all: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ap50_95_all: Option<f64>,
+    /// Per scored class, false alerts on the frames without it ([`AlertStats::class_alerts`]),
+    /// `person` first. Empty in results of older versions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class_alerts: Vec<ClassAlerts>,
+}
+
+/// False alerts of one class at the threshold: frames that have no object of the class but a
+/// detection of it (unmatched, not in an ignore region). A camera with parked cars has no empty
+/// frame, but plenty of frames without a person: this is where its false person alerts show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassAlerts {
+    pub class: String,
+    /// Frames with no ground-truth box of the class (a frame whose only boxes of it are ignore
+    /// regions is left out: whether its detection is an alert cannot be judged).
+    pub frames_without: usize,
+    /// Of `frames_without`, those with a detection of the class at or above the threshold.
+    pub alerts: usize,
+}
+
+impl ClassAlerts {
+    /// `alerts / frames_without` (None without such frames).
+    pub fn rate(&self) -> Option<f64> {
+        (self.frames_without > 0).then(|| self.alerts as f64 / self.frames_without as f64)
+    }
+}
+
+impl Summary {
+    /// The false alerts of `class` ([`Summary::class_alerts`]).
+    pub fn class_alert(&self, class: &str) -> Option<&ClassAlerts> {
+        self.class_alerts.iter().find(|c| c.class == class)
+    }
 }
 
 /// The labels (scored label space) that count as a vehicle for [`AlertStats::vehicle_recall`]:
@@ -635,12 +753,18 @@ pub fn is_vehicle_label(label: &str) -> bool {
 /// - `empty_frame_alerts`: empty frames with at least one detection of a scored class at or
 ///   above the threshold that is not inside an ignore region (a false positive by the
 ///   matching; a detection on a crowd / "other" region is not counted, like everywhere else).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+/// - `class_alerts`: per scored class `c` ([`ClassAlerts`], `person` first, then `classes`
+///   order): frames with no ground-truth box of `c` at all (a frame whose only `c` boxes are
+///   ignore regions is left out), and of those, the frames with a `c` detection at or above the
+///   threshold that the matching calls a false positive. Unlike `empty_frame_alerts`, a frame
+///   with a parked car still counts as a frame without a person.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AlertStats {
     pub person_recall: Option<f64>,
     pub vehicle_recall: Option<f64>,
     pub empty_frames: usize,
     pub empty_frame_alerts: usize,
+    pub class_alerts: Vec<ClassAlerts>,
 }
 
 impl AlertStats {
@@ -651,6 +775,17 @@ impl AlertStats {
         let mut vehicle = Counts::default();
         let mut empty = 0;
         let mut alerts = 0;
+        // Person first, then the scored classes in their order.
+        let mut order: Vec<&String> = classes.iter().filter(|c| *c == "person").collect();
+        order.extend(classes.iter().filter(|c| *c != "person"));
+        let mut class_alerts: Vec<ClassAlerts> = order
+            .iter()
+            .map(|c| ClassAlerts {
+                class: (*c).clone(),
+                frames_without: 0,
+                alerts: 0,
+            })
+            .collect();
         for img in images {
             let kept: Vec<PredBox> = img
                 .preds
@@ -674,6 +809,19 @@ impl AlertStats {
             if gt.iter().all(|g| g.ignore) {
                 empty += 1;
                 alerts += usize::from(m.pred.contains(&Some(false)));
+            }
+            for ca in &mut class_alerts {
+                // Any box of the class (an object, or an ignore region that cannot be judged)
+                // takes the frame out.
+                if gt.iter().any(|g| g.label == ca.class) {
+                    continue;
+                }
+                ca.frames_without += 1;
+                let alerted = kept
+                    .iter()
+                    .zip(&m.pred)
+                    .any(|(p, r)| p.label == ca.class && *r == Some(false));
+                ca.alerts += usize::from(alerted);
             }
             // Vehicles, classes merged.
             let as_vehicle = |label: &str| is_vehicle_label(label).then(|| "vehicle".to_string());
@@ -702,6 +850,7 @@ impl AlertStats {
             vehicle_recall: vehicle.recall(),
             empty_frames: empty,
             empty_frame_alerts: alerts,
+            class_alerts,
         }
     }
 }
@@ -747,8 +896,6 @@ fn cap(preds: &[PredBox]) -> Vec<PredBox> {
 pub fn evaluate(images: &[EvalImage], classes: &[String], threshold: f32) -> Summary {
     let capped: Vec<Vec<PredBox>> = images.iter().map(|i| cap(&i.preds)).collect();
     let mut per_class = Vec::new();
-    let mut ap50s = Vec::new();
-    let mut ap_all = Vec::new();
     // Per-class counts at the threshold.
     let mut class_counts: HashMap<&str, Counts> = HashMap::new();
     let mut counts = Counts::default();
@@ -814,12 +961,6 @@ pub fn evaluate(images: &[EvalImage], classes: &[String], threshold: f32) -> Sum
         }
         let ap50 = aps.first().copied().flatten();
         let ap50_95 = ap50.map(|_| aps.iter().flatten().sum::<f64>() / IOU_THRESHOLDS.len() as f64);
-        if let Some(a) = ap50 {
-            ap50s.push(a);
-        }
-        if let Some(a) = ap50_95 {
-            ap_all.push(a);
-        }
         let cc = class_counts
             .get(class.as_str())
             .copied()
@@ -834,19 +975,36 @@ pub fn evaluate(images: &[EvalImage], classes: &[String], threshold: f32) -> Sum
         });
     }
     let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+    // Every class with ground truth (the old headline), then the supported ones.
+    let with_gt: Vec<&ClassMetrics> = per_class.iter().filter(|c| c.ap50.is_some()).collect();
+    let ap50s: Vec<f64> = with_gt.iter().filter_map(|c| c.ap50).collect();
+    let ap_all: Vec<f64> = with_gt.iter().filter_map(|c| c.ap50_95).collect();
+    let names: Vec<&str> = with_gt.iter().map(|c| c.class.as_str()).collect();
+    let gts: Vec<usize> = with_gt.iter().map(|c| c.gt).collect();
+    let (basis, idx) = ApBasis::of(&names, &gts);
+    let pick = |f: fn(&ClassMetrics) -> Option<f64>| -> Vec<f64> {
+        idx.iter()
+            .filter_map(|&i| with_gt.get(i).and_then(|c| f(c)))
+            .collect()
+    };
+    let (ap50, ap50_95) = (pick(|c| c.ap50), pick(|c| c.ap50_95));
     let alert = AlertStats::of(images, classes, threshold);
     Summary {
         person_recall: alert.person_recall,
         vehicle_recall: alert.vehicle_recall,
         empty_frames: Some(alert.empty_frames),
         empty_frame_alerts: Some(alert.empty_frame_alerts),
+        class_alerts: alert.class_alerts,
         images: images.len(),
         counts,
         precision: counts.precision(),
         recall: counts.recall(),
         f1: counts.f1(),
-        ap50: mean(&ap50s),
-        ap50_95: mean(&ap_all),
+        ap50: mean(&ap50),
+        ap50_95: mean(&ap50_95),
+        ap50_all: mean(&ap50s),
+        ap50_95_all: mean(&ap_all),
+        ap_basis: (!idx.is_empty()).then_some(basis),
         per_class,
         by_size: ["small", "medium", "large"]
             .iter()
@@ -1398,6 +1556,19 @@ mod tests {
     }
 
     #[test]
+    fn supported_classes_and_fallback() {
+        assert_eq!(supported(&[30, 25, 2, 0], 20), (vec![0, 1], false));
+        assert_eq!(supported(&[19, 20, 21], 20), (vec![1, 2], false));
+        assert_eq!(supported(&[7, 0, 1], 20), (vec![0, 2], true));
+        assert_eq!(supported(&[0, 0], 20), (vec![], true));
+        let (b, idx) = ApBasis::of(&["person", "car", "dog"], &[25, 30, 2]);
+        assert_eq!(idx, vec![0, 1]);
+        assert_eq!(b.classes, vec!["person", "car"]);
+        assert!(!b.fell_back);
+        assert_eq!(b.min_gt, MIN_CLASS_GT);
+    }
+
+    #[test]
     fn ap_known_values() {
         // Perfect ranking: AP 1.
         let mut s = vec![(0.9, true), (0.8, true)];
@@ -1466,6 +1637,156 @@ mod tests {
         let s = evaluate(&images, &["person".into(), "dog".into()], 0.5);
         assert_eq!(s.per_class[1].ap50, None);
         assert!((s.ap50.unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    /// One image per object: `n` boxes of `label`, the first `found` detected exactly.
+    fn objects(label: &str, n: usize, found: usize) -> Vec<EvalImage> {
+        (0..n)
+            .map(|k| {
+                let b = [0.0, 0.0, 100.0, 100.0];
+                EvalImage {
+                    gt: vec![gt(label, b)],
+                    preds: if k < found {
+                        vec![p(label, 0.9, b)]
+                    } else {
+                        vec![]
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// AP averages the classes with at least `MIN_CLASS_GT` objects; the old mean over every
+    /// class with ground truth stays in `ap50_all`.
+    #[test]
+    fn ap_averages_supported_classes_only() {
+        let mut images = objects("car", 30, 30); // AP 1
+        images.extend(objects("person", 25, 20)); // recall 0.8 at precision 1: 81 / 101
+        images.extend(objects("dog", 2, 0)); // AP 0
+        let classes: Vec<String> = vec!["person".into(), "car".into(), "dog".into()];
+        let s = evaluate(&images, &classes, 0.5);
+        let person = 81.0 / 101.0;
+        assert!((s.per_class[0].ap50.unwrap() - person).abs() < 1e-12);
+        assert_eq!(s.per_class[2].ap50, Some(0.0));
+        assert!((s.ap50.unwrap() - (1.0 + person) / 2.0).abs() < 1e-12);
+        assert!((s.ap50_95.unwrap() - (1.0 + person) / 2.0).abs() < 1e-12);
+        assert!((s.ap50_all.unwrap() - (1.0 + person) / 3.0).abs() < 1e-12);
+        assert!((s.ap50_95_all.unwrap() - (1.0 + person) / 3.0).abs() < 1e-12);
+        assert_eq!(
+            s.ap_basis,
+            Some(ApBasis {
+                min_gt: MIN_CLASS_GT,
+                classes: vec!["person".into(), "car".into()],
+                fell_back: false,
+            })
+        );
+        assert_eq!(
+            s.ap_basis.as_ref().unwrap().describe(),
+            "over person, car (\u{2265} 20 objects each)"
+        );
+        // Every class under 20 objects: the old mean, said so.
+        let mut few = objects("car", 5, 5);
+        few.extend(objects("dog", 2, 0));
+        let s = evaluate(&few, &classes, 0.5);
+        assert_eq!((s.ap50, s.ap50_all), (Some(0.5), Some(0.5)));
+        let b = s.ap_basis.unwrap();
+        assert!(b.fell_back);
+        assert_eq!(b.classes, ["car", "dog"]);
+        assert_eq!(b.describe(), "every class: none had 20 objects");
+        // No ground truth at all: no AP, no basis.
+        let none = evaluate(&[EvalImage::default()], &classes, 0.5);
+        assert_eq!(
+            (none.ap50, none.ap50_all, none.ap_basis),
+            (None, None, None)
+        );
+        // Old results without the new fields load as they were (nothing recomputed).
+        let old: Summary = serde_json::from_str(
+            r#"{"images":3,"counts":{"tp":1,"fp":0,"fn":2},"precision":1.0,"recall":0.33,
+               "f1":0.5,"ap50":0.58,"ap50_95":0.4,"per_class":[],"by_size":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.ap50, Some(0.58));
+        assert_eq!(
+            (old.ap_basis.is_none(), old.ap50_all, old.class_alerts.len()),
+            (true, None, 0)
+        );
+        let back = serde_json::to_value(&old).unwrap();
+        for k in ["ap_basis", "ap50_all", "ap50_95_all", "class_alerts"] {
+            assert!(back.get(k).is_none(), "{k}");
+        }
+    }
+
+    /// False alerts per class: a parked-car frame with a stray person detection counts for
+    /// person (where `empty_frame_alerts` sees nothing); a person on an ignore region does not.
+    #[test]
+    fn class_alerts_count_frames_without_the_class() {
+        let big = |x: f32| [x, 0.0, x + 100.0, 100.0];
+        let classes: Vec<String> = vec!["car".into(), "person".into()];
+        let images = vec![
+            // A: parked car found, a stray person detection: a false person alert.
+            EvalImage {
+                gt: vec![gt("car", big(0.0))],
+                preds: vec![p("car", 0.9, big(0.0)), p("person", 0.8, big(300.0))],
+            },
+            // B: only a person ignore region, a person detection on it: left out for person.
+            EvalImage {
+                gt: vec![GtBox {
+                    ignore: true,
+                    ..gt("person", big(0.0))
+                }],
+                preds: vec![p("person", 0.9, big(1.0))],
+            },
+            // C: a person, found: not a frame without a person.
+            EvalImage {
+                gt: vec![gt("person", big(0.0))],
+                preds: vec![p("person", 0.9, big(0.0))],
+            },
+            // D: parked car, a person detection below the threshold: no alert.
+            EvalImage {
+                gt: vec![gt("car", big(0.0))],
+                preds: vec![p("car", 0.9, big(0.0)), p("person", 0.3, big(300.0))],
+            },
+            // E: empty, nothing detected.
+            EvalImage::default(),
+        ];
+        let a = AlertStats::of(&images, &classes, 0.5);
+        // Person first whatever the class order.
+        assert_eq!(
+            a.class_alerts,
+            [
+                ClassAlerts {
+                    class: "person".into(),
+                    frames_without: 3,
+                    alerts: 1,
+                },
+                ClassAlerts {
+                    class: "car".into(),
+                    frames_without: 3,
+                    alerts: 0,
+                },
+            ]
+        );
+        // The empty-frame view sees none of it: B (ignore only) and E, no alert.
+        assert_eq!((a.empty_frames, a.empty_frame_alerts), (2, 0));
+        let s = evaluate(&images, &classes, 0.5);
+        let person = s.class_alert("person").unwrap();
+        assert_eq!((person.frames_without, person.alerts), (3, 1));
+        assert!((person.rate().unwrap() - 1.0 / 3.0).abs() < 1e-12);
+        assert_eq!(s.class_alerts, a.class_alerts);
+        // At 0.25 frame D alerts too.
+        let low = AlertStats::of(&images, &classes, 0.25);
+        assert_eq!(low.class_alerts[0].alerts, 2);
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["class_alerts"][0]["frames_without"], 3);
+        assert_eq!(
+            ClassAlerts {
+                class: "cat".into(),
+                frames_without: 0,
+                alerts: 0
+            }
+            .rate(),
+            None
+        );
     }
 
     /// Person / vehicle recall and false alerts on empty frames at the threshold, hand-counted.

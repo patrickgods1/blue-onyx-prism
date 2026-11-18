@@ -37,6 +37,7 @@ pub fn noise_json() -> serde_json::Value {
         "plateau_points": PLATEAU * 100.0,
         "trust_low_objects": TRUST_LOW_OBJECTS,
         "trust_medium_objects": TRUST_MEDIUM_OBJECTS,
+        "min_class_gt": crate::benchmark::metrics::MIN_CLASS_GT,
     })
 }
 

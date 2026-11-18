@@ -20,8 +20,12 @@
 //! The AUC is exact: the Mann-Whitney U statistic over the samples (a positive scoring above a
 //! negative counts 1, a tie 0.5), divided by `positives * negatives` ([`auc`]); this equals the
 //! trapezoidal area under the ROC curve through every distinct score. It is undefined (None)
-//! without positives or without negatives. Reported per class, as the macro mean over the
-//! classes with a defined AUC (the headline `roc_auc`) and micro (all class samples pooled).
+//! without positives or without negatives. Reported per class, as the macro mean (the headline
+//! `roc_auc`) and micro (all class samples pooled). The macro mean follows the class-average rule
+//! of AP ([`super::metrics::supported`]): it averages the classes with a defined AUC and at least
+//! [`super::metrics::MIN_CLASS_GT`] positive frames, else (none has) every class with a defined
+//! AUC; [`FrameRoc::auc_basis`] names them, [`FrameRoc::auc_all`] keeps the mean over every
+//! defined class.
 //!
 //! The alert decision at a confidence threshold `t` is "max confidence >= t": frame TPR (alert
 //! rate on positive frames) and FPR (false-alert rate on negative frames) at `t` come from the
@@ -29,7 +33,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::metrics::EvalImage;
+use super::metrics::{ApBasis, EvalImage};
 
 /// Points of a stored (decimated) ROC curve.
 pub const ROC_POINTS: usize = 100;
@@ -248,7 +252,8 @@ pub struct ClassRoc {
 /// Frame-level ROC of a set of images.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct FrameRoc {
-    /// Macro mean of the per-class AUCs that are defined (the headline `roc_auc`).
+    /// Macro mean of the per-class AUCs of [`FrameRoc::auc_basis`] (the headline `roc_auc`).
+    /// Results of older versions hold the mean over every defined class.
     pub auc: Option<f64>,
     /// AUC over every class's samples pooled.
     pub micro_auc: Option<f64>,
@@ -259,6 +264,13 @@ pub struct FrameRoc {
     /// Pooled ROC curve, thinned (absent in summaries that do not chart it).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub curve: Vec<RocPoint>,
+    /// The classes `auc` averages; its `min_gt` counts positive frames (frames with the class).
+    /// None: results of older versions, or no class with a defined AUC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auc_basis: Option<ApBasis>,
+    /// Macro mean over every class with a defined AUC (None in results of older versions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auc_all: Option<f64>,
 }
 
 impl FrameRoc {
@@ -288,7 +300,16 @@ impl FrameRoc {
             })
             .filter(|c| c.positives + c.negatives > 0)
             .collect();
-        let defined: Vec<f64> = per_class.iter().filter_map(|c| c.auc).collect();
+        let defined: Vec<&ClassRoc> = per_class.iter().filter(|c| c.auc.is_some()).collect();
+        let names: Vec<&str> = defined.iter().map(|c| c.class.as_str()).collect();
+        let positives_of: Vec<usize> = defined.iter().map(|c| c.positives).collect();
+        let (basis, idx) = ApBasis::of(&names, &positives_of);
+        let mean = |v: &[f64]| (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64);
+        let every: Vec<f64> = defined.iter().filter_map(|c| c.auc).collect();
+        let averaged: Vec<f64> = idx
+            .iter()
+            .filter_map(|&i| defined.get(i).and_then(|c| c.auc))
+            .collect();
         let pooled: Vec<(f32, bool)> = samples
             .iter()
             .filter(|s| classes.contains(&s.class))
@@ -308,7 +329,9 @@ impl FrameRoc {
             Vec::new()
         };
         Self {
-            auc: (!defined.is_empty()).then(|| defined.iter().sum::<f64>() / defined.len() as f64),
+            auc: mean(&averaged),
+            auc_all: mean(&every),
+            auc_basis: (!idx.is_empty()).then_some(basis),
             micro_auc: auc(&pooled),
             positives,
             negatives: pooled.len() - positives,
@@ -520,5 +543,49 @@ mod tests {
         let c = fs.curve(3);
         assert_eq!(c.len(), 3);
         assert_eq!((c[2].tpr, c[2].fpr), (1.0, 1.0));
+        // Every class under 20 positive frames: all defined classes, said so.
+        let b = r.auc_basis.as_ref().unwrap();
+        assert!(b.fell_back);
+        assert_eq!(b.classes, ["person", "vehicle"]);
+        assert_eq!(r.auc_all, r.auc);
+    }
+
+    /// The macro AUC averages the classes with at least `MIN_CLASS_GT` positive frames, like AP.
+    #[test]
+    fn macro_auc_averages_supported_classes() {
+        let mk = |class: &str, positive: bool, score: f32| FrameSample {
+            class: class.into(),
+            positive,
+            score,
+        };
+        let mut samples = Vec::new();
+        // person: 25 positive frames above 10 negatives: AUC 1.
+        samples.extend((0..25).map(|_| mk("person", true, 0.9)));
+        samples.extend((0..10).map(|_| mk("person", false, 0.1)));
+        // dog: 2 positive frames below its negatives: AUC 0, too few to count.
+        samples.extend((0..2).map(|_| mk("dog", true, 0.1)));
+        samples.extend((0..10).map(|_| mk("dog", false, 0.5)));
+        let classes: Vec<String> = vec!["person".into(), "dog".into()];
+        let r = FrameRoc::of(&samples, &classes, 0);
+        assert_eq!(r.class_auc("dog"), Some(0.0));
+        assert_eq!(r.auc, Some(1.0));
+        assert_eq!(r.auc_all, Some(0.5));
+        let b = r.auc_basis.as_ref().unwrap();
+        assert_eq!(
+            (b.classes.clone(), b.fell_back),
+            (vec!["person".to_string()], false)
+        );
+        // Nothing defined: neither.
+        let none = FrameRoc::of(&samples[..25], &classes, 0);
+        assert_eq!((none.auc, none.auc_basis), (None, None));
+        // Old results load without them.
+        let old: FrameRoc = serde_json::from_str(
+            r#"{"auc":0.7,"micro_auc":0.8,"positives":3,"negatives":4,"per_class":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (old.auc, old.auc_basis, old.auc_all),
+            (Some(0.7), None, None)
+        );
     }
 }

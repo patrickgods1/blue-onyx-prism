@@ -31,9 +31,11 @@ Prepared dataset (`--data`, written by the service, see docs/TRAINING.md):
                                 separate image entries)
 
 Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `eval`, `batch`,
-`stop`, `phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
+`support`, `stop`, `phase`, `done`); the service parses them, everything else is log output. `epoch` and `eval` carry
 `metrics`: every scalar metric of the epoch under the trainer's own key (`val/mAP_50_95`,
 `metrics/mAP50(B)`, `eval_loss`, ...) plus this script's `f1`/`f2`/`f0_5` sweeps (`fbeta_sweep`),
+the averages over the well-supported classes (`map_sup`, `map50_sup`, `f2_sup`, ...) and per-class
+`class/<name>/ap50`, `class/<name>/ap`, `class/<name>/recall` (`class_metrics`),
 `iou` (`mean_iou`), `mem_gb` (peak GPU memory) and `img_s` (training images per second); the service
 maps the keys to stable ids (src/training/progress.rs). Night augmentation
 (`--aug-dark`, `--aug-noise`, `--aug-gray`: per-image probabilities) is applied on the fly to the
@@ -43,7 +45,9 @@ those probabilities (rfdetr).
 Convergence (`Convergence`, the same rule for every trainer; their own early stopping is off):
 after each validation, the run reaches a stop point once `--min-epochs` passed and `--patience`
 epochs brought no gain above `--min-delta` in the mean of the last `--smooth` values of the
-selected metric (`--select-metric`, default `map`: mAP 50-95, else mAP 50). While the training loss
+selected metric (`--select-metric`, default `map`: mAP 50-95, else mAP 50), averaged over the
+classes with at least MIN_CLASS_BOXES (20) validation boxes, or over every class when none has
+that many (`Selection.decide` at the first validation, the `support` event). While the training loss
 still falls over those epochs (`loss_falling`: the later half's mean more than 2% below the earlier
 half's) it goes on instead, at most twice, each time for another `--patience` epochs (a
 `converge_point` event; the service offers Stop now / Continue); else it stops. It stops at once
@@ -115,6 +119,14 @@ SELECT_KEYS = {
     "f0_5": ("f0_5",),
     "iou": ("iou",),
 }
+# A class counts in the class averages a run selects its epoch and converges on only with at least
+# this many validation boxes (`supported_rows`): with fewer, one box flipping moves the class by
+# more than 5 points, and a class of 1-7 boxes would weigh as much as hundreds of persons. Twin:
+# `MIN_CLASS_GT` in src/benchmark/metrics.rs (parity-tested).
+MIN_CLASS_BOXES = 20
+# The metrics with a supported-class twin `<id>_sup` (`class_metrics`; `iou` is pooled over the
+# matched boxes of every class, so it has none).
+SUP_METRICS = ("map", "map50", "f1", "f2", "f0_5")
 RFDETR_CLASSES = {
     "nano": "RFDETRNano",
     "small": "RFDETRSmall",
@@ -345,12 +357,24 @@ class Convergence:
 
 
 def pick_metric(metrics: dict, metric: str):
-    """The value of `metric` (a `SELECT_METRICS` id) in an epoch's `metrics`, under any trainer's
-    key. `map` is mAP 50-95, else mAP 50; both may be None. A macro F or the mean IoU without a key
-    (or not finite) is 0.0: nothing matched at that validation."""
+    """The value of `metric` (a `SELECT_METRICS` id, or its supported-class twin `<id>_sup`, see
+    `Selection.key`) in an epoch's `metrics`, under any trainer's key. `map` is mAP 50-95, else mAP
+    50 (`map_sup`: else `map50_sup`); both may be None. A macro F or the mean IoU without a key (or
+    not finite) is 0.0: nothing matched at that validation. The Rust twin is
+    src/training/progress.rs `rule_values_by`."""
     def first(keys):
         return next((metrics[k] for k in keys if k in metrics), None)
 
+    if metric.endswith("_sup"):
+        base = metric[: -len("_sup")]
+        if base == "map":
+            v = first(("map_sup",))
+            return first(("map50_sup",)) if v is None else v
+        v = first((metric,))
+        if base == "map50":
+            return v
+        f = finite_lr(v)
+        return 0.0 if f is None else f
     if metric == "map":
         v = first(SELECT_KEYS["map"])
         return first(SELECT_KEYS["map50"]) if v is None else v
@@ -363,36 +387,114 @@ def pick_metric(metrics: dict, metric: str):
 
 class Selection:
     """The metric a run selects by (`--select-metric`): `value` gives the one number for an epoch
-    that both the convergence rule and the trainer's best checkpoint use. When the source of the
-    metric failed (`sweep_failed`: the F-beta sweep, `iou_failed`: the mean IoU) the run says so
-    once and goes on by mAP (`fall_back`); it never fails for this. Pure apart from the log."""
+    that both the convergence rule and the trainer's best checkpoint use.
 
-    def __init__(self, metric: str = "map", conv=None):
+    Which classes it averages is decided once, at the first validation (`decide`, from the
+    validation boxes per class): the classes with at least `min_boxes` (MIN_CLASS_BOXES) boxes, so
+    `key` is `<metric>_sup` (`class_metrics`); when no class has that many, every class (`key` is
+    the metric itself, as the trainer reports it). `iou` is pooled over every class either way. The
+    decision is the `support` event. When the source of the metric failed (`sweep_failed`: the
+    F-beta sweep, `iou_failed`: the mean IoU, `classes_failed`: the per-class matching of a `_sup`
+    key) the run says so once and goes on by mAP over all classes (`fall_back`); it never fails
+    for this. Pure apart from the log and the events."""
+
+    def __init__(self, metric: str = "map", conv=None, min_boxes: int = MIN_CLASS_BOXES):
         self.requested, self.metric, self.conv = metric, metric, conv
+        self.min_boxes = int(min_boxes)
+        # The `support` event's fields once decided; the averaged class indexes.
+        self.support = None
+        self.rows = []
+        # Fell back to mAP over all classes (`fall_back`).
+        self.fell = False
+
+    @property
+    def supported(self) -> bool:
+        """Decided, and some class has `min_boxes` validation boxes."""
+        return self.support is not None and not self.support["fell_back"]
+
+    @property
+    def key(self) -> str:
+        """The metric id the run selects by: `<metric>_sup` over the supported classes, else the
+        metric itself (before the decision, after a fall-back, for `iou`)."""
+        if self.supported and not self.fell and self.metric in SUP_METRICS:
+            return self.metric + "_sup"
+        return self.metric
 
     @property
     def label(self) -> str:
+        if self.key.endswith("_sup"):
+            return f"{SELECT_LABELS[self.metric]} (>={self.min_boxes})"
         return SELECT_LABELS[self.metric]
 
-    def fall_back(self, why: str, epoch: int = 0) -> None:
-        """From `epoch` on the run selects by mAP: a `select_fallback` event, and the rule forgets
-        the old metric's values (another scale); the trainer forgets its best the same way."""
-        if self.metric == "map":
+    @property
+    def beta(self) -> str:
+        """The F-beta whose best threshold the per-class recall is read at (`class_metrics`)."""
+        return self.metric if self.metric in ("f1", "f2", "f0_5") else "f1"
+
+    def decide(self, boxes, why=None) -> None:
+        """Once, at the first validation: `boxes` is {class name: validation boxes} in class
+        order (None: the per-class matching failed, `why` says how). Averages over the classes with
+        at least `min_boxes` (`supported_rows`); none: over every class with boxes (`fell_back`).
+        Logs it and prints `@train {"event":"support","min_boxes":20,"boxes":{...},"classes":[...],
+        "fell_back":false,"key":"f2_sup","reason":null}`."""
+        if self.support is not None:
             return
-        log(f"--select-metric {self.metric}: {why}; selecting by mAP for the whole run: the best epoch and "
-            f"the convergence rule start again at epoch {epoch}")
-        event("select_fallback", metric=self.metric, epoch=epoch, reason=why)
+        names = list(boxes or {})
+        counts = [int(boxes[n]) for n in names] if boxes is not None else []
+        if boxes is None:
+            rows, fell = [], True
+        else:
+            rows, fell = supported_rows(counts, self.min_boxes)
+        if fell and why is None:
+            why = f"no class has {self.min_boxes} validation boxes"
+        self.rows = rows
+        classes = [names[i] for i in rows]
+        self.support = {"min_boxes": self.min_boxes, "boxes": dict(zip(names, counts)), "classes": classes,
+                        "fell_back": fell, "key": None, "reason": why if fell else None}
+        self.support["key"] = self.key
+        if self.conv is not None:
+            self.conv.label = self.label
+        few = [f"{n} {c}" for n, c in zip(names, counts) if 0 < c < self.min_boxes]
+        none = [n for n, c in zip(names, counts) if c == 0]
+        tail = (f"; too few to judge: {', '.join(few)}" if few else "") + \
+            (f"; no validation boxes: {', '.join(none)}" if none else "")
+        name = SELECT_LABELS[self.metric]
+        if boxes is None:
+            log(f"selecting by {name} over all classes ({why})")
+        elif fell:
+            log(f"selecting by {name} over every class with validation boxes ({why}){tail}")
+        elif self.key.endswith("_sup"):
+            log(f"selecting by {name} over {', '.join(classes)} (>={self.min_boxes} validation boxes each){tail}")
+        else:
+            log(f"selecting by {name} (matched boxes of every class); classes with >={self.min_boxes} validation "
+                f"boxes: {', '.join(classes)}{tail}")
+        event("support", **self.support)
+
+    def fall_back(self, why: str, epoch: int = 0) -> None:
+        """From `epoch` on the run selects by mAP over all classes: a `select_fallback` event, and
+        the rule forgets the old metric's values (another scale); the trainer forgets its best the
+        same way."""
+        if self.key == "map":
+            return
+        log(f"--select-metric {self.metric}: {why}; selecting by mAP over all classes for the whole run: the best "
+            f"epoch and the convergence rule start again at epoch {epoch}")
+        event("select_fallback", metric=self.key, epoch=epoch, reason=why)
         self.metric = "map"
+        self.fell = True
         if self.conv is not None:
             self.conv.label = self.label
             self.conv.forget_values()
 
-    def value(self, metrics: dict, epoch: int = 0, sweep_failed: bool = False, iou_failed: bool = False):
-        if self.metric in ("f1", "f2", "f0_5") and sweep_failed:
+    def value(self, metrics: dict, epoch: int = 0, sweep_failed: bool = False, iou_failed: bool = False,
+              classes_failed: bool = False):
+        if self.key.endswith("_sup"):
+            if classes_failed:
+                self.fall_back("the per-class metrics failed", epoch)
+        elif self.metric in ("f1", "f2", "f0_5") and sweep_failed:
             self.fall_back("the F-beta sweep failed", epoch)
         elif self.metric == "iou" and iou_failed:
             self.fall_back("the mean IoU failed", epoch)
-        return pick_metric(metrics, self.metric)
+        return pick_metric(metrics, self.key)
 
 
 def bend_lambda_lr(scheduler, steps: int, min_factor: float) -> bool:
@@ -448,8 +550,8 @@ def bend_rfdetr_lr(trainer, epochs: int, steps_per_epoch: int, min_factor: float
 
 
 def log_selected(selection: Selection, conv: Convergence) -> None:
-    """After training, with `--select-metric` set: the epoch the trainer's best checkpoint holds."""
-    if selection.requested != "map":
+    """After training, unless the trainer's own mAP chose: the epoch its best checkpoint holds."""
+    if selection.requested != "map" or selection.key != "map":
         log(f"exporting epoch {conv.top_epoch} (best {selection.label} {conv.top}); the last epoch was {conv.last}")
 
 
@@ -495,8 +597,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smooth", type=int, default=1, help="the convergence rule's value is the mean of this many last epochs (1 = the raw value)")
     p.add_argument("--select-metric", choices=SELECT_METRICS, default="map",
                    help="the metric that picks the exported epoch and drives the convergence rule (default: map, mAP 50-95): "
-                        "map50; f1, f2 (favours catching objects), f0_5 (favours fewer false alarms): macro averages over the "
-                        "classes at their best threshold; iou: box tightness of matched boxes, ignores missed objects")
+                        "map50; f1, f2 (favours catching objects), f0_5 (favours fewer false alarms): macro averages at the "
+                        "best threshold; every one averaged over the classes with at least 20 validation boxes (all classes "
+                        "when none has); iou: box tightness of matched boxes, ignores missed objects")
     p.add_argument("--anneal", type=int, default=0,
                    help="at the first stop point, train this many more epochs (at most --epochs) with a lowered learning rate (RF-DETR), then stop (0 = stop there)")
     p.add_argument("--stop-file", type=Path, default=None, help="finish after the current epoch (keeping the best one) once this file exists")
@@ -737,7 +840,11 @@ def any_augment(a) -> bool:
 # Metrics (per-epoch `metrics` of the epoch / eval events), memory and speed
 # ---------------------------------------------------------------------------------------------
 
-MAX_METRICS = 64
+# Most metrics per epoch event (the service keeps as many: `progress::MAX_METRICS_PER_EPOCH`).
+MAX_METRICS = 96
+# Detections kept per image and class for the per-class AP (COCO `maxDets`; the benchmark's
+# `metrics::MAX_DETS`).
+MAX_DETS = 100
 
 
 def scalar_metrics(d) -> dict:
@@ -844,32 +951,207 @@ def mean_iou(ious) -> dict:
     return {"iou": math.fsum(ious) / len(ious)} if ious else {}
 
 
-class IouMeter:
-    """[`mean_iou`] of one validation, fed by a hook inside a trainer: `read()` returns the `preds`
-    and `gts` of [`match_detections`]. A changed library internal is logged once and leaves the
-    metric out; the run goes on."""
+def supported_rows(counts, min_boxes: int = MIN_CLASS_BOXES):
+    """The indexes of the classes a class average is taken over: those with at least `min_boxes`
+    ground-truth boxes (`counts`, in class order), and False; when none has, every class with
+    ground truth and True (fell back). Twin of src/benchmark/metrics.rs `supported`."""
+    m = max(1, int(min_boxes))
+    strong = [i for i, n in enumerate(counts) if n >= m]
+    if not strong:
+        return [i for i, n in enumerate(counts) if n > 0], True
+    return strong, False
 
-    def __init__(self):
-        self.ious, self.failed = [], False
+
+def ap_from_matches(scores, matched, n_gt):
+    """AP of one class, 101-point interpolated precision (COCO): `scores` / `matched` (1 = a true
+    positive) of every detection of the class over all images, `n_gt` its ground-truth boxes. None
+    when `n_gt` is 0. Detections sort by score, highest first (ties keep their order); the precision
+    envelope is taken from the right; the sum runs left to right. Twin of src/benchmark/metrics.rs
+    `average_precision` (parity-tested, exact)."""
+    if n_gt <= 0:
+        return None
+    s = [float(x) for x in scores]
+    order = sorted(range(len(s)), key=lambda i: -s[i])
+    tp = fp = 0
+    recall, precision = [], []
+    for i in order:
+        if matched[i]:
+            tp += 1
+        else:
+            fp += 1
+        recall.append(tp / n_gt)
+        precision.append(tp / (tp + fp))
+    right = -math.inf
+    for k in range(len(precision) - 1, -1, -1):
+        if right > precision[k]:
+            precision[k] = right
+        else:
+            right = precision[k]
+    points = []
+    for k in range(101):
+        r = k / 100.0
+        # The first index with recall >= r (recall never falls).
+        lo, hi = 0, len(recall)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if recall[mid] < r - 1e-12:
+                lo = mid + 1
+            else:
+                hi = mid
+        points.append(precision[lo] if lo < len(precision) else 0.0)
+    return mean(points)
+
+
+def cap_detections(preds, cap: int = MAX_DETS):
+    """`preds` of [`match_detections`] with at most `cap` detections per image and class, the
+    highest scores (ties: the earlier), as the benchmark's AP (`metrics::MAX_DETS`)."""
+    import numpy as np
+
+    out = []
+    for pb, pl, ps in preds:
+        pl, ps = np.asarray(pl), np.asarray(ps)
+        if len(ps) <= cap:
+            out.append((pb, pl, ps))
+            continue
+        keep = np.zeros(len(ps), dtype=bool)
+        for c in np.unique(pl):
+            idx = np.where(pl == c)[0]
+            keep[idx[np.argsort(-ps[idx], kind="stable")[:cap]]] = True
+        out.append((np.asarray(pb)[keep], pl[keep], ps[keep]))
+    return out
+
+
+class ClassMeter:
+    """The matches of one validation per class (IoU 0.5, [`match_detections`] on at most `cap`
+    detections per image and class) and [`mean_iou`] of the matched pairs, fed by a hook inside a
+    trainer: `read()` returns the `preds` and `gts` of [`match_detections`]. `matches()` and
+    `counts()` feed `class_metrics` and `Selection.decide`. A changed library internal is logged
+    once and leaves these metrics out for the run (`failed`); the run goes on."""
+
+    what = "per-class metrics and mean IoU"
+
+    def __init__(self, cap: int | None = MAX_DETS):
+        self.cap = cap
+        self.ious, self.data, self.failed = [], {}, False
 
     def add(self, read) -> None:
         if self.failed:
             return
         try:
-            match_detections(*read(), ious=self.ious)
+            preds, gts = read()
+            if self.cap:
+                preds = cap_detections(preds, self.cap)
+            for c, (s, m, n) in match_detections(preds, gts, ious=self.ious).items():
+                d = self.data.setdefault(int(c), [[], [], 0])
+                d[0].extend(float(x) for x in s)
+                d[1].extend(int(x) for x in m)
+                d[2] += int(n)
         except Exception as e:
-            self.failed = True
-            self.ious.clear()
-            log(f"mean IoU skipped ({type(e).__name__}: {e})")
+            self.fail(e)
+
+    def fail(self, e) -> None:
+        self.failed = True
+        self.ious.clear()
+        self.data.clear()
+        log(f"{self.what} skipped ({type(e).__name__}: {e})")
 
     def peek(self) -> dict:
         """[`mean_iou`] so far, keeping the data for `take`."""
         return mean_iou(self.ious)
 
     def take(self) -> dict:
+        """[`mean_iou`]; forgets this validation's data."""
         m = self.peek()
         self.ious.clear()
+        self.data.clear()
         return m
+
+    def matches(self) -> dict:
+        """{class index: (scores, matched 0/1, ground-truth boxes)} so far."""
+        import numpy as np
+
+        return {c: (np.asarray(d[0], dtype=np.float64), np.asarray(d[1], dtype=np.int64), d[2])
+                for c, d in self.data.items()}
+
+    def counts(self, k: int) -> list:
+        """Ground-truth boxes of classes 0..k-1 so far."""
+        return [self.data[c][2] if c in self.data else 0 for c in range(k)]
+
+
+class IouMeter(ClassMeter):
+    """[`mean_iou`] alone (every detection, no cap)."""
+
+    what = "mean IoU"
+
+    def __init__(self):
+        super().__init__(cap=None)
+
+
+def class_metrics(matches: dict, names: list, rows, ap95=None, beta: str = "f1", sup: bool = True) -> dict:
+    """The class averages a run selects by and the per-class values of one validation.
+
+    `matches`: {class index: (scores, matched, ground-truth boxes)} at IoU 0.5 (`ClassMeter`);
+    `names`: the class names by index; `rows`: the averaged class indexes (`Selection.rows`);
+    `ap95`: {class index: AP 50-95} from the trainer's own evaluation, when it has one; `sup`: emit
+    the averages (False when no class has enough boxes: the trainer's all-class values stand).
+    Returns `map50_sup` (mean AP50 of the rows, `ap_from_matches`), `map_sup` (mean `ap95` of the
+    rows, only when every row has one), `f1_sup`, `f2_sup`, `f0_5_sup` with `_thr`, `_precision`,
+    `_recall` (`fbeta_sweep` over the rows at 101 confidences, `pr_sweep`), and for every class with
+    ground truth `class/<name>/ap50`, `class/<name>/ap` (with `ap95`) and `class/<name>/recall` at
+    the best `beta` threshold of the rows."""
+    import numpy as np
+
+    out = {}
+    with_gt = sorted(c for c, v in matches.items() if v[2] > 0 and 0 <= c < len(names))
+    ap50 = {c: ap_from_matches(matches[c][0], matches[c][1], matches[c][2]) for c in with_gt}
+    ap95 = {c: float(v) for c, v in (ap95 or {}).items() if finite_lr(v) is not None and float(v) >= 0}
+    rows = [c for c in (rows or []) if c in ap50]
+    thr = None
+    if rows:
+        thresholds = np.linspace(0, 1, 101)
+        prec, rec = pr_sweep({c: matches[c] for c in rows}, thresholds)
+        f = fbeta_sweep(prec, rec, thresholds)
+        thr = f.get(f"{beta}_thr")
+        if sup:
+            out["map50_sup"] = mean([ap50[c] for c in rows])
+            if all(c in ap95 for c in rows):
+                out["map_sup"] = mean([ap95[c] for c in rows])
+            for k, v in f.items():
+                k = {"precision": "f1_precision", "recall": "f1_recall"}.get(k, k)
+                base = next(b for b in ("f0_5", "f1", "f2") if k == b or k.startswith(b + "_"))
+                out[base + "_sup" + k[len(base):]] = v
+    recall = {}
+    if thr is not None:
+        _, r = pr_sweep({c: matches[c] for c in with_gt}, [thr])
+        recall = {c: float(r[i][0]) for i, c in enumerate(with_gt)}
+    for c in with_gt:
+        out[f"class/{names[c]}/ap50"] = ap50[c]
+        if c in ap95:
+            out[f"class/{names[c]}/ap"] = ap95[c]
+        if c in recall:
+            out[f"class/{names[c]}/recall"] = recall[c]
+    return out
+
+
+def selection_metrics(selection: Selection, meter: ClassMeter, names: list, ap95=None) -> dict:
+    """At a validation, with `meter` holding its matches: the run's classes decided once
+    (`Selection.decide` from the meter's ground-truth boxes per class), then `class_metrics` over
+    them. {} before the meter saw anything and once it failed (a failure in `class_metrics` itself
+    fails the meter)."""
+    if not meter.failed and not meter.data:
+        return {}
+    if selection.support is None:
+        if meter.failed:
+            selection.decide(None, "the per-class matching failed")
+        else:
+            selection.decide(dict(zip(names, meter.counts(len(names)))))
+    if meter.failed:
+        return {}
+    try:
+        return class_metrics(meter.matches(), names, selection.rows, ap95, selection.beta, selection.supported)
+    except Exception as e:  # never the run's end
+        meter.fail(e)
+        return {}
 
 
 def pr_sweep(matches: dict, thresholds):
@@ -1366,6 +1648,36 @@ def ultralytics_boxes(preds: dict, batch: dict) -> tuple:
             [(numpy_of(batch["bboxes"]), numpy_of(batch["cls"]))])
 
 
+def ultralytics_ap95(validator) -> dict:
+    """{class index: AP 50-95} of the validator's last run (ultralytics 8.4 `DetMetrics.box`:
+    `all_ap` rows [classes with ground truth, 10 IoU thresholds] in `ap_class_index` order); {}
+    when unreadable."""
+    import numpy as np
+
+    try:
+        box = validator.metrics.box
+        ap = np.asarray(box.all_ap, dtype=np.float64)
+        if ap.ndim != 2 or not len(ap):
+            return {}
+        return {int(c): float(v) for c, v in zip(box.ap_class_index, ap.mean(axis=1))}
+    except Exception:
+        return {}
+
+
+def rfdetr_ap95(metrics: dict, names: list) -> dict:
+    """{class index: AP 50-95} from rfdetr's per-class keys (`log_per_class_metrics=True`, rfdetr
+    1.11 `COCOEvalCallback._build_per_class_rows`: `val/AP/<name>`, with EMA also
+    `val/ema_AP/<name>`); {} without them."""
+    out = {}
+    for i, n in enumerate(names):
+        for k in (f"val/AP/{n}", f"val/ema_AP/{n}"):
+            v = finite_lr(metrics.get(k))
+            if v is not None and v >= 0:
+                out[i] = v
+                break
+    return out
+
+
 def train_ultralytics(a, device: str, names: list[str], em) -> dict:
     import torch
     from ultralytics import YOLO
@@ -1419,10 +1731,17 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         return model
     probs = (a.aug_dark, a.aug_noise, a.aug_gray)
     gen = torch.Generator().manual_seed(a.seed)
-    iou_meter = IouMeter()
+    class_meter = ClassMeter()
     conv = convergence(a)
     selection = Selection(a.select_metric, conv)
     state = {"batches": 0}
+
+    def epoch_classes(epoch: int, validator) -> dict:
+        """This validation's `selection_metrics` (once per epoch: `validate` and
+        `on_fit_epoch_end` both read them)."""
+        if state.get("classes", (0, None))[0] != epoch:
+            state["classes"] = (epoch, selection_metrics(selection, class_meter, names, ultralytics_ap95(validator)))
+        return state["classes"][1]
 
     base_yolo = YOLO(str(a.weights))
     base_names = em.ultralytics_names(base_yolo)
@@ -1454,28 +1773,30 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
             validator = super().get_validator()
             orig = getattr(validator, "_process_batch", None)
             if orig is None:
-                log("mean IoU skipped (no _process_batch in the Ultralytics validator)")
-                iou_meter.failed = True
+                class_meter.fail(RuntimeError("no _process_batch in the Ultralytics validator"))
                 return validator
 
             # Called once per image with both box sets in the model's input pixels.
             def process_batch(*args, **kw):
-                iou_meter.add(lambda: ultralytics_boxes(*args[:2]))
+                class_meter.add(lambda: ultralytics_boxes(*args[:2]))
                 return orig(*args, **kw)
 
             validator._process_batch = process_batch
             return validator
 
         def validate(self):
-            # best.pt follows `best_fitness` (`save_model`, also on a tie): with another metric
-            # than mAP it and the returned fitness carry that metric's value. mAP keeps
-            # Ultralytics' own path untouched. Its patience is above the epochs, so its stopper
+            # best.pt follows `best_fitness` (`save_model`, also on a tie): with another key than
+            # the trainer's own mAP (another metric, or mAP over the supported classes) it and the
+            # returned fitness carry that key's value. Selecting by mAP over all classes keeps
+            # Ultralytics' own result untouched. Its patience is above the epochs, so its stopper
             # never fires, and a real NaN fitness stays its NaN recovery's.
-            if selection.metric == "map":
-                return super().validate()
             prev = self.best_fitness
             metrics, fitness = super().validate()
             if metrics is None:
+                return metrics, fitness
+            epoch = self.epoch + 1
+            classes = epoch_classes(epoch, getattr(self, "validator", None))  # decides the classes once
+            if selection.key == "map":
                 return metrics, fitness
             m, swept = dict(metrics), True
             box = getattr(getattr(getattr(self, "validator", None), "metrics", None), "box", None)
@@ -1485,10 +1806,11 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
             except Exception as e:  # a changed Ultralytics internal
                 log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
                 swept = False
-            m.update(iou_meter.peek())
-            epoch = self.epoch + 1
-            value = selection.value(m, epoch, sweep_failed=not swept, iou_failed=iou_meter.failed)
-            if selection.metric == "map":  # fell back just now: mAP's best starts here
+            m.update(classes)
+            m.update(class_meter.peek())
+            value = selection.value(m, epoch, sweep_failed=not swept, iou_failed=class_meter.failed,
+                                    classes_failed=class_meter.failed)
+            if selection.key == "map":  # fell back just now: mAP's best starts here
                 self.best_fitness = fitness
                 return metrics, fitness
             if not math.isfinite(float(fitness)):
@@ -1560,7 +1882,8 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
                 m.pop("recall", None)
         except Exception as e:  # a changed Ultralytics internal: the other metrics still count
             log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
-        m.update(iou_meter.take())
+        m.update(epoch_classes(trainer.epoch + 1, getattr(trainer, "validator", None)))
+        m.update(class_meter.take())
         try:
             images = len(trainer.train_loader.dataset)
         except Exception:
@@ -1581,8 +1904,8 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         # best.pt is validated and exported as always.
         tm = getattr(trainer, "metrics", None) or {}
         at, value = state.get("selected", (0, None))
-        if selection.metric == "map" or at != trainer.epoch + 1:
-            value = selection.value(tm)
+        if selection.key == "map" or at != trainer.epoch + 1:
+            value = selection.value(tm if selection.key == "map" else m)
         if conv.step(trainer.epoch + 1, value, loss):
             trainer.stop = True
 
@@ -1824,33 +2147,42 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
 
     # Its validation matches each batch's boxes for that F1, in original image pixels, once per
     # batch (`on_validation_batch_end`; the extra EMA pass of `eval_base_model` does not match).
-    iou_meter = IouMeter()
+    class_meter = ClassMeter()
     orig_matching = getattr(coco_eval, "build_matching_data", None)
 
     def matching(*args, **kw):
-        iou_meter.add(lambda: rfdetr_boxes(*args[:2]))
+        class_meter.add(lambda: rfdetr_boxes(*args[:2]))
         return orig_matching(*args, **kw)
 
     if orig_matching is not None:
         coco_eval.build_matching_data = matching
     else:
-        log("mean IoU skipped (no build_matching_data in rfdetr)")
-        iou_meter.failed = True
+        class_meter.fail(RuntimeError("no build_matching_data in rfdetr"))
 
     conv = convergence(a)
     selection = Selection(a.select_metric, conv)
     # This epoch's selected value, as rfdetr's best-checkpoint callback compared it.
     selected = {}
+    # This epoch's `selection_metrics` (best_on_validation_end and Progress both read them).
+    classes = {"epoch": 0, "m": {}}
+
+    def epoch_classes(trainer, metrics: dict) -> dict:
+        epoch = trainer.current_epoch + 1
+        if classes["epoch"] != epoch:
+            classes["epoch"] = epoch
+            classes["m"] = selection_metrics(selection, class_meter, names, rfdetr_ap95(metrics, names))
+        return classes["m"]
 
     def rfdetr_value(trainer, metrics: dict):
-        """`Selection.value` over the epoch's callback metrics and this validation's sweep and IoU;
-        rfdetr's own `val/F1` does not go through the script's sweep wrapper."""
+        """`Selection.value` over the epoch's callback metrics and this validation's sweep, class
+        averages and IoU; rfdetr's own `val/F1` does not go through the script's sweep wrapper."""
         m = dict(metrics)
         if sweeps["n"] > sweeps["used"]:
             m.update(sweeps["last"])
-        m.update(iou_meter.peek())
+        m.update(epoch_classes(trainer, metrics))
+        m.update(class_meter.peek())
         return selection.value(m, trainer.current_epoch + 1, sweep_failed=sweeps["failed"] and selection.metric != "f1",
-                               iou_failed=iou_meter.failed)
+                               iou_failed=class_meter.failed, classes_failed=class_meter.failed)
 
     # rfdetr's BestModelCallback writes checkpoint_best_total.pth and only knows mAP / mAR. For its
     # `on_validation_end` it gets the trainer with the selected value under its monitor keys. Not
@@ -1877,7 +2209,11 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         selection.fall_back(f"rfdetr's best checkpoint cannot follow it ({type(e).__name__}: {e})")
 
     def best_on_validation_end(cb, trainer, pl_module):
-        if selection.metric == "map" or trainer.sanity_checking:
+        if trainer.sanity_checking:
+            return orig_best_end(cb, trainer, pl_module)
+        # The first validation decides the classes (`Selection.decide`) before the key is read.
+        epoch_classes(trainer, scalar_metrics(trainer.callback_metrics))
+        if selection.key == "map":
             return orig_best_end(cb, trainer, pl_module)
         # Its high-water mark starts at 0.0 with a strict `>`: below any value, so an all-zero
         # metric still keeps the first epoch (the rule's) and not the final weights it backfills.
@@ -1886,7 +2222,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             cb._best_ema = -1.0
         metrics = dict(trainer.callback_metrics)
         value = rfdetr_value(trainer, scalar_metrics(metrics))
-        if selection.metric == "map":  # fell back just now: mAP's best starts here
+        if selection.key == "map":  # fell back just now: mAP's best starts here
             cb._best_ema = -1.0
             return orig_best_end(cb, trainer, pl_module)
         for key in (cb.monitor, cb._monitor_ema):
@@ -1941,7 +2277,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
 
         def on_validation_start(self, trainer, pl_module):
             meter.train_done()
-            iou_meter.take()  # this validation's boxes only (not a sanity check's, the training split's)
+            class_meter.take()  # this validation's boxes only (not a sanity check's, the training split's)
 
         def on_validation_end(self, trainer, pl_module):
             # The first training step after the EMA validation is where MPS ran out of memory.
@@ -1957,7 +2293,10 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             if sweeps["n"] > sweeps["used"]:
                 m.update(sweeps["last"])
                 sweeps["used"] = sweeps["n"]
-            m.update(iou_meter.take())
+            # rfdetr's per-class AP keys come back as `class/<name>/ap`.
+            m.update(epoch_classes(trainer, m))
+            m = {k: v for k, v in m.items() if not k.startswith(("val/AP/", "val/ema_AP/"))}
+            m.update(class_meter.take())
             m.update(meter.metrics())
             emit_metrics("epoch", m, epoch=trainer.current_epoch + 1, epochs=trainer.max_epochs, loss=loss, map50=mp,
                          map=mp95, elapsed_s=round(time.time() - started, 1))
@@ -2005,6 +2344,8 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         kw["lr_scheduler_kwargs"] = {"min_factor": min_factor}
     if a.multi_scale == "off":
         kw["multi_scale"] = False
+    # Per-class AP 50-95 (`val/AP/<name>`) for `map_sup` and the per-class table.
+    kw["log_per_class_metrics"] = True
     if a.workers > 0:
         kw["persistent_workers"] = True
         if device.startswith("cuda"):
@@ -2020,7 +2361,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             raise
         log(f"rfdetr rejected an option ({e}); retrying with the basic options")
         for k in ("seed", "multi_scale", "persistent_workers", "pin_memory", "lr_encoder", "lr_scheduler",
-                  "lr_scheduler_kwargs"):
+                  "lr_scheduler_kwargs", "log_per_class_metrics"):
             kw.pop(k, None)
         model.train(**kw)
     pl.Trainer.__init__ = orig_init
@@ -2190,11 +2531,24 @@ def collate(batch):
     return {"pixel_values": torch.stack([b["pixel_values"] for b in batch]), "labels": [b["labels"] for b in batch]}
 
 
-def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
+def torchmetrics_ap95(r) -> dict:
+    """{class index: AP 50-95} of a `MeanAveragePrecision(class_metrics=True)` result
+    (`classes`, `map_per_class`; -1 = no ground truth); {} without them."""
+    try:
+        cs = r["classes"].reshape(-1).tolist()
+        aps = r["map_per_class"].reshape(-1).tolist()
+        return {int(c): float(v) for c, v in zip(cs, aps) if float(v) >= 0}
+    except Exception:
+        return {}
+
+
+def detection_metrics(model, ds, proc, batch: int, imgsz: int, meter: ClassMeter | None = None) -> tuple:
     """mAP 50-95 / 50 / 75 and mAR@100 (torchmetrics, COCO rules) plus the macro P / R / F-beta
     sweep at IoU 0.5 ([`fbeta_sweep`]) and the mean IoU of the matched boxes ([`mean_iou`]) of
     `model` on the prepared validation set `ds`, in the model's input pixels (images are stretched
-    to imgsz x imgsz, the labels are normalized). `sweep_failed` is set when the sweep raised."""
+    to imgsz x imgsz, the labels are normalized). `sweep_failed` is set when the sweep raised.
+    Returns those metrics and {class index: AP 50-95} (`torchmetrics_ap95`); `meter` gets the
+    boxes (`ClassMeter.add`)."""
     import numpy as np
     import torch
     from torchmetrics.detection import MeanAveragePrecision
@@ -2202,7 +2556,7 @@ def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
     dev = next(model.parameters()).device
     was_training = model.training
     model.eval()
-    mean_ap = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+    mean_ap = MeanAveragePrecision(box_format="xyxy", iou_type="bbox", class_metrics=True)
     preds, gts = [], []
     try:
         with torch.no_grad():
@@ -2234,7 +2588,9 @@ def detection_metrics(model, ds, proc, batch: int, imgsz: int) -> dict:
     except Exception as e:  # the mAP still counts
         log(f"F-beta sweep skipped ({type(e).__name__}: {e})")
         m["sweep_failed"] = True
-    return m
+    if meter is not None:
+        meter.add(lambda: (preds, gts))
+    return m, torchmetrics_ap95(r)
 
 
 def train_transformers(a, device: str, names: list[str], em) -> dict:
@@ -2303,27 +2659,32 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
 
     conv = convergence(a)
     selection = Selection(a.select_metric, conv)
+    class_meter = ClassMeter()
     best_state = {}
 
     class DetectionTrainer(Trainer):
-        """Trainer whose evaluation also scores the detections (mAP, P / R, F-beta), keeps the
-        best epoch's weights and stops on convergence (or a finish request)."""
+        """Trainer whose evaluation also scores the detections (mAP, P / R, F-beta, the class
+        averages), keeps the best epoch's weights and stops on convergence (or a finish request)."""
 
         def evaluate(self, *args, **kw):
             out = super().evaluate(*args, **kw)
             m = {}
-            failed = False
+            failed = broke = False
             epoch = round(self.state.epoch or 0)
             try:
-                m = detection_metrics(self.model, val_ds, proc, a.batch, a.imgsz)
+                class_meter.take()
+                m, ap95 = detection_metrics(self.model, val_ds, proc, a.batch, a.imgsz, class_meter)
                 failed = m.pop("sweep_failed", False)
+                m.update(selection_metrics(selection, class_meter, names, ap95))
+                class_meter.take()
                 emit_metrics("eval", m, epoch=epoch, epochs=a.epochs)
             except Exception as e:  # the loss still counts
                 log(f"detection metrics skipped ({type(e).__name__}: {e})")
-                failed = True
+                failed = broke = True
             if epoch >= 1:
                 losses = [h["loss"] for h in self.state.log_history if "loss" in h]
-                value = selection.value(m, epoch, sweep_failed=failed, iou_failed=failed)
+                value = selection.value(m, epoch, sweep_failed=failed, iou_failed=failed,
+                                        classes_failed=broke or class_meter.failed)
                 stop = conv.step(epoch, value, losses[-1] if losses else None)
                 if conv.improved:
                     best_state["epoch"], best_state["value"] = conv.top_epoch, conv.top
