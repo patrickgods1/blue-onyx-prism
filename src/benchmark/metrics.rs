@@ -191,6 +191,49 @@ pub const MAX_DETS: usize = 100;
 pub const SMALL_AREA: f32 = 32.0 * 32.0;
 pub const MEDIUM_AREA: f32 = 96.0 * 96.0;
 
+/// A class counts in a class average (AP, F-scores, frame ROC AUC, the trainer's checkpoint choice)
+/// only with at least this many ground-truth boxes in the evaluated set. With fewer, one box moves
+/// the class by more than 5 points, and a class of 1-7 boxes (a dog, a cat, a bicycle) would
+/// weigh as much as hundreds of persons. Twin: `MIN_CLASS_BOXES` in `scripts/train_model.py`.
+pub const MIN_CLASS_GT: usize = 20;
+
+/// The indexes of the classes a class average is taken over: those with at least `min`
+/// ground-truth boxes; when none has, every class with ground truth and `true` (fell back).
+/// Twin: `supported_rows` in `scripts/train_model.py`.
+pub fn supported(gts: &[usize], min: usize) -> (Vec<usize>, bool) {
+    let strong: Vec<usize> = (0..gts.len()).filter(|&i| gts[i] >= min.max(1)).collect();
+    if strong.is_empty() {
+        ((0..gts.len()).filter(|&i| gts[i] > 0).collect(), true)
+    } else {
+        (strong, false)
+    }
+}
+
+/// Which classes a class average was taken over ([`supported`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApBasis {
+    /// The [`MIN_CLASS_GT`] in force.
+    pub min_gt: usize,
+    /// The averaged classes.
+    pub classes: Vec<String>,
+    /// No class reached `min_gt`: every class with ground truth was averaged.
+    #[serde(default)]
+    pub fell_back: bool,
+}
+
+impl ApBasis {
+    /// The basis of `names` with ground-truth counts `gts` (same order).
+    pub fn of(names: &[&str], gts: &[usize]) -> (Self, Vec<usize>) {
+        let (idx, fell_back) = supported(gts, MIN_CLASS_GT);
+        let basis = ApBasis {
+            min_gt: MIN_CLASS_GT,
+            classes: idx.iter().map(|&i| names[i].to_string()).collect(),
+            fell_back,
+        };
+        (basis, idx)
+    }
+}
+
 /// Lowercase, trimmed, with VOC/YOLO spellings mapped to COCO's.
 pub fn canonical_label(label: &str) -> String {
     let l = label.trim().to_ascii_lowercase().replace('_', " ");
@@ -1395,6 +1438,19 @@ mod tests {
             0.5,
         );
         assert_eq!(c, Counts::default());
+    }
+
+    #[test]
+    fn supported_classes_and_fallback() {
+        assert_eq!(supported(&[30, 25, 2, 0], 20), (vec![0, 1], false));
+        assert_eq!(supported(&[19, 20, 21], 20), (vec![1, 2], false));
+        assert_eq!(supported(&[7, 0, 1], 20), (vec![0, 2], true));
+        assert_eq!(supported(&[0, 0], 20), (vec![], true));
+        let (b, idx) = ApBasis::of(&["person", "car", "dog"], &[25, 30, 2]);
+        assert_eq!(idx, vec![0, 1]);
+        assert_eq!(b.classes, vec!["person", "car"]);
+        assert!(!b.fell_back);
+        assert_eq!(b.min_gt, MIN_CLASS_GT);
     }
 
     #[test]
