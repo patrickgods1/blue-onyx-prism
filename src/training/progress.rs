@@ -394,6 +394,16 @@ pub const METRICS: &[MetricInfo] = {
         m("lr", "Learning rate", "LR", None, Sci),
         m("mem_gb", "Peak GPU memory (GB)", "Mem", None, Gb),
         m("img_s", "Training images per second", "img/s", UP, Rate),
+        // Display only, like the two above (the script's `EpochMeter`): the whole GPU's busy share
+        // from NVML (CUDA only) and the share of the training time waiting for the next batch.
+        m("gpu_util", "GPU busy (training)", "GPU busy", None, Pct),
+        m(
+            "data_wait",
+            "Waiting for data (training)",
+            "Data wait",
+            None,
+            Pct,
+        ),
         m("ema_map", "mAP 50-95 (EMA)", "EMA mAP", UP, Fixed3),
         m("ema_map50", "mAP 50 (EMA)", "EMA mAP50", UP, Fixed3),
         m("ema_map75", "mAP 75 (EMA)", "EMA mAP75", UP, Fixed3),
@@ -2196,6 +2206,8 @@ mod tests {
             ("f2_thr", "f2_thr"),
             ("mem_gb", "mem_gb"),
             ("img_s", "img_s"),
+            ("gpu_util", "gpu_util"),
+            ("data_wait", "data_wait"),
         ] {
             assert_eq!(canonical(raw), Some(id), "{raw}");
         }
@@ -2984,6 +2996,107 @@ print(json.dumps({"runs": out, "falling": falling, "finish": fin, "anneal_finish
         let falling: Vec<bool> = serde_json::from_value(v["falling"].clone()).unwrap();
         let want: Vec<bool> = loss_cases().iter().map(|(l, _)| loss_falling(l)).collect();
         assert_eq!(falling, want);
+    }
+
+    /// The script's `EpochMeter` on a fake clock and a stand-in `torch`: `data_wait` sums the
+    /// gaps from each `batch_end` (the epoch start for the first step) to the next
+    /// `batch_start` over the training wall time; `gpu_util` averages NVML samples taken at most
+    /// every 2 s; a failing NVML call turns it off for the run; neither key is emitted when
+    /// unmeasured (skipped without Python 3).
+    #[test]
+    fn epoch_meter_data_wait_and_gpu_busy() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import json, sys, types
+src = sys.stdin.read()
+ns = {"__name__": "train_model"}
+exec(compile(src, "train_model.py", "exec"), ns)
+calls = {"util": 0, "fail": False}
+def utilization(device):
+    calls["util"] += 1
+    if calls["fail"]:
+        raise ModuleNotFoundError("nvidia-ml-py does not seem to be installed")
+    return [40, 80, 60, 150][calls["util"] - 1]
+cuda = types.SimpleNamespace(utilization=utilization, reset_peak_memory_stats=lambda d: None,
+                             max_memory_reserved=lambda d: 2 * 2**30)
+sys.modules["torch"] = types.SimpleNamespace(cuda=cuda, mps=types.SimpleNamespace())
+now = [100.0]
+clock = lambda: now[0]
+def at(t):
+    now[0] = t
+out = {}
+m = ns["EpochMeter"]("cuda:0", clock)
+at(10.0); m.epoch_start()
+# Step 1 waits 1 s from the epoch start, step 2 0.5 s, step 3 0 s; a repeated batch_start adds
+# nothing; training ends at 20 s: 1.5 / 10.
+at(11.0); m.batch_start(); at(11.5); m.batch_start()
+at(13.0); m.batch_end(4)     # util sample 40 (first)
+at(13.5); m.batch_start()
+at(14.0); m.batch_end(4)     # 1 s after the sample: none
+at(14.0); m.batch_start()
+at(15.0); m.batch_end(4)     # 2 s: sample 80
+at(20.0); m.train_done()
+at(25.0); m.batch_start()    # after the training phase (validation): not counted
+out["first"] = m.metrics()
+at(30.0); m.epoch_start()
+at(30.0); m.batch_end(8)     # sample 60
+at(31.0); m.batch_end(8)     # none
+at(32.0); m.batch_end(8)     # sample 150, clamped to 100
+at(34.0); m.train_done()
+out["second"] = m.metrics()   # no batch_start in this epoch: no data_wait
+at(40.0); m.epoch_start()
+calls["fail"] = True
+at(41.0); m.batch_start(); at(42.0); m.batch_end(2)
+out["failed"] = m.metrics()
+calls["fail"] = False
+n = calls["util"]
+at(50.0); m.epoch_start(); at(50.5); m.batch_start(); at(51.0); m.batch_end(2); m.train_done()
+out["after"] = m.metrics()
+out["calls_after"] = calls["util"] - n
+c = ns["EpochMeter"]("cpu", clock)
+at(60.0); c.epoch_start(); at(61.0); c.batch_start(); at(62.0); c.batch_end(2); c.train_done()
+out["cpu"] = c.metrics()
+print(json.dumps(out))
+"#;
+        let Some(python) = test_python::python3("EpochMeter") else {
+            return;
+        };
+        let out = test_python::run(python, &["-I", "-c", code], script);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // The script's log line says once why the share is missing; the result is the last line.
+        assert_eq!(
+            stdout.matches("GPU busy share not measured").count(),
+            1,
+            "{stdout}"
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        assert_eq!(
+            v["first"],
+            serde_json::json!({"mem_gb": 2.0, "img_s": 1.2, "gpu_util": 0.6, "data_wait": 0.15})
+        );
+        assert_eq!(
+            v["second"],
+            serde_json::json!({"mem_gb": 2.0, "img_s": 6.0, "gpu_util": 0.8})
+        );
+        // The failing call leaves the epoch without a share, and the rest of the run asks no more.
+        assert_eq!(
+            v["failed"],
+            serde_json::json!({"mem_gb": 2.0, "img_s": 1.0, "data_wait": 0.5})
+        );
+        assert_eq!(
+            v["after"],
+            serde_json::json!({"mem_gb": 2.0, "img_s": 2.0, "data_wait": 0.5})
+        );
+        assert_eq!(v["calls_after"], 0);
+        assert_eq!(
+            v["cpu"],
+            serde_json::json!({"img_s": 1.0, "data_wait": 0.5})
+        );
+        for id in ["gpu_util", "data_wait"] {
+            let m = metric(id).unwrap();
+            assert_eq!(m.format, MetricFormat::Pct);
+            assert_eq!(canonical(id), Some(id));
+        }
     }
 
     /// The script's `match_detections(..., ious=)` on hand-computed boxes (a partial overlap, a

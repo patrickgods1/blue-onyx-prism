@@ -309,6 +309,52 @@ pub struct AutolabelReport {
     pub frames_failed: usize,
     /// The first of those failures.
     pub first_write_error: Option<String>,
+    /// A labelers run: each labeler's per-frame time (the script's `ms`, [`labeler_ms`]), kept
+    /// here because `work` (with `proposals.jsonl`) is removed after a run. Missing in records of
+    /// older runs and of model runs (task results are read as JSON, so they still load).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labeler_ms: BTreeMap<String, LabelerMs>,
+}
+
+/// One labeler's per-frame time over a run, in milliseconds (nearest-rank percentiles, as the
+/// benchmark's `p50`, [`crate::benchmark::percentile`]).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, serde::Deserialize)]
+pub struct LabelerMs {
+    pub median: f64,
+    pub p90: f64,
+    /// Frames it ran on (the VLM and SigLIP only run on some: frames with a box to check).
+    pub frames: usize,
+}
+
+/// The per-labeler [`LabelerMs`] of a `proposals.jsonl` (`"ms": {"gdino": 412, ...}` per
+/// frame), read lossy per line: a line that does not parse, a missing `ms` and a value that is
+/// no finite non-negative number are left out.
+pub fn labeler_ms(text: &str) -> BTreeMap<String, LabelerMs> {
+    let mut per: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ms) = v.get("ms").and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (k, v) in ms {
+            if let Some(x) = v.as_f64().filter(|x| x.is_finite() && *x >= 0.0) {
+                per.entry(k.clone()).or_default().push(x);
+            }
+        }
+    }
+    per.into_iter()
+        .map(|(k, mut v)| {
+            v.sort_by(f64::total_cmp);
+            let t = LabelerMs {
+                median: crate::benchmark::percentile(&v, 50.0),
+                p90: crate::benchmark::percentile(&v, 90.0),
+                frames: v.len(),
+            };
+            (k, t)
+        })
+        .collect()
 }
 
 impl AutolabelReport {
@@ -383,10 +429,21 @@ impl AutolabelReport {
         )
     }
 
-    /// A labelers run's SAM 3 threshold and what it did to frames with a reviewer's decisions, for
-    /// its summary (empty when neither applies).
+    /// A labelers run's per-frame times, SAM 3 threshold and what it did to frames with a
+    /// reviewer's decisions, for its summary (empty when none applies).
     fn labelers_notes(&self) -> String {
         let mut s = String::new();
+        if !self.labeler_ms.is_empty() {
+            let each: Vec<String> = self
+                .labeler_ms
+                .iter()
+                .map(|(k, t)| format!("{k} {:.0} / {:.0}", t.median, t.p90))
+                .collect();
+            s.push_str(&format!(
+                "; time per frame (median / p90 ms): {}",
+                each.join(", ")
+            ));
+        }
         if let Some(t) = self.sam3_threshold {
             s.push_str(&format!("; SAM 3 threshold {t}"));
         }
@@ -1218,6 +1275,7 @@ impl AutolabelJob {
                     }
                 }
             };
+            rep.labeler_ms = labeler_ms(&text);
             let done_count = self.write_proposals(
                 &frames,
                 &text,

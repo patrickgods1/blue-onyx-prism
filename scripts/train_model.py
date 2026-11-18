@@ -36,7 +36,9 @@ Progress: every event is one line `@train {json}` on stdout (`start`, `epoch`, `
 `metrics/mAP50(B)`, `eval_loss`, ...) plus this script's `f1`/`f2`/`f0_5` sweeps (`fbeta_sweep`),
 the averages over the well-supported classes (`map_sup`, `map50_sup`, `f2_sup`, ...) and per-class
 `class/<name>/ap50`, `class/<name>/ap`, `class/<name>/recall` (`class_metrics`),
-`iou` (`mean_iou`), `mem_gb` (peak GPU memory) and `img_s` (training images per second); the service
+`iou` (`mean_iou`), `mem_gb` (peak GPU memory), `img_s` (training images per second), `gpu_util`
+(the GPU's busy share, CUDA only) and `data_wait` (share of the training time waiting for batches,
+`EpochMeter`); the service
 maps the keys to stable ids (src/training/progress.rs). Night augmentation
 (`--aug-dark`, `--aug-noise`, `--aug-gray`: per-image probabilities) is applied on the fly to the
 training batches (Ultralytics, transformers) or to one extra copy of each training image chosen by
@@ -1174,29 +1176,59 @@ def pr_sweep(matches: dict, thresholds):
     return np.array(ps), np.array(rs)
 
 
-class EpochMeter:
-    """Peak GPU memory (`mem_gb`) and training speed (`img_s`) of one epoch. MPS has no peak
-    counter: the driver's allocation is sampled after every batch and the largest kept."""
+# Seconds between two `torch.cuda.utilization` samples (an NVML query, cheap, no CUDA context).
+# Each value covers NVML's own sample period (1/6 s to 1 s, by GPU) ending just after a batch, so
+# the mean is a sparse view of the epoch, not an exact busy time.
+GPU_UTIL_EVERY_S = 2.0
 
-    def __init__(self, device: str):
+
+class EpochMeter:
+    """Per-epoch measurements of the training phase (validation excluded), all display only:
+    peak GPU memory (`mem_gb`), training speed (`img_s`), the GPU's busy share (`gpu_util`, 0..1)
+    and the share of the training time spent waiting for the next batch (`data_wait`, 0..1).
+
+    MPS has no peak counter: the driver's allocation is sampled after every batch and the largest
+    kept. `gpu_util` (CUDA only) is the mean of `torch.cuda.utilization` (NVML, the whole GPU: the
+    service's own models on the same card count too) sampled at most every GPU_UTIL_EVERY_S from
+    `batch_end`; the first failure (no `nvidia-ml-py`, no NVML) turns it off for the run and that
+    epoch reports none. `data_wait` sums, per step, the time from the previous `batch_end` (the
+    epoch start for the first step) to the step's `batch_start`, over the epoch's training wall
+    time; a trainer whose hook never called `batch_start` reports none. `clock` is for tests."""
+
+    def __init__(self, device: str, clock=time.monotonic):
         self.device = device
-        self.start = time.time()
-        self.train_end = None
-        self.peak = 0.0
-        self.images = 0
+        self.clock = clock
+        self.util_on = device.startswith("cuda")
+        self._reset()
+
+    def _reset(self):
+        self.start, self.train_end, self.peak, self.images = self.clock(), None, 0.0, 0
+        self.util, self.util_at = [], None
+        # `mark`: when the wait for the next batch began (None once a `batch_start` consumed it,
+        # so a second one without a `batch_end` between them adds nothing).
+        self.wait, self.waits, self.mark = 0.0, 0, self.start
 
     def epoch_start(self):
-        import torch
-
-        self.start, self.train_end, self.peak, self.images = time.time(), None, 0.0, 0
+        self._reset()
         if self.device.startswith("cuda"):
+            import torch
+
             try:
                 torch.cuda.reset_peak_memory_stats(self.device)
             except Exception:
                 pass
 
+    def batch_start(self):
+        now = self.clock()
+        if self.train_end is None and self.mark is not None:
+            self.wait += max(0.0, now - self.mark)
+            self.waits += 1
+        self.mark = None
+
     def batch_end(self, images: int):
         self.images += max(0, int(images))
+        now = self.clock()
+        self.mark = now
         if self.device == "mps":
             import torch
 
@@ -1204,27 +1236,40 @@ class EpochMeter:
                 self.peak = max(self.peak, float(torch.mps.driver_allocated_memory()))
             except Exception:
                 pass
+        if self.util_on and (self.util_at is None or now - self.util_at >= GPU_UTIL_EVERY_S):
+            self.util_at = now
+            try:
+                import torch
+
+                self.util.append(min(100.0, max(0.0, float(torch.cuda.utilization(self.device)))) / 100.0)
+            except Exception as e:
+                self.util_on, self.util = False, []
+                log(f"GPU busy share not measured ({type(e).__name__}: {e})")
 
     def train_done(self):
         if self.train_end is None:
-            self.train_end = time.time()
+            self.train_end = self.clock()
 
     def metrics(self, images: int | None = None) -> dict:
-        import torch
-
         out = {}
         mem = self.peak
         if self.device.startswith("cuda"):
+            import torch
+
             try:
                 mem = float(torch.cuda.max_memory_reserved(self.device))
             except Exception:
                 mem = 0.0
         if mem > 0:
             out["mem_gb"] = round(mem / 2**30, 3)
-        end = self.train_end or time.time()
+        end = self.train_end or self.clock()
         n = images if images else self.images
         if n and end > self.start:
             out["img_s"] = round(n / (end - self.start), 3)
+        if self.util_on and self.util:
+            out["gpu_util"] = round(sum(self.util) / len(self.util), 4)
+        if self.waits and end > self.start:
+            out["data_wait"] = round(min(1.0, max(0.0, self.wait / (end - self.start))), 4)
         return out
 
 
@@ -1837,6 +1882,9 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         state["epoch_started"] = time.time()
         meter.epoch_start()
 
+    def on_train_batch_start(trainer):
+        meter.batch_start()
+
     def on_train_batch_end(trainer):
         state["batches"] += 1
         meter.batch_end(0)
@@ -1910,6 +1958,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
             trainer.stop = True
 
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
+    model.add_callback("on_train_batch_start", on_train_batch_start)
     model.add_callback("on_train_batch_end", on_train_batch_end)
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
     model.add_callback("on_fit_epoch_end", on_fit_epoch_end)
@@ -2260,6 +2309,9 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
     class Progress(Callback):
         def on_train_epoch_start(self, trainer, pl_module):
             meter.epoch_start()
+
+        def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+            meter.batch_start()
 
         def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
             nb = trainer.num_training_batches
@@ -2633,6 +2685,9 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     class Progress(TrainerCallback):
         def on_epoch_begin(self, args, state, control, **kw):
             meter.epoch_start()
+
+        def on_step_begin(self, args, state, control, **kw):
+            meter.batch_start()
 
         def on_step_end(self, args, state, control, **kw):
             meter.batch_end(0)

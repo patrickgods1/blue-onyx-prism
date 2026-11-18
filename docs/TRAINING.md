@@ -1015,7 +1015,7 @@ own key, plus the script's own:
 | RF-DETR (rfdetr 1.11 Lightning `callback_metrics`) | `val/mAP_50_95`, `val/mAP_50`, `val/mAP_75`, `val/mAR` (the EMA model by default), `val/ema_*`, `val/F1`, `val/precision`, `val/recall` (at the best macro-F1 confidence), `train/loss`, `train/lr`, `train/loss_ce`, ...; its per-class AP 50-95 (`val/AP/<name>`, `val/ema_AP/<name>`, `log_per_class_metrics=True`) comes back as `class/<name>/ap` |
 | Ultralytics (`trainer.metrics`, `tloss`, `lr`) | `metrics/mAP50-95(B)`, `metrics/mAP50(B)`, `metrics/precision(B)`, `metrics/recall(B)`, `val/box_loss`, `train/cls_loss`, `lr/pg0`, ...; `val_loss` = the sum of the `val/*_loss` |
 | transformers (RT-DETRv2, D-FINE) | `eval_loss`, `learning_rate`, and a detection evaluation after each `evaluate` (an extra pass over the validation split): mAP 50-95 / 50 / 75 and mAR@100 with torchmetrics (COCO rules), P / R / F-beta from a greedy IoU-0.5 matching swept over 101 confidences |
-| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); the same over the classes with at least 20 validation boxes, `map50_sup`, `map_sup`, `f1_sup`, `f2_sup`, `f0_5_sup` with their `_thr`, `_precision`, `_recall` (*Select best by*; left out when no class has 20); per class with validation boxes `class/<name>/ap50`, `class/<name>/ap` (the trainer's AP 50-95) and `class/<name>/recall` (at the best threshold of the selected F, else of F1); `iou` (mean IoU of the matched boxes, below); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded) |
+| all (the script) | `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`, `f0_5`, `f0_5_thr`, ...: macro F-beta (`(1+b^2)PR/(b^2P+R)` per class, averaged over the classes with ground truth) at the best confidence of the sweep (rfdetr's own 101-threshold rows, Ultralytics' `p_curve` / `r_curve`); the same over the classes with at least 20 validation boxes, `map50_sup`, `map_sup`, `f1_sup`, `f2_sup`, `f0_5_sup` with their `_thr`, `_precision`, `_recall` (*Select best by*; left out when no class has 20); per class with validation boxes `class/<name>/ap50`, `class/<name>/ap` (the trainer's AP 50-95) and `class/<name>/recall` (at the best threshold of the selected F, else of F1); `iou` (mean IoU of the matched boxes, below); `mem_gb` (peak GPU memory: CUDA `max_memory_reserved`, MPS the driver's allocation sampled after every batch); `img_s` (training images per second, validation excluded); `gpu_util` (CUDA only: the mean of `torch.cuda.utilization`, NVML's whole-GPU busy share, so the service's own models on the same card count too, sampled at most every 2 s after a batch; left out when NVML or `nvidia-ml-py` fails, then for the rest of the run); `data_wait` (the epoch's summed wait from one batch's end, or the epoch start, to the next batch's start hook, over the training wall time: Ultralytics `on_train_batch_start`, Lightning `on_train_batch_start`, transformers `on_step_begin`). All four are display only (`EpochMeter`) |
 
 F2 weighs recall four times precision ("don't miss a person"), F0.5 the other way; the `*_thr` columns
 are a starting confidence threshold for the trained model. NaN, infinite and non-numeric values are
@@ -1032,7 +1032,7 @@ not comparable with it. By default it is display only; `--select-metric iou` mak
 
 The service maps the keys to stable ids (`src/training/progress.rs` `canonical`): `map`, `map50`,
 `map75`, `mar`, `iou`, `precision`, `recall`, `f1`, `f1_thr`, `f2`, `f2_thr`, `f2_precision`, `f2_recall`,
-`f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, the `_sup` twins (`map_sup`, `f2_sup`,
+`f0_5`, `f0_5_thr`, `loss`, `val_loss`, `lr`, `mem_gb`, `img_s`, `gpu_util`, `data_wait`, the `_sup` twins (`map_sup`, `f2_sup`,
 `f2_sup_thr`, ..., labelled "F2 (≥20)"), and `ema_map` ... for rfdetr's `val/ema_*`; unknown keys keep
 their raw name (`class/raccoon/ap50`, `train/loss_ce`), so nothing is lost when a library renames one. Each run's `progress` in `GET /v1/training` has
 `history` (kept in `<run dir>/history.jsonl`, one line per new or changed epoch, so `runs.json` holds only `best` and the latest values; an older `runs.json` that still holds history is moved into the files at start; one point per epoch: `epoch`, `elapsed_s`, `metrics`; an `eval` event fills its epoch's
@@ -2734,6 +2734,12 @@ frame's rel path, `sample_size` its pixels). The tab has no card for tighter box
 Per frame on the M1 (from the script's `ms` per frame): MM-Grounding-DINO tiny 1.3-2.8 s, RF-DETR L
 0.17-0.8 s, Qwen3-VL 2B 1-3 s per frame with checked crops, SigLIP 2 about 1.8 s for the first frame
 with animals (the text prompts are computed once).
+
+A labelers run keeps those times after its work folder is removed: the task report's `labeler_ms`
+has, per labeler, the nearest-rank `median` and `p90` of the per-frame `ms` and the `frames` it ran on
+(the VLM and SigLIP only on frames with a box to check), and the summary adds
+`time per frame (median / p90 ms): gdino 412 / 530, rfdetr 85 / 97, ...`. Records of older runs have
+no `labeler_ms`.
 
 ## Train area
 

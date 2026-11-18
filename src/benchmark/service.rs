@@ -861,6 +861,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         versions,
         retain_sets: None,
         finalized: false,
+        bookkeeping_ms: 0.0,
     };
 
     for (mi, (name, entry)) in entries.iter().enumerate() {
@@ -883,6 +884,13 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
 
     if !finished.is_empty() && !saver.finalized {
         run.finalize(&saver)?;
+    }
+    if !finished.is_empty() {
+        tracing::info!(
+            "benchmark: results bookkeeping {:.0} ms in total for {} model(s)",
+            saver.bookkeeping_ms,
+            finished.len()
+        );
     }
     outcome?;
     Ok(run_summary(
@@ -1240,10 +1248,12 @@ impl ServiceRun<'_> {
     ) -> Result<()> {
         let (ctx, req) = (self.ctx, self.req);
         let key = crate::registry::normalize_name(&model.model);
+        let t = Instant::now();
         let results =
             BenchmarkResults::new(saver.hardware.clone(), saver.versions.clone(), vec![model])
                 .with_sets(sets);
         let (prev, warnings) = BenchmarkResults::load_for_merge(&ctx.results_path)?;
+        let load_ms = super::run::ms(t.elapsed());
         for w in warnings {
             self.h.with(|g| g.warnings.push(w));
         }
@@ -1259,10 +1269,13 @@ impl ServiceRun<'_> {
         let mut merged = saver.merge(prev, results, last);
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
+        let merge_ms = super::run::ms(t.elapsed()) - load_ms;
         merged.save(&ctx.results_path)?;
+        let save_ms = super::run::ms(t.elapsed()) - load_ms - merge_ms;
         for w in super::history::record(&ctx.results_path, &seeds, &merged, name.as_slice()) {
             self.h.warn(w);
         }
+        let history_ms = super::run::ms(t.elapsed()) - load_ms - merge_ms - save_ms;
         // The model's entry in `merged` still has its evaluation predictions (not serialized).
         let new = merged
             .models
@@ -1275,6 +1288,15 @@ impl ServiceRun<'_> {
         ) {
             self.h.with(|g| g.warnings.push(w));
         }
+        let total_ms = super::run::ms(t.elapsed());
+        let preds_ms = total_ms - load_ms - merge_ms - save_ms - history_ms;
+        saver.bookkeeping_ms += total_ms;
+        tracing::info!(
+            "benchmark {}: results bookkeeping {total_ms:.0} ms (read {load_ms:.0}, merge and \
+             regrade {merge_ms:.0}, write benchmark.json {save_ms:.0}, history {history_ms:.0}, \
+             predictions {preds_ms:.0})",
+            name.as_deref().unwrap_or("?")
+        );
         saver.finalized = last;
         Ok(())
     }
@@ -1312,6 +1334,9 @@ struct Saver {
     retain_sets: Option<bool>,
     /// The last save dropped the unreferenced image sets (nothing left to do at the end).
     finalized: bool,
+    /// Wall time of every [`ServiceRun::save`] so far (reading and rewriting benchmark.json, the
+    /// history and benchmark-preds.json), logged at the end of the run.
+    bookkeeping_ms: f64,
 }
 
 impl Saver {
@@ -1927,6 +1952,7 @@ mod tests {
                     versions: RuntimeVersions::default(),
                     retain_sets: None,
                     finalized: false,
+                    bookkeeping_ms: 0.0,
                 };
                 let mut file = prev.clone();
                 let n = models.len();

@@ -123,6 +123,22 @@
     if (delta) t.appendChild(delta);
     return t;
   }
+  // A tile whose label is a `button.term` (PrismTip shows `tip` on hover, focus or tap).
+  function termTile(label, tip, tipId, value, sub) {
+    var t = el("div", "tr-kpi"), k = el("div", "tr-kpi-k"), b = el("button", "term", label);
+    b.setAttribute("type", "button");
+    b.setAttribute("data-tip", tip);
+    b.setAttribute("data-tip-id", tipId);
+    k.appendChild(b);
+    t.appendChild(k);
+    t.appendChild(el("div", "tr-kpi-v", value));
+    if (sub) t.appendChild(el("div", "tr-kpi-s muted", sub));
+    return t;
+  }
+  var MEASURED = [
+    ["gpu_util", "GPU busy", "Whole-GPU busy share from NVML; includes the service's own models on the same GPU."],
+    ["data_wait", "Data wait", "Share of the epoch's training time spent waiting for the next batch (loading and augmenting images); a high share means the GPU sits idle waiting for images."]
+  ];
   // ---- what the run selects by ---------------------------------------------------------------
   // The metric id the best epoch and the convergence rule follow: twin of TrainProgress::rule_key
   // (src/training/progress.rs, node-tested against it): mAP after a select_fallback; the support
@@ -206,6 +222,13 @@
       if (!has(v)) return;
       var i = info(p[0]);
       box.appendChild(tile(p[1], format(i.format || p[2], v), ""));
+    });
+    // The last epoch's GPU busy share and data wait (the script's EpochMeter, display only);
+    // no tile when the run never measured them (MPS, CPU, no NVML, an older run).
+    MEASURED.forEach(function (p) {
+      var lt = lastTwo(history, p[0]);
+      if (!has(lt.last)) return;
+      box.appendChild(termTile(p[1], p[2], "tr-kpi-" + p[0], format(info(p[0]).format || "pct", lt.last), "last epoch"));
     });
     return box;
   }
