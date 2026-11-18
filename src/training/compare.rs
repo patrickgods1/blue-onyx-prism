@@ -5,7 +5,10 @@
 //! `night_model` routing would score. Scenes are scored separately, so no combined AP is made
 //! up. Beside AP, the alerting figures of the post-training benchmark at its configured threshold
 //! (every held-out frame): person recall, vehicle recall (car/truck/bus merged) and false alerts
-//! on frames without any object (best = highest recall, lowest false-alert rate). Pure; the
+//! on frames without any object, and false person alerts on frames without a person (a parked car
+//! does not hide them; best = highest recall, lowest false-alert rate). A warning names runs whose
+//! AP averages different classes (a class counts with at least
+//! [`crate::benchmark::metrics::MIN_CLASS_GT`] held-out objects). Pure; the
 //! Train tab and `train run --scene ... --scene ...` render it. Runs that differ only by
 //! training seed (`--seeds`, "Repeat with N seeds") also get a "mean of N seeds" summary
 //! ([`SeedSummary`]: mean and range per column; never the best of a column). A "random picks"
@@ -48,6 +51,10 @@ pub struct CompareRun {
     pub seed: Option<u64>,
     /// The metric that picked its best epoch (`RunRecord::select_metric`).
     pub select_metric: SelectMetric,
+    /// The classes its best epoch was picked over (the trainer's `support` event: classes with at
+    /// least `MIN_CLASS_GT` validation boxes); None = every class (no such class, or a run from
+    /// before the rule).
+    pub select_classes: Option<Vec<String>>,
     /// None while the run has no benchmark (running, failed, or nothing held out).
     pub bench: Option<BenchSummary>,
 }
@@ -103,6 +110,9 @@ pub struct Row {
     pub vehicle_recall: Option<f64>,
     /// False alerts on held-out frames without any object.
     pub false_alerts: Option<FalseAlerts>,
+    /// False person alerts on held-out frames without a person (other objects allowed: a
+    /// parked car does not hide them); None for a routed row and runs of older versions.
+    pub person_false_alerts: Option<PersonAlerts>,
     /// The held-out frames the Review queue picked at random ([`BenchSummary::random`]; None for a
     /// routed row, a run without any and runs of older versions). Its AP50-95 is the `random`
     /// column, shown only with [`Comparison::random_column`].
@@ -136,6 +146,33 @@ impl FalseAlerts {
     }
 }
 
+/// Frames without a person that got a person detection at the threshold, of all such frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PersonAlerts {
+    pub alerts: usize,
+    pub frames: usize,
+}
+
+impl PersonAlerts {
+    /// From a benchmark summary; None when it has no person counts.
+    pub fn of(b: &BenchSummary) -> Option<Self> {
+        Some(Self {
+            alerts: b.person_false_alerts?,
+            frames: b.person_free_frames?,
+        })
+    }
+
+    /// Share of the frames without a person that alerted (None without such frames).
+    pub fn rate(&self) -> Option<f64> {
+        (self.frames > 0).then(|| self.alerts as f64 / self.frames as f64)
+    }
+
+    /// `2/210`.
+    pub fn text(&self) -> String {
+        format!("{}/{}", self.alerts, self.frames)
+    }
+}
+
 /// Which way a column improves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Better {
@@ -145,7 +182,7 @@ pub enum Better {
 
 /// Column ids of [`Comparison::best_per_column`] and the direction each improves in. A new
 /// column is one entry here plus its arm in [`value`].
-pub const COLUMNS: [(&str, Better); 13] = [
+pub const COLUMNS: [(&str, Better); 14] = [
     ("day", Better::Higher),
     ("night", Better::Higher),
     ("ir", Better::Higher),
@@ -159,6 +196,8 @@ pub const COLUMNS: [(&str, Better); 13] = [
     ("vehicle_recall", Better::Higher),
     // The false-alert rate (alerts / empty frames).
     ("false_alerts", Better::Lower),
+    // False person alerts / frames without a person.
+    ("person_false_alerts", Better::Lower),
     // AP50-95 on the held-out random picks (only with `Comparison::random_column`).
     ("random", Better::Higher),
 ];
@@ -285,7 +324,8 @@ fn row_of(r: &CompareRun) -> Row {
         person_recall: r.bench.as_ref().and_then(|b| b.person_recall),
         vehicle_recall: r.bench.as_ref().and_then(|b| b.vehicle_recall),
         false_alerts: r.bench.as_ref().and_then(FalseAlerts::of),
-        random: r.bench.as_ref().and_then(|b| b.random),
+        person_false_alerts: r.bench.as_ref().and_then(PersonAlerts::of),
+        random: r.bench.as_ref().and_then(|b| b.random.clone()),
     }
 }
 
@@ -313,7 +353,8 @@ fn value(r: &Row, c: &str) -> Option<f64> {
         "person_recall" => r.person_recall,
         "vehicle_recall" => r.vehicle_recall,
         "false_alerts" => r.false_alerts.and_then(|f| f.rate()),
-        "random" => r.random.and_then(|s| s.ap50_95),
+        "person_false_alerts" => r.person_false_alerts.and_then(|f| f.rate()),
+        "random" => r.random.as_ref().and_then(|s| s.ap50_95),
         _ => None,
     }
     .filter(|v| v.is_finite())
@@ -448,6 +489,44 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
                 uniq.join(" / ")
             ));
         }
+        // The classes each run's AP averages (only runs that recorded them).
+        let mut bases: Vec<String> = Vec::new();
+        for b in runs
+            .iter()
+            .filter_map(|r| r.bench.as_ref().and_then(|b| b.ap_basis.as_ref()))
+        {
+            let mut names = b.classes.clone();
+            names.sort();
+            let words = names.join(", ");
+            if !bases.contains(&words) {
+                bases.push(words);
+            }
+        }
+        if bases.len() > 1 {
+            c.warnings.push(format!(
+                "the runs' AP averages different classes ({}): a class counts in the average only \
+                 with at least {} held-out objects, so their AP columns are not comparable",
+                bases.join(" / "),
+                crate::benchmark::metrics::MIN_CLASS_GT
+            ));
+        }
+        let mut picked: Vec<String> = Vec::new();
+        for r in runs {
+            let v = r
+                .select_classes
+                .as_ref()
+                .map_or_else(|| "every class".to_string(), |c| c.join(", "));
+            if !picked.contains(&v) {
+                picked.push(v);
+            }
+        }
+        if picked.len() > 1 {
+            c.warnings.push(format!(
+                "the runs picked their best epoch over different classes ({}): a class counts                  only with at least {} validation boxes, so their best epochs were chosen on                  different evidence",
+                picked.join(" / "),
+                crate::benchmark::metrics::MIN_CLASS_GT
+            ));
+        }
         if runs.iter().any(|r| r.select_metric != first.select_metric) {
             let mut names: Vec<&str> = Vec::new();
             for m in runs.iter().map(|r| r.select_metric.short()) {
@@ -470,12 +549,12 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
         .iter()
         .zip(runs)
         .filter(|(_, r)| r.bench.is_some())
-        .map(|(row, _)| row.random)
+        .map(|(row, _)| row.random.clone())
         .collect();
     c.random_column = !picks.is_empty()
         && picks
             .iter()
-            .all(|p| p.is_some_and(|p| p.images >= MIN_RANDOM_HELDOUT));
+            .all(|p| p.as_ref().is_some_and(|p| p.images >= MIN_RANDOM_HELDOUT));
     let mut counts: Vec<usize> = Vec::new();
     for n in picks.iter().flatten().map(|p| p.images) {
         if !counts.contains(&n) {
@@ -552,6 +631,7 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             person_recall: None,
             vehicle_recall: None,
             false_alerts: None,
+            person_false_alerts: None,
             random: None,
         });
     }
@@ -590,6 +670,7 @@ impl Comparison {
             "person R",
             "vehicle R",
             "false alerts",
+            "person FA",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -615,11 +696,15 @@ impl Comparison {
                 || "-".into(),
                 |f| format!("{}{}", f.text(), mark("false_alerts")),
             );
+            let person_alerts = r.person_false_alerts.map_or_else(
+                || "-".into(),
+                |f| format!("{}{}", f.text(), mark("person_false_alerts")),
+            );
             let name = match r.seed {
                 Some(seed) => format!("{} (seed {seed})", r.name),
                 None => r.name.clone(),
             };
-            let random = ap("random", r.random.and_then(|s| s.ap50_95));
+            let random = ap("random", r.random.as_ref().and_then(|s| s.ap50_95));
             table.push(with_random(
                 vec![
                     name,
@@ -635,6 +720,7 @@ impl Comparison {
                     recall("person_recall", r.person_recall),
                     recall("vehicle_recall", r.vehicle_recall),
                     alerts,
+                    person_alerts,
                 ],
                 random,
             ));
@@ -684,6 +770,7 @@ impl Comparison {
                     recall("person_recall"),
                     recall("vehicle_recall"),
                     pct("false_alerts"),
+                    pct("person_false_alerts"),
                 ],
                 ap("random"),
             ));
@@ -703,10 +790,12 @@ impl Comparison {
         match thresholds.as_slice() {
             [] => {}
             [t] => out.push_str(&format!(
-                "; recall and false alerts (empty frames that alert) at {t:.2}"
+                "; recall and false alerts (empty frames that alert; person FA: frames without a \
+                 person that alert for one) at {t:.2}"
             )),
             _ => out.push_str(
-                "; recall and false alerts (empty frames that alert) at each run's threshold",
+                "; recall and false alerts (empty frames that alert; person FA: frames without a \
+                 person that alert for one) at each run's threshold",
             ),
         }
         out.push_str(" (* = best)\n");
@@ -735,6 +824,7 @@ mod tests {
             ap50: Some(v + 0.2),
             ap50_95: Some(v),
             images: 10,
+            ap_basis: None,
         }
     }
 
@@ -762,6 +852,7 @@ mod tests {
             best_epoch: Some(12),
             stopped_epoch: Some(27),
             select_metric: SelectMetric::Map,
+            select_classes: None,
             bench: Some(BenchSummary {
                 ms_p50: Some(ms),
                 by_scene,
@@ -898,7 +989,11 @@ mod tests {
         assert!(t.contains("0.70*"), "{t}");
         assert!(t.contains("0.80*"), "{t}");
         assert!(t.contains("2/130*"), "{t}");
-        assert!(t.contains(" 9/130\n"), "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l.contains(" 9/130 ") && !l.contains("9/130*")),
+            "{t}"
+        );
         // A rate is compared, not the count: 3 of 300 beats 2 of 130.
         let mut more = runs.clone();
         let b = more[0].bench.as_mut().unwrap();
@@ -927,6 +1022,89 @@ mod tests {
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["rows"][0]["false_alerts"]["empty_frames"], 130);
         assert_eq!(v["rows"][0]["person_recall"], 0.39);
+    }
+
+    /// False person alerts on frames without a person: a lower-is-better rate column.
+    #[test]
+    fn person_false_alert_column() {
+        let with = |name: &str, alerts: usize, frames: usize| {
+            let mut r = alerting(
+                run(name, SceneFilter::DAY, 0.5, 0.2, 0.1, 10.0),
+                0.8,
+                0.8,
+                1,
+            );
+            let b = r.bench.as_mut().unwrap();
+            b.person_false_alerts = Some(alerts);
+            b.person_free_frames = Some(frames);
+            r
+        };
+        // 3 of 300 (1%) beats 2 of 100 (2%): the rate, not the count.
+        let c = compare(&[
+            with("a", 2, 100),
+            with("b", 3, 300),
+            run("old", SceneFilter::DAY, 0.1, 0.1, 0.1, 9.0),
+        ]);
+        assert_eq!(c.best_per_column["person_false_alerts"], 1);
+        let pa = c.rows[1].person_false_alerts.unwrap();
+        assert_eq!((pa.text(), pa.rate()), ("3/300".into(), Some(0.01)));
+        assert_eq!(c.rows[2].person_false_alerts, None, "an older run");
+        let t = c.render_text();
+        assert!(t.contains("person FA"), "{t}");
+        assert!(t.contains("3/300*"), "{t}");
+        assert!(t.contains("person FA: frames without a person"), "{t}");
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["rows"][0]["person_false_alerts"]["frames"], 100);
+        // Seed repeats get its mean and range.
+        let mut s0 = with("s0", 2, 100);
+        s0.seed = Some(0);
+        let mut s1 = with("s1", 4, 100);
+        s1.seed = Some(1);
+        let c = compare(&[s0, s1]);
+        let sp = c.seed_summaries[0].columns["person_false_alerts"];
+        assert!((sp.mean - 0.03).abs() < 1e-12 && sp.min == 0.02 && sp.max == 0.04);
+    }
+
+    /// Runs whose AP averages different classes are warned about; unrecorded classes say nothing.
+    #[test]
+    fn runs_averaging_different_classes_warn() {
+        use crate::benchmark::metrics::ApBasis;
+        let based = |name: &str, classes: &[&str]| {
+            let mut r = run(name, SceneFilter::DAY, 0.5, 0.2, 0.1, 10.0);
+            r.bench.as_mut().unwrap().ap_basis = Some(ApBasis {
+                min_gt: 20,
+                classes: classes.iter().map(|c| c.to_string()).collect(),
+                fell_back: false,
+            });
+            r
+        };
+        let c = compare(&[
+            based("a", &["person", "car"]),
+            based("b", &["car", "person", "truck"]),
+        ]);
+        assert_eq!(
+            c.warnings,
+            [
+                "the runs' AP averages different classes (car, person / car, person, truck): a \
+                 class counts in the average only with at least 20 held-out objects, so their AP \
+                 columns are not comparable"
+            ]
+        );
+        // The same classes in another order, or a run of an older version: no warning.
+        assert!(
+            compare(&[
+                based("a", &["person", "car"]),
+                based("b", &["car", "person"])
+            ])
+            .warnings
+            .is_empty()
+        );
+        let old = run("old", SceneFilter::DAY, 0.5, 0.2, 0.1, 10.0);
+        assert!(
+            compare(&[based("a", &["person", "car"]), old])
+                .warnings
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1027,6 +1205,7 @@ mod tests {
             ap50: Some(ap + 0.2),
             ap50_95: Some(ap),
             recall: Some(0.8),
+            ap_basis: None,
         });
         r
     }
@@ -1040,7 +1219,7 @@ mod tests {
         assert!(c.random_column);
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
         assert_eq!(c.best_per_column["random"], 1);
-        assert_eq!(c.rows[0].random.unwrap().images, 60);
+        assert_eq!(c.rows[0].random.as_ref().unwrap().images, 60);
         let t = c.render_text();
         assert!(t.contains("in-scope  random"), "{t}");
         assert!(t.contains("0.420*"), "{t}");
@@ -1063,7 +1242,7 @@ mod tests {
             "{t}"
         );
         assert!(!t.contains("0.420"), "{t}");
-        assert_eq!(c.rows[1].random.unwrap().images, 49);
+        assert_eq!(c.rows[1].random.as_ref().unwrap().images, 49);
         assert_eq!(c.warnings.len(), 1, "60 / 49 differ: {:?}", c.warnings);
         // A run without any (an older version, or no random pick held out): hidden.
         let c = compare(&[picked(a(), 60, 0.31), b()]);
@@ -1113,6 +1292,28 @@ mod tests {
         // A run without random picks is no count.
         let plain = run("day-c", SceneFilter::DAY, 0.5, 0.2, 0.1, 10.0);
         assert!(compare(&[a, plain]).warnings.is_empty());
+    }
+
+    #[test]
+    fn runs_picking_over_different_classes_warn() {
+        let a = run("a", SceneFilter::DAY, 0.5, 0.5, 0.5, 10.0);
+        let mut b = run("b", SceneFilter::DAY, 0.5, 0.5, 0.5, 10.0);
+        let same = compare(&[a.clone(), b.clone()]);
+        assert!(
+            !same
+                .warnings
+                .iter()
+                .any(|w| w.contains("over different classes"))
+        );
+        b.select_classes = Some(vec!["car".into(), "person".into()]);
+        let c = compare(&[a, b]);
+        let w = c
+            .warnings
+            .iter()
+            .find(|w| w.contains("over different classes"))
+            .expect("a warning");
+        assert!(w.contains("every class / car, person"), "{w}");
+        assert!(w.contains("20 validation boxes"), "{w}");
     }
 
     #[test]

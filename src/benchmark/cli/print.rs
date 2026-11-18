@@ -680,6 +680,16 @@ pub(super) fn print_device_table(result: &ModelResult, m: &ModelReport) {
         }
         println!("{}", device_row(r, &marks));
     }
+    if let Some(note) = runs.iter().find_map(|r| ap_footnote(r)) {
+        println!("  {note}");
+    }
+}
+
+/// `AP50 / AP50-95: average over car, person (>= 20 objects each)`, or None without a recorded
+/// basis (results of older versions, no accuracy).
+pub(super) fn ap_footnote(r: &RunResult) -> Option<String> {
+    let b = r.accuracy.as_ref()?.overall.ap_basis.as_ref()?;
+    Some(format!("AP50 / AP50-95: average {}", b.describe()))
 }
 
 /// One row of [`print_device_table`] with its `marks` ("fastest", "recommended", ...).
@@ -839,6 +849,9 @@ pub(super) fn print_run(r: &RunResult) {
             pct(a.overall.recall),
             pct(a.overall.f1)
         );
+        if let Some(note) = ap_footnote(r) {
+            println!("  {note}");
+        }
     }
     if let Some(g) = &r.grades {
         println!(

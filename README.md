@@ -361,7 +361,7 @@ it; every key can also be set in the file.
 | `training.lr` | unset | Learning rate of every run (above 0, below 1); unset = the family's default (YOLO: the optimizer picks; RF-DETR 1e-4, 5e-5 under 1000 unique training frames; RT-DETRv2 / D-FINE 1e-4). The Train form's value wins. Applies: at once. UI: Train tab |
 | `training.lr_schedule` | unset | `cosine`, `linear` or `step`; unset = the family's default (YOLO linear, RF-DETR cosine, RT-DETRv2 / D-FINE cosine). YOLO takes linear / cosine, RF-DETR cosine / step, RT-DETRv2 / D-FINE cosine / linear; another family trains with its default. Applies: at once. UI: Train tab, Advanced |
 | `training.lr_min_factor` | unset | Final learning rate as a share of the starting one (0-1); unset = the family's default (YOLO 0.01, RF-DETR 0.1, also its anneal's; RT-DETRv2 / D-FINE 0). Applies: at once. UI: Train tab, Advanced |
-| `training.select_metric` | unset | What a run optimizes: it picks the exported epoch and drives the convergence rule. `map` (unset), `map50`, `f1`, `f2` (catch more), `f0_5` (fewer false alarms) or `iou` (box tightness only, ignores missed objects). F values are macro averages over the classes at their best threshold, not person or vehicle specific. With a small validation split anything but mAP is noisy; the held-out benchmark stays the number to trust. The Train form's value wins. Applies: at once. UI: Train tab, Advanced |
+| `training.select_metric` | unset | What a run optimizes: it picks the exported epoch and drives the convergence rule. `map` (unset), `map50`, `f1`, `f2` (catch more), `f0_5` (fewer false alarms) or `iou` (box tightness only, ignores missed objects). All but `iou` are averaged over the classes with at least 20 validation boxes (every class when none has; rarer classes are shown per class, not averaged); F values at their best threshold, not person or vehicle specific. With a small validation split any choice is noisy; the held-out benchmark stays the number to trust. The Train form's value wins. Applies: at once. UI: Train tab, Advanced |
 | `training.negative_share` | `0.15` | Share of frames without objects (hard negatives) kept in the training split; extra empty frames are dropped, too few give a warning (0-0.9). Applies: at once. UI: config file |
 | `training.heldout_share` | `0.2` | Share of the review frames held out by whole camera days for the benchmark when the export holds nothing out; a single camera day is held out frame by frame (0-0.9; 0 = none). Applies: at once. UI: config file |
 | `training.oversample` | `3` | How often each of your own frames repeats in the training split when the public night subset is mixed in (1-10). Applies: at once. UI: config file |
@@ -674,7 +674,18 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   threshold, recall by object size, by dataset and by tag (day/night, complexity, resolution, crowd,
   small objects). Scored classes: person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse
   as far as the model has them (IPcam `vehicle` = car/truck/bus); AP over all of a COCO model's classes
-  is reported too.
+  is reported too. AP50 and AP50-95 are the average over the classes with at least 20 labelled objects
+  in the scored images (`MIN_CLASS_GT`; every class with objects when none has 20, said so); rarer
+  classes keep their own AP in *By class*, marked "too few to judge", and stay out of the headline
+  (a set of 950 cars, 180 persons and 2 cats would otherwise let the 2 cats decide a third of it). The
+  page, the CLI and the report name the averaged classes; results of older versions keep the mean
+  over every class they were saved with. The frame ROC AUC's class average follows the same rule
+  (20 frames with the class).
+- **False alerts**: on empty frames (no object of any scored class), and per class on the frames
+  without that class (*False alerts by class*; a frame whose only box of the class is an unsure region
+  is left out). A camera that always sees a parked car has no empty frame, so its false person alerts
+  show only in the person row: frames without a person that still got a person detection at the
+  threshold. The run history compares that rate between runs (lower is better).
 - **Frame-level ROC AUC** (what Blue Iris decides: alert on this frame or not). Box-level ROC is
   undefined for detection, so each frame is one sample per scored class: positive when it has a
   non-ignored object of the class, negative when it has none (frames whose only objects of the class
@@ -685,8 +696,9 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   configured and best thresholds. It uses the 0.05+ predictions: lower scores count as 0, which can
   only understate the AUC slightly.
 - **Grades**: speed from the full-request p50 (A < 50 ms, B < 100, C < 200, D < 400, else F); accuracy
-  by `benchmark.accuracy_metric` / `--accuracy-metric`: `ap50` (default; AP@0.5 blended 20% with
-  small-object recall, A >= 0.70, B >= 0.60, C >= 0.50, D >= 0.40) or `roc_auc` (macro frame ROC AUC,
+  by `benchmark.accuracy_metric` / `--accuracy-metric`: `ap50` (default; AP@0.5 over the classes with
+  20 or more objects, see Accuracy, blended 20% with small-object recall, A >= 0.70, B >= 0.60,
+  C >= 0.50, D >= 0.40) or `roc_auc` (macro frame ROC AUC,
   A >= 0.95, B >= 0.90, C >= 0.80, D >= 0.70; 0.5 is chance); overall = weighted grade points
   (`benchmark.weights`, default 60% accuracy / 40% speed). The metric also drives the ranking and the
   device recommendation's accuracy tie (0.015 AP50, 0.01 AUC); results kept from earlier runs are

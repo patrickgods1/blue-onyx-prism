@@ -5,9 +5,13 @@
 //! [`convergence_run`] mirrors the script's `Convergence`, with its smoothing window and the
 //! extensions while the training loss still falls ([`loss_falling`], [`ConvergePoint`]; the page's
 //! Stop now / Continue notice is [`TrainProgress::extension`]) and the anneal before the stop
-//! ([`Anneal`]: a lowered learning rate for a few epochs, then the stop). Raw metric keys of the trainers (rfdetr,
-//! Ultralytics, transformers) map to stable ids ([`canonical`], described by [`METRICS`]);
-//! unknown keys are kept under their raw name. Pure.
+//! ([`Anneal`]: a lowered learning rate for a few epochs, then the stop). The rule and the best epoch
+//! follow [`TrainProgress::rule_key`]: the selected metric averaged over the classes with at least
+//! `MIN_CLASS_GT` validation boxes (`<id>_sup`, the script's [`Support`] event), the trainer's own
+//! all-class value when no class has that many, mAP over all classes after a [`SelectFallback`].
+//! Raw metric keys of the trainers (rfdetr, Ultralytics, transformers) map to stable ids
+//! ([`canonical`], described by [`METRICS`]); unknown keys (`class/<name>/ap50`) are kept under
+//! their raw name. Pure.
 
 use super::recipe::SelectMetric;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -116,6 +120,8 @@ pub enum TrainEvent {
     Anneal(Anneal),
     /// The selected metric's source failed: the run goes on by mAP.
     SelectFallback(SelectFallback),
+    /// The first validation decided which classes the run's class averages are taken over.
+    Support(Support),
     Done {
         onnx: String,
         yaml: String,
@@ -141,8 +147,9 @@ pub fn parse_line(line: &str) -> Option<TrainEvent> {
 
 /// Longest metric key kept.
 pub const MAX_METRIC_KEY: usize = 64;
-/// Most metrics kept per epoch (known ids first, then raw keys in order).
-pub const MAX_METRICS_PER_EPOCH: usize = 64;
+/// Most metrics kept per epoch (known ids first, then raw keys in order); the script's
+/// `MAX_METRICS` (parity-tested).
+pub const MAX_METRICS_PER_EPOCH: usize = 96;
 /// Most epochs kept in [`TrainProgress::history`] (the oldest go first).
 pub const MAX_HISTORY: usize = super::config::MAX_EPOCHS as usize;
 
@@ -282,6 +289,106 @@ pub const METRICS: &[MetricInfo] = {
             UP,
             Fixed3,
         ),
+        // The averages over the classes with at least `MIN_CLASS_GT` (20) validation boxes (the
+        // script's `class_metrics`; a test checks the 20).
+        m(
+            "map_sup",
+            "mAP 50-95 (classes with \u{2265}20 validation boxes)",
+            "mAP (\u{2265}20)",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "map50_sup",
+            "mAP 50 (classes with \u{2265}20 validation boxes)",
+            "mAP50 (\u{2265}20)",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f1_sup",
+            "F1 (classes with \u{2265}20 validation boxes)",
+            "F1 (\u{2265}20)",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f1_sup_thr",
+            "Best F1 (\u{2265}20) confidence threshold",
+            "F1 (\u{2265}20) thr",
+            None,
+            Fixed3,
+        ),
+        m(
+            "f1_sup_precision",
+            "Precision at the best F1 (\u{2265}20) threshold",
+            "F1 (\u{2265}20) P",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f1_sup_recall",
+            "Recall at the best F1 (\u{2265}20) threshold",
+            "F1 (\u{2265}20) R",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f2_sup",
+            "F2 (classes with \u{2265}20 validation boxes)",
+            "F2 (\u{2265}20)",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f2_sup_thr",
+            "Best F2 (\u{2265}20) confidence threshold",
+            "F2 (\u{2265}20) thr",
+            None,
+            Fixed3,
+        ),
+        m(
+            "f2_sup_precision",
+            "Precision at the best F2 (\u{2265}20) threshold",
+            "F2 (\u{2265}20) P",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f2_sup_recall",
+            "Recall at the best F2 (\u{2265}20) threshold",
+            "F2 (\u{2265}20) R",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f0_5_sup",
+            "F0.5 (classes with \u{2265}20 validation boxes)",
+            "F0.5 (\u{2265}20)",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f0_5_sup_thr",
+            "Best F0.5 (\u{2265}20) confidence threshold",
+            "F0.5 (\u{2265}20) thr",
+            None,
+            Fixed3,
+        ),
+        m(
+            "f0_5_sup_precision",
+            "Precision at the best F0.5 (\u{2265}20) threshold",
+            "F0.5 (\u{2265}20) P",
+            UP,
+            Fixed3,
+        ),
+        m(
+            "f0_5_sup_recall",
+            "Recall at the best F0.5 (\u{2265}20) threshold",
+            "F0.5 (\u{2265}20) R",
+            UP,
+            Fixed3,
+        ),
         m("loss", "Training loss", "Loss", DOWN, Fixed3),
         m("val_loss", "Validation loss", "Val loss", DOWN, Fixed3),
         m("lr", "Learning rate", "LR", None, Sci),
@@ -396,6 +503,8 @@ fn best_label(id: &str) -> &str {
     match id {
         "map" => "mAP50-95",
         "map50" => "mAP50",
+        "map_sup" => "mAP50-95 (\u{2265}20)",
+        "map50_sup" => "mAP50 (\u{2265}20)",
         "val_loss" => "val loss",
         other => metric(other).map_or(other, |m| m.short),
     }
@@ -406,13 +515,21 @@ const PRIMARY: [(&str, bool); 3] = [("map", true), ("map50", true), ("val_loss",
 
 /// The best epoch of `history` on `select` (see [`Best`]); the earliest epoch wins a tie.
 pub fn best_of(history: &[EpochPoint], select: SelectMetric) -> Option<Best> {
-    if !select.is_default() {
+    best_by(history, select.id())
+}
+
+/// [`best_of`] by a rule key ([`TrainProgress::rule_key`]: a [`SelectMetric`] id or its
+/// supported-class twin `<id>_sup`): `map` is the primary metric's, anything else the highest
+/// [`rule_values_by`] value (named by the id it read: `map50_sup` for a `map_sup` no epoch has).
+pub fn best_by(history: &[EpochPoint], key: &str) -> Option<Best> {
+    if key != SelectMetric::Map.id() {
+        let id = rule_id(history, key);
         let mut best: Option<Best> = None;
-        for (epoch, v) in rule_values(history, select) {
+        for (epoch, v) in rule_values_by(history, key) {
             let Some(v) = v else { continue };
             if best.as_ref().is_none_or(|b| v > b.value) {
                 best = Some(Best {
-                    metric: select.id().to_string(),
+                    metric: id.to_string(),
                     epoch,
                     value: v,
                 });
@@ -447,13 +564,29 @@ pub fn best_of(history: &[EpochPoint], select: SelectMetric) -> Option<Best> {
 /// script's `pick_metric`: `map` (`map50` when no epoch has it), `map50`, or the macro F / mean
 /// IoU, which a validated epoch without one (nothing matched) counts as 0.
 pub fn rule_values(history: &[EpochPoint], select: SelectMetric) -> Vec<(u32, Option<f64>)> {
-    let map = select == SelectMetric::Map;
-    let id = if map && !history.iter().any(|p| p.metrics.contains_key("map")) {
+    rule_values_by(history, select.id())
+}
+
+/// The id [`rule_values_by`] reads for `key`: `map` (`map_sup`) is `map50` (`map50_sup`) when no
+/// epoch of `history` has it.
+fn rule_id<'a>(history: &[EpochPoint], key: &'a str) -> &'a str {
+    let base = key.strip_suffix("_sup").unwrap_or(key);
+    if base != "map" || history.iter().any(|p| p.metrics.contains_key(key)) {
+        key
+    } else if base == key {
         "map50"
     } else {
-        select.id()
-    };
-    let zero = !matches!(select, SelectMetric::Map | SelectMetric::Map50);
+        "map50_sup"
+    }
+}
+
+/// [`rule_values`] by a rule key ([`TrainProgress::rule_key`]), the script's `pick_metric`: a
+/// supported-class twin follows its metric's rules (`map_sup` falls to `map50_sup`, a missing
+/// `f2_sup` at a validated epoch is 0).
+pub fn rule_values_by(history: &[EpochPoint], key: &str) -> Vec<(u32, Option<f64>)> {
+    let id = rule_id(history, key);
+    let base = key.strip_suffix("_sup").unwrap_or(key);
+    let zero = !matches!(base, "map" | "map50");
     history
         .iter()
         .map(|p| {
@@ -514,6 +647,37 @@ pub struct SelectFallback {
     pub metric: String,
     pub epoch: u32,
     pub reason: String,
+}
+
+/// The script's `support` event, at the first validation: the run's class averages (the
+/// selected metric, the best epoch, the convergence rule) are taken over `classes`, those with at
+/// least `min_boxes` validation boxes (`crate::benchmark::metrics::supported`); `fell_back` = no
+/// class had that many, so every class with boxes (`reason` says why). `key` is the metric id the
+/// run selects by ([`TrainProgress::rule_key`]): `<id>_sup` while supported, else the id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Support {
+    pub min_boxes: usize,
+    /// Validation boxes per class.
+    pub boxes: BTreeMap<String, usize>,
+    pub classes: Vec<String>,
+    pub fell_back: bool,
+    pub key: String,
+    pub reason: Option<String>,
+}
+
+/// The classes a run's best epoch was picked over: its `support` event's classes when it
+/// selected on them; None = every class (no class had enough validation boxes, the selection
+/// fell back, or a run from before the rule).
+pub fn selected_classes(p: Option<&TrainProgress>) -> Option<Vec<String>> {
+    let p = p?;
+    if p.select_fallback.is_some() {
+        return None;
+    }
+    p.support
+        .as_ref()
+        .filter(|s| !s.fell_back && !s.classes.is_empty())
+        .map(|s| s.classes.clone())
 }
 
 /// Extensions past a stop point while the training loss still falls (the script's
@@ -849,6 +1013,10 @@ pub struct TrainProgress {
     /// The selected metric's source failed: the run went on by mAP.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub select_fallback: Option<SelectFallback>,
+    /// The classes the run's class averages are taken over (the script's `support` event; None
+    /// before the first validation and in records from before it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support: Option<Support>,
     /// Changes with every change of [`Self::history`] (never saved, equal in every comparison):
     /// the history file's writer skips a report whose history it has seen.
     #[serde(skip)]
@@ -919,6 +1087,7 @@ impl TrainProgress {
             imgsz,
             settings,
             select_fallback,
+            support,
             history_rev: _,
         } = self;
         Self {
@@ -952,6 +1121,7 @@ impl TrainProgress {
             imgsz: *imgsz,
             settings: settings.clone(),
             select_fallback: select_fallback.clone(),
+            support: support.clone(),
             history_rev: HistoryRev::default(),
         }
     }
@@ -963,7 +1133,7 @@ impl TrainProgress {
         if self.history.is_empty() {
             return;
         }
-        self.best = best_of(self.rule_history(), self.select_metric());
+        self.best = best_by(self.rule_history(), self.rule_key());
         self.since_best = self.since_improvement();
     }
 
@@ -1063,7 +1233,12 @@ impl TrainProgress {
             TrainEvent::Anneal(a) => self.anneal = Some(a.clone()),
             TrainEvent::SelectFallback(f) => {
                 self.select_fallback = Some(f.clone());
-                self.best = best_of(self.rule_history(), self.select_metric());
+                self.best = best_by(self.rule_history(), self.rule_key());
+                self.since_best = self.since_improvement();
+            }
+            TrainEvent::Support(s) => {
+                self.support = Some(s.clone());
+                self.best = best_by(self.rule_history(), self.rule_key());
                 self.since_best = self.since_improvement();
             }
             TrainEvent::SelfCheck { .. } | TrainEvent::Done { .. } => {}
@@ -1153,7 +1328,7 @@ impl TrainProgress {
         while self.history.len() > MAX_HISTORY {
             self.history.remove(0);
         }
-        self.best = best_of(self.rule_history(), self.select_metric());
+        self.best = best_by(self.rule_history(), self.rule_key());
         self.since_best = self.since_improvement();
     }
 
@@ -1163,6 +1338,27 @@ impl TrainProgress {
         match &self.settings {
             Some(s) if self.select_fallback.is_none() => s.select_metric,
             _ => SelectMetric::Map,
+        }
+    }
+
+    /// The metric id the best epoch and the rule follow, as the script's `Selection.key`: after a
+    /// [`SelectFallback`] `map` (mAP over all classes, else mAP 50); while [`Self::support`] found
+    /// classes with enough validation boxes its `key` (`f2_sup`: the average over them; `iou` has
+    /// no such twin); else the selected metric's id (its all-class value).
+    pub fn rule_key(&self) -> &str {
+        let id = self.select_metric().id();
+        if self.select_fallback.is_some() {
+            return id;
+        }
+        match &self.support {
+            Some(s)
+                if !s.fell_back
+                    && s.key.strip_suffix("_sup") == Some(id)
+                    && metric(&s.key).is_some() =>
+            {
+                &s.key
+            }
+            _ => id,
         }
     }
 
@@ -1177,7 +1373,7 @@ impl TrainProgress {
     /// The rule's state over the history ([`rule_values`] of the selected metric).
     fn rule_state(&self) -> Tracker {
         let mut t = Tracker::new(self.min_delta, self.smooth);
-        for (epoch, v) in rule_values(self.rule_history(), self.select_metric()) {
+        for (epoch, v) in rule_values_by(self.rule_history(), self.rule_key()) {
             t.update(epoch, v);
         }
         t
@@ -1202,7 +1398,8 @@ impl TrainProgress {
             return None;
         }
         let t = self.rule_state();
-        let label = self.select_metric().short();
+        let key = self.rule_key();
+        let label = metric(key).map_or(key, |m| m.short);
         let kept = |epoch: u32, value: Option<f64>| {
             let (keep, best) = match t.top {
                 Some(v) if t.top_epoch > 0 => (t.top_epoch, Some(v)),
@@ -3514,5 +3711,781 @@ print("RESULT: " + json.dumps(out))
         );
         assert!(f2.contains("best epoch 1 (F2 0.5)"), "{f2}");
         assert_eq!(v["args"], json!(["map", "f0_5", "error"]));
+    }
+
+    /// Run `code` on the training script (stdin: the script, `#CASES#`, `data`) and read the JSON
+    /// after its `RESULT: ` line; None without Python (or numpy, `numpy`).
+    fn script_result(
+        test: &str,
+        numpy: bool,
+        code: &str,
+        data: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let python = if numpy {
+            test_python::python3_with_numpy(test)?
+        } else {
+            test_python::python3(test)?
+        };
+        let script = include_str!("../../scripts/train_model.py");
+        let input = format!("{script}\n#CASES#\n{data}");
+        let out = test_python::run(python, &["-I", "-c", code], &input);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RESULT: "))
+            .unwrap_or_else(|| panic!("no result in {stdout}"));
+        Some(serde_json::from_str(line).unwrap())
+    }
+
+    /// The script's `supported_rows` and `ap_from_matches` decide exactly as the benchmark's
+    /// `metrics::supported` and `metrics::average_precision` (a tie, no detection, no ground
+    /// truth, only false alarms, a long list with ties), and its constants are the service's
+    /// (skipped without Python 3).
+    #[test]
+    fn supported_classes_and_ap_match_the_benchmark() {
+        use crate::benchmark::metrics::{self, MAX_DETS, MIN_CLASS_GT};
+        let counts: Vec<Vec<usize>> = vec![
+            vec![0, 19, 20, 21],
+            vec![19, 1, 0],
+            vec![],
+            vec![0, 0],
+            vec![20],
+            vec![5, 25, 0, 40],
+            vec![428, 34, 7, 1, 1, 1],
+        ];
+        let mins = [MIN_CLASS_GT, 0, 1, 21];
+        type ApCase = (Vec<f32>, Vec<bool>, usize);
+        let mut lists: Vec<ApCase> = vec![
+            // A tie, the false alarm listed first, then second.
+            (vec![0.9, 0.9, 0.8], vec![true, false, true], 2),
+            (vec![0.9, 0.9, 0.8], vec![false, true, true], 2),
+            // No detection; no ground truth (None); only false alarms; all tied.
+            (vec![], vec![], 3),
+            (vec![0.5], vec![true], 0),
+            (vec![0.3, 0.2], vec![false, false], 4),
+            (vec![0.7; 4], vec![true, true, false, true], 3),
+            // Unsorted input.
+            (vec![0.1, 0.8, 0.4, 0.95], vec![true, false, true, true], 5),
+        ];
+        // A long list from a fixed generator, scores k/64 (exact in f32, many ties).
+        let mut x: u64 = 0x9E37_79B9;
+        let (mut s, mut t) = (Vec::new(), Vec::new());
+        for _ in 0..300 {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            s.push(((x >> 33) % 64) as f32 / 64.0);
+            t.push(!(x >> 20).is_multiple_of(3));
+        }
+        let npos = t.iter().filter(|b| **b).count() + 17;
+        lists.push((s, t, npos));
+        let ap_json: Vec<serde_json::Value> = lists
+            .iter()
+            .map(|(s, t, n)| {
+                let s: Vec<f64> = s.iter().map(|&v| f64::from(v)).collect();
+                let t: Vec<u8> = t.iter().map(|&b| u8::from(b)).collect();
+                serde_json::json!([s, t, n])
+            })
+            .collect();
+        let data = serde_json::json!({"counts": counts, "mins": mins, "ap": ap_json});
+        let code = r#"
+import json, struct, sys
+src, data = sys.stdin.read().split("\n#CASES#\n")
+d = json.loads(data)
+ns = {"__name__": "train_model"}
+exec(compile(src, "train_model.py", "exec"), ns)
+def bits(v):
+    return None if v is None else struct.unpack("<Q", struct.pack("<d", v))[0]
+out = {"min": ns["MIN_CLASS_BOXES"], "max_dets": ns["MAX_DETS"], "max_metrics": ns["MAX_METRICS"],
+       "default": ns["supported_rows"]([3, 25]),
+       "rows": [[ns["supported_rows"](c, m) for m in d["mins"]] for c in d["counts"]],
+       "ap": [bits(ns["ap_from_matches"](s, t, n)) for s, t, n in d["ap"]]}
+print("RESULT: " + json.dumps(out))
+"#;
+        let Some(v) = script_result("supported classes and AP", false, code, &data) else {
+            return;
+        };
+        assert_eq!(v["min"], MIN_CLASS_GT);
+        assert_eq!(v["max_dets"], MAX_DETS);
+        assert_eq!(v["max_metrics"], MAX_METRICS_PER_EPOCH);
+        // The default floor is MIN_CLASS_GT.
+        assert_eq!(v["default"], serde_json::json!([[1], false]));
+        for (i, c) in counts.iter().enumerate() {
+            for (j, &min) in mins.iter().enumerate() {
+                let (rows, fell) = metrics::supported(c, min);
+                assert_eq!(
+                    v["rows"][i][j],
+                    serde_json::json!([rows, fell]),
+                    "{c:?} min {min}"
+                );
+            }
+        }
+        for (i, (s, t, n)) in lists.iter().enumerate() {
+            let mut scored: Vec<(f32, bool)> = s.iter().copied().zip(t.iter().copied()).collect();
+            let want = metrics::average_precision(&mut scored, *n);
+            // Exactly, as IEEE bits (JSON text need not parse back to the same double): the
+            // same sums in the same order.
+            let got = v["ap"][i].as_u64();
+            assert_eq!(got, want.map(f64::to_bits), "list {i}");
+        }
+        let ap = |i: usize| v["ap"][i].as_u64().map(f64::from_bits);
+        assert!((ap(0).unwrap() - (51.0 + 50.0 * 2.0 / 3.0) / 101.0).abs() < 1e-12);
+        assert_eq!(ap(2), Some(0.0));
+        assert!(v["ap"][3].is_null());
+        assert_eq!(ap(4), Some(0.0));
+        assert_eq!(ap(5), Some(92.5 / 101.0));
+    }
+
+    /// The script's `class_metrics` over a hand-built validation through `ClassMeter` and
+    /// `selection_metrics` (car 25 boxes all found, person 20 boxes half found, cat 2 boxes):
+    /// the averages over car and person only, AP50 per class equal to the benchmark's
+    /// `average_precision` of the same matches, the per-class keys, the `support` event, the
+    /// trainers' per-class AP 50-95 readers (Ultralytics, rfdetr, torchmetrics stand-ins), the
+    /// detection cap, a split where no class qualifies and a failed meter (skipped without
+    /// Python 3 or numpy).
+    #[test]
+    fn class_metrics_follow_the_supported_classes() {
+        use crate::benchmark::metrics;
+        let code = r#"
+import io, json, struct, sys
+from contextlib import redirect_stdout
+import numpy as np
+src, data = sys.stdin.read().split("\n#CASES#\n")
+ns = {"__name__": "train_model"}
+exec(compile(src, "train_model.py", "exec"), ns)
+
+def B(rows):
+    return np.array(rows, dtype=np.float64).reshape(-1, 4)
+
+def L(rows):
+    return np.array(rows, dtype=np.int64)
+
+def S(rows):
+    return np.array(rows, dtype=np.float64)
+
+preds, gts = [], []
+# car: 25 boxes, each found (0.9), plus one false alarm (0.95) beside the first.
+for i in range(25):
+    extra = i == 0
+    preds.append((B([[0, 0, 10, 10]] + ([[50, 50, 60, 60]] if extra else [])), L([0] + ([0] if extra else [])),
+                  S([0.9] + ([0.95] if extra else []))))
+    gts.append((B([[0, 0, 10, 10]]), L([0])))
+# person: 20 boxes, the first 10 found (0.8).
+for i in range(20):
+    found = i < 10
+    preds.append((B([[0, 0, 10, 10]] if found else []), L([1] if found else []), S([0.8] if found else [])))
+    gts.append((B([[0, 0, 10, 10]]), L([1])))
+# cat: 2 boxes in one image, one found (0.7).
+preds.append((B([[0, 0, 10, 10]]), L([2]), S([0.7])))
+gts.append((B([[0, 0, 10, 10], [20, 20, 30, 30]]), L([2, 2])))
+names = ["car", "person", "cat"]
+
+class T:
+    def __init__(self, a):
+        self.a = np.array(a)
+    def reshape(self, *s):
+        return T(self.a.reshape(*s))
+    def tolist(self):
+        return self.a.tolist()
+
+class Box:
+    all_ap = [[0.5] * 10, [0.3] * 10, [0.9] * 10]
+    ap_class_index = [0, 1, 2]
+
+class Metrics:
+    box = Box()
+
+class Validator:
+    metrics = Metrics()
+
+readers = {
+    "ultralytics": ns["ultralytics_ap95"](Validator()),
+    "ultralytics_none": ns["ultralytics_ap95"](object()),
+    "rfdetr": ns["rfdetr_ap95"]({"val/AP/car": 0.5, "val/ema_AP/person": 0.3, "val/AP/cat": -1.0}, names),
+    "torchmetrics": ns["torchmetrics_ap95"]({"classes": T([0, 1, 2]), "map_per_class": T([0.5, 0.3, -1.0])}),
+    "torchmetrics_one": ns["torchmetrics_ap95"]({"classes": T(1), "map_per_class": T(0.25)}),
+}
+
+def run(metric, preds, gts, counts_only=False, broken=False):
+    meter = ns["ClassMeter"]()
+    if broken:
+        def bad():
+            raise KeyError("labels")
+        meter.add(bad)
+    else:
+        meter.add(lambda: (preds, gts))
+    matches = {str(c): [list(map(float, s)), list(map(int, m)), int(n)] for c, (s, m, n) in meter.matches().items()}
+    sel = ns["Selection"](metric)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        m = ns["selection_metrics"](sel, meter, names, readers["ultralytics"])
+        again = ns["selection_metrics"](sel, meter, names, readers["ultralytics"])
+    bits = {k: struct.unpack("<Q", struct.pack("<d", x))[0] for k, x in m.items()
+            if k.endswith("ap50") or k == "map50_sup"}
+    return {"m": m, "bits": bits, "same_again": m == again, "matches": matches, "log": buf.getvalue(),
+            "key": sel.key, "label": sel.label, "rows": sel.rows}
+
+out = {"readers": readers, "f2": run("f2", preds, gts), "map": run("map", preds, gts), "iou": run("iou", preds, gts)}
+# No class with 20 boxes: no car, 19 persons, the cat.
+out["few"] = run("f2", preds[26:], gts[26:])
+out["broken"] = run("f2", preds, gts, broken=True)
+empty = ns["ClassMeter"]()
+sel = ns["Selection"]("f2")
+out["empty"] = [ns["selection_metrics"](sel, empty, names), sel.support]
+# The cap: 150 car boxes and 3 person boxes in one image keep the 100 best cars and every person.
+pb = B([[0, 0, 10, 10]] * 153)
+pl = L([0] * 150 + [1] * 3)
+ps = S([i / 1000 for i in range(150)] + [0.5, 0.4, 0.3])
+(cb, cl, cs), = ns["cap_detections"]([(pb, pl, ps)], 100)
+out["cap"] = [int((cl == 0).sum()), int((cl == 1).sum()), float(cs[cl == 0].min())]
+print("RESULT: " + json.dumps(out))
+"#;
+        let Some(v) = script_result("class metrics", true, code, &serde_json::Value::Null) else {
+            return;
+        };
+        use serde_json::json;
+        let close = |got: &serde_json::Value, want: f64, what: &str| {
+            let got = got
+                .as_f64()
+                .unwrap_or_else(|| panic!("{what}: {got} is no number"));
+            assert!((got - want).abs() < 1e-9, "{what}: {got} != {want}");
+        };
+        // The trainers' per-class AP 50-95, by class index; no ground truth (-1) is left out.
+        let reader = |name: &str, want: &[(&str, f64)]| {
+            let got = v["readers"][name].as_object().unwrap();
+            assert_eq!(got.len(), want.len(), "{name}: {got:?}");
+            for (k, x) in want {
+                close(&got[*k], *x, name);
+            }
+        };
+        reader("ultralytics", &[("0", 0.5), ("1", 0.3), ("2", 0.9)]);
+        reader("ultralytics_none", &[]);
+        reader("rfdetr", &[("0", 0.5), ("1", 0.3)]);
+        reader("torchmetrics", &[("0", 0.5), ("1", 0.3)]);
+        reader("torchmetrics_one", &[("1", 0.25)]);
+
+        let f2 = &v["f2"];
+        let m = &f2["m"];
+        assert_eq!(f2["key"], "f2_sup");
+        assert_eq!(f2["label"], "F2 (>=20)");
+        assert_eq!(f2["rows"], json!([0, 1]));
+        assert_eq!(f2["same_again"], true);
+        // AP50 per class: the benchmark's AP of the very same matches, bit for bit; the mean
+        // over car and person only.
+        let mut aps = Vec::new();
+        for (c, name) in ["car", "person", "cat"].iter().enumerate() {
+            let row = &f2["matches"][c.to_string()];
+            let mut scored: Vec<(f32, bool)> = row[0]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(row[1].as_array().unwrap())
+                .map(|(s, t)| (s.as_f64().unwrap() as f32, t.as_u64() == Some(1)))
+                .collect();
+            let want =
+                metrics::average_precision(&mut scored, row[2].as_u64().unwrap() as usize).unwrap();
+            assert_eq!(
+                f2["bits"][format!("class/{name}/ap50")].as_u64(),
+                Some(want.to_bits()),
+                "{name}"
+            );
+            aps.push(want);
+        }
+        assert_eq!(
+            f2["bits"]["map50_sup"].as_u64(),
+            Some(mean(&aps[..2]).to_bits())
+        );
+        // Hand values: person found 10 of 20 at precision 1 (51 of 101 recall points); car's one
+        // false alarm outranks every hit.
+        close(&m["class/person/ap50"], 51.0 / 101.0, "person AP50");
+        close(&m["class/cat/ap50"], 51.0 / 101.0, "cat AP50");
+        close(&m["class/car/ap50"], 25.0 / 26.0, "car AP50");
+        // AP 50-95: the trainer's, over car and person.
+        close(&m["map_sup"], 0.4, "map_sup");
+        close(&m["class/cat/ap"], 0.9, "cat AP");
+        // F2 over car (P 25/26, R 1) and person (P 1, R 0.5): the same up to 0.8, so the lowest
+        // threshold; the cat (P 1, R 0.5) does not count.
+        assert_eq!(m["f2_sup_thr"], 0.0);
+        close(&m["f2_sup"], (125.0 / 126.0 + 5.0 / 9.0) / 2.0, "f2_sup");
+        close(&m["f2_sup_recall"], 0.75, "f2_sup_recall");
+        close(
+            &m["f2_sup_precision"],
+            (25.0 / 26.0 + 1.0) / 2.0,
+            "f2_sup_precision",
+        );
+        // Recall per class at that threshold, the cat's too (shown, never averaged).
+        close(&m["class/car/recall"], 1.0, "car recall");
+        close(&m["class/person/recall"], 0.5, "person recall");
+        close(&m["class/cat/recall"], 0.5, "cat recall");
+        for k in [
+            "f1_sup",
+            "f1_sup_thr",
+            "f1_sup_precision",
+            "f1_sup_recall",
+            "f0_5_sup",
+            "f0_5_sup_thr",
+            "f0_5_sup_precision",
+            "f0_5_sup_recall",
+        ] {
+            assert!(m.get(k).is_some(), "{k}: {m}");
+            assert!(metric(k).is_some(), "{k} has a METRICS entry");
+        }
+        for k in m.as_object().unwrap().keys() {
+            assert!(
+                metric(k).is_some() || (k.starts_with("class/") && k.matches('/').count() == 2),
+                "{k}"
+            );
+        }
+        // The support event, logged once.
+        let log = f2["log"].as_str().unwrap();
+        assert!(
+            log.contains(
+                "selecting by F2 over car, person (>=20 validation boxes each); too few to judge: cat 2"
+            ),
+            "{log}"
+        );
+        let evs: Vec<TrainEvent> = log.lines().filter_map(parse_line).collect();
+        assert_eq!(
+            evs,
+            vec![TrainEvent::Support(Support {
+                min_boxes: 20,
+                boxes: [("car", 25), ("person", 20), ("cat", 2)]
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                classes: vec!["car".into(), "person".into()],
+                fell_back: false,
+                key: "f2_sup".into(),
+                reason: None,
+            })]
+        );
+        // The Python label is the service's short name, spelled in ASCII.
+        assert_eq!(
+            metric("f2_sup").unwrap().short.replace('\u{2265}', ">="),
+            f2["label"].as_str().unwrap()
+        );
+        assert_eq!(v["map"]["key"], "map_sup");
+        assert_eq!(v["iou"]["key"], "iou");
+        assert!(
+            v["iou"]["log"]
+                .as_str()
+                .unwrap()
+                .contains("classes with >=20 validation boxes: car, person"),
+            "{}",
+            v["iou"]["log"]
+        );
+        // No class with 20 boxes: every class is averaged, as the trainer reports it (no `_sup`
+        // keys), the per-class keys stay.
+        let few = &v["few"];
+        assert_eq!(few["key"], "f2");
+        let fm = few["m"].as_object().unwrap();
+        assert!(
+            fm.keys()
+                .all(|k| !k.ends_with("_sup") && !k.contains("_sup_")),
+            "{fm:?}"
+        );
+        assert!(fm.contains_key("class/person/ap50"));
+        let ev = few["log"].as_str().unwrap().lines().find_map(parse_line);
+        let Some(TrainEvent::Support(s)) = ev else {
+            panic!("{}", few["log"])
+        };
+        assert!(s.fell_back);
+        assert_eq!(s.classes, vec!["person".to_string(), "cat".to_string()]);
+        assert_eq!(s.boxes.get("car"), Some(&0));
+        assert_eq!(s.key, "f2");
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("no class has 20 validation boxes")
+        );
+        // A failed meter: nothing, logged once, decided as every class.
+        let broken = &v["broken"];
+        assert_eq!(broken["m"], json!({}));
+        assert_eq!(broken["key"], "f2");
+        let blog = broken["log"].as_str().unwrap();
+        assert!(blog.contains("selecting by F2 over all classes (the per-class matching failed)"));
+        let ev = blog.lines().find_map(parse_line);
+        assert!(matches!(
+            ev,
+            Some(TrainEvent::Support(Support {
+                fell_back: true,
+                ..
+            }))
+        ));
+        // Nothing seen yet: nothing decided.
+        assert_eq!(v["empty"], json!([{}, null]));
+        // The cap keeps the 100 best of a class per image.
+        assert_eq!(v["cap"], json!([100, 3, 0.05]));
+    }
+
+    /// Epoch rows with the supported-class keys (`map_sup` ... `f0_5_sup`), peaking elsewhere
+    /// than the all-class ones; without `map_sup` (an rfdetr without per-class AP) when not
+    /// `with_ap95`.
+    fn support_rows(with_ap95: bool) -> Vec<SelectRow> {
+        (1..=40u32)
+            .map(|e| {
+                let t = f64::from(e);
+                let wave = |p: f64, q: f64| 0.5 + 0.3 * (t / p).sin() - t * q;
+                let mut m = vec![
+                    ("metrics/mAP50-95(B)", wave(5.0, 0.002)),
+                    ("metrics/mAP50(B)", wave(4.0, 0.001)),
+                    ("f1", wave(6.0, 0.0)),
+                    ("f2", wave(7.0, 0.003)),
+                    ("f0_5", wave(3.0, 0.004)),
+                    ("iou", wave(2.5, 0.0)),
+                    ("map50_sup", wave(3.5, 0.002)),
+                    ("f1_sup", wave(4.5, 0.001)),
+                    ("f0_5_sup", wave(2.0, 0.0)),
+                ];
+                if with_ap95 {
+                    m.push(("map_sup", wave(6.5, 0.003)));
+                }
+                if e % 7 != 0 {
+                    m.push(("f2_sup", wave(5.5, 0.002)));
+                }
+                (e, 4.0 - t * if e < 20 { 0.08 } else { 0.0 }, m)
+            })
+            .collect()
+    }
+
+    /// `Selection` after a `support` event, fed by `pick_metric`, decides as
+    /// [`convergence_run`] over [`rule_values_by`] of [`TrainProgress::rule_key`] (stop, points,
+    /// anneal, the kept epoch) for every selectable metric: supported (`<id>_sup`), supported
+    /// without per-class AP 50-95 (`map_sup` -> `map50_sup`), no class with enough boxes (today's
+    /// all-class values) and a per-class failure after the decision (`select_fallback`, mAP over
+    /// all classes from there) (skipped without Python 3).
+    #[test]
+    fn supported_selection_matches_the_training_script() {
+        use crate::training::recipe::SELECT_METRICS;
+        use serde_json::json;
+        let rule = Rule {
+            patience: 6,
+            min_epochs: 10,
+            min_delta: 0.001,
+            smooth: 3,
+            epochs: 40,
+            anneal: 3,
+        };
+        let raw = |rows: &[SelectRow]| -> Vec<serde_json::Value> {
+            rows.iter()
+                .map(|(e, l, m)| {
+                    let metrics: BTreeMap<&str, f64> = m.iter().copied().collect();
+                    json!({"epoch": e, "loss": l, "metrics": metrics})
+                })
+                .collect()
+        };
+        let nano5 = json!({"car": 428, "person": 34, "truck": 7, "bicycle": 1, "motorcycle": 1,
+            "cat": 1});
+        let cases = [
+            ("supported", true, nano5.clone(), None),
+            ("no_ap95", false, nano5.clone(), None),
+            ("fell_back", true, json!({"truck": 7, "bicycle": 1}), None),
+            ("failed", true, nano5, Some(5u32)),
+        ];
+        let ids: Vec<&str> = SELECT_METRICS.iter().map(|o| o.metric.id()).collect();
+        let data = json!({
+            "ids": ids,
+            "cases": cases.iter().map(|(name, ap95, boxes, fail)| json!({"name": name,
+                "rows": raw(&support_rows(*ap95)), "boxes": boxes, "fail_at": fail}))
+                .collect::<Vec<_>>(),
+            "patience": rule.patience, "min_epochs": rule.min_epochs, "min_delta": rule.min_delta,
+            "smooth": rule.smooth, "total": rule.epochs, "anneal": rule.anneal});
+        let code = r#"
+import io, json, struct, sys
+from contextlib import redirect_stdout
+src, data = sys.stdin.read().split("\n#CASES#\n")
+d = json.loads(data)
+ns = {"__name__": "train_model"}
+exec(compile(src, "train_model.py", "exec"), ns)
+Sel, Conv = ns["Selection"], ns["Convergence"]
+out = {}
+for case in d["cases"]:
+    for id in d["ids"]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            c = Conv(d["patience"], d["min_epochs"], d["min_delta"], None, d["smooth"], d["total"], d["anneal"],
+                     ns["SELECT_LABELS"][id])
+            s = Sel(id, c)
+            stop, points, anneal, values = None, [], None, []
+            for r in case["rows"]:
+                s.decide(case["boxes"])
+                failed = case["fail_at"] is not None and r["epoch"] >= case["fail_at"]
+                v = s.value(r["metrics"], r["epoch"], classes_failed=failed)
+                values.append(v)
+                decision = c.update(r["epoch"], v, r["loss"])
+                if c.point is not None:
+                    points.append(c.point["epoch"])
+                if c.annealing is not None:
+                    anneal = c.annealing["epoch"]
+                if decision:
+                    stop = r["epoch"]
+                    break
+        values = [None if x is None else struct.unpack("<Q", struct.pack("<d", float(x)))[0] for x in values]
+        out[case["name"] + ":" + id] = {"stop": stop, "points": points, "anneal": anneal, "top_epoch": c.top_epoch,
+                                        "key": s.key, "label": c.label, "values": values, "log": buf.getvalue()}
+print("RESULT: " + json.dumps(out))
+"#;
+        let Some(v) = script_result("supported selection", false, code, &data) else {
+            return;
+        };
+        let mut differs = 0;
+        for (name, ap95, _, fail) in &cases {
+            let rows = support_rows(*ap95);
+            for o in SELECT_METRICS {
+                let id = o.metric.id();
+                let got = &v[format!("{name}:{id}")];
+                let mut p = selecting(o.metric, &rows);
+                p.min_delta = rule.min_delta;
+                let log = got["log"].as_str().unwrap();
+                for ev in log.lines().filter_map(parse_line) {
+                    p.apply(&ev, 40.0);
+                }
+                assert!(p.support.is_some(), "{name}:{id}: {log}");
+                assert_eq!(got["key"], p.rule_key(), "{name}:{id}");
+                let key = p.rule_key().to_string();
+                let want_key = match (*name, id) {
+                    ("fell_back" | "failed", "map") | (_, "iou") => id.to_string(),
+                    ("fell_back", _) => id.to_string(),
+                    ("failed", _) => "map".to_string(),
+                    _ => format!("{id}_sup"),
+                };
+                assert_eq!(key, want_key, "{name}:{id}");
+                if let Some(from) = fail.filter(|_| id != "iou") {
+                    // From the failure on: mAP over all classes, the kept epoch its best since.
+                    assert_eq!(p.select_fallback.as_ref().map(|f| f.epoch), Some(from));
+                    assert_eq!(
+                        p.select_fallback.as_ref().unwrap().metric,
+                        format!("{id}_sup"),
+                        "{name}:{id}"
+                    );
+                    assert!(
+                        log.contains("the per-class metrics failed"),
+                        "{name}:{id}: {log}"
+                    );
+                    let seen = got["stop"].as_u64().map_or(rule.epochs, |s| s as u32);
+                    let cut: Vec<EpochPoint> = p
+                        .history
+                        .iter()
+                        .filter(|h| h.epoch >= from && h.epoch <= seen)
+                        .cloned()
+                        .collect();
+                    let best = best_by(&cut, "map").unwrap();
+                    assert_eq!(got["top_epoch"], json!(best.epoch), "{name}:{id}");
+                    assert_eq!(got["label"], "mAP", "{name}:{id}");
+                    continue;
+                }
+                let values = rule_values_by(&p.history, &key);
+                // As IEEE bits: the same doubles, not only the same text.
+                let picked: Vec<Option<u64>> =
+                    values.iter().map(|&(_, x)| x.map(f64::to_bits)).collect();
+                let run_rows: Vec<_> = values
+                    .iter()
+                    .zip(&rows)
+                    .map(|(&(e, x), (_, l, _))| (e, x, Some(*l)))
+                    .collect();
+                let r = convergence_run(&run_rows, &rule);
+                assert_eq!(got["stop"], json!(r.stop), "{name}:{id}");
+                assert_eq!(got["points"], json!(r.points), "{name}:{id}");
+                assert_eq!(got["anneal"], json!(r.anneal), "{name}:{id}");
+                let n = got["values"].as_array().unwrap().len();
+                assert_eq!(got["values"], json!(picked[..n]), "{name}:{id}");
+                let seen = r.stop.unwrap_or(rule.epochs);
+                let cut: Vec<EpochPoint> = p
+                    .history
+                    .iter()
+                    .filter(|h| h.epoch <= seen)
+                    .cloned()
+                    .collect();
+                let best = best_by(&cut, &key).unwrap();
+                assert_eq!(got["top_epoch"], json!(best.epoch), "{name}:{id}");
+                // What the page and the status lines show is that run's best.
+                let full = best_by(&p.history, &key).unwrap();
+                assert_eq!(p.best.as_ref(), Some(&full), "{name}:{id}");
+                if *name == "no_ap95" && id == "map" {
+                    assert_eq!(full.metric, "map50_sup");
+                }
+                if *name == "fell_back" {
+                    // As before the support rule: the all-class value.
+                    let old = rule_values(&p.history, o.metric);
+                    assert_eq!(values, old, "{name}:{id}");
+                } else if id != "iou" {
+                    assert_eq!(
+                        got["label"],
+                        metric(&key).unwrap().short.replace('\u{2265}', ">="),
+                        "{name}:{id}"
+                    );
+                    let old = rule_values(&p.history, o.metric);
+                    differs += usize::from(values != old);
+                }
+            }
+        }
+        // The key really changes what the rule sees.
+        assert!(differs >= 8, "{differs}");
+    }
+
+    #[test]
+    fn support_events_parse_and_survive_the_stored_record() {
+        let line = r#"x @train {"min_boxes":20,"boxes":{"car":428,"person":34,"truck":7},"classes":["car","person"],"fell_back":false,"key":"f2_sup","reason":null,"event":"support"}"#;
+        let ev = parse_line(line).unwrap();
+        let TrainEvent::Support(s) = &ev else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(s.min_boxes, 20);
+        assert_eq!(s.boxes.get("truck"), Some(&7));
+        assert_eq!(s.classes, vec!["car".to_string(), "person".to_string()]);
+        assert_eq!(s.key, "f2_sup");
+        // Fields an older or newer script leaves out default.
+        assert_eq!(
+            parse_line(r#"@train {"event":"support","key":"map_sup"}"#),
+            Some(TrainEvent::Support(Support {
+                key: "map_sup".into(),
+                ..Support::default()
+            }))
+        );
+        let row = |e: u32, f2: f64, f2s: f64| -> SelectRow {
+            (
+                e,
+                3.0,
+                vec![
+                    ("metrics/mAP50-95(B)", 0.5),
+                    ("metrics/mAP50(B)", 0.6),
+                    ("f2", f2),
+                    ("f2_sup", f2s),
+                    ("map_sup", f2s / 2.0),
+                ],
+            )
+        };
+        let rows = vec![row(1, 0.9, 0.3), row(2, 0.4, 0.8), row(3, 0.5, 0.5)];
+        let mut p = selecting(SelectMetric::F2, &rows);
+        assert_eq!(p.rule_key(), "f2");
+        assert_eq!(p.best.as_ref().unwrap().epoch, 1);
+        p.apply(&ev, 3.0);
+        assert_eq!(p.rule_key(), "f2_sup");
+        assert_eq!(
+            p.best,
+            Some(Best {
+                metric: "f2_sup".into(),
+                epoch: 2,
+                value: 0.8
+            })
+        );
+        assert_eq!(p.since_best, 1);
+        assert!(
+            p.describe()
+                .contains("best F2 (\u{2265}20) 0.800 @ epoch 2"),
+            "{}",
+            p.describe()
+        );
+        p.apply(
+            &TrainEvent::ConvergePoint(ConvergePoint {
+                epoch: 3,
+                best_epoch: 2,
+                best: Some(0.8),
+                loss_falling: true,
+                loss_from: Some(3.0),
+                loss_to: Some(2.5),
+                extension: 1,
+                next_check: 9,
+            }),
+            3.0,
+        );
+        let text = &p.extension.as_ref().unwrap().text;
+        assert!(
+            text.contains("best epoch 2, F2 (\u{2265}20) 0.800"),
+            "{text}"
+        );
+        // The stored record keeps it; JSON round trip.
+        let stored = p.without_history();
+        assert_eq!(stored.support, p.support);
+        let back: TrainProgress =
+            serde_json::from_value(serde_json::to_value(&stored).unwrap()).unwrap();
+        assert_eq!(back.support, p.support);
+        let mut again = back.clone();
+        again.history = p.history.clone();
+        again.recompute_best();
+        assert_eq!(again.best, p.best);
+        // A record from before the event has none and writes none.
+        let old = selecting(SelectMetric::F2, &rows);
+        assert!(
+            serde_json::to_value(old.without_history())
+                .unwrap()
+                .get("support")
+                .is_none()
+        );
+        // A key for another metric, or a fall-back, is the selected metric's own value.
+        for s in [
+            Support {
+                key: "map_sup".into(),
+                ..s.clone()
+            },
+            Support {
+                fell_back: true,
+                ..s.clone()
+            },
+            Support {
+                key: "f2_nonsense".into(),
+                ..s.clone()
+            },
+        ] {
+            let mut q = selecting(SelectMetric::F2, &rows);
+            q.apply(&TrainEvent::Support(s), 3.0);
+            assert_eq!(q.rule_key(), "f2");
+            assert_eq!(q.best.as_ref().unwrap().epoch, 1);
+        }
+        // mAP over the supported classes; the brief line names it.
+        let mut q = selecting(SelectMetric::Map, &rows);
+        q.apply(
+            &TrainEvent::Support(Support {
+                key: "map_sup".into(),
+                ..s.clone()
+            }),
+            3.0,
+        );
+        assert_eq!(q.best.as_ref().unwrap().metric, "map_sup");
+        assert!(
+            q.brief()
+                .unwrap()
+                .contains("best mAP50-95 (\u{2265}20) 0.400"),
+            "{:?}",
+            q.brief()
+        );
+        // After a fall-back: mAP over all classes.
+        q.apply(
+            &TrainEvent::SelectFallback(SelectFallback {
+                metric: "map_sup".into(),
+                epoch: 2,
+                reason: "the per-class metrics failed".into(),
+            }),
+            3.0,
+        );
+        assert_eq!(q.rule_key(), "map");
+        assert_eq!(q.best.as_ref().unwrap().metric, "map");
+    }
+
+    /// The `_sup` ids: one per supported-class twin of the script's `class_metrics`, named after
+    /// their metric and the class floor.
+    #[test]
+    fn supported_metric_ids_are_described() {
+        let floor = format!("\u{2265}{}", crate::benchmark::metrics::MIN_CLASS_GT);
+        let sup: Vec<&MetricInfo> = METRICS.iter().filter(|m| m.id.contains("_sup")).collect();
+        assert_eq!(sup.len(), 14);
+        for m in sup {
+            assert!(m.label.contains(&floor), "{}", m.label);
+            assert!(m.short.contains(&floor), "{}", m.short);
+            assert_eq!(canonical(m.id), Some(m.id));
+            let base = match m.id.replacen("_sup", "", 1).as_str() {
+                "f1_precision" => "precision".to_string(),
+                "f1_recall" => "recall".to_string(),
+                other => other.to_string(),
+            };
+            let b = metric(&base).unwrap_or_else(|| panic!("{base}"));
+            assert_eq!(m.format, b.format);
+            assert_eq!(m.higher_better, b.higher_better);
+            if !m.id.ends_with("_thr")
+                && !m.id.ends_with("_precision")
+                && !m.id.ends_with("_recall")
+            {
+                assert_eq!(m.short, format!("{} ({floor})", b.short));
+            }
+        }
     }
 }

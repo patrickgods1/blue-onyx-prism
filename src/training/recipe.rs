@@ -123,7 +123,10 @@ impl std::fmt::Display for LrSchedule {
 /// The metric a run optimizes (`--select-metric`, one of [`SELECT_METRICS`]): it picks the epoch
 /// whose weights are exported and is the value of the convergence rule, so a run never stops on
 /// one metric and keeps another's best. Ids are [`super::progress::METRICS`]'; all are on a 0..1
-/// scale, so the family's `min_delta` suits every one.
+/// scale, so the family's `min_delta` suits every one. All but `iou` are averaged over the classes
+/// with at least [`crate::benchmark::metrics::MIN_CLASS_GT`] validation boxes, every class when none
+/// has (the script's `support` event, [`super::progress::TrainProgress::rule_key`]); the hints say
+/// 20 (a test checks it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SelectMetric {
@@ -153,32 +156,35 @@ pub const SELECT_METRICS: [SelectOption; 6] = [
     SelectOption {
         metric: SelectMetric::Map,
         label: "mAP 50-95 (default)",
-        hint: "Average precision over IoU 0.5-0.95, per class: rewards finding objects and \
-               tight boxes.",
+        hint: "Average precision over IoU 0.5-0.95, averaged over the classes with at least 20 \
+               validation boxes: rewards finding objects and tight boxes.",
     },
     SelectOption {
         metric: SelectMetric::Map50,
         label: "mAP 50",
-        hint: "Average precision at IoU 0.5, per class: finding objects counts, exact box fit \
-               does not.",
+        hint: "Average precision at IoU 0.5, averaged over the classes with at least 20 \
+               validation boxes: finding objects counts, exact box fit does not.",
     },
     SelectOption {
         metric: SelectMetric::F1,
         label: "F1",
-        hint: "Weighs catching objects and false alarms equally. Macro average over the classes \
-               at its best confidence threshold, not person or vehicle specific.",
+        hint: "Weighs catching objects and false alarms equally. Averaged over the classes with \
+               at least 20 validation boxes at its best confidence threshold, not person or \
+               vehicle specific.",
     },
     SelectOption {
         metric: SelectMetric::F2,
         label: "F2 (catch more)",
-        hint: "Favours catching objects over false alarms. Macro average over the classes at its \
-               best confidence threshold, not person or vehicle specific.",
+        hint: "Favours catching objects over false alarms. Averaged over the classes with at \
+               least 20 validation boxes at its best confidence threshold, not person or vehicle \
+               specific.",
     },
     SelectOption {
         metric: SelectMetric::F05,
         label: "F0.5 (fewer false alarms)",
-        hint: "Favours fewer false alarms over catching objects. Macro average over the classes \
-               at its best confidence threshold, not person or vehicle specific.",
+        hint: "Favours fewer false alarms over catching objects. Averaged over the classes with \
+               at least 20 validation boxes at its best confidence threshold, not person or \
+               vehicle specific.",
     },
     SelectOption {
         metric: SelectMetric::Iou,
@@ -469,7 +475,10 @@ impl TrainRecipe {
 
     /// The patience the run trains with on `valid_images` validation images, and the `train.log`
     /// line that explains the rule: a recommended patience doubles below [`SMALL_VALID_IMAGES`]
-    /// (at most the epochs); a typed one is kept.
+    /// (at most the epochs); a typed one is kept. Unless the run selects by `iou`, the line says
+    /// the metric is averaged over the classes with at least
+    /// [`crate::benchmark::metrics::MIN_CLASS_GT`] validation boxes (the script names them at its
+    /// first validation).
     pub fn convergence_patience(&self, valid_images: usize) -> (u32, String) {
         let smooth = recommended(self.family).smooth;
         let metric = self.select_metric.short();
@@ -478,14 +487,22 @@ impl TrainRecipe {
         } else {
             format!("{metric} of each epoch")
         };
+        let over = if self.select_metric == SelectMetric::Iou {
+            String::new()
+        } else {
+            format!(
+                " (by the classes with at least {} validation boxes, every class when none has)",
+                crate::benchmark::metrics::MIN_CLASS_GT
+            )
+        };
         if self.patience_recommended && self.patience > 0 && valid_images < SMALL_VALID_IMAGES {
             let p = self.patience.saturating_mul(2).min(self.epochs);
             if p != self.patience {
                 return (
                     p,
                     format!(
-                        "convergence: {valid_images} validation images (< {SMALL_VALID_IMAGES}): \
-                         patience {p} instead of {}; {window}",
+                        "convergence{over}: {valid_images} validation images (< \
+                         {SMALL_VALID_IMAGES}): patience {p} instead of {}; {window}",
                         self.patience
                     ),
                 );
@@ -499,7 +516,8 @@ impl TrainRecipe {
         (
             self.patience,
             format!(
-                "convergence: {valid_images} validation images: patience {}{typed}; {window}",
+                "convergence{over}: {valid_images} validation images: patience {}{typed}; \
+                 {window}",
                 self.patience
             ),
         )
@@ -935,7 +953,8 @@ mod tests {
             r.convergence_patience(16),
             (
                 20,
-                "convergence: 16 validation images (< 50): patience 20 instead of 10; mAP \
+                "convergence (by the classes with at least 20 validation boxes, every class \
+                 when none has): 16 validation images (< 50): patience 20 instead of 10; mAP \
                  averaged over the last 3 epochs"
                     .into()
             )
@@ -945,11 +964,31 @@ mod tests {
             r.convergence_patience(50),
             (
                 10,
-                "convergence: 50 validation images: patience 10; mAP averaged over the last 3 \
+                "convergence (by the classes with at least 20 validation boxes, every class \
+                 when none has): 50 validation images: patience 10; mAP averaged over the last 3 \
                  epochs"
                     .into()
             )
         );
+        // `iou` is pooled over every class: no class sentence.
+        let iou = TrainRecipe {
+            select_metric: SelectMetric::Iou,
+            ..r.clone()
+        };
+        assert_eq!(
+            iou.convergence_patience(50).1,
+            "convergence: 50 validation images: patience 10; IoU averaged over the last 3 epochs"
+        );
+        // The hints and the line name the same class floor as the benchmark and the script.
+        let floor = format!(
+            "at least {} validation boxes",
+            crate::benchmark::metrics::MIN_CLASS_GT
+        );
+        for o in SELECT_METRICS {
+            if o.metric != SelectMetric::Iou {
+                assert!(o.hint.contains(&floor), "{}", o.hint);
+            }
+        }
         // Capped by the epochs.
         let short = TrainRecipe {
             epochs: 15,

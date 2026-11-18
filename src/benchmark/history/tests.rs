@@ -811,6 +811,7 @@ fn view_annotates_status_json() {
     let n = view::noise_json();
     assert_eq!(n["speed_rel"], 0.05);
     assert_eq!(n["trust_medium_objects"], 300);
+    assert_eq!(n["min_class_gt"], 20);
     assert!((n["plateau_points"].as_f64().unwrap() - 0.2).abs() < 1e-9);
 }
 
@@ -835,4 +836,283 @@ fn ranking_rows_carry_runtime_tradeoff_and_trust() {
     assert_eq!(points[1].rank, 2);
     let v = serde_json::to_value(&points[1]).unwrap();
     assert!(v["recall"].is_null() && v["threshold"].is_null());
+}
+
+/// A device row whose AP averages `classes` (`(name, gt, ap50)`; AP50-95 = AP50 / 2) with
+/// `ap_min_gt` 20 (None: an entry of an older version, no per-class values).
+fn ap_snap(classes: &[(&str, usize, f64)], min_gt: Option<usize>, ap50: f64) -> DeviceSnap {
+    let objects = classes.iter().map(|c| c.1).sum();
+    let mut s = snap("openvino:cpu", 20.0, Some(0.8), objects);
+    s.ap50 = Some(ap50);
+    s.ap50_95 = Some(ap50 / 2.0);
+    s.ap_min_gt = min_gt;
+    if min_gt.is_some() {
+        s.ap_classes = classes
+            .iter()
+            .map(|&(class, gt, ap)| ClassAp {
+                class: class.into(),
+                gt,
+                ap50: Some(ap),
+                ap50_95: Some(ap / 2.0),
+            })
+            .collect();
+    }
+    s
+}
+
+#[test]
+fn macro_noise_hand_computed() {
+    // Two classes at p 0.5 with 100 objects each: 2 * sqrt(0.0025 + 0.0025) / 2 = 0.0707.
+    let n = macro_noise(&[(0.5, 100), (0.5, 100)]);
+    assert!((n - (0.005f64).sqrt()).abs() < 1e-12, "{n}");
+    // Perfect classes: the floor, one object of the smallest class: 1 / (2 * 20).
+    assert!((macro_noise(&[(1.0, 950), (1.0, 20)]) - 1.0 / 40.0).abs() < 1e-12);
+    // Classes without objects are left out; nothing at all is no noise.
+    assert!((macro_noise(&[(1.0, 50), (0.3, 0)]) - 1.0 / 50.0).abs() < 1e-12);
+    assert_eq!(macro_noise(&[]), 0.0);
+}
+
+/// The investigation's held-out set: person 178, car 953, truck 34, dog 7, bicycle 2, cat 2.
+/// A dog going from 0.129 to 1.0 moved the old all-class mean by 14.5 points, "better" against
+/// the noise of 1176 objects; averaged over the classes with 20 objects or more it moves nothing.
+#[test]
+fn a_rare_class_flip_is_no_longer_better() {
+    let strong = [
+        ("person", 178, 0.933),
+        ("car", 953, 0.966),
+        ("truck", 34, 0.947),
+    ];
+    let old_mean = |dog: f64| (0.933 + 0.966 + 0.947 + 0.505 + dog + 0.0) / 6.0;
+    // Two entries of older versions: the old rule over every object (kept as it was).
+    let mut a_old = ap_snap(&strong, None, old_mean(0.129));
+    a_old.ground_truth = Some(1176);
+    let mut b_old = a_old.clone();
+    b_old.ap50 = Some(old_mean(1.0));
+    let c = compare(
+        &entry("r1", vec![a_old.clone()]),
+        &entry("r2", vec![b_old.clone()]),
+    );
+    assert_eq!(metric(&c, "ap50").verdict, Verdict::Better, "the old rule");
+    // The same runs scored with the supported-class rule: the dog is not in the average.
+    let mean = (0.933 + 0.966 + 0.947) / 3.0;
+    let a = ap_snap(&strong, Some(20), mean);
+    let b = ap_snap(&strong, Some(20), mean);
+    let c = compare(&entry("r1", vec![a.clone()]), &entry("r2", vec![b]));
+    let m = metric(&c, "ap50");
+    assert_eq!(m.verdict, Verdict::Same, "{}", m.why);
+    assert!(
+        m.why
+            .contains("for the average of person (178 objects), car (953 objects)"),
+        "{}",
+        m.why
+    );
+    // A real change of the averaged classes still counts: truck 0.947 -> 0.70 moves the mean by
+    // 8.2 points, over the noise (2 * sqrt(sum p (1 - p) / n) / 3 = 2.9 points).
+    let mut worse = strong;
+    worse[2].2 = 0.70;
+    let b = ap_snap(&worse, Some(20), (0.933 + 0.966 + 0.70) / 3.0);
+    let c = compare(&entry("r1", vec![a.clone()]), &entry("r2", vec![b]));
+    let m = metric(&c, "ap50");
+    assert_eq!(m.verdict, Verdict::Worse, "{}", m.why);
+    assert!(
+        m.why.contains("normal variation of 2.9 points"),
+        "{}",
+        m.why
+    );
+    // Two rare classes alone (fell back): a flip of one of 2 dog boxes (0.5 -> 1.0, the mean
+    // +25 points) is within the macro noise (2 * sqrt(0.125 + 0.125) / 2 = 50 points).
+    let rare = [("dog", 2, 0.5), ("cat", 2, 0.5)];
+    let mut ra = ap_snap(&rare, Some(20), 0.5);
+    ra.ap_fell_back = true;
+    let mut rb = ap_snap(&[("dog", 2, 1.0), ("cat", 2, 0.5)], Some(20), 0.75);
+    rb.ap_fell_back = true;
+    let c = compare(&entry("r1", vec![ra]), &entry("r2", vec![rb]));
+    assert_eq!(metric(&c, "ap50").verdict, Verdict::Same);
+}
+
+/// Runs that average other classes are not comparable on AP alone; the rest still compares.
+#[test]
+fn another_ap_basis_is_not_comparable_for_ap_only() {
+    let two = [("person", 178, 0.93), ("car", 953, 0.96)];
+    let three = [
+        ("person", 178, 0.93),
+        ("car", 953, 0.96),
+        ("truck", 34, 0.9),
+    ];
+    let a = ap_snap(&two, Some(20), 0.945);
+    let mut b = ap_snap(&three, Some(20), 0.93);
+    b.recall = Some(0.95);
+    let c = compare(&entry("r1", vec![a.clone()]), &entry("r2", vec![b.clone()]));
+    assert!(c.comparable);
+    for name in ["ap50", "ap50_95"] {
+        let m = metric(&c, name);
+        assert_eq!((m.verdict, m.delta), (Verdict::NotComparable, None));
+    }
+    assert_eq!(
+        metric(&c, "ap50").why,
+        "AP50 averaged over other classes (person, car -> person, car, truck)"
+    );
+    assert_eq!(metric(&c, "recall").verdict, Verdict::Better);
+    assert_eq!(c.summary, "speed about the same; more accurate");
+    // An entry of an older version beside a new one: "every class".
+    let old = ap_snap(&two, None, 0.9);
+    let m = metric(
+        &compare(&entry("r1", vec![old]), &entry("r2", vec![a.clone()])),
+        "ap50",
+    )
+    .clone();
+    assert_eq!(m.verdict, Verdict::NotComparable);
+    assert_eq!(
+        m.why,
+        "AP50 averaged over other classes (every class -> person, car)"
+    );
+    // The same classes in another order are the same basis; another minimum is not.
+    let swapped = ap_snap(
+        &[("car", 953, 0.96), ("person", 178, 0.93)],
+        Some(20),
+        0.945,
+    );
+    let c = compare(&entry("r1", vec![a.clone()]), &entry("r2", vec![swapped]));
+    assert_eq!(metric(&c, "ap50").verdict, Verdict::Same);
+    let mut min30 = a.clone();
+    min30.ap_min_gt = Some(30);
+    let m = metric(
+        &compare(&entry("r1", vec![a.clone()]), &entry("r2", vec![min30])),
+        "ap50",
+    )
+    .clone();
+    assert_eq!(m.verdict, Verdict::NotComparable);
+    assert_eq!(
+        m.why,
+        "AP50 averaged over classes with at least 20 objects -> at least 30 objects"
+    );
+}
+
+/// False person alerts on frames without a person: a rate where lower is better.
+#[test]
+fn person_false_alerts_lower_is_better() {
+    let with = |alerts: usize| {
+        let mut s = snap("openvino:cpu", 20.0, Some(0.8), 300);
+        s.person_free_frames = Some(200);
+        s.person_false_alerts = Some(alerts);
+        s
+    };
+    // 10 of 200 (5%) -> 2 of 200 (1%): 4 points down, noise 2 * sqrt(.05 * .95 / 200) = 3.1.
+    let c = compare(&entry("r1", vec![with(10)]), &entry("r2", vec![with(2)]));
+    let m = metric(&c, "person_false_alerts");
+    assert_eq!(m.verdict, Verdict::Better, "{}", m.why);
+    assert_eq!(
+        m.why,
+        "person false-alert rate down 4.0 points (more than the normal variation of 3.1 points \
+         for 200 frames without a person)"
+    );
+    assert_eq!((m.before, m.after), (Some(0.05), Some(0.01)));
+    // Counted with the accuracy measures.
+    assert_eq!(c.summary, "speed about the same; more accurate");
+    let m = metric(
+        &compare(&entry("r1", vec![with(10)]), &entry("r2", vec![with(20)])),
+        "person_false_alerts",
+    )
+    .clone();
+    assert_eq!(m.verdict, Verdict::Worse, "{}", m.why);
+    let m = metric(
+        &compare(&entry("r1", vec![with(10)]), &entry("r2", vec![with(13)])),
+        "person_false_alerts",
+    )
+    .clone();
+    assert_eq!(m.verdict, Verdict::Same, "{}", m.why);
+    // Lower-better directly: a rise is worse.
+    let c = lower_proportion_change("x", "d", Some(0.1), Some(0.5), Some(100), "frames");
+    assert_eq!(c.verdict, Verdict::Worse);
+    // Neither run has it (older entries, no person class): not listed.
+    let plain = snap("openvino:cpu", 20.0, Some(0.8), 300);
+    let c = compare(&entry("r1", vec![plain.clone()]), &entry("r2", vec![plain]));
+    assert!(c.metrics.iter().all(|m| m.metric != "person_false_alerts"));
+}
+
+/// The snapshot of a result records the AP's classes with their values and the person counts;
+/// entries of older versions load without them.
+#[test]
+fn snapshots_record_the_ap_basis_and_person_alerts() {
+    use crate::benchmark::metrics::{ApBasis, ClassAlerts, ClassMetrics, Summary};
+    let mut m = model(vec![dev("openvino:cpu", 20.0, scene())], None);
+    let class = |name: &str, gt: usize, ap: f64| ClassMetrics {
+        class: name.into(),
+        gt,
+        ap50: Some(ap),
+        ap50_95: Some(ap / 2.0),
+        precision: None,
+        recall: None,
+    };
+    m.devices[0].run.as_mut().unwrap().accuracy = Some(crate::benchmark::AccuracyReport {
+        ground_truth: "ground truth".into(),
+        relative: false,
+        classes: vec!["person".into(), "car".into(), "dog".into()],
+        threshold: 0.5,
+        overall: Summary {
+            ap50: Some(0.95),
+            per_class: vec![
+                class("person", 178, 0.93),
+                class("car", 953, 0.97),
+                class("dog", 7, 0.13),
+            ],
+            ap_basis: Some(ApBasis {
+                min_gt: 20,
+                classes: vec!["person".into(), "car".into()],
+                fell_back: false,
+            }),
+            class_alerts: vec![ClassAlerts {
+                class: "person".into(),
+                frames_without: 210,
+                alerts: 3,
+            }],
+            ..Default::default()
+        },
+        by_dataset: vec![],
+        by_tag: vec![],
+        all_classes: None,
+        sweep: None,
+        frame_roc: None,
+    });
+    let d = &HistoryEntry::from(&m).devices[0];
+    assert_eq!(d.ap_min_gt, Some(20));
+    assert!(!d.ap_fell_back);
+    assert_eq!(
+        d.ap_classes,
+        [
+            ClassAp {
+                class: "person".into(),
+                gt: 178,
+                ap50: Some(0.93),
+                ap50_95: Some(0.465)
+            },
+            ClassAp {
+                class: "car".into(),
+                gt: 953,
+                ap50: Some(0.97),
+                ap50_95: Some(0.485)
+            },
+        ]
+    );
+    assert_eq!(
+        (d.person_free_frames, d.person_false_alerts),
+        (Some(210), Some(3))
+    );
+    assert!((d.person_alert_rate().unwrap() - 3.0 / 210.0).abs() < 1e-12);
+    let v = serde_json::to_value(d).unwrap();
+    assert_eq!(v["ap_classes"][1]["gt"], 953);
+    // An entry of an older version: none of them, and none written back.
+    let old: DeviceSnap = serde_json::from_str(r#"{"device":"openvino:cpu","ap50":0.58}"#).unwrap();
+    assert_eq!((old.ap_min_gt, old.person_free_frames), (None, None));
+    assert!(old.ap_classes.is_empty() && !old.ap_fell_back);
+    let back = serde_json::to_value(&old).unwrap();
+    for k in [
+        "ap_min_gt",
+        "ap_classes",
+        "ap_fell_back",
+        "person_free_frames",
+        "person_false_alerts",
+    ] {
+        assert!(back.get(k).is_none(), "{k}");
+    }
 }

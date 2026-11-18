@@ -901,16 +901,44 @@
   }
 
   // ---- Details, Per model (one collapsible card per model) --------------------------------------
-  function breakdown(key, title, rows) {
+  // An AP cell whose value is a class average: the classes it covers in a tap-to-pin tooltip
+  // (results of older versions have no basis: plain text).
+  // `asc`: sort by the value itself (the breakdown tables) instead of its negative (devices).
+  function apCell(tr, v, basis, what, label, asc) {
+    var has = v !== null && v !== undefined, c = cell(tr, pct(v), has ? (asc ? v : -v) : null, label);
+    if (has && PB.basisText(basis)) { c.textContent = ""; c.appendChild(PB.withBasis(pct(v), basis, what + " averaged", "ap:" + what)); }
+    return c;
+  }
+  // `few`: the minimum objects of a class average; a row with fewer is marked "too few to judge"
+  // (By class: shown, but left out of the averages).
+  function breakdown(key, title, rows, few) {
     var d = el("div"); if (!rows || !rows.length) return d;
     d.appendChild(el("h4", null, title));
     var t = sortable(table("", ["", "Images", "Objects", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@f1"]));
     rows.forEach(function (b) {
-      var tr = el("tr"); cell(tr, b.key + (b.relative ? " (relative)" : "")); cell(tr, b.images, b.images); cell(tr, b.gt, b.gt);
-      [b.ap50, b.ap50_95, b.roc_auc, b.precision, b.recall, b.f1].forEach(function (v) { cell(tr, pct(v), v === undefined ? null : v); });
+      var tr = el("tr"), k = cell(tr, b.key + (b.relative ? " (relative)" : "")); cell(tr, b.images, b.images); cell(tr, b.gt, b.gt);
+      if (few && b.gt > 0 && b.gt < few) { k.appendChild(document.createTextNode(" ")); k.appendChild(PB.tip("too few to judge", "Fewer than " + few + " objects: one object moves this class by more than 5 points, so it is shown here but left out of the AP50 and AP50-95 averages.", "tag", "few")); }
+      apCell(tr, b.ap50, b.ap_basis, "AP50", undefined, true); apCell(tr, b.ap50_95, b.ap_basis, "AP50-95", undefined, true);
+      [b.roc_auc, b.precision, b.recall, b.f1].forEach(function (v) { cell(tr, pct(v), v === undefined ? null : v); });
       t.tBodies[0].appendChild(tr);
     });
     d.appendChild(wrap(t, key + ":" + title)); return d;
+  }
+  // "False alerts by class": frames without each class (other objects allowed) and how many of
+  // them still got a detection of it at the threshold.
+  function classAlerts(key, a) {
+    var d = el("div"), rows = (a.overall.class_alerts || []).filter(function (c) { return c.frames_without > 0; });
+    if (!rows.length) return d;
+    var h = el("h4", null, "False alerts by class "); h.appendChild(PB.term("?", "class_alerts", "ca")); d.appendChild(h);
+    var t = sortable(table("", ["Class", "Frames without it", "False alerts", "Rate"]));
+    rows.forEach(function (c) {
+      var tr = el("tr"), rate = c.frames_without > 0 ? c.alerts / c.frames_without : null;
+      cell(tr, c["class"], undefined, "Class"); cell(tr, c.frames_without, c.frames_without, "Frames without it"); cell(tr, c.alerts, c.alerts, "False alerts"); cell(tr, pct(rate), rate, "Rate");
+      t.tBodies[0].appendChild(tr);
+    });
+    d.appendChild(wrap(t, "ca:" + key));
+    d.appendChild(el("p", "muted small", "At confidence " + a.threshold.toFixed(2) + ", IoU 0.5. A frame counts when it has no box of the class; one whose only box of it is an unsure region is left out."));
+    return d;
   }
   function details(key, run) {
     var box = det("brk:" + key, "Breakdown on " + run.requested_device + (run.accuracy ? " (" + run.accuracy.ground_truth + ")" : ""));
@@ -920,8 +948,15 @@
       box.appendChild(breakdown("bd:" + key, "By dataset", a.by_dataset));
       box.appendChild(breakdown("bd:" + key, "By tag", a.by_tag));
       var classAuc = function (k) { var x = a.frame_roc && (a.frame_roc.per_class || []).find(function (c) { return c["class"] === k; }); return x ? x.auc : null; };
-      box.appendChild(breakdown("bd:" + key, "By class", a.overall.per_class.map(function (c) { return {key: c.class, images: a.overall.images, gt: c.gt, ap50: c.ap50, ap50_95: c.ap50_95, roc_auc: classAuc(c.class), precision: c.precision, recall: c.recall, f1: null}; })));
-      if (a.frame_roc && a.frame_roc.per_class && a.frame_roc.per_class.length) { box.appendChild(el("h4", null, "Frame-level ROC by class")); box.appendChild(wrap(rocTable(a.frame_roc), "roc-run:" + key)); }
+      var basis = a.overall.ap_basis;
+      if (PB.basisText(basis)) box.appendChild(el("p", "muted", "AP50 and AP50-95 average " + PB.basisText(basis) + (basis.fell_back ? "." : "; classes with fewer objects are scored per class only (By class).")));
+      box.appendChild(breakdown("bd:" + key, "By class", a.overall.per_class.map(function (c) { return {key: c.class, images: a.overall.images, gt: c.gt, ap50: c.ap50, ap50_95: c.ap50_95, roc_auc: classAuc(c.class), precision: c.precision, recall: c.recall, f1: null}; }), basis ? basis.min_gt : null));
+      box.appendChild(classAlerts(key, a));
+      if (a.frame_roc && a.frame_roc.per_class && a.frame_roc.per_class.length) {
+        box.appendChild(el("h4", null, "Frame-level ROC by class"));
+        if (PB.basisText(a.frame_roc.auc_basis)) box.appendChild(el("p", "muted", "The macro ROC AUC averages " + PB.basisText(a.frame_roc.auc_basis) + ", counted in frames with the class."));
+        box.appendChild(wrap(rocTable(a.frame_roc), "roc-run:" + key));
+      }
     } else if (run.accuracy_note) box.appendChild(el("p", "muted", "Accuracy not scored: " + run.accuracy_note + "."));
     if (run.by_resolution && run.by_resolution.length) {
       box.appendChild(el("h4", null, "Speed by resolution (ms)"));
@@ -1002,7 +1037,8 @@
         cell(tr, r.compile_ms.toFixed(0), r.compile_ms, "Load ms"); cell(tr, ms(r.stages_ms.infer.p50), r.stages_ms.infer.p50, "Infer p50"); cell(tr, ms(r.stages_ms.infer.mean), r.stages_ms.infer.mean, "Infer mean");
         cell(tr, ms(r.stages_ms.total.p50), r.stages_ms.total.p50, "Total p50"); cell(tr, ms(r.stages_ms.total.p95), r.stages_ms.total.p95, "Total p95"); cell(tr, r.throughput_fps.toFixed(1), -r.throughput_fps, "req/s");
         var rauc = r.accuracy && r.accuracy.frame_roc ? r.accuracy.frame_roc.auc : null;
-        [["AP50", acc && acc.ap50], ["AP50-95", acc && acc.ap50_95], ["ROC AUC", rauc], ["P", acc && acc.precision], ["R", acc && acc.recall]].forEach(function (p) { cell(tr, pct(p[1]), p[1] === null || p[1] === undefined ? null : -p[1], p[0]); });
+        apCell(tr, acc && acc.ap50, acc && acc.ap_basis, "AP50", "AP50"); apCell(tr, acc && acc.ap50_95, acc && acc.ap_basis, "AP50-95", "AP50-95");
+        [["ROC AUC", rauc], ["P", acc && acc.precision], ["R", acc && acc.recall]].forEach(function (p) { cell(tr, pct(p[1]), p[1] === null || p[1] === undefined ? null : -p[1], p[0]); });
         var g = cell(tr, "", r.grades ? 4 - r.grades.overall_points : null, "Grade");
         if (r.grades) { g.append(gradeEl(r.grades.overall), " ", gradeEl(r.grades.accuracy, r.grades.relative), " ", gradeEl(r.grades.speed)); g.title = "overall / accuracy" + metricTag(r.grades) + " / speed"; }
         var ag = cell(tr, verdictText(r.agreement), undefined, "Agreement");

@@ -161,8 +161,9 @@ pub(super) fn score_image(
     (eval, classes)
 }
 
-/// AP over every class of the model on the images of the overall score; None when the model
-/// has no classes besides the scored ones.
+/// AP over every class of the model on the images of the overall score, averaged like the
+/// overall AP (the classes with [`metrics::MIN_CLASS_GT`] objects or more, recorded in its
+/// `ap_basis`); None when the model has no classes besides the scored ones.
 pub(super) fn all_classes_ap(
     job: &Job,
     map: &ClassMap,
@@ -188,6 +189,7 @@ pub(super) fn all_classes_ap(
             classes: s.per_class.iter().filter(|c| c.gt > 0).count(),
             ap50: s.ap50,
             ap50_95: s.ap50_95,
+            ap_basis: s.ap_basis,
         }
     })
 }

@@ -3,7 +3,9 @@
 // progress record (`history` per epoch, `best`): KPI tiles with the change since the previous
 // epoch (learning rate, convergence countdown, finish time among them), an overfitting hint,
 // loss, quality and learning-rate curves (PrismBench.charts, legend toggles, "Show as table"), a
-// per-epoch table over the chosen columns and the columns picker. refresh(el, progress, metrics,
+// per-epoch table over the chosen columns (led by what the run selects by when that is an average
+// over the supported classes, ruleKey), the per-class values of the best epoch (classRows: rows
+// under the support event's min_boxes are "too few to judge") and the columns picker. refresh(el, progress, metrics,
 // opts) swaps only the tiles and the hint (every poll; render() when signature() changes).
 // opts: runId, available [keys the picker offers], onColumns(list) -> Promise<{ok, message}>.
 // Everything is built with createElement / textContent (metric keys come from a training
@@ -121,15 +123,41 @@
     if (delta) t.appendChild(delta);
     return t;
   }
+  // ---- what the run selects by ---------------------------------------------------------------
+  // The metric id the best epoch and the convergence rule follow: twin of TrainProgress::rule_key
+  // (src/training/progress.rs, node-tested against it): mAP after a select_fallback; the support
+  // event's `<id>_sup` while some class had enough validation boxes (the ids with such an average,
+  // the script's SUP_METRICS); else the selected id.
+  var SUP_IDS = ["map", "map50", "f1", "f2", "f0_5"];
+  function ruleKey(progress) {
+    progress = progress || {};
+    var id = progress.select_fallback ? "map" : ((progress.settings || {}).select_metric || "map");
+    var sup = progress.support;
+    if (!progress.select_fallback && sup && !sup.fell_back && sup.key === id + "_sup" && SUP_IDS.indexOf(id) >= 0) return sup.key;
+    return id;
+  }
+  // "by F2 over car, person" (the averaged classes, at most 4 named), "by F2" for another metric
+  // over all classes, "" for mAP over all classes (the default before the support rule).
+  function selectedBy(progress, info) {
+    progress = progress || {};
+    var key = ruleKey(progress), base = key.replace(/_sup$/, "");
+    if (key !== base) {
+      var cls = (progress.support.classes || []).slice(), more = cls.length > 4 ? cls.length - 4 : 0;
+      var names = cls.slice(0, 4).join(", ") + (more ? " +" + more : "");
+      return "by " + info(base).short + (names ? " over " + names : "");
+    }
+    return key !== "map" ? "by " + info(key).short : "";
+  }
+
   // The convergence rule's countdown: epochs since the last gain against the patience, where the
   // run stops (the server's `stop_epoch`) and the extension / anneal it is in. Null when early
-  // stopping is off or the run predates it (patience 0 or missing). `by F2`: the metric it follows
-  // when not mAP.
+  // stopping is off or the run predates it (patience 0 or missing). `by F2 over car, person`: what
+  // it follows (selectedBy).
   function convergenceTile(progress, info) {
     if (!has(progress.patience) || progress.patience <= 0 || !has(progress.since_best)) return null;
     var subs = [], st = progress.stopped, an = progress.anneal, cp = progress.converge_point;
-    var by = progress.select_fallback ? "map" : (progress.settings || {}).select_metric;
-    if (by && by !== "map") subs.push("by " + info(by).short);
+    var by = selectedBy(progress, info);
+    if (by) subs.push(by);
     if (st && has(st.epoch)) subs.push("stopped at epoch " + st.epoch + (st.reason ? " (" + st.reason + ")" : ""));
     else if (an && has(an.until)) subs.push("annealing (lower learning rate), stops at epoch " + an.until);
     else {
@@ -218,7 +246,7 @@
   }
 
   // ---- charts ----------------------------------------------------------------------------------
-  var QUALITY = /^(ema_)?(map|map50|map75|mar|iou|precision|recall|f1|f2|f0_5)$/;
+  var QUALITY = /^(ema_)?(map|map50|map75|mar|iou|precision|recall|f1|f2|f0_5)(_sup)?$/;
   function intTick(v) { return String(Math.round(v)); }
   // valFmt (optional): the hover and table text of a value (default: percent with pct, else 4
   // significant digits).
@@ -312,6 +340,69 @@
       b.addEventListener("click", function () { state.all[runId] = !all; wrap.parentNode.replaceChild(table(runId, history, cols, info, progress), wrap); });
       wrap.appendChild(b);
     }
+    return wrap;
+  }
+
+  // ---- per-class values ------------------------------------------------------------------------
+  // Pure: the per-class values (`class/<name>/ap50`, `ap`, `recall`, from the training script's
+  // class_metrics) of the best epoch (else the newest epoch that has them), with the validation
+  // boxes of the support event. {epoch, min, rows: [{name, boxes, ap50, ap, recall, few}]}, the
+  // most boxes first; `few`: under the support event's min_boxes ("too few to judge": shown,
+  // never averaged). Null without per-class values.
+  var CLASS_KEY = /^class\/(.+)\/(ap50|ap|recall)$/;
+  function classRows(progress) {
+    progress = progress || {};
+    var history = progress.history || [], best = progress.best;
+    var hasClass = function (h) { return Object.keys((h && h.metrics) || {}).some(function (k) { return CLASS_KEY.test(k); }); };
+    var row = best && has(best.epoch) ? history.filter(function (h) { return h.epoch === best.epoch; })[0] : null;
+    if (!hasClass(row)) {
+      row = null;
+      for (var i = history.length - 1; i >= 0 && !row; i--) if (hasClass(history[i])) row = history[i];
+    }
+    if (!row) return null;
+    var sup = progress.support || {}, boxes = sup.boxes || {};
+    var min = has(sup.min_boxes) && sup.min_boxes > 0 ? sup.min_boxes : null;
+    var by = {}, names = [];
+    Object.keys(row.metrics).forEach(function (k) {
+      var m = CLASS_KEY.exec(k), v = row.metrics[k];
+      if (!m || !has(v)) return;
+      if (!by[m[1]]) { by[m[1]] = { name: m[1], boxes: has(boxes[m[1]]) ? boxes[m[1]] : null, ap50: null, ap: null, recall: null }; names.push(m[1]); }
+      by[m[1]][m[2]] = v;
+    });
+    var rows = names.map(function (n) {
+      var r = by[n];
+      r.few = min !== null && r.boxes !== null && r.boxes < min;
+      return r;
+    });
+    rows.sort(function (a, b) {
+      var x = a.boxes === null ? -1 : a.boxes, y = b.boxes === null ? -1 : b.boxes;
+      return y - x || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    });
+    return { epoch: row.epoch, min: min, rows: rows };
+  }
+  function classTable(progress) {
+    var c = classRows(progress);
+    if (!c || !c.rows.length) return null;
+    var wrap = el("div", "tr-classes");
+    wrap.appendChild(el("h4", "tr-chart-title", "Per class, epoch " + c.epoch));
+    var sc = el("div", "scroll");
+    var t = el("table", "tr-mtable rcards"), thead = el("thead"), hr = el("tr");
+    var heads = [["Class", null, ""], ["Val boxes", "num", "Boxes in the validation split"], ["AP50", "num", "Average precision at IoU 0.5"],
+      ["AP50-95", "num", "Average precision over IoU 0.5-0.95 (the trainer's own)"], ["Recall", "num", "Recall at the selected F threshold (F1 when the run selects by something else)"], ["", null, ""]];
+    heads.forEach(function (h) { var th = el("th", h[1], h[0]); if (h[2]) th.title = h[2]; hr.appendChild(th); });
+    thead.appendChild(hr); t.appendChild(thead);
+    var tb = el("tbody");
+    c.rows.forEach(function (r) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "rc-title", r.name));
+      [["Val boxes", r.boxes === null ? "-" : String(r.boxes)], ["AP50", format("fixed3", r.ap50)], ["AP50-95", format("fixed3", r.ap)], ["Recall", format("fixed3", r.recall)]].forEach(function (p) {
+        tr.appendChild(el("td", "num", p[1])).setAttribute("data-label", p[0]);
+      });
+      tr.appendChild(el("td", "muted", r.few ? "too few to judge" : ""));
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); sc.appendChild(t); wrap.appendChild(sc);
+    if (c.min !== null) wrap.appendChild(el("p", "muted small", "Averages count the classes with at least " + c.min + " validation boxes; the others are shown, not averaged."));
     return wrap;
   }
 
@@ -420,8 +511,11 @@
     // dozens of raw keys still draws a few readable series; one epoch is no curve.
     var lossKeys = keys.filter(function (k) { return (k === "loss" || k === "val_loss" || cols.indexOf(k) >= 0) && /loss/i.test(k); });
     var isQuality = function (k) { return QUALITY.test(k) || (info(k).format === "pct" && !/loss/i.test(k)); };
-    var qualityKeys = cols.filter(function (k) { return keys.indexOf(k) >= 0 && isQuality(k); });
-    if (!qualityKeys.length) qualityKeys = ["map", "map50"].filter(function (k) { return keys.indexOf(k) >= 0; });
+    // What the run selects by leads the quality chart and the table when it is an average over
+    // the supported classes (`f2_sup`) no chosen column shows.
+    var rk = ruleKey(progress), lead = /_sup$/.test(rk) && keys.indexOf(rk) >= 0 && cols.indexOf(rk) < 0 ? [rk] : [];
+    var qualityKeys = lead.concat(cols.filter(function (k) { return keys.indexOf(k) >= 0 && isQuality(k); }));
+    if (!qualityKeys.length) qualityKeys = [rk, "map", "map50"].filter(function (k, i, a) { return a.indexOf(k) === i && keys.indexOf(k) >= 0; });
     if (history.length < 2) { lossKeys = []; qualityKeys = []; }
     var charts = el("div", "tr-charts");
     var c1 = chart(runId, "loss", "Loss", lossKeys, history, info, progress, function (v) { return String(+v.toPrecision(3)); }, false);
@@ -443,8 +537,10 @@
       host.appendChild(note);
     }
 
-    var tw = table(runId, history, cols, info, progress);
+    var tw = table(runId, history, lead.concat(cols), info, progress);
     if (tw) host.appendChild(tw);
+    var ct = classTable(progress);
+    if (ct) host.appendChild(ct);
     var available = opts.available && opts.available.length ? opts.available : keys;
     host.appendChild(picker(runId, cols, available, info, opts.onColumns));
     return true;
@@ -490,6 +586,7 @@
 
   window.TrainMetrics = {
     render: render, refresh: refresh, signature: signature, format: format, infoMap: infoMap, keysOf: keysOf,
-    overfitting: overfitting, shortSci: shortSci, constantOf: constantOf, poll: { have: pollHave, merge: pollMerge }
+    overfitting: overfitting, shortSci: shortSci, constantOf: constantOf, ruleKey: ruleKey, selectedBy: selectedBy,
+    classRows: classRows, poll: { have: pollHave, merge: pollMerge }
   };
 })();

@@ -441,9 +441,15 @@
     });
     d.appendChild(tools);
     var bad = ordered.map(function (e) { return e.comparable === undefined ? reasonsBetween(e, latest) : e.comparable ? [] : (e.reasons && e.reasons.length ? e.reasons : ["not comparable"]); });
+    // AP is a class average: a run that averaged other classes than the latest (another class
+    // set, or an older entry over every class) is a gap, never joined to the line.
+    var devOf = function (e, dv) { return (e.devices || []).find(function (q) { return q.device === dv; }); };
+    var basisOf = function (x) { return x ? PB.basisKey(x.ap_min_gt, (x.ap_classes || []).map(function (c) { return c["class"]; }), x.ap_fell_back) : ""; };
+    var otherBasis = {};
     var val = function (e, dv) {
       if (S.trend === "threshold") return e.threshold ? e.threshold.best : null;
-      var x = (e.devices || []).find(function (q) { return q.device === dv; }); if (!x || x.error) return null;
+      var x = devOf(e, dv); if (!x || x.error) return null;
+      if (S.trend === "ap50" && has(x.ap50) && basisOf(x) !== basisOf(devOf(latest, dv))) { otherBasis[e.run_id] = e; return null; }
       return S.trend === "p50" ? x.total_p50_ms : x.ap50;
     };
     var keys = S.trend === "threshold" ? ["model"] : devs.filter(function (dv) { return !S.trendOff[dv]; });
@@ -468,6 +474,11 @@
         },
         table: function () { return {head: ["Run"].concat(series.map(function (s) { return s.label; })), rows: ordered.map(function (e, k) { return [fmt.when(e.timestamp)].concat(series.map(function (s) { var v = s.points[k].y; return bad[k].length ? "not comparable" : isMs ? fmt.ms(v) : S.trend === "threshold" ? fmt.thr(v) : fmt.pct(v, 1); })); })}; }
       }));
+    }
+    var ob = ordered.filter(function (e, k) { return !bad[k].length && otherBasis[e.run_id]; });
+    if (ob.length) {
+      var obox = el("div", "nc-list"); obox.appendChild(el("p", "muted", "AP50 averaged over other classes than in the latest run (a class counts with at least " + PB.noise.min_class_gt + " objects; runs of older versions averaged every class), drawn as gaps:"));
+      var oul = el("ul"); ob.forEach(function (e) { oul.appendChild(el("li", null, fmt.when(e.timestamp))); }); obox.appendChild(oul); d.appendChild(obox);
     }
     var nc = ordered.filter(function (e, k) { return bad[k].length; });
     if (nc.length) {
