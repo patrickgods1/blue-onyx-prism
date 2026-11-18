@@ -764,7 +764,7 @@ pub fn plan_autolabel(
 /// The frame of a `train.txt` line (`./images/s0-day.back.2026-10-25.<stem>.jpg`): the file name
 /// [`crate::training::dataset`] gives it without its `s<N>-` source prefix, as an export's flat
 /// name. None: not a frame of a dataset folder (a public image).
-fn trained_frame(line: &str) -> Option<String> {
+pub(crate) fn trained_frame(line: &str) -> Option<String> {
     let name = line.trim().rsplit('/').next()?;
     let (source, flat) = name.strip_prefix('s')?.split_once('-')?;
     if source.is_empty() || !source.bytes().all(|b| b.is_ascii_digit()) {

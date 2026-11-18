@@ -10,7 +10,12 @@
 //! named. Explicit `holdout_cameras` / `holdout_days` decide when given;
 //! else a (camera, date) group is held out when the first 8 bytes of SHA-256(`camera/date`), as a
 //! fraction of 2^64, are below `holdout_fraction` (stable when days are added), with at least
-//! one group on each side once there are two groups.
+//! one group on each side once there are two groups. With [`ExportRequest::heldout`] (the Dataset
+//! tab's export only) the review folder's `heldout-days.json` ([`super::heldout`]) holds out every
+//! day it lists too, and an export of the default split adds its held-out days to it, plus days
+//! for cameras with fewer than two ([`ExportReport::heldout`]); exports of other settings only
+//! read it. Selections for other uses ([`reviewed_frames_filtered`], [`run_selected`], the dataset
+//! check's folds) never touch it.
 //!
 //! Class filter ([`ClassFilter`]): with `labels`, only frames with a training box of one of
 //! them are exported (other-class boxes in a kept frame stay labelled, class ids still follow
@@ -61,6 +66,7 @@
 
 use super::super::layout::{self, Rel, Walker};
 use super::super::record::{Bucket, Record};
+use super::heldout::{self, HeldoutPolicy, HeldoutReport};
 use super::xany;
 use super::{
     BoxState, Frame, LabelBox, LabelFile, ReviewPick, SizeFloor, Status, clamp_box, spots,
@@ -149,7 +155,8 @@ impl Default for SplitConfig {
 /// A (camera, date) group.
 pub type Group = (String, String);
 
-fn group_hash(g: &Group) -> u64 {
+/// First 8 bytes of SHA-256(`camera/date`): the rank of a group in the split.
+pub fn group_hash(g: &Group) -> u64 {
     use sha2::Digest;
     let d = sha2::Sha256::digest(format!("{}/{}", g.0, g.1).as_bytes());
     let mut b = [0u8; 8];
@@ -647,6 +654,11 @@ pub struct ExportRequest {
     /// ([`ExportFrame::under_floor`]; the X-AnyLabeling files keep them as they are). None = off,
     /// the export as before.
     pub size_floor: Option<SizeFloor>,
+    /// The camera days held out for good ([`heldout`]): read, and grown by an export of the
+    /// default split. None = the split alone, the list untouched (every export but the Dataset
+    /// tab's). Applied by [`run`] / [`run_filtered`] / [`run_filtered_with`], never by
+    /// [`run_selected`], whose frames carry their split.
+    pub heldout: Option<HeldoutPolicy>,
 }
 
 /// The training boxes an export's size floor made ignore regions ([`ExportReport::under_floor`]).
@@ -703,6 +715,10 @@ pub struct ExportReport {
     /// in `per_class`); absent when off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub under_floor: Option<UnderFloor>,
+    /// What the export did with the camera days held out for good ([`ExportRequest::heldout`]);
+    /// absent without.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heldout: Option<HeldoutReport>,
 }
 
 /// One (camera, date) group of an export.
@@ -1226,8 +1242,45 @@ pub fn run_filtered_with(
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
     filter.check(classes)?;
-    let selected = select_with(dir, classes, &req.split, filter, progress);
-    run_selected_with(dir, classes, req, filter, selected, progress)
+    let mut selected = select_with(dir, classes, &req.split, filter, progress);
+    let held = match &req.heldout {
+        Some(policy) => Some(frozen_split(dir, &mut selected, &req.split, policy)?),
+        None => None,
+    };
+    run_selected_with(dir, classes, req, filter, selected, held, progress)
+}
+
+/// The split of `selected` by [`heldout::apply`] (the listed days held out, the list grown by an
+/// export of the default split): after the walk, under the list's lock for the decision only.
+fn frozen_split(
+    dir: &Path,
+    selected: &mut Selection,
+    split: &SplitConfig,
+    policy: &HeldoutPolicy,
+) -> Result<HeldoutReport> {
+    let groups: BTreeSet<Group> = selected
+        .frames
+        .iter()
+        .map(|f| (f.rel.camera.clone(), f.rel.date.clone()))
+        .collect();
+    let (splits, report) =
+        heldout::apply(dir, &groups, split, policy, std::time::SystemTime::now())?;
+    for f in &mut selected.frames {
+        f.split = splits
+            .get(&(f.rel.camera.clone(), f.rel.date.clone()))
+            .copied()
+            .unwrap_or(Split::Train);
+    }
+    if policy.seen.is_none() && heldout::is_default_split(split) {
+        selected.warnings.push(
+            "the frame lists of past training runs (<training dir>/<run>/data/train.txt, \
+             valid.txt) could not all be read, so no camera day was added for a camera with too \
+             few held-out days: one of them may have been trained on. Check the training folder, \
+             then export again"
+                .into(),
+        );
+    }
+    Ok(report)
 }
 
 /// [`run_filtered`] of frames selected already ([`reviewed_frames_filtered`]), each with the split
@@ -1243,16 +1296,17 @@ pub fn run_selected(
     filter: &ClassFilter,
     selected: Selection,
 ) -> Result<ExportReport> {
-    run_selected_with(dir, classes, req, filter, selected, &|_| {})
+    run_selected_with(dir, classes, req, filter, selected, None, &|_| {})
 }
 
-/// [`run_selected`], telling `progress` where it is.
+/// [`run_selected`], telling `progress` where it is; `heldout` is what [`frozen_split`] did.
 fn run_selected_with(
     dir: &Path,
     classes: &[String],
     req: &ExportRequest,
     filter: &ClassFilter,
     selected: Selection,
+    heldout: Option<HeldoutReport>,
     progress: ProgressFn<'_>,
 ) -> Result<ExportReport> {
     if req.formats.is_empty() {
@@ -1303,6 +1357,7 @@ fn run_selected_with(
         filter,
         &target,
         &staging.build,
+        heldout,
         progress,
     );
     match report {
@@ -1321,7 +1376,8 @@ fn run_selected_with(
 /// reader of the export sees names `out`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the selection, what goes with it, the two folders and the progress report"
+    reason = "the selection, what goes with it, the two folders, the held-out list's report and \
+              the progress report"
 )]
 fn build_export(
     selected: Selection,
@@ -1331,6 +1387,7 @@ fn build_export(
     filter: &ClassFilter,
     out: &Path,
     build: &Path,
+    heldout: Option<HeldoutReport>,
     progress: ProgressFn<'_>,
 ) -> Result<ExportReport> {
     let Selection {
@@ -1355,6 +1412,7 @@ fn build_export(
         unreadable_folders,
         size_floor: req.size_floor,
         under_floor: req.size_floor.map(|_| UnderFloor::default()),
+        heldout,
         ..ExportReport::default()
     };
     let mut groups: BTreeMap<Group, (Split, usize)> = BTreeMap::new();
@@ -2101,6 +2159,7 @@ mod tests {
             include_unreviewed: false,
             hidden_classes: Vec::new(),
             size_floor: None,
+            heldout: None,
         };
         let filter = ClassFilter {
             labels: vec!["raccoon".into()],
@@ -2445,6 +2504,7 @@ mod tests {
             include_unreviewed: false,
             hidden_classes: Vec::new(),
             size_floor: floor,
+            heldout: None,
         };
         let off = run(&dir, &classes(), &req("off", None)).unwrap();
         let on = run(&dir, &classes(), &req("on", floor_384())).unwrap();
@@ -2588,6 +2648,7 @@ mod tests {
             include_unreviewed: false,
             hidden_classes: Vec::new(),
             size_floor: None,
+            heldout: None,
         };
         let r = run(&dir, &classes(), &req).unwrap();
         assert_eq!(
@@ -2708,6 +2769,7 @@ mod tests {
             include_unreviewed: false,
             hidden_classes: Vec::new(),
             size_floor: None,
+            heldout: None,
         }
     }
 

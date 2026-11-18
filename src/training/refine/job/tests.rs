@@ -613,9 +613,15 @@ fn a_check_writes_suggestions_and_the_report_and_nothing_else() {
             assert_eq!(now, was, "{} changed", p.display());
         }
     }
-    // The only new file is the report.
+    // The only new file is the report: the fold exports never read or write the camera days
+    // held out for good.
     let new: Vec<&PathBuf> = after.keys().filter(|p| !before.contains_key(*p)).collect();
     assert_eq!(new, [&PathBuf::from("refine").join("report.json")]);
+    assert!(!dir.join(crate::collect::labels::heldout::FILE).exists());
+    assert!(
+        !dir.join(crate::collect::labels::heldout::LOCK_FILE)
+            .exists()
+    );
     let report: report::RefineReport =
         serde_json::from_slice(&after[&PathBuf::from("refine").join("report.json")]).unwrap();
     assert_eq!(report.run, job.id);
@@ -2929,6 +2935,7 @@ fn size_floor_measure_on_a_copy() {
             include_unreviewed: false,
             hidden_classes: cfg.collect.hidden_classes.clone(),
             size_floor: f,
+            heldout: None,
         };
         let started = Instant::now();
         let r = ex::run(&dir, classes, &req).unwrap();

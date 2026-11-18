@@ -170,6 +170,15 @@ pub struct ClassLine {
     pub by_scene: SceneCounts,
 }
 
+/// A class of [`dataset::VALID_CLASS_FLOORS`] the run trains: its validation boxes and how many
+/// are wanted ([`Report::valid_floors`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidFloor {
+    pub class: String,
+    pub boxes: usize,
+    pub wanted: usize,
+}
+
 /// What a run of a plan would train on ([`report`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
@@ -180,6 +189,9 @@ pub struct Report {
     /// Training images per epoch (repeats counted).
     pub train_images: usize,
     pub valid_frames: usize,
+    /// The validation boxes of each class with a floor the run trains (person: 80 wanted; the
+    /// plan's warnings say why a floor is short).
+    pub valid_floors: Vec<ValidFloor>,
     pub heldout_frames: usize,
     /// Training frames without an object, and those a reviewer confirmed or rejected a box on.
     pub negatives: usize,
@@ -315,6 +327,15 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         train_frames: plan.train.len(),
         train_images: plan.train.iter().map(|(_, n)| *n as usize).sum(),
         valid_frames: plan.valid.len(),
+        valid_floors: dataset::VALID_CLASS_FLOORS
+            .iter()
+            .filter(|(c, _)| plan.classes.iter().any(|k| k == c))
+            .map(|(c, wanted)| ValidFloor {
+                class: (*c).to_string(),
+                boxes: s.valid_boxes.get(*c).copied().unwrap_or(0),
+                wanted: *wanted,
+            })
+            .collect(),
         heldout_frames: plan.heldout.len(),
         negatives: s.train_negatives,
         hard_negatives: s.hard_negatives,
@@ -356,6 +377,12 @@ pub fn text(r: &Report) -> String {
         "training frames per scene: day {}, night {}, ir {}, unknown {}\n",
         sc.day, sc.night, sc.ir, sc.unknown
     ));
+    for f in &r.valid_floors {
+        out.push_str(&format!(
+            "validation: {} {} boxes ({} wanted to choose the checkpoint on)\n",
+            f.boxes, f.class, f.wanted
+        ));
+    }
     out.push_str("boxes per class (train / validation / held out; train by day, night, ir):\n");
     for c in &r.classes {
         let s = &c.by_scene;

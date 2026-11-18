@@ -1,7 +1,8 @@
 // The export card's line about the dataset check's open suggestions (GET /v1/refine `open`: a walk
 // of the folder's label files that route keeps 60 s, so a load within the minute walks nothing
 // and a save shows within it; the route also reads both reports and the trained models' list,
-// kept a few seconds): pure, node-tested (tests/it/js_rules.rs), `globalThis.DatasetOpen`.
+// kept a few seconds): pure, node-tested (tests/it/js_rules.rs), `globalThis.DatasetOpen`; and
+// the export report's lines on the camera days held out for good, `globalThis.DatasetHeldout`.
 (function () {
   'use strict';
   function plural(n, one, many) { return n + ' ' + (n === 1 ? one : many); }
@@ -21,6 +22,35 @@
         link: 'Refine tab',
         after: ' first, or export anyway.'
       };
+    }
+  };
+
+  // The export report's camera days held out for good (`report.heldout`: {listed, added:
+  // [{camera, date, reason}], short: [{camera, held, wanted, why}], custom_split?}): the lines to
+  // show, [] without. At most LISTED added days are named.
+  var LISTED = 10;
+  var REASONS = { hash: 'split', 'camera-minimum': 'camera minimum' };
+  globalThis.DatasetHeldout = {
+    lines: function (h) {
+      if (!h) return [];
+      var out = [];
+      var added = h.added || [];
+      var days = plural(h.listed || 0, 'camera day', 'camera days') + ' held out for good';
+      if (h.custom_split) {
+        out.push(days + '; held out here too. Other split settings add none (only the default split does).');
+      } else if (added.length) {
+        var named = added.slice(0, LISTED).map(function (d) {
+          return d.camera + ' ' + d.date + ' (' + (REASONS[d.reason] || d.reason) + ')';
+        });
+        if (added.length > LISTED) named.push('and ' + (added.length - LISTED) + ' more');
+        out.push(days + '; added this export: ' + named.join(', '));
+      } else {
+        out.push(days + '; none added this export');
+      }
+      (h.short || []).forEach(function (s) {
+        out.push(s.camera + ': ' + s.held + ' of ' + s.wanted + ' held-out days; ' + s.why);
+      });
+      return out;
     }
   };
 })();
@@ -167,6 +197,7 @@
       }
       if (r.unreviewed_frames) lines.push(r.unreviewed_frames + ' unreviewed frame(s) added to the X-AnyLabeling folder');
       if (r.benchmark_dataset) lines.push('Benchmark: blue-onyx-prism benchmark --dataset "' + r.benchmark_dataset + '"');
+      lines = lines.concat(globalThis.DatasetHeldout.lines(r.heldout));
       report(box, lines, r.warnings);
       counted();
       return refreshCards();

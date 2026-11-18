@@ -811,6 +811,9 @@ impl RefineJob {
             // out, and the recall by size would only repeat the floor). The judge still treats
             // a box under the floor as an ignore region.
             size_floor: None,
+            // A fold's split is its own: the camera days held out for good are never read or
+            // grown by it.
+            heldout: None,
         };
         let exported = export::run_selected(
             &self.dataset_dir,
@@ -840,6 +843,9 @@ impl RefineJob {
         tj.export_only = None;
         // Its export has no floor on purpose: no warning that it differs from the current one.
         tj.options.size_floor = None;
+        // Its export's split is the fold: a camera day held out for good from the benchmark is
+        // still a training day of the other folds here (its frames are judged by their own fold).
+        tj.options.frozen_heldout.clear();
         let trained = job::run_training_holding(
             &tj,
             lock,

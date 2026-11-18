@@ -16,6 +16,7 @@ use crate::collect::CollectSettings;
 use crate::collect::labels::export::{
     self, BenchSplit, ClassFilter, ExportRequest, Format, SplitConfig,
 };
+use crate::collect::labels::heldout::HeldoutPolicy;
 use crate::collect::labels::{self, bulk, xany};
 use crate::server::side_jobs::{self, SideKind};
 use crate::server::{browse, save_config};
@@ -275,6 +276,11 @@ pub(in crate::server) async fn export(
             include_unreviewed: b.include_unreviewed,
             hidden_classes: hidden(&state),
             size_floor: state.config_read().collect.size_floor,
+            // The camera days held out for good: read, and grown by an export of the default
+            // split, never with a day a training run has seen.
+            heldout: Some(HeldoutPolicy {
+                seen: crate::training::seen_days(&state.config_read()),
+            }),
         };
         let job = state
             .side_jobs
