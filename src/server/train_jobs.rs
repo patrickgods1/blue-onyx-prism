@@ -1,7 +1,18 @@
 //! The Jobs tab of the Train area (`GET /train/jobs`) and what fills it (`GET /v1/train/jobs`,
-//! drawn by `assets/train-area.js`): every import, auto-label run, overlap check and training run
-//! on the queue in one list, with its step, percent, time left and a link to its row on its own
-//! tab. Read from the queue's memory, no disk, so the page can ask every few seconds.
+//! drawn by `assets/train-area.js`): every job a person started that is still working, in one
+//! list, with its step, percent, time left and a link to where it lives:
+//!
+//! - the training queue: imports, auto-label runs, overlap checks, dataset checks and training
+//!   runs (their rows on their own tabs, `#job-<id>`);
+//! - side jobs beside it ([`super::side_jobs`]): dataset exports and X-AnyLabeling imports of the
+//!   Dataset tab (`side-<n>`);
+//! - a benchmark run (`/benchmark`, id `benchmark`), from the benchmark runner's progress;
+//! - model exports, queued or running (the Config page's exported models, id
+//!   `model-export-<resource>`), from the exporter's state.
+//!
+//! The ids never collide: queue ids are times, the others carry their prefix. Everything is read
+//! from memory (the queue's records, the side jobs, the benchmark runner, the exporter), no disk,
+//! so the page can ask every few seconds.
 //!
 //! The estimates say what they cover. Training comes from its epochs and is a range, from the
 //! early stop if nothing improves any more to the epoch cap, and leaves out the export and the
@@ -9,9 +20,12 @@
 //! ([`crate::training::eta`]), and the steps after it are unknown, so a step that is not the job's
 //! last says "in this step".
 
+use super::side_jobs::SideView;
 use super::train_area::{JOBS, TRAIN, tab_title, task_tab};
 use super::{AppState, blocking, render, training};
-use crate::training::estimate::format_duration;
+use crate::benchmark::service::Running as BenchRunning;
+use crate::resources::export::{ExportState, ExportStatus};
+use crate::training::estimate::{format_duration, to_u64};
 use crate::training::eta::JobTiming;
 use crate::training::job::TrainStage;
 use crate::training::progress::TrainProgress;
@@ -23,6 +37,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Under this an estimate is "under a minute" and a range's two ends read as one.
 const SAME_ESTIMATE_S: f64 = 60.0;
@@ -49,13 +64,13 @@ pub(super) async fn page() -> Response {
     })
 }
 
-/// A job on the queue.
+/// A job of the list: on the queue or beside it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(super) struct JobLine {
     pub(super) id: String,
-    /// "Training", "Import", ...
+    /// "Training", "Import", "Dataset export", "Benchmark", ...
     pub(super) kind: &'static str,
-    /// The run's model name, the task's title.
+    /// The run's model name, the task's title, the export's formats and folder, ...
     pub(super) title: String,
     pub(super) paused: bool,
     /// Waiting for its turn: nothing to measure yet.
@@ -70,9 +85,9 @@ pub(super) struct JobLine {
     pub(super) percent: u8,
     /// `about 12 min left in this step`, `running for 3 min` until it can tell.
     pub(super) time: String,
-    /// The tab's title, for the link.
+    /// The tab's (or page's) title, for the link.
     pub(super) tab: &'static str,
-    /// The job's row on its tab.
+    /// The job's row on its tab, or the card or page that shows it.
     pub(super) link: String,
 }
 
@@ -219,11 +234,206 @@ fn task_line(t: &TaskRecord, timing: Option<JobTiming>, tasks: &[TaskRecord]) ->
     }
 }
 
-/// Every job of `runs` and `tasks` on the queue; `timing` is the queue's clock.
+/// What works beside the queue, read at `now` ([`beside`]).
+#[derive(Debug, Clone)]
+pub(super) struct Beside {
+    pub(super) side: Vec<SideView>,
+    pub(super) benchmark: Option<BenchRunning>,
+    /// The exporter's busy (queued or running) exports.
+    pub(super) exports: Vec<ExportStatus>,
+    pub(super) now: Instant,
+}
+
+impl Default for Beside {
+    fn default() -> Self {
+        Self {
+            side: Vec::new(),
+            benchmark: None,
+            exports: Vec::new(),
+            now: Instant::now(),
+        }
+    }
+}
+
+/// What works beside the queue now: memory only, one short lock each.
+fn beside(state: &AppState) -> Beside {
+    let now = Instant::now();
+    let exports = state
+        .resources
+        .as_ref()
+        .and_then(|c| c.provisioner.exporter())
+        .map(|e| e.statuses())
+        .unwrap_or_default();
+    Beside {
+        side: state.side_jobs.views(now),
+        benchmark: state.benchmark.running(),
+        exports: exports.into_iter().filter(|s| s.state.is_busy()).collect(),
+        now,
+    }
+}
+
+/// A clock that only says how long a job ran, and its estimate of the rest when it has one.
+fn plain_timing(elapsed_s: f64, left_s: Option<f64>) -> JobTiming {
+    JobTiming {
+        elapsed_s,
+        paused_s: 0.0,
+        step_left_s: left_s,
+    }
+}
+
+/// Seconds from `since` to `now`.
+fn seconds(since: Instant, now: Instant) -> f64 {
+    now.saturating_duration_since(since).as_secs_f64()
+}
+
+fn side_line(v: &SideView) -> JobLine {
+    let r = v.report.as_ref();
+    JobLine {
+        id: v.id.clone(),
+        kind: v.kind.label(),
+        title: v.title.clone(),
+        paused: false,
+        queued: false,
+        // A job of one step has no "Step 1 of 1".
+        step: r
+            .filter(|r| r.steps > 1)
+            .map_or_else(String::new, |r| step_text(r.step, r.steps)),
+        phase: r.map_or_else(String::new, |r| capitalised(r.stage)),
+        detail: r.map_or_else(String::new, |r| r.detail.clone()),
+        percent: r.map_or(0, |r| r.percent),
+        time: time_text(
+            false,
+            r.is_none_or(|r| r.step >= r.steps),
+            r.map(|_| v.timing),
+            None,
+        ),
+        tab: tab_title(v.kind.tab()),
+        link: format!("/train/{}#{}", v.kind.tab(), v.kind.anchor()),
+    }
+}
+
+/// Models a benchmark line names before "and N more".
+const BENCH_TITLE_MODELS: usize = 3;
+
+/// The benchmark run's title: its models.
+fn bench_title(models: &[String]) -> String {
+    match models.len() {
+        0 => "The enabled models".to_string(),
+        n if n <= BENCH_TITLE_MODELS => models.join(", "),
+        n => format!(
+            "{} and {} more",
+            models
+                .iter()
+                .take(BENCH_TITLE_MODELS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            n - BENCH_TITLE_MODELS
+        ),
+    }
+}
+
+/// The running benchmark, from the runner's own progress (`GET /v1/benchmark`).
+fn bench_line(b: &BenchRunning, now: Instant) -> JobLine {
+    let p = b.progress.as_ref();
+    let phase = match p.map(|p| p.stage.as_str()) {
+        None => String::new(),
+        Some("download") => "Downloading image sets".to_string(),
+        Some("pseudo-gt") => "Reference labels".to_string(),
+        Some("benchmark") => "Measuring".to_string(),
+        Some(other) => capitalised(other),
+    };
+    let step = p
+        .filter(|p| p.stage == "benchmark" && p.runs_total > 0)
+        .map_or_else(String::new, |p| {
+            let run = (p.runs_done + 1).min(p.runs_total);
+            format!("Run {run} of {}", p.runs_total)
+        });
+    let detail = p.map_or_else(String::new, |p| {
+        if !p.text.is_empty() {
+            capitalised(&p.text)
+        } else if p.model.is_empty() {
+            String::new()
+        } else if p.total > 0 {
+            format!(
+                "{} on {}: {} {} of {}",
+                p.model, p.device, p.phase, p.done, p.total
+            )
+        } else {
+            format!("{} on {}: {}", p.model, p.device, p.phase)
+        }
+    });
+    let timing = b
+        .started
+        .filter(|_| p.is_some())
+        .map(|s| plain_timing(seconds(s, now), p.and_then(|p| p.eta_secs)));
+    JobLine {
+        id: "benchmark".to_string(),
+        kind: "Benchmark",
+        title: bench_title(&b.models),
+        paused: false,
+        queued: false,
+        step,
+        phase,
+        detail,
+        percent: p.map_or(0, |p| {
+            u8::try_from(to_u64(p.percent.min(100.0))).unwrap_or(100)
+        }),
+        // The runner's estimate covers the whole run.
+        time: time_text(false, true, timing, None),
+        tab: "Benchmark",
+        link: "/benchmark".to_string(),
+    }
+}
+
+/// A model export of the exporter that is queued or running (None for any other state).
+fn export_line(s: &ExportStatus, now: Instant) -> Option<JobLine> {
+    let base = |queued: bool| JobLine {
+        id: format!("model-export-{}", s.id),
+        kind: "Model export",
+        title: s.title.to_string(),
+        paused: false,
+        queued,
+        step: String::new(),
+        phase: String::new(),
+        detail: String::new(),
+        percent: 0,
+        time: WAITING.to_string(),
+        tab: "Resources",
+        link: "/config#res-models-export".to_string(),
+    };
+    match &s.state {
+        ExportState::Queued => Some(base(true)),
+        ExportState::Running {
+            stage,
+            step,
+            steps,
+            percent,
+            detail,
+        } => Some(JobLine {
+            step: step_text(*step, *steps),
+            phase: capitalised(stage.label()),
+            detail: detail.clone(),
+            percent: *percent,
+            time: time_text(
+                false,
+                step >= steps,
+                s.started.map(|t| plain_timing(seconds(t, now), None)),
+                None,
+            ),
+            ..base(false)
+        }),
+        _ => None,
+    }
+}
+
+/// Every job of `runs` and `tasks` on the queue (`timing` is the queue's clock) and what works
+/// `beside` it: queue jobs first, then side jobs, the benchmark and model exports.
 pub(super) fn view(
     runs: &[RunRecord],
     tasks: &[TaskRecord],
     timing: &dyn Fn(&str) -> Option<JobTiming>,
+    beside: &Beside,
 ) -> Jobs {
     let lines = |keep: &dyn Fn(RunState) -> bool| -> Vec<JobLine> {
         runs.iter()
@@ -237,10 +447,19 @@ pub(super) fn view(
             )
             .collect()
     };
-    Jobs {
-        active: lines(&RunState::is_active),
-        queued: lines(&|s| s == RunState::Queued),
-    }
+    let exports = beside
+        .exports
+        .iter()
+        .filter_map(|s| export_line(s, beside.now));
+    let (queued_exports, running_exports): (Vec<JobLine>, Vec<JobLine>) =
+        exports.partition(|l| l.queued);
+    let mut active = lines(&RunState::is_active);
+    active.extend(beside.side.iter().map(side_line));
+    active.extend(beside.benchmark.iter().map(|b| bench_line(b, beside.now)));
+    active.extend(running_exports);
+    let mut queued = lines(&|s| s == RunState::Queued);
+    queued.extend(queued_exports);
+    Jobs { active, queued }
 }
 
 /// Query of `GET /v1/train/jobs`: `task=<id>` adds that task's record (`task`, null when there
@@ -272,13 +491,14 @@ fn answer(
     runs: &[RunRecord],
     tasks: &[TaskRecord],
     timing: &dyn Fn(&str) -> Option<JobTiming>,
+    beside: &Beside,
     q: &JobsQuery,
 ) -> serde_json::Value {
     let mut v = serde_json::Map::new();
     v.insert("success".into(), true.into());
     v.insert(
         "jobs".into(),
-        serde_json::to_value(view(runs, tasks, timing)).unwrap_or_default(),
+        serde_json::to_value(view(runs, tasks, timing, beside)).unwrap_or_default(),
     );
     if let Some(id) = q.task.as_deref() {
         let t = tasks.iter().find(|t| t.id == id);
@@ -293,7 +513,8 @@ fn answer(
 
 /// `GET /v1/train/jobs` (`?task=<id>`, `?tasks=busy`: [`JobsQuery`]). Off the async workers: the
 /// queue's records are cloned under its locks and, without a started queue, `runs.json` and
-/// `tasks.json` are read; the answer is serialized there too.
+/// `tasks.json` are read; what works beside the queue is read from memory ([`beside`]); the
+/// answer is serialized there too.
 pub(super) async fn jobs(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<JobsQuery>,
@@ -303,6 +524,7 @@ pub(super) async fn jobs(
             &training::records(&state),
             &training::tasks(&state),
             &training::job_timing,
+            &beside(&state),
             &q,
         );
         Json(v).into_response()
@@ -316,6 +538,11 @@ mod tests {
     use crate::training::dataset::SceneFilter;
 
     const NO_CLOCK: fn(&str) -> Option<JobTiming> = |_| None;
+
+    /// Nothing beside the queue.
+    fn none() -> Beside {
+        Beside::default()
+    }
 
     fn clock(elapsed_s: f64, step_left_s: Option<f64>) -> JobTiming {
         JobTiming {
@@ -354,7 +581,7 @@ mod tests {
     #[test]
     fn a_task_line_says_step_detail_time_and_where_it_lives() {
         let tasks = [task("t1", TaskKind::Autolabel, RunState::Running)];
-        let v = view(&[], &tasks, &|_| Some(clock(300.0, Some(720.0))));
+        let v = view(&[], &tasks, &|_| Some(clock(300.0, Some(720.0))), &none());
         assert_eq!(v.active.len(), 1);
         let l = &v.active[0];
         assert_eq!(l.kind, "Auto-label");
@@ -375,7 +602,7 @@ mod tests {
             task("f", TaskKind::Refine, RunState::Running),
         ];
         let runs = [run("r", RunState::Running)];
-        let v = view(&runs, &tasks, &NO_CLOCK);
+        let v = view(&runs, &tasks, &NO_CLOCK, &none());
         let links: Vec<_> = v.active.iter().map(|l| l.link.as_str()).collect();
         assert_eq!(
             links,
@@ -394,7 +621,7 @@ mod tests {
         let mut t = task("t", TaskKind::Import, RunState::Running);
         t.step = 7;
         t.steps = 7;
-        let v = view(&[], &[t], &|_| Some(clock(10.0, Some(30.0))));
+        let v = view(&[], &[t], &|_| Some(clock(10.0, Some(30.0))), &none());
         assert_eq!(v.active[0].time, "under a minute left");
     }
 
@@ -460,7 +687,7 @@ mod tests {
             run("r2", RunState::Cancelled),
             run("r3", RunState::Done),
         ];
-        let v = view(&runs, &tasks, &NO_CLOCK);
+        let v = view(&runs, &tasks, &NO_CLOCK, &none());
         assert!(v.active.is_empty());
         let q: Vec<_> = v
             .queued
@@ -490,17 +717,17 @@ mod tests {
         done.result = Some(serde_json::json!({ "frames": 900 }));
         done.summary = Some("labelled 900 frames".into());
         let tasks = [done, task("o", TaskKind::Overlaps, RunState::Running)];
-        let plain = answer(&[], &tasks, &NO_CLOCK, &JobsQuery::default());
+        let plain = answer(&[], &tasks, &NO_CLOCK, &none(), &JobsQuery::default());
         assert!(plain.get("task").is_none() && plain.get("tasks").is_none());
         assert_eq!(
             plain["jobs"],
-            serde_json::to_value(view(&[], &tasks, &NO_CLOCK)).unwrap()
+            serde_json::to_value(view(&[], &tasks, &NO_CLOCK, &none())).unwrap()
         );
         let q = JobsQuery {
             task: Some("d".into()),
             tasks: Some("busy".into()),
         };
-        let v = answer(&[], &tasks, &NO_CLOCK, &q);
+        let v = answer(&[], &tasks, &NO_CLOCK, &none(), &q);
         assert_eq!(v["task"]["state"], "done");
         assert_eq!(v["task"]["summary"], "labelled 900 frames");
         assert!(v["task"].get("log").is_none() && v["task"].get("result").is_none());
@@ -516,12 +743,194 @@ mod tests {
             task: Some("nope".into()),
             tasks: None,
         };
-        assert!(answer(&[], &tasks, &NO_CLOCK, &gone)["task"].is_null());
+        assert!(answer(&[], &tasks, &NO_CLOCK, &none(), &gone)["task"].is_null());
+    }
+
+    fn export_status(
+        id: &'static str,
+        state: ExportState,
+        started: Option<Instant>,
+    ) -> ExportStatus {
+        ExportStatus {
+            id,
+            title: "YOLO26 s",
+            state,
+            log: vec!["a child line".into()],
+            started,
+        }
+    }
+
+    /// Everything beside the queue at once: an export of the Dataset tab, a benchmark run, a
+    /// running and a queued model export, beside a training run.
+    fn busy_beside() -> (
+        Beside,
+        Arc<crate::server::side_jobs::SideJobs>,
+        crate::server::side_jobs::SideJob,
+    ) {
+        use crate::benchmark::service::ProgressView;
+        use crate::resources::export::Stage;
+        use crate::server::side_jobs::{SideJobs, SideKind, export_report};
+        let now = Instant::now();
+        let ago = |s: u64| now.checked_sub(std::time::Duration::from_secs(s)).unwrap();
+        let jobs = Arc::new(SideJobs::default());
+        let job = jobs.start(SideKind::DatasetExport, "YOLO, COCO to D:/exports/a".into());
+        job.report(export_report(
+            crate::collect::labels::export::ExportStep::Writing { done: 50, of: 100 },
+        ));
+        let beside = Beside {
+            side: jobs.views(now),
+            benchmark: Some(BenchRunning {
+                models: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                progress: Some(ProgressView {
+                    stage: "benchmark".into(),
+                    model: "a".into(),
+                    device: "openvino:gpu".into(),
+                    phase: "timing".into(),
+                    done: 40,
+                    total: 200,
+                    runs_done: 2,
+                    runs_total: 8,
+                    percent: 31.6,
+                    eta_secs: Some(600.0),
+                    ..ProgressView::default()
+                }),
+                started: Some(ago(300)),
+            }),
+            exports: vec![
+                export_status(
+                    "model:yolo26s",
+                    ExportState::Running {
+                        stage: Stage::Packages,
+                        step: 3,
+                        steps: 8,
+                        percent: 40,
+                        detail: "downloading torch".into(),
+                    },
+                    Some(ago(240)),
+                ),
+                export_status("model:yolo26m", ExportState::Queued, None),
+            ],
+            now,
+        };
+        (beside, jobs, job)
+    }
+
+    #[test]
+    fn exports_imports_benchmarks_and_model_exports_are_listed_beside_the_queue() {
+        let (beside, _jobs, _job) = busy_beside();
+        let runs = [run("r", RunState::Running)];
+        let v = view(&runs, &[], &NO_CLOCK, &beside);
+        let ids: Vec<_> = v.active.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["r", "side-1", "benchmark", "model-export-model:yolo26s"]
+        );
+
+        let side = &v.active[1];
+        assert_eq!(side.kind, "Dataset export");
+        assert_eq!(side.title, "YOLO, COCO to D:/exports/a");
+        assert_eq!(side.step, "Step 2 of 3");
+        assert_eq!(side.phase, "Writing files");
+        assert_eq!(side.detail, "50 of 100 files written");
+        assert_eq!(side.percent, 61);
+        assert_eq!(
+            (side.tab, side.link.as_str()),
+            ("Dataset", "/train/dataset#export")
+        );
+        assert!(side.time.starts_with("running for"), "{}", side.time);
+
+        let b = &v.active[2];
+        assert_eq!(b.kind, "Benchmark");
+        assert_eq!(b.title, "a, b, c and 1 more");
+        assert_eq!(b.step, "Run 3 of 8");
+        assert_eq!(b.phase, "Measuring");
+        assert_eq!(b.detail, "a on openvino:gpu: timing 40 of 200");
+        assert_eq!(b.percent, 32);
+        assert_eq!(b.time, "about 10 min left");
+        assert_eq!((b.tab, b.link.as_str()), ("Benchmark", "/benchmark"));
+
+        let e = &v.active[3];
+        assert_eq!(e.kind, "Model export");
+        assert_eq!(e.title, "YOLO26 s");
+        assert_eq!(e.step, "Step 3 of 8");
+        assert_eq!(e.phase, "Installing the pinned Python packages");
+        assert_eq!(e.detail, "downloading torch");
+        assert_eq!(e.percent, 40);
+        assert_eq!(e.time, "running for 4 min");
+        assert_eq!(e.link, "/config#res-models-export");
+
+        let q: Vec<_> = v
+            .queued
+            .iter()
+            .map(|l| (l.id.as_str(), l.queued, l.time.as_str()))
+            .collect();
+        assert_eq!(q, [("model-export-model:yolo26m", true, WAITING)]);
+
+        // One id per line across every source.
+        let mut all: Vec<_> = v
+            .active
+            .iter()
+            .chain(&v.queued)
+            .map(|l| l.id.clone())
+            .collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n);
+    }
+
+    #[test]
+    fn a_side_job_ends_its_line_when_its_guard_drops() {
+        let (beside, jobs, job) = busy_beside();
+        assert!(
+            view(&[], &[], &NO_CLOCK, &beside)
+                .active
+                .iter()
+                .any(|l| l.id == "side-1")
+        );
+        drop(job);
+        let now = Beside {
+            side: jobs.views(Instant::now()),
+            ..Beside::default()
+        };
+        assert!(view(&[], &[], &NO_CLOCK, &now).active.is_empty());
+    }
+
+    #[test]
+    fn a_side_job_before_its_first_report_is_starting_and_a_benchmark_before_its_first_too() {
+        use crate::server::side_jobs::{SideJobs, SideKind};
+        let jobs = Arc::new(SideJobs::default());
+        let _g = jobs.start(SideKind::XanyImport, "From D:/x".into());
+        let beside = Beside {
+            side: jobs.views(Instant::now()),
+            benchmark: Some(BenchRunning {
+                models: Vec::new(),
+                progress: None,
+                started: Some(Instant::now()),
+            }),
+            ..Beside::default()
+        };
+        let v = view(&[], &[], &NO_CLOCK, &beside);
+        let l = &v.active[0];
+        assert_eq!(
+            (l.kind, l.time.as_str(), l.percent),
+            ("X-AnyLabeling import", "starting", 0)
+        );
+        assert_eq!(l.step, "");
+        assert_eq!(l.link, "/train/dataset#xany-import");
+        let b = &v.active[1];
+        assert_eq!(
+            (b.title.as_str(), b.time.as_str()),
+            ("The enabled models", "starting")
+        );
+        // A finished or failed model export is no job.
+        let gone = export_status("x", ExportState::Installed, None);
+        assert!(export_line(&gone, Instant::now()).is_none());
     }
 
     #[test]
     fn nothing_on_the_queue_is_an_empty_summary() {
         let done = [task("d", TaskKind::Import, RunState::Done)];
-        assert_eq!(view(&[], &done, &NO_CLOCK), Jobs::default());
+        assert_eq!(view(&[], &done, &NO_CLOCK, &none()), Jobs::default());
     }
 }

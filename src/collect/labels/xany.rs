@@ -9,7 +9,8 @@
 //! a reviewed frame. Import ([`import_dir`], [`apply_import`]) reads such files back: a file
 //! counts as reviewed when `checked` is true (or the caller treats unchecked files as reviewed,
 //! except one with no shapes: nobody looked at that frame) and its shapes become the frame's
-//! complete set of training boxes (see [`apply_import`]).
+//! complete set of training boxes (see [`apply_import`]). [`import_dir_with`] reports the files
+//! looked at, for a caller that shows a running import.
 
 use super::export::parse_flat_name;
 use super::{BoxState, Frame, LabelBox, LabelFile, Source, Status, iou, normalize};
@@ -314,6 +315,28 @@ pub fn import_dir(
     treat_unchecked_as_reviewed: bool,
     now: &str,
 ) -> Result<ImportReport> {
+    import_dir_with(
+        dir,
+        src,
+        classes,
+        hidden,
+        treat_unchecked_as_reviewed,
+        now,
+        &|_, _| {},
+    )
+}
+
+/// [`import_dir`], calling `progress(done, of)` with the JSON files looked at so far of the
+/// folder's `of`: once before the first and after each one.
+pub fn import_dir_with(
+    dir: &Path,
+    src: &Path,
+    classes: &[String],
+    hidden: &[String],
+    treat_unchecked_as_reviewed: bool,
+    now: &str,
+    progress: &dyn Fn(usize, usize),
+) -> Result<ImportReport> {
     let mut names: Vec<String> = std::fs::read_dir(src)
         .with_context(|| format!("reading {}", src.display()))?
         .flatten()
@@ -331,7 +354,9 @@ pub fn import_dir(
     }
     let mut r = ImportReport::default();
     let mut unchecked_empty = 0usize;
-    for name in names {
+    let of = names.len();
+    progress(0, of);
+    for (i, name) in names.into_iter().enumerate() {
         let path = src.join(&name);
         let one = (|| -> Result<Option<()>> {
             let bytes = super::read_capped(&path, MAX_IMPORT_FILE_BYTES)?;
@@ -387,6 +412,7 @@ pub fn import_dir(
         if let Err(e) = one {
             r.errors.push(format!("{name}: {e:#}"));
         }
+        progress(i + 1, of);
     }
     if unchecked_empty > 0 {
         r.warnings.push(format!(

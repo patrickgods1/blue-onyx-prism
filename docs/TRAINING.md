@@ -2726,6 +2726,27 @@ finished model nobody decided about, nothing collected yet, then:
 The link is hidden on its own tab unless it asks for a list or card the page is not on (Review's
 `?auto=refine`, Refine's `#quick-check`).
 
+### Jobs tab
+
+The Jobs tab (`/train/jobs`, `GET /v1/train/jobs`, `server/train_jobs.rs`) lists every job a person
+started that is still working, with its step, percent, time left and a link to where it lives; the
+count on the tab's label on every Train tab comes from the same answer. Everything is read from memory
+(the page asks every 3 s):
+
+| Kind | Source | Link |
+|---|---|---|
+| Import, Auto-label, Overlap check, Dataset check, Training | the one-at-a-time queue (`runs.json`, `tasks.json`), running, paused or queued | the job's row on its tab, `#job-<id>` |
+| Dataset export, X-AnyLabeling import | side jobs (`server/side_jobs.rs`): the Dataset tab's `POST /v1/review/export` and `/import`, registered while they work | the Dataset tab's Export or Import card |
+| Benchmark | the benchmark runner's progress (`GET /v1/benchmark`): run *n* of *m* (model x device), the runner's own estimate | `/benchmark` |
+| Model export | the exporter's state (Config page, Resources), queued or running | `/config#res-models-export` |
+
+A side job runs inside its request, never behind the queue: the answer still comes when it is done, and
+a browser that leaves the page does not stop it, so the Jobs tab shows it until it ends (a guard removes
+it then, also after an error). An export moves through *selecting frames* (label files read), *writing
+files* (every image placed and per-frame label file written) and *publishing*; an import counts its
+files. While it waits, the Dataset tab shows the same line under its form. A training run's own
+benchmark step uses the benchmark runner, so it also shows as a Benchmark line with its progress.
+
 ### Review pace in boxes
 
 The Review tab's session line counts effort in boxes, since active-learning gains largely vanish when

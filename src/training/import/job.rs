@@ -814,14 +814,28 @@ impl ImportJob {
                     "1080".into(),
                 ],
                 "import",
-                &mut |ev, _| match ev.get("event").and_then(serde_json::Value::as_str) {
+                &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
                     Some("fetched") => fetched = Some(ev.clone()),
                     Some("progress") => {
                         let n = |k: &str| ev.get(k).and_then(serde_json::Value::as_u64);
-                        let rest = n("total")
-                            .unwrap_or(0)
-                            .saturating_sub(n("bytes").unwrap_or(0));
-                        guard.check_work_for(rest);
+                        let (bytes, total) = (n("bytes").unwrap_or(0), n("total").unwrap_or(0));
+                        guard.check_work_for(total.saturating_sub(bytes));
+                        // The second half of the step (the first is the pinned downloads).
+                        if let Some(share) = (49 * bytes.min(total)).checked_div(total) {
+                            let pct = 50 + share;
+                            stage(
+                                report,
+                                STAGES[2],
+                                3,
+                                STAGES.len(),
+                                u8::try_from(pct).unwrap_or(99),
+                                &format!(
+                                    "downloading the video with yt-dlp: {} of {} MB",
+                                    bytes / 1_000_000,
+                                    total / 1_000_000
+                                ),
+                            );
+                        }
                     }
                     _ => {}
                 },
@@ -1370,6 +1384,14 @@ impl ImportJob {
                 write::Step::Before(k) => {
                     if k % 10 == 0 {
                         guard.check_dataset();
+                        // 60..100 of the step: `k` frames are behind (written or skipped).
+                        let pct = 60 + 40 * k / n_write.max(1);
+                        self.step(
+                            report,
+                            7,
+                            u8::try_from(pct.min(99)).unwrap_or(99),
+                            &format!("{k} of {n_write} frames written"),
+                        );
                     }
                     check(cancel)
                 }

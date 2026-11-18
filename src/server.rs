@@ -57,6 +57,7 @@ mod refine_spots;
 mod resources;
 mod review;
 mod sam3_access;
+pub(crate) mod side_jobs;
 mod status;
 mod storage;
 #[cfg(test)]
@@ -119,6 +120,9 @@ pub struct AppState {
     pub(crate) resources: Option<crate::resources::status::ResourcesCtx>,
     /// Benchmark runner (one per process, shared by every generation).
     pub(crate) benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    /// Running exports and imports of the Dataset tab, for the Jobs tab (one per process, shared
+    /// by every generation: [`side_jobs`]).
+    pub(crate) side_jobs: Arc<side_jobs::SideJobs>,
     /// Wrong API tokens per peer (one list for the process, like the config).
     pub(crate) admin_failures: Arc<std::sync::Mutex<FailureLimit>>,
     /// Wrong passwords and setup codes per peer, the hashing permits (one for the process).
@@ -171,6 +175,7 @@ impl AppState {
             restart: CancellationToken::new(),
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
+            side_jobs: Arc::default(),
             admin_failures: Arc::default(),
             login: Arc::default(),
             auth: Arc::new(auth),

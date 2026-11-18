@@ -1,8 +1,9 @@
 // Train area, every tab: the status strip under the tabs (counts per tab and the one suggested next
 // action, GET /v1/train/summary, filled after the page is up so a large dataset never holds it back),
-// the Jobs tab's list of every job on the queue (GET /v1/train/jobs, every 3 s on that tab: step,
-// percent, time left, a link to the job's row on its tab), the count on that tab's label, and the
-// URL. A form's answer is the tab itself, rendered at the form's POST address: the address
+// the Jobs tab's list of every job still working (GET /v1/train/jobs, every 3 s on that tab: step,
+// percent, time left, a link to where it lives): the training queue's jobs, and beside it the
+// Dataset tab's exports and X-AnyLabeling imports, a benchmark run and model exports; the count
+// on that tab's label, and the URL. A form's answer is the tab itself, rendered at the form's POST address: the address
 // bar goes to the tab's own URL, so a reload shows it again instead of asking to resubmit. An old
 // /training#import link (the redirect keeps its fragment) goes on to the card's new tab, and a
 // #fragment inside a closed section opens it.

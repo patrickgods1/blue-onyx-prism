@@ -54,6 +54,10 @@
 //!
 //! A reviewed frame that lost its image or sidecar and a folder that cannot be listed cannot be
 //! exported; the report counts them (`lost_frames`, `unreadable_folders`) and warns.
+//!
+//! Progress ([`run_filtered_with`], [`ExportStep`]): the label files read, every image placed and
+//! per-frame label file written, then the publish, for a caller that shows a running export (the
+//! Jobs tab of the Train area). The plain entry points report to nobody.
 
 use super::super::layout::{self, Rel, Walker};
 use super::super::record::{Bucket, Record};
@@ -794,10 +798,29 @@ pub fn reviewed_frames_filtered(
     split: &SplitConfig,
     filter: &ClassFilter,
 ) -> Selection {
+    select_with(dir, classes, split, filter, &|_| {})
+}
+
+/// Label files read between two [`ExportStep::Reading`] reports (the walk's threads share one
+/// count), and always the last one.
+const READ_REPORT_EVERY: usize = 64;
+
+/// [`reviewed_frames_filtered`], telling `progress` how far the walk is.
+fn select_with(
+    dir: &Path,
+    classes: &[String],
+    split: &SplitConfig,
+    filter: &ClassFilter,
+    progress: ProgressFn<'_>,
+) -> Selection {
     let mut filtered_out = 0;
     let mut warnings = Vec::new();
     let mut frames = Vec::new();
+    progress(ExportStep::Listing);
     let scan = super::scan_labels(dir);
+    let of = scan.files.len();
+    progress(ExportStep::Reading { done: 0, of });
+    let read_count = std::sync::atomic::AtomicUsize::new(0);
     for folder in &scan.unreadable {
         warnings.push(format!(
             "{} could not be read, so its frames are not in this export; check the folder's \
@@ -816,7 +839,14 @@ pub fn reviewed_frames_filtered(
     let read = super::queue::over_days(&scan.files, &|day| {
         let mut walker = walker.clone();
         day.iter()
-            .filter_map(|(rel, path)| Some((rel.clone(), read_reviewed(&mut walker, rel, path)?)))
+            .filter_map(|(rel, path)| {
+                let read = read_reviewed(&mut walker, rel, path);
+                let done = read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if done.is_multiple_of(READ_REPORT_EVERY) || done == of {
+                    progress(ExportStep::Reading { done, of });
+                }
+                Some((rel.clone(), read?))
+            })
             .collect()
     });
     for (rel, read) in read {
@@ -1159,12 +1189,45 @@ pub fn run_filtered(
     req: &ExportRequest,
     filter: &ClassFilter,
 ) -> Result<ExportReport> {
+    run_filtered_with(dir, classes, req, filter, &|_| {})
+}
+
+/// Where a running export is ([`run_filtered_with`]): the steps in order. A step without a count
+/// is one the export cannot count cheaply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportStep {
+    /// Listing the dataset's label files.
+    Listing,
+    /// `done` of the `of` label files read (to find the reviewed frames).
+    Reading { done: usize, of: usize },
+    /// Reading the review queue's unreviewed frames (X-AnyLabeling with `include_unreviewed`).
+    Queue,
+    /// `done` of the `of` files written: every image placed (hard link or copy) and every
+    /// per-frame label file (YOLO txt, X-AnyLabeling JSON). The COCO, manifest and list files are
+    /// written in this step too, uncounted (one file each).
+    Writing { done: usize, of: usize },
+    /// Moving the finished export into place ([`Staging::publish`]).
+    Publishing,
+}
+
+/// What an export tells about its progress: called on the export's thread, and from the walk's
+/// threads while label files are read, so it must be `Sync` and cheap.
+pub type ProgressFn<'a> = &'a (dyn Fn(ExportStep) + Sync);
+
+/// [`run_filtered`], telling `progress` where it is ([`ExportStep`]).
+pub fn run_filtered_with(
+    dir: &Path,
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+    progress: ProgressFn<'_>,
+) -> Result<ExportReport> {
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
     filter.check(classes)?;
-    let selected = reviewed_frames_filtered(dir, classes, &req.split, filter);
-    run_selected(dir, classes, req, filter, selected)
+    let selected = select_with(dir, classes, &req.split, filter, progress);
+    run_selected_with(dir, classes, req, filter, selected, progress)
 }
 
 /// [`run_filtered`] of frames selected already ([`reviewed_frames_filtered`]), each with the split
@@ -1180,6 +1243,18 @@ pub fn run_selected(
     filter: &ClassFilter,
     selected: Selection,
 ) -> Result<ExportReport> {
+    run_selected_with(dir, classes, req, filter, selected, &|_| {})
+}
+
+/// [`run_selected`], telling `progress` where it is.
+fn run_selected_with(
+    dir: &Path,
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+    selected: Selection,
+    progress: ProgressFn<'_>,
+) -> Result<ExportReport> {
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
@@ -1187,6 +1262,7 @@ pub fn run_selected(
     let mut selected = selected;
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
+            progress(ExportStep::Queue);
             unreviewed_queue_frames(dir, classes, &req.hidden_classes, &mut selected.warnings)
                 .into_iter()
                 .filter(|(_, labels, _, _)| filter.keeps(&preview(labels)))
@@ -1227,9 +1303,13 @@ pub fn run_selected(
         filter,
         &target,
         &staging.build,
+        progress,
     );
     match report {
-        Ok(r) => staging.publish().map(|()| r),
+        Ok(r) => {
+            progress(ExportStep::Publishing);
+            staging.publish().map(|()| r)
+        }
         Err(e) => {
             staging.discard();
             Err(e)
@@ -1239,6 +1319,10 @@ pub fn run_selected(
 
 /// Write the export that will be at `out` into the folder `build` ([`Staging`]). Every path a
 /// reader of the export sees names `out`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the selection, what goes with it, the two folders and the progress report"
+)]
 fn build_export(
     selected: Selection,
     unreviewed: &[(Frame, LabelFile, u32, u32)],
@@ -1247,6 +1331,7 @@ fn build_export(
     filter: &ClassFilter,
     out: &Path,
     build: &Path,
+    progress: ProgressFn<'_>,
 ) -> Result<ExportReport> {
     let Selection {
         mut frames,
@@ -1310,6 +1395,17 @@ fn build_export(
         .collect();
     let by_split = |s: Split| frames.iter().filter(|f| f.split == s).collect::<Vec<_>>();
     let wants = |f: Format| req.formats.contains(&f);
+    let in_bench = |f: &ExportFrame| match req.benchmark_split {
+        BenchSplit::All => true,
+        BenchSplit::Train => f.split == Split::Train,
+        BenchSplit::Val => f.split == Split::Val,
+    };
+    let mut written = Written {
+        done: 0,
+        of: written_files(&frames, unreviewed.len(), req, &in_bench),
+        progress,
+    };
+    written.report();
     if (wants(Format::Yolo) || wants(Format::Coco)) && !frames.is_empty() {
         for f in &frames {
             let dst = build.join("images").join(f.split.as_str()).join(&f.name);
@@ -1317,6 +1413,7 @@ fn build_export(
                 std::fs::create_dir_all(p)?;
             }
             link_or_copy(&f.image, &dst)?;
+            written.one();
         }
     }
     if wants(Format::Yolo) && !frames.is_empty() {
@@ -1330,6 +1427,7 @@ fn build_export(
                     .join(format!("{stem}.txt")),
                 txt.as_bytes(),
             )?;
+            written.one();
         }
         let mut names = classes.join("\n");
         names.push('\n');
@@ -1375,19 +1473,23 @@ fn build_export(
         std::fs::create_dir_all(&xdir)?;
         for f in &frames {
             link_or_copy(&f.image, &xdir.join(&f.name))?;
+            written.one();
             // Every training box, the floor regardless: an import treats a box missing here as
             // rejected, and `difficult` on it would stay in the label file for good.
             let x = xany::to_xany(&f.name, f.width, f.height, f.training_boxes(), true);
             let stem = f.name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
+            written.one();
         }
         for (frame, labels, w, h) in unreviewed {
             let name = flat_name(&frame.rel);
             link_or_copy(&frame.jpg, &xdir.join(&name))?;
+            written.one();
             let preview = preview(labels).boxes;
             let x = xany::to_xany(&name, *w, *h, &preview, false);
             let stem = name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
+            written.one();
         }
         let mut names = classes.join("\n");
         names.push('\n');
@@ -1397,14 +1499,7 @@ fn build_export(
     }
     if wants(Format::Benchmark) && !frames.is_empty() {
         let bdir = build.join("benchmark");
-        let list: Vec<&ExportFrame> = frames
-            .iter()
-            .filter(|f| match req.benchmark_split {
-                BenchSplit::All => true,
-                BenchSplit::Train => f.split == Split::Train,
-                BenchSplit::Val => f.split == Split::Val,
-            })
-            .collect();
+        let list: Vec<&ExportFrame> = frames.iter().filter(|f| in_bench(f)).collect();
         if list.is_empty() {
             warnings.push(
                 "the benchmark set was not written: no frame is in the chosen split (a share of \
@@ -1416,6 +1511,7 @@ fn build_export(
             std::fs::create_dir_all(&img)?;
             for f in &list {
                 link_or_copy(&f.image, &img.join(&f.name))?;
+                written.one();
             }
             let id = out
                 .file_name()
@@ -1465,6 +1561,61 @@ fn build_export(
     r.warnings = warnings;
     write_file(&build.join("export.json"), &json_bytes(&r)?)?;
     Ok(r)
+}
+
+/// The files [`build_export`] counts in [`ExportStep::Writing`]: what its loops below write.
+fn written_files(
+    frames: &[ExportFrame],
+    unreviewed: usize,
+    req: &ExportRequest,
+    in_bench: &dyn Fn(&ExportFrame) -> bool,
+) -> usize {
+    let wants = |f: Format| req.formats.contains(&f);
+    let n = frames.len();
+    if n == 0 {
+        // Only the X-AnyLabeling folder is written without a reviewed frame.
+        return if wants(Format::XAnyLabeling) {
+            2 * unreviewed
+        } else {
+            0
+        };
+    }
+    let mut of = 0;
+    if wants(Format::Yolo) || wants(Format::Coco) {
+        of += n;
+    }
+    if wants(Format::Yolo) {
+        of += n;
+    }
+    if wants(Format::XAnyLabeling) {
+        of += 2 * (n + unreviewed);
+    }
+    if wants(Format::Benchmark) {
+        of += frames.iter().filter(|f| in_bench(f)).count();
+    }
+    of
+}
+
+/// The count of [`ExportStep::Writing`].
+struct Written<'a> {
+    done: usize,
+    of: usize,
+    progress: ProgressFn<'a>,
+}
+
+impl Written<'_> {
+    fn report(&self) {
+        (self.progress)(ExportStep::Writing {
+            done: self.done,
+            of: self.of,
+        });
+    }
+
+    /// One more file written.
+    fn one(&mut self) {
+        self.done += 1;
+        self.report();
+    }
 }
 
 /// An unreviewed frame's labels as a save could leave them: pending boxes resolved, training

@@ -594,7 +594,7 @@ pub(super) fn job_of(
     let rec = tasks
         .iter()
         .find(|t| t.kind == TaskKind::Refine && t.state.is_busy())?;
-    let jobs = super::train_jobs::view(runs, tasks, timing);
+    let jobs = super::train_jobs::view(runs, tasks, timing, &super::train_jobs::Beside::default());
     let line = jobs
         .active
         .iter()

@@ -31,7 +31,9 @@
 // collect.hidden_classes). A class save that leaves reviewed frames with accepted boxes of unwanted
 // classes asks, then POST /v1/review/reject-unwanted-reviewed. After an export the Exports and
 // coverage cards are read again from the page's own URL. The export card warns when the dataset check left
-// open suggestions (`DatasetOpen`, GET /v1/refine). No inline handlers (CSP); server values
+// open suggestions (`DatasetOpen`, GET /v1/refine). While an export or an import waits for its
+// answer, its progress comes from its line on the Jobs list (GET /v1/train/jobs, a PrismPoll chain
+// every 2 s; the server lists it as a side job). No inline handlers (CSP); server values
 // come from data-*.
 (function () {
   'use strict';
@@ -79,6 +81,32 @@
     });
   }
 
+  // While a POST of `kind` ("Dataset export", "X-AnyLabeling import") waits: its newest line of
+  // the Jobs list in `box`, after `lead`. Returns the stop, called before the answer is shown.
+  function follow(kind, box, lead) {
+    if (!window.PrismPoll) return function () {};
+    var over = false;
+    var poller = window.PrismPoll.create({
+      period: 2000,
+      run: function () {
+        return fetch('/v1/train/jobs', { headers: { Accept: 'application/json' }, cache: 'no-store' })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (j) {
+            if (over || !j || !j.jobs) return;
+            var mine = j.jobs.active.filter(function (l) { return l.kind === kind; }).pop();
+            if (!mine) return;
+            var where = mine.step && mine.phase ? mine.step + ': ' + mine.phase : mine.step || mine.phase;
+            var text = [where, mine.detail].filter(Boolean).join(' · ');
+            report(box, [lead + (text ? ' ' + text : '') + ' (' + mine.percent + '%, ' + mine.time + ')']);
+          })
+          .catch(function () { /* the line stays as it was */ });
+      },
+      more: function () { return !over; }
+    });
+    poller.start();
+    return function () { over = true; poller.stop(); };
+  }
+
   function list(text) {
     return String(text || '').split(/[,\n]/).map(function (s) { return s.trim(); }).filter(Boolean);
   }
@@ -119,7 +147,10 @@
     };
     if (f.elements.out_dir.value.trim()) body.out_dir = f.elements.out_dir.value.trim();
     report(box, ['Exporting...']);
-    postJson('/v1/review/export', body).then(function (j) {
+    var unfollow = follow('Dataset export', box, 'Exporting:');
+    var sent = postJson('/v1/review/export', body);
+    sent.then(unfollow, unfollow);
+    sent.then(function (j) {
       var r = j.report;
       var per = Object.keys(r.per_class || {}).map(function (k) { return k + ' ' + r.per_class[k]; }).join(', ');
       var lines = [
@@ -147,10 +178,13 @@
     var f = ev.target;
     var box = $('rv-import-msg');
     report(box, ['Importing...']);
-    postJson('/v1/review/import', {
+    var unfollow = follow('X-AnyLabeling import', box, 'Importing:');
+    var sent = postJson('/v1/review/import', {
       dir: f.elements.dir.value.trim(),
       treat_unchecked_as_reviewed: f.elements.treat_unchecked_as_reviewed.checked
-    }).then(function (j) {
+    });
+    sent.then(unfollow, unfollow);
+    sent.then(function (j) {
       var r = j.report;
       report(box, ['Imported ' + r.imported + ' frame(s); ' + r.unchecked + ' unchecked file(s) left alone; ' +
         r.unmatched + ' file(s) name no frame of the dataset.'], (r.errors || []).concat(r.warnings || []));

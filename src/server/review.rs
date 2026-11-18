@@ -963,6 +963,60 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
     }
 
+    /// An export and an import are side jobs while they work (the Jobs tab lists them with their
+    /// steps) and nothing is left listed once they answered; the answer is what it always was.
+    #[tokio::test]
+    async fn an_export_and_an_import_are_listed_while_they_work_and_gone_after() {
+        use crate::server::side_jobs::SideKind;
+        let d = ds();
+        reviewed_frame(&d).await;
+        let body = r#"{"format": ["yolo", "xanylabeling"]}"#;
+        let (s, v) = json(&d.state, post_json("/v1/review/export", body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["report"]["frames"], 1, "{v}");
+        let seen = d.state.side_jobs.seen();
+        assert!(seen.iter().all(|(k, _)| *k == SideKind::DatasetExport));
+        let mut stages: Vec<&str> = seen.iter().map(|(_, r)| r.stage).collect();
+        stages.dedup();
+        assert_eq!(stages, ["selecting frames", "writing files", "publishing"]);
+        // One frame: its YOLO image and label file, its X-AnyLabeling image and JSON.
+        let last_write = seen
+            .iter()
+            .rev()
+            .find(|(_, r)| r.stage == "writing files")
+            .unwrap();
+        assert_eq!(last_write.1.detail, "4 of 4 files written");
+        let percents: Vec<u8> = seen.iter().map(|(_, r)| r.percent).collect();
+        assert!(percents.windows(2).all(|w| w[0] <= w[1]), "{percents:?}");
+        assert!(
+            d.state
+                .side_jobs
+                .views(std::time::Instant::now())
+                .is_empty()
+        );
+
+        let xdir = v["report"]["paths"]["xanylabeling"].as_str().unwrap();
+        let body = serde_json::json!({ "dir": xdir }).to_string();
+        let (s, v) = json(&d.state, post_json("/v1/review/import", &body)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["report"]["imported"], 1, "{v}");
+        let imports: Vec<_> = d
+            .state
+            .side_jobs
+            .seen()
+            .into_iter()
+            .filter(|(k, _)| *k == SideKind::XanyImport)
+            .map(|(_, r)| r.detail)
+            .collect();
+        assert_eq!(imports, ["0 of 1 files", "1 of 1 files"]);
+        assert!(
+            d.state
+                .side_jobs
+                .views(std::time::Instant::now())
+                .is_empty()
+        );
+    }
+
     fn post_json(uri: &str, body: &str) -> Request<Body> {
         Request::post(uri)
             .header(header::CONTENT_TYPE, "application/json")

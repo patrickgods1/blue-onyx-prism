@@ -85,6 +85,9 @@ pub struct ExportStatus {
     pub state: ExportState,
     /// Last lines of the child processes' output.
     pub log: Vec<String>,
+    /// When the export started running (None while queued): the Jobs tab's elapsed time.
+    #[serde(skip)]
+    pub started: Option<Instant>,
 }
 
 /// Lines of output kept per export.
@@ -179,6 +182,7 @@ impl Exporter {
                     title: res.title,
                     state: ExportState::Queued,
                     log: Vec::new(),
+                    started: None,
                 },
             );
         }
@@ -309,6 +313,7 @@ fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
             res.license
         );
         let started = Instant::now();
+        shared.update(id, |s| s.started = Some(started));
         let mut last_stage: Option<Stage> = None;
         let mut report = |p: Progress<'_>| match p {
             Progress::Stage {

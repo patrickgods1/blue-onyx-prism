@@ -3,6 +3,10 @@
 //! folder under review, `collect.review_dir`), `POST /v1/review/classes` and
 //! `GET /v1/review/class-catalog`, with the checks of a folder a client names
 //! ([`allowed_folder`]).
+//!
+//! An export and an import run inside their request and answer when done; while they work they
+//! are side jobs ([`crate::server::side_jobs`]) with their progress, so the Jobs tab lists them,
+//! also after the browser left the page (the work goes on).
 
 use super::{
     Answer, AppState, blocking, context, fail, folder_problem, folder_unavailable, hidden,
@@ -13,6 +17,7 @@ use crate::collect::labels::export::{
     self, BenchSplit, ClassFilter, ExportRequest, Format, SplitConfig,
 };
 use crate::collect::labels::{self, bulk, xany};
+use crate::server::side_jobs::{self, SideKind};
 use crate::server::{browse, save_config};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -207,6 +212,21 @@ fn export_folder(
         .map_err(|e| folder_refusal("out_dir", e.into_parts()))
 }
 
+/// The Jobs tab's title of an export: its formats and where it goes.
+fn export_title(req: &ExportRequest) -> String {
+    let formats: Vec<&str> = req
+        .formats
+        .iter()
+        .map(|f| match f {
+            Format::Yolo => "YOLO",
+            Format::Coco => "COCO",
+            Format::XAnyLabeling => "X-AnyLabeling",
+            Format::Benchmark => "benchmark set",
+        })
+        .collect();
+    format!("{} to {}", formats.join(", "), req.out_dir.display())
+}
+
 /// `POST /v1/review/export` with `{format(s), out_dir?, holdout_cameras?, holdout_days?,
 /// holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`.
 pub(in crate::server) async fn export(
@@ -256,7 +276,13 @@ pub(in crate::server) async fn export(
             hidden_classes: hidden(&state),
             size_floor: state.config_read().collect.size_floor,
         };
-        match export::run_filtered(&dir, &classes, &req, &filter) {
+        let job = state
+            .side_jobs
+            .start(SideKind::DatasetExport, export_title(&req));
+        let progress = |s| job.report(side_jobs::export_report(s));
+        let result = export::run_filtered_with(&dir, &classes, &req, &filter, &progress);
+        drop(job);
+        match result {
             Ok(r) => {
                 tracing::info!(out = %r.out_dir.display(), frames = r.frames, "review export written");
                 success(serde_json::json!({ "report": r }))
@@ -305,14 +331,20 @@ pub(in crate::server) async fn import(
             Err((s, m)) => return fail(s, m),
         };
         let hidden = hidden(&state);
-        match xany::import_dir(
+        let job = state
+            .side_jobs
+            .start(SideKind::XanyImport, format!("From {}", src.display()));
+        let result = xany::import_dir_with(
             &dir,
             &src,
             &classes,
             &hidden,
             b.treat_unchecked_as_reviewed,
             &now(),
-        ) {
+            &|done, of| job.report(side_jobs::import_report(done, of)),
+        );
+        drop(job);
+        match result {
             Ok(r) => success(serde_json::json!({ "report": r })),
             Err(e) => fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
