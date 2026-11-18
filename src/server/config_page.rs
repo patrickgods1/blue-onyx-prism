@@ -2450,7 +2450,7 @@ mod tests {
         let (s, html) = get_text(&state, "/config").await;
         assert_eq!(s, StatusCode::OK);
         let card = html
-            .split("<table class=\"model-card rcards\">")
+            .split("<table class=\"model-card rcards\" data-sort=\"models\">")
             .nth(1)
             .and_then(|t| t.split("</table>").next())
             .expect("the Models card");

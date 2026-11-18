@@ -1,28 +1,26 @@
 // Blue Onyx Prism: Benchmark tables (PrismBench.dataTable, PrismBench.tableFilter).
-// dataTable({key, columns, rows, filters, ...}) builds a sortable, filterable table: click a
-// header to sort (aria-sort and an arrow; Enter / Space too), a text filter, model / device /
-// runtime selects and "Only this run", a "Showing N of M" count and "Clear filters". Sort and
-// filters live in per-table state (remembered per browser), so the 1 s polling re-render of a
-// section rebuilds the table as the user left it. tableFilter(table, key) adds the text filter
-// and the count to an existing table (the expert tables under "More detail").
+// dataTable({key, columns, rows, filters, ...}) builds a sortable, filterable table: the sort is
+// PrismSort's (sort.js: click a header, Shift-click for a second key, the phones' Sort by; each
+// cell's data-v is its column's value(row)), plus a text filter, model / device / runtime selects
+// and "Only this run", a "Showing N of M" count and "Clear filters". Filters live in per-table
+// state and the sort in PrismSort's (both remembered per browser; an old saved sort here moved to
+// PrismSort once), so the 1 s polling re-render of a section rebuilds the table as the user left
+// it. tableFilter(table, key) adds the text filter and the count to an existing table (the expert
+// tables under "More detail").
 // Loaded after bench-glossary.js (uses PB.el, PB.store, PB.head).
 (function () {
   var PB = window.PrismBench, el = PB.el, has = PB.has;
   var states = {};
-  function stateOf(key, dflt) {
+  function stateOf(key) {
     if (!states[key]) {
       var s = PB.store.get("table:" + key, null) || {};
-      states[key] = {sort: s.sort || dflt || null, q: s.q || "", model: s.model || "", device: s.device || "", runtime: s.runtime || "", thisRun: !!s.thisRun};
+      states[key] = {q: s.q || "", model: s.model || "", device: s.device || "", runtime: s.runtime || "", thisRun: !!s.thisRun};
     }
     return states[key];
   }
   function save(key) { PB.store.set("table:" + key, states[key]); }
-  function cmp(a, b) {
-    var na = a === null || a === undefined || (typeof a === "number" && isNaN(a)), nb = b === null || b === undefined || (typeof b === "number" && isNaN(b));
-    if (na || nb) return na && nb ? 0 : na ? 1 : -1; // empty values last, either direction
-    if (typeof a === "number" && typeof b === "number") return a - b;
-    return String(a).localeCompare(String(b), undefined, {numeric: true});
-  }
+  // A column value as data-v (null and undefined are empty).
+  function dataV(v) { return v === null || v === undefined || (typeof v === "number" && !isFinite(v)) ? "" : String(v); }
   function selectFilter(labelText, all, values, cur, onChange) {
     var l = el("label", "dt-filter"), s = el("select");
     l.appendChild(el("span", "visually-hidden", labelText));
@@ -37,10 +35,11 @@
   // o: key, cls, columns [{id, head ("Text" | "@labelId"), value(row) (sort key), render(row, td)
   // (returns text / node or fills td), num, label (mobile card label), first ("desc")}],
   // rows, filters {model(row), device(row), runtime(row), thisRun(row)} (each optional),
-  // text(row) (what the text filter searches), sort {col, dir} (default), rowAttrs(row, tr),
+  // text(row) (what the text filter searches), sort {col, dir} (the default order; none = the
+  // rows' own order), rowAttrs(row, tr),
   // empty (text when nothing matches), note.
   function dataTable(o) {
-    var st = stateOf(o.key, o.sort), f = o.filters || {};
+    var st = stateOf(o.key), f = o.filters || {};
     var box = el("div", "dtable"); box.dataset.keep = "dt:" + o.key;
     var tools = el("div", "dt-tools"), count = el("span", "dt-count muted"), clear = el("button", "small secondary dt-clear", "Clear filters"); clear.type = "button";
     var q = el("input"); q.type = "search"; q.setAttribute("enterkeyhint", "search"); q.setAttribute("autocapitalize", "none"); q.setAttribute("autocorrect", "off"); q.spellcheck = false; q.name = "dt-q-" + o.key; q.placeholder = "Filter…"; q.value = st.q; q.setAttribute("aria-label", "Filter the rows of this table");
@@ -70,20 +69,13 @@
     o.columns.forEach(function (c) {
       var h = el("th", c.num ? "num" : null);
       if (typeof c.head === "string" && c.head.charAt(0) === "@") h.appendChild(PB.head(c.head.slice(1))); else if (c.head) h.appendChild(document.createTextNode(c.head));
-      if (c.value) {
-        h.classList.add("dt-sort"); h.tabIndex = 0;
-        var go = function () {
-          if (st.sort && st.sort.col === c.id) st.sort = {col: c.id, dir: st.sort.dir === "asc" ? "desc" : "asc"};
-          else st.sort = {col: c.id, dir: c.first || "asc"};
-          save(o.key); draw();
-        };
-        h.addEventListener("click", go);
-        h.addEventListener("keydown", function (e) { if (e.target !== h) return; if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
-        h.title = "Sort by " + (h.textContent || c.id);
-      }
-      h.dataset.col = c.id; hr.appendChild(h);
+      h.dataset.col = c.id; h.dataset.sortCol = c.id;
+      if (!c.value) h.setAttribute("data-sort-off", "");
+      else if (c.first) h.dataset.sortFirst = c.first;
+      hr.appendChild(h);
     });
     th.appendChild(hr); t.appendChild(th); t.appendChild(tb);
+    if (window.PrismSort) PrismSort.attach(t, {key: o.key, defaultKeys: o.sort ? [o.sort] : []});
     var w = el("div", "scroll"); w.dataset.keep = "w:dt:" + o.key; w.appendChild(t); box.appendChild(w);
     var empty = el("p", "empty dt-empty"); box.appendChild(empty);
     function match(r) {
@@ -98,24 +90,13 @@
       return true;
     }
     function draw() {
-      var rows = o.rows.filter(match), col = st.sort && o.columns.find(function (c) { return c.id === st.sort.col && c.value; });
-      if (col) {
-        var dir = st.sort.dir === "desc" ? -1 : 1;
-        rows = rows.map(function (r, i) { return {r: r, i: i, v: col.value(r)}; }).sort(function (a, b) {
-          var na = a.v === null || a.v === undefined, nb = b.v === null || b.v === undefined;
-          if (na || nb) return na && nb ? a.i - b.i : na ? 1 : -1;
-          return dir * cmp(a.v, b.v) || a.i - b.i;
-        }).map(function (x) { return x.r; });
-      }
-      hr.querySelectorAll("th").forEach(function (h) {
-        var on = col && h.dataset.col === col.id;
-        if (on) h.setAttribute("aria-sort", st.sort.dir === "desc" ? "descending" : "ascending"); else if (h.classList.contains("dt-sort")) h.setAttribute("aria-sort", "none");
-      });
+      var rows = o.rows.filter(match);
       tb.replaceChildren();
       rows.forEach(function (r) {
         var tr = el("tr");
         o.columns.forEach(function (c) {
           var td = el("td", c.num ? "num" : null); if (c.label || typeof c.head === "string") td.dataset.label = c.label || (c.head.charAt(0) === "@" ? PB.label(c.head.slice(1)) : c.head);
+          if (c.value) td.dataset.v = dataV(c.value(r));
           var out = c.render ? c.render(r, td) : (c.value ? c.value(r) : "");
           if (out !== undefined && out !== null) { if (typeof out === "string" || typeof out === "number") td.appendChild(document.createTextNode(String(out))); else td.appendChild(out); }
           tr.appendChild(td);
@@ -123,6 +104,7 @@
         if (o.rowAttrs) o.rowAttrs(r, tr);
         tb.appendChild(tr);
       });
+      if (window.PrismSort) PrismSort.apply(t);
       var active = !!(st.q || st.model || st.device || st.runtime || st.thisRun);
       count.textContent = "Showing " + rows.length + " of " + o.rows.length;
       clear.hidden = !active;

@@ -6,7 +6,7 @@
 <p class="muted">Times are the average, with the fastest and slowest under it.</p>
 <noscript><p class="muted">Reload the page to update (live updates need JavaScript).</p></noscript>
 <div class="scroll" tabindex="0" role="region" aria-label="Models">
-<table class="stats sticky-first rcards rgrid">
+<table class="stats sticky-first rcards rgrid" data-sort="models">
 <thead>
 <tr><th>Model</th><th>State</th><th>Runtime</th><th>Device</th><th>Fell back</th>
 <th class="num">Requests</th><th class="num">Dropped</th><th class="num">Queue</th>
@@ -14,7 +14,7 @@
 </thead>
 <tbody id="stats-body">
 {% for m in models %}
-<tr class="st-{{ m.state_class }}">
+<tr class="st-{{ m.state_class }}" data-model="{{ m.name }}">
 <td class="rc-title">{{ m.name }}{% if m.is_default %} <span class="tag">default</span>{% endif %}</td>
 <td class="state">{{ m.state }}{% if let Some(d) = m.state_detail %}<br><span class="detail">{{ d }}</span>{% endif %}</td>
 <td data-label="Runtime">{{ m.runtime }}</td>

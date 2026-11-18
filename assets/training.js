@@ -1370,6 +1370,8 @@
       });
       t.appendChild(tb);
       wrap.appendChild(t);
+      // Sortable (sort.js), one remembered sort per kind of table ("Boxes per class", ...).
+      if (window.PrismSort) window.PrismSort.attach(t, { key: "balance:" + head });
       return wrap;
     };
     // Rows of two {name: n} maps: every name, the largest before first; at most `top`.
@@ -1460,6 +1462,7 @@
         var wrap = mk("div", "scroll");
         wrap.appendChild(t);
         d.appendChild(wrap);
+        if (window.PrismSort) window.PrismSort.attach(t, { key: "preflight-classes" });
       }
       // Frames with ignore regions (unsure, too small, under the size floor), by the run's mode
       // (`training.ignore`, set on the Refine tab): background keeps a frame with a label left and
@@ -2054,6 +2057,8 @@
       var a = update(runs, "run", data.runs);
       var b = update(tasks, "task", data.tasks);
       renderMetrics(data, false);
+      // States and progress changed in place: the user's sort (sort.js) again.
+      if (window.PrismSort) [runs, tasks].forEach(function (t) { if (t) window.PrismSort.apply(t); });
       if (!(a || b)) return true;
       // Not reload(): the page may be the answer to a POST, and reloading it would ask to
       // resubmit (and queue the job again). The poll navigates, not the user: no activity.

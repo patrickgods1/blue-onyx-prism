@@ -56,6 +56,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("style.css", CSS),
     asset!("live.js", JS),
     asset!("time.js", JS),
+    asset!("sort.js", JS),
     asset!("bench-glossary.js", JS),
     asset!("bench-table.js", JS),
     asset!("bench-charts.js", JS),
@@ -1004,7 +1005,7 @@ mod tests {
         assert!(home.contains(
             "<td>Failed:<br><span class=\"detail\">model file not found: x.onnx</span></td>"
         ));
-        assert!(home.contains("<tr class=\"st-fail\">"));
+        assert!(home.contains("<tr class=\"st-fail\" data-model=\"ipcam-general\">"));
         // A restart badge's reasons open on a tap (live.js PrismTip), not only as a title.
         assert!(
             home.contains("<button type=\"button\" class=\"term tag restart pending-badge\" data-model=\"ipcam-general\" data-tip=\""),
@@ -1175,6 +1176,7 @@ mod tests {
         }
         for name in [
             "live.js",
+            "sort.js",
             "benchmark.js",
             "class-picker.js",
             "model-picker.js",

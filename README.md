@@ -809,6 +809,16 @@ address. Every page below needs a sign-in:
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
 
+#### Sorting tables
+
+Click a column header to sort a table by it, and click it again for the other direction.
+Shift-click another header to add it as the next sort key; the headers then show the rank of
+each key (1, 2, ...). On a phone, where the tables show as cards without headers, a **Sort by**
+list above the table does the same. **Default order** (or **Best first**, on tables whose own order
+ranks the rows) puts the table back in its own order. Each browser remembers the sort of each table
+(in its local storage; a private window forgets it); tables the page updates live keep it. Rows
+that belong to another (a run's training details) move with it, and summary rows stay at the end.
+
 #### Prometheus metrics
 
 Counters and histograms live for the whole process and survive in-process restarts; a model removed

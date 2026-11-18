@@ -645,7 +645,9 @@
     return pct(x.recall) + ' (' + pct(x.low) + ' to ' + pct(x.high) + ')';
   }
 
-  function recallTable(columns, rows) {
+  // `key`: the table's remembered sort (sort.js); a column's `sort(row, i)` is its cells' data-v
+  // (the recall itself, not its text with the interval).
+  function recallTable(key, columns, rows) {
     var wrap = el('div', 'scroll');
     var table = el('table', 'rcards');
     var head = el('thead');
@@ -654,19 +656,23 @@
     head.appendChild(hr);
     table.appendChild(head);
     var body = el('tbody');
-    rows.forEach(function (row) {
+    rows.forEach(function (row, n) {
       var tr = el('tr');
       columns.forEach(function (c, i) {
         var td = el('td', (i === 0 ? 'rc-title' : '') + (c.num ? ' num' : ''), c.value(row));
         if (i > 0) td.setAttribute('data-label', c.title);
+        if (c.sort) td.setAttribute('data-v', sortV(c.sort(row, n)));
         tr.appendChild(td);
       });
       body.appendChild(tr);
     });
     table.appendChild(body);
     wrap.appendChild(table);
+    if (window.PrismSort) window.PrismSort.attach(table, { key: key });
     return wrap;
   }
+  function sortV(v) { return v === null || v === undefined || (typeof v === 'number' && !isFinite(v)) ? '' : String(v); }
+  function recallOf(x) { return x ? x.recall : null; }
 
   function drawCoverage(state) {
     var box = $('refine-coverage-body');
@@ -684,13 +690,13 @@
     }
     var groups = r.recall_by_group || [];
     if (groups.length) {
-      box.appendChild(recallTable([
+      box.appendChild(recallTable('recall', [
         { title: 'Camera', value: function (g) { return g.camera; } },
         { title: 'Scene', value: function (g) { return g.scene; } },
         { title: 'Class', value: function (g) { return g.class; } },
         { title: 'Boxes', num: true, value: function (g) { return String(g.boxes); } },
         { title: 'Found', num: true, value: function (g) { return String(g.found); } },
-        { title: 'Recall (95%)', num: true, value: recallText }
+        { title: 'Recall (95%)', num: true, value: recallText, sort: recallOf }
       ], groups));
     } else {
       box.appendChild(el('p', 'muted', 'The report holds no labelled boxes.'));
@@ -750,9 +756,9 @@
       cell(2, 'num', String(r.reviewed));
       cell(3, 'num', String(r.persons));
       cell(4, 'num', String(r.vehicles));
-      cell(5, 'num', RefineFloor.emptyText(r));
-      cell(6, 'num', thinRecall(r.person));
-      cell(7, 'num', thinRecall(r.vehicle));
+      cell(5, 'num', RefineFloor.emptyText(r)).setAttribute('data-v', sortV(r.empty || 0));
+      cell(6, 'num', thinRecall(r.person)).setAttribute('data-v', sortV(recallOf(r.person)));
+      cell(7, 'num', thinRecall(r.vehicle)).setAttribute('data-v', sortV(recallOf(r.vehicle)));
       var un = cell(8, 'num', r.unreviewed_person_frames > 0 ? null : '0');
       if (r.unreviewed_person_frames > 0) {
         var a = el('a', null, String(r.unreviewed_person_frames));
@@ -766,6 +772,7 @@
     table.appendChild(body);
     wrap.appendChild(table);
     box.appendChild(wrap);
+    if (window.PrismSort) window.PrismSort.attach(table, { key: 'thin', columns: { 9: { off: true } } });
     box.appendChild(el('p', 'muted small', 'Boxes are the accepted labels of reviewed frames (unsure and too-small objects left out, hidden classes not counted). Unreviewed with a person: unreviewed frames with a person nobody rejected (a proposal, or the detection of a frame nobody opened yet); the number opens them in Review. Counts refresh within a minute.'));
   }
   function loadThin() {
@@ -793,11 +800,12 @@
     box.appendChild(el('p', 'muted small', 'Size is the box\'s short side in pixels at the model\'s input (' + r.recipe.imgsz +
       ' px in the last check). Objects below about 10 px are rarely found by any model, so a low recall there says little about your labels.'));
     box.appendChild(el('p', 'muted small', RF.measuredWith(r)));
-    box.appendChild(recallTable([
-      { title: 'Size (px)', value: function (s) { return s.bucket; } },
+    box.appendChild(recallTable('recall-size', [
+      // The buckets in the report's order, smallest first (their names do not sort as text).
+      { title: 'Size (px)', value: function (s) { return s.bucket; }, sort: function (s, i) { return i; } },
       { title: 'Boxes', num: true, value: function (s) { return String(s.boxes); } },
       { title: 'Found', num: true, value: function (s) { return String(s.found); } },
-      { title: 'Recall (95%)', num: true, value: recallText }
+      { title: 'Recall (95%)', num: true, value: recallText, sort: recallOf }
     ], sizes));
   }
 
@@ -966,6 +974,7 @@
     table.appendChild(body);
     wrap.appendChild(table);
     box.appendChild(wrap);
+    if (window.PrismSort) window.PrismSort.attach(table, { key: 'spots', columns: { 2: { off: true } } });
     box.appendChild(el('p', 'muted small', 'Frames: reviewed frames with a labelled box at the spot. Missing here: suggestions of the dataset check for a box nobody drew at the spot; nothing is added until you confirm.'));
   }
 
@@ -1173,6 +1182,7 @@
       table.appendChild(body);
       wrap.appendChild(table);
       box.appendChild(wrap);
+      if (window.PrismSort) window.PrismSort.attach(table, { key: 'floor-classes' });
     } else {
       box.appendChild(el('p', 'muted small', 'No reviewed frame holds a labelled box yet.'));
     }
