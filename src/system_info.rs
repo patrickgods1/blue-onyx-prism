@@ -56,6 +56,31 @@ pub fn commit() -> Option<crate::backend::memory::Commit> {
     crate::backend::memory::commit_bytes()
 }
 
+/// Installed and available physical memory now (Windows only; `None` elsewhere or when the query
+/// fails). Not cached.
+pub fn physical() -> Option<crate::backend::memory::Physical> {
+    crate::backend::memory::physical_bytes()
+}
+
+/// Bytes the paging files can still grow by beyond `commit_limit` on a machine with `total_phys`
+/// of RAM ([`crate::backend::memory::growable_bytes`] over the registry's `PagingFiles`, each
+/// volume's free space from `fs4`). 0 on other platforms, for fixed paging files, a full disk or
+/// any failed read.
+pub fn paging_growth(commit_limit: u64, total_phys: u64) -> u64 {
+    use crate::backend::memory;
+    let Some((files, existing)) = memory::paging_registry() else {
+        return 0;
+    };
+    let system_drive = std::env::var("SystemDrive").ok();
+    memory::growable_bytes(
+        &files,
+        commit_limit,
+        total_phys,
+        |f| memory::volume_root(f, &existing, system_drive.as_deref()),
+        |root| fs4::available_space(root).ok(),
+    )
+}
+
 /// Total physical memory in GiB, if it can be determined. Probed once per process and cached
 /// (the hardware profile and the start-up log line both ask).
 pub fn total_memory_gb() -> Option<f64> {

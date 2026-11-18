@@ -868,15 +868,44 @@ Stages (page and `train run` show them with percent and ETA):
    about a minute and the retry takes over.
 
    **Data loader workers** (`--workers`): none on macOS; else all cores but one (1 to 8), and on
-   Windows also at most what the free system commit (RAM + paging file) holds when training starts:
-   `(free commit - 6 GB) / (1.4 GB x loaders)`, down to 0 (data loaded in the training process:
-   slower, never short of memory). On Windows every worker is a spawned Python that imports PyTorch
-   (measured ~0.9 GB commit for the import, ~1.4 GB per worker while an RF-DETR nano run trained; its
-   trainer process itself committed 5.5 GB, hence the 6 GB reserve), and the validation loader's workers stay alive beside the training
+   Windows also at most the smaller of two memory bounds, read when training starts, each down to 0
+   (data loaded in the training process: slower, never short of memory):
+   - commit: `(free commit + growable paging file - 8 GB) / (1.4 GB x loaders)`. The commit limit is
+     RAM + paging files; a paging file whose maximum is above its current size (registry
+     `PagingFiles`, e.g. `c:\pagefile.sys 2935 24576`: initial 2.9 GB, maximum 24 GB) is grown by
+     Windows on demand, so what it can still grow by counts: maximum less current size (the commit
+     limit less RAM), capped by its drive's free space less 4 GB. A system-managed file (`?:\` or
+     sizes `0 0`) may grow to 3 x RAM (at least 4 GB); a fixed one (initial = maximum) adds nothing,
+     and so does any failed read.
+   - RAM: `(available RAM - 2.6 GB - 2 GB) / (0.75 GB x loaders)`. A commit the paging file backs
+     still pages: the trainer keeps ~2.6 GB in RAM, each worker ~0.75 GB, and 2 GB are left over.
+
+   On Windows every worker is a spawned Python that imports PyTorch (~0.9 GB commit for the import,
+   ~1.4 GB per worker while training; the RF-DETR nano 384 trainer process itself commits ~8 GB,
+   hence the 8 GB reserve), and the validation loader's workers stay alive beside the training
    loader's: `loaders` is 2 for RF-DETR and transformers (both loaders persistent) and 3 for
-   Ultralytics (its validation loader gets twice the workers). The decision is the first line of the
-   train stage in `train.log`: `memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers
-   (cores allow 5)`. `training.workers` in the config forces a count (0 = none; absent = automatic).
+   Ultralytics (its validation loader gets twice the workers). Elsewhere neither bound applies
+   (Linux overcommits and forks its workers). The decision is the first line of the train stage in
+   `train.log`, naming each bound: `memory: commit 23.3 GB limit (can grow to 38.3 GB), 5.4 GB free,
+   RAM 7.6 GB free -> 2 data loader workers (cores allow 5, commit 4, RAM 2)` (no "can grow" for a
+   fixed paging file). `training.workers` in the config forces a count (0 = none; absent =
+   automatic).
+
+   Measured on a GTX 1070 Ti, i5-8600K (6 cores), 16 GB (15.9 usable), growable 24 GB paging file
+   (`c:\pagefile.sys 2935 24576`, 19 GB free on C:): RF-DETR nano 384, batch 8, 2308 training
+   images, 2 epochs, `--workers` forced. Everything else on the box committed ~17.9 GB; 6-7.6 GB of
+   RAM was available before a run. Per worker process: ~1.43 GB commit, ~0.75 GB working set.
+
+   | Workers | `img_s` | Data wait | Commit (peak of limit) | Paging file | Least available RAM | Result |
+   |---|---|---|---|---|---|---|
+   | 0 | 8.5-8.7 | 35% | trainer 8.0 GB private, 2.6 GB working set | - | - | trained |
+   | 2 (6 Python processes: trainer, 2 train, 2 persistent validation workers) | 11.3-11.4 (+32%) | 15% | 31.4 of 32.4 GB | grew 7.6 -> 16.9 GB on its own, no WinError 1455 | 2.06 GB (up to 2.8k page-ins/s) | trained |
+   | 4 | 11.3 in epoch 1 (no gain over 2) | - | 36.6 of 37.8 GB | grew to 22.4 GB (not its 24 GB maximum) | 0.87 GB (12k page-ins/s) | epoch 2 failed: `DefaultCPUAllocator: not enough memory` |
+
+   The rule gives that box 2 with 7.6 GB of RAM available (commit alone would allow 4, the RAM
+   bound 2; with 6 GB available, 0); the old rule, the free commit only with a 6 GB reserve, gave 0
+   in 19 of 21 runs. Should a run still run out of host memory, the retry below halves the workers.
+
    **Out of system memory** (`[WinError 1455]` "the paging file is too small", `DefaultCPUAllocator:
    not enough memory`, `can't start new thread`, `MemoryError`, a worker killed by the OOM killer)
    restarts the training with half the workers and the same batch (at most 3 restarts; after 3
