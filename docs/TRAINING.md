@@ -1507,7 +1507,10 @@ and progress ("full resolution: 40 of 120 frames") come back in video order too,
 carry the video's name. Measured on a GTX 1070 Ti box (i5-8500, D3D11VA, three Blue Iris clips of
 0.5-2.7 GB on a second drive, 33 kept frames, the same bytes either way, a game using the GPU
 meanwhile): 81 and 80 s one video after another, 74 and 76 s three at once. The videos share the
-hardware decoder and the drive, so the gain there is small. The helpers run below normal priority,
+hardware decoder and the drive, so the gain there is small. The SigLIP embedding step (`embed`)
+decodes and preprocesses the next batch on a thread while the GPU embeds the current one (220
+candidate frames on the same box: 6.0 and 6.3 s before, 5.5 s after, the embeddings identical to
+the byte). The helpers run below normal priority,
 like every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
@@ -1685,7 +1688,7 @@ so a Review save with a stale `revision` gets a 409 instead of overwriting merge
 |---|---|---|---|
 | Batch the VLM check: up to 8 of a frame's boxes per Qwen3-VL call | on | `--no-vlm-batch` | `--vlm-batch 8` (off: `1`) |
 | Skip the VLM check below a fused score (0 < x <= 1); 2% of those boxes are asked anyway, to audit the cutoff | on, 0.15 | `--vlm-min-score X`, `--vlm-all-boxes` | `--vlm-min-score X --vlm-sample 0.02` |
-| Load the next frame on a background thread while the GPU works | on | `--no-prefetch` | `--prefetch` |
+| Load the next frame on a background thread while the GPU works; finish the frame before (WBF, SigLIP, the output line) on another | on | `--no-prefetch` | `--prefetch` |
 | Keep finished frames if cancelled (both modes) | on | `--discard-on-cancel` | - |
 | GPU of the labelers (shown with more than one usable NVIDIA GPU) | automatic (most VRAM) | `--gpu cuda:N` | `--device cuda:N` |
 
@@ -1700,6 +1703,11 @@ MM-Grounding-DINO and Qwen3-VL (the default run about 13.8 GB). A run that would
 the last 16 GB of its drive is refused before its first Python process, naming the labelers to turn off
 (largest first); the preview says so first. A run with a model labels in this process and is not
 checked. See *Memory commit check before a job* in [A run](#a-run), after *Data loader workers*.
+
+Finishing a frame on another thread was measured on the GTX 1070 Ti box (MM-Grounding-DINO tiny +
+RF-DETR L + SigLIP on its CPU path, no VLM, 220 day and IR frames, 2,259 proposals): 0.72 s per
+frame before (two runs), 0.61 s after, with every proposal, score, source and species score
+identical to both runs before.
 
 ### Measuring auto-label
 
