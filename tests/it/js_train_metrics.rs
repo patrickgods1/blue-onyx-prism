@@ -278,3 +278,83 @@ console.log('RESULT: ' + JSON.stringify({by, rows, late: late && late.epoch, non
         "{tiles:?}"
     );
 }
+
+/// The GPU busy and data wait tiles show the last epoch's value as a percent under a
+/// `button.term` label (PrismTip), and are absent when the run never measured them.
+#[test]
+fn gpu_busy_and_data_wait_tiles() {
+    if !have_node() {
+        return;
+    }
+    let metrics = serde_json::to_value(progress::METRICS).unwrap();
+    let row = |e: u32, extra: Value| {
+        let mut m = json!({"map": 0.4, "loss": 2.0, "mem_gb": 3.5, "img_s": 20.0});
+        m.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"epoch": e, "elapsed_s": e, "metrics": m})
+    };
+    let measured = json!({"epoch": 2, "epochs": 10, "settings": settings("map"),
+        "history": [row(1, json!({"gpu_util": 0.5, "data_wait": 0.25})),
+                    row(2, json!({"gpu_util": 0.875, "data_wait": 0.125}))]});
+    let bare = json!({"epoch": 2, "epochs": 10, "settings": settings("map"),
+        "history": [row(1, json!({})), row(2, json!({}))]});
+    let input = json!({"measured": measured, "bare": bare, "metrics": metrics});
+    let body = r#"
+const out = {};
+for (const k of ["measured", "bare"]) {
+  const host = document.createElement('div');
+  host.dataset = {};
+  T.render(host, input[k], ["map", "loss"], input.metrics, {runId: "r-" + k});
+  const tiles = host.all(n => hasClass(n, 'tr-kpi'));
+  out[k] = {
+    text: tiles.map(n => n.textContent),
+    terms: tiles.flatMap(t => t.all(n => n.tagName === 'button' && hasClass(n, 'term')).map(b =>
+      [b.textContent, b.getAttribute('type'), b.getAttribute('data-tip')])),
+  };
+}
+console.log('RESULT: ' + JSON.stringify(out));
+"#;
+    let v = node(body, &input);
+    let text = |k: &str| -> Vec<String> {
+        v[k]["text"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect()
+    };
+    let measured = text("measured");
+    assert!(
+        measured.contains(&"GPU busy87.5%last epoch".to_string()),
+        "{measured:?}"
+    );
+    assert!(
+        measured.contains(&"Data wait12.5%last epoch".to_string()),
+        "{measured:?}"
+    );
+    // Next to the peak memory / speed tiles, in that order.
+    let at = |s: &str| measured.iter().position(|t| t.starts_with(s)).unwrap();
+    assert!(at("Peak memory") < at("Peak speed"));
+    assert_eq!(at("Peak speed") + 1, at("GPU busy"));
+    assert_eq!(at("GPU busy") + 1, at("Data wait"));
+    let terms = v["measured"]["terms"].as_array().unwrap();
+    assert_eq!(
+        terms[0],
+        json!([
+            "GPU busy",
+            "button",
+            "Whole-GPU busy share from NVML; includes the service's own models on the same GPU."
+        ])
+    );
+    assert_eq!(terms[1][0], "Data wait");
+    let bare = text("bare");
+    assert!(bare.iter().any(|t| t.starts_with("Peak speed")), "{bare:?}");
+    assert!(
+        !bare
+            .iter()
+            .any(|t| t.starts_with("GPU busy") || t.starts_with("Data wait")),
+        "{bare:?}"
+    );
+    assert_eq!(v["bare"]["terms"], json!([]));
+}

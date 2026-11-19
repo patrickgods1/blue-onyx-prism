@@ -247,6 +247,18 @@ fn labelers_propose_triaged_pending_boxes_and_queue_the_frames() {
     assert_eq!(rep["review"], 2);
     assert_eq!(rep["added"], 4);
     assert_eq!(rep["vlm_objections"], 2);
+    // The per-frame times outlive `work` (removed below): in the result and the summary.
+    assert_eq!(
+        rep["labeler_ms"],
+        serde_json::json!({"gdino": {"median": 10.0, "p90": 10.0, "frames": 2}})
+    );
+    assert!(
+        out.summary
+            .contains("time per frame (median / p90 ms): gdino 10 / 10"),
+        "{}",
+        out.summary
+    );
+    assert!(!job.work.exists());
     // Every labeler checkpoint was fetched (fake) and passed to the script.
     let fetched = fake.inner.fetched.lock().unwrap().clone();
     for id in [
@@ -3951,4 +3963,59 @@ fn a_crashed_runs_proposals_are_written_by_the_sweep_before_its_folder_goes() {
     // Written twice, merged once.
     assert_eq!(labels_of(&dir, &rels[1]).boxes, first.boxes);
     assert_eq!(review_queue(&dir).len(), 3);
+}
+
+/// `labeler_ms`: nearest-rank median and p90 per labeler, lossy per line (a torn line, a line
+/// without `ms` and non-numbers are left out); a report without them serializes no key (task
+/// results are stored as JSON values, so older records without it load as before).
+#[test]
+fn labeler_times_are_median_and_p90_per_labeler() {
+    let mut text = String::new();
+    for i in 1..=10 {
+        let mut ms = serde_json::json!({"gdino": i * 100, "rfdetr": 50});
+        if i % 5 == 0 {
+            ms["vlm"] = serde_json::json!(i);
+        }
+        text.push_str(
+            &serde_json::json!({"frame": format!("f{i}"), "boxes": [], "ms": ms}).to_string(),
+        );
+        text.push('\n');
+    }
+    text.push_str("{\"frame\": \"f11\", \"boxes\": []}\n");
+    text.push_str("{\"frame\": \"f12\", \"ms\": {\"gdino\": \"slow\", \"siglip\": -1}}\n");
+    text.push_str("{\"frame\": \"torn\", \"ms\": {\"gdino\": 99");
+    let t = super::labeler_ms(&text);
+    let get = |k: &str| t.get(k).copied().unwrap();
+    assert_eq!(
+        get("gdino"),
+        super::LabelerMs {
+            median: 500.0,
+            p90: 900.0,
+            frames: 10
+        }
+    );
+    assert_eq!(
+        get("rfdetr"),
+        super::LabelerMs {
+            median: 50.0,
+            p90: 50.0,
+            frames: 10
+        }
+    );
+    assert_eq!(
+        get("vlm"),
+        super::LabelerMs {
+            median: 5.0,
+            p90: 10.0,
+            frames: 2
+        }
+    );
+    assert_eq!(t.len(), 3, "{t:?}");
+    assert!(super::labeler_ms("").is_empty());
+    let none = serde_json::to_value(AutolabelReport::default()).unwrap();
+    assert!(none.get("labeler_ms").is_none(), "{none}");
+    // The stored form reads back.
+    let back: LabelerMs =
+        serde_json::from_value(serde_json::to_value(get("vlm")).unwrap()).unwrap();
+    assert_eq!(back, get("vlm"));
 }
