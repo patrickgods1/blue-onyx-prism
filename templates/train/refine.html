@@ -47,6 +47,7 @@
     <label class="check"><input type="checkbox" id="refine-tighten" name="tighten"{% if tighten_default %} checked{% endif %}> Propose better boxes for loose labels</label>
     <p class="muted small">After the last fold (or the quick check's model), a larger model (RF-DETR L, the overlap check's) looks closer at each label a model found only partly covering its object; it needs an NVIDIA GPU or Apple silicon. Where both looks agree on another box, you get it as a suggestion; your label stays until you accept it. Adds a few minutes{% if !tighten_default %}, and downloads RF-DETR L (0.14 GB) the first time{% endif %}.</p>
     <label class="check tr-confirm"><input type="checkbox" name="allow_large"> Allow downloads over 500 MB (the training environment and the base weights, when they are not set up yet)</label>
+    <label class="check tr-confirm" id="refine-memory-anyway" hidden><input type="checkbox" name="ignore_memory_check" value="1" disabled> <span data-memory-label></span></label>
     <div class="actions"><button type="button" class="secondary" id="refine-preview-btn">Preview</button> <button type="submit" id="refine-start">Start</button></div>
   </form>
   <p class="muted small" id="refine-why" role="status" hidden></p>

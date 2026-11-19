@@ -1721,10 +1721,54 @@ fn a_labelers_run_short_of_commit_is_refused_before_any_process() {
         ),
         "{e}"
     );
-    assert!(e.ends_with("then start the job again."), "{e}");
+    assert!(
+        e.ends_with(&format!(
+            "then start the job again. {}",
+            crate::training::commit::OVERRIDE_HINT
+        )),
+        "{e}"
+    );
     assert!(fake.inner.cmds().is_empty(), "{:?}", fake.inner.cmds());
     assert!(fake.cmds.lock().unwrap().is_empty());
     assert!(label_files(&dir).is_empty(), "{:?}", label_files(&dir));
+    // Start anyway: it runs, its log has the warning with the same numbers, its summary says so.
+    let mut anyway = job.clone();
+    anyway.request.ignore_memory_check = true;
+    let mut lines: Vec<String> = Vec::new();
+    let out = anyway
+        .run(
+            TaskContext {
+                runner: &fake,
+                fetcher: &fake,
+            },
+            &mut |p| {
+                if let TaskReport::Line(l) = p {
+                    lines.push(l.to_string());
+                }
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let warn = format!(
+        "memory check overridden: {}",
+        e.trim_end_matches(crate::training::commit::OVERRIDE_HINT)
+            .trim_end()
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("memory check overridden: "))
+            .collect::<Vec<_>>(),
+        [&warn]
+    );
+    assert!(
+        out.summary
+            .ends_with(crate::training::commit::OVERRIDDEN_NOTE),
+        "{}",
+        out.summary
+    );
+    assert!(!fake.cmds.lock().unwrap().is_empty(), "the labelers ran");
+    assert!(!label_files(&dir).is_empty());
     // With 19 GB more free on C: the paging file may grow by 16.2 GB: it runs.
     job.headroom = || {
         Some(headroom(
@@ -1734,8 +1778,13 @@ fn a_labelers_run_short_of_commit_is_refused_before_any_process() {
             &[(r"C:\", 34.2)],
         ))
     };
-    run_job(&job, &fake).unwrap();
-    assert!(!label_files(&dir).is_empty());
+    job.request.frames.query.insert("again".into(), "1".into());
+    let out = run_job(&job, &fake).unwrap();
+    assert!(
+        !out.summary.contains("overridden"),
+        "nothing to override: {}",
+        out.summary
+    );
 }
 
 #[test]

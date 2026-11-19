@@ -653,6 +653,9 @@
     var run = document.getElementById("al-preview-run");
     var box = document.getElementById("al-preview");
     if (!form || !run || !box) return;
+    // "Start anyway" beside a memory refusal (PrismMemory, live.js): shown only with one.
+    var anyway = document.getElementById("al-memory-anyway");
+    var memory = function (m) { if (window.PrismMemory) window.PrismMemory.sync(anyway, m); };
     var seq = 0;
     var line = function (cls, text) {
       var p = document.createElement("p");
@@ -660,10 +663,11 @@
       p.textContent = text;
       box.appendChild(p);
     };
-    var clear = function () { seq++; box.textContent = ""; box.hidden = true; };
+    var clear = function () { seq++; box.textContent = ""; box.hidden = true; memory(null); };
     var draw = function (j, note) {
       box.textContent = "";
       box.hidden = false;
+      memory(j.memory);
       line("small tr-runs-line", j.summary);
       var warnings = (j.warnings || []).concat(note ? [note] : []);
       if (!warnings.length) return;
@@ -682,7 +686,11 @@
       line("small error-text", text);
     };
     run.hidden = false;
-    form.addEventListener("change", clear);
+    // Ticking "Start anyway" is no change to what the preview describes.
+    form.addEventListener("change", function (e) {
+      if (anyway && anyway.contains(e.target)) return;
+      clear();
+    });
     run.addEventListener("click", function () {
       var mine = ++seq;
       var body = new URLSearchParams(), note = "";
@@ -1326,6 +1334,9 @@
       var disk = j.disk || {};
       (disk.lines || []).forEach(function (l) { pre.appendChild(mk("p", "muted small", "Disk: " + l.text + ".")); });
       if (disk.refusal) pre.appendChild(mk("p", "error-text small", disk.refusal));
+      // The memory commit check each run meets at its start, with "Start anyway" beside it.
+      if (j.memory && j.memory.refusal) pre.appendChild(mk("p", "error-text small", "A run would be refused if it started now: " + j.memory.refusal));
+      if (window.PrismMemory) window.PrismMemory.sync(document.getElementById("train-memory-anyway"), j.memory);
       pre.hidden = false;
     };
     var render = function (j) {

@@ -1953,6 +1953,7 @@ pub(crate) fn requests_from_form(
             balance: data.balance.clone(),
             compare_group: compare_group.clone(),
             train_seed: None,
+            ignore_memory_check: field(f, "ignore_memory_check").is_some(),
         };
         // Repeats train on the same frames (the assembly seed is the config's) with their own
         // trainer seed.
@@ -2253,7 +2254,9 @@ fn preview_recipes(f: &[(String, String)]) -> anyhow::Result<Vec<TrainRecipe>> {
 /// sources and options, nothing written) as `{scene, title, report, warnings, classes,
 /// train_frames, train_images, valid_frames, heldout_frames, dropped, preflight, error}` (`report`
 /// null when balancing is off; `preflight`: [`preflight::Report`]; `error` set when that run cannot
-/// be planned), and `disk` `{lines, refusal}`, what every ticked run needs together. The folders
+/// be planned), `disk` `{lines, refusal}`, what every ticked run needs together, and `memory`
+/// `{refusal, override_label}` when the memory commit check would refuse a run started now (null
+/// otherwise; [`preflight::memory`]). The folders
 /// are checked like the queue's ([`checked_datasets`]); a bad field or folder is an error naming it.
 pub(crate) fn balance_preview_json(
     f: &[(String, String)],
@@ -2316,6 +2319,7 @@ pub(crate) fn balance_preview_json(
                 balance: data.balance.clone(),
                 compare_group: None,
                 train_seed: None,
+                ignore_memory_check: false,
             };
             match crate::training::preview_parts(config, &request) {
                 Ok(parts) => {
@@ -2373,10 +2377,20 @@ pub(crate) fn balance_preview_json(
             (n, s)
         })
         .collect();
+    // The memory commit check each run meets at its start (Windows), with the checkbox's words.
+    let memory = preflight::memory(
+        &recipes,
+        config.training.workers.map_or(
+            crate::training::job::Workers::Auto,
+            crate::training::job::Workers::Fixed,
+        ),
+        crate::training::commit::now().as_ref(),
+    );
     Ok(serde_json::json!({
         "success": true,
         "balance": data.balance,
         "runs": runs,
+        "memory": memory,
         "disk": {
             "lines": volumes.iter().map(|(n, s)| preflight::disk_line(n, *s)).collect::<Vec<_>>(),
             "refusal": preflight::refusal(&volumes),
@@ -3213,6 +3227,22 @@ pub(super) mod tests {
             &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
             Some(16.0),
         )
+    }
+
+    /// The queue form's "Start anyway" reaches every request it makes (each seed is checked at its
+    /// own start); without it, none.
+    #[test]
+    fn the_queue_form_carries_start_anyway() {
+        let cap = mac();
+        let training = crate::training::config::TrainingConfig::default();
+        let base = [("model", "yolo26n"), ("dataset", "/x"), ("seeds", "2")];
+        let (reqs, _) = requests_from_form(&form(&base), &cap, &training).unwrap();
+        assert!(!reqs.is_empty() && reqs.iter().all(|r| !r.ignore_memory_check));
+        let mut on = base.to_vec();
+        on.push(("ignore_memory_check", "1"));
+        let (reqs, _) = requests_from_form(&form(&on), &cap, &training).unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(|r| r.ignore_memory_check));
     }
 
     /// The form and `train run` build their recipe through `recipe::build_recipe`: the same
@@ -4557,6 +4587,7 @@ pub(super) mod tests {
             excluded: Excluded::Background,
             balance: Default::default(),
             compare_group: group.map(str::to_string),
+            ignore_memory_check: false,
             train_seed: None,
         };
         let benchmark = ap.map(|(d, n, i)| BenchSummary {

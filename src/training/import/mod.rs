@@ -178,6 +178,10 @@ pub struct ImportRequest {
     /// `collect.dir`, the folder the Collect and Review tabs show).
     #[serde(default)]
     pub out_dir: Option<PathBuf>,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 fn default_window() -> f32 {
@@ -206,6 +210,7 @@ impl ImportRequest {
             workers: 0,
             hwaccel: HwAccel::Auto,
             out_dir: None,
+            ignore_memory_check: false,
         }
     }
 

@@ -908,8 +908,9 @@ Stages (page and `train run` show them with percent and ETA):
    bound 2; with 6 GB available, 0); the old rule, the free commit only with a 6 GB reserve, gave 0
    in 19 of 21 runs. Should a run still run out of host memory, the retry below halves the workers.
 
-   **Memory commit check before a job (Windows).** Auto-label, the overlap check, the dataset check and
-   an import's SigLIP 2 selection check the memory commit before their first Python process
+   **Memory commit check before a job (Windows).** Auto-label, the overlap check, the dataset check, an
+   import's SigLIP 2 selection and every training run check the memory commit before their first Python
+   process
    (`training/commit.rs`) and refuse with what happened, why and what to do when the job's estimated
    peak plus 1 GB kept spare (`COMMIT_SLACK_BYTES`) is more than the free commit plus what the paging
    files may grow by, counted with the same 16 GB drive margin as the workers above. Windows grows a
@@ -920,7 +921,8 @@ Stages (page and `train run` show them with percent and ETA):
    `this auto-label run needs about 10.0 GB of memory commit (PyTorch and RF-DETR L 2.6 GB + SAM 3 6.4 GB,
    1.0 GB kept spare); 5.0 GB is free and the paging file on C: can grow only while 16 GB stays free there
    (15.2 GB free now). Free space on C:, put the paging file on another drive, or turn off SAM 3 (or label
-   with a trained model, --with-model), then start the job again.`
+   with a trained model, --with-model), then start the job again. To start it anyway, tick Start anyway
+   beside its preview, or pass --ignore-memory-check.`
 
    A fixed or full-size paging file, or none, gets its own reason and advice. The memory is read when the
    job starts, not when it is queued; a refused job fails with that message as its error and nothing
@@ -929,6 +931,25 @@ Stages (page and `train run` show them with percent and ETA):
    `train overlaps --dry-run` and the Review tab's *Suggest overlaps* confirmation. Linux and macOS are
    never checked (no fixed commit limit), and a reading that fails (the commit, the RAM, the registry's
    paging files or a drive's free space) refuses nothing: the job then runs as it did before the check.
+
+   **Start anyway.** Where a preview shows the refusal (the Auto-label preview, the Refine tab's preview,
+   the Review tab's *Suggest overlaps* answer, the Train tab's *Before you train*), an unticked checkbox
+   "Start anyway: this job may grow the paging file into the last 16 GB of C:" appears beside it (only
+   then); on the command line it is `--ignore-memory-check` (`train autolabel`, `train overlaps`, `train
+   refine`, `train import`, `train run`). It is the job's own `ignore_memory_check` request field, kept
+   with the queued task or run (the memory is judged when it starts), never a config key and not part of
+   what runs compare by. An overridden job starts, logs one warning with the same numbers
+   (`memory check overridden: ...`, in the service log and the job's log, `train.log` for a run), and a
+   task's summary ends "the memory check was overridden (Start anyway)". The import page has no preview
+   of its own memory, so an import overrides by the form field or the flag only.
+
+   **Training runs** are checked at the start of each run (each seed and each model of a queue at its
+   own), before the environment's tools, the self-check and the trainer: 8.0 GB
+   (`MAIN_COMMIT_RESERVE_BYTES`, the measured trainer) plus 1 GB spare, plus 1.4 GB per worker per
+   loader only when `training.workers` forces a count (automatic workers are fitted to what is left by
+   the rule above). A refused run fails with the message and keeps its record. The dataset check's
+   fold runs are covered by the check's own test before its first fold and not judged again; an export
+   retry (`train retry-export`) trains nothing and is not checked.
 
    | Job | Estimated peak commit | Where the figure comes from |
    |---|---|---|
@@ -944,9 +965,9 @@ Stages (page and `train run` show them with percent and ETA):
    everything else). On the dev box (23.65 GB limit, ~5 GB free, 15.2 GB free on C:) RF-DETR L alone and
    the overlap check run (3.6 GB); RF-DETR L + SigLIP 2 (5.6 GB: that run grew the paging file by 2 GB from
    this state), every SAM 3 run, the default run, the dataset check (9.0 GB) and a SigLIP 2 import are
-   refused until C: has more free space. Training itself is not checked: with the same rule a run there
-   (8 GB + 1 spare against ~5 GB) would be refused too, and today it starts with 0 data loader workers and
-   may grow the paging file.
+   refused until C: has more free space, and so is a training run (8 GB + 1 spare against ~5 GB; with the
+   19 GB free of the measured runs above, 5.4 GB + 3 GB of growth would still be short), unless started
+   anyway.
 
    **Out of system memory** (`[WinError 1455]` "the paging file is too small", `DefaultCPUAllocator:
    not enough memory`, `can't start new thread`, `MemoryError`, a worker killed by the OOM killer)
@@ -2616,7 +2637,9 @@ web UI and shows its results; the check itself is the one above and changes no b
   sends it as `tighten` with the preview, `tighten=1|0`, and the start, `"tighten": true|false`) and *Allow
   downloads over 500 MB*. *Preview* is `train refine --dry-run`
   (`GET /v1/refine/preview`: frames, what the export leaves out, camera days, each fold's size, the model,
-  a rough time, warnings, or why a start would be refused). *Start* (`POST /v1/refine/check`) plans the check,
+  a rough time, warnings, or why a start would be refused; `memory` `{refusal, override_label}` when the
+  memory commit check would refuse a start now, with the *Start anyway* box that sends
+  `"ignore_memory_check": true`). *Start* (`POST /v1/refine/check`) plans the check,
   gives it the running service's runtimes for the fold models' predictions (no second OpenVINO / ONNX Runtime
   instance) and queues it on the one-at-a-time queue. It refuses, in the check's own words, when too few
   reviewed frames can be checked, the folder under review is unplugged (503, `folder_missing`), a large
@@ -2907,11 +2930,11 @@ blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <e
     [--classes a,b] [--classes c] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
     [--static-cap 20 (0 = off)] [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--select-metric map|map50|f1|f2|f0_5|iou] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
-    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
+    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--ignore-memory-check] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
     [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \
-    [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--verbose] \
+    [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--ignore-memory-check] [--verbose] \
     [--out-dir <dir> [--review-folder]] [--autolabel | --autolabel-with-model <model>] \
     [--reject-below 0.3] [--accept-auto]
 blue-onyx-prism train import --url <video URL> --license "CC BY 4.0" --confirm-license [...]
@@ -2919,13 +2942,14 @@ blue-onyx-prism train import --dataset meva-sample [...]
 blue-onyx-prism train import --list-datasets
 blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any,limit=200"] \
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
-    [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] [--verbose]
+    [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] \
+    [--ignore-memory-check] [--verbose]
 blue-onyx-prism train autolabel --sam3 [--dry-run] [...]   # SAM 3 in MM-Grounding-DINO's seat; --dry-run only previews
 blue-onyx-prism hf-login | hf-logout      # Hugging Face token for the SAM 3 download
 blue-onyx-prism train overlaps [--frames "scene=ir,camera=patio,limit=200,again=1"] [--gpu cuda:0] \
-    [--allow-large] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
+    [--allow-large] [--ignore-memory-check] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
 blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
-    [--gpu cuda:N] [--allow-large] [--verbose]    # dataset check by fold models; changes no box
+    [--gpu cuda:N] [--allow-large] [--ignore-memory-check] [--verbose]    # dataset check by fold models; changes no box
 blue-onyx-prism train refine --with-model <name> [--dry-run] [--frames ...] [--no-tighten]   # quick check:
     # a model trained here judges the reviewed frames it never trained or validated on; no training
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
@@ -2946,7 +2970,9 @@ strength, max repeat and cap flags change that default's values. See [Assembly](
 step 7. `--static-cap N` (`prepare`, `run`) overrides `training.static_cap` for this command (0 = off; see
 the static cap in step 3). `prepare --dry-run` writes nothing and prints images per epoch before -> after, boxes and frames per
 class, frames per scene, the top cameras (and camera-days), dropped frames and warnings; `prepare` and
-`run` print the balance summary.
+`run` print the balance summary. `--ignore-memory-check` (`run`, `import`, `autolabel`, `overlaps`,
+`refine`) starts a job the memory commit check would refuse on Windows ([Memory commit check before a
+job](#a-run)); `prepare --dry-run` says when a run would be refused now.
 
 Model labels: `yolo26n`..`yolo26x`, `yolo11n`.., `yolov8n`.., `rfdetr-nano|small|medium|base|large`,
 `rt-detrv2-s|m|l|x`, `dfine-s|m|l|x`.

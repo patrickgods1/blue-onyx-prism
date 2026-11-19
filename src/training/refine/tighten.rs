@@ -438,10 +438,13 @@ pub fn run_stage(
         }
     };
     // Before the environment's first Python process (the folds' training has ended by now).
-    if let Some(why) =
-        crate::training::commit::refusal(&zoom::commit_need(LOOK_WHAT), (job.headroom)().as_ref())
-    {
-        fail(acc, &mut end, anyhow::anyhow!(why));
+    if let Err(e) = crate::training::commit::gate_task(
+        &zoom::commit_need(LOOK_WHAT),
+        (job.headroom)().as_ref(),
+        job.request.ignore_memory_check,
+        report,
+    ) {
+        fail(acc, &mut end, e);
         return end;
     }
     stage(report, &name, step, steps, 0, "setting up the environment");

@@ -193,6 +193,10 @@ pub struct RefineRequest {
     /// fold check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 /// Longest model name a request may carry (a config name; more is no name of the config).
@@ -216,6 +220,7 @@ impl Default for RefineRequest {
             allow_large: false,
             tighten: None,
             model: None,
+            ignore_memory_check: false,
         }
     }
 }
@@ -907,6 +912,11 @@ pub struct RefinePreview {
     /// not be determined (`refused` says why).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<report::ModelInfo>,
+    /// A start now would be refused for memory commit (Windows), or a quick check's closer look
+    /// skipped: the refusal and the words of the page's "Start anyway" checkbox; also first in
+    /// `warnings` (the closer look's at their end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::training::commit::Preview>,
 }
 
 impl RefinePreview {
@@ -1079,11 +1089,14 @@ pub fn preview(
         warnings.push(tighten::skipped_warning());
     }
     // A check that would train: first, it matters more than anything about its frames.
-    if accelerator.is_some()
-        && let Some(w) = commit_warning(Some(commit_need(recipe.family, workers_of(config))), false)
-    {
-        warnings.insert(0, w);
-    }
+    let memory = accelerator
+        .is_some()
+        .then(|| commit_warning(Some(commit_need(recipe.family, workers_of(config))), false))
+        .flatten()
+        .map(|(w, m)| {
+            warnings.insert(0, w);
+            m
+        });
     Ok(RefinePreview {
         dataset_dir: dir,
         filter: request.frames.describe(),
@@ -1103,6 +1116,7 @@ pub fn preview(
         folder_missing: missing.is_some(),
         mode: Mode::Folds,
         model: None,
+        memory,
     })
 }
 
@@ -1254,62 +1268,52 @@ pub fn preview_text(p: &RefinePreview) -> String {
 /// The host memory commit (Windows) of a dataset check whose fold models are `family` trained with
 /// `workers`, for the check before its first fold ([`crate::training::commit`]). The folds train
 /// one at a time, and the closer look (2.6 GB, [`crate::training::overlaps::zoom::ZOOM_COMMIT_BYTES`])
-/// runs after the last one, alone, so the peak is one fold's training:
-/// [`super::MAIN_COMMIT_RESERVE_BYTES`] (the measured trainer process, 8.0 GB) plus, with a fixed
-/// `training.workers`, [`super::WORKER_COMMIT_BYTES`] per worker per loader. Automatic workers add
-/// nothing: [`super::workers_for`] gives a run only the workers the commit holds beyond the
-/// trainer's reserve (0 when none).
+/// runs after the last one, alone, so the peak is one fold's training
+/// ([`super::trainer_commit_need`]). The folds are not checked again at their own starts.
 pub fn commit_need(family: TrainFamily, workers: Workers) -> Need {
-    let gib = super::gib;
-    let trainer = super::MAIN_COMMIT_RESERVE_BYTES;
-    let n = match workers {
-        Workers::Auto => 0,
-        Workers::Fixed(n) => n,
-    };
-    let per = super::WORKER_COMMIT_BYTES * u64::from(super::worker_loaders(family.trainer()));
-    let extra = per.saturating_mul(u64::from(n));
-    let mut detail = format!("a fold model's training process {:.1} GB", gib(trainer));
-    if extra > 0 {
-        detail.push_str(&format!(
-            " + {} {:.1} GB (training.workers)",
-            super::workers_text(n),
-            gib(extra)
-        ));
-    }
-    Need {
-        what: "the dataset check".into(),
-        bytes: trainer.saturating_add(extra),
-        detail,
-        lighter: Some(
-            "run a quick check with a trained model instead (Quick check with a model, or \
-             --with-model), which trains nothing"
-                .into(),
-        ),
-    }
+    let mut need = super::trainer_commit_need(family, workers);
+    need.what = "the dataset check".into();
+    need.detail =
+        need.detail
+            .replacen("the training process", "a fold model's training process", 1);
+    need.lighter = Some(
+        "run a quick check with a trained model instead (Quick check with a model, or \
+         --with-model), which trains nothing"
+            .into(),
+    );
+    need
 }
 
 /// The preview's line when the check would be refused for memory now ([`commit_need`]), or for its
 /// closer look only (`look`: [`crate::training::overlaps::zoom::commit_need`], a quick check's
 /// only Python process). None when it fits, off Windows or without a reading.
-fn commit_warning(need: Option<Need>, look: bool) -> Option<String> {
-    let reading = crate::training::commit::now();
+fn commit_warning(
+    need: Option<Need>,
+    look: bool,
+) -> Option<(String, crate::training::commit::Preview)> {
+    use crate::training::commit;
+    let reading = commit::now();
     if let Some(n) = need
-        && let Some(why) = crate::training::commit::refusal(&n, reading.as_ref())
+        && let Some(m) = commit::preview(&n, reading.as_ref())
     {
-        return Some(format!(
-            "This check would be refused if it started now: {why} The memory is read again when \
-             it starts."
-        ));
+        let line = format!(
+            "This check would be refused if it started now: {} The memory is read again when it \
+             starts.",
+            m.refusal
+        );
+        return Some((line, m));
     }
     if !look {
         return None;
     }
     let need = crate::training::overlaps::zoom::commit_need(tighten::LOOK_WHAT);
-    crate::training::commit::refusal(&need, reading.as_ref()).map(|why| {
-        format!(
+    commit::preview(&need, reading.as_ref()).map(|m| {
+        let line = format!(
             "The closer look at loose labels would be skipped if it started now (the other \
-             suggestions are still written): {why}"
-        )
+             suggestions are still written): {}",
+            m.refusal
+        );
+        (line, m)
     })
 }
 
@@ -1391,6 +1395,7 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
         balance: Default::default(),
         compare_group: None,
         train_seed: None,
+        ignore_memory_check: false,
     };
     let mut train = super::plan_job(config, train_request, cap, Some(fold_model_name(1)))?;
     train.run_dir = first;
@@ -1692,6 +1697,7 @@ mod tests {
                 folder_missing: false,
                 mode: Mode::Folds,
                 model: None,
+                memory: None,
             })
         };
         assert!(
@@ -2178,6 +2184,7 @@ mod tests {
                 folder_missing: false,
                 mode: Mode::Folds,
                 model: None,
+                memory: None,
             })
         };
         let on = text(true);
@@ -2210,16 +2217,16 @@ mod commit_tests {
     fn the_preview_line_names_the_trainer_or_the_look() {
         let family = TrainFamily::Rfdetr;
         tests_reading::set(Some(this_box()));
-        let full = commit_warning(Some(commit_need(family, Workers::Auto)), false);
-        let look = commit_warning(None, true);
+        let full = commit_warning(Some(commit_need(family, Workers::Auto)), false).map(|w| w.0);
+        let look = commit_warning(None, true).map(|w| w.0);
         tests_reading::set(Some(headroom(
             &[r"c:\pagefile.sys 4096 4096"],
             19.9,
             1.0,
             &[],
         )));
-        let short_look = commit_warning(None, true);
-        let no_look = commit_warning(None, false);
+        let short_look = commit_warning(None, true).map(|w| w.0);
+        let no_look = commit_warning(None, false).map(|w| w.0);
         tests_reading::set(None);
         let full = full.unwrap();
         assert!(

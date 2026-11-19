@@ -2008,4 +2008,82 @@ mod tests {
         let js = static_file("browse.js").unwrap();
         assert!(js.contains("(pointer: fine)") && js.contains("browse-close"));
     }
+
+    /// The "Start anyway" box beside a memory commit refusal: in each page with a preview that
+    /// shows one, a hidden, disabled checkbox row (named `ignore_memory_check` where a native form or
+    /// the page posts it), shown only by `PrismMemory.sync` with the preview's `memory`; and a
+    /// hidden check row stays hidden (`form label` sets display).
+    #[test]
+    fn the_start_anyway_box_is_hidden_until_a_preview_has_a_memory_refusal() {
+        for (page, id, named) in [
+            (
+                include_str!("../../templates/train/autolabel.html"),
+                "al-memory-anyway",
+                true,
+            ),
+            (
+                include_str!("../../templates/train/refine.html"),
+                "refine-memory-anyway",
+                true,
+            ),
+            (
+                include_str!("../../templates/train/train.html"),
+                "train-memory-anyway",
+                true,
+            ),
+            (
+                include_str!("../../templates/train/review.html"),
+                "rv-suggest-anyway",
+                false,
+            ),
+        ] {
+            let at = page
+                .find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("{id} missing"));
+            let start = page[..at].rfind("<label").unwrap();
+            let end = at + page[at..].find("</label>").unwrap();
+            let row = &page[start..end];
+            assert!(row.contains(" hidden>"), "{id} is not hidden: {row}");
+            assert!(
+                row.contains("type=\"checkbox\"") && row.contains(" disabled>"),
+                "{row}"
+            );
+            assert!(row.contains("data-memory-label"), "{row}");
+            assert_eq!(row.contains("name=\"ignore_memory_check\""), named, "{row}");
+            assert!(!row.contains(" checked"), "it starts unticked: {row}");
+        }
+        for (js, id) in [
+            ("training.js", "al-memory-anyway"),
+            ("training.js", "train-memory-anyway"),
+            ("train-refine.js", "refine-memory-anyway"),
+            ("review.js", "rv-suggest-anyway"),
+        ] {
+            let text = static_file(js).unwrap();
+            assert!(
+                text.contains(id) && text.contains("PrismMemory.sync"),
+                "{js}: {id}"
+            );
+        }
+        assert!(
+            static_file("live.js")
+                .unwrap()
+                .contains("root.PrismMemory = {")
+        );
+        assert!(
+            static_file("style.css")
+                .unwrap()
+                .contains("label.check[hidden] { display: none; }")
+        );
+        // The JSON pages send the field by name.
+        assert!(
+            static_file("train-refine.js")
+                .unwrap()
+                .contains("o.ignore_memory_check = true")
+        );
+        assert!(
+            static_file("review.js")
+                .unwrap()
+                .contains("body.ignore_memory_check = true")
+        );
+    }
 }

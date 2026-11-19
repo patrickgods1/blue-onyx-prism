@@ -49,6 +49,10 @@ pub struct OverlapsRequest {
     pub gpu: Option<String>,
     #[serde(default)]
     pub allow_large: bool,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 impl OverlapsRequest {
@@ -64,6 +68,7 @@ impl OverlapsRequest {
             frames,
             gpu: None,
             allow_large: false,
+            ignore_memory_check: false,
         })
     }
 }

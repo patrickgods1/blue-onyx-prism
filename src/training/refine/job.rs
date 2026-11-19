@@ -838,6 +838,8 @@ impl RefineJob {
         tj.request.install_dir = Some(fold_dir.join("model"));
         tj.keep_work = false;
         tj.export_only = None;
+        // Judged once, before the first fold ([`super::commit_need`]).
+        tj.headroom = commit::checked_already;
         // Its export has no floor on purpose: no warning that it differs from the current one.
         tj.options.size_floor = None;
         let trained = job::run_training_holding(
@@ -1001,12 +1003,12 @@ impl RefineJob {
             bail!("{why}");
         }
         // Before the first fold's first Python process: its training is the check's peak.
-        if let Some(why) = commit::refusal(
+        commit::gate_task(
             &super::commit_need(train_job.request.recipe.family, train_job.workers),
             (self.headroom)().as_ref(),
-        ) {
-            bail!(why);
-        }
+            self.request.ignore_memory_check,
+            report,
+        )?;
         // The GPU is this check's from the first fold's training to the last fold's writes: held
         // across the folds, so no other process (the service or a `train` command) trains or
         // labels between a fold's training and its prediction, or takes the next fold's turn.
@@ -1627,7 +1629,16 @@ impl Task for RefineJob {
         // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
         // ([`crate::storage::sweep`]).
         let busy = crate::storage::Busy::hold(&self.work);
-        let r = self.stages(ctx, report, cancel);
+        let mut overridden = false;
+        let r = self.stages(
+            ctx,
+            &mut |p| {
+                commit::watch(&p, &mut overridden);
+                report(p);
+            },
+            cancel,
+        );
+        let r = commit::noted(r, overridden);
         if let Err(e) = manager::remove_any(&self.work) {
             tracing::warn!(
                 "dataset check: could not remove its work folder {}: {e:#}",

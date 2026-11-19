@@ -11,6 +11,8 @@
 //! - [`gpu_need`], [`gpu_warning`]: the run's estimated GPU memory against what the card has free
 //!   now ([`crate::backend::vram`]), naming the service's models loaded on it; a warning, never a
 //!   refusal, and none when the card cannot be read.
+//! - [`memory`]: the memory commit check a run meets at its start ([`crate::training::commit`]),
+//!   "would be refused if it started now", with the words of the "Start anyway" checkbox.
 //!
 //! Everything here is advice over a pure plan, but for reading file sizes, [`disk::space`] and the
 //! card's free memory.
@@ -221,6 +223,10 @@ pub struct Report {
     pub warnings: Vec<String>,
     /// Why the run would not start ([`refusals`]).
     pub refusals: Vec<String>,
+    /// The memory commit check would refuse a start now ([`memory`]; filled by the caller, None
+    /// from [`report`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::training::commit::Preview>,
 }
 
 /// The [`Report`] of `plan`.
@@ -336,7 +342,23 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         notes,
         warnings: plan.warnings.clone(),
         refusals: refusals(plan, sources, opts),
+        memory: None,
     }
+}
+
+/// What the memory commit check would answer a run of each of `recipes` with `workers` started now
+/// with `reading` ([`crate::training::trainer_commit_need`]; the largest need when several models
+/// are ticked, each run is checked at its own start): None when every one would start.
+pub fn memory(
+    recipes: &[TrainRecipe],
+    workers: super::job::Workers,
+    reading: Option<&crate::training::commit::Headroom>,
+) -> Option<crate::training::commit::Preview> {
+    let need = recipes
+        .iter()
+        .map(|r| super::trainer_commit_need(r.family, workers))
+        .max_by_key(|n| n.bytes)?;
+    crate::training::commit::preview(&need, reading)
 }
 
 /// [`Report`] as text (`train prepare --dry-run`): warnings come with the plan's text.
@@ -422,6 +444,13 @@ pub fn text(r: &Report) -> String {
     }
     for x in &r.refusals {
         out.push_str(&format!("refused: {x}\n"));
+    }
+    if let Some(m) = &r.memory {
+        out.push_str(&format!(
+            "memory: a run would be refused if it started now: {} (--ignore-memory-check starts \
+             it anyway)\n",
+            m.refusal
+        ));
     }
     out
 }

@@ -145,6 +145,7 @@ pub fn plan_retry(config: &Config, r: &RunRecord, cap: &Capability) -> Result<Tr
             train_seconds,
             device: r.device.clone(),
         }),
+        headroom: crate::training::commit::checked_already,
     })
 }
 

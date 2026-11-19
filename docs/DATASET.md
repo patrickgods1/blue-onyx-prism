@@ -897,10 +897,11 @@ on a better one the same way. A duplicate sits on a real object: it is left out 
 the rejected-box count and the per-camera repeat history.
 
 `POST /v1/review/suggest-overlaps` (JSON `{bucket?, scene?, camera?, label?, gpu?, allow_large?, again?,
-dry_run?}`; the Review tab's *Suggest overlaps...*) queues the overlap check on the label files of the
-folder under review those filters select, reviewed frames too. `dry_run` needs no GPU and answers
+dry_run?, ignore_memory_check?}`; the Review tab's *Suggest overlaps...*) queues the overlap check on the label
+files of the folder under review those filters select, reviewed frames too. `dry_run` needs no GPU and answers
 `{success, frames, pairs, no_zoom, crops, answered, passed_over, message, memory}` (`memory`: on
-Windows, the refusal a start now would meet for memory commit, null when it fits or there is no crop;
+Windows, `{refusal, override_label}` when a start now would be refused for memory commit, null when it
+fits or there is no crop; the page then shows *Start anyway*, which sends `ignore_memory_check: true`;
 docs/TRAINING.md "Memory commit check before a job"); otherwise `{success, message, id}`, the
 task's id in `GET /v1/training`. `GET /v1/review/labels` carries `overlap_live`, the indices of the
 frame's `overlap_suggestions` a reviewer can act on.

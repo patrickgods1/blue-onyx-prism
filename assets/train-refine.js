@@ -313,6 +313,8 @@
     };
     if (quick) o.model = f.model.value || '';
     if (f.gpu && f.gpu.value) o.gpu = f.gpu.value;
+    // "Start anyway" beside the preview's memory refusal (shown only with one).
+    if (window.PrismMemory && window.PrismMemory.ticked($('refine-memory-anyway'))) o.ignore_memory_check = true;
     return o;
   }
   function query(o) {
@@ -381,6 +383,7 @@
       p.warnings.forEach(function (t) { w.appendChild(el('li', null, t)); });
       box.appendChild(w);
     }
+    if (window.PrismMemory) window.PrismMemory.sync($('refine-memory-anyway'), p.memory);
     if (p.refused) box.appendChild(el('p', 'error', 'A start would be refused: ' + p.refused));
     else box.appendChild(el('p', 'muted small', 'Nothing was run or written.'));
   }
@@ -433,6 +436,7 @@
       .then(function (j) {
         say(j.message);
         $('refine-preview').hidden = true;
+        if (window.PrismMemory) window.PrismMemory.sync($('refine-memory-anyway'), null);
         window.dispatchEvent(new Event('train-area:refresh'));
         poller.kick();
         load();

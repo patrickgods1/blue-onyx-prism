@@ -1035,3 +1035,45 @@ fn drafts_survive_missing_and_throwing_storage() {
         run(&format!("{KIT}{DRAFT}"));
     }
 }
+
+/// `PrismMemory` (live.js): the "Start anyway" checkbox beside a memory commit refusal shows only
+/// with one, comes unticked when it appears, keeps a tick while the refusal stays, and is
+/// disabled (so a native form post leaves it out) and unticked once it goes.
+const MEMORY: &str = r#"
+const assert = require('assert');
+const fs = require('fs'), vm = require('vm');
+const ctx = vm.createContext({console, Promise});
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const M = vm.runInContext('PrismMemory', ctx);
+function row() {
+  const box = {type: 'checkbox', name: 'ignore_memory_check', checked: true, disabled: true};
+  const words = {textContent: ''};
+  return {hidden: true, box, words,
+    querySelector: s => s.indexOf('checkbox') >= 0 ? box : s.indexOf('data-memory-label') >= 0 ? words : null};
+}
+const refusal = {refusal: 'this auto-label run needs about 10.0 GB ...', override_label: 'Start anyway: this job may grow the paging file into the last 16 GB of C:'};
+const r = row();
+M.sync(r, null);
+assert.deepStrictEqual([r.hidden, r.box.disabled, r.box.checked, r.words.textContent], [true, true, false, ''], 'no refusal: hidden');
+assert.strictEqual(M.ticked(r), false);
+r.box.checked = true;   // a restored form ticks a hidden box: it is still not "ticked"
+assert.strictEqual(M.ticked(r), false, 'a hidden box never counts');
+M.sync(r, refusal);
+assert.deepStrictEqual([r.hidden, r.box.disabled, r.box.checked], [false, false, false], 'appears unticked');
+assert.strictEqual(r.words.textContent, refusal.override_label);
+assert.strictEqual(M.ticked(r), false);
+r.box.checked = true;
+M.sync(r, refusal);
+assert.strictEqual(M.ticked(r), true, 'the tick stays while the refusal does');
+M.sync(r, {});
+assert.deepStrictEqual([r.hidden, r.box.disabled, r.box.checked], [true, true, false], 'a preview without one hides it');
+M.sync(null, refusal);   // a page without the row
+console.log('ok');
+"#;
+
+#[test]
+fn the_start_anyway_box_shows_only_beside_a_memory_refusal() {
+    if have_node() {
+        run(MEMORY);
+    }
+}

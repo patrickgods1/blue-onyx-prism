@@ -299,6 +299,38 @@ impl WorkerChoice {
     }
 }
 
+/// The host memory commit (Windows) of one training run of `family` with `workers`, for the check
+/// before its first Python process ([`commit`], in [`job`]): [`MAIN_COMMIT_RESERVE_BYTES`] (the
+/// measured trainer process, 8.0 GB) plus, only when `training.workers` forces a count,
+/// [`WORKER_COMMIT_BYTES`] per worker per loader ([`worker_loaders`]). Automatic workers add
+/// nothing: [`workers_for`] gives a run only the workers the commit holds beyond the trainer's
+/// reserve when it starts (0 when none). [`commit::COMMIT_SLACK_BYTES`] comes on top in the check.
+pub fn trainer_commit_need(family: catalog::TrainFamily, workers: job::Workers) -> commit::Need {
+    let trainer = MAIN_COMMIT_RESERVE_BYTES;
+    let n = match workers {
+        job::Workers::Auto => 0,
+        job::Workers::Fixed(n) => n,
+    };
+    let per = WORKER_COMMIT_BYTES * u64::from(worker_loaders(family.trainer()));
+    let extra = per.saturating_mul(u64::from(n));
+    let mut detail = format!("the training process {:.1} GB", gib(trainer));
+    if extra > 0 {
+        detail.push_str(&format!(
+            " + {} {:.1} GB (training.workers)",
+            workers_text(n),
+            gib(extra)
+        ));
+    }
+    commit::Need {
+        what: "this training run".into(),
+        bytes: trainer.saturating_add(extra),
+        detail,
+        lighter: (extra > 0).then(|| {
+            "let training choose its data loader workers (remove training.workers)".to_string()
+        }),
+    }
+}
+
 /// "1 data loader worker", "3 data loader workers".
 pub fn workers_text(n: u32) -> String {
     format!("{n} data loader worker{}", if n == 1 { "" } else { "s" })
@@ -646,6 +678,7 @@ pub fn plan_job(
         workers: t.workers.map_or(job::Workers::Auto, job::Workers::Fixed),
         keep_work: false,
         export_only: None,
+        headroom: commit::now,
     })
 }
 
@@ -747,6 +780,7 @@ mod tests {
             balance: Default::default(),
             compare_group: None,
             train_seed: None,
+            ignore_memory_check: false,
         }
     }
 

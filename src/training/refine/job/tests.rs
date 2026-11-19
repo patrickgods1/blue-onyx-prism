@@ -695,7 +695,8 @@ fn short_commit_refuses_the_check_before_any_process() {
          8.0 GB, 1.0 GB kept spare); 5.0 GB is free and the paging file on C: can grow only \
          while 16 GB stays free there (15.2 GB free now). Free space on C:, put the paging file \
          on another drive, or run a quick check with a trained model instead (Quick check with a \
-         model, or --with-model), which trains nothing, then start the job again."
+         model, or --with-model), which trains nothing, then start the job again. To start it \
+         anyway, tick Start anyway beside its preview, or pass --ignore-memory-check."
     );
     assert_eq!(fake.trains.load(Ordering::SeqCst), 0);
     assert!(fake.inner.cmds().is_empty(), "{:?}", fake.inner.cmds());

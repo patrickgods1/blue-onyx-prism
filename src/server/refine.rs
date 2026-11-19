@@ -849,6 +849,7 @@ fn build_request(f: Fields<'_>) -> Result<RefineRequest, String> {
         allow_large,
         tighten,
         model,
+        ignore_memory_check: false,
     };
     request.validate().map_err(|e| format!("{e:#}"))?;
     Ok(request)
@@ -980,6 +981,9 @@ struct CheckBody {
     /// check.
     #[serde(default)]
     model: Option<String>,
+    /// Start even when the memory commit check would refuse (the preview's "Start anyway").
+    #[serde(default)]
+    ignore_memory_check: bool,
 }
 
 /// The JSON body of a POST: 413 over the cap, 415 without a JSON content type, 400 when it does
@@ -1160,7 +1164,8 @@ fn start_check(
 }
 
 /// `POST /v1/refine/check` with `{folds?, epochs?, scenes?, cameras?, gpu?, allow_large?,
-/// replace_open?}`: queue the dataset check; 200 `{success: true, id, message}` (the task id, in
+/// replace_open?, ignore_memory_check?}` (the last: start even when the memory commit check would
+/// refuse): queue the dataset check; 200 `{success: true, id, message}` (the task id, in
 /// `GET /v1/train/jobs` and `GET /v1/training` `tasks[]`), or a refusal `{success: false, message,
 /// folder_missing}`: 400 for a bad field, too few frames or a plan that cannot run, 409 for a check
 /// already in the queue, 503 for an unplugged review folder. A check that would replace open
@@ -1188,7 +1193,10 @@ pub(super) async fn start(
             tighten: b.tighten,
             model: b.model,
         }) {
-            Ok(r) => r,
+            Ok(r) => check::RefineRequest {
+                ignore_memory_check: b.ignore_memory_check,
+                ..r
+            },
             Err(m) => return fail(StatusCode::BAD_REQUEST, m),
         };
         let state = shared.current();

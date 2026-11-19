@@ -12,6 +12,7 @@ use crate::resources::export::{Cmd, CommandRunner, Fetcher};
 use crate::training::capability::{self, Capability};
 use crate::training::overlaps::{OverlapsRequest, plan_overlaps};
 use crate::training::pyenv::is_cancel;
+use anyhow::bail;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -523,7 +524,8 @@ fn short_commit_stops_with_a_clear_error_before_any_process() {
         "the overlap check needs about 3.6 GB of memory commit (PyTorch and RF-DETR L 2.6 GB, 1.0 \
          GB kept spare); 1.0 GB is free and the paging file cannot grow (a fixed size, or at its \
          maximum). Close programs that use memory, or let Windows manage the paging file size on \
-         a drive with room to spare, then start the job again. Nothing was changed."
+         a drive with room to spare, then start the job again. To start it anyway, tick Start \
+         anyway beside its preview, or pass --ignore-memory-check."
     );
     assert_eq!(*fake.started.lock().unwrap(), 0, "no process started");
     assert_eq!(std::fs::read(path_of(&dir, &rel)).unwrap(), bytes);
@@ -544,6 +546,46 @@ fn short_commit_stops_with_a_clear_error_before_any_process() {
     assert!(
         e.contains("the paging file on C: can grow only while 16 GB"),
         "{e}"
+    );
+    // Start anyway (the request, as queued): it runs, warns once with the same numbers, and its
+    // summary says it was overridden.
+    let mut job = plan(&t.0, "");
+    job.request.ignore_memory_check = true;
+    job.headroom = || Some(headroom(&[r"c:\pagefile.sys 4096 4096"], 19.9, 1.0, &[]));
+    let fake = ZoomFake::default();
+    let mut lines: Vec<String> = Vec::new();
+    let out = job
+        .run(
+            TaskContext {
+                runner: &fake,
+                fetcher: &fake,
+            },
+            &mut |p| {
+                if let TaskReport::Line(l) = p {
+                    lines.push(l.to_string());
+                }
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(*fake.zooms.lock().unwrap(), 1);
+    let warned: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("memory check overridden: "))
+        .collect();
+    assert_eq!(warned.len(), 1, "{lines:?}");
+    assert!(
+        warned[0].starts_with(
+            "memory check overridden: the overlap check needs about 3.6 GB of memory commit"
+        ),
+        "{}",
+        warned[0]
+    );
+    assert!(
+        out.summary
+            .ends_with("; the memory check was overridden (Start anyway)"),
+        "{}",
+        out.summary
     );
     // Nothing to zoom (no pair): no check, no refusal.
     let none = tmp("commit-none");

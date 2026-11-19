@@ -157,6 +157,10 @@ pub struct TrainRequest {
     /// dataset assembly keeps `options.seed`, so every repeat trains on the same frames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub train_seed: Option<u64>,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 impl TrainRequest {
@@ -228,6 +232,11 @@ pub struct TrainJob {
     pub keep_work: bool,
     /// Export this failed run's checkpoint instead of training ([`super::retry::plan_retry`]).
     pub export_only: Option<ExportRetry>,
+    /// The memory commit a run can take now ([`super::commit::now`]; tests fake it), checked
+    /// before the run's first Python process ([`super::trainer_commit_need`]). A dataset check's
+    /// fold runs get [`super::commit::checked_already`]: the check judged that need before its
+    /// first fold. An export retry is not checked (it trains nothing).
+    pub headroom: fn() -> Option<super::commit::Headroom>,
 }
 
 /// A failed run to export again: what the run itself no longer tells.
@@ -715,6 +724,21 @@ fn stages(
         ),
         None => Some(TrainLock::try_acquire(&paths.train_lock_file())?),
     };
+
+    // The memory commit, before the run's first Python process (the environment's tools, the
+    // self-check, the trainer). Each run of a queue (a seed, another model) is checked at its own
+    // start; an export retry trains nothing and is not checked.
+    if job.export_only.is_none() {
+        super::commit::gate(
+            &super::trainer_commit_need(family, job.workers),
+            (job.headroom)().as_ref(),
+            job.request.ignore_memory_check,
+            &mut |l| {
+                log.line(l);
+                report(TrainReport::Line(l));
+            },
+        )?;
+    }
 
     // 1. Environment.
     enter!(TrainStage::Setup, 0, "checking the toolchain");

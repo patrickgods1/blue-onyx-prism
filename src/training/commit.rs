@@ -23,9 +23,18 @@
 //!
 //! The needs of each job are named constants beside the job, with where each figure came from:
 //! [`crate::training::autolabel::memory::commit_need`], [`crate::training::overlaps::zoom::commit_need`],
-//! [`crate::training::refine::commit_need`], [`crate::training::import::commit_need`].
+//! [`crate::training::refine::commit_need`], [`crate::training::import::commit_need`],
+//! [`crate::training::trainer_commit_need`] (a training run, checked in `training::job`).
+//!
+//! **Start anyway.** Every checked job's request carries `ignore_memory_check` (opt-in, stored with
+//! the queued task or run, never a config key): [`gate`] then lets a refused job start, warns once
+//! with the same numbers ([`OVERRIDDEN_PREFIX`]) into the log and the job's own log, and the
+//! task's summary says so ([`watch`], [`noted`]). Previews give the refusal and the checkbox's
+//! words ([`preview`], [`Preview`]).
 
 use crate::backend::memory::{self, Commit, PAGING_DISK_MARGIN_BYTES, PagingFile, growable_bytes};
+use crate::training::task::{TaskOutcome, TaskReport};
+use serde::{Deserialize, Serialize};
 
 const GB: u64 = 1 << 30;
 
@@ -289,6 +298,136 @@ pub fn refusal_now(need: &Need) -> Option<String> {
     refusal(need, now().as_ref())
 }
 
+/// A job's refusal at its start ends with how to override it.
+pub const OVERRIDE_HINT: &str =
+    "To start it anyway, tick Start anyway beside its preview, or pass --ignore-memory-check.";
+
+/// The start of the warning an overridden job logs (the rest is its refusal).
+pub const OVERRIDDEN_PREFIX: &str = "memory check overridden: ";
+
+/// What an overridden task's summary ends with ([`noted`]).
+pub const OVERRIDDEN_NOTE: &str = "the memory check was overridden (Start anyway)";
+
+/// What a preview shows when a start now would be refused: the refusal and the words of the
+/// unticked "Start anyway" checkbox beside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    pub refusal: String,
+    pub override_label: String,
+}
+
+impl Headroom {
+    /// The words of the "Start anyway" checkbox: what overriding risks with this reading.
+    pub fn override_label(&self) -> String {
+        let margin = PAGING_DISK_MARGIN_BYTES / GB;
+        if self.limited.is_empty() {
+            return "Start anyway: this job may run out of memory commit (the paging file cannot \
+                    grow)"
+                .to_string();
+        }
+        let names: Vec<String> = self.limited.iter().map(|d| d.name.clone()).collect();
+        format!(
+            "Start anyway: this job may grow the paging file into the last {margin} GB of {}",
+            and_list(&names)
+        )
+    }
+}
+
+/// [`Preview`] of `need` with `reading`: None when nothing would be refused ([`refusal`]).
+pub fn preview(need: &Need, reading: Option<&Headroom>) -> Option<Preview> {
+    let refusal = refusal(need, reading)?;
+    Some(Preview {
+        refusal,
+        override_label: reading.map(Headroom::override_label).unwrap_or_default(),
+    })
+}
+
+/// [`preview`] on this machine now ([`now`]).
+pub fn preview_now(need: &Need) -> Option<Preview> {
+    preview(need, now().as_ref())
+}
+
+/// What the check decides at a job's start ([`decide`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// It fits, or there is nothing to judge (off Windows, no reading).
+    Run,
+    /// Refused: the message, ending with [`OVERRIDE_HINT`].
+    Refused(String),
+    /// It would be refused, and the request says start anyway: the warning line
+    /// ([`OVERRIDDEN_PREFIX`] + the refusal).
+    Overridden(String),
+}
+
+/// The decision for `need` with `reading` when the request's `ignore_memory_check` is `ignore`
+/// (pure).
+pub fn decide(need: &Need, reading: Option<&Headroom>, ignore: bool) -> Decision {
+    match refusal(need, reading) {
+        None => Decision::Run,
+        Some(why) if ignore => Decision::Overridden(format!("{OVERRIDDEN_PREFIX}{why}")),
+        Some(why) => Decision::Refused(format!("{why} {OVERRIDE_HINT}")),
+    }
+}
+
+/// [`decide`] at a job's start: an error for a refusal; for an override, one warning in the log
+/// and the same line through `line` (the job's own log); true when overridden.
+pub fn gate(
+    need: &Need,
+    reading: Option<&Headroom>,
+    ignore: bool,
+    line: &mut dyn FnMut(&str),
+) -> anyhow::Result<bool> {
+    match decide(need, reading, ignore) {
+        Decision::Run => Ok(false),
+        Decision::Refused(why) => Err(anyhow::anyhow!(why)),
+        Decision::Overridden(warn) => {
+            tracing::warn!("{warn}");
+            line(&warn);
+            Ok(true)
+        }
+    }
+}
+
+/// [`gate`] reporting its line as a task's [`TaskReport::Line`].
+pub fn gate_task(
+    need: &Need,
+    reading: Option<&Headroom>,
+    ignore: bool,
+    report: &mut dyn FnMut(TaskReport<'_>),
+) -> anyhow::Result<bool> {
+    gate(need, reading, ignore, &mut |l| report(TaskReport::Line(l)))
+}
+
+/// Notes in `seen` whether `p` is the line of an overridden check (a task's `run` wraps its
+/// report with this, so its summary can say so: [`noted`]).
+pub fn watch(p: &TaskReport<'_>, seen: &mut bool) {
+    if let TaskReport::Line(l) = p
+        && l.starts_with(OVERRIDDEN_PREFIX)
+    {
+        *seen = true;
+    }
+}
+
+/// `r` with [`OVERRIDDEN_NOTE`] at the end of its summary when the check was `overridden`.
+pub fn noted(r: anyhow::Result<TaskOutcome>, overridden: bool) -> anyhow::Result<TaskOutcome> {
+    r.map(|mut o| {
+        if overridden {
+            o.summary = if o.summary.is_empty() {
+                OVERRIDDEN_NOTE.to_string()
+            } else {
+                format!("{}; {OVERRIDDEN_NOTE}", o.summary)
+            };
+        }
+        o
+    })
+}
+
+/// A reading that judges nothing: for a run whose need was checked already (a dataset check's
+/// fold models, checked by the check before its first fold).
+pub fn checked_already() -> Option<Headroom> {
+    None
+}
+
 /// The reading [`now`] gives in unit tests: per thread, none by default.
 #[cfg(test)]
 pub(crate) mod tests_reading {
@@ -526,6 +665,148 @@ pub(crate) mod tests {
         assert!(problem("windows", &n, Some(&h)).is_some());
         assert_eq!(problem("linux", &n, Some(&h)), None);
         assert_eq!(problem("macos", &n, Some(&h)), None);
+    }
+
+    #[test]
+    fn a_refusal_names_the_override_and_an_override_warns_with_the_same_numbers() {
+        let n = need("this auto-label run", 9.0);
+        let h = this_box();
+        let why = refusal(&n, Some(&h)).unwrap();
+        assert_eq!(
+            decide(&n, Some(&h), false),
+            Decision::Refused(format!("{why} {OVERRIDE_HINT}"))
+        );
+        assert_eq!(
+            decide(&n, Some(&h), true),
+            Decision::Overridden(format!("memory check overridden: {why}"))
+        );
+        // Nothing to override: it fits, or there is no reading.
+        assert_eq!(decide(&need("a", 1.0), Some(&h), true), Decision::Run);
+        assert_eq!(decide(&n, None, false), Decision::Run);
+        // gate: an error, or one line through the job's log.
+        let mut lines = Vec::new();
+        let e = gate(&n, Some(&h), false, &mut |l| lines.push(l.to_string())).unwrap_err();
+        assert!(
+            e.to_string().ends_with("or pass --ignore-memory-check."),
+            "{e}"
+        );
+        assert!(lines.is_empty());
+        assert!(gate(&n, Some(&h), true, &mut |l| lines.push(l.to_string())).unwrap());
+        assert_eq!(lines, [format!("{OVERRIDDEN_PREFIX}{why}")]);
+        assert!(!gate(&n, None, true, &mut |l| lines.push(l.to_string())).unwrap());
+        assert_eq!(lines.len(), 1);
+        // A task's summary says so only when the check was overridden.
+        let mut seen = false;
+        watch(&TaskReport::Line("an ordinary line"), &mut seen);
+        assert!(!seen);
+        watch(&TaskReport::Line(&lines[0]), &mut seen);
+        assert!(seen);
+        let out = |s: &str| {
+            Ok(TaskOutcome {
+                summary: s.into(),
+                result: serde_json::Value::Null,
+            })
+        };
+        assert_eq!(
+            noted(out("3 frames"), true).unwrap().summary,
+            format!("3 frames; {OVERRIDDEN_NOTE}")
+        );
+        assert_eq!(noted(out("3 frames"), false).unwrap().summary, "3 frames");
+        assert!(noted(Err(anyhow::anyhow!("x")), true).is_err());
+    }
+
+    #[test]
+    fn the_preview_gives_the_checkbox_its_drive() {
+        let n = need("a", 9.0);
+        let p = preview(&n, Some(&this_box())).unwrap();
+        assert_eq!(p.refusal, refusal(&n, Some(&this_box())).unwrap());
+        assert_eq!(
+            p.override_label,
+            "Start anyway: this job may grow the paging file into the last 16 GB of C:"
+        );
+        let fixed = headroom(&[r"c:\pagefile.sys 4096 4096"], 19.9, 1.0, &[]);
+        assert_eq!(
+            preview(&n, Some(&fixed)).unwrap().override_label,
+            "Start anyway: this job may run out of memory commit (the paging file cannot grow)"
+        );
+        assert_eq!(preview(&need("a", 1.0), Some(&this_box())), None);
+        assert_eq!(preview(&n, None), None);
+        // Serialized for the pages: {refusal, override_label}.
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(
+            v.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["override_label", "refusal"]
+        );
+    }
+
+    /// Every checked job's request carries the override: written only when set, read back, and
+    /// false in a record stored before it existed.
+    #[test]
+    fn the_override_round_trips_through_every_request_and_old_records_read_false() {
+        use crate::training::autolabel::{AutolabelRequest, FrameFilter};
+        use crate::training::import::{ImportRequest, ImportSource};
+        use crate::training::overlaps::OverlapsRequest;
+        use crate::training::refine::RefineRequest;
+        fn check<T>(mut r: T, set: fn(&mut T), get: fn(&T) -> bool)
+        where
+            T: Serialize + for<'de> Deserialize<'de>,
+        {
+            let v = serde_json::to_value(&r).unwrap();
+            assert!(v.get("ignore_memory_check").is_none(), "{v}");
+            let old: T = serde_json::from_value(v).unwrap();
+            assert!(!get(&old));
+            set(&mut r);
+            let v = serde_json::to_value(&r).unwrap();
+            assert_eq!(v["ignore_memory_check"], true, "{v}");
+            assert!(get(&serde_json::from_value::<T>(v).unwrap()));
+        }
+        check(
+            AutolabelRequest::new(FrameFilter::default()),
+            |r| r.ignore_memory_check = true,
+            |r| r.ignore_memory_check,
+        );
+        check(
+            OverlapsRequest::parse("").unwrap(),
+            |r| r.ignore_memory_check = true,
+            |r| r.ignore_memory_check,
+        );
+        check(
+            RefineRequest::default(),
+            |r| r.ignore_memory_check = true,
+            |r| r.ignore_memory_check,
+        );
+        check(
+            ImportRequest::new(ImportSource::Path("clips".into())),
+            |r| r.ignore_memory_check = true,
+            |r| r.ignore_memory_check,
+        );
+        let train = crate::training::job::TrainRequest {
+            recipe: crate::training::TrainRecipe::new(
+                crate::resources::catalog::TrainFamily::Yolo26,
+                "n",
+            )
+            .unwrap(),
+            datasets: vec!["export".into()],
+            include_public: false,
+            scene: Default::default(),
+            classes: None,
+            rename: Default::default(),
+            benchmark_sets: Vec::new(),
+            benchmark_devices: Vec::new(),
+            allow_large: false,
+            install_dir: None,
+            gpu: None,
+            excluded: Default::default(),
+            balance: Default::default(),
+            compare_group: None,
+            train_seed: None,
+            ignore_memory_check: false,
+        };
+        check(
+            train,
+            |r| r.ignore_memory_check = true,
+            |r| r.ignore_memory_check,
+        );
     }
 
     /// The live reading: present on Windows, consistent; None elsewhere.

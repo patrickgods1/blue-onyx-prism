@@ -387,6 +387,31 @@
     if (tag === "select" || tag === "textarea") return true;
     return tag === "input" && !NO_KEYBOARD[String(type || "text").toLowerCase()];
   }
+  // The "Start anyway" checkbox beside a preview's memory commit refusal (src/training/commit.rs):
+  // `row` is the page's static, hidden <label> with the checkbox (named `ignore_memory_check` in a
+  // native form, so a post sends it) and a [data-memory-label] span. With `memory` ({refusal,
+  // override_label}) the row shows with its words, enabled; it comes unticked when it appears and
+  // keeps the user's tick while the refusal stays. Without, it hides, disabled (not posted) and
+  // unticked.
+  root.PrismMemory = {
+    sync: function (row, memory) {
+      if (!row) return;
+      var box = row.querySelector('input[type="checkbox"]');
+      var words = row.querySelector("[data-memory-label]");
+      var on = !!(memory && memory.refusal);
+      if (box) {
+        if (!on || row.hidden) box.checked = false;
+        box.disabled = !on;
+      }
+      if (words) words.textContent = on ? (memory.override_label || "Start anyway") : "";
+      row.hidden = !on;
+    },
+    // Whether the shown row is ticked.
+    ticked: function (row) {
+      var box = row && row.querySelector('input[type="checkbox"]');
+      return !!(row && !row.hidden && box && !box.disabled && box.checked);
+    }
+  };
   root.PrismViewport = {
     KEYBOARD_SHARE: 0.75,
     typingField: typingField,

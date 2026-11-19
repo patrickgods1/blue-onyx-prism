@@ -5263,6 +5263,9 @@
       if (large && large.checked) body.allow_large = true;
       var askAgain = $('rv-suggest-again');
       if (askAgain && askAgain.checked) body.again = true;
+      // "Start anyway" shows beside a memory refusal of the dry run (PrismMemory, live.js).
+      var anyway = $('rv-suggest-anyway');
+      var anywayTicked = !!(window.PrismMemory && window.PrismMemory.ticked(anyway));
       body.dry_run = true;
       box.className = 'review-report';
       report(box, ['Counting the pairs...']);
@@ -5272,7 +5275,14 @@
           report(box, [j.message || 'No open overlap without a suggestion on these frames.']);
           return null;
         }
-        if (!window.confirm((j.memory ? 'Warning: ' + j.memory + '\n\n' : '') + 'Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
+        if (window.PrismMemory) window.PrismMemory.sync(anyway, j.memory);
+        if (j.memory && !anywayTicked) {
+          box.className = 'review-report error-text';
+          report(box, [j.memory.refusal, 'To queue it anyway, tick Start anyway above, then press Suggest overlaps again.']);
+          return null;
+        }
+        if (j.memory) body.ignore_memory_check = true;
+        if (!window.confirm((j.memory ? 'Warning: ' + j.memory.refusal + '\n\n' : '') + 'Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
           (body.again ? ', answered pairs asked again' : '') + ', ' +
           'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
           'It writes suggestions only: no box changes until you confirm one here.')) {

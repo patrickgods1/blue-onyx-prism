@@ -145,6 +145,8 @@ tbody tr:last-child td { border-bottom: none; }
 .card h2:first-child { margin-top: 0; }
 form label { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.5rem 0; font-size: 0.9rem; color: var(--muted); }
 form label.check { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--fg); }
+/* A hidden check row (the "Start anyway" checkbox of a memory refusal) stays hidden: `form label` sets display. */
+label.check[hidden] { display: none; }
 form.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0 1.5rem; }
 form.grid h2, form.grid textarea, form.grid p, form.grid .actions { grid-column: 1 / -1; }
 form.inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }

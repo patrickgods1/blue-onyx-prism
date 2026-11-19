@@ -954,10 +954,13 @@ impl AutolabelJob {
         self.step(report, 1, 100, &format!("{} frames", frames.len()));
         check(cancel)?;
         // Before the labelers' first Python process (a run with a model labels in this process).
-        if let Some(need) = super::memory::commit_need(r, &self.classes)
-            && let Some(why) = crate::training::commit::refusal(&need, (self.headroom)().as_ref())
-        {
-            bail!(why);
+        if let Some(need) = super::memory::commit_need(r, &self.classes) {
+            crate::training::commit::gate_task(
+                &need,
+                (self.headroom)().as_ref(),
+                r.ignore_memory_check,
+                report,
+            )?;
         }
         let _lock =
             crate::resources::export::train::TrainLock::try_acquire(&self.paths.train_lock_file())?;
@@ -1812,11 +1815,20 @@ impl Task for AutolabelJob {
         // finished proposals and removes it ([`crate::storage::sweep`]).
         let _busy = crate::storage::Busy::hold(&self.work);
         let mut keep_work = false;
-        let r = self.stages(ctx, report, cancel, &mut keep_work);
+        let mut overridden = false;
+        let r = self.stages(
+            ctx,
+            &mut |p| {
+                crate::training::commit::watch(&p, &mut overridden);
+                report(p);
+            },
+            cancel,
+            &mut keep_work,
+        );
         if r.is_err() && !keep_work {
             let _ = crate::resources::manager::remove_any(&self.work);
         }
-        let mut out = r?;
+        let mut out = crate::training::commit::noted(r, overridden)?;
         if let Some(fin) = self.finish.as_ref().filter(|f| !f.is_empty())
             && !cancelled(cancel)
             && out.result.get("cancelled") != Some(&serde_json::Value::Bool(true))
