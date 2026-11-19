@@ -1336,7 +1336,7 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
     let threads = threads.unwrap_or_else(|| parallel::walk_threads_over(kept.len()));
     let days = by_day(kept);
     let walker = Walker::new(dir);
-    let parts = parallel::map_all(days.len(), threads, &|i| {
+    let parts = parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
         let day = days.get(i).map_or(&[][..], Vec::as_slice);
         build_day(walker.clone(), day, f)
     });
@@ -1573,7 +1573,7 @@ fn tally_on(dir: &Path, threads: Option<usize>) -> Tally {
     let threads = threads.unwrap_or_else(|| parallel::walk_threads_over(all.len()));
     let days = by_day(all);
     let walker = Walker::new(dir);
-    let parts = parallel::map_all(days.len(), threads, &|i| {
+    let parts = parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
         let mut walker = walker.clone();
         let mut t = Tally::default();
         for c in days.get(i).map_or(&[][..], Vec::as_slice) {
@@ -1615,7 +1615,7 @@ fn over_days_on<T: Send>(
     let days: Vec<&[Listed]> = files
         .chunk_by(|a, b| day_of(&a.0) == day_of(&b.0))
         .collect();
-    let parts = parallel::map_all(days.len(), threads, &|i| {
+    let parts = parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
         days.get(i).map_or_else(Vec::new, |day| each(day))
     });
     parts.into_iter().flatten().collect()

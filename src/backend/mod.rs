@@ -426,6 +426,25 @@ impl Backend {
         }
     }
 
+    /// [`Self::submit`] with the pooled tensor handed over: ONNX Runtime's session thread reads
+    /// it in place instead of a copy in the slot (it returns to its pool once the slot is
+    /// collected); OpenVINO and the test fake copy it like `submit`, and it returns to its pool
+    /// here.
+    pub fn submit_pooled(
+        &mut self,
+        slot: usize,
+        chw: crate::prep::PooledBuf,
+        extra: &[ExtraInput],
+    ) -> Result<u64> {
+        match self {
+            Backend::OpenVino(b) => device::submit(&b.info, &mut b.slots, slot, &chw, extra),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.submit_pooled(slot, chw, extra),
+            #[cfg(test)]
+            Backend::Fake(b) => b.submit(slot, &chw, extra),
+        }
+    }
+
     /// Completions of submitted inferences (select on it; then [`Self::collect`] the slot).
     pub fn completions(&self) -> &crossbeam_channel::Receiver<Completion> {
         match self {

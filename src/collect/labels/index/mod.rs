@@ -610,7 +610,13 @@ fn open(dir: &Path, f: &Filters) -> Option<Arc<Index>> {
     let thread = index.clone();
     let spawned = std::thread::Builder::new()
         .name("review-index".into())
-        .spawn(move || refresh::run(thread));
+        .spawn(move || {
+            // A walk for the page: never ahead of detections for the CPU.
+            crate::backend::priority::lower_this_thread(
+                crate::backend::priority::ThreadRole::Background,
+            );
+            refresh::run(thread);
+        });
     if let Err(e) = spawned {
         tracing::warn!("review index: no thread for it ({e}), so Next walks the folder");
         return None;

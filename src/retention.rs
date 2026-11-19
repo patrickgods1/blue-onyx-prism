@@ -414,7 +414,8 @@ fn nap(total: Duration, shutdown: &CancellationToken) -> bool {
 
 /// Run [`prune_saved_images`] and the free-space check every [`SWEEP_INTERVAL`] (first after
 /// [`FIRST_SWEEP_DELAY`]), and the storage sweep once a day, until `shutdown`. `settings` is called on every tick, so config
-/// changes apply at once.
+/// changes apply at once. The thread runs below normal priority
+/// ([`crate::backend::priority::lower_this_thread`]).
 #[allow(
     clippy::expect_used,
     reason = "the OS can create one more thread; without it the sweeper cannot exist, and it \
@@ -427,6 +428,9 @@ pub fn spawn_sweeper(
     std::thread::Builder::new()
         .name("retention".into())
         .spawn(move || {
+            crate::backend::priority::lower_this_thread(
+                crate::backend::priority::ThreadRole::Background,
+            );
             let mut last_warn = None;
             let mut last_storage = None;
             let mut delay = FIRST_SWEEP_DELAY;

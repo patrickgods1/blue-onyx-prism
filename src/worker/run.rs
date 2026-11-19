@@ -2,10 +2,13 @@
 //! candidate), then a `Select`-driven state machine over the work channel, the prep reply of the
 //! oldest request and the backend's completions. Invariants: requests are answered in arrival
 //! order; nothing is left in flight when the loop ends (shutdown aborts, then answers every
-//! queued request); postprocessing runs on this thread.
+//! queued request); postprocessing runs on this thread. Decode and preprocessing (forwarded
+//! frames included) run on the prep pool, the annotated-image save on the `image-save` thread
+//! after the reply ([`super::save`]).
 
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
 use super::reap::reap;
+use super::save::{self, SaveJob};
 use super::verify::{Lane, LaneCtx, Pending};
 use super::watch::{SlowCompile, StuckWatch, collect_watched, watch_slow_compile};
 use super::{
@@ -19,9 +22,8 @@ use crate::backend::{Backend, Candidate, Completion, DeviceInfo, Runtimes};
 use crate::image_stats::Scene;
 use crate::metrics::{DropReason, ModelMetrics, RouteFallback};
 use crate::model::filters::{SuppressCounts, SuppressReason};
-use crate::model::preprocess::Preprocessor;
 use crate::model::{Family, PostParams};
-use crate::prep::{PrepJob, PrepPool, PrepSpec, Prepared};
+use crate::prep::{PrepInput, PrepJob, PrepPool, PrepSpec, Prepared};
 use crate::profile::DeviceTuning;
 use crate::startup::{ModelState, StateHandle};
 use crate::static_memory::StaticMemory;
@@ -85,9 +87,6 @@ pub(super) struct WorkerCtx {
     /// Static-box memory of this model (kept across live-settings swaps; a reload starts a new
     /// worker and so an empty memory).
     pub(super) static_memory: RefCell<StaticMemory>,
-    /// Preprocessor for requests forwarded with a decoded image ([`WorkItem::DetectDecoded`]),
-    /// made on first use for the engine's geometry.
-    pub(super) decoded_pre: RefCell<Option<(PrepSpec, Preprocessor)>>,
     /// The verifier-cascade continuation thread (started on the first verification; see
     /// [`super::verify`]).
     pub(super) verify_lane: RefCell<Option<Lane>>,
@@ -382,36 +381,29 @@ impl WorkerCtx {
             request_id = %meta.request_id,
             "accepted"
         );
-        let image_data = match input {
-            Input::Bytes(b) => b,
-            Input::Decoded { img, stats, decode } => {
-                let stage = if let Some(resp) = self.timed_out(&meta) {
-                    Stage::Answer(resp)
-                } else {
-                    match self.prepare_decoded(eng, prep, img, stats, &meta) {
-                        Ok(mut prepared) => {
-                            prepared.decode = decode;
-                            Stage::Ready(prepared)
-                        }
-                        Err(e) => Stage::Answer(self.failure(&meta, &eng.provider, &e)),
-                    }
-                };
-                p.pending.push_back(Job { meta, stage });
-                return;
-            }
+        let (input, keep_image) = match input {
+            // The decoded frame is forwarded when the night model takes it, and cropped for
+            // the verifier.
+            Input::Bytes(b) => (
+                PrepInput::Encoded(b),
+                meta.live.save_image_path.is_some() || may_route(&meta) || may_verify(&meta),
+            ),
+            // A forwarded frame: prepared on the pool like an upload, with this model's own
+            // modes for the sender's scene statistics (its original frame, never the sender's
+            // enhanced copy).
+            Input::Decoded { img, stats, decode } => (
+                PrepInput::Decoded { img, stats, decode },
+                (meta.live.save_image_path.is_some() && !meta.verify_crop) || may_verify(&meta),
+            ),
         };
         let stage = if let Some(resp) = self.timed_out(&meta) {
             Stage::Answer(resp)
         } else {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let job = PrepJob {
-                image: image_data,
+                input,
                 spec: eng.spec,
-                // The decoded frame is forwarded when the night model takes it, and cropped
-                // for the verifier.
-                keep_image: meta.live.save_image_path.is_some()
-                    || may_route(&meta)
-                    || may_verify(&meta),
+                keep_image,
                 preprocess: meta.live.preprocess,
                 reply: tx,
             };
@@ -433,6 +425,9 @@ impl WorkerCtx {
     ) -> (Meta, Input) {
         let live = self.cfg.live.load_full();
         let original = (live.collect.enabled && !req.no_collect).then(|| req.image_data.clone());
+        // The reference copy of `save_ref_image` is the upload itself (see `save`).
+        let upload =
+            (live.save_ref_image && live.save_image_path.is_some()).then(|| req.image_data.clone());
         let meta = Meta {
             reply,
             enqueued,
@@ -445,6 +440,7 @@ impl WorkerCtx {
             routed_from: None,
             verify_crop: false,
             original,
+            upload,
         };
         (meta, Input::Bytes(req.image_data))
     }
@@ -465,6 +461,7 @@ impl WorkerCtx {
             from,
             purpose,
             original,
+            upload,
         } = d;
         let meta = Meta {
             reply,
@@ -478,41 +475,9 @@ impl WorkerCtx {
             routed_from: Some(from),
             verify_crop: purpose == Purpose::Verify,
             original: original.filter(|_| purpose == Purpose::NightModel),
+            upload: upload.filter(|_| purpose == Purpose::NightModel),
         };
         (meta, Input::Decoded { img, stats, decode })
-    }
-
-    /// Preprocess a forwarded, already decoded image for this model on this thread (the
-    /// letterbox / stretch of one frame, plus this model's enhancement for the frame's scene).
-    fn prepare_decoded(
-        &self,
-        eng: &Engine,
-        prep: &PrepPool,
-        img: crate::image::RgbImage,
-        stats: crate::image_stats::ImageStats,
-        meta: &Meta,
-    ) -> Result<Prepared> {
-        let mut cell = self.decoded_pre.borrow_mut();
-        let (spec, pre) = match cell.take() {
-            Some((spec, pre)) if spec == eng.spec => (spec, pre),
-            _ => (eng.spec, eng.spec.preprocessor()),
-        };
-        let mut pre = pre;
-        let keep = (meta.live.save_image_path.is_some() && !meta.verify_crop) || may_verify(meta);
-        // This model's own modes (the sender's scene statistics, its original frame).
-        let modes = meta.live.preprocess;
-        let tensors = prep.tensors();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            PrepPool::prepare_image(&mut pre, tensors, img, stats, &spec, keep, modes)
-        }));
-        match result {
-            Ok(r) => {
-                *cell = Some((spec, pre));
-                r
-            }
-            // The preprocessor may be half-updated: the next request makes a new one.
-            Err(_) => Err(anyhow::anyhow!("preprocessing panicked")),
-        }
     }
 
     /// Night model switch for the request at the head of `pending` (decoded, a night / IR
@@ -563,6 +528,7 @@ impl WorkerCtx {
             request_id,
             budget,
             original,
+            upload,
             ..
         } = meta;
         let decoded = Decoded {
@@ -578,6 +544,7 @@ impl WorkerCtx {
             from: self.cfg.name.clone(),
             purpose: Purpose::NightModel,
             original,
+            upload,
         };
         let (back, reason) = match target
             .sender
@@ -621,6 +588,7 @@ impl WorkerCtx {
             routed_from: None,
             verify_crop: false,
             original: d.original,
+            upload: d.upload,
         };
         Some(self.fall_back(meta, prepared, d.img, &night, reason))
     }
@@ -799,16 +767,18 @@ impl WorkerCtx {
             }
             let extra = eng.family.extra_inputs(&prepared.ctx);
             let submitted = Instant::now();
-            match self.submit(eng, slot, &prepared.chw, &extra) {
+            let Prepared {
+                chw,
+                ctx,
+                img,
+                stats,
+                decode,
+                preprocess,
+            } = prepared;
+            // The tensor goes to the backend, which returns it to the pool (see
+            // `Backend::submit_pooled`).
+            match self.submit(eng, slot, chw, &extra) {
                 Ok(seq) => {
-                    let Prepared {
-                        ctx,
-                        img,
-                        stats,
-                        decode,
-                        preprocess,
-                        ..
-                    } = prepared; // the tensor buffer goes back to the pool here
                     #[allow(
                         clippy::indexing_slicing,
                         reason = "slot was returned by p.free_slot() earlier in this loop iteration, \
@@ -847,19 +817,19 @@ impl WorkerCtx {
         moved
     }
 
-    /// Start one inference ([`Backend::submit`]).
+    /// Start one inference ([`Backend::submit_pooled`]).
     fn submit(
         &self,
         eng: &mut Engine,
         slot: usize,
-        chw: &[f32],
+        chw: crate::prep::PooledBuf,
         extra: &[crate::model::ExtraInput],
     ) -> Result<u64> {
         #[cfg(test)]
         if let Some(fault) = &self.cfg.faults.submit {
             fault()?;
         }
-        eng.backend.submit(slot, chw, extra)
+        eng.backend.submit_pooled(slot, chw, extra)
     }
 
     /// Reply to the requests at the front of `order` that are answered or whose inference
@@ -1444,6 +1414,8 @@ impl WorkerCtx {
             stats,
             ..
         } = f;
+        // The annotated image, drawn, encoded and written after the reply ([`save`]).
+        let mut save_job = None;
         let resp = match result {
             Ok(predictions) => {
                 self.metrics.inference_ms.record(millis_u64(infer_d));
@@ -1484,21 +1456,23 @@ impl WorkerCtx {
                         handed_off: Instant::now(),
                         line,
                         collect: collect_job.take(),
+                        upload: meta.upload,
                     });
                     self.hand_off(pending);
                     return;
                 }
                 self.metrics.process_ms.record(millis_u64(process_d));
                 line.emit(&resp.predictions, None);
-                if !crop && let (Some(dir), Some(img)) = (&live.save_image_path, &img) {
-                    save_annotated(
-                        name,
-                        dir,
-                        &meta.image_name,
+                if !crop && let (Some(dir), Some(img)) = (&live.save_image_path, img) {
+                    save_job = Some(SaveJob {
+                        model: name.clone(),
+                        dir: dir.clone(),
+                        image_name: meta.image_name.clone(),
                         img,
-                        &resp.predictions,
-                        live.save_ref_image,
-                    );
+                        predictions: resp.predictions.clone(),
+                        save_ref: live.save_ref_image,
+                        upload: meta.upload.clone(),
+                    });
                 }
                 resp
             }
@@ -1519,12 +1493,33 @@ impl WorkerCtx {
                 r
             }
         };
-        // The collector gets the frame after the reply went out (a `try_send`, never waits).
+        // The collector and the image saver get the frame after the reply went out (each a
+        // `try_send`, never waits).
         let collect = collect_job.map(|job| (job, resp.predictions.clone()));
         self.reply(meta, resp);
         if let Some((job, predictions)) = collect {
             job.submit(&predictions);
         }
+        if let Some(job) = save_job {
+            save::submit(self.saver().as_deref(), job);
+        }
+    }
+
+    /// The image saver of this worker: a test's ([`super::TestFaults::saver`]), else None (the
+    /// process-wide one).
+    #[cfg(test)]
+    fn saver(&self) -> Option<Arc<save::Saver>> {
+        self.cfg.faults.saver.clone()
+    }
+
+    /// The image saver of this worker: None, the process-wide one.
+    #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the test build reads the worker's faults"
+    )]
+    fn saver(&self) -> Option<Arc<save::Saver>> {
+        None
     }
 
     /// Give a request with verifier candidates to the verify lane (started on first use). If
@@ -1536,6 +1531,7 @@ impl WorkerCtx {
                 name: self.cfg.name.clone(),
                 metrics: self.metrics.clone(),
                 peers: self.cfg.peers.clone(),
+                saver: self.saver(),
             }) {
                 Ok(l) => *lane = Some(l),
                 Err(e) => warn!(
@@ -1556,30 +1552,11 @@ impl WorkerCtx {
                 name: self.cfg.name.clone(),
                 metrics: self.metrics.clone(),
                 peers: self.cfg.peers.clone(),
+                saver: self.saver(),
             },
             pending,
             super::verify::Failure::Stopped,
         );
-    }
-}
-
-/// Save `img` annotated with `predictions` under `dir` (a warning on failure).
-pub(super) fn save_annotated(
-    model: &str,
-    dir: &std::path::Path,
-    image_name: &str,
-    img: &crate::image::RgbImage,
-    predictions: &[crate::api::Prediction],
-    save_ref_image: bool,
-) {
-    let file_name = if image_name.is_empty() || image_name == "image.jpg" {
-        format!("{}.jpg", uuid::Uuid::new_v4())
-    } else {
-        image_name.to_string()
-    };
-    if let Err(e) = crate::image::save_annotated(dir, &file_name, img, predictions, save_ref_image)
-    {
-        warn!(model = %model, "could not save annotated image: {e:#}");
     }
 }
 

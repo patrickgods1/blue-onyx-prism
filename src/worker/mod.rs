@@ -23,8 +23,9 @@
 //!
 //! Layout: this module holds the public surface (work items, [`WorkerConfig`], [`LiveSettings`],
 //! [`WorkerHandle`], spawning); `run` is the thread's load + run loop, `pipeline` the request
-//! bookkeeping it drives, `watch` the stuck-inference and slow-compile watchdogs, and `reap` the
-//! threads that free a backend a worker has given up on.
+//! bookkeeping it drives, `watch` the stuck-inference and slow-compile watchdogs, `reap` the
+//! threads that free a backend a worker has given up on, and `save` the annotated-image writer
+//! (`save_image_path`, after the reply).
 
 use crate::api::{VisionDetectionRequest, VisionDetectionResponse};
 use crate::backend::plan::Better;
@@ -52,6 +53,7 @@ mod reap;
 mod run;
 #[cfg(test)]
 mod run_tests;
+pub(crate) mod save;
 mod verify;
 mod watch;
 
@@ -136,6 +138,9 @@ pub struct Decoded {
     pub purpose: Purpose,
     /// The request's encoded image as uploaded (for the dataset collector; None: not kept).
     pub original: Option<bytes::Bytes>,
+    /// The request's encoded image for `save_ref_image` (None: not kept; the reference copy
+    /// is then encoded from `img`).
+    pub upload: Option<bytes::Bytes>,
 }
 
 /// Why a [`Decoded`] request was handed over.
@@ -276,6 +281,9 @@ pub(crate) struct TestFaults {
     pub(crate) warmup_timeout: Option<Duration>,
     /// See [`LoadFault`].
     pub(crate) load: Option<LoadFault>,
+    /// The image saver to use instead of the process-wide one (e.g. one without a thread, so
+    /// a test sees what is queued).
+    pub(crate) saver: Option<Arc<save::Saver>>,
 }
 
 #[cfg(test)]
@@ -925,7 +933,6 @@ pub fn spawn_worker_after(
         consecutive_errors: std::cell::Cell::new(0),
         consecutive_degenerate: std::cell::Cell::new(0),
         static_memory: std::cell::RefCell::new(crate::static_memory::StaticMemory::new()),
-        decoded_pre: std::cell::RefCell::new(None),
         verify_lane: std::cell::RefCell::new(None),
     };
     let name = cfg.name.clone();

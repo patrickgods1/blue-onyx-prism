@@ -145,9 +145,30 @@ pub fn map<T: Send>(
     by_index(n, parts)
 }
 
+/// Priority of the threads [`map_all_at`] spawns. The calling thread never changes: it may be
+/// a pooled HTTP or blocking thread, which must keep its priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spawned {
+    /// As the calling process (detection-side callers).
+    Normal,
+    /// Below normal ([`crate::backend::priority::lower_this_thread`]): UI and index walks, so a
+    /// long walk never competes with detections for the CPU.
+    Background,
+}
+
 /// `f(i)` for `i` in `0..n` on `threads` threads, the calling thread among them, results by
 /// index: no progress, no cancel, no polling. A panic in `f` comes out here.
 pub fn map_all<T: Send>(n: usize, threads: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    map_all_at(n, threads, Spawned::Normal, f)
+}
+
+/// [`map_all`] whose spawned threads run at `spawned` priority.
+pub fn map_all_at<T: Send>(
+    n: usize,
+    threads: usize,
+    spawned: Spawned,
+    f: &(dyn Fn(usize) -> T + Sync),
+) -> Vec<T> {
     if n <= 1 || threads <= 1 {
         return (0..n).map(f).collect();
     }
@@ -156,7 +177,16 @@ pub fn map_all<T: Send>(n: usize, threads: usize, f: &(dyn Fn(usize) -> T + Sync
     let cancel = AtomicBool::new(false);
     let parts: Vec<Vec<(usize, T)>> = std::thread::scope(|s| {
         let handles: Vec<_> = (1..threads.min(n))
-            .map(|_| s.spawn(|| steal(&next, &done, n, f, &cancel)))
+            .map(|_| {
+                s.spawn(|| {
+                    if spawned == Spawned::Background {
+                        crate::backend::priority::lower_this_thread(
+                            crate::backend::priority::ThreadRole::Background,
+                        );
+                    }
+                    steal(&next, &done, n, f, &cancel)
+                })
+            })
             .collect();
         let mine = steal(&next, &done, n, f, &cancel);
         let mut parts: Vec<_> = handles
@@ -174,6 +204,34 @@ pub fn map_all<T: Send>(n: usize, threads: usize, f: &(dyn Fn(usize) -> T + Sync
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// Background maps lower the threads they spawn and never the calling thread; normal maps
+    /// lower nothing.
+    #[test]
+    fn background_maps_lower_only_their_spawned_threads() {
+        use crate::backend::priority::thread_level;
+        let me = std::thread::current().id();
+        let before = thread_level();
+        for spawned in [Spawned::Normal, Spawned::Background] {
+            let seen = map_all_at(64, 4, spawned, &|_| {
+                // Long enough that the spawned threads take items too.
+                std::thread::sleep(Duration::from_millis(2));
+                (std::thread::current().id() == me, thread_level())
+            });
+            assert!(seen.iter().any(|(caller, _)| !caller), "{spawned:?}");
+            for (caller, level) in seen {
+                let lowered = spawned == Spawned::Background
+                    && !caller
+                    && cfg!(any(windows, target_os = "linux"));
+                assert_eq!(level != before, lowered, "{spawned:?} caller={caller}");
+            }
+            assert_eq!(
+                thread_level(),
+                before,
+                "the calling thread keeps its priority"
+            );
+        }
+    }
 
     #[test]
     fn map_keeps_the_order_and_stops_on_cancel() {

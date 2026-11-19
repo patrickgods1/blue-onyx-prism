@@ -347,6 +347,9 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
             let spawned = std::thread::Builder::new()
                 .name("storage-usage".into())
                 .spawn(move || {
+                    crate::backend::priority::lower_this_thread(
+                        crate::backend::priority::ThreadRole::Background,
+                    );
                     let r = Arc::new(measure(&s, &runs));
                     let mut c = CACHE.lock_recover();
                     c.last = Some((Instant::now(), r));
