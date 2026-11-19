@@ -18,6 +18,8 @@
 //! - [`self_check`]: when a run may skip its separate self-check process (nothing it checked
 //!   changed since the last one passed); [`file_id`]: the file identity the reuse checks compare.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
+//! - [`workers`]: what a run used (workers, commit, RAM, page-ins; sampled while it trains) and the
+//!   worker count learned from earlier runs of the same machine and recipe.
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
 //! - [`refine`]: the dataset check (`train refine`), short fold models that never saw a camera
 //!   day suggest missing boxes, labels to verify and other classes.
@@ -57,6 +59,7 @@ pub mod self_check;
 pub mod service;
 pub mod switch;
 pub mod task;
+pub mod workers;
 
 pub use capability::{Accelerator, Capability};
 pub use config::TrainingConfig;
@@ -306,7 +309,10 @@ impl WorkerChoice {
 /// measured trainer process, 8.0 GB) plus, only when `training.workers` forces a count,
 /// [`WORKER_COMMIT_BYTES`] per worker per loader ([`worker_loaders`]). Automatic workers add
 /// nothing: [`workers_for`] gives a run only the workers the commit holds beyond the trainer's
-/// reserve when it starts (0 when none). [`commit::COMMIT_SLACK_BYTES`] comes on top in the check.
+/// reserve when it starts (0 when none), and the count learned from earlier runs
+/// ([`workers::learned`]) is never above that limit, so an automatic run never commits more workers
+/// than its own start-time reading holds. Counting them here would refuse a run the limit would
+/// shrink to fit. [`commit::COMMIT_SLACK_BYTES`] comes on top in the check.
 pub fn trainer_commit_need(family: catalog::TrainFamily, workers: job::Workers) -> commit::Need {
     let trainer = MAIN_COMMIT_RESERVE_BYTES;
     let n = match workers {
@@ -758,6 +764,7 @@ pub fn plan_job(
         root: config.data_root(),
         timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
         workers: t.workers.map_or(job::Workers::Auto, job::Workers::Fixed),
+        past_runs: Vec::new(),
         keep_work: false,
         export_only: None,
         headroom: commit::now,

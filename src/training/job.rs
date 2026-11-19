@@ -229,6 +229,9 @@ pub struct TrainJob {
     /// Data loader workers (`--workers`): sized when training starts, or forced by
     /// `training.workers`.
     pub workers: Workers,
+    /// Earlier runs [`Workers::Auto`] learns from ([`super::workers::learned`]): filled by the
+    /// queue when the run starts (the records of `runs.json` with resources), empty = the limit.
+    pub past_runs: Vec<super::service::RunRecord>,
     /// Keep the checkpoints (`<run>/work`) after the run.
     pub keep_work: bool,
     /// Export this failed run's checkpoint instead of training ([`super::retry::plan_retry`]).
@@ -284,6 +287,8 @@ pub enum TrainReport<'a> {
     Installed(&'a TrainOutput),
     /// [`Hooks::register`] added it to the config; its message.
     Registered(&'a str),
+    /// What the training stage used (sent once it ends, also when it failed).
+    Resources(&'a super::workers::RunResources),
 }
 
 /// The installed model.
@@ -1249,22 +1254,38 @@ fn stages(
         }
         args
     };
-    let (mut workers, start_commit) = match job.workers {
+    let machine = super::workers::Machine::now(&job.accelerator);
+    let (mut workers, start_commit, limit) = match job.workers {
         Workers::Auto => {
+            // The limit of the memory free now, then what earlier runs of this machine and key
+            // taught ([`super::workers::learned`]), never above that limit.
             let c = super::workers_now(family.trainer());
             log.line(&format!("# {}", c.describe()));
-            (c.workers, c.commit)
+            let (n, why) = super::workers::learned(
+                &machine,
+                &super::workers::WorkerKey::of(recipe),
+                &job.past_runs,
+                c.workers,
+            );
+            let line = super::workers::sentence(n, &why, c.workers);
+            log.line(&format!("# {line}"));
+            tracing::info!("training {}: {line}", job.name);
+            (n, c.commit, Some(c.workers))
         }
         Workers::Fixed(n) => {
-            log.line(&format!("# data loader workers: {n} (training.workers)"));
-            (n, None)
+            log.line(&format!("# {}", super::workers::forced_sentence(n)));
+            (n, None, None)
         }
     };
+    let loaders = super::worker_loaders(family.trainer());
+    // The latest attempt that ran out of host memory (the fewest workers): its workers and
+    // median speed.
+    let mut host_oom_at: Option<(u32, Option<f64>)> = None;
     let mut batch = recipe.batch;
     let mut retries = 0;
     let mut host_retries = 0;
     let mut note: Option<String> = None;
-    let (res, done) = loop {
+    let (res, done, usage, attempt) = loop {
         let mut cmd = env::train_python_cmd(
             paths,
             job.platform,
@@ -1308,6 +1329,7 @@ fn stages(
                 patience_doubled,
                 batch: recipe.batch,
                 workers: Some(workers),
+                loaders: Some(loaders),
                 seed: job.request.train_seed,
                 scene: Some(job.request.scene.as_str().to_string()),
                 gpu: Some(job.accelerator.name().to_string()),
@@ -1321,6 +1343,8 @@ fn stages(
             ..TrainProgress::default()
         };
         let mut done: Option<TrainEvent> = None;
+        // Commit, RAM and page-ins from here to the export (the baseline is read first).
+        let sampler = super::workers::sampler::Sampler::start();
         let res = runner.run(
             &cmd,
             &mut |l| {
@@ -1329,6 +1353,9 @@ fn stages(
                     Some(ev @ TrainEvent::Done { .. }) => done = Some(ev),
                     Some(ev) => {
                         tp.apply(&ev, started.elapsed().as_secs_f64());
+                        if tp.phase.is_some() {
+                            sampler.stop();
+                        }
                         let pct = super::estimate::to_u64(tp.fraction() * 100.0).min(100);
                         let d = tp.describe();
                         report(TrainReport::Stage {
@@ -1343,12 +1370,21 @@ fn stages(
             },
             cancel,
         );
+        let usage = sampler.finish();
+        let speed = (
+            super::workers::median_metric(&tp.history, "img_s"),
+            super::workers::median_metric(&tp.history, "data_wait"),
+        );
         let lines = res.as_ref().err().and_then(|e| {
             e.downcast_ref::<crate::resources::export::ChildFailed>()
                 .map(|c| c.lines.as_slice())
         });
         let host_oom = lines.is_some_and(|l| host_out_of_memory_line(l).is_some());
         let gpu_oom = lines.is_some_and(|l| out_of_memory_line(l).is_some());
+        if host_oom {
+            // Each restart halves the workers: the latest such attempt has the fewest.
+            host_oom_at = Some((workers, speed.0));
+        }
         let cancelled = cancel.load(Ordering::Relaxed);
         let keep = keeps_checkpoints(&tp, family.trainer(), &work);
         // Out of system memory (commit): fewer workers, same batch (the worker count does not
@@ -1397,8 +1433,31 @@ fn stages(
             note = Some(msg);
             continue;
         }
-        break (res, done);
+        break (res, done, usage, speed);
     };
+    let resources = super::workers::RunResources {
+        workers,
+        loaders,
+        forced: matches!(job.workers, Workers::Fixed(_)),
+        limit,
+        machine,
+        img_s: attempt.0,
+        data_wait: attempt.1,
+        commit_start: usage.commit_start,
+        commit_peak: usage.commit_peak,
+        commit_limit_at_peak: usage.commit_limit_at_peak,
+        ram_start: usage.ram_start,
+        ram_min: usage.ram_min,
+        page_ins_peak: usage.page_ins_peak,
+        samples: usage.samples,
+        host_oom: host_oom_at.map(|(n, _)| n),
+        // The measured attempt's own speed is `img_s`.
+        host_oom_img_s: host_oom_at
+            .filter(|(n, _)| *n != workers)
+            .and_then(|(_, v)| v),
+    };
+    log.line(&format!("# {}", resources.describe()));
+    report(TrainReport::Resources(&resources));
     let finished_recipe = TrainRecipe {
         batch,
         ..recipe.clone()

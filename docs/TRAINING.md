@@ -1010,7 +1010,9 @@ Stages (page and `train run` show them with percent and ETA):
    `train.log`, naming each bound: `memory: commit 23.3 GB limit (can grow to 38.3 GB), 5.4 GB free,
    RAM 7.6 GB free -> 2 data loader workers (cores allow 5, commit 4, RAM 2)` (no "can grow" for a
    fixed paging file). `training.workers` in the config forces a count (0 = none; absent =
-   automatic).
+   automatic). The automatic count is that limit, or less once earlier runs of the machine and recipe
+   showed fewer were as fast ("Learned worker count" under [Estimates](#estimates)); the next line
+   says which.
 
    Measured on a GTX 1070 Ti, i5-8600K (6 cores), 16 GB (15.9 usable), growable 24 GB paging file
    (`c:\pagefile.sys 2935 24576`, 19 GB free on C:): RF-DETR nano 384, batch 8, 2308 training
@@ -1396,6 +1398,55 @@ default input size (and RF-DETR multi-scale setting) on the same GPU comes from 
 (`measured: true` in `GET /v1/training`): linear in the batch above the table's fixed part (at most
 half the peak), 90% of the VRAM on CUDA, the whole MPS share on a Mac (the driver's allocation
 includes the allocator's cache, the share is already 60% of the RAM against PyTorch's own 74%).
+
+**Learned worker count** (`src/training/workers.rs`). The [data loader workers](#a-run) limit (cores,
+commit, RAM when training starts) is a safe start, not the best count: on the box measured there it
+allowed 4, and 4 were no faster than 2 and then ran out of host memory. So every run records what it
+used, and the next run of the same machine and recipe learns from it. There is no file of its own:
+everything comes from `runs.json`.
+
+- *What a run records* (`resources` on its record; none on records from before): its workers and
+  loaders (worker processes = workers x loaders), whether `training.workers` forced them, the limit
+  when it started, the machine (CPU model, logical cores, RAM rounded to GB, GPU name and memory),
+  the median `img_s` and `data_wait` of its epochs, and from a reading every 5 s between the start of
+  the training stage and the export: the system commit at the start, its peak and the commit limit at
+  the peak (Windows), the available RAM at the start and its minimum (Windows, Linux), and the most
+  pages read in per second (hard faults: the PDH counter `\Memory\Pages Input/sec` on Windows,
+  `pgmajfault` of `/proc/vmstat` on Linux; none on macOS). A run that ran out of host memory records
+  the fewest workers it did so with (and that attempt's speed when it finished an epoch, since the
+  restart's history starts over). Once the trainer exits, the train log sums it up:
+  `# resources: 2 data loader workers (4 processes), commit 17.9 GB at the start, peak 31.4 of 32.4
+  GB, RAM 7.6 GB free at the start, 2.06 GB at least, page-ins up to 2.8k/s, 11.4 img/s, waited on
+  data 15%`.
+- *What the next run gets*, from the runs of the same machine, trainer, family, size, input size and
+  batch (another machine starts over; forced runs count as measurements too):
+  - no such run: the limit, as before;
+  - the speed of a count is that of its latest run; going up from the fewest workers measured, a
+    count becomes the best only when it is at least 5% faster than the best below it (repeats of one
+    setting vary by about 4%);
+  - a measured count above the best (so no faster): the best;
+  - the best is the highest count measured and its run waited on data more than 10% of its training
+    time: one more, if what it left covers one more worker. That is its least available RAM less 2 GB,
+    and its commit limit less its peak, each at least one worker's measured share: the run's growth
+    in commit and in RAM over its start, divided by its worker processes, times the loaders (the
+    growth includes the trainer, so this errs high; a run without workers uses 1.4 GB commit and
+    0.75 GB RAM per loader; a figure the OS does not give is not checked). Else the best;
+  - a run that ran out of host memory with N workers: at most N - 1, until the machine changes;
+  - never above the limit of the moment. `training.workers` always wins.
+- *Where it shows*: the train log, after the limit's line: `# data loader workers: 2 (learned on this
+  machine: 4 was no faster than 2; limits allow 4)` (`nothing learned on this machine yet` without
+  history); the Train tab's pre-flight shows the same sentence for each ticked model at the batch and
+  input size typed (memory read now, so the run's own line may differ); `GET /v1/training` lists
+  `workers_learned`, one entry per recipe measured on this machine (`family`, `size`, `imgsz`,
+  `batch`, `workers` (what a run would get, the forced count included), `learned`, `limit`, `why`,
+  `text`). The dataset check's fold runs learn from the recorded runs too (they record nothing
+  themselves).
+
+On the measured box (RF-DETR nano 384, batch 8; the table under "Data loader workers"): after the
+0-worker run (35% data wait, memory to spare) the next run gets 1; after the 2-worker run (15% data
+wait, but only 2.06 GB of RAM left) it stays at 2; with the 4-worker run (no faster, then out of
+memory) it settles at 2. The unit tests (`src/training/workers/tests.rs`) use these runs as their
+fixture.
 
 Time: `epoch = images / (images per second x GPU factor) x (imgsz / default)^2`, images per second
 for a GTX

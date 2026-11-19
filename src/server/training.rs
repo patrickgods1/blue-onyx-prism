@@ -1137,6 +1137,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         static_cap: p
             .and_then(|p| p.settings.as_ref())
             .and_then(|s| s.static_cap),
+        workers: p.and_then(|p| p.settings.as_ref()).and_then(|s| s.workers),
         balance: r.request.balance.clone(),
         best_epoch: stop
             .map(|s| s.best_epoch)
@@ -2326,8 +2327,14 @@ pub(super) async fn json(
             return Json(v).into_response();
         }
         let cap = crate::training::capability_with_runs(&all);
+        // What a run of each recipe trained here before would get now (none without a GPU).
+        let forced = state.config_read().training.workers;
+        let workers_learned = cap.accelerator.as_ref().map_or_else(Vec::new, |a| {
+            crate::training::workers::learned_now(a, forced, &all)
+        });
         Json(serde_json::json!({
             "capability": cap,
+            "workers_learned": workers_learned,
             "busy": busy,
             "runs": all,
             "tasks": tasks,
@@ -2487,13 +2494,16 @@ fn preview_recipes(f: &[(String, String)]) -> anyhow::Result<Vec<TrainRecipe>> {
 /// sources and options, nothing written) as `{scene, title, report, warnings, classes,
 /// train_frames, train_images, valid_frames, heldout_frames, dropped, preflight, error}` (`report`
 /// null when balancing is off; `preflight`: [`preflight::Report`]; `error` set when that run cannot
-/// be planned), `disk` `{lines, refusal}`, what every ticked run needs together, and `memory`
+/// be planned), `disk` `{lines, refusal}`, what every ticked run needs together, `memory`
 /// `{refusal, override_label}` when the memory commit check would refuse a run started now (null
-/// otherwise; [`preflight::memory`]). The folders
-/// are checked like the queue's ([`checked_datasets`]); a bad field or folder is an error naming it.
+/// otherwise; [`preflight::memory`]), and `workers`: per ticked model the data loader workers it
+/// would get now ([`preflight::workers_line`], learned from `past`, the queue's records). The
+/// folders are checked like the queue's ([`checked_datasets`]); a bad field or folder is an error
+/// naming it.
 pub(crate) fn balance_preview_json(
     f: &[(String, String)],
     config: &crate::config::Config,
+    past: &[RunRecord],
 ) -> anyhow::Result<serde_json::Value> {
     let data = data_fields(f, &config.training)?;
     let datasets = checked_datasets(f, &offered_datasets(config), &allow_in(config))?;
@@ -2523,6 +2533,10 @@ pub(crate) fn balance_preview_json(
                 .filter_map(|r| preflight::gpu_warning(r, a))
                 .collect()
         })
+        .unwrap_or_default();
+    let workers = accelerator
+        .as_ref()
+        .map(|a| worker_lines(f, config, a, past))
         .unwrap_or_default();
     let mut needs: Vec<preflight::VolumeNeed> = Vec::new();
     let runs: Vec<serde_json::Value> = data
@@ -2628,7 +2642,51 @@ pub(crate) fn balance_preview_json(
             "lines": volumes.iter().map(|(n, s)| preflight::disk_line(n, *s)).collect::<Vec<_>>(),
             "refusal": preflight::refusal(&volumes),
         },
+        "workers": workers,
     }))
+}
+
+/// One [`preflight::workers_line`] per model the form ticks (none ticked: none), each recipe built
+/// like the queue builds it ([`recipe::build_recipe`]: the typed batch and input size, else the
+/// GPU's suggestion), prefixed with the model when there are several. A model whose recipe does
+/// not build gets no line (the queue names the error).
+fn worker_lines(
+    f: &[(String, String)],
+    config: &crate::config::Config,
+    accel: &crate::training::Accelerator,
+    past: &[RunRecord],
+) -> Vec<String> {
+    let models = all(f, "model");
+    if models.is_empty() {
+        return Vec::new();
+    }
+    let typed = recipe::RecipeInputs {
+        epochs: None,
+        patience: None,
+        imgsz: num(f, "imgsz", "input size").ok().flatten(),
+        batch: num(f, "batch", "batch").ok().flatten(),
+        lr: None,
+        lr_schedule: None,
+        lr_min_factor: None,
+        select_metric: None,
+        augment: Augment::default(),
+        multi_scale: recipe::MultiScale::Auto,
+    };
+    let cap = crate::training::capability_with_runs(past);
+    let several = models.len() > 1;
+    models
+        .iter()
+        .filter_map(|m| {
+            let (family, size) = recipe::parse_label(m)?;
+            let r = recipe::build_recipe(family, size, &typed, &config.training, &cap).ok()?;
+            let line = preflight::workers_line(&r, accel, config.training.workers, past);
+            Some(if several {
+                format!("{}: {line}", r.label())
+            } else {
+                line
+            })
+        })
+        .collect()
 }
 
 /// `POST /v1/training/balance-preview` with the queue form's fields (urlencoded): what
@@ -2650,7 +2708,8 @@ pub(super) async fn balance_preview(
     blocking(move || {
         let f = super::dataset::parse_form(&body);
         let config = state.config_read().clone();
-        match balance_preview_json(&f, &config) {
+        let past = records(&state);
+        match balance_preview_json(&f, &config, &past) {
             Ok(v) => Json(v).into_response(),
             Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
         }
@@ -4760,6 +4819,7 @@ pub(super) mod tests {
                 ignore: None,
                 negative_share: None,
                 static_cap: None,
+                workers: None,
                 balance: Default::default(),
                 best_epoch: None,
                 stopped_epoch: None,
@@ -5103,6 +5163,7 @@ pub(super) mod tests {
             finished: None,
             run_dir: PathBuf::from("/runs").join(id),
             retrying: false,
+            resources: None,
         }
     }
 

@@ -1,11 +1,13 @@
-//! Total and available physical memory, the commit charge, the paging files and this process's
-//! own memory from the OS, without spawning a process.
+//! Total and available physical memory, the commit charge, the paging files, the page-in rate and
+//! this process's own memory from the OS, without spawning a process.
 //!
 //! Windows asks `GlobalMemoryStatusEx` and the registry (the FFI calls are why this lives in
 //! `backend/`, the only place `unsafe` is allowed); other platforms return `None` and
 //! `system_info` reads `/proc/meminfo` or `sysctl` there instead. [`process_memory`] asks
 //! `K32GetProcessMemoryInfo` on Windows and `proc_pid_rusage` on macOS; Linux reads
-//! `/proc/self/status` in [`crate::metrics`], with no FFI. Never panics; a failed call is `None`.
+//! `/proc/self/status` in [`crate::metrics`], with no FFI. [`PageIns`] is the system's page-in
+//! (hard fault) rate: PDH on Windows, `/proc/vmstat` on Linux, none elsewhere. Never panics; a
+//! failed call is `None`.
 //!
 //! Paging files: [`parse_paging_files`] reads the registry's `PagingFiles` lines and
 //! [`growable_bytes`] (pure) how far they can still grow. That is commit a process gets on
@@ -400,6 +402,141 @@ pub fn commit_bytes() -> Option<Commit> {
     None
 }
 
+/// The system's page-in rate, pages read from disk per second because a process touched memory
+/// that was not in RAM (hard faults): what a box short of RAM does instead of failing. Each
+/// [`PageIns::rate`] is the average since the previous call (or since [`PageIns::open`]).
+///
+/// Windows: the PDH counter `\Memory\Pages Input/sec` (English name, so a localized Windows
+/// finds it too), the figure Resource Monitor's "Hard Faults/sec" is close to. Linux:
+/// `pgmajfault` of `/proc/vmstat` ([`parse_vmstat_majfault`]; major faults, which read a page
+/// from disk or swap). Elsewhere none: [`PageIns::open`] is None. Owned by one thread (the PDH
+/// handles are not `Send`).
+pub struct PageIns {
+    #[cfg(windows)]
+    query: windows::Win32::System::Performance::PDH_HQUERY,
+    #[cfg(windows)]
+    counter: windows::Win32::System::Performance::PDH_HCOUNTER,
+    #[cfg(target_os = "linux")]
+    last: (u64, std::time::Instant),
+}
+
+impl std::fmt::Debug for PageIns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageIns").finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
+impl PageIns {
+    /// Opens the counter and takes its first reading; None when PDH refuses (a broken
+    /// performance counter registry).
+    pub fn open() -> Option<Self> {
+        use windows::Win32::System::Performance::{
+            PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+            PdhOpenQueryW,
+        };
+        use windows::core::{PCWSTR, w};
+        let mut query = PDH_HQUERY::default();
+        // SAFETY: a null data source = live data; `query` is a live out-parameter written only
+        // during the call.
+        if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
+            return None;
+        }
+        let mut counter = PDH_HCOUNTER::default();
+        // SAFETY: `query` was opened above; the path is a NUL-terminated wide string literal;
+        // `counter` is a live out-parameter written only during the call.
+        let added = unsafe {
+            PdhAddEnglishCounterW(query, w!(r"\Memory\Pages Input/sec"), 0, &mut counter)
+        };
+        // SAFETY: `query` is open; collecting fills the counter's first raw value (a rate
+        // needs two).
+        if added != 0 || unsafe { PdhCollectQueryData(query) } != 0 {
+            // SAFETY: `query` is open and closed once here; nothing uses it afterwards.
+            unsafe { PdhCloseQuery(query) };
+            return None;
+        }
+        Some(Self { query, counter })
+    }
+
+    /// Pages read in per second since the last call; None when a reading fails.
+    pub fn rate(&mut self) -> Option<f64> {
+        use windows::Win32::System::Performance::{
+            PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
+            PdhCollectQueryData, PdhGetFormattedCounterValue,
+        };
+        // SAFETY: `self.query` stays open until drop.
+        if unsafe { PdhCollectQueryData(self.query) } != 0 {
+            return None;
+        }
+        let mut value = PDH_FMT_COUNTERVALUE::default();
+        // SAFETY: `self.counter` belongs to the open query; `value` is a live out-parameter
+        // written only during the call; the type out-parameter is not asked for.
+        let rc =
+            unsafe { PdhGetFormattedCounterValue(self.counter, PDH_FMT_DOUBLE, None, &mut value) };
+        if rc != 0 || !matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
+            return None;
+        }
+        // SAFETY: PDH_FMT_DOUBLE asked for the `doubleValue` member, which the call filled.
+        let v = unsafe { value.Anonymous.doubleValue };
+        (v.is_finite() && v >= 0.0).then_some(v)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PageIns {
+    fn drop(&mut self) {
+        // SAFETY: the query was opened in `open` and is closed once, here (closing it also
+        // removes its counter).
+        unsafe { windows::Win32::System::Performance::PdhCloseQuery(self.query) };
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PageIns {
+    /// Takes the first reading of `/proc/vmstat`; None when it cannot be read.
+    pub fn open() -> Option<Self> {
+        let n = read_majfault()?;
+        Some(Self {
+            last: (n, std::time::Instant::now()),
+        })
+    }
+
+    /// Major faults per second since the last call; None when a reading fails.
+    pub fn rate(&mut self) -> Option<f64> {
+        let n = read_majfault()?;
+        let now = std::time::Instant::now();
+        let (before, at) = std::mem::replace(&mut self.last, (n, now));
+        let secs = now.duration_since(at).as_secs_f64();
+        (secs > 0.0).then(|| n.saturating_sub(before) as f64 / secs)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_majfault() -> Option<u64> {
+    parse_vmstat_majfault(&std::fs::read_to_string("/proc/vmstat").ok()?)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+impl PageIns {
+    /// None: no page-in counter is read on this platform.
+    pub fn open() -> Option<Self> {
+        None
+    }
+
+    /// None (never opened here).
+    pub fn rate(&mut self) -> Option<f64> {
+        None
+    }
+}
+
+/// `pgmajfault` of `/proc/vmstat` text (pure; `<name> <count>` lines).
+pub fn parse_vmstat_majfault(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once(' ')?;
+        (k == "pgmajfault").then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     /// Grows by a large touched allocation. Other tests of this binary free memory at any moment,
@@ -471,6 +608,28 @@ mod tests {
             assert!(p.available > 0 && p.available <= p.total, "{p:?}");
         } else {
             assert_eq!(got, None);
+        }
+    }
+
+    #[test]
+    fn vmstat_majfault_is_parsed() {
+        let text = "nr_free_pages 1234\npgmajfault 98765\npgmajfault_s 1\n";
+        assert_eq!(super::parse_vmstat_majfault(text), Some(98765));
+        assert_eq!(super::parse_vmstat_majfault("pgfault 5\n"), None);
+        assert_eq!(super::parse_vmstat_majfault("pgmajfault x\n"), None);
+    }
+
+    /// The live counter: open on Windows and Linux, a rate that is a plain non-negative number.
+    #[test]
+    fn page_ins_read_where_supported() {
+        let got = super::PageIns::open();
+        if cfg!(any(windows, target_os = "linux")) {
+            let mut c = got.expect("the page-in counter opens");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let r = c.rate();
+            assert!(r.is_some_and(|r| r.is_finite() && r >= 0.0), "{r:?}");
+        } else {
+            assert!(got.is_none());
         }
     }
 

@@ -11,6 +11,8 @@
 //! - [`gpu_need`], [`gpu_warning`]: the run's estimated GPU memory against what the card has free
 //!   now ([`crate::backend::vram`]), naming the service's models loaded on it; a warning, never a
 //!   refusal, and none when the card cannot be read.
+//! - [`workers_line`]: the data loader workers a run would get now, learned from earlier runs
+//!   ([`super::workers`]).
 //! - [`memory`]: the memory commit check a run meets at its start ([`crate::training::commit`]),
 //!   "would be refused if it started now", with the words of the "Start anyway" checkbox.
 //!
@@ -699,6 +701,19 @@ pub fn gpu_warning(recipe: &TrainRecipe, accel: &Accelerator) -> Option<String> 
         }
         Accelerator::Mps { .. } => None,
     }
+}
+
+/// The data loader workers a run of `recipe` on `accel` would get if it started now, as the
+/// train log's line says it ([`super::workers::choice_now`]): `forced` is `training.workers`,
+/// `past` the queue's run records, e.g. "data loader workers: 2 (learned on this machine: 4 was
+/// no faster than 2; limits allow 4)". The memory read now may differ when the run starts.
+pub fn workers_line(
+    recipe: &TrainRecipe,
+    accel: &Accelerator,
+    forced: Option<u32>,
+    past: &[super::service::RunRecord],
+) -> String {
+    super::workers::choice_now(recipe, accel, forced, past).1
 }
 
 #[cfg(test)]

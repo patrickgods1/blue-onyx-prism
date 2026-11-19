@@ -931,6 +931,10 @@ pub struct RunSettings {
     pub batch: u32,
     /// Data loader workers of this attempt.
     pub workers: Option<u32>,
+    /// Loaders keeping workers alive at once (`training::worker_loaders`: 2 for RF-DETR and
+    /// transformers, 3 for Ultralytics); None = a record from before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaders: Option<u32>,
     /// The trainer's seed of a "Repeat with N seeds" run; None = the options' seed.
     pub seed: Option<u64>,
     /// The scene filter (`all`, `day`, `night`, `day+night`, ... `SceneFilter::as_str`).
@@ -2105,6 +2109,7 @@ mod tests {
             patience_doubled: true,
             batch: 4,
             workers: Some(3),
+            loaders: Some(2),
             seed: Some(2),
             scene: Some("night+ir".into()),
             gpu: Some("NVIDIA GeForce GTX 1070 Ti".into()),
@@ -3482,6 +3487,7 @@ print("RESULT: " + json.dumps(out))
             patience_doubled: false,
             batch: 8,
             workers: None,
+            loaders: None,
             seed: None,
             scene: None,
             gpu: None,

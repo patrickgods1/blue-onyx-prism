@@ -1329,11 +1329,16 @@
         p.append("balance_cap_on", "on");
         if (cap && cap.value !== "") p.append("balance_cap", cap.value);
       }
-      // The disk estimate of the ticked models.
+      // The disk estimate of the ticked models, and the data loader workers each would get
+      // (learned per batch and input size, so those go too).
       form.querySelectorAll('input[name="model"]:checked').forEach(function (b) { p.append("model", b.value); });
       var seeds = form.elements.seeds, dir = form.elements.install_dir;
       if (seeds && seeds.value) p.append("seeds", seeds.value);
       if (dir && dir.value.trim()) p.append("install_dir", dir.value.trim());
+      ["batch", "imgsz"].forEach(function (n) {
+        var e = form.elements[n];
+        if (e && e.value.trim()) p.append(n, e.value.trim());
+      });
       return p.toString();
     };
     var say = function (text, cls) {
@@ -1511,6 +1516,8 @@
       var disk = j.disk || {};
       (disk.lines || []).forEach(function (l) { pre.appendChild(mk("p", "muted small", "Disk: " + l.text + ".")); });
       if (disk.refusal) pre.appendChild(mk("p", "error-text small", disk.refusal));
+      // The train log's own line (learned on this machine, never above what memory allows now).
+      (j.workers || []).forEach(function (l) { pre.appendChild(mk("p", "muted small", l)); });
       // The memory commit check each run meets at its start, with "Start anyway" beside it.
       if (j.memory && j.memory.refusal) pre.appendChild(mk("p", "error-text small", "A run would be refused if it started now: " + j.memory.refusal));
       if (window.PrismMemory) window.PrismMemory.sync(document.getElementById("train-memory-anyway"), j.memory);

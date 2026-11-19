@@ -1405,6 +1405,11 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
     let mut train = super::plan_job(config, train_request, cap, Some(fold_model_name(1)))?;
     train.run_dir = first;
     train.id = format!("{id}-fold1");
+    // The folds are not recorded in `runs.json`, but learn their worker count from the runs that are.
+    train.past_runs = super::service::load_bare_records(&super::runs_file(config))
+        .into_iter()
+        .filter(|r| r.resources.is_some())
+        .collect();
     Ok(RefineJob {
         dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
         classes: config.collect.classes.clone(),

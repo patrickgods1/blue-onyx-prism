@@ -1109,6 +1109,7 @@ mod tests {
             finished: None,
             run_dir: PathBuf::from(format!("/training/{id}")),
             retrying: false,
+            resources: None,
         }
     }
 

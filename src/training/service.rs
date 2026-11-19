@@ -181,6 +181,11 @@ pub struct RunRecord {
     /// Queued or running again to export its checkpoint ([`TrainingService::enqueue_retry`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retrying: bool,
+    /// What its training used: data loader workers, the machine, commit and RAM
+    /// ([`super::workers::RunResources`]; None before the training stage and in records from
+    /// before it was recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<super::workers::RunResources>,
 }
 
 impl RunRecord {
@@ -221,6 +226,7 @@ impl RunRecord {
             finished: None,
             run_dir: job.run_dir.clone(),
             retrying: false,
+            resources: None,
         }
     }
 
@@ -1202,6 +1208,16 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         inner.persist();
         job.reuse_from = group_data_dirs(&inner.runs.lock_recover(), &job);
         inner.start_clock(&id);
+        // What an automatic worker count learns from: the runs that recorded their resources.
+        if job.workers == super::job::Workers::Auto && job.past_runs.is_empty() {
+            job.past_runs = inner
+                .runs
+                .lock_recover()
+                .iter()
+                .filter(|r| r.resources.is_some() && r.id != id)
+                .cloned()
+                .collect();
+        }
         tracing::info!(run = %id, model = %job.name, "training started: {} on {}", job.request.recipe.label(), job.accelerator.describe());
         let started = Instant::now();
         let mut last_stage = None;
@@ -1271,6 +1287,9 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             }
             TrainReport::Registered(m) => {
                 inner.update_persist(&id, |r| r.registered = Some(m.to_string()));
+            }
+            TrainReport::Resources(x) => {
+                inner.update_persist(&id, |r| r.resources = Some(x.clone()));
             }
         };
         let runner = PausableRunner {
