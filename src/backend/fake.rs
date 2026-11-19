@@ -109,7 +109,10 @@ pub(crate) struct FakeScript {
 
 /// A synchronous inference's outputs as a function of its image tensor (CHW f32).
 #[derive(Clone)]
-pub(crate) struct InferFn(pub(crate) Arc<dyn Fn(&[f32]) -> Vec<NamedOutput> + Send + Sync>);
+pub(crate) struct InferFn(pub(crate) Arc<InferFnDyn>);
+
+/// The function behind [`InferFn`].
+pub(crate) type InferFnDyn = dyn Fn(&[f32]) -> Vec<NamedOutput> + Send + Sync;
 
 impl std::fmt::Debug for InferFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

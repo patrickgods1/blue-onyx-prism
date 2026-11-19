@@ -290,7 +290,8 @@ mod imp {
         let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, NICE) };
         if rc == 0 {
             tracing::info!(
-                "benchmark: process priority lowered to nice {NICE} for this CPU-only run                  (benchmark.low_priority)"
+                "benchmark: process priority lowered to nice {NICE} for this CPU-only run \
+                 (benchmark.low_priority)"
             );
         } else {
             tracing::warn!(

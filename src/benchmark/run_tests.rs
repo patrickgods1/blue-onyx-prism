@@ -198,7 +198,6 @@ fn run(
     bench.cancel = Some(&cancel);
     bench.max_stored_preds = 300;
     let r = bench.run(&rt, job, &job.device);
-    drop(bench);
     (r, seen.into_inner().unwrap())
 }
 
