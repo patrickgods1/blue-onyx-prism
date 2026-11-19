@@ -35,7 +35,11 @@
 //! the folds before it keep their suggestions and the report says how far it got.
 //!
 //! The work folder (`<training dir>/refine/<id>`) is held busy for the whole run, so a storage sweep
-//! leaves it alone, and removed at the end however the run ends.
+//! leaves it alone, and removed at the end however the run ends. The fold folders go in it, or, when
+//! the training folder is on another volume than the folder under review, on that folder's volume
+//! ([`place::FoldRoot`]: held busy and named in the work folder, removed when the folds end, left
+//! to the sweep after a crash), so the fold exports hard-link the frames instead of copying them.
+//! A fold model compiles without the OpenVINO model cache: its blob would never be read again.
 //!
 //! **A quick check** ([`super::quick`], [`RefineJob::quick`]) has no fold: select the reviewed
 //! frames its model never trained or validated on (one snapshot), take the training lock, run the
@@ -50,7 +54,7 @@ use super::judge::{self, Context};
 use super::predict::{FoldModel, FoldPredictor, LocalPredictor};
 use super::quick::{self, Quick};
 use super::report::{Mode, RecallTally, RefineReport};
-use super::{RefineRequest, Selected, fold_model_name, recipe_info, select, tighten, write};
+use super::{RefineRequest, Selected, fold_model_name, place, recipe_info, select, tighten, write};
 use crate::backend::memory::Commit;
 use crate::collect::labels::Frame;
 use crate::collect::labels::bulk::Wanted;
@@ -708,6 +712,30 @@ impl RefineJob {
         Ok(w)
     }
 
+    /// Where this check's fold folders go ([`place::FoldRoot::choose`]): the selected frames'
+    /// bytes and the base weights decide whether the dataset's volume has room.
+    fn fold_root(&self, train_job: &TrainJob, s: &Selected) -> place::FoldRoot {
+        let root = self.config.data_root();
+        let dirs = vec![
+            self.config.collect.resolved_dir(&root),
+            self.dataset_dir.clone(),
+        ];
+        let bytes: u64 = s
+            .frames
+            .iter()
+            .map(|f| std::fs::metadata(&f.image).map_or(0, |m| m.len()))
+            .sum();
+        let weights = train_job.request.recipe.base().map_or(0, |b| b.size());
+        place::FoldRoot::choose(
+            &self.work,
+            &self.id,
+            &self.dataset_dir,
+            &dirs,
+            s.frames.first().map(|f| f.image.as_path()),
+            place::need(bytes, weights, s.frames.len()),
+        )
+    }
+
     fn predictor(&self) -> Arc<dyn FoldPredictor> {
         self.predictor
             .clone()
@@ -721,6 +749,7 @@ impl RefineJob {
     fn run_fold(
         &self,
         train_job: &TrainJob,
+        folds: &Path,
         i: usize,
         s: &Selected,
         lock: &TrainLock,
@@ -735,7 +764,7 @@ impl RefineJob {
         let steps = steps_for(k, self.tighten());
         let at = i + 2;
         let name = format!("checking fold {n} of {k}");
-        let fold_dir = self.work.join(format!("fold-{n}"));
+        let fold_dir = folds.join(format!("fold-{n}"));
         // The folder under review may have gone since the last fold (an unplugged drive): that is
         // no fold of gone frames.
         if let Some(why) = self.config.collect.review_folder_problem(&self.dataset_dir) {
@@ -1006,6 +1035,9 @@ impl RefineJob {
         let lock = TrainLock::try_acquire(&self.lock_file())?;
         let k = s.k;
         let look = self.tighten();
+        // The fold folders: on the volume of the folder under review when that helps and fits
+        // ([`place`]); removed (or left to the sweep) when this returns.
+        let folds = self.fold_root(train_job, &s);
         // From here on the count the folds were lowered to ([`Task::steps`] has the asked one).
         let steps = steps_for(k, look);
         let mut acc = Acc::new(self.start_report(train_job, &s));
@@ -1032,6 +1064,7 @@ impl RefineJob {
             }
             let r = self.run_fold(
                 train_job,
+                &folds.dir,
                 i,
                 &s,
                 &lock,

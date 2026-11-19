@@ -421,8 +421,26 @@ Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, els
 `train.coco.json` / `valid.coco.json` (category ids 0..C-1, `file_name` relative to the folder; a
 repeated frame is a separate image entry), `heldout/` (a benchmark `dir:` set: `images/`, YOLO
 `labels/`, `classes.txt`, `manifest.json` with tags, `scored_labels` and every frame's `objects`) and
-`dataset.json` (sources, licences, counts, warnings). `train prepare --out <dir>` writes the same without
-training.
+`dataset.json` (sources, licences, counts, warnings) and `prepared_files.json` (written last: every image
+with its source and the size and last-write time of both, and the plan's fingerprint). `train prepare --out
+<dir>` writes the same without training.
+
+**Seeds of a comparison group share their images.** The seeds of one group (and its other runs with the
+same scene filter and prepared image size) assemble the same plan. A run of a group hard-links the image files of the
+first earlier run of the group whose `prepared_files.json` names the same plan fingerprint (the options,
+the prepared size, the plan, every frame it uses with its labels, and the build) instead of copying or
+downscaling them again (`dataset/reuse.rs`; measured before: 930 MB and about 30 s per seed with the dataset
+on another volume than the training folder). An image is linked only when its source is the same file,
+unchanged since the first run wrote it, the first run's file is unchanged too (checked again after the
+link), and it is no JPEG without its end marker; anything else (a link that fails, a first run removed or
+changed) is written from its source as before, so the dataset is the same bytes either way (tested against
+a plain write). `train.log` says `dataset: N of M image files hard-linked from the identical dataset of
+<folder>`. Nothing writes into a prepared image in place: the writer creates every file under a new name
+(link, copy, or a temporary file renamed over it), a run folder is only removed whole, and Remove on the
+first run only drops its names. The one image a trainer writes back is a JPEG without its end marker
+("corrupt JPEG restored and saved"); Ultralytics does it through a temporary file and a rename, so the
+bytes behind a link stay, and such a file is still always copied, never linked, into a dataset (from the
+review export or from another run), whatever a trainer version does with it.
 
 **Prepared image size.** A run writes its train and validation images with the short side at what its
 trainer reads at most (`TrainRecipe::prepared_short_side`, `dataset.json` `prepared_short_side` and
@@ -913,7 +931,15 @@ Stages (page and `train run` show them with percent and ETA):
 1. **setup**: uv, Python, the lock's packages, on Windows the Visual C++ runtime check (the export's
    code).
 2. **self-check**: `train_model.py --self-check` imports the trainer and reports what PyTorch sees; a
-   CUDA run also launches a test kernel, so a driver or kernel problem fails here in seconds.
+   CUDA run also launches a test kernel, so a driver or kernel problem fails here in seconds. A passed
+   check is recorded in `tools/train-env/.prism-self-check.json` (per trainer and device, written
+   atomically); a later run skips the separate process (about 13 s of imports) when nothing it checked
+   changed: the environment's marker and Python executable (bytes, size, time), the embedded training and
+   export scripts (SHA-256), the GPU as described, the platform and the build, and the check is under 12
+   hours old (`self_check::MAX_AGE`: a driver can change under an unchanged environment). The log then says
+   `self-check skipped (unchanged since <time>: ...)`. Any doubt runs it (no or a damaged marker, another
+   fingerprint, a time in the future), and a training process that fails forgets the pass, so the next run
+   checks again. The dataset check's folds are training runs: its first fold checks, the others skip.
 3. **weights**: the base weights (and the public subset), SHA-256 checked.
 4. **dataset**: assembled as above.
 5. **train**: `train_model.py` trains, then exports and checks the ONNX; a failure at any later point
@@ -1031,7 +1057,14 @@ After a run's benchmark the current default runs on the same sets and devices (`
 Train tab only; `train run` and `train retry-export` print one line saying so), so the Models tab's Use card can say "On N held-out frames: new finds ...; current finds ...".
 Its results stay in `<run>/baseline/`, removed afterwards: they never touch `benchmark.json`, the
 history or the `auto` order. It is skipped, with the reason in the row, when the default is the new
-model, is not loaded, or reports none of its classes.
+model, is not loaded, or reports none of its classes. A run of a comparison group (seeds, scene filters)
+takes over the baseline another run of the group measured when everything it depends on is equal
+(`bench::baseline_key`, stored as `baseline.key`: the default's name, config entry, model and class file
+size and time, the config without its model list, each set's manifest, class file, held-out fingerprint and
+image sizes, the resolved devices, the build) instead of benchmarking again: two seeds of one group had the
+identical baseline AP 0.5793077331746791. The run's record then has `baseline.reused_from: <run id>`
+and `train.log` says `baseline reused from <run>`. A baseline that failed, carried a note or ran on
+another device than its key names is never reused.
 
 `trained_on_share` on a benchmark result (`benchmark/trained_on.rs`) is the share of its frames the
 model trained on (frame identity against the run's `train.txt`; None without a training record). Older
@@ -2058,7 +2091,9 @@ never saw. Before it runs, the job reads the fold model's `train.txt` and `valid
 error if a frame of its own fold is in either, by name and by the source the dataset recorded for each
 image (`image_sources.json` beside the lists: the dataset cuts long names and numbers a name taken twice,
 so a name alone could miss one). The fold model is the training run as it is (`train run`'s
-stages), installed in the job's work folder, registered nowhere and benchmarked never. Its export applies no
+stages), installed in the fold's folder, registered nowhere, benchmarked never, and compiled without the
+OpenVINO model cache (`LoadRequest::no_cache`: each one's blob, about 60 MB, would never be read again;
+a quick check's configured model keeps its cache). Its export applies no
 size floor, whatever `collect.size_floor` says: the fold models try to learn every label, so the recall by
 size measures what a model of the recipe finds (a model trained under the floor would never find what the
 floor left out, and the table would only repeat the floor). The judge still treats a box under the floor
@@ -2345,7 +2380,16 @@ read (a damaged JPEG) gets no result; both are counted in a warning and the fold
 suggestions cannot be written is a warning (the first 20 named, the rest counted in one line); a fold none
 of whose frames could be written counts as failed. Each fold's folder
 (`<training dir>/refine/<id>/fold-N`) is deleted when the fold is written, the work folder at the end however
-the run ends; a crashed run's is removed by the storage sweep (`WORK_DIRS`). Pause suspends the training
+the run ends; a crashed run's is removed by the storage sweep (`WORK_DIRS`). When the training folder is
+on another volume than the folder under review, and that volume allows hard links and has room for the
+folds (twice the selected images, five times the base weights, the labels, plus the free-space margin
+of an import), the fold folders go to `<parent of the folder under review>/.blue-onyx-prism-work/refine/<id>/fold-N`
+instead (`refine/place.rs`; never inside the dataset or review folder), so each fold's export hard-links
+the frames rather than copying them across volumes. That folder is held busy like a work folder, named in
+the work folder (`elsewhere.txt`) before it is made, and removed at the end; after a crash the sweep
+removes it by its own marker (`NEAR_WORK_DIRS` under `.blue-onyx-prism-work` beside the configured dataset
+and review folders) or through the work folder that names it, and the Storage card lists it with the other
+work folders. Pause suspends the training
 processes; the export, prediction and writes of the running fold finish first.
 
 - **Cancel** keeps the suggestions of the finished folds (a fold is written whole or not at all) and ends

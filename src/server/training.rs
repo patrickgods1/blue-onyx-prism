@@ -218,13 +218,12 @@ impl Hooks for ServerHooks {
         if let Some(why) = skip {
             return Ok(Some(Baseline {
                 model: name,
-                summary: None,
                 note: Some(why),
+                ..Baseline::default()
             }));
         }
         // Its own results file: see `bench`'s module docs.
         let dir = run_dir.join("baseline");
-        std::fs::create_dir_all(&dir)?;
         let results_path = dir.join(crate::benchmark::report::RESULTS_FILE);
         let shared = self.shared.clone();
         let ctx = move || {
@@ -237,6 +236,19 @@ impl Hooks for ServerHooks {
                 resources: st.resources.clone(),
             }
         };
+        // What it would measure (None: cannot tell, measured as before); a baseline of the same
+        // inputs measured for another run of this comparison group is taken over.
+        let resolved = bench::resolve_devices(&mut ctx(), &name, devices).ok();
+        let reuse_key = resolved
+            .clone()
+            .and_then(|d| bench::baseline_inputs(&config, &name, &sets, d))
+            .map(|i| bench::baseline_key(&i));
+        if let Some(k) = &reuse_key
+            && let Some(b) = bench::reusable_baseline(&records(&state), run_dir, k)
+        {
+            return Ok(Some(b));
+        }
+        std::fs::create_dir_all(&dir)?;
         let result = bench::run(&state.benchmark, &ctx, &name, sets, devices, cancel);
         let _ = std::fs::remove_dir_all(&dir);
         match result {
@@ -246,13 +258,27 @@ impl Hooks for ServerHooks {
                     "{name} did not run on the benchmark devices; try it on the Benchmark page"
                 )),
                 model: name,
-                summary: None,
+                ..Baseline::default()
             })),
-            Ok(summary) => Ok(Some(Baseline {
-                model: name,
-                summary,
-                note: None,
-            })),
+            Ok(summary) => {
+                // The key only stands for a result measured on the devices it names.
+                let ran_on_key = summary
+                    .as_ref()
+                    .and_then(|s| s.device.as_ref())
+                    .zip(resolved.as_ref())
+                    .is_some_and(|(d, r)| {
+                        let canon = |x: &str| crate::backend::spec::parse(x).map(|s| s.to_string());
+                        r.iter().any(|x| {
+                            x == d || matches!((canon(x), canon(d)), (Ok(a), Ok(b)) if a == b)
+                        })
+                    });
+                Ok(Some(Baseline {
+                    model: name,
+                    summary,
+                    key: reuse_key.filter(|_| ran_on_key),
+                    ..Baseline::default()
+                }))
+            }
             Err(e)
                 if e.downcast_ref::<crate::resources::export::Cancelled>()
                     .is_some() =>
@@ -261,8 +287,8 @@ impl Hooks for ServerHooks {
             }
             Err(e) => Ok(Some(Baseline {
                 model: name,
-                summary: None,
                 note: Some(format!("{e:#}")),
+                ..Baseline::default()
             })),
         }
     }
@@ -4669,6 +4695,7 @@ pub(super) mod tests {
             model: "ipcam-general".into(),
             summary: None,
             note: Some("ipcam-general is not loaded".into()),
+            ..Baseline::default()
         });
         // The model is not in the config yet: the preview does not add it.
         let p = super::super::training_switch::preview_of(&state, &rec).unwrap();

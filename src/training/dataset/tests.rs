@@ -3998,3 +3998,200 @@ fn prepare_image_keeps_the_format_and_passes_others_through() {
         BTreeSet::from(["a.png", "b.jpg", "c.webp", "d.jpg", "e.jpg"].map(String::from))
     );
 }
+
+/// Every file under `dir` (relative path -> bytes), but `dataset.json` (its creation time) and
+/// the reuse record.
+fn data_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let rel = p
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "dataset.json" || rel == reuse::PREPARED_FILES_FILE {
+                continue;
+            }
+            // The YAML names its own folder.
+            let bytes = if rel == "data.yaml" {
+                std::fs::read_to_string(&p)
+                    .unwrap()
+                    .lines()
+                    .filter(|l| !l.starts_with("path:"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes()
+            } else {
+                std::fs::read(&p).unwrap()
+            };
+            out.insert(rel, bytes);
+        }
+    }
+    out
+}
+
+/// Overwrite the first byte of `path` in place (the same file, every name of it).
+fn poke(path: &Path) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.write_all(&[0x00]).unwrap();
+    f.sync_all().unwrap();
+    // A later time than the write a moment ago, on file systems with coarse times too.
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn a_seed_with_the_same_plan_links_the_first_seeds_images_and_writes_the_same_dataset() {
+    let t = tmp("reuse");
+    camera_export(&t.0);
+    let s = vec![read_export(&t.0).unwrap()];
+    // Downscaled train / valid images: the first seed's are files of its own, not the sources.
+    let opts = Options {
+        prepared_short_side: Some(32),
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    let out = tmp("reuse-out");
+    let seed = |n: &str| out.0.join(n).join("data");
+    let (a, b, plain) = (seed("s0"), seed("s1"), seed("plain"));
+    let (_, ra) = write_reusing(&s, &p, &opts, &a, &[]).unwrap();
+    assert_eq!(
+        ra,
+        Reused {
+            from: None,
+            linked: 0,
+            images: ra.images
+        }
+    );
+    assert!(a.join(reuse::PREPARED_FILES_FILE).is_file());
+    // The next seed: every image linked from the first (a missing donor is passed over).
+    let (pb, rb) = write_reusing(&s, &p, &opts, &b, &[seed("gone"), a.clone()]).unwrap();
+    assert_eq!(rb.from.as_deref(), Some(a.as_path()));
+    assert!(rb.images > 0);
+    assert_eq!(rb.linked, rb.images, "{rb:?}");
+    assert!(rb.describe().unwrap().contains("hard-linked"));
+    // The same dataset as a plain write, byte for byte, and the same report.
+    let pp = write(&s, &p, &opts, &plain).unwrap();
+    assert_eq!(data_files(&b), data_files(&plain));
+    assert_eq!(
+        (
+            pb.train_images,
+            pb.valid_images,
+            pb.heldout_images,
+            &pb.classes
+        ),
+        (
+            pp.train_images,
+            pp.valid_images,
+            pp.heldout_images,
+            &pp.classes
+        )
+    );
+    let coco = |d: &Path| std::fs::read(d.join("train.coco.json")).unwrap();
+    assert_eq!(coco(&b), coco(&plain), "downscaled sizes come along");
+    // Linked indeed: one file under two names.
+    let img = std::fs::read_to_string(b.join("train.txt")).unwrap();
+    let first = img
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("./")
+        .to_string();
+    poke(&a.join(&first));
+    assert_eq!(
+        std::fs::read(a.join(&first)).unwrap(),
+        std::fs::read(b.join(&first)).unwrap()
+    );
+    // A donor file changed since it was written is never linked: written again from its source.
+    let c = seed("s2");
+    let (_, rc) = write_reusing(&s, &p, &opts, &c, std::slice::from_ref(&a)).unwrap();
+    assert_eq!(rc.linked, rc.images - 1, "{rc:?}");
+    assert_eq!(data_files(&c).get(&first), data_files(&plain).get(&first));
+    // A donor's folder removed (Remove on its run): the linked seed keeps its bytes.
+    std::fs::remove_dir_all(out.0.join("s0")).unwrap();
+    let mut want = data_files(&plain);
+    want.insert(first.clone(), std::fs::read(b.join(&first)).unwrap());
+    assert_eq!(data_files(&b), want);
+    // Another plan (another assembly seed, scene filter or size): nothing linked.
+    for other in [
+        Options {
+            seed: 7,
+            ..opts.clone()
+        },
+        Options {
+            scene: SceneFilter::NIGHT_IR,
+            ..opts.clone()
+        },
+        Options {
+            prepared_short_side: Some(40),
+            ..opts.clone()
+        },
+    ] {
+        let po = plan(&s, &other).unwrap();
+        let d = out
+            .0
+            .join(format!("other-{}", uuid::Uuid::new_v4()))
+            .join("data");
+        let (_, r) = write_reusing(&s, &po, &other, &d, &[c.clone(), b.clone()]).unwrap();
+        assert_eq!((r.from, r.linked), (None, 0));
+    }
+    // A source changed since: that image is written from it again.
+    let src = s[0].frames[p.train[0].0.1].image.clone();
+    jpg(&src, 64, 48);
+    image::RgbImage::from_pixel(64, 48, image::Rgb([10, 200, 10]))
+        .save(&src)
+        .unwrap();
+    let f = std::fs::File::options().write(true).open(&src).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+        .unwrap();
+    drop(f);
+    let e = seed("s3");
+    let (_, re) = write_reusing(&s, &p, &opts, &e, std::slice::from_ref(&c)).unwrap();
+    assert_eq!(re.linked, re.images - 1, "{re:?}");
+    let fresh = seed("plain2");
+    write(&s, &p, &opts, &fresh).unwrap();
+    assert_eq!(data_files(&e), data_files(&fresh));
+}
+
+#[test]
+fn a_jpeg_without_its_end_marker_is_copied_never_linked() {
+    let t = tmp("eoi");
+    let whole = t.0.join("whole.jpg");
+    jpg(&whole, 16, 16);
+    assert!(!jpeg_without_end(&whole));
+    let cut = t.0.join("cut.jpg");
+    let bytes = std::fs::read(&whole).unwrap();
+    std::fs::write(&cut, &bytes[..bytes.len() - 2]).unwrap();
+    assert!(jpeg_without_end(&cut));
+    let png = t.0.join("a.png");
+    image::RgbImage::from_pixel(4, 4, image::Rgb([1, 2, 3]))
+        .save(&png)
+        .unwrap();
+    assert!(!jpeg_without_end(&png), "not a JPEG");
+    assert!(!jpeg_without_end(&t.0.join("gone.jpg")));
+    std::fs::write(t.0.join("one.jpg"), [0xFF]).unwrap();
+    assert!(!jpeg_without_end(&t.0.join("one.jpg")));
+    // Linked: a write into the source shows; copied: it does not.
+    link_or_copy(&whole, &t.0.join("whole-link.jpg")).unwrap();
+    link_or_copy(&cut, &t.0.join("cut-copy.jpg")).unwrap();
+    poke(&whole);
+    poke(&cut);
+    assert_eq!(
+        std::fs::read(t.0.join("whole-link.jpg")).unwrap(),
+        std::fs::read(&whole).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(t.0.join("cut-copy.jpg")).unwrap(),
+        bytes[..bytes.len() - 2],
+        "the copy kept its bytes"
+    );
+}

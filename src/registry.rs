@@ -57,6 +57,7 @@ pub fn load_request(config: &Config, m: &ModelConfig, path: PathBuf) -> LoadRequ
         path,
         requested: config.device_for(m),
         gpu_precision: m.gpu_precision.clone(),
+        no_cache: false,
     }
 }
 

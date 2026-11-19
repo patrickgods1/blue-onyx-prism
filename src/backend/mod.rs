@@ -12,7 +12,7 @@
 //! let mut rt = Runtimes::new_with(&CoreOptions { cache_dir, intra_threads, openvino_dir },
 //!                                 &OrtOptions { onnxruntime_dir });
 //! rt.require_any()?;                                   // fails when no runtime initialized
-//! let req = LoadRequest { path, requested: "GPU".into(), gpu_precision: None };
+//! let req = LoadRequest { path, requested: "GPU".into(), gpu_precision: None, no_cache: false };
 //! // Whole plan (GPU, then CPU) in one call, without warm-up:
 //! let mut backend: Backend = rt.load(&spec::parse("auto")?, &req)?;
 //! // Or per candidate, compiling under the `Runtimes` lock and creating the request elsewhere:
@@ -105,6 +105,10 @@ pub struct LoadRequest {
     pub requested: String,
     /// "f16" (default on GPU) or "f32".
     pub gpu_precision: Option<String>,
+    /// Compile without OpenVINO's model cache (CACHE_DIR off for this compile only): a throwaway
+    /// model whose blob would never be read again, the dataset check's fold models
+    /// (`training::refine::predict`). False for everything else. ONNX Runtime ignores it.
+    pub no_cache: bool,
 }
 
 /// Runtime-neutral facts about a loaded model.

@@ -67,6 +67,9 @@ pub struct Bench<'a> {
     /// Stored predictions per image (most confident first; `MAX_STORED_PREDS`). The pseudo
     /// ground truth run keeps all of them (BM-10).
     pub max_stored_preds: usize,
+    /// Compile the model without the OpenVINO model cache ([`LoadRequest::no_cache`]: a
+    /// throwaway fold model of the dataset check); false for everything else.
+    pub no_cache: bool,
 }
 
 impl std::fmt::Debug for Bench<'_> {
@@ -85,6 +88,7 @@ impl std::fmt::Debug for Bench<'_> {
             .field("threshold_objective", &self.threshold_objective)
             .field("accuracy_metric", &self.accuracy_metric)
             .field("max_stored_preds", &self.max_stored_preds)
+            .field("no_cache", &self.no_cache)
             .finish()
     }
 }
@@ -142,6 +146,7 @@ impl<'a> Bench<'a> {
             threshold_objective: threshold::Objective::default(),
             accuracy_metric: grade::AccuracyMetric::default(),
             max_stored_preds: MAX_STORED_PREDS,
+            no_cache: false,
         }
     }
 
@@ -225,8 +230,9 @@ impl<'a> Bench<'a> {
             path: job.path.clone(),
             requested: requested.to_string(),
             gpu_precision: job.gpu_precision.clone(),
+            no_cache: self.no_cache,
         };
-        let before = self.cache_dir.map(cache_files);
+        let before = self.cache_dir.filter(|_| !self.no_cache).map(cache_files);
         let t = Instant::now();
         let label = format!("model {}", job.name);
         // Compile under the runtimes lock (workers compile through the same lock), create the
@@ -276,6 +282,7 @@ impl<'a> Bench<'a> {
             path: vjob.path.clone(),
             requested: device.to_string(),
             gpu_precision: vjob.gpu_precision.clone(),
+            no_cache: false,
         };
         let label = format!("verifier {}", vjob.name);
         let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {

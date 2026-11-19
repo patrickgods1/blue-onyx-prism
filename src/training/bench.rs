@@ -16,9 +16,14 @@
 //! The current default model then runs on the same sets and devices ([`baseline_skip`] says when
 //! it cannot), so the Use card compares like with like ([`compare_text`]). Its results stay in
 //! the run's folder: a set of a few hundred frames must not replace the default model's saved
-//! benchmark, its threshold advice or its `auto` device order.
+//! benchmark, its threshold advice or its `auto` device order. A run of a comparison group whose
+//! baseline inputs equal those of a baseline already measured for another run of the group (the
+//! same default model file, held-out frames, devices, settings and build: [`baseline_key`]) takes
+//! that result over instead of benchmarking again ([`reusable_baseline`]; the run's log says
+//! "baseline reused from <run>"), as the seeds of one group do.
 
 use super::dataset;
+use super::file_id::FileId;
 use super::job::{Baseline, BenchSummary, SceneAp, SubsetScore};
 use crate::backend::DeviceSpec;
 use crate::benchmark::Breakdown;
@@ -28,7 +33,7 @@ use crate::config::DatasetRef;
 use crate::resources::export::Cancelled;
 use crate::sync::LockExt;
 use anyhow::{Result, anyhow, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -189,6 +194,151 @@ pub fn baseline_skip(
         ));
     }
     None
+}
+
+/// Format of [`baseline_key`]: a change of what it covers bumps it, so older keys never match.
+pub const BASELINE_KEY_FORMAT: u32 = 1;
+
+/// One dataset of a baseline as [`baseline_key`] sees it: what its result depends on, never its
+/// display name (`heldout-<new model>` differs from run to run).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetIdentity {
+    /// A built-in set: pinned with its hashes in this build's catalog.
+    Builtin(String),
+    /// A folder (the held-out frames): SHA-256 of its manifest and class file, its held-out
+    /// fingerprint, the size of every image and the identity of a ground-truth file.
+    Dir {
+        manifest_sha256: Option<String>,
+        classes_sha256: Option<String>,
+        heldout_fingerprint: Option<String>,
+        images: Vec<(String, u64)>,
+        gt: Option<FileId>,
+    },
+}
+
+/// Everything a baseline measurement depends on: equal inputs measure the same thing, so a result
+/// of equal inputs is reused instead of benchmarking again ([`reusable_baseline`]).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct BaselineInputs {
+    /// The default model's name (normalized) and its config entry as configured.
+    pub model: String,
+    pub entry: serde_json::Value,
+    /// The model file and its class file, with their identity.
+    pub files: Vec<(PathBuf, FileId)>,
+    /// The config without its model list (registering a trained model only adds to that list;
+    /// any other change, a threshold or a benchmark setting, makes another key).
+    pub config: serde_json::Value,
+    pub sets: Vec<SetIdentity>,
+    /// The devices it runs on, resolved ([`resolve_devices`]).
+    pub devices: Vec<String>,
+    /// This build ([`crate::long_version`]): another build may score differently.
+    pub build: String,
+}
+
+/// Hex SHA-256 of `inputs` (with [`BASELINE_KEY_FORMAT`]). Pure.
+pub fn baseline_key(inputs: &BaselineInputs) -> String {
+    let bytes = serde_json::to_vec(&(BASELINE_KEY_FORMAT, inputs)).unwrap_or_default();
+    crate::resources::manager::sha256_hex(&bytes)
+}
+
+/// The identity of the dataset `set` (see [`SetIdentity`]); None when a folder's files cannot be
+/// read (then nothing is reused).
+pub fn set_identity(set: &DatasetRef) -> Option<SetIdentity> {
+    let sha = |p: &Path| {
+        std::fs::read(p)
+            .ok()
+            .map(|b| crate::resources::manager::sha256_hex(&b))
+    };
+    match set {
+        DatasetRef::Id(id) => Some(SetIdentity::Builtin(id.clone())),
+        DatasetRef::Dir { dir, gt, .. } => {
+            let mut images = Vec::new();
+            for e in std::fs::read_dir(dir.join("images")).ok()? {
+                let p = e.ok()?.path();
+                // Through the file, never the directory entry (stale for a hard link on NTFS).
+                let len = std::fs::metadata(&p).ok()?.len();
+                images.push((p.file_name()?.to_string_lossy().into_owned(), len));
+            }
+            images.sort();
+            let gt = match gt {
+                Some(g) => Some(FileId::of(g)?),
+                None => None,
+            };
+            Some(SetIdentity::Dir {
+                manifest_sha256: sha(&dir.join("manifest.json")),
+                classes_sha256: sha(&dir.join("classes.txt")),
+                heldout_fingerprint: dataset::read_heldout_fingerprint(dir),
+                images,
+                gt,
+            })
+        }
+    }
+}
+
+/// The inputs of a baseline of the default model `default` on `sets` and the resolved `devices`
+/// under `config`; None when anything cannot be read (the model is not configured, its file has
+/// no identity, a set's files do not read): then it is measured as before.
+pub fn baseline_inputs(
+    config: &crate::config::Config,
+    default: &str,
+    sets: &[DatasetRef],
+    devices: Vec<String>,
+) -> Option<BaselineInputs> {
+    let m = crate::benchmark::find_model(config, default)?;
+    let mut files = vec![{
+        let p = config.data_path(&m.path);
+        let id = FileId::of(&p)?;
+        (p, id)
+    }];
+    if let Some(c) = &m.classes {
+        let p = config.data_path(c);
+        let id = FileId::of(&p)?;
+        files.push((p, id));
+    }
+    let mut cfg = serde_json::to_value(config).ok()?;
+    cfg.as_object_mut()?.remove("models");
+    Some(BaselineInputs {
+        model: crate::registry::normalize_name(default),
+        entry: serde_json::to_value(m).ok()?,
+        files,
+        config: cfg,
+        sets: sets.iter().map(set_identity).collect::<Option<_>>()?,
+        devices,
+        build: crate::long_version(),
+    })
+}
+
+/// The devices a benchmark of `name` runs on: `chosen`, else the one device it would load on (as
+/// [`run`] resolves them).
+pub fn resolve_devices(c: &mut RunContext, name: &str, chosen: &[String]) -> Result<Vec<String>> {
+    devices_for(c, name, chosen)
+}
+
+/// A baseline measured for another run of the comparison group of the run in `run_dir`, with the
+/// same `key` and a result (never a note, a failure or a result without a device), marked
+/// [`Baseline::reused_from`] that run (or the run it was reused from in turn). The first such run
+/// in queue order. None: measure it. Pure over `records`.
+pub fn reusable_baseline(
+    records: &[super::service::RunRecord],
+    run_dir: &Path,
+    key: &str,
+) -> Option<Baseline> {
+    let me = records.iter().find(|r| r.run_dir == run_dir)?;
+    let group = me.request.compare_group.as_deref()?;
+    records
+        .iter()
+        .filter(|r| r.id != me.id && r.request.compare_group.as_deref() == Some(group))
+        .find_map(|r| {
+            let b = r.baseline.as_ref()?;
+            let usable = b.key.as_deref() == Some(key)
+                && b.note.is_none()
+                && b.summary.as_ref().is_some_and(|s| s.device.is_some());
+            usable.then(|| Baseline {
+                reused_from: Some(b.reused_from.clone().unwrap_or_else(|| r.id.clone())),
+                ..b.clone()
+            })
+        })
 }
 
 /// The chip of a benchmark that includes the model's own training frames; None without any.
@@ -454,6 +604,7 @@ mod tests {
             model: "IPcam".into(),
             summary: Some(summary(0.72, 9)),
             note: None,
+            ..Baseline::default()
         };
         let t = compare_text(Some(&new), Some(&base));
         assert_eq!(
@@ -471,6 +622,7 @@ mod tests {
             model: "IPcam".into(),
             summary: None,
             note: Some("IPcam is not loaded".into()),
+            ..Baseline::default()
         };
         assert_eq!(
             compare_text(Some(&new), Some(&skipped)),
@@ -782,5 +934,246 @@ mod tests {
         assert_eq!(b.in_scope, None);
         // Beside a built-in set the bare tags are not the held-out set's.
         assert!(summarize(&result(tags, true)).by_scene.is_empty());
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bop-bench-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A held-out set in `dir`: two images, a manifest, a class file.
+    fn heldout(dir: &Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::write(dir.join("images/s0-a.jpg"), b"aaaa").unwrap();
+        std::fs::write(dir.join("images/s0-b.jpg"), b"bbbbbb").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            br#"{"id":"heldout","heldout_fingerprint":"f1","images":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\n").unwrap();
+    }
+
+    fn config_with(root: &Path) -> crate::config::Config {
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        std::fs::write(root.join("models/base.onnx"), b"onnx-bytes").unwrap();
+        crate::config::Config {
+            models: vec![crate::config::ModelConfig {
+                name: Some("base".into()),
+                path: root.join("models/base.onnx"),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn key_of(c: &crate::config::Config, sets: &[DatasetRef], devices: &[&str]) -> String {
+        let d = devices.iter().map(|d| d.to_string()).collect();
+        baseline_key(&baseline_inputs(c, "base", sets, d).unwrap())
+    }
+
+    #[test]
+    fn the_baseline_key_follows_everything_the_measurement_depends_on() {
+        let root = tmp("key");
+        let (h1, h2) = (root.join("run1/heldout"), root.join("run2/heldout"));
+        heldout(&h1);
+        heldout(&h2);
+        let c = config_with(&root);
+        // Two runs' copies of the same frames, under their own names: one key.
+        let set = |dir: &Path, name: &str| DatasetRef::Dir {
+            dir: dir.to_path_buf(),
+            gt: None,
+            name: Some(format!("heldout-{name}")),
+        };
+        let k = key_of(&c, &[set(&h1, "seed0")], &["openvino:gpu.0"]);
+        assert_eq!(k, key_of(&c, &[set(&h2, "seed1")], &["openvino:gpu.0"]));
+        // Registering another model (the trained one) does not change it.
+        let mut more = c.clone();
+        more.models.push(crate::config::ModelConfig {
+            name: Some("night-yolo26n-s1".into()),
+            path: root.join("models/other.onnx"),
+            ..Default::default()
+        });
+        assert_eq!(k, key_of(&more, &[set(&h1, "a")], &["openvino:gpu.0"]));
+        // Another device, set, extra set or held-out content: another key.
+        assert_ne!(k, key_of(&c, &[set(&h1, "a")], &["openvino:cpu"]));
+        assert_ne!(
+            k,
+            key_of(
+                &c,
+                &[set(&h1, "a"), DatasetRef::Id("nir-night".into())],
+                &["openvino:gpu.0"]
+            )
+        );
+        std::fs::write(h2.join("images/s0-b.jpg"), b"bbbbbbb").unwrap();
+        assert_ne!(
+            k,
+            key_of(&c, &[set(&h2, "a")], &["openvino:gpu.0"]),
+            "an image"
+        );
+        heldout(&h2);
+        std::fs::write(
+            h2.join("manifest.json"),
+            br#"{"id":"heldout","images":[1]}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            k,
+            key_of(&c, &[set(&h2, "a")], &["openvino:gpu.0"]),
+            "the manifest"
+        );
+        heldout(&h2);
+        std::fs::write(h2.join("classes.txt"), "person\ncar\n").unwrap();
+        assert_ne!(
+            k,
+            key_of(&c, &[set(&h2, "a")], &["openvino:gpu.0"]),
+            "the classes"
+        );
+        // The default's settings, a global setting, or its file: another key.
+        let mut t = c.clone();
+        t.models[0].confidence_threshold = Some(0.3);
+        assert_ne!(
+            k,
+            key_of(&t, &[set(&h1, "a")], &["openvino:gpu.0"]),
+            "its threshold"
+        );
+        let mut g = c.clone();
+        g.nms_iou += 0.05;
+        assert_ne!(
+            k,
+            key_of(&g, &[set(&h1, "a")], &["openvino:gpu.0"]),
+            "a global"
+        );
+        std::fs::write(root.join("models/base.onnx"), b"onnx-bytes-retrained").unwrap();
+        assert_ne!(
+            k,
+            key_of(&c, &[set(&h1, "a")], &["openvino:gpu.0"]),
+            "a new file"
+        );
+        // Nothing to tell: no key.
+        let sets = [set(&root.join("gone"), "a")];
+        assert!(baseline_inputs(&c, "base", &sets, vec![]).is_none());
+        assert!(baseline_inputs(&c, "missing", &[set(&h1, "a")], vec![]).is_none());
+        std::fs::remove_file(root.join("models/base.onnx")).unwrap();
+        assert!(baseline_inputs(&c, "base", &[set(&h1, "a")], vec![]).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn rec(
+        id: &str,
+        group: Option<&str>,
+        baseline: Option<Baseline>,
+    ) -> super::super::service::RunRecord {
+        use super::super::job::TrainRequest;
+        use super::super::recipe::TrainRecipe;
+        use crate::resources::catalog::TrainFamily;
+        super::super::service::RunRecord {
+            id: id.into(),
+            name: id.into(),
+            created: String::new(),
+            request: TrainRequest {
+                recipe: TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap(),
+                datasets: Vec::new(),
+                include_public: false,
+                scene: Default::default(),
+                classes: None,
+                rename: Default::default(),
+                benchmark_sets: Vec::new(),
+                benchmark_devices: Vec::new(),
+                allow_large: false,
+                install_dir: None,
+                gpu: None,
+                excluded: Default::default(),
+                balance: Default::default(),
+                compare_group: group.map(str::to_string),
+                train_seed: None,
+            },
+            device: String::new(),
+            state: super::super::service::RunState::Done,
+            stage: None,
+            step: 0,
+            steps: 8,
+            percent: 0,
+            detail: String::new(),
+            progress: None,
+            log: Vec::new(),
+            dataset: None,
+            output: None,
+            registered: None,
+            benchmark: None,
+            benchmark_error: None,
+            baseline,
+            error: None,
+            finished: None,
+            run_dir: PathBuf::from(format!("/training/{id}")),
+            retrying: false,
+        }
+    }
+
+    fn measured(key: &str) -> Baseline {
+        Baseline {
+            model: "base".into(),
+            summary: Some(BenchSummary {
+                ap50: Some(0.5793),
+                device: Some("openvino:gpu.0".into()),
+                ..BenchSummary::default()
+            }),
+            key: Some(key.into()),
+            ..Baseline::default()
+        }
+    }
+
+    #[test]
+    fn a_baseline_is_reused_only_within_the_group_and_with_an_equal_key() {
+        let me = Path::new("/training/s2");
+        let runs = vec![
+            rec("other", Some("cmp-2"), Some(measured("k"))),
+            rec("s0", Some("cmp-1"), Some(measured("k"))),
+            rec("s1", Some("cmp-1"), None),
+            rec("s2", Some("cmp-1"), None),
+        ];
+        let b = reusable_baseline(&runs, me, "k").unwrap();
+        assert_eq!(
+            b.reused_from.as_deref(),
+            Some("s0"),
+            "the group's, not the other group's"
+        );
+        assert_eq!(b.summary.as_ref().unwrap().ap50, Some(0.5793));
+        assert_eq!(b.key.as_deref(), Some("k"));
+        // Another key, no group, a note, no result or no device: measured again.
+        assert!(reusable_baseline(&runs, me, "other").is_none());
+        let mut lone = runs.clone();
+        lone[3].request.compare_group = None;
+        assert!(reusable_baseline(&lone, me, "k").is_none());
+        for spoil in [
+            |b: &mut Baseline| b.note = Some("not loaded".into()),
+            |b: &mut Baseline| b.summary = None,
+            |b: &mut Baseline| b.summary.as_mut().unwrap().device = None,
+            |b: &mut Baseline| b.key = None,
+        ] {
+            let mut r = runs.clone();
+            spoil(r[1].baseline.as_mut().unwrap());
+            assert!(reusable_baseline(&r, me, "k").is_none());
+        }
+        // A reused one passes on where it came from.
+        let mut chain = runs.clone();
+        chain[1].baseline = None;
+        chain[2].baseline = Some(Baseline {
+            reused_from: Some("s-first".into()),
+            ..measured("k")
+        });
+        assert_eq!(
+            reusable_baseline(&chain, me, "k")
+                .unwrap()
+                .reused_from
+                .as_deref(),
+            Some("s-first")
+        );
+        // Never its own.
+        let mut own = runs;
+        own[3].baseline = Some(measured("k"));
+        own[1].baseline = None;
+        assert!(reusable_baseline(&own, me, "k").is_none());
     }
 }

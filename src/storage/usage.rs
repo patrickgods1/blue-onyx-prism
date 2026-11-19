@@ -211,7 +211,7 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
         );
     }
     let training = s.training_dir();
-    let crashed = sweep::crashed_work(&training);
+    let crashed = sweep::crashed_all(s);
     if !crashed.is_empty() {
         let bytes: u64 = crashed.iter().map(|w| size_of(&w.dir)).sum();
         let autolabel = crashed
@@ -288,7 +288,7 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
         &models,
         crate::training::retry::disk_use(&models).saturating_sub(staging_bytes),
     ));
-    let kept = sweep::kept_work(&training);
+    let kept = sweep::kept_all(s);
     if !kept.is_empty() {
         let bytes: u64 = kept.iter().map(|w| size_of(&w.dir)).sum();
         data.push(

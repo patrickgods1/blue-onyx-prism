@@ -381,6 +381,7 @@ fn job(
         workers: Workers::Fixed(0),
         keep_work: false,
         export_only: None,
+        reuse_from: Vec::new(),
     }
 }
 
@@ -1044,6 +1045,89 @@ fn a_chosen_gpu_trains_on_its_device_in_its_lanes_environment() {
         j.platform,
         TrainLane::Cu126
     ));
+}
+
+/// The self-checks among the commands `fake` ran.
+fn self_checks(fake: &TrainFake) -> usize {
+    fake.train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.display().contains("--self-check"))
+        .count()
+}
+
+#[test]
+fn an_unchanged_self_check_runs_once_and_any_change_or_failure_runs_it_again() {
+    let t = tmp("self-check-once");
+    let mut n = 0;
+    let mut next = |t: &Tmp| {
+        n += 1;
+        let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+        j.name = format!("night-yolo26n-test{n}");
+        j.run_dir = t.0.join("training").join(format!("run{n}"));
+        j
+    };
+    let hooks = RecHooks::default();
+    let go = |j: &TrainJob, fake: &TrainFake| run(j, fake, &hooks, &AtomicBool::new(false)).0;
+    // The first run checks and records the pass.
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1);
+    let marker =
+        crate::training::self_check::marker_path(&TrainPaths::new(&t.0, t.0.join("models")));
+    assert!(marker.is_file(), "a passed check is recorded");
+    // The next run on the same environment, scripts and GPU skips it and says so.
+    let fake = TrainFake::new();
+    let j = next(&t);
+    let out = go(&j, &fake).unwrap();
+    assert_eq!(self_checks(&fake), 0, "skipped");
+    assert_eq!(fake.train_cmds.lock().unwrap().len(), 1, "training only");
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains("self-check skipped (unchanged since "),
+        "{log}"
+    );
+    assert_eq!(
+        out.output.classes,
+        ["cat", "raccoon"],
+        "the run itself is unchanged"
+    );
+    // A rebuilt environment (its marker rewritten): checked again.
+    let env_marker =
+        t.0.join("tools/train-env")
+            .join(crate::resources::export::ENV_MARKER);
+    let mut bytes = std::fs::read(&env_marker).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&env_marker, bytes).unwrap();
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "env changed");
+    // Another GPU: its own check.
+    let fake = TrainFake::new();
+    let mut j = next(&t);
+    j.accelerator = Accelerator::Mps {
+        name: "Apple M2 GPU".into(),
+        memory_mb: 9000,
+    };
+    go(&j, &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "another GPU");
+    // A damaged marker file: checked again (and repaired).
+    std::fs::write(&marker, b"{damaged").unwrap();
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "damaged marker");
+    // A training process that fails (after a skipped check) forgets the pass.
+    let fake = TrainFake {
+        fail_lines: vec!["RuntimeError: something broke"],
+        ..TrainFake::new()
+    };
+    let e = go(&next(&t), &fake).unwrap_err();
+    assert_eq!(e.stage, Some(TrainStage::Train));
+    assert_eq!(self_checks(&fake), 0, "skipped before the failure");
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "after a failed training");
 }
 
 #[test]
@@ -2242,4 +2326,54 @@ fn a_cancel_during_the_benchmark_keeps_the_registered_model() {
     assert_eq!(r.state, RunState::Cancelled, "{}", r.describe());
     assert!(r.output.is_some());
     assert!(!r.retrying);
+}
+
+#[test]
+fn the_seeds_of_a_group_link_the_first_seeds_dataset_and_other_groups_do_not() {
+    let t = tmp("seed-reuse");
+    let fake = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(t.0.join("runs.json")),
+    );
+    let mut ids = Vec::new();
+    for (i, group) in [(0, "cmp-a"), (1, "cmp-a"), (2, "cmp-b")] {
+        let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+        j.name = format!("night-yolo26n-s{i}");
+        j.run_dir = t.0.join("training").join(format!("seed{i}"));
+        j.request.compare_group = Some(group.into());
+        j.request.train_seed = Some(i);
+        ids.push((
+            svc.enqueue(j).unwrap(),
+            t.0.join("training").join(format!("seed{i}")),
+        ));
+    }
+    let log = |dir: &Path| std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+    for (id, _) in &ids {
+        let r = svc.wait(id, Duration::from_secs(60)).unwrap();
+        assert_eq!(r.state, RunState::Done, "{:?}", r.error);
+    }
+    assert!(
+        !log(&ids[0].1).contains("hard-linked"),
+        "the first seed writes its own"
+    );
+    let second = log(&ids[1].1);
+    assert!(
+        second.contains("hard-linked from the identical dataset of")
+            && second.contains(&ids[0].1.join("data").display().to_string()),
+        "{second}"
+    );
+    assert!(
+        !log(&ids[2].1).contains("hard-linked"),
+        "another group lends nothing"
+    );
+    // The same dataset either way.
+    let lists = |d: &Path| {
+        ["train.txt", "valid.txt", "classes.txt", "train.coco.json"]
+            .map(|f| std::fs::read(d.join("data").join(f)).unwrap())
+    };
+    assert_eq!(lists(&ids[0].1), lists(&ids[1].1));
+    svc.shutdown();
 }

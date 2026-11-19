@@ -13,13 +13,17 @@
 //! **It changes nothing else**: no box, frame status, config entry, models folder file,
 //! `runs.json` or `benchmark.json`. A fold model is installed in the job's work folder, registered
 //! nowhere and benchmarked never ([`crate::training::job::NoHooks`]), and the whole work folder
-//! (`<training dir>/refine/<id>`) is deleted at the end.
+//! (`<training dir>/refine/<id>`, and the fold folders' place on the dataset's volume when they
+//! went there, [`place`]) is deleted at the end.
 //!
 //! Each stage is a file:
 //!
 //! - [`folds`]: whole camera days per fold, pure;
 //! - [`job`]: the stage machine ([`RefineJob`], a task of the training queue);
-//! - [`predict`]: a fold model over its frames, in this process ([`predict::FoldPredictor`]);
+//! - [`place`]: where the fold folders go (on the volume of the folder under review when the
+//!   training folder is on another one, so the fold exports hard-link the frames);
+//! - [`predict`]: a fold model over its frames, in this process ([`predict::FoldPredictor`]; a
+//!   fold model compiles without the OpenVINO model cache);
 //! - [`judge`]: one frame's labels against the detections, pure (and [`judge::tighten`], the
 //!   decision on a loose label from two looks);
 //! - [`write`]: the suggestions, re-judged under the label write lock;
@@ -39,6 +43,7 @@
 pub mod folds;
 pub mod job;
 pub mod judge;
+pub mod place;
 pub mod predict;
 pub mod quick;
 pub mod report;
