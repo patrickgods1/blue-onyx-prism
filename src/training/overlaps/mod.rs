@@ -13,7 +13,7 @@
 //!
 //! - [`select`]: stage 1, the open pairs without an answer and the crops they need;
 //! - [`job`]: stage 2 (the environment, RF-DETR L's weights) and the stage machine;
-//! - [`zoom`]: stage 3, `scripts/autolabel.py --zoom-pairs`, one flushed JSONL line per finished crop;
+//! - [`zoom`]: stage 3, `scripts/autolabel.py --zoom-pairs`, one JSONL line per finished crop, flushed per frame;
 //! - [`write`]: stage 4, the suggestions, re-judged under the label write lock.
 //!
 //! A cancel keeps the finished crops: they are written as usual, and a rerun skips every pair with an

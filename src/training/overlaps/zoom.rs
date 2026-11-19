@@ -1,6 +1,6 @@
 //! Stage 3 of the overlap check: `scripts/autolabel.py --zoom-pairs` runs RF-DETR L on the crops of
-//! [`super::select`], one flushed JSONL line per finished crop (`@overlaps` events carry the
-//! progress). The answers ([`read_results`]) are detections only; every decision is the service's
+//! [`super::select`], one JSONL line per finished crop, flushed after each frame's crops (`@overlaps`
+//! events carry the progress, one per crop). The answers ([`read_results`]) are detections only; every decision is the service's
 //! ([`crate::collect::labels::overlaps`]).
 //!
 //! The dataset check's closer look at loose labels ([`crate::training::refine::tighten`]) runs the
