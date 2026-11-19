@@ -52,6 +52,10 @@
         <p class="muted small">Comma-separated, in head order; empty = all of the export. (With scripts: a list of the ticked folders' classes and their boxes.)</p>
       </div>
       <p class="small" id="train-classes-msg" role="status"></p>
+      <fieldset id="train-merges"><legend>Merge classes</legend>
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="rename" aria-label="Merge classes" placeholder="truck=car, van=car">
+        <p class="muted small">Boxes of the first class are trained as the second; an empty second drops them. Tick the merged class (car), not the one merged away.</p>
+      </fieldset>
       <div class="tr-radios" role="radiogroup" aria-label="Objects of unticked classes">
         <span class="muted small">Objects of unticked classes:</span>
         <label class="check" title="The frame stays; the object is background (a frame left without a box is a negative). Right for unrelated objects (a bench)."><input type="radio" name="excluded" value="background" checked> treat as background</label>

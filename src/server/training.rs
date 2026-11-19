@@ -25,6 +25,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
@@ -412,6 +413,8 @@ struct ResultRow {
     family: String,
     license: String,
     classes: String,
+    /// "merged: truck \u{2192} car" (empty without merges).
+    merges: String,
     benchmark: String,
     /// `/benchmark?set=...#tab-compare`: Compare on the run's held-out images.
     compare_href: String,
@@ -982,6 +985,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         model: r.request.recipe.label(),
         scene: r.request.scene,
         classes: r.request.classes.clone().unwrap_or_default(),
+        rename: r.request.rename.clone(),
         excluded: r.request.excluded,
         ignore: p
             .and_then(|p| p.settings.as_ref())
@@ -1487,6 +1491,7 @@ fn view_with(
                 family: format!("{} ({})", r.request.recipe.label(), o.family),
                 license: o.license.clone(),
                 classes: o.classes.join(", "),
+                merges: merges_text(&r.request.rename),
                 benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
                 compare_href: compare_href(r.benchmark.as_ref()),
                 compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
@@ -1714,6 +1719,8 @@ pub(crate) struct DataFields {
     pub classes: Vec<String>,
     pub excluded: Excluded,
     pub balance: Balance,
+    /// Class merges (`from` -> `to`; an empty `to` drops the label), see [`rename_of`].
+    pub rename: BTreeMap<String, String>,
 }
 
 /// The datasets, scenes ([`scenes_of`]), classes ([`classes_of`]), excluded mode, public mix
@@ -1739,7 +1746,49 @@ pub(crate) fn data_fields(
         classes: classes_of(f),
         excluded,
         balance: balance_of(f, training)?,
+        rename: rename_of(f)?,
     })
+}
+
+/// The class merges of a form or query: repeated `rename` fields, each one `from=to` or several
+/// joined by commas (the Train tab's Merge classes rows, the older text field); an empty `to`
+/// drops the label, a later duplicate `from` wins. Like the CLI's `--rename`, nothing else is
+/// checked here (the class list must name the target).
+pub(crate) fn rename_of(f: &[(String, String)]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for piece in all(f, "rename")
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let (from, to) = crate::training::dataset::parse_rename(piece)
+            .map_err(|_| anyhow::anyhow!("class merges: '{piece}' is not from=to"))?;
+        out.insert(from, to);
+    }
+    Ok(out)
+}
+
+/// "merged: truck -> car; dropped: tree" for the Models tab; empty without merges.
+fn merges_text(rename: &BTreeMap<String, String>) -> String {
+    let merged: Vec<String> = rename
+        .iter()
+        .filter(|(_, to)| !to.is_empty())
+        .map(|(from, to)| format!("{from} \u{2192} {to}"))
+        .collect();
+    let dropped: Vec<&str> = rename
+        .iter()
+        .filter(|(_, to)| to.is_empty())
+        .map(|(from, _)| from.as_str())
+        .collect();
+    let mut parts = Vec::new();
+    if !merged.is_empty() {
+        parts.push(format!("merged: {}", merged.join(", ")));
+    }
+    if !dropped.is_empty() {
+        parts.push(format!("dropped: {}", dropped.join(", ")));
+    }
+    parts.join("; ")
 }
 
 /// The Balance fieldset of a form: `balance` (repeated axis checkboxes and / or comma lists of
@@ -1943,7 +1992,7 @@ pub(crate) fn requests_from_form(
             include_public: data.include_public,
             scene,
             classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
-            rename: Default::default(),
+            rename: data.rename.clone(),
             benchmark_sets: sets.clone(),
             benchmark_devices: bench_devices.clone(),
             allow_large: field(f, "confirm_large").is_some(),
@@ -2144,6 +2193,7 @@ pub(crate) fn dataset_inventory(
     offered: &[PathBuf],
     data_path: &dyn Fn(&std::path::Path) -> PathBuf,
     allow: &dyn Fn(&str) -> Result<PathBuf, String>,
+    rename: &BTreeMap<String, String>,
 ) -> serde_json::Value {
     use crate::training::dataset;
     let mut sources = Vec::new();
@@ -2160,17 +2210,40 @@ pub(crate) fn dataset_inventory(
             Err(e) => errors.push(serde_json::json!({ "dataset": d, "message": e })),
         }
     }
-    let classes = dataset::inventory(&sources, &Default::default());
+    let classes = dataset::inventory(&sources, rename);
+    // The merged names, as `plan` lists them: each class renamed, a dropped one skipped.
     let mut order: Vec<String> = Vec::new();
     for c in sources
         .iter()
         .flat_map(|s| s.classes.iter())
+        .map(|c| rename.get(c).unwrap_or(c))
         .chain(classes.iter().map(|c| &c.name))
     {
-        if !order.contains(c) {
+        if !c.is_empty() && !order.contains(c) {
             order.push(c.clone());
         }
     }
+    // The names as the exports have them, with their boxes: the page's "from" choices.
+    let mut source_classes: Vec<(String, u64)> = Vec::new();
+    for c in sources.iter().flat_map(|s| s.classes.iter()) {
+        if !source_classes.iter().any(|(n, _)| n == c) {
+            source_classes.push((c.clone(), 0));
+        }
+    }
+    for b in sources
+        .iter()
+        .flat_map(|s| s.frames.iter())
+        .flat_map(|f| f.boxes.iter())
+    {
+        match source_classes.iter_mut().find(|(n, _)| *n == b.class) {
+            Some(e) => e.1 += 1,
+            None => source_classes.push((b.class.clone(), 1)),
+        }
+    }
+    let source_classes: Vec<serde_json::Value> = source_classes
+        .into_iter()
+        .map(|(name, boxes)| serde_json::json!({ "name": name, "boxes": boxes }))
+        .collect();
     let mut frames = dataset::SceneCounts::default();
     for f in sources.iter().flat_map(|s| s.frames.iter()) {
         *match f.scene.as_deref() {
@@ -2184,6 +2257,7 @@ pub(crate) fn dataset_inventory(
         "success": true,
         "classes": classes,
         "order": order,
+        "source_classes": source_classes,
         "frames": frames,
         "errors": errors,
     })
@@ -2207,11 +2281,16 @@ pub(super) async fn dataset_classes(
     blocking(move || {
         let config = state.config_read().clone();
         let datasets = all(&q, "dataset");
+        let rename = match rename_of(&q) {
+            Ok(r) => r,
+            Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        };
         Json(dataset_inventory(
             &datasets,
             &offered_datasets(&config),
             &|p| config.data_path(p),
             &allow_in(&config),
+            &rename,
         ))
         .into_response()
     })
@@ -2306,7 +2385,7 @@ pub(crate) fn balance_preview_json(
                 include_public: data.include_public,
                 scene,
                 classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
-                rename: Default::default(),
+                rename: data.rename.clone(),
                 benchmark_sets: Vec::new(),
                 benchmark_devices: Vec::new(),
                 allow_large: false,
@@ -4437,6 +4516,223 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn rename_repeats_or_commas_and_empty_to_drops() {
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("model", "yolo26s"),
+                ("scene", "day"),
+                ("scene", "night"),
+                ("seeds", "2"),
+                ("rename", "truck=car"),
+                ("rename", "van = car, tree="),
+                ("rename", "truck=bus"),
+                ("rename", ""),
+            ]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap();
+        // Every model x scene x seed request carries the merges; a later duplicate wins.
+        assert_eq!(reqs.len(), 8);
+        for r in &reqs {
+            assert_eq!(
+                r.rename,
+                BTreeMap::from([
+                    ("truck".to_string(), "bus".to_string()),
+                    ("van".to_string(), "car".to_string()),
+                    ("tree".to_string(), String::new()),
+                ])
+            );
+        }
+        let (reqs, _) =
+            requests_from_form(&form(&[("model", "yolo26n")]), &mac(), &Default::default())
+                .unwrap();
+        assert!(reqs[0].rename.is_empty());
+        let e = requests_from_form(
+            &form(&[("model", "yolo26n"), ("rename", "truck=car, =x")]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "class merges: '=x' is not from=to");
+        let e = rename_of(&form(&[("rename", "truck")])).unwrap_err();
+        assert!(e.to_string().starts_with("class merges: 'truck'"), "{e}");
+    }
+
+    #[test]
+    fn mixed_renames_warn_in_a_comparison_and_equal_ones_do_not() {
+        let mk = |rename: &[(&str, &str)]| {
+            let mut r = crate::training::compare::CompareRun {
+                name: "n".into(),
+                model: "yolo26n".into(),
+                scene: SceneFilter::ALL_SCENES,
+                classes: vec!["car".into()],
+                rename: rename
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect(),
+                excluded: Excluded::Background,
+                ignore: None,
+                negative_share: None,
+                static_cap: None,
+                balance: Default::default(),
+                best_epoch: None,
+                stopped_epoch: None,
+                seed: None,
+                select_metric: Default::default(),
+                select_classes: None,
+                bench: None,
+            };
+            r.name = format!("r{}", rename.len());
+            r
+        };
+        let merged = [("truck", "car")];
+        let c = compare::compare(&[mk(&merged), mk(&merged), mk(&[])]);
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("merge classes differently")
+                    && w.contains("truck \u{2192} car on 2 of 3")),
+            "{:?}",
+            c.warnings
+        );
+        for runs in [[mk(&merged), mk(&merged)], [mk(&[]), mk(&[])]] {
+            let c = compare::compare(&runs);
+            assert!(
+                !c.warnings.iter().any(|w| w.contains("merge classes")),
+                "{:?}",
+                c.warnings
+            );
+        }
+        assert_eq!(merges_text(&BTreeMap::new()), "");
+        assert_eq!(
+            merges_text(&BTreeMap::from([
+                ("truck".to_string(), "car".to_string()),
+                ("tree".to_string(), String::new()),
+            ])),
+            "merged: truck \u{2192} car; dropped: tree"
+        );
+    }
+
+    fn truck_export(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\ncar\ntruck\n").unwrap();
+        for cam in ["a", "b", "c"] {
+            for i in 0..12 {
+                let stem = format!("day.{cam}.2026-10-01.f{i}");
+                std::fs::write(dir.join("images").join(format!("{stem}.jpg")), b"x").unwrap();
+                let label = match i % 3 {
+                    0 => "1 0.5 0.5 0.2 0.4\n",
+                    1 => "2 0.5 0.5 0.2 0.4\n",
+                    _ => "0 0.5 0.5 0.2 0.4\n",
+                };
+                std::fs::write(dir.join("labels").join(format!("{stem}.txt")), label).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_classes_count_in_the_preview_and_the_class_list() {
+        use crate::server::test_util::{call, get_text, post_form, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-train-mrg-{}", uuid::Uuid::new_v4()));
+        let export = root.join("exports/review-1");
+        truck_export(&export);
+        let (r2, e2) = (root.clone(), export.clone());
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.training.datasets = vec![e2];
+        });
+        let enc = super::super::encode_uri_component(&export.display().to_string());
+        let total = |v: &serde_json::Value, name: &str| -> Option<u64> {
+            v["runs"][0]["preflight"]["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .map(|c| {
+                    ["train", "valid", "heldout"]
+                        .iter()
+                        .map(|k| c[*k].as_u64().unwrap())
+                        .sum()
+                })
+        };
+        let preview = |extra: &str| {
+            let state = &state;
+            let body = format!("dataset={enc}&scene=all{extra}");
+            async move {
+                let (s, _, b) = call(
+                    state,
+                    post_form("/v1/training/balance-preview", &body, false),
+                )
+                .await;
+                assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+                serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+            }
+        };
+        let plain = preview("").await;
+        let (car0, truck0) = (
+            total(&plain, "car").unwrap(),
+            total(&plain, "truck").unwrap(),
+        );
+        assert!(car0 > 0 && truck0 > 0, "{plain}");
+        let merged = preview("&rename=truck%3Dcar").await;
+        assert_eq!(total(&merged, "car"), Some(car0 + truck0), "{merged}");
+        assert_eq!(total(&merged, "truck"), None, "{merged}");
+
+        // The class picker's answer: car summed, truck out of the order, kept as a source.
+        let (s, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&rename=truck%3Dcar"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let car = v["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "car")
+            .unwrap();
+        assert_eq!(car["boxes"], 24);
+        assert!(
+            v["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["name"] != "truck")
+        );
+        assert_eq!(v["order"], serde_json::json!(["person", "car"]));
+        assert_eq!(
+            v["source_classes"],
+            serde_json::json!([
+                {"name": "person", "boxes": 12},
+                {"name": "car", "boxes": 12},
+                {"name": "truck", "boxes": 12},
+            ])
+        );
+        // A dropped class leaves the order too; a bad merge is a 400 naming it.
+        let (_, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&rename=truck%3D"),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["order"], serde_json::json!(["person", "car"]));
+        let (s, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&rename=%3Dcar"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("class merges: '=car' is not from=to"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn default_names_get_a_suffix_when_taken() {
         let taken = ["day-yolo26n-1", "day-yolo26n-1-2"];
         let t = |n: &str| taken.contains(&n);
@@ -5187,6 +5483,8 @@ pub(super) mod tests {
         assert!(page.contains("<option value=\"map\" data-hint"));
         assert!(page.contains("held-out benchmark is the number to trust"));
         assert!(page.contains("id=\"train-picker\""));
+        assert!(page.contains("id=\"train-merges\""));
+        assert!(page.contains("name=\"rename\""));
         assert!(page.contains("name=\"excluded\" value=\"drop-frame\""));
         // The per-run summary of a finished run: AP50-95 per scene and in scope.
         assert!(

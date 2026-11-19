@@ -1015,6 +1015,15 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
 // Plan
 // ---------------------------------------------------------------------------------------------
 
+/// One `from=to` class merge (CLI `--rename`, the Train tab's Merge classes): both sides trimmed,
+/// `from` not empty, an empty `to` drops the label.
+pub(crate) fn parse_rename(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+        .filter(|(a, _)| !a.is_empty())
+        .ok_or_else(|| format!("'{s}' is not from=to"))
+}
+
 /// How a run assembles its data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Options {

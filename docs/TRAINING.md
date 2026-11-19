@@ -237,7 +237,10 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
 
 1. **Classes**: the run's list (`--classes`, repeated or comma-separated; the page's class picker) in
    head order, else every class of the exports in first-seen order. Labels are matched by name across
-   exports (each export's ids are remapped), `--rename from=to` renames, an empty `to` drops. What
+   exports (each export's ids are remapped), `--rename from=to` renames, an empty `to` drops. The Train
+   tab's **Merge classes** rows (`from` -> `to`, `to` a class, a new name or "drop") post the same
+   `rename` fields. The rename happens before the class list, so the list must name the target
+   (`car`, not `truck`); a label renamed away is no longer a class of its own. What
    happens to a box of a label that is not in the list is the **excluded mode** (`--excluded`, the
    page's radio under the picker): `background` (default) keeps the frame and the object is
    background (a frame left with no box is a negative, counted toward the negative share);
@@ -538,7 +541,9 @@ night, ir, unknown scene). With `--scene` an **in scope** column adds the boxes 
 (unknown-scene boxes count only for `all`). The Train tab's class picker shows the same counts
 (`GET /v1/training/dataset-classes`) and warns about a class with fewer than 50 boxes (a fine-tuning
 floor, far below Ultralytics' best-case 10,000 instances) and about a class with no box in the
-scenes the run trains on (`person` with no night boxes in a night run).
+scenes the run trains on (`person` with no night boxes in a night run). The picker follows the Merge
+classes rows: a merged class shows the summed counts (and a note, "includes 61 truck"), the class
+merged away is gone from the list but stays a choice for "from" (`source_classes`).
 
 ### Public night subset (`train-data:lila-night`)
 
@@ -1091,7 +1096,7 @@ blue-onyx-prism train run --model yolo26s --dataset <export> \
 
 One run per scene per model is queued (several `--model` x several `--scene` = the product; identical
 scenes are queued once; the page lists the run names first) and they run one at a time in that order.
-They share a `compare_group` (`cmp-<YYYYMMDD-HHMMSS>`), the class list and the excluded mode.
+They share a `compare_group` (`cmp-<YYYYMMDD-HHMMSS>`), the class list, the class merges and the excluded mode.
 
 **Same held-out frames.** The held-out set is chosen before the scene filter, so every run of the
 group is benchmarked on the same frames, all scenes included. The fingerprint in each run's benchmark
@@ -1113,7 +1118,7 @@ count) and **Person FA** (`2/210`: frames without a person, parked cars and othe
 that got a person detection at the threshold, of all such frames; a camera that always sees a parked
 car has no empty frame, so its false person alerts show only here; CLI `person FA`). The best value
 of each column is marked (`*` in the CLI): highest AP and recall, lowest time and false-alert rates.
-Runs of older versions show a dash in the new columns. Runs that differ in classes, excluded mode or
+Runs of older versions show a dash in the new columns. Runs that differ in classes, class merges, excluded mode or
 threshold get a warning, and so do runs whose AP averages different classes: AP50 and AP50-95 average
 only the classes with at least 20 held-out objects (`MIN_CLASS_GT`; every class when none has 20), so a
 class that crossed 20 objects in one run's held-out frames changes what its AP means.
@@ -2837,7 +2842,7 @@ blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene n
     [--static-cap 20 (0 = off)] (--out <dir> | --dry-run)
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> \
     [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
-    [--classes a,b] [--classes c] [--excluded background|drop-frame] \
+    [--classes a,b] [--classes c] [--rename from=to ...] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
     [--static-cap 20 (0 = off)] [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--select-metric map|map50|f1|f2|f0_5|iou] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
     [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]

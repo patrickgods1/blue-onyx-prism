@@ -1578,6 +1578,12 @@ table.tr-mtable tr.best-epoch td { background: var(--ok-bg); }
 .cp-badge.tr-cls-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
 .cp-chip:not(:has(input[type=checkbox]:checked)) .tr-scene-warn { display: none; }
 #train-classes .tr-radios { align-items: baseline; gap: 0 1rem; }
+#train-merges { margin: 0.6rem 0; }
+.tr-merge-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.3rem 0; }
+.tr-merge-row select, .tr-merge-row input { width: auto; max-width: 100%; }
+.tr-merge-off { opacity: 0.55; }
+.tr-merge-x { padding: 0.1rem 0.5rem; }
+.tr-merge-add { margin: 0.3rem 0; }
 .tr-rec { white-space: normal; font-weight: normal; }
 details.tr-compare { margin: 0.4rem 0 0.8rem; }
 details.tr-compare > summary { cursor: pointer; font-weight: 600; margin: 0.2rem 0 0.4rem; overflow-wrap: anywhere; }
