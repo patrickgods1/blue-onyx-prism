@@ -12,7 +12,7 @@
 // Train: the runs line (one run per ticked scene per model, named before queuing), the class
 // picker of the ticked folders (counts per scene, warnings), the balance preview (what the
 // Balance fieldset does to each run's training frames) and Finish now while training, plus the
-// Stop now / Continue notice of an early-stop point passed while the training loss still falls.
+// Stop now / Continue notice of an early-stop point passed while validation still improves.
 // Each run row gets a settings line (device, batch, input size, learning rate and schedule,
 // patience, seed, ...) and the Learning rate field's placeholder follows the ticked family.
 // SAM 3: the three-step access panel of the Auto-label card (GET /v1/autolabel/sam3); its option
@@ -1855,7 +1855,7 @@
         var p = r.progress || {};
         finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase && !r.retrying);
       }
-      // An early-stop point passed while the training loss still falls: Stop now / Continue.
+      // An early-stop point passed while validation still improves: Stop now / Continue.
       var ext = tr.querySelector('[data-field="extend"]');
       if (ext) {
         var n = (r.progress || {}).extension;

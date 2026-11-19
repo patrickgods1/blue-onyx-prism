@@ -973,17 +973,24 @@ fn out_of_memory_after_the_first_epochs_or_at_batch_1_is_not_retried() {
 
 #[test]
 fn multi_scale_auto_turns_off_when_batch_4_does_not_fit() {
+    use crate::training::estimate::Target;
+    let mps = Target::Mps;
+    let cuda = Target::Cuda(crate::backend::detect::ComputeCapability::new(6, 1));
     let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
     // 16 GB Mac share: batch 4 fits with multi-scale.
-    assert!(r.multi_scale_on(9830));
-    // 6 GB: batch 4 at 544 px does not (1500 + 4 x 650 x 2.0 = 6.7 GB > 5.4 GB).
-    assert!(!r.multi_scale_on(6144));
+    assert!(r.multi_scale_on(9830, mps));
+    // 6 GB of a Mac: batch 4 at 544 px does not (1500 + 4 x 650 x 2.0 = 6.7 GB > 5.4 GB).
+    assert!(!r.multi_scale_on(6144, mps));
+    // A 6 GB CUDA card does (measured: 3.1 GB at batch 4; 1000 + 4 x 325 x 2.0 = 3.6 GB), a
+    // 3 GB one does not (2.7 GB usable).
+    assert!(r.multi_scale_on(6144, cuda));
+    assert!(!r.multi_scale_on(3072, cuda));
     r.multi_scale = super::super::recipe::MultiScale::On;
-    assert!(r.multi_scale_on(6144));
+    assert!(r.multi_scale_on(6144, mps));
     r.multi_scale = super::super::recipe::MultiScale::Off;
-    assert!(!r.multi_scale_on(100_000));
+    assert!(!r.multi_scale_on(100_000, cuda));
     let y = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
-    assert!(!y.multi_scale_on(100_000));
+    assert!(!y.multi_scale_on(100_000, cuda));
     // Stored only when not auto.
     let text =
         serde_json::to_string(&TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap()).unwrap();

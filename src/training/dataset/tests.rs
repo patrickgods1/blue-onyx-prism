@@ -3698,3 +3698,303 @@ fn validation_on_public_frames_only_is_said() {
         p.warnings
     );
 }
+
+/// `camera_export` with the `-0` and `-1` frames redrawn at `w` x `h`: a dark frame with each of
+/// its label boxes filled bright (so a box can be found again after a resize), the manifest's
+/// size updated. The `-2` and `-3` frames stay 64 x 48.
+fn large_camera_export(dir: &Path, w: u32, h: u32) {
+    camera_export(dir);
+    let m = dir.join("manifest.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&m).unwrap()).unwrap();
+    for im in v["images"].as_array_mut().unwrap() {
+        let name = im["file"].as_str().unwrap().to_string();
+        if !(name.ends_with("-0.jpg") || name.ends_with("-1.jpg")) {
+            continue;
+        }
+        let stem = name.trim_end_matches(".jpg");
+        let labels =
+            std::fs::read_to_string(dir.join("labels").join(format!("{stem}.txt"))).unwrap();
+        let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([30, 30, 30]));
+        for l in labels.lines() {
+            let n: Vec<f32> = l
+                .split_whitespace()
+                .skip(1)
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let (x0, x1) = (
+                (n[0] - n[2] / 2.0) * w as f32,
+                (n[0] + n[2] / 2.0) * w as f32,
+            );
+            let (y0, y1) = (
+                (n[1] - n[3] / 2.0) * h as f32,
+                (n[1] + n[3] / 2.0) * h as f32,
+            );
+            for y in (y0.round() as u32)..(y1.round() as u32) {
+                for x in (x0.round() as u32)..(x1.round() as u32) {
+                    img.put_pixel(x, y, image::Rgb([230, 230, 230]));
+                }
+            }
+        }
+        img.save(dir.join("images").join(&name)).unwrap();
+        im["width"] = w.into();
+        im["height"] = h.into();
+    }
+    std::fs::write(&m, serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+/// Every file of `dir` with its bytes.
+fn files_of(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (
+                e.file_name().to_string_lossy().to_string(),
+                std::fs::read(e.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn prepared_size_scales_the_short_side_and_never_up() {
+    assert_eq!(prepared_size((2688, 1520), 600), Some((1061, 600)));
+    assert_eq!(prepared_size((1520, 2688), 600), Some((600, 1061)));
+    assert_eq!(prepared_size((2688, 1520), 960), Some((1698, 960)));
+    assert_eq!(prepared_size((1920, 1080), 640), Some((1138, 640)));
+    assert_eq!(prepared_size((800, 800), 600), Some((600, 600)));
+    // At or under the target: as it is.
+    assert_eq!(prepared_size((2688, 600), 600), None);
+    assert_eq!(prepared_size((640, 480), 600), None);
+    assert_eq!(prepared_size((0, 480), 100), None);
+    assert_eq!(prepared_size((640, 480), 0), None);
+    // A very wide one keeps a long side of at least 1 px.
+    assert_eq!(prepared_size((10_000, 3), 1), Some((3333, 1)));
+}
+
+/// The train / valid images are downscaled to the short side, the small ones and every held-out
+/// one are linked as they are; the labels (and so the size floor and ignore decisions, made on
+/// normalized boxes before any image is written) are the same as without it; the COCO sizes and
+/// boxes follow the written image, where the box still covers the drawn object.
+#[test]
+fn prepared_images_are_downscaled_with_their_boxes_and_the_heldout_stays_full_size() {
+    let t = tmp("prep-resize");
+    large_camera_export(&t.0, 320, 200);
+    let s = read_export(&t.0).unwrap();
+    // A size floor region on a trained frame that a 640 px run gives back as a box.
+    let p0 = plan(std::slice::from_ref(&s), &Options::default()).unwrap();
+    let grown = p0.train[0].0;
+    let s = [with_floor_regions(
+        &s,
+        FLOOR_384,
+        &[(grown, floor_region("dog", 0.02, 0.03))],
+    )];
+    let plain = at_imgsz(Some(640));
+    let short = Options {
+        prepared_short_side: Some(100),
+        ..plain.clone()
+    };
+    let p = plan(&s, &plain).unwrap();
+    assert_eq!(
+        plan(&s, &short).unwrap(),
+        p,
+        "the plan does not depend on it"
+    );
+    assert_eq!(p.stats.floor_restored.get("dog"), Some(&1));
+    let a = t.0.join("full");
+    let b = t.0.join("short");
+    write(&s, &p, &plain, &a).unwrap();
+    write(&s, &p, &short, &b).unwrap();
+    // Labels: byte for byte the same, the restored dog among them.
+    assert_eq!(files_of(&a.join("labels")), files_of(&b.join("labels")));
+    let sources = read_image_sources(&b).unwrap();
+    let large = |n: &str| n.ends_with("-0.jpg") || n.ends_with("-1.jpg");
+    let mut resized = 0;
+    for (n, src) in &sources {
+        let got = b.join("images").join(n);
+        if large(n) {
+            assert_eq!(image::image_dimensions(&got).unwrap(), (160, 100), "{n}");
+            resized += 1;
+        } else {
+            assert_eq!(
+                std::fs::read(&got).unwrap(),
+                std::fs::read(src).unwrap(),
+                "{n}"
+            );
+        }
+        // Without a short side: the source as it is.
+        let full = a.join("images").join(n);
+        assert_eq!(
+            std::fs::read(&full).unwrap(),
+            std::fs::read(src).unwrap(),
+            "{n}"
+        );
+    }
+    assert!(resized >= 4, "{resized}");
+    // Held out: every image the source's bytes, its manifest at the source size.
+    let held = files_of(&b.join("heldout/images"));
+    assert_eq!(held, files_of(&a.join("heldout/images")));
+    assert!(held.keys().any(|n| large(n)), "a large frame is held out");
+    let m: Manifest =
+        serde_json::from_slice(&std::fs::read(b.join("heldout/manifest.json")).unwrap()).unwrap();
+    for im in &m.images {
+        let want = if large(&im.file) {
+            (320, 200)
+        } else {
+            (64, 48)
+        };
+        assert_eq!(
+            (im.width, im.height),
+            (Some(want.0), Some(want.1)),
+            "{}",
+            im.file
+        );
+    }
+    // COCO: the written sizes; a box at the normalized label times it, over the bright object.
+    for split in ["train", "valid"] {
+        let coco: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(b.join(format!("{split}.coco.json"))).unwrap())
+                .unwrap();
+        let full: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(a.join(format!("{split}.coco.json"))).unwrap())
+                .unwrap();
+        assert_eq!(
+            coco["annotations"].as_array().unwrap().len(),
+            full["annotations"].as_array().unwrap().len()
+        );
+        for (im, im_full) in coco["images"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(full["images"].as_array().unwrap())
+        {
+            let n = im["file_name"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("images/");
+            let (w, h) = (
+                im["width"].as_u64().unwrap(),
+                im["height"].as_u64().unwrap(),
+            );
+            let (fw, fh) = (
+                im_full["width"].as_u64().unwrap(),
+                im_full["height"].as_u64().unwrap(),
+            );
+            if !large(n) {
+                assert_eq!((w, h), (fw, fh), "{n}");
+                continue;
+            }
+            assert_eq!(((w, h), (fw, fh)), ((160, 100), (320, 200)), "{n}");
+            let pix = image::open(b.join("images").join(n)).unwrap().to_rgb8();
+            let id = &im["id"];
+            let pairs = coco["annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|x| &x["image_id"] == id)
+                .zip(
+                    full["annotations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|x| x["image_id"] == im_full["id"]),
+                );
+            for (box_s, box_f) in pairs {
+                let bs: Vec<f64> = box_s["bbox"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap())
+                    .collect();
+                let bf: Vec<f64> = box_f["bbox"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap())
+                    .collect();
+                // Half the size of the full-size box (within the 0.01 px rounding).
+                for (x, y) in bs.iter().zip(&bf) {
+                    assert!((x - y / 2.0).abs() <= 0.011, "{n}: {bs:?} vs {bf:?}");
+                }
+                if box_s["category_id"] == 1 && bs[2] < 4.0 {
+                    continue; // the restored size floor dog: not drawn
+                }
+                // Inside (one pixel in from the edges): the drawn object; one pixel outside: not.
+                let inside =
+                    pix.get_pixel((bs[0] + bs[2] / 2.0) as u32, (bs[1] + bs[3] / 2.0) as u32)[0];
+                assert!(inside > 200, "{n}: {inside} at the centre of {bs:?}");
+                let left = (bs[0] - 2.0).max(0.0) as u32;
+                if bs[0] >= 2.0 {
+                    let out = pix.get_pixel(left, (bs[1] + bs[3] / 2.0) as u32)[0];
+                    assert!(out < 80, "{n}: {out} left of {bs:?}");
+                }
+                let edge = pix.get_pixel((bs[0] + 1.0) as u32, (bs[1] + bs[3] / 2.0) as u32)[0];
+                assert!(edge > 150, "{n}: {edge} just inside {bs:?}");
+            }
+        }
+    }
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(b.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["prepared_short_side"], 100);
+    assert_eq!(summary["resized_images"], resized);
+    assert!(summary["options"].get("prepared_short_side").is_none());
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(a.join("dataset.json")).unwrap()).unwrap();
+    assert_eq!(summary["prepared_short_side"], serde_json::Value::Null);
+    assert_eq!(summary["resized_images"], 0);
+}
+
+/// A PNG is downscaled as a PNG; an image of another extension, an unreadable one and a JPEG
+/// already at the size are linked as they are; nothing is left behind but the written files.
+#[test]
+fn prepare_image_keeps_the_format_and_passes_others_through() {
+    let t = tmp("prep-image");
+    let png = t.0.join("a.png");
+    image::RgbImage::from_pixel(300, 150, image::Rgb([10, 200, 30]))
+        .save(&png)
+        .unwrap();
+    let out = t.0.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    assert_eq!(
+        prepare_image(&png, &out.join("a.png"), 75).unwrap(),
+        Some((150, 75))
+    );
+    let back = image::open(out.join("a.png")).unwrap().to_rgb8();
+    assert_eq!(back.dimensions(), (150, 75));
+    assert_eq!(back.get_pixel(70, 30).0, [10, 200, 30], "lossless");
+    let jpg_small = t.0.join("b.jpg");
+    jpg(&jpg_small, 120, 75);
+    assert_eq!(
+        prepare_image(&jpg_small, &out.join("b.jpg"), 75).unwrap(),
+        None
+    );
+    assert_eq!(
+        std::fs::read(out.join("b.jpg")).unwrap(),
+        std::fs::read(&jpg_small).unwrap()
+    );
+    let other = t.0.join("c.webp");
+    std::fs::write(&other, b"not decoded").unwrap();
+    assert_eq!(
+        prepare_image(&other, &out.join("c.webp"), 10).unwrap(),
+        None
+    );
+    let broken = t.0.join("d.jpg");
+    std::fs::write(&broken, b"not a jpeg").unwrap();
+    assert_eq!(
+        prepare_image(&broken, &out.join("d.jpg"), 10).unwrap(),
+        None
+    );
+    assert_eq!(std::fs::read(out.join("d.jpg")).unwrap(), b"not a jpeg");
+    // A header that reads with a body cut short: never an error of the run (linked, or decoded
+    // as far as the decoder gets).
+    let cut = t.0.join("e.jpg");
+    jpg(&cut, 300, 150);
+    let bytes = std::fs::read(&cut).unwrap();
+    std::fs::write(&cut, &bytes[..bytes.len() / 3]).unwrap();
+    prepare_image(&cut, &out.join("e.jpg"), 75).unwrap();
+    let names: BTreeSet<String> = files_of(&out).into_keys().collect();
+    assert_eq!(
+        names,
+        BTreeSet::from(["a.png", "b.jpg", "c.webp", "d.jpg", "e.jpg"].map(String::from))
+    );
+}

@@ -77,19 +77,17 @@ pub fn capability_now() -> Capability {
 /// ([`measured_peaks`] of `runs`).
 pub fn capability_with_runs(runs: &[service::RunRecord]) -> Capability {
     let mut cap = capability_now();
-    let mem = cap
-        .accelerator
-        .as_ref()
-        .map_or(0, capability::Accelerator::memory_mb);
-    cap.apply_measured(&measured_peaks(runs, mem));
+    if let Some(a) = cap.accelerator.clone() {
+        cap.apply_measured(&measured_peaks(runs, &a));
+    }
     cap
 }
 
 /// The peak GPU memory of every run that reported `mem_gb` for a finished epoch, oldest first
-/// (by `created`); `memory_mb` resolves RF-DETR's `auto` multi-scale as the run did.
+/// (by `created`); `accel` resolves RF-DETR's `auto` multi-scale as the run did.
 pub fn measured_peaks(
     runs: &[service::RunRecord],
-    memory_mb: u64,
+    accel: &capability::Accelerator,
 ) -> Vec<capability::MeasuredPeak> {
     let mut v: Vec<(&str, capability::MeasuredPeak)> = runs
         .iter()
@@ -109,7 +107,7 @@ pub fn measured_peaks(
                     family: recipe.family,
                     size: recipe.size.clone(),
                     imgsz: recipe.imgsz,
-                    multi_scale: recipe.multi_scale_on(memory_mb),
+                    multi_scale: recipe.multi_scale_on(accel.memory_mb(), accel.target()),
                     device: r.device.clone(),
                     batch: recipe.batch,
                     peak_mb: peak * 1024.0,
@@ -625,7 +623,7 @@ mod tests {
             record("2026-10-28T11:00:00Z", &r, "NVIDIA X (cuda:0)", &[0.5]),
             record("2026-10-28T12:00:00Z", &r, &dev, &[]),
         ];
-        let peaks = measured_peaks(&runs, accel.memory_mb());
+        let peaks = measured_peaks(&runs, &accel);
         assert_eq!(peaks.len(), 4);
         assert_eq!(peaks[0].peak_mb, 7.0 * 1024.0);
         assert!(peaks[0].multi_scale);

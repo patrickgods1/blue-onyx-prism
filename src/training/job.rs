@@ -971,7 +971,14 @@ fn stages(
         &job.request.datasets,
         job.request.include_public.then_some(public_dir.as_path()),
     )?;
-    let opts = request_options(&job.options, &job.request);
+    let opts = dataset::Options {
+        // Train / valid images at what the trainer reads of them at most; the held-out frames
+        // stay full size.
+        prepared_short_side: Some(recipe.prepared_short_side(
+            recipe.multi_scale_on(job.accelerator.memory_mb(), job.accelerator.target()),
+        )),
+        ..request_options(&job.options, &job.request)
+    };
     let plan = preflight::planned(&sources, &opts)?;
     preflight::check_plan(&plan, &sources, &opts)?;
     let data_dir = job.run_dir.join("data");
@@ -989,6 +996,12 @@ fn stages(
     }
     let prepared = dataset::write(&sources, &plan, &opts, &data_dir)
         .map_err(|e| explain_full_disk(e, &job.run_dir))?;
+    if let Some(short) = opts.prepared_short_side {
+        log.line(&format!(
+            "dataset: train / valid images with a short side over {short} px written at {short} \
+             px (what the trainer reads at most); held-out frames full size"
+        ));
+    }
     for w in &prepared.warnings {
         log.line(&format!("dataset: {w}"));
     }
@@ -1067,7 +1080,7 @@ fn stages(
         ),
     };
     // RF-DETR's multi-scale training (`auto`: on when the estimate fits batch 4 with it).
-    let multi_scale = recipe.multi_scale_on(job.accelerator.memory_mb());
+    let multi_scale = recipe.multi_scale_on(job.accelerator.memory_mb(), job.accelerator.target());
     let train_args = |batch: u32, workers: u32| -> Vec<OsString> {
         let mut args: Vec<OsString> = vec![
             train_script.clone().into_os_string(),

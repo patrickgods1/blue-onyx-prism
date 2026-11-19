@@ -47,9 +47,10 @@ after each validation, the run reaches a stop point once `--min-epochs` passed a
 epochs brought no gain above `--min-delta` in the mean of the last `--smooth` values of the
 selected metric (`--select-metric`, default `map`: mAP 50-95, else mAP 50), averaged over the
 classes with at least MIN_CLASS_BOXES (20) validation boxes, or over every class when none has
-that many (`Selection.decide` at the first validation, the `support` event). While the training loss
-still falls over those epochs (`loss_falling`: the later half's mean more than 2% below the earlier
-half's) it goes on instead, at most twice, each time for another `--patience` epochs (a
+that many (`Selection.decide` at the first validation, the `support` event). While that smoothed
+value is still rising over those epochs (`metric_rising`: the later half's mean more than
+`--min-delta` above the earlier half's; the training loss is not consulted) it goes on instead, at
+most twice, each time for another `--patience` epochs (a
 `converge_point` event; the service offers Stop now / Continue); else it stops. It stops at once
 when `--stop-file` exists (the service's Finish now / Stop now); a `stop` event says why, and the
 weights of the epoch with the highest raw value of that metric are exported (`Selection`: one
@@ -194,10 +195,9 @@ def fail(msg: str) -> None:
     raise SystemExit(f"[train_model] error: {msg}")
 
 
-# Extensions past a stop point while the training loss still falls (`Convergence`), and the
-# relative drop of the loss that counts as falling (`loss_falling`).
+# Extensions past a stop point while the selected metric is still rising (`Convergence`,
+# `metric_rising`).
 MAX_EXTENSIONS = 2
-LOSS_FALL = 0.02
 
 
 def mean(values) -> float:
@@ -208,34 +208,35 @@ def mean(values) -> float:
     return s / len(values)
 
 
-def loss_halves(losses):
-    """(mean of the earlier n // 2, mean of the later n // 2) of the finite values of `losses` (None
+def halves(values):
+    """(mean of the earlier n // 2, mean of the later n // 2) of the finite values of `values` (None
     and non-finite ones skipped; an odd middle value counts in neither); None below 4 values."""
-    v = [float(x) for x in losses if x is not None and math.isfinite(float(x))]
+    v = [float(x) for x in values if x is not None and math.isfinite(float(x))]
     half = len(v) // 2
     if half < 2:
         return None
     return mean(v[:half]), mean(v[len(v) - half:])
 
 
-def loss_falling(losses) -> bool:
-    """Whether the training loss still falls over `losses` (in epoch order): the later half's mean
-    is below the earlier half's by more than LOSS_FALL of it (`loss_halves`; too few values: False).
-    The twin of src/training/progress.rs `loss_falling`."""
-    h = loss_halves(losses)
-    return h is not None and h[1] < h[0] - LOSS_FALL * abs(h[0])
+def metric_rising(trend, min_delta: float) -> bool:
+    """Whether the selected metric is still rising over `trend` (its smoothed values, in epoch
+    order): the later half's mean exceeds the earlier half's by more than `min_delta` (`halves`;
+    too few values: False). The twin of src/training/progress.rs `metric_rising`."""
+    h = halves(trend)
+    return h is not None and h[1] > h[0] + float(min_delta)
 
 
 class Convergence:
     """When to stop training (one rule for every trainer; src/training/progress.rs
-    `convergence_run` is its twin, parity-tested). `update(epoch, value, loss)` once per validated
+    `convergence_run` is its twin, parity-tested). `update(epoch, value)` once per validated
     epoch with the value of the selected metric (`Selection`, None when there is none; `label`
-    names it in the logs) and the training loss: "finish" when the stop file exists, "converged"
+    names it in the logs): "finish" when the stop file exists, "converged"
     once `epoch >= min_epochs` and `patience` epochs passed since the last gain above `min_delta`
     (patience 0 = never), else None. The gain is measured on the mean of the last `smooth` values
     (1 = the raw value), so one noisy peak of a small validation split does not start the
-    countdown. At such a stop point, while the training loss still falls over the last
-    `patience` epochs (`loss_falling`), at most MAX_EXTENSIONS times and before the last of
+    countdown. At such a stop point, while the smoothed value is still rising over the last
+    `patience` epochs (`metric_rising`: a validation trend, never the training loss, which a DETR
+    lowers long after its validation peaked), at most MAX_EXTENSIONS times and before the last of
     `epochs` (0 = unknown), the run goes on instead: `point` holds the `converge_point` event and
     the countdown restarts there. Else, with `anneal` > 0 epochs and before the last of `epochs`,
     the first stop point that would stop starts an anneal instead: `annealing` holds the `anneal`
@@ -253,12 +254,12 @@ class Convergence:
         self.label = label
         self.last = 0
         self.window = []
-        self.losses = []
+        self.trend = []
         self.best, self.best_epoch = None, 0
         self.top, self.top_epoch = None, 0
         self.improved = False
         self.extensions, self.restart = 0, 0
-        self.falling = False
+        self.rising = False
         self.point = None
         self.anneal_from, self.anneal_until = 0, 0
         self.annealing = None
@@ -266,13 +267,14 @@ class Convergence:
 
     def forget_values(self) -> None:
         """The run changed metric (`Selection.fall_back`): the values so far are on another scale,
-        so the best and the smoothing window start again at the next value. The losses and the
+        so the best, the smoothing window and the trend start again at the next value. The
         extensions stay."""
         self.window = []
+        self.trend = []
         self.best, self.best_epoch = None, 0
         self.top, self.top_epoch = None, 0
 
-    def update(self, epoch: int, value, loss=None) -> str | None:
+    def update(self, epoch: int, value) -> str | None:
         epoch = int(epoch)
         if epoch <= self.last or self.decision is not None:
             return None
@@ -280,7 +282,7 @@ class Convergence:
         self.improved = False
         self.point = None
         self.annealing = None
-        self.losses.append(float(loss) if loss is not None and math.isfinite(float(loss)) else None)
+        m = None
         if value is not None and math.isfinite(float(value)):
             v = float(value)
             self.window = (self.window + [v])[-self.smooth:]
@@ -289,6 +291,7 @@ class Convergence:
                 self.best, self.best_epoch = m, epoch
             if self.top is None or v > self.top:
                 self.top, self.top_epoch, self.improved = v, epoch, True
+        self.trend.append(m)
         if self.stop_file is not None and self.stop_file.exists():
             self.decision = "finish"
         elif self.anneal_until:
@@ -296,34 +299,35 @@ class Convergence:
                 self.decision = "converged"
         elif (self.patience > 0 and self.best is not None and epoch >= self.min_epochs
               and epoch - max(self.best_epoch, self.restart) >= self.patience):
-            recent = self.losses[-self.patience:]
-            self.falling = loss_falling(recent)
-            if self.falling and self.extensions < MAX_EXTENSIONS and (self.epochs <= 0 or epoch < self.epochs):
+            recent = self.trend[-self.patience:]
+            self.rising = metric_rising(recent, self.min_delta)
+            if self.rising and self.extensions < MAX_EXTENSIONS and (self.epochs <= 0 or epoch < self.epochs):
                 self.extensions += 1
                 self.restart = epoch
                 nxt = epoch + self.patience
-                early, late = loss_halves(recent)
-                self.point = {"epoch": epoch, "best_epoch": self.top_epoch, "best": self.top, "loss_falling": True,
-                              "loss_from": early, "loss_to": late, "extension": self.extensions,
+                early, late = halves(recent)
+                self.point = {"epoch": epoch, "best_epoch": self.top_epoch, "best": self.top, "rising": True,
+                              "value_from": early, "value_to": late, "extension": self.extensions,
                               "next_check": nxt if self.epochs <= 0 else min(nxt, self.epochs)}
             elif self.anneal > 0 and (self.epochs <= 0 or epoch < self.epochs):
                 until = epoch + self.anneal
                 self.anneal_from = epoch
                 self.anneal_until = until if self.epochs <= 0 else min(until, self.epochs)
                 self.annealing = {"epoch": epoch, "until": self.anneal_until, "best_epoch": self.top_epoch,
-                                  "best": self.top, "loss_falling": self.falling, "extensions": self.extensions}
+                                  "best": self.top, "rising": self.rising, "extensions": self.extensions}
             else:
                 self.decision = "converged"
         return self.decision
 
-    def step(self, epoch: int, value, loss=None) -> bool:
+    def step(self, epoch: int, value) -> bool:
         """`update`, then its events (`converge_point`, `stop`): True when training stops here."""
-        decision = self.update(epoch, value, loss)
+        decision = self.update(epoch, value)
         if self.point is not None:
             p = self.point
-            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, {self.label} {p['best']}), but the "
-                f"training loss is still falling (mean {p['loss_from']:.3f} -> {p['loss_to']:.3f}): continuing to epoch "
-                f"{p['next_check']} (extension {p['extension']} of {MAX_EXTENSIONS}; Finish now keeps epoch {p['best_epoch']})")
+            log(f"early stop point at epoch {p['epoch']} (best epoch {p['best_epoch']}, {self.label} {p['best']}), but "
+                f"validation is still improving ({self.label} mean {p['value_from']:.4f} -> {p['value_to']:.4f}): "
+                f"continuing to epoch {p['next_check']} (extension {p['extension']} of {MAX_EXTENSIONS}; Finish now "
+                f"keeps epoch {p['best_epoch']})")
             event("converge_point", **p)
         if self.annealing is not None:
             p = self.annealing
@@ -343,17 +347,17 @@ class Convergence:
             why = "no %s gain above %g for %d epochs" % (self.label, self.min_delta, self.patience)
             if self.smooth > 1:
                 why += " (%s averaged over the last %d epochs)" % (self.label, self.smooth)
-            if not self.falling:
-                why += "; training loss no longer falling"
+            if not self.rising:
+                why += "; validation no longer improving"
             elif self.extensions >= MAX_EXTENSIONS:
-                why += "; training loss still falling, but %d extensions used" % MAX_EXTENSIONS
+                why += "; validation still improving, but %d extensions used" % MAX_EXTENSIONS
             else:
-                why += "; training loss still falling, but no epochs left"
+                why += "; validation still improving, but no epochs left"
         else:
             why = "finish requested"
         log(f"stopping after epoch {self.last}: {why}; best epoch {self.top_epoch} ({self.label} {self.top})")
         event("stop", reason=self.decision, epoch=self.last, best_epoch=self.top_epoch, best=self.top,
-              loss_falling=self.falling, extensions=self.extensions, anneal_until=self.anneal_until or None)
+              rising=self.rising, extensions=self.extensions, anneal_until=self.anneal_until or None)
 
 
 def pick_metric(metrics: dict, metric: str):
@@ -801,7 +805,12 @@ def night_augment(x, p_dark: float, p_noise: float, p_gray: float, gen=None):
     Per image, independently: grayscale (BT.601 luma in all channels, like a camera in IR mode)
     with `p_gray`; darkness with `p_dark` (to linear light with gamma 2.2, exposure x0.05..0.4,
     back: an under-exposed night frame, MAET-style); then sensor noise with `p_noise` (shot noise
-    proportional to the signal plus read noise, sigma 0.01..0.05). Returns a new tensor."""
+    proportional to the signal plus read noise, sigma 0.01..0.05). Returns a new tensor.
+
+    Each step computes its branch only when its coin picked an image (`chosen`): the random draws
+    are the same, in the same order, whether or not it does (exposure, then the coin; sigma, the
+    noise, then the coin), so the result and the generator's state are as when every branch was
+    computed and selected with `torch.where`."""
     import torch
 
     single = x.dim() == 3
@@ -810,24 +819,35 @@ def night_augment(x, p_dark: float, p_noise: float, p_gray: float, gen=None):
     b = x.shape[0]
     dev = x.device
 
+    # Drawn on the CPU generator; the decisions are read there (no device sync).
     def coin(p):
-        return (torch.rand(b, 1, 1, 1, generator=gen) < p).to(dev)
+        return torch.rand(b, 1, 1, 1, generator=gen) < p
 
     def unif(lo, hi):
-        return (lo + (hi - lo) * torch.rand(b, 1, 1, 1, generator=gen)).to(dev)
+        return lo + (hi - lo) * torch.rand(b, 1, 1, 1, generator=gen)
+
+    def chosen(mask, branch, y):
+        """`torch.where(mask, branch(), y)`, without `branch()` when no image is picked and
+        without the select when every one is: the same values, and contiguous like `where`'s
+        (the luma is an expanded view, and a strided `pow` rounds differently from a dense one)."""
+        if not bool(mask.any()):
+            return y
+        out = branch()
+        if bool(mask.all()):
+            return out.contiguous()
+        return torch.where(mask.to(dev), out, y)
 
     y = x.clamp(0, 1)
     if p_gray > 0:
-        luma = (0.299 * y[:, 0:1] + 0.587 * y[:, 1:2] + 0.114 * y[:, 2:3]).expand_as(y)
-        y = torch.where(coin(p_gray), luma, y)
+        y = chosen(coin(p_gray), lambda: (0.299 * y[:, 0:1] + 0.587 * y[:, 1:2] + 0.114 * y[:, 2:3]).expand_as(y), y)
     if p_dark > 0:
-        dark = (y.pow(2.2) * unif(0.05, 0.4)).pow(1 / 2.2)
-        y = torch.where(coin(p_dark), dark, y)
+        exposure = unif(0.05, 0.4)
+        y = chosen(coin(p_dark), lambda: (y.pow(2.2) * exposure.to(dev)).pow(1 / 2.2), y)
     if p_noise > 0:
         sigma = unif(0.01, 0.05)
-        noise = torch.randn(y.shape, generator=gen).to(dev)
-        noisy = y + noise * (sigma * y.clamp(min=1e-4).sqrt() * 0.5 + sigma * 0.5)
-        y = torch.where(coin(p_noise), noisy, y)
+        noise = torch.randn(y.shape, generator=gen)
+        y = chosen(coin(p_noise), lambda: y + noise.to(dev) * (sigma.to(dev) * y.clamp(min=1e-4).sqrt() * 0.5
+                                                              + sigma.to(dev) * 0.5), y)
     y = y.clamp(0, 1)
     return y[0] if single else y
 
@@ -1257,7 +1277,8 @@ def cuda_capability(device: str):
 
 def tune_backend(device: str, fixed_size: bool) -> None:
     """CUDA: TF32 matmuls / convolutions on Ampere and newer (compute capability >= 8.0), and
-    cuDNN autotuning when every batch has the same size (`fixed_size`, Ultralytics)."""
+    cuDNN autotuning when every batch has the same size (`fixed_size`: Ultralytics and
+    transformers; not rfdetr, whose multi-scale batches change size)."""
     import torch
 
     cc = cuda_capability(device)
@@ -1906,7 +1927,7 @@ def train_ultralytics(a, device: str, names: list[str], em) -> dict:
         at, value = state.get("selected", (0, None))
         if selection.key == "map" or at != trainer.epoch + 1:
             value = selection.value(tm if selection.key == "map" else m)
-        if conv.step(trainer.epoch + 1, value, loss):
+        if conv.step(trainer.epoch + 1, value):
             trainer.stop = True
 
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
@@ -2280,8 +2301,11 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             class_meter.take()  # this validation's boxes only (not a sanity check's, the training split's)
 
         def on_validation_end(self, trainer, pl_module):
-            # The first training step after the EMA validation is where MPS ran out of memory.
-            free_memory(device)
+            # The first training step after the EMA validation is where MPS ran out of memory. On
+            # CUDA the caching allocator reuses the blocks; emptying it every epoch only costs
+            # the next epoch's allocations (and a gc pass).
+            if device == "mps":
+                free_memory(device)
 
         def on_train_epoch_end(self, trainer, pl_module):
             # Bare `loss`, `loss_cls`, ... are the progress bar's last-step values; the epoch's are `train/...`.
@@ -2307,7 +2331,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
                 sched_steps["per_epoch"] = s - sched_steps["last"]
             sched_steps["last"] = s
             value = selected["value"] if selected.get("epoch") == trainer.current_epoch + 1 else selection.value(m)
-            if not trainer.sanity_checking and conv.step(trainer.current_epoch + 1, value, loss):
+            if not trainer.sanity_checking and conv.step(trainer.current_epoch + 1, value):
                 trainer.should_stop = True
             elif conv.annealing is not None:
                 p = conv.annealing
@@ -2346,6 +2370,11 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
         kw["multi_scale"] = False
     # Per-class AP 50-95 (`val/AP/<name>`) for `map_sup` and the per-class table.
     kw["log_per_class_metrics"] = True
+    # No interval archives (`checkpoint_<epoch>.ckpt`, about 480 MB each for a nano, every 10
+    # epochs by default): an interval past the last epoch never fires. rfdetr 1.11 still writes
+    # `last.ckpt` every epoch (interval != 1) and BestModelCallback the `checkpoint_best_*.pth`
+    # the export and a retry read.
+    kw["checkpoint_interval"] = a.epochs + 1
     if a.workers > 0:
         kw["persistent_workers"] = True
         if device.startswith("cuda"):
@@ -2361,7 +2390,7 @@ def train_rfdetr(a, device: str, names: list[str], em) -> dict:
             raise
         log(f"rfdetr rejected an option ({e}); retrying with the basic options")
         for k in ("seed", "multi_scale", "persistent_workers", "pin_memory", "lr_encoder", "lr_scheduler",
-                  "lr_scheduler_kwargs", "log_per_class_metrics"):
+                  "lr_scheduler_kwargs", "log_per_class_metrics", "checkpoint_interval"):
             kw.pop(k, None)
         model.train(**kw)
     pl.Trainer.__init__ = orig_init
@@ -2682,10 +2711,9 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
                 log(f"detection metrics skipped ({type(e).__name__}: {e})")
                 failed = broke = True
             if epoch >= 1:
-                losses = [h["loss"] for h in self.state.log_history if "loss" in h]
                 value = selection.value(m, epoch, sweep_failed=failed, iou_failed=failed,
                                         classes_failed=broke or class_meter.failed)
-                stop = conv.step(epoch, value, losses[-1] if losses else None)
+                stop = conv.step(epoch, value)
                 if conv.improved:
                     best_state["epoch"], best_state["value"] = conv.top_epoch, conv.top
                     best_state["sd"] = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
@@ -2693,12 +2721,15 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
                 if stop:
                     # Read after this evaluation by the epoch loop (transformers Trainer `train`).
                     self.control.should_training_stop = True
-            free_memory(device)
+            if device == "mps":  # as rfdetr's `on_validation_end`
+                free_memory(device)
             return out
 
     cc = cuda_capability(device)
     bf16 = cc is not None and cc[0] >= 8
-    tune_backend(device, fixed_size=False)
+    # Every batch is imgsz x imgsz (the processor stretches to `proc.size`), so cuDNN's autotuner
+    # picks its convolutions once.
+    tune_backend(device, fixed_size=True)
     # Cosine to 0 unless set: linear (to 0), or cosine to a share of the rate (cosine_with_min_lr,
     # transformers 4.38+).
     sched_kw = {}
