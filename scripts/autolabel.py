@@ -1432,17 +1432,21 @@ class Siglip:
         self.cache[key] = t
         return t
 
-    def rank(self, crop, classes: tuple, night: bool, synonyms: dict) -> dict:
+    def rank(self, crops: list, classes: tuple, night: bool, synonyms: dict) -> list:
+        """The species scores of each crop of `crops` (one frame's animal boxes), in one call: one
+        processor call and one image-tower forward for all of them."""
+        if not crops:
+            return []
         torch = self.torch
         t = self.text_features(classes, night, synonyms)
-        inputs = self.processor(images=crop, return_tensors="pt").to(self.device)
+        inputs = self.processor(images=crops, return_tensors="pt").to(self.device)
         with torch.no_grad():
             f = self.model.get_image_features(**inputs)
         f = getattr(f, "pooler_output", f)
         f = torch.nn.functional.normalize(f, dim=-1)
         logits = (f @ t.T) * self.model.logit_scale.exp() + self.model.logit_bias
-        p = torch.softmax(logits[0], dim=-1).tolist()
-        return {c: round(float(v), 4) for c, v in zip(classes, p)}
+        rows = torch.softmax(logits, dim=-1).tolist()
+        return [{c: round(float(v), 4) for c, v in zip(classes, p)} for p in rows]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1604,17 +1608,19 @@ def main() -> int:
         event("frame", index=i + 1, frames=len(frames), frame=fr.get("frame"), boxes=0, error=str(e))
 
     def finish(i: int, fr: dict, image, per: dict, fused, ms: dict) -> None:
-        """WBF (unless the VLM needed it first), SigLIP, the line in --out and the `frame` event."""
+        """WBF (unless the VLM needed it first), SigLIP (the frame's animal crops in one call), the line
+        in --out and the `frame` event."""
         w, h = image.size
         if fused is None:
             fused = wbf(per, weights, a.wbf_iou, participants)
         night = fr.get("scene") in ("night", "ir")
-        for b in fused:
-            if siglip is not None and b["label"] in animals:
-                t = time.time()
-                crop = image.crop(crop_box(b["bbox"], w, h, 0.1))
-                b["species_scores"] = siglip.rank(crop, animals, night, synonyms)
-                ms["siglip"] = ms.get("siglip", 0) + round((time.time() - t) * 1000)
+        ranked = [b for b in fused if b["label"] in animals] if siglip is not None else []
+        if ranked:
+            t = time.time()
+            crops = [image.crop(crop_box(b["bbox"], w, h, 0.1)) for b in ranked]
+            for b, scores in zip(ranked, siglip.rank(crops, animals, night, synonyms)):
+                b["species_scores"] = scores
+            ms["siglip"] = round((time.time() - t) * 1000)
         totals["boxes"] += len(fused)
         totals["agreed"] += sum(1 for b in fused if b["agree"])
         out.write(json.dumps({"frame": fr["frame"], "width": w, "height": h, "boxes": fused, "ms": ms},
