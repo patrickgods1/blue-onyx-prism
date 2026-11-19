@@ -1,8 +1,10 @@
 //! The Review tab's finger rules (`assets/review-touch.js`): pinch zoom and pan, the two-tap box,
 //! what one finger's drag does, where a tag sits in the zoomed view, which box an overview tap
-//! picks, which corner the overview takes and the quarters of the "Anything missing?" look. The
-//! page applies these answers to its view and boxes (`assets/review.js`), so they are checked here
-//! on exact numbers, in Node.
+//! picks, which corner the overview takes and the quarters of the "Anything missing?" look; and
+//! the editor's rules: which edge or corner of a box a press grabs (`edgeAt`), what the view does
+//! when the selection moves (`nextView`) and a drag of the overview's view rect (`overviewPan`).
+//! The page applies these answers to its view and boxes (`assets/review.js`), so they are checked
+//! here on exact numbers, in Node.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -27,6 +29,9 @@ console.log(JSON.stringify(req.map((r) => {
   if (r.op === 'pickBox') return T.pickBox(r.boxes, r.x, r.y, r.pad);
   if (r.op === 'overviewCorner') return T.overviewCorner(r.current, r.frame, r.size, r.inset, r.keep, r.others);
   if (r.op === 'quarterView') return T.quarterView(r.i, r.w, r.h, r.share);
+  if (r.op === 'edgeAt') return T.edgeAt(r.bbox, r.p, r.grabOut, r.grabIn);
+  if (r.op === 'nextView') return T.nextView(r.o);
+  if (r.op === 'overviewPan') return T.overviewPan(r.view, r.frame, r.delta);
   throw new Error('unknown op ' + r.op);
 })));
 "#;
@@ -78,7 +83,15 @@ fn node(requests: &Value) -> Vec<Value> {
         .clone()
 }
 
-const MAX_ZOOM: f64 = 8.0;
+/// The page's zoom limit (review.js `MAX_ZOOM`), pinned in
+/// `the_pinch_limit_is_the_pages_zoom_limit`.
+const MAX_ZOOM: f64 = 16.0;
+
+#[test]
+fn the_pinch_limit_is_the_pages_zoom_limit() {
+    // Needs no `node`: the limits these tests pass to the pinch are the page's own.
+    assert!(include_str!("../../assets/review.js").contains("var MAX_ZOOM = 16;"));
+}
 
 fn pinch_req(a: [f64; 2], b: [f64; 2], view: [f64; 3], na: [f64; 2], nb: [f64; 2]) -> Value {
     json!({
@@ -226,6 +239,14 @@ fn the_zoom_is_clamped_to_one_and_the_maximum() {
             [100.0, 300.0],
             [500.0, 300.0]
         ),
+        // 6x spread from 2x: 12x, under the maximum, so not clamped.
+        pinch_req(
+            [300.0, 300.0],
+            [320.0, 300.0],
+            [2.0, 10.0, 10.0],
+            [250.0, 300.0],
+            [370.0, 300.0]
+        ),
     ]));
     let top = view_of(&got[0]);
     assert!(close(top[0], MAX_ZOOM), "{top:?}");
@@ -237,6 +258,7 @@ fn the_zoom_is_clamped_to_one_and_the_maximum() {
     assert!(close(before[0], after[0]) && close(before[1], after[1]));
     assert!(close(view_of(&got[1])[0], 1.0), "{:?}", got[1]);
     assert!(close(view_of(&got[2])[0], 3.0), "{:?}", got[2]);
+    assert!(close(view_of(&got[3])[0], 12.0), "{:?}", got[3]);
 }
 
 #[test]
@@ -547,4 +569,335 @@ fn the_page_loads_the_touch_rules_first_and_they_touch_no_page() {
     ] {
         assert!(!js.contains(word), "review-touch.js is pure: {word}");
     }
+}
+
+/// A box 100..200 x 50..250 with a 4 unit band outside each edge and 10 inside.
+const BOX: [f64; 4] = [100.0, 50.0, 200.0, 250.0];
+
+fn edge(bbox: [f64; 4], p: [f64; 2], out: f64, inside: f64) -> Value {
+    json!({ "op": "edgeAt", "bbox": bbox, "p": p, "grabOut": out, "grabIn": inside })
+}
+
+/// Runs `cases` (point, want) on [`BOX`] with bands 4 out and 10 in, naming the point on a miss.
+fn edges_on_box(cases: &[([f64; 2], Value)]) {
+    let got = node(&json!(
+        cases
+            .iter()
+            .map(|(p, _)| edge(BOX, *p, 4.0, 10.0))
+            .collect::<Vec<_>>()
+    ));
+    for ((p, want), g) in cases.iter().zip(&got) {
+        assert_eq!(g, want, "point {p:?}");
+    }
+}
+
+#[test]
+fn a_press_grabs_each_side_and_corner_and_none_inside_or_off_the_box() {
+    if !have_node() {
+        return;
+    }
+    edges_on_box(&[
+        // Sides at their middles, just inside each edge.
+        ([105.0, 150.0], json!("w")),
+        ([195.0, 150.0], json!("e")),
+        ([150.0, 55.0], json!("n")),
+        ([150.0, 245.0], json!("s")),
+        // Corners, inside both bands.
+        ([105.0, 55.0], json!("nw")),
+        ([195.0, 55.0], json!("ne")),
+        ([195.0, 245.0], json!("se")),
+        ([105.0, 245.0], json!("sw")),
+        // Well inside: no edge, a move. Far outside on every side: nothing.
+        ([150.0, 150.0], Value::Null),
+        ([0.0, 150.0], Value::Null),
+        ([300.0, 150.0], Value::Null),
+        ([150.0, 0.0], Value::Null),
+        ([150.0, 400.0], Value::Null),
+        ([0.0, 0.0], Value::Null),
+    ]);
+}
+
+#[test]
+fn the_bands_reach_grab_out_outside_and_grab_in_inside_each_edge() {
+    if !have_node() {
+        return;
+    }
+    edges_on_box(&[
+        // Left edge x 100: the band is 96..110.
+        ([96.0, 150.0], json!("w")),
+        ([95.9, 150.0], Value::Null),
+        ([110.0, 150.0], json!("w")),
+        ([110.1, 150.0], Value::Null),
+        // Right edge x 200: 190..204.
+        ([204.0, 150.0], json!("e")),
+        ([204.1, 150.0], Value::Null),
+        ([190.0, 150.0], json!("e")),
+        ([189.9, 150.0], Value::Null),
+        // Top edge y 50: 46..60.
+        ([150.0, 46.0], json!("n")),
+        ([150.0, 45.9], Value::Null),
+        ([150.0, 60.0], json!("n")),
+        ([150.0, 60.1], Value::Null),
+        // Bottom edge y 250: 240..254.
+        ([150.0, 254.0], json!("s")),
+        ([150.0, 254.1], Value::Null),
+        ([150.0, 240.0], json!("s")),
+        ([150.0, 239.9], Value::Null),
+    ]);
+    // The same point is in or out by which band is wider: 6 outside the left edge needs a
+    // 6 unit outer band, 6 inside it a 6 unit inner one.
+    let got = node(&json!([
+        edge(BOX, [94.0, 150.0], 4.0, 10.0),
+        edge(BOX, [94.0, 150.0], 6.0, 2.0),
+        edge(BOX, [106.0, 150.0], 6.0, 2.0),
+        edge(BOX, [106.0, 150.0], 4.0, 10.0),
+        // No bands at all: only the edge line itself.
+        edge(BOX, [100.0, 150.0], 0.0, 0.0),
+        edge(BOX, [100.5, 150.0], 0.0, 0.0),
+    ]));
+    assert_eq!(
+        got,
+        json!([null, "w", null, "w", "w", null])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
+fn where_bands_cross_a_corner_wins_and_side_bands_end_grab_out_past_the_box() {
+    if !have_node() {
+        return;
+    }
+    edges_on_box(&[
+        // Inside both the left and the top band, anywhere in their crossing (inner corner of
+        // the crossing, outer corner, and mixed): the corner, never a side.
+        ([110.0, 60.0], json!("nw")),
+        ([96.0, 46.0], json!("nw")),
+        ([96.0, 60.0], json!("nw")),
+        ([110.0, 46.0], json!("nw")),
+        // Just past the crossing on one axis: the side only.
+        ([110.1, 55.0], json!("n")),
+        ([105.0, 60.1], json!("w")),
+        ([204.0, 254.0], json!("se")),
+        ([189.9, 254.0], json!("s")),
+        // Beside the left edge, the band runs y 46..254; beyond that, nothing (and a point far
+        // below the box in line with its edge is no grab).
+        ([98.0, 254.0], json!("sw")),
+        ([98.0, 254.1], Value::Null),
+        ([98.0, 45.9], Value::Null),
+        ([105.0, 400.0], Value::Null),
+        ([195.0, 400.0], Value::Null),
+        // Beside the top edge, the band runs x 96..204.
+        ([95.9, 55.0], Value::Null),
+        ([204.1, 55.0], Value::Null),
+        ([400.0, 55.0], Value::Null),
+    ]);
+}
+
+#[test]
+fn on_a_tiny_box_the_nearer_edge_wins_and_a_tie_goes_right_and_down() {
+    if !have_node() {
+        return;
+    }
+    // Bands 4 out and 10 in. On a 6 x 6 box at 100..106 every point from 96 to 110 is in both
+    // opposite bands on both axes (the caller caps grabIn, but the rule must hold either way), so
+    // each axis picks its nearer edge and a press there is always a corner.
+    let tiny = [100.0, 100.0, 106.0, 106.0];
+    // A flat box (100 x 6) and a thin one (6 x 100): one axis has both bands, the other none.
+    let (flat, thin) = ([100.0, 100.0, 200.0, 106.0], [100.0, 100.0, 106.0, 200.0]);
+    let got = node(&json!([
+        edge(tiny, [101.0, 101.0], 4.0, 10.0),
+        edge(tiny, [105.0, 101.0], 4.0, 10.0),
+        edge(tiny, [98.0, 105.0], 4.0, 10.0),
+        edge(tiny, [108.0, 105.0], 4.0, 10.0),
+        // The exact middle on an axis: east across, south up and down.
+        edge(tiny, [103.0, 103.0], 4.0, 10.0),
+        edge(tiny, [103.0, 101.0], 4.0, 10.0),
+        edge(tiny, [101.0, 103.0], 4.0, 10.0),
+        edge(flat, [150.0, 101.0], 4.0, 10.0),
+        edge(flat, [150.0, 105.0], 4.0, 10.0),
+        edge(flat, [150.0, 103.0], 4.0, 10.0),
+        edge(thin, [101.0, 150.0], 4.0, 10.0),
+        edge(thin, [105.0, 150.0], 4.0, 10.0),
+        edge(thin, [103.0, 150.0], 4.0, 10.0),
+        // grabIn capped at a third of the side (2): the bands no longer meet and the middle moves.
+        edge(tiny, [103.0, 103.0], 4.0, 2.0),
+        edge(tiny, [101.0, 103.0], 4.0, 2.0),
+        // A zero-size box with no inner band: a press on it is a tie on both axes, so a drag out
+        // of it grows it right and down; a press beside it takes the side it is on.
+        edge([50.0, 50.0, 50.0, 50.0], [50.0, 50.0], 4.0, 0.0),
+        edge([50.0, 50.0, 50.0, 50.0], [47.0, 47.0], 4.0, 0.0),
+        edge([50.0, 50.0, 50.0, 50.0], [53.0, 50.0], 4.0, 0.0),
+        // A zero-width box with height: on its line east, beside it west, past its top end the
+        // corner.
+        edge([50.0, 50.0, 50.0, 90.0], [50.0, 70.0], 4.0, 0.0),
+        edge([50.0, 50.0, 50.0, 90.0], [49.0, 70.0], 4.0, 0.0),
+        edge([50.0, 50.0, 50.0, 90.0], [50.0, 48.0], 4.0, 0.0),
+    ]));
+    assert_eq!(
+        got,
+        json!([
+            "nw", "ne", "sw", "se", "se", "ne", "sw", "n", "s", "s", "w", "e", "e", null, "w",
+            "se", "nw", "se", "e", "w", "ne"
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[test]
+fn an_edge_needs_finite_numbers_and_takes_the_corners_in_either_order() {
+    if !have_node() {
+        return;
+    }
+    // JSON has no NaN or Infinity: a null, a string and a missing value stand for a value that
+    // is no number. JavaScript reads null as 0 and "4" as 4 in arithmetic, so each case is one
+    // that would grab an edge if the value got through (x0 as 0: the east edge; y as 0: the
+    // north-west corner; grabOut "4": the west edge).
+    let got = node(&json!([
+        { "op": "edgeAt", "bbox": [null, 50, 200, 250], "p": [195, 150], "grabOut": 4, "grabIn": 10 },
+        { "op": "edgeAt", "bbox": [100, 0, 200, 250], "p": [105, null], "grabOut": 4, "grabIn": 10 },
+        { "op": "edgeAt", "bbox": BOX, "p": [105, 150], "grabOut": "4", "grabIn": 10 },
+        { "op": "edgeAt", "bbox": BOX, "p": [105, 150], "grabOut": 4 },
+        { "op": "edgeAt", "bbox": BOX, "p": [105, 150], "grabOut": 4, "grabIn": 10 },
+        // Reversed corners are the same box.
+        edge([200.0, 250.0, 100.0, 50.0], [105.0, 55.0], 4.0, 10.0),
+        edge([200.0, 50.0, 100.0, 250.0], [195.0, 245.0], 4.0, 10.0),
+    ]));
+    assert_eq!(
+        got,
+        json!([null, null, null, null, "w", "nw", "se"])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[test]
+fn the_next_view_over_every_combination() {
+    if !have_node() {
+        return;
+    }
+    let mut req = Vec::new();
+    let mut want = Vec::new();
+    for bits in 0..8u8 {
+        let (follow, custom, same) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+        req.push(json!({ "op": "nextView", "o": {
+            "follow": follow, "custom": custom, "sameBox": same,
+        }}));
+        // The same box keeps the reviewer's view; after a zoom or pan by hand the next box is
+        // framed; else the last Fit / Zoom-to-box choice.
+        want.push(if same {
+            "keep"
+        } else if custom || follow {
+            "box"
+        } else {
+            "fit"
+        });
+    }
+    let got = node(&json!(req));
+    assert_eq!(got, json!(want).as_array().unwrap().clone());
+    // Written out: only no follow, no custom zoom and another box gives the whole frame.
+    assert_eq!(
+        want,
+        ["fit", "box", "box", "box", "keep", "keep", "keep", "keep"]
+    );
+}
+
+fn pan(view: [f64; 3], frame: [f64; 2], delta: [f64; 2]) -> Value {
+    json!({ "op": "overviewPan", "view": { "z": view[0], "ox": view[1], "oy": view[2] },
+            "frame": frame, "delta": delta })
+}
+
+fn offsets(v: &Value) -> [f64; 2] {
+    let o = v.as_object().unwrap();
+    assert_eq!(o.len(), 2, "only ox and oy: {v}");
+    [v["ox"].as_f64().unwrap(), v["oy"].as_f64().unwrap()]
+}
+
+#[test]
+fn an_overview_drag_moves_the_view_and_stays_in_the_frame() {
+    if !have_node() {
+        return;
+    }
+    // A 1000 x 600 frame at 4x shows 250 x 150: the offsets run 0..750 and 0..450.
+    let f = [1000.0, 600.0];
+    let got = node(&json!([
+        pan([4.0, 100.0, 100.0], f, [30.0, -20.0]),
+        // Past each edge: held at it.
+        pan([4.0, 100.0, 100.0], f, [-500.0, 0.0]),
+        pan([4.0, 100.0, 100.0], f, [5000.0, 0.0]),
+        pan([4.0, 100.0, 100.0], f, [0.0, -500.0]),
+        pan([4.0, 100.0, 100.0], f, [0.0, 5000.0]),
+        // Exactly onto the far corner.
+        pan([4.0, 100.0, 100.0], f, [650.0, 350.0]),
+        // A view already outside the frame comes back in, even with no move.
+        pan([4.0, -40.0, 900.0], f, [0.0, 0.0]),
+        // Zoom 1 and just under 1.001 are the whole frame; just over pans a little.
+        pan([1.0, 30.0, 30.0], f, [10.0, 10.0]),
+        pan([1.0009, 0.0, 0.0], f, [10.0, 10.0]),
+        pan([1.25, 0.0, 0.0], f, [100.0, 100.0]),
+        // A tall frame (360 x 640) at 2x: 0..180 across, 0..320 down.
+        pan([2.0, 0.0, 0.0], [360.0, 640.0], [500.0, 500.0]),
+        pan([2.0, 100.0, 100.0], [360.0, 640.0], [50.0, 200.0]),
+    ]));
+    let o: Vec<[f64; 2]> = got.iter().map(offsets).collect();
+    let want = [
+        [130.0, 80.0],
+        [0.0, 100.0],
+        [750.0, 100.0],
+        [100.0, 0.0],
+        [100.0, 450.0],
+        [750.0, 450.0],
+        [0.0, 450.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        // 1000 - 1000 / 1.25 = 200 across, 600 - 480 = 120 down.
+        [100.0, 100.0],
+        [180.0, 320.0],
+        [150.0, 300.0],
+    ];
+    for (i, (g, w)) in o.iter().zip(want).enumerate() {
+        assert!(
+            close(g[0], w[0]) && close(g[1], w[1]),
+            "case {i}: {g:?} want {w:?}"
+        );
+    }
+    // Clamped to 1.25x's limits too, not just its zoom.
+    let got = node(&json!([pan([1.25, 0.0, 0.0], f, [300.0, 300.0])]));
+    let g = offsets(&got[0]);
+    assert!(close(g[0], 200.0) && close(g[1], 120.0), "{g:?}");
+}
+
+#[test]
+fn an_overview_drag_survives_values_that_are_no_numbers() {
+    if !have_node() {
+        return;
+    }
+    let f = json!([1000, 600]);
+    let got = node(&json!([
+        // No zoom or frame: the whole frame.
+        { "op": "overviewPan", "view": { "z": null, "ox": 100, "oy": 100 }, "frame": f, "delta": [10, 10] },
+        { "op": "overviewPan", "view": { "z": 4, "ox": 100, "oy": 100 }, "frame": [null, 600], "delta": [10, 10] },
+        // No delta or offset: that one counts as 0, the rest still applies (a string delta
+        // would otherwise join the offset as text, "100" + "5", and pan to the far edge).
+        { "op": "overviewPan", "view": { "z": 4, "ox": 100, "oy": 100 }, "frame": f, "delta": [null, 10] },
+        { "op": "overviewPan", "view": { "z": 4, "ox": 100, "oy": 100 }, "frame": f, "delta": ["5", 10] },
+        { "op": "overviewPan", "view": { "z": 4, "ox": "x", "oy": 100 }, "frame": f, "delta": [10, 10] },
+        { "op": "overviewPan", "view": { "z": 4, "ox": 100, "oy": 100 }, "frame": f },
+    ]));
+    let o: Vec<[f64; 2]> = got.iter().map(offsets).collect();
+    assert_eq!(
+        o,
+        [
+            [0.0, 0.0],
+            [0.0, 0.0],
+            [100.0, 110.0],
+            [100.0, 110.0],
+            [10.0, 110.0],
+            [100.0, 100.0]
+        ]
+    );
 }

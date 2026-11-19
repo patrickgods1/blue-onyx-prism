@@ -1779,8 +1779,19 @@ mod tests {
             assert!(picker < own, "{uri}");
         }
         let (_, review) = get_text(&state, "/train/review").await;
-        // The finger rules (pinch, two-tap box, one finger's drag) before the page script that
-        // reads them.
+        // The overview's places, the layout switches and no close-up.
+        for needle in [
+            "id=\"rv-side-top\"",
+            "id=\"rv-ov-slot\"",
+            "id=\"rv-side-wide\"",
+            "id=\"rv-ov-layout\"",
+            "data-view=\"ov-layout\"",
+        ] {
+            assert!(review.contains(needle), "{needle}");
+        }
+        assert!(!review.contains("rv-crop"));
+        // The finger rules (pinch, two-tap box, one finger's drag) come before the page script
+        // that reads them.
         let touch = review.find("/static/review-touch.js?v=");
         assert!(
             touch.is_some() && touch < review.find("/static/review.js?v="),

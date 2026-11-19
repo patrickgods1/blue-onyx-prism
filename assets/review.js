@@ -4,7 +4,10 @@
 // Filters (bucket, scene, camera, class, auto, status, source) go to /v1/review/next as query
 // params; they start from the page's own URL (a deep link such as ?auto=overlaps), stay in it, and
 // fold to the one-line summary above the frame, whose "Auto-label these frames" link passes them
-// on. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view.
+// on. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view; its buffer
+// is its CSS size x devicePixelRatio (the frame's size is FW x FH), so the 1 px box lines drawn
+// just outside each box are sharp at any zoom. The overview shows the whole frame and the part in
+// view (two columns: in the side panel under the HUD, or in a corner of the frame, `o`).
 // A job queued on the Auto-label tab is followed on GET /v1/train/jobs?task=<id> (its record only;
 // GET /v1/training on a server without it), every 3 s while the tab shows, and the frames reload
 // when it ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
@@ -40,8 +43,8 @@
 // that frame (and its place) rather than the queue's start; a counts refresh passes `then` = the
 // frame on screen. The next frame's image and labels are fetched ahead (prefetch) and a frame is
 // shown only once its image is decoded. The layout is still from frame to frame (a HUD of fixed
-// slots over a frame box of one size, the side panel's foot pinned, one-column docks of one
-// height): setHud, sizeStage, revealFrame.
+// slots, a frame box of one size, the side panel's foot pinned, one-column docks of one height):
+// setHud, sizeStage, revealFrame.
 // No inline handlers (CSP): everything is wired here; server values come from data-*.
 (function () {
   'use strict';
@@ -71,9 +74,10 @@
   var msg = $('rv-msg');
   var fitBtn = $('rv-fit');
   var zoomText = $('rv-zoom');
-  var cropWrap = $('rv-crop-wrap');
+  var zoomOutBtn = $('rv-zoom-out'), zoomInBtn = $('rv-zoom-in');   // the tool row's - and + (mouse)
   var likelyBar = $('rv-accept-likely');
-  // The HUD over the frame (setHud): one element per value, each in a slot of a fixed size.
+  // The HUD (setHud): one element per value, each in a slot of a fixed size; over the frame on one
+  // column, at the side panel's top on two (placeLayout).
   var hud = root.querySelector('.rv-hud');
   var hudEl = {
     pos: $('rv-hud-pos'), done: $('rv-hud-done'), meter: $('rv-hud-meter'), todo: $('rv-hud-todo'),
@@ -83,8 +87,6 @@
   // The box the frame keeps its place in (one size for every frame; sizeStage on one column).
   var frameBox = canvas.closest('.rv-frame-box');
   var saveBtn = $('rv-save');
-  var cropCanvas = $('rv-crop');
-  var cropCap = $('rv-crop-cap');
   var grid = canvas.closest('.review-grid');
 
   // Per-viewer preferences (browser storage may be off: then the defaults).
@@ -143,10 +145,6 @@
     [side.querySelector('.rv-show-of'), classSel && classSel.closest('label'), side.querySelector(':scope > details')]
       .forEach(function (e) { if (e) opts.appendChild(e); });
     side.appendChild(opts);
-  }
-  // The close-up goes first in the side panel.
-  if (cropWrap && cropWrap.parentNode && cropWrap !== cropWrap.parentNode.firstElementChild) {
-    cropWrap.parentNode.insertBefore(cropWrap, cropWrap.parentNode.firstElementChild);
   }
   // The view-only image setting (`b`), next to Zoom / Fit.
   var imgBtn = $('rv-imgmode');
@@ -210,8 +208,9 @@
     keysDialog.className = 'rv-keys-dialog';
     document.body.appendChild(keysDialog);
   }
-  // One column: the overview over the frame while it is zoomed (the whole frame, the boxes, the
-  // part the frame below shows); an older page gets one made here.
+  // The overview: the whole frame, its boxes and the part the frame shows (placeLayout puts it in
+  // the side panel or a corner of the frame; one column over the frame); an older page gets one
+  // made here.
   var overview = $('rv-overview');
   if (!overview) {
     overview = document.createElement('canvas');
@@ -224,6 +223,9 @@
     else canvas.parentNode.insertBefore(overview, canvas);
   }
   overview.classList.add('rv-overview');
+  // Two columns: the side panel's top holds the HUD and, in the side layout, the overview's slot
+  // (placeLayout).
+  var sideTop = $('rv-side-top'), ovSlot = $('rv-ov-slot');
   var stage = canvas.closest('.review-stage');
   // One column: the selected box's main answers in the bar at the screen's foot while boxes still
   // need a decision (renderDecision); empty and hidden otherwise. A child of the grid, not of the
@@ -270,13 +272,20 @@
   var drawMode = false; // the Draw toggle (touch UI): a finger's drag draws, taps set corners
   var taps = null;      // two-tap box in progress {kind: 'draw' | 'redraw', first: frame point, idx}
   var busy = false;
-  var view = { z: 1, ox: 0, oy: 0, follow: false };   // zoom, the frame point at the canvas's top
-                                                      // left; `follow`: `x` zooms to each box
+  // The view: zoom, the frame point at the canvas's top left; `follow`: Zoom to box (each box is
+  // zoomed to); `custom`: zoomed or panned by hand since (the next box is zoomed to: followTarget).
+  var view = { z: 1, ox: 0, oy: 0, follow: false, custom: false };
+  // The frame's size in frame pixels (box coordinates and the view's units; the canvas's buffer is
+  // its CSS size x devicePixelRatio, syncBuffer). Before the first frame, the canvas's own.
+  var FW = 640, FH = 360;
   var hideBoxes = false;               // `h` held
   var showTags = true;                 // `l` toggles
   var spotlight = pref('spotlight', true);   // `v`: veil the frame and dim the other boxes
-  var wideSide = pref('wide', false);        // a larger close-up (wider side panel)
+  var wideSide = pref('wide', false);        // Wider panel
+  var ovLayout = 'side';                     // the overview on two columns: 'side' panel or 'corner'
+  try { if (window.localStorage.getItem('bop.review.ov-layout') === 'corner') ovLayout = 'corner'; } catch (e) { /* the default */ }
   var hoverIdx = -1;                   // the box under the pointer (its tag shows in full)
+  var hoverEdge = null;                // the selected box's edge under the mouse ('n', 'se', ...)
   var classGrid = false;               // the decision bar's "It's a..." class buttons open
   var dismissedOn = false;             // `i`: this frame's dismissed boxes are shown
   var spaceDown = false;               // Space held: left-drag pans
@@ -321,11 +330,15 @@
     pending: '#e8d000', review: '#ffa000', unlikely: '#ffa000', likely: '#14d6b0', hint: '#f08c00', accepted: '#2e9e4f',
     added: '#1f6fe0', rejected: '#e53935', sugDrop: '#ff3df0', sugKeep: '#00e5ff', ghost: '#b26bff'
   };
-  var MAX_ZOOM = 8;
+  // Up to 16x: a frame pixel 16 CSS px or more wide, sharp (draw), to line a box up with an edge.
+  var MAX_ZOOM = 16;
   // The quarter look's share of the frame's width and height: neighbours overlap by 10%, so an
   // object on a centre line is whole in one quarter.
   var QUARTER_SHARE = 0.55;
-  var HANDLE_CSS = 5;   // half size of a resize handle, CSS pixels
+  var HANDLE_CSS = 5;   // half size of a touch resize handle, CSS pixels
+  var HANDLE_OUT_CSS = 3;   // from a box's edge to a touch handle's square: past the selection's lines
+  var GRAB_CSS = 6;     // mouse: an edge of the selected box takes a press this far outside it
+                        // (and inside, up to a third of the shorter side), CSS pixels (handleAt)
   var CLICK_CSS = 4;    // a pointer that moves less than this is a click
   var TAP_CSS = 10;     // the same for a finger, which is never still
   var TAP_NEAR_CSS = 14; // a tap this close to a box selects it (tiny boxes are smaller than a finger)
@@ -760,7 +773,7 @@
   // What the frame shows for the current suggestion (R.refineFocus), null for none.
   function refineShown() { return cur && refineCur ? R.refineFocus(refineCur.l, boxes()) : null; }
 
-  // The proposed box of the current add / tighten, as a box the drawing and the close-up take.
+  // The proposed box of the current add / tighten, as a box the drawing and the overview take.
   function ghostBox() {
     var f = refineShown();
     if (!f || !f.ghost) return null;
@@ -783,17 +796,15 @@
   }
 
   // Bring the current suggestion up: select its box (nothing for an add) and frame it the way a
-  // selected box is framed (zoomed while following, else panned into view).
+  // selected box is framed (followTarget).
   function focusRefine() {
     var f = refineShown();
     if (!f) return;
-    if (f.mark >= 0) { select(f.mark, true); return; }
+    // A new suggestion on the box already selected frames its own focus (the box and a ghost).
+    if (f.mark >= 0) { select(f.mark, true, false); return; }
     selected = -1;
-    if (oneColumn.matches) view.follow = pref('follow', true);
-    if (f.focus) {
-      var g = { bbox: f.focus };
-      if (view.follow) zoomTo(g); else panTo(g);
-    }
+    hoverEdge = null;
+    if (f.focus) followTarget({ bbox: f.focus }, false);
     refresh();
     revealSelected(true);
   }
@@ -839,9 +850,9 @@
     refineCur = currentRefine();
     if (adjusting() >= 0) {
       select(adjusting(), true);
-      say((card ? card.said_yes : 'Added') + ': ' + (noHover.matches
-        ? 'drag it or its handles to fit, then Accept box.'
-        : 'drag it or its handles to fit, then y (Accept box).') + ' z undoes.');
+      // Handles where handleAt takes them (touchUi), the edges with a mouse; no keys without hover.
+      say((card ? card.said_yes : 'Added') + ': drag it or its ' + (touchUi.matches ? 'handles' : 'edges') +
+        ' to fit, then ' + (noHover.matches ? 'Accept box.' : 'y (Accept box).') + ' z undoes.');
       return;
     }
     if (refineCur) focusRefine();
@@ -892,7 +903,7 @@
       row.appendChild(show);
     }
     if (row.childNodes.length) box.appendChild(row);
-    box.appendChild(el('div', 'muted', (noHover.matches ? 'Drag it or its handles to fit the object, then Accept box' : 'Drag it or its handles to fit the object, then Accept box (y)') +
+    box.appendChild(el('div', 'muted', 'Drag it or its ' + (touchUi.matches ? 'handles' : 'edges') + ' to fit the object, then Accept box' + (noHover.matches ? '' : ' (y)') +
       (rest ? ': the next suggestion follows (' + rest.n + ' left).' : ': no suggestion left on this frame.') + ' z undoes.'));
     if (!rest) box.appendChild(el('div', 'muted', REFINE_MISSES));
     return box;
@@ -1019,7 +1030,7 @@
     return lut;
   }
 
-  // What the frame and the close-up draw: the frame, or a copy of it through the table (made
+  // What the frame and the overview draw: the frame, or a copy of it through the table (made
   // again only when the frame or the setting changes; the saved frame never changes).
   function viewSource() {
     if (!img || !img.complete || !img.naturalWidth) return null;
@@ -1049,21 +1060,22 @@
 
   // ---- view (zoom / pan) --------------------------------------------------------------------
 
-  // Canvas pixels per CSS pixel.
+  // Frame pixels per CSS pixel at zoom 1 (the canvas point of canvasPoint); / view.z: one CSS
+  // pixel in frame pixels at the current zoom.
   function cssScale() {
     var r = canvas.getBoundingClientRect();
-    return r.width ? canvas.width / r.width : 1;
+    return r.width ? FW / r.width : 1;
   }
 
   function clampView() {
     view.z = clamp(view.z, 1, MAX_ZOOM);
     if (view.z < 1.001) { view.z = 1; view.ox = 0; view.oy = 0; return; }
-    view.ox = clamp(view.ox, 0, canvas.width - canvas.width / view.z);
-    view.oy = clamp(view.oy, 0, canvas.height - canvas.height / view.z);
+    view.ox = clamp(view.ox, 0, FW - FW / view.z);
+    view.oy = clamp(view.oy, 0, FH - FH / view.z);
   }
 
   function fit() {
-    view.z = 1; view.ox = 0; view.oy = 0; view.follow = false;
+    view.z = 1; view.ox = 0; view.oy = 0; view.follow = false; view.custom = false;
     quarter = -1;
     draw();
   }
@@ -1081,10 +1093,11 @@
     if (quarter < 0) quarterFollow = view.follow;
     var next = quarter + 1;
     if (next > 3) { endQuarters(); return true; }
-    var r = window.ReviewTouch.quarterView(next, canvas.width, canvas.height, QUARTER_SHARE);
+    var r = window.ReviewTouch.quarterView(next, FW, FH, QUARTER_SHARE);
     quarter = next;
     view.follow = false;
-    view.z = canvas.width / (r[2] - r[0]);
+    view.custom = false;
+    view.z = FW / (r[2] - r[0]);
     view.ox = r[0]; view.oy = r[1];
     clampView();
     refresh();
@@ -1097,6 +1110,7 @@
     if (quarter < 0) return false;
     quarter = -1;
     view.follow = quarterFollow;
+    view.custom = false;
     view.z = 1; view.ox = 0; view.oy = 0;
     refresh();
     if (quarterOpen()) say(missingText());
@@ -1108,7 +1122,7 @@
   // Zoom so the box `b` with a margin fills about 60% of the view, centred on it.
   function zoomTo(b) {
     if (!b) return;
-    var W = canvas.width, H = canvas.height;
+    var W = FW, H = FH;
     var bw = Math.max(MIN_BOX, b.bbox[2] - b.bbox[0]), bh = Math.max(MIN_BOX, b.bbox[3] - b.bbox[1]);
     view.z = clamp(Math.min(W * 0.6 / bw, H * 0.6 / bh), 1, MAX_ZOOM);
     view.ox = (b.bbox[0] + b.bbox[2]) / 2 - W / view.z / 2;
@@ -1117,24 +1131,27 @@
   }
 
   // The one Zoom to box / Fit toggle reads Fit (and fits) while following the selection, or when
-  // there is no box to zoom to; with a mouse also while zoomed (the wheel), as the Fit button it
-  // replaced. On the touch UI a pinch-zoomed frame keeps Zoom to box (the box to come back to).
+  // there is no box to zoom to; with a mouse also while zoomed by hand (the wheel, - / +). On the
+  // touch UI a pinch-zoomed frame keeps Zoom to box (the box to come back to).
   function zoomBoxFits() { return view.follow || !viewTarget() || (!touchUi.matches && view.z > 1); }
 
-  // `x`: zoom to the selected box and keep following the selection (Fit, the wheel or a pan stop it).
-  // With a dataset check suggestion on screen, to what viewTarget frames.
+  // `x`: zoom to the selected box and keep following the selection (until Fit; after the wheel or
+  // a pan the next box is zoomed to again, followTarget). With a dataset check suggestion on
+  // screen, to what viewTarget frames.
   function zoomToSelected() {
     var b = viewTarget();
     if (!b) { say('No box selected: j selects one.'); return false; }
     quarter = -1;
     view.follow = true;
+    view.custom = false;
     zoomTo(b);
     draw();
     return true;
   }
 
   // The viewer's choice (`x`, `f`, the Zoom to box / Fit toggle, View's Fit whole frame): kept
-  // for the next frames (followPref). The wheel, a pinch or a pan only hold this frame's view.
+  // for the next frames (followPref). The wheel, a pinch or a pan make the view custom: the next
+  // box is zoomed to, and that becomes the choice (followTarget).
   function chooseZoom() { if (zoomToSelected()) setFollowPref(true); }
   // During the quarter look Fit ends the look: the whole frame, the preference as it was.
   function chooseFit() {
@@ -1142,20 +1159,31 @@
     setFollowPref(false); fit();
   }
 
-  // Zoom by `factor` keeping the canvas point (cx, cy) on the same frame point.
+  // The view was changed by hand (the wheel, a pinch, a pan, the overview, - / +), after
+  // clampView: zoomed, it is custom (followTarget zooms to the next box); back at the whole frame
+  // it is not, and the viewer's Fit / Zoom to box choice holds again.
+  function byHand() {
+    if (view.z > 1) { view.follow = false; view.custom = true; return; }
+    if (!view.custom) return;
+    view.custom = false;
+    if (quarter < 0) view.follow = followPref();
+  }
+
+  // Zoom by hand by `factor` keeping the canvas point (cx, cy) on the same frame point.
   function zoomAt(cx, cy, factor) {
     var fx = cx / view.z + view.ox, fy = cy / view.z + view.oy;
     view.z = clamp(view.z * factor, 1, MAX_ZOOM);
     view.ox = fx - cx / view.z;
     view.oy = fy - cy / view.z;
     clampView();
+    byHand();
     draw();
   }
 
   // Zoomed: pan so the box `b` is in view (centred when it is not).
   function panTo(b) {
     if (!b || view.z <= 1) return;
-    var vw = canvas.width / view.z, vh = canvas.height / view.z;
+    var vw = FW / view.z, vh = FH / view.z;
     var bb = b.bbox;
     if (bb[0] >= view.ox && bb[2] <= view.ox + vw && bb[1] >= view.oy && bb[3] <= view.oy + vh) return;
     view.ox = (bb[0] + bb[2]) / 2 - vw / 2;
@@ -1163,36 +1191,68 @@
     clampView();
   }
 
+  // The view for a new selection `vt` (viewTarget) on this frame or a new one
+  // (ReviewTouch.nextView): the same box keeps the view (only brought into it); else a custom view
+  // (wheel, pinch, pan, overview) zooms to the box and Zoom to box becomes the choice, else the
+  // choice holds: Zoom to box or the whole frame. No box: the view stays, but a new frame
+  // (`newFrame`, shown whole) after a custom view still makes Zoom to box the choice. The quarter
+  // look holds its own view (following is off until it ends).
+  function followTarget(vt, sameBox, newFrame) {
+    if (!vt) {
+      if (newFrame && view.custom) { view.custom = false; view.follow = true; setFollowPref(true); }
+      return;
+    }
+    if (quarter >= 0) { panTo(vt); return; }
+    var how = window.ReviewTouch.nextView({ follow: view.follow, custom: view.custom, sameBox: sameBox });
+    if (how === 'keep') { panTo(vt); return; }
+    if (how === 'box') {
+      if (view.custom) { view.custom = false; setFollowPref(true); }
+      view.follow = true;
+      zoomTo(vt);
+      return;
+    }
+    view.z = 1; view.ox = 0; view.oy = 0;
+  }
+
+  // DOM writes that change nothing still dirty the style and layout, and every draw runs these
+  // (then reads the layout): each writes only a value that differs.
+  function setText(e, t) { if (e && e.textContent !== t) e.textContent = t; }
+  function setTitle(e, t) { if (e && e.title !== t) e.title = t; }
+  function setHidden(e, h) { if (e && e.hidden !== h) e.hidden = h; }
+  function setClass(e, c, on) { if (e && e.classList.contains(c) !== on) e.classList.toggle(c, on); }
+  function setAttr(e, k, v) { if (e && e.getAttribute(k) !== v) e.setAttribute(k, v); }
+
   function updateViewUi() {
     var zoomed = view.z > 1;
     var sb = viewTarget();
     // One toggle (zoomBoxFits): Fit or Zoom to box.
-    if (fitBtn) fitBtn.hidden = true;
+    setHidden(fitBtn, true);
     if (zoomBoxBtn) {
       var fits = zoomBoxFits();
-      zoomBoxBtn.textContent = fits ? 'Fit' : 'Zoom to box';
-      zoomBoxBtn.title = touchUi.matches ? ''
-        : (fits ? 'Show the whole frame (f)' : 'Zoom to the selected box and follow the selection (x)');
+      setText(zoomBoxBtn, fits ? 'Fit' : 'Zoom to box');
+      setTitle(zoomBoxBtn, touchUi.matches ? ''
+        : (fits ? 'Show the whole frame (f)' : 'Zoom to the selected box and follow the selection (x)'));
       // Its slot stays: shown and hidden in place.
-      zoomBoxBtn.classList.toggle('rv-off', !sb && !zoomed);
+      setClass(zoomBoxBtn, 'rv-off', !sb && !zoomed);
       // Its text names what a click does; no pressed state (a filled "Fit" reads as the main action).
-      zoomBoxBtn.removeAttribute('aria-pressed');
+      if (zoomBoxBtn.hasAttribute('aria-pressed')) zoomBoxBtn.removeAttribute('aria-pressed');
     }
-    if (zoomText) zoomText.textContent = zoomed ? Math.round(view.z * 100) + '%' : '';
+    setText(zoomText, zoomed ? Math.round(view.z * 100) + '%' : '');
+    // - and + stay in their slots; at the end of the range they do nothing, so they say so.
+    var noOut = !cur || !zoomed, noIn = !cur || view.z >= MAX_ZOOM;
+    if (zoomOutBtn && zoomOutBtn.disabled !== noOut) zoomOutBtn.disabled = noOut;
+    if (zoomInBtn && zoomInBtn.disabled !== noIn) zoomInBtn.disabled = noIn;
     // The touch UI has the image setting in the View menu (style.css drops its slot there).
     if (imgBtn) {
-      var il = imgLabel();
-      if (imgBtn.textContent !== il) imgBtn.textContent = il;
-      imgBtn.title = touchUi.matches
+      setText(imgBtn, imgLabel());
+      setTitle(imgBtn, touchUi.matches
         ? 'View only: cycles auto / off / bright / bright + equalised; View has Brighter, Darker and Reset image'
-        : 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets';
+        : 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets');
     }
     touchViewUi();
   }
 
   // ---- drawing ------------------------------------------------------------------------------
-
-  function lineWidth() { return Math.max(2, Math.round(canvas.width / 400)); }
 
   var media = function (q) { return window.matchMedia ? window.matchMedia(q) : { matches: false }; };
   // The one-column page (same width as the stylesheet); small canvas or a finger.
@@ -1201,10 +1261,10 @@
   // No hover: the keys and "the pointer over a box" mean nothing, the answers name the buttons.
   var noHover = media('(hover: none)');
   // Whether the frame follows the selected box (Zoom to box) or shows whole (Fit): the viewer's last
-  // choice, kept per layout (loadFrame takes it again on each frame). One column: the frame below
-  // the overview is the editor, so it follows by default (`follow`); beside the side panel and its
-  // close-up the frame shows whole by default (`follow-wide`).
-  function followPref() { return oneColumn.matches ? pref('follow', true) : pref('follow-wide', false); }
+  // choice, kept per layout (loadFrame takes it again on each frame). The frame is the editor and
+  // the overview shows the whole frame, so both layouts follow by default (`follow` on one column,
+  // `follow-wide` on two).
+  function followPref() { return oneColumn.matches ? pref('follow', true) : pref('follow-wide', true); }
   function setFollowPref(on) { setPref(oneColumn.matches ? 'follow' : 'follow-wide', on); }
   view.follow = followPref();
 
@@ -1213,11 +1273,15 @@
     return Math.min(bb[2] - bb[0], bb[3] - bb[1]) * view.z / cssScale();
   }
 
-  // Half size of a handle in CSS pixels. It follows the box, so a small box keeps its object in
-  // view: a sixth of the shorter side, 2 to 5 px (any pointer; the desktop hit area stays 7 px).
+  // Half size of a touch handle in CSS pixels. It follows the box, so a small box keeps its object
+  // in view: a sixth of the shorter side, 2 to 5 px.
   function handleCss(bb) {
     return clamp(boxSideCss(bb) / 6, 2, HANDLE_CSS);
   }
+
+  // A handle's outward direction, across and down: -1, 0 (a side's middle) or 1.
+  function handleDx(n) { return n.indexOf('w') >= 0 ? -1 : (n.indexOf('e') >= 0 ? 1 : 0); }
+  function handleDy(n) { return n.indexOf('n') >= 0 ? -1 : (n.indexOf('s') >= 0 ? 1 : 0); }
 
   function handlePoints(bb) {
     var cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
@@ -1253,31 +1317,97 @@
   // Spotlight on: a selected box is the only bright one (veil over the frame, the others dim).
   function spotlit() { return spotlight && !!boxes()[selected]; }
 
+  // ---- the canvas buffer --------------------------------------------------------------------
+  // The canvas's CSS size x devicePixelRatio, drawn through the view's transform (draw), so a line
+  // of 1 CSS px is one sharp line at any zoom. Its width is the canvas's device pixel width
+  // (ResizeObserver's devicePixelContentBoxSize where the browser has it, else the CSS width x
+  // devicePixelRatio); its height follows from that width and the frame's ratio, never from the
+  // canvas's CSS height, which style.css takes from the buffer's ratio (so no resize loop).
+  var BUFFER_MAX = 16e6;   // pixels: under every browser's canvas limit (Safari: 16.7M)
+  var devPx = { w: 0, css: 0, dpr: 0 };   // ResizeObserver: the device pixel width at a CSS width
+  function syncBuffer(r) {
+    if (!r.width) return;   // not shown: the buffer waits
+    var dpr = window.devicePixelRatio || 1;
+    var bw = devPx.w && devPx.dpr === dpr && Math.abs(devPx.css - r.width) < 0.01 ? devPx.w : Math.round(r.width * dpr);
+    var bh = Math.round(bw * FH / FW);
+    if (bw * bh > BUFFER_MAX) {
+      bw = Math.floor(bw * Math.sqrt(BUFFER_MAX / (bw * bh)));
+      bh = Math.round(bw * FH / FW);
+    }
+    bw = Math.max(1, bw); bh = Math.max(1, bh);
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+  }
+
+  // What draw() measured for this drawing: device pixels per frame pixel at the zoom (`kx`, `ky`),
+  // device pixels per CSS pixel (`dpr`, the buffer's own) and one CSS pixel in frame pixels (`px`).
+  var dm = { kx: 1, ky: 1, dpr: 1, px: 1 };
+
+  // Frame pixels -> the buffer, through the view.
+  function viewTransform() { ctx.setTransform(dm.kx, 0, 0, dm.ky, -view.ox * dm.kx, -view.oy * dm.ky); }
+
+  // A line `w` CSS px wide around the rect [x0, y0, x1, y1] (frame px), `gap` CSS px outside it,
+  // on whole device pixels: it starts at the first device pixel edge at or outside the rect's
+  // edge, so no line pixel covers a pixel of the box at any zoom (the object's edge stays seen).
+  function strokeOut(x0, y0, x1, y1, gap, w) {
+    var kx = dm.kx, ky = dm.ky;
+    var lw = Math.max(1, Math.round(w * dm.dpr)), o = Math.round(gap * dm.dpr) + lw / 2;
+    var l = Math.floor((x0 - view.ox) * kx + 1e-6) - o, t = Math.floor((y0 - view.oy) * ky + 1e-6) - o;
+    var r = Math.ceil((x1 - view.ox) * kx - 1e-6) + o, b = Math.ceil((y1 - view.oy) * ky - 1e-6) + o;
+    ctx.lineWidth = lw / kx;
+    ctx.strokeRect(l / kx + view.ox, t / ky + view.oy, (r - l) / kx, (b - t) / ky);
+  }
+
+  // The edges `which` ('n', 'se', ...) of the rect [x0, y0, x1, y1] as bands `w` CSS px wide just
+  // outside it, on whole device pixels like strokeOut (the edge a mouse would grab, handleAt).
+  function fillEdges(x0, y0, x1, y1, which, w) {
+    var kx = dm.kx, ky = dm.ky, ox = view.ox, oy = view.oy;
+    var lw = Math.max(1, Math.round(w * dm.dpr));
+    var l = Math.floor((x0 - ox) * kx + 1e-6), t = Math.floor((y0 - oy) * ky + 1e-6);
+    var r = Math.ceil((x1 - ox) * kx - 1e-6), b = Math.ceil((y1 - oy) * ky - 1e-6);
+    if (which.indexOf('n') >= 0) ctx.fillRect((l - lw) / kx + ox, (t - lw) / ky + oy, (r - l + 2 * lw) / kx, lw / ky);
+    if (which.indexOf('s') >= 0) ctx.fillRect((l - lw) / kx + ox, b / ky + oy, (r - l + 2 * lw) / kx, lw / ky);
+    if (which.indexOf('w') >= 0) ctx.fillRect((l - lw) / kx + ox, (t - lw) / ky + oy, lw / kx, (b - t + 2 * lw) / ky);
+    if (which.indexOf('e') >= 0) ctx.fillRect(r / kx + ox, (t - lw) / ky + oy, lw / kx, (b - t + 2 * lw) / ky);
+  }
+
   function draw() {
-    var W = canvas.width, H = canvas.height;
+    var cr = canvas.getBoundingClientRect();
+    syncBuffer(cr);
     clampView();
     updateViewUi();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, W, H);
     var z = view.z;
-    ctx.setTransform(z, 0, 0, z, -view.ox * z, -view.oy * z);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    var cs = cr.width ? FW / cr.width : 1;   // cssScale()
+    var px = dm.px = cs / z;
+    dm.kx = canvas.width / FW * z;
+    dm.ky = canvas.height / FH * z;
+    dm.dpr = cr.width ? canvas.width / cr.width : (window.devicePixelRatio || 1);
+    viewTransform();
+    // Sharp frame pixels once one is 3 CSS px or more on screen: an edge is a clean step to line
+    // a box up with, not a blur.
+    ctx.imageSmoothingEnabled = z / cs < 3;
     var src = viewSource();
-    if (src) ctx.drawImage(src, 0, 0, W, H);
-    drawCrop();
+    if (src) ctx.drawImage(src, 0, 0, FW, FH);
     drawOverview();
     if (!cur || hideBoxes) { drawTapMarker(); return; }
-    var lw = lineWidth() / z;
-    // Tags keep one size on screen at any zoom; on the touch UI they grow with the zoom up to
-    // 11 CSS px (a large frame on a phone has them tiny at zoom 1).
-    var base = Math.max(12, Math.round(W / 70));
-    var fpx = touchUi.matches ? Math.max(base, Math.min(11 * cssScale(), base * z)) : base;
-    var font = fpx / z;
-    var pad = 4 * fpx / base / z;
+    // Tags: 12 CSS px at any zoom and frame size. On the touch UI they start at the shown frame's
+    // width / 70 (a phone's small frame is not covered by them) and grow with the zoom to 12.
+    var tagCss = 12;
+    if (touchUi.matches && cr.width) tagCss = clamp(cr.width / 70 * z, Math.min(12, cr.width / 70), 12);
+    var font = tagCss * px;
+    var pad = tagCss / 3 * px;
     var th = font + pad;
     // The part of the frame in view: tags are placed against it.
-    var vx0 = view.ox, vy0 = view.oy, vx1 = view.ox + W / z, vy1 = view.oy + H / z;
+    var vx0 = view.ox, vy0 = view.oy, vx1 = view.ox + FW / z, vy1 = view.oy + FH / z;
     ctx.font = font + 'px system-ui, sans-serif';
     ctx.textBaseline = 'bottom';
+    // Line patterns in frame px (one CSS px = `px`): dashed (rejected, rejected on save), dotted
+    // (unsure), the dropped box of an overlap suggestion.
+    var DASH = [4 * px, 3 * px], DOT = [px, 1.5 * px], DROP = [3 * px, 2 * px], SOLID = [];
+    // The edge of the selected box a mouse would grab (hover), or the one it drags (resize).
+    var edgeLit = touchUi.matches ? null : (gesture ? (gesture.mode === 'resize' ? gesture.handle : null) : hoverEdge);
     var spot = spotlit();
     var sb = boxes()[selected];
     if (spot) {
@@ -1285,7 +1415,7 @@
       ctx.save();
       ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
       ctx.beginPath();
-      ctx.rect(0, 0, W, H);
+      ctx.rect(0, 0, FW, FH);
       ctx.rect(sb.bbox[0], sb.bbox[1], sb.bbox[2] - sb.bbox[0], sb.bbox[3] - sb.bbox[1]);
       ctx.fill('evenodd');
       ctx.restore();
@@ -1293,7 +1423,7 @@
 
     function drawBox(b, i) {
       var l = look(b);
-      var x = b.bbox[0], y = b.bbox[1], w = b.bbox[2] - b.bbox[0], h = b.bbox[3] - b.bbox[1];
+      var bb = b.bbox, x = bb[0], y = bb[1], w = bb[2] - bb[0], h = bb[3] - bb[1];
       var color = COLORS[l] || '#ffffff';
       var dashed = l === 'rejected' || isHint(b);
       var sel = i === selected;
@@ -1307,55 +1437,55 @@
       // Shown dismissed boxes and the unlikely ones sit back: the eye goes to the likely ones.
       var quiet = isDismissed(b) ? 0.85 : (l === 'unlikely' ? 0.6 : 1);
       ctx.globalAlpha = (l === 'rejected' ? 0.7 : 1) * quiet * (shown ? 1 : 0.2) * (dim ? 0.35 : 1);
+      // Every line lies outside the box (strokeOut): 1 px in the box's colour. The flagged ones
+      // (review, likely) have a 1 px dark line beyond it. The selected box has the dark line and a
+      // 1 px white one beyond that: the dark reads on a bright frame, the white on a dark one, and
+      // no other box has white, so the selection stands out with Spotlight off too. Nothing is
+      // drawn inside a box but a rejected one's cross.
       if (sel) {
         ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = lw * 3.5;
-        ctx.strokeRect(x, y, w, h);
+        strokeOut(bb[0], bb[1], bb[2], bb[3], 0, 3);
       }
-      // Dashed: rejected or rejected on save; dotted: an unsure box.
-      ctx.setLineDash(dashed ? [lw * 4, lw * 3] : (b.difficult ? [lw, lw * 1.5] : []));
-      ctx.lineWidth = (sel ? 2 : 1) * (strong ? 1.5 : 1) * lw;
-      ctx.strokeStyle = color;
-      ctx.strokeRect(x, y, w, h);
-      if (strong) {
-        // A dark inner line: the flagged boxes read as outlined.
-        ctx.setLineDash([]);
-        ctx.lineWidth = lw * 0.6;
+      if (sel || strong) {
         ctx.strokeStyle = '#000000';
-        var inset = (sel ? 2.25 : 1.1) * lw;
-        if (w > 2 * inset && h > 2 * inset) ctx.strokeRect(x + inset, y + inset, w - 2 * inset, h - 2 * inset);
-        ctx.strokeStyle = color;
+        strokeOut(bb[0], bb[1], bb[2], bb[3], 0, 2);
+      }
+      ctx.setLineDash(dashed ? DASH : (b.difficult ? DOT : SOLID));
+      ctx.strokeStyle = color;
+      strokeOut(bb[0], bb[1], bb[2], bb[3], 0, 1);
+      ctx.setLineDash(SOLID);
+      if (sel && edgeLit) {
+        // The edge a mouse would grab (or drags): all three lines white, 3 px.
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#ffffff';
+        fillEdges(bb[0], bb[1], bb[2], bb[3], edgeLit, 3);
       }
       if (role) {
-        // The pair of the suggestion on screen, outside the box: dashed around the box it drops.
-        var o = 2.5 * lw;
-        ctx.setLineDash(role === 'drop' ? [lw * 3, lw * 2] : []);
-        ctx.lineWidth = lw * 1.5;
+        // The pair of the suggestion on screen, a ring outside the box (and its selection lines):
+        // dashed around the box it drops.
+        ctx.setLineDash(role === 'drop' ? DROP : SOLID);
         ctx.strokeStyle = role === 'drop' ? COLORS.sugDrop : COLORS.sugKeep;
-        ctx.strokeRect(x - o, y - o, w + 2 * o, h + 2 * o);
-        ctx.strokeStyle = color;
+        strokeOut(bb[0], bb[1], bb[2], bb[3], 4, 1.5);
+        ctx.setLineDash(SOLID);
       }
       if (rrole) {
-        // Outside the box, in the suggestion's colour: a solid line on a dark one.
-        var ro = 2.5 * lw;
-        ctx.setLineDash([]);
-        ctx.lineWidth = lw * 2.5;
+        // A ring outside the box (and its selection lines) in the suggestion's colour: a solid
+        // line on a dark one.
         ctx.strokeStyle = '#000000';
-        ctx.strokeRect(x - ro, y - ro, w + 2 * ro, h + 2 * ro);
-        ctx.lineWidth = lw * 1.5;
+        strokeOut(bb[0], bb[1], bb[2], bb[3], 3, 3);
         ctx.strokeStyle = COLORS.ghost;
-        ctx.strokeRect(x - ro, y - ro, w + 2 * ro, h + 2 * ro);
-        ctx.strokeStyle = color;
+        strokeOut(bb[0], bb[1], bb[2], bb[3], 4, 1);
       }
       if (l === 'rejected') {
-        ctx.setLineDash(dashed ? [lw * 4, lw * 3] : []);
-        ctx.lineWidth = lw;
+        ctx.setLineDash(dashed ? DASH : SOLID);
+        ctx.lineWidth = px;
+        ctx.strokeStyle = color;
         ctx.beginPath();
         ctx.moveTo(x, y); ctx.lineTo(x + w, y + h);
         ctx.moveTo(x + w, y); ctx.lineTo(x, y + h);
         ctx.stroke();
+        ctx.setLineDash(SOLID);
       }
-      ctx.setLineDash([]);
       // Tags: in full for the selected and the hovered box; none on dimmed boxes; a decided box
       // already checked shows its number only.
       var full = sel || i === hoverIdx;
@@ -1385,21 +1515,19 @@
     if (hb && hoverIdx !== selected && !isOff(hb)) drawBox(hb, hoverIdx);
     if (sb && !isOff(sb)) drawBox(sb, selected);
     // The proposed box of the current dataset check suggestion (add, tighten): dashed in its own
-    // colour over a dark dash, a light fill, its own tag; no box of the frame looks like it.
+    // colour on a dark dash outside it, a light fill, its own tag; no box of the frame looks like it.
     var gb = ghostBox();
     if (gb) {
-      var gx = gb.bbox[0], gy = gb.bbox[1], gw = gb.bbox[2] - gb.bbox[0], gh = gb.bbox[3] - gb.bbox[1];
+      var gbb = gb.bbox, gx = gbb[0], gy = gbb[1], gw = gbb[2] - gbb[0], gh = gbb[3] - gbb[1];
       ctx.save();
       ctx.fillStyle = 'rgba(178, 107, 255, 0.16)';
       ctx.fillRect(gx, gy, gw, gh);
-      ctx.setLineDash([lw * 5, lw * 3]);
-      ctx.lineWidth = lw * 3;
+      ctx.setLineDash([5 * px, 3 * px]);
       ctx.strokeStyle = '#000000';
-      ctx.strokeRect(gx, gy, gw, gh);
-      ctx.lineWidth = lw * 1.75;
+      strokeOut(gbb[0], gbb[1], gbb[2], gbb[3], 0, 3);
       ctx.strokeStyle = COLORS.ghost;
-      ctx.strokeRect(gx, gy, gw, gh);
-      ctx.setLineDash([]);
+      strokeOut(gbb[0], gbb[1], gbb[2], gbb[3], 1, 1);
+      ctx.setLineDash(SOLID);
       if (showTags) {
         var gt = (refineCur.l.kind === 'add' ? 'add? ' : 'tighter? ') + gb.label +
           (gb.score != null ? ' ' + fmtScore(gb.score) : '');
@@ -1413,25 +1541,30 @@
       }
       ctx.restore();
     }
-    if (sb && !(gesture && gesture.mode === 'draw' && gesture.moved)) {
-      var hs = handleCss(sb.bbox) * cssScale() / z;
+    // Touch: the selected box's handles as small hollow squares just outside its corners and
+    // sides (HANDLE_OUT_CSS past the edge), so none sits on its edge; handleAt takes a finger on
+    // the square and around it. A mouse grabs the edges themselves: no squares.
+    if (sb && touchUi.matches && !(gesture && gesture.mode === 'draw' && gesture.moved)) {
+      var hs = handleCss(sb.bbox) * px, ho = HANDLE_OUT_CSS * px + hs;
       ctx.save();
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = '#000000';
-      ctx.lineWidth = 1 / z;
       handlePoints(sb.bbox).forEach(function (p) {
-        ctx.fillRect(p[1] - hs, p[2] - hs, 2 * hs, 2 * hs);
-        ctx.strokeRect(p[1] - hs, p[2] - hs, 2 * hs, 2 * hs);
+        var hx = p[1] + handleDx(p[0]) * ho;
+        var hy = p[2] + handleDy(p[0]) * ho;
+        ctx.lineWidth = 3 * px;
+        ctx.strokeStyle = '#000000';
+        ctx.strokeRect(hx - hs, hy - hs, 2 * hs, 2 * hs);
+        ctx.lineWidth = px;
+        ctx.strokeStyle = '#ffffff';
+        ctx.strokeRect(hx - hs, hy - hs, 2 * hs, 2 * hs);
       });
       ctx.restore();
     }
     if (gesture && gesture.mode === 'draw' && gesture.moved) {
       ctx.save();
-      ctx.lineWidth = lw;
-      ctx.setLineDash([lw * 3, lw * 2]);
+      ctx.setLineDash([3 * px, 2 * px]);
       ctx.strokeStyle = COLORS.added;
       var r = norm(gesture);
-      ctx.strokeRect(r[0], r[1], r[2] - r[0], r[3] - r[1]);
+      strokeOut(r[0], r[1], r[2], r[3], 0, 1);
       ctx.restore();
     }
     drawTapMarker();
@@ -1443,12 +1576,12 @@
 
 
   // The first corner of a two-tap box (Draw, Redraw): a cross in a ring, the same size on screen
-  // at any zoom.
+  // at any zoom (draw's transform and units).
   function drawTapMarker() {
     if (!taps || !taps.first) return;
-    var z = view.z, k = cssScale() / z, p = taps.first, r = 9 * k;
+    var k = dm.px, p = taps.first, r = 9 * k;
     ctx.save();
-    ctx.setTransform(z, 0, 0, z, -view.ox * z, -view.oy * z);
+    viewTransform();
     ctx.lineWidth = 3 * k;
     ctx.strokeStyle = '#000000';
     ctx.beginPath();
@@ -1462,157 +1595,45 @@
     ctx.restore();
   }
 
-  // The close-up: the selected box with a 40% margin, enlarged to the panel's width (a box under
-  // 120 px at least 2x, at most 8x; the view then centres on the box), from the full-size image.
-  // Two columns only: on one column the frame itself is the close-up (it follows the selected box)
-  // and the overview over it shows where that is. Its slot keeps one size (the panel's width, a
-  // height from the window): the crop is centred on black in it, and with no box selected it shows
-  // the whole frame dimmed under "No box selected", so nothing under it moves.
-  var CROP_TAG_FONT = 14, CROP_TAG_PAD = 5, CROP_TAG_H = CROP_TAG_FONT + 2 * CROP_TAG_PAD;   // the tag, CSS px
-  function drawCrop() {
-    if (!cropCanvas) return;
-    if (oneColumn.matches || noneShown) { cropWrap.hidden = true; return; }
-    cropWrap.hidden = false;
-    var aw = Math.max(120, cropWrap.clientWidth || 300);
-    // Its height follows the window (style.css, in `svh`: iOS toolbars coming and going do not
-    // move it), so the decision card and the list stay in view under it.
-    var area = cropCanvas.parentNode;
-    var ah = Math.max(60, Math.round(area.clientHeight || 140));
-    var dpr = window.devicePixelRatio || 1;
-    var PW = Math.max(1, Math.round(aw * dpr)), PH = Math.max(1, Math.round(ah * dpr));
-    if (cropCanvas.width !== PW) cropCanvas.width = PW;
-    if (cropCanvas.height !== PH) cropCanvas.height = PH;
-    var sw0 = aw + 'px', sh0 = ah + 'px';
-    if (cropCanvas.style.width !== sw0) cropCanvas.style.width = sw0;
-    if (cropCanvas.style.height !== sh0) cropCanvas.style.height = sh0;
-    var c = cropCanvas.getContext('2d');
-    c.setTransform(1, 0, 0, 1, 0, 0);
-    c.clearRect(0, 0, PW, PH);
-    c.fillStyle = '#000000';
-    c.fillRect(0, 0, PW, PH);
-    c.imageSmoothingEnabled = true;
-    c.imageSmoothingQuality = 'high';
-    // With no box selected, the proposed box of a dataset check suggestion (an add).
-    var gb = ghostBox();
-    var b = boxes()[selected] || gb;
-    var ready = !!(img && img.complete && img.naturalWidth);
-    if (!b || !ready) {
-      if (ready) {
-        // The whole frame, dimmed, fitted in the slot.
-        var fk = Math.min(PW / img.naturalWidth, PH / img.naturalHeight);
-        var fw = img.naturalWidth * fk, fh = img.naturalHeight * fk;
-        c.globalAlpha = 0.35;
-        c.drawImage(viewSource() || img, (PW - fw) / 2, (PH - fh) / 2, fw, fh);
-        c.globalAlpha = 1;
-      }
-      var text = cur ? 'No box selected' : '';
-      if (text) {
-        c.font = '600 ' + (14 * dpr) + 'px system-ui, sans-serif';
-        c.textAlign = 'center';
-        c.textBaseline = 'middle';
-        c.fillStyle = 'rgba(255, 255, 255, 0.85)';
-        c.fillText(text, PW / 2, PH / 2);
-        c.textAlign = 'start';
-      }
-      cropCap.textContent = text;
-      return;
-    }
-    var W = canvas.width, H = canvas.height;
-    var bw = Math.max(1, b.bbox[2] - b.bbox[0]), bh = Math.max(1, b.bbox[3] - b.bbox[1]);
-    var mw = bw * 1.8, mh = bh * 1.8;
-    var k = 0, o = 2 * dpr, th = CROP_TAG_H * dpr;
-    // The crop in `avail` CSS px of height, from `top0` down: its scale, source and place.
-    function layout(avail, top0) {
-      var scale = Math.min(aw / mw, avail / mh);
-      if (Math.max(bw, bh) < 120) scale = Math.max(scale, 2);
-      scale = Math.min(scale, 8);
-      var cw = Math.min(aw, mw * scale), ch = Math.min(avail, mh * scale);
-      var sw = Math.min(W, cw / scale), sh = Math.min(H, ch / scale);
-      cw = sw * scale; ch = sh * scale;
-      var x0 = clamp((b.bbox[0] + b.bbox[2]) / 2 - sw / 2, 0, W - sw);
-      var y0 = clamp((b.bbox[1] + b.bbox[3]) / 2 - sh / 2, 0, H - sh);
-      var ox = (aw - cw) / 2, oy = top0 + (avail - ch) / 2;
-      k = scale * dpr;
-      // The box's outline (a thin dashed line just outside the box: the object's edges stay
-      // visible), in device pixels of the slot.
-      return {
-        scale: scale, cw: cw, ch: ch, sw: sw, sh: sh, x0: x0, y0: y0, ox: ox, oy: oy,
-        rx: ox * dpr + (b.bbox[0] - x0) * k - o, ry: oy * dpr + (b.bbox[1] - y0) * k - o, rw: bw * k + 2 * o, rh: bh * k + 2 * o
-      };
-    }
-    var L = layout(ah, 0);
-    // The tag never covers the object: when it fits neither above nor below the outline (a box
-    // about as tall as the close-up), the crop gives up a strip at the top for it.
-    if (L.ry - th < 0 && L.ry + L.rh + th > PH) L = layout(Math.max(20, ah - CROP_TAG_H - 2), CROP_TAG_H + 2);
-    var kx = img.naturalWidth / W, ky = img.naturalHeight / H;
-    c.drawImage(viewSource() || img, L.x0 * kx, L.y0 * ky, L.sw * kx, L.sh * ky,
-      L.ox * dpr, L.oy * dpr, L.cw * dpr, L.ch * dpr);
-    c.lineWidth = 1.5 * dpr;
-    c.setLineDash(b.difficult ? [2 * dpr, 3 * dpr] : [5 * dpr, 3 * dpr]);
-    c.strokeStyle = COLORS[look(b)] || '#ffffff';
-    c.strokeRect(L.rx, L.ry, L.rw, L.rh);
-    if (gb && gb !== b && refineRole(selected) === 'tighten') {
-      // A tighter box proposed for the selected one: dashed in the suggestion's colour.
-      c.lineWidth = 2 * dpr;
-      c.setLineDash([6 * dpr, 3 * dpr]);
-      c.strokeStyle = COLORS.ghost;
-      c.strokeRect(L.ox * dpr + (gb.bbox[0] - L.x0) * k, L.oy * dpr + (gb.bbox[1] - L.y0) * k, (gb.bbox[2] - gb.bbox[0]) * k, (gb.bbox[3] - gb.bbox[1]) * k);
-    }
-    c.setLineDash([]);
-    cropTag(c, b, L.rx, L.ry, L.rh, PW, PH, dpr);
-    cropCap.textContent = (b === gb ? 'Proposed box' : 'Box ' + (selected + 1)) + ' (' + b.label + '), ' + Math.round(bw) + ' x ' + Math.round(bh) + ' px, ' +
-      (Math.round(L.scale * 10) / 10) + 'x';
-  }
-
-  // The close-up's tag: the class at a glance (bold), the score, the decision so far (? flagged,
-  // ✓ accepted / drawn, ✗ rejected, ?! unsure) and the labelers' class when they name another
-  // one. Above the outline when there is room, else below it (drawCrop makes room above when
-  // neither fits); kept within the close-up.
-  function cropTag(c, b, rx, ry, rh, pw, ph, dpr) {
-    var l = look(b);
-    var mark = b.difficult ? '?! ' : (markOf(b) || (l === 'accepted' || l === 'added' ? '✓ ' : (l === 'rejected' ? '✗ ' : '')));
-    var main = mark + b.label;
-    var extra = (b.score != null ? ' ' + fmtScore(b.score) : '') +
-      (b.auto_label && b.auto_label !== b.label ? ' · labelers: ' + b.auto_label : '');
-    var fs = CROP_TAG_FONT * dpr, pad = CROP_TAG_PAD * dpr, th = CROP_TAG_H * dpr;
-    var bold = '600 ' + fs + 'px system-ui, sans-serif', thin = (fs * 0.85) + 'px system-ui, sans-serif';
-    c.font = bold;
-    var mw = c.measureText(main).width;
-    c.font = thin;
-    var tw = Math.min(pw, mw + c.measureText(extra).width + 2 * pad);
-    var top;
-    if (ry - th >= 0) top = ry - th;
-    else if (ry + rh + th <= ph) top = ry + rh;
-    else top = Math.max(0, ry);
-    var tx = clamp(rx, 0, Math.max(0, pw - tw));
-    c.fillStyle = COLORS[l] || '#ffffff';
-    c.fillRect(tx, top, tw, th);
-    c.fillStyle = '#000000';
-    c.textBaseline = 'middle';
-    c.font = bold;
-    c.fillText(main, tx + pad, top + th / 2);
-    c.font = thin;
-    c.fillText(extra, tx + pad + mw, top + th / 2);
-  }
-
   // The overview (one column: over the frame while it is zoomed or follows the selection; two
-  // columns: in the frame's top right corner while it is zoomed, style.css): the whole frame
-  // at the overview's CSS width (x devicePixelRatio), every shown box as a thin outline, the
-  // selected one thicker on a white line, and a veil outside the part the frame shows. Held
-  // while a gesture runs: the frame would move under the fingers of a pinch that crossed zoom 1.
+  // columns: with every frame, in the side panel under the HUD or in a corner of the frame,
+  // placeLayout): the whole frame at the overview's CSS size (x devicePixelRatio), every shown box
+  // as a thin outline, the selected one on a dark line, and a veil outside the part the frame
+  // shows. Held while a gesture runs: the frame would move under the fingers of a pinch that
+  // crossed zoom 1.
   var overviewCache = null;   // {img, src, key, w, h, canvas}: the frame at the overview's size
 
-  // Two columns: the overview lies over the zoomed frame, so it takes the corner that leaves the
-  // selected box, its handles and tag (and a proposed or half-drawn box) in sight
+  // The frame's rect in the overview's box, CSS px, or null while it is not laid out: inside its
+  // border (the corner layout has one), and centred when the box is wider or taller than the
+  // frame (style.css caps its height in the side panel, `object-fit: contain`).
+  function ovFrameRect() {
+    var r = overview.getBoundingClientRect();
+    var bl = overview.clientLeft || 0, bt = overview.clientTop || 0;
+    var bw = r.width - 2 * bl, bh = r.height - 2 * bt;
+    if (!(bw > 0) || !(bh > 0)) return null;
+    var w = Math.min(bw, bh * FW / FH), h = w * FH / FW;
+    return { left: r.left + bl + (bw - w) / 2, top: r.top + bt + (bh - h) / 2, width: w, height: h };
+  }
+
+  // The frame point under the pointer event `ev` on the overview (frame rect `fr`).
+  function ovPoint(ev, fr) {
+    return [(ev.clientX - fr.left) * FW / fr.width, (ev.clientY - fr.top) * FH / fr.height];
+  }
+
+  // Corner layout: the overview lies over the frame, so it takes the corner that leaves the
+  // selected box, its grab band and tag (and a proposed or half-drawn box) in sight
   // (ReviewTouch.overviewCorner; it stays put while its corner covers none of them). style.css
-  // places it top right until this runs; one column keeps it in the flow.
+  // places it top right until this runs; the side panel's slot and one column keep it in the flow.
+  // It holds its corner while the pointer is over it or drags its rect: it must not jump away from
+  // the mouse (its pointerleave and the drag's end take the choice up again).
   var ovCorner = 'tr';
   var OV_INSET = 8;   // CSS px from the frame's edges (style.css: 0.5rem)
+  var overOverview = false;   // the pointer is over the overview
   function placeOverview() {
     var st = overview.style;
     // Its containing block: the frame box (style.css), else the stage of an older page.
     var holder = frameBox || stage;
-    if (oneColumn.matches || !holder) {
+    if (oneColumn.matches || !holder || (ovSlot && ovSlot.contains(overview))) {
       if (st.left || st.top) { st.left = ''; st.top = ''; st.right = ''; }
       return;
     }
@@ -1620,22 +1641,23 @@
     var or = overview.getBoundingClientRect();
     if (!cr.width || !cr.height || !or.width) return;
     // Frame point -> CSS px in the shown frame.
-    var k = view.z * cr.width / canvas.width;
+    var k = view.z * cr.width / FW;
     function css(bb, side, top) {
       return [(bb[0] - view.ox) * k - side, (bb[1] - view.oy) * k - top,
         (bb[2] - view.ox) * k + side, (bb[3] - view.oy) * k + side];
     }
     var keep = [], others = [];
+    // The grab band of the selected box's edges (and its lines) on every side, room for a tag above.
+    var margin = GRAB_CSS + 3;
     if (cur && !hideBoxes) {
       var sb = boxes()[selected];
-      // The handles' hit area (HANDLE_CSS + 2) on every side, and room for a tag above.
-      if (sb && !isOff(sb)) keep.push(css(sb.bbox, HANDLE_CSS + 4, 20));
+      if (sb && !isOff(sb)) keep.push(css(sb.bbox, margin, 20));
       var og = ghostBox();
-      if (og) keep.push(css(og.bbox, HANDLE_CSS + 4, 20));
+      if (og) keep.push(css(og.bbox, margin, 20));
       boxes().forEach(function (b, i) { if (i !== selected && isShown(b)) others.push(css(b.bbox, 0, 0)); });
     }
-    if (gesture && gesture.mode === 'draw' && gesture.moved) keep.push(css(norm(gesture), HANDLE_CSS + 4, 20));
-    ovCorner = window.ReviewTouch.overviewCorner(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET, keep, others);
+    if (gesture && gesture.mode === 'draw' && gesture.moved) keep.push(css(norm(gesture), margin, 20));
+    if (!overOverview && !(ovDrag && ovDrag.captured)) ovCorner = window.ReviewTouch.overviewCorner(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET, keep, others);
     var at = window.ReviewTouch.cornerRect(ovCorner, [cr.width, cr.height], [or.width, or.height], OV_INSET);
     // Relative to the frame box's padding box (it is the overview's containing block).
     var left = Math.round(cr.left - sr.left - holder.clientLeft + at[0]) + 'px';
@@ -1648,19 +1670,18 @@
   function drawOverview() {
     if (!overview) return;
     // One column: following keeps it shown when a box too big to zoom on comes up (zoom 1): the
-    // frame and the answers under it stay where they were from one decision to the next. Two
-    // columns: it lies over the frame, so it comes and goes with the zoom alone.
-    // One column before the first frame: shown already when it will be (following), so the frame
-    // does not move down under it when the frame comes.
-    var show = !!((cur || (oneColumn.matches && !noneShown)) && (view.z > 1 || (oneColumn.matches && view.follow)));
+    // frame and the answers under it stay where they were from one decision to the next; before
+    // the first frame it shows already when it will be (following), so the frame does not move
+    // down under it when the frame comes. Two columns: with every frame, in both layouts.
+    var show = oneColumn.matches ? !!((cur || !noneShown) && (view.z > 1 || view.follow)) : !!cur;
     if (gesture) show = !overview.hidden;
     if (overview.hidden === show) overview.hidden = !show;
-    if (stage) stage.classList.toggle('rv-ov-on', show);
     if (!show) return;
     placeOverview();
-    var W = canvas.width, H = canvas.height;
+    var W = FW, H = FH;
     var dpr = window.devicePixelRatio || 1;
-    var cssW = overview.getBoundingClientRect().width || overview.clientWidth || 300;
+    var fr = ovFrameRect();
+    var cssW = fr ? fr.width : (overview.clientWidth || 300);
     var pw = Math.max(1, Math.round(cssW * dpr)), ph = Math.max(1, Math.round(pw * H / W));
     if (overview.width !== pw) overview.width = pw;
     if (overview.height !== ph) overview.height = ph;
@@ -1693,11 +1714,12 @@
         c.strokeRect(b.bbox[0] * k, b.bbox[1] * k, (b.bbox[2] - b.bbox[0]) * k, (b.bbox[3] - b.bbox[1]) * k);
       });
       if (sb && !isOff(sb)) {
+        // Small here: its colour on a dark line, edge precision is the frame's.
         var r = [sb.bbox[0] * k, sb.bbox[1] * k, (sb.bbox[2] - sb.bbox[0]) * k, (sb.bbox[3] - sb.bbox[1]) * k];
-        c.lineWidth = 4.5 * dpr;
-        c.strokeStyle = '#ffffff';
+        c.lineWidth = 3 * dpr;
+        c.strokeStyle = '#000000';
         c.strokeRect(r[0], r[1], r[2], r[3]);
-        c.lineWidth = 2.25 * dpr;
+        c.lineWidth = 1.5 * dpr;
         c.strokeStyle = COLORS[look(sb)] || '#ffffff';
         c.strokeRect(r[0], r[1], r[2], r[3]);
       }
@@ -1722,37 +1744,111 @@
     c.strokeRect(vx, vy, vw, vh);
   }
 
-  // A tap on the overview selects the smallest shown box there (ReviewTouch.pickBox), else moves
-  // the frame's view to centre on that point at the same zoom. A drag stays the page's (scroll).
-  var overviewDown = null;   // {id, x, y}: the primary pointer down on the overview
-  overview.addEventListener('pointerdown', function (ev) {
-    overviewDown = ev.button === 0 ? { id: ev.pointerId, x: ev.clientX, y: ev.clientY } : null;
+  // The wheel's zoom factor (lines and pages as pixels).
+  function wheelFactor(ev) {
+    var dy = ev.deltaY * (ev.deltaMode === 1 ? 16 : (ev.deltaMode === 2 ? 400 : 1));
+    return Math.exp(-dy * 0.0015);
+  }
+
+  // The overview's pointer. A tap selects the smallest shown box there (ReviewTouch.pickBox), else
+  // moves the frame's view to centre on that point at the same zoom. A mouse or a pen drags the
+  // view's rect while zoomed (ReviewTouch.overviewPan): from inside it, as it is; from outside it,
+  // once past TAP_CSS the rect jumps there (centred on the pointer) and the drag goes on. A
+  // finger's drag stays the page's (a scroll on one column). The wheel zooms the frame there.
+  var ovDrag = null;   // the primary pointer down on the overview: {id, x, y, ox, oy, inside, moving, captured}
+  function endOvDrag() {
+    var d = ovDrag;
+    ovDrag = null;
+    if (!d || !d.captured) return;
+    try { if (overview.hasPointerCapture(d.id)) overview.releasePointerCapture(d.id); } catch (e) { /* already gone */ }
+    // The corner held for the drag is chosen again once the pointer is off the overview.
+    if (!overOverview && !overview.hidden) placeOverview();
+  }
+  overview.addEventListener('pointerenter', function () { overOverview = true; });
+  overview.addEventListener('pointerleave', function () {
+    overOverview = false;
+    // A press that is no drag ends here: a tap is let go on the overview.
+    if (ovDrag && !ovDrag.captured) ovDrag = null;
+    if (!ovDrag && !overview.hidden) placeOverview();
   });
-  overview.addEventListener('pointercancel', function () { overviewDown = null; });
+  overview.addEventListener('pointerdown', function (ev) {
+    endOvDrag();
+    if (ev.button !== 0) return;
+    var d = { id: ev.pointerId, x: ev.clientX, y: ev.clientY, ox: view.ox, oy: view.oy, inside: false, moving: false, captured: false };
+    var fr = cur && view.z > 1 && ev.pointerType !== 'touch' ? ovFrameRect() : null;
+    if (fr) {
+      var p = ovPoint(ev, fr);
+      d.inside = p[0] >= view.ox && p[0] <= view.ox + FW / view.z && p[1] >= view.oy && p[1] <= view.oy + FH / view.z;
+      try { overview.setPointerCapture(ev.pointerId); d.captured = true; } catch (e) { /* a tap only */ }
+      // No text selection or image drag while the rect is dragged.
+      ev.preventDefault();
+    }
+    ovDrag = d;
+  });
+  overview.addEventListener('pointermove', function (ev) {
+    var d = ovDrag;
+    if (!d || !d.captured || d.id !== ev.pointerId || !cur) return;
+    var fr = ovFrameRect();
+    if (!fr) return;
+    if (!d.moving) {
+      // From inside the rect a mouse's small move already drags it; from outside a tap is kept.
+      var still = d.inside ? CLICK_CSS : TAP_CSS;
+      if (Math.abs(ev.clientX - d.x) <= still && Math.abs(ev.clientY - d.y) <= still) return;
+      d.moving = true;
+      if (!d.inside) {
+        var p = ovPoint(ev, fr);
+        d.ox = p[0] - FW / view.z / 2; d.oy = p[1] - FH / view.z / 2;
+        d.x = ev.clientX; d.y = ev.clientY;
+      }
+    }
+    var v = window.ReviewTouch.overviewPan({ z: view.z, ox: d.ox, oy: d.oy }, [FW, FH],
+      [(ev.clientX - d.x) * FW / fr.width, (ev.clientY - d.y) * FH / fr.height]);
+    view.ox = v.ox; view.oy = v.oy;
+    byHand();
+    draw();
+  });
   overview.addEventListener('pointerup', function (ev) {
-    var d = overviewDown;
-    overviewDown = null;
-    if (!d || d.id !== ev.pointerId || !cur || overview.hidden) return;
+    var d = ovDrag;
+    if (!d || d.id !== ev.pointerId) return;
+    endOvDrag();
+    if (d.moving || !cur || overview.hidden) return;
     if (Math.abs(ev.clientX - d.x) > TAP_CSS || Math.abs(ev.clientY - d.y) > TAP_CSS) return;
-    var r = overview.getBoundingClientRect();
-    if (!r.width || !r.height) return;
-    var W = canvas.width, H = canvas.height;
-    var x = (ev.clientX - r.left) * W / r.width, y = (ev.clientY - r.top) * H / r.height;
+    var fr = ovFrameRect();
+    if (!fr) return;
+    var p = ovPoint(ev, fr), x = p[0], y = p[1];
     var idx = [], rects = [];
     if (!hideBoxes) {
       boxes().forEach(function (b, i) { if (isShown(b)) { idx.push(i); rects.push(b.bbox); } });
     }
     // A finger on a small overview: a few CSS px of slack around each box.
-    var hit = window.ReviewTouch.pickBox(rects, x, y, 6 * W / r.width);
+    var hit = window.ReviewTouch.pickBox(rects, x, y, 6 * FW / fr.width);
     if (hit >= 0) { select(idx[hit], false); return; }
     // Unzoomed there is nothing to move to, and ending the follow would fold the overview away.
     if (view.z <= 1) return;
-    view.follow = false;
-    view.ox = x - W / view.z / 2;
-    view.oy = y - H / view.z / 2;
+    view.ox = x - FW / view.z / 2;
+    view.oy = y - FH / view.z / 2;
     clampView();
+    byHand();
     draw();
   });
+  overview.addEventListener('pointercancel', function (ev) { if (ovDrag && ovDrag.id === ev.pointerId) endOvDrag(); });
+  overview.addEventListener('lostpointercapture', function (ev) { if (ovDrag && ovDrag.id === ev.pointerId) endOvDrag(); });
+  overview.addEventListener('wheel', function (ev) {
+    // The overview's wheel is the frame's zoom, never the page's scroll.
+    ev.preventDefault();
+    if (!cur || overview.hidden) return;
+    var factor = wheelFactor(ev);
+    if (factor === 1 || (view.z <= 1 && factor < 1)) return;
+    var fr = ovFrameRect();
+    if (!fr) return;
+    var p = ovPoint(ev, fr), vw = FW / view.z, vh = FH / view.z;
+    // About that point: a point outside the part in view is brought to its middle first.
+    if (!(p[0] >= view.ox && p[0] <= view.ox + vw && p[1] >= view.oy && p[1] <= view.oy + vh)) {
+      view.ox = p[0] - vw / 2; view.oy = p[1] - vh / 2;
+      clampView();
+    }
+    zoomAt((p[0] - view.ox) * view.z, (p[1] - view.oy) * view.z, factor);
+  }, { passive: false });
 
   // ---- side panel ---------------------------------------------------------------------------
 
@@ -2252,7 +2348,7 @@
       }
       // (The score has its own slot on the line above.)
       if (b.triage === 'review' && b.why && b.why.length) why.push(b.why.join('; '));
-      // Most verification errors are on small objects: say so (the close-up is at least 2x).
+      // Most verification errors are on small objects: say so (Zoom to box shows them large).
       if (Math.min(b.bbox[2] - b.bbox[0], b.bbox[3] - b.bbox[1]) < 24) why.unshift('small: check closely');
       if (b.difficult) why.unshift('marked unsure: kept out of training, its frame goes to held-out only, ignored by the benchmark');
       if (b.state === 'rejected' && b.reject_reason === 'too_small') why.unshift('too small: a real object, no negative; its frame goes to held-out only, ignored by the benchmark');
@@ -2455,7 +2551,7 @@
         (touchUi.matches ? 'Reject as duplicate or No, reject under the question' : 'u rejects it as a duplicate, r rejects it as wrong') +
         '. Saving with both kept stops flagging the frame.';
     }
-    // The HUD over the frame and the dock show the progress: the card keeps the stack / repeat tools.
+    // The HUD and the dock show the progress: the card keeps the stack / repeat tools.
     if (stackBtn || repeatBtn || lapNote) {
       var line = el('div', 'rv-progress');
       var row = el('div', 'rv-progress-row');
@@ -2588,7 +2684,7 @@
       if (frameBox.style.getPropertyValue('--rv-stage-h')) frameBox.style.removeProperty('--rv-stage-h');
       return;
     }
-    var ar = canvas.width / canvas.height;
+    var ar = FW / FH;
     if (cur && ar > 0 && (!stageAr || ar < stageAr)) {
       stageAr = ar;
       try { window.localStorage.setItem('bop.review.stage-ar', String(Math.round(ar * 1000) / 1000)); } catch (e) { /* not kept */ }
@@ -2634,21 +2730,21 @@
 
   // ---- edits --------------------------------------------------------------------------------
 
-  function select(i, page) {
-    var was = selected;
+  // `sameBox`: whether the selection stays on the same box (default: the same box object; with
+  // none, the same index).
+  function select(i, page, sameBox) {
+    var was = selected, wasBox = boxes()[selected];
     selected = (i >= 0 && i < boxes().length) ? i : -1;
-    // One column: the frame is the editor, so another box is zoomed to again even after a pan, a
-    // pinch or an overview tap ended the follow (those hold the view for the box they were made
-    // on; a page scroll started on the frame pans it). Fit stays the viewer's choice (pref).
-    // The quarter look holds its view (following is off until it ends).
-    if (oneColumn.matches && selected !== was && boxes()[selected] && quarter < 0) view.follow = pref('follow', true);
+    var now = boxes()[selected];
+    var same = sameBox != null ? sameBox : (now ? now === wasBox : selected === was);
+    // The lit edge was the old box's (the next pointer move finds the new one's).
+    if (!same) hoverEdge = null;
     // Touch: the reason chips stay until the selection moves on; Redraw is of the box it started on.
     if (reasonAsk && !reasonAsk.timer && selected !== reasonAsk.sel) clearReason(true);
     if (taps && taps.kind === 'redraw' && selected !== taps.idx) cancelTaps();
-    // The selected box (or a proposed one: viewTarget).
-    var vt = viewTarget();
-    if (view.follow && vt) zoomTo(vt);
-    else panTo(vt);
+    // The selected box (or a proposed one: viewTarget), framed as the viewer chose (followTarget):
+    // another box after a pan, a pinch or the wheel is zoomed to; the same box keeps the view.
+    followTarget(viewTarget(), same);
     refresh();
     revealSelected(page);
   }
@@ -3156,13 +3252,18 @@
     if (!cur || !undo.length) return;
     // The selection goes back with the boxes: to the box the undone step changed.
     var u = JSON.parse(undo.pop());
+    var wasBox = boxes()[selected];
     cur.labels = u.labels;
     lastNudge = null;
     // A suggestion answered in the undone step is back: the view frames it again.
     dups = dupGroups();
     suggestions = liveSuggestions();
     refineCur = currentRefine();
-    select(u.selected, true);
+    // The boxes are new objects: the selection stays on the same box when the restored one is
+    // where the selected one was (a nudge, a resize, a relabel undone keep the view); a box
+    // restored at an index another box had taken is another box (the view follows it).
+    var back = boxes()[u.selected];
+    select(u.selected, true, !!(wasBox && back && selected === u.selected && iou(wasBox.bbox, back.bbox) >= 0.5));
     sayProgress();
   }
 
@@ -3185,14 +3286,14 @@
   }
 
   function moveBox(b, orig, dx, dy) {
-    var W = canvas.width, H = canvas.height;
+    var W = FW, H = FH;
     var w = orig[2] - orig[0], h = orig[3] - orig[1];
     var x0 = clamp(orig[0] + dx, 0, Math.max(0, W - w)), y0 = clamp(orig[1] + dy, 0, Math.max(0, H - h));
     b.bbox = [x0, y0, x0 + w, y0 + h];
   }
 
   function resizeBox(b, orig, handle, dx, dy) {
-    var W = canvas.width, H = canvas.height;
+    var W = FW, H = FH;
     var x0 = orig[0], y0 = orig[1], x1 = orig[2], y1 = orig[3];
     if (handle.indexOf('w') >= 0) x0 = clamp(Math.min(orig[0] + dx, x1 - MIN_BOX), 0, W);
     if (handle.indexOf('e') >= 0) x1 = clamp(Math.max(orig[2] + dx, x0 + MIN_BOX), 0, W);
@@ -3220,33 +3321,47 @@
   //
   // pointerdown starts a gesture:
   //   middle / right button, or Space + left: `pan` (drag moves the view);
-  //   left on a handle of the selected box: `resize`; inside the selected box: `move`;
-  //   left elsewhere: `draw`.
+  //   left on an edge or corner of the selected box (a mouse; a finger: on a handle): `resize`;
+  //   inside the selected box: `move`; left elsewhere: `draw`.
   // A gesture whose pointer moves less than CLICK_CSS is a click on pointerup (select the
-  // smallest box under the point; a click on a handle keeps the selection). A move / resize
-  // takes one undo snapshot when it starts moving.
+  // smallest box under the point; a click on an edge or handle keeps the selection). A move /
+  // resize takes one undo snapshot when it starts moving.
 
+  // The pointer's canvas point: frame pixels at zoom 1 (the buffer's own size does not matter).
   function canvasPoint(ev) {
     var r = canvas.getBoundingClientRect();
-    return [(ev.clientX - r.left) * canvas.width / (r.width || 1), (ev.clientY - r.top) * canvas.height / (r.height || 1)];
+    return [(ev.clientX - r.left) * FW / (r.width || 1), (ev.clientY - r.top) * FH / (r.height || 1)];
   }
 
   function framePoint(ev) {
     var c = canvasPoint(ev);
     var x = c[0] / view.z + view.ox, y = c[1] / view.z + view.oy;
-    return [clamp(x, 0, canvas.width), clamp(y, 0, canvas.height)];
+    return [clamp(x, 0, FW), clamp(y, 0, FH)];
   }
 
+  // What a press at the frame point `p` grabs of the selected box: 'n', 'se', ... or null. A mouse
+  // or a pen takes any edge or corner (ReviewTouch.edgeAt): GRAB_CSS outside it, and inside it up
+  // to a third of the shorter side, so a small box keeps a middle to move it by. A finger takes
+  // the handles (handlePoints): across, `r` either side of the handle's point; outward, the drawn
+  // square (handleOut from the point, draw) with `r` of slack around it; inward, `r` but never past
+  // a third of the shorter side, so the middle third of a box stays a move.
   function handleAt(p) {
     var b = boxes()[selected];
     if (!b) return null;
-    var css = HANDLE_CSS + 2;
-    // A finger needs more room; the middle third of a box stays a move.
-    if (touchUi.matches) css = Math.max(handleCss(b.bbox) + 2, Math.min(12, boxSideCss(b.bbox) / 3));
-    var r = css * cssScale() / view.z;
+    var k = cssScale() / view.z;   // one CSS px in frame px
+    var side = boxSideCss(b.bbox);
+    if (!touchUi.matches) {
+      return window.ReviewTouch.edgeAt(b.bbox, p, GRAB_CSS * k, Math.min(GRAB_CSS, side / 3) * k);
+    }
+    var hs = handleCss(b.bbox);
+    var r = Math.max(hs + 2, Math.min(12, side / 3));
+    var out = (HANDLE_OUT_CSS + hs + r) * k, inner = Math.min(r, side / 3) * k, across = r * k;
+    // Whether `d` (frame px from the point) lies in the handle's band on an axis whose outward
+    // direction is `u` (-1, 1; 0: across).
+    function inBand(d, u) { return u ? d * u <= out && d * u >= -inner : Math.abs(d) <= across; }
     var hit = null;
     handlePoints(b.bbox).forEach(function (h) {
-      if (!hit && Math.abs(p[0] - h[1]) <= r && Math.abs(p[1] - h[2]) <= r) hit = h[0];
+      if (!hit && inBand(p[0] - h[1], handleDx(h[0])) && inBand(p[1] - h[2], handleDy(h[0]))) hit = h[0];
     });
     return hit;
   }
@@ -3288,10 +3403,13 @@
     return best;
   }
 
-  // The hovered box shows its tag in full (also dimmed or checked ones).
-  function setHover(i) {
-    if (i === hoverIdx) return;
+  // The hovered box shows its tag in full (also dimmed or checked ones); the selected box's edge
+  // under the mouse (`edge`, a mouse only) is lit. Drawn again only when either changes.
+  function setHover(i, edge) {
+    edge = edge || null;
+    if (i === hoverIdx && edge === hoverEdge) return;
     hoverIdx = i;
+    hoverEdge = edge;
     draw();
   }
 
@@ -3300,8 +3418,8 @@
     if (spaceDown) { setCursor('grab'); return; }
     if (!cur || hideBoxes || !ev) { setCursor('crosshair'); return; }
     var p = framePoint(ev);
-    setHover(boxAt(p));
     var h = handleAt(p);
+    setHover(boxAt(p), touchUi.matches ? null : h);
     if (h) setCursor(HANDLE_CURSOR[h]);
     else if (insideSelected(p)) setCursor('move');
     else setCursor('crosshair');
@@ -3331,15 +3449,17 @@
       mode: 'pinch', a: a, b: b,
       start: { a: fingers[a], b: fingers[b], view: { z: view.z, ox: view.ox, oy: view.oy } }
     };
-    view.follow = false;
     draw();
   }
 
   function applyPinch() {
     var g = gesture;
     var v = T.pinch(g.start, { a: fingers[g.a], b: fingers[g.b] }, { min: 1, max: MAX_ZOOM });
+    var z0 = view.z, ox0 = view.ox, oy0 = view.oy;
     view.z = v.z; view.ox = v.ox; view.oy = v.oy;
     clampView();
+    // Two fingers down that do not move the view leave it as it was (custom or not).
+    if (view.z !== z0 || view.ox !== ox0 || view.oy !== oy0) byHand();
     draw();
   }
 
@@ -3449,7 +3569,6 @@
     if (ev.button === 1 || ev.button === 2 || (ev.button === 0 && spaceDown)) {
       ev.preventDefault();
       gesture = { mode: 'pan', id: ev.pointerId, cx: ev.clientX, cy: ev.clientY, ox: view.ox, oy: view.oy, moved: false };
-      view.follow = false;
       canvas.setPointerCapture(ev.pointerId);
       setCursor('grabbing');
       return;
@@ -3505,10 +3624,12 @@
     }
     if (g.mode === 'none') return;
     if (g.mode === 'pan') {
-      view.follow = false;
       var k = cssScale() / view.z;
       view.ox = g.ox - (ev.clientX - g.cx) * k;
       view.oy = g.oy - (ev.clientY - g.cy) * k;
+      // The whole frame has nothing to pan: no custom view from it.
+      clampView();
+      if (view.z > 1) byHand();
       draw();
       return;
     }
@@ -3582,15 +3703,15 @@
   canvas.addEventListener('mousedown', function (ev) { if (ev.button === 1) ev.preventDefault(); });
   canvas.addEventListener('auxclick', function (ev) { ev.preventDefault(); });
   canvas.addEventListener('wheel', function (ev) {
-    if (!cur) return;
-    var dy = ev.deltaY * (ev.deltaMode === 1 ? 16 : (ev.deltaMode === 2 ? 400 : 1));
-    var factor = Math.exp(-dy * 0.0015);
-    // Unzoomed, scrolling down scrolls the page.
-    if (view.z <= 1 && factor <= 1) return;
+    // The wheel over the frame is its zoom, never the page's scroll (not even at the whole frame).
     ev.preventDefault();
-    view.follow = false;
+    if (!cur) return;
+    var factor = wheelFactor(ev);
+    if (factor === 1 || (view.z <= 1 && factor < 1)) return;
     var c = canvasPoint(ev);
     zoomAt(c[0], c[1], factor);
+    // The box and edge under the pointer after the zoom (tag, lit edge, cursor).
+    hoverCursor(ev);
   }, { passive: false });
   if (fitBtn) fitBtn.addEventListener('click', function () { fit(); canvas.focus({ preventScroll: true }); });
   if (zoomBoxBtn) {
@@ -3599,6 +3720,10 @@
       canvas.focus({ preventScroll: true });
     });
   }
+  // The tool row's - and + (a mouse; the View menu has them too): about the frame's middle.
+  [[zoomOutBtn, 1 / 1.5], [zoomInBtn, 1.5]].forEach(function (z) {
+    if (z[0]) z[0].addEventListener('click', function () { zoomCentre(z[1]); canvas.focus({ preventScroll: true }); });
+  });
   if (drawBtn) drawBtn.addEventListener('click', function () { setDrawMode(!drawMode); });
   if (redrawBtn) redrawBtn.addEventListener('click', startRedraw);
 
@@ -3613,14 +3738,14 @@
     draw();
   }
   function zoomCentre(factor) {
-    if (!cur) return;
-    view.follow = false;
-    zoomAt(canvas.width / 2, canvas.height / 2, factor);
+    if (!cur || (factor < 1 && view.z <= 1)) return;
+    zoomAt(FW / 2, FH / 2, factor);
   }
   var VIEW_ACTIONS = {
     'zoom-in': function () { zoomCentre(1.5); },
     'zoom-out': function () { zoomCentre(1 / 1.5); },
     fit: chooseFit,
+    'ov-layout': function () { toggleOvLayout(); },
     image: cycleImg,
     hide: function () { hideBoxes = !hideBoxes; draw(); },
     labels: toggleTags,
@@ -3634,6 +3759,7 @@
     'zoom-in': 'Or the wheel, where the pointer is',
     'zoom-out': 'Or the wheel, where the pointer is',
     fit: 'f',
+    'ov-layout': 'o',
     hide: 'Until clicked again; hold h to hide them for a moment',
     labels: 'l',
     spotlight: 'v',
@@ -3673,32 +3799,35 @@
   var canvasLabel = canvas.getAttribute('aria-label') || '';
   var legendHover = $('rv-legend-hover');
   var legendText = legendHover ? legendHover.textContent : '';
+  var viewBtns = null;   // the View menu's items (fixed once the page is built)
   function touchViewUi() {
     var on = touchUi.matches;
     // The touch UI's slots (Draw, Redraw; the image setting goes in View): style.css by `rv-touch`.
-    root.classList.toggle('rv-touch', on);
+    setClass(root, 'rv-touch', on);
     if (drawBtn) {
-      drawBtn.hidden = !on;
-      drawBtn.setAttribute('aria-pressed', drawMode ? 'true' : 'false');
+      setHidden(drawBtn, !on);
+      setAttr(drawBtn, 'aria-pressed', drawMode ? 'true' : 'false');
     }
     if (redrawBtn) {
       // Its slot stays while no box is selected: shown and hidden in place.
-      redrawBtn.hidden = !on;
-      redrawBtn.classList.toggle('rv-off', !boxes()[selected]);
-      redrawBtn.setAttribute('aria-pressed', taps && taps.kind === 'redraw' ? 'true' : 'false');
+      setHidden(redrawBtn, !on);
+      setClass(redrawBtn, 'rv-off', !boxes()[selected]);
+      setAttr(redrawBtn, 'aria-pressed', taps && taps.kind === 'redraw' ? 'true' : 'false');
     }
     if (viewMenu) {
       // Every layout: with a mouse it holds what the view keys do, for whoever does not know them.
-      viewMenu.hidden = false;
-      var pressed = { hide: hideBoxes, labels: showTags, spotlight: spotlight };
-      Array.prototype.forEach.call(viewMenu.querySelectorAll('button[data-view]'), function (b) {
-        var k = b.getAttribute('data-view');
-        if (k in pressed) b.setAttribute('aria-pressed', pressed[k] ? 'true' : 'false');
-        if (k === 'image') b.textContent = imgLabel();
+      setHidden(viewMenu, false);
+      if (!viewBtns) viewBtns = viewMenu.querySelectorAll('button[data-view]');
+      for (var i = 0; i < viewBtns.length; i++) {
+        var b = viewBtns[i], k = b.getAttribute('data-view');
+        if (k === 'hide') setAttr(b, 'aria-pressed', hideBoxes ? 'true' : 'false');
+        else if (k === 'labels') setAttr(b, 'aria-pressed', showTags ? 'true' : 'false');
+        else if (k === 'spotlight') setAttr(b, 'aria-pressed', spotlight ? 'true' : 'false');
+        else if (k === 'image') setText(b, imgLabel());
+        else if (k === 'ov-layout') setText(b, ovLayoutLabel());
         // With a mouse each item names its key (the touch UI has none to name).
-        var tip = on || !VIEW_KEYS ? '' : (VIEW_KEYS[k] || '');
-        if (b.title !== tip) b.title = tip;
-      });
+        setTitle(b, on || !VIEW_KEYS ? '' : (VIEW_KEYS[k] || ''));
+      }
     }
   }
   function touchWords() {
@@ -3711,7 +3840,10 @@
   function touchUiChanged() {
     // Off the touch UI the toggles have no button: they go off.
     if (!touchUi.matches) { drawMode = false; taps = null; }
+    hoverEdge = null;
     if (viewMenu) viewMenu.open = false;
+    // The HUD and the overview go where this layout has them.
+    placeLayout();
     // Each layout keeps its own Zoom to box / Fit choice (after the quarter look, if one is on).
     if (quarter >= 0) quarterFollow = followPref(); else view.follow = followPref();
     touchWords();
@@ -3762,19 +3894,12 @@
   // The frame box's size before the first frame comes (one column): nothing moves when it does.
   sizeStage();
 
-  // "Larger close-up": a wider side panel (per viewer).
-  var wideBtn = $('rv-crop-wide');
-  if (!wideBtn && cropWrap) {
-    wideBtn = button('', function () {}, 'secondary rv-crop-wide');
-    wideBtn.id = 'rv-crop-wide';
-    cropWrap.appendChild(wideBtn);
-  }
+  // Wider panel (Panel options): a wider side panel, so a larger overview and HUD (per viewer).
+  var wideBtn = $('rv-side-wide');
   function applyWide() {
     if (grid) grid.classList.toggle('rv-wide', wideSide);
-    if (wideBtn) {
-      wideBtn.textContent = wideSide ? 'Smaller close-up' : 'Larger close-up';
-      wideBtn.setAttribute('aria-pressed', wideSide ? 'true' : 'false');
-    }
+    // Its text names what a click does.
+    if (wideBtn) wideBtn.textContent = wideSide ? 'Narrower panel' : 'Wider panel';
   }
   if (wideBtn) {
     wideBtn.addEventListener('click', function () {
@@ -3786,11 +3911,110 @@
     });
   }
   applyWide();
-  // The close-up follows the side panel's width.
+
+  // ---- where the HUD and the overview go (two columns) ----
+  // The DOM is the phone layout's (style.css orders it there), so two columns move the nodes and
+  // one column puts them back where the page had them: the HUD to the side panel's top, over the
+  // overview's slot; the overview into that slot (`side`, the default) or over a corner of the
+  // frame (`corner`, placeOverview). `o`, View's item and Panel options switch; kept per viewer
+  // (`ov-layout`).
+  var homeOf = function (node) { return node ? { parent: node.parentNode, next: node.nextSibling } : null; };
+  var hudHome = homeOf(hud), ovHome = homeOf(overview);
+  var ovLayoutBtn = $('rv-ov-layout');
+
+  // What a click on the switch does.
+  function ovLayoutLabel() { return ovLayout === 'side' ? 'Overview in a corner' : 'Overview in the panel'; }
+
+  function goHome(node, home) {
+    if (!node || !home || !home.parent) return;
+    var next = home.next && home.next.parentNode === home.parent ? home.next : null;
+    if (node.parentNode !== home.parent || node.nextSibling !== next) home.parent.insertBefore(node, next);
+  }
+
+  function placeLayout() {
+    var two = !oneColumn.matches && !!sideTop;
+    var inSide = two && ovLayout === 'side' && !!ovSlot;
+    if (hud) {
+      var before = ovSlot && ovSlot.parentNode === sideTop ? ovSlot : null;
+      if (!two) goHome(hud, hudHome);
+      else if (hud.parentNode !== sideTop || hud.nextSibling !== before) sideTop.insertBefore(hud, before);
+    }
+    var wasIn = overview.parentNode;
+    if (inSide) { if (overview.parentNode !== ovSlot) ovSlot.appendChild(overview); }
+    else goHome(overview, ovHome);
+    // A drag of the overview does not survive its move.
+    if (overview.parentNode !== wasIn) endOvDrag();
+    if (ovLayoutBtn && ovLayoutBtn.textContent !== ovLayoutLabel()) ovLayoutBtn.textContent = ovLayoutLabel();
+  }
+
+  // `o`: the overview in the side panel or in a corner of the frame (two columns).
+  function toggleOvLayout() {
+    if (oneColumn.matches) { say('On this narrow screen the overview stays over the frame.'); return; }
+    ovLayout = ovLayout === 'side' ? 'corner' : 'side';
+    try { window.localStorage.setItem('bop.review.ov-layout', ovLayout); } catch (e) { /* not kept */ }
+    placeLayout();
+    say(ovLayout === 'side' ? 'Overview in the side panel (o moves it to a corner of the frame).' : 'Overview in a corner of the frame (o moves it to the side panel).');
+    draw();
+  }
+  if (ovLayoutBtn) ovLayoutBtn.addEventListener('click', function () { toggleOvLayout(); canvas.focus({ preventScroll: true }); });
+  placeLayout();
+
+  // ---- size changes ----
+  // One ResizeObserver for the frame's canvas and the overview: a new size (the window, the panel's
+  // width, the layout, browser zoom; on the canvas the device pixel size too, so a move to a screen
+  // of another devicePixelRatio counts) draws again once, on the next animation frame, where
+  // draw() sizes the buffers (syncBuffer). The canvas's height alone is the buffer's own doing
+  // (its ratio) and draws nothing. A media query on the current devicePixelRatio (made again when
+  // it changes) covers browsers without device pixel sizes.
+  var drawQueued = false;
+  function queuedDraw() { drawQueued = false; draw(); }
+  function queueDraw() {
+    if (drawQueued) return;
+    drawQueued = true;
+    window.requestAnimationFrame(queuedDraw);
+  }
+  var seenSize = { cw: -1, dw: -1, ow: -1, oh: -1 };
+  if (window.ResizeObserver) {
+    var sizes = new window.ResizeObserver(function (entries) {
+      var again = false;
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i], r = e.contentRect;
+        if (e.target === canvas) {
+          var dp = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
+          var dw = dp ? dp.inlineSize : 0;
+          if (dp) { devPx.w = dw; devPx.css = r.width; devPx.dpr = window.devicePixelRatio || 1; }
+          if (r.width !== seenSize.cw || dw !== seenSize.dw) { seenSize.cw = r.width; seenSize.dw = dw; again = true; }
+        } else if (r.width !== seenSize.ow || r.height !== seenSize.oh) {
+          seenSize.ow = r.width; seenSize.oh = r.height; again = true;
+        }
+      }
+      if (again) queueDraw();
+    });
+    try { sizes.observe(canvas, { box: 'device-pixel-content-box' }); } catch (e) { sizes.observe(canvas); }
+    sizes.observe(overview);
+  }
+  var dprQuery = null;
+  function watchDpr() {
+    if (!window.matchMedia) return;
+    if (dprQuery) {
+      if (dprQuery.removeEventListener) dprQuery.removeEventListener('change', dprChanged);
+      else if (dprQuery.removeListener) dprQuery.removeListener(dprChanged);
+    }
+    dprQuery = window.matchMedia('(resolution: ' + (window.devicePixelRatio || 1) + 'dppx)');
+    if (dprQuery.addEventListener) dprQuery.addEventListener('change', dprChanged);
+    else if (dprQuery.addListener) dprQuery.addListener(dprChanged);
+  }
+  function dprChanged() { watchDpr(); queueDraw(); }
+  watchDpr();
+  // One column: the frame box's height follows the window's (sizeStage); the observer draws.
   var resizeTimer = null;
   window.addEventListener('resize', function () {
     if (resizeTimer) clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(function () { resizeTimer = null; sizeStage(); draw(); }, 100);
+    resizeTimer = setTimeout(function () {
+      resizeTimer = null;
+      sizeStage();
+      if (!window.ResizeObserver) draw();
+    }, 100);
   });
 
   // ---- loading and saving -------------------------------------------------------------------
@@ -4027,7 +4251,6 @@
     missingNote.hidden = !on || !missingNote.textContent;
     canvas.hidden = on;
     if (frameBox) frameBox.hidden = on;
-    if (on && cropWrap) cropWrap.hidden = true;
   }
 
   // The folder under review is gone (an unplugged drive): that, not "no frame matches".
@@ -4162,14 +4385,15 @@
       emptyBackup = null; missingAsked = null; quarter = -1; frameStart = Date.now();
       // Asking for these frames means asking to see those boxes.
       dismissedOn = !!filtersForm.elements.auto && filtersForm.elements.auto.value === 'dismissed';
-      canvas.width = j.width || 640;
-      canvas.height = j.height || 360;
-      // The CSS size keeps this ratio inside the frame box (style.css).
-      canvas.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
-      overview.style.setProperty('--rv-ar', String(canvas.width / canvas.height));
+      FW = j.width || 640;
+      FH = j.height || 360;
+      // The CSS size keeps this ratio inside the frame box (style.css); draw sizes the buffer.
+      canvas.style.setProperty('--rv-ar', String(FW / FH));
+      overview.style.setProperty('--rv-ar', String(FW / FH));
       sizeStage();
       view.z = 1; view.ox = 0; view.oy = 0;
-      hoverIdx = -1;
+      hoverIdx = -1; hoverEdge = null;
+      endOvDrag();
       selected = nextUndecided(-1);
       // A suggestion opens on the box it would drop.
       dups = dupGroups();
@@ -4181,11 +4405,11 @@
       refineCur = currentRefine();
       if (refineCur) selected = R.refineFocus(refineCur.l, boxes()).mark;
       var draftNote = restoreDraft(j);
-      // Following is the viewer's choice again (a pinch or the wheel on the last frame stopped it).
+      // The viewer's choice again, and the new frame opens on its first box (or the suggestion's
+      // place) as another box would (followTarget): zoomed to it while following, or after a
+      // custom view on the last frame (wheel, pinch, pan), which makes following the choice.
       view.follow = followPref();
-      // Following (`x`): the new frame opens zoomed on its first box (or the suggestion's place).
-      var opening = viewTarget();
-      if (view.follow && opening) zoomTo(opening);
+      followTarget(viewTarget(), false, true);
       img = got[1];
       if (!img.complete) img.onload = draw;
       showNone(false);
@@ -4722,22 +4946,24 @@
     ['Decide', 'Delete', 'delete a drawn box, reject a model box'],
     ['Decide', 'z', 'undo'],
     ['Decide', 's, Enter', 'save & next; flagged (?) boxes need a decision first, then it asks about boxes not checked yet and "Anything missing?" (Panel options)'],
-    ['Decide', 'drag', 'on a handle: resize; inside the selected box: move; elsewhere: draw a box'],
+    ['Decide', 'drag', 'on an edge or corner of the selected box (it lights up under the pointer): resize; inside it: move; elsewhere: draw a box'],
     ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
     ['Decide', '', 'The next box is the next likely (★) one, then the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
     ['Navigate', 'j / k', 'select the next / previous box'],
     ['Navigate', 'Esc', 'no box selected (during the quarter look: the whole frame first)'],
     ['Navigate', 'n', 'next frame without saving (after Back: the frame you came from)'],
     ['Navigate', 'p', 'back to the previous frame of this session (as saved)'],
-    ['Navigate', 'x', 'zoom to the selected box and follow the selection (the next box, the next frame) until f, the wheel or a pan'],
-    ['Navigate', 'f', 'fit (zoom out)'],
+    ['Navigate', 'x', 'zoom to the selected box and follow the selection (the next box, the next frame) until f'],
+    ['Navigate', 'f', 'fit: the whole frame, for the next boxes and frames too'],
     ['Navigate', 'q', 'while "Anything missing?" asks: zoom to the top-left, top-right, bottom-left and bottom-right quarter in turn, then the whole frame again (small, distant objects are the ones most often missed; drawing works there, s saves)'],
-    ['Navigate', 'wheel', 'zoom about the pointer (up to 8x)'],
+    ['Navigate', 'wheel', 'zoom about the pointer (up to 16x; sharp pixels from 3x on screen); after zooming or panning by hand the next box is zoomed to, and that stays the choice until f'],
     ['Navigate', 'right / middle drag, Space + drag', 'pan'],
+    ['Navigate', 'overview', 'drag the outlined part to pan, the wheel zooms there; click a box to select it, elsewhere to move the view there'],
     ['View', 'b', 'image (view only): auto, off, bright, bright + equalised; auto = bright + equalised on night / IR frames'],
     ['View', '[ / ]', 'image darker / brighter (gamma)'],
     ['View', 'Shift+0', 'image back to auto, gamma 1'],
     ['View', 'v', 'spotlight on / off: the frame dimmed outside the selected box, the other boxes faint'],
+    ['View', 'o', 'the overview of the whole frame: in the side panel under the frame info, or in a corner of the frame (wide screens; kept for your next visits)'],
     ['View', 'h (hold)', 'hide the boxes'],
     ['View', 'l', 'labels on the boxes on / off'],
     ['View', 'i', 'show / put away the hidden boxes of this frame (low-score auto boxes and boxes at spots you rejected, dimmed; accepting one makes it a label)'],
@@ -4848,6 +5074,7 @@
       if (!ev.repeat && !hideBoxes) { hideBoxes = true; draw(); }
     } else if (k === 'l') toggleTags();
     else if (k === 'v') toggleSpotlight();
+    else if (k === 'o') { if (!ev.repeat) toggleOvLayout(); }
     else if (k === 'x') chooseZoom();
     else if (k === 'f') chooseFit();
     else if (k === 'b') cycleImg();

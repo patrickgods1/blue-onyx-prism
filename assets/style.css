@@ -874,8 +874,8 @@ main:has(#review), main:has(> nav.train-tabs > a.active[href="/train/review"]) {
    never paints at one size and jumps to another while the page loads. */
 #review:not(.rv-ready) > .review-grid { visibility: hidden; }
 #review > details.help, #review > details.rv-bulk, #review > details.rv-filters-card { max-width: 75rem; }
-.review-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 380px); gap: 1rem; align-items: start; }
-.review-grid.rv-wide { grid-template-columns: minmax(0, 1fr) minmax(320px, 480px); }
+.review-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); gap: 1rem; align-items: start; }
+.review-grid.rv-wide { grid-template-columns: minmax(0, 1fr) minmax(360px, 520px); }
 /* The side panel stays in view while the page scrolls, at the window's height: its body scrolls
    (the box list scrolls inside it first), its foot (message, actions) is pinned to its bottom. */
 .review-side { position: sticky; top: 0.5rem; height: calc(100vh - 1rem); height: calc(100dvh - 1rem); overflow: hidden; display: flex; flex-direction: column; padding: 0; }
@@ -914,12 +914,14 @@ details.rv-bulk > summary { margin: 0; font-weight: 600; }
 details.rv-bulk[open] > summary { margin-bottom: 0.6rem; }
 details.rv-panel-opts { font-size: 0.9rem; margin-top: 0.3rem; }
 details.rv-panel-opts > summary { margin: 0.2rem 0; font-size: 0.85rem; }
+.rv-panel-btns { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.4rem 0; }
+.rv-panel-btns button.small { margin: 0; }
 details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25rem; color: var(--muted); margin: 0.4rem 0; }
 .rv-actions button { margin: 0; }
 .review-stage { min-width: 0; }
 .review-stage canvas { display: block; width: 100%; height: auto; background: #000; border-radius: 6px; cursor: crosshair; touch-action: none; }
 .review-stage canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* The frame box: one size for every frame (two columns: what the window leaves under the HUD; one
+/* The frame box: one size for every frame (two columns: what the window leaves under the tool row; one
    column: `--rv-stage-h`, set by review.js sizeStage). The frame keeps its ratio inside it (`--rv-ar`,
    set by review.js), top-aligned and centred, so a frame of another ratio letterboxes and nothing
    around it moves. The canvas's CSS box is exactly the frame shown (pointer mapping reads the
@@ -928,13 +930,13 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-frame-box[hidden] { display: none; }
 .rv-canvas-fit { flex: 1 1 0; min-height: 0; container-type: size; }
 .review-stage .rv-canvas-fit > canvas { width: min(100cqw, calc(100cqh * var(--rv-ar, 1.78))); height: auto; margin-inline: auto; }
-/* Two columns: the frame's top left corner stays put (under the HUD's first slot); a frame of
+/* Two columns: the frame's top left corner stays put (under the tool row's first slot); a frame of
    another ratio letterboxes to the right or below. */
 @media (min-width: 901px) { .review-stage .rv-canvas-fit > canvas { margin-inline: 0 auto; } }
 .review-side.card { margin: 0; min-width: 0; }
 .rv-side-body > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; color: var(--muted); }
 .rv-side-body > label.check { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--fg); margin: 0.4rem 0; }
-/* ---- The HUD over the frame: every value in its own fixed slot (review.js setHud) ---- */
+/* ---- The HUD (over the frame on one column, at the top of the side panel on two): every value in its own fixed slot (review.js setHud) ---- */
 .rv-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 0.75rem; }
 .rv-hud { display: grid; grid-template-columns: 6.5rem 9.5rem 6.5rem minmax(0, 8rem) 5rem 6.5rem 6.5rem minmax(0, 9.5rem) 5.5rem; column-gap: 0.5rem; align-items: center; height: 2.5rem; min-width: 0; font-size: 0.88rem; font-variant-numeric: tabular-nums; }
 .rv-slot { display: flex; align-items: center; min-width: 0; height: 100%; overflow: hidden; white-space: nowrap; }
@@ -956,6 +958,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-tools { display: flex; align-items: center; gap: 0.4rem; height: 2.5rem; }
 .rv-tools .rv-slot { flex: none; }
 .rv-tool-zoom { width: 3rem; justify-content: flex-end; }
+.rv-tool-zoomout, .rv-tool-zoomin { width: 2.2rem; }
 .rv-tool-zoombox { width: 7.5rem; }
 .rv-tool-image { width: 11.5rem; }
 .rv-tool-draw { width: 4.5rem; }
@@ -964,7 +967,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-tool-view .rv-view-menu { width: 100%; }
 .rv-tool-view .rv-view-menu > summary { justify-content: center; min-height: 32px; }
 @media (min-width: 901px) {
-  #review:not(.rv-touch) .rv-tool-draw, #review:not(.rv-touch) .rv-tool-redraw, #review.rv-touch .rv-tool-image, #review.rv-touch .rv-tool-zoom { display: none; }
+  #review:not(.rv-touch) .rv-tool-draw, #review:not(.rv-touch) .rv-tool-redraw, #review.rv-touch .rv-tool-image, #review.rv-touch .rv-tool-zoom, #review.rv-touch .rv-tool-zoomout, #review.rv-touch .rv-tool-zoomin { display: none; }
 }
 /* Details: the frame's full facts in a box over the frame, out of the flow. */
 .rv-details { display: none; position: absolute; z-index: 20; left: 0; top: 2.9rem; width: min(48rem, 100%); max-height: 60%; overflow: auto; box-sizing: border-box; padding: 0.6rem 0.8rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); font-size: 0.85rem; }
@@ -973,23 +976,43 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-details-pace { margin-top: 0.3rem; }
 .rv-details-pace:empty { display: none; }
 .review-meta { font-size: 0.85rem; margin: 0 0 0.4rem; overflow-wrap: anywhere; }
-/* Two columns: the HUD and the frame box fill the window; the page lands every frame with the
+/* Two columns: the tool row and the frame box fill the window; the page lands every frame with the
    grid's top at the same place (review.js revealFrame). */
 @media (min-width: 901px) {
   .review-stage { position: relative; display: flex; flex-direction: column; height: calc(100vh - 1rem); height: calc(100dvh - 1rem); container: rv-stage / inline-size; }
   .review-stage:has(#rv-none:not([hidden])) { height: auto; }
-  .rv-head { flex: none; margin-bottom: 0.4rem; }
+  .rv-head { flex: none; display: block; margin-bottom: 0.4rem; }
   .rv-frame-box { flex: 1 1 0; }
-  /* Less room: the session pace moves into Details, then the view buttons get a row of their own. */
-  @container rv-stage (max-width: 1420px) {
-    .rv-hud { grid-template-columns: 6.5rem 9.5rem 6.5rem minmax(0, 8rem) 5rem 6.5rem 6.5rem 0 5.5rem; }
-    .rv-hud-pace { visibility: hidden; }
+  /* The tool row is one fixed-height row at every width (never wraps): Zoom to box and View always
+     stay; the slots give way in order of least use: the - / + buttons (the wheel and View zoom too),
+     then the zoom %, then Image, Draw and Redraw shrink with an ellipsis. */
+  .rv-tools { flex-wrap: nowrap; }
+  .rv-tools .rv-tool-image { flex: 0 1 11.5rem; min-width: 0; }
+  .rv-tools .rv-tool-draw { flex: 0 1 4.5rem; min-width: 0; }
+  .rv-tools .rv-tool-redraw { flex: 0 1 5.5rem; min-width: 0; }
+  @container rv-stage (max-width: 540px) {
+    .rv-tool-zoomout, .rv-tool-zoomin { display: none; }
   }
-  @container rv-stage (max-width: 1180px) {
-    .rv-head { grid-template-columns: minmax(0, 1fr); }
-    .rv-tools { justify-self: end; }
-    .rv-details { top: 5.4rem; }
+  @container rv-stage (max-width: 450px) {
+    .rv-tool-zoom { display: none; }
   }
+  /* The side panel's top: the frame info (review.js moves .rv-hud here) over the overview of the
+     whole frame (#rv-ov-slot, the canvas moved in by review.js in the side layout). Slots keep their
+     size, so a value changes in place. The corner layout leaves the slot empty (no space). */
+  .rv-side-top { flex: none; margin-bottom: 0.4rem; }
+  .rv-side-top .rv-hud { grid-template-columns: 5.2rem minmax(0, 1fr) 5.2rem 5.2rem; grid-template-rows: 1.9rem 1.5rem 1.7rem; grid-template-areas: "pos pos progress progress" "camera scene scene time" "todo pick pace details"; column-gap: 0.4rem; height: auto; margin-bottom: 0.4rem; font-size: 0.82rem; }
+  .rv-side-top .rv-hud-pos { grid-area: pos; font-size: 1.15rem; }
+  .rv-side-top .rv-hud-progress { grid-area: progress; justify-content: flex-end; }
+  .rv-side-top .rv-hud-camera { grid-area: camera; }
+  .rv-side-top .rv-hud-scene { grid-area: scene; }
+  .rv-side-top .rv-hud-time { grid-area: time; justify-content: flex-end; }
+  .rv-side-top .rv-hud-todo { grid-area: todo; }
+  .rv-side-top .rv-hud-pick { grid-area: pick; }
+  .rv-side-top .rv-hud-pace { grid-area: pace; }
+  .rv-side-top .rv-hud-details { grid-area: details; }
+  .rv-ov-slot:empty { display: none; }
+  #rv-ov-slot canvas.rv-overview { display: block; width: 100%; height: auto; aspect-ratio: var(--rv-ar, 1.78); max-height: 30vh; max-height: 30svh; object-fit: contain; background: #000; border-radius: 4px; cursor: pointer; touch-action: manipulation; }
+  #rv-ov-slot canvas.rv-overview[hidden] { display: none; }
 }
 .review-boxes { list-style: none; padding: 0; margin: 0.5rem 0; max-height: 52vh; max-height: 52dvh; overflow-y: auto; }
 .review-boxes li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15rem 0.45rem; align-items: center; padding: 0.35rem 0.45rem; border: 1px solid var(--border); border-radius: 6px; margin: 0 0 0.3rem; cursor: pointer; }
@@ -1139,14 +1162,15 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .review-stage canvas[hidden] { display: none; }
 /* One column, the frame zoomed: the whole frame over it, a tap selects a box or moves the view
    there (review.js drawOverview); a drag scrolls the page. Its height is right before it is drawn. */
-.review-stage canvas.rv-overview { flex: none; width: min(100%, calc(28svh * var(--rv-ar, 1.78))); height: auto; aspect-ratio: var(--rv-ar, 1.78); margin: 0 auto 0.3rem; cursor: pointer; touch-action: manipulation; }
-/* Two columns: the overview lies over a corner of the frame while it is zoomed (review.js
-   drawOverview), out of the flow, so the frame never moves when it comes or goes. This places it
+.review-stage .rv-frame-box > canvas.rv-overview { flex: none; width: min(100%, calc(28svh * var(--rv-ar, 1.78))); height: auto; aspect-ratio: var(--rv-ar, 1.78); margin: 0 auto 0.3rem; cursor: pointer; touch-action: manipulation; }
+/* Two columns, the corner layout (the canvas stays in the frame box; in the side layout review.js
+   moves it into #rv-ov-slot, where this does not apply): the overview lies over a corner of the
+   frame, always shown, out of the flow, so the frame never moves. This places it
    top right; review.js placeOverview then sets `left`/`top` to the corner that leaves the selected
    box in sight. `--rv-cw` is the frame's CSS width (the frame box is the size container), so the
    overview follows the frame's right edge when the frame is narrower than the box. */
 @media (min-width: 901px) {
-  .review-stage canvas.rv-overview {
+  .review-stage .rv-frame-box > canvas.rv-overview {
     --rv-cw: min(100cqw, calc(100cqh * var(--rv-ar, 1.78)));
     position: absolute; z-index: 5; margin: 0;
     top: 0.5rem;
@@ -1166,18 +1190,8 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .rv-view-menu[open] > summary { border-color: var(--accent); }
 .rv-view-items { position: absolute; right: 0; top: calc(100% + 0.25rem); z-index: 30; display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; width: max-content; max-width: calc(100vw - 2rem); padding: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); }
 .rv-view-items button.small { margin: 0; }
-.rv-view-items button[data-view=image] { grid-column: 1 / -1; }
+.rv-view-items button[data-view=image], .rv-view-items button[data-view=ov-layout] { grid-column: 1 / -1; }
 .rv-view-items button[aria-pressed=true] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-.review-crop { margin: 0 0 0.2rem; }
-.review-crop[hidden] { display: none; }
-/* The close-up: always its full size (review.js drawCrop: the crop centred on black in it, or the
-   dimmed frame and "No box selected"), so nothing under it moves from one box to the next. */
-.review-crop .rv-crop-area { height: clamp(140px, 22vh, 240px); height: clamp(140px, 22svh, 240px); background: #000; border-radius: 4px; overflow: hidden; }
-.rv-wide .review-crop .rv-crop-area { height: clamp(140px, 36vh, 340px); height: clamp(140px, 36svh, 340px); }
-.review-crop canvas { display: block; max-width: 100%; background: #000; }
-.review-crop figcaption { display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; height: 1.7rem; font-size: 0.8rem; margin-top: 0.15rem; white-space: nowrap; }
-.review-crop figcaption > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.review-crop button.rv-crop-wide { flex: none; margin: 0; padding: 0 0.45rem; font-size: 0.75rem; }
 .review-boxes li.lk-review { border-color: #ffa000; }
 .review-boxes li.lk-review.sel { box-shadow: 0 0 0 1px #ffa000; }
 .review-boxes li.lk-likely { border-color: var(--likely-fg); }
@@ -1899,10 +1913,10 @@ td.tr-bal-bars { vertical-align: middle; }
   .review-meta-row.rv-tools { order: 2; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0.3rem; height: auto; margin-top: 0.3rem; }
   .rv-tools .rv-slot { width: auto; overflow: visible; }
   /* One column is always the touch UI (review.js touchUi): Draw and Redraw, the image setting in View. */
-  .rv-tools .rv-tool-image, .rv-tools .rv-tool-zoom { display: none; }
+  .rv-tools .rv-tool-image, .rv-tools .rv-tool-zoom, .rv-tools .rv-tool-zoomout, .rv-tools .rv-tool-zoomin { display: none; }
+  .rv-side-top, #rv-side-wide, #rv-ov-layout, .rv-view-items button[data-view=ov-layout] { display: none; }
   .rv-tools button.small, .rv-tools .rv-view-menu > summary { min-height: 44px; padding: 0.1rem 0.5rem; justify-content: center; }
   .review-side.card { padding: 0.4rem 0.6rem 0; }
-  .review-side #rv-crop-wrap { order: 1; }
   .rv-actions { display: contents; }
   /* Back, Skip, Next, Undo: a row stuck right over the dock (`--rv-dock-h`, the dock's one height),
      the same in both of its modes; its fifth cell holds Save & next while the dock holds the answers
@@ -1987,7 +2001,6 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-q-reason button.small { flex: none; padding: 0 0.6rem; font-size: 0.85rem; }
   .rv-q-spot button.small, .rv-q-dup button.small { font-size: 0.85rem; padding: 0 0.6rem; }
   .rv-q-classes { gap: 0.35rem; }
-  .review-crop figcaption .rv-crop-wide { display: none; }
   .review-boxes li.compact { min-height: 44px; }
   .rv-chip { white-space: normal; }
 }
@@ -2007,7 +2020,6 @@ td.tr-bal-bars { vertical-align: middle; }
   .review-side.card { border: 0; background: none; padding: 0; border-radius: 0; }
   .rv-actions-main, .rv-actions-more { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
   .review-grid > .rv-decide-bar { margin-left: calc(-1 * var(--main-px, 1rem)); margin-right: calc(-1 * var(--main-px, 1rem)); padding-left: max(0.6rem, env(safe-area-inset-left)); padding-right: max(0.6rem, env(safe-area-inset-right)); }
-  .review-crop figcaption { display: none; }
   .rv-decide { margin: 0.3rem 0; }
   .rv-decide > .rv-card { padding: 0.4rem 0.5rem; background: var(--card); }
 }
