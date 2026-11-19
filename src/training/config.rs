@@ -102,8 +102,9 @@ pub struct TrainingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<super::dataset::Balance>,
     /// Data loader worker processes of every run; None = automatic (all cores but one, at most 8,
-    /// on Windows fewer when the free commit cannot hold them: [`super::workers_for`]). 0 loads
-    /// the data in the training process (slower, needs the least memory).
+    /// on Windows fewer when the commit or the available RAM cannot hold them:
+    /// [`super::workers_for`]). 0 loads the data in the training process (slower, needs the
+    /// least memory).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<u32>,
     /// Devices the benchmark at the end of a run uses, one after the other (canonical specs:

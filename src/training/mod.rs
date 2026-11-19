@@ -193,11 +193,34 @@ pub fn check_public_download(root: &Path, allowed: bool) -> Result<()> {
 pub const MAX_AUTO_WORKERS: u32 = 8;
 /// Commit one data loader worker takes on Windows: each is a spawned Python that imports PyTorch
 /// (measured ~0.9 GB commit for `import torch` alone), plus its prefetched batches (measured
-/// ~1.4 GB per spawned worker during an RF-DETR nano run).
+/// ~1.4 GB per spawned worker during an RF-DETR nano run; re-measured 1.43 GB per worker process
+/// on a GTX 1070 Ti / i5-8600K box, RF-DETR nano 384, batch 8).
 pub const WORKER_COMMIT_BYTES: u64 = 1400 << 20;
 /// Commit kept free for the training process itself (model, optimizer, CUDA context, pinned
-/// memory) before any worker is counted (measured 5.5 GB for the RF-DETR nano trainer process).
-pub const MAIN_COMMIT_RESERVE_BYTES: u64 = 6 << 30;
+/// memory) before any worker is counted: measured 8.0 GB private commit for the RF-DETR nano 384,
+/// batch 8 trainer process on a GTX 1070 Ti / i5-8600K box (5.5 GB in an earlier, smaller run).
+pub const MAIN_COMMIT_RESERVE_BYTES: u64 = 8 << 30;
+/// RAM the training process itself keeps in its working set on Windows (measured ~2.6 GB for the
+/// same RF-DETR nano 384, batch 8 trainer); the rest of its commit may sit in the paging file.
+pub const MAIN_RAM_BYTES: u64 = (26 << 30) / 10;
+/// Available RAM kept after the trainer and its workers: below that the measured box paged in
+/// 2.8k pages/s with 2 workers (2.06 GB left) and 12k/s with 4 (0.87 GB left, then out of memory).
+pub const RAM_RESERVE_BYTES: u64 = 2 << 30;
+/// RAM one data loader worker process keeps in its working set on Windows (measured ~0.75 GB per
+/// spawned worker, RF-DETR nano 384, batch 8).
+pub const WORKER_RAM_BYTES: u64 = (3 << 30) / 4;
+
+/// What [`workers_for`] reads of the host's memory (Windows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerMemory {
+    /// The commit limit and what is free of it now.
+    pub commit: Commit,
+    /// Bytes the paging files can still grow by ([`crate::system_info::paging_growth`]; 0 for a
+    /// fixed paging file, a full disk or a failed read).
+    pub growable: u64,
+    /// Physical RAM available now (`ullAvailPhys`); None when it was not read (no RAM bound).
+    pub ram_available: Option<u64>,
+}
 
 /// Worker processes alive at once per `--workers` of `trainer`, read from the pinned packages:
 /// - RF-DETR (rfdetr 1.11.2, `training/module_data.py` `train_dataloader` and `val_dataloader`):
@@ -225,25 +248,52 @@ pub struct WorkerChoice {
     pub by_cores: u32,
     /// The commit seen when choosing (Windows only).
     pub commit: Option<Commit>,
+    /// Bytes the paging files could still grow by then (0 without a commit reading).
+    pub growable: u64,
+    /// What the commit (free + growable) allows (Windows only).
+    pub by_commit: Option<u32>,
+    /// Physical RAM available then (Windows only).
+    pub ram_available: Option<u64>,
+    /// What the available RAM allows (Windows only).
+    pub by_ram: Option<u32>,
 }
 
 impl WorkerChoice {
-    /// The log line: "memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers (cores
-    /// allow 5)".
+    /// The log line: "memory: commit 23.3 GB limit (can grow to 38.3 GB), 5.4 GB free, RAM 7.6 GB
+    /// free -> 2 data loader workers (cores allow 5, commit 4, RAM 2)"; without growth no
+    /// "(can grow ...)", without a RAM reading no RAM parts.
     pub fn describe(&self) -> String {
         let n = workers_text(self.workers);
-        match self.commit {
-            Some(c) => format!(
-                "memory: commit {:.1} GB limit, {:.1} GB free -> {n} (cores allow {})",
-                gib(c.limit),
-                gib(c.available),
-                self.by_cores
-            ),
-            None => format!(
+        let Some(c) = self.commit else {
+            return format!(
                 "data loader workers: {} (cores allow {})",
                 self.workers, self.by_cores
-            ),
+            );
+        };
+        let grow = if self.growable > 0 {
+            format!(
+                " (can grow to {:.1} GB)",
+                gib(c.limit.saturating_add(self.growable))
+            )
+        } else {
+            String::new()
+        };
+        let ram = self
+            .ram_available
+            .map(|b| format!(", RAM {:.1} GB free", gib(b)))
+            .unwrap_or_default();
+        let mut bounds = format!("cores allow {}", self.by_cores);
+        if let Some(k) = self.by_commit {
+            bounds.push_str(&format!(", commit {k}"));
         }
+        if let Some(r) = self.by_ram {
+            bounds.push_str(&format!(", RAM {r}"));
+        }
+        format!(
+            "memory: commit {:.1} GB limit{grow}, {:.1} GB free{ram} -> {n} ({bounds})",
+            gib(c.limit),
+            gib(c.available),
+        )
     }
 }
 
@@ -257,14 +307,28 @@ pub fn gib(bytes: u64) -> f64 {
     bytes as f64 / f64::from(1u32 << 30)
 }
 
-/// Data loader workers on `os` with `cpus` logical cores, `commit` (Windows) and `loaders`
+/// Data loader workers on `os` with `cpus` logical cores, `memory` (Windows) and `loaders`
 /// ([`worker_loaders`]): none on macOS (measured on an M1: 2 or 4 spawned workers did not speed
 /// up RF-DETR nano, which is GPU-bound there, and Ultralytics uses none on MPS;
-/// docs/TRAINING.md), else all cores but one, 1..=[`MAX_AUTO_WORKERS`]. On Windows every worker
-/// is a fresh Python importing PyTorch, so a fixed paging file runs out of commit long before
-/// RAM (WinError 1455): there also at most what the free commit holds after
-/// [`MAIN_COMMIT_RESERVE_BYTES`], [`WORKER_COMMIT_BYTES`] per worker per loader, down to 0.
-pub fn workers_for(os: &str, cpus: usize, commit: Option<Commit>, loaders: u32) -> WorkerChoice {
+/// docs/TRAINING.md), else all cores but one, 1..=[`MAX_AUTO_WORKERS`].
+///
+/// On Windows every worker is a fresh (spawned) Python importing PyTorch, so there also the
+/// smaller of
+/// - commit: `(free commit + growable paging file - MAIN_COMMIT_RESERVE_BYTES) / (WORKER_COMMIT_BYTES
+///   x loaders)`; a fixed paging file runs out of commit long before RAM (WinError 1455), a growable
+///   one is grown by Windows on demand;
+/// - RAM: `(available RAM - MAIN_RAM_BYTES - RAM_RESERVE_BYTES) / (WORKER_RAM_BYTES x loaders)`;
+///   a commit the paging file can back still pages: 4 workers on a 16 GB box left 0.87 GB of RAM,
+///   paged in 12k pages/s and ran out of memory, 2 were as fast;
+///
+/// each down to 0. Elsewhere neither: Linux overcommits and forks its workers (copy-on-write, so
+/// the spawned workers' RAM figures do not apply), and macOS uses none.
+pub fn workers_for(
+    os: &str,
+    cpus: usize,
+    memory: Option<WorkerMemory>,
+    loaders: u32,
+) -> WorkerChoice {
     let by_cores = if os == "macos" {
         0
     } else {
@@ -272,28 +336,49 @@ pub fn workers_for(os: &str, cpus: usize, commit: Option<Commit>, loaders: u32) 
             .unwrap_or(u32::MAX)
             .clamp(1, MAX_AUTO_WORKERS)
     };
-    let commit = commit.filter(|_| os == "windows");
-    let by_memory = commit.map_or(u32::MAX, |c| {
-        let per = WORKER_COMMIT_BYTES * u64::from(loaders.max(1));
-        let n = c.available.saturating_sub(MAIN_COMMIT_RESERVE_BYTES) / per;
-        u32::try_from(n).unwrap_or(u32::MAX)
+    let memory = memory.filter(|_| os == "windows");
+    let loaders = u64::from(loaders.max(1));
+    let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+    let by_commit = memory.map(|m| {
+        let free = m.commit.available.saturating_add(m.growable);
+        count(free.saturating_sub(MAIN_COMMIT_RESERVE_BYTES) / (WORKER_COMMIT_BYTES * loaders))
     });
+    let ram_available = memory.and_then(|m| m.ram_available);
+    let by_ram = ram_available.map(|b| {
+        let left = b.saturating_sub(MAIN_RAM_BYTES + RAM_RESERVE_BYTES);
+        count(left / (WORKER_RAM_BYTES * loaders))
+    });
+    let workers = [Some(by_cores), by_commit, by_ram]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(by_cores);
     WorkerChoice {
-        workers: by_cores.min(by_memory),
+        workers,
         by_cores,
-        commit,
+        commit: memory.map(|m| m.commit),
+        growable: memory.map_or(0, |m| m.growable),
+        by_commit,
+        ram_available,
+        by_ram,
     }
 }
 
-/// [`workers_for`] on this machine now, for `trainer`.
+/// [`workers_for`] on this machine now, for `trainer`: the commit, the available RAM and how far
+/// the paging files can grow, read when training starts.
 pub fn workers_now(trainer: catalog::Trainer) -> WorkerChoice {
     let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    workers_for(
-        std::env::consts::OS,
-        cpus,
-        crate::system_info::commit(),
-        worker_loaders(trainer),
-    )
+    let memory = crate::system_info::commit().map(|commit| {
+        let physical = crate::system_info::physical();
+        WorkerMemory {
+            commit,
+            growable: physical.map_or(0, |p| {
+                crate::system_info::paging_growth(commit.limit, p.total)
+            }),
+            ram_available: physical.map(|p| p.available),
+        }
+    });
+    workers_for(std::env::consts::OS, cpus, memory, worker_loaders(trainer))
 }
 
 /// The dataset options of `request` on `config`: the `training` section's assembly defaults
@@ -824,32 +909,55 @@ mod tests {
 
     const GB: u64 = 1 << 30;
 
-    fn commit(limit_gb: f64, free_gb: f64) -> Option<Commit> {
-        Some(Commit {
-            limit: (limit_gb * GB as f64) as u64,
-            available: (free_gb * GB as f64) as u64,
+    fn gb(v: f64) -> u64 {
+        (v * GB as f64) as u64
+    }
+
+    /// A commit reading with `growable_gb` of paging file growth and `ram_gb` of RAM available.
+    fn mem(
+        limit_gb: f64,
+        free_gb: f64,
+        growable_gb: f64,
+        ram_gb: Option<f64>,
+    ) -> Option<WorkerMemory> {
+        Some(WorkerMemory {
+            commit: Commit {
+                limit: gb(limit_gb),
+                available: gb(free_gb),
+            },
+            growable: gb(growable_gb),
+            ram_available: ram_gb.map(gb),
         })
     }
 
+    /// A fixed paging file, RAM not read: the commit bound alone.
+    fn commit(limit_gb: f64, free_gb: f64) -> Option<WorkerMemory> {
+        mem(limit_gb, free_gb, 0.0, None)
+    }
+
+    /// Fixed paging files. The reserve went from 6 to the measured 8 GB, so every free commit
+    /// below moved up by 2 GB to keep its result (10.0 now gives 0 where it gave 1).
     #[test]
     fn workers_follow_the_cores_and_on_windows_the_free_commit() {
         let rf = worker_loaders(catalog::Trainer::RfDetr);
         let w = |os, cpus, c, loaders| workers_for(os, cpus, c, loaders).workers;
         // This box: 6 cores, 2 GB of commit free -> none (load in the training process).
         assert_eq!(w("windows", 6, commit(21.3, 2.0), rf), 0);
-        // Train + val loaders: (9.1 - 6) / (2 x 1.37 GiB) = 1; (12 - 6) / 2.73 = 2.
-        assert_eq!(w("windows", 6, commit(32.0, 9.1), 2), 1);
-        assert_eq!(w("windows", 6, commit(32.0, 10.0), 2), 1);
-        assert_eq!(w("windows", 6, commit(32.0, 12.0), 2), 2);
+        // Train + val loaders: (10.8 - 8) / (2 x 1.37 GiB) = 1; (13.5 - 8) / 2.73 = 2.
+        assert_eq!(w("windows", 6, commit(32.0, 10.0), 2), 0);
+        assert_eq!(w("windows", 6, commit(32.0, 10.8), 2), 1);
+        assert_eq!(w("windows", 6, commit(32.0, 13.4), 2), 1);
+        assert_eq!(w("windows", 6, commit(32.0, 13.5), 2), 2);
         // Plenty free: the cores rule.
         assert_eq!(w("windows", 6, commit(64.0, 60.0), rf), 5);
         // Ultralytics' validation loader doubles the count: 3 processes per worker.
         assert_eq!(worker_loaders(catalog::Trainer::Ultralytics), 3);
         assert_eq!(w("windows", 16, commit(32.0, 13.0), 3), 1);
-        assert_eq!(w("windows", 16, commit(32.0, 16.0), 3), 2);
+        assert_eq!(w("windows", 16, commit(32.0, 16.0), 3), 1);
+        assert_eq!(w("windows", 16, commit(32.0, 16.5), 3), 2);
         assert_eq!(worker_loaders(catalog::Trainer::Transformers), 2);
         // Exactly at the reserve, or below it: none.
-        assert_eq!(w("windows", 6, commit(8.0, 6.0), rf), 0);
+        assert_eq!(w("windows", 6, commit(10.0, 8.0), rf), 0);
         assert_eq!(w("windows", 6, commit(8.0, 0.5), rf), 0);
         // No commit reading: the cores rule (all but one, 1..=8).
         assert_eq!(w("windows", 6, None, rf), 5);
@@ -863,9 +971,10 @@ mod tests {
         let c = workers_for("windows", 6, commit(21.3, 5.1), rf);
         assert_eq!(
             c.describe(),
-            "memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers (cores allow 5)"
+            "memory: commit 21.3 GB limit, 5.1 GB free -> 0 data loader workers (cores allow 5, \
+             commit 0)"
         );
-        let c = workers_for("windows", 6, commit(21.3, 9.1), rf);
+        let c = workers_for("windows", 6, commit(21.3, 10.8), rf);
         assert_eq!(c.workers, 1);
         assert!(
             c.describe().contains("-> 1 data loader worker (cores"),
@@ -876,6 +985,112 @@ mod tests {
             workers_for("linux", 6, commit(1.0, 1.0), rf).describe(),
             "data loader workers: 5 (cores allow 5)"
         );
+    }
+
+    /// The measured box (GTX 1070 Ti, i5-8600K: 6 cores, 15.9 GB RAM, `c:\pagefile.sys 2935
+    /// 24576`, 19 GB free on C:): commit 23.3 GB limit, 5.4 GB free, 7.6 GB RAM available before a
+    /// run. 2 workers trained 32% faster than none; 4 were no faster and ran out of memory. The
+    /// main case gives C: 31 GB free, so the paging file's growth is not capped below 15 GB.
+    #[test]
+    fn a_growable_paging_file_allows_workers_and_the_ram_caps_them() {
+        use crate::backend::memory::{growable_bytes, parse_paging_files, volume_root};
+        let rf = worker_loaders(catalog::Trainer::RfDetr);
+        let ram = gb(15.9);
+        let files = parse_paging_files(&[r"c:\pagefile.sys 2935 24576".to_string()]);
+        let grow = |limit: u64, disk_free: u64| {
+            growable_bytes(
+                &files,
+                limit,
+                ram,
+                |f| volume_root(f, &[], Some("C:")),
+                |root| (root == r"C:\").then_some(disk_free),
+            )
+        };
+        // 24 GB max less 7.4 GB now = 16.6, but 31 GB free on C: keeps 16: 15.
+        let growable = grow(gb(23.3), gb(31.0));
+        assert_eq!(growable, 15 * GB);
+        // With the 19 GB C: had when measured, the 16 GB kept leaves 3 GB of growth: no worker
+        // (commit (5.4 + 3 - 8) / 2.8 < 1), which keeps the recordings' drive from filling.
+        let tight = WorkerMemory {
+            commit: Commit {
+                limit: gb(23.3),
+                available: gb(5.4),
+            },
+            growable: grow(gb(23.3), gb(19.0)),
+            ram_available: Some(gb(7.6)),
+        };
+        assert_eq!(tight.growable, 3 * GB);
+        assert_eq!(workers_for("windows", 6, Some(tight), rf).workers, 0);
+        let measured = WorkerMemory {
+            commit: Commit {
+                limit: gb(23.3),
+                available: gb(5.4),
+            },
+            growable,
+            ram_available: Some(gb(7.6)),
+        };
+        let c = workers_for("windows", 6, Some(measured), rf);
+        // Commit: (5.4 + 15 - 8) / 2.73 = 4; RAM: (7.6 - 2.6 - 2) / (2 x 0.75) = 2, exactly.
+        assert_eq!(
+            (c.workers, c.by_cores, c.by_commit, c.by_ram),
+            (2, 5, Some(4), Some(2))
+        );
+        assert_eq!(
+            c.describe(),
+            "memory: commit 23.3 GB limit (can grow to 38.3 GB), 5.4 GB free, RAM 7.6 GB free -> \
+             2 data loader workers (cores allow 5, commit 4, RAM 2)"
+        );
+        // A fixed file (the free commit only, as before) gives this box none.
+        let fixed = mem(23.3, 5.4, 0.0, Some(7.6));
+        assert_eq!(workers_for("windows", 6, fixed, rf).workers, 0);
+        // Without the RAM reading the growable file alone allows the 4 that ran out of memory.
+        let no_ram = mem(23.3, 5.4, 15.0, None);
+        assert_eq!(workers_for("windows", 6, no_ram, rf).workers, 4);
+        // The RAM bound: 4 workers need 10.6 GB available, 1 needs 6.1.
+        let by_ram = |ram_gb| workers_for("windows", 6, mem(64.0, 60.0, 0.0, Some(ram_gb)), rf);
+        assert_eq!(by_ram(7.5).workers, 1);
+        assert_eq!(by_ram(9.0).workers, 2);
+        assert_eq!(by_ram(10.7).workers, 4);
+        assert_eq!(by_ram(6.0).workers, 0);
+        assert_eq!(by_ram(4.0).workers, 0);
+        assert_eq!(by_ram(1.0).workers, 0);
+        assert_eq!(by_ram(64.0).workers, 5, "the cores still cap");
+        // Ultralytics: 3 worker processes per worker.
+        let ul = worker_loaders(catalog::Trainer::Ultralytics);
+        assert_eq!(
+            workers_for("windows", 6, mem(64.0, 60.0, 0.0, Some(9.2)), ul).workers,
+            2
+        );
+        // A full disk: no growth, so the free commit alone (none here).
+        assert_eq!(grow(gb(23.3), gb(3.0)), 0);
+        let full = Some(WorkerMemory {
+            growable: grow(gb(23.3), gb(3.0)),
+            ..measured
+        });
+        assert_eq!(workers_for("windows", 6, full, rf).workers, 0);
+        // The file at its maximum: no growth either.
+        assert_eq!(grow(gb(15.9 + 25.0), gb(100.0)), 0);
+        // Elsewhere neither bound applies (Linux forks, macOS uses none).
+        assert_eq!(workers_for("linux", 6, Some(measured), rf).workers, 5);
+        assert_eq!(workers_for("linux", 6, Some(measured), rf).by_ram, None);
+        assert_eq!(workers_for("macos", 6, Some(measured), rf).workers, 0);
+    }
+
+    /// This machine's reading (shown with `--nocapture`): every bound present on Windows only,
+    /// and the choice is their minimum.
+    #[test]
+    fn workers_now_reads_every_bound_on_windows() {
+        let c = workers_now(catalog::Trainer::RfDetr);
+        println!("{}", c.describe());
+        let windows = cfg!(windows);
+        assert_eq!(c.commit.is_some(), windows, "{c:?}");
+        assert_eq!(c.by_commit.is_some(), windows, "{c:?}");
+        assert_eq!(c.by_ram.is_some(), windows, "{c:?}");
+        let min = [Some(c.by_cores), c.by_commit, c.by_ram]
+            .into_iter()
+            .flatten()
+            .min();
+        assert_eq!(Some(c.workers), min, "{c:?}");
     }
 
     #[test]
