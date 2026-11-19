@@ -2,7 +2,9 @@
 //! fits a GPU ([`suggest_batch`]). **Estimates, not measurements**: the constants below are round
 //! numbers from public reports (Ultralytics and Roboflow issue threads, transformers fine-tuning
 //! notes) and the 1-epoch smoke runs on an Apple M1 (docs/TRAINING.md); they are good to a factor
-//! of about 1.5 and only meant to hide choices that cannot fit and to set expectations.
+//! of about 1.5 and only meant to hide choices that cannot fit and to set expectations. On CUDA the
+//! memory of RF-DETR nano and D-FINE S follows full runs on a GTX 1070 Ti instead
+//! ([`cuda_memory`]).
 //!
 //! Model: `vram = base + per_image x batch x (side / default)^2` MB, and
 //! `seconds per epoch = images / (images per second x gpu factor) x (imgsz / default)^2`, where
@@ -102,6 +104,40 @@ pub struct Estimate {
     pub total_s: f64,
 }
 
+/// CUDA memory constants `(base_mb, per_image_mb)` where full runs measured them, else None (the
+/// [`cost`] table's, which the M1 runs calibrated). From the peak `mem_gb` (PyTorch's
+/// `max_memory_reserved`, GiB) of 14 runs on a GTX 1070 Ti (Pascal, AMP fp16) in 2026-10/11, plus
+/// [`CUDA_CONTEXT_MB`] (not in that peak):
+/// - RF-DETR nano 384 multi-scale (544 px batches): 3.09 GiB at batch 4 (1 run), 5.57-5.62 GiB at
+///   batch 8 (10 runs): 648 MiB per image at 544 px, so 323 at 384 (`(384 / 544)^2`), and 568 MiB
+///   fixed; rounded up to 325 and 1000 with the context. Its 640 px runs without multi-scale
+///   (6.08 GiB at batch 8, 2 runs) come out 24% high: per-image memory grows slower than the area.
+/// - D-FINE S 640 at batch 8: 3.38-3.39 GiB (2 runs), split as 400 MiB fixed (a guess: one size
+///   cannot separate the two) and 384 per image; 800 with the context.
+///
+/// The old shared constants said 11.7 GB for RF-DETR nano at batch 8 (2.1x the measured peak), so
+/// `multi_scale_on`'s `auto` and the start-of-run warning were wrong on 8 GB cards.
+pub fn cuda_memory(family: TrainFamily, size: &str) -> Option<(u32, u32)> {
+    match (family, size) {
+        (TrainFamily::Rfdetr, "nano") => Some((1000, 325)),
+        (TrainFamily::Dfine, "s") => Some((800, 385)),
+        _ => None,
+    }
+}
+
+/// The CUDA context and cuDNN / cuBLAS workspaces PyTorch holds beside its allocator's pool (the
+/// measured peaks leave them out), MB.
+pub const CUDA_CONTEXT_MB: u32 = 400;
+
+/// `(base_mb, per_image_mb)` on `target`: [`cuda_memory`] on CUDA where measured, else [`cost`]'s.
+pub fn memory_cost(family: TrainFamily, size: &str, target: Target) -> Option<(u32, u32)> {
+    let c = cost(family, size)?;
+    Some(match target {
+        Target::Cuda(_) => cuda_memory(family, size).unwrap_or((c.base_mb, c.per_image_mb)),
+        Target::Mps => (c.base_mb, c.per_image_mb),
+    })
+}
+
 /// RF-DETR's patch size and window count per size (rfdetr's `RFDETR*Config`: base uses the
 /// DINOv2 14 px patches with 4 windows, every other size 16 px with 2).
 pub fn rfdetr_patch_windows(size: &str) -> (u32, u32) {
@@ -144,18 +180,9 @@ pub fn estimate_with(
     multi_scale: bool,
 ) -> Option<Estimate> {
     let cost = cost(family, size)?;
-    let ratio2 = |side: u32| {
-        let r = f64::from(side) / f64::from(family.default_imgsz(size));
-        r * r
-    };
-    let scale = ratio2(imgsz);
-    let mem_side = if family == TrainFamily::Rfdetr && multi_scale {
-        rfdetr_max_side(size, imgsz)
-    } else {
-        imgsz
-    };
-    let vram = f64::from(cost.base_mb)
-        + f64::from(cost.per_image_mb) * f64::from(batch) * ratio2(mem_side);
+    let vram_mb = memory_estimate(family, size, imgsz, batch, target, multi_scale)?;
+    let r = f64::from(imgsz) / f64::from(family.default_imgsz(size));
+    let scale = r * r;
     let speed = match target {
         Target::Cuda(cc) => f64::from(cost.pascal_img_s) * f64::from(gpu_factor(cc)),
         Target::Mps => f64::from(cost.m1_img_s),
@@ -165,40 +192,60 @@ pub fn estimate_with(
     }
     let epoch_s = images as f64 / speed * scale;
     Some(Estimate {
-        vram_mb: to_u64(vram),
+        vram_mb,
         epoch_s,
         total_s: epoch_s * f64::from(epochs),
     })
 }
 
-/// The largest batch of 1, 2, 4, ..., 64 whose estimate fits `vram_mb` (90% of it, for the
-/// allocator's slack); None when even batch 1 does not. RF-DETR with multi-scale on.
-pub fn suggest_batch(family: TrainFamily, size: &str, imgsz: u32, vram_mb: u64) -> Option<u32> {
-    suggest_batch_with(family, size, imgsz, vram_mb, true)
+/// The largest batch of 1, 2, 4, ..., 64 whose estimate on `target` fits `vram_mb` (90% of it,
+/// for the allocator's slack); None when even batch 1 does not. RF-DETR with multi-scale on.
+pub fn suggest_batch(
+    family: TrainFamily,
+    size: &str,
+    imgsz: u32,
+    vram_mb: u64,
+    target: Target,
+) -> Option<u32> {
+    suggest_batch_with(family, size, imgsz, vram_mb, true, target)
 }
 
-/// [`suggest_batch`] with RF-DETR's multi-scale training on or off.
+/// [`suggest_batch`] with RF-DETR's multi-scale training on or off. Only the memory of `target`
+/// counts (its speed does not).
 pub fn suggest_batch_with(
     family: TrainFamily,
     size: &str,
     imgsz: u32,
     vram_mb: u64,
     multi_scale: bool,
+    target: Target,
 ) -> Option<u32> {
     let usable = vram_mb.saturating_mul(9) / 10;
     [64u32, 32, 16, 8, 4, 2, 1].into_iter().find(|b| {
-        estimate_with(
-            family,
-            size,
-            imgsz,
-            *b,
-            1,
-            1,
-            Target::Cuda(ComputeCapability::new(8, 6)),
-            multi_scale,
-        )
-        .is_some_and(|e| e.vram_mb <= usable)
+        memory_estimate(family, size, imgsz, *b, target, multi_scale).is_some_and(|mb| mb <= usable)
     })
+}
+
+/// The VRAM part of [`estimate_with`] alone, MB (no speed needed, so also for a family that does
+/// not train on MPS, as [`suggest_batch_with`] always answered).
+fn memory_estimate(
+    family: TrainFamily,
+    size: &str,
+    imgsz: u32,
+    batch: u32,
+    target: Target,
+    multi_scale: bool,
+) -> Option<u64> {
+    let (base_mb, per_image_mb) = memory_cost(family, size, target)?;
+    let mem_side = if family == TrainFamily::Rfdetr && multi_scale {
+        rfdetr_max_side(size, imgsz)
+    } else {
+        imgsz
+    };
+    let r = f64::from(mem_side) / f64::from(family.default_imgsz(size));
+    Some(to_u64(
+        f64::from(base_mb) + f64::from(per_image_mb) * f64::from(batch) * r * r,
+    ))
 }
 
 /// The largest batch of 1, 2, 4, ..., 64 that fits `vram_mb` (90% of it) by a measured peak:
@@ -314,24 +361,87 @@ mod tests {
         assert!(estimate(TrainFamily::Dfine, "s", 640, 4, 10, 1, Target::Mps).is_none());
     }
 
+    const PASCAL: Target = Target::Cuda(ComputeCapability { major: 6, minor: 1 });
+
     #[test]
     fn batch_suggestion_fits_the_card() {
         // 8 GB: YOLO26 s at 640 fits batch 16 (900 + 260 x 16 = 5060 MB), not 32.
-        assert_eq!(suggest_batch(TrainFamily::Yolo26, "s", 640, 8192), Some(16));
-        // 4 GB GTX 1650 class: RF-DETR large does not fit at all.
-        assert_eq!(suggest_batch(TrainFamily::Rfdetr, "large", 704, 3000), None);
-        // RF-DETR nano 384 trains at up to 544 px: 1500 + 650 x 2 x 2.007 = 4109 MB > 3686.
         assert_eq!(
-            suggest_batch(TrainFamily::Rfdetr, "nano", 384, 4096),
+            suggest_batch(TrainFamily::Yolo26, "s", 640, 8192, PASCAL),
+            Some(16)
+        );
+        // 4 GB GTX 1650 class: RF-DETR large does not fit at all.
+        assert_eq!(
+            suggest_batch(TrainFamily::Rfdetr, "large", 704, 3000, PASCAL),
+            None
+        );
+        // RF-DETR nano 384 trains at up to 544 px: on CUDA 1000 + 325 x 4 x 2.007 = 3609 MB of
+        // 3686 usable (measured 3.1 GiB + the context at batch 4); 1500 + 650 x 2 x 2.007 =
+        // 4109 MB > 3686 by the M1's constants.
+        assert_eq!(
+            suggest_batch(TrainFamily::Rfdetr, "nano", 384, 4096, PASCAL),
+            Some(4)
+        );
+        assert_eq!(
+            suggest_batch(TrainFamily::Rfdetr, "nano", 384, 4096, Target::Mps),
             Some(1)
         );
         assert_eq!(
-            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, 4096, false),
-            Some(2)
+            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, 4096, false, PASCAL),
+            Some(8)
         );
         assert_eq!(
-            suggest_batch(TrainFamily::Yolo26, "n", 640, 100_000),
+            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, 4096, false, Target::Mps),
+            Some(2)
+        );
+        // The GTX 1070 Ti (8 GB) these were measured on trains batch 8 with multi-scale.
+        assert_eq!(
+            suggest_batch(TrainFamily::Rfdetr, "nano", 384, 8192, PASCAL),
+            Some(8)
+        );
+        assert_eq!(
+            suggest_batch(TrainFamily::Yolo26, "n", 640, 100_000, PASCAL),
             Some(64)
+        );
+    }
+
+    /// The CUDA memory estimate against the peaks measured on a GTX 1070 Ti (`mem_gb`, GiB, plus
+    /// [`CUDA_CONTEXT_MB`]): never under, at most 30% over; and the start-of-run figure for
+    /// RF-DETR nano at batch 8 is 6.2 GB, no longer 11.7 GB. MPS keeps the M1's constants.
+    #[test]
+    fn the_cuda_memory_follows_the_measured_runs() {
+        // (family, size, imgsz, batch, multi-scale, peak GiB: the largest of the runs)
+        let runs = [
+            (TrainFamily::Rfdetr, "nano", 384, 4, true, 3.086),
+            (TrainFamily::Rfdetr, "nano", 384, 8, true, 5.617),
+            (TrainFamily::Rfdetr, "nano", 640, 8, false, 6.080),
+            (TrainFamily::Dfine, "s", 640, 8, false, 3.391),
+        ];
+        for (f, size, imgsz, batch, ms, gib) in runs {
+            let e = estimate_with(f, size, imgsz, batch, 1, 1, PASCAL, ms).unwrap();
+            let measured = gib * 1024.0 + f64::from(CUDA_CONTEXT_MB);
+            let ratio = e.vram_mb as f64 / measured;
+            assert!(
+                (1.0..=1.3).contains(&ratio),
+                "{f} {size} {imgsz} b{batch}: {} MB for {measured:.0} ({ratio:.2})",
+                e.vram_mb
+            );
+        }
+        let e = estimate(TrainFamily::Rfdetr, "nano", 384, 8, 1, 1, PASCAL).unwrap();
+        assert_eq!(e.vram_mb, 6218);
+        let m1 = estimate(TrainFamily::Rfdetr, "nano", 384, 8, 1, 1, Target::Mps).unwrap();
+        assert_eq!(
+            m1.vram_mb,
+            1500 + to_u64(650.0 * 8.0 * (544.0f64 / 384.0).powi(2))
+        );
+        // Unmeasured ones keep the shared table on CUDA too.
+        assert_eq!(
+            memory_cost(TrainFamily::Rfdetr, "small", PASCAL),
+            Some((1800, 650))
+        );
+        assert_eq!(
+            memory_cost(TrainFamily::Dfine, "s", Target::Mps),
+            Some((1100, 450))
         );
     }
 
@@ -342,14 +452,14 @@ mod tests {
         let mem = crate::training::estimate::to_u64(
             16.0 * 1024.0 * crate::training::capability::MPS_MEMORY_SHARE,
         );
-        let b = suggest_batch(TrainFamily::Rfdetr, "nano", 384, mem).unwrap();
+        let b = suggest_batch(TrainFamily::Rfdetr, "nano", 384, mem, Target::Mps).unwrap();
         assert!(b <= 4, "{b}");
         assert_eq!(b, 4);
         let e = estimate(TrainFamily::Rfdetr, "nano", 384, 16, 1, 1, Target::Mps).unwrap();
         assert!(e.vram_mb > 20_000, "{e:?}");
         // Multi-scale off: memory at the input size.
         assert_eq!(
-            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, mem, false),
+            suggest_batch_with(TrainFamily::Rfdetr, "nano", 384, mem, false, Target::Mps),
             Some(8)
         );
         let off = estimate_with(

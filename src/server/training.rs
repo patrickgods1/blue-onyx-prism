@@ -338,8 +338,8 @@ struct RunRow {
     busy: bool,
     /// Finish now applies: running (or paused) in its training stage, not stopped yet.
     can_finish: bool,
-    /// The Stop now / Continue notice while the run trains past an early-stop point (training
-    /// loss still falling); empty otherwise.
+    /// The Stop now / Continue notice while the run trains past an early-stop point (validation
+    /// still improving); empty otherwise.
     extend: String,
     /// The epoch Stop now keeps, and the point's extension number (Continue dismisses it).
     extend_keep: u32,
@@ -5170,9 +5170,8 @@ pub(super) mod tests {
             patience: 15,
             since_best: 1,
             extension: Some(crate::training::progress::ExtensionNotice {
-                text:
-                    "Early stop reached at epoch 3 (best epoch 2); training loss is still falling."
-                        .into(),
+                text: "Early stop reached at epoch 3 (best epoch 2); validation still improving."
+                    .into(),
                 keep_epoch: 2,
                 extension: 1,
             }),

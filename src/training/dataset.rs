@@ -1073,6 +1073,13 @@ pub struct Options {
     /// older export put it in its train split (step 3). Empty = none listed, or no folder.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub frozen_heldout: BTreeSet<String>,
+    /// The short side the train / valid images are written at ([`prepare_image`], the recipe's
+    /// `TrainRecipe::prepared_short_side`): a larger one is downscaled, a smaller or equal one
+    /// linked as it is. The held-out frames always stay full size (the benchmark scores them like
+    /// a camera's). None = every image linked as it is (`train prepare`, which names no model).
+    /// Recorded at the top of `dataset.json` ([`Summary::prepared_short_side`]).
+    #[serde(default, skip_serializing)]
+    pub prepared_short_side: Option<u32>,
 }
 
 /// Most camera days the plan's warning on frozen held-out days names.
@@ -1109,6 +1116,7 @@ impl Default for Options {
             imgsz: None,
             size_floor: None,
             frozen_heldout: BTreeSet::new(),
+            prepared_short_side: None,
         }
     }
 }
@@ -2563,6 +2571,10 @@ pub struct Summary<'a> {
     pub warnings: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<&'a BalanceReport>,
+    /// [`Options::prepared_short_side`] (null = every image as it was).
+    pub prepared_short_side: Option<u32>,
+    /// Train / valid images written downscaled to it (the others are links or copies).
+    pub resized_images: usize,
 }
 
 /// One source in `dataset.json`.
@@ -2602,6 +2614,150 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
     std::fs::copy(src, dst)
         .map(|_| ())
         .with_context(|| format!("copying {} to {}", src.display(), dst.display()))
+}
+
+/// JPEG quality of a downscaled image ([`prepare_image`]): high enough that the re-encode adds
+/// little to what the camera's own compression lost (4:4:4 chroma at 90 and above, the encoder's
+/// rule).
+pub const PREPARED_JPEG_QUALITY: u8 = 95;
+
+/// The size of an image of `(w, h)` downscaled so its short side is `short`, the long side scaled
+/// alike and rounded (at least 1); None when the short side is already at most `short` (never
+/// upscaled) or a side is 0. Pure.
+pub fn prepared_size((w, h): (u32, u32), short: u32) -> Option<(u32, u32)> {
+    let min = w.min(h);
+    if min == 0 || short == 0 || min <= short {
+        return None;
+    }
+    let long = w.max(h);
+    // Integer rounding of long * short / min (no float edge cases; fits u64).
+    let scaled = (u64::from(long) * u64::from(short) * 2 + u64::from(min)) / (u64::from(min) * 2);
+    let scaled = u32::try_from(scaled.max(1)).unwrap_or(u32::MAX);
+    Some(if w <= h {
+        (short, scaled)
+    } else {
+        (scaled, short)
+    })
+}
+
+/// Which encoder [`prepare_image`] writes a file of this name with: JPEG or PNG by extension,
+/// None for anything else (linked as it is).
+fn prepared_format(name: &Path) -> Option<::image::ImageFormat> {
+    let ext = name.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some(::image::ImageFormat::Jpeg),
+        "png" => Some(::image::ImageFormat::Png),
+        _ => None,
+    }
+}
+
+/// Write the train / valid image `src` to `dst` with its short side at most `short`: a larger
+/// image is decoded, downscaled ([`prepared_size`]; a separable Catmull-Rom convolution scaled to
+/// the ratio, so it filters like an antialiased bicubic, sharper than bilinear without
+/// Lanczos3's ringing around the bright edges of night and IR frames) and encoded as the format
+/// its name says (JPEG at [`PREPARED_JPEG_QUALITY`], PNG lossless), through a temporary file in
+/// the same folder and a rename; anything else (at or under the size, another format, a JPEG
+/// whose EXIF orientation is not the identity, which the encoder would drop, a file that does not
+/// decode, which the trainer reports as before) is linked or copied as it is. Returns the written size when it was downscaled, else None (the source's).
+pub fn prepare_image(src: &Path, dst: &Path, short: u32) -> Result<Option<(u32, u32)>> {
+    let Some(format) = prepared_format(dst) else {
+        link_or_copy(src, dst)?;
+        return Ok(None);
+    };
+    let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    let (dims, oriented) = match format {
+        ::image::ImageFormat::Jpeg => {
+            use ::image::ImageDecoder;
+            match ::image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes)) {
+                Ok(mut d) => {
+                    let o = d
+                        .orientation()
+                        .unwrap_or(::image::metadata::Orientation::NoTransforms);
+                    (
+                        Some(d.dimensions()),
+                        o != ::image::metadata::Orientation::NoTransforms,
+                    )
+                }
+                Err(_) => (None, false),
+            }
+        }
+        _ => (
+            ::image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok()),
+            false,
+        ),
+    };
+    // An unreadable header is linked too: the trainer reports the damaged file, as before.
+    let Some(size) = dims
+        .filter(|_| !oriented)
+        .and_then(|d| prepared_size(d, short))
+    else {
+        link_or_copy(src, dst)?;
+        return Ok(None);
+    };
+    // A body that does not decode (or is over the decode limit) likewise.
+    let Ok(img) = crate::image::decode(&bytes) else {
+        link_or_copy(src, dst)?;
+        return Ok(None);
+    };
+    let small = resize_rgb(&img, size)?;
+    let out = match format {
+        ::image::ImageFormat::Jpeg => crate::image::encode_jpeg(&small, PREPARED_JPEG_QUALITY)?,
+        _ => {
+            use ::image::ImageEncoder;
+            let mut out = Vec::new();
+            ::image::codecs::png::PngEncoder::new(&mut out)
+                .write_image(
+                    &small.rgb,
+                    small.width,
+                    small.height,
+                    ::image::ExtendedColorType::Rgb8,
+                )
+                .context("encoding PNG")?;
+            out
+        }
+    };
+    write_renamed(dst, &out)?;
+    Ok(Some(size))
+}
+
+/// `img` resized to `(w, h)` with the Catmull-Rom convolution ([`prepare_image`]).
+fn resize_rgb(img: &crate::image::RgbImage, (w, h): (u32, u32)) -> Result<crate::image::RgbImage> {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let src = ImageRef::new(img.width, img.height, &img.rgb, PixelType::U8x3)
+        .context("source image view")?;
+    let mut dst = Image::new(w, h, PixelType::U8x3);
+    Resizer::new()
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
+        )
+        .context("resizing image")?;
+    Ok(crate::image::RgbImage {
+        width: w,
+        height: h,
+        rgb: dst.into_vec(),
+    })
+}
+
+/// Write `bytes` to `path` through `.<name>.tmp` beside it and a rename: a crash never leaves a
+/// half-written image under the name the lists give (the next run rebuilds the folder anyway, so
+/// no fsync).
+fn write_renamed(path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    let r = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.with_context(|| format!("writing {}", path.display()))
 }
 
 fn yolo_line(class: usize, b: &YoloBox) -> String {
@@ -2726,10 +2882,12 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         }
         Ok(objects)
     };
+    // The train / valid images to write (each once), in plan order; written together below.
     let mut written: BTreeSet<FrameRef> = BTreeSet::new();
-    let put = |r: FrameRef, f: &Frame, n: &str, written: &mut BTreeSet<FrameRef>| -> Result<()> {
+    let mut to_write: Vec<(FrameRef, String)> = Vec::new();
+    let mut put = |r: FrameRef, f: &Frame, n: &str| -> Result<()> {
         if written.insert(r) {
-            link_or_copy(&f.image, &out.join("images").join(n))?;
+            to_write.push((r, n.to_string()));
             let txt = out
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(n))));
@@ -2777,28 +2935,49 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
     // Where each image of `images/` came from ([`IMAGE_SOURCES_FILE`]).
     let mut image_sources: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut train_lines = String::new();
-    let mut train_entries = Vec::new();
+    let mut train_refs = Vec::new();
     for &(r, repeats) in &plan.train {
         let f = frame(r)?;
         let n = name_of(r, f);
-        put(r, f, &n, &mut written)?;
+        put(r, f, &n)?;
         image_sources.insert(n.clone(), f.image.clone());
-        let s = size_of(r, f)?;
         for _ in 0..repeats.max(1) {
             train_lines.push_str(&format!("./images/{n}\n"));
-            train_entries.push((r, n.clone(), s));
+            train_refs.push((r, n.clone()));
         }
     }
     let mut valid_lines = String::new();
-    let mut valid_entries = Vec::new();
+    let mut valid_refs = Vec::new();
     for &r in &plan.valid {
         let f = frame(r)?;
         let n = name_of(r, f);
-        put(r, f, &n, &mut written)?;
+        put(r, f, &n)?;
         image_sources.insert(n.clone(), f.image.clone());
         valid_lines.push_str(&format!("./images/{n}\n"));
-        valid_entries.push((r, n.clone(), size_of(r, f)?));
+        valid_refs.push((r, n.clone()));
     }
+    // The images (downscaled to the run's need, or linked), in parallel.
+    let jobs: Vec<(FrameRef, &Path, &str)> = to_write
+        .iter()
+        .map(|(r, n)| Ok((*r, frame(*r)?.image.as_path(), n.as_str())))
+        .collect::<Result<_>>()?;
+    let resized = write_images(&jobs, opts.prepared_short_side, &out.join("images"))?;
+    // COCO sizes: the written image's (labels are normalized, so they hold either way).
+    let mut entry = |(r, n): (FrameRef, String)| -> Result<(FrameRef, String, (u32, u32))> {
+        let s = match resized.get(&r) {
+            Some(s) => *s,
+            None => size_of(r, frame(r)?)?,
+        };
+        Ok((r, n, s))
+    };
+    let train_entries: Vec<_> = train_refs
+        .into_iter()
+        .map(&mut entry)
+        .collect::<Result<_>>()?;
+    let valid_entries: Vec<_> = valid_refs
+        .into_iter()
+        .map(&mut entry)
+        .collect::<Result<_>>()?;
     let write_text = |name: &str, text: &str| -> Result<()> {
         std::fs::write(out.join(name), text)
             .with_context(|| format!("writing {}", out.join(name).display()))
@@ -2919,6 +3098,8 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         heldout_fingerprint: &plan.heldout_fingerprint,
         warnings: &warnings,
         balance: plan.balance.as_ref(),
+        prepared_short_side: opts.prepared_short_side,
+        resized_images: resized.len(),
     };
     write_text("dataset.json", &serde_json::to_string_pretty(&summary)?)?;
     Ok(Prepared {
@@ -2934,6 +3115,40 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         warnings,
         balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
     })
+}
+
+/// Write the images `jobs` (frame, source, file name in `dir`) of the train / valid splits: each through
+/// [`prepare_image`] at `short`, or linked as it is when None. In parallel
+/// ([`crate::parallel::map_all`] on all physical cores but one); the first error is returned.
+/// Returns the size of every image written downscaled.
+fn write_images(
+    jobs: &[(FrameRef, &Path, &str)],
+    short: Option<u32>,
+    dir: &Path,
+) -> Result<BTreeMap<FrameRef, (u32, u32)>> {
+    type Done = Result<Option<(FrameRef, (u32, u32))>>;
+    let one = |i: usize| -> Done {
+        let Some(&(r, src, n)) = jobs.get(i) else {
+            return Ok(None);
+        };
+        let dst = dir.join(n);
+        match short {
+            Some(short) => Ok(prepare_image(src, &dst, short)?.map(|s| (r, s))),
+            None => link_or_copy(src, &dst).map(|()| None),
+        }
+    };
+    // Linking is a syscall per file (a read walk's thread count); a downscale is CPU work.
+    let threads = match short {
+        Some(_) => crate::backend::cpu_threads::effective(0),
+        None => crate::parallel::walk_threads_over(jobs.len()),
+    };
+    let mut out = BTreeMap::new();
+    for d in crate::parallel::map_all(jobs.len(), threads, &one) {
+        if let Some((r, s)) = d? {
+            out.insert(r, s);
+        }
+    }
+    Ok(out)
 }
 
 /// The file of a prepared dataset that names, for every image in `images/` (the names

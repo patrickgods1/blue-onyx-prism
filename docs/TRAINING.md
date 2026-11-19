@@ -434,9 +434,11 @@ not reviewed yet, and disk needed against free per volume.
 
 The checks run when a run is queued (page, `train run`) and again when it starts. Warnings stay with the
 run: on its row, in `dataset.json` and in `train.log`. The disk need is the frames that cannot be hard-linked
-(another volume, or exFAT, probed with one link), labels, four times the base weights for the work folder
-(measured: YOLO26n 16 MB, RT-DETRv2 S 77 MB, RF-DETR nano 1.2 GB), RF-DETR's augmented copies, the model, and
-what the environment and weights still have to download.
+(another volume, or exFAT, probed with one link), labels, five times the base weights for the work folder
+(`WORK_WEIGHT_FACTOR`; measured: YOLO26n 16 MB, RT-DETRv2 S 77 MB, RF-DETR nano 1.1 GB without rfdetr's interval
+archives, which the script turns off; two full nano runs that kept them used 1.6 and 3.5 GB), RF-DETR's augmented
+copies, the model, and what the environment and weights still have to download. The frames are counted at full
+size, although the train / valid ones are written smaller (below): the need is an upper bound.
 
 Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, else copies),
 `classes.txt`, `train.txt` / `valid.txt` (repeats as repeated lines), `data.yaml` (Ultralytics),
@@ -445,6 +447,31 @@ repeated frame is a separate image entry), `heldout/` (a benchmark `dir:` set: `
 `labels/`, `classes.txt`, `manifest.json` with tags, `scored_labels` and every frame's `objects`) and
 `dataset.json` (sources, licences, counts, warnings). `train prepare --out <dir>` writes the same without
 training.
+
+**Prepared image size.** A run writes its train and validation images with the short side at what its
+trainer reads at most (`TrainRecipe::prepared_short_side`, `dataset.json` `prepared_short_side` and
+`resized_images`): a larger image is decoded, downscaled (Catmull-Rom convolution scaled to the ratio, an
+antialiased bicubic: sharper than bilinear, without Lanczos3's ringing on the bright edges of night and IR
+frames) and written as JPEG quality 95 (PNG stays PNG), through a temporary file and a rename, on all physical
+cores but one; an image at or under the size, of another format or with an EXIF rotation is linked as before.
+The held-out frames always stay full size (the benchmark scores them as a camera sends them). Labels are
+normalized, so they do not change; the COCO JSON gets the written width and height. The size floor and
+ignore-region decisions run before any image is written, on normalized boxes, so they are the same at any
+prepared size (tested). Per trainer:
+
+| Trainer | Short side | Why |
+|---|---|---|
+| RF-DETR | max(largest training side, 600): nano 384 600 (multi-scale on or off), nano 640 800 / 640, small 512 672 / 600, medium 576 736 / 600, base 560 840 / 600, large 704 864 / 704 | its square resize stretches to the largest multi-scale side (`rfdetr_max_side`, else `imgsz`); its scale-jitter branch first resizes the short side to 400 / 500 / 600 (`RFDETR_JITTER_FLOOR`); equal to rfdetr's own `draft_size_for_transforms`, the size its JPEG decoder already reduced to |
+| Ultralytics | 1.5 x imgsz (960 at 640) | it resizes the long side to `imgsz` before mosaic and zoom; 1.5x leaves room to spare |
+| transformers (RT-DETRv2, D-FINE) | imgsz | the image processor stretches to `imgsz` x `imgsz` |
+
+On this box (2688 x 1520 frames) this replaces a 930 MB copy per run (D: to C:) and the trainers'
+per-image decode and resize of the full frame (RF-DETR 31 ms, transformers 68 ms). Measured on 240 frames of
+a run (release build, i5-8500, 5 threads): 27 ms per frame at 600 px (6.5 s for the 240; 367 KB per frame
+instead of 1,193 KB), 20 ms at 640 px (415 KB), 28 ms at 960 px (868 KB). The night augmentation's CPU
+cost per image (preset, one thread) falls from 276 ms at full size to 27 ms at 1061 x 600. Results are not bit-identical to full-size input: the trainer now
+resizes from the prepared image instead of the original (two resamplings instead of one), a difference of
+the order of JPEG noise.
 
 ### Ignore regions
 
@@ -589,7 +616,10 @@ exposure x0.05-0.4 in linear light (gamma 2.2), MAET-style; noise = shot noise p
 signal plus read noise, sigma 0.01-0.05. Applied on the fly to the training batches for Ultralytics
 (on top of its own mosaic / HSV / flip) and transformers (plus a horizontal flip); for RF-DETR, whose
 training loop is the `rfdetr` package's, one augmented copy of each training image the probabilities
-pick is added before training.
+pick is added before training. Each step computes its branch only for an image its coin picked, with the
+same random draws in the same order, so the result and the generator state are bit for bit those of
+computing every branch (checked with a seeded comparison on CPU and CUDA, 1,680 cases); the noise is still
+drawn for every image, as before.
 
 ## Starting points and convergence
 
@@ -700,20 +730,51 @@ is switched off so only this one decides:
 - A **stop point** is reached once `epoch >= min_epochs` (10) and `patience` epochs passed since
   the last improvement. `patience` 0 turns it off (the run trains all its epochs); it may not exceed
   the epochs, and a patience that is not below the epochs never fires (a warning says so).
-- At a stop point the run **goes on while the training loss still falls**: over the last `patience`
-  epochs, the mean training loss of the later half (n / 2 epochs; an odd middle one counts in
-  neither) is more than 2% below the earlier half's (`loss_falling`; fewer than 4 losses = not
-  falling). Then the countdown restarts there (the next stop point is `patience` epochs later, or
+- At a stop point the run **goes on while the validation is still improving**: over the last
+  `patience` epochs, the mean of the later half of the smoothed values (n / 2 epochs; an odd middle
+  one counts in neither; epochs without a value are skipped) is more than `min_delta` above the
+  earlier half's (`metric_rising`; fewer than 4 values = not rising). A stop point means no new best
+  for `patience` epochs, so this is a curve climbing back after a dip, not one still setting
+  records. Then the countdown restarts there (the next stop point is `patience` epochs later, or
   sooner past a gain), at most 2 times (`MAX_EXTENSIONS`) and never at the last epoch; otherwise it
-  stops. The script prints `@train {"event":"converge_point","epoch":E,"best_epoch":B,"best":v,
-  "loss_falling":true,"loss_from":a,"loss_to":b,"extension":n,"next_check":E+patience}` and the
-  Train tab shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835; the selected metric's
-  name when it is not mAP); training loss is still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
-  Finish now action) and **Continue** (hides the notice; the run goes on by itself, so an unattended
-  run never waits). The incident run with its losses passes its epoch-15 stop point this way.
+  stops. The training loss is not consulted: a DETR's keeps falling long after its validation
+  peaked (see the replay below). The script prints `@train {"event":"converge_point","epoch":E,
+  "best_epoch":B,"best":v,"rising":true,"value_from":a,"value_to":b,"extension":n,
+  "next_check":E+patience}` and the Train tab shows "Early stop reached at epoch 15 (best epoch 5,
+  mAP 0.835; the selected metric's name when it is not mAP); validation still improving (mAP 0.786
+  -> 0.791). Continuing to epoch 25." with **Stop now and keep epoch 5** (the Finish now action)
+  and **Continue** (hides the notice; the run goes on by itself, so an unattended run never waits).
+  Records written before this rule extended on a falling training loss (`loss_falling`,
+  `loss_from`, `loss_to`; read and ignored).
+
+  *Replay* of the 14 run histories on the GTX 1070 Ti (2026-11, RF-DETR nano and D-FINE S, patience
+  10, `smooth` 3, `min_delta` 0.001, anneal 5 for RF-DETR; the old rule replayed to the recorded
+  stop in all 13 runs that converged, the 14th was stopped by hand): the old rule extended 12 of
+  them and spent 33% of all training time after the first stop point; the new one extends 1
+  (`a39b`, whose F2 was climbing back at epoch 27) and would have ended the 14 runs 27,607 s of
+  84,610 s (32.6%) sooner. The kept (best raw) value is the same in 10 of 14 and at most 0.0051
+  lower (mean 0.0010); the replay uses the recorded epochs, so the earlier anneal's lowered
+  learning rate, which usually gives the best epoch, is not in it.
+
+  | run | model | metric | stop old (extended at; anneal) | stop new | best epoch | kept old / new | saved |
+  |---|---|---|---|---|---|---|---|
+  | d455 | rfdetr nano 384 | mAP | 68 (-; 63) | 68 (-; 63) | 52 | 0.6906 / 0.6906 | 0 s |
+  | f36e | rfdetr nano 640 | mAP | 51 (25; 46) | 30 (-; 25) | 35 | 0.6961 / 0.6910 | 1,691 s |
+  | ab70 | rfdetr nano 640 | mAP | 58 (33, 43; 53) | 38 (-; 33) | 22 | 0.7126 / 0.7126 | 1,628 s |
+  | 200c | dfine s 640 | mAP | 49 (20, 30) | 20 | 37 | 0.6245 / 0.6204 | 1,766 s |
+  | dd9c | dfine s 640 | mAP | 39 (19, 29) | 19 | 9 | 0.5966 / 0.5966 | 1,334 s |
+  | ccb7 | rfdetr nano 384 | mAP | 63 (38, 48; 58) | 43 (-; 38) | 39 | 0.7502 / 0.7502 | 3,434 s |
+  | cad6 | rfdetr nano 384 | F2 | 47 (22, 32; 42) | 27 (-; 22) | 11 | 0.6667 / 0.6667 | 3,030 s |
+  | 2fff | rfdetr nano 384 | F2 | 51 (19, 29; 46) | 24 (-; 19) | 34 | 0.6720 / 0.6672 | 4,084 s |
+  | df88 | rfdetr nano 384 | F2 | 55 (40; 50) | 45 (-; 40) | 30 | 0.7407 / 0.7407 | 1,050 s |
+  | 5dfd | rfdetr nano 384 | F2 | 48 (23, 33; 43) | 28 (-; 23) | 46 | 0.7285 / 0.7285 | 2,066 s |
+  | a39b | rfdetr nano 384 | F2 | 56 (27, 41; 51) | 46 (27; 41) | 54 | 0.7288 / 0.7285 | 556 s |
+  | dee4 | rfdetr nano 384 | F2 | 40 (-; 35) | 40 (-; 35) | 24 | 0.5251 / 0.5251 | 0 s |
+  | 4813 | rfdetr nano 384 | F2 | 50 (25, 35; 45) | 30 (-; 25) | 13 | 0.6368 / 0.6368 | 5,371 s |
+  | 4a15 | rfdetr nano 384 | F2 | 44, stopped by hand (33, 43) | 38 (-; 33) | 23 | 0.6304 / 0.6304 | 1,596 s |
 - **Anneal, then stop** (RF-DETR, `--anneal N`, 0 = off for the other trainers, whose schedules
-  already decay): the first stop point that would stop (no extension left or the loss no longer
-  falling, before the last epoch) instead trains `N` more epochs, at most up to the epochs, with a
+  already decay): the first stop point that would stop (no extension left or the validation no
+  longer improving, before the last epoch) instead trains `N` more epochs, at most up to the epochs, with a
   lowered learning rate, then stops ("converged"); stop points during the anneal are ignored and
   Finish now still stops at once. `N = max(5, ceil(patience / 2))` with early stopping on
   (`TrainRecipe::anneal_epochs`; 5 for the recommended patience 10, 10 for a doubled 20), in the
@@ -721,7 +782,7 @@ is switched off so only this one decides:
   current factor f0 down to `--lr-min-factor` (0.1) along a half cosine over those epochs' optimizer
   steps (never above the schedule; `bend_lambda_lr`, tested with a stand-in scheduler); another
   scheduler is logged and only anneals-then-stops. It prints `@train {"event":"anneal","epoch":E,
-  "until":U,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n}` and the page shows "Early stop
+  "until":U,"best_epoch":B,"best":v,"rising":f,"extensions":n}` and the page shows "Early stop
   reached at epoch E (best epoch B, mAP v). Lowering the learning rate until epoch U, then
   stopping." (with Stop now / Continue) and "lowering the learning rate until epoch U, then
   stopping" in the run's progress line. The best checkpoint is still the one exported, usually one
@@ -828,8 +889,8 @@ checks the file after each epoch; a stale one is removed before training starts.
 cancels.
 
 **The `stop` event.** When the rule (or the stop file) ends training the script prints
-`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n,"anneal_until":U|null}`
-(the log line says why: "training loss no longer falling", that the extensions or epochs ran out, or
+`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"rising":f,"extensions":n,"anneal_until":U|null}`
+(the log line says why: "validation no longer improving", that the extensions or epochs ran out, or
 that the learning rate was lowered for N epochs after the stop point). The page shows
 "best epoch B, M epochs without improvement (stops at patience P)" while training and then
 "converged at epoch N (best B)" or "finished on request at epoch N (best B)"; `train run` prints the same
@@ -857,6 +918,12 @@ row states their size. Cancelling a retry returns the run to its failure.
 | YOLO26, YOLO11, YOLOv8 | `run/weights/best.pt`, else `last.pt` | yes, the best epoch so far |
 | RF-DETR | `rfdetr-out/checkpoint_best_total.pth`, else the running `checkpoint_best_ema.pth` / `_regular.pth` | yes, the best epoch so far |
 | RT-DETRv2, D-FINE | `hf-best/` (saved at every new best epoch; `save_strategy="no"` keeps nothing else) | yes, the best epoch so far; not for runs of older versions |
+
+rfdetr's interval archives (`checkpoint_<epoch>.ckpt`, 483 MB each for a nano, every 10 epochs by default;
+one run left 3.1 GB of them) are off: the script passes `checkpoint_interval = epochs + 1`, an interval
+Lightning never reaches. rfdetr 1.11 still writes `last.ckpt` every epoch and its `BestModelCallback` the
+`checkpoint_best_*.pth` files above (checked in the installed package; an rfdetr that refuses the setting
+trains with its default, as for the other optional settings).
 
 Measured on an M1 with a 16-frame set, 2 epochs: YOLO26n, RF-DETR nano and RT-DETRv2 S each exported after
 a failed export and after `kill -9` during training (RF-DETR from `checkpoint_best_ema.pth`), in 3 to 7 s. D-FINE
@@ -1276,6 +1343,15 @@ patch x windows` (nano 384 -> 544, small 512 -> 672, medium 576 -> 736, base 560
 suggested instead of 16. The other RF-DETR sizes keep their constants, now scaled by their multi-scale
 side, so their estimates rose 1.5-2.25x (conservative until measured).
 
+On CUDA, RF-DETR nano and D-FINE S use constants from full runs on a GTX 1070 Ti (`estimate::cuda_memory`):
+the peak `mem_gb` (`max_memory_reserved`) of 14 runs plus 400 MB for the CUDA context
+(`CUDA_CONTEXT_MB`, outside that peak). RF-DETR nano: 1000 MB + 325 MB per image at 384 px (3.09 GiB at
+batch 4 and 5.57-5.62 GiB at batch 8 multi-scale; its 640 px runs come out 24% high); D-FINE S: 800 +
+385 (3.39 GiB at batch 8, 640 px). The old shared constants said 11.7 GB for nano at batch 8 where 5.6
+GiB was measured, so `auto` multi-scale and the start-of-run warning misjudged 8 GB cards; now 6.2 GB.
+The suggested batch and `auto` multi-scale use the constants of the run's device (CUDA or MPS); the
+sizes not measured on CUDA keep the shared table there.
+
 **RF-DETR multi-scale** (`multi_scale` in the recipe: page form field `multi_scale`, `train run
 --multi-scale auto|on|off`, script `--multi-scale on|off`): `auto` (default) keeps rfdetr's
 multi-scale training when the estimate fits batch 4 or more with it, else trains at the input size
@@ -1313,7 +1389,7 @@ run per row; repeats of the baseline varied by about 4% in `img_s`.
 | Multi-scale off (384 px only) | 84 s | 1.98 / 1.98 | 3.9 / 3.8 | as `auto` when batch 4 does not fit |
 | AMP off (fp32) | 88 s | 1.92 / 1.88 | 7.5 / 9.9 | no: no faster, more memory |
 | AMP bf16 | - | - | - | n/a: rfdetr keeps fp16 on MPS (warns) |
-| No `gc.collect()` + `empty_cache()` after validation | 87-89 s | 1.94 / 1.86 | 6.5 / 9.2 | kept the release (0.2-1.2 GB lower in epoch 2, same speed) |
+| No `gc.collect()` + `empty_cache()` after validation | 87-89 s | 1.94 / 1.86 | 6.5 / 9.2 | kept the release on MPS (0.2-1.2 GB lower in epoch 2, same speed); CUDA skips it (its caching allocator reuses the blocks, so emptying it every epoch only costs the next epoch's allocations) |
 | Batch 16 (the failed run's), MPS cap 1.0 | - | - | out of memory after 52 s | the cap: fails fast instead of swapping 35 min |
 | Batch 8, MPS cap 1.0 | 86 s (through the CLI) | 1.97 | 11.4 (one run ran out of memory after 87 s) | batch 4 suggested |
 
@@ -1330,8 +1406,8 @@ at batch 16 after about a minute, retried at batch 8, trained (11.4 GB peak, 1.9
 / 0.82, 2.3-2.5 img/s, 7.1 GB.
 
 Not measurable here (no NVIDIA GPU), implemented behind the capability checks and unmeasured: TF32
-matmuls and cuDNN convolutions on compute capability 8.0+, `cudnn.benchmark` for Ultralytics (fixed
-input size), transformers `bf16` instead of `fp16` on 8.0+, `pin_memory` and persistent workers on
+matmuls and cuDNN convolutions on compute capability 8.0+, `cudnn.benchmark` for Ultralytics and
+transformers (fixed input size; not rfdetr, whose multi-scale batches change size), transformers `bf16` instead of `fp16` on 8.0+, `pin_memory` and persistent workers on
 CUDA, and Linux / Windows data loader workers raised from half the cores (at most 4) to all cores but
 one (at most 8).
 

@@ -40,8 +40,13 @@ pub const MIN_HELDOUT_FRAMES: usize = 10;
 pub const MIN_SCENE_FRAMES: usize = 50;
 /// Disk the run's work folder takes, as a multiple of the base weights. Measured on 2-epoch runs:
 /// YOLO26n 16 MB of 5.5 MB (best + last), RT-DETRv2 S 77 MB of 81 MB, RF-DETR nano 1.2 GB of 366 MB
-/// (the mapped base, `last.ckpt` with the optimizer, the best checkpoints).
-pub const WORK_WEIGHT_FACTOR: u64 = 4;
+/// (the mapped base, `last.ckpt` with the optimizer, the best checkpoints). Two full RF-DETR nano
+/// runs kept their work (2026-10-31, `du`): 3.5 GB and 1.6 GB, of which 5 and 1 interval archives
+/// of 483 MB (`checkpoint_<epoch>.ckpt`, which the script now turns off: `checkpoint_interval`),
+/// so 1.1 GB without them (3.2x: mapped base 350 MB, `last.ckpt` 483 MB, three best checkpoints of
+/// 121 MB, `last_ema.pth` 68 MB); 5x leaves room for an rfdetr that refuses the setting (one
+/// archive) and for the larger sizes' optimizer state.
+pub const WORK_WEIGHT_FACTOR: u64 = 5;
 /// Disk per frame beyond its image: the label file, its share of the COCO JSON and the lists.
 pub const LABEL_BYTES_PER_FRAME: u64 = 8 * 1024;
 
@@ -658,7 +663,7 @@ pub fn refusal(needs: &[(VolumeNeed, Option<Space>)]) -> Option<String> {
 /// size ([`super::estimate`], RF-DETR multi-scale as the run decides it). None when the family
 /// and size have no estimate there.
 pub fn gpu_need(recipe: &TrainRecipe, accel: &Accelerator) -> Option<vram::JobNeed> {
-    let multi_scale = recipe.multi_scale_on(accel.memory_mb());
+    let multi_scale = recipe.multi_scale_on(accel.memory_mb(), accel.target());
     let est = super::estimate::estimate_with(
         recipe.family,
         &recipe.size,
