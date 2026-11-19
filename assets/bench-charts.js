@@ -324,6 +324,8 @@
         var body = el("tbody"); t.rows.forEach(function (r) { var row = el("tr"); r.forEach(function (c, i) { row.appendChild(el("td", i ? "num" : null, c)); }); body.appendChild(row); }); tb.appendChild(body);
         var w = el("div", "scroll"); w.tabIndex = 0; w.setAttribute("role", "region"); w.setAttribute("aria-label", ((holder.querySelector("svg > title") || {}).textContent || o.title || "Chart") + ": data");
         w.appendChild(tb); d.appendChild(w);
+        // Sortable (sort.js); one remembered sort per kind of chart (`thr:<model>` -> `chart:thr`).
+        if (window.PrismSort) PrismSort.attach(tb, {key: "chart:" + String(o.key).split(":")[0]});
       });
       box.appendChild(d);
     }

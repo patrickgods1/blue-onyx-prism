@@ -811,6 +811,35 @@ address. Every page below needs a sign-in:
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
 
+#### Sorting tables
+
+Click a column header to sort a table by it, and click it again for the other direction.
+Shift-click another header to add it as the next sort key; the headers then show the rank of
+each key (1, 2, ...). On a phone, where the tables show as cards without headers, a **Sort by**
+list above the table does the same. **Default order** (or **Best first**, on tables whose own order
+ranks the rows) puts the table back in its own order. Each browser remembers the sort of each table
+(in its local storage; a private window forgets it); tables the page updates live keep it. Rows
+that belong to another (a run's training details) move with it, and summary rows stay at the end.
+
+What **Best first** means, table by table (the server decides it; the page only sorts by it):
+
+- **Home** and **Stats** models: the benchmark ranking (overall grade, then accuracy, then speed, each
+  model on its recommended device); models without benchmark results follow in config order.
+- **Config → Models**: no best order; the config order (the load order) is the table's own order.
+- **Benchmark → All results, Confidence, a model's devices (Details) and Tune**: each model on each
+  device ranked by the same grades (the `points` of `GET /v1/benchmark`); rows of runs picked from
+  the history follow.
+- **Benchmark → Compare** (models on the same images): the headline's rule: people found, then
+  vehicles, then all objects, a difference counting only past the noise; models level on all three
+  by fewer false alerts; models that trained on these images last.
+- **Train → Models → Comparison**: person recall, then vehicle recall, then AP50-95 on every
+  held-out frame (missing values last); routed and seed-summary rows stay at the bottom.
+- **Train → Models → Use a trained model**: grouped by held-out set (runs scored on the same
+  held-out frames with the same classes and merges), newest group first; inside a group, best
+  first by the Comparison's rule. A sort by a column sorts inside each group.
+- The **HTML benchmark report** sorts too (opened from disk); its tables start in their own order
+  (the ranking in rank order).
+
 #### Prometheus metrics
 
 Counters and histograms live for the whole process and survive in-process restarts; a model removed

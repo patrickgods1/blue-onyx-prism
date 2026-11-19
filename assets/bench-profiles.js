@@ -1,7 +1,8 @@
 // Blue Onyx Prism: Benchmark page, the Tune tab (PrismBench.profiles).
 // Profiles: one card per model (id "m-<model>") with one row per device it ran on: speed, finds,
 // correct, the best confidence for the saved goal, the saved profile and a "Run on" radio (the
-// choice is remembered per browser, PrismBench.choice). Save: the plain list of what saving
+// choice is remembered per browser, PrismBench.choice); the rows are sortable (sort.js), best
+// first by default (the server's ranking of model x device, PB.pointRank). Save: the plain list of what saving
 // changes (built from status.profiles and the choices), one POST to
 // /v1/benchmark/apply-profiles per button, the answer with Undo (the server's `undo` pairs) and
 // "Restart now" only when the answer says needsRestart.
@@ -103,10 +104,13 @@
     // Numeric columns: their headings sit over the right-aligned numbers.
     var NUM = {speed: 1, finds: 1, correct: 1, best_conf: 1, saved_conf: 1};
     ["device", "speed", "finds", "correct", "best_conf", "saved_conf", "run_on"].forEach(function (id) { th(tr, id, NUM[id] ? "num" : null); });
+    // The radios are a choice, not data: not a sort key.
+    tr.lastChild.setAttribute("data-sort-off", "");
     hd.appendChild(tr); t.appendChild(hd);
     var body = el("tbody"), pick = chosen(p);
     (p.devices || []).forEach(function (d) {
-      var r = el("tr"), ok = d.ok && !d.fellBack;
+      var r = el("tr"), ok = d.ok && !d.fellBack, best = PB.pointRank(S.j, p.model, d.device);
+      if (typeof best === "number") r.setAttribute("data-best", String(best));
       if (ok && d.device === pick) r.classList.add("hl");
       var dc = el("span", "nowrap"); dc.appendChild(el("code", null, d.device)); if (d.label) dc.title = d.label;
       if (d.recommended) { var rt = el("span", "tag rec", "Recommended"); rt.title = "The best device for this model and your goal"; dc.appendChild(rt); }
@@ -134,6 +138,7 @@
     });
     t.appendChild(body);
     var w = el("div", "scroll"); w.dataset.keep = "w:prof:" + lc(p.model); w.appendChild(t); box.appendChild(w);
+    if (window.PrismSort) PrismSort.attach(t, {key: "profiles", defaultKeys: [{col: "best", dir: "asc"}]});
     return box;
   }
   function renderCards(j) {
@@ -146,7 +151,8 @@
     // A notice left from an older answer is not a keyed card: start over.
     if (Array.prototype.some.call(box.children, function (c) { return c.dataset.patchKey === undefined; })) box.replaceChildren();
     L.patch(box, list.map(function (p) {
-      return {key: lc(p.model), sig: JSON.stringify([p, chosen(p), running]), build: function () { return card(p, running); }};
+      var best = (p.devices || []).map(function (d) { return PB.pointRank(j, p.model, d.device); });
+      return {key: lc(p.model), sig: JSON.stringify([p, chosen(p), running, best]), build: function () { return card(p, running); }};
     }));
   }
 

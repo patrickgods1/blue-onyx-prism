@@ -152,9 +152,11 @@
           var hint = document.createElement("span"); hint.className = "muted"; hint.textContent = " " + none[1];
           td.appendChild(hint);
         }
-        tr.appendChild(td); tbody.appendChild(tr);
+        tr.dataset.sortPin = "top"; tr.appendChild(td); tbody.appendChild(tr);
       }
     }
+    // The user's sort of the detections (sort.js) applies to every new answer.
+    if (window.PrismSort) PrismSort.apply(document.getElementById("detections"));
     document.getElementById("client-result").hidden = false;
     var img = new Image();
     img.onload = function () { draw(img, j.success ? (j.predictions || []) : []); };

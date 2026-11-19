@@ -271,17 +271,20 @@ document.addEventListener("click", function (e) {
     typed[tr.dataset.model + "\n" + thrParts(tr).key.value] = t.value;
   });
 
-  // Models card: rows keyed by model; a new or removed model re-renders the card.
+  // Models card: rows keyed by model; a new or removed model re-renders the card. The SET of
+  // models decides, never their order: the card may be sorted (sort.js), and a sorted card would
+  // otherwise be fetched again on every poll.
   function refreshCard(j, force) {
-    var rows = card.querySelectorAll("tbody tr[data-model]");
-    var names = Array.prototype.map.call(rows, function (r) { return r.dataset.model; }).join("\n");
-    if (names !== j.models.map(function (m) { return m.key; }).join("\n")) { reloadCard(force); return; }
+    var rows = card.querySelectorAll("tbody tr[data-model]"), byKey = {};
+    Array.prototype.forEach.call(rows, function (r) { byKey[r.dataset.model] = r; });
+    var names = Object.keys(byKey).sort().join("\n");
+    if (rows.length !== j.models.length || names !== j.models.map(function (m) { return m.key; }).sort().join("\n")) { reloadCard(force); return; }
     var upd = function (ctl, v) {
       if (force) { U.set(ctl, v); U.note(ctl, null); ctl.classList.remove("edited"); return; }
       U.refresh(ctl, v, show);
     };
-    j.models.forEach(function (m, i) {
-      var tr = rows[i];
+    j.models.forEach(function (m) {
+      var tr = byKey[m.key];
       upd(tr.querySelector("input[name=enabled]"), m.enabled);
       var rm = tr.querySelector("button.model-remove");
       if (rm) { rm.disabled = m.enabled; rm.title = m.enabled ? "Enabled: disable it first (untick Load and save), then remove it" : "Remove this entry from the config and delete its model files in the models folder"; }
@@ -318,6 +321,9 @@ document.addEventListener("click", function (e) {
       if (mine && mine.value === defName) radios.forEach(function (r) { r.defaultChecked = r.checked; });
     }
     card.querySelector(".restart-now").hidden = !j.restartNeeded;
+    // Values a sort may use (Load, Default, Running, ...) changed: the user's sort again.
+    var mt = card.querySelector("table.model-card");
+    if (mt && window.PrismSort) PrismSort.apply(mt);
   }
 
   // Re-render the Models card from a fresh /config, carrying the user's unsaved edits over.
@@ -797,7 +803,7 @@ document.addEventListener("click", function (e) {
     if (!items.length) { wrap.appendChild(el("p", "muted", "Nothing here.")); return wrap; }
     var scroll = el("div", "scroll"), t = el("table", "storage rcards");
     var head = el("thead"), hr = el("tr");
-    ["Item", "Size", "Action"].forEach(function (c) { hr.appendChild(el("th", c === "Size" ? "num" : null, c)); });
+    ["Item", "Size", "Action"].forEach(function (c) { var th = el("th", c === "Size" ? "num" : null, c); if (c === "Action") th.setAttribute("data-sort-off", ""); hr.appendChild(th); });
     head.appendChild(hr); t.appendChild(head);
     var tb = el("tbody");
     items.forEach(function (i) {
@@ -819,6 +825,9 @@ document.addEventListener("click", function (e) {
       tb.appendChild(tr);
     });
     t.appendChild(tb); scroll.appendChild(t); wrap.appendChild(scroll);
+    // Sortable (sort.js); every re-render (a poll while measuring) builds it again with the sort
+    // the user chose.
+    if (window.PrismSort) PrismSort.attach(t, {key: title === "Safe to clear" ? "storage-safe" : "storage-data"});
     return wrap;
   }
   function render(j) {

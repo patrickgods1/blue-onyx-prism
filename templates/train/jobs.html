@@ -4,7 +4,7 @@
   {% if !runs.is_empty() %}
   <h3>Training runs</h3>
   <div class="scroll">
-  <table id="training-runs" class="rcards">
+  <table id="training-runs" class="rcards" data-sort="runs">
     <thead><tr><th>Run</th><th>Model</th><th>State</th><th>Progress</th><th></th></tr></thead>
     <tbody>
     {% for r in runs %}
@@ -24,7 +24,7 @@
         {% if !r.files.size.is_empty() %}<form method="post" action="/training/remove" class="inline" data-confirm="Delete the files of run {{ r.name }} ({{ r.files.size }}) from this machine?"><input type="hidden" name="id" value="{{ r.id }}"><input type="hidden" name="tab" value="{{ tab }}"><input type="hidden" name="delete_files" value="1"><button type="submit" class="small danger">Remove and delete files ({{ r.files.size }})</button></form>{% endif %}{% endif %}
       </td>
     </tr>
-    <tr class="tr-metrics-row" hidden><td colspan="5"><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
+    <tr class="tr-metrics-row" data-sort-follow hidden><td colspan="5"><div class="tr-metrics" data-run="{{ r.id }}"></div></td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -34,7 +34,7 @@
   <details class="tr-tasks"{% if tasks_busy %} open{% endif %}>
   <summary>Import and auto-label jobs ({{ tasks.len() }})</summary>
   <div class="scroll">
-  <table id="training-tasks" class="rcards">
+  <table id="training-tasks" class="rcards" data-sort="tasks">
     <thead><tr><th>Job</th><th>State</th><th>Progress</th><th></th></tr></thead>
     <tbody>
     {% for r in tasks %}

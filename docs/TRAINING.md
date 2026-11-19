@@ -971,6 +971,19 @@ The dataset folders a run uses are checked too: a ticked folder is used as is on
 offered it (`training.datasets` or an export under `<training dir>/exports`); any other value, the typed
 *Another folder* and its *Save folder* must be a browsable folder or one picked in the native dialog.
 
+**The results list** (Models tab, *Use a trained model*) groups the finished runs by what makes their
+held-out scores comparable: the held-out fingerprint of their benchmark, their trained classes and
+their class merges (`server::training::result_groups`). Each group starts with a header row ("Held-out
+set 3f2a1c…, 4 runs — scores compare only inside a group"; a held-out set two groups share names their
+classes and merges); a run without a benchmark is its own group ("Not benchmarked"), and so is a run
+of an older version without a fingerprint. Groups come newest first (by their newest run); inside a
+group the runs come best first by the Comparison's rule (`training::compare::best_order_by`: person
+recall, then vehicle recall, then AP50-95 on every held-out frame, each highest first, a missing value
+last; equal runs newest first). Person R, Vehicle R and AP50-95 are columns beside the benchmark
+sentence (a dash without a benchmark); a click on a header sorts the runs inside each group
+(`data-sort-group` in `assets/sort.js`), never across groups, and **Best first** goes back. The
+Comparison card's runs start in the same best-first order, its routed and seed rows at the bottom.
+
 **Use as** (Trained models card): *Use as default* first shows what changes (`GET
 /v1/training/switch-preview`, `training/switch.rs`): thresholds, classes (a class reported today and
 not after the switch is called out, since Blue Iris may filter on labels), night model, filters,

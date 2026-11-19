@@ -42,7 +42,8 @@
           trust: d.trust, recommended: m.recommended === d.device, fellBack: !!r.fell_back, datasets: m.datasets || [], timestamp: m.timestamp, thisRun: m.this_run, trainedOn: m.trained_on_share,
           curve: sweep && sweep.overall ? sweep.overall.points : adv ? adv.curve : null,
           roc: sweep && sweep.roc && sweep.roc.curve && sweep.roc.curve.length ? sweep.roc.curve : adv && adv.roc ? adv.roc.curve : null,
-          threshold: acc ? acc.threshold : null
+          threshold: acc ? acc.threshold : null,
+          best: PB.pointRank(j, m.model, d.device)
         });
       });
     });
@@ -232,6 +233,9 @@
       key: "compare", cls: "stack cmp-table", rows: rows, columns: columns,
       filters: {model: function (r) { return r.model; }, device: function (r) { return r.device; }, runtime: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }, thisRun: function (r) { return r.thisRun; }},
       text: function (r) { return r.model + " " + r.device + " " + r.runtime; },
+      // Best first: the server's ranking of model x device (points); rows of picked history runs
+      // have none and follow.
+      sort: {col: "best", dir: "asc"}, best: function (r) { return r.best; },
       rowAttrs: function (r, tr) {
         tr.dataset.key = r.key; if (r.key === S.selected) tr.classList.add("hl");
         tr.addEventListener("click", function (e) { if (e.target.closest("button")) return; S.selected = r.key; highlight(); });

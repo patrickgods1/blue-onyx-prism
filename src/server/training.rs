@@ -430,6 +430,117 @@ struct ResultRow {
     files: RunFiles,
     /// The Remove button's confirmation.
     confirm: String,
+    /// Held-out person recall, vehicle recall and AP50-95 on every held-out frame (a dash
+    /// without a benchmark): the sortable columns beside the sentence.
+    person_r: String,
+    vehicle_r: String,
+    ap: String,
+    /// Its place in its group's Best first order ([`compare::best_order_by`], `data-best`).
+    best: usize,
+}
+
+/// Runs whose held-out scores compare: the same held-out frames
+/// ([`BenchSummary::heldout_fingerprint`]), trained classes and class merges.
+type HeldoutKey = (String, Vec<String>, BTreeMap<String, String>);
+
+/// [`HeldoutKey`] of a finished run; None without a benchmark or a fingerprint (a run of an
+/// older version): such a run compares with nothing and is a group of its own.
+fn heldout_key(r: &RunRecord) -> Option<HeldoutKey> {
+    let fp = r.benchmark.as_ref()?.heldout_fingerprint.clone()?;
+    let classes = r.output.as_ref()?.classes.clone();
+    Some((fp, classes, r.request.rename.clone()))
+}
+
+/// One group of the Models tab's results list: the runs of one [`HeldoutKey`] (or one run
+/// that compares with nothing), best first.
+struct ResultGroup {
+    /// The group's header row ("Held-out set 3f2a1c..., 4 runs ...").
+    head: String,
+    rows: Vec<ResultRow>,
+}
+
+/// One finished run for [`result_groups`].
+struct GroupItem {
+    key: Option<HeldoutKey>,
+    benchmarked: bool,
+    keys: compare::BestKeys,
+    row: ResultRow,
+}
+
+/// The results list in groups of runs whose held-out scores compare (`items` newest first): the
+/// groups in the order of their newest run, each best first ([`compare::best_order_by`]: person
+/// R, vehicle R, AP50-95; equal ones newest first), `best` set to the place in the group.
+fn result_groups(items: Vec<GroupItem>) -> Vec<ResultGroup> {
+    let mut groups: Vec<(Option<HeldoutKey>, bool, Vec<GroupItem>)> = Vec::new();
+    for it in items {
+        match groups.iter_mut().find(|g| g.0.is_some() && g.0 == it.key) {
+            Some(g) => g.2.push(it),
+            None => groups.push((it.key.clone(), it.benchmarked, vec![it])),
+        }
+    }
+    // A held-out set two groups share (other classes or merges) names what differs.
+    let shared = |fp: &str| {
+        groups
+            .iter()
+            .filter(|g| g.0.as_ref().is_some_and(|k| k.0 == fp))
+            .count()
+            > 1
+    };
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|(key, benchmarked, items)| match key {
+            Some((fp, classes, rename)) => {
+                let short: String = fp.chars().take(6).collect();
+                let n = items.len();
+                let mut head = format!(
+                    "Held-out set {short}\u{2026}, {n} run{}",
+                    if n == 1 { "" } else { "s" }
+                );
+                if shared(fp) {
+                    head.push_str(&format!(", classes {}", classes.join(", ")));
+                    let merges = merges_text(rename);
+                    if !merges.is_empty() {
+                        head.push_str(&format!(" ({merges})"));
+                    }
+                }
+                if n > 1 {
+                    head.push_str(" \u{2014} scores compare only inside a group");
+                }
+                head
+            }
+            None if *benchmarked => {
+                "Held-out set not recorded (a run of an older version): its scores compare with \
+                 no other run"
+                    .to_string()
+            }
+            None => "Not benchmarked".to_string(),
+        })
+        .collect();
+    groups
+        .into_iter()
+        .zip(heads)
+        .map(|((_, _, items), head)| {
+            let keys: Vec<compare::BestKeys> = items.iter().map(|i| i.keys).collect();
+            let order = compare::best_order_by(&keys);
+            let mut slots: Vec<Option<GroupItem>> = items.into_iter().map(Some).collect();
+            let rows = order
+                .into_iter()
+                .enumerate()
+                .filter_map(|(place, i)| {
+                    let mut row = slots.get_mut(i)?.take()?.row;
+                    row.best = place + 1;
+                    Some(row)
+                })
+                .collect();
+            ResultGroup { head, rows }
+        })
+        .collect()
+}
+
+/// A recall as the Models tab shows it (`0.39`; a dash when unknown).
+fn recall_text(v: Option<f64>) -> String {
+    v.filter(|v| v.is_finite())
+        .map_or_else(|| "\u{2014}".into(), |v| format!("{v:.2}"))
 }
 
 /// One GPU of the page's GPU selects (a PC with more than one usable NVIDIA GPU).
@@ -535,6 +646,9 @@ struct CompareRowView {
     alerts: Vec<AlertCell>,
     /// AP50-95 on the held-out random picks (shown with [`CompareCard::random`]).
     random: AlertCell,
+    /// Its place in the card's Best first order ([`compare::best_order`], `data-best`); None for
+    /// a routed row.
+    best: Option<usize>,
 }
 
 /// The "mean of N seeds" row of a Comparison card.
@@ -814,7 +928,8 @@ pub(super) struct TrainingTemplate {
     /// What none ticked runs on: the device `auto` picks (a model without its own device).
     bench_auto: String,
     runs: Vec<RunRow>,
-    results: Vec<ResultRow>,
+    /// Finished runs in groups whose held-out scores compare ([`result_groups`]).
+    results: Vec<ResultGroup>,
     models: Vec<String>,
     /// The models folder (where a trained model goes by default).
     models_dir: String,
@@ -1041,6 +1156,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
         .map(|(i, (group, runs))| {
             let c = compare::compare(&runs.iter().map(|r| compare_run(r)).collect::<Vec<_>>());
             let best = |row: usize, col: &str| c.best_per_column.get(col) == Some(&row);
+            let order = compare::best_order(&c.rows);
             let rows = c
                 .rows
                 .iter()
@@ -1079,6 +1195,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                         (None, None) => "\u{2014}".into(),
                     };
                     CompareRowView {
+                        best: order.iter().position(|&i| i == k).map(|p| p + 1),
                         name: row.name.clone(),
                         seed: row.seed,
                         model: row.model.clone(),
@@ -1479,42 +1596,53 @@ fn view_with(
         .collect();
     let names: Vec<String> = config.models.iter().map(|m| m.effective_name()).collect();
     let current = crate::training::switch::current_default(&config).unwrap_or_default();
-    let results = all
-        .iter()
-        .rev()
-        .filter(|r| r.state == RunState::Done)
-        .filter_map(|r| {
-            let o = r.output.as_ref()?;
-            Some(ResultRow {
-                id: r.id.clone(),
-                name: o.name.clone(),
-                family: format!("{} ({})", r.request.recipe.label(), o.family),
-                license: o.license.clone(),
-                classes: o.classes.join(", "),
-                merges: merges_text(&r.request.rename),
-                benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
-                compare_href: compare_href(r.benchmark.as_ref()),
-                compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
-                trained_on: r
-                    .benchmark
-                    .as_ref()
-                    .and_then(|b| b.trained_on_share)
-                    .and_then(bench::trained_chip)
-                    .unwrap_or_default(),
-                is_default: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name))
-                    && o.name.eq_ignore_ascii_case(&current),
-                finished: r
-                    .finished
-                    .as_deref()
-                    .map(crate::clock::display_stored)
-                    .unwrap_or_default(),
-                in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
-                warnings: warnings_of(r),
-                confirm: RunFiles::of(r).confirm(r),
-                files: RunFiles::of(r),
+    let results = result_groups(
+        all.iter()
+            .rev()
+            .filter(|r| r.state == RunState::Done)
+            .filter_map(|r| {
+                let o = r.output.as_ref()?;
+                let keys = compare::best_keys(r.benchmark.as_ref());
+                Some(GroupItem {
+                    key: heldout_key(r),
+                    benchmarked: r.benchmark.is_some(),
+                    keys,
+                    row: ResultRow {
+                        person_r: recall_text(keys[0]),
+                        vehicle_r: recall_text(keys[1]),
+                        ap: ap_text(keys[2]),
+                        best: 0,
+                        id: r.id.clone(),
+                        name: o.name.clone(),
+                        family: format!("{} ({})", r.request.recipe.label(), o.family),
+                        license: o.license.clone(),
+                        classes: o.classes.join(", "),
+                        merges: merges_text(&r.request.rename),
+                        benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
+                        compare_href: compare_href(r.benchmark.as_ref()),
+                        compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
+                        trained_on: r
+                            .benchmark
+                            .as_ref()
+                            .and_then(|b| b.trained_on_share)
+                            .and_then(bench::trained_chip)
+                            .unwrap_or_default(),
+                        is_default: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name))
+                            && o.name.eq_ignore_ascii_case(&current),
+                        finished: r
+                            .finished
+                            .as_deref()
+                            .map(crate::clock::display_stored)
+                            .unwrap_or_default(),
+                        in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
+                        warnings: warnings_of(r),
+                        confirm: RunFiles::of(r).confirm(r),
+                        files: RunFiles::of(r),
+                    },
+                })
             })
-        })
-        .collect();
+            .collect(),
+    );
     let default_model = config
         .effective_default_index()
         .and_then(|i| config.models.get(i))
@@ -5307,6 +5435,130 @@ pub(super) mod tests {
         // The route names what is wrong.
         let (_, _, b) = call(&state, post_form("/training/retry-export", "id=nope", true)).await;
         assert!(String::from_utf8(b).unwrap().contains("no run nope"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Models tab's results list: groups of runs whose held-out scores compare (fingerprint,
+    /// classes, merges), newest group first, each led by its header row and best first (person
+    /// R, vehicle R, AP50-95), with the three figures as sortable columns.
+    #[test]
+    fn the_results_list_groups_runs_by_comparable_heldout_set() {
+        use crate::server::test_util::test_state_with;
+        use askama::Template;
+        let root = std::env::temp_dir().join(format!("bop-train-groups-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let done = |id: &str, person: Option<f64>, print: Option<&str>| {
+            let mut r = record(
+                id,
+                SceneFilter::DAY,
+                None,
+                RunState::Done,
+                person.map(|p| (p, 0.2, 0.1)),
+            );
+            if let Some(b) = r.benchmark.as_mut() {
+                b.heldout_fingerprint = print.map(str::to_string);
+            }
+            r.output = Some(TrainOutput {
+                name: r.name.clone(),
+                onnx: root.join(format!("{id}.onnx")),
+                yaml: root.join(format!("{id}.yaml")),
+                provenance: root.join(format!("{id}.provenance.json")),
+                family: ModelFamilyKind::Yolo26,
+                classes: vec!["person".into()],
+                license: "AGPL-3.0".into(),
+                heldout: None,
+                device: "mps".into(),
+                train_seconds: 1.0,
+            });
+            r
+        };
+        let mut merged = done("g3", Some(0.9), Some("f1f1f1f1"));
+        merged.request.rename = [("truck".to_string(), "car".to_string())].into();
+        // Queue order, oldest first.
+        let recs = vec![
+            done("g1a", Some(0.5), Some("f1f1f1f1")),
+            done("g1b", Some(0.7), Some("f1f1f1f1")),
+            done("g2", Some(0.1), Some("f2abcdef99")),
+            done("old", Some(0.3), None),
+            done("nob", None, None),
+            done("g1c", Some(0.6), Some("f1f1f1f1")),
+            merged,
+        ];
+        let page = view_with(
+            &state,
+            MODELS,
+            None,
+            None,
+            recs,
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
+        let i = page.find("id=\"use\"").expect("the Use card");
+        let card = &page[i..page[i..].find("</table>").map_or(page.len(), |e| i + e)];
+        assert!(
+            card.contains(
+                "data-sort=\"results\" data-sort-default=\"best\" data-sort-cols=\",,,,,,,,-\""
+            ),
+            "{card}"
+        );
+        // The rows in page order: group heads and runs.
+        let order: Vec<String> = card
+            .split("<tr")
+            .skip(1)
+            .filter_map(|t| {
+                if t.starts_with(" class=\"tr-group\" data-sort-group><td colspan=\"9\">") {
+                    let head = t
+                        .split("<td colspan=\"9\">")
+                        .nth(1)?
+                        .split("</td>")
+                        .next()?;
+                    Some(format!("# {head}"))
+                } else if t.starts_with(" data-best=\"") {
+                    let best = t.split('"').nth(1)?;
+                    let name = t.split("<code>").nth(1)?.split("</code>").next()?;
+                    Some(format!("{best} {name}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "# Held-out set f1f1f1\u{2026}, 1 run, classes person (merged: truck \u{2192} car)",
+                "1 day-yolo26n-g3",
+                "# Held-out set f1f1f1\u{2026}, 3 runs, classes person \u{2014} scores compare only \
+                 inside a group",
+                "1 day-yolo26n-g1b",
+                "2 day-yolo26n-g1c",
+                "3 day-yolo26n-g1a",
+                "# Not benchmarked",
+                "1 day-yolo26n-nob",
+                "# Held-out set not recorded (a run of an older version): its scores compare with \
+                 no other run",
+                "1 day-yolo26n-old",
+                "# Held-out set f2abcd\u{2026}, 1 run",
+                "1 day-yolo26n-g2",
+            ],
+            "{card}"
+        );
+        // The figures beside the sentence; a dash without a benchmark.
+        assert!(
+            card.contains("<td class=\"num\" data-label=\"Person R\">0.70</td>"),
+            "{card}"
+        );
+        assert!(card.contains("<td class=\"num\" data-label=\"Vehicle R\">\u{2014}</td>"));
+        assert!(
+            card.contains("<td class=\"num\" data-label=\"AP50-95\">0.333</td>"),
+            "{card}"
+        );
+        // The detail rows follow their run and span every column.
+        assert!(
+            card.contains("<tr class=\"tr-switch-row\" data-sort-follow hidden><td colspan=\"9\">")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -751,7 +751,7 @@
   // unchanged, defers it while the user is busy in it (selecting text, pressing the mouse, e.g.
   // dragging a scrollbar, pointing at a chart), and otherwise carries over, by stable key, the
   // scroll offsets of every `.scroll` wrapper (and any element with `data-keep`), the open state
-  // of every <details>, each table's sort column and direction, and the focused control.
+  // of every <details>, each table's sort keys (PrismSort, sort.js), and the focused control.
   // Keys: `data-keep`, else the id, else the element's kind and position in the section.
   // `patch(box, items)` does the same per child (keyed cards): only changed children are
   // rebuilt, in place.
@@ -782,9 +782,10 @@
       var e = map[k], v = {};
       if (e.scrollLeft || e.scrollTop) { v.left = e.scrollLeft; v.top = e.scrollTop; }
       if (e.tagName === "DETAILS") v.open = e.open;
-      if (e.tagName === "TABLE") {
-        var hs = e.tHead ? e.tHead.rows[0].cells : [];
-        for (var i = 0; i < hs.length; i++) if (hs[i].dataset.dir) v.sort = [i, hs[i].dataset.dir];
+      // A sorted table's sort keys (PrismSort, sort.js; loaded after this file).
+      if (e.tagName === "TABLE" && window.PrismSort && PrismSort.state) {
+        var keys = PrismSort.state(e);
+        if (keys !== undefined) v.sort = keys;
       }
       st.els[k] = v;
     });
@@ -795,27 +796,15 @@
     }
     return st;
   }
-  // Sort a table's body by column `col` (numeric when the cells carry data-v).
-  function sortTable(table, col, asc) {
-    var tb = table.tBodies[0]; if (!tb) return;
-    var rows = Array.prototype.slice.call(tb.rows);
-    table.querySelectorAll("th").forEach(function (h) { delete h.dataset.dir; h.removeAttribute("aria-sort"); });
-    var th = table.tHead && table.tHead.rows[0].cells[col]; if (th) { th.dataset.dir = asc ? "asc" : "desc"; th.setAttribute("aria-sort", asc ? "ascending" : "descending"); }
-    rows.sort(function (a, b) {
-      var x = a.cells[col], y = b.cells[col]; if (!x || !y) return 0;
-      var vx = x.dataset.v, vy = y.dataset.v;
-      if (vx !== undefined && vy !== undefined) { vx = parseFloat(vx); vy = parseFloat(vy); if (isNaN(vx)) vx = Infinity; if (isNaN(vy)) vy = Infinity; return asc ? vx - vy : vy - vx; }
-      return asc ? x.textContent.localeCompare(y.textContent) : y.textContent.localeCompare(x.textContent);
-    });
-    rows.forEach(function (r) { tb.appendChild(r); });
-  }
   function restore(root, st) {
-    var map = keyed(root);
+    var map = keyed(root), S = window.PrismSort;
     Object.keys(st.els).forEach(function (k) {
       var e = map[k], v = st.els[k]; if (!e) return;
-      if (v.sort) sortTable(e, v.sort[0], v.sort[1] === "asc");
+      if (v.sort !== undefined && e.tagName === "TABLE" && S && S.restore) S.restore(e, v.sort);
       if (v.open !== undefined && e.open !== v.open) e.open = v.open;
     });
+    // Tables of swapped-in server markup (`data-sort`) that had no twin before.
+    if (S && S.scan) S.scan(root);
     // Scroll after every <details> is open again (closed ones have no layout).
     Object.keys(st.els).forEach(function (k) {
       var e = map[k], v = st.els[k]; if (!e || v.left === undefined) return;
@@ -1172,7 +1161,6 @@
     last: function () { return last; },
     keep: keep,
     patch: patch,
-    sortTable: sortTable,
     scrollCue: scrollCue,
     tabs: tabs,
     view: {capture: capture, restore: restore, busy: busyIn},
