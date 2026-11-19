@@ -874,7 +874,9 @@ Stages (page and `train run` show them with percent and ETA):
      RAM + paging files; a paging file whose maximum is above its current size (registry
      `PagingFiles`, e.g. `c:\pagefile.sys 2935 24576`: initial 2.9 GB, maximum 24 GB) is grown by
      Windows on demand, so what it can still grow by counts: maximum less current size (the commit
-     limit less RAM), capped by its drive's free space less 4 GB. A system-managed file (`?:\` or
+     limit less RAM), capped by its drive's free space less 16 GB (the paging file is usually on the
+     system drive, which may hold Blue Iris's recordings; an auto-label job once grew it to its
+     maximum and left 236 MB free). A system-managed file (`?:\` or
      sizes `0 0`) may grow to 3 x RAM (at least 4 GB); a fixed one (initial = maximum) adds nothing,
      and so does any failed read.
    - RAM: `(available RAM - 2.6 GB - 2 GB) / (0.75 GB x loaders)`. A commit the paging file backs

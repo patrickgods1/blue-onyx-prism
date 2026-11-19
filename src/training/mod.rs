@@ -906,7 +906,8 @@ mod tests {
 
     /// The measured box (GTX 1070 Ti, i5-8600K: 6 cores, 15.9 GB RAM, `c:\pagefile.sys 2935
     /// 24576`, 19 GB free on C:): commit 23.3 GB limit, 5.4 GB free, 7.6 GB RAM available before a
-    /// run. 2 workers trained 32% faster than none; 4 were no faster and ran out of memory.
+    /// run. 2 workers trained 32% faster than none; 4 were no faster and ran out of memory. The
+    /// main case gives C: 31 GB free, so the paging file's growth is not capped below 15 GB.
     #[test]
     fn a_growable_paging_file_allows_workers_and_the_ram_caps_them() {
         use crate::backend::memory::{growable_bytes, parse_paging_files, volume_root};
@@ -922,9 +923,21 @@ mod tests {
                 |root| (root == r"C:\").then_some(disk_free),
             )
         };
-        // 24 GB max less 7.4 GB now = 16.6, but 19 GB free on C: keeps 4: 15.
-        let growable = grow(gb(23.3), gb(19.0));
+        // 24 GB max less 7.4 GB now = 16.6, but 31 GB free on C: keeps 16: 15.
+        let growable = grow(gb(23.3), gb(31.0));
         assert_eq!(growable, 15 * GB);
+        // With the 19 GB C: had when measured, the 16 GB kept leaves 3 GB of growth: no worker
+        // (commit (5.4 + 3 - 8) / 2.8 < 1), which keeps the recordings' drive from filling.
+        let tight = WorkerMemory {
+            commit: Commit {
+                limit: gb(23.3),
+                available: gb(5.4),
+            },
+            growable: grow(gb(23.3), gb(19.0)),
+            ram_available: Some(gb(7.6)),
+        };
+        assert_eq!(tight.growable, 3 * GB);
+        assert_eq!(workers_for("windows", 6, Some(tight), rf).workers, 0);
         let measured = WorkerMemory {
             commit: Commit {
                 limit: gb(23.3),

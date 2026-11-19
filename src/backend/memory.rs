@@ -46,9 +46,11 @@ pub struct Physical {
 const MIB: u64 = 1 << 20;
 
 /// Free space kept on a paging file's volume when counting how far the file can grow: Windows
-/// stops growing it near a full disk, and other writers (training checkpoints, the dataset) need
-/// room too.
-pub const PAGING_DISK_MARGIN_BYTES: u64 = 4 << 30;
+/// grows the file until the disk is nearly full, and other writers need that room. The paging
+/// file is usually on the system drive, which on a Blue Iris box often holds the recordings too:
+/// an auto-label job grew `c:\pagefile.sys` to its 24 GB maximum and left C: with 236 MB free
+/// (2026-11-18), so 4 GB was not enough to protect them.
+pub const PAGING_DISK_MARGIN_BYTES: u64 = 16 << 30;
 
 /// One line of the registry's `PagingFiles` value
 /// (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management`):
@@ -582,10 +584,19 @@ mod tests {
             grow(&this_box, ram + 15 * GB / 2, ram, &[(r"C:\", 100 * GB)]),
             33 * GB / 2
         );
-        // 19 GB free on C: keeps 4: 15.
+        // 31 GB free on C: keeps 16: 15.
+        assert_eq!(
+            grow(&this_box, ram + 15 * GB / 2, ram, &[(r"C:\", 31 * GB)]),
+            15 * GB
+        );
+        // 19 GB free keeps 16: 3; 15 GB free (this box on 2026-11-18): none.
         assert_eq!(
             grow(&this_box, ram + 15 * GB / 2, ram, &[(r"C:\", 19 * GB)]),
-            15 * GB
+            3 * GB
+        );
+        assert_eq!(
+            grow(&this_box, ram + 15 * GB / 2, ram, &[(r"C:\", 15 * GB)]),
+            0
         );
         // A full disk (or under the margin): no growth.
         assert_eq!(grow(&this_box, ram + 7 * GB, ram, &[(r"C:\", 3 * GB)]), 0);
@@ -613,7 +624,7 @@ mod tests {
         // System-managed (`?:`, on C: per ExistingPageFiles): up to 3 x RAM.
         let sm = parse_paging_files(&lines(&[r"?:\pagefile.sys"]));
         assert_eq!(grow(&sm, ram + 8 * GB, ram, &[(r"C:\", 100 * GB)]), 40 * GB);
-        assert_eq!(grow(&sm, ram + 8 * GB, ram, &[(r"C:\", 10 * GB)]), 6 * GB);
+        assert_eq!(grow(&sm, ram + 8 * GB, ram, &[(r"C:\", 22 * GB)]), 6 * GB);
         // Two files: the current 12 GB shared 1:2 by initial size (4 + 8); each volume its own cap.
         let two = parse_paging_files(&lines(&[
             r"c:\pagefile.sys 4096 16384",
@@ -621,7 +632,7 @@ mod tests {
         ]));
         let plenty = [(r"C:\", 100 * GB), (r"D:\", 100 * GB)];
         assert_eq!(grow(&two, ram + 12 * GB, ram, &plenty), 12 * GB);
-        let tight = [(r"C:\", 9 * GB), (r"D:\", 100 * GB)];
+        let tight = [(r"C:\", 21 * GB), (r"D:\", 100 * GB)];
         assert_eq!(grow(&two, ram + 12 * GB, ram, &tight), 5 * GB);
         // Initial sizes of 0 (weights 0): equal shares of the current 4 GB.
         let zero = parse_paging_files(&lines(&[r"c:\a.sys 0 8192", r"d:\b.sys 0 8192"]));
@@ -636,7 +647,7 @@ mod tests {
             24 * GB
         );
         assert_eq!(
-            grow(&same, ram + 8 * GB, ram, &[(r"C:\", 14 * GB)]),
+            grow(&same, ram + 8 * GB, ram, &[(r"C:\", 26 * GB)]),
             10 * GB
         );
     }
