@@ -42,6 +42,8 @@ pub struct CompareRun {
     /// The most frames per static spot (`RunSettings::static_cap`, `Some(0)` = off); None =
     /// unknown.
     pub static_cap: Option<u32>,
+    /// Data loader workers it trained with (`RunSettings::workers`); None = unknown.
+    pub workers: Option<u32>,
     /// How the run balanced its training frames (off for older runs).
     pub balance: Balance,
     /// Best epoch (1-based) and the epoch training stopped at, when known.
@@ -522,9 +524,28 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
         }
         if picked.len() > 1 {
             c.warnings.push(format!(
-                "the runs picked their best epoch over different classes ({}): a class counts                  only with at least {} validation boxes, so their best epochs were chosen on                  different evidence",
+                "the runs picked their best epoch over different classes ({}): a class counts \
+                 only with at least {} validation boxes, so their best epochs were chosen on \
+                 different evidence",
                 picked.join(" / "),
                 crate::benchmark::metrics::MIN_CLASS_GT
+            ));
+        }
+        // Each worker draws its own random augmentations: the same seed with another count is
+        // not the same run.
+        let mut counts: Vec<u32> = Vec::new();
+        for n in runs.iter().filter_map(|r| r.workers) {
+            if !counts.contains(&n) {
+                counts.push(n);
+            }
+        }
+        if counts.len() > 1 {
+            let list: Vec<String> = counts.iter().map(u32::to_string).collect();
+            c.warnings.push(format!(
+                "the runs used different numbers of data loader workers ({}): each worker draws \
+                 its own random augmentations, so even the same seed trained on other images; \
+                 small AP differences may come from that",
+                list.join(" / ")
             ));
         }
         if runs.iter().any(|r| r.select_metric != first.select_metric) {
@@ -848,6 +869,7 @@ mod tests {
             ignore: Some(IgnoreMode::Background),
             negative_share: Some(0.15),
             static_cap: Some(20),
+            workers: Some(2),
             balance: Balance::default(),
             best_epoch: Some(12),
             stopped_epoch: Some(27),
@@ -1185,6 +1207,25 @@ mod tests {
         unknown.static_cap = None;
         assert!(compare(&[unknown.clone(), day.clone()]).warnings.is_empty());
         assert!(compare(&[unknown, s25]).warnings.is_empty());
+        // Worker counts: said when known counts differ (a record without one says nothing).
+        let mut w0 = day.clone();
+        w0.workers = Some(0);
+        assert_eq!(
+            compare(&[day.clone(), w0.clone()]).warnings,
+            [
+                "the runs used different numbers of data loader workers (2 / 0): each worker \
+                 draws its own random augmentations, so even the same seed trained on other \
+                 images; small AP differences may come from that"
+            ]
+        );
+        let mut w_unknown = day.clone();
+        w_unknown.workers = None;
+        assert!(
+            compare(&[day.clone(), w_unknown.clone()])
+                .warnings
+                .is_empty()
+        );
+        assert!(compare(&[w0, w_unknown]).warnings.is_empty());
         let mut same = day.clone();
         same.name = "day-c".into();
         assert!(compare(&[day, same]).warnings.is_empty());

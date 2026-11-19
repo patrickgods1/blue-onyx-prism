@@ -379,6 +379,7 @@ fn job(
         root: root.to_path_buf(),
         timeout: Duration::from_secs(60),
         workers: Workers::Fixed(0),
+        past_runs: Vec::new(),
         keep_work: false,
         export_only: None,
     }
@@ -1448,6 +1449,7 @@ fn out_of_system_memory_halves_the_workers_and_keeps_the_batch() {
     };
     let mut lines = Vec::new();
     let mut batches_reported = Vec::new();
+    let mut resources = Vec::new();
     let r = run_training(
         &j,
         &fake,
@@ -1456,6 +1458,7 @@ fn out_of_system_memory_halves_the_workers_and_keeps_the_batch() {
         &mut |p| match p {
             TrainReport::Line(l) => lines.push(l.to_string()),
             TrainReport::Batch(b) => batches_reported.push(b),
+            TrainReport::Resources(x) => resources.push(x.clone()),
             _ => {}
         },
         &AtomicBool::new(false),
@@ -1464,6 +1467,18 @@ fn out_of_system_memory_halves_the_workers_and_keeps_the_batch() {
     assert_eq!(train_workers(&fake), [5, 2, 1]);
     assert_eq!(train_batches(&fake), [4, 4, 4]);
     assert!(batches_reported.is_empty(), "{batches_reported:?}");
+    // One report, of the attempt that trained: 1 worker x 2 loaders, forced, the fewest workers
+    // that ran out of memory (2), and this machine.
+    let [res] = &resources[..] else {
+        panic!("{resources:?}")
+    };
+    assert_eq!((res.workers, res.loaders, res.forced), (1, 2, true));
+    assert_eq!((res.limit, res.host_oom), (None, Some(2)));
+    assert!(res.samples >= 1, "{res:?}");
+    assert_eq!(
+        res.machine,
+        crate::training::workers::Machine::now(&j.accelerator)
+    );
     assert!(
         lines
             .iter()
@@ -2235,4 +2250,128 @@ fn a_cancel_during_the_benchmark_keeps_the_registered_model() {
     assert_eq!(r.state, RunState::Cancelled, "{}", r.describe());
     assert!(r.output.is_some());
     assert!(!r.retrying);
+}
+
+/// An automatic count learns from the job's earlier runs of this machine and recipe: 1 worker was
+/// no faster than 0, so 0 (whatever the limit of the machine running the test), and the log says
+/// why. The run's own record gets its resources with the limit it started under.
+#[test]
+fn an_automatic_count_learns_from_earlier_runs() {
+    use crate::training::workers::{Machine, RunResources};
+    let t = tmp("learned-workers");
+    let mut j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        cuda(),
+        Platform::LINUX_X64,
+    );
+    j.workers = Workers::Auto;
+    let past = |created: &str, workers: u32, img_s: f64| -> service::RunRecord {
+        let mut r: service::RunRecord = serde_json::from_value(serde_json::json!({
+            "id": created, "name": "x", "created": created,
+            "request": {"recipe": j.request.recipe, "datasets": []},
+            "device": "cuda", "state": "done", "stage": null, "step": 8, "steps": 8,
+            "percent": 100, "detail": "", "run_dir": "/tmp/x"
+        }))
+        .unwrap();
+        r.resources = Some(RunResources {
+            workers,
+            loaders: 2,
+            machine: Machine::now(&j.accelerator),
+            img_s: Some(img_s),
+            data_wait: Some(0.3),
+            ..RunResources::default()
+        });
+        r
+    };
+    j.past_runs = vec![
+        past("2026-11-10T00:00:00Z", 0, 10.0),
+        past("2026-11-11T00:00:00Z", 1, 10.1),
+    ];
+    let fake = TrainFake {
+        cuda: true,
+        mps: false,
+        ..TrainFake::new()
+    };
+    let mut resources = Vec::new();
+    let r = run_training(
+        &j,
+        &fake,
+        &fake,
+        &NoHooks,
+        &mut |p| {
+            if let TrainReport::Resources(x) = p {
+                resources.push(x.clone());
+            }
+        },
+        &AtomicBool::new(false),
+    );
+    r.unwrap();
+    assert_eq!(train_workers(&fake), [0]);
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains(
+            "# data loader workers: 0 (learned on this machine: 1 was no faster than 0; limits \
+             allow "
+        ),
+        "{log}"
+    );
+    assert!(
+        log.contains("# resources: 0 data loader workers (0 processes)"),
+        "{log}"
+    );
+    let [res] = &resources[..] else {
+        panic!("{resources:?}")
+    };
+    assert!(!res.forced);
+    assert!(res.limit.is_some());
+    assert_eq!(res.host_oom, None);
+}
+
+/// The queue stores each run's resources on its record and hands the next automatic run the
+/// records that have them: the second run's log says it found a run (with no finished epoch
+/// measured) rather than none.
+#[test]
+fn the_queue_records_resources_and_passes_them_on() {
+    let t = tmp("queue-resources");
+    let fake = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(t.0.join("runs.json")),
+    );
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("a");
+    a.workers = Workers::Auto;
+    let mut b = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    b.run_dir = t.0.join("b");
+    b.name = "second".into();
+    b.workers = Workers::Auto;
+    let ida = svc.enqueue(a).unwrap();
+    let idb = svc.enqueue(b).unwrap();
+    let ra = svc.wait(&ida, Duration::from_secs(30)).unwrap();
+    let rb = svc.wait(&idb, Duration::from_secs(30)).unwrap();
+    svc.shutdown();
+    assert_eq!(ra.state, RunState::Done, "{}", ra.describe());
+    assert_eq!(rb.state, RunState::Done, "{}", rb.describe());
+    let res = ra.resources.expect("the first run's resources");
+    assert!(
+        !res.forced && res.limit.is_some() && res.samples >= 1,
+        "{res:?}"
+    );
+    // On disk too.
+    let stored = service::load_records(&t.0.join("runs.json"));
+    assert!(stored.iter().all(|r| r.resources.is_some()), "{stored:?}");
+    let log_a = std::fs::read_to_string(t.0.join("a").join(LOG_FILE)).unwrap();
+    assert!(
+        log_a.contains("(nothing learned on this machine yet; limits allow "),
+        "{log_a}"
+    );
+    let log_b = std::fs::read_to_string(t.0.join("b").join(LOG_FILE)).unwrap();
+    assert!(
+        log_b.contains("(nothing measured on this machine yet (no finished epoch); limits allow "),
+        "{log_b}"
+    );
 }

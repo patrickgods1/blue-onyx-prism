@@ -139,6 +139,7 @@ pub fn plan_retry(config: &Config, r: &RunRecord, cap: &Capability) -> Result<Tr
         workers: t
             .workers
             .map_or(super::job::Workers::Auto, super::job::Workers::Fixed),
+        past_runs: Vec::new(),
         keep_work: false,
         export_only: Some(ExportRetry {
             checkpoint,

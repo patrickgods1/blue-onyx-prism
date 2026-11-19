@@ -1555,6 +1555,11 @@ fn compare_text(runs: &[service::RunRecord]) -> String {
                 .as_ref()
                 .and_then(|p| p.settings.as_ref())
                 .and_then(|s| s.static_cap),
+            workers: r
+                .progress
+                .as_ref()
+                .and_then(|p| p.settings.as_ref())
+                .and_then(|s| s.workers),
             balance: r.request.balance.clone(),
             best_epoch: r
                 .progress

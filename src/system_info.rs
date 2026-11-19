@@ -62,6 +62,35 @@ pub fn physical() -> Option<crate::backend::memory::Physical> {
     crate::backend::memory::physical_bytes()
 }
 
+/// RAM available now in bytes: `ullAvailPhys` on Windows ([`physical`]), `MemAvailable` of
+/// `/proc/meminfo` on Linux; `None` elsewhere or when the read fails. Not cached.
+pub fn ram_available() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        meminfo_bytes(
+            &std::fs::read_to_string("/proc/meminfo").ok()?,
+            "MemAvailable:",
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        physical().map(|p| p.available)
+    }
+}
+
+/// The `key` line (`MemAvailable:`) of `/proc/meminfo` text in bytes (the file says kB).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn meminfo_bytes(text: &str, key: &str) -> Option<u64> {
+    let kb: u64 = text
+        .lines()
+        .find(|l| l.starts_with(key))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    kb.checked_mul(1024)
+}
+
 /// Bytes the paging files can still grow by beyond `commit_limit` on a machine with `total_phys`
 /// of RAM ([`crate::backend::memory::growable_bytes`] over the registry's `PagingFiles`, each
 /// volume's free space from `fs4`). 0 on other platforms, for fixed paging files, a full disk or
@@ -92,15 +121,7 @@ pub fn total_memory_gb() -> Option<f64> {
 
 #[cfg(target_os = "linux")]
 fn total_memory_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb: u64 = text
-        .lines()
-        .find(|l| l.starts_with("MemTotal:"))?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
-    Some(kb * 1024)
+    meminfo_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
 }
 
 #[cfg(target_os = "macos")]
@@ -258,6 +279,25 @@ pub(crate) mod tests {
         let _ = super::total_memory_gb();
         // Cached: the same answer twice.
         assert_eq!(super::total_memory_gb(), super::total_memory_gb());
+    }
+
+    #[test]
+    fn meminfo_lines_are_read_in_bytes() {
+        let text =
+            "MemTotal:       16303516 kB\nMemFree:         1000 kB\nMemAvailable:    8000 kB\n";
+        assert_eq!(
+            super::meminfo_bytes(text, "MemAvailable:"),
+            Some(8000 * 1024)
+        );
+        assert_eq!(
+            super::meminfo_bytes(text, "MemTotal:"),
+            Some(16303516 * 1024)
+        );
+        assert_eq!(super::meminfo_bytes(text, "SwapFree:"), None);
+        let live = super::ram_available();
+        if cfg!(any(windows, target_os = "linux")) {
+            assert!(live.is_some_and(|b| b > 0), "{live:?}");
+        }
     }
 
     /// `(key, None)` in `get_envs()` = removed from the child's environment.

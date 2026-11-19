@@ -178,7 +178,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     file never deleted. Error messages state what happened, the likely cause and the next action.
 
 - **Backend** (`src/backend/`, the only place `unsafe` is allowed): runtimes behind a `Backend` enum
-  (`OpenVino | Ort`). OpenVINO wrapper (properties CACHE_DIR / LATENCY / f16 on GPU; cache dir
+  (`OpenVino | Ort`). OpenVINO wrapper (properties CACHE_DIR, f16 on GPU and the GPU hint: the hardware profile's choice
+  or `performance_hint`, LATENCY by default on an integrated GPU, THROUGHPUT on Arc; cache dir
   `<cache>/openvino-<device>-<prec>`, the CPU cache hash ignores precision); `ort.rs` holds all `ort` code; `spec.rs`
   parses device specs; `detect.rs` finds GPUs (DXGI / sysfs / Apple); `select.rs` builds the ranked, pure `DeviceOption`
   list and the `auto` pick; `plan.rs` turns it into per-model load candidates (compile + warm-up, falling down the list,
@@ -354,6 +355,7 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - Protection: a failed run keeps `work` (`training/retry.rs`, `train retry-export`; training itself does not resume);
     an OOM restarts only before 3 finished epochs; an early GPU OOM retries at half the batch, a host OOM halves the
     loader workers, never the batch (`training::workers_for`); `check_disk` refuses up front.
+  - Worker count: `training::workers::learned` (pure) adjusts the automatic count from past runs' `RunRecord.resources`.
   - Model switch (`training/switch.rs`): Revert swaps `previous_default` (one level); a verifier is replaced only when
     named (`replace_verifier`); `Hooks::baseline` benchmarks into the run folder, never `benchmark.json`.
   - Jobs: import, auto-label, overlaps and refine are `task::Task`s on the one-at-a-time queue, recorded in

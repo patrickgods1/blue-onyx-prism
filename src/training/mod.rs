@@ -15,6 +15,8 @@
 //! - [`preflight`]: the report shown before a run, the refusals and the disk check.
 //! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
+//! - [`workers`]: what a run used (workers, commit, RAM, page-ins; sampled while it trains) and the
+//!   worker count learned from earlier runs of the same machine and recipe.
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
 //! - [`refine`]: the dataset check (`train refine`), short fold models that never saw a camera
 //!   day suggest missing boxes, labels to verify and other classes.
@@ -51,6 +53,7 @@ pub mod retry;
 pub mod service;
 pub mod switch;
 pub mod task;
+pub mod workers;
 
 pub use capability::{Accelerator, Capability};
 pub use config::TrainingConfig;
@@ -642,6 +645,7 @@ pub fn plan_job(
         root: config.data_root(),
         timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
         workers: t.workers.map_or(job::Workers::Auto, job::Workers::Fixed),
+        past_runs: Vec::new(),
         keep_work: false,
         export_only: None,
     })
