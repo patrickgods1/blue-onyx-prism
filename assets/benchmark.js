@@ -1219,8 +1219,8 @@
     if (running && p) {
       if (p.stage === "benchmark") {
         bar.value = p.percent;
-        ptext.textContent = p.model + " (" + p.modelIndex + "/" + p.modelCount + ") on " + p.device + " · " + p.phase + (p.total ? " " + p.done + "/" + p.total : "") + (p.image ? " · " + p.image : "") + " · " + p.percent.toFixed(0) + "%" + (p.etaSecs ? " · about " + Math.ceil(p.etaSecs) + " s left" : "");
-      } else { bar.removeAttribute("value"); ptext.textContent = p.text || p.stage; }
+        ptext.textContent = p.model + " (" + p.modelIndex + "/" + p.modelCount + ") on " + p.device + " · " + p.phase + (p.total ? " " + p.done + "/" + p.total : "") + (p.image ? " · " + p.image : "") + " · " + p.percent.toFixed(0) + "%" + (p.etaSecs ? " · about " + Math.ceil(p.etaSecs) + " s left" : "") + (p.priority ? " · " + p.priority : "");
+      } else { bar.removeAttribute("value"); ptext.textContent = (p.text || p.stage) + (p.priority ? " · " + p.priority : ""); }
     } else if (running) { bar.removeAttribute("value"); ptext.textContent = "starting…"; }
     if (!running && lastState === "running") { finished(j); refreshSearch(); if (PB.compare) PB.compare.invalidate(); }
     else if (!running && !msg.textContent && j.run.state !== "idle") msg.textContent = j.run.message || j.run.error || "";

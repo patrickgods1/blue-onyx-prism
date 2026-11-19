@@ -145,8 +145,9 @@ pub struct BenchArgs {
     /// Default: the configured intra_threads.
     #[arg(long)]
     pub threads: Option<usize>,
-    /// Keep the normal process priority (default: below normal so the desktop stays
-    /// responsive; also off with benchmark.low_priority = false).
+    /// Keep the normal process priority (default: below normal while a CPU device runs so the
+    /// desktop stays responsive, normal for GPU devices; also off with
+    /// benchmark.low_priority = false).
     #[arg(long)]
     pub no_low_priority: bool,
     /// Confidence threshold. Default: the configured confidence_threshold.

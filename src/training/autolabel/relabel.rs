@@ -144,6 +144,8 @@ impl Detector for LocalDetector {
         );
         bench.cancel = Some(cancel);
         bench.max_stored_preds = 300;
+        // Only the detections are kept: read the next frame ahead on every device, CPU too.
+        bench.read_ahead = crate::benchmark::ReadAhead::Always;
         // Each frame as it finishes, for a cancelled run.
         let finished: Mutex<BTreeMap<String, Vec<Det>>> = Mutex::default();
         let sink = |r: &ImageRun| {

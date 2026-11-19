@@ -486,6 +486,9 @@ pub(crate) fn pseudo_ground_truth(
         // Every reference detection >= PSEUDO_IGNORE_CONFIDENCE becomes ground truth, not
         // only the 100 most confident (BM-10).
         max_stored_preds: usize::MAX,
+        priority: bench.priority,
+        // Only its detections are kept, so the time per frame is all that counts.
+        read_ahead: super::ReadAhead::Always,
     };
     let run = pb
         .run_exact(runtimes, &job, device)

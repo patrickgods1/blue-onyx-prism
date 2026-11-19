@@ -101,6 +101,20 @@ pub(crate) struct FakeScript {
     pub(crate) input_size: (u32, u32),
     /// Warm-up submits never complete (a hung device at load time).
     pub(crate) warmup_hangs: bool,
+    /// What a synchronous `infer` returns for its image tensor (None: an empty YOLO26 output).
+    /// The benchmark's pipeline infers synchronously; a function of the input makes its
+    /// predictions depend on each frame's pixels.
+    pub(crate) infer_fn: Option<InferFn>,
+}
+
+/// A synchronous inference's outputs as a function of its image tensor (CHW f32).
+#[derive(Clone)]
+pub(crate) struct InferFn(pub(crate) Arc<dyn Fn(&[f32]) -> Vec<NamedOutput> + Send + Sync>);
+
+impl std::fmt::Debug for InferFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InferFn")
+    }
 }
 
 impl FakeScript {
@@ -111,6 +125,7 @@ impl FakeScript {
             slots: slots.max(1),
             input_size,
             warmup_hangs: false,
+            infer_fn: None,
         }
     }
 
@@ -411,12 +426,15 @@ impl FakeBackend {
 
     pub(crate) fn infer_into(
         &mut self,
-        _chw: &[f32],
+        chw: &[f32],
         _extra: &[ExtraInput],
         outs: &mut Vec<NamedOutput>,
     ) -> Result<()> {
         self.script.log(Call::Infer);
-        *outs = vec![yolo26_output(&[])];
+        *outs = match &self.script.infer_fn {
+            Some(f) => (f.0)(chw),
+            None => vec![yolo26_output(&[])],
+        };
         Ok(())
     }
 }
