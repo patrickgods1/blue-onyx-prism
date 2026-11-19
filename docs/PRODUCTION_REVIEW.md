@@ -4100,7 +4100,7 @@ the device spec (`priority::decide`):
 - The previous class is restored when a non-CPU device starts and when the run ends, also on an error or a
   panic (the guard drops).
 
-## Live path (performance plan phase 3.5)
+### Live path (performance plan phase 3.5)
 
 *Windows 11, the dev box (i5-8600K, 6 cores), **debug build on CPU** (`openvino:cpu`, IPcam-general,
 `cargo build` without `--release`), 2026-11-19. Server from `--config` with the fixtures of `tests/common`
