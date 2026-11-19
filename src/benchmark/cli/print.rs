@@ -831,8 +831,13 @@ pub(super) fn print_run(r: &RunResult) {
     println!("{}", stats_row("postprocess", &s.postprocess));
     println!("{}", stats_row("total", &s.total));
     println!(
-        "  throughput {:.1} img/s | {} detections (first image) | {} image(s): {}",
+        "  throughput {:.1} img/s ({}) | {} detections (first image) | {} image(s): {}",
         r.throughput_fps,
+        if r.pipelined {
+            "pipelined: next image decoded during inference"
+        } else {
+            "one image at a time"
+        },
         r.detections.len(),
         r.images,
         r.image
@@ -947,6 +952,7 @@ mod tests {
             repeat: 1,
             stages_ms: Default::default(),
             throughput_fps: 0.0,
+            pipelined: false,
             detections: Vec::new(),
             by_resolution: Vec::new(),
             accuracy: None,

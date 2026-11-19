@@ -80,8 +80,8 @@ pub struct RunRequest {
     /// What the accuracy grade is computed from.
     #[serde(default)]
     pub accuracy_metric: AccuracyMetric,
-    /// Run at below-normal process priority (`benchmark.low_priority`, see
-    /// [`crate::backend::priority`]).
+    /// Run CPU devices at below-normal process priority, GPU devices at normal
+    /// (`benchmark.low_priority`, see [`crate::backend::priority`]).
     #[serde(default = "default_true")]
     pub low_priority: bool,
 }
@@ -280,6 +280,9 @@ pub struct ProgressView {
     pub eta_secs: Option<f64>,
     /// Free text ("downloading coco-cctv 42%").
     pub text: String,
+    /// The process priority of the device running ("below normal priority (CPU device)");
+    /// empty when not set (`benchmark.low_priority`, CPU devices only).
+    pub priority: String,
 }
 
 /// Snapshot for `GET /v1/benchmark`.
@@ -431,7 +434,6 @@ impl BenchmarkService {
     where
         F: FnOnce(&RunHandle) -> Result<String> + Send + 'static,
     {
-        let low_priority = request.low_priority;
         let run_id = {
             let mut g = self.lock();
             if g.state == RunState::Running {
@@ -461,11 +463,10 @@ impl BenchmarkService {
                     svc: me.clone(),
                     run_id,
                 };
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Inside the closure: a panic unwinds through the guard, restoring too.
-                    let _prio = crate::backend::priority::lower_for_benchmark(low_priority, true);
-                    job(&handle)
-                }));
+                // The process priority is switched per device inside the job (`ServiceRun`'s
+                // `DevicePriority`, restored when it drops, also on a panic).
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&handle)));
                 let mut g = me.lock();
                 if g.run_id != run_id {
                     return;
@@ -826,6 +827,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         cache_dir: ctx.config.cache_dir_path(),
         run_id: super::history::new_run_id(),
         trail: breadcrumb::Trail::new(&ctx.config.data_root()),
+        priority: crate::backend::priority::DevicePriority::new(req.low_priority),
     };
     let image_count: usize = sets.iter().map(|s| s.images.len()).sum();
 
@@ -1042,8 +1044,16 @@ impl OverallProgress {
             percent,
             eta_secs,
             text: String::new(),
+            priority: priority_text(p),
         }
     }
+}
+
+/// The progress line's priority text of `p` (empty without one).
+fn priority_text(p: &Progress) -> String {
+    p.priority
+        .map(|a| a.describe().to_string())
+        .unwrap_or_default()
 }
 
 /// One benchmark run of the service once its datasets and runtimes are ready.
@@ -1060,6 +1070,9 @@ struct ServiceRun<'a> {
     run_id: String,
     /// Goes with the run, on every way out: see [`breadcrumb`].
     trail: breadcrumb::Trail,
+    /// `benchmark.low_priority`: below normal while a CPU device runs, restored for the other
+    /// devices and when the run ends (drop).
+    priority: crate::backend::priority::DevicePriority,
 }
 
 impl ServiceRun<'_> {
@@ -1098,6 +1111,7 @@ impl ServiceRun<'_> {
                             "pseudo ground truth: {} on {} ({}/{} images)",
                             p.model, p.device, p.done, pseudo_images
                         ),
+                        priority: priority_text(p),
                         ..Default::default()
                     })
                 };
@@ -1105,6 +1119,7 @@ impl ServiceRun<'_> {
                 pb.cache_dir = self.cache_dir.as_deref();
                 pb.cancel = Some(h.cancel_flag());
                 pb.progress = Some(&progress);
+                pb.priority = Some(&self.priority);
                 self.trail.note(&device.to_string(), &job.name);
                 match pseudo_ground_truth(&pb, &self.runtimes, &job, device, sets) {
                     Ok(_) => {
@@ -1197,6 +1212,7 @@ impl ServiceRun<'_> {
         bench.weights = req.weights;
         bench.threshold_objective = req.threshold_objective;
         bench.accuracy_metric = req.accuracy_metric;
+        bench.priority = Some(&self.priority);
         let devices = self
             .devices
             .clone()

@@ -846,9 +846,10 @@ pub struct BenchmarkConfig {
     /// What the accuracy grade, the ranking and the device recommendation use: `ap50` (default,
     /// box-level AP@0.5 with small-object recall) or `roc_auc` (macro frame-level ROC AUC).
     pub accuracy_metric: crate::benchmark::grade::AccuracyMetric,
-    /// Run benchmarks at below-normal process priority so the desktop stays responsive
-    /// (Windows: the whole service for the run, restored after; CLI on Unix: nice 10). Applies
-    /// at once.
+    /// Run benchmarks of CPU devices at below-normal process priority so the desktop stays
+    /// responsive; GPU devices keep the normal priority (Windows: the whole process while a CPU
+    /// device runs, restored before a GPU device and after the run; CLI on Unix: nice 10 for a
+    /// CPU-only run). Applies at once.
     pub low_priority: bool,
 }
 

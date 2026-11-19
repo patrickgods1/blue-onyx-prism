@@ -770,7 +770,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.reference_model` | `null` | Model whose detections score datasets without ground truth; `null` = the most accurate installed one. UI: yes |
 | `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
-| `benchmark.low_priority` | `true` | Run benchmarks at below-normal process priority so the desktop stays responsive (Windows: the whole service for the run, restored after; CLI on Linux/macOS: nice 10). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
+| `benchmark.low_priority` | `true` | Run benchmarks of CPU devices (`openvino:cpu`, `ort:cpu`, `CPU`) at below-normal process priority so the desktop stays responsive; GPU and NPU devices keep the normal priority, so the service keeps answering Blue Iris at full priority while they run (Windows: the whole process while a CPU device compiles and runs, restored before a GPU device and after the run; the log and the Benchmark page's progress line say which applied; CLI on Linux/macOS: nice 10 for a run whose devices are all CPUs, a running service is never lowered there). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
 | `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`. UI: yes |
 | `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
 
@@ -1470,7 +1470,7 @@ for throwaway test servers only).
   and restart` means the installed CUDA build is older than the catalog's and has no kernels for the card
   (GTX 10-series needs 1.28+): press Update on the Config page's Resources card (or run
   `blue-onyx-prism fetch --resource onnxruntime-cuda`), then restart.
-- **A CPU benchmark made the desktop unresponsive:** benchmarks run at below-normal priority
+- **A CPU benchmark made the desktop unresponsive:** benchmarks of CPU devices run at below-normal priority
   (`benchmark.low_priority`, `benchmark --no-low-priority` to opt out) and CPU inference keeps one core
   free (`intra_threads` 0); ONNX Runtime's thread pools do not spin-wait between runs (`BOP_ORT_SPINNING=1`
   restores the default spinning).

@@ -3361,7 +3361,7 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
   - `--report <path>` via a plain `std::fs::write` (export.rs:878).
   - Compiled-model cache dir (`cache_dir`) is only listed (`cache_files`) to detect a hit or miss.
 - **Parsed external content**: `benchmark.json` (serde_json, error not panic), dataset images (decoder), model files (backends). No archives are extracted and no programs run in these files. Dataset downloads are delegated to `resources::actions::download` and `resources::commands::fetch`.
-- **Threads/channels**: one detached `benchmark` thread per service run (no JoinHandle). Progress is published through `Mutex<Inner>`. Cancel is an `AtomicBool` checked per iteration, per device and per download poll (250 ms). Compile and model load are not interruptible.
+- **Threads/channels**: one detached `benchmark` thread per service run (no JoinHandle); since phase 3.4 each device's timed loop adds a scoped `bench-read` thread (read ahead, joined before the device's run returns; see "Benchmark read ahead and CPU-only priority" below). Progress is published through `Mutex<Inner>`. Cancel is an `AtomicBool` checked per iteration, per device and per download poll (250 ms). Compile and model load are not interruptible.
 - **Locks**: `Inner` (service) and `Mutex<Runtimes>` (shared with registry workers) never nest. The runtimes lock is held only for plan, selection and compile. Benchmark inference on shared runtimes runs concurrently with production inference on the same device, which affects production latency during a run (by design).
 - **Memory**: the service keeps full per-image results for every finished model until the final save (BM-11). `Status` holds summaries only. `sweep` clones all finished device results after each device. Eval preds at 0.05 are uncapped per image.
 - **Cross-file observations (other reviewers' files)**: `server/benchmark.rs:756` loads and parses the whole `benchmark.json` (sync `std::fs` + serde) on every `/v1/benchmark/image` request inside an async handler. `server/live.rs:100` also calls `load_or_warn`.
@@ -4034,3 +4034,68 @@ HEURISTIC, EXHAUSTIVE, HEURISTIC (`BOP_CUDNN_CONV_ALGO_SEARCH`).
 
 AP50 was identical. No difference in speed or memory, so HEURISTIC stays; the variable remains for later
 measurements.
+
+### Benchmark read ahead and CPU-only priority (performance plan phase 3.4)
+
+**Before.** The benchmark's timed loop, refine fold prediction and the quick check (`LocalDetector`, which runs
+the benchmark's per-image pipeline) read and decoded each image on the inference thread, so the device sat idle
+during every decode: the quick check spent about 128 s of its 169 s on decode and preprocessing, and on CUDA
+inference was 15.5 ms of a 32 ms frame. `benchmark.low_priority` lowered the whole process for the whole run on
+Windows, including the threads answering Blue Iris, whatever device was benchmarked.
+
+**Read ahead** (`benchmark/run.rs`). A scoped `bench-read` thread reads each image once and decodes one frame per
+timed run while the inference thread works on the previous one. The hand-over is a rendezvous channel (one frame
+decoded ahead), so at most two decoded frames are in flight: about 24 MB for 2688x1520 frames, plus the encoded
+bytes of the image being read.
+- The stages keep their meaning. `decode` is timed on the helper for that frame, preprocess, infer and
+  postprocess on the inference thread. The verifier copy and the set's transform stay outside every stage, as
+  before.
+- `throughput_fps` is the inference thread's wall time (each run's wait for its frame plus its stages), marked
+  `pipelined` in `benchmark.json` and the history. The CLI says `pipelined` or `one image at a time`.
+  `history::compare` reports images per second as not comparable between a pipelined and a serial run.
+- Results, their order and the `on_image` order are those of the serial loop. A read or decode failure is
+  reported for the same image with the same message. A cancel stops both threads after the current frame, and
+  the helper is joined before the device's run returns, also on an error or a panic.
+- **Where it applies** (`ReadAhead`):
+  - The benchmark reads ahead on GPUs and other accelerators, never on a CPU device (`ExceptCpu`). On the CPU
+    the decode takes cores from the inference and inflates the CPU's own latency figures (below), which grade
+    the device and feed the history.
+  - Detections over frames read ahead on every device (`Always`): the quick check, refine fold prediction,
+    relabelling and the pseudo ground truth. Only their time per frame counts.
+
+**Measured** (dev box, the GTX 1070 Ti machine; IPcam-general on `openvino:cpu` only, no GPU run; **debug build**,
+so decode and preprocess are several times slower than in a release build; 15 camera frames 2688x1520 from the
+patio camera; two runs each, alternating). Command:
+`BLUE_ONYX_TEST_ROOT=<fixtures> BOP_READ_AHEAD_IMAGES=<dir> BOP_READ_AHEAD_MAX=15 cargo test --test it backend_bench_read_ahead -- --ignored --nocapture --test-threads=1`.
+
+| loop | wall per image | img/s | decode p50 | preprocess p50 | infer p50 | total p50 |
+|---|---|---|---|---|---|---|
+| serial | 1456 / 1496 ms | 0.69 / 0.67 | 975 / 973 ms | 298 / 291 ms | 160 / 148 ms | 1437 / 1447 ms |
+| read ahead | 1112 / 1104 ms | 0.90 / 0.91 | 1068 / 1021 ms | 306 / 312 ms | 204 / 187 ms | 1594 / 1528 ms |
+
+- On the CPU, read ahead cuts the wall time per frame by about a quarter (0.68 to 0.90 img/s).
+- The CPU's infer p50 rises by about a quarter (154 to 195 ms), because the decode competes for its cores. That
+  is why a CPU benchmark stays serial.
+- Predictions were bit-identical in all four runs (54 stored boxes, 169 at the evaluation threshold). The unit
+  tests `benchmark::run_tests` check the same with the fake backend over JPEGs and PNGs, a grayscale set,
+  `repeat` 1 and 3, a cancel, an unreadable file and an undecodable one.
+- Not measured: a GPU (none may run on this box now) and a release build. With a GPU, where inference does not
+  use the CPU cores, the wall time per frame should approach the larger of decode and
+  preprocess + infer + postprocess, instead of their sum.
+
+**Priority** (`backend/priority.rs`). `DevicePriority`, one per run, is switched before each candidate compiles
+and again on the device the model loaded on (a fallback to CPU is a CPU run). The decision is a pure function of
+the device spec (`priority::decide`):
+
+| `low_priority` | device | Windows | Linux / macOS service | Linux / macOS CLI |
+|---|---|---|---|---|
+| off | any | normal | normal | normal |
+| on | `openvino:cpu`, `ort:cpu`, `CPU` | below normal while it compiles and runs | unchanged (`Nice=` in the unit) | nice 10 from the start if every device of the run is a CPU |
+| on | GPU, NPU, CUDA, TensorRT, DirectML, CoreML, `auto` resolved to one of them | normal (restored before it compiles) | normal | normal (a mixed run is not lowered) |
+
+- The log has one line per device run: `benchmark on openvino:cpu: below normal priority (CPU device)
+  (benchmark.low_priority lowers CPU devices only)`.
+- The Benchmark page's progress line ends with the priority that applied, and its checkbox reads "Run CPU
+  devices at low priority".
+- The previous class is restored when a non-CPU device starts and when the run ends, also on an error or a
+  panic (the guard drops).

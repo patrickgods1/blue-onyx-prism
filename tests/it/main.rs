@@ -8,6 +8,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod backend_bench_read_ahead;
 mod backend_cache;
 mod backend_cpu;
 mod backend_ort;

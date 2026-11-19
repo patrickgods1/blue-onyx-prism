@@ -518,6 +518,30 @@ fn metric_name(metric: &str) -> &'static str {
     }
 }
 
+/// Images per second of one device: not comparable when one run read ahead and the other did
+/// not (the throughput of a pipelined run is higher by construction).
+fn fps_change(dev: &str, a: &DeviceSnap, b: &DeviceSnap) -> MetricChange {
+    let mut c = speed_change("fps", dev, a.fps, b.fps, true);
+    if a.pipelined != b.pipelined && c.delta.is_some() {
+        let how = |p: bool| {
+            if p {
+                "pipelined"
+            } else {
+                "one image at a time"
+            }
+        };
+        c.verdict = Verdict::NotComparable;
+        c.delta = None;
+        c.rel = None;
+        c.why = format!(
+            "images per second measured another way ({} -> {})",
+            how(a.pipelined),
+            how(b.pipelined)
+        );
+    }
+    c
+}
+
 /// The metrics of one device present in both runs.
 fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
     let dev = b.device.as_str();
@@ -529,7 +553,7 @@ fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
     let mut v = vec![
         speed_change("p50_ms", dev, a.total_p50_ms, b.total_p50_ms, false),
         speed_change("infer_p50_ms", dev, a.infer_p50_ms, b.infer_p50_ms, false),
-        speed_change("fps", dev, a.fps, b.fps, true),
+        fps_change(dev, a, b),
     ];
     for m in ["ap50", "ap50_95"] {
         let (x, y) = if m == "ap50" {

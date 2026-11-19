@@ -296,6 +296,46 @@ fn compare_lists_changes_and_summarizes() {
     assert_eq!(nc, "not_comparable");
 }
 
+/// Images per second of a pipelined run never compares with one measured one image at a time
+/// (older versions); two pipelined runs compare as before.
+#[test]
+fn fps_compares_only_the_same_way_of_measuring() {
+    let a = entry("r1", vec![snap("openvino:cpu", 100.0, Some(0.80), 300)]);
+    let mut fast = snap("openvino:cpu", 100.0, Some(0.80), 300);
+    fast.fps = Some(14.0);
+    fast.pipelined = true;
+    let b = entry("r2", vec![fast.clone()]);
+    let c = compare(&a, &b);
+    let m = metric(&c, "fps");
+    assert_eq!(
+        (m.verdict, m.delta, m.rel),
+        (Verdict::NotComparable, None, None)
+    );
+    assert_eq!(
+        m.why,
+        "images per second measured another way (one image at a time -> pipelined)"
+    );
+    assert_eq!(
+        metric(&c, "p50_ms").verdict,
+        Verdict::Same,
+        "latency still compares"
+    );
+    let mut a2 = a.clone();
+    a2.devices[0].pipelined = true;
+    assert_eq!(metric(&compare(&a2, &b), "fps").verdict, Verdict::Better);
+    // Older entries without the key load as not pipelined; a pipelined one writes it.
+    let v = serde_json::to_value(&fast).unwrap();
+    assert_eq!(v["pipelined"], true);
+    let old: DeviceSnap = serde_json::from_str(r#"{"device":"openvino:cpu","fps":10.0}"#).unwrap();
+    assert!(!old.pipelined);
+    assert!(
+        serde_json::to_value(&old)
+            .unwrap()
+            .get("pipelined")
+            .is_none()
+    );
+}
+
 #[test]
 fn compare_with_history_picks_the_baseline() {
     let d = |p50: f64| vec![snap("openvino:cpu", p50, Some(0.8), 300)];

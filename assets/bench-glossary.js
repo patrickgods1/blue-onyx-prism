@@ -90,7 +90,7 @@
     mean: {name: "Average time", term: "mean", better: "lower", meaning: "The average time per image; a few slow images pull it above the median (p50)."},
     load_ms: {name: "Load time", term: "load / compile ms", better: "lower", meaning: "Time to read, compile and prepare the model on the device: paid once when the model loads (a cache makes later loads faster)."},
     infer: {name: "Inference vs total", term: "infer vs total", better: "lower", meaning: "Inference is the model alone on the device; total is the whole request: decode, resize, inference and post-processing."},
-    fps: {name: "Images per second", term: "req/s (throughput)", better: "higher", meaning: "Requests handled per second, one at a time. The service overlaps decoding and inference, so it handles more than this."},
+    fps: {name: "Images per second", term: "req/s (throughput)", better: "higher", meaning: "Requests handled per second, one inference at a time. On a GPU or other accelerator the next image is read and decoded during each inference (pipelined, as the service does); on a CPU device one image at a time. A pipelined figure is not compared with one measured one image at a time (older versions)."},
     iou: {name: "Box overlap", term: "IoU (intersection over union)", better: null, meaning: "How much a detected box overlaps the real object: 0.5 means the shared area is half of their combined area."},
     fp_per_image: {name: "False detections per image", term: "FP / image", better: "lower", meaning: "Detections that match no real object, per image on average."},
     frame: {name: "Per frame", term: "frame level", better: null, meaning: "Scored per image (does this frame alert?) rather than per object, the way Blue Iris decides whether to alert."},

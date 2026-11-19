@@ -44,6 +44,8 @@ pub mod trained_on;
 pub mod variant;
 
 mod run;
+#[cfg(test)]
+mod run_tests;
 mod scoring;
 mod sweep;
 
@@ -52,7 +54,7 @@ pub use report::{
     recommend, results_path, speed_order,
 };
 
-pub use run::{Bench, Cancelled, Phase, Progress, is_cancelled};
+pub use run::{Bench, Cancelled, Phase, Progress, ReadAhead, is_cancelled};
 pub(crate) use scoring::{
     REFERENCE_DEVICES, no_pseudo_gt_device, pseudo_ground_truth, pseudo_gt_device,
 };
@@ -454,9 +456,14 @@ pub struct RunResult {
     pub repeat: usize,
     #[serde(default)]
     pub stages_ms: StageStats,
-    /// Sequential requests per second over the timed loop (1 concurrent client).
+    /// Requests per second over the timed loop, one inference at a time (1 concurrent client);
+    /// with [`Self::pipelined`] the next frame was read and decoded during each inference.
     #[serde(default)]
     pub throughput_fps: f64,
+    /// [`Self::throughput_fps`] was measured with read ahead (`run.rs`); false for results
+    /// saved before it, measured one image at a time (not comparable).
+    #[serde(default)]
+    pub pipelined: bool,
     /// Detections of the first image.
     #[serde(default)]
     pub detections: Vec<Detection>,

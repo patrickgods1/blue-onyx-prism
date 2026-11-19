@@ -95,8 +95,8 @@ mean `openvino:*`. The `auto` ranking (discrete GPUs by VRAM, then integrated, C
 build has no kernels for) is in README "Hardware and device selection". A model with results in `benchmark.json`
 orders its `auto` devices by measured speed. NPU is never auto. ORT needs `.onnx` files. `OrtProbe.version` is the
 loaded library's version (the resolver's hypothetical probe carries the version the plan installs).
-- CPU inference uses all physical cores but one (`backend/cpu_threads.rs`); ORT thread pools do not spin; benchmarks
-  and training helpers run below normal priority (`backend/priority.rs`).
+- CPU inference uses all physical cores but one (`backend/cpu_threads.rs`); ORT thread pools do not spin; benchmarks of
+  CPU devices and training helpers run below normal priority (`backend/priority.rs`).
 - Windows CPUs with AMX but no AMX-FP16 get `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` unless set (OpenVINO's AMX kernels
   raise #UD there; `backend/cpu_isa.rs`). RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim
   aborts MPSGraph).
