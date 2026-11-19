@@ -522,7 +522,9 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
         }
         if picked.len() > 1 {
             c.warnings.push(format!(
-                "the runs picked their best epoch over different classes ({}): a class counts                  only with at least {} validation boxes, so their best epochs were chosen on                  different evidence",
+                "the runs picked their best epoch over different classes ({}): a class counts \
+                 only with at least {} validation boxes, so their best epochs were chosen on \
+                 different evidence",
                 picked.join(" / "),
                 crate::benchmark::metrics::MIN_CLASS_GT
             ));

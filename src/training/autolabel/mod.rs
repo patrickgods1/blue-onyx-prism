@@ -499,7 +499,8 @@ impl AutolabelRequest {
             }
             if v < self.threshold {
                 bail!(
-                    "model accept score {v} is below the threshold {}: raise it to the threshold                      or more (boxes under the threshold are never proposed)",
+                    "model accept score {v} is below the threshold {}: raise it to the threshold \
+                     or more (boxes under the threshold are never proposed)",
                     self.threshold
                 );
             }
@@ -507,7 +508,8 @@ impl AutolabelRequest {
         if let Some(d) = &self.device {
             if self.with_model.is_none() {
                 bail!(
-                    "a device applies to a run with a model (--with-model); the labelers run on                      the training GPU"
+                    "a device applies to a run with a model (--with-model); the labelers run on \
+                     the training GPU"
                 );
             }
             models::canonical_device(d)?;

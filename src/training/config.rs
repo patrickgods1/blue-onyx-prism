@@ -168,7 +168,8 @@ pub fn benchmark_devices(specs: &[impl AsRef<str>]) -> anyhow::Result<Vec<String
         let s = s.as_ref();
         match crate::backend::spec::parse(s).map_err(|e| anyhow::anyhow!("device '{s}': {e}"))? {
             crate::backend::DeviceSpec::Auto => anyhow::bail!(
-                "device 'auto' is not a single device; pick devices, or none for the device the                  model would load on"
+                "device 'auto' is not a single device; pick devices, or none for the device the \
+                 model would load on"
             ),
             crate::backend::DeviceSpec::Device(d) => {
                 let d = d.to_string();
