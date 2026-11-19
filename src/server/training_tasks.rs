@@ -652,6 +652,7 @@ fn attach_seams(state: &AppState, shared: &Shared, config: &Config, job: &mut Au
             crate::training::autolabel::relabel::LocalDetector {
                 config: config.clone(),
                 runtimes: state.registry.runtimes().cloned(),
+                no_cache: false,
             },
         ));
         job.config_writer = Some(Arc::new(ServerConfigWriter {

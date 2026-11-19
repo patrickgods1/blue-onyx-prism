@@ -32,6 +32,7 @@ fn cpu_and_gpu_inference() {
         path: model_path.clone(),
         requested: requested.into(),
         gpu_precision: None,
+        no_cache: false,
     };
 
     // CPU, no fallback.

@@ -4,7 +4,8 @@
 //!
 //! Stages ([`TrainStage`]): setup (uv, Python, the training lock's packages, the Visual C++
 //! runtime; shared code with the export, under its lock) -> self-check (`train_model.py
-//! --self-check`: PyTorch imports and sees the GPU) -> weights (the pinned base weights, and the
+//! --self-check`: PyTorch imports and sees the GPU; skipped when nothing it checks changed since
+//! the last one passed, [`super::self_check`]) -> weights (the pinned base weights, and the
 //! public subset when asked) -> dataset (assembled in Rust, [`super::dataset`]) -> train (the
 //! script trains and exports a static ONNX, checked against PyTorch with ONNX Runtime; progress
 //! from its `@train` events) -> install (`<name>.onnx`, `.yaml` and `<name>.provenance.json`
@@ -237,6 +238,11 @@ pub struct TrainJob {
     /// fold runs get [`super::commit::checked_already`]: the check judged that need before its
     /// first fold. An export retry is not checked (it trains nothing).
     pub headroom: fn() -> Option<super::commit::Headroom>,
+    /// Dataset folders (`<run>/data`) of the other runs of this run's comparison group that
+    /// started before it ([`super::service::group_data_dirs`], filled by the queue when it starts
+    /// the run): the first whose plan is the same lends its images as hard links
+    /// ([`dataset::write_reusing`]). Empty = every image is written from its source.
+    pub reuse_from: Vec<PathBuf>,
 }
 
 /// A failed run to export again: what the run itself no longer tells.
@@ -386,6 +392,15 @@ pub struct Baseline {
     /// Why it was not compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// [`super::bench::baseline_key`] of what was measured (model file, held-out set, devices,
+    /// settings); None when it could not be told (and for runs of older versions): such a result
+    /// is never reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// The run of the same comparison group whose measurement this is, taken over because its
+    /// key is equal ([`super::bench::reusable_baseline`]); None when measured for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<String>,
 }
 
 /// AP of a subset of the held-out frames.
@@ -565,6 +580,17 @@ fn run_training_with(
     r.map_err(|e| {
         let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
         let work = super::retry::work_dir(&job.run_dir);
+        // A training process that failed: the next run runs the self-check again, whether this
+        // one skipped it or not ([`super::self_check`]).
+        if !cancelled && stage == Some(TrainStage::Train) {
+            super::self_check::forget(
+                &super::self_check::marker_path(&job.paths),
+                &super::self_check::key(
+                    job.request.recipe.family.trainer().as_str(),
+                    &job.accelerator.device_arg(),
+                ),
+            );
+        }
         if cancelled && !job.keep_work && job.export_only.is_none() && unregistered.is_none() {
             let _ = manager::remove_any(&work);
         }
@@ -793,63 +819,92 @@ fn stages(
     );
     let (train_script, export_script) = env::write_scripts(paths)?;
     let trainer = family.trainer().as_str();
-    let cmd = env::train_python_cmd(
-        paths,
-        job.platform,
-        Stage::SelfCheck,
-        &paths.scripts,
-        SELF_CHECK_TIMEOUT,
-        vec![
-            train_script.clone().into_os_string(),
-            "--self-check".into(),
-            "--trainer".into(),
-            trainer.into(),
-            // The test kernel runs on the run's GPU (another GPU may have other kernels).
-            "--device".into(),
-            job.accelerator.device_arg().into(),
-        ],
-    );
-    let mut seen: Option<TrainEvent> = None;
-    runner
-        .run(
-            &cmd,
-            &mut |l| {
-                log.line(l);
-                report(TrainReport::Line(l));
-                if let Some(ev @ TrainEvent::SelfCheck { .. }) = progress::parse_line(l) {
-                    seen = Some(ev);
-                }
+    // Skipped when nothing it checks changed since the last check that passed
+    // ([`super::self_check`]); any doubt runs it.
+    let check_marker = super::self_check::marker_path(paths);
+    let check_key = super::self_check::key(trainer, &job.accelerator.device_arg());
+    let check_fp = super::self_check::fingerprint(paths, job.platform, &job.accelerator, trainer);
+    let skipped_since = check_fp.as_ref().and_then(|fp| {
+        super::self_check::skip_since(&check_marker, &check_key, fp, std::time::SystemTime::now())
+    });
+    if let Some(at) = skipped_since {
+        let l = format!(
+            "self-check skipped (unchanged since {}: the same environment, scripts, GPU and \
+             trainer passed it then)",
+            crate::clock::display(std::time::UNIX_EPOCH + Duration::from_secs(at))
+        );
+        log.line(&format!("# {l}"));
+        report(TrainReport::Line(&l));
+        enter!(TrainStage::SelfCheck, 100, &l);
+    } else {
+        let cmd = env::train_python_cmd(
+            paths,
+            job.platform,
+            Stage::SelfCheck,
+            &paths.scripts,
+            SELF_CHECK_TIMEOUT,
+            vec![
+                train_script.clone().into_os_string(),
+                "--self-check".into(),
+                "--trainer".into(),
+                trainer.into(),
+                // The test kernel runs on the run's GPU (another GPU may have other kernels).
+                "--device".into(),
+                job.accelerator.device_arg().into(),
+            ],
+        );
+        let mut seen: Option<TrainEvent> = None;
+        runner
+            .run(
+                &cmd,
+                &mut |l| {
+                    log.line(l);
+                    report(TrainReport::Line(l));
+                    if let Some(ev @ TrainEvent::SelfCheck { .. }) = progress::parse_line(l) {
+                        seen = Some(ev);
+                    }
+                },
+                cancel,
+            )
+            .map_err(|e| env::explain_train_failure(e, paths, job.platform, TRAINING_TASK))
+            .context("the training environment's self-check failed")?;
+        match seen {
+            Some(TrainEvent::SelfCheck {
+                cuda, mps, cuda_ok, ..
+            }) => match &job.accelerator {
+                Accelerator::Cuda { name, .. } if !cuda => bail!(
+                    "PyTorch does not see the NVIDIA GPU {name}: the driver may be too old for the \
+                     PyTorch {} build; update the NVIDIA driver and try again",
+                    lane.as_str()
+                ),
+                Accelerator::Cuda {
+                    name,
+                    compute_capability,
+                    ..
+                } if cuda_ok == Some(false) => bail!(
+                    "a test kernel failed on {name} (compute capability {compute_capability}): the \
+                     PyTorch {} build has no kernels for it",
+                    lane.as_str()
+                ),
+                Accelerator::Mps { .. } if !mps => bail!(
+                    "PyTorch reports no Apple MPS device (macOS 14 or newer on Apple silicon is needed)"
+                ),
+                _ => {}
             },
-            cancel,
-        )
-        .map_err(|e| env::explain_train_failure(e, paths, job.platform, TRAINING_TASK))
-        .context("the training environment's self-check failed")?;
-    match seen {
-        Some(TrainEvent::SelfCheck {
-            cuda, mps, cuda_ok, ..
-        }) => match &job.accelerator {
-            Accelerator::Cuda { name, .. } if !cuda => bail!(
-                "PyTorch does not see the NVIDIA GPU {name}: the driver may be too old for the \
-                 PyTorch {} build; update the NVIDIA driver and try again",
-                lane.as_str()
-            ),
-            Accelerator::Cuda {
-                name,
-                compute_capability,
-                ..
-            } if cuda_ok == Some(false) => bail!(
-                "a test kernel failed on {name} (compute capability {compute_capability}): the \
-                 PyTorch {} build has no kernels for it",
-                lane.as_str()
-            ),
-            Accelerator::Mps { .. } if !mps => bail!(
-                "PyTorch reports no Apple MPS device (macOS 14 or newer on Apple silicon is needed)"
-            ),
-            _ => {}
-        },
-        _ => bail!("the self-check printed no device report; the training script is damaged"),
+            _ => bail!("the self-check printed no device report; the training script is damaged"),
+        }
+        if let Some(fp) = &check_fp
+            && let Err(e) = super::self_check::record(
+                &check_marker,
+                &check_key,
+                fp,
+                std::time::SystemTime::now(),
+            )
+        {
+            tracing::warn!("training {}: {e:#} (the next run checks again)", job.id);
+        }
+        enter!(TrainStage::SelfCheck, 100, "PyTorch sees the GPU");
     }
-    enter!(TrainStage::SelfCheck, 100, "PyTorch sees the GPU");
     check(cancel)?;
     let finish = Finish {
         job,
@@ -1018,8 +1073,13 @@ fn stages(
         log.line(&format!("gpu: {w}"));
         tracing::warn!("training {}: {w}", job.name);
     }
-    let prepared = dataset::write(&sources, &plan, &opts, &data_dir)
-        .map_err(|e| explain_full_disk(e, &job.run_dir))?;
+    let (prepared, reused) =
+        dataset::write_reusing(&sources, &plan, &opts, &data_dir, &job.reuse_from)
+            .map_err(|e| explain_full_disk(e, &job.run_dir))?;
+    if let Some(l) = reused.describe() {
+        log.line(&format!("dataset: {l}"));
+        report(TrainReport::Line(&l));
+    }
     if let Some(short) = opts.prepared_short_side {
         log.line(&format!(
             "dataset: train / valid images with a short side over {short} px written at {short} \
@@ -1551,6 +1611,17 @@ impl Finish<'_> {
         } else {
             None
         };
+        if let Some(b) = &baseline
+            && let Some(from) = &b.reused_from
+        {
+            let l = format!(
+                "baseline reused from {from}: {} was measured there on the same held-out frames, \
+                 model file, devices and benchmark settings",
+                b.model
+            );
+            log.line(&format!("# {l}"));
+            report(TrainReport::Line(&l));
+        }
         enter(current, report, TrainStage::Benchmark, 100, "done");
         Ok(RunOutcome {
             output,

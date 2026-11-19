@@ -432,6 +432,7 @@ mod tests {
             path: PathBuf::from("fake.onnx"),
             requested: "auto".into(),
             gpu_precision: None,
+            no_cache: false,
         };
         let b = script.compile(&req, "openvino:cpu", false).into_backend();
         (script, b)

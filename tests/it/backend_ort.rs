@@ -79,6 +79,7 @@ fn req(path: &std::path::Path, requested: &str) -> LoadRequest {
         path: path.to_path_buf(),
         requested: requested.into(),
         gpu_precision: None,
+        no_cache: false,
     }
 }
 

@@ -15,6 +15,8 @@
 //! - [`preflight`]: the report shown before a run, the refusals and the disk check.
 //! - [`commit`]: the memory commit check before a job starts a Python model process (Windows).
 //! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
+//! - [`self_check`]: when a run may skip its separate self-check process (nothing it checked
+//!   changed since the last one passed); [`file_id`]: the file identity the reuse checks compare.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
 //! - [`refine`]: the dataset check (`train refine`), short fold models that never saw a camera
@@ -40,6 +42,7 @@ pub mod config;
 pub mod dataset;
 pub mod estimate;
 pub mod eta;
+pub mod file_id;
 pub mod finish;
 pub mod import;
 pub mod job;
@@ -50,6 +53,7 @@ pub mod pyenv;
 pub mod recipe;
 pub mod refine;
 pub mod retry;
+pub mod self_check;
 pub mod service;
 pub mod switch;
 pub mod task;
@@ -757,6 +761,7 @@ pub fn plan_job(
         keep_work: false,
         export_only: None,
         headroom: commit::now,
+        reuse_from: Vec::new(),
     })
 }
 

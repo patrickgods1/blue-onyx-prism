@@ -62,6 +62,7 @@
 //!
 //! [`inventory`] counts the boxes per class and scene of the sources (the class picker).
 
+use super::file_id;
 use crate::benchmark::images::{self, Manifest, ManifestObject};
 use crate::collect::labels::bulk;
 use crate::collect::labels::export::{
@@ -75,6 +76,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod balance;
+pub mod reuse;
 mod valid;
 pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
 pub use valid::{VALID_CLASS_FLOORS, valid_groups_text};
@@ -2607,8 +2609,31 @@ fn safe_name(s: &str) -> String {
     out
 }
 
+/// Whether `path` is a JPEG (by its bytes: it starts with the SOI marker) that does not end with
+/// the EOI marker: the one kind of image a trainer rewrites ("corrupt JPEG restored and saved").
+/// Ultralytics does it through a temporary file and a rename (`_replace_image`, "so hard links to
+/// the original are never modified", read in the installed 8.4.184), so the bytes behind a link
+/// stay; such a file is still copied rather than linked, so no trainer version's way of writing it
+/// back can ever reach another name of the file (the review export's, the dataset frame's, another
+/// run's). An unreadable file is not one.
+pub fn jpeg_without_end(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let (mut head, mut tail) = ([0u8; 2], [0u8; 2]);
+    let read = (|| -> std::io::Result<()> {
+        f.read_exact(&mut head)?;
+        f.seek(SeekFrom::End(-2))?;
+        f.read_exact(&mut tail)
+    })();
+    read.is_ok() && head == [0xFF, 0xD8] && tail != [0xFF, 0xD9]
+}
+
+/// Hard-link `src` to `dst`, else copy it. A JPEG without its end marker is always copied
+/// ([`jpeg_without_end`]): the trainer writes it back.
 fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
-    if std::fs::hard_link(src, dst).is_ok() {
+    if !jpeg_without_end(src) && std::fs::hard_link(src, dst).is_ok() {
         return Ok(());
     }
     std::fs::copy(src, dst)
@@ -2799,8 +2824,53 @@ pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter, random_pick: bool)
 /// Write `plan` into `out` (created; must not exist or be empty). The frames as the plan read them
 /// ([`at_run_input`]: size floor regions a run at `opts.imgsz` can learn are boxes).
 pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Result<Prepared> {
+    write_reusing(sources, plan, opts, out, &[]).map(|(p, _)| p)
+}
+
+/// What [`write_reusing`] took from a donor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reused {
+    /// The donor dataset folder whose plan matched; None = none did.
+    pub from: Option<PathBuf>,
+    /// Image files hard-linked from it, of `images` written in all.
+    pub linked: usize,
+    pub images: usize,
+}
+
+impl Reused {
+    /// The run log's line, when anything was linked.
+    pub fn describe(&self) -> Option<String> {
+        let from = self.from.as_ref().filter(|_| self.linked > 0)?;
+        Some(format!(
+            "{} of {} image files hard-linked from the identical dataset of {} (the same plan, \
+             sources unchanged) instead of written again",
+            self.linked,
+            self.images,
+            from.display()
+        ))
+    }
+}
+
+/// [`write`], hard-linking the images of the first of `donors` (dataset folders of earlier runs)
+/// whose plan is the same instead of writing them again, where that is safe ([`reuse`]); every
+/// image it cannot link is written from its source as by [`write`]. Records its own images
+/// ([`reuse::PREPARED_FILES_FILE`]) for a later run.
+pub fn write_reusing(
+    sources: &[Source],
+    plan: &Plan,
+    opts: &Options,
+    out: &Path,
+    donors: &[PathBuf],
+) -> Result<(Prepared, Reused)> {
     let at_input = at_run_input(sources, plan, opts);
     let sources: &[Source] = &at_input;
+    let plan_fp = reuse::plan_fingerprint(sources, plan, opts);
+    let donor = reuse::find_donor(donors, &plan_fp);
+    let mut recorder = reuse::Recorder::default();
+    let mut reused = Reused {
+        from: donor.as_ref().map(|d| d.dir.clone()),
+        ..Reused::default()
+    };
     if out.exists()
         && std::fs::read_dir(out)
             .with_context(|| format!("reading {}", out.display()))?
@@ -2961,7 +3031,22 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         .iter()
         .map(|(r, n)| Ok((*r, frame(*r)?.image.as_path(), n.as_str())))
         .collect::<Result<_>>()?;
-    let resized = write_images(&jobs, opts.prepared_short_side, &out.join("images"))?;
+    let written = write_images(
+        &jobs,
+        opts.prepared_short_side,
+        &out.join("images"),
+        donor.as_ref(),
+    )?;
+    let mut resized: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
+    for (&(r, src, n), w) in jobs.iter().zip(&written) {
+        if let Some(s) = w.resized {
+            resized.insert(r, s);
+        }
+        reused.images += 1;
+        reused.linked += usize::from(w.linked);
+        let dst = out.join("images").join(n);
+        recorder.add(format!("images/{n}"), src, w.before, &dst, w.resized);
+    }
     // COCO sizes: the written image's (labels are normalized, so they hold either way).
     let mut entry = |(r, n): (FrameRef, String)| -> Result<(FrameRef, String, (u32, u32))> {
         let s = match resized.get(&r) {
@@ -3033,7 +3118,15 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
                 continue;
             };
             let n = name_of(r, f);
-            link_or_copy(&f.image, &hd.join("images").join(&n))?;
+            let dst = hd.join("images").join(&n);
+            let rel = format!("heldout/images/{n}");
+            let before = file_id::FileId::of(&f.image);
+            reused.images += 1;
+            match donor.as_ref().and_then(|d| d.link(&rel, &f.image, &dst)) {
+                Some(_) => reused.linked += 1,
+                None => link_or_copy(&f.image, &dst)?,
+            }
+            recorder.add(rel, &f.image, before, &dst, None);
             let txt = hd
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(&n))));
@@ -3102,7 +3195,9 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         resized_images: resized.len(),
     };
     write_text("dataset.json", &serde_json::to_string_pretty(&summary)?)?;
-    Ok(Prepared {
+    // Last: its presence says the folder is whole (a later run may link from it).
+    recorder.write(out, plan_fp)?;
+    let prepared = Prepared {
         dir: out.to_path_buf(),
         classes: classes.clone(),
         train_images: train_entries.len(),
@@ -3114,38 +3209,67 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         heldout_fingerprint: plan.heldout_fingerprint.clone(),
         warnings,
         balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
-    })
+    };
+    Ok((prepared, reused))
 }
 
-/// Write the images `jobs` (frame, source, file name in `dir`) of the train / valid splits: each through
-/// [`prepare_image`] at `short`, or linked as it is when None. In parallel
-/// ([`crate::parallel::map_all`] on all physical cores but one); the first error is returned.
-/// Returns the size of every image written downscaled.
+/// How [`write_images`] wrote one image.
+#[derive(Debug, Clone, Copy)]
+struct WrittenImage {
+    /// The size it was downscaled to, if it was.
+    resized: Option<(u32, u32)>,
+    /// The source's identity before it was written ([`reuse::Recorder::add`]).
+    before: Option<file_id::FileId>,
+    /// Hard-linked from the donor.
+    linked: bool,
+}
+
+/// Write the images `jobs` (frame, source, file name in `dir`) of the train / valid splits: each
+/// hard-linked from `donor` when it may ([`reuse::Donor::link`]), else through [`prepare_image`] at
+/// `short`, or linked as it is when None. In parallel ([`crate::parallel::map_all`] on all
+/// physical cores but one); the first error is returned. Returns how each was written, in `jobs`
+/// order.
 fn write_images(
     jobs: &[(FrameRef, &Path, &str)],
     short: Option<u32>,
     dir: &Path,
-) -> Result<BTreeMap<FrameRef, (u32, u32)>> {
-    type Done = Result<Option<(FrameRef, (u32, u32))>>;
-    let one = |i: usize| -> Done {
-        let Some(&(r, src, n)) = jobs.get(i) else {
+    donor: Option<&reuse::Donor>,
+) -> Result<Vec<WrittenImage>> {
+    let one = |i: usize| -> Result<Option<WrittenImage>> {
+        let Some(&(_, src, n)) = jobs.get(i) else {
             return Ok(None);
         };
         let dst = dir.join(n);
-        match short {
-            Some(short) => Ok(prepare_image(src, &dst, short)?.map(|s| (r, s))),
-            None => link_or_copy(src, &dst).map(|()| None),
+        let before = file_id::FileId::of(src);
+        if let Some(resized) = donor.and_then(|d| d.link(&format!("images/{n}"), src, &dst)) {
+            return Ok(Some(WrittenImage {
+                resized,
+                before,
+                linked: true,
+            }));
         }
+        let resized = match short {
+            Some(short) => prepare_image(src, &dst, short)?,
+            None => {
+                link_or_copy(src, &dst)?;
+                None
+            }
+        };
+        Ok(Some(WrittenImage {
+            resized,
+            before,
+            linked: false,
+        }))
     };
     // Linking is a syscall per file (a read walk's thread count); a downscale is CPU work.
     let threads = match short {
         Some(_) => crate::backend::cpu_threads::effective(0),
         None => crate::parallel::walk_threads_over(jobs.len()),
     };
-    let mut out = BTreeMap::new();
+    let mut out = Vec::with_capacity(jobs.len());
     for d in crate::parallel::map_all(jobs.len(), threads, &one) {
-        if let Some((r, s)) = d? {
-            out.insert(r, s);
+        if let Some(w) = d? {
+            out.push(w);
         }
     }
     Ok(out)

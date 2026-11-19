@@ -1520,6 +1520,7 @@ impl AutolabelJob {
                 local = super::relabel::LocalDetector {
                     config: config.clone(),
                     runtimes: None,
+                    no_cache: false,
                 };
                 &local
             }

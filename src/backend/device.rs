@@ -605,6 +605,7 @@ fn compile_on(
     needs_f32: bool,
     hint: PerfHint,
     path: &std::path::Path,
+    no_cache: bool,
 ) -> Result<openvino::CompiledModel> {
     let dt = DeviceType::from(device);
     // Core-wide settings like the precision hint: set before every compile so each model gets
@@ -644,7 +645,26 @@ fn compile_on(
             .get()
             .map_or("default", String::as_str)
     };
-    select_cache_dir(core, cache_root, device, wanted);
+    if no_cache {
+        // [`LoadRequest::no_cache`]: a throwaway model, whose blob would never be read again. The
+        // next compile points CACHE_DIR at its folder again (`select_cache_dir`).
+        if cache_root.is_some() {
+            let class_name = device_class(device);
+            let class = DeviceType::from(class_name.as_str());
+            match core_set_property(core, &class, &RwPropertyKey::CacheDir, "") {
+                Ok(()) => {
+                    tracing::debug!("OpenVINO {class}: no model cache for {}", path.display())
+                }
+                Err(e) => tracing::warn!(
+                    "OpenVINO {class}: could not switch the model cache off for {} ({e:#}); its \
+                     compiled blob goes to the cache",
+                    path.display()
+                ),
+            }
+        }
+    } else {
+        select_cache_dir(core, cache_root, device, wanted);
+    }
     core.compile_model(model, dt)
         .with_context(|| format!("compiling model {} on {device}", path.display()))
 }
@@ -761,6 +781,7 @@ pub(crate) fn load_model(
         needs_f32,
         tuning.hint,
         path,
+        req.no_cache,
     )?;
     let actual = primary;
     let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);

@@ -3,7 +3,8 @@
 //!
 //! In order: cache folders unused for [`super::caches::UNUSED_DAYS`] and the CoreML orphans
 //! ([`super::caches`]); `.<name>.train-staging` folders no running training holds; work folders
-//! of auto-label, import, overlap and dataset-check jobs that crashed ([`super::busy`]), an
+//! of auto-label, import, overlap and dataset-check jobs that crashed ([`super::busy`]; a dataset
+//! check's fold folders on the dataset's volume too, [`NEAR_WORK_DIRS`], [`ELSEWHERE_FILE`]), an
 //! auto-label's finished proposals written to their frames first
 //! ([`crate::training::autolabel::job::recover_crashed`],
 //! the folder kept and the reason logged when that fails); then `review-queue.jsonl` compaction
@@ -26,6 +27,39 @@ pub const WORK_DIRS: [(&str, WorkKind); 4] = [
     ("overlaps", WorkKind::Overlaps),
     ("refine", WorkKind::Refine),
 ];
+
+/// The work that may live on the dataset's volume instead, in [`NEAR_DATASET_DIR`]
+/// ([`near_dataset_base`]): the dataset check's fold folders, so their exports hard-link the
+/// frames ([`crate::training::refine::job`]).
+pub const NEAR_WORK_DIRS: [(&str, WorkKind); 1] = [("refine", WorkKind::Refine)];
+
+/// The folder beside the folder under review that holds [`NEAR_WORK_DIRS`]:
+/// `<parent>/.blue-onyx-prism-work/<sub>/<task id>`, held busy like any work folder.
+pub const NEAR_DATASET_DIR: &str = ".blue-onyx-prism-work";
+
+/// The file in a work folder naming its part elsewhere (one absolute path): written before that
+/// part is made, so a sweep that removes a crashed job's work folder removes that part too
+/// ([`elsewhere_of`]), wherever the configured folders point by then.
+pub const ELSEWHERE_FILE: &str = "elsewhere.txt";
+
+/// `<parent of review_dir>/.blue-onyx-prism-work`; None when `review_dir` has no parent, or that
+/// folder would lie inside one of `dataset_dirs` (the dataset's walkers and exports never see work
+/// folders).
+pub fn near_dataset_base(review_dir: &Path, dataset_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let review = abs(review_dir);
+    let parent = review.parent().filter(|p| !p.as_os_str().is_empty())?;
+    let base = parent.join(NEAR_DATASET_DIR);
+    let inside = |d: &Path| {
+        let d = abs(d);
+        base.starts_with(&d)
+            || d.canonicalize()
+                .ok()
+                .zip(parent.canonicalize().ok())
+                .is_some_and(|(d, p)| p.join(NEAR_DATASET_DIR).starts_with(d))
+    };
+    (!dataset_dirs.iter().any(|d| inside(d))).then_some(base)
+}
 
 /// Whose work folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +133,17 @@ impl Settings {
                 .map(|m| self.config.data_path(&m.path)),
         );
         out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Where [`NEAR_WORK_DIRS`] may be: [`near_dataset_base`] of each dataset folder.
+    pub fn near_dataset_bases(&self) -> Vec<PathBuf> {
+        let dirs = self.dataset_dirs();
+        let mut out: Vec<PathBuf> = dirs
+            .iter()
+            .filter_map(|d| near_dataset_base(d, &dirs))
+            .collect();
         out.dedup();
         out
     }
@@ -259,9 +304,22 @@ pub struct CrashedWork {
 /// Work folders that are neither running nor crashed: kept on purpose (an import's keep work, an
 /// auto-label's proposals it could not write) or left by a version without busy markers.
 pub fn kept_work(training_dir: &Path) -> Vec<CrashedWork> {
+    kept_in(training_dir, &WORK_DIRS)
+}
+
+/// [`kept_work`] of the training folder and of [`Settings::near_dataset_bases`].
+pub fn kept_all(s: &Settings) -> Vec<CrashedWork> {
+    let mut out = kept_work(&s.training_dir());
+    for base in s.near_dataset_bases() {
+        out.extend(kept_in(&base, &NEAR_WORK_DIRS));
+    }
+    out
+}
+
+fn kept_in(root: &Path, dirs: &[(&str, WorkKind)]) -> Vec<CrashedWork> {
     let mut out = Vec::new();
-    for (sub, kind) in WORK_DIRS {
-        let Ok(rd) = std::fs::read_dir(training_dir.join(sub)) else {
+    for &(sub, kind) in dirs {
+        let Ok(rd) = std::fs::read_dir(root.join(sub)) else {
             continue;
         };
         for e in rd.flatten() {
@@ -277,9 +335,23 @@ pub fn kept_work(training_dir: &Path) -> Vec<CrashedWork> {
 
 /// The markers of crashed jobs under `training_dir` (their folders may be gone already).
 pub fn crashed_work(training_dir: &Path) -> Vec<CrashedWork> {
+    crashed_in(training_dir, &WORK_DIRS)
+}
+
+/// [`crashed_work`] of the training folder, then of [`Settings::near_dataset_bases`] (the
+/// dataset check's fold folders on the dataset's volume).
+pub fn crashed_all(s: &Settings) -> Vec<CrashedWork> {
+    let mut out = crashed_work(&s.training_dir());
+    for base in s.near_dataset_bases() {
+        out.extend(crashed_in(&base, &NEAR_WORK_DIRS));
+    }
+    out
+}
+
+fn crashed_in(root: &Path, dirs: &[(&str, WorkKind)]) -> Vec<CrashedWork> {
     let mut out = Vec::new();
-    for (sub, kind) in WORK_DIRS {
-        let Ok(rd) = std::fs::read_dir(training_dir.join(sub)) else {
+    for &(sub, kind) in dirs {
+        let Ok(rd) = std::fs::read_dir(root.join(sub)) else {
             continue;
         };
         for e in rd.flatten() {
@@ -303,7 +375,7 @@ pub fn crashed_work(training_dir: &Path) -> Vec<CrashedWork> {
 /// folder goes. A folder whose proposals could not all be written stays (with its marker, so the
 /// next sweep tries again) and the reason goes to `rep.kept`.
 pub fn sweep_work(s: &Settings, rep: &mut Report) {
-    for w in crashed_work(&s.training_dir()) {
+    for w in crashed_all(s) {
         let State::Crashed(claim) = busy::probe(&w.dir) else {
             continue;
         };
@@ -324,9 +396,52 @@ pub fn sweep_work(s: &Settings, rep: &mut Report) {
             "an"
         };
         let why = format!("work folder of {article} {} that crashed", w.kind.as_str());
+        // Its part on another volume first (the folder names it, [`ELSEWHERE_FILE`]).
+        if let Some(far) = elsewhere_of(&w)
+            && !sweep_elsewhere(&far, &why, rep)
+        {
+            continue;
+        }
         if remove_counted(&w.dir, &why, &mut rep.removed) {
             claim.finish();
         }
+    }
+}
+
+/// The part elsewhere of the work folder `w` ([`ELSEWHERE_FILE`]), when it names one that can only
+/// be this job's: `<..>/.blue-onyx-prism-work/<w's sub>/<w's name>` (an absolute path; anything
+/// else in the file is ignored, so the sweep never removes a folder a stray file names).
+pub fn elsewhere_of(w: &CrashedWork) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(w.dir.join(ELSEWHERE_FILE)).ok()?;
+    let far = PathBuf::from(text.trim());
+    let sub = NEAR_WORK_DIRS.iter().find(|(_, k)| *k == w.kind)?.0;
+    let name = far.file_name()?;
+    let in_sub = far.parent()?;
+    let base = in_sub.parent()?;
+    let ok = far.is_absolute()
+        && Some(name) == w.dir.file_name()
+        && in_sub.file_name().is_some_and(|n| n == sub)
+        && base.file_name().is_some_and(|n| n == NEAR_DATASET_DIR);
+    ok.then_some(far)
+}
+
+/// Remove `far`, the part elsewhere of a crashed job's work folder, unless a running job holds
+/// it. Whether it is gone (the work folder may go too).
+fn sweep_elsewhere(far: &Path, why: &str, rep: &mut Report) -> bool {
+    match busy::probe(far) {
+        State::Live => {
+            rep.kept
+                .push(format!("{}: a running job holds it", far.display()));
+            false
+        }
+        State::Crashed(claim) => {
+            let gone = !far.exists() || remove_counted(far, why, &mut rep.removed);
+            if gone {
+                claim.finish();
+            }
+            gone
+        }
+        State::Ended => !far.exists() || remove_counted(far, why, &mut rep.removed),
     }
 }
 
@@ -621,6 +736,86 @@ mod tests {
             [&kept]
         );
         drop(hold);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_near_dataset_folder_lies_beside_the_review_folder_never_inside_a_dataset() {
+        let root = tmp("near-base");
+        let (ds, review) = (root.join("dataset"), root.join("dataset/review"));
+        assert_eq!(
+            near_dataset_base(&ds, std::slice::from_ref(&ds)),
+            Some(root.join(NEAR_DATASET_DIR))
+        );
+        // A review folder inside the dataset folder: its parent is the dataset folder.
+        assert_eq!(
+            near_dataset_base(&review, &[ds.clone(), review.clone()]),
+            None
+        );
+        // A dataset folder that holds the parent (a drive root): none either.
+        assert_eq!(near_dataset_base(&ds, &[root.clone(), ds.clone()]), None);
+        let s = settings(&root);
+        let dirs = s.dataset_dirs();
+        assert_eq!(
+            s.near_dataset_bases(),
+            dirs.iter()
+                .filter_map(|d| near_dataset_base(d, &dirs))
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_crashed_dataset_checks_fold_folder_near_the_dataset_goes_like_its_work_folder() {
+        let root = tmp("near-work");
+        let s = settings(&root);
+        let t = s.training_dir();
+        let base = s.near_dataset_bases()[0].clone();
+        // A crashed check: its work folder names its fold folder near the dataset.
+        let work = t.join("refine/20261118-1");
+        let far = base.join("refine/20261118-1");
+        put(&work.join("tighten.jsonl"), 10);
+        put(&far.join("fold-1/export/images/a.jpg"), 100);
+        std::fs::write(work.join(ELSEWHERE_FILE), far.display().to_string()).unwrap();
+        std::fs::write(busy::marker_of(&work), b"1\n").unwrap();
+        std::fs::write(busy::marker_of(&far), b"1\n").unwrap();
+        // A crashed fold folder whose work folder is gone already: found by its own marker.
+        let lone = base.join("refine/20261118-2");
+        put(&lone.join("fold-2/model/m.onnx"), 100);
+        std::fs::write(busy::marker_of(&lone), b"1\n").unwrap();
+        // A running check's fold folder stays.
+        let running = base.join("refine/20261118-3");
+        put(&running.join("fold-1/data/x.jpg"), 100);
+        let hold = busy::Busy::hold(&running);
+        // A work folder naming a folder that is not a near fold folder: that one is never touched.
+        let other = t.join("refine/20261118-4");
+        let stray = root.join("photos/20261118-4");
+        put(&stray.join("keep.jpg"), 100);
+        put(&other.join("x"), 1);
+        std::fs::write(other.join(ELSEWHERE_FILE), stray.display().to_string()).unwrap();
+        std::fs::write(busy::marker_of(&other), b"1\n").unwrap();
+        let crashed: Vec<_> = crashed_all(&s).into_iter().map(|w| w.dir).collect();
+        assert!(crashed.contains(&work) && crashed.contains(&far) && crashed.contains(&lone));
+        assert!(!crashed.contains(&running));
+        let mut rep = Report::default();
+        sweep_work(&s, &mut rep);
+        for gone in [&work, &far, &lone, &other] {
+            assert!(!gone.exists(), "{} stayed: {rep:?}", gone.display());
+            assert!(!busy::marker_of(gone).exists(), "{}", gone.display());
+        }
+        assert!(running.join("fold-1/data/x.jpg").is_file(), "running");
+        assert!(
+            stray.join("keep.jpg").is_file(),
+            "never a folder a stray file names"
+        );
+        drop(hold);
+        // Ended in order but not removed: listed as kept, like a work folder.
+        put(&base.join("refine/20261118-5/fold-1/a"), 1);
+        assert!(
+            kept_all(&s)
+                .iter()
+                .any(|w| w.dir == base.join("refine/20261118-5"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

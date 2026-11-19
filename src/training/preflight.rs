@@ -509,7 +509,7 @@ pub const TOOLS_ADVICE: &str = "free some space, or set download_dir to a bigger
 /// volume, and a file system that has hard links (exFAT does not, so a same-volume dataset can still
 /// be a full copy). Probed with a link that is removed at once; a folder that refuses the probe
 /// says nothing about the volume, so it counts as linkable.
-fn hard_links_work(file: &Path, dir: &Path) -> bool {
+pub(crate) fn hard_links_work(file: &Path, dir: &Path) -> bool {
     if !disk::same_volume(file, dir) {
         return false;
     }
