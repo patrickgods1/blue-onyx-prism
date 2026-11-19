@@ -417,14 +417,22 @@ async fn discard_raw_within(body: Body, limit: Duration) {
 // ---------------------------------------------------------------------------------------------
 // Detection endpoints
 
+/// The most a declared `Content-Length` reserves ahead of the bytes arriving. The length is the
+/// client's word: uncapped, one address's [`BODY_READS_PER_PEER`] reads declaring
+/// [`BODY_LIMIT`] each would allocate the whole upload budget (1 GiB) before sending a byte.
+/// 4 MiB covers a camera JPEG (2688x1520 is about 0.3-1.5 MB); a larger image grows its buffer
+/// past the reservation as its chunks arrive, as every image did before.
+const UPLOAD_RESERVE_CAP: usize = 4 * 1024 * 1024;
+
 /// Bytes to reserve for the image field from the request's declared `Content-Length` (the whole
-/// multipart body: the image plus a few hundred bytes of headers). A length past [`BODY_LIMIT`]
-/// (refused by the read anyway) or none reserves nothing. Pure.
+/// multipart body: the image plus a few hundred bytes of headers), at most
+/// [`UPLOAD_RESERVE_CAP`]. A length past [`BODY_LIMIT`] (refused by the read anyway) or none
+/// reserves nothing. Pure.
 fn upload_reserve(declared: Option<u64>) -> usize {
     declared
         .filter(|&n| n <= BODY_LIMIT as u64)
         .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(0)
+        .map_or(0, |n| n.min(UPLOAD_RESERVE_CAP))
 }
 
 /// An empty buffer for a field, with room for `reserve` bytes when `charge` can take them now:
@@ -2034,7 +2042,14 @@ mod tests {
         assert_eq!(upload_reserve(None), 0);
         assert_eq!(upload_reserve(Some(0)), 0);
         assert_eq!(upload_reserve(Some(300_000)), 300_000);
-        assert_eq!(upload_reserve(Some(BODY_LIMIT as u64)), BODY_LIMIT);
+        assert_eq!(
+            upload_reserve(Some(UPLOAD_RESERVE_CAP as u64)),
+            UPLOAD_RESERVE_CAP
+        );
+        // A lying or huge length reserves at most the cap: one address cannot allocate the
+        // budget with headers alone.
+        assert_eq!(upload_reserve(Some(BODY_LIMIT as u64)), UPLOAD_RESERVE_CAP);
+        const { assert!(BODY_READS_PER_PEER * UPLOAD_RESERVE_CAP <= body_budget::UPLOAD_BUDGET / 4) };
         assert_eq!(upload_reserve(Some(BODY_LIMIT as u64 + 1)), 0);
         assert_eq!(upload_reserve(Some(u64::MAX)), 0);
 
