@@ -443,7 +443,8 @@ fn without_one_off_flags(config: &Config, file: &Config) -> Config {
 pub fn log_startup_warnings(config: &Config, config_path: &Path) {
     for (what, t) in blocking_thresholds(config) {
         tracing::warn!(
-            "{what} is {t}: no detection can reach it, so every request answers 0 objects; set a              threshold below 1 (0.4 to 0.6 is usual)"
+            "{what} is {t}: no detection can reach it, so every request answers 0 objects; set a \
+             threshold below 1 (0.4 to 0.6 is usual)"
         );
     }
     if let Some(w) = retired_remote_admin_warning(config, config_path) {

@@ -399,7 +399,8 @@ fn rescore_saved(state: &AppState, req: &RunRequest) -> (bool, Option<String>) {
             return (
                 false,
                 Some(format!(
-                    "The saved results were not re-ranked: {} (run the benchmark again to                      replace the entries that do not load).",
+                    "The saved results were not re-ranked: {} (run the benchmark again to \
+                     replace the entries that do not load).",
                     w.join("; ")
                 )),
             );
@@ -670,7 +671,8 @@ mod tests {
             &st,
             post(
                 "/v1/benchmark/settings",
-                "dataset=sample&accuracy_metric=roc_auc&threshold_objective=youden                 &low_priority=0&low_priority=1",
+                "dataset=sample&accuracy_metric=roc_auc&threshold_objective=youden\
+                 &low_priority=0&low_priority=1",
             ),
         )
         .await;
