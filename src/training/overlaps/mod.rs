@@ -13,7 +13,7 @@
 //!
 //! - [`select`]: stage 1, the open pairs without an answer and the crops they need;
 //! - [`job`]: stage 2 (the environment, RF-DETR L's weights) and the stage machine;
-//! - [`zoom`]: stage 3, `scripts/autolabel.py --zoom-pairs`, one flushed JSONL line per finished crop;
+//! - [`zoom`]: stage 3, `scripts/autolabel.py --zoom-pairs`, one JSONL line per finished crop, flushed per frame;
 //! - [`write`]: stage 4, the suggestions, re-judged under the label write lock.
 //!
 //! A cancel keeps the finished crops: they are written as usual, and a rerun skips every pair with an
@@ -37,10 +37,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Free commit (RAM + paging file) the check needs on Windows, in GiB: torch, RF-DETR L and its
-/// trace, measured. A fixed paging file runs out of commit long before RAM.
-pub const NEEDED_COMMIT_GB: f64 = 2.6;
-
 /// What to check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlapsRequest {
@@ -53,6 +49,10 @@ pub struct OverlapsRequest {
     pub gpu: Option<String>,
     #[serde(default)]
     pub allow_large: bool,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 impl OverlapsRequest {
@@ -68,6 +68,7 @@ impl OverlapsRequest {
             frames,
             gpu: None,
             allow_large: false,
+            ignore_memory_check: false,
         })
     }
 }
@@ -121,7 +122,7 @@ pub fn plan_overlaps(
         platform,
         accelerator,
         timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
-        free_commit: crate::system_info::commit,
+        headroom: crate::training::commit::now,
     })
 }
 

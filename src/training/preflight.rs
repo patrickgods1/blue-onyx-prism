@@ -13,6 +13,8 @@
 //!   refusal, and none when the card cannot be read.
 //! - [`workers_line`]: the data loader workers a run would get now, learned from earlier runs
 //!   ([`super::workers`]).
+//! - [`memory`]: the memory commit check a run meets at its start ([`crate::training::commit`]),
+//!   "would be refused if it started now", with the words of the "Start anyway" checkbox.
 //!
 //! Everything here is advice over a pure plan, but for reading file sizes, [`disk::space`] and the
 //! card's free memory.
@@ -40,8 +42,13 @@ pub const MIN_HELDOUT_FRAMES: usize = 10;
 pub const MIN_SCENE_FRAMES: usize = 50;
 /// Disk the run's work folder takes, as a multiple of the base weights. Measured on 2-epoch runs:
 /// YOLO26n 16 MB of 5.5 MB (best + last), RT-DETRv2 S 77 MB of 81 MB, RF-DETR nano 1.2 GB of 366 MB
-/// (the mapped base, `last.ckpt` with the optimizer, the best checkpoints).
-pub const WORK_WEIGHT_FACTOR: u64 = 4;
+/// (the mapped base, `last.ckpt` with the optimizer, the best checkpoints). Two full RF-DETR nano
+/// runs kept their work (2026-10-31, `du`): 3.5 GB and 1.6 GB, of which 5 and 1 interval archives
+/// of 483 MB (`checkpoint_<epoch>.ckpt`, which the script now turns off: `checkpoint_interval`),
+/// so 1.1 GB without them (3.2x: mapped base 350 MB, `last.ckpt` 483 MB, three best checkpoints of
+/// 121 MB, `last_ema.pth` 68 MB); 5x leaves room for an rfdetr that refuses the setting (one
+/// archive) and for the larger sizes' optimizer state.
+pub const WORK_WEIGHT_FACTOR: u64 = 5;
 /// Disk per frame beyond its image: the label file, its share of the COCO JSON and the lists.
 pub const LABEL_BYTES_PER_FRAME: u64 = 8 * 1024;
 
@@ -172,6 +179,15 @@ pub struct ClassLine {
     pub by_scene: SceneCounts,
 }
 
+/// A class of [`dataset::VALID_CLASS_FLOORS`] the run trains: its validation boxes and how many
+/// are wanted ([`Report::valid_floors`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ValidFloor {
+    pub class: String,
+    pub boxes: usize,
+    pub wanted: usize,
+}
+
 /// What a run of a plan would train on ([`report`]).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
@@ -182,6 +198,9 @@ pub struct Report {
     /// Training images per epoch (repeats counted).
     pub train_images: usize,
     pub valid_frames: usize,
+    /// The validation boxes of each class with a floor the run trains (person: 80 wanted; the
+    /// plan's warnings say why a floor is short).
+    pub valid_floors: Vec<ValidFloor>,
     pub heldout_frames: usize,
     /// Training frames without an object, and those a reviewer confirmed or rejected a box on.
     pub negatives: usize,
@@ -223,6 +242,10 @@ pub struct Report {
     pub warnings: Vec<String>,
     /// Why the run would not start ([`refusals`]).
     pub refusals: Vec<String>,
+    /// The memory commit check would refuse a start now ([`memory`]; filled by the caller, None
+    /// from [`report`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::training::commit::Preview>,
 }
 
 /// The [`Report`] of `plan`.
@@ -317,6 +340,15 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         train_frames: plan.train.len(),
         train_images: plan.train.iter().map(|(_, n)| *n as usize).sum(),
         valid_frames: plan.valid.len(),
+        valid_floors: dataset::VALID_CLASS_FLOORS
+            .iter()
+            .filter(|(c, _)| plan.classes.iter().any(|k| k == c))
+            .map(|(c, wanted)| ValidFloor {
+                class: (*c).to_string(),
+                boxes: s.valid_boxes.get(*c).copied().unwrap_or(0),
+                wanted: *wanted,
+            })
+            .collect(),
         heldout_frames: plan.heldout.len(),
         negatives: s.train_negatives,
         hard_negatives: s.hard_negatives,
@@ -338,7 +370,23 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
         notes,
         warnings: plan.warnings.clone(),
         refusals: refusals(plan, sources, opts),
+        memory: None,
     }
+}
+
+/// What the memory commit check would answer a run of each of `recipes` with `workers` started now
+/// with `reading` ([`crate::training::trainer_commit_need`]; the largest need when several models
+/// are ticked, each run is checked at its own start): None when every one would start.
+pub fn memory(
+    recipes: &[TrainRecipe],
+    workers: super::job::Workers,
+    reading: Option<&crate::training::commit::Headroom>,
+) -> Option<crate::training::commit::Preview> {
+    let need = recipes
+        .iter()
+        .map(|r| super::trainer_commit_need(r.family, workers))
+        .max_by_key(|n| n.bytes)?;
+    crate::training::commit::preview(&need, reading)
 }
 
 /// [`Report`] as text (`train prepare --dry-run`): warnings come with the plan's text.
@@ -358,6 +406,12 @@ pub fn text(r: &Report) -> String {
         "training frames per scene: day {}, night {}, ir {}, unknown {}\n",
         sc.day, sc.night, sc.ir, sc.unknown
     ));
+    for f in &r.valid_floors {
+        out.push_str(&format!(
+            "validation: {} {} boxes ({} wanted to choose the checkpoint on)\n",
+            f.boxes, f.class, f.wanted
+        ));
+    }
     out.push_str("boxes per class (train / validation / held out; train by day, night, ir):\n");
     for c in &r.classes {
         let s = &c.by_scene;
@@ -425,6 +479,13 @@ pub fn text(r: &Report) -> String {
     for x in &r.refusals {
         out.push_str(&format!("refused: {x}\n"));
     }
+    if let Some(m) = &r.memory {
+        out.push_str(&format!(
+            "memory: a run would be refused if it started now: {} (--ignore-memory-check starts \
+             it anyway)\n",
+            m.refusal
+        ));
+    }
     out
 }
 
@@ -450,7 +511,7 @@ pub const TOOLS_ADVICE: &str = "free some space, or set download_dir to a bigger
 /// volume, and a file system that has hard links (exFAT does not, so a same-volume dataset can still
 /// be a full copy). Probed with a link that is removed at once; a folder that refuses the probe
 /// says nothing about the volume, so it counts as linkable.
-fn hard_links_work(file: &Path, dir: &Path) -> bool {
+pub(crate) fn hard_links_work(file: &Path, dir: &Path) -> bool {
     if !disk::same_volume(file, dir) {
         return false;
     }
@@ -604,7 +665,7 @@ pub fn refusal(needs: &[(VolumeNeed, Option<Space>)]) -> Option<String> {
 /// size ([`super::estimate`], RF-DETR multi-scale as the run decides it). None when the family
 /// and size have no estimate there.
 pub fn gpu_need(recipe: &TrainRecipe, accel: &Accelerator) -> Option<vram::JobNeed> {
-    let multi_scale = recipe.multi_scale_on(accel.memory_mb());
+    let multi_scale = recipe.multi_scale_on(accel.memory_mb(), accel.target());
     let est = super::estimate::estimate_with(
         recipe.family,
         &recipe.size,

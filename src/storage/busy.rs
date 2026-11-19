@@ -83,6 +83,16 @@ impl Busy {
     pub fn marker(&self) -> &Path {
         &self.marker
     }
+
+    /// Let go of the folder but keep its marker: the job ended without removing a folder it
+    /// meant to (a file still in use), so the next sweep sees a crashed job's folder and removes
+    /// it ([`probe`] then answers [`State::Crashed`]).
+    pub fn abandon(mut self) {
+        self.remove_target = false;
+        if let Some(f) = self.file.take() {
+            let _ = fs4::FileExt::unlock(&f);
+        }
+    }
 }
 
 impl Drop for Busy {

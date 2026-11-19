@@ -378,8 +378,8 @@ it; every key can also be set in the file.
 | `log_timezone` | retired | Replaced by `timezone`. Read from old files only: when `timezone` is absent, its value becomes `timezone`, except `"utc"` (the old default, which every save wrote), which means `"local"`. Dropped from the file at the next save. UI: no |
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
 | `log_format` | `"text"` | Format of the log files under `log_path`: `"text"` or `"json"` (one JSON object per line, for log shippers); the console stays text. Applies: process restart. UI: no |
-| `save_image_path` | `null` | Save annotated detections here. Path. Applies: at once. UI: yes |
-| `save_ref_image` | `false` | Also save the unannotated image. Boolean. Applies: at once. UI: yes |
+| `save_image_path` | `null` | Save annotated detections here (`<name>_od.jpg`, written after the answer went out; when images arrive faster than they are written, a few are skipped with a warning). Path. Applies: at once. UI: yes |
+| `save_ref_image` | `false` | Also save the unannotated image (`<name>.jpg`: the uploaded JPEG as it came, other formats as a JPEG). Boolean. Applies: at once. UI: yes |
 | `save_image_max_age_days` | `30` | Delete saved images (`.jpg`/`.jpeg`/`.png` directly in `save_image_path`) older than this many days, 0 = keep; checked every 10 minutes. Integer 0-3650. Applies: at once. UI: yes |
 | `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0 = unlimited. Integer 0-1000000. Applies: at once. UI: yes |
 | `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Integer 1000-1000000000. Applies: at once. UI: no |
@@ -389,6 +389,7 @@ it; every key can also be set in the file.
 | `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
 | `ort_gpu_mem_limit_mb` | unset (no cap) | Cap in MB of the GPU memory arena of each ONNX Runtime CUDA session (ONNX Runtime's `gpu_mem_limit`), for a card shared with training or auto-label jobs; also caps the CUDA provider behind `ort:tensorrt` (TensorRT's own memory is not counted). Per session: a model with two `ort_sessions` can use twice it, and the CUDA context and libraries' own memory lie outside it. A run that needs more than the cap fails with an inference error instead of growing the arena. Unset = no cap (the arena grows by what a run asks for). No effect on DirectML, CoreML or OpenVINO. Integer 64-1048576. Applies: restart. UI: no |
 | `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
+| `performance_hint` | unset (`latency` on an integrated GPU) | OpenVINO compile hint for models on an OpenVINO GPU (`openvino:gpu[.N]`): `latency` (one stream, 2 requests in flight so the host prepares the next frame while the GPU runs one) or `throughput` (OpenVINO's THROUGHPUT hint, several streams; requests in flight = the compiled model's `OPTIMAL_NUMBER_OF_INFER_REQUESTS`, two per stream, at most 4: 2 streams and 4 requests on a UHD 630. The OpenVINO runtime `setup-openvino` installs has no auto-batching plugin, so a request never waits for a batch to fill). Unset = the hardware profile's choice: `latency` on an integrated GPU, THROUGHPUT with up to 4 in flight (clamped to its streams) on a discrete Intel GPU. An explicit `inflight` still sets the count. CPU, NPU and ONNX Runtime devices ignore it. On a UHD 630 `throughput` measured the same as `latency` below saturation and about 5% more frames per second only when overloaded (docs/PRODUCTION_REVIEW.md), so the default stays; a model's own `performance_hint` wins. Applies: restart (shown on every model it moves). UI: no |
 | `models_dir` | `"models"` | Where `download-models` and exports put files (relative = under the data root). Path; empty on the Config page = `models`. Applies: restart. Files already there are not moved. UI: yes (Server, Folders) |
 | `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry. Model name. Applies: at once. UI: yes (Models card) |
 | `previous_default` | `null` | What the last **Use as default** on the Models tab replaced (the model, its `default_model` value, the settings the switch changed), for the one-click Revert on that card and on Home. Written by the page; a Revert writes the opposite record, so a second Revert redoes the switch. Applies: at once. UI: yes (Models tab, Use a trained model) |
@@ -601,6 +602,7 @@ and the default model; every key is in the *Models JSON* under it):
 | `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
 | `enabled` | `true` | Load and serve this model; disabled models stay in the config but are not loaded. Boolean. Applies: model reload (start or stop). UI: yes (Models card *Load*) |
 | `inflight` | `null` | Concurrent inferences of this model; `null` or `0` = the global `inflight`. Integer 0-64. Applies: restart. UI: no |
+| `performance_hint` | `null` | OpenVINO GPU compile hint of this model, `latency` or `throughput` (see the global key); `null` = the global `performance_hint`. No effect on CPU, NPU or ONNX Runtime devices. Applies: model reload. UI: Models JSON |
 | `night_confidence_threshold`, `person_aspect`, `min_box_area_frac`, `suppress_overlaps`, `static_suppression` | absent | Per-model night / IR rules (see the global keys); absent = the global value, a set value replaces it. Applies: at once. UI: Models JSON |
 | `label_thresholds`, `night_label_thresholds` | absent | Per-model label thresholds, merged over the global ones (this model's entries win; `0` turns a global entry off). Applies: at once. UI: Models JSON |
 | `preprocess`, `night_preprocess` | absent | Per-model image enhancement (see the global keys); absent = the global value, `"none"` turns a global mode off for this model. Applies: at once. UI: Models JSON |
@@ -768,7 +770,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.reference_model` | `null` | Model whose detections score datasets without ground truth; `null` = the most accurate installed one. UI: yes |
 | `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
-| `benchmark.low_priority` | `true` | Run benchmarks at below-normal process priority so the desktop stays responsive (Windows: the whole service for the run, restored after; CLI on Linux/macOS: nice 10). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
+| `benchmark.low_priority` | `true` | Run benchmarks of CPU devices (`openvino:cpu`, `ort:cpu`, `CPU`) at below-normal process priority so the desktop stays responsive; GPU and NPU devices keep the normal priority, so the service keeps answering Blue Iris at full priority while they run (Windows: the whole process while a CPU device compiles and runs, restored before a GPU device and after the run; the log and the Benchmark page's progress line say which applied; CLI on Linux/macOS: nice 10 for a run whose devices are all CPUs, a running service is never lowered there). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
 | `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`. UI: yes |
 | `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
 
@@ -808,6 +810,35 @@ address. Every page below needs a sign-in:
 | `/train/models` | The trained models with their held-out benchmark, Comparison, and **Default model** (with a preview of what changes, and Revert) / **night model of** / **verifier of** actions |
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
+
+#### Sorting tables
+
+Click a column header to sort a table by it, and click it again for the other direction.
+Shift-click another header to add it as the next sort key; the headers then show the rank of
+each key (1, 2, ...). On a phone, where the tables show as cards without headers, a **Sort by**
+list above the table does the same. **Default order** (or **Best first**, on tables whose own order
+ranks the rows) puts the table back in its own order. Each browser remembers the sort of each table
+(in its local storage; a private window forgets it); tables the page updates live keep it. Rows
+that belong to another (a run's training details) move with it, and summary rows stay at the end.
+
+What **Best first** means, table by table (the server decides it; the page only sorts by it):
+
+- **Home** and **Stats** models: the benchmark ranking (overall grade, then accuracy, then speed, each
+  model on its recommended device); models without benchmark results follow in config order.
+- **Config → Models**: no best order; the config order (the load order) is the table's own order.
+- **Benchmark → All results, Confidence, a model's devices (Details) and Tune**: each model on each
+  device ranked by the same grades (the `points` of `GET /v1/benchmark`); rows of runs picked from
+  the history follow.
+- **Benchmark → Compare** (models on the same images): the headline's rule: people found, then
+  vehicles, then all objects, a difference counting only past the noise; models level on all three
+  by fewer false alerts; models that trained on these images last.
+- **Train → Models → Comparison**: person recall, then vehicle recall, then AP50-95 on every
+  held-out frame (missing values last); routed and seed-summary rows stay at the bottom.
+- **Train → Models → Use a trained model**: grouped by held-out set (runs scored on the same
+  held-out frames with the same classes and merges), newest group first; inside a group, best
+  first by the Comparison's rule. A sort by a column sorts inside each group.
+- The **HTML benchmark report** sorts too (opened from disk); its tables start in their own order
+  (the ranking in rank order).
 
 #### Prometheus metrics
 
@@ -1269,17 +1300,17 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/dataset/settings`, `/dataset/review`, `/dataset/resume` | the Collect tab's forms: `collect` settings; `frame=<path>` (repeated) to queue for review; re-arm after a disk stop |
 | GET | `/v1/review/next?bucket=&scene=&camera=&label=&status=&source=&after=&then=` | the most uncertain frame to review (after `after`; on `then` when `after` is no longer listed, e.g. just saved), its position, the review counts (reviewed, remaining, skipped, per class) and the cameras and classes for the filter lists; `label` keeps frames with a box of that class (reviewed labels, else the reply's) |
 | GET, POST | `/v1/review/labels?frame=<path>` | a frame's label file (saved, else pre-filled from the sidecar) with its size and sidecar summary; POST a label file (JSON, at most 256 KiB) to save it (`unreviewed`, `reviewed` or `skipped`; pending boxes resolved on `reviewed`) |
-| POST | `/v1/review/export` | `{formats, out_dir?, holdout_cameras?, holdout_days?, holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`: export the reviewed frames (only those with a box of `labels` when given, plus confirmed-empty ones unless `include_empty` is false; a label outside `collect.classes` is a 400) (YOLO, COCO, X-AnyLabeling, benchmark set) to a new folder, default `<data root>/training/exports/<UTC time>` |
+| POST | `/v1/review/export` | `{formats, out_dir?, holdout_cameras?, holdout_days?, holdout_fraction?, benchmark_split?, include_unreviewed?, labels?, include_empty?}`: export the reviewed frames (only those with a box of `labels` when given, plus confirmed-empty ones unless `include_empty` is false; a label outside `collect.classes` is a 400) (YOLO, COCO, X-AnyLabeling, benchmark set) to a new folder, default `<data root>/training/exports/<UTC time>`. Every camera day listed in the review folder's `heldout-days.json` is held out; an export of the default split adds its held-out days and tops each camera up to two with days no run trained on (report `heldout`: `listed`, `added`, `short`); a newer or damaged list is a 422, never rewritten (docs/DATASET.md "Export") |
 | POST | `/v1/review/import`, `/v1/review/classes` | `{dir, treat_unchecked_as_reviewed?}`: import X-AnyLabeling files; `{classes: [...]}`: save `collect.classes` |
 | GET | `/v1/train/summary` | the Train area's status strip: `summary` (frames collected, to review, reviewed, boxes to review, frames to review with no label file, reviewed camera days, the dataset check's open relabel and add suggestions (`open_relabel_add`, null until counted) and the frames its last report covered (`check_covered`), `quick_model`, exports, runs, models, the job on the queue; `counted: false` while the first count of a large folder runs) and `next` (`key`, `text`, `link`, `label`, `tab`: the one suggested action) |
 | GET | `/v1/training` | training capability (accelerator, families and sizes with estimates and fit, reasons), the data loader workers learned per measured recipe on this machine (`workers_learned`: family, size, imgsz, batch, workers, learned, limit, why, text), the runs (state, stage, percent, progress, log tail, dataset counts, installed model, benchmark) and the import / auto-label jobs (`tasks`: state, stage, percent, log tail, summary, result) |
-| POST | `/training/queue` | the Train tab's form: `model` (repeated: `yolo26n`, `rfdetr-nano`, `rt-detrv2-s`, ...), `dataset` (repeated) / `dataset_path`, `scene` (repeated: one run per scene, compared), `classes` (repeated or comma-separated), `excluded` (`background` / `drop-frame`), `balance` (repeated or comma-separated: `class`, `scene`, `camera`, `camera-day`), `balance_strength`, `balance_max_repeat`, `balance_cap_on` + `balance_cap`, `epochs`, `patience`, `batch`, `imgsz`, `lr`, `night_aug`, `aug_dark`, `aug_noise`, `aug_gray`, `public`, `benchmark_set`, `name`; `confirm_large=1` for the first environment download unless `allow_large_downloads` |
-| GET | `/v1/training/dataset-classes` | `dataset` (repeated): boxes and frames per class with per-scene box counts (the class picker), frames per scene, errors per folder |
-| POST | `/v1/training/balance-preview` | the queue form's dataset fields (`dataset`, `dataset_path`, `scene`, `classes`, `excluded`, `public`, `balance*`): per scene filter the planned split and the balance report (before / after per class, scene, camera), and per ticked `model` (at the typed `batch` / `imgsz`) the data loader workers it would get (`workers`), nothing written |
+| POST | `/training/queue` | the Train tab's form: `model` (repeated: `yolo26n`, `rfdetr-nano`, `rt-detrv2-s`, ...), `dataset` (repeated) / `dataset_path`, `scene` (repeated: one run per scene, compared), `classes` (repeated or comma-separated), `rename` (repeated or comma-separated `from=to`: boxes of `from` train as `to`, an empty `to` drops them; the class list names `to`), `excluded` (`background` / `drop-frame`), `balance` (repeated or comma-separated: `class`, `scene`, `camera`, `camera-day`), `balance_strength`, `balance_max_repeat`, `balance_cap_on` + `balance_cap`, `epochs`, `patience`, `batch`, `imgsz`, `lr`, `night_aug`, `aug_dark`, `aug_noise`, `aug_gray`, `public`, `benchmark_set`, `name`; `confirm_large=1` for the first environment download unless `allow_large_downloads`; `ignore_memory_check=1` (the pre-flight's "Start anyway", shown only with a memory commit refusal) starts each run even when the Windows memory commit check would refuse it |
+| GET | `/v1/training/dataset-classes` | `dataset` (repeated), `rename` (repeated `from=to`, a bad one is 400): boxes and frames per class after the merges, with per-scene box counts (the class picker), `order`, `source_classes` (the exports' own names with box counts), frames per scene, errors per folder |
+| POST | `/v1/training/balance-preview` | the queue form's dataset fields (`dataset`, `dataset_path`, `scene`, `classes`, `rename`, `excluded`, `public`, `balance*`): per scene filter the planned split and the balance report (before / after per class, scene, camera), the disk check, the data loader workers each ticked `model` would get now at the typed `batch` / `imgsz` (`workers`), and `memory` `{refusal, override_label}` when the memory commit check would refuse a run started now; nothing written |
 | GET | `/v1/training/compare` | `group`: the runs of a comparison group and their per-scene held-out AP table (`comparison`, `text`) |
-| POST | `/training/import` | the Import footage form: `source` (`path`, `url`, `dataset`) with `path` / `url` / `dataset`, `camera`, `frames`, `select` (`siglip`, `dhash`), `scene`, `max_fps`, `every`, `dedup_window`, `no_balance`, `license`, `confirm_license`, `confirm_large`; queued on the training queue |
-| POST | `/training/autolabel` | the Auto-label form (Training and Review tabs): `frames` (filter text), `gdino` (`tiny`, `base`, `large`, `off`, `sam3` once installed), `sam3_threshold` (with `gdino=sam3`, 0.01 to 1, default 0.3), `rfdetr`, `vlm` (`2b`, `4b`, `8b`, `off`), `siglip`, `with_model`, `missing_only`, `threshold`, `confirm_large` |
-| POST | `/training/autolabel/preview` | same form as `/training/autolabel`, starts nothing: frames matched, taken after the limit, skipped by marker, split by status, rough time, warnings |
+| POST | `/training/import` | the Import footage form: `source` (`path`, `url`, `dataset`) with `path` / `url` / `dataset`, `camera`, `frames`, `select` (`siglip`, `dhash`), `scene`, `max_fps`, `every`, `dedup_window`, `no_balance`, `license`, `confirm_license`, `confirm_large`, `ignore_memory_check` (start a SigLIP 2 selection the memory commit check would refuse); queued on the training queue |
+| POST | `/training/autolabel` | the Auto-label form (Training and Review tabs): `frames` (filter text), `gdino` (`tiny`, `base`, `large`, `off`, `sam3` once installed), `sam3_threshold` (with `gdino=sam3`, 0.01 to 1, default 0.3), `rfdetr`, `vlm` (`2b`, `4b`, `8b`, `off`), `siglip`, `with_model`, `missing_only`, `threshold`, `confirm_large`, `ignore_memory_check` (the preview's "Start anyway") |
+| POST | `/training/autolabel/preview` | same form as `/training/autolabel`, starts nothing: frames matched, taken after the limit, skipped by marker, split by status, rough time, warnings, `memory` `{refusal, override_label}` when the memory commit check would refuse a start now |
 | GET | `/v1/autolabel/sam3` | SAM 3 access state (`not_requested`, `needs_login`, `token_unreadable`, `needs_access`, `checking`, `downloading`, `installed`, `failed`), token source (never its value), the login command, size, progress |
 | POST | `/v1/autolabel/sam3/download` | "I have access": adopts a folder already on disk, else checks access and downloads; 409 with the state when refused |
 | POST | `/v1/autolabel/sam3/remove` | deletes the whole SAM 3 weights folder; refused while a run uses it |
@@ -1439,10 +1470,16 @@ for throwaway test servers only).
   and restart` means the installed CUDA build is older than the catalog's and has no kernels for the card
   (GTX 10-series needs 1.28+): press Update on the Config page's Resources card (or run
   `blue-onyx-prism fetch --resource onnxruntime-cuda`), then restart.
-- **A CPU benchmark made the desktop unresponsive:** benchmarks run at below-normal priority
+- **A CPU benchmark made the desktop unresponsive:** benchmarks of CPU devices run at below-normal priority
   (`benchmark.low_priority`, `benchmark --no-low-priority` to opt out) and CPU inference keeps one core
   free (`intra_threads` 0); ONNX Runtime's thread pools do not spin-wait between runs (`BOP_ORT_SPINNING=1`
   restores the default spinning).
+- **cuDNN convolution search (measurement only):** CUDA sessions (`ort:cuda`, and the CUDA provider behind
+  `ort:tensorrt`) use `cudnn_conv_algo_search` HEURISTIC, which avoids the memory peak of ONNX Runtime's
+  exhaustive search at load. `BOP_CUDNN_CONV_ALGO_SEARCH=exhaustive|heuristic|default` replaces it for the
+  whole process, to compare inference time and load memory; the log says so once. Unset (or an unknown
+  value, which is warned about) keeps HEURISTIC. On a GTX 1070 Ti, EXHAUSTIVE gave the same inference time
+  and memory peak as HEURISTIC for rf-detr-nano and dfine-s (docs/PRODUCTION_REVIEW.md).
 - **GPU usage stays around 60 % with DirectML or CUDA:** Task Manager's GPU column shows the busiest engine
   and under-reports compute work; look at the *Compute_0* / *3D* engine graphs or `nvidia-smi dmon -s u`.
   The server runs two ONNX Runtime sessions per model on a discrete GPU (`ort_sessions`) so one request's

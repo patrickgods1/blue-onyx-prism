@@ -13,13 +13,17 @@
 //! **It changes nothing else**: no box, frame status, config entry, models folder file,
 //! `runs.json` or `benchmark.json`. A fold model is installed in the job's work folder, registered
 //! nowhere and benchmarked never ([`crate::training::job::NoHooks`]), and the whole work folder
-//! (`<training dir>/refine/<id>`) is deleted at the end.
+//! (`<training dir>/refine/<id>`, and the fold folders' place on the dataset's volume when they
+//! went there, [`place`]) is deleted at the end.
 //!
 //! Each stage is a file:
 //!
 //! - [`folds`]: whole camera days per fold, pure;
 //! - [`job`]: the stage machine ([`RefineJob`], a task of the training queue);
-//! - [`predict`]: a fold model over its frames, in this process ([`predict::FoldPredictor`]);
+//! - [`place`]: where the fold folders go (on the volume of the folder under review when the
+//!   training folder is on another one, so the fold exports hard-link the frames);
+//! - [`predict`]: a fold model over its frames, in this process ([`predict::FoldPredictor`]; a
+//!   fold model compiles without the OpenVINO model cache);
 //! - [`judge`]: one frame's labels against the detections, pure (and [`judge::tighten`], the
 //!   decision on a loose label from two looks);
 //! - [`write`]: the suggestions, re-judged under the label write lock;
@@ -39,6 +43,7 @@
 pub mod folds;
 pub mod job;
 pub mod judge;
+pub mod place;
 pub mod predict;
 pub mod quick;
 pub mod report;
@@ -49,8 +54,9 @@ pub use job::RefineJob;
 pub use report::Mode;
 
 use super::capability::Capability;
+use super::commit::Need;
 use super::dataset::SceneFilter;
-use super::job::TrainRequest;
+use super::job::{TrainRequest, Workers};
 use super::progress::EpochPoint;
 use super::recipe::TrainRecipe;
 use crate::collect::labels::bulk::Wanted;
@@ -192,6 +198,10 @@ pub struct RefineRequest {
     /// fold check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 /// Longest model name a request may carry (a config name; more is no name of the config).
@@ -215,6 +225,7 @@ impl Default for RefineRequest {
             allow_large: false,
             tighten: None,
             model: None,
+            ignore_memory_check: false,
         }
     }
 }
@@ -906,6 +917,11 @@ pub struct RefinePreview {
     /// not be determined (`refused` says why).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<report::ModelInfo>,
+    /// A start now would be refused for memory commit (Windows), or a quick check's closer look
+    /// skipped: the refusal and the words of the page's "Start anyway" checkbox; also first in
+    /// `warnings` (the closer look's at their end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<crate::training::commit::Preview>,
 }
 
 impl RefinePreview {
@@ -1077,6 +1093,15 @@ pub fn preview(
     if !tighten && request.tighten.is_none() {
         warnings.push(tighten::skipped_warning());
     }
+    // A check that would train: first, it matters more than anything about its frames.
+    let memory = accelerator
+        .is_some()
+        .then(|| commit_warning(Some(commit_need(recipe.family, workers_of(config))), false))
+        .flatten()
+        .map(|(w, m)| {
+            warnings.insert(0, w);
+            m
+        });
     Ok(RefinePreview {
         dataset_dir: dir,
         filter: request.frames.describe(),
@@ -1096,6 +1121,7 @@ pub fn preview(
         folder_missing: missing.is_some(),
         mode: Mode::Folds,
         model: None,
+        memory,
     })
 }
 
@@ -1244,6 +1270,67 @@ pub fn preview_text(p: &RefinePreview) -> String {
     t
 }
 
+/// The host memory commit (Windows) of a dataset check whose fold models are `family` trained with
+/// `workers`, for the check before its first fold ([`crate::training::commit`]). The folds train
+/// one at a time, and the closer look (2.6 GB, [`crate::training::overlaps::zoom::ZOOM_COMMIT_BYTES`])
+/// runs after the last one, alone, so the peak is one fold's training
+/// ([`super::trainer_commit_need`]). The folds are not checked again at their own starts.
+pub fn commit_need(family: TrainFamily, workers: Workers) -> Need {
+    let mut need = super::trainer_commit_need(family, workers);
+    need.what = "the dataset check".into();
+    need.detail =
+        need.detail
+            .replacen("the training process", "a fold model's training process", 1);
+    need.lighter = Some(
+        "run a quick check with a trained model instead (Quick check with a model, or \
+         --with-model), which trains nothing"
+            .into(),
+    );
+    need
+}
+
+/// The preview's line when the check would be refused for memory now ([`commit_need`]), or for its
+/// closer look only (`look`: [`crate::training::overlaps::zoom::commit_need`], a quick check's
+/// only Python process). None when it fits, off Windows or without a reading.
+fn commit_warning(
+    need: Option<Need>,
+    look: bool,
+) -> Option<(String, crate::training::commit::Preview)> {
+    use crate::training::commit;
+    let reading = commit::now();
+    if let Some(n) = need
+        && let Some(m) = commit::preview(&n, reading.as_ref())
+    {
+        let line = format!(
+            "This check would be refused if it started now: {} The memory is read again when it \
+             starts.",
+            m.refusal
+        );
+        return Some((line, m));
+    }
+    if !look {
+        return None;
+    }
+    let need = crate::training::overlaps::zoom::commit_need(tighten::LOOK_WHAT);
+    commit::preview(&need, reading.as_ref()).map(|m| {
+        let line = format!(
+            "The closer look at loose labels would be skipped if it started now (the other \
+             suggestions are still written): {}",
+            m.refusal
+        );
+        (line, m)
+    })
+}
+
+/// The data loader workers of `config`'s training runs (`training.workers`; absent = automatic),
+/// as [`super::plan_job`] sets them.
+fn workers_of(config: &Config) -> Workers {
+    config
+        .training
+        .workers
+        .map_or(Workers::Auto, Workers::Fixed)
+}
+
 /// The name of fold `k`'s model (1-based).
 pub fn fold_model_name(k: usize) -> String {
     format!("refine-fold-{k}")
@@ -1313,6 +1400,7 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
         balance: Default::default(),
         compare_group: None,
         train_seed: None,
+        ignore_memory_check: false,
     };
     let mut train = super::plan_job(config, train_request, cap, Some(fold_model_name(1)))?;
     train.run_dir = first;
@@ -1333,7 +1421,7 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
         predictor: None,
         config: Box::new(config.clone()),
         min_frames: MIN_FRAMES,
-        free_commit: crate::system_info::commit,
+        headroom: crate::training::commit::now,
         id,
         request,
     })
@@ -1619,6 +1707,7 @@ mod tests {
                 folder_missing: false,
                 mode: Mode::Folds,
                 model: None,
+                memory: None,
             })
         };
         assert!(
@@ -2105,6 +2194,7 @@ mod tests {
                 folder_missing: false,
                 mode: Mode::Folds,
                 model: None,
+                memory: None,
             })
         };
         let on = text(true);
@@ -2121,5 +2211,61 @@ mod tests {
         );
         assert!(!text(false).contains("closer look adds"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod commit_tests {
+    use super::*;
+    use crate::training::commit::tests::{headroom, this_box};
+    use crate::training::commit::tests_reading;
+
+    /// The quick check's only Python process is the closer look (2.6 GB + 1 spare): this box runs
+    /// it, a fixed paging file with 1 GB free would skip it. The full check's need is the trainer's.
+    #[test]
+    fn the_preview_line_names_the_trainer_or_the_look() {
+        let family = TrainFamily::Rfdetr;
+        tests_reading::set(Some(this_box()));
+        let full = commit_warning(Some(commit_need(family, Workers::Auto)), false).map(|w| w.0);
+        let look = commit_warning(None, true).map(|w| w.0);
+        tests_reading::set(Some(headroom(
+            &[r"c:\pagefile.sys 4096 4096"],
+            19.9,
+            1.0,
+            &[],
+        )));
+        let short_look = commit_warning(None, true).map(|w| w.0);
+        let no_look = commit_warning(None, false).map(|w| w.0);
+        tests_reading::set(None);
+        let full = full.unwrap();
+        assert!(
+            full.starts_with("This check would be refused if it started now: the dataset check"),
+            "{full}"
+        );
+        assert_eq!(look, None);
+        let short_look = short_look.unwrap();
+        assert!(
+            short_look.starts_with(
+                "The closer look at loose labels would be skipped if it started now (the other \
+                 suggestions are still written): the closer look at loose labels needs about 3.6 GB"
+            ),
+            "{short_look}"
+        );
+        assert_eq!(no_look, None);
+        // A fixed `training.workers` counts its workers; automatic ones are chosen to fit.
+        let auto = commit_need(family, Workers::Auto);
+        assert_eq!(auto.bytes, crate::training::MAIN_COMMIT_RESERVE_BYTES);
+        assert_eq!(auto.detail, "a fold model's training process 8.0 GB");
+        let fixed = commit_need(TrainFamily::Yolo26, Workers::Fixed(1));
+        assert_eq!(
+            fixed.bytes,
+            crate::training::MAIN_COMMIT_RESERVE_BYTES + 3 * crate::training::WORKER_COMMIT_BYTES
+        );
+        assert_eq!(
+            fixed.detail,
+            "a fold model's training process 8.0 GB + 1 data loader worker 4.1 GB \
+             (training.workers)"
+        );
     }
 }

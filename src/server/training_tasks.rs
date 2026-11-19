@@ -159,6 +159,7 @@ pub(crate) fn import_from_form(f: &[(String, String)]) -> anyhow::Result<ImportR
     r.license_confirmed = field(f, "confirm_license").is_some();
     r.allow_large = field(f, "confirm_large").is_some();
     r.out_dir = field(f, "out_dir").map(PathBuf::from);
+    r.ignore_memory_check = field(f, "ignore_memory_check").is_some();
     r.validate()?;
     Ok(r)
 }
@@ -285,6 +286,8 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     }
     r.allow_large = field(f, "confirm_large").is_some();
     r.confirm_license = field(f, "confirm_license").is_some();
+    // The preview's "Start anyway" checkbox (shown only with a memory refusal).
+    r.ignore_memory_check = field(f, "ignore_memory_check").is_some();
     let classes: Vec<String> = all(f, "classes")
         .iter()
         .flat_map(|c| c.split(','))
@@ -649,6 +652,7 @@ fn attach_seams(state: &AppState, shared: &Shared, config: &Config, job: &mut Au
             crate::training::autolabel::relabel::LocalDetector {
                 config: config.clone(),
                 runtimes: state.registry.runtimes().cloned(),
+                no_cache: false,
             },
         ));
         job.config_writer = Some(Arc::new(ServerConfigWriter {
@@ -734,6 +738,26 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// "Start anyway" posts `ignore_memory_check` (a checkbox: present = on); absent = refused as
+    /// usual.
+    #[test]
+    fn the_forms_carry_start_anyway() {
+        let src = [
+            ("source", "path"),
+            ("path", "clips"),
+            ("confirm_license", "on"),
+        ];
+        assert!(!import_from_form(&form(&src)).unwrap().ignore_memory_check);
+        let mut on = src.to_vec();
+        on.push(("ignore_memory_check", "1"));
+        assert!(import_from_form(&form(&on)).unwrap().ignore_memory_check);
+        let al = [("mode", "labelers"), ("rfdetr", "on")];
+        assert!(!autolabel_from_form(&form(&al)).unwrap().ignore_memory_check);
+        let mut on = al.to_vec();
+        on.push(("ignore_memory_check", "1"));
+        assert!(autolabel_from_form(&form(&on)).unwrap().ignore_memory_check);
     }
 
     #[test]

@@ -17,7 +17,7 @@
 
 use super::job::{ExportRetry, TrainJob};
 use super::service::{RunRecord, RunState};
-use super::{Capability, options_for, training_dir};
+use super::{Capability, options_with, training_dir};
 use crate::config::Config;
 use crate::resources::catalog::{Platform, Trainer};
 use crate::resources::export::train::TrainPaths;
@@ -133,7 +133,13 @@ pub fn plan_retry(config: &Config, r: &RunRecord, cap: &Capability) -> Result<Tr
         run_dir: r.run_dir.clone(),
         platform: Platform::current(),
         accelerator: accel,
-        options: options_for(config, &r.request),
+        // An export of the kept checkpoint plans no dataset (the run's own data stays), so a list
+        // of days held out for good that does not read is no reason to refuse it.
+        options: options_with(
+            config,
+            &r.request,
+            super::frozen_heldout(config).unwrap_or_default(),
+        ),
         root: config.data_root(),
         timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
         workers: t
@@ -146,6 +152,8 @@ pub fn plan_retry(config: &Config, r: &RunRecord, cap: &Capability) -> Result<Tr
             train_seconds,
             device: r.device.clone(),
         }),
+        headroom: crate::training::commit::checked_already,
+        reuse_from: Vec::new(),
     })
 }
 

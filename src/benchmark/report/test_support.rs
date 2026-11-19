@@ -55,6 +55,7 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
             ..Default::default()
         },
         throughput_fps: 1000.0 / p50,
+        pipelined: true,
         detections: dets,
         by_resolution: Vec::new(),
         accuracy: None,

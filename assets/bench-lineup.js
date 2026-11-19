@@ -1,8 +1,9 @@
 // Blue Onyx Prism: Benchmark page, Compare tab (PrismBench.lineup): the models side by side on one
 // set of images. The server (`lineup` of GET /v1/benchmark, benchmark::lineup) decides everything
 // that is a judgement: which models are on a set, the shared objects, what is best past the noise,
-// the plain sentence, who is not on these images and why. This file only draws it. The choices are
-// remembered per browser; `?set=<id>` in the URL opens a set (links from the Train area).
+// the rows' Best first order, the plain sentence, who is not on these images and why. This file
+// only draws it. The choices are remembered per browser; `?set=<id>` in the URL opens a set
+// (links from the Train area).
 // Loaded after bench-glossary.js, before benchmark.js, which calls render(status) on every poll
 // (ES5, no build step, CSP script-src 'self').
 (function () {
@@ -68,6 +69,7 @@
   // One value cell; `label` is what a phone card shows beside it.
   function valueCell(tr, label, text, c, title, cls) {
     var td = el("td", "num" + (cls ? " " + cls : ""), text); td.dataset.label = label;
+    td.dataset.v = c && has(c.value) ? String(c.value) : "";
     if (!c || !has(c.value)) td.classList.add("lineup-none");
     if (title) td.title = title;
     mark(td, c); tr.appendChild(td); return td;
@@ -75,20 +77,20 @@
   function scenesOf(s) { return [{id: "all", name: "All"}].concat((s.scenes || []).map(function (x) { return {id: x.id, name: SCENE_NAMES[x.id] || x.id}; })); }
   function headRow(s) {
     var scenes = scenesOf(s), one = scenes.length === 1, thead = el("thead"), a = el("tr"), b = el("tr");
-    var m = el("th", "lineup-model", "Model"); m.rowSpan = 2; m.scope = "col"; a.appendChild(m);
+    var m = el("th", "lineup-model", "Model"); m.rowSpan = 2; m.scope = "col"; m.dataset.sortCol = "model"; a.appendChild(m);
     [["finds", "finds"], ["correct", "correct"]].forEach(function (g) {
-      var th = el("th", "lineup-group"); th.appendChild(PB.head(g[1])); th.colSpan = scenes.length; th.scope = "colgroup"; if (one) th.rowSpan = 2; a.appendChild(th);
-      if (!one) scenes.forEach(function (x) { b.appendChild(el("th", "num", x.name)); });
+      var th = el("th", "lineup-group"); th.appendChild(PB.head(g[1])); th.colSpan = scenes.length; th.scope = "colgroup"; if (one) { th.rowSpan = 2; th.dataset.sortCol = g[0] + ":all"; } a.appendChild(th);
+      if (!one) scenes.forEach(function (x) { var leaf = el("th", "num", x.name); leaf.dataset.sortCol = g[0] + ":" + x.id; b.appendChild(leaf); });
     });
-    var fa = el("th", "lineup-group num"); fa.appendChild(PB.head("false_alerts")); fa.appendChild(el("span", "lineup-sub", "per 100 empty frames")); fa.rowSpan = 2; a.appendChild(fa);
+    var fa = el("th", "lineup-group num"); fa.appendChild(PB.head("false_alerts")); fa.appendChild(el("span", "lineup-sub", "per 100 empty frames")); fa.rowSpan = 2; fa.dataset.sortCol = "false_alerts"; a.appendChild(fa);
     var sp = el("th", "lineup-group num"); sp.appendChild(PB.head("speed")); sp.appendChild(el("span", "lineup-sub", "ms per image"));
     if (!s.speed.comparable) { sp.classList.add("lineup-flag"); sp.appendChild(el("span", "tag restart", "not like for like")); sp.title = s.speed.reasons.join("; "); }
-    sp.rowSpan = 2; a.appendChild(sp);
+    sp.rowSpan = 2; sp.dataset.sortCol = "speed"; a.appendChild(sp);
     thead.appendChild(a); if (!one) thead.appendChild(b);
     return thead;
   }
   function modelCell(r) {
-    var td = el("td", "lineup-model");
+    var td = el("td", "lineup-model"); td.dataset.v = r.model;
     var name = el("a", "lineup-name", r.model); name.href = "#d-" + encodeURIComponent(r.model); name.title = "Every number of " + r.model + " in Details";
     td.appendChild(name);
     if (r.isDefault) { var t = el("span", "tag now", "Default"); t.title = "The model Blue Iris gets when it names none"; td.appendChild(t); }
@@ -101,6 +103,8 @@
   }
   function row(s, r, kind) {
     var tr = el("tr");
+    // The server's Best first place (the headline's rule as an order, lineup::verdict::best_order).
+    if (r.best) tr.setAttribute("data-best", String(r.best));
     if (r.excluded) { tr.classList.add("lineup-out"); tr.title = "Not counted for best: it trained on some of these frames"; }
     tr.appendChild(modelCell(r));
     var o = (r.objects || {})[kind] || (r.objects || {}).all || {finds: {}, correct: {}};
@@ -121,6 +125,9 @@
   function table(s, v, kind) {
     var t = el("table", "bench stack lineup-table"); t.appendChild(headRow(s));
     var body = el("tbody"); v.rows.forEach(function (r) { body.appendChild(row(s, r, kind)); }); t.appendChild(body);
+    // Sortable (sort.js), best first by default; models that trained on these images stay last
+    // (`tr.lineup-out`).
+    if (window.PrismSort) PrismSort.attach(t, {key: "lineup", defaultKeys: [{col: "best", dir: "asc"}]});
     var w = el("div", "scroll lineup-scroll"); w.dataset.keep = "w:lineup"; w.appendChild(t);
     return w;
   }

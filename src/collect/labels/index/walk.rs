@@ -196,9 +196,10 @@ pub(super) struct Stats {
 /// Every day folder of `dir`, read in [`layout::day_dirs`]' order.
 pub(super) fn read_all_days(dir: &Path, now: SystemTime) -> Vec<DayRead> {
     let folders: Vec<PathBuf> = layout::day_dirs(dir);
-    let reads = crate::parallel::map_all(
+    let reads = crate::parallel::map_all_at(
         folders.len(),
         crate::parallel::walk_threads_over(folders.len()),
+        crate::parallel::Spawned::Background,
         &|i| {
             let folder = folders.get(i)?;
             Some(DayRead::of(folder, day_key(folder)?, now))

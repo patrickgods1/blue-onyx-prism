@@ -145,6 +145,8 @@ tbody tr:last-child td { border-bottom: none; }
 .card h2:first-child { margin-top: 0; }
 form label { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.5rem 0; font-size: 0.9rem; color: var(--muted); }
 form label.check { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--fg); }
+/* A hidden check row (the "Start anyway" checkbox of a memory refusal) stays hidden: `form label` sets display. */
+label.check[hidden] { display: none; }
 form.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0 1.5rem; }
 form.grid h2, form.grid textarea, form.grid p, form.grid .actions { grid-column: 1 / -1; }
 form.inline { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; }
@@ -166,7 +168,7 @@ button.secondary { background: var(--card); color: var(--accent); border-color: 
 button.danger { background: var(--card); color: var(--danger); border-color: var(--danger); }
 @media (hover: hover) { button.danger:hover { background: var(--danger); color: var(--danger-fg); } }
 button:disabled { opacity: 0.55; cursor: default; }
-button:focus-visible, a:focus-visible, th.sortable:focus-visible, summary:focus-visible,
+button:focus-visible, a:focus-visible, summary:focus-visible,
 input:focus-visible, select:focus-visible, textarea:focus-visible, .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* Boxes that scroll take the keyboard focus (tabindex="0"): the ring sits inside, where no
    overflow clips it. */
@@ -331,10 +333,31 @@ span.small { font-size: 0.8rem; font-weight: normal; }
 .grade-F { background: #c0392b; color: #fff; }
 .grade-none { background: var(--code-bg); color: var(--muted); }
 table.bench td, table.bench th { white-space: nowrap; }
-th.sortable { cursor: pointer; user-select: none; }
-@media (hover: hover) { th.sortable:hover { color: var(--fg); } }
-th.sortable[data-dir="asc"]::after { content: " \25B2"; }
-th.sortable[data-dir="desc"]::after { content: " \25BC"; }
+/* Sortable tables (sort.js, PrismSort): the header's own text sorts too; its button (arrow and
+   the rank of the key when there are several) takes the keyboard focus. */
+th.th-sortable { cursor: pointer; user-select: none; -webkit-user-select: none; }
+th.th-sortable.th-sorted { color: var(--fg); }
+th .th-sort { display: inline-flex; align-items: center; gap: 0.1rem; margin: 0 0 0 0.25rem; padding: 0 0.2rem; min-width: 1.4em; border: 1px solid transparent; border-radius: 4px; background: none; color: inherit; font: inherit; font-size: 0.8em; line-height: 1.3; vertical-align: baseline; cursor: pointer; }
+th .th-sort .th-sort-arrow { opacity: 0.4; }
+th .th-sort.on .th-sort-arrow { opacity: 1; color: var(--accent); }
+th .th-sort .th-sort-rank { font-size: 0.8em; font-weight: 700; color: var(--accent); }
+th .th-sort .th-sort-rank:empty { display: none; }
+th .th-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (hover: hover) {
+  th.th-sortable:hover { color: var(--fg); }
+  th.th-sortable:hover .th-sort-arrow { opacity: 1; }
+}
+/* Above a sorted table: "Default order" (desktop: only while sorted); phones also "Sort by". */
+.sort-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 0.3rem 0.6rem; font-size: 0.85rem; }
+.sort-tools.sorted { margin: 0.3rem 0; }
+.sort-tools .sort-by { display: none; align-items: center; gap: 0.3rem; margin: 0; }
+.sort-tools .sort-by select { max-width: 100%; min-width: 0; }
+.sort-tools button.sort-reset { margin: 0; }
+.sort-tools[hidden], .sort-tools button.sort-reset[hidden] { display: none; }
+@media (max-width: 700px) {
+  .sort-tools { justify-content: flex-start; margin: 0.3rem 0; }
+  .sort-tools .sort-by { display: inline-flex; max-width: 100%; }
+}
 table.bench tr.fastest td { background: var(--ok-bg); }
 table.bench tr.bad td { color: var(--err-fg); }
 table.bench tr.failed td { color: var(--muted); }
@@ -807,19 +830,13 @@ table.rank-table td .best-tradeoff { display: inline-block; margin: 0.15rem 0 0;
   table.bench.stack td .best-tradeoff { margin-left: 0.35rem; }
 }
 
-/* Benchmark tables (bench-table.js): filters, count, sortable headers with an arrow. */
+/* Benchmark tables (bench-table.js): filters and count; the sort is PrismSort's (above). */
 .dt-tools { display: flex; flex-wrap: wrap; gap: 0.4rem 0.8rem; align-items: center; margin: 0.4rem 0; }
 .dt-tools input[type="search"] { min-width: 0; width: 14rem; max-width: 100%; }
 .dt-tools select { max-width: 100%; }
 .dt-tools .dt-filter { display: inline-flex; align-items: center; margin: 0; }
 .dt-tools .dt-count { font-size: 0.85rem; }
 .dt-tools button.small { margin: 0; }
-table.dt th.dt-sort { cursor: pointer; user-select: none; }
-@media (hover: hover) { table.dt th.dt-sort:hover { color: var(--fg); } }
-table.dt th.dt-sort::after { content: " \2195"; opacity: 0.35; }
-table.dt th.dt-sort[aria-sort="ascending"]::after { content: " \25B2"; opacity: 1; }
-table.dt th.dt-sort[aria-sort="descending"]::after { content: " \25BC"; opacity: 1; }
-table.dt th.dt-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 table.dt th.num { text-align: right; }
 table.dt td .tag { margin-left: 0.35rem; }
 table.dt td.warn-cell { color: var(--warn-fg); }
@@ -1530,7 +1547,7 @@ dialog#class-dialog .actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; p
 .tr-metrics svg { max-width: 100%; height: auto; }
 .tr-metrics-row > td { padding-top: 0; }
 .tr-logbox { margin: 0.3rem 0 0; }
-/* Training page: an early-stop point passed while the loss still falls (Stop now / Continue). */
+/* Training page: an early-stop point passed while validation still improves (Stop now / Continue). */
 .tr-extend { margin: 0.4rem 0 0; padding: 0.4rem 0.6rem; border-radius: 6px; background: var(--warn-bg); color: var(--warn-fg); font-size: 0.9rem; }
 .tr-extend form, .tr-extend button { margin-top: 0.3rem; }
 .tr-logbox > summary { margin: 0.2rem 0; font-size: 0.85rem; color: var(--muted); }
@@ -1578,6 +1595,12 @@ table.tr-mtable tr.best-epoch td { background: var(--ok-bg); }
 .cp-badge.tr-cls-warn { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn-fg); }
 .cp-chip:not(:has(input[type=checkbox]:checked)) .tr-scene-warn { display: none; }
 #train-classes .tr-radios { align-items: baseline; gap: 0 1rem; }
+#train-merges { margin: 0.6rem 0; }
+.tr-merge-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin: 0.3rem 0; }
+.tr-merge-row select, .tr-merge-row input { width: auto; max-width: 100%; }
+.tr-merge-off { opacity: 0.55; }
+.tr-merge-x { padding: 0.1rem 0.5rem; }
+.tr-merge-add { margin: 0.3rem 0; }
 .tr-rec { white-space: normal; font-weight: normal; }
 details.tr-compare { margin: 0.4rem 0 0.8rem; }
 details.tr-compare > summary { cursor: pointer; font-weight: 600; margin: 0.2rem 0 0.4rem; overflow-wrap: anywhere; }
@@ -1588,6 +1611,8 @@ table.tr-ctable th:last-child, table.tr-ctable td:last-child { padding-left: 1re
 table.tr-ctable td:first-child { min-width: 13rem; }
 table.tr-ctable td.best-val { font-weight: 700; background: var(--ok-bg); color: var(--ok-fg); }
 table.tr-ctable tr.tr-routed td { font-style: italic; background: var(--code-bg); border-top: 2px dashed var(--border); }
+/* The Models tab's results list: the header row of each held-out group (scores compare only inside one). */
+table.tr-results tr.tr-group > td { padding-top: 0.7rem; background: var(--code-bg); color: var(--muted); font-size: 0.85rem; font-weight: 600; white-space: normal; }
 
 /* Train form: the Balance fieldset and its before / after preview (bars sized by script). */
 details.tr-balance > summary { cursor: pointer; font-weight: 600; }
@@ -1777,6 +1802,8 @@ td.tr-bal-bars { vertical-align: middle; }
   table.rcards td .detail { display: block; overflow-wrap: anywhere; }
   table.rcards > tbody > tr[hidden] { display: none; }
   table.rcards > tbody > tr.tr-metrics-row, table.rcards > tbody > tr.tr-switch-row { padding: 0.4rem 0.5rem; }
+  table.rcards > tbody > tr.tr-group { background: none; border: 0; padding: 0.4rem 0 0.1rem; margin: 0.8rem 0 0.3rem; }
+  table.rcards > tbody > tr.tr-group > td { background: none; padding: 0; }
   .tr-metrics { max-width: 100%; }
 
   /* rgrid: label over value, three to a row (rc-title and rc-wide take the whole row). */

@@ -111,6 +111,10 @@ pub struct DeviceSnap {
     pub infer_p50_ms: Option<f64>,
     #[serde(default)]
     pub fps: Option<f64>,
+    /// `fps` was measured with read ahead ([`crate::benchmark::RunResult::pipelined`]); false
+    /// in entries of older versions (one image at a time: their `fps` does not compare).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pipelined: bool,
     #[serde(default)]
     pub ap50: Option<f64>,
     #[serde(default)]
@@ -300,6 +304,7 @@ fn device_snap(m: &ModelResult, d: &DeviceResult) -> DeviceSnap {
     s.total_p95_ms = Some(run.stages_ms.total.p95);
     s.infer_p50_ms = Some(run.stages_ms.infer.p50);
     s.fps = Some(run.throughput_fps);
+    s.pipelined = run.pipelined;
     s.grade = run.grades.map(|g| g.overall.letter().to_string());
     if let Some(a) = &run.accuracy {
         let o = &a.overall;

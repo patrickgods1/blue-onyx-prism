@@ -486,3 +486,21 @@ fn learned_now_lists_each_key_of_this_machine() {
         assert!(learned_now(&accel, None, &dev_box_runs()).is_empty());
     }
 }
+
+/// Whatever the history, the learned count is at most the limit of the moment: an automatic run's
+/// workers always fit the commit its start reads, which is why `trainer_commit_need` counts none.
+#[test]
+fn the_learned_count_never_exceeds_the_limit() {
+    let runs = dev_box_runs();
+    let mut roomy = measured(2);
+    roomy.ram_min = Some(gb(8.0));
+    roomy.commit_limit_at_peak = Some(gb(64.0));
+    roomy.data_wait = Some(0.5);
+    let roomy = [record("2026-11-10T10:00:00Z", &nano(8), roomy)];
+    for limit in 0..=8 {
+        for past in [&runs[..0], &runs[..1], &runs[..2], &runs[..], &roomy[..]] {
+            let (n, why) = learn(past, limit);
+            assert!(n <= limit, "{n} > {limit}: {why}");
+        }
+    }
+}

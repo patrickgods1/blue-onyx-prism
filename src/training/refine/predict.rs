@@ -79,6 +79,13 @@ impl std::fmt::Debug for LocalPredictor {
     }
 }
 
+impl FoldModel {
+    /// A throwaway fold model (no config entry of its own), not a quick check's configured one.
+    pub fn is_fold_model(&self) -> bool {
+        self.entry.is_none()
+    }
+}
+
 impl LocalPredictor {
     /// A predictor on `config` (a copy: nothing is saved), sharing `runtimes` when given.
     pub fn new(config: Config, runtimes: Option<Arc<Mutex<Runtimes>>>) -> Self {
@@ -123,6 +130,9 @@ impl FoldPredictor for LocalPredictor {
         let detector = LocalDetector {
             config: self.config.clone(),
             runtimes: Some(self.runtimes()?),
+            // A fold model is compiled once and thrown away: its blob would only fill the
+            // OpenVINO cache (about 60 MB each). A quick check's configured model keeps it.
+            no_cache: model.is_fold_model(),
         };
         let runtimes_s = t0.elapsed().as_secs_f64();
         let entry = model_entry(model);

@@ -1,7 +1,27 @@
 //! The benchmark run itself: `Bench` compiles a model on a device, warms it up and times the
 //! per-image pipeline (decode -> preprocess -> infer -> postprocess) at the configured and the
 //! evaluation confidence. Progress and cancellation are reported through `Progress`/`Cancelled`.
-//! One image at a time on one thread; the runtimes mutex is held only while compiling.
+//! One inference at a time; the runtimes mutex is held only while compiling.
+//!
+//! Read ahead: during the timed runs a helper thread (`bench-read`) reads and decodes the next
+//! frame while the current one infers, as the service's prep pool does. The hand-over is a
+//! rendezvous channel ([`READ_AHEAD`] = 1 frame decoded ahead), so at most two decoded frames
+//! are in flight (a 2688x1520 RGB frame is about 12 MB). The stage times stay per image and mean
+//! what they meant serially (`decode` is measured on the helper for that frame; preprocess,
+//! infer and postprocess on the inference thread); only the wall-clock throughput
+//! ([`RunResult::throughput_fps`], marked [`RunResult::pipelined`]) gains from the overlap.
+//! Results, their order and the `on_image` order are those of the serial loop
+//! ([`ReadAhead::Off`], kept for the parity test and as the fallback when the thread cannot
+//! start). The helper is a scoped thread: it ends on cancel, on an error of either side and with
+//! the run, never outliving it. Warm-up stays serial (it repeats one frame).
+//!
+//! A benchmark does not read ahead on a CPU device ([`ReadAhead::ExceptCpu`], the default): the
+//! decode would take cores from the CPU inference and inflate the CPU's latency figures (on the
+//! dev box, IPcam-general on `openvino:cpu`, 2688x1520 frames: infer p50 +27%, decode p50 +7%;
+//! `docs/PRODUCTION_REVIEW.md`, "Benchmark read ahead and CPU-only priority"), which grade the
+//! device. Detections over frames, where the time per frame counts and the stage times are not
+//! kept (the quick check, refine fold prediction, relabelling, pseudo ground truth), read ahead
+//! on every device ([`ReadAhead::Always`]).
 
 use super::scoring::score;
 use super::*;
@@ -30,6 +50,8 @@ pub struct Progress<'a> {
     pub total: usize,
     /// Image being processed (timing phase).
     pub image: &'a str,
+    /// The process priority of this device's run (None = no [`Bench::priority`]).
+    pub priority: Option<crate::backend::priority::Applied>,
 }
 
 /// Error returned when the cancel flag is set during a run.
@@ -67,7 +89,43 @@ pub struct Bench<'a> {
     /// Stored predictions per image (most confident first; `MAX_STORED_PREDS`). The pseudo
     /// ground truth run keeps all of them (BM-10).
     pub max_stored_preds: usize,
+    /// Compile the model without the OpenVINO model cache ([`LoadRequest::no_cache`]: a
+    /// throwaway fold model of the dataset check); false for everything else.
+    pub no_cache: bool,
+    /// The run's process priority, switched per device (`benchmark.low_priority`: below normal
+    /// for CPU devices only); None leaves the priority alone.
+    pub priority: Option<&'a crate::backend::priority::DevicePriority>,
+    /// When to read and decode the next frame on a helper thread while the current one infers
+    /// (see the module docs).
+    pub read_ahead: ReadAhead,
 }
+
+/// When the timed loop reads ahead (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAhead {
+    /// Never: read and decode on the inference thread.
+    Off,
+    /// Unless the device the model loaded on is a CPU (the benchmark's default: the CPU's stage
+    /// times stay free of the decode's competition for cores).
+    ExceptCpu,
+    /// On every device (detections over frames: only the time per frame counts).
+    Always,
+}
+
+impl ReadAhead {
+    /// Whether a run on the device spec `device` (the one the model loaded on) reads ahead.
+    pub fn applies(self, device: &str) -> bool {
+        match self {
+            ReadAhead::Off => false,
+            ReadAhead::ExceptCpu => !spec::parse(device).is_ok_and(|s| s.is_cpu()),
+            ReadAhead::Always => true,
+        }
+    }
+}
+
+/// Frames decoded ahead of the one inferring: the hand-over channel's capacity is one less
+/// (a rendezvous for 1: the helper holds the decoded frame until the inference thread takes it).
+pub(super) const READ_AHEAD: usize = 1;
 
 impl std::fmt::Debug for Bench<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,6 +143,9 @@ impl std::fmt::Debug for Bench<'_> {
             .field("threshold_objective", &self.threshold_objective)
             .field("accuracy_metric", &self.accuracy_metric)
             .field("max_stored_preds", &self.max_stored_preds)
+            .field("no_cache", &self.no_cache)
+            .field("priority", &self.priority)
+            .field("read_ahead", &self.read_ahead)
             .finish()
     }
 }
@@ -244,6 +305,9 @@ impl<'a> Bench<'a> {
             threshold_objective: threshold::Objective::default(),
             accuracy_metric: grade::AccuracyMetric::default(),
             max_stored_preds: MAX_STORED_PREDS,
+            no_cache: false,
+            priority: None,
+            read_ahead: ReadAhead::ExceptCpu,
         }
     }
 
@@ -284,7 +348,15 @@ impl<'a> Bench<'a> {
                 done,
                 total,
                 image,
+                priority: self.priority.and_then(|p| p.current()),
             });
+        }
+    }
+
+    /// Set the run's priority for `device` (a device spec), when the run has one.
+    fn enter_priority(&self, device: &str) {
+        if let Some(p) = self.priority {
+            p.enter(device);
         }
     }
 
@@ -327,8 +399,9 @@ impl<'a> Bench<'a> {
             path: job.path.clone(),
             requested: requested.to_string(),
             gpu_precision: job.gpu_precision.clone(),
+            no_cache: self.no_cache,
         };
-        let before = self.cache_dir.map(cache_files);
+        let before = self.cache_dir.filter(|_| !self.no_cache).map(cache_files);
         let t = Instant::now();
         let label = format!("model {}", job.name);
         // Compile under the runtimes lock (workers compile through the same lock), create the
@@ -336,6 +409,9 @@ impl<'a> Bench<'a> {
         // effect after the current compile, before the next fallback candidate (BM-06).
         let loaded = crate::backend::try_candidates(&label, candidates, |cand| {
             self.check_cancel()?;
+            // The compile counts as the device's run (OpenVINO's GPU compile is CPU work too,
+            // and it keeps the normal priority with the GPU).
+            self.enter_priority(&cand.device.to_string());
             let compiled = lock(runtimes).compile(cand, &req)?;
             compiled.into_backend()
         });
@@ -344,6 +420,11 @@ impl<'a> Bench<'a> {
         self.check_cancel()?;
         let backend = loaded.with_context(|| format!("loading {}", job.path.display()))?;
         let compile_ms = ms(t.elapsed());
+        // Decided again on the device it loaded on (a fallback to CPU is a CPU run).
+        match backend.info().device.spec.as_str() {
+            "" => self.enter_priority(requested),
+            spec => self.enter_priority(spec),
+        }
         let cache = match (self.cache_dir, before) {
             (None, _) | (_, None) => "disabled".to_string(),
             (Some(dir), Some(before)) => {
@@ -371,6 +452,7 @@ impl<'a> Bench<'a> {
             path: vjob.path.clone(),
             requested: device.to_string(),
             gpu_precision: vjob.gpu_precision.clone(),
+            no_cache: false,
         };
         let label = format!("verifier {}", vjob.name);
         let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {
@@ -431,7 +513,23 @@ impl<'a> Bench<'a> {
             .collect();
         let warmup_ms = self.warm_up(job, requested, &all, &mut pipe)?;
         let repeat = self.repeat.max(1);
-        let mut timed = self.timed_runs(job, requested, &all, &mut pipe, repeat)?;
+        let loaded_on = if dev.spec.is_empty() {
+            dev.actual.as_str()
+        } else {
+            dev.spec.as_str()
+        };
+        let mut timed = if self.read_ahead.applies(loaded_on) {
+            self.timed_runs_ahead(job, requested, &all, &mut pipe, repeat)?
+        } else {
+            self.timed_runs(
+                job,
+                requested,
+                &all,
+                &mut pipe,
+                repeat,
+                &mut serial_frames(&all),
+            )?
+        };
         let loop_s = timed.loop_time.as_secs_f64();
 
         let stages_ms = timed.stage_stats();
@@ -486,6 +584,7 @@ impl<'a> Bench<'a> {
             } else {
                 0.0
             },
+            pipelined: timed.pipelined,
             detections: first_dets,
             by_resolution: timed.by_resolution(),
             accuracy,
@@ -533,8 +632,68 @@ impl<'a> Bench<'a> {
         Ok(ms(t.elapsed()))
     }
 
+    /// [`Self::timed_runs`] with the frames read and decoded ahead on a scoped helper thread
+    /// (see the module docs); the serial loop when the thread cannot start.
+    fn timed_runs_ahead(
+        &self,
+        job: &Job,
+        requested: &str,
+        all: &[(&ImageSet, &images::SetImage)],
+        pipe: &mut Pipeline,
+        repeat: usize,
+    ) -> Result<Timings> {
+        let cancel = self.cancel;
+        std::thread::scope(|scope| {
+            let (tx, rx) = crossbeam_channel::bounded::<Result<Frame>>(READ_AHEAD - 1);
+            let reader = std::thread::Builder::new()
+                .name("bench-read".into())
+                .spawn_scoped(scope, move || read_frames(all, repeat, cancel, &tx));
+            let reader = match reader {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "benchmark: could not start the image reader thread ({e}); reading \
+                         and decoding on the inference thread"
+                    );
+                    return self.timed_runs(
+                        job,
+                        requested,
+                        all,
+                        pipe,
+                        repeat,
+                        &mut serial_frames(all),
+                    );
+                }
+            };
+            // `rx` moves into the source and drops with it when the loop ends (done, error or
+            // cancel), which stops a reader waiting to hand a frame over.
+            let mut source = move |_: usize| -> Result<Frame> {
+                match rx.recv() {
+                    Ok(f) => f,
+                    // The reader stops early only on a cancel (or a panic, reported below).
+                    Err(_) => {
+                        self.check_cancel()?;
+                        bail!("the benchmark's image reader thread stopped")
+                    }
+                }
+            };
+            let timed = self.timed_runs(job, requested, all, pipe, repeat, &mut source);
+            drop(source);
+            let joined = reader.join();
+            match (timed, joined) {
+                (Ok(mut t), Ok(())) => {
+                    t.pipelined = true;
+                    Ok(t)
+                }
+                (Err(e), _) => Err(e),
+                (Ok(_), Err(_)) => bail!("the benchmark's image reader thread panicked"),
+            }
+        })
+    }
+
     /// `repeat` timed runs of every image; the last run of each image keeps its predictions
-    /// (production and evaluation threshold).
+    /// (production and evaluation threshold). `frames` gives each run's decoded frame, in
+    /// order (image by image, `repeat` per image; its argument is the image's index in `all`).
     fn timed_runs(
         &self,
         job: &Job,
@@ -542,6 +701,7 @@ impl<'a> Bench<'a> {
         all: &[(&ImageSet, &images::SetImage)],
         pipe: &mut Pipeline,
         repeat: usize,
+        frames: &mut dyn FnMut(usize) -> Result<Frame>,
     ) -> Result<Timings> {
         let total_iters = all.len().saturating_mul(repeat);
         let mut timed = Timings {
@@ -551,11 +711,11 @@ impl<'a> Bench<'a> {
             eval_preds: Vec::with_capacity(all.len()),
             total_iters,
             loop_time: Duration::ZERO,
+            pipelined: false,
         };
         let mut done = 0;
         self.report(job, requested, Phase::Timing, 0, total_iters, "");
-        for (set, img) in all {
-            let bytes = img.bytes()?;
+        for (i, (set, img)) in all.iter().enumerate() {
             // Not pre-sized by `repeat`: the CLI and service bound it, but stay safe regardless.
             let mut totals = Vec::new();
             let mut infers = Vec::new();
@@ -564,8 +724,11 @@ impl<'a> Bench<'a> {
             for r in 0..repeat {
                 self.check_cancel()?;
                 let t = Instant::now();
-                let sample = pipe
-                    .run(&bytes, r + 1 == repeat, set.transform)
+                // A read failure as it is, a decode failure in the image's context (as before
+                // read ahead).
+                let frame = frames(i)?;
+                let sample = frame
+                    .and_then(|d| pipe.run_decoded(d, r + 1 == repeat))
                     .with_context(|| format!("image {}", img.file))?;
                 timed.loop_time += t.elapsed();
                 let total = timed.record(bucket, &sample);
@@ -585,6 +748,80 @@ impl<'a> Bench<'a> {
             timed.per_image.push(run);
         }
         Ok(timed)
+    }
+}
+
+/// One timed run's decoded frame, or why it did not decode (a frame source's `Err` = the image
+/// could not be read).
+pub(super) type Frame = Result<Decoded>;
+
+/// A decoded frame (the set's transform applied) and its decode time.
+pub(super) struct Decoded {
+    img: crate::image::RgbImage,
+    /// Decode only, without reading the file or the transform (ms).
+    decode_ms: f64,
+}
+
+/// Decode `bytes` (timed) and apply the set's `transform` (not part of any stage time).
+fn decode(bytes: &[u8], transform: Option<images::ImageTransform>) -> Result<Decoded> {
+    let t = Instant::now();
+    let mut img = crate::image::decode(bytes)?;
+    let decode_ms = ms(t.elapsed());
+    if let Some(tr) = transform {
+        tr.apply(&mut img);
+    }
+    Ok(Decoded { img, decode_ms })
+}
+
+/// The serial frame source: each image read once (cached across its runs), decoded per run
+/// on the calling thread.
+fn serial_frames<'s>(
+    all: &'s [(&ImageSet, &images::SetImage)],
+) -> impl FnMut(usize) -> Result<Frame> + 's {
+    let mut cached: Option<(usize, std::borrow::Cow<'static, [u8]>)> = None;
+    move |i| {
+        let (set, img) = all.get(i).context("frame index out of range")?;
+        let bytes = match cached.take() {
+            Some((at, b)) if at == i => b,
+            _ => img.bytes()?,
+        };
+        let frame = decode(&bytes, set.transform);
+        cached = Some((i, bytes));
+        Ok(frame)
+    }
+}
+
+/// The read-ahead thread: every image read once, decoded `repeat` times (one frame per timed
+/// run, in the timed loop's order) and handed over through `tx`. Stops at a cancel, after a
+/// failed read or decode (sent first), and when the inference thread is gone (`send` fails).
+fn read_frames(
+    all: &[(&ImageSet, &images::SetImage)],
+    repeat: usize,
+    cancel: Option<&AtomicBool>,
+    tx: &crossbeam_channel::Sender<Result<Frame>>,
+) {
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+    for (set, img) in all {
+        if cancelled() {
+            return;
+        }
+        let bytes = match img.bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        for _ in 0..repeat {
+            if cancelled() {
+                return;
+            }
+            let frame = decode(&bytes, set.transform);
+            let failed = frame.is_err();
+            if tx.send(Ok(frame)).is_err() || failed {
+                return;
+            }
+        }
     }
 }
 
@@ -726,12 +963,16 @@ impl Pipeline<'_> {
         eval: bool,
         transform: Option<images::ImageTransform>,
     ) -> Result<Sample> {
-        let t = Instant::now();
-        let mut img = crate::image::decode(bytes)?;
-        let decode = ms(t.elapsed());
-        if let Some(tr) = transform {
-            tr.apply(&mut img);
-        }
+        self.run_decoded(decode(bytes, transform)?, eval)
+    }
+
+    /// [`Self::run`] from the decoded frame on: its decode time is `frame.decode_ms` (measured
+    /// where it was decoded, possibly the read-ahead thread).
+    fn run_decoded(&mut self, frame: Decoded, eval: bool) -> Result<Sample> {
+        let Decoded {
+            mut img,
+            decode_ms: decode,
+        } = frame;
         // The verifier crops the original frame, as the service does (not timed: the service
         // keeps the decoded frame without a copy).
         let original = self.verifier.is_some().then(|| img.clone());
@@ -798,8 +1039,11 @@ pub(super) struct Timings {
     /// Per image: the last run's predictions at the evaluation threshold.
     eval_preds: Vec<Vec<PredBox>>,
     total_iters: usize,
-    /// Wall time of the timed iterations (throughput).
+    /// Wall time of the timed iterations (throughput): with read ahead, each run's wait for its
+    /// frame plus its stages on the inference thread.
     loop_time: Duration,
+    /// The frames were read and decoded ahead ([`Bench::timed_runs_ahead`]).
+    pipelined: bool,
 }
 
 impl Timings {
@@ -982,6 +1226,7 @@ mod tests {
             eval_preds: Vec::new(),
             total_iters: 3,
             loop_time: Duration::ZERO,
+            pipelined: false,
         };
         let sample = |stages: [f64; 4]| Sample {
             stages,

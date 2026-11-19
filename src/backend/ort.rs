@@ -826,19 +826,138 @@ impl OrtRuntime {
 ///   about twice what it uses, on a card a training or auto-label job may share;
 /// - `cudnn_conv_algo_search` `HEURISTIC`: the default exhaustive search benchmarks every
 ///   convolution algorithm at the first run, each with its own workspace: a memory peak at load
-///   that can fail on a nearly full card. The speed difference was not measured here (no NVIDIA
-///   GPU on the development machine);
+///   that can fail on a nearly full card. Measured against EXHAUSTIVE on a GTX 1070 Ti (plan
+///   phase 3.6, docs/PRODUCTION_REVIEW.md): the same inference time and memory peak for
+///   rf-detr-nano and dfine-s; [`ENV_CUDNN_CONV_ALGO_SEARCH`] picks another search to measure;
 /// - `gpu_mem_limit` = `limit_mb` (config `ort_gpu_mem_limit_mb`, per session) when set.
 pub(crate) fn cuda_provider(device_id: i32, limit_mb: Option<u64>) -> ep::CUDA {
+    cuda_provider_with(device_id, limit_mb, conv_search_from_env())
+}
+
+/// [`cuda_provider`] with the cuDNN convolution search given. Pure.
+pub(crate) fn cuda_provider_with(
+    device_id: i32,
+    limit_mb: Option<u64>,
+    search: ConvSearch,
+) -> ep::CUDA {
     let mut cuda = ep::CUDA::default()
         .with_device_id(device_id)
         .with_arena_extend_strategy(ep::ArenaExtendStrategy::SameAsRequested)
-        .with_conv_algorithm_search(ep::cuda::ConvAlgorithmSearch::Heuristic);
+        .with_conv_algorithm_search(search.to_ort());
     if let Some(mb) = limit_mb {
         let bytes = usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
         cuda = cuda.with_memory_limit(bytes);
     }
     cuda
+}
+
+/// Environment variable that replaces the CUDA provider's `cudnn_conv_algo_search`
+/// (`exhaustive`, `heuristic` or `default`), for measuring the search against the shipped
+/// HEURISTIC only (plan phase 3.6): unset, empty or unknown = HEURISTIC, unchanged. Read once per
+/// process, logged once when set. Also reaches the CUDA provider behind `ort:tensorrt`.
+pub(crate) const ENV_CUDNN_CONV_ALGO_SEARCH: &str = "BOP_CUDNN_CONV_ALGO_SEARCH";
+
+/// cuDNN convolution algorithm search of the CUDA provider (`ep::cuda::ConvAlgorithmSearch`,
+/// which is neither `Copy` nor comparable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConvSearch {
+    /// Benchmark every algorithm at the first run (ONNX Runtime's own default).
+    Exhaustive,
+    /// cuDNN's heuristic ranking (what this service uses).
+    Heuristic,
+    /// `IMPLICIT_PRECOMP_GEMM`, no search.
+    Default,
+}
+
+impl ConvSearch {
+    fn to_ort(self) -> ep::cuda::ConvAlgorithmSearch {
+        match self {
+            ConvSearch::Exhaustive => ep::cuda::ConvAlgorithmSearch::Exhaustive,
+            ConvSearch::Heuristic => ep::cuda::ConvAlgorithmSearch::Heuristic,
+            ConvSearch::Default => ep::cuda::ConvAlgorithmSearch::Default,
+        }
+    }
+
+    /// The ONNX Runtime option value (`EXHAUSTIVE`, `HEURISTIC`, `DEFAULT`).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ConvSearch::Exhaustive => "EXHAUSTIVE",
+            ConvSearch::Heuristic => "HEURISTIC",
+            ConvSearch::Default => "DEFAULT",
+        }
+    }
+}
+
+/// The search [`ENV_CUDNN_CONV_ALGO_SEARCH`]'s value asks for: Ok(None) when unset or empty
+/// (HEURISTIC), Err(value) when it names no search. Case and surrounding space are ignored.
+pub(crate) fn parse_conv_search(env: Option<&str>) -> Result<Option<ConvSearch>, String> {
+    let Some(v) = env.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    match v.to_ascii_lowercase().as_str() {
+        "exhaustive" => Ok(Some(ConvSearch::Exhaustive)),
+        "heuristic" => Ok(Some(ConvSearch::Heuristic)),
+        "default" => Ok(Some(ConvSearch::Default)),
+        _ => Err(v.to_string()),
+    }
+}
+
+/// What a parsed [`ENV_CUDNN_CONV_ALGO_SEARCH`] means: the search, and the one log line to write
+/// (`true` = a warning: the search differs from HEURISTIC or the value is unknown). Pure.
+pub(crate) fn conv_search_choice(
+    parsed: Result<Option<ConvSearch>, String>,
+) -> (ConvSearch, Option<(bool, String)>) {
+    match parsed {
+        Ok(None) => (ConvSearch::Heuristic, None),
+        Ok(Some(ConvSearch::Heuristic)) => (
+            ConvSearch::Heuristic,
+            Some((
+                false,
+                format!(
+                    "{ENV_CUDNN_CONV_ALGO_SEARCH} is set to the default: CUDA sessions use \
+                     cudnn_conv_algo_search=HEURISTIC"
+                ),
+            )),
+        ),
+        Ok(Some(s)) => (
+            s,
+            Some((
+                true,
+                format!(
+                    "{ENV_CUDNN_CONV_ALGO_SEARCH} is set: CUDA sessions use \
+                     cudnn_conv_algo_search={} instead of HEURISTIC (a measurement setting; \
+                     unset it to return to the default)",
+                    s.as_str()
+                ),
+            )),
+        ),
+        Err(v) => (
+            ConvSearch::Heuristic,
+            Some((
+                true,
+                format!(
+                    "{ENV_CUDNN_CONV_ALGO_SEARCH}='{v}' is not exhaustive, heuristic or default; \
+                     CUDA sessions keep cudnn_conv_algo_search=HEURISTIC"
+                ),
+            )),
+        ),
+    }
+}
+
+/// The search of every CUDA session of this process: [`ENV_CUDNN_CONV_ALGO_SEARCH`] read once
+/// (one log line when it is set, [`conv_search_choice`]), HEURISTIC otherwise.
+fn conv_search_from_env() -> ConvSearch {
+    static SEARCH: std::sync::OnceLock<ConvSearch> = std::sync::OnceLock::new();
+    *SEARCH.get_or_init(|| {
+        let env = std::env::var(ENV_CUDNN_CONV_ALGO_SEARCH).ok();
+        let (search, note) = conv_search_choice(parse_conv_search(env.as_deref()));
+        match note {
+            Some((true, msg)) => tracing::warn!("{msg}"),
+            Some((false, msg)) => tracing::info!("{msg}"),
+            None => {}
+        }
+        search
+    })
 }
 
 /// Environment variable that lets ONNX Runtime's thread pools spin-wait (`1`, `true`, `on`,
@@ -1180,15 +1299,33 @@ struct RunCtx {
 /// One inference for a session thread; the buffers travel back in [`OrtResult`].
 struct OrtJob {
     seq: u64,
-    chw: Vec<f32>,
+    chw: OrtChw,
     extra: Vec<ExtraInput>,
     outs: Vec<NamedOutput>,
 }
 
 struct OrtResult {
-    chw: Vec<f32>,
+    chw: OrtChw,
     outs: Vec<NamedOutput>,
     result: Result<()>,
+}
+
+/// The image tensor of an [`OrtJob`]: the slot's own buffer holding a copy
+/// ([`OrtBackend::submit`]), or the caller's pooled tensor handed over without a copy
+/// ([`OrtBackend::submit_pooled`]), which goes back to its pool when the slot is collected.
+enum OrtChw {
+    Slot(Vec<f32>),
+    Pooled(crate::prep::PooledBuf),
+}
+
+impl std::ops::Deref for OrtChw {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match self {
+            OrtChw::Slot(v) => v,
+            OrtChw::Pooled(b) => b,
+        }
+    }
 }
 
 /// A session thread and the buffers of its slot while idle.
@@ -1504,6 +1641,37 @@ impl OrtBackend {
     /// buffer). Returns its sequence number. A dead session thread fails with [`SessionDead`]
     /// (see [`super::is_session_dead`]).
     pub(crate) fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
+        self.submit_input(
+            slot,
+            |s| {
+                let mut buf = std::mem::take(&mut s.chw);
+                buf.clear();
+                buf.extend_from_slice(chw);
+                OrtChw::Slot(buf)
+            },
+            extra,
+        )
+    }
+
+    /// [`Self::submit`] without the copy: the session thread reads `chw` itself, and it goes back
+    /// to its pool when the slot is collected (or with the thread, if that never returns).
+    pub(crate) fn submit_pooled(
+        &mut self,
+        slot: usize,
+        chw: crate::prep::PooledBuf,
+        extra: &[ExtraInput],
+    ) -> Result<u64> {
+        self.submit_input(slot, |_| OrtChw::Pooled(chw), extra)
+    }
+
+    /// The checks and the hand-over of [`Self::submit`]; `input` makes the job's image tensor
+    /// once the slot is known to be free and alive.
+    fn submit_input(
+        &mut self,
+        slot: usize,
+        input: impl FnOnce(&mut OrtSlot) -> OrtChw,
+        extra: &[ExtraInput],
+    ) -> Result<u64> {
         let n = self.slots.len();
         let where_ = format!(
             "model {} on {}",
@@ -1524,13 +1692,11 @@ impl OrtBackend {
         if s.thread.as_ref().is_none_or(|t| t.is_finished()) {
             return Err(s.kill(slot, format!("session thread {slot} exited"))).context(where_);
         }
-        let mut buf = std::mem::take(&mut s.chw);
-        buf.clear();
-        buf.extend_from_slice(chw);
+        let chw = input(s);
         s.seq += 1;
         let job = OrtJob {
             seq: s.seq,
-            chw: buf,
+            chw,
             extra: extra.to_vec(),
             outs: std::mem::take(&mut s.outs),
         };
@@ -1592,7 +1758,10 @@ impl OrtBackend {
             }
         };
         s.busy = false;
-        s.chw = r.chw;
+        // The slot's buffer is kept for the next copy; a pooled tensor goes back to its pool.
+        if let OrtChw::Slot(buf) = r.chw {
+            s.chw = buf;
+        }
         match r.result {
             Ok(()) => Ok(r.outs),
             Err(e) => {
@@ -1821,8 +1990,59 @@ mod tests {
     }
 
     #[test]
+    fn cudnn_search_override_parses() {
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(parse_conv_search(unset), Ok(None), "{unset:?}");
+        }
+        for (v, want) in [
+            ("exhaustive", ConvSearch::Exhaustive),
+            (" HEURISTIC ", ConvSearch::Heuristic),
+            ("Default", ConvSearch::Default),
+        ] {
+            assert_eq!(parse_conv_search(Some(v)), Ok(Some(want)), "{v}");
+        }
+        assert_eq!(parse_conv_search(Some(" fast ")), Err("fast".to_string()));
+        // Each search reaches the provider options under ONNX Runtime's own name.
+        for s in [
+            ConvSearch::Exhaustive,
+            ConvSearch::Heuristic,
+            ConvSearch::Default,
+        ] {
+            let opts = format!("{:?}", cuda_provider_with(0, None, s));
+            let want = format!("\"cudnn_conv_algo_search\": \"{}\"", s.as_str());
+            assert!(opts.contains(&want), "{want} in {opts}");
+        }
+        assert_eq!(ENV_CUDNN_CONV_ALGO_SEARCH, "BOP_CUDNN_CONV_ALGO_SEARCH");
+    }
+
+    #[test]
+    fn cudnn_search_override_logs_once_and_plainly() {
+        assert_eq!(conv_search_choice(Ok(None)), (ConvSearch::Heuristic, None));
+        // The default named explicitly: an info line, never "HEURISTIC instead of HEURISTIC".
+        let (s, note) = conv_search_choice(Ok(Some(ConvSearch::Heuristic)));
+        assert_eq!(s, ConvSearch::Heuristic);
+        let (warn, msg) = note.unwrap();
+        assert!(!warn && msg.contains("set to the default"), "{msg}");
+        assert!(!msg.contains("instead of"), "{msg}");
+        for other in [ConvSearch::Exhaustive, ConvSearch::Default] {
+            let (s, note) = conv_search_choice(Ok(Some(other)));
+            assert_eq!(s, other);
+            let (warn, msg) = note.unwrap();
+            assert!(warn, "{msg}");
+            assert!(
+                msg.contains(&format!("={} instead of HEURISTIC", other.as_str())),
+                "{msg}"
+            );
+        }
+        let (s, note) = conv_search_choice(Err("fast".into()));
+        assert_eq!(s, ConvSearch::Heuristic);
+        let (warn, msg) = note.unwrap();
+        assert!(warn && msg.contains("'fast'"), "{msg}");
+    }
+
+    #[test]
     fn cuda_sessions_grow_their_arena_by_the_request_and_search_heuristically() {
-        let plain = format!("{:?}", cuda_provider(1, None));
+        let plain = format!("{:?}", cuda_provider_with(1, None, ConvSearch::Heuristic));
         for want in [
             "\"device_id\": \"1\"",
             "\"arena_extend_strategy\": \"kSameAsRequested\"",
@@ -1832,6 +2052,10 @@ mod tests {
         }
         assert!(!plain.contains("gpu_mem_limit"), "{plain}");
         let capped = format!("{:?}", cuda_provider(0, Some(1536)));
+        // Without the measurement override every session searches heuristically.
+        if std::env::var_os(ENV_CUDNN_CONV_ALGO_SEARCH).is_none() {
+            assert!(capped.contains("\"cudnn_conv_algo_search\": \"HEURISTIC\""));
+        }
         assert!(
             capped.contains("\"gpu_mem_limit\": \"1610612736\""),
             "{capped}"
@@ -2089,6 +2313,35 @@ mod tests {
             done_rx,
             abort_timeout: std::time::Duration::from_millis(100),
         }
+    }
+
+    /// A pooled tensor reaches the session thread as it is (the same allocation, no copy into
+    /// the slot) and goes back to its pool once the slot is collected; a slice is still copied.
+    #[test]
+    fn pooled_tensors_are_handed_over_without_a_copy() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let mut b = fake_backend(1, move |job: &mut OrtJob| {
+            let pooled = matches!(job.chw, OrtChw::Pooled(_));
+            log.lock()
+                .unwrap()
+                .push((job.chw.as_ptr() as usize, job.chw.to_vec(), pooled));
+            Ok(())
+        });
+        let pool = crate::prep::TensorPool::new();
+        let mut chw = pool.take(3);
+        chw.vec_mut().extend_from_slice(&[1.0, 2.0, 3.0]);
+        let ptr = chw.as_ptr() as usize;
+        b.submit_pooled(0, chw, &[]).unwrap();
+        assert_eq!(pool.free_count(3), 0, "held while the inference runs");
+        b.collect(0).unwrap();
+        assert_eq!(pool.free_count(3), 1, "back in its pool once collected");
+        b.submit(0, &[4.0, 5.0, 6.0], &[]).unwrap();
+        b.collect(0).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], (ptr, vec![1.0, 2.0, 3.0], true));
+        assert_eq!((seen[1].1.clone(), seen[1].2), (vec![4.0, 5.0, 6.0], false));
+        assert_ne!(seen[1].0, ptr, "a slice goes into the slot's own buffer");
     }
 
     #[test]

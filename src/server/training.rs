@@ -25,6 +25,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, OnceLock};
@@ -218,13 +219,12 @@ impl Hooks for ServerHooks {
         if let Some(why) = skip {
             return Ok(Some(Baseline {
                 model: name,
-                summary: None,
                 note: Some(why),
+                ..Baseline::default()
             }));
         }
         // Its own results file: see `bench`'s module docs.
         let dir = run_dir.join("baseline");
-        std::fs::create_dir_all(&dir)?;
         let results_path = dir.join(crate::benchmark::report::RESULTS_FILE);
         let shared = self.shared.clone();
         let ctx = move || {
@@ -237,6 +237,19 @@ impl Hooks for ServerHooks {
                 resources: st.resources.clone(),
             }
         };
+        // What it would measure (None: cannot tell, measured as before); a baseline of the same
+        // inputs measured for another run of this comparison group is taken over.
+        let resolved = bench::resolve_devices(&mut ctx(), &name, devices).ok();
+        let reuse_key = resolved
+            .clone()
+            .and_then(|d| bench::baseline_inputs(&config, &name, &sets, d))
+            .map(|i| bench::baseline_key(&i));
+        if let Some(k) = &reuse_key
+            && let Some(b) = bench::reusable_baseline(&records(&state), run_dir, k)
+        {
+            return Ok(Some(b));
+        }
+        std::fs::create_dir_all(&dir)?;
         let result = bench::run(&state.benchmark, &ctx, &name, sets, devices, cancel);
         let _ = std::fs::remove_dir_all(&dir);
         match result {
@@ -246,13 +259,27 @@ impl Hooks for ServerHooks {
                     "{name} did not run on the benchmark devices; try it on the Benchmark page"
                 )),
                 model: name,
-                summary: None,
+                ..Baseline::default()
             })),
-            Ok(summary) => Ok(Some(Baseline {
-                model: name,
-                summary,
-                note: None,
-            })),
+            Ok(summary) => {
+                // The key only stands for a result measured on the devices it names.
+                let ran_on_key = summary
+                    .as_ref()
+                    .and_then(|s| s.device.as_ref())
+                    .zip(resolved.as_ref())
+                    .is_some_and(|(d, r)| {
+                        let canon = |x: &str| crate::backend::spec::parse(x).map(|s| s.to_string());
+                        r.iter().any(|x| {
+                            x == d || matches!((canon(x), canon(d)), (Ok(a), Ok(b)) if a == b)
+                        })
+                    });
+                Ok(Some(Baseline {
+                    model: name,
+                    summary,
+                    key: reuse_key.filter(|_| ran_on_key),
+                    ..Baseline::default()
+                }))
+            }
             Err(e)
                 if e.downcast_ref::<crate::resources::export::Cancelled>()
                     .is_some() =>
@@ -261,8 +288,8 @@ impl Hooks for ServerHooks {
             }
             Err(e) => Ok(Some(Baseline {
                 model: name,
-                summary: None,
                 note: Some(format!("{e:#}")),
+                ..Baseline::default()
             })),
         }
     }
@@ -337,8 +364,8 @@ struct RunRow {
     busy: bool,
     /// Finish now applies: running (or paused) in its training stage, not stopped yet.
     can_finish: bool,
-    /// The Stop now / Continue notice while the run trains past an early-stop point (training
-    /// loss still falling); empty otherwise.
+    /// The Stop now / Continue notice while the run trains past an early-stop point (validation
+    /// still improving); empty otherwise.
     extend: String,
     /// The epoch Stop now keeps, and the point's extension number (Continue dismisses it).
     extend_keep: u32,
@@ -412,6 +439,8 @@ struct ResultRow {
     family: String,
     license: String,
     classes: String,
+    /// "merged: truck \u{2192} car" (empty without merges).
+    merges: String,
     benchmark: String,
     /// `/benchmark?set=...#tab-compare`: Compare on the run's held-out images.
     compare_href: String,
@@ -427,6 +456,117 @@ struct ResultRow {
     files: RunFiles,
     /// The Remove button's confirmation.
     confirm: String,
+    /// Held-out person recall, vehicle recall and AP50-95 on every held-out frame (a dash
+    /// without a benchmark): the sortable columns beside the sentence.
+    person_r: String,
+    vehicle_r: String,
+    ap: String,
+    /// Its place in its group's Best first order ([`compare::best_order_by`], `data-best`).
+    best: usize,
+}
+
+/// Runs whose held-out scores compare: the same held-out frames
+/// ([`BenchSummary::heldout_fingerprint`]), trained classes and class merges.
+type HeldoutKey = (String, Vec<String>, BTreeMap<String, String>);
+
+/// [`HeldoutKey`] of a finished run; None without a benchmark or a fingerprint (a run of an
+/// older version): such a run compares with nothing and is a group of its own.
+fn heldout_key(r: &RunRecord) -> Option<HeldoutKey> {
+    let fp = r.benchmark.as_ref()?.heldout_fingerprint.clone()?;
+    let classes = r.output.as_ref()?.classes.clone();
+    Some((fp, classes, r.request.rename.clone()))
+}
+
+/// One group of the Models tab's results list: the runs of one [`HeldoutKey`] (or one run
+/// that compares with nothing), best first.
+struct ResultGroup {
+    /// The group's header row ("Held-out set 3f2a1c..., 4 runs ...").
+    head: String,
+    rows: Vec<ResultRow>,
+}
+
+/// One finished run for [`result_groups`].
+struct GroupItem {
+    key: Option<HeldoutKey>,
+    benchmarked: bool,
+    keys: compare::BestKeys,
+    row: ResultRow,
+}
+
+/// The results list in groups of runs whose held-out scores compare (`items` newest first): the
+/// groups in the order of their newest run, each best first ([`compare::best_order_by`]: person
+/// R, vehicle R, AP50-95; equal ones newest first), `best` set to the place in the group.
+fn result_groups(items: Vec<GroupItem>) -> Vec<ResultGroup> {
+    let mut groups: Vec<(Option<HeldoutKey>, bool, Vec<GroupItem>)> = Vec::new();
+    for it in items {
+        match groups.iter_mut().find(|g| g.0.is_some() && g.0 == it.key) {
+            Some(g) => g.2.push(it),
+            None => groups.push((it.key.clone(), it.benchmarked, vec![it])),
+        }
+    }
+    // A held-out set two groups share (other classes or merges) names what differs.
+    let shared = |fp: &str| {
+        groups
+            .iter()
+            .filter(|g| g.0.as_ref().is_some_and(|k| k.0 == fp))
+            .count()
+            > 1
+    };
+    let heads: Vec<String> = groups
+        .iter()
+        .map(|(key, benchmarked, items)| match key {
+            Some((fp, classes, rename)) => {
+                let short: String = fp.chars().take(6).collect();
+                let n = items.len();
+                let mut head = format!(
+                    "Held-out set {short}\u{2026}, {n} run{}",
+                    if n == 1 { "" } else { "s" }
+                );
+                if shared(fp) {
+                    head.push_str(&format!(", classes {}", classes.join(", ")));
+                    let merges = merges_text(rename);
+                    if !merges.is_empty() {
+                        head.push_str(&format!(" ({merges})"));
+                    }
+                }
+                if n > 1 {
+                    head.push_str(" \u{2014} scores compare only inside a group");
+                }
+                head
+            }
+            None if *benchmarked => {
+                "Held-out set not recorded (a run of an older version): its scores compare with \
+                 no other run"
+                    .to_string()
+            }
+            None => "Not benchmarked".to_string(),
+        })
+        .collect();
+    groups
+        .into_iter()
+        .zip(heads)
+        .map(|((_, _, items), head)| {
+            let keys: Vec<compare::BestKeys> = items.iter().map(|i| i.keys).collect();
+            let order = compare::best_order_by(&keys);
+            let mut slots: Vec<Option<GroupItem>> = items.into_iter().map(Some).collect();
+            let rows = order
+                .into_iter()
+                .enumerate()
+                .filter_map(|(place, i)| {
+                    let mut row = slots.get_mut(i)?.take()?.row;
+                    row.best = place + 1;
+                    Some(row)
+                })
+                .collect();
+            ResultGroup { head, rows }
+        })
+        .collect()
+}
+
+/// A recall as the Models tab shows it (`0.39`; a dash when unknown).
+fn recall_text(v: Option<f64>) -> String {
+    v.filter(|v| v.is_finite())
+        .map_or_else(|| "\u{2014}".into(), |v| format!("{v:.2}"))
 }
 
 /// One GPU of the page's GPU selects (a PC with more than one usable NVIDIA GPU).
@@ -532,6 +672,9 @@ struct CompareRowView {
     alerts: Vec<AlertCell>,
     /// AP50-95 on the held-out random picks (shown with [`CompareCard::random`]).
     random: AlertCell,
+    /// Its place in the card's Best first order ([`compare::best_order`], `data-best`); None for
+    /// a routed row.
+    best: Option<usize>,
 }
 
 /// The "mean of N seeds" row of a Comparison card.
@@ -811,7 +954,8 @@ pub(super) struct TrainingTemplate {
     /// What none ticked runs on: the device `auto` picks (a model without its own device).
     bench_auto: String,
     runs: Vec<RunRow>,
-    results: Vec<ResultRow>,
+    /// Finished runs in groups whose held-out scores compare ([`result_groups`]).
+    results: Vec<ResultGroup>,
     models: Vec<String>,
     /// The models folder (where a trained model goes by default).
     models_dir: String,
@@ -982,6 +1126,7 @@ fn compare_run(r: &RunRecord) -> CompareRun {
         model: r.request.recipe.label(),
         scene: r.request.scene,
         classes: r.request.classes.clone().unwrap_or_default(),
+        rename: r.request.rename.clone(),
         excluded: r.request.excluded,
         ignore: p
             .and_then(|p| p.settings.as_ref())
@@ -1038,6 +1183,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
         .map(|(i, (group, runs))| {
             let c = compare::compare(&runs.iter().map(|r| compare_run(r)).collect::<Vec<_>>());
             let best = |row: usize, col: &str| c.best_per_column.get(col) == Some(&row);
+            let order = compare::best_order(&c.rows);
             let rows = c
                 .rows
                 .iter()
@@ -1076,6 +1222,7 @@ fn compare_cards(records: &[RunRecord]) -> Vec<CompareCard> {
                         (None, None) => "\u{2014}".into(),
                     };
                     CompareRowView {
+                        best: order.iter().position(|&i| i == k).map(|p| p + 1),
                         name: row.name.clone(),
                         seed: row.seed,
                         model: row.model.clone(),
@@ -1476,41 +1623,53 @@ fn view_with(
         .collect();
     let names: Vec<String> = config.models.iter().map(|m| m.effective_name()).collect();
     let current = crate::training::switch::current_default(&config).unwrap_or_default();
-    let results = all
-        .iter()
-        .rev()
-        .filter(|r| r.state == RunState::Done)
-        .filter_map(|r| {
-            let o = r.output.as_ref()?;
-            Some(ResultRow {
-                id: r.id.clone(),
-                name: o.name.clone(),
-                family: format!("{} ({})", r.request.recipe.label(), o.family),
-                license: o.license.clone(),
-                classes: o.classes.join(", "),
-                benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
-                compare_href: compare_href(r.benchmark.as_ref()),
-                compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
-                trained_on: r
-                    .benchmark
-                    .as_ref()
-                    .and_then(|b| b.trained_on_share)
-                    .and_then(bench::trained_chip)
-                    .unwrap_or_default(),
-                is_default: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name))
-                    && o.name.eq_ignore_ascii_case(&current),
-                finished: r
-                    .finished
-                    .as_deref()
-                    .map(crate::clock::display_stored)
-                    .unwrap_or_default(),
-                in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
-                warnings: warnings_of(r),
-                confirm: RunFiles::of(r).confirm(r),
-                files: RunFiles::of(r),
+    let results = result_groups(
+        all.iter()
+            .rev()
+            .filter(|r| r.state == RunState::Done)
+            .filter_map(|r| {
+                let o = r.output.as_ref()?;
+                let keys = compare::best_keys(r.benchmark.as_ref());
+                Some(GroupItem {
+                    key: heldout_key(r),
+                    benchmarked: r.benchmark.is_some(),
+                    keys,
+                    row: ResultRow {
+                        person_r: recall_text(keys[0]),
+                        vehicle_r: recall_text(keys[1]),
+                        ap: ap_text(keys[2]),
+                        best: 0,
+                        id: r.id.clone(),
+                        name: o.name.clone(),
+                        family: format!("{} ({})", r.request.recipe.label(), o.family),
+                        license: o.license.clone(),
+                        classes: o.classes.join(", "),
+                        merges: merges_text(&r.request.rename),
+                        benchmark: bench_text(r.benchmark.as_ref(), r.benchmark_error.as_deref()),
+                        compare_href: compare_href(r.benchmark.as_ref()),
+                        compare: bench::compare_text(r.benchmark.as_ref(), r.baseline.as_ref()),
+                        trained_on: r
+                            .benchmark
+                            .as_ref()
+                            .and_then(|b| b.trained_on_share)
+                            .and_then(bench::trained_chip)
+                            .unwrap_or_default(),
+                        is_default: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name))
+                            && o.name.eq_ignore_ascii_case(&current),
+                        finished: r
+                            .finished
+                            .as_deref()
+                            .map(crate::clock::display_stored)
+                            .unwrap_or_default(),
+                        in_config: names.iter().any(|n| n.eq_ignore_ascii_case(&o.name)),
+                        warnings: warnings_of(r),
+                        confirm: RunFiles::of(r).confirm(r),
+                        files: RunFiles::of(r),
+                    },
+                })
             })
-        })
-        .collect();
+            .collect(),
+    );
     let default_model = config
         .effective_default_index()
         .and_then(|i| config.models.get(i))
@@ -1715,6 +1874,8 @@ pub(crate) struct DataFields {
     pub classes: Vec<String>,
     pub excluded: Excluded,
     pub balance: Balance,
+    /// Class merges (`from` -> `to`; an empty `to` drops the label), see [`rename_of`].
+    pub rename: BTreeMap<String, String>,
 }
 
 /// The datasets, scenes ([`scenes_of`]), classes ([`classes_of`]), excluded mode, public mix
@@ -1740,7 +1901,49 @@ pub(crate) fn data_fields(
         classes: classes_of(f),
         excluded,
         balance: balance_of(f, training)?,
+        rename: rename_of(f)?,
     })
+}
+
+/// The class merges of a form or query: repeated `rename` fields, each one `from=to` or several
+/// joined by commas (the Train tab's Merge classes rows, the older text field); an empty `to`
+/// drops the label, a later duplicate `from` wins. Like the CLI's `--rename`, nothing else is
+/// checked here (the class list must name the target).
+pub(crate) fn rename_of(f: &[(String, String)]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for piece in all(f, "rename")
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let (from, to) = crate::training::dataset::parse_rename(piece)
+            .map_err(|_| anyhow::anyhow!("class merges: '{piece}' is not from=to"))?;
+        out.insert(from, to);
+    }
+    Ok(out)
+}
+
+/// "merged: truck -> car; dropped: tree" for the Models tab; empty without merges.
+fn merges_text(rename: &BTreeMap<String, String>) -> String {
+    let merged: Vec<String> = rename
+        .iter()
+        .filter(|(_, to)| !to.is_empty())
+        .map(|(from, to)| format!("{from} \u{2192} {to}"))
+        .collect();
+    let dropped: Vec<&str> = rename
+        .iter()
+        .filter(|(_, to)| to.is_empty())
+        .map(|(from, _)| from.as_str())
+        .collect();
+    let mut parts = Vec::new();
+    if !merged.is_empty() {
+        parts.push(format!("merged: {}", merged.join(", ")));
+    }
+    if !dropped.is_empty() {
+        parts.push(format!("dropped: {}", dropped.join(", ")));
+    }
+    parts.join("; ")
 }
 
 /// The Balance fieldset of a form: `balance` (repeated axis checkboxes and / or comma lists of
@@ -1944,7 +2147,7 @@ pub(crate) fn requests_from_form(
             include_public: data.include_public,
             scene,
             classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
-            rename: Default::default(),
+            rename: data.rename.clone(),
             benchmark_sets: sets.clone(),
             benchmark_devices: bench_devices.clone(),
             allow_large: field(f, "confirm_large").is_some(),
@@ -1954,6 +2157,7 @@ pub(crate) fn requests_from_form(
             balance: data.balance.clone(),
             compare_group: compare_group.clone(),
             train_seed: None,
+            ignore_memory_check: field(f, "ignore_memory_check").is_some(),
         };
         // Repeats train on the same frames (the assembly seed is the config's) with their own
         // trainer seed.
@@ -2151,6 +2355,7 @@ pub(crate) fn dataset_inventory(
     offered: &[PathBuf],
     data_path: &dyn Fn(&std::path::Path) -> PathBuf,
     allow: &dyn Fn(&str) -> Result<PathBuf, String>,
+    rename: &BTreeMap<String, String>,
 ) -> serde_json::Value {
     use crate::training::dataset;
     let mut sources = Vec::new();
@@ -2167,17 +2372,40 @@ pub(crate) fn dataset_inventory(
             Err(e) => errors.push(serde_json::json!({ "dataset": d, "message": e })),
         }
     }
-    let classes = dataset::inventory(&sources, &Default::default());
+    let classes = dataset::inventory(&sources, rename);
+    // The merged names, as `plan` lists them: each class renamed, a dropped one skipped.
     let mut order: Vec<String> = Vec::new();
     for c in sources
         .iter()
         .flat_map(|s| s.classes.iter())
+        .map(|c| rename.get(c).unwrap_or(c))
         .chain(classes.iter().map(|c| &c.name))
     {
-        if !order.contains(c) {
+        if !c.is_empty() && !order.contains(c) {
             order.push(c.clone());
         }
     }
+    // The names as the exports have them, with their boxes: the page's "from" choices.
+    let mut source_classes: Vec<(String, u64)> = Vec::new();
+    for c in sources.iter().flat_map(|s| s.classes.iter()) {
+        if !source_classes.iter().any(|(n, _)| n == c) {
+            source_classes.push((c.clone(), 0));
+        }
+    }
+    for b in sources
+        .iter()
+        .flat_map(|s| s.frames.iter())
+        .flat_map(|f| f.boxes.iter())
+    {
+        match source_classes.iter_mut().find(|(n, _)| *n == b.class) {
+            Some(e) => e.1 += 1,
+            None => source_classes.push((b.class.clone(), 1)),
+        }
+    }
+    let source_classes: Vec<serde_json::Value> = source_classes
+        .into_iter()
+        .map(|(name, boxes)| serde_json::json!({ "name": name, "boxes": boxes }))
+        .collect();
     let mut frames = dataset::SceneCounts::default();
     for f in sources.iter().flat_map(|s| s.frames.iter()) {
         *match f.scene.as_deref() {
@@ -2191,6 +2419,7 @@ pub(crate) fn dataset_inventory(
         "success": true,
         "classes": classes,
         "order": order,
+        "source_classes": source_classes,
         "frames": frames,
         "errors": errors,
     })
@@ -2214,11 +2443,16 @@ pub(super) async fn dataset_classes(
     blocking(move || {
         let config = state.config_read().clone();
         let datasets = all(&q, "dataset");
+        let rename = match rename_of(&q) {
+            Ok(r) => r,
+            Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        };
         Json(dataset_inventory(
             &datasets,
             &offered_datasets(&config),
             &|p| config.data_path(p),
             &allow_in(&config),
+            &rename,
         ))
         .into_response()
     })
@@ -2260,10 +2494,12 @@ fn preview_recipes(f: &[(String, String)]) -> anyhow::Result<Vec<TrainRecipe>> {
 /// sources and options, nothing written) as `{scene, title, report, warnings, classes,
 /// train_frames, train_images, valid_frames, heldout_frames, dropped, preflight, error}` (`report`
 /// null when balancing is off; `preflight`: [`preflight::Report`]; `error` set when that run cannot
-/// be planned), `disk` `{lines, refusal}`, what every ticked run needs together, and `workers`:
-/// per ticked model the data loader workers it would get now ([`preflight::workers_line`], learned
-/// from `past`, the queue's records). The folders are checked like the queue's
-/// ([`checked_datasets`]); a bad field or folder is an error naming it.
+/// be planned), `disk` `{lines, refusal}`, what every ticked run needs together, `memory`
+/// `{refusal, override_label}` when the memory commit check would refuse a run started now (null
+/// otherwise; [`preflight::memory`]), and `workers`: per ticked model the data loader workers it
+/// would get now ([`preflight::workers_line`], learned from `past`, the queue's records). The
+/// folders are checked like the queue's ([`checked_datasets`]); a bad field or folder is an error
+/// naming it.
 pub(crate) fn balance_preview_json(
     f: &[(String, String)],
     config: &crate::config::Config,
@@ -2320,7 +2556,7 @@ pub(crate) fn balance_preview_json(
                 include_public: data.include_public,
                 scene,
                 classes: (!data.classes.is_empty()).then(|| data.classes.clone()),
-                rename: Default::default(),
+                rename: data.rename.clone(),
                 benchmark_sets: Vec::new(),
                 benchmark_devices: Vec::new(),
                 allow_large: false,
@@ -2330,6 +2566,7 @@ pub(crate) fn balance_preview_json(
                 balance: data.balance.clone(),
                 compare_group: None,
                 train_seed: None,
+                ignore_memory_check: false,
             };
             match crate::training::preview_parts(config, &request) {
                 Ok(parts) => {
@@ -2387,10 +2624,20 @@ pub(crate) fn balance_preview_json(
             (n, s)
         })
         .collect();
+    // The memory commit check each run meets at its start (Windows), with the checkbox's words.
+    let memory = preflight::memory(
+        &recipes,
+        config.training.workers.map_or(
+            crate::training::job::Workers::Auto,
+            crate::training::job::Workers::Fixed,
+        ),
+        crate::training::commit::now().as_ref(),
+    );
     Ok(serde_json::json!({
         "success": true,
         "balance": data.balance,
         "runs": runs,
+        "memory": memory,
         "disk": {
             "lines": volumes.iter().map(|(n, s)| preflight::disk_line(n, *s)).collect::<Vec<_>>(),
             "refusal": preflight::refusal(&volumes),
@@ -3272,6 +3519,22 @@ pub(super) mod tests {
             &HardwareInfo::new("macos", "aarch64", vec![apple_gpu("Apple M1")]),
             Some(16.0),
         )
+    }
+
+    /// The queue form's "Start anyway" reaches every request it makes (each seed is checked at its
+    /// own start); without it, none.
+    #[test]
+    fn the_queue_form_carries_start_anyway() {
+        let cap = mac();
+        let training = crate::training::config::TrainingConfig::default();
+        let base = [("model", "yolo26n"), ("dataset", "/x"), ("seeds", "2")];
+        let (reqs, _) = requests_from_form(&form(&base), &cap, &training).unwrap();
+        assert!(!reqs.is_empty() && reqs.iter().all(|r| !r.ignore_memory_check));
+        let mut on = base.to_vec();
+        on.push(("ignore_memory_check", "1"));
+        let (reqs, _) = requests_from_form(&form(&on), &cap, &training).unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(|r| r.ignore_memory_check));
     }
 
     /// The form and `train run` build their recipe through `recipe::build_recipe`: the same
@@ -4496,6 +4759,224 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn rename_repeats_or_commas_and_empty_to_drops() {
+        let (reqs, _) = requests_from_form(
+            &form(&[
+                ("model", "yolo26n"),
+                ("model", "yolo26s"),
+                ("scene", "day"),
+                ("scene", "night"),
+                ("seeds", "2"),
+                ("rename", "truck=car"),
+                ("rename", "van = car, tree="),
+                ("rename", "truck=bus"),
+                ("rename", ""),
+            ]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap();
+        // Every model x scene x seed request carries the merges; a later duplicate wins.
+        assert_eq!(reqs.len(), 8);
+        for r in &reqs {
+            assert_eq!(
+                r.rename,
+                BTreeMap::from([
+                    ("truck".to_string(), "bus".to_string()),
+                    ("van".to_string(), "car".to_string()),
+                    ("tree".to_string(), String::new()),
+                ])
+            );
+        }
+        let (reqs, _) =
+            requests_from_form(&form(&[("model", "yolo26n")]), &mac(), &Default::default())
+                .unwrap();
+        assert!(reqs[0].rename.is_empty());
+        let e = requests_from_form(
+            &form(&[("model", "yolo26n"), ("rename", "truck=car, =x")]),
+            &mac(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "class merges: '=x' is not from=to");
+        let e = rename_of(&form(&[("rename", "truck")])).unwrap_err();
+        assert!(e.to_string().starts_with("class merges: 'truck'"), "{e}");
+    }
+
+    #[test]
+    fn mixed_renames_warn_in_a_comparison_and_equal_ones_do_not() {
+        let mk = |rename: &[(&str, &str)]| {
+            let mut r = crate::training::compare::CompareRun {
+                name: "n".into(),
+                model: "yolo26n".into(),
+                scene: SceneFilter::ALL_SCENES,
+                classes: vec!["car".into()],
+                rename: rename
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect(),
+                excluded: Excluded::Background,
+                ignore: None,
+                negative_share: None,
+                static_cap: None,
+                workers: None,
+                balance: Default::default(),
+                best_epoch: None,
+                stopped_epoch: None,
+                seed: None,
+                select_metric: Default::default(),
+                select_classes: None,
+                bench: None,
+            };
+            r.name = format!("r{}", rename.len());
+            r
+        };
+        let merged = [("truck", "car")];
+        let c = compare::compare(&[mk(&merged), mk(&merged), mk(&[])]);
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("merge classes differently")
+                    && w.contains("truck \u{2192} car on 2 of 3")),
+            "{:?}",
+            c.warnings
+        );
+        for runs in [[mk(&merged), mk(&merged)], [mk(&[]), mk(&[])]] {
+            let c = compare::compare(&runs);
+            assert!(
+                !c.warnings.iter().any(|w| w.contains("merge classes")),
+                "{:?}",
+                c.warnings
+            );
+        }
+        assert_eq!(merges_text(&BTreeMap::new()), "");
+        assert_eq!(
+            merges_text(&BTreeMap::from([
+                ("truck".to_string(), "car".to_string()),
+                ("tree".to_string(), String::new()),
+            ])),
+            "merged: truck \u{2192} car; dropped: tree"
+        );
+    }
+
+    fn truck_export(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("classes.txt"), "person\ncar\ntruck\n").unwrap();
+        for cam in ["a", "b", "c"] {
+            for i in 0..12 {
+                let stem = format!("day.{cam}.2026-10-01.f{i}");
+                std::fs::write(dir.join("images").join(format!("{stem}.jpg")), b"x").unwrap();
+                let label = match i % 3 {
+                    0 => "1 0.5 0.5 0.2 0.4\n",
+                    1 => "2 0.5 0.5 0.2 0.4\n",
+                    _ => "0 0.5 0.5 0.2 0.4\n",
+                };
+                std::fs::write(dir.join("labels").join(format!("{stem}.txt")), label).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_classes_count_in_the_preview_and_the_class_list() {
+        use crate::server::test_util::{call, get_text, post_form, test_state_with};
+        let root = std::env::temp_dir().join(format!("bop-train-mrg-{}", uuid::Uuid::new_v4()));
+        let export = root.join("exports/review-1");
+        truck_export(&export);
+        let (r2, e2) = (root.clone(), export.clone());
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r2);
+            c.training.datasets = vec![e2];
+        });
+        let enc = super::super::encode_uri_component(&export.display().to_string());
+        let total = |v: &serde_json::Value, name: &str| -> Option<u64> {
+            v["runs"][0]["preflight"]["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .map(|c| {
+                    ["train", "valid", "heldout"]
+                        .iter()
+                        .map(|k| c[*k].as_u64().unwrap())
+                        .sum()
+                })
+        };
+        let preview = |extra: &str| {
+            let state = &state;
+            let body = format!("dataset={enc}&scene=all{extra}");
+            async move {
+                let (s, _, b) = call(
+                    state,
+                    post_form("/v1/training/balance-preview", &body, false),
+                )
+                .await;
+                assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+                serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+            }
+        };
+        let plain = preview("").await;
+        let (car0, truck0) = (
+            total(&plain, "car").unwrap(),
+            total(&plain, "truck").unwrap(),
+        );
+        assert!(car0 > 0 && truck0 > 0, "{plain}");
+        let merged = preview("&rename=truck%3Dcar").await;
+        assert_eq!(total(&merged, "car"), Some(car0 + truck0), "{merged}");
+        assert_eq!(total(&merged, "truck"), None, "{merged}");
+
+        // The class picker's answer: car summed, truck out of the order, kept as a source.
+        let (s, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&rename=truck%3Dcar"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{text}");
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let car = v["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "car")
+            .unwrap();
+        assert_eq!(car["boxes"], 24);
+        assert!(
+            v["classes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|c| c["name"] != "truck")
+        );
+        assert_eq!(v["order"], serde_json::json!(["person", "car"]));
+        assert_eq!(
+            v["source_classes"],
+            serde_json::json!([
+                {"name": "person", "boxes": 12},
+                {"name": "car", "boxes": 12},
+                {"name": "truck", "boxes": 12},
+            ])
+        );
+        // A dropped class leaves the order too; a bad merge is a 400 naming it.
+        let (_, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&rename=truck%3D"),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["order"], serde_json::json!(["person", "car"]));
+        let (s, text) = get_text(
+            &state,
+            &format!("/v1/training/dataset-classes?dataset={enc}&rename=%3Dcar"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("class merges: '=car' is not from=to"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn default_names_get_a_suffix_when_taken() {
         let taken = ["day-yolo26n-1", "day-yolo26n-1-2"];
         let t = |n: &str| taken.contains(&n);
@@ -4616,6 +5097,7 @@ pub(super) mod tests {
             excluded: Excluded::Background,
             balance: Default::default(),
             compare_group: group.map(str::to_string),
+            ignore_memory_check: false,
             train_seed: None,
         };
         let benchmark = ap.map(|(d, n, i)| BenchSummary {
@@ -4729,6 +5211,7 @@ pub(super) mod tests {
             model: "ipcam-general".into(),
             summary: None,
             note: Some("ipcam-general is not loaded".into()),
+            ..Baseline::default()
         });
         // The model is not in the config yet: the preview does not add it.
         let p = super::super::training_switch::preview_of(&state, &rec).unwrap();
@@ -4775,9 +5258,8 @@ pub(super) mod tests {
             patience: 15,
             since_best: 1,
             extension: Some(crate::training::progress::ExtensionNotice {
-                text:
-                    "Early stop reached at epoch 3 (best epoch 2); training loss is still falling."
-                        .into(),
+                text: "Early stop reached at epoch 3 (best epoch 2); validation still improving."
+                    .into(),
                 keep_epoch: 2,
                 extension: 1,
             }),
@@ -5074,6 +5556,130 @@ pub(super) mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The Models tab's results list: groups of runs whose held-out scores compare (fingerprint,
+    /// classes, merges), newest group first, each led by its header row and best first (person
+    /// R, vehicle R, AP50-95), with the three figures as sortable columns.
+    #[test]
+    fn the_results_list_groups_runs_by_comparable_heldout_set() {
+        use crate::server::test_util::test_state_with;
+        use askama::Template;
+        let root = std::env::temp_dir().join(format!("bop-train-groups-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let r2 = root.clone();
+        let state = test_state_with(move |c| c.download_dir = Some(r2));
+        let done = |id: &str, person: Option<f64>, print: Option<&str>| {
+            let mut r = record(
+                id,
+                SceneFilter::DAY,
+                None,
+                RunState::Done,
+                person.map(|p| (p, 0.2, 0.1)),
+            );
+            if let Some(b) = r.benchmark.as_mut() {
+                b.heldout_fingerprint = print.map(str::to_string);
+            }
+            r.output = Some(TrainOutput {
+                name: r.name.clone(),
+                onnx: root.join(format!("{id}.onnx")),
+                yaml: root.join(format!("{id}.yaml")),
+                provenance: root.join(format!("{id}.provenance.json")),
+                family: ModelFamilyKind::Yolo26,
+                classes: vec!["person".into()],
+                license: "AGPL-3.0".into(),
+                heldout: None,
+                device: "mps".into(),
+                train_seconds: 1.0,
+            });
+            r
+        };
+        let mut merged = done("g3", Some(0.9), Some("f1f1f1f1"));
+        merged.request.rename = [("truck".to_string(), "car".to_string())].into();
+        // Queue order, oldest first.
+        let recs = vec![
+            done("g1a", Some(0.5), Some("f1f1f1f1")),
+            done("g1b", Some(0.7), Some("f1f1f1f1")),
+            done("g2", Some(0.1), Some("f2abcdef99")),
+            done("old", Some(0.3), None),
+            done("nob", None, None),
+            done("g1c", Some(0.6), Some("f1f1f1f1")),
+            merged,
+        ];
+        let page = view_with(
+            &state,
+            MODELS,
+            None,
+            None,
+            recs,
+            crate::training::capability::host_for_tests(),
+        )
+        .render()
+        .unwrap();
+        let i = page.find("id=\"use\"").expect("the Use card");
+        let card = &page[i..page[i..].find("</table>").map_or(page.len(), |e| i + e)];
+        assert!(
+            card.contains(
+                "data-sort=\"results\" data-sort-default=\"best\" data-sort-cols=\",,,,,,,,-\""
+            ),
+            "{card}"
+        );
+        // The rows in page order: group heads and runs.
+        let order: Vec<String> = card
+            .split("<tr")
+            .skip(1)
+            .filter_map(|t| {
+                if t.starts_with(" class=\"tr-group\" data-sort-group><td colspan=\"9\">") {
+                    let head = t
+                        .split("<td colspan=\"9\">")
+                        .nth(1)?
+                        .split("</td>")
+                        .next()?;
+                    Some(format!("# {head}"))
+                } else if t.starts_with(" data-best=\"") {
+                    let best = t.split('"').nth(1)?;
+                    let name = t.split("<code>").nth(1)?.split("</code>").next()?;
+                    Some(format!("{best} {name}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "# Held-out set f1f1f1\u{2026}, 1 run, classes person (merged: truck \u{2192} car)",
+                "1 day-yolo26n-g3",
+                "# Held-out set f1f1f1\u{2026}, 3 runs, classes person \u{2014} scores compare only \
+                 inside a group",
+                "1 day-yolo26n-g1b",
+                "2 day-yolo26n-g1c",
+                "3 day-yolo26n-g1a",
+                "# Not benchmarked",
+                "1 day-yolo26n-nob",
+                "# Held-out set not recorded (a run of an older version): its scores compare with \
+                 no other run",
+                "1 day-yolo26n-old",
+                "# Held-out set f2abcd\u{2026}, 1 run",
+                "1 day-yolo26n-g2",
+            ],
+            "{card}"
+        );
+        // The figures beside the sentence; a dash without a benchmark.
+        assert!(
+            card.contains("<td class=\"num\" data-label=\"Person R\">0.70</td>"),
+            "{card}"
+        );
+        assert!(card.contains("<td class=\"num\" data-label=\"Vehicle R\">\u{2014}</td>"));
+        assert!(
+            card.contains("<td class=\"num\" data-label=\"AP50-95\">0.333</td>"),
+            "{card}"
+        );
+        // The detail rows follow their run and span every column.
+        assert!(
+            card.contains("<tr class=\"tr-switch-row\" data-sort-follow hidden><td colspan=\"9\">")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn the_page_shows_runs_comparisons_finish_and_the_new_fields() {
         use crate::server::test_util::{get_text, test_state_with};
@@ -5247,6 +5853,8 @@ pub(super) mod tests {
         assert!(page.contains("<option value=\"map\" data-hint"));
         assert!(page.contains("held-out benchmark is the number to trust"));
         assert!(page.contains("id=\"train-picker\""));
+        assert!(page.contains("id=\"train-merges\""));
+        assert!(page.contains("name=\"rename\""));
         assert!(page.contains("name=\"excluded\" value=\"drop-frame\""));
         // The per-run summary of a finished run: AP50-95 per scene and in scope.
         assert!(

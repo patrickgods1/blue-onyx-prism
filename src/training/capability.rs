@@ -546,9 +546,14 @@ fn family_fit(f: TrainFamily, accel: Option<&Accelerator>) -> FamilyFit {
         .map(|&size| {
             let imgsz = f.default_imgsz(size);
             let mem = accel.map_or(0, Accelerator::memory_mb);
+            // No accelerator: mem 0, nothing is asked of the target.
+            let target = accel.map_or(
+                estimate::Target::Cuda(crate::backend::detect::ComputeCapability::new(8, 6)),
+                Accelerator::target,
+            );
             // RF-DETR's `auto` multi-scale: on when it fits batch 4, else off (and the batch
             // suggested for off).
-            let fits = |ms: bool| estimate::suggest_batch_with(f, size, imgsz, mem, ms);
+            let fits = |ms: bool| estimate::suggest_batch_with(f, size, imgsz, mem, ms, target);
             let multi_scale = f == TrainFamily::Rfdetr
                 && (mem == 0
                     || fits(true).is_some_and(|b| b >= super::recipe::MULTI_SCALE_MIN_BATCH));

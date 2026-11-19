@@ -9,11 +9,16 @@
 //! most 12 animal classes (the script's `siglip_device`), so it takes nothing there. An import's
 //! embeddings put SigLIP 2's vision tower alone on the GPU ([`embed_need`]). The sizes come from the catalog pins, so a new pin
 //! moves them.
+//!
+//! Host memory commit (Windows) is apart: [`commit_need`] is what a labelers run commits on the
+//! host, for the check before it starts ([`crate::training::commit`]); [`embed_commit_need`] an
+//! import's SigLIP 2 selection.
 
 use super::{AutolabelRequest, GdinoSize, VlmSize};
 use crate::backend::vram::{self, JobNeed, gb};
 use crate::resources::catalog::{self as res_catalog, Resource};
 use crate::training::capability::Accelerator;
+use crate::training::commit::Need;
 
 /// CUDA context and the allocator's reserve beside the weights, MB: torch's context alone is
 /// 300-500 MB.
@@ -161,6 +166,131 @@ pub fn job_need(r: &AutolabelRequest) -> Option<JobNeed> {
         ),
         smaller: "a smaller VLM, or the VLM check off".into(),
     })
+}
+
+/// Host memory commit (Windows) of `scripts/autolabel.py` with RF-DETR L, bytes: Python, PyTorch,
+/// the CUDA context and RF-DETR L. Measured: 2.6 GB for the overlap check's `--zoom-pairs`, the same
+/// script and model ([`crate::training::overlaps::zoom::ZOOM_COMMIT_BYTES`]). A run without RF-DETR
+/// L counts it too, at most ~0.3 GB high (its checkpoint is 136 MB).
+pub const LABELERS_BASE_COMMIT_BYTES: u64 = crate::training::overlaps::zoom::ZOOM_COMMIT_BYTES;
+
+/// Host commit SigLIP 2 adds (the whole model, loaded in float32), bytes. Measured on the GTX 1070
+/// Ti box (2026-11-18, private bytes of the labeler's process tree): an RF-DETR L + SigLIP 2 run
+/// took about 4.6 GB at load, then stayed flat over 220 frames (no leak); less
+/// [`LABELERS_BASE_COMMIT_BYTES`].
+pub const SIGLIP_COMMIT_BYTES: u64 = 2 << 30;
+
+/// The least host commit SAM 3 adds, bytes: a lower bound only. The same box, the same day: a SAM
+/// 3 + RF-DETR L run was killed while still loading SAM 3, at >= 7.6 GB; less
+/// [`LABELERS_BASE_COMMIT_BYTES`]. Its estimate is the larger of this and
+/// [`UNMEASURED_CHECKPOINT_FACTOR`] x its checkpoint (3.2 GB x 2 = 6.4 GB).
+pub const SAM3_COMMIT_FLOOR_BYTES: u64 = 5 << 30;
+
+/// Host commit of a labeler with no full measurement (MM-Grounding-DINO, Qwen3-VL; SAM 3 above its
+/// floor) as a multiple of its checkpoint as stored (the precision the script loads it at): a
+/// guess (GB here are GiB, as in the messages). The script builds each model on the host
+/// (`from_pretrained`) before `.to(device)`; the measured ones sit at 1.4x (SigLIP 2: 2.0 GB for a
+/// 1.4 GB checkpoint) and above 1.55x (SAM 3: still loading at 5.0 GB for 3.2 GB). With it the
+/// default run (MM-Grounding-DINO tiny 1.3, RF-DETR L, Qwen3-VL 2B 7.9, SigLIP 2) is about 13.8 GB
+/// and the SAM 3 + RF-DETR L + Qwen3-VL 2B + SigLIP 2 run about 19 GB, which is consistent with
+/// that run growing the box's paging file from about 7.8 GB to its 24 GB maximum (a commit limit of
+/// about 39.8 GB with ~18.6 GB in use by everything else: up to ~21 GB for the run).
+pub const UNMEASURED_CHECKPOINT_FACTOR: u64 = 2;
+
+/// Host commit of one labeler by catalog key ([`UNMEASURED_CHECKPOINT_FACTOR`] x its checkpoint),
+/// with SAM 3 at least [`SAM3_COMMIT_FLOOR_BYTES`]; None when the build has no pin for it.
+fn labeler_commit(key: &str, res: Option<&'static Resource>) -> Option<(String, u64)> {
+    let estimate = res?.size().saturating_mul(UNMEASURED_CHECKPOINT_FACTOR);
+    let bytes = if key == "sam3" {
+        estimate.max(SAM3_COMMIT_FLOOR_BYTES)
+    } else {
+        estimate
+    };
+    Some((title(key), bytes))
+}
+
+/// The host commit (Windows) a labelers run of `r` on `classes` takes at its peak, for the check
+/// before it starts ([`crate::training::commit`]): [`LABELERS_BASE_COMMIT_BYTES`] plus each
+/// labeler it loads (they stay loaded for the whole run). SigLIP 2 counts only with two or more
+/// animal classes, as the script loads it (`siglip_device`). None for a run with a model, which
+/// labels in this process.
+pub fn commit_need(r: &AutolabelRequest, classes: &[String]) -> Option<Need> {
+    if r.with_model.is_some() {
+        return None;
+    }
+    let mut parts: Vec<(String, u64)> = Vec::new();
+    if r.sam3 {
+        parts.extend(labeler_commit(
+            "sam3",
+            crate::resources::hf_token::sam3_resource(),
+        ));
+    }
+    if let Some(g) = r.gdino {
+        parts.extend(labeler_commit(
+            g.key(),
+            res_catalog::autolabel_weights(g.key()),
+        ));
+    }
+    if let Some(q) = r.vlm {
+        parts.extend(labeler_commit(
+            q.key(),
+            res_catalog::autolabel_weights(q.key()),
+        ));
+    }
+    let animals = classes
+        .iter()
+        .filter(|c| super::Category::of(c) == super::Category::Animal)
+        .count();
+    if r.siglip && animals >= 2 {
+        parts.push(("SigLIP 2".into(), SIGLIP_COMMIT_BYTES));
+    }
+    let mut by_size = parts.clone();
+    by_size.sort_by_key(|a| std::cmp::Reverse(a.1));
+    let optional: Vec<String> = by_size.into_iter().map(|(n, _)| n).collect();
+    let base = if r.rfdetr {
+        "PyTorch and RF-DETR L"
+    } else {
+        "PyTorch"
+    };
+    let bytes = parts
+        .iter()
+        .map(|(_, b)| *b)
+        .fold(LABELERS_BASE_COMMIT_BYTES, u64::saturating_add);
+    let mut detail = vec![format!("{base} {}", gb_text(LABELERS_BASE_COMMIT_BYTES))];
+    detail.extend(parts.iter().map(|(n, b)| format!("{n} {}", gb_text(*b))));
+    Some(Need {
+        what: "this auto-label run".into(),
+        bytes,
+        detail: detail.join(" + "),
+        lighter: (!optional.is_empty()).then(|| {
+            format!(
+                "turn off {} (or label with a trained model, --with-model)",
+                optional.join(" or ")
+            )
+        }),
+    })
+}
+
+/// Host commit (Windows) of an import's SigLIP 2 selection (`scripts/import_footage.py embed`,
+/// which loads the whole model in float32 on the host and moves its vision tower to the GPU),
+/// bytes: counted as the measured RF-DETR L + SigLIP 2 run ([`LABELERS_BASE_COMMIT_BYTES`] +
+/// [`SIGLIP_COMMIT_BYTES`], 4.6 GB), not measured on its own; RF-DETR L's share makes it ~0.3 GB
+/// high.
+pub const EMBED_COMMIT_BYTES: u64 = LABELERS_BASE_COMMIT_BYTES + SIGLIP_COMMIT_BYTES;
+
+/// [`EMBED_COMMIT_BYTES`] as the import's [`Need`].
+pub fn embed_commit_need() -> Need {
+    Need {
+        what: "this import's SigLIP 2 selection".into(),
+        bytes: EMBED_COMMIT_BYTES,
+        detail: format!("PyTorch and SigLIP 2 {}", gb_text(EMBED_COMMIT_BYTES)),
+        lighter: Some("use the dHash selection (--select dhash), which loads no model".into()),
+    }
+}
+
+/// `2.6 GB`.
+fn gb_text(bytes: u64) -> String {
+    format!("{:.1} GB", crate::training::gib(bytes))
 }
 
 /// SigLIP 2's vision tower in float32, MB (92.9 M parameters, measured): what an import's
@@ -335,5 +465,130 @@ mod tests {
             memory_mb: 1,
         };
         assert_eq!(gpu_warning(&request(), &mps), None);
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    fn classes(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A request with only the given labelers.
+    fn only(
+        sam3: bool,
+        gdino: Option<GdinoSize>,
+        vlm: Option<VlmSize>,
+        siglip: bool,
+    ) -> AutolabelRequest {
+        let mut r = request();
+        r.sam3 = sam3;
+        r.gdino = gdino;
+        r.vlm = vlm;
+        r.siglip = siglip;
+        r
+    }
+
+    #[test]
+    fn commit_needs_add_up_the_labelers_a_run_loads() {
+        let animals = classes(&["person", "car", "dog", "cat"]);
+        // RF-DETR L + SigLIP 2: the measured 4.6 GB.
+        let rf_siglip = commit_need(&only(false, None, None, true), &animals).unwrap();
+        assert_eq!(
+            rf_siglip.bytes,
+            LABELERS_BASE_COMMIT_BYTES + SIGLIP_COMMIT_BYTES
+        );
+        assert_eq!(rf_siglip.bytes, EMBED_COMMIT_BYTES);
+        assert_eq!(
+            rf_siglip.detail,
+            "PyTorch and RF-DETR L 2.6 GB + SigLIP 2 2.0 GB"
+        );
+        assert_eq!(
+            rf_siglip.lighter.as_deref(),
+            Some("turn off SigLIP 2 (or label with a trained model, --with-model)")
+        );
+        // SigLIP 2 is not loaded with fewer than two animal classes: RF-DETR L alone.
+        let one_animal = commit_need(&only(false, None, None, true), &classes(&["person", "dog"]));
+        assert_eq!(one_animal.unwrap().bytes, LABELERS_BASE_COMMIT_BYTES);
+        let rf = commit_need(&only(false, None, None, false), &animals).unwrap();
+        assert_eq!((rf.bytes, rf.lighter), (LABELERS_BASE_COMMIT_BYTES, None));
+        // SAM 3: twice its 3.2 GB checkpoint, above its 5.0 GB floor.
+        let sam = commit_need(&only(true, None, None, false), &animals).unwrap();
+        let sam3 = crate::resources::hf_token::sam3_resource().unwrap().size();
+        assert_eq!(sam.bytes, LABELERS_BASE_COMMIT_BYTES + 2 * sam3);
+        assert!(2 * sam3 > SAM3_COMMIT_FLOOR_BYTES);
+        assert!(sam.detail.ends_with(" + SAM 3 6.4 GB"), "{}", sam.detail);
+        // The default run: MM-Grounding-DINO tiny, RF-DETR L, Qwen3-VL 2B, SigLIP 2, about 13.8 GB.
+        let d = commit_need(&request(), &animals).unwrap();
+        assert_eq!(
+            d.bytes,
+            LABELERS_BASE_COMMIT_BYTES
+                + 2 * mb_bytes("mm-gdino-tiny")
+                + 2 * mb_bytes("qwen3-vl-2b")
+                + SIGLIP_COMMIT_BYTES
+        );
+        assert!((13 * GIB..14 * GIB).contains(&d.bytes), "{}", d.detail);
+        assert_eq!(
+            d.lighter.as_deref(),
+            Some(
+                "turn off Qwen3-VL 2B or SigLIP 2 or MM-Grounding-DINO tiny (or label with a \
+                 trained model, --with-model)"
+            )
+        );
+        // The run that filled C:: SAM 3, RF-DETR L, Qwen3-VL 2B, SigLIP 2, about 19 GB.
+        let full = commit_need(&only(true, None, Some(VlmSize::Qwen2b), true), &animals).unwrap();
+        assert!(
+            (18 * GIB..20 * GIB).contains(&full.bytes),
+            "{}",
+            full.detail
+        );
+        // A run with a model labels in this process.
+        let mut model = request();
+        model.with_model = Some("IPcam-general".into());
+        assert_eq!(commit_need(&model, &animals), None);
+    }
+
+    fn mb_bytes(key: &str) -> u64 {
+        res_catalog::autolabel_weights(key).unwrap().size()
+    }
+
+    /// The decision on the dev box (commit 23.65 GB limit, ~5.05 GB free, `c:\pagefile.sys 2935
+    /// 24576`, 15.2 GB free on C:, so no growth under the 16 GB margin) for each labeler set.
+    #[test]
+    fn this_box_runs_rfdetr_alone_and_refuses_the_rest() {
+        use crate::training::commit::{refusal, tests::this_box};
+        let animals = classes(&["person", "car", "dog", "cat"]);
+        let h = this_box();
+        let refused = |r: &AutolabelRequest| refusal(&commit_need(r, &animals).unwrap(), Some(&h));
+        // RF-DETR L alone: 2.6 + 1 spare fits 5.05.
+        assert_eq!(refused(&only(false, None, None, false)), None);
+        // RF-DETR L + SigLIP 2: 4.6 + 1 does not (that run grew the paging file by 2 GB from here).
+        let e = refused(&only(false, None, None, true)).unwrap();
+        assert!(
+            e.starts_with("this auto-label run needs about 5.6 GB"),
+            "{e}"
+        );
+        // Every SAM 3 run.
+        for r in [
+            only(true, None, None, false),
+            only(true, None, Some(VlmSize::Qwen2b), true),
+        ] {
+            let e = refused(&r).unwrap();
+            assert!(e.contains("SAM 3"), "{e}");
+            assert!(
+                e.contains("the paging file on C: can grow only while 16 GB"),
+                "{e}"
+            );
+        }
+        // The example in docs/TRAINING.md ("Memory commit check before a job").
+        assert_eq!(
+            refused(&only(true, None, None, false)).unwrap(),
+            "this auto-label run needs about 10.0 GB of memory commit (PyTorch and RF-DETR L 2.6 \
+             GB + SAM 3 6.4 GB, 1.0 GB kept spare); 5.0 GB is free and the paging file on C: can \
+             grow only while 16 GB stays free there (15.2 GB free now). Free space on C:, put the \
+             paging file on another drive, or turn off SAM 3 (or label with a trained model, \
+             --with-model), then start the job again."
+        );
+        // The default run.
+        assert!(refused(&request()).is_some());
     }
 }

@@ -12,7 +12,7 @@
 //! let mut rt = Runtimes::new_with(&CoreOptions { cache_dir, intra_threads, openvino_dir },
 //!                                 &OrtOptions { onnxruntime_dir });
 //! rt.require_any()?;                                   // fails when no runtime initialized
-//! let req = LoadRequest { path, requested: "GPU".into(), gpu_precision: None };
+//! let req = LoadRequest { path, requested: "GPU".into(), gpu_precision: None, no_cache: false };
 //! // Whole plan (GPU, then CPU) in one call, without warm-up:
 //! let mut backend: Backend = rt.load(&spec::parse("auto")?, &req)?;
 //! // Or per candidate, compiling under the `Runtimes` lock and creating the request elsewhere:
@@ -105,6 +105,10 @@ pub struct LoadRequest {
     pub requested: String,
     /// "f16" (default on GPU) or "f32".
     pub gpu_precision: Option<String>,
+    /// Compile without OpenVINO's model cache (CACHE_DIR off for this compile only): a throwaway
+    /// model whose blob would never be read again, the dataset check's fold models
+    /// (`training::refine::predict`). False for everything else. ONNX Runtime ignores it.
+    pub no_cache: bool,
 }
 
 /// Runtime-neutral facts about a loaded model.
@@ -247,6 +251,8 @@ pub struct OvCompiled {
     pub(crate) tuning: DeviceTuning,
     /// `NUM_STREAMS` of the compiled model (None when not readable).
     pub(crate) streams: Option<usize>,
+    /// `OPTIMAL_NUMBER_OF_INFER_REQUESTS` of the compiled model (None when not readable).
+    pub(crate) optimal_requests: Option<usize>,
 }
 
 /// A finished asynchronous inference: which slot, its sequence number (from
@@ -278,6 +284,7 @@ impl fmt::Debug for OvCompiled {
             .field("info", &self.info)
             .field("tuning", &self.tuning)
             .field("streams", &self.streams)
+            .field("optimal_requests", &self.optimal_requests)
             .finish_non_exhaustive()
     }
 }
@@ -423,6 +430,25 @@ impl Backend {
             Backend::Ort(b) => b.submit(slot, chw, extra),
             #[cfg(test)]
             Backend::Fake(b) => b.submit(slot, chw, extra),
+        }
+    }
+
+    /// [`Self::submit`] with the pooled tensor handed over: ONNX Runtime's session thread reads
+    /// it in place instead of a copy in the slot (it returns to its pool once the slot is
+    /// collected); OpenVINO and the test fake copy it like `submit`, and it returns to its pool
+    /// here.
+    pub fn submit_pooled(
+        &mut self,
+        slot: usize,
+        chw: crate::prep::PooledBuf,
+        extra: &[ExtraInput],
+    ) -> Result<u64> {
+        match self {
+            Backend::OpenVino(b) => device::submit(&b.info, &mut b.slots, slot, &chw, extra),
+            #[cfg(feature = "onnxruntime")]
+            Backend::Ort(b) => b.submit_pooled(slot, chw, extra),
+            #[cfg(test)]
+            Backend::Fake(b) => b.submit(slot, &chw, extra),
         }
     }
 

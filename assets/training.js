@@ -12,7 +12,7 @@
 // Train: the runs line (one run per ticked scene per model, named before queuing), the class
 // picker of the ticked folders (counts per scene, warnings), the balance preview (what the
 // Balance fieldset does to each run's training frames) and Finish now while training, plus the
-// Stop now / Continue notice of an early-stop point passed while the training loss still falls.
+// Stop now / Continue notice of an early-stop point passed while validation still improves.
 // Each run row gets a settings line (device, batch, input size, learning rate and schedule,
 // patience, seed, ...) and the Learning rate field's placeholder follows the ticked family.
 // SAM 3: the three-step access panel of the Auto-label card (GET /v1/autolabel/sam3); its option
@@ -33,6 +33,9 @@
   var alClasses = null;
   // Set by the train classes block: the picked classes in head order (null without the picker).
   var trainClasses = null;
+  // Set by the train classes block: the active class merges as "from=to" strings (null without
+  // the merge rows: the text field then posts them itself).
+  var trainRename = null;
 
   // The value of the checked radio `name` of `form`.
   function checked(form, name) {
@@ -653,6 +656,9 @@
     var run = document.getElementById("al-preview-run");
     var box = document.getElementById("al-preview");
     if (!form || !run || !box) return;
+    // "Start anyway" beside a memory refusal (PrismMemory, live.js): shown only with one.
+    var anyway = document.getElementById("al-memory-anyway");
+    var memory = function (m) { if (window.PrismMemory) window.PrismMemory.sync(anyway, m); };
     var seq = 0;
     var line = function (cls, text) {
       var p = document.createElement("p");
@@ -660,10 +666,11 @@
       p.textContent = text;
       box.appendChild(p);
     };
-    var clear = function () { seq++; box.textContent = ""; box.hidden = true; };
+    var clear = function () { seq++; box.textContent = ""; box.hidden = true; memory(null); };
     var draw = function (j, note) {
       box.textContent = "";
       box.hidden = false;
+      memory(j.memory);
       line("small tr-runs-line", j.summary);
       var warnings = (j.warnings || []).concat(note ? [note] : []);
       if (!warnings.length) return;
@@ -682,7 +689,11 @@
       line("small error-text", text);
     };
     run.hidden = false;
-    form.addEventListener("change", clear);
+    // Ticking "Start anyway" is no change to what the preview describes.
+    form.addEventListener("change", function (e) {
+      if (anyway && anyway.contains(e.target)) return;
+      clear();
+    });
     run.addEventListener("click", function () {
       var mine = ++seq;
       var body = new URLSearchParams(), note = "";
@@ -889,6 +900,8 @@
     var holder = document.getElementById("train-picker"), msg = document.getElementById("train-classes-msg");
     if (!form || !holder || !CP) return;
     var KEY = "bop.training.classes";
+    var RKEY = "bop.training.rename";
+    var NEW = "__new__";
     var FEW = 50;
     var picker = null, inv = null, byName = {}, catalog = null, seq = 0, timer = null, lastQuery = null;
     var mk = function (tag, cls, text) {
@@ -901,6 +914,155 @@
     // The balance preview follows the picked classes.
     var changed = function () { form.dispatchEvent(new Event("tr-classes")); };
     trainClasses = function () { return picker ? inOrder(picker.getSelected()) : null; };
+    // Merge classes: rows {from, to, kind} (kind class | drop | new), kept in localStorage; the
+    // exports' own class names (with boxes) come with each answer as `source_classes`.
+    var mergeBox = document.getElementById("train-merges");
+    var rows = [], srcList = [], rowsEl = null;
+    var storedRows = function () {
+      try {
+        var v = JSON.parse(window.localStorage.getItem(RKEY) || "null");
+        if (!Array.isArray(v)) return [];
+        return v.filter(function (r) { return r && typeof r.from === "string" && typeof r.to === "string"; })
+          .map(function (r) { return { from: r.from, to: r.to, kind: r.kind === "drop" || r.kind === "new" ? r.kind : "class" }; });
+      } catch (e) { return []; }
+    };
+    var storeRows = function () {
+      try { window.localStorage.setItem(RKEY, JSON.stringify(rows)); } catch (e) { /* storage blocked */ }
+    };
+    var srcBoxes = function (n) {
+      for (var i = 0; i < srcList.length; i++) if (srcList[i].name === n) return srcList[i].boxes;
+      return null;
+    };
+    // A row that merges: from chosen (and in the exports, once they are known) and a target.
+    var complete = function (r) {
+      if (!r.from) return false;
+      if (srcList.length && srcBoxes(r.from) === null) return false;
+      if (r.kind === "drop") return true;
+      return r.to.trim() !== "" && r.to.trim() !== r.from;
+    };
+    var activeRows = function () { return rows.filter(complete); };
+    var activePairs = function () {
+      var seen = {}, out = [];
+      activeRows().forEach(function (r) {
+        var to = r.kind === "drop" ? "" : r.to.trim();
+        seen[r.from] = to;
+      });
+      Object.keys(seen).forEach(function (k) { out.push(k + "=" + seen[k]); });
+      return out;
+    };
+    var renameQuery = function () {
+      return activePairs().map(function (r) { return "rename=" + encodeURIComponent(r); });
+    };
+    if (mergeBox) trainRename = activePairs;
+    // The merged-away classes that a class absorbed, for its chip.
+    var absorbed = function (name) {
+      var out = [];
+      activeRows().forEach(function (r) {
+        if (r.kind !== "drop" && r.to.trim() === name && srcBoxes(r.from)) out.push(srcBoxes(r.from) + " " + r.from);
+      });
+      return out;
+    };
+    var option = function (value, text, sel) {
+      var o = mk("option", null, text);
+      o.value = value;
+      if (sel) o.selected = true;
+      return o;
+    };
+    var renderRows = function () {
+      if (!rowsEl) return;
+      rowsEl.replaceChildren();
+      rows.forEach(function (r, i) {
+        var row = mk("div", "tr-merge-row");
+        var gone = srcList.length && r.from && srcBoxes(r.from) === null;
+        var del = mk("button", "tr-merge-x", "\u2715");
+        del.type = "button";
+        del.title = "Remove this merge";
+        del.setAttribute("aria-label", "Remove this merge");
+        del.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          rows.splice(i, 1);
+          storeRows(); renderRows(); load();
+        });
+        if (gone) {
+          row.classList.add("tr-merge-off");
+          row.appendChild(mk("span", "small", r.from + " \u2192 " + (r.kind === "drop" ? "(drop)" : r.to)));
+          row.appendChild(mk("span", "muted small", "no " + r.from + " boxes in these exports"));
+          row.appendChild(del);
+          rowsEl.appendChild(row);
+          return;
+        }
+        var others = rows.filter(function (o, j) { return j !== i; });
+        var otherFrom = others.map(function (o) { return o.from; }).filter(Boolean);
+        var otherTo = others.filter(function (o) { return o.kind !== "drop" && o.to.trim(); }).map(function (o) { return o.to.trim(); });
+        var from = mk("select", "tr-merge-from");
+        from.setAttribute("aria-label", "Merge this class");
+        from.appendChild(option("", "choose a class\u2026", !r.from));
+        if (r.from && !srcList.length) from.appendChild(option(r.from, r.from, true));
+        srcList.forEach(function (c) {
+          if (c.name !== r.from && (otherFrom.indexOf(c.name) >= 0 || otherTo.indexOf(c.name) >= 0)) return;
+          from.appendChild(option(c.name, c.name + " (" + c.boxes + ")", c.name === r.from));
+        });
+        var to = mk("select", "tr-merge-to");
+        to.setAttribute("aria-label", "into this class");
+        var tos = srcList.filter(function (c) {
+          return c.name !== r.from && otherFrom.indexOf(c.name) < 0;
+        });
+        var cur = r.kind === "class" ? r.to : null;
+        if (cur && !tos.some(function (c) { return c.name === cur; })) tos.push({ name: cur, boxes: 0 });
+        to.appendChild(option("", "choose\u2026", r.kind === "class" && !r.to));
+        tos.forEach(function (c) { to.appendChild(option(c.name, c.name, r.kind === "class" && c.name === r.to)); });
+        to.appendChild(option("", "drop (remove these boxes)", r.kind === "drop"));
+        to.lastChild.value = "__drop__";
+        to.appendChild(option(NEW, "new name\u2026", r.kind === "new"));
+        var name = mk("input", "tr-merge-new");
+        name.type = "text"; name.autocapitalize = "none"; name.spellcheck = false;
+        name.setAttribute("aria-label", "New class name");
+        name.placeholder = "new class name";
+        name.value = r.kind === "new" ? r.to : "";
+        name.hidden = r.kind !== "new";
+        var stopForm = function (ev) { ev.stopPropagation(); };
+        row.addEventListener("input", stopForm);
+        row.addEventListener("change", stopForm);
+        from.addEventListener("change", function () {
+          r.from = from.value;
+          storeRows(); renderRows(); load();
+        });
+        to.addEventListener("change", function () {
+          if (to.value === "__drop__") { r.kind = "drop"; r.to = ""; }
+          else if (to.value === NEW) { r.kind = "new"; r.to = ""; }
+          else { r.kind = "class"; r.to = to.value; }
+          storeRows(); renderRows(); load();
+        });
+        name.addEventListener("input", function () { r.to = name.value; storeRows(); later(); });
+        name.addEventListener("change", function () { load(); });
+        row.appendChild(from);
+        row.appendChild(mk("span", "tr-merge-arrow", "\u2192"));
+        row.appendChild(to);
+        row.appendChild(name);
+        row.appendChild(del);
+        rowsEl.appendChild(row);
+      });
+    };
+    if (mergeBox) {
+      var fallback = mergeBox.querySelector('input[name="rename"]');
+      rowsEl = mk("div", "tr-merge-rows");
+      var add = mk("button", "tr-merge-add", "Add a merge");
+      add.type = "button";
+      add.addEventListener("click", function () {
+        rows.push({ from: "", to: "", kind: "class" });
+        storeRows(); renderRows();
+      });
+      if (fallback) {
+        fallback.parentNode.insertBefore(rowsEl, fallback);
+        fallback.parentNode.insertBefore(add, fallback);
+        fallback.remove();
+      } else {
+        mergeBox.appendChild(rowsEl);
+        mergeBox.appendChild(add);
+      }
+      rows = storedRows();
+      renderRows();
+    }
     var stored = function () {
       try {
         var v = JSON.parse(window.localStorage.getItem(KEY) || "null");
@@ -949,6 +1111,12 @@
       if (!c) return;
       var label = chip.querySelector(".cp-label") || chip;
       var s = c.by_scene || {};
+      var inc = absorbed(c.name);
+      if (inc.length) {
+        var incl = mk("span", "cp-badge tr-cls-merged", "includes " + inc.join(", "));
+        incl.title = "Boxes merged into " + c.name + " (Merge classes).";
+        label.appendChild(incl);
+      }
       var count = mk("span", "tr-cls-count", c.boxes + " · day " + (s.day || 0) + " / night " + (s.night || 0) + " / IR " + (s.ir || 0));
       count.title = c.boxes + " boxes in " + c.frames + " frames: " + (s.day || 0) + " day, " + (s.night || 0) + " night, " +
         (s.ir || 0) + " IR" + (s.unknown ? ", " + s.unknown + " without a scene tag" : "");
@@ -1025,7 +1193,7 @@
     };
     var load = function () {
       var list = datasets();
-      var q = list.map(function (d) { return "dataset=" + encodeURIComponent(d); }).join("&");
+      var q = list.map(function (d) { return "dataset=" + encodeURIComponent(d); }).concat(renameQuery()).join("&");
       if (q === lastQuery) return;
       lastQuery = q;
       var mine = ++seq;
@@ -1046,6 +1214,7 @@
         catalog = r[0] || {};
         if (!r[1] || r[1].success === false) throw new Error((r[1] && r[1].message) || "no answer");
         inv = r[1];
+        if (Array.isArray(inv.source_classes)) { srcList = inv.source_classes; renderRows(); }
         build();
       }).catch(function (e) {
         if (mine !== seq) return;
@@ -1073,6 +1242,13 @@
       // Save folder / Remove post to /training/datasets: no class check.
       var by = ev.submitter;
       if (by && by.getAttribute("formaction")) return;
+      if (mergeBox && rowsEl) {
+        activePairs().forEach(function (r) {
+          var i = document.createElement("input");
+          i.type = "hidden"; i.name = "rename"; i.value = r; i.className = "tr-cls-field";
+          form.appendChild(i);
+        });
+      }
       if (!picker) return;
       var names = inOrder(picker.getSelected());
       if (!names.length) {
@@ -1133,6 +1309,12 @@
       else {
         var t = form.querySelector('#train-picker input[name="classes"]');
         if (t && t.value.trim()) p.append("classes", t.value.trim());
+      }
+      var rn = trainRename ? trainRename() : null;
+      if (rn) rn.forEach(function (r) { p.append("rename", r); });
+      else {
+        var rt = form.querySelector('#train-merges input[name="rename"]');
+        if (rt && rt.value.trim()) p.append("rename", rt.value.trim());
       }
       ["excluded", "balance_strength"].forEach(function (n) {
         var r = form.querySelector('input[name="' + n + '"]:checked');
@@ -1201,6 +1383,8 @@
       });
       t.appendChild(tb);
       wrap.appendChild(t);
+      // Sortable (sort.js), one remembered sort per kind of table ("Boxes per class", ...).
+      if (window.PrismSort) window.PrismSort.attach(t, { key: "balance:" + head });
       return wrap;
     };
     // Rows of two {name: n} maps: every name, the largest before first; at most `top`.
@@ -1291,6 +1475,7 @@
         var wrap = mk("div", "scroll");
         wrap.appendChild(t);
         d.appendChild(wrap);
+        if (window.PrismSort) window.PrismSort.attach(t, { key: "preflight-classes" });
       }
       // Frames with ignore regions (unsure, too small, under the size floor), by the run's mode
       // (`training.ignore`, set on the Refine tab): background keeps a frame with a label left and
@@ -1333,6 +1518,9 @@
       if (disk.refusal) pre.appendChild(mk("p", "error-text small", disk.refusal));
       // The train log's own line (learned on this machine, never above what memory allows now).
       (j.workers || []).forEach(function (l) { pre.appendChild(mk("p", "muted small", l)); });
+      // The memory commit check each run meets at its start, with "Start anyway" beside it.
+      if (j.memory && j.memory.refusal) pre.appendChild(mk("p", "error-text small", "A run would be refused if it started now: " + j.memory.refusal));
+      if (window.PrismMemory) window.PrismMemory.sync(document.getElementById("train-memory-anyway"), j.memory);
       pre.hidden = false;
     };
     var render = function (j) {
@@ -1862,7 +2050,7 @@
         var p = r.progress || {};
         finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase && !r.retrying);
       }
-      // An early-stop point passed while the training loss still falls: Stop now / Continue.
+      // An early-stop point passed while validation still improves: Stop now / Continue.
       var ext = tr.querySelector('[data-field="extend"]');
       if (ext) {
         var n = (r.progress || {}).extension;
@@ -1887,6 +2075,8 @@
       var a = update(runs, "run", data.runs);
       var b = update(tasks, "task", data.tasks);
       renderMetrics(data, false);
+      // States and progress changed in place: the user's sort (sort.js) again.
+      if (window.PrismSort) [runs, tasks].forEach(function (t) { if (t) window.PrismSort.apply(t); });
       if (!(a || b)) return true;
       // Not reload(): the page may be the answer to a POST, and reloading it would ask to
       // resubmit (and queue the job again). The poll navigates, not the user: no activity.

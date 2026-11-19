@@ -27,7 +27,7 @@
   </details>
   {% if c.force_cpu %}<p class="warn">Force CPU is on and overrides every per-model device. <a href="#inference">Change</a></p>{% endif %}
   <div class="scroll">
-  <table class="model-card rcards">
+  <table class="model-card rcards" data-sort="models">
   <thead><tr><th>Load</th><th>Default</th><th>Name</th><th>Device</th><th>Threshold</th><th title="Model that answers this model's night / IR frames">Night model</th><th title="Which classes this model reports (its object filter)">Classes</th><th>Running</th></tr></thead>
   <tbody>
   {% for m in models %}
@@ -96,7 +96,7 @@
   <p class="muted">No other <code>.onnx</code> / <code>.xml</code> files in <code>{{ models_dir }}</code>.</p>
   {% else %}
   <div class="scroll">
-  <table class="resources rcards">
+  <table class="resources rcards" data-sort="local-models" data-sort-cols=",,,-">
   <thead><tr><th>File</th><th class="num">Size</th><th>Family</th><th>Action</th></tr></thead>
   <tbody>
   {% for l in local_models %}
@@ -118,7 +118,7 @@
   <form method="post" action="/config#at-models" id="models-json-form">
   <textarea autocapitalize="none" autocorrect="off" name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
   <p class="muted">Merged per model and field with changes made elsewhere (the Models card, Benchmark apply). Each entry: <code>path</code> (required), <code>family</code>, <code>name</code>, <code>classes</code>, <code>device</code>,
-  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>). A new or changed <code>path</code> / <code>classes</code> must be inside the data root, the models or download folder or your home folder (it may not exist yet), or chosen with Browse&hellip; under <a href="#custom-model">Add a model by path</a>.</p>
+  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>performance_hint</code> (<code>latency</code> or <code>throughput</code> on an OpenVINO GPU), <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>). A new or changed <code>path</code> / <code>classes</code> must be inside the data root, the models or download folder or your home folder (it may not exist yet), or chosen with Browse&hellip; under <a href="#custom-model">Add a model by path</a>.</p>
   <div class="actions"><button type="submit">Save models JSON</button> <span class="form-msg" aria-live="polite"></span></div>
   </form>
 </details>
@@ -141,7 +141,7 @@
   {% if g.key == "models-export" %}{% if let Some(n) = g.note %}<p class="muted small res-note">{{ n }}</p>{% endif %}<details class="help"><summary>About exports</summary><p>{{ export_notice }} Export makes <code>&lt;name&gt;.onnx</code> + <code>.yaml</code> in <code>{{ models_dir }}</code> (runs on OpenVINO and ONNX Runtime incl. CoreML); the toolchain lives in <code>{{ tools_dir }}</code> (remove it with <em>Remove export toolchain</em>). Nothing is exported automatically. CLI: <code>blue-onyx-prism fetch --resource model:yolo11s --allow-large</code>; by hand: <code>scripts/export_model.py</code>.</p></details>
   <p class="export-add-row" hidden><label class="check"><input type="checkbox" id="export-add-to-config" checked> Add exported models to the config</label></p>{% endif %}
   <div class="scroll">
-  <table class="resources rcards">
+  <table class="resources rcards" data-sort="resources:{{ g.key }}" data-sort-cols=",,,-">
   <colgroup><col><col class="c-size"><col class="c-state"><col class="c-action"></colgroup>
   <thead><tr><th>Resource</th><th class="num">Size</th><th>State</th><th>Action</th></tr></thead>
   <tbody>
@@ -307,7 +307,7 @@
   <p class="muted">People sign in to this web UI with an account; every account can do everything here. Adding, removing or unlocking an account, changing your password and signing out everywhere each ask for your current password.</p>
   {% if let Some(why) = accounts.closed %}<p class="error">{{ why }}</p>{% else %}
   <div class="scroll">
-  <table class="accounts rcards">
+  <table class="accounts rcards" data-sort="accounts">
   <thead><tr><th>Account</th><th>Created</th><th>Password changed</th><th>Wrong passwords</th></tr></thead>
   <tbody>
   {% for r in accounts.rows %}

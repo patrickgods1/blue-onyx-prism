@@ -912,6 +912,7 @@ pub fn preview(
         folder_missing: missing_folder.is_some(),
         mode: Mode::Model,
         model: Some(bare_info(&name)),
+        memory: None,
     };
     if let Some(why) = missing_folder {
         p.refused = Some(why);
@@ -1004,6 +1005,11 @@ pub fn preview(
         p.warnings.push(w);
     } else if !look && request.tighten.is_none() {
         p.warnings.push(tighten::skipped_warning());
+    }
+    // The closer look is a quick check's only Python process.
+    if look && let Some((w, m)) = super::commit_warning(None, true) {
+        p.warnings.push(w);
+        p.memory = Some(m);
     }
     if !qs.s.frames.is_empty() {
         let last = last_report(&dir);
@@ -1211,7 +1217,7 @@ pub fn plan(
         predictor: None,
         config: Box::new(config.clone()),
         min_frames: MIN_UNSEEN_FRAMES,
-        free_commit: crate::system_info::commit,
+        headroom: crate::training::commit::now,
         id,
         request,
     })

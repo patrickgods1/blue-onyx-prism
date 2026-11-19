@@ -1,6 +1,7 @@
 //! Standalone benchmark reports from [`BenchmarkResults`]: Markdown (`--report out.md`) and a
-//! self-contained HTML page (`--report out.html`, inline CSS, light/dark, no scripts or
-//! external files). Both show the machine, the datasets, the cross-model ranking, and per model
+//! self-contained HTML page (`--report out.html`, inline CSS, light/dark, no external files;
+//! its one script is the inlined table sorter `assets/sort.js`, so every table sorts by a click
+//! on a header opened from disk too, numeric cells carry their value as `data-v`). Both show the machine, the datasets, the cross-model ranking, and per model
 //! the device table with grades plus the recommended device's breakdown by dataset, tag and
 //! resolution, and the confidence-threshold sweep (best threshold per model, a compact
 //! P/R/F1/F2 table per model), and the frame-level ROC (AUC per class with the positive and
@@ -23,7 +24,21 @@ struct Table {
     title: String,
     head: Vec<String>,
     rows: Vec<Vec<String>>,
+    /// The HTML report's sort values (Markdown ignores them).
+    numbers: Numbers,
 }
+
+/// Sort values of a table's cells for the HTML report: `values[row][col]` is a cell's `data-v`
+/// (None or a short row: the sorter reads the text), `desc[col]` a column whose first click puts
+/// the highest value first (`data-sort-first="desc"`). Empty = none.
+#[derive(Default)]
+struct Numbers {
+    values: Vec<Vec<Option<f64>>>,
+    desc: Vec<bool>,
+}
+
+/// The table sorter of the pages (`PrismSort`), inlined into the HTML report.
+const SORT_JS: &str = include_str!("../../assets/sort.js");
 
 /// A report section: heading, paragraphs, tables.
 struct Section {
@@ -114,6 +129,7 @@ fn device_row(m: &ModelResult, d: &DeviceResult) -> Vec<String> {
 fn breakdown_table(title: &str, rows: &[Breakdown]) -> Table {
     Table {
         title: title.to_string(),
+        numbers: Numbers::default(),
         head: [
             "", "images", "objects", "AP50", "AP50-95", "ROC AUC", "P", "R", "F1",
         ]
@@ -207,6 +223,7 @@ fn threshold_summary(r: &BenchmarkResults) -> Option<Section> {
         ],
         tables: vec![Table {
             title: String::new(),
+            numbers: Numbers::default(),
             head: [
                 "model",
                 "device",
@@ -274,6 +291,7 @@ fn threshold_summary(r: &BenchmarkResults) -> Option<Section> {
 fn group_table(title: &str, a: &ThresholdAdvice, groups: &[GroupPick]) -> Table {
     Table {
         title: title.to_string(),
+        numbers: Numbers::default(),
         head: [
             "",
             "images",
@@ -362,6 +380,7 @@ fn threshold_tables(a: &ThresholdAdvice, paragraphs: &mut Vec<String>, tables: &
     }
     tables.push(Table {
         title: format!("Confidence threshold on {} (%, IoU 0.5)", a.device),
+        numbers: Numbers::default(),
         head: ["confidence", "P", "R", "F1", "F2", "FP / image", ""]
             .map(String::from)
             .to_vec(),
@@ -397,6 +416,7 @@ fn threshold_tables(a: &ThresholdAdvice, paragraphs: &mut Vec<String>, tables: &
     if a.by_device.len() > 1 {
         tables.push(Table {
             title: "Best threshold by device".into(),
+            numbers: Numbers::default(),
             head: ["device", "best", "P", "R", "F1"]
                 .map(String::from)
                 .to_vec(),
@@ -478,6 +498,7 @@ fn datasets_section(r: &BenchmarkResults) -> Section {
         paragraphs: vec![],
         tables: vec![Table {
             title: String::new(),
+            numbers: Numbers::default(),
             head: [
                 "dataset",
                 "images",
@@ -519,6 +540,27 @@ fn ranking_section(ranking: &[super::report::RankRow], metric: AccuracyMetric) -
         )],
         tables: vec![Table {
             title: String::new(),
+            // Rank, the grades' points and score, p50, AP50, ROC AUC; the rows are written in rank
+            // order, the table's own order.
+            numbers: Numbers {
+                values: ranking
+                    .iter()
+                    .map(|k| {
+                        vec![
+                            Some(k.rank as f64),
+                            None,
+                            None,
+                            Some(k.overall_points),
+                            k.accuracy_score,
+                            Some(k.speed.points()),
+                            Some(k.p50_ms).filter(|v| *v < f64::MAX),
+                            k.ap50,
+                            k.roc_auc,
+                        ]
+                    })
+                    .collect(),
+                desc: vec![false, false, false, true, true, true, false, true, true],
+            },
             head: [
                 "#", "model", "device", "overall", "accuracy", "speed", "p50 ms", "AP50", "ROC AUC",
             ]
@@ -578,6 +620,7 @@ fn model_section(m: &ModelResult) -> Section {
     }
     let mut tables = vec![Table {
         title: "Devices".into(),
+        numbers: Numbers::default(),
         head: [
             "device",
             "load ms",
@@ -647,6 +690,7 @@ fn accuracy_tables(
     tables.push(breakdown_table("By tag", &a.by_tag));
     tables.push(Table {
         title: "By class".into(),
+        numbers: Numbers::default(),
         head: ["class", "objects", "AP50", "AP50-95", "P", "R"]
             .map(String::from)
             .to_vec(),
@@ -683,6 +727,7 @@ fn accuracy_tables(
         }
         tables.push(Table {
             title: "Frame-level ROC by class".into(),
+            numbers: Numbers::default(),
             head: ["class", "frames with", "frames without", "ROC AUC"]
                 .map(String::from)
                 .to_vec(),
@@ -702,6 +747,7 @@ fn accuracy_tables(
     }
     tables.push(Table {
         title: "Recall by object size".into(),
+        numbers: Numbers::default(),
         head: ["size", "objects", "recall"].map(String::from).to_vec(),
         rows: a
             .overall
@@ -732,6 +778,7 @@ fn ap_basis_note(b: &super::metrics::ApBasis) -> String {
 fn resolution_table(run: &RunResult) -> Table {
     Table {
         title: format!("Speed by resolution on {} (ms)", run.requested_device),
+        numbers: Numbers::default(),
         head: [
             "resolution",
             "images",
@@ -893,8 +940,16 @@ pub fn html(r: &BenchmarkResults) -> String {
          .scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card);border:1px solid var(--border);margin:.5rem 0 1rem}\
          th,td{padding:.35rem .6rem;border-bottom:1px solid var(--border);text-align:left;white-space:nowrap}\
          th{font-size:.85rem;color:var(--muted)}h3{font-size:1rem}\
+         th.th-sortable{cursor:pointer;user-select:none}\
+         th .th-sort{margin-left:.25rem;padding:0 .2rem;border:0;background:none;color:inherit;font:inherit;font-size:.8em;cursor:pointer}\
+         th .th-sort .th-sort-arrow{opacity:.45}th .th-sort.on .th-sort-arrow{opacity:1}th .th-sort .th-sort-rank{font-weight:700}\
+         .sort-tools{display:flex;justify-content:flex-end;gap:.6rem;font-size:.85rem}\
+         .sort-tools[hidden],.sort-tools [hidden]{display:none}.sort-tools .sort-by{display:none}\
+         @media (max-width:700px){.sort-tools{justify-content:flex-start}.sort-tools .sort-by{display:inline-flex}}\
+         .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}\
          </style></head><body><main>\n<h1>Blue Onyx Prism benchmark report</h1>\n",
     );
+    let mut index = 0;
     for s in sections(r) {
         let _ = writeln!(out, "<h{l}>{}</h{l}>", html_escape(&s.heading), l = s.level);
         for p in &s.paragraphs {
@@ -907,22 +962,49 @@ pub fn html(r: &BenchmarkResults) -> String {
             if !t.title.is_empty() {
                 let _ = writeln!(out, "<h3>{}</h3>", html_escape(&t.title));
             }
-            out.push_str("<div class=\"scroll\"><table><thead><tr>");
-            for h in &t.head {
-                let _ = write!(out, "<th>{}</th>", html_escape(h));
+            // Each table sorts on its own (PrismSort, attached by its `data-sort` key).
+            index += 1;
+            let _ = write!(
+                out,
+                "<div class=\"scroll\"><table data-sort=\"report-{index}\"><thead><tr>"
+            );
+            for (i, h) in t.head.iter().enumerate() {
+                let first = if t.numbers.desc.get(i).copied().unwrap_or(false) {
+                    " data-sort-first=\"desc\""
+                } else {
+                    ""
+                };
+                let _ = write!(out, "<th{first}>{}</th>", html_escape(h));
             }
             out.push_str("</tr></thead><tbody>\n");
-            for row in &t.rows {
+            for (k, row) in t.rows.iter().enumerate() {
                 out.push_str("<tr>");
-                for c in row {
-                    let _ = write!(out, "<td>{}</td>", html_escape(c));
+                for (i, c) in row.iter().enumerate() {
+                    let v = t
+                        .numbers
+                        .values
+                        .get(k)
+                        .and_then(|v| v.get(i).copied().flatten())
+                        .filter(|v| v.is_finite());
+                    match v {
+                        Some(v) => {
+                            let _ = write!(out, "<td data-v=\"{v}\">{}</td>", html_escape(c));
+                        }
+                        None => {
+                            let _ = write!(out, "<td>{}</td>", html_escape(c));
+                        }
+                    }
                 }
                 out.push_str("</tr>\n");
             }
             out.push_str("</tbody></table></div>\n");
         }
     }
-    out.push_str("</main></body></html>\n");
+    // The sorter inline (opened from disk: no server to load it from); `</` escaped so nothing in
+    // it can close the element early.
+    out.push_str("</main>\n<script>\n");
+    out.push_str(&SORT_JS.replace("</", "<\\/"));
+    out.push_str("\n</script></body></html>\n");
     out
 }
 
@@ -1024,6 +1106,58 @@ mod tests {
         write(&r, &dir.join("r.HTML")).unwrap();
         assert!(write(&r, &dir.join("r.txt")).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The HTML report's tables sort opened from disk: the sorter is inlined, every table has
+    /// its own `data-sort` key, the ranking table's numbers carry `data-v` (its rows stay in rank
+    /// order); Markdown is unchanged by it.
+    #[test]
+    fn the_html_report_sorts_its_tables() {
+        use super::super::report::test_support::{graded, model};
+        let mut a = model(vec![graded("openvino:cpu", 12.5, Some(0.9))], None);
+        a.model = "first".into();
+        let mut b = model(vec![graded("openvino:cpu", 40.0, Some(0.3))], None);
+        b.model = "second".into();
+        let r = BenchmarkResults::new(Default::default(), Default::default(), vec![b, a]);
+        let h = html(&r);
+        assert!(h.contains("<script>\n"), "the sorter is inline");
+        assert!(h.contains("root.PrismSort = {"));
+        assert!(h.contains("\n</script></body></html>\n"));
+        // Nothing inside the script closes it early.
+        let script = h.split("<script>").nth(1).unwrap();
+        assert_eq!(
+            script.matches("</").count(),
+            3,
+            "</script></body></html> only"
+        );
+        assert!(script.contains("PrismSort.attach"));
+        assert!(h.contains("<table data-sort=\"report-1\">"));
+        assert!(
+            h.contains("<th data-sort-first=\"desc\">overall</th>"),
+            "{h}"
+        );
+        let ranking = h
+            .split("Best model for this machine")
+            .nth(1)
+            .and_then(|s| s.split("</table>").next())
+            .unwrap();
+        assert!(ranking.contains("<th>#</th>"));
+        assert!(
+            ranking.contains("<td data-v=\"1\">1</td><td>first</td>"),
+            "{ranking}"
+        );
+        assert!(
+            ranking.contains("<td data-v=\"2\">2</td><td>second</td>"),
+            "{ranking}"
+        );
+        assert!(
+            ranking.contains("<td data-v=\"12.5\">12.5</td>"),
+            "{ranking}"
+        );
+        assert!(ranking.find("first").unwrap() < ranking.find("second").unwrap());
+        let md = markdown(&r);
+        assert!(!md.contains("data-v") && !md.contains("<script"), "{md}");
+        assert!(md.contains("| 1 | first |"), "{md}");
     }
 
     #[test]

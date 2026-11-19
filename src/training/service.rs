@@ -1140,6 +1140,29 @@ impl Drop for TrainingService {
     }
 }
 
+/// The dataset folders (`<run>/data`) of the runs of `job`'s comparison group that started before
+/// it (not queued, not `job`), in queue order: where an identical dataset may already be
+/// ([`super::dataset::write_reusing`] checks that it is, file by file). Empty without a group, and
+/// for an export retry (it writes no dataset). Pure.
+pub fn group_data_dirs(records: &[RunRecord], job: &TrainJob) -> Vec<PathBuf> {
+    let Some(group) = job.request.compare_group.as_deref() else {
+        return Vec::new();
+    };
+    if job.export_only.is_some() {
+        return Vec::new();
+    }
+    records
+        .iter()
+        .filter(|r| {
+            r.id != job.id
+                && r.state != RunState::Queued
+                && r.request.compare_group.as_deref() == Some(group)
+                && r.run_dir != job.run_dir
+        })
+        .map(|r| r.run_dir.join("data"))
+        .collect()
+}
+
 fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
     while let Ok(msg) = rx.recv() {
         let mut job = match msg {
@@ -1183,6 +1206,7 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
             continue;
         }
         inner.persist();
+        job.reuse_from = group_data_dirs(&inner.runs.lock_recover(), &job);
         inner.start_clock(&id);
         // What an automatic worker count learns from: the runs that recorded their resources.
         if job.workers == super::job::Workers::Auto && job.past_runs.is_empty() {

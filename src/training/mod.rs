@@ -13,7 +13,10 @@
 //! - [`job`]: one run's stage machine over the model export's seams (`CommandRunner`, `Fetcher`;
 //!   the environment is `tools/train-env`, [`crate::resources::export::train`]).
 //! - [`preflight`]: the report shown before a run, the refusals and the disk check.
+//! - [`commit`]: the memory commit check before a job starts a Python model process (Windows).
 //! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
+//! - [`self_check`]: when a run may skip its separate self-check process (nothing it checked
+//!   changed since the last one passed); [`file_id`]: the file identity the reuse checks compare.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
 //! - [`workers`]: what a run used (workers, commit, RAM, page-ins; sampled while it trains) and the
 //!   worker count learned from earlier runs of the same machine and recipe.
@@ -35,11 +38,13 @@ pub mod autolabel;
 pub mod bench;
 pub mod capability;
 pub mod cli;
+pub mod commit;
 pub mod compare;
 pub mod config;
 pub mod dataset;
 pub mod estimate;
 pub mod eta;
+pub mod file_id;
 pub mod finish;
 pub mod import;
 pub mod job;
@@ -50,6 +55,7 @@ pub mod pyenv;
 pub mod recipe;
 pub mod refine;
 pub mod retry;
+pub mod self_check;
 pub mod service;
 pub mod switch;
 pub mod task;
@@ -80,19 +86,17 @@ pub fn capability_now() -> Capability {
 /// ([`measured_peaks`] of `runs`).
 pub fn capability_with_runs(runs: &[service::RunRecord]) -> Capability {
     let mut cap = capability_now();
-    let mem = cap
-        .accelerator
-        .as_ref()
-        .map_or(0, capability::Accelerator::memory_mb);
-    cap.apply_measured(&measured_peaks(runs, mem));
+    if let Some(a) = cap.accelerator.clone() {
+        cap.apply_measured(&measured_peaks(runs, &a));
+    }
     cap
 }
 
 /// The peak GPU memory of every run that reported `mem_gb` for a finished epoch, oldest first
-/// (by `created`); `memory_mb` resolves RF-DETR's `auto` multi-scale as the run did.
+/// (by `created`); `accel` resolves RF-DETR's `auto` multi-scale as the run did.
 pub fn measured_peaks(
     runs: &[service::RunRecord],
-    memory_mb: u64,
+    accel: &capability::Accelerator,
 ) -> Vec<capability::MeasuredPeak> {
     let mut v: Vec<(&str, capability::MeasuredPeak)> = runs
         .iter()
@@ -112,7 +116,7 @@ pub fn measured_peaks(
                     family: recipe.family,
                     size: recipe.size.clone(),
                     imgsz: recipe.imgsz,
-                    multi_scale: recipe.multi_scale_on(memory_mb),
+                    multi_scale: recipe.multi_scale_on(accel.memory_mb(), accel.target()),
                     device: r.device.clone(),
                     batch: recipe.batch,
                     peak_mb: peak * 1024.0,
@@ -300,6 +304,41 @@ impl WorkerChoice {
     }
 }
 
+/// The host memory commit (Windows) of one training run of `family` with `workers`, for the check
+/// before its first Python process ([`commit`], in [`job`]): [`MAIN_COMMIT_RESERVE_BYTES`] (the
+/// measured trainer process, 8.0 GB) plus, only when `training.workers` forces a count,
+/// [`WORKER_COMMIT_BYTES`] per worker per loader ([`worker_loaders`]). Automatic workers add
+/// nothing: [`workers_for`] gives a run only the workers the commit holds beyond the trainer's
+/// reserve when it starts (0 when none), and the count learned from earlier runs
+/// ([`workers::learned`]) is never above that limit, so an automatic run never commits more workers
+/// than its own start-time reading holds. Counting them here would refuse a run the limit would
+/// shrink to fit. [`commit::COMMIT_SLACK_BYTES`] comes on top in the check.
+pub fn trainer_commit_need(family: catalog::TrainFamily, workers: job::Workers) -> commit::Need {
+    let trainer = MAIN_COMMIT_RESERVE_BYTES;
+    let n = match workers {
+        job::Workers::Auto => 0,
+        job::Workers::Fixed(n) => n,
+    };
+    let per = WORKER_COMMIT_BYTES * u64::from(worker_loaders(family.trainer()));
+    let extra = per.saturating_mul(u64::from(n));
+    let mut detail = format!("the training process {:.1} GB", gib(trainer));
+    if extra > 0 {
+        detail.push_str(&format!(
+            " + {} {:.1} GB (training.workers)",
+            workers_text(n),
+            gib(extra)
+        ));
+    }
+    commit::Need {
+        what: "this training run".into(),
+        bytes: trainer.saturating_add(extra),
+        detail,
+        lighter: (extra > 0).then(|| {
+            "let training choose its data loader workers (remove training.workers)".to_string()
+        }),
+    }
+}
+
 /// "1 data loader worker", "3 data loader workers".
 pub fn workers_text(n: u32) -> String {
     format!("{n} data loader worker{}", if n == 1 { "" } else { "s" })
@@ -386,10 +425,20 @@ pub fn workers_now(trainer: catalog::Trainer) -> WorkerChoice {
 
 /// The dataset options of `request` on `config`: the `training` section's assembly defaults
 /// (shares, oversampling, static cap, ignore mode), `collect.size_floor` (the exports' floors are
-/// compared with it) and the request's scene, classes, renames, excluded mode, balance and input
-/// size. The job ([`plan_job`]) and [`preview_plan`] both build them here, so a preview is the
-/// run's plan.
-pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options {
+/// compared with it), the camera days held out for good ([`frozen_heldout`]) and the request's
+/// scene, classes, renames, excluded mode, balance and input size. The job ([`plan_job`]) and
+/// [`preview_plan`] both build them here, so a preview is the run's plan. Fails when the list of
+/// days held out for good does not read: a run could then train on one of them.
+pub fn options_for(config: &Config, request: &TrainRequest) -> Result<dataset::Options> {
+    Ok(options_with(config, request, frozen_heldout(config)?))
+}
+
+/// [`options_for`] with the camera days held out for good given.
+pub(crate) fn options_with(
+    config: &Config,
+    request: &TrainRequest,
+    frozen_heldout: std::collections::BTreeSet<String>,
+) -> dataset::Options {
     let t = &config.training;
     let base = dataset::Options {
         negative_share: t.negative_share,
@@ -398,9 +447,79 @@ pub fn options_for(config: &Config, request: &TrainRequest) -> dataset::Options 
         static_cap: t.static_cap_option(),
         ignore: t.ignore,
         size_floor: config.collect.size_floor,
+        frozen_heldout,
         ..dataset::Options::default()
     };
     job::request_options(&base, request)
+}
+
+/// The `camera/day` keys of the folder under review's camera days held out for good
+/// (`collect.review_dir`, else the dataset folder;
+/// [`crate::collect::labels::heldout`]): [`dataset::Options::frozen_heldout`]. Empty without the
+/// file; an error when it is newer, damaged or does not read.
+pub fn frozen_heldout(config: &Config) -> Result<std::collections::BTreeSet<String>> {
+    let dir = config.collect.resolved_review_dir(&config.data_root());
+    let file = crate::collect::labels::heldout::load(&dir).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}. A training run reads it to keep those camera days out of training, so none \
+             starts until it reads"
+        )
+    })?;
+    Ok(file.keys())
+}
+
+/// The camera days (`camera`, `date`) any training run trained or validated on: the frames of
+/// every `<training dir>/<run>/data/train.txt` and `valid.txt` (names as the run's dataset writes
+/// them, `s<N>-<scene>.<camera>.<date>.<stem>.jpg`; public images name no day). A run folder
+/// without a list (a run that never wrote its dataset) adds nothing. None when the training folder
+/// or a list does not read: a day may then have been trained on unseen
+/// ([`crate::collect::labels::heldout::HeldoutPolicy::seen`]).
+pub fn seen_days(config: &Config) -> Option<std::collections::BTreeSet<(String, String)>> {
+    seen_days_in(&training_dir(config))
+}
+
+fn seen_days_in(dir: &Path) -> Option<std::collections::BTreeSet<(String, String)>> {
+    let mut days = std::collections::BTreeSet::new();
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(days),
+        Err(e) => {
+            tracing::warn!("{}: {e}", dir.display());
+            return None;
+        }
+    };
+    for entry in rd {
+        let data = match entry {
+            Ok(e) => e.path().join("data"),
+            Err(e) => {
+                tracing::warn!("{}: {e}", dir.display());
+                return None;
+            }
+        };
+        if !data.is_dir() {
+            continue;
+        }
+        for list in ["train.txt", "valid.txt"] {
+            let path = data.join(list);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!("{}: {e}", path.display());
+                    return None;
+                }
+            };
+            for line in text.lines() {
+                let Some(rel) = autolabel::trained_frame(line)
+                    .and_then(|f| crate::collect::layout::parse_rel(&f))
+                else {
+                    continue;
+                };
+                days.insert((rel.camera, rel.date));
+            }
+        }
+    }
+    Some(days)
 }
 
 /// The plan a run of `request` would train on, without writing anything: the sources read like
@@ -421,7 +540,7 @@ pub struct Preview {
 
 /// [`preview_plan`] with what it read, for [`preflight::report`] and [`preflight::run_needs`].
 pub fn preview_parts(config: &Config, request: &TrainRequest) -> Result<Preview> {
-    preview_with(config, request, options_for(config, request))
+    preview_with(config, request, options_for(config, request)?)
 }
 
 /// [`preview_parts`] with `options` of the caller's: `train prepare --dry-run` has no model, so no
@@ -632,7 +751,7 @@ pub fn plan_job(
     request.balance.validate()?;
     let id = service::new_run_id();
     let t = &config.training;
-    let options = options_for(config, &request);
+    let options = options_for(config, &request)?;
     Ok(TrainJob {
         run_dir: training_dir(config).join(&id),
         id,
@@ -648,6 +767,8 @@ pub fn plan_job(
         past_runs: Vec::new(),
         keep_work: false,
         export_only: None,
+        headroom: commit::now,
+        reuse_from: Vec::new(),
     })
 }
 
@@ -714,7 +835,7 @@ mod tests {
             record("2026-10-28T11:00:00Z", &r, "NVIDIA X (cuda:0)", &[0.5]),
             record("2026-10-28T12:00:00Z", &r, &dev, &[]),
         ];
-        let peaks = measured_peaks(&runs, accel.memory_mb());
+        let peaks = measured_peaks(&runs, &accel);
         assert_eq!(peaks.len(), 4);
         assert_eq!(peaks[0].peak_mb, 7.0 * 1024.0);
         assert!(peaks[0].multi_scale);
@@ -749,6 +870,7 @@ mod tests {
             balance: Default::default(),
             compare_group: None,
             train_seed: None,
+            ignore_memory_check: false,
         }
     }
 
@@ -794,7 +916,7 @@ mod tests {
         // What the job's dataset stage plans: its sources and options.
         let j = plan_job(&c, req.clone(), &mac(), None).unwrap();
         assert_eq!(j.options.balance, req.balance);
-        assert_eq!(j.options, options_for(&c, &req));
+        assert_eq!(j.options, options_for(&c, &req).unwrap());
         let sources = job::read_sources(&j.request.datasets, None).unwrap();
         let job_plan =
             preflight::planned(&sources, &job::request_options(&j.options, &j.request)).unwrap();
@@ -802,7 +924,10 @@ mod tests {
         // A repeat with another training seed: the same frames.
         let mut seeded = req.clone();
         seeded.train_seed = Some(2);
-        assert_eq!(options_for(&c, &seeded), options_for(&c, &req));
+        assert_eq!(
+            options_for(&c, &seeded).unwrap(),
+            options_for(&c, &req).unwrap()
+        );
         assert_eq!(preview_plan(&c, &seeded).unwrap(), preview);
         // training.datasets when the request names none.
         let mut cfg = c.clone();
@@ -1257,5 +1382,91 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("already has a model"), "{e}");
+    }
+
+    #[test]
+    fn seen_days_are_every_runs_train_and_valid_days() {
+        let root = std::env::temp_dir().join(format!("bop-seen-{}", uuid::Uuid::new_v4()));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let dir = training_dir(&c);
+        // Nothing trained yet: no day seen.
+        assert_eq!(seen_days(&c), Some(std::collections::BTreeSet::new()));
+        let write = |run: &str, list: &str, text: &str| {
+            let data = dir.join(run).join("data");
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(data.join(list), text).unwrap();
+        };
+        write(
+            "20261101-1",
+            "train.txt",
+            "./images/s0-day.back.2026-10-25.20261025T010203004Z_ab.jpg\n\
+             ./images/s0-day.back.2026-10-25.20261025T010203004Z_ab.jpg\n\
+             ./images/s1-night.drive.2026-10-26.x.jpg\n\
+             ./images/s2-lila_0001.jpg\n\n",
+        );
+        write(
+            "20261101-1",
+            "valid.txt",
+            "./images/s0-ir.nook.2026-10-27.y.jpg\n",
+        );
+        write(
+            "20261102-1",
+            "train.txt",
+            "./images/s3-day.alley.2026-11-01.z.jpg\n",
+        );
+        // Not runs: the exports folder, a run that never wrote its lists, a file.
+        std::fs::create_dir_all(dir.join("exports").join("x")).unwrap();
+        std::fs::create_dir_all(dir.join("20261103-1").join("data")).unwrap();
+        std::fs::write(dir.join("runs.json"), "[]").unwrap();
+        let day = |c: &str, d: &str| (c.to_string(), d.to_string());
+        assert_eq!(
+            seen_days(&c),
+            Some(
+                [
+                    day("back", "2026-10-25"),
+                    day("drive", "2026-10-26"),
+                    day("nook", "2026-10-27"),
+                    day("alley", "2026-11-01"),
+                ]
+                .into()
+            )
+        );
+        // A list that does not read: nothing can be called unseen.
+        let bad = dir.join("20261104-1").join("data");
+        std::fs::create_dir_all(bad.join("train.txt")).unwrap();
+        assert_eq!(seen_days(&c), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_runs_options_hold_the_frozen_days_and_a_damaged_list_stops_them() {
+        let root = std::env::temp_dir().join(format!("bop-frozen-{}", uuid::Uuid::new_v4()));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let req = request(TrainFamily::Yolo26, "n");
+        assert!(options_for(&c, &req).unwrap().frozen_heldout.is_empty());
+        let review = c.collect.resolved_review_dir(&c.data_root());
+        std::fs::create_dir_all(&review).unwrap();
+        let file = review.join(crate::collect::labels::heldout::FILE);
+        std::fs::write(
+            &file,
+            r#"{"version":1,"days":[{"camera":"nook","date":"2026-10-27","added":"2026-11-18T00:00:00.000Z","reason":"camera-minimum"}]}"#,
+        )
+        .unwrap();
+        let o = options_for(&c, &req).unwrap();
+        assert_eq!(o.frozen_heldout, ["nook/2026-10-27".to_string()].into());
+        // The service's job and the preview share them.
+        assert_eq!(plan_job(&c, req.clone(), &mac(), None).unwrap().options, o);
+        std::fs::write(&file, "{").unwrap();
+        let e = options_for(&c, &req).unwrap_err().to_string();
+        assert!(e.contains("damaged") && e.contains("none starts"), "{e}");
+        assert!(plan_job(&c, req.clone(), &mac(), None).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"{");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

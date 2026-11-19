@@ -56,6 +56,7 @@ fn precision_change_never_reuses_a_blob() {
         path: path.to_path_buf(),
         requested: "openvino:cpu".into(),
         gpu_precision: None,
+        no_cache: false,
     };
     // A non-trivial input so f16 and f32 differ in the outputs.
     let chw: Vec<f32> = (0..3 * 640 * 640u64)
@@ -117,4 +118,55 @@ fn precision_change_never_reuses_a_blob() {
         // The CPU default is f32 already (most x86): one folder, the same blob is correct.
         assert_eq!(found.len(), 1, "{found:?}");
     }
+}
+
+#[test]
+#[ignore = "needs models/ and the runtime libraries; see tests/common"]
+fn a_no_cache_compile_writes_no_blob_and_the_next_compile_caches_again() {
+    let ov_dir = common::require_openvino();
+    let ipcam = common::require_ipcam();
+    let dir = common::temp_dir("ov-cache-none");
+    let cache = dir.join("cache");
+    let mut rt = Runtimes::new(&CoreOptions {
+        cache_dir: Some(cache.clone()),
+        intra_threads: 0,
+        openvino_dir: Some(ov_dir),
+    });
+    rt.require_any().expect("Runtimes::new");
+    let cpu = spec::parse("openvino:cpu").unwrap();
+    let req = |no_cache: bool| LoadRequest {
+        path: ipcam.clone(),
+        requested: "openvino:cpu".into(),
+        gpu_precision: None,
+        no_cache,
+    };
+    let chw: Vec<f32> = (0..3 * 640 * 640u64)
+        .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+        .collect();
+    let mut run = |no_cache: bool| {
+        let mut b = rt.load(&cpu, &req(no_cache)).expect("load on CPU");
+        let ms = b.info().compile_ms;
+        let out = b.infer(&chw, &[]).expect("infer")[0]
+            .as_f32()
+            .expect("f32 output")
+            .to_vec();
+        (out, ms)
+    };
+    // A throwaway model (a dataset check's fold model): no blob anywhere under the cache.
+    let (thrown, ms) = run(true);
+    println!("no_cache compile {ms} ms; blobs {:?}", blobs(&cache));
+    assert!(blobs(&cache).is_empty(), "{:?}", blobs(&cache));
+    // The next ordinary compile caches as before, and computes the same outputs.
+    let (cached, ms) = run(false);
+    println!("cached compile {ms} ms; blobs {:?}", blobs(&cache));
+    assert_eq!(blobs(&cache).iter().map(|(_, n)| n).sum::<usize>(), 1);
+    assert_eq!(
+        thrown, cached,
+        "the cache never changes what a model computes"
+    );
+    // And a no_cache compile after it adds nothing.
+    let before = blobs(&cache);
+    let (again, _) = run(true);
+    assert_eq!(blobs(&cache), before);
+    assert_eq!(again, cached);
 }

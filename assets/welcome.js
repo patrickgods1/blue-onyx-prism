@@ -1,5 +1,6 @@
 // Blue Onyx Prism: Home page (served from /static/; no inline scripts under the CSP).
 // While a model loads or waits for a download, follow its state (and reload once it changes).
+// Rows are matched by `data-model`, never by position: the table may be sorted (sort.js).
 (function () {
   var rows = document.querySelectorAll("table.models tbody tr");
   var busy = Array.prototype.some.call(rows, function (r) { return r.className === "st-loading" || r.className === "st-wait"; });
@@ -9,9 +10,10 @@
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     }).then(function (j) {
-      var changed = false;
-      j.models.forEach(function (m, i) {
-        var row = rows[i];
+      var changed = false, byName = {};
+      Array.prototype.forEach.call(rows, function (r) { byName[r.dataset.model] = r; });
+      j.models.forEach(function (m) {
+        var row = byName[m.name];
         if (!row) return;
         if (row.className !== "st-" + m.stateClass) changed = true;
         var d = row.querySelector(".detail");

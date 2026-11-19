@@ -8,6 +8,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod backend_bench_read_ahead;
 mod backend_cache;
 mod backend_cpu;
 mod backend_ort;
@@ -21,6 +22,7 @@ mod js_poll;
 mod js_review_refine;
 mod js_review_touch;
 mod js_rules;
+mod js_sort;
 mod js_time;
 mod js_train_metrics;
 mod js_viewport;

@@ -2347,3 +2347,55 @@ process.stdout.write(JSON.stringify({
     );
     assert!(got["none"].is_null() && got["nothing"].is_null());
 }
+
+/// The export report's lines on the camera days held out for good (`DatasetHeldout.lines` in
+/// `assets/train-dataset.js`, from `ExportReport.heldout`).
+#[test]
+fn the_export_report_names_the_days_held_out_for_good() {
+    if !have_node() {
+        return;
+    }
+    let driver = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+require(req.dataset);
+const L = globalThis.DatasetHeldout.lines;
+const day = (camera, date, reason) => ({ camera, date, reason, added: '2026-11-18T00:00:00.000Z' });
+const many = [];
+for (let i = 1; i <= 12; i++) many.push(day('cam' + i, '2026-11-01', 'hash'));
+process.stdout.write(JSON.stringify({
+  added: L({ listed: 17, added: [day('alley', '2026-11-21', 'camera-minimum'), day('back', '2026-10-02', 'hash')],
+    short: [{ camera: 'nook', held: 0, wanted: 2, why: 'every reviewed nook day was trained on; review a newer day' }] }),
+  none: L({ listed: 1, added: [], short: [] }),
+  custom: L({ listed: 3, added: [], short: [], custom_split: true }),
+  many: L({ listed: 12, added: many, short: [] }),
+  absent: L(undefined),
+}));
+"#;
+    let dataset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-dataset.js");
+    let got = node_with(driver, &json!({"dataset": dataset}));
+    assert_eq!(
+        got["added"],
+        json!([
+            "17 camera days held out for good; added this export: alley 2026-11-21 (camera minimum), back 2026-10-02 (split)",
+            "nook: 0 of 2 held-out days; every reviewed nook day was trained on; review a newer day"
+        ])
+    );
+    assert_eq!(
+        got["none"],
+        json!(["1 camera day held out for good; none added this export"])
+    );
+    assert_eq!(
+        got["custom"],
+        json!([
+            "3 camera days held out for good; held out here too. Other split settings add none (only the default split does)."
+        ])
+    );
+    let many = got["many"][0].as_str().unwrap();
+    assert!(
+        many.contains("cam10 2026-11-01 (split), and 2 more"),
+        "{many}"
+    );
+    assert_eq!(got["absent"], json!([]));
+}

@@ -51,6 +51,8 @@ struct Harness {
     handle: Arc<WorkerHandle>,
     script: FakeScript,
     shutdown: CancellationToken,
+    /// The worker's prep pool.
+    prep: Arc<PrepPool>,
 }
 
 impl Harness {
@@ -79,6 +81,7 @@ impl Harness {
         let script = FakeScript::new(slots, INPUT);
         let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
         let path = PathBuf::from("fake.onnx");
+        let prep = PrepPool::new(2);
         let cfg = WorkerConfig {
             name: name.into(),
             model: ModelConfig {
@@ -91,6 +94,7 @@ impl Harness {
                 path,
                 requested: "auto".into(),
                 gpu_precision: None,
+                no_cache: false,
             },
             classes: classes(),
             live: live.shared(),
@@ -99,7 +103,7 @@ impl Harness {
             can_use_gpu: false,
             wait: None,
             concurrency: None,
-            prep: Some(PrepPool::new(2)),
+            prep: Some(prep.clone()),
             peers,
             only: None,
             make_room: None,
@@ -113,6 +117,7 @@ impl Harness {
             handle,
             script,
             shutdown,
+            prep,
         };
         h.wait_for("the model to load", || {
             h.handle.state.get() == ModelState::Ready
@@ -606,6 +611,7 @@ fn spawn_faulty(script: &FakeScript, faults: TestFaults) -> (WorkerHandle, Cance
             path,
             requested: "auto".into(),
             gpu_precision: None,
+            no_cache: false,
         },
         classes: classes(),
         live: LiveSettings::default().shared(),
@@ -837,6 +843,11 @@ fn ir_frame_is_answered_by_the_night_model_and_day_frame_by_the_primary() {
     assert_eq!(r.message, "Found 1 objects");
     assert_eq!(night.script.submits(), 1);
     assert_eq!(
+        night.prep.jobs_done(),
+        1,
+        "the forwarded frame was prepared on the prep pool"
+    );
+    assert_eq!(
         day.script.submits(),
         1,
         "only the day frame ran on the primary"
@@ -1045,16 +1056,20 @@ fn decoded_frames_can_be_answered_to_another_worker() {
             from: "primary".into(),
             purpose: super::Purpose::Verify,
             original: None,
+            upload: None,
         }))
     };
     h.script.push([det(4, 0)]);
     let (tx, rx) = crossbeam_channel::bounded(1);
+    let prepared = h.prep.jobs_done();
     h.handle
         .sender
         .try_send(decoded(Instant::now() + SOON, super::Reply::Worker(tx)))
         .unwrap();
     let r = rx.recv_timeout(SOON).unwrap();
     assert_eq!(label(&r), "c4");
+    // Prepared by the prep pool, not on the receiving model's inference thread.
+    assert_eq!(h.prep.jobs_done(), prepared + 1);
     // Letterboxed for this model like a decoded upload: same box as from the JPEG.
     assert_eq!(
         (r.predictions[0].x_min, r.predictions[0].y_min),
@@ -1548,5 +1563,59 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
     assert_eq!(summary.frames, 6);
     primary.stop();
     checker.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- Saved images (`save_image_path`) ----
+
+/// The save is queued after the reply went out (here nothing writes it until the test does),
+/// and it writes the same annotated image as before the save moved off the worker; the
+/// reference copy is the upload itself. A full queue drops saves, never replies.
+#[test]
+fn images_are_saved_after_the_reply() {
+    let dir = std::env::temp_dir().join(format!("bo_save_run_{}", uuid::Uuid::new_v4()));
+    let (saver, saves) = super::save::Saver::unstarted(1);
+    let saver = Arc::new(saver);
+    let live = LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        save_image_path: Some(dir.clone()),
+        save_ref_image: true,
+        ..LiveSettings::default()
+    };
+    let faults = TestFaults {
+        saver: Some(saver.clone()),
+        ..TestFaults::default()
+    };
+    let h = Harness::start_faulty("fake", 1, live, Peers::new(), faults);
+    h.script.push([det(2, 0)]);
+    let r = h.send("cam1.jpg").wait();
+    assert_eq!(label(&r), "c2");
+    // Answered, and the save is still waiting: nothing is written yet.
+    let job = saves.recv_timeout(SOON).unwrap();
+    assert!(!dir.exists(), "nothing written before the save runs");
+    assert_eq!(job.image_name, "cam1.jpg");
+    assert_eq!(job.predictions, r.predictions);
+    super::save::write(job);
+    let img = crate::image::decode(&jpeg()).unwrap();
+    let annotated = crate::image::draw_predictions(&img, &r.predictions);
+    assert_eq!(
+        std::fs::read(dir.join("cam1_od.jpg")).unwrap(),
+        crate::image::encode_jpeg(&annotated, 95).unwrap(),
+        "the annotated image as it was written before"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("cam1.jpg")).unwrap(),
+        jpeg(),
+        "the reference copy is the upload"
+    );
+    // The queue holds one save: with nothing draining it the next save is dropped, the reply
+    // is not held up.
+    h.script.push([det(1, 0), det(3, 0)]);
+    assert_eq!(label(&h.send("a.jpg").wait()), "c1");
+    assert_eq!(label(&h.send("b.jpg").wait()), "c3");
+    h.wait_for("the dropped save", || saver.dropped() == 1);
+    assert_eq!(saves.try_recv().unwrap().image_name, "a.jpg");
+    assert!(saves.try_recv().is_err());
+    h.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }

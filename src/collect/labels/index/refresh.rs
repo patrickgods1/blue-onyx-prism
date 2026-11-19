@@ -186,7 +186,7 @@ impl Index {
         let threads = parallel::walk_threads_over(candidates.len());
         let days = days_of(candidates);
         let walker = Walker::new(&self.dir);
-        parallel::map_all(days.len(), threads, &|i| {
+        parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
             let Some((key, day)) = days.get(i).filter(|_| !self.cancelled()) else {
                 return;
             };
@@ -251,10 +251,11 @@ impl Index {
         let threads = parallel::walk_threads_over(candidates.len());
         let days = days_of(candidates);
         let walker = Walker::new(&self.dir);
-        let shards = parallel::map_all(days.len(), threads, &|i| {
-            let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
-            Some(self.walk_shard(walker.clone(), key.clone(), day))
-        });
+        let shards =
+            parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
+                let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
+                Some(self.walk_shard(walker.clone(), key.clone(), day))
+            });
         before_swap();
         self.swap(Swap {
             whole: true,
@@ -341,12 +342,13 @@ impl Index {
         self.show_progress(days.iter().map(|(_, d)| d.len() as u64).sum());
         let threads = parallel::walk_threads_over(days.iter().map(|(_, d)| d.len()).sum());
         let walker = Walker::new(&self.dir);
-        let shards = parallel::map_all(days.len(), threads, &|i| {
-            let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
-            let shard = self.walk_shard(walker.clone(), key.clone(), day);
-            self.done.fetch_add(day.len() as u64, Ordering::AcqRel);
-            Some(shard)
-        });
+        let shards =
+            parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
+                let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
+                let shard = self.walk_shard(walker.clone(), key.clone(), day);
+                self.done.fetch_add(day.len() as u64, Ordering::AcqRel);
+                Some(shard)
+            });
         swap.shards = shards.into_iter().flatten().collect();
         before_swap();
         self.swap(swap);

@@ -32,6 +32,8 @@ pub struct CompareRun {
     pub scene: SceneFilter,
     /// The run's classes (head order).
     pub classes: Vec<String>,
+    /// Its class merges (`TrainRequest.rename`; an empty target drops the label).
+    pub rename: BTreeMap<String, String>,
     pub excluded: Excluded,
     /// What its training frames with ignore regions became (`RunSettings::ignore_mode`); None
     /// while the run has not started training.
@@ -362,6 +364,67 @@ fn value(r: &Row, c: &str) -> Option<f64> {
     .filter(|v| v.is_finite())
 }
 
+/// The figures of the Models tab's "Best first" order, in order: person recall, vehicle recall,
+/// AP50-95 on every held-out frame (higher is better each). What alerting sees comes first: a
+/// missed person is the costliest error of a camera model.
+pub type BestKeys = [Option<f64>; 3];
+
+/// [`BestKeys`] of a run's held-out benchmark (all None without one).
+pub fn best_keys(b: Option<&BenchSummary>) -> BestKeys {
+    let Some(b) = b else {
+        return [None; 3];
+    };
+    [
+        b.person_recall,
+        b.vehicle_recall,
+        b.by_scene.get("all").and_then(|a| a.ap50_95),
+    ]
+}
+
+/// Indices of `keys` best first: by each figure of [`BestKeys`] in turn, highest first, a
+/// missing (or not finite) figure after every present one; rows equal on all three keep their
+/// given order. Plain values, no noise rule: these are one run's figures on one held-out set,
+/// with no repeat to measure a noise from.
+pub fn best_order_by(keys: &[BestKeys]) -> Vec<usize> {
+    use std::cmp::Ordering;
+    // Highest first, a missing figure last.
+    let one = |x: Option<f64>, y: Option<f64>| match (
+        x.filter(|v| v.is_finite()),
+        y.filter(|v| v.is_finite()),
+    ) {
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    let mut idx: Vec<(usize, &BestKeys)> = keys.iter().enumerate().collect();
+    idx.sort_by(|(_, a), (_, b)| {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| one(*x, *y))
+            .find(|o| o.is_ne())
+            .unwrap_or(Ordering::Equal)
+    });
+    idx.into_iter().map(|(i, _)| i).collect()
+}
+
+/// The run rows of a comparison best first (indices into `rows`; [`best_order_by`] over person
+/// R, vehicle R, all AP50-95): the Comparison card's `data-best`. Routed rows are left out
+/// (they copy other rows' cells and stay pinned under the runs).
+pub fn best_order(rows: &[Row]) -> Vec<usize> {
+    let runs: Vec<(usize, BestKeys)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.routed)
+        .map(|(i, r)| (i, [r.person_recall, r.vehicle_recall, r.all.ap50_95]))
+        .collect();
+    let keys: Vec<BestKeys> = runs.iter().map(|(_, k)| *k).collect();
+    best_order_by(&keys)
+        .into_iter()
+        .filter_map(|k| runs.get(k).map(|(i, _)| *i))
+        .collect()
+}
+
 /// Build the comparison of `runs` (in queue order).
 pub fn compare(runs: &[CompareRun]) -> Comparison {
     let mut c = Comparison {
@@ -402,6 +465,37 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             c.warnings.push(
                 "the runs train different classes: AP is averaged over different classes".into(),
             );
+        }
+        if runs.iter().any(|r| r.rename != first.rename) {
+            let mut seen: Vec<(&String, &String)> = Vec::new();
+            for r in runs {
+                for e in &r.rename {
+                    if !seen.contains(&e) {
+                        seen.push(e);
+                    }
+                }
+            }
+            let parts: Vec<String> = seen
+                .iter()
+                .filter_map(|(from, to)| {
+                    let n = runs
+                        .iter()
+                        .filter(|r| r.rename.get(*from) == Some(*to))
+                        .count();
+                    (n < runs.len()).then(|| {
+                        let to = if to.is_empty() {
+                            "dropped"
+                        } else {
+                            to.as_str()
+                        };
+                        format!("{from} \u{2192} {to} on {n} of {}", runs.len())
+                    })
+                })
+                .collect();
+            c.warnings.push(format!(
+                "the runs merge classes differently ({})",
+                parts.join(", ")
+            ));
         }
         if runs.iter().any(|r| r.excluded != first.excluded) {
             c.warnings.push(
@@ -865,6 +959,7 @@ mod tests {
             model: "yolo26n".into(),
             scene,
             classes: vec!["person".into()],
+            rename: BTreeMap::new(),
             excluded: Excluded::Background,
             ignore: Some(IgnoreMode::Background),
             negative_share: Some(0.15),
@@ -925,6 +1020,53 @@ mod tests {
         b.empty_frames = Some(130);
         b.empty_frame_alerts = Some(alerts);
         r
+    }
+
+    #[test]
+    fn best_first_is_person_then_vehicle_recall_then_ap_with_missing_last() {
+        let k = |p: Option<f64>, v: Option<f64>, a: Option<f64>| -> BestKeys { [p, v, a] };
+        let keys = [
+            k(Some(0.8), Some(0.5), Some(0.30)),
+            k(Some(0.9), Some(0.1), Some(0.10)),
+            k(Some(0.8), Some(0.7), Some(0.20)),
+            k(None, Some(0.99), Some(0.99)),
+            k(Some(0.8), Some(0.7), Some(0.25)),
+            k(Some(f64::NAN), None, None),
+            k(Some(0.8), None, Some(0.9)),
+            k(Some(0.8), Some(0.5), Some(0.30)),
+        ];
+        // Person R first; equal person R: vehicle R; equal both: AP50-95; a missing figure after
+        // the present ones (NaN counts as missing); an exact tie keeps the given order.
+        assert_eq!(best_order_by(&keys), [1, 4, 2, 0, 7, 6, 3, 5]);
+        assert!(best_order_by(&[]).is_empty());
+        // From a benchmark summary: person R, vehicle R, AP50-95 on every held-out frame.
+        let b = alerting(run("x", SceneFilter::DAY, 0.6, 0.3, 0.3, 10.0), 0.7, 0.4, 3).bench;
+        let got = best_keys(b.as_ref());
+        assert_eq!((got[0], got[1]), (Some(0.7), Some(0.4)));
+        assert!((got[2].unwrap() - 0.4).abs() < 1e-9);
+        assert_eq!(best_keys(None), [None; 3]);
+    }
+
+    #[test]
+    fn the_comparison_best_order_leaves_routed_rows_out() {
+        let runs = [
+            alerting(
+                run("day-a", SceneFilter::DAY, 0.6, 0.2, 0.1, 10.0),
+                0.5,
+                0.5,
+                1,
+            ),
+            alerting(
+                run("night-a", SceneFilter::NIGHT_IR, 0.3, 0.5, 0.45, 11.0),
+                0.9,
+                0.2,
+                1,
+            ),
+            run("custom-a", SceneFilter::ALL_SCENES, 0.55, 0.4, 0.5, 9.0),
+        ];
+        let c = compare(&runs);
+        assert!(c.rows[3].routed);
+        assert_eq!(best_order(&c.rows), [1, 0, 2]);
     }
 
     #[test]

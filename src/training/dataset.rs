@@ -22,7 +22,8 @@
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
 //!    drop the copies of a frame that several exports hold (a held-out copy wins); hold out review
 //!    frames by whole camera days (unless the exports already did; one camera day: frame by frame,
-//!    with a warning) from **every** review frame, before any filter, so runs with other scene
+//!    with a warning; a camera day of [`Options::frozen_heldout`] is held out whatever split an
+//!    older export gave it) from **every** review frame, before any filter, so runs with other scene
 //!    filters are benchmarked on the same frames ([`Plan::heldout_fingerprint`]); judge the size
 //!    floor regions of the train / valid frames again at the run's input ([`restore_floor`]: one
 //!    not under the export's floor there is a box again) and compare the exports' floors
@@ -42,7 +43,8 @@
 //!    `negative_share` frames without objects in training (frames a reviewer confirmed empty or
 //!    rejected a box on first), take a
 //!    validation split of `val_share` of the review training frames as whole camera days
-//!    ([`valid`], never a class's last training box; the positives that leave with a validated
+//!    ([`valid`], never a class's last training box, more days for a class short of its floor of
+//!    validation boxes; the positives that leave with a validated
 //!    day for their ignore regions no longer count for the negatives, which are trimmed to
 //!    match), and repeat the review frames
 //!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
@@ -60,6 +62,7 @@
 //!
 //! [`inventory`] counts the boxes per class and scene of the sources (the class picker).
 
+use super::file_id;
 use crate::benchmark::images::{self, Manifest, ManifestObject};
 use crate::collect::labels::bulk;
 use crate::collect::labels::export::{
@@ -73,9 +76,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub mod balance;
+pub mod reuse;
 mod valid;
 pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
-pub use valid::valid_groups_text;
+pub use valid::{VALID_CLASS_FLOORS, valid_groups_text};
 
 /// Which frames a run trains on, by scene: any combination of day, night and IR. None or all
 /// three = every frame (unknown scenes included). Serialized as its canonical string
@@ -1013,6 +1017,15 @@ pub fn read_public_set(dir: &Path, manifest: &Manifest) -> Result<Source> {
 // Plan
 // ---------------------------------------------------------------------------------------------
 
+/// One `from=to` class merge (CLI `--rename`, the Train tab's Merge classes): both sides trimmed,
+/// `from` not empty, an empty `to` drops the label.
+pub(crate) fn parse_rename(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(a, b)| (a.trim().to_string(), b.trim().to_string()))
+        .filter(|(a, _)| !a.is_empty())
+        .ok_or_else(|| format!("'{s}' is not from=to"))
+}
+
 /// How a run assembles its data.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Options {
@@ -1057,7 +1070,22 @@ pub struct Options {
     /// no comparison (the floor is off, or a caller that does not say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_floor: Option<SizeFloor>,
+    /// The `camera/day` keys of the folder under review's `heldout-days.json`
+    /// ([`crate::collect::labels::heldout`]): a review frame of one is held out even when an
+    /// older export put it in its train split (step 3). Empty = none listed, or no folder.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub frozen_heldout: BTreeSet<String>,
+    /// The short side the train / valid images are written at ([`prepare_image`], the recipe's
+    /// `TrainRecipe::prepared_short_side`): a larger one is downscaled, a smaller or equal one
+    /// linked as it is. The held-out frames always stay full size (the benchmark scores them like
+    /// a camera's). None = every image linked as it is (`train prepare`, which names no model).
+    /// Recorded at the top of `dataset.json` ([`Summary::prepared_short_side`]).
+    #[serde(default, skip_serializing)]
+    pub prepared_short_side: Option<u32>,
 }
+
+/// Most camera days the plan's warning on frozen held-out days names.
+const FROZEN_LISTED: usize = 10;
 
 /// Default `Options.min_valid`.
 pub const MIN_VALID: usize = 50;
@@ -1089,6 +1117,8 @@ impl Default for Options {
             static_cap: default_static_cap(),
             imgsz: None,
             size_floor: None,
+            frozen_heldout: BTreeSet::new(),
+            prepared_short_side: None,
         }
     }
 }
@@ -1168,6 +1198,13 @@ pub struct Stats {
     /// `camera/day` groups validated on, each whole and sorted (empty when validation fell back
     /// to the frame split, see [`valid`]).
     pub valid_groups: Vec<String>,
+    /// Validation boxes per class of the run (classes without any left out).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub valid_boxes: BTreeMap<String, usize>,
+    /// Review frames held out for a camera day of [`Options::frozen_heldout`] that their export
+    /// put in its train split (an export older than the day's listing).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frozen_moved: usize,
     /// Training frames the balance cap left out ([`Balance::cap_dominant`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub balance_dropped: usize,
@@ -1886,18 +1923,58 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     // leaves both sides; else the same held-out share as a folder without a split: an export of
     // one camera day has nothing to split, and its one group goes all to train or (by its hash)
     // all to val. All held out stays as it is when public frames train.
-    let is_held = |r: FrameRef| frame(r).is_some_and(|f| f.split == SplitHint::Heldout);
+    // A camera day held out for good (`heldout-days.json`) is held out whatever split its export
+    // gave it: an export older than the day's listing has it in train.
+    let frozen = |r: FrameRef| {
+        !opts.frozen_heldout.is_empty()
+            && frame(r).is_some_and(|f| opts.frozen_heldout.contains(&group_key(f)))
+    };
+    let is_held =
+        |r: FrameRef| frame(r).is_some_and(|f| f.split == SplitHint::Heldout) || frozen(r);
     let hinted = review.iter().any(|&r| is_held(r))
         && (review.iter().any(|&r| !is_held(r)) || !public.is_empty());
-    let (pool, heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
-        review
+    // Frames of a frozen day are held out on every path: also when the export's split is not
+    // used (every review frame held out, or no held-out share), the share split below only sees
+    // the other frames.
+    let (frozen_frames, open): (Vec<FrameRef>, Vec<FrameRef>) =
+        review.iter().partition(|&&r| frozen(r));
+    let (pool, mut heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
+        let moved: Vec<FrameRef> = review
             .iter()
-            .partition(|&&r| frame(r).is_none_or(|f| f.split != SplitHint::Heldout))
-    } else if opts.heldout_share <= 0.0 || review.is_empty() {
-        (review.clone(), Vec::new())
+            .copied()
+            .filter(|&r| frozen(r) && frame(r).is_some_and(|f| f.split != SplitHint::Heldout))
+            .collect();
+        if !moved.is_empty() {
+            let days: BTreeSet<String> = moved
+                .iter()
+                .filter_map(|&r| frame(r).map(group_key))
+                .collect();
+            p.stats.frozen_moved = moved.len();
+            let more = days.len().saturating_sub(FROZEN_LISTED);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            p.warnings.push(format!(
+                "{} frame(s) of {} camera day(s) held out for good ({}{more}) are in the train \
+                 split of an older export: they are held out here, never trained on; export again \
+                 so the export agrees",
+                moved.len(),
+                days.len(),
+                days.iter()
+                    .take(FROZEN_LISTED)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        review.iter().partition(|&&r| !is_held(r))
+    } else if opts.heldout_share <= 0.0 || open.is_empty() {
+        (open.clone(), Vec::new())
     } else {
         let mut groups: BTreeMap<String, Vec<FrameRef>> = BTreeMap::new();
-        for &r in &review {
+        for &r in &open {
             if let Some(f) = frame(r) {
                 groups.entry(group_key(f)).or_default().push(r);
             }
@@ -1905,7 +1982,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         if groups.len() >= 2 {
             let mut keys: Vec<&String> = groups.keys().collect();
             keys.sort_by_key(|k| (rank(opts.seed, k), (*k).clone()));
-            let want = share_of(review.len(), opts.heldout_share).max(1);
+            let want = share_of(open.len(), opts.heldout_share).max(1);
             let mut held = Vec::new();
             let mut held_groups = Vec::new();
             // Never hold out every group.
@@ -1918,7 +1995,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             }
             p.stats.heldout_groups = held_groups;
             let held_set: BTreeSet<FrameRef> = held.iter().copied().collect();
-            let rest = review
+            let rest = open
                 .iter()
                 .copied()
                 .filter(|r| !held_set.contains(r))
@@ -1932,7 +2009,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                  for a fair measurement"
                     .into(),
             );
-            let mut v = review.clone();
+            let mut v = open.clone();
             v.sort_by_key(|r| rank(opts.seed, &key_of(*r)));
             let n = share_of(v.len(), opts.heldout_share)
                 .max(1)
@@ -1941,6 +2018,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             (v, held)
         }
     };
+    if !hinted {
+        heldout.extend(frozen_frames.iter().copied());
+    }
     p.heldout = heldout;
     p.heldout.sort_unstable();
     p.heldout_fingerprint = fingerprint(p.heldout.iter().map(|&r| match frame(r) {
@@ -2201,6 +2281,15 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     p.stats.ignore_valid_day = valid_day.len();
     p.stats.valid_groups = split.groups;
     p.warnings.extend(split.warning);
+    p.warnings.extend(split.notes);
+    for &r in &valid {
+        let Some(f) = frame(r) else { continue };
+        for (c, n) in p.classes.iter().zip(class_boxes(f, opts, &p.classes)) {
+            if n > 0 {
+                *p.stats.valid_boxes.entry(c.clone()).or_default() += n;
+            }
+        }
+    }
     if valid.is_empty() {
         p.warnings.push(
             "too few frames for a validation split: the trainer validates on its training frames"
@@ -2484,6 +2573,10 @@ pub struct Summary<'a> {
     pub warnings: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<&'a BalanceReport>,
+    /// [`Options::prepared_short_side`] (null = every image as it was).
+    pub prepared_short_side: Option<u32>,
+    /// Train / valid images written downscaled to it (the others are links or copies).
+    pub resized_images: usize,
 }
 
 /// One source in `dataset.json`.
@@ -2516,13 +2609,180 @@ fn safe_name(s: &str) -> String {
     out
 }
 
+/// Whether `path` is a JPEG (by its bytes: it starts with the SOI marker) that does not end with
+/// the EOI marker: the one kind of image a trainer rewrites ("corrupt JPEG restored and saved").
+/// Ultralytics does it through a temporary file and a rename (`_replace_image`, "so hard links to
+/// the original are never modified", read in the installed 8.4.184), so the bytes behind a link
+/// stay; such a file is still copied rather than linked, so no trainer version's way of writing it
+/// back can ever reach another name of the file (the review export's, the dataset frame's, another
+/// run's). An unreadable file is not one.
+pub fn jpeg_without_end(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let (mut head, mut tail) = ([0u8; 2], [0u8; 2]);
+    let read = (|| -> std::io::Result<()> {
+        f.read_exact(&mut head)?;
+        f.seek(SeekFrom::End(-2))?;
+        f.read_exact(&mut tail)
+    })();
+    read.is_ok() && head == [0xFF, 0xD8] && tail != [0xFF, 0xD9]
+}
+
+/// Hard-link `src` to `dst`, else copy it. A JPEG without its end marker is always copied
+/// ([`jpeg_without_end`]): the trainer writes it back.
 fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
-    if std::fs::hard_link(src, dst).is_ok() {
+    if !jpeg_without_end(src) && std::fs::hard_link(src, dst).is_ok() {
         return Ok(());
     }
     std::fs::copy(src, dst)
         .map(|_| ())
         .with_context(|| format!("copying {} to {}", src.display(), dst.display()))
+}
+
+/// JPEG quality of a downscaled image ([`prepare_image`]): high enough that the re-encode adds
+/// little to what the camera's own compression lost (4:4:4 chroma at 90 and above, the encoder's
+/// rule).
+pub const PREPARED_JPEG_QUALITY: u8 = 95;
+
+/// The size of an image of `(w, h)` downscaled so its short side is `short`, the long side scaled
+/// alike and rounded (at least 1); None when the short side is already at most `short` (never
+/// upscaled) or a side is 0. Pure.
+pub fn prepared_size((w, h): (u32, u32), short: u32) -> Option<(u32, u32)> {
+    let min = w.min(h);
+    if min == 0 || short == 0 || min <= short {
+        return None;
+    }
+    let long = w.max(h);
+    // Integer rounding of long * short / min (no float edge cases; fits u64).
+    let scaled = (u64::from(long) * u64::from(short) * 2 + u64::from(min)) / (u64::from(min) * 2);
+    let scaled = u32::try_from(scaled.max(1)).unwrap_or(u32::MAX);
+    Some(if w <= h {
+        (short, scaled)
+    } else {
+        (scaled, short)
+    })
+}
+
+/// Which encoder [`prepare_image`] writes a file of this name with: JPEG or PNG by extension,
+/// None for anything else (linked as it is).
+fn prepared_format(name: &Path) -> Option<::image::ImageFormat> {
+    let ext = name.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some(::image::ImageFormat::Jpeg),
+        "png" => Some(::image::ImageFormat::Png),
+        _ => None,
+    }
+}
+
+/// Write the train / valid image `src` to `dst` with its short side at most `short`: a larger
+/// image is decoded, downscaled ([`prepared_size`]; a separable Catmull-Rom convolution scaled to
+/// the ratio, so it filters like an antialiased bicubic, sharper than bilinear without
+/// Lanczos3's ringing around the bright edges of night and IR frames) and encoded as the format
+/// its name says (JPEG at [`PREPARED_JPEG_QUALITY`], PNG lossless), through a temporary file in
+/// the same folder and a rename; anything else (at or under the size, another format, a JPEG
+/// whose EXIF orientation is not the identity, which the encoder would drop, a file that does not
+/// decode, which the trainer reports as before) is linked or copied as it is. Returns the written size when it was downscaled, else None (the source's).
+pub fn prepare_image(src: &Path, dst: &Path, short: u32) -> Result<Option<(u32, u32)>> {
+    let Some(format) = prepared_format(dst) else {
+        link_or_copy(src, dst)?;
+        return Ok(None);
+    };
+    let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
+    let (dims, oriented) = match format {
+        ::image::ImageFormat::Jpeg => {
+            use ::image::ImageDecoder;
+            match ::image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes)) {
+                Ok(mut d) => {
+                    let o = d
+                        .orientation()
+                        .unwrap_or(::image::metadata::Orientation::NoTransforms);
+                    (
+                        Some(d.dimensions()),
+                        o != ::image::metadata::Orientation::NoTransforms,
+                    )
+                }
+                Err(_) => (None, false),
+            }
+        }
+        _ => (
+            ::image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok()),
+            false,
+        ),
+    };
+    // An unreadable header is linked too: the trainer reports the damaged file, as before.
+    let Some(size) = dims
+        .filter(|_| !oriented)
+        .and_then(|d| prepared_size(d, short))
+    else {
+        link_or_copy(src, dst)?;
+        return Ok(None);
+    };
+    // A body that does not decode (or is over the decode limit) likewise.
+    let Ok(img) = crate::image::decode(&bytes) else {
+        link_or_copy(src, dst)?;
+        return Ok(None);
+    };
+    let small = resize_rgb(&img, size)?;
+    let out = match format {
+        ::image::ImageFormat::Jpeg => crate::image::encode_jpeg(&small, PREPARED_JPEG_QUALITY)?,
+        _ => {
+            use ::image::ImageEncoder;
+            let mut out = Vec::new();
+            ::image::codecs::png::PngEncoder::new(&mut out)
+                .write_image(
+                    &small.rgb,
+                    small.width,
+                    small.height,
+                    ::image::ExtendedColorType::Rgb8,
+                )
+                .context("encoding PNG")?;
+            out
+        }
+    };
+    write_renamed(dst, &out)?;
+    Ok(Some(size))
+}
+
+/// `img` resized to `(w, h)` with the Catmull-Rom convolution ([`prepare_image`]).
+fn resize_rgb(img: &crate::image::RgbImage, (w, h): (u32, u32)) -> Result<crate::image::RgbImage> {
+    use fast_image_resize::images::{Image, ImageRef};
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+    let src = ImageRef::new(img.width, img.height, &img.rgb, PixelType::U8x3)
+        .context("source image view")?;
+    let mut dst = Image::new(w, h, PixelType::U8x3);
+    Resizer::new()
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
+        )
+        .context("resizing image")?;
+    Ok(crate::image::RgbImage {
+        width: w,
+        height: h,
+        rgb: dst.into_vec(),
+    })
+}
+
+/// Write `bytes` to `path` through `.<name>.tmp` beside it and a rename: a crash never leaves a
+/// half-written image under the name the lists give (the next run rebuilds the folder anyway, so
+/// no fsync).
+fn write_renamed(path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    let r = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.with_context(|| format!("writing {}", path.display()))
 }
 
 fn yolo_line(class: usize, b: &YoloBox) -> String {
@@ -2564,8 +2824,53 @@ pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter, random_pick: bool)
 /// Write `plan` into `out` (created; must not exist or be empty). The frames as the plan read them
 /// ([`at_run_input`]: size floor regions a run at `opts.imgsz` can learn are boxes).
 pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Result<Prepared> {
+    write_reusing(sources, plan, opts, out, &[]).map(|(p, _)| p)
+}
+
+/// What [`write_reusing`] took from a donor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reused {
+    /// The donor dataset folder whose plan matched; None = none did.
+    pub from: Option<PathBuf>,
+    /// Image files hard-linked from it, of `images` written in all.
+    pub linked: usize,
+    pub images: usize,
+}
+
+impl Reused {
+    /// The run log's line, when anything was linked.
+    pub fn describe(&self) -> Option<String> {
+        let from = self.from.as_ref().filter(|_| self.linked > 0)?;
+        Some(format!(
+            "{} of {} image files hard-linked from the identical dataset of {} (the same plan, \
+             sources unchanged) instead of written again",
+            self.linked,
+            self.images,
+            from.display()
+        ))
+    }
+}
+
+/// [`write`], hard-linking the images of the first of `donors` (dataset folders of earlier runs)
+/// whose plan is the same instead of writing them again, where that is safe ([`reuse`]); every
+/// image it cannot link is written from its source as by [`write`]. Records its own images
+/// ([`reuse::PREPARED_FILES_FILE`]) for a later run.
+pub fn write_reusing(
+    sources: &[Source],
+    plan: &Plan,
+    opts: &Options,
+    out: &Path,
+    donors: &[PathBuf],
+) -> Result<(Prepared, Reused)> {
     let at_input = at_run_input(sources, plan, opts);
     let sources: &[Source] = &at_input;
+    let plan_fp = reuse::plan_fingerprint(sources, plan, opts);
+    let donor = reuse::find_donor(donors, &plan_fp);
+    let mut recorder = reuse::Recorder::default();
+    let mut reused = Reused {
+        from: donor.as_ref().map(|d| d.dir.clone()),
+        ..Reused::default()
+    };
     if out.exists()
         && std::fs::read_dir(out)
             .with_context(|| format!("reading {}", out.display()))?
@@ -2647,10 +2952,12 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         }
         Ok(objects)
     };
+    // The train / valid images to write (each once), in plan order; written together below.
     let mut written: BTreeSet<FrameRef> = BTreeSet::new();
-    let put = |r: FrameRef, f: &Frame, n: &str, written: &mut BTreeSet<FrameRef>| -> Result<()> {
+    let mut to_write: Vec<(FrameRef, String)> = Vec::new();
+    let mut put = |r: FrameRef, f: &Frame, n: &str| -> Result<()> {
         if written.insert(r) {
-            link_or_copy(&f.image, &out.join("images").join(n))?;
+            to_write.push((r, n.to_string()));
             let txt = out
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(n))));
@@ -2698,28 +3005,64 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
     // Where each image of `images/` came from ([`IMAGE_SOURCES_FILE`]).
     let mut image_sources: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut train_lines = String::new();
-    let mut train_entries = Vec::new();
+    let mut train_refs = Vec::new();
     for &(r, repeats) in &plan.train {
         let f = frame(r)?;
         let n = name_of(r, f);
-        put(r, f, &n, &mut written)?;
+        put(r, f, &n)?;
         image_sources.insert(n.clone(), f.image.clone());
-        let s = size_of(r, f)?;
         for _ in 0..repeats.max(1) {
             train_lines.push_str(&format!("./images/{n}\n"));
-            train_entries.push((r, n.clone(), s));
+            train_refs.push((r, n.clone()));
         }
     }
     let mut valid_lines = String::new();
-    let mut valid_entries = Vec::new();
+    let mut valid_refs = Vec::new();
     for &r in &plan.valid {
         let f = frame(r)?;
         let n = name_of(r, f);
-        put(r, f, &n, &mut written)?;
+        put(r, f, &n)?;
         image_sources.insert(n.clone(), f.image.clone());
         valid_lines.push_str(&format!("./images/{n}\n"));
-        valid_entries.push((r, n.clone(), size_of(r, f)?));
+        valid_refs.push((r, n.clone()));
     }
+    // The images (downscaled to the run's need, or linked), in parallel.
+    let jobs: Vec<(FrameRef, &Path, &str)> = to_write
+        .iter()
+        .map(|(r, n)| Ok((*r, frame(*r)?.image.as_path(), n.as_str())))
+        .collect::<Result<_>>()?;
+    let written = write_images(
+        &jobs,
+        opts.prepared_short_side,
+        &out.join("images"),
+        donor.as_ref(),
+    )?;
+    let mut resized: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
+    for (&(r, src, n), w) in jobs.iter().zip(&written) {
+        if let Some(s) = w.resized {
+            resized.insert(r, s);
+        }
+        reused.images += 1;
+        reused.linked += usize::from(w.linked);
+        let dst = out.join("images").join(n);
+        recorder.add(format!("images/{n}"), src, w.before, &dst, w.resized);
+    }
+    // COCO sizes: the written image's (labels are normalized, so they hold either way).
+    let mut entry = |(r, n): (FrameRef, String)| -> Result<(FrameRef, String, (u32, u32))> {
+        let s = match resized.get(&r) {
+            Some(s) => *s,
+            None => size_of(r, frame(r)?)?,
+        };
+        Ok((r, n, s))
+    };
+    let train_entries: Vec<_> = train_refs
+        .into_iter()
+        .map(&mut entry)
+        .collect::<Result<_>>()?;
+    let valid_entries: Vec<_> = valid_refs
+        .into_iter()
+        .map(&mut entry)
+        .collect::<Result<_>>()?;
     let write_text = |name: &str, text: &str| -> Result<()> {
         std::fs::write(out.join(name), text)
             .with_context(|| format!("writing {}", out.join(name).display()))
@@ -2775,7 +3118,15 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
                 continue;
             };
             let n = name_of(r, f);
-            link_or_copy(&f.image, &hd.join("images").join(&n))?;
+            let dst = hd.join("images").join(&n);
+            let rel = format!("heldout/images/{n}");
+            let before = file_id::FileId::of(&f.image);
+            reused.images += 1;
+            match donor.as_ref().and_then(|d| d.link(&rel, &f.image, &dst)) {
+                Some(_) => reused.linked += 1,
+                None => link_or_copy(&f.image, &dst)?,
+            }
+            recorder.add(rel, &f.image, before, &dst, None);
             let txt = hd
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(&n))));
@@ -2840,9 +3191,13 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         heldout_fingerprint: &plan.heldout_fingerprint,
         warnings: &warnings,
         balance: plan.balance.as_ref(),
+        prepared_short_side: opts.prepared_short_side,
+        resized_images: resized.len(),
     };
     write_text("dataset.json", &serde_json::to_string_pretty(&summary)?)?;
-    Ok(Prepared {
+    // Last: its presence says the folder is whole (a later run may link from it).
+    recorder.write(out, plan_fp)?;
+    let prepared = Prepared {
         dir: out.to_path_buf(),
         classes: classes.clone(),
         train_images: train_entries.len(),
@@ -2854,7 +3209,70 @@ pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Res
         heldout_fingerprint: plan.heldout_fingerprint.clone(),
         warnings,
         balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
-    })
+    };
+    Ok((prepared, reused))
+}
+
+/// How [`write_images`] wrote one image.
+#[derive(Debug, Clone, Copy)]
+struct WrittenImage {
+    /// The size it was downscaled to, if it was.
+    resized: Option<(u32, u32)>,
+    /// The source's identity before it was written ([`reuse::Recorder::add`]).
+    before: Option<file_id::FileId>,
+    /// Hard-linked from the donor.
+    linked: bool,
+}
+
+/// Write the images `jobs` (frame, source, file name in `dir`) of the train / valid splits: each
+/// hard-linked from `donor` when it may ([`reuse::Donor::link`]), else through [`prepare_image`] at
+/// `short`, or linked as it is when None. In parallel ([`crate::parallel::map_all`] on all
+/// physical cores but one); the first error is returned. Returns how each was written, in `jobs`
+/// order.
+fn write_images(
+    jobs: &[(FrameRef, &Path, &str)],
+    short: Option<u32>,
+    dir: &Path,
+    donor: Option<&reuse::Donor>,
+) -> Result<Vec<WrittenImage>> {
+    let one = |i: usize| -> Result<Option<WrittenImage>> {
+        let Some(&(_, src, n)) = jobs.get(i) else {
+            return Ok(None);
+        };
+        let dst = dir.join(n);
+        let before = file_id::FileId::of(src);
+        if let Some(resized) = donor.and_then(|d| d.link(&format!("images/{n}"), src, &dst)) {
+            return Ok(Some(WrittenImage {
+                resized,
+                before,
+                linked: true,
+            }));
+        }
+        let resized = match short {
+            Some(short) => prepare_image(src, &dst, short)?,
+            None => {
+                link_or_copy(src, &dst)?;
+                None
+            }
+        };
+        Ok(Some(WrittenImage {
+            resized,
+            before,
+            linked: false,
+        }))
+    };
+    // Linking is a syscall per file (a read walk's thread count); a downscale is CPU work.
+    let threads = match short {
+        Some(_) => crate::backend::cpu_threads::effective(0),
+        None => crate::parallel::walk_threads_over(jobs.len()),
+    };
+    let mut out = Vec::with_capacity(jobs.len());
+    for d in crate::parallel::map_all(jobs.len(), threads, &one) {
+        if let Some(w) = d? {
+            out.push(w);
+        }
+    }
+    Ok(out)
 }
 
 /// The file of a prepared dataset that names, for every image in `images/` (the names

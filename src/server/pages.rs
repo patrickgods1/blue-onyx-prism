@@ -56,6 +56,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("style.css", CSS),
     asset!("live.js", JS),
     asset!("time.js", JS),
+    asset!("sort.js", JS),
     asset!("bench-glossary.js", JS),
     asset!("bench-table.js", JS),
     asset!("bench-charts.js", JS),
@@ -191,6 +192,9 @@ struct ModelRow {
     queue: String,
     /// What a restart would change for this model ("" = nothing).
     pending: String,
+    /// Its place in the benchmark ranking (`data-best`; None = not benchmarked: after the
+    /// ranked models, in config order).
+    best: Option<usize>,
 }
 
 /// Distinct execution providers of the loaded models, in config order.
@@ -248,12 +252,16 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
         let snap = devices_snapshot(&state);
         let default = default_name(reg);
         let pending = crate::config_merge::pending(&state.running(), &state.config_read());
+        let ranks = super::benchmark::model_ranks(&state.config_path);
         let models = reg
             .workers()
             .iter()
             .map(|w| {
                 let (state, state_class, state_detail) = state_view(w);
                 ModelRow {
+                    best: ranks
+                        .get(&crate::registry::normalize_name(&w.name))
+                        .copied(),
                     pending: pending.for_model(&w.name).join("; "),
                     name: w.name.clone(),
                     is_default: w.name == default,
@@ -376,6 +384,8 @@ struct StatsRow {
     queue: String,
     /// Inference, process, round trip.
     timings: [TimingCells; 3],
+    /// Its place in the benchmark ranking (as [`ModelRow::best`]).
+    best: Option<usize>,
 }
 
 #[derive(Template)]
@@ -425,6 +435,7 @@ pub(super) fn ort_version(reg: &ModelRegistry) -> Option<String> {
 }
 
 pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
+    let ranks = ranks(&state).await;
     let reg = &state.registry;
     let default = default_name(reg);
     let ortv = ort_version(reg);
@@ -436,6 +447,9 @@ pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
             let dev = w.device.read().ok().and_then(|d| d.clone());
             let (state, state_class, state_detail) = state_view(w);
             StatsRow {
+                best: ranks
+                    .get(&crate::registry::normalize_name(&w.name))
+                    .copied(),
                 name: w.name.clone(),
                 is_default: w.name == default,
                 state,
@@ -471,7 +485,14 @@ pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
     })
 }
 
+/// [`super::benchmark::model_ranks`] off the runtime threads (a new results file is parsed).
+async fn ranks(state: &Arc<AppState>) -> Arc<std::collections::HashMap<String, usize>> {
+    let path = state.config_path.clone();
+    blocking(move || super::benchmark::model_ranks(&path)).await
+}
+
 pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let ranks = ranks(&state).await;
     let reg = &state.registry;
     let default = reg.default_model().map(|w| w.name.clone());
     let ortv = ort_version(reg);
@@ -487,6 +508,8 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
             let (short, class, detail) = state_view(w);
             serde_json::json!({
                 "name": w.name,
+                // The benchmark rank (Stats' `data-best`); null = not benchmarked.
+                "best": ranks.get(&crate::registry::normalize_name(&w.name)),
                 "default": default.as_deref() == Some(w.name.as_str()),
                 "state": w.state.describe(),
                 // Short state + detail as the pages show them (Home, Stats): the failure,
@@ -985,6 +1008,44 @@ mod tests {
         assert_eq!(format_uptime(Duration::from_secs(90_061)), "1d 1h 1m 1s");
     }
 
+    /// Home and Stats rank their rows by the benchmark (`data-best` = the model's place in the
+    /// cross-model ranking; `/stats.json` `best`), unbenchmarked models without one (after the
+    /// ranked ones, in config order).
+    #[tokio::test]
+    async fn home_and_stats_carry_the_benchmark_rank() {
+        use crate::benchmark::report::test_support::{graded, model};
+        use crate::benchmark::report::{BenchmarkResults, HardwareSummary, RuntimeVersions};
+        let state = test_state();
+        let (_, home) = get_text(&state, "/").await;
+        assert!(home.contains("data-sort=\"models\" data-sort-default=\"best\""));
+        assert!(!home.contains("data-best="), "no results, no ranks");
+        let mut a = model(vec![graded("openvino:cpu", 10.0, Some(0.9))], None);
+        a.model = "<b>evil</b>".into();
+        let mut b = model(vec![graded("openvino:cpu", 10.0, Some(0.2))], None);
+        b.model = "other".into();
+        BenchmarkResults::new(
+            HardwareSummary::default(),
+            RuntimeVersions::default(),
+            vec![b, a],
+        )
+        .save(&crate::benchmark::results_path(&state.config_path))
+        .unwrap();
+        let (_, home) = get_text(&state, "/").await;
+        assert!(
+            home.contains("data-model=\"&#60;b&#62;evil&#60;/b&#62;\" data-best=\"1\">"),
+            "{home}"
+        );
+        assert!(home.contains("<tr class=\"st-fail\" data-model=\"ipcam-general\">"));
+        let (_, stats) = get_text(&state, "/stats").await;
+        assert!(stats.contains("data-sort=\"models\" data-sort-default=\"best\""));
+        assert!(stats.contains("data-best=\"1\">"), "{stats}");
+        let (_, json) = get_text(&state, "/stats.json").await;
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["models"][0]["best"].is_null(), "{v}");
+        assert_eq!(v["models"][1]["best"], 1);
+        assert!(static_file("stats.js").is_some_and(|js| js.contains("\"data-best\"")));
+    }
+
     #[tokio::test]
     async fn pages_render_and_escape() {
         let state = test_state();
@@ -1004,7 +1065,7 @@ mod tests {
         assert!(home.contains(
             "<td>Failed:<br><span class=\"detail\">model file not found: x.onnx</span></td>"
         ));
-        assert!(home.contains("<tr class=\"st-fail\">"));
+        assert!(home.contains("<tr class=\"st-fail\" data-model=\"ipcam-general\">"));
         // A restart badge's reasons open on a tap (live.js PrismTip), not only as a title.
         assert!(
             home.contains("<button type=\"button\" class=\"term tag restart pending-badge\" data-model=\"ipcam-general\" data-tip=\""),
@@ -1175,6 +1236,7 @@ mod tests {
         }
         for name in [
             "live.js",
+            "sort.js",
             "benchmark.js",
             "class-picker.js",
             "model-picker.js",
@@ -2007,5 +2069,83 @@ mod tests {
         }
         let js = static_file("browse.js").unwrap();
         assert!(js.contains("(pointer: fine)") && js.contains("browse-close"));
+    }
+
+    /// The "Start anyway" box beside a memory commit refusal: in each page with a preview that
+    /// shows one, a hidden, disabled checkbox row (named `ignore_memory_check` where a native form or
+    /// the page posts it), shown only by `PrismMemory.sync` with the preview's `memory`; and a
+    /// hidden check row stays hidden (`form label` sets display).
+    #[test]
+    fn the_start_anyway_box_is_hidden_until_a_preview_has_a_memory_refusal() {
+        for (page, id, named) in [
+            (
+                include_str!("../../templates/train/autolabel.html"),
+                "al-memory-anyway",
+                true,
+            ),
+            (
+                include_str!("../../templates/train/refine.html"),
+                "refine-memory-anyway",
+                true,
+            ),
+            (
+                include_str!("../../templates/train/train.html"),
+                "train-memory-anyway",
+                true,
+            ),
+            (
+                include_str!("../../templates/train/review.html"),
+                "rv-suggest-anyway",
+                false,
+            ),
+        ] {
+            let at = page
+                .find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("{id} missing"));
+            let start = page[..at].rfind("<label").unwrap();
+            let end = at + page[at..].find("</label>").unwrap();
+            let row = &page[start..end];
+            assert!(row.contains(" hidden>"), "{id} is not hidden: {row}");
+            assert!(
+                row.contains("type=\"checkbox\"") && row.contains(" disabled>"),
+                "{row}"
+            );
+            assert!(row.contains("data-memory-label"), "{row}");
+            assert_eq!(row.contains("name=\"ignore_memory_check\""), named, "{row}");
+            assert!(!row.contains(" checked"), "it starts unticked: {row}");
+        }
+        for (js, id) in [
+            ("training.js", "al-memory-anyway"),
+            ("training.js", "train-memory-anyway"),
+            ("train-refine.js", "refine-memory-anyway"),
+            ("review.js", "rv-suggest-anyway"),
+        ] {
+            let text = static_file(js).unwrap();
+            assert!(
+                text.contains(id) && text.contains("PrismMemory.sync"),
+                "{js}: {id}"
+            );
+        }
+        assert!(
+            static_file("live.js")
+                .unwrap()
+                .contains("root.PrismMemory = {")
+        );
+        assert!(
+            static_file("style.css")
+                .unwrap()
+                .contains("label.check[hidden] { display: none; }")
+        );
+        // The JSON pages send the field by name.
+        assert!(
+            static_file("train-refine.js")
+                .unwrap()
+                .contains("o.ignore_memory_check = true")
+        );
+        assert!(
+            static_file("review.js")
+                .unwrap()
+                .contains("body.ignore_memory_check = true")
+        );
     }
 }

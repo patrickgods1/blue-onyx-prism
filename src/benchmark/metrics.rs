@@ -500,7 +500,8 @@ pub struct ImageMatch {
 /// same class, IoU >= `iou_thr`. Labels must already be in one label space.
 #[allow(
     clippy::indexing_slicing,
-    reason = "i < preds.len() (from 0..preds.len()) and j < gt.len() (from enumerate);               `out.pred`/`out.pred_gt` have preds.len() entries, `out.gt_matched` gt.len()"
+    reason = "i < preds.len() (from 0..preds.len()) and j < gt.len() (from enumerate); \
+     `out.pred`/`out.pred_gt` have preds.len() entries, `out.gt_matched` gt.len()"
 )]
 pub fn match_image(preds: &[PredBox], gt: &[GtBox], iou_thr: f32) -> ImageMatch {
     let mut order: Vec<usize> = (0..preds.len()).collect();

@@ -3361,7 +3361,7 @@ Multipart parse (image `Bytes` copy, `HashMap` of text fields), one `oneshot`, r
   - `--report <path>` via a plain `std::fs::write` (export.rs:878).
   - Compiled-model cache dir (`cache_dir`) is only listed (`cache_files`) to detect a hit or miss.
 - **Parsed external content**: `benchmark.json` (serde_json, error not panic), dataset images (decoder), model files (backends). No archives are extracted and no programs run in these files. Dataset downloads are delegated to `resources::actions::download` and `resources::commands::fetch`.
-- **Threads/channels**: one detached `benchmark` thread per service run (no JoinHandle). Progress is published through `Mutex<Inner>`. Cancel is an `AtomicBool` checked per iteration, per device and per download poll (250 ms). Compile and model load are not interruptible.
+- **Threads/channels**: one detached `benchmark` thread per service run (no JoinHandle); since phase 3.4 each device's timed loop adds a scoped `bench-read` thread (read ahead, joined before the device's run returns; see "Benchmark read ahead and CPU-only priority" below). Progress is published through `Mutex<Inner>`. Cancel is an `AtomicBool` checked per iteration, per device and per download poll (250 ms). Compile and model load are not interruptible.
 - **Locks**: `Inner` (service) and `Mutex<Runtimes>` (shared with registry workers) never nest. The runtimes lock is held only for plan, selection and compile. Benchmark inference on shared runtimes runs concurrently with production inference on the same device, which affects production latency during a run (by design).
 - **Memory**: the service keeps full per-image results for every finished model until the final save (BM-11). `Status` holds summaries only. `sweep` clones all finished device results after each device. Eval preds at 0.05 are uncapped per image.
 - **Cross-file observations (other reviewers' files)**: `server/benchmark.rs:756` loads and parses the whole `benchmark.json` (sync `std::fs` + serde) on every `/v1/benchmark/image` request inside an async handler. `server/live.rs:100` also calls `load_or_warn`.
@@ -3985,4 +3985,188 @@ Linking the 15 integration test binaries took 21.4 to 21.9 s of CPU time (25%) a
 Slowest units of a full build: this crate 30 s, `aws-lc-sys` build script 26 s, `moxcms` 5.3 s, `tokio` 4.4 s, `objc2-app-kit` 4.3 s, `syn` 4.2 s, `zlib-rs` 4.0 s, `image` 3.9 s, `chrono-tz` 3.8 s.
 
 A debug build reads `assets/` from the source tree on each request and embeds nothing, because any `include_str!` of a file makes cargo rebuild when it changes. So a debug binary moved off its source tree answers 500 for `/static/*`; a release build is unchanged. Templates stay compiled in: askama 0.16 has no runtime template loading, so a template edit still needs a rebuild.
+
+
+### OpenVINO GPU performance hint and cuDNN search (plan phase 3.6)
+
+*Release build of `perf/hints`, the dev box (i5-8600K, UHD 630 iGPU, GTX 1070 Ti), Windows 11, 2026-11-19. The
+user's own service ran rfdetr-nano on the same iGPU meanwhile with live Blue Iris traffic, so the iGPU numbers are
+noisy.*
+
+`performance_hint` (global and per model, `latency` | `throughput`; unset = the profile: LATENCY with 2 in flight
+on an integrated GPU, THROUGHPUT with up to 4 clamped to `NUM_STREAMS` on a discrete Intel GPU) chooses the
+OpenVINO hint of models on an OpenVINO GPU. `throughput` compiles with THROUGHPUT and keeps
+`OPTIMAL_NUMBER_OF_INFER_REQUESTS` in flight, at most `profile::THROUGHPUT_INFLIGHT_CAP` (4). On the UHD 630 the
+THROUGHPUT compile reported NUM_STREAMS=2 and OPTIMAL_NUMBER_OF_INFER_REQUESTS=4 (two per stream): no
+auto-batching, which the OpenVINO archive `setup-openvino` installs has no plugin for. (Switching it off through
+the Core's `ALLOW_AUTO_BATCHING` with the C API's empty device name fails: the name reaches the AUTO plugin,
+`property: ALLOW_AUTO_BATCHING: not supported`; the code no longer tries.) The GPU plugin's caching properties
+include `PERFORMANCE_HINT`, so the two hints never share a cached blob. CPU, NPU and ONNX Runtime ignore the key.
+
+**iGPU hint.** rfdetr-nano 384x384 on `openvino:gpu.0`, one 2688x1520 camera JPEG, open loop 30 s per rate
+(`scripts/research/hint_burst.ps1`, `test-blue-onyx-prism --rate`), runs in the order latency, throughput,
+latency. Latency in ms from the scheduled start.
+
+| hint | 4/s p50 | 4/s p99 | 8/s p50 | 8/s p99 | 12/s answers/s | 12/s p50 | 12/s failed |
+|---|---|---|---|---|---|---|---|
+| latency, run 1 | 160.6 | 188.7 | 142.8 | 172.5 | 9.10 | 4704 | 17 |
+| throughput | 149.6 | 184.3 | 143.0 | 171.9 | 9.48 | 4067 | 2 |
+| latency, run 2 | 155.4 | 178.6 | 145.3 | 185.6 | 9.04 | 4705 | 19 |
+
+Below saturation (4 and 8 per second) the two hints are within the noise of the two latency runs. Only when
+overloaded (12 per second, past what the iGPU serves) does `throughput` answer about 5% more frames per second,
+with fewer failures. The default stays unset (`latency` on an integrated GPU); `throughput` is there for a
+machine that runs at its limit.
+
+To repeat it: build `test-blue-onyx-prism`, run the service with the model on the iGPU, then
+`powershell -ExecutionPolicy Bypass -File scripts\research\hint_burst.ps1 -Model <name> -Image <camera jpeg>
+-Rates 4,8,12 -Duration 30`. The script never edits the config: it asks you to set `"performance_hint"` on the
+model's entry (a model reload) and press Enter once the model is Ready again.
+
+**cuDNN search.** `ort:cuda:0` on the GTX 1070 Ti, the `coco-cctv` set (40 images, 3 passes), runs in the order
+HEURISTIC, EXHAUSTIVE, HEURISTIC (`BOP_CUDNN_CONV_ALGO_SEARCH`).
+
+| | HEURISTIC | EXHAUSTIVE | HEURISTIC |
+|---|---|---|---|
+| rfdetr-nano infer p50 | 16.44 ms | 16.49 ms | 16.38 ms |
+| dfine-s infer p50 | 20.21 ms | 20.02 ms | 20.37 ms |
+| GPU memory peak during the run | 983-985 MiB | 962-983 MiB | 972-983 MiB |
+
+AP50 was identical. No difference in speed or memory, so HEURISTIC stays; the variable remains for later
+measurements.
+
+### Benchmark read ahead and CPU-only priority (performance plan phase 3.4)
+
+**Before.** The benchmark's timed loop, refine fold prediction and the quick check (`LocalDetector`, which runs
+the benchmark's per-image pipeline) read and decoded each image on the inference thread, so the device sat idle
+during every decode: the quick check spent about 128 s of its 169 s on decode and preprocessing, and on CUDA
+inference was 15.5 ms of a 32 ms frame. `benchmark.low_priority` lowered the whole process for the whole run on
+Windows, including the threads answering Blue Iris, whatever device was benchmarked.
+
+**Read ahead** (`benchmark/run.rs`). A scoped `bench-read` thread reads each image once and decodes one frame per
+timed run while the inference thread works on the previous one. The hand-over is a rendezvous channel (one frame
+decoded ahead), so at most two decoded frames are in flight: about 24 MB for 2688x1520 frames, plus the encoded
+bytes of the image being read.
+- The stages keep their meaning. `decode` is timed on the helper for that frame, preprocess, infer and
+  postprocess on the inference thread. The verifier copy and the set's transform stay outside every stage, as
+  before.
+- `throughput_fps` is the inference thread's wall time (each run's wait for its frame plus its stages), marked
+  `pipelined` in `benchmark.json` and the history. The CLI says `pipelined` or `one image at a time`.
+  `history::compare` reports images per second as not comparable between a pipelined and a serial run.
+- Results, their order and the `on_image` order are those of the serial loop. A read or decode failure is
+  reported for the same image with the same message. A cancel stops both threads after the current frame, and
+  the helper is joined before the device's run returns, also on an error or a panic.
+- **Where it applies** (`ReadAhead`):
+  - The benchmark reads ahead on GPUs and other accelerators, never on a CPU device (`ExceptCpu`). On the CPU
+    the decode takes cores from the inference and inflates the CPU's own latency figures (below), which grade
+    the device and feed the history.
+  - Detections over frames read ahead on every device (`Always`): the quick check, refine fold prediction,
+    relabelling and the pseudo ground truth. Only their time per frame counts.
+
+**Measured** (dev box, the GTX 1070 Ti machine; IPcam-general on `openvino:cpu` only, no GPU run; **debug build**,
+so decode and preprocess are several times slower than in a release build; 15 camera frames 2688x1520 from the
+patio camera; two runs each, alternating). Command:
+`BLUE_ONYX_TEST_ROOT=<fixtures> BOP_READ_AHEAD_IMAGES=<dir> BOP_READ_AHEAD_MAX=15 cargo test --test it backend_bench_read_ahead -- --ignored --nocapture --test-threads=1`.
+
+| loop | wall per image | img/s | decode p50 | preprocess p50 | infer p50 | total p50 |
+|---|---|---|---|---|---|---|
+| serial | 1456 / 1496 ms | 0.69 / 0.67 | 975 / 973 ms | 298 / 291 ms | 160 / 148 ms | 1437 / 1447 ms |
+| read ahead | 1112 / 1104 ms | 0.90 / 0.91 | 1068 / 1021 ms | 306 / 312 ms | 204 / 187 ms | 1594 / 1528 ms |
+
+- On the CPU, read ahead cuts the wall time per frame by about a quarter (0.68 to 0.90 img/s).
+- The CPU's infer p50 rises by about a quarter (154 to 195 ms), because the decode competes for its cores. That
+  is why a CPU benchmark stays serial.
+- Predictions were bit-identical in all four runs (54 stored boxes, 169 at the evaluation threshold). The unit
+  tests `benchmark::run_tests` check the same with the fake backend over JPEGs and PNGs, a grayscale set,
+  `repeat` 1 and 3, a cancel, an unreadable file and an undecodable one.
+- Not measured: a GPU (none may run on this box now) and a release build. With a GPU, where inference does not
+  use the CPU cores, the wall time per frame should approach the larger of decode and
+  preprocess + infer + postprocess, instead of their sum.
+
+**Priority** (`backend/priority.rs`). `DevicePriority`, one per run, is switched before each candidate compiles
+and again on the device the model loaded on (a fallback to CPU is a CPU run). The decision is a pure function of
+the device spec (`priority::decide`):
+
+| `low_priority` | device | Windows | Linux / macOS service | Linux / macOS CLI |
+|---|---|---|---|---|
+| off | any | normal | normal | normal |
+| on | `openvino:cpu`, `ort:cpu`, `CPU` | below normal while it compiles and runs | unchanged (`Nice=` in the unit) | nice 10 from the start if every device of the run is a CPU |
+| on | GPU, NPU, CUDA, TensorRT, DirectML, CoreML, `auto` resolved to one of them | normal (restored before it compiles) | normal | normal (a mixed run is not lowered) |
+
+- The log has one line per device run: `benchmark on openvino:cpu: below normal priority (CPU device)
+  (benchmark.low_priority lowers CPU devices only)`.
+- The Benchmark page's progress line ends with the priority that applied, and its checkbox reads "Run CPU
+  devices at low priority".
+- The previous class is restored when a non-CPU device starts and when the run ends, also on an error or a
+  panic (the guard drops).
+
+### Live path (performance plan phase 3.5)
+
+*Windows 11, the dev box (i5-8600K, 6 cores), **debug build on CPU** (`openvino:cpu`, IPcam-general,
+`cargo build` without `--release`), 2026-11-19. Server from `--config` with the fixtures of `tests/common`
+(`models/IPcam-general.onnx`, OpenVINO without the GPU plugin); one 2688x1520 camera JPEG (366 KB) from the
+dataset, sent as `image.jpg`, no detections at the default threshold. "before" is `origin/main` (d40dbb2),
+"after" this branch, the same binaries swapped on the same config. Sequential: 100 (60 in the A/B runs, 40
+and 20 with saving) requests one after another, reading `analysisRoundTripMs` / `processMs` from the answers.
+Open loop: `test-blue-onyx-prism --rate R --duration S` (p50 / p99 from the scheduled start).*
+
+In a debug build zune-jpeg alone takes about 740 ms of the ~1050 ms `processMs` and the JPEG encode of a save
+about 1.7 s, so the absolute numbers are far from a release build's; the comparisons are what this section is
+for.
+
+What changed on the per-request path:
+
+- **Decode buffer reuse** (`prep::Scratch`, `image::decode_into`): each prep thread decodes into one kept RGB
+  buffer (12.3 MB for this frame) instead of a new zeroed allocation per request, at most one per thread and
+  never above `MAX_SCRATCH_BYTES` (32 MiB). A frame kept past the request (save, night model, verifier) still
+  gets a buffer of its own. The JPEG output is zero-filled first, as zune-jpeg's own `decode` does, so a
+  truncated stream reads exactly as before.
+- **Saving after the reply** (`worker/save.rs`): drawing, encoding and writing `save_image_path` images moved
+  to one `image-save` thread fed by a bounded queue (`QUEUE` = 4 frames, ~50 MB); a full queue drops the save
+  with a warning at most every 10 s. `save_ref_image` writes the uploaded JPEG as it came (a PNG upload, or a
+  forwarded frame without its bytes, is still encoded as a quality-95 JPEG, so `<name>.jpg` stays a JPEG).
+- **Forwarded frames on the prep pool**: night-model and verifier frames (`PrepInput::Decoded`) are
+  preprocessed by the pool instead of on the receiving model's inference thread.
+- **Copies**: the upload buffer is reserved from `Content-Length` (at most `BODY_LIMIT`, charged to the upload
+  budget up front, otherwise grown as before); `ort` sessions read the pooled tensor in place
+  (`Backend::submit_pooled`) instead of copying it into the slot.
+- **Background threads below normal** (`priority::lower_this_thread`): review index, review queue walk
+  workers (`parallel::map_all_at(.., Spawned::Background, ..)`), Train area tally, storage measurement and
+  retention. Detection, prep, worker, HTTP and `image-save` threads keep normal priority.
+
+Without saving (A/B alternated, two runs each; `processMs` and `analysisRoundTripMs` p50 / p99 in ms):
+
+| | before | after |
+|---|---|---|
+| sequential `processMs` | 1051 / 1593, 1047 / 1275 | 1038 / 1592, 1041 / 1373 |
+| sequential `analysisRoundTripMs` | 1054 / 1599, 1053 / 1291 | 1042 / 1594, 1043 / 1376 |
+| decode, from the debug log under 2 req/s | 741, 759 | 737, 737 |
+| preprocess, same runs | 258, 262 | 255, 255 |
+| open loop 2 req/s for 45 s, from schedule p50 | 1122, 1307, 1316, 2756 | 1251, 1726, 1247, 1151 |
+| server RSS at the start of the open loop | 231 to 233 MB | 257 to 258 MB |
+
+The sequential gain is about 10 ms, inside the noise of a debug build whose decode dominates. 2 req/s is at
+the edge of what this debug build serves, so the open-loop p50 is mostly queueing and swings by a factor of two
+between runs of the same binary; it shows no difference either way. The RSS is ~25 MB higher from the start:
+the two busy prep threads keep their 12.3 MB buffers instead of freeing them after every request.
+
+With `save_image_path` on (`save_ref_image` off, then on):
+
+| | before | after |
+|---|---|---|
+| sequential `analysisRoundTripMs` p50 / p99 | 2789 / 3118 | 1061 / 1397 |
+| open loop 0.3 req/s for 60 s, p50 / p99 | 2779 / 3415 | 1116 / 1526 |
+| with `save_ref_image`, sequential p50 / p99 | 4617 / 5641 | 1077 / 1156 |
+| with `save_ref_image`, open loop 0.3 req/s for 30 s, p50 / p99 | 7775 / 9599 | 1092 / 1159 |
+| annotated `_od.jpg` | sha256 `1bc94d4c...` | the same bytes, every file |
+| reference `<name>.jpg` | re-encoded (`1bc94d4c...`: no boxes, so the same as `_od`) | the upload itself (`a3178614...`) |
+| saves written | every request | 49 of 63, 28 of 34 (a dropped save warns, once per 10 s) |
+
+`analysisRoundTripMs` no longer contains the encode: with saving on the answer comes as fast as without. In
+this debug build one save takes ~1.7 s (two encodes with `save_ref_image` before, one now), longer than the
+~1.05 s between sequential requests, so the four-frame queue fills and some saves are dropped, each burst with
+one warning. A release build encodes far faster (not measured here: no release build on this machine for
+this phase), so how often it drops at camera rates is still to be measured.
+Before, the worker itself encoded, so at 0.3 req/s with `save_ref_image` the requests queued behind each other
+(p50 7.8 s). The queued frames add up to ~50 MB of RSS while the writer is behind.
 

@@ -201,6 +201,17 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
    the benchmark. `test/`, `valid/` and `heldout/` folders count as held out too. An export that
    holds nothing out (a single camera day goes wholly to one side) is held out by the run instead,
    step 2.
+
+   **Camera days held out for good.** The Dataset tab's export reads `heldout-days.json` in the review
+   folder (`src/collect/labels/heldout.rs`, format in docs/DATASET.md "Export") and holds out every day
+   it lists; an export of the default split adds its own held-out days, and for a camera with fewer than
+   two (`MIN_HELDOUT_DAYS_PER_CAMERA`) its days no run trained or validated on, so the list only grows. A
+   run reads the same list (`collect.review_dir`, else the dataset folder; `dataset::Options::frozen_heldout`,
+   recorded in `dataset.json`): a review frame of a listed day is held out even when an older export has it
+   in `train`, with a warning that counts those frames (`Stats.frozen_moved`). Adding days changes
+   `heldout_fingerprint`, so the run comparison says the held-out sets differ. A list that is newer or
+   does not parse stops the export and every run (`train run`, the Train tab, `train prepare`) until it
+   reads; nothing moves or rewrites it. The dataset check's fold runs ignore it (their split is the fold).
 2. **A flat YOLO folder**: `images/` (or the folder itself), `labels/<stem>.txt` or `<stem>.txt` beside
    the image, `classes.txt` or `data.yaml` (`names`), optionally `heldout.txt` / `test.txt` listing
    the held-out images, and a `manifest.json` in the benchmark format whose tags (`day` | `night` |
@@ -226,7 +237,10 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
 
 1. **Classes**: the run's list (`--classes`, repeated or comma-separated; the page's class picker) in
    head order, else every class of the exports in first-seen order. Labels are matched by name across
-   exports (each export's ids are remapped), `--rename from=to` renames, an empty `to` drops. What
+   exports (each export's ids are remapped), `--rename from=to` renames, an empty `to` drops. The Train
+   tab's **Merge classes** rows (`from` -> `to`, `to` a class, a new name or "drop") post the same
+   `rename` fields. The rename happens before the class list, so the list must name the target
+   (`car`, not `truck`); a label renamed away is no longer a class of its own. What
    happens to a box of a label that is not in the list is the **excluded mode** (`--excluded`, the
    page's radio under the picker): `background` (default) keeps the frame and the object is
    background (a frame left with no box is a negative, counted toward the negative share);
@@ -327,6 +341,14 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
    more than half of a class's boxes in the pool, which also keeps a class's last training box in
    training (`Stats.valid_groups` in `dataset.json` and the `dataset:` line of `train.log` list the
    groups). Frames with neither a camera nor a day tag are no group and stay in training.
+   **Validation floor** (`VALID_CLASS_FLOORS`, person 80): a run that trains `person` gets more whole
+   days in a third pass until validation holds 80 person boxes, so the checkpoint choice is not decided
+   by a handful of boxes (34 person boxes made one box about 3% of the recall). It takes days with people
+   in the same seeded rank under the same half rule, while validation stays within a third of the
+   candidate frames. When 80 cannot be reached the plan warns, e.g. *validation has 54 person boxes, 80
+   wanted: the remaining camera days with people would take more than half of a class's training boxes
+   or past a third of the frames; review more days with people*. The frame-by-frame fallback adds no day,
+   it only warns. `Stats.valid_boxes` in `dataset.json` counts validation boxes per class.
    **Fallback**: under 3 camera days left after the held-out split, groups reaching under half of the
    size, no group with a box, or no camera or day tag at all give a warning that says so and the
    frame-by-frame split (seeded rank, a frame holding a class's last training box stays in training);
@@ -407,20 +429,67 @@ not reviewed yet, and disk needed against free per volume.
 | Few training boxes of a class | under 50 (`MIN_CLASS_BOXES`) | warning |
 | Few held-out frames | under 10 (`MIN_HELDOUT_FRAMES`) | warning |
 | Few training frames of a scene | under 50 (`MIN_SCENE_FRAMES`) | warning, e.g. "Only 12 night frames: review more, or train day only." |
+| Few validation boxes of person (runs that train it) | under 80 (`VALID_CLASS_FLOORS`) | more whole days for validation, else a warning; the report shows `validation: N person boxes (80 wanted ...)` (`valid_floors`) |
+| A camera day held out for good in an older export's train split | any | held out anyway, with a warning |
 
 The checks run when a run is queued (page, `train run`) and again when it starts. Warnings stay with the
 run: on its row, in `dataset.json` and in `train.log`. The disk need is the frames that cannot be hard-linked
-(another volume, or exFAT, probed with one link), labels, four times the base weights for the work folder
-(measured: YOLO26n 16 MB, RT-DETRv2 S 77 MB, RF-DETR nano 1.2 GB), RF-DETR's augmented copies, the model, and
-what the environment and weights still have to download.
+(another volume, or exFAT, probed with one link), labels, five times the base weights for the work folder
+(`WORK_WEIGHT_FACTOR`; measured: YOLO26n 16 MB, RT-DETRv2 S 77 MB, RF-DETR nano 1.1 GB without rfdetr's interval
+archives, which the script turns off; two full nano runs that kept them used 1.6 and 3.5 GB), RF-DETR's augmented
+copies, the model, and what the environment and weights still have to download. The frames are counted at full
+size, although the train / valid ones are written smaller (below): the need is an upper bound.
 
 Output in `<training dir>/<run id>/data/`: `images/`, `labels/` (hard links, else copies),
 `classes.txt`, `train.txt` / `valid.txt` (repeats as repeated lines), `data.yaml` (Ultralytics),
 `train.coco.json` / `valid.coco.json` (category ids 0..C-1, `file_name` relative to the folder; a
 repeated frame is a separate image entry), `heldout/` (a benchmark `dir:` set: `images/`, YOLO
 `labels/`, `classes.txt`, `manifest.json` with tags, `scored_labels` and every frame's `objects`) and
-`dataset.json` (sources, licences, counts, warnings). `train prepare --out <dir>` writes the same without
-training.
+`dataset.json` (sources, licences, counts, warnings) and `prepared_files.json` (written last: every image
+with its source and the size and last-write time of both, and the plan's fingerprint). `train prepare --out
+<dir>` writes the same without training.
+
+**Seeds of a comparison group share their images.** The seeds of one group (and its other runs with the
+same scene filter and prepared image size) assemble the same plan. A run of a group hard-links the image files of the
+first earlier run of the group whose `prepared_files.json` names the same plan fingerprint (the options,
+the prepared size, the plan, every frame it uses with its labels, and the build) instead of copying or
+downscaling them again (`dataset/reuse.rs`; measured before: 930 MB and about 30 s per seed with the dataset
+on another volume than the training folder). An image is linked only when its source is the same file,
+unchanged since the first run wrote it, the first run's file is unchanged too (checked again after the
+link), and it is no JPEG without its end marker; anything else (a link that fails, a first run removed or
+changed) is written from its source as before, so the dataset is the same bytes either way (tested against
+a plain write). `train.log` says `dataset: N of M image files hard-linked from the identical dataset of
+<folder>`. Nothing writes into a prepared image in place: the writer creates every file under a new name
+(link, copy, or a temporary file renamed over it), a run folder is only removed whole, and Remove on the
+first run only drops its names. The one image a trainer writes back is a JPEG without its end marker
+("corrupt JPEG restored and saved"); Ultralytics does it through a temporary file and a rename, so the
+bytes behind a link stay, and such a file is still always copied, never linked, into a dataset (from the
+review export or from another run), whatever a trainer version does with it.
+
+**Prepared image size.** A run writes its train and validation images with the short side at what its
+trainer reads at most (`TrainRecipe::prepared_short_side`, `dataset.json` `prepared_short_side` and
+`resized_images`): a larger image is decoded, downscaled (Catmull-Rom convolution scaled to the ratio, an
+antialiased bicubic: sharper than bilinear, without Lanczos3's ringing on the bright edges of night and IR
+frames) and written as JPEG quality 95 (PNG stays PNG), through a temporary file and a rename, on all physical
+cores but one; an image at or under the size, of another format or with an EXIF rotation is linked as before.
+The held-out frames always stay full size (the benchmark scores them as a camera sends them). Labels are
+normalized, so they do not change; the COCO JSON gets the written width and height. The size floor and
+ignore-region decisions run before any image is written, on normalized boxes, so they are the same at any
+prepared size (tested). Per trainer:
+
+| Trainer | Short side | Why |
+|---|---|---|
+| RF-DETR | max(largest training side, 600): nano 384 600 (multi-scale on or off), nano 640 800 / 640, small 512 672 / 600, medium 576 736 / 600, base 560 840 / 600, large 704 864 / 704 | its square resize stretches to the largest multi-scale side (`rfdetr_max_side`, else `imgsz`); its scale-jitter branch first resizes the short side to 400 / 500 / 600 (`RFDETR_JITTER_FLOOR`); equal to rfdetr's own `draft_size_for_transforms`, the size its JPEG decoder already reduced to |
+| Ultralytics | 1.5 x imgsz (960 at 640) | it resizes the long side to `imgsz` before mosaic and zoom; 1.5x leaves room to spare |
+| transformers (RT-DETRv2, D-FINE) | imgsz | the image processor stretches to `imgsz` x `imgsz` |
+
+On this box (2688 x 1520 frames) this replaces a 930 MB copy per run (D: to C:) and the trainers'
+per-image decode and resize of the full frame (RF-DETR 31 ms, transformers 68 ms). Measured on 240 frames of
+a run (release build, i5-8500, 5 threads): 27 ms per frame at 600 px (6.5 s for the 240; 367 KB per frame
+instead of 1,193 KB), 20 ms at 640 px (415 KB), 28 ms at 960 px (868 KB). The night augmentation's CPU
+cost per image (preset, one thread) falls from 276 ms at full size to 27 ms at 1061 x 600. Results are not bit-identical to full-size input: the trainer now
+resizes from the prepared image instead of the original (two resamplings instead of one), a difference of
+the order of JPEG noise.
 
 ### Ignore regions
 
@@ -517,7 +586,9 @@ night, ir, unknown scene). With `--scene` an **in scope** column adds the boxes 
 (unknown-scene boxes count only for `all`). The Train tab's class picker shows the same counts
 (`GET /v1/training/dataset-classes`) and warns about a class with fewer than 50 boxes (a fine-tuning
 floor, far below Ultralytics' best-case 10,000 instances) and about a class with no box in the
-scenes the run trains on (`person` with no night boxes in a night run).
+scenes the run trains on (`person` with no night boxes in a night run). The picker follows the Merge
+classes rows: a merged class shows the summed counts (and a note, "includes 61 truck"), the class
+merged away is gone from the list but stays a choice for "from" (`source_classes`).
 
 ### Public night subset (`train-data:lila-night`)
 
@@ -563,7 +634,10 @@ exposure x0.05-0.4 in linear light (gamma 2.2), MAET-style; noise = shot noise p
 signal plus read noise, sigma 0.01-0.05. Applied on the fly to the training batches for Ultralytics
 (on top of its own mosaic / HSV / flip) and transformers (plus a horizontal flip); for RF-DETR, whose
 training loop is the `rfdetr` package's, one augmented copy of each training image the probabilities
-pick is added before training.
+pick is added before training. Each step computes its branch only for an image its coin picked, with the
+same random draws in the same order, so the result and the generator state are bit for bit those of
+computing every branch (checked with a seeded comparison on CPU and CUDA, 1,680 cases); the noise is still
+drawn for every image, as before.
 
 ## Starting points and convergence
 
@@ -674,20 +748,51 @@ is switched off so only this one decides:
 - A **stop point** is reached once `epoch >= min_epochs` (10) and `patience` epochs passed since
   the last improvement. `patience` 0 turns it off (the run trains all its epochs); it may not exceed
   the epochs, and a patience that is not below the epochs never fires (a warning says so).
-- At a stop point the run **goes on while the training loss still falls**: over the last `patience`
-  epochs, the mean training loss of the later half (n / 2 epochs; an odd middle one counts in
-  neither) is more than 2% below the earlier half's (`loss_falling`; fewer than 4 losses = not
-  falling). Then the countdown restarts there (the next stop point is `patience` epochs later, or
+- At a stop point the run **goes on while the validation is still improving**: over the last
+  `patience` epochs, the mean of the later half of the smoothed values (n / 2 epochs; an odd middle
+  one counts in neither; epochs without a value are skipped) is more than `min_delta` above the
+  earlier half's (`metric_rising`; fewer than 4 values = not rising). A stop point means no new best
+  for `patience` epochs, so this is a curve climbing back after a dip, not one still setting
+  records. Then the countdown restarts there (the next stop point is `patience` epochs later, or
   sooner past a gain), at most 2 times (`MAX_EXTENSIONS`) and never at the last epoch; otherwise it
-  stops. The script prints `@train {"event":"converge_point","epoch":E,"best_epoch":B,"best":v,
-  "loss_falling":true,"loss_from":a,"loss_to":b,"extension":n,"next_check":E+patience}` and the
-  Train tab shows "Early stop reached at epoch 15 (best epoch 5, mAP 0.835; the selected metric's
-  name when it is not mAP); training loss is still falling (3.569 -> 3.315). Continuing to epoch 25." with **Stop now and keep epoch 5** (the
-  Finish now action) and **Continue** (hides the notice; the run goes on by itself, so an unattended
-  run never waits). The incident run with its losses passes its epoch-15 stop point this way.
+  stops. The training loss is not consulted: a DETR's keeps falling long after its validation
+  peaked (see the replay below). The script prints `@train {"event":"converge_point","epoch":E,
+  "best_epoch":B,"best":v,"rising":true,"value_from":a,"value_to":b,"extension":n,
+  "next_check":E+patience}` and the Train tab shows "Early stop reached at epoch 15 (best epoch 5,
+  mAP 0.835; the selected metric's name when it is not mAP); validation still improving (mAP 0.786
+  -> 0.791). Continuing to epoch 25." with **Stop now and keep epoch 5** (the Finish now action)
+  and **Continue** (hides the notice; the run goes on by itself, so an unattended run never waits).
+  Records written before this rule extended on a falling training loss (`loss_falling`,
+  `loss_from`, `loss_to`; read and ignored).
+
+  *Replay* of the 14 run histories on the GTX 1070 Ti (2026-11, RF-DETR nano and D-FINE S, patience
+  10, `smooth` 3, `min_delta` 0.001, anneal 5 for RF-DETR; the old rule replayed to the recorded
+  stop in all 13 runs that converged, the 14th was stopped by hand): the old rule extended 12 of
+  them and spent 33% of all training time after the first stop point; the new one extends 1
+  (`a39b`, whose F2 was climbing back at epoch 27) and would have ended the 14 runs 27,607 s of
+  84,610 s (32.6%) sooner. The kept (best raw) value is the same in 10 of 14 and at most 0.0051
+  lower (mean 0.0010); the replay uses the recorded epochs, so the earlier anneal's lowered
+  learning rate, which usually gives the best epoch, is not in it.
+
+  | run | model | metric | stop old (extended at; anneal) | stop new | best epoch | kept old / new | saved |
+  |---|---|---|---|---|---|---|---|
+  | d455 | rfdetr nano 384 | mAP | 68 (-; 63) | 68 (-; 63) | 52 | 0.6906 / 0.6906 | 0 s |
+  | f36e | rfdetr nano 640 | mAP | 51 (25; 46) | 30 (-; 25) | 35 | 0.6961 / 0.6910 | 1,691 s |
+  | ab70 | rfdetr nano 640 | mAP | 58 (33, 43; 53) | 38 (-; 33) | 22 | 0.7126 / 0.7126 | 1,628 s |
+  | 200c | dfine s 640 | mAP | 49 (20, 30) | 20 | 37 | 0.6245 / 0.6204 | 1,766 s |
+  | dd9c | dfine s 640 | mAP | 39 (19, 29) | 19 | 9 | 0.5966 / 0.5966 | 1,334 s |
+  | ccb7 | rfdetr nano 384 | mAP | 63 (38, 48; 58) | 43 (-; 38) | 39 | 0.7502 / 0.7502 | 3,434 s |
+  | cad6 | rfdetr nano 384 | F2 | 47 (22, 32; 42) | 27 (-; 22) | 11 | 0.6667 / 0.6667 | 3,030 s |
+  | 2fff | rfdetr nano 384 | F2 | 51 (19, 29; 46) | 24 (-; 19) | 34 | 0.6720 / 0.6672 | 4,084 s |
+  | df88 | rfdetr nano 384 | F2 | 55 (40; 50) | 45 (-; 40) | 30 | 0.7407 / 0.7407 | 1,050 s |
+  | 5dfd | rfdetr nano 384 | F2 | 48 (23, 33; 43) | 28 (-; 23) | 46 | 0.7285 / 0.7285 | 2,066 s |
+  | a39b | rfdetr nano 384 | F2 | 56 (27, 41; 51) | 46 (27; 41) | 54 | 0.7288 / 0.7285 | 556 s |
+  | dee4 | rfdetr nano 384 | F2 | 40 (-; 35) | 40 (-; 35) | 24 | 0.5251 / 0.5251 | 0 s |
+  | 4813 | rfdetr nano 384 | F2 | 50 (25, 35; 45) | 30 (-; 25) | 13 | 0.6368 / 0.6368 | 5,371 s |
+  | 4a15 | rfdetr nano 384 | F2 | 44, stopped by hand (33, 43) | 38 (-; 33) | 23 | 0.6304 / 0.6304 | 1,596 s |
 - **Anneal, then stop** (RF-DETR, `--anneal N`, 0 = off for the other trainers, whose schedules
-  already decay): the first stop point that would stop (no extension left or the loss no longer
-  falling, before the last epoch) instead trains `N` more epochs, at most up to the epochs, with a
+  already decay): the first stop point that would stop (no extension left or the validation no
+  longer improving, before the last epoch) instead trains `N` more epochs, at most up to the epochs, with a
   lowered learning rate, then stops ("converged"); stop points during the anneal are ignored and
   Finish now still stops at once. `N = max(5, ceil(patience / 2))` with early stopping on
   (`TrainRecipe::anneal_epochs`; 5 for the recommended patience 10, 10 for a doubled 20), in the
@@ -695,7 +800,7 @@ is switched off so only this one decides:
   current factor f0 down to `--lr-min-factor` (0.1) along a half cosine over those epochs' optimizer
   steps (never above the schedule; `bend_lambda_lr`, tested with a stand-in scheduler); another
   scheduler is logged and only anneals-then-stops. It prints `@train {"event":"anneal","epoch":E,
-  "until":U,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n}` and the page shows "Early stop
+  "until":U,"best_epoch":B,"best":v,"rising":f,"extensions":n}` and the page shows "Early stop
   reached at epoch E (best epoch B, mAP v). Lowering the learning rate until epoch U, then
   stopping." (with Stop now / Continue) and "lowering the learning rate until epoch U, then
   stopping" in the run's progress line. The best checkpoint is still the one exported, usually one
@@ -802,8 +907,8 @@ checks the file after each epoch; a stale one is removed before training starts.
 cancels.
 
 **The `stop` event.** When the rule (or the stop file) ends training the script prints
-`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"loss_falling":f,"extensions":n,"anneal_until":U|null}`
-(the log line says why: "training loss no longer falling", that the extensions or epochs ran out, or
+`@train {"event":"stop","reason":"converged"|"finish","epoch":N,"best_epoch":B,"best":v,"rising":f,"extensions":n,"anneal_until":U|null}`
+(the log line says why: "validation no longer improving", that the extensions or epochs ran out, or
 that the learning rate was lowered for N epochs after the stop point). The page shows
 "best epoch B, M epochs without improvement (stops at patience P)" while training and then
 "converged at epoch N (best B)" or "finished on request at epoch N (best B)"; `train run` prints the same
@@ -832,6 +937,12 @@ row states their size. Cancelling a retry returns the run to its failure.
 | RF-DETR | `rfdetr-out/checkpoint_best_total.pth`, else the running `checkpoint_best_ema.pth` / `_regular.pth` | yes, the best epoch so far |
 | RT-DETRv2, D-FINE | `hf-best/` (saved at every new best epoch; `save_strategy="no"` keeps nothing else) | yes, the best epoch so far; not for runs of older versions |
 
+rfdetr's interval archives (`checkpoint_<epoch>.ckpt`, 483 MB each for a nano, every 10 epochs by default;
+one run left 3.1 GB of them) are off: the script passes `checkpoint_interval = epochs + 1`, an interval
+Lightning never reaches. rfdetr 1.11 still writes `last.ckpt` every epoch and its `BestModelCallback` the
+`checkpoint_best_*.pth` files above (checked in the installed package; an rfdetr that refuses the setting
+trains with its default, as for the other optional settings).
+
 Measured on an M1 with a 16-frame set, 2 epochs: YOLO26n, RF-DETR nano and RT-DETRv2 S each exported after
 a failed export and after `kill -9` during training (RF-DETR from `checkpoint_best_ema.pth`), in 3 to 7 s. D-FINE
 has not been run: it trains on CUDA only. Training itself does not resume: the convergence rule, the
@@ -846,7 +957,15 @@ Stages (page and `train run` show them with percent and ETA):
 1. **setup**: uv, Python, the lock's packages, on Windows the Visual C++ runtime check (the export's
    code).
 2. **self-check**: `train_model.py --self-check` imports the trainer and reports what PyTorch sees; a
-   CUDA run also launches a test kernel, so a driver or kernel problem fails here in seconds.
+   CUDA run also launches a test kernel, so a driver or kernel problem fails here in seconds. A passed
+   check is recorded in `tools/train-env/.prism-self-check.json` (per trainer and device, written
+   atomically); a later run skips the separate process (about 13 s of imports) when nothing it checked
+   changed: the environment's marker and Python executable (bytes, size, time), the embedded training and
+   export scripts (SHA-256), the GPU as described, the platform and the build, and the check is under 12
+   hours old (`self_check::MAX_AGE`: a driver can change under an unchanged environment). The log then says
+   `self-check skipped (unchanged since <time>: ...)`. Any doubt runs it (no or a damaged marker, another
+   fingerprint, a time in the future), and a training process that fails forgets the pass, so the next run
+   checks again. The dataset check's folds are training runs: its first fold checks, the others skip.
 3. **weights**: the base weights (and the public subset), SHA-256 checked.
 4. **dataset**: assembled as above.
 5. **train**: `train_model.py` trains, then exports and checks the ONNX; a failure at any later point
@@ -909,6 +1028,67 @@ Stages (page and `train run` show them with percent and ETA):
    The rule gives that box 2 with 7.6 GB of RAM available (commit alone would allow 4, the RAM
    bound 2; with 6 GB available, 0); the old rule, the free commit only with a 6 GB reserve, gave 0
    in 19 of 21 runs. Should a run still run out of host memory, the retry below halves the workers.
+
+   **Memory commit check before a job (Windows).** Auto-label, the overlap check, the dataset check, an
+   import's SigLIP 2 selection and every training run check the memory commit before their first Python
+   process
+   (`training/commit.rs`) and refuse with what happened, why and what to do when the job's estimated
+   peak plus 1 GB kept spare (`COMMIT_SLACK_BYTES`) is more than the free commit plus what the paging
+   files may grow by, counted with the same 16 GB drive margin as the workers above. Windows grows a
+   paging file in jumps of about 2 to 5.5 GB as the commit charge nears the limit; on the dev box an
+   auto-label run (SAM 3 + RF-DETR L + Qwen3-VL 2B + SigLIP 2) grew `c:\pagefile.sys` to its 24 GB maximum
+   and left C:, which holds Blue Iris's recordings, with 236 MB free. For example:
+
+   `this auto-label run needs about 10.0 GB of memory commit (PyTorch and RF-DETR L 2.6 GB + SAM 3 6.4 GB,
+   1.0 GB kept spare); 5.0 GB is free and the paging file on C: can grow only while 16 GB stays free there
+   (15.2 GB free now). Free space on C:, put the paging file on another drive, or turn off SAM 3 (or label
+   with a trained model, --with-model), then start the job again. To start it anyway, tick Start anyway
+   beside its preview, or pass --ignore-memory-check.`
+
+   A fixed or full-size paging file, or none, gets its own reason and advice. The memory is read when the
+   job starts, not when it is queued; a refused job fails with that message as its error and nothing
+   written. The previews say so first, as "would be refused if it started now": `train autolabel
+   --dry-run` and the Auto-label tab's preview, `train refine --dry-run` and the Refine tab's preview,
+   `train overlaps --dry-run` and the Review tab's *Suggest overlaps* confirmation. Linux and macOS are
+   never checked (no fixed commit limit), and a reading that fails (the commit, the RAM, the registry's
+   paging files or a drive's free space) refuses nothing: the job then runs as it did before the check.
+
+   **Start anyway.** Where a preview shows the refusal (the Auto-label preview, the Refine tab's preview,
+   the Review tab's *Suggest overlaps* answer, the Train tab's *Before you train*), an unticked checkbox
+   "Start anyway: this job may grow the paging file into the last 16 GB of C:" appears beside it (only
+   then); on the command line it is `--ignore-memory-check` (`train autolabel`, `train overlaps`, `train
+   refine`, `train import`, `train run`). It is the job's own `ignore_memory_check` request field, kept
+   with the queued task or run (the memory is judged when it starts), never a config key and not part of
+   what runs compare by. An overridden job starts, logs one warning with the same numbers
+   (`memory check overridden: ...`, in the service log and the job's log, `train.log` for a run), and a
+   task's summary ends "the memory check was overridden (Start anyway)". The import page has no preview
+   of its own memory, so an import overrides by the form field or the flag only.
+
+   **Training runs** are checked at the start of each run (each seed and each model of a queue at its
+   own), before the environment's tools, the self-check and the trainer: 8.0 GB
+   (`MAIN_COMMIT_RESERVE_BYTES`, the measured trainer) plus 1 GB spare, plus 1.4 GB per worker per
+   loader only when `training.workers` forces a count (automatic workers are fitted to what is left by
+   the rule above). A refused run fails with the message and keeps its record. The dataset check's
+   fold runs are covered by the check's own test before its first fold and not judged again; an export
+   retry (`train retry-export`) trains nothing and is not checked.
+
+   | Job | Estimated peak commit | Where the figure comes from |
+   |---|---|---|
+   | Python, PyTorch, CUDA and RF-DETR L (every labelers run, the overlap check, the closer look) | 2.6 GB | measured (the overlap check) |
+   | + SigLIP 2 (with two or more animal classes, as the script loads it) | 2.0 GB | measured: RF-DETR L + SigLIP 2 took about 4.6 GB at load, flat over 220 frames |
+   | + SAM 3 | 6.4 GB (2 x its checkpoint) | estimate above a measured lower bound: SAM 3 + RF-DETR L was killed while still loading at >= 7.6 GB (5.0 GB beyond the base) |
+   | + MM-Grounding-DINO, + Qwen3-VL | 2 x the checkpoint (tiny 1.3 GB, Qwen3-VL 2B 7.9 GB) | estimate, not measured |
+   | Dataset check (fold training) | 8.0 GB, plus 1.4 GB per worker per loader when `training.workers` is set | the measured trainer (`MAIN_COMMIT_RESERVE_BYTES`); automatic workers are chosen to fit |
+   | Import, SigLIP 2 selection | 4.6 GB | counted as the measured RF-DETR L + SigLIP 2 run; `--select dhash` loads no model |
+
+   The default auto-label run is about 13.8 GB, SAM 3 + RF-DETR L + Qwen3-VL 2B + SigLIP 2 about 19 GB
+   (consistent with the run that filled C:, whose commit limit reached about 39.8 GB with ~18.6 GB in use by
+   everything else). On the dev box (23.65 GB limit, ~5 GB free, 15.2 GB free on C:) RF-DETR L alone and
+   the overlap check run (3.6 GB); RF-DETR L + SigLIP 2 (5.6 GB: that run grew the paging file by 2 GB from
+   this state), every SAM 3 run, the default run, the dataset check (9.0 GB) and a SigLIP 2 import are
+   refused until C: has more free space, and so is a training run (8 GB + 1 spare against ~5 GB; with the
+   19 GB free of the measured runs above, 5.4 GB + 3 GB of growth would still be short), unless started
+   anyway.
 
    **Out of system memory** (`[WinError 1455]` "the paging file is too small", `DefaultCPUAllocator:
    not enough memory`, `can't start new thread`, `MemoryError`, a worker killed by the OOM killer)
@@ -978,6 +1158,19 @@ The dataset folders a run uses are checked too: a ticked folder is used as is on
 offered it (`training.datasets` or an export under `<training dir>/exports`); any other value, the typed
 *Another folder* and its *Save folder* must be a browsable folder or one picked in the native dialog.
 
+**The results list** (Models tab, *Use a trained model*) groups the finished runs by what makes their
+held-out scores comparable: the held-out fingerprint of their benchmark, their trained classes and
+their class merges (`server::training::result_groups`). Each group starts with a header row ("Held-out
+set 3f2a1c…, 4 runs — scores compare only inside a group"; a held-out set two groups share names their
+classes and merges); a run without a benchmark is its own group ("Not benchmarked"), and so is a run
+of an older version without a fingerprint. Groups come newest first (by their newest run); inside a
+group the runs come best first by the Comparison's rule (`training::compare::best_order_by`: person
+recall, then vehicle recall, then AP50-95 on every held-out frame, each highest first, a missing value
+last; equal runs newest first). Person R, Vehicle R and AP50-95 are columns beside the benchmark
+sentence (a dash without a benchmark); a click on a header sorts the runs inside each group
+(`data-sort-group` in `assets/sort.js`), never across groups, and **Best first** goes back. The
+Comparison card's runs start in the same best-first order, its routed and seed rows at the bottom.
+
 **Use as** (Trained models card): *Use as default* first shows what changes (`GET
 /v1/training/switch-preview`, `training/switch.rs`): thresholds, classes (a class reported today and
 not after the switch is called out, since Blue Iris may filter on labels), night model, filters,
@@ -997,7 +1190,14 @@ After a run's benchmark the current default runs on the same sets and devices (`
 Train tab only; `train run` and `train retry-export` print one line saying so), so the Models tab's Use card can say "On N held-out frames: new finds ...; current finds ...".
 Its results stay in `<run>/baseline/`, removed afterwards: they never touch `benchmark.json`, the
 history or the `auto` order. It is skipped, with the reason in the row, when the default is the new
-model, is not loaded, or reports none of its classes.
+model, is not loaded, or reports none of its classes. A run of a comparison group (seeds, scene filters)
+takes over the baseline another run of the group measured when everything it depends on is equal
+(`bench::baseline_key`, stored as `baseline.key`: the default's name, config entry, model and class file
+size and time, the config without its model list, each set's manifest, class file, held-out fingerprint and
+image sizes, the resolved devices, the build) instead of benchmarking again: two seeds of one group had the
+identical baseline AP 0.5793077331746791. The run's record then has `baseline.reused_from: <run id>`
+and `train.log` says `baseline reused from <run>`. A baseline that failed, carried a note or ran on
+another device than its key names is never reused.
 
 `trained_on_share` on a benchmark result (`benchmark/trained_on.rs`) is the share of its frames the
 model trained on (frame identity against the run's `train.txt`; None without a training record). Older
@@ -1103,7 +1303,7 @@ blue-onyx-prism train run --model yolo26s --dataset <export> \
 
 One run per scene per model is queued (several `--model` x several `--scene` = the product; identical
 scenes are queued once; the page lists the run names first) and they run one at a time in that order.
-They share a `compare_group` (`cmp-<YYYYMMDD-HHMMSS>`), the class list and the excluded mode.
+They share a `compare_group` (`cmp-<YYYYMMDD-HHMMSS>`), the class list, the class merges and the excluded mode.
 
 **Same held-out frames.** The held-out set is chosen before the scene filter, so every run of the
 group is benchmarked on the same frames, all scenes included. The fingerprint in each run's benchmark
@@ -1125,7 +1325,7 @@ count) and **Person FA** (`2/210`: frames without a person, parked cars and othe
 that got a person detection at the threshold, of all such frames; a camera that always sees a parked
 car has no empty frame, so its false person alerts show only here; CLI `person FA`). The best value
 of each column is marked (`*` in the CLI): highest AP and recall, lowest time and false-alert rates.
-Runs of older versions show a dash in the new columns. Runs that differ in classes, excluded mode or
+Runs of older versions show a dash in the new columns. Runs that differ in classes, class merges, excluded mode or
 threshold get a warning, and so do runs whose AP averages different classes: AP50 and AP50-95 average
 only the classes with at least 20 held-out objects (`MIN_CLASS_GT`; every class when none has 20), so a
 class that crossed 20 objects in one run's held-out frames changes what its AP means.
@@ -1177,6 +1377,15 @@ patch x windows` (nano 384 -> 544, small 512 -> 672, medium 576 -> 736, base 560
 20.4 GB; the estimate now says 22.4 GB) and on the measurements below; a 16 GB Mac now gets batch 4
 suggested instead of 16. The other RF-DETR sizes keep their constants, now scaled by their multi-scale
 side, so their estimates rose 1.5-2.25x (conservative until measured).
+
+On CUDA, RF-DETR nano and D-FINE S use constants from full runs on a GTX 1070 Ti (`estimate::cuda_memory`):
+the peak `mem_gb` (`max_memory_reserved`) of 14 runs plus 400 MB for the CUDA context
+(`CUDA_CONTEXT_MB`, outside that peak). RF-DETR nano: 1000 MB + 325 MB per image at 384 px (3.09 GiB at
+batch 4 and 5.57-5.62 GiB at batch 8 multi-scale; its 640 px runs come out 24% high); D-FINE S: 800 +
+385 (3.39 GiB at batch 8, 640 px). The old shared constants said 11.7 GB for nano at batch 8 where 5.6
+GiB was measured, so `auto` multi-scale and the start-of-run warning misjudged 8 GB cards; now 6.2 GB.
+The suggested batch and `auto` multi-scale use the constants of the run's device (CUDA or MPS); the
+sizes not measured on CUDA keep the shared table there.
 
 **RF-DETR multi-scale** (`multi_scale` in the recipe: page form field `multi_scale`, `train run
 --multi-scale auto|on|off`, script `--multi-scale on|off`): `auto` (default) keeps rfdetr's
@@ -1264,7 +1473,7 @@ run per row; repeats of the baseline varied by about 4% in `img_s`.
 | Multi-scale off (384 px only) | 84 s | 1.98 / 1.98 | 3.9 / 3.8 | as `auto` when batch 4 does not fit |
 | AMP off (fp32) | 88 s | 1.92 / 1.88 | 7.5 / 9.9 | no: no faster, more memory |
 | AMP bf16 | - | - | - | n/a: rfdetr keeps fp16 on MPS (warns) |
-| No `gc.collect()` + `empty_cache()` after validation | 87-89 s | 1.94 / 1.86 | 6.5 / 9.2 | kept the release (0.2-1.2 GB lower in epoch 2, same speed) |
+| No `gc.collect()` + `empty_cache()` after validation | 87-89 s | 1.94 / 1.86 | 6.5 / 9.2 | kept the release on MPS (0.2-1.2 GB lower in epoch 2, same speed); CUDA skips it (its caching allocator reuses the blocks, so emptying it every epoch only costs the next epoch's allocations) |
 | Batch 16 (the failed run's), MPS cap 1.0 | - | - | out of memory after 52 s | the cap: fails fast instead of swapping 35 min |
 | Batch 8, MPS cap 1.0 | 86 s (through the CLI) | 1.97 | 11.4 (one run ran out of memory after 87 s) | batch 4 suggested |
 
@@ -1281,8 +1490,8 @@ at batch 16 after about a minute, retried at batch 8, trained (11.4 GB peak, 1.9
 / 0.82, 2.3-2.5 img/s, 7.1 GB.
 
 Not measurable here (no NVIDIA GPU), implemented behind the capability checks and unmeasured: TF32
-matmuls and cuDNN convolutions on compute capability 8.0+, `cudnn.benchmark` for Ultralytics (fixed
-input size), transformers `bf16` instead of `fp16` on 8.0+, `pin_memory` and persistent workers on
+matmuls and cuDNN convolutions on compute capability 8.0+, `cudnn.benchmark` for Ultralytics and
+transformers (fixed input size; not rfdetr, whose multi-scale batches change size), transformers `bf16` instead of `fp16` on 8.0+, `pin_memory` and persistent workers on
 CUDA, and Linux / Windows data loader workers raised from half the cores (at most 4) to all cores but
 one (at most 8).
 
@@ -1343,8 +1552,17 @@ workers send their output lines and results to the job thread, which alone repor
 ("videos 3/12 done; reading a.mp4, b.mp4"); the results are put back in video order before the dedup
 (which keeps the first of near duplicates), so the outcome does not depend on which video finished
 first. A video that fails is a warning (`<file>: not read (...)`); a cancel stops every worker (the
-running helpers are killed, no further video starts). The helpers run below normal priority, like
-every training-environment helper ([System load](#system-load-during-training)).
+running helpers are killed, no further video starts). The full-resolution pass of the kept frames
+(`import_footage.py frames`, below) runs the same way, as many videos at a time; its frames, warnings
+and progress ("full resolution: 40 of 120 frames") come back in video order too, and its log lines
+carry the video's name. Measured on a GTX 1070 Ti box (i5-8500, D3D11VA, three Blue Iris clips of
+0.5-2.7 GB on a second drive, 33 kept frames, the same bytes either way, a game using the GPU
+meanwhile): 81 and 80 s one video after another, 74 and 76 s three at once. The videos share the
+hardware decoder and the drive, so the gain there is small. The SigLIP embedding step (`embed`)
+decodes and preprocesses the next batch on a thread while the GPU embeds the current one (220
+candidate frames on the same box: 6.0 and 6.3 s before, 5.5 s after, the embeddings identical to
+the byte). The helpers run below normal priority,
+like every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
 (`av.codec.hwaccel.hwdevices_available()`): D3D11VA on Windows, CUDA then VAAPI on Linux (macOS
@@ -1415,7 +1633,9 @@ dataset.
    distance (Gonzalez; exact; starting at the frame closest to the mean), per scene with equal quotas
    (water-filled when a scene has fewer frames) unless `--no-balance`. `--select dhash` runs k-center
    on the dHash Hamming distance instead (no embeddings; an image-folder import then needs no Python,
-   no GPU and no download).
+   no GPU and no download). On Windows a SigLIP 2 import needs about 4.6 GB of memory commit (plus 1 GB
+   spare), checked before its first Python process: short, it is refused and the message offers the
+   dHash selection (*Memory commit check before a job* in [A run](#a-run)).
 5. **Writing**: each frame becomes `<scene>/<camera>/<date>/<ts>_imp-<id>-<n>.jpg`, the date and
    `<ts>` (`20240315T083012500-0700`) in the configured `timezone` (the JPEG copied as is), with a
    version-1 sidecar without detections, `source: "import:<id>"` and its
@@ -1519,7 +1739,7 @@ so a Review save with a stale `revision` gets a 409 instead of overwriting merge
 |---|---|---|---|
 | Batch the VLM check: up to 8 of a frame's boxes per Qwen3-VL call | on | `--no-vlm-batch` | `--vlm-batch 8` (off: `1`) |
 | Skip the VLM check below a fused score (0 < x <= 1); 2% of those boxes are asked anyway, to audit the cutoff | on, 0.15 | `--vlm-min-score X`, `--vlm-all-boxes` | `--vlm-min-score X --vlm-sample 0.02` |
-| Load the next frame on a background thread while the GPU works | on | `--no-prefetch` | `--prefetch` |
+| Load the next frame on a background thread while the GPU works; finish the frame before (WBF, SigLIP, the output line) on another | on | `--no-prefetch` | `--prefetch` |
 | Keep finished frames if cancelled (both modes) | on | `--discard-on-cancel` | - |
 | GPU of the labelers (shown with more than one usable NVIDIA GPU) | automatic (most VRAM) | `--gpu cuda:N` | `--device cuda:N` |
 
@@ -1527,6 +1747,18 @@ The VLM flags are left out when the VLM is off. Measured per frame on an M1 (MPS
 call): Qwen3-VL check 7.6 s (about 1 s per box, ~8 boxes), MM-Grounding-DINO 1.9 s, RF-DETR 0.2 s,
 SigLIP 0.07 s; 89% of the checked boxes had a fused score below 0.2, which is what the minimum score
 skips (such a box is triaged without a VLM answer).
+
+**Memory** (Windows): a labelers run keeps every labeler loaded, so their host memory commit adds up:
+about 2.6 GB for PyTorch and RF-DETR L, 2.0 GB for SigLIP 2, 6.4 GB for SAM 3 and twice the checkpoint for
+MM-Grounding-DINO and Qwen3-VL (the default run about 13.8 GB). A run that would grow the paging file into
+the last 16 GB of its drive is refused before its first Python process, naming the labelers to turn off
+(largest first); the preview says so first. A run with a model labels in this process and is not
+checked. See *Memory commit check before a job* in [A run](#a-run), after *Data loader workers*.
+
+Finishing a frame on another thread was measured on the GTX 1070 Ti box (MM-Grounding-DINO tiny +
+RF-DETR L + SigLIP on its CPU path, no VLM, 220 day and IR frames, 2,259 proposals): 0.72 s per
+frame before (two runs), 0.61 s after, with every proposal, score, source and species score
+identical to both runs before.
 
 ### Measuring auto-label
 
@@ -2028,8 +2260,13 @@ ones too, so it resumes; `again=1` in the filter looks afresh). The stages are *
 up the environment* (the training environment, RF-DETR L's weights through the pinned download if they are
 missing), *zoom check* (`scripts/autolabel.py --zoom-pairs`) and *writing suggestions*. A failed script
 keeps what finished too. It needs an NVIDIA GPU or Apple silicon, about 500 MB of VRAM and on Windows about
-2.6 GB of free commit, checked before the model loads. Measured on a GTX 1070 Ti: 79 ms per crop, about 5
-minutes for 3,578 crops.
+2.6 GB of memory commit (plus 1 GB kept spare, the paging file's growth counted with its 16 GB drive margin),
+checked before the environment's first process when there is a crop to check (*Memory commit check before a
+job* in [A run](#a-run)); the dry run and the Review tab's confirmation say first when a start now
+would be refused. Measured on a GTX 1070 Ti: 79 ms per crop, about 5
+minutes for 3,578 crops. The reader thread cuts the crops beside the decode and the output is flushed once per
+frame; on 528 crops of 186 frames that gave the same bytes and no difference beyond run-to-run noise (72 and
+84 ms per crop before, 75 ms after, RF-DETR L's load not counted).
 
 **Live reviews.** Each frame is judged again under the label write lock with the file as it stands: a pair
 whose box moved or went is passed over, a frame you skipped or checked meanwhile is left alone, and only a
@@ -2052,7 +2289,10 @@ labels, labels no model finds, and a box of another class than the one an indepe
 exists for the frames every trained model has already seen, which `--with-model --missing-only` cannot
 check (it skips them); for the frames reviewed since your last training run, the
 [quick check with a model](#quick-check-with-a-model) asks that model instead and trains nothing. It
-starts from the Refine tab, the command line or the job queue. **It changes no box, frame
+starts from the Refine tab, the command line or the job queue. On Windows it needs the memory commit
+of a fold's training (8.0 GB, more with a fixed `training.workers`, plus 1 GB spare), checked before the
+first fold: short, it is refused with nothing written, and the preview says so first (*Memory commit
+check before a job* in [A run](#a-run)). **It changes no box, frame
 status, config entry, model file, `runs.json` or `benchmark.json`**: it writes suggestions to
 `LabelFile.refine` and a report, and a box changes only when a reviewer accepts a suggestion.
 
@@ -2064,7 +2304,9 @@ never saw. Before it runs, the job reads the fold model's `train.txt` and `valid
 error if a frame of its own fold is in either, by name and by the source the dataset recorded for each
 image (`image_sources.json` beside the lists: the dataset cuts long names and numbers a name taken twice,
 so a name alone could miss one). The fold model is the training run as it is (`train run`'s
-stages), installed in the job's work folder, registered nowhere and benchmarked never. Its export applies no
+stages), installed in the fold's folder, registered nowhere, benchmarked never, and compiled without the
+OpenVINO model cache (`LoadRequest::no_cache`: each one's blob, about 60 MB, would never be read again;
+a quick check's configured model keeps its cache). Its export applies no
 size floor, whatever `collect.size_floor` says: the fold models try to learn every label, so the recall by
 size measures what a model of the recipe finds (a model trained under the floor would never find what the
 floor left out, and the table would only repeat the floor). The judge still treats a box under the floor
@@ -2351,7 +2593,16 @@ read (a damaged JPEG) gets no result; both are counted in a warning and the fold
 suggestions cannot be written is a warning (the first 20 named, the rest counted in one line); a fold none
 of whose frames could be written counts as failed. Each fold's folder
 (`<training dir>/refine/<id>/fold-N`) is deleted when the fold is written, the work folder at the end however
-the run ends; a crashed run's is removed by the storage sweep (`WORK_DIRS`). Pause suspends the training
+the run ends; a crashed run's is removed by the storage sweep (`WORK_DIRS`). When the training folder is
+on another volume than the folder under review, and that volume allows hard links and has room for the
+folds (twice the selected images, five times the base weights, the labels, plus the free-space margin
+of an import), the fold folders go to `<parent of the folder under review>/.blue-onyx-prism-work/refine/<id>/fold-N`
+instead (`refine/place.rs`; never inside the dataset or review folder), so each fold's export hard-links
+the frames rather than copying them across volumes. That folder is held busy like a work folder, named in
+the work folder (`elsewhere.txt`) before it is made, and removed at the end; after a crash the sweep
+removes it by its own marker (`NEAR_WORK_DIRS` under `.blue-onyx-prism-work` beside the configured dataset
+and review folders) or through the work folder that names it, and the Storage card lists it with the other
+work folders. Pause suspends the training
 processes; the export, prediction and writes of the running fold finish first.
 
 - **Cancel** keeps the suggestions of the finished folds (a fold is written whole or not at all) and ends
@@ -2413,14 +2664,16 @@ look decides, the overlap check's zoom stage (`refine/tighten.rs`):
 2. **The look**, once after the last fold, under the training lock the check holds:
    `scripts/autolabel.py --zoom-pairs` (unchanged; the overlap check's runner, `overlaps::zoom::prepare` and
    `run`) with RF-DETR L on one crop per candidate, the union of the label `L` and `D`, padded by 20%
-   (`--zoom-pad`), at score 0.1, one flushed JSONL line per crop (with the crop it cut and the image's size,
+   (`--zoom-pad`), at score 0.1, one JSONL line per crop, flushed per frame (with the crop it cut and the image's size,
    which rule (g) uses). At most `MAX_TIGHTEN_CANDIDATES` 2,000 candidates are sent, those with the most
    confident `D` (ties by frame and place, so the same on every run); the rest are left out with a warning
    in the report and the summary (`tighten_left_out`), and their open `tighten` stays. It is the job's step
    *looking closer at N loose labels* (N the labels sent; its progress line counts *i of N crops*), and
    needs what the overlap check needs: the training environment, RF-DETR L's weights
-   (0.14 GB, `train-base:rfdetr-large`), about 500 MB of VRAM and on Windows about 2.6 GB of free commit,
-   checked before the model loads.
+   (0.14 GB, `train-base:rfdetr-large`), about 500 MB of VRAM and on Windows about 2.6 GB of memory
+   commit (plus 1 GB spare), checked again before the look's first process: short, the look is skipped
+   with a warning and the folds' suggestions stay. A quick check's preview says when the look would be
+   skipped now.
 3. **The decision** (`judge::tighten_verdict`, pure): the closer look's boxes of the object are its
    detections of the same object at `TIGHTEN_ZOOM_SCORE` 0.5 or more, clamped to the frame; `Z` is the one
    with the best IoU to `D` (ties: the higher score, then the earlier detection). A `tighten` to `Z`
@@ -2610,7 +2863,9 @@ web UI and shows its results; the check itself is the one above and changes no b
   sends it as `tighten` with the preview, `tighten=1|0`, and the start, `"tighten": true|false`) and *Allow
   downloads over 500 MB*. *Preview* is `train refine --dry-run`
   (`GET /v1/refine/preview`: frames, what the export leaves out, camera days, each fold's size, the model,
-  a rough time, warnings, or why a start would be refused). *Start* (`POST /v1/refine/check`) plans the check,
+  a rough time, warnings, or why a start would be refused; `memory` `{refusal, override_label}` when the
+  memory commit check would refuse a start now, with the *Start anyway* box that sends
+  `"ignore_memory_check": true`). *Start* (`POST /v1/refine/check`) plans the check,
   gives it the running service's runtimes for the fold models' predictions (no second OpenVINO / ONNX Runtime
   instance) and queues it on the one-at-a-time queue. It refuses, in the check's own words, when too few
   reviewed frames can be checked, the folder under review is unplugged (503, `folder_missing`), a large
@@ -2904,14 +3159,14 @@ blue-onyx-prism train prepare --dataset <export> [--dataset <export>] [--scene n
     [--static-cap 20 (0 = off)] (--out <dir> | --dry-run)
 blue-onyx-prism train run --model yolo26n [--model rfdetr-nano ...] --dataset <export> \
     [--scene all|day|night|ir|night+ir|day+ir ... (repeat for a comparison)] \
-    [--classes a,b] [--classes c] [--excluded background|drop-frame] \
+    [--classes a,b] [--classes c] [--rename from=to ...] [--excluded background|drop-frame] \
     [--balance class,scene,camera,camera-day|off] [--balance-strength 0.5] [--balance-max-repeat 4] [--balance-cap 3] \
     [--static-cap 20 (0 = off)] [--epochs 100] [--patience 15 (0 = off)] [--batch 16] [--imgsz 640] [--lr 0.001] [--lr-schedule cosine|linear|step] [--lr-min-factor 0.05] [--select-metric map|map50|f1|f2|f0_5|iou] [--night-aug] [--aug-dark p --aug-noise p --aug-gray p] \
-    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--verbose]
+    [--name n] [--install-dir <dir>] [--gpu cuda:N] [--benchmark-set nir-night] [--benchmark-device ort:cuda:0] [--no-register] [--no-benchmark] [--keep-work] [--allow-large] [--ignore-memory-check] [--verbose]
 blue-onyx-prism train import --path <video, image or folder> [--camera c] [--frames 200] [--select siglip|dhash] \
     [--scene 0.01] [--max-fps 1] [--every 10] [--dedup 6] [--dedup-window 10] [--no-balance] \
     [--max-candidates 1500] [--workers 0] [--hwaccel auto|off] \
-    [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--verbose] \
+    [--license "own footage"] --confirm-license [--allow-large] [--keep-work] [--ignore-memory-check] [--verbose] \
     [--out-dir <dir> [--review-folder]] [--autolabel | --autolabel-with-model <model>] \
     [--reject-below 0.3] [--accept-auto]
 blue-onyx-prism train import --url <video URL> --license "CC BY 4.0" --confirm-license [...]
@@ -2919,13 +3174,14 @@ blue-onyx-prism train import --dataset meva-sample [...]
 blue-onyx-prism train import --list-datasets
 blue-onyx-prism train autolabel [--frames "scene=ir,status=unreviewed,import=any,limit=200"] \
     [--gdino tiny|base|large|off] [--no-rfdetr] [--vlm 2b|4b|8b|off] [--no-siglip] [--classes a,b] \
-    [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] [--verbose]
+    [--no-vlm-batch] [--vlm-min-score 0.2] [--no-prefetch] [--discard-on-cancel] [--gpu cuda:N] [--allow-large] \
+    [--ignore-memory-check] [--verbose]
 blue-onyx-prism train autolabel --sam3 [--dry-run] [...]   # SAM 3 in MM-Grounding-DINO's seat; --dry-run only previews
 blue-onyx-prism hf-login | hf-logout      # Hugging Face token for the SAM 3 download
 blue-onyx-prism train overlaps [--frames "scene=ir,camera=patio,limit=200,again=1"] [--gpu cuda:0] \
-    [--allow-large] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
+    [--allow-large] [--ignore-memory-check] [--dry-run] [--verbose]    # suggestions for overlapping boxes; changes no box
 blue-onyx-prism train refine [--dry-run] [--folds 4] [--epochs 8] [--frames "scene=ir,camera=patio"] \
-    [--gpu cuda:N] [--allow-large] [--verbose]    # dataset check by fold models; changes no box
+    [--gpu cuda:N] [--allow-large] [--ignore-memory-check] [--verbose]    # dataset check by fold models; changes no box
 blue-onyx-prism train refine --with-model <name> [--dry-run] [--frames ...] [--no-tighten]   # quick check:
     # a model trained here judges the reviewed frames it never trained or validated on; no training
 blue-onyx-prism train autolabel --with-model <name|local:<file>|resource:<id>> [--threshold 0.3] \
@@ -2946,7 +3202,9 @@ strength, max repeat and cap flags change that default's values. See [Assembly](
 step 7. `--static-cap N` (`prepare`, `run`) overrides `training.static_cap` for this command (0 = off; see
 the static cap in step 3). `prepare --dry-run` writes nothing and prints images per epoch before -> after, boxes and frames per
 class, frames per scene, the top cameras (and camera-days), dropped frames and warnings; `prepare` and
-`run` print the balance summary.
+`run` print the balance summary. `--ignore-memory-check` (`run`, `import`, `autolabel`, `overlaps`,
+`refine`) starts a job the memory commit check would refuse on Windows ([Memory commit check before a
+job](#a-run)); `prepare --dry-run` says when a run would be refused now.
 
 Model labels: `yolo26n`..`yolo26x`, `yolo11n`.., `yolov8n`.., `rfdetr-nano|small|medium|base|large`,
 `rt-detrv2-s|m|l|x`, `dfine-s|m|l|x`.

@@ -24,7 +24,8 @@
 //! order of the worker. The in-flight cap counts a request until its handler gets the reply,
 //! so verification time counts against it as it should.
 
-use super::run::{DoneLine, VerifyLog, save_annotated};
+use super::run::{DoneLine, VerifyLog};
+use super::save::SaveJob;
 use super::{Decoded, LiveSettings, ORDER_TARGET, Peers, Purpose, Reply, WorkItem, ms};
 use crate::api::{Prediction, VisionDetectionResponse};
 use crate::image::RgbImage;
@@ -45,6 +46,8 @@ pub(super) struct LaneCtx {
     pub(super) name: String,
     pub(super) metrics: Arc<ModelMetrics>,
     pub(super) peers: Peers,
+    /// The image saver (None: the process-wide one).
+    pub(super) saver: Option<Arc<super::save::Saver>>,
 }
 
 /// A request whose candidates wait for the verifier.
@@ -68,6 +71,8 @@ pub(super) struct Pending {
     pub(super) line: DoneLine,
     /// The dataset collector's record of the request (None: collection off).
     pub(super) collect: Option<super::collect::Job>,
+    /// The upload's encoded bytes for `save_ref_image` ([`super::pipeline::Meta::upload`]).
+    pub(super) upload: Option<bytes::Bytes>,
 }
 
 /// Why candidates stayed unverified.
@@ -387,6 +392,7 @@ fn start(ctx: &LaneCtx, p: Box<Pending>, active: &mut Vec<Active>) {
                             from: ctx.name.clone(),
                             purpose: Purpose::Verify,
                             original: None,
+                            upload: None,
                         }));
                         match h.sender.try_send(item) {
                             Ok(()) => a.waits.push((k, rx)),
@@ -471,6 +477,7 @@ fn complete(
         handed_off,
         line,
         mut collect,
+        upload,
         ..
     } = *p;
     let outcomes = match &live.verify {
@@ -536,16 +543,19 @@ fn complete(
             outcome,
         }),
     );
-    if let (Some(dir), Some(img)) = (&live.save_image_path, &img) {
-        save_annotated(
-            &ctx.name,
-            dir,
-            &image_name,
+    // Drawn, encoded and written after the reply ([`super::save`]).
+    let save_job = match (&live.save_image_path, img) {
+        (Some(dir), Some(img)) => Some(SaveJob {
+            model: ctx.name.clone(),
+            dir: dir.clone(),
+            image_name: image_name.clone(),
             img,
-            &resp.predictions,
-            live.save_ref_image,
-        );
-    }
+            predictions: resp.predictions.clone(),
+            save_ref: live.save_ref_image,
+            upload,
+        }),
+        _ => None,
+    };
     trace!(
         target: ORDER_TARGET,
         model = %ctx.name,
@@ -557,9 +567,12 @@ fn complete(
     if !reply.send(resp) {
         tracing::debug!(model = %ctx.name, "client went away before the response was sent");
     }
-    // After the reply (a `try_send`, never waits).
+    // After the reply (each a `try_send`, never waits).
     if let Some((job, predictions)) = collect {
         job.submit(&predictions);
+    }
+    if let Some(job) = save_job {
+        super::save::submit(ctx.saver.as_deref(), job);
     }
 }
 

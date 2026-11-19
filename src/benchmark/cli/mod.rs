@@ -13,7 +13,7 @@
 //!                                                       # grade by frame ROC AUC, pick by Youden's J
 //! ```
 
-use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, spec};
+use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, priority, spec};
 use crate::benchmark::grade::AccuracyMetric;
 use crate::benchmark::images::{self, ImageSet};
 use crate::benchmark::report::{HardwareSummary, RuntimeVersions};
@@ -307,12 +307,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         return Ok(ok);
     }
     check_args(&args, &config_path)?;
-    // Before the runtimes exist, so their thread pools inherit the nice value on Unix; held to
-    // the end of the run.
-    let _prio = crate::backend::priority::lower_for_benchmark(
-        !args.no_low_priority && config.benchmark.low_priority,
-        false,
-    );
+    let low_priority = !args.no_low_priority && config.benchmark.low_priority;
     let objective = args
         .threshold_objective
         .unwrap_or(config.benchmark.threshold_objective);
@@ -340,6 +335,14 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     let (mut sets, warnings) = load_sets(&args, &config)?;
     let (repeat, warmup, weights) = timing_settings(&args, &config, &sets);
     let cache_dir = cache_dir_arg(&args, &config);
+    // Unix: before the runtimes exist, so their thread pools inherit the nice value, and only
+    // for a run whose devices are all CPUs (it cannot be raised again); held to the end of the
+    // run. Windows switches per device instead (`bench.priority`).
+    let cpu_only = !all_devices
+        && !jobs.is_empty()
+        && jobs.iter().all(|p| priority::lowers_device(&p.job.device));
+    let _prio = priority::lower_up_front(low_priority, cpu_only);
+    let per_device = priority::DevicePriority::new(low_priority);
     let runtimes = open_runtimes(
         &args,
         &config,
@@ -411,6 +414,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         let mut pb = Bench::new(&[], 0, 1, params);
         pb.cache_dir = cache_dir.as_deref();
         pb.progress = Some(&progress);
+        pb.priority = priority::PER_DEVICE.then_some(&per_device);
         ctx.pseudo_ground_truth(&pb, &jobs, &mut sets, &mut report);
     }
 
@@ -420,6 +424,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     bench.weights = weights;
     bench.threshold_objective = objective;
     bench.accuracy_metric = metric;
+    bench.priority = priority::PER_DEVICE.then_some(&per_device);
 
     let run_id = crate::benchmark::history::new_run_id();
     let mut swept = ctx.run_jobs(&mut bench, &progress, &jobs, all_devices, &mut report)?;

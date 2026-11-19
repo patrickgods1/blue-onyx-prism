@@ -51,6 +51,8 @@ use std::sync::atomic::AtomicBool;
 pub const CANDIDATES_FILE: &str = "tighten-candidates.jsonl";
 /// The look's own folder in the work folder (the crop list and the script's answers).
 pub const ZOOM_DIR: &str = "zoom";
+/// The look in a sentence (its commit refusal, [`crate::training::commit`]).
+pub const LOOK_WHAT: &str = "the closer look at loose labels";
 /// Seconds per crop of the look: the overlap check's measurement (79 ms per crop of RF-DETR L on a
 /// GTX 1070 Ti, 3,578 crops in about 5 minutes; its Review page estimate uses 0.08 s).
 pub const ZOOM_S_PER_CROP: f64 = 0.079;
@@ -435,6 +437,16 @@ pub fn run_stage(
             return end;
         }
     };
+    // Before the environment's first Python process (the folds' training has ended by now).
+    if let Err(e) = crate::training::commit::gate_task(
+        &zoom::commit_need(LOOK_WHAT),
+        (job.headroom)().as_ref(),
+        job.request.ignore_memory_check,
+        report,
+    ) {
+        fail(acc, &mut end, e);
+        return end;
+    }
     stage(report, &name, step, steps, 0, "setting up the environment");
     let mut bar = Bar { last: 0 };
     let prepared = zoom::prepare(
@@ -456,11 +468,6 @@ pub fn run_stage(
             return end;
         }
     };
-    if let Some(why) = zoom::commit_problem("the closer look at loose labels", (job.free_commit)())
-    {
-        fail(acc, &mut end, anyhow::anyhow!(why));
-        return end;
-    }
     let ran = match zoom::run(
         &helper,
         &work,

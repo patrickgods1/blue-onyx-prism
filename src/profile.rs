@@ -36,6 +36,16 @@ pub const CPU_THROUGHPUT_CORES: usize = 12;
 pub const IGPU_INFLIGHT: usize = 2;
 /// In flight on a discrete OpenVINO GPU (Intel Arc), clamped to its `NUM_STREAMS`.
 pub const DGPU_INFLIGHT: usize = 4;
+/// Upper bound of the in-flight count of an OpenVINO GPU model with `performance_hint:
+/// throughput`, which otherwise follows the compiled model's `OPTIMAL_NUMBER_OF_INFER_REQUESTS`
+/// (the GPU plugin reports twice its `NUM_STREAMS` under any hint but LATENCY: measured on a UHD
+/// 630, NUM_STREAMS=2 and OPTIMAL_NUMBER_OF_INFER_REQUESTS=4). More requests than
+/// that only queue inside OpenVINO, adding their wait to each request's latency, and every
+/// request holds its own input and output buffers. Blue Iris sends one request per camera
+/// trigger, so a burst of more than 4 at once is rare on the boxes this targets.
+pub const THROUGHPUT_INFLIGHT_CAP: usize = 4;
+// The cap is reachable: `effective_inflight` clamps to MAX_INFLIGHT last.
+const _: () = assert!(THROUGHPUT_INFLIGHT_CAP <= MAX_INFLIGHT);
 
 /// VRAM from which a discrete GPU gets two ONNX Runtime sessions per model (each holds a copy).
 pub const ORT_TWO_SESSIONS_VRAM_MB: u64 = 4096;
@@ -271,6 +281,49 @@ impl PerfHint {
     }
 }
 
+/// Config `performance_hint` (global and per model): the OpenVINO hint a model on an OpenVINO
+/// GPU is compiled with. Unset = the profile's choice for the device ([`Profile::tuning_for`]:
+/// LATENCY on an integrated GPU, THROUGHPUT on a discrete Intel GPU); CPU, NPU and ONNX Runtime
+/// devices ignore it ([`Profile::tuning_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PerformanceHint {
+    /// LATENCY, [`IGPU_INFLIGHT`] in flight (an integrated GPU's default).
+    Latency,
+    /// THROUGHPUT, in flight = `OPTIMAL_NUMBER_OF_INFER_REQUESTS` of the compiled model, at most
+    /// [`THROUGHPUT_INFLIGHT_CAP`].
+    Throughput,
+}
+
+impl PerformanceHint {
+    /// `latency` / `throughput` (the config value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PerformanceHint::Latency => "latency",
+            PerformanceHint::Throughput => "throughput",
+        }
+    }
+
+    /// The OpenVINO hint it compiles with.
+    pub fn perf_hint(self) -> PerfHint {
+        match self {
+            PerformanceHint::Latency => PerfHint::Latency,
+            PerformanceHint::Throughput => PerfHint::Throughput,
+        }
+    }
+}
+
+impl std::str::FromStr for PerformanceHint {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "latency" => Ok(PerformanceHint::Latency),
+            "throughput" => Ok(PerformanceHint::Throughput),
+            other => Err(format!("'{other}' is not one of latency, throughput")),
+        }
+    }
+}
+
 /// The kind of device a model runs on, for its concurrency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceClass {
@@ -294,6 +347,9 @@ pub struct DeviceTuning {
     pub inflight: usize,
     /// Clamp `inflight` to the `NUM_STREAMS` OpenVINO reports after compiling.
     pub clamp_to_streams: bool,
+    /// Clamp `inflight` to the `OPTIMAL_NUMBER_OF_INFER_REQUESTS` OpenVINO reports after
+    /// compiling (`performance_hint: throughput`).
+    pub clamp_to_optimal: bool,
     /// ONNX Runtime sessions of the model (1 for OpenVINO).
     pub ort_sessions: usize,
 }
@@ -304,15 +360,20 @@ impl DeviceTuning {
         hint: PerfHint::Latency,
         inflight: 1,
         clamp_to_streams: false,
+        clamp_to_optimal: false,
         ort_sessions: 1,
     };
 
-    /// `inflight` after compiling with `streams` reported (None: not readable).
-    pub fn effective_inflight(&self, streams: Option<usize>) -> usize {
-        let n = match streams {
-            Some(s) if self.clamp_to_streams => self.inflight.min(s.max(1)),
-            _ => self.inflight,
-        };
+    /// `inflight` after compiling with `streams` (`NUM_STREAMS`) and `optimal`
+    /// (`OPTIMAL_NUMBER_OF_INFER_REQUESTS`) reported; None = not readable, no clamp from it.
+    pub fn effective_inflight(&self, streams: Option<usize>, optimal: Option<usize>) -> usize {
+        let mut n = self.inflight;
+        if let Some(s) = streams.filter(|_| self.clamp_to_streams) {
+            n = n.min(s.max(1));
+        }
+        if let Some(o) = optimal.filter(|_| self.clamp_to_optimal) {
+            n = n.min(o.max(1));
+        }
         n.clamp(1, MAX_INFLIGHT)
     }
 }
@@ -325,6 +386,8 @@ pub struct Overrides {
     /// The model serves `/v1/vision/detection` (the config's effective default when it loaded):
     /// only it gets the profile's second ONNX Runtime session ([`Profile::tuning_with`]).
     pub default_model: bool,
+    /// `performance_hint` (model, else global; None = the profile's hint for the device).
+    pub hint: Option<PerformanceHint>,
 }
 
 /// The profile of this machine.
@@ -487,14 +550,43 @@ impl Profile {
         }
     }
 
-    /// [`Self::tuning_for`] with the explicit config values applied: `inflight` (model, else
+    /// The tuning `performance_hint` sets on an OpenVINO GPU (`dev` integrated or discrete; None
+    /// for every other device, which keeps [`Self::tuning_for`]):
+    /// - `latency`: LATENCY, [`IGPU_INFLIGHT`] in flight (today's integrated-GPU tuning);
+    /// - `throughput`: THROUGHPUT, in flight = `OPTIMAL_NUMBER_OF_INFER_REQUESTS` at most
+    ///   [`THROUGHPUT_INFLIGHT_CAP`] ([`DeviceTuning::effective_inflight`]).
+    pub fn hint_tuning(dev: DeviceClass, hint: PerformanceHint) -> Option<DeviceTuning> {
+        if !matches!(dev, DeviceClass::IntegratedGpu | DeviceClass::DiscreteGpu) {
+            return None;
+        }
+        let serial = DeviceTuning::SERIAL;
+        Some(match hint {
+            PerformanceHint::Latency => DeviceTuning {
+                inflight: IGPU_INFLIGHT,
+                ..serial
+            },
+            PerformanceHint::Throughput => DeviceTuning {
+                hint: PerfHint::Throughput,
+                inflight: THROUGHPUT_INFLIGHT_CAP,
+                clamp_to_optimal: true,
+                ..serial
+            },
+        })
+    }
+
+    /// [`Self::tuning_for`] with the explicit config values applied: `performance_hint` (model,
+    /// else global; None = profile) picks the hint and count on an OpenVINO GPU
+    /// ([`Self::hint_tuning`]); `inflight` (model, else
     /// global; 0 = profile) replaces the count and is not clamped to the streams; for ONNX
     /// Runtime `ort_sessions` (0 = profile) sets the sessions and an explicit `inflight` caps
     /// them. Without `ort_sessions` only the default model gets the profile's sessions, every
     /// other model one: each session is a full copy of the model in GPU memory, and the other
     /// models (night, verifier, per-camera) see a fraction of the traffic.
     pub fn tuning_with(&self, dev: DeviceClass, o: Overrides) -> DeviceTuning {
-        let mut t = self.tuning_for(dev);
+        let mut t = o
+            .hint
+            .and_then(|h| Self::hint_tuning(dev, h))
+            .unwrap_or_else(|| self.tuning_for(dev));
         if let DeviceClass::Ort { .. } = dev {
             if o.ort_sessions > 0 {
                 t.ort_sessions = o.ort_sessions.min(MAX_INFLIGHT);
@@ -508,6 +600,7 @@ impl Profile {
         } else if o.inflight > 0 {
             t.inflight = o.inflight.min(MAX_INFLIGHT);
             t.clamp_to_streams = false;
+            t.clamp_to_optimal = false;
         }
         t
     }
@@ -692,9 +785,9 @@ mod tests {
             (t.hint, t.inflight, t.clamp_to_streams),
             (PerfHint::Throughput, 4, true)
         );
-        assert_eq!(t.effective_inflight(Some(2)), 2);
-        assert_eq!(t.effective_inflight(Some(8)), 4);
-        assert_eq!(t.effective_inflight(None), 4);
+        assert_eq!(t.effective_inflight(Some(2), None), 2);
+        assert_eq!(t.effective_inflight(Some(8), None), 4);
+        assert_eq!(t.effective_inflight(None, None), 4);
         assert_eq!(p.primary_device(), DeviceClass::DiscreteGpu);
         assert_eq!(p.inflight, 4);
     }
@@ -706,8 +799,12 @@ mod tests {
         let t = p.tuning_for(DeviceClass::Cpu);
         assert_eq!(t.hint, PerfHint::Throughput);
         assert!(t.clamp_to_streams);
-        assert_eq!(t.effective_inflight(Some(4)), 4, "inflight = NUM_STREAMS");
-        assert_eq!(t.effective_inflight(Some(32)), MAX_INFLIGHT);
+        assert_eq!(
+            t.effective_inflight(Some(4), None),
+            4,
+            "inflight = NUM_STREAMS"
+        );
+        assert_eq!(t.effective_inflight(Some(32), None), MAX_INFLIGHT);
         assert_eq!(p.preprocess_threads_for(true), 2);
         assert!(p.summary(2).contains("up to 8 in flight (NUM_STREAMS)"));
     }
@@ -876,7 +973,7 @@ mod tests {
         assert_eq!(cpu.inflight, 2);
         assert!(!cpu.clamp_to_streams, "explicit counts are not clamped");
         assert_eq!(cpu.hint, PerfHint::Throughput);
-        assert_eq!(cpu.effective_inflight(Some(1)), 2);
+        assert_eq!(cpu.effective_inflight(Some(1), None), 2);
         let ort = p.tuning_with(
             DeviceClass::Ort { gpu: false },
             Overrides {
@@ -1011,5 +1108,159 @@ mod tests {
         assert_eq!(f.gpu_name.as_deref(), Some("big"));
         let detected = Facts::detect();
         assert!(detected.logical_cores >= 1);
+    }
+
+    fn uhd_630() -> Profile {
+        classify(&facts(
+            6,
+            16.0,
+            "x86_64",
+            vec![gpu(GpuVendor::Intel, "Intel(R) UHD Graphics 630", 0, false)],
+        ))
+    }
+
+    fn with_hint(hint: Option<PerformanceHint>) -> Overrides {
+        Overrides {
+            hint,
+            ..Overrides::default()
+        }
+    }
+
+    #[test]
+    fn performance_hint_parses_and_serializes_lowercase() {
+        for (text, want) in [
+            ("latency", PerformanceHint::Latency),
+            (" Throughput ", PerformanceHint::Throughput),
+        ] {
+            assert_eq!(text.parse::<PerformanceHint>(), Ok(want));
+            let json = format!("\"{}\"", want.as_str());
+            assert_eq!(serde_json::to_string(&want).unwrap(), json);
+            assert_eq!(
+                serde_json::from_str::<PerformanceHint>(&json).unwrap(),
+                want
+            );
+        }
+        assert!("cumulative_throughput".parse::<PerformanceHint>().is_err());
+        assert!(serde_json::from_str::<PerformanceHint>(r#""LATENCY""#).is_err());
+        assert_eq!(
+            PerformanceHint::Throughput.perf_hint(),
+            PerfHint::Throughput
+        );
+        assert_eq!(PerformanceHint::Latency.perf_hint(), PerfHint::Latency);
+    }
+
+    #[test]
+    fn unset_hint_is_the_profile_on_every_device() {
+        let p = uhd_630();
+        for dev in [
+            DeviceClass::Cpu,
+            DeviceClass::IntegratedGpu,
+            DeviceClass::DiscreteGpu,
+            DeviceClass::Npu,
+            DeviceClass::Ort { gpu: true },
+            DeviceClass::Ort { gpu: false },
+        ] {
+            assert_eq!(
+                p.tuning_with(dev, with_hint(None)),
+                p.tuning_with(dev, Overrides::default()),
+                "{dev:?}"
+            );
+        }
+        // Today's integrated-GPU tuning: LATENCY, 2 in flight, nothing reported clamps it.
+        let t = p.tuning_with(DeviceClass::IntegratedGpu, with_hint(None));
+        assert_eq!((t.hint, t.inflight), (PerfHint::Latency, IGPU_INFLIGHT));
+        assert_eq!(t.effective_inflight(Some(1), Some(1)), IGPU_INFLIGHT);
+        // `latency` set explicitly is exactly the integrated GPU's default.
+        assert_eq!(
+            p.tuning_with(
+                DeviceClass::IntegratedGpu,
+                with_hint(Some(PerformanceHint::Latency))
+            ),
+            t
+        );
+    }
+
+    #[test]
+    fn throughput_hint_follows_optimal_requests_up_to_the_cap() {
+        let p = uhd_630();
+        let t = p.tuning_with(
+            DeviceClass::IntegratedGpu,
+            with_hint(Some(PerformanceHint::Throughput)),
+        );
+        assert_eq!(t.hint, PerfHint::Throughput);
+        assert!(t.clamp_to_optimal && !t.clamp_to_streams);
+        assert_eq!(t.ort_sessions, 1);
+        // 2 streams under THROUGHPUT report 4 optimal requests.
+        assert_eq!(t.effective_inflight(Some(2), Some(4)), 4);
+        assert_eq!(t.effective_inflight(Some(1), Some(2)), 2);
+        assert_eq!(t.effective_inflight(None, Some(3)), 3);
+        // A plugin that asks for more stays at the cap.
+        assert_eq!(
+            t.effective_inflight(Some(4), Some(64)),
+            THROUGHPUT_INFLIGHT_CAP
+        );
+        // Unreadable: the cap; a reported 0 still keeps one request.
+        assert_eq!(t.effective_inflight(None, None), THROUGHPUT_INFLIGHT_CAP);
+        assert_eq!(t.effective_inflight(None, Some(0)), 1);
+    }
+
+    #[test]
+    fn hint_applies_to_openvino_gpus_only() {
+        let arc = classify(&facts(
+            16,
+            32.0,
+            "x86_64",
+            vec![gpu(GpuVendor::Intel, "Intel(R) Arc(TM) A770", 16384, true)],
+        ));
+        for dev in [DeviceClass::IntegratedGpu, DeviceClass::DiscreteGpu] {
+            let lat = arc.tuning_with(dev, with_hint(Some(PerformanceHint::Latency)));
+            assert_eq!(
+                (
+                    lat.hint,
+                    lat.inflight,
+                    lat.clamp_to_streams,
+                    lat.clamp_to_optimal
+                ),
+                (PerfHint::Latency, IGPU_INFLIGHT, false, false),
+                "{dev:?}"
+            );
+            let tput = arc.tuning_with(dev, with_hint(Some(PerformanceHint::Throughput)));
+            assert_eq!(
+                (tput.hint, tput.inflight, tput.clamp_to_optimal),
+                (PerfHint::Throughput, THROUGHPUT_INFLIGHT_CAP, true),
+                "{dev:?}"
+            );
+        }
+        for dev in [
+            DeviceClass::Cpu,
+            DeviceClass::Npu,
+            DeviceClass::Ort { gpu: true },
+            DeviceClass::Ort { gpu: false },
+        ] {
+            assert_eq!(Profile::hint_tuning(dev, PerformanceHint::Throughput), None);
+            for h in [PerformanceHint::Latency, PerformanceHint::Throughput] {
+                assert_eq!(
+                    arc.tuning_with(dev, with_hint(Some(h))),
+                    arc.tuning_with(dev, Overrides::default()),
+                    "{dev:?} {h:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_inflight_wins_over_the_hint_count() {
+        let p = uhd_630();
+        let t = p.tuning_with(
+            DeviceClass::IntegratedGpu,
+            Overrides {
+                inflight: 3,
+                hint: Some(PerformanceHint::Throughput),
+                ..Overrides::default()
+            },
+        );
+        assert_eq!(t.hint, PerfHint::Throughput, "the hint stays");
+        assert!(!t.clamp_to_optimal, "explicit counts are not clamped");
+        assert_eq!(t.effective_inflight(Some(2), Some(2)), 3);
     }
 }

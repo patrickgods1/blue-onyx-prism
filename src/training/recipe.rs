@@ -55,6 +55,13 @@ pub enum MultiScale {
 /// Smallest batch `auto` keeps multi-scale training for.
 pub const MULTI_SCALE_MIN_BATCH: u32 = 4;
 
+/// The short side rfdetr's scale-jitter branch resizes a training image to before its random crop
+/// (`SmallestMaxSize` 400 / 500 / 600 in `rfdetr.datasets.coco`, on by default): a prepared image
+/// keeps at least this ([`TrainRecipe::prepared_short_side`]).
+pub const RFDETR_JITTER_FLOOR: u32 = 600;
+/// Ultralytics' prepared short side as a fraction of `imgsz` (3 / 2).
+pub const ULTRALYTICS_PREPARED_FACTOR: (u32, u32) = (3, 2);
+
 impl MultiScale {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -612,9 +619,10 @@ impl TrainRecipe {
     }
 
     /// Whether RF-DETR trains multi-scale on a GPU with `memory_mb` for the estimate (0 =
-    /// unknown): `on` / `off` as set; `auto` = on when the estimate with it on fits a batch of at
-    /// least [`MULTI_SCALE_MIN_BATCH`]. Always false for the other families.
-    pub fn multi_scale_on(&self, memory_mb: u64) -> bool {
+    /// unknown) on `target` (CUDA and MPS memory are estimated apart): `on` / `off` as set;
+    /// `auto` = on when the estimate with it on fits a batch of at least
+    /// [`MULTI_SCALE_MIN_BATCH`]. Always false for the other families.
+    pub fn multi_scale_on(&self, memory_mb: u64, target: super::estimate::Target) -> bool {
         if self.family != TrainFamily::Rfdetr {
             return false;
         }
@@ -629,9 +637,39 @@ impl TrainRecipe {
                         self.imgsz,
                         memory_mb,
                         true,
+                        target,
                     )
                     .is_some_and(|b| b >= MULTI_SCALE_MIN_BATCH)
             }
+        }
+    }
+
+    /// The short side, in pixels, the run's train and validation images are re-encoded to when
+    /// the dataset is prepared (`dataset::Options::prepared_short_side`; never upscaled, the
+    /// held-out frames stay full size), with RF-DETR's multi-scale training on or off
+    /// ([`Self::multi_scale_on`]). What each trainer reads of an image at most:
+    /// - RF-DETR: the larger of its largest training side ([`super::estimate::rfdetr_max_side`]
+    ///   with multi-scale on, else `imgsz`; its square resize stretches to it) and
+    ///   [`RFDETR_JITTER_FLOOR`], the short side its scale-jitter branch resizes to before the crop
+    ///   (rfdetr's `draft_size_for_transforms`, which decodes no smaller than this either);
+    /// - Ultralytics: [`ULTRALYTICS_PREPARED_FACTOR`] x `imgsz` (it resizes the long side to
+    ///   `imgsz` before its augmentations, so this leaves room for its zoom);
+    /// - transformers (RT-DETRv2, D-FINE): `imgsz` (its image processor stretches to `imgsz` x
+    ///   `imgsz`). Pure.
+    pub fn prepared_short_side(&self, multi_scale: bool) -> u32 {
+        match self.family.trainer() {
+            catalog::Trainer::RfDetr => {
+                let side = if multi_scale {
+                    super::estimate::rfdetr_max_side(&self.size, self.imgsz)
+                } else {
+                    self.imgsz
+                };
+                side.max(RFDETR_JITTER_FLOOR)
+            }
+            catalog::Trainer::Ultralytics => {
+                (self.imgsz * ULTRALYTICS_PREPARED_FACTOR.0).div_ceil(ULTRALYTICS_PREPARED_FACTOR.1)
+            }
+            catalog::Trainer::Transformers => self.imgsz,
         }
     }
 
@@ -839,6 +877,65 @@ pub fn build_recipe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prepared short side of every family: RF-DETR's equal rfdetr 1.11.2's own
+    /// `draft_size_for_transforms("train", imgsz, multi_scale=.., expanded_scales=True,
+    /// scale_jitter=True)` for every size at its default, 384 and 640 px, multi-scale on and off
+    /// (printed from the installed package); Ultralytics 1.5 x imgsz rounded up; transformers
+    /// imgsz.
+    #[test]
+    fn prepared_short_side_per_family() {
+        // (size, imgsz, multi-scale on, off)
+        let rfdetr = [
+            ("nano", 384, 600, 600),
+            ("nano", 640, 800, 640),
+            ("small", 384, 600, 600),
+            ("small", 512, 672, 600),
+            ("small", 640, 800, 640),
+            ("medium", 384, 600, 600),
+            ("medium", 576, 736, 600),
+            ("medium", 640, 800, 640),
+            ("base", 384, 616, 600),
+            ("base", 560, 840, 600),
+            ("base", 640, 896, 640),
+            ("large", 384, 600, 600),
+            ("large", 640, 800, 640),
+            ("large", 704, 864, 704),
+        ];
+        for (size, imgsz, on, off) in rfdetr {
+            let r = TrainRecipe {
+                imgsz,
+                ..TrainRecipe::new(TrainFamily::Rfdetr, size).unwrap()
+            };
+            assert_eq!(r.prepared_short_side(true), on, "{size} {imgsz} on");
+            assert_eq!(r.prepared_short_side(false), off, "{size} {imgsz} off");
+        }
+        for f in [
+            TrainFamily::Yolo26,
+            TrainFamily::Yolo11,
+            TrainFamily::Yolov8,
+        ] {
+            for (imgsz, want) in [(640, 960), (384, 576), (321, 482), (1536, 2304)] {
+                let r = TrainRecipe {
+                    imgsz,
+                    ..TrainRecipe::new(f, f.sizes()[0]).unwrap()
+                };
+                // Multi-scale is RF-DETR's only.
+                assert_eq!(r.prepared_short_side(true), want, "{f:?} {imgsz}");
+                assert_eq!(r.prepared_short_side(false), want, "{f:?} {imgsz}");
+            }
+        }
+        for f in [TrainFamily::Rtdetrv2, TrainFamily::Dfine] {
+            for imgsz in [640, 384, 800] {
+                let r = TrainRecipe {
+                    imgsz,
+                    ..TrainRecipe::new(f, f.sizes()[0]).unwrap()
+                };
+                assert_eq!(r.prepared_short_side(true), imgsz, "{f:?} {imgsz}");
+                assert_eq!(r.prepared_short_side(false), imgsz, "{f:?} {imgsz}");
+            }
+        }
+    }
 
     #[test]
     fn defaults_follow_the_family() {

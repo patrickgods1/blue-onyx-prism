@@ -369,6 +369,7 @@ fn job(
             compare_group: None,
             // A repeat: the trainer's seed differs from the assembly seed (options.seed 0).
             train_seed: Some(2),
+            ignore_memory_check: false,
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -382,6 +383,8 @@ fn job(
         past_runs: Vec::new(),
         keep_work: false,
         export_only: None,
+        headroom: crate::training::commit::now,
+        reuse_from: Vec::new(),
     }
 }
 
@@ -974,17 +977,24 @@ fn out_of_memory_after_the_first_epochs_or_at_batch_1_is_not_retried() {
 
 #[test]
 fn multi_scale_auto_turns_off_when_batch_4_does_not_fit() {
+    use crate::training::estimate::Target;
+    let mps = Target::Mps;
+    let cuda = Target::Cuda(crate::backend::detect::ComputeCapability::new(6, 1));
     let mut r = TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap();
     // 16 GB Mac share: batch 4 fits with multi-scale.
-    assert!(r.multi_scale_on(9830));
-    // 6 GB: batch 4 at 544 px does not (1500 + 4 x 650 x 2.0 = 6.7 GB > 5.4 GB).
-    assert!(!r.multi_scale_on(6144));
+    assert!(r.multi_scale_on(9830, mps));
+    // 6 GB of a Mac: batch 4 at 544 px does not (1500 + 4 x 650 x 2.0 = 6.7 GB > 5.4 GB).
+    assert!(!r.multi_scale_on(6144, mps));
+    // A 6 GB CUDA card does (measured: 3.1 GB at batch 4; 1000 + 4 x 325 x 2.0 = 3.6 GB), a
+    // 3 GB one does not (2.7 GB usable).
+    assert!(r.multi_scale_on(6144, cuda));
+    assert!(!r.multi_scale_on(3072, cuda));
     r.multi_scale = super::super::recipe::MultiScale::On;
-    assert!(r.multi_scale_on(6144));
+    assert!(r.multi_scale_on(6144, mps));
     r.multi_scale = super::super::recipe::MultiScale::Off;
-    assert!(!r.multi_scale_on(100_000));
+    assert!(!r.multi_scale_on(100_000, cuda));
     let y = TrainRecipe::new(TrainFamily::Yolo26, "n").unwrap();
-    assert!(!y.multi_scale_on(100_000));
+    assert!(!y.multi_scale_on(100_000, cuda));
     // Stored only when not auto.
     let text =
         serde_json::to_string(&TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap()).unwrap();
@@ -1038,6 +1048,89 @@ fn a_chosen_gpu_trains_on_its_device_in_its_lanes_environment() {
         j.platform,
         TrainLane::Cu126
     ));
+}
+
+/// The self-checks among the commands `fake` ran.
+fn self_checks(fake: &TrainFake) -> usize {
+    fake.train_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.display().contains("--self-check"))
+        .count()
+}
+
+#[test]
+fn an_unchanged_self_check_runs_once_and_any_change_or_failure_runs_it_again() {
+    let t = tmp("self-check-once");
+    let mut n = 0;
+    let mut next = |t: &Tmp| {
+        n += 1;
+        let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+        j.name = format!("night-yolo26n-test{n}");
+        j.run_dir = t.0.join("training").join(format!("run{n}"));
+        j
+    };
+    let hooks = RecHooks::default();
+    let go = |j: &TrainJob, fake: &TrainFake| run(j, fake, &hooks, &AtomicBool::new(false)).0;
+    // The first run checks and records the pass.
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1);
+    let marker =
+        crate::training::self_check::marker_path(&TrainPaths::new(&t.0, t.0.join("models")));
+    assert!(marker.is_file(), "a passed check is recorded");
+    // The next run on the same environment, scripts and GPU skips it and says so.
+    let fake = TrainFake::new();
+    let j = next(&t);
+    let out = go(&j, &fake).unwrap();
+    assert_eq!(self_checks(&fake), 0, "skipped");
+    assert_eq!(fake.train_cmds.lock().unwrap().len(), 1, "training only");
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    assert!(
+        log.contains("self-check skipped (unchanged since "),
+        "{log}"
+    );
+    assert_eq!(
+        out.output.classes,
+        ["cat", "raccoon"],
+        "the run itself is unchanged"
+    );
+    // A rebuilt environment (its marker rewritten): checked again.
+    let env_marker =
+        t.0.join("tools/train-env")
+            .join(crate::resources::export::ENV_MARKER);
+    let mut bytes = std::fs::read(&env_marker).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&env_marker, bytes).unwrap();
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "env changed");
+    // Another GPU: its own check.
+    let fake = TrainFake::new();
+    let mut j = next(&t);
+    j.accelerator = Accelerator::Mps {
+        name: "Apple M2 GPU".into(),
+        memory_mb: 9000,
+    };
+    go(&j, &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "another GPU");
+    // A damaged marker file: checked again (and repaired).
+    std::fs::write(&marker, b"{damaged").unwrap();
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "damaged marker");
+    // A training process that fails (after a skipped check) forgets the pass.
+    let fake = TrainFake {
+        fail_lines: vec!["RuntimeError: something broke"],
+        ..TrainFake::new()
+    };
+    let e = go(&next(&t), &fake).unwrap_err();
+    assert_eq!(e.stage, Some(TrainStage::Train));
+    assert_eq!(self_checks(&fake), 0, "skipped before the failure");
+    let fake = TrainFake::new();
+    go(&next(&t), &fake).unwrap();
+    assert_eq!(self_checks(&fake), 1, "after a failed training");
 }
 
 #[test]
@@ -2250,6 +2343,156 @@ fn a_cancel_during_the_benchmark_keeps_the_registered_model() {
     assert_eq!(r.state, RunState::Cancelled, "{}", r.describe());
     assert!(r.output.is_some());
     assert!(!r.retrying);
+}
+
+/// The memory commit check before a run's first process (this box: 5 GB free, no growth on C:,
+/// 8 GB + 1 GB spare needed): refused before any command (no uv, no Python), the queue's record
+/// kept with the error; with Start anyway it trains and says so in train.log; a fixed
+/// `training.workers` counts its workers; an export retry is not checked.
+#[test]
+fn a_run_short_of_commit_is_refused_before_the_trainer_and_its_record_is_kept() {
+    use crate::training::commit::tests::this_box;
+    use crate::training::commit::{OVERRIDDEN_PREFIX, OVERRIDE_HINT};
+    let t = tmp("commit");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.headroom = || Some(this_box());
+    let fake = TrainFake::new();
+    let (r, stages) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert!(
+        e.message.starts_with(
+            "this training run needs about 9.0 GB of memory commit (the training process 8.0 GB, \
+             1.0 GB kept spare); 5.0 GB is free and the paging file on C: can grow only while 16 \
+             GB stays free there (15.2 GB free now)."
+        ),
+        "{}",
+        e.message
+    );
+    assert!(e.message.ends_with(OVERRIDE_HINT), "{}", e.message);
+    assert!(stages.is_empty(), "no stage entered: {stages:?}");
+    assert!(fake.train_cmds.lock().unwrap().is_empty());
+    assert!(fake.inner.cmds().is_empty(), "{:?}", fake.inner.cmds());
+
+    // Through the queue: the run fails with the message and its record stays.
+    let t2 = tmp("commit-svc");
+    let mut j2 = job(
+        &t2.0,
+        TrainFamily::Yolo26,
+        "n",
+        mps(),
+        Platform::MACOS_ARM64,
+    );
+    j2.headroom = || Some(this_box());
+    let fake2 = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(fake2.clone(), fake2.clone(), Arc::new(NoHooks), None);
+    let id = svc.enqueue(j2).unwrap();
+    let rec = svc.wait(&id, Duration::from_secs(20)).unwrap();
+    assert_eq!(rec.state, RunState::Failed);
+    assert!(
+        rec.error
+            .as_deref()
+            .is_some_and(|m| m.starts_with("this training run needs about 9.0 GB")),
+        "{:?}",
+        rec.error
+    );
+    assert!(
+        svc.records().iter().any(|r| r.id == id),
+        "the record is kept"
+    );
+    assert!(fake2.train_cmds.lock().unwrap().is_empty());
+
+    // Start anyway: it trains, and train.log has the warning with the same numbers.
+    j.request.ignore_memory_check = true;
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    assert!(!fake.train_cmds.lock().unwrap().is_empty());
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    let warned: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with(OVERRIDDEN_PREFIX))
+        .collect();
+    assert_eq!(warned.len(), 1, "{log}");
+    assert!(
+        warned[0].contains("this training run needs about 9.0 GB of memory commit"),
+        "{}",
+        warned[0]
+    );
+
+    // Forced workers add theirs: 2 x 3 loaders (Ultralytics) x 1.37 GB.
+    let n = crate::training::trainer_commit_need(TrainFamily::Yolo26, Workers::Fixed(2));
+    assert_eq!(
+        n.bytes,
+        crate::training::MAIN_COMMIT_RESERVE_BYTES + 6 * crate::training::WORKER_COMMIT_BYTES
+    );
+    assert_eq!(
+        n.detail,
+        "the training process 8.0 GB + 2 data loader workers 8.2 GB (training.workers)"
+    );
+    assert!(n.lighter.unwrap().contains("remove training.workers"));
+    let auto = crate::training::trainer_commit_need(TrainFamily::Rfdetr, Workers::Auto);
+    assert_eq!(
+        (auto.bytes, auto.lighter),
+        (crate::training::MAIN_COMMIT_RESERVE_BYTES, None)
+    );
+
+    // An export retry trains nothing: not checked, whatever the reading.
+    let mut retry = retry_of(&j);
+    retry.headroom = || Some(this_box());
+    retry.request.ignore_memory_check = false;
+    let (r, _) = run(&retry, &fake, &NoHooks, &AtomicBool::new(false));
+    if let Err(e) = r {
+        assert!(!e.message.contains("memory commit"), "{}", e.message);
+    }
+}
+
+#[test]
+fn the_seeds_of_a_group_link_the_first_seeds_dataset_and_other_groups_do_not() {
+    let t = tmp("seed-reuse");
+    let fake = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(t.0.join("runs.json")),
+    );
+    let mut ids = Vec::new();
+    for (i, group) in [(0, "cmp-a"), (1, "cmp-a"), (2, "cmp-b")] {
+        let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+        j.name = format!("night-yolo26n-s{i}");
+        j.run_dir = t.0.join("training").join(format!("seed{i}"));
+        j.request.compare_group = Some(group.into());
+        j.request.train_seed = Some(i);
+        ids.push((
+            svc.enqueue(j).unwrap(),
+            t.0.join("training").join(format!("seed{i}")),
+        ));
+    }
+    let log = |dir: &Path| std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+    for (id, _) in &ids {
+        let r = svc.wait(id, Duration::from_secs(60)).unwrap();
+        assert_eq!(r.state, RunState::Done, "{:?}", r.error);
+    }
+    assert!(
+        !log(&ids[0].1).contains("hard-linked"),
+        "the first seed writes its own"
+    );
+    let second = log(&ids[1].1);
+    assert!(
+        second.contains("hard-linked from the identical dataset of")
+            && second.contains(&ids[0].1.join("data").display().to_string()),
+        "{second}"
+    );
+    assert!(
+        !log(&ids[2].1).contains("hard-linked"),
+        "another group lends nothing"
+    );
+    // The same dataset either way.
+    let lists = |d: &Path| {
+        ["train.txt", "valid.txt", "classes.txt", "train.coco.json"]
+            .map(|f| std::fs::read(d.join("data").join(f)).unwrap())
+    };
+    assert_eq!(lists(&ids[0].1), lists(&ids[1].1));
+    svc.shutdown();
 }
 
 /// An automatic count learns from the job's earlier runs of this machine and recipe: 1 worker was

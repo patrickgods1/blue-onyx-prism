@@ -49,6 +49,10 @@ pub(super) struct Meta {
     /// collector is on ([`crate::collect`]), which also marks the request as one to collect;
     /// None otherwise, and for a `no_collect` upload.
     pub(super) original: Option<bytes::Bytes>,
+    /// The upload's encoded bytes, kept (a reference count, no copy) while `save_ref_image`
+    /// and `save_image_path` are on: the reference copy is written from them
+    /// ([`super::save`]).
+    pub(super) upload: Option<bytes::Bytes>,
 }
 
 impl Meta {
@@ -156,6 +160,7 @@ mod tests {
                 routed_from: None,
                 verify_crop: false,
                 original: None,
+                upload: None,
             },
             ctx: PreprocessCtx {
                 orig_w: 1,

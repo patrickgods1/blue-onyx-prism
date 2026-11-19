@@ -158,6 +158,7 @@ pub(crate) fn field_label(field: &str) -> String {
         "device_thresholds" => "confidence per device".into(),
         "enabled" => "load".into(),
         "gpu_precision" => "GPU precision".into(),
+        "performance_hint" => "performance hint".into(),
         "object_filter" => "object filter".into(),
         "night_confidence_threshold" => "night threshold".into(),
         "label_thresholds" => "label thresholds".into(),
@@ -206,6 +207,7 @@ fn global_label(k: &str) -> String {
         "inflight" => "Inferences in flight".into(),
         "ort_sessions" => "ONNX Runtime sessions".into(),
         "hardware_profile" => "Hardware profile".into(),
+        "performance_hint" => "OpenVINO GPU performance hint".into(),
         "auto_download" => "Auto download".into(),
         "allow_large_downloads" => "Allow large downloads".into(),
         "default_model" => "Default model".into(),
@@ -516,9 +518,15 @@ pub fn applied_live(changes: &[FieldChange]) -> Vec<String> {
 /// `port`, `device`, `force_cpu`, `cache_dir`) of `running`: what this generation can apply
 /// without a restart. Models, live globals and the benchmark section come from `current`.
 pub fn runtime_overlay(running: &Config, current: &Config) -> Config {
+    let runtime_level =
+        |k: &str| !matches!(k, "models" | "benchmark" | "default_model") && !live_global(k);
     let mut obj = config_object(current);
-    for (k, v) in config_object(running) {
-        if !matches!(k.as_str(), "models" | "benchmark" | "default_model") && !live_global(&k) {
+    let from_running = config_object(running);
+    // A runtime-level key written only while set (`performance_hint`, `ort_gpu_mem_limit_mb`)
+    // and set only in `current` is unset in this generation too.
+    obj.retain(|k, _| !runtime_level(k) || from_running.contains_key(k));
+    for (k, v) in from_running {
+        if runtime_level(&k) {
             obj.insert(k, v);
         }
     }
@@ -561,7 +569,9 @@ pub fn model_reloads(running: &Config, next: &Config) -> Vec<String> {
                     }
                     o
                 };
-                strip(r) != strip(n) || running.device_for(r) != next.device_for(n)
+                strip(r) != strip(n)
+                    || running.device_for(r) != next.device_for(n)
+                    || running.hint_for(r) != next.hint_for(n)
             }
             _ => true,
         };
@@ -648,13 +658,27 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
                 if dr != dc {
                     reasons.push(format!("device: {dr} \u{2192} {dc}"));
                 }
+                // Like the device: the hint the model compiles with (its own, else the global).
+                let (hr, hc) = (running.hint_for(&r), current.hint_for(&c));
+                if hr != hc {
+                    let text = |h: Option<crate::profile::PerformanceHint>| {
+                        h.map_or("profile default", |h| h.as_str())
+                    };
+                    reasons.push(format!(
+                        "performance hint: {} \u{2192} {}",
+                        text(hr),
+                        text(hc)
+                    ));
+                }
                 // Threshold and object filter apply live. Both sides' keys: a field serialized
                 // only when set (`inflight`) is absent from one side when removed (CO-09).
                 let (or, oc) = (model_object(&r), model_object(&c));
                 let fields: BTreeSet<&String> = or.keys().chain(oc.keys()).collect();
                 for f in fields {
-                    if matches!(f.as_str(), "name" | "device" | "enabled")
-                        || LIVE_MODEL_FIELDS.contains(&f.as_str())
+                    if matches!(
+                        f.as_str(),
+                        "name" | "device" | "enabled" | "performance_hint"
+                    ) || LIVE_MODEL_FIELDS.contains(&f.as_str())
                     {
                         continue;
                     }
@@ -841,6 +865,60 @@ mod tests {
         let mut back = gone.clone();
         keep_model_from(&mut back, &running, "yolo26s");
         assert!(model_reloads(&running, &back).is_empty());
+    }
+
+    #[test]
+    fn performance_hint_reloads_like_the_device() {
+        use crate::profile::PerformanceHint::{Latency, Throughput};
+        let running = cfg();
+        // A model's own hint: that model reloads, the other does not.
+        let mut next = running.clone();
+        next.models[1].performance_hint = Some(Throughput);
+        assert_eq!(model_reloads(&running, &next), ["yolo26s"]);
+        assert!(
+            !applied_live(&describe_changes(&running, &next).0)
+                .iter()
+                .any(|l| l.contains("hint"))
+        );
+        let p = pending(&running, &next);
+        assert_eq!(
+            p.for_model("yolo26s"),
+            ["performance hint: profile default \u{2192} throughput"]
+        );
+        assert!(p.for_model("IPcam-general").is_empty() && p.global.is_empty());
+        // The global hint is runtime-level (a restart), shown on every model it moves; a model
+        // with its own value is not moved.
+        assert!(!live_global("performance_hint"));
+        let mut global = next.clone();
+        global.performance_hint = Some(Latency);
+        let p = pending(&next, &global);
+        assert_eq!(p.global.len(), 1, "{p:?}");
+        assert!(
+            p.global[0].starts_with("OpenVINO GPU performance hint"),
+            "{p:?}"
+        );
+        assert_eq!(
+            p.for_model("IPcam-general"),
+            ["performance hint: profile default \u{2192} latency"]
+        );
+        assert!(p.for_model("yolo26s").is_empty(), "{p:?}");
+        // Through the runtime overlay the running global stays until the restart (also when
+        // only the new config writes the key), and so does any other key written only while set.
+        let overlay = runtime_overlay(&next, &global);
+        assert_eq!(overlay.performance_hint, None);
+        let mut capped = global.clone();
+        capped.ort_gpu_mem_limit_mb = Some(2048);
+        assert_eq!(runtime_overlay(&next, &capped).ort_gpu_mem_limit_mb, None);
+        assert_eq!(
+            runtime_overlay(&global, &next).performance_hint,
+            Some(Latency),
+            "unset in the new config: the running value stays"
+        );
+        assert!(model_reloads(&next, &overlay).is_empty());
+        // Same effective hint written explicitly: still a field change, so a reload.
+        let mut same = global.clone();
+        same.models[0].performance_hint = Some(Latency);
+        assert_eq!(model_reloads(&global, &same), ["IPcam-general"]);
     }
 
     #[test]

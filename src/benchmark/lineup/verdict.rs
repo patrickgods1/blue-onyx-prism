@@ -1,6 +1,7 @@
 //! The judgement of a comparison table, pure: when one value beats another (the run-vs-run noise
 //! rules of [`crate::benchmark::history`], applied between models), which cells of a column are
-//! marked best ([`mark_best`]), and the one plain sentence above the table ([`headline`]).
+//! marked best ([`mark_best`]), the one plain sentence above the table ([`headline`]) and the
+//! table's "Best first" order ([`best_order`], the same rule as an order).
 
 use crate::benchmark::history::compare::{SPEED_ABS_MS, SPEED_REL, proportion_noise};
 use serde::Serialize;
@@ -90,12 +91,81 @@ pub struct Contender {
     pub all: Option<(f64, usize)>,
     /// (precision, detections) over everything scored.
     pub correct: Option<(f64, usize)>,
+    /// False alerts per empty frame (lower is better): the tie-break of [`best_order`].
+    pub false_alerts: Option<f64>,
 }
 
 impl Contender {
     fn fair(&self) -> bool {
         self.trained_on.is_none_or(|s| s <= 0.0)
     }
+}
+
+/// The rows of a comparison table best first (indices into `rows`): the [`headline`]'s rule as
+/// an order. People found first, then vehicles, then every object scored; a difference counts
+/// only past the noise of both values ([`clearly_higher`]). Rows level on a figure form a tier
+/// (the top value and every value not clearly behind it, then the same over the rest), ordered
+/// within by the next figure; rows without a figure come after the rows with one. Rows level on
+/// all three go by fewer false alerts per empty frame (missing last), then in the given order.
+/// Models that trained on the images (not [`Contender::fair`]) come after every other row,
+/// ordered by the same rule among themselves.
+pub fn best_order(rows: &[Contender]) -> Vec<usize> {
+    let (fair, out): (Vec<usize>, Vec<usize>) =
+        (0..rows.len()).partition(|&i| rows.get(i).is_some_and(Contender::fair));
+    let mut order = tiers(rows, fair, 0);
+    order.extend(tiers(rows, out, 0));
+    order
+}
+
+/// [`best_order`] of `idx` from figure `level` on (0 people, 1 vehicles, 2 all, 3 the
+/// false-alert tie-break).
+fn tiers(rows: &[Contender], idx: Vec<usize>, level: usize) -> Vec<usize> {
+    if idx.len() < 2 {
+        return idx;
+    }
+    if level >= 3 {
+        let alerts = |i: usize| {
+            rows.get(i)
+                .and_then(|c| c.false_alerts)
+                .filter(|v| v.is_finite())
+        };
+        let mut v = idx;
+        v.sort_by(|&a, &b| match (alerts(a), alerts(b)) {
+            (Some(x), Some(y)) => x.total_cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+        return v;
+    }
+    let pick = |i: usize| {
+        let c = rows.get(i)?;
+        match level {
+            0 => c.people,
+            1 => c.vehicles,
+            _ => c.all,
+        }
+        .filter(|p| p.0.is_finite())
+    };
+    let (mut rest, missing): (Vec<usize>, Vec<usize>) =
+        idx.into_iter().partition(|&i| pick(i).is_some());
+    // Highest first (stable), so the first of `rest` is always the top of what is left.
+    rest.sort_by(|&a, &b| {
+        let (x, y) = (pick(a).map_or(0.0, |p| p.0), pick(b).map_or(0.0, |p| p.0));
+        y.total_cmp(&x)
+    });
+    let mut order = Vec::with_capacity(rest.len() + missing.len());
+    while let Some(top) = rest.first().and_then(|&i| pick(i)) {
+        let (mut tier, behind): (Vec<usize>, Vec<usize>) = rest
+            .into_iter()
+            .partition(|&i| pick(i).is_some_and(|p| !clearly_higher(top, p)));
+        // Level rows: no value decides, so back to the given order for the next figure.
+        tier.sort_unstable();
+        order.extend(tiers(rows, tier, level + 1));
+        rest = behind;
+    }
+    order.extend(tiers(rows, missing, level + 1));
+    order
 }
 
 /// What the sentence says.
@@ -375,6 +445,105 @@ mod tests {
             mark_best(Column::Share, &[None, s(0.5), s(0.8)]),
             [false, false, true]
         );
+    }
+
+    /// A contender with people / vehicles / all found (of 100 objects each) and false alerts.
+    fn f(
+        model: &str,
+        people: Option<f64>,
+        vehicles: Option<f64>,
+        all: Option<f64>,
+        false_alerts: Option<f64>,
+    ) -> Contender {
+        let of = |v: Option<f64>| v.map(|v| (v, 100));
+        Contender {
+            model: model.into(),
+            trained_on: Some(0.0),
+            people: of(people),
+            vehicles: of(vehicles),
+            all: of(all),
+            correct: None,
+            false_alerts,
+        }
+    }
+
+    fn order_of(rows: &[Contender]) -> Vec<&str> {
+        best_order(rows)
+            .into_iter()
+            .map(|i| rows[i].model.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn best_first_goes_by_people_then_vehicles_past_the_noise() {
+        // 0.99 is clearly ahead of 0.88; 0.88 and 0.80 of 100 are level (the noise is 8
+        // points), so vehicles decide between them.
+        let rows = [
+            f("a", Some(0.80), Some(0.50), Some(0.6), None),
+            f("b", Some(0.88), Some(0.30), Some(0.9), None),
+            f("c", Some(0.99), Some(0.10), Some(0.1), None),
+        ];
+        assert_eq!(order_of(&rows), ["c", "a", "b"]);
+        // A tier is the top and what is not clearly behind it: 0.92 and 0.86 are level, 0.80 is
+        // clearly behind 0.92 (however close to 0.86), so its better vehicles do not lift it.
+        let rows = [
+            f("low", Some(0.80), Some(0.99), None, None),
+            f("top", Some(0.92), Some(0.20), None, None),
+            f("mid", Some(0.86), Some(0.60), None, None),
+        ];
+        assert_eq!(order_of(&rows), ["mid", "top", "low"]);
+        // Level on people and vehicles: every object decides; level there too, the given order.
+        let rows = [
+            f("x", Some(0.5), Some(0.5), Some(0.50), None),
+            f("y", Some(0.5), Some(0.5), Some(0.80), None),
+            f("z", Some(0.5), Some(0.5), Some(0.52), None),
+        ];
+        assert_eq!(order_of(&rows), ["y", "x", "z"]);
+    }
+
+    #[test]
+    fn best_first_breaks_a_level_tie_by_fewer_false_alerts() {
+        let rows = [
+            f("noisy", Some(0.9), Some(0.9), Some(0.9), Some(0.20)),
+            f("unknown", Some(0.9), Some(0.9), Some(0.9), None),
+            f("quiet", Some(0.9), Some(0.88), Some(0.9), Some(0.05)),
+        ];
+        assert_eq!(order_of(&rows), ["quiet", "noisy", "unknown"]);
+        // A clear difference in finding wins over fewer false alerts.
+        let rows = [
+            f("quiet", Some(0.5), None, None, Some(0.0)),
+            f("finds", Some(0.9), None, None, Some(0.5)),
+        ];
+        assert_eq!(order_of(&rows), ["finds", "quiet"]);
+    }
+
+    #[test]
+    fn best_first_puts_missing_figures_and_trained_on_models_last() {
+        // No people figure: after every row with one, however many vehicles it finds; among
+        // themselves by vehicles.
+        let rows = [
+            f("no-people-a", None, Some(0.40), None, None),
+            f("people", Some(0.1), Some(0.10), None, None),
+            f("no-people-b", None, Some(0.95), None, None),
+            f("nothing", None, None, None, None),
+        ];
+        assert_eq!(
+            order_of(&rows),
+            ["people", "no-people-b", "no-people-a", "nothing"]
+        );
+        // A model that trained on the images is last whatever it finds; two of them by the rule.
+        let mut seen = f("seen", Some(1.0), Some(1.0), Some(1.0), Some(0.0));
+        seen.trained_on = Some(0.3);
+        let mut seen2 = f("seen2", Some(0.2), None, None, None);
+        seen2.trained_on = Some(0.1);
+        let rows = [
+            seen2,
+            seen,
+            f("fair-low", Some(0.1), None, None, None),
+            f("fair", Some(0.6), None, None, None),
+        ];
+        assert_eq!(order_of(&rows), ["fair", "fair-low", "seen", "seen2"]);
+        assert!(best_order(&[]).is_empty());
     }
 
     fn c(model: &str, people: f64, n: usize, correct: f64) -> Contender {

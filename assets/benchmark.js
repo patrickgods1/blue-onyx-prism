@@ -128,18 +128,15 @@
     });
   });
 
-  // Sortable tables: click a header; numeric when the cell has data-v. The sort survives
-  // re-renders (PrismLive.keep / patch carry it over by the table's key). A term tooltip
-  // button inside a header does not sort (bench-glossary.js stops its events).
+  // Sortable tables (PrismSort, sort.js): click a header, Shift-click for a second key; a cell's
+  // data-v is its sort value (the metrics carry their negative, so the first click puts the best
+  // first). `key` names the kind of table: its sort is remembered per browser, the same for every
+  // model's table of that kind. A term tooltip button inside a header does not sort (PrismTip
+  // stops its clicks).
   var L = window.PrismLive, T = L && L.tabs(document.querySelector("nav.tabs"));
-  function sortable(table) {
-    table.querySelectorAll("th").forEach(function (th, i) {
-      th.classList.add("sortable"); th.tabIndex = 0; th.setAttribute("role", "button");
-      if (th.textContent) th.title = "Sort by " + th.textContent;
-      var sort = function () { L.sortTable(table, i, th.dataset.dir !== "asc"); };
-      th.addEventListener("click", sort);
-      th.addEventListener("keydown", function (e) { if (e.target !== th) return; if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
-    });
+  // `defaults`: the table's own order (none = as built; [{col: "best"}] = by each row's data-best).
+  function sortable(table, key, defaults) {
+    if (window.PrismSort) PrismSort.attach(table, defaults ? {key: key, defaultKeys: defaults} : {key: key});
     return table;
   }
   PB.sortable = sortable;
@@ -279,9 +276,9 @@
   function rocWrap(o) { var w = el("div", "thr-chart-wrap roc-chart-wrap"); w.appendChild(C.rocSvg(o)); return w; }
   // Per-class frame ROC table (frames with / without the class, AUC).
   function rocTable(roc) {
-    var t = sortable(table("", ["Class", "Frames with", "Frames without", "@roc_auc"]));
+    var t = sortable(table("", ["Class", "Frames with", "Frames without", "@roc_auc"]), "roc-class");
     (roc.per_class || []).forEach(function (c) { var tr = el("tr"); cell(tr, c["class"]); cell(tr, c.positives, c.positives); cell(tr, c.negatives, c.negatives); cell(tr, pct(c.auc), c.auc === null ? null : -c.auc); t.tBodies[0].appendChild(tr); });
-    var tr = el("tr"); cell(tr, "macro (micro " + pct(roc.micro_auc) + ")"); cell(tr, roc.positives, roc.positives); cell(tr, roc.negatives, roc.negatives); cell(tr, pct(roc.auc), roc.auc === null ? null : -roc.auc); t.tBodies[0].appendChild(tr);
+    var tr = el("tr"); tr.dataset.sortPin = "bottom"; cell(tr, "macro (micro " + pct(roc.micro_auc) + ")"); cell(tr, roc.positives, roc.positives); cell(tr, roc.negatives, roc.negatives); cell(tr, pct(roc.auc), roc.auc === null ? null : -roc.auc); t.tBodies[0].appendChild(tr);
     return t;
   }
   function thresholdChart(m, a) {
@@ -330,7 +327,7 @@
     var act = thrAction(m.model, a, "Apply threshold "); if (act && act.tagName === "BUTTON") box.appendChild(act);
     var groups = (a.by_dataset || []).concat(a.by_tag || [], (a.per_class || []).map(function (g) { return Object.assign({}, g, {key: "class " + g.key}); }), (a.by_device || []).map(function (d) { return {key: "device " + d.device, best: d.best, configured: null, now: null}; }));
     if (groups.length) {
-      var t = sortable(table("", ["Group", "Images", "Objects", "Best", "P", "R", "F1", "F1 at configured " + thr(n.threshold), "ROC AUC"]));
+      var t = sortable(table("", ["Group", "Images", "Objects", "Best", "P", "R", "F1", "F1 at configured " + thr(n.threshold), "ROC AUC"]), "thr-groups");
       groups.forEach(function (g) {
         var tr = el("tr"), gb = g.best, gn = g.configured === null ? null : groupNow(a, g); cell(tr, g.key + (g.relative ? " (relative)" : "")); cell(tr, g.images === undefined ? "-" : g.images, g.images); cell(tr, g.gt === undefined ? "-" : g.gt, g.gt);
         cell(tr, gb ? thr(gb.threshold) + (gb.met ? "" : " !") : "-", gb ? gb.threshold : null);
@@ -361,7 +358,7 @@
     box.appendChild(el("h2", null, "Best confidence threshold"));
     box.appendChild(el("p", "muted", "Exact best threshold per model on its recommended device, compared with the threshold configured now. Gain is the objective's value at the best minus at the configured threshold, in points."));
     box.appendChild(el("details", "help")); var hd = box.lastChild; hd.appendChild(el("summary", null, "How to read it")); hd.appendChild(el("p", null, "The best threshold is the middle of the widest near-optimal range, rounded down to 0.01; P / R / F1 at the configured threshold are exact, from the stored predictions. F2 favors recall; precision:0.9 limits false alerts; youden maximizes the frame alert rate minus the frame false-alert rate. Frame TPR / FPR: alert rate on frames with an object / on frames without one (a frame alerts when its top confidence reaches the threshold). Blue Iris may send its own min_confidence per request (it then replaces the server threshold) and each camera's minimum confidence filters again."));
-    var t = sortable(table("", ["Model", "@objective", "Now", "@precision", "@recall", "@f1", "Best", "@precision", "@recall", "@f1", "Gain", "F2 pick", "P≥90% pick", "Youden pick", "@roc_auc", "TPR / FPR now", "TPR / FPR best", ""]));
+    var t = sortable(table("", ["Model", "@objective", "Now", "@precision", "@recall", "@f1", "Best", "@precision", "@recall", "@f1", "Gain", "F2 pick", "P≥90% pick", "Youden pick", "@roc_auc", "TPR / FPR now", "TPR / FPR best", ""]), "thr");
     rows.forEach(function (m) {
       var a = m.threshold, b = a.best, tr = el("tr"), n = nowOf(a), np = n.point;
       tr.dataset.model = m.model;
@@ -496,7 +493,7 @@
     $("s-apply-all").hidden = !j || !j.results.some(applicableSearch);
     if (!j) return;
     var obj = j.results.length ? j.results[0].objective : "f1";
-    var t = sortable(table("", ["Model", "Device", "Images", "Objects", "Configured", "@precision", "@recall", "@f1", "Best", "@precision", "@recall", "@f1", gainLabel(obj) + " gain", "@roc_auc", "TPR / FPR configured", "TPR / FPR best", ""]));
+    var t = sortable(table("", ["Model", "Device", "Images", "Objects", "Configured", "@precision", "@recall", "@f1", "Best", "@precision", "@recall", "@f1", gainLabel(obj) + " gain", "@roc_auc", "TPR / FPR configured", "TPR / FPR best", ""]), "search");
     j.results.forEach(function (r) {
       // "Configured": the threshold in the config now (r.now), not the run's.
       var tr = el("tr"), c = r.now || r.configured, b = r.best, run = searchRunning(r);
@@ -547,7 +544,7 @@
     if (r.roc && r.roc.per_class && r.roc.per_class.length) {
       var rd = det("s-roc", "Frame-level ROC AUC by class (macro " + pct(r.roc.auc) + ", micro " + pct(r.roc.micro_auc) + ")"); rd.appendChild(wrap(rocTable(r.roc), "s-roc")); box.appendChild(rd);
     }
-    var g = sortable(table("", ["Confidence", "@precision", "@recall", "@f1", "@f2", "@fp_per_image", "TP", "FP", "FN", "@tpr", "@fpr", ""]));
+    var g = sortable(table("", ["Confidence", "@precision", "@recall", "@f1", "@f2", "@fp_per_image", "TP", "FP", "FN", "@tpr", "@fpr", ""]), "search-grid");
     var rows = r.grid.slice(); [c, b && b.point].forEach(function (p) { if (p && !rows.some(function (q) { return near(q.threshold, p.threshold); })) rows.push(p); });
     rows.sort(function (x, y) { return x.threshold - y.threshold; });
     rows.forEach(function (p) {
@@ -564,7 +561,7 @@
     var d = det("s-grid", "Every 0.05 step", true); d.appendChild(wrap(g, "s-grid")); box.appendChild(d);
     var groups = r.by_dataset.concat(r.per_class.map(function (x) { return Object.assign({}, x, {key: "class " + x.key}); }));
     if (groups.length) {
-      var gt = sortable(table("", ["Group", "Images", "Objects", "Best", "P", "R", "F1", "F1 at configured " + thr(c.threshold), "ROC AUC"]));
+      var gt = sortable(table("", ["Group", "Images", "Objects", "Best", "P", "R", "F1", "F1 at configured " + thr(c.threshold), "ROC AUC"]), "search-groups");
       groups.forEach(function (x) {
         var tr = el("tr"), xb = x.best, xn = x.now || x.configured; cell(tr, x.key + (x.relative ? " (relative)" : "")); cell(tr, x.images, x.images); cell(tr, x.gt, x.gt);
         cell(tr, xb ? thr(xb.threshold) + (xb.met ? "" : " !") : "-", xb ? xb.threshold : null);
@@ -856,12 +853,14 @@
     if (picked.some(function (r) { return r.cp.other; })) box.appendChild(el("p", "warn stale-notice", STALE));
     var usable = function (b) { return b && b.met && b.point && b.point.tp > 0 && !findsNothing(b); };
     box.appendChild(PB.dataTable({
-      key: "confidence", cls: "stack conf-table", rows: picked, filters: FILTERS, sort: {col: "model", dir: "asc"},
+      key: "confidence", cls: "stack conf-table", rows: picked, filters: FILTERS,
+      // Best first: the server's ranking of model x device (points).
+      sort: {col: "best", dir: "asc"}, best: function (r) { return PB.pointRank(j, r.model, r.device); },
       text: function (r) { return r.model + " " + r.device + " " + r.runtime; }, empty: "No confidence results on " + selName() + ": choose another device.",
       columns: [
         {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) { return el("span", "nowrap", r.model + (r.relative ? " *" : "")); }},
         {id: "device", head: "@device", value: function (r) { return r.device; }, render: deviceCell},
-        {id: "best", head: "@best_conf", num: true, value: function (r) { return r.b ? r.b.threshold : null; }, render: function (r, td) {
+        {id: "best_conf", head: "@best_conf", num: true, value: function (r) { return r.b ? r.b.threshold : null; }, render: function (r, td) {
           if (r.cp.pending) return "searching…";
           if (!r.b) return r.cp.missing ? "not searched" : "-";
           if (findsNothing(r.b)) { td.title = FINDS_NOTHING; td.classList.add("warn-cell"); return "finds no objects"; }
@@ -914,7 +913,8 @@
   function breakdown(key, title, rows, few) {
     var d = el("div"); if (!rows || !rows.length) return d;
     d.appendChild(el("h4", null, title));
-    var t = sortable(table("", ["", "Images", "Objects", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@f1"]));
+    var t = sortable(table("", ["", "Images", "Objects", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@f1"]), "breakdown");
+    t.tHead.rows[0].cells[0].dataset.sortLabel = title.replace(/^By (.)/, function (m, c) { return c.toUpperCase(); });
     rows.forEach(function (b) {
       var tr = el("tr"), k = cell(tr, b.key + (b.relative ? " (relative)" : "")); cell(tr, b.images, b.images); cell(tr, b.gt, b.gt);
       if (few && b.gt > 0 && b.gt < few) { k.appendChild(document.createTextNode(" ")); k.appendChild(PB.tip("too few to judge", "Fewer than " + few + " objects: one object moves this class by more than 5 points, so it is shown here but left out of the AP50 and AP50-95 averages.", "tag", "few")); }
@@ -930,7 +930,7 @@
     var d = el("div"), rows = (a.overall.class_alerts || []).filter(function (c) { return c.frames_without > 0; });
     if (!rows.length) return d;
     var h = el("h4", null, "False alerts by class "); h.appendChild(PB.term("?", "class_alerts", "ca")); d.appendChild(h);
-    var t = sortable(table("", ["Class", "Frames without it", "False alerts", "Rate"]));
+    var t = sortable(table("", ["Class", "Frames without it", "False alerts", "Rate"]), "class-alerts");
     rows.forEach(function (c) {
       var tr = el("tr"), rate = c.frames_without > 0 ? c.alerts / c.frames_without : null;
       cell(tr, c["class"], undefined, "Class"); cell(tr, c.frames_without, c.frames_without, "Frames without it"); cell(tr, c.alerts, c.alerts, "False alerts"); cell(tr, pct(rate), rate, "Rate");
@@ -960,7 +960,7 @@
     } else if (run.accuracy_note) box.appendChild(el("p", "muted", "Accuracy not scored: " + run.accuracy_note + "."));
     if (run.by_resolution && run.by_resolution.length) {
       box.appendChild(el("h4", null, "Speed by resolution (ms)"));
-      var t = sortable(table("", ["Resolution", "Images", "Decode+pre p50", "Infer p50", "Post p50", "Total p50", "Total p95"]));
+      var t = sortable(table("", ["Resolution", "Images", "Decode+pre p50", "Infer p50", "Post p50", "Total p50", "Total p95"]), "resolution");
       ["sd", "hd", "fhd", "4mp+"].forEach(function (k) {
         var b = run.by_resolution.find(function (x) { return x.bucket === k; }), tr = el("tr"); cell(tr, k);
         if (!b) { cell(tr, "0", 0); for (var i = 0; i < 5; i++) cell(tr, "n/a", null); tr.className = "muted"; }
@@ -975,7 +975,7 @@
   // patched in place: only cards whose data changed are rebuilt (keeping their scroll offsets,
   // open <details> and sort order). The first card (or the one the URL names) starts open; a
   // rebuilt card keeps its open state.
-  function renderModels(models, cfg, ranking) {
+  function renderModels(models, cfg, ranking, j) {
     var box = $("models");
     $("no-models").hidden = models.length > 0;
     var cfgByName = {}; (cfg.models || []).forEach(function (c) { cfgByName[c.name.toLowerCase()] = c; });
@@ -984,11 +984,13 @@
       var c = cfgByName[m.model.toLowerCase()] || {}, id = "d-" + encodeURIComponent(m.model);
       var rk = (ranking || []).find(function (r) { return r.model === m.model; }), metric = rk && rk.metric === "roc_auc" ? "roc_auc" : "ap50";
       var was = document.getElementById(id), open = was ? was.open : (named ? id === hashId : i === 0);
-      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel, metric]), build: function () { var d = modelCard(m, c, cfg, metric); d.open = open; return d; }};
+      // Each device's Best first place (the server's ranking of model x device, points).
+      var best = (m.devices || []).map(function (d) { return PB.pointRank(j, m.model, d.device); });
+      return {key: m.model.toLowerCase(), sig: JSON.stringify([m, c, cfg.globalLabel, metric, best]), build: function () { var d = modelCard(m, c, cfg, metric, best); d.open = open; return d; }};
     }));
     if (named && !box.dataset.scrolled) { var t2 = document.getElementById(hashId); if (t2) { openTo(hashId); t2.scrollIntoView(); box.dataset.scrolled = "1"; } }
   }
-  function modelCard(m, c, cfg, metric) {
+  function modelCard(m, c, cfg, metric, best) {
     var det2 = el("details", "card model"), key = m.model.toLowerCase(); det2.id = "d-" + encodeURIComponent(m.model);
     var card = el("div", "body");
     // The device the config resolves to now (not when the benchmark ran) and the loaded one.
@@ -1020,11 +1022,12 @@
     } else if (m.changes && m.changes.baseline && !m.changes.comparable) {
       card.appendChild(el("p", "muted", "⚠ Not compared with the run of " + when(m.changes.baseline.timestamp) + ": " + ((m.changes.reasons || []).join("; ") || "the runs differ") + "."));
     }
-    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]));
+    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]), "devices", [{col: "best", dir: "asc"}]);
     var okRuns = m.devices.filter(function (d) { return d.run && !d.run.fell_back; });
     var fastest = okRuns.reduce(function (a, d) { return !a || d.run.stages_ms.total.p50 < a.run.stages_ms.total.p50 ? d : a; }, null);
-    m.devices.forEach(function (d) {
+    m.devices.forEach(function (d, k) {
       var tr = el("tr"), r = d.run, name = cell(tr, d.device, undefined, "Device");
+      if (best && typeof best[k] === "number") tr.setAttribute("data-best", String(best[k]));
       name.title = d.label;
       if (d === fastest && okRuns.length > 1) { tr.classList.add("fastest"); name.appendChild(el("span", "tag", "fastest")); }
       if (d.device === m.recommended) name.appendChild(el("span", "tag rec", "Recommended"));
@@ -1192,7 +1195,7 @@
       // A link to a tab or into one (#m-<model> = a profile card, #d-<model> = a Details card)
       // opens it; without one the page opens on Compare when there are results, else on Run.
       var target = location.hash.slice(1);
-      if (target) renderModels(models, j.config, j.ranking);
+      if (target) renderModels(models, j.config, j.ranking, j);
       if (T && target && T.show(target)) { openTo(target); var te = $(target); if (te && te.getAttribute("role") !== "tabpanel") te.scrollIntoView(); }
       else if (T) T.show(hasResults ? "tab-compare" : "tab-run");
     }
@@ -1210,7 +1213,7 @@
     L.keep($("conf-pick"), JSON.stringify([savedObjective(j), conf.obj, objs, running, devicesOf(models), selDevice]), function () { renderConfPick(j); });
     L.keep($("conf-best"), sm + sc + sp + conf.obj + sel + running + Object.keys(conf.cache).join(","), function () { renderConfBest(j, models); });
     L.keep($("thresholds"), sm + sc + JSON.stringify(j.profiles || null), function () { renderThresholds(models); });
-    renderModels(models, j.config, j.ranking);
+    renderModels(models, j.config, j.ranking, j);
     if (PB.compare) PB.compare.render(j, models);
     estimate();
     $("apply-thr-bar").hidden = running || !models.some(function (m) { return applicable(m.threshold); });
@@ -1219,8 +1222,8 @@
     if (running && p) {
       if (p.stage === "benchmark") {
         bar.value = p.percent;
-        ptext.textContent = p.model + " (" + p.modelIndex + "/" + p.modelCount + ") on " + p.device + " · " + p.phase + (p.total ? " " + p.done + "/" + p.total : "") + (p.image ? " · " + p.image : "") + " · " + p.percent.toFixed(0) + "%" + (p.etaSecs ? " · about " + Math.ceil(p.etaSecs) + " s left" : "");
-      } else { bar.removeAttribute("value"); ptext.textContent = p.text || p.stage; }
+        ptext.textContent = p.model + " (" + p.modelIndex + "/" + p.modelCount + ") on " + p.device + " · " + p.phase + (p.total ? " " + p.done + "/" + p.total : "") + (p.image ? " · " + p.image : "") + " · " + p.percent.toFixed(0) + "%" + (p.etaSecs ? " · about " + Math.ceil(p.etaSecs) + " s left" : "") + (p.priority ? " · " + p.priority : "");
+      } else { bar.removeAttribute("value"); ptext.textContent = (p.text || p.stage) + (p.priority ? " · " + p.priority : ""); }
     } else if (running) { bar.removeAttribute("value"); ptext.textContent = "starting…"; }
     if (!running && lastState === "running") { finished(j); refreshSearch(); if (PB.compare) PB.compare.invalidate(); }
     else if (!running && !msg.textContent && j.run.state !== "idle") msg.textContent = j.run.message || j.run.error || "";

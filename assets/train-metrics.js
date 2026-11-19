@@ -425,6 +425,8 @@
       tb.appendChild(tr);
     });
     t.appendChild(tb); sc.appendChild(t); wrap.appendChild(sc);
+    // Sortable on the page (sort.js; every render builds it again with the user's sort).
+    if (window.PrismSort && window.PrismSort.attach) window.PrismSort.attach(t, { key: "run-classes" });
     if (c.min !== null) wrap.appendChild(el("p", "muted small", "Averages count the classes with at least " + c.min + " validation boxes; the others are shown, not averaged."));
     return wrap;
   }

@@ -41,8 +41,13 @@ fn frames(camera: &str, day: &str, n: usize, class: &str) -> Vec<Frame> {
 
 /// `count` camera days (`cam<i>/2026-10-01`) of `n` person frames each.
 fn days(count: usize, n: usize) -> Vec<Frame> {
+    days_of(count, n, "person")
+}
+
+/// `count` camera days (`cam<i>/2026-10-01`) of `n` frames each with one box of `class`.
+fn days_of(count: usize, n: usize, class: &str) -> Vec<Frame> {
     (0..count)
-        .flat_map(|i| frames(&format!("cam{i}"), "2026-10-01", n, "person"))
+        .flat_map(|i| frames(&format!("cam{i}"), "2026-10-01", n, class))
         .collect()
 }
 
@@ -118,11 +123,13 @@ fn validation_is_whole_camera_days_unseen_in_training() {
     for seed in 0..20 {
         let o = Options { seed, ..opts() };
         let p = plan(&s, &o).unwrap();
-        // 240 frames: 50 wanted, three days reach it.
-        assert_eq!(p.valid.len(), 60);
-        assert_eq!(p.stats.valid_groups.len(), 3);
+        // 240 frames: 50 wanted, three days reach it; a fourth brings the person boxes to their
+        // floor (80, within a third of the frames).
+        assert_eq!(p.valid.len(), 80);
+        assert_eq!(p.stats.valid_groups.len(), 4);
+        assert_eq!(p.stats.valid_boxes["person"], 80);
         assert_whole_days(&s, &p);
-        assert_eq!(p.train.len(), 180);
+        assert_eq!(p.train.len(), 160);
         assert_eq!(split_warning(&p), None);
         assert!(p.valid.is_sorted());
     }
@@ -268,9 +275,9 @@ fn days_adding_a_class_go_first() {
 
 #[test]
 fn the_first_pass_stops_at_one_and_a_half_times_the_wanted_size() {
-    // 74-frame days: 500 frames want 50, one day is 74 <= 75.
-    let mut f = days(6, 74);
-    f.extend(frames("small", "2026-10-01", 56, "person"));
+    // 74-frame days: 500 frames want 50, one day is 74 <= 75. Cars: no floor adds a day.
+    let mut f = days_of(6, 74, "car");
+    f.extend(frames("small", "2026-10-01", 56, "car"));
     let s = vec![source(f)];
     for seed in 0..20 {
         let p = plan(&s, &Options { seed, ..opts() }).unwrap();
@@ -466,8 +473,9 @@ fn public_frames_are_never_validated_on_or_counted() {
     let s = vec![source(days(10, 30)), public];
     let p = plan(&s, &opts()).unwrap();
     assert!(p.valid.iter().all(|r| r.0 == 0));
-    // 300 review frames want 50: two days are 60. The public frames do not grow that.
-    assert_eq!(p.valid.len(), 60);
+    // 300 review frames want 50: two days are 60, a third for the person floor 90 (a third of
+    // the review frames is 100). The public frames grow neither.
+    assert_eq!(p.valid.len(), 90);
     assert_eq!(p.stats.public_frames, 400);
     assert_whole_days(&s, &p);
 }
@@ -662,4 +670,233 @@ fn frames_with_regions_never_validate_and_their_boxes_count_for_the_half_rule() 
     }
     // Training would lose 3 of the 4 dog boxes with that day.
     assert_eq!(validated_cam0, 0);
+}
+
+/// The note of a floor class short of its validation boxes.
+fn floor_note(p: &Plan) -> Option<&String> {
+    p.warnings
+        .iter()
+        .find(|w| w.starts_with("validation has ") && w.contains(" wanted"))
+}
+
+#[test]
+fn the_third_pass_reaches_the_person_floor() {
+    // 300 frames want 50: the first pass stops at five 10-frame days (50 person boxes); the floor
+    // takes three more (80), well within a third of the frames (100).
+    let s = vec![source(days(30, 10))];
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..opts() }).unwrap();
+        assert_eq!(p.stats.valid_boxes["person"], 80, "seed {seed}");
+        assert_eq!(p.stats.valid_groups.len(), 8, "seed {seed}");
+        assert_eq!(p.valid.len(), 80);
+        assert_eq!(boxes_in_valid(&s, &p, "person"), 80);
+        assert_whole_days(&s, &p);
+        assert_eq!(floor_note(&p), None);
+        assert_eq!(split_warning(&p), None);
+    }
+}
+
+#[test]
+fn the_third_pass_never_takes_a_day_over_the_half_rule_and_says_so() {
+    // People on two days of 10 frames each: 60 boxes on one, 40 on the other. Validation can take
+    // the 40 (half of 100), never the 60. Cars fill the rest: 30 days of 10 frames.
+    let mut f = days_of(30, 10, "car");
+    for (cam, per) in [("big", 6), ("small", 4)] {
+        let boxes = vec!["person"; per];
+        for i in 0..10 {
+            f.push(frame(cam, "2026-10-01", &format!("p{i}"), &boxes));
+        }
+    }
+    let s = vec![source(f)];
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..opts() }).unwrap();
+        assert!(!p.stats.valid_groups.contains(&"big/2026-10-01".into()));
+        assert!(p.stats.valid_groups.contains(&"small/2026-10-01".into()));
+        assert_eq!(p.stats.valid_boxes["person"], 40, "seed {seed}");
+        assert_eq!(p.stats.train_boxes["person"], 60);
+        assert_whole_days(&s, &p);
+        assert_eq!(
+            floor_note(&p).map(String::as_str),
+            Some(
+                "validation has 40 person boxes, 80 wanted: the remaining camera days with people \
+                 would take more than half of a class's training boxes or past a third of the \
+                 frames; review more days with people"
+            ),
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn the_third_pass_stops_at_a_third_of_the_frames() {
+    // 12 days of 25 frames: 300 frames want 50, two days reach it; the floor adds two more, the
+    // last one exactly at a third of the frames (100).
+    let s = vec![source(days(12, 25))];
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..opts() }).unwrap();
+        assert_eq!(p.valid.len(), 100, "seed {seed}");
+        assert_eq!(p.stats.valid_boxes["person"], 100);
+        assert_eq!(floor_note(&p), None);
+        assert_whole_days(&s, &p);
+    }
+    // 280 frames want 50: one 70-frame day; a second would pass a third (93).
+    let s = vec![source(days(4, 70))];
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..opts() }).unwrap();
+        assert_eq!(p.valid.len(), 70);
+        let note = floor_note(&p).unwrap();
+        assert!(
+            note.starts_with(
+                "validation has 70 person boxes, 80 wanted: the remaining camera days"
+            ),
+            "{note}"
+        );
+    }
+}
+
+#[test]
+fn runs_without_person_take_no_day_for_it() {
+    // People on days of their own, but the run trains cars only: the first passes decide alone.
+    let mut f = days_of(30, 10, "car");
+    for i in 0..30 {
+        f.extend(frames(&format!("people{i}"), "2026-10-01", 10, "person"));
+    }
+    let s = vec![source(f)];
+    for seed in 0..20 {
+        let o = Options {
+            seed,
+            classes: Some(vec!["car".into()]),
+            ..opts()
+        };
+        let p = plan(&s, &o).unwrap();
+        assert!((50..=90).contains(&p.valid.len()), "{}", p.valid.len());
+        assert_eq!(floor_note(&p), None);
+        assert!(!p.stats.valid_boxes.contains_key("person"));
+    }
+    // A pool without any person box: no day and no note, though the class list has person.
+    let s = vec![source(days_of(30, 10, "car"))];
+    for seed in 0..20 {
+        let p = plan(&s, &Options { seed, ..opts() }).unwrap();
+        assert_eq!(p.valid.len(), 50, "seed {seed}");
+        assert_eq!(floor_note(&p), None);
+    }
+}
+
+#[test]
+fn the_frame_split_takes_no_day_for_the_floor_only_a_note() {
+    let src = source(days(2, 50));
+    let s = vec![src.clone()];
+    let o = opts();
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.valid, frame_split(&src, &o, 25));
+    assert!(split_warning(&p).is_some());
+    let note = floor_note(&p).unwrap();
+    assert!(
+        note.starts_with(
+            "validation has 25 person boxes, 80 wanted: validation is split frame by frame"
+        ),
+        "{note}"
+    );
+    assert!(note.ends_with("review more days with people"), "{note}");
+    // Public frames only: silent.
+    let mut public = source(days(10, 10));
+    public.public = Some(Public {
+        id: "pub".into(),
+        license: "cc".into(),
+    });
+    let p = plan(&[public], &opts()).unwrap();
+    assert_eq!(floor_note(&p), None);
+}
+
+/// A camera day held out for good is held out even where an older export put it in train, and
+/// the plan says how many frames that moved.
+#[test]
+fn a_frozen_day_never_trains_when_the_exports_split_is_not_used() {
+    // Every review frame held out by its export and no public frames: the plan ignores that
+    // split and holds out a share itself. A frozen day stays held out there, and with no
+    // held-out share at all.
+    let mut f = days(8, 20);
+    for x in &mut f {
+        x.split = SplitHint::Heldout;
+    }
+    let s = vec![source(f)];
+    let frozen = "cam3/2026-10-01".to_string();
+    for share in [opts().heldout_share, 0.0] {
+        let o = Options {
+            frozen_heldout: [frozen.clone()].into(),
+            heldout_share: share,
+            ..opts()
+        };
+        let p = plan(&s, &o).unwrap();
+        assert!(
+            groups_of(&s, p.heldout.iter().copied()).contains(&frozen),
+            "share {share}"
+        );
+        assert!(
+            !groups_of(&s, p.train.iter().map(|(r, _)| *r)).contains(&frozen),
+            "share {share}"
+        );
+        assert!(!p.stats.valid_groups.contains(&frozen), "share {share}");
+    }
+}
+
+#[test]
+fn a_frozen_day_in_an_older_exports_train_split_is_held_out() {
+    let mut f = days(8, 20);
+    for x in &mut f {
+        x.split = SplitHint::Train;
+    }
+    let mut held = frames("held", "2026-10-01", 20, "person");
+    for x in &mut held {
+        x.split = SplitHint::Heldout;
+    }
+    f.extend(held);
+    let s = vec![source(f)];
+    let plain = plan(&s, &opts()).unwrap();
+    assert_eq!(plain.heldout.len(), 20);
+    let o = Options {
+        frozen_heldout: ["cam3/2026-10-01".to_string(), "gone/2026-09-01".to_string()].into(),
+        ..opts()
+    };
+    let p = plan(&s, &o).unwrap();
+    assert_eq!(p.heldout.len(), 40);
+    let held_days = groups_of(&s, p.heldout.iter().copied());
+    assert_eq!(
+        held_days,
+        ["cam3/2026-10-01", "held/2026-10-01"]
+            .map(String::from)
+            .into()
+    );
+    assert!(!groups_of(&s, p.train.iter().map(|(r, _)| *r)).contains("cam3/2026-10-01"));
+    assert!(!p.stats.valid_groups.contains(&"cam3/2026-10-01".into()));
+    assert_eq!(p.stats.frozen_moved, 20);
+    let w = p
+        .warnings
+        .iter()
+        .find(|w| w.contains("held out for good"))
+        .unwrap();
+    assert!(
+        w.starts_with(
+            "20 frame(s) of 1 camera day(s) held out for good (cam3/2026-10-01) are in the train \
+             split of an older export"
+        ),
+        "{w}"
+    );
+    assert_ne!(p.heldout_fingerprint, plain.heldout_fingerprint);
+    // An export that holds it out already: no warning, the same plan as without the list.
+    let mut agreed = s.clone();
+    for x in &mut agreed[0].frames {
+        if x.camera == "cam3" {
+            x.split = SplitHint::Heldout;
+        }
+    }
+    let q = plan(&agreed, &o).unwrap();
+    assert_eq!(q.stats.frozen_moved, 0);
+    assert!(!q.warnings.iter().any(|w| w.contains("held out for good")));
+    assert_eq!(q, plan(&agreed, &opts()).unwrap());
+    // The options keep the list out of `dataset.json` when it is empty.
+    let json = serde_json::to_value(opts()).unwrap();
+    assert!(json.get("frozen_heldout").is_none());
+    let json = serde_json::to_value(&o).unwrap();
+    assert_eq!(json["frozen_heldout"][0], "cam3/2026-10-01");
 }

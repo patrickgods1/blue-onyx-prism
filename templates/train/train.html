@@ -52,6 +52,10 @@
         <p class="muted small">Comma-separated, in head order; empty = all of the export. (With scripts: a list of the ticked folders' classes and their boxes.)</p>
       </div>
       <p class="small" id="train-classes-msg" role="status"></p>
+      <fieldset id="train-merges"><legend>Merge classes</legend>
+        <input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="rename" aria-label="Merge classes" placeholder="truck=car, van=car">
+        <p class="muted small">Boxes of the first class are trained as the second; an empty second drops them. Tick the merged class (car), not the one merged away.</p>
+      </fieldset>
       <div class="tr-radios" role="radiogroup" aria-label="Objects of unticked classes">
         <span class="muted small">Objects of unticked classes:</span>
         <label class="check" title="The frame stays; the object is background (a frame left without a box is a negative). Right for unrelated objects (a bench)."><input type="radio" name="excluded" value="background" checked> treat as background</label>
@@ -126,6 +130,7 @@
   <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if let Some(o) = other_env %}{% if !env_ready %};{% endif %} the training environment of another GPU if you choose it ({{ o }}){% endif %}{% if (!env_ready || other_env.is_some()) && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
   {% endif %}
   <div class="tr-preflight" id="train-preflight" aria-live="polite" hidden></div>
+  <label class="check tr-confirm" id="train-memory-anyway" hidden><input type="checkbox" name="ignore_memory_check" value="1" disabled> <span data-memory-label></span></label>
   <div class="actions"><button type="submit">Queue training</button></div>
   {% endif %}
   <details class="tr-more" id="train-advanced">

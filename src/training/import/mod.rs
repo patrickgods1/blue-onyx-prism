@@ -178,6 +178,10 @@ pub struct ImportRequest {
     /// `collect.dir`, the folder the Collect and Review tabs show).
     #[serde(default)]
     pub out_dir: Option<PathBuf>,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 fn default_window() -> f32 {
@@ -206,6 +210,7 @@ impl ImportRequest {
             workers: 0,
             hwaccel: HwAccel::Auto,
             out_dir: None,
+            ignore_memory_check: false,
         }
     }
 
@@ -403,7 +408,16 @@ pub(crate) fn plan_import_with(
         timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
         needs_python,
         finish: None,
+        headroom: super::commit::now,
     })
+}
+
+/// The host memory commit (Windows) of an import with `selection`, for the check before its first
+/// Python process ([`crate::training::commit`]): the SigLIP 2 selection loads SigLIP 2
+/// ([`crate::training::autolabel::memory::embed_commit_need`]); the dHash selection loads no model
+/// (its extraction helpers are PyAV processes without PyTorch), so None.
+pub fn commit_need(selection: Selection) -> Option<crate::training::commit::Need> {
+    (selection == Selection::Siglip).then(crate::training::autolabel::memory::embed_commit_need)
 }
 
 /// What [`plan_import`] knows of the source for the space estimate.

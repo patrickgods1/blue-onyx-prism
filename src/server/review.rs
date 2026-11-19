@@ -1330,6 +1330,11 @@ mod tests {
         let r = &v["report"];
         assert_eq!(r["frames"], 2);
         assert_eq!((r["train"].as_u64(), r["val"].as_u64()), (Some(1), Some(1)));
+        // A named camera: the camera days held out for good are read, never added to.
+        let held = d.dir.join(crate::collect::labels::heldout::FILE);
+        assert_eq!(r["heldout"]["custom_split"], true, "{r}");
+        assert_eq!(r["heldout"]["listed"], 0);
+        assert!(!held.exists());
         assert_eq!(r["empty_confirmed"], 1);
         assert_eq!(
             r["hard_negative_boxes"], 3,
@@ -1408,6 +1413,15 @@ mod tests {
         let canon = super::super::browse::plain(&out.canonicalize().unwrap());
         assert_eq!(inner.parent(), Some(canon.as_path()));
         assert!(inner.join("export.json").is_file());
+        // The default split lists what it held out: one of the two camera days (each camera has
+        // one, so neither can be topped up: both are short).
+        let h = &v["report"]["heldout"];
+        assert_eq!(h["listed"], 1, "{h}");
+        assert_eq!(h["added"].as_array().unwrap().len(), 1);
+        assert_eq!(h["short"].as_array().unwrap().len(), 2, "{h}");
+        let listed = crate::collect::labels::heldout::load(&d.dir).unwrap();
+        assert_eq!(listed.days.len(), 1);
+        assert!(held.is_file());
         // The dataset folder itself is refused.
         let body = serde_json::json!({"format": "coco", "out_dir": d.dir}).to_string();
         let (s, v) = json(&d.state, post_json("/v1/review/export", &body)).await;
@@ -1616,6 +1630,8 @@ mod tests {
             (Some(1), Some(1))
         );
         assert_eq!(v["crops"], 1);
+        // No memory reading in unit tests (`commit::now`): nothing would be refused.
+        assert_eq!(v["memory"], serde_json::Value::Null, "{v}");
         // A skipped frame is passed over.
         let mut skipped = labels::read(&path).unwrap().unwrap();
         skipped.status = labels::Status::Skipped;

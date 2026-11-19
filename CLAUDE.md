@@ -95,8 +95,8 @@ mean `openvino:*`. The `auto` ranking (discrete GPUs by VRAM, then integrated, C
 build has no kernels for) is in README "Hardware and device selection". A model with results in `benchmark.json`
 orders its `auto` devices by measured speed. NPU is never auto. ORT needs `.onnx` files. `OrtProbe.version` is the
 loaded library's version (the resolver's hypothetical probe carries the version the plan installs).
-- CPU inference uses all physical cores but one (`backend/cpu_threads.rs`); ORT thread pools do not spin; benchmarks
-  and training helpers run below normal priority (`backend/priority.rs`).
+- CPU inference uses all physical cores but one (`backend/cpu_threads.rs`); ORT thread pools do not spin; benchmarks of
+  CPU devices and training helpers run below normal priority (`backend/priority.rs`).
 - Windows CPUs with AMX but no AMX-FP16 get `ONEDNN_MAX_CPU_ISA=AVX512_CORE_FP16` unless set (OpenVINO's AMX kernels
   raise #UD there; `backend/cpu_isa.rs`). RT-DETR runs on CoreML only with every input dim pinned (a dynamic batch dim
   aborts MPSGraph).
@@ -259,6 +259,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - `task::load_or_move_aside` moves a damaged `runs.json` / `tasks.json` to `.corrupt-<time>` and leaves an unreadable
     one alone, unwritten. Runs are never dropped. JSONL reads are lossy per line and appends repair a torn tail
     (`layout::read_lines`); `layout::compact_review` and appends to `review-queue.jsonl` share `.review-queue.lock`.
+  - `heldout-days.json` (review folder) only grows: one writer, `labels::heldout::update` under `.heldout-days.lock`
+    (fs4, never under `.labels.lock`); a newer or damaged one refuses the export and is never moved aside.
   - Exports are built hidden, then renamed. A crashed auto-label's `proposals.jsonl` is written through the job's own
     path first (`autolabel::job::recover_crashed`) and kept on failure.
   - An unavailable review folder is `folder_missing`, never an empty dataset. Uninstall keeps data unless asked.
@@ -348,7 +350,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     (`heldout_fingerprint`; random picks never in it), validation as whole camera days (`dataset/valid.rs`), ignore
     mode (`dataset::IgnoreMode`), static cap (`collect/labels/statics.rs`, pure: persons and animals never form spots),
     parked cap, opt-in balancing, size-floor restore at the run's input. `training/preflight.rs` is the one report
-    behind the page, `balance-preview` and `train prepare --dry-run`.
+    behind the page, `balance-preview` and `train prepare --dry-run`. Listed held-out days (`Options.frozen_heldout`)
+    are held out even from an older export's train split; validation adds whole days up to `VALID_CLASS_FLOORS`.
   - One convergence rule for every trainer: `Convergence` in `train_model.py`, Rust twin `progress::convergence_run`,
     parity-tested. `RunSettings` records what changes results (ignore mode, negative share, static cap) and
     `compare.rs` warns on mixed values.
@@ -403,6 +406,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     `PrismDraft` (sessionStorage drafts restored only at the same revision), `PrismViewport`, `PrismPointer`,
     `PrismTip` (information only in a `title` needs a tap-to-pin `button.term`, touch has no hover). Incremental polls: `server/training/poll.rs`
     (`TrainMetrics.poll`, node parity test), `server/benchmark/poll.rs`.
+  - `PrismSort` (`assets/sort.js`, node-tested in `tests/it/js_sort.rs`) is the one table sorter (`data-sort="<key>"`
+    or `PrismSort.attach`; re-renders call `PrismSort.apply`); ranked defaults come from Rust `data-best`, never
+    a JS ranking twin.
   - Pure modules are node-tested from `tests/it/`: `review-rules.js` (`js_rules.rs`), `review-touch.js`
     (`js_review_touch.rs`), charts, viewport, poll.
   - Phones (`assets/style.css`, *Phones and tablets*): every `vh` height is followed by `dvh`/`svh` and every `:hover`

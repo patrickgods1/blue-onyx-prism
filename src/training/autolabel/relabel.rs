@@ -63,6 +63,9 @@ pub trait Detector: Send + Sync {
 pub struct LocalDetector {
     pub config: Config,
     pub runtimes: Option<Arc<Mutex<Runtimes>>>,
+    /// Compile the model without the OpenVINO model cache: a throwaway model (the dataset
+    /// check's fold models, [`crate::training::refine::predict`]); false for everything else.
+    pub no_cache: bool,
 }
 
 impl std::fmt::Debug for LocalDetector {
@@ -144,6 +147,9 @@ impl Detector for LocalDetector {
         );
         bench.cancel = Some(cancel);
         bench.max_stored_preds = 300;
+        bench.no_cache = self.no_cache;
+        // Only the detections are kept: read the next frame ahead on every device, CPU too.
+        bench.read_ahead = crate::benchmark::ReadAhead::Always;
         // Each frame as it finishes, for a cancelled run.
         let finished: Mutex<BTreeMap<String, Vec<Det>>> = Mutex::default();
         let sink = |r: &ImageRun| {
