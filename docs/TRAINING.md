@@ -1267,7 +1267,9 @@ and progress ("full resolution: 40 of 120 frames") come back in video order too,
 carry the video's name. Measured on a GTX 1070 Ti box (i5-8500, D3D11VA, three Blue Iris clips of
 0.5-2.7 GB on a second drive, 33 kept frames, the same bytes either way, a game using the GPU
 meanwhile): 81 and 80 s one video after another, 74 and 76 s three at once. The videos share the
-hardware decoder and the drive, so the gain there is small. The helpers run below normal priority,
+hardware decoder and the drive, so the gain there is small. The SigLIP embedding step (`embed`)
+decodes and preprocesses the next batch on a thread while the GPU embeds the current one. The
+helpers run below normal priority,
 like every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it

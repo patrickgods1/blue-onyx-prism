@@ -557,6 +557,29 @@ def self_test() -> int:
     assert embed_dtype("cuda:0", (8, 6)) == "float16" and embed_dtype("cuda:1", (7, 5)) == "float16"
     assert embed_dtype("cuda:0", (6, 1)) == "float32", "Pascal: float16 is slow there"
     assert embed_dtype("mps", None) == "float32" and embed_dtype("cpu", None) == "float32"
+    import threading
+
+    where = []
+
+    def job(k):
+        where.append(threading.current_thread().name)
+        if k == 3:
+            raise OSError("cannot identify image file")
+        return k * 10
+
+    got = []
+    try:
+        for v in prefetched([lambda k=k: job(k) for k in range(6)]):
+            got.append(v)
+    except OSError as e:
+        assert str(e) == "cannot identify image file", e
+    assert got == [0, 10, 20], got
+    assert set(where) == {"embed-prefetch"} and len(where) == 4, where
+    gen = prefetched([lambda k=k: k for k in range(50)], depth=2)
+    assert next(gen) == 0
+    gen.close()
+    assert not any(t.name == "embed-prefetch" for t in threading.enumerate()), "the thread stops on close"
+    assert list(prefetched([])) == []
     tmp = Path(tempfile.mkdtemp(prefix="import_footage_selftest_"))
     try:
         try:
@@ -630,12 +653,54 @@ def embed_dtype(device: str, capability) -> str:
     return "float32"
 
 
+def prefetched(jobs: list, depth: int = 1):
+    """The results of the callables `jobs`, in order, each computed on one background thread up to
+    `depth` ahead of the one being used. A job's exception is raised where its result would be
+    yielded; leaving the loop early stops the thread (at most the jobs already started finish)."""
+    import queue
+    import threading
+
+    q = queue.Queue(maxsize=max(1, depth))
+    stop = threading.Event()
+
+    def put(item) -> bool:
+        while not stop.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce() -> None:
+        for job in jobs:
+            try:
+                item = (True, job())
+            except BaseException as e:  # noqa: BLE001 - raised on the consumer's thread
+                item = (False, e)
+            if not put(item) or not item[0]:
+                return
+
+    thread = threading.Thread(target=produce, name="embed-prefetch", daemon=True)
+    thread.start()
+    try:
+        for _ in jobs:
+            ok, value = q.get()
+            if not ok:
+                raise value
+            yield value
+    finally:
+        stop.set()
+        thread.join()
+
+
 def embed(a) -> int:
     """Image embeddings with SigLIP 2's vision tower. Only that tower goes to the device (354 MB in
     float32 of the model's 1431 MB; the text tower is never used here and stays on the CPU), in
     `embed_dtype`. It stays on the GPU rather than the CPU: up to 20,000 candidates in batches of
     16 took 27 ms per image on an M1's GPU against 55 ms on its CPU (measured), and a CUDA card is
-    much further ahead of a desktop CPU."""
+    much further ahead of a desktop CPU. A thread decodes the next batch and runs the processor on
+    it (`prefetched`) while this one is on the device."""
     import numpy as np
     import torch
     from PIL import Image
@@ -654,18 +719,27 @@ def embed(a) -> int:
     event("start", images=len(paths), device=dev, dtype=str(dtype).replace("torch.", ""),
           load_s=round(time.time() - t0, 1))
     dim = None
+
+    def decode(part: list):
+        return processor(images=[Image.open(p).convert("RGB") for p in part], return_tensors="pt")
+
+    starts = list(range(0, len(paths), a.batch))
+    jobs = [lambda i=i: decode(paths[i:i + a.batch]) for i in starts]
+    batches = prefetched(jobs)
     with open(a.out, "wb") as out:
-        for i in range(0, len(paths), a.batch):
-            batch = [Image.open(p).convert("RGB") for p in paths[i:i + a.batch]]
-            inputs = processor(images=batch, return_tensors="pt").to(dev)
-            inputs["pixel_values"] = inputs["pixel_values"].to(dtype)
-            with torch.no_grad():
-                f = model.get_image_features(**inputs)
-            f = getattr(f, "pooler_output", f)
-            f = torch.nn.functional.normalize(f.float(), dim=-1).cpu().numpy().astype("<f4")
-            dim = f.shape[1]
-            out.write(np.ascontiguousarray(f).tobytes())
-            event("progress", done=min(len(paths), i + a.batch), images=len(paths))
+        try:
+            for i, inputs in zip(starts, batches):
+                inputs = inputs.to(dev)
+                inputs["pixel_values"] = inputs["pixel_values"].to(dtype)
+                with torch.no_grad():
+                    f = model.get_image_features(**inputs)
+                f = getattr(f, "pooler_output", f)
+                f = torch.nn.functional.normalize(f.float(), dim=-1).cpu().numpy().astype("<f4")
+                dim = f.shape[1]
+                out.write(np.ascontiguousarray(f).tobytes())
+                event("progress", done=min(len(paths), i + a.batch), images=len(paths))
+        finally:
+            batches.close()
     event("done", images=len(paths), dim=dim, seconds=round(time.time() - t0, 1), device=dev)
     return 0
 
