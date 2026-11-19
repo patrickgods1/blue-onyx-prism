@@ -382,14 +382,20 @@ struct SuggestOverlapsBody {
     again: bool,
     #[serde(default)]
     dry_run: bool,
+    /// Start even when the memory commit check would refuse (the page's "Start anyway").
+    #[serde(default)]
+    ignore_memory_check: bool,
 }
 
 /// `POST /v1/review/suggest-overlaps` with `{bucket?, scene?, camera?, label?, gpu?, allow_large?,
-/// again?, dry_run?}`: queue the overlap check ([`crate::training::overlaps`]) on the label files
-/// of the folder under review those filters select, reviewed frames too (no `source` or `status`
-/// narrows it, a reviewed frame need not be in the review queue). It writes suggestions and nothing
-/// else. `dry_run` only counts (`frames`, `pairs`, `crops`, `no_zoom`, `answered`, `passed_over`), and
-/// needs no GPU. Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
+/// again?, dry_run?, ignore_memory_check?}`: queue the overlap check ([`crate::training::overlaps`])
+/// on the label files of the folder under review those filters select, reviewed frames too (no
+/// `source` or `status` narrows it, a reviewed frame need not be in the review queue). It writes
+/// suggestions and nothing else. `dry_run` only counts (`frames`, `pairs`, `crops`, `no_zoom`,
+/// `answered`, `passed_over`), and needs no GPU; its `memory` is `{refusal, override_label}` when
+/// a start now would be refused for memory commit on Windows ([`crate::training::commit::Preview`],
+/// null when it fits or there is no crop), and `ignore_memory_check: true` then starts it anyway.
+/// Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
 pub(in crate::server) async fn suggest_overlaps(
     State(shared): State<Shared>,
     headers: HeaderMap,
@@ -415,6 +421,7 @@ pub(in crate::server) async fn suggest_overlaps(
         }
         req.gpu = b.gpu;
         req.allow_large = b.allow_large;
+        req.ignore_memory_check = b.ignore_memory_check;
         if let Err(e) = req.frames.filters() {
             return fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
         }
@@ -441,6 +448,14 @@ pub(in crate::server) async fn suggest_overlaps(
                     s.answered, s.passed_over
                 )
             });
+            // A start now would be refused for memory (read again when it starts).
+            let memory = (s.crops > 0)
+                .then(|| {
+                    crate::training::commit::preview_now(
+                        &crate::training::overlaps::job::commit_need(),
+                    )
+                })
+                .flatten();
             return success(serde_json::json!({
                 "frames": s.frame_count,
                 "pairs": s.pairs,
@@ -449,6 +464,7 @@ pub(in crate::server) async fn suggest_overlaps(
                 "answered": s.answered,
                 "passed_over": s.passed_over,
                 "message": message,
+                "memory": memory,
             }));
         }
         let config = state.config_read().clone();

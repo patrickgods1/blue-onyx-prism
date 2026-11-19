@@ -71,6 +71,9 @@ pub struct ImportJob {
     /// Steps after a finished import that nothing follows ([`crate::training::finish`]; the
     /// Review folder switch).
     pub finish: Option<crate::training::finish::Finish>,
+    /// The memory commit a job can take now ([`crate::training::commit::now`]; tests fake it),
+    /// checked before the first Python process of a SigLIP 2 selection ([`super::commit_need`]).
+    pub headroom: fn() -> Option<crate::training::commit::Headroom>,
 }
 
 /// A frame before the selection.
@@ -680,6 +683,16 @@ impl ImportJob {
         }
         self.step(report, 1, 100, &r.source.describe());
         check(cancel)?;
+        // Before the first Python process: the SigLIP 2 selection loads a model (hours of
+        // extraction later; refused now rather than then).
+        if let Some(need) = super::commit_need(r.selection) {
+            crate::training::commit::gate_task(
+                &need,
+                (self.headroom)().as_ref(),
+                r.ignore_memory_check,
+                report,
+            )?;
+        }
 
         // 2. The environment.
         let _lock =
@@ -1611,12 +1624,17 @@ impl Task for ImportJob {
         // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
         // ([`crate::storage::sweep`]). A kept work folder (`keep_work`) outlives the marker.
         let _busy = crate::storage::Busy::hold(&self.work);
-        let mut out = self.run_guarded(
+        let mut overridden = false;
+        let r = self.run_guarded(
             ctx,
-            report,
+            &mut |p| {
+                crate::training::commit::watch(&p, &mut overridden);
+                report(p);
+            },
             cancel,
             Guard::new(&self.work, &self.dataset_dir),
-        )?;
+        );
+        let mut out = crate::training::commit::noted(r, overridden)?;
         if let Some(fin) = self.finish.as_ref().filter(|f| !f.is_empty())
             && !cancel.load(Ordering::Relaxed)
         {

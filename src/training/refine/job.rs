@@ -51,7 +51,6 @@ use super::predict::{FoldModel, FoldPredictor, LocalPredictor};
 use super::quick::{self, Quick};
 use super::report::{Mode, RecallTally, RefineReport};
 use super::{RefineRequest, Selected, fold_model_name, recipe_info, select, tighten, write};
-use crate::backend::memory::Commit;
 use crate::collect::labels::Frame;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{
@@ -63,6 +62,7 @@ use crate::resources::export::Cancelled;
 use crate::resources::export::train::TrainLock;
 use crate::resources::manager;
 use crate::training::autolabel::relabel::{Detections, Image};
+use crate::training::commit::{self, Headroom};
 use crate::training::dataset;
 use crate::training::job::{self, NoHooks, TrainJob, TrainReport, TrainStage};
 use crate::training::pyenv::{check, is_cancel, stage};
@@ -113,9 +113,9 @@ pub struct RefineJob {
     pub config: Box<Config>,
     /// Fewest frames a check runs on ([`super::MIN_FRAMES`]; tests lower it).
     pub min_frames: usize,
-    /// The free commit now, checked before the closer look loads RF-DETR L
-    /// ([`crate::system_info::commit`]; tests fake it).
-    pub free_commit: fn() -> Option<Commit>,
+    /// The memory commit a job can take now ([`commit::now`]; tests fake it), checked before the
+    /// first fold trains ([`super::commit_need`]) and again before the closer look loads RF-DETR L.
+    pub headroom: fn() -> Option<Headroom>,
 }
 
 impl std::fmt::Debug for RefineJob {
@@ -841,6 +841,8 @@ impl RefineJob {
         tj.request.install_dir = Some(fold_dir.join("model"));
         tj.keep_work = false;
         tj.export_only = None;
+        // Judged once, before the first fold ([`super::commit_need`]).
+        tj.headroom = commit::checked_already;
         // Its export has no floor on purpose: no warning that it differs from the current one.
         tj.options.size_floor = None;
         // Its export's split is the fold: a camera day held out for good from the benchmark is
@@ -1006,6 +1008,13 @@ impl RefineJob {
         if let Some(why) = &s.refused {
             bail!("{why}");
         }
+        // Before the first fold's first Python process: its training is the check's peak.
+        commit::gate_task(
+            &super::commit_need(train_job.request.recipe.family, train_job.workers),
+            (self.headroom)().as_ref(),
+            self.request.ignore_memory_check,
+            report,
+        )?;
         // The GPU is this check's from the first fold's training to the last fold's writes: held
         // across the folds, so no other process (the service or a `train` command) trains or
         // labels between a fold's training and its prediction, or takes the next fold's turn.
@@ -1626,7 +1635,16 @@ impl Task for RefineJob {
         // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
         // ([`crate::storage::sweep`]).
         let busy = crate::storage::Busy::hold(&self.work);
-        let r = self.stages(ctx, report, cancel);
+        let mut overridden = false;
+        let r = self.stages(
+            ctx,
+            &mut |p| {
+                commit::watch(&p, &mut overridden);
+                report(p);
+            },
+            cancel,
+        );
+        let r = commit::noted(r, overridden);
         if let Err(e) = manager::remove_any(&self.work) {
             tracing::warn!(
                 "dataset check: could not remove its work folder {}: {e:#}",

@@ -219,6 +219,67 @@ fn the_report_counts_splits_scenes_and_the_bulk_share() {
     );
 }
 
+/// The pre-flight says when the memory commit check would refuse a run started now (the dev box:
+/// 5 GB free, no growth on C:), with the checkbox's words, and is silent when it fits.
+#[test]
+fn the_preflight_shows_a_memory_refusal_with_the_override() {
+    use crate::training::commit::tests::{headroom, this_box};
+    use crate::training::job::Workers;
+    let sources = [export(60, 10, "day")];
+    let o = opts();
+    let p = planned(&sources, &o).unwrap();
+    let mut r = report(&p, &sources, &o, None);
+    assert_eq!(r.memory, None);
+    assert!(!text(&r).contains("memory:"), "{}", text(&r));
+    let recipes = [
+        TrainRecipe::new(catalog::TrainFamily::Rfdetr, "nano").unwrap(),
+        TrainRecipe::new(catalog::TrainFamily::Yolo26, "n").unwrap(),
+    ];
+    r.memory = memory(&recipes, Workers::Auto, Some(&this_box()));
+    let m = r.memory.clone().unwrap();
+    assert!(
+        m.refusal
+            .starts_with("this training run needs about 9.0 GB of memory commit"),
+        "{}",
+        m.refusal
+    );
+    assert_eq!(
+        m.override_label,
+        "Start anyway: this job may grow the paging file into the last 16 GB of C:"
+    );
+    let t = text(&r);
+    assert!(
+        t.contains(&format!(
+            "memory: a run would be refused if it started now: {} (--ignore-memory-check starts \
+             it anyway)",
+            m.refusal
+        )),
+        "{t}"
+    );
+    // Forced workers: the largest need of the ticked models (Ultralytics, 3 loaders).
+    let forced = memory(&recipes, Workers::Fixed(1), Some(&this_box())).unwrap();
+    assert!(
+        forced.refusal.contains("1 data loader worker 4.1 GB"),
+        "{}",
+        forced.refusal
+    );
+    // Room on C:, no reading, no model: nothing.
+    let roomy = headroom(
+        &[r"c:\pagefile.sys 2935 24576"],
+        23.65,
+        5.05,
+        &[(r"C:\", 34.2)],
+    );
+    assert_eq!(memory(&recipes, Workers::Auto, Some(&roomy)), None);
+    assert_eq!(memory(&recipes, Workers::Auto, None), None);
+    assert_eq!(memory(&[], Workers::Auto, Some(&this_box())), None);
+    // Serialized: the key only when set.
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["memory"]["override_label"], m.override_label);
+    r.memory = None;
+    assert!(serde_json::to_value(&r).unwrap().get("memory").is_none());
+}
+
 #[test]
 fn a_negative_counts_as_hard_when_confirmed_or_rejected_on() {
     let mut s = export(60, 10, "day");

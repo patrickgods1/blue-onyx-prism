@@ -7,13 +7,12 @@
 //! same script on its own crops: [`prepare`] (the environment, the script's self-check, RF-DETR L's
 //! weights) and [`run`] (the script, its progress, how it ended) serve both.
 
-use super::NEEDED_COMMIT_GB;
 use super::select::{Crop, Selected};
-use crate::backend::memory::Commit;
 use crate::collect::labels::overlaps::{Det, ZOOM_FLOOR, ZOOM_PAD};
 use crate::resources::catalog::Platform;
 use crate::resources::export::train::{self as env, TrainPaths};
 use crate::training::capability::Accelerator;
+use crate::training::commit::Need;
 use crate::training::pyenv::{self, check, is_cancel, stage};
 use crate::training::task::{TaskContext, TaskReport};
 use anyhow::{Context, Result, anyhow};
@@ -118,18 +117,23 @@ pub struct Helper<'a> {
     pub timeout: Duration,
 }
 
-/// Why `free` cannot hold the script (`what` needs it: "the overlap check", ...), or None (enough,
-/// or off Windows: no fixed limit). Measured: [`NEEDED_COMMIT_GB`].
-pub fn commit_problem(what: &str, free: Option<Commit>) -> Option<String> {
-    let needed = NEEDED_COMMIT_GB * 1024.0 * 1024.0 * 1024.0;
-    let have = free?.available as f64;
-    (have < needed).then(|| {
-        format!(
-            "{what} needs about {NEEDED_COMMIT_GB} GB of free commit for PyTorch and RF-DETR L, \
-             and {:.1} GB is free: close programs or enlarge the paging file",
-            have / (1024.0 * 1024.0 * 1024.0)
-        )
-    })
+/// Host memory commit (Windows) the script takes with RF-DETR L, bytes: PyTorch, the CUDA context,
+/// RF-DETR L and its trace, measured 2.6 GB (the overlap check on a GTX 1070 Ti). A fixed paging
+/// file runs out of commit long before RAM.
+pub const ZOOM_COMMIT_BYTES: u64 = (26 << 30) / 10;
+
+/// [`ZOOM_COMMIT_BYTES`] as the [`Need`] of `what` ("the overlap check", "the closer look at loose
+/// labels"), for [`crate::training::commit::problem`] before the script's first process.
+pub fn commit_need(what: &str) -> Need {
+    Need {
+        what: what.to_string(),
+        bytes: ZOOM_COMMIT_BYTES,
+        detail: format!(
+            "PyTorch and RF-DETR L {:.1} GB",
+            crate::training::gib(ZOOM_COMMIT_BYTES)
+        ),
+        lighter: None,
+    }
 }
 
 /// The environment, the script's own check and RF-DETR L's weights (downloaded when missing, the

@@ -166,6 +166,7 @@
     <label class="check"><input type="checkbox" id="rv-suggest-again"> Ask again <span class="muted small">(pairs with an answer too, say after a rerun added a labeler's vote)</span></label>
     <span class="muted">Takes a closer look at the nested and partly overlapping boxes on the frames the Bucket, Scene, Camera and Class filters select, <strong>reviewed frames too</strong>, and writes a suggestion for each pair: which box to drop, or that they are two objects. <strong>No box changes</strong>: under Auto <em>overlapping boxes</em> the frames open on the suggestion, strongest first, and <kbd>y</kbd> accepts it. Run <em>Reject stacked duplicates</em> first. Runs on the <a href="/train/autolabel#jobs">job queue</a> (NVIDIA GPU or Apple silicon). Asks first.</span>
   </div>
+  <label class="check tr-confirm" id="rv-suggest-anyway" hidden><input type="checkbox" disabled> <span data-memory-label></span></label>
   <progress id="rv-suggest-progress" max="100" value="0" hidden></progress>
   <div id="rv-suggest-msg" class="review-report" role="status"></div>
 </details>

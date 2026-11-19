@@ -401,6 +401,10 @@ pub struct AutolabelRequest {
     /// Load and decode the next frame on a background thread while the GPU labels this one.
     #[serde(default = "yes")]
     pub prefetch: bool,
+    /// Start even when the memory commit check would refuse ([`crate::training::commit::gate`]):
+    /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_memory_check: bool,
 }
 
 /// Boxes per Qwen3-VL call when [`AutolabelRequest::vlm_batch`] is on.
@@ -443,6 +447,7 @@ impl AutolabelRequest {
             confirm_license: false,
             gdino_threshold: 0.2,
             sam3_threshold: SAM3_THRESHOLD,
+            ignore_memory_check: false,
             rfdetr_threshold: 0.3,
             accept_score: triage::ACCEPT_SCORE,
             classes: None,
@@ -634,6 +639,7 @@ fn scoped_job(config: &Config, mut request: AutolabelRequest) -> Result<Autolabe
         config_writer: None,
         after: None,
         finish: None,
+        headroom: super::commit::now,
     })
 }
 
@@ -652,6 +658,10 @@ pub fn preview_autolabel(
         // First: a run that cannot load matters more than anything about its frames.
         let gpu = gpu_notes(&job.request, &a);
         p.warnings.splice(0..0, gpu);
+    }
+    if let Some(m) = commit_preview(&job.request, &job.classes, (job.headroom)().as_ref()) {
+        p.warnings.insert(0, commit_line(&m));
+        p.memory = Some(m);
     }
     Ok(p)
 }
@@ -690,6 +700,35 @@ pub(crate) mod tests_gpu {
     pub(crate) fn set(a: Option<Accelerator>) {
         GPU.with(|g| *g.borrow_mut() = a);
     }
+}
+
+/// What the preview says when a labelers run of `request` on `classes` would be refused for host
+/// memory now ([`memory::commit_need`], [`super::commit::refusal`] with `reading`); None when it
+/// fits, for a run with a model, or without a reading (always off Windows). The run reads the
+/// memory again when it starts.
+pub fn commit_note(
+    request: &AutolabelRequest,
+    classes: &[String],
+    reading: Option<&super::commit::Headroom>,
+) -> Option<String> {
+    commit_preview(request, classes, reading).map(|m| commit_line(&m))
+}
+
+/// [`commit_note`] as the refusal and the checkbox's words ([`super::commit::Preview`]).
+pub fn commit_preview(
+    request: &AutolabelRequest,
+    classes: &[String],
+    reading: Option<&super::commit::Headroom>,
+) -> Option<super::commit::Preview> {
+    super::commit::preview(&memory::commit_need(request, classes)?, reading)
+}
+
+/// The preview's warning of `m`.
+fn commit_line(m: &super::commit::Preview) -> String {
+    format!(
+        "This run would be refused if it started now: {} The memory is read again when it starts.",
+        m.refusal
+    )
 }
 
 /// What the preview and the run say about the labelers' GPU `a`: a labeler the card cannot hold

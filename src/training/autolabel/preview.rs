@@ -157,6 +157,10 @@ pub struct AutolabelPreview {
     pub summary: String,
     /// What to know before running this, most important first.
     pub warnings: Vec<String>,
+    /// A start now would be refused for memory commit (Windows): the refusal and the words of the
+    /// page's "Start anyway" checkbox ([`crate::training::commit::Preview`]); also first in
+    /// `warnings`.
+    pub memory: Option<crate::training::commit::Preview>,
     /// The frames [`Self::taken`] counts, in run order.
     #[serde(skip)]
     pub frames: Vec<String>,
@@ -198,6 +202,7 @@ impl AutolabelPreview {
             estimate: estimate(r, phrases, taken),
             summary: String::new(),
             warnings: Vec::new(),
+            memory: None,
             frames,
         };
         p.summary = p.summary_text(r);

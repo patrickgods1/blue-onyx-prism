@@ -369,6 +369,7 @@ fn job(
             compare_group: None,
             // A repeat: the trainer's seed differs from the assembly seed (options.seed 0).
             train_seed: Some(2),
+            ignore_memory_check: false,
         },
         name: format!("night-{}-test", family.base_name(size)),
         paths: TrainPaths::new(root, root.join("models")),
@@ -381,6 +382,7 @@ fn job(
         workers: Workers::Fixed(0),
         keep_work: false,
         export_only: None,
+        headroom: crate::training::commit::now,
     }
 }
 
@@ -2235,4 +2237,104 @@ fn a_cancel_during_the_benchmark_keeps_the_registered_model() {
     assert_eq!(r.state, RunState::Cancelled, "{}", r.describe());
     assert!(r.output.is_some());
     assert!(!r.retrying);
+}
+
+/// The memory commit check before a run's first process (this box: 5 GB free, no growth on C:,
+/// 8 GB + 1 GB spare needed): refused before any command (no uv, no Python), the queue's record
+/// kept with the error; with Start anyway it trains and says so in train.log; a fixed
+/// `training.workers` counts its workers; an export retry is not checked.
+#[test]
+fn a_run_short_of_commit_is_refused_before_the_trainer_and_its_record_is_kept() {
+    use crate::training::commit::tests::this_box;
+    use crate::training::commit::{OVERRIDDEN_PREFIX, OVERRIDE_HINT};
+    let t = tmp("commit");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.headroom = || Some(this_box());
+    let fake = TrainFake::new();
+    let (r, stages) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert!(
+        e.message.starts_with(
+            "this training run needs about 9.0 GB of memory commit (the training process 8.0 GB, \
+             1.0 GB kept spare); 5.0 GB is free and the paging file on C: can grow only while 16 \
+             GB stays free there (15.2 GB free now)."
+        ),
+        "{}",
+        e.message
+    );
+    assert!(e.message.ends_with(OVERRIDE_HINT), "{}", e.message);
+    assert!(stages.is_empty(), "no stage entered: {stages:?}");
+    assert!(fake.train_cmds.lock().unwrap().is_empty());
+    assert!(fake.inner.cmds().is_empty(), "{:?}", fake.inner.cmds());
+
+    // Through the queue: the run fails with the message and its record stays.
+    let t2 = tmp("commit-svc");
+    let mut j2 = job(
+        &t2.0,
+        TrainFamily::Yolo26,
+        "n",
+        mps(),
+        Platform::MACOS_ARM64,
+    );
+    j2.headroom = || Some(this_box());
+    let fake2 = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(fake2.clone(), fake2.clone(), Arc::new(NoHooks), None);
+    let id = svc.enqueue(j2).unwrap();
+    let rec = svc.wait(&id, Duration::from_secs(20)).unwrap();
+    assert_eq!(rec.state, RunState::Failed);
+    assert!(
+        rec.error
+            .as_deref()
+            .is_some_and(|m| m.starts_with("this training run needs about 9.0 GB")),
+        "{:?}",
+        rec.error
+    );
+    assert!(
+        svc.records().iter().any(|r| r.id == id),
+        "the record is kept"
+    );
+    assert!(fake2.train_cmds.lock().unwrap().is_empty());
+
+    // Start anyway: it trains, and train.log has the warning with the same numbers.
+    j.request.ignore_memory_check = true;
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    assert!(!fake.train_cmds.lock().unwrap().is_empty());
+    let log = std::fs::read_to_string(j.run_dir.join(LOG_FILE)).unwrap();
+    let warned: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with(OVERRIDDEN_PREFIX))
+        .collect();
+    assert_eq!(warned.len(), 1, "{log}");
+    assert!(
+        warned[0].contains("this training run needs about 9.0 GB of memory commit"),
+        "{}",
+        warned[0]
+    );
+
+    // Forced workers add theirs: 2 x 3 loaders (Ultralytics) x 1.37 GB.
+    let n = crate::training::trainer_commit_need(TrainFamily::Yolo26, Workers::Fixed(2));
+    assert_eq!(
+        n.bytes,
+        crate::training::MAIN_COMMIT_RESERVE_BYTES + 6 * crate::training::WORKER_COMMIT_BYTES
+    );
+    assert_eq!(
+        n.detail,
+        "the training process 8.0 GB + 2 data loader workers 8.2 GB (training.workers)"
+    );
+    assert!(n.lighter.unwrap().contains("remove training.workers"));
+    let auto = crate::training::trainer_commit_need(TrainFamily::Rfdetr, Workers::Auto);
+    assert_eq!(
+        (auto.bytes, auto.lighter),
+        (crate::training::MAIN_COMMIT_RESERVE_BYTES, None)
+    );
+
+    // An export retry trains nothing: not checked, whatever the reading.
+    let mut retry = retry_of(&j);
+    retry.headroom = || Some(this_box());
+    retry.request.ignore_memory_check = false;
+    let (r, _) = run(&retry, &fake, &NoHooks, &AtomicBool::new(false));
+    if let Err(e) = r {
+        assert!(!e.message.contains("memory commit"), "{}", e.message);
+    }
 }

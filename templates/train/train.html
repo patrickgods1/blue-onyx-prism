@@ -130,6 +130,7 @@
   <label class="check tr-confirm"><input type="checkbox" name="confirm_large"> Allow downloads over 500 MB:{% if !env_ready %} {{ env_download }}{% endif %}{% if let Some(o) = other_env %}{% if !env_ready %};{% endif %} the training environment of another GPU if you choose it ({{ o }}){% endif %}{% if (!env_ready || other_env.is_some()) && public_available && !public_installed %};{% endif %}{% if public_available && !public_installed %} the public night subset ({{ public_size }}) when it is mixed in{% endif %}</label>
   {% endif %}
   <div class="tr-preflight" id="train-preflight" aria-live="polite" hidden></div>
+  <label class="check tr-confirm" id="train-memory-anyway" hidden><input type="checkbox" name="ignore_memory_check" value="1" disabled> <span data-memory-label></span></label>
   <div class="actions"><button type="submit">Queue training</button></div>
   {% endif %}
   <details class="tr-more" id="train-advanced">

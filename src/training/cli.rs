@@ -176,6 +176,10 @@ pub enum TrainCommand {
         /// Keep the checkpoints in <run>/work.
         #[arg(long)]
         keep_work: bool,
+        /// Start even when the memory commit check (Windows) would refuse a run: it may grow the
+        /// paging file into the last 16 GB of its drive. It logs a warning, in train.log too.
+        #[arg(long)]
+        ignore_memory_check: bool,
         /// Print the trainer's output.
         #[arg(long)]
         verbose: bool,
@@ -219,6 +223,10 @@ pub enum TrainCommand {
 #[derive(Debug, Clone, clap::Args)]
 #[command(group(clap::ArgGroup::new("from").required(true).args(["path", "url", "dataset", "list_datasets"])))]
 pub struct ImportArgs {
+    /// Start even when the memory commit check (Windows) would refuse: the job may grow the
+    /// paging file into the last 16 GB of its drive. It logs a warning and its summary says so.
+    #[arg(long)]
+    pub ignore_memory_check: bool,
     /// A video (.mp4 .mkv .avi .mov), an image, or a folder of them (Blue Iris clip and alert
     /// folders; .bvr clips must be exported to MP4 first).
     #[arg(long)]
@@ -353,6 +361,7 @@ pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
             let mut r = AutolabelRequest::new(FrameFilter::default());
             r.with_model = a.autolabel_with_model.clone();
             r.allow_large = a.allow_large;
+            r.ignore_memory_check = a.ignore_memory_check;
             r.validate().map(|()| r)
         })
         .transpose()?;
@@ -367,6 +376,10 @@ pub fn import_chain(a: &ImportArgs) -> Result<ImportChain> {
 /// `train autolabel`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct AutolabelArgs {
+    /// Start even when the memory commit check (Windows) would refuse: the job may grow the
+    /// paging file into the last 16 GB of its drive. It logs a warning and its summary says so.
+    #[arg(long)]
+    pub ignore_memory_check: bool,
     /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, status
     /// (unreviewed | reviewed | skipped | any), source (queue | all), auto (review | accept |
     /// nothing | none | repeats | overlaps | both: frames in that auto-label state; overlaps =
@@ -467,6 +480,10 @@ pub struct AutolabelArgs {
 /// `train overlaps`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct OverlapsArgs {
+    /// Start even when the memory commit check (Windows) would refuse: the job may grow the
+    /// paging file into the last 16 GB of its drive. It logs a warning and its summary says so.
+    #[arg(long)]
+    pub ignore_memory_check: bool,
     /// Which frames: key=value pairs, comma-separated: bucket, scene, camera, label, import, limit,
     /// again=1 (also pairs with an answer). Every label file of the folder under review but
     /// skipped frames and frames a reviewer checked; status and source do not narrow it.
@@ -490,6 +507,10 @@ pub struct OverlapsArgs {
 /// `train refine`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct RefineArgs {
+    /// Start even when the memory commit check (Windows) would refuse: the job may grow the
+    /// paging file into the last 16 GB of its drive. It logs a warning and its summary says so.
+    #[arg(long)]
+    pub ignore_memory_check: bool,
     /// Only show what the check would do: frames, what the export leaves out and why, camera
     /// days, fold sizes, the model and a rough time. Needs no GPU or download and writes nothing.
     #[arg(long)]
@@ -545,6 +566,7 @@ pub fn refine_request(a: &RefineArgs) -> Result<super::refine::RefineRequest> {
             _ => None,
         },
         model: a.with_model.clone(),
+        ignore_memory_check: a.ignore_memory_check,
     };
     r.validate()?;
     Ok(r)
@@ -586,6 +608,7 @@ pub fn import_request(a: &ImportArgs) -> Result<Option<super::import::ImportRequ
     r.allow_large = a.allow_large;
     r.keep_work = a.keep_work;
     r.out_dir = a.out_dir.clone();
+    r.ignore_memory_check = a.ignore_memory_check;
     r.validate()?;
     Ok(Some(r))
 }
@@ -637,6 +660,7 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     r.confirm_license = a.confirm_license;
     r.classes = (!a.classes.is_empty()).then(|| a.classes.clone());
     r.allow_large = a.allow_large;
+    r.ignore_memory_check = a.ignore_memory_check;
     r.validate()?;
     Ok(r)
 }
@@ -1006,7 +1030,15 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 let p = super::preview_with(&config, &request, options)?;
                 println!("{}", dry_run_text(&p.plan, &request.balance));
                 let unreviewed = super::unreviewed_frames(&config);
-                let report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
+                let mut report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
+                report.memory = preflight::memory(
+                    std::slice::from_ref(&request.recipe),
+                    config
+                        .training
+                        .workers
+                        .map_or(super::job::Workers::Auto, super::job::Workers::Fixed),
+                    super::commit::now().as_ref(),
+                );
                 print!("{}", preflight::text(&report));
                 let needs = preflight::run_needs(
                     &p.plan,
@@ -1081,6 +1113,7 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             benchmark_sets,
             benchmark_devices,
             keep_work,
+            ignore_memory_check,
             verbose,
         } => {
             let scenes = data.scenes();
@@ -1179,6 +1212,7 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                         balance: balance.clone(),
                         compare_group: group.clone(),
                         train_seed: (seeds > 1).then_some(i),
+                        ignore_memory_check,
                     };
                     let run_name = seed_run_name(name.as_deref(), &req.recipe, req.scene, i);
                     let mut job = super::plan_job(&config, req, &cap, run_name)?;
@@ -1389,6 +1423,7 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             let mut req = super::overlaps::OverlapsRequest::parse(&a.frames)?;
             req.gpu.clone_from(&a.gpu);
             req.allow_large = a.allow_large;
+            req.ignore_memory_check = a.ignore_memory_check;
             let cap = super::capability_now();
             let job = super::overlaps::plan_overlaps(&config, req, &cap)?;
             eprintln!(
@@ -1403,6 +1438,12 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                      pairs answered before, {} frames skipped or checked by a reviewer",
                     s.frame_count, s.pairs, s.no_zoom, s.crops, s.answered, s.passed_over
                 );
+                if s.crops > 0
+                    && let Some(why) =
+                        super::overlaps::job::commit_problem((job.headroom)().as_ref())
+                {
+                    println!("warning: it would be refused if it started now: {why}");
+                }
                 return Ok(true);
             }
             run_task_cli(&config, Box::new(job), a.verbose)
@@ -1762,6 +1803,7 @@ fn preview_request(config: &Config, data: &DataArgs, scene: SceneFilter) -> Resu
         balance: data.balance(config)?,
         compare_group: None,
         train_seed: None,
+        ignore_memory_check: false,
     })
 }
 
@@ -2060,6 +2102,52 @@ mod tests {
     fn parse(args: &[&str]) -> Result<TrainCommand, clap::Error> {
         use clap::Parser;
         T::try_parse_from(std::iter::once("train").chain(args.iter().copied())).map(|t| t.c)
+    }
+
+    /// `--ignore-memory-check` on every command that starts a checked job reaches its request;
+    /// without it, false.
+    #[test]
+    fn ignore_memory_check_reaches_every_checked_request() {
+        let flag = "--ignore-memory-check";
+        for on in [false, true] {
+            let with = |args: &[&'static str]| {
+                let mut v = args.to_vec();
+                if on {
+                    v.push(flag);
+                }
+                parse(&v).unwrap()
+            };
+            let TrainCommand::Autolabel(a) = with(&["autolabel"]) else {
+                panic!()
+            };
+            assert_eq!(autolabel_request(&a).unwrap().ignore_memory_check, on);
+            let TrainCommand::Refine(a) = with(&["refine"]) else {
+                panic!()
+            };
+            assert_eq!(refine_request(&a).unwrap().ignore_memory_check, on);
+            let TrainCommand::Import(a) = with(&["import", "--path", "clips", "--autolabel"])
+            else {
+                panic!()
+            };
+            assert_eq!(import_request(&a).unwrap().unwrap().ignore_memory_check, on);
+            let chained = import_chain(&a).unwrap().autolabel.unwrap();
+            assert_eq!(
+                chained.ignore_memory_check, on,
+                "the chained auto-label too"
+            );
+            let TrainCommand::Overlaps(a) = with(&["overlaps"]) else {
+                panic!()
+            };
+            assert_eq!(a.ignore_memory_check, on);
+            let TrainCommand::Run {
+                ignore_memory_check,
+                ..
+            } = with(&["run", "--model", "yolo26n"])
+            else {
+                panic!()
+            };
+            assert_eq!(ignore_memory_check, on);
+        }
     }
 
     #[test]
