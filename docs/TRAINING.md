@@ -1443,7 +1443,7 @@ so a Review save with a stale `revision` gets a 409 instead of overwriting merge
 |---|---|---|---|
 | Batch the VLM check: up to 8 of a frame's boxes per Qwen3-VL call | on | `--no-vlm-batch` | `--vlm-batch 8` (off: `1`) |
 | Skip the VLM check below a fused score (0 < x <= 1); 2% of those boxes are asked anyway, to audit the cutoff | on, 0.15 | `--vlm-min-score X`, `--vlm-all-boxes` | `--vlm-min-score X --vlm-sample 0.02` |
-| Load the next frame on a background thread while the GPU works | on | `--no-prefetch` | `--prefetch` |
+| Load the next frame on a background thread while the GPU works; finish the frame before (WBF, SigLIP, the output line) on another | on | `--no-prefetch` | `--prefetch` |
 | Keep finished frames if cancelled (both modes) | on | `--discard-on-cancel` | - |
 | GPU of the labelers (shown with more than one usable NVIDIA GPU) | automatic (most VRAM) | `--gpu cuda:N` | `--device cuda:N` |
 
