@@ -55,7 +55,6 @@ use super::predict::{FoldModel, FoldPredictor, LocalPredictor};
 use super::quick::{self, Quick};
 use super::report::{Mode, RecallTally, RefineReport};
 use super::{RefineRequest, Selected, fold_model_name, place, recipe_info, select, tighten, write};
-use crate::backend::memory::Commit;
 use crate::collect::labels::Frame;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{

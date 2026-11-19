@@ -1088,6 +1088,7 @@ mod tests {
                 balance: Default::default(),
                 compare_group: group.map(str::to_string),
                 train_seed: None,
+                ignore_memory_check: false,
             },
             device: String::new(),
             state: super::super::service::RunState::Done,

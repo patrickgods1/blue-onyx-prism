@@ -2428,6 +2428,8 @@ fn a_run_short_of_commit_is_refused_before_the_trainer_and_its_record_is_kept() 
     if let Err(e) = r {
         assert!(!e.message.contains("memory commit"), "{}", e.message);
     }
+}
+
 #[test]
 fn the_seeds_of_a_group_link_the_first_seeds_dataset_and_other_groups_do_not() {
     let t = tmp("seed-reuse");
