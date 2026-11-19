@@ -96,6 +96,23 @@ struct ImportFake {
     duration: Option<f64>,
     /// The lists `frames` got.
     lists: Mutex<Vec<serde_json::Value>>,
+    /// Each video `v<k>.mp4` has its own pictures (pattern `k * frames + i`), so no frame of one
+    /// is a duplicate of another's.
+    per_video: bool,
+    /// How long `frames` of `v<k>.mp4` takes: `(slow - k) * refetch_delay_ms` (later videos first).
+    refetch_delay_ms: u64,
+    /// `frames` runs now and at most at once.
+    refetch_active: AtomicUsize,
+    refetch_peak: AtomicUsize,
+}
+
+/// `k` of a fake video `v<k>.mp4` (0 for any other name).
+fn video_number(video: &Path) -> u64 {
+    video
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.trim_start_matches('v').parse().ok())
+        .unwrap_or(0)
 }
 
 impl ImportFake {
@@ -121,11 +138,7 @@ impl ImportFake {
             cancel.store(true, Ordering::SeqCst);
         }
         if self.delay_ms > 0 {
-            let k: u64 = video
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.trim_start_matches('v').parse().ok())
-                .unwrap_or(0);
+            let k = video_number(&video);
             std::thread::sleep(Duration::from_millis(
                 self.slow.saturating_sub(k) * self.delay_ms,
             ));
@@ -172,7 +185,7 @@ impl ImportFake {
                 crate::training::pyenv::check(cancel)?;
             }
             let name = format!("f_{i:06}.jpg");
-            let pat = if self.duplicates { 0 } else { i };
+            let pat = self.pattern(&video, i);
             std::fs::write(out.join(&name), jpeg(pat, i < self.gray)).unwrap();
             // The frame's own time (pts) and decode index (n, 25 fps) beside the time from the
             // start; the source is FULL, the stored candidate 48x32.
@@ -205,6 +218,12 @@ impl ImportFake {
     fn refetch(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str)) {
         let list = arg_after(cmd, "--list").unwrap();
         let out = arg_after(cmd, "--out").unwrap();
+        let video = arg_after(cmd, "--video").unwrap();
+        if self.refetch_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(
+                self.slow.saturating_sub(video_number(&video)) * self.refetch_delay_ms,
+            ));
+        }
         let items: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&list).unwrap()).unwrap();
         self.lists.lock().unwrap().push(items.clone());
@@ -223,7 +242,7 @@ impl ImportFake {
                 .trim_end_matches(".jpg")
                 .parse()
                 .unwrap();
-            let pat = if self.duplicates { 0 } else { i };
+            let pat = self.pattern(&video, i);
             std::fs::write(
                 out.join(name),
                 jpeg_sized(pat, i < self.gray, FULL.0, FULL.1),
@@ -236,6 +255,17 @@ impl ImportFake {
             ));
         }
         on_line(r#"@import {"event":"done"}"#);
+    }
+
+    /// The picture of frame `i` of `video` ([`jpeg`]'s pattern).
+    fn pattern(&self, video: &Path, i: usize) -> usize {
+        if self.duplicates {
+            0
+        } else if self.per_video {
+            usize::try_from(video_number(video)).unwrap() * self.frames + i
+        } else {
+            i
+        }
     }
 
     fn script_cmds(&self, sub: &str) -> Vec<Cmd> {
@@ -267,7 +297,10 @@ impl CommandRunner for ImportFake {
             self.active.fetch_sub(1, Ordering::SeqCst);
             r?;
         } else if cmd.args.iter().any(|a| a == "frames") {
+            let now = self.refetch_active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.refetch_peak.fetch_max(now, Ordering::SeqCst);
             self.refetch(cmd, on_line);
+            self.refetch_active.fetch_sub(1, Ordering::SeqCst);
         } else if cmd.args.iter().any(|a| a == "fetch-url") {
             let out = arg_after(cmd, "--out").unwrap();
             std::fs::create_dir_all(&out).unwrap();
@@ -1003,6 +1036,60 @@ fn kept_frames_are_extracted_again_at_full_resolution_by_their_time() {
         jpeg_size(&job.work.join("frames/v0000/f_000000.jpg")),
         (48, 32)
     );
+}
+
+#[test]
+fn the_full_resolution_pass_runs_videos_in_parallel_and_keeps_video_order() {
+    let t = tmp("twopass-parallel");
+    let root = &t.0;
+    videos(&root.join("clips"), 4);
+    let mut req = path_request(root.join("clips"));
+    req.frames = 12;
+    req.workers = 3;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    // Three pictures per video, none shared; v0 is the slowest, so its pass finishes last. The
+    // second frame of every video is not found again.
+    let mut fake = ImportFake::new(3, 0);
+    fake.per_video = true;
+    fake.refetch_delay_ms = 25;
+    fake.slow = 4;
+    fake.missing = vec!["f_000001.jpg"];
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    let peak = fake.refetch_peak.load(Ordering::SeqCst);
+    assert!(peak > 1 && peak <= 3, "peak {peak}");
+    assert_eq!(fake.script_cmds("frames").len(), 4);
+    assert_eq!(rep["frames"], 8, "{rep}");
+    // One warning per video, in video order although v3 finished first.
+    let w: Vec<String> = warnings(&rep)
+        .into_iter()
+        .filter(|w| w.contains("not found again"))
+        .collect();
+    let want: Vec<String> = (0..4)
+        .map(|k| {
+            format!(
+                "v{k}.mp4: 1 kept frame(s) not found again at full resolution and skipped (no \
+                 frame at 1.000 s)"
+            )
+        })
+        .collect();
+    assert_eq!(w, want);
+    // Every video's own frames, at full resolution.
+    let recs = records(&root.join("dataset"));
+    assert_eq!(recs.len(), 8);
+    for k in 0..4 {
+        let n = recs
+            .iter()
+            .filter(|r| {
+                r.provenance
+                    .as_ref()
+                    .and_then(|p| p.path.as_deref())
+                    .is_some_and(|p| p.ends_with(&format!("v{k}.mp4")))
+            })
+            .count();
+        assert_eq!(n, 2, "v{k}.mp4");
+    }
+    assert!(recs.iter().all(|r| (r.width, r.height) == FULL));
 }
 
 #[test]

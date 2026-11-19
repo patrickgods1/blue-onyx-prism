@@ -5,7 +5,9 @@
 //!   The task's progress callback is not `Send`, so the workers send owned messages
 //!   ([`Event`]: started, an output line, finished) over a channel and only the calling (job)
 //!   thread reports them. Results come back by index, so the caller reassembles them in video
-//!   order (the dedup that follows depends on the order).
+//!   order (the dedup that follows depends on the order). [`run_with_notes`] is the same with a
+//!   progress tick beside the lines ([`Note::Tick`]): the full-resolution pass of the kept frames,
+//!   one helper per video as well, counts its frames with it.
 //! - [`map`] ([`crate::parallel::map`]): the analysis (decode, dHash, scene of every candidate),
 //!   CPU-bound, work-stealing by index over `threads` threads; the calling thread polls a counter
 //!   for the progress.
@@ -64,16 +66,31 @@ pub enum Event<'a> {
     Started(usize),
     /// A line of item `i`'s output.
     Line(usize, &'a str),
+    /// Item `i` made one step of progress ([`Note::Tick`]).
+    Tick(usize),
     /// Item `i` finished (its result is in the returned list).
     Finished(usize),
+}
+
+/// What the work of [`run_with_notes`] tells the calling thread while it runs.
+#[derive(Debug, Clone, Copy)]
+pub enum Note<'a> {
+    /// A line of its output.
+    Line(&'a str),
+    /// One step of progress (a frame written).
+    Tick,
 }
 
 /// The work of [`run_with_lines`]: item `i`, a sink for its output lines.
 pub type LineWork<'a, T> = dyn Fn(usize, &mut dyn FnMut(&str)) -> Result<T> + Sync + 'a;
 
+/// The work of [`run_with_notes`]: item `i`, a sink for its lines and progress ticks.
+pub type NoteWork<'a, T> = dyn Fn(usize, &mut dyn FnMut(Note<'_>)) -> Result<T> + Sync + 'a;
+
 enum Msg<T> {
     Started(usize),
     Line(usize, String),
+    Tick(usize),
     Finished(usize, Result<T>),
 }
 
@@ -84,6 +101,24 @@ pub fn run_with_lines<T: Send>(
     n: usize,
     workers: usize,
     work: &LineWork<'_, T>,
+    on_event: &mut dyn FnMut(Event<'_>),
+    cancel: &AtomicBool,
+) -> Vec<Option<Result<T>>> {
+    run_with_notes(
+        n,
+        workers,
+        &|i, note: &mut dyn FnMut(Note<'_>)| work(i, &mut |l| note(Note::Line(l))),
+        on_event,
+        cancel,
+    )
+}
+
+/// [`run_with_lines`] whose work also reports progress ticks ([`Note::Tick`], delivered as
+/// [`Event::Tick`] on the calling thread, in order with the item's lines).
+pub fn run_with_notes<T: Send>(
+    n: usize,
+    workers: usize,
+    work: &NoteWork<'_, T>,
     on_event: &mut dyn FnMut(Event<'_>),
     cancel: &AtomicBool,
 ) -> Vec<Option<Result<T>>> {
@@ -104,8 +139,11 @@ pub fn run_with_lines<T: Send>(
                         break;
                     }
                     let _ = tx.send(Msg::Started(i));
-                    let r = work(i, &mut |l| {
-                        let _ = tx.send(Msg::Line(i, l.to_string()));
+                    let r = work(i, &mut |note| {
+                        let _ = tx.send(match note {
+                            Note::Line(l) => Msg::Line(i, l.to_string()),
+                            Note::Tick => Msg::Tick(i),
+                        });
                     });
                     let _ = tx.send(Msg::Finished(i, r));
                 }
@@ -117,6 +155,7 @@ pub fn run_with_lines<T: Send>(
             match m {
                 Msg::Started(i) => on_event(Event::Started(i)),
                 Msg::Line(i, l) => on_event(Event::Line(i, &l)),
+                Msg::Tick(i) => on_event(Event::Tick(i)),
                 Msg::Finished(i, r) => {
                     if let Some(slot) = out.get_mut(i) {
                         *slot = Some(r);
@@ -200,7 +239,7 @@ mod tests {
                 match e {
                     Event::Line(i, l) => lines.push((i, l.to_string())),
                     Event::Finished(i) => finished.push(i),
-                    Event::Started(_) => {}
+                    Event::Started(_) | Event::Tick(_) => {}
                 }
             },
             &cancel,
@@ -217,6 +256,55 @@ mod tests {
         assert_eq!(lines.len(), 10);
         assert!(lines.iter().all(|(i, l)| *l == format!("item {i}")));
         assert_ne!(finished, (0..10).collect::<Vec<_>>(), "out of order");
+    }
+
+    #[test]
+    fn ticks_come_in_order_with_the_lines_of_their_item() {
+        let me = std::thread::current().id();
+        let cancel = AtomicBool::new(false);
+        let mut seen: Vec<(usize, String)> = Vec::new();
+        let work = |i: usize, note: &mut dyn FnMut(Note<'_>)| -> Result<usize> {
+            for k in 0..3 {
+                note(Note::Line(&format!("{i}.{k}")));
+                note(Note::Tick);
+            }
+            Ok(i)
+        };
+        let out = run_with_notes(
+            6,
+            3,
+            &work,
+            &mut |e| {
+                assert_eq!(std::thread::current().id(), me);
+                match e {
+                    Event::Line(i, l) => seen.push((i, l.to_string())),
+                    Event::Tick(i) => seen.push((i, "tick".into())),
+                    Event::Started(_) | Event::Finished(_) => {}
+                }
+            },
+            &cancel,
+        );
+        assert!(
+            out.iter()
+                .enumerate()
+                .all(|(i, r)| r.as_ref().unwrap().as_ref().unwrap() == &i)
+        );
+        for i in 0..6 {
+            let mine: Vec<&str> = seen
+                .iter()
+                .filter(|(k, _)| *k == i)
+                .map(|(_, l)| l.as_str())
+                .collect();
+            let want = [
+                format!("{i}.0"),
+                "tick".into(),
+                format!("{i}.1"),
+                "tick".into(),
+                format!("{i}.2"),
+                "tick".into(),
+            ];
+            assert_eq!(mine, want.iter().map(String::as_str).collect::<Vec<_>>());
+        }
     }
 
     #[test]

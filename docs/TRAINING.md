@@ -1261,8 +1261,14 @@ workers send their output lines and results to the job thread, which alone repor
 ("videos 3/12 done; reading a.mp4, b.mp4"); the results are put back in video order before the dedup
 (which keeps the first of near duplicates), so the outcome does not depend on which video finished
 first. A video that fails is a warning (`<file>: not read (...)`); a cancel stops every worker (the
-running helpers are killed, no further video starts). The helpers run below normal priority, like
-every training-environment helper ([System load](#system-load-during-training)).
+running helpers are killed, no further video starts). The full-resolution pass of the kept frames
+(`import_footage.py frames`, below) runs the same way, as many videos at a time; its frames, warnings
+and progress ("full resolution: 40 of 120 frames") come back in video order too, and its log lines
+carry the video's name. Measured on a GTX 1070 Ti box (i5-8500, D3D11VA, three Blue Iris clips of
+0.5-2.7 GB on a second drive, 33 kept frames, the same bytes either way, a game using the GPU
+meanwhile): 81 and 80 s one video after another, 74 and 76 s three at once. The videos share the
+hardware decoder and the drive, so the gain there is small. The helpers run below normal priority,
+like every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
 (`av.codec.hwaccel.hwdevices_available()`): D3D11VA on Windows, CUDA then VAAPI on Linux (macOS
