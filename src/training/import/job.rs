@@ -156,6 +156,20 @@ struct Video {
     kind: &'static str,
 }
 
+/// How the full-resolution pass of one video ended ([`ImportJob::full_frames`]).
+enum FullVideo {
+    /// The video is no longer there.
+    Gone,
+    /// The helper ran: the candidates it wrote into `out`, the reasons of those it did not find,
+    /// and its error (a cancel, a full disk or a failure; `got` holds what it wrote before).
+    Ran {
+        out: PathBuf,
+        got: Vec<usize>,
+        missing: Vec<String>,
+        error: Option<anyhow::Error>,
+    },
+}
+
 /// What one extraction found.
 #[derive(Debug, Default)]
 struct Extracted {
@@ -456,8 +470,9 @@ impl ImportJob {
     }
 
     /// The kept video frames `chosen` (indices into `cands`) that are downscaled candidates,
-    /// extracted again at full resolution (`import_footage.py frames`, one run per video) into
-    /// `<work>/full/v<i>/`, and analysed: the file, dHash, scene stats and size per candidate.
+    /// extracted again at full resolution (`import_footage.py frames`, one run per video, as many
+    /// videos at a time as the extraction runs) into `<work>/full/v<i>/`, and analysed: the file,
+    /// dHash, scene stats and size per candidate.
     /// A frame that is not found again, a video that is gone or fails, or a file whose size is
     /// not the video's is a warning and the frame is skipped.
     #[allow(
@@ -490,22 +505,26 @@ impl ImportJob {
         }
         let script = script.ok_or_else(|| anyhow!("internal: no import script"))?;
         let total: usize = by_video.values().map(Vec::len).sum();
-        let mut done = 0usize;
-        // (candidate, file, the video's size)
-        let mut files: Vec<(usize, PathBuf, u32, u32)> = Vec::new();
-        for (vi, idxs) in &by_video {
-            check(cancel)?;
-            let Some(v) = videos.get(*vi) else { continue };
-            let name = file_name(&v.path);
+        let todo: Vec<(usize, &Vec<usize>)> = by_video.iter().map(|(v, i)| (*v, i)).collect();
+        // Like the extraction: one helper per video, `workers` at a time (each decodes with
+        // FFmpeg's own threads, or the hardware decoder), results reassembled in video order.
+        let workers = parallel::extract_workers(self.request.workers, todo.len());
+        let work = |k: usize, note: &mut dyn FnMut(parallel::Note<'_>)| -> Result<FullVideo> {
+            let (vi, idxs) = todo
+                .get(k)
+                .copied()
+                .ok_or_else(|| anyhow!("internal: no video {k}"))?;
+            let v = videos
+                .get(vi)
+                .ok_or_else(|| anyhow!("internal: no video {vi}"))?;
             if !v.path.is_file() {
-                warnings.push(format!(
-                    "{name}: the video is gone, so its {} kept frame(s) cannot be written at full \
-                     resolution and were skipped",
-                    idxs.len()
-                ));
-                done += idxs.len();
-                continue;
+                for _ in idxs {
+                    note(parallel::Note::Tick);
+                }
+                return Ok(FullVideo::Gone);
             }
+            check(cancel)?;
+            let name = file_name(&v.path);
             let out = self.work.join("full").join(format!("v{vi:04}"));
             std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
             let list = self.work.join("full").join(format!("v{vi:04}.json"));
@@ -524,6 +543,9 @@ impl ImportJob {
                 .with_context(|| format!("writing {}", list.display()))?;
             let mut got: Vec<usize> = Vec::new();
             let mut missing: Vec<String> = Vec::new();
+            // The script's events and its log lines (named after the video: several run at once)
+            // both go to `note`, from two callbacks.
+            let note = std::cell::RefCell::new(note);
             let res = pyenv::run_script(
                 runner,
                 &self.paths,
@@ -543,36 +565,91 @@ impl ImportJob {
                     self.request.hwaccel.as_str().into(),
                 ],
                 "import",
-                &mut |ev, report| {
+                &mut |ev, _| {
                     let text = |k: &str| ev.get(k).and_then(serde_json::Value::as_str);
                     match text("event") {
                         Some("frame") => {
                             if let Some(i) = text("name").and_then(|n| by_name.get(n)) {
                                 got.push(*i);
-                                done += 1;
                                 guard.check_work();
-                                let pct = u8::try_from(done * 60 / total.max(1)).unwrap_or(60);
-                                stage(
-                                    report,
-                                    STAGES[6],
-                                    7,
-                                    STAGES.len(),
-                                    pct,
-                                    &format!("full resolution: {done} of {total} frames"),
-                                );
+                                (*note.borrow_mut())(parallel::Note::Tick);
                             }
                         }
                         Some("missing") => {
-                            done += 1;
                             missing.push(text("reason").unwrap_or("not found").to_string());
+                            (*note.borrow_mut())(parallel::Note::Tick);
                         }
                         _ => {}
                     }
                 },
-                report,
+                &mut |rep| {
+                    if let TaskReport::Line(l) = rep {
+                        (*note.borrow_mut())(parallel::Note::Line(&format!("{name}: {l}")));
+                    }
+                },
                 cancel,
             );
-            if let Err(e) = res {
+            if let Err(e) = &res
+                && disk::is_disk_full(e)
+            {
+                // At once, so no other video starts.
+                guard.trip(Trip::Full);
+            }
+            Ok(FullVideo::Ran {
+                out,
+                got,
+                missing,
+                error: res.err(),
+            })
+        };
+        let mut done = 0usize;
+        let results = parallel::run_with_notes(
+            todo.len(),
+            workers,
+            &work,
+            &mut |e| match e {
+                parallel::Event::Line(_, l) => report(TaskReport::Line(l)),
+                parallel::Event::Tick(_) => {
+                    done += 1;
+                    let pct = u8::try_from(done * 60 / total.max(1)).unwrap_or(60);
+                    stage(
+                        report,
+                        STAGES[6],
+                        7,
+                        STAGES.len(),
+                        pct,
+                        &format!("full resolution: {done} of {total} frames"),
+                    );
+                }
+                parallel::Event::Started(_) | parallel::Event::Finished(_) => {}
+            },
+            cancel,
+        );
+        // (candidate, file, the video's size), in video order.
+        let mut files: Vec<(usize, PathBuf, u32, u32)> = Vec::new();
+        for (k, res) in results.into_iter().enumerate() {
+            let (Some((vi, idxs)), Some(res)) = (todo.get(k).copied(), res) else {
+                continue;
+            };
+            let Some(v) = videos.get(vi) else { continue };
+            let name = file_name(&v.path);
+            let (out, got, missing, error) = match res? {
+                FullVideo::Gone => {
+                    warnings.push(format!(
+                        "{name}: the video is gone, so its {} kept frame(s) cannot be written at \
+                         full resolution and were skipped",
+                        idxs.len()
+                    ));
+                    continue;
+                }
+                FullVideo::Ran {
+                    out,
+                    got,
+                    missing,
+                    error,
+                } => (out, got, missing, error),
+            };
+            if let Some(e) = error {
                 if e.downcast_ref::<crate::resources::export::Cancelled>()
                     .is_some()
                 {
@@ -1006,6 +1083,7 @@ impl ImportJob {
                             running.retain(|x| *x != k);
                             done += 1;
                         }
+                        parallel::Event::Tick(_) => return,
                     }
                     let reading: Vec<&str> = running
                         .iter()

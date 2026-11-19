@@ -1501,8 +1501,14 @@ workers send their output lines and results to the job thread, which alone repor
 ("videos 3/12 done; reading a.mp4, b.mp4"); the results are put back in video order before the dedup
 (which keeps the first of near duplicates), so the outcome does not depend on which video finished
 first. A video that fails is a warning (`<file>: not read (...)`); a cancel stops every worker (the
-running helpers are killed, no further video starts). The helpers run below normal priority, like
-every training-environment helper ([System load](#system-load-during-training)).
+running helpers are killed, no further video starts). The full-resolution pass of the kept frames
+(`import_footage.py frames`, below) runs the same way, as many videos at a time; its frames, warnings
+and progress ("full resolution: 40 of 120 frames") come back in video order too, and its log lines
+carry the video's name. Measured on a GTX 1070 Ti box (i5-8500, D3D11VA, three Blue Iris clips of
+0.5-2.7 GB on a second drive, 33 kept frames, the same bytes either way, a game using the GPU
+meanwhile): 81 and 80 s one video after another, 74 and 76 s three at once. The videos share the
+hardware decoder and the drive, so the gain there is small. The helpers run below normal priority,
+like every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
 (`av.codec.hwaccel.hwdevices_available()`): D3D11VA on Windows, CUDA then VAAPI on Linux (macOS
@@ -2199,7 +2205,9 @@ keeps what finished too. It needs an NVIDIA GPU or Apple silicon, about 500 MB o
 checked before the environment's first process when there is a crop to check (*Memory commit check before a
 job* in [A run](#a-run)); the dry run and the Review tab's confirmation say first when a start now
 would be refused. Measured on a GTX 1070 Ti: 79 ms per crop, about 5
-minutes for 3,578 crops.
+minutes for 3,578 crops. The reader thread cuts the crops beside the decode and the output is flushed once per
+frame; on 528 crops of 186 frames that gave the same bytes and no difference beyond run-to-run noise (72 and
+84 ms per crop before, 75 ms after, RF-DETR L's load not counted).
 
 **Live reviews.** Each frame is judged again under the label write lock with the file as it stands: a pair
 whose box moved or went is passed over, a frame you skipped or checked meanwhile is left alone, and only a
@@ -2597,7 +2605,7 @@ look decides, the overlap check's zoom stage (`refine/tighten.rs`):
 2. **The look**, once after the last fold, under the training lock the check holds:
    `scripts/autolabel.py --zoom-pairs` (unchanged; the overlap check's runner, `overlaps::zoom::prepare` and
    `run`) with RF-DETR L on one crop per candidate, the union of the label `L` and `D`, padded by 20%
-   (`--zoom-pad`), at score 0.1, one flushed JSONL line per crop (with the crop it cut and the image's size,
+   (`--zoom-pad`), at score 0.1, one JSONL line per crop, flushed per frame (with the crop it cut and the image's size,
    which rule (g) uses). At most `MAX_TIGHTEN_CANDIDATES` 2,000 candidates are sent, those with the most
    confident `D` (ties by frame and place, so the same on every run); the rest are left out with a warning
    in the report and the summary (`tighten_left_out`), and their open `tighten` stays. It is the job's step

@@ -40,7 +40,8 @@ service runs this file (embedded in the binary) in its training environment
 --zoom-pairs is the overlap check's detector (`blue-onyx-prism train overlaps`, docs/TRAINING.md,
 "Overlap suggestions"): RF-DETR L on a padded crop of each union, detections in frame coordinates.
 Input: JSONL, one object per frame: `{"frame": "<rel>", "path": "<image>", "crops": [{"id": 0,
-"union": [x0, y0, x1, y1]}]}`. Output (`--out`): JSONL, one flushed line per finished crop:
+"union": [x0, y0, x1, y1]}]}`. Output (`--out`): JSONL, one line per finished crop, flushed after each
+frame's crops (the reader thread cuts them):
 `{"id": 0, "frame": "<rel>", "crop": [x0, y0, x1, y1], "size": [w, h], "boxes": [{"label", "bbox",
 "score"}]}`, highest score first, or `{"id", "frame", "error"}` for an unreadable frame. Progress:
 `@overlaps {json}` events (`start`, `model`, `crop`, `done`). Nothing is decided here either: the
@@ -558,7 +559,8 @@ def self_test(parity: Path = None) -> int:
         check(fv.calls == calls and st.get("fallbacks", 0) == (1 if fail else 0), f"vlm_check calls (fail={fail}) {fv.calls}")
     got = list(FrameReader([{"path": "/nonexistent/a.jpg"}, {"path": "/nonexistent/b.jpg"}], True,
                            opener=lambda path: path[-5]))
-    check([(i, img, err) for i, _, img, err in got] == [(0, "a", None), (1, "b", None)], f"prefetch order {got}")
+    check([(i, img, err, pr) for i, _, img, err, pr in got] == [(0, "a", None, None), (1, "b", None, None)],
+          f"prefetch order {got}")
 
     def bad(path):
         if path.endswith("b"):
@@ -566,9 +568,31 @@ def self_test(parity: Path = None) -> int:
         return path
 
     for pre in (False, True):
-        got = [(i, img, str(err) if err else None) for i, _, img, err in
+        got = [(i, img, str(err) if err else None) for i, _, img, err, _ in
                FrameReader([{"path": "a"}, {"path": "b"}, {"path": "c"}], pre, opener=bad)]
         check(got == [(0, "a", None), (1, None, "broken"), (2, "c", None)], f"reader errors (prefetch={pre}) {got}")
+    # `prepare` runs beside the decode (on the prefetch thread with prefetch); its error is raised
+    # where the result is used, and an unreadable frame is not prepared.
+    for pre in (False, True):
+        where = []
+
+        def prep(fr, img):
+            where.append(threading.current_thread().name)
+            if img == "c":
+                raise ValueError("no pixels")
+            return img.upper()
+
+        got = list(FrameReader([{"path": "a"}, {"path": "b"}, {"path": "c"}], pre, opener=bad, prepare=prep))
+        check([g[4] for g in got[:2]] == ["A", None] and isinstance(got[2][4], PrepareFailed),
+              f"prepared (prefetch={pre}) {got}")
+        check(unwrap(got[0][4]) == "A" and unwrap(None) is None, "unwrap")
+        try:
+            unwrap(got[2][4])
+            check(False, "a failed prepare raises")
+        except ValueError as e:
+            check(str(e) == "no pixels", f"prepare error {e}")
+        main = threading.current_thread().name
+        check(where == (["frame-prefetch"] * 2 if pre else [main] * 2), f"prepare thread (prefetch={pre}) {where}")
     # Stopping early (an exception in the loop) ends the prefetch thread.
     r = FrameReader([{"path": str(k)} for k in range(10)], True, opener=lambda path: path)
     with r:
@@ -602,30 +626,45 @@ def self_test(parity: Path = None) -> int:
         def flush(self):
             self.flushes += 1
 
-    fake, sink, seen = FakeModel(), Sink(), []
     frames = [{"frame": "a", "path": "a", "crops": [{"id": 0, "union": [10, 10, 20, 20]}, {"id": 1, "union": [0, 0, 100, 100]}]},
-              {"frame": "b", "path": "b", "crops": [{"id": 2, "union": [10, 10, 20, 20]}]}]
+              {"frame": "b", "path": "b", "crops": [{"id": 2, "union": [10, 10, 20, 20]}]},
+              {"frame": "c", "path": "c", "crops": []}]
+
+    class CropImage(FakeImage):
+        cut_on = []
+
+        def crop(self, box):
+            self.cut_on.append(threading.current_thread().name)
+            return box
 
     def opener(path):
         if path == "b":
             raise OSError("broken")
-        return FakeImage()
+        return CropImage()
 
     quiet, real_log = (lambda msg: None), globals()["log"]
-    globals()["log"] = quiet
-    try:
-        with FrameReader(frames, False, opener=opener) as reader:
-            total = zoom_crops(fake, reader, 3, {}, 0.2, sink, lambda **e: seen.append(e))
-    finally:
-        globals()["log"] = real_log
-    lines = [json.loads(line) for line in sink.lines]
-    check(total == 3 and len(lines) == 3 and sink.flushes == 3, f"zoom_crops lines {lines}")
-    check(all(line.endswith("\n") for line in sink.lines), "zoom_crops one line each")
-    check(lines[0]["crop"] == [8, 8, 22, 22] and lines[0]["id"] == 0 and lines[0]["size"] == [100, 100], f"zoom crop {lines[0]}")
-    check(lines[0]["boxes"] == [{"label": "car", "bbox": [8.0, 8.0, 13.0, 13.0], "score": 0.7}], f"zoom boxes {lines[0]}")
-    check(fake.seen[1] == (0, 0, 100, 100), f"zoom crop clamp {fake.seen}")
-    check(lines[2] == {"id": 2, "frame": "b", "error": "broken"}, f"zoom error line {lines[2]}")
-    check([e["index"] for e in seen] == [1, 2, 3], f"zoom events {seen}")
+    # Crops cut beside the decode (prefetch, as `zoom_pairs` runs) or in `zoom_crops`: the same lines.
+    for pre in (False, True):
+        fake, sink, seen = FakeModel(), Sink(), []
+        CropImage.cut_on = []
+        prep = (lambda fr, image: zoom_cut(fr, image, 0.2)) if pre else None
+        globals()["log"] = quiet
+        try:
+            with FrameReader(frames, pre, opener=opener, prepare=prep) as reader:
+                total = zoom_crops(fake, reader, 3, {}, 0.2, sink, lambda **e: seen.append(e))
+        finally:
+            globals()["log"] = real_log
+        lines = [json.loads(line) for line in sink.lines]
+        check(total == 3 and len(lines) == 3, f"zoom_crops lines {lines}")
+        check(sink.flushes == 2, f"zoom_crops flushes once per frame with crops: {sink.flushes}")
+        check(all(line.endswith("\n") for line in sink.lines), "zoom_crops one line each")
+        check(lines[0]["crop"] == [8, 8, 22, 22] and lines[0]["id"] == 0 and lines[0]["size"] == [100, 100], f"zoom crop {lines[0]}")
+        check(lines[0]["boxes"] == [{"label": "car", "bbox": [8.0, 8.0, 13.0, 13.0], "score": 0.7}], f"zoom boxes {lines[0]}")
+        check(fake.seen[1] == (0, 0, 100, 100), f"zoom crop clamp {fake.seen}")
+        check(lines[2] == {"id": 2, "frame": "b", "error": "broken"}, f"zoom error line {lines[2]}")
+        check([e["index"] for e in seen] == [1, 2, 3], f"zoom events {seen}")
+        want = "frame-prefetch" if pre else threading.current_thread().name
+        check(CropImage.cut_on == [want, want], f"zoom crops cut on {CropImage.cut_on}")
     if parity:
         doc = json.loads(Path(parity).read_text(encoding="utf-8"))
         check(len(doc["crops"]) >= 4, "parity crops")
@@ -1066,17 +1105,37 @@ def vlm_check(vlm: Vlm, image, boxes: list, batch: int, name: str, state: dict) 
             b["vlm_skipped"] = "unclear"
 
 
+class PrepareFailed:
+    """What `FrameReader` yields in place of `prepare`'s result when it raised: `unwrap` raises the
+    exception on the thread that uses the result, as when `prepare` ran there."""
+
+    def __init__(self, error: BaseException):
+        self.error = error
+
+
+def unwrap(prepared):
+    """`prepared` (a `FrameReader` item's last field), raising what `prepare` raised."""
+    if isinstance(prepared, PrepareFailed):
+        raise prepared.error
+    return prepared
+
+
 class FrameReader:
-    """The frames with their decoded RGB images, in order: `(index, frame, image, error)` (image None
-    and the exception when it cannot be read). With `prefetch`, a thread decodes up to two frames
-    ahead; leaving the `with` block (or exhausting it) stops the thread."""
+    """The frames with their decoded RGB images, in order: `(index, frame, image, error, prepared)`
+    (image None and the exception when it cannot be read). `prepare(frame, image)`, when given,
+    runs right after the decode and its result is `prepared` (None without it or for an unreadable
+    frame; `PrepareFailed` when it raised, see `unwrap`): the CPU work of a frame that does not
+    need the GPU (the overlap check's crops). With `prefetch`, a thread
+    does both up to two frames ahead; leaving the `with` block (or exhausting it) stops the
+    thread."""
 
     DEPTH = 2
 
-    def __init__(self, frames: list, prefetch: bool, opener=None):
+    def __init__(self, frames: list, prefetch: bool, opener=None, prepare=None):
         self.frames = frames
         self.prefetch = prefetch
         self.opener = opener or self.open_rgb
+        self.prepare = prepare
         self.thread = None
         self.stop = threading.Event()
         self.q = queue.Queue(maxsize=self.DEPTH)
@@ -1089,9 +1148,15 @@ class FrameReader:
 
     def load(self, i: int, fr: dict):
         try:
-            return i, fr, self.opener(fr["path"]), None
+            image = self.opener(fr["path"])
         except Exception as e:  # noqa: BLE001 - one unreadable frame must not stop the run
-            return i, fr, None, e
+            return i, fr, None, e, None
+        if self.prepare is None:
+            return i, fr, image, None, None
+        try:
+            return i, fr, image, None, self.prepare(fr, image)
+        except Exception as e:  # noqa: BLE001 - raised where the result is used (`unwrap`)
+            return i, fr, image, None, PrepareFailed(e)
 
     def produce(self) -> None:
         for i, fr in enumerate(self.frames):
@@ -1139,26 +1204,44 @@ class FrameReader:
             self.close()
 
 
+def zoom_cut(fr: dict, image, pad: float) -> list:
+    """The crops of frame `fr` (`zoom_pairs` input) out of its `image`: `(box, crop image)` per
+    entry of `fr["crops"]`, in order. `zoom_pairs` cuts them on the reader thread
+    (`FrameReader(prepare=...)`)."""
+    w, h = image.size
+    out = []
+    for c in fr["crops"]:
+        box = crop_box(c["union"], w, h, pad)
+        out.append((box, image.crop(box)))
+    return out
+
+
 def zoom_crops(model, reader, crops: int, wanted: dict, pad: float, out, emit) -> int:
-    """Runs `model` on every crop of `reader`'s frames; one flushed line per finished crop in `out`,
-    `emit(...)` after each. Returns the crops done."""
+    """Runs `model` on every crop of `reader`'s frames; one line per finished crop in `out`, flushed
+    after the frame's last crop, `emit(...)` after each crop. The crops are `reader`'s prepared
+    `zoom_cut`, else cut here. Returns the crops done."""
     n = 0
-    for _, fr, image, e in reader:
+    for _, fr, image, e, prepared in reader:
         if image is None:
             log(f"{fr.get('frame')}: cannot read the image ({e}); no zoom answer for it")
-        for c in fr["crops"]:
+        else:
+            cut = unwrap(prepared)
+            if cut is None:
+                cut = zoom_cut(fr, image, pad)
+        for k, c in enumerate(fr["crops"]):
             line = {"id": c["id"], "frame": fr["frame"]}
             if image is None:
                 line["error"] = str(e)
             else:
                 w, h = image.size
-                box = crop_box(c["union"], w, h, pad)
+                box, crop = cut[k]
                 line.update({"crop": list(box), "size": [w, h],
-                             "boxes": crop_detections(model.detect(image.crop(box), wanted), box, w, h)})
+                             "boxes": crop_detections(model.detect(crop, wanted), box, w, h)})
             out.write(json.dumps(line, separators=(",", ":")) + "\n")
-            out.flush()
             n += 1
             emit(index=n, crops=crops)
+        if fr["crops"]:
+            out.flush()
     return n
 
 
@@ -1187,7 +1270,8 @@ def zoom_pairs(a: argparse.Namespace) -> int:
     model = RfDetr(a.rfdetr, device, a.rfdetr_threshold)
     event("model", name="rfdetr", seconds=round(time.time() - t0, 1))
     a.out.parent.mkdir(parents=True, exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as out, FrameReader(frames, True) as reader:
+    cut = lambda fr, image: zoom_cut(fr, image, a.zoom_pad)  # noqa: E731
+    with open(a.out, "w", encoding="utf-8", newline="\n") as out, FrameReader(frames, True, prepare=cut) as reader:
         n = zoom_crops(model, reader, crops, wanted, a.zoom_pad, out, lambda **e: event("crop", **e))
     event("done", crops=n, seconds=round(time.time() - t0, 1), device=device)
     return 0
@@ -1404,7 +1488,7 @@ def main() -> int:
         log(f"VLM: {a.vlm_batch} crop(s) per call, skipped below fused score {a.vlm_min_score}")
     reader = FrameReader(frames, a.prefetch)
     with open(a.out, "w", encoding="utf-8") as out, reader:
-        for i, fr, image, e in reader:
+        for i, fr, image, e, _ in reader:
             ms = {}
             if image is None:
                 log(f"{fr.get('frame')}: cannot read the image ({e}); skipped")
