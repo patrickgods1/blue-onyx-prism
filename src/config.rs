@@ -294,6 +294,10 @@ pub struct ModelConfig {
     /// Concurrent inferences of this model (None = the global `inflight`). Restart.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inflight: Option<usize>,
+    /// OpenVINO GPU compile hint of this model, `latency` or `throughput` (None = the global
+    /// `performance_hint`; [`crate::profile::Profile::tuning_with`]). Model reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance_hint: Option<crate::profile::PerformanceHint>,
     /// Night / IR false-positive rules ([`crate::model::filters`]); None = the global value.
     /// Maps (`label_thresholds`, `night_label_thresholds`) are merged over the global ones
     /// (this model's entries win); the other fields replace the global value. Applies at once.
@@ -371,6 +375,7 @@ impl Default for ModelConfig {
             gpu_precision: None,
             enabled: true,
             inflight: None,
+            performance_hint: None,
             night_confidence_threshold: None,
             label_thresholds: None,
             night_label_thresholds: None,
@@ -708,6 +713,13 @@ pub struct Config {
     pub ort_gpu_mem_limit_mb: Option<u64>,
     /// `auto` (classify the hardware) or a forced class: `low`, `mid`, `high`. Restart.
     pub hardware_profile: crate::profile::HardwareProfile,
+    /// OpenVINO compile hint for models on an OpenVINO GPU: `latency` (one stream, 2 in flight)
+    /// or `throughput` (THROUGHPUT, in flight = `OPTIMAL_NUMBER_OF_INFER_REQUESTS` up to
+    /// [`crate::profile::THROUGHPUT_INFLIGHT_CAP`]). None = the profile's (LATENCY on an
+    /// integrated GPU, THROUGHPUT on a discrete Intel GPU). A model's own value wins. CPU, NPU
+    /// and ONNX Runtime ignore it. Restart (a model's own value: model reload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance_hint: Option<crate::profile::PerformanceHint>,
     pub models_dir: PathBuf,
     /// Download missing resources (runtimes, models) in the background at startup. `false`
     /// (air-gapped, Docker) only reports what is missing and the command to fetch it.
@@ -912,6 +924,7 @@ impl Default for Config {
             ort_sessions: 0,
             ort_gpu_mem_limit_mb: None,
             hardware_profile: crate::profile::HardwareProfile::Auto,
+            performance_hint: None,
             models_dir: PathBuf::from("models"),
             auto_download: true,
             check_updates: true,
@@ -1287,7 +1300,14 @@ impl Config {
             ort_sessions: self.ort_sessions,
             default_model: default
                 .is_some_and(|d| d == crate::registry::normalize_name(&m.effective_name())),
+            hint: self.hint_for(m),
         }
+    }
+
+    /// The `performance_hint` model `m` compiles with: its own, else the global one (None = the
+    /// profile's hint for the device it loads on).
+    pub fn hint_for(&self, m: &ModelConfig) -> Option<crate::profile::PerformanceHint> {
+        m.performance_hint.or(self.performance_hint)
     }
 
     /// Cache directory resolved against the exe dir, or None when disabled.
@@ -3395,6 +3415,49 @@ mod tests {
     fn rule_inflight_too_large() {
         let e = check(|c| c.inflight = 65).unwrap_err();
         assert!(e.contains("inflight:"), "{e}");
+    }
+
+    #[test]
+    fn performance_hint_parses_defaults_and_round_trips() {
+        use crate::profile::PerformanceHint::{Latency, Throughput};
+        // Unset by default and absent from writes (top level and model entry).
+        let c: Config = serde_json::from_str(r#"{"models": [{"path": "a.onnx"}]}"#).unwrap();
+        assert_eq!(c.performance_hint, None);
+        assert_eq!(c.models[0].performance_hint, None);
+        assert_eq!(Config::default().performance_hint, None);
+        let text = serde_json::to_string(&c).unwrap();
+        assert!(!text.contains("performance_hint"), "{text}");
+        assert_eq!(c.hint_for(&c.models[0]), None);
+        assert_eq!(c.concurrency_overrides(&c.models[0]).hint, None);
+        // Set: read, the model's own value wins, written back as given.
+        let c: Config = serde_json::from_str(
+            r#"{"performance_hint": "throughput",
+                "models": [{"path": "a.onnx"}, {"path": "b.onnx", "performance_hint": "latency"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.performance_hint, Some(Throughput));
+        assert_eq!(c.hint_for(&c.models[0]), Some(Throughput));
+        assert_eq!(c.hint_for(&c.models[1]), Some(Latency));
+        assert_eq!(c.concurrency_overrides(&c.models[1]).hint, Some(Latency));
+        let back: Config = serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+        assert_eq!(back.performance_hint, Some(Throughput));
+        assert_eq!(back.models[1].performance_hint, Some(Latency));
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["performance_hint"], "throughput");
+        assert_eq!(v["models"][1]["performance_hint"], "latency");
+        assert!(v["models"][0].get("performance_hint").is_none());
+        assert!(validate_config(&c).is_ok());
+        // Anything else is a parse error naming the key.
+        let e = serde_json::from_str::<Config>(r#"{"performance_hint": "fast"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("fast") || e.contains("variant"), "{e}");
+        assert!(
+            serde_json::from_str::<Config>(
+                r#"{"models": [{"path": "a.onnx", "performance_hint": "THROUGHPUT"}]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

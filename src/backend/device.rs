@@ -567,6 +567,34 @@ fn select_cache_dir(
     }
 }
 
+/// One OpenVINO property a compile sets on its device for its performance hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HintProp {
+    pub key: &'static str,
+    pub value: &'static str,
+}
+
+/// The properties a compile sets on its device (`CPU`, `GPU`, `GPU.1`, ...) for `hint`, the
+/// same on every device. Pure. `PERFORMANCE_HINT` = the hint, always: a plugin keeps the last
+/// value, so every compile sets its own.
+///
+/// Auto-batching (OpenVINO wraps a GPU THROUGHPUT compile in `BATCH:GPU`, which holds requests
+/// until a batch fills or `AUTO_BATCH_TIMEOUT` passes) needs no switch: the OpenVINO archive
+/// `setup-openvino` installs has no auto-batching plugin, and OpenVINO skips auto-batching
+/// without it. Measured on the UHD 630 (plan phase 3.6): THROUGHPUT compiled with
+/// NUM_STREAMS=2 and OPTIMAL_NUMBER_OF_INFER_REQUESTS=4, two per stream, no batch. (The Core's
+/// `ALLOW_AUTO_BATCHING` cannot be set through the C API's empty device name: that name reaches
+/// the AUTO plugin, which refuses the key.)
+///
+/// The model cache needs no key of its own per hint: the GPU plugin's caching properties
+/// include `PERFORMANCE_HINT`, so OpenVINO hashes blobs of the two hints apart.
+pub(crate) fn hint_properties(hint: PerfHint) -> [HintProp; 1] {
+    [HintProp {
+        key: "PERFORMANCE_HINT",
+        value: hint.as_str(),
+    }]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_on(
     core: &mut openvino::Core,
@@ -579,19 +607,19 @@ fn compile_on(
     path: &std::path::Path,
 ) -> Result<openvino::CompiledModel> {
     let dt = DeviceType::from(device);
-    // A Core-wide setting like the precision hint: set before every compile so each model gets
-    // its own (THROUGHPUT for a discrete GPU or a many-core CPU, see `profile`).
-    match core_set_property(
-        core,
-        &dt,
-        &RwPropertyKey::HintPerformanceMode,
-        hint.as_str(),
-    ) {
-        Ok(()) => tracing::debug!("OpenVINO {device}: PERFORMANCE_HINT={}", hint.as_str()),
-        Err(e) => tracing::warn!(
-            "OpenVINO {device}: failed to set PERFORMANCE_HINT={}: {e}",
-            hint.as_str()
-        ),
+    // Core-wide settings like the precision hint: set before every compile so each model gets
+    // its own (THROUGHPUT for a discrete GPU, a many-core CPU or `performance_hint:
+    // throughput`, see `profile`).
+    for p in hint_properties(hint) {
+        let key = RwPropertyKey::Other(p.key.into());
+        match core_set_property(core, &dt, &key, p.value) {
+            Ok(()) => tracing::debug!("OpenVINO {device}: {}={}", p.key, p.value),
+            Err(e) => tracing::warn!(
+                "OpenVINO {device}: failed to set {}={}: {e}",
+                p.key,
+                p.value
+            ),
+        }
     }
     if device.eq_ignore_ascii_case("CPU") {
         set_cpu_precision(core, &dt, needs_f32);
@@ -775,6 +803,7 @@ pub(crate) fn load_model(
         compiled,
         tuning: *tuning,
         streams,
+        optimal_requests,
         info: ModelInfo {
             path: path.clone(),
             inputs,
@@ -919,6 +948,7 @@ pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
         info: model,
         tuning,
         streams,
+        optimal_requests,
     } = compiled;
     let idx = image_index(&model)?;
     let spec = model.inputs.get(idx).with_context(|| {
@@ -943,7 +973,7 @@ pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
             spec.name
         )
     })?;
-    let n = tuning.effective_inflight(streams);
+    let n = tuning.effective_inflight(streams, optimal_requests);
     let (done_tx, done_rx) = crossbeam_channel::unbounded();
     let mut slots = Vec::with_capacity(n);
     for slot in 0..n {
@@ -985,7 +1015,8 @@ pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
         });
     }
     tracing::debug!(
-        "model {} on {}: {n} infer request(s) (PERFORMANCE_HINT={}, NUM_STREAMS={streams:?})",
+        "model {} on {}: {n} infer request(s) (PERFORMANCE_HINT={}, NUM_STREAMS={streams:?}, \
+         OPTIMAL_NUMBER_OF_INFER_REQUESTS={optimal_requests:?})",
         model.path.display(),
         model.device.actual,
         tuning.hint.as_str()
@@ -1296,6 +1327,26 @@ pub(crate) fn abort(slots: &mut [OvSlot]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hint_properties_set_only_the_hint() {
+        for h in [PerfHint::Latency, PerfHint::Throughput] {
+            assert_eq!(
+                hint_properties(h),
+                [HintProp {
+                    key: "PERFORMANCE_HINT",
+                    value: h.as_str(),
+                }]
+            );
+        }
+        assert_eq!(hint_properties(PerfHint::Throughput)[0].value, "THROUGHPUT");
+        // The key is OpenVINO's own name; nothing touches auto-batching (the AUTO plugin
+        // refuses ALLOW_AUTO_BATCHING through the empty device name).
+        assert_eq!(
+            RwPropertyKey::HintPerformanceMode.as_ref(),
+            hint_properties(PerfHint::Latency)[0].key
+        );
+    }
 
     #[test]
     fn dynamic_image_shapes() {
