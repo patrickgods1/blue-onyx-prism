@@ -899,9 +899,11 @@ the rejected-box count and the per-camera repeat history.
 `POST /v1/review/suggest-overlaps` (JSON `{bucket?, scene?, camera?, label?, gpu?, allow_large?, again?,
 dry_run?}`; the Review tab's *Suggest overlaps...*) queues the overlap check on the label files of the
 folder under review those filters select, reviewed frames too. `dry_run` needs no GPU and answers
-`{success, frames, pairs, no_zoom, crops, answered, passed_over, message}`; otherwise `{success, message,
-id}`, the task's id in `GET /v1/training`. `GET /v1/review/labels` carries `overlap_live`, the indices of
-the frame's `overlap_suggestions` a reviewer can act on.
+`{success, frames, pairs, no_zoom, crops, answered, passed_over, message, memory}` (`memory`: on
+Windows, the refusal a start now would meet for memory commit, null when it fits or there is no crop;
+docs/TRAINING.md "Memory commit check before a job"); otherwise `{success, message, id}`, the
+task's id in `GET /v1/training`. `GET /v1/review/labels` carries `overlap_live`, the indices of the
+frame's `overlap_suggestions` a reviewer can act on.
 
 `POST /v1/review/reject-unwanted-reviewed` (JSON `{dry_run, limit?}`, `limit` 1..20000, default 20000)
 rejects the accepted and added boxes of unwanted classes on every reviewed label file of the folder under

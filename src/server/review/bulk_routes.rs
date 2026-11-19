@@ -389,7 +389,9 @@ struct SuggestOverlapsBody {
 /// of the folder under review those filters select, reviewed frames too (no `source` or `status`
 /// narrows it, a reviewed frame need not be in the review queue). It writes suggestions and nothing
 /// else. `dry_run` only counts (`frames`, `pairs`, `crops`, `no_zoom`, `answered`, `passed_over`), and
-/// needs no GPU. Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
+/// needs no GPU; its `memory` is the refusal a start now would meet for memory commit on Windows
+/// ([`crate::training::overlaps::job::commit_problem`], null when it fits or there is no crop).
+/// Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
 pub(in crate::server) async fn suggest_overlaps(
     State(shared): State<Shared>,
     headers: HeaderMap,
@@ -441,6 +443,14 @@ pub(in crate::server) async fn suggest_overlaps(
                     s.answered, s.passed_over
                 )
             });
+            // A start now would be refused for memory (read again when it starts).
+            let memory = (s.crops > 0)
+                .then(|| {
+                    crate::training::overlaps::job::commit_problem(
+                        crate::training::commit::now().as_ref(),
+                    )
+                })
+                .flatten();
             return success(serde_json::json!({
                 "frames": s.frame_count,
                 "pairs": s.pairs,
@@ -449,6 +459,7 @@ pub(in crate::server) async fn suggest_overlaps(
                 "answered": s.answered,
                 "passed_over": s.passed_over,
                 "message": message,
+                "memory": memory,
             }));
         }
         let config = state.config_read().clone();

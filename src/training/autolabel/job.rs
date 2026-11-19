@@ -157,6 +157,9 @@ pub struct AutolabelJob {
     pub after: Option<String>,
     /// Steps after a finished run ([`crate::training::finish`]).
     pub finish: Option<crate::training::finish::Finish>,
+    /// The memory commit a job can take now ([`crate::training::commit::now`]; tests fake it),
+    /// checked before a labelers run's first Python process ([`super::memory::commit_need`]).
+    pub headroom: fn() -> Option<crate::training::commit::Headroom>,
 }
 
 impl std::fmt::Debug for AutolabelJob {
@@ -950,6 +953,12 @@ impl AutolabelJob {
         rep.frames = frames.len();
         self.step(report, 1, 100, &format!("{} frames", frames.len()));
         check(cancel)?;
+        // Before the labelers' first Python process (a run with a model labels in this process).
+        if let Some(need) = super::memory::commit_need(r, &self.classes)
+            && let Some(why) = crate::training::commit::refusal(&need, (self.headroom)().as_ref())
+        {
+            bail!(why);
+        }
         let _lock =
             crate::resources::export::train::TrainLock::try_acquire(&self.paths.train_lock_file())?;
         let mut changed: Vec<String> = Vec::new();
@@ -1893,6 +1902,7 @@ pub fn recover_crashed(work: &std::path::Path, config: &Config) -> Result<Recove
         config_writer: None,
         after: None,
         finish: None,
+        headroom: crate::training::commit::now,
         request: rec.request,
         dataset_dir: rec.dataset_dir,
         classes: rec.classes,

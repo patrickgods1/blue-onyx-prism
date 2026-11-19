@@ -37,6 +37,8 @@ const FAR: [f32; 4] = [45.0, 30.0, 60.0, 46.0];
 #[derive(Default)]
 struct ZoomFake {
     inner: Fake,
+    /// Every command the job started, whatever it was.
+    started: Mutex<usize>,
     cmds: Mutex<Vec<Cmd>>,
     /// Detections of every crop (default: one car on [`BIG`]).
     dets: Option<serde_json::Value>,
@@ -52,6 +54,7 @@ struct ZoomFake {
 
 impl CommandRunner for ZoomFake {
     fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        *self.started.lock().unwrap() += 1;
         if !cmd.display().contains("autolabel.py") {
             return self.inner.run(cmd, on_line, cancel);
         }
@@ -127,7 +130,7 @@ fn host() -> Capability {
 fn plan(root: &Path, filter: &str) -> OverlapsJob {
     let cfg = config(root);
     let mut job = plan_overlaps(&cfg, OverlapsRequest::parse(filter).unwrap(), &host()).unwrap();
-    job.free_commit = || None;
+    job.headroom = || None;
     job
 }
 
@@ -501,36 +504,53 @@ fn hidden_classes_are_not_checked_and_a_class_rf_detr_cannot_see_needs_no_model(
     assert_eq!(job.select().unwrap().pairs, 0);
 }
 
+/// The check needs 2.6 GB + 1 GB spare. A fixed paging file with 1 GB free: refused before the
+/// environment's first process, nothing written; this box's state (5 GB free, the paging file on C:
+/// held by the 16 GB margin) runs it.
 #[test]
-fn short_commit_stops_with_a_clear_error_before_loading_anything() {
+fn short_commit_stops_with_a_clear_error_before_any_process() {
+    use crate::training::commit::tests::{headroom, this_box};
     let t = tmp("commit");
     let dir = t.0.join("dataset");
     let rel = nested(&dir, "a");
     let bytes = std::fs::read(path_of(&dir, &rel)).unwrap();
     let fake = ZoomFake::default();
     let mut job = plan(&t.0, "");
-    job.free_commit = || {
-        Some(Commit {
-            limit: 16 << 30,
-            available: 1 << 30,
-        })
-    };
+    job.headroom = || Some(headroom(&[r"c:\pagefile.sys 4096 4096"], 19.9, 1.0, &[]));
     let e = run(&job, &fake).unwrap_err().to_string();
-    assert!(
-        e.contains("2.6 GB of free commit") && e.contains("1.0 GB is free"),
-        "{e}"
+    assert_eq!(
+        e,
+        "the overlap check needs about 3.6 GB of memory commit (PyTorch and RF-DETR L 2.6 GB, 1.0 \
+         GB kept spare); 1.0 GB is free and the paging file cannot grow (a fixed size, or at its \
+         maximum). Close programs that use memory, or let Windows manage the paging file size on \
+         a drive with room to spare, then start the job again. Nothing was changed."
     );
-    assert_eq!(*fake.zooms.lock().unwrap(), 0);
+    assert_eq!(*fake.started.lock().unwrap(), 0, "no process started");
     assert_eq!(std::fs::read(path_of(&dir, &rel)).unwrap(), bytes);
-    let ok = Commit {
-        limit: 16 << 30,
-        available: 3 << 30,
-    };
-    assert!(commit_problem(Some(ok)).is_none());
+    // This box: 5 GB free fits 3.6 GB.
+    assert!(commit_problem(Some(&this_box())).is_none());
     assert!(
         commit_problem(None).is_none(),
-        "off Windows there is no fixed limit"
+        "no reading: nothing refused"
     );
+    // The same box with 3 GB free: refused, and the paging file's drive is named.
+    let short = headroom(
+        &[r"c:\pagefile.sys 2935 24576"],
+        23.65,
+        3.0,
+        &[(r"C:\", 15.2)],
+    );
+    let e = commit_problem(Some(&short)).unwrap();
+    assert!(
+        e.contains("the paging file on C: can grow only while 16 GB"),
+        "{e}"
+    );
+    // Nothing to zoom (no pair): no check, no refusal.
+    let none = tmp("commit-none");
+    std::fs::create_dir_all(none.0.join("dataset")).unwrap();
+    let mut job = plan(&none.0, "");
+    job.headroom = || Some(headroom(&[], 15.9, 0.1, &[]));
+    run(&job, &ZoomFake::default()).unwrap();
 }
 
 #[test]
@@ -651,7 +671,7 @@ fn real_script_on_a_copy() {
     let t = tmp("real");
     let mut job = plan(&t.0, "");
     job.dataset_dir = copy;
-    job.free_commit = crate::system_info::commit;
+    job.headroom = crate::training::commit::read;
     let fake = RealScript {
         fake: ZoomFake::default(),
         python,

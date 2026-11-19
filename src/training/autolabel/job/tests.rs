@@ -1678,6 +1678,66 @@ fn a_labelers_run_on_a_card_short_of_memory_says_so() {
     );
 }
 
+/// Every `*.labels.json` under `dir`.
+fn label_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.to_string_lossy().ends_with(".labels.json") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// This box's memory (5 GB of commit free, its paging file on C: held by the 16 GB margin): a SAM
+/// 3 run is refused before any process starts and nothing is written; with room on C: it runs.
+#[test]
+fn a_labelers_run_short_of_commit_is_refused_before_any_process() {
+    use crate::training::commit::tests::{headroom, this_box};
+    let t = tmp("commit");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let dir = t.0.join("dataset");
+    let fake = LabelFake::default();
+    let mut job = sam3_job(&cfg);
+    job.headroom = || Some(this_box());
+    let e = run_job(&job, &fake).unwrap_err().to_string();
+    assert!(e.starts_with("this auto-label run needs about "), "{e}");
+    assert!(
+        e.contains("(PyTorch and RF-DETR L 2.6 GB + SAM 3 6.4 GB + Qwen3-VL 2B 7.9 GB"),
+        "{e}"
+    );
+    assert!(
+        e.contains(
+            "5.0 GB is free and the paging file on C: can grow only while 16 GB stays free there \
+             (15.2 GB free now). Free space on C:, put the paging file on another drive, or turn \
+             off Qwen3-VL 2B or SAM 3"
+        ),
+        "{e}"
+    );
+    assert!(e.ends_with("then start the job again."), "{e}");
+    assert!(fake.inner.cmds().is_empty(), "{:?}", fake.inner.cmds());
+    assert!(fake.cmds.lock().unwrap().is_empty());
+    assert!(label_files(&dir).is_empty(), "{:?}", label_files(&dir));
+    // With 19 GB more free on C: the paging file may grow by 16.2 GB: it runs.
+    job.headroom = || {
+        Some(headroom(
+            &[r"c:\pagefile.sys 2935 24576"],
+            23.65,
+            5.05,
+            &[(r"C:\", 34.2)],
+        ))
+    };
+    run_job(&job, &fake).unwrap();
+    assert!(!label_files(&dir).is_empty());
+}
+
 #[test]
 fn a_cancelled_run_without_keep_on_cancel_writes_nothing() {
     let t = tmp("discard");
@@ -3043,6 +3103,55 @@ fn the_preview_puts_a_labeler_the_gpu_cannot_hold_first() {
     let first = p.warnings.first().expect("a GPU note");
     assert!(first.starts_with("This run would be refused:"), "{first}");
     assert!(first.contains("Qwen3-VL"), "{first}");
+}
+
+/// `train autolabel --dry-run` and the Auto-label tab's preview say first when a start now would
+/// be refused for memory commit; a run that fits, a run with a model or no reading says nothing.
+#[test]
+fn the_preview_puts_a_commit_refusal_first() {
+    use crate::training::commit::tests::{headroom, this_box};
+    use crate::training::commit::tests_reading;
+    let t = tmp("preview-commit");
+    frames(&t.0, 2, false);
+    let cfg = config(&t.0);
+    let preview =
+        |r: AutolabelRequest| crate::training::autolabel::preview_autolabel(&cfg, r).unwrap();
+    let refusal = "This run would be refused if it started now: this auto-label run needs about";
+    tests_reading::set(Some(this_box()));
+    let p = preview(request(""));
+    let mut model = request("");
+    model.with_model = Some("IPcam-general".into());
+    let with_model = preview(model);
+    let mut light = request("");
+    (light.gdino, light.vlm, light.siglip) = (None, None, false);
+    let light = preview(light);
+    tests_reading::set(Some(headroom(
+        &[r"c:\pagefile.sys 2935 24576"],
+        23.65,
+        5.05,
+        &[(r"C:\", 34.2)],
+    )));
+    let roomy = preview(request(""));
+    tests_reading::set(None);
+    let none = preview(request(""));
+    let first = p.warnings.first().expect("a commit note");
+    assert!(first.starts_with(refusal), "{first}");
+    assert!(
+        first.ends_with("then start the job again. The memory is read again when it starts."),
+        "{first}"
+    );
+    for (what, p) in [
+        ("a model", &with_model),
+        ("RF-DETR L alone", &light),
+        ("room on C:", &roomy),
+        ("no reading", &none),
+    ] {
+        assert!(
+            !p.warnings.iter().any(|w| w.starts_with(refusal)),
+            "{what}: {:?}",
+            p.warnings
+        );
+    }
 }
 
 #[test]

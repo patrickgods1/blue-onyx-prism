@@ -1410,6 +1410,12 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                      pairs answered before, {} frames skipped or checked by a reviewer",
                     s.frame_count, s.pairs, s.no_zoom, s.crops, s.answered, s.passed_over
                 );
+                if s.crops > 0
+                    && let Some(why) =
+                        super::overlaps::job::commit_problem((job.headroom)().as_ref())
+                {
+                    println!("warning: it would be refused if it started now: {why}");
+                }
                 return Ok(true);
             }
             run_task_cli(&config, Box::new(job), a.verbose)

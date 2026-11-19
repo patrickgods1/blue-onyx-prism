@@ -632,6 +632,7 @@ fn scoped_job(config: &Config, mut request: AutolabelRequest) -> Result<Autolabe
         config_writer: None,
         after: None,
         finish: None,
+        headroom: super::commit::now,
     })
 }
 
@@ -650,6 +651,9 @@ pub fn preview_autolabel(
         // First: a run that cannot load matters more than anything about its frames.
         let gpu = gpu_notes(&job.request, &a);
         p.warnings.splice(0..0, gpu);
+    }
+    if let Some(w) = commit_note(&job.request, &job.classes, (job.headroom)().as_ref()) {
+        p.warnings.insert(0, w);
     }
     Ok(p)
 }
@@ -688,6 +692,24 @@ pub(crate) mod tests_gpu {
     pub(crate) fn set(a: Option<Accelerator>) {
         GPU.with(|g| *g.borrow_mut() = a);
     }
+}
+
+/// What the preview says when a labelers run of `request` on `classes` would be refused for host
+/// memory now ([`memory::commit_need`], [`super::commit::refusal`] with `reading`); None when it
+/// fits, for a run with a model, or without a reading (always off Windows). The run reads the
+/// memory again when it starts.
+pub fn commit_note(
+    request: &AutolabelRequest,
+    classes: &[String],
+    reading: Option<&super::commit::Headroom>,
+) -> Option<String> {
+    let need = memory::commit_need(request, classes)?;
+    super::commit::refusal(&need, reading).map(|why| {
+        format!(
+            "This run would be refused if it started now: {why} The memory is read again when \
+             it starts."
+        )
+    })
 }
 
 /// What the preview and the run say about the labelers' GPU `a`: a labeler the card cannot hold

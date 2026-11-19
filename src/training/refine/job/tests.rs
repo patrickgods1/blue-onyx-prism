@@ -671,6 +671,67 @@ fn the_fold_models_train_on_every_label_and_the_report_names_the_floor() {
     assert_eq!(r["found"]["verify"], 0, "{r}");
 }
 
+/// The check's peak is a fold's training (8 GB + 1 GB spare): with this box's 5 GB free and its
+/// paging file held by the 16 GB margin on C:, it is refused before any process, nothing written;
+/// with room it runs.
+#[test]
+fn short_commit_refuses_the_check_before_any_process() {
+    use crate::training::commit::tests::{headroom, this_box};
+    let t = tmp("commit");
+    let dir = t.0.join("dataset");
+    let rels = dataset(&dir);
+    let before: Vec<Vec<u8>> = rels
+        .iter()
+        .map(|r| std::fs::read(path_of(&dir, r)).unwrap())
+        .collect();
+    let predictor = Arc::new(PredictorFake::default());
+    let mut job = plan(&t.0, &predictor);
+    job.headroom = || Some(this_box());
+    let fake = trainer();
+    let e = run(&job, &fake).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        "the dataset check needs about 9.0 GB of memory commit (a fold model's training process \
+         8.0 GB, 1.0 GB kept spare); 5.0 GB is free and the paging file on C: can grow only \
+         while 16 GB stays free there (15.2 GB free now). Free space on C:, put the paging file \
+         on another drive, or run a quick check with a trained model instead (Quick check with a \
+         model, or --with-model), which trains nothing, then start the job again."
+    );
+    assert_eq!(fake.trains.load(Ordering::SeqCst), 0);
+    assert!(fake.inner.cmds().is_empty(), "{:?}", fake.inner.cmds());
+    let after: Vec<Vec<u8>> = rels
+        .iter()
+        .map(|r| std::fs::read(path_of(&dir, r)).unwrap())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!report::report_path(&dir).exists());
+    // A fixed training.workers adds its workers: 2 x 2 loaders x 1.37 GB for RF-DETR.
+    let n = super::super::commit_need(
+        job.train.as_ref().unwrap().request.recipe.family,
+        crate::training::job::Workers::Fixed(2),
+    );
+    let loaders = crate::training::worker_loaders(
+        job.train.as_ref().unwrap().request.recipe.family.trainer(),
+    );
+    assert_eq!(
+        n.bytes,
+        crate::training::MAIN_COMMIT_RESERVE_BYTES
+            + 2 * u64::from(loaders) * crate::training::WORKER_COMMIT_BYTES
+    );
+    assert!(n.detail.contains("2 data loader workers"), "{}", n.detail);
+    // With room (19 GB more free on C:), it runs.
+    let mut job = plan(&t.0, &predictor);
+    job.headroom = || {
+        Some(headroom(
+            &[r"c:\pagefile.sys 2935 24576"],
+            23.65,
+            5.05,
+            &[(r"C:\", 34.2)],
+        ))
+    };
+    run(&job, &trainer()).unwrap();
+}
+
 #[test]
 fn a_second_identical_run_writes_no_label_file() {
     let t = tmp("rerun");
@@ -1522,6 +1583,49 @@ fn the_preview_counts_frames_folds_and_what_is_left_out() {
     );
 }
 
+/// `train refine --dry-run` and the Refine tab's preview say first when a start now would be
+/// refused for memory commit (this box: 5 GB free, no growth on C:), and the `--dry-run` text
+/// prints it; with room it says nothing, and the preview's `refused` stays about the frames.
+#[test]
+fn the_preview_warns_first_when_memory_would_refuse_the_check() {
+    use crate::training::commit::tests::{headroom, this_box};
+    use crate::training::commit::tests_reading;
+    let t = tmp("preview-commit");
+    dataset(&t.0.join("dataset"));
+    let cfg = config(&t.0);
+    let req = RefineRequest::default();
+    tests_reading::set(Some(this_box()));
+    let short = super::super::preview(&cfg, &req, &host());
+    tests_reading::set(Some(headroom(
+        &[r"c:\pagefile.sys 2935 24576"],
+        23.65,
+        5.05,
+        &[(r"C:\", 34.2)],
+    )));
+    let roomy = super::super::preview(&cfg, &req, &host());
+    tests_reading::set(None);
+    let (short, roomy) = (short.unwrap(), roomy.unwrap());
+    let first = &short.warnings[0];
+    assert!(
+        first.starts_with(
+            "This check would be refused if it started now: the dataset check needs about 9.0 GB \
+             of memory commit"
+        ),
+        "{first}"
+    );
+    assert!(
+        super::super::preview_text(&short).contains(&format!("warning: {first}")),
+        "{}",
+        super::super::preview_text(&short)
+    );
+    assert!(
+        !roomy.warnings.iter().any(|w| w.contains("memory commit")),
+        "{:?}",
+        roomy.warnings
+    );
+    assert_eq!(short.refused, roomy.refused);
+}
+
 #[test]
 fn planning_needs_a_gpu_and_a_download_allowed_and_stays_out_of_the_config() {
     let t = tmp("plan");
@@ -1620,7 +1724,7 @@ fn plan_look(root: &Path, predictor: &Arc<PredictorFake>, tighten: Option<bool>)
     let mut job = plan_refine(&config(root), req, &host()).unwrap();
     job.min_frames = 4;
     job.predictor = Some(predictor.clone());
-    job.free_commit = || None;
+    job.headroom = || None;
     job
 }
 
@@ -1834,22 +1938,33 @@ fn a_failed_look_keeps_the_folds_suggestions_and_says_so() {
         assert_eq!(l.refine.len(), 1, "{rel}");
         assert_eq!(l.refine[0].kind, Kind::Add);
     }
-    // Too little free commit: refused before the model loads, the same way.
+    // Too little commit by the time the look starts (enough for the folds' training when the
+    // check started): refused before its first process, the same way.
+    use crate::training::commit::tests::headroom;
+    static READS: AtomicUsize = AtomicUsize::new(0);
     let mut job = plan_look(&t.0, &predictor, Some(true));
-    job.free_commit = || {
-        Some(Commit {
-            limit: 16 << 30,
-            available: 1 << 30,
+    job.headroom = || {
+        let fixed = [r"c:\pagefile.sys 4096 4096"];
+        Some(if READS.fetch_add(1, Ordering::SeqCst) == 0 {
+            headroom(&fixed, 40.0, 20.0, &[])
+        } else {
+            headroom(&fixed, 19.9, 1.0, &[])
         })
     };
     let fake = trainer();
     let out = run(&job, &fake).unwrap();
+    assert_eq!(
+        READS.load(Ordering::SeqCst),
+        2,
+        "read at the start and before the look"
+    );
     assert!(!fake.order.lock().unwrap().contains(&"zoom"));
     let warnings = warnings_of(&out.result);
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("needs about 2.6 GB of free commit")),
+        warnings.iter().any(|w| w.starts_with(
+            "the closer look at loose labels failed: the closer look at loose labels needs about \
+             3.6 GB of memory commit"
+        )),
         "{warnings:?}"
     );
     // The report says so too.

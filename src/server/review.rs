@@ -1616,6 +1616,8 @@ mod tests {
             (Some(1), Some(1))
         );
         assert_eq!(v["crops"], 1);
+        // No memory reading in unit tests (`commit::now`): nothing would be refused.
+        assert_eq!(v["memory"], serde_json::Value::Null, "{v}");
         // A skipped frame is passed over.
         let mut skipped = labels::read(&path).unwrap().unwrap();
         skipped.status = labels::Status::Skipped;

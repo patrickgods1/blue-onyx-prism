@@ -1005,6 +1005,10 @@ pub fn preview(
     } else if !look && request.tighten.is_none() {
         p.warnings.push(tighten::skipped_warning());
     }
+    // The closer look is a quick check's only Python process.
+    if look && let Some(w) = super::commit_warning(None, true) {
+        p.warnings.push(w);
+    }
     if !qs.s.frames.is_empty() {
         let last = last_report(&dir);
         let (mut secs, basis) = quick_seconds(qs.s.frames.len(), &name, last.as_ref());
@@ -1211,7 +1215,7 @@ pub fn plan(
         predictor: None,
         config: Box::new(config.clone()),
         min_frames: MIN_UNSEEN_FRAMES,
-        free_commit: crate::system_info::commit,
+        headroom: crate::training::commit::now,
         id,
         request,
     })

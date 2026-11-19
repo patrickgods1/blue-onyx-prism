@@ -561,6 +561,54 @@ fn an_image_folder_with_dhash_selection_needs_no_python() {
     );
 }
 
+/// The SigLIP 2 selection loads a model (4.6 GB + 1 GB spare): on this box's memory (5 GB free, no
+/// growth on C:) it is refused before any process; the dHash selection loads none and is not
+/// checked.
+#[test]
+fn a_siglip_import_short_of_commit_is_refused_before_any_process() {
+    use crate::training::commit::tests::this_box;
+    let t = tmp("commit");
+    let root = &t.0;
+    std::fs::create_dir_all(root.join("snaps")).unwrap();
+    for i in 0..5 {
+        std::fs::write(
+            root.join(format!("snaps/Gate.2024010{i}_120000.jpg")),
+            jpeg(i, false),
+        )
+        .unwrap();
+    }
+    let cfg = config(root);
+    let mut req = ImportRequest::new(ImportSource::Path(root.join("snaps")));
+    req.license_confirmed = true;
+    req.selection = Selection::Siglip;
+    req.frames = 3;
+    let mut job = plan_import(&cfg, req.clone(), &host()).unwrap();
+    job.headroom = || Some(this_box());
+    let fake = ImportFake::new(0, 0);
+    let (r, _) = run(&job, &fake);
+    let e = r.unwrap_err().to_string();
+    assert!(
+        e.starts_with(
+            "this import's SigLIP 2 selection needs about 5.6 GB of memory commit (PyTorch and \
+             SigLIP 2 4.6 GB, 1.0 GB kept spare); 5.0 GB is free"
+        ),
+        "{e}"
+    );
+    assert!(
+        e.contains("or use the dHash selection (--select dhash), which loads no model, then"),
+        "{e}"
+    );
+    assert_eq!(fake.inner.runs.load(Ordering::SeqCst), 0, "no process ran");
+    assert!(fake.cmds.lock().unwrap().is_empty());
+    assert!(records(&root.join("dataset")).is_empty());
+    // dHash: no model, no check.
+    req.selection = Selection::Dhash;
+    let mut job = plan_import(&cfg, req, &host()).unwrap();
+    job.headroom = || Some(this_box());
+    let (r, _) = run(&job, &ImportFake::new(0, 0));
+    assert_eq!(r.unwrap().result["frames"], 3);
+}
+
 #[test]
 fn a_url_import_records_the_site_and_the_confirmed_licence() {
     let t = tmp("url");

@@ -5272,7 +5272,7 @@
           report(box, [j.message || 'No open overlap without a suggestion on these frames.']);
           return null;
         }
-        if (!window.confirm('Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
+        if (!window.confirm((j.memory ? 'Warning: ' + j.memory + '\n\n' : '') + 'Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
           (body.again ? ', answered pairs asked again' : '') + ', ' +
           'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
           'It writes suggestions only: no box changes until you confirm one here.')) {

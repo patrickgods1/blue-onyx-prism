@@ -13,6 +13,7 @@
 //! - [`job`]: one run's stage machine over the model export's seams (`CommandRunner`, `Fetcher`;
 //!   the environment is `tools/train-env`, [`crate::resources::export::train`]).
 //! - [`preflight`]: the report shown before a run, the refusals and the disk check.
+//! - [`commit`]: the memory commit check before a job starts a Python model process (Windows).
 //! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
 //! - [`service`]: the queue (one run at a time, cancellable, records in `runs.json`).
 //! - [`overlaps`]: the overlap check, suggestions for nested and partly overlapping boxes.
@@ -33,6 +34,7 @@ pub mod autolabel;
 pub mod bench;
 pub mod capability;
 pub mod cli;
+pub mod commit;
 pub mod compare;
 pub mod config;
 pub mod dataset;

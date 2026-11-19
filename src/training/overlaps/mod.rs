@@ -37,10 +37,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Free commit (RAM + paging file) the check needs on Windows, in GiB: torch, RF-DETR L and its
-/// trace, measured. A fixed paging file runs out of commit long before RAM.
-pub const NEEDED_COMMIT_GB: f64 = 2.6;
-
 /// What to check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverlapsRequest {
@@ -121,7 +117,7 @@ pub fn plan_overlaps(
         platform,
         accelerator,
         timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
-        free_commit: crate::system_info::commit,
+        headroom: crate::training::commit::now,
     })
 }
 

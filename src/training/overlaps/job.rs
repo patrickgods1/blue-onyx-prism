@@ -11,11 +11,11 @@ use super::OverlapsRequest;
 use super::select::{self, Selection};
 use super::write::{self, Written};
 use super::zoom::{self, CropResult};
-use crate::backend::memory::Commit;
 use crate::collect::labels::bulk::Wanted;
 use crate::resources::catalog::Platform;
 use crate::resources::export::train::TrainPaths;
 use crate::training::capability::Accelerator;
+use crate::training::commit::{self, Headroom};
 use crate::training::pyenv::{check, stage};
 use crate::training::task::{Task, TaskContext, TaskKind, TaskOutcome, TaskReport};
 use anyhow::{Result, anyhow, bail};
@@ -50,8 +50,8 @@ pub struct OverlapsJob {
     pub timeout: Duration,
     /// `<training dir>/overlaps/<id>`: the crop list and the results (deleted at the end).
     pub work: PathBuf,
-    /// The free commit now ([`crate::system_info::commit`]; tests fake it).
-    pub free_commit: fn() -> Option<Commit>,
+    /// The memory commit a job can take now ([`commit::now`]; tests fake it).
+    pub headroom: fn() -> Option<Headroom>,
 }
 
 impl std::fmt::Debug for OverlapsJob {
@@ -80,10 +80,11 @@ pub struct OverlapsReport {
     pub cancelled: bool,
 }
 
-/// The refusal when `free` cannot hold the check; None off Windows (no fixed limit).
-pub fn commit_problem(free: Option<Commit>) -> Option<String> {
-    zoom::commit_problem("the overlap check", free)
-        .map(|why| format!("{why}, then run it again (nothing was changed)"))
+/// The refusal when `headroom` cannot hold the check ([`commit::refusal`] of
+/// [`zoom::commit_need`]); None without a reading (always off Windows).
+pub fn commit_problem(headroom: Option<&Headroom>) -> Option<String> {
+    commit::refusal(&zoom::commit_need("the overlap check"), headroom)
+        .map(|why| format!("{why} Nothing was changed."))
 }
 
 impl OverlapsJob {
@@ -142,9 +143,6 @@ impl OverlapsJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<(bool, Option<anyhow::Error>, PathBuf)> {
-        if let Some(why) = commit_problem((self.free_commit)()) {
-            bail!(why);
-        }
         let ran = zoom::run(
             &self.helper(),
             &self.work,
@@ -202,6 +200,10 @@ impl OverlapsJob {
         let mut failed = None;
         let mut crops: BTreeMap<usize, CropResult> = BTreeMap::new();
         if rep.selection.crops > 0 {
+            // Before the environment's first Python process.
+            if let Some(why) = commit_problem((self.headroom)().as_ref()) {
+                bail!(why);
+            }
             let (script, weights) = self.prepare(ctx, report, cancel)?;
             check(cancel)?;
             let (stop, failure, out) =

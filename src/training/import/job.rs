@@ -71,6 +71,9 @@ pub struct ImportJob {
     /// Steps after a finished import that nothing follows ([`crate::training::finish`]; the
     /// Review folder switch).
     pub finish: Option<crate::training::finish::Finish>,
+    /// The memory commit a job can take now ([`crate::training::commit::now`]; tests fake it),
+    /// checked before the first Python process of a SigLIP 2 selection ([`super::commit_need`]).
+    pub headroom: fn() -> Option<crate::training::commit::Headroom>,
 }
 
 /// A frame before the selection.
@@ -680,6 +683,13 @@ impl ImportJob {
         }
         self.step(report, 1, 100, &r.source.describe());
         check(cancel)?;
+        // Before the first Python process: the SigLIP 2 selection loads a model (hours of
+        // extraction later; refused now rather than then).
+        if let Some(need) = super::commit_need(r.selection)
+            && let Some(why) = crate::training::commit::refusal(&need, (self.headroom)().as_ref())
+        {
+            bail!(why);
+        }
 
         // 2. The environment.
         let _lock =
