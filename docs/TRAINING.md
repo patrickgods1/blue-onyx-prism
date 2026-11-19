@@ -2526,7 +2526,7 @@ the file a save checks (`refine::check`) and keeps; a check that wrote the frame
 409 like any other write. A big folder answers `auto=refine` from the review index like the other filters.
 
 **Fitting an accepted missing box.** *Accept: add this box* (`y`) adds the box and keeps it selected and in
-view; the next suggestion waits. Drag the box or its handles to fit the object, then *Accept box* (`y` again)
+view; the next suggestion waits. Drag the box or its edges (handles on a touch screen) to fit the object, then *Accept box* (`y` again)
 brings the next suggestion (after the last: *s saves*). Meanwhile `w` does nothing, `z` undoes the moves one by
 one and then the accept itself (the suggestion is back), and rejecting the box ends the step. Only adds work
 this way; a tighter box, a relabel or a kept label moves on at once. The page marks the box `_adjusting`

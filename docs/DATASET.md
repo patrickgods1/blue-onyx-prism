@@ -970,8 +970,20 @@ with both kinds is in [docs/TRAINING.md](TRAINING.md#spot-memory-of-fixed-camera
 | `s`, `Enter` | Save & next. A box the auto-labelers flagged (`?`) needs a decision first: the save refuses it, on the page and on the server, however often it is pressed. |
 | `Shift+R` | Reject the rest: every box still undecided (`reason: rest_rejected`; these count for the repeats history and spot memory). |
 | `n` | Next without saving. |
+| `o` | Switch the overview between the side panel and a corner of the frame. |
 
-Click a box to select it. Drag on the image to draw a new one.
+Click a box to select it. Drag on the image to draw a new one. Drag any edge or corner of the selected box
+to resize it, or inside it to move it (touch screens show handles at the corners and sides instead; a small box gets corners only, and a very small one none, so a drag moves it).
+
+The frame is a zoomable editor. The wheel always zooms over it, up to 16x, with sharp pixels at high
+zoom; the *+* and *-* buttons and the View menu zoom too. Box lines are 1 px, drawn just outside the
+box's edge so the object's own edge stays visible. An overview of the whole frame, with the zoomed part
+outlined, sits at the top of the side panel under the frame's facts (the default) or, with `o`, *Overview in
+a corner* (View menu or Panel options) always shown in a corner of the frame. Drag the outline to pan,
+use the wheel over the overview to zoom, tap an empty spot to centre the view there, or tap a box to select
+it. *Wider panel* in Panel options widens the side panel. The last choice of *Fit whole frame* or *Zoom to
+box* is remembered for the next box and frame; after a zoom you set yourself (wheel, pinch, pan, overview
+drag) the next box is framed with *Zoom to box*.
 
 ### Export
 

@@ -1,12 +1,16 @@
 // Review tab, fingers (/train/review; loaded before review.js): the gesture rules of the frame on
 // a touchscreen, where a box's tag sits in the zoomed view, which box a tap on the overview
-// means, which corner of the zoomed frame the overview takes and the quarters of the
-// "Anything missing?" look. Pure: no page, no browser API, no state of its own; review.js passes everything in
-// and applies the answers. `tests/it/js_review_touch.rs` runs this file in Node.
+// means, which corner of the frame the overview takes (corner layout) and the quarters of the
+// "Anything missing?" look, plus the editor's pointer and view rules: which edge or corner of a
+// box a press grabs (`edgeAt`), how the view follows a new selection (`nextView`) and a drag of
+// the overview's view rect (`overviewPan`). Pure: no page, no browser API, no state of its own;
+// review.js passes everything in and applies the answers. `tests/it/js_review_touch.rs` runs this
+// file in Node.
 //
-// Coordinates are the canvas's buffer pixels (review.js `canvasPoint`: the frame at zoom 1), and a
-// view is {z, ox, oy}: the zoom and the frame point at the canvas's top left, so the frame point
-// under the canvas point c is c / z + o (review.js `zoomAt`, `framePoint`).
+// Coordinates are frame pixels, a canvas point being the frame point at zoom 1 (review.js
+// `canvasPoint`; the canvas's buffer has its own, device pixel size), and a view is {z, ox, oy}:
+// the zoom and the frame point at the canvas's top left, so the frame point under the canvas
+// point c is c / z + o (review.js `zoomAt`, `framePoint`).
 (function () {
   'use strict';
 
@@ -80,13 +84,13 @@
     return best;
   }
 
-  // The overview's corner over the zoomed frame (two columns): 'tr', 'tl', 'br' or 'bl'. In CSS
-  // pixels of the frame as shown: `frame` = [w, h], `size` = the overview's [w, h], `inset` its
-  // distance from the frame's edges; `keep` = rects [x0, y0, x1, y1] it must not cover (the
-  // selected box with its handles and tag, a proposed or half-drawn box), `others` = rects it
-  // would rather not cover (the other boxes). It stays at `current` while that covers nothing of
-  // `keep`, so it never moves for nothing; else the corner covering least of `keep`, then least
-  // of `others`, ties in the order tr, tl, br, bl.
+  // The overview's corner over the frame (two columns, corner layout, at any zoom): 'tr', 'tl',
+  // 'br' or 'bl'. In CSS pixels of the frame as shown: `frame` = [w, h], `size` = the overview's
+  // [w, h], `inset` its distance from the frame's edges; `keep` = rects [x0, y0, x1, y1] it must
+  // not cover (the selected box with its grab band and tag, a proposed or half-drawn box),
+  // `others` = rects it would rather not cover (the other boxes). It stays at `current` while
+  // that covers nothing of `keep`, so it never moves for nothing; else the corner covering least
+  // of `keep`, then least of `others`, ties in the order tr, tl, br, bl.
   var CORNERS = ['tr', 'tl', 'br', 'bl'];
 
   function cornerRect(corner, frame, size, inset) {
@@ -132,6 +136,61 @@
     return [right ? w - sw : 0, bottom ? h - sh : 0, right ? w : sw, bottom ? h : sh];
   }
 
+  function finite(v) { return typeof v === 'number' && isFinite(v); }
+
+  // Which edge or corner of the box `bbox` = [x0, y0, x1, y1] a press at `p` = [x, y] grabs, all
+  // in frame units: 'nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w', or null (no edge: inside, that is
+  // a move, or off the box). Each edge has a band `grabOut` outside it and `grabIn` inside it (the
+  // caller caps `grabIn` to a third of the shorter side, so a small box keeps a middle to move
+  // by); a side band spans the box's length plus `grabOut` at both ends, so a press just past a
+  // corner still takes it. A vertical and a horizontal band together are that corner. On a box
+  // narrower than its two bands both opposite bands hold the point: the nearer edge wins, and a
+  // tie (a press on a zero-width box, or the exact middle) goes to the right and the bottom, so a
+  // drag from a degenerate box grows it right and down, the way a drawn box grows (a press beside
+  // it is in one band only and takes that side). A non-finite input is no edge.
+  function edgeAt(bbox, p, grabOut, grabIn) {
+    if (!bbox || !p) return null;
+    var vals = [bbox[0], bbox[1], bbox[2], bbox[3], p[0], p[1], grabOut, grabIn];
+    for (var i = 0; i < vals.length; i++) if (!finite(vals[i])) return null;
+    // Either order of the corners (a box mid-resize may be inside out); bands are never negative.
+    var x0 = Math.min(bbox[0], bbox[2]), x1 = Math.max(bbox[0], bbox[2]);
+    var y0 = Math.min(bbox[1], bbox[3]), y1 = Math.max(bbox[1], bbox[3]);
+    var go = Math.max(0, grabOut), gi = Math.max(0, grabIn), x = p[0], y = p[1];
+    var alongY = y >= y0 - go && y <= y1 + go, alongX = x >= x0 - go && x <= x1 + go;
+    var w = alongY && x >= x0 - go && x <= x0 + gi, e = alongY && x >= x1 - gi && x <= x1 + go;
+    var n = alongX && y >= y0 - go && y <= y0 + gi, s = alongX && y >= y1 - gi && y <= y1 + go;
+    if (w && e) { if (Math.abs(x - x0) < Math.abs(x - x1)) e = false; else w = false; }
+    if (n && s) { if (Math.abs(y - y0) < Math.abs(y - y1)) s = false; else n = false; }
+    var side = (n ? 'n' : s ? 's' : '') + (w ? 'w' : e ? 'e' : '');
+    return side || null;
+  }
+
+  // What the zoom does when the selection moves to another box or another frame: 'keep' (the
+  // same box stays selected: leave the view as the reviewer has it), 'box' (zoom to the box) or
+  // 'fit' (the whole frame). `o` = {follow, custom, sameBox}: `follow` is the reviewer's last
+  // Fit / Zoom-to-box choice, remembered; `custom` says they zoomed or panned by hand since (wheel,
+  // pinch, pan, an overview drag), which means they want a close look, so the next box is framed
+  // by Zoom to box rather than thrown back to the whole frame or left at a view made for another box.
+  function nextView(o) {
+    if (o.sameBox) return 'keep';
+    if (o.custom) return 'box';
+    return o.follow ? 'box' : 'fit';
+  }
+
+  // Dragging the view rect on the overview: `view` = {z, ox, oy}, `frame` = [W, H] and `delta` =
+  // [dx, dy], all in frame units. The new {ox, oy} is moved by the delta and held in the frame,
+  // [0, W - W / z] x [0, H - H / z], as review.js `clampView` holds it; a view under zoom 1.001
+  // is the whole frame there (it snaps to 1), so it is {0, 0} here. Non-finite: a zoom or frame
+  // gives {0, 0}, an offset or delta counts as 0.
+  function overviewPan(view, frame, delta) {
+    var z = view && view.z, W = frame && frame[0], H = frame && frame[1];
+    if (!finite(z) || !finite(W) || !finite(H) || z < 1.001) return { ox: 0, oy: 0 };
+    var ox = finite(view.ox) ? view.ox : 0, oy = finite(view.oy) ? view.oy : 0;
+    var dx = delta && finite(delta[0]) ? delta[0] : 0, dy = delta && finite(delta[1]) ? delta[1] : 0;
+    var hx = Math.max(0, W - W / z), hy = Math.max(0, H - H / z);
+    return { ox: Math.min(hx, Math.max(0, ox + dx)), oy: Math.min(hy, Math.max(0, oy + dy)) };
+  }
+
   globalThis.ReviewTouch = {
     quarterView: quarterView,
     pinch: pinch,
@@ -140,6 +199,9 @@
     tagTop: tagTop,
     pickBox: pickBox,
     overviewCorner: overviewCorner,
-    cornerRect: cornerRect
+    cornerRect: cornerRect,
+    edgeAt: edgeAt,
+    nextView: nextView,
+    overviewPan: overviewPan
   };
 }());
