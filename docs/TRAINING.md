@@ -1268,8 +1268,9 @@ carry the video's name. Measured on a GTX 1070 Ti box (i5-8500, D3D11VA, three B
 0.5-2.7 GB on a second drive, 33 kept frames, the same bytes either way, a game using the GPU
 meanwhile): 81 and 80 s one video after another, 74 and 76 s three at once. The videos share the
 hardware decoder and the drive, so the gain there is small. The SigLIP embedding step (`embed`)
-decodes and preprocesses the next batch on a thread while the GPU embeds the current one. The
-helpers run below normal priority,
+decodes and preprocesses the next batch on a thread while the GPU embeds the current one (220
+candidate frames on the same box: 6.0 and 6.3 s before, 5.5 s after, the embeddings identical to
+the byte). The helpers run below normal priority,
 like every training-environment helper ([System load](#system-load-during-training)).
 
 `--hwaccel auto` (default) decodes on the platform's hardware decoder when PyAV's FFmpeg has it
@@ -1453,6 +1454,11 @@ The VLM flags are left out when the VLM is off. Measured per frame on an M1 (MPS
 call): Qwen3-VL check 7.6 s (about 1 s per box, ~8 boxes), MM-Grounding-DINO 1.9 s, RF-DETR 0.2 s,
 SigLIP 0.07 s; 89% of the checked boxes had a fused score below 0.2, which is what the minimum score
 skips (such a box is triaged without a VLM answer).
+
+Finishing a frame on another thread was measured on the GTX 1070 Ti box (MM-Grounding-DINO tiny +
+RF-DETR L + SigLIP on its CPU path, no VLM, 220 day and IR frames, 2,259 proposals): 0.72 s per
+frame before (two runs), 0.61 s after, with every proposal, score, source and species score
+identical to both runs before.
 
 ### Measuring auto-label
 
