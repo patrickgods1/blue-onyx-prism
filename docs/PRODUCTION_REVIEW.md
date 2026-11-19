@@ -3987,32 +3987,50 @@ Slowest units of a full build: this crate 30 s, `aws-lc-sys` build script 26 s, 
 A debug build reads `assets/` from the source tree on each request and embeds nothing, because any `include_str!` of a file makes cargo rebuild when it changes. So a debug binary moved off its source tree answers 500 for `/static/*`; a release build is unchanged. Templates stay compiled in: askama 0.16 has no runtime template loading, so a template edit still needs a rebuild.
 
 
-### Pending measurement: OpenVINO GPU performance hint (plan phase 3.6)
+### OpenVINO GPU performance hint and cuDNN search (plan phase 3.6)
 
-*No numbers yet: the code is in, nothing has been run on a GPU.*
+*Release build of `perf/hints`, the dev box (i5-8600K, UHD 630 iGPU, GTX 1070 Ti), Windows 11, 2026-11-19. The
+user's own service ran rfdetr-nano on the same iGPU meanwhile with live Blue Iris traffic, so the iGPU numbers are
+noisy.*
 
 `performance_hint` (global and per model, `latency` | `throughput`; unset = the profile: LATENCY with 2 in flight
 on an integrated GPU, THROUGHPUT with up to 4 clamped to `NUM_STREAMS` on a discrete Intel GPU) chooses the
 OpenVINO hint of models on an OpenVINO GPU. `throughput` compiles with THROUGHPUT and keeps
-`OPTIMAL_NUMBER_OF_INFER_REQUESTS` in flight, at most `profile::THROUGHPUT_INFLIGHT_CAP` (4; the GPU plugin reports
-twice its streams under THROUGHPUT; the compile log line shows both counts), with the Core's `ALLOW_AUTO_BATCHING` off so no request waits for a batch
-(`backend::device::hint_properties`). The GPU plugin's caching properties include `PERFORMANCE_HINT`, so the two
-hints never share a cached blob. CPU, NPU and ONNX Runtime ignore the key.
+`OPTIMAL_NUMBER_OF_INFER_REQUESTS` in flight, at most `profile::THROUGHPUT_INFLIGHT_CAP` (4). On the UHD 630 the
+THROUGHPUT compile reported NUM_STREAMS=2 and OPTIMAL_NUMBER_OF_INFER_REQUESTS=4 (two per stream): no
+auto-batching, which the OpenVINO archive `setup-openvino` installs has no plugin for. (Switching it off through
+the Core's `ALLOW_AUTO_BATCHING` with the C API's empty device name fails: the name reaches the AUTO plugin,
+`property: ALLOW_AUTO_BATCHING: not supported`; the code no longer tries.) The GPU plugin's caching properties
+include `PERFORMANCE_HINT`, so the two hints never share a cached blob. CPU, NPU and ONNX Runtime ignore the key.
 
-To measure, on the dev box (i5-8500, UHD 630, `openvino:gpu.0`), with the service running a model on the iGPU:
+**iGPU hint.** rfdetr-nano 384x384 on `openvino:gpu.0`, one 2688x1520 camera JPEG, open loop 30 s per rate
+(`scripts/research/hint_burst.ps1`, `test-blue-onyx-prism --rate`), runs in the order latency, throughput,
+latency. Latency in ms from the scheduled start.
 
-```powershell
-cargo build --release --bin test-blue-onyx-prism
-powershell -ExecutionPolicy Bypass -File scripts\research\hint_burst.ps1 -Model <name> -Rates 2,4,6,8 -Duration 60
-```
+| hint | 4/s p50 | 4/s p99 | 8/s p50 | 8/s p99 | 12/s answers/s | 12/s p50 | 12/s failed |
+|---|---|---|---|---|---|---|---|
+| latency, run 1 | 160.6 | 188.7 | 142.8 | 172.5 | 9.10 | 4704 | 17 |
+| throughput | 149.6 | 184.3 | 143.0 | 171.9 | 9.48 | 4067 | 2 |
+| latency, run 2 | 155.4 | 178.6 | 145.3 | 185.6 | 9.04 | 4705 | 19 |
 
-The script never edits the config: it asks you to set `"performance_hint"` on the model's entry (a model
-reload; the first compile with a new hint is not cached) and press Enter once the model is Ready again, runs a
-discarded warm-up, then one open-loop `test-blue-onyx-prism --rate <r> --duration <s>` run per rate, and writes
-a table and a CSV of answers per second, p50 / p95 / p99 / max latency from the scheduled start, and 503s. Change the default only if `throughput` raises
-answers per second with p99 within Blue Iris's timeout, then record the table here.
+Below saturation (4 and 8 per second) the two hints are within the noise of the two latency runs. Only when
+overloaded (12 per second, past what the iGPU serves) does `throughput` answer about 5% more frames per second,
+with fewer failures. The default stays unset (`latency` on an integrated GPU); `throughput` is there for a
+machine that runs at its limit.
 
-The cuDNN half of phase 3.6 is also pending: `BOP_CUDNN_CONV_ALGO_SEARCH=exhaustive|heuristic|default` (README,
-Troubleshooting) switches the CUDA provider's search for one process, so `benchmark` on the 1070 Ti can compare
-inference p50 and the load memory peak of rf-detr-nano and dfine-s under HEURISTIC (the shipped value) and
-EXHAUSTIVE.
+To repeat it: build `test-blue-onyx-prism`, run the service with the model on the iGPU, then
+`powershell -ExecutionPolicy Bypass -File scripts\research\hint_burst.ps1 -Model <name> -Image <camera jpeg>
+-Rates 4,8,12 -Duration 30`. The script never edits the config: it asks you to set `"performance_hint"` on the
+model's entry (a model reload) and press Enter once the model is Ready again.
+
+**cuDNN search.** `ort:cuda:0` on the GTX 1070 Ti, the `coco-cctv` set (40 images, 3 passes), runs in the order
+HEURISTIC, EXHAUSTIVE, HEURISTIC (`BOP_CUDNN_CONV_ALGO_SEARCH`).
+
+| | HEURISTIC | EXHAUSTIVE | HEURISTIC |
+|---|---|---|---|
+| rfdetr-nano infer p50 | 16.44 ms | 16.49 ms | 16.38 ms |
+| dfine-s infer p50 | 20.21 ms | 20.02 ms | 20.37 ms |
+| GPU memory peak during the run | 983-985 MiB | 962-983 MiB | 972-983 MiB |
+
+AP50 was identical. No difference in speed or memory, so HEURISTIC stays; the variable remains for later
+measurements.

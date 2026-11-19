@@ -118,7 +118,7 @@
   <form method="post" action="/config#at-models" id="models-json-form">
   <textarea autocapitalize="none" autocorrect="off" name="models_json" rows="14" spellcheck="false">{{ c.models_json }}</textarea>
   <p class="muted">Merged per model and field with changes made elsewhere (the Models card, Benchmark apply). Each entry: <code>path</code> (required), <code>family</code>, <code>name</code>, <code>classes</code>, <code>device</code>,
-  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>). A new or changed <code>path</code> / <code>classes</code> must be inside the data root, the models or download folder or your home folder (it may not exist yet), or chosen with Browse&hellip; under <a href="#custom-model">Add a model by path</a>.</p>
+  <code>confidence_threshold</code>, <code>object_filter</code>, <code>lazy</code>, <code>gpu_precision</code>, <code>performance_hint</code> (<code>latency</code> or <code>throughput</code> on an OpenVINO GPU), <code>enabled</code>, <code>night_model</code>, <code>verify</code> (verifier cascade, e.g. <code>{"model": "yolo26s"}</code>). A new or changed <code>path</code> / <code>classes</code> must be inside the data root, the models or download folder or your home folder (it may not exist yet), or chosen with Browse&hellip; under <a href="#custom-model">Add a model by path</a>.</p>
   <div class="actions"><button type="submit">Save models JSON</button> <span class="form-msg" aria-live="polite"></span></div>
   </form>
 </details>

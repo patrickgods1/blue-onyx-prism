@@ -38,8 +38,8 @@ pub const IGPU_INFLIGHT: usize = 2;
 pub const DGPU_INFLIGHT: usize = 4;
 /// Upper bound of the in-flight count of an OpenVINO GPU model with `performance_hint:
 /// throughput`, which otherwise follows the compiled model's `OPTIMAL_NUMBER_OF_INFER_REQUESTS`
-/// (the GPU plugin reports twice its `NUM_STREAMS` under any hint but LATENCY, so 4 for 2
-/// streams; the stream count a UHD 630 gets has not been read here yet). More requests than
+/// (the GPU plugin reports twice its `NUM_STREAMS` under any hint but LATENCY: measured on a UHD
+/// 630, NUM_STREAMS=2 and OPTIMAL_NUMBER_OF_INFER_REQUESTS=4). More requests than
 /// that only queue inside OpenVINO, adding their wait to each request's latency, and every
 /// request holds its own input and output buffers. Blue Iris sends one request per camera
 /// trigger, so a burst of more than 4 at once is rare on the boxes this targets.
@@ -1194,7 +1194,7 @@ mod tests {
         assert_eq!(t.effective_inflight(Some(2), Some(4)), 4);
         assert_eq!(t.effective_inflight(Some(1), Some(2)), 2);
         assert_eq!(t.effective_inflight(None, Some(3)), 3);
-        // A plugin that asks for more (or auto-batching's dozens) stays at the cap.
+        // A plugin that asks for more stays at the cap.
         assert_eq!(
             t.effective_inflight(Some(4), Some(64)),
             THROUGHPUT_INFLIGHT_CAP

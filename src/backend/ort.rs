@@ -826,8 +826,9 @@ impl OrtRuntime {
 ///   about twice what it uses, on a card a training or auto-label job may share;
 /// - `cudnn_conv_algo_search` `HEURISTIC`: the default exhaustive search benchmarks every
 ///   convolution algorithm at the first run, each with its own workspace: a memory peak at load
-///   that can fail on a nearly full card. The speed difference has not been measured yet (plan
-///   phase 3.6); [`ENV_CUDNN_CONV_ALGO_SEARCH`] picks another search for that measurement;
+///   that can fail on a nearly full card. Measured against EXHAUSTIVE on a GTX 1070 Ti (plan
+///   phase 3.6, docs/PRODUCTION_REVIEW.md): the same inference time and memory peak for
+///   rf-detr-nano and dfine-s; [`ENV_CUDNN_CONV_ALGO_SEARCH`] picks another search to measure;
 /// - `gpu_mem_limit` = `limit_mb` (config `ort_gpu_mem_limit_mb`, per session) when set.
 pub(crate) fn cuda_provider(device_id: i32, limit_mb: Option<u64>) -> ep::CUDA {
     cuda_provider_with(device_id, limit_mb, conv_search_from_env())
@@ -901,30 +902,61 @@ pub(crate) fn parse_conv_search(env: Option<&str>) -> Result<Option<ConvSearch>,
     }
 }
 
-/// The search of every CUDA session of this process: [`ENV_CUDNN_CONV_ALGO_SEARCH`] read once
-/// (one log line when it is set), HEURISTIC otherwise.
-fn conv_search_from_env() -> ConvSearch {
-    static SEARCH: std::sync::OnceLock<ConvSearch> = std::sync::OnceLock::new();
-    *SEARCH.get_or_init(|| {
-        match parse_conv_search(std::env::var(ENV_CUDNN_CONV_ALGO_SEARCH).ok().as_deref()) {
-            Ok(None) => ConvSearch::Heuristic,
-            Ok(Some(s)) => {
-                tracing::warn!(
+/// What a parsed [`ENV_CUDNN_CONV_ALGO_SEARCH`] means: the search, and the one log line to write
+/// (`true` = a warning: the search differs from HEURISTIC or the value is unknown). Pure.
+pub(crate) fn conv_search_choice(
+    parsed: Result<Option<ConvSearch>, String>,
+) -> (ConvSearch, Option<(bool, String)>) {
+    match parsed {
+        Ok(None) => (ConvSearch::Heuristic, None),
+        Ok(Some(ConvSearch::Heuristic)) => (
+            ConvSearch::Heuristic,
+            Some((
+                false,
+                format!(
+                    "{ENV_CUDNN_CONV_ALGO_SEARCH} is set to the default: CUDA sessions use \
+                     cudnn_conv_algo_search=HEURISTIC"
+                ),
+            )),
+        ),
+        Ok(Some(s)) => (
+            s,
+            Some((
+                true,
+                format!(
                     "{ENV_CUDNN_CONV_ALGO_SEARCH} is set: CUDA sessions use \
                      cudnn_conv_algo_search={} instead of HEURISTIC (a measurement setting; \
                      unset it to return to the default)",
                     s.as_str()
-                );
-                s
-            }
-            Err(v) => {
-                tracing::warn!(
+                ),
+            )),
+        ),
+        Err(v) => (
+            ConvSearch::Heuristic,
+            Some((
+                true,
+                format!(
                     "{ENV_CUDNN_CONV_ALGO_SEARCH}='{v}' is not exhaustive, heuristic or default; \
                      CUDA sessions keep cudnn_conv_algo_search=HEURISTIC"
-                );
-                ConvSearch::Heuristic
-            }
+                ),
+            )),
+        ),
+    }
+}
+
+/// The search of every CUDA session of this process: [`ENV_CUDNN_CONV_ALGO_SEARCH`] read once
+/// (one log line when it is set, [`conv_search_choice`]), HEURISTIC otherwise.
+fn conv_search_from_env() -> ConvSearch {
+    static SEARCH: std::sync::OnceLock<ConvSearch> = std::sync::OnceLock::new();
+    *SEARCH.get_or_init(|| {
+        let env = std::env::var(ENV_CUDNN_CONV_ALGO_SEARCH).ok();
+        let (search, note) = conv_search_choice(parse_conv_search(env.as_deref()));
+        match note {
+            Some((true, msg)) => tracing::warn!("{msg}"),
+            Some((false, msg)) => tracing::info!("{msg}"),
+            None => {}
         }
+        search
     })
 }
 
@@ -1931,6 +1963,31 @@ mod tests {
             assert!(opts.contains(&want), "{want} in {opts}");
         }
         assert_eq!(ENV_CUDNN_CONV_ALGO_SEARCH, "BOP_CUDNN_CONV_ALGO_SEARCH");
+    }
+
+    #[test]
+    fn cudnn_search_override_logs_once_and_plainly() {
+        assert_eq!(conv_search_choice(Ok(None)), (ConvSearch::Heuristic, None));
+        // The default named explicitly: an info line, never "HEURISTIC instead of HEURISTIC".
+        let (s, note) = conv_search_choice(Ok(Some(ConvSearch::Heuristic)));
+        assert_eq!(s, ConvSearch::Heuristic);
+        let (warn, msg) = note.unwrap();
+        assert!(!warn && msg.contains("set to the default"), "{msg}");
+        assert!(!msg.contains("instead of"), "{msg}");
+        for other in [ConvSearch::Exhaustive, ConvSearch::Default] {
+            let (s, note) = conv_search_choice(Ok(Some(other)));
+            assert_eq!(s, other);
+            let (warn, msg) = note.unwrap();
+            assert!(warn, "{msg}");
+            assert!(
+                msg.contains(&format!("={} instead of HEURISTIC", other.as_str())),
+                "{msg}"
+            );
+        }
+        let (s, note) = conv_search_choice(Err("fast".into()));
+        assert_eq!(s, ConvSearch::Heuristic);
+        let (warn, msg) = note.unwrap();
+        assert!(warn && msg.contains("'fast'"), "{msg}");
     }
 
     #[test]

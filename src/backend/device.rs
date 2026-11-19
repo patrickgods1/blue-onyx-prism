@@ -567,52 +567,32 @@ fn select_cache_dir(
     }
 }
 
-/// Where an OpenVINO property of [`hint_properties`] is set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PropScope {
-    /// The device's plugin (`core.set_property("GPU", ...)`).
-    Device,
-    /// The Core itself (empty device name: `ov::Core::set_property(AnyMap)`).
-    Core,
-}
-
-/// One OpenVINO property a compile sets for its performance hint.
+/// One OpenVINO property a compile sets on its device for its performance hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HintProp {
-    pub scope: PropScope,
     pub key: &'static str,
     pub value: &'static str,
 }
 
-/// The properties a compile on `device` (`CPU`, `GPU`, `GPU.1`, ...) sets for `hint`. Pure.
-/// - `PERFORMANCE_HINT` = the hint on the device, always (a plugin keeps the last value, so
-///   every compile sets its own).
-/// - THROUGHPUT on a GPU also sets the Core's `ALLOW_AUTO_BATCHING` = `NO`: with THROUGHPUT on
-///   the GPU plugin, OpenVINO otherwise wraps the model in the auto-batching plugin (`BATCH:GPU`),
-///   which holds requests until a batch fills or `AUTO_BATCH_TIMEOUT` (1000 ms by default)
-///   passes, and reports an `OPTIMAL_NUMBER_OF_INFER_REQUESTS` of the batch size times the
-///   streams. A worker keeps at most [`crate::profile::THROUGHPUT_INFLIGHT_CAP`] requests in
-///   flight, so the batch would rarely fill and each request would wait for the timeout. The
-///   OpenVINO archive `setup-openvino` installs has no auto-batching plugin (OpenVINO skips
-///   auto-batching then); a system OpenVINO may have one.
+/// The properties a compile sets on its device (`CPU`, `GPU`, `GPU.1`, ...) for `hint`, the
+/// same on every device. Pure. `PERFORMANCE_HINT` = the hint, always: a plugin keeps the last
+/// value, so every compile sets its own.
+///
+/// Auto-batching (OpenVINO wraps a GPU THROUGHPUT compile in `BATCH:GPU`, which holds requests
+/// until a batch fills or `AUTO_BATCH_TIMEOUT` passes) needs no switch: the OpenVINO archive
+/// `setup-openvino` installs has no auto-batching plugin, and OpenVINO skips auto-batching
+/// without it. Measured on the UHD 630 (plan phase 3.6): THROUGHPUT compiled with
+/// NUM_STREAMS=2 and OPTIMAL_NUMBER_OF_INFER_REQUESTS=4, two per stream, no batch. (The Core's
+/// `ALLOW_AUTO_BATCHING` cannot be set through the C API's empty device name: that name reaches
+/// the AUTO plugin, which refuses the key.)
 ///
 /// The model cache needs no key of its own per hint: the GPU plugin's caching properties
 /// include `PERFORMANCE_HINT`, so OpenVINO hashes blobs of the two hints apart.
-pub(crate) fn hint_properties(device: &str, hint: PerfHint) -> Vec<HintProp> {
-    let mut out = vec![HintProp {
-        scope: PropScope::Device,
+pub(crate) fn hint_properties(hint: PerfHint) -> [HintProp; 1] {
+    [HintProp {
         key: "PERFORMANCE_HINT",
         value: hint.as_str(),
-    }];
-    let gpu = device.to_ascii_uppercase().starts_with("GPU");
-    if gpu && hint == PerfHint::Throughput {
-        out.push(HintProp {
-            scope: PropScope::Core,
-            key: "ALLOW_AUTO_BATCHING",
-            value: "NO",
-        });
-    }
-    out
+    }]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -630,13 +610,9 @@ fn compile_on(
     // Core-wide settings like the precision hint: set before every compile so each model gets
     // its own (THROUGHPUT for a discrete GPU, a many-core CPU or `performance_hint:
     // throughput`, see `profile`).
-    for p in hint_properties(device, hint) {
-        let target = match p.scope {
-            PropScope::Device => DeviceType::from(device),
-            PropScope::Core => DeviceType::Other("".into()),
-        };
+    for p in hint_properties(hint) {
         let key = RwPropertyKey::Other(p.key.into());
-        match core_set_property(core, &target, &key, p.value) {
+        match core_set_property(core, &dt, &key, p.value) {
             Ok(()) => tracing::debug!("OpenVINO {device}: {}={}", p.key, p.value),
             Err(e) => tracing::warn!(
                 "OpenVINO {device}: failed to set {}={}: {e}",
@@ -1039,7 +1015,8 @@ pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
         });
     }
     tracing::debug!(
-        "model {} on {}: {n} infer request(s) (PERFORMANCE_HINT={}, NUM_STREAMS={streams:?},          OPTIMAL_NUMBER_OF_INFER_REQUESTS={optimal_requests:?})",
+        "model {} on {}: {n} infer request(s) (PERFORMANCE_HINT={}, NUM_STREAMS={streams:?}, \
+         OPTIMAL_NUMBER_OF_INFER_REQUESTS={optimal_requests:?})",
         model.path.display(),
         model.device.actual,
         tuning.hint.as_str()
@@ -1352,43 +1329,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hint_properties_per_device() {
-        let dev = |key, value| HintProp {
-            scope: PropScope::Device,
-            key,
-            value,
-        };
-        let no_batching = HintProp {
-            scope: PropScope::Core,
-            key: "ALLOW_AUTO_BATCHING",
-            value: "NO",
-        };
-        for gpu in ["GPU", "GPU.0", "gpu.1"] {
+    fn hint_properties_set_only_the_hint() {
+        for h in [PerfHint::Latency, PerfHint::Throughput] {
             assert_eq!(
-                hint_properties(gpu, PerfHint::Latency),
-                [dev("PERFORMANCE_HINT", "LATENCY")],
-                "{gpu}"
-            );
-            assert_eq!(
-                hint_properties(gpu, PerfHint::Throughput),
-                [dev("PERFORMANCE_HINT", "THROUGHPUT"), no_batching],
-                "{gpu}"
+                hint_properties(h),
+                [HintProp {
+                    key: "PERFORMANCE_HINT",
+                    value: h.as_str(),
+                }]
             );
         }
-        // The CPU (no auto-batching there) and the NPU only get the hint.
-        for other in ["CPU", "NPU"] {
-            for h in [PerfHint::Latency, PerfHint::Throughput] {
-                assert_eq!(
-                    hint_properties(other, h),
-                    [dev("PERFORMANCE_HINT", h.as_str())],
-                    "{other}"
-                );
-            }
-        }
-        // The keys are OpenVINO's own names.
+        assert_eq!(hint_properties(PerfHint::Throughput)[0].value, "THROUGHPUT");
+        // The key is OpenVINO's own name; nothing touches auto-batching (the AUTO plugin
+        // refuses ALLOW_AUTO_BATCHING through the empty device name).
         assert_eq!(
             RwPropertyKey::HintPerformanceMode.as_ref(),
-            hint_properties("GPU", PerfHint::Latency)[0].key
+            hint_properties(PerfHint::Latency)[0].key
         );
     }
 

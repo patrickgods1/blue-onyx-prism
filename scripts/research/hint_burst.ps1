@@ -22,6 +22,9 @@
     Read-only on everything but -Out. Uses the GPU only through the service under test.
 .PARAMETER Url
     Service base URL (plain HTTP port; default http://127.0.0.1:32168).
+.PARAMETER Image
+    Image to send (default: the load tester's embedded test image); a camera-sized JPEG measures
+    the decode and preprocessing a real trigger costs.
 .PARAMETER Model
     Model name for POST /v1/vision/custom/{model}; empty = the default model (/v1/vision/detection).
 .PARAMETER Hints
@@ -53,6 +56,7 @@
 param(
     [string]$Url = 'http://127.0.0.1:32168',
     [string]$Model = '',
+    [string]$Image = '',
     [string[]]$Hints = @('latency', 'throughput'),
     [string[]]$Rates = @('2', '4', '6', '8'),
     [ValidateRange(1, 3600)]
@@ -115,6 +119,7 @@ function Get-Field([string]$line, [string]$label) {
 function Invoke-Burst([string]$exe, [double]$rate, [double]$seconds) {
     $argv = @('--url', $Url, '--rate', $rate.ToString($inv), '--duration', $seconds.ToString($inv))
     if ($Model) { $argv += @('--model', $Model) }
+    if ($Image) { $argv += @('--image', $Image) }
     # A run with any failed request exits 1; its summary is still printed and still counts.
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
