@@ -258,6 +258,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - `task::load_or_move_aside` moves a damaged `runs.json` / `tasks.json` to `.corrupt-<time>` and leaves an unreadable
     one alone, unwritten. Runs are never dropped. JSONL reads are lossy per line and appends repair a torn tail
     (`layout::read_lines`); `layout::compact_review` and appends to `review-queue.jsonl` share `.review-queue.lock`.
+  - `heldout-days.json` (review folder) only grows: one writer, `labels::heldout::update` under `.heldout-days.lock`
+    (fs4, never under `.labels.lock`); a newer or damaged one refuses the export and is never moved aside.
   - Exports are built hidden, then renamed. A crashed auto-label's `proposals.jsonl` is written through the job's own
     path first (`autolabel::job::recover_crashed`) and kept on failure.
   - An unavailable review folder is `folder_missing`, never an empty dataset. Uninstall keeps data unless asked.
@@ -347,7 +349,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     (`heldout_fingerprint`; random picks never in it), validation as whole camera days (`dataset/valid.rs`), ignore
     mode (`dataset::IgnoreMode`), static cap (`collect/labels/statics.rs`, pure: persons and animals never form spots),
     parked cap, opt-in balancing, size-floor restore at the run's input. `training/preflight.rs` is the one report
-    behind the page, `balance-preview` and `train prepare --dry-run`.
+    behind the page, `balance-preview` and `train prepare --dry-run`. Listed held-out days (`Options.frozen_heldout`)
+    are held out even from an older export's train split; validation adds whole days up to `VALID_CLASS_FLOORS`.
   - One convergence rule for every trainer: `Convergence` in `train_model.py`, Rust twin `progress::convergence_run`,
     parity-tested. `RunSettings` records what changes results (ignore mode, negative share, static cap) and
     `compare.rs` warns on mixed values.

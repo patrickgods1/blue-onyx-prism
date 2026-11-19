@@ -1074,6 +1074,40 @@ train unless the camera is named in `holdout_cameras`.
   of 2^64, fall below `holdout_fraction`. This is deterministic, and stable when days are added.
 - Once there are two or more camera-days, at least one goes to each side.
 
+**Camera days held out for good** (`src/collect/labels/heldout.rs`). Each camera day the split holds out
+is listed in `<review folder>/heldout-days.json`, so a later export never trains on it again:
+
+```json
+{"version": 1, "days": [
+  {"camera": "back", "date": "2026-10-02", "added": "2026-11-18T02:30:39.157Z", "reason": "hash"},
+  {"camera": "alley", "date": "2026-11-21", "added": "2026-11-21T08:00:00.000Z", "reason": "camera-minimum"}]}
+```
+
+- Every export from the Dataset tab (`POST /v1/review/export`) holds out the listed days, whatever its
+  settings. The "one camera-day each side" rule never moves a listed day to `train`.
+- Only an export of the **default** split (`holdout_fraction` 0.2, no camera or day named) adds days:
+  the days its hash holds out (`hash`), and for a camera of the export with fewer than two held-out days
+  (`MIN_HELDOUT_DAYS_PER_CAMERA`), more of its days, lowest hash first (`camera-minimum`). A top-up is
+  never a day a training run trained or validated on (any `<training dir>/<run>/data/train.txt` or
+  `valid.txt`; when one of those lists does not read, nothing is topped up and the export warns), and
+  never the camera's last training day of the export. An export of other settings uses its own split plus
+  the listed days and writes nothing.
+- The list only grows. A file of a later `version` refuses the export as newer, one that does not parse
+  as damaged: it is never moved aside or replaced, since a shorter list would let held-out days train.
+  Restore it from a backup or fix it by hand.
+- Its writer holds `<review folder>/.heldout-days.lock` (cross-process, waited for up to 30 s, held from
+  the read to the rename only; never with the label lock). A folder where that lock cannot work (a
+  read-only share) refuses only an export that would add days.
+- The dataset check's fold exports and every other selection of reviewed frames never read or write it.
+- The report's `heldout` says what happened: `listed` (days in the file now), `added` (`camera`, `date`,
+  `added`, `reason`), `short` (`camera`, `held`, `wanted`, `why`: a camera still under two, such as
+  *every reviewed nook day was trained on; review a newer day*) and `custom_split` (true for other
+  settings). The Dataset tab shows them under the result, e.g. *17 camera days held out for good; added
+  this export: alley 2026-11-21 (camera minimum)* and *nook: 0 of 2 held-out days; every reviewed nook day
+  was trained on; review a newer day*.
+- A training run holds out a listed day even in an older export that has it in `train`
+  (docs/TRAINING.md, "Input: review exports").
+
 **Benchmark set.** `manifest.json` gives each frame its training boxes as ground truth, and its ignore
 regions (too-small rejects included) as `ignore` objects. `scored_labels`
 is the class list, so predictions of other labels count neither way. The tags are:

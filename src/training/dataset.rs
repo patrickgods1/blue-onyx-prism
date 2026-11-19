@@ -22,7 +22,8 @@
 //! 2. **Plan** ([`plan`], pure): map the classes onto the run's class list (renames, drops);
 //!    drop the copies of a frame that several exports hold (a held-out copy wins); hold out review
 //!    frames by whole camera days (unless the exports already did; one camera day: frame by frame,
-//!    with a warning) from **every** review frame, before any filter, so runs with other scene
+//!    with a warning; a camera day of [`Options::frozen_heldout`] is held out whatever split an
+//!    older export gave it) from **every** review frame, before any filter, so runs with other scene
 //!    filters are benchmarked on the same frames ([`Plan::heldout_fingerprint`]); judge the size
 //!    floor regions of the train / valid frames again at the run's input ([`restore_floor`]: one
 //!    not under the export's floor there is a box again) and compare the exports' floors
@@ -42,7 +43,8 @@
 //!    `negative_share` frames without objects in training (frames a reviewer confirmed empty or
 //!    rejected a box on first), take a
 //!    validation split of `val_share` of the review training frames as whole camera days
-//!    ([`valid`], never a class's last training box; the positives that leave with a validated
+//!    ([`valid`], never a class's last training box, more days for a class short of its floor of
+//!    validation boxes; the positives that leave with a validated
 //!    day for their ignore regions no longer count for the negatives, which are trimmed to
 //!    match), and repeat the review frames
 //!    `oversample` times when public frames are mixed in. Public frames are only ever trained on.
@@ -75,7 +77,7 @@ use std::path::{Path, PathBuf};
 pub mod balance;
 mod valid;
 pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
-pub use valid::valid_groups_text;
+pub use valid::{VALID_CLASS_FLOORS, valid_groups_text};
 
 /// Which frames a run trains on, by scene: any combination of day, night and IR. None or all
 /// three = every frame (unknown scenes included). Serialized as its canonical string
@@ -1057,7 +1059,15 @@ pub struct Options {
     /// no comparison (the floor is off, or a caller that does not say).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_floor: Option<SizeFloor>,
+    /// The `camera/day` keys of the folder under review's `heldout-days.json`
+    /// ([`crate::collect::labels::heldout`]): a review frame of one is held out even when an
+    /// older export put it in its train split (step 3). Empty = none listed, or no folder.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub frozen_heldout: BTreeSet<String>,
 }
+
+/// Most camera days the plan's warning on frozen held-out days names.
+const FROZEN_LISTED: usize = 10;
 
 /// Default `Options.min_valid`.
 pub const MIN_VALID: usize = 50;
@@ -1089,6 +1099,7 @@ impl Default for Options {
             static_cap: default_static_cap(),
             imgsz: None,
             size_floor: None,
+            frozen_heldout: BTreeSet::new(),
         }
     }
 }
@@ -1168,6 +1179,13 @@ pub struct Stats {
     /// `camera/day` groups validated on, each whole and sorted (empty when validation fell back
     /// to the frame split, see [`valid`]).
     pub valid_groups: Vec<String>,
+    /// Validation boxes per class of the run (classes without any left out).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub valid_boxes: BTreeMap<String, usize>,
+    /// Review frames held out for a camera day of [`Options::frozen_heldout`] that their export
+    /// put in its train split (an export older than the day's listing).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frozen_moved: usize,
     /// Training frames the balance cap left out ([`Balance::cap_dominant`]).
     #[serde(skip_serializing_if = "is_zero")]
     pub balance_dropped: usize,
@@ -1886,18 +1904,58 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     // leaves both sides; else the same held-out share as a folder without a split: an export of
     // one camera day has nothing to split, and its one group goes all to train or (by its hash)
     // all to val. All held out stays as it is when public frames train.
-    let is_held = |r: FrameRef| frame(r).is_some_and(|f| f.split == SplitHint::Heldout);
+    // A camera day held out for good (`heldout-days.json`) is held out whatever split its export
+    // gave it: an export older than the day's listing has it in train.
+    let frozen = |r: FrameRef| {
+        !opts.frozen_heldout.is_empty()
+            && frame(r).is_some_and(|f| opts.frozen_heldout.contains(&group_key(f)))
+    };
+    let is_held =
+        |r: FrameRef| frame(r).is_some_and(|f| f.split == SplitHint::Heldout) || frozen(r);
     let hinted = review.iter().any(|&r| is_held(r))
         && (review.iter().any(|&r| !is_held(r)) || !public.is_empty());
-    let (pool, heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
-        review
+    // Frames of a frozen day are held out on every path: also when the export's split is not
+    // used (every review frame held out, or no held-out share), the share split below only sees
+    // the other frames.
+    let (frozen_frames, open): (Vec<FrameRef>, Vec<FrameRef>) =
+        review.iter().partition(|&&r| frozen(r));
+    let (pool, mut heldout): (Vec<FrameRef>, Vec<FrameRef>) = if hinted {
+        let moved: Vec<FrameRef> = review
             .iter()
-            .partition(|&&r| frame(r).is_none_or(|f| f.split != SplitHint::Heldout))
-    } else if opts.heldout_share <= 0.0 || review.is_empty() {
-        (review.clone(), Vec::new())
+            .copied()
+            .filter(|&r| frozen(r) && frame(r).is_some_and(|f| f.split != SplitHint::Heldout))
+            .collect();
+        if !moved.is_empty() {
+            let days: BTreeSet<String> = moved
+                .iter()
+                .filter_map(|&r| frame(r).map(group_key))
+                .collect();
+            p.stats.frozen_moved = moved.len();
+            let more = days.len().saturating_sub(FROZEN_LISTED);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            p.warnings.push(format!(
+                "{} frame(s) of {} camera day(s) held out for good ({}{more}) are in the train \
+                 split of an older export: they are held out here, never trained on; export again \
+                 so the export agrees",
+                moved.len(),
+                days.len(),
+                days.iter()
+                    .take(FROZEN_LISTED)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        review.iter().partition(|&&r| !is_held(r))
+    } else if opts.heldout_share <= 0.0 || open.is_empty() {
+        (open.clone(), Vec::new())
     } else {
         let mut groups: BTreeMap<String, Vec<FrameRef>> = BTreeMap::new();
-        for &r in &review {
+        for &r in &open {
             if let Some(f) = frame(r) {
                 groups.entry(group_key(f)).or_default().push(r);
             }
@@ -1905,7 +1963,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         if groups.len() >= 2 {
             let mut keys: Vec<&String> = groups.keys().collect();
             keys.sort_by_key(|k| (rank(opts.seed, k), (*k).clone()));
-            let want = share_of(review.len(), opts.heldout_share).max(1);
+            let want = share_of(open.len(), opts.heldout_share).max(1);
             let mut held = Vec::new();
             let mut held_groups = Vec::new();
             // Never hold out every group.
@@ -1918,7 +1976,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             }
             p.stats.heldout_groups = held_groups;
             let held_set: BTreeSet<FrameRef> = held.iter().copied().collect();
-            let rest = review
+            let rest = open
                 .iter()
                 .copied()
                 .filter(|r| !held_set.contains(r))
@@ -1932,7 +1990,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                  for a fair measurement"
                     .into(),
             );
-            let mut v = review.clone();
+            let mut v = open.clone();
             v.sort_by_key(|r| rank(opts.seed, &key_of(*r)));
             let n = share_of(v.len(), opts.heldout_share)
                 .max(1)
@@ -1941,6 +1999,9 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             (v, held)
         }
     };
+    if !hinted {
+        heldout.extend(frozen_frames.iter().copied());
+    }
     p.heldout = heldout;
     p.heldout.sort_unstable();
     p.heldout_fingerprint = fingerprint(p.heldout.iter().map(|&r| match frame(r) {
@@ -2201,6 +2262,15 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     p.stats.ignore_valid_day = valid_day.len();
     p.stats.valid_groups = split.groups;
     p.warnings.extend(split.warning);
+    p.warnings.extend(split.notes);
+    for &r in &valid {
+        let Some(f) = frame(r) else { continue };
+        for (c, n) in p.classes.iter().zip(class_boxes(f, opts, &p.classes)) {
+            if n > 0 {
+                *p.stats.valid_boxes.entry(c.clone()).or_default() += n;
+            }
+        }
+    }
     if valid.is_empty() {
         p.warnings.push(
             "too few frames for a validation split: the trainer validates on its training frames"

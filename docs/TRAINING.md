@@ -201,6 +201,17 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
    the benchmark. `test/`, `valid/` and `heldout/` folders count as held out too. An export that
    holds nothing out (a single camera day goes wholly to one side) is held out by the run instead,
    step 2.
+
+   **Camera days held out for good.** The Dataset tab's export reads `heldout-days.json` in the review
+   folder (`src/collect/labels/heldout.rs`, format in docs/DATASET.md "Export") and holds out every day
+   it lists; an export of the default split adds its own held-out days, and for a camera with fewer than
+   two (`MIN_HELDOUT_DAYS_PER_CAMERA`) its days no run trained or validated on, so the list only grows. A
+   run reads the same list (`collect.review_dir`, else the dataset folder; `dataset::Options::frozen_heldout`,
+   recorded in `dataset.json`): a review frame of a listed day is held out even when an older export has it
+   in `train`, with a warning that counts those frames (`Stats.frozen_moved`). Adding days changes
+   `heldout_fingerprint`, so the run comparison says the held-out sets differ. A list that is newer or
+   does not parse stops the export and every run (`train run`, the Train tab, `train prepare`) until it
+   reads; nothing moves or rewrites it. The dataset check's fold runs ignore it (their split is the fold).
 2. **A flat YOLO folder**: `images/` (or the folder itself), `labels/<stem>.txt` or `<stem>.txt` beside
    the image, `classes.txt` or `data.yaml` (`names`), optionally `heldout.txt` / `test.txt` listing
    the held-out images, and a `manifest.json` in the benchmark format whose tags (`day` | `night` |
@@ -327,6 +338,14 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
    more than half of a class's boxes in the pool, which also keeps a class's last training box in
    training (`Stats.valid_groups` in `dataset.json` and the `dataset:` line of `train.log` list the
    groups). Frames with neither a camera nor a day tag are no group and stay in training.
+   **Validation floor** (`VALID_CLASS_FLOORS`, person 80): a run that trains `person` gets more whole
+   days in a third pass until validation holds 80 person boxes, so the checkpoint choice is not decided
+   by a handful of boxes (34 person boxes made one box about 3% of the recall). It takes days with people
+   in the same seeded rank under the same half rule, while validation stays within a third of the
+   candidate frames. When 80 cannot be reached the plan warns, e.g. *validation has 54 person boxes, 80
+   wanted: the remaining camera days with people would take more than half of a class's training boxes
+   or past a third of the frames; review more days with people*. The frame-by-frame fallback adds no day,
+   it only warns. `Stats.valid_boxes` in `dataset.json` counts validation boxes per class.
    **Fallback**: under 3 camera days left after the held-out split, groups reaching under half of the
    size, no group with a box, or no camera or day tag at all give a warning that says so and the
    frame-by-frame split (seeded rank, a frame holding a class's last training box stays in training);
@@ -407,6 +426,8 @@ not reviewed yet, and disk needed against free per volume.
 | Few training boxes of a class | under 50 (`MIN_CLASS_BOXES`) | warning |
 | Few held-out frames | under 10 (`MIN_HELDOUT_FRAMES`) | warning |
 | Few training frames of a scene | under 50 (`MIN_SCENE_FRAMES`) | warning, e.g. "Only 12 night frames: review more, or train day only." |
+| Few validation boxes of person (runs that train it) | under 80 (`VALID_CLASS_FLOORS`) | more whole days for validation, else a warning; the report shows `validation: N person boxes (80 wanted ...)` (`valid_floors`) |
+| A camera day held out for good in an older export's train split | any | held out anyway, with a warning |
 
 The checks run when a run is queued (page, `train run`) and again when it starts. Warnings stay with the
 run: on its row, in `dataset.json` and in `train.log`. The disk need is the frames that cannot be hard-linked

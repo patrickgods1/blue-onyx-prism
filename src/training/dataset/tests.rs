@@ -1226,6 +1226,7 @@ fn review_export(
             include_unreviewed: false,
             hidden_classes: Vec::new(),
             size_floor: None,
+            heldout: None,
         },
     )
     .unwrap()

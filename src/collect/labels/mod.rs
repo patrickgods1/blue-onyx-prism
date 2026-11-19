@@ -9,7 +9,8 @@
 //! [`super::layout::parse_rel`] / [`super::layout::resolve`]), [`read`], [`revision`] and the
 //! atomic writes under one process-wide lock ([`write`], [`update`], [`write_checked`]). The
 //! review queue is in [`queue`] (its default order, Recommended, in [`recommend`]), with a background index of it for the Review tab in [`index`], the bulk accept and the low-score and unwanted-class rejects in
-//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`], the X-AnyLabeling interop in
+//! [`bulk`], the YOLO / COCO / benchmark exporters in [`export`] (the camera days held out for good
+//! in [`heldout`]), the X-AnyLabeling interop in
 //! [`xany`], the repeat detections of fixed cameras (spot matching, per-camera history) in
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
 //! boxes on one object (stacks, overlaps) in [`stacks`], the static spots of fixed cameras (the
@@ -19,6 +20,7 @@
 
 pub mod bulk;
 pub mod export;
+pub mod heldout;
 pub mod index;
 pub mod overlaps;
 pub mod queue;

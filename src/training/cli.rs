@@ -1008,7 +1008,7 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 // No model: the run's input size is not known (its placeholder recipe's is not).
                 let options = dataset::Options {
                     imgsz: None,
-                    ..super::options_for(&config, &request)
+                    ..super::options_for(&config, &request)?
                 };
                 let p = super::preview_with(&config, &request, options)?;
                 println!("{}", dry_run_text(&p.plan, &request.balance));
@@ -1961,6 +1961,7 @@ fn read_sources(
         static_cap: data.with_static_cap(config).training.static_cap_option(),
         ignore: data.with_plan_flags(config).training.ignore,
         size_floor: config.collect.size_floor,
+        frozen_heldout: super::frozen_heldout(config)?,
         // `train prepare` names no model: the input size is not known.
         imgsz: None,
         ..dataset::Options::default()
