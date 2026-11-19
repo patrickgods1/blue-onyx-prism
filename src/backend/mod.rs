@@ -247,6 +247,8 @@ pub struct OvCompiled {
     pub(crate) tuning: DeviceTuning,
     /// `NUM_STREAMS` of the compiled model (None when not readable).
     pub(crate) streams: Option<usize>,
+    /// `OPTIMAL_NUMBER_OF_INFER_REQUESTS` of the compiled model (None when not readable).
+    pub(crate) optimal_requests: Option<usize>,
 }
 
 /// A finished asynchronous inference: which slot, its sequence number (from
@@ -278,6 +280,7 @@ impl fmt::Debug for OvCompiled {
             .field("info", &self.info)
             .field("tuning", &self.tuning)
             .field("streams", &self.streams)
+            .field("optimal_requests", &self.optimal_requests)
             .finish_non_exhaustive()
     }
 }

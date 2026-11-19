@@ -3986,3 +3986,33 @@ Slowest units of a full build: this crate 30 s, `aws-lc-sys` build script 26 s, 
 
 A debug build reads `assets/` from the source tree on each request and embeds nothing, because any `include_str!` of a file makes cargo rebuild when it changes. So a debug binary moved off its source tree answers 500 for `/static/*`; a release build is unchanged. Templates stay compiled in: askama 0.16 has no runtime template loading, so a template edit still needs a rebuild.
 
+
+### Pending measurement: OpenVINO GPU performance hint (plan phase 3.6)
+
+*No numbers yet: the code is in, nothing has been run on a GPU.*
+
+`performance_hint` (global and per model, `latency` | `throughput`; unset = the profile: LATENCY with 2 in flight
+on an integrated GPU, THROUGHPUT with up to 4 clamped to `NUM_STREAMS` on a discrete Intel GPU) chooses the
+OpenVINO hint of models on an OpenVINO GPU. `throughput` compiles with THROUGHPUT and keeps
+`OPTIMAL_NUMBER_OF_INFER_REQUESTS` in flight, at most `profile::THROUGHPUT_INFLIGHT_CAP` (4; the GPU plugin reports
+twice its streams under THROUGHPUT; the compile log line shows both counts), with the Core's `ALLOW_AUTO_BATCHING` off so no request waits for a batch
+(`backend::device::hint_properties`). The GPU plugin's caching properties include `PERFORMANCE_HINT`, so the two
+hints never share a cached blob. CPU, NPU and ONNX Runtime ignore the key.
+
+To measure, on the dev box (i5-8500, UHD 630, `openvino:gpu.0`), with the service running a model on the iGPU:
+
+```powershell
+cargo build --release --bin test-blue-onyx-prism
+powershell -ExecutionPolicy Bypass -File scripts\research\hint_burst.ps1 -Model <name> -Rates 2,4,6,8 -Duration 60
+```
+
+The script never edits the config: it asks you to set `"performance_hint"` on the model's entry (a model
+reload; the first compile with a new hint is not cached) and press Enter once the model is Ready again, runs a
+discarded warm-up, then one open-loop `test-blue-onyx-prism --rate <r> --duration <s>` run per rate, and writes
+a table and a CSV of answers per second, p50 / p95 / p99 / max latency from the scheduled start, and 503s. Change the default only if `throughput` raises
+answers per second with p99 within Blue Iris's timeout, then record the table here.
+
+The cuDNN half of phase 3.6 is also pending: `BOP_CUDNN_CONV_ALGO_SEARCH=exhaustive|heuristic|default` (README,
+Troubleshooting) switches the CUDA provider's search for one process, so `benchmark` on the 1070 Ti can compare
+inference p50 and the load memory peak of rf-detr-nano and dfine-s under HEURISTIC (the shipped value) and
+EXHAUSTIVE.

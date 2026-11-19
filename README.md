@@ -389,6 +389,7 @@ it; every key can also be set in the file.
 | `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
 | `ort_gpu_mem_limit_mb` | unset (no cap) | Cap in MB of the GPU memory arena of each ONNX Runtime CUDA session (ONNX Runtime's `gpu_mem_limit`), for a card shared with training or auto-label jobs; also caps the CUDA provider behind `ort:tensorrt` (TensorRT's own memory is not counted). Per session: a model with two `ort_sessions` can use twice it, and the CUDA context and libraries' own memory lie outside it. A run that needs more than the cap fails with an inference error instead of growing the arena. Unset = no cap (the arena grows by what a run asks for). No effect on DirectML, CoreML or OpenVINO. Integer 64-1048576. Applies: restart. UI: no |
 | `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
+| `performance_hint` | unset (`latency` on an integrated GPU) | OpenVINO compile hint for models on an OpenVINO GPU (`openvino:gpu[.N]`): `latency` (one stream, 2 requests in flight so the host prepares the next frame while the GPU runs one) or `throughput` (OpenVINO's THROUGHPUT hint, several streams; requests in flight = the compiled model's `OPTIMAL_NUMBER_OF_INFER_REQUESTS`, at most 4; auto-batching stays off, so a request never waits for a batch to fill). Unset = the hardware profile's choice: `latency` on an integrated GPU, THROUGHPUT with up to 4 in flight (clamped to its streams) on a discrete Intel GPU. An explicit `inflight` still sets the count. CPU, NPU and ONNX Runtime devices ignore it. Whether `throughput` helps Blue Iris on a UHD 630 is not measured yet (docs/PRODUCTION_REVIEW.md); a model's own `performance_hint` wins. Applies: restart (shown on every model it moves). UI: no |
 | `models_dir` | `"models"` | Where `download-models` and exports put files (relative = under the data root). Path; empty on the Config page = `models`. Applies: restart. Files already there are not moved. UI: yes (Server, Folders) |
 | `default_model` | `null` | Model serving `/v1/vision/detection`; default = first enabled entry. Model name. Applies: at once. UI: yes (Models card) |
 | `previous_default` | `null` | What the last **Use as default** on the Models tab replaced (the model, its `default_model` value, the settings the switch changed), for the one-click Revert on that card and on Home. Written by the page; a Revert writes the opposite record, so a second Revert redoes the switch. Applies: at once. UI: yes (Models tab, Use a trained model) |
@@ -601,6 +602,7 @@ and the default model; every key is in the *Models JSON* under it):
 | `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
 | `enabled` | `true` | Load and serve this model; disabled models stay in the config but are not loaded. Boolean. Applies: model reload (start or stop). UI: yes (Models card *Load*) |
 | `inflight` | `null` | Concurrent inferences of this model; `null` or `0` = the global `inflight`. Integer 0-64. Applies: restart. UI: no |
+| `performance_hint` | `null` | OpenVINO GPU compile hint of this model, `latency` or `throughput` (see the global key); `null` = the global `performance_hint`. No effect on CPU, NPU or ONNX Runtime devices. Applies: model reload. UI: Models JSON |
 | `night_confidence_threshold`, `person_aspect`, `min_box_area_frac`, `suppress_overlaps`, `static_suppression` | absent | Per-model night / IR rules (see the global keys); absent = the global value, a set value replaces it. Applies: at once. UI: Models JSON |
 | `label_thresholds`, `night_label_thresholds` | absent | Per-model label thresholds, merged over the global ones (this model's entries win; `0` turns a global entry off). Applies: at once. UI: Models JSON |
 | `preprocess`, `night_preprocess` | absent | Per-model image enhancement (see the global keys); absent = the global value, `"none"` turns a global mode off for this model. Applies: at once. UI: Models JSON |
@@ -1443,6 +1445,11 @@ for throwaway test servers only).
   (`benchmark.low_priority`, `benchmark --no-low-priority` to opt out) and CPU inference keeps one core
   free (`intra_threads` 0); ONNX Runtime's thread pools do not spin-wait between runs (`BOP_ORT_SPINNING=1`
   restores the default spinning).
+- **cuDNN convolution search (measurement only):** CUDA sessions (`ort:cuda`, and the CUDA provider behind
+  `ort:tensorrt`) use `cudnn_conv_algo_search` HEURISTIC, which avoids the memory peak of ONNX Runtime's
+  exhaustive search at load. `BOP_CUDNN_CONV_ALGO_SEARCH=exhaustive|heuristic|default` replaces it for the
+  whole process, to compare inference time and load memory; the log says so once. Unset (or an unknown
+  value, which is warned about) keeps HEURISTIC.
 - **GPU usage stays around 60 % with DirectML or CUDA:** Task Manager's GPU column shows the busiest engine
   and under-reports compute work; look at the *Compute_0* / *3D* engine graphs or `nvidia-smi dmon -s u`.
   The server runs two ONNX Runtime sessions per model on a discrete GPU (`ort_sessions`) so one request's
