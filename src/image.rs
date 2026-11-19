@@ -114,16 +114,35 @@ fn rgb_len(w: u32, h: u32) -> Result<usize> {
 /// The header is read first: a zero-sized image or one whose pixel count exceeds
 /// [`max_pixels`] is rejected before any pixel buffer is allocated.
 pub fn decode(bytes: &[u8]) -> Result<RgbImage> {
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        match decode_jpeg(bytes) {
-            Ok(img) => return Ok(img),
+    let mut rgb = Vec::new();
+    let (width, height) = decode_into(bytes, &mut rgb)?;
+    Ok(RgbImage { width, height, rgb })
+}
+
+/// [`decode`] into `buf`, reusing its allocation: on success `buf` holds exactly the packed RGB8
+/// pixels (`width * height * 3` bytes) and the size is returned; on error its contents are
+/// unspecified. The pixels equal [`decode`]'s byte for byte: a JPEG is decoded into a buffer
+/// zero-filled first, as zune-jpeg's own `decode` does, so a truncated stream that leaves rows
+/// unwritten reads the same zeros instead of an earlier frame's pixels. A non-JPEG (or a JPEG
+/// zune-jpeg refuses) is decoded by the `image` crate into a new buffer that replaces `buf`'s.
+pub fn decode_into(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(u32, u32)> {
+    if is_jpeg(bytes) {
+        match decode_jpeg_into(bytes, buf) {
+            Ok(size) => return Ok(size),
             Err(e) if e.is::<SizeRejected>() => return Err(e),
             Err(e) => {
                 tracing::debug!("zune-jpeg failed ({e:#}), falling back to image crate");
             }
         }
     }
-    decode_with_image_crate(bytes)
+    let img = decode_with_image_crate(bytes)?;
+    *buf = img.rgb;
+    Ok((img.width, img.height))
+}
+
+/// True when `bytes` start with the JPEG SOI marker (what [`decode`] hands to zune-jpeg).
+pub fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8])
 }
 
 fn decode_with_image_crate(bytes: &[u8]) -> Result<RgbImage> {
@@ -169,7 +188,7 @@ fn decode_with_image_crate(bytes: &[u8]) -> Result<RgbImage> {
     })
 }
 
-fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage> {
+fn decode_jpeg_into(bytes: &[u8], buf: &mut Vec<u8>) -> Result<(u32, u32)> {
     let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
     let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
     decoder
@@ -182,17 +201,29 @@ fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage> {
     let h = u32::try_from(h).map_err(|_| anyhow!("JPEG height {h} is out of range"))?;
     check_dimensions(u64::from(w), u64::from(h))?;
     let expected = rgb_len(w, h)?;
-    let rgb = decoder
-        .decode()
-        .map_err(|e| anyhow!("JPEG decode failed: {e:?}"))?;
-    if rgb.len() != expected {
-        bail!("unexpected JPEG output size {} for {w}x{h}", rgb.len());
+    if decoder.output_buffer_size() != Some(expected) {
+        bail!(
+            "unexpected JPEG output size {:?} for {w}x{h}",
+            decoder.output_buffer_size()
+        );
     }
-    Ok(RgbImage {
-        width: w,
-        height: h,
-        rgb,
-    })
+    // Zero-filled like `JpegDecoder::decode` (see `decode_into`), in place when the allocation
+    // is big enough: `resize` writes zeros past the old length only (or cuts it), and `fill`
+    // (one memset) clears the bytes that were there. Otherwise a zeroed allocation replaces it
+    // (`vec!` of zeros asks the allocator for zeroed memory).
+    if buf.capacity() >= expected {
+        let old = buf.len().min(expected);
+        buf.resize(expected, 0);
+        if let Some(head) = buf.get_mut(..old) {
+            head.fill(0);
+        }
+    } else {
+        *buf = vec![0; expected];
+    }
+    decoder
+        .decode_into(buf)
+        .map_err(|e| anyhow!("JPEG decode failed: {e:?}"))?;
+    Ok((w, h))
 }
 
 /// Encode as baseline JPEG.
@@ -392,12 +423,18 @@ fn safe_stem(name: &str) -> Option<String> {
 /// Write `<stem>_od.jpg` (annotated) into `dir`, plus `<stem>.jpg` (unannotated) when
 /// `save_ref` is set. `name` is untrusted (client-supplied): only a sanitized form of its file
 /// stem is used (`safe_stem`), else a random `image_<uuid>` name.
+///
+/// The unannotated `<stem>.jpg` is `upload`, the bytes as the client sent them, when they are a
+/// JPEG ([`is_jpeg`]; what Blue Iris sends): no second encode, and no second generation of JPEG
+/// loss. Otherwise (a PNG upload, or no bytes kept) `img` is encoded as a quality-95 JPEG, so
+/// the file is a JPEG whatever was uploaded and its `.jpg` name stays true.
 pub fn save_annotated(
     dir: &Path,
     name: &str,
     img: &RgbImage,
     preds: &[Prediction],
     save_ref: bool,
+    upload: Option<&[u8]>,
 ) -> Result<()> {
     let stem = safe_stem(name).unwrap_or_else(|| format!("image_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -408,8 +445,11 @@ pub fn save_annotated(
         .with_context(|| format!("writing {}", od_path.display()))?;
     if save_ref {
         let ref_path = dir.join(format!("{stem}.jpg"));
-        std::fs::write(&ref_path, encode_jpeg(img, 95)?)
-            .with_context(|| format!("writing {}", ref_path.display()))?;
+        let written = match upload.filter(|b| is_jpeg(b)) {
+            Some(bytes) => std::fs::write(&ref_path, bytes),
+            None => std::fs::write(&ref_path, encode_jpeg(img, 95)?),
+        };
+        written.with_context(|| format!("writing {}", ref_path.display()))?;
     }
     Ok(())
 }
@@ -536,9 +576,45 @@ mod tests {
     fn save_writes_files() {
         let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
         let img = synthetic(32, 32);
-        save_annotated(&dir, "../evil/cam1.jpg", &img, &[], true).unwrap();
+        save_annotated(&dir, "../evil/cam1.jpg", &img, &[], true, None).unwrap();
         assert!(dir.join("cam1_od.jpg").exists());
         assert!(dir.join("cam1.jpg").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reference copy is the uploaded JPEG byte for byte; a PNG upload (or none) is
+    /// encoded as a JPEG as before. The annotated file does not depend on the upload.
+    #[test]
+    fn reference_is_the_uploaded_jpeg() {
+        let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
+        let img = synthetic(32, 24);
+        let jpeg = encode_jpeg(&img, 80).unwrap();
+        let preds = [Prediction {
+            x_min: 2,
+            y_min: 2,
+            x_max: 20,
+            y_max: 20,
+            confidence: 0.9,
+            label: "car".into(),
+        }];
+        let annotated = encode_jpeg(&draw_predictions(&img, &preds), 95).unwrap();
+        let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+        save_annotated(&dir, "a.jpg", &img, &preds, true, Some(&jpeg)).unwrap();
+        assert_eq!(read("a.jpg"), jpeg, "the upload as it came");
+        assert_eq!(read("a_od.jpg"), annotated);
+        let png = png_bytes(32, 24);
+        save_annotated(&dir, "b.png", &img, &preds, true, Some(&png)).unwrap();
+        assert_eq!(
+            read("b.jpg"),
+            encode_jpeg(&img, 95).unwrap(),
+            "a JPEG, never PNG bytes"
+        );
+        assert_eq!(read("b_od.jpg"), annotated);
+        save_annotated(&dir, "c.jpg", &img, &preds, true, None).unwrap();
+        assert_eq!(read("c.jpg"), encode_jpeg(&img, 95).unwrap());
+        save_annotated(&dir, "d.jpg", &img, &preds, false, Some(&jpeg)).unwrap();
+        assert!(!dir.join("d.jpg").exists());
+        assert_eq!(read("d_od.jpg"), annotated);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -580,7 +656,7 @@ mod tests {
     fn reserved_name_falls_back_to_uuid() {
         let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
         let img = synthetic(8, 8);
-        save_annotated(&dir, "CON.jpg", &img, &[], true).unwrap();
+        save_annotated(&dir, "CON.jpg", &img, &[], true, None).unwrap();
         let names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -708,5 +784,37 @@ mod tests {
                 .to_string()
                 .contains("too large")
         );
+    }
+
+    /// `decode_into` gives `decode`'s pixels whatever the buffer held before (a larger frame of
+    /// garbage), reuses its allocation, and replaces it for a PNG.
+    #[test]
+    fn decode_into_equals_decode_and_reuses_the_buffer() {
+        let jpeg = encode_jpeg(&synthetic(64, 40), 90).unwrap();
+        let want = decode(&jpeg).unwrap();
+        let mut buf = vec![0xAB; 64 * 64 * 3];
+        let ptr = buf.as_ptr();
+        assert_eq!(decode_into(&jpeg, &mut buf).unwrap(), (64, 40));
+        assert_eq!(buf, want.rgb);
+        assert_eq!(buf.as_ptr(), ptr, "no new allocation");
+
+        // A truncated stream: whatever zune-jpeg leaves unwritten reads as in `decode`.
+        let cut = &jpeg[..jpeg.len() * 2 / 3];
+        let fresh = decode(cut);
+        let mut dirty = vec![0xCD; 64 * 40 * 3];
+        let reused = decode_into(cut, &mut dirty);
+        match fresh {
+            Ok(img) => {
+                assert_eq!(reused.unwrap(), (img.width, img.height));
+                assert_eq!(dirty, img.rgb);
+            }
+            Err(_) => assert!(reused.is_err()),
+        }
+
+        let png = png_bytes(9, 7);
+        let mut buf = vec![1u8; 10];
+        assert_eq!(decode_into(&png, &mut buf).unwrap(), (9, 7));
+        assert_eq!(buf, decode(&png).unwrap().rgb);
+        assert!(is_jpeg(&jpeg) && !is_jpeg(&png));
     }
 }

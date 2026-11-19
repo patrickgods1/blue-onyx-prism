@@ -1299,15 +1299,33 @@ struct RunCtx {
 /// One inference for a session thread; the buffers travel back in [`OrtResult`].
 struct OrtJob {
     seq: u64,
-    chw: Vec<f32>,
+    chw: OrtChw,
     extra: Vec<ExtraInput>,
     outs: Vec<NamedOutput>,
 }
 
 struct OrtResult {
-    chw: Vec<f32>,
+    chw: OrtChw,
     outs: Vec<NamedOutput>,
     result: Result<()>,
+}
+
+/// The image tensor of an [`OrtJob`]: the slot's own buffer holding a copy
+/// ([`OrtBackend::submit`]), or the caller's pooled tensor handed over without a copy
+/// ([`OrtBackend::submit_pooled`]), which goes back to its pool when the slot is collected.
+enum OrtChw {
+    Slot(Vec<f32>),
+    Pooled(crate::prep::PooledBuf),
+}
+
+impl std::ops::Deref for OrtChw {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        match self {
+            OrtChw::Slot(v) => v,
+            OrtChw::Pooled(b) => b,
+        }
+    }
 }
 
 /// A session thread and the buffers of its slot while idle.
@@ -1623,6 +1641,37 @@ impl OrtBackend {
     /// buffer). Returns its sequence number. A dead session thread fails with [`SessionDead`]
     /// (see [`super::is_session_dead`]).
     pub(crate) fn submit(&mut self, slot: usize, chw: &[f32], extra: &[ExtraInput]) -> Result<u64> {
+        self.submit_input(
+            slot,
+            |s| {
+                let mut buf = std::mem::take(&mut s.chw);
+                buf.clear();
+                buf.extend_from_slice(chw);
+                OrtChw::Slot(buf)
+            },
+            extra,
+        )
+    }
+
+    /// [`Self::submit`] without the copy: the session thread reads `chw` itself, and it goes back
+    /// to its pool when the slot is collected (or with the thread, if that never returns).
+    pub(crate) fn submit_pooled(
+        &mut self,
+        slot: usize,
+        chw: crate::prep::PooledBuf,
+        extra: &[ExtraInput],
+    ) -> Result<u64> {
+        self.submit_input(slot, |_| OrtChw::Pooled(chw), extra)
+    }
+
+    /// The checks and the hand-over of [`Self::submit`]; `input` makes the job's image tensor
+    /// once the slot is known to be free and alive.
+    fn submit_input(
+        &mut self,
+        slot: usize,
+        input: impl FnOnce(&mut OrtSlot) -> OrtChw,
+        extra: &[ExtraInput],
+    ) -> Result<u64> {
         let n = self.slots.len();
         let where_ = format!(
             "model {} on {}",
@@ -1643,13 +1692,11 @@ impl OrtBackend {
         if s.thread.as_ref().is_none_or(|t| t.is_finished()) {
             return Err(s.kill(slot, format!("session thread {slot} exited"))).context(where_);
         }
-        let mut buf = std::mem::take(&mut s.chw);
-        buf.clear();
-        buf.extend_from_slice(chw);
+        let chw = input(s);
         s.seq += 1;
         let job = OrtJob {
             seq: s.seq,
-            chw: buf,
+            chw,
             extra: extra.to_vec(),
             outs: std::mem::take(&mut s.outs),
         };
@@ -1711,7 +1758,10 @@ impl OrtBackend {
             }
         };
         s.busy = false;
-        s.chw = r.chw;
+        // The slot's buffer is kept for the next copy; a pooled tensor goes back to its pool.
+        if let OrtChw::Slot(buf) = r.chw {
+            s.chw = buf;
+        }
         match r.result {
             Ok(()) => Ok(r.outs),
             Err(e) => {
@@ -2263,6 +2313,35 @@ mod tests {
             done_rx,
             abort_timeout: std::time::Duration::from_millis(100),
         }
+    }
+
+    /// A pooled tensor reaches the session thread as it is (the same allocation, no copy into
+    /// the slot) and goes back to its pool once the slot is collected; a slice is still copied.
+    #[test]
+    fn pooled_tensors_are_handed_over_without_a_copy() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let mut b = fake_backend(1, move |job: &mut OrtJob| {
+            let pooled = matches!(job.chw, OrtChw::Pooled(_));
+            log.lock()
+                .unwrap()
+                .push((job.chw.as_ptr() as usize, job.chw.to_vec(), pooled));
+            Ok(())
+        });
+        let pool = crate::prep::TensorPool::new();
+        let mut chw = pool.take(3);
+        chw.vec_mut().extend_from_slice(&[1.0, 2.0, 3.0]);
+        let ptr = chw.as_ptr() as usize;
+        b.submit_pooled(0, chw, &[]).unwrap();
+        assert_eq!(pool.free_count(3), 0, "held while the inference runs");
+        b.collect(0).unwrap();
+        assert_eq!(pool.free_count(3), 1, "back in its pool once collected");
+        b.submit(0, &[4.0, 5.0, 6.0], &[]).unwrap();
+        b.collect(0).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], (ptr, vec![1.0, 2.0, 3.0], true));
+        assert_eq!((seen[1].1.clone(), seen[1].2), (vec![4.0, 5.0, 6.0], false));
+        assert_ne!(seen[1].0, ptr, "a slice goes into the slot's own buffer");
     }
 
     #[test]

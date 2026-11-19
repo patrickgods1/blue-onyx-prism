@@ -4099,3 +4099,74 @@ the device spec (`priority::decide`):
   devices at low priority".
 - The previous class is restored when a non-CPU device starts and when the run ends, also on an error or a
   panic (the guard drops).
+
+## Live path (performance plan phase 3.5)
+
+*Windows 11, the dev box (i5-8600K, 6 cores), **debug build on CPU** (`openvino:cpu`, IPcam-general,
+`cargo build` without `--release`), 2026-11-19. Server from `--config` with the fixtures of `tests/common`
+(`models/IPcam-general.onnx`, OpenVINO without the GPU plugin); one 2688x1520 camera JPEG (366 KB) from the
+dataset, sent as `image.jpg`, no detections at the default threshold. "before" is `origin/main` (d40dbb2),
+"after" this branch, the same binaries swapped on the same config. Sequential: 100 (60 in the A/B runs, 40
+and 20 with saving) requests one after another, reading `analysisRoundTripMs` / `processMs` from the answers.
+Open loop: `test-blue-onyx-prism --rate R --duration S` (p50 / p99 from the scheduled start).*
+
+In a debug build zune-jpeg alone takes about 740 ms of the ~1050 ms `processMs` and the JPEG encode of a save
+about 1.7 s, so the absolute numbers are far from a release build's; the comparisons are what this section is
+for.
+
+What changed on the per-request path:
+
+- **Decode buffer reuse** (`prep::Scratch`, `image::decode_into`): each prep thread decodes into one kept RGB
+  buffer (12.3 MB for this frame) instead of a new zeroed allocation per request, at most one per thread and
+  never above `MAX_SCRATCH_BYTES` (32 MiB). A frame kept past the request (save, night model, verifier) still
+  gets a buffer of its own. The JPEG output is zero-filled first, as zune-jpeg's own `decode` does, so a
+  truncated stream reads exactly as before.
+- **Saving after the reply** (`worker/save.rs`): drawing, encoding and writing `save_image_path` images moved
+  to one `image-save` thread fed by a bounded queue (`QUEUE` = 4 frames, ~50 MB); a full queue drops the save
+  with a warning at most every 10 s. `save_ref_image` writes the uploaded JPEG as it came (a PNG upload, or a
+  forwarded frame without its bytes, is still encoded as a quality-95 JPEG, so `<name>.jpg` stays a JPEG).
+- **Forwarded frames on the prep pool**: night-model and verifier frames (`PrepInput::Decoded`) are
+  preprocessed by the pool instead of on the receiving model's inference thread.
+- **Copies**: the upload buffer is reserved from `Content-Length` (at most `BODY_LIMIT`, charged to the upload
+  budget up front, otherwise grown as before); `ort` sessions read the pooled tensor in place
+  (`Backend::submit_pooled`) instead of copying it into the slot.
+- **Background threads below normal** (`priority::lower_this_thread`): review index, review queue walk
+  workers (`parallel::map_all_at(.., Spawned::Background, ..)`), Train area tally, storage measurement and
+  retention. Detection, prep, worker, HTTP and `image-save` threads keep normal priority.
+
+Without saving (A/B alternated, two runs each; `processMs` and `analysisRoundTripMs` p50 / p99 in ms):
+
+| | before | after |
+|---|---|---|
+| sequential `processMs` | 1051 / 1593, 1047 / 1275 | 1038 / 1592, 1041 / 1373 |
+| sequential `analysisRoundTripMs` | 1054 / 1599, 1053 / 1291 | 1042 / 1594, 1043 / 1376 |
+| decode, from the debug log under 2 req/s | 741, 759 | 737, 737 |
+| preprocess, same runs | 258, 262 | 255, 255 |
+| open loop 2 req/s for 45 s, from schedule p50 | 1122, 1307, 1316, 2756 | 1251, 1726, 1247, 1151 |
+| server RSS at the start of the open loop | 231 to 233 MB | 257 to 258 MB |
+
+The sequential gain is about 10 ms, inside the noise of a debug build whose decode dominates. 2 req/s is at
+the edge of what this debug build serves, so the open-loop p50 is mostly queueing and swings by a factor of two
+between runs of the same binary; it shows no difference either way. The RSS is ~25 MB higher from the start:
+the two busy prep threads keep their 12.3 MB buffers instead of freeing them after every request.
+
+With `save_image_path` on (`save_ref_image` off, then on):
+
+| | before | after |
+|---|---|---|
+| sequential `analysisRoundTripMs` p50 / p99 | 2789 / 3118 | 1061 / 1397 |
+| open loop 0.3 req/s for 60 s, p50 / p99 | 2779 / 3415 | 1116 / 1526 |
+| with `save_ref_image`, sequential p50 / p99 | 4617 / 5641 | 1077 / 1156 |
+| with `save_ref_image`, open loop 0.3 req/s for 30 s, p50 / p99 | 7775 / 9599 | 1092 / 1159 |
+| annotated `_od.jpg` | sha256 `1bc94d4c...` | the same bytes, every file |
+| reference `<name>.jpg` | re-encoded (`1bc94d4c...`: no boxes, so the same as `_od`) | the upload itself (`a3178614...`) |
+| saves written | every request | 49 of 63, 28 of 34 (a dropped save warns, once per 10 s) |
+
+`analysisRoundTripMs` no longer contains the encode: with saving on the answer comes as fast as without. In
+this debug build one save takes ~1.7 s (two encodes with `save_ref_image` before, one now), longer than the
+~1.05 s between sequential requests, so the four-frame queue fills and some saves are dropped, each burst with
+one warning. A release build encodes far faster (not measured here: no release build on this machine for
+this phase), so how often it drops at camera rates is still to be measured.
+Before, the worker itself encoded, so at 0.3 req/s with `save_ref_image` the requests queued behind each other
+(p50 7.8 s). The queued frames add up to ~50 MB of RSS while the writer is behind.
+

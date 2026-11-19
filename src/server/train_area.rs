@@ -498,6 +498,9 @@ pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
         k.walking = true;
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
+            crate::backend::priority::lower_this_thread(
+                crate::backend::priority::ThreadRole::Background,
+            );
             let mut done = WalkDone(&dir, None);
             let start = Instant::now();
             let t = queue::tally(&dir);

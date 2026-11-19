@@ -417,16 +417,49 @@ async fn discard_raw_within(body: Body, limit: Duration) {
 // ---------------------------------------------------------------------------------------------
 // Detection endpoints
 
-/// Read one field whole, every chunk charged to a new charge of `budget` as it arrives.
-/// `Err(None)`: the budget had no room for a chunk (the rest of the field is left unread).
+/// The most a declared `Content-Length` reserves ahead of the bytes arriving. The length is the
+/// client's word: uncapped, one address's [`BODY_READS_PER_PEER`] reads declaring
+/// [`BODY_LIMIT`] each would allocate the whole upload budget (1 GiB) before sending a byte.
+/// 4 MiB covers a camera JPEG (2688x1520 is about 0.3-1.5 MB); a larger image grows its buffer
+/// past the reservation as its chunks arrive, as every image did before.
+const UPLOAD_RESERVE_CAP: usize = 4 * 1024 * 1024;
+
+/// Bytes to reserve for the image field from the request's declared `Content-Length` (the whole
+/// multipart body: the image plus a few hundred bytes of headers), at most
+/// [`UPLOAD_RESERVE_CAP`]. A length past [`BODY_LIMIT`] (refused by the read anyway) or none
+/// reserves nothing. Pure.
+fn upload_reserve(declared: Option<u64>) -> usize {
+    declared
+        .filter(|&n| n <= BODY_LIMIT as u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .map_or(0, |n| n.min(UPLOAD_RESERVE_CAP))
+}
+
+/// An empty buffer for a field, with room for `reserve` bytes when `charge` can take them now:
+/// the reservation is charged up front, so a declared length never allocates past the upload
+/// budget. Otherwise (no room, or nothing to reserve) the buffer grows as chunks arrive.
+fn reserved_buffer(charge: &mut body_budget::Charge, reserve: usize) -> BytesMut {
+    if reserve > 0 && charge.add(reserve) {
+        BytesMut::with_capacity(reserve)
+    } else {
+        BytesMut::new()
+    }
+}
+
+/// Read one field whole, every chunk charged to a new charge of `budget` as it arrives
+/// (beyond what `reserve`, a [`reserved_buffer`], charged up front: one allocation for the
+/// image instead of a buffer that doubles as it grows). `Err(None)`: the budget had no room for
+/// a chunk (the rest of the field is left unread).
 async fn read_charged(
     field: &mut axum::extract::multipart::Field<'_>,
     budget: &'static UploadBudget,
+    reserve: usize,
 ) -> Result<(BytesMut, body_budget::Charge), Option<MultipartError>> {
     let mut charge = budget.charge();
-    let mut buf = BytesMut::new();
+    let mut buf = reserved_buffer(&mut charge, reserve);
     while let Some(chunk) = field.chunk().await.map_err(Some)? {
-        if !charge.add(chunk.len()) {
+        let more = (buf.len() + chunk.len()).saturating_sub(charge.held());
+        if more > 0 && !charge.add(more) {
             return Err(None);
         }
         buf.extend_from_slice(&chunk);
@@ -462,8 +495,11 @@ async fn read_multipart(
     mut multipart: Multipart,
     budget: &'static UploadBudget,
     drains: Option<&Arc<Metrics>>,
+    declared: Option<u64>,
 ) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
     let mut req = VisionDetectionRequest::default();
+    // Reserved for the first image field only.
+    let mut reserve = upload_reserve(declared);
     let mut fields = HashMap::new();
     let mut got_image = false;
     loop {
@@ -478,7 +514,12 @@ async fn read_multipart(
         } else {
             "Invalid multipart body"
         };
-        let (buf, charge) = match read_charged(&mut field, budget).await {
+        let field_reserve = if name.as_deref() == Some("image") {
+            std::mem::take(&mut reserve)
+        } else {
+            0
+        };
+        let (buf, charge) = match read_charged(&mut field, budget, field_reserve).await {
             Ok(v) => v,
             Err(Some(e)) => return Err(BodyError::from_multipart(&e, what)),
             Err(None) => {
@@ -548,20 +589,23 @@ async fn parse_body_within(
         drains,
         ..
     } = upload;
+    let declared = declared_length(&request);
     match multipart_stream(request).await {
-        Ok(mp) => tokio::time::timeout(limit, read_multipart(mp, budget, drains.as_ref()))
-            .await
-            .unwrap_or_else(|_| {
-                Err(BodyError {
-                    reason: RejectReason::BodyTimeout,
-                    message: format!(
-                        "Request body not received within {} s; the client stalled or the \
-                         network is too slow, so retry the request.",
-                        limit.as_secs()
-                    ),
-                    status: StatusCode::OK,
+        Ok(mp) => {
+            tokio::time::timeout(limit, read_multipart(mp, budget, drains.as_ref(), declared))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(BodyError {
+                        reason: RejectReason::BodyTimeout,
+                        message: format!(
+                            "Request body not received within {} s; the client stalled or the \
+                             network is too slow, so retry the request.",
+                            limit.as_secs()
+                        ),
+                        status: StatusCode::OK,
+                    })
                 })
-            }),
+        }
         Err(NotMultipart { rejection, body }) => {
             discard_raw_within(body, limit.min(DISCARD_TIMEOUT)).await;
             Err(BodyError::bad_request(format!(
@@ -1989,6 +2033,74 @@ mod tests {
             .header(header::CONTENT_TYPE, MP)
             .body(body)
             .unwrap()
+    }
+
+    /// The declared `Content-Length` reserves the image buffer, charged up front; a length past
+    /// the budget or [`BODY_LIMIT`] (a lie, or simply too big) allocates nothing ahead.
+    #[tokio::test]
+    async fn content_length_reserves_within_the_limits() {
+        assert_eq!(upload_reserve(None), 0);
+        assert_eq!(upload_reserve(Some(0)), 0);
+        assert_eq!(upload_reserve(Some(300_000)), 300_000);
+        assert_eq!(
+            upload_reserve(Some(UPLOAD_RESERVE_CAP as u64)),
+            UPLOAD_RESERVE_CAP
+        );
+        // A lying or huge length reserves at most the cap: one address cannot allocate the
+        // budget with headers alone.
+        assert_eq!(upload_reserve(Some(BODY_LIMIT as u64)), UPLOAD_RESERVE_CAP);
+        const { assert!(BODY_READS_PER_PEER * UPLOAD_RESERVE_CAP <= body_budget::UPLOAD_BUDGET / 4) };
+        assert_eq!(upload_reserve(Some(BODY_LIMIT as u64 + 1)), 0);
+        assert_eq!(upload_reserve(Some(u64::MAX)), 0);
+
+        let budget = body_budget::leaked(1 << 20);
+        let mut charge = budget.charge();
+        let buf = reserved_buffer(&mut charge, 4096);
+        assert!(buf.capacity() >= 4096);
+        assert_eq!(
+            (charge.held(), budget.used()),
+            (4096, 4096),
+            "charged up front"
+        );
+        drop(charge);
+        let mut charge = budget.charge();
+        let buf = reserved_buffer(&mut charge, BODY_LIMIT);
+        assert_eq!(buf.capacity(), 0, "no room in the budget: nothing reserved");
+        assert_eq!((charge.held(), budget.used()), (0, 0));
+        drop(charge);
+
+        // End to end: an honest length holds its reservation while the image lives; the image
+        // is the same bytes either way.
+        let image = vec![5u8; 5000];
+        let body = image_body(&image);
+        let declared = body.len();
+        let req = Request::post("/")
+            .header(header::CONTENT_TYPE, MP)
+            .header(header::CONTENT_LENGTH, declared)
+            .body(Body::from(body))
+            .unwrap();
+        let mut upload = multipart_of(req).await;
+        upload.budget = budget;
+        let (req, _) = parse_detection_body(upload).await.unwrap();
+        assert_eq!(req.image_data, image);
+        assert_eq!(budget.used(), declared, "the reservation, charged");
+        drop(req);
+        assert_eq!(budget.used(), 0);
+
+        // A length larger than the budget (a lying client): read as before, chunk by chunk.
+        let small = body_budget::leaked(64 << 10);
+        let req = Request::post("/")
+            .header(header::CONTENT_TYPE, MP)
+            .header(header::CONTENT_LENGTH, BODY_LIMIT)
+            .body(Body::from(image_body(&image)))
+            .unwrap();
+        let mut upload = multipart_of(req).await;
+        upload.budget = small;
+        let (req, _) = parse_detection_body(upload).await.unwrap();
+        assert_eq!(req.image_data, image);
+        assert_eq!(small.used(), image.len(), "the image only");
+        drop(req);
+        assert_eq!(small.used(), 0);
     }
 
     /// M7: the image's bytes stay charged while any clone of them lives (the worker, the

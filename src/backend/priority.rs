@@ -25,6 +25,17 @@
 //! to at least [`CHILD_NICE`] between fork and exec on Unix (inherited by its threads and
 //! children).
 //!
+//! Background threads of the service (the review index, the review queue's walk workers, the
+//! Train area's tally, the storage measurement, retention) lower only themselves with
+//! [`lower_this_thread`] ([`ThreadRole::Background`]): Windows
+//! `SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL)`; Linux, where nice is per thread, the
+//! thread's own nice raised to at least [`BACKGROUND_NICE`] (`setpriority(PRIO_PROCESS, tid)`;
+//! never lowered, so a service under `Nice=15` keeps 15); other OSes nothing (macOS
+//! `setpriority` would move the whole process). Detection, prep, worker and HTTP threads are
+//! [`ThreadRole::Detection`] and never change. A lowered thread stays lowered until it exits (an
+//! unprivileged Linux thread cannot get its nice back), so only threads that do nothing else are
+//! lowered, never a pooled HTTP or blocking thread.
+//!
 //! Only the CPU scheduling priority changes: `PROCESS_MODE_BACKGROUND_BEGIN` / EcoQoS are
 //! deliberately not used because they also lower I/O and memory priority and change clocks,
 //! which skews timings.
@@ -219,9 +230,127 @@ pub fn lower_child(cmd: &mut std::process::Command) {
     }
 }
 
+/// Nice value (at least) of a background thread on Linux ([`lower_this_thread`]).
+pub const BACKGROUND_NICE: i32 = 10;
+
+/// What a thread does, for [`thread_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadRole {
+    /// Detection, prep, worker and HTTP threads: never lowered.
+    Detection,
+    /// A UI or index walk, retention, a measurement: below normal.
+    Background,
+}
+
+/// The operating systems [`thread_action`] tells apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Windows,
+    Linux,
+    /// macOS and every other OS: no per-thread priority call is used.
+    Other,
+}
+
+impl Os {
+    /// The OS this build runs on.
+    pub const fn current() -> Self {
+        if cfg!(windows) {
+            Os::Windows
+        } else if cfg!(target_os = "linux") {
+            Os::Linux
+        } else {
+            Os::Other
+        }
+    }
+}
+
+/// What [`lower_this_thread`] does to the calling thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadAction {
+    /// Nothing.
+    Keep,
+    /// `SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)`.
+    BelowNormal,
+    /// Raise the thread's nice to at least this value (never lower it).
+    NiceAtLeast(i32),
+}
+
+/// The action for a thread of `role` on `os` (pure): background threads below normal on Windows
+/// and Linux, everything else kept.
+pub const fn thread_action(os: Os, role: ThreadRole) -> ThreadAction {
+    match (os, role) {
+        (_, ThreadRole::Detection) | (Os::Other, _) => ThreadAction::Keep,
+        (Os::Windows, ThreadRole::Background) => ThreadAction::BelowNormal,
+        (Os::Linux, ThreadRole::Background) => ThreadAction::NiceAtLeast(BACKGROUND_NICE),
+    }
+}
+
+/// The nice value a thread at `current` gets for `action` (pure): `None` = no call.
+pub const fn nice_target(current: i32, action: ThreadAction) -> Option<i32> {
+    match action {
+        ThreadAction::NiceAtLeast(n) if current < n => Some(n),
+        _ => None,
+    }
+}
+
+/// Apply [`thread_action`] for `role` to the calling thread (best effort: a failure is logged at
+/// debug level and the thread keeps its priority). True when the priority changed. Call it first
+/// thing on a thread the caller spawned for background work; see the module docs.
+pub fn lower_this_thread(role: ThreadRole) -> bool {
+    let action = thread_action(Os::current(), role);
+    let changed = imp::apply_thread(action);
+    if let Err(e) = &changed {
+        tracing::debug!("could not lower the thread's priority ({e}); it keeps its priority");
+    }
+    changed.unwrap_or(false)
+}
+
+/// The calling thread's scheduling level, for tests: `GetThreadPriority` on Windows, the nice
+/// value on Linux, 0 elsewhere.
+#[cfg(all(test, windows))]
+pub(crate) fn thread_level() -> i32 {
+    imp::thread_priority()
+}
+
+/// See the Windows twin.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn thread_level() -> i32 {
+    // SAFETY: reads the calling thread's nice value (Linux: per thread).
+    unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+}
+
+/// See the Windows twin.
+#[cfg(all(test, not(any(windows, target_os = "linux"))))]
+pub(crate) fn thread_level() -> i32 {
+    0
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::Guard;
+    use super::{Guard, ThreadAction};
+
+    pub(super) fn apply_thread(action: ThreadAction) -> std::io::Result<bool> {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        if action != ThreadAction::BelowNormal {
+            return Ok(false);
+        }
+        // SAFETY: GetCurrentThread returns a pseudo-handle for the calling thread that needs no
+        // closing; SetThreadPriority only changes that thread's scheduling priority.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) }
+            .map(|()| true)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// The calling thread's priority (`GetThreadPriority`), for tests.
+    #[cfg(test)]
+    pub(super) fn thread_priority() -> i32 {
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        // SAFETY: reads the calling thread's priority through its pseudo-handle.
+        unsafe { GetThreadPriority(GetCurrentThread()) }
+    }
+
     use windows::Win32::System::Threading::{
         BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, PROCESS_CREATION_FLAGS,
         SetPriorityClass,
@@ -279,7 +408,37 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    use super::Guard;
+    use super::{Guard, ThreadAction};
+
+    pub(super) fn apply_thread(action: ThreadAction) -> std::io::Result<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: gettid has no preconditions and only returns the calling thread's id.
+            let tid = unsafe { libc::gettid() };
+            let who = libc::id_t::try_from(tid).map_err(std::io::Error::other)?;
+            // SAFETY: errno is thread-local; clearing it first tells a nice of -1 from an error.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: getpriority / setpriority with PRIO_PROCESS and a thread id read and change
+            // only that thread's nice value (Linux: nice is per thread).
+            let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, who) };
+            if current == -1 && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+                return Err(std::io::Error::last_os_error());
+            }
+            let Some(target) = super::nice_target(current, action) else {
+                return Ok(false);
+            };
+            // SAFETY: see above.
+            if unsafe { libc::setpriority(libc::PRIO_PROCESS, who, target) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = action;
+            Ok(false)
+        }
+    }
 
     /// Nice value of a low-priority benchmark.
     const NICE: libc::c_int = 10;
@@ -306,7 +465,11 @@ mod imp {
 
 #[cfg(not(any(windows, unix)))]
 mod imp {
-    use super::Guard;
+    use super::{Guard, ThreadAction};
+
+    pub(super) fn apply_thread(_action: ThreadAction) -> std::io::Result<bool> {
+        Ok(false)
+    }
 
     pub(super) fn lower() -> Guard {
         Guard::noop()
@@ -446,6 +609,79 @@ mod tests {
         // Up front is a no-op where the priority switches per device.
         drop(lower_up_front(true, true));
         assert_eq!(class(), before);
+    }
+
+    #[test]
+    fn thread_action_table() {
+        use ThreadAction::{BelowNormal, Keep, NiceAtLeast};
+        use ThreadRole::{Background, Detection};
+        let table = [
+            (Os::Windows, Detection, Keep),
+            (Os::Windows, Background, BelowNormal),
+            (Os::Linux, Detection, Keep),
+            (Os::Linux, Background, NiceAtLeast(BACKGROUND_NICE)),
+            (Os::Other, Detection, Keep),
+            (Os::Other, Background, Keep),
+        ];
+        for (os, role, want) in table {
+            assert_eq!(thread_action(os, role), want, "{os:?} {role:?}");
+        }
+        // Nice only ever goes up: a thread already at or above the target is left alone.
+        assert_eq!(nice_target(0, NiceAtLeast(10)), Some(10));
+        assert_eq!(nice_target(-5, NiceAtLeast(10)), Some(10));
+        assert_eq!(nice_target(10, NiceAtLeast(10)), None);
+        assert_eq!(nice_target(15, NiceAtLeast(10)), None);
+        assert_eq!(nice_target(0, Keep), None);
+        assert_eq!(nice_target(0, BelowNormal), None);
+        let here = Os::current();
+        #[cfg(windows)]
+        assert_eq!(here, Os::Windows);
+        #[cfg(target_os = "linux")]
+        assert_eq!(here, Os::Linux);
+        #[cfg(not(any(windows, target_os = "linux")))]
+        assert_eq!(here, Os::Other);
+    }
+
+    /// A background thread is lowered, a detection thread and the spawning thread are not.
+    #[test]
+    fn only_the_calling_background_thread_is_lowered() {
+        let level = thread_level;
+        let before = level();
+        let (detection, background) = std::thread::spawn(move || {
+            let d = std::thread::spawn(move || {
+                let changed = lower_this_thread(ThreadRole::Detection);
+                (changed, level())
+            })
+            .join()
+            .unwrap();
+            let b = std::thread::spawn(move || {
+                let changed = lower_this_thread(ThreadRole::Background);
+                (changed, level())
+            })
+            .join()
+            .unwrap();
+            (d, b)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            detection,
+            (false, before),
+            "detection threads keep their priority"
+        );
+        assert_eq!(level(), before, "the spawning thread is untouched");
+        #[cfg(windows)]
+        assert_eq!(
+            background,
+            (
+                true,
+                windows::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL.0
+            )
+        );
+        #[cfg(target_os = "linux")]
+        assert!(background.1 >= BACKGROUND_NICE, "{background:?}");
+        #[cfg(not(any(windows, target_os = "linux")))]
+        assert_eq!(background, (false, before));
     }
 
     #[cfg(unix)]

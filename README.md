@@ -378,8 +378,8 @@ it; every key can also be set in the file.
 | `log_timezone` | retired | Replaced by `timezone`. Read from old files only: when `timezone` is absent, its value becomes `timezone`, except `"utc"` (the old default, which every save wrote), which means `"local"`. Dropped from the file at the next save. UI: no |
 | `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
 | `log_format` | `"text"` | Format of the log files under `log_path`: `"text"` or `"json"` (one JSON object per line, for log shippers); the console stays text. Applies: process restart. UI: no |
-| `save_image_path` | `null` | Save annotated detections here. Path. Applies: at once. UI: yes |
-| `save_ref_image` | `false` | Also save the unannotated image. Boolean. Applies: at once. UI: yes |
+| `save_image_path` | `null` | Save annotated detections here (`<name>_od.jpg`, written after the answer went out; when images arrive faster than they are written, a few are skipped with a warning). Path. Applies: at once. UI: yes |
+| `save_ref_image` | `false` | Also save the unannotated image (`<name>.jpg`: the uploaded JPEG as it came, other formats as a JPEG). Boolean. Applies: at once. UI: yes |
 | `save_image_max_age_days` | `30` | Delete saved images (`.jpg`/`.jpeg`/`.png` directly in `save_image_path`) older than this many days, 0 = keep; checked every 10 minutes. Integer 0-3650. Applies: at once. UI: yes |
 | `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0 = unlimited. Integer 0-1000000. Applies: at once. UI: yes |
 | `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Integer 1000-1000000000. Applies: at once. UI: no |
