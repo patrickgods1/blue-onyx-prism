@@ -1,0 +1,172 @@
+--- a/scripts/autolabel.py
++++ b/scripts/autolabel.py
+@@ -33,9 +33,9 @@
+ 
+ Progress: one stdout line `@autolabel {json}` per event (`start`, `model`, `frame`, `done`,
+ `self_check`, `self_test`); everything else is log output. Every finished frame is flushed to
+-`--out` at once, so a stopped run keeps them. --prefetch decodes the next frames on a thread, and
+-ends each frame (WBF unless the VLM needs it first, SigLIP, its line, its event) on another while the
+-next one is on the GPU; the output is the same without it. The
++`--out` at once, so a stopped run keeps them. --prefetch decodes the next frames (and builds SAM 3's
++`pixel_values`) on a thread, and ends each frame (WBF unless the VLM needs it first, SigLIP, its line,
++its event) on another while the next one is on the GPU; the output is the same without it. The
+ service runs this file (embedded in the binary) in its training environment
+ (<data root>/tools/train-env), offline, with weights it downloaded and SHA-256 checked.
+ 
+@@ -211,6 +211,20 @@
+     return None
+ 
+ 
++SAM3_OUTPUTS = ("pred_logits", "pred_boxes", "presence_logits")
++
++
++def nonfinite_output(phrases: list, flags: list):
++    """The first `(phrase, output name)` whose output is not all finite, None when every one is:
++    `flags[i][k]` says whether output `SAM3_OUTPUTS[k]` of `phrases[i]` is (`Sam3.check`). Phrase
++    order, then output order, as a check after each phrase would find it."""
++    for phrase, row in zip(phrases, flags):
++        for name, ok in zip(SAM3_OUTPUTS, row):
++            if not ok:
++                return phrase, name
++    return None
++
++
+ def wbf(per_model: dict, weights: dict, iou_thr: float, participants: dict) -> list:
+     """Weighted boxes fusion (Solovyev et al. 2021, `conf_type="avg"`) of `per_model`
+     ({model: [{"label", "bbox", "score"}]}), per label.
+@@ -653,6 +667,10 @@
+     finally:
+         globals()["log"] = real_log
+     check(done == [7] and not f.thread.is_alive(), f"close finishes queued work {done}")
++    # SAM 3's NaN check reports the first non-finite output as a check after each phrase would.
++    check(nonfinite_output(["a", "b"], [[True, True, True], [True, True, True]]) is None, "all finite")
++    check(nonfinite_output(["a", "b", "c"], [[True, True, True], [True, False, False], [False, True, True]])
++          == ("b", "pred_boxes"), "first non-finite")
+     # The overlap check: crops to frame coordinates, one line per crop, an unreadable frame.
+     check(clamp_frame([-3.0, 2.0, 120.0, 50.0], 100, 40) == [0.0, 2.0, 100.0, 40.0], "clamp_frame")
+     check(clamp_frame([99.5, 0, 120, 10], 100, 40) is None, "clamp_frame under a pixel")
+@@ -904,36 +922,55 @@
+             if device.startswith("cuda"):
+                 torch.cuda.empty_cache()
+ 
+-    def check(self, outputs, phrase: str) -> None:
++    def check(self, outs: list) -> None:
+         """A NaN compares false with every threshold, so without this a broken run would label frames
+-        as empty and mark them done."""
+-        for name in ("pred_logits", "pred_boxes", "presence_logits"):
+-            v = getattr(outputs, name)
+-            if v is not None and not self.torch.isfinite(v).all():
+-                fail(f"SAM 3's {name} for {phrase!r} is NaN or infinite in float32 on {self.device}, which "
+-                     "points at the GPU (a reset, overheating, a driver problem) rather than this frame. "
+-                     "Check the GPU and run it again.")
++        as empty and mark them done. `outs`: the frame's `(phrase, pred_logits, pred_boxes,
++        presence_logits)`, every phrase queued on the device first: one device-to-host copy for the
++        whole frame (`nonfinite_output`) instead of a wait after each phrase, and still before any
++        box of the frame is read."""
++        torch = self.torch
++        yes = torch.ones((), dtype=torch.bool, device=self.device)
++        flags = torch.stack([torch.stack([yes if v is None else torch.isfinite(v).all() for v in o[1:]])
++                             for o in outs]).tolist()
++        bad = nonfinite_output([o[0] for o in outs], flags)
++        if bad is not None:
++            phrase, name = bad
++            fail(f"SAM 3's {name} for {phrase!r} is NaN or infinite in float32 on {self.device}, which "
++                 "points at the GPU (a reset, overheating, a driver problem) rather than this frame. "
++                 "Check the GPU and run it again.")
++
++    def pixels(self, image):
++        """The processor's `pixel_values` of `image` on the CPU: `FrameReader`'s `prepare` builds
++        them on the prefetch thread while the GPU is busy with the frame before."""
++        return self.processor(images=image, return_tensors="pt")["pixel_values"]
+ 
+-    def detect(self, image, phrase_to_class: dict) -> list:
++    def detect(self, image, phrase_to_class: dict, pixel=None) -> list:
++        """The frame's boxes. `pixel`: `pixels(image)` when it was built ahead, else built here."""
+         torch = self.torch
+         w, h = image.size
+-        pixel = self.processor(images=image, return_tensors="pt")["pixel_values"].to(self.device, dtype=torch.float32)
++        if pixel is None:
++            pixel = self.pixels(image)
++        pixel = pixel.to(self.device, dtype=torch.float32)
+         found = []
+         with torch.no_grad():
+             vision = self.model.get_vision_features(pixel_values=pixel)
+-            for phrase, cls in phrase_to_class.items():
++            outs = []
++            for phrase in phrase_to_class:
+                 outputs = self.model(vision_embeds=vision, text_embeds=self.embeds[phrase],
+                                      attention_mask=self.masks[phrase])
+-                self.check(outputs, phrase)
++                outs.append((phrase, outputs.pred_logits, outputs.pred_boxes, outputs.presence_logits))
++                del outputs
++            del vision
++            self.check(outs)
++            for (phrase, logits, boxes, presence), cls in zip(outs, phrase_to_class.values()):
+                 res = self.processor.post_process_object_detection(types.SimpleNamespace(
+-                    pred_logits=outputs.pred_logits.float(), pred_boxes=outputs.pred_boxes.float(),
+-                    presence_logits=None if outputs.presence_logits is None else outputs.presence_logits.float(),
++                    pred_logits=logits.float(), pred_boxes=boxes.float(),
++                    presence_logits=None if presence is None else presence.float(),
+                 ), threshold=self.threshold, target_sizes=[(h, w)])[0]
+                 for box, score in zip(res["boxes"].tolist(), res["scores"].tolist()):
+                     b = clamp_box(box, w, h)
+                     if b is not None:
+                         found.append({"label": cls, "bbox": b, "score": float(score)})
+-                del outputs
+         return nms(found, self.nms_iou)
+ 
+ 
+@@ -1179,7 +1216,7 @@
+     (image None and the exception when it cannot be read). `prepare(frame, image)`, when given,
+     runs right after the decode and its result is `prepared` (None without it or for an unreadable
+     frame; `PrepareFailed` when it raised, see `unwrap`): the CPU work of a frame that does not
+-    need the GPU (the overlap check's crops). With `prefetch`, a thread
++    need the GPU (SAM 3's `pixel_values`, the overlap check's crops). With `prefetch`, a thread
+     does both up to two frames ahead; leaving the `with` block (or exhausting it) stops the
+     thread."""
+ 
+@@ -1593,9 +1630,12 @@
+     vlm_state = {}
+     if vlm is not None and (a.vlm_batch > 1 or a.vlm_min_score > 0):
+         log(f"VLM: {a.vlm_batch} crop(s) per call, skipped below fused score {a.vlm_min_score}")
+-    # With --prefetch, the reader thread decodes the next frames and the finisher thread ends frame i (`finish`) while frame i+1 is on the GPU; without it all
++    # With --prefetch, the reader thread decodes the next frames (and builds SAM 3's pixel_values)
++    # and the finisher thread ends frame i (`finish`) while frame i+1 is on the GPU; without it all
+     # of it runs here, one frame after another. The output is the same either way.
+-    reader = FrameReader(frames, a.prefetch)
++    sam3 = labelers.get("sam3")
++    prepare = (lambda fr, image: sam3.pixels(image)) if sam3 is not None else None
++    reader = FrameReader(frames, a.prefetch, prepare=prepare)
+     finisher = Finisher(a.prefetch)
+ 
+     def unreadable(i: int, fr: dict, e: BaseException) -> None:
+@@ -1623,15 +1663,15 @@
+ 
+     with open(a.out, "w", encoding="utf-8") as out, reader:
+         try:
+-            for i, fr, image, e, _ in reader:
++            for i, fr, image, e, prepared in reader:
+                 if image is None:
+                     finisher.put(functools.partial(unreadable, i, fr, e))
+                     continue
+                 ms = {}
+                 per = {}
+-                if "sam3" in labelers:
++                if sam3 is not None:
+                     t = time.time()
+-                    per["sam3"] = labelers["sam3"].detect(image, phrase_to_class)
++                    per["sam3"] = sam3.detect(image, phrase_to_class, unwrap(prepared))
+                     ms["sam3"] = round((time.time() - t) * 1000)
+                 if "gdino" in labelers:
+                     t = time.time()
+--- a/docs/TRAINING.md
++++ b/docs/TRAINING.md
+@@ -1441,7 +1441,7 @@
+ |---|---|---|---|
+ | Batch the VLM check: up to 8 of a frame's boxes per Qwen3-VL call | on | `--no-vlm-batch` | `--vlm-batch 8` (off: `1`) |
+ | Skip the VLM check below a fused score (0 < x <= 1); 2% of those boxes are asked anyway, to audit the cutoff | on, 0.15 | `--vlm-min-score X`, `--vlm-all-boxes` | `--vlm-min-score X --vlm-sample 0.02` |
+-| Load the next frame on a background thread while the GPU works; finish the frame before (WBF, SigLIP, the output line) on another | on | `--no-prefetch` | `--prefetch` |
++| Load the next frame on a background thread while the GPU works (and SAM 3's `pixel_values`); finish the frame before (WBF, SigLIP, the output line) on another | on | `--no-prefetch` | `--prefetch` |
+ | Keep finished frames if cancelled (both modes) | on | `--discard-on-cancel` | - |
+ | GPU of the labelers (shown with more than one usable NVIDIA GPU) | automatic (most VRAM) | `--gpu cuda:N` | `--device cuda:N` |
+ 
