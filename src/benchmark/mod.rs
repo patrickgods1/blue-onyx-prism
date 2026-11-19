@@ -440,7 +440,9 @@ pub struct RunResult {
     /// read + reshape + compile + request creation wall time.
     #[serde(default)]
     pub compile_ms: f64,
-    /// "disabled", "hit" (no new cache file written), "miss" (a blob was written) or "unknown".
+    /// "disabled", "hit" (no new file in the device's cache folder), "miss" (a blob was written
+    /// there), "unknown" (that folder is empty) or "none" (a runtime without a compile cache:
+    /// ORT CPU, CUDA, DirectML); `run::cache_status`.
     #[serde(default)]
     pub cache: String,
     #[serde(default)]

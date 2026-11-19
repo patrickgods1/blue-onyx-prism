@@ -96,11 +96,113 @@ pub(super) struct Sample {
     pub(super) eval: Vec<Prediction>,
 }
 
-/// Files directly inside `dir` (the compiled-blob cache is flat).
+/// Folder levels below the cache root [`cache_files`] lists: OpenVINO blobs are one level down
+/// (`openvino-<device>-<precision>/<hash>.blob`), ORT's CoreML model cache a few more
+/// (`coreml/<COREML_CACHE_KEY>/...`).
+const CACHE_DEPTH: usize = 4;
+
+/// Every file under `dir` (down to [`CACHE_DEPTH`] folders), as paths relative to it.
 pub(super) fn cache_files(dir: &Path) -> std::collections::HashSet<PathBuf> {
-    std::fs::read_dir(dir)
-        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
-        .unwrap_or_default()
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut std::collections::HashSet<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.filter_map(|e| e.ok()) {
+            let path = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => {
+                    if depth < CACHE_DEPTH {
+                        walk(root, &path, depth + 1, out);
+                    }
+                }
+                Ok(_) => {
+                    if let Ok(rel) = path.strip_prefix(root) {
+                        out.insert(rel.to_path_buf());
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(dir, dir, 0, &mut out);
+    out
+}
+
+/// The folders under the cache root a compile on one device writes to ([`cache_scope`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CacheScope {
+    /// Every folder whose name starts with this (`openvino-cpu-`).
+    Prefix(String),
+    /// This folder (`tensorrt`, `coreml`).
+    Folder(&'static str),
+}
+
+impl CacheScope {
+    /// Whether `rel` (a file path relative to the cache root) is inside the scope's folders.
+    pub(super) fn holds(&self, rel: &Path) -> bool {
+        let mut parts = rel.components();
+        let Some(first) = parts.next().and_then(|c| c.as_os_str().to_str()) else {
+            return false;
+        };
+        // A file directly in the root is in no folder.
+        if parts.next().is_none() {
+            return false;
+        }
+        match self {
+            CacheScope::Prefix(p) => first.starts_with(p.as_str()),
+            CacheScope::Folder(f) => first == *f,
+        }
+    }
+}
+
+/// The cache folders a compile on `device` writes to; None for a runtime that keeps no compile
+/// cache (ORT CPU, CUDA, DirectML).
+///
+/// - OpenVINO: `openvino-<class>-<precision>` ([`crate::backend::device::ov_cache_dir`], set
+///   per compile from the precision the plugin reports at that moment). Every precision folder
+///   of the device's class counts: the precision is not known out here, and the CPU blob hash
+///   ignores it, so the folder is all that tells a CPU f32 blob from a bf16 one.
+/// - ORT TensorRT: `tensorrt/` (engines, timing cache). ORT CoreML: `coreml/` (the graph
+///   rewrite's copies at its top, the CoreML model cache below).
+pub(super) fn cache_scope(device: &crate::backend::device::DeviceInfo) -> Option<CacheScope> {
+    use crate::backend::spec::{self, Target};
+    match device.runtime {
+        Runtime::OpenVino => {
+            // The folder name with an empty precision: `openvino-<class>-` (the same cleaning).
+            let probe = crate::backend::device::ov_cache_dir(Path::new(""), &device.actual, "x");
+            let name = probe.to_string_lossy().into_owned();
+            let prefix = name.strip_suffix('x').unwrap_or(&name).to_string();
+            Some(CacheScope::Prefix(prefix))
+        }
+        Runtime::Ort => match spec::parse(&device.spec).ok()?.device()?.target {
+            Target::TensorRt => Some(CacheScope::Folder("tensorrt")),
+            Target::CoreMl => Some(CacheScope::Folder("coreml")),
+            _ => None,
+        },
+    }
+}
+
+/// The cache result of a compile on `device` from the files under the cache root before
+/// ([`cache_files`]) and after it: "miss" (a file appeared in the device's cache folder,
+/// [`cache_scope`]), "hit" (that folder holds files and none is new), "unknown" (it holds none:
+/// caching off or failing) or "none" (the runtime keeps no compile cache).
+pub(super) fn cache_status(
+    before: &std::collections::HashSet<PathBuf>,
+    after: &std::collections::HashSet<PathBuf>,
+    device: &crate::backend::device::DeviceInfo,
+) -> String {
+    let Some(mine) = cache_scope(device) else {
+        return "none".into();
+    };
+    let mut any = false;
+    for f in after.iter().filter(|f| mine.holds(f)) {
+        if !before.contains(f) {
+            return "miss".into();
+        }
+        any = true;
+    }
+    if any { "hit" } else { "unknown" }.into()
 }
 
 pub(super) fn ms(d: Duration) -> f64 {
@@ -245,14 +347,7 @@ impl<'a> Bench<'a> {
         let cache = match (self.cache_dir, before) {
             (None, _) | (_, None) => "disabled".to_string(),
             (Some(dir), Some(before)) => {
-                let after = cache_files(dir);
-                if after.difference(&before).next().is_some() {
-                    "miss".into()
-                } else if after.is_empty() {
-                    "unknown".into()
-                } else {
-                    "hit".into()
-                }
+                cache_status(&before, &cache_files(dir), &backend.info().device)
             }
         };
         let verifier = match job.variant.as_ref().and_then(|v| v.verify.as_ref()) {
@@ -795,6 +890,88 @@ pub(super) fn image_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn device(runtime: Runtime, actual: &str, spec: &str) -> crate::backend::device::DeviceInfo {
+        crate::backend::device::DeviceInfo {
+            actual: actual.into(),
+            runtime,
+            spec: spec.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The cache status looks in the folder the compile writes to (`openvino-<class>-<prec>`,
+    /// `tensorrt`, `coreml`), not the root: a new blob there is a miss, an unchanged folder a
+    /// hit, one of another device or the root changes nothing, an empty one is unknown and a
+    /// runtime without a cache says so.
+    #[test]
+    fn cache_status_watches_the_compiles_own_folder() {
+        let root = std::env::temp_dir().join(format!("bop-cache-{}", uuid::Uuid::new_v4()));
+        let cpu = crate::backend::device::ov_cache_dir(&root, "CPU", "f32");
+        let gpu = crate::backend::device::ov_cache_dir(&root, "GPU.1", "f16");
+        std::fs::create_dir_all(&cpu).unwrap();
+        std::fs::create_dir_all(&gpu).unwrap();
+        let ov_cpu = device(Runtime::OpenVino, "CPU", "openvino:cpu");
+        let ov_gpu = device(Runtime::OpenVino, "GPU.0", "openvino:gpu.0");
+        assert_eq!(
+            cache_scope(&ov_gpu),
+            Some(CacheScope::Prefix("openvino-gpu-".into()))
+        );
+        assert_eq!(
+            cache_scope(&ov_cpu),
+            Some(CacheScope::Prefix("openvino-cpu-".into()))
+        );
+        // An empty folder: caching off or failing.
+        let before = cache_files(&root);
+        assert_eq!(
+            cache_status(&before, &cache_files(&root), &ov_cpu),
+            "unknown"
+        );
+        // The first compile writes a blob into the subfolder: a miss (the old flat listing of
+        // the root saw only the folders and called it a hit).
+        let before = cache_files(&root);
+        std::fs::write(cpu.join("123.blob"), b"x").unwrap();
+        let after = cache_files(&root);
+        assert!(after.contains(&Path::new(cpu.file_name().unwrap()).join("123.blob")));
+        assert_eq!(cache_status(&before, &after, &ov_cpu), "miss");
+        // Unchanged: a hit.
+        let before = cache_files(&root);
+        assert_eq!(cache_status(&before, &cache_files(&root), &ov_cpu), "hit");
+        // A blob of another precision of the same class is this compile's (CPU's hash ignores
+        // the precision; the folder is chosen by the plugin's hint at compile time).
+        let bf16 = crate::backend::device::ov_cache_dir(&root, "CPU", "bf16");
+        std::fs::create_dir_all(&bf16).unwrap();
+        std::fs::write(bf16.join("456.blob"), b"x").unwrap();
+        assert_eq!(cache_status(&before, &cache_files(&root), &ov_cpu), "miss");
+        // Another device's folder or a file at the root are not (`GPU.1`'s folder is every
+        // GPU's: the class).
+        let before = cache_files(&root);
+        std::fs::write(gpu.join("789.blob"), b"x").unwrap();
+        std::fs::write(root.join("stray.blob"), b"x").unwrap();
+        let after = cache_files(&root);
+        assert_eq!(cache_status(&before, &after, &ov_cpu), "hit");
+        assert_eq!(cache_status(&before, &after, &ov_gpu), "miss");
+        // ORT: TensorRT engines and the CoreML cache (nested) in their folders; CPU / CUDA /
+        // DirectML keep none.
+        let trt = device(Runtime::Ort, "TensorRT", "ort:tensorrt");
+        let coreml = device(Runtime::Ort, "CoreML", "ort:coreml");
+        let before = cache_files(&root);
+        assert_eq!(cache_status(&before, &before, &trt), "unknown");
+        std::fs::create_dir_all(root.join("tensorrt")).unwrap();
+        std::fs::write(root.join("tensorrt/engine.engine"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("coreml/key/model.mlmodelc")).unwrap();
+        std::fs::write(root.join("coreml/key/model.mlmodelc/weights.bin"), b"x").unwrap();
+        let after = cache_files(&root);
+        assert_eq!(cache_status(&before, &after, &trt), "miss");
+        assert_eq!(cache_status(&before, &after, &coreml), "miss");
+        assert_eq!(cache_status(&after, &after, &coreml), "hit");
+        assert_eq!(cache_status(&after, &after, &ov_cpu), "hit");
+        for spec in ["ort:cpu", "ort:cuda", "ort:directml"] {
+            let d = device(Runtime::Ort, "x", spec);
+            assert_eq!(cache_status(&before, &after, &d), "none", "{spec}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn timings_record_overall_and_by_bucket() {
