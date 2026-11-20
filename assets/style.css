@@ -874,8 +874,12 @@ main:has(#review), main:has(> nav.train-tabs > a.active[href="/train/review"]) {
    never paints at one size and jumps to another while the page loads. */
 #review:not(.rv-ready) > .review-grid { visibility: hidden; }
 #review > details.help, #review > details.rv-bulk, #review > details.rv-filters-card { max-width: 75rem; }
-.review-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); gap: 1rem; align-items: start; }
-.review-grid.rv-wide { grid-template-columns: minmax(0, 1fr) minmax(360px, 520px); }
+/* Two columns: the editor, then the side panel at the width its handle sets (review.js
+   `--rv-side-w`, per viewer), held between 280 px and 60% of the grid, so a smaller window never
+   squeezes the editor and no script follows the window's size. */
+.review-grid { display: grid; grid-template-columns: minmax(0, 1fr) clamp(280px, var(--rv-side-w, 400px), 60%); gap: 1rem; align-items: start; }
+/* While the handle is dragged nothing gets selected. */
+.review-grid.rv-resizing { -webkit-user-select: none; user-select: none; cursor: col-resize; }
 /* The side panel stays in view while the page scrolls, at the window's height: its body scrolls
    (the box list scrolls inside it first), its foot (message, actions) is pinned to its bottom. */
 .review-side { position: sticky; top: 0.5rem; height: calc(100vh - 1rem); height: calc(100dvh - 1rem); overflow: hidden; display: flex; flex-direction: column; padding: 0; }
@@ -884,6 +888,14 @@ main:has(#review), main:has(> nav.train-tabs > a.active[href="/train/review"]) {
 .rv-side-body > .review-boxes { flex: 1 1 0; min-height: 8rem; max-height: none; margin: 0.3rem 0; }
 .rv-side-body > label.check { margin: 0.2rem 0; }
 .rv-side-foot { flex: none; padding: 0.4rem 0.9rem 0.7rem; border-top: 1px solid var(--border); }
+/* The panel's width handle (review.js): a strip over its left edge, with an accent line while it
+   has the focus, is dragged, or is under the mouse. One column has none. */
+/* `scroll-margin: 0`: the `[id]` rule's top margin would scroll the page when it takes the focus. */
+.rv-side-resize { position: absolute; z-index: 3; left: 0; top: 0; bottom: 0; width: 8px; cursor: col-resize; touch-action: none; scroll-margin: 0; }
+.rv-side-resize::after { content: ""; position: absolute; left: 1px; top: 0.5rem; bottom: 0.5rem; width: 3px; border-radius: 2px; background: transparent; }
+.rv-side-resize:focus-visible { outline: none; }
+.rv-side-resize:focus-visible::after, .review-grid.rv-resizing .rv-side-resize::after { background: var(--accent); }
+@media (hover: hover) { .rv-side-resize:hover::after { background: var(--accent); } }
 /* The message slot: one line, always there (the full text in its title), green for a save, red for
    an error; it dims after a few seconds (review.js say) without moving anything. A message its line
    cuts opens (`rv-msg-open`): a copy of the line (`.rv-msg-full`), out of the flow, grows upward
@@ -898,7 +910,7 @@ main:has(#review), main:has(> nav.train-tabs > a.active[href="/train/review"]) {
 #rv-msg > .rv-msg-full .rv-msg-text { overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
 #rv-msg button.small { flex: none; margin: 0; padding: 0 0.4rem; font-size: 0.75rem; }
 @media (max-width: 900px) {
-  .review-grid, .review-grid.rv-wide { grid-template-columns: minmax(0, 1fr); }
+  .review-grid { grid-template-columns: minmax(0, 1fr); }
   .review-side { position: static; height: auto; overflow: visible; }
   .rv-side-body, .rv-side-foot { display: contents; }
   .review-side .review-boxes { flex: none; max-height: 40vh; max-height: 40dvh; }
@@ -936,8 +948,8 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .review-side.card { margin: 0; min-width: 0; }
 .rv-side-body > label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; color: var(--muted); }
 .rv-side-body > label.check { flex-direction: row; align-items: center; gap: 0.5rem; color: var(--fg); margin: 0.4rem 0; }
-/* ---- The HUD (over the frame on one column, at the top of the side panel on two): every value in its own fixed slot (review.js setHud) ---- */
-.rv-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 0.75rem; }
+/* ---- The HUD over the frame (one column: two rows; two columns: one row, the progress first): every value in its own fixed slot (review.js setHud) ---- */
+.rv-head { min-width: 0; }
 .rv-hud { display: grid; grid-template-columns: 6.5rem 9.5rem 6.5rem minmax(0, 8rem) 5rem 6.5rem 6.5rem minmax(0, 9.5rem) 5.5rem; column-gap: 0.5rem; align-items: center; height: 2.5rem; min-width: 0; font-size: 0.88rem; font-variant-numeric: tabular-nums; }
 .rv-slot { display: flex; align-items: center; min-width: 0; height: 100%; overflow: hidden; white-space: nowrap; }
 .rv-slot > span, .rv-slot > button { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -954,7 +966,7 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-hud-scene .sc { display: inline-block; width: 1.2em; text-align: center; }
 .rv-hud .rv-pick { font-size: 0.75rem; padding: 0 0.45rem; border: 1px solid var(--likely-fg); border-radius: 4px; color: var(--likely-fg); background: var(--likely-bg); text-decoration: none; letter-spacing: 0.03em; text-transform: uppercase; line-height: 1.6; }
 .rv-hud-details button.small, .rv-tools button.small { width: 100%; min-height: 32px; margin: 0; padding-top: 0.1rem; padding-bottom: 0.1rem; }
-/* The view buttons: fixed slots too (review.js shows and hides them with `visibility`). */
+/* The view buttons, under the frame: fixed slots too (review.js shows and hides them with `visibility`). */
 .rv-tools { display: flex; align-items: center; gap: 0.4rem; height: 2.5rem; }
 .rv-tools .rv-slot { flex: none; }
 .rv-tool-zoom { width: 3rem; justify-content: flex-end; }
@@ -976,17 +988,61 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
 .rv-details-pace { margin-top: 0.3rem; }
 .rv-details-pace:empty { display: none; }
 .review-meta { font-size: 0.85rem; margin: 0 0 0.4rem; overflow-wrap: anywhere; }
-/* Two columns: the tool row and the frame box fill the window; the page lands every frame with the
-   grid's top at the same place (review.js revealFrame). */
+/* Two columns: the HUD row, the frame box and the tool row fill the window; the page lands every
+   frame with the grid's top at the same place (review.js revealFrame). */
 @media (min-width: 901px) {
   .review-stage { position: relative; display: flex; flex-direction: column; height: calc(100vh - 1rem); height: calc(100dvh - 1rem); container: rv-stage / inline-size; }
   .review-stage:has(#rv-none:not([hidden])) { height: auto; }
-  .rv-head { flex: none; display: block; margin-bottom: 0.4rem; }
-  .rv-frame-box { flex: 1 1 0; }
-  /* The tool row is one fixed-height row at every width (never wraps): Zoom to box and View always
-     stay; the slots give way in order of least use: the - / + buttons (the wheel and View zoom too),
-     then the zoom %, then Image, Draw and Redraw shrink with an ellipsis. */
-  .rv-tools { flex-wrap: nowrap; }
+  .rv-head { flex: none; margin-bottom: 0.4rem; }
+  /* The frame box: the height the tallest frame seen needs at the editor's width (`--rv-stage-ar`,
+     review.js sizeStage), shrunk to the room the window leaves, so the tool row sits right under
+     the frame and any spare height goes under the tool row. */
+  .rv-frame-box { flex: 0 1 calc(100cqw / var(--rv-stage-ar, 1.778)); }
+  /* The HUD, one row: the progress (the queue's place, the frame's box meter, what is left to
+     decide), then the frame's facts on the right (camera, scene, time, random pick, pace,
+     Details). Every slot keeps its size, so a value changes in place and nothing moves. */
+  .rv-hud { display: flex; gap: 0.5rem; }
+  .rv-hud > .rv-slot { flex: none; }
+  .rv-hud-pos { width: 9rem; }
+  .rv-hud-progress { width: 13rem; }
+  .rv-hud-meter { width: 6rem; height: 0.5rem; }
+  .rv-hud-todo { width: 7rem; margin-right: auto; }
+  .rv-hud-camera { width: 8rem; }
+  .rv-hud-scene { width: 4rem; }
+  .rv-hud-time { width: 6.5rem; }
+  .rv-hud-pick { width: 6.5rem; }
+  .rv-hud-pace { width: 9.5rem; }
+  .rv-hud-details { width: 5.5rem; }
+  /* A narrower editor: the facts make way, pace first, then time, scene and camera (all of them
+     are in Details too); then the box meter shortens and loses "done", and at last the queue's
+     place and the meter's slot shrink with an ellipsis. The progress never goes. Each step is the
+     row's width with the slots it still has (73rem: 30 progress, 42.5 facts, 0.5 between; then
+     each slot that goes takes its width and a gap with it). */
+  @container rv-stage (max-width: 73rem) {
+    .rv-hud-pace { display: none; }
+  }
+  @container rv-stage (max-width: 63rem) {
+    .rv-hud-time { display: none; }
+  }
+  @container rv-stage (max-width: 56rem) {
+    .rv-hud-scene { display: none; }
+  }
+  @container rv-stage (max-width: 51.5rem) {
+    .rv-hud-camera { display: none; }
+  }
+  @container rv-stage (max-width: 43rem) {
+    .rv-hud-progress { width: 6.5rem; }
+    .rv-hud-meter { width: 2.6rem; }
+    .rv-hud-unit { display: none; }
+  }
+  @container rv-stage (max-width: 36.5rem) {
+    .rv-hud > .rv-hud-pos, .rv-hud > .rv-hud-progress { flex: 0 1 auto; min-width: 0; }
+    .rv-hud-pos { font-size: 1.15rem; }
+  }
+  /* The tool row, under the frame, is one fixed-height row at every width (never wraps): Zoom to box
+     and View always stay; the slots give way in order of least use: the - / + buttons (the wheel
+     and View zoom too), then the zoom %, then Image, Draw and Redraw shrink with an ellipsis. */
+  .rv-tools { flex: none; flex-wrap: nowrap; margin-top: 0.4rem; }
   .rv-tools .rv-tool-image { flex: 0 1 11.5rem; min-width: 0; }
   .rv-tools .rv-tool-draw { flex: 0 1 4.5rem; min-width: 0; }
   .rv-tools .rv-tool-redraw { flex: 0 1 5.5rem; min-width: 0; }
@@ -996,23 +1052,16 @@ details.rv-panel-opts > label { display: flex; flex-direction: column; gap: 0.25
   @container rv-stage (max-width: 450px) {
     .rv-tool-zoom { display: none; }
   }
-  /* The side panel's top: the frame info (review.js moves .rv-hud here) over the overview of the
-     whole frame (#rv-ov-slot, the canvas moved in by review.js in the side layout). Slots keep their
-     size, so a value changes in place. The corner layout leaves the slot empty (no space). */
+  /* The side panel's top: the overview of the whole frame (#rv-ov-slot, the canvas moved in by
+     review.js in the side layout). The corner layout leaves the slot empty (no space). */
   .rv-side-top { flex: none; margin-bottom: 0.4rem; }
-  .rv-side-top .rv-hud { grid-template-columns: 5.2rem minmax(0, 1fr) 5.2rem 5.2rem; grid-template-rows: 1.9rem 1.5rem 1.7rem; grid-template-areas: "pos pos progress progress" "camera scene scene time" "todo pick pace details"; column-gap: 0.4rem; height: auto; margin-bottom: 0.4rem; font-size: 0.82rem; }
-  .rv-side-top .rv-hud-pos { grid-area: pos; font-size: 1.15rem; }
-  .rv-side-top .rv-hud-progress { grid-area: progress; justify-content: flex-end; }
-  .rv-side-top .rv-hud-camera { grid-area: camera; }
-  .rv-side-top .rv-hud-scene { grid-area: scene; }
-  .rv-side-top .rv-hud-time { grid-area: time; justify-content: flex-end; }
-  .rv-side-top .rv-hud-todo { grid-area: todo; }
-  .rv-side-top .rv-hud-pick { grid-area: pick; }
-  .rv-side-top .rv-hud-pace { grid-area: pace; }
-  .rv-side-top .rv-hud-details { grid-area: details; }
   .rv-ov-slot:empty { display: none; }
   #rv-ov-slot canvas.rv-overview { display: block; width: 100%; height: auto; aspect-ratio: var(--rv-ar, 1.78); max-height: 30vh; max-height: 30svh; object-fit: contain; background: #000; border-radius: 4px; cursor: pointer; touch-action: manipulation; }
   #rv-ov-slot canvas.rv-overview[hidden] { display: none; }
+  /* The session line keeps only its notes ("Going fast", "Take a break?"): its plain stats are in
+     the HUD's pace slot and in Details. */
+  .rv-session-stats { display: none; }
+  .review-side .rv-session:not(:has(.rv-chip)) { display: none; }
 }
 .review-boxes { list-style: none; padding: 0; margin: 0.5rem 0; max-height: 52vh; max-height: 52dvh; overflow-y: auto; }
 .review-boxes li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15rem 0.45rem; align-items: center; padding: 0.35rem 0.45rem; border: 1px solid var(--border); border-radius: 6px; margin: 0 0 0.3rem; cursor: pointer; }
@@ -1191,7 +1240,20 @@ details.help kbd { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monosp
 .rv-view-items { position: absolute; right: 0; top: calc(100% + 0.25rem); z-index: 30; display: grid; grid-template-columns: 1fr 1fr; gap: 0.35rem; width: max-content; max-width: calc(100vw - 2rem); padding: 0.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25); }
 .rv-view-items button.small { margin: 0; }
 .rv-view-items button[data-view=image], .rv-view-items button[data-view=ov-layout] { grid-column: 1 / -1; }
+/* Done: one column only (its sheet covers View). */
+.rv-view-items .rv-view-done { display: none; }
 .rv-view-items button[aria-pressed=true] { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+/* Brightness and Contrast (review.js wireSlider): a row each, the name, the slider, its value. */
+.rv-view-items .rv-view-range { grid-column: 1 / -1; display: grid; grid-template-columns: 5.5rem minmax(9rem, 1fr) 2.6rem; align-items: center; gap: 0.4rem; font-size: 0.85rem; }
+.rv-view-range input[type=range] { width: 100%; margin: 0; padding: 0; border: 0; background: none; accent-color: var(--accent); }
+.rv-view-range output { text-align: right; font-variant-numeric: tabular-nums; }
+#review.rv-touch .rv-view-range { min-height: 44px; }
+#review.rv-touch .rv-view-range input[type=range] { height: 44px; }
+/* Two columns: the View menu sits in the tool row at the foot of the screen, so it opens upward,
+   and scrolls if the window is short (one column keeps it opening downward). */
+@media (min-width: 901px) {
+  .rv-view-items { top: auto; bottom: calc(100% + 0.25rem); max-height: calc(100vh - 5rem); max-height: calc(100dvh - 5rem); overflow-y: auto; }
+}
 .review-boxes li.lk-review { border-color: #ffa000; }
 .review-boxes li.lk-review.sel { box-shadow: 0 0 0 1px #ffa000; }
 .review-boxes li.lk-likely { border-color: var(--likely-fg); }
@@ -1699,6 +1761,26 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-actions #rv-save { min-height: 2.3rem; padding: 0.2rem 0.5rem; font-size: 0.95rem; font-weight: 600; }
   .rv-actions-main button.small, .rv-actions #rv-undo, .rv-actions #rv-keys-open { padding: 0.25rem 0.25rem; font-size: 0.8rem; }
 }
+/* Two columns with a mouse (the touch UI keeps its sizes): a more compact side panel, so more of
+   the box list shows. The decision card's slot (#rv-decide) is recalculated from these rows (see
+   its min-height), so the box list under it still keeps its place from one box to the next. */
+@media (min-width: 901px) {
+  #review:not(.rv-touch) .rv-side-body { padding: 0.5rem 0.65rem 0.3rem; }
+  #review:not(.rv-touch) .rv-side-foot { padding: 0.3rem 0.65rem 0.5rem; }
+  #review:not(.rv-touch) #rv-ov-slot canvas.rv-overview { max-height: 26vh; max-height: 26svh; }
+  #review:not(.rv-touch) .rv-decide > .rv-card { padding: 0.35rem 0.5rem; }
+  #review:not(.rv-touch) .rv-q-answers > button.small, #review:not(.rv-touch) .rv-q-answers > .rv-q-ph, #review:not(.rv-touch) .rv-q-tools > .rv-q-wide { min-height: 1.85rem; }
+  #review:not(.rv-touch) .rv-q-answers > button.small { padding-top: 0.15rem; padding-bottom: 0.15rem; }
+  #review:not(.rv-touch) .rv-q-btns.rv-q-answers, #review:not(.rv-touch) .rv-q-tools, #review:not(.rv-touch) .rv-q-sug > .rv-q-sug-btns { gap: 0.25rem; }
+  #review:not(.rv-touch) .rv-q-tools, #review:not(.rv-touch) .rv-q-why { margin-top: 0.25rem; }
+  /* The slot holds the tallest common card as the 14.35rem + 2px one did (the answers, then Accept
+     likely and the reason chips): 2px border + 2 x 0.35 padding + 1.6 question line + 0.45 + three
+     answer rows (3 x 1.85 + 2 x 0.25) + 0.25 + Accept likely (1.7) + 0.25 + reasons (1.6) = 12.6rem
+     + 2px (measured 203.5 px), with the same 0.15rem to spare. */
+  #review:not(.rv-touch) .rv-decide { min-height: calc(12.75rem + 2px); }
+  #review:not(.rv-touch) .review-boxes li { padding: 0.2rem 0.4rem; margin: 0 0 0.2rem; }
+  #review:not(.rv-touch) .rv-actions #rv-back, #review:not(.rv-touch) .rv-actions #rv-skip, #review:not(.rv-touch) .rv-actions #rv-next, #review:not(.rv-touch) .rv-actions #rv-save { min-height: 2.1rem; }
+}
 /* A save on its way: Save & next looks busy, at the same size (review.js save). */
 #rv-save.rv-busy { opacity: 0.6; cursor: progress; }
 /* The small viewport height in px for review.js sizeStage (it cannot read `svh` otherwise). */
@@ -1914,8 +1996,12 @@ td.tr-bal-bars { vertical-align: middle; }
   .rv-tools .rv-slot { width: auto; overflow: visible; }
   /* One column is always the touch UI (review.js touchUi): Draw and Redraw, the image setting in View. */
   .rv-tools .rv-tool-image, .rv-tools .rv-tool-zoom, .rv-tools .rv-tool-zoomout, .rv-tools .rv-tool-zoomin { display: none; }
-  .rv-side-top, #rv-side-wide, #rv-ov-layout, .rv-view-items button[data-view=ov-layout] { display: none; }
+  .rv-side-top, .rv-side-resize, #rv-ov-layout, .rv-view-items button[data-view=ov-layout] { display: none; }
   .rv-tools button.small, .rv-tools .rv-view-menu > summary { min-height: 44px; padding: 0.1rem 0.5rem; justify-content: center; }
+  /* View, open: a sheet over the screen's foot (over the dock), so all of it is on screen and the
+     frame above it stays in sight while the brightness and contrast change. */
+  .rv-view-items { position: fixed; z-index: 40; left: 0; right: 0; top: auto; bottom: 0; width: auto; max-width: none; max-height: 60vh; max-height: 60svh; overflow-y: auto; overscroll-behavior: contain; padding: 0.6rem max(0.6rem, env(safe-area-inset-right)) calc(0.6rem + env(safe-area-inset-bottom)) max(0.6rem, env(safe-area-inset-left)); border-width: 1px 0 0; border-radius: 10px 10px 0 0; box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.28); }
+  .rv-view-items .rv-view-done { display: block; }
   .review-side.card { padding: 0.4rem 0.6rem 0; }
   .rv-actions { display: contents; }
   /* Back, Skip, Next, Undo: a row stuck right over the dock (`--rv-dock-h`, the dock's one height),
