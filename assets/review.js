@@ -321,6 +321,14 @@
   // through the table at each change), hist, n, mode, b, k (the setting it shows; k the contrast),
   // bad (the frame cannot be read back)}. `viewGen` counts its repaints (the overview's cache key).
   var viewCache = null, viewGen = 0;
+  // The box tags, as draw() sized them: font size `dev`, padding `pad` and height `h` in the
+  // buffer's pixels, that height in frame px (`th`, for tagTop) and the font.
+  var tg = { dev: 12, pad: 4, h: 16, th: 16, font: '12px system-ui, sans-serif' };
+  // View's Label size (CSS px, ReviewTouch.tagSize), kept per viewer.
+  var TAG_SIZE_KEY = 'bop.review.tag-size';
+  var tagSize = window.ReviewTouch.tagSize((function () {
+    try { var v = window.localStorage.getItem(TAG_SIZE_KEY); return v == null ? NaN : parseFloat(v); } catch (e) { return NaN; }
+  }()));
   var viewTable = new Uint8ClampedArray(256), viewHist = new Float64Array(256);
   var dups = { groups: [], of: {}, overlaps: [], near: {} };   // dupGroups, as of the last render
   var suggestions = [];                // liveSuggestions, as of the last render
@@ -1057,6 +1065,25 @@
   }
   wireSlider(brightIn, brightOut, 'brightness');
   wireSlider(contrastIn, contrastOut, 'contrast');
+
+  // Label size (View): the box tags' font size, like the image sliders: drawn at most once per
+  // animation frame while it moves, kept and said once let go. Reset image leaves it.
+  var tagSizeIn = $('rv-tag-size'), tagSizeOut = $('rv-tag-size-val');
+  if (tagSizeIn) {
+    tagSizeIn.value = String(tagSize);
+    setText(tagSizeOut, tagSize + ' px');
+    tagSizeIn.addEventListener('input', function () {
+      var v = window.ReviewTouch.tagSize(Number(tagSizeIn.value));
+      if (v === tagSize) return;
+      tagSize = v;
+      setText(tagSizeOut, v + ' px');
+      queueDraw();
+    });
+    tagSizeIn.addEventListener('change', function () {
+      try { window.localStorage.setItem(TAG_SIZE_KEY, String(tagSize)); } catch (e) { /* not kept */ }
+      say('Labels ' + tagSize + ' px' + (tagSize === 12 ? ' (the default).' : ' (12 is the default).'));
+    });
+  }
   syncSliders();
 
   // Lets the adjusted frame go (its canvas's pixels at once, the buffers with the object).
@@ -1392,7 +1419,11 @@
   function syncBuffer(r) {
     if (!r.width) return;   // not shown: the buffer waits
     var dpr = window.devicePixelRatio || 1;
-    var bw = devPx.w && devPx.dpr === dpr && Math.abs(devPx.css - r.width) < 0.01 ? devPx.w : Math.round(r.width * dpr);
+    // The device pixel width the browser reported, when it is of this width and ratio and agrees
+    // with them (within the 2 px of its rounding): an emulated ratio (DevTools, headless) reports
+    // the screen's own and would leave the buffer at a fraction of its pixels.
+    var bw = devPx.w && devPx.dpr === dpr && Math.abs(devPx.css - r.width) < 0.01 && Math.abs(devPx.w - r.width * dpr) <= 2
+      ? devPx.w : Math.round(r.width * dpr);
     var bh = Math.round(bw * FH / FW);
     if (bw * bh > BUFFER_MAX) {
       bw = Math.floor(bw * Math.sqrt(BUFFER_MAX / (bw * bh)));
@@ -1406,6 +1437,26 @@
   // What draw() measured for this drawing: device pixels per frame pixel at the zoom (`kx`, `ky`),
   // device pixels per CSS pixel (`dpr`, the buffer's own) and one CSS pixel in frame pixels (`px`).
   var dm = { kx: 1, ky: 1, dpr: 1, px: 1 };
+
+  // A box's tag: `text` on `color` above the box `bb` (frame px; at the view's top below it when
+  // there is room, else inside its top: ReviewTouch.tagTop), its left at the box's left, kept in
+  // the view. Drawn in the buffer's own pixels at a whole device pixel font size: a font of a
+  // fraction of a frame pixel scaled up by the view (a zoomed frame on a large window) measures
+  // and draws wider than its size in Chrome, and the text ran out of its tag.
+  function drawTag(text, bb, color, vy0, vy1) {
+    var top = Math.round((window.ReviewTouch.tagTop(bb, vy0, vy1, tg.th) - view.oy) * dm.ky);
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.font = tg.font;
+    ctx.textBaseline = 'bottom';
+    var tw = Math.ceil(ctx.measureText(text).width) + 2 * tg.pad;
+    var tx = clamp(Math.round((bb[0] - view.ox) * dm.kx), 0, Math.max(0, canvas.width - tw));
+    ctx.fillStyle = color;
+    ctx.fillRect(tx, top, tw, tg.h);
+    ctx.fillStyle = '#000000';
+    ctx.fillText(text, tx + tg.pad, top + tg.h - Math.round(tg.pad / 2));
+    ctx.restore();
+  }
 
   // Frame pixels -> the buffer, through the view.
   function viewTransform() { ctx.setTransform(dm.kx, 0, 0, dm.ky, -view.ox * dm.kx, -view.oy * dm.ky); }
@@ -1456,17 +1507,20 @@
     if (src) ctx.drawImage(src, 0, 0, FW, FH);
     drawOverview();
     if (!cur || hideBoxes) { drawTapMarker(); return; }
-    // Tags: 12 CSS px at any zoom and frame size. On the touch UI they start at the shown frame's
-    // width / 70 (a phone's small frame is not covered by them) and grow with the zoom to 12.
-    var tagCss = 12;
-    if (touchUi.matches && cr.width) tagCss = clamp(cr.width / 70 * z, Math.min(12, cr.width / 70), 12);
-    var font = tagCss * px;
-    var pad = tagCss / 3 * px;
-    var th = font + pad;
-    // The part of the frame in view: tags are placed against it.
-    var vx0 = view.ox, vy0 = view.oy, vx1 = view.ox + FW / z, vy1 = view.oy + FH / z;
-    ctx.font = font + 'px system-ui, sans-serif';
-    ctx.textBaseline = 'bottom';
+    // Tags: `tagSize` CSS px (View's Label size, 12 by default) at any zoom and frame size. On the
+    // touch UI they start at the shown frame's width / 70 (a phone's small frame is not covered
+    // by them) and grow with the zoom to that size. They are drawn in the buffer's own pixels
+    // (drawTag), at a whole device pixel font size.
+    var tagCss = tagSize;
+    if (touchUi.matches && cr.width) tagCss = clamp(cr.width / 70 * z, Math.min(tagSize, cr.width / 70), tagSize);
+    tg.dev = Math.max(1, Math.round(tagCss * dm.dpr));
+    tg.pad = Math.round(tg.dev / 3);
+    tg.h = tg.dev + tg.pad;
+    tg.th = tg.h / dm.ky;
+    tg.font = tg.dev + 'px system-ui, sans-serif';
+    // The part of the frame in view, top to bottom: tags are placed against it (drawTag keeps
+    // them in it across).
+    var vy0 = view.oy, vy1 = view.oy + FH / z;
     // Line patterns in frame px (one CSS px = `px`): dashed (rejected, rejected on save), dotted
     // (unsure), the dropped box of an overlap suggestion.
     var DASH = [4 * px, 3 * px], DOT = [px, 1.5 * px], DROP = [3 * px, 2 * px], SOLID = [];
@@ -1558,15 +1612,7 @@
         if (full) ctx.globalAlpha = 1;
         var text = (role === 'drop' ? 'drop? ' : (role === 'keep' ? 'keep ' : '')) + refineTag(rrole) +
           ((full || b.state === 'pending' || !b._checked) ? tagText(b, i) : String(i + 1));
-        var tw = ctx.measureText(text).width + 2 * pad;
-        // Above the box; at the view's top below it when there is room; else inside its top
-        // (ReviewTouch.tagTop); across, kept in view.
-        var top = window.ReviewTouch.tagTop(b.bbox, vy0, vy1, th);
-        var tx = clamp(x, vx0, Math.max(vx0, vx1 - tw));
-        ctx.fillStyle = color;
-        ctx.fillRect(tx, top, tw, th);
-        ctx.fillStyle = '#000000';
-        ctx.fillText(text, tx + pad, top + th - pad / 2);
+        drawTag(text, b.bbox, color, vy0, vy1);
       }
       ctx.restore();
     }
@@ -1595,13 +1641,7 @@
       if (showTags) {
         var gt = (refineCur.l.kind === 'add' ? 'add? ' : 'tighter? ') + gb.label +
           (gb.score != null ? ' ' + fmtScore(gb.score) : '');
-        var gtw = ctx.measureText(gt).width + 2 * pad;
-        var gtop = window.ReviewTouch.tagTop(gb.bbox, vy0, vy1, th);
-        var gtx = clamp(gx, vx0, Math.max(vx0, vx1 - gtw));
-        ctx.fillStyle = COLORS.ghost;
-        ctx.fillRect(gtx, gtop, gtw, th);
-        ctx.fillStyle = '#000000';
-        ctx.fillText(gt, gtx + pad, gtop + th - pad / 2);
+        drawTag(gt, gb.bbox, COLORS.ghost, vy0, vy1);
       }
       ctx.restore();
     }

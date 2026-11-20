@@ -4,9 +4,9 @@
 // "Anything missing?" look, plus the editor's pointer and view rules: which edge or corner of a
 // box a press grabs (`edgeAt`), how the view follows a new selection (`nextView`) and a drag of
 // the overview's view rect (`overviewPan`); the view-only image setting (`viewSettings`, the tone
-// table `viewLut`) and the side panel's width (`sideWidth`). Pure: no page, no browser API, no
-// state of its own; review.js passes everything in and applies the answers.
-// `tests/it/js_review_touch.rs` runs this file in Node.
+// table `viewLut`), the box tags' size (`tagSize`) and the side panel's width (`sideWidth`).
+// Pure: no page, no browser API, no state of its own; review.js passes everything in and applies
+// the answers. `tests/it/js_review_touch.rs` runs this file in Node.
 //
 // Coordinates are frame pixels, a canvas point being the frame point at zoom 1 (review.js
 // `canvasPoint`; the canvas's buffer has its own, device pixel size), and a view is {z, ox, oy}:
@@ -262,6 +262,15 @@
     return lut;
   }
 
+  // ---- the box tags' size (View's Label size; review.js draw) ----
+
+  // The tags' font size in CSS px: a whole number from TAG_MIN to TAG_MAX; anything that is no
+  // finite number (nothing kept, a damaged value) is TAG_SIZE.
+  var TAG_MIN = 8, TAG_MAX = 24, TAG_SIZE = 12;
+  function tagSize(v) {
+    return finite(v) ? Math.max(TAG_MIN, Math.min(TAG_MAX, Math.round(v))) : TAG_SIZE;
+  }
+
   // ---- the side panel's width (two columns; review.js) ----
 
   // The width in CSS px the panel takes for a wanted width `want`: rounded and held in
@@ -277,6 +286,7 @@
     viewLevel: viewLevel,
     viewSettings: viewSettings,
     viewLut: viewLut,
+    tagSize: tagSize,
     sideWidth: sideWidth,
     quarterView: quarterView,
     pinch: pinch,

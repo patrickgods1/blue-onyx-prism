@@ -998,7 +998,9 @@ The View menu (it opens upward on a wide screen; on a phone it is a sheet over t
 *Done*, so the frame stays in sight) also holds the image setting, which changes only what you
 see, never the frame: the mode (`b`), *Brightness* (`[` / `]`, a gamma that lifts the shadows without
 clipping the highlights) and *Contrast* (`{` / `}`, about the frame's median level, so a dark frame does not
-go black), then *Reset image* (`Shift+0`). The setting stays from frame to frame and for your next visits.
+go black), then *Reset image* (`Shift+0`). The setting stays from frame to frame and for your next visits. *Label size*
+(8 to 24 px, 12 by default) sets the size of the boxes' tags at every zoom; it is kept too, and *Reset image*
+leaves it.
 
 ### Export
 

@@ -1137,7 +1137,7 @@ included; once you have signed in, the page goes on where it was.
 move it. Pinch to zoom, and drag with two fingers to pan. Turn on **Draw** to add a box: drag it
 out, or tap two opposite corners. **Redraw** sets the selected box's corners with the next two
 taps. **View** holds zoom in and out, *Hide boxes*, *Labels*, *Spotlight*, the *Brightness* and
-*Contrast* sliders, and *Reset image*.
+*Contrast* sliders, *Label size* (the boxes' tags), and *Reset image*.
 
 ## Running as a service
 

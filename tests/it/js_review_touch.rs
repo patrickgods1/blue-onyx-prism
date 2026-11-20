@@ -3,8 +3,8 @@
 //! picks, which corner the overview takes and the quarters of the "Anything missing?" look; and
 //! the editor's rules: which edge or corner of a box a press grabs (`edgeAt`), what the view does
 //! when the selection moves (`nextView`) and a drag of the overview's view rect (`overviewPan`);
-//! the view-only image setting (`viewSettings`, the tone table `viewLut`) and the side panel's
-//! width (`sideWidth`). The page applies these answers to its view, frame and boxes
+//! the view-only image setting (`viewSettings`, the tone table `viewLut`), the box tags' size
+//! (`tagSize`) and the side panel's width (`sideWidth`). The page applies these answers to its view, frame and boxes
 //! (`assets/review.js`), so they are checked here on exact numbers, in Node.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
@@ -42,6 +42,7 @@ console.log(JSON.stringify(req.map((r) => {
   }
   if (r.op === 'viewSettings') return T.viewSettings(r.raw);
   if (r.op === 'sideWidth') return T.sideWidth(r.want, r.min, r.max, r.dflt);
+  if (r.op === 'tagSize') return T.tagSize(r.v);
   throw new Error('unknown op ' + r.op);
 })));
 "#;
@@ -1201,6 +1202,36 @@ fn the_side_panel_width_is_held_in_its_range() {
     assert_eq!(
         got,
         [500, 334, 280, 600, 600, 400, 400, 280, 5000, 280, 350]
+            .iter()
+            .map(|&v| json!(v))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_label_size_is_a_whole_number_in_its_range() {
+    if !have_node() {
+        return;
+    }
+    let req = |v: Value| json!({ "op": "tagSize", "v": v });
+    let got = node(&json!([
+        req(json!(12)),
+        req(json!(8)),
+        req(json!(24)),
+        req(json!(15.4)),
+        req(json!(15.5)),
+        // Out of range: held to its ends.
+        req(json!(4)),
+        req(json!(40)),
+        req(json!(-3)),
+        // Nothing kept or a damaged value (parseFloat gives NaN, JSON null): the default 12.
+        req(json!(null)),
+        req(json!("16")),
+        req(json!(true)),
+    ]));
+    assert_eq!(
+        got,
+        [12, 8, 24, 15, 16, 8, 24, 8, 12, 12, 12]
             .iter()
             .map(|&v| json!(v))
             .collect::<Vec<_>>()

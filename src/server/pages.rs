@@ -1790,6 +1790,7 @@ mod tests {
             "id=\"rv-side-resize\"",
             "id=\"rv-bright\"",
             "id=\"rv-contrast\"",
+            "id=\"rv-tag-size\"",
         ] {
             assert!(review.contains(needle), "{needle}");
         }
