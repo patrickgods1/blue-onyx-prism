@@ -88,7 +88,7 @@ for. Every bucket has `enabled`, a sampling `rate` (0 to 1, deterministic per re
 | `near_threshold` | For some label, the top score over `raw` (suppressed boxes included) and `below_threshold` is within `margin` (default 0.1) of the request's threshold: `abs(top - threshold) <= margin`. It is per label, so an uncertain dog next to a sure person still counts. | 0 |
 | `disagreement` | The verifier rejected a candidate, or in mode `frame` reported a box at or above its `min_confidence` that matches no `raw` box (same label, IoU at or above its `iou`): a miss of the model. | 0 |
 
-**Night and IR empty frames.** `empty` has a second interval, `night_interval` (default 120 s), used
+**Night and IR empty frames.** `empty` has a second interval, `night_interval` (default: 120 s, or the day interval if that is shorter), used
 instead of `per_camera_min_interval_s` (600 s) when the frame's scene is `night` or `ir`. Blue Iris sends
 frames on motion only, so an empty frame in the dark means something moved that the model did not detect,
 often an animal, and those frames are worth more than an empty day frame. The dedup still drops a frame

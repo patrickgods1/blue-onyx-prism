@@ -57,7 +57,7 @@
           <td class="rc-wide bk-when">{{ b.describe }}</td>
           <td class="bk-on" data-label="On"><input type="checkbox" name="{{ b.key }}.enabled" aria-label="{{ b.key }} on"{% if b.enabled %} checked{% endif %}></td>
           <td data-label="Rate (0..1)"><input type="number" name="{{ b.key }}.rate" aria-label="{{ b.key }} rate" min="0" max="1" step="0.01" value="{{ b.rate }}"></td>
-          <td data-label="Min interval (s)"><input inputmode="numeric" type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}">{% if let Some(n) = b.night_interval %}<label class="muted bk-night">night / IR <input inputmode="numeric" type="number" name="{{ b.key }}.night_interval" aria-label="{{ b.key }} night interval" min="0" step="1" value="{{ n }}"></label>{% endif %}</td>
+          <td data-label="Min interval (s)"><input inputmode="numeric" type="number" name="{{ b.key }}.interval" aria-label="{{ b.key }} interval" min="0" step="1" value="{{ b.interval }}">{% if let Some(n) = b.night_interval %}<label class="muted">night / IR <input inputmode="numeric" type="number" name="{{ b.key }}.night_interval" aria-label="{{ b.key }} night interval" min="0" step="1" value="{{ n.value }}" placeholder="{{ n.effective }}"></label>{% endif %}</td>
           <td class="num" data-label="Saved">{{ b.saved }}</td>
         </tr>
         {% endfor %}
