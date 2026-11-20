@@ -153,8 +153,10 @@ fn idle_after(settings: &CollectSettings) -> Duration {
     Bucket::ALL
         .iter()
         .map(|b| {
+            let c = settings.buckets.get(*b);
             Duration::from_secs(u64::from(
-                settings.buckets.get(*b).per_camera_min_interval_s,
+                c.per_camera_min_interval_s
+                    .max(c.night_interval_s.unwrap_or(0)),
             ))
         })
         .fold(CAMERA_IDLE, Duration::max)
@@ -352,7 +354,7 @@ impl Store {
                 let c = settings.buckets.get(*b);
                 let sampled = f64::from(c.rate) >= 1.0
                     || sample(&record.record.request_id, *b) < f64::from(c.rate);
-                let interval = Duration::from_secs(u64::from(c.per_camera_min_interval_s));
+                let interval = Duration::from_secs(u64::from(c.interval_for(&record.record.scene)));
                 let due = self.last.get(&(camera.clone(), *b)).is_none_or(|t| {
                     at.duration_since(*t)
                         .map_or(true, |since| since >= interval)
@@ -851,6 +853,46 @@ mod tests {
         let share = kept as f64 / f64::from(n);
         assert!((share - 0.25).abs() < 0.02, "{share}");
         assert_eq!(sample("abc", Bucket::Empty), sample("abc", Bucket::Empty));
+    }
+
+    /// An empty frame at night or IR is kept after the shorter `night_interval` (120 s); a day one
+    /// waits the full 600 s.
+    #[test]
+    fn night_and_ir_empty_frames_use_the_night_interval() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let mut st = store();
+        let scene = |cam: &str, rid: &str, at: u64, scene: &str| {
+            let mut d = base(cam, rid, t(at));
+            d.record.scene = scene.into();
+            d
+        };
+        for (cam, scene_name) in [("n", "night"), ("i", "ir"), ("d", "day")] {
+            assert!(matches!(
+                st.handle(frame(&s, scene(cam, "r1", 0, scene_name), 1)),
+                Handled::Saved { .. }
+            ));
+            // 60 s on: limited in every scene.
+            assert_eq!(
+                st.handle(frame(&s, scene(cam, "r2", 60, scene_name), 2)),
+                Handled::Dropped(Dropped::Rate),
+                "{scene_name}"
+            );
+            // 130 s on: night / IR are due again, day is not.
+            let out = st.handle(frame(&s, scene(cam, "r3", 130, scene_name), 3));
+            if scene_name == "day" {
+                assert_eq!(out, Handled::Dropped(Dropped::Rate));
+                assert!(matches!(
+                    st.handle(frame(&s, scene(cam, "r4", 601, scene_name), 4)),
+                    Handled::Saved { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(out, Handled::Saved { .. }),
+                    "{scene_name}: {out:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -84,6 +84,14 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
                 format!("{key} interval: '{v}' is not a whole number of seconds")
             })?;
         }
+        if b == Bucket::Empty
+            && let Some(v) =
+                field(fields, &format!("{key}.night_interval")).filter(|v| !v.is_empty())
+        {
+            bc.night_interval_s = Some(v.parse().with_context(|| {
+                format!("{key} night interval: '{v}' is not a whole number of seconds")
+            })?);
+        }
     }
     if let Some(v) = field(fields, "near_threshold.margin").filter(|v| !v.is_empty()) {
         c.buckets.near_threshold.margin = Some(
@@ -118,6 +126,8 @@ struct BucketRow {
     enabled: bool,
     rate: String,
     interval: u32,
+    /// `empty` only: the interval for night / IR frames.
+    night_interval: Option<u32>,
     saved: u64,
 }
 
@@ -260,6 +270,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
                 enabled: bc.enabled,
                 rate: clean(bc.rate),
                 interval: bc.per_camera_min_interval_s,
+                night_interval: bc.night_interval_s,
                 saved: SCENES.iter().map(|s| summary.count(s, b)).sum(),
             }
         })
@@ -633,6 +644,10 @@ mod tests {
         assert_eq!(c.buckets.positive.per_camera_min_interval_s, 60);
         assert_eq!(c.buckets.empty.rate, 1.0, "an empty field keeps the value");
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
+        assert_eq!(c.buckets.empty.night_interval_s, Some(120));
+        apply_form(&mut c, &parse_form(b"empty.night_interval=30")).unwrap();
+        assert_eq!(c.buckets.empty.night_interval_s, Some(30));
+        assert_eq!(c.buckets.positive.night_interval_s, None);
         assert_eq!(c.max_gb, 2.0);
         assert_eq!(c.buckets.near_margin(), 0.05);
         assert_eq!(c.dir, None);

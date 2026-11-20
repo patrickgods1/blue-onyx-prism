@@ -1,5 +1,7 @@
 //! The `collect` config section (dataset collector, [`super`]): which buckets are kept, how
-//! often per camera, the dedup distance and the disk caps. Every field applies live. Pure data
+//! often per camera (the `empty` bucket has a second, shorter interval for night / IR frames,
+//! [`DEFAULT_EMPTY_NIGHT_INTERVAL_S`]), the dedup distance and the disk caps. Every field applies
+//! live. Pure data
 //! plus validation; [`CollectSettings`] is the resolved form the workers carry in their live
 //! settings.
 
@@ -25,6 +27,10 @@ pub const DEFAULT_NEAR_MARGIN: f32 = 0.1;
 pub const MAX_NEAR_MARGIN: f32 = 0.5;
 /// Largest accepted `per_camera_min_interval_s` (one week).
 pub const MAX_INTERVAL_S: u32 = 7 * 24 * 3600;
+/// Default `empty.night_interval`: Blue Iris sends frames on motion only, so an empty night / IR
+/// frame means something moved that the model did not detect (often an animal); keep more of
+/// them than the 600 s day interval allows.
+pub const DEFAULT_EMPTY_NIGHT_INTERVAL_S: u32 = 120;
 /// Folder name of the default dataset directory under the data root.
 pub const DEFAULT_DIR_NAME: &str = "dataset";
 /// Default review / training class list (`collect.classes`).
@@ -69,11 +75,24 @@ pub struct BucketConfig {
         serialize_with = "crate::config::thr::ser_opt_clean"
     )]
     pub margin: Option<f32>,
+    /// `empty` only: the per-camera interval for frames whose scene is `night` or `ir`
+    /// (`night_interval` in the config; 0 = no limit). None = [`Self::per_camera_min_interval_s`]
+    /// for every scene.
+    #[serde(rename = "night_interval", skip_serializing_if = "Option::is_none")]
+    pub night_interval_s: Option<u32>,
 }
 
 impl BucketConfig {
+    /// The per-camera interval for a frame of `scene` (`day | night | ir`).
+    pub fn interval_for(&self, scene: &str) -> u32 {
+        match (scene, self.night_interval_s) {
+            ("night" | "ir", Some(n)) => n,
+            _ => self.per_camera_min_interval_s,
+        }
+    }
+
     /// The default settings of `bucket`: every bucket on and fully sampled; `empty` at most one
-    /// frame per camera per 10 min, `positive` one per 30 s; `near_threshold` with a 0.1 band.
+    /// frame per camera per 10 min (night / IR: per 2 min), `positive` one per 30 s; `near_threshold` with a 0.1 band.
     pub fn default_for(bucket: Bucket) -> Self {
         Self {
             enabled: true,
@@ -84,6 +103,7 @@ impl BucketConfig {
                 _ => 0,
             },
             margin: (bucket == Bucket::NearThreshold).then_some(DEFAULT_NEAR_MARGIN),
+            night_interval_s: (bucket == Bucket::Empty).then_some(DEFAULT_EMPTY_NIGHT_INTERVAL_S),
         }
     }
 }
@@ -154,6 +174,7 @@ struct RawBucket {
     rate: Option<f32>,
     per_camera_min_interval_s: Option<u32>,
     margin: Option<f32>,
+    night_interval: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -178,6 +199,8 @@ fn fill(bucket: Bucket, raw: Option<RawBucket>) -> BucketConfig {
             .unwrap_or(d.per_camera_min_interval_s),
         // Kept as written (validation refuses a margin on another bucket).
         margin: r.margin.or(d.margin),
+        // Likewise (validation refuses it on a bucket other than empty).
+        night_interval_s: r.night_interval.or(d.night_interval_s),
     }
 }
 
@@ -268,8 +291,8 @@ pub fn unknown_keys(v: &serde_json::Value) -> Vec<String> {
     out
 }
 
-/// A section with every optional key set (each bucket with a margin: [`RawBucket`] reads one on
-/// every bucket, validation refuses it there).
+/// A section with every optional key set (each bucket with a margin and a night interval:
+/// [`RawBucket`] reads them on every bucket, validation refuses them there).
 fn known_shape() -> serde_json::Value {
     let mut c = CollectConfig {
         dir: Some("d".into()),
@@ -282,7 +305,9 @@ fn known_shape() -> serde_json::Value {
         ..CollectConfig::default()
     };
     for b in Bucket::ALL {
-        c.buckets.get_mut(b).margin = Some(DEFAULT_NEAR_MARGIN);
+        let bc = c.buckets.get_mut(b);
+        bc.margin = Some(DEFAULT_NEAR_MARGIN);
+        bc.night_interval_s = Some(DEFAULT_EMPTY_NIGHT_INTERVAL_S);
     }
     serde_json::to_value(&c).unwrap_or_default()
 }
@@ -477,6 +502,19 @@ impl CollectConfig {
                 0,
                 MAX_INTERVAL_S,
             )?;
+            match (b, c.night_interval_s) {
+                (Bucket::Empty, Some(n)) => crate::config::check_range(
+                    &format!("{field}.night_interval"),
+                    n,
+                    0,
+                    MAX_INTERVAL_S,
+                )?,
+                (Bucket::Empty, None) => {}
+                (_, Some(_)) => {
+                    bail!("{field}.night_interval: only empty has a night interval; remove it here")
+                }
+                (_, None) => {}
+            }
             match (b, c.margin) {
                 (Bucket::NearThreshold, Some(m)) => {
                     if !(m.is_finite() && m > 0.0 && m <= MAX_NEAR_MARGIN) {
@@ -647,6 +685,12 @@ mod tests {
         assert_eq!(c.classes.len(), 14);
         assert_eq!(c.classes[7], "raccoon");
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
+        assert_eq!(c.buckets.empty.night_interval_s, Some(120));
+        assert_eq!(c.buckets.empty.interval_for("day"), 600);
+        assert_eq!(c.buckets.empty.interval_for("night"), 120);
+        assert_eq!(c.buckets.empty.interval_for("ir"), 120);
+        assert_eq!(c.buckets.positive.night_interval_s, None);
+        assert_eq!(c.buckets.positive.interval_for("night"), 30);
         assert_eq!(c.buckets.near_margin(), 0.1);
         assert!(Bucket::ALL.iter().all(|b| c.buckets.get(*b).enabled));
         c.validate(Path::new("/data")).unwrap();
@@ -690,6 +734,52 @@ mod tests {
             BucketConfig::default_for(Bucket::Positive)
         );
         c.validate(Path::new("/data")).unwrap();
+    }
+
+    #[test]
+    fn the_night_interval_parses_round_trips_and_is_checked() {
+        let c: CollectConfig =
+            serde_json::from_str(r#"{"buckets": {"empty": {"night_interval": 0}}}"#).unwrap();
+        assert_eq!(c.buckets.empty.night_interval_s, Some(0));
+        assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
+        assert_eq!(c.buckets.empty.interval_for("ir"), 0);
+        c.validate(Path::new("/data")).unwrap();
+        let back: CollectConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        let c: CollectConfig =
+            serde_json::from_str(r#"{"buckets": {"empty": {"night_interval": 30}}}"#).unwrap();
+        assert!(
+            serde_json::to_string(&c)
+                .unwrap()
+                .contains("\"night_interval\":30")
+        );
+        let none: CollectConfig = serde_json::from_str(r#"{"buckets": {"empty": {}}}"#).unwrap();
+        assert_eq!(
+            none.buckets.empty.night_interval_s,
+            Some(120),
+            "absent = default"
+        );
+        assert!(
+            unknown_keys(&serde_json::json!({"buckets": {"empty": {"night_interval": 5}}}))
+                .is_empty()
+        );
+        let mut bad = CollectConfig::default();
+        bad.buckets.empty.night_interval_s = Some(MAX_INTERVAL_S + 1);
+        assert!(
+            bad.validate(Path::new("/data"))
+                .unwrap_err()
+                .to_string()
+                .contains("collect.buckets.empty.night_interval")
+        );
+        let mut bad = CollectConfig::default();
+        bad.buckets.positive.night_interval_s = Some(5);
+        assert!(
+            bad.validate(Path::new("/data"))
+                .unwrap_err()
+                .to_string()
+                .contains("only empty has a night interval")
+        );
     }
 
     #[test]
