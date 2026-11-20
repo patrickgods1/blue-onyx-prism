@@ -614,6 +614,59 @@ pub struct ClassMetrics {
     pub recall: Option<f64>,
 }
 
+/// Recall of one class at the confidence threshold, IoU 0.5, with its integer counts (a tag's
+/// [`super::Breakdown::per_class`], a training run's recall cells): `gt` non-ignored
+/// ground-truth objects, `missed` of them unmatched. Integers, so cells add up exactly in any
+/// order; `recall` is `(gt - missed) / gt` (None without ground truth).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassRecall {
+    pub class: String,
+    pub gt: usize,
+    pub missed: usize,
+    #[serde(default)]
+    pub recall: Option<f64>,
+}
+
+impl ClassRecall {
+    /// The cell of `class` with `gt` objects, `missed` of them unmatched (clamped to `gt`).
+    pub fn new(class: &str, gt: usize, missed: usize) -> Self {
+        let missed = missed.min(gt);
+        Self {
+            class: class.to_string(),
+            gt,
+            missed,
+            recall: (gt > 0).then(|| (gt - missed) as f64 / gt as f64),
+        }
+    }
+}
+
+/// Recall per class of `classes` (in their order) over `images` at `threshold`, IoU 0.5, counted
+/// exactly as [`evaluate`] counts its per-class recall (every prediction at or above the
+/// threshold, greedy matching, an ignore region never a miss); classes without ground truth are
+/// left out. Cheaper than [`evaluate`]: no AP.
+pub fn class_recall(images: &[EvalImage], classes: &[String], threshold: f32) -> Vec<ClassRecall> {
+    let mut counts: HashMap<&str, (usize, usize)> = HashMap::new();
+    for img in images {
+        let (_, _, m) = image_counts(img, threshold);
+        // `gt_matched` has one entry per ground-truth box.
+        for (g, &hit) in img.gt.iter().zip(&m.gt_matched) {
+            if g.ignore {
+                continue;
+            }
+            let e = counts.entry(g.label.as_str()).or_default();
+            e.0 += 1;
+            e.1 += usize::from(!hit);
+        }
+    }
+    classes
+        .iter()
+        .filter_map(|c| {
+            let &(gt, missed) = counts.get(c.as_str())?;
+            (gt > 0).then(|| ClassRecall::new(c, gt, missed))
+        })
+        .collect()
+}
+
 /// Recall at the confidence threshold for one object-size bucket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SizeRecall {
@@ -1588,6 +1641,63 @@ mod tests {
         assert!((average_precision(&mut s, 2).unwrap() - 51.0 / 101.0).abs() < 1e-12);
         assert_eq!(average_precision(&mut [], 0), None);
         assert_eq!(average_precision(&mut [], 3), Some(0.0));
+    }
+
+    /// `class_recall` counts like `evaluate`: the same gt and recall per class, integer misses,
+    /// classes without ground truth left out, an ignore region never a miss.
+    #[test]
+    fn class_recall_equals_evaluate() {
+        let mut region = gt("cat", [700.0, 0.0, 800.0, 100.0]);
+        region.ignore = true;
+        let images = vec![
+            EvalImage {
+                gt: vec![
+                    gt("person", [0.0, 0.0, 100.0, 200.0]),
+                    gt("person", [200.0, 0.0, 300.0, 200.0]), // missed (only a 0.3 match)
+                    gt("raccoon", [400.0, 400.0, 460.0, 440.0]),
+                    region,
+                ],
+                preds: vec![
+                    p("person", 0.9, [2.0, 2.0, 100.0, 200.0]),
+                    p("person", 0.3, [200.0, 0.0, 300.0, 200.0]),
+                    p("raccoon", 0.6, [400.0, 400.0, 460.0, 440.0]),
+                    p("car", 0.9, [0.0, 500.0, 50.0, 550.0]), // FP of a class without gt
+                ],
+            },
+            EvalImage {
+                gt: vec![gt("raccoon", [0.0, 0.0, 50.0, 50.0])], // missed
+                preds: vec![],
+            },
+        ];
+        let classes: Vec<String> = ["person", "raccoon", "car", "cat"]
+            .map(String::from)
+            .to_vec();
+        let r = class_recall(&images, &classes, 0.5);
+        let s = evaluate(&images, &classes, 0.5);
+        let expect: Vec<(String, usize, Option<f64>)> = s
+            .per_class
+            .iter()
+            .filter(|c| c.gt > 0)
+            .map(|c| (c.class.clone(), c.gt, c.recall))
+            .collect();
+        let got: Vec<(String, usize, Option<f64>)> = r
+            .iter()
+            .map(|c| (c.class.clone(), c.gt, c.recall))
+            .collect();
+        assert_eq!(got, expect);
+        assert_eq!(
+            r,
+            vec![
+                ClassRecall::new("person", 2, 1),
+                ClassRecall::new("raccoon", 2, 1)
+            ]
+        );
+        assert_eq!(r[0].recall, Some(0.5));
+        // Old-format cells without `recall` parse; `missed` is clamped.
+        let c: ClassRecall = serde_json::from_str(r#"{"class":"fox","gt":3,"missed":1}"#).unwrap();
+        assert_eq!((c.gt, c.missed, c.recall), (3, 1, None));
+        assert_eq!(ClassRecall::new("fox", 2, 5).missed, 2);
+        assert_eq!(ClassRecall::new("fox", 0, 0).recall, None);
     }
 
     #[test]

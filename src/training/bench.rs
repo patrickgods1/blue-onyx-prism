@@ -13,6 +13,14 @@
 //! picks among the held-out frames (`heldout:random`) are read the same way into
 //! [`BenchSummary::random`].
 //!
+//! Recall per class ([`BenchSummary::recall_cells`]) comes from the same tags' per-class recall
+//! (`Breakdown::per_class`, every class the held-out set scores, custom animals included): per
+//! scene (`heldout:<scene>`, `heldout:all`), per camera (`heldout:cam:<camera>`) and per camera in
+//! a scene (`heldout:camscene:<scene>:<camera>`), only when the held-out set's own tags are there
+//! ([`cells_of`]). [`measured_recall`] folds the runs' cells into the one table the Review queue
+//! steers by ([`Measured`]; its rule is documented there): per scene the newest finished run that
+//! trained on the scene, over every scene the newest that trained on all of them.
+//!
 //! The current default model then runs on the same sets and devices ([`baseline_skip`] says when
 //! it cannot), so the Use card compares like with like ([`compare_text`]). Its results stay in
 //! the run's folder: a set of a few hundred frames must not replace the default model's saved
@@ -24,11 +32,12 @@
 
 use super::dataset;
 use super::file_id::FileId;
-use super::job::{Baseline, BenchSummary, SceneAp, SubsetScore};
+use super::job::{Baseline, BenchSummary, CameraSceneRecall, RecallCells, SceneAp, SubsetScore};
 use crate::backend::DeviceSpec;
 use crate::benchmark::Breakdown;
 use crate::benchmark::report::ModelResult;
 use crate::benchmark::service::{BenchmarkService, RunContext, RunRequest, RunState};
+use crate::collect::labels::recall::{self, Measured};
 use crate::config::DatasetRef;
 use crate::resources::export::Cancelled;
 use crate::sync::LockExt;
@@ -450,6 +459,7 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
     let tagged = |key: &str| tags.iter().find(|b| b.key == key).map(ap);
     let mut by_scene = std::collections::BTreeMap::new();
     let mut in_scope = None;
+    let mut recall_cells = RecallCells::default();
     if tagged(dataset::HELDOUT_ALL).is_some() {
         for s in ["day", "night", "ir", "all"] {
             if let Some(a) = tagged(&format!("{}{s}", dataset::HELDOUT_TAG)) {
@@ -457,6 +467,7 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
             }
         }
         in_scope = tagged(dataset::HELDOUT_IN_SCOPE);
+        recall_cells = cells_of(tags);
     } else if m.datasets.len() == 1
         && let Some(a) = acc
     {
@@ -513,12 +524,109 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
         ap_basis,
         person_free_frames: person.map(|p| p.frames_without),
         person_false_alerts: person.map(|p| p.alerts),
+        recall_cells,
     }
+}
+
+/// The recall cells of a run ([`RecallCells`]) from the per-class recall of the held-out
+/// manifest's own tags: `heldout:<scene>` (and `heldout:all`), `heldout:cam:<camera>`,
+/// `heldout:camscene:<scene>:<camera>` ([`dataset::cell_tag`]). Never from bare tags: a built-in
+/// set run beside the held-out frames has its own `night` or `camera:` images. Breakdowns against
+/// pseudo ground truth are left out.
+fn cells_of(tags: &[Breakdown]) -> RecallCells {
+    let mut c = RecallCells::default();
+    for b in tags
+        .iter()
+        .filter(|b| !b.relative && !b.per_class.is_empty())
+    {
+        let classes = b.per_class.clone();
+        if let Some(cell) = dataset::cell_tag(&b.key) {
+            match cell {
+                dataset::CellTag::Camera(camera) => {
+                    c.by_camera.insert(camera.to_string(), classes);
+                }
+                dataset::CellTag::CameraScene { scene, camera } => {
+                    c.by_camera_scene.push(CameraSceneRecall {
+                        camera: camera.to_string(),
+                        scene: scene.to_string(),
+                        classes,
+                    });
+                }
+            }
+        } else if let Some(scene) = b.key.strip_prefix(dataset::HELDOUT_TAG)
+            && matches!(scene, "day" | "night" | "ir" | "all")
+        {
+            c.by_scene.insert(scene.to_string(), classes);
+        }
+    }
+    c
+}
+
+/// The measured recall the Review queue steers by, from the training runs `records` (pure; the
+/// rule of [`Measured`]):
+///
+/// - Only finished runs (`done`) whose benchmark has a held-out fingerprint (the held-out frames
+///   were chosen from the review folder, before the scene filter) and recall cells count, newest
+///   first (by `finished`, else `created`; equal stamps: the later record).
+/// - Per scene (`day` / `night` / `ir`): the newest such run whose scene filter keeps the scene
+///   and that has cells for it, with its camera-in-scene cells. A night model also has day
+///   frames among its held-out frames, but it never trained on them: its day recall says
+///   nothing about what the day model misses.
+/// - Over every scene (per class and per camera): the newest run whose filter keeps every scene,
+///   else the newest with cells over all its held-out frames.
+///
+/// None when no run measured anything.
+pub fn measured_recall(records: &[super::service::RunRecord]) -> Option<Measured> {
+    use super::service::RunState;
+    let mut runs: Vec<(usize, &super::service::RunRecord, &RecallCells)> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.state == RunState::Done)
+        .filter_map(|(i, r)| {
+            let b = r.benchmark.as_ref()?;
+            b.heldout_fingerprint.as_ref()?;
+            (!b.recall_cells.is_empty()).then_some((i, r, &b.recall_cells))
+        })
+        .collect();
+    // RFC 3339 UTC stamps (`service::now`): their text order is their time order.
+    fn stamp(r: &super::service::RunRecord) -> &str {
+        r.finished.as_deref().unwrap_or(&r.created)
+    }
+    runs.sort_by(|a, b| stamp(b.1).cmp(stamp(a.1)).then(b.0.cmp(&a.0)));
+    let has = |c: &RecallCells, s: &str| c.by_scene.get(s).is_some_and(|v| !v.is_empty());
+    let mut m = Measured::default();
+    for s in recall::SCENES {
+        let Some((_, r, c)) = runs
+            .iter()
+            .find(|(_, r, c)| r.request.scene.keeps(Some(s)) && has(c, s))
+        else {
+            continue;
+        };
+        let cams = c
+            .by_camera_scene
+            .iter()
+            .filter(|x| x.scene == s)
+            .map(|x| (x.camera.as_str(), x.classes.as_slice()));
+        let classes = c.by_scene.get(s).map(Vec::as_slice).unwrap_or_default();
+        m.scenes
+            .insert(s.to_string(), recall::Slice::new(&r.id, classes, cams));
+    }
+    let overall = runs
+        .iter()
+        .find(|(_, r, c)| r.request.scene.is_all() && has(c, "all"))
+        .or_else(|| runs.iter().find(|(_, _, c)| has(c, "all")));
+    if let Some((_, r, c)) = overall {
+        let classes = c.by_scene.get("all").map(Vec::as_slice).unwrap_or_default();
+        let cams = c.by_camera.iter().map(|(k, v)| (k.as_str(), v.as_slice()));
+        m.overall = Some(recall::Slice::new(&r.id, classes, cams));
+    }
+    (!m.is_empty()).then_some(m)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::benchmark::ClassRecall;
 
     fn ctx_with(device: Option<&str>) -> RunContext {
         let mut config = crate::config::Config::default();
@@ -686,6 +794,19 @@ mod tests {
             relative: false,
             roc_auc: None,
             ap_basis: None,
+            per_class: vec![],
+        }
+    }
+
+    fn cr(class: &str, gt: usize, missed: usize) -> ClassRecall {
+        ClassRecall::new(class, gt, missed)
+    }
+
+    /// [`breakdown`] with per-class recall.
+    fn cells(key: &str, per_class: Vec<ClassRecall>) -> Breakdown {
+        Breakdown {
+            per_class,
+            ..breakdown(key, 10, 0.5)
         }
     }
 
@@ -1177,5 +1298,239 @@ mod tests {
         own[3].baseline = Some(measured("k"));
         own[1].baseline = None;
         assert!(reusable_baseline(&own, me, "k").is_none());
+    }
+
+    #[test]
+    fn summarize_reads_recall_cells_from_the_heldout_tags_only() {
+        let tags = vec![
+            // Bare tags of a built-in set run beside: never cells.
+            cells("night", vec![cr("person", 500, 100)]),
+            cells("camera:back", vec![cr("person", 500, 100)]),
+            cells(
+                "heldout:all",
+                vec![cr("person", 40, 4), cr("raccoon", 9, 5)],
+            ),
+            cells("heldout:night", vec![cr("raccoon", 9, 5)]),
+            cells("heldout:day", vec![cr("person", 40, 4)]),
+            cells("heldout:in-scope", vec![cr("raccoon", 9, 5)]),
+            cells("heldout:random", vec![cr("person", 4, 1)]),
+            cells("heldout:cam:back:yard", vec![cr("raccoon", 9, 5)]),
+            cells(
+                "heldout:camscene:night:back:yard",
+                vec![cr("raccoon", 9, 5)],
+            ),
+            cells("heldout:cam:front", vec![cr("person", 40, 4)]),
+            cells("heldout:camscene:day:front", vec![cr("person", 40, 4)]),
+        ];
+        let b = summarize(&result(tags.clone(), true));
+        let c = &b.recall_cells;
+        assert_eq!(
+            c.by_scene.keys().collect::<Vec<_>>(),
+            ["all", "day", "night"]
+        );
+        assert_eq!(c.by_scene["night"], [cr("raccoon", 9, 5)]);
+        assert_eq!(
+            c.by_scene["all"],
+            [cr("person", 40, 4), cr("raccoon", 9, 5)]
+        );
+        assert_eq!(
+            c.by_camera.keys().collect::<Vec<_>>(),
+            ["back:yard", "front"]
+        );
+        assert_eq!(
+            c.by_camera_scene,
+            [
+                CameraSceneRecall {
+                    camera: "back:yard".into(),
+                    scene: "night".into(),
+                    classes: vec![cr("raccoon", 9, 5)],
+                },
+                CameraSceneRecall {
+                    camera: "front".into(),
+                    scene: "day".into(),
+                    classes: vec![cr("person", 40, 4)],
+                },
+            ]
+        );
+        // The JSON shape, and a round trip.
+        let j = serde_json::to_value(&b).unwrap();
+        let cell = &j["recall_cells"]["by_scene"]["night"][0];
+        assert_eq!(cell["class"], "raccoon");
+        assert_eq!(
+            (cell["gt"].as_u64(), cell["missed"].as_u64()),
+            (Some(9), Some(5))
+        );
+        assert_eq!(j["recall_cells"]["by_camera"]["back:yard"][0]["gt"], 9);
+        assert_eq!(j["recall_cells"]["by_camera_scene"][1]["camera"], "front");
+        assert_eq!(j["recall_cells"]["by_camera_scene"][1]["scene"], "day");
+        let back: BenchSummary = serde_json::from_value(j).unwrap();
+        assert_eq!(back.recall_cells, b.recall_cells);
+        // Without the held-out set's own tags: no cells, whatever the bare tags say, and
+        // nothing written.
+        let bare: Vec<Breakdown> = tags
+            .into_iter()
+            .filter(|t| !t.key.starts_with("heldout:"))
+            .collect();
+        let b = summarize(&result(bare, false));
+        assert!(b.recall_cells.is_empty());
+        assert!(
+            serde_json::to_value(&b)
+                .unwrap()
+                .get("recall_cells")
+                .is_none()
+        );
+        // Breakdowns against pseudo ground truth are no cells either.
+        let mut rel = cells("heldout:night", vec![cr("raccoon", 9, 5)]);
+        rel.relative = true;
+        let b = summarize(&result(
+            vec![cells("heldout:all", vec![cr("raccoon", 9, 5)]), rel],
+            false,
+        ));
+        assert!(!b.recall_cells.by_scene.contains_key("night"));
+    }
+
+    /// Cells per camera: (camera, cells).
+    type CamCells<'a> = Vec<(&'a str, Vec<ClassRecall>)>;
+
+    /// A finished run of filter `scene` with a fingerprint and cells: per scene `scenes`
+    /// ((scene, cells, camera-in-scene cells)), over all held-out frames `all`, per camera
+    /// `cams`.
+    fn cell_run(
+        id: &str,
+        finished: &str,
+        scene: dataset::SceneFilter,
+        scenes: &[(&str, Vec<ClassRecall>, CamCells<'_>)],
+        all: Vec<ClassRecall>,
+        cams: CamCells<'_>,
+    ) -> super::super::service::RunRecord {
+        let mut r = rec(id, None, None);
+        r.request.scene = scene;
+        r.finished = Some(finished.into());
+        let mut c = RecallCells::default();
+        for (s, classes, by_cam) in scenes {
+            c.by_scene.insert(s.to_string(), classes.clone());
+            for (cam, v) in by_cam {
+                c.by_camera_scene.push(CameraSceneRecall {
+                    camera: cam.to_string(),
+                    scene: s.to_string(),
+                    classes: v.clone(),
+                });
+            }
+        }
+        if !all.is_empty() {
+            c.by_scene.insert("all".into(), all);
+        }
+        c.by_camera = cams.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        r.benchmark = Some(BenchSummary {
+            heldout_fingerprint: Some("fp".into()),
+            recall_cells: c,
+            ..BenchSummary::default()
+        });
+        r
+    }
+
+    #[test]
+    fn measured_recall_takes_the_newest_run_per_scene_that_trained_on_it() {
+        use dataset::SceneFilter;
+        let general = cell_run(
+            "general",
+            "2026-11-01T10:00:00Z",
+            SceneFilter::ALL_SCENES,
+            &[
+                (
+                    "day",
+                    vec![cr("person", 100, 10)],
+                    vec![("front", vec![cr("person", 60, 6)])],
+                ),
+                (
+                    "night",
+                    vec![cr("raccoon", 30, 15)],
+                    vec![("back", vec![cr("raccoon", 30, 15)])],
+                ),
+            ],
+            vec![cr("person", 100, 10), cr("raccoon", 30, 15)],
+            vec![
+                ("front", vec![cr("person", 60, 6)]),
+                ("back", vec![cr("raccoon", 30, 15)]),
+            ],
+        );
+        // Newer, a night model: its night cells win; its day cells (frames it never trained
+        // on) and its overall cells do not.
+        let night = cell_run(
+            "night",
+            "2026-11-05T10:00:00Z",
+            SceneFilter::NIGHT_IR,
+            &[
+                ("day", vec![cr("person", 100, 90)], vec![]),
+                (
+                    "night",
+                    vec![cr("raccoon", 30, 3)],
+                    vec![("back", vec![cr("raccoon", 30, 3)])],
+                ),
+            ],
+            vec![cr("person", 100, 90), cr("raccoon", 30, 3)],
+            vec![("back", vec![cr("raccoon", 30, 3)])],
+        );
+        // Newest, but without a held-out fingerprint (an older version's run): skipped.
+        let mut old = cell_run(
+            "no-fingerprint",
+            "2026-11-09T10:00:00Z",
+            SceneFilter::ALL_SCENES,
+            &[("day", vec![cr("person", 10, 10)], vec![])],
+            vec![cr("person", 10, 10)],
+            vec![],
+        );
+        old.benchmark.as_mut().unwrap().heldout_fingerprint = None;
+        // Newest, failed: skipped.
+        let mut failed = cell_run(
+            "failed",
+            "2026-11-10T10:00:00Z",
+            SceneFilter::ALL_SCENES,
+            &[("day", vec![cr("person", 10, 10)], vec![])],
+            vec![cr("person", 10, 10)],
+            vec![],
+        );
+        failed.state = super::super::service::RunState::Failed;
+        let runs = vec![night.clone(), general.clone(), old, failed];
+        let m = measured_recall(&runs).unwrap();
+        assert_eq!(m.scenes["day"].run, "general");
+        assert_eq!(m.scenes["night"].run, "night");
+        assert!(!m.scenes.contains_key("ir"), "no run measured IR");
+        assert_eq!(
+            m.scenes["night"].camera_class("back", "raccoon"),
+            recall::Cell { gt: 30, missed: 3 }
+        );
+        assert_eq!(
+            m.scenes["day"].camera_class("front", "person"),
+            recall::Cell { gt: 60, missed: 6 }
+        );
+        let o = m.overall.as_ref().unwrap();
+        assert_eq!(
+            o.run, "general",
+            "the newest run that trained on every scene"
+        );
+        assert_eq!(o.class("raccoon"), recall::Cell { gt: 30, missed: 15 });
+        assert_eq!(
+            m.class_recall_on_camera("back", "raccoon").unwrap().cell,
+            recall::Cell { gt: 30, missed: 15 }
+        );
+        // The order of the records does not matter, the stamps do.
+        assert_eq!(
+            measured_recall(&[general.clone(), night.clone()]),
+            Some(m.clone())
+        );
+        // Only the night model: its overall cells stand in (the newest with any), and its day
+        // cells are still not the day scene's.
+        let m = measured_recall(std::slice::from_ref(&night)).unwrap();
+        assert_eq!(m.overall.as_ref().unwrap().run, "night");
+        assert!(!m.scenes.contains_key("day"));
+        // No runs, or none measured: None.
+        assert_eq!(measured_recall(&[]), None);
+        let mut bare = rec("bare", None, None);
+        bare.benchmark = Some(BenchSummary {
+            heldout_fingerprint: Some("fp".into()),
+            ..BenchSummary::default()
+        });
+        assert_eq!(measured_recall(&[bare]), None);
     }
 }

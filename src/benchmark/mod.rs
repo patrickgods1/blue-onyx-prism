@@ -54,6 +54,7 @@ pub use report::{
     recommend, results_path, speed_order,
 };
 
+pub use metrics::ClassRecall;
 pub use run::{Bench, Cancelled, Phase, Progress, ReadAhead, is_cancelled};
 pub(crate) use scoring::{
     REFERENCE_DEVICES, no_pseudo_gt_device, pseudo_ground_truth, pseudo_gt_device,
@@ -265,6 +266,12 @@ pub struct Breakdown {
     /// versions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ap_basis: Option<ApBasis>,
+    /// Per tag only: recall of every class with ground truth in the subset, at the threshold
+    /// (IoU 0.5), with integer counts. Over every class of the model the set scores (the
+    /// held-out set's raccoon, fox, ... included), not only the CCTV classes the AP above
+    /// averages (`scoring::score`). Empty for datasets and in results of older versions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_class: Vec<ClassRecall>,
 }
 
 impl Breakdown {
@@ -281,6 +288,7 @@ impl Breakdown {
             relative,
             roc_auc,
             ap_basis: s.ap_basis.clone(),
+            per_class: Vec::new(),
         }
     }
 }
@@ -318,6 +326,17 @@ pub struct AccuracyReport {
 }
 
 impl AccuracyReport {
+    /// The tag breakdowns a tag table shows: every one but the held-out set's per-camera tags
+    /// (`heldout:cam:` / `heldout:camscene:`, [`crate::training::dataset::is_cell_tag`]), which
+    /// repeat the `camera:` rows and only feed the training run's recall cells. Twin:
+    /// `cellTag` in `assets/benchmark.js`.
+    pub fn shown_tags(&self) -> Vec<&Breakdown> {
+        self.by_tag
+            .iter()
+            .filter(|b| !crate::training::dataset::is_cell_tag(&b.key))
+            .collect()
+    }
+
     /// The accuracy score `metric` grades: AP@0.5 blended with small-object recall
     /// (`grade::accuracy_score`), or the macro frame ROC AUC.
     pub fn score(&self, metric: grade::AccuracyMetric) -> Option<f64> {

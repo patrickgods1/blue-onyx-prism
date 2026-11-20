@@ -276,6 +276,17 @@ Before the Export button, the Dataset tab's Export card can show two lines (`ass
    Nobody chose those frames, while the rest of the reviewed set leans to the hard and rare frames the
    queue order puts first, so their score is the least biased one ([Comparison](#comparing-day-nightir-and-mixed-models)).
    The flag is not part of `heldout_fingerprint`: marking a frame changes no held-out frame.
+   Each frame is also tagged with its camera, `heldout:cam:<camera>` and
+   `heldout:camscene:<scene>:<camera>` (the camera last: a folder name may hold a `:`). The
+   benchmark keeps every tag's recall per class (`per_class`: `class`, `gt`, `missed`, `recall` at
+   the threshold, IoU 0.5) over every class the held-out set scores, the custom animals included
+   (raccoon, fox, ... are no CCTV class, so they are in no AP, but they have their recall). The
+   summary's `recall_cells` holds these from the held-out tags only: `by_scene` (`day`, `night`,
+   `ir`, `all`), `by_camera` and `by_camera_scene` (`{camera, scene, classes}`). The per-camera
+   tags are left out of the Benchmark page's and report's tag tables (the `camera:` rows already
+   show each camera). The Review queue reads the newest of these per scene
+   (`bench::measured_recall`: the newest finished run with a held-out fingerprint that trained on
+   the scene; per camera over every scene the newest that trained on all scenes).
 3. **Scene filter** (training and validation frames only): `all`, or any combination of `day`,
    `night` and `ir` joined by `+` (`day`, `night`, `ir`, `day+night`, `day+ir`, `night+ir`; the
    page's checkboxes). Frames without a scene tag are left out by every filter but `all`, with a

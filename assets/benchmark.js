@@ -908,6 +908,10 @@
     if (has && PB.basisText(basis)) { c.textContent = ""; c.appendChild(PB.withBasis(pct(v), basis, what + " averaged", "ap:" + what)); }
     return c;
   }
+  // A held-out set's per-camera tag (`heldout:cam:<camera>`, `heldout:camscene:<scene>:<camera>`):
+  // left out of the By tag table (the `camera:` rows show each camera; these feed the training
+  // run's recall cells). Twin: `training::dataset::is_cell_tag`.
+  function cellTag(k) { return k.indexOf("heldout:cam:") === 0 || k.indexOf("heldout:camscene:") === 0; }
   // `few`: the minimum objects of a class average; a row with fewer is marked "too few to judge"
   // (By class: shown, but left out of the averages).
   function breakdown(key, title, rows, few) {
@@ -946,7 +950,7 @@
       var a = run.accuracy;
       box.appendChild(el("p", "muted", "Scored classes: " + a.classes.join(", ") + ". Precision/recall at confidence " + a.threshold.toFixed(2) + ", IoU 0.5. Small/medium/large recall: " + a.overall.by_size.map(function (s) { return s.bucket + " " + pct(s.recall) + " (" + s.gt + ")"; }).join(", ")));
       box.appendChild(breakdown("bd:" + key, "By dataset", a.by_dataset));
-      box.appendChild(breakdown("bd:" + key, "By tag", a.by_tag));
+      box.appendChild(breakdown("bd:" + key, "By tag", (a.by_tag || []).filter(function (b) { return !cellTag(b.key); })));
       var classAuc = function (k) { var x = a.frame_roc && (a.frame_roc.per_class || []).find(function (c) { return c["class"] === k; }); return x ? x.auc : null; };
       var basis = a.overall.ap_basis;
       if (PB.basisText(basis)) box.appendChild(el("p", "muted", "AP50 and AP50-95 average " + PB.basisText(basis) + (basis.fell_back ? "." : "; classes with fewer objects are scored per class only (By class).")));

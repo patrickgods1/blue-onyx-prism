@@ -126,7 +126,7 @@ fn device_row(m: &ModelResult, d: &DeviceResult) -> Vec<String> {
     }
 }
 
-fn breakdown_table(title: &str, rows: &[Breakdown]) -> Table {
+fn breakdown_table<'a>(title: &str, rows: impl IntoIterator<Item = &'a Breakdown>) -> Table {
     Table {
         title: title.to_string(),
         numbers: Numbers::default(),
@@ -136,7 +136,7 @@ fn breakdown_table(title: &str, rows: &[Breakdown]) -> Table {
         .map(String::from)
         .to_vec(),
         rows: rows
-            .iter()
+            .into_iter()
             .map(|b| {
                 vec![
                     if b.relative {
@@ -687,7 +687,7 @@ fn accuracy_tables(
         paragraphs.push(ap_basis_note(b));
     }
     tables.push(breakdown_table("By dataset", &a.by_dataset));
-    tables.push(breakdown_table("By tag", &a.by_tag));
+    tables.push(breakdown_table("By tag", a.shown_tags()));
     tables.push(Table {
         title: "By class".into(),
         numbers: Numbers::default(),

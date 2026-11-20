@@ -751,7 +751,7 @@ pub(super) fn print_accuracy_breakdown(p: &RunResult) {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            for b in a.by_dataset.iter().chain(&a.by_tag) {
+            for b in a.by_dataset.iter().chain(a.shown_tags()) {
                 println!(
                     "    {:<24} {:>4} img {:>5} obj  AP50 {:>5}  AUC {:>5}  P {:>5}  R {:>5}{}",
                     b.key,

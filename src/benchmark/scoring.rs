@@ -6,7 +6,9 @@ use super::*;
 
 /// Score the run: overall accuracy (over the images with real ground truth, else those with
 /// pseudo ground truth), per dataset and per tag; marks each stored prediction TP/FP and each
-/// ground-truth object matched/missed in `per_image`.
+/// ground-truth object matched/missed in `per_image`. Each tag also gets its per-class recall
+/// ([`Breakdown::per_class`]) over every class of the model the sets score: a custom model's
+/// raccoon or fox is no CCTV class, so it is in no AP here, but it has its recall per tag.
 pub(super) fn score(
     job: &Job,
     all: &[(&ImageSet, &images::SetImage)],
@@ -49,7 +51,36 @@ pub(super) fn score(
     let chosen = &scored.chosen;
     let relative = scored.relative;
     let overall = metrics::evaluate(&scored.subset(chosen), &map.classes, threshold);
-    let all_classes = all_classes_ap(job, &map, &scored, eval_preds, threshold);
+    // Every class of the model the sets score (raccoon, fox, ... besides the CCTV classes):
+    // the all-classes AP and each tag's per-class recall.
+    let wide = ClassMap::all_classes(&job.classes);
+    let wide = (wide.classes.len() > map.classes.len()).then(|| {
+        let evals: Vec<Option<EvalImage>> = all
+            .iter()
+            .enumerate()
+            .map(|(k, (set, img))| {
+                let gt = img.gt.as_ref()?;
+                let preds = eval_preds.get(k)?;
+                Some(eval_input(&wide, set.scored_labels.as_deref(), gt, preds).1)
+            })
+            .collect();
+        (wide, evals)
+    });
+    let all_classes = wide
+        .as_ref()
+        .map(|(m, evals)| all_classes_ap(m, evals, chosen, threshold));
+    // The per-class recall of the images `ks`: over every class when the model has more than
+    // the CCTV ones (the AP of a tag stays on the CCTV classes, the headline's basis).
+    let class_recall = |ks: &[usize]| match &wide {
+        Some((m, evals)) => {
+            let imgs: Vec<EvalImage> = ks
+                .iter()
+                .filter_map(|&k| evals.get(k).cloned().flatten())
+                .collect();
+            metrics::class_recall(&imgs, &m.classes, threshold)
+        }
+        None => metrics::class_recall(&scored.subset(ks), &map.classes, threshold),
+    };
     let ground_truth = ground_truth_desc(all, relative);
     // Per dataset (each with its own kind of ground truth).
     let by_dataset = scored
@@ -77,12 +108,15 @@ pub(super) fn score(
         .into_iter()
         .map(|(t, ks)| {
             let sum = metrics::evaluate(&scored.subset(&ks), &map.classes, threshold);
-            Breakdown::of(
-                t,
-                &sum,
-                relative,
-                scored.frame_roc(&ks, &map.classes, 0).auc,
-            )
+            Breakdown {
+                per_class: class_recall(&ks),
+                ..Breakdown::of(
+                    t,
+                    &sum,
+                    relative,
+                    scored.frame_roc(&ks, &map.classes, 0).auc,
+                )
+            }
         })
         .collect();
     let sweep = scored.threshold_sweep(&map.classes, threshold, objective);
@@ -161,37 +195,27 @@ pub(super) fn score_image(
     (eval, classes)
 }
 
-/// AP over every class of the model on the images of the overall score, averaged like the
-/// overall AP (the classes with [`metrics::MIN_CLASS_GT`] objects or more, recorded in its
-/// `ap_basis`); None when the model has no classes besides the scored ones.
+/// AP over every class of the model (`all_map`, wider than the scored CCTV classes) on the
+/// images `chosen` of the overall score, averaged like the overall AP (the classes with
+/// [`metrics::MIN_CLASS_GT`] objects or more, recorded in its `ap_basis`). `evals`: per image of
+/// the run, its eval input in `all_map`'s label space (None = no ground truth).
 pub(super) fn all_classes_ap(
-    job: &Job,
-    map: &ClassMap,
-    scored: &Scored,
-    eval_preds: &[Vec<PredBox>],
+    all_map: &ClassMap,
+    evals: &[Option<EvalImage>],
+    chosen: &[usize],
     threshold: f32,
-) -> Option<AllClasses> {
-    let all = scored.all;
-    let all_map = ClassMap::all_classes(&job.classes);
-    (all_map.classes.len() > map.classes.len()).then(|| {
-        let imgs: Vec<EvalImage> = scored
-            .chosen
-            .iter()
-            .filter_map(|&k| {
-                let (set, img) = all.get(k)?;
-                let gt = img.gt.as_ref()?;
-                let preds = eval_preds.get(k)?;
-                Some(eval_input(&all_map, set.scored_labels.as_deref(), gt, preds).1)
-            })
-            .collect();
-        let s = metrics::evaluate(&imgs, &all_map.classes, threshold);
-        AllClasses {
-            classes: s.per_class.iter().filter(|c| c.gt > 0).count(),
-            ap50: s.ap50,
-            ap50_95: s.ap50_95,
-            ap_basis: s.ap_basis,
-        }
-    })
+) -> AllClasses {
+    let imgs: Vec<EvalImage> = chosen
+        .iter()
+        .filter_map(|&k| evals.get(k).cloned().flatten())
+        .collect();
+    let s = metrics::evaluate(&imgs, &all_map.classes, threshold);
+    AllClasses {
+        classes: s.per_class.iter().filter(|c| c.gt > 0).count(),
+        ap50: s.ap50,
+        ap50_95: s.ap50_95,
+        ap_basis: s.ap_basis,
+    }
 }
 
 /// [`AccuracyReport::ground_truth`]: "ground truth", or the pseudo ground truth references.
@@ -926,6 +950,174 @@ mod tests {
         assert_eq!(keys, [("car", 1, 0), ("motorcycle", 0, 1)]);
         // One-sided per class: undefined, so no macro AUC.
         assert_eq!(roc.auc, None);
+    }
+
+    /// A custom model trained on the default review classes, on its held-out set (a folder set
+    /// whose scored labels are the export's classes): every tag lists the recall of each class
+    /// with ground truth, the wildlife classes the CCTV scoring leaves out included, while the
+    /// AP of the tag and of the run stays on the CCTV classes. Datasets get no per-class list.
+    #[test]
+    fn tags_carry_recall_of_every_class_custom_animals_included() {
+        let classes: Vec<String> = crate::collect::config::DEFAULT_CLASSES
+            .map(String::from)
+            .to_vec();
+        let g = |l: &str, b: [f32; 4]| GtBox {
+            label: l.into(),
+            bbox: b,
+            ignore: false,
+            crowd: false,
+        };
+        let p = |l: &str, c: f32, b: [f32; 4]| PredBox {
+            label: l.into(),
+            confidence: c,
+            bbox: b,
+        };
+        let mut set = ImageSet::sample();
+        set.id = "heldout-m".into();
+        set.ground_truth = GroundTruth::Manifest;
+        set.scored_labels = Some(classes.clone());
+        let tags = |scene: &str| -> Vec<String> {
+            [
+                format!("heldout:{scene}"),
+                "heldout:all".into(),
+                "heldout:cam:back".into(),
+                format!("heldout:camscene:{scene}:back"),
+            ]
+            .to_vec()
+        };
+        let mut night = set.images[0].clone();
+        night.tags = tags("night");
+        night.gt = Some(vec![
+            g("person", [0.0, 0.0, 100.0, 200.0]),
+            g("raccoon", [300.0, 300.0, 360.0, 340.0]),
+            g("fox", [500.0, 300.0, 580.0, 360.0]),
+        ]);
+        let mut ir = set.images[0].clone();
+        ir.tags = tags("ir");
+        ir.gt = Some(vec![
+            g("raccoon", [0.0, 0.0, 60.0, 40.0]),
+            g("opossum", [200.0, 200.0, 260.0, 240.0]),
+            g("bird", [400.0, 0.0, 420.0, 20.0]),
+        ]);
+        set.images = vec![night, ir];
+        let preds = vec![
+            vec![
+                p("person", 0.9, [0.0, 0.0, 100.0, 200.0]),
+                p("raccoon", 0.8, [300.0, 300.0, 360.0, 340.0]),
+                // The fox called a cat: a missed fox (and a false cat).
+                p("cat", 0.7, [500.0, 300.0, 580.0, 360.0]),
+            ],
+            vec![
+                p("opossum", 0.6, [200.0, 200.0, 260.0, 240.0]),
+                p("bird", 0.9, [400.0, 0.0, 420.0, 20.0]),
+                // Below the threshold: the raccoon is missed.
+                p("raccoon", 0.2, [0.0, 0.0, 60.0, 40.0]),
+            ],
+        ];
+        let job = Job {
+            name: "custom".into(),
+            path: "custom.onnx".into(),
+            family: ModelFamilyKind::Yolo8,
+            classes,
+            device: "auto".into(),
+            gpu_precision: None,
+            confidence_threshold: None,
+            object_filter: None,
+            variant: None,
+        };
+        let all: Vec<_> = set.images.iter().map(|i| (&set, i)).collect();
+        let mut pi: Vec<ImageRun> = all
+            .iter()
+            .map(|(s, i)| ImageRun {
+                set: s.id.clone(),
+                file: i.file.clone(),
+                total_ms: 1.0,
+                infer_ms: 1.0,
+                preds: vec![],
+                gt_matched: vec![],
+                counts: None,
+            })
+            .collect();
+        let (acc, note) = score(&job, &all, &mut pi, &preds, 0.5, Default::default());
+        assert!(note.is_none());
+        let acc = acc.unwrap();
+        let cells = |key: &str| -> BTreeMap<String, (usize, usize)> {
+            acc.by_tag
+                .iter()
+                .find(|b| b.key == key)
+                .unwrap()
+                .per_class
+                .iter()
+                .map(|c| (c.class.clone(), (c.gt, c.missed)))
+                .collect()
+        };
+        let want = |v: &[(&str, usize, usize)]| -> BTreeMap<String, (usize, usize)> {
+            v.iter()
+                .map(|&(c, gt, m)| (c.to_string(), (gt, m)))
+                .collect()
+        };
+        let every = want(&[
+            ("person", 1, 0),
+            ("raccoon", 2, 1),
+            ("fox", 1, 1),
+            ("opossum", 1, 0),
+            ("bird", 1, 0),
+        ]);
+        assert_eq!(cells("heldout:all"), every);
+        assert_eq!(cells("heldout:cam:back"), every);
+        assert_eq!(
+            cells("heldout:night"),
+            want(&[("person", 1, 0), ("raccoon", 1, 0), ("fox", 1, 1)])
+        );
+        assert_eq!(
+            cells("heldout:camscene:ir:back"),
+            want(&[("raccoon", 1, 1), ("opossum", 1, 0), ("bird", 1, 0)])
+        );
+        let racc = acc.by_tag[0]
+            .per_class
+            .iter()
+            .find(|c| c.class == "raccoon")
+            .cloned();
+        assert!(racc.is_some_and(|c| c.recall.is_some()));
+        // The AP of the run and of each tag stays on the CCTV classes.
+        assert_eq!(
+            acc.classes,
+            [
+                "person",
+                "bicycle",
+                "car",
+                "motorcycle",
+                "truck",
+                "dog",
+                "cat",
+                "bird"
+            ]
+        );
+        let tag = acc.by_tag.iter().find(|b| b.key == "heldout:all").unwrap();
+        assert_eq!(tag.gt, 2, "person and bird: the CCTV classes with objects");
+        assert!(acc.all_classes.is_some());
+        assert!(acc.by_dataset.iter().all(|b| b.per_class.is_empty()));
+        // The tag tables leave the per-camera held-out tags out.
+        let shown: Vec<&str> = acc.shown_tags().iter().map(|b| b.key.as_str()).collect();
+        assert!(shown.contains(&"heldout:all") && shown.contains(&"heldout:night"));
+        assert!(
+            shown.iter().all(|k| !k.starts_with("heldout:cam")),
+            "{shown:?}"
+        );
+        assert!(acc.by_tag.iter().any(|b| b.key == "heldout:cam:back"));
+        // Round trip, and a breakdown of an older version without the field parses.
+        let j = serde_json::to_value(tag).unwrap();
+        assert!(j["per_class"].as_array().is_some_and(|a| a.len() == 5));
+        let back: Breakdown = serde_json::from_value(j).unwrap();
+        assert_eq!(&back, tag);
+        let mut old = serde_json::to_value(tag).unwrap();
+        old.as_object_mut().unwrap().remove("per_class");
+        let old: Breakdown = serde_json::from_value(old).unwrap();
+        assert!(old.per_class.is_empty());
+        assert!(
+            !serde_json::to_string(&old).unwrap().contains("per_class"),
+            "an empty list is not written"
+        );
     }
 
     /// Frame-level ROC through scoring: an IPcam-style model (person + vehicle group), ignore

@@ -851,27 +851,47 @@ fn the_heldout_set_is_the_same_for_every_scene_filter() {
             "{:?}",
             i.tags
         );
+        // The camera's own held-out tags, alone and in the scene.
+        let camera = i
+            .tags
+            .iter()
+            .find_map(|t| t.strip_prefix("camera:"))
+            .unwrap();
+        assert!(
+            i.tags.contains(&format!("{HELDOUT_CAM}{camera}")),
+            "{:?}",
+            i.tags
+        );
+        assert!(
+            i.tags
+                .contains(&format!("{HELDOUT_CAMSCENE}{scene}:{camera}")),
+            "{:?}",
+            i.tags
+        );
     }
 }
 
 #[test]
 fn heldout_tags_name_the_scene_and_the_scope() {
     assert_eq!(
-        heldout_tags(Some("ir"), SceneFilter::NIGHT_IR, false),
+        heldout_tags(Some("ir"), "", SceneFilter::NIGHT_IR, false),
         ["ir", "heldout:ir", "heldout:all", "heldout:in-scope"]
     );
     assert_eq!(
-        heldout_tags(Some("day"), SceneFilter::NIGHT_IR, false),
+        heldout_tags(Some("day"), "", SceneFilter::NIGHT_IR, false),
         ["day", "heldout:day", "heldout:all"]
     );
     assert_eq!(
-        heldout_tags(None, SceneFilter::ALL_SCENES, false),
+        heldout_tags(None, "", SceneFilter::ALL_SCENES, false),
         ["heldout:all", "heldout:in-scope"]
     );
-    assert_eq!(heldout_tags(None, SceneFilter::DAY, false), ["heldout:all"]);
-    // A random pick of the Review queue: one more tag, last.
     assert_eq!(
-        heldout_tags(Some("day"), SceneFilter::DAY, true),
+        heldout_tags(None, "", SceneFilter::DAY, false),
+        ["heldout:all"]
+    );
+    // A random pick of the Review queue: one more tag.
+    assert_eq!(
+        heldout_tags(Some("day"), "", SceneFilter::DAY, true),
         [
             "day",
             "heldout:day",
@@ -881,9 +901,56 @@ fn heldout_tags_name_the_scene_and_the_scope() {
         ]
     );
     assert_eq!(
-        heldout_tags(None, SceneFilter::DAY, true),
+        heldout_tags(None, "", SceneFilter::DAY, true),
         ["heldout:all", HELDOUT_RANDOM]
     );
+    // The camera last, alone and in its scene; no scene, no camera-in-scene tag.
+    assert_eq!(
+        heldout_tags(Some("night"), "back", SceneFilter::NIGHT_IR, true),
+        [
+            "night",
+            "heldout:night",
+            "heldout:all",
+            "heldout:in-scope",
+            "heldout:random",
+            "heldout:cam:back",
+            "heldout:camscene:night:back"
+        ]
+    );
+    assert_eq!(
+        heldout_tags(None, "back", SceneFilter::DAY, false),
+        ["heldout:all", "heldout:cam:back"]
+    );
+}
+
+/// Camera names are folder names and may hold a `:` (Unix): the camera comes last and is read
+/// by prefix, whole.
+#[test]
+fn camera_tags_read_back_whole() {
+    let cam = "drive:way";
+    for t in heldout_tags(Some("ir"), cam, SceneFilter::ALL_SCENES, false) {
+        match cell_tag(&t) {
+            Some(CellTag::Camera(c)) => assert_eq!(c, cam),
+            Some(CellTag::CameraScene { scene, camera }) => {
+                assert_eq!((scene, camera), ("ir", cam));
+            }
+            None => assert!(!is_cell_tag(&t), "{t}"),
+        }
+    }
+    assert_eq!(cell_tag("heldout:cam:"), None);
+    assert_eq!(cell_tag("heldout:camscene:night"), None);
+    assert_eq!(cell_tag("heldout:camscene::back"), None);
+    assert_eq!(cell_tag("heldout:all"), None);
+    assert_eq!(cell_tag("camera:back"), None);
+    assert_eq!(
+        cell_tag("heldout:camscene:day:a:b"),
+        Some(CellTag::CameraScene {
+            scene: "day",
+            camera: "a:b"
+        })
+    );
+    assert!(is_cell_tag("heldout:cam:x") && is_cell_tag("heldout:camscene:day:x"));
+    assert!(!is_cell_tag("heldout:day") && !is_cell_tag("heldout:in-scope"));
 }
 
 #[test]
