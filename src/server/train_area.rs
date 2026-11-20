@@ -5,9 +5,10 @@
 //! next action) with the pure rule [`next_step`], and the Dataset tab. The other tabs render in
 //! [`super::dataset`], [`super::review`], [`super::refine`] and [`super::training`].
 //!
-//! Nothing here walks the frames on the request path: the walk ([`queue::tally`]) runs on its own
-//! thread and its answer is kept ([`tally_of`]), so a large dataset delays neither the pages (the
-//! strip is filled by `assets/train-area.js` after the page is up) nor this route.
+//! Nothing here walks the frames on the request path: the walk ([`queue::tally`], then [`auto_gap`]
+//! for the frames no auto-label run has seen) runs on its own thread and its answer is kept
+//! ([`tally_of`], [`walked_of`]), so a large dataset delays neither the pages (the strip is filled by
+//! `assets/train-area.js` after the page is up) nor this route.
 
 use super::{AppState, blocking, encode_uri_component, render};
 use crate::collect::CollectSettings;
@@ -71,6 +72,16 @@ const ENOUGH_TO_EXPORT: u64 = 50;
 /// Frames no auto-label run has seen before Auto-label is suggested: a few new frames from the
 /// collector should not send the owner back there.
 const ENOUGH_TO_AUTOLABEL: u64 = 20;
+/// Unreviewed night and IR frames no auto-label run has seen before a run is suggested ahead of an
+/// export ([`autolabel_gap`]): one default run's worth (`autolabel::DEFAULT_LIMIT`, 200 frames). The
+/// camera's model misses most at night, and only a labeler's box can bring such a frame up in the
+/// Review queue, so this many frames left unlabelled is where recall is lost; fewer is not worth
+/// putting ahead of an export of frames already reviewed.
+pub(crate) const ENOUGH_NIGHT_TO_AUTOLABEL: u64 = 200;
+/// Unreviewed frames that arrived since the last auto-label run (file time after its start) and no
+/// run has seen, before a run is suggested ahead of an export: one default run's worth, as
+/// [`ENOUGH_NIGHT_TO_AUTOLABEL`].
+pub(crate) const ENOUGH_NEW_TO_AUTOLABEL: u64 = 200;
 
 /// A job on the queue, as the strip words it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,6 +131,12 @@ pub(crate) struct Summary {
     /// Frames to review with no label file: their boxes are in sidecars only, so
     /// `boxes_to_review` undercounts while this is above 0.
     pub(crate) unfiled_to_review: u64,
+    /// Of `never_auto_labelled`, night and of IR frames ([`AutoGap`]).
+    pub(crate) night_never_auto_labelled: u64,
+    pub(crate) ir_never_auto_labelled: u64,
+    /// Of `never_auto_labelled`, frames that arrived after the last auto-label run started (all of
+    /// them when none has run).
+    pub(crate) new_never_auto_labelled: u64,
     /// Distinct (camera, date) among the reviewed frames: a check needs 2.
     pub(crate) reviewed_camera_days: u64,
     /// The dataset check's open `relabel` and `add` suggestions (the fixes that matter most); None
@@ -173,7 +190,8 @@ const CHECK_COVER_NUM: u64 = 3;
 const CHECK_COVER_DEN: u64 = 4;
 
 /// The next step of `s`, the first rule that applies: a job in progress, a finished model nobody
-/// decided about, nothing to work on yet, the dataset check's likely fixes to answer, enough new
+/// decided about, nothing to work on yet, the dataset check's likely fixes to answer, many night / IR
+/// or newly arrived frames no auto-label run has seen ([`autolabel_gap`]), enough new
 /// reviewed frames to export, frames to label and review, a dataset check over the frames reviewed
 /// since the last one, an export not trained on, a failed run, and otherwise nothing to do.
 pub(crate) fn next_step(s: &Summary) -> NextStep {
@@ -225,6 +243,9 @@ pub(crate) fn next_step(s: &Summary) -> NextStep {
         return collect_or_import(s);
     }
     if let Some(n) = answer_check(s) {
+        return n;
+    }
+    if let Some(n) = autolabel_gap(s) {
         return n;
     }
     let unexported = s.frames_reviewed.saturating_sub(s.exported_frames);
@@ -320,6 +341,63 @@ pub(crate) fn next_step(s: &Summary) -> NextStep {
         "/train/collect".to_string(),
         "Turn on collecting",
     )
+}
+
+/// An auto-label run ahead of an export, when many frames to review are unlabelled where it matters:
+/// [`ENOUGH_NIGHT_TO_AUTOLABEL`] night and IR frames (the link filters the scene with more of them,
+/// so the run takes those first, where the enhanced copy and MegaDetector apply), else
+/// [`ENOUGH_NEW_TO_AUTOLABEL`] frames that arrived since the last run. Only on a machine that can run
+/// the labelers; the link fills the Auto-label tab, which starts nothing by itself.
+fn autolabel_gap(s: &Summary) -> Option<NextStep> {
+    if !s.can_autolabel || s.frames_to_review == 0 {
+        return None;
+    }
+    let night = s.night_never_auto_labelled + s.ir_never_auto_labelled;
+    if night >= ENOUGH_NIGHT_TO_AUTOLABEL {
+        let scene = if s.ir_never_auto_labelled >= s.night_never_auto_labelled {
+            "ir"
+        } else {
+            "night"
+        };
+        return Some(step(
+            "autolabel_night",
+            AUTOLABEL,
+            format!(
+                "{} night and IR {} no proposed boxes yet ({} night, {} IR). Your camera's model \
+                 misses most in the dark: auto-label them so animals and people there reach the \
+                 Review queue. MegaDetector v6, under Advanced, adds a camera-trap detector.",
+                night,
+                if night == 1 {
+                    "frame has"
+                } else {
+                    "frames have"
+                },
+                s.night_never_auto_labelled,
+                s.ir_never_auto_labelled
+            ),
+            format!("/train/autolabel?scene={scene}&auto=none"),
+            "Auto-label them",
+        ));
+    }
+    if s.new_never_auto_labelled >= ENOUGH_NEW_TO_AUTOLABEL {
+        return Some(step(
+            "autolabel_new",
+            AUTOLABEL,
+            format!(
+                "{} arrived since the last auto-label run and {} no proposed boxes yet. Auto-label \
+                 them, then you only confirm or correct.",
+                frames(s.new_never_auto_labelled),
+                if s.new_never_auto_labelled == 1 {
+                    "has"
+                } else {
+                    "have"
+                }
+            ),
+            "/train/autolabel?auto=none".to_string(),
+            "Auto-label them",
+        ));
+    }
+    None
 }
 
 fn collect_or_import(s: &Summary) -> NextStep {
@@ -454,7 +532,7 @@ fn export_step(unexported: u64) -> NextStep {
 #[derive(Default)]
 struct Kept {
     /// When the kept answer was made, how long it took; `None` before the first one.
-    done: Option<(Instant, Duration, Arc<Tally>)>,
+    done: Option<(Instant, Duration, Walked)>,
     /// A walk is running.
     walking: bool,
 }
@@ -469,25 +547,110 @@ fn keep_for(took: Duration) -> Duration {
     (took * 20).max(Duration::from_secs(10))
 }
 
+/// What one walk of a folder found: the [`Tally`] and the [`AutoGap`].
+type Walked = (Arc<Tally>, Arc<AutoGap>);
+
 /// Marks a walk over when dropped, panic included, so one failure does not stop the next.
-struct WalkDone<'a>(&'a Path, Option<(Tally, Duration)>);
+struct WalkDone<'a>(&'a Path, Option<(Tally, AutoGap, Duration)>);
 
 impl Drop for WalkDone<'_> {
     fn drop(&mut self) {
         if let Some(k) = KEPT.lock_recover().get_mut(self.0) {
             k.walking = false;
-            if let Some((t, took)) = self.1.take() {
-                k.done = Some((Instant::now(), took, Arc::new(t)));
+            if let Some((t, g, took)) = self.1.take() {
+                k.done = Some((Instant::now(), took, (Arc::new(t), Arc::new(g))));
             }
         }
         WALKED.notify_all();
     }
 }
 
+/// The frames to review that no auto-label run has seen, for [`autolabel_gap`]: night and IR ones,
+/// and the file time of each (to count those that arrived since the last run when the summary is
+/// asked, so a run that finishes needs no new walk to be taken into account).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AutoGap {
+    pub(crate) night: u64,
+    pub(crate) ir: u64,
+    /// Seconds since the Unix epoch of each such frame's file, sorted.
+    arrived: Vec<i64>,
+}
+
+impl AutoGap {
+    /// Such frames whose file is newer than `t` (seconds since the epoch); every one with None.
+    pub(crate) fn newer_than(&self, t: Option<i64>) -> u64 {
+        let old = t.map_or(0, |t| self.arrived.partition_point(|a| *a <= t));
+        (self.arrived.len() - old) as u64
+    }
+}
+
+/// Label files read per piece of [`auto_gap`]'s parallel walk.
+const GAP_CHUNK: usize = 512;
+
+/// The [`AutoGap`] of `dir`: the label file of every frame of [`queue::candidates`] (as
+/// [`queue::tally`] reads them), on the walk's threads at background priority. Frames whose label
+/// file does not read are left out, as the tally leaves them out of its counts.
+pub(crate) fn auto_gap(dir: &Path) -> AutoGap {
+    use crate::collect::labels::queue::{AutoFilter, QueueSource};
+    use crate::collect::labels::{Frame, Status};
+    let all = queue::candidates(dir, QueueSource::All);
+    let chunks: Vec<&[queue::Candidate]> = all.chunks(GAP_CHUNK).collect();
+    let threads = crate::parallel::walk_threads_over(all.len());
+    let walker = crate::collect::layout::Walker::new(dir);
+    let parts = crate::parallel::map_all_at(
+        chunks.len(),
+        threads,
+        crate::parallel::Spawned::Background,
+        &|i| {
+            let mut walker = walker.clone();
+            let mut g = AutoGap::default();
+            for c in chunks.get(i).copied().unwrap_or_default() {
+                let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
+                    continue;
+                };
+                let Ok(labels) = frame.labels() else {
+                    continue;
+                };
+                let open = labels
+                    .as_ref()
+                    .is_none_or(|l| l.status == Status::Unreviewed);
+                if !open || !AutoFilter::Never.matches(labels.as_ref()) {
+                    continue;
+                }
+                match c.scene.as_str() {
+                    "night" => g.night += 1,
+                    "ir" => g.ir += 1,
+                    _ => {}
+                }
+                let at = std::fs::metadata(&frame.jpg)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok());
+                g.arrived.extend(at);
+            }
+            g
+        },
+    );
+    let mut g = AutoGap::default();
+    for p in parts {
+        g.night += p.night;
+        g.ir += p.ir;
+        g.arrived.extend(p.arrived);
+    }
+    g.arrived.sort_unstable();
+    g
+}
+
 /// The [`Tally`] of `dir`: what is kept, however old, while a new walk runs on its own thread. With
 /// nothing kept, waits up to `wait` for the walk (None past that: the page says it is counting and
 /// asks again).
 pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
+    walked_of(dir, wait).map(|w| w.0)
+}
+
+/// [`tally_of`] with the [`AutoGap`] of the same walk.
+pub(super) fn walked_of(dir: &Path, wait: Duration) -> Option<Walked> {
     let mut kept = KEPT.lock_recover();
     let k = kept.entry(dir.to_path_buf()).or_default();
     let fresh = k
@@ -504,14 +667,15 @@ pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
             let mut done = WalkDone(&dir, None);
             let start = Instant::now();
             let t = queue::tally(&dir);
-            done.1 = Some((t, start.elapsed()));
+            let g = auto_gap(&dir);
+            done.1 = Some((t, g, start.elapsed()));
         });
     }
     let until = Instant::now() + wait;
     loop {
         let k = kept.get(dir)?;
-        if let Some((_, _, t)) = &k.done {
-            return Some(t.clone());
+        if let Some((_, _, w)) = &k.done {
+            return Some(w.clone());
         }
         let left = until.saturating_duration_since(Instant::now());
         if !k.walking || left.is_zero() {
@@ -656,12 +820,25 @@ fn unused_model(cfg: &crate::config::Config, runs: &[RunRecord]) -> Option<Strin
     (!used).then(|| name.to_string())
 }
 
+/// When the newest auto-label run that finished was queued (seconds since the epoch); None when none
+/// has finished.
+fn last_autolabel(tasks: &[crate::training::task::TaskRecord]) -> Option<i64> {
+    tasks
+        .iter()
+        .filter(|t| t.kind == TaskKind::Autolabel && t.state == RunState::Done)
+        .filter_map(|t| chrono::DateTime::parse_from_rfc3339(&t.created).ok())
+        .map(|t| t.timestamp())
+        .max()
+}
+
 /// The strip's counts now. `wait`: see [`tally_of`].
 pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<Arc<Tally>>) {
     let config = state.config_read().clone();
     let review_dir = config.collect.resolved_review_dir(&config.data_root());
     let dataset_dir = CollectSettings::for_config(&config).dir;
-    let tally = tally_of(&review_dir, wait);
+    let walked = walked_of(&review_dir, wait);
+    let tally = walked.as_ref().map(|w| w.0.clone());
+    let gap = walked.map(|w| w.1);
     let brief = crate::collect::global().brief_of(&dataset_dir);
     let runs = super::training::records(state);
     let tasks = super::training::tasks(state);
@@ -674,6 +851,7 @@ pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<A
         .filter(|d| !exports.contains(d))
         .count();
     let t = tally.as_deref();
+    let g = gap.as_deref();
     let folder_problem = super::review::folder_problem(state, &review_dir);
     // Nothing is read from a folder that is not there; the counts never wait for a walk.
     let (open, covered) = if folder_problem.is_none() {
@@ -692,6 +870,9 @@ pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<A
     (
         Summary {
             unfiled_to_review: t.map_or(0, |t| t.unfiled_to_review),
+            night_never_auto_labelled: g.map_or(0, |g| g.night),
+            ir_never_auto_labelled: g.map_or(0, |g| g.ir),
+            new_never_auto_labelled: g.map_or(0, |g| g.newer_than(last_autolabel(&tasks))),
             reviewed_camera_days: t.map_or(0, Tally::reviewed_camera_days),
             open_relabel_add: open.map(|o| (o.relabel as u64, o.add as u64)),
             check_covered: covered,
@@ -993,6 +1174,158 @@ mod tests {
             ..s
         };
         assert_eq!(key(&few), "review");
+    }
+
+    #[test]
+    fn night_frames_nobody_auto_labelled_come_before_an_export() {
+        let s = Summary {
+            frames_collected: 900,
+            frames_to_review: 600,
+            never_auto_labelled: 600,
+            night_never_auto_labelled: 50,
+            ir_never_auto_labelled: 150,
+            frames_reviewed: 300,
+            ..counted()
+        };
+        let n = next_step(&s);
+        assert_eq!((n.key, n.tab), ("autolabel_night", AUTOLABEL));
+        assert_eq!(n.link, "/train/autolabel?scene=ir&auto=none");
+        assert!(
+            n.text.starts_with(
+                "200 night and IR frames have no proposed boxes yet (50 night, 150 IR)"
+            ),
+            "{}",
+            n.text
+        );
+        // The scene with more of them is the link's.
+        let night = Summary {
+            night_never_auto_labelled: 151,
+            ..s.clone()
+        };
+        assert_eq!(
+            next_step(&night).link,
+            "/train/autolabel?scene=night&auto=none"
+        );
+        // Under the floor: the export of the reviewed frames comes first.
+        let few = Summary {
+            ir_never_auto_labelled: ENOUGH_NIGHT_TO_AUTOLABEL - 51,
+            ..s.clone()
+        };
+        assert_eq!(key(&few), "export");
+        // Not on a machine that cannot run the labelers, and never before the dataset check's fixes.
+        let no_gpu = Summary {
+            can_autolabel: false,
+            ..s.clone()
+        };
+        assert_eq!(key(&no_gpu), "export");
+        let fixes = Summary {
+            open_relabel_add: Some((2, 1)),
+            ..s.clone()
+        };
+        assert_ne!(key(&fixes), "autolabel_night");
+        // Nothing to review: no suggestion, whatever the counts say.
+        let done = Summary {
+            frames_to_review: 0,
+            ..s
+        };
+        assert_ne!(key(&done), "autolabel_night");
+    }
+
+    #[test]
+    fn frames_new_since_the_last_run_come_before_an_export() {
+        let s = Summary {
+            frames_collected: 900,
+            frames_to_review: 600,
+            never_auto_labelled: 600,
+            new_never_auto_labelled: ENOUGH_NEW_TO_AUTOLABEL,
+            frames_reviewed: 300,
+            ..counted()
+        };
+        let n = next_step(&s);
+        assert_eq!((n.key, n.tab), ("autolabel_new", AUTOLABEL));
+        assert_eq!(n.link, "/train/autolabel?auto=none");
+        assert!(n.text.starts_with("200 frames arrived since"), "{}", n.text);
+        let few = Summary {
+            new_never_auto_labelled: ENOUGH_NEW_TO_AUTOLABEL - 1,
+            ..s
+        };
+        assert_eq!(key(&few), "export");
+    }
+
+    #[test]
+    fn the_gap_counts_frames_newer_than_the_last_run() {
+        let g = AutoGap {
+            night: 0,
+            ir: 0,
+            arrived: vec![10, 20, 20, 30],
+        };
+        assert_eq!(g.newer_than(None), 4, "no run yet: every one");
+        assert_eq!(g.newer_than(Some(20)), 1);
+        assert_eq!(g.newer_than(Some(5)), 4);
+        assert_eq!(g.newer_than(Some(30)), 0);
+        let rec = |kind: TaskKind, state: RunState, created: &str| {
+            serde_json::from_value::<crate::training::task::TaskRecord>(serde_json::json!({
+                "id": "t", "kind": kind, "title": "t", "created": created, "state": state,
+                "step": 0, "steps": 0, "percent": 0,
+            }))
+            .unwrap()
+        };
+        let tasks = [
+            rec(TaskKind::Autolabel, RunState::Done, "2026-11-01T00:00:10Z"),
+            rec(
+                TaskKind::Autolabel,
+                RunState::Failed,
+                "2026-11-03T00:00:00Z",
+            ),
+            rec(TaskKind::Import, RunState::Done, "2026-11-04T00:00:00Z"),
+            rec(TaskKind::Autolabel, RunState::Done, "2026-11-02T00:00:00Z"),
+        ];
+        let want = chrono::DateTime::parse_from_rfc3339("2026-11-02T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(last_autolabel(&tasks), Some(want));
+        assert_eq!(last_autolabel(&tasks[1..3]), None);
+    }
+
+    #[test]
+    fn the_gap_walk_counts_open_frames_no_run_has_seen() {
+        use crate::collect::labels::bulk::test_support::{auto_box, put_frame};
+        use crate::collect::labels::{AutoRun, Frame, Status, Triage};
+        let dir = scratch();
+        put_frame(&dir, "a", None, Vec::new());
+        put_frame(&dir, "b", None, Vec::new());
+        // Auto-labelled (the marker), auto evidence, reviewed: not in the gap.
+        let ran = put_frame(&dir, "c", None, Vec::new());
+        put_frame(&dir, "d", None, vec![auto_box("cat", 0.4, Triage::Review)]);
+        let reviewed = put_frame(&dir, "e", None, Vec::new());
+        for (rel, edit) in [
+            (
+                &ran,
+                Box::new(|f: &mut crate::collect::labels::LabelFile| {
+                    f.auto_run = Some(AutoRun {
+                        at: "2026-11-01T00:00:00Z".into(),
+                        labeler: "mm-gdino-tiny".into(),
+                        classes: Vec::new(),
+                    });
+                }) as Box<dyn Fn(&mut crate::collect::labels::LabelFile)>,
+            ),
+            (
+                &reviewed,
+                Box::new(|f: &mut crate::collect::labels::LabelFile| {
+                    f.status = Status::Reviewed;
+                    f.empty_confirmed = true;
+                }),
+            ),
+        ] {
+            let frame = Frame::resolve(&dir, rel).unwrap();
+            let mut f = frame.labels().unwrap().unwrap();
+            edit(&mut f);
+            crate::collect::labels::write(&frame.labels, &f).unwrap();
+        }
+        let g = auto_gap(&dir);
+        assert_eq!((g.night, g.ir), (0, 2), "{g:?}");
+        assert_eq!(g.newer_than(None), 2);
+        assert_eq!(g.newer_than(Some(i64::MAX)), 0);
     }
 
     #[test]
