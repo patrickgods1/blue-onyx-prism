@@ -8,8 +8,9 @@
 //!   prompts from `collect.classes` plus `training.synonyms`), RF-DETR L (COCO classes) and fuses
 //!   them (WBF), then asks Qwen3-VL "is there a real <label>" about each box above a score and ranks animal species
 //!   with SigLIP 2. The service triages every box ([`triage`]): `accept` only when both labelers
-//!   agree at a score of at least 0.6 and no check objects; night person / animal boxes and SAM 3
-//!   boxes always `review`.
+//!   agree at a score of at least 0.6 and no check objects; night person / animal boxes, SAM 3
+//!   boxes and boxes only MegaDetector found always `review`. Night and IR frames also get an
+//!   enhanced view and, opt-in, MegaDetector v6 ([`night`]).
 //! - **A model** (`--with-model <id>`, any model of [`models`]: configured, a local file, or a
 //!   catalog model the run downloads or exports first and adds to the config disabled): the
 //!   service's own inference path (the benchmark pipeline: decode, preprocess, infer,
@@ -22,7 +23,10 @@
 //!   Review queue sorts first. With `missing_only` it looks for real objects without a label on
 //!   reviewed frames and nothing else: frames the model trained on are left out
 //!   ([`trained_frames`]), only a new object reopens a frame ([`triage::apply_missing`]), no
-//!   `auto_run` marker is written (several models can run in turn, and a rerun re-detects).
+//!   `auto_run` marker is written (several models can run in turn, and a rerun re-detects). With
+//!   [`AutolabelRequest::missing_unreviewed`] (the default) it also proposes on the unreviewed
+//!   frames it never trained or validated on, as a labeler: pending `auto` boxes and votes, so the
+//!   model counts in labeler agreement there too.
 //!
 //! The service owns every label-file write ([`crate::collect::labels::merge_proposals`],
 //! [`triage::apply_missing`]); the Python side only returns proposals as JSONL. Nothing is accepted
@@ -37,6 +41,7 @@
 //! - [`relabel`]: detection with a model of the config in this process.
 //! - [`job`]: the stage machine ([`AutolabelJob`], a [`super::task::Task`]).
 //! - [`preview`]: what a run would do, from its own first stage ([`preview_autolabel`]).
+//! - [`night`]: night and IR frames: the enhanced view, MegaDetector v6, their marker.
 //! - [`memory`]: the labelers' GPU memory: options a card cannot hold are refused, a card short
 //!   of free memory is warned about.
 
@@ -44,6 +49,7 @@ pub mod catalog;
 pub mod job;
 pub mod memory;
 pub mod models;
+pub mod night;
 pub mod preview;
 pub mod relabel;
 pub mod triage;
@@ -405,6 +411,25 @@ pub struct AutolabelRequest {
     /// "Start anyway" / `--ignore-memory-check`. Kept with the queued job, never in the config.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignore_memory_check: bool,
+    /// Night and IR frames of a labelers run: the labelers also look at a copy enhanced by this mode
+    /// ([`night`]; None or `none` = off; a run with a model ignores it). [`Self::new`] sets
+    /// [`night::DEFAULT_NIGHT_ENHANCE`]; a request stored before this option reads as off, which is
+    /// what that run did.
+    #[serde(default)]
+    pub night_enhance: Option<crate::model::enhance::Preprocess>,
+    /// MegaDetector v6 as an extra labeler on night and IR frames ([`night`]; its animals named by
+    /// SigLIP 2, which it needs). Its boxes never triage `accept`.
+    #[serde(default)]
+    pub mdv6: bool,
+    /// MegaDetector's own score threshold.
+    #[serde(default = "default_mdv6_threshold")]
+    pub mdv6_threshold: f32,
+    /// A `missing_only` run also proposes on the unreviewed frames the model never trained or
+    /// validated on ([`triage::unreviewed_scope`]): its boxes join them as pending `auto` boxes with
+    /// the model as their labeler, and its votes go on the boxes it finds again. Reviewed frames are
+    /// treated as before. [`Self::new`] sets it; a request stored before it reads as off.
+    #[serde(default)]
+    pub missing_unreviewed: bool,
 }
 
 /// Boxes per Qwen3-VL call when [`AutolabelRequest::vlm_batch`] is on.
@@ -426,6 +451,10 @@ const fn yes() -> bool {
 
 const fn default_sam3_threshold() -> f32 {
     SAM3_THRESHOLD
+}
+
+const fn default_mdv6_threshold() -> f32 {
+    night::MDV6_THRESHOLD
 }
 
 impl AutolabelRequest {
@@ -456,6 +485,10 @@ impl AutolabelRequest {
             vlm_batch: true,
             vlm_min_score: Some(SUGGESTED_VLM_MIN_SCORE),
             prefetch: true,
+            night_enhance: Some(night::DEFAULT_NIGHT_ENHANCE),
+            mdv6: false,
+            mdv6_threshold: night::MDV6_THRESHOLD,
+            missing_unreviewed: true,
         }
     }
 
@@ -466,6 +499,7 @@ impl AutolabelRequest {
             ("sam3 threshold", self.sam3_threshold),
             ("rfdetr threshold", self.rfdetr_threshold),
             ("accept score", self.accept_score),
+            ("MegaDetector threshold", self.mdv6_threshold),
         ] {
             if !(v.is_finite() && (0.01..=1.0).contains(&v)) {
                 bail!("{k} must be between 0.01 and 1, got {v}");
@@ -482,6 +516,18 @@ impl AutolabelRequest {
         }
         if self.sam3 && self.gdino.is_some() {
             bail!("SAM 3 takes MM-Grounding-DINO's place: choose one of them");
+        }
+        if self.mdv6 && self.with_model.is_some() {
+            bail!(
+                "MegaDetector is one of the labelers, and a run with a model (--with-model) uses \
+                 that model alone: remove --mdv6 or --with-model"
+            );
+        }
+        if self.mdv6 && !self.siglip {
+            bail!(
+                "MegaDetector names its animal boxes with SigLIP 2's species ranking: turn SigLIP 2 \
+                 on, or MegaDetector off"
+            );
         }
         if self.missing_only && self.with_model.is_none() {
             bail!(
@@ -567,6 +613,11 @@ impl AutolabelRequest {
             && let Some(s) = res_catalog::autolabel_weights("siglip2-base")
         {
             v.push(s);
+        }
+        if self.mdv6
+            && let Some(m) = night::mdv6_weights()
+        {
+            v.push(m);
         }
         v
     }
@@ -844,6 +895,27 @@ pub fn trained_frames(
     model: &crate::config::ModelConfig,
     warnings: &mut Vec<String>,
 ) -> Result<BTreeSet<String>> {
+    seen_frames(config, model, warnings).map(|s| s.train)
+}
+
+/// The frames a model's training run saw ([`seen_frames`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Seen {
+    /// [`trained_frames`].
+    pub train: BTreeSet<String>,
+    /// The run's validation frames (`data/valid.txt`; a run folder without the list has none).
+    pub valid: BTreeSet<String>,
+}
+
+/// [`trained_frames`] and the run's validation frames: a `missing_only` run leaves both out of the
+/// unreviewed frames it labels ([`AutolabelRequest::missing_unreviewed`]), since a model's boxes
+/// there would repeat what it saw, while reviewed frames keep only the trained ones out. The same
+/// record rules; `valid.txt` that is missing counts as no frames, one that does not read is an error.
+pub fn seen_frames(
+    config: &Config,
+    model: &crate::config::ModelConfig,
+    warnings: &mut Vec<String>,
+) -> Result<Seen> {
     #[derive(Deserialize)]
     struct Record {
         run_id: String,
@@ -855,7 +927,7 @@ pub fn trained_frames(
     let text = match std::fs::read_to_string(&record) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             warnings.push(no_training_record(&name));
-            return Ok(BTreeSet::new());
+            return Ok(Seen::default());
         }
         t => t.with_context(|| format!("reading {}", record.display()))?,
     };
@@ -870,10 +942,8 @@ pub fn trained_frames(
                 record.display()
             )
         })?;
-    let list = super::training_dir(config)
-        .join(&run)
-        .join("data")
-        .join("train.txt");
+    let data = super::training_dir(config).join(&run).join("data");
+    let list = data.join("train.txt");
     let text = std::fs::read_to_string(&list).map_err(|e| {
         anyhow!(
             "{name} was trained in run {run}, but its frame list {} does not read ({e}), so the \
@@ -893,7 +963,21 @@ pub fn trained_frames(
             list.display()
         ));
     }
-    Ok(frames)
+    let valid_list = data.join("valid.txt");
+    let valid = match std::fs::read_to_string(&valid_list) {
+        Ok(t) => t.lines().filter_map(trained_frame).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        Err(e) => bail!(
+            "{name} was trained in run {run}, but its validation list {} does not read ({e}), so \
+             the frames it validated on cannot be left out; restore that run folder, or choose \
+             another model",
+            valid_list.display()
+        ),
+    };
+    Ok(Seen {
+        train: frames,
+        valid,
+    })
 }
 
 /// The warning of a model without a training record ([`trained_frames`]).
@@ -1131,6 +1215,58 @@ mod tests {
             let e = m.validate().unwrap_err().to_string();
             assert!(e.contains("VLM minimum score"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn night_options_validate_and_parse_from_old_requests() {
+        use crate::model::enhance::Preprocess;
+        let r = AutolabelRequest::new(FrameFilter::default());
+        let mut old = serde_json::to_value(&r).unwrap();
+        let obj = old.as_object_mut().unwrap();
+        for k in [
+            "night_enhance",
+            "mdv6",
+            "mdv6_threshold",
+            "missing_unreviewed",
+        ] {
+            assert!(obj.remove(k).is_some(), "{k}");
+        }
+        // A request stored before them: what that run did.
+        let back: AutolabelRequest = serde_json::from_value(old).unwrap();
+        assert_eq!(back.night_enhance, None);
+        assert!(!back.mdv6 && !back.missing_unreviewed);
+        assert!((back.mdv6_threshold - night::MDV6_THRESHOLD).abs() < f32::EPSILON);
+        let mut on = r.clone();
+        on.mdv6 = true;
+        on.night_enhance = Some(Preprocess::Gamma(0.6));
+        let back: AutolabelRequest =
+            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert_eq!(back, on);
+        assert!(on.validate().is_ok());
+        let md = |x: &AutolabelRequest| {
+            x.resources()
+                .iter()
+                .any(|res| res.model_name() == Some(night::MDV6_MODEL))
+        };
+        assert!(md(&on) && !md(&r));
+        let mut no_siglip = on.clone();
+        no_siglip.siglip = false;
+        let e = no_siglip.validate().unwrap_err().to_string();
+        assert!(e.contains("SigLIP 2"), "{e}");
+        let mut model = on.clone();
+        model.with_model = Some("yolo".into());
+        let e = model.validate().unwrap_err().to_string();
+        assert!(e.contains("MegaDetector"), "{e}");
+        for bad in [0.0, 1.5, f32::NAN] {
+            let mut t = on.clone();
+            t.mdv6_threshold = bad;
+            assert!(t.validate().is_err(), "{bad}");
+        }
+        // A run with a model keeps the default enhancement in its request, and ignores it.
+        let mut m = r.clone();
+        m.with_model = Some("yolo".into());
+        assert!(m.validate().is_ok());
+        assert_eq!(night::enhancement(&m), None);
     }
 
     #[test]
