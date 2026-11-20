@@ -2,9 +2,10 @@
 //! what one finger's drag does, where a tag sits in the zoomed view, which box an overview tap
 //! picks, which corner the overview takes and the quarters of the "Anything missing?" look; and
 //! the editor's rules: which edge or corner of a box a press grabs (`edgeAt`), what the view does
-//! when the selection moves (`nextView`) and a drag of the overview's view rect (`overviewPan`).
-//! The page applies these answers to its view and boxes (`assets/review.js`), so they are checked
-//! here on exact numbers, in Node.
+//! when the selection moves (`nextView`) and a drag of the overview's view rect (`overviewPan`);
+//! the view-only image setting (`viewSettings`, the tone table `viewLut`) and the side panel's
+//! width (`sideWidth`). The page applies these answers to its view, frame and boxes
+//! (`assets/review.js`), so they are checked here on exact numbers, in Node.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI), which
 //! makes a missing `node` a failure: a skip must not read as a pass there.
@@ -32,6 +33,15 @@ console.log(JSON.stringify(req.map((r) => {
   if (r.op === 'edgeAt') return T.edgeAt(r.bbox, r.p, r.grabOut, r.grabIn);
   if (r.op === 'nextView') return T.nextView(r.o);
   if (r.op === 'overviewPan') return T.overviewPan(r.view, r.frame, r.delta);
+  if (r.op === 'viewLut') return Array.from(T.viewLut(r.hist, r.total, r.mode, r.b, r.c));
+  if (r.op === 'viewLutInto') {
+    // Into a table of its own (the page's, reused for every slider step): the same one back.
+    const out = new Uint8ClampedArray(256).fill(7);
+    const got = T.viewLut(r.hist, r.total, r.mode, r.b, r.c, out);
+    return [got === out, Array.from(got)];
+  }
+  if (r.op === 'viewSettings') return T.viewSettings(r.raw);
+  if (r.op === 'sideWidth') return T.sideWidth(r.want, r.min, r.max, r.dflt);
   throw new Error('unknown op ' + r.op);
 })));
 "#;
@@ -899,5 +909,300 @@ fn an_overview_drag_survives_values_that_are_no_numbers() {
             [10.0, 110.0],
             [100.0, 100.0]
         ]
+    );
+}
+
+// ---- the view-only image setting ----
+
+/// A luma histogram with `mass[k].1` pixels at level `mass[k].0` (256 counts).
+fn hist(mass: &[(usize, f64)]) -> Vec<f64> {
+    let mut h = vec![0.0; 256];
+    for &(level, n) in mass {
+        h[level] += n;
+    }
+    h
+}
+
+fn lut_req(h: &[f64], mode: &str, b: i32, c: i32) -> Value {
+    let total: f64 = h.iter().sum();
+    json!({ "op": "viewLut", "hist": h, "total": total, "mode": mode, "b": b, "c": c })
+}
+
+fn table(v: &Value) -> Vec<i64> {
+    let t: Vec<i64> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(t.len(), 256);
+    t
+}
+
+/// The table `review.js` made before brightness and contrast (mode, then `gamma` on top; the
+/// bright mode's lift 1.5 in the same power), here for c = 0 and the gammas that are exact in
+/// both: the new table must equal it there.
+fn old_lut(h: &[f64], mode: &str, gamma: f64) -> Vec<i64> {
+    let total: f64 = h.iter().sum();
+    let mut cdf = [0.0f64; 256];
+    let mut acc = 0.0;
+    for i in 0..256 {
+        acc += h[i];
+        cdf[i] = acc / total;
+    }
+    let (mut lo, mut hi) = (0usize, 255usize);
+    while lo < 254 && cdf[lo] < 0.01 {
+        lo += 1;
+    }
+    while hi > lo + 1 && cdf[hi - 1] >= 0.995 {
+        hi -= 1;
+    }
+    let g = gamma * if mode == "bright" { 1.5 } else { 1.0 };
+    (0..256)
+        .map(|i| {
+            let mut v = i as f64 / 255.0;
+            if mode != "off" {
+                v = ((i as f64 - lo as f64) / (hi - lo).max(1) as f64).clamp(0.0, 1.0);
+            }
+            if mode == "eq" {
+                v = 0.75 * cdf[i] + 0.25 * v;
+            }
+            (255.0 * v.powf(1.0 / g)).round() as i64
+        })
+        .collect()
+}
+
+#[test]
+fn a_neutral_image_setting_is_the_identity() {
+    if !have_node() {
+        return;
+    }
+    let flat = vec![1.0; 256];
+    let dark = hist(&[(3, 500.0), (12, 300.0), (40, 200.0)]);
+    let empty = vec![0.0; 256];
+    let got = node(&json!([
+        lut_req(&flat, "off", 0, 0),
+        lut_req(&dark, "off", 0, 0),
+        // No pixels counted (the page passes at least 1 as the total).
+        { "op": "viewLut", "hist": empty, "total": 1, "mode": "off", "b": 0, "c": 0 },
+        // Levels that are not numbers are 0.
+        { "op": "viewLut", "hist": dark, "total": 1000, "mode": "off", "b": null, "c": "x" },
+    ]));
+    let id: Vec<i64> = (0..256).collect();
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(table(g), id, "case {i}");
+    }
+}
+
+#[test]
+fn brightness_is_the_old_gamma_and_stays_monotonic() {
+    if !have_node() {
+        return;
+    }
+    let h = hist(&[(5, 400.0), (30, 300.0), (90, 200.0), (220, 100.0)]);
+    let levels = [-100, -70, -30, -10, 10, 30, 70, 100];
+    let reqs: Vec<Value> = levels.iter().map(|&b| lut_req(&h, "off", b, 0)).collect();
+    let got: Vec<Vec<i64>> = node(&json!(reqs)).iter().map(table).collect();
+    for (t, &b) in got.iter().zip(&levels) {
+        // The ends stay (a gamma never clips), the table never goes down.
+        assert_eq!((t[0], t[255]), (0, 255), "b {b}");
+        assert!(t.windows(2).all(|w| w[0] <= w[1]), "b {b}: {t:?}");
+        // Exactly 255 (i / 255)^(1 / g), g = 2.5^(b / 100).
+        let gi = 1.0 / 2.5f64.powf(f64::from(b) / 100.0);
+        for (i, &v) in t.iter().enumerate() {
+            let want = (255.0 * (i as f64 / 255.0).powf(gi)).round() as i64;
+            assert_eq!(v, want, "b {b} level {i}");
+        }
+    }
+    // More brightness: every level the same or lighter; a level in the shadows strictly lighter.
+    for w in got.windows(2) {
+        assert!(w[0].iter().zip(&w[1]).all(|(a, b)| a <= b));
+        assert!(w[0][40] < w[1][40]);
+    }
+    // The endpoints by hand: 64 at gamma 2.5 is 255 (64/255)^0.4 = 146.69, at 0.4 it is 8.03.
+    assert_eq!(got[7][64], 147);
+    assert_eq!(got[0][64], 8);
+}
+
+#[test]
+fn contrast_turns_about_the_median_and_keeps_it() {
+    if !have_node() {
+        return;
+    }
+    // Median 60 (40% at 30, then 30% at 60): k = 2 at +50, 1/2 at -50, 4 at +100.
+    let h = hist(&[(30, 40.0), (60, 30.0), (200, 30.0)]);
+    // A dark frame: median 10.
+    let dark = hist(&[(10, 60.0), (40, 40.0)]);
+    let got: Vec<Vec<i64>> = node(&json!([
+        lut_req(&h, "off", 0, 50),
+        lut_req(&h, "off", 0, -50),
+        lut_req(&h, "off", 0, 100),
+        lut_req(&h, "off", 0, -100),
+        lut_req(&dark, "off", 0, 100),
+        lut_req(&h, "eq", 0, 0),
+        lut_req(&h, "eq", 0, 80),
+        lut_req(&h, "bright", 0, 0),
+        lut_req(&h, "bright", 0, -60),
+    ]))
+    .iter()
+    .map(table)
+    .collect();
+    // The median level stays, whatever the contrast.
+    for t in &got[..4] {
+        assert_eq!(t[60], 60);
+    }
+    // k = 2: 60 + 2 (i - 60), clamped to 0..255.
+    assert_eq!(
+        [got[0][0], got[0][30], got[0][100], got[0][157], got[0][200]],
+        [0, 0, 140, 254, 255]
+    );
+    // k = 1/2: 60 + (i - 60) / 2.
+    assert_eq!(
+        [got[1][0], got[1][30], got[1][200], got[1][254]],
+        [30, 45, 130, 157]
+    );
+    // k = 4 and 1/4.
+    assert_eq!([got[2][45], got[2][75]], [0, 120]);
+    assert_eq!([got[3][0], got[3][255]], [45, 109]);
+    // The dark frame's median stays at 10, so its shadows are not all black.
+    assert_eq!(
+        [got[4][0], got[4][10], got[4][20], got[4][40]],
+        [0, 10, 50, 130]
+    );
+    // After a mode, the median keeps the level the mode gave it.
+    assert_eq!(got[6][60], got[5][60]);
+    assert_eq!(got[8][60], got[7][60]);
+    assert!(got[6][30] < got[5][30] && got[6][100] > got[5][100]);
+    assert!(got[8][30] > got[7][30] && got[8][200] < got[7][200]);
+}
+
+#[test]
+fn the_modes_are_the_tables_they_were() {
+    if !have_node() {
+        return;
+    }
+    let h = hist(&[
+        (2, 50.0),
+        (8, 900.0),
+        (20, 600.0),
+        (35, 300.0),
+        (80, 100.0),
+        (240, 5.0),
+    ]);
+    let got: Vec<Vec<i64>> = node(&json!([
+        lut_req(&h, "bright", 0, 0),
+        lut_req(&h, "eq", 0, 0),
+        lut_req(&h, "off", 100, 0),
+        lut_req(&h, "off", -100, 0),
+    ]))
+    .iter()
+    .map(table)
+    .collect();
+    assert_eq!(got[0], old_lut(&h, "bright", 1.0));
+    assert_eq!(got[1], old_lut(&h, "eq", 1.0));
+    // An old gamma's endpoints are brightness 100 and -100.
+    assert_eq!(got[2], old_lut(&h, "off", 2.5));
+    assert_eq!(got[3], old_lut(&h, "off", 0.4));
+}
+
+#[test]
+fn a_table_of_the_pages_own_is_filled_not_made() {
+    if !have_node() {
+        return;
+    }
+    let h = hist(&[(10, 5.0), (100, 5.0)]);
+    let got = node(&json!([
+        { "op": "viewLutInto", "hist": h, "total": 10, "mode": "off", "b": 0, "c": 0 },
+        { "op": "viewLutInto", "hist": h, "total": 10, "mode": "eq", "b": 30, "c": -20 },
+    ]));
+    let id: Vec<i64> = (0..256).collect();
+    assert_eq!(got[0][0], json!(true));
+    assert_eq!(table(&got[0][1]), id);
+    assert_eq!(got[1][0], json!(true));
+    let made = node(&json!([lut_req(&h, "eq", 30, -20)]));
+    assert_eq!(table(&got[1][1]), table(&made[0]));
+}
+
+#[test]
+fn a_stored_image_setting_is_checked_and_an_old_gamma_converts() {
+    if !have_node() {
+        return;
+    }
+    let raws = json!([
+        { "mode": "eq", "gamma": 2.5 },
+        { "mode": "bright", "gamma": 0.4 },
+        { "mode": "off", "gamma": 1 },
+        // `]` once stored 1.18 (1 / 0.85, to 2 places): 100 ln 1.18 / ln 2.5 = 18.06.
+        { "mode": "auto", "gamma": 1.18 },
+        // Past the old range: held at the ends; not a gamma: ignored.
+        { "gamma": 10 },
+        { "gamma": 0.01 },
+        { "gamma": 0 },
+        { "gamma": -2 },
+        { "gamma": "2" },
+        // A brightness wins over a gamma.
+        { "mode": "eq", "brightness": -30, "contrast": 25, "gamma": 2.5 },
+        // Levels: rounded and clamped; a mode not known is auto.
+        { "mode": "night", "brightness": 250, "contrast": -3.6 },
+        { "mode": "OFF", "brightness": -1000, "contrast": null },
+        { "brightness": "20", "contrast": true },
+        null,
+        "eq",
+    ]);
+    let reqs: Vec<Value> = raws
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| json!({ "op": "viewSettings", "raw": r }))
+        .collect();
+    let got = node(&json!(reqs));
+    let want = json!([
+        { "mode": "eq", "brightness": 100, "contrast": 0 },
+        { "mode": "bright", "brightness": -100, "contrast": 0 },
+        { "mode": "off", "brightness": 0, "contrast": 0 },
+        { "mode": "auto", "brightness": 18, "contrast": 0 },
+        { "mode": "auto", "brightness": 100, "contrast": 0 },
+        { "mode": "auto", "brightness": -100, "contrast": 0 },
+        { "mode": "auto", "brightness": 0, "contrast": 0 },
+        { "mode": "auto", "brightness": 0, "contrast": 0 },
+        { "mode": "auto", "brightness": 0, "contrast": 0 },
+        { "mode": "eq", "brightness": -30, "contrast": 25 },
+        { "mode": "auto", "brightness": 100, "contrast": -4 },
+        { "mode": "auto", "brightness": -100, "contrast": 0 },
+        { "mode": "auto", "brightness": 0, "contrast": 0 },
+        { "mode": "auto", "brightness": 0, "contrast": 0 },
+        { "mode": "auto", "brightness": 0, "contrast": 0 },
+    ]);
+    assert_eq!(Value::Array(got), want);
+}
+
+#[test]
+fn the_side_panel_width_is_held_in_its_range() {
+    if !have_node() {
+        return;
+    }
+    let req = |want: Value, max: Value| json!({ "op": "sideWidth", "want": want, "min": 280, "max": max, "dflt": 400 });
+    let got = node(&json!([
+        req(json!(500), json!(600)),
+        req(json!(333.6), json!(600)),
+        req(json!(100), json!(600)),
+        req(json!(900), json!(600)),
+        req(json!(600), json!(600)),
+        // Not a number: the default; a range with its top under its foot: the foot.
+        req(json!(null), json!(600)),
+        req(json!("480"), json!(600)),
+        req(json!(500), json!(200)),
+        // No top known yet (the page passes Infinity; JSON has null): only the foot holds.
+        req(json!(5000), json!(null)),
+        req(json!(100), json!(null)),
+        // The default is held too (a narrow window).
+        req(json!(null), json!(350)),
+    ]));
+    assert_eq!(
+        got,
+        [500, 334, 280, 600, 600, 400, 400, 280, 5000, 280, 350]
+            .iter()
+            .map(|&v| json!(v))
+            .collect::<Vec<_>>()
     );
 }

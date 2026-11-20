@@ -3,9 +3,10 @@
 // means, which corner of the frame the overview takes (corner layout) and the quarters of the
 // "Anything missing?" look, plus the editor's pointer and view rules: which edge or corner of a
 // box a press grabs (`edgeAt`), how the view follows a new selection (`nextView`) and a drag of
-// the overview's view rect (`overviewPan`). Pure: no page, no browser API, no state of its own;
-// review.js passes everything in and applies the answers. `tests/it/js_review_touch.rs` runs this
-// file in Node.
+// the overview's view rect (`overviewPan`); the view-only image setting (`viewSettings`, the tone
+// table `viewLut`) and the side panel's width (`sideWidth`). Pure: no page, no browser API, no
+// state of its own; review.js passes everything in and applies the answers.
+// `tests/it/js_review_touch.rs` runs this file in Node.
 //
 // Coordinates are frame pixels, a canvas point being the frame point at zoom 1 (review.js
 // `canvasPoint`; the canvas's buffer has its own, device pixel size), and a view is {z, ox, oy}:
@@ -191,7 +192,92 @@
     return { ox: Math.min(hx, Math.max(0, ox + dx)), oy: Math.min(hy, Math.max(0, oy + dy)) };
   }
 
+  // ---- the view-only image setting (review.js viewSource) ----
+
+  // A level of the Brightness or Contrast slider: an integer from -100 to 100; anything else
+  // (not a number, NaN, Infinity) is 0.
+  function viewLevel(v) {
+    return finite(v) ? Math.max(-100, Math.min(100, Math.round(v))) : 0;
+  }
+
+  // The setting kept in storage (`bop.review.view`), checked: `mode` auto | off | bright | eq
+  // (else auto), `brightness` and `contrast` levels (viewLevel). An older page kept a `gamma`
+  // (0.4 .. 2.5, from `[` / `]`) instead of a brightness: it becomes the brightness whose gamma
+  // it is (viewLut: g = 2.5^(b / 100), so b = 100 ln g / ln 2.5, rounded and clamped).
+  function viewSettings(raw) {
+    var o = raw && typeof raw === 'object' ? raw : {};
+    var mode = typeof o.mode === 'string' && /^(auto|off|bright|eq)$/.test(o.mode) ? o.mode : 'auto';
+    var b = viewLevel(o.brightness);
+    if (o.brightness == null && finite(o.gamma) && o.gamma > 0) b = viewLevel(100 * Math.log(o.gamma) / Math.log(2.5));
+    return { mode: mode, brightness: b, contrast: viewLevel(o.contrast) };
+  }
+
+  // viewLut's step 1 for level `x` (0 .. 255) whose cumulative share is `cx`: 0 .. 1.
+  function toneStep1(x, cx, mode, lo, span) {
+    var v = x / 255;
+    if (mode === 'bright' || mode === 'eq') v = Math.max(0, Math.min(1, (x - lo) / span));
+    if (mode === 'eq') v = 0.75 * cx + 0.25 * v;
+    return mode === 'bright' ? Math.pow(v, 1 / 1.5) : v;
+  }
+
+  // The 256-entry tone table of the view-only image setting, from the frame's luma histogram
+  // `hist` (256 counts, `total` of them), in this order:
+  //   1. the mode: `off` leaves the levels; `bright` stretches them (the 1% .. 99.5% levels to
+  //      0 .. 1) and lifts them (gamma 1.5); `eq` mostly equalises them (3/4 the histogram's
+  //      cumulative share, 1/4 the stretch);
+  //   2. contrast `c` (-100 .. 100): a slope of k = 2^(c / 50) (1/4 .. 4) about the level the
+  //      frame's median luma has after step 1, clamped to 0 .. 1; the median stays where it is,
+  //      so more contrast on a dark frame does not push it to black;
+  //   3. brightness `b` (-100 .. 100) as a gamma, v^(1 / g) with g = 2.5^(b / 100) (0.4 .. 2.5):
+  //      it lifts the shadows without clipping the highlights.
+  // Off, 0 and 0 is the identity. `out` (optional, 256 entries) is filled and returned, so a
+  // slider moved over and over makes no new table; without it a Uint8ClampedArray is made. No
+  // other array is made: the cumulative shares are summed as the loops go.
+  function viewLut(hist, total, mode, brightness, contrast, out) {
+    var lut = out || new Uint8ClampedArray(256);
+    var n = finite(total) && total > 0 ? total : 1;
+    var b = viewLevel(brightness), c = viewLevel(contrast);
+    // The levels holding 1%, 50% and 99.5% of the pixels (first of the cumulative share), and
+    // the cumulative share at the median.
+    var acc = 0, lo = -1, med = -1, top = -1, cMed = 0, i, cdf;
+    for (i = 0; i < 256; i++) {
+      acc += hist[i] || 0;
+      cdf = acc / n;
+      if (lo < 0 && cdf >= 0.01) lo = i;
+      if (med < 0 && cdf >= 0.5) { med = i; cMed = cdf; }
+      if (top < 0 && cdf >= 0.995) top = i;
+    }
+    if (lo < 0 || lo > 254) lo = 254;
+    if (med < 0) med = 255;
+    var hi = Math.max(lo + 1, top < 0 ? 255 : top), span = hi - lo;
+    var k = Math.pow(2, c / 50), pivot = toneStep1(med, cMed, mode, lo, span), gi = 1 / Math.pow(2.5, b / 100);
+    acc = 0;
+    for (i = 0; i < 256; i++) {
+      acc += hist[i] || 0;
+      var v = toneStep1(i, acc / n, mode, lo, span);
+      if (c !== 0) v = Math.max(0, Math.min(1, pivot + k * (v - pivot)));
+      if (b !== 0) v = Math.pow(v, gi);
+      lut[i] = Math.round(255 * v);
+    }
+    return lut;
+  }
+
+  // ---- the side panel's width (two columns; review.js) ----
+
+  // The width in CSS px the panel takes for a wanted width `want`: rounded and held in
+  // [min, max]; a `max` under `min` is `min`, one that is no finite number (Infinity: the page
+  // before it knows the grid's width) no top. A non-finite `want` is `dflt` (held too).
+  function sideWidth(want, min, max, dflt) {
+    var w = finite(want) ? want : dflt;
+    var hi = !finite(max) ? Infinity : (max > min ? max : min);
+    return Math.round(Math.max(min, Math.min(hi, w)));
+  }
+
   globalThis.ReviewTouch = {
+    viewLevel: viewLevel,
+    viewSettings: viewSettings,
+    viewLut: viewLut,
+    sideWidth: sideWidth,
     quarterView: quarterView,
     pinch: pinch,
     twoTapRect: twoTapRect,

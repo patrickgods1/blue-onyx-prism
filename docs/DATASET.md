@@ -971,19 +971,34 @@ with both kinds is in [docs/TRAINING.md](TRAINING.md#spot-memory-of-fixed-camera
 | `Shift+R` | Reject the rest: every box still undecided (`reason: rest_rejected`; these count for the repeats history and spot memory). |
 | `n` | Next without saving. |
 | `o` | Switch the overview between the side panel and a corner of the frame. |
+| `b` | Image mode, view only: auto (bright + equalised on night / IR frames), off, bright, bright + equalised. |
+| `[` / `]` | Image brightness down / up by 10 (view only). |
+| `{` / `}` | Image contrast down / up by 10 (Shift+`[` / `]`; view only). |
+| `Shift+0` | Image back to auto, brightness and contrast 0. |
 
 Click a box to select it. Drag on the image to draw a new one. Drag any edge or corner of the selected box
 to resize it, or inside it to move it (touch screens show handles at the corners and sides instead; a small box gets corners only, and a very small one none, so a drag moves it).
 
 The frame is a zoomable editor. The wheel always zooms over it, up to 16x, with sharp pixels at high
 zoom; the *+* and *-* buttons and the View menu zoom too. Box lines are 1 px, drawn just outside the
-box's edge so the object's own edge stays visible. An overview of the whole frame, with the zoomed part
-outlined, sits at the top of the side panel under the frame's facts (the default) or, with `o`, *Overview in
-a corner* (View menu or Panel options) always shown in a corner of the frame. Drag the outline to pan,
-use the wheel over the overview to zoom, tap an empty spot to centre the view there, or tap a box to select
-it. *Wider panel* in Panel options widens the side panel. The last choice of *Fit whole frame* or *Zoom to
-box* is remembered for the next box and frame; after a zoom you set yourself (wheel, pinch, pan, overview
-drag) the next box is framed with *Zoom to box*.
+box's edge so the object's own edge stays visible. On a wide screen a progress row sits over the frame: the
+frame's place in the queue (`15 / 250`, or `249 left` for an order worked out again after every save), the
+box meter (`3 / 8 done`) and what is left to decide, then the frame's camera, scene, time, random pick, the
+session's pace and *Details*. When the editor is narrow the facts make way (pace first, then time, scene and
+camera; all of them stay in *Details*); the progress always shows. The view buttons sit under the frame.
+An overview of the whole frame, with the zoomed part outlined, sits at the top of the side panel (the default)
+or, with `o`, *Overview in a corner* (View menu or Panel options) always shown in a corner of the frame. Drag
+the outline to pan, use the wheel over the overview to zoom, tap an empty spot to centre the view there, or tap
+a box to select it. Drag the side panel's left edge to set its width (arrow keys on it too, double-click for
+the default); it is kept for your next visits and never takes more than 60% of the page. The last choice of
+*Fit whole frame* or *Zoom to box* is remembered for the next box and frame; after a zoom you set yourself
+(wheel, pinch, pan, overview drag) the next box is framed with *Zoom to box*.
+
+The View menu (it opens upward on a wide screen; on a phone it is a sheet over the screen's foot, closed with
+*Done*, so the frame stays in sight) also holds the image setting, which changes only what you
+see, never the frame: the mode (`b`), *Brightness* (`[` / `]`, a gamma that lifts the shadows without
+clipping the highlights) and *Contrast* (`{` / `}`, about the frame's median level, so a dark frame does not
+go black), then *Reset image* (`Shift+0`). The setting stays from frame to frame and for your next visits.
 
 ### Export
 

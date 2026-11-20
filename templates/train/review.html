@@ -34,8 +34,10 @@
 
 <div class="review-grid">
   <div class="review-stage">
-    <!-- The HUD (review.js setHud): every value in a slot of its own and of a fixed size, so a value
-         changes in place and nothing around it moves. An empty value shows a dim dash. -->
+    <!-- The HUD over the frame (review.js setHud): the progress first (the queue's place, this frame's
+         boxes done, what is left to decide), then the frame's facts. Every value in a slot of its own
+         and of a fixed size, so a value changes in place and nothing around it moves. An empty value
+         shows a dim dash. -->
     <div class="rv-head">
       <div class="rv-hud" role="group" aria-label="This frame">
         <span class="rv-slot rv-hud-pos" data-slot="pos" title="The frame's place in the queue"><span id="rv-hud-pos" class="rv-empty">&mdash;</span></span>
@@ -48,19 +50,6 @@
         <span class="rv-slot rv-hud-pace" data-slot="pace" title="This session: boxes decided and boxes a minute"><span id="rv-hud-pace" class="rv-empty">&mdash;</span></span>
         <span class="rv-slot rv-hud-details" data-slot="details"><button type="button" id="rv-info-toggle" class="small secondary" aria-expanded="false" aria-controls="rv-details">Details</button></span>
       </div>
-      <div class="review-meta-row rv-tools"><span class="rv-slot rv-tool-zoom" data-slot="zoom"><span id="rv-zoom" class="muted review-zoom"></span></span><span class="rv-slot rv-tool-zoomout" data-slot="zoomout"><button type="button" id="rv-zoom-out" class="small secondary" title="Zoom out">−</button></span><span class="rv-slot rv-tool-zoomin" data-slot="zoomin"><button type="button" id="rv-zoom-in" class="small secondary" title="Zoom in">+</button></span><span class="rv-slot rv-tool-zoombox" data-slot="zoombox"><button type="button" id="rv-zoombox" class="small secondary rv-off">Zoom to box</button></span><span class="rv-slot rv-tool-image" data-slot="image"><button type="button" id="rv-imgmode" class="small secondary">Image</button></span><span class="rv-slot rv-tool-draw" data-slot="draw"><button type="button" id="rv-draw" class="small secondary" aria-pressed="false">Draw</button></span><span class="rv-slot rv-tool-redraw" data-slot="redraw"><button type="button" id="rv-redraw" class="small secondary rv-off" aria-pressed="false">Redraw</button></span><span class="rv-slot rv-tool-view" data-slot="view"><details id="rv-view-menu" class="rv-view-menu"><summary>View</summary><div class="rv-view-items">
-        <button type="button" class="small secondary" data-view="zoom-in">Zoom in</button>
-        <button type="button" class="small secondary" data-view="zoom-out">Zoom out</button>
-        <button type="button" class="small secondary" data-view="fit">Fit whole frame</button>
-        <button type="button" class="small secondary" data-view="ov-layout">Overview in a corner</button>
-        <button type="button" class="small secondary" data-view="hide" aria-pressed="false">Hide boxes</button>
-        <button type="button" class="small secondary" data-view="labels" aria-pressed="true">Labels</button>
-        <button type="button" class="small secondary" data-view="spotlight" aria-pressed="false">Spotlight</button>
-        <button type="button" class="small secondary" data-view="image">Image</button>
-        <button type="button" class="small secondary" data-view="brighter">Brighter</button>
-        <button type="button" class="small secondary" data-view="darker">Darker</button>
-        <button type="button" class="small secondary" data-view="reset">Reset image</button>
-      </div></details></span></div>
     </div>
     <!-- Details: the frame's full facts, over the frame (out of the flow). -->
     <div id="rv-details" class="rv-details"><div id="rv-meta" class="review-meta"></div><div id="rv-details-pace" class="rv-details-pace muted"></div></div>
@@ -69,9 +58,27 @@
       <canvas id="rv-overview" class="rv-overview" width="1" height="1" hidden aria-label="Overview of the whole frame: the outlined part is the one the frame shows. Tap or click a box to select it, or elsewhere to move the view there."></canvas>
       <div class="rv-canvas-fit"><canvas id="rv-canvas" width="640" height="360" tabindex="0" aria-label="The frame with its boxes. Click a box to select it, drag its edges or corners to resize it, drag inside it to move it, drag elsewhere to draw a new one; the wheel zooms."></canvas></div>
     </div>
+    <!-- The view buttons, under the frame (one size, shown and hidden in place; View opens upward on
+         two columns). -->
+    <div class="review-meta-row rv-tools"><span class="rv-slot rv-tool-zoom" data-slot="zoom"><span id="rv-zoom" class="muted review-zoom"></span></span><span class="rv-slot rv-tool-zoomout" data-slot="zoomout"><button type="button" id="rv-zoom-out" class="small secondary" title="Zoom out">−</button></span><span class="rv-slot rv-tool-zoomin" data-slot="zoomin"><button type="button" id="rv-zoom-in" class="small secondary" title="Zoom in">+</button></span><span class="rv-slot rv-tool-zoombox" data-slot="zoombox"><button type="button" id="rv-zoombox" class="small secondary rv-off">Zoom to box</button></span><span class="rv-slot rv-tool-image" data-slot="image"><button type="button" id="rv-imgmode" class="small secondary">Image</button></span><span class="rv-slot rv-tool-draw" data-slot="draw"><button type="button" id="rv-draw" class="small secondary" aria-pressed="false">Draw</button></span><span class="rv-slot rv-tool-redraw" data-slot="redraw"><button type="button" id="rv-redraw" class="small secondary rv-off" aria-pressed="false">Redraw</button></span><span class="rv-slot rv-tool-view" data-slot="view"><details id="rv-view-menu" class="rv-view-menu"><summary>View</summary><div class="rv-view-items">
+      <button type="button" class="small secondary" data-view="zoom-in">Zoom in</button>
+      <button type="button" class="small secondary" data-view="zoom-out">Zoom out</button>
+      <button type="button" class="small secondary" data-view="fit">Fit whole frame</button>
+      <button type="button" class="small secondary" data-view="ov-layout">Overview in a corner</button>
+      <button type="button" class="small secondary" data-view="hide" aria-pressed="false">Hide boxes</button>
+      <button type="button" class="small secondary" data-view="labels" aria-pressed="true">Labels</button>
+      <button type="button" class="small secondary" data-view="spotlight" aria-pressed="false">Spotlight</button>
+      <button type="button" class="small secondary" data-view="image">Image</button>
+      <label class="rv-view-range">Brightness <input type="range" id="rv-bright" min="-100" max="100" step="5" value="0"><output id="rv-bright-val" for="rv-bright">0</output></label>
+      <label class="rv-view-range">Contrast <input type="range" id="rv-contrast" min="-100" max="100" step="5" value="0"><output id="rv-contrast-val" for="rv-contrast">0</output></label>
+      <button type="button" class="small secondary" data-view="reset">Reset image</button>
+      <button type="button" class="small rv-view-done" data-view="done">Done</button>
+    </div></details></span></div>
     <p id="rv-none" class="empty" hidden>No frame matches the filters. Send frames to review from the <a href="/train/collect">Collect</a> tab, or show all collected frames.</p>
   </div>
   <aside class="review-side card">
+    <!-- Two columns: drag (or arrow keys) to set the panel's width (review.js, per viewer). -->
+    <div id="rv-side-resize" class="rv-side-resize" role="separator" aria-orientation="vertical" aria-label="Side panel width" aria-valuemin="280" tabindex="0" title="Drag to set the panel's width (arrow keys too); double-click for the default"></div>
     <div class="rv-side-body">
     <div id="rv-side-top" class="rv-side-top"><div id="rv-ov-slot" class="rv-ov-slot"></div></div>
     <!-- The card: the question's line, the answers right under it, then what varies (review.js renderDecision). -->
@@ -91,7 +98,7 @@
       <div class="rv-show-of"><span class="field-label" id="rv-show-cap">Show boxes of</span> <div id="rv-show-picker" aria-labelledby="rv-show-cap"></div></div>
       <label>Class for new boxes <select id="rv-class">{% for c in classes %}<option value="{{ c }}">{{ loop.index }}. {{ c }}</option>{% endfor %}</select></label>
       <label class="check"><input type="checkbox" id="rv-ask-missing"> Ask about missed objects before saving</label>
-      <div class="rv-panel-btns"><button type="button" id="rv-side-wide" class="small secondary">Wider panel</button> <button type="button" id="rv-ov-layout" class="small secondary">Overview in a corner</button></div>
+      <div class="rv-panel-btns"><button type="button" id="rv-ov-layout" class="small secondary">Overview in a corner</button></div>
     <details>
       <summary>Keyboard and colours</summary>
       <table class="review-keys">

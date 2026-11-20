@@ -1779,17 +1779,35 @@ mod tests {
             assert!(picker < own, "{uri}");
         }
         let (_, review) = get_text(&state, "/train/review").await;
-        // The overview's places, the layout switches and no close-up.
+        // The overview's places, the layout switch, the side panel's width handle (it replaced
+        // "Wider panel"), View's Brightness and Contrast (they replaced Brighter / Darker), and no
+        // close-up.
         for needle in [
             "id=\"rv-side-top\"",
             "id=\"rv-ov-slot\"",
-            "id=\"rv-side-wide\"",
             "id=\"rv-ov-layout\"",
             "data-view=\"ov-layout\"",
+            "id=\"rv-side-resize\"",
+            "id=\"rv-bright\"",
+            "id=\"rv-contrast\"",
         ] {
             assert!(review.contains(needle), "{needle}");
         }
-        assert!(!review.contains("rv-crop"));
+        for gone in [
+            "rv-crop",
+            "rv-side-wide",
+            "data-view=\"brighter\"",
+            "data-view=\"darker\"",
+        ] {
+            assert!(!review.contains(gone), "{gone}");
+        }
+        // Top to bottom (and in the tab order): the HUD, the frame box, the view buttons under it.
+        let at = |needle: &str| review.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(
+            at("class=\"rv-hud\"") < at("class=\"rv-frame-box\"")
+                && at("class=\"rv-frame-box\"") < at("rv-tools\""),
+            "HUD, then the frame box, then the tools"
+        );
         // The finger rules (pinch, two-tap box, one finger's drag) come before the page script
         // that reads them.
         let touch = review.find("/static/review-touch.js?v=");

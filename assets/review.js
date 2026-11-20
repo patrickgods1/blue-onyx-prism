@@ -7,7 +7,10 @@
 // on. The canvas edits boxes (draw, select, move, resize, nudge) under a zoom / pan view; its buffer
 // is its CSS size x devicePixelRatio (the frame's size is FW x FH), so the 1 px box lines drawn
 // just outside each box are sharp at any zoom. The overview shows the whole frame and the part in
-// view (two columns: in the side panel under the HUD, or in a corner of the frame, `o`).
+// view (two columns: at the top of the side panel, or in a corner of the frame, `o`). Two columns
+// put the HUD (the progress, then the frame's facts) over the frame and the view buttons under it;
+// the side panel's width is dragged on its left edge (kept per viewer). The View menu's Brightness
+// and Contrast (`[` `]`, `{` `}`) and the image mode (`b`) change the view only (viewSource).
 // A job queued on the Auto-label tab is followed on GET /v1/train/jobs?task=<id> (its record only;
 // GET /v1/training on a server without it), every 3 s while the tab shows, and the frames reload
 // when it ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
@@ -76,8 +79,8 @@
   var zoomText = $('rv-zoom');
   var zoomOutBtn = $('rv-zoom-out'), zoomInBtn = $('rv-zoom-in');   // the tool row's - and + (mouse)
   var likelyBar = $('rv-accept-likely');
-  // The HUD (setHud): one element per value, each in a slot of a fixed size; over the frame on one
-  // column, at the side panel's top on two (placeLayout).
+  // The HUD (setHud): one element per value, each in a slot of a fixed size, over the frame (one
+  // column: two rows; two columns: one row, the progress first, style.css).
   var hud = root.querySelector('.rv-hud');
   var hudEl = {
     pos: $('rv-hud-pos'), done: $('rv-hud-done'), meter: $('rv-hud-meter'), todo: $('rv-hud-todo'),
@@ -223,8 +226,7 @@
     else canvas.parentNode.insertBefore(overview, canvas);
   }
   overview.classList.add('rv-overview');
-  // Two columns: the side panel's top holds the HUD and, in the side layout, the overview's slot
-  // (placeLayout).
+  // Two columns: the side panel's top holds the overview's slot (the side layout, placeLayout).
   var sideTop = $('rv-side-top'), ovSlot = $('rv-ov-slot');
   var stage = canvas.closest('.review-stage');
   // One column: the selected box's main answers in the bar at the screen's foot while boxes still
@@ -281,7 +283,6 @@
   var hideBoxes = false;               // `h` held
   var showTags = true;                 // `l` toggles
   var spotlight = pref('spotlight', true);   // `v`: veil the frame and dim the other boxes
-  var wideSide = pref('wide', false);        // Wider panel
   var ovLayout = 'side';                     // the overview on two columns: 'side' panel or 'corner'
   try { if (window.localStorage.getItem('bop.review.ov-layout') === 'corner') ovLayout = 'corner'; } catch (e) { /* the default */ }
   var hoverIdx = -1;                   // the box under the pointer (its tag shows in full)
@@ -309,15 +310,18 @@
     start: Date.now(), frames: [],     // per saved frame {s, acc, rej, boxes}
     breakAt: Date.now() + 45 * 60000   // the next break note
   };
-  // View-only image setting: `mode` auto (bright + equalised on night / IR frames, else off), off,
-  // bright (levels stretched, lifted), eq (histogram equalised); `gamma` on top ([ / ]).
-  var imgView = { mode: 'auto', gamma: 1 };
-  try {
-    var iv = JSON.parse(window.localStorage.getItem('bop.review.view') || 'null');
-    if (iv && /^(auto|off|bright|eq)$/.test(iv.mode)) imgView.mode = iv.mode;
-    if (iv && typeof iv.gamma === 'number' && iv.gamma >= 0.4 && iv.gamma <= 2.5) imgView.gamma = iv.gamma;
-  } catch (e) { /* the defaults */ }
-  var viewCache = null;                // {img, key, canvas}: the adjusted frame
+  // View-only image setting (ReviewTouch.viewSettings / viewLut): `mode` auto (bright + equalised
+  // on night / IR frames, else off), off, bright (levels stretched, lifted), eq (histogram
+  // equalised); `brightness` and `contrast` (-100 .. 100; View's sliders, [ ] and { }) on top.
+  // Kept per viewer, the same from frame to frame.
+  var imgView = window.ReviewTouch.viewSettings(null);
+  try { imgView = window.ReviewTouch.viewSettings(JSON.parse(window.localStorage.getItem('bop.review.view') || 'null')); } catch (e) { /* the defaults */ }
+  // The adjusted frame (viewSource), only while the setting is not neutral: {img, w, h, canvas,
+  // c (its context), orig (the frame's pixels, read once per frame), out (one ImageData, written
+  // through the table at each change), hist, n, mode, b, k (the setting it shows; k the contrast),
+  // bad (the frame cannot be read back)}. `viewGen` counts its repaints (the overview's cache key).
+  var viewCache = null, viewGen = 0;
+  var viewTable = new Uint8ClampedArray(256), viewHist = new Float64Array(256);
   var dups = { groups: [], of: {}, overlaps: [], near: {} };   // dupGroups, as of the last render
   var suggestions = [];                // liveSuggestions, as of the last render
   var refineCur = null;                // R.refineCurrent ({l, k, n}), as of the last render
@@ -986,15 +990,38 @@
 
   var IMG_NAMES = { off: 'off', bright: 'bright', eq: 'bright+eq' };
 
+  // A slider's level as shown: +20, −20, 0.
+  function signedLevel(v) { return v > 0 ? '+' + v : (v < 0 ? '−' + (-v) : '0'); }
+
+  // "Image auto: off · B+20 C+10" (the brightness and contrast only when set).
   function imgLabel() {
+    var adj = (imgView.brightness ? 'B' + signedLevel(imgView.brightness) : '') +
+      (imgView.brightness && imgView.contrast ? ' ' : '') + (imgView.contrast ? 'C' + signedLevel(imgView.contrast) : '');
     return 'Image ' + (imgView.mode === 'auto' ? 'auto: ' + IMG_NAMES[imgMode()] : IMG_NAMES[imgView.mode]) +
-      (imgView.gamma !== 1 ? ' γ' + imgView.gamma.toFixed(2) : '');
+      (adj ? ' · ' + adj : '');
   }
 
-  function setImgView(mode, gamma) {
-    imgView.mode = mode;
-    imgView.gamma = gamma;
+  function saveImgView() {
     try { window.localStorage.setItem('bop.review.view', JSON.stringify(imgView)); } catch (e) { /* not kept */ }
+  }
+
+  // View's Brightness and Contrast sliders, each with its value; they follow the keys.
+  var brightIn = $('rv-bright'), contrastIn = $('rv-contrast');
+  var brightOut = $('rv-bright-val'), contrastOut = $('rv-contrast-val');
+  function syncSliders() {
+    if (brightIn && Number(brightIn.value) !== imgView.brightness) brightIn.value = String(imgView.brightness);
+    if (contrastIn && Number(contrastIn.value) !== imgView.contrast) contrastIn.value = String(imgView.contrast);
+    setText(brightOut, signedLevel(imgView.brightness));
+    setText(contrastOut, signedLevel(imgView.contrast));
+  }
+
+  // A new setting from a key or a View button: kept, said once, drawn.
+  function setImgView(mode, brightness, contrast) {
+    imgView.mode = mode;
+    imgView.brightness = window.ReviewTouch.viewLevel(brightness);
+    imgView.contrast = window.ReviewTouch.viewLevel(contrast);
+    saveImgView();
+    syncSliders();
     say(imgLabel() + ' (view only: the frame is not changed).');
     draw();
   }
@@ -1002,59 +1029,96 @@
   // `b`: auto -> off -> bright -> bright + equalised -> auto.
   function cycleImg() {
     var order = ['auto', 'off', 'bright', 'eq'];
-    setImgView(order[(order.indexOf(imgView.mode) + 1) % order.length], imgView.gamma);
+    setImgView(order[(order.indexOf(imgView.mode) + 1) % order.length], imgView.brightness, imgView.contrast);
   }
 
-  // `[` / `]`: darker / brighter (gamma); back at 1 snaps to it.
-  function stepGamma(d) {
-    var g = clamp(imgView.gamma * (d > 0 ? 1 / 0.85 : 0.85), 0.4, 2.5);
-    if (Math.abs(g - 1) < 0.04) g = 1;
-    setImgView(imgView.mode, Math.round(g * 100) / 100);
+  // `[` / `]`: brightness -10 / +10; `{` / `}`: contrast. On the sliders' steps of 5 (a brightness
+  // converted from an older page's gamma may be between them).
+  function onStep(v, d) { return Math.round((v + 10 * d) / 5) * 5; }
+  function stepBrightness(d) { setImgView(imgView.mode, onStep(imgView.brightness, d), imgView.contrast); }
+  function stepContrast(d) { setImgView(imgView.mode, imgView.brightness, onStep(imgView.contrast, d)); }
+
+  // A slider moved: the setting follows at once and the frame is drawn at most once per animation
+  // frame (queueDraw), with no message and nothing stored; once let go (`change`) it is kept and
+  // said once. Wired once, here.
+  function wireSlider(input, out, key) {
+    if (!input) return;
+    input.addEventListener('input', function () {
+      var v = window.ReviewTouch.viewLevel(Number(input.value));
+      if (imgView[key] === v) return;
+      imgView[key] = v;
+      setText(out, signedLevel(v));
+      queueDraw();
+    });
+    input.addEventListener('change', function () {
+      saveImgView();
+      say(imgLabel() + ' (view only: the frame is not changed).');
+    });
+  }
+  wireSlider(brightIn, brightOut, 'brightness');
+  wireSlider(contrastIn, contrastOut, 'contrast');
+  syncSliders();
+
+  // Lets the adjusted frame go (its canvas's pixels at once, the buffers with the object).
+  function dropViewCache() {
+    if (viewCache && viewCache.canvas) viewCache.canvas.width = 0;
+    viewCache = null;
   }
 
-  // A 256-entry table from the frame's luma histogram: `bright` stretches the levels (1% .. 99.5%)
-  // and lifts them, `eq` mostly equalises them; the gamma on top.
-  function viewLut(hist, total, mode, gamma) {
-    var lut = new Uint8ClampedArray(256), cdf = new Float64Array(256), acc = 0, i;
-    for (i = 0; i < 256; i++) { acc += hist[i]; cdf[i] = acc / total; }
-    var lo = 0, hi = 255;
-    while (lo < 254 && cdf[lo] < 0.01) lo++;
-    while (hi > lo + 1 && cdf[hi - 1] >= 0.995) hi--;
-    var g = gamma * (mode === 'bright' ? 1.5 : 1);
-    for (i = 0; i < 256; i++) {
-      var v = i / 255;
-      if (mode !== 'off') v = clamp((i - lo) / Math.max(1, hi - lo), 0, 1);
-      if (mode === 'eq') v = 0.75 * cdf[i] + 0.25 * v;
-      lut[i] = Math.round(255 * Math.pow(v, 1 / g));
-    }
-    return lut;
-  }
-
-  // What the frame and the overview draw: the frame, or a copy of it through the table (made
-  // again only when the frame or the setting changes; the saved frame never changes).
+  // What the frame and the overview draw: the frame itself while the setting is neutral (mode off,
+  // brightness and contrast 0; an adjusted copy of another frame is let go then), else a copy of
+  // it through the tone table (ReviewTouch.viewLut). Per frame its pixels are read once (`orig`),
+  // its luma histogram counted once, and one output ImageData is reused; a new setting makes the
+  // 256-entry table again (into `viewTable`), runs one pass orig -> out and puts it on the
+  // canvas: nothing is allocated per slider step. A next frame of the same size reuses the canvas
+  // and the output (the read is the browser's new ImageData, the old one let go). The saved frame
+  // never changes.
   function viewSource() {
     if (!img || !img.complete || !img.naturalWidth) return null;
-    var mode = imgMode();
-    if (mode === 'off' && imgView.gamma === 1) return img;
-    var key = mode + ':' + imgView.gamma;
-    if (viewCache && viewCache.img === img && viewCache.key === key) return viewCache.canvas;
+    var mode = imgMode(), b = imgView.brightness, k = imgView.contrast;
+    if (mode === 'off' && !b && !k) {
+      if (viewCache && viewCache.img !== img) dropViewCache();
+      return img;
+    }
+    var vc = viewCache;
+    if (vc && vc.img === img) {
+      if (vc.bad) return img;
+      if (vc.mode === mode && vc.b === b && vc.k === k) return vc.canvas;
+    }
     try {
-      var w = img.naturalWidth, h = img.naturalHeight;
-      var oc = (viewCache && viewCache.canvas) || document.createElement('canvas');
-      oc.width = w; oc.height = h;
-      var c = oc.getContext('2d');
-      c.drawImage(img, 0, 0);
-      var data = c.getImageData(0, 0, w, h), d = data.data, i;
-      // The histogram from about 250k pixels.
-      var hist = new Float64Array(256), n = 0, step = Math.max(1, Math.floor(d.length / 4 / 250000)) * 4;
-      for (i = 0; i < d.length; i += step) { hist[(d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8]++; n++; }
-      var lut = viewLut(hist, n || 1, mode, imgView.gamma);
-      for (i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
-      c.putImageData(data, 0, 0);
-      viewCache = { img: img, key: key, canvas: oc };
-      return oc;
+      var w = img.naturalWidth, h = img.naturalHeight, i;
+      if (!vc || vc.img !== img) {
+        if (!vc || vc.bad || vc.w !== w || vc.h !== h) {
+          // Another size (or the first frame): a canvas and an output of this one.
+          var oc = (vc && vc.canvas) || document.createElement('canvas');
+          oc.width = w; oc.height = h;
+          var octx = oc.getContext('2d');
+          vc = viewCache = { img: null, w: w, h: h, canvas: oc, c: octx, orig: null, out: octx.createImageData(w, h), hist: viewHist, n: 1, mode: '', b: 0, k: 0, bad: false };
+        }
+        vc.img = img; vc.mode = ''; vc.orig = null;
+        vc.c.clearRect(0, 0, w, h);
+        vc.c.drawImage(img, 0, 0);
+        var orig = vc.orig = vc.c.getImageData(0, 0, w, h).data;
+        // Alpha (and everything) once per frame; a setting change writes RGB only.
+        vc.out.data.set(orig);
+        // The histogram from about 250k pixels.
+        var hist = vc.hist, n = 0, step = Math.max(1, Math.floor(orig.length / 4 / 250000)) * 4;
+        hist.fill(0);
+        for (i = 0; i < orig.length; i += step) { hist[(orig[i] * 77 + orig[i + 1] * 150 + orig[i + 2] * 29) >> 8]++; n++; }
+        vc.n = n || 1;
+      }
+      var lut = window.ReviewTouch.viewLut(vc.hist, vc.n, mode, b, k, viewTable);
+      var s = vc.orig, d = vc.out.data, len = s.length;
+      for (i = 0; i < len; i += 4) { d[i] = lut[s[i]]; d[i + 1] = lut[s[i + 1]]; d[i + 2] = lut[s[i + 2]]; }
+      vc.c.putImageData(vc.out, 0, 0);
+      vc.mode = mode; vc.b = b; vc.k = k;
+      viewGen++;
+      return vc.canvas;
     } catch (e) {
-      return img;   // a frame the page cannot read back: shown as it is
+      // A frame the page cannot read back: shown as it is (and not tried again on every draw).
+      if (viewCache) { viewCache.img = img; viewCache.bad = true; viewCache.orig = null; }
+      else viewCache = { img: img, bad: true };
+      return img;
     }
   }
 
@@ -1246,8 +1310,8 @@
     if (imgBtn) {
       setText(imgBtn, imgLabel());
       setTitle(imgBtn, touchUi.matches
-        ? 'View only: cycles auto / off / bright / bright + equalised; View has Brighter, Darker and Reset image'
-        : 'View only: b cycles auto / off / bright / bright + equalised, [ and ] darker / brighter, Shift+0 resets');
+        ? 'View only: cycles auto / off / bright / bright + equalised; View has Brightness, Contrast and Reset image'
+        : 'View only: b cycles auto / off / bright / bright + equalised; [ and ] brightness, { and } contrast (View has the sliders), Shift+0 resets');
     }
     touchViewUi();
   }
@@ -1596,12 +1660,12 @@
   }
 
   // The overview (one column: over the frame while it is zoomed or follows the selection; two
-  // columns: with every frame, in the side panel under the HUD or in a corner of the frame,
+  // columns: with every frame, at the top of the side panel or in a corner of the frame,
   // placeLayout): the whole frame at the overview's CSS size (x devicePixelRatio), every shown box
   // as a thin outline, the selected one on a dark line, and a veil outside the part the frame
   // shows. Held while a gesture runs: the frame would move under the fingers of a pinch that
   // crossed zoom 1.
-  var overviewCache = null;   // {img, src, key, w, h, canvas}: the frame at the overview's size
+  var overviewCache = null;   // {img, src, key (viewGen), w, h, canvas}: the frame at the overview's size
 
   // The frame's rect in the overview's box, CSS px, or null while it is not laid out: inside its
   // border (the corner layout has one), and centred when the box is wider or taller than the
@@ -1690,8 +1754,9 @@
     c.clearRect(0, 0, pw, ph);
     var src = viewSource();
     if (src) {
-      // Scaled down once per frame, setting and size (a pinch redraws this on every move).
-      var vkey = imgMode() + ':' + imgView.gamma;
+      // Scaled down once per frame, setting and size (a pinch redraws this on every move): the
+      // adjusted frame's canvas stays the same object, so its repaint count tells a new setting.
+      var vkey = src === img ? 0 : viewGen;
       var oc0 = overviewCache;
       if (!oc0 || oc0.img !== img || oc0.src !== src || oc0.key !== vkey || oc0.w !== pw || oc0.h !== ph) {
         var oc = (overviewCache && overviewCache.canvas) || document.createElement('canvas');
@@ -2668,7 +2733,8 @@
   // seen (its ratio kept in storage, `stage-ar`), so a frame of a wider ratio letterboxes and the
   // HUD, the buttons and the card under it never move: the overview (shown while following, the
   // default) and the frame at the stylesheet's sizes, at most STAGE_CAP of the small viewport
-  // height. Two columns: the stylesheet sizes the box (the window under the HUD).
+  // height. Two columns: the stylesheet sizes the box (the window between the HUD and the tool
+  // row).
   var STAGE_CAP = 0.6, MIN_STAGE = 0.4, OV_SHARE = 0.26, FRAME_SHARE_OV = 0.48, FRAME_SHARE = 0.6, OV_GAP = 4.8;
   var STAGE_AR = 4 / 3;
   // CSS px: the card's question line and two rows under it (the answers, then Accept likely / the
@@ -2680,14 +2746,19 @@
   document.body.appendChild(svhProbe);
   function sizeStage() {
     if (!frameBox) return;
-    if (!oneColumn.matches) {
-      if (frameBox.style.getPropertyValue('--rv-stage-h')) frameBox.style.removeProperty('--rv-stage-h');
-      return;
-    }
     var ar = FW / FH;
     if (cur && ar > 0 && (!stageAr || ar < stageAr)) {
       stageAr = ar;
       try { window.localStorage.setItem('bop.review.stage-ar', String(Math.round(ar * 1000) / 1000)); } catch (e) { /* not kept */ }
+    }
+    if (!oneColumn.matches) {
+      if (frameBox.style.getPropertyValue('--rv-stage-h')) frameBox.style.removeProperty('--rv-stage-h');
+      // Two columns: the frame box is as tall as the tallest frame seen needs at the editor's
+      // width (style.css, at most the window's room), so the tool row sits right under the frame
+      // and stays put when a frame of another ratio letterboxes in it.
+      var sa = String(Math.round(Math.min(stageAr || ar, ar) * 1000) / 1000);
+      if (frameBox.style.getPropertyValue('--rv-stage-ar') !== sa) frameBox.style.setProperty('--rv-stage-ar', sa);
+      return;
     }
     // At least a 4:3 frame's height (with 16:9 the commonest camera ratio): a session mixing the
     // two never grows the box.
@@ -3750,9 +3821,9 @@
     hide: function () { hideBoxes = !hideBoxes; draw(); },
     labels: toggleTags,
     spotlight: toggleSpotlight,
-    brighter: function () { stepGamma(1); },
-    darker: function () { stepGamma(-1); },
-    reset: function () { setImgView('auto', 1); }
+    reset: function () { setImgView('auto', 0, 0); },
+    // One column: the sheet covers View, so it closes here (a tap elsewhere would land on the frame).
+    done: function () { if (viewMenu) viewMenu.open = false; }
   };
   // What each View item's key is (its title with a mouse).
   var VIEW_KEYS = {
@@ -3764,14 +3835,12 @@
     labels: 'l',
     spotlight: 'v',
     image: 'b cycles auto / off / bright / bright + equalised',
-    brighter: ']',
-    darker: '[',
-    reset: 'Shift+0'
+    reset: 'Shift+0 (auto, brightness and contrast 0)'
   };
   // Fit whole frame and the image setting (`b`): an older page gets them made here.
   var viewItems = viewMenu && viewMenu.querySelector('.rv-view-items');
   if (viewItems) {
-    [['fit', 'Fit whole frame', 'hide'], ['image', 'Image', 'brighter']].forEach(function (v) {
+    [['fit', 'Fit whole frame', 'hide'], ['image', 'Image', 'reset']].forEach(function (v) {
       if (viewItems.querySelector('button[data-view="' + v[0] + '"]')) return;
       var vb = el('button', 'small secondary', v[1]);
       vb.type = 'button';
@@ -3828,6 +3897,8 @@
         // With a mouse each item names its key (the touch UI has none to name).
         setTitle(b, on || !VIEW_KEYS ? '' : (VIEW_KEYS[k] || ''));
       }
+      setTitle(brightIn, on ? '' : '[ and ] (view only)');
+      setTitle(contrastIn, on ? '' : '{ and } (Shift+[ and ]; view only)');
     }
   }
   function touchWords() {
@@ -3842,7 +3913,7 @@
     if (!touchUi.matches) { drawMode = false; taps = null; }
     hoverEdge = null;
     if (viewMenu) viewMenu.open = false;
-    // The HUD and the overview go where this layout has them.
+    // The overview goes where this layout has it.
     placeLayout();
     // Each layout keeps its own Zoom to box / Fit choice (after the quarter look, if one is on).
     if (quarter >= 0) quarterFollow = followPref(); else view.follow = followPref();
@@ -3894,32 +3965,115 @@
   // The frame box's size before the first frame comes (one column): nothing moves when it does.
   sizeStage();
 
-  // Wider panel (Panel options): a wider side panel, so a larger overview and HUD (per viewer).
-  var wideBtn = $('rv-side-wide');
-  function applyWide() {
-    if (grid) grid.classList.toggle('rv-wide', wideSide);
-    // Its text names what a click does.
-    if (wideBtn) wideBtn.textContent = wideSide ? 'Narrower panel' : 'Wider panel';
+  // ---- the side panel's width (two columns) ----
+  // Set by dragging the handle on the panel's left edge (or its arrow keys), kept per viewer in
+  // `side-w` (CSS px; an older page's "Wider panel" starts at 480). style.css holds it in
+  // [SIDE_MIN, 60% of the grid] (`--rv-side-w`), so a smaller window never squeezes the editor and
+  // no resize listener is needed; the ResizeObserver below draws the frame and the overview again.
+  // The drag's listeners are the handle's own (pointer capture): nothing is added per drag.
+  var SIDE_W = 400, SIDE_MIN = 280, SIDE_MAX_SHARE = 0.6, SIDE_STEP = 16, SIDE_STEP_BIG = 64, SIDE_WAS_WIDE = 480;
+  var sideHandle = $('rv-side-resize');
+  var sidePanel = sideHandle ? sideHandle.parentNode : null;
+  var sideDrag = null;   // {id (pointer), x, w (at the start), max, want, raf}
+  var sideW = (function () {
+    try {
+      var ls = window.localStorage, kept = ls.getItem('bop.review.side-w');
+      if (kept != null) return window.ReviewTouch.sideWidth(parseFloat(kept), SIDE_MIN, Infinity, SIDE_W);
+      if (ls.getItem('bop.review.wide') === '1') {
+        ls.setItem('bop.review.side-w', String(SIDE_WAS_WIDE));
+        ls.removeItem('bop.review.wide');
+        return SIDE_WAS_WIDE;
+      }
+    } catch (e) { /* the default */ }
+    return SIDE_W;
+  }());
+  // The widest the panel gets (style.css's 60% of the grid).
+  function sideMax() { return grid ? Math.floor(grid.clientWidth * SIDE_MAX_SHARE) : SIDE_W; }
+  function setSideW(w, max) {
+    sideW = window.ReviewTouch.sideWidth(w, SIDE_MIN, max, SIDE_W);
+    var v = sideW + 'px';
+    if (grid && grid.style.getPropertyValue('--rv-side-w') !== v) grid.style.setProperty('--rv-side-w', v);
   }
-  if (wideBtn) {
-    wideBtn.addEventListener('click', function () {
-      wideSide = !wideSide;
-      setPref('wide', wideSide);
-      applyWide();
-      draw();
-      canvas.focus({ preventScroll: true });
+  // The handle's value for assistive tech: the width as shown (the one kept, held to the widest
+  // it can be now) and that widest.
+  function sideAria() {
+    if (!sideHandle) return;
+    var max = Math.max(SIDE_MIN, sideMax());
+    setAttr(sideHandle, 'aria-valuenow', String(Math.min(sideW, max)));
+    setAttr(sideHandle, 'aria-valuemax', String(max));
+  }
+  function saveSideW() {
+    sideAria();
+    try { window.localStorage.setItem('bop.review.side-w', String(sideW)); } catch (e) { /* not kept */ }
+  }
+  // The width as shown (the stylesheet may hold it narrower than the one kept).
+  function shownSideW() { return sidePanel ? Math.round(sidePanel.getBoundingClientRect().width) : sideW; }
+  function sideFrame() {
+    if (!sideDrag) return;
+    sideDrag.raf = 0;
+    setSideW(sideDrag.want, sideDrag.max);
+  }
+  // pointerup, pointercancel and a lost capture all end the drag here (once).
+  function endSideDrag(ev) {
+    var d = sideDrag;
+    if (!d || (ev && ev.pointerId !== d.id)) return;
+    sideDrag = null;
+    if (d.raf) window.cancelAnimationFrame(d.raf);
+    if (d.want != null) setSideW(d.want, d.max);
+    if (grid) grid.classList.remove('rv-resizing');
+    try { if (sideHandle.hasPointerCapture(d.id)) sideHandle.releasePointerCapture(d.id); } catch (e) { /* gone already */ }
+    saveSideW();
+  }
+  if (sideHandle && grid) {
+    setSideW(sideW, Infinity);
+    sideAria();
+    sideHandle.addEventListener('pointerdown', function (ev) {
+      if (ev.button !== 0 || sideDrag || oneColumn.matches) return;
+      ev.preventDefault();
+      sideDrag = { id: ev.pointerId, x: ev.clientX, w: shownSideW(), max: sideMax(), want: null, raf: 0 };
+      try { sideHandle.setPointerCapture(ev.pointerId); } catch (e) { /* the drag still works over the handle */ }
+      grid.classList.add('rv-resizing');
+    });
+    sideHandle.addEventListener('pointermove', function (ev) {
+      var d = sideDrag;
+      if (!d || ev.pointerId !== d.id) return;
+      // The handle is on the panel's left edge: moving it left widens the panel.
+      d.want = d.w + (d.x - ev.clientX);
+      if (!d.raf) d.raf = window.requestAnimationFrame(sideFrame);
+    });
+    sideHandle.addEventListener('pointerup', endSideDrag);
+    sideHandle.addEventListener('pointercancel', endSideDrag);
+    sideHandle.addEventListener('lostpointercapture', endSideDrag);
+    // Keys: left / right move the edge by SIDE_STEP px (Shift: SIDE_STEP_BIG), Home the narrowest,
+    // End the widest; up / down do nothing. Theirs alone: an arrow here never nudges a box.
+    sideHandle.addEventListener('keydown', function (ev) {
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      var step = ev.shiftKey ? SIDE_STEP_BIG : SIDE_STEP, max = sideMax(), w;
+      if (ev.key === 'ArrowLeft') w = shownSideW() + step;
+      else if (ev.key === 'ArrowRight') w = shownSideW() - step;
+      else if (ev.key === 'Home') w = SIDE_MIN;
+      else if (ev.key === 'End') w = max;
+      else if (ev.key === 'ArrowUp' || ev.key === 'ArrowDown') { ev.preventDefault(); ev.stopPropagation(); return; }
+      else return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      setSideW(w, max);
+      saveSideW();
+    });
+    // Double-click: the default width.
+    sideHandle.addEventListener('dblclick', function () {
+      setSideW(SIDE_W, sideMax());
+      saveSideW();
     });
   }
-  applyWide();
 
-  // ---- where the HUD and the overview go (two columns) ----
-  // The DOM is the phone layout's (style.css orders it there), so two columns move the nodes and
-  // one column puts them back where the page had them: the HUD to the side panel's top, over the
-  // overview's slot; the overview into that slot (`side`, the default) or over a corner of the
-  // frame (`corner`, placeOverview). `o`, View's item and Panel options switch; kept per viewer
-  // (`ov-layout`).
+  // ---- where the overview goes (two columns) ----
+  // The DOM is the phone layout's (style.css orders it there), so two columns move the overview and
+  // one column puts it back where the page had it: into the slot at the side panel's top (`side`,
+  // the default) or over a corner of the frame (`corner`, placeOverview). `o`, View's item and Panel
+  // options switch; kept per viewer (`ov-layout`). The HUD stays over the frame in every layout.
   var homeOf = function (node) { return node ? { parent: node.parentNode, next: node.nextSibling } : null; };
-  var hudHome = homeOf(hud), ovHome = homeOf(overview);
+  var ovHome = homeOf(overview);
   var ovLayoutBtn = $('rv-ov-layout');
 
   // What a click on the switch does.
@@ -3934,11 +4088,6 @@
   function placeLayout() {
     var two = !oneColumn.matches && !!sideTop;
     var inSide = two && ovLayout === 'side' && !!ovSlot;
-    if (hud) {
-      var before = ovSlot && ovSlot.parentNode === sideTop ? ovSlot : null;
-      if (!two) goHome(hud, hudHome);
-      else if (hud.parentNode !== sideTop || hud.nextSibling !== before) sideTop.insertBefore(hud, before);
-    }
     var wasIn = overview.parentNode;
     if (inSide) { if (overview.parentNode !== ovSlot) ovSlot.appendChild(overview); }
     else goHome(overview, ovHome);
@@ -4761,7 +4910,9 @@
     ];
     if (rate != null) parts.push(Math.round(rate * 100) + '% accepted');
     parts.push(min + ' min');
-    sessionLine.appendChild(el('span', null, parts.join(' · ')));
+    // The plain stats (two columns hide them: the HUD's pace slot and Details have them; the
+    // warning chips after them stay).
+    sessionLine.appendChild(el('span', 'rv-session-stats', parts.join(' · ')));
     if (detailsPace) detailsPace.textContent = parts.join(' · ');
     if (fs.length >= 15) {
       var last = fs.slice(-10), lr = acceptRate(last);
@@ -4960,10 +5111,11 @@
     ['Navigate', 'right / middle drag, Space + drag', 'pan'],
     ['Navigate', 'overview', 'drag the outlined part to pan, the wheel zooms there; click a box to select it, elsewhere to move the view there'],
     ['View', 'b', 'image (view only): auto, off, bright, bright + equalised; auto = bright + equalised on night / IR frames'],
-    ['View', '[ / ]', 'image darker / brighter (gamma)'],
-    ['View', 'Shift+0', 'image back to auto, gamma 1'],
+    ['View', '[ / ]', 'image brightness down / up (view only; the View menu has the slider): lifts or deepens the shadows, never clips the highlights'],
+    ['View', '{ / }', 'image contrast down / up (Shift+[ / ]; view only; the View menu has the slider), about the frame\'s median level (a dark frame does not go black)'],
+    ['View', 'Shift+0', 'image back to auto, brightness and contrast 0'],
     ['View', 'v', 'spotlight on / off: the frame dimmed outside the selected box, the other boxes faint'],
-    ['View', 'o', 'the overview of the whole frame: in the side panel under the frame info, or in a corner of the frame (wide screens; kept for your next visits)'],
+    ['View', 'o', 'the overview of the whole frame: at the top of the side panel, or in a corner of the frame (wide screens; kept for your next visits)'],
     ['View', 'h (hold)', 'hide the boxes'],
     ['View', 'l', 'labels on the boxes on / off'],
     ['View', 'i', 'show / put away the hidden boxes of this frame (low-score auto boxes and boxes at spots you rejected, dimmed; accepting one makes it a label)'],
@@ -5078,8 +5230,9 @@
     else if (k === 'x') chooseZoom();
     else if (k === 'f') chooseFit();
     else if (k === 'b') cycleImg();
-    else if (k === '[' || k === ']') stepGamma(k === ']' ? 1 : -1);
-    else if (ev.code === 'Digit0' && ev.shiftKey) setImgView('auto', 1);
+    else if (k === '[' || k === ']') stepBrightness(k === ']' ? 1 : -1);
+    else if (k === '{' || k === '}') stepContrast(k === '}' ? 1 : -1);
+    else if (ev.code === 'Digit0' && ev.shiftKey) setImgView('auto', 0, 0);
     else if (k === 'p') goBack();
     else if (k === 'd') toggleUnsure();
     else if (k === 't') parkSelected();
