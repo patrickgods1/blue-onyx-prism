@@ -1,7 +1,16 @@
 //! What steers the Review queue's Recommended order from outside its rows ([`snapshot`], one
 //! [`Steer`] per `GET /v1/review/next`, handed to the review index and the walk alike): the
-//! measured recall of the newest trained models ([`recall`]) and the folder's parked spots
-//! ([`spots`]). Nothing here runs a walk on the request path, and nothing here writes a file.
+//! measured recall of the newest trained models ([`recall`]), the folder's parked spots
+//! ([`spots`]) and the camera days held out for good ([`heldout_listed`]). Nothing here runs a walk
+//! on the request path, and nothing here writes a file.
+//!
+//! Held-out days. The `camera/date` keys of the review folder's `heldout-days.json`
+//! ([`crate::collect::labels::heldout::load`], read only: never written, locked or moved aside
+//! here), one cached entry keyed on the file's (path, modification time, length) like the recall's.
+//! A missing file lists nothing; a newer or damaged one lists nothing too, with a warning once per
+//! change of the key, and the order then holds out the hash split's days alone (an export refuses
+//! such a file, so no export follows it until it is fixed). A list read again that is the same
+//! keeps its `Arc`.
 //!
 //! Recall. A [`Measured`] from `runs.json` through [`crate::training::bench::measured_recall`],
 //! one cached entry keyed on `runs.json`'s (path, modification time, length): a request costs one
@@ -36,7 +45,7 @@ use crate::collect::labels::statics;
 use crate::server::AppState;
 use crate::sync::LockExt;
 use crate::training::service::RunRecord;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -57,7 +66,7 @@ pub(super) fn snapshot(
     Arc::new(Steer {
         recall: recall(state),
         spots: spots(dir, classes, hidden),
-        heldout_listed: Arc::default(),
+        heldout_listed: Some(heldout_listed(dir)),
     })
 }
 
@@ -456,6 +465,57 @@ fn cached(
     value
 }
 
+/// The one cached list of held-out days.
+struct Listed {
+    key: Option<Key>,
+    path: PathBuf,
+    value: Arc<BTreeSet<String>>,
+}
+
+static LISTED: Mutex<Option<Listed>> = Mutex::new(None);
+
+/// The camera days `heldout-days.json` of the review folder `dir` lists (see the module docs).
+pub fn heldout_listed(dir: &Path) -> Arc<BTreeSet<String>> {
+    listed_in(&LISTED, dir)
+}
+
+/// [`heldout_listed`] over `cache`.
+fn listed_in(cache: &Mutex<Option<Listed>>, dir: &Path) -> Arc<BTreeSet<String>> {
+    use crate::collect::labels::heldout;
+    let path = dir.join(heldout::FILE);
+    let key = key_of(&path);
+    let mut c = cache.lock_recover();
+    if let Some(e) = c.as_ref()
+        && e.path == path
+        && e.key == key
+    {
+        return e.value.clone();
+    }
+    let read = match &key {
+        None => BTreeSet::new(),
+        Some(_) => match heldout::load(dir) {
+            Ok(file) => file.keys(),
+            Err(e) => {
+                tracing::warn!(
+                    "review queue: {e:#}. Until it reads, the Recommended order holds out only the \
+                     days the export's hash split does"
+                );
+                BTreeSet::new()
+            }
+        },
+    };
+    let value = match c.as_ref() {
+        Some(e) if e.path == path && *e.value == read => e.value.clone(),
+        _ => Arc::new(read),
+    };
+    *c = Some(Listed {
+        key,
+        path,
+        value: value.clone(),
+    });
+    value
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -605,6 +665,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The listed held-out days: none without the file, the file's keys cached until it changes
+    /// (the same `Arc` while unchanged, and for the same list read again), none for a newer or
+    /// damaged file; and the file is only read: byte for byte, nothing beside it.
+    #[test]
+    fn the_listed_days_are_cached_until_the_file_changes() {
+        use crate::collect::labels::heldout::FILE;
+        let dir = temp("listed");
+        let cache = Mutex::new(None);
+        let get = || listed_in(&cache, &dir);
+        assert!(get().is_empty());
+        let day = |camera: &str, date: &str| {
+            serde_json::json!({"camera": camera, "date": date, "added": "2026-11-01T00:00:00Z",
+                "reason": "hash"})
+        };
+        let write = |days: Vec<serde_json::Value>| {
+            let v = serde_json::json!({"version": 1, "days": days});
+            std::fs::write(dir.join(FILE), serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        };
+        write(vec![day("drive", "2026-10-21"), day("yard", "2026-10-22")]);
+        let first = get();
+        let want: BTreeSet<String> = ["drive/2026-10-21".to_string(), "yard/2026-10-22".into()]
+            .into_iter()
+            .collect();
+        assert_eq!(*first, want);
+        assert!(Arc::ptr_eq(&first, &get()), "unchanged: the same Arc");
+        // Another length, the same days (one twice): the same list, the same Arc.
+        write(vec![
+            day("drive", "2026-10-21"),
+            day("yard", "2026-10-22"),
+            day("yard", "2026-10-22"),
+        ]);
+        assert!(Arc::ptr_eq(&first, &get()));
+        write(vec![day("drive", "2026-10-21")]);
+        assert_eq!(get().len(), 1);
+        // Newer, damaged: nothing listed, and the file stays as it is.
+        let newer = br#"{"version": 9, "days": []}"#;
+        std::fs::write(dir.join(FILE), newer).unwrap();
+        assert!(get().is_empty());
+        std::fs::write(dir.join(FILE), b"{ not json").unwrap();
+        assert!(get().is_empty());
+        assert_eq!(std::fs::read(dir.join(FILE)).unwrap(), b"{ not json");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        assert_eq!(names, [FILE.to_string()], "nothing written beside it");
+        std::fs::remove_file(dir.join(FILE)).unwrap();
+        assert!(get().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Through the app state: a config whose training folder has no `runs.json` answers None.
     #[test]
     fn the_state_without_runs_is_none() {
@@ -620,7 +731,8 @@ mod tests {
         let s = snapshot(&state, &dir, &["car".to_string()], &[]);
         assert!(s.recall.is_none());
         assert!(s.spots.is_empty());
-        assert!(s.heldout_listed.is_empty());
+        // Held-out steering is on, with no listed day.
+        assert!(s.heldout_listed.as_ref().unwrap().is_empty());
         assert_eq!(SPOTS_EVERY, std::time::Duration::from_secs(600));
         assert_eq!(SPOTS_INDEXED_EVERY, std::time::Duration::from_secs(60));
         // Without an index the builder walks (nothing here), with no stamp.

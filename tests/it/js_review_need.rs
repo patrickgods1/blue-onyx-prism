@@ -148,6 +148,31 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
         hard_class: Some("cat".into()),
         ..cat_in_fox_visit.clone()
     };
+    // Held-out steering: a held-out day of a cell short of its test boxes, a training day of one
+    // that has them, a held-out day the gain did not raise.
+    let heldout = RecallNeed {
+        class: Some("cat".into()),
+        camera_reviewed: 12.0,
+        reviewed: 30.0,
+        class_reviewed: 45.0,
+        strong: true,
+        evidence: 1.0,
+        heldout_day: true,
+        heldout_boxes: Some(7.0),
+        heldout_floor: Some(20),
+        heldout_gain: true,
+        ..RecallNeed::default()
+    };
+    let trains = RecallNeed {
+        heldout_day: false,
+        heldout_boxes: Some(20.25),
+        ..heldout.clone()
+    };
+    let full = RecallNeed {
+        heldout_gain: false,
+        heldout_boxes: Some(20.25),
+        ..heldout.clone()
+    };
     // A frame with nothing but a likely false box: its hard negative, never "empty".
     let only_false = RecallNeed {
         hard_negative: 0.12,
@@ -184,6 +209,9 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
         item(&cat_in_fox_visit, "day", 4),
         item(&person_maybe_false, "day", 0),
         item(&only_false, "night", 0),
+        item(&heldout, "ir", 0),
+        item(&trains, "ir", 0),
+        item(&full, "ir", 0),
         { "op": "note", "item": { "camera": "back", "scene": "day" } },
         { "op": "counts", "c": serde_json::to_value(&counts).unwrap() },
         { "op": "counts", "c": serde_json::to_value(NeedCounts::default()).unwrap() },
@@ -212,6 +240,12 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
              may be false: rejecting those teaches the model",
             "likely false dog · back · night: nothing else to label here; rejecting it teaches \
              the model",
+            "cat · back · IR: 12 boxes on this camera (30 on every camera in this scene), \
+             held-out day: 7 of 20 test boxes for cat · IR on this camera",
+            "cat · back · IR: 12 boxes on this camera (30 on every camera in this scene), \
+             training day: cat · IR has its 20 test boxes on this camera (20.25)",
+            "cat · back · IR: 12 boxes on this camera (30 on every camera in this scene), \
+             held-out day",
             "",
             "person 12.25 (day 8, night 4.25) · raccoon 3 (IR 3) · empty: day 20",
             "none yet",

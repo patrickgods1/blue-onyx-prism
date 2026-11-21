@@ -1360,9 +1360,147 @@ mod cases {
         cues
     }
 
+    /// The listed held-out day of [`heldout_frames`] (no hash split holds it out), a day the hash
+    /// split holds out, and a training day, all of camera `hold`.
+    const LISTED_DAY: &str = "2026-10-24";
+    const HASHED_DAY: &str = "2026-09-19";
+    const TRAIN_DAY: &str = "2026-10-25";
+
+    /// Unreviewed frames of [`heldout_frames`].
+    struct HeldCues {
+        /// A person on the hashed day, its cell (hold, person, night) at the held-out floor.
+        held_full: String,
+        /// A person on the training day of that cell.
+        train_full: String,
+        /// A car on the listed day, its cell short of the floor; and one on the training day.
+        held_short: String,
+        train_short: String,
+    }
+
+    /// Held-out days of camera `hold` at night: 12 reviewed persons on [`LISTED_DAY`] and 9 on
+    /// [`HASHED_DAY`] (21 held-out boxes: the floor crossed), 2 reviewed cars on the listed day
+    /// (short of it), and unreviewed persons and cars on both kinds of day.
+    fn heldout_frames(dir: &Path, rels: &mut Vec<String>) -> HeldCues {
+        use crate::collect::labels::export::{DEFAULT_HOLDOUT_FRACTION, hash_heldout};
+        let frac = f64::from(DEFAULT_HOLDOUT_FRACTION);
+        assert!(hash_heldout("hold", HASHED_DAY, frac));
+        assert!(!hash_heldout("hold", LISTED_DAY, frac) && !hash_heldout("hold", TRAIN_DAY, frac));
+        let none = |_: &mut Record| {};
+        let person = |x: f32| {
+            cue_box(
+                "person",
+                [x, 100.0, x + 40.0, 200.0],
+                Source::Model,
+                BoxState::Accepted,
+            )
+        };
+        let car = cue_box(
+            "car",
+            [300.0, 200.0, 420.0, 280.0],
+            Source::Model,
+            BoxState::Accepted,
+        );
+        let reviewed = |boxes: Vec<LabelBox>| LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-10-26T00:00:00Z".into()),
+            boxes,
+            ..LabelFile::default()
+        };
+        let pending = |b: LabelBox| LabelFile {
+            boxes: vec![LabelBox {
+                state: BoxState::Pending,
+                ..b
+            }],
+            ..LabelFile::default()
+        };
+        let mut put = |date: &str, hour: u32, tag: &str, labels: &LabelFile| {
+            let compact = date.replace('-', "");
+            let rel = format!("night/hold/{date}/{compact}T{hour:02}0000000Z_{tag}.jpg");
+            let time = format!("{date}T{hour:02}:00:00Z");
+            let rel = put_cue(dir, &rel, &time, &none, Some(labels));
+            rels.push(rel.clone());
+            rel
+        };
+        for i in 0..12u32 {
+            put(
+                LISTED_DAY,
+                i,
+                &format!("p{i}"),
+                &reviewed(vec![person(10.0 * i as f32)]),
+            );
+        }
+        for i in 0..9u32 {
+            put(
+                HASHED_DAY,
+                i,
+                &format!("p{i}"),
+                &reviewed(vec![person(10.0 * i as f32)]),
+            );
+        }
+        for i in 12..14u32 {
+            put(
+                LISTED_DAY,
+                i,
+                &format!("c{i}"),
+                &reviewed(vec![car.clone()]),
+            );
+        }
+        HeldCues {
+            held_full: put(HASHED_DAY, 20, "open", &pending(person(500.0))),
+            train_full: put(TRAIN_DAY, 20, "open", &pending(person(500.0))),
+            held_short: put(LISTED_DAY, 21, "car", &pending(car.clone())),
+            train_short: put(TRAIN_DAY, 21, "car", &pending(car.clone())),
+        }
+    }
+
+    /// The steered Recommended order sees both splits of [`heldout_frames`]: the listed and the
+    /// hashed days held out, the person cell past its floor (its training day raised), the car cell
+    /// short (its held-out day raised); a steer without the list holds out the hashed day alone,
+    /// and none without held-out steering.
+    fn covers_heldout(dir: &Path, steer: &Arc<Steer>, cues: &HeldCues) {
+        let need_in = |s: &Arc<Steer>, rel: &str| {
+            queue::build(dir, &steered(recommended_all(), s))
+                .items
+                .into_iter()
+                .find(|i| i.frame == rel)
+                .and_then(|i| i.uncertainty.need)
+                .unwrap_or_else(|| panic!("no need for {rel}"))
+        };
+        let n = need_in(steer, &cues.held_full);
+        assert!(n.heldout_day && !n.heldout_gain, "{n:?}");
+        assert_eq!((n.heldout_boxes, n.heldout_floor), (Some(21.0), Some(20)));
+        let n = need_in(steer, &cues.train_full);
+        assert!(!n.heldout_day && n.heldout_gain, "{n:?}");
+        let n = need_in(steer, &cues.held_short);
+        assert!(n.heldout_day && n.heldout_gain, "{n:?}");
+        assert_eq!(n.heldout_boxes, Some(2.0));
+        let n = need_in(steer, &cues.train_short);
+        assert!(!n.heldout_day && !n.heldout_gain, "{n:?}");
+        // Without the listed day: 9 held-out persons, so the held-out person is raised now; the
+        // listed day's car trains.
+        let unlisted = Arc::new(Steer {
+            heldout_listed: Some(Arc::default()),
+            ..(**steer).clone()
+        });
+        let n = need_in(&unlisted, &cues.held_full);
+        assert!(n.heldout_day && n.heldout_gain, "{n:?}");
+        assert_eq!(n.heldout_boxes, Some(9.0));
+        assert!(!need_in(&unlisted, &cues.held_short).heldout_day);
+        // Without held-out steering: no held-out day, nothing shown.
+        let off = Arc::new(Steer {
+            heldout_listed: None,
+            ..(**steer).clone()
+        });
+        let n = need_in(&off, &cues.held_full);
+        assert!(
+            !n.heldout_day && !n.heldout_gain && n.heldout_boxes.is_none(),
+            "{n:?}"
+        );
+    }
+
     /// The steer of [`need_frames`]' folder: the parked spot of `lot` (as the server's table makes
-    /// it, from the reviewed frames) and a recall table of a run without trucks, in which dog is
-    /// `trail`'s lowest class.
+    /// it, from the reviewed frames), a recall table of a run without trucks, in which dog is
+    /// `trail`'s lowest class, and the listed held-out day of [`heldout_frames`].
     fn steer_of(dir: &Path) -> Steer {
         let (classes, hidden) = wanted_a();
         let w = Wanted {
@@ -1413,7 +1551,7 @@ mod cases {
                 overall: Some(overall),
             })),
             spots: Arc::new(spots),
-            heldout_listed: Arc::default(),
+            heldout_listed: Some(Arc::new([format!("hold/{LISTED_DAY}")].into())),
         }
     }
 
@@ -2430,13 +2568,28 @@ mod cases {
             let (on_drive, on_lane) = precision_frames(&dir, seed, &mut rels);
             let chain = event_frames(&dir, seed, &mut rels);
             let cues = need_frames(&dir, &mut rels);
+            let held = heldout_frames(&dir, &mut rels);
             let steer = Arc::new(steer_of(&dir));
             let mut rng = Rng::new(seed ^ 0xabc);
             let (a, b) = (wanted_a(), wanted_b());
             covers_every_case(&dir, &chain);
             covers_need(&dir, &steer, &cues);
+            covers_heldout(&dir, &steer, &held);
             let left_out = spot_cases(&dir, &mut rels);
             same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, built"));
+            // Another list of held-out days (the listed day trains now): the index's per-shard
+            // parts follow, so it answers as the walk does again.
+            let unlisted = Arc::new(Steer {
+                heldout_listed: Some(Arc::default()),
+                ..(*steer).clone()
+            });
+            for f in [recommended_all(), recommended_default()] {
+                same_order(
+                    &dir,
+                    &steered(f, &unlisted),
+                    &format!("seed {seed}, built, unlisted"),
+                );
+            }
             // The index's reviewed rows give the parked spots the label files do.
             spots_agree(&dir, &a, &left_out, &format!("seed {seed}, built"));
             let (_, obs) = super::super::reviewed_obs(&dir, Some(&a)).unwrap();

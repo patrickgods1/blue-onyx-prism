@@ -1099,21 +1099,24 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        // The higher need first: the surer person of `far` (both missed a suppressed dog alike).
-        assert_eq!(v["item"]["frame"], far, "the higher need first");
+        // The higher need first: `near`, on a day the export's hash split holds out
+        // (yard/2026-10-22) while its cell has no held-out box, weighs double; without that the
+        // surer person of `far` would lead (both missed a suppressed dog alike).
+        assert_eq!(v["item"]["frame"], near, "the higher need first");
+        assert_eq!(v["item"]["need"]["heldout_gain"], true, "{v}");
         assert_eq!(v["total"], 2);
         assert_eq!(v["counts"]["remaining"], 2);
         let (_, v2) = json(
             &d.state,
             Request::get(format!(
                 "/v1/review/next?after={}",
-                encode_uri_component(&far)
+                encode_uri_component(&near)
             ))
             .body(Body::empty())
             .unwrap(),
         )
         .await;
-        assert_eq!(v2["item"]["frame"], near);
+        assert_eq!(v2["item"]["frame"], far);
         assert_eq!(v2["position"], 2);
         // The uncertainty order: the nearer the threshold, the first.
         let (_, u) = json(
@@ -3808,6 +3811,76 @@ mod tests {
         a_damaged_runs_json_still_answers_next_in
     );
 
+    both_ways!(
+        held_out_days_steer_next_and_a_broken_list_still_answers,
+        held_out_days_steer_next_and_a_broken_list_still_answers_indexed,
+        held_out_days_steer_next_and_a_broken_list_still_answers_in
+    );
+
+    /// Each served frame's need, by frame, in the default order.
+    async fn needs_of(d: &Ds) -> BTreeMap<String, serde_json::Value> {
+        let mut out = BTreeMap::new();
+        let mut after: Option<String> = None;
+        loop {
+            let p: Vec<(&str, &str)> = after.iter().map(|a| ("after", a.as_str())).collect();
+            let v = next_of(d, &p).await;
+            if v["wrapped"] == true || v["item"].is_null() {
+                return out;
+            }
+            let frame = v["item"]["frame"].as_str().unwrap().to_string();
+            out.insert(frame.clone(), v["item"]["need"].clone());
+            assert!(out.len() < 50, "never wraps");
+            after = Some(frame);
+        }
+    }
+
+    /// The days `heldout-days.json` lists are held out (`need.heldout_day`), beside the hash
+    /// split's (`yard/2026-10-22`); a damaged or newer list answers 200 with the hash split's days
+    /// alone, and is only read: byte for byte, nothing moved aside or written beside it.
+    async fn held_out_days_steer_next_and_a_broken_list_still_answers_in(way: Way) {
+        use crate::collect::labels::heldout::FILE;
+        let d = way.ds();
+        let train = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.7);
+        let hashed = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_b", 0.6);
+        let listed = put_frame(&d.dir, "drive", "2026-10-20", "20261020T010203004Z_c", 0.65);
+        let held = |n: &BTreeMap<String, serde_json::Value>, rel: &str| {
+            n.get(rel)
+                .unwrap_or_else(|| panic!("{rel} not served: {n:?}"))["heldout_day"]
+                == true
+        };
+        let n = needs_of(&d).await;
+        assert_eq!(n.len(), 3, "{n:?}");
+        assert!(
+            held(&n, &hashed) && !held(&n, &train) && !held(&n, &listed),
+            "{n:?}"
+        );
+        // Each frame's cell is short of held-out boxes: the held-out one is raised.
+        assert_eq!(n[&hashed]["heldout_gain"], true, "{n:?}");
+        assert_eq!(n[&hashed]["heldout_floor"], 20, "{n:?}");
+        let path = d.dir.join(FILE);
+        let list = serde_json::json!({"version": 1, "days": [{"camera": "drive",
+            "date": "2026-10-20", "added": "2026-10-23T00:00:00Z", "reason": "hash"}]});
+        std::fs::write(&path, serde_json::to_vec_pretty(&list).unwrap()).unwrap();
+        let n = needs_of(&d).await;
+        assert!(
+            held(&n, &hashed) && held(&n, &listed) && !held(&n, &train),
+            "{n:?}"
+        );
+        for broken in [&b"{ not json"[..], br#"{"version": 99, "days": []}"#] {
+            std::fs::write(&path, broken).unwrap();
+            // `next_of` checks the 200.
+            let n = needs_of(&d).await;
+            assert!(held(&n, &hashed) && !held(&n, &listed), "{n:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), broken);
+        }
+        let beside: Vec<String> = std::fs::read_dir(&d.dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.contains("heldout"))
+            .collect();
+        assert_eq!(beside, [FILE.to_string()]);
+    }
+
     /// The need's recall comes from `runs.json` (`steer::recall`): a damaged one measures nothing,
     /// so the queue answers as it does without one: 200, the same order, no recall named. And the
     /// queue only reads: the file stays where it is, byte for byte, with nothing moved aside.
@@ -4100,7 +4173,12 @@ mod tests {
         let mut f = Filters::from_query(&q).unwrap();
         f.order = next_order(&q, &f).unwrap();
         let (dir, classes, _) = context(&d.state);
-        f.wanted = Some((classes, hidden(&d.state)));
+        let hidden = hidden(&d.state);
+        if f.order == Order::Recommended {
+            // The route's steer (held-out steering, spots, recall).
+            f.steer = Some(steer::snapshot(&d.state, &dir, &classes, &hidden));
+        }
+        f.wanted = Some((classes, hidden));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
         let then = q.get("then").map(String::as_str).filter(|t| !t.is_empty());
         let mut v = serde_json::json!(labels::index::Answer::walk(&dir, &f, after, then));

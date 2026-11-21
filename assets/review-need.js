@@ -22,7 +22,8 @@
   // Why the Recommended order put `item` (its `need`, `camera`, `scene`, `event_rank`) where it
   // is, e.g. "raccoon · back · IR: 3 boxes on this camera (3 in all, floor 20), recall 22% on 9
   // held-out boxes (lowest on this camera), camera model missed it, new place in view, frame 3 of
-  // a raccoon visit", and "likely false person: rejecting it teaches the model" for the
+  // a raccoon visit" ("held-out day: 7 of 20 test boxes for cat · IR on this camera" when held-out
+  // steering raised it), and "likely false person: rejecting it teaches the model" for the
   // hard-negative share ("likely false person · ...: nothing else to label here; ..." when that is
   // all the frame holds). '' without a need.
   function note(item) {
@@ -54,6 +55,17 @@
       parts.push('recall ' + Math.round(n.recall * 100) + '%' + on + (n.catch_up ? ' (lowest on this camera)' : ''));
     } else if (n.catch_up) {
       parts.push('lowest recall on this camera');
+    }
+    // Held-out steering: the split the cell needs raised it, or the frame is on a held-out day.
+    var cell = n.class + ' · ' + sceneName(item.scene);
+    if (n.heldout_gain && n.heldout_day) {
+      parts.push('held-out day: ' + num(n.heldout_boxes) + ' of ' + n.heldout_floor +
+        ' test boxes for ' + cell + ' on this camera');
+    } else if (n.heldout_gain) {
+      parts.push('training day: ' + cell + ' has its ' + n.heldout_floor +
+        ' test boxes on this camera (' + num(n.heldout_boxes) + ')');
+    } else if (n.heldout_day) {
+      parts.push('held-out day');
     }
     if (n.missed) parts.push('camera model missed it');
     if (n.gap) parts.push('lost for a frame of its visit');

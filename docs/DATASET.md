@@ -811,7 +811,7 @@ one object: candidates of classes labelers confuse (an animal with an animal, a 
             80% of the smaller box inside the other, are one object, two decided boxes never; only its best
             class (a decided box's, else the largest Σ a_b · w_k) keeps its boxes
 E_k  = crowd(S) = min(S, 1) + 0.5 · min(max(S − 1, 0), 2),  S = Σ a_b   (3 full boxes count 2, at most 2)
-w_k  = v_k · D_k · F_k · r_k · U_k
+w_k  = v_k · D_k · F_k · r_k · U_k · g_k
 v_k  = ½·100/(100 + n_{k,s}) + ½·30/(30 + n_{m,k,s})
 D_k  = 1.5 if d is a new day of (m, k, s), else 1
 F_k  = 3 while class k has fewer than 20 whole reviewed boxes (every camera and scene, parked ones too);
@@ -820,6 +820,8 @@ F_k  = 3 while class k has fewer than 20 whole reviewed boxes (every camera and 
        lone weak boxes lose it
 r_k  = 1 + 2·m̂   (m̂: the held-out miss rate of k on m in s, shrunk)
 U_k  = 2 for camera m's lowest-recall class, else 1
+g_k  = 2 on the split the cell needs: d is a held-out day and (m, k, s) has fewer than 20 held-out boxes,
+       or d is a training day and (m, k, s) has 20 or more; else 1
 V    = Σ_k E_k · w_k
 H    = 0.5 · crowd(Σ_b f_b · 20/(20 + h_{m,k}) · v_k · region_b)
        f_b = max(1 − κ_b, 0.5 if the VLM said no) for a likely false box (κ_b < 0.5 or a VLM no), else 0
@@ -882,9 +884,30 @@ need = round(1000 · (V + H))
   strong ones) of its frames in time order; a class tracked in an earlier and a later frame, each within 20 s
   (`GAP_S`), with no box of the class on this frame at IoU >= 0.3 to the box interpolated between them, adds a
   candidate of evidence 0.5 there, weighed as missed.
+- **Held-out steering** (`g_k`; item fields `heldout_day`, `heldout_boxes`, `heldout_floor`, `heldout_gain`): the
+  benchmark scores a class from 20 held-out objects (`MIN_CLASS_GT`), so each cell (camera, class, scene) is
+  steered to 20 held-out boxes (`HELDOUT_FLOOR`) and then to training. A camera day is **held out**
+  (`Need::heldout_day`) when `heldout-days.json` in the review folder lists it ("Export" below) or the export's
+  hash split holds it out at the default `holdout_fraction` (`export::hash_heldout`, the per-day rule of
+  `assign_splits`): what the next export of the default split, and a training run from it, hold out. They can
+  differ only where that export looks at more than one day: its "one group on each side" guard (a folder whose
+  days all fall on one side), the days it adds for a camera with fewer than two held-out days (held out here once
+  that export listed them), an export of other split settings, and a training run whose exports hold nothing out
+  (it splits by `training.heldout_share`). The tally counts the training boxes of held-out days again, apart, per
+  (camera, class, scene), in quarter-boxes like `n` (a parked box a quarter). A cell short of 20 doubles its
+  held-out days' frames; one at 20 doubles its training days'. On a held-out day the missed doubling and the gap
+  candidates are off: they would fill the held-out set with the hard cases the camera model misses, and its recall
+  would read low. **Bias:** the held-out set still leans to the frames the order serves first (rare classes,
+  weak cells); each per-cell figure (`recall_cells`: `by_scene`, `by_camera`, `by_camera_scene`) stays exact
+  over its own images, and the random picks (`heldout:random`, below) stay the unbiased figure for normal
+  traffic. Without held-out steering (no steer: the walk outside the route) no day is held out and `g_k = 1`. The
+  details say *held-out day: 7 of 20 test boxes for cat · IR on this camera*, or *training day: cat · IR has its
+  20 test boxes on this camera*.
 - **Steer** (`need::Steer`, `Filters.steer`, never from the query): one snapshot per request
   (`server/review/steer.rs`), handed to the index and the walk alike: the recall table (cached on `runs.json`'s
-  time and size) and the folder's parked spots, by the export's rules (`need::spot_obs`: reviewed frames without
+  time and size), the days `heldout-days.json` lists (cached on its time and size, read only: a newer or damaged
+  file lists nothing, with a warning, and the hash split's days are held out alone) and the folder's parked spots,
+  by the export's rules (`need::spot_obs`: reviewed frames without
   a pending box or a label off the class list, boxes at whole pixels), built on a background thread from the
   review index's rows when the folder has one (no label file read; again when they changed, at most every
   minute), neutral while a big folder's index is still building, else (a folder under 2000 frames) by a walk at
@@ -899,7 +922,7 @@ The constants and their reasons are in `need.rs`'s first lines. The item's `need
 `catch_up`, `missed`, `gap`, `spot`, `new_region` (these four only of boxes carrying at least a quarter of the
 class's weight), `new_day`, `strong`, `expanded` with `visit_class` (the class decided in the visit that expands
 it), the best `evidence`, `kept` / `proposed` when κ lowered a box of the class, and `hard_negative` /
-`hard_class` (with `hard_only` when that is all the frame holds). The page's details turn it into a sentence (`assets/review-need.js`), e.g. *raccoon · back · IR: 3
+`hard_class` (with `hard_only` when that is all the frame holds), and the held-out steering fields above. The page's details turn it into a sentence (`assets/review-need.js`), e.g. *raccoon · back · IR: 3
 boxes on this camera (3 in all, floor 20), recall 22% on 9 held-out boxes (lowest on this camera), camera model
 missed it, new place in view, frame 3 of a raccoon visit*.
 

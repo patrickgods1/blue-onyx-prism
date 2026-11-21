@@ -212,6 +212,11 @@ The Train tab lists the folders in `training.datasets` and the Dataset tab's exp
    `heldout_fingerprint`, so the run comparison says the held-out sets differ. A list that is newer or
    does not parse stops the export and every run (`train run`, the Train tab, `train prepare`) until it
    reads; nothing moves or rewrites it. The dataset check's fold runs ignore it (their split is the fold).
+   The Review queue's Recommended order reads the list too (read only), with the hash split's days, and
+   steers each camera's class and scene to 20 held-out boxes before its training days (docs/DATASET.md
+   "Recommended (default)", *Held-out steering*): per-class recall per camera then has enough objects
+   to be scored. The held-out set leans to the frames that order serves; the random picks
+   (`heldout:random`, below) stay the unbiased figure.
 2. **A flat YOLO folder**: `images/` (or the folder itself), `labels/<stem>.txt` or `<stem>.txt` beside
    the image, `classes.txt` or `data.yaml` (`names`), optionally `heldout.txt` / `test.txt` listing
    the held-out images, and a `manifest.json` in the benchmark format whose tags (`day` | `night` |
