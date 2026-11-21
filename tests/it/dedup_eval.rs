@@ -66,7 +66,7 @@ const BUCKETS: [(&str, f64); 3] = [
 const Z_CELLS: [f32; 4] = [4.0, 5.0, 6.0, 8.0];
 const D_MINS: [f32; 4] = [2.0, 4.0, 6.0, 8.0];
 const MIN_COMPONENTS: [usize; 3] = [1, 2, 3];
-const TEXTURE_BETAS: [f32; 3] = [0.0, 0.5, 1.0];
+const TEXTURE_BETAS: [f32; 4] = [0.0, 0.25, 0.5, 1.0];
 /// The texture-masked variant reported beside the defaults.
 const TEXTURE_VARIANT: f32 = 0.5;
 /// The best sweep point minimises `MISS_WEIGHT * missed + kept` over all pairs: a lost object
@@ -75,6 +75,9 @@ const MISS_WEIGHT: f64 = 2.0;
 /// Frames and pairs timed on one thread.
 const TIME_FRAMES: usize = 60;
 const TIME_PAIRS: usize = 2000;
+/// The collector's rule (`collect.dedup_mode` `both`): dHash <= 6 and [`Params::COLLECTOR`] on
+/// the same reference.
+const COLLECTOR_BOTH: &str = "both: dhash<=6 + COLLECTOR";
 /// Lines per section of the contact sheets.
 const SHEET: usize = 20;
 
@@ -126,6 +129,8 @@ struct Pair {
     verdict: Verdict,
     /// [`TEXTURE_VARIANT`] at otherwise default parameters calls the pair different.
     textured: bool,
+    /// [`Params::COLLECTOR`] (the collector's block test) calls the pair different.
+    collector: bool,
     /// Sweep point `k` calls the pair different.
     sweep: Vec<bool>,
 }
@@ -646,6 +651,7 @@ fn dedup_eval() {
             hamming: dhash::hamming(decs[i].hash, decs[j].hash),
             verdict: call(&Params::default()),
             textured: call(&textured).different,
+            collector: call(&Params::COLLECTOR).different,
             sweep: points
                 .iter()
                 .map(|&pt| call(&sweep_params(pt)).different)
@@ -734,6 +740,14 @@ fn dedup_eval() {
     methods.push(Method {
         name: format!("dhash<={DHASH_TODAY} confirmed by blockdiff"),
         dup: Box::new(|p: &Pair| p.hamming <= DHASH_TODAY && !p.verdict.different),
+    });
+    methods.push(Method {
+        name: "blockdiff COLLECTOR".into(),
+        dup: Box::new(|p: &Pair| !p.collector),
+    });
+    methods.push(Method {
+        name: COLLECTOR_BOTH.into(),
+        dup: Box::new(|p: &Pair| p.hamming <= DHASH_TODAY && !p.collector),
     });
     if let Some((b, pt)) = best {
         methods.push(Method {
@@ -898,6 +912,7 @@ fn dedup_eval() {
         let mut dh: VecDeque<usize> = VecDeque::new();
         let mut veto: VecDeque<usize> = VecDeque::new();
         let mut veto_best: VecDeque<usize> = VecDeque::new();
+        let mut veto_collector: VecDeque<usize> = VecDeque::new();
         let mut bd: HashMap<Scene, VecDeque<usize>> = HashMap::new();
         let mut bt: HashMap<Scene, VecDeque<usize>> = HashMap::new();
         let mut bb: HashMap<Scene, VecDeque<usize>> = HashMap::new();
@@ -937,6 +952,7 @@ fn dedup_eval() {
             for (refs, params, name) in [
                 (&mut veto, Params::default(), veto_name.as_str()),
                 (&mut veto_best, best_params, best_veto_name.as_str()),
+                (&mut veto_collector, Params::COLLECTOR, COLLECTOR_BOTH),
             ] {
                 fresh(refs);
                 let m = refs.iter().rev().copied().find(|&r| {

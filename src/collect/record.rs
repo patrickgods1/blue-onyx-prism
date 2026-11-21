@@ -229,11 +229,13 @@ pub struct Record {
 pub struct DedupInfo {
     /// `collect.dedup_mode` at the time: `both` or `dhash`.
     pub mode: String,
-    /// Smallest dHash distance to a reference of the camera in the window; absent without one.
+    /// Smallest dHash distance over every reference of the camera in the window (any scene);
+    /// absent without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nearest_hamming: Option<u32>,
-    /// The block test against the dHash look-alikes it checked, the closest call (smallest
-    /// changed group): its largest |z| (0.1) and the cells of its largest group.
+    /// One block-test verdict: its largest |z| (0.1) and the cells of its largest group. On a near
+    /// duplicate saved for a skip bucket, that of the reference that confirmed it; otherwise the
+    /// closest call (smallest changed group) among the dHash look-alikes it checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_max_z: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

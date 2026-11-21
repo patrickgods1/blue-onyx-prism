@@ -638,6 +638,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn the_settings_form_sets_the_dedup_rule() {
+        use crate::collect::config::DedupMode;
+        let mut c = CollectConfig::default();
+        apply_form(&mut c, &parse_form(b"dedup_mode=dhash")).unwrap();
+        assert_eq!(c.dedup_mode, DedupMode::Dhash);
+        apply_form(&mut c, &parse_form(b"dedup_mode=")).unwrap();
+        assert_eq!(
+            c.dedup_mode,
+            DedupMode::Dhash,
+            "an empty field keeps the value"
+        );
+        apply_form(&mut c, &parse_form(b"dedup_mode=both")).unwrap();
+        assert_eq!(c.dedup_mode, DedupMode::Both);
+        let e = apply_form(&mut c, &parse_form(b"dedup_mode=blocks")).unwrap_err();
+        assert!(e.to_string().contains("dedup rule"), "{e}");
+        assert_eq!(c.dedup_mode, DedupMode::Both);
+    }
+
+    #[tokio::test]
+    async fn the_page_selects_the_configured_dedup_rule() {
+        use crate::collect::config::DedupMode;
+        for mode in [DedupMode::Both, DedupMode::Dhash] {
+            let dir = std::env::temp_dir().join(format!("bop-ds-{}", uuid::Uuid::new_v4()));
+            let d = dir.clone();
+            let state = test_state_with(move |c| {
+                c.collect.dir = Some(d);
+                c.collect.dedup_mode = mode;
+            });
+            let (_, page) = get_text(&state, "/train/collect").await;
+            let other = if mode == DedupMode::Both {
+                "dhash"
+            } else {
+                "both"
+            };
+            assert!(
+                page.contains(&format!("<option value=\"{}\" selected>", mode.as_str())),
+                "{mode:?}"
+            );
+            assert!(
+                page.contains(&format!("<option value=\"{other}\">")),
+                "{mode:?}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     #[tokio::test]
     async fn home_says_whether_it_collects_and_links_the_dataset() {
         let (state, dir) = dataset_state();

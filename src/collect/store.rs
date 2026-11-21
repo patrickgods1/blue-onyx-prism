@@ -12,11 +12,22 @@
 //! scene, still has its thumbnail and the block test ([`blockdiff::Params::COLLECTOR`]) finds no
 //! change against it. The offline evaluation (`tests/it/dedup_eval.rs`, docs/DATASET.md) found the
 //! dHash test alone missed 56% of labelled object changes on 1,009 reviewed pairs (76% in imported
-//! footage); requiring both missed 6.1% (0.7% of collected pairs). Thumbnails are capped across
-//! cameras at [`DEDUP_THUMB_BYTES`]; the oldest lose theirs first, which can only keep a frame
-//! that would have been dropped, never drop one. The rate limits, the night interval and the skips
-//! of [`Bucket::skips_dedup`] come first or apply as before. A kept frame's sidecar records what the
-//! dedup saw ([`DedupInfo`]).
+//! footage); requiring both missed none, and confirmed no drop on those frames either (rain,
+//! insects, IR flicker and foliage differ by more than a small animal), so volume is held by the
+//! rate limits and the storm cap below, not by the dedup. Thumbnails are capped across cameras at
+//! [`DEDUP_THUMB_BYTES`]; the oldest lose theirs first.
+//!
+//! "Never drops a frame the old rule kept" holds per decision, against the same references: `both`
+//! drops a frame only when `dhash` would too, and a lost thumbnail only takes a drop away. It does
+//! not hold over a sequence: a frame `both` keeps restarts its buckets' interval clocks and becomes
+//! a reference, so a later frame can be dropped (by a rate limit, or as a near duplicate of it)
+//! that `dhash` mode, which had dropped the earlier one, would have kept.
+//!
+//! Storm cap: every dHash look-alike counts toward [`DEDUP_SKIPS_PER_CAMERA`], as the duplicates of
+//! `dhash` mode do. A look-alike the block test calls different is kept for a `positive` or
+//! `empty` bucket; one whose passing buckets all skip the dedup ([`Bucket::skips_dedup`]) is held
+//! to the cap, so that cap is never looser than in `dhash` mode. The rate limits and the night
+//! interval come first. A kept frame's sidecar records what the dedup saw ([`DedupInfo`]).
 
 use super::blockdiff::{self, Thumb};
 use super::config::DedupMode;
@@ -208,13 +219,20 @@ fn scene_of(s: &str) -> Scene {
 /// What the dedup decided for a frame: a near duplicate, or why not ([`DedupInfo`]).
 #[derive(Debug, Clone, PartialEq)]
 struct DedupCheck {
+    /// Dropped as a near duplicate unless a bucket skips the dedup.
     duplicate: bool,
+    /// Some reference in the window is within `dedup_hamming` dHash bits (a dHash look-alike):
+    /// counted toward [`DEDUP_SKIPS_PER_CAMERA`] like the duplicates of `dhash` mode.
+    look_alike: bool,
     info: DedupInfo,
 }
 
 /// The dedup decision for a frame of `scene` with dHash `hash` and thumbnail `thumb` against the
-/// camera's references (already limited to the window). Pure. See the module docs for the rule;
-/// references are tried newest first and the first that confirms stops the search.
+/// camera's references (already limited to the window). Pure. See the module docs for the rule:
+/// one reference must pass both tests. References are tried newest first and the first that
+/// confirms stops the search; `nearest_hamming` is still the minimum over all of them. The new
+/// frame's side of the block test is prepared once ([`blockdiff::Probe`]), on the first
+/// look-alike that needs it.
 fn dedup_check(
     refs: &VecDeque<Reference>,
     hash: u64,
@@ -225,6 +243,7 @@ fn dedup_check(
 ) -> DedupCheck {
     let mut info = DedupInfo {
         mode: mode.as_str().to_string(),
+        nearest_hamming: refs.iter().map(|r| dhash::hamming(r.hash, hash)).min(),
         decided_by: if refs.is_empty() {
             DedupInfo::NO_REFERENCE
         } else {
@@ -233,19 +252,23 @@ fn dedup_check(
         .to_string(),
         ..DedupInfo::default()
     };
+    let record = |info: &mut DedupInfo, v: &blockdiff::Verdict| {
+        info.block_max_z = Some((v.max_z * 10.0).round() / 10.0);
+        info.block_largest_blob = Some(u32::try_from(v.largest_blob).unwrap_or(u32::MAX));
+    };
+    let mut probe: Option<blockdiff::Probe> = None;
     // The block test's closest call: the look-alike with the smallest changed group.
     let mut closest: Option<blockdiff::Verdict> = None;
-    let mut look_alikes = false;
+    let mut look_alike = false;
     for r in refs.iter().rev() {
-        let h = dhash::hamming(r.hash, hash);
-        info.nearest_hamming = Some(info.nearest_hamming.map_or(h, |n| n.min(h)));
-        if h > max_hamming {
+        if dhash::hamming(r.hash, hash) > max_hamming {
             continue;
         }
-        look_alikes = true;
+        look_alike = true;
         if mode == DedupMode::Dhash {
             return DedupCheck {
                 duplicate: true,
+                look_alike,
                 info,
             };
         }
@@ -255,10 +278,14 @@ fn dedup_check(
         if r.scene != scene {
             continue;
         }
-        let v = blockdiff::verdict_with(t, rt, scene, None, &blockdiff::Params::COLLECTOR);
+        let v = probe
+            .get_or_insert_with(|| blockdiff::Probe::new(t))
+            .verdict(rt, scene, None, &blockdiff::Params::COLLECTOR);
         if !v.different {
+            record(&mut info, &v);
             return DedupCheck {
                 duplicate: true,
+                look_alike,
                 info,
             };
         }
@@ -266,7 +293,7 @@ fn dedup_check(
             closest = Some(v);
         }
     }
-    if look_alikes {
+    if look_alike {
         info.decided_by = if closest.is_some() {
             DedupInfo::BLOCKDIFF
         } else {
@@ -275,11 +302,11 @@ fn dedup_check(
         .to_string();
     }
     if let Some(v) = closest {
-        info.block_max_z = Some((v.max_z * 10.0).round() / 10.0);
-        info.block_largest_blob = Some(u32::try_from(v.largest_blob).unwrap_or(u32::MAX));
+        record(&mut info, &v);
     }
     DedupCheck {
         duplicate: false,
+        look_alike,
         info,
     }
 }
@@ -522,16 +549,31 @@ impl Store {
             mode,
         );
         let near_duplicate = check.duplicate;
-        if near_duplicate {
-            check.info.decided_by = DedupInfo::SKIPS_DEDUP.to_string();
+        // Storm cap: every dHash look-alike counts toward DEDUP_SKIPS_PER_CAMERA, as the
+        // duplicates of `dhash` mode do. A look-alike the block test calls different is kept for
+        // a `positive` / `empty` bucket (the point of `both`); one whose only passing buckets
+        // skip the dedup is held to the cap, so on a rainy IR night the cap is never looser than
+        // in `dhash` mode.
+        let plain_bucket = passing.iter().any(|b| !b.skips_dedup());
+        let counted = check.look_alike && (near_duplicate || !plain_bucket);
+        if check.look_alike {
             let skips = self.skips.entry(camera.clone()).or_default();
             skips.retain(|t| {
                 at.duration_since(*t)
                     .map_or(true, |since| since < DEDUP_SKIP_WINDOW)
             });
-            if !passing.iter().any(|b| b.skips_dedup()) || skips.len() >= DEDUP_SKIPS_PER_CAMERA {
+            let full = skips.len() >= DEDUP_SKIPS_PER_CAMERA;
+            let drop = if near_duplicate {
+                !passing.iter().any(|b| b.skips_dedup()) || full
+            } else {
+                !plain_bucket && full
+            };
+            if drop {
                 METRICS.record_drop(Dropped::Dup);
                 return Handled::Dropped(Dropped::Dup);
+            }
+            if near_duplicate {
+                check.info.decided_by = DedupInfo::SKIPS_DEDUP.to_string();
             }
         }
         if let Some(reason) = self.check_free(&settings) {
@@ -564,10 +606,12 @@ impl Store {
         for b in &passing {
             self.last.insert((camera.clone(), *b), at);
         }
-        if near_duplicate {
-            // Its look-alike stays the one remembered, so the skip does not extend the window.
-            self.skips.entry(camera).or_default().push_back(at);
-        } else {
+        if counted {
+            self.skips.entry(camera.clone()).or_default().push_back(at);
+        }
+        // A near duplicate saved for a skip bucket is no reference: its look-alike stays the one
+        // remembered, so the skip does not extend the window.
+        if !near_duplicate {
             let recent = self.recent.entry(camera).or_default();
             recent.push_back(Reference {
                 at,
@@ -1382,6 +1426,93 @@ mod tests {
         let before = st.thumb_bytes();
         st.forget(&["c".to_string()]);
         assert!(st.thumb_bytes() < before);
+    }
+
+    /// A minute of rain-like look-alikes at 1 fps (dHash alike, each with a new blob the block test
+    /// sees) on a bucket that skips the dedup: at most the cap is saved, in both modes; a
+    /// `positive` look-alike the block test calls different is still kept.
+    #[test]
+    fn a_storm_of_block_different_look_alikes_is_capped_like_dhash_mode() {
+        for mode in [DedupMode::Both, DedupMode::Dhash] {
+            let tmp = Tmp::new();
+            let s = settings(&tmp.0, |c| {
+                c.buckets.positive.per_camera_min_interval_s = 0;
+                c.dedup_mode = mode;
+            });
+            let mut st = store();
+            let mut saved = 0;
+            for k in 0..60u32 {
+                let img = ramp_jpeg(
+                    150,
+                    Some((20 + (k % 12) * 50, 30 + (k / 12) * 60, 24, 70)),
+                    0,
+                );
+                let rid = format!("n{k}");
+                if matches!(
+                    st.handle(with_image(&s, near("a", &rid, t(u64::from(k))), img)),
+                    Handled::Saved { .. }
+                ) {
+                    saved += 1;
+                }
+            }
+            assert!(
+                saved <= 1 + DEDUP_SKIPS_PER_CAMERA,
+                "{mode:?}: {saved} saved in a minute"
+            );
+            assert!(saved > DEDUP_SKIPS_PER_CAMERA / 2, "{mode:?}: {saved}");
+            let img = ramp_jpeg(150, Some((600, 300, 24, 70)), 0);
+            let out = st.handle(with_image(&s, positive("a", "p", t(59)), img));
+            assert_eq!(
+                matches!(out, Handled::Saved { .. }),
+                mode == DedupMode::Both,
+                "{mode:?}: {out:?}"
+            );
+        }
+    }
+
+    /// One reference must pass both tests: dHash matching reference A and the block test matching
+    /// reference B is no duplicate.
+    #[test]
+    fn both_tests_must_pass_on_the_same_reference() {
+        let plain = Thumb::of_encoded(&ramp_jpeg(150, None, 0)).unwrap().0;
+        let blob = Thumb::of_encoded(&ramp_jpeg(150, Some((300, 150, 24, 70)), 0))
+            .unwrap()
+            .0;
+        let hash = 0x0123_4567_89ab_cdef_u64;
+        let refs: VecDeque<Reference> = [
+            // A: the same dHash, but the block test sees the blob.
+            (hash, blob),
+            // B: the block test finds nothing, but dHash is far.
+            (!hash, plain.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(k, (h, th))| Reference {
+            at: t(k as u64),
+            hash: h,
+            scene: Scene::Day,
+            thumb: Some(th),
+        })
+        .collect();
+        let c = dedup_check(&refs, hash, Some(&plain), Scene::Day, 6, DedupMode::Both);
+        assert!(!c.duplicate && c.look_alike, "{c:?}");
+        assert_eq!(c.info.decided_by, DedupInfo::BLOCKDIFF);
+        assert_eq!(c.info.nearest_hamming, Some(0));
+        // `nearest_hamming` is the minimum over every reference, also when one confirms.
+        let mut refs = refs;
+        refs.push_back(Reference {
+            at: t(5),
+            hash: hash ^ 0b111,
+            scene: Scene::Day,
+            thumb: Some(plain.clone()),
+        });
+        let c = dedup_check(&refs, hash, Some(&plain), Scene::Day, 6, DedupMode::Both);
+        assert!(c.duplicate);
+        assert_eq!(c.info.nearest_hamming, Some(0));
+        assert!(
+            c.info.block_largest_blob.is_some(),
+            "the confirming verdict is recorded"
+        );
     }
 
     #[test]

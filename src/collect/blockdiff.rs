@@ -9,9 +9,11 @@
 //! pairs different: at night these cameras' frames differ in rain, insects, IR flicker, foliage and
 //! the clock overlay, which a pixel test cannot tell from a small animal. So the defaults are a
 //! sensitivity ceiling, not a dedup: as a filter they keep every frame. The sweep's best point
-//! (`z_cell` 5, `d_min` 8, groups of 3, texture masking 1, [`Params::COLLECTOR`]) missed 6.8% for
-//! 68% kept repeats, where dHash at 2 missed 20.7% for 64%; the [`Params::default`] constants below
-//! stay the sensitive ones the evaluation starts from.
+//! (`z_cell` 5, `d_min` 8, groups of 3, texture masking 1) missed 6.8% for 68% kept repeats, where
+//! dHash at 2 missed 20.7% for 64%, but texture masking hid 30 x 30 px objects on textured
+//! backgrounds (see [`Params::COLLECTOR`]), so the collector uses that point without it, which on
+//! the same pairs missed none and confirmed no drop. The [`Params::default`] constants below stay
+//! the sensitive ones the evaluation starts from.
 //!
 //! Why: the collector's whole-frame dHash averages 2688 x 1520 into 9 x 8 cells of about 300 x 190
 //! pixels, so a 30 x 30 animal or a distant person in an otherwise identical night scene moves a
@@ -34,7 +36,9 @@
 //! - **Gain fit**: auto exposure and IR gain scale the scene's contrast, so the new detail is
 //!   matched to the reference's by least squares, `a = Σ D_new D_ref / Σ D_ref²` (`a = 1` when the
 //!   reference has no detail at all), fitted again once without the cells whose residual exceeds
-//!   [`OUTLIER_SIGMAS`] σ (an object must not pull the gain). Residual `R = D_new - a D_ref`.
+//!   [`OUTLIER_SIGMAS`] σ (an object must not pull the gain), and held to [`MIN_GAIN`]..[`MAX_GAIN`]
+//!   (0.5..2: on a plain scene an object that left would otherwise fit `a` to 0 and vanish).
+//!   Residual `R = D_new - a D_ref`.
 //! - **Noise**: per pair `σ = max(SIGMA_FLOOR, MAD_TO_SIGMA · MAD(R))`, the MAD read from a
 //!   histogram of `R` in 1/16 grey levels (O(cells), deterministic). [`MAD_TO_SIGMA`] (1.4826) makes
 //!   it the standard deviation of Gaussian noise; the MAD ignores the object's own cells.
@@ -88,6 +92,13 @@ pub const SIGMA_FLOOR: f32 = 0.75;
 pub const MAD_TO_SIGMA: f32 = 1.4826;
 /// Cells with `|R|` above this many σ are left out of the second gain fit.
 pub const OUTLIER_SIGMAS: f32 = 3.0;
+/// Smallest fitted gain: see [`MAX_GAIN`].
+pub const MIN_GAIN: f32 = 0.5;
+/// Largest fitted gain. Exposure does not halve or double a fixed camera's contrast between two
+/// frames minutes apart; a fit outside that is the detail itself changing. On a scene with little
+/// other detail an object present in only one frame dominates the fit: when it is in the
+/// reference, `a` goes to 0 and the object vanishes from `R` (it left, and the test saw nothing).
+pub const MAX_GAIN: f32 = 2.0;
 /// Weight of a new residual in the per-cell noise map.
 pub const NOISE_ALPHA: f32 = 1.0 / 16.0;
 /// σ over the mean absolute value of Gaussian noise, `sqrt(π/2)`.
@@ -264,7 +275,8 @@ fn gain_fit(dn: &[i32], dr: &[i32], keep: impl Fn(usize) -> bool) -> f64 {
             den += f64::from(r) * f64::from(r);
         }
     }
-    if den > 0.0 { num / den } else { 1.0 }
+    let a = if den > 0.0 { num / den } else { 1.0 };
+    a.clamp(f64::from(MIN_GAIN), f64::from(MAX_GAIN))
 }
 
 /// `R = (dn - a dr) / 81` in grey levels.
@@ -338,17 +350,24 @@ fn hist_median(hist: &[u32], n: usize) -> usize {
 
 /// `1.4826 · MAD(r)` in grey levels (histogram of 1/16 levels), at least [`SIGMA_FLOOR`].
 pub fn robust_sigma(r: &[f32]) -> f32 {
+    robust_sigma_in(r, &mut Vec::new(), &mut Vec::new())
+}
+
+/// [`robust_sigma`] with reusable histogram buffers (resized and cleared here).
+fn robust_sigma_in(r: &[f32], hist: &mut Vec<u32>, dev: &mut Vec<u32>) -> f32 {
     if r.is_empty() {
         return SIGMA_FLOOR;
     }
-    let mut hist = vec![0u32; 2 * HIST_HALF];
+    hist.clear();
+    hist.resize(2 * HIST_HALF, 0);
+    dev.clear();
+    dev.resize(2 * HIST_HALF, 0);
     for &v in r {
         if let Some(h) = hist.get_mut(bin(v)) {
             *h += 1;
         }
     }
-    let med = hist_median(&hist, r.len());
-    let mut dev = vec![0u32; 2 * HIST_HALF];
+    let med = hist_median(hist, r.len());
     for (i, &c) in hist.iter().enumerate() {
         if c > 0
             && let Some(d) = dev.get_mut(i.abs_diff(med))
@@ -356,7 +375,7 @@ pub fn robust_sigma(r: &[f32]) -> f32 {
             *d += c;
         }
     }
-    let mad = hist_median(&dev, r.len()) as f32 / HIST_STEPS;
+    let mad = hist_median(dev, r.len()) as f32 / HIST_STEPS;
     (MAD_TO_SIGMA * mad).max(SIGMA_FLOOR)
 }
 
@@ -394,10 +413,14 @@ impl Default for Params {
 
 impl Params {
     /// The collector's confirmation of a dHash drop ([`crate::collect::store`], `collect.dedup_mode`
-    /// `both`): the best point of the offline sweep (`tests/it/dedup_eval.rs`, lowest
-    /// `2 * missed + kept`): `z_cell` 5, `d_min` 8 grey levels in every scene, groups of 3 cells or
-    /// more, texture masking 1. Alone it missed 6.8% of 1,009 labelled object changes for 68% kept
-    /// repeats; with dHash at 6 it missed 0.7% of 284 collected pairs (6.1% over all pairs).
+    /// `both`): `z_cell` 5, `d_min` 8 grey levels in every scene, groups of 3 cells or more, no
+    /// texture masking. The sweep's best point (lowest `2 * missed + kept`) had texture masking 1,
+    /// but on 2688 x 1520 scenes it saw a 30 x 30 px object at only 22, 13, 9 and 0 of 40 positions
+    /// (IR 40-70 +30, IR 20-120 +40, day 60-200 +40, day with an 80 px texture +40); 0.25 still
+    /// missed up to 33 of 40; without masking all 160 were seen (the
+    /// `the_collector_parameters_see_a_30px_object_in_every_case` grid). Missing an object costs
+    /// more than keeping a repeat (rate limits and the storm cap bound the volume). On reviewed
+    /// pairs: see docs/DATASET.md "Near duplicates".
     pub const COLLECTOR: Params = Params {
         z_cell: 5.0,
         z_single: Z_SINGLE,
@@ -406,7 +429,7 @@ impl Params {
         min_component: 3,
         weather_share: WEATHER_SHARE,
         weather_component: WEATHER_COMPONENT,
-        texture_beta: 1.0,
+        texture_beta: 0.0,
     };
 
     /// `d_min` of a scene.
@@ -464,41 +487,88 @@ pub struct Residual {
     texture: Vec<f32>,
 }
 
-impl Residual {
-    /// `R` of `new` against `reference`; None when their grids differ.
-    pub fn of(new: &Thumb, reference: &Thumb) -> Option<Self> {
-        if new.cols != reference.cols || new.rows != reference.rows {
+/// A new frame prepared for comparisons with many references: its detail layer and its side of
+/// the texture are computed once, and the histogram buffers of the noise estimate are reused, so a
+/// comparison costs only the reference's side ([`Probe::residual`]). [`Residual::of`],
+/// [`verdict_with`] and [`duplicate_of`] go through it, with the same results.
+#[derive(Debug, Clone)]
+pub struct Probe {
+    cols: usize,
+    rows: usize,
+    /// `81 · D_new`.
+    detail: Vec<i32>,
+    /// The [`TEXTURE_RADIUS`] box mean of `|D_new|` (grey levels).
+    texture: Vec<f32>,
+    hist: Vec<u32>,
+    dev: Vec<u32>,
+}
+
+impl Probe {
+    pub fn new(new: &Thumb) -> Self {
+        let detail = new.detail81();
+        let abs_new: Vec<f32> = detail
+            .iter()
+            .map(|&v| narrow(f64::from(v.unsigned_abs()) / f64::from(BLUR_AREA)))
+            .collect();
+        Self {
+            cols: new.cols,
+            rows: new.rows,
+            texture: box_mean(&abs_new, new.cols, new.rows, TEXTURE_RADIUS),
+            detail,
+            hist: Vec::new(),
+            dev: Vec::new(),
+        }
+    }
+
+    /// `R` of the new frame against `reference`; None when their grids differ.
+    pub fn residual(&mut self, reference: &Thumb) -> Option<Residual> {
+        if self.cols != reference.cols || self.rows != reference.rows {
             return None;
         }
-        let (dn, dr) = (new.detail81(), reference.detail81());
-        let a0 = gain_fit(&dn, &dr, |_| true);
-        let r0 = residuals(&dn, &dr, a0);
-        let limit = OUTLIER_SIGMAS * robust_sigma(&r0);
-        let a = gain_fit(&dn, &dr, |i| r0.get(i).is_some_and(|v| v.abs() <= limit));
-        let r = residuals(&dn, &dr, a);
-        let (c, rows) = (new.cols, new.rows);
+        let (dn, dr) = (&self.detail, reference.detail81());
+        let a0 = gain_fit(dn, &dr, |_| true);
+        let r0 = residuals(dn, &dr, a0);
+        let limit = OUTLIER_SIGMAS * robust_sigma_in(&r0, &mut self.hist, &mut self.dev);
+        let a = gain_fit(dn, &dr, |i| r0.get(i).is_some_and(|v| v.abs() <= limit));
+        let r = residuals(dn, &dr, a);
         let scale = a.abs() / f64::from(BLUR_AREA);
         let abs_ref: Vec<f32> = dr
             .iter()
             .map(|&v| narrow(scale * f64::from(v.unsigned_abs())))
             .collect();
-        let abs_new: Vec<f32> = dn
-            .iter()
-            .map(|&v| narrow(f64::from(v.unsigned_abs()) / f64::from(BLUR_AREA)))
-            .collect();
-        let texture = box_mean(&abs_ref, c, rows, TEXTURE_RADIUS)
+        let texture = box_mean(&abs_ref, self.cols, self.rows, TEXTURE_RADIUS)
             .into_iter()
-            .zip(box_mean(&abs_new, c, rows, TEXTURE_RADIUS))
-            .map(|(x, y)| x.min(y))
+            .zip(&self.texture)
+            .map(|(x, &y)| x.min(y))
             .collect();
-        Some(Self {
-            cols: c,
-            rows,
+        Some(Residual {
+            cols: self.cols,
+            rows: self.rows,
             gain: narrow(a),
-            sigma: robust_sigma(&r),
+            sigma: robust_sigma_in(&r, &mut self.hist, &mut self.dev),
             r,
             texture,
         })
+    }
+
+    /// Whether the new frame differs from `reference` ([`Residual::verdict`]);
+    /// [`Verdict::MISMATCH`] for thumbnails of different grids.
+    pub fn verdict(
+        &mut self,
+        reference: &Thumb,
+        scene: Scene,
+        sigma_c: Option<&NoiseMap>,
+        params: &Params,
+    ) -> Verdict {
+        self.residual(reference)
+            .map_or(Verdict::MISMATCH, |r| r.verdict(scene, sigma_c, params))
+    }
+}
+
+impl Residual {
+    /// `R` of `new` against `reference`; None when their grids differ.
+    pub fn of(new: &Thumb, reference: &Thumb) -> Option<Self> {
+        Probe::new(new).residual(reference)
     }
 
     /// `R` per cell, row-major.
@@ -658,7 +728,7 @@ pub fn verdict_with(
     sigma_c: Option<&NoiseMap>,
     params: &Params,
 ) -> Verdict {
-    Residual::of(new, reference).map_or(Verdict::MISMATCH, |r| r.verdict(scene, sigma_c, params))
+    Probe::new(new).verdict(reference, scene, sigma_c, params)
 }
 
 /// The index of the first reference (newest first) `new` does not differ from, if any.
@@ -669,9 +739,10 @@ pub fn duplicate_of<'a>(
     sigma_c: Option<&NoiseMap>,
     params: &Params,
 ) -> Option<usize> {
+    let mut probe = Probe::new(new);
     refs_newest_first
         .into_iter()
-        .position(|r| !verdict_with(new, r, scene, sigma_c, params).different)
+        .position(|r| !probe.verdict(r, scene, sigma_c, params).different)
 }
 
 /// `new` is a near duplicate of one of the references ([`duplicate_of`], default [`Params`]).
@@ -1122,6 +1193,138 @@ mod tests {
                 "{x}"
             );
             assert_eq!(r.verdict(Scene::Ir, None, &masked).different, flat, "{x}");
+        }
+    }
+
+    /// On a scene with almost no detail, an object only the reference holds dominates the gain
+    /// fit; the gain range keeps it from fitting to 0 and hiding the object that left.
+    #[test]
+    fn an_object_that_left_a_plain_scene_is_different() {
+        let (w, h) = (640, 360);
+        let ramp: Vec<f32> = (0..w * h)
+            .map(|i| 40.0 + 150.0 * (i % w) as f32 / w as f32)
+            .collect();
+        let plain = thumb(&render(&ramp, 0.0, 0), w, h);
+        let blob = thumb(
+            &render(&with_blob(&ramp, w, (300, 150, 24, 24), 70.0), 0.0, 0),
+            w,
+            h,
+        );
+        for p in [Params::default(), Params::COLLECTOR] {
+            assert!(
+                verdict_with(&plain, &blob, Scene::Day, None, &p).different,
+                "left"
+            );
+            assert!(
+                verdict_with(&blob, &plain, Scene::Day, None, &p).different,
+                "came"
+            );
+        }
+        let r = Residual::of(&plain, &blob).unwrap();
+        assert!(r.gain >= MIN_GAIN, "{}", r.gain);
+    }
+
+    /// The 30 x 30 px object grid of the collector's parameters: (name, scene, lo, hi, delta,
+    /// coarse texture). The coarse texture is an 80 px checker of ±20 grey levels over the scene.
+    const GRID_CASES: [(&str, Scene, f32, f32, f32, bool); 4] = [
+        ("IR 40-70 +30", Scene::Ir, 40.0, 70.0, 30.0, false),
+        ("IR 20-120 +40", Scene::Ir, 20.0, 120.0, 40.0, false),
+        ("day 60-200 +40", Scene::Day, 60.0, 200.0, 40.0, false),
+        (
+            "day 60-200, 80 px texture, +40",
+            Scene::Day,
+            60.0,
+            200.0,
+            40.0,
+            true,
+        ),
+    ];
+    /// Positions per case.
+    const GRID_POSITIONS: usize = 40;
+
+    /// How many of [`GRID_POSITIONS`] 30 x 30 px objects of `delta` on a 2688 x 1520 scene the
+    /// block test at each of `params` calls different both when the object appears and when it
+    /// leaves, per [`GRID_CASES`] entry (fixed seeds; the two frames have independent noise of 4
+    /// grey levels).
+    fn grid_hits(params: &[Params]) -> Vec<Vec<usize>> {
+        let mut out = vec![vec![0; GRID_CASES.len()]; params.len()];
+        for (c, &(_, scene, lo, hi, delta, coarse)) in GRID_CASES.iter().enumerate() {
+            let mut base = make_scene(W, H, 100 + c as u64, lo, hi);
+            if coarse {
+                for (i, v) in base.iter_mut().enumerate() {
+                    let (x, y) = (i % W, i / W);
+                    *v += if ((x / 80) + (y / 80)) % 2 == 0 {
+                        20.0
+                    } else {
+                        -20.0
+                    };
+                }
+            }
+            let a = thumb(&render(&base, 4.0, 200 + c as u64), W, H);
+            let mut left = Probe::new(&a);
+            let mut b = render(&base, 4.0, 300 + c as u64);
+            for k in 0..GRID_POSITIONS {
+                let x = 150 + (k % 8) * 300 + (k * 37) % 21;
+                let y = 120 + (k / 8) * 280 + (k * 53) % 21;
+                let saved: Vec<u8> = (y..y + 30)
+                    .flat_map(|r| b[r * W + x..r * W + x + 30].to_vec())
+                    .collect();
+                for r in y..y + 30 {
+                    for v in &mut b[r * W + x..r * W + x + 30] {
+                        *v = (f32::from(*v) + delta).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                let tb = thumb(&b, W, H);
+                let mut appeared = Probe::new(&tb);
+                for (pi, p) in params.iter().enumerate() {
+                    // Seen both when it appears and when it leaves (the reference holds it).
+                    if appeared.verdict(&a, scene, None, p).different
+                        && left.verdict(&tb, scene, None, p).different
+                    {
+                        out[pi][c] += 1;
+                    }
+                }
+                for (j, r) in (y..y + 30).enumerate() {
+                    b[r * W + x..r * W + x + 30].copy_from_slice(&saved[j * 30..j * 30 + 30]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The collector's parameters ([`Params::COLLECTOR`]) still see a 30 x 30 px object on
+    /// textured backgrounds: at least 38 of 40 positions in every case.
+    #[test]
+    fn the_collector_parameters_see_a_30px_object_in_every_case() {
+        let hits = grid_hits(&[Params::COLLECTOR]);
+        for (c, case) in GRID_CASES.iter().enumerate() {
+            assert!(hits[0][c] >= 38, "{}: {}/40", case.0, hits[0][c]);
+        }
+    }
+
+    /// The grid for candidate parameters (a measurement: prints; set `BOP_BLOCKDIFF_GRID`).
+    #[test]
+    #[ignore = "a measurement: set BOP_BLOCKDIFF_GRID"]
+    fn grid_of_candidate_parameters() {
+        if std::env::var_os("BOP_BLOCKDIFF_GRID").is_none() {
+            return;
+        }
+        let mut cands = Vec::new();
+        for beta in [0.0, 0.25, 0.5, 1.0] {
+            for minc in [2, 3] {
+                cands.push(Params {
+                    texture_beta: beta,
+                    min_component: minc,
+                    ..Params::COLLECTOR
+                });
+            }
+        }
+        let hits = grid_hits(&cands);
+        for (p, h) in cands.iter().zip(&hits) {
+            eprintln!(
+                "beta {} min_component {}: {:?} of {GRID_POSITIONS}",
+                p.texture_beta, p.min_component, h
+            );
         }
     }
 

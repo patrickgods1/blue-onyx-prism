@@ -30,8 +30,12 @@ pub const MAX_INTERVAL_S: u32 = 7 * 24 * 3600;
 /// sends frames on motion only, so an empty night / IR frame means something moved that the model
 /// did not detect (often an animal); keep more of them than the 600 s day interval allows.
 pub const DEFAULT_EMPTY_NIGHT_INTERVAL_S: u32 = 120;
-/// Which test drops a near duplicate (`collect.dedup_mode`, [`super::store`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Which test drops a near duplicate (`collect.dedup_mode`, [`super::store`]). An unknown value
+/// (a typo, or a mode of a later build) loads as [`DedupMode::Both`] with a warning instead of
+/// failing the config: the `collect` section is lenient (unknown keys only warn,
+/// [`unknown_keys`]), and `both` is the rule that drops less. Top-level enums such as `log_format`
+/// stay parse errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DedupMode {
     /// Dropped only when a kept frame of the same camera and scene in the window is within
@@ -57,6 +61,20 @@ impl DedupMode {
             "dhash" => Some(DedupMode::Dhash),
             _ => None,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for DedupMode {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let mode = v.as_str().and_then(Self::parse);
+        Ok(mode.unwrap_or_else(|| {
+            tracing::warn!(
+                "collect.dedup_mode: {v} is not one of \"both\", \"dhash\"; using \"both\" (a frame is \
+                 dropped only when dHash and the block test agree)"
+            );
+            DedupMode::Both
+        }))
     }
 }
 
@@ -1103,5 +1121,34 @@ mod tests {
         assert!(first_seen(k("a")).is_empty());
         assert_eq!(first_seen([k("a"), k("b")].concat()), k("b"));
         assert!(first_seen(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn dedup_mode_reads_both_and_dhash_and_falls_back_to_both() {
+        let read = |v: serde_json::Value| -> CollectConfig {
+            serde_json::from_value(serde_json::json!({"dedup_mode": v})).unwrap()
+        };
+        assert_eq!(CollectConfig::default().dedup_mode, DedupMode::Both);
+        assert_eq!(read("both".into()).dedup_mode, DedupMode::Both);
+        assert_eq!(read("dhash".into()).dedup_mode, DedupMode::Dhash);
+        // An unknown value (or type) does not fail the config: `both`, with a warning.
+        assert_eq!(read("blocks".into()).dedup_mode, DedupMode::Both);
+        assert_eq!(read(3.into()).dedup_mode, DedupMode::Both);
+        for m in [DedupMode::Both, DedupMode::Dhash] {
+            assert_eq!(DedupMode::parse(m.as_str()), Some(m));
+            let c = CollectConfig {
+                dedup_mode: m,
+                ..CollectConfig::default()
+            };
+            let v = serde_json::to_value(&c).unwrap();
+            assert_eq!(v["dedup_mode"], m.as_str());
+            assert_eq!(
+                serde_json::from_value::<CollectConfig>(v)
+                    .unwrap()
+                    .dedup_mode,
+                m
+            );
+        }
+        assert_eq!(DedupMode::parse("Both"), None);
     }
 }
