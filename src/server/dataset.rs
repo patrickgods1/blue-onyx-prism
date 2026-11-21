@@ -84,6 +84,19 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
                 format!("{key} interval: '{v}' is not a whole number of seconds")
             })?;
         }
+        // Present and empty = unset (the default, never stricter than the day interval); a
+        // number sets it; a missing field keeps the value.
+        if b == Bucket::Empty
+            && let Some(v) = field(fields, &format!("{key}.night_interval"))
+        {
+            bc.night_interval_s = if v.is_empty() {
+                None
+            } else {
+                Some(v.parse().with_context(|| {
+                    format!("{key} night interval: '{v}' is not a whole number of seconds")
+                })?)
+            };
+        }
     }
     if let Some(v) = field(fields, "near_threshold.margin").filter(|v| !v.is_empty()) {
         c.buckets.near_threshold.margin = Some(
@@ -112,12 +125,22 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
     Ok(())
 }
 
+struct NightRow {
+    /// The explicit value, empty when unset.
+    value: String,
+    /// What applies now.
+    effective: u32,
+}
+
 struct BucketRow {
     key: &'static str,
     describe: &'static str,
     enabled: bool,
     rate: String,
     interval: u32,
+    /// `empty` only: the explicit interval for night / IR frames (None = unset) and the effective
+    /// one, shown as the placeholder.
+    night_interval: Option<NightRow>,
     saved: u64,
 }
 
@@ -260,6 +283,13 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
                 enabled: bc.enabled,
                 rate: clean(bc.rate),
                 interval: bc.per_camera_min_interval_s,
+                night_interval: (b == Bucket::Empty).then(|| NightRow {
+                    value: bc
+                        .night_interval_s
+                        .map(|n| n.to_string())
+                        .unwrap_or_default(),
+                    effective: bc.night_interval(b),
+                }),
                 saved: SCENES.iter().map(|s| summary.count(s, b)).sum(),
             }
         })
@@ -633,6 +663,18 @@ mod tests {
         assert_eq!(c.buckets.positive.per_camera_min_interval_s, 60);
         assert_eq!(c.buckets.empty.rate, 1.0, "an empty field keeps the value");
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
+        assert_eq!(
+            c.buckets.empty.night_interval_s, None,
+            "a missing field keeps it"
+        );
+        apply_form(&mut c, &parse_form(b"empty.night_interval=30")).unwrap();
+        assert_eq!(c.buckets.empty.night_interval_s, Some(30));
+        apply_form(&mut c, &parse_form(b"empty.night_interval=")).unwrap();
+        assert_eq!(c.buckets.empty.night_interval_s, None, "empty = unset");
+        apply_form(&mut c, &parse_form(b"empty.night_interval=0")).unwrap();
+        assert_eq!(c.buckets.empty.night_interval_s, Some(0));
+        assert!(apply_form(&mut c, &parse_form(b"empty.night_interval=soon")).is_err());
+        assert_eq!(c.buckets.positive.night_interval_s, None);
         assert_eq!(c.max_gb, 2.0);
         assert_eq!(c.buckets.near_margin(), 0.05);
         assert_eq!(c.dir, None);
@@ -894,7 +936,39 @@ mod tests {
         let c = state.config_read().collect.clone();
         assert!(c.enabled && c.buckets.positive.enabled && !c.buckets.suppressed.enabled);
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 120);
+        assert_eq!(
+            c.buckets.empty.night_interval_s, None,
+            "unset: 120 s anyway"
+        );
         assert_eq!(c.max_gb, 1.0);
+        // Set, then cleared, through the real save path.
+        let save = |extra: &str| {
+            post(
+                "/dataset/settings",
+                &format!("enabled=on&positive.enabled=on&empty.enabled=on&max_gb=1{extra}"),
+            )
+        };
+        let (s, _, _) = call(&state, save("&empty.night_interval=45")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            state.config_read().collect.buckets.empty.night_interval_s,
+            Some(45)
+        );
+        let (_, page) = get_text(&state, "/train/collect").await;
+        assert!(page.contains("name=\"empty.night_interval\""), "{page}");
+        assert!(page.contains("value=\"45\""));
+        let (s, _, _) = call(&state, save("&empty.night_interval=")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            state.config_read().collect.buckets.empty.night_interval_s,
+            None
+        );
+        let (_, page) = get_text(&state, "/train/collect").await;
+        assert!(page.contains("name=\"empty.night_interval\""), "{page}");
+        assert!(
+            page.contains("placeholder=\"120\""),
+            "effective value shown"
+        );
         let (_, _, page) = call(&state, post("/dataset/settings", "enabled=on&max_gb=0")).await;
         assert!(String::from_utf8_lossy(&page).contains("collect.max_gb"));
         assert_eq!(
