@@ -78,6 +78,7 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("model-picker.js", JS),
     asset!("review-rules.js", JS),
     asset!("review-touch.js", JS),
+    asset!("review-need.js", JS),
     asset!("review.js", JS),
     asset!("welcome.js", JS),
     asset!("manifest.webmanifest", "application/manifest+json"),
@@ -1817,6 +1818,13 @@ mod tests {
             "review-touch.js before review.js"
         );
         assert!(static_file("review-touch.js").is_some_and(|js| js.contains("ReviewTouch")));
+        // The need sentences too.
+        let need = review.find("/static/review-need.js?v=");
+        assert!(
+            need.is_some() && need < review.find("/static/review.js?v="),
+            "review-need.js before review.js"
+        );
+        assert!(static_file("review-need.js").is_some_and(|js| js.contains("ReviewNeed")));
         for id in ["rv-draw", "rv-redraw", "rv-view-menu"] {
             assert!(review.contains(&format!("id=\"{id}\"")), "missing #{id}");
         }

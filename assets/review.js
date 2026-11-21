@@ -4240,6 +4240,7 @@
     var keys = Object.keys(per);
     add('Per class', keys.length ? keys.map(function (k) { return k + ' ' + per[k]; }).join(', ') : 'none yet');
     if (j.balance) add('Reviewed frames', balanceCounts(j.balance));
+    if (j.need && window.ReviewNeed) add('Reviewed boxes', ReviewNeed.counts(j.need));
     add('Matching', j.position ? (j.position + ' of ' + j.total) : (j.total || 0));
     if (j.unreadable) add('Unreadable', j.unreadable);
     // The place of the frame the answer landed on (the HUD shows it once that frame is on screen).
@@ -4257,7 +4258,8 @@
   // folder's index is still filling in.
   var queuePlace = { frame: null, text: '', left: false }, queueIndexing = false;
   // The queue's item of the frame it last landed on (GET /v1/review/next), for what only the
-  // queue knows: why `balance=` put it there, and whether it is a random pick.
+  // queue knows: why Recommended (`need`) or `balance=` put it there, and whether it is a random
+  // pick.
   var queueItem = null;
 
   // A random pick (the item's `random_pick`: 1 frame in 5 of the default view, a fixed pool by
@@ -4279,8 +4281,8 @@
     return !!(cur && cur.labels && cur.labels.review_pick === 'random');
   }
 
-  // `balance=` and Recommended: the reviewed frames the order weighs against, of the dimensions
-  // the Order filter balances (the answer's `balance`).
+  // `balance=`: the reviewed frames the order weighs against, of the dimensions the Order filter
+  // balances (the answer's `balance`; Recommended's reviewed boxes are ReviewNeed.counts).
   function balanceCounts(b) {
     var by = balanceBy();
     var list = function (o) { return Object.keys(o || {}).map(function (k) { return k + ' ' + o[k]; }).join(', ') || 'none'; };
@@ -4421,7 +4423,9 @@
     if (cur.labels && cur.labels.disagreement) parts.push('back for review: ' + cur.labels.disagreement);
     // Recommended: the frame's place in its event (one camera's activity), 1 = its first.
     if (queueItem && queueItem.frame === cur.frame && queueItem.event_rank != null) parts.push('event: frame ' + (queueItem.event_rank + 1));
-    if (queueItem && queueItem.frame === cur.frame && queueItem.balance) parts.push(balanceNote(queueItem));
+    // Recommended: why it is next (the item's `need`); `balance=`: what it balances.
+    if (queueItem && queueItem.frame === cur.frame && queueItem.need && window.ReviewNeed) parts.push(ReviewNeed.note(queueItem));
+    else if (queueItem && queueItem.frame === cur.frame && queueItem.balance) parts.push(balanceNote(queueItem));
     m.textContent = parts.filter(Boolean).join(' · ');
     setHud();
   }
