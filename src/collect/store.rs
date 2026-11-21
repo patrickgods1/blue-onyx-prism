@@ -1,14 +1,42 @@
 //! The collector thread's state: bucket selection with per-camera rate limits and sampling,
-//! dHash dedup per camera, the atomic writes of image + sidecar + index line, the size / age
-//! caps (through [`crate::retention::prune_dataset`]) and the disk guard that stops collection
+//! near-duplicate dedup per camera, the atomic writes of image + sidecar + index line, the size /
+//! age caps (through [`crate::retention::prune_dataset`]) and the disk guard that stops collection
 //! on low free space or a full disk and re-arms it once space is back. Single-threaded: only the
 //! collector thread owns a [`Store`], so it is the only writer of the frame files and index files.
+//!
+//! Dedup (`collect.dedup_mode`, [`DedupMode`]): each saved frame that was not itself a near
+//! duplicate is remembered as a reference: its time, dHash, scene and, in `both` mode, its block
+//! thumbnail ([`blockdiff::Thumb`], from the luma decoded for the dHash: one decode). A new frame
+//! is a near duplicate when a reference of the same camera within [`DEDUP_WINDOW`] is within
+//! `dedup_hamming` dHash bits and, in `both` mode (default), that same reference is of the same
+//! scene, still has its thumbnail and the block test ([`blockdiff::Params::COLLECTOR`]) finds no
+//! change against it. The offline evaluation (`tests/it/dedup_eval.rs`, docs/DATASET.md) found the
+//! dHash test alone missed 56% of labelled object changes on 1,009 reviewed pairs (76% in imported
+//! footage); requiring both missed none, and confirmed no drop on those frames either (rain,
+//! insects, IR flicker and foliage differ by more than a small animal), so volume is held by the
+//! rate limits and the storm cap below, not by the dedup. Thumbnails are capped across cameras at
+//! [`DEDUP_THUMB_BYTES`]; the oldest lose theirs first.
+//!
+//! "Never drops a frame the old rule kept" holds per decision, against the same references: `both`
+//! drops a frame only when `dhash` would too, and a lost thumbnail only takes a drop away. It does
+//! not hold over a sequence: a frame `both` keeps restarts its buckets' interval clocks and becomes
+//! a reference, so a later frame can be dropped (by a rate limit, or as a near duplicate of it)
+//! that `dhash` mode, which had dropped the earlier one, would have kept.
+//!
+//! Storm cap: every dHash look-alike counts toward [`DEDUP_SKIPS_PER_CAMERA`], as the duplicates of
+//! `dhash` mode do. A look-alike the block test calls different is kept for a `positive` or
+//! `empty` bucket; one whose passing buckets all skip the dedup ([`Bucket::skips_dedup`]) is held
+//! to the cap, so that cap is never looser than in `dhash` mode. The rate limits and the night
+//! interval come first. A kept frame's sidecar records what the dedup saw ([`DedupInfo`]).
 
+use super::blockdiff::{self, Thumb};
+use super::config::DedupMode;
 use super::health::LastError;
 use super::layout::{self, Summary};
 use super::metrics::{Dropped, METRICS};
-use super::record::{Bucket, IndexLine, RECORD_VERSION};
+use super::record::{Bucket, DedupInfo, IndexLine, RECORD_VERSION};
 use super::{CollectSettings, Frame, Status, dhash};
+use crate::image_stats::Scene;
 use crate::retention::DatasetUsage;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -18,8 +46,13 @@ use tracing::{debug, info, warn};
 
 /// Frames of one camera compared for near duplicates: those saved within this window.
 pub const DEDUP_WINDOW: Duration = Duration::from_secs(10 * 60);
-/// At most this many recent hashes per camera.
+/// At most this many references (recent saved frames) per camera.
 pub const DEDUP_KEEP: usize = 32;
+/// Most bytes of reference thumbnails held across all cameras: 8 MiB, 910 thumbnails of
+/// [`blockdiff::THUMB_CELLS`] (9,216) bytes, a full [`DEDUP_KEEP`] for 28 busy cameras. Past it the
+/// oldest thumbnails (any camera) are dropped; their references keep their dHash, so `dhash` mode
+/// is unchanged and in `both` mode they can no longer confirm a drop.
+pub const DEDUP_THUMB_BYTES: usize = 8 * 1024 * 1024;
 /// At most this many near duplicates of one camera are saved in [`DEDUP_SKIP_WINDOW`] because
 /// their bucket skips the dedup ([`Bucket::skips_dedup`]); past it they are dropped as duplicates.
 /// Those buckets have no minimum interval by default, so in a storm of look-alike frames near the
@@ -95,8 +128,10 @@ pub struct Store {
     usage: DatasetUsage,
     /// (camera, bucket) -> when its last frame was saved.
     last: HashMap<(String, Bucket), SystemTime>,
-    /// camera -> recent (time, dHash) of saved frames.
-    recent: HashMap<String, VecDeque<(SystemTime, u64)>>,
+    /// camera -> its references, oldest first.
+    recent: HashMap<String, VecDeque<Reference>>,
+    /// Cap of the reference thumbnails' bytes ([`DEDUP_THUMB_BYTES`]; tests lower it).
+    thumb_cap: usize,
     /// camera -> when near duplicates were saved for a bucket that skips the dedup.
     skips: HashMap<String, VecDeque<SystemTime>>,
     /// camera -> its latest frame that got as far as the per-camera limits. Every camera in
@@ -162,6 +197,120 @@ fn idle_after(settings: &CollectSettings) -> Duration {
         .fold(CAMERA_IDLE, Duration::max)
 }
 
+/// A saved frame the dedup compares later frames of its camera with.
+#[derive(Debug)]
+struct Reference {
+    at: SystemTime,
+    hash: u64,
+    scene: Scene,
+    /// Its block thumbnail: None in `dhash` mode or once [`DEDUP_THUMB_BYTES`] evicted it.
+    thumb: Option<Thumb>,
+}
+
+/// The scene of a sidecar's `scene` (`day`, `night`, `ir`; anything else counts as day).
+fn scene_of(s: &str) -> Scene {
+    match s {
+        "night" => Scene::Night,
+        "ir" => Scene::Ir,
+        _ => Scene::Day,
+    }
+}
+
+/// What the dedup decided for a frame: a near duplicate, or why not ([`DedupInfo`]).
+#[derive(Debug, Clone, PartialEq)]
+struct DedupCheck {
+    /// Dropped as a near duplicate unless a bucket skips the dedup.
+    duplicate: bool,
+    /// Some reference in the window is within `dedup_hamming` dHash bits (a dHash look-alike):
+    /// counted toward [`DEDUP_SKIPS_PER_CAMERA`] like the duplicates of `dhash` mode.
+    look_alike: bool,
+    info: DedupInfo,
+}
+
+/// The dedup decision for a frame of `scene` with dHash `hash` and thumbnail `thumb` against the
+/// camera's references (already limited to the window). Pure. See the module docs for the rule:
+/// one reference must pass both tests. References are tried newest first and the first that
+/// confirms stops the search; `nearest_hamming` is still the minimum over all of them. The new
+/// frame's side of the block test is prepared once ([`blockdiff::Probe`]), on the first
+/// look-alike that needs it.
+fn dedup_check(
+    refs: &VecDeque<Reference>,
+    hash: u64,
+    thumb: Option<&Thumb>,
+    scene: Scene,
+    max_hamming: u32,
+    mode: DedupMode,
+) -> DedupCheck {
+    let mut info = DedupInfo {
+        mode: mode.as_str().to_string(),
+        nearest_hamming: refs.iter().map(|r| dhash::hamming(r.hash, hash)).min(),
+        decided_by: if refs.is_empty() {
+            DedupInfo::NO_REFERENCE
+        } else {
+            DedupInfo::DHASH
+        }
+        .to_string(),
+        ..DedupInfo::default()
+    };
+    let record = |info: &mut DedupInfo, v: &blockdiff::Verdict| {
+        info.block_max_z = Some((v.max_z * 10.0).round() / 10.0);
+        info.block_largest_blob = Some(u32::try_from(v.largest_blob).unwrap_or(u32::MAX));
+    };
+    let mut probe: Option<blockdiff::Probe> = None;
+    // The block test's closest call: the look-alike with the smallest changed group.
+    let mut closest: Option<blockdiff::Verdict> = None;
+    let mut look_alike = false;
+    for r in refs.iter().rev() {
+        if dhash::hamming(r.hash, hash) > max_hamming {
+            continue;
+        }
+        look_alike = true;
+        if mode == DedupMode::Dhash {
+            return DedupCheck {
+                duplicate: true,
+                look_alike,
+                info,
+            };
+        }
+        let (Some(rt), Some(t)) = (r.thumb.as_ref(), thumb) else {
+            continue;
+        };
+        if r.scene != scene {
+            continue;
+        }
+        let v = probe
+            .get_or_insert_with(|| blockdiff::Probe::new(t))
+            .verdict(rt, scene, None, &blockdiff::Params::COLLECTOR);
+        if !v.different {
+            record(&mut info, &v);
+            return DedupCheck {
+                duplicate: true,
+                look_alike,
+                info,
+            };
+        }
+        if closest.is_none_or(|c| (v.largest_blob, v.max_z) < (c.largest_blob, c.max_z)) {
+            closest = Some(v);
+        }
+    }
+    if look_alike {
+        info.decided_by = if closest.is_some() {
+            DedupInfo::BLOCKDIFF
+        } else {
+            DedupInfo::UNCHECKED
+        }
+        .to_string();
+    }
+    if let Some(v) = closest {
+        record(&mut info, &v);
+    }
+    DedupCheck {
+        duplicate: false,
+        look_alike,
+        info,
+    }
+}
+
 /// True for the errors of a full disk or an exhausted quota.
 pub fn is_disk_full(e: &std::io::Error) -> bool {
     matches!(
@@ -187,6 +336,7 @@ impl Store {
             usage: DatasetUsage::default(),
             last: HashMap::new(),
             recent: HashMap::new(),
+            thumb_cap: DEDUP_THUMB_BYTES,
             skips: HashMap::new(),
             seen: HashMap::new(),
             swept: None,
@@ -367,8 +517,15 @@ impl Store {
             METRICS.record_drop(Dropped::Rate);
             return Handled::Dropped(Dropped::Rate);
         }
-        let hash = match dhash::of_encoded(&image) {
-            Ok((h, _, _)) => h,
+        let mode = settings.dedup_mode;
+        let scene = scene_of(&record.record.scene);
+        let (hash, thumb) = match dhash::luma_of_encoded(&image) {
+            Ok((luma, w, h)) => (
+                dhash::of_luma(&luma, w, h),
+                (mode == DedupMode::Both)
+                    .then(|| Thumb::of_luma(&luma, w, h))
+                    .flatten(),
+            ),
             Err(e) => {
                 self.note_error(&format!(
                     "could not read a frame Blue Iris sent, so it was not saved: {e:#}; the image \
@@ -379,22 +536,44 @@ impl Store {
             }
         };
         let recent = self.recent.entry(camera.clone()).or_default();
-        recent.retain(|(t, _)| {
-            at.duration_since(*t)
+        recent.retain(|r| {
+            at.duration_since(r.at)
                 .map_or(true, |since| since <= DEDUP_WINDOW)
         });
-        let near_duplicate = recent
-            .iter()
-            .any(|(_, h)| dhash::hamming(*h, hash) <= settings.dedup_hamming);
-        if near_duplicate {
+        let mut check = dedup_check(
+            recent,
+            hash,
+            thumb.as_ref(),
+            scene,
+            settings.dedup_hamming,
+            mode,
+        );
+        let near_duplicate = check.duplicate;
+        // Storm cap: every dHash look-alike counts toward DEDUP_SKIPS_PER_CAMERA, as the
+        // duplicates of `dhash` mode do. A look-alike the block test calls different is kept for
+        // a `positive` / `empty` bucket (the point of `both`); one whose only passing buckets
+        // skip the dedup is held to the cap, so on a rainy IR night the cap is never looser than
+        // in `dhash` mode.
+        let plain_bucket = passing.iter().any(|b| !b.skips_dedup());
+        let counted = check.look_alike && (near_duplicate || !plain_bucket);
+        if check.look_alike {
             let skips = self.skips.entry(camera.clone()).or_default();
             skips.retain(|t| {
                 at.duration_since(*t)
                     .map_or(true, |since| since < DEDUP_SKIP_WINDOW)
             });
-            if !passing.iter().any(|b| b.skips_dedup()) || skips.len() >= DEDUP_SKIPS_PER_CAMERA {
+            let full = skips.len() >= DEDUP_SKIPS_PER_CAMERA;
+            let drop = if near_duplicate {
+                !passing.iter().any(|b| b.skips_dedup()) || full
+            } else {
+                !plain_bucket && full
+            };
+            if drop {
                 METRICS.record_drop(Dropped::Dup);
                 return Handled::Dropped(Dropped::Dup);
+            }
+            if near_duplicate {
+                check.info.decided_by = DedupInfo::SKIPS_DEDUP.to_string();
             }
         }
         if let Some(reason) = self.check_free(&settings) {
@@ -406,6 +585,7 @@ impl Store {
         record.record.matched = matched;
         record.record.buckets = passing.clone();
         record.record.dhash = dhash::hex(hash);
+        record.record.dedup = Some(check.info);
         let rel = match self.write(&settings.dir, &mut record, &image) {
             Ok(rel) => rel,
             Err(e) if is_disk_full(&e) => {
@@ -426,15 +606,23 @@ impl Store {
         for b in &passing {
             self.last.insert((camera.clone(), *b), at);
         }
-        if near_duplicate {
-            // Its look-alike stays the one remembered, so the skip does not extend the window.
-            self.skips.entry(camera).or_default().push_back(at);
-        } else {
+        if counted {
+            self.skips.entry(camera.clone()).or_default().push_back(at);
+        }
+        // A near duplicate saved for a skip bucket is no reference: its look-alike stays the one
+        // remembered, so the skip does not extend the window.
+        if !near_duplicate {
             let recent = self.recent.entry(camera).or_default();
-            recent.push_back((at, hash));
+            recent.push_back(Reference {
+                at,
+                hash,
+                scene,
+                thumb,
+            });
             while recent.len() > DEDUP_KEEP {
                 recent.pop_front();
             }
+            self.cap_thumbs();
         }
         self.last_saved = Some(at);
         METRICS.record_frame(&passing);
@@ -503,6 +691,33 @@ impl Store {
             self.forget(std::slice::from_ref(&oldest));
         }
         self.seen.insert(camera.to_string(), at);
+    }
+
+    /// Bytes of the reference thumbnails held, all cameras.
+    fn thumb_bytes(&self) -> usize {
+        self.recent
+            .values()
+            .flatten()
+            .filter_map(|r| r.thumb.as_ref())
+            .map(Thumb::heap_bytes)
+            .sum()
+    }
+
+    /// Drop the oldest thumbnails (any camera) until they fit in `thumb_cap`.
+    fn cap_thumbs(&mut self) {
+        let mut total = self.thumb_bytes();
+        while total > self.thumb_cap {
+            let oldest = self
+                .recent
+                .values_mut()
+                .flat_map(|q| q.iter_mut())
+                .filter(|r| r.thumb.is_some())
+                .min_by_key(|r| r.at);
+            let Some(r) = oldest else {
+                break;
+            };
+            total = total.saturating_sub(r.thumb.take().map_or(0, |t| t.heap_bytes()));
+        }
     }
 
     /// Drop everything remembered of `cameras`.
@@ -988,35 +1203,417 @@ mod tests {
         );
     }
 
+    /// Both modes: `dhash` is the rule from before `both`, and on these pictures (the same one, or
+    /// one far apart) `both` decides alike.
     #[test]
     fn near_duplicates_of_a_camera_are_dropped_within_the_window() {
+        for mode in [DedupMode::Dhash, DedupMode::Both] {
+            let tmp = Tmp::new();
+            let s = settings(&tmp.0, |c| {
+                c.buckets.positive.per_camera_min_interval_s = 0;
+                c.dedup_mode = mode;
+            });
+            let mut st = store();
+            assert!(matches!(
+                st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+                Handled::Saved { .. }
+            ));
+            assert_eq!(
+                st.handle(frame(&s, positive("a", "r2", t(5)), 1)),
+                Handled::Dropped(Dropped::Dup),
+                "{mode:?}"
+            );
+            // Another scene of the same camera is kept; the same picture on another camera too.
+            assert!(matches!(
+                st.handle(frame(&s, positive("a", "r3", t(6)), 7)),
+                Handled::Saved { .. }
+            ));
+            assert!(matches!(
+                st.handle(frame(&s, positive("b", "r4", t(6)), 1)),
+                Handled::Saved { .. }
+            ));
+            // Past the window the same picture is saved again.
+            let later = t(DEDUP_WINDOW.as_secs() + 10);
+            assert!(matches!(
+                st.handle(frame(&s, positive("a", "r5", later), 1)),
+                Handled::Saved { .. }
+            ));
+            assert_eq!(st.summary.frames, 4, "{mode:?}");
+            // `dhash` mode keeps no thumbnails.
+            assert_eq!(st.thumb_bytes() == 0, mode == DedupMode::Dhash);
+        }
+    }
+
+    /// A 640 x 360 grey picture: a left-to-right ramp of `slope` grey levels, an optional `size` x `size` blob of
+    /// `delta` at `(x, y)` and `step` grey levels added to every other 71 px column band.
+    fn ramp_jpeg(slope: u32, blob: Option<(u32, u32, u32, i32)>, step: i32) -> bytes::Bytes {
+        let (w, h) = (640u32, 360u32);
+        let rgb = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let mut v = 40 + (x * slope / w) as i32 + if (x / 71) % 2 == 1 { step } else { 0 };
+                if let Some((bx, by, size, delta)) = blob
+                    && (bx..bx + size).contains(&x)
+                    && (by..by + size).contains(&y)
+                {
+                    v += delta;
+                }
+                let v = v.clamp(0, 255) as u8;
+                [v, v, v]
+            })
+            .collect();
+        let img = RgbImage {
+            width: w,
+            height: h,
+            rgb,
+        };
+        crate::image::encode_jpeg(&img, 92).unwrap().into()
+    }
+
+    fn with_image(s: &Arc<CollectSettings>, d: Draft, image: bytes::Bytes) -> Frame {
+        Frame {
+            settings: s.clone(),
+            image,
+            record: d,
+        }
+    }
+
+    /// The sidecar of a saved frame.
+    fn sidecar(dir: &Path, out: &Handled) -> Record {
+        let Handled::Saved { rel, .. } = out else {
+            panic!("{out:?}")
+        };
+        let path = dir.join(rel.replace(".jpg", ".json"));
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn scene_frame(camera: &str, rid: &str, at: SystemTime, scene: &str) -> Draft {
+        let mut d = positive(camera, rid, at);
+        d.record.scene = scene.into();
+        d
+    }
+
+    #[test]
+    fn a_small_object_dhash_cannot_see_keeps_the_frame_in_both_mode_only() {
+        let plain = ramp_jpeg(150, None, 0);
+        let blob = ramp_jpeg(150, Some((300, 150, 24, 70)), 0);
+        let (ha, _, _) = dhash::of_encoded(&plain).unwrap();
+        let (hb, _, _) = dhash::of_encoded(&blob).unwrap();
+        assert!(dhash::hamming(ha, hb) <= 6, "{}", dhash::hamming(ha, hb));
+        for mode in [DedupMode::Both, DedupMode::Dhash] {
+            let tmp = Tmp::new();
+            let s = settings(&tmp.0, |c| {
+                c.buckets.positive.per_camera_min_interval_s = 0;
+                c.dedup_mode = mode;
+            });
+            let mut st = store();
+            let first = st.handle(with_image(&s, positive("a", "r1", t(0)), plain.clone()));
+            let info = sidecar(&tmp.0, &first).dedup.unwrap();
+            assert_eq!(info.decided_by, DedupInfo::NO_REFERENCE);
+            assert_eq!(info.mode, mode.as_str());
+            let out = st.handle(with_image(&s, positive("a", "r2", t(5)), blob.clone()));
+            if mode == DedupMode::Dhash {
+                assert_eq!(out, Handled::Dropped(Dropped::Dup));
+                continue;
+            }
+            let info = sidecar(&tmp.0, &out).dedup.unwrap();
+            assert_eq!(info.decided_by, DedupInfo::BLOCKDIFF, "{info:?}");
+            assert!(info.nearest_hamming.unwrap() <= 6);
+            assert!(info.block_largest_blob.unwrap() >= 3, "{info:?}");
+            assert!(info.block_max_z.unwrap() > 5.0, "{info:?}");
+            // Both agree on the same picture again: dropped.
+            assert_eq!(
+                st.handle(with_image(&s, positive("a", "r3", t(6)), blob.clone())),
+                Handled::Dropped(Dropped::Dup)
+            );
+        }
+    }
+
+    #[test]
+    fn a_dhash_change_the_block_test_calls_noise_is_kept() {
+        // Faint column bands flip dHash bits; 4 grey levels are under the block test's d_min.
+        let plain = ramp_jpeg(0, None, 0);
+        let banded = ramp_jpeg(0, None, 4);
+        let (ha, _, _) = dhash::of_encoded(&plain).unwrap();
+        let (hb, _, _) = dhash::of_encoded(&banded).unwrap();
+        assert!(dhash::hamming(ha, hb) > 0);
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = 0;
+            c.dedup_hamming = 0;
+        });
+        let mut st = store();
+        st.handle(with_image(&s, positive("a", "r1", t(0)), plain));
+        let out = st.handle(with_image(&s, positive("a", "r2", t(5)), banded.clone()));
+        let info = sidecar(&tmp.0, &out).dedup.unwrap();
+        assert_eq!(info.decided_by, DedupInfo::DHASH, "{info:?}");
+        // The block test alone would call it a duplicate.
+        let refs = &st.recent["a"];
+        let t0 = refs[0].thumb.as_ref().unwrap();
+        let t1 = refs[1].thumb.as_ref().unwrap();
+        let v = blockdiff::verdict_with(t1, t0, Scene::Day, None, &blockdiff::Params::COLLECTOR);
+        assert!(!v.different, "{v:?}");
+    }
+
+    #[test]
+    fn a_reference_of_another_scene_never_matches_in_both_mode() {
+        for mode in [DedupMode::Both, DedupMode::Dhash] {
+            let tmp = Tmp::new();
+            let s = settings(&tmp.0, |c| {
+                c.buckets.positive.per_camera_min_interval_s = 0;
+                c.dedup_mode = mode;
+            });
+            let mut st = store();
+            let img = ramp_jpeg(150, None, 0);
+            st.handle(with_image(
+                &s,
+                scene_frame("a", "r1", t(0), "day"),
+                img.clone(),
+            ));
+            let out = st.handle(with_image(
+                &s,
+                scene_frame("a", "r2", t(5), "ir"),
+                img.clone(),
+            ));
+            if mode == DedupMode::Dhash {
+                // The old rule compares across scenes.
+                assert_eq!(out, Handled::Dropped(Dropped::Dup));
+            } else {
+                let info = sidecar(&tmp.0, &out).dedup.unwrap();
+                assert_eq!(info.decided_by, DedupInfo::UNCHECKED, "{info:?}");
+                // Its own scene's reference now matches.
+                assert_eq!(
+                    st.handle(with_image(&s, scene_frame("a", "r3", t(6), "ir"), img)),
+                    Handled::Dropped(Dropped::Dup)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_thumbnail_cap_evicts_the_oldest_and_only_ever_keeps_more() {
+        assert_eq!(DEDUP_THUMB_BYTES / blockdiff::THUMB_CELLS, 910);
+        // One reference: its struct plus one thumbnail on the heap.
+        assert!(
+            std::mem::size_of::<Reference>() <= 96,
+            "{}",
+            std::mem::size_of::<Reference>()
+        );
         let tmp = Tmp::new();
         let s = settings(&tmp.0, |c| c.buckets.positive.per_camera_min_interval_s = 0);
         let mut st = store();
-        assert!(matches!(
-            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
-            Handled::Saved { .. }
-        ));
+        st.thumb_cap = 2 * blockdiff::THUMB_CELLS;
+        let img = ramp_jpeg(150, None, 0);
+        for (i, cam) in ["a", "b", "c"].into_iter().enumerate() {
+            let out = st.handle(with_image(&s, positive(cam, cam, t(i as u64)), img.clone()));
+            assert!(matches!(out, Handled::Saved { .. }));
+            assert!(st.thumb_bytes() <= st.thumb_cap);
+        }
+        let thumb = |cam: &str| st.recent[cam][0].thumb.as_ref().map(Thumb::heap_bytes);
+        assert_eq!(thumb("a"), None, "the oldest lost its thumbnail");
+        assert_eq!(thumb("b"), Some(blockdiff::THUMB_CELLS));
+        assert_eq!(thumb("c"), Some(blockdiff::THUMB_CELLS));
+        // Camera a's reference keeps its hash but cannot confirm a drop any more: kept.
+        let out = st.handle(with_image(&s, positive("a", "a2", t(10)), img.clone()));
+        let info = sidecar(&tmp.0, &out).dedup.unwrap();
+        assert_eq!(info.decided_by, DedupInfo::UNCHECKED);
+        // Camera c's still can.
         assert_eq!(
-            st.handle(frame(&s, positive("a", "r2", t(5)), 1)),
+            st.handle(with_image(&s, positive("c", "c2", t(11)), img)),
             Handled::Dropped(Dropped::Dup)
         );
-        // Another scene of the same camera is kept; the same picture on another camera too.
+        // Forgetting a camera frees its thumbnails.
+        let before = st.thumb_bytes();
+        st.forget(&["c".to_string()]);
+        assert!(st.thumb_bytes() < before);
+    }
+
+    /// A minute of rain-like look-alikes at 1 fps (dHash alike, each with a new blob the block test
+    /// sees) on a bucket that skips the dedup: at most the cap is saved, in both modes; a
+    /// `positive` look-alike the block test calls different is still kept.
+    #[test]
+    fn a_storm_of_block_different_look_alikes_is_capped_like_dhash_mode() {
+        for mode in [DedupMode::Both, DedupMode::Dhash] {
+            let tmp = Tmp::new();
+            let s = settings(&tmp.0, |c| {
+                c.buckets.positive.per_camera_min_interval_s = 0;
+                c.dedup_mode = mode;
+            });
+            let mut st = store();
+            let mut saved = 0;
+            for k in 0..60u32 {
+                let img = ramp_jpeg(
+                    150,
+                    Some((20 + (k % 12) * 50, 30 + (k / 12) * 60, 24, 70)),
+                    0,
+                );
+                let rid = format!("n{k}");
+                if matches!(
+                    st.handle(with_image(&s, near("a", &rid, t(u64::from(k))), img)),
+                    Handled::Saved { .. }
+                ) {
+                    saved += 1;
+                }
+            }
+            assert!(
+                saved <= 1 + DEDUP_SKIPS_PER_CAMERA,
+                "{mode:?}: {saved} saved in a minute"
+            );
+            assert!(saved > DEDUP_SKIPS_PER_CAMERA / 2, "{mode:?}: {saved}");
+            let img = ramp_jpeg(150, Some((600, 300, 24, 70)), 0);
+            let out = st.handle(with_image(&s, positive("a", "p", t(59)), img));
+            assert_eq!(
+                matches!(out, Handled::Saved { .. }),
+                mode == DedupMode::Both,
+                "{mode:?}: {out:?}"
+            );
+        }
+    }
+
+    /// One reference must pass both tests: dHash matching reference A and the block test matching
+    /// reference B is no duplicate.
+    #[test]
+    fn both_tests_must_pass_on_the_same_reference() {
+        let plain = Thumb::of_encoded(&ramp_jpeg(150, None, 0)).unwrap().0;
+        let blob = Thumb::of_encoded(&ramp_jpeg(150, Some((300, 150, 24, 70)), 0))
+            .unwrap()
+            .0;
+        let hash = 0x0123_4567_89ab_cdef_u64;
+        let refs: VecDeque<Reference> = [
+            // A: the same dHash, but the block test sees the blob.
+            (hash, blob),
+            // B: the block test finds nothing, but dHash is far.
+            (!hash, plain.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(k, (h, th))| Reference {
+            at: t(k as u64),
+            hash: h,
+            scene: Scene::Day,
+            thumb: Some(th),
+        })
+        .collect();
+        let c = dedup_check(&refs, hash, Some(&plain), Scene::Day, 6, DedupMode::Both);
+        assert!(!c.duplicate && c.look_alike, "{c:?}");
+        assert_eq!(c.info.decided_by, DedupInfo::BLOCKDIFF);
+        assert_eq!(c.info.nearest_hamming, Some(0));
+        // `nearest_hamming` is the minimum over every reference, also when one confirms.
+        let mut refs = refs;
+        refs.push_back(Reference {
+            at: t(5),
+            hash: hash ^ 0b111,
+            scene: Scene::Day,
+            thumb: Some(plain.clone()),
+        });
+        let c = dedup_check(&refs, hash, Some(&plain), Scene::Day, 6, DedupMode::Both);
+        assert!(c.duplicate);
+        assert_eq!(c.info.nearest_hamming, Some(0));
+        assert!(
+            c.info.block_largest_blob.is_some(),
+            "the confirming verdict is recorded"
+        );
+    }
+
+    #[test]
+    fn the_night_interval_applies_before_the_dedup() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let mut st = store();
+        let empty_ir = |rid: &str, at: u64| {
+            let mut d = base("n", rid, t(at));
+            d.record.scene = "ir".into();
+            d
+        };
+        let img = ramp_jpeg(150, None, 0);
         assert!(matches!(
-            st.handle(frame(&s, positive("a", "r3", t(6)), 7)),
+            st.handle(with_image(&s, empty_ir("r1", 0), img.clone())),
             Handled::Saved { .. }
         ));
-        assert!(matches!(
-            st.handle(frame(&s, positive("b", "r4", t(6)), 1)),
-            Handled::Saved { .. }
-        ));
-        // Past the window the same picture is saved again.
-        let later = t(DEDUP_WINDOW.as_secs() + 10);
-        assert!(matches!(
-            st.handle(frame(&s, positive("a", "r5", later), 1)),
-            Handled::Saved { .. }
-        ));
-        assert_eq!(st.summary.frames, 4);
+        // Inside the 120 s night interval: the rate limit, before any dedup.
+        assert_eq!(
+            st.handle(with_image(&s, empty_ir("r2", 60), img.clone())),
+            Handled::Dropped(Dropped::Rate)
+        );
+        // Past it: now the dedup decides (the same picture).
+        assert_eq!(
+            st.handle(with_image(&s, empty_ir("r3", 130), img)),
+            Handled::Dropped(Dropped::Dup)
+        );
+    }
+
+    /// The dedup's cost per frame on a 2688 x 1520 frame against 32 references that all pass dHash
+    /// and all differ by the block test (the worst case: every one is compared). A measurement:
+    /// prints, runs only with `BOP_DEDUP_BENCH` set (debug numbers are slow; use `--release` for real
+    /// ones).
+    #[test]
+    #[ignore = "a measurement: set BOP_DEDUP_BENCH"]
+    fn dedup_cost_per_frame() {
+        if std::env::var_os("BOP_DEDUP_BENCH").is_none() {
+            return;
+        }
+        let (w, h) = (2688usize, 1520usize);
+        let luma = |blob_x: usize| -> Vec<u8> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let v = 40 + x * 150 / w + ((x / 8 + y / 8) % 3);
+                    let blob = (blob_x..blob_x + 60).contains(&x) && (700..760).contains(&y);
+                    (v + if blob { 60 } else { 0 }) as u8
+                })
+                .collect()
+        };
+        let img = |blob_x: usize| {
+            let l = luma(blob_x);
+            let rgb = l.iter().flat_map(|&v| [v, v, v]).collect();
+            let img = RgbImage {
+                width: w as u32,
+                height: h as u32,
+                rgb,
+            };
+            crate::image::encode_jpeg(&img, 90).unwrap()
+        };
+        let mut refs = VecDeque::new();
+        for k in 0..DEDUP_KEEP {
+            let l = luma(100 + k * 70);
+            refs.push_back(Reference {
+                at: t(k as u64),
+                hash: dhash::of_luma(&l, w, h),
+                scene: Scene::Ir,
+                thumb: Thumb::of_luma(&l, w, h),
+            });
+        }
+        let new = img(2500);
+        let runs = 10;
+        let (mut prep, mut check) = (Vec::new(), Vec::new());
+        for _ in 0..runs {
+            let t0 = Instant::now();
+            let (l, lw, lh) = dhash::luma_of_encoded(&new).unwrap();
+            let hash = dhash::of_luma(&l, lw, lh);
+            let thumb = Thumb::of_luma(&l, lw, lh);
+            let t1 = Instant::now();
+            let c = dedup_check(&refs, hash, thumb.as_ref(), Scene::Ir, 6, DedupMode::Both);
+            let t2 = Instant::now();
+            assert!(!c.duplicate);
+            assert_eq!(c.info.decided_by, DedupInfo::BLOCKDIFF);
+            prep.push((t1 - t0).as_secs_f64() * 1e3);
+            check.push((t2 - t1).as_secs_f64() * 1e3);
+        }
+        prep.sort_by(f64::total_cmp);
+        check.sort_by(f64::total_cmp);
+        eprintln!(
+            "dedup cost, median of {runs}: decode + dHash + thumbnail {:.1} ms, check against {} \
+             look-alike references {:.1} ms ({:.2} ms each)",
+            prep[runs / 2],
+            DEDUP_KEEP,
+            check[runs / 2],
+            check[runs / 2] / DEDUP_KEEP as f64
+        );
+        eprintln!(
+            "a reference: {} bytes + a {}-byte thumbnail",
+            std::mem::size_of::<Reference>(),
+            blockdiff::THUMB_CELLS
+        );
     }
 
     #[test]

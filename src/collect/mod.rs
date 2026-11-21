@@ -9,17 +9,18 @@
 //! re-encode) to [`submit`]: a `try_send` into a bounded channel. A full channel drops the
 //! frame and counts `dataset_dropped_total{reason="queue_full"}`; the inference thread never
 //! waits and the reply is never delayed. One collector thread ([`store`]) decides the buckets
-//! ([`record::decide`]), applies sampling, per-camera rate limits and dHash dedup, writes the
-//! files atomically, maintains the per-day `index.jsonl` and the in-memory [`layout::Summary`]
+//! ([`record::decide`]), applies sampling, per-camera rate limits and the dHash + block-diff
+//! dedup ([`blockdiff`]; both must agree), writes the files atomically, maintains the per-day `index.jsonl` and the in-memory [`layout::Summary`]
 //! the Collect tab shows, applies the caps through [`crate::retention::prune_dataset`] and
 //! stops on low free space or a full disk until space is back. [`health`] turns its counts into
 //! what the pages say.
 //!
 //! The thread runs at the normal priority: the per-thread below-normal priority helper would
 //! live in `backend/priority.rs` (the only place `unsafe` is allowed) and does not exist yet.
-//! Its work is bounded by the rate limits: the dHash decode (grayscale JPEG) and the writes
-//! only happen for frames that passed them.
+//! Its work is bounded by the rate limits: the luma decode (grayscale JPEG), the dHash, the block
+//! thumbnail and test, and the writes only happen for frames that passed them.
 
+pub mod blockdiff;
 pub mod config;
 pub mod dhash;
 pub mod health;
