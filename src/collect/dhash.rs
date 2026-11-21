@@ -2,13 +2,27 @@
 //! box-averaged down to 9 x 8 cells and bit `8 * row + col` is set when cell `col` is brighter
 //! than cell `col + 1` of the same row. Two frames of a still scene differ in a few bits; a
 //! moved object or another scene flips many. Pure, plus a grayscale JPEG decode for the
-//! collector thread ([`of_encoded`]).
+//! collector thread ([`of_encoded`], [`luma_of_encoded`]). The cell edges ([`cell_edges`]) are
+//! shared with the finer near-duplicate test of [`super::blockdiff`].
 
 use anyhow::{Result, anyhow};
 
 /// Columns of the downscale (one more than the bits per row).
 const COLS: usize = 9;
 const ROWS: usize = 8;
+
+/// The pixel ranges `[a, b)` of `cells` equal cells along a side of `n > 0` pixels: edges at
+/// `floor(i * n / cells)`; when `n < cells`, pixels repeat so every cell has at least one. Shared
+/// with [`super::blockdiff::Thumb`].
+pub fn cell_edges(n: usize, cells: usize) -> Vec<(usize, usize)> {
+    (0..cells)
+        .map(|i| {
+            let a = i * n / cells;
+            let b = ((i + 1) * n / cells).max(a + 1).min(n.max(1));
+            (a.min(n.saturating_sub(1)), b)
+        })
+        .collect()
+}
 
 /// dHash of a `w` x `h` 8-bit luma plane (`luma.len() >= w * h`). Each cell is the exact mean
 /// of its pixels (cell edges at `floor(i * w / 9)`); an image narrower than 9 or shorter than
@@ -17,17 +31,8 @@ pub fn of_luma(luma: &[u8], w: usize, h: usize) -> u64 {
     if w == 0 || h == 0 || luma.len() < w.saturating_mul(h) {
         return 0;
     }
-    let edges = |n: usize, cells: usize| -> Vec<(usize, usize)> {
-        (0..cells)
-            .map(|i| {
-                let a = i * n / cells;
-                let b = ((i + 1) * n / cells).max(a + 1).min(n.max(1));
-                (a.min(n - 1), b)
-            })
-            .collect()
-    };
-    let xs = edges(w, COLS);
-    let ys = edges(h, ROWS);
+    let xs = cell_edges(w, COLS);
+    let ys = cell_edges(h, ROWS);
     let mut cells = [[0f64; COLS]; ROWS];
     for (r, &(y0, y1)) in ys.iter().enumerate() {
         for (c, &(x0, x1)) in xs.iter().enumerate() {
@@ -58,19 +63,32 @@ pub fn of_luma(luma: &[u8], w: usize, h: usize) -> u64 {
 
 /// dHash of a packed RGB8 image (BT.601 luma).
 pub fn of_rgb(img: &crate::image::RgbImage) -> u64 {
-    let luma: Vec<u8> = img
-        .rgb
+    of_luma(&luma_of_rgb(img), img.width as usize, img.height as usize)
+}
+
+/// The BT.601 luma plane of a packed RGB8 image.
+pub fn luma_of_rgb(img: &crate::image::RgbImage) -> Vec<u8> {
+    img.rgb
         .as_chunks::<3>()
         .0
         .iter()
         .map(|[r, g, b]| crate::image::luma601(*r, *g, *b))
-        .collect();
-    of_luma(&luma, img.width as usize, img.height as usize)
+        .collect()
 }
 
-/// dHash and size of an encoded image: a JPEG is decoded straight to luma (no colour
-/// conversion), anything else through [`crate::image::decode`].
+/// dHash and size of an encoded image ([`luma_of_encoded`]).
 pub fn of_encoded(bytes: &[u8]) -> Result<(u64, u32, u32)> {
+    let (luma, w, h) = luma_of_encoded(bytes)?;
+    let (w32, h32) = (
+        u32::try_from(w).map_err(|_| anyhow!("width out of range"))?,
+        u32::try_from(h).map_err(|_| anyhow!("height out of range"))?,
+    );
+    Ok((of_luma(&luma, w, h), w32, h32))
+}
+
+/// The luma plane and size (`w`, `h`) of an encoded image: a JPEG is decoded straight to luma (no
+/// colour conversion), anything else through [`crate::image::decode`] and [`luma_of_rgb`].
+pub fn luma_of_encoded(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
     if bytes.starts_with(&[0xFF, 0xD8]) {
         use zune_core::bytestream::ZCursor;
         use zune_core::colorspace::ColorSpace;
@@ -81,15 +99,11 @@ pub fn of_encoded(bytes: &[u8]) -> Result<(u64, u32, u32)> {
             && let Some((w, h)) = d.dimensions()
             && luma.len() >= w * h
         {
-            let (w32, h32) = (
-                u32::try_from(w).map_err(|_| anyhow!("width out of range"))?,
-                u32::try_from(h).map_err(|_| anyhow!("height out of range"))?,
-            );
-            return Ok((of_luma(&luma, w, h), w32, h32));
+            return Ok((luma, w, h));
         }
     }
     let img = crate::image::decode(bytes)?;
-    Ok((of_rgb(&img), img.width, img.height))
+    Ok((luma_of_rgb(&img), img.width as usize, img.height as usize))
 }
 
 /// Bits that differ.

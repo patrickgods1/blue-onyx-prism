@@ -13,6 +13,7 @@ mod backend_cache;
 mod backend_cpu;
 mod backend_ort;
 mod config_disk_http;
+mod dedup_eval;
 mod enabled_models_http;
 mod families_http;
 mod formats_020;

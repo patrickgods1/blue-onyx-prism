@@ -119,6 +119,10 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
             .parse()
             .with_context(|| format!("dedup distance: '{v}' is not a whole number"))?;
     }
+    if let Some(v) = field(fields, "dedup_mode").filter(|v| !v.is_empty()) {
+        c.dedup_mode = crate::collect::config::DedupMode::parse(v)
+            .with_context(|| format!("dedup rule: '{v}' is not one of both, dhash"))?;
+    }
     if let Some(v) = field(fields, "dir") {
         c.dir = (!v.is_empty()).then(|| v.into());
     }
@@ -221,6 +225,7 @@ struct DatasetTemplate {
     max_gb: String,
     max_age_days: u32,
     dedup_hamming: u32,
+    dedup_mode: &'static str,
     near_margin: String,
     disabled: Option<String>,
     /// The folder's size and what the cap covers, in one sentence.
@@ -363,6 +368,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
         max_gb: clean(c.max_gb),
         max_age_days: c.max_age_days,
         dedup_hamming: c.dedup_hamming,
+        dedup_mode: c.dedup_mode.as_str(),
         near_margin: clean(c.buckets.near_margin()),
         disabled,
         disk_line,
@@ -630,6 +636,53 @@ mod tests {
         assert!(h.get("last_frame_at").is_some() && h.get("last_error_at").is_some());
         assert_eq!(v["usage"]["protected_frames"], 0);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_settings_form_sets_the_dedup_rule() {
+        use crate::collect::config::DedupMode;
+        let mut c = CollectConfig::default();
+        apply_form(&mut c, &parse_form(b"dedup_mode=dhash")).unwrap();
+        assert_eq!(c.dedup_mode, DedupMode::Dhash);
+        apply_form(&mut c, &parse_form(b"dedup_mode=")).unwrap();
+        assert_eq!(
+            c.dedup_mode,
+            DedupMode::Dhash,
+            "an empty field keeps the value"
+        );
+        apply_form(&mut c, &parse_form(b"dedup_mode=both")).unwrap();
+        assert_eq!(c.dedup_mode, DedupMode::Both);
+        let e = apply_form(&mut c, &parse_form(b"dedup_mode=blocks")).unwrap_err();
+        assert!(e.to_string().contains("dedup rule"), "{e}");
+        assert_eq!(c.dedup_mode, DedupMode::Both);
+    }
+
+    #[tokio::test]
+    async fn the_page_selects_the_configured_dedup_rule() {
+        use crate::collect::config::DedupMode;
+        for mode in [DedupMode::Both, DedupMode::Dhash] {
+            let dir = std::env::temp_dir().join(format!("bop-ds-{}", uuid::Uuid::new_v4()));
+            let d = dir.clone();
+            let state = test_state_with(move |c| {
+                c.collect.dir = Some(d);
+                c.collect.dedup_mode = mode;
+            });
+            let (_, page) = get_text(&state, "/train/collect").await;
+            let other = if mode == DedupMode::Both {
+                "dhash"
+            } else {
+                "both"
+            };
+            assert!(
+                page.contains(&format!("<option value=\"{}\" selected>", mode.as_str())),
+                "{mode:?}"
+            );
+            assert!(
+                page.contains(&format!("<option value=\"{other}\">")),
+                "{mode:?}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[tokio::test]
