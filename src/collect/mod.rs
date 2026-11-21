@@ -20,6 +20,7 @@
 //! Its work is bounded by the rate limits: the dHash decode (grayscale JPEG) and the writes
 //! only happen for frames that passed them.
 
+pub mod blockdiff;
 pub mod config;
 pub mod dhash;
 pub mod health;
