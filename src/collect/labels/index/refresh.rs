@@ -1,5 +1,12 @@
 //! The index's thread: the first build, then a look at the folder every minute, a walk of
-//! everything every 30 minutes, and the end of it all when nobody has asked for a while.
+//! everything every 30 minutes or at once when one is asked for ([`super::rescan`]), and the end
+//! of it all when nobody has asked for a while.
+//!
+//! A requested walk is never lost. The thread sets `full_running`, then takes `full_due`, then
+//! reads: a request before the take is in what that walk reads, one after it stays due and is the
+//! next walk. `full_running` goes after the swap, under [`HUB`] (so a query waiting in `settle`
+//! cannot miss the wake), and the request stays visible to answers all along
+//! ([`Index::full_wanted`]).
 //!
 //! A build publishes each day as it finishes, newest day first, so a query sees rows so far. A
 //! later walk works beside the rows, which keep serving, and swaps at the end. Every walk goes
@@ -51,6 +58,8 @@ impl Drop for ThreadDone {
         let index = &self.0;
         index.building.store(false, Ordering::Release);
         index.catching_up.store(false, Ordering::Release);
+        index.full_due.store(false, Ordering::SeqCst);
+        index.full_running.store(false, Ordering::SeqCst);
         let mut hub = HUB.lock_recover();
         let panicked = std::thread::panicking();
         if hub.of(index).is_some() {
@@ -86,7 +95,18 @@ pub(super) fn run(index: Arc<Index>) {
             }
             Wake::Pass => {}
         }
-        if last_full.elapsed() >= index.timing.full {
+        if index.full_due.load(Ordering::SeqCst) {
+            // Running first, then the request taken (the module's first lines).
+            index.full_running.store(true, Ordering::SeqCst);
+            index.full_due.store(false, Ordering::SeqCst);
+            index.pass(Pass::Full, &|| {});
+            {
+                let _hub = HUB.lock_recover();
+                index.full_running.store(false, Ordering::SeqCst);
+            }
+            CHANGED.notify_all();
+            last_full = Instant::now();
+        } else if last_full.elapsed() >= index.timing.full {
             index.pass(Pass::Full, &|| {});
             last_full = Instant::now();
         } else {
@@ -119,6 +139,10 @@ impl Index {
             let idle_left = t.idle.saturating_sub(self.idle_for());
             if idle_left.is_zero() {
                 return Wake::Idle;
+            }
+            // Asked for: no pause (set under the lock held here, so its wake is not missed).
+            if self.full_due.load(Ordering::SeqCst) {
+                return Wake::Pass;
             }
             let since = last_pass.elapsed();
             let left = if hub.stale(self) {
@@ -241,20 +265,29 @@ impl Index {
         self.done.store(rows - walking, Ordering::Release);
     }
 
+    /// Walk everything. Its progress (frames walked of the frames there are, the rows until the
+    /// lines are read) is what an answer shows while a [`super::rescan`] waits for it, or stale
+    /// days it took.
     fn pass_full(self: &Arc<Self>, before_swap: &dyn Fn()) {
         self.take_stale();
+        self.done.store(0, Ordering::Release);
+        self.total
+            .store(self.state.read_recover().rows(), Ordering::Release);
         self.begin_walk();
         let now = self.now();
         let queue = walk::read_queue(&self.dir, now);
         let days = walk::read_all_days(&self.dir, now);
         let (candidates, stats) = walk::candidates_of(queue.lines, days);
+        self.total.store(candidates.len() as u64, Ordering::Release);
         let threads = parallel::walk_threads_over(candidates.len());
         let days = days_of(candidates);
         let walker = Walker::new(&self.dir);
         let shards =
             parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
                 let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
-                Some(self.walk_shard(walker.clone(), key.clone(), day))
+                let shard = self.walk_shard(walker.clone(), key.clone(), day);
+                self.done.fetch_add(day.len() as u64, Ordering::AcqRel);
+                Some(shard)
             });
         before_swap();
         self.swap(Swap {

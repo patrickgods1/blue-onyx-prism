@@ -1,6 +1,7 @@
 //! The Review tab's files and settings: `POST /v1/review/export` (YOLO / COCO / X-AnyLabeling /
 //! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/folder` (the
-//! folder under review, `collect.review_dir`), `POST /v1/review/classes` and
+//! folder under review, `collect.review_dir`), `POST /v1/review/rescan` (read that folder again
+//! and name the images no frame of the layout names, [`rescan`]), `POST /v1/review/classes` and
 //! `GET /v1/review/class-catalog`, with the checks of a folder a client names
 //! ([`allowed_folder`]).
 //!
@@ -20,6 +21,7 @@ use crate::collect::labels::heldout::HeldoutPolicy;
 use crate::collect::labels::{self, bulk, xany};
 use crate::server::side_jobs::{self, SideKind};
 use crate::server::{browse, save_config};
+use crate::sync::LockExt as _;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
@@ -410,6 +412,95 @@ pub(in crate::server) async fn folder(
                 format!("Folder not changed: {e:#}"),
             ),
         }
+    })
+    .await)
+}
+
+/// The folders being rescanned: a second rescan of one answers 409 while the first runs.
+static RESCANNING: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A rescan of its folder running; the folder leaves [`RESCANNING`] when this goes, panic
+/// included.
+pub(super) struct Rescanning(PathBuf);
+
+impl Rescanning {
+    /// The rescan of `dir`, None while another one of it runs.
+    pub(super) fn start(dir: &std::path::Path) -> Option<Self> {
+        RESCANNING
+            .lock_recover()
+            .insert(dir.to_path_buf())
+            .then(|| Self(dir.to_path_buf()))
+    }
+}
+
+impl Drop for Rescanning {
+    fn drop(&mut self) {
+        RESCANNING.lock_recover().remove(&self.0);
+    }
+}
+
+/// `POST /v1/review/rescan` (no fields: an empty body or any JSON, such as the page's `{}`): read
+/// the folder under review again now, for what changed outside this process. The review index
+/// walks everything ([`labels::index::rescan`]; `indexed: false` when the folder has none, and
+/// the next Next walks the files anyway), and the caches the Review and Train pages show beside
+/// it are dropped: the reviewer's history ([`labels::repeats::invalidate`]), the parked-spot table
+/// of the Recommended order ([`super::steer::forget_spots`]), the Train strip's counts
+/// ([`crate::server::train_area::forget_tally`]) and the Refine tab's (open suggestions, coverage,
+/// size floor, static spots). Then the images in the folder that no frame of the layout names
+/// ([`labels::strays::find`]): `strays: {count, sample, unreadable}`. Writes nothing to the folder.
+/// 503 with `folder_missing` when the folder is not there.
+pub(in crate::server) async fn rescan(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Answer {
+    if !body.as_ref().is_ok_and(Bytes::is_empty) {
+        let _: serde_json::Value = json_body(&headers, body)?;
+    }
+    Ok(blocking(move || {
+        let (dir, _, _) = context(&state);
+        if let Some(message) = folder_problem(&state, &dir) {
+            return folder_unavailable(message);
+        }
+        let Some(_one) = Rescanning::start(&dir) else {
+            return fail(
+                StatusCode::CONFLICT,
+                "A rescan is already running; its counts show on the page as it goes.",
+            );
+        };
+        let start = std::time::Instant::now();
+        let indexed = labels::index::rescan(&dir);
+        labels::repeats::invalidate(&dir);
+        super::steer::forget_spots(&dir);
+        crate::server::train_area::forget_tally(&dir);
+        crate::server::refine::forget_counts();
+        crate::server::refine_coverage::forget();
+        crate::server::refine_floor::forget();
+        crate::server::refine_spots::forget();
+        let strays = labels::strays::find(&dir);
+        tracing::info!(
+            "review: rescan of {} asked ({}); {} image(s) no frame of the layout names, {} \
+             folder(s) not listable; {} ms",
+            dir.display(),
+            if indexed {
+                "the index reads everything again"
+            } else {
+                "no index, the next Next walks the files"
+            },
+            strays.count,
+            strays.unreadable,
+            start.elapsed().as_millis()
+        );
+        success(serde_json::json!({
+            "dir": dir,
+            "indexed": indexed,
+            "strays": {
+                "count": strays.count,
+                "sample": strays.sample,
+                "unreadable": strays.unreadable,
+            },
+        }))
     })
     .await)
 }

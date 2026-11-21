@@ -161,13 +161,16 @@ struct Cache {
     kept: Mutex<BTreeMap<String, Kept>>,
     /// One walk at a time: a second caller waits and finds the first one's answer.
     walking: Mutex<()>,
+    /// Bumped by [`Self::forget`] under `kept`'s lock: a walk that began before a drop answers
+    /// its caller and keeps nothing (it may have read the files before the change).
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// The process's walk answers.
 static CACHE: Cache = Cache::new();
 
 /// Drop every kept answer of the process (a label write changed what a walk finds).
-fn forget() {
+pub(super) fn forget() {
     CACHE.forget();
 }
 
@@ -181,11 +184,15 @@ impl Cache {
         Self {
             kept: Mutex::new(BTreeMap::new()),
             walking: Mutex::new(()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     fn forget(&self) {
-        self.kept.lock_recover().clear();
+        let mut kept = self.kept.lock_recover();
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        kept.clear();
     }
 
     /// [`compute`], kept [`KEEP_FOR`]; `stamp` names the checks on the queue: when one starts,
@@ -211,8 +218,13 @@ impl Cache {
         if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
             return k.value.clone();
         }
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         let value = Arc::new(compute(dir, classes, hidden));
         let mut map = self.kept.lock_recover();
+        // A drop since the walk began: what it found may be the files before a change.
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return value;
+        }
         map.retain(|k, v| *k != key && v.at.elapsed() < KEEP_FOR);
         while map.len() >= KEEP {
             let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {

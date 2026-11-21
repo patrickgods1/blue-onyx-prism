@@ -304,7 +304,7 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     a non-pool frame; an unknown value round-trips (`ReviewPick::Other`). Training scores them apart (`heldout:random`).
   - Index (`labels/index/`): only `GET /v1/review/next`, for folders of `MIN_INDEXED_FRAMES` or more, answers from it;
     it must equal `queue::build` (`index/tests.rs` `equivalence` over the filter grid; review route tests run both ways,
-    `both_ways!`). `index::written` (pushed only under the label write lock) makes the next query re-read a file;
+    `both_ways!`). `index::written` (pushed only under the label write lock) makes the next query re-read a file; `index::rescan` (Rescan folder, `POST /v1/review/rescan`) asks a full pass now (never lost, coalesced; answers carry `indexing` until its swap) and `strays::find` lists images no frame names;
     `INDEX_CEILING_BYTES`, then walking. Walks use `layout::Walker` and `crate::parallel::map_all`; label writes stay on
     one thread. Its row sizes are asserted in tests (keep them compact).
   - Repeats (`repeats.rs`), rejected spots (`spots.rs`, `triage::apply_spots`) and parked spots (`<review_dir>/spots/`,

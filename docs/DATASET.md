@@ -444,6 +444,22 @@ The page works on the dataset folder, or on another folder in the same layout (a
 The queue, the label saves, the exports, the X-AnyLabeling import and auto-label runs then use that
 folder; the collector and the Collect tab keep `collect.dir`.
 
+*Rescan folder* (beside *Review this folder*, `POST /v1/review/rescan`) reads the folder under review
+again now, for what changed outside the app: a label file or sidecar edited in place (which a folder
+of 2,000 frames or more otherwise shows only after its 30-minute walk of everything), frames another
+process added, a day folder copied in. The review index walks every frame while the rows it has keep
+serving, and the page shows "Indexing x of y" until that walk is in; the reviewer's history, the
+parked-spot table of the Recommended order and the Train strip's and Refine tab's counts are dropped
+and counted again. The frame on screen is opened again, unless it has unsaved edits (a later save of
+a file changed on disk is a conflict, as always). It then lists the **strays**: images in the
+folder that no frame of the layout names, so neither the queue nor an export can see them: a `.jpg`
+in a day folder with no `index.jsonl` or `review-queue.jsonl` line, another image type (`.png`,
+`.jpeg`, `.bmp`) there, or any image directly in the folder, a scene folder or a camera folder.
+Other subfolders (an export's `images/`, `refine/`, `spots/`) are not looked in, symlinks are not
+followed, and a folder that cannot be listed is counted as unreadable. The answer names up to five
+of them (sorted), the page the count and the first; **Import** is how outside images enter the layout. A rescan never writes, moves or deletes
+anything in the folder.
+
 ### Label file (version 1)
 
 ```json

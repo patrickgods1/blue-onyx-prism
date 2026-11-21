@@ -4557,6 +4557,8 @@
       return decodedImage(j.image_url).then(function (im) { return [j, im]; });
     }).then(function (got) {
       if (seq !== frameSeq) return;
+      // A reopen (Rescan) never replaces edits begun while it fetched.
+      if (nav === 'reopen' && dirty) return;
       var j = got[0];
       if (cur && cur.frame !== j.frame) {
         if (nav === 'back') fwdStack.push(cur.frame);
@@ -5828,6 +5830,72 @@
   });
   if ($('rv-folder-reset')) {
     $('rv-folder-reset').addEventListener('click', function () { setFolder(''); });
+  }
+
+  // Rescan: the server reads the folder again (new frames, label files changed outside the app);
+  // then the page refreshes without dropping unsaved edits.
+  function rescanMessage(box, j) {
+    box.textContent = '';
+    box.className = 'form-msg ok-text';
+    var dir = j.dir || '';
+    var first = document.createElement('div');
+    first.textContent = j.indexed
+      ? 'Rescanned ' + dir + ': reading it again, the counts update as it goes.'
+      : 'Rescanned ' + dir + '.';
+    box.appendChild(first);
+    var st = j.strays || {};
+    if (st.count > 0) {
+      var line = document.createElement('div');
+      var e = st.sample && st.sample[0] ? ', e.g. ' + st.sample[0] : '';
+      line.appendChild(document.createTextNode(st.count + (st.count === 1 ? ' image here is' : ' images here are') +
+        ' not in the dataset layout (no index line)' + e + '. Add them with '));
+      var a = document.createElement('a');
+      a.href = '/train/import';
+      a.textContent = 'Import';
+      line.appendChild(a);
+      line.appendChild(document.createTextNode('.'));
+      box.appendChild(line);
+    }
+    if (st.unreadable > 0) {
+      var u = document.createElement('div');
+      u.textContent = st.unreadable + (st.unreadable === 1 ? ' folder' : ' folders') + ' could not be read.';
+      box.appendChild(u);
+    }
+  }
+  // After a rescan: counts and lists again, the frame on screen and its edits kept.
+  function refreshAfterRescan() {
+    var frame = cur ? cur.frame : null;   // `cur` changes while this runs
+    if (!frame) return loadNext();
+    if (dirty) return loadNext(null, null, true, frame);
+    // A frame gone from disk: the queue's next, unless edits began meanwhile (they stay).
+    return loadFrame(frame, 'reopen').then(function () {
+      return loadNext(null, null, true, frame);
+    }, function () { return dirty ? loadNext(null, null, true, frame) : loadNext(); });
+  }
+  var rescanBtn = $('rv-rescan');
+  if (rescanBtn) {
+    rescanBtn.addEventListener('click', function () {
+      if (rescanBtn.disabled) return;
+      var label = rescanBtn.textContent;
+      var box = $('rv-folder-msg');
+      var restore = function () {
+        rescanBtn.disabled = false;
+        rescanBtn.removeAttribute('aria-busy');
+        rescanBtn.textContent = label;
+      };
+      rescanBtn.disabled = true;
+      rescanBtn.setAttribute('aria-busy', 'true');
+      rescanBtn.textContent = 'Rescanning\u2026';
+      box.textContent = 'Rescanning\u2026';
+      box.className = 'form-msg';
+      postJson('/v1/review/rescan', {}).then(function (j) {
+        rescanMessage(box, j);
+        return refreshAfterRescan();
+      }).catch(function (e) {
+        box.textContent = e.message;
+        box.className = 'form-msg error-text';
+      }).then(restore);
+    });
   }
 
   // ---- class pickers ------------------------------------------------------------------------
