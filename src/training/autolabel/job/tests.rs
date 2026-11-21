@@ -114,6 +114,8 @@ struct LabelFake {
     saved_during_run: Vec<(PathBuf, LabelFile)>,
     /// Label files that cannot be written from the moment the script runs ([`unwritable`]).
     broken_during_run: Vec<PathBuf>,
+    /// Night frames whose enhanced copy failed (`"enhanced": false` on their line).
+    not_enhanced: Vec<String>,
 }
 
 /// Make [`labels::update`] fail on the label file at `path`, on every OS, as a full disk or a lost
@@ -184,8 +186,21 @@ impl CommandRunner for LabelFake {
                  "species_scores": {"raccoon": 0.6, "cat": 0.4}},
                 {"label": "unicorn", "bbox": [1, 1, 5, 5], "score": 0.9, "agree": true, "sources": {}}
             ]));
-            let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48,
-                                          "boxes": boxes, "ms": {"gdino": 10}});
+            let mut line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48,
+                                              "boxes": boxes, "ms": {"gdino": 10}});
+            // The night extras on night and IR frames, as the script reports them.
+            let night = f["scene"] == "ir" || f["scene"] == "night";
+            if cmd.args.iter().any(|a| a == "--night-enhance") {
+                let done = night && !self.not_enhanced.iter().any(|e| f["frame"] == e.as_str());
+                line["enhanced"] = done.into();
+                if done {
+                    line["enhanced_boxes"] = serde_json::json!({"gdino": 1, "rfdetr": 0});
+                }
+            }
+            if night && cmd.args.iter().any(|a| a == "--mdv6") {
+                line["mdv6"] =
+                    serde_json::json!({"votes": 1, "added": 1, "dropped": 0, "guesses": 1});
+            }
             text.push_str(&line.to_string());
             text.push('\n');
             on_line(&format!(
@@ -284,6 +299,9 @@ fn labelers_propose_triaged_pending_boxes_and_queue_the_frames() {
         assert!(cmd.contains(flag), "{flag}: {cmd}");
     }
     assert!(cmd.contains("rf-detr-large-2026.pth"), "{cmd}");
+    assert!(cmd.contains("--night-enhance clahe"), "{cmd}");
+    assert!(!cmd.contains("--mdv6"), "MegaDetector is opt-in: {cmd}");
+    assert_eq!(rep["night_enhance"], "clahe", "{rep}");
     // The label files: pending auto boxes with their triage; IR frames, so the car is accepted
     // (vehicles are not night-reviewed) and the raccoon reviewed.
     let dir = t.0.join("dataset");
@@ -315,7 +333,11 @@ fn labelers_propose_triaged_pending_boxes_and_queue_the_frames() {
         assert!(rac.auto.why.iter().any(|w| w.contains("at night")));
         assert_eq!(rac.auto.species_scores.get("raccoon"), Some(&0.6));
         let run = f.auto_run.as_ref().unwrap();
-        assert_eq!(run.labeler, rep["labeler"].as_str().unwrap());
+        // IR frames: the marker names the enhanced copy the labelers also looked at.
+        assert_eq!(
+            run.labeler,
+            format!("{} + night-clahe", rep["labeler"].as_str().unwrap())
+        );
         assert!(run.at.starts_with("20"), "{run:?}");
     }
     // Queued for review once each (the import queued them already).
@@ -1458,6 +1480,184 @@ fn script_flags_follow_the_run_options() {
         "{a:?}"
     );
     assert!(has(&a, "--prefetch"), "{a:?}");
+    // The night extras: the enhanced copy by default, MegaDetector with its weights when asked.
+    let a = argv(&|_| {});
+    assert_eq!(
+        after(&a, "--night-enhance").as_deref(),
+        Some("clahe"),
+        "{a:?}"
+    );
+    assert!(!has(&a, "--mdv6"), "{a:?}");
+    let a = argv(&|r| {
+        r.night_enhance = Some(crate::model::enhance::Preprocess::None);
+        r.mdv6 = true;
+        r.mdv6_threshold = 0.25;
+    });
+    assert!(!has(&a, "--night-enhance"), "{a:?}");
+    let weights = after(&a, "--mdv6").unwrap();
+    assert!(
+        weights
+            .replace('\\', "/")
+            .ends_with("export-weights/mdv6-yolov9-c/MDV6-yolov9-c.pt"),
+        "{weights}"
+    );
+    assert_eq!(
+        after(&a, "--mdv6-threshold").as_deref(),
+        Some("0.25"),
+        "{a:?}"
+    );
+    assert!(
+        fake.inner
+            .fetched
+            .lock()
+            .unwrap()
+            .contains(&"model:mdv6-yolov9-c".to_string()),
+        "the weights are fetched"
+    );
+}
+
+#[test]
+fn a_night_run_records_its_extras_and_never_accepts_megadetector_alone() {
+    let t = tmp("night-extras");
+    let rels = frames(&t.0, 2, true);
+    let cfg = config(&t.0);
+    let fake = LabelFake {
+        boxes: Some(serde_json::json!([
+            {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.82, "agree": true,
+             "sources": {"gdino": 0.7, "rfdetr": 0.94, "mdv6": 0.9}},
+            {"label": "raccoon", "bbox": [35, 20, 60, 46], "score": 0.92, "agree": true,
+             "sources": {"mdv6": 0.92}, "animal_guess": true,
+             "species_scores": {"raccoon": 0.41, "cat": 0.3}}
+        ])),
+        ..LabelFake::default()
+    };
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.mdv6 = true;
+    let job = plan_autolabel(&cfg, req, &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["night_enhance"], "clahe", "{rep}");
+    assert_eq!(rep["mdv6"], "mdv6-yolov9-c at 0.2", "{rep}");
+    assert_eq!(rep["frames_enhanced"], 2, "{rep}");
+    assert_eq!(rep["enhanced_boxes"]["gdino"], 2, "{rep}");
+    assert_eq!(
+        (&rep["mdv6_votes"], &rep["mdv6_added"], &rep["mdv6_guesses"]),
+        (&2.into(), &2.into(), &2.into()),
+        "{rep}"
+    );
+    assert!(
+        out.summary
+            .contains("2 night or IR frames also labelled on a copy enhanced by clahe (2 boxes"),
+        "{}",
+        out.summary
+    );
+    assert!(
+        out.summary.contains("MegaDetector: 2 votes"),
+        "{}",
+        out.summary
+    );
+    let dir = t.0.join("dataset");
+    for rel in &rels {
+        let f = labels_of(&dir, rel);
+        let marker = f.auto_run.as_ref().unwrap();
+        assert!(
+            marker.labeler.ends_with(" + mdv6-yolov9-c + night-clahe"),
+            "{marker:?}"
+        );
+        // The car the labelers agree on keeps their triage; MegaDetector's vote is in its labelers.
+        let car = f.boxes.iter().find(|b| b.label == "car").unwrap();
+        assert_eq!(car.auto.triage, Some(Triage::Accept));
+        assert!(car.auto.labelers.contains_key("mdv6"));
+        // The raccoon only MegaDetector found: review, whatever its score and `agree` say.
+        let rac = f.boxes.iter().find(|b| b.label == "raccoon").unwrap();
+        assert_eq!(rac.auto.triage, Some(Triage::Review));
+        assert!(
+            rac.auto
+                .why
+                .iter()
+                .any(|w| w.starts_with("animal? MegaDetector")),
+            "{:?}",
+            rac.auto.why
+        );
+        assert_eq!(rac.state, BoxState::Pending);
+    }
+    // The same run again skips them, and so does a run without MegaDetector: the marker covers it.
+    let mut again = AutolabelRequest::new(FrameFilter::default());
+    again.mdv6 = true;
+    let job = plan_autolabel(&cfg, again, &host()).unwrap();
+    assert_eq!(job.preview().unwrap().skipped_done, 2);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    assert_eq!(job.preview().unwrap().skipped_done, 2);
+    // A run with another enhancement labels them again.
+    let mut gamma = AutolabelRequest::new(FrameFilter::default());
+    gamma.night_enhance = Some(crate::model::enhance::Preprocess::Gamma(0.6));
+    let job = plan_autolabel(&cfg, gamma, &host()).unwrap();
+    assert_eq!(job.preview().unwrap().skipped_done, 0);
+}
+
+/// [`FakeDetector`] that writes label files (a reviewer's saves) while the model runs.
+struct ReopeningDetector {
+    dets: BTreeMap<String, Vec<Det>>,
+    rewrite: Vec<(PathBuf, LabelFile)>,
+}
+
+impl Detector for ReopeningDetector {
+    fn detect(
+        &self,
+        _: &Config,
+        _: &ModelConfig,
+        device: Option<&str>,
+        images: &[Image],
+        _: f32,
+        _: &AtomicBool,
+    ) -> Result<super::super::relabel::Detections> {
+        for (path, f) in &self.rewrite {
+            labels::write(path, f).unwrap();
+        }
+        Ok(super::super::relabel::Detections {
+            frames: images
+                .iter()
+                .map(|i| {
+                    (
+                        i.frame.clone(),
+                        self.dets.get(&i.frame).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            device: device.unwrap_or("openvino:cpu").to_string(),
+            cancelled: false,
+            load_s: None,
+        })
+    }
+}
+
+/// A frame whose enhancement failed in the script gets no `night-<mode>` in its marker, so the
+/// next run labels it again; the others are skipped.
+#[test]
+fn a_frame_whose_enhancement_failed_is_marked_without_it_and_labelled_again() {
+    let t = tmp("night-failed");
+    let rels = frames(&t.0, 2, true);
+    let cfg = config(&t.0);
+    let fake = LabelFake {
+        not_enhanced: vec![rels[0].clone()],
+        ..LabelFake::default()
+    };
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    assert_eq!(out.result["frames_enhanced"], 1, "{}", out.result);
+    let dir = t.0.join("dataset");
+    let failed = labels_of(&dir, &rels[0]).auto_run.unwrap().labeler;
+    let done = labels_of(&dir, &rels[1]).auto_run.unwrap().labeler;
+    assert!(!failed.contains("night-"), "{failed}");
+    assert!(done.ends_with(" + night-clahe"), "{done}");
+    let p = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host())
+        .unwrap()
+        .preview()
+        .unwrap();
+    assert_eq!(
+        (p.skipped_done, p.frames.clone()),
+        (1, vec![rels[0].clone()])
+    );
 }
 
 /// A SAM 3 run, past the plan's login gate (it looks at this machine's token).
@@ -2207,7 +2407,10 @@ mod missing {
             (&rels[4], car()),
             (&rels[5], car()),
         ]);
-        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let mut job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        // The reviewed frames only (`unreviewed_frames_take_the_model_as_a_labeler_...` has the
+        // others): rels[5] has no label file and must get none.
+        job.request.missing_unreviewed = false;
         // The preview walks the frames as the run does, the training record included.
         let p = job.preview().unwrap();
         assert_eq!(p.matched, 3, "{p:?}");
@@ -2271,6 +2474,186 @@ mod missing {
         let saved = labels::normalize(f, &classes, 64, 48, "2026-11-04T00:00:00.000Z").unwrap();
         assert_eq!(saved.training().count(), 2);
         assert_eq!(saved.disagreement, None);
+    }
+
+    #[test]
+    fn unreviewed_frames_take_the_model_as_a_labeler_unless_it_saw_them() {
+        let t = tmp("missing-unreviewed");
+        let rels = frames(&t.0, 5, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // rels[0]: no label file. rels[1]: a pending box of a labelers run, with its marker.
+        let mut open = reviewed(&[("car", CAR)]);
+        open.status = Status::Unreviewed;
+        open.boxes[0].state = BoxState::Pending;
+        open.boxes[0].source = Source::Auto;
+        open.boxes[0].origin = None;
+        open.boxes[0].auto.labelers.insert("gdino".into(), 0.41);
+        open.boxes[0].auto.triage = Some(Triage::Review);
+        open.auto_run = Some(labels::AutoRun {
+            at: "2026-11-01T00:00:00Z".into(),
+            labeler: "mm-gdino-tiny + rfdetr-large".into(),
+            classes: Vec::new(),
+        });
+        put(&dir, &rels[1], &open);
+        // rels[2]: validated on, rels[3]: trained on (both unreviewed), rels[4]: reviewed.
+        put(&dir, &rels[4], &reviewed(&[("car", CAR)]));
+        trained_on(&cfg, "20261031-2", &[&rels[3]]);
+        let data = crate::training::training_dir(&cfg)
+            .join("20261031-2")
+            .join("data");
+        let flat = flat_name(&layout::parse_rel(&rels[2]).unwrap());
+        std::fs::write(data.join("valid.txt"), format!("./images/s0-{flat}\n")).unwrap();
+        let car = || vec![det("car", 0.9, CAR)];
+        let detector = fake(&[
+            (&rels[0], car()),
+            (&rels[1], car()),
+            (&rels[2], car()),
+            (&rels[3], car()),
+            (&rels[4], vec![det("car", 0.9, CAR)]),
+        ]);
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        let rep = &out.result;
+        assert_eq!(rep["unreviewed_frames"], 2, "{rep}");
+        assert_eq!(rep["unreviewed_added"], 1, "{rep}");
+        assert_eq!(
+            rep["skipped_trained"], 2,
+            "trained on and validated on: {rep}"
+        );
+        assert!(
+            out.summary.contains("on 2 unreviewed frames"),
+            "{}",
+            out.summary
+        );
+        // The new frame: a pending auto box with the model as its labeler, and no marker.
+        let f = labels_of(&dir, &rels[0]);
+        assert_eq!(f.status, Status::Unreviewed);
+        assert_eq!(f.auto_run, None);
+        let b = f.boxes.iter().find(|b| b.source == Source::Auto).unwrap();
+        assert_eq!(b.state, BoxState::Pending);
+        assert!(b.auto.labelers.contains_key("IPcam-general"), "{b:?}");
+        // The labelers' box gains the model's vote; their marker stays.
+        let f = labels_of(&dir, &rels[1]);
+        assert_eq!(f.boxes.len(), 1);
+        assert!(f.boxes[0].auto.labelers.contains_key("IPcam-general"));
+        assert_eq!(f.auto_run, open.auto_run);
+        // Frames it saw get no file; the reviewed one takes the reviewed path (its car covers it).
+        assert!(!Frame::resolve(&dir, &rels[2]).unwrap().labels.exists());
+        assert!(!Frame::resolve(&dir, &rels[3]).unwrap().labels.exists());
+        assert_eq!(labels_of(&dir, &rels[4]).status, Status::Reviewed);
+        // Off: the unreviewed frames are not looked at.
+        let detector = fake(&[(&rels[0], car())]);
+        let mut job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        job.request.missing_unreviewed = false;
+        let before = bytes(&dir, &rels[0]);
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["unreviewed_frames"], 0, "{}", out.result);
+        assert_eq!(bytes(&dir, &rels[0]), before);
+    }
+
+    #[test]
+    fn reviewed_frames_keep_the_limit_and_unreviewed_ones_come_after_up_to_their_own_cap() {
+        let t = tmp("missing-caps");
+        let rels = frames(&t.0, 9, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // Three reviewed frames among nine; six unreviewed, more than the limit of 3.
+        for rel in [&rels[1], &rels[4], &rels[7]] {
+            put(&dir, rel, &reviewed(&[("car", CAR)]));
+        }
+        let detector = fake(&[]);
+        let job = plan(&cfg, "IPcam-general", "limit=3", detector.clone()).unwrap();
+        let p = job.preview().unwrap();
+        assert_eq!(
+            (p.taken, p.taken_unreviewed, p.taken_by_status.reviewed),
+            (9, 6, 3),
+            "every reviewed frame, then the unreviewed ones: {p:?}"
+        );
+        assert!(
+            p.summary
+                .contains("Of them 3 reviewed or sent back (limit 3), then 6 unreviewed"),
+            "{}",
+            p.summary
+        );
+        // The reviewed frames come first in the run's list.
+        let first: BTreeSet<&String> = p.frames.iter().take(3).collect();
+        assert_eq!(first, [&rels[1], &rels[4], &rels[7]].into_iter().collect());
+        // Their own cap.
+        let mut capped = plan(&cfg, "IPcam-general", "limit=3", detector.clone()).unwrap();
+        capped.request.missing_unreviewed_limit = 2;
+        let p = capped.preview().unwrap();
+        assert_eq!((p.taken, p.taken_unreviewed), (5, 2), "{p:?}");
+        let out = run_job(&capped, &LabelFake::default()).unwrap();
+        assert_eq!(
+            (
+                &out.result["taken_reviewed"],
+                &out.result["taken_unreviewed"]
+            ),
+            (&3.into(), &2.into()),
+            "{}",
+            out.result
+        );
+        assert!(
+            out.summary
+                .contains("(3 reviewed or sent back, 2 unreviewed)"),
+            "{}",
+            out.summary
+        );
+        // A limit below the reviewed frames cuts them, never for an unreviewed one.
+        let p = plan(&cfg, "IPcam-general", "limit=2", detector)
+            .unwrap()
+            .preview()
+            .unwrap();
+        assert_eq!(
+            (p.taken_by_status.reviewed, p.taken_unreviewed),
+            (2, 6),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_model_saw_never_takes_the_unreviewed_path_even_when_reopened_while_it_ran() {
+        let t = tmp("missing-reopen-race");
+        let rels = frames(&t.0, 2, false);
+        let dir = t.0.join("dataset");
+        let cfg = config(&t.0);
+        // Both reviewed (the reviewed path takes validation frames); the model validated on rels[0].
+        for rel in &rels {
+            put(&dir, rel, &reviewed(&[("car", CAR)]));
+        }
+        trained_on(&cfg, "20261031-3", &[]);
+        let data = crate::training::training_dir(&cfg)
+            .join("20261031-3")
+            .join("data");
+        let flat = flat_name(&layout::parse_rel(&rels[0]).unwrap());
+        std::fs::write(data.join("valid.txt"), format!("./images/s0-{flat}\n")).unwrap();
+        // While the model runs, a reviewer sends both back to unreviewed (no note).
+        let reopened = LabelFile {
+            status: Status::Unreviewed,
+            ..reviewed(&[("car", CAR)])
+        };
+        let detector = Arc::new(ReopeningDetector {
+            dets: rels
+                .iter()
+                .map(|r| (r.clone(), vec![det("person", 0.9, SPOT)]))
+                .collect(),
+            rewrite: rels
+                .iter()
+                .map(|r| (Frame::resolve(&dir, r).unwrap().labels, reopened.clone()))
+                .collect(),
+        });
+        let job = plan(&cfg, "IPcam-general", "", detector).unwrap();
+        assert_eq!(job.preview().unwrap().taken_by_status.reviewed, 2);
+        let out = run_job(&job, &LabelFake::default()).unwrap();
+        assert_eq!(out.result["unreviewed_frames"], 1, "{}", out.result);
+        // The validation frame keeps what the reviewer left, no box of the model's.
+        let saw = labels_of(&dir, &rels[0]);
+        assert_eq!((saw.status, saw.boxes.len()), (Status::Unreviewed, 1));
+        // The other one, now unreviewed, takes the model as a labeler.
+        let other = labels_of(&dir, &rels[1]);
+        assert_eq!(other.boxes.len(), 2, "{other:?}");
+        assert!(other.boxes[1].auto.labelers.contains_key("IPcam-general"));
     }
 
     #[test]
@@ -2424,7 +2807,10 @@ mod missing {
         )
         .unwrap();
         let out = run_job(&job, &LabelFake::default()).unwrap();
-        assert_eq!(out.result["frames"], 1);
+        // The limit is the reviewed frame's; the two unreviewed ones come after it, under their cap.
+        assert_eq!(out.result["taken_reviewed"], 1, "{}", out.result);
+        assert_eq!(out.result["taken_unreviewed"], 2, "{}", out.result);
+        assert_eq!(out.result["frames"], 3);
         assert_eq!(out.result["candidates"], 1);
     }
 
@@ -3112,8 +3498,7 @@ fn the_preview_takes_what_the_run_then_takes() {
     assert_eq!(p.skipped_done, 2, "{p:?}");
     assert_eq!(p.matched_by_status.unreviewed, 6, "{p:?}");
     assert_eq!(p.taken_by_status.unreviewed, 3, "{p:?}");
-    let labeler = job.run_labeler();
-    let sel = job.select(Some(&labeler), None).unwrap();
+    let sel = job.select(true, None).unwrap();
     let selected: Vec<String> = sel.frames.iter().map(|f| f.rel.clone()).collect();
     assert_eq!(selected, p.frames);
     assert_eq!(sel.skipped_done, p.skipped_done);
@@ -3351,7 +3736,7 @@ fn a_job_and_the_page_agree_on_an_overlap_of_an_unwanted_class() {
 
     let job = plan_autolabel(&cfg, request("status=reviewed,auto=overlaps"), &host()).unwrap();
     let selected: Vec<String> = job
-        .select(None, None)
+        .select(false, None)
         .unwrap()
         .frames
         .into_iter()

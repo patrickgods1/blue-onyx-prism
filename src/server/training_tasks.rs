@@ -219,10 +219,11 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 /// `threshold`, for the labelers `gpu` (`cuda:N`; empty or `auto` = the automatic pick) and, when
 /// `gdino` is `sam3`, `sam3_threshold` (empty = the default; ignored otherwise, so a stale value of
 /// a hidden field refuses nothing), and for a run with a model `device` (empty = the model's), `model_accept_score` (empty = off),
-/// `missing_only` (ticked = on); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
-/// `vlm_batch`, `prefetch` and `vlm_min_on` (ticked = on; then `vlm_min_score` applies) count
-/// only when the form posts `run_options` (the Train tab's card); without it (the Review
-/// page, older forms) they keep the request's defaults.
+/// `missing_only` (ticked = on); for the labelers `mdv6` (ticked = on) and `mdv6_threshold` (empty =
+/// the default); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
+/// `vlm_batch`, `prefetch`, `night_enhance`, `missing_unreviewed` and `vlm_min_on` (ticked = on; then
+/// `vlm_min_score` applies) count only when the form posts `run_options` (the Train tab's card);
+/// without it (the Review page, older forms) they keep the request's defaults.
 pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<AutolabelRequest> {
     let with_model = match field(f, "mode") {
         Some("labelers") => None,
@@ -258,6 +259,10 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         r.keep_on_cancel = field(f, "keep_on_cancel").is_some();
         r.vlm_batch = field(f, "vlm_batch").is_some();
         r.prefetch = field(f, "prefetch").is_some();
+        r.night_enhance = field(f, "night_enhance")
+            .is_some()
+            .then_some(crate::training::autolabel::night::DEFAULT_NIGHT_ENHANCE);
+        r.missing_unreviewed = field(f, "missing_unreviewed").is_some();
         r.vlm_min_score = if field(f, "vlm_min_on").is_some() {
             Some(
                 num(f, "vlm_min_score", "VLM minimum score")?
@@ -274,6 +279,12 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         r.missing_only = field(f, "missing_only").is_some();
     } else {
         r.gpu = field(f, "gpu").map(str::to_string);
+        r.mdv6 = field(f, "mdv6").is_some();
+        if r.mdv6
+            && let Some(t) = num(f, "mdv6_threshold", "MegaDetector threshold")?
+        {
+            r.mdv6_threshold = t;
+        }
         if r.sam3
             && let Some(t) = num(f, "sam3_threshold", "SAM 3 threshold")?
         {
@@ -904,6 +915,46 @@ mod tests {
         assert!(e.to_string().contains("is not cuda:N"), "{e:#}");
         assert!(autolabel_from_form(&form(&[("frames", "colour=red")])).is_err());
         assert!(autolabel_from_form(&form(&[("gdino", "off"), ("vlm", "off")])).is_err());
+    }
+
+    #[test]
+    fn autolabel_night_options_parse() {
+        use crate::training::autolabel::night;
+        // Without the card's run options: the request's defaults (the enhanced copy on, every
+        // unreviewed frame of a missing-labels run in), MegaDetector off.
+        let r = autolabel_from_form(&form(&[("rfdetr", "on"), ("siglip", "on")])).unwrap();
+        assert_eq!(r.night_enhance, Some(night::DEFAULT_NIGHT_ENHANCE));
+        assert!(r.missing_unreviewed && !r.mdv6);
+        // The card: unticked = off.
+        let r = autolabel_from_form(&form(&[("rfdetr", "on"), ("run_options", "1")])).unwrap();
+        assert_eq!(r.night_enhance, None);
+        assert!(!r.missing_unreviewed);
+        let r = autolabel_from_form(&form(&[
+            ("rfdetr", "on"),
+            ("siglip", "on"),
+            ("run_options", "1"),
+            ("night_enhance", "on"),
+            ("missing_unreviewed", "on"),
+            ("mdv6", "on"),
+            ("mdv6_threshold", "0.35"),
+        ]))
+        .unwrap();
+        assert_eq!(r.night_enhance, Some(night::DEFAULT_NIGHT_ENHANCE));
+        assert!(r.missing_unreviewed && r.mdv6);
+        assert!((r.mdv6_threshold - 0.35).abs() < 1e-6);
+        // The threshold field counts only with MegaDetector ticked; MegaDetector needs SigLIP 2.
+        let r = autolabel_from_form(&form(&[("rfdetr", "on"), ("mdv6_threshold", "0.9")])).unwrap();
+        assert!((r.mdv6_threshold - night::MDV6_THRESHOLD).abs() < 1e-6);
+        let e = autolabel_from_form(&form(&[("rfdetr", "on"), ("mdv6", "on")])).unwrap_err();
+        assert!(e.to_string().contains("SigLIP 2"), "{e:#}");
+        // A run with a model ignores it.
+        let m = autolabel_from_form(&form(&[
+            ("mode", "model"),
+            ("with_model", "x"),
+            ("mdv6", "on"),
+        ]))
+        .unwrap();
+        assert!(!m.mdv6);
     }
 
     #[test]
