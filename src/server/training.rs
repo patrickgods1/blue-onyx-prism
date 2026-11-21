@@ -5128,6 +5128,7 @@ pub(super) mod tests {
             ap_basis: None,
             person_free_frames: None,
             person_false_alerts: None,
+            recall_cells: Default::default(),
         });
         RunRecord {
             baseline: None,

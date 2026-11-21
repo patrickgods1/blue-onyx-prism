@@ -27,7 +27,7 @@ use super::dataset::{self, Prepared, SceneFilter};
 use super::preflight;
 use super::progress::{self, TrainEvent, TrainProgress};
 use super::recipe::TrainRecipe;
-use crate::benchmark::metrics::ApBasis;
+use crate::benchmark::metrics::{ApBasis, ClassRecall};
 use crate::model::ModelFamilyKind;
 use crate::resources::catalog::{self, Platform, Resource, TrainFamily};
 use crate::resources::export::train::{self as env, TrainLock, TrainPaths};
@@ -367,6 +367,50 @@ pub struct BenchSummary {
     pub person_free_frames: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_false_alerts: Option<usize>,
+    /// Recall per class on the held-out frames per scene, per camera and per camera in a scene
+    /// ([`super::bench::summarize`], from the held-out manifest's own tags only). Empty for runs
+    /// of older versions and without held-out frames.
+    #[serde(default, skip_serializing_if = "RecallCells::is_empty")]
+    pub recall_cells: RecallCells,
+}
+
+/// Recall per class of a trained model on its held-out frames, at the benchmark's threshold
+/// ([`BenchSummary::threshold`], IoU 0.5), each cell with its integer counts (`gt` objects,
+/// `missed` of them). Over every class of the model the held-out set scores (custom animals
+/// included), classes with objects only. JSON:
+///
+/// ```json
+/// {"by_scene": {"night": [{"class": "raccoon", "gt": 12, "missed": 5}],
+///               "all": [...]},
+///  "by_camera": {"back": [...]},
+///  "by_camera_scene": [{"camera": "back", "scene": "night", "classes": [...]}]}
+/// ```
+///
+/// `by_scene` is keyed `day` / `night` / `ir` / `all` (every held-out frame, `heldout:all`),
+/// `by_camera` by camera over every scene; `by_camera_scene` is a list because a camera name may
+/// hold any character (no joined key is unambiguous).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RecallCells {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_scene: BTreeMap<String, Vec<ClassRecall>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_camera: BTreeMap<String, Vec<ClassRecall>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub by_camera_scene: Vec<CameraSceneRecall>,
+}
+
+impl RecallCells {
+    pub fn is_empty(&self) -> bool {
+        self.by_scene.is_empty() && self.by_camera.is_empty() && self.by_camera_scene.is_empty()
+    }
+}
+
+/// The recall cells of one camera in one scene ([`RecallCells::by_camera_scene`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CameraSceneRecall {
+    pub camera: String,
+    pub scene: String,
+    pub classes: Vec<ClassRecall>,
 }
 
 /// The score on a tagged subset of the held-out frames ([`BenchSummary::random`]), from the
@@ -1656,7 +1700,14 @@ impl Finish<'_> {
                 &job.run_dir,
                 cancel,
             ) {
-                Ok(b) => b,
+                // Its recall cells are read by nothing (the Review queue steers by the trained
+                // model's): kept out of `runs.json`.
+                Ok(b) => b.map(|mut b| {
+                    if let Some(s) = b.summary.as_mut() {
+                        s.recall_cells = RecallCells::default();
+                    }
+                    b
+                }),
                 Err(e) if e.downcast_ref::<Cancelled>().is_some() => return Err(e),
                 Err(e) => {
                     let msg = format!("{e:#}");

@@ -2799,13 +2799,55 @@ pub const HELDOUT_IN_SCOPE: &str = "heldout:in-scope";
 /// Held-out tag of the Review queue's random picks ([`Frame::random_pick`]): the held-out frames
 /// nobody chose, the least biased score ([`super::job::BenchSummary::random`]).
 pub const HELDOUT_RANDOM: &str = "heldout:random";
+/// Held-out tag prefix of a frame's camera: `heldout:cam:<camera>`. The camera is a folder name
+/// and may hold a `:` on Unix, so it comes last and the tag is read by prefix ([`cell_tag`]).
+pub const HELDOUT_CAM: &str = "heldout:cam:";
+/// Held-out tag prefix of a frame's camera in its scene: `heldout:camscene:<scene>:<camera>`
+/// (the scene, `day` / `night` / `ir`, never holds a `:`; the camera last, as in [`HELDOUT_CAM`]).
+pub const HELDOUT_CAMSCENE: &str = "heldout:camscene:";
 
-/// Benchmark tags of a held-out frame of `scene` for a run filtered by `filter`: the bare scene
-/// (the benchmark's own scene views), `heldout:<scene>`, `heldout:all`, when the run trained on
-/// its scene `heldout:in-scope`, and for a random pick of the Review queue `heldout:random` (so
+/// A per-camera held-out tag, read ([`cell_tag`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellTag<'a> {
+    /// `heldout:cam:<camera>`.
+    Camera(&'a str),
+    /// `heldout:camscene:<scene>:<camera>`.
+    CameraScene { scene: &'a str, camera: &'a str },
+}
+
+/// The camera (and scene) of a per-camera held-out tag; None for any other tag (and for one
+/// with an empty camera or scene).
+pub fn cell_tag(tag: &str) -> Option<CellTag<'_>> {
+    if let Some(rest) = tag.strip_prefix(HELDOUT_CAMSCENE) {
+        let (scene, camera) = rest.split_once(':')?;
+        return (!scene.is_empty() && !camera.is_empty())
+            .then_some(CellTag::CameraScene { scene, camera });
+    }
+    let camera = tag.strip_prefix(HELDOUT_CAM)?;
+    (!camera.is_empty()).then_some(CellTag::Camera(camera))
+}
+
+/// `tag` is a per-camera held-out tag ([`HELDOUT_CAM`], [`HELDOUT_CAMSCENE`]): the benchmark's
+/// tag tables leave them out (a camera's row is there already as the manifest's `camera:<name>`
+/// tag, and one row per camera and scene would bury the others); the run's summary reads them
+/// ([`super::bench::summarize`]).
+pub fn is_cell_tag(tag: &str) -> bool {
+    tag.starts_with(HELDOUT_CAM) || tag.starts_with(HELDOUT_CAMSCENE)
+}
+
+/// Benchmark tags of a held-out frame of `scene` and `camera` for a run filtered by `filter`: the
+/// bare scene (the benchmark's own scene views), `heldout:<scene>`, `heldout:all`, when the run
+/// trained on its scene `heldout:in-scope`, for a random pick of the Review queue
+/// `heldout:random`, then `heldout:cam:<camera>` and `heldout:camscene:<scene>:<camera>` (so
 /// [`super::bench::summarize`] reads exact AP per scene, over the run's scenes and over the random
-/// picks from `accuracy.by_tag`).
-pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter, random_pick: bool) -> Vec<String> {
+/// picks, and recall per class per scene, camera and camera in scene from `accuracy.by_tag`). An
+/// empty camera gets no camera tags; a frame without a scene no `camscene` tag.
+pub fn heldout_tags(
+    scene: Option<&str>,
+    camera: &str,
+    filter: SceneFilter,
+    random_pick: bool,
+) -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
     if let Some(s) = scene {
         tags.push(s.to_string());
@@ -2817,6 +2859,12 @@ pub fn heldout_tags(scene: Option<&str>, filter: SceneFilter, random_pick: bool)
     }
     if random_pick {
         tags.push(HELDOUT_RANDOM.into());
+    }
+    if !camera.is_empty() {
+        tags.push(format!("{HELDOUT_CAM}{camera}"));
+        if let Some(s) = scene.filter(|s| !s.is_empty() && !s.contains(':')) {
+            tags.push(format!("{HELDOUT_CAMSCENE}{s}:{camera}"));
+        }
     }
     tags
 }
@@ -3131,7 +3179,7 @@ pub fn write_reusing(
                 .join("labels")
                 .join(format!("{}.txt", stem(Path::new(&n))));
             std::fs::write(&txt, label_text(f))?;
-            let mut tags = heldout_tags(f.scene.as_deref(), opts.scene, f.random_pick);
+            let mut tags = heldout_tags(f.scene.as_deref(), &f.camera, opts.scene, f.random_pick);
             tags.push(format!("camera:{}", f.camera));
             tags.push(format!("date:{}", f.day));
             if f.hard_negative {

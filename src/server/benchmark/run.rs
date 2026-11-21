@@ -498,7 +498,16 @@ fn images_detail_blocking(state: &AppState, q: &HashMap<String, String>) -> Resp
                 "file": r.file,
                 "width": info.map(|i| i.width),
                 "height": info.map(|i| i.height),
-                "tags": info.map(|i| i.tags.clone()).unwrap_or_default(),
+                // Without the held-out set's per-camera tags (`camera:` names the camera).
+                "tags": info
+                    .map(|i| {
+                        i.tags
+                            .iter()
+                            .filter(|t| !crate::training::dataset::is_cell_tag(t))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
                 "objects": info.and_then(|i| i.objects.clone()),
                 "gtMatched": r.gt_matched,
                 "preds": r.preds,

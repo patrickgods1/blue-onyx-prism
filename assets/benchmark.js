@@ -8,6 +8,7 @@
 // answer means. During a run the page polls GET /v1/benchmark?only=run (the run, `viewTag` = the
 // tag of everything else, `modelsTag` = the tag of run.models, left out when the page sent it
 // back as `models=`); the full answer is fetched only when `viewTag` changes or the run ends.
+// BenchTags (pure): which tags the tag tables leave out.
 (function (root) {
   "use strict";
   function runUri(modelsTag) {
@@ -33,6 +34,12 @@
     return {status: Object.assign({}, last.status, {state: s.state, running: s.running, run: run}), modelsTag: s.modelsTag || null};
   }
   root.BenchPoll = {runUri: runUri, step: step};
+  // BenchTags (pure): a held-out set's per-camera tag (`heldout:cam:<camera>`,
+  // `heldout:camscene:<scene>:<camera>`) is left out of the By tag table (the `camera:` rows show
+  // each camera; these feed the training run's recall cells). Twin:
+  // `training::dataset::is_cell_tag`, checked in node by its tests.
+  function cellTag(k) { return String(k).indexOf("heldout:cam:") === 0 || String(k).indexOf("heldout:camscene:") === 0; }
+  root.BenchTags = {cellTag: cellTag};
 })(typeof globalThis !== "undefined" ? globalThis : window);
 (function () {
   if (typeof document === "undefined") return; // loaded by the node test for BenchPoll only
@@ -946,7 +953,7 @@
       var a = run.accuracy;
       box.appendChild(el("p", "muted", "Scored classes: " + a.classes.join(", ") + ". Precision/recall at confidence " + a.threshold.toFixed(2) + ", IoU 0.5. Small/medium/large recall: " + a.overall.by_size.map(function (s) { return s.bucket + " " + pct(s.recall) + " (" + s.gt + ")"; }).join(", ")));
       box.appendChild(breakdown("bd:" + key, "By dataset", a.by_dataset));
-      box.appendChild(breakdown("bd:" + key, "By tag", a.by_tag));
+      box.appendChild(breakdown("bd:" + key, "By tag", (a.by_tag || []).filter(function (b) { return !BenchTags.cellTag(b.key); })));
       var classAuc = function (k) { var x = a.frame_roc && (a.frame_roc.per_class || []).find(function (c) { return c["class"] === k; }); return x ? x.auc : null; };
       var basis = a.overall.ap_basis;
       if (PB.basisText(basis)) box.appendChild(el("p", "muted", "AP50 and AP50-95 average " + PB.basisText(basis) + (basis.fell_back ? "." : "; classes with fewer objects are scored per class only (By class).")));

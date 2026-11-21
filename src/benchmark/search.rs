@@ -778,6 +778,9 @@ pub fn options(results: &BenchmarkResults, preds: &StoredPreds) -> SearchOptions
         .iter()
         .filter(|s| datasets.contains(&s.id))
         .flat_map(|s| s.images.iter().flat_map(|i| i.tags.iter().cloned()))
+        // The held-out set's per-camera tags only feed a training run's recall cells; the
+        // `camera:` tags offer each camera already.
+        .filter(|t| !crate::training::dataset::is_cell_tag(t))
         .collect();
     tags.sort();
     tags.dedup();
@@ -1907,5 +1910,28 @@ pub(crate) mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tag choices leave out the held-out set's per-camera tags.
+    #[test]
+    fn options_leave_out_the_per_camera_heldout_tags() {
+        let (mut results, preds) = fixture();
+        results.image_sets[0].images[0].tags.extend(
+            [
+                "heldout:all",
+                "heldout:cam:back",
+                "heldout:camscene:night:back",
+                "camera:back",
+            ]
+            .map(String::from),
+        );
+        let o = options(&results, &preds);
+        assert!(o.tags.iter().any(|t| t == "heldout:all"), "{:?}", o.tags);
+        assert!(o.tags.iter().any(|t| t == "camera:back"));
+        assert!(
+            o.tags.iter().all(|t| !t.starts_with("heldout:cam")),
+            "{:?}",
+            o.tags
+        );
     }
 }

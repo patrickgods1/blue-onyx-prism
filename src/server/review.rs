@@ -28,11 +28,13 @@
 //! This file holds what the routes share (answers, body and filter checks, the context of the
 //! current config), the page, the queue (`next`) and a frame's labels; the other routes are split by
 //! concern: [`bulk_routes`] (the bulk tools and the overlap check), [`spots`] (the reviewer's
-//! history and the spot memory) and [`files`] (export, import, the folder under review, classes).
+//! history and the spot memory) and [`files`] (export, import, the folder under review, classes);
+//! [`steer`] caches what steers the queue from outside the folder (measured recall).
 
 mod bulk_routes;
 mod files;
 mod spots;
+mod steer;
 
 pub(super) use bulk_routes::{
     accept_auto, accept_repeats, reject_low, reject_other_class, reject_stacked,
