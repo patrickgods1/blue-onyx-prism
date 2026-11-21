@@ -284,6 +284,27 @@ const READ_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// Every reader comes through here, including those that never save (the page before the queue
 /// starts, `train list`): a damaged file is damaged for all of them.
 pub fn load_or_move_aside<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
+    load_checked(path)
+}
+
+/// The records of `path` that parse, for a reader that only reads (the Review queue's steer):
+/// a missing, unreadable or damaged file is no records, a record that does not parse (or of a
+/// newer format) is skipped, and the file is never renamed, moved aside or written, whatever it
+/// holds. Its owner ([`load_or_move_aside`], the training queue) deals with damage.
+pub fn read_records<T: DeserializeOwned>(path: &Path) -> Vec<T> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter(|v| record_format(v).is_ok())
+        .filter_map(|v| T::deserialize(v).ok())
+        .collect()
+}
+
+fn load_checked<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
     let bytes = match read_retrying(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -526,6 +547,41 @@ pub fn overall(step: usize, steps: usize, pct: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pure reader takes what parses and leaves the file exactly as it was, damaged or not.
+    #[test]
+    fn read_records_only_reads() {
+        let dir = std::env::temp_dir().join(format!("bop-read-records-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runs.json");
+        let listing = || -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .collect();
+            v.sort();
+            v
+        };
+        assert!(read_records::<serde_json::Value>(&path).is_empty());
+        for bytes in [&b"{ not json"[..], b"{\"a\": 1}", b""] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(read_records::<serde_json::Value>(&path).is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(listing(), ["runs.json"]);
+        }
+        // A record of a newer format, and one of the wrong shape, are skipped; the rest read.
+        let newer = format!("{{\"{FORMAT_KEY}\": {}}}", RECORD_FORMAT + 1);
+        let text = format!("[{{\"n\": 1}}, {newer}, 7, {{\"n\": 2}}]");
+        std::fs::write(&path, &text).unwrap();
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct N {
+            n: u32,
+        }
+        assert_eq!(read_records::<N>(&path), [N { n: 1 }, N { n: 2 }]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(listing(), ["runs.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn overall_percent_and_describe() {

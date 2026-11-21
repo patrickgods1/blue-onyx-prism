@@ -62,7 +62,12 @@ impl State {
         let mut found = 0usize;
         for (rel, cand) in &q.cands {
             let at = self.locate(rel).map(|(s, at)| (s.day.clone(), at));
-            match at.and_then(|(day, at)| self.shards.get_mut(&day)?.rows.get_mut(at)) {
+            let shard = at.as_ref().and_then(|(day, _)| self.shards.get_mut(day));
+            let row = shard.and_then(|s| {
+                s.touch();
+                s.rows.get_mut(at.as_ref()?.1)
+            });
+            match row {
                 Some(row) => {
                     row.cand = *cand;
                     row.queued = true;

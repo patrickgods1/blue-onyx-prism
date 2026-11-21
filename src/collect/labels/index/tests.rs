@@ -1256,7 +1256,9 @@ mod cases {
             Source::Auto,
             BoxState::Pending,
         );
+        // Two labelers: strong, so a miss of it doubles (MISSED_MIN_E).
         found.auto.labelers.insert("rfdetr".into(), 0.6);
+        found.auto.labelers.insert("gdino".into(), 0.5);
         found.score = Some(0.6);
         let seen = put_cue(
             dir,
@@ -1424,15 +1426,22 @@ mod cases {
         assert!(gap.expanded && gap.recall.is_some(), "{gap:?}");
         assert!(need_of(&cues.lost).missed);
         assert!(!need_of(&cues.seen).missed);
-        assert!(need_of(&cues.bare).missed);
-        // The suggestion is a missed candidate of its own class.
-        let frame = Frame::resolve(dir, &cues.suggested).unwrap();
-        let l = frame.labels().unwrap().unwrap();
+        // The reply's below-threshold person: a missed candidate (too weak to double).
+        let bare = Frame::resolve(dir, &cues.bare).unwrap().record().unwrap();
         let (classes, hidden) = wanted_a();
         let w = Wanted {
             classes: &classes,
             hidden: &hidden,
         };
+        assert!(
+            need::of_reply(&bare, Some(&w))
+                .iter()
+                .any(|b| b.has(need::MISSED))
+        );
+        assert!(!need_of(&cues.bare).missed);
+        // The suggestion is a missed candidate of its own class.
+        let frame = Frame::resolve(dir, &cues.suggested).unwrap();
+        let l = frame.labels().unwrap().unwrap();
         let boxes = need::of_file(&l, Some(&w));
         assert!(
             boxes.iter().any(|b| b.has(need::MISSED) && b.class == 0),
@@ -2267,6 +2276,12 @@ mod cases {
             covers_every_case(&dir, &chain);
             covers_need(&dir, &steer, &cues);
             same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, built"));
+            // The index's reviewed rows give the parked spot the label files do.
+            let (stamp, obs) = super::super::reviewed_obs(&dir, Some(&a)).unwrap();
+            assert_eq!(super::super::rows_version(&dir, Some(&a)), Some(stamp));
+            let from_rows = statics::Table::build(obs);
+            assert_eq!(from_rows.camera("lot"), steer.spots.camera("lot"));
+            assert!(super::super::reviewed_obs(&dir, Some(&wanted_b())).is_none());
             same_order(&dir, &all_any(), &format!("seed {seed}, built"));
             same_order(
                 &dir,

@@ -1328,8 +1328,10 @@ fn build_day(
                 Some(l) => need::of_file(l, n.wanted()),
                 None => need::of_reply(&rec, n.wanted()),
             };
-            if let Some(l) = labels.as_ref().filter(|l| l.status == Status::Reviewed) {
-                let proposed = need::proposed_classes(proposed_labels(l), n.wanted());
+            if labels
+                .as_ref()
+                .is_some_and(|l| l.status == Status::Reviewed)
+            {
                 n.add_reviewed(
                     &mut q.need,
                     &need::Reviewed {
@@ -1339,7 +1341,6 @@ fn build_day(
                         width: rec.width,
                         height: rec.height,
                         boxes: &boxes,
-                        proposed: &proposed,
                     },
                 );
             }
@@ -1387,11 +1388,10 @@ fn build_day(
     if n.is_some() {
         let frames: Vec<need::DayFrame<'_>> = counted
             .iter()
-            .map(|(ms, alone, boxes, listed)| need::DayFrame {
+            .map(|(ms, alone, boxes, _)| need::DayFrame {
                 ms: *ms,
                 alone: *alone,
                 boxes,
-                listed: listed.is_some(),
             })
             .collect();
         for ((_, _, boxes, listed), out) in counted.iter().zip(need::day(&frames)) {
@@ -1427,8 +1427,8 @@ fn weigh_need(items: &mut [Item], facts: &[ItemFacts], n: &Need<'_>, tally: &Cel
             height: x.height,
         };
         let d = scorer.score(&at, &x.boxes, &x.gaps);
-        let expanded = scorer.expands(&item.camera, &x.visit_classes);
-        item.uncertainty.need = Some(scorer.explain(&d, &item.camera, &item.scene, expanded));
+        let visit = scorer.expands(&item.camera, &x.visit_classes);
+        item.uncertainty.need = Some(scorer.explain(&d, &item.camera, &item.scene, visit));
     }
 }
 

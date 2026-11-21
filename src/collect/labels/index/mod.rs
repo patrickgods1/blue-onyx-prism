@@ -154,6 +154,8 @@ struct Index {
     drain: Mutex<()>,
     state: RwLock<State>,
     names: RwLock<Names>,
+    /// What the Recommended order keeps per shard between queries.
+    need: query::NeedCache,
     /// Set for good when the index stops being current.
     cancelled: AtomicBool,
     /// The first build is running.
@@ -182,6 +184,7 @@ impl Index {
             drain: Mutex::new(()),
             state: RwLock::new(State::default()),
             names: RwLock::new(Names::default()),
+            need: query::NeedCache::default(),
             cancelled: AtomicBool::new(false),
             building: AtomicBool::new(true),
             catching_up: AtomicBool::new(false),
@@ -313,7 +316,7 @@ impl Index {
         let indexing = self.indexing();
         let state = self.state.read_recover();
         let names = self.names.read_recover();
-        let (mut answer, shown) = query::answer(&state, &names, f, after, then);
+        let (mut answer, shown) = query::answer(&state, &names, f, after, then, &self.need);
         answer.indexing = indexing;
         (answer, shown)
     }
@@ -558,6 +561,85 @@ pub fn day_written(day: &Path) {
             CHANGED.notify_all();
         }
     }
+}
+
+/// The current index of `dir` for `wanted` once built (none is made here).
+fn built(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> Option<Arc<Index>> {
+    let index = HUB
+        .lock_recover()
+        .current
+        .iter()
+        .find(|c| c.index.is(dir, wanted))
+        .map(|c| c.index.clone())?;
+    (!index.cancelled() && !index.building.load(Ordering::Acquire)).then_some(index)
+}
+
+/// What changes when any row of `state` does: a sum of its shards' versions, mixed.
+fn rows_stamp(state: &State) -> u64 {
+    state.shards.values().fold(0u64, |h, s| {
+        // splitmix64 of the version, so that sums of distinct versions rarely collide.
+        let mut z = s.version.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h.wrapping_add(z ^ (z >> 31))
+    })
+}
+
+/// The stamp of the rows of the built index of `dir` for `wanted` ([`reviewed_obs`] of the same
+/// stamp holds the same frames); None without one.
+pub fn rows_version(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> Option<u64> {
+    let index = built(dir, wanted)?;
+    let state = index.state.read_recover();
+    Some(rows_stamp(&state))
+}
+
+/// The training boxes of the reviewed rows of the built index of `dir` for `wanted`, as parked-spot
+/// observations ([`super::statics::Obs`], of the frame's path: its camera, scene and date), with
+/// the stamp of the rows they came from: the spot table of the folder without reading a label
+/// file. None without a built index (none is made here).
+pub fn reviewed_obs(
+    dir: &Path,
+    wanted: Option<&(Vec<String>, Vec<String>)>,
+) -> Option<(u64, Vec<super::statics::Obs>)> {
+    let index = built(dir, wanted)?;
+    let classes = wanted.map_or(&[][..], |w| w.0.as_slice());
+    let state = index.state.read_recover();
+    let mut obs = Vec::new();
+    for shard in state.shards.values() {
+        let mut parts = shard.day.split('/');
+        let (Some(scene), Some(camera), Some(date)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        for row in &shard.rows {
+            if row.gone || !row.readable() || row.part.status != super::Status::Reviewed {
+                continue;
+            }
+            let (w, h) = (row.side.width, row.side.height);
+            let mut frame = None;
+            for b in shard
+                .boxes_of(row)
+                .iter()
+                .filter(|b| b.has(super::need::TRAINING))
+            {
+                let (Some(label), Some(bbox)) = (
+                    classes.get(usize::from(b.class)),
+                    super::statics::normalised(&b.bbox.map(f32::from), w, h),
+                ) else {
+                    continue;
+                };
+                obs.push(super::statics::Obs {
+                    camera: camera.to_string(),
+                    frame: frame.get_or_insert_with(|| shard.rel(row)).clone(),
+                    day: date.to_string(),
+                    scene: scene.to_string(),
+                    label: label.clone(),
+                    bbox,
+                });
+            }
+        }
+    }
+    Some((rows_stamp(&state), obs))
 }
 
 /// The index's bytes, from capacities; None with no index.

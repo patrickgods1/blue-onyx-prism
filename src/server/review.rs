@@ -3731,15 +3731,15 @@ mod tests {
         let m = v["message"].as_str().unwrap();
         assert!(m.contains("order") && m.contains("newest"), "{m}");
 
-        // Their needs: the dog the static rule suppressed is a missed box on each, the person a
-        // weak one. c's is the highest; a is its event's second frame (b's person is more sure),
-        // its need halved. b is a random pick (its path's hash is in the pool): it takes a random
-        // slot, here the last, the rest having run out.
+        // Their needs: a weak person and the weak dog the static rule suppressed on each (too weak
+        // for the missed doubling). c's is the highest; a and b share a band, so the more uncertain
+        // a leads their event and b is its second. b is also a random pick (its path's hash is in
+        // the pool): it takes a random slot, here the last, the rest having run out.
         assert!(labels::recommend::in_pool(&b) && !labels::recommend::in_pool(&a));
         let ranked = vec![
             (c.clone(), Some(0)),
-            (a.clone(), Some(1)),
-            (b.clone(), Some(0)),
+            (a.clone(), Some(0)),
+            (b.clone(), Some(1)),
         ];
         assert_eq!(order_of(&d, &[]).await, ranked);
         assert_eq!(order_of(&d, &[("order", "recommended")]).await, ranked);
@@ -3748,7 +3748,7 @@ mod tests {
         assert!(v["need"]["boxes"].is_object(), "{v}");
         assert_eq!(v["need"]["floor"], 20, "{v}");
         assert!(v["item"]["need"]["score"].as_u64() > Some(0), "{v}");
-        assert_eq!(v["item"]["need"]["missed"], true, "{v}");
+        assert!(v["item"]["need"]["class"].is_string(), "{v}");
         assert!(
             v["balance"].is_null() && v["item"]["balance"].is_null(),
             "{v}"
@@ -3779,7 +3779,8 @@ mod tests {
     );
 
     /// The need's recall comes from `runs.json` (`steer::recall`): a damaged one measures nothing,
-    /// so the queue answers as it does without one: 200, the same order, no recall named.
+    /// so the queue answers as it does without one: 200, the same order, no recall named. And the
+    /// queue only reads: the file stays where it is, byte for byte, with nothing moved aside.
     async fn a_damaged_runs_json_still_answers_next_in(way: Way) {
         let d = way.ds();
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.7);
@@ -3795,6 +3796,15 @@ mod tests {
         assert!(v["item"]["need"]["recall"].is_null(), "{v}");
         assert_eq!(order_of(&d, &[]).await, plain);
         assert!(plain.iter().any(|(f, _)| *f == a) && plain.iter().any(|(f, _)| *f == b));
+        assert_eq!(std::fs::read(&runs).unwrap(), b"{ not json");
+        let siblings: Vec<String> = std::fs::read_dir(runs.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        assert!(
+            !siblings.iter().any(|n| n.contains(".corrupt-")),
+            "{siblings:?}"
+        );
     }
 
     both_ways!(

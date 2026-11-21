@@ -92,7 +92,22 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
         missed: true,
         new_region: true,
         expanded: true,
+        visit_class: Some("raccoon".into()),
         evidence: 0.35,
+        ..RecallNeed::default()
+    };
+    // A visit a decided fox expanded, and a likely false box of the frame.
+    let cat_in_fox_visit = RecallNeed {
+        class: Some("cat".into()),
+        camera_reviewed: 25.0,
+        reviewed: 40.0,
+        class_reviewed: 60.0,
+        strong: true,
+        evidence: 1.0,
+        expanded: true,
+        visit_class: Some("fox".into()),
+        hard_negative: 0.21,
+        hard_class: Some("person".into()),
         ..RecallNeed::default()
     };
     let person = RecallNeed {
@@ -154,6 +169,7 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
         item(&person, "day", 1),
         item(&lacking, "night", 0),
         item(&empty, "night", 0),
+        item(&cat_in_fox_visit, "day", 4),
         { "op": "note", "item": { "camera": "back", "scene": "day" } },
         { "op": "counts", "c": serde_json::to_value(&counts).unwrap() },
         { "op": "counts", "c": serde_json::to_value(NeedCounts::default()).unwrap() },
@@ -176,6 +192,8 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
              no fox",
             "nothing of a wanted class · back · night: 1 empty frame reviewed in this scene, 33% \
              of this camera's reviewed frames here had an animal",
+            "cat · back · day: 25 boxes on this camera (40 on every camera in this scene), frame 5 \
+             of a fox visit, likely false person: rejecting it teaches the model",
             "",
             "person 12.25 (day 8, night 4.25) · raccoon 3 (IR 3) · empty: day 20",
             "none yet",

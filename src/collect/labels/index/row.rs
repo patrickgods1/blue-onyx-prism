@@ -14,6 +14,10 @@
 //!
 //! No field saturates: counts of what a file holds fit the types below because of the file size
 //! caps, which the `const` checks state.
+//!
+//! The arenas only grow: a row's update appends its new text and candidates (unless they are the
+//! ones it has) and leaves the old ones unreferenced. They are reclaimed when the thread walks the
+//! day again (a scan of a changed day, the full pass every 30 minutes), which builds the shard anew.
 
 use super::super::super::layout::{self, Walker};
 use super::super::super::record::{Bucket, Record};
@@ -417,6 +421,9 @@ impl Row {
 #[derive(Debug, Default)]
 pub(super) struct Shard {
     pub day: String,
+    /// Changes with every row added or updated, unique over every shard of the process: what the
+    /// query's per-shard cache ([`super::query::NeedCache`]) is keyed on.
+    pub version: u64,
     pub rows: Vec<Row>,
     text: String,
     notes: Vec<Box<str>>,
@@ -430,6 +437,12 @@ pub(super) struct SideRead {
     pub side: Side,
     pub timestamp: String,
     pub boxes: Vec<CellBox>,
+}
+
+/// The next [`Shard::version`].
+fn next_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A frame as read from disk, to go into a row.
@@ -448,6 +461,7 @@ impl Shard {
     pub(super) fn new(day: String) -> Self {
         Self {
             day,
+            version: next_version(),
             ..Self::default()
         }
     }
@@ -550,7 +564,13 @@ impl Shard {
     }
 
     /// Add a row at the end: the caller adds them by stem, then by `.jpg` before `.json`.
+    /// A row of this shard changes in place: a new [`Self::version`].
+    pub(super) fn touch(&mut self) {
+        self.version = next_version();
+    }
+
     pub(super) fn push(&mut self, stem: &str, json: bool, queued: bool, cand: Cand, e: Encoded) {
+        self.version = next_version();
         let SideRead {
             mut side,
             timestamp,
@@ -579,6 +599,7 @@ impl Shard {
 
     /// Put what `e` says into row `at`.
     pub(super) fn update(&mut self, at: usize, e: Encoded) {
+        self.version = next_version();
         let Some(mut row) = self.rows.get(at).copied() else {
             return;
         };

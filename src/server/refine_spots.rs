@@ -142,11 +142,25 @@ fn reviewed(dir: &Path, classes: &[String]) -> Vec<ExportFrame> {
     .frames
 }
 
-/// The spots of `dir`'s reviewed frames, the table [`compute`] makes: what steers the Review
-/// queue's need (`review::steer`, rebuilt in the background).
+/// The spots of `dir`'s reviewed frames, the table [`compute`] makes, walked now: what the Review
+/// queue's tests and the real-data comparison steer by (the service takes [`cached_table`] or the
+/// index's rows, `review::steer`).
+#[cfg(test)]
 pub(super) fn spot_table(dir: &Path, classes: &[String], hidden: &[String]) -> statics::Table {
     let wanted = Wanted { classes, hidden };
     statics::Table::build(statics::observations(&reviewed(dir, classes), &wanted))
+}
+
+/// The spot table of [`compute`] through the Refine tab's cache ([`Cache::computed`], `stamp`
+/// naming the checks on the queue): a folder's spots without a walk of its own when the tab
+/// walked it recently.
+pub(super) fn cached_table(
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+    stamp: &str,
+) -> statics::Table {
+    computed(dir, classes, hidden, stamp).table.clone()
 }
 
 /// A fresh walk of the reviewed frames of `dir`.

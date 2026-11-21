@@ -15,9 +15,10 @@ const CAR: u16 = 1;
 const RACCOON: u16 = 2;
 const CAT: u16 = 3;
 const DOG: u16 = 4;
+const MOTORCYCLE: u16 = 5;
 
 fn classes() -> Vec<String> {
-    ["person", "car", "raccoon", "cat", "dog"]
+    ["person", "car", "raccoon", "cat", "dog", "motorcycle"]
         .map(String::from)
         .to_vec()
 }
@@ -38,6 +39,16 @@ fn cb(k: u16, bbox: [u16; 4], e: u8, flags: u8) -> CellBox {
 
 fn trained(k: u16, bbox: [u16; 4]) -> CellBox {
     cb(k, bbox, 100, TRAINING | STRONG)
+}
+
+/// A reviewed frame's marker: class `k` was proposed there and judged.
+fn proposed(k: u16) -> CellBox {
+    cb(k, [0; 4], 0, PROPOSED)
+}
+
+/// A reviewed frame's hard negative of class `k`.
+fn rejected(k: u16) -> CellBox {
+    cb(k, LEFT, 0, REJECTED)
 }
 
 /// Region 0 and region 8 of a 640 x 480 frame.
@@ -72,7 +83,6 @@ fn review(
                 width: 640,
                 height: 480,
                 boxes,
-                proposed: &[],
             },
         );
     }
@@ -83,12 +93,21 @@ fn score(need: &Need<'_>, t: &CellTally, f: &Facts<'_>, boxes: &[CellBox]) -> u3
     Scorer::new(need, t).score(f, boxes, &[]).score
 }
 
+/// v_k of a class with `n_ks` and `n_mks` reviewed boxes.
+fn v(n_ks: f64, n_mks: f64) -> f64 {
+    0.5 * T / (T + n_ks) + 0.5 * T_CAM / (T_CAM + n_mks)
+}
+
+/// The region factor of `n` reviewed boxes in a box's region.
+fn rf(n: f64) -> f64 {
+    (1.0 + W_REGION * T_R / (T_R + n)) / 2.0
+}
+
 /// The score the formula gives one box of weight `a` (evidence and its box factors) in a region
 /// with `region` reviewed boxes, of a class with `n_ks` and `n_mks` reviewed boxes, times `rest`
 /// (day, floor, recall, catch-up).
 fn expect(a: f64, region: f64, n_ks: f64, n_mks: f64, rest: f64) -> u32 {
-    let v = 0.5 * T / (T + n_ks) + 0.5 * T_CAM / (T_CAM + n_mks);
-    score_of(a * (1.0 + W_REGION * T_R / (T_R + region)) / 2.0 * v * rest)
+    score_of(a * rf(region) * v(n_ks, n_mks) * rest)
 }
 
 fn wanted(c: &[String]) -> Wanted<'_> {
@@ -97,6 +116,9 @@ fn wanted(c: &[String]) -> Wanted<'_> {
         hidden: &[],
     }
 }
+
+/// A new day of a class under the floor.
+const FRESH: f64 = (1.0 + W_DAY) * RARE_GAIN;
 
 #[test]
 fn a_cell_needs_less_as_its_boxes_come_per_camera_and_overall() {
@@ -161,7 +183,7 @@ fn parked() -> statics::Table {
 const SPOT: [u16; 4] = [64, 48, 192, 144];
 
 #[test]
-fn a_box_at_a_parked_spot_counts_a_quarter() {
+fn a_box_at_a_parked_spot_counts_a_quarter_but_whole_for_the_floor() {
     let c = classes();
     let steer = Steer {
         spots: Arc::new(parked()),
@@ -194,15 +216,22 @@ fn a_box_at_a_parked_spot_counts_a_quarter() {
         &[trained(CAR, SPOT)],
     );
     assert_eq!(t.class_scene[&(CAR, 0)], 38);
+    // The floor counts whole boxes: 32 cars, none rare.
+    assert_eq!(t.class_boxes[&CAR], 32);
+    let s = Scorer::new(&need, &t);
+    assert!(!s.below_floor(CAR));
     let car = |bbox| [cb(CAR, bbox, 100, STRONG)];
     let (n_ks, n_mks) = (38.0 / 4.0, 34.0 / 4.0);
-    // Under the floor (9.5 boxes < 20): x RARE_GAIN. The spot's region holds 7.5 boxes.
+    // The spot's region holds 7.5 boxes.
     let at_spot = score(&need, &t, &at("drive", "day", "d1"), &car(SPOT));
-    assert_eq!(at_spot, expect(W_SPOT, 7.5, n_ks, n_mks, RARE_GAIN));
+    assert_eq!(at_spot, expect(W_SPOT, 7.5, n_ks, n_mks, 1.0));
     let elsewhere = score(&need, &t, &at("drive", "day", "d1"), &car(RIGHT));
-    assert_eq!(elsewhere, expect(1.0, 1.0, n_ks, n_mks, RARE_GAIN));
-    let d = Scorer::new(&need, &t).score(&at("drive", "day", "d1"), &car(SPOT), &[]);
+    assert_eq!(elsewhere, expect(1.0, 1.0, n_ks, n_mks, 1.0));
+    let d = s.score(&at("drive", "day", "d1"), &car(SPOT), &[]);
     assert!(d.spot);
+    // A parked box beside a car elsewhere carries under a quarter of the class: no spot cue.
+    let both = [cb(CAR, RIGHT, 100, STRONG), cb(CAR, SPOT, 100, STRONG)];
+    assert!(!s.score(&at("drive", "day", "d1"), &both, &[]).spot);
     // Without the table: neutral.
     let plain = Need::new(Some(wanted(&c)), None);
     let mut u = CellTally::default();
@@ -218,7 +247,7 @@ fn a_box_at_a_parked_spot_counts_a_quarter() {
     let person = [cb(PERSON, SPOT, 100, STRONG)];
     assert_eq!(
         score(&need, &t, &at("drive", "day", "d1"), &person),
-        expect(1.0, 0.0, 0.0, 0.0, (1.0 + W_DAY) * RARE_GAIN)
+        expect(1.0, 0.0, 0.0, 0.0, FRESH)
     );
 }
 
@@ -255,7 +284,7 @@ fn a_new_region_and_a_new_day_add_need() {
 }
 
 #[test]
-fn a_missed_box_doubles_and_a_frame_counts_up_to_the_cap() {
+fn a_missed_box_doubles_only_with_evidence_and_a_camera_that_keeps_the_class() {
     let c = classes();
     let need = Need::new(Some(wanted(&c)), None);
     let mut t = CellTally::default();
@@ -271,10 +300,38 @@ fn a_missed_box_doubles_and_a_frame_counts_up_to_the_cap() {
     let missed = score(&need, &t, &f, &[cb(PERSON, RIGHT, 100, STRONG | MISSED)]);
     assert_eq!(plain, expect(1.0, 0.0, 25.0, 25.0, 1.0));
     assert_eq!(missed, expect(W_MISSED, 0.0, 25.0, 25.0, 1.0));
+    // A weak missed box (evidence under 0.5): no doubling.
+    let weak = score(&need, &t, &f, &[cb(PERSON, RIGHT, 40, MISSED)]);
+    assert_eq!(weak, expect(0.4, 0.0, 25.0, 25.0, 1.0));
+    // A camera that rejected most person proposals: no doubling either.
+    let mut u = CellTally::default();
+    review(
+        &need,
+        &mut u,
+        ("gate", "day", "d1"),
+        25,
+        &[trained(PERSON, LEFT)],
+    );
+    review(
+        &need,
+        &mut u,
+        ("gate", "day", "d1"),
+        25,
+        &[proposed(PERSON)],
+    );
+    let s = Scorer::new(&need, &u);
+    let d = s.score(
+        &at("gate", "day", "d1"),
+        &[cb(PERSON, RIGHT, 100, STRONG | MISSED)],
+        &[],
+    );
+    assert!(!d.missed, "{d:?}");
     // Five strong boxes in a new place count as BOX_CAP.
     let crowd: Vec<CellBox> = (0..5).map(|_| cb(PERSON, RIGHT, 100, STRONG)).collect();
-    let v = 0.5 * T / (T + 25.0) + 0.5 * T_CAM / (T_CAM + 25.0);
-    assert_eq!(score(&need, &t, &f, &crowd), score_of(BOX_CAP * v));
+    assert_eq!(
+        score(&need, &t, &f, &crowd),
+        score_of(BOX_CAP * v(25.0, 25.0))
+    );
 }
 
 fn vlm(ok: bool) -> VlmCheck {
@@ -294,12 +351,12 @@ fn the_evidence_table() {
         a
     };
     // Lone weak: sqrt(score) x W_LONE.
-    assert_eq!(evidence(Some(0.64), None), (40, false));
-    assert_eq!(evidence(None, None), (50, false));
+    assert_eq!(evidence(Some(0.64), None), (40, false, false));
+    assert_eq!(evidence(None, None), (50, false, false));
     let lone = auto(&|a| {
         a.labelers.insert("gdino".into(), 0.64);
     });
-    assert_eq!(evidence(Some(0.64), Some(&lone)), (40, false));
+    assert_eq!(evidence(Some(0.64), Some(&lone)), (40, false, false));
     // Strong: two labelers, agree, likely, a VLM yes.
     let strong = [
         auto(&|a| {
@@ -311,7 +368,7 @@ fn the_evidence_table() {
         auto(&|a| a.vlm = Some(vlm(true))),
     ];
     for a in &strong {
-        assert_eq!(evidence(Some(0.1), Some(a)), (100, true), "{a:?}");
+        assert_eq!(evidence(Some(0.1), Some(a)), (100, true, false), "{a:?}");
     }
     // SigLIP's species scores name an animal, they do not show there is one: no strong box.
     let named = auto(&|a| {
@@ -319,18 +376,17 @@ fn the_evidence_table() {
         a.species_scores.insert("raccoon".into(), 0.9);
         a.species_scores.insert("cat".into(), 0.1);
     });
-    assert_eq!(evidence(Some(0.64), Some(&named)), (40, false));
+    assert_eq!(evidence(Some(0.64), Some(&named)), (40, false, false));
     // A VLM no: lower still, never zero; and two labelers agreeing on it make no strong box.
     let no = auto(&|a| a.vlm = Some(vlm(false)));
-    assert_eq!(evidence(Some(0.64), Some(&no)), (10, false));
+    assert_eq!(evidence(Some(0.64), Some(&no)), (10, false, true));
     let agreed_no = auto(&|a| {
         a.labelers.insert("gdino".into(), 0.3);
         a.labelers.insert("rfdetr".into(), 0.3);
         a.vlm = Some(vlm(false));
     });
-    assert_eq!(evidence(Some(0.1), Some(&agreed_no)), (25, false));
-    // An older run's category answer counts by its `ok`: `plant` for an animal is a no, SigLIP's
-    // species score of the class (which sums to 1 over the animals whatever the crop) or not.
+    assert_eq!(evidence(Some(0.1), Some(&agreed_no)), (25, false, true));
+    // An older run's category answer counts by its `ok`: `plant` for an animal is a no.
     let plant = auto(&|a| {
         a.vlm = Some(VlmCheck {
             model: "q".into(),
@@ -340,7 +396,7 @@ fn the_evidence_table() {
         });
         a.species_scores.insert("raccoon".into(), 0.84);
     });
-    assert_eq!(evidence(Some(0.64), Some(&plant)), (10, false));
+    assert_eq!(evidence(Some(0.64), Some(&plant)), (10, false, true));
     let animal = auto(&|a| {
         a.vlm = Some(VlmCheck {
             model: "q".into(),
@@ -349,7 +405,7 @@ fn the_evidence_table() {
             ok: true,
         });
     });
-    assert_eq!(evidence(Some(0.1), Some(&animal)), (100, true));
+    assert_eq!(evidence(Some(0.1), Some(&animal)), (100, true, false));
     // A decided box is 1, and training.
     let mut b = auto_box("raccoon");
     b.state = BoxState::Accepted;
@@ -364,56 +420,78 @@ fn the_evidence_table() {
     );
 }
 
+/// `n` reviewed frames of `camera` at night that proposed class `k`, `kept` of them keeping it
+/// (the others rejected it, a hard negative each).
+fn proposals(need: &Need<'_>, t: &mut CellTally, camera: &str, k: u16, n: usize, kept: usize) {
+    for i in 0..n {
+        let boxes = if i < kept {
+            vec![trained(k, LEFT), proposed(k)]
+        } else {
+            vec![rejected(k), proposed(k)]
+        };
+        review(need, t, (camera, "night", "d1"), 1, &boxes);
+    }
+}
+
 #[test]
-fn kappa_lowers_weak_boxes_only() {
+fn rejects_lower_weak_boxes_and_more_gently_strong_ones() {
     let c = classes();
     let need = Need::new(Some(wanted(&c)), None);
     let mut t = CellTally::default();
-    // On `back`, cats were proposed on 9 reviewed frames and kept on 1: kappa = 2 / 10.
-    for kept in [true, false, false, false, false, false, false, false, false] {
-        let boxes = if kept {
-            vec![trained(CAT, LEFT)]
-        } else {
-            vec![]
-        };
-        need.add_reviewed(
-            &mut t,
-            &Reviewed {
-                camera: "back",
-                scene: "night",
-                day: "d1",
-                width: 640,
-                height: 480,
-                boxes: &boxes,
-                proposed: &[CAT],
-            },
-        );
-    }
+    // On `back`, cats were proposed on 9 reviewed frames and kept on 1.
+    proposals(&need, &mut t, "back", CAT, 9, 1);
     let f = at("back", "night", "d1");
-    let weak = score(&need, &t, &f, &[cb(CAT, RIGHT, 40, 0)]);
-    let strong = score(&need, &t, &f, &[cb(CAT, RIGHT, 100, STRONG)]);
-    assert_eq!(weak, expect(0.4 * 0.2, 0.0, 1.0, 1.0, RARE_GAIN));
-    assert_eq!(strong, expect(1.0, 0.0, 1.0, 1.0, RARE_GAIN));
-    // Another camera's proposals say nothing here.
-    let side = score(
-        &need,
-        &t,
-        &at("side", "night", "d1"),
-        &[cb(CAT, RIGHT, 40, 0)],
-    );
-    assert_eq!(side, expect(0.4, 0.0, 1.0, 0.0, RARE_GAIN * (1.0 + W_DAY)));
-    let d = Scorer::new(&need, &t).score(&f, &[cb(CAT, RIGHT, 40, 0)], &[]);
+    let s = Scorer::new(&need, &t);
+    let (kw, ks) = (2.0 / 10.0, 6.0 / 14.0);
+    let vv = v(1.0, 1.0);
+    // 8 hard negatives of cat on `back`.
+    let hard = T_H / (T_H + 8.0);
+    let weak = s.score(&f, &[cb(CAT, RIGHT, 40, 0)], &[]);
+    let want = 0.4 * kw * vv * RARE_GAIN + W_HARDNEG * (1.0 - kw) * hard * vv;
+    assert_eq!(weak.score, score_of(want), "{weak:?}");
+    let strong = s.score(&f, &[cb(CAT, RIGHT, 100, STRONG)], &[]);
+    let want = ks * vv * RARE_GAIN + W_HARDNEG * (1.0 - ks) * hard * vv;
+    assert_eq!(strong.score, score_of(want), "{strong:?}");
     assert_eq!(
-        d.kept,
+        strong.kept,
         Some(Kept {
             kept: 1,
             proposed: 9
         })
     );
+    // Another camera's proposals say nothing here: no kept share, no hard negatives.
+    let side = s.score(&at("side", "night", "d1"), &[cb(CAT, RIGHT, 40, 0)], &[]);
+    assert_eq!(side.score, expect(0.4, 0.0, 1.0, 0.0, FRESH));
+    assert_eq!((side.kept, side.hard), (None, 0.0));
+    // A decided box is never lowered, and names no kept share.
+    let decided = s.score(&f, &[trained(CAT, RIGHT)], &[]);
+    assert_eq!(decided.kept, None);
+    assert_eq!(decided.hard, 0.0);
 }
 
 #[test]
-fn a_class_under_the_floor_comes_first() {
+fn thirty_rejected_strong_proposals_lower_a_cameras_strong_need_fivefold() {
+    let c = classes();
+    let need = Need::new(Some(wanted(&c)), None);
+    let mut t = CellTally::default();
+    proposals(&need, &mut t, "back", MOTORCYCLE, 30, 0);
+    let s = Scorer::new(&need, &t);
+    let one = [cb(MOTORCYCLE, RIGHT, 100, STRONG)];
+    let back = s.score(&at("back", "night", "d1"), &one, &[]);
+    let side = s.score(&at("side", "night", "d1"), &one, &[]);
+    // The need part (before the hard-negative share) of `back`: κ = 5/35.
+    let need_back = f64::from(back.score) / 1000.0 - back.hard;
+    let need_side = f64::from(side.score) / 1000.0 - side.hard;
+    assert_eq!(side.hard, 0.0);
+    assert!(need_side >= 5.0 * need_back, "{need_side} {need_back}");
+    // `side` is weighed as a camera with no history of the class.
+    assert_eq!(side.score, expect(1.0, 0.0, 0.0, 0.0, 1.0 + W_DAY));
+    // The class is mostly false (30 proposals, none kept): it left the floor.
+    assert!(!s.below_floor(MOTORCYCLE));
+}
+
+#[test]
+fn a_class_under_the_floor_comes_first_until_it_is_mostly_false() {
     let c = classes();
     let need = Need::new(Some(wanted(&c)), None);
     let mut t = CellTally::default();
@@ -436,10 +514,7 @@ fn a_class_under_the_floor_comes_first() {
     let one = [cb(RACCOON, LEFT, 100, STRONG)];
     let d = Scorer::new(&need, &t).score(&f, &one, &[]);
     assert!(d.below_floor);
-    assert_eq!(
-        d.score,
-        expect(1.0, 0.0, 0.0, 0.0, RARE_GAIN * (1.0 + W_DAY))
-    );
+    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, FRESH));
     review(
         &need,
         &mut t,
@@ -450,7 +525,17 @@ fn a_class_under_the_floor_comes_first() {
     let d = Scorer::new(&need, &t).score(&f, &one, &[]);
     assert!(!d.below_floor);
     assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, 1.0 + W_DAY));
-    assert_eq!(CLASS_FLOOR, 20);
+    // Cats proposed on 20 reviewed frames over two cameras, kept on 3 (under a fifth): mostly
+    // false, so no floor although 3 boxes are far under it. Kept on 4 (a fifth): rare again.
+    let mut u = CellTally::default();
+    proposals(&need, &mut u, "back", CAT, 10, 3);
+    proposals(&need, &mut u, "side", CAT, 10, 0);
+    assert!(!Scorer::new(&need, &u).below_floor(CAT));
+    let mut w = CellTally::default();
+    proposals(&need, &mut w, "back", CAT, 10, 4);
+    proposals(&need, &mut w, "side", CAT, 10, 0);
+    assert!(Scorer::new(&need, &w).below_floor(CAT));
+    assert_eq!((CLASS_FLOOR, FALSE_MIN_PROPOSED), (20, 20));
 }
 
 #[test]
@@ -483,20 +568,14 @@ fn an_empty_frame_has_a_prior_raised_by_the_cameras_animals() {
         s.score(&at("gate", "day", "d1"), &[], &[]).score,
         score_of(W_EMPTY)
     );
-    let n = s.explain(&d, "back", "night", false);
+    let n = s.explain(&d, "back", "night", None);
     assert_eq!(n.class, None);
     assert_eq!(n.empty_reviewed, Some(50));
     assert!(!n.new_region);
 }
 
 /// A reviewed frame of [`the_quarter_box_tally_is_the_same_in_any_order`].
-type Frame = (
-    &'static str,
-    &'static str,
-    &'static str,
-    Vec<CellBox>,
-    Vec<u16>,
-);
+type Frame = (&'static str, &'static str, &'static str, Vec<CellBox>);
 
 #[test]
 fn the_quarter_box_tally_is_the_same_in_any_order() {
@@ -507,23 +586,26 @@ fn the_quarter_box_tally_is_the_same_in_any_order() {
     };
     let need = Need::new(Some(wanted(&c)), Some(&steer));
     let frames: Vec<Frame> = vec![
-        ("drive", "day", "d1", vec![trained(CAR, SPOT)], vec![CAR]),
+        (
+            "drive",
+            "day",
+            "d1",
+            vec![trained(CAR, SPOT), proposed(CAR)],
+        ),
         (
             "drive",
             "night",
             "d2",
             vec![trained(CAR, RIGHT), trained(PERSON, LEFT)],
-            vec![],
         ),
-        ("back", "ir", "d1", vec![], vec![CAT]),
+        ("back", "ir", "d1", vec![rejected(CAT), proposed(CAT)]),
         (
             "back",
             "ir",
             "d3",
-            vec![trained(RACCOON, LEFT)],
-            vec![RACCOON, CAT],
+            vec![trained(RACCOON, LEFT), proposed(RACCOON), proposed(CAT)],
         ),
-        ("gate", "other", "d1", vec![trained(PERSON, RIGHT)], vec![]),
+        ("gate", "other", "d1", vec![trained(PERSON, RIGHT)]),
     ];
     let add = |t: &mut CellTally, f: &Frame| {
         need.add_reviewed(
@@ -535,7 +617,6 @@ fn the_quarter_box_tally_is_the_same_in_any_order() {
                 width: 640,
                 height: 480,
                 boxes: &f.3,
-                proposed: &f.4,
             },
         );
     };
@@ -560,15 +641,24 @@ fn the_quarter_box_tally_is_the_same_in_any_order() {
     assert_eq!(ab, forward);
     assert_eq!(ba, forward);
     assert_eq!(forward.empty, [0, 0, 1, 0]);
+    assert_eq!(forward.class_boxes[&CAR], 2);
+    assert_eq!(forward.cameras["back"].hard[&CAT], 1);
+    assert_eq!(
+        forward.cameras["back"].precision[&CAT],
+        Kept {
+            kept: 0,
+            proposed: 2
+        }
+    );
     let counts = forward.counts(&c);
     assert_eq!(counts.boxes["car"]["day"], 0.25);
     assert_eq!(counts.boxes["person"]["other"], 1.0);
     assert_eq!(counts.empty["ir"], 1);
 }
 
-/// A measured table of run `run-n` (person, car, cat; it lacks raccoon and dropped dog). Night:
-/// person 10 of 60 missed, 20 of 40 on `back`. Overall: person 30 of 100, cat 10 of 30, car 5 of
-/// 50; `back` person 20 of 40 and cat 10 of 30, `side` 5 of 25 of each.
+/// A measured table of run `run-n` (person, car, cat; it lacks raccoon and motorcycle, and dropped
+/// dog). Night: person 10 of 60 missed, 20 of 40 on `back`. Overall: person 30 of 100, cat 10 of
+/// 30, car 5 of 50; `back` person 20 of 40 and cat 10 of 30, `side` 5 of 25 of each.
 fn measured() -> Measured {
     let run = Run {
         id: "run-n".into(),
@@ -607,7 +697,6 @@ fn measured_recall_raises_need_and_a_class_the_model_lacks_needs_most() {
     let t = CellTally::default();
     let s = Scorer::new(&need, &t);
     let f = at("back", "night", "d1");
-    let fresh = (1.0 + W_DAY) * RARE_GAIN;
     // Person on `back`: r = 1 + RECALL_GAIN x the shrunk miss rate; the camera's lowest class.
     let rate = m.miss("back", "night", "person").unwrap().rate.unwrap();
     let person = [cb(PERSON, RIGHT, 100, STRONG)];
@@ -620,10 +709,10 @@ fn measured_recall_raises_need_and_a_class_the_model_lacks_needs_most() {
             0.0,
             0.0,
             0.0,
-            fresh * (1.0 + RECALL_GAIN * rate) * CATCHUP_GAIN
+            FRESH * (1.0 + RECALL_GAIN * rate) * CATCHUP_GAIN
         )
     );
-    let n = s.explain(&d, "back", "night", false);
+    let n = s.explain(&d, "back", "night", None);
     close(n.recall.unwrap(), four(1.0 - rate));
     assert_eq!(n.heldout_gt, Some(40));
     assert_eq!(n.run.as_deref(), Some("run-n"));
@@ -639,23 +728,25 @@ fn measured_recall_raises_need_and_a_class_the_model_lacks_needs_most() {
             0.0,
             0.0,
             0.0,
-            fresh * (1.0 + RECALL_GAIN) * CATCHUP_GAIN
+            FRESH * (1.0 + RECALL_GAIN) * CATCHUP_GAIN
         )
     );
-    let n = s.explain(&d, "back", "night", false);
+    let n = s.explain(&d, "back", "night", Some(RACCOON));
     assert!(n.model_lacks);
     assert_eq!((n.recall, n.heldout_gt), (None, None));
+    assert_eq!(n.visit_class.as_deref(), Some("raccoon"));
+    assert!(n.expanded);
     // Dog: dropped on purpose. No recall information.
     let d = s.score(&f, &[cb(DOG, RIGHT, 100, STRONG)], &[]);
     assert!(!d.catch_up);
-    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, fresh));
+    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, FRESH));
     // Day has no measured run: r = 1 (catch-up is over every scene and still applies).
     let d = s.score(&at("back", "day", "d1"), &person, &[]);
-    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, fresh * CATCHUP_GAIN));
+    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, FRESH * CATCHUP_GAIN));
     // No steer at all: r = U = 1.
     let plain = Need::new(Some(wanted(&c)), None);
     let d = Scorer::new(&plain, &t).score(&f, &raccoon, &[]);
-    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, fresh));
+    assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, FRESH));
 }
 
 #[test]
@@ -676,14 +767,14 @@ fn catch_up_fills_the_lowest_class_of_each_camera() {
             .unwrap()
     };
     // `back`: person (40 held out) is lower than cat (30); car has no held-out car there (not
-    // supported, excluded), raccoon is absent from the model, dog was dropped.
+    // supported, excluded), raccoon and motorcycle are absent from the model, dog was dropped.
     assert!(recall("back", "person") < recall("back", "cat") - CATCHUP_TOL);
-    assert_eq!(of("back"), [true, false, true, false, false]);
+    assert_eq!(of("back"), [true, false, true, false, false, true]);
     // `side`: person and cat on 25 objects each, within the tolerance: both (a tie).
     assert!((recall("side", "person") - recall("side", "cat")).abs() <= CATCHUP_TOL);
-    assert_eq!(of("side"), [true, false, true, true, false]);
-    // A camera with nothing measured: only the absent class.
-    assert_eq!(of("gate"), [false, false, true, false, false]);
+    assert_eq!(of("side"), [true, false, true, true, false, true]);
+    // A camera with nothing measured: only the absent classes.
+    assert_eq!(of("gate"), [false, false, true, false, false, true]);
 }
 
 #[test]
@@ -713,7 +804,7 @@ fn candidates_of_a_file_and_of_a_reply() {
         origin: Some(Origin::BelowThreshold),
         ..pred("dog", [0.0, 300.0, 50.0, 350.0])
     };
-    let rejected = LabelBox {
+    let rejected_dog = LabelBox {
         state: BoxState::Rejected,
         ..auto_box("dog")
     };
@@ -728,33 +819,41 @@ fn candidates_of_a_file_and_of_a_reply() {
             person,
             lost,
             below,
-            rejected,
+            rejected_dog,
             unsure,
             auto_box("bird"),
         ],
         ..LabelFile::default()
     };
+    // By class, in their order within one.
     assert_eq!(
         of_file(&f, Some(&w)),
         [
-            // The cat itself: lone weak, sqrt(0.81) x 0.5; its findings are the raccoon's.
-            cb(CAT, [100, 100, 200, 200], 45, 0),
-            // The raccoon: missed, sqrt(0.49) x 0.5.
-            cb(RACCOON, [100, 100, 200, 200], 35, MISSED),
             cb(PERSON, [300, 100, 340, 200], 35, 0),
             cb(PERSON, [302, 100, 340, 200], 35, 0),
             cb(PERSON, [500, 100, 540, 200], 35, MISSED),
+            // The raccoon: missed, sqrt(0.49) x 0.5.
+            cb(RACCOON, [100, 100, 200, 200], 35, MISSED),
+            // The cat itself: lone weak, sqrt(0.81) x 0.5; its findings are the raccoon's.
+            cb(CAT, [100, 100, 200, 200], 45, 0),
             cb(DOG, [0, 300, 50, 350], 35, MISSED),
         ]
     );
-    // Reviewed: the training boxes only.
+    // Reviewed: the training boxes, the hard negatives and a marker per judged proposal.
     let mut r = f.clone();
     r.status = Status::Reviewed;
     r.boxes[3].state = BoxState::Accepted;
     r.boxes[0].state = BoxState::Rejected;
     assert_eq!(
         of_file(&r, Some(&w)),
-        [cb(PERSON, [500, 100, 540, 200], 100, TRAINING | STRONG)]
+        [
+            cb(PERSON, [500, 100, 540, 200], 100, TRAINING | STRONG),
+            proposed(PERSON),
+            cb(CAT, [100, 100, 200, 200], 0, REJECTED),
+            proposed(CAT),
+            cb(DOG, [10, 10, 50, 50], 0, REJECTED),
+            proposed(DOG),
+        ]
     );
     // No class list: nothing.
     assert!(of_file(&f, None).is_empty());
@@ -780,35 +879,138 @@ fn candidates_of_a_file_and_of_a_reply() {
         of_reply(&rec, Some(&w)),
         [
             cb(PERSON, [0, 0, 10, 10], 45, 0),
-            cb(RACCOON, [100, 100, 150, 150], 30, MISSED),
             // A prediction is on it: the camera model alerted, no miss.
             cb(PERSON, [0, 0, 10, 11], 32, 0),
+            cb(RACCOON, [100, 100, 150, 150], 30, MISSED),
             cb(CAT, [200, 0, 260, 60], 40, MISSED),
         ]
     );
 }
 
 #[test]
-fn a_suggested_class_counts_toward_its_class() {
+fn weak_candidates_are_thinned_and_at_most_eight_of_a_class_kept() {
+    let c = classes();
+    let w = wanted(&c);
+    // Twelve pending person boxes of rising score, and a dog of a VLM no (under a tenth).
+    let mut boxes: Vec<LabelBox> = (0..12)
+        .map(|i| LabelBox {
+            score: Some(0.2 + 0.05 * i as f32),
+            bbox: [i as f32 * 10.0, 0.0, i as f32 * 10.0 + 5.0, 5.0],
+            ..auto_box("person")
+        })
+        .collect();
+    let mut no = auto_box("dog");
+    no.score = Some(0.1);
+    no.auto.vlm = Some(vlm(false));
+    boxes.push(no);
+    let f = LabelFile {
+        boxes,
+        ..LabelFile::default()
+    };
+    let got = of_file(&f, Some(&w));
+    assert_eq!(got.len(), MAX_PER_CLASS, "{got:?}");
+    assert!(got.iter().all(|b| b.class == PERSON));
+    // The eight strongest, in their order.
+    let xs: Vec<u16> = got.iter().map(|b| b.bbox[0]).collect();
+    assert_eq!(xs, [40, 50, 60, 70, 80, 90, 100, 110]);
+}
+
+#[test]
+fn one_object_proposed_as_several_classes_scores_once() {
     let c = classes();
     let need = Need::new(Some(wanted(&c)), None);
     let t = CellTally::default();
-    // The raccoon suggestion of a "cat" box: its own class, missed.
-    let boxes = [
+    let s = Scorer::new(&need, &t);
+    let f = at("back", "night", "d1");
+    let one = expect(1.0, 0.0, 0.0, 0.0, FRESH);
+    let animal = [
+        cb(RACCOON, [100, 100, 200, 200], 100, STRONG),
+        cb(CAT, [102, 100, 200, 200], 100, STRONG),
+        cb(DOG, [100, 100, 198, 202], 100, STRONG),
+    ];
+    let d = s.score(&f, &animal, &[]);
+    assert_eq!(d.score, one, "{d:?}");
+    assert_eq!(d.top, Some(RACCOON), "ties to the first class");
+    // A box inside a bigger one of another class is the same object too.
+    let nested = [
+        cb(CAT, [100, 100, 200, 200], 100, STRONG),
+        cb(DOG, [110, 110, 180, 190], 100, STRONG),
+    ];
+    assert_eq!(s.score(&f, &nested, &[]).score, one);
+    // Two animals apart are two.
+    let two = [
+        cb(CAT, [100, 100, 200, 200], 100, STRONG),
+        cb(DOG, [400, 100, 500, 200], 100, STRONG),
+    ];
+    assert_eq!(
+        s.score(&f, &two, &[]).score,
+        score_of(2.0 * v(0.0, 0.0) * FRESH)
+    );
+    // A weak suggestion on a box: the object's best class only; a strong one wins it.
+    let weak = [
         cb(CAT, [100, 100, 200, 200], 45, 0),
         cb(RACCOON, [100, 100, 200, 200], 35, MISSED),
     ];
-    let d = Scorer::new(&need, &t).score(&at("back", "night", "d1"), &boxes, &[]);
-    let fresh = (1.0 + W_DAY) * RARE_GAIN;
-    let cat = expect(0.45, 0.0, 0.0, 0.0, fresh);
-    let raccoon = expect(0.35 * W_MISSED, 0.0, 0.0, 0.0, fresh);
-    assert!(
-        d.score.abs_diff(cat + raccoon) <= 1,
-        "{} {cat} {raccoon}",
-        d.score
+    let d = s.score(&f, &weak, &[]);
+    assert_eq!(
+        (d.top, d.score),
+        (Some(CAT), expect(0.45, 0.0, 0.0, 0.0, FRESH))
     );
+    let strong = [
+        cb(CAT, [100, 100, 200, 200], 45, 0),
+        cb(RACCOON, [100, 100, 200, 200], 100, MISSED | STRONG),
+    ];
+    let d = s.score(&f, &strong, &[]);
     assert_eq!(d.top, Some(RACCOON));
     assert!(d.missed);
+    assert_eq!(d.score, expect(W_MISSED, 0.0, 0.0, 0.0, FRESH));
+}
+
+#[test]
+fn the_hard_negative_share_falls_as_rejections_come_and_a_real_object_outranks_it() {
+    let c = classes();
+    let need = Need::new(Some(wanted(&c)), None);
+    // `bad` kept 1 of its cat proposals and rejected `rejects` more.
+    let share = |rejects: usize| {
+        let mut t = CellTally::default();
+        proposals(&need, &mut t, "bad", CAT, rejects + 1, 1);
+        let s = Scorer::new(&need, &t);
+        s.score(&at("bad", "night", "d1"), &[cb(CAT, RIGHT, 40, 0)], &[])
+            .hard
+    };
+    let (h5, h20, h80) = (share(5), share(20), share(80));
+    assert!(h5 > 0.0 && h20 < h5 && h80 < h20, "{h5} {h20} {h80}");
+    // A VLM no is likely false even on a camera that keeps the class.
+    let mut t = CellTally::default();
+    proposals(&need, &mut t, "good", CAT, 1, 1);
+    let s = Scorer::new(&need, &t);
+    let no = s.score(
+        &at("good", "night", "d1"),
+        &[cb(CAT, RIGHT, 40, VLM_NO)],
+        &[],
+    );
+    assert!(no.hard > 0.0);
+    let n = s.explain(&no, "good", "night", None);
+    assert_eq!(n.hard_class.as_deref(), Some("cat"));
+    assert!(n.hard_negative > 0.0);
+    // At equal counts, a real object (a camera that keeps the class) outranks a likely false one.
+    let mut t = CellTally::default();
+    proposals(&need, &mut t, "good", CAT, 10, 10);
+    proposals(&need, &mut t, "bad", CAT, 10, 0);
+    review(
+        &need,
+        &mut t,
+        ("bad", "night", "d1"),
+        10,
+        &[trained(CAT, LEFT)],
+    );
+    let s = Scorer::new(&need, &t);
+    for (e, flags) in [(40, 0), (100, STRONG)] {
+        let real = s.score(&at("good", "night", "d1"), &[cb(CAT, RIGHT, e, flags)], &[]);
+        let fake = s.score(&at("bad", "night", "d1"), &[cb(CAT, RIGHT, e, flags)], &[]);
+        assert!(fake.hard > 0.0 && real.hard == 0.0, "{real:?} {fake:?}");
+        assert!(real.score > fake.score, "{real:?} {fake:?}");
+    }
 }
 
 #[test]
@@ -816,31 +1018,28 @@ fn a_gap_in_a_visit_is_found_and_the_visit_holds_its_decided_classes() {
     // One event: a raccoon decided at 0 s and 10 s, a strong person at 10 s only. At 5 s a frame
     // with nothing and one with the raccoon already boxed; one at 40 s, beyond GAP_S of both.
     let raccoon_at = |x: u16| trained(RACCOON, [x, 100, x + 50, 150]);
-    let first = [raccoon_at(100)];
-    let last = [
+    let first: &'static [CellBox] = Box::leak(Box::new([raccoon_at(100)]));
+    let last: &'static [CellBox] = Box::leak(Box::new([
         raccoon_at(200),
         cb(PERSON, [400, 100, 440, 200], 100, STRONG),
-    ];
-    let covered = [cb(RACCOON, [150, 100, 200, 150], 30, 0)];
-    let frame = |ms: i64, boxes: &'static [CellBox], listed: bool| DayFrame {
+    ]));
+    let covered: &'static [CellBox] =
+        Box::leak(Box::new([cb(RACCOON, [150, 100, 200, 150], 30, 0)]));
+    let frame = |ms: i64, boxes: &'static [CellBox]| DayFrame {
         ms: Some(ms),
         alone: false,
         boxes,
-        listed,
     };
-    let first: &'static [CellBox] = Box::leak(Box::new(first));
-    let last: &'static [CellBox] = Box::leak(Box::new(last));
-    let covered: &'static [CellBox] = Box::leak(Box::new(covered));
     let frames = [
-        frame(0, first, false),
-        frame(5_000, &[], true),
-        frame(5_000, covered, true),
-        frame(10_000, last, false),
-        frame(40_000, &[], true),
+        frame(0, first),
+        frame(5_000, &[]),
+        frame(5_000, covered),
+        frame(10_000, last),
+        frame(40_000, &[]),
         // An import of its own: no gap, its own visit.
         DayFrame {
             alone: true,
-            ..frame(5_000, &[], true)
+            ..frame(5_000, &[])
         },
     ];
     let out = day(&frames);
@@ -856,7 +1055,7 @@ fn a_gap_in_a_visit_is_found_and_the_visit_holds_its_decided_classes() {
     assert!(out[4].gaps.is_empty(), "{out:?}");
     assert_eq!(out[4].visit_classes, [RACCOON]);
     assert!(out[5].gaps.is_empty() && out[5].visit_classes.is_empty());
-    assert_eq!(out[0], DayOut::default(), "not listed");
+    assert!(out[0].gaps.is_empty() && out[3].gaps.is_empty());
     // The order the frames come in changes nothing.
     let mut rev = frames.to_vec();
     rev.reverse();
@@ -869,10 +1068,7 @@ fn a_gap_in_a_visit_is_found_and_the_visit_holds_its_decided_classes() {
     let t = CellTally::default();
     let d = Scorer::new(&need, &t).score(&at("back", "night", "d1"), &[], &out[1].gaps);
     assert!(d.gap && d.top == Some(RACCOON));
-    assert_eq!(
-        d.score,
-        expect(0.5 * W_MISSED, 0.0, 0.0, 0.0, (1.0 + W_DAY) * RARE_GAIN)
-    );
+    assert_eq!(d.score, expect(0.5 * W_MISSED, 0.0, 0.0, 0.0, FRESH));
 }
 
 #[test]
@@ -900,13 +1096,13 @@ fn a_visit_expands_for_a_rare_or_catch_up_class() {
     );
     let s = Scorer::new(&need, &t);
     // Raccoon: under the floor.
-    assert!(s.expands("gate", &[RACCOON]));
+    assert_eq!(s.expands("gate", &[RACCOON]), Some(RACCOON));
     // Car: past the floor, no catch-up on `gate`.
-    assert!(!s.expands("gate", &[CAR]));
+    assert_eq!(s.expands("gate", &[CAR]), None);
     // Person: past the floor, but the catch-up class of `back`.
-    assert!(!s.expands("gate", &[PERSON]));
-    assert!(s.expands("back", &[PERSON, CAR]));
-    assert!(!s.expands("back", &[]));
+    assert_eq!(s.expands("gate", &[PERSON]), None);
+    assert_eq!(s.expands("back", &[PERSON, CAR]), Some(PERSON));
+    assert_eq!(s.expands("back", &[]), None);
     assert_eq!(visit_score(1000, 2, true), 666);
     assert_eq!(visit_score(1000, 2, false), 333);
     assert_eq!(visit_score(u32::MAX, 0, false), u32::MAX);
@@ -924,8 +1120,29 @@ fn a_candidate_is_twelve_bytes_and_its_parts_round() {
     let w = wanted(&c);
     assert_eq!(class_index(&w, "Raccoon"), Some(RACCOON));
     assert_eq!(class_index(&w, "bird"), None);
-    assert_eq!(
-        proposed_classes(["cat", "raccoon", "cat", "bird"], Some(&w)),
-        [RACCOON, CAT]
+    let mut set = ClassSet::default();
+    for k in [0, 63, 64, 199] {
+        set.insert(k);
+    }
+    assert_eq!(set.iter().collect::<Vec<_>>(), [0, 63, 64, 199]);
+}
+
+#[test]
+fn a_steer_compares_by_identity_and_shows_a_summary() {
+    let a = Steer {
+        spots: Arc::new(parked()),
+        ..Steer::default()
+    };
+    let b = a.clone();
+    assert_eq!(a, b);
+    let c = Steer {
+        spots: Arc::new(parked()),
+        ..Steer::default()
+    };
+    assert_ne!(a, c, "equal tables, but other snapshots");
+    let shown = format!("{a:?}");
+    assert!(
+        shown.contains("spots: 1") && !shown.contains("bbox"),
+        "{shown}"
     );
 }

@@ -163,13 +163,13 @@ fn tally(items: &[Item], n: usize, facts: &HashMap<String, Seen>, out: &mut Stri
     let _ = writeln!(out, "\n#### {title}: first {n}\n");
     let _ = writeln!(
         out,
-        "| frames | animal | rare animal (< {} boxes) | IR/night person | missed-cue boxes | gap frames | parked-spot frames | spot boxes | expanded visits |",
+        "| frames | animal | rare animal (< {} boxes) | IR/night person | missed-cue boxes | gap frames | parked-spot frames | spot boxes | expanded visits | spot-led | hard-negative |",
         need::CLASS_FLOOR
     );
-    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
     let _ = writeln!(
         out,
-        "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         first.len(),
         count(&|s| s.animal),
         count(&|s| s.rare_animal),
@@ -179,6 +179,8 @@ fn tally(items: &[Item], n: usize, facts: &HashMap<String, Seen>, out: &mut Stri
         count(&|s| s.spot_boxes > 0),
         sum(&|s| s.spot_boxes),
         count(&|s| s.need.as_ref().is_some_and(|n| n.expanded)),
+        count(&|s| s.need.as_ref().is_some_and(|n| n.spot)),
+        count(&|s| s.need.as_ref().is_some_and(|n| n.hard_negative > 0.0)),
     );
     let _ = writeln!(
         out,
@@ -360,6 +362,7 @@ fn the_recommended_order_before_and_after_the_need_model() {
             (n.new_day, "new day"),
             (n.expanded, "expanded"),
             (n.model_lacks, "model lacks"),
+            (n.hard_negative > 0.0, "hard negative"),
         ]
         .iter()
         .filter(|(on, _)| *on)
@@ -414,6 +417,29 @@ fn the_recommended_order_before_and_after_the_need_model() {
             .collect();
         let _ = writeln!(out, "- {}: {}", item.frame, list.join("; "));
     }
+    // What the review index would hold of the folder's need candidates: every frame of every
+    // source, a row of 108 bytes plus 12 bytes a candidate.
+    let all = queue::candidates(&dir, queue::QueueSource::All);
+    let (mut frames, mut cands) = (0usize, 0usize);
+    for c in &all {
+        let Some(fr) = Frame::resolve(&dir, &c.rel) else {
+            continue;
+        };
+        let n = match (fr.labels().ok().flatten(), fr.record().ok()) {
+            (Some(l), _) => need::of_file(&l, Some(&w)).len(),
+            (None, Some(r)) => need::of_reply(&r, Some(&w)).len(),
+            (None, None) => continue,
+        };
+        frames += 1;
+        cands += n;
+    }
+    let per = cands as f64 / frames.max(1) as f64;
+    let _ = writeln!(
+        out,
+        "\n## Index need candidates\n\n{frames} frames, {cands} candidates: {per:.2} a frame, \
+         {:.1} bytes a frame in the arena (rows 108 bytes)",
+        per * 12.0
+    );
     std::fs::create_dir_all(&out_dir).unwrap();
     std::fs::write(out_dir.join("report.md"), &out).unwrap();
     println!("{out}");

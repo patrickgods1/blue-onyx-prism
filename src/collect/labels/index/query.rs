@@ -17,17 +17,20 @@
 //! ones after it become strings.
 
 use super::super::Status;
-use super::super::need::{self, CellBox, CellTally, Need, RecallNeed, Scorer};
+use super::super::need::{self, CellBox, CellTally, DayOut, Need, RecallNeed, Scorer};
 use super::super::queue::{
     AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, Filters, Item, Order,
     QueueSource, SortKey, StatusFilter, Uncertainty,
 };
 use super::super::recommend;
+use super::super::statics;
 use super::State;
 use super::answer::{Answer, UPCOMING};
 use super::row::{Name, Names, Row, Shard, auto_bit, stem_of};
+use crate::sync::LockExt as _;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 /// A name filter, over ids.
 enum Want {
@@ -519,35 +522,126 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
     }
 }
 
-/// The reviewed rows `q` counts, as the walk counts them ([`Need::add_reviewed`]).
-fn need_tally(state: &State, q: &Compiled, names: &Names, n: &Need<'_>) -> CellTally {
+/// What the Recommended order derives from one shard's rows alone, kept per shard until the shard
+/// changes ([`Shard::version`]) or the query counts other rows ([`count_key`]): its counted rows'
+/// gaps and visits ([`need::day`]) and its reviewed rows' part of the tally (also kept with the
+/// parked spots it was counted with, [`Need::spots`], compared by identity: the entry holds the
+/// table, so no other table can take its address). Only what is pure of the rows is kept, so an
+/// answer from it is the answer without it.
+#[derive(Debug, Default)]
+pub(super) struct NeedCache {
+    shards: Mutex<HashMap<String, ShardNeed>>,
+}
+
+#[derive(Debug, Default)]
+struct ShardNeed {
+    version: u64,
+    filter: String,
+    outs: Option<Arc<Vec<DayOut>>>,
+    tally: Option<(Option<Arc<statics::Table>>, Arc<CellTally>)>,
+}
+
+impl NeedCache {
+    /// The entry of `shard` for `filter`, emptied when either changed.
+    fn with<T>(&self, shard: &Shard, filter: &str, f: impl FnOnce(&mut ShardNeed) -> T) -> T {
+        let mut map = self.shards.lock_recover();
+        let e = map.entry(shard.day.clone()).or_default();
+        if e.version != shard.version || e.filter != filter {
+            *e = ShardNeed {
+                version: shard.version,
+                filter: filter.to_string(),
+                ..ShardNeed::default()
+            };
+        }
+        f(e)
+    }
+
+    fn outs(
+        &self,
+        shard: &Shard,
+        filter: &str,
+        make: impl FnOnce() -> Vec<DayOut>,
+    ) -> Arc<Vec<DayOut>> {
+        if let Some(o) = self.with(shard, filter, |e| e.outs.clone()) {
+            return o;
+        }
+        let o = Arc::new(make());
+        self.with(shard, filter, |e| e.outs = Some(o.clone()));
+        o
+    }
+
+    fn tally(
+        &self,
+        shard: &Shard,
+        filter: &str,
+        spots: Option<&Arc<statics::Table>>,
+        make: impl FnOnce() -> CellTally,
+    ) -> Arc<CellTally> {
+        let same = |kept: &Option<Arc<statics::Table>>| match (kept, spots) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let kept = self.with(shard, filter, |e| {
+            e.tally
+                .as_ref()
+                .filter(|(s, _)| same(s))
+                .map(|(_, t)| t.clone())
+        });
+        if let Some(t) = kept {
+            return t;
+        }
+        let t = Arc::new(make());
+        self.with(shard, filter, |e| {
+            e.tally = Some((spots.cloned(), t.clone()))
+        });
+        t
+    }
+}
+
+/// What decides the rows a query counts (every filter but status and auto): the key of the
+/// shard parts of [`NeedCache`].
+fn count_key(f: &Filters) -> String {
+    format!(
+        "{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}",
+        f.source, f.scene, f.camera, f.bucket, f.label
+    )
+}
+
+/// The reviewed rows `q` counts, as the walk counts them ([`Need::add_reviewed`]), one shard's
+/// part at a time ([`NeedCache`]).
+fn need_tally(
+    state: &State,
+    q: &Compiled,
+    names: &Names,
+    n: &Need<'_>,
+    cache: &NeedCache,
+    filter: &str,
+) -> CellTally {
     let mut tally = CellTally::default();
     for shard in state.shards.values() {
-        let date = need::date_of(&shard.day);
-        for row in &shard.rows {
-            if row.part.status != Status::Reviewed || !q.counts(row) {
-                continue;
+        let part = cache.tally(shard, filter, n.spots(), || {
+            let mut t = CellTally::default();
+            let date = need::date_of(&shard.day);
+            for row in &shard.rows {
+                if row.part.status != Status::Reviewed || !q.counts(row) {
+                    continue;
+                }
+                n.add_reviewed(
+                    &mut t,
+                    &need::Reviewed {
+                        camera: names.name(row.cand.camera),
+                        scene: names.name(row.cand.scene),
+                        day: date,
+                        width: row.side.width,
+                        height: row.side.height,
+                        boxes: shard.boxes_of(row),
+                    },
+                );
             }
-            let proposed = need::proposed_classes(
-                names
-                    .proposed(row.part.proposed)
-                    .iter()
-                    .map(|c| names.name(*c)),
-                n.wanted(),
-            );
-            n.add_reviewed(
-                &mut tally,
-                &need::Reviewed {
-                    camera: names.name(row.cand.camera),
-                    scene: names.name(row.cand.scene),
-                    day: date,
-                    width: row.side.width,
-                    height: row.side.height,
-                    boxes: shard.boxes_of(row),
-                    proposed: &proposed,
-                },
-            );
-        }
+            t
+        });
+        tally.merge_ref(&part);
     }
     tally
 }
@@ -560,6 +654,7 @@ pub(super) fn answer(
     f: &Filters,
     after: Option<&str>,
     then: Option<&str>,
+    cache: &NeedCache,
 ) -> (Answer, Vec<String>) {
     let mut q = Compiled::new(f, names);
     // Before anything sorts: the pivot's place needs the scores too.
@@ -569,7 +664,10 @@ pub(super) fn answer(
     let pivot = Pivot::of(state, &q, after, then);
     let mut tally = Tally::new(names);
     let n = f.need();
-    let cells = n.as_ref().map(|n| need_tally(state, &q, names, n));
+    let filter = count_key(f);
+    let cells = n
+        .as_ref()
+        .map(|n| need_tally(state, &q, names, n, cache, &filter));
     let placed = match (f.order, &n, &cells) {
         (Order::Recommended, Some(n), Some(cells)) => {
             let random = recommend::random_slots(f);
@@ -577,6 +675,8 @@ pub(super) fn answer(
             let weighs = Weighs {
                 scorer: &scorer,
                 names,
+                cache,
+                filter: &filter,
             };
             recommended(state, &q, &mut tally, pivot.as_ref(), random, &weighs)
         }
@@ -624,6 +724,8 @@ pub(super) fn answer(
 struct Weighs<'a> {
     scorer: &'a Scorer<'a>,
     names: &'a Names,
+    cache: &'a NeedCache,
+    filter: &'a str,
 }
 
 impl Weighs<'_> {
@@ -637,24 +739,28 @@ impl Weighs<'_> {
         }
     }
 
-    /// The need of a listed row with gaps `gaps`, and whether its visit of `visit_classes`
-    /// expands.
+    /// The need of a listed row with gaps `gaps`, and the class that expands its visit of
+    /// `visit_classes`.
     fn visit(
         &self,
         shard: &Shard,
         row: &Row,
         gaps: &[CellBox],
         visit_classes: &[u16],
-    ) -> recommend::Visit {
+    ) -> (recommend::Visit, Option<u16>) {
         let d = self
             .scorer
             .score(&self.facts(shard, row), shard.boxes_of(row), gaps);
-        recommend::Visit {
-            score: d.score,
-            expanded: self
-                .scorer
-                .expands(self.names.name(row.cand.camera), visit_classes),
-        }
+        let class = self
+            .scorer
+            .expands(self.names.name(row.cand.camera), visit_classes);
+        (
+            recommend::Visit {
+                score: d.score,
+                expanded: class.is_some(),
+            },
+            class,
+        )
     }
 
     /// The page's need of a listed row at event rank `rank`, as the walk makes it.
@@ -663,13 +769,13 @@ impl Weighs<'_> {
         shard: &Shard,
         row: &Row,
         gaps: &[CellBox],
-        expanded: bool,
+        visit: Option<u16>,
         rank: u32,
     ) -> RecallNeed {
         let at = self.facts(shard, row);
         let d = self.scorer.score(&at, shard.boxes_of(row), gaps);
-        let mut n = self.scorer.explain(&d, at.camera, at.scene, expanded);
-        n.visit_score = need::visit_score(n.score, rank, expanded);
+        let mut n = self.scorer.explain(&d, at.camera, at.scene, visit);
+        n.visit_score = need::visit_score(n.score, rank, visit.is_some());
         n
     }
 }
@@ -757,8 +863,9 @@ fn recommended<'a>(
     let mut listed: Vec<(&'a Shard, &'a Row)> = Vec::new();
     let mut keys: Vec<recommend::Key> = Vec::new();
     let mut visits: Vec<recommend::Visit> = Vec::new();
-    // Per listed row: its gaps (what its need is made of besides its own boxes).
-    let mut gaps: Vec<Vec<CellBox>> = Vec::new();
+    // Per listed row: the day's outputs and its place in them (its gaps), and the class that
+    // expands its visit.
+    let mut gaps: Vec<(Arc<Vec<DayOut>>, usize, Option<u16>)> = Vec::new();
     // The day's counted rows, for [`need::day`].
     let mut day: Vec<(&'a Shard, &'a Row, bool)> = Vec::new();
     pass(state, q, tally, &mut |step| match step {
@@ -777,26 +884,28 @@ fn recommended<'a>(
         Step::DayDone => {
             events.add_day(&mut members);
             members.clear();
-            let outs = {
+            let Some((this, _, _)) = day.first().copied() else {
+                return;
+            };
+            let outs = weighs.cache.outs(this, weighs.filter, || {
                 let frames: Vec<need::DayFrame<'_>> = day
                     .iter()
-                    .map(|(shard, row, lists)| need::DayFrame {
+                    .map(|(shard, row, _)| need::DayFrame {
                         ms: recommend::event_ms(shard.timestamp(row)),
                         alone: row.side.alone,
                         boxes: shard.boxes_of(row),
-                        listed: *lists,
                     })
                     .collect();
                 need::day(&frames)
-            };
-            for ((shard, row, lists), out) in day.iter().zip(outs) {
+            });
+            for (at, ((shard, row, lists), out)) in day.iter().zip(outs.iter()).enumerate() {
                 if !lists {
                     continue;
                 }
-                let visit = weighs.visit(shard, row, &out.gaps, &out.visit_classes);
+                let (visit, class) = weighs.visit(shard, row, &out.gaps, &out.visit_classes);
                 keys.push(recommend::key(&q.uncertainty(row), visit));
                 visits.push(visit);
-                gaps.push(out.gaps);
+                gaps.push((outs.clone(), at, class));
             }
             day.clear();
         }
@@ -842,9 +951,9 @@ fn recommended<'a>(
     };
     let need = order.get(from).and_then(|(i, rank, _)| {
         let (shard, row) = at(*i)?;
-        let expanded = visits.get(*i).is_some_and(|v| v.expanded);
-        let gaps = gaps.get(*i).map_or(&[][..], Vec::as_slice);
-        Some(weighs.need(shard, row, gaps, expanded, *rank))
+        let (outs, place, class) = gaps.get(*i)?;
+        let gaps = outs.get(*place).map_or(&[][..], |o| o.gaps.as_slice());
+        Some(weighs.need(shard, row, gaps, *class, *rank))
     });
     Placed {
         need,

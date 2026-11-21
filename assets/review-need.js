@@ -22,7 +22,8 @@
   // Why the Recommended order put `item` (its `need`, `camera`, `scene`, `event_rank`) where it
   // is, e.g. "raccoon · back · IR: 3 boxes on this camera (3 in all, floor 20), recall 22% on 9
   // held-out boxes (lowest on this camera), camera model missed it, new place in view, frame 3 of
-  // a raccoon visit". '' without a need.
+  // a raccoon visit", and "likely false person: rejecting it teaches the model" for the
+  // hard-negative share. '' without a need.
   function note(item) {
     var n = item && item.need;
     if (!n) return '';
@@ -54,8 +55,11 @@
     if (n.new_region) parts.push('new place in view');
     if (n.new_day) parts.push('new day');
     if (!n.strong && n.evidence != null && n.evidence < 0.5) parts.push('weak evidence (' + n.evidence.toFixed(2) + ')');
+    // Only when the camera's kept share lowered a box of the class.
     if (n.proposed != null) parts.push((n.kept || 0) + ' of ' + n.proposed + ' proposals kept on this camera');
-    if (n.expanded && item.event_rank) parts.push('frame ' + (item.event_rank + 1) + ' of a ' + n.class + ' visit');
+    // The class decided in the visit that makes it serve more of its frames.
+    if (n.expanded && item.event_rank) parts.push('frame ' + (item.event_rank + 1) + ' of a ' + (n.visit_class || n.class) + ' visit');
+    if (n.hard_negative && n.hard_class) parts.push('likely false ' + n.hard_class + ': rejecting it teaches the model');
     return n.class + ' · ' + where + ': ' + parts.join(', ');
   }
 
