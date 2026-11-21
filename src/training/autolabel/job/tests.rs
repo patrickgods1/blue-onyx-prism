@@ -184,8 +184,18 @@ impl CommandRunner for LabelFake {
                  "species_scores": {"raccoon": 0.6, "cat": 0.4}},
                 {"label": "unicorn", "bbox": [1, 1, 5, 5], "score": 0.9, "agree": true, "sources": {}}
             ]));
-            let line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48,
-                                          "boxes": boxes, "ms": {"gdino": 10}});
+            let mut line = serde_json::json!({"frame": f["frame"], "width": 64, "height": 48,
+                                              "boxes": boxes, "ms": {"gdino": 10}});
+            // The night extras on night and IR frames, as the script reports them.
+            let night = f["scene"] == "ir" || f["scene"] == "night";
+            if night && cmd.args.iter().any(|a| a == "--night-enhance") {
+                line["enhanced"] = true.into();
+                line["enhanced_boxes"] = serde_json::json!({"gdino": 1, "rfdetr": 0});
+            }
+            if night && cmd.args.iter().any(|a| a == "--mdv6") {
+                line["mdv6"] =
+                    serde_json::json!({"votes": 1, "added": 1, "dropped": 0, "guesses": 1});
+            }
             text.push_str(&line.to_string());
             text.push('\n');
             on_line(&format!(
@@ -1499,6 +1509,80 @@ fn script_flags_follow_the_run_options() {
             .contains(&"model:mdv6-yolov9-c".to_string()),
         "the weights are fetched"
     );
+}
+
+#[test]
+fn a_night_run_records_its_extras_and_never_accepts_megadetector_alone() {
+    let t = tmp("night-extras");
+    let rels = frames(&t.0, 2, true);
+    let cfg = config(&t.0);
+    let fake = LabelFake {
+        boxes: Some(serde_json::json!([
+            {"label": "car", "bbox": [1, 1, 30, 20], "score": 0.82, "agree": true,
+             "sources": {"gdino": 0.7, "rfdetr": 0.94, "mdv6": 0.9}},
+            {"label": "raccoon", "bbox": [35, 20, 60, 46], "score": 0.92, "agree": true,
+             "sources": {"mdv6": 0.92}, "animal_guess": true,
+             "species_scores": {"raccoon": 0.41, "cat": 0.3}}
+        ])),
+        ..LabelFake::default()
+    };
+    let mut req = AutolabelRequest::new(FrameFilter::default());
+    req.mdv6 = true;
+    let job = plan_autolabel(&cfg, req, &host()).unwrap();
+    let out = run_job(&job, &fake).unwrap();
+    let rep = &out.result;
+    assert_eq!(rep["night_enhance"], "clahe", "{rep}");
+    assert_eq!(rep["mdv6"], "mdv6-yolov9-c at 0.2", "{rep}");
+    assert_eq!(rep["frames_enhanced"], 2, "{rep}");
+    assert_eq!(rep["enhanced_boxes"]["gdino"], 2, "{rep}");
+    assert_eq!(
+        (&rep["mdv6_votes"], &rep["mdv6_added"], &rep["mdv6_guesses"]),
+        (&2.into(), &2.into(), &2.into()),
+        "{rep}"
+    );
+    assert!(
+        out.summary
+            .contains("2 night or IR frames also labelled on a copy enhanced by clahe (2 boxes"),
+        "{}",
+        out.summary
+    );
+    assert!(
+        out.summary.contains("MegaDetector: 2 votes"),
+        "{}",
+        out.summary
+    );
+    let dir = t.0.join("dataset");
+    for rel in &rels {
+        let f = labels_of(&dir, rel);
+        let marker = f.auto_run.as_ref().unwrap();
+        assert!(
+            marker.labeler.ends_with(" + mdv6-yolov9-c + night-clahe"),
+            "{marker:?}"
+        );
+        // The car the labelers agree on keeps their triage; MegaDetector's vote is in its labelers.
+        let car = f.boxes.iter().find(|b| b.label == "car").unwrap();
+        assert_eq!(car.auto.triage, Some(Triage::Accept));
+        assert!(car.auto.labelers.contains_key("mdv6"));
+        // The raccoon only MegaDetector found: review, whatever its score and `agree` say.
+        let rac = f.boxes.iter().find(|b| b.label == "raccoon").unwrap();
+        assert_eq!(rac.auto.triage, Some(Triage::Review));
+        assert!(
+            rac.auto
+                .why
+                .iter()
+                .any(|w| w.starts_with("animal? MegaDetector")),
+            "{:?}",
+            rac.auto.why
+        );
+        assert_eq!(rac.state, BoxState::Pending);
+    }
+    // The same run again skips them; a run without MegaDetector labels them again.
+    let mut again = AutolabelRequest::new(FrameFilter::default());
+    again.mdv6 = true;
+    let job = plan_autolabel(&cfg, again, &host()).unwrap();
+    assert_eq!(job.preview().unwrap().skipped_done, 2);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    assert_eq!(job.preview().unwrap().skipped_done, 0);
 }
 
 /// A SAM 3 run, past the plan's login gate (it looks at this machine's token).
