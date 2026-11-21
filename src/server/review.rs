@@ -3773,6 +3773,31 @@ mod tests {
     }
 
     both_ways!(
+        a_damaged_runs_json_still_answers_next,
+        a_damaged_runs_json_still_answers_next_indexed,
+        a_damaged_runs_json_still_answers_next_in
+    );
+
+    /// The need's recall comes from `runs.json` (`steer::recall`): a damaged one measures nothing,
+    /// so the queue answers as it does without one: 200, the same order, no recall named.
+    async fn a_damaged_runs_json_still_answers_next_in(way: Way) {
+        let d = way.ds();
+        let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.7);
+        let b = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_b", 0.6);
+        let plain = order_of(&d, &[]).await;
+        assert_eq!(plain.len(), 2, "{plain:?}");
+        let runs = crate::training::runs_file(&d.state.config_read());
+        std::fs::create_dir_all(runs.parent().unwrap()).unwrap();
+        std::fs::write(&runs, b"{ not json").unwrap();
+        // `next_of` checks the 200.
+        let v = next_of(&d, &[]).await;
+        assert!(v["item"]["need"]["score"].as_u64() > Some(0), "{v}");
+        assert!(v["item"]["need"]["recall"].is_null(), "{v}");
+        assert_eq!(order_of(&d, &[]).await, plain);
+        assert!(plain.iter().any(|(f, _)| *f == a) && plain.iter().any(|(f, _)| *f == b));
+    }
+
+    both_ways!(
         a_limited_bulk_accept_keeps_the_uncertainty_order,
         a_limited_bulk_accept_keeps_the_uncertainty_order_indexed,
         a_limited_bulk_accept_keeps_the_uncertainty_order_in
