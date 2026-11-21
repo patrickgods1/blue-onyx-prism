@@ -288,8 +288,12 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     go to a human (`auto=overlaps`), never a bulk action; `overlaps_checked` marks a reviewer's look
     (`ReviewRules.overlapsCheckedOnSave`).
   - Queue (`queue.rs`): `queue::build` is the reference walk for bulk actions, previews, the CLI, coverage and spots
-    (uncertainty order). `GET /v1/review/next` alone defaults to Recommended (`recommend.rs`: reopened, event rank,
-    balance bands, uncertainty; `order` is read by `server::review::next_order` only, never `Filters::from_query`);
+    (uncertainty order). `GET /v1/review/next` alone defaults to Recommended (`recommend.rs`: reopened; recall need
+    (`need.rs`: class×scene and camera cells vs targets, rare floor, held-out recall + per-camera catch-up from
+    `labels::recall`, κ per camera, cues missed/spot/region/day/gap, one object one term, hard-negative share) divided
+    by (1 + event rank·P) with rare-visit expansion, in bands; uncertainty. Walk and index call the same `need`
+    functions on one `Filters.steer` snapshot per request (`server::review::steer`: recall from runs.json read-only,
+    spot table from index rows). `order` is read by `server::review::next_order` only, never `Filters::from_query`);
     `auto=` and `balance=` keep their own orders. Balance weighs each camera's kept share of a class's proposals
     (`queue::proposed_labels`, `BalanceTally.precision`).
   - Random picks: in the default view only (`recommend::random_slots`) one slot in `RANDOM_EVERY` is a frame of a fixed
