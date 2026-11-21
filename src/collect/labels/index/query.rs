@@ -13,6 +13,9 @@
 //! keys and needs ([`need::Scorer::score`], the walk's function on the walk's inputs), and
 //! [`recommend::arrange`] sorts them as the walk does.
 //!
+//! Held-out steering needs no row field: whether a shard's day is held out
+//! ([`Need::heldout_day`]) is asked once per shard and query ([`Held`]), from its day folder.
+//!
 //! The steps of the pass are those of `queue::build`, in its order. Only the found frame and the
 //! ones after it become strings.
 
@@ -526,8 +529,8 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
 /// changes ([`Shard::version`]) or the query counts other rows ([`count_key`]): its counted rows'
 /// gaps and visits ([`need::day`]) and its reviewed rows' part of the tally (also kept with the
 /// parked spots it was counted with, [`Need::spots`], compared by identity: the entry holds the
-/// table, so no other table can take its address). Only what is pure of the rows is kept, so an
-/// answer from it is the answer without it.
+/// table, so no other table can take its address; and with whether its day was held out). Only
+/// what is pure of the rows is kept, so an answer from it is the answer without it.
 #[derive(Debug, Default)]
 pub(super) struct NeedCache {
     shards: Mutex<HashMap<String, ShardNeed>>,
@@ -543,7 +546,8 @@ struct ShardNeed {
     version: u64,
     filter: String,
     outs: Option<Arc<Vec<DayOut>>>,
-    tally: Option<(Option<Arc<statics::Table>>, Arc<CellTally>)>,
+    /// The tally part, with the spot table and the held-out bit it was counted with.
+    tally: Option<(Option<Arc<statics::Table>>, bool, Arc<CellTally>)>,
 }
 
 impl NeedCache {
@@ -574,7 +578,7 @@ impl NeedCache {
                                     })
                                     .sum::<usize>()
                         })
-                        + e.tally.as_ref().map_or(0, |(_, t)| t.bytes())
+                        + e.tally.as_ref().map_or(0, |(_, _, t)| t.bytes())
                 })
                 .sum::<usize>()
     }
@@ -623,6 +627,7 @@ impl NeedCache {
         shard: &Shard,
         filter: &str,
         spots: Option<&Arc<statics::Table>>,
+        heldout: bool,
         make: impl FnOnce() -> CellTally,
     ) -> Arc<CellTally> {
         let same = |kept: &Option<Arc<statics::Table>>| match (kept, spots) {
@@ -633,8 +638,8 @@ impl NeedCache {
         let kept = self.with(shard, filter, |e| {
             e.tally
                 .as_ref()
-                .filter(|(s, _)| same(s))
-                .map(|(_, t)| t.clone())
+                .filter(|(s, h, _)| same(s) && *h == heldout)
+                .map(|(_, _, t)| t.clone())
         });
         if let Some(t) = kept {
             self.count(true);
@@ -643,9 +648,33 @@ impl NeedCache {
         self.count(false);
         let t = Arc::new(make());
         self.with(shard, filter, |e| {
-            e.tally = Some((spots.cloned(), t.clone()))
+            e.tally = Some((spots.cloned(), heldout, t.clone()))
         });
         t
+    }
+}
+
+/// Which shards of a query are held-out days ([`Need::heldout_day`]), each asked once: by day
+/// folder.
+struct Held<'a>(HashMap<&'a str, bool>);
+
+impl<'a> Held<'a> {
+    /// Every shard of `state` under `n` (none when held-out steering is off).
+    fn of(state: &'a State, n: &Need<'_>) -> Self {
+        if !n.steers_heldout() {
+            return Self(HashMap::new());
+        }
+        Self(
+            state
+                .shards
+                .values()
+                .map(|s| (s.day.as_str(), n.heldout_day(&s.day)))
+                .collect(),
+        )
+    }
+
+    fn day(&self, shard: &Shard) -> bool {
+        self.0.get(shard.day.as_str()).copied().unwrap_or(false)
     }
 }
 
@@ -667,10 +696,12 @@ fn need_tally(
     n: &Need<'_>,
     cache: &NeedCache,
     filter: &str,
+    held: &Held<'_>,
 ) -> CellTally {
     let mut tally = CellTally::default();
     for shard in state.shards.values() {
-        let part = cache.tally(shard, filter, n.spots(), || {
+        let heldout = held.day(shard);
+        let part = cache.tally(shard, filter, n.spots(), heldout, || {
             let mut t = CellTally::default();
             let date = need::date_of(&shard.day);
             for row in &shard.rows {
@@ -686,6 +717,7 @@ fn need_tally(
                         width: row.side.width,
                         height: row.side.height,
                         boxes: shard.boxes_of(row),
+                        heldout,
                     },
                 );
             }
@@ -718,11 +750,13 @@ pub(super) fn answer(
     if n.is_some() {
         cache.retain(state);
     }
+    let held = n.as_ref().map(|n| Held::of(state, n));
     let cells = n
         .as_ref()
-        .map(|n| need_tally(state, &q, names, n, cache, &filter));
-    let placed = match (f.order, &n, &cells) {
-        (Order::Recommended, Some(n), Some(cells)) => {
+        .zip(held.as_ref())
+        .map(|(n, held)| need_tally(state, &q, names, n, cache, &filter, held));
+    let placed = match (f.order, &n, &cells, &held) {
+        (Order::Recommended, Some(n), Some(cells), Some(held)) => {
             let random = recommend::random_slots(f);
             let scorer = Scorer::new(n, cells);
             let weighs = Weighs {
@@ -730,6 +764,7 @@ pub(super) fn answer(
                 names,
                 cache,
                 filter: &filter,
+                held,
             };
             recommended(state, &q, &mut tally, pivot.as_ref(), random, &weighs)
         }
@@ -779,6 +814,7 @@ struct Weighs<'a> {
     names: &'a Names,
     cache: &'a NeedCache,
     filter: &'a str,
+    held: &'a Held<'a>,
 }
 
 impl Weighs<'_> {
@@ -789,6 +825,7 @@ impl Weighs<'_> {
             day: need::date_of(&shard.day),
             width: row.side.width,
             height: row.side.height,
+            heldout: self.held.day(shard),
         }
     }
 

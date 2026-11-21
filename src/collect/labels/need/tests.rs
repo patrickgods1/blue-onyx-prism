@@ -62,6 +62,7 @@ fn at<'a>(camera: &'a str, scene: &'a str, day: &'a str) -> Facts<'a> {
         day,
         width: 640,
         height: 480,
+        heldout: false,
     }
 }
 
@@ -69,7 +70,19 @@ fn at<'a>(camera: &'a str, scene: &'a str, day: &'a str) -> Facts<'a> {
 fn review(
     need: &Need<'_>,
     t: &mut CellTally,
+    day: (&str, &str, &str),
+    n: usize,
+    boxes: &[CellBox],
+) {
+    review_split(need, t, day, false, n, boxes);
+}
+
+/// [`review`] of a held-out day or not.
+fn review_split(
+    need: &Need<'_>,
+    t: &mut CellTally,
     (camera, scene, day): (&str, &str, &str),
+    heldout: bool,
     n: usize,
     boxes: &[CellBox],
 ) {
@@ -83,6 +96,7 @@ fn review(
                 width: 640,
                 height: 480,
                 boxes,
+                heldout,
             },
         );
     }
@@ -645,6 +659,8 @@ fn the_quarter_box_tally_is_the_same_in_any_order() {
                 width: 640,
                 height: 480,
                 boxes: &f.3,
+                // The day d1 held out: its boxes count twice, apart.
+                heldout: f.2 == "d1",
             },
         );
     };
@@ -682,6 +698,11 @@ fn the_quarter_box_tally_is_the_same_in_any_order() {
     assert_eq!(counts.boxes["car"]["day"], 0.25);
     assert_eq!(counts.boxes["person"]["other"], 1.0);
     assert_eq!(counts.empty["ir"], 1);
+    // Held-out quarter-boxes, as the training ones (the parked car a quarter), d1 only.
+    assert_eq!(forward.cameras["drive"].heldout[&(CAR, 0)], SPOT_QUARTERS);
+    assert_eq!(forward.cameras["gate"].heldout[&(PERSON, 3)], BOX_QUARTERS);
+    assert!(forward.cameras["back"].heldout.is_empty());
+    assert!(!forward.cameras["drive"].heldout.contains_key(&(CAR, 1)));
 }
 
 /// A measured table of run `run-n` (person, car, cat; it lacks raccoon and motorcycle, and dropped
@@ -1324,4 +1345,194 @@ fn a_steer_compares_by_identity_and_shows_a_summary() {
         shown.contains("spots: 1") && !shown.contains("bbox"),
         "{shown}"
     );
+}
+
+/// A steer with held-out steering on and `listed` camera days.
+fn heldout_steer(listed: &[&str]) -> Steer {
+    Steer {
+        heldout_listed: Some(Arc::new(listed.iter().map(|s| (*s).to_string()).collect())),
+        ..Steer::default()
+    }
+}
+
+#[test]
+fn a_day_is_held_out_when_listed_or_by_the_export_hash_with_steering_on() {
+    use super::super::export::{DEFAULT_HOLDOUT_FRACTION, hash_heldout};
+    let c = classes();
+    let frac = f64::from(DEFAULT_HOLDOUT_FRACTION);
+    let dates: Vec<String> = (0..60)
+        .map(|d| format!("2026-{:02}-{:02}", 1 + d / 28, 1 + d % 28))
+        .collect();
+    let hashed = dates
+        .iter()
+        .find(|d| hash_heldout("back", d, frac))
+        .unwrap();
+    let mut open = dates.iter().filter(|d| !hash_heldout("back", d, frac));
+    let (listed_day, other) = (open.next().unwrap(), open.next().unwrap());
+    let listed = format!("back/{listed_day}");
+    let steer = heldout_steer(&[&listed]);
+    let on = Need::new(Some(wanted(&c)), Some(&steer));
+    assert!(on.steers_heldout());
+    // Per camera day, whatever the scene folder.
+    for scene in ["day", "ir", "other"] {
+        assert!(on.heldout_day(&format!("{scene}/back/{hashed}")), "hashed");
+        assert!(
+            on.heldout_day(&format!("{scene}/back/{listed_day}")),
+            "listed"
+        );
+        assert!(!on.heldout_day(&format!("{scene}/back/{other}")));
+    }
+    // The listed key names a camera: another camera's same date is its own day.
+    assert_eq!(
+        on.heldout_day(&format!("day/gate/{listed_day}")),
+        hash_heldout("gate", listed_day, frac)
+    );
+    // Not a day folder: no.
+    assert!(!on.heldout_day(&format!("back/{hashed}")));
+    assert!(!on.heldout_day(&format!("ir/back/{hashed}/x")));
+    // Off without a steer, or with one that carries no list (the default): no day held out.
+    let plain = Steer::default();
+    for steer in [None, Some(&plain)] {
+        let off = Need::new(Some(wanted(&c)), steer);
+        assert!(!off.steers_heldout());
+        assert!(!off.heldout_day(&format!("ir/back/{hashed}")));
+        assert!(!off.heldout_day(&format!("ir/back/{listed_day}")));
+    }
+    // About the default share of days.
+    let share = dates
+        .iter()
+        .filter(|d| hash_heldout("back", d, frac))
+        .count();
+    assert!((4..=24).contains(&share), "{share}");
+}
+
+#[test]
+fn held_out_days_pull_until_the_cell_has_its_floor_then_training_days() {
+    let c = classes();
+    let steer = heldout_steer(&[]);
+    let need = Need::new(Some(wanted(&c)), Some(&steer));
+    let mut t = CellTally::default();
+    // 25 cat boxes of back at IR (past the class floor), 7 of them on a held-out day.
+    let cat = [trained(CAT, LEFT)];
+    review_split(&need, &mut t, ("back", "ir", "d1"), true, 7, &cat);
+    review_split(&need, &mut t, ("back", "ir", "d2"), false, 18, &cat);
+    let held = Facts {
+        heldout: true,
+        ..at("back", "ir", "d1")
+    };
+    let train = at("back", "ir", "d2");
+    let b = [cb(CAT, RIGHT, 100, STRONG)];
+    let s = Scorer::new(&need, &t);
+    let (dh, dt) = (s.score(&held, &b, &[]), s.score(&train, &b, &[]));
+    assert_eq!(dh.score, expect(1.0, 0.0, 25.0, 25.0, HELDOUT_GAIN));
+    assert_eq!(dt.score, expect(1.0, 0.0, 25.0, 25.0, 1.0));
+    assert!(dh.heldout_gain && dh.heldout_day, "{dh:?}");
+    assert!(!dt.heldout_gain && !dt.heldout_day, "{dt:?}");
+    assert_eq!((dh.heldout_boxes, dt.heldout_boxes), (Some(7.0), Some(7.0)));
+    let n = s.explain(&dh, "back", "ir", None);
+    assert_eq!(
+        (
+            n.heldout_day,
+            n.heldout_boxes,
+            n.heldout_floor,
+            n.heldout_gain
+        ),
+        (true, Some(7.0), Some(HELDOUT_FLOOR), true)
+    );
+    // The cell is per camera and scene: back's cats at night have no held-out box yet.
+    let night = Facts {
+        heldout: true,
+        ..at("back", "night", "d1")
+    };
+    assert_eq!(s.score(&night, &b, &[]).heldout_boxes, Some(0.0));
+    assert!(s.score(&night, &b, &[]).heldout_gain);
+    // A parked box counts a quarter here too: 12 more held-out boxes at the spot are 3.
+    let mut parked_t = t.clone();
+    let spot_steer = Steer {
+        spots: Arc::new(parked()),
+        ..heldout_steer(&[])
+    };
+    let spot_need = Need::new(Some(wanted(&c)), Some(&spot_steer));
+    review_split(
+        &spot_need,
+        &mut parked_t,
+        ("drive", "day", "d1"),
+        true,
+        12,
+        &[trained(CAR, SPOT)],
+    );
+    assert_eq!(
+        parked_t.cameras["drive"].heldout[&(CAR, 0)],
+        12 * SPOT_QUARTERS
+    );
+    // At the floor (13 more held-out boxes: 20), training days pull instead.
+    review_split(&need, &mut t, ("back", "ir", "d1"), true, 13, &cat);
+    let s = Scorer::new(&need, &t);
+    let (dh, dt) = (s.score(&held, &b, &[]), s.score(&train, &b, &[]));
+    assert_eq!(dh.score, expect(1.0, 0.0, 38.0, 38.0, 1.0));
+    assert_eq!(dt.score, expect(1.0, 0.0, 38.0, 38.0, HELDOUT_GAIN));
+    assert!(!dh.heldout_gain && dh.heldout_day && dt.heldout_gain);
+    assert_eq!(dt.heldout_boxes, Some(20.0));
+    // Without held-out steering: no gain either way, nothing shown.
+    let plain = Steer::default();
+    let off = Need::new(Some(wanted(&c)), Some(&plain));
+    let s = Scorer::new(&off, &t);
+    for f in [&held, &train] {
+        let d = s.score(f, &b, &[]);
+        assert_eq!(d.score, expect(1.0, 0.0, 38.0, 38.0, 1.0));
+        assert!(!d.heldout_gain && d.heldout_boxes.is_none());
+    }
+}
+
+#[test]
+fn a_held_out_day_has_no_missed_bonus_and_no_gap() {
+    let c = classes();
+    let steer = heldout_steer(&[]);
+    let need = Need::new(Some(wanted(&c)), Some(&steer));
+    let mut t = CellTally::default();
+    review(
+        &need,
+        &mut t,
+        ("back", "day", "d1"),
+        25,
+        &[trained(PERSON, LEFT)],
+    );
+    let train = at("back", "day", "d1");
+    let held = Facts {
+        heldout: true,
+        ..train
+    };
+    let missed = [cb(PERSON, RIGHT, 100, STRONG | MISSED)];
+    let s = Scorer::new(&need, &t);
+    // A training day of a cell short of held-out boxes: the miss doubles, no gain.
+    let d = s.score(&train, &missed, &[]);
+    assert_eq!(d.score, expect(W_MISSED, 0.0, 25.0, 25.0, 1.0));
+    assert!(d.missed);
+    // A held-out day: the gain, never the miss.
+    let d = s.score(&held, &missed, &[]);
+    assert_eq!(d.score, expect(1.0, 0.0, 25.0, 25.0, HELDOUT_GAIN));
+    assert!(!d.missed && d.heldout_gain);
+    // A gap: a candidate on a training day, none on a held-out one (an empty frame there).
+    let gap = [cb(PERSON, RIGHT, 50, GAP)];
+    let d = s.score(&train, &[], &gap);
+    assert!(d.gap && d.top == Some(PERSON), "{d:?}");
+    let d = s.score(&held, &[], &gap);
+    assert!(
+        d.top.is_none() && d.empty.is_some() && d.heldout_day,
+        "{d:?}"
+    ); // A likely false box: its hard-negative share on a training day, none on a held-out one.
+    let false_box = [cb(PERSON, LEFT, 100, VLM_NO), cb(DOG, RIGHT, 6, VLM_NO)];
+    let d = s.score(&train, &false_box, &[]);
+    assert!(d.hard > 0.0, "{d:?}");
+    let d = s.score(&held, &false_box, &[]);
+    assert!(
+        d.hard == 0.0 && d.hard_class.is_none() && !d.hard_only,
+        "{d:?}"
+    );
+    // A faint likely false box alone: hard-negative only on a training day, an empty frame held out.
+    let faint = [cb(DOG, RIGHT, 6, VLM_NO)];
+    let d = s.score(&train, &faint, &[]);
+    assert!(d.hard_only && d.hard > 0.0, "{d:?}");
+    let d = s.score(&held, &faint, &[]);
+    assert!(d.empty.is_some() && !d.hard_only && d.hard == 0.0, "{d:?}");
 }

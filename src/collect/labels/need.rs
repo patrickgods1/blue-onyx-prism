@@ -72,11 +72,13 @@
 //!        them kept) only a frame with a strong or decided box of it (after objects) keeps the gain
 //! r_k  = 1 + RECALL_GAIN · m̂   (m̂: the shrunk held-out miss rate, recall::Measured::miss)
 //! U_k  = CATCHUP_GAIN if k is camera m's lowest-recall class (within CATCHUP_TOL), else 1
-//! g_k  = 1 (held-out steering comes later)
+//! g_k  = HELDOUT_GAIN on the split the cell (m, k, s) needs: d held out while h_{m,k,s} < HELDOUT_FLOOR,
+//!        d a training day once h_{m,k,s} >= HELDOUT_FLOOR; else 1   (h: held-out boxes)
 //! V    = Σ_k E_k · w_k
 //! H    = W_HARDNEG · crowd(Σ_b f_b · T_H/(T_H + h_{m,k}) · v_k · region_b)
 //!        f_b = max(1 − κ_b, VLM_NO_FALSE if a VLM no) for a likely false box (κ_b < LIKELY_FALSE_KAPPA
 //!        or a VLM no), else 0; h_{m,k}: m's hard negatives of k
+//!        H = 0 on a held-out day (a held-out frame never trains), and faint boxes are no candidates there
 //! empty frame: V = W_EMPTY · T/(T + empty_s) · (1 + ANIMAL_GAIN · p_{m,s}), H = 0
 //! score = round(1000 · (V + H))
 //! ```
@@ -94,6 +96,18 @@
 //! box by its class's diminishing returns and its region, never by the floor, recall or catch-up
 //! gains (a false box adds no recall), so a real object outranks a likely false one of the same
 //! class at equal counts.
+//!
+//! **Held-out steering** ([`Steer::heldout_listed`], on with a steer that carries the list, as the
+//! server's always does): a camera day is held out ([`Need::heldout_day`]) when
+//! `heldout-days.json` lists it or the export's hash split holds it out at the default fraction
+//! ([`super::export::hash_heldout`]): what the next export of the default split, and a training run
+//! from it, hold out (see [`Need::heldout_day`] for where they can differ). The tally counts the
+//! training boxes of held-out days again, apart, per (camera, class, scene) in quarter-boxes (`h`).
+//! A cell short of [`HELDOUT_FLOOR`] held-out boxes pulls its held-out days up; one at the floor
+//! pulls its training days. On a held-out day [`W_MISSED`], the [`GAP`] candidates and `H` are off:
+//! they would fill the held-out set with the hard cases the camera model missed or falsely
+//! proposed, its figures would read low, and a rejected box there teaches nothing. Per-cell recall stays exact over the cell's own images; the random picks
+//! ([`super::recommend::random_slots`]), scored apart as `heldout:random`, stay the unbiased figure.
 //!
 //! **Visits** ([`day`]): per event (one camera's activity, [`super::recommend::chain`]) the classes
 //! of its decided training boxes ([`DayOut::visit_classes`]): an event holding a box of a class
@@ -156,6 +170,10 @@
 //! - [`MISSED_IOU`] = 0.5: one object; [`GAP_IOU`] = 0.3 and [`GAP_S`] = 20 s: an object moves, so
 //!   the interpolated box is loose, and over 20 s it may have left.
 //! - [`GAP_EVIDENCE`] = 0.5: as a lone weak box of score 1.
+//! - [`HELDOUT_FLOOR`] = [`crate::benchmark::metrics::MIN_CLASS_GT`] (20): the benchmark scores a
+//!   class from 20 held-out objects, so a cell's held-out boxes are wanted up to that, then its
+//!   training boxes. [`HELDOUT_GAIN`] = 2: the split a cell needs weighs double; less than the
+//!   floor's [`RARE_GAIN`], so a rare class's frames still come first on either split.
 
 use super::bulk::Wanted;
 use super::queue::Kept;
@@ -251,6 +269,10 @@ pub const GAP_IOU: f32 = 0.3;
 pub const GAP_EVIDENCE: f64 = 0.5;
 /// Scores in one band compare equal in the order ([`super::recommend::key`]).
 pub const NEED_BAND: u32 = 100;
+/// Held-out boxes of a cell (camera, class, scene) wanted before its training days pull instead.
+pub const HELDOUT_FLOOR: u64 = crate::benchmark::metrics::MIN_CLASS_GT as u64;
+/// The split a cell needs weighs this much more (`g_k`).
+pub const HELDOUT_GAIN: f64 = 2.0;
 /// The visit divisor's step in quarters: `1 + rank` (4) or, expanded, `1 + rank / 4` (1).
 pub const VISIT_QUARTERS: u32 = 4;
 pub const VISIT_P_QUARTERS: u32 = 1;
@@ -615,21 +637,26 @@ pub struct Steer {
     pub recall: Option<Arc<Measured>>,
     /// The folder's parked spots (empty until the first build: neutral).
     pub spots: Arc<statics::Table>,
-    /// Camera days listed in `heldout-days.json` (`<camera>/<date>`), for held-out steering
-    /// (not read yet: `g_k` is 1).
-    pub heldout_listed: Arc<BTreeSet<String>>,
+    /// Held-out steering (see the module docs): the camera days `heldout-days.json` lists
+    /// (`<camera>/<date>`; empty when it is missing, newer or damaged), with which the hash split's
+    /// days are held out too. None = no held-out steering (the default: no day is held out).
+    pub heldout_listed: Option<Arc<BTreeSet<String>>>,
+}
+
+/// Two optional tables are the same one.
+fn same_arc<T>(a: Option<&Arc<T>>, b: Option<&Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 impl PartialEq for Steer {
     fn eq(&self, other: &Self) -> bool {
-        let recall = match (&self.recall, &other.recall) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        recall
+        same_arc(self.recall.as_ref(), other.recall.as_ref())
             && Arc::ptr_eq(&self.spots, &other.spots)
-            && Arc::ptr_eq(&self.heldout_listed, &other.heldout_listed)
+            && same_arc(self.heldout_listed.as_ref(), other.heldout_listed.as_ref())
     }
 }
 
@@ -644,7 +671,10 @@ impl std::fmt::Debug for Steer {
                     .map(|m| m.scenes.len() + usize::from(m.overall.is_some())),
             )
             .field("spots", &self.spots.len())
-            .field("heldout_listed", &self.heldout_listed.len())
+            .field(
+                "heldout_listed",
+                &self.heldout_listed.as_ref().map(|l| l.len()),
+            )
             .finish()
     }
 }
@@ -683,6 +713,8 @@ fn region(b: &CellBox, w: u32, h: u32) -> u8 {
 struct CameraCells {
     /// (class, scene) -> quarter-boxes.
     cells: BTreeMap<(u16, u8), u64>,
+    /// (class, scene) -> quarter-boxes of held-out days (counted in `cells` too).
+    heldout: BTreeMap<(u16, u8), u64>,
     /// (class, region) -> quarter-boxes.
     regions: BTreeMap<(u16, u8), u64>,
     /// (class, scene) -> the days with a box.
@@ -700,6 +732,9 @@ impl CameraCells {
     fn merge(&mut self, c: &CameraCells) {
         for (k, n) in &c.cells {
             *self.cells.entry(*k).or_default() += n;
+        }
+        for (k, n) in &c.heldout {
+            *self.heldout.entry(*k).or_default() += n;
         }
         for (k, n) in &c.regions {
             *self.regions.entry(*k).or_default() += n;
@@ -763,6 +798,7 @@ impl CellTally {
                     .sum();
                 name.capacity()
                     + map_bytes(&c.cells)
+                    + map_bytes(&c.heldout)
                     + map_bytes(&c.regions)
                     + map_bytes(&c.days)
                     + days
@@ -855,6 +891,8 @@ pub struct Reviewed<'a> {
     pub height: u32,
     /// [`of_file`] of the reviewed frame: training boxes, hard negatives, proposal markers.
     pub boxes: &'a [CellBox],
+    /// Its day is held out ([`Need::heldout_day`]).
+    pub heldout: bool,
 }
 
 /// A frame to weigh, for [`Scorer::score`].
@@ -865,6 +903,8 @@ pub struct Facts<'a> {
     pub day: &'a str,
     pub width: u32,
     pub height: u32,
+    /// Its day is held out ([`Need::heldout_day`]).
+    pub heldout: bool,
 }
 
 /// What weighs frames of one query: the class list and the steer.
@@ -902,6 +942,43 @@ impl<'a> Need<'a> {
     /// are kept with, and compared to by identity.
     pub fn spots(&self) -> Option<&'a Arc<statics::Table>> {
         self.steer.map(|s| &s.spots)
+    }
+
+    /// The listed held-out days when held-out steering is on (see the module docs).
+    fn listed(&self) -> Option<&'a BTreeSet<String>> {
+        self.steer.and_then(|s| s.heldout_listed.as_deref())
+    }
+
+    /// Held-out steering is on: a steer with the listed days.
+    pub fn steers_heldout(&self) -> bool {
+        self.listed().is_some()
+    }
+
+    /// Whether the day folder `day` (`<scene>/<camera>/<date>`) is a held-out day: with held-out
+    /// steering on, its camera day listed in `heldout-days.json` or held out by the export's hash
+    /// split at [`super::export::DEFAULT_HOLDOUT_FRACTION`] ([`super::export::hash_heldout`]);
+    /// never without. The one test the walk and the index ask, per day folder. This is what the
+    /// next export of the default split and a training run from it hold out, but for: the export's
+    /// "one group on each side" guard (only a folder with every day on one side), the days an
+    /// export adds for a camera under its minimum of held-out days (listed from that export on),
+    /// an export of other split settings, and a training run whose exports had no held-out frame
+    /// (it splits by its own share).
+    pub fn heldout_day(&self, day: &str) -> bool {
+        let Some(listed) = self.listed() else {
+            return false;
+        };
+        let mut parts = day.split('/');
+        let (Some(_scene), Some(camera), Some(date), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        listed.contains(&format!("{camera}/{date}"))
+            || super::export::hash_heldout(
+                camera,
+                date,
+                f64::from(super::export::DEFAULT_HOLDOUT_FRACTION),
+            )
     }
 
     /// The class list's name of class `k`.
@@ -965,6 +1042,9 @@ impl<'a> Need<'a> {
             *t.class_scene.entry((b.class, s)).or_default() += q;
             *t.class_boxes.entry(b.class).or_default() += 1;
             *cam.cells.entry((b.class, s)).or_default() += q;
+            if r.heldout {
+                *cam.heldout.entry((b.class, s)).or_default() += q;
+            }
             *cam.regions
                 .entry((b.class, region(b, r.width, r.height)))
                 .or_default() += q;
@@ -1279,6 +1359,12 @@ pub struct Detail {
     pub hard_only: bool,
     /// An empty frame: the scene's reviewed empty frames and the camera's animal share there.
     pub empty: Option<(u64, f64)>,
+    /// The frame's day is held out (held-out steering on).
+    pub heldout_day: bool,
+    /// With held-out steering on, the top class's held-out boxes on the camera in the scene, and
+    /// whether `g_k` raised it.
+    pub heldout_boxes: Option<f64>,
+    pub heldout_gain: bool,
 }
 
 /// What one camera's frames are weighed by, per class (made when the camera is first asked).
@@ -1288,6 +1374,8 @@ struct Cam<'a> {
     spots: &'a [statics::Spot],
     /// Per class, per scene: v and r; per class, per measured scene: the shrunk miss rate.
     v: Vec<[f64; 4]>,
+    /// Per class, per scene: held-out boxes.
+    heldout: Vec<[f64; 4]>,
     r: Vec<[f64; 4]>,
     miss: Vec<[Option<Miss>; 3]>,
     catch_up: Vec<bool>,
@@ -1422,6 +1510,7 @@ impl<'a> Scorer<'a> {
             cells,
             spots: self.need.spots_of(camera),
             v: Vec::with_capacity(n),
+            heldout: Vec::with_capacity(n),
             r: Vec::with_capacity(n),
             miss,
             catch_up,
@@ -1437,8 +1526,16 @@ impl<'a> Scorer<'a> {
             let n_ks = self.n_ks.get(i).copied().unwrap_or_default();
             let mut vk = [0.0; 4];
             let mut rk = [1.0; 4];
-            for (s, (v, r)) in vk.iter_mut().zip(rk.iter_mut()).enumerate() {
-                let n_mks = quarters(cells.map(|c| &c.cells), (k, u8::try_from(s).unwrap_or(3)));
+            let mut hk = [0.0; 4];
+            for (s, ((v, r), h)) in vk
+                .iter_mut()
+                .zip(rk.iter_mut())
+                .zip(hk.iter_mut())
+                .enumerate()
+            {
+                let key = (k, u8::try_from(s).unwrap_or(3));
+                let n_mks = quarters(cells.map(|c| &c.cells), key);
+                *h = quarters(cells.map(|c| &c.heldout), key);
                 let n = n_ks.get(s).copied().unwrap_or(0.0);
                 *v = 0.5 * T / (T + n) + 0.5 * T_CAM / (T_CAM + n_mks);
                 *r = recall_factor(
@@ -1449,6 +1546,7 @@ impl<'a> Scorer<'a> {
                 );
             }
             c.v.push(vk);
+            c.heldout.push(hk);
             c.r.push(rk);
             let kept = cells
                 .and_then(|c| c.precision.get(&k))
@@ -1527,10 +1625,16 @@ impl<'a> Scorer<'a> {
         let s8 = scene_ix(f.scene);
         let s = usize::from(s8);
         let cam = self.cam(f.camera);
+        // No gap on a held-out day: a hard case for the held-out set. No hard-negative share
+        // there either (a held-out frame never trains), so a faint likely false box is no
+        // candidate on it.
+        let gaps = if f.heldout { &[][..] } else { gaps };
         let cands: Vec<&CellBox> = boxes
             .iter()
             .chain(gaps)
-            .filter(|b| b.is_candidate() && (!faint(b) || self.likely_false(&cam, b)))
+            .filter(|b| {
+                b.is_candidate() && (!faint(b) || (!f.heldout && self.likely_false(&cam, b)))
+            })
             .collect();
         if cands.is_empty() {
             let empty = self.tally.empty.get(s).copied().unwrap_or(0);
@@ -1539,6 +1643,7 @@ impl<'a> Scorer<'a> {
             return Detail {
                 score: score_of(v),
                 empty: Some((empty, share)),
+                heldout_day: f.heldout,
                 ..Detail::default()
             };
         }
@@ -1567,7 +1672,8 @@ impl<'a> Scorer<'a> {
             let r_k = cam.r.get(ki).and_then(|r| r.get(s)).copied().unwrap_or(1.0);
             let catch_up = cam.catch_up.get(ki).copied().unwrap_or(false);
             let u_k = if catch_up { CATCHUP_GAIN } else { 1.0 };
-            let g_k = self.heldout_gain(f, k);
+            let heldout_gain = self.heldout_gain(&cam, f, k);
+            let g_k = if heldout_gain { HELDOUT_GAIN } else { 1.0 };
             ClassWeight {
                 k,
                 v: v_k,
@@ -1575,6 +1681,7 @@ impl<'a> Scorer<'a> {
                 new_day,
                 floor,
                 catch_up,
+                heldout_gain,
             }
         };
         // Objects are found with every candidate's strength; the floor then follows the boxes
@@ -1655,11 +1762,21 @@ impl<'a> Scorer<'a> {
                 d.below_floor = cw.floor;
                 d.catch_up = cw.catch_up;
                 d.new_day = cw.new_day;
+                d.heldout_gain = cw.heldout_gain;
+                d.heldout_boxes = self
+                    .need
+                    .steers_heldout()
+                    .then(|| cam.heldout.get(ki).and_then(|h| h.get(s)).copied())
+                    .flatten();
                 d.top = Some(k);
                 best = Some((term, d));
             }
         }
-        let hard = W_HARDNEG * crowd(hard);
+        let hard = if f.heldout {
+            0.0
+        } else {
+            W_HARDNEG * crowd(hard)
+        };
         let mut d = best.map(|(_, d)| d).unwrap_or_default();
         d.hard = hard;
         d.hard_class = hard_class.filter(|_| hard > 0.0);
@@ -1674,6 +1791,7 @@ impl<'a> Scorer<'a> {
             };
         }
         d.score = score_of(v + hard);
+        d.heldout_day = f.heldout;
         d
     }
 
@@ -1722,8 +1840,11 @@ impl<'a> Scorer<'a> {
             .unwrap_or(0.0);
         let kappa = self.kappa(cam, b);
         let kp = kappa.unwrap_or(1.0);
-        let missed =
-            (b.has(MISSED) || b.has(GAP)) && b.e() >= MISSED_MIN_E && kp >= MISSED_MIN_KAPPA;
+        // Never on a held-out day: a hard case for the held-out set.
+        let missed = !f.heldout
+            && (b.has(MISSED) || b.has(GAP))
+            && b.e() >= MISSED_MIN_E
+            && kp >= MISSED_MIN_KAPPA;
         let rf = (1.0 + W_REGION * T_R / (T_R + n_region)) / 2.0;
         // A faint box adds no recall need, only its hard-negative share.
         let mut a = if faint(b) { 0.0 } else { b.e() };
@@ -1754,9 +1875,21 @@ impl<'a> Scorer<'a> {
         }
     }
 
-    /// `g_k`: held-out steering, not applied yet (1).
-    fn heldout_gain(&self, _f: &Facts<'_>, _k: u16) -> f64 {
-        1.0
+    /// Whether `g_k` is [`HELDOUT_GAIN`] for class `k` of frame `f` on `cam` (see the module
+    /// docs): with held-out steering on, its day is held out and the cell has fewer than
+    /// [`HELDOUT_FLOOR`] held-out boxes, or a training day and the cell has the floor.
+    fn heldout_gain(&self, cam: &Cam<'_>, f: &Facts<'_>, k: u16) -> bool {
+        if !self.need.steers_heldout() {
+            return false;
+        }
+        let h = cam
+            .heldout
+            .get(usize::from(k))
+            .and_then(|h| h.get(usize::from(scene_ix(f.scene))))
+            .copied()
+            .unwrap_or(0.0);
+        let short = h < HELDOUT_FLOOR as f64;
+        f.heldout == short
     }
 
     /// The page's explanation of a frame of `camera` in `scene` ([`Self::score`]'s `d`), its visit
@@ -1801,6 +1934,10 @@ impl<'a> Scorer<'a> {
             hard_only: d.hard_only,
             empty_reviewed: d.empty.map(|e| e.0),
             animal_share: d.empty.map(|e| four(e.1)).filter(|s| *s > 0.0),
+            heldout_day: d.heldout_day,
+            heldout_boxes: d.heldout_boxes,
+            heldout_floor: d.heldout_boxes.map(|_| HELDOUT_FLOOR),
+            heldout_gain: d.heldout_gain,
         }
     }
 }
@@ -1814,6 +1951,7 @@ struct ClassWeight {
     new_day: bool,
     floor: bool,
     catch_up: bool,
+    heldout_gain: bool,
 }
 
 /// What one candidate adds ([`Scorer::box_val`]).
@@ -2054,6 +2192,20 @@ pub struct RecallNeed {
     pub empty_reviewed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub animal_share: Option<f64>,
+    /// Held-out steering: the frame's day is held out (listed in `heldout-days.json`, or by the
+    /// export's hash split), ...
+    #[serde(skip_serializing_if = "is_false")]
+    pub heldout_day: bool,
+    /// ... the class's held-out boxes on the camera in the scene (a box at a parked spot counts a
+    /// quarter) and the floor they are wanted up to (absent without held-out steering or a class),
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heldout_boxes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heldout_floor: Option<u64>,
+    /// ... and whether the split the cell needs raised the class (`g_k`): a held-out day of a cell
+    /// short of its held-out boxes, or a training day of one that has them.
+    #[serde(skip_serializing_if = "is_false")]
+    pub heldout_gain: bool,
 }
 
 #[cfg(test)]

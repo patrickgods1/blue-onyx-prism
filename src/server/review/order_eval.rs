@@ -1,10 +1,12 @@
 //! A measurement, not a check: the Review tab's default order on a real review folder before the
 //! need model ([`queue::build_legacy`]: event rank as a strict tier, then the balance of class,
 //! scene and camera) and after it ([`queue::build`] with a [`Steer`]: no spot table, then the
-//! folder's own), tallied over the first 100 and 500 frames served. Does nothing unless
-//! `BOP_ORDER_EVAL_DIR` names the folder, so the `--ignored` runs of CI pass it by. Only reads:
-//! `queue::build` and the spot table's walk ([`queue::reviewed_obs`], the service's path for a
-//! folder without an index) write nothing, and no review index is made.
+//! folder's own, then with held-out steering: the folder's `heldout-days.json`, read only, and the
+//! hash split), tallied over the first 100 and 500 frames served, with how many are on held-out
+//! days by camera and by class. Does nothing unless `BOP_ORDER_EVAL_DIR` names the folder, so the
+//! `--ignored` runs of CI pass it by. Only reads: `queue::build`, the spot table's walk
+//! ([`queue::reviewed_obs`], the service's path for a folder without an index) and
+//! [`crate::collect::labels::heldout::load`] write nothing, and no review index is made.
 //!
 //! ```text
 //! BOP_ORDER_EVAL_DIR=D:\dataset BOP_ORDER_EVAL_CONFIG=<config json> BOP_ORDER_EVAL_RUNS=<runs.json> \
@@ -79,6 +81,8 @@ struct Seen {
     person: bool,
     missed_boxes: usize,
     spot_boxes: usize,
+    /// On a held-out day (listed or hashed).
+    heldout: bool,
 }
 
 /// The per-frame facts of the frames of `q` (the steered order): its need and candidates.
@@ -139,6 +143,7 @@ fn facts_of(dir: &Path, q: &Queue, f: &Filters, spots: &statics::Table) -> HashM
                     missed_boxes: boxes.iter().filter(|b| b.has(need::MISSED)).count(),
                     spot_boxes: boxes.iter().filter(|b| at_spot(b)).count(),
                     need: n,
+                    heldout: false,
                 },
             )
         })
@@ -190,6 +195,56 @@ fn tally(items: &[Item], n: usize, facts: &HashMap<String, Seen>, out: &mut Stri
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     for ((camera, class, scene), n) in rows {
         let _ = writeln!(out, "| {camera} | {class} | {scene} | {n} |");
+    }
+}
+
+/// How many of the first `n` frames of `items` are on held-out days, overall, by camera and by top
+/// class (`frames held-out/all`), and how many the held-out gain raised on each split.
+fn heldout_tally(
+    items: &[Item],
+    n: usize,
+    facts: &HashMap<String, Seen>,
+    out: &mut String,
+    title: &str,
+) {
+    let first: Vec<&Seen> = items
+        .iter()
+        .take(n)
+        .filter_map(|i| facts.get(&i.frame))
+        .collect();
+    let held = first.iter().filter(|s| s.heldout).count();
+    let gain = |day: bool| {
+        first
+            .iter()
+            .filter(|s| s.heldout == day)
+            .filter(|s| s.need.as_ref().is_some_and(|n| n.heldout_gain))
+            .count()
+    };
+    let _ = writeln!(
+        out,
+        "\n#### {title}: held-out days in the first {n}\n\n{held} of {} on held-out days; \
+         raised by the held-out gain: {} on held-out days, {} on training days.\n",
+        first.len(),
+        gain(true),
+        gain(false)
+    );
+    for (what, by_class) in [("camera", false), ("top class", true)] {
+        let mut by: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for s in &first {
+            let key = if by_class { &s.class } else { &s.camera };
+            let e = by.entry(key.clone()).or_default();
+            e.1 += 1;
+            if s.heldout {
+                e.0 += 1;
+            }
+        }
+        let _ = writeln!(out, "| {what} | held-out / frames |\n|---|---|");
+        let mut rows: Vec<_> = by.into_iter().collect();
+        rows.sort_by(|a, b| (b.1).1.cmp(&(a.1).1).then_with(|| a.0.cmp(&b.0)));
+        for (k, (h, all)) in rows {
+            let _ = writeln!(out, "| {k} | {h} / {all} |");
+        }
+        let _ = writeln!(out);
     }
 }
 
@@ -263,7 +318,20 @@ fn the_recommended_order_before_and_after_the_need_model() {
     let real = Arc::new(Steer {
         recall: recall.clone(),
         spots: spots.clone(),
-        heldout_listed: Arc::default(),
+        heldout_listed: None,
+    });
+    // Held-out steering: the folder's listed days (read only), as the server's steer.
+    let listed = match crate::collect::labels::heldout::load(&dir) {
+        Ok(f) => f.keys(),
+        Err(e) => {
+            println!("heldout-days.json does not read ({e:#}): the hash split's days alone");
+            Default::default()
+        }
+    };
+    let listed_days = listed.len();
+    let held = Arc::new(Steer {
+        heldout_listed: Some(Arc::new(listed)),
+        ..(*real).clone()
     });
     let with = |s: &Arc<Steer>| Filters {
         steer: Some(s.clone()),
@@ -272,7 +340,25 @@ fn the_recommended_order_before_and_after_the_need_model() {
     let (old_ms, old) = median_of_3(|| queue::build_legacy(&dir, &base));
     let (new_empty_ms, new_empty) = median_of_3(|| queue::build(&dir, &with(&empty)));
     let (new_ms, new) = median_of_3(|| queue::build(&dir, &with(&real)));
-    let facts = facts_of(&dir, &new, &with(&real), &spots);
+    let (held_ms, steered) = median_of_3(|| queue::build(&dir, &with(&held)));
+    // Whether a frame is on a held-out day, by the steered need's one test.
+    let held_need = need::Need::new(
+        Some(crate::collect::labels::bulk::Wanted {
+            classes: &wanted.0,
+            hidden: &wanted.1,
+        }),
+        Some(&held),
+    );
+    let on_heldout =
+        |frame: &str| held_need.heldout_day(frame.rsplit_once('/').map_or("", |(d, _)| d));
+    let mut facts = facts_of(&dir, &new, &with(&real), &spots);
+    for (frame, s) in &mut facts {
+        s.heldout = on_heldout(frame);
+    }
+    let mut held_facts = facts_of(&dir, &steered, &with(&held), &spots);
+    for (frame, s) in &mut held_facts {
+        s.heldout = on_heldout(frame);
+    }
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -306,20 +392,35 @@ fn the_recommended_order_before_and_after_the_need_model() {
     }
     let _ = writeln!(
         out,
-        "\n## Walk time (`queue::build`, median of 3)\n\n| order | ms |\n|---|---|\n| before (legacy) | {:.0} |\n| need, no spot table | {:.0} |\n| need, spot table | {:.0} |",
+        "\n## Walk time (`queue::build`, median of 3)\n\n| order | ms |\n|---|---|\n| before (legacy) | {:.0} |\n| need, no spot table | {:.0} |\n| need, spot table | {:.0} |\n| need, spot table, held-out steering | {:.0} |",
         old_ms.as_secs_f64() * 1000.0,
         new_empty_ms.as_secs_f64() * 1000.0,
-        new_ms.as_secs_f64() * 1000.0
+        new_ms.as_secs_f64() * 1000.0,
+        held_ms.as_secs_f64() * 1000.0
+    );
+    let _ = writeln!(
+        out,
+        "\nHeld-out days: {listed_days} listed in heldout-days.json, plus the hash split's; {} of \
+         {} listed frames on held-out days.",
+        held_facts.values().filter(|s| s.heldout).count(),
+        held_facts.len()
     );
     assert_eq!(old.items.len(), new.items.len(), "the same frames listed");
-    for (title, q) in [
-        ("Before (legacy)", &old),
-        ("Need, no spot table", &new_empty),
-        ("Need, spot table", &new),
+    assert_eq!(
+        steered.items.len(),
+        new.items.len(),
+        "the same frames listed"
+    );
+    for (title, q, facts) in [
+        ("Before (legacy)", &old, &facts),
+        ("Need, no spot table", &new_empty, &facts),
+        ("Need, spot table", &new, &facts),
+        ("Need, spot table, held-out steering", &steered, &held_facts),
     ] {
         let _ = writeln!(out, "\n### {title}");
         for n in [100, 500] {
-            tally(&q.items, n, &facts, &mut out, title);
+            tally(&q.items, n, facts, &mut out, title);
+            heldout_tally(&q.items, n, facts, &mut out, title);
         }
         let all = |p: &dyn Fn(&RecallNeed) -> bool| {
             q.items
@@ -355,11 +456,13 @@ fn the_recommended_order_before_and_after_the_need_model() {
     // The first 30 served of the steered order, with their notes.
     let _ = writeln!(
         out,
-        "\n## First 30 served (need, spot table)\n\n| # | frame | rank | random | need | visit | class | cues |\n|---|---|---|---|---|---|---|---|"
+        "\n## First 30 served (need, spot table, held-out steering)\n\n| # | frame | rank | random | need | visit | class | cues |\n|---|---|---|---|---|---|---|---|"
     );
-    for (i, item) in new.items.iter().take(30).enumerate() {
+    for (i, item) in steered.items.iter().take(30).enumerate() {
         let n = item.uncertainty.need.clone().unwrap_or_default();
         let cues: Vec<&str> = [
+            (n.heldout_day, "held-out day"),
+            (n.heldout_gain, "held-out gain"),
             (n.below_floor, "floor"),
             (n.catch_up, "catch-up"),
             (n.missed, "missed"),
@@ -398,7 +501,7 @@ fn the_recommended_order_before_and_after_the_need_model() {
         classes: &classes,
         hidden: &hidden,
     };
-    for item in new.items.iter().take(5) {
+    for item in steered.items.iter().take(5) {
         let Some(fr) = Frame::resolve(&dir, &item.frame) else {
             continue;
         };

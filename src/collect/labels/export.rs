@@ -9,7 +9,8 @@
 //! sit on both sides. Other days of a held-out group's camera still train, unless a camera is
 //! named. Explicit `holdout_cameras` / `holdout_days` decide when given;
 //! else a (camera, date) group is held out when the first 8 bytes of SHA-256(`camera/date`), as a
-//! fraction of 2^64, are below `holdout_fraction` (stable when days are added), with at least
+//! fraction of 2^64, are below `holdout_fraction` ([`hash_heldout`], stable when days are added;
+//! the Review queue's held-out steering asks the same function), with at least
 //! one group on each side once there are two groups. With [`ExportRequest::heldout`] (the Dataset
 //! tab's export only) the review folder's `heldout-days.json` ([`super::heldout`]) holds out every
 //! day it lists too, and an export of the default split adds its held-out days to it, plus days
@@ -157,13 +158,33 @@ pub type Group = (String, String);
 
 /// First 8 bytes of SHA-256(`camera/date`): the rank of a group in the split.
 pub fn group_hash(g: &Group) -> u64 {
+    day_hash(&g.0, &g.1)
+}
+
+/// [`group_hash`] of the camera day `camera`, `date`.
+fn day_hash(camera: &str, date: &str) -> u64 {
     use sha2::Digest;
-    let d = sha2::Sha256::digest(format!("{}/{}", g.0, g.1).as_bytes());
+    let mut h = sha2::Sha256::new();
+    h.update(camera.as_bytes());
+    h.update(b"/");
+    h.update(date.as_bytes());
+    let d = h.finalize();
     let mut b = [0u8; 8];
     for (o, i) in b.iter_mut().zip(d.iter()) {
         *o = *i;
     }
     u64::from_be_bytes(b)
+}
+
+/// Whether the hash split holds the camera day `camera`, `date` out at fraction `frac` (0..=1):
+/// its [`group_hash`] as a fraction of 2^64 is below `frac`. The per-day rule of
+/// [`assign_splits`] when no camera or day is named, before its "one group on each side" guard
+/// (which looks at every group of an export); the Review queue's held-out steering
+/// ([`super::need::Need::heldout_day`]) asks it at [`DEFAULT_HOLDOUT_FRACTION`].
+pub fn hash_heldout(camera: &str, date: &str, frac: f64) -> bool {
+    #[allow(clippy::cast_precision_loss, reason = "a fraction of 2^64")]
+    let x = day_hash(camera, date) as f64 / 18_446_744_073_709_551_616.0;
+    x < frac
 }
 
 /// The split of every group (see the module doc). Pure and deterministic.
@@ -182,9 +203,8 @@ pub fn assign_splits(groups: &BTreeSet<Group>, cfg: &SplitConfig) -> BTreeMap<Gr
     let mut out: BTreeMap<Group, Split> = groups
         .iter()
         .map(|g| {
-            #[allow(clippy::cast_precision_loss, reason = "a fraction of 2^64")]
-            let x = group_hash(g) as f64 / 18_446_744_073_709_551_616.0;
-            (g.clone(), if x < frac { Split::Val } else { Split::Train })
+            let val = hash_heldout(&g.0, &g.1, frac);
+            (g.clone(), if val { Split::Val } else { Split::Train })
         })
         .collect();
     if groups.len() >= 2 && frac > 0.0 {
@@ -2021,6 +2041,68 @@ mod tests {
         assert_eq!(x.values().filter(|s| **s == Split::Train).count(), 1);
         let one: BTreeSet<Group> = [g("a", "2026-01-01")].into_iter().collect();
         assert_eq!(assign_splits(&one, &cfg).len(), 1);
+    }
+
+    /// [`hash_heldout`] is [`assign_splits`]' rule per day: over a grid of cameras, dates and
+    /// fractions, every group splits as the function says unless the guard had to move one, and
+    /// the hash is still the one of `camera/date`.
+    #[test]
+    fn the_per_day_hash_rule_agrees_with_assign_splits() {
+        let cameras = ["drive", "yard", "porch", "back-door", "cam 7"];
+        let dates: Vec<String> = (1..=28).map(|d| format!("2026-10-{d:02}")).collect();
+        let grid: BTreeSet<Group> = cameras
+            .iter()
+            .flat_map(|c| dates.iter().map(|d| g(c, d)))
+            .collect();
+        let small: BTreeSet<Group> = grid.iter().take(3).cloned().collect();
+        let (mut held, mut trained, mut guarded) = (0, 0, 0);
+        for groups in [&grid, &small] {
+            for frac in [
+                0.0f32,
+                0.01,
+                0.05,
+                0.2,
+                DEFAULT_HOLDOUT_FRACTION,
+                0.5,
+                0.9,
+                1.0,
+            ] {
+                let cfg = SplitConfig {
+                    holdout_fraction: frac,
+                    ..SplitConfig::default()
+                };
+                let splits = assign_splits(groups, &cfg);
+                let rule: BTreeMap<&Group, bool> = groups
+                    .iter()
+                    .map(|x| (x, hash_heldout(&x.0, &x.1, f64::from(frac))))
+                    .collect();
+                // The guard moves one group, only when a side would be empty.
+                let one_sided = rule.values().all(|v| *v) || !rule.values().any(|v| *v);
+                let moved = rule
+                    .iter()
+                    .filter(|(x, val)| (splits[**x] == Split::Val) != **val)
+                    .count();
+                if one_sided && frac > 0.0 {
+                    assert_eq!(moved, 1, "{frac}");
+                    guarded += 1;
+                } else {
+                    assert_eq!(moved, 0, "{frac}");
+                }
+                held += rule.values().filter(|v| **v).count();
+                trained += rule.values().filter(|v| !**v).count();
+            }
+        }
+        assert!(
+            held > 100 && trained > 100 && guarded > 0,
+            "{held} {trained} {guarded}"
+        );
+        // The hash is that of the joined name, as before the factoring.
+        use sha2::Digest;
+        let d = sha2::Sha256::digest(b"drive/2026-10-20");
+        let want = u64::from_be_bytes(d[..8].try_into().unwrap());
+        assert_eq!(group_hash(&g("drive", "2026-10-20")), want);
+        assert!(!hash_heldout("drive", "2026-10-20", 0.0));
+        assert!(hash_heldout("drive", "2026-10-20", 1.0));
     }
 
     #[test]

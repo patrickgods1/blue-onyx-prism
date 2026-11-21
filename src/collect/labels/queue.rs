@@ -1271,6 +1271,8 @@ struct ItemFacts {
     height: u32,
     /// Its date folder.
     date: String,
+    /// Its day is held out ([`Need::heldout_day`]).
+    heldout: bool,
 }
 
 /// The candidates of one day folder, read: the part of [`build`] that touches files.
@@ -1285,6 +1287,8 @@ fn build_day(
     let recommended = f.order == Order::Recommended;
     // [`need::day`]'s input: every counted frame (time, alone, candidates, listed index).
     let mut counted: Vec<Counted> = Vec::new();
+    // Whether the day folder is held out, asked once a folder (they all come of one).
+    let mut held: Option<(&str, bool)> = None;
     for c in day {
         let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
             continue;
@@ -1323,7 +1327,16 @@ fn build_day(
             });
         }
         if let Some(n) = n {
-            let date = need::date_of(day_of(&c.rel));
+            let folder = day_of(&c.rel);
+            let date = need::date_of(folder);
+            let heldout = match held {
+                Some((d, h)) if d == folder => h,
+                _ => {
+                    let h = n.heldout_day(folder);
+                    held = Some((folder, h));
+                    h
+                }
+            };
             let boxes = match labels.as_ref() {
                 Some(l) => need::of_file(l, n.wanted()),
                 None => need::of_reply(&rec, n.wanted()),
@@ -1341,6 +1354,7 @@ fn build_day(
                         width: rec.width,
                         height: rec.height,
                         boxes: &boxes,
+                        heldout,
                     },
                 );
             }
@@ -1349,6 +1363,7 @@ fn build_day(
                     width: rec.width,
                     height: rec.height,
                     date: date.to_string(),
+                    heldout,
                     ..ItemFacts::default()
                 });
             }
@@ -1425,6 +1440,7 @@ fn weigh_need(items: &mut [Item], facts: &[ItemFacts], n: &Need<'_>, tally: &Cel
             day: &x.date,
             width: x.width,
             height: x.height,
+            heldout: x.heldout,
         };
         let d = scorer.score(&at, &x.boxes, &x.gaps);
         let visit = scorer.expands(&item.camera, &x.visit_classes);

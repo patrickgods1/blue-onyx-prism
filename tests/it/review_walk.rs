@@ -24,6 +24,7 @@
 use blue_onyx_prism::backend::memory::process_memory;
 use blue_onyx_prism::collect::labels::bulk::{self, Wanted};
 use blue_onyx_prism::collect::labels::index;
+use blue_onyx_prism::collect::labels::need;
 use blue_onyx_prism::collect::labels::overlaps::{Suggestion, Verdict};
 use blue_onyx_prism::collect::labels::queue::{
     self, AutoFilter, Candidate, Filters, Order, QueueSource, StatusFilter,
@@ -422,6 +423,18 @@ fn next(dir: &Path, f: &Filters) -> usize {
     built.items.len()
 }
 
+/// What the route steers the Recommended order by, as far as a made-up folder has it: held-out
+/// steering on (no listed day, so the hash split's days), no recall, no parked spot.
+fn held_out(f: Filters) -> Filters {
+    Filters {
+        steer: Some(std::sync::Arc::new(need::Steer {
+            heldout_listed: Some(std::sync::Arc::default()),
+            ..need::Steer::default()
+        })),
+        ..f
+    }
+}
+
 type Walk<'a> = (&'static str, Box<dyn Fn() -> usize + 'a>);
 
 /// Every walk measured, by name.
@@ -445,6 +458,7 @@ fn walks(dir: &Path) -> Vec<Walk<'_>> {
         order: Order::Recommended,
         ..default.clone()
     };
+    let recommended_held = held_out(recommended.clone());
     vec![
         ("build", Box::new(move || next(dir, &default))),
         ("build_all", Box::new(move || next(dir, &every))),
@@ -453,6 +467,10 @@ fn walks(dir: &Path) -> Vec<Walk<'_>> {
         (
             "build_recommended",
             Box::new(move || next(dir, &recommended)),
+        ),
+        (
+            "build_recommended_heldout",
+            Box::new(move || next(dir, &recommended_held)),
         ),
         ("tally", Box::new(move || queue::tally(dir).frames as usize)),
         ("scan", Box::new(move || Summary::scan(dir).frames as usize)),
@@ -764,12 +782,20 @@ fn indexed(dir: &Path, every: &Filters) {
         ("auto=overlaps", with_auto(AutoFilter::Overlaps)),
         ("auto=both", with_auto(AutoFilter::Both)),
         ("one camera", one_camera),
-        ("recommended, page default", recommended_page),
+        ("recommended, page default", recommended_page.clone()),
+        (
+            "recommended, page default, held-out steering",
+            held_out(recommended_page),
+        ),
         (
             "recommended, status unreviewed",
             recommended(unreviewed_again),
         ),
         ("recommended, status any", recommended(every.clone())),
+        (
+            "recommended, status any, held-out steering",
+            held_out(recommended(every.clone())),
+        ),
     ];
     println!("\n| index query | first ms | warm ms | frames listed |\n|---|---|---|---|");
     for (name, f) in &queries {
