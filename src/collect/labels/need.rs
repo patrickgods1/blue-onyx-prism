@@ -55,16 +55,18 @@
 //!            · (1 + W_REGION · T_R/(T_R + n_{m,k,region(b)}))/2 · κ_b
 //! objects: candidates of other classes at IoU >= OBJECT_IOU, or intersection over the smaller box
 //!          >= OBJECT_INSIDE, are one object; only its best class (largest Σ a_b · w_k) keeps its boxes
-//! E_k  = min(Σ a_b, BOX_CAP)      w_k = v_k · D_k · F_k · r_k · U_k · g_k
+//! E_k  = crowd(Σ a_b) = min(S, 1) + MORE_WEIGHT · min(max(S − 1, 0), MORE_BOXES)
+//!                                 w_k = v_k · D_k · F_k · r_k · U_k · g_k
 //! v_k  = ½·T/(T + n_{k,s}) + ½·T_CAM/(T_CAM + n_{m,k,s})
 //! D_k  = 1 + W_DAY if d is a new day of (m, k, s), else 1
-//! F_k  = RARE_GAIN under CLASS_FLOOR whole reviewed boxes, unless mostly false (FALSE_MIN_PROPOSED or
-//!        more judged proposals over every camera, under FALSE_KEPT_SHARE of them kept), else 1
+//! F_k  = RARE_GAIN under CLASS_FLOOR whole reviewed boxes, else 1; when the class is mostly false
+//!        (FALSE_MIN_PROPOSED or more judged proposals over every camera, under FALSE_KEPT_SHARE of
+//!        them kept) only a frame with a strong or decided box of it keeps the gain
 //! r_k  = 1 + RECALL_GAIN · m̂   (m̂: the shrunk held-out miss rate, recall::Measured::miss)
 //! U_k  = CATCHUP_GAIN if k is camera m's lowest-recall class (within CATCHUP_TOL), else 1
 //! g_k  = 1 (held-out steering comes later)
 //! V    = Σ_k E_k · w_k
-//! H    = W_HARDNEG · min(Σ_b f_b · T_H/(T_H + h_{m,k}) · v_k · region_b, BOX_CAP)
+//! H    = W_HARDNEG · crowd(Σ_b f_b · T_H/(T_H + h_{m,k}) · v_k · region_b)
 //!        f_b = max(1 − κ_b, VLM_NO_FALSE if a VLM no) for a likely false box (κ_b < LIKELY_FALSE_KAPPA
 //!        or a VLM no), else 0; h_{m,k}: m's hard negatives of k
 //! empty frame: V = W_EMPTY · T/(T + empty_s) · (1 + ANIMAL_GAIN · p_{m,s}), H = 0
@@ -100,7 +102,10 @@
 //!   needs about a third of that (its backgrounds and angles), so a camera's own weak class keeps
 //!   pulling after the scene is well covered. [`T_R`] = 10: a region of a camera's view is new
 //!   until about ten boxes there (persons and animals included, which never form spots).
-//! - [`BOX_CAP`] = 3: a crowd counts as three boxes; past that a frame's boxes are near copies.
+//! - [`crowd`] ([`MORE_WEIGHT`] = 0.5, [`MORE_BOXES`] = 2): the first box of a class on a frame is
+//!   worth the most, each further one half as much, and three full boxes (2) are the most a class
+//!   of a frame counts: a frame of five cars teaches little more than one of two, and a storm of
+//!   weak boxes never reaches a single strong one's worth by number.
 //! - [`MIN_EVIDENCE`] = 0.1, [`MAX_PER_CLASS`] = 8: a box under a tenth of evidence (a VLM no on a
 //!   lone low score) adds nothing a reviewer would keep; eight of a class are more than the cap
 //!   counts.
@@ -108,7 +113,9 @@
 //!   ([`crate::benchmark::metrics::MIN_CLASS_GT`]), so the first 20 come first. A parked box counts
 //!   whole here: the floor is about how many boxes exist. [`FALSE_MIN_PROPOSED`] = 20 and
 //!   [`FALSE_KEPT_SHARE`] = 0.2: a class proposed on 20 reviewed frames and kept on fewer than one
-//!   in five is mostly a labeler's false positive, not a rare class, and leaves the floor.
+//!   in five is mostly a labeler's false positive (lone SAM 3 cats): its weak boxes leave the floor,
+//!   while a frame with a strong box of it keeps the gain (a real cat is still rare), lowered per
+//!   camera by κ as that camera's rejects accumulate.
 //! - [`RECALL_GAIN`] = 2: a class missed half the time weighs twice one never missed.
 //! - [`CATCHUP_GAIN`] = 2, [`CATCHUP_TOL`] = 0.05: a camera's lowest class weighs double until it
 //!   is within five points of the next; one held-out object of twenty moves recall by five points.
@@ -164,8 +171,15 @@ pub const MISSED_MIN_E: f64 = 0.5;
 pub const MISSED_MIN_KAPPA: f64 = 0.5;
 /// Weight of a box's region novelty within its camera.
 pub const W_REGION: f64 = 1.0;
-/// Most boxes one class of a frame counts as (and the cap of the hard-negative share).
-pub const BOX_CAP: f64 = 3.0;
+/// [`crowd`]: what each box of a class past the first is worth, and how many such boxes count.
+pub const MORE_WEIGHT: f64 = 0.5;
+pub const MORE_BOXES: f64 = 2.0;
+
+/// What `s` (the summed weight of one class's boxes on a frame, or of its likely false boxes)
+/// counts as: the first box whole, further ones at [`MORE_WEIGHT`], up to [`MORE_BOXES`] more.
+pub fn crowd(s: f64) -> f64 {
+    s.min(1.0) + MORE_WEIGHT * (s - 1.0).clamp(0.0, MORE_BOXES)
+}
 /// Pending candidates under this evidence are left out; at most this many of a class are kept.
 pub const MIN_EVIDENCE: f64 = 0.1;
 pub const MAX_PER_CLASS: usize = 8;
@@ -1193,8 +1207,10 @@ struct Cam<'a> {
 pub struct Scorer<'a> {
     need: &'a Need<'a>,
     tally: &'a CellTally,
-    /// Per class: under the floor (whole boxes, not mostly false), and whole reviewed boxes.
-    floor: Vec<bool>,
+    /// Per class: under the floor (whole boxes), mostly false (its weak boxes leave the floor),
+    /// and whole reviewed boxes.
+    rare: Vec<bool>,
+    mostly_false: Vec<bool>,
     boxes: Vec<f64>,
     /// Per class, per scene: reviewed boxes over every camera.
     n_ks: Vec<[f64; 4]>,
@@ -1227,13 +1243,12 @@ impl<'a> Scorer<'a> {
         let boxes: Vec<u64> = (0..classes)
             .map(|i| tally.class_boxes.get(&k16(i)).copied().unwrap_or(0))
             .collect();
-        let floor = boxes
+        let rare = boxes.iter().map(|n| *n < CLASS_FLOOR).collect();
+        let mostly_false = proposed
             .iter()
-            .zip(&proposed)
-            .map(|(n, p)| {
-                let mostly_false = p.proposed >= FALSE_MIN_PROPOSED
-                    && (p.kept as f64) < FALSE_KEPT_SHARE * p.proposed as f64;
-                *n < CLASS_FLOOR && !mostly_false
+            .map(|p| {
+                p.proposed >= FALSE_MIN_PROPOSED
+                    && (p.kept as f64) < FALSE_KEPT_SHARE * p.proposed as f64
             })
             .collect();
         let n_ks = (0..classes)
@@ -1251,7 +1266,8 @@ impl<'a> Scorer<'a> {
         Self {
             need,
             tally,
-            floor,
+            rare,
+            mostly_false,
             boxes: boxes.iter().map(|n| *n as f64).collect(),
             n_ks,
             cams: RefCell::new(HashMap::new()),
@@ -1371,8 +1387,23 @@ impl<'a> Scorer<'a> {
             .flatten()
     }
 
+    /// Class `k` is under the floor of whole boxes.
     fn below_floor(&self, k: u16) -> bool {
-        self.floor.get(usize::from(k)).copied().unwrap_or(false)
+        self.rare.get(usize::from(k)).copied().unwrap_or(false)
+    }
+
+    /// Class `k` is mostly false (see the module docs).
+    fn mostly_false(&self, k: u16) -> bool {
+        self.mostly_false
+            .get(usize::from(k))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The floor's gain applies to a frame's class `k`, `strong` when it has a strong or decided
+    /// box of it: under the floor, and for a mostly false class only with a strong box.
+    fn floor_gain(&self, k: u16, strong: bool) -> bool {
+        self.below_floor(k) && (strong || !self.mostly_false(k))
     }
 
     /// The class that makes the visit of a frame of `camera` expand, of the classes of its event's
@@ -1422,7 +1453,10 @@ impl<'a> Scorer<'a> {
                     .and_then(|c| c.days.get(&(k, s8)))
                     .is_some_and(|days| days.contains(f.day));
                 let d_k = if new_day { 1.0 + W_DAY } else { 1.0 };
-                let floor = self.below_floor(k);
+                let strong = cands
+                    .iter()
+                    .any(|b| b.class == k && (b.has(STRONG) || b.has(TRAINING)));
+                let floor = self.floor_gain(k, strong);
                 let f_k = if floor { RARE_GAIN } else { 1.0 };
                 let r_k = cam.r.get(ki).and_then(|r| r.get(s)).copied().unwrap_or(1.0);
                 let catch_up = cam.catch_up.get(ki).copied().unwrap_or(false);
@@ -1460,7 +1494,7 @@ impl<'a> Scorer<'a> {
                 sum += x.a;
                 h_k += x.h;
             }
-            let e_k = sum.min(BOX_CAP);
+            let e_k = crowd(sum);
             let term = e_k * cw.w;
             v += term;
             let h_k = h_k * cw.v;
@@ -1500,7 +1534,7 @@ impl<'a> Scorer<'a> {
                 best = Some((term, d));
             }
         }
-        let hard = W_HARDNEG * hard.min(BOX_CAP);
+        let hard = W_HARDNEG * crowd(hard);
         let mut d = best.map(|(_, d)| d).unwrap_or_default();
         d.hard = hard;
         d.hard_class = hard_class.filter(|_| hard > 0.0);

@@ -107,7 +107,7 @@ fn rf(n: f64) -> f64 {
 /// with `region` reviewed boxes, of a class with `n_ks` and `n_mks` reviewed boxes, times `rest`
 /// (day, floor, recall, catch-up).
 fn expect(a: f64, region: f64, n_ks: f64, n_mks: f64, rest: f64) -> u32 {
-    score_of(a * rf(region) * v(n_ks, n_mks) * rest)
+    score_of(crowd(a * rf(region)) * v(n_ks, n_mks) * rest)
 }
 
 fn wanted(c: &[String]) -> Wanted<'_> {
@@ -326,12 +326,22 @@ fn a_missed_box_doubles_only_with_evidence_and_a_camera_that_keeps_the_class() {
         &[],
     );
     assert!(!d.missed, "{d:?}");
-    // Five strong boxes in a new place count as BOX_CAP.
-    let crowd: Vec<CellBox> = (0..5).map(|_| cb(PERSON, RIGHT, 100, STRONG)).collect();
-    assert_eq!(
-        score(&need, &t, &f, &crowd),
-        score_of(BOX_CAP * v(25.0, 25.0))
-    );
+    // Five strong boxes in a new place count as two (the first whole, the next two at a half).
+    let five: Vec<CellBox> = (0..5).map(|_| cb(PERSON, RIGHT, 100, STRONG)).collect();
+    assert_eq!(score(&need, &t, &f, &five), score_of(2.0 * v(25.0, 25.0)));
+    let two: Vec<CellBox> = (0..2).map(|_| cb(PERSON, RIGHT, 100, STRONG)).collect();
+    assert_eq!(score(&need, &t, &f, &two), score_of(1.5 * v(25.0, 25.0)));
+}
+
+#[test]
+fn further_boxes_of_a_class_count_less() {
+    assert_eq!(crowd(0.0), 0.0);
+    assert_eq!(crowd(0.5), 0.5);
+    assert_eq!(crowd(1.0), 1.0);
+    assert_eq!(crowd(1.5), 1.25);
+    assert_eq!(crowd(3.0), 2.0);
+    assert_eq!(crowd(10.0), 2.0);
+    assert_eq!((MORE_WEIGHT, MORE_BOXES), (0.5, 2.0));
 }
 
 fn vlm(ok: bool) -> VlmCheck {
@@ -484,10 +494,18 @@ fn thirty_rejected_strong_proposals_lower_a_cameras_strong_need_fivefold() {
     let need_side = f64::from(side.score) / 1000.0 - side.hard;
     assert_eq!(side.hard, 0.0);
     assert!(need_side >= 5.0 * need_back, "{need_side} {need_back}");
-    // `side` is weighed as a camera with no history of the class.
-    assert_eq!(side.score, expect(1.0, 0.0, 0.0, 0.0, 1.0 + W_DAY));
-    // The class is mostly false (30 proposals, none kept): it left the floor.
-    assert!(!s.below_floor(MOTORCYCLE));
+    // `side` is weighed as a camera with no history of the class; a strong box keeps the floor's
+    // gain although the class is mostly false (30 proposals, none kept).
+    assert_eq!(side.score, expect(1.0, 0.0, 0.0, 0.0, FRESH));
+    assert!(side.below_floor && back.below_floor);
+    // A lone weak box of the mostly false class does not.
+    let weak = s.score(
+        &at("side", "night", "d1"),
+        &[cb(MOTORCYCLE, RIGHT, 40, 0)],
+        &[],
+    );
+    assert!(!weak.below_floor);
+    assert_eq!(weak.score, expect(0.4, 0.0, 0.0, 0.0, 1.0 + W_DAY));
 }
 
 #[test]
@@ -526,15 +544,25 @@ fn a_class_under_the_floor_comes_first_until_it_is_mostly_false() {
     assert!(!d.below_floor);
     assert_eq!(d.score, expect(1.0, 0.0, 0.0, 0.0, 1.0 + W_DAY));
     // Cats proposed on 20 reviewed frames over two cameras, kept on 3 (under a fifth): mostly
-    // false, so no floor although 3 boxes are far under it. Kept on 4 (a fifth): rare again.
+    // false, so a lone weak cat loses the floor although 3 boxes are far under it, while a strong
+    // cat keeps it. Kept on 4 (a fifth): rare for both.
     let mut u = CellTally::default();
     proposals(&need, &mut u, "back", CAT, 10, 3);
     proposals(&need, &mut u, "side", CAT, 10, 0);
-    assert!(!Scorer::new(&need, &u).below_floor(CAT));
+    let s = Scorer::new(&need, &u);
+    assert!(s.below_floor(CAT) && s.mostly_false(CAT));
+    assert!(!s.floor_gain(CAT, false) && s.floor_gain(CAT, true));
+    let yard = at("yard", "night", "d1");
+    assert!(!s.score(&yard, &[cb(CAT, RIGHT, 40, 0)], &[]).below_floor);
+    assert!(
+        s.score(&yard, &[cb(CAT, RIGHT, 100, STRONG)], &[])
+            .below_floor
+    );
     let mut w = CellTally::default();
     proposals(&need, &mut w, "back", CAT, 10, 4);
     proposals(&need, &mut w, "side", CAT, 10, 0);
-    assert!(Scorer::new(&need, &w).below_floor(CAT));
+    let s = Scorer::new(&need, &w);
+    assert!(s.floor_gain(CAT, false) && s.floor_gain(CAT, true));
     assert_eq!((CLASS_FLOOR, FALSE_MIN_PROPOSED), (20, 20));
 }
 

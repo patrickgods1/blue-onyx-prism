@@ -808,16 +808,17 @@ a_b  = e_b · (1/4 at a parked spot of m) · (2 if missed or a gap, e_b >= 0.5 a
            · (1 + 10/(10 + n_{m,k,region(b)}))/2 · κ_b
 one object: candidates of other classes at IoU >= 0.5, or with 80% of the smaller box inside the other,
             are one object, and only its best class (largest Σ a_b · w_k) keeps its boxes
-E_k  = min(Σ a_b, 3)
+E_k  = crowd(S) = min(S, 1) + 0.5 · min(max(S − 1, 0), 2),  S = Σ a_b   (3 full boxes count 2, at most 2)
 w_k  = v_k · D_k · F_k · r_k · U_k
 v_k  = ½·100/(100 + n_{k,s}) + ½·30/(30 + n_{m,k,s})
 D_k  = 1.5 if d is a new day of (m, k, s), else 1
-F_k  = 3 while class k has fewer than 20 whole reviewed boxes (every camera and scene, parked ones too),
-       unless it is mostly false: proposed on 20 or more reviewed frames and kept on fewer than a fifth
+F_k  = 3 while class k has fewer than 20 whole reviewed boxes (every camera and scene, parked ones too);
+       when it is mostly false (proposed on 20 or more reviewed frames, every camera, and kept on fewer
+       than a fifth), only on a frame with a strong or decided box of it: its lone weak boxes lose it
 r_k  = 1 + 2·m̂   (m̂: the held-out miss rate of k on m in s, shrunk)
 U_k  = 2 for camera m's lowest-recall class, else 1
 V    = Σ_k E_k · w_k
-H    = 0.5 · min(Σ_b f_b · 20/(20 + h_{m,k}) · v_k · region_b, 3)
+H    = 0.5 · crowd(Σ_b f_b · 20/(20 + h_{m,k}) · v_k · region_b)
        f_b = max(1 − κ_b, 0.5 if the VLM said no) for a likely false box (κ_b < 0.5 or a VLM no), else 0
 empty frame: V = 0.3 · 100/(100 + empty_s) · (1 + 3 · p_{m,s}), H = 0
 need = round(1000 · (V + H))
