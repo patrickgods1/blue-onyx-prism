@@ -283,8 +283,18 @@ impl Hooks for RecHooks {
             bail!("no runtime for the default");
         }
         assert!(run_dir.is_dir());
+        // With recall cells, which the run does not keep for a baseline.
+        let mut cells = super::RecallCells::default();
+        cells.by_scene.insert(
+            "all".into(),
+            vec![crate::benchmark::ClassRecall::new("cat", 3, 1)],
+        );
         Ok(Some(Baseline {
             model: format!("default+{}", extra.len()),
+            summary: Some(BenchSummary {
+                recall_cells: cells,
+                ..BenchSummary::default()
+            }),
             ..Baseline::default()
         }))
     }
@@ -504,6 +514,11 @@ fn a_run_trains_installs_registers_and_benchmarks() {
         out.baseline.as_ref().unwrap().model,
         "default+1",
         "the default ran on the same sets"
+    );
+    let base = out.baseline.as_ref().unwrap().summary.as_ref().unwrap();
+    assert!(
+        base.recall_cells.is_empty(),
+        "a baseline keeps no recall cells"
     );
     // The commands.
     let cmds = fake.inner.cmds();

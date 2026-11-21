@@ -541,6 +541,12 @@ impl<'a> Bench<'a> {
             threshold,
             self.threshold_objective,
         );
+        // No accuracy (no CCTV class): the held-out tags' per-class recall all the same.
+        let tag_recall = if accuracy.is_none() {
+            super::scoring::tag_recall_only(job, &all, &timed.eval_preds, threshold)
+        } else {
+            Vec::new()
+        };
         let accuracy_score = accuracy
             .as_ref()
             .and_then(|a| a.score(self.accuracy_metric));
@@ -589,6 +595,7 @@ impl<'a> Bench<'a> {
             by_resolution: timed.by_resolution(),
             accuracy,
             accuracy_note,
+            tag_recall,
             grades: Some(grades),
             agreement: None,
             eval_preds: {

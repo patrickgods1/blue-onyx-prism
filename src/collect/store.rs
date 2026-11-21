@@ -39,8 +39,9 @@ pub const PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// An I/O failure is warned about at most this often.
 const WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// A camera that sent no frame for this long is forgotten (its rate limits and recent hashes),
-/// unless a bucket's `per_camera_min_interval_s` is longer: then that interval, so forgetting
-/// never lets a frame in early.
+/// unless a bucket's `per_camera_min_interval_s` or night / IR interval
+/// ([`BucketConfig::night_interval`]) is longer: then that interval, so forgetting never lets a
+/// frame in early.
 pub const CAMERA_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Most cameras remembered; a new one past it makes the one silent the longest forgotten. The
 /// camera names come from upload file names, so a client sending random names must not grow the
@@ -153,8 +154,9 @@ fn idle_after(settings: &CollectSettings) -> Duration {
     Bucket::ALL
         .iter()
         .map(|b| {
+            let c = settings.buckets.get(*b);
             Duration::from_secs(u64::from(
-                settings.buckets.get(*b).per_camera_min_interval_s,
+                c.per_camera_min_interval_s.max(c.night_interval(*b)),
             ))
         })
         .fold(CAMERA_IDLE, Duration::max)
@@ -352,7 +354,8 @@ impl Store {
                 let c = settings.buckets.get(*b);
                 let sampled = f64::from(c.rate) >= 1.0
                     || sample(&record.record.request_id, *b) < f64::from(c.rate);
-                let interval = Duration::from_secs(u64::from(c.per_camera_min_interval_s));
+                let interval =
+                    Duration::from_secs(u64::from(c.interval_for(*b, &record.record.scene)));
                 let due = self.last.get(&(camera.clone(), *b)).is_none_or(|t| {
                     at.duration_since(*t)
                         .map_or(true, |since| since >= interval)
@@ -851,6 +854,138 @@ mod tests {
         let share = kept as f64 / f64::from(n);
         assert!((share - 0.25).abs() < 0.02, "{share}");
         assert_eq!(sample("abc", Bucket::Empty), sample("abc", Bucket::Empty));
+    }
+
+    /// An empty frame at night or IR is kept after the shorter `night_interval` (120 s); a day one
+    /// waits the full 600 s.
+    #[test]
+    fn night_and_ir_empty_frames_use_the_night_interval() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let mut st = store();
+        let scene = |cam: &str, rid: &str, at: u64, scene: &str| {
+            let mut d = base(cam, rid, t(at));
+            d.record.scene = scene.into();
+            d
+        };
+        for (cam, scene_name) in [("n", "night"), ("i", "ir"), ("d", "day")] {
+            assert!(matches!(
+                st.handle(frame(&s, scene(cam, "r1", 0, scene_name), 1)),
+                Handled::Saved { .. }
+            ));
+            // 60 s on: limited in every scene.
+            assert_eq!(
+                st.handle(frame(&s, scene(cam, "r2", 60, scene_name), 2)),
+                Handled::Dropped(Dropped::Rate),
+                "{scene_name}"
+            );
+            // 130 s on: night / IR are due again, day is not.
+            let out = st.handle(frame(&s, scene(cam, "r3", 130, scene_name), 3));
+            if scene_name == "day" {
+                assert_eq!(out, Handled::Dropped(Dropped::Rate));
+                assert!(matches!(
+                    st.handle(frame(&s, scene(cam, "r4", 601, scene_name), 4)),
+                    Handled::Saved { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(out, Handled::Saved { .. }),
+                    "{scene_name}: {out:?}"
+                );
+            }
+        }
+    }
+
+    /// One camera, mixed scenes: the empty bucket has a single clock, the interval depends on the
+    /// scene of the frame that asks.
+    #[test]
+    fn mixed_scenes_share_one_clock_with_the_asking_frames_interval() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let mut st = store();
+        let mut f = |rid: &str, at: u64, scene: &str, seed: u32| {
+            let mut d = base("a", rid, t(at));
+            d.record.scene = scene.into();
+            st.handle(frame(&s, d, seed))
+        };
+        assert!(matches!(f("r1", 0, "day", 1), Handled::Saved { .. }));
+        assert!(matches!(f("r2", 130, "night", 2), Handled::Saved { .. }));
+        assert_eq!(
+            f("r3", 601, "day", 3),
+            Handled::Dropped(Dropped::Rate),
+            "600 s from the night save at 130 s"
+        );
+        assert!(matches!(f("r4", 731, "day", 4), Handled::Saved { .. }));
+    }
+
+    /// Unset night interval: never stricter than the day interval.
+    #[test]
+    fn an_unset_night_interval_is_never_stricter_than_the_day_one() {
+        for day in [0u32, 30] {
+            let tmp = Tmp::new();
+            let s = settings(&tmp.0, |c| c.buckets.empty.per_camera_min_interval_s = day);
+            let mut st = store();
+            let mut n = 0u32;
+            let mut go = |at: u64, scene: &str| {
+                n += 1;
+                let mut d = base("a", &format!("r{n}"), t(at));
+                d.record.scene = scene.into();
+                st.handle(frame(&s, d, n))
+            };
+            assert!(matches!(go(0, "night"), Handled::Saved { .. }));
+            assert!(
+                matches!(go(31, "night"), Handled::Saved { .. }),
+                "day {day}"
+            );
+            if day == 0 {
+                assert!(matches!(go(32, "ir"), Handled::Saved { .. }));
+            } else {
+                assert_eq!(go(40, "ir"), Handled::Dropped(Dropped::Rate));
+            }
+        }
+    }
+
+    #[test]
+    fn a_night_interval_of_zero_is_no_limit() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |c| c.buckets.empty.night_interval_s = Some(0));
+        let mut st = store();
+        for (i, at) in [0u64, 1, 2].into_iter().enumerate() {
+            let mut d = base("a", &format!("r{i}"), t(at));
+            d.record.scene = "ir".into();
+            assert!(
+                matches!(st.handle(frame(&s, d, i as u32 + 1)), Handled::Saved { .. }),
+                "{i}"
+            );
+        }
+        // A day frame is still held to 600 s.
+        let mut d = base("a", "rd", t(3));
+        d.record.scene = "day".into();
+        assert_eq!(st.handle(frame(&s, d, 9)), Handled::Dropped(Dropped::Rate));
+    }
+
+    /// Forgetting never lets a night frame in before the night interval is over.
+    #[test]
+    fn a_camera_inside_a_longer_night_interval_is_kept() {
+        let tmp = Tmp::new();
+        let two_days = 2 * CAMERA_IDLE.as_secs();
+        let s = settings(&tmp.0, |c| {
+            c.buckets.empty.night_interval_s = Some(u32::try_from(two_days).unwrap())
+        });
+        let mut st = store();
+        let mut night = |cam: &str, rid: &str, at: u64, seed: u32| {
+            let mut d = base(cam, rid, t(at));
+            d.record.scene = "night".into();
+            st.handle(frame(&s, d, seed))
+        };
+        assert!(matches!(night("a", "a1", 0, 1), Handled::Saved { .. }));
+        let later = two_days * 3 / 4;
+        assert!(matches!(night("b", "b1", later, 2), Handled::Saved { .. }));
+        assert_eq!(
+            night("a", "a2", later, 3),
+            Handled::Dropped(Dropped::Rate),
+            "past a day, inside the night interval: a is still limited"
+        );
     }
 
     #[test]

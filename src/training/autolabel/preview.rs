@@ -17,6 +17,16 @@ pub const SAM3_BASE_SECONDS: f64 = 2.0;
 pub const SAM3_PHRASE_SECONDS: f64 = 0.2;
 /// MM-Grounding-DINO per frame, measured on [`RATE_HARDWARE`].
 pub const GDINO_SECONDS: f64 = 0.55;
+/// MegaDetector v6 (YOLOv9 compact at 640 px) per night or IR frame and view. Not measured here:
+/// an estimate from its size (25.5M parameters, a tenth of MM-Grounding-DINO tiny's compute), so
+/// the figure says it is small next to the open-vocabulary labeler, not how small.
+pub const MDV6_SECONDS: f64 = 0.05;
+/// Boxes of its own MegaDetector adds per night or IR frame for the VLM to check, assumed (camera
+/// traps hold one or two animals a frame, and most of its boxes vote on the other labelers'), at
+/// [`VLM_SECONDS_PER_BOX`].
+pub const MDV6_VLM_BOXES: f64 = 1.0;
+/// The VLM check per box (measured on an M1, docs/TRAINING.md "Auto-label").
+pub const VLM_SECONDS_PER_BOX: f64 = 1.0;
 /// Where the rates come from: every estimate names it, since another GPU differs a lot.
 pub const RATE_HARDWARE: &str = "a GTX 1070 Ti";
 
@@ -69,9 +79,15 @@ pub struct Estimate {
     pub text: String,
 }
 
-/// The rough time of `frames` frames of a run of `r` with `phrases` prompt phrases. None when no
-/// rate was measured: a run with a model, or RF-DETR L alone.
-pub fn estimate(r: &AutolabelRequest, phrases: usize, frames: usize) -> Option<Estimate> {
+/// The rough time of `frames` frames of a run of `r` with `phrases` prompt phrases, `night` of
+/// them night or IR: with the enhanced view ([`super::night`]) the open-vocabulary labeler runs
+/// twice on those. None when no rate was measured: a run with a model, or RF-DETR L alone.
+pub fn estimate(
+    r: &AutolabelRequest,
+    phrases: usize,
+    frames: usize,
+    night: usize,
+) -> Option<Estimate> {
     if r.with_model.is_some() {
         return None;
     }
@@ -96,7 +112,31 @@ pub fn estimate(r: &AutolabelRequest, phrases: usize, frames: usize) -> Option<E
             format!("MM-Grounding-DINO at {GDINO_SECONDS} s per frame{other}"),
         )
     };
-    let total_seconds = seconds_per_frame * frames as f64;
+    let twice = if super::night::enhancement(r).is_some() {
+        night.min(frames)
+    } else {
+        0
+    };
+    let mut total_seconds = seconds_per_frame * (frames + twice) as f64;
+    let mut rate = if twice > 0 {
+        format!("{rate}, twice on {twice} night or IR frames for their enhanced copy")
+    } else {
+        rate
+    };
+    let night_frames = night.min(frames);
+    if r.mdv6 && night_frames > 0 {
+        let views = if twice > 0 { 2.0 } else { 1.0 };
+        let mut md = MDV6_SECONDS * views;
+        let mut what = format!("MegaDetector about {MDV6_SECONDS} s per view");
+        if r.vlm.is_some() {
+            md += MDV6_VLM_BOXES * VLM_SECONDS_PER_BOX;
+            what.push_str(&format!(
+                " and the VLM on about {MDV6_VLM_BOXES} box of its own ({VLM_SECONDS_PER_BOX} s)"
+            ));
+        }
+        total_seconds += md * night_frames as f64;
+        rate = format!("{rate}; {what} on {night_frames} night or IR frames");
+    }
     let before_vlm = r.vlm.is_some();
     let vlm = if before_vlm {
         ", before the VLM check (most of a frame's time, about 1 s per box)"
@@ -123,6 +163,10 @@ pub struct Counts {
     pub skipped_done: usize,
     pub skipped_trained: usize,
     pub unreadable: u64,
+    /// Of `taken`, night and IR frames.
+    pub taken_night: usize,
+    /// Of `taken`, the unreviewed frames of a `missing_only` run.
+    pub taken_unreviewed: usize,
 }
 
 /// `POST /training/autolabel/preview`, `train autolabel --dry-run`.
@@ -142,6 +186,12 @@ pub struct AutolabelPreview {
     /// Frames the run labels: the first `limit` of those it does not leave out.
     pub taken: usize,
     pub taken_by_status: StatusSplit,
+    /// Of [`Self::taken`], night and IR frames: a labelers run's enhanced view and MegaDetector look
+    /// at them too ([`super::night`]).
+    pub taken_night: usize,
+    /// Of [`Self::taken`], the unreviewed frames of a `missing_only` run (after the reviewed and
+    /// sent-back ones, which keep `limit` to themselves).
+    pub taken_unreviewed: usize,
     /// Matching frames left out: these labelers looked at them already (`again=1` to redo).
     pub skipped_done: usize,
     /// `missing_only`: matching frames left out because the model trained on them.
@@ -194,12 +244,14 @@ impl AutolabelPreview {
             matched_by_status: counts.matched,
             taken,
             taken_by_status: counts.taken,
+            taken_night: counts.taken_night,
+            taken_unreviewed: counts.taken_unreviewed,
             skipped_done: counts.skipped_done,
             skipped_trained: counts.skipped_trained,
             over_limit: left - taken,
             unreadable: counts.unreadable,
             phrases,
-            estimate: estimate(r, phrases, taken),
+            estimate: estimate(r, phrases, taken, counts.taken_night),
             summary: String::new(),
             warnings: Vec::new(),
             memory: None,
@@ -242,6 +294,15 @@ impl AutolabelPreview {
             self.taken,
             self.taken_by_status.text()
         ));
+        if r.missing_only && r.missing_unreviewed {
+            s.push_str(&format!(
+                " Of them {} reviewed or sent back (limit {}), then {} unreviewed (at most {}).",
+                self.taken - self.taken_unreviewed,
+                self.limit,
+                self.taken_unreviewed,
+                r.missing_unreviewed_limit
+            ));
+        }
         match &self.estimate {
             Some(e) => s.push_str(&format!(" Time: {}.", e.text)),
             None if r.with_model.is_some() => {
@@ -368,7 +429,7 @@ mod tests {
 
     #[test]
     fn the_estimate_uses_the_measured_rates_and_names_the_hardware() {
-        let e = estimate(&sam3(), 20, 100).unwrap();
+        let e = estimate(&sam3(), 20, 100, 0).unwrap();
         assert!(near(e.seconds_per_frame, 6.0), "2 s + 0.2 s x 20: {e:?}");
         assert!(near(e.total_seconds, 600.0), "{e:?}");
         assert!(e.text.contains("a GTX 1070 Ti"), "{}", e.text);
@@ -378,7 +439,7 @@ mod tests {
 
         let mut r = request();
         r.vlm = None;
-        let e = estimate(&r, 20, 1000).unwrap();
+        let e = estimate(&r, 20, 1000, 0).unwrap();
         assert!(near(e.seconds_per_frame, 0.55), "phrases do not count");
         assert!(near(e.total_seconds, 550.0), "{e:?}");
         assert!(!e.before_vlm && !e.text.contains("VLM"), "{}", e.text);
@@ -386,7 +447,7 @@ mod tests {
 
         r.vlm = Some(VlmSize::Qwen2b);
         r.gdino = Some(GdinoSize::Large);
-        let e = estimate(&r, 20, 1).unwrap();
+        let e = estimate(&r, 20, 1, 0).unwrap();
         assert!(e.text.contains("measured with tiny"), "{}", e.text);
     }
 
@@ -424,10 +485,10 @@ mod tests {
     fn no_measured_rate_means_no_estimate() {
         let mut r = request();
         r.gdino = None;
-        assert_eq!(estimate(&r, 20, 10), None, "RF-DETR L alone");
+        assert_eq!(estimate(&r, 20, 10, 0), None, "RF-DETR L alone");
         let mut m = request();
         m.with_model = Some("mine".into());
-        assert_eq!(estimate(&m, 20, 10), None);
+        assert_eq!(estimate(&m, 20, 10, 0), None);
         let c = Counts {
             matched: unreviewed(1),
             taken: unreviewed(1),

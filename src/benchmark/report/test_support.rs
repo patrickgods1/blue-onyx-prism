@@ -60,6 +60,7 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
         by_resolution: Vec::new(),
         accuracy: None,
         accuracy_note: None,
+        tag_recall: vec![],
         grades: Some(Grades::new(None, p50, Default::default(), false)),
         agreement: None,
         per_image: Vec::new(),

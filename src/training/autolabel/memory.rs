@@ -4,7 +4,7 @@
 //!
 //! `scripts/autolabel.py` loads every chosen labeler on one device and keeps them there for the
 //! run, so they add up. A labeler takes about its checkpoint as stored (the script loads each at
-//! the checkpoint's precision: MM-Grounding-DINO, RF-DETR and SAM 3 in f32, Qwen3-VL in bf16 / f16);
+//! the checkpoint's precision: MM-Grounding-DINO, RF-DETR, SAM 3 and MegaDetector v6 (opt-in, on night frames) in f32, Qwen3-VL in bf16 / f16);
 //! SigLIP 2 ranks a few crops per frame on the CPU when other models use the GPU and there are at
 //! most 12 animal classes (the script's `siglip_device`), so it takes nothing there. An import's
 //! embeddings put SigLIP 2's vision tower alone on the GPU ([`embed_need`]). The sizes come from the catalog pins, so a new pin
@@ -50,6 +50,7 @@ fn title(key: &str) -> String {
         "qwen3-vl-8b" => "Qwen3-VL 8B".into(),
         "sam3" => "SAM 3".into(),
         "rfdetr-large" => "RF-DETR L".into(),
+        super::night::MDV6_MODEL => "MegaDetector v6".into(),
         other => other.into(),
     }
 }
@@ -78,6 +79,12 @@ pub fn labelers_on_gpu(r: &AutolabelRequest) -> Vec<OnGpu> {
         v.extend(on_gpu(
             "rfdetr-large",
             res_catalog::base_weights(res_catalog::TrainFamily::Rfdetr, "large"),
+        ));
+    }
+    if r.mdv6 {
+        v.extend(on_gpu(
+            super::night::MDV6_MODEL,
+            super::night::mdv6_weights(),
         ));
     }
     if let Some(q) = r.vlm {
@@ -235,6 +242,12 @@ pub fn commit_need(r: &AutolabelRequest, classes: &[String]) -> Option<Need> {
         parts.extend(labeler_commit(
             q.key(),
             res_catalog::autolabel_weights(q.key()),
+        ));
+    }
+    if r.mdv6 {
+        parts.extend(labeler_commit(
+            super::night::MDV6_MODEL,
+            super::night::mdv6_weights(),
         ));
     }
     let animals = classes

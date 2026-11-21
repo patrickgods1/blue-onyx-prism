@@ -60,6 +60,15 @@
         <label class="check"><input type="checkbox" name="rfdetr" checked> <span>RF-DETR L <span class="muted small">(COCO classes, 0.1 GB)</span></span></label>
         <label class="check"><input type="checkbox" name="siglip" checked> <span>SigLIP 2 species ranking <span class="muted small">(1.5 GB)</span></span></label>
         <label class="check"><input type="checkbox" name="prefetch" checked> <span>Load the next frame while the GPU works</span></label>
+        <label class="check"><input type="checkbox" name="night_enhance" checked> <span>Night and IR frames: also look at an enhanced copy<span class="muted small tr-hint">CLAHE brightens dark corners; the boxes of both copies are kept, so nothing the original shows is lost. About twice the labelers' time on those frames.</span></span></label>
+      </div>
+      <div class="tr-field" id="al-mdv6-field">
+        <label class="check"><input type="checkbox" name="mdv6" id="al-mdv6"> <span>MegaDetector v6 on night and IR frames <span class="muted small">(YOLOv9 compact, 52 MB)</span></span></label>
+        <p class="muted small">A camera-trap detector trained on night IR: finds animals the other labelers miss. SigLIP 2 names each animal from your classes; one it cannot name stays as <em>animal?</em> for you. Its boxes are never accepted without you. Ticking it accepts the weights' licence, <strong>AGPL-3.0</strong> (Microsoft AI for Good, downloaded from their Zenodo record, SHA-256 pinned; nothing is redistributed).</p>
+        <div class="tr-sub">
+          <label for="al-mdv6-threshold">MegaDetector threshold</label>
+          <input type="number" id="al-mdv6-threshold" name="mdv6_threshold" class="al-num" min="0.01" max="1" step="0.01" value="0.2">
+        </div>
       </div>
       {% if let Some(auto) = gpu_choices.first() %}
       <div class="tr-field">
@@ -91,6 +100,8 @@
       <div class="tr-field tr-wide">
         <label class="check"><input type="checkbox" name="missing_only"> Find missing labels only</label>
         <p class="muted small">Proposes real objects with no box on reviewed frames, for you to check, and nothing else: no class changes, no missed boxes. Frames the model trained on are left out; validation and held-out frames stay in. Status and the frame source are ignored, threshold 0.3 means 0.5, limit 200 means every frame. Run it once per model. A frame that gains a box goes back to review and <strong>leaves exports until you save it again</strong>.</p>
+        <label class="check"><input type="checkbox" name="missing_unreviewed" checked> Also unreviewed frames it never trained or validated on</label>
+        <p class="muted small">There the model is one more labeler: its boxes join as pending proposals and its votes count for boxes it finds again, so the Review queue sees what your camera's model missed.</p>
       </div>
     </div>
     <fieldset>

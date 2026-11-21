@@ -428,6 +428,19 @@ pub struct AutolabelArgs {
     /// Do not load the next frame on a background thread while the GPU labels this one.
     #[arg(long)]
     pub no_prefetch: bool,
+    /// Night and IR frames: the labelers also look at a copy enhanced by this mode and keep the
+    /// boxes of both (none to turn it off, grayscale, gamma:<g>, clahe[:<clip>[,<tiles>]]; default
+    /// clahe). Not used by --with-model.
+    #[arg(long)]
+    pub night_enhance: Option<String>,
+    /// MegaDetector v6 (YOLOv9 compact, AGPL-3.0 weights from Microsoft's Zenodo record, 52 MB) as
+    /// an extra labeler on night and IR frames; SigLIP 2 names its animals. Its boxes are never
+    /// accepted without you. Not with --with-model or --no-siglip.
+    #[arg(long)]
+    pub mdv6: bool,
+    /// MegaDetector's own score threshold, 0.01 to 1 (default 0.2). Needs --mdv6.
+    #[arg(long, requires = "mdv6")]
+    pub mdv6_threshold: Option<f32>,
     /// On Ctrl-C while labelling, discard the frames already labelled (default: they are
     /// written for review, and a rerun skips them).
     #[arg(long)]
@@ -455,9 +468,22 @@ pub struct AutolabelArgs {
     /// to check. Frames the model trained on are left out; a frame goes back to review only when
     /// it gains a box, and leaves exports until you save it again. Looks at every frame (--frames
     /// status and source are ignored); a --threshold of 0.3 means 0.5 and a limit of 200 means
-    /// 20000. Run it once per model.
+    /// 20000. Run it once per model. It also proposes on the unreviewed frames the model never
+    /// trained or validated on, as one more labeler (pending boxes and votes, nothing reopened),
+    /// unless --missing-reviewed-only.
     #[arg(long)]
     pub missing_only: bool,
+    /// With --missing-only: look at reviewed frames only, not at the unreviewed ones.
+    #[arg(long, requires = "missing_only")]
+    pub missing_reviewed_only: bool,
+    /// With --missing-only: most unreviewed frames it looks at (default 2000), after the reviewed
+    /// and sent-back frames, which keep the --frames limit to themselves.
+    #[arg(
+        long,
+        requires = "missing_only",
+        conflicts_with = "missing_reviewed_only"
+    )]
+    pub missing_unreviewed_limit: Option<usize>,
     /// Confirm the licence of a non-commercial / personal-use catalog model --with-model
     /// installs or adds.
     #[arg(long)]
@@ -651,6 +677,20 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
     };
     r.prefetch = !a.no_prefetch;
     r.keep_on_cancel = !a.discard_on_cancel;
+    if let Some(m) = &a.night_enhance {
+        r.night_enhance = Some(
+            m.parse::<crate::model::enhance::Preprocess>()
+                .map_err(|e| anyhow::anyhow!("--night-enhance: {e}"))?,
+        );
+    }
+    r.mdv6 = a.mdv6;
+    if let Some(t) = a.mdv6_threshold {
+        r.mdv6_threshold = t;
+    }
+    r.missing_unreviewed = !a.missing_reviewed_only;
+    if let Some(n) = a.missing_unreviewed_limit {
+        r.missing_unreviewed_limit = n;
+    }
     r.with_model = a.with_model.clone();
     r.threshold = a.threshold;
     r.device = a.device.clone();
@@ -2507,6 +2547,72 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("--sam3"), "{e}");
+    }
+
+    #[test]
+    fn night_options_parse() {
+        use crate::model::enhance::Preprocess;
+        let req = |rest: &[&str]| {
+            let mut v = vec!["autolabel"];
+            v.extend_from_slice(rest);
+            let TrainCommand::Autolabel(a) = parse(&v).unwrap() else {
+                panic!("not autolabel")
+            };
+            autolabel_request(&a)
+        };
+        let r = req(&[]).unwrap();
+        assert_eq!(r.night_enhance, Some(Preprocess::CLAHE));
+        assert!(!r.mdv6 && r.missing_unreviewed);
+        assert_eq!(
+            req(&["--night-enhance", "none"]).unwrap().night_enhance,
+            Some(Preprocess::None)
+        );
+        assert_eq!(
+            req(&["--night-enhance", "gamma:0.6"])
+                .unwrap()
+                .night_enhance,
+            Some(Preprocess::Gamma(0.6))
+        );
+        let e = req(&["--night-enhance", "sharpen"])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--night-enhance"), "{e}");
+        let r = req(&["--mdv6", "--mdv6-threshold", "0.3"]).unwrap();
+        assert!(r.mdv6 && (r.mdv6_threshold - 0.3).abs() < f32::EPSILON);
+        let e = req(&["--mdv6", "--no-siglip"]).unwrap_err().to_string();
+        assert!(e.contains("SigLIP 2"), "{e}");
+        assert!(
+            parse(&["autolabel", "--mdv6-threshold", "0.3"]).is_err(),
+            "needs --mdv6"
+        );
+        let r = req(&[
+            "--with-model",
+            "x",
+            "--missing-only",
+            "--missing-reviewed-only",
+        ])
+        .unwrap();
+        assert!(r.missing_only && !r.missing_unreviewed);
+        assert!(
+            parse(&["autolabel", "--missing-reviewed-only"]).is_err(),
+            "needs --missing-only"
+        );
+        let unrev = |rest: &[&str]| {
+            let mut v = vec!["--with-model", "x", "--missing-only"];
+            v.extend_from_slice(rest);
+            req(&v)
+        };
+        assert_eq!(
+            unrev(&["--missing-unreviewed-limit", "50"])
+                .unwrap()
+                .missing_unreviewed_limit,
+            50
+        );
+        assert!(unrev(&["--missing-unreviewed-limit", "0"]).is_err());
+        assert_eq!(
+            unrev(&[]).unwrap().missing_unreviewed_limit,
+            crate::training::autolabel::MISSING_UNREVIEWED_LIMIT
+        );
     }
 
     #[test]

@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 pub const LOCAL_PREFIX: &str = status::LOCAL_ID_PREFIX;
 /// Id prefix of a catalog model (`resource:model:rfdetr-large`).
 pub const RESOURCE_PREFIX: &str = "resource:";
+/// The start of a run with a model's frame marker (`model:<name>@<device>`, [`ModelPlan::labeler`]);
+/// the labelers' markers never start so.
+pub const MODEL_MARKER_PREFIX: &str = "model:";
 /// Default score threshold of a run with a model.
 pub const DEFAULT_THRESHOLD: f32 = 0.3;
 
@@ -413,7 +416,7 @@ impl ModelPlan {
     /// The marker's labeler: `model:<name>@<device>` (a later run of the same model on the
     /// same device skips the frames unless `again=1`).
     pub fn labeler(&self) -> String {
-        format!("model:{}@{}", self.name, self.device)
+        format!("{MODEL_MARKER_PREFIX}{}@{}", self.name, self.device)
     }
 
     /// The catalog resource, if any.

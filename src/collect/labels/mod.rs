@@ -24,6 +24,7 @@ pub mod heldout;
 pub mod index;
 pub mod overlaps;
 pub mod queue;
+pub mod recall;
 pub mod recommend;
 pub mod refine;
 pub mod repeats;
