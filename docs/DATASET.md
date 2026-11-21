@@ -108,9 +108,12 @@ that looks like one saved in the last 10 minutes.
 2. A bucket passes when its sampling and its per-camera interval (since the camera's last saved frame
    in that bucket) allow it. The passing buckets become `buckets`. If none passes, the frame is
    dropped (`reason="rate"`).
-3. The frame is dropped as a near duplicate (`reason="dup"`) when its dHash is within `dedup_hamming`
-   bits (default 6) of a frame of the same camera saved in the last 10 minutes (at most 32 frames are
-   remembered).
+3. The frame is dropped as a near duplicate (`reason="dup"`) by the rule `collect.dedup_mode` picks
+   ([Near duplicates](#near-duplicates) below has the details and the measurements):
+   - `both` (default): some frame of the same camera **and scene** saved in the last 10 minutes (at
+     most 32 are remembered) is within `dedup_hamming` dHash bits (default 6) **and** the block test
+     finds no change against that same frame. Both must agree.
+   - `dhash`: the dHash test alone, against any of those frames (the rule before `both`).
    - dHash is 64 bits: the luma is box-averaged to 9 x 8 cells, and a bit is set when a cell is brighter
      than its right neighbour.
    - This check is only for frames kept for `positive` or `empty`. A frame kept for `near_threshold`,
@@ -124,6 +127,48 @@ that looks like one saved in the last 10 minutes.
      Frames that do not look like a recent one are not limited by it, as before. To limit those too,
      set the bucket's interval.
 4. The frame is saved, and the passing buckets' interval clocks restart.
+
+<a id="near-duplicates"></a>**Near duplicates.** dHash averages a 2688 x 1520 frame into cells of about
+300 x 190 px, so a 30 x 30 px animal or a distant person in an otherwise identical night scene barely moves
+it, and dHash alone drops exactly the frames with the small objects review needs. The block test
+(`collect::blockdiff`) looks at the same luma at 128 x 72 cells (about 21 x 21 px): it removes slow light
+changes (a 9 x 9 cell detail layer), fits the camera's gain, scores each cell against the pair's noise
+(and, with texture masking, against the local texture), and calls the frames different when a connected
+group of changed cells qualifies. In `both` mode it confirms each dHash drop at
+`blockdiff::Params::COLLECTOR`: `z_cell` 5, `d_min` 8 grey levels, groups of 3 cells or more, texture
+masking 1 (the best point of the sweep below).
+
+- **Memory:** each remembered frame keeps a 9,216-byte thumbnail beside its hash, at most 32 per camera
+  and 8 MiB over all cameras (`store::DEDUP_THUMB_BYTES`, about 28 busy cameras). Past that the oldest
+  thumbnails go first; a frame whose thumbnail is gone can no longer confirm a drop, so eviction only ever
+  keeps more frames. Forgotten cameras free theirs.
+- **Cost** per frame: the luma decode dHash already does, plus about 2 ms for the thumbnail and about
+  0.4 ms per dHash look-alike the block test checks (release build, measured offline).
+- **The sidecar** of a kept frame records what the dedup saw, in `dedup` (see Sidecar JSON).
+
+**How it was measured** (`tests/it/dedup_eval.rs`, `#[ignore]`d, runs only with `BOP_DEDUP_EVAL_DIR`; it
+reads a review folder and writes `report.md` / `report.json` elsewhere). On 3,598 reviewed frames
+(592 of them imported footage), 2,087 pairs of one camera and scene within 10 minutes, a pair is
+*different* when a training box of one frame has no same-object box at IoU 0.5 in the other (1,009
+pairs), else a *duplicate* (1,078). Missed-object rate = called duplicate though different; kept-repeat
+rate = called different though a duplicate:
+
+| rule | missed (all) | missed (collected frames) | missed (imported footage) | kept repeats (all) |
+|---|---|---|---|---|
+| dHash <= 6 | 55.5% (560/1009) | 3.5% (10/284) | 75.9% (550/725) | 37.2% |
+| dHash <= 2 | 20.7% | 0% | 28.8% | 64.2% |
+| block test, `COLLECTOR` alone | 6.8% (69/1009) | 1.8% (5/284) | 8.8% | 68.0% |
+| `both` (dHash <= 6 and `COLLECTOR`) | 6.1% (62/1009) | 0.7% (2/284) | 8.3% | 71.2% |
+| block test at its most sensitive | 0% | 0% | 0% | 100% |
+
+A replay of the keep logic over those frames in time order dropped 451 of 3,598 with dHash <= 6 (173 of
+them holding an object their matching frame lacked) and 177 with `both` (27). **Caveats:** the folder
+only holds frames the collector had already kept, so collected pairs had mostly passed dHash (its 3.5%
+there is low by construction); the imported footage, picked by scene change instead, shows the problem.
+No labelled object in these pairs was under 0.05% of the frame (the 30 x 30 px case is covered by unit
+tests only), most objects were people, and a "duplicate" by labels can still hold rain, insects, IR
+flicker, foliage or the clock overlay, which no pixel test tells from a small animal. The thresholds
+should be checked on live frames: the sidecars' `dedup` field is there for that.
 
 **`below_threshold`:** with `near_threshold` on, postprocessing runs `margin` below the request's
 threshold (never below the 0.01 floor). Boxes under the threshold are only recorded, never reported.
@@ -162,12 +207,21 @@ the threshold (a unit test checks this). At most the 20 highest are kept.
   },
   "buckets": ["suppressed", "near_threshold"],
   "matched": ["suppressed", "near_threshold"],
-  "dhash": "f0e1d2c3b4a59687"
+  "dhash": "f0e1d2c3b4a59687",
+  "dedup": {"mode": "both", "nearest_hamming": 4, "block_max_z": 23.5, "block_largest_blob": 7, "decided_by": "blockdiff"}
 }
 ```
 
 **Optional fields:**
 
+- `dedup` is what the collector's dedup saw when it kept the frame ([Near duplicates](#near-duplicates)):
+  `mode` (`both` or `dhash`), `nearest_hamming` (the smallest dHash distance to a remembered frame of
+  the camera; absent without one), `block_max_z` and `block_largest_blob` (the block test's closest call
+  among the dHash look-alikes it checked: its largest |z| and its largest changed group in cells; absent
+  when it checked none) and `decided_by`: `no_reference`, `dhash` (no look-alike), `blockdiff` (the block
+  test saw a change against every look-alike it checked), `unchecked` (look-alikes, none it could check:
+  another scene or an evicted thumbnail) or `skips_dedup` (a near duplicate saved for a bucket that skips
+  the dedup). Absent on imported frames and frames saved before it was recorded; older readers ignore it.
 - `routed_from` is absent when the frame was not forwarded by another model.
 - `near_margin` and `below_threshold` appear only with `near_threshold` on.
 - `verify` appears only when the request went through the verifier. Its `failure` is set when

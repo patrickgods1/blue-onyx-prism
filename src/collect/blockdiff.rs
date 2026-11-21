@@ -1,6 +1,7 @@
 //! Near-duplicate test of two frames of one fixed camera that a small object still tells apart
-//! (offline evaluation only for now: `tests/it/dedup_eval.rs`; the collector still uses
-//! [`super::dhash`]). Pure: thumbnails in, a [`Verdict`] out.
+//! (the collector's `collect.dedup_mode` `both` drops a frame only when [`super::dhash`] and this
+//! test at [`Params::COLLECTOR`] agree, [`super::store`]; measured by `tests/it/dedup_eval.rs`).
+//! Pure: thumbnails in, a [`Verdict`] out.
 //!
 //! What the evaluation found on 3,598 reviewed frames (2,087 pairs within 10 minutes): at the
 //! defaults it called none of 1,009 labelled object changes a duplicate, where dHash at 6 called
@@ -8,8 +9,9 @@
 //! pairs different: at night these cameras' frames differ in rain, insects, IR flicker, foliage and
 //! the clock overlay, which a pixel test cannot tell from a small animal. So the defaults are a
 //! sensitivity ceiling, not a dedup: as a filter they keep every frame. The sweep's best point
-//! (`z_cell` 5, `d_min` 8, groups of 3, texture masking 1) missed 6.8% for 68% kept repeats, where
-//! dHash at 2 missed 20.7% for 64%.
+//! (`z_cell` 5, `d_min` 8, groups of 3, texture masking 1, [`Params::COLLECTOR`]) missed 6.8% for
+//! 68% kept repeats, where dHash at 2 missed 20.7% for 64%; the [`Params::default`] constants below
+//! stay the sensitive ones the evaluation starts from.
 //!
 //! Why: the collector's whole-frame dHash averages 2688 x 1520 into 9 x 8 cells of about 300 x 190
 //! pixels, so a 30 x 30 animal or a distant person in an otherwise identical night scene moves a
@@ -72,6 +74,8 @@ use anyhow::{Result, anyhow};
 pub const LONG_CELLS: usize = 128;
 /// Cells along the short side of a [`Thumb`].
 pub const SHORT_CELLS: usize = 72;
+/// Cells of a [`Thumb`] (one byte each).
+pub const THUMB_CELLS: usize = LONG_CELLS * SHORT_CELLS;
 /// Half-width of the box blur in cells: a 9 x 9 cell window.
 pub const BLUR_RADIUS: usize = 4;
 /// Side of the blur window.
@@ -199,6 +203,11 @@ impl Thumb {
     /// The means, row-major.
     pub fn cells(&self) -> &[u8] {
         &self.cells
+    }
+
+    /// Heap bytes of the means: [`THUMB_CELLS`] for any frame.
+    pub fn heap_bytes(&self) -> usize {
+        self.cells.capacity()
     }
 
     /// `81 · D`: each cell minus the mean of the 9 x 9 cells around it, edges clamped. Exact.
@@ -384,6 +393,22 @@ impl Default for Params {
 }
 
 impl Params {
+    /// The collector's confirmation of a dHash drop ([`crate::collect::store`], `collect.dedup_mode`
+    /// `both`): the best point of the offline sweep (`tests/it/dedup_eval.rs`, lowest
+    /// `2 * missed + kept`): `z_cell` 5, `d_min` 8 grey levels in every scene, groups of 3 cells or
+    /// more, texture masking 1. Alone it missed 6.8% of 1,009 labelled object changes for 68% kept
+    /// repeats; with dHash at 6 it missed 0.7% of 284 collected pairs (6.1% over all pairs).
+    pub const COLLECTOR: Params = Params {
+        z_cell: 5.0,
+        z_single: Z_SINGLE,
+        d_min_dark: 8.0,
+        d_min_day: 8.0,
+        min_component: 3,
+        weather_share: WEATHER_SHARE,
+        weather_component: WEATHER_COMPONENT,
+        texture_beta: 1.0,
+    };
+
     /// `d_min` of a scene.
     pub fn d_min(&self, scene: Scene) -> f32 {
         if scene.is_night() {

@@ -67,6 +67,7 @@
       <div class="fields">
         <label>Near-threshold margin <input type="number" name="near_threshold.margin" min="0.01" max="0.5" step="0.01" value="{{ near_margin }}"></label>
         <label>Dedup distance (dHash bits) <input inputmode="numeric" type="number" name="dedup_hamming" min="0" max="32" step="1" value="{{ dedup_hamming }}"></label>
+        <label>Dedup rule <select name="dedup_mode"><option value="both"{% if dedup_mode == "both" %} selected{% endif %}>dHash and block test agree</option><option value="dhash"{% if dedup_mode == "dhash" %} selected{% endif %}>dHash only</option></select></label>
         <label class="wide">Folder <span class="with-browse"><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" name="dir" value="{{ dir_setting }}"><button type="button" class="browse secondary" data-browse="folder" data-target="dir" data-title="Choose the dataset folder" hidden>Browse&hellip;</button></span><span class="muted small">Empty = <span class="nowrap"><code>dataset</code></span> under the data folder.</span></label>
       </div>
       <h3>Frames by scene and bucket</h3>

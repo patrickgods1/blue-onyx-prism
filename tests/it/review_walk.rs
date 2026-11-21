@@ -208,6 +208,7 @@ fn record(rng: &mut Rng, id: &str, scene: &str, camera: &str, timestamp: String)
         matched: buckets.clone(),
         buckets,
         dhash: format!("{:016x}", rng.next()),
+        dedup: None,
         source: None,
         provenance: None,
     }

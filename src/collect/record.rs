@@ -210,6 +210,10 @@ pub struct Record {
     pub matched: Vec<Bucket>,
     /// 64-bit dHash of the frame (16 hex digits).
     pub dhash: String,
+    /// What the collector's dedup saw when it kept the frame ([`DedupInfo`]); absent on imported
+    /// frames and on frames saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup: Option<DedupInfo>,
     /// Where the frame came from when the service did not receive it from Blue Iris:
     /// `import:<id>` for imported footage ([`crate::training::import`]). None = collected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -217,6 +221,39 @@ pub struct Record {
     /// Provenance of an imported frame (file or URL, licence and its confirmation, time offset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
+}
+
+/// The dedup's view of a kept frame (`docs/DATASET.md`, "Sidecar JSON"): small, additive, for
+/// tuning the rule on live data later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DedupInfo {
+    /// `collect.dedup_mode` at the time: `both` or `dhash`.
+    pub mode: String,
+    /// Smallest dHash distance to a reference of the camera in the window; absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nearest_hamming: Option<u32>,
+    /// The block test against the dHash look-alikes it checked, the closest call (smallest
+    /// changed group): its largest |z| (0.1) and the cells of its largest group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_max_z: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_largest_blob: Option<u32>,
+    /// Why the frame was kept: [`DedupInfo::NO_REFERENCE`], [`DedupInfo::DHASH`],
+    /// [`DedupInfo::BLOCKDIFF`], [`DedupInfo::UNCHECKED`] or [`DedupInfo::SKIPS_DEDUP`].
+    pub decided_by: String,
+}
+
+impl DedupInfo {
+    /// No reference of the camera in the window.
+    pub const NO_REFERENCE: &str = "no_reference";
+    /// No reference within `dedup_hamming` dHash bits.
+    pub const DHASH: &str = "dhash";
+    /// dHash look-alikes, and the block test found a change against each it checked.
+    pub const BLOCKDIFF: &str = "blockdiff";
+    /// dHash look-alikes, none the block test could check (another scene, or its thumbnail evicted).
+    pub const UNCHECKED: &str = "unchecked";
+    /// A near duplicate saved because its bucket skips the dedup ([`Bucket::skips_dedup`]).
+    pub const SKIPS_DEDUP: &str = "skips_dedup";
 }
 
 /// Provenance of an imported frame (`docs/DATASET.md`, "Imported frames").
@@ -282,6 +319,7 @@ pub(crate) fn empty_record() -> Record {
         buckets: Vec::new(),
         matched: Vec::new(),
         dhash: String::new(),
+        dedup: None,
         source: None,
         provenance: None,
     }

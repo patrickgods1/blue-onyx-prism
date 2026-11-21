@@ -30,6 +30,36 @@ pub const MAX_INTERVAL_S: u32 = 7 * 24 * 3600;
 /// sends frames on motion only, so an empty night / IR frame means something moved that the model
 /// did not detect (often an animal); keep more of them than the 600 s day interval allows.
 pub const DEFAULT_EMPTY_NIGHT_INTERVAL_S: u32 = 120;
+/// Which test drops a near duplicate (`collect.dedup_mode`, [`super::store`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DedupMode {
+    /// Dropped only when a kept frame of the same camera and scene in the window is within
+    /// `dedup_hamming` dHash bits *and* the block test ([`super::blockdiff`],
+    /// [`super::blockdiff::Params::COLLECTOR`]) finds no change against that same frame.
+    #[default]
+    Both,
+    /// The dHash test alone (the rule before `both`).
+    Dhash,
+}
+
+impl DedupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DedupMode::Both => "both",
+            DedupMode::Dhash => "dhash",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "both" => Some(DedupMode::Both),
+            "dhash" => Some(DedupMode::Dhash),
+            _ => None,
+        }
+    }
+}
+
 /// Folder name of the default dataset directory under the data root.
 pub const DEFAULT_DIR_NAME: &str = "dataset";
 /// Default review / training class list (`collect.classes`).
@@ -260,6 +290,8 @@ pub struct CollectConfig {
     /// dHash Hamming distance (of 64 bits) at or below which a frame of the same camera within
     /// the dedup window counts as a near duplicate and is dropped.
     pub dedup_hamming: u32,
+    /// Which test drops a near duplicate ([`DedupMode`]): `both` (default) or `dhash`.
+    pub dedup_mode: DedupMode,
     /// Classes of the Review tab and the label exports (YOLO class ids follow this order).
     pub classes: Vec<String>,
     /// Classes of `classes` the reviewer does not want (the Review tab's "don't want"): left out
@@ -375,6 +407,7 @@ impl Default for CollectConfig {
             max_gb: DEFAULT_MAX_GB,
             max_age_days: DEFAULT_MAX_AGE_DAYS,
             dedup_hamming: DEFAULT_DEDUP_HAMMING,
+            dedup_mode: DedupMode::Both,
             classes: default_classes(),
             hidden_classes: Vec::new(),
             size_floor: None,
@@ -611,6 +644,7 @@ pub struct CollectSettings {
     pub max_bytes: u64,
     pub max_age_days: u32,
     pub dedup_hamming: u32,
+    pub dedup_mode: DedupMode,
 }
 
 impl Default for CollectSettings {
@@ -628,6 +662,7 @@ impl CollectSettings {
             max_bytes: c.max_bytes(),
             max_age_days: c.max_age_days,
             dedup_hamming: c.dedup_hamming,
+            dedup_mode: c.dedup_mode,
         }
     }
 

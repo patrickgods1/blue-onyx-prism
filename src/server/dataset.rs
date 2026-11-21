@@ -119,6 +119,10 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
             .parse()
             .with_context(|| format!("dedup distance: '{v}' is not a whole number"))?;
     }
+    if let Some(v) = field(fields, "dedup_mode").filter(|v| !v.is_empty()) {
+        c.dedup_mode = crate::collect::config::DedupMode::parse(v)
+            .with_context(|| format!("dedup rule: '{v}' is not one of both, dhash"))?;
+    }
     if let Some(v) = field(fields, "dir") {
         c.dir = (!v.is_empty()).then(|| v.into());
     }
@@ -221,6 +225,7 @@ struct DatasetTemplate {
     max_gb: String,
     max_age_days: u32,
     dedup_hamming: u32,
+    dedup_mode: &'static str,
     near_margin: String,
     disabled: Option<String>,
     /// The folder's size and what the cap covers, in one sentence.
@@ -363,6 +368,7 @@ fn view(state: &AppState, message: Option<String>, error: Option<String>) -> Dat
         max_gb: clean(c.max_gb),
         max_age_days: c.max_age_days,
         dedup_hamming: c.dedup_hamming,
+        dedup_mode: c.dedup_mode.as_str(),
         near_margin: clean(c.buckets.near_margin()),
         disabled,
         disk_line,
