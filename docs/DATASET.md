@@ -694,33 +694,105 @@ lists the classes of the frames the other filters keep, for the page's **Class**
 holds `collect.classes`). The auto-label form passes it on like the other filters.
 
 **Recommended (default).** With no `auto=` and no `balance=`, `GET /v1/review/next` sorts by
-`collect/labels/recommend.rs` (`order=recommended`, or no `order`; page: Filters > **Order**, *Recommended*).
-Labelling neighbouring frames of one clip teaches a model little more than one of them, and an uncertainty order
-alone keeps serving such neighbours; frames of rare classes, scenes and cameras matter most while the counts are
-uneven. So:
+`collect/labels/recommend.rs` and `collect/labels/need.rs` (`order=recommended`, or no `order`; page: Filters >
+**Order**, *Recommended*). The goal: the frames reviewed next most raise each camera's recall on every class it
+sees, from varied examples. Labelling neighbouring frames of one clip teaches a model little more than one of
+them; a parked car on its hundredth frame teaches nothing; a raccoon the camera model called a cat, a person at
+night the camera model scored below its threshold, or a class the trained model keeps missing on one camera
+teaches most. So:
 
 1. a re-label disagreement first, repeat-only frames last (as below);
-2. the **event rank** (item field `event_rank`, 0 = the event's first frame to review; the page's details show
-   *event: frame N*): the first frame of every event comes before any second one. An event is one camera's
-   activity: frames of one day folder (`<scene>/<camera>/<date>`, so an event ends at midnight of the zone the
-   folder was named in, and at a scene change) at most 60 s apart (`EVENT_GAP_S`), at most 600 s from its first
-   frame (`EVENT_MAX_S`). A frame whose
-   time does not parse, and an imported frame without a real time within its source (sidecar `model: "import"`
-   with no `provenance`, `provenance.kind: "image"` or no `provenance.time_offset_s`: image-folder imports carry
-   file times, and import already spread its frames out), is an event of its own (`recommend::own_event`). A frame
-   of an imported video (also a URL or dataset import) with an offset has a real time, the video's start plus the
-   offset, and joins events like a collected frame. Events are built over the frames the counts
-   count (every filter but `status` and `auto`), so they do not split as frames get reviewed: a frame's rank is
-   the decided (reviewed or skipped) frames of its event the queue does not list, plus the listed frames of its
-   event ahead of it in this order without the rank;
-3. the balance of class, scene and camera (`balance=class,scene,camera`, below, the answer's `balance` too) in
-   bands of 250 (`BALANCE_BAND`), highest first, so the most uncertain frames lead within a band;
-4. the uncertainty order below, from more likely boxes on; then newest, then by path.
+2. the **need** (item field `need.visit_score`, below), divided by the event rank, in bands of 100
+   (`NEED_BAND`), highest first, so the most uncertain frames lead within a band;
+3. the uncertainty order below, from more likely boxes on; then newest, then by path.
 
-So diversity leads while the counts are uneven, and uncertainty takes over as they even out. `order=uncertain`
-(*Most uncertain first*) is the order below; an `auto=` or `balance=` filter keeps its own order whatever `order`
-says; any other `order` is 400. Only this route reads `order`: bulk actions, previews, the auto-label `select`,
-the Coverage card and spots keep the uncertainty order.
+**The event rank** (item field `event_rank`, 0 = the event's first frame to review; the page's details show
+*event: frame N*). An event is one camera's activity: frames of one day folder (`<scene>/<camera>/<date>`, so an
+event ends at midnight of the zone the folder was named in, and at a scene change) at most 60 s apart
+(`EVENT_GAP_S`), at most 600 s from its first frame (`EVENT_MAX_S`). A frame whose time does not parse, and an
+imported frame without a real time within its source (sidecar `model: "import"` with no `provenance`,
+`provenance.kind: "image"` or no `provenance.time_offset_s`: image-folder imports carry file times, and import
+already spread its frames out), is an event of its own (`recommend::own_event`). A frame of an imported video
+(also a URL or dataset import) with an offset has a real time, the video's start plus the offset, and joins
+events like a collected frame. Events are built over the frames the counts count (every filter but `status` and
+`auto`), so they do not split as frames get reviewed: a frame's rank is the decided (reviewed or skipped) frames
+of its event the queue does not list, plus the listed frames of its event ahead of it by the need at rank 0. The
+rank divides the need: `need / (1 + rank · P)` (`need::visit_score`, integer math), P = 1, or 1/4 when the
+**visit expands**: its event holds a decided training box of a class under the floor or of the camera's catch-up
+class (below), so a rare animal's visit serves more of its poses (item field `need.expanded`; the details say
+*frame N of a raccoon visit*).
+
+**The need** of a frame f (camera m, scene s, date folder d): per wanted class k of its candidate boxes b,
+
+```
+a_b  = e_b · (1/4 at a parked spot of m) · (2 if missed or a gap)
+           · (1 + T_R/(T_R + n_{m,k,region(b)}))/2 · (κ_mk unless strong)
+E_k  = min(Σ a_b, 3)
+v_k  = ½·100/(100 + n_{k,s}) + ½·30/(30 + n_{m,k,s})
+D_k  = 1.5 if d is a new day of (m, k, s), else 1
+F_k  = 3 while class k has fewer than 20 reviewed boxes (every camera and scene), else 1
+r_k  = 1 + 2·m̂   (m̂: the held-out miss rate of k on m in s, shrunk)
+U_k  = 2 for camera m's lowest-recall class, else 1
+κ_mk = (kept + 1)/(proposed + 1) of m's reviewed proposals of k
+V    = Σ_k E_k · v_k · D_k · F_k · r_k · U_k
+empty frame: V = 0.3 · 100/(100 + empty_s) · (1 + 3 · p_{m,s})
+need = round(1000 · V)
+```
+
+- **Candidates** (`need::of_file`, `need::of_reply`), of the wanted classes only (`collect.classes` without
+  `collect.hidden_classes`): on a reviewed frame its training boxes; otherwise every box that is not rejected and
+  no ignore region, plus a second one for a box's class suggestion (`auto_label`, at `auto_score`: the merge keeps
+  only the suggestion when the auto-labelers find a raccoon on a pending "cat"). A frame without a label file:
+  the reply's predictions, plus the sidecar's `below_threshold` and `suppressed` boxes.
+- **Missed** (`need::missed`, item field `need.missed`): a pending box with evidence the camera model did not
+  alert on (an auto-labeler found it: `source: auto` or any `labelers`; or the camera model scored it below its
+  threshold or a rule suppressed it), with no prediction of the same object (vehicle classes are one) at IoU
+  >= 0.5 on it. A class suggestion is always missed.
+- **Evidence** `e_b` (`need::evidence`): a decided box 1; a pending box **strong** (1) with two or more labelers,
+  `agree`, `likely` or a VLM yes; else `sqrt(score) · 0.5`. A VLM no multiplies either by 0.25 and makes the box
+  weak (it ranks lower, never hides). A VLM check counts by its `ok` here, in either format: an older run's
+  category answer (`plant` where `animal` was expected) is a no too. SigLIP's `species_scores` make no box
+  strong: they sum to 1 over the wanted animals whatever the crop shows, so they name an animal without showing
+  there is one. κ (the camera's precision on the class) weighs weak boxes only, so the order learns from each
+  camera's rejects.
+- **Reviewed boxes** `n` (`need::CellTally`, integer quarter-boxes, so the order frames are read in changes
+  nothing): a training box of a reviewed frame counts 1, a quarter at a known parked spot of its camera
+  (`statics`, the Refine tab's Static objects). Per (class, scene) over every camera, per (camera, class,
+  scene), per (camera, class, region: the box centre on a 3 x 3 grid of the frame), and the days per (camera,
+  class, scene). `empty_s`: reviewed frames of scene s with no wanted training box; `p_{m,s}`: the share of
+  camera m's reviewed frames in s with an animal's box (an "empty" frame of a camera that sees animals may hold
+  one nobody proposed). The answer's `need` holds the per class and scene counts (page: Details,
+  *Reviewed boxes*).
+- **Recall** (from `runs.json`: per scene the newest finished run measured on held-out frames,
+  `collect/labels/recall.rs`): m̂ is the camera's miss rate of the class in the scene shrunk toward the class's,
+  the scene's and the overall rate (a prior worth 20 objects). A class the trained model lacks needs most
+  (`r = 3`, catch-up applies); a class the run dropped on purpose (a rename to nothing), a scene without its own
+  measured run, and no measured run at all, are `r = U = 1`. **Catch-up** (water-filling): within a camera, its
+  lowest recall over every held-out scene among the classes measured on at least 20 held-out objects of the
+  camera, and any within 0.05 of it, get `U = 2` until they reach the next one.
+- **Gaps** (`need::day`, item field `need.gap`): per event, the tracked boxes (decided training boxes and pending
+  strong ones) of its frames in time order; a class tracked in an earlier and a later frame, each within 20 s
+  (`GAP_S`), with no box of the class on this frame at IoU >= 0.3 to the box interpolated between them, adds a
+  candidate of evidence 0.5 there, weighed as missed.
+- **Steer** (`need::Steer`, `Filters.steer`, never from the query): one snapshot per request
+  (`server/review/steer.rs`), handed to the index and the walk alike: the recall table (cached on `runs.json`'s
+  time and size) and the folder's parked spots (rebuilt on a background thread at most every 10 minutes; empty, so
+  neutral, until the first build). Nothing walks the folder on the request path for it.
+
+The constants and their reasons are in `need.rs`'s first lines. The item's `need` explains the score: `score`,
+`visit_score`, the top `class` (absent: an empty frame, with `empty_reviewed` and `animal_share`), its `boxes`
+(E_k), `camera_reviewed` / `camera_target` (30) and `reviewed` / `target` (100) in the frame's scene,
+`class_reviewed` / `floor` (20), `recall`, `heldout_gt` and `run` (or `model_lacks`), the flags `below_floor`,
+`catch_up`, `missed`, `gap`, `spot`, `new_region`, `new_day`, `strong`, `expanded`, the best `evidence`, and
+`kept` / `proposed` when some of the camera's proposals of the class were rejected. The page's details turn it
+into a sentence (`assets/review-need.js`), e.g. *raccoon · back · IR: 3 boxes on this camera (3 in all, floor
+20), recall 22% on 9 held-out boxes (lowest on this camera), camera model missed it, new place in view, frame 3
+of a raccoon visit*.
+
+`order=uncertain` (*Most uncertain first*) is the order below; an `auto=` or `balance=` filter keeps its own order
+whatever `order` says (`balance=` still weighs reviewed frames per class, scene and camera, below); any other
+`order` is 400. Only this route reads `order`: bulk actions, previews, the auto-label `select`, the Coverage card
+and spots keep the uncertainty order.
 
 **Random picks.** An order that always serves hard and rare frames first would fill the held-out set (drawn from
 reviewed frames) with hard frames, and its scores and thresholds would stop reflecting normal traffic. So in the
