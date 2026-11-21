@@ -7,13 +7,17 @@
 //! sort would put there.
 //!
 //! The Recommended order ([`Order::Recommended`]) is no key of a row alone: a row's event rank
-//! depends on the other rows of its event. Its pass gathers the counted rows per day folder and
-//! the listed ones' keys, and [`recommend::arrange`] sorts them as the walk does.
+//! depends on the other rows of its event, and its need on the reviewed rows ([`need::CellTally`],
+//! counted first by [`need_tally`]) and on its day's events (gaps and visits, [`need::day`] per
+//! shard at query time). Its pass gathers the counted rows per day folder and the listed ones'
+//! keys and needs ([`need::Scorer::score`], the walk's function on the walk's inputs), and
+//! [`recommend::arrange`] sorts them as the walk does.
 //!
 //! The steps of the pass are those of `queue::build`, in its order. Only the found frame and the
 //! ones after it become strings.
 
 use super::super::Status;
+use super::super::need::{self, CellBox, CellTally, Need, RecallNeed, Scorer};
 use super::super::queue::{
     AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, Filters, Item, Order,
     QueueSource, SortKey, StatusFilter, Uncertainty,
@@ -515,6 +519,39 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
     }
 }
 
+/// The reviewed rows `q` counts, as the walk counts them ([`Need::add_reviewed`]).
+fn need_tally(state: &State, q: &Compiled, names: &Names, n: &Need<'_>) -> CellTally {
+    let mut tally = CellTally::default();
+    for shard in state.shards.values() {
+        let date = need::date_of(&shard.day);
+        for row in &shard.rows {
+            if row.part.status != Status::Reviewed || !q.counts(row) {
+                continue;
+            }
+            let proposed = need::proposed_classes(
+                names
+                    .proposed(row.part.proposed)
+                    .iter()
+                    .map(|c| names.name(*c)),
+                n.wanted(),
+            );
+            n.add_reviewed(
+                &mut tally,
+                &need::Reviewed {
+                    camera: names.name(row.cand.camera),
+                    scene: names.name(row.cand.scene),
+                    day: date,
+                    width: row.side.width,
+                    height: row.side.height,
+                    boxes: shard.boxes_of(row),
+                    proposed: &proposed,
+                },
+            );
+        }
+    }
+    tally
+}
+
 /// The answer of `state` for `f`, `after` and `then`, with the frames it shows:
 /// [`Answer::indexing`] is the caller's.
 pub(super) fn answer(
@@ -531,17 +568,28 @@ pub(super) fn answer(
     }
     let pivot = Pivot::of(state, &q, after, then);
     let mut tally = Tally::new(names);
-    let placed = match f.order {
-        Order::Uncertain => uncertain(state, &q, &mut tally, pivot.as_ref()),
-        Order::Recommended => {
+    let n = f.need();
+    let cells = n.as_ref().map(|n| need_tally(state, &q, names, n));
+    let placed = match (f.order, &n, &cells) {
+        (Order::Recommended, Some(n), Some(cells)) => {
             let random = recommend::random_slots(f);
-            recommended(state, &q, &mut tally, pivot.as_ref(), random)
+            let scorer = Scorer::new(n, cells);
+            let weighs = Weighs {
+                scorer: &scorer,
+                names,
+            };
+            recommended(state, &q, &mut tally, pivot.as_ref(), random, &weighs)
         }
+        _ => uncertain(state, &q, &mut tally, pivot.as_ref()),
     };
-    let found = placed.found.map(|(shard, row, rank, random_pick)| Item {
-        event_rank: rank,
-        random_pick,
-        ..item(shard, row, &q, names)
+    let found = placed.found.map(|(shard, row, rank, random_pick)| {
+        let mut it = Item {
+            event_rank: rank,
+            random_pick,
+            ..item(shard, row, &q, names)
+        };
+        it.uncertainty.need.clone_from(&placed.need);
+        it
     });
     let upcoming: Vec<String> = placed
         .upcoming
@@ -564,8 +612,66 @@ pub(super) fn answer(
         upcoming,
         indexing: None,
         balance: q.weigh.map(|w| w.tally),
+        need: n
+            .as_ref()
+            .zip(cells.as_ref())
+            .map(|(n, c)| c.counts(n.wanted().map_or(&[][..], |w| w.classes))),
     };
     (answer, shown)
+}
+
+/// What weighs the listed rows under the Recommended order.
+struct Weighs<'a> {
+    scorer: &'a Scorer<'a>,
+    names: &'a Names,
+}
+
+impl Weighs<'_> {
+    fn facts<'s>(&'s self, shard: &'s Shard, row: &Row) -> need::Facts<'s> {
+        need::Facts {
+            camera: self.names.name(row.cand.camera),
+            scene: self.names.name(row.cand.scene),
+            day: need::date_of(&shard.day),
+            width: row.side.width,
+            height: row.side.height,
+        }
+    }
+
+    /// The need of a listed row with gaps `gaps`, and whether its visit of `visit_classes`
+    /// expands.
+    fn visit(
+        &self,
+        shard: &Shard,
+        row: &Row,
+        gaps: &[CellBox],
+        visit_classes: &[u16],
+    ) -> recommend::Visit {
+        let d = self
+            .scorer
+            .score(&self.facts(shard, row), shard.boxes_of(row), gaps);
+        recommend::Visit {
+            score: d.score,
+            expanded: self
+                .scorer
+                .expands(self.names.name(row.cand.camera), visit_classes),
+        }
+    }
+
+    /// The page's need of a listed row at event rank `rank`, as the walk makes it.
+    fn need(
+        &self,
+        shard: &Shard,
+        row: &Row,
+        gaps: &[CellBox],
+        expanded: bool,
+        rank: u32,
+    ) -> RecallNeed {
+        let at = self.facts(shard, row);
+        let d = self.scorer.score(&at, shard.boxes_of(row), gaps);
+        let mut n = self.scorer.explain(&d, at.camera, at.scene, expanded);
+        n.visit_score = need::visit_score(n.score, rank, expanded);
+        n
+    }
 }
 
 /// Where `next_after` lands: the frame (with its event rank under the Recommended order, and
@@ -577,6 +683,8 @@ struct Placed<'a> {
     wrapped: bool,
     upcoming: Vec<(&'a Shard, &'a Row)>,
     total: usize,
+    /// Under the Recommended order: the found frame's need.
+    need: Option<RecallNeed>,
 }
 
 /// The uncertainty order in one pass, no sort: the rows before the pivot are counted and the
@@ -627,6 +735,7 @@ fn uncertain<'a>(
             .map(|h| (h.shard, h.row))
             .collect(),
         total,
+        need: None,
     }
 }
 
@@ -641,11 +750,17 @@ fn recommended<'a>(
     tally: &mut Tally,
     pivot: Option<&Pivot<'a>>,
     random: bool,
+    weighs: &Weighs<'_>,
 ) -> Placed<'a> {
     let mut members: Vec<recommend::Member> = Vec::new();
     let mut events = recommend::Events::default();
     let mut listed: Vec<(&'a Shard, &'a Row)> = Vec::new();
     let mut keys: Vec<recommend::Key> = Vec::new();
+    let mut visits: Vec<recommend::Visit> = Vec::new();
+    // Per listed row: its gaps (what its need is made of besides its own boxes).
+    let mut gaps: Vec<Vec<CellBox>> = Vec::new();
+    // The day's counted rows, for [`need::day`].
+    let mut day: Vec<(&'a Shard, &'a Row, bool)> = Vec::new();
     pass(state, q, tally, &mut |step| match step {
         Step::Counted(shard, row, lists) => {
             members.push(recommend::Member {
@@ -654,14 +769,36 @@ fn recommended<'a>(
                 decided: row.part.status != Status::Unreviewed,
                 listed: lists.then_some(listed.len()),
             });
+            day.push((shard, row, lists));
             if lists {
-                keys.push(recommend::key(&q.uncertainty(row), 0));
                 listed.push((shard, row));
             }
         }
         Step::DayDone => {
             events.add_day(&mut members);
             members.clear();
+            let outs = {
+                let frames: Vec<need::DayFrame<'_>> = day
+                    .iter()
+                    .map(|(shard, row, lists)| need::DayFrame {
+                        ms: recommend::event_ms(shard.timestamp(row)),
+                        alone: row.side.alone,
+                        boxes: shard.boxes_of(row),
+                        listed: *lists,
+                    })
+                    .collect();
+                need::day(&frames)
+            };
+            for ((shard, row, lists), out) in day.iter().zip(outs) {
+                if !lists {
+                    continue;
+                }
+                let visit = weighs.visit(shard, row, &out.gaps, &out.visit_classes);
+                keys.push(recommend::key(&q.uncertainty(row), visit));
+                visits.push(visit);
+                gaps.push(out.gaps);
+            }
+            day.clear();
         }
     });
     let tie = |a: usize, b: usize| match (listed.get(a), listed.get(b)) {
@@ -671,7 +808,7 @@ fn recommended<'a>(
             .then_with(|| sa.rel_bytes(ra).cmp(sb.rel_bytes(rb))),
         _ => a.cmp(&b),
     };
-    let order = recommend::arrange(&events, &keys, &tie);
+    let order = recommend::arrange(&events, &keys, &visits, &tie);
     let order: Vec<(usize, u32, bool)> = if random {
         // As the walk: one more with each frame reviewed or skipped of those counted.
         let decided = tally.counts.reviewed.saturating_add(tally.counts.skipped);
@@ -703,7 +840,14 @@ fn recommended<'a>(
         Some(_) => (0, true),
         None => (0, false),
     };
+    let need = order.get(from).and_then(|(i, rank, _)| {
+        let (shard, row) = at(*i)?;
+        let expanded = visits.get(*i).is_some_and(|v| v.expanded);
+        let gaps = gaps.get(*i).map_or(&[][..], Vec::as_slice);
+        Some(weighs.need(shard, row, gaps, expanded, *rank))
+    });
     Placed {
+        need,
         found: order
             .get(from)
             .and_then(|(i, rank, random)| at(*i).map(|(s, r)| (s, r, Some(*rank), *random))),

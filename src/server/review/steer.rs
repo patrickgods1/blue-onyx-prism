@@ -1,30 +1,138 @@
-//! What steers the Review queue from outside the review folder: the measured recall of the newest
-//! trained models ([`recall`], a [`Measured`] from `runs.json` through
-//! [`crate::training::bench::measured_recall`]).
+//! What steers the Review queue's Recommended order from outside its rows ([`snapshot`], one
+//! [`Steer`] per `GET /v1/review/next`, handed to the review index and the walk alike): the
+//! measured recall of the newest trained models ([`recall`]) and the folder's parked spots
+//! ([`spots`]). Nothing here runs a walk on the request path.
 //!
-//! Cache. One entry, keyed on `runs.json`'s (path, modification time, length): a request costs
-//! one `stat` while nothing changed, and the table is rebuilt only after the training queue saved
-//! a run (it rewrites the whole file). Records are read through
-//! [`crate::server::training::records`] (the started queue's, else the file without starting
-//! the queue). A missing `runs.json`, or one without measured runs (a damaged file reads as no
-//! runs), is None, logged once per change of the key; never an error to the request. A rewrite
-//! of the same length within the file system's time resolution is seen at the next change.
+//! Recall. A [`Measured`] from `runs.json` through [`crate::training::bench::measured_recall`],
+//! one cached entry keyed on `runs.json`'s (path, modification time, length): a request costs one
+//! `stat` while nothing changed, and the table is rebuilt only after the training queue saved a run
+//! (it rewrites the whole file). Records are read through [`crate::server::training::records`]
+//! (the started queue's, else the file without starting the queue). A missing `runs.json`, or one
+//! without measured runs (a damaged file reads as no runs), is None, logged once per change of the
+//! key; never an error to the request. A rewrite of the same length within the file system's time
+//! resolution is seen at the next change.
+//!
+//! Spots. The static spots of the folder's reviewed frames
+//! ([`super::super::refine_spots::spot_table`], the Refine tab's table), built on a background
+//! thread at most every [`SPOTS_EVERY`] (a walk of every reviewed frame), one at a time; a request
+//! serves the last table built for the folder and class list, empty (so neutral: no box counts as
+//! parked) until the first is in. In tests the table is built on the request's thread, so an
+//! answer never depends on a thread's timing.
 
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the Review queue's need model reads it (next change)"
-    )
-)]
-
+use crate::collect::labels::need::Steer;
 use crate::collect::labels::recall::Measured;
+use crate::collect::labels::statics;
 use crate::server::AppState;
 use crate::sync::LockExt;
 use crate::training::service::RunRecord;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+/// Least time between two builds of a folder's spot table.
+pub const SPOTS_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// What steers the Recommended order of the folder under review `dir` for the class list
+/// (`classes`, `hidden`) now: one snapshot for the whole request.
+pub(super) fn snapshot(
+    state: &AppState,
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+) -> Arc<Steer> {
+    Arc::new(Steer {
+        recall: recall(state),
+        spots: spots(dir, classes, hidden),
+        heldout_listed: Arc::default(),
+    })
+}
+
+/// The parked spots of `dir`'s reviewed frames for the class list, built on the request's thread
+/// in tests (see the module docs).
+#[cfg(test)]
+pub(super) fn spots(dir: &Path, classes: &[String], hidden: &[String]) -> Arc<statics::Table> {
+    Arc::new(super::super::refine_spots::spot_table(dir, classes, hidden))
+}
+
+/// The last spot table built (one: the folder under review).
+#[cfg(not(test))]
+struct Spots {
+    key: String,
+    /// When the last build started.
+    at: std::time::Instant,
+    building: bool,
+    table: Arc<statics::Table>,
+}
+
+#[cfg(not(test))]
+static SPOTS: Mutex<Option<Spots>> = Mutex::new(None);
+
+/// The parked spots of `dir`'s reviewed frames for the class list (see the module docs): the last
+/// table built, a build started in the background when none is or the last is
+/// [`SPOTS_EVERY`] old.
+#[cfg(not(test))]
+pub(super) fn spots(dir: &Path, classes: &[String], hidden: &[String]) -> Arc<statics::Table> {
+    use std::time::Instant;
+    let key = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        dir.display(),
+        classes.join("\u{1e}"),
+        hidden.join("\u{1e}")
+    );
+    let mut slot = SPOTS.lock_recover();
+    let table = match slot.as_mut() {
+        Some(s) if s.key == key => {
+            if s.building || s.at.elapsed() < SPOTS_EVERY {
+                return s.table.clone();
+            }
+            s.building = true;
+            s.at = Instant::now();
+            s.table.clone()
+        }
+        _ => {
+            *slot = Some(Spots {
+                key: key.clone(),
+                at: Instant::now(),
+                building: true,
+                table: Arc::default(),
+            });
+            Arc::default()
+        }
+    };
+    drop(slot);
+    let (dir, classes, hidden) = (dir.to_path_buf(), classes.to_vec(), hidden.to_vec());
+    let spawned = std::thread::Builder::new()
+        .name("review-spots".into())
+        .spawn(move || {
+            // A walk for the page: never ahead of detections for the CPU.
+            crate::backend::priority::lower_this_thread(
+                crate::backend::priority::ThreadRole::Background,
+            );
+            let built = Arc::new(super::super::refine_spots::spot_table(
+                &dir, &classes, &hidden,
+            ));
+            tracing::debug!(
+                "review queue: {} parked spot(s) in {}",
+                built.len(),
+                dir.display()
+            );
+            if let Some(s) = SPOTS.lock_recover().as_mut().filter(|s| s.key == key) {
+                s.table = built;
+                s.building = false;
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(
+            "review queue: no thread to find the parked spots ({e}), so the order counts every box \
+             as unparked; it tries again in {} minutes",
+            SPOTS_EVERY.as_secs() / 60
+        );
+        if let Some(s) = SPOTS.lock_recover().as_mut() {
+            s.building = false;
+        }
+    }
+    table
+}
 
 /// What the cached table was built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,5 +364,19 @@ mod tests {
     fn the_state_without_runs_is_none() {
         let state = crate::server::test_util::test_state();
         assert!(recall(&state).is_none());
+    }
+
+    /// The snapshot of a folder without reviewed frames steers by nothing: no recall, no spot.
+    /// The spot table is rebuilt at most every ten minutes outside tests.
+    #[test]
+    fn a_snapshot_of_a_new_folder_is_neutral() {
+        let state = crate::server::test_util::test_state();
+        let dir = temp("snapshot");
+        let s = snapshot(&state, &dir, &["car".to_string()], &[]);
+        assert!(s.recall.is_none());
+        assert!(s.spots.is_empty());
+        assert!(s.heldout_listed.is_empty());
+        assert_eq!(SPOTS_EVERY, std::time::Duration::from_secs(600));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

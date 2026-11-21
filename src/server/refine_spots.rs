@@ -131,17 +131,30 @@ fn newest_samples(
         .collect()
 }
 
-/// A fresh walk of the reviewed frames of `dir`.
-fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Computed {
-    let wanted = Wanted { classes, hidden };
-    let sel = export::reviewed_frames_filtered(
+/// The reviewed frames of `dir` the spots are made from (a walk that only reads).
+fn reviewed(dir: &Path, classes: &[String]) -> Vec<ExportFrame> {
+    export::reviewed_frames_filtered(
         dir,
         classes,
         &SplitConfig::default(),
         &ClassFilter::default(),
-    );
-    let (table, spots) = statics::overview_table(&sel.frames, &wanted);
-    let samples = newest_samples(&sel.frames, &spots, &wanted);
+    )
+    .frames
+}
+
+/// The spots of `dir`'s reviewed frames, the table [`compute`] makes: what steers the Review
+/// queue's need (`review::steer`, rebuilt in the background).
+pub(super) fn spot_table(dir: &Path, classes: &[String], hidden: &[String]) -> statics::Table {
+    let wanted = Wanted { classes, hidden };
+    statics::Table::build(statics::observations(&reviewed(dir, classes), &wanted))
+}
+
+/// A fresh walk of the reviewed frames of `dir`.
+fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Computed {
+    let wanted = Wanted { classes, hidden };
+    let frames = reviewed(dir, classes);
+    let (table, spots) = statics::overview_table(&frames, &wanted);
+    let samples = newest_samples(&frames, &spots, &wanted);
     Computed {
         table,
         spots,

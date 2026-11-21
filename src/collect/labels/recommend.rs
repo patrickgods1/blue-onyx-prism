@@ -1,8 +1,9 @@
 //! The Recommended review order, the default of `GET /v1/review/next` (no `auto=`, no `balance=`;
-//! [`super::queue::Order::Recommended`]): the first frame of each event comes before any second
-//! one, then the frames of the classes, scenes and cameras with the fewest reviewed frames
-//! (balance score in bands of [`BALANCE_BAND`], so uncertainty decides within a band), then the
-//! uncertainty keys of [`super::queue::Uncertainty::key`]. Reopened frames (a re-label
+//! [`super::queue::Order::Recommended`]): the frames of the highest recall need first
+//! ([`super::need`]), divided by the event rank (`need / (1 + rank · P)`, [`super::need::visit_score`];
+//! P is 1/4 in a visit of a rare or catch-up class, so it serves more of its poses), in bands of
+//! [`super::need::NEED_BAND`] so uncertainty decides within a band, then the uncertainty keys of
+//! [`super::queue::Uncertainty::key`] from the likely boxes on. Reopened frames (a re-label
 //! disagreement) come first and repeat-only frames last, as in the uncertainty order.
 //!
 //! An event is one camera's activity: the frames of one day folder (`<scene>/<camera>/<date>`, so
@@ -26,6 +27,7 @@
 //! the order as indices, for the random slots on top of it.
 
 use super::Status;
+use super::need::{NEED_BAND, visit_score};
 use super::queue::{Filters, Order, StatusFilter, Uncertainty};
 use crate::collect::record::Record;
 use std::cmp::{Ordering, Reverse};
@@ -34,9 +36,6 @@ use std::cmp::{Ordering, Reverse};
 pub const EVENT_GAP_S: i64 = 60;
 /// Most seconds from an event's first frame to its last.
 pub const EVENT_MAX_S: i64 = 600;
-/// Balance scores ([`super::queue::BalanceNeed::score`]) in one band compare equal: uncertainty
-/// orders the frames of a band.
-pub const BALANCE_BAND: u32 = 250;
 /// The sidecar `model` of an imported frame (`training::import`): an event of its own unless it
 /// has a real time within its source ([`own_event`]).
 pub const IMPORT_MODEL: &str = "import";
@@ -156,32 +155,53 @@ pub struct Events {
     listed: Vec<(usize, usize)>,
 }
 
-impl Events {
-    /// Add the events of one day folder's counted frames (reordered here).
-    pub fn add_day(&mut self, members: &mut [Member]) {
-        // Frames that chain first, by time; the ones alone after them, in any order.
-        members.sort_unstable_by_key(|m| (m.alone || m.ms.is_none(), m.ms));
-        // (first, last) time of the open event.
-        let mut open: Option<(i64, i64)> = None;
-        for m in members.iter() {
-            let ms = m.ms.filter(|_| !m.alone);
-            let joins = match (ms, open) {
-                (Some(t), Some((first, last))) => {
-                    t.saturating_sub(last) <= GAP_MS && t.saturating_sub(first) <= MAX_MS
-                }
-                _ => false,
-            };
-            if joins {
-                open = open.map(|(first, _)| (first, ms.unwrap_or(first)));
-            } else {
-                self.decided.push(0);
-                open = ms.map(|t| (t, t));
+/// The events of one day folder's frames of times `ms` (None: no time, or an event of its own):
+/// per frame, in their order, its event's number from 0 (in time order of the events' first
+/// frames; frames without a time after them). The order the frames come in changes no event.
+pub fn chain(ms: &[Option<i64>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ms.len()).collect();
+    let at = |i: usize| ms.get(i).copied().flatten();
+    // Frames that chain first, by time; the ones alone after them.
+    order.sort_by_key(|&i| (at(i).is_none(), at(i), i));
+    let mut out = vec![0usize; ms.len()];
+    // (first, last) time of the open event.
+    let mut open: Option<(i64, i64)> = None;
+    let mut events = 0usize;
+    for i in order {
+        let t = at(i);
+        let joins = match (t, open) {
+            (Some(t), Some((first, last))) => {
+                t.saturating_sub(last) <= GAP_MS && t.saturating_sub(first) <= MAX_MS
             }
-            let event = self.decided.len().saturating_sub(1);
+            _ => false,
+        };
+        if joins {
+            open = open.map(|(first, last)| (first, t.unwrap_or(last)));
+        } else {
+            events += 1;
+            open = t.map(|t| (t, t));
+        }
+        if let Some(o) = out.get_mut(i) {
+            *o = events - 1;
+        }
+    }
+    out
+}
+
+impl Events {
+    /// Add the events of one day folder's counted frames ([`chain`]).
+    pub fn add_day(&mut self, members: &mut [Member]) {
+        let times: Vec<Option<i64>> = members.iter().map(|m| m.ms.filter(|_| !m.alone)).collect();
+        let of = chain(&times);
+        let base = self.decided.len();
+        let count = of.iter().copied().max().map_or(0, |m| m + 1);
+        self.decided.extend(std::iter::repeat_n(0, count));
+        for (m, e) in members.iter().zip(of) {
+            let event = base + e;
             match m.listed {
                 Some(i) => self.listed.push((event, i)),
                 None if m.decided => {
-                    if let Some(n) = self.decided.last_mut() {
+                    if let Some(n) = self.decided.get_mut(event) {
                         *n = n.saturating_add(1);
                     }
                 }
@@ -201,13 +221,12 @@ impl Events {
 }
 
 /// What the Recommended order sorts by: repeat-only frames last, reopened frames first, then the
-/// event rank, the balance band (highest first), the likely boxes (most first), the flagged boxes
-/// (fewest first), the margin in hundredths (no box last), verifier disagreement, suppressed boxes
-/// (most first).
+/// need band after the visit divisor (highest first), the likely boxes (most first), the flagged
+/// boxes (fewest first), the margin in hundredths (no box last), verifier disagreement, suppressed
+/// boxes (most first).
 pub type Key = (
     bool,
     bool,
-    u32,
     Reverse<u32>,
     Reverse<u32>,
     usize,
@@ -216,14 +235,27 @@ pub type Key = (
     Reverse<usize>,
 );
 
-/// The key of a frame of uncertainty `u` (its `balance` the Recommended one, class, scene and
-/// camera) at event rank `rank`.
-pub fn key(u: &Uncertainty, rank: u32) -> Key {
+/// A listed frame's need ([`super::need::RecallNeed::score`]) and whether its visit expands
+/// ([`super::need::Scorer::expands`]): what the event rank divides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Visit {
+    pub score: u32,
+    pub expanded: bool,
+}
+
+impl Visit {
+    /// The band at event rank `rank` ([`visit_score`] / [`NEED_BAND`]).
+    fn band(self, rank: u32) -> u32 {
+        visit_score(self.score, rank, self.expanded) / NEED_BAND
+    }
+}
+
+/// The key of a frame of uncertainty `u` and need `visit` at event rank 0.
+pub fn key(u: &Uncertainty, visit: Visit) -> Key {
     (
         u.repeats_only,
         u.relabel.is_none(),
-        rank,
-        Reverse(u.balance.as_ref().map_or(0, |b| b.score) / BALANCE_BAND),
+        Reverse(visit.band(0)),
         Reverse(u.likely_boxes),
         u.auto_review,
         u.margin_hundredths(),
@@ -232,23 +264,25 @@ pub fn key(u: &Uncertainty, rank: u32) -> Key {
     )
 }
 
-/// `k` with the event rank `rank`.
-fn ranked(mut k: Key, rank: u32) -> Key {
-    k.2 = rank;
+/// `k` (of need `visit`) at the event rank `rank`.
+fn ranked(mut k: Key, visit: Visit, rank: u32) -> Key {
+    k.2 = Reverse(visit.band(rank));
     k
 }
 
-/// The Recommended order of the listed frames: `keys` are their [`key`]s at rank 0, `tie` orders
-/// two of them that have the same key (newest first, then by path: no two are equal). Each
-/// listed frame's rank is its event's decided frames plus the listed frames of its event ahead of
-/// it by the key without the rank, so the rank is well defined. The frames' indices in order,
-/// each with its event rank.
+/// The Recommended order of the listed frames: `keys` are their [`key`]s at rank 0 of their needs
+/// `visits`, `tie` orders two of them that have the same key (newest first, then by path: no two
+/// are equal). Each listed frame's rank is its event's decided frames plus the listed frames of
+/// its event ahead of it by the key at rank 0, so the rank is well defined; the order is then by
+/// the key at that rank. The frames' indices in order, each with its event rank.
 pub fn arrange(
     events: &Events,
     keys: &[Key],
+    visits: &[Visit],
     tie: &dyn Fn(usize, usize) -> Ordering,
 ) -> Vec<(usize, u32)> {
     let base = |i: usize| keys.get(i).copied().unwrap_or_default();
+    let visit = |i: usize| visits.get(i).copied().unwrap_or_default();
     let mut ranks = vec![0u32; keys.len()];
     let mut by_event = events.listed.clone();
     by_event.sort_unstable_by(|&(ea, a), &(eb, b)| {
@@ -271,11 +305,85 @@ pub fn arrange(
     let rank = |i: usize| ranks.get(i).copied().unwrap_or(0);
     let mut order: Vec<usize> = (0..keys.len()).collect();
     order.sort_unstable_by(|&a, &b| {
-        ranked(base(a), rank(a))
-            .cmp(&ranked(base(b), rank(b)))
+        ranked(base(a), visit(a), rank(a))
+            .cmp(&ranked(base(b), visit(b), rank(b)))
             .then_with(|| tie(a, b))
     });
     order.into_iter().map(|i| (i, rank(i))).collect()
+}
+
+/// The Recommended order before the need model (event rank as a strict tier, then the balance of
+/// class, scene and camera in bands of 250), kept for tests alone: the real-data comparison of the
+/// two orders (`server::review::order_eval`).
+#[cfg(test)]
+pub(crate) mod legacy {
+    use super::{Events, Ordering, Reverse, Uncertainty};
+
+    pub(crate) const BALANCE_BAND: u32 = 250;
+
+    pub(crate) type Key = (
+        bool,
+        bool,
+        u32,
+        Reverse<u32>,
+        Reverse<u32>,
+        usize,
+        u32,
+        bool,
+        Reverse<usize>,
+    );
+
+    /// The old key of `u` (its `balance`, every dimension) at event rank `rank`.
+    pub(crate) fn key(u: &Uncertainty, rank: u32) -> Key {
+        (
+            u.repeats_only,
+            u.relabel.is_none(),
+            rank,
+            Reverse(u.balance.as_ref().map_or(0, |b| b.score) / BALANCE_BAND),
+            Reverse(u.likely_boxes),
+            u.auto_review,
+            u.margin_hundredths(),
+            !u.disagreement,
+            Reverse(u.suppressed),
+        )
+    }
+
+    /// The old `arrange`.
+    pub(crate) fn arrange(
+        events: &Events,
+        keys: &[Key],
+        tie: &dyn Fn(usize, usize) -> Ordering,
+    ) -> Vec<(usize, u32)> {
+        let base = |i: usize| keys.get(i).copied().unwrap_or_default();
+        let mut ranks = vec![0u32; keys.len()];
+        let mut by_event = events.listed.clone();
+        by_event.sort_unstable_by(|&(ea, a), &(eb, b)| {
+            ea.cmp(&eb)
+                .then_with(|| base(a).cmp(&base(b)))
+                .then_with(|| tie(a, b))
+        });
+        for run in by_event.chunk_by(|x, y| x.0 == y.0) {
+            let decided = run
+                .first()
+                .and_then(|(e, _)| events.decided.get(*e))
+                .copied()
+                .unwrap_or(0);
+            for (ahead, (_, i)) in run.iter().enumerate() {
+                if let Some(r) = ranks.get_mut(*i) {
+                    *r = decided.saturating_add(u32::try_from(ahead).unwrap_or(u32::MAX));
+                }
+            }
+        }
+        let rank = |i: usize| ranks.get(i).copied().unwrap_or(0);
+        let ranked = |i: usize| {
+            let mut k = base(i);
+            k.2 = rank(i);
+            k
+        };
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_unstable_by(|&a, &b| ranked(a).cmp(&ranked(b)).then_with(|| tie(a, b)));
+        order.into_iter().map(|i| (i, rank(i))).collect()
+    }
 }
 
 /// One served slot in this many is a random pick ([`interleave`]), and one frame in this many is
@@ -398,7 +506,6 @@ pub fn with_random_slots(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
-    use super::super::queue::BalanceNeed;
     use super::*;
 
     #[test]
@@ -549,8 +656,8 @@ mod tests {
         ];
         let mut e = Events::default();
         e.add_day(&mut members);
-        let keys = [key(&u(0.2), 0); 2];
-        let mut got: Vec<(usize, u32)> = arrange(&e, &keys, &|a, b| a.cmp(&b));
+        let keys = [key(&u(0.2), Visit::default()); 2];
+        let mut got: Vec<(usize, u32)> = arrange(&e, &keys, &[], &|a, b| a.cmp(&b));
         got.sort_unstable();
         got.into_iter().map(|(_, r)| r).collect()
     }
@@ -593,9 +700,25 @@ mod tests {
         }
     }
 
-    /// `arrange` over one day of listed frames `us` (times `secs`) with `decided` more decided
-    /// frames at `decided_at`: the listed indices in order, with ranks.
+    /// The need every frame of [`order`] has: 5 bands, 2 at rank 1, 1 at rank 2.
+    const NEED: Visit = Visit {
+        score: 500,
+        expanded: false,
+    };
+
+    /// `arrange` over one day of listed frames `us` (times `secs`, each of need [`NEED`]) with
+    /// `decided` more decided frames at `decided_at`: the listed indices in order, with ranks.
     fn order(us: &[Uncertainty], secs: &[i64], decided_at: &[i64]) -> Vec<(usize, u32)> {
+        order_of(us, &vec![NEED; us.len()], secs, decided_at)
+    }
+
+    /// [`order`] with each frame's need.
+    fn order_of(
+        us: &[Uncertainty],
+        visits: &[Visit],
+        secs: &[i64],
+        decided_at: &[i64],
+    ) -> Vec<(usize, u32)> {
         let mut members: Vec<Member> = secs
             .iter()
             .enumerate()
@@ -610,8 +733,8 @@ mod tests {
         }));
         let mut e = Events::default();
         e.add_day(&mut members);
-        let keys: Vec<Key> = us.iter().map(|u| key(u, 0)).collect();
-        arrange(&e, &keys, &|a, b| a.cmp(&b))
+        let keys: Vec<Key> = us.iter().zip(visits).map(|(u, v)| key(u, *v)).collect();
+        arrange(&e, &keys, visits, &|a, b| a.cmp(&b))
     }
 
     #[test]
@@ -656,23 +779,54 @@ mod tests {
         assert_eq!(got[2], (0, 1));
     }
 
-    fn balanced(score: u32, margin: f32) -> Uncertainty {
-        Uncertainty {
-            balance: Some(BalanceNeed {
-                score,
-                ..BalanceNeed::default()
-            }),
-            ..u(margin)
+    fn need(score: u32) -> Visit {
+        Visit {
+            score,
+            expanded: false,
         }
     }
 
     #[test]
-    fn balance_counts_in_bands_and_uncertainty_decides_within_one() {
-        // 0 and 249 share a band: the more uncertain first. 250 is a band above both.
-        let us = [balanced(249, 0.4), balanced(0, 0.0), balanced(250, 0.45)];
-        let got = order(&us, &[0, 1000, 2000], &[]);
+    fn the_need_counts_in_bands_and_uncertainty_decides_within_one() {
+        // 0 and 99 share a band: the more uncertain first. 100 is a band above both.
+        let us = [u(0.4), u(0.0), u(0.45)];
+        let got = order_of(&us, &[need(99), need(0), need(100)], &[0, 1000, 2000], &[]);
         assert_eq!(got.iter().map(|x| x.0).collect::<Vec<_>>(), [2, 1, 0]);
-        assert_eq!(BALANCE_BAND, 250);
+        assert_eq!(NEED_BAND, 100);
+    }
+
+    #[test]
+    fn a_rare_second_frame_beats_a_common_first() {
+        // Event A: a frame of need 3000 and its second frame of the same need; event B a common
+        // first frame of need 300, more uncertain. The rank divides: 3000 / 2 = 1500 > 300.
+        let us = [u(0.3), u(0.3), u(0.0)];
+        let visits = [need(3000), need(3000), need(300)];
+        let got = order_of(&us, &visits, &[0, 10, 1000], &[]);
+        assert_eq!(got, [(0, 0), (1, 1), (2, 0)]);
+        // Equal needs: the first frame of each event before any second.
+        let got = order_of(&us, &[need(300); 3], &[0, 10, 1000], &[]);
+        assert_eq!(got, [(2, 0), (0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn a_rare_visit_expands() {
+        // Two events of four frames each, one decided frame ahead in each; one visit expands.
+        let us = vec![u(0.2); 6];
+        let mut visits = vec![need(1000); 6];
+        for v in &mut visits[..3] {
+            v.expanded = true;
+        }
+        let got = order_of(&us, &visits, &[0, 10, 20, 1000, 1010, 1020], &[30, 1030]);
+        // Expanded: 1000 * 4 / (4 + r) at r = 1, 2, 3 (800, 666, 571); else 1000 / (1 + r)
+        // (500, 333, 250).
+        assert_eq!(visit_score(1000, 1, true), 800);
+        assert_eq!(visit_score(1000, 3, true), 571);
+        assert_eq!(visit_score(1000, 1, false), 500);
+        assert_eq!(visit_score(1000, 0, false), 1000);
+        let ids: Vec<usize> = got.iter().map(|x| x.0).collect();
+        assert_eq!(ids, [0, 1, 2, 3, 4, 5], "{got:?}");
+        assert_eq!(got[2].1, 3);
+        assert_eq!(got[5].1, 3);
     }
 
     #[test]
@@ -698,8 +852,9 @@ mod tests {
             })
             .collect();
         e.add_day(&mut members);
-        let keys: Vec<Key> = us.iter().map(|u| key(u, 0)).collect();
-        assert_eq!(arrange(&e, &keys, &|a, b| a.cmp(&b)), got);
+        let keys: Vec<Key> = us.iter().map(|u| key(u, NEED)).collect();
+        let visits = vec![NEED; us.len()];
+        assert_eq!(arrange(&e, &keys, &visits, &|a, b| a.cmp(&b)), got);
     }
 
     #[test]
