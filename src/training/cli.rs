@@ -476,6 +476,14 @@ pub struct AutolabelArgs {
     /// With --missing-only: look at reviewed frames only, not at the unreviewed ones.
     #[arg(long, requires = "missing_only")]
     pub missing_reviewed_only: bool,
+    /// With --missing-only: most unreviewed frames it looks at (default 2000), after the reviewed
+    /// and sent-back frames, which keep the --frames limit to themselves.
+    #[arg(
+        long,
+        requires = "missing_only",
+        conflicts_with = "missing_reviewed_only"
+    )]
+    pub missing_unreviewed_limit: Option<usize>,
     /// Confirm the licence of a non-commercial / personal-use catalog model --with-model
     /// installs or adds.
     #[arg(long)]
@@ -680,6 +688,9 @@ pub fn autolabel_request(a: &AutolabelArgs) -> Result<super::autolabel::Autolabe
         r.mdv6_threshold = t;
     }
     r.missing_unreviewed = !a.missing_reviewed_only;
+    if let Some(n) = a.missing_unreviewed_limit {
+        r.missing_unreviewed_limit = n;
+    }
     r.with_model = a.with_model.clone();
     r.threshold = a.threshold;
     r.device = a.device.clone();
@@ -2585,6 +2596,22 @@ mod tests {
         assert!(
             parse(&["autolabel", "--missing-reviewed-only"]).is_err(),
             "needs --missing-only"
+        );
+        let unrev = |rest: &[&str]| {
+            let mut v = vec!["--with-model", "x", "--missing-only"];
+            v.extend_from_slice(rest);
+            req(&v)
+        };
+        assert_eq!(
+            unrev(&["--missing-unreviewed-limit", "50"])
+                .unwrap()
+                .missing_unreviewed_limit,
+            50
+        );
+        assert!(unrev(&["--missing-unreviewed-limit", "0"]).is_err());
+        assert_eq!(
+            unrev(&[]).unwrap().missing_unreviewed_limit,
+            crate::training::autolabel::MISSING_UNREVIEWED_LIMIT
         );
     }
 

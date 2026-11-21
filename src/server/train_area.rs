@@ -72,15 +72,16 @@ const ENOUGH_TO_EXPORT: u64 = 50;
 /// Frames no auto-label run has seen before Auto-label is suggested: a few new frames from the
 /// collector should not send the owner back there.
 const ENOUGH_TO_AUTOLABEL: u64 = 20;
-/// Unreviewed night and IR frames no auto-label run has seen before a run is suggested ahead of an
+/// Unreviewed night and IR frames the labelers never looked at before a run is suggested ahead of an
 /// export ([`autolabel_gap`]): one default run's worth (`autolabel::DEFAULT_LIMIT`, 200 frames). The
 /// camera's model misses most at night, and only a labeler's box can bring such a frame up in the
 /// Review queue, so this many frames left unlabelled is where recall is lost; fewer is not worth
 /// putting ahead of an export of frames already reviewed.
 pub(crate) const ENOUGH_NIGHT_TO_AUTOLABEL: u64 = 200;
-/// Unreviewed frames that arrived since the last auto-label run (file time after its start) and no
-/// run has seen, before a run is suggested ahead of an export: one default run's worth, as
-/// [`ENOUGH_NIGHT_TO_AUTOLABEL`].
+/// Unreviewed frames that arrived since the last auto-label run (the time in their name after its
+/// start) and the labelers never looked at, before a run is suggested ahead of an export: one
+/// default run's worth, as [`ENOUGH_NIGHT_TO_AUTOLABEL`]. Imported footage named by its capture time
+/// counts as arrived then. The labelers' marker alone counts ([`AutoGap`]).
 pub(crate) const ENOUGH_NEW_TO_AUTOLABEL: u64 = 200;
 
 /// A job on the queue, as the strip words it.
@@ -375,7 +376,7 @@ fn autolabel_gap(s: &Summary) -> Option<NextStep> {
                 s.night_never_auto_labelled,
                 s.ir_never_auto_labelled
             ),
-            format!("/train/autolabel?scene={scene}&auto=none"),
+            format!("/train/autolabel?scene={scene}"),
             "Auto-label them",
         ));
     }
@@ -393,7 +394,7 @@ fn autolabel_gap(s: &Summary) -> Option<NextStep> {
                     "have"
                 }
             ),
-            "/train/autolabel?auto=none".to_string(),
+            "/train/autolabel".to_string(),
             "Auto-label them",
         ));
     }
@@ -565,33 +566,53 @@ impl Drop for WalkDone<'_> {
     }
 }
 
-/// The frames to review that no auto-label run has seen, for [`autolabel_gap`]: night and IR ones,
-/// and the file time of each (to count those that arrived since the last run when the summary is
-/// asked, so a run that finishes needs no new walk to be taken into account).
+/// The frames to review that the labelers never looked at, for [`autolabel_gap`]: night and IR
+/// ones, and the time in each one's name (to count those that arrived since the last run when the
+/// summary is asked, so a run that finishes needs no new walk to be taken into account). Only the
+/// labelers' marker counts ([`labelers_looked`]): a run with a model, its marker or its votes, is no
+/// labelers run, since the labelers are what finds what the camera's model missed. The queue's own
+/// `auto=none` treats any marker or auto evidence as labelled (`collect/labels`, not changed here),
+/// so the strip's link names only the scene and the run's own marker check skips the frames the
+/// labelers looked at.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AutoGap {
     pub(crate) night: u64,
     pub(crate) ir: u64,
-    /// Seconds since the Unix epoch of each such frame's file, sorted.
+    /// Seconds since the Unix epoch of each such frame's name stamp
+    /// ([`crate::clock::parse_frame_stamp`]), sorted.
     arrived: Vec<i64>,
+    /// Such frames whose name holds no stamp: counted only when no run has finished.
+    undated: u64,
 }
 
 impl AutoGap {
-    /// Such frames whose file is newer than `t` (seconds since the epoch); every one with None.
+    /// Such frames named after `t` (seconds since the epoch); every one with None.
     pub(crate) fn newer_than(&self, t: Option<i64>) -> u64 {
-        let old = t.map_or(0, |t| self.arrived.partition_point(|a| *a <= t));
-        (self.arrived.len() - old) as u64
+        match t {
+            None => self.arrived.len() as u64 + self.undated,
+            Some(t) => (self.arrived.len() - self.arrived.partition_point(|a| *a <= t)) as u64,
+        }
     }
+}
+
+/// Whether the labelers looked at a frame whose label file is `f`: its `auto_run` marker is a
+/// labelers run's, not a run with a model's.
+fn labelers_looked(f: Option<&crate::collect::labels::LabelFile>) -> bool {
+    f.and_then(|f| f.auto_run.as_ref()).is_some_and(|r| {
+        !r.labeler
+            .starts_with(crate::training::autolabel::models::MODEL_MARKER_PREFIX)
+    })
 }
 
 /// Label files read per piece of [`auto_gap`]'s parallel walk.
 const GAP_CHUNK: usize = 512;
 
 /// The [`AutoGap`] of `dir`: the label file of every frame of [`queue::candidates`] (as
-/// [`queue::tally`] reads them), on the walk's threads at background priority. Frames whose label
-/// file does not read are left out, as the tally leaves them out of its counts.
+/// [`queue::tally`] reads them), on the walk's threads at background priority; the arrival time comes
+/// from the frame's name, no file is stat'ed. Frames whose label file does not read are left out,
+/// as the tally leaves them out of its counts.
 pub(crate) fn auto_gap(dir: &Path) -> AutoGap {
-    use crate::collect::labels::queue::{AutoFilter, QueueSource};
+    use crate::collect::labels::queue::QueueSource;
     use crate::collect::labels::{Frame, Status};
     let all = queue::candidates(dir, QueueSource::All);
     let chunks: Vec<&[queue::Candidate]> = all.chunks(GAP_CHUNK).collect();
@@ -614,7 +635,7 @@ pub(crate) fn auto_gap(dir: &Path) -> AutoGap {
                 let open = labels
                     .as_ref()
                     .is_none_or(|l| l.status == Status::Unreviewed);
-                if !open || !AutoFilter::Never.matches(labels.as_ref()) {
+                if !open || labelers_looked(labels.as_ref()) {
                     continue;
                 }
                 match c.scene.as_str() {
@@ -622,12 +643,11 @@ pub(crate) fn auto_gap(dir: &Path) -> AutoGap {
                     "ir" => g.ir += 1,
                     _ => {}
                 }
-                let at = std::fs::metadata(&frame.jpg)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| i64::try_from(d.as_secs()).ok());
-                g.arrived.extend(at);
+                let stem = c.rel.rsplit('/').next().unwrap_or_default();
+                match crate::clock::parse_frame_stamp(stem) {
+                    Some(t) => g.arrived.push(t.timestamp()),
+                    None => g.undated += 1,
+                }
             }
             g
         },
@@ -636,6 +656,7 @@ pub(crate) fn auto_gap(dir: &Path) -> AutoGap {
     for p in parts {
         g.night += p.night;
         g.ir += p.ir;
+        g.undated += p.undated;
         g.arrived.extend(p.arrived);
     }
     g.arrived.sort_unstable();
@@ -1189,7 +1210,7 @@ mod tests {
         };
         let n = next_step(&s);
         assert_eq!((n.key, n.tab), ("autolabel_night", AUTOLABEL));
-        assert_eq!(n.link, "/train/autolabel?scene=ir&auto=none");
+        assert_eq!(n.link, "/train/autolabel?scene=ir");
         assert!(
             n.text.starts_with(
                 "200 night and IR frames have no proposed boxes yet (50 night, 150 IR)"
@@ -1202,10 +1223,7 @@ mod tests {
             night_never_auto_labelled: 151,
             ..s.clone()
         };
-        assert_eq!(
-            next_step(&night).link,
-            "/train/autolabel?scene=night&auto=none"
-        );
+        assert_eq!(next_step(&night).link, "/train/autolabel?scene=night");
         // Under the floor: the export of the reviewed frames comes first.
         let few = Summary {
             ir_never_auto_labelled: ENOUGH_NIGHT_TO_AUTOLABEL - 51,
@@ -1243,7 +1261,7 @@ mod tests {
         };
         let n = next_step(&s);
         assert_eq!((n.key, n.tab), ("autolabel_new", AUTOLABEL));
-        assert_eq!(n.link, "/train/autolabel?auto=none");
+        assert_eq!(n.link, "/train/autolabel");
         assert!(n.text.starts_with("200 frames arrived since"), "{}", n.text);
         let few = Summary {
             new_never_auto_labelled: ENOUGH_NEW_TO_AUTOLABEL - 1,
@@ -1258,8 +1276,9 @@ mod tests {
             night: 0,
             ir: 0,
             arrived: vec![10, 20, 20, 30],
+            undated: 2,
         };
-        assert_eq!(g.newer_than(None), 4, "no run yet: every one");
+        assert_eq!(g.newer_than(None), 6, "no run yet: every one, dated or not");
         assert_eq!(g.newer_than(Some(20)), 1);
         assert_eq!(g.newer_than(Some(5)), 4);
         assert_eq!(g.newer_than(Some(30)), 0);
@@ -1292,12 +1311,16 @@ mod tests {
         use crate::collect::labels::bulk::test_support::{auto_box, put_frame};
         use crate::collect::labels::{AutoRun, Frame, Status, Triage};
         let dir = scratch();
-        put_frame(&dir, "a", None, Vec::new());
-        put_frame(&dir, "b", None, Vec::new());
-        // Auto-labelled (the marker), auto evidence, reviewed: not in the gap.
+        // Named by their time (UTC, then the zone's form), and one without a stamp.
+        put_frame(&dir, "20261020T010203004Z_a", None, Vec::new());
+        put_frame(&dir, "20261022T010203004-0700_b", None, Vec::new());
+        put_frame(&dir, "plain", None, Vec::new());
+        // The labelers' marker or a review: not in the gap.
         let ran = put_frame(&dir, "c", None, Vec::new());
-        put_frame(&dir, "d", None, vec![auto_box("cat", 0.4, Triage::Review)]);
         let reviewed = put_frame(&dir, "e", None, Vec::new());
+        // A model's marker, or auto evidence a model run left: still in it, no labelers looked.
+        let model = put_frame(&dir, "f", None, Vec::new());
+        put_frame(&dir, "d", None, vec![auto_box("cat", 0.4, Triage::Review)]);
         for (rel, edit) in [
             (
                 &ran,
@@ -1316,6 +1339,16 @@ mod tests {
                     f.empty_confirmed = true;
                 }),
             ),
+            (
+                &model,
+                Box::new(|f: &mut crate::collect::labels::LabelFile| {
+                    f.auto_run = Some(AutoRun {
+                        at: "2026-11-01T00:00:00Z".into(),
+                        labeler: "model:mine@auto".into(),
+                        classes: Vec::new(),
+                    });
+                }),
+            ),
         ] {
             let frame = Frame::resolve(&dir, rel).unwrap();
             let mut f = frame.labels().unwrap().unwrap();
@@ -1323,8 +1356,13 @@ mod tests {
             crate::collect::labels::write(&frame.labels, &f).unwrap();
         }
         let g = auto_gap(&dir);
-        assert_eq!((g.night, g.ir), (0, 2), "{g:?}");
-        assert_eq!(g.newer_than(None), 2);
+        assert_eq!((g.night, g.ir), (0, 5), "{g:?}");
+        assert_eq!(g.newer_than(None), 5);
+        // The arrival is the name's time: 2026-10-22 08:02:03 UTC for the second frame.
+        let day_21 = chrono::DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(g.newer_than(Some(day_21)), 1);
         assert_eq!(g.newer_than(Some(i64::MAX)), 0);
     }
 

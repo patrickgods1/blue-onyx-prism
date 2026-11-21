@@ -26,9 +26,12 @@ Night and IR frames (`scene` night or ir) get two extras:
 
   - --night-enhance <mode> (the service's `model::enhance::Preprocess` form; `enhance_array` is its
     byte-for-byte twin, checked by a Rust test through --enhance-parity): every labeler also runs on
-    an enhanced copy of the frame; its boxes join the original's per labeler (`union_views`, NMS at
-    --nms-iou), and the size is the same, so boxes map 1:1. Crops for the VLM and SigLIP 2 come from
-    the original, which is also the frame the service keeps.
+    an enhanced copy of the frame; its boxes join the original's per labeler (`union_views`: one
+    object found on both, of one kind at IoU >= 0.5 or 80% of the smaller inside, is one box), and
+    the size is the same, so boxes map 1:1. Every box of such a frame says which views found it
+    (`views`) and whether its score came from the copy (`enhanced_raised`): the service never
+    accepts a box the copy alone found or raised, nor hides it for its score. Crops for the VLM and
+    SigLIP 2 come from the original, which is also the frame the service keeps.
   - --mdv6 <MDV6-yolov9-c.pt> (MegaDetector v6, AGPL-3.0, through Ultralytics) at --mdv6-threshold
     (0.2): its `animal` boxes are named by SigLIP 2 over the run's animal classes (the top species from
     MD_NAME_SCORE 0.5; below it the box keeps that guess with `animal_guess`), `person` / `vehicle` map
@@ -43,9 +46,11 @@ review) and merges them into the frames' label files as pending `source: auto` b
 Input (`--frames`): JSONL, one object per frame: `{"frame": "<rel>", "path": "<image>", "width": W,
 "height": H, "scene": "day|night|ir"}`. Output (`--out`): JSONL, one object per frame:
 `{"frame": "<rel>", "boxes": [{"label", "bbox": [x0, y0, x1, y1], "score", "sources": {"gdino": s,
-"rfdetr": s, "mdv6": s}, "agree", "vlm": {...}, "species_scores": {...}, "animal_guess"}], "ms": {...},
-"enhanced": true, "enhanced_boxes": {labeler: n}, "mdv6": {"votes", "added", "dropped", "guesses"}}` (pixels of
-the frame; the last three only on night and IR frames with those extras).
+"rfdetr": s, "mdv6": s}, "agree", "vlm": {...}, "species_scores": {...}, "animal_guess", "views":
+["original", "enhanced"], "enhanced_raised"}], "ms": {...}, "enhanced": bool, "enhanced_boxes": {labeler:
+n}, "mdv6": {"votes", "added", "dropped", "guesses"}}` (pixels of the frame). `enhanced` is on every line
+(whether the copy was labelled); `views`, `enhanced_raised` and `enhanced_boxes` only with the copy,
+`mdv6` only where MegaDetector ran.
 
 Progress: one stdout line `@autolabel {json}` per event (`start`, `model`, `frame`, `done`,
 `self_check`, `self_test`); everything else is log output. Every finished frame is flushed to
@@ -239,7 +244,9 @@ def wbf(per_model: dict, weights: dict, iou_thr: float, participants: dict) -> l
     min(n, M) / M), so a box only one of two labelers found keeps half its score. `participants`
     maps a label to the models that can report it (default: all); a class only one labeler knows
     is fused over that labeler alone (M = its weight). Returns dicts with `label`, `bbox`, `score`,
-    `sources` (best score per model) and `agree` (every participating model is in the cluster).
+    `sources` (best score per model) and `agree` (every participating model is in the cluster);
+    when the members carry `union_views` provenance, also `views` (every view a member came from)
+    and `enhanced_raised` (a member's score came from the enhanced copy).
     """
     labels = sorted({b["label"] for bs in per_model.values() for b in bs})
     out = []
@@ -250,7 +257,8 @@ def wbf(per_model: dict, weights: dict, iou_thr: float, participants: dict) -> l
         for m in models:
             for b in per_model.get(m, []):
                 if b["label"] == label:
-                    items.append((b["score"] * weights.get(m, 1.0), b["score"], m, b["bbox"]))
+                    items.append((b["score"] * weights.get(m, 1.0), b["score"], m, b["bbox"], b.get("views"),
+                                  bool(b.get("enhanced_raised"))))
         items.sort(key=lambda t: -t[0])
         clusters = []  # [members, fused_box]
         for it in items:
@@ -274,13 +282,19 @@ def wbf(per_model: dict, weights: dict, iou_thr: float, participants: dict) -> l
             sources = {}
             for t in members:
                 sources[t[2]] = max(sources.get(t[2], 0.0), t[1])
-            out.append({
+            fused = {
                 "label": label,
                 "bbox": [round(v, 1) for v in box],
                 "score": round(min(1.0, score), 4),
                 "sources": {k: round(v, 4) for k, v in sorted(sources.items())},
                 "agree": len(models) > 1 and all(m in in_cluster for m in models),
-            })
+            }
+            views = [t[4] for t in members if t[4]]
+            if views:
+                # The views of a night frame its members came from (`union_views`).
+                fused["views"] = sorted({v for vs in views for v in vs}, key=VIEWS.index)
+                fused["enhanced_raised"] = any(t[5] for t in members)
+            out.append(fused)
     out.sort(key=lambda b: -b["score"])
     return out
 
@@ -455,13 +469,22 @@ def round_half_away(x: float) -> int:
     return int(f) + (1 if x - f >= 0.5 else 0)
 
 
+# Rows of a frame the enhancement handles at once: its work arrays stay at this many rows (uint32
+# per pixel at most), so a 4K frame never needs a full-frame array wider than the uint8 output.
+ENHANCE_ROWS = 64
+
+
 def luma601(rgb):
     """BT.601 luma of an H x W x 3 uint8 array, `(299 r + 587 g + 114 b + 500) / 1000` in integers
-    (the twin of `image::luma601`)."""
+    (the twin of `image::luma601`), as uint8, ENHANCE_ROWS rows at a time."""
     import numpy as np
 
-    r, g, b = (rgb[..., k].astype(np.uint32) for k in range(3))
-    return ((299 * r + 587 * g + 114 * b + 500) // 1000).astype(np.uint8)
+    out = np.empty(rgb.shape[:2], np.uint8)
+    for y in range(0, rgb.shape[0], ENHANCE_ROWS):
+        part = rgb[y:y + ENHANCE_ROWS]
+        r, g, b = (part[..., k].astype(np.uint32) for k in range(3))
+        out[y:y + ENHANCE_ROWS] = (299 * r + 587 * g + 114 * b + 500) // 1000
+    return out
 
 
 def gamma_lut(g: float) -> list:
@@ -531,39 +554,47 @@ def tile_lut(hist, area: int, clip: float):
 def clahe(rgb, clip: float, tiles: int):
     """CLAHE on the luma of an H x W x 3 uint8 array, the twin of `enhance::clahe` (OpenCV's
     algorithm; a monochrome frame gets the new luma in all channels, a colour one keeps its hue:
-    each channel times new / old luma in f32, a black pixel plus the new gray)."""
+    each channel times new / old luma in f32, a black pixel plus the new gray). Histograms tile by
+    tile, the blend ENHANCE_ROWS rows at a time in uint32 (at most 65280 x 256 + 32768 per pixel)."""
     import numpy as np
 
     h, w = rgb.shape[0], rgb.shape[1]
     if w == 0 or h == 0:
         return rgb.copy()
     tx, ty = min(max(tiles, 1), w), min(max(tiles, 1), h)
-    col_tile, col_blend = axis_weights(w, tx)
-    row_tile, row_blend = axis_weights(h, ty)
+    _, col_blend = axis_weights(w, tx)
+    _, row_blend = axis_weights(h, ty)
     luma = luma601(rgb)
-    mono = bool(np.all((rgb[..., 0] == rgb[..., 1]) & (rgb[..., 1] == rgb[..., 2])))
-    tile = np.asarray(row_tile, np.int64)[:, None] * tx + np.asarray(col_tile, np.int64)[None, :]
-    hists = np.bincount((tile * 256 + luma).ravel(), minlength=tx * ty * 256).reshape(tx * ty, 256)
-    luts = np.zeros((tx * ty, 256), np.int64)
-    for k in range(tx * ty):
-        i, j = k % tx, k // tx
-        area = (tile_start(i + 1, w, tx) - tile_start(i, w, tx)) * (tile_start(j + 1, h, ty) - tile_start(j, h, ty))
-        luts[k] = tile_lut(hists[k], area, clip)
-    luts = luts.reshape(ty, tx, 256)
-    r1, r2, wy = (np.asarray([b[k] for b in row_blend], np.int64)[:, None] for k in range(3))
-    c1, c2, wx = (np.asarray([b[k] for b in col_blend], np.int64)[None, :] for k in range(3))
-    v = luma.astype(np.int64)
-    t = luts[r1, c1, v] * (256 - wx) + luts[r1, c2, v] * wx
-    u = luts[r2, c1, v] * (256 - wx) + luts[r2, c2, v] * wx
-    nv = np.minimum((t * (256 - wy) + u * wy + 32768) >> 16, 255)
-    if mono:
-        return np.repeat(nv[..., None], 3, axis=2).astype(np.uint8)
+    mono = all(bool(np.all((p[..., 0] == p[..., 1]) & (p[..., 1] == p[..., 2])))
+               for p in (rgb[y:y + ENHANCE_ROWS] for y in range(0, h, ENHANCE_ROWS)))
+    luts = np.zeros((ty, tx, 256), np.uint8)
+    for j in range(ty):
+        y0, y1 = tile_start(j, h, ty), tile_start(j + 1, h, ty)
+        for i in range(tx):
+            x0, x1 = tile_start(i, w, tx), tile_start(i + 1, w, tx)
+            hist = np.bincount(luma[y0:y1, x0:x1].ravel(), minlength=256)
+            luts[j, i] = tile_lut(hist, (x1 - x0) * (y1 - y0), clip)
+    c1, c2, wx = (np.asarray([b[k] for b in col_blend], np.intp if k < 2 else np.uint32)[None, :] for k in range(3))
     recip = np.zeros(256, np.float32)
     recip[1:] = np.float32(1.0) / np.arange(1, 256, dtype=np.float32)
-    k = nv.astype(np.float32) * recip[v]
-    scaled = np.minimum(rgb.astype(np.float32) * k[..., None] + np.float32(0.5), np.float32(255.0)).astype(np.uint8)
-    black = np.minimum(rgb.astype(np.int64) + nv[..., None], 255).astype(np.uint8)
-    return np.where((v == 0)[..., None], black, scaled)
+    out = np.empty_like(rgb)
+    for y in range(0, h, ENHANCE_ROWS):
+        rows = row_blend[y:y + ENHANCE_ROWS]
+        r1, r2 = (np.asarray([b[k] for b in rows], np.intp)[:, None] for k in range(2))
+        wy = np.asarray([b[2] for b in rows], np.uint32)[:, None]
+        v = luma[y:y + ENHANCE_ROWS]
+        t = luts[r1, c1, v].astype(np.uint32) * (256 - wx) + luts[r1, c2, v].astype(np.uint32) * wx
+        u = luts[r2, c1, v].astype(np.uint32) * (256 - wx) + luts[r2, c2, v].astype(np.uint32) * wx
+        nv = np.minimum((t * (256 - wy) + u * wy + 32768) >> 16, 255).astype(np.uint8)
+        if mono:
+            out[y:y + ENHANCE_ROWS] = nv[..., None]
+            continue
+        part = rgb[y:y + ENHANCE_ROWS]
+        k = nv.astype(np.float32) * recip[v]
+        scaled = np.minimum(part.astype(np.float32) * k[..., None] + np.float32(0.5), np.float32(255.0)).astype(np.uint8)
+        black = np.minimum(part.astype(np.uint16) + nv[..., None], 255).astype(np.uint8)
+        out[y:y + ENHANCE_ROWS] = np.where((v == 0)[..., None], black, scaled)
+    return out
 
 
 def enhance_array(rgb, mode):
@@ -605,12 +636,59 @@ def enhance_parity(stdin) -> int:
     return 0
 
 
-def union_views(found: list, thr: float) -> list:
-    """One labeler's boxes over the views of a frame (the original, then the enhanced copy): class-
-    aware NMS at `thr` over all of them, so an object both views found keeps its higher score and one
-    only the enhanced view found is added. The original's boxes come first: at equal scores its box
-    stays."""
-    return nms([b for view in found for b in view], thr)
+# The views of a night frame, in the order a box lists them (`union_views`).
+VIEWS = ("original", "enhanced")
+# A box of the enhanced copy is the same object as one of the original's at this IoU or more ...
+VIEW_SAME_IOU = 0.5
+# ... or with this share of the smaller of the two inside the other (a box drawn tighter or looser
+# on the brighter copy).
+VIEW_SAME_INSIDE = 0.8
+
+
+def overlap_min(a, b) -> float:
+    """The intersection of `a` and `b` over the smaller one's area."""
+    iw = min(a[2], b[2]) - max(a[0], b[0])
+    ih = min(a[3], b[3]) - max(a[1], b[1])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return iw * ih / small if small > 0 else 0.0
+
+
+def same_kind(a: str, b: str) -> bool:
+    """Whether labels `a` and `b` can name one object across the two views: the same label, or two
+    of the animal classes, or two of the vehicle classes (a cat on the original that the brighter
+    copy calls a dog). A person on a bicycle stays two objects."""
+    return a == b or (category(a) == category(b) and category(a) in ("animal", "vehicle"))
+
+
+def union_views(found: list) -> list:
+    """One labeler's boxes over the views of a frame (`found`: the original's, then the enhanced
+    copy's), each with its provenance. Every box of the original is kept, `views: ["original"]`. A
+    box of the copy that is the same object as one of them (`same_kind`, IoU >= VIEW_SAME_IOU or
+    overlap of the smaller >= VIEW_SAME_INSIDE; the best such match, any class of the kind, so one
+    object is never proposed twice) adds `enhanced` to that box's views, and when it scores higher
+    it takes the box's label, place and score with `enhanced_raised` (the service never accepts such
+    a box, nor hides it for its score). Any other box of the copy joins with `views: ["enhanced"]`.
+    Highest score first; the input dicts are not changed."""
+    out = [{**b, "views": ["original"]} for b in found[0]]
+    for e in sorted(found[1] if len(found) > 1 else [], key=lambda x: -x["score"]):
+        best, best_v = None, 0.0
+        for k in out:
+            if "original" not in k["views"] or not same_kind(k["label"], e["label"]):
+                continue
+            v, m = iou(k["bbox"], e["bbox"]), overlap_min(k["bbox"], e["bbox"])
+            if (v >= VIEW_SAME_IOU or m >= VIEW_SAME_INSIDE) and max(v, m) > best_v:
+                best, best_v = k, max(v, m)
+        if best is None:
+            out.append({**e, "views": ["enhanced"]})
+            continue
+        if "enhanced" not in best["views"]:
+            best["views"].append("enhanced")
+        if e["score"] > best["score"]:
+            best.update(label=e["label"], bbox=e["bbox"], score=e["score"], enhanced_raised=True)
+    out.sort(key=lambda b: -b["score"])
+    return out
 
 
 # MegaDetector v6's head order (PytorchWildlife `CLASS_NAMES`; `catalog::MDV6_CLASSES`).
@@ -636,6 +714,7 @@ def md_proposals(md: list, classes: list, animals: tuple, rank) -> list:
     for d in md:
         kind = d["label"]
         p = {"kind": kind, "bbox": d["bbox"], "score": d["score"], "named": True}
+        p.update({k: d[k] for k in ("views", "enhanced_raised") if k in d})
         if kind == "animal":
             if not animals:
                 continue
@@ -692,6 +771,7 @@ def md_merge(fused: list, props: list, iou_thr: float) -> dict:
                "sources": {MD_KEY: s}, "agree": False}
         if p.get("species_scores"):
             box["species_scores"] = p["species_scores"]
+        box.update({k: p[k] for k in ("views", "enhanced_raised") if k in p})
         if not p["named"]:
             box["animal_guess"] = True
             n["guesses"] += 1
@@ -1046,12 +1126,32 @@ def self_test(parity: Path = None) -> int:
           "round half away")
     orig = [{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5}]
     enh = [{"label": "dog", "bbox": [0, 0, 10, 11], "score": 0.7}, {"label": "fox", "bbox": [40, 40, 60, 60], "score": 0.3}]
-    u = union_views([orig, enh], 0.6)
-    check([(b["label"], b["score"]) for b in u] == [("dog", 0.7), ("fox", 0.3)], f"union of views {u}")
-    check(union_views([orig, []], 0.6) == orig, "union keeps the original")
-    tie = union_views([[{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5, "view": "o"}],
-                       [{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5, "view": "e"}]], 0.6)
-    check(len(tie) == 1 and tie[0]["view"] == "o", "a tie keeps the original's box")
+    u = union_views([orig, enh])
+    check([(b["label"], b["score"], b["views"], b.get("enhanced_raised", False)) for b in u]
+          == [("dog", 0.7, ["original", "enhanced"], True), ("fox", 0.3, ["enhanced"], False)], f"union of views {u}")
+    check(orig[0] == {"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5}, "the input is not changed")
+    check(union_views([orig, []]) == [{**orig[0], "views": ["original"]}], "union keeps the original")
+    tie = union_views([[{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5, "tag": "o"}],
+                       [{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5, "tag": "e"}]])
+    check(len(tie) == 1 and tie[0]["tag"] == "o" and "enhanced_raised" not in tie[0], "a tie keeps the original's box")
+    # One object across the views, whatever class each view gave it within its kind; a looser box with
+    # most of the tighter one inside is the same object; a person on a bicycle stays two.
+    u = union_views([[{"label": "cat", "bbox": [0, 0, 20, 20], "score": 0.6}],
+                     [{"label": "dog", "bbox": [1, 1, 21, 21], "score": 0.4},
+                      {"label": "cat", "bbox": [2, 2, 12, 12], "score": 0.3}]])
+    check(len(u) == 1 and u[0]["label"] == "cat" and u[0]["views"] == ["original", "enhanced"], f"one object {u}")
+    u = union_views([[{"label": "bicycle", "bbox": [0, 0, 20, 20], "score": 0.6}],
+                     [{"label": "person", "bbox": [1, 0, 20, 20], "score": 0.5}]])
+    check(sorted(b["label"] for b in u) == ["bicycle", "person"], f"person on a bicycle {u}")
+    check(overlap_min([0, 0, 10, 10], [0, 0, 5, 5]) == 1.0 and overlap_min([0, 0, 1, 1], [2, 2, 3, 3]) == 0.0,
+          "overlap of the smaller")
+    # WBF keeps the provenance: views of every member, raised when one member's score was.
+    fz = wbf({"gdino": [{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5, "views": ["enhanced"]}],
+              "rfdetr": [{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.9, "views": ["original", "enhanced"],
+                          "enhanced_raised": True}]}, {"gdino": 1.0, "rfdetr": 1.0}, 0.55, {})
+    check(fz[0]["views"] == ["original", "enhanced"] and fz[0]["enhanced_raised"], f"wbf provenance {fz}")
+    plain = wbf({"gdino": [{"label": "dog", "bbox": [0, 0, 10, 10], "score": 0.5}]}, {"gdino": 1.0}, 0.55, {})
+    check("views" not in plain[0] and "enhanced_raised" not in plain[0], "no provenance on a day frame")
     animals = ("dog", "cat", "raccoon")
     ranks = {(0, 0): {"dog": 0.1, "cat": 0.2, "raccoon": 0.7}, (100, 0): {"dog": 0.3, "cat": 0.3, "raccoon": 0.4}}
     md = [{"label": "animal", "bbox": [0, 0, 20, 20], "score": 0.8},
@@ -1099,6 +1199,7 @@ def self_test(parity: Path = None) -> int:
         out = enhance_array(ramp, ("clahe", 2.0, 2))
         check(out.shape == ramp.shape and int(out.max()) - int(out.min()) > 15, "clahe stretches a low contrast")
         check(np.array_equal(enhance_array(ramp, None), ramp), "no mode is a copy")
+        n += main_wiring_test(check)
     if parity:
         doc = json.loads(Path(parity).read_text(encoding="utf-8"))
         check(len(doc["crops"]) >= 4, "parity crops")
@@ -1110,6 +1211,106 @@ def self_test(parity: Path = None) -> int:
     event("self_test", passed=n)
     log(f"self-test: {n} checks passed")
     return 0
+
+
+def main_wiring_test(check) -> int:
+    """`main()` end to end with fake labelers (no torch): a day and a dark IR frame with
+    --night-enhance and --mdv6, with and without --prefetch; checks the written lines' keys, the
+    views provenance and MegaDetector's fields. Needs numpy and Pillow (the caller checked numpy)."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return 0
+    import tempfile
+
+    g = globals()
+
+    class Gdino:
+        def __init__(self, *a):
+            pass
+
+        def batches(self, phrases):
+            return [phrases]
+
+        def detect(self, image, batches, p2c):
+            out = [{"label": "cat", "bbox": [1.0, 1.0, 20.0, 20.0], "score": 0.5}]
+            if image.getpixel((5, 5))[0] > 30:  # only the brightened copy shows the fox
+                out.append({"label": "fox", "bbox": [30.0, 10.0, 50.0, 40.0], "score": 0.4})
+            return out
+
+    class Rf:
+        def __init__(self, *a):
+            pass
+
+        def detect(self, image, wanted):
+            return [{"label": "cat", "bbox": [1.0, 1.0, 21.0, 20.0], "score": 0.7}]
+
+    class Md:
+        def __init__(self, *a):
+            pass
+
+        def detect(self, image):
+            return [{"label": "animal", "bbox": [2.0, 1.0, 20.0, 20.0], "score": 0.8},
+                    {"label": "animal", "bbox": [40.0, 30.0, 60.0, 46.0], "score": 0.3}]
+
+    class Sig:
+        def __init__(self, *a):
+            pass
+
+        def prepare(self, *a):
+            pass
+
+        def rank(self, crop, classes, night, syn):
+            return {c: 1.0 / len(classes) for c in classes}
+
+    saved = {k: g[k] for k in ("GroundingDino", "RfDetr", "MegaDetector", "Siglip", "pick_device", "event", "log",
+                               "watch_parent")}
+    argv = sys.argv
+    g.update(GroundingDino=Gdino, RfDetr=Rf, MegaDetector=Md, Siglip=Sig, pick_device=lambda want: "cpu",
+             event=lambda *a, **k: None, log=lambda msg: None, watch_parent=lambda: None)
+    n = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for name, v in (("day", 200), ("ir", 20)):
+                Image.new("RGB", (64, 48), (v, v, v)).save(d / f"{name}.jpg")
+            frames = [{"frame": f"{s}/c/2026-10-22/{s}.jpg", "path": str(d / f"{s}.jpg"), "width": 64, "height": 48,
+                       "scene": s} for s in ("day", "ir")]
+            (d / "f.jsonl").write_text("".join(json.dumps(f) + "\n" for f in frames), encoding="utf-8")
+            (d / "w.pt").write_text("x", encoding="utf-8")
+            outs = []
+            for extra in ([], ["--prefetch"]):
+                sys.argv = ["autolabel.py", "--frames", str(d / "f.jsonl"), "--out", str(d / "o.jsonl"), "--classes",
+                            json.dumps(["person", "cat", "fox", "raccoon"]), "--gdino", str(d), "--rfdetr",
+                            str(d / "w.pt"), "--siglip", str(d), "--mdv6", str(d / "w.pt"), "--night-enhance",
+                            "gamma:0.3"] + extra
+                check(main() == 0, "main() with fakes")
+                outs.append([json.loads(x) for x in (d / "o.jsonl").read_text(encoding="utf-8").splitlines()])
+                n += 1
+            day, ir = outs[0]
+            same = [[{k: v for k, v in x.items() if k != "ms"} for x in o] for o in outs]
+            check(same[0] == same[1], "the same lines with --prefetch (times aside)")
+            check(set(day) == {"frame", "width", "height", "boxes", "ms", "enhanced"} and day["enhanced"] is False,
+                  f"day line keys {sorted(day)}")
+            check(all("views" not in b and "enhanced_raised" not in b for b in day["boxes"]), "no views by day")
+            check(set(ir) == {"frame", "width", "height", "boxes", "ms", "enhanced", "enhanced_boxes", "mdv6"}
+                  and ir["enhanced"] is True, f"ir line keys {sorted(ir)}")
+            check(ir["enhanced_boxes"] == {"gdino": 1, "rfdetr": 0, "mdv6": 0}, f"enhanced boxes {ir['enhanced_boxes']}")
+            check(ir["mdv6"] == {"votes": 1, "added": 1, "dropped": 0, "guesses": 1}, f"mdv6 counts {ir['mdv6']}")
+            by = {(b["label"], tuple(sorted(b["sources"]))): b for b in ir["boxes"]}
+            cat = by[("cat", ("gdino", "mdv6", "rfdetr"))]
+            check(cat["views"] == ["original", "enhanced"] and not cat["enhanced_raised"] and cat["agree"],
+                  f"cat both views {cat}")
+            fox = by[("fox", ("gdino",))]
+            check(fox["views"] == ["enhanced"], f"fox only on the copy {fox}")
+            guess = [b for b in ir["boxes"] if b["sources"] == {"mdv6": 0.3}]
+            check(len(guess) == 1 and guess[0]["animal_guess"] and guess[0]["views"] == ["original", "enhanced"],
+                  f"megadetector's own box {guess}")
+            check("mdv6" in ir["ms"] and "gdino" in ir["ms"], f"ms {ir['ms']}")
+    finally:
+        g.update(saved)
+        sys.argv = argv
+    return n
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2068,21 +2269,13 @@ def main() -> int:
         return [image] if extra is None else [image, extra]
 
     def detect_views(name: str, views: list, run, ms: dict, enhanced: dict) -> list:
-        """`run(view)` on every view, merged by `union_views`; the boxes kept only from the enhanced
-        copy are counted in `enhanced[name]`."""
+        """`run(view)` on every view, merged by `union_views` (each box with its `views`); the boxes
+        only the enhanced copy found are counted in `enhanced[name]`."""
         t = time.time()
-        found = []
-        for k, view in enumerate(views):
-            boxes = run(view)
-            if k:
-                for b in boxes:
-                    b["view"] = "enhanced"
-            found.append(boxes)
-        kept = union_views(found, a.nms_iou) if len(views) > 1 else found[0]
+        found = [run(view) for view in views]
+        kept = union_views(found) if len(views) > 1 else found[0]
         if len(views) > 1:
-            enhanced[name] = sum(1 for b in kept if b.get("view") == "enhanced")
-            for b in kept:
-                b.pop("view", None)
+            enhanced[name] = sum(1 for b in kept if b["views"] == ["enhanced"])
         ms[name] = round((time.time() - t) * 1000)
         return kept
 
@@ -2135,8 +2328,10 @@ def main() -> int:
                 if image is None:
                     finisher.put(functools.partial(unreadable, i, fr, e))
                     continue
-                ms, per, line, enhanced = {}, {}, {}, {}
+                ms, per, enhanced = {}, {}, {}
                 views = views_of(fr, image, prepared)
+                # Always written: the service builds the frame's marker from what ran here.
+                line = {"enhanced": len(views) > 1}
                 if "sam3" in labelers:
                     per["sam3"] = detect_views("sam3", views, lambda v: labelers["sam3"].detect(v, phrase_to_class),
                                                ms, enhanced)
@@ -2151,7 +2346,6 @@ def main() -> int:
                 if md is not None and is_night(fr.get("scene")):
                     md_boxes = detect_views(MD_KEY, views, md.detect, ms, enhanced)
                 if len(views) > 1:
-                    line["enhanced"] = True
                     line["enhanced_boxes"] = enhanced
                 fused = None
                 if vlm is not None:

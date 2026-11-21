@@ -93,6 +93,34 @@ pub struct Proposal {
     /// that best guess ("animal?" in its reasons, always reviewed).
     #[serde(default)]
     pub animal_guess: bool,
+    /// The views of a night frame that found it (`original`, `enhanced`; empty: one view only,
+    /// [`super::night`]).
+    #[serde(default)]
+    pub views: Vec<String>,
+    /// Its score came from the enhanced copy (it beat the original's for the same object).
+    #[serde(default)]
+    pub enhanced_raised: bool,
+}
+
+/// The reason of a box only the enhanced night copy found ([`Proposal::views`]). Stored in the box's
+/// `why`, which a review keeps, so the verdicts on such boxes can be counted later.
+pub const ENHANCED_ONLY_WHY: &str = "found on the enhanced night copy only: always reviewed";
+/// The reason of a box whose score came from the enhanced night copy ([`Proposal::enhanced_raised`]).
+pub const ENHANCED_RAISED_WHY: &str =
+    "its score came from the enhanced night copy: always reviewed";
+
+/// Whether a proposal's `views` are the enhanced copy alone.
+fn enhanced_only(views: &[String]) -> bool {
+    !views.is_empty() && views.iter().all(|v| v == "enhanced")
+}
+
+/// Whether a stored box got its place or score from the enhanced copy (its reasons say so): never
+/// dismissed for its score, never accepted at a parked spot.
+pub fn enhanced_evidence(b: &LabelBox) -> bool {
+    b.auto
+        .why
+        .iter()
+        .any(|w| w == ENHANCED_ONLY_WHY || w == ENHANCED_RAISED_WHY)
 }
 
 /// What MegaDetector did on one frame (`md_merge`'s counts).
@@ -114,9 +142,10 @@ pub struct FrameProposals {
     pub frame: String,
     #[serde(default)]
     pub boxes: Vec<Proposal>,
-    /// A night or IR frame the labelers also looked at enhanced ([`super::night`]).
+    /// Whether the labelers also looked at an enhanced copy ([`super::night`]); written on every
+    /// line by the script since that option, None on a line of an older script.
     #[serde(default)]
-    pub enhanced: bool,
+    pub enhanced: Option<bool>,
     /// Per labeler, boxes only the enhanced copy found.
     #[serde(default)]
     pub enhanced_boxes: BTreeMap<String, usize>,
@@ -135,9 +164,10 @@ pub fn mdv6_only<V>(sources: &BTreeMap<String, V>) -> bool {
 /// The triage of a proposal on a `scene` frame: `accept` only when both labelers agree, the
 /// fused score is at least `accept_score`, it is not a person or an animal at night (`night` /
 /// `ir`), the VLM did not object, SigLIP ranks the box's own species first, SAM 3 did not find
-/// it and MegaDetector is not its only finder ([`ACCEPT_SCORE`] was tuned on MM-Grounding-DINO +
-/// RF-DETR, and a bulk accept reaches the exports); else `review` with the reasons. A MegaDetector
-/// vote on a box changes nothing here: it is not one of the two labelers `agree` is about.
+/// it, MegaDetector is not its only finder and the enhanced night copy neither found it alone nor
+/// gave it its score ([`ACCEPT_SCORE`] was tuned on MM-Grounding-DINO + RF-DETR on original frames,
+/// and a bulk accept reaches the exports); else `review` with the reasons. A MegaDetector vote on a
+/// box never moves it toward `accept`: it is not one of the two labelers `agree` is about.
 pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<String>) {
     let mut why = Vec::new();
     if mdv6_only(&p.sources) {
@@ -164,12 +194,23 @@ pub fn triage(p: &Proposal, scene: &str, accept_score: f32) -> (Triage, Vec<Stri
     if p.sources.contains_key(SAM3_KEY) {
         why.push("found by SAM 3: always reviewed".to_string());
     }
+    if enhanced_only(&p.views) {
+        why.push(ENHANCED_ONLY_WHY.to_string());
+    } else if p.enhanced_raised {
+        why.push(ENHANCED_RAISED_WHY.to_string());
+    }
     if p.animal_guess {
-        let s = p.species_scores.get(&p.label).copied().unwrap_or(0.0);
-        why.push(format!(
-            "animal? MegaDetector found an animal; SigLIP's best guess is {} ({s:.2})",
-            p.label
-        ));
+        why.push(match p.species_scores.get(&p.label) {
+            Some(s) => format!(
+                "animal? MegaDetector found an animal; SigLIP's best guess is {} ({s:.2})",
+                p.label
+            ),
+            None => format!(
+                "animal? MegaDetector found an animal; {} is this run's only animal class, \
+                 nothing ranked the species",
+                p.label
+            ),
+        });
     }
     if let Some(n) = night_review(&p.label, scene) {
         why.push(n.to_string());
@@ -560,6 +601,8 @@ pub fn model_boxes(dets: &[Det], run: &ModelRun<'_>, w: u32, h: u32) -> Boxes {
             vlm: None,
             species_scores: BTreeMap::new(),
             animal_guess: false,
+            views: Vec::new(),
+            enhanced_raised: false,
         })
         .collect();
     let mut out = to_boxes_counted(&props, run.classes, run.scene, w, h, ACCEPT_SCORE);
@@ -1054,9 +1097,10 @@ fn is_likely(b: &LabelBox, score: f32) -> bool {
 /// - Likely: fused score >= [`LIKELY_SCORE`] and a yes to the yes/no question. An older run's
 ///   seven-way VLM answer is never one.
 /// - Dismissed: fused score < [`DISMISS_SCORE`], not triaged `accept`, not of a class in
-///   [`NEVER_DISMISSED`], not found by SAM 3, not found by MegaDetector alone ([`mdv6_only`]: its
-///   score is its own, not a fused one), and `sam3_run` false (the thresholds were measured on
-///   MM-Grounding-DINO + RF-DETR). Only the score decides: a VLM no never hides a box, 40% of
+///   [`NEVER_DISMISSED`], not found by SAM 3, not found or voted for by MegaDetector (its score is
+///   its own, and its vote is evidence the fused score does not hold), no [`enhanced_evidence`]
+///   (scores of the enhanced copy were never measured), and `sam3_run` false (the thresholds were
+///   measured on MM-Grounding-DINO + RF-DETR on original frames). Only the score decides: a VLM no never hides a box, 40% of
 ///   those were real on public sets. A class only one labeler can report is not halved by the
 ///   fusion, so it stays at or above that labeler's threshold (0.2 for MM-Grounding-DINO).
 pub fn tier(b: &LabelBox, frame: &str, sam3_run: bool) -> Tier {
@@ -1068,7 +1112,8 @@ pub fn tier(b: &LabelBox, frame: &str, sam3_run: bool) -> Tier {
     }
     let protected = sam3_run
         || found_by_sam3(b)
-        || mdv6_only(&b.auto.labelers)
+        || b.auto.labelers.contains_key(MDV6_KEY)
+        || enhanced_evidence(b)
         || b.auto.triage == Some(Triage::Accept)
         || NEVER_DISMISSED
             .iter()
@@ -1125,7 +1170,8 @@ fn spot_keeps(b: &LabelBox, score: f32) -> bool {
 ///
 /// - Parked spot ([`CameraMemory::parked_at`]: the exact label, IoU >= 0.8), any pending auto box
 ///   with no sign of a reviewer and no class suggestion, an [`AUDIT_ONE_IN`] sample and a box only
-///   MegaDetector found ([`mdv6_only`], never accepted on its word) excepted:
+///   MegaDetector found ([`mdv6_only`], never accepted on its word) and one with
+///   [`enhanced_evidence`] excepted:
 ///   accepted, [`PARKED_REASON`], so it leaves the frame's undecided count. The frame stays
 ///   unreviewed and is marked [`LabelFile::repeat_spot`]. A VLM no in the yes/no contract leaves it
 ///   pending and flagged instead: the car may have left.
@@ -1155,7 +1201,7 @@ fn apply_spots(
             continue;
         }
         if let Some(p) = memory.parked_at(b, width, height) {
-            if mdv6_only(&b.auto.labelers) {
+            if mdv6_only(&b.auto.labelers) || enhanced_evidence(b) {
                 continue;
             }
             if b.auto.vlm.as_ref().is_some_and(VlmCheck::says_no) {
@@ -1345,6 +1391,8 @@ mod tests {
             vlm: None,
             species_scores: BTreeMap::new(),
             animal_guess: false,
+            views: Vec::new(),
+            enhanced_raised: false,
         }
     }
 
@@ -4147,14 +4195,14 @@ mod tests {
         // A script line with the flag parses; one without it reads as named.
         let line = r#"{"frame":"ir/cam/2026-10-22/a.jpg","boxes":[{"label":"raccoon","bbox":[1,2,30,40],"score":0.4,"sources":{"mdv6":0.4},"agree":false,"animal_guess":true}],"enhanced":true,"enhanced_boxes":{"gdino":2},"mdv6":{"votes":1,"added":1,"dropped":0,"guesses":1}}"#;
         let f: FrameProposals = serde_json::from_str(line).unwrap();
-        assert!(f.boxes[0].animal_guess && f.enhanced);
+        assert!(f.boxes[0].animal_guess && f.enhanced == Some(true));
         assert_eq!(f.enhanced_boxes["gdino"], 2);
         assert_eq!(f.mdv6.unwrap().guesses, 1);
         let old: FrameProposals = serde_json::from_str(
             r#"{"frame":"a","boxes":[{"label":"cat","bbox":[1,2,3,4],"score":0.5}]}"#,
         )
         .unwrap();
-        assert!(!old.boxes[0].animal_guess && !old.enhanced && old.mdv6.is_none());
+        assert!(!old.boxes[0].animal_guess && old.enhanced.is_none() && old.mdv6.is_none());
     }
 
     #[test]
@@ -4210,5 +4258,110 @@ mod tests {
             ..LabelFile::default()
         };
         assert!(missing_scope(&sent) && !unreviewed_scope(Some(&sent)));
+    }
+
+    /// `p` as the views of a night frame found it.
+    fn viewed(views: &[&str], raised: bool, p: Proposal) -> Proposal {
+        Proposal {
+            views: views.iter().map(|v| (*v).to_string()).collect(),
+            enhanced_raised: raised,
+            ..p
+        }
+    }
+
+    #[test]
+    fn boxes_the_enhanced_copy_found_or_raised_are_never_accepted_nor_hidden() {
+        // A car both labelers agree on at 0.9, on a day-like scene: accept, unless the copy made it.
+        let car = p("car", 0.9, true);
+        assert_eq!(triage(&car, "day", ACCEPT_SCORE).0, Triage::Accept);
+        let both = viewed(&["original", "enhanced"], false, car.clone());
+        assert_eq!(triage(&both, "day", ACCEPT_SCORE).0, Triage::Accept);
+        let (t, why) = triage(
+            &viewed(&["enhanced"], false, car.clone()),
+            "day",
+            ACCEPT_SCORE,
+        );
+        assert_eq!(t, Triage::Review);
+        assert!(why.iter().any(|w| w == ENHANCED_ONLY_WHY), "{why:?}");
+        let (t, why) = triage(
+            &viewed(&["original", "enhanced"], true, car),
+            "day",
+            ACCEPT_SCORE,
+        );
+        assert_eq!(t, Triage::Review);
+        assert!(why.iter().any(|w| w == ENHANCED_RAISED_WHY), "{why:?}");
+        // The reason stays on the box (a review keeps `why`), so its verdict can be counted, and a
+        // score below the dismissal line does not hide it.
+        let at = place("cat", false);
+        let (b, r) = one(
+            "gdino",
+            viewed(&["enhanced"], false, fused("cat", at, 0.1, None)),
+        );
+        assert_eq!((b.state, r.dismissed), (BoxState::Pending, 0));
+        assert!(enhanced_evidence(&b));
+        let (b, _) = one(
+            "gdino",
+            viewed(&["original", "enhanced"], true, fused("cat", at, 0.1, None)),
+        );
+        assert_eq!(b.state, BoxState::Pending);
+        let (b, _) = one(
+            "gdino",
+            viewed(
+                &["original", "enhanced"],
+                false,
+                fused("cat", at, 0.1, None),
+            ),
+        );
+        assert!(b.is_dismissed(), "the original's score: the tiers apply");
+        // Nor accepted at a parked spot.
+        let spot = place("car", false);
+        let (f, r) = at_spot(
+            "gdino",
+            &parked_spot(spot),
+            viewed(&["enhanced"], false, fused("car", spot, 0.3, None)),
+        );
+        assert_eq!(
+            (f.boxes[0].state, r.parked_accepted),
+            (BoxState::Pending, 0)
+        );
+        // A line with the provenance parses; an older one has none.
+        let line = r#"{"frame":"ir/c/d/a.jpg","enhanced":true,"boxes":[{"label":"fox","bbox":[1,2,30,40],"score":0.4,"sources":{"gdino":0.4},"views":["enhanced"],"enhanced_raised":false}]}"#;
+        let fp: FrameProposals = serde_json::from_str(line).unwrap();
+        assert_eq!(fp.boxes[0].views, ["enhanced"]);
+        assert_eq!(fp.enhanced, Some(true));
+    }
+
+    #[test]
+    fn a_megadetector_vote_keeps_a_box_from_dismissal_and_never_moves_it_to_accept() {
+        // gdino alone at 0.3 on a raccoon, MegaDetector's vote at 0.8: still review.
+        let mut rac = p("raccoon", 0.3, false);
+        rac.sources.insert(MDV6_KEY.into(), 0.8);
+        let (t, why) = triage(&rac, "day", ACCEPT_SCORE);
+        assert_eq!(t, Triage::Review);
+        assert!(why.iter().any(|w| w == "found by gdino only"), "{why:?}");
+        // Under the dismissal score the vote keeps it visible.
+        let at = place("raccoon", false);
+        let mut low = fused("raccoon", at, 0.1, None);
+        low.sources.insert(MDV6_KEY.into(), 0.8);
+        let (b, r) = one("gdino", low);
+        assert_eq!((b.state, r.dismissed), (BoxState::Pending, 0));
+        assert_eq!(b.auto.triage, Some(Triage::Review));
+        assert!(!b.auto.likely, "no VLM yes: not likely either");
+    }
+
+    #[test]
+    fn an_animal_guess_with_one_animal_class_claims_no_siglip_ranking() {
+        let guess = Proposal {
+            animal_guess: true,
+            ..md("dog", [10.0, 10.0, 60.0, 90.0], 0.6)
+        };
+        let (_, why) = triage(&guess, "ir", ACCEPT_SCORE);
+        assert!(
+            why.iter().any(|w| w
+                == "animal? MegaDetector found an animal; dog is this run's only animal class, \
+                    nothing ranked the species"),
+            "{why:?}"
+        );
+        assert!(!why.iter().any(|w| w.contains("SigLIP")), "{why:?}");
     }
 }

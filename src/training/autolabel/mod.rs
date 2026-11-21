@@ -75,6 +75,13 @@ pub const MAX_LIMIT: usize = 20_000;
 /// Threshold of a `missing_only` run that leaves it at [`models::DEFAULT_THRESHOLD`]: every box it
 /// proposes reopens a reviewed frame, so it should be a sure one.
 pub const MISSING_THRESHOLD: f32 = 0.5;
+/// Most unreviewed frames a `missing_only` run labels ([`AutolabelRequest::missing_unreviewed`]),
+/// taken after the reviewed and sent-back frames, which keep `limit` to themselves: unreviewed frames
+/// are most of a folder (tens of thousands), and 2,000 of them is a few minutes for a model on a GPU
+/// and about half an hour for RF-DETR L on a CPU (about 1 s a frame), so a large folder neither
+/// pushes the reviewed frames out nor turns a missing-labels check into a day's run.
+/// `--missing-unreviewed-limit` changes it for one run.
+pub const MISSING_UNREVIEWED_LIMIT: usize = 2_000;
 
 /// Prompt phrases of the default classes (`training.synonyms` adds or replaces entries).
 pub const DEFAULT_SYNONYMS: [(&str, &[&str]); 14] = [
@@ -413,9 +420,10 @@ pub struct AutolabelRequest {
     pub ignore_memory_check: bool,
     /// Night and IR frames of a labelers run: the labelers also look at a copy enhanced by this mode
     /// ([`night`]; None or `none` = off; a run with a model ignores it). [`Self::new`] sets
-    /// [`night::DEFAULT_NIGHT_ENHANCE`]; a request stored before this option reads as off, which is
-    /// what that run did.
-    #[serde(default)]
+    /// [`night::DEFAULT_NIGHT_ENHANCE`], and so does a request stored without the key (an import's
+    /// chained run, a queued job), so every run without an explicit choice gets the default; an
+    /// explicit off is stored as `null` and stays off.
+    #[serde(default = "default_night_enhance")]
     pub night_enhance: Option<crate::model::enhance::Preprocess>,
     /// MegaDetector v6 as an extra labeler on night and IR frames ([`night`]; its animals named by
     /// SigLIP 2, which it needs). Its boxes never triage `accept`.
@@ -430,6 +438,9 @@ pub struct AutolabelRequest {
     /// treated as before. [`Self::new`] sets it; a request stored before it reads as off.
     #[serde(default)]
     pub missing_unreviewed: bool,
+    /// Most unreviewed frames of such a run ([`MISSING_UNREVIEWED_LIMIT`]).
+    #[serde(default = "default_missing_unreviewed_limit")]
+    pub missing_unreviewed_limit: usize,
 }
 
 /// Boxes per Qwen3-VL call when [`AutolabelRequest::vlm_batch`] is on.
@@ -451,6 +462,18 @@ const fn yes() -> bool {
 
 const fn default_sam3_threshold() -> f32 {
     SAM3_THRESHOLD
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "serde's default takes the field's type"
+)]
+const fn default_night_enhance() -> Option<crate::model::enhance::Preprocess> {
+    Some(night::DEFAULT_NIGHT_ENHANCE)
+}
+
+const fn default_missing_unreviewed_limit() -> usize {
+    MISSING_UNREVIEWED_LIMIT
 }
 
 const fn default_mdv6_threshold() -> f32 {
@@ -489,6 +512,7 @@ impl AutolabelRequest {
             mdv6: false,
             mdv6_threshold: night::MDV6_THRESHOLD,
             missing_unreviewed: true,
+            missing_unreviewed_limit: MISSING_UNREVIEWED_LIMIT,
         }
     }
 
@@ -522,6 +546,9 @@ impl AutolabelRequest {
                 "MegaDetector is one of the labelers, and a run with a model (--with-model) uses \
                  that model alone: remove --mdv6 or --with-model"
             );
+        }
+        if !(1..=MAX_LIMIT).contains(&self.missing_unreviewed_limit) {
+            bail!("the unreviewed frames' limit must be between 1 and {MAX_LIMIT}");
         }
         if self.mdv6 && !self.siglip {
             bail!(
@@ -1228,12 +1255,23 @@ mod tests {
             "mdv6",
             "mdv6_threshold",
             "missing_unreviewed",
+            "missing_unreviewed_limit",
         ] {
             assert!(obj.remove(k).is_some(), "{k}");
         }
-        // A request stored before them: what that run did.
+        // A request stored without them: the enhancement as a new request, the opt-ins off.
         let back: AutolabelRequest = serde_json::from_value(old).unwrap();
-        assert_eq!(back.night_enhance, None);
+        assert_eq!(back.night_enhance, Some(night::DEFAULT_NIGHT_ENHANCE));
+        assert_eq!(back.missing_unreviewed_limit, MISSING_UNREVIEWED_LIMIT);
+        // An explicit off stays off.
+        let mut off = r.clone();
+        off.night_enhance = None;
+        let back_off: AutolabelRequest =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(back_off.night_enhance, None);
+        let mut cap = r.clone();
+        cap.missing_unreviewed_limit = 0;
+        assert!(cap.validate().is_err());
         assert!(!back.mdv6 && !back.missing_unreviewed);
         assert!((back.mdv6_threshold - night::MDV6_THRESHOLD).abs() < f32::EPSILON);
         let mut on = r.clone();

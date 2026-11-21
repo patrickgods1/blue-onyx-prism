@@ -15,7 +15,12 @@
 //! frames of [`triage::missing_scope`] the model did not train on ([`super::trained_frames`]) and
 //! stage 5 writes [`triage::apply_missing`] to the frames that gain a box, and nothing else: no
 //! marker (it is one slot, and every reviewed frame holds the labelers'; several models run in
-//! turn, and a rerun re-detects and relies on the pending boxes to add nothing twice).
+//! turn, and a rerun re-detects and relies on the pending boxes to add nothing twice). With
+//! `missing_unreviewed` it also takes unreviewed frames the model never trained or validated on,
+//! after the reviewed ones (which keep `limit`) and up to their own cap, and labels them as one
+//! more labeler ([`triage::apply_relabel_at`], no marker); the write checks the model's frames
+//! again, so a frame reopened while the model ran cannot slip in. A labelers run writes the night
+//! extras into a frame's marker as the script reports it ran them ([`night::done_labeler`]).
 //!
 //! A cancel while labelling with [`AutolabelRequest::keep_on_cancel`] (the default) is not a
 //! failure: the frames finished so far (the script's flushed `proposals.jsonl`, the model's
@@ -200,6 +205,11 @@ struct Selection {
     taken: StatusSplit,
     /// Of [`Self::frames`], night and IR ones ([`super::night::is_night`]).
     taken_night: usize,
+    /// Of [`Self::frames`], the unreviewed ones of a `missing_only` run (last in the list).
+    taken_unreviewed: usize,
+    /// The frames the model of a `missing_only` run trained and validated on, for the write stage's
+    /// own check ([`AutolabelJob::run_model`]).
+    seen: Option<super::Seen>,
     /// Left out by the marker.
     skipped_done: usize,
     /// Left out because the model trained on them.
@@ -338,6 +348,10 @@ pub struct AutolabelReport {
     /// unreviewed frames it labelled and the boxes it added there (also in `added`).
     pub unreviewed_frames: usize,
     pub unreviewed_added: usize,
+    /// A `missing_only` run: the frames it took of each kind, the reviewed and sent-back ones (up to
+    /// `limit`) and the unreviewed ones after them (up to `missing_unreviewed_limit`).
+    pub taken_reviewed: usize,
+    pub taken_unreviewed: usize,
 }
 
 /// One labeler's per-frame time over a run, in milliseconds (nearest-rank percentiles, as the
@@ -384,7 +398,7 @@ pub fn labeler_ms(text: &str) -> BTreeMap<String, LabelerMs> {
 impl AutolabelReport {
     /// Add what the night extras did on one frame of a labelers run.
     fn count_night(&mut self, fp: &FrameProposals) {
-        if fp.enhanced {
+        if fp.enhanced == Some(true) {
             self.frames_enhanced += 1;
             for (k, n) in &fp.enhanced_boxes {
                 *self.enhanced_boxes.entry(k.clone()).or_default() += n;
@@ -717,7 +731,9 @@ impl AutolabelJob {
             Some(plan) if r.missing_only => Some(self.seen(plan, warnings)?),
             _ => None,
         };
-        self.select(!r.frames.again() && !r.missing_only, seen.as_ref())
+        let mut sel = self.select(!r.frames.again() && !r.missing_only, seen.as_ref())?;
+        sel.seen = seen;
+        Ok(sel)
     }
 
     /// The marker of a frame of `scene` this run writes and skips by: the model's, else the
@@ -737,9 +753,11 @@ impl AutolabelJob {
     /// With `seen` (a `missing_only` run) only frames of [`triage::missing_scope`] count, and with
     /// [`super::AutolabelRequest::missing_unreviewed`] those of [`triage::unreviewed_scope`] too;
     /// frames the model trained on are left out, and of the unreviewed ones also those it
-    /// validated on: `limit` is then the number of frames looked at. The whole list is walked past
-    /// `limit`, so the counts are of the whole filter, not of the frames before the limit was
-    /// reached.
+    /// validated on. `limit` then counts the reviewed and sent-back frames alone, as before the
+    /// unreviewed ones were in scope; those come after them, up to
+    /// [`super::AutolabelRequest::missing_unreviewed_limit`]. A marker with more night extras than
+    /// this run's covers it ([`night::marker_covers`]). The whole list is walked past `limit`, so the
+    /// counts are of the whole filter, not of the frames before the limit was reached.
     fn select(&self, skip_done: bool, seen: Option<&super::Seen>) -> Result<Selection> {
         let f = &self.request.frames;
         let collect = &self.config.collect;
@@ -750,6 +768,8 @@ impl AutolabelJob {
             unreadable: built.unreadable,
             ..Selection::default()
         };
+        // A `missing_only` run's unreviewed frames, after the others.
+        let mut unreviewed_frames = Vec::new();
         for item in built.items {
             let Some(frame) = Frame::resolve(&self.dataset_dir, &item.frame) else {
                 continue;
@@ -768,7 +788,8 @@ impl AutolabelJob {
             out.matched.add(item.status);
             if skip_done
                 && file.and_then(|x| x.auto_run).is_some_and(|r| {
-                    r.labeler == self.marker_for(&rec.scene) && r.covers(&self.classes)
+                    night::marker_covers(&r.labeler, &self.marker_for(&rec.scene))
+                        && r.covers(&self.classes)
                 })
             {
                 out.skipped_done += 1;
@@ -780,19 +801,31 @@ impl AutolabelJob {
                 out.skipped_trained += 1;
                 continue;
             }
-            if out.frames.len() >= f.limit {
+            let full = if unreviewed {
+                unreviewed_frames.len() >= self.request.missing_unreviewed_limit
+            } else {
+                out.frames.len() >= f.limit
+            };
+            if full {
                 continue;
             }
             out.taken.add(item.status);
             out.taken_night += usize::from(night::is_night(&rec.scene));
-            out.frames.push(Selected {
+            let sel = Selected {
                 rel: item.frame,
                 jpg: frame.jpg,
                 scene: rec.scene,
                 width: rec.width,
                 height: rec.height,
-            });
+            };
+            if unreviewed {
+                unreviewed_frames.push(sel);
+            } else {
+                out.frames.push(sel);
+            }
         }
+        out.taken_unreviewed = unreviewed_frames.len();
+        out.frames.extend(unreviewed_frames);
         Ok(out)
     }
 
@@ -823,6 +856,7 @@ impl AutolabelJob {
             matched: sel.matched,
             taken: sel.taken,
             taken_night: sel.taken_night,
+            taken_unreviewed: sel.taken_unreviewed,
             skipped_done: sel.skipped_done,
             skipped_trained: sel.skipped_trained,
             unreadable: sel.unreadable,
@@ -977,7 +1011,13 @@ impl AutolabelJob {
             // extras on night and IR frames.
             let marker = labels::AutoRun {
                 at: crate::collect::utc_rfc3339(std::time::SystemTime::now()),
-                labeler: night::frame_labeler(labeler, r, &sel.scene),
+                labeler: night::done_labeler(
+                    labeler,
+                    r,
+                    &sel.scene,
+                    fp.enhanced,
+                    fp.mdv6.is_some(),
+                ),
                 classes: self.classes.clone(),
             };
             // Decided from the file as it is now: a reviewer may have got to the frame since
@@ -1053,10 +1093,16 @@ impl AutolabelJob {
             frames,
             skipped_done: skipped,
             skipped_trained,
+            taken_unreviewed,
+            seen,
             ..
         } = selection;
         rep.skipped_done = skipped;
         rep.skipped_trained = skipped_trained;
+        if r.missing_only {
+            rep.taken_unreviewed = taken_unreviewed;
+            rep.taken_reviewed = frames.len() - taken_unreviewed;
+        }
         if frames.is_empty() && r.missing_only {
             bail!(
                 "no frame to check for missing labels in {}: {skipped_trained} reviewed frame(s) \
@@ -1104,6 +1150,7 @@ impl AutolabelJob {
                 plan,
                 &frames,
                 &labeler,
+                seen.as_ref(),
                 ctx,
                 report,
                 cancel,
@@ -1435,13 +1482,15 @@ impl AutolabelJob {
                 String::new()
             };
             s.push_str(&format!(
-                "{} frames checked for missing labels by {} on {}: {} detections, {} candidate \
-                 boxes ({} replace automatic rejects), {} frames reopened; {} detections matched \
-                 existing boxes, {} of them boxes you rejected; {} frames left out because the \
-                 model trained on them",
+                "{} frames checked for missing labels by {} on {} ({} reviewed or sent back, {} \
+                 unreviewed): {} detections, {} candidate boxes ({} replace automatic rejects), {} \
+                 frames reopened; {} detections matched existing boxes, {} of them boxes you \
+                 rejected; {} frames left out because the model trained on them",
                 rep.frames,
                 self.model.as_ref().map_or("?", |m| m.name.as_str()),
                 rep.device.as_deref().unwrap_or("?"),
+                rep.taken_reviewed,
+                rep.taken_unreviewed,
                 rep.proposals,
                 rep.candidates,
                 rep.overwritten,
@@ -1568,6 +1617,7 @@ impl AutolabelJob {
         plan: &ModelPlan,
         frames: &[Selected],
         labeler: &str,
+        seen: Option<&super::Seen>,
         ctx: TaskContext<'_>,
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
@@ -1719,7 +1769,11 @@ impl AutolabelJob {
                             queue: gained,
                         };
                     }
-                    if !(r.missing_unreviewed && triage::unreviewed_scope(Some(file))) {
+                    // Checked again here, not only at selection: a reviewed frame the model
+                    // validated on, reopened while it ran, must not take the unreviewed path.
+                    let saw =
+                        seen.is_some_and(|s| s.train.contains(&f.rel) || s.valid.contains(&f.rel));
+                    if saw || !(r.missing_unreviewed && triage::unreviewed_scope(Some(file))) {
                         return FrameWrite::default();
                     }
                     let t = triage::apply_relabel_at(

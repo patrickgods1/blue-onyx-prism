@@ -5,11 +5,15 @@
 //! - **The enhanced view** ([`AutolabelRequest::night_enhance`], default [`DEFAULT_NIGHT_ENHANCE`]):
 //!   every labeler also runs on a copy enhanced by a [`Preprocess`] mode; the script's
 //!   `enhance_array` is the byte-for-byte twin of [`crate::model::enhance::apply`] (the parity test
-//!   below). Its boxes join the original's per labeler (NMS, the higher score kept), the geometry is
-//!   the same, so boxes map 1:1; the VLM and SigLIP 2 crop the original, the stored frame. The copy
-//!   is added, never put in the original's place: `docs/NIGHT_IR.md` measured CLAHE and gamma on
-//!   every frame lowering the service models' person recall by 3 to 13 points on ExDark, so the
-//!   union keeps every box the original gives and only adds those the copy gives.
+//!   below). Its boxes join the original's per labeler (one object of one kind found on both is one
+//!   box, the higher score kept), the geometry is the same, so boxes map 1:1; the VLM and SigLIP 2
+//!   crop the original, the stored frame. The copy is added, never put in the original's place:
+//!   `docs/NIGHT_IR.md` measured CLAHE and gamma on every frame lowering the service models' person
+//!   recall by 3 to 13 points on ExDark, so the union keeps every box the original gives and only
+//!   adds those the copy gives. Each box records its views; [`super::triage`] never accepts a box
+//!   the copy alone found or whose score came from it, nor hides one for its score, and says so in
+//!   its reasons (`ENHANCED_ONLY_WHY`, `ENHANCED_RAISED_WHY`), so the verdicts on them can be
+//!   counted. A request stored without the option reads as [`DEFAULT_NIGHT_ENHANCE`], as a new one.
 //! - **MegaDetector v6** ([`AutolabelRequest::mdv6`], opt-in): `MDV6-yolov9-c.pt` ([`MDV6_MODEL`],
 //!   the catalog's export pin, AGPL-3.0, 52 MB) through the training environment's Ultralytics,
 //!   at [`MDV6_THRESHOLD`]. Its `animal` boxes are named by SigLIP 2 over the run's animal classes:
@@ -20,8 +24,11 @@
 //!   were tuned on MM-Grounding-DINO + RF-DETR, and a bulk accept reaches the exports), never hides
 //!   one for its score, and never accepts one at a parked spot.
 //!
-//! The frames' marker ([`frame_labeler`]) names both on night and IR frames only, so a run with
-//! them labels night frames an earlier run without them looked at, and leaves its day frames alone.
+//! The frames' marker names both on night and IR frames only: a run expects [`frame_labeler`] and
+//! writes [`done_labeler`], what the script reports it did on the frame (an enhancement that failed
+//! there leaves `night-<mode>` out, so the next run labels the frame again). A marker with more
+//! extras than a run asks for covers it ([`marker_covers`]): after a MegaDetector run, a run without
+//! it skips the frame.
 
 use super::AutolabelRequest;
 use crate::model::enhance::Preprocess;
@@ -74,6 +81,51 @@ pub fn frame_labeler(base: &str, r: &AutolabelRequest, scene: &str) -> String {
     s
 }
 
+/// The marker a labelers run of `r` writes on a frame of `scene` whose labelers are `base`, from what
+/// the script reports for it: `enhanced` (None: a line of a script older than the option, which
+/// falls back to the request, [`frame_labeler`]) and whether MegaDetector ran (`mdv6_ran`).
+pub fn done_labeler(
+    base: &str,
+    r: &AutolabelRequest,
+    scene: &str,
+    enhanced: Option<bool>,
+    mdv6_ran: bool,
+) -> String {
+    let Some(enhanced) = enhanced else {
+        return frame_labeler(base, r, scene);
+    };
+    if !is_night(scene) || r.with_model.is_some() {
+        return base.to_string();
+    }
+    let mut s = base.to_string();
+    if mdv6_ran {
+        s.push_str(" + ");
+        s.push_str(MDV6_MODEL);
+    }
+    if enhanced && let Some(p) = enhancement(r) {
+        s.push_str(&format!(" + night-{p}"));
+    }
+    s
+}
+
+/// A marker part that is a night extra, not a labeler.
+fn is_extra(part: &str) -> bool {
+    part == MDV6_MODEL || part.starts_with("night-")
+}
+
+/// Whether a frame whose marker says `found` needs no run that would write `wanted`: the same
+/// labelers in the same order, and every night extra of `wanted` in `found` (more is fine).
+pub fn marker_covers(found: &str, wanted: &str) -> bool {
+    let split = |m: &str| -> (Vec<String>, Vec<String>) {
+        m.split(" + ")
+            .map(str::to_string)
+            .partition(|p| !is_extra(p))
+    };
+    let (found_base, found_extra) = split(found);
+    let (wanted_base, wanted_extra) = split(wanted);
+    found_base == wanted_base && wanted_extra.iter().all(|e| found_extra.contains(e))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -118,6 +170,45 @@ mod tests {
             frame_labeler("model:yolo@auto", &m, "ir"),
             "model:yolo@auto"
         );
+    }
+
+    #[test]
+    fn the_written_marker_follows_what_the_script_did() {
+        let mut r = AutolabelRequest::new(super::super::FrameFilter::default());
+        r.mdv6 = true;
+        let base = "mm-gdino-tiny + rfdetr-large";
+        let all = "mm-gdino-tiny + rfdetr-large + mdv6-yolov9-c + night-clahe";
+        assert_eq!(done_labeler(base, &r, "ir", Some(true), true), all);
+        // The enhancement failed on this frame, MegaDetector was not loaded: neither is named.
+        assert_eq!(
+            done_labeler(base, &r, "ir", Some(false), true),
+            "mm-gdino-tiny + rfdetr-large + mdv6-yolov9-c"
+        );
+        assert_eq!(done_labeler(base, &r, "night", Some(false), false), base);
+        // A day frame never names them; an older script's line falls back to the request.
+        assert_eq!(done_labeler(base, &r, "day", Some(true), true), base);
+        assert_eq!(done_labeler(base, &r, "ir", None, false), all);
+    }
+
+    #[test]
+    fn a_marker_with_more_extras_covers_a_run_with_fewer() {
+        let base = "mm-gdino-tiny + rfdetr-large";
+        let enh = "mm-gdino-tiny + rfdetr-large + night-clahe";
+        let all = "mm-gdino-tiny + rfdetr-large + mdv6-yolov9-c + night-clahe";
+        assert!(marker_covers(all, enh) && marker_covers(all, base) && marker_covers(enh, enh));
+        assert!(!marker_covers(enh, all), "MegaDetector never ran there");
+        assert!(!marker_covers(base, enh), "the copy was never looked at");
+        assert!(!marker_covers(
+            "mm-gdino-tiny + rfdetr-large + night-gamma:0.6",
+            enh
+        ));
+        assert!(!marker_covers("mm-gdino-base + rfdetr-large", base));
+        assert!(!marker_covers(
+            base,
+            "mm-gdino-tiny + rfdetr-large + qwen3-vl-2b"
+        ));
+        assert!(marker_covers("model:yolo@auto", "model:yolo@auto"));
+        assert!(!marker_covers("model:yolo@auto", "model:yolo@openvino:cpu"));
     }
 
     #[test]

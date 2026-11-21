@@ -2053,8 +2053,10 @@ proposed. A labelers run gives frames whose scene is `night` or `ir` two extras
 **Enhanced copy** (on by default; Advanced: *Night and IR frames: also look at an enhanced copy*; CLI
 `--night-enhance <mode>`, `none` turns it off): every labeler (MM-Grounding-DINO or SAM 3, RF-DETR L,
 MegaDetector) also runs on a copy of the frame enhanced by CLAHE (clip 2, 8 x 8 tiles; any
-`preprocess` mode of [docs/NIGHT_IR.md](NIGHT_IR.md) works). The boxes of both copies are kept per labeler
-(class-aware NMS at IoU 0.6, the higher score wins), then fused as usual. The copy has the frame's size, so
+`preprocess` mode of [docs/NIGHT_IR.md](NIGHT_IR.md) works). The boxes of both copies are kept per labeler,
+then fused as usual: a box of the copy that is the same object as one of the original's (the same label,
+or two animal classes, or two vehicle classes, at IoU 0.5 or more or with 80% of the smaller box inside
+the other) is that box, the higher score wins; a person on a bicycle stays two. The copy has the frame's size, so
 its boxes are boxes of the frame; the VLM and SigLIP 2 crop the original, and the frame and label file
 keep the original. The copy is *added*, never put in the original's place: CLAHE and gamma on every frame
 lowered the service models' person recall by 3 to 13 points on ExDark (NIGHT_IR.md), so the union keeps
@@ -2062,8 +2064,19 @@ what the original finds and adds what the copy finds. The open-vocabulary labele
 time on those frames (Preview counts it). The script's `enhance_array` is the byte-for-byte twin of
 `model::enhance::apply` (a Rust test feeds both the same synthetic frames: colour and monochrome, black
 pixels, frames smaller than the tile grid). Whether the copy finds more real objects than false ones on
-your cameras has not been measured: the report's `enhanced_boxes` (per labeler, boxes only the copy
-found) and your verdicts on them are the measurement.
+your cameras has not been measured, so every box says where it came from: the script's line gives each box
+`views` (`original`, `enhanced`) and `enhanced_raised` (its score came from the copy), and a box the copy
+alone found, or whose score came from it:
+
+- is **never triaged `accept`** and never hidden for its score (the thresholds were measured on original
+  frames), nor accepted at a parked spot;
+- carries the reason *found on the enhanced night copy only: always reviewed* or *its score came from the
+  enhanced night copy: always reviewed* (`triage::ENHANCED_ONLY_WHY`, `ENHANCED_RAISED_WHY`), which a review
+  keeps, so your accepts and rejects of those boxes can be counted later.
+
+The report's `enhanced_boxes` gives, per labeler, the boxes only the copy found. A request stored without
+the option (a queued job, an import's chained run) reads as on, CLAHE, like a new one; an explicit off
+stays off.
 
 **MegaDetector v6** (opt-in; Advanced: *MegaDetector v6 on night and IR frames*; CLI `--mdv6
 [--mdv6-threshold 0.2]`): Microsoft's camera-trap detector (`MDV6-yolov9-c.pt`, YOLOv9 compact, trained on
@@ -2077,7 +2090,7 @@ names its animals.
 |---|---|
 | `animal`, SigLIP 2's top species of the run's animal classes at 0.5 or more | a box of that species |
 | `animal`, top species below 0.5 | a box of that best guess, reason *animal? MegaDetector found an animal; SigLIP's best guess is raccoon (0.32)*, with the scores |
-| `animal`, the run has one animal class | that class, as *animal?* |
+| `animal`, the run has one animal class | that class, as *animal? ... dog is this run's only animal class, nothing ranked the species* |
 | `person` | the run's person class (none: left out) |
 | `vehicle` | a vote only, unless the run has a `vehicle` class |
 
@@ -2092,8 +2105,17 @@ MegaDetector's own score and `labelers: {"mdv6": s}`. Such a box (only MegaDetec
   hides it like any box;
 - is never accepted at a parked spot.
 
-The frames' marker names the extras on night and IR frames only (`... + mdv6-yolov9-c + night-clahe`), so a
-run with them labels the night frames an earlier run without them looked at, and skips its day frames. The
+A vote of MegaDetector on another labeler's box keeps that box from being hidden for its score too (a
+raccoon MM-Grounding-DINO found at 0.1 that MegaDetector saw stays visible), and never moves it toward
+`accept`: `agree` is about MM-Grounding-DINO and RF-DETR alone.
+
+The frames' marker names the extras on night and IR frames only (`... + mdv6-yolov9-c + night-clahe`), as the
+script reports it ran them on that frame: a frame whose enhanced copy failed gets no `night-clahe`, so the
+next run labels it again. A marker with more extras than a run asks for covers it (after a MegaDetector
+run, a run without MegaDetector skips those frames); a run with an extra the marker lacks, or another
+enhancement mode, labels the night frames again, and skips its day frames. Preview counts MegaDetector's
+time (an estimate, 0.05 s per view, not measured) and, with the VLM on, one box of its own per night frame
+for the VLM (1 s). The
 summary and report give `night_enhance`, `mdv6`, `frames_enhanced`, `enhanced_boxes`, `mdv6_votes`,
 `mdv6_added`, `mdv6_guesses`. A run with a model uses neither extra.
 
@@ -2272,8 +2294,14 @@ confirmed empty or sent back (`triage::unreviewed_scope`), leaving out the frame
 model is one more labeler, as in a first-pass run with a model (`triage::apply_relabel_at`): its boxes join
 as pending `source: auto` boxes with `labelers: {"<model>": score}`, triaged `review`; a box it finds again
 gets its vote, so agreement and the Review queue's "missed by the camera model" cue can use it. Nothing
-reopens and no marker is written there either, so a labelers run's marker stays. The report adds
-`unreviewed_frames` and `unreviewed_added`.
+reopens and no marker is written there either, so a labelers run's marker stays. The reviewed and
+sent-back frames come first and keep the limit to themselves, exactly as before; the unreviewed frames come
+after them, up to 2,000 (`autolabel::MISSING_UNREVIEWED_LIMIT`; CLI `--missing-unreviewed-limit N`), so
+a large folder never pushes reviewed frames out. A rerun takes the same unreviewed frames first (nothing
+marks them), so raise the cap rather than rerunning to reach more. The write checks the model's frames
+again: a frame it trained or validated on that a reviewer reopened while the model ran never takes the
+unreviewed path. The summary says how many of each kind it took; the report adds `taken_reviewed`,
+`taken_unreviewed`, `unreviewed_frames` and `unreviewed_added`.
 
 *Accept this spot on all frames* takes the proposals like any pending box (parked cars), `d` marks an
 unclear one. For a labelers run, see [Spot memory](#spot-memory-of-fixed-cameras).
@@ -3164,13 +3192,17 @@ finished model nobody decided about, nothing collected yet, then:
    missing one starts a walk on its own thread (one per folder and class list, at most one started a
    minute, never two walks at once), so the step appears on a later poll.
 2. **Auto-label where the camera's model is blind** (`autolabel_gap`, only when this machine can run the
-   labelers): 200 or more frames to review that no auto-label run has seen are night or IR
+   labelers): 200 or more frames to review that the labelers never looked at are night or IR
    (`ENOUGH_NIGHT_TO_AUTOLABEL`, one default run's worth), e.g. *240 night and IR frames have no proposed
-   boxes yet (40 night, 200 IR) ...*, linking `/train/autolabel?scene=ir&auto=none` (the scene with more
-   of them, so the run takes those first, where [the enhanced copy and MegaDetector](#night-and-ir-frames)
-   apply); else 200 or more such frames arrived since the last auto-label run that finished
-   (`ENOUGH_NEW_TO_AUTOLABEL`; the frame's file time after that run's start; every such frame when none
-   has run), linking `/train/autolabel?auto=none`. It comes before the export rules: only a labeler's box
+   boxes yet (40 night, 200 IR) ...*, linking `/train/autolabel?scene=ir` (the scene with more of them, so
+   the run takes those first, where [the enhanced copy and MegaDetector](#night-and-ir-frames) apply); else
+   200 or more such frames arrived since the last auto-label run that finished (`ENOUGH_NEW_TO_AUTOLABEL`;
+   the time in the frame's name after that run's start, so imported footage counts at its capture time;
+   every such frame when none has run), linking `/train/autolabel`. Only the labelers' `auto_run` marker
+   counts as looked at: a run with a model (its `model:` marker, its votes) does not, since the labelers
+   are what finds what the camera's model missed. The queue's `auto=none` counts any marker or auto
+   evidence as labelled, so the links leave it out and let the run's own marker check skip the frames the
+   labelers looked at. It comes before the export rules: only a labeler's box
    brings a frame the camera's model missed up in the Review queue. The counts come from the same
    background walk as the strip's other counts (`train_area::auto_gap`, after `queue::tally`, kept with it),
    never from the request. The link only fills the Auto-label tab; a run still starts only when you press it.
