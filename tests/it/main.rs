@@ -20,6 +20,7 @@ mod formats_020;
 mod integration_http;
 mod js_charts;
 mod js_poll;
+mod js_review_need;
 mod js_review_refine;
 mod js_review_touch;
 mod js_rules;

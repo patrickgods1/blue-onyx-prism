@@ -22,6 +22,7 @@ pub mod bulk;
 pub mod export;
 pub mod heldout;
 pub mod index;
+pub mod need;
 pub mod overlaps;
 pub mod queue;
 pub mod recall;

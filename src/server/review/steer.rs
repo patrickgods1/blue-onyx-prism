@@ -1,30 +1,382 @@
-//! What steers the Review queue from outside the review folder: the measured recall of the newest
-//! trained models ([`recall`], a [`Measured`] from `runs.json` through
-//! [`crate::training::bench::measured_recall`]).
+//! What steers the Review queue's Recommended order from outside its rows ([`snapshot`], one
+//! [`Steer`] per `GET /v1/review/next`, handed to the review index and the walk alike): the
+//! measured recall of the newest trained models ([`recall`]) and the folder's parked spots
+//! ([`spots`]). Nothing here runs a walk on the request path, and nothing here writes a file.
 //!
-//! Cache. One entry, keyed on `runs.json`'s (path, modification time, length): a request costs
-//! one `stat` while nothing changed, and the table is rebuilt only after the training queue saved
-//! a run (it rewrites the whole file). Records are read through
-//! [`crate::server::training::records`] (the started queue's, else the file without starting
-//! the queue). A missing `runs.json`, or one without measured runs (a damaged file reads as no
-//! runs), is None, logged once per change of the key; never an error to the request. A rewrite
-//! of the same length within the file system's time resolution is seen at the next change.
+//! Recall. A [`Measured`] from `runs.json` through [`crate::training::bench::measured_recall`],
+//! one cached entry keyed on `runs.json`'s (path, modification time, length): a request costs one
+//! `stat` while nothing changed, and the table is rebuilt only after the training queue saved a run
+//! (it rewrites the whole file). Records come from the started queue, else from the file through
+//! the pure [`crate::training::task::read_records`] ([`super::super::training::records_read_only`]):
+//! a damaged `runs.json` is no measured run here, and is never renamed, moved aside or written (the
+//! queue deals with it when it starts). A missing file, or one without measured runs, is None,
+//! logged once per change of the key; never an error to the request.
+//!
+//! Spots. The static spots of the folder's reviewed frames ([`SpotCache`]), by the export's rules
+//! ([`crate::collect::labels::need::spot_obs`]: no reviewed frame with a pending box or a label off
+//! the class list): from the review index's reviewed rows when the folder has a built index
+//! ([`crate::collect::labels::index::reviewed_obs`], no label file read), rebuilt when those rows
+//! changed and the last build is [`SPOTS_INDEXED_EVERY`] old; neutral (empty) while a folder that
+//! takes an index has none built yet; else walked ([`crate::collect::labels::queue::reviewed_obs`],
+//! a small folder) at most every [`SPOTS_EVERY`]. Both make the observations through the one
+//! function, at the same whole-pixel geometry, so a spot near [`statics::SPOT_IOU`] is the same
+//! either way. A rebuild that finds the same table serves the old `Arc` on, so the index's
+//! per-shard need cache keeps its parts. A request serves the last table built for the folder and
+//! class list, empty (so neutral: no box counts as parked) until the first is in; so the order may
+//! shift a little when a new table lands. Builds run on one background thread at a time; one asked
+//! for while another runs is remembered (the latest) and run after it; a build that panics keeps
+//! the old table and waits its interval before the next try (a guard). In tests the build runs on
+//! the request's thread at every ask that is due, the intervals zero, so an answer never depends
+//! on a thread's timing; the decision ([`refresh_due`]) and the builder ([`build`]) are the
+//! service's.
 
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the Review queue's need model reads it (next change)"
-    )
-)]
-
+use crate::collect::labels::need::Steer;
 use crate::collect::labels::recall::Measured;
+use crate::collect::labels::statics;
 use crate::server::AppState;
 use crate::sync::LockExt;
 use crate::training::service::RunRecord;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
+
+/// Least time between two builds of a folder's spot table without an index.
+pub const SPOTS_EVERY: Duration = Duration::from_secs(10 * 60);
+/// Least time between two builds from the index's rows, while they change.
+pub const SPOTS_INDEXED_EVERY: Duration = Duration::from_secs(60);
+
+/// What steers the Recommended order of the folder under review `dir` for the class list
+/// (`classes`, `hidden`) now: one snapshot for the whole request.
+pub(super) fn snapshot(
+    state: &AppState,
+    dir: &Path,
+    classes: &[String],
+    hidden: &[String],
+) -> Arc<Steer> {
+    Arc::new(Steer {
+        recall: recall(state),
+        spots: spots(dir, classes, hidden),
+        heldout_listed: Arc::default(),
+    })
+}
+
+/// A spot table to build: for which folder and class list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Job {
+    /// The folder and class list.
+    pub key: String,
+    /// The index rows' stamp when asked (None: no built index).
+    pub stamp: Option<u64>,
+    pub dir: PathBuf,
+    pub classes: Vec<String>,
+    pub hidden: Vec<String>,
+}
+
+/// The table last built for one key.
+#[derive(Debug)]
+struct SpotSlot {
+    /// The stamp of the rows it was built from (None: walked, or neutral).
+    stamp: Option<u64>,
+    /// When it was built (or a build of it last failed).
+    at: Instant,
+    table: Arc<statics::Table>,
+}
+
+/// Keys kept at once (folders and class lists): one is in use, the others are switches back.
+const SLOTS: usize = 4;
+
+#[derive(Debug, Default)]
+struct Slots {
+    slots: HashMap<String, SpotSlot>,
+    building: bool,
+    /// The latest build asked for while one ran.
+    queued: Option<Job>,
+}
+
+impl Slots {
+    /// Keep `table` for `key`, built from rows of `stamp`: the old `Arc` when it is the same
+    /// table. At most [`SLOTS`] keys, the oldest let go.
+    fn store(&mut self, key: &str, stamp: Option<u64>, table: statics::Table) {
+        let table = match self.slots.get(key) {
+            Some(old) if *old.table == table => old.table.clone(),
+            _ => Arc::new(table),
+        };
+        self.slots.insert(
+            key.to_string(),
+            SpotSlot {
+                stamp,
+                at: Instant::now(),
+                table,
+            },
+        );
+        while self.slots.len() > SLOTS {
+            let Some(oldest) = self
+                .slots
+                .iter()
+                .min_by_key(|(_, s)| s.at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.slots.remove(&oldest);
+        }
+    }
+
+    /// The table of `job`'s key now (empty when none), and whether a build of it is due.
+    fn ask(&self, job: &Job, every: Duration) -> (Arc<statics::Table>, bool) {
+        let slot = self.slots.get(&job.key);
+        let table = slot.map(|s| s.table.clone()).unwrap_or_default();
+        let due = refresh_due(slot.map(|s| (s.stamp, s.at.elapsed())), job.stamp, every);
+        (table, due)
+    }
+}
+
+/// Whether the table of a key is to be built again: `built` = the stamp it was built from and its
+/// age (None: never built), `stamp` = the rows' stamp now (None: no built index). Never built:
+/// yes. Younger than `every`: no. Else, with no stamp (a walked folder) yes, and with one, yes when
+/// the rows changed since.
+pub(super) fn refresh_due(
+    built: Option<(Option<u64>, Duration)>,
+    stamp: Option<u64>,
+    every: Duration,
+) -> bool {
+    match built {
+        None => true,
+        Some((_, age)) if age < every => false,
+        Some((was, _)) => stamp.is_none() || was != stamp,
+    }
+}
+
+/// The spot tables of the process (see the module docs): one build at a time, the latest asked
+/// for run next, a panicking build waiting its interval.
+#[derive(Debug)]
+pub(super) struct SpotCache {
+    slots: Mutex<Option<Slots>>,
+}
+
+/// On a build that did not finish (a panic): no longer building, and the key's last try is now,
+/// its old table and stamp kept, so the next try waits `every`.
+struct Building<'a> {
+    cache: &'a SpotCache,
+    key: String,
+    done: bool,
+}
+
+impl Drop for Building<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut guard = self.cache.slots.lock_recover();
+        let s = guard.get_or_insert_with(Slots::default);
+        s.building = false;
+        s.queued = None;
+        match s.slots.get_mut(&self.key) {
+            Some(slot) => slot.at = Instant::now(),
+            None => {
+                s.slots.insert(
+                    self.key.clone(),
+                    SpotSlot {
+                        stamp: None,
+                        at: Instant::now(),
+                        table: Arc::default(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// What builds a table: the stamp of the rows it came from and the table.
+pub(super) type Builder<'a> = &'a dyn Fn(&Job) -> (Option<u64>, statics::Table);
+
+impl SpotCache {
+    pub(super) const fn new() -> Self {
+        Self {
+            slots: Mutex::new(None),
+        }
+    }
+
+    /// The table to serve for `job` now, and the job to build (the caller runs it with
+    /// [`Self::run`] on a thread) when one is due ([`refresh_due`]). While a build runs, `job` is
+    /// remembered for after it.
+    pub(super) fn get(&self, job: Job, every: Duration) -> (Arc<statics::Table>, Option<Job>) {
+        let mut guard = self.slots.lock_recover();
+        let s = guard.get_or_insert_with(Slots::default);
+        let (table, due) = s.ask(&job, every);
+        if !due {
+            return (table, None);
+        }
+        if s.building {
+            s.queued = Some(job);
+            return (table, None);
+        }
+        s.building = true;
+        (table, Some(job))
+    }
+
+    /// Build `job` with `build`, then the latest job asked for meanwhile, until none is left.
+    pub(super) fn run(&self, mut job: Job, build: Builder<'_>) {
+        loop {
+            let mut guard = Building {
+                cache: self,
+                key: job.key.clone(),
+                done: false,
+            };
+            let (stamp, table) = build(&job);
+            let next = {
+                let mut g = self.slots.lock_recover();
+                let s = g.get_or_insert_with(Slots::default);
+                s.store(&job.key, stamp, table);
+                let next = s.queued.take().filter(|q| *q != job);
+                if next.is_none() {
+                    s.building = false;
+                }
+                next
+            };
+            guard.done = true;
+            drop(guard);
+            match next {
+                Some(n) => job = n,
+                None => return,
+            }
+        }
+    }
+
+    /// [`Self::get`] and, when due, the build on this thread (tests: no other build is waited
+    /// for), then the key's table.
+    #[cfg(test)]
+    pub(super) fn get_now(
+        &self,
+        job: Job,
+        every: Duration,
+        build: Builder<'_>,
+    ) -> Arc<statics::Table> {
+        let due = {
+            let mut guard = self.slots.lock_recover();
+            guard.get_or_insert_with(Slots::default).ask(&job, every).1
+        };
+        if due {
+            let (stamp, table) = build(&job);
+            self.slots
+                .lock_recover()
+                .get_or_insert_with(Slots::default)
+                .store(&job.key, stamp, table);
+        }
+        self.table_of(&job.key).unwrap_or_default()
+    }
+
+    /// The table last built for `key`, if any.
+    #[cfg(test)]
+    fn table_of(&self, key: &str) -> Option<Arc<statics::Table>> {
+        self.slots
+            .lock_recover()
+            .as_ref()
+            .and_then(|s| s.slots.get(key))
+            .map(|s| s.table.clone())
+    }
+}
+
+/// The spot table of `job` and the stamp of the rows it came from (see the module docs): the
+/// index's rows when it is built, neutral while a folder that takes an index has none yet, else a
+/// walk.
+pub(super) fn build(job: &Job) -> (Option<u64>, statics::Table) {
+    use crate::collect::labels::{index, queue};
+    let wanted = (job.classes.clone(), job.hidden.clone());
+    if let Some((stamp, obs)) = index::reviewed_obs(&job.dir, Some(&wanted)) {
+        return (Some(stamp), statics::Table::build(obs));
+    }
+    if index::building(&job.dir, Some(&wanted)) {
+        return (None, statics::Table::default());
+    }
+    let all = queue::candidates(&job.dir, queue::QueueSource::All);
+    if index::takes_index(all.len()) {
+        // Its index comes with the first Next: a walk of a big folder is not this table's.
+        return (None, statics::Table::default());
+    }
+    let w = crate::collect::labels::bulk::Wanted {
+        classes: &job.classes,
+        hidden: &job.hidden,
+    };
+    (
+        None,
+        statics::Table::build(queue::reviewed_obs(&job.dir, all, &w)),
+    )
+}
+
+static SPOTS: SpotCache = SpotCache::new();
+
+/// The job of `dir` and the class list now.
+fn job_of(dir: &Path, classes: &[String], hidden: &[String]) -> Job {
+    let wanted = (classes.to_vec(), hidden.to_vec());
+    let stamp = crate::collect::labels::index::rows_version(dir, Some(&wanted));
+    Job {
+        key: format!(
+            "{}\u{1f}{}\u{1f}{}",
+            dir.display(),
+            classes.join("\u{1e}"),
+            hidden.join("\u{1e}")
+        ),
+        stamp,
+        dir: dir.to_path_buf(),
+        classes: wanted.0,
+        hidden: wanted.1,
+    }
+}
+
+/// The interval of `job` (see the module docs; zero in tests).
+fn every_of(job: &Job) -> Duration {
+    if cfg!(test) {
+        Duration::ZERO
+    } else if job.stamp.is_some() {
+        SPOTS_INDEXED_EVERY
+    } else {
+        SPOTS_EVERY
+    }
+}
+
+/// The parked spots of `dir`'s reviewed frames for the class list, built on the request's thread
+/// in tests (see the module docs).
+#[cfg(test)]
+pub(super) fn spots(dir: &Path, classes: &[String], hidden: &[String]) -> Arc<statics::Table> {
+    let job = job_of(dir, classes, hidden);
+    let every = every_of(&job);
+    SPOTS.get_now(job, every, &build)
+}
+
+/// The parked spots of `dir`'s reviewed frames for the class list (see the module docs).
+#[cfg(not(test))]
+pub(super) fn spots(dir: &Path, classes: &[String], hidden: &[String]) -> Arc<statics::Table> {
+    let job = job_of(dir, classes, hidden);
+    let every = every_of(&job);
+    let (table, due) = SPOTS.get(job, every);
+    if let Some(job) = due {
+        let key = job.key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("review-spots".into())
+            .spawn(move || {
+                // A walk for the page: never ahead of detections for the CPU.
+                crate::backend::priority::lower_this_thread(
+                    crate::backend::priority::ThreadRole::Background,
+                );
+                SPOTS.run(job, &build);
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "review queue: no thread to find the parked spots ({e}), so the order counts \
+                 every box as unparked for now; it tries again on the next Next"
+            );
+            // As a build that failed: not building, the next try after the interval.
+            drop(Building {
+                cache: &SPOTS,
+                key,
+                done: false,
+            });
+        }
+    }
+    table
+}
 
 /// What the cached table was built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +398,9 @@ static CACHE: Mutex<Option<Entry>> = Mutex::new(None);
 /// The measured recall of the training runs of the current config (see the module docs).
 pub fn recall(state: &AppState) -> Option<Arc<Measured>> {
     let path = crate::training::runs_file(&state.config_read());
-    cached(&CACHE, &path, || super::super::training::records(state))
+    cached(&CACHE, &path, || {
+        super::super::training::records_read_only(state)
+    })
 }
 
 /// The key of `path` now; None when it cannot be read (missing).
@@ -256,5 +610,257 @@ mod tests {
     fn the_state_without_runs_is_none() {
         let state = crate::server::test_util::test_state();
         assert!(recall(&state).is_none());
+    }
+
+    /// The snapshot of a folder without reviewed frames steers by nothing: no recall, no spot.
+    #[test]
+    fn a_snapshot_of_a_new_folder_is_neutral() {
+        let state = crate::server::test_util::test_state();
+        let dir = temp("snapshot");
+        let s = snapshot(&state, &dir, &["car".to_string()], &[]);
+        assert!(s.recall.is_none());
+        assert!(s.spots.is_empty());
+        assert!(s.heldout_listed.is_empty());
+        assert_eq!(SPOTS_EVERY, std::time::Duration::from_secs(600));
+        assert_eq!(SPOTS_INDEXED_EVERY, std::time::Duration::from_secs(60));
+        // Without an index the builder walks (nothing here), with no stamp.
+        let (stamp, t) = build(&job_for(&dir, "k", None));
+        assert!(stamp.is_none() && t.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn job_for(dir: &Path, key: &str, stamp: Option<u64>) -> Job {
+        Job {
+            key: key.into(),
+            stamp,
+            dir: dir.to_path_buf(),
+            classes: vec!["car".into()],
+            hidden: Vec::new(),
+        }
+    }
+
+    /// A table of `n` made-up spots of camera `cam` (each a car parked on two days).
+    fn table(cam: &str, n: usize) -> statics::Table {
+        let obs = (0..n).flat_map(|s| {
+            (0..12).map(move |i| statics::Obs {
+                camera: cam.into(),
+                frame: format!("{s}-{i}"),
+                day: if i < 6 { "d1" } else { "d2" }.into(),
+                scene: "day".into(),
+                label: "car".into(),
+                bbox: [0.2 * s as f32, 0.0, 0.2 * s as f32 + 0.1, 0.1],
+            })
+        });
+        statics::Table::build(obs)
+    }
+
+    #[test]
+    fn a_table_is_rebuilt_after_its_interval_or_when_its_rows_changed() {
+        let (min, hour) = (Duration::from_secs(60), Duration::from_secs(3600));
+        // Never built: due, whatever the stamp.
+        assert!(refresh_due(None, None, hour));
+        assert!(refresh_due(None, Some(3), hour));
+        // Within the interval: never.
+        assert!(!refresh_due(Some((None, min)), None, hour));
+        assert!(!refresh_due(Some((Some(1), min)), Some(2), hour));
+        // No index (a walked folder): after the interval, always (its files may have changed).
+        assert!(refresh_due(Some((None, hour)), None, min));
+        assert!(refresh_due(Some((None, min)), None, min));
+        // With an index: after the interval, only when the rows changed.
+        assert!(!refresh_due(Some((Some(1), hour)), Some(1), min));
+        assert!(refresh_due(Some((Some(1), hour)), Some(2), min));
+        // An index built since a walk (or the other way): a change.
+        assert!(refresh_due(Some((None, hour)), Some(1), min));
+        assert!(refresh_due(Some((Some(1), hour)), None, min));
+    }
+
+    #[test]
+    fn the_spot_cache_builds_once_serves_the_last_and_keeps_an_unchanged_table() {
+        let cache = SpotCache::new();
+        let dir = PathBuf::from("/nowhere");
+        let every = Duration::from_secs(3600);
+        // Nothing built: empty, and a build is due.
+        let (t, due) = cache.get(job_for(&dir, "a", Some(1)), every);
+        assert!(t.is_empty());
+        let due = due.unwrap();
+        // While it runs, a second ask for another folder waits; one for the same is no build.
+        assert!(cache.get(job_for(&dir, "b", Some(7)), every).1.is_none());
+        assert!(cache.get(job_for(&dir, "a", Some(1)), every).1.is_none());
+        // The build of `a`, then the latest asked for (`a` again, which is no new work).
+        let built = std::cell::Cell::new(0);
+        cache.run(due, &|j| {
+            built.set(built.get() + 1);
+            (j.stamp, table("cam", if j.key == "a" { 1 } else { 2 }))
+        });
+        assert_eq!(built.get(), 1, "the queued job was the one just built");
+        let first = cache.table_of("a").unwrap();
+        assert_eq!(first.len(), 1);
+        // The same key: served, nothing due while the rows did not change, nor within `every`.
+        let (t, due) = cache.get(job_for(&dir, "a", Some(1)), every);
+        assert!(Arc::ptr_eq(&t, &first) && due.is_none());
+        assert!(cache.get(job_for(&dir, "a", Some(2)), every).1.is_none());
+        // Past `every` the changed rows rebuild, the old table serving meanwhile; the same table
+        // again keeps its `Arc` (the index's need cache keys on it).
+        let (t, due) = cache.get(job_for(&dir, "a", Some(2)), Duration::ZERO);
+        assert!(Arc::ptr_eq(&t, &first));
+        // Another key while that build runs: queued, built right after.
+        assert!(cache.get(job_for(&dir, "b", Some(9)), every).1.is_none());
+        let seen = std::cell::RefCell::new(Vec::new());
+        cache.run(due.unwrap(), &|j| {
+            seen.borrow_mut().push(j.key.clone());
+            (j.stamp, table("cam", if j.key == "a" { 1 } else { 2 }))
+        });
+        assert_eq!(*seen.borrow(), ["a", "b"]);
+        assert!(Arc::ptr_eq(&cache.table_of("a").unwrap(), &first));
+        let (t, due) = cache.get(job_for(&dir, "b", Some(9)), every);
+        assert_eq!(t.len(), 2);
+        assert!(due.is_none());
+        // A switch back serves the key's own table, nothing due.
+        let (t, due) = cache.get(job_for(&dir, "a", Some(2)), every);
+        assert!(Arc::ptr_eq(&t, &first) && due.is_none());
+        // A table that changed is a new `Arc`.
+        let (_, due) = cache.get(job_for(&dir, "a", Some(3)), Duration::ZERO);
+        cache.run(due.unwrap(), &|j| (j.stamp, table("cam", 3)));
+        assert_eq!(cache.table_of("a").unwrap().len(), 3);
+        // At most SLOTS keys: the oldest goes.
+        for k in ["c", "d", "e", "f"] {
+            let (_, due) = cache.get(job_for(&dir, k, None), every);
+            cache.run(due.unwrap(), &|_| (None, table("cam", 1)));
+        }
+        assert!(cache.table_of("b").is_none() && cache.table_of("f").is_some());
+    }
+
+    #[test]
+    fn a_panicking_spot_build_waits_its_interval_and_keeps_the_old_table() {
+        let cache = SpotCache::new();
+        let dir = PathBuf::from("/nowhere");
+        let hour = Duration::from_secs(3600);
+        let panics = || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let due = cache.get(job_for(&dir, "a", Some(2)), Duration::ZERO).1;
+                cache.run(due.expect("due"), &|_| panic!("a build that fails"));
+            }))
+            .is_err()
+        };
+        // A first build that panics: no table, and no new try within the interval.
+        assert!(panics());
+        let (t, due) = cache.get(job_for(&dir, "a", Some(2)), hour);
+        assert!(t.is_empty() && due.is_none(), "no respawn on every request");
+        // After it: a try again, which builds.
+        let due = cache.get(job_for(&dir, "a", Some(2)), Duration::ZERO).1;
+        cache.run(due.expect("due again"), &|j| (j.stamp, table("cam", 1)));
+        let good = cache.table_of("a").unwrap();
+        assert_eq!(good.len(), 1);
+        // A later build that panics keeps the table it had, and waits again.
+        assert!(panics());
+        let (t, due) = cache.get(job_for(&dir, "a", Some(5)), hour);
+        assert!(Arc::ptr_eq(&t, &good) && due.is_none());
+        // The stamp kept is the one built, so the changed rows are still due after the interval.
+        assert!(
+            cache
+                .get(job_for(&dir, "a", Some(5)), Duration::ZERO)
+                .1
+                .is_some()
+        );
+    }
+
+    /// A car parked at one place on two days: 12 reviewed frames of camera `lot`, 640x480.
+    fn parked_folder(dir: &Path) -> Vec<String> {
+        use crate::collect::labels::{BoxState, Frame, LabelBox, LabelFile, Source, Status};
+        (0..12u32)
+            .map(|i| {
+                let date = if i < 6 { "2026-10-20" } else { "2026-10-21" };
+                let stem = format!("{}T{:02}0000000Z_p{i}", date.replace('-', ""), 1 + i);
+                let day = dir.join("day").join("lot").join(date);
+                std::fs::create_dir_all(&day).unwrap();
+                image::RgbImage::from_pixel(8, 6, image::Rgb([90, 90, 90]))
+                    .save(day.join(format!("{stem}.jpg")))
+                    .unwrap();
+                let mut r = crate::collect::record::empty_record();
+                r.id = stem.clone();
+                r.scene = "day".into();
+                r.camera = "lot".into();
+                r.timestamp = format!("{date}T{:02}:00:00Z", 1 + i);
+                r.width = 640;
+                r.height = 480;
+                std::fs::write(
+                    day.join(format!("{stem}.json")),
+                    serde_json::to_vec(&r).unwrap(),
+                )
+                .unwrap();
+                let rel = format!("day/lot/{date}/{stem}.jpg");
+                crate::collect::layout::append_review(dir, std::slice::from_ref(&rel)).unwrap();
+                let labels = LabelFile {
+                    status: Status::Reviewed,
+                    reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+                    boxes: vec![LabelBox {
+                        label: "car".into(),
+                        bbox: [64.4, 48.0, 192.0, 144.6],
+                        source: Source::Human,
+                        state: BoxState::Accepted,
+                        ..crate::collect::labels::bulk::test_support::auto_box(
+                            "car",
+                            0.9,
+                            crate::collect::labels::Triage::Review,
+                        )
+                    }],
+                    ..LabelFile::default()
+                };
+                let frame = Frame::resolve(dir, &rel).unwrap();
+                crate::collect::labels::write(&frame.labels, &labels).unwrap();
+                rel
+            })
+            .collect()
+    }
+
+    /// The service's path without its thread: a walked folder's table, then the index's once it
+    /// is built (the same table, so the same `Arc`), rebuilt when its rows change.
+    #[test]
+    fn the_spot_table_follows_the_index_rows() {
+        use crate::collect::labels::{index, queue};
+        let dir = temp("rows");
+        let rels = parked_folder(&dir);
+        let classes = vec!["car".to_string()];
+        let cache = SpotCache::new();
+        let get = || cache.get_now(job_of(&dir, &classes, &[]), Duration::ZERO, &build);
+        // No index: walked, and every ask walks again (the interval is zero here).
+        let walked = get();
+        assert_eq!(walked.camera("lot").len(), 1, "{walked:?}");
+        assert!(Arc::ptr_eq(&get(), &walked), "the same table, the same Arc");
+        // An index of the folder: its rows give the same table, under a stamp.
+        index::tests::force(&dir);
+        let f = queue::Filters {
+            wanted: Some((classes.clone(), Vec::new())),
+            ..queue::Filters::default()
+        };
+        assert!(index::answer(&dir, &f, None, None).is_some());
+        let stamp = index::rows_version(&dir, Some(&(classes.clone(), Vec::new()))).unwrap();
+        assert_eq!(job_of(&dir, &classes, &[]).stamp, Some(stamp));
+        let (built, t) = build(&job_of(&dir, &classes, &[]));
+        assert_eq!((built, &t), (Some(stamp), &*walked));
+        assert!(Arc::ptr_eq(&get(), &walked));
+        // A frame reopened with a pending box leaves the spot's evidence (the export's rule).
+        for rel in &rels[..4] {
+            let frame = crate::collect::labels::Frame::resolve(&dir, rel).unwrap();
+            crate::collect::labels::update(&frame.labels, |l| {
+                let mut l = l.unwrap();
+                if let Some(b) = l.boxes.first_mut() {
+                    b.state = crate::collect::labels::BoxState::Pending;
+                }
+                Ok(Some(l))
+            })
+            .unwrap();
+        }
+        assert!(index::answer(&dir, &f, None, None).is_some());
+        let moved = index::rows_version(&dir, Some(&(classes.clone(), Vec::new()))).unwrap();
+        assert_ne!(moved, stamp);
+        let after = get();
+        assert!(!Arc::ptr_eq(&after, &walked));
+        assert!(
+            after.camera("lot").is_empty(),
+            "8 frames are too few: {after:?}"
+        );
+        index::tests::unforce(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

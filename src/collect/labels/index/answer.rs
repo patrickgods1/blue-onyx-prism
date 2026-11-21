@@ -3,6 +3,7 @@
 //! nothing else, so the two cannot differ in the JSON's fields.
 
 use super::super::super::layout;
+use super::super::need::NeedCounts;
 use super::super::queue::{self, BalanceTally, Counts, Filters, Item, Queue, QueueSource};
 use serde::Serialize;
 use std::path::Path;
@@ -37,6 +38,9 @@ pub struct Answer {
     /// With `balance=`: the reviewed frames per class, scene and camera the order weighed against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceTally>,
+    /// With the Recommended order: the reviewed boxes per class and scene the need weighed against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub need: Option<NeedCounts>,
 }
 
 /// How many frames [`Answer::upcoming`] lists.
@@ -72,6 +76,7 @@ impl Answer {
             unreadable: built.unreadable + damaged,
             indexing: None,
             balance: built.balance,
+            need: built.need,
         }
     }
 }

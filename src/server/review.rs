@@ -29,10 +29,12 @@
 //! current config), the page, the queue (`next`) and a frame's labels; the other routes are split by
 //! concern: [`bulk_routes`] (the bulk tools and the overlap check), [`spots`] (the reviewer's
 //! history and the spot memory) and [`files`] (export, import, the folder under review, classes);
-//! [`steer`] caches what steers the queue from outside the folder (measured recall).
+//! [`steer`] caches what steers the queue from outside its rows (measured recall, parked spots).
 
 mod bulk_routes;
 mod files;
+#[cfg(test)]
+mod order_eval;
 mod spots;
 mod steer;
 
@@ -300,9 +302,10 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
 /// `then`, the frame that was next after it, is the answer itself when it is listed, so the
 /// position stays where the reviewer was; `then` alone gives the place of the frame on screen
 /// ([`labels::queue::next_after`]). With the frame: its position, the counts and the cameras and
-/// classes for the filter lists. The order ([`next_order`]): Recommended by default (one frame per event first, then the
-/// balance in bands, then the most uncertain, [`labels::recommend`]); `order=uncertain` = the most
-/// uncertain first; an `auto=` or `balance=` filter keeps its own order, whatever `order` says.
+/// classes for the filter lists. The order ([`next_order`]): Recommended by default (the recall
+/// need divided by the event rank, in bands, then the most uncertain, [`labels::recommend`],
+/// [`labels::need`], steered by [`steer::snapshot`]); `order=uncertain` = the most uncertain
+/// first; an `auto=` or `balance=` filter keeps its own order, whatever `order` says.
 /// Only this route reads `order`: bulk actions and auto-label runs keep the uncertainty order. A big
 /// folder answers from [`labels::index`], with `indexing: {done, total}` while its rows are still
 /// coming in; a small one is walked.
@@ -315,7 +318,12 @@ pub(super) async fn next(
     filters.order = next_order(&q, &filters)?;
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
-        filters.wanted = Some((classes, hidden(&state)));
+        let hidden = hidden(&state);
+        if filters.order == Order::Recommended {
+            // One snapshot for the index and the walk alike.
+            filters.steer = Some(steer::snapshot(&state, &dir, &classes, &hidden));
+        }
+        filters.wanted = Some((classes, hidden));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
         let then = q.get("then").map(String::as_str).filter(|t| !t.is_empty());
         let found = labels::index::answer(&dir, &filters, after, then)
@@ -1091,21 +1099,31 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(v["item"]["frame"], near, "most uncertain first");
+        // The higher need first: the surer person of `far` (both missed a suppressed dog alike).
+        assert_eq!(v["item"]["frame"], far, "the higher need first");
         assert_eq!(v["total"], 2);
         assert_eq!(v["counts"]["remaining"], 2);
         let (_, v2) = json(
             &d.state,
             Request::get(format!(
                 "/v1/review/next?after={}",
-                encode_uri_component(&near)
+                encode_uri_component(&far)
             ))
             .body(Body::empty())
             .unwrap(),
         )
         .await;
-        assert_eq!(v2["item"]["frame"], far);
+        assert_eq!(v2["item"]["frame"], near);
         assert_eq!(v2["position"], 2);
+        // The uncertainty order: the nearer the threshold, the first.
+        let (_, u) = json(
+            &d.state,
+            Request::get("/v1/review/next?order=uncertain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(u["item"]["frame"], near, "most uncertain first");
         let (_, v3) = json(
             &d.state,
             Request::get("/v1/review/next?camera=drive")
@@ -2369,14 +2387,15 @@ mod tests {
         let d = way.ds();
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.52);
         let b = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_b", 0.95);
+        // The surer person of b has the higher need: b, then a.
         let next = |after: &str| format!("/v1/review/next?after={}", encode_uri_component(after));
-        let (_, v) = json(&d.state, get(&next(&a))).await;
+        let (_, v) = json(&d.state, get(&next(&b))).await;
         assert_eq!(
             (v["item"]["frame"].as_str(), v["wrapped"].as_bool()),
-            (Some(b.as_str()), Some(false))
+            (Some(a.as_str()), Some(false))
         );
-        let (_, v) = json(&d.state, get(&next(&b))).await;
-        assert_eq!(v["item"]["frame"], a.as_str());
+        let (_, v) = json(&d.state, get(&next(&a))).await;
+        assert_eq!(v["item"]["frame"], b.as_str());
         assert_eq!(v["position"], 1);
         assert_eq!(v["wrapped"], true);
         let (_, v) = json(&d.state, get("/v1/review/next?camera=yard")).await;
@@ -3698,9 +3717,10 @@ mod tests {
         next_is_recommended_unless_asked_otherwise_in
     );
 
-    /// Recommended by default: a and b are one event (one camera, the same time), so c comes
-    /// before b although b is more uncertain. `order=uncertain`, `balance=` and `auto=` keep the
-    /// uncertainty order; another `order` is refused.
+    /// Recommended by default: a and b are one event (one camera, the same time), so the second of
+    /// them has its need halved and c, of about the same need, comes before it.
+    /// `order=uncertain`, `balance=` and `auto=` keep the uncertainty order; another `order` is
+    /// refused.
     async fn next_is_recommended_unless_asked_otherwise_in(way: Way) {
         let d = way.ds();
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
@@ -3711,17 +3731,28 @@ mod tests {
         let m = v["message"].as_str().unwrap();
         assert!(m.contains("order") && m.contains("newest"), "{m}");
 
+        // Their needs: a weak person and the weak dog the static rule suppressed on each (too weak
+        // for the missed doubling). c's is the highest; a and b share a band, so the more uncertain
+        // a leads their event and b is its second. b is also a random pick (its path's hash is in
+        // the pool): it takes a random slot, here the last, the rest having run out.
+        assert!(labels::recommend::in_pool(&b) && !labels::recommend::in_pool(&a));
         let ranked = vec![
-            (a.clone(), Some(0)),
             (c.clone(), Some(0)),
+            (a.clone(), Some(0)),
             (b.clone(), Some(1)),
         ];
         assert_eq!(order_of(&d, &[]).await, ranked);
         assert_eq!(order_of(&d, &[("order", "recommended")]).await, ranked);
-        // The balance it weighs by is in the answer, every dimension, for the page's note.
+        // The need it weighs by is in the answer, for the page's note; no balance.
         let v = next_of(&d, &[]).await;
-        assert!(v["balance"]["scenes"].is_object(), "{v}");
-        assert!(v["item"]["balance"].is_object(), "{v}");
+        assert!(v["need"]["boxes"].is_object(), "{v}");
+        assert_eq!(v["need"]["floor"], 20, "{v}");
+        assert!(v["item"]["need"]["score"].as_u64() > Some(0), "{v}");
+        assert!(v["item"]["need"]["class"].is_string(), "{v}");
+        assert!(
+            v["balance"].is_null() && v["item"]["balance"].is_null(),
+            "{v}"
+        );
 
         let plain = vec![(a.clone(), None), (b.clone(), None), (c.clone(), None)];
         assert_eq!(order_of(&d, &[("order", "uncertain")]).await, plain);
@@ -3742,6 +3773,71 @@ mod tests {
     }
 
     both_ways!(
+        an_unchanged_folder_steers_by_one_spot_table,
+        an_unchanged_folder_steers_by_one_spot_table_indexed,
+        an_unchanged_folder_steers_by_one_spot_table_in
+    );
+
+    /// The steer's spot table comes through the service's path ([`steer::spots`]); while nothing
+    /// changes, every Next steers by the same table (one `Arc`), so the index's per-shard need
+    /// parts are served again rather than counted anew.
+    async fn an_unchanged_folder_steers_by_one_spot_table_in(way: Way) {
+        let d = way.ds();
+        put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
+        put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.6);
+        let first = order_of(&d, &[]).await;
+        let (_, classes, _) = context(&d.state);
+        let hidden = super::hidden(&d.state);
+        let a = steer::spots(&d.dir, &classes, &hidden);
+        let b = steer::spots(&d.dir, &classes, &hidden);
+        assert!(Arc::ptr_eq(&a, &b));
+        let (made, hits) = labels::index::tests::need_parts(&d.dir);
+        assert_eq!(order_of(&d, &[]).await, first);
+        assert!(Arc::ptr_eq(&a, &steer::spots(&d.dir, &classes, &hidden)));
+        if way == Way::Index {
+            let (made2, hits2) = labels::index::tests::need_parts(&d.dir);
+            assert!(made > 0, "the index made need parts");
+            assert_eq!(made2, made, "an unchanged folder made a part again");
+            assert!(hits2 > hits);
+        }
+    }
+
+    both_ways!(
+        a_damaged_runs_json_still_answers_next,
+        a_damaged_runs_json_still_answers_next_indexed,
+        a_damaged_runs_json_still_answers_next_in
+    );
+
+    /// The need's recall comes from `runs.json` (`steer::recall`): a damaged one measures nothing,
+    /// so the queue answers as it does without one: 200, the same order, no recall named. And the
+    /// queue only reads: the file stays where it is, byte for byte, with nothing moved aside.
+    async fn a_damaged_runs_json_still_answers_next_in(way: Way) {
+        let d = way.ds();
+        let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.7);
+        let b = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_b", 0.6);
+        let plain = order_of(&d, &[]).await;
+        assert_eq!(plain.len(), 2, "{plain:?}");
+        let runs = crate::training::runs_file(&d.state.config_read());
+        std::fs::create_dir_all(runs.parent().unwrap()).unwrap();
+        std::fs::write(&runs, b"{ not json").unwrap();
+        // `next_of` checks the 200.
+        let v = next_of(&d, &[]).await;
+        assert!(v["item"]["need"]["score"].as_u64() > Some(0), "{v}");
+        assert!(v["item"]["need"]["recall"].is_null(), "{v}");
+        assert_eq!(order_of(&d, &[]).await, plain);
+        assert!(plain.iter().any(|(f, _)| *f == a) && plain.iter().any(|(f, _)| *f == b));
+        assert_eq!(std::fs::read(&runs).unwrap(), b"{ not json");
+        let siblings: Vec<String> = std::fs::read_dir(runs.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        assert!(
+            !siblings.iter().any(|n| n.contains(".corrupt-")),
+            "{siblings:?}"
+        );
+    }
+
+    both_ways!(
         a_limited_bulk_accept_keeps_the_uncertainty_order,
         a_limited_bulk_accept_keeps_the_uncertainty_order_indexed,
         a_limited_bulk_accept_keeps_the_uncertainty_order_in
@@ -3749,8 +3845,8 @@ mod tests {
 
     /// A bulk action with a limit takes the first frames of the uncertainty order, never the
     /// Recommended one: the four frames the triage settles are two per camera, all at one time,
-    /// so the Recommended order puts one of each camera first, the uncertainty order both of
-    /// drive.
+    /// so the Recommended order puts one of each camera first (the surer car of each, its need the
+    /// higher; the other's halved as its event's second), the uncertainty order both of drive.
     async fn a_limited_bulk_accept_keeps_the_uncertainty_order_in(way: Way) {
         let d = way.ds();
         let rels = put_auto_frames(&d.dir);
@@ -3774,7 +3870,7 @@ mod tests {
             .collect();
         assert_eq!(
             recommended,
-            [settled(0), settled(3), settled(6), settled(9)]
+            [settled(9), settled(6), settled(3), settled(0)]
         );
         let (s, v) = json(
             &d.state,

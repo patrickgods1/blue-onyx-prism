@@ -127,6 +127,18 @@ pub(super) fn records(state: &AppState) -> Vec<RunRecord> {
     }
 }
 
+/// [`records`] for a reader that must never touch the files: the started queue's runs, else the
+/// records of `runs.json` that parse ([`crate::training::task::read_records`]), the file left as it
+/// is, damaged or not (the queue moves a damaged one aside when it starts).
+pub(super) fn records_read_only(state: &AppState) -> Vec<RunRecord> {
+    match SERVICE.get() {
+        Some(s) => s.records(),
+        None => {
+            crate::training::task::read_records(&crate::training::runs_file(&state.config_read()))
+        }
+    }
+}
+
 /// The queue if it was started (the page shows `runs.json` otherwise).
 pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
     match SERVICE.get() {

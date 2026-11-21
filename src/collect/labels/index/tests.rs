@@ -6,7 +6,8 @@
 //! The test that matters is [`equivalence`]: for a seeded folder holding every case `queue::build`
 //! knows, and a grid of filters and `after` values, the index's JSON equals the walk's, whole,
 //! after a build, after writes through the real writers, after direct edits and a scan, and after
-//! a full pass.
+//! a full pass. The Recommended order is compared with and without a populated [`Steer`] (a
+//! recall table, a parked spot) on frames of every need cue ([`need_frames`]).
 
 use super::Timing;
 use crate::sync::LockExt as _;
@@ -224,6 +225,21 @@ pub(crate) fn served(dir: &Path) -> bool {
     with(dir, |f| f.served).unwrap_or(false)
 }
 
+/// The need cache of `dir`'s index: parts made and parts served again (0, 0 without an index).
+pub(crate) fn need_parts(dir: &Path) -> (u64, u64) {
+    super::HUB
+        .lock_recover()
+        .current
+        .iter()
+        .find(|c| c.index.dir == dir)
+        .map_or((0, 0), |c| {
+            (
+                c.index.need.made.load(Ordering::Relaxed),
+                c.index.need.hits.load(Ordering::Relaxed),
+            )
+        })
+}
+
 /// See [`served`].
 pub(super) fn note_served(dir: &Path, by_index: bool) {
     with(dir, |f| f.served = by_index);
@@ -284,14 +300,17 @@ pub(super) fn walk_point(dir: &Path) {
 )]
 mod cases {
     use super::super::super::bulk::{self, Wanted};
+    use super::super::super::export;
+    use super::super::super::need::{self, Steer};
     use super::super::super::overlaps::{Suggestion, Verdict};
     use super::super::super::queue::{self, AutoFilter, Filters, Order, QueueSource, StatusFilter};
+    use super::super::super::recall::{Measured, Run, Slice};
     use super::super::super::recommend;
-    use super::super::super::refine;
     use super::super::super::{
         AutoInfo, AutoRun, BoxState, Frame, LABELS_SUFFIX, LabelBox, LabelFile, Origin,
         RejectReason, Source, Status, Triage, VlmCheck,
     };
+    use super::super::super::{refine, statics};
     use super::super::Indexing;
     use super::super::refresh::Pass;
     use super::super::{Answer, DIRTY_MAX, HUB, Index};
@@ -302,7 +321,7 @@ mod cases {
         empty_record,
     };
     use crate::sync::RwLockExt as _;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::RwLock;
     use std::time::Instant;
 
@@ -440,6 +459,10 @@ mod cases {
         // seconds apart, gaps of over a minute, hours apart, a time that does not parse.
         r.timestamp = TIMES[rng.below(TIMES.len())].into();
         r.threshold = 0.5;
+        // By the stem, not `rng`: most frames have a size, some none (their boxes have no region).
+        if !(recommend::pool_hash(stem) >> 40).is_multiple_of(7) {
+            (r.width, r.height) = (640, 480);
+        }
         // Now and then an imported frame: of an image folder or with no time within its source an
         // event of its own, of a video one that chains.
         r.model = match rng.below(12) {
@@ -1089,9 +1112,378 @@ mod cases {
         chain
     }
 
+    /// The frames [`need_frames`] made, by what each is for.
+    struct Cues {
+        /// Unreviewed: a car at the parked spot of `lot`, and a truck (no class of the run).
+        parked: String,
+        truck: String,
+        /// A pending "dog" the auto-labelers call a person (`auto_label`).
+        suggested: String,
+        /// Auto persons with a prediction on them, and without.
+        seen: String,
+        lost: String,
+        /// The middle frame of a visit whose dog was decided before and after it.
+        gap: String,
+        /// No label file; the sidecar has a below-threshold person.
+        bare: String,
+    }
+
+    /// The parked spot's box on a 640 x 480 frame: [0.1, 0.1, 0.3, 0.3].
+    const PARKED: [f32; 4] = [64.0, 48.0, 192.0, 144.0];
+
+    /// One frame of [`need_frames`] at `rel` and `time`, its sidecar edited by `edit`, with
+    /// `labels` (None: no label file), queued and indexed.
+    fn put_cue(
+        dir: &Path,
+        rel: &str,
+        time: &str,
+        edit: &dyn Fn(&mut Record),
+        labels: Option<&LabelFile>,
+    ) -> String {
+        let r = layout::parse_rel(rel).unwrap();
+        let day = dir.join(&r.scene).join(&r.camera).join(&r.date);
+        std::fs::create_dir_all(&day).unwrap();
+        let mut rec = empty_record();
+        rec.id = r.stem.clone();
+        rec.scene = r.scene.clone();
+        rec.camera = r.camera.clone();
+        rec.timestamp = time.into();
+        rec.threshold = 0.5;
+        rec.model = "m0".into();
+        (rec.width, rec.height) = (640, 480);
+        edit(&mut rec);
+        std::fs::write(day.join(format!("{}.jpg", r.stem)), b"x").unwrap();
+        std::fs::write(
+            day.join(format!("{}.json", r.stem)),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+        if let Some(l) = labels {
+            std::fs::write(
+                day.join(format!("{}{LABELS_SUFFIX}", r.stem)),
+                serde_json::to_vec(l).unwrap(),
+            )
+            .unwrap();
+        }
+        let path = day.join(INDEX_FILE);
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text.push_str(&index_line(&rec));
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+        layout::append_review(dir, &[rel.to_string()]).unwrap();
+        rel.to_string()
+    }
+
+    /// A box of `label` at `bbox` from `source`, in `state`.
+    fn cue_box(label: &str, bbox: [f32; 4], source: Source, state: BoxState) -> LabelBox {
+        LabelBox {
+            label: label.into(),
+            bbox,
+            source,
+            score: Some(0.8),
+            state,
+            origin: (source == Source::Model).then_some(Origin::Prediction),
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: AutoInfo::default(),
+        }
+    }
+
+    fn det_at(label: &str, score: f32, bbox: [f32; 4]) -> Det {
+        Det {
+            label: label.into(),
+            score,
+            bbox,
+        }
+    }
+
+    /// Frames of every need cue (see [`Cues`]; of the unreviewed ones only the truck is in the random
+    /// pool, so the default view keeps enough slots of each kind): a parked car reviewed on 12
+    /// frames of two days of `lot` (the spot of [`steer_of`]) and two unreviewed frames there; a
+    /// class suggestion; auto boxes with and without a prediction; a visit with a gap on `trail`; a
+    /// frame without a label file whose sidecar has a below-threshold box.
+    fn need_frames(dir: &Path, rels: &mut Vec<String>) -> Cues {
+        let reviewed = |boxes: Vec<LabelBox>| LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes,
+            ..LabelFile::default()
+        };
+        let pending = |boxes: Vec<LabelBox>| LabelFile {
+            boxes,
+            ..LabelFile::default()
+        };
+        let none = |_: &mut Record| {};
+        for i in 0..12u32 {
+            let date = if i < 6 { "2026-10-20" } else { "2026-10-21" };
+            let rel = format!("day/lot/{date}/20261021T{:06}000Z_lot{i}.jpg", 800 + i);
+            let car = cue_box("car", PARKED, Source::Model, BoxState::Accepted);
+            let time = format!("{date}T{:02}:00:00Z", 1 + i);
+            rels.push(put_cue(dir, &rel, &time, &none, Some(&reviewed(vec![car]))));
+        }
+        let parked = put_cue(
+            dir,
+            "day/lot/2026-10-22/20261022T010000000Z_parked.jpg",
+            "2026-10-22T01:00:00Z",
+            &|r| r.predictions = vec![det_at("car", 0.9, PARKED)],
+            Some(&pending(vec![cue_box(
+                "car",
+                PARKED,
+                Source::Model,
+                BoxState::Pending,
+            )])),
+        );
+        let truck = put_cue(
+            dir,
+            "day/lot/2026-10-22/20261022T050000000Z_truck.jpg",
+            "2026-10-22T05:00:00Z",
+            &none,
+            Some(&pending(vec![cue_box(
+                "truck",
+                [400.0, 300.0, 520.0, 400.0],
+                Source::Model,
+                BoxState::Pending,
+            )])),
+        );
+        let mut dog = cue_box(
+            "dog",
+            [100.0, 100.0, 200.0, 200.0],
+            Source::Model,
+            BoxState::Pending,
+        );
+        dog.auto.auto_label = Some("person".into());
+        dog.auto.auto_score = Some(0.7);
+        dog.auto.triage = Some(Triage::Review);
+        dog.auto.labelers.insert("gdino".into(), 0.7);
+        let suggested = put_cue(
+            dir,
+            "night/yard2/2026-10-21/20261021T020000000Z_suggestion.jpg",
+            "2026-10-21T02:00:00Z",
+            &none,
+            Some(&pending(vec![dog])),
+        );
+        let mut found = cue_box(
+            "person",
+            [300.0, 100.0, 340.0, 200.0],
+            Source::Auto,
+            BoxState::Pending,
+        );
+        // Two labelers: strong, so a miss of it doubles (MISSED_MIN_E).
+        found.auto.labelers.insert("rfdetr".into(), 0.6);
+        found.auto.labelers.insert("gdino".into(), 0.5);
+        found.score = Some(0.6);
+        let seen = put_cue(
+            dir,
+            "night/porch2/2026-10-21/20261021T020000000Z_seen.jpg",
+            "2026-10-21T02:00:00Z",
+            &none,
+            Some(&pending(vec![
+                found.clone(),
+                cue_box(
+                    "person",
+                    [302.0, 100.0, 340.0, 200.0],
+                    Source::Model,
+                    BoxState::Pending,
+                ),
+            ])),
+        );
+        let lost = put_cue(
+            dir,
+            "night/porch2/2026-10-21/20261021T030000000Z_unseen.jpg",
+            "2026-10-21T03:00:00Z",
+            &none,
+            Some(&pending(vec![LabelBox {
+                bbox: [500.0, 100.0, 540.0, 200.0],
+                ..found
+            }])),
+        );
+        let dog_at = |x: f32| {
+            cue_box(
+                "dog",
+                [x, 100.0, x + 50.0, 150.0],
+                Source::Auto,
+                BoxState::Accepted,
+            )
+        };
+        rels.push(put_cue(
+            dir,
+            "night/trail/2026-10-21/20261021T010000000Z_t0.jpg",
+            "2026-10-21T01:00:00Z",
+            &none,
+            Some(&reviewed(vec![dog_at(100.0)])),
+        ));
+        let gap = put_cue(
+            dir,
+            "night/trail/2026-10-21/20261021T010010000Z_t1.jpg",
+            "2026-10-21T01:00:10Z",
+            &none,
+            Some(&pending(Vec::new())),
+        );
+        rels.push(put_cue(
+            dir,
+            "night/trail/2026-10-21/20261021T010020000Z_t2.jpg",
+            "2026-10-21T01:00:20Z",
+            &none,
+            Some(&reviewed(vec![dog_at(200.0)])),
+        ));
+        let bare = put_cue(
+            dir,
+            "ir/shed/2026-10-21/20261021T040000000Z_unlabelled.jpg",
+            "2026-10-21T04:00:00Z",
+            &|r| r.below_threshold = vec![det_at("person", 0.4, [10.0, 10.0, 60.0, 120.0])],
+            None,
+        );
+        let cues = Cues {
+            parked,
+            truck,
+            suggested,
+            seen,
+            lost,
+            gap,
+            bare,
+        };
+        rels.extend(
+            [
+                &cues.parked,
+                &cues.truck,
+                &cues.suggested,
+                &cues.seen,
+                &cues.lost,
+                &cues.gap,
+                &cues.bare,
+            ]
+            .map(String::clone),
+        );
+        cues
+    }
+
+    /// The steer of [`need_frames`]' folder: the parked spot of `lot` (as the server's table makes
+    /// it, from the reviewed frames) and a recall table of a run without trucks, in which dog is
+    /// `trail`'s lowest class.
+    fn steer_of(dir: &Path) -> Steer {
+        let (classes, hidden) = wanted_a();
+        let w = Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        let frames = export::reviewed_frames_filtered(
+            dir,
+            &classes,
+            &export::SplitConfig::default(),
+            &export::ClassFilter::default(),
+        )
+        .frames;
+        let spots = statics::Table::build(statics::observations(&frames, &w));
+        assert!(
+            spots.camera("lot").len() == 1,
+            "the parked car is a spot: {spots:?}"
+        );
+        let run = Run {
+            id: "run-7".into(),
+            classes: ["person", "car", "dog", "motorcycle"]
+                .map(String::from)
+                .to_vec(),
+            rename: BTreeMap::new(),
+        };
+        let cr = crate::benchmark::ClassRecall::new;
+        let trail = [cr("person", 30, 3), cr("dog", 30, 15)];
+        let night = Slice::new(
+            run.clone(),
+            &[cr("person", 40, 8), cr("dog", 30, 15), cr("car", 20, 2)],
+            [("trail", &trail[..])],
+        );
+        let day = Slice::new(
+            run.clone(),
+            &[cr("person", 40, 4), cr("car", 50, 10)],
+            [("lot", &[cr("car", 30, 6)][..])],
+        );
+        let overall = Slice::new(
+            run,
+            &[cr("person", 80, 12), cr("dog", 30, 15), cr("car", 70, 12)],
+            [("trail", &trail[..]), ("lot", &[cr("car", 30, 6)][..])],
+        );
+        Steer {
+            recall: Some(Arc::new(Measured {
+                scenes: [("night".to_string(), night), ("day".to_string(), day)]
+                    .into_iter()
+                    .collect(),
+                overall: Some(overall),
+            })),
+            spots: Arc::new(spots),
+            heldout_listed: Arc::default(),
+        }
+    }
+
+    /// The Recommended order steered by `steer` sees every cue of [`need_frames`], and its scores
+    /// differ: the comparison is of an order that means something.
+    fn covers_need(dir: &Path, steer: &Arc<Steer>, cues: &Cues) {
+        let built = queue::build(dir, &steered(recommended_all(), steer));
+        let need_of = |rel: &str| {
+            built
+                .items
+                .iter()
+                .find(|i| i.frame == rel)
+                .and_then(|i| i.uncertainty.need.clone())
+                .unwrap_or_else(|| panic!("no need for {rel}"))
+        };
+        let parked = need_of(&cues.parked);
+        assert!(
+            parked.spot && parked.class.as_deref() == Some("car"),
+            "{parked:?}"
+        );
+        let truck = need_of(&cues.truck);
+        assert!(truck.model_lacks && truck.catch_up, "{truck:?}");
+        let gap = need_of(&cues.gap);
+        assert!(gap.gap && gap.class.as_deref() == Some("dog"), "{gap:?}");
+        assert!(gap.expanded && gap.recall.is_some(), "{gap:?}");
+        assert!(need_of(&cues.lost).missed);
+        assert!(!need_of(&cues.seen).missed);
+        // The reply's below-threshold person: a missed candidate (too weak to double).
+        let bare = Frame::resolve(dir, &cues.bare).unwrap().record().unwrap();
+        let (classes, hidden) = wanted_a();
+        let w = Wanted {
+            classes: &classes,
+            hidden: &hidden,
+        };
+        assert!(
+            need::of_reply(&bare, Some(&w))
+                .iter()
+                .any(|b| b.has(need::MISSED))
+        );
+        assert!(!need_of(&cues.bare).missed);
+        // The suggestion is a missed candidate of its own class.
+        let frame = Frame::resolve(dir, &cues.suggested).unwrap();
+        let l = frame.labels().unwrap().unwrap();
+        let boxes = need::of_file(&l, Some(&w));
+        assert!(
+            boxes.iter().any(|b| b.has(need::MISSED) && b.class == 0),
+            "{boxes:?}"
+        );
+        // Without the steer: no spot, no recall.
+        let plain = queue::build(dir, &recommended_all());
+        let p = plain
+            .items
+            .iter()
+            .find(|i| i.frame == cues.parked)
+            .and_then(|i| i.uncertainty.need.clone())
+            .unwrap();
+        assert!(!p.spot && p.recall.is_none(), "{p:?}");
+        assert!(parked.recall.is_some(), "{parked:?}");
+        let scores: BTreeSet<u32> = built
+            .items
+            .iter()
+            .filter_map(|i| i.uncertainty.need.as_ref().map(|n| n.visit_score))
+            .collect();
+        assert!(scores.len() > 20, "a trivial need order: {scores:?}");
+        assert!(built.need.is_some() && built.balance.is_none());
+    }
+
     /// The filters the comparison runs: every source x status x auto filter, and each other
     /// filter on its own, with `wanted`.
-    fn grid(wanted: &(Vec<String>, Vec<String>)) -> Vec<Filters> {
+    fn grid(wanted: &(Vec<String>, Vec<String>), steer: &Arc<Steer>) -> Vec<Filters> {
         let autos = [
             None,
             Some(AutoFilter::Review),
@@ -1202,11 +1594,20 @@ mod cases {
             auto: Some(AutoFilter::Overlaps),
             ..all.clone()
         });
-        // The Recommended order: every source x status, and with each other filter.
+        // The Recommended order: every source x status, and with each other filter, steered; and
+        // the default view without a steer.
         let recommended = Filters {
             order: Order::Recommended,
+            steer: Some(steer.clone()),
             ..all.clone()
         };
+        out.push(Filters {
+            order: Order::Recommended,
+            steer: None,
+            source: QueueSource::Queue,
+            status: StatusFilter::Is(Status::Unreviewed),
+            ..all.clone()
+        });
         for source in [QueueSource::Queue, QueueSource::All] {
             for status in statuses {
                 out.push(Filters {
@@ -1260,6 +1661,14 @@ mod cases {
         }
     }
 
+    /// `f` steered by `steer`.
+    fn steered(f: Filters, steer: &Arc<Steer>) -> Filters {
+        Filters {
+            steer: Some(steer.clone()),
+            ..f
+        }
+    }
+
     /// Every filter's whole order: `all_any` balanced by everything.
     fn balance_all() -> Filters {
         Filters {
@@ -1297,8 +1706,14 @@ mod cases {
     /// For every filter of `grid(wanted)` and several `after`s, and `then`s with an `after` that
     /// is listed, not listed or absent, the index answers what the walk does, compared whole.
     /// `rels`: frames to try as `after` and `then` too.
-    fn same_answers(dir: &Path, wanted: &(Vec<String>, Vec<String>), rels: &[String], round: &str) {
-        let filters = grid(wanted);
+    fn same_answers(
+        dir: &Path,
+        wanted: &(Vec<String>, Vec<String>),
+        steer: &Arc<Steer>,
+        rels: &[String],
+        round: &str,
+    ) {
+        let filters = grid(wanted, steer);
         // The walks are the slow part: on threads, as the route's queries come.
         crate::parallel::map_all(filters.len(), 8, &|i| {
             let f = &filters[i];
@@ -1532,9 +1947,16 @@ mod cases {
         assert_eq!(rank(&unreviewed.items, &chain[13]), Some(0));
         covers_random_slots(dir);
         // Ties of the whole key and the time, which only the path breaks.
+        // The key at the frame's rank: its band is its need after the visit divisor.
         let keys: Vec<recommend::Key> = items
             .iter()
-            .map(|i| recommend::key(&i.uncertainty, i.event_rank.unwrap()))
+            .map(|i| {
+                let at_rank = recommend::Visit {
+                    score: i.uncertainty.need.as_ref().map_or(0, |n| n.visit_score),
+                    expanded: false,
+                };
+                recommend::key(&i.uncertainty, at_rank)
+            })
             .collect();
         assert!(
             items
@@ -1852,6 +2274,151 @@ mod cases {
         }
     }
 
+    /// Reviewed frames of camera `gate` that test the spot table's rules: a car parked on two
+    /// days (12 frames), four more at a box whose IoU to it is 0.6 at whole pixels and just under
+    /// at the drawn ones (25.4 px off), two reopened ones (a pending box beside the car: no
+    /// export's frame) and one with a training label off the class list (`motorbike`, an alias of
+    /// `motorcycle`: left out whole). Returns the reopened and the aliased frames.
+    fn spot_cases(dir: &Path, rels: &mut Vec<String>) -> Vec<String> {
+        let none = |_: &mut Record| {};
+        let reviewed = |boxes: Vec<LabelBox>| LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes,
+            ..LabelFile::default()
+        };
+        let car = |x: f32| {
+            cue_box(
+                "car",
+                [x, 200.0, x + 100.0, 300.0],
+                Source::Human,
+                BoxState::Accepted,
+            )
+        };
+        let mut put = |i: u32, boxes: Vec<LabelBox>| {
+            let date = if i.is_multiple_of(2) {
+                "2026-10-20"
+            } else {
+                "2026-10-21"
+            };
+            let rel = format!("day/gate/{date}/20261020T{:06}000Z_gate{i}.jpg", 100 + i);
+            let time = format!("{date}T{:02}:00:00Z", i % 24);
+            let rel = put_cue(dir, &rel, &time, &none, Some(&reviewed(boxes)));
+            rels.push(rel.clone());
+            rel
+        };
+        for i in 0..12 {
+            put(i, vec![car(300.0)]);
+        }
+        for i in 12..16 {
+            put(i, vec![car(325.4)]);
+        }
+        let mut odd = Vec::new();
+        for i in 16..18 {
+            let pending = cue_box(
+                "person",
+                [10.0, 10.0, 40.0, 90.0],
+                Source::Model,
+                BoxState::Pending,
+            );
+            odd.push(put(i, vec![car(300.0), pending]));
+        }
+        let bike = cue_box(
+            "motorbike",
+            [50.0, 50.0, 90.0, 90.0],
+            Source::Human,
+            BoxState::Accepted,
+        );
+        odd.push(put(18, vec![car(300.0), bike]));
+        odd
+    }
+
+    /// The spot table of the index's rows is the walk's, observation for observation, and holds
+    /// the listed frames an export holds, at their boxes to within a pixel's rounding: every
+    /// camera.
+    /// `left_out`: frames that must give none (none after the edits).
+    fn spots_agree(
+        dir: &Path,
+        wanted: &(Vec<String>, Vec<String>),
+        left_out: &[String],
+        round: &str,
+    ) {
+        let w = Wanted {
+            classes: &wanted.0,
+            hidden: &wanted.1,
+        };
+        from_index(dir, &all_any(), None);
+        let (stamp, rows) = super::super::reviewed_obs(dir, Some(wanted)).unwrap();
+        assert_eq!(
+            super::super::rows_version(dir, Some(wanted)),
+            Some(stamp),
+            "{round}"
+        );
+        let walked = queue::reviewed_obs(dir, queue::candidates(dir, QueueSource::All), &w);
+        assert_eq!(rows, walked, "{round}");
+        let table = statics::Table::build(rows.clone());
+        assert_eq!(table, statics::Table::build(walked), "{round}");
+        // Before the edits (which may rewrite gate's frames), its spot is there.
+        assert!(
+            left_out.is_empty() || !table.camera("gate").is_empty(),
+            "{round}: {table:?}"
+        );
+        for f in left_out {
+            assert!(!rows.iter().any(|o| o.frame == *f), "{round}: {f}");
+        }
+        let frames = export::reviewed_frames_filtered(
+            dir,
+            &wanted.0,
+            &export::SplitConfig::default(),
+            &export::ClassFilter::default(),
+        )
+        .frames;
+        // The export walks every label file; the queue (so the index) knows the frames a line
+        // names: a frame no index or review line names is in neither.
+        let listed: BTreeSet<String> = queue::candidates(dir, QueueSource::All)
+            .into_iter()
+            .map(|c| c.rel)
+            .collect();
+        let exported: Vec<statics::Obs> = statics::observations(&frames, &w)
+            .into_iter()
+            .filter(|o| listed.contains(&o.frame))
+            .collect();
+        let key = |o: &statics::Obs| {
+            (
+                o.frame.clone(),
+                o.label.clone(),
+                o.bbox.map(|v| (v * 64.0).round() as i64),
+            )
+        };
+        let mut a: Vec<_> = rows.iter().collect();
+        let mut b: Vec<_> = exported.iter().collect();
+        a.sort_by_key(|o| key(o));
+        b.sort_by_key(|o| key(o));
+        let names = |v: &[&statics::Obs]| -> BTreeSet<(String, String)> {
+            v.iter()
+                .map(|o| (o.frame.clone(), o.label.clone()))
+                .collect()
+        };
+        let (na, nb) = (names(&a), names(&b));
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{round}: rows only {:?}, export only {:?}",
+            na.difference(&nb).collect::<Vec<_>>(),
+            nb.difference(&na).collect::<Vec<_>>()
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(
+                (&x.frame, &x.label, &x.camera, &x.day, &x.scene),
+                (&y.frame, &y.label, &y.camera, &y.day, &y.scene),
+                "{round}"
+            );
+            for (p, q) in x.bbox.iter().zip(&y.bbox) {
+                assert!((p - q).abs() <= 0.5 / 480.0 + 1e-6, "{round}: {x:?} {y:?}");
+            }
+        }
+    }
+
     /// The test that matters: see the module doc.
     #[test]
     fn equivalence() {
@@ -1862,10 +2429,22 @@ mod cases {
             let mut rels = generate(&dir, seed, 120, foreign);
             let (on_drive, on_lane) = precision_frames(&dir, seed, &mut rels);
             let chain = event_frames(&dir, seed, &mut rels);
+            let cues = need_frames(&dir, &mut rels);
+            let steer = Arc::new(steer_of(&dir));
             let mut rng = Rng::new(seed ^ 0xabc);
             let (a, b) = (wanted_a(), wanted_b());
             covers_every_case(&dir, &chain);
-            same_answers(&dir, &a, &rels, &format!("seed {seed}, built"));
+            covers_need(&dir, &steer, &cues);
+            let left_out = spot_cases(&dir, &mut rels);
+            same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, built"));
+            // The index's reviewed rows give the parked spots the label files do.
+            spots_agree(&dir, &a, &left_out, &format!("seed {seed}, built"));
+            let (_, obs) = super::super::reviewed_obs(&dir, Some(&a)).unwrap();
+            assert_eq!(
+                statics::Table::build(obs).camera("lot"),
+                steer.spots.camera("lot")
+            );
+            assert!(super::super::reviewed_obs(&dir, Some(&wanted_b())).is_none());
             same_order(&dir, &all_any(), &format!("seed {seed}, built"));
             same_order(
                 &dir,
@@ -1876,6 +2455,16 @@ mod cases {
                 &dir,
                 &recommended_default(),
                 &format!("seed {seed}, built, default"),
+            );
+            same_order(
+                &dir,
+                &steered(recommended_default(), &steer),
+                &format!("seed {seed}, built, default, steered"),
+            );
+            same_order(
+                &dir,
+                &steered(recommended_all(), &steer),
+                &format!("seed {seed}, built, recommended, steered"),
             );
             let refine_all = Filters {
                 auto: Some(AutoFilter::Refine),
@@ -1916,7 +2505,14 @@ mod cases {
             assert!(index_of(&dir).is_some());
 
             real_writes(&dir, &mut rng, &mut rels, &a);
-            same_answers(&dir, &a, &rels, &format!("seed {seed}, real writes"));
+            same_answers(
+                &dir,
+                &a,
+                &steer,
+                &rels,
+                &format!("seed {seed}, real writes"),
+            );
+            spots_agree(&dir, &a, &[], &format!("seed {seed}, real writes"));
             same_order(
                 &dir,
                 &balance_all(),
@@ -1937,10 +2533,21 @@ mod cases {
                 &recommended_default(),
                 &format!("seed {seed}, real writes, default"),
             );
+            same_order(
+                &dir,
+                &steered(recommended_default(), &steer),
+                &format!("seed {seed}, real writes, default, steered"),
+            );
 
             // Another class list: another index, built anew.
             let before = index_of(&dir).unwrap();
-            same_answers(&dir, &b, &rels, &format!("seed {seed}, class change"));
+            same_answers(
+                &dir,
+                &b,
+                &steer,
+                &rels,
+                &format!("seed {seed}, class change"),
+            );
             assert!(!Arc::ptr_eq(&before, &index_of(&dir).unwrap()));
             assert!(before.cancelled());
             // Back: built anew before the edits below, so that only a scan can see them.
@@ -1948,15 +2555,23 @@ mod cases {
 
             direct_edits(&dir, &mut rng, &mut rels);
             index_of(&dir).unwrap().pass(Pass::Scan, &|| {});
-            same_answers(&dir, &a, &rels, &format!("seed {seed}, scan"));
+            same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, scan"));
+            spots_agree(&dir, &a, &[], &format!("seed {seed}, scan"));
 
             shrink_queue(&dir);
             index_of(&dir).unwrap().pass(Pass::Scan, &|| {});
-            same_answers(&dir, &a, &rels, &format!("seed {seed}, queue shrunk"));
+            same_answers(
+                &dir,
+                &a,
+                &steer,
+                &rels,
+                &format!("seed {seed}, queue shrunk"),
+            );
 
             in_place_edits(&dir, &mut rng, &rels);
             index_of(&dir).unwrap().pass(Pass::Full, &|| {});
-            same_answers(&dir, &a, &rels, &format!("seed {seed}, full pass"));
+            same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, full pass"));
+            spots_agree(&dir, &a, &[], &format!("seed {seed}, full pass"));
             same_order(&dir, &all_any(), &format!("seed {seed}, full pass"));
             same_order(
                 &dir,
@@ -1967,6 +2582,11 @@ mod cases {
                 &dir,
                 &recommended_default(),
                 &format!("seed {seed}, full pass, default"),
+            );
+            same_order(
+                &dir,
+                &steered(recommended_all(), &steer),
+                &format!("seed {seed}, full pass, recommended, steered"),
             );
         }
     }
@@ -2489,14 +3109,72 @@ mod cases {
         assert!(served(&dir));
     }
 
+    /// A drain that re-reads an unchanged review queue moves no shard's version, so the need
+    /// cache's parts are served again; a real change moves its shard's only.
+    #[test]
+    fn an_unchanged_queue_drain_keeps_the_need_cache() {
+        let dir = Dir::new();
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        let mut rels = generate(&dir, 5, 60, false);
+        need_frames(&dir, &mut rels);
+        let steer = Arc::new(steer_of(&dir));
+        let f = steered(recommended_all(), &steer);
+        let first = json(&from_index(&dir, &f, None));
+        let index = index_of(&dir).unwrap();
+        let versions = || -> BTreeMap<String, u64> {
+            index
+                .state
+                .read_recover()
+                .shards
+                .values()
+                .map(|s| (s.day.clone(), s.version))
+                .collect()
+        };
+        let before = versions();
+        let made = || index.need.made.load(Ordering::Relaxed);
+        let hits = || index.need.hits.load(Ordering::Relaxed);
+        let (m0, h0) = (made(), hits());
+        assert!(m0 > 0);
+        // The queue file "gained lines" that change nothing: every part is a hit.
+        super::super::queue_written(&dir);
+        assert_eq!(json(&from_index(&dir, &f, None)), first);
+        assert_eq!(versions(), before, "an unchanged drain moved a version");
+        assert_eq!(made(), m0, "a part was made again");
+        assert!(hits() > h0);
+        // A new review line for a frame that had none moves that frame's shard alone.
+        let moved = rels
+            .iter()
+            .find(|r| {
+                let q = std::fs::read_to_string(dir.join(REVIEW_QUEUE_FILE)).unwrap();
+                !q.contains(r.as_str())
+            })
+            .cloned();
+        if let Some(rel) = moved {
+            layout::append_review(&dir, std::slice::from_ref(&rel)).unwrap();
+            super::super::queue_written(&dir);
+            from_index(&dir, &f, None);
+            let after = versions();
+            let changed: Vec<&String> = after
+                .iter()
+                .filter(|(d, v)| before.get(*d) != Some(*v))
+                .map(|(d, _)| d)
+                .collect();
+            assert_eq!(changed, [&queue::day_of(&rel).to_string()], "{rel}");
+        }
+        // The cache counts in the index's bytes.
+        assert!(index.need.bytes() > 0 && index.bytes() > index.need.bytes());
+    }
+
     #[test]
     fn rows_keep_their_size() {
         use super::super::row::{Cand, Part, Row, Side};
         // A field that grows the row grows a 300,000 frame index by 300 kB a byte: say so here.
         assert_eq!(size_of::<Cand>(), 12);
-        assert_eq!(size_of::<Side>(), 20);
-        assert_eq!(size_of::<Part>(), 40);
-        assert_eq!(size_of::<Row>(), 84);
+        assert_eq!(size_of::<Side>(), 36);
+        assert_eq!(size_of::<Part>(), 48);
+        assert_eq!(size_of::<Row>(), 108);
+        // And each need candidate in the shard's arena.
+        assert_eq!(size_of::<need::CellBox>(), 12);
     }
 
     #[test]
@@ -2599,7 +3277,7 @@ mod cases {
                     rec.predictions = vec![det(&mut rng)];
                     rec.raw = rec.predictions.clone();
                     let label = rng.one_in(3).then(|| a_label_file(&mut rng));
-                    let (part, mut note) = derive.part(label.as_ref(), &names);
+                    let (part, mut note, part_boxes) = derive.part(label.as_ref(), &names);
                     if !rng.one_in(100) {
                         note = None;
                     }
@@ -2619,6 +3297,7 @@ mod cases {
                             gone: false,
                             side: Some(encoder.side(&rec)),
                             part,
+                            part_boxes,
                             note,
                         },
                     );

@@ -1,8 +1,10 @@
-//! The index's rows: what [`super::super::queue::build`] reads of one frame, in about 84 bytes
-//! plus its text. Names, bucket lists and class sets are interned ([`Names`]), text sits in its day
-//! shard's arena ([`Shard`]), and box geometry is not kept: `auto=overlaps`, `auto=both` and
-//! `auto=refine` (per `refine_kind`, [`Names::refine`]) are worked out with the real functions
-//! when a row is encoded, for the index's wanted classes.
+//! The index's rows: what [`super::super::queue::build`] reads of one frame, in about 108 bytes
+//! plus its text and its need candidates. Names, bucket lists and class sets are interned
+//! ([`Names`]), text and the Recommended order's candidate boxes ([`CellBox`], 12 bytes each, of
+//! [`need::of_file`] or [`need::of_reply`]) sit in their day shard's arenas ([`Shard`]); no other
+//! box geometry is kept: `auto=overlaps`, `auto=both` and `auto=refine` (per `refine_kind`,
+//! [`Names::refine`]) are worked out with the real functions when a row is encoded, for the
+//! index's wanted classes.
 //!
 //! A row has three parts because they change apart: [`Cand`] comes from the review line or index
 //! line, [`Side`] from the sidecar, [`Part`] from the label file. Encoding goes through the real
@@ -12,9 +14,15 @@
 //!
 //! No field saturates: counts of what a file holds fit the types below because of the file size
 //! caps, which the `const` checks state.
+//!
+//! The arenas only grow: a row's update appends its new text and candidates (unless they are the
+//! ones it has) and leaves the old ones unreferenced. They are reclaimed when the thread walks the
+//! day again (a scan of a changed day, the full pass every 30 minutes), which builds the shard anew.
 
 use super::super::super::layout::{self, Walker};
 use super::super::super::record::{Bucket, Record};
+use super::super::bulk::Wanted;
+use super::super::need::{self, CellBox};
 use super::super::queue::{self, AutoFilter, Candidate, Filters, Uncertainty};
 use super::super::recommend;
 use super::super::refine::Kind as RefineKind;
@@ -33,6 +41,17 @@ const MIN_BOX_JSON_BYTES: u64 = 10;
 const _: () = assert!(MAX_LABEL_FILE_BYTES / MIN_BOX_JSON_BYTES <= u16::MAX as u64);
 // A count of anything in a sidecar is below its size in bytes.
 const _: () = assert!(MAX_SIDECAR_BYTES <= u32::MAX as u64);
+
+/// Need candidates of one file: at most two a box of a label file ([`need::of_file`]), one a
+/// detection of a sidecar ([`need::of_reply`]); fewer than a `u32` counts either way.
+const _: () = assert!(MAX_LABEL_FILE_BYTES / MIN_BOX_JSON_BYTES * 2 <= u32::MAX as u64);
+
+/// Where a run of [`CellBox`]es of one file sits in its shard's arena ([`Shard::boxes`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Run {
+    pub at: u32,
+    pub len: u32,
+}
 
 /// A count of boxes of one label file, which fits (see [`MIN_BOX_JSON_BYTES`]).
 fn box_count(n: usize) -> u16 {
@@ -250,6 +269,11 @@ pub(super) struct Side {
     pub reply: u32,
     pub has_margin: bool,
     pub disagreement: bool,
+    /// The frame's size ([`Record::width`], [`Record::height`]): where its boxes are in it.
+    pub width: u32,
+    pub height: u32,
+    /// [`need::of_reply`]: the need candidates of a frame without a label file.
+    pub boxes: Run,
     /// [`recommend::own_event`]: an event of its own in the Recommended order.
     pub alone: bool,
     /// False: it did not read, the frame counts as unreadable.
@@ -269,6 +293,8 @@ pub(super) struct Part {
     pub refine: u32,
     /// The id of the frame's proposed labels ([`Names::proposed`]) plus one, 0 = none.
     pub proposed: u32,
+    /// [`need::of_file`]: the need candidates of the label file.
+    pub boxes: Run,
     /// [`super::super::overlaps::frame_strength`] for the index's wanted classes
     /// ([`MAX_STRENGTH`]).
     pub strength: u16,
@@ -296,6 +322,7 @@ impl Default for Part {
             note: 0,
             refine: 0,
             proposed: 0,
+            boxes: Run::default(),
             strength: 0,
             auto_review: 0,
             likely: 0,
@@ -384,6 +411,7 @@ impl Row {
             refine_strength,
             refine_open,
             balance: None,
+            need: None,
         }
     }
 }
@@ -393,18 +421,39 @@ impl Row {
 #[derive(Debug, Default)]
 pub(super) struct Shard {
     pub day: String,
+    /// Changes with every row added or updated, unique over every shard of the process: what the
+    /// query's per-shard cache ([`super::query::NeedCache`]) is keyed on.
+    pub version: u64,
     pub rows: Vec<Row>,
     text: String,
     notes: Vec<Box<str>>,
+    /// The rows' need candidates ([`Side::boxes`], [`Part::boxes`]): a row's update appends.
+    boxes: Vec<CellBox>,
+}
+
+/// What the sidecar of a frame said: its row part, its timestamp and its need candidates.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SideRead {
+    pub side: Side,
+    pub timestamp: String,
+    pub boxes: Vec<CellBox>,
+}
+
+/// The next [`Shard::version`].
+fn next_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A frame as read from disk, to go into a row.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Encoded {
     pub gone: bool,
-    /// The sidecar part and its timestamp; None = not read, the row keeps what it has.
-    pub side: Option<(Side, String)>,
+    /// The sidecar part; None = not read, the row keeps what it has.
+    pub side: Option<SideRead>,
     pub part: Part,
+    /// The label file's need candidates ([`Part::boxes`]).
+    pub part_boxes: Vec<CellBox>,
     pub note: Option<String>,
 }
 
@@ -412,6 +461,7 @@ impl Shard {
     pub(super) fn new(day: String) -> Self {
         Self {
             day,
+            version: next_version(),
             ..Self::default()
         }
     }
@@ -436,6 +486,37 @@ impl Shard {
     pub(super) fn note(&self, r: &Row) -> Option<&str> {
         let at = r.part.note.checked_sub(1)?;
         self.notes.get(at as usize).map(|n| &**n)
+    }
+
+    fn run(&self, run: Run) -> &[CellBox] {
+        let at = run.at as usize;
+        at.checked_add(run.len as usize)
+            .and_then(|end| self.boxes.get(at..end))
+            .unwrap_or_default()
+    }
+
+    /// The need candidates of `r`: of its label file, else of its sidecar ([`Row::classes`]'s
+    /// rule).
+    pub(super) fn boxes_of(&self, r: &Row) -> &[CellBox] {
+        if r.part.has_file {
+            self.run(r.part.boxes)
+        } else {
+            self.run(r.side.boxes)
+        }
+    }
+
+    /// Put `boxes` in the arena: where they are. Empty: no room taken.
+    fn store_boxes(&mut self, boxes: &[CellBox]) -> Run {
+        if boxes.is_empty() {
+            return Run::default();
+        }
+        // The ceiling trips long before 4 billion boxes.
+        let at = u32::try_from(self.boxes.len()).unwrap_or(u32::MAX);
+        self.boxes.extend_from_slice(boxes);
+        Run {
+            at,
+            len: u32::try_from(boxes.len()).unwrap_or(0),
+        }
     }
 
     /// The path of `r`, `<scene>/<camera>/<date>/<stem>.jpg`.
@@ -483,16 +564,32 @@ impl Shard {
     }
 
     /// Add a row at the end: the caller adds them by stem, then by `.jpg` before `.json`.
+    /// A row of this shard changes in place: a new [`Self::version`].
+    pub(super) fn touch(&mut self) {
+        self.version = next_version();
+    }
+
     pub(super) fn push(&mut self, stem: &str, json: bool, queued: bool, cand: Cand, e: Encoded) {
-        let (side, timestamp) = e.side.unwrap_or_default();
+        self.version = next_version();
+        let SideRead {
+            mut side,
+            timestamp,
+            boxes,
+        } = e.side.unwrap_or_default();
+        side.boxes = self.store_boxes(&boxes);
         let note = self.store_note(e.note.as_deref(), 0);
+        let part_boxes = self.store_boxes(&e.part_boxes);
         let text_at = self.store(stem, &timestamp).unwrap_or(u32::MAX);
         self.rows.push(Row {
             text_at,
             timestamp_len: u32::try_from(timestamp.len()).unwrap_or(0),
             cand,
             side,
-            part: Part { note, ..e.part },
+            part: Part {
+                note,
+                boxes: part_boxes,
+                ..e.part
+            },
             stem_len: u8::try_from(stem.len()).unwrap_or(u8::MAX),
             queued,
             json,
@@ -502,12 +599,18 @@ impl Shard {
 
     /// Put what `e` says into row `at`.
     pub(super) fn update(&mut self, at: usize, e: Encoded) {
+        self.version = next_version();
         let Some(mut row) = self.rows.get(at).copied() else {
             return;
         };
         row.gone = e.gone;
         if !e.gone {
-            if let Some((side, timestamp)) = e.side {
+            if let Some(SideRead {
+                mut side,
+                timestamp,
+                boxes,
+            }) = e.side
+            {
                 if self.timestamp(&row) != timestamp {
                     let stem = self.stem(&row).to_string();
                     if let Some(text_at) = self.store(&stem, &timestamp) {
@@ -515,10 +618,24 @@ impl Shard {
                         row.timestamp_len = u32::try_from(timestamp.len()).unwrap_or(0);
                     }
                 }
+                side.boxes = if self.run(row.side.boxes) == boxes.as_slice() {
+                    row.side.boxes
+                } else {
+                    self.store_boxes(&boxes)
+                };
                 row.side = side;
             }
             let note = self.store_note(e.note.as_deref(), row.part.note);
-            row.part = Part { note, ..e.part };
+            let part_boxes = if self.run(row.part.boxes) == e.part_boxes.as_slice() {
+                row.part.boxes
+            } else {
+                self.store_boxes(&e.part_boxes)
+            };
+            row.part = Part {
+                note,
+                boxes: part_boxes,
+                ..e.part
+            };
         }
         if let Some(slot) = self.rows.get_mut(at) {
             *slot = row;
@@ -527,13 +644,16 @@ impl Shard {
 
     /// Bytes of rows and text so far: a quick look during a walk.
     pub(super) fn used(&self) -> usize {
-        self.rows.len() * size_of::<Row>() + self.text.len()
+        self.rows.len() * size_of::<Row>()
+            + self.text.len()
+            + self.boxes.len() * size_of::<CellBox>()
     }
 
     /// Heap bytes, from capacities.
     pub(super) fn bytes(&self) -> usize {
         self.rows.capacity() * size_of::<Row>()
             + self.text.capacity()
+            + self.boxes.capacity() * size_of::<CellBox>()
             + self.notes.capacity() * size_of::<Box<str>>()
             + self.notes.iter().map(|n| n.len()).sum::<usize>()
             + self.day.capacity()
@@ -543,6 +663,7 @@ impl Shard {
     pub(super) fn shrink(&mut self) {
         self.rows.shrink_to_fit();
         self.text.shrink_to_fit();
+        self.boxes.shrink_to_fit();
     }
 }
 
@@ -553,6 +674,8 @@ pub(super) struct Derive {
     filters: Vec<Filters>,
     /// `auto=refine` once per entry of [`REFINE_KINDS`], with the index's wanted classes.
     refine: Vec<Filters>,
+    /// The index's wanted classes, for the need candidates.
+    wanted: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl Derive {
@@ -569,19 +692,28 @@ impl Derive {
                 .iter()
                 .map(|k| with(AutoFilter::Refine, *k))
                 .collect(),
+            wanted: wanted.cloned(),
         }
+    }
+
+    /// The index's wanted classes as [`Wanted`].
+    pub(super) fn wanted(&self) -> Option<Wanted<'_>> {
+        self.wanted
+            .as_ref()
+            .map(|(classes, hidden)| Wanted { classes, hidden })
     }
 
     fn of(&self, auto: AutoFilter) -> Option<&Filters> {
         self.filters.iter().find(|f| f.auto == Some(auto))
     }
 
-    /// The label part of a frame with `labels` (None = no label file), and its re-label note.
+    /// The label part of a frame with `labels` (None = no label file), its re-label note and its
+    /// need candidates.
     pub(super) fn part(
         &self,
         labels: Option<&LabelFile>,
         names: &RwLock<Names>,
-    ) -> (Part, Option<String>) {
+    ) -> (Part, Option<String>, Vec<CellBox>) {
         let u = Uncertainty::default().with_labels(labels);
         let auto = self.filters.iter().enumerate().fold(0u8, |bits, (at, f)| {
             bits | u8::from(f.auto_keeps(labels)) << at
@@ -607,8 +739,9 @@ impl Derive {
             ..Part::default()
         };
         let Some(l) = labels else {
-            return (part, u.relabel);
+            return (part, u.relabel, Vec::new());
         };
+        let boxes = need::of_file(l, self.wanted().as_ref());
         part.status = l.status;
         part.has_file = true;
         part.empty_confirmed = l.empty_confirmed;
@@ -638,7 +771,7 @@ impl Derive {
             let set: Vec<Name> = proposed.iter().map(|p| names.names.intern(p)).collect();
             part.proposed = names.proposed.intern(&set).saturating_add(1);
         }
-        (part, u.relabel)
+        (part, u.relabel, boxes)
     }
 }
 
@@ -667,21 +800,29 @@ impl Encoder<'_> {
         }
     }
 
-    pub(super) fn side(&self, rec: &Record) -> (Side, String) {
+    pub(super) fn side(&self, rec: &Record) -> SideRead {
         let u = Uncertainty::of(rec);
         let reply = queue::reply_confidence(rec);
+        let boxes = need::of_reply(rec, self.derive.wanted().as_ref());
         let mut names = self.names.write_recover();
         let side = Side {
             model: names.names.intern(&rec.model),
             margin: u.margin.unwrap_or(0.0),
             suppressed: u32::try_from(u.suppressed).unwrap_or(u32::MAX),
             reply: names.class_set_of(reply.iter().map(|(c, s)| (c.as_str(), *s))),
+            width: rec.width,
+            height: rec.height,
+            boxes: Run::default(),
             has_margin: u.margin.is_some(),
             disagreement: u.disagreement,
             alone: recommend::own_event(rec),
             ok: true,
         };
-        (side, rec.timestamp.clone())
+        SideRead {
+            side,
+            timestamp: rec.timestamp.clone(),
+            boxes,
+        }
     }
 
     /// `frame` as a row: the sidecar too with `side`.
@@ -694,9 +835,9 @@ impl Encoder<'_> {
         };
         let side = side.then(|| match frame.record() {
             Ok(rec) => self.side(&rec),
-            Err(_) => (Side::default(), String::new()),
+            Err(_) => SideRead::default(),
         });
-        let (part, note) = match frame.labels() {
+        let (part, note, part_boxes) = match frame.labels() {
             Ok(labels) => self.derive.part(labels.as_ref(), self.names),
             Err(_) => (
                 Part {
@@ -704,12 +845,14 @@ impl Encoder<'_> {
                     ..Part::default()
                 },
                 None,
+                Vec::new(),
             ),
         };
         Encoded {
             gone: false,
             side,
             part,
+            part_boxes,
             note,
         }
     }

@@ -62,15 +62,27 @@ impl State {
         let mut found = 0usize;
         for (rel, cand) in &q.cands {
             let at = self.locate(rel).map(|(s, at)| (s.day.clone(), at));
-            match at.and_then(|(day, at)| self.shards.get_mut(&day)?.rows.get_mut(at)) {
-                Some(row) => {
-                    row.cand = *cand;
-                    row.queued = true;
-                    found += 1;
-                }
+            let shard = at.as_ref().and_then(|(day, _)| self.shards.get_mut(day));
+            let Some((shard, i)) = shard.zip(at.as_ref().map(|(_, i)| *i)) else {
+                missing.insert(queue::day_of(rel).to_string());
+                continue;
+            };
+            // Only a row that changes moves its shard's version (what the need cache keys on):
+            // a drain that re-reads an unchanged queue keeps every cached part.
+            let changed = match shard.rows.get(i) {
+                Some(row) => row.cand != *cand || !row.queued,
                 None => {
                     missing.insert(queue::day_of(rel).to_string());
+                    continue;
                 }
+            };
+            if changed {
+                shard.touch();
+            }
+            if let Some(row) = shard.rows.get_mut(i) {
+                row.cand = *cand;
+                row.queued = true;
+                found += 1;
             }
         }
         let queued = self
@@ -262,6 +274,8 @@ impl Index {
                 if let Some(q) = queue {
                     state.apply_queue(q, &mut missing);
                 }
+                // Days the walk removed take their cached need parts with them.
+                self.need.retain(&state);
             }
             self.mark_stale(missing);
         }

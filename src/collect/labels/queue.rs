@@ -3,8 +3,9 @@
 //! status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
 //! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest; or,
-//! with [`Order::Recommended`] (the Review tab's default, set by its route alone), one frame per
-//! event first ([`super::recommend`]). Also the counts the Review tab shows, and
+//! with [`Order::Recommended`] (the Review tab's default, set by its route alone), by recall need
+//! divided by the event rank ([`super::need`], [`super::recommend`]). Also the counts the Review
+//! tab shows, and
 //! [`labelled`], every label file those filters select whichever queue it is in.
 //!
 //! The walks read a day folder at a time ([`by_day`], [`over_days`], one [`Walker`] per day folder)
@@ -14,6 +15,7 @@
 use super::super::layout::{self, REVIEW_QUEUE_FILE, ReviewLine, Walker};
 use super::super::record::{Bucket, IndexLine, Record};
 use super::bulk::Wanted;
+use super::need::{self, CellBox, CellTally, Need, NeedCounts, RecallNeed, Scorer, Steer};
 use super::recommend;
 use super::refine::Kind as RefineKind;
 use super::{BoxState, Frame, LabelFile, Status, Triage};
@@ -21,6 +23,7 @@ use crate::parallel;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Which frames the queue draws from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -182,7 +185,7 @@ pub struct Balance {
 }
 
 impl Balance {
-    /// Every dimension: what the Recommended order ([`Order::Recommended`]) balances by.
+    /// Every dimension.
     pub const ALL: Self = Self {
         class: true,
         scene: true,
@@ -484,9 +487,9 @@ pub enum Order {
     /// orders and `balance=`: what bulk actions, auto-label runs, previews and the CLI take.
     #[default]
     Uncertain,
-    /// The first frame of each event before any second one, then the balance of class, scene and
-    /// camera in bands, then the uncertainty ([`super::recommend`]). Only `GET /v1/review/next`
-    /// asks for it, without `auto=` and `balance=`; [`Filters::from_query`] never does.
+    /// The recall need ([`super::need`]) divided by the event rank, in bands, then the uncertainty
+    /// ([`super::recommend`]). Only `GET /v1/review/next` asks for it, without `auto=` and
+    /// `balance=`; [`Filters::from_query`] never does.
     Recommended,
 }
 
@@ -516,6 +519,10 @@ pub struct Filters {
     /// How the listed frames are sorted. Not from the query ([`Self::from_query`] leaves it
     /// [`Order::Uncertain`]): the Review tab's route sets it. Lists nothing more or less.
     pub order: Order,
+    /// What steers [`Order::Recommended`] from outside the folder (measured recall, parked spots;
+    /// [`need::Steer`]). Never from the query: the route's one snapshot per request, so the walk
+    /// and the index weigh alike. None = nothing steers.
+    pub steer: Option<Arc<Steer>>,
 }
 
 impl Filters {
@@ -612,20 +619,27 @@ impl Filters {
             refine_kind,
             balance,
             order: Order::Uncertain,
+            steer: None,
         })
     }
 
-    /// What the order balances by: every dimension under [`Order::Recommended`], else
-    /// [`Self::balance`].
+    /// What `balance=` balances by: [`Self::balance`] in the uncertainty order; the Recommended
+    /// order weighs by recall need instead ([`Self::need`]).
     pub fn balance_by(&self) -> Option<Balance> {
         match self.order {
-            Order::Recommended => Some(Balance::ALL),
+            Order::Recommended => None,
             Order::Uncertain => self.balance,
         }
     }
 
+    /// What weighs the frames under [`Order::Recommended`] ([`need::Need`]); None in the
+    /// uncertainty order.
+    pub(super) fn need(&self) -> Option<Need<'_>> {
+        (self.order == Order::Recommended).then(|| Need::new(self.wanted(), self.steer.as_deref()))
+    }
+
     /// [`Self::wanted`] as [`Wanted`].
-    fn wanted(&self) -> Option<Wanted<'_>> {
+    pub(super) fn wanted(&self) -> Option<Wanted<'_>> {
         self.wanted
             .as_ref()
             .map(|(classes, hidden)| Wanted { classes, hidden })
@@ -881,6 +895,10 @@ pub struct Uncertainty {
     /// before everything else but repeat-only frames, which stay last.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceNeed>,
+    /// [`Order::Recommended`] only: the frame's recall need ([`need::RecallNeed`]), what the order
+    /// sorts by after reopened and before repeat-only frames.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub need: Option<RecallNeed>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -917,6 +935,7 @@ impl Uncertainty {
             refine_strength: 0,
             refine_open: 0,
             balance: None,
+            need: None,
         }
     }
 
@@ -1129,6 +1148,9 @@ pub struct Queue {
     pub unreadable: u64,
     /// With [`Filters::balance`]: the reviewed frames the order weighed against.
     pub balance: Option<BalanceTally>,
+    /// With [`Order::Recommended`]: the reviewed boxes the need weighed against
+    /// ([`CellTally::counts`]).
+    pub need: Option<NeedCounts>,
 }
 
 /// Add the frames of review lines `lines` to `out`, each once with those in `seen`.
@@ -1230,13 +1252,39 @@ struct DayQueue {
     wanted: Vec<BTreeMap<String, u8>>,
     /// [`Order::Recommended`]: every counted frame, listed ones by their index in `items`.
     members: Vec<recommend::Member>,
+    /// [`Order::Recommended`]: the reviewed boxes counted, and per item what its need is made of.
+    need: CellTally,
+    facts: Vec<ItemFacts>,
+}
+
+/// A counted frame of a day folder for [`need::day`]: its time, whether it is an event of its own,
+/// its candidates and its index among the listed items.
+type Counted = (Option<i64>, bool, Vec<CellBox>, Option<usize>);
+
+/// What the need of a listed frame is made of ([`need::Scorer::score`]).
+#[derive(Debug, Default)]
+struct ItemFacts {
+    boxes: Vec<CellBox>,
+    gaps: Vec<CellBox>,
+    visit_classes: Vec<u16>,
+    width: u32,
+    height: u32,
+    /// Its date folder.
+    date: String,
 }
 
 /// The candidates of one day folder, read: the part of [`build`] that touches files.
-fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue {
+fn build_day(
+    mut walker: Walker<'_>,
+    day: &[Candidate],
+    f: &Filters,
+    balance: Option<Balance>,
+    n: Option<&Need<'_>>,
+) -> DayQueue {
     let mut q = DayQueue::default();
-    let balance = f.balance_by();
     let recommended = f.order == Order::Recommended;
+    // [`need::day`]'s input: every counted frame (time, alone, candidates, listed index).
+    let mut counted: Vec<Counted> = Vec::new();
     for c in day {
         let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
             continue;
@@ -1274,6 +1322,43 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
                 listed: listed.then_some(q.items.len()),
             });
         }
+        if let Some(n) = n {
+            let date = need::date_of(day_of(&c.rel));
+            let boxes = match labels.as_ref() {
+                Some(l) => need::of_file(l, n.wanted()),
+                None => need::of_reply(&rec, n.wanted()),
+            };
+            if labels
+                .as_ref()
+                .is_some_and(|l| l.status == Status::Reviewed)
+            {
+                n.add_reviewed(
+                    &mut q.need,
+                    &need::Reviewed {
+                        camera: &c.camera,
+                        scene: &c.scene,
+                        day: date,
+                        width: rec.width,
+                        height: rec.height,
+                        boxes: &boxes,
+                    },
+                );
+            }
+            if listed {
+                q.facts.push(ItemFacts {
+                    width: rec.width,
+                    height: rec.height,
+                    date: date.to_string(),
+                    ..ItemFacts::default()
+                });
+            }
+            counted.push((
+                recommend::event_ms(&rec.timestamp),
+                recommend::own_event(&rec),
+                boxes,
+                listed.then_some(q.items.len()),
+            ));
+        }
         if !listed {
             continue;
         }
@@ -1300,6 +1385,23 @@ fn build_day(mut walker: Walker<'_>, day: &[Candidate], f: &Filters) -> DayQueue
         });
         q.wanted.extend(wanted);
     }
+    if n.is_some() {
+        let frames: Vec<need::DayFrame<'_>> = counted
+            .iter()
+            .map(|(ms, alone, boxes, _)| need::DayFrame {
+                ms: *ms,
+                alone: *alone,
+                boxes,
+            })
+            .collect();
+        for ((_, _, boxes, listed), out) in counted.iter().zip(need::day(&frames)) {
+            if let Some(facts) = listed.and_then(|i| q.facts.get_mut(i)) {
+                facts.boxes.clone_from(boxes);
+                facts.gaps = out.gaps;
+                facts.visit_classes = out.visit_classes;
+            }
+        }
+    }
     q
 }
 
@@ -1312,14 +1414,64 @@ fn weigh(items: &mut [Item], wanted: &[BTreeMap<String, u8>], tally: &BalanceTal
     }
 }
 
+/// Each item's [`Uncertainty::need`] against `tally`; `facts` holds what each item's need is made
+/// of, in their order.
+fn weigh_need(items: &mut [Item], facts: &[ItemFacts], n: &Need<'_>, tally: &CellTally) {
+    let scorer = Scorer::new(n, tally);
+    for (item, x) in items.iter_mut().zip(facts) {
+        let at = need::Facts {
+            camera: &item.camera,
+            scene: &item.scene,
+            day: &x.date,
+            width: x.width,
+            height: x.height,
+        };
+        let d = scorer.score(&at, &x.boxes, &x.gaps);
+        let visit = scorer.expands(&item.camera, &x.visit_classes);
+        item.uncertainty.need = Some(scorer.explain(&d, &item.camera, &item.scene, visit));
+    }
+}
+
 /// Build the queue of `dir` for `f`. Frames whose image or sidecar is gone (retention) are
 /// left out silently; a sidecar or label file that does not parse counts as `unreadable`.
 pub fn build(dir: &Path, f: &Filters) -> Queue {
     build_on(dir, f, None)
 }
 
+/// How [`build_on`] arranges the Recommended order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrangement {
+    /// By recall need ([`super::need`]).
+    Need,
+    /// As before the need model ([`recommend::legacy`]), for the real-data comparison alone.
+    #[cfg(test)]
+    Legacy,
+}
+
 /// [`build`] on `threads` threads (None: as many as a walk of that size takes).
 fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
+    build_as(dir, f, threads, Arrangement::Need)
+}
+
+/// The Recommended order of `dir` for `f` as it was before the need model: event rank as a strict
+/// tier, then the balance of every dimension in bands of 250. For the real-data comparison
+/// (`server::review::order_eval`) alone.
+#[cfg(test)]
+pub(crate) fn build_legacy(dir: &Path, f: &Filters) -> Queue {
+    let f = Filters {
+        order: Order::Recommended,
+        ..f.clone()
+    };
+    build_as(dir, &f, None, Arrangement::Legacy)
+}
+
+fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -> Queue {
+    let legacy = how != Arrangement::Need;
+    let balance = if legacy {
+        Some(Balance::ALL)
+    } else {
+        f.balance_by()
+    };
     let mut q = Queue::default();
     let mut cameras = BTreeSet::new();
     let mut kept = Vec::new();
@@ -1336,12 +1488,14 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
     let threads = threads.unwrap_or_else(|| parallel::walk_threads_over(kept.len()));
     let days = by_day(kept);
     let walker = Walker::new(dir);
+    let n = if legacy { None } else { f.need() };
     let parts = parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
         let day = days.get(i).map_or(&[][..], Vec::as_slice);
-        build_day(walker.clone(), day, f)
+        build_day(walker.clone(), day, f, balance, n.as_ref())
     });
     let mut seen_labels = BTreeSet::new();
     let (mut tally, mut wanted) = (BalanceTally::default(), Vec::new());
+    let (mut cells, mut facts) = (CellTally::default(), Vec::new());
     let mut events = recommend::Events::default();
     for mut part in parts {
         // Each part is one day folder: its members' indices move by the items before it.
@@ -1356,10 +1510,16 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
         q.unreadable += part.unreadable;
         tally.merge(part.balance);
         wanted.extend(part.wanted);
+        cells.merge(part.need);
+        facts.extend(part.facts);
     }
-    if let Some(by) = f.balance_by() {
+    if let Some(by) = balance {
         weigh(&mut q.items, &wanted, &tally, by);
         q.balance = Some(tally);
+    }
+    if let Some(n) = &n {
+        weigh_need(&mut q.items, &facts, n, &cells);
+        q.need = Some(cells.counts(n.wanted().map_or(&[][..], |w| w.classes)));
     }
     match f.order {
         Order::Uncertain => sort_items(&mut q.items),
@@ -1367,7 +1527,7 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
             // The random slots move by one with each frame decided (reviewed or skipped).
             let decided = recommend::random_slots(f)
                 .then(|| q.counts.reviewed.saturating_add(q.counts.skipped));
-            q.items = recommended(std::mem::take(&mut q.items), &events, decided);
+            q.items = recommended(std::mem::take(&mut q.items), &events, decided, how);
         }
     }
     q.cameras = cameras.into_iter().collect();
@@ -1379,10 +1539,17 @@ fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
 /// ([`recommend::arrange`]; ties as [`sort_items`]: newest, then by path). With `decided` (the
 /// view has random slots, [`recommend::random_slots`]): the pool frames in their slots, marked
 /// [`Item::random_pick`] ([`recommend::with_random_slots`]).
-fn recommended(items: Vec<Item>, events: &recommend::Events, decided: Option<u64>) -> Vec<Item> {
+fn recommended(
+    items: Vec<Item>,
+    events: &recommend::Events,
+    decided: Option<u64>,
+    how: Arrangement,
+) -> Vec<Item> {
+    let visits: Vec<recommend::Visit> = items.iter().map(|i| visit_of(&i.uncertainty)).collect();
     let keys: Vec<recommend::Key> = items
         .iter()
-        .map(|i| recommend::key(&i.uncertainty, 0))
+        .zip(&visits)
+        .map(|(i, v)| recommend::key(&i.uncertainty, *v))
         .collect();
     let tie = |a: usize, b: usize| match (items.get(a), items.get(b)) {
         (Some(a), Some(b)) => b
@@ -1391,7 +1558,17 @@ fn recommended(items: Vec<Item>, events: &recommend::Events, decided: Option<u64
             .then_with(|| a.frame.cmp(&b.frame)),
         _ => a.cmp(&b),
     };
-    let order = recommend::arrange(events, &keys, &tie);
+    let order = match how {
+        Arrangement::Need => recommend::arrange(events, &keys, &visits, &tie),
+        #[cfg(test)]
+        Arrangement::Legacy => {
+            let keys: Vec<recommend::legacy::Key> = items
+                .iter()
+                .map(|i| recommend::legacy::key(&i.uncertainty, 0))
+                .collect();
+            recommend::legacy::arrange(events, &keys, &tie)
+        }
+    };
     let served: Vec<(usize, u32, bool)> = match decided {
         Some(decided) => {
             let pool_hash_of = |i: usize| {
@@ -1414,9 +1591,22 @@ fn recommended(items: Vec<Item>, events: &recommend::Events, decided: Option<u64
             let mut item = slots.get_mut(i)?.take()?;
             item.event_rank = Some(rank);
             item.random_pick = random;
+            if let Some(n) = &mut item.uncertainty.need {
+                n.visit_score = need::visit_score(n.score, rank, n.expanded);
+            }
             Some(item)
         })
         .collect()
+}
+
+/// What the event rank divides of a frame of uncertainty `u` ([`Uncertainty::need`]; none: 0).
+pub(super) fn visit_of(u: &Uncertainty) -> recommend::Visit {
+    u.need
+        .as_ref()
+        .map_or_else(recommend::Visit::default, |n| recommend::Visit {
+            score: n.score,
+            expanded: n.expanded,
+        })
 }
 
 /// Reviewed boxes of one class ([`Tally::coverage`]).
@@ -1558,6 +1748,50 @@ fn camera_day(rel: &str) -> Option<(String, String)> {
         (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
     (parts.next().is_none() && !camera.is_empty() && !date.is_empty())
         .then(|| (camera.to_string(), date.to_string()))
+}
+
+/// The parked-spot observations of the reviewed frames among `all` (the candidates of `dir`), by
+/// the export's rules ([`need::spot_obs`]: the one way the review index makes them too,
+/// [`super::index::reviewed_obs`]), in frame order. Reads the label file of every frame and the
+/// sidecar of reviewed ones with a training box (their size).
+pub fn reviewed_obs(
+    dir: &Path,
+    all: Vec<Candidate>,
+    wanted: &Wanted<'_>,
+) -> Vec<super::statics::Obs> {
+    let threads = parallel::walk_threads_over(all.len());
+    let days = by_day(all);
+    let walker = Walker::new(dir);
+    let parts = parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
+        let mut walker = walker.clone();
+        let mut out = Vec::new();
+        for c in days.get(i).map_or(&[][..], Vec::as_slice) {
+            let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
+                continue;
+            };
+            let Ok(Some(labels)) = frame.labels() else {
+                continue;
+            };
+            if labels.status != Status::Reviewed {
+                continue;
+            }
+            let boxes = need::of_file(&labels, Some(wanted));
+            if !boxes.iter().any(|b| b.has(need::TRAINING)) {
+                continue;
+            }
+            let Ok(rec) = frame.record() else {
+                continue;
+            };
+            out.push((c.rel.clone(), rec.width, rec.height, boxes));
+        }
+        out
+    });
+    let mut frames: Vec<_> = parts.into_iter().flatten().collect();
+    frames.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    frames
+        .iter()
+        .flat_map(|(rel, w, h, boxes)| need::spot_obs(rel, *w, *h, boxes, wanted.classes))
+        .collect()
 }
 
 /// The [`Tally`] of `dir`. Reads the label files, never the sidecars, so it costs about one small
@@ -1749,6 +1983,7 @@ mod tests {
             refine_strength: 0,
             refine_open: 0,
             balance: None,
+            need: None,
         }
     }
 

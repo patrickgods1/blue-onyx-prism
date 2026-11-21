@@ -154,6 +154,8 @@ struct Index {
     drain: Mutex<()>,
     state: RwLock<State>,
     names: RwLock<Names>,
+    /// What the Recommended order keeps per shard between queries.
+    need: query::NeedCache,
     /// Set for good when the index stops being current.
     cancelled: AtomicBool,
     /// The first build is running.
@@ -182,6 +184,7 @@ impl Index {
             drain: Mutex::new(()),
             state: RwLock::new(State::default()),
             names: RwLock::new(Names::default()),
+            need: query::NeedCache::default(),
             cancelled: AtomicBool::new(false),
             building: AtomicBool::new(true),
             catching_up: AtomicBool::new(false),
@@ -231,7 +234,7 @@ impl Index {
     }
 
     fn bytes(&self) -> usize {
-        self.state.read_recover().bytes() + self.names.read_recover().bytes()
+        self.state.read_recover().bytes() + self.names.read_recover().bytes() + self.need.bytes()
     }
 
     /// How long a query waits for what is behind.
@@ -313,7 +316,7 @@ impl Index {
         let indexing = self.indexing();
         let state = self.state.read_recover();
         let names = self.names.read_recover();
-        let (mut answer, shown) = query::answer(&state, &names, f, after, then);
+        let (mut answer, shown) = query::answer(&state, &names, f, after, then, &self.need);
         answer.indexing = indexing;
         (answer, shown)
     }
@@ -560,6 +563,90 @@ pub fn day_written(day: &Path) {
     }
 }
 
+/// The current index of `dir` for `wanted` once built (none is made here).
+fn built(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> Option<Arc<Index>> {
+    let index = HUB
+        .lock_recover()
+        .current
+        .iter()
+        .find(|c| c.index.is(dir, wanted))
+        .map(|c| c.index.clone())?;
+    (!index.cancelled() && !index.building.load(Ordering::Acquire)).then_some(index)
+}
+
+/// What changes when any row of `state` does: a sum of its shards' versions, mixed.
+fn rows_stamp(state: &State) -> u64 {
+    state.shards.values().fold(0u64, |h, s| {
+        // splitmix64 of the version, so that sums of distinct versions rarely collide.
+        let mut z = s.version.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h.wrapping_add(z ^ (z >> 31))
+    })
+}
+
+/// The stamp of the rows of the built index of `dir` for `wanted` ([`reviewed_obs`] of the same
+/// stamp holds the same frames); None without one.
+pub fn rows_version(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> Option<u64> {
+    let index = built(dir, wanted)?;
+    let state = index.state.read_recover();
+    Some(rows_stamp(&state))
+}
+
+/// The parked-spot observations of the reviewed rows of the built index of `dir` for `wanted`
+/// ([`super::need::spot_obs`], the export's rules, as [`super::queue::reviewed_obs`] walks them),
+/// in frame order, with the stamp of the rows they came from: the spot table of the folder without
+/// reading a label file. None without a built index (none is made here). Under the read lock only
+/// each frame's path, size and boxes are copied; the observations and their strings are made after
+/// it is released.
+pub fn reviewed_obs(
+    dir: &Path,
+    wanted: Option<&(Vec<String>, Vec<String>)>,
+) -> Option<(u64, Vec<super::statics::Obs>)> {
+    let index = built(dir, wanted)?;
+    let classes = wanted.map_or(&[][..], |w| w.0.as_slice());
+    let (stamp, mut frames) = {
+        let state = index.state.read_recover();
+        let mut frames: Vec<(String, u32, u32, Vec<super::need::CellBox>)> = Vec::new();
+        for shard in state.shards.values() {
+            for row in &shard.rows {
+                if row.gone || !row.readable() || row.part.status != super::Status::Reviewed {
+                    continue;
+                }
+                let boxes = shard.boxes_of(row);
+                // Only frames that give an observation are copied ([`super::need::spot_obs`]).
+                if !boxes.iter().any(|b| b.has(super::need::TRAINING))
+                    || boxes.iter().any(|b| b.has(super::need::UNSPOTTED))
+                {
+                    continue;
+                }
+                frames.push((
+                    shard.rel(row),
+                    row.side.width,
+                    row.side.height,
+                    boxes.to_vec(),
+                ));
+            }
+        }
+        (rows_stamp(&state), frames)
+    };
+    frames.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let obs = frames
+        .iter()
+        .flat_map(|(rel, w, h, boxes)| super::need::spot_obs(rel, *w, *h, boxes, classes))
+        .collect();
+    Some((stamp, obs))
+}
+
+/// The index of `dir` for `wanted` is still being built (its rows are not all in).
+pub fn building(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> bool {
+    HUB.lock_recover()
+        .current
+        .iter()
+        .find(|c| c.index.is(dir, wanted))
+        .is_some_and(|c| !c.index.cancelled() && c.index.building.load(Ordering::Acquire))
+}
+
 /// The index's bytes, from capacities; None with no index.
 pub fn bytes() -> Option<usize> {
     let index = HUB.lock_recover().current.first()?.index.clone();
@@ -582,7 +669,7 @@ fn timing(dir: &Path) -> Timing {
 }
 
 /// Whether a folder of `frames` frames takes an index.
-fn takes_index(frames: usize) -> bool {
+pub fn takes_index(frames: usize) -> bool {
     frames >= MIN_INDEXED_FRAMES
 }
 
