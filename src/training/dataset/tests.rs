@@ -4263,3 +4263,61 @@ fn a_jpeg_without_its_end_marker_is_copied_never_linked() {
         "the copy kept its bytes"
     );
 }
+
+/// `BenchTags.cellTag` of `assets/benchmark.js` (the Benchmark page's By tag table) says what
+/// [`is_cell_tag`] says. Needs `node`: without it this says so and passes, unless
+/// `BOP_REQUIRE_NODE=1` (CI).
+#[test]
+fn the_page_hides_the_same_tags_as_is_cell_tag() {
+    let node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !node {
+        assert!(
+            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
+            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
+        );
+        println!("skipped: no node");
+        return;
+    }
+    let tags = [
+        "heldout:cam:back",
+        "heldout:cam:drive:way",
+        "heldout:camscene:night:back",
+        "heldout:camscene:ir:a:b",
+        "heldout:cam:",
+        "heldout:camera:x",
+        "heldout:all",
+        "heldout:night",
+        "heldout:in-scope",
+        "heldout:random",
+        "camera:back",
+        "date:2026-11-01",
+        "night",
+        "",
+    ];
+    const DRIVER: &str = r#"
+const fs = require('fs'), vm = require('vm');
+const ctx = vm.createContext({});
+vm.runInContext(fs.readFileSync(process.env.BOP_BENCHMARK_JS, 'utf8'), ctx);
+const tags = JSON.parse(process.env.BOP_TAGS);
+process.stdout.write(JSON.stringify(tags.map((t) => ctx.BenchTags.cellTag(t))));
+"#;
+    let js = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/benchmark.js");
+    let out = std::process::Command::new("node")
+        .args(["-e", DRIVER])
+        .env("BOP_BENCHMARK_JS", js)
+        .env("BOP_TAGS", serde_json::to_string(&tags).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "node: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let page: Vec<bool> = serde_json::from_slice(&out.stdout).unwrap();
+    let rust: Vec<bool> = tags.iter().map(|t| is_cell_tag(t)).collect();
+    assert_eq!(page, rust, "{tags:?}");
+    assert!(rust.iter().filter(|x| **x).count() >= 4);
+}

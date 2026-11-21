@@ -108,7 +108,7 @@ mod tests {
     use super::*;
     use crate::benchmark::ClassRecall;
     use crate::resources::catalog::TrainFamily;
-    use crate::training::job::{BenchSummary, RecallCells, TrainRequest};
+    use crate::training::job::{BenchSummary, RecallCells, TrainOutput, TrainRequest};
     use crate::training::recipe::TrainRecipe;
     use crate::training::service::RunState;
     use std::cell::Cell;
@@ -165,7 +165,18 @@ mod tests {
             progress: None,
             log: Vec::new(),
             dataset: None,
-            output: None,
+            output: Some(TrainOutput {
+                name: id.into(),
+                onnx: PathBuf::from(format!("/models/{id}.onnx")),
+                yaml: PathBuf::from(format!("/models/{id}.yaml")),
+                provenance: PathBuf::new(),
+                family: crate::model::ModelFamilyKind::Yolo26,
+                classes: vec!["person".into()],
+                license: String::new(),
+                heldout: None,
+                device: String::new(),
+                train_seconds: 0.0,
+            }),
             registered: None,
             benchmark: Some(b),
             benchmark_error: None,
@@ -207,7 +218,7 @@ mod tests {
         assert_eq!(read(&path).len(), 1);
         let first = get().unwrap();
         assert_eq!(reads.get(), 1);
-        assert_eq!(first.overall.as_ref().unwrap().run, "a");
+        assert_eq!(first.overall.as_ref().unwrap().run.id, "a");
         // Unchanged: the same table, not read again.
         let again = get().unwrap();
         assert!(Arc::ptr_eq(&first, &again));

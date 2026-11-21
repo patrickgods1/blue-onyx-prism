@@ -380,7 +380,7 @@ pub struct BenchSummary {
 /// included), classes with objects only. JSON:
 ///
 /// ```json
-/// {"by_scene": {"night": [{"class": "raccoon", "gt": 12, "missed": 5, "recall": 0.583}],
+/// {"by_scene": {"night": [{"class": "raccoon", "gt": 12, "missed": 5}],
 ///               "all": [...]},
 ///  "by_camera": {"back": [...]},
 ///  "by_camera_scene": [{"camera": "back", "scene": "night", "classes": [...]}]}
@@ -1700,7 +1700,14 @@ impl Finish<'_> {
                 &job.run_dir,
                 cancel,
             ) {
-                Ok(b) => b,
+                // Its recall cells are read by nothing (the Review queue steers by the trained
+                // model's): kept out of `runs.json`.
+                Ok(b) => b.map(|mut b| {
+                    if let Some(s) = b.summary.as_mut() {
+                        s.recall_cells = RecallCells::default();
+                    }
+                    b
+                }),
                 Err(e) if e.downcast_ref::<Cancelled>().is_some() => return Err(e),
                 Err(e) => {
                     let msg = format!("{e:#}");

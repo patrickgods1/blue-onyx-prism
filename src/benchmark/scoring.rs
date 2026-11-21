@@ -6,9 +6,12 @@ use super::*;
 
 /// Score the run: overall accuracy (over the images with real ground truth, else those with
 /// pseudo ground truth), per dataset and per tag; marks each stored prediction TP/FP and each
-/// ground-truth object matched/missed in `per_image`. Each tag also gets its per-class recall
-/// ([`Breakdown::per_class`]) over every class of the model the sets score: a custom model's
-/// raccoon or fox is no CCTV class, so it is in no AP here, but it has its recall per tag.
+/// ground-truth object matched/missed in `per_image`. Each held-out tag (`heldout:*`, the only
+/// ones a training run reads them from; other tags would only grow `benchmark.json`) also gets
+/// its per-class recall ([`Breakdown::per_class`]) over every class of the model the sets score:
+/// a custom model's raccoon or fox is no CCTV class, so it is in no AP here, but it has its
+/// recall per tag. A model without any CCTV class gets no accuracy at all; [`tag_recall_only`]
+/// gives its held-out tags' recall.
 pub(super) fn score(
     job: &Job,
     all: &[(&ImageSet, &images::SetImage)],
@@ -55,15 +58,7 @@ pub(super) fn score(
     // the all-classes AP and each tag's per-class recall.
     let wide = ClassMap::all_classes(&job.classes);
     let wide = (wide.classes.len() > map.classes.len()).then(|| {
-        let evals: Vec<Option<EvalImage>> = all
-            .iter()
-            .enumerate()
-            .map(|(k, (set, img))| {
-                let gt = img.gt.as_ref()?;
-                let preds = eval_preds.get(k)?;
-                Some(eval_input(&wide, set.scored_labels.as_deref(), gt, preds).1)
-            })
-            .collect();
+        let evals = wide_evals(&wide, all, eval_preds);
         (wide, evals)
     });
     let all_classes = wide
@@ -109,7 +104,11 @@ pub(super) fn score(
         .map(|(t, ks)| {
             let sum = metrics::evaluate(&scored.subset(&ks), &map.classes, threshold);
             Breakdown {
-                per_class: class_recall(&ks),
+                per_class: if t.starts_with(HELDOUT_TAG) {
+                    class_recall(&ks)
+                } else {
+                    Vec::new()
+                },
                 ..Breakdown::of(
                     t,
                     &sum,
@@ -135,6 +134,62 @@ pub(super) fn score(
         }),
         None,
     )
+}
+
+// The tag prefix whose breakdowns carry `Breakdown::per_class` (the held-out set's own tags).
+use crate::training::dataset::HELDOUT_TAG;
+
+/// Per image of `all`: its eval input in `map`'s label space (None = no ground truth).
+fn wide_evals(
+    map: &ClassMap,
+    all: &[(&ImageSet, &images::SetImage)],
+    eval_preds: &[Vec<PredBox>],
+) -> Vec<Option<EvalImage>> {
+    all.iter()
+        .enumerate()
+        .map(|(k, (set, img))| {
+            let gt = img.gt.as_ref()?;
+            let preds = eval_preds.get(k)?;
+            Some(eval_input(map, set.scored_labels.as_deref(), gt, preds).1)
+        })
+        .collect()
+}
+
+/// The per-class recall of each held-out tag (`heldout:*`) of a run that [`score`] gave no
+/// accuracy: a model without any CCTV class (a custom raccoon / opossum / fox model) still gets
+/// what a training run reads, [`RunResult::tag_recall`]. Over the images with real ground truth
+/// only, every class of the model the sets score; nothing else (no AP, no headline, no grade).
+/// Empty without such images or classes.
+pub(super) fn tag_recall_only(
+    job: &Job,
+    all: &[(&ImageSet, &images::SetImage)],
+    eval_preds: &[Vec<PredBox>],
+    threshold: f32,
+) -> Vec<TagRecall> {
+    let wide = ClassMap::all_classes(&job.classes);
+    if wide.is_empty() {
+        return Vec::new();
+    }
+    let evals = wide_evals(&wide, all, eval_preds);
+    let mut tags: BTreeMap<&str, Vec<EvalImage>> = BTreeMap::new();
+    for (k, (set, img)) in all.iter().enumerate() {
+        let Some(Some(e)) = evals.get(k) else {
+            continue;
+        };
+        if !set.ground_truth.is_real() {
+            continue;
+        }
+        for t in img.tags.iter().filter(|t| t.starts_with(HELDOUT_TAG)) {
+            tags.entry(t.as_str()).or_default().push(e.clone());
+        }
+    }
+    tags.into_iter()
+        .map(|(t, imgs)| TagRecall {
+            key: t.to_string(),
+            images: imgs.len(),
+            per_class: metrics::class_recall(&imgs, &wide.classes, threshold),
+        })
+        .collect()
 }
 
 /// Score one image with ground truth `gt`: flags its stored (production) predictions TP/FP
@@ -1078,7 +1133,7 @@ mod tests {
             .iter()
             .find(|c| c.class == "raccoon")
             .cloned();
-        assert!(racc.is_some_and(|c| c.recall.is_some()));
+        assert!(racc.is_some_and(|c| c.recall() == Some(0.5)));
         // The AP of the run and of each tag stays on the CCTV classes.
         assert_eq!(
             acc.classes,
@@ -1308,5 +1363,177 @@ mod tests {
             "low confidences are ignore regions"
         );
         assert!(gt.iter().all(|g| g.label == "person"));
+    }
+
+    /// A held-out-like set of two night images on camera `back`, tagged like the held-out
+    /// manifest plus a bare `date:` tag: image 1 person (found) and raccoon (found), image 2
+    /// raccoon (missed) and fox (called a cat).
+    fn heldout_pair(classes: &[String]) -> (ImageSet, Vec<Vec<PredBox>>) {
+        let g = |l: &str, b: [f32; 4]| GtBox {
+            label: l.into(),
+            bbox: b,
+            ignore: false,
+            crowd: false,
+        };
+        let p = |l: &str, c: f32, b: [f32; 4]| PredBox {
+            label: l.into(),
+            confidence: c,
+            bbox: b,
+        };
+        let mut set = ImageSet::sample();
+        set.id = "heldout-m".into();
+        set.ground_truth = GroundTruth::Manifest;
+        set.scored_labels = Some(classes.to_vec());
+        let tags: Vec<String> = [
+            "heldout:night",
+            "heldout:all",
+            "heldout:cam:back",
+            "heldout:camscene:night:back",
+            "date:2026-11-01",
+            "camera:back",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut one = set.images[0].clone();
+        one.tags = tags.clone();
+        one.gt = Some(vec![
+            g("person", [0.0, 0.0, 100.0, 200.0]),
+            g("raccoon", [300.0, 300.0, 360.0, 340.0]),
+        ]);
+        let mut two = set.images[0].clone();
+        two.tags = tags;
+        two.gt = Some(vec![
+            g("raccoon", [0.0, 0.0, 60.0, 40.0]),
+            g("fox", [500.0, 300.0, 580.0, 360.0]),
+        ]);
+        set.images = vec![one, two];
+        let preds = vec![
+            vec![
+                p("person", 0.9, [0.0, 0.0, 100.0, 200.0]),
+                p("raccoon", 0.8, [300.0, 300.0, 360.0, 340.0]),
+            ],
+            vec![p("cat", 0.7, [500.0, 300.0, 580.0, 360.0])],
+        ];
+        (set, preds)
+    }
+
+    fn job_of(classes: &[String]) -> Job {
+        Job {
+            name: "custom".into(),
+            path: "custom.onnx".into(),
+            family: ModelFamilyKind::Yolo8,
+            classes: classes.to_vec(),
+            device: "auto".into(),
+            gpu_precision: None,
+            confidence_threshold: None,
+            object_filter: None,
+            variant: None,
+        }
+    }
+
+    fn runs_of(set: &ImageSet) -> Vec<ImageRun> {
+        set.images
+            .iter()
+            .map(|i| ImageRun {
+                set: set.id.clone(),
+                file: i.file.clone(),
+                total_ms: 1.0,
+                infer_ms: 1.0,
+                preds: vec![],
+                gt_matched: vec![],
+                counts: None,
+            })
+            .collect()
+    }
+
+    /// A model of CCTV classes only (no wider class map): the tags' per-class recall comes from
+    /// the scored classes themselves, and only on the held-out tags.
+    #[test]
+    fn per_class_of_a_cctv_only_model_uses_the_scored_classes() {
+        let classes: Vec<String> = ["person", "cat"].map(String::from).to_vec();
+        let (set, preds) = heldout_pair(&classes);
+        let all: Vec<_> = set.images.iter().map(|i| (&set, i)).collect();
+        let job = job_of(&classes);
+        assert_eq!(
+            ClassMap::all_classes(&job.classes).classes.len(),
+            ClassMap::for_model(&job.classes).classes.len(),
+            "no wider map"
+        );
+        let (acc, _) = score(
+            &job,
+            &all,
+            &mut runs_of(&set),
+            &preds,
+            0.5,
+            Default::default(),
+        );
+        let acc = acc.unwrap();
+        assert!(acc.all_classes.is_none());
+        let tag = |k: &str| acc.by_tag.iter().find(|b| b.key == k).unwrap();
+        // The raccoon and the fox are wildlife ignore regions here, not misses.
+        assert_eq!(
+            tag("heldout:all").per_class,
+            [ClassRecall::new("person", 1, 0)]
+        );
+        assert_eq!(
+            tag("heldout:camscene:night:back").per_class,
+            [ClassRecall::new("person", 1, 0)]
+        );
+        // Not on other tags.
+        assert!(tag("date:2026-11-01").per_class.is_empty());
+        assert!(tag("camera:back").per_class.is_empty());
+    }
+
+    /// A model without any CCTV class: no accuracy, the same note, and the held-out tags'
+    /// per-class recall from `tag_recall_only` (only on images with real ground truth, held-out
+    /// tags only).
+    #[test]
+    fn a_model_without_cctv_classes_still_gets_heldout_recall() {
+        let classes: Vec<String> = ["raccoon", "opossum", "skunk", "fox"]
+            .map(String::from)
+            .to_vec();
+        let (set, preds) = heldout_pair(&classes);
+        let all: Vec<_> = set.images.iter().map(|i| (&set, i)).collect();
+        let job = job_of(&classes);
+        let (acc, note) = score(
+            &job,
+            &all,
+            &mut runs_of(&set),
+            &preds,
+            0.5,
+            Default::default(),
+        );
+        assert!(acc.is_none());
+        assert_eq!(
+            note.as_deref(),
+            Some("the model has none of the scored CCTV classes")
+        );
+        let tags = tag_recall_only(&job, &all, &preds, 0.5);
+        let keys: Vec<&str> = tags.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "heldout:all",
+                "heldout:cam:back",
+                "heldout:camscene:night:back",
+                "heldout:night"
+            ]
+        );
+        let all_tag = &tags[0];
+        assert_eq!(all_tag.images, 2);
+        assert_eq!(
+            all_tag.per_class,
+            [
+                ClassRecall::new("raccoon", 2, 1),
+                ClassRecall::new("fox", 1, 1)
+            ]
+        );
+        // Pseudo ground truth is no recall.
+        let mut pseudo = set.clone();
+        pseudo.ground_truth = GroundTruth::Pseudo("ref".into());
+        let all: Vec<_> = pseudo.images.iter().map(|i| (&pseudo, i)).collect();
+        assert!(tag_recall_only(&job, &all, &preds, 0.5).is_empty());
+        // A model with no class at all: nothing.
+        assert!(tag_recall_only(&job_of(&[]), &all, &preds, 0.5).is_empty());
     }
 }

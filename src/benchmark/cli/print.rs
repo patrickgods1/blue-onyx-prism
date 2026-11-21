@@ -957,6 +957,7 @@ mod tests {
             by_resolution: Vec::new(),
             accuracy: None,
             accuracy_note: None,
+            tag_recall: vec![],
             grades: None,
             agreement: None,
             per_image: Vec::new(),

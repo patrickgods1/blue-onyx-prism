@@ -617,26 +617,28 @@ pub struct ClassMetrics {
 /// Recall of one class at the confidence threshold, IoU 0.5, with its integer counts (a tag's
 /// [`super::Breakdown::per_class`], a training run's recall cells): `gt` non-ignored
 /// ground-truth objects, `missed` of them unmatched. Integers, so cells add up exactly in any
-/// order; `recall` is `(gt - missed) / gt` (None without ground truth).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// order. The recall itself is derived ([`ClassRecall::recall`]) and never written: a
+/// `"recall"` key in older JSON is ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassRecall {
     pub class: String,
     pub gt: usize,
     pub missed: usize,
-    #[serde(default)]
-    pub recall: Option<f64>,
 }
 
 impl ClassRecall {
     /// The cell of `class` with `gt` objects, `missed` of them unmatched (clamped to `gt`).
     pub fn new(class: &str, gt: usize, missed: usize) -> Self {
-        let missed = missed.min(gt);
         Self {
             class: class.to_string(),
             gt,
-            missed,
-            recall: (gt > 0).then(|| (gt - missed) as f64 / gt as f64),
+            missed: missed.min(gt),
         }
+    }
+
+    /// `(gt - missed) / gt`; None without ground truth.
+    pub fn recall(&self) -> Option<f64> {
+        (self.gt > 0).then(|| self.gt.saturating_sub(self.missed) as f64 / self.gt as f64)
     }
 }
 
@@ -1682,7 +1684,7 @@ mod tests {
             .collect();
         let got: Vec<(String, usize, Option<f64>)> = r
             .iter()
-            .map(|c| (c.class.clone(), c.gt, c.recall))
+            .map(|c| (c.class.clone(), c.gt, c.recall()))
             .collect();
         assert_eq!(got, expect);
         assert_eq!(
@@ -1692,12 +1694,17 @@ mod tests {
                 ClassRecall::new("raccoon", 2, 1)
             ]
         );
-        assert_eq!(r[0].recall, Some(0.5));
-        // Old-format cells without `recall` parse; `missed` is clamped.
-        let c: ClassRecall = serde_json::from_str(r#"{"class":"fox","gt":3,"missed":1}"#).unwrap();
-        assert_eq!((c.gt, c.missed, c.recall), (3, 1, None));
+        assert_eq!(r[0].recall(), Some(0.5));
+        // The recall is not written; JSON of the first version, which had it, still parses.
+        assert_eq!(
+            serde_json::to_string(&r[0]).unwrap(),
+            r#"{"class":"person","gt":2,"missed":1}"#
+        );
+        let c: ClassRecall =
+            serde_json::from_str(r#"{"class":"fox","gt":3,"missed":1,"recall":0.667}"#).unwrap();
+        assert_eq!(c, ClassRecall::new("fox", 3, 1));
         assert_eq!(ClassRecall::new("fox", 2, 5).missed, 2);
-        assert_eq!(ClassRecall::new("fox", 0, 0).recall, None);
+        assert_eq!(ClassRecall::new("fox", 0, 0).recall(), None);
     }
 
     #[test]

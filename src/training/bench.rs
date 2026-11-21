@@ -34,9 +34,9 @@ use super::dataset;
 use super::file_id::FileId;
 use super::job::{Baseline, BenchSummary, CameraSceneRecall, RecallCells, SceneAp, SubsetScore};
 use crate::backend::DeviceSpec;
-use crate::benchmark::Breakdown;
 use crate::benchmark::report::ModelResult;
 use crate::benchmark::service::{BenchmarkService, RunContext, RunRequest, RunState};
+use crate::benchmark::{Breakdown, ClassRecall};
 use crate::collect::labels::recall::{self, Measured};
 use crate::config::DatasetRef;
 use crate::resources::export::Cancelled;
@@ -467,7 +467,21 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
             }
         }
         in_scope = tagged(dataset::HELDOUT_IN_SCOPE);
-        recall_cells = cells_of(tags);
+        recall_cells = cells_of(
+            tags.iter()
+                .filter(|b| !b.relative)
+                .map(|b| (b.key.as_str(), b.per_class.as_slice())),
+        );
+    } else if acc.is_none()
+        && let Some(r) = dev.and_then(|d| d.run.as_ref())
+        && r.tag_recall.iter().any(|t| t.key == dataset::HELDOUT_ALL)
+    {
+        // No accuracy (a model without any CCTV class): its held-out tags' recall only.
+        recall_cells = cells_of(
+            r.tag_recall
+                .iter()
+                .map(|t| (t.key.as_str(), t.per_class.as_slice())),
+        );
     } else if m.datasets.len() == 1
         && let Some(a) = acc
     {
@@ -529,18 +543,15 @@ pub fn summarize(m: &ModelResult) -> BenchSummary {
 }
 
 /// The recall cells of a run ([`RecallCells`]) from the per-class recall of the held-out
-/// manifest's own tags: `heldout:<scene>` (and `heldout:all`), `heldout:cam:<camera>`,
-/// `heldout:camscene:<scene>:<camera>` ([`dataset::cell_tag`]). Never from bare tags: a built-in
-/// set run beside the held-out frames has its own `night` or `camera:` images. Breakdowns against
-/// pseudo ground truth are left out.
-fn cells_of(tags: &[Breakdown]) -> RecallCells {
+/// manifest's own tags, `(tag, cells)`: `heldout:<scene>` (and `heldout:all`),
+/// `heldout:cam:<camera>`, `heldout:camscene:<scene>:<camera>` ([`dataset::cell_tag`]). Never
+/// from bare tags: a built-in set run beside the held-out frames has its own `night` or `camera:`
+/// images. The caller leaves out breakdowns against pseudo ground truth.
+fn cells_of<'a>(tags: impl IntoIterator<Item = (&'a str, &'a [ClassRecall])>) -> RecallCells {
     let mut c = RecallCells::default();
-    for b in tags
-        .iter()
-        .filter(|b| !b.relative && !b.per_class.is_empty())
-    {
-        let classes = b.per_class.clone();
-        if let Some(cell) = dataset::cell_tag(&b.key) {
+    for (key, cells) in tags.into_iter().filter(|(_, c)| !c.is_empty()) {
+        let classes = cells.to_vec();
+        if let Some(cell) = dataset::cell_tag(key) {
             match cell {
                 dataset::CellTag::Camera(camera) => {
                     c.by_camera.insert(camera.to_string(), classes);
@@ -553,7 +564,7 @@ fn cells_of(tags: &[Breakdown]) -> RecallCells {
                     });
                 }
             }
-        } else if let Some(scene) = b.key.strip_prefix(dataset::HELDOUT_TAG)
+        } else if let Some(scene) = key.strip_prefix(dataset::HELDOUT_TAG)
             && matches!(scene, "day" | "night" | "ir" | "all")
         {
             c.by_scene.insert(scene.to_string(), classes);
@@ -565,15 +576,17 @@ fn cells_of(tags: &[Breakdown]) -> RecallCells {
 /// The measured recall the Review queue steers by, from the training runs `records` (pure; the
 /// rule of [`Measured`]):
 ///
-/// - Only finished runs (`done`) whose benchmark has a held-out fingerprint (the held-out frames
-///   were chosen from the review folder, before the scene filter) and recall cells count, newest
-///   first (by `finished`, else `created`; equal stamps: the later record).
+/// - Only finished runs (`done`) with their model's output (its classes) whose benchmark has a
+///   held-out fingerprint (the held-out frames were chosen from the review folder, before the
+///   scene filter) and recall cells count, newest first (by `finished`, else `created`; equal
+///   stamps: the later record).
 /// - Per scene (`day` / `night` / `ir`): the newest such run whose scene filter keeps the scene
 ///   and that has cells for it, with its camera-in-scene cells. A night model also has day
 ///   frames among its held-out frames, but it never trained on them: its day recall says
 ///   nothing about what the day model misses.
-/// - Over every scene (per class and per camera): the newest run whose filter keeps every scene,
-///   else the newest with cells over all its held-out frames.
+/// - Over every scene (per class and per camera): the newest run whose filter keeps every scene;
+///   none without one (a scene-filtered model never trained on some of those frames).
+/// - Each slice carries its run's model classes and renames ([`recall::Run`]).
 ///
 /// None when no run measured anything.
 pub fn measured_recall(records: &[super::service::RunRecord]) -> Option<Measured> {
@@ -585,9 +598,20 @@ pub fn measured_recall(records: &[super::service::RunRecord]) -> Option<Measured
         .filter_map(|(i, r)| {
             let b = r.benchmark.as_ref()?;
             b.heldout_fingerprint.as_ref()?;
+            r.output.as_ref()?;
             (!b.recall_cells.is_empty()).then_some((i, r, &b.recall_cells))
         })
         .collect();
+    // What the run's model can detect: its classes (after the renames) and the renames.
+    let run_of = |r: &super::service::RunRecord| recall::Run {
+        id: r.id.clone(),
+        classes: r
+            .output
+            .as_ref()
+            .map(|o| o.classes.clone())
+            .unwrap_or_default(),
+        rename: r.request.rename.clone(),
+    };
     // RFC 3339 UTC stamps (`service::now`): their text order is their time order.
     fn stamp(r: &super::service::RunRecord) -> &str {
         r.finished.as_deref().unwrap_or(&r.created)
@@ -609,16 +633,15 @@ pub fn measured_recall(records: &[super::service::RunRecord]) -> Option<Measured
             .map(|x| (x.camera.as_str(), x.classes.as_slice()));
         let classes = c.by_scene.get(s).map(Vec::as_slice).unwrap_or_default();
         m.scenes
-            .insert(s.to_string(), recall::Slice::new(&r.id, classes, cams));
+            .insert(s.to_string(), recall::Slice::new(run_of(r), classes, cams));
     }
     let overall = runs
         .iter()
-        .find(|(_, r, c)| r.request.scene.is_all() && has(c, "all"))
-        .or_else(|| runs.iter().find(|(_, _, c)| has(c, "all")));
+        .find(|(_, r, c)| r.request.scene.is_all() && has(c, "all"));
     if let Some((_, r, c)) = overall {
         let classes = c.by_scene.get("all").map(Vec::as_slice).unwrap_or_default();
         let cams = c.by_camera.iter().map(|(k, v)| (k.as_str(), v.as_slice()));
-        m.overall = Some(recall::Slice::new(&r.id, classes, cams));
+        m.overall = Some(recall::Slice::new(run_of(r), classes, cams));
     }
     (!m.is_empty()).then_some(m)
 }
@@ -626,7 +649,6 @@ pub fn measured_recall(records: &[super::service::RunRecord]) -> Option<Measured
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::benchmark::ClassRecall;
 
     fn ctx_with(device: Option<&str>) -> RunContext {
         let mut config = crate::config::Config::default();
@@ -1379,14 +1401,60 @@ mod tests {
                 .get("recall_cells")
                 .is_none()
         );
-        // Breakdowns against pseudo ground truth are no cells either.
-        let mut rel = cells("heldout:night", vec![cr("raccoon", 9, 5)]);
-        rel.relative = true;
-        let b = summarize(&result(
-            vec![cells("heldout:all", vec![cr("raccoon", 9, 5)]), rel],
+        // A run scored against pseudo ground truth (every breakdown of it relative, as the
+        // benchmark writes them): no cells.
+        let mut m = result(
+            ["heldout:all", "heldout:night", "heldout:cam:back"]
+                .map(|k| Breakdown {
+                    relative: true,
+                    ..cells(k, vec![cr("raccoon", 9, 5)])
+                })
+                .to_vec(),
             false,
-        ));
-        assert!(!b.recall_cells.by_scene.contains_key("night"));
+        );
+        m.devices[0]
+            .run
+            .as_mut()
+            .unwrap()
+            .accuracy
+            .as_mut()
+            .unwrap()
+            .relative = true;
+        let b = summarize(&m);
+        assert!(b.recall_cells.is_empty());
+        assert!(b.by_scene.contains_key("all"), "its AP per scene stays");
+    }
+
+    /// A model without any CCTV class has no accuracy report: its cells come from the run's
+    /// `tag_recall`, held-out tags only, and nothing else is summarized from them.
+    #[test]
+    fn summarize_reads_the_tag_recall_of_a_run_without_accuracy() {
+        use crate::benchmark::TagRecall;
+        let mut m = result(vec![], false);
+        let run = m.devices[0].run.as_mut().unwrap();
+        run.accuracy = None;
+        run.accuracy_note = Some("the model has none of the scored CCTV classes".into());
+        let tag = |k: &str, v: Vec<ClassRecall>| TagRecall {
+            key: k.into(),
+            images: 3,
+            per_class: v,
+        };
+        run.tag_recall = vec![
+            tag("heldout:all", vec![cr("raccoon", 9, 5), cr("fox", 2, 2)]),
+            tag("heldout:night", vec![cr("raccoon", 9, 5)]),
+            tag("heldout:cam:back", vec![cr("fox", 2, 2)]),
+            tag("heldout:camscene:night:back", vec![cr("raccoon", 9, 5)]),
+        ];
+        let b = summarize(&m);
+        let c = &b.recall_cells;
+        assert_eq!(c.by_scene["all"], [cr("raccoon", 9, 5), cr("fox", 2, 2)]);
+        assert_eq!(c.by_scene["night"], [cr("raccoon", 9, 5)]);
+        assert_eq!(c.by_camera["back"], [cr("fox", 2, 2)]);
+        assert_eq!(c.by_camera_scene.len(), 1);
+        assert!(b.by_scene.is_empty() && b.ap50.is_none());
+        // Without the held-out set's `heldout:all`: nothing.
+        m.devices[0].run.as_mut().unwrap().tag_recall.remove(0);
+        assert!(summarize(&m).recall_cells.is_empty());
     }
 
     /// Cells per camera: (camera, cells).
@@ -1406,6 +1474,18 @@ mod tests {
         let mut r = rec(id, None, None);
         r.request.scene = scene;
         r.finished = Some(finished.into());
+        r.output = Some(super::super::job::TrainOutput {
+            name: id.into(),
+            onnx: PathBuf::from(format!("/models/{id}.onnx")),
+            yaml: PathBuf::from(format!("/models/{id}.yaml")),
+            provenance: PathBuf::new(),
+            family: crate::model::ModelFamilyKind::Yolo26,
+            classes: vec!["person".into(), "raccoon".into()],
+            license: String::new(),
+            heldout: None,
+            device: String::new(),
+            train_seconds: 0.0,
+        });
         let mut c = RecallCells::default();
         for (s, classes, by_cam) in scenes {
             c.by_scene.insert(s.to_string(), classes.clone());
@@ -1493,8 +1573,8 @@ mod tests {
         failed.state = super::super::service::RunState::Failed;
         let runs = vec![night.clone(), general.clone(), old, failed];
         let m = measured_recall(&runs).unwrap();
-        assert_eq!(m.scenes["day"].run, "general");
-        assert_eq!(m.scenes["night"].run, "night");
+        assert_eq!(m.scenes["day"].run.id, "general");
+        assert_eq!(m.scenes["night"].run.id, "night");
         assert!(!m.scenes.contains_key("ir"), "no run measured IR");
         assert_eq!(
             m.scenes["night"].camera_class("back", "raccoon"),
@@ -1506,8 +1586,14 @@ mod tests {
         );
         let o = m.overall.as_ref().unwrap();
         assert_eq!(
-            o.run, "general",
+            o.run.id, "general",
             "the newest run that trained on every scene"
+        );
+        // The slices know what their model can detect.
+        assert_eq!(o.run.classes, ["person", "raccoon"]);
+        assert_eq!(
+            m.miss("back", "night", "fox").map(|x| x.class),
+            Some(recall::InRun::Absent)
         );
         assert_eq!(o.class("raccoon"), recall::Cell { gt: 30, missed: 15 });
         assert_eq!(
@@ -1519,11 +1605,17 @@ mod tests {
             measured_recall(&[general.clone(), night.clone()]),
             Some(m.clone())
         );
-        // Only the night model: its overall cells stand in (the newest with any), and its day
-        // cells are still not the day scene's.
+        // Only the night model: no overall slice (it never trained on the day frames among its
+        // held-out frames), and its day cells are not the day scene's either.
         let m = measured_recall(std::slice::from_ref(&night)).unwrap();
-        assert_eq!(m.overall.as_ref().unwrap().run, "night");
+        assert!(m.overall.is_none());
         assert!(!m.scenes.contains_key("day"));
+        assert_eq!(m.scenes["night"].run.id, "night");
+        assert!(m.miss("back", "day", "person").is_none());
+        // A run without its model's output (its classes) is not used.
+        let mut no_output = general.clone();
+        no_output.output = None;
+        assert_eq!(measured_recall(&[no_output]), None);
         // No runs, or none measured: None.
         assert_eq!(measured_recall(&[]), None);
         let mut bare = rec("bare", None, None);
@@ -1532,5 +1624,34 @@ mod tests {
             ..BenchSummary::default()
         });
         assert_eq!(measured_recall(&[bare]), None);
+    }
+
+    /// Equal stamps: the later record wins (a run of the same second queued after).
+    #[test]
+    fn measured_recall_breaks_equal_stamps_by_record_order() {
+        use dataset::SceneFilter;
+        let at = "2026-11-01T10:00:00Z";
+        let one = |id: &str, missed: usize| {
+            cell_run(
+                id,
+                at,
+                SceneFilter::ALL_SCENES,
+                &[("day", vec![cr("person", 40, missed)], vec![])],
+                vec![cr("person", 40, missed)],
+                vec![],
+            )
+        };
+        let (a, b) = (one("first", 4), one("second", 8));
+        let m = measured_recall(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(m.scenes["day"].run.id, "second");
+        assert_eq!(m.overall.as_ref().unwrap().run.id, "second");
+        let m = measured_recall(&[b, a]).unwrap();
+        assert_eq!(m.scenes["day"].run.id, "first");
+        // `finished` missing: `created` decides.
+        let mut c = one("created-later", 1);
+        c.finished = None;
+        c.created = "2026-11-02T00:00:00Z".into();
+        let m = measured_recall(&[c, one("finished-earlier", 2)]).unwrap();
+        assert_eq!(m.scenes["day"].run.id, "created-later");
     }
 }
