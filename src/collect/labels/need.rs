@@ -78,6 +78,7 @@
 //! H    = W_HARDNEG · crowd(Σ_b f_b · T_H/(T_H + h_{m,k}) · v_k · region_b)
 //!        f_b = max(1 − κ_b, VLM_NO_FALSE if a VLM no) for a likely false box (κ_b < LIKELY_FALSE_KAPPA
 //!        or a VLM no), else 0; h_{m,k}: m's hard negatives of k
+//!        H = 0 on a held-out day (a held-out frame never trains), and faint boxes are no candidates there
 //! empty frame: V = W_EMPTY · T/(T + empty_s) · (1 + ANIMAL_GAIN · p_{m,s}), H = 0
 //! score = round(1000 · (V + H))
 //! ```
@@ -103,9 +104,9 @@
 //! from it, hold out (see [`Need::heldout_day`] for where they can differ). The tally counts the
 //! training boxes of held-out days again, apart, per (camera, class, scene) in quarter-boxes (`h`).
 //! A cell short of [`HELDOUT_FLOOR`] held-out boxes pulls its held-out days up; one at the floor
-//! pulls its training days. On a held-out day [`W_MISSED`] and the [`GAP`] candidates are off: they
-//! would fill the held-out set with the hard cases the camera model missed, and its recall would
-//! read low. Per-cell recall stays exact over the cell's own images; the random picks
+//! pulls its training days. On a held-out day [`W_MISSED`], the [`GAP`] candidates and `H` are off:
+//! they would fill the held-out set with the hard cases the camera model missed or falsely
+//! proposed, its figures would read low, and a rejected box there teaches nothing. Per-cell recall stays exact over the cell's own images; the random picks
 //! ([`super::recommend::random_slots`]), scored apart as `heldout:random`, stay the unbiased figure.
 //!
 //! **Visits** ([`day`]): per event (one camera's activity, [`super::recommend::chain`]) the classes
@@ -1624,12 +1625,16 @@ impl<'a> Scorer<'a> {
         let s8 = scene_ix(f.scene);
         let s = usize::from(s8);
         let cam = self.cam(f.camera);
-        // No gap on a held-out day: a hard case for the held-out set.
+        // No gap on a held-out day: a hard case for the held-out set. No hard-negative share
+        // there either (a held-out frame never trains), so a faint likely false box is no
+        // candidate on it.
         let gaps = if f.heldout { &[][..] } else { gaps };
         let cands: Vec<&CellBox> = boxes
             .iter()
             .chain(gaps)
-            .filter(|b| b.is_candidate() && (!faint(b) || self.likely_false(&cam, b)))
+            .filter(|b| {
+                b.is_candidate() && (!faint(b) || (!f.heldout && self.likely_false(&cam, b)))
+            })
             .collect();
         if cands.is_empty() {
             let empty = self.tally.empty.get(s).copied().unwrap_or(0);
@@ -1767,7 +1772,11 @@ impl<'a> Scorer<'a> {
                 best = Some((term, d));
             }
         }
-        let hard = W_HARDNEG * crowd(hard);
+        let hard = if f.heldout {
+            0.0
+        } else {
+            W_HARDNEG * crowd(hard)
+        };
         let mut d = best.map(|(_, d)| d).unwrap_or_default();
         d.hard = hard;
         d.hard_class = hard_class.filter(|_| hard > 0.0);

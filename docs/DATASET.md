@@ -895,9 +895,9 @@ need = round(1000 · (V + H))
   that export listed them), an export of other split settings, and a training run whose exports hold nothing out
   (it splits by `training.heldout_share`). The tally counts the training boxes of held-out days again, apart, per
   (camera, class, scene), in quarter-boxes like `n` (a parked box a quarter). A cell short of 20 doubles its
-  held-out days' frames; one at 20 doubles its training days'. On a held-out day the missed doubling and the gap
-  candidates are off: they would fill the held-out set with the hard cases the camera model misses, and its recall
-  would read low. **Bias:** the held-out set still leans to the frames the order serves first (rare classes,
+  held-out days' frames; one at 20 doubles its training days'. On a held-out day the missed doubling, the gap
+  candidates and the hard-negative share are off: they would fill the held-out set with the hard cases the camera
+  model misses or falsely proposes, its figures would read low, and a rejected box there never trains. **Bias:** the held-out set still leans to the frames the order serves first (rare classes,
   weak cells); each per-cell figure (`recall_cells`: `by_scene`, `by_camera`, `by_camera_scene`) stays exact
   over its own images, and the random picks (`heldout:random`, below) stay the unbiased figure for normal
   traffic. Without held-out steering (no steer: the walk outside the route) no day is held out and `g_k = 1`. The

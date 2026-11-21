@@ -1520,5 +1520,19 @@ fn a_held_out_day_has_no_missed_bonus_and_no_gap() {
     assert!(
         d.top.is_none() && d.empty.is_some() && d.heldout_day,
         "{d:?}"
+    ); // A likely false box: its hard-negative share on a training day, none on a held-out one.
+    let false_box = [cb(PERSON, LEFT, 100, VLM_NO), cb(DOG, RIGHT, 6, VLM_NO)];
+    let d = s.score(&train, &false_box, &[]);
+    assert!(d.hard > 0.0, "{d:?}");
+    let d = s.score(&held, &false_box, &[]);
+    assert!(
+        d.hard == 0.0 && d.hard_class.is_none() && !d.hard_only,
+        "{d:?}"
     );
+    // A faint likely false box alone: hard-negative only on a training day, an empty frame held out.
+    let faint = [cb(DOG, RIGHT, 6, VLM_NO)];
+    let d = s.score(&train, &faint, &[]);
+    assert!(d.hard_only && d.hard > 0.0, "{d:?}");
+    let d = s.score(&held, &faint, &[]);
+    assert!(d.empty.is_some() && !d.hard_only && d.hard == 0.0, "{d:?}");
 }
