@@ -248,7 +248,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     (`Refusal::NeedsLogin|NeedsAccess`); `without_url()` keeps signed CDN URLs out of logs and state.
 
 - **Collector** (`src/collect/`, `collect` config, default off; docs/DATASET.md): after the reply the worker `try_send`s the
-  upload + a v1 sidecar to one collector thread (buckets, per-camera rate limits, dHash dedup that most buckets skip,
+  upload + a v1 sidecar to one collector thread (buckets, per-camera rate limits (shorter `empty.night_interval` for
+  night/IR), dedup that most buckets skip: dHash + `blockdiff` thumbnail both must agree, `collect.dedup_mode`,
   disk guard that re-arms; atomic writes under `<data root>/dataset/<scene>/<camera>/<date>/`;
   `retention::prune_dataset`). `collect/health.rs` feeds `GET /v1/dataset`. Collect tab `/train/collect`.
 
