@@ -139,16 +139,6 @@ pub(super) fn records_read_only(state: &AppState) -> Vec<RunRecord> {
     }
 }
 
-/// [`tasks`] likewise.
-pub(super) fn tasks_read_only(state: &AppState) -> Vec<crate::training::task::TaskRecord> {
-    match SERVICE.get() {
-        Some(s) => s.tasks(),
-        None => crate::training::task::read_records(&crate::training::task::tasks_file(
-            &crate::training::runs_file(&state.config_read()),
-        )),
-    }
-}
-
 /// The queue if it was started (the page shows `runs.json` otherwise).
 pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
     match SERVICE.get() {

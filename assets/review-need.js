@@ -23,11 +23,17 @@
   // is, e.g. "raccoon · back · IR: 3 boxes on this camera (3 in all, floor 20), recall 22% on 9
   // held-out boxes (lowest on this camera), camera model missed it, new place in view, frame 3 of
   // a raccoon visit", and "likely false person: rejecting it teaches the model" for the
-  // hard-negative share. '' without a need.
+  // hard-negative share ("likely false person · ...: nothing else to label here; ..." when that is
+  // all the frame holds). '' without a need.
   function note(item) {
     var n = item && item.need;
     if (!n) return '';
     var where = item.camera + ' · ' + sceneName(item.scene);
+    // Nothing to need but boxes that are likely false: here for the hard negatives, not empty.
+    if (n.hard_only) {
+      return 'likely false ' + (n.hard_class || 'box') + ' · ' + where +
+        ': nothing else to label here; rejecting it teaches the model';
+    }
     if (n.class == null) {
       var empty = 'nothing of a wanted class · ' + where + ': ' +
         num(n.empty_reviewed) + ' empty frame' + (n.empty_reviewed === 1 ? '' : 's') + ' reviewed in this scene';
@@ -59,7 +65,12 @@
     if (n.proposed != null) parts.push((n.kept || 0) + ' of ' + n.proposed + ' proposals kept on this camera');
     // The class decided in the visit that makes it serve more of its frames.
     if (n.expanded && item.event_rank) parts.push('frame ' + (item.event_rank + 1) + ' of a ' + (n.visit_class || n.class) + ' visit');
-    if (n.hard_negative && n.hard_class) parts.push('likely false ' + n.hard_class + ': rejecting it teaches the model');
+    // The top class's own likely false boxes are not named again.
+    if (n.hard_negative && n.hard_class) {
+      parts.push(n.hard_class === n.class
+        ? 'some may be false: rejecting those teaches the model'
+        : 'likely false ' + n.hard_class + ': rejecting it teaches the model');
+    }
     return n.class + ' · ' + where + ': ' + parts.join(', ');
   }
 

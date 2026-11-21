@@ -3773,6 +3773,36 @@ mod tests {
     }
 
     both_ways!(
+        an_unchanged_folder_steers_by_one_spot_table,
+        an_unchanged_folder_steers_by_one_spot_table_indexed,
+        an_unchanged_folder_steers_by_one_spot_table_in
+    );
+
+    /// The steer's spot table comes through the service's path ([`steer::spots`]); while nothing
+    /// changes, every Next steers by the same table (one `Arc`), so the index's per-shard need
+    /// parts are served again rather than counted anew.
+    async fn an_unchanged_folder_steers_by_one_spot_table_in(way: Way) {
+        let d = way.ds();
+        put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
+        put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.6);
+        let first = order_of(&d, &[]).await;
+        let (_, classes, _) = context(&d.state);
+        let hidden = super::hidden(&d.state);
+        let a = steer::spots(&d.dir, &classes, &hidden);
+        let b = steer::spots(&d.dir, &classes, &hidden);
+        assert!(Arc::ptr_eq(&a, &b));
+        let (made, hits) = labels::index::tests::need_parts(&d.dir);
+        assert_eq!(order_of(&d, &[]).await, first);
+        assert!(Arc::ptr_eq(&a, &steer::spots(&d.dir, &classes, &hidden)));
+        if way == Way::Index {
+            let (made2, hits2) = labels::index::tests::need_parts(&d.dir);
+            assert!(made > 0, "the index made need parts");
+            assert_eq!(made2, made, "an unchanged folder made a part again");
+            assert!(hits2 > hits);
+        }
+    }
+
+    both_ways!(
         a_damaged_runs_json_still_answers_next,
         a_damaged_runs_json_still_answers_next_indexed,
         a_damaged_runs_json_still_answers_next_in

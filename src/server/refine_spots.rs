@@ -131,44 +131,17 @@ fn newest_samples(
         .collect()
 }
 
-/// The reviewed frames of `dir` the spots are made from (a walk that only reads).
-fn reviewed(dir: &Path, classes: &[String]) -> Vec<ExportFrame> {
-    export::reviewed_frames_filtered(
+/// A fresh walk of the reviewed frames of `dir`.
+fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Computed {
+    let wanted = Wanted { classes, hidden };
+    let sel = export::reviewed_frames_filtered(
         dir,
         classes,
         &SplitConfig::default(),
         &ClassFilter::default(),
-    )
-    .frames
-}
-
-/// The spots of `dir`'s reviewed frames, the table [`compute`] makes, walked now: what the Review
-/// queue's tests and the real-data comparison steer by (the service takes [`cached_table`] or the
-/// index's rows, `review::steer`).
-#[cfg(test)]
-pub(super) fn spot_table(dir: &Path, classes: &[String], hidden: &[String]) -> statics::Table {
-    let wanted = Wanted { classes, hidden };
-    statics::Table::build(statics::observations(&reviewed(dir, classes), &wanted))
-}
-
-/// The spot table of [`compute`] through the Refine tab's cache ([`Cache::computed`], `stamp`
-/// naming the checks on the queue): a folder's spots without a walk of its own when the tab
-/// walked it recently.
-pub(super) fn cached_table(
-    dir: &Path,
-    classes: &[String],
-    hidden: &[String],
-    stamp: &str,
-) -> statics::Table {
-    computed(dir, classes, hidden, stamp).table.clone()
-}
-
-/// A fresh walk of the reviewed frames of `dir`.
-fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Computed {
-    let wanted = Wanted { classes, hidden };
-    let frames = reviewed(dir, classes);
-    let (table, spots) = statics::overview_table(&frames, &wanted);
-    let samples = newest_samples(&frames, &spots, &wanted);
+    );
+    let (table, spots) = statics::overview_table(&sel.frames, &wanted);
+    let samples = newest_samples(&sel.frames, &spots, &wanted);
     Computed {
         table,
         spots,

@@ -3,8 +3,8 @@
 //! scene and camera) and after it ([`queue::build`] with a [`Steer`]: no spot table, then the
 //! folder's own), tallied over the first 100 and 500 frames served. Does nothing unless
 //! `BOP_ORDER_EVAL_DIR` names the folder, so the `--ignored` runs of CI pass it by. Only reads:
-//! `queue::build` and the spot table's walk ([`super::super::refine_spots::spot_table`]) write
-//! nothing, and no review index is made.
+//! `queue::build` and the spot table's walk ([`queue::reviewed_obs`], the service's path for a
+//! folder without an index) write nothing, and no review index is made.
 //!
 //! ```text
 //! BOP_ORDER_EVAL_DIR=D:\dataset BOP_ORDER_EVAL_CONFIG=<config json> BOP_ORDER_EVAL_RUNS=<runs.json> \
@@ -245,8 +245,15 @@ fn the_recommended_order_before_and_after_the_need_model() {
         ..Filters::default()
     };
     let t = Instant::now();
-    let spots = Arc::new(super::super::refine_spots::spot_table(
-        &dir, &wanted.0, &wanted.1,
+    let spots = Arc::new(crate::collect::labels::statics::Table::build(
+        queue::reviewed_obs(
+            &dir,
+            queue::candidates(&dir, queue::QueueSource::All),
+            &crate::collect::labels::bulk::Wanted {
+                classes: &wanted.0,
+                hidden: &wanted.1,
+            },
+        ),
     ));
     let spot_ms = t.elapsed();
     let empty = Arc::new(Steer {

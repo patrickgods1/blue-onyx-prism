@@ -234,7 +234,7 @@ impl Index {
     }
 
     fn bytes(&self) -> usize {
-        self.state.read_recover().bytes() + self.names.read_recover().bytes()
+        self.state.read_recover().bytes() + self.names.read_recover().bytes() + self.need.bytes()
     }
 
     /// How long a query waits for what is behind.
@@ -593,53 +593,58 @@ pub fn rows_version(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> 
     Some(rows_stamp(&state))
 }
 
-/// The training boxes of the reviewed rows of the built index of `dir` for `wanted`, as parked-spot
-/// observations ([`super::statics::Obs`], of the frame's path: its camera, scene and date), with
-/// the stamp of the rows they came from: the spot table of the folder without reading a label
-/// file. None without a built index (none is made here).
+/// The parked-spot observations of the reviewed rows of the built index of `dir` for `wanted`
+/// ([`super::need::spot_obs`], the export's rules, as [`super::queue::reviewed_obs`] walks them),
+/// in frame order, with the stamp of the rows they came from: the spot table of the folder without
+/// reading a label file. None without a built index (none is made here). Under the read lock only
+/// each frame's path, size and boxes are copied; the observations and their strings are made after
+/// it is released.
 pub fn reviewed_obs(
     dir: &Path,
     wanted: Option<&(Vec<String>, Vec<String>)>,
 ) -> Option<(u64, Vec<super::statics::Obs>)> {
     let index = built(dir, wanted)?;
     let classes = wanted.map_or(&[][..], |w| w.0.as_slice());
-    let state = index.state.read_recover();
-    let mut obs = Vec::new();
-    for shard in state.shards.values() {
-        let mut parts = shard.day.split('/');
-        let (Some(scene), Some(camera), Some(date)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        for row in &shard.rows {
-            if row.gone || !row.readable() || row.part.status != super::Status::Reviewed {
-                continue;
-            }
-            let (w, h) = (row.side.width, row.side.height);
-            let mut frame = None;
-            for b in shard
-                .boxes_of(row)
-                .iter()
-                .filter(|b| b.has(super::need::TRAINING))
-            {
-                let (Some(label), Some(bbox)) = (
-                    classes.get(usize::from(b.class)),
-                    super::statics::normalised(&b.bbox.map(f32::from), w, h),
-                ) else {
+    let (stamp, mut frames) = {
+        let state = index.state.read_recover();
+        let mut frames: Vec<(String, u32, u32, Vec<super::need::CellBox>)> = Vec::new();
+        for shard in state.shards.values() {
+            for row in &shard.rows {
+                if row.gone || !row.readable() || row.part.status != super::Status::Reviewed {
                     continue;
-                };
-                obs.push(super::statics::Obs {
-                    camera: camera.to_string(),
-                    frame: frame.get_or_insert_with(|| shard.rel(row)).clone(),
-                    day: date.to_string(),
-                    scene: scene.to_string(),
-                    label: label.clone(),
-                    bbox,
-                });
+                }
+                let boxes = shard.boxes_of(row);
+                // Only frames that give an observation are copied ([`super::need::spot_obs`]).
+                if !boxes.iter().any(|b| b.has(super::need::TRAINING))
+                    || boxes.iter().any(|b| b.has(super::need::UNSPOTTED))
+                {
+                    continue;
+                }
+                frames.push((
+                    shard.rel(row),
+                    row.side.width,
+                    row.side.height,
+                    boxes.to_vec(),
+                ));
             }
         }
-    }
-    Some((rows_stamp(&state), obs))
+        (rows_stamp(&state), frames)
+    };
+    frames.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let obs = frames
+        .iter()
+        .flat_map(|(rel, w, h, boxes)| super::need::spot_obs(rel, *w, *h, boxes, classes))
+        .collect();
+    Some((stamp, obs))
+}
+
+/// The index of `dir` for `wanted` is still being built (its rows are not all in).
+pub fn building(dir: &Path, wanted: Option<&(Vec<String>, Vec<String>)>) -> bool {
+    HUB.lock_recover()
+        .current
+        .iter()
+        .find(|c| c.index.is(dir, wanted))
+        .is_some_and(|c| !c.index.cancelled() && c.index.building.load(Ordering::Acquire))
 }
 
 /// The index's bytes, from capacities; None with no index.
@@ -664,7 +669,7 @@ fn timing(dir: &Path) -> Timing {
 }
 
 /// Whether a folder of `frames` frames takes an index.
-fn takes_index(frames: usize) -> bool {
+pub fn takes_index(frames: usize) -> bool {
     frames >= MIN_INDEXED_FRAMES
 }
 

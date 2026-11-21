@@ -15,16 +15,22 @@
 //! suppressed boxes. A box is [`MISSED`] ([`missed`]) when it is pending, has evidence the camera
 //! model did not alert on (an auto-labeler found it, or the camera model scored it below its
 //! threshold or a rule suppressed it), and no prediction of the same object
-//! ([`super::repeats::same_object`]) lies on it at IoU >= [`MISSED_IOU`]. Pending candidates of
-//! evidence under [`MIN_EVIDENCE`] are left out, and at most [`MAX_PER_CLASS`] of a class are kept
-//! (the strongest; ties by order): a storm of weak boxes is no crowd, and the index holds less.
-//! Candidates come sorted by class, in their order within a class.
+//! ([`super::repeats::same_object`]) lies on it at IoU >= [`MISSED_IOU`]. At most
+//! [`MAX_PER_CLASS`] pending candidates of a class are kept (the strongest; ties by order): a storm
+//! of weak boxes is no crowd, and the index holds less. Candidates come sorted by class, in their
+//! order within a class. A pending candidate of evidence under [`MIN_EVIDENCE`] ([`faint`]) adds
+//! no recall need: [`Scorer::score`] leaves it out unless it is likely false (a VLM no, or κ under
+//! [`LIKELY_FALSE_KAPPA`]), and then it counts for its hard-negative share alone, so a frame
+//! holding nothing else scores its `H` ([`Detail::hard_only`]), not as an empty frame.
 //!
 //! A reviewed frame's [`of_file`] is what the tally reads instead: its training boxes
 //! ([`TRAINING`]), its hard negatives ([`REJECTED`]: rejected machine boxes a reviewer judged, no
 //! duplicates, ignore regions or dismissals, [`LabelFile::hard_negatives`]) and one marker per
 //! class a model or auto-labeler proposed there and a reviewer judged ([`PROPOSED`],
-//! [`super::queue::proposed_labels`]). The markers are no candidates.
+//! [`super::queue::proposed_labels`]), plus an [`UNSPOTTED`] marker when an export leaves the frame
+//! out (a pending box, a training label not in the class list): [`spot_obs`], the one source of
+//! parked-spot observations for the walk and the index, then takes none of its boxes. The markers
+//! are no candidates.
 //!
 //! **Evidence** ([`evidence`]) of a pending box: [`STRONG`] (1) with two or more labelers, `agree`,
 //! `likely` or a VLM yes; else `sqrt(score)` x [`W_LONE`]. A VLM no multiplies either by
@@ -53,15 +59,17 @@
 //!        for a strong box; 1 for a decided one
 //! a_b  = e_b · (W_SPOT at a spot of m) · (W_MISSED if MISSED or GAP, e_b >= MISSED_MIN_E, κ_b >= MISSED_MIN_KAPPA)
 //!            · (1 + W_REGION · T_R/(T_R + n_{m,k,region(b)}))/2 · κ_b
-//! objects: candidates of other classes at IoU >= OBJECT_IOU, or intersection over the smaller box
-//!          >= OBJECT_INSIDE, are one object; only its best class (largest Σ a_b · w_k) keeps its boxes
+//! objects: candidates of other classes confused with each other (two animals, two vehicles),
+//!          areas within a factor OBJECT_AREA, at IoU >= OBJECT_IOU or intersection over the smaller
+//!          box >= OBJECT_INSIDE, are one object, never joining two decided boxes; only its best
+//!          class (a decided box's, else the largest Σ a_b · w_k) keeps its boxes
 //! E_k  = crowd(Σ a_b) = min(S, 1) + MORE_WEIGHT · min(max(S − 1, 0), MORE_BOXES)
 //!                                 w_k = v_k · D_k · F_k · r_k · U_k · g_k
 //! v_k  = ½·T/(T + n_{k,s}) + ½·T_CAM/(T_CAM + n_{m,k,s})
 //! D_k  = 1 + W_DAY if d is a new day of (m, k, s), else 1
 //! F_k  = RARE_GAIN under CLASS_FLOOR whole reviewed boxes, else 1; when the class is mostly false
 //!        (FALSE_MIN_PROPOSED or more judged proposals over every camera, under FALSE_KEPT_SHARE of
-//!        them kept) only a frame with a strong or decided box of it keeps the gain
+//!        them kept) only a frame with a strong or decided box of it (after objects) keeps the gain
 //! r_k  = 1 + RECALL_GAIN · m̂   (m̂: the shrunk held-out miss rate, recall::Measured::miss)
 //! U_k  = CATCHUP_GAIN if k is camera m's lowest-recall class (within CATCHUP_TOL), else 1
 //! g_k  = 1 (held-out steering comes later)
@@ -107,8 +115,8 @@
 //!   of a frame counts: a frame of five cars teaches little more than one of two, and a storm of
 //!   weak boxes never reaches a single strong one's worth by number.
 //! - [`MIN_EVIDENCE`] = 0.1, [`MAX_PER_CLASS`] = 8: a box under a tenth of evidence (a VLM no on a
-//!   lone low score) adds nothing a reviewer would keep; eight of a class are more than the cap
-//!   counts.
+//!   lone low score) adds nothing a reviewer would keep, but one likely false still teaches once
+//!   rejected; eight of a class are more than the cap counts.
 //! - [`CLASS_FLOOR`] = 20 and [`RARE_GAIN`] = 3: under 20 boxes the benchmark scores no class
 //!   ([`crate::benchmark::metrics::MIN_CLASS_GT`]), so the first 20 come first. A parked box counts
 //!   whole here: the floor is about how many boxes exist. [`FALSE_MIN_PROPOSED`] = 20 and
@@ -127,8 +135,11 @@
 //! - [`K_WEAK`] = 1, [`K_STRONG`] = 5: the camera's kept share of a class's proposals, with a
 //!   prior worth one kept proposal for a weak box and five for a strong one: rejects lower strong
 //!   boxes too, more gently (30 rejected strong proposals bring them to a seventh).
-//! - [`OBJECT_IOU`] = 0.5, [`OBJECT_INSIDE`] = 0.8: one animal proposed as cat, dog and raccoon is
-//!   one object, worth its best class once.
+//! - [`OBJECT_IOU`] = 0.5, [`OBJECT_INSIDE`] = 0.8, [`OBJECT_AREA`] = 2: one animal proposed as
+//!   cat, dog and raccoon is one object, worth its best class once. Only classes labelers confuse
+//!   join (an animal with an animal, a vehicle with a vehicle), of similar sizes: a person on a
+//!   motorcycle, a person by a car, a cat on a car stay two; two decided boxes are two objects a
+//!   reviewer drew.
 //! - [`W_DAY`] = 0.5: a new day of a cell brings other light and weather.
 //! - [`W_LONE`] = 0.5, [`W_VLM_NO`] = 0.25: a lone weak box is often false; one the VLM rejects
 //!   mostly is.
@@ -209,9 +220,11 @@ pub const CATCHUP_TOL: f64 = 0.05;
 /// The kept share's prior, in kept proposals, for a weak and for a strong box.
 pub const K_WEAK: f64 = 1.0;
 pub const K_STRONG: f64 = 5.0;
-/// Candidates of other classes this close are one object.
+/// Candidates of other classes this close, of areas within a factor [`OBJECT_AREA`], are one
+/// object.
 pub const OBJECT_IOU: f32 = 0.5;
 pub const OBJECT_INSIDE: f32 = 0.8;
+pub const OBJECT_AREA: f32 = 2.0;
 /// What an empty frame weighs, against a fresh box.
 pub const W_EMPTY: f64 = 0.3;
 /// How much a camera's share of reviewed frames with an animal raises its empty frames.
@@ -256,6 +269,9 @@ pub const REJECTED: u8 = 16;
 pub const PROPOSED: u8 = 32;
 /// The VLM said no.
 pub const VLM_NO: u8 = 64;
+/// A reviewed frame's marker: an export leaves the frame out (a pending box, or a training label
+/// off the class list), so it is no parked-spot evidence ([`spot_obs`]).
+pub const UNSPOTTED: u8 = 128;
 
 /// The scenes of the tally; any other scene is the fourth.
 const SCENES: [&str; 4] = ["day", "night", "ir", "other"];
@@ -291,7 +307,7 @@ impl CellBox {
 
     /// A candidate of the need: no hard negative or proposal marker.
     pub fn is_candidate(&self) -> bool {
-        self.flags & (REJECTED | PROPOSED) == 0
+        self.flags & (REJECTED | PROPOSED | UNSPOTTED) == 0
     }
 
     /// Tracked through a visit ([`day`]): decided, or pending with strong evidence.
@@ -405,16 +421,12 @@ fn thinned(b: &CellBox) -> bool {
     b.is_candidate() && !b.has(TRAINING)
 }
 
-/// `c` sorted by class (stable), its pending candidates under [`MIN_EVIDENCE`] left out and at
-/// most [`MAX_PER_CLASS`] of a class kept (the strongest; ties by order). Decided boxes and markers
-/// all stay.
+/// `c` sorted by class (stable), at most [`MAX_PER_CLASS`] pending candidates of a class kept (the
+/// strongest; ties by order). Decided boxes and markers all stay. Candidates under
+/// [`MIN_EVIDENCE`] stay too: whether one counts depends on the camera ([`Scorer::score`] keeps a
+/// [`faint`] one only when it is likely false).
 fn finish(c: Vec<CellBox>) -> Vec<CellBox> {
-    let min = hundredths(MIN_EVIDENCE);
-    let mut kept: Vec<(usize, CellBox)> = c
-        .into_iter()
-        .enumerate()
-        .filter(|(_, b)| !thinned(b) || b.evidence >= min)
-        .collect();
+    let mut kept: Vec<(usize, CellBox)> = c.into_iter().enumerate().collect();
     // Strongest first within a class, to keep the first few.
     kept.sort_by_key(|(i, b)| (b.class, thinned(b), std::cmp::Reverse(b.evidence), *i));
     let mut out: Vec<(usize, CellBox)> = Vec::with_capacity(kept.len());
@@ -434,12 +446,62 @@ fn finish(c: Vec<CellBox>) -> Vec<CellBox> {
     out.into_iter().map(|(_, b)| b).collect()
 }
 
+/// A pending candidate under [`MIN_EVIDENCE`]: it adds no recall need; it counts only when it is
+/// likely false ([`Scorer::likely_false`]), for its hard-negative share alone.
+fn faint(b: &CellBox) -> bool {
+    thinned(b) && b.e() < MIN_EVIDENCE
+}
+
+/// The parked-spot observations of a reviewed frame of `boxes` ([`of_file`]: its training boxes),
+/// by the export's rules, the one way the walk and the review index both make the spot table:
+/// none when [`UNSPOTTED`] (pending boxes, a label off the class list), else each training box of
+/// a class of `classes`, its whole-pixel box normalised to the `width` x `height` frame. `rel`'s
+/// path names the camera, date and scene.
+pub fn spot_obs(
+    rel: &str,
+    width: u32,
+    height: u32,
+    boxes: &[CellBox],
+    classes: &[String],
+) -> Vec<statics::Obs> {
+    let mut parts = rel.split('/');
+    let (Some(scene), Some(camera), Some(date)) = (parts.next(), parts.next(), parts.next()) else {
+        return Vec::new();
+    };
+    if boxes.iter().any(|b| b.has(UNSPOTTED)) {
+        return Vec::new();
+    }
+    boxes
+        .iter()
+        .filter(|b| b.has(TRAINING))
+        .filter_map(|b| {
+            Some(statics::Obs {
+                camera: camera.to_string(),
+                frame: rel.to_string(),
+                day: date.to_string(),
+                scene: scene.to_string(),
+                label: classes.get(usize::from(b.class))?.clone(),
+                bbox: statics::normalised(&b.rect(), width, height)?,
+            })
+        })
+        .collect()
+}
+
 /// The candidates of a frame with label file `l` (see the module docs); of a reviewed frame, what
 /// the tally reads.
 pub fn of_file(l: &LabelFile, w: Option<&Wanted<'_>>) -> Vec<CellBox> {
     let Some(w) = w else { return Vec::new() };
     let mut out = Vec::new();
     if l.status == Status::Reviewed {
+        // As the export: a frame with a pending box or a label off the list is left out.
+        if l.boxes.iter().any(|b| b.state == BoxState::Pending)
+            || l.training().any(|b| !w.classes.contains(&b.label))
+        {
+            out.push(CellBox {
+                flags: UNSPOTTED,
+                ..CellBox::default()
+            });
+        }
         for b in l.training().filter(|b| !b.is_ignore()) {
             if let Some(k) = class_index(w, &b.label) {
                 out.push(CellBox {
@@ -679,7 +741,42 @@ pub struct CellTally {
     cameras: BTreeMap<String, CameraCells>,
 }
 
+/// About the heap bytes of `m`'s entries (a B-tree node's share each), for [`CellTally::bytes`].
+fn map_bytes<K, V>(m: &BTreeMap<K, V>) -> usize {
+    m.len() * (size_of::<(K, V)>() + 2 * size_of::<usize>())
+}
+
 impl CellTally {
+    /// About its bytes (the review index's ceiling counts the parts it keeps).
+    pub fn bytes(&self) -> usize {
+        let cameras: usize = self
+            .cameras
+            .iter()
+            .map(|(name, c)| {
+                let days: usize = c
+                    .days
+                    .values()
+                    .map(|d| {
+                        d.iter().map(String::capacity).sum::<usize>()
+                            + d.len() * (size_of::<String>() + 2 * size_of::<usize>())
+                    })
+                    .sum();
+                name.capacity()
+                    + map_bytes(&c.cells)
+                    + map_bytes(&c.regions)
+                    + map_bytes(&c.days)
+                    + days
+                    + map_bytes(&c.precision)
+                    + map_bytes(&c.hard)
+            })
+            .sum();
+        size_of::<Self>()
+            + map_bytes(&self.class_scene)
+            + map_bytes(&self.class_boxes)
+            + map_bytes(&self.cameras)
+            + cameras
+    }
+
     /// Add another part of a walk.
     pub fn merge(&mut self, other: Self) {
         self.merge_ref(&other);
@@ -775,9 +872,11 @@ pub struct Facts<'a> {
 pub struct Need<'a> {
     wanted: Option<Wanted<'a>>,
     steer: Option<&'a Steer>,
-    /// Per class: an animal ([`Category::Animal`]), and may form a parked spot.
+    /// Per class: an animal ([`Category::Animal`]), may form a parked spot, and its category (what
+    /// a class is confused with: one object, [`objects`]).
     animal: Vec<bool>,
     may_park: Vec<bool>,
+    category: Vec<Category>,
 }
 
 impl<'a> Need<'a> {
@@ -789,6 +888,7 @@ impl<'a> Need<'a> {
                 .map(|c| Category::of(c) == Category::Animal)
                 .collect(),
             may_park: classes.iter().map(|c| statics::may_be_static(c)).collect(),
+            category: classes.iter().map(|c| Category::of(c)).collect(),
             wanted,
             steer,
         }
@@ -1174,6 +1274,9 @@ pub struct Detail {
     /// The hard-negative share, and the class of its largest part.
     pub hard: f64,
     pub hard_class: Option<u16>,
+    /// The frame adds no recall need, only likely false boxes: its score is their hard-negative
+    /// share.
+    pub hard_only: bool,
     /// An empty frame: the scene's reviewed empty frames and the camera's animal share there.
     pub empty: Option<(u64, f64)>,
 }
@@ -1427,7 +1530,7 @@ impl<'a> Scorer<'a> {
         let cands: Vec<&CellBox> = boxes
             .iter()
             .chain(gaps)
-            .filter(|b| b.is_candidate())
+            .filter(|b| b.is_candidate() && (!faint(b) || self.likely_false(&cam, b)))
             .collect();
         if cands.is_empty() {
             let empty = self.tally.empty.get(s).copied().unwrap_or(0);
@@ -1443,38 +1546,60 @@ impl<'a> Scorer<'a> {
         let mut classes: Vec<u16> = cands.iter().map(|b| b.class).collect();
         classes.sort_unstable();
         classes.dedup();
-        let weights: Vec<ClassWeight> = classes
-            .iter()
-            .map(|&k| {
-                let ki = usize::from(k);
-                let v_k = cam.v.get(ki).and_then(|v| v.get(s)).copied().unwrap_or(1.0);
-                let new_day = !cam
-                    .cells
-                    .and_then(|c| c.days.get(&(k, s8)))
-                    .is_some_and(|days| days.contains(f.day));
-                let d_k = if new_day { 1.0 + W_DAY } else { 1.0 };
-                let strong = cands
-                    .iter()
-                    .any(|b| b.class == k && (b.has(STRONG) || b.has(TRAINING)));
-                let floor = self.floor_gain(k, strong);
-                let f_k = if floor { RARE_GAIN } else { 1.0 };
-                let r_k = cam.r.get(ki).and_then(|r| r.get(s)).copied().unwrap_or(1.0);
-                let catch_up = cam.catch_up.get(ki).copied().unwrap_or(false);
-                let u_k = if catch_up { CATCHUP_GAIN } else { 1.0 };
-                let g_k = self.heldout_gain(f, k);
-                ClassWeight {
-                    k,
-                    v: v_k,
-                    w: v_k * d_k * f_k * r_k * u_k * g_k,
-                    new_day,
-                    floor,
-                    catch_up,
-                }
+        // A strong or decided box of class `k` among `boxes` (with `keep`, the kept ones only).
+        let strong_of = |k: u16, keep: Option<&[bool]>| {
+            cands.iter().enumerate().any(|(i, b)| {
+                b.class == k
+                    && (b.has(STRONG) || b.has(TRAINING))
+                    && keep.is_none_or(|kept| kept.get(i).copied().unwrap_or(false))
             })
+        };
+        let weigh = |k: u16, strong: bool| {
+            let ki = usize::from(k);
+            let v_k = cam.v.get(ki).and_then(|v| v.get(s)).copied().unwrap_or(1.0);
+            let new_day = !cam
+                .cells
+                .and_then(|c| c.days.get(&(k, s8)))
+                .is_some_and(|days| days.contains(f.day));
+            let d_k = if new_day { 1.0 + W_DAY } else { 1.0 };
+            let floor = self.floor_gain(k, strong);
+            let f_k = if floor { RARE_GAIN } else { 1.0 };
+            let r_k = cam.r.get(ki).and_then(|r| r.get(s)).copied().unwrap_or(1.0);
+            let catch_up = cam.catch_up.get(ki).copied().unwrap_or(false);
+            let u_k = if catch_up { CATCHUP_GAIN } else { 1.0 };
+            let g_k = self.heldout_gain(f, k);
+            ClassWeight {
+                k,
+                v: v_k,
+                w: v_k * d_k * f_k * r_k * u_k * g_k,
+                new_day,
+                floor,
+                catch_up,
+            }
+        };
+        // Objects are found with every candidate's strength; the floor then follows the boxes
+        // that survive them.
+        let first: Vec<ClassWeight> = classes
+            .iter()
+            .map(|&k| weigh(k, strong_of(k, None)))
             .collect();
-        let weight_of = |k: u16| weights.iter().find(|w| w.k == k).map_or(0.0, |w| w.w);
+        let weight_of = |k: u16| first.iter().find(|w| w.k == k).map_or(0.0, |w| w.w);
         let vals: Vec<BoxVal> = cands.iter().map(|b| self.box_val(&cam, b, f)).collect();
-        let keep = objects(&cands, &vals, &weight_of);
+        // One class: nothing to join (boxes of one class never do), every box kept.
+        let keep = if classes.len() < 2 {
+            vec![true; cands.len()]
+        } else {
+            objects(&cands, &vals, &weight_of, &|a, b| self.confusable(a, b))
+        };
+        let mut weights = first;
+        if keep.contains(&false) {
+            for w in &mut weights {
+                let kept = strong_of(w.k, Some(&keep));
+                if kept != strong_of(w.k, None) {
+                    *w = weigh(w.k, kept);
+                }
+            }
+        }
         let mut v = 0.0;
         let mut hard = 0.0;
         let (mut hard_best, mut hard_class) = (0.0, None);
@@ -1538,11 +1663,51 @@ impl<'a> Scorer<'a> {
         let mut d = best.map(|(_, d)| d).unwrap_or_default();
         d.hard = hard;
         d.hard_class = hard_class.filter(|_| hard > 0.0);
+        // No recall need, only likely false boxes (faint ones, or of a κ of 0): the frame is worth
+        // its hard-negative share alone, no class named.
+        if v == 0.0 && hard > 0.0 {
+            d = Detail {
+                hard,
+                hard_class: d.hard_class,
+                hard_only: true,
+                ..Detail::default()
+            };
+        }
         d.score = score_of(v + hard);
         d
     }
 
+    /// Classes `a` and `b` can be one object proposed twice: an animal for another or a vehicle
+    /// for another, never a person or any other class.
+    fn confusable(&self, a: u16, b: u16) -> bool {
+        let of = |k: u16| self.need.category.get(usize::from(k)).copied();
+        match (of(a), of(b)) {
+            (Some(x), Some(y)) => x == y && matches!(x, Category::Vehicle | Category::Animal),
+            _ => false,
+        }
+    }
+
     /// What one candidate `b` of a frame at `f` adds (see the module docs).
+    /// κ of box `b` on `cam`: None for a decided box, else the camera's kept share of the class
+    /// for boxes of its strength.
+    fn kappa(&self, cam: &Cam<'_>, b: &CellBox) -> Option<f64> {
+        let ki = usize::from(b.class);
+        if b.has(TRAINING) {
+            None
+        } else if b.has(STRONG) {
+            Some(cam.kappa_strong.get(ki).copied().unwrap_or(1.0))
+        } else {
+            Some(cam.kappa_weak.get(ki).copied().unwrap_or(1.0))
+        }
+    }
+
+    /// Box `b` is likely false on `cam`: pending, no gap, and a VLM no or κ under
+    /// [`LIKELY_FALSE_KAPPA`].
+    fn likely_false(&self, cam: &Cam<'_>, b: &CellBox) -> bool {
+        let kp = self.kappa(cam, b).unwrap_or(1.0);
+        !b.has(TRAINING) && !b.has(GAP) && (kp < LIKELY_FALSE_KAPPA || b.has(VLM_NO))
+    }
+
     fn box_val(&self, cam: &Cam<'_>, b: &CellBox, f: &Facts<'_>) -> BoxVal {
         let ki = usize::from(b.class);
         let decided = b.has(TRAINING);
@@ -1555,18 +1720,13 @@ impl<'a> Scorer<'a> {
             .and_then(|r| r.get(g))
             .copied()
             .unwrap_or(0.0);
-        let kappa = if decided {
-            None
-        } else if strong {
-            Some(cam.kappa_strong.get(ki).copied().unwrap_or(1.0))
-        } else {
-            Some(cam.kappa_weak.get(ki).copied().unwrap_or(1.0))
-        };
+        let kappa = self.kappa(cam, b);
         let kp = kappa.unwrap_or(1.0);
         let missed =
             (b.has(MISSED) || b.has(GAP)) && b.e() >= MISSED_MIN_E && kp >= MISSED_MIN_KAPPA;
         let rf = (1.0 + W_REGION * T_R / (T_R + n_region)) / 2.0;
-        let mut a = b.e();
+        // A faint box adds no recall need, only its hard-negative share.
+        let mut a = if faint(b) { 0.0 } else { b.e() };
         if spot {
             a *= W_SPOT;
         }
@@ -1576,7 +1736,7 @@ impl<'a> Scorer<'a> {
         a *= rf;
         a *= kp;
         let vlm_no = b.has(VLM_NO);
-        let likely_false = !decided && !b.has(GAP) && (kp < LIKELY_FALSE_KAPPA || vlm_no);
+        let likely_false = self.likely_false(cam, b);
         let falseness = if likely_false {
             (1.0 - kp).max(if vlm_no { VLM_NO_FALSE } else { 0.0 })
         } else {
@@ -1638,6 +1798,7 @@ impl<'a> Scorer<'a> {
             visit_class: visit.map(|k| self.need.name(k).to_string()),
             hard_negative: four(d.hard),
             hard_class: d.hard_class.map(|k| self.need.name(k).to_string()),
+            hard_only: d.hard_only,
             empty_reviewed: d.empty.map(|e| e.0),
             animal_share: d.empty.map(|e| four(e.1)).filter(|s| *s > 0.0),
         }
@@ -1693,25 +1854,59 @@ fn root(p: &mut [usize], i: usize) -> usize {
     r
 }
 
-/// Which of `cands` count (see the module docs, "objects"): candidates of other classes on one
-/// object form one, and only its best class (the largest `Σ a_b · w_k`, ties to the first class)
-/// keeps its boxes. Boxes of one class never join directly. The one rule for both paths.
-fn objects(cands: &[&CellBox], vals: &[BoxVal], weight: &dyn Fn(u16) -> f64) -> Vec<bool> {
+/// The area of `b`.
+fn area(b: &[f32; 4]) -> f32 {
+    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
+}
+
+/// Which of `cands` count (see the module docs, "objects"): candidates of other classes that
+/// `confusable` allows (two animals, two vehicles), of areas within [`OBJECT_AREA`] of each other
+/// and at IoU >= [`OBJECT_IOU`] or [`OBJECT_INSIDE`] inside one another, form one object, and only
+/// its best class keeps its boxes: a decided box's class when it holds one, else the largest
+/// `Σ a_b · w_k` (ties to the first class). Boxes of one class never join directly, and two
+/// objects that each hold a decided box never join. The one rule for both paths.
+fn objects(
+    cands: &[&CellBox],
+    vals: &[BoxVal],
+    weight: &dyn Fn(u16) -> f64,
+    confusable: &dyn Fn(u16, u16) -> bool,
+) -> Vec<bool> {
     let n = cands.len();
     let mut parent: Vec<usize> = (0..n).collect();
+    // Per root: the class of a decided box in it.
+    let mut decided: Vec<Option<u16>> = cands
+        .iter()
+        .map(|b| b.has(TRAINING).then_some(b.class))
+        .collect();
     for (i, a) in cands.iter().enumerate() {
         for (j, b) in cands.iter().enumerate().skip(i + 1) {
-            if a.class == b.class {
+            if a.class == b.class || !confusable(a.class, b.class) {
                 continue;
             }
             let (ra, rb) = (a.rect(), b.rect());
-            if iou(&ra, &rb) >= OBJECT_IOU || inside_share(&ra, &rb) >= OBJECT_INSIDE {
-                let (x, y) = (root(&mut parent, i), root(&mut parent, j));
-                if x != y
-                    && let Some(p) = parent.get_mut(x.max(y))
-                {
-                    *p = x.min(y);
-                }
+            let (aa, ab) = (area(&ra), area(&rb));
+            let similar = aa > 0.0 && ab > 0.0 && {
+                let r = aa / ab;
+                (1.0 / OBJECT_AREA..=OBJECT_AREA).contains(&r)
+            };
+            if !similar || !(iou(&ra, &rb) >= OBJECT_IOU || inside_share(&ra, &rb) >= OBJECT_INSIDE)
+            {
+                continue;
+            }
+            let (x, y) = (root(&mut parent, i), root(&mut parent, j));
+            let (dx, dy) = (
+                decided.get(x).copied().flatten(),
+                decided.get(y).copied().flatten(),
+            );
+            if x == y || (dx.is_some() && dy.is_some()) {
+                continue;
+            }
+            let (lo, hi) = (x.min(y), x.max(y));
+            if let Some(p) = parent.get_mut(hi) {
+                *p = lo;
+            }
+            if let Some(d) = decided.get_mut(lo) {
+                *d = dx.or(dy);
             }
         }
     }
@@ -1720,9 +1915,13 @@ fn objects(cands: &[&CellBox], vals: &[BoxVal], weight: &dyn Fn(u16) -> f64) -> 
     for ((b, x), r) in cands.iter().zip(vals).zip(&roots) {
         *sums.entry((*r, b.class)).or_default() += x.a;
     }
-    // Per object, its best class (in class order, the first of a tie).
+    // Per object, its best class (a decided one, else in class order the first of a tie).
     let mut best: BTreeMap<usize, (u16, f64)> = BTreeMap::new();
     for ((r, k), sum) in sums {
+        if let Some(d) = decided.get(r).copied().flatten() {
+            best.insert(r, (d, f64::INFINITY));
+            continue;
+        }
         let v = sum * weight(k);
         let e = best.entry(r).or_insert((k, v));
         if v > e.1 {
@@ -1845,6 +2044,10 @@ pub struct RecallNeed {
     pub hard_negative: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hard_class: Option<String>,
+    /// The frame adds no recall need, only likely false boxes (no class named): it is here for its
+    /// hard-negative share alone.
+    #[serde(skip_serializing_if = "is_false")]
+    pub hard_only: bool,
     /// An empty frame: the scene's reviewed empty frames, and the camera's share of reviewed
     /// frames with an animal there (when any).
     #[serde(skip_serializing_if = "Option::is_none")]

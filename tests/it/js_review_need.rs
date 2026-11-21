@@ -143,6 +143,18 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
         animal_share: Some(0.333),
         ..RecallNeed::default()
     };
+    // The top class's own likely false box: not named twice.
+    let person_maybe_false = RecallNeed {
+        hard_class: Some("cat".into()),
+        ..cat_in_fox_visit.clone()
+    };
+    // A frame with nothing but a likely false box: its hard negative, never "empty".
+    let only_false = RecallNeed {
+        hard_negative: 0.12,
+        hard_class: Some("dog".into()),
+        hard_only: true,
+        ..RecallNeed::default()
+    };
     let counts = NeedCounts {
         boxes: [
             (
@@ -170,6 +182,8 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
         item(&lacking, "night", 0),
         item(&empty, "night", 0),
         item(&cat_in_fox_visit, "day", 4),
+        item(&person_maybe_false, "day", 0),
+        item(&only_false, "night", 0),
         { "op": "note", "item": { "camera": "back", "scene": "day" } },
         { "op": "counts", "c": serde_json::to_value(&counts).unwrap() },
         { "op": "counts", "c": serde_json::to_value(NeedCounts::default()).unwrap() },
@@ -194,6 +208,10 @@ fn the_need_reads_as_the_reasons_for_the_frame() {
              of this camera's reviewed frames here had an animal",
             "cat · back · day: 25 boxes on this camera (40 on every camera in this scene), frame 5 \
              of a fox visit, likely false person: rejecting it teaches the model",
+            "cat · back · day: 25 boxes on this camera (40 on every camera in this scene), some \
+             may be false: rejecting those teaches the model",
+            "likely false dog · back · night: nothing else to label here; rejecting it teaches \
+             the model",
             "",
             "person 12.25 (day 8, night 4.25) · raccoon 3 (IR 3) · empty: day 20",
             "none yet",

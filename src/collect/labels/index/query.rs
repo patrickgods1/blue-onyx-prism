@@ -531,6 +531,11 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
 #[derive(Debug, Default)]
 pub(super) struct NeedCache {
     shards: Mutex<HashMap<String, ShardNeed>>,
+    /// Parts served from the cache, and made (tests).
+    #[cfg(test)]
+    pub(super) hits: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(super) made: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -542,6 +547,47 @@ struct ShardNeed {
 }
 
 impl NeedCache {
+    /// Drop the entries of shards `state` no longer has (a folder's days removed).
+    pub(super) fn retain(&self, state: &State) {
+        let mut map = self.shards.lock_recover();
+        if map.len() > state.shards.len() || map.keys().any(|d| !state.shards.contains_key(d)) {
+            map.retain(|day, _| state.shards.contains_key(day));
+        }
+    }
+
+    /// About its bytes (the index's ceiling counts them).
+    pub(super) fn bytes(&self) -> usize {
+        let map = self.shards.lock_recover();
+        map.capacity() * size_of::<(String, ShardNeed)>()
+            + map
+                .iter()
+                .map(|(day, e)| {
+                    day.capacity()
+                        + e.filter.capacity()
+                        + e.outs.as_ref().map_or(0, |o| {
+                            size_of::<Vec<DayOut>>()
+                                + o.iter()
+                                    .map(|d| {
+                                        size_of::<DayOut>()
+                                            + d.gaps.capacity() * size_of::<CellBox>()
+                                            + d.visit_classes.capacity() * size_of::<u16>()
+                                    })
+                                    .sum::<usize>()
+                        })
+                        + e.tally.as_ref().map_or(0, |(_, t)| t.bytes())
+                })
+                .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    fn count(&self, hit: bool) {
+        let n = if hit { &self.hits } else { &self.made };
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    fn count(&self, _hit: bool) {}
+
     /// The entry of `shard` for `filter`, emptied when either changed.
     fn with<T>(&self, shard: &Shard, filter: &str, f: impl FnOnce(&mut ShardNeed) -> T) -> T {
         let mut map = self.shards.lock_recover();
@@ -563,8 +609,10 @@ impl NeedCache {
         make: impl FnOnce() -> Vec<DayOut>,
     ) -> Arc<Vec<DayOut>> {
         if let Some(o) = self.with(shard, filter, |e| e.outs.clone()) {
+            self.count(true);
             return o;
         }
+        self.count(false);
         let o = Arc::new(make());
         self.with(shard, filter, |e| e.outs = Some(o.clone()));
         o
@@ -589,8 +637,10 @@ impl NeedCache {
                 .map(|(_, t)| t.clone())
         });
         if let Some(t) = kept {
+            self.count(true);
             return t;
         }
+        self.count(false);
         let t = Arc::new(make());
         self.with(shard, filter, |e| {
             e.tally = Some((spots.cloned(), t.clone()))
@@ -665,6 +715,9 @@ pub(super) fn answer(
     let mut tally = Tally::new(names);
     let n = f.need();
     let filter = count_key(f);
+    if n.is_some() {
+        cache.retain(state);
+    }
     let cells = n
         .as_ref()
         .map(|n| need_tally(state, &q, names, n, cache, &filter));

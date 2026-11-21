@@ -225,6 +225,21 @@ pub(crate) fn served(dir: &Path) -> bool {
     with(dir, |f| f.served).unwrap_or(false)
 }
 
+/// The need cache of `dir`'s index: parts made and parts served again (0, 0 without an index).
+pub(crate) fn need_parts(dir: &Path) -> (u64, u64) {
+    super::HUB
+        .lock_recover()
+        .current
+        .iter()
+        .find(|c| c.index.dir == dir)
+        .map_or((0, 0), |c| {
+            (
+                c.index.need.made.load(Ordering::Relaxed),
+                c.index.need.hits.load(Ordering::Relaxed),
+            )
+        })
+}
+
 /// See [`served`].
 pub(super) fn note_served(dir: &Path, by_index: bool) {
     with(dir, |f| f.served = by_index);
@@ -2259,6 +2274,151 @@ mod cases {
         }
     }
 
+    /// Reviewed frames of camera `gate` that test the spot table's rules: a car parked on two
+    /// days (12 frames), four more at a box whose IoU to it is 0.6 at whole pixels and just under
+    /// at the drawn ones (25.4 px off), two reopened ones (a pending box beside the car: no
+    /// export's frame) and one with a training label off the class list (`motorbike`, an alias of
+    /// `motorcycle`: left out whole). Returns the reopened and the aliased frames.
+    fn spot_cases(dir: &Path, rels: &mut Vec<String>) -> Vec<String> {
+        let none = |_: &mut Record| {};
+        let reviewed = |boxes: Vec<LabelBox>| LabelFile {
+            status: Status::Reviewed,
+            reviewed_at: Some("2026-10-22T00:00:00Z".into()),
+            boxes,
+            ..LabelFile::default()
+        };
+        let car = |x: f32| {
+            cue_box(
+                "car",
+                [x, 200.0, x + 100.0, 300.0],
+                Source::Human,
+                BoxState::Accepted,
+            )
+        };
+        let mut put = |i: u32, boxes: Vec<LabelBox>| {
+            let date = if i.is_multiple_of(2) {
+                "2026-10-20"
+            } else {
+                "2026-10-21"
+            };
+            let rel = format!("day/gate/{date}/20261020T{:06}000Z_gate{i}.jpg", 100 + i);
+            let time = format!("{date}T{:02}:00:00Z", i % 24);
+            let rel = put_cue(dir, &rel, &time, &none, Some(&reviewed(boxes)));
+            rels.push(rel.clone());
+            rel
+        };
+        for i in 0..12 {
+            put(i, vec![car(300.0)]);
+        }
+        for i in 12..16 {
+            put(i, vec![car(325.4)]);
+        }
+        let mut odd = Vec::new();
+        for i in 16..18 {
+            let pending = cue_box(
+                "person",
+                [10.0, 10.0, 40.0, 90.0],
+                Source::Model,
+                BoxState::Pending,
+            );
+            odd.push(put(i, vec![car(300.0), pending]));
+        }
+        let bike = cue_box(
+            "motorbike",
+            [50.0, 50.0, 90.0, 90.0],
+            Source::Human,
+            BoxState::Accepted,
+        );
+        odd.push(put(18, vec![car(300.0), bike]));
+        odd
+    }
+
+    /// The spot table of the index's rows is the walk's, observation for observation, and holds
+    /// the listed frames an export holds, at their boxes to within a pixel's rounding: every
+    /// camera.
+    /// `left_out`: frames that must give none (none after the edits).
+    fn spots_agree(
+        dir: &Path,
+        wanted: &(Vec<String>, Vec<String>),
+        left_out: &[String],
+        round: &str,
+    ) {
+        let w = Wanted {
+            classes: &wanted.0,
+            hidden: &wanted.1,
+        };
+        from_index(dir, &all_any(), None);
+        let (stamp, rows) = super::super::reviewed_obs(dir, Some(wanted)).unwrap();
+        assert_eq!(
+            super::super::rows_version(dir, Some(wanted)),
+            Some(stamp),
+            "{round}"
+        );
+        let walked = queue::reviewed_obs(dir, queue::candidates(dir, QueueSource::All), &w);
+        assert_eq!(rows, walked, "{round}");
+        let table = statics::Table::build(rows.clone());
+        assert_eq!(table, statics::Table::build(walked), "{round}");
+        // Before the edits (which may rewrite gate's frames), its spot is there.
+        assert!(
+            left_out.is_empty() || !table.camera("gate").is_empty(),
+            "{round}: {table:?}"
+        );
+        for f in left_out {
+            assert!(!rows.iter().any(|o| o.frame == *f), "{round}: {f}");
+        }
+        let frames = export::reviewed_frames_filtered(
+            dir,
+            &wanted.0,
+            &export::SplitConfig::default(),
+            &export::ClassFilter::default(),
+        )
+        .frames;
+        // The export walks every label file; the queue (so the index) knows the frames a line
+        // names: a frame no index or review line names is in neither.
+        let listed: BTreeSet<String> = queue::candidates(dir, QueueSource::All)
+            .into_iter()
+            .map(|c| c.rel)
+            .collect();
+        let exported: Vec<statics::Obs> = statics::observations(&frames, &w)
+            .into_iter()
+            .filter(|o| listed.contains(&o.frame))
+            .collect();
+        let key = |o: &statics::Obs| {
+            (
+                o.frame.clone(),
+                o.label.clone(),
+                o.bbox.map(|v| (v * 64.0).round() as i64),
+            )
+        };
+        let mut a: Vec<_> = rows.iter().collect();
+        let mut b: Vec<_> = exported.iter().collect();
+        a.sort_by_key(|o| key(o));
+        b.sort_by_key(|o| key(o));
+        let names = |v: &[&statics::Obs]| -> BTreeSet<(String, String)> {
+            v.iter()
+                .map(|o| (o.frame.clone(), o.label.clone()))
+                .collect()
+        };
+        let (na, nb) = (names(&a), names(&b));
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{round}: rows only {:?}, export only {:?}",
+            na.difference(&nb).collect::<Vec<_>>(),
+            nb.difference(&na).collect::<Vec<_>>()
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(
+                (&x.frame, &x.label, &x.camera, &x.day, &x.scene),
+                (&y.frame, &y.label, &y.camera, &y.day, &y.scene),
+                "{round}"
+            );
+            for (p, q) in x.bbox.iter().zip(&y.bbox) {
+                assert!((p - q).abs() <= 0.5 / 480.0 + 1e-6, "{round}: {x:?} {y:?}");
+            }
+        }
+    }
+
     /// The test that matters: see the module doc.
     #[test]
     fn equivalence() {
@@ -2275,12 +2435,15 @@ mod cases {
             let (a, b) = (wanted_a(), wanted_b());
             covers_every_case(&dir, &chain);
             covers_need(&dir, &steer, &cues);
+            let left_out = spot_cases(&dir, &mut rels);
             same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, built"));
-            // The index's reviewed rows give the parked spot the label files do.
-            let (stamp, obs) = super::super::reviewed_obs(&dir, Some(&a)).unwrap();
-            assert_eq!(super::super::rows_version(&dir, Some(&a)), Some(stamp));
-            let from_rows = statics::Table::build(obs);
-            assert_eq!(from_rows.camera("lot"), steer.spots.camera("lot"));
+            // The index's reviewed rows give the parked spots the label files do.
+            spots_agree(&dir, &a, &left_out, &format!("seed {seed}, built"));
+            let (_, obs) = super::super::reviewed_obs(&dir, Some(&a)).unwrap();
+            assert_eq!(
+                statics::Table::build(obs).camera("lot"),
+                steer.spots.camera("lot")
+            );
             assert!(super::super::reviewed_obs(&dir, Some(&wanted_b())).is_none());
             same_order(&dir, &all_any(), &format!("seed {seed}, built"));
             same_order(
@@ -2349,6 +2512,7 @@ mod cases {
                 &rels,
                 &format!("seed {seed}, real writes"),
             );
+            spots_agree(&dir, &a, &[], &format!("seed {seed}, real writes"));
             same_order(
                 &dir,
                 &balance_all(),
@@ -2392,6 +2556,7 @@ mod cases {
             direct_edits(&dir, &mut rng, &mut rels);
             index_of(&dir).unwrap().pass(Pass::Scan, &|| {});
             same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, scan"));
+            spots_agree(&dir, &a, &[], &format!("seed {seed}, scan"));
 
             shrink_queue(&dir);
             index_of(&dir).unwrap().pass(Pass::Scan, &|| {});
@@ -2406,6 +2571,7 @@ mod cases {
             in_place_edits(&dir, &mut rng, &rels);
             index_of(&dir).unwrap().pass(Pass::Full, &|| {});
             same_answers(&dir, &a, &steer, &rels, &format!("seed {seed}, full pass"));
+            spots_agree(&dir, &a, &[], &format!("seed {seed}, full pass"));
             same_order(&dir, &all_any(), &format!("seed {seed}, full pass"));
             same_order(
                 &dir,
@@ -2941,6 +3107,62 @@ mod cases {
         assert_eq!(listed(&f), before, "answered: kept");
         assert_eq!(listed(&verify_only), verify_before);
         assert!(served(&dir));
+    }
+
+    /// A drain that re-reads an unchanged review queue moves no shard's version, so the need
+    /// cache's parts are served again; a real change moves its shard's only.
+    #[test]
+    fn an_unchanged_queue_drain_keeps_the_need_cache() {
+        let dir = Dir::new();
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        let mut rels = generate(&dir, 5, 60, false);
+        need_frames(&dir, &mut rels);
+        let steer = Arc::new(steer_of(&dir));
+        let f = steered(recommended_all(), &steer);
+        let first = json(&from_index(&dir, &f, None));
+        let index = index_of(&dir).unwrap();
+        let versions = || -> BTreeMap<String, u64> {
+            index
+                .state
+                .read_recover()
+                .shards
+                .values()
+                .map(|s| (s.day.clone(), s.version))
+                .collect()
+        };
+        let before = versions();
+        let made = || index.need.made.load(Ordering::Relaxed);
+        let hits = || index.need.hits.load(Ordering::Relaxed);
+        let (m0, h0) = (made(), hits());
+        assert!(m0 > 0);
+        // The queue file "gained lines" that change nothing: every part is a hit.
+        super::super::queue_written(&dir);
+        assert_eq!(json(&from_index(&dir, &f, None)), first);
+        assert_eq!(versions(), before, "an unchanged drain moved a version");
+        assert_eq!(made(), m0, "a part was made again");
+        assert!(hits() > h0);
+        // A new review line for a frame that had none moves that frame's shard alone.
+        let moved = rels
+            .iter()
+            .find(|r| {
+                let q = std::fs::read_to_string(dir.join(REVIEW_QUEUE_FILE)).unwrap();
+                !q.contains(r.as_str())
+            })
+            .cloned();
+        if let Some(rel) = moved {
+            layout::append_review(&dir, std::slice::from_ref(&rel)).unwrap();
+            super::super::queue_written(&dir);
+            from_index(&dir, &f, None);
+            let after = versions();
+            let changed: Vec<&String> = after
+                .iter()
+                .filter(|(d, v)| before.get(*d) != Some(*v))
+                .map(|(d, _)| d)
+                .collect();
+            assert_eq!(changed, [&queue::day_of(&rel).to_string()], "{rel}");
+        }
+        // The cache counts in the index's bytes.
+        assert!(index.need.bytes() > 0 && index.bytes() > index.need.bytes());
     }
 
     #[test]

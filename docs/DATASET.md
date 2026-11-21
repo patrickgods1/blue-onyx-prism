@@ -806,21 +806,24 @@ class (below), so a rare animal's visit serves more of its poses (item field `ne
        (kept + 5)/(proposed + 5) for a strong one, 1 for a decided one
 a_b  = e_b · (1/4 at a parked spot of m) · (2 if missed or a gap, e_b >= 0.5 and κ_b >= 0.5)
            · (1 + 10/(10 + n_{m,k,region(b)}))/2 · κ_b
-one object: candidates of other classes at IoU >= 0.5, or with 80% of the smaller box inside the other,
-            are one object, and only its best class (largest Σ a_b · w_k) keeps its boxes
+one object: candidates of classes labelers confuse (an animal with an animal, a vehicle with a vehicle;
+            never a person, never an animal with a vehicle), of areas within a factor 2, at IoU >= 0.5 or with
+            80% of the smaller box inside the other, are one object, two decided boxes never; only its best
+            class (a decided box's, else the largest Σ a_b · w_k) keeps its boxes
 E_k  = crowd(S) = min(S, 1) + 0.5 · min(max(S − 1, 0), 2),  S = Σ a_b   (3 full boxes count 2, at most 2)
 w_k  = v_k · D_k · F_k · r_k · U_k
 v_k  = ½·100/(100 + n_{k,s}) + ½·30/(30 + n_{m,k,s})
 D_k  = 1.5 if d is a new day of (m, k, s), else 1
 F_k  = 3 while class k has fewer than 20 whole reviewed boxes (every camera and scene, parked ones too);
        when it is mostly false (proposed on 20 or more reviewed frames, every camera, and kept on fewer
-       than a fifth), only on a frame with a strong or decided box of it: its lone weak boxes lose it
+       than a fifth), only on a frame with a strong or decided box of it that is its object's class: its
+       lone weak boxes lose it
 r_k  = 1 + 2·m̂   (m̂: the held-out miss rate of k on m in s, shrunk)
 U_k  = 2 for camera m's lowest-recall class, else 1
 V    = Σ_k E_k · w_k
 H    = 0.5 · crowd(Σ_b f_b · 20/(20 + h_{m,k}) · v_k · region_b)
        f_b = max(1 − κ_b, 0.5 if the VLM said no) for a likely false box (κ_b < 0.5 or a VLM no), else 0
-empty frame: V = 0.3 · 100/(100 + empty_s) · (1 + 3 · p_{m,s}), H = 0
+empty frame (no candidate): V = 0.3 · 100/(100 + empty_s) · (1 + 3 · p_{m,s}), H = 0
 need = round(1000 · (V + H))
 ```
 
@@ -828,9 +831,13 @@ need = round(1000 · (V + H))
   `collect.hidden_classes`): every box of an unreviewed or skipped frame that is not rejected and no ignore
   region, plus a second one for a box's class suggestion (`auto_label`, at `auto_score`: the merge keeps only the
   suggestion when the auto-labelers find a raccoon on a pending "cat"). A frame without a label file: the reply's
-  predictions, plus the sidecar's `below_threshold` and `suppressed` boxes. Pending candidates under 0.1 of
-  evidence are left out, and at most 8 of a class are kept (the strongest). A reviewed frame gives the tally its
-  training boxes, its hard negatives and its judged proposals.
+  predictions, plus the sidecar's `below_threshold` and `suppressed` boxes. At most 8 pending candidates of a class
+  are kept (the strongest). One under 0.1 of evidence adds no need: it counts only when it is likely false (a VLM
+  no, or κ under 0.5), for its hard-negative share alone, and a frame with nothing else is no empty frame: it scores
+  its `H` (item field `hard_only`; the details: *likely false dog · ...: nothing else to label here; rejecting it
+  teaches the model*). A reviewed frame gives the tally its training boxes, its hard negatives and its judged
+  proposals, and the parked spots its training boxes unless an export leaves it out (a pending box, a training
+  label not in the class list).
 - **Missed** (`need::missed`): a pending box with evidence the camera model did not alert on (an auto-labeler
   found it: `source: auto` or any `labelers`; or the camera model scored it below its threshold or a rule
   suppressed it), with no prediction of the same object (vehicle classes are one) at IoU >= 0.5 on it. A class
@@ -853,7 +860,7 @@ need = round(1000 · (V + H))
   duplicates or ignore regions). It is weighed by the class's diminishing returns and the box's region only,
   never by the floor, recall or catch-up gains, so a real object outranks a likely false one of its class at
   equal counts; likely false frames come up now and then (the details: *likely false person: rejecting it teaches
-  the model*).
+  the model*, or *some may be false* when they are of the frame's top class).
 - **Reviewed boxes** `n` (`need::CellTally`, integer quarter-boxes, so the order frames are read in changes
   nothing): a training box of a reviewed frame counts 1, a quarter at a known parked spot of its camera
   (`statics`, the Refine tab's Static objects). Per (class, scene) over every camera, per (camera, class,
@@ -877,10 +884,13 @@ need = round(1000 · (V + H))
   candidate of evidence 0.5 there, weighed as missed.
 - **Steer** (`need::Steer`, `Filters.steer`, never from the query): one snapshot per request
   (`server/review/steer.rs`), handed to the index and the walk alike: the recall table (cached on `runs.json`'s
-  time and size) and the folder's parked spots, built on a background thread from the review index's rows when
-  the folder has one (no label file read; again when they changed, at most every minute), else from the Refine
-  tab's cached table at most every 10 minutes; empty, so neutral, until the first build. The order may shift a
-  little when a new spot table lands. Nothing walks the folder on the request path for it.
+  time and size) and the folder's parked spots, by the export's rules (`need::spot_obs`: reviewed frames without
+  a pending box or a label off the class list, boxes at whole pixels), built on a background thread from the
+  review index's rows when the folder has one (no label file read; again when they changed, at most every
+  minute), neutral while a big folder's index is still building, else (a folder under 2000 frames) by a walk at
+  most every 10 minutes; empty, so neutral, until the first build. A rebuild that finds the same table keeps it
+  (the index's per-shard parts stay cached); a build that fails waits its interval before the next try. The order
+  may shift a little when a new spot table lands. Nothing walks the folder on the request path for it.
 
 The constants and their reasons are in `need.rs`'s first lines. The item's `need` explains the score: `score`,
 `visit_score`, the top `class` (absent: an empty frame, with `empty_reviewed` and `animal_share`), its `boxes`
@@ -889,7 +899,7 @@ The constants and their reasons are in `need.rs`'s first lines. The item's `need
 `catch_up`, `missed`, `gap`, `spot`, `new_region` (these four only of boxes carrying at least a quarter of the
 class's weight), `new_day`, `strong`, `expanded` with `visit_class` (the class decided in the visit that expands
 it), the best `evidence`, `kept` / `proposed` when κ lowered a box of the class, and `hard_negative` /
-`hard_class`. The page's details turn it into a sentence (`assets/review-need.js`), e.g. *raccoon · back · IR: 3
+`hard_class` (with `hard_only` when that is all the frame holds). The page's details turn it into a sentence (`assets/review-need.js`), e.g. *raccoon · back · IR: 3
 boxes on this camera (3 in all, floor 20), recall 22% on 9 held-out boxes (lowest on this camera), camera model
 missed it, new place in view, frame 3 of a raccoon visit*.
 

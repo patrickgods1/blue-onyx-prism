@@ -1750,6 +1750,50 @@ fn camera_day(rel: &str) -> Option<(String, String)> {
         .then(|| (camera.to_string(), date.to_string()))
 }
 
+/// The parked-spot observations of the reviewed frames among `all` (the candidates of `dir`), by
+/// the export's rules ([`need::spot_obs`]: the one way the review index makes them too,
+/// [`super::index::reviewed_obs`]), in frame order. Reads the label file of every frame and the
+/// sidecar of reviewed ones with a training box (their size).
+pub fn reviewed_obs(
+    dir: &Path,
+    all: Vec<Candidate>,
+    wanted: &Wanted<'_>,
+) -> Vec<super::statics::Obs> {
+    let threads = parallel::walk_threads_over(all.len());
+    let days = by_day(all);
+    let walker = Walker::new(dir);
+    let parts = parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
+        let mut walker = walker.clone();
+        let mut out = Vec::new();
+        for c in days.get(i).map_or(&[][..], Vec::as_slice) {
+            let Some(frame) = Frame::resolve_in(&mut walker, &c.rel) else {
+                continue;
+            };
+            let Ok(Some(labels)) = frame.labels() else {
+                continue;
+            };
+            if labels.status != Status::Reviewed {
+                continue;
+            }
+            let boxes = need::of_file(&labels, Some(wanted));
+            if !boxes.iter().any(|b| b.has(need::TRAINING)) {
+                continue;
+            }
+            let Ok(rec) = frame.record() else {
+                continue;
+            };
+            out.push((c.rel.clone(), rec.width, rec.height, boxes));
+        }
+        out
+    });
+    let mut frames: Vec<_> = parts.into_iter().flatten().collect();
+    frames.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    frames
+        .iter()
+        .flat_map(|(rel, w, h, boxes)| need::spot_obs(rel, *w, *h, boxes, wanted.classes))
+        .collect()
+}
+
 /// The [`Tally`] of `dir`. Reads the label files, never the sidecars, so it costs about one small
 /// file per frame; a caller on a request path keeps the answer ([`crate::server`]'s Train area
 /// does).

@@ -875,6 +875,8 @@ fn candidates_of_a_file_and_of_a_reply() {
     assert_eq!(
         of_file(&r, Some(&w)),
         [
+            // Pending boxes are left on it: no export's frame, so no parked-spot evidence.
+            cb(PERSON, [0; 4], 0, UNSPOTTED),
             cb(PERSON, [500, 100, 540, 200], 100, TRAINING | STRONG),
             proposed(PERSON),
             cb(CAT, [100, 100, 200, 200], 0, REJECTED),
@@ -919,7 +921,8 @@ fn candidates_of_a_file_and_of_a_reply() {
 fn weak_candidates_are_thinned_and_at_most_eight_of_a_class_kept() {
     let c = classes();
     let w = wanted(&c);
-    // Twelve pending person boxes of rising score, and a dog of a VLM no (under a tenth).
+    // Twelve pending person boxes of rising score, and a dog of a VLM no (under a tenth: kept, it
+    // may be the frame's hard negative).
     let mut boxes: Vec<LabelBox> = (0..12)
         .map(|i| LabelBox {
             score: Some(0.2 + 0.05 * i as f32),
@@ -936,11 +939,67 @@ fn weak_candidates_are_thinned_and_at_most_eight_of_a_class_kept() {
         ..LabelFile::default()
     };
     let got = of_file(&f, Some(&w));
-    assert_eq!(got.len(), MAX_PER_CLASS, "{got:?}");
-    assert!(got.iter().all(|b| b.class == PERSON));
+    assert_eq!(got.len(), MAX_PER_CLASS + 1, "{got:?}");
+    let persons: Vec<&CellBox> = got.iter().filter(|b| b.class == PERSON).collect();
+    assert_eq!(persons.len(), MAX_PER_CLASS);
     // The eight strongest, in their order.
-    let xs: Vec<u16> = got.iter().map(|b| b.bbox[0]).collect();
+    let xs: Vec<u16> = persons.iter().map(|b| b.bbox[0]).collect();
     assert_eq!(xs, [40, 50, 60, 70, 80, 90, 100, 110]);
+    let dog = got.iter().find(|b| b.class == DOG).unwrap();
+    assert!(dog.has(VLM_NO) && dog.e() < MIN_EVIDENCE, "{dog:?}");
+}
+
+#[test]
+fn a_faint_box_counts_only_when_likely_false_and_then_for_its_hard_negative_alone() {
+    let c = classes();
+    let need = Need::new(Some(wanted(&c)), None);
+    let t = CellTally::default();
+    let s = Scorer::new(&need, &t);
+    let f = at("back", "night", "d1");
+    // A lone box of score 0.3 the VLM rejected: sqrt(0.3) · W_LONE · W_VLM_NO, under a tenth.
+    let mut b = auto_box("dog");
+    b.score = Some(0.3);
+    b.auto.vlm = Some(vlm(false));
+    let l = LabelFile {
+        boxes: vec![b],
+        ..LabelFile::default()
+    };
+    let w = wanted(&c);
+    let boxes = of_file(&l, Some(&w));
+    assert_eq!(boxes.len(), 1);
+    assert!(boxes[0].e() < MIN_EVIDENCE && boxes[0].has(VLM_NO));
+    let d = s.score(&f, &boxes, &[]);
+    assert!(d.hard > 0.0 && d.hard_only, "{d:?}");
+    assert!(
+        d.empty.is_none() && d.top.is_none(),
+        "not an empty frame: {d:?}"
+    );
+    // H alone: half a fresh box's v, times the VLM no's falseness, the region factor.
+    let want = W_HARDNEG * crowd(VLM_NO_FALSE * v(0.0, 0.0) * rf(0.0));
+    assert_eq!(d.score, score_of(want), "{d:?}");
+    let n = s.explain(&d, "back", "night", None);
+    assert!(
+        n.hard_only && n.class.is_none() && n.empty_reviewed.is_none(),
+        "{n:?}"
+    );
+    assert_eq!(n.hard_class.as_deref(), Some("dog"));
+    // A faint box nobody calls false is no candidate: the frame weighs as an empty one.
+    let faint = [cb(DOG, RIGHT, 5, 0)];
+    let d = s.score(&f, &faint, &[]);
+    assert!(d.empty.is_some() && !d.hard_only, "{d:?}");
+    // On a camera that rejects the class (κ under a half), it is likely false: H only.
+    let mut u = CellTally::default();
+    proposals(&need, &mut u, "back", DOG, 9, 1);
+    let d = Scorer::new(&need, &u).score(&f, &faint, &[]);
+    assert!(d.hard_only && d.hard > 0.0, "{d:?}");
+    // Beside a real box, a faint likely false one adds its share and no need.
+    let real = [cb(CAT, LEFT, 100, STRONG)];
+    let both = [cb(CAT, LEFT, 100, STRONG), cb(DOG, RIGHT, 6, VLM_NO)];
+    let (a, ab) = (s.score(&f, &real, &[]), s.score(&f, &both, &[]));
+    assert!(
+        ab.score > a.score && !ab.hard_only && ab.top == Some(CAT),
+        "{a:?} {ab:?}"
+    );
 }
 
 #[test]
@@ -992,6 +1051,98 @@ fn one_object_proposed_as_several_classes_scores_once() {
     assert_eq!(d.top, Some(RACCOON));
     assert!(d.missed);
     assert_eq!(d.score, expect(W_MISSED, 0.0, 0.0, 0.0, FRESH));
+}
+
+#[test]
+fn only_confusable_classes_of_similar_size_are_one_object() {
+    let c = classes();
+    let need = Need::new(Some(wanted(&c)), None);
+    let t = CellTally::default();
+    let s = Scorer::new(&need, &t);
+    let f = at("back", "night", "d1");
+    let one = expect(1.0, 0.0, 0.0, 0.0, FRESH);
+    // A person on a motorcycle: two objects, two terms (different regions' factors aside, both
+    // fresh), however much they overlap.
+    let rider = [
+        cb(PERSON, [100, 100, 200, 260], 100, STRONG),
+        cb(MOTORCYCLE, [100, 150, 210, 270], 100, STRONG),
+    ];
+    let d = s.score(&f, &rider, &[]);
+    assert!(d.score > one, "{d:?}");
+    let alone = |b: CellBox| s.score(&f, &[b], &[]).score;
+    let sum = |bs: &[CellBox]| bs.iter().map(|b| f64::from(alone(*b))).sum::<f64>();
+    assert!((f64::from(d.score) - sum(&rider)).abs() <= 1.0, "{d:?}");
+    // A decided person and a pending car on it: both kept.
+    let by_car = [
+        trained(PERSON, [100, 100, 200, 200]),
+        cb(CAR, [100, 100, 200, 200], 100, STRONG),
+    ];
+    let d = s.score(&f, &by_car, &[]);
+    assert!((f64::from(d.score) - sum(&by_car)).abs() <= 1.0, "{d:?}");
+    // A cat, a dog and a raccoon proposed on one animal: one.
+    let animal = [
+        cb(CAT, [100, 100, 200, 200], 100, STRONG),
+        cb(DOG, [101, 100, 200, 201], 100, STRONG),
+        cb(RACCOON, [100, 99, 199, 200], 100, STRONG),
+    ];
+    assert_eq!(s.score(&f, &animal, &[]).score, one);
+    // A cat inside a dog box of four times its area: two animals (a kitten by a dog).
+    let sizes = [
+        cb(CAT, [100, 100, 150, 150], 100, STRONG),
+        cb(DOG, [100, 100, 200, 200], 100, STRONG),
+    ];
+    assert!(s.score(&f, &sizes, &[]).score > one);
+    // Vehicles join: a car proposed as a truck-sized motorcycle is one vehicle.
+    let vehicle = [
+        cb(CAR, [100, 100, 300, 200], 100, STRONG),
+        cb(MOTORCYCLE, [105, 100, 300, 205], 100, STRONG),
+    ];
+    assert_eq!(s.score(&f, &vehicle, &[]).score, one);
+    // Two decided animals a reviewer drew on one place stay two; a pending one between them joins
+    // one of them, and the decided class wins the object.
+    let drawn = [
+        trained(CAT, [100, 100, 200, 200]),
+        trained(DOG, [102, 100, 200, 200]),
+    ];
+    assert_eq!(
+        s.score(&f, &drawn, &[]).score,
+        alone(drawn[0]) + alone(drawn[1])
+    );
+    let joined = [
+        trained(DOG, [100, 100, 200, 200]),
+        cb(RACCOON, [100, 100, 200, 200], 100, STRONG),
+    ];
+    let d = s.score(&f, &joined, &[]);
+    assert_eq!(d.top, Some(DOG), "{d:?}");
+    assert_eq!(d.score, alone(joined[0]));
+}
+
+#[test]
+fn the_floor_follows_the_boxes_that_survive_their_objects() {
+    let c = classes();
+    let need = Need::new(Some(wanted(&c)), None);
+    // Cats: mostly false (20 proposals, 3 kept) and under the floor.
+    let mut t = CellTally::default();
+    proposals(&need, &mut t, "back", CAT, 10, 3);
+    proposals(&need, &mut t, "side", CAT, 10, 0);
+    let s = Scorer::new(&need, &t);
+    assert!(s.below_floor(CAT) && s.mostly_false(CAT));
+    let f = at("yard", "night", "d1");
+    // A strong cat that is one object with a strong raccoon (which wins it: the floor gains tie,
+    // so the first class), and a weak cat elsewhere. The strong cat counts nowhere, so it gives
+    // the weak one no floor: the frame scores as the raccoon and the weak cat alone.
+    let with_strong = [
+        cb(RACCOON, [100, 100, 200, 200], 100, STRONG),
+        cb(CAT, [100, 100, 200, 200], 100, STRONG),
+        cb(CAT, [400, 300, 500, 400], 40, 0),
+    ];
+    let without = [
+        cb(RACCOON, [100, 100, 200, 200], 100, STRONG),
+        cb(CAT, [400, 300, 500, 400], 40, 0),
+    ];
+    let (a, b) = (s.score(&f, &with_strong, &[]), s.score(&f, &without, &[]));
+    assert_eq!(a.score, b.score, "{a:?} {b:?}");
+    assert_eq!(a.top, Some(RACCOON));
 }
 
 #[test]
