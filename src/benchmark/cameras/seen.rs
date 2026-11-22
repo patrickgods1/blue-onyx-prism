@@ -4,7 +4,7 @@
 //! frames its run's record of image sources names behind a renamed or cut list name
 //! ([`crate::training::refine::quick::seen_of`], when that record reads). Those frames are left
 //! out of the model's scores on "Your cameras" ([`super::for_model`]) and out of the Compare view
-//! of every model listed beside it ([`crate::benchmark::lineup`]).
+//! of every model listed beside it ([`crate::benchmark::combos`]).
 
 use crate::collect::labels::export::{self, ExportFrame, Split};
 use crate::config::{Config, ModelConfig};

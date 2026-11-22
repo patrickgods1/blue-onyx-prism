@@ -598,7 +598,7 @@ and the default model; every key is in the *Models JSON* under it):
 | `classes` | `null` | YAML with `NAMES:`; default `<stem>.yaml` beside the model, then COCO-80. Path. Applies: model reload. UI: Models JSON, *Add a model by path* |
 | `device` | `null` | Device spec for this model (any spec of `list-devices`); `null` = the global `device`. Applies: model reload. UI: yes (Models card) |
 | `confidence_threshold` | `null` | Minimum confidence for this model; `null` = the global one. Number 0-1. Applies: at once. UI: yes (Models card) |
-| `device_thresholds` | `{}` | Confidence profiles: minimum confidence per device spec (`{"ort:coreml": 0.30, "openvino:cpu": 0.34}`); the model uses the entry of the device it actually loaded on (`auto` and fallback included), else `confidence_threshold`, else the global one. Keys are concrete specs (`openvino:gpu` = `openvino:gpu.0`; no `auto`). Written by the Benchmark page's **Apply** step and `--apply-threshold`. Number 0-1 each. Applies: at once. UI: yes (Models card: the Threshold field edits the selected device's profile; *Confidence per device*) |
+| `device_thresholds` | `{}` | Confidence profiles: minimum confidence per device spec (`{"ort:coreml": 0.30, "openvino:cpu": 0.34}`); the model uses the entry of the device it actually loaded on (`auto` and fallback included), else `confidence_threshold`, else the global one. Keys are concrete specs (`openvino:gpu` = `openvino:gpu.0`; no `auto`). Written by the Benchmark's **Tune & save** step and `--apply-threshold`. Number 0-1 each. Applies: at once. UI: yes (Models card: the Threshold field edits the selected device's profile; *Confidence per device*) |
 | `object_filter` | `null` | Only report these labels; `null` = the global `object_filter`. List of strings. Applies: at once. UI: Models JSON |
 | `lazy` | `false` | Compile on first request instead of at startup; requests are answered "initializing" at once until it is ready. Boolean. Applies: model reload. UI: Models JSON |
 | `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
@@ -685,8 +685,8 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   (`train.txt`, `valid.txt`, and the run's record of image sources), recorded per model as
   `left_out` (`frames`, `trained`, `validated`, or `unknown` with why when its lists do not read:
   then it is scored on every frame and never shown as best). Compare scores every listed model on the
-  frames none of them saw and says how many were left out (`framesLeftOut`, `leftOutBy` in
-  `lineup`); models without a record see every frame. **Labels snapshot**: a run stores the labels it
+  frames none of them saw and says how many were left out (`framesLeftOut`, `leftOutBy` of
+  `GET /v1/benchmark/compare`); models without a record see every frame. **Labels snapshot**: a run stores the labels it
   scored against in `benchmark-gt.json` beside `benchmark.json` (per frame: its name, identity, size,
   boxes and the label file's revision; `benchmark.json` keeps the frames without their boxes), and
   everything that re-scores the saved results (Compare, the confidence search, a regrade, the
@@ -878,25 +878,41 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
     load (`live_requests_per_min`); the A/B comparison calls a goal change only when the two runs'
     intervals do not overlap. `benchmark` prints the Compare view after a sweep (`--json`:
     `compare`); `--threshold-search` adds each combo's cross-validated pick and interval.
-  - The run's own threshold advice (`threshold` in `benchmark.json`, the current page's
-    Confidence tab and Apply) still picks on every frame with the target on its point estimate;
-    the goal views are the ones above.
+  - **One rule for saving**: the Tune step's Save and Save all, `POST /v1/benchmark/apply-profiles`
+    and `apply-threshold` with `all=1`, and `benchmark --apply-threshold` all write the Tune view's
+    suggestion (the pick on every frame for the saved goal, its target judged on the 95% bound). A
+    pick that must not be saved (another model's detections, a target not met, a flat curve) is
+    left alone and named; a low-confidence one is asked about on the page, needs `confirm=1` in the
+    API and is written and marked by the CLI. The run's own `threshold` advice in `benchmark.json`
+    is kept for the report and older readers.
 - **Confidence profiles**: the best confidence differs per device (a GPU's FP16 path scores a little
   differently from the CPU), so it is saved per model and device in `device_thresholds`. The Benchmark
-  page has five tabs. **Compare** (opens first once there are results) is one table of the models on
-  the same images: choose the image set, read what finds, what is right, the false alerts on empty
-  frames and the speed, day / night / IR where the set allows; a value is marked best only past the
-  noise, a model with training frames in the set cannot be best, and models not scored on these images
-  are listed with why and a button to run them. **Run** chooses datasets, models and devices. **Tune**
-  chooses the goal (the only place it is set), shows per model one row per device (speed, finds,
-  correct, best confidence, saved value, the device to run on) and saves (*Save profiles and use chosen
-  devices* or *Save profiles only*, one change with Undo). **History** compares runs of one model.
-  **Details** holds every other table, each collapsed. On the Config page, choosing another device in a model's dropdown shows that device's
+  is three steps at their own addresses, with the goal chip and the run's progress on each.
+  **1 Run** (`/benchmark/run`) ticks images (Your cameras first, with its frames, cameras, days and
+  scenes), models and devices; two GPU devices ask for a confirmation in the page, and two or more
+  devices without a CPU one get the CPU reference ticked (with Undo), since without it no device is
+  checked or recommended; while a run goes, each model on each device shows its state. **2 Compare**
+  (`/benchmark/compare`, the first step once there are results) ranks every model on every device on
+  one image set for the goal: the cross-validated goal metric with its 95% interval, recall,
+  precision, false alerts per 100 empty frames, the suggested confidence and p95, chips (default,
+  trained here, too slow, target not met, served, stale rules, low confidence), optional columns
+  (remembered in the browser), details per row with links to Tune and Images, the frames left out
+  and why, models not run on these images (with a button to run them), a scatter of the goal metric
+  against p95 and the Day / Night / IR, Classes, Cameras and Speed breakdowns; Save report and
+  Download CSV. **3 Tune & save** (`/benchmark/tune`) shows one model on one device: the goal metric,
+  recall, precision and FA/100 against the confidence with the suggested value, its equally good
+  band and the saved one, a slider with the numbers and the frames it would miss and alert on, and
+  Save (a low-confidence pick asks first; a pick that cannot be saved says why); *All models and
+  devices* saves every suggestion at once (*Save all suggested and use chosen devices* or *Save
+  confidences only*), each save with Undo. **History** (`/benchmark/history`) compares runs of one
+  model, **Images** (`/benchmark/images`) shows every scored frame with its boxes. The Goal dialog
+  (the chip) tries a goal without saving it (the address carries it, a banner offers Save and Back)
+  or saves it. On the Config page, choosing another device in a model's dropdown shows that device's
   saved profile, or pre-fills its benchmark best (Save keeps it). `/v1/status` shows each model's
   `threshold` and `thresholdSource` (e.g. `profile for ort:coreml`).
 
 ```sh
-blue-onyx-prism benchmark --all-devices --apply-threshold    # also save each model's best confidence per measured device (device_thresholds)
+blue-onyx-prism benchmark --all-devices --apply-threshold    # also save each model's suggested confidence per measured device (device_thresholds; the Tune step's rule)
 blue-onyx-prism benchmark --apply --apply-threshold --threshold-objective f2
 blue-onyx-prism benchmark --threshold-search --tag night --threshold-objective recall:0.9   # stored predictions, no inference
 blue-onyx-prism benchmark --threshold-search --dataset exdark-night --class person --iou 0.6 --json
@@ -965,7 +981,7 @@ address. Every page below needs a sign-in:
 | `/stats` | Per-model state, runtime, device, CPU fallback, requests, dropped, queue, inference/process/round-trip avg/min/max; updates in place every 5 s from `/stats.json` |
 | `/test` | Pick, drop or paste an image, choose a model and `min_confidence`; the page posts to `/v1/vision/custom/{model}` and draws the boxes client-side, with a detections table and the raw JSON (same code path and metrics as the API, but uploads never enter the dataset; without JavaScript the form posts to `/test` and the server draws the image) |
 | `/config` | Models card (which models load, the default model, device and threshold per model; **Save** applies at once), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
-| `/benchmark` | Benchmark models x devices x datasets in the background (progress, ETA, cancel), Your cameras (your reviewed frames) first; grade cards, model ranking, sortable per-device tables (fastest, recommended and configured marked), breakdowns by dataset/tag/class/size/resolution, per-image drill-down with ground truth and predictions drawn; **Use <device>** / **Apply recommended to all** write per-model devices; best confidence threshold per model with a P/R/F1 vs threshold chart, **Apply threshold** / **Apply all thresholds**; **Confidence search** over the stored predictions (filters, objective, chart with hover values, tables, CSV) |
+| `/benchmark` | Three steps at their own addresses (`/benchmark` opens Compare once results exist, else Run): **Run** (`/benchmark/run`: Your cameras first, built-in sets with their download, folders; models; devices with the CPU reference ticked for you when two or more devices and no CPU are ticked; options; estimate; progress per model and device, Cancel), **Compare** (`/benchmark/compare`: every model on every device ranked for the goal with intervals, chips, optional columns, details, the scatter of the goal metric against p95, Day / Night / IR, Classes, Cameras and Speed, Save report, Download CSV), **Tune & save** (`/benchmark/tune`: the confidence curve and slider, the suggested value, the misses and false alerts at it, Save per device with Undo, Save all); **History** (`/benchmark/history`: runs, pin, delete, A/B, trend) and **Images** (`/benchmark/images`: every scored frame with its boxes, filters, Open in Review). The goal chip on every step opens the Goal dialog (try without saving, or save) |
 | `/train` | The Train area: one entry with eight tabs at their own URLs (the last, Jobs, lists every running and queued job with its step, percent, time left and a link to it: imports, auto-label runs, overlap and dataset checks and training runs on the queue, and beside it dataset exports, X-AnyLabeling imports, a benchmark run and model exports), a status strip (frames collected, to review, reviewed, exports, runs, models) and one suggested next action (`GET /v1/train/summary`). `/train` opens the most useful tab. The old `/dataset`, `/review` and `/training` redirect to Collect, Review and Train and keep their query string |
 | `/train/collect` | Dataset collector (`collect`): on/off and the caps (applied at once), with per-bucket toggles, rates, intervals, near-threshold margin and dHash distance under Advanced; frames per detected class and per camera, disk use, the newest frames per bucket with their sidecars, and **Send to review** (appends the ticked frames to `review-queue.jsonl`). Collection stops on its own on low disk space or a full disk; **Resume** re-arms it |
 | `/train/import` | Import footage (videos, Blue Iris folders, a URL, pinned MEVA clips), optionally auto-labelling the new frames, with the Jobs card |
@@ -996,13 +1012,13 @@ What **Best first** means, table by table (the server decides it; the page only 
   then accuracy, then speed, on the recommended device), models without benchmark results in config
   order.
 - **Config → Models**: no best order; the config order (the load order) is the table's own order.
-- **Benchmark → All results, Confidence, a model's devices (Details) and Tune**: each model on each
-  device in the same goal order (the `points` of `GET /v1/benchmark`: the Compare position of the
-  combo, then the grades for combos the default set does not hold); rows of runs picked from the
-  history follow.
-- **Benchmark → Compare** (models on the same images): the headline's rule: people found, then
-  vehicles, then all objects, a difference counting only past the noise; models level on all three
-  by fewer false alerts; models that trained on these images last.
+- **Benchmark → Compare** (every model on every device on one image set): the goal's rank (rows
+  within the speed budget and the target met first, by the cross-validated goal metric, rows that
+  are not clearly different sharing a rank; then too slow, then target not met; models that
+  trained on these images last), the server's order of `GET /v1/benchmark/compare`.
+- **Benchmark → Tune & save, All models and devices**: the same Compare order of the image set the
+  step shows.
+- **Benchmark → History**: newest run first.
 - **Train → Models → Comparison**: person recall, then vehicle recall, then AP50-95 on every
   held-out frame (missing values last); routed and seed-summary rows stay at the bottom.
 - **Train → Models → Use a trained model**: grouped by held-out set (runs scored on the same
@@ -1489,10 +1505,10 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/review/restore-reopened` | puts frames a rerun reopened back to reviewed when nothing is pending; `dry_run` counts them |
 | GET | `/v1/training/switch-preview?id=` | What **Use as default** of a run would change (settings, classes, what copies, the suggested threshold, the comparison with the current default); saves nothing |
 | POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/retry-export`, `/training/use`, `/training/revert`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one (`delete_files` also deletes its folder); export a failed run's best checkpoint; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model (default: `copy`, `use_threshold`, `expect_current`; verifier: `replace_verifier`); no field, or `forget=1`: undo the last default switch, or drop its record; `add` / `remove`: a `training.datasets` folder; delete the training environment |
-| GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking (`ranking` and `points` in the goal's order on the default Compare set), per-model devices, `labelsChanged` (Your cameras: `{frames, changed, left, joined}` since the run's labels snapshot, `{frames: null, computing: true}` before the first count, `folderMissing`; `null` without a snapshot) |
+| GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking (`ranking` and `points` in the goal's order on the default Compare set), per-model devices, `labelsChanged` (Your cameras: `{frames, changed, left, joined}` since the run's labels snapshot, `{frames: null, computing: true}` before the first count, `folderMissing`; `null` without a snapshot), `goal` (the saved goal as the views name it). `?only=run` answers the run alone (`run` with `progress`, `request` and this run's `models`, `viewTag`, `modelsTag`, `labelsChanged`): what the Benchmark pages poll |
 | GET | `/v1/benchmark/compare?set=&scene=&goal=&tune_for=&classes=&budget=` | every combo (model x device) on one compare set (default: the one most models share; `sets` lists them), judged for the goal: `rows` best first (`metric` `{value, low, high}`, `rank`, `block` `ok`/`too_slow`/`unmet`/`unfair`, `vsLeader`, recall, precision, F1/F2/F0.5, `fa100`, TPR/FPR, AP50, AP50-95, ROC AUC, grade, `confidence` (suggested), `plateau`, `pickInformative`, `target`, `servedThreshold`, `speed` (p50/p95/p99, stages, `burstP95Ms`, `firstLoad`), `agreement`, `flags` (`tooSlow`, `unmet`, `trainedHere`, `relative`, `served`, `staleRules`, `lowConfidence`, `liveLoad`, `videoDecode`, `flat`), `scenes`, `classes`, `cameras`), `headline`, `set` (frames, `framesLeftOut`, `leftOutBy`, counted `classes`, `ignoredClasses`, `groups`, `run`), `missing` (models not on the set, why, `device`, `blocked`). `goal=` etc. try a goal without saving it; `scene=day\|night\|ir`. Cached per files, config revision and query |
 | GET | `/v1/benchmark/tune?model=&device=&set=&goal=&tune_for=&classes=` | one combo: the 0.01 `grid` (threshold, tp/fp/fn, precision, recall, F1/F2/F0.5, FA/100, TPR/FPR, `score`, `bound`), `suggested` (`threshold`, `plateau`, `best`, `inSample`, `metric` with interval), `lowConfidence`, `pickInformative`, `target` (`met`, `bound`, `text`), `saved` (`threshold`, `source`: `profile for <device>`, `model`, `global`), `servedThreshold`, `relative`, `savable` / `notSavable`, `confirm`; 404 when the model has no stored predictions |
-| GET | `/v1/benchmark/tune/images?model=&device=&set=&threshold=&kind=miss\|fa&limit=` | the frames for the Tune strips at `threshold`, worst first (`miss`: most missed objects; `fa`: the most confident false positive), each with `set`, `file`, `camera`, `scene`, `date`, its labels (`ok` = matched) and predictions (`ok` = true positive); `limit` 1-200, default 24 |
+| GET | `/v1/benchmark/tune/images?model=&device=&set=&threshold=&kind=miss\|fa\|all&camera=&scene=&offset=&limit=` | the frames for the Tune strips and the Images step at `threshold`, worst first (`miss`: most missed objects; `fa`: the most confident false positive; `all`: every frame, the most errors first), of one camera / scene when asked, from `offset`; each with `set`, `file`, `width`, `height`, `camera`, `scene`, `date`, `review` (Your cameras: the frame's id for `/train/review?frame=`), its labels (`ok` = matched) and predictions (`ok` = true positive); `total` before the page, `cameras` of the set; `limit` 1-200, default 24 |
 | POST | `/v1/benchmark/goal` | `optimize_for` (or `goal`), `tune_for`, `classes` (`all` = none), `speed_budget_ms` (or `budget`, `none` = no budget); absent fields keep their value. Validates, saves `benchmark.goal` (and the legacy keys) and answers `goal` and the new `ranking` on the default set; 400 on a bad value |
 | POST | `/v1/benchmark/rescore` | Your cameras: score the stored predictions against the current labels (no inference) and replace `benchmark-gt.json`; `{success, rescored: {models, runs, frames, changes, needRun, notRescored}}`; 409 while a benchmark runs, 503 `folder_missing`, 422 without a run on the set |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
@@ -1500,8 +1516,8 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/benchmark/datasets/remove` | `dataset`: the saved folder dataset to drop from `benchmark.datasets` (e.g. `dir:/srv/alerts`; the list may end up empty); 404 for a built-in id or a folder that is not saved |
 | POST | `/v1/benchmark/report` | `dir`: write the HTML report of the saved results there as `benchmark-report-<YYYYMMDD-HHMMSS>.html`, wall time in `timezone` (folder inside the browsable folders or natively picked); `{success, path}`, 404 without results |
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
-| POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
-| POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the best confidence of every measured device, `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |
+| POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every model's suggested confidence on its recommended device (the Tune view's pick for the saved goal; not savable ones are named, low-confidence ones need `confirm=1`); writes `confidence_threshold`; `restart=1` restarts |
+| POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the suggested confidence of every measured device (the Tune view's pick for the saved goal; not savable ones are named, low-confidence ones need `confirm=1`), `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |
 | GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>`, `youden`, `fpr:<x>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, `preds_capped_images`, CSV; 400 when nothing is stored (run a benchmark first) |
 | GET | `/v1/benchmark/images?model=&device=`, `/v1/benchmark/image?set=&file=` | per-image drill-down data; an image of the saved results (Your cameras: only a frame of the labels snapshot, resolved inside the folder under review) |
 | POST | `/v1/resources/add-to-config` | form `id` of a downloaded model, or `local:<file>` for a model file in `models_dir` (family `auto`): append it to `models` |

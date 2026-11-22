@@ -6,7 +6,7 @@
 //!   runs (their rows on their own tabs, `#job-<id>`);
 //! - side jobs beside it ([`super::side_jobs`]): dataset exports and X-AnyLabeling imports of the
 //!   Dataset tab (`side-<n>`);
-//! - a benchmark run (`/benchmark`, id `benchmark`), from the benchmark runner's progress;
+//! - a benchmark run (`/benchmark/run`, id `benchmark`), from the benchmark runner's progress;
 //! - model exports, queued or running (the Config page's exported models, id
 //!   `model-export-<resource>`), from the exporter's state.
 //!
@@ -382,7 +382,7 @@ fn bench_line(b: &BenchRunning, now: Instant) -> JobLine {
         // The runner's estimate covers the whole run.
         time: time_text(false, true, timing, None),
         tab: "Benchmark",
-        link: "/benchmark".to_string(),
+        link: "/benchmark/run".to_string(),
     }
 }
 
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(b.detail, "a on openvino:gpu: timing 40 of 200");
         assert_eq!(b.percent, 32);
         assert_eq!(b.time, "about 10 min left");
-        assert_eq!((b.tab, b.link.as_str()), ("Benchmark", "/benchmark"));
+        assert_eq!((b.tab, b.link.as_str()), ("Benchmark", "/benchmark/run"));
 
         let e = &v.active[3];
         assert_eq!(e.kind, "Model export");

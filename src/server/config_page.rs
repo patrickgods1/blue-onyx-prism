@@ -253,7 +253,7 @@ struct ModelSelectRow {
 struct BenchHint {
     text: String,
     title: String,
-    /// `/benchmark#m-<name>` (the Benchmark page's id for the model's card).
+    /// `/benchmark/tune?model=<name>`: the model on the Benchmark's Tune & save step.
     href: String,
 }
 
@@ -487,7 +487,7 @@ fn model_choices(
                         run.threshold,
                         configured.clone(),
                     ),
-                    href: format!("/benchmark#m-{}", encode_uri_component(&r.model)),
+                    href: format!("/benchmark/tune?model={}", encode_uri_component(&r.model)),
                 }
             });
             let mut devices = model_device_choices(snap, m.device.as_deref(), &global);

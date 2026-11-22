@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Benchmark: Images{% endblock %}
+{% block content %}
+<div class="bench" id="bench" data-step="images" data-has-results="{{ shell.has_results }}">
+{% include "benchmark/shell.html" %}
+<section aria-labelledby="h-img">
+  <h2 id="h-img">Images</h2>
+  <p class="muted">Every scored frame of one model on one device, at the confidence you choose.</p>
+  <div class="bn-row">
+    <label for="i-combo">Model <select id="i-combo"><option value="">Loading&hellip;</option></select></label>
+    <label for="i-set">Images <select id="i-set"></select></label>
+    <label for="i-thr">at <input type="number" id="i-thr" min="0.05" max="0.99" step="0.01" value="0.50"></label>
+    <label for="i-kind">Show <select id="i-kind"><option value="miss">Misses</option><option value="fa">False alerts</option><option value="dis">Disagrees with&hellip;</option><option value="all">All</option></select></label>
+    <label for="i-other" id="i-other-l" hidden>other <select id="i-other"></select></label>
+    <label for="i-cam">Camera <select id="i-cam"><option value="all">All</option></select></label>
+    <label for="i-scene">Scene <select id="i-scene"><option value="all">All</option><option value="day">Day</option><option value="night">Night</option><option value="ir">IR</option></select></label>
+  </div>
+  <p class="small"><span class="bn-lg"><i></i>found</span><span class="bn-lg"><i class="miss"></i>missed</span><span class="bn-lg"><i class="fp"></i>false alert</span> <span class="muted" id="i-count" aria-live="polite"></span></p>
+  <p class="bn-error" id="i-error" role="alert" hidden></p>
+  <div class="bn-thumbs" id="i-grid"></div>
+  <p class="bn-more" id="i-more-p" hidden><button type="button" class="secondary" id="i-more">Show more</button></p>
+</section>
+{% include "benchmark/image_dialog.html" %}
+</div>
+<script src="/static/bench-core.js?v={{ version }}"></script>
+<script src="/static/bench-shell.js?v={{ version }}"></script>
+<script src="/static/bench-frames.js?v={{ version }}"></script>
+<script src="/static/bench-images.js?v={{ version }}"></script>
+{% endblock %}

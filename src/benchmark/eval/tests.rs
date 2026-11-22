@@ -5,11 +5,10 @@ use super::compare::{self, Request};
 use super::goal::{Goal, Optimize};
 use super::rank::Block;
 use super::tune;
+use crate::benchmark::combos::{Configured, Inputs};
 use crate::benchmark::current::ModelNow;
 use crate::benchmark::grade::Weights;
-use crate::benchmark::history::History;
 use crate::benchmark::images::{GroundTruth, SetKind};
-use crate::benchmark::lineup::{Configured, Inputs};
 use crate::benchmark::metrics::{GtBox, Window};
 use crate::benchmark::report::test_support::{dev, model as base_model};
 use crate::benchmark::report::{BenchmarkResults, DeviceResult, ImageInfo, ImageSetInfo};
@@ -241,14 +240,12 @@ impl World {
     }
 
     fn compare(&self, goal: &Goal, scene: Option<&str>) -> compare::CompareView {
-        let history = History::default();
         let trained: HashMap<String, BTreeSet<String>> = HashMap::new();
         let seen = HashMap::new();
         compare::build(
             &Inputs {
                 results: &self.results,
                 preds: Some(&self.preds),
-                history: &history,
                 now: &self.now,
                 default_model: Some("ipcam-general"),
                 configured: &self.configured,
@@ -503,35 +500,68 @@ fn tune_lists_the_grid_the_pick_and_the_examples() {
     assert!(!tg.met && tg.text.starts_with("not met"), "{}", tg.text);
     assert!(!t.savable);
     // Misses, most missed first; false alerts, most confident first.
-    let ex = tune::images(
-        &w.results,
-        &w.preds,
-        "dfine-s",
-        None,
-        None,
-        &goal,
-        0.5,
-        tune::Kind::Miss,
-        5,
-    )
-    .unwrap();
+    let req = |kind, offset, limit| tune::ImagesRequest {
+        model: "dfine-s",
+        device: None,
+        set: None,
+        goal: &goal,
+        threshold: 0.5,
+        kind,
+        camera: None,
+        scene: None,
+        offset,
+        limit,
+    };
+    let ex = tune::images(&w.results, &w.preds, req(tune::Kind::Miss, 0, 5)).unwrap();
     assert_eq!(ex.frames.len(), 5);
     assert!(ex.total >= 5);
     assert!(ex.frames.iter().all(|f| f.missed >= 1));
     assert_eq!(ex.frames[0].camera.as_deref(), Some("a"));
-    let fa = tune::images(
+    let fa = tune::images(&w.results, &w.preds, req(tune::Kind::Fa, 0, 200)).unwrap();
+    assert!(fa.frames.iter().all(|f| f.top_false == Some(0.7)));
+    // Every frame, the most errors first, in pages; one camera; the boxes' space.
+    let all = tune::images(&w.results, &w.preds, req(tune::Kind::All, 0, 200)).unwrap();
+    assert!(all.total >= ex.total.max(fa.total), "every frame");
+    assert_eq!(all.frames.len(), all.total);
+    assert!(
+        all.frames
+            .windows(2)
+            .all(|p| p[0].missed + p[0].false_positives >= p[1].missed + p[1].false_positives)
+    );
+    assert!(all.frames.iter().all(|f| f.width > 0 && f.height > 0));
+    let page = tune::images(&w.results, &w.preds, req(tune::Kind::All, 2, 3)).unwrap();
+    assert_eq!((page.total, page.offset), (all.total, 2));
+    assert_eq!(
+        page.frames.iter().map(|f| &f.file).collect::<Vec<_>>(),
+        all.frames[2..5].iter().map(|f| &f.file).collect::<Vec<_>>()
+    );
+    assert!(!all.cameras.is_empty());
+    let cam = all.cameras[0].clone();
+    let one = tune::images(
         &w.results,
         &w.preds,
-        "dfine-s",
-        None,
-        None,
-        &goal,
-        0.5,
-        tune::Kind::Fa,
-        200,
+        tune::ImagesRequest {
+            camera: Some(&cam),
+            ..req(tune::Kind::All, 0, 200)
+        },
     )
     .unwrap();
-    assert!(fa.frames.iter().all(|f| f.top_false == Some(0.7)));
+    assert!(one.total > 0 && one.total <= all.total);
+    assert!(
+        one.frames
+            .iter()
+            .all(|f| f.camera.as_deref() == Some(cam.as_str()))
+    );
+    let none = tune::images(
+        &w.results,
+        &w.preds,
+        tune::ImagesRequest {
+            camera: Some("no such camera"),
+            ..req(tune::Kind::All, 0, 200)
+        },
+    )
+    .unwrap();
+    assert_eq!(none.total, 0);
     assert!(
         tune::build(
             &w.results,
@@ -685,12 +715,10 @@ fn eval_on_saved_results() {
         })
         .collect();
     let now = HashMap::new();
-    let history = History::default();
     let (trained, seen) = (HashMap::new(), HashMap::new());
     let inputs = Inputs {
         results: &results,
         preds: Some(&preds),
-        history: &history,
         now: &now,
         default_model: None,
         configured: &configured,
@@ -776,16 +804,22 @@ fn eval_on_saved_results() {
             t.model, t.device, s.threshold, s.plateau, s.in_sample, s.metric, t.folds, t.elapsed_ms
         );
         let started = std::time::Instant::now();
+        let goal = Goal::default();
         let ex = tune::images(
             &results,
             &preds,
-            &run.model,
-            Some(&run.device),
-            None,
-            &Goal::default(),
-            s.threshold,
-            tune::Kind::Miss,
-            24,
+            tune::ImagesRequest {
+                model: &run.model,
+                device: Some(&run.device),
+                set: None,
+                goal: &goal,
+                threshold: s.threshold,
+                kind: tune::Kind::Miss,
+                camera: None,
+                scene: None,
+                offset: 0,
+                limit: 24,
+            },
         )
         .unwrap();
         println!(

@@ -34,12 +34,13 @@ mod apply;
 mod cameras;
 mod eval;
 mod history;
+mod pages;
 mod poll;
-mod profiles;
 mod report;
 mod run;
 
 use apply::BLUE_IRIS_THRESHOLD_NOTE;
+pub(super) use pages::{compare_page, history_page, images_page, index, run_page, tune_page};
 
 pub(super) use apply::{apply, apply_profiles, apply_threshold, search_options, threshold_search};
 pub(super) use cameras::rescore;
@@ -48,12 +49,9 @@ pub(super) use history::{history_compare, history_delete, history_get, history_p
 pub(super) use report::save_report;
 pub(super) use run::{cancel, image_file, images_detail, remove_dataset, settings, start};
 
-use super::{AppState, DevicesSnapshot, devices_snapshot, global_device_label, render};
-use crate::benchmark::images::{self, ImageSet};
-use crate::benchmark::service::default_models;
+use super::{AppState, DevicesSnapshot, devices_snapshot, global_device_label};
 use crate::benchmark::{BenchmarkResults, configured_device, results_path};
 use crate::config::Config;
-use askama::Template;
 use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
@@ -67,406 +65,6 @@ use tracing::warn;
 pub(super) const LIVE_WARNING: &str = "Benchmarking runs on the same CPU/GPU as live detections: \
      Blue Iris requests are slower while it runs, and its numbers are noisier when the server is \
      busy. Run it when the cameras are quiet.";
-
-struct ModelOption {
-    name: String,
-    family: String,
-    enabled: bool,
-    exists: bool,
-    checked: bool,
-}
-
-struct DeviceOptionRow {
-    spec: String,
-    label: String,
-    runnable: bool,
-    checked: bool,
-    /// Counts toward the "several GPUs" confirmation.
-    gpu: bool,
-    reason: Option<String>,
-}
-
-/// One dataset row of the form.
-struct DatasetRow {
-    /// Value posted as `dataset` (`coco-cctv`, `sample`, `dir:/path`).
-    value: String,
-    title: String,
-    /// What it tests, in a few words (a folder: its path).
-    tests: String,
-    /// "120 images · 45 MB".
-    size: String,
-    /// Licence text, shown behind a disclosure; empty for none.
-    license: String,
-    /// `installed`, `partial`, `available`, `embedded`, `folder`, `missing`, `unavailable`.
-    state: &'static str,
-    state_text: String,
-    checked: bool,
-    /// Resource id to download (built-in sets not fully installed).
-    download_id: Option<String>,
-    /// A user folder (removable from the defaults).
-    folder: bool,
-    selectable: bool,
-}
-
-#[derive(Template)]
-#[template(path = "benchmark.html")]
-struct BenchmarkTemplate {
-    nav: &'static str,
-    version: &'static str,
-    models: Vec<ModelOption>,
-    devices: Vec<DeviceOptionRow>,
-    datasets: Vec<DatasetRow>,
-    reference_models: Vec<(String, bool)>,
-    repeat: usize,
-    warmup: usize,
-    /// `benchmark.low_priority`: the "Run at low priority" checkbox.
-    low_priority: bool,
-    /// `benchmark.served`: the "As served" checkbox.
-    served: bool,
-    max_images: usize,
-    accuracy_weight: String,
-    warning: &'static str,
-    /// The text of the "several GPUs" confirmation.
-    gpu_warning: &'static str,
-    /// A run that never ended, shown once ([`crate::benchmark::service::breadcrumb`]).
-    interrupted: Option<String>,
-    force_cpu: bool,
-    results_file: String,
-    speed_thresholds: String,
-    accuracy_thresholds: String,
-    auc_thresholds: String,
-    /// (value, label, selected) of the threshold objective select.
-    objectives: Vec<(String, String, bool)>,
-    /// (value, label, selected) of the accuracy metric select.
-    accuracy_metrics: Vec<(String, String, bool)>,
-    blue_iris_note: &'static str,
-    /// The benchmark goal's plain name ("Balanced", "Miss fewer objects", "Fewer false
-    /// alerts", "Fastest / lightest", "Custom"; [`profiles::goal_label`]).
-    goal_label: String,
-}
-
-/// Threshold objective choices; the configured one is added when it is not among them.
-fn objective_options(
-    current: crate::benchmark::threshold::Objective,
-) -> Vec<(String, String, bool)> {
-    use crate::benchmark::threshold::Objective;
-    let mut list = vec![
-        (Objective::F1, "F1: balance precision and recall"),
-        (Objective::F2, "F2: favor recall (fewer missed objects)"),
-        (Objective::F05, "F0.5: favor precision (fewer false alerts)"),
-        (
-            Objective::Precision(0.8),
-            "Precision \u{2265} 80%, highest recall",
-        ),
-        (
-            Objective::Precision(0.9),
-            "Precision \u{2265} 90%, highest recall (fewer false alerts)",
-        ),
-        (
-            Objective::Precision(0.95),
-            "Precision \u{2265} 95%, highest recall",
-        ),
-        (
-            Objective::RecallAtFa(2.0),
-            "\u{2264} 2 false alerts per 100 empty frames, highest recall",
-        ),
-        (
-            Objective::RecallAtFa(5.0),
-            "\u{2264} 5 false alerts per 100 empty frames, highest recall",
-        ),
-        (
-            Objective::Youden,
-            "Youden's J: frame alert rate minus false-alert rate",
-        ),
-        (
-            Objective::Fpr(0.05),
-            "Frame false alerts \u{2264} 5%, highest alert rate",
-        ),
-        (
-            Objective::Fpr(0.1),
-            "Frame false alerts \u{2264} 10%, highest alert rate",
-        ),
-    ]
-    .into_iter()
-    .map(|(o, l)| (o.to_string(), l.to_string(), o == current))
-    .collect::<Vec<_>>();
-    if !list.iter().any(|o| o.2) {
-        list.push((current.to_string(), current.describe(), true));
-    }
-    list
-}
-
-/// Accuracy metric choices.
-fn metric_options(current: crate::benchmark::grade::AccuracyMetric) -> Vec<(String, String, bool)> {
-    use crate::benchmark::grade::AccuracyMetric;
-    AccuracyMetric::ALL
-        .iter()
-        .map(|m| {
-            let label = match m {
-                AccuracyMetric::Ap50 => "AP50: box accuracy (AP@0.5, small-object recall)",
-                AccuracyMetric::RocAuc => {
-                    "ROC AUC: frame-level alerting (does a frame with an object score higher?)"
-                }
-            };
-            (m.as_str().to_string(), label.to_string(), *m == current)
-        })
-        .collect()
-}
-
-fn model_options(c: &Config) -> Vec<ModelOption> {
-    let defaults = if c.benchmark.models.is_empty() {
-        default_models(c)
-    } else {
-        c.benchmark.models.clone()
-    };
-    let key = crate::registry::normalize_name;
-    c.models
-        .iter()
-        .map(|m| {
-            let exists = c.data_path(&m.path).is_file();
-            let name = m.effective_name();
-            ModelOption {
-                checked: exists && defaults.iter().any(|d| key(d) == key(&name)),
-                name,
-                family: m.family.to_string(),
-                enabled: m.enabled,
-                exists,
-            }
-        })
-        .collect()
-}
-
-/// The devices the enabled models run on now (loaded), else would run on, in config order.
-fn devices_in_use(state: &AppState, snap: &DevicesSnapshot, c: &Config) -> Vec<String> {
-    let loaded = loaded_devices(state);
-    c.enabled_models()
-        .filter_map(|m| {
-            let name = crate::registry::normalize_name(&m.effective_name());
-            loaded
-                .get(&name)
-                .cloned()
-                .or_else(|| configured_device(c, m, &snap.model_selection(state, c, m)))
-        })
-        .collect()
-}
-
-/// Every device option, runnable first (downloadable ones count as not runnable here: the
-/// benchmark only measures what is installed). The saved devices are ticked, else `in_use`, the
-/// devices the models run on, else the first runnable option: a sweep of every device has hung
-/// a machine, so that takes ticking them by hand. Any of those that cannot run here is left out
-/// (a saved `openvino:gpu.0` whose iGPU was switched off must not leave the page with nothing
-/// ticked).
-fn device_rows(snap: &DevicesSnapshot, c: &Config, in_use: &[String]) -> Vec<DeviceOptionRow> {
-    let (ok, bad): (Vec<_>, Vec<_>) = snap.selection.options.iter().partition(|o| o.runnable);
-    let runnable = |list: &[String]| -> Vec<String> {
-        list.iter()
-            .filter_map(|d| crate::backend::spec::parse(d).ok().map(|s| s.to_string()))
-            .filter(|d| ok.iter().any(|o| o.spec.to_string() == *d))
-            .collect()
-    };
-    let chosen = [runnable(&c.benchmark.devices), runnable(in_use)]
-        .into_iter()
-        .find(|l| !l.is_empty())
-        .or_else(|| ok.first().map(|o| vec![o.spec.to_string()]))
-        .unwrap_or_default();
-    ok.iter()
-        .copied()
-        .chain(bad)
-        .map(|o| {
-            let spec = o.spec.to_string();
-            DeviceOptionRow {
-                checked: o.runnable && chosen.contains(&spec),
-                gpu: o.spec.is_gpu_like(),
-                spec,
-                label: o.label.clone(),
-                runnable: o.runnable,
-                reason: (!o.runnable).then(|| match &o.download {
-                    Some(d) => format!("not installed ({})", d.summary),
-                    None => o.reason.clone().unwrap_or_else(|| "not runnable".into()),
-                }),
-            }
-        })
-        .collect()
-}
-
-/// Download state of a built-in set from the manager (busy) or the disk.
-/// What a built-in set tests, in a few words.
-fn tests_of(m: &images::Manifest) -> String {
-    let known = match m.id.as_str() {
-        "coco-cctv" => "Street scenes by day: people, vehicles, animals",
-        "bmd45-cctv" => "Real daytime CCTV traffic: vehicles only",
-        "exdark-night" => "Low light and twilight: people, vehicles, animals",
-        "exdark-ir" => "A grayscale stand-in for night IR",
-        "nir-night" => "Real night IR camera traps: mostly false alerts",
-        _ => "",
-    };
-    if !known.is_empty() {
-        return known.to_string();
-    }
-    // A set added later: the first sentence of its description.
-    let first = m.description.split(". ").next().unwrap_or_default();
-    if m.has_ground_truth() {
-        first.to_string()
-    } else {
-        format!("{first}; no labels")
-    }
-}
-
-fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
-    let selected: Vec<String> = c.benchmark.datasets.iter().map(|d| d.label()).collect();
-    let is_sel = |id: &str| selected.iter().any(|s| s.eq_ignore_ascii_case(id));
-    let root = c.data_root();
-    let rows_by_id: HashMap<String, crate::resources::status::ResourceRow> =
-        crate::resources::status::rows(state.resources.as_ref(), c)
-            .into_iter()
-            .filter(|r| r.kind == "bench-images")
-            .map(|r| (r.id.to_string(), r))
-            .collect();
-    // Your cameras first: the headline set.
-    let mut out = vec![cameras::dataset_row(
-        c,
-        is_sel(crate::benchmark::cameras::ID),
-    )];
-    for m in images::builtin_manifests() {
-        let (set, missing) = ImageSet::from_manifest(m, &images::builtin_dir(&root, &m.id));
-        let rid = format!("{}{}", crate::resources::catalog::BENCH_ID_PREFIX, m.id);
-        let busy = rows_by_id.get(&rid).filter(|r| r.busy);
-        let (st, text) = match busy {
-            Some(r) => ("downloading", r.state_text.clone()),
-            None if missing == 0 => ("installed", "installed".to_string()),
-            None if !set.images.is_empty() => (
-                "partial",
-                format!("{} of {} images", set.images.len(), m.images.len()),
-            ),
-            None => ("available", "not downloaded".to_string()),
-        };
-        out.push(DatasetRow {
-            value: m.id.clone(),
-            title: m.title.clone(),
-            tests: tests_of(m),
-            size: format!(
-                "{} images \u{b7} {}",
-                m.images.len(),
-                crate::resources::catalog::format_size(m.size())
-            ),
-            license: m.license.clone(),
-            state: st,
-            state_text: text,
-            checked: is_sel(&m.id),
-            download_id: (missing > 0 && busy.is_none()).then_some(rid),
-            folder: false,
-            selectable: true,
-        });
-    }
-    for id in images::KNOWN_SET_IDS {
-        if images::builtin_manifest(id).is_none() {
-            out.push(DatasetRow {
-                value: id.to_string(),
-                title: id.to_string(),
-                tests: "curated set; not included in this build yet".into(),
-                size: String::new(),
-                license: String::new(),
-                state: "unavailable",
-                state_text: "not in this build".into(),
-                checked: is_sel(id),
-                download_id: None,
-                folder: false,
-                selectable: true,
-            });
-        }
-    }
-    out.push(DatasetRow {
-        value: images::SAMPLE_ID.into(),
-        title: "Embedded sample".into(),
-        tests: "Checks that a model runs, offline; no labels".into(),
-        size: "1 image".into(),
-        license: String::new(),
-        state: "embedded",
-        state_text: "always available".into(),
-        checked: is_sel(images::SAMPLE_ID),
-        download_id: None,
-        folder: false,
-        selectable: true,
-    });
-    for d in &c.benchmark.datasets {
-        if let Some((dir, _, _)) = d.dir() {
-            let abs = c.data_path(&dir);
-            let ok = abs.is_dir();
-            out.push(DatasetRow {
-                value: d.label(),
-                title: d.label(),
-                tests: abs.display().to_string(),
-                size: String::new(),
-                license: String::new(),
-                state: if ok { "folder" } else { "missing" },
-                state_text: if ok {
-                    "folder on the server".into()
-                } else {
-                    "directory not found".into()
-                },
-                checked: true,
-                download_id: None,
-                folder: true,
-                selectable: ok,
-            });
-        }
-    }
-    out
-}
-
-/// `GET /benchmark`.
-pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
-    super::blocking(move || {
-        let snap = devices_snapshot(&state);
-        let cfg = state.config_read().clone();
-        let b = &cfg.benchmark;
-        use crate::benchmark::grade::{
-            ACCURACY_THRESHOLDS as A, ROC_AUC_THRESHOLDS as U, SPEED_THRESHOLDS_MS as S,
-        };
-        render(&BenchmarkTemplate {
-            nav: "benchmark",
-            version: crate::VERSION,
-            models: model_options(&cfg),
-            devices: device_rows(&snap, &cfg, &devices_in_use(&state, &snap, &cfg)),
-            datasets: dataset_rows(&state, &cfg),
-            reference_models: cfg
-                .models
-                .iter()
-                .filter(|m| cfg.data_path(&m.path).is_file())
-                .map(|m| {
-                    let n = m.effective_name();
-                    let sel = b.reference_model.as_deref() == Some(n.as_str());
-                    (n, sel)
-                })
-                .collect(),
-            repeat: b.repeat_per_image.max(1),
-            warmup: b.warmup,
-            low_priority: b.low_priority,
-            served: b.served,
-            max_images: b.max_images_per_dataset,
-            accuracy_weight: format!("{:.2}", b.weights.accuracy_share()),
-            warning: LIVE_WARNING,
-            gpu_warning: crate::benchmark::service::SEVERAL_GPUS_WARNING,
-            interrupted: state.benchmark.take_interrupted(&cfg.data_root()),
-            force_cpu: cfg.force_cpu,
-            results_file: results_path(&state.config_path).display().to_string(),
-            speed_thresholds: format!("A < {} ms, B < {}, C < {}, D < {}", S[0], S[1], S[2], S[3]),
-            accuracy_thresholds: format!(
-                "A \u{2265} {:.2}, B \u{2265} {:.2}, C \u{2265} {:.2}, D \u{2265} {:.2}",
-                A[0], A[1], A[2], A[3]
-            ),
-            auc_thresholds: format!(
-                "A \u{2265} {:.2}, B \u{2265} {:.2}, C \u{2265} {:.2}, D \u{2265} {:.2}",
-                U[0], U[1], U[2], U[3]
-            ),
-            objectives: objective_options(b.threshold_objective),
-            accuracy_metrics: metric_options(b.accuracy_metric),
-            blue_iris_note: BLUE_IRIS_THRESHOLD_NOTE,
-            goal_label: profiles::goal_label(b).to_string(),
-        })
-    })
-    .await
-}
 
 /// Normalized model name -> spec of the device it is loaded on (this generation).
 pub(super) fn loaded_devices(state: &AppState) -> HashMap<String, String> {
@@ -646,10 +244,6 @@ struct SavedView {
     ranking: Box<RawValue>,
     points: Box<RawValue>,
     latest_run_id: Option<String>,
-    /// `lineup`: the models side by side per image set ([`crate::benchmark::lineup`]).
-    lineup: Box<RawValue>,
-    /// The measured part of `profiles` ([`profiles::facts`]).
-    facts: Vec<profiles::ModelFacts>,
     /// The hardware the results were measured on (`otherHardware`).
     hardware: Option<crate::benchmark::report::HardwareSummary>,
 }
@@ -729,10 +323,8 @@ fn compute_saved_view(
             let points = raw(&crate::benchmark::report::follow_order(r.points(), &order));
             crate::benchmark::current::rebase(&mut r, stored.as_deref(), now);
             crate::benchmark::trained_on::backfill(&mut r, &state.config_read());
-            let facts = profiles::facts(&r);
             // No history file yet: seeded in memory (written by the next run, pin or delete).
             let history = History::load_or_seed(hist, Some(&r));
-            let lineup = lineup_of(&r, stored.as_deref(), &history, now, &state.config_read());
             let mut results = serde_json::to_value(r.summary()).unwrap_or_default();
             view::annotate(&mut results, &r, &history);
             SavedView {
@@ -741,8 +333,6 @@ fn compute_saved_view(
                 ranking,
                 points,
                 latest_run_id: view::latest_run_id(&r),
-                lineup,
-                facts,
                 hardware: Some(r.hardware.clone()),
             }
         }
@@ -752,8 +342,6 @@ fn compute_saved_view(
             ranking: null(),
             points: null(),
             latest_run_id: None,
-            lineup: raw(&crate::benchmark::lineup::Lineup::default()),
-            facts: Vec::new(),
             hardware: None,
         },
     }
@@ -767,7 +355,7 @@ fn goal_order(
     preds: Option<&crate::benchmark::search::StoredPreds>,
     now: &HashMap<String, crate::benchmark::current::ModelNow>,
 ) -> Vec<(String, String)> {
-    use crate::benchmark::lineup::{Inputs, Parts};
+    use crate::benchmark::combos::{Inputs, Parts};
     let Some(preds) = preds else {
         return Vec::new();
     };
@@ -776,12 +364,10 @@ fn goal_order(
     crate::benchmark::current::rebase(&mut view, Some(preds), now);
     crate::benchmark::trained_on::backfill(&mut view, &cfg);
     let parts = Parts::of(&view, &cfg);
-    let history = crate::benchmark::history::History::default();
     let default_model = crate::training::switch::current_default(&cfg);
     let inputs = Inputs {
         results: &view,
         preds: Some(preds),
-        history: &history,
         now,
         default_model: default_model.as_deref(),
         configured: &parts.configured,
@@ -804,40 +390,14 @@ fn goal_order(
     .collect()
 }
 
-/// The `lineup` of the saved results: the frames each trained model trained on, what can run and
-/// which dataset folders can be read now are read here ([`crate::benchmark::lineup::Parts`]), the
-/// rest is pure.
-fn lineup_of(
-    results: &BenchmarkResults,
-    preds: Option<&crate::benchmark::search::StoredPreds>,
-    history: &crate::benchmark::history::History,
-    now: &HashMap<String, crate::benchmark::current::ModelNow>,
-    cfg: &Config,
-) -> Box<RawValue> {
-    use crate::benchmark::lineup::{Inputs, Parts, build};
-    let parts = Parts::of(results, cfg);
-    let lineup = build(&Inputs {
-        results,
-        preds,
-        history,
-        now,
-        default_model: crate::training::switch::current_default(cfg).as_deref(),
-        configured: &parts.configured,
-        trained: &parts.trained,
-        seen: &parts.seen,
-        reachable: &|s| s.dir.as_deref().is_some_and(std::path::Path::is_dir),
-    });
-    raw(&lineup)
-}
-
 /// `GET /v1/benchmark`: the current/last run (state, progress, partial results), the saved
 /// results (without per-image details), the ranking and the config's per-model devices. Results
 /// are shown against the config now: each threshold advice carries `now` (the effective
 /// threshold in the config, the counts there, exact from the stored predictions) and each
-/// model's `configured` is the device the config resolves to now. `profiles` lists per model and
-/// device the measured best threshold and the saved confidence profile ([`profiles::profiles`]),
-/// `otherHardware` whether the results were measured on other GPUs, `goal` the benchmark goal,
-/// `lineup` the models side by side per image set ([`crate::benchmark::lineup`]).
+/// model's `configured` is the device the config resolves to now. `otherHardware` says whether
+/// the results were measured on other GPUs, `goal` is the saved goal as the views name it
+/// ([`crate::benchmark::eval::compare::GoalView`]). The pages read the evaluation views instead
+/// (`/v1/benchmark/compare`, `/tune`) and poll `?only=run`.
 ///
 /// `?only=run[&models=<modelsTag>]` answers the run alone with the tag of the rest (`viewTag`),
 /// for polling during a run; the full answer has an `ETag` (304 on `If-None-Match`) and
@@ -1091,100 +651,178 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_lists_models_and_devices() {
+    async fn benchmark_goes_to_the_step_with_something_to_show() {
+        use axum::http::header::LOCATION;
         let st = state();
-        let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let html = String::from_utf8(
-            axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(html.contains(
-            "<a href=\"/benchmark\" class=\"active\" aria-current=\"page\">Benchmark</a>"
-        ));
+        let to = |r: &Response| r.headers()[LOCATION].to_str().unwrap().to_string();
+        let r = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(to(&r), "/benchmark/run", "no results yet");
+        profile_results(Default::default())
+            .save(&results_path(&st.config_path))
+            .unwrap();
+        let r = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
+        assert_eq!(to(&r), "/benchmark/compare");
+        let r = router(st.clone())
+            .oneshot(get("/benchmark?goal=f2&set=cameras"))
+            .await
+            .unwrap();
+        assert_eq!(
+            to(&r),
+            "/benchmark/compare?goal=f2&set=cameras",
+            "the query is kept"
+        );
+    }
+
+    /// Every step: the shell (title, goal chip, stepper with the step current and Run ticked
+    /// once results exist, History / Images), the Goal dialog, and its scripts (CSP: no inline
+    /// scripts; bench-core.js first).
+    #[tokio::test]
+    async fn every_step_has_the_shell_and_its_scripts() {
+        let st = state();
+        let steps = [
+            ("run", "bench-run.js"),
+            ("compare", "bench-compare.js"),
+            ("tune", "bench-tune.js"),
+            ("history", "bench-history.js"),
+            ("images", "bench-images.js"),
+        ];
+        for with_results in [false, true] {
+            if with_results {
+                profile_results(Default::default())
+                    .save(&results_path(&st.config_path))
+                    .unwrap();
+            }
+            for (step, script) in steps {
+                let (s, html) =
+                    crate::server::test_util::get_text(&st, &format!("/benchmark/{step}")).await;
+                assert_eq!(s, StatusCode::OK, "{step}");
+                assert!(
+                    html.contains(
+                        "<a href=\"/benchmark\" class=\"active\" aria-current=\"page\">Benchmark</a>"
+                    ),
+                    "{step}"
+                );
+                assert!(html.contains("<h1>Benchmark</h1>"), "{step}");
+                assert!(html.contains("id=\"goal-chip\""), "{step}");
+                assert!(
+                    html.contains("<b id=\"goal-chip-v\">F1</b>"),
+                    "{step}: the saved goal"
+                );
+                assert!(
+                    html.contains("<dialog class=\"bn-dialog\" id=\"goal-dlg\""),
+                    "{step}"
+                );
+                assert_eq!(
+                    html.matches("aria-current=\"step\"").count()
+                        + html
+                            .matches("data-step=\"history\" aria-current=\"page\"")
+                            .count()
+                        + html
+                            .matches("data-step=\"images\" aria-current=\"page\"")
+                            .count(),
+                    1,
+                    "{step}: one current step"
+                );
+                assert!(
+                    html.contains(&format!("data-step=\"{step}\" aria-current=")),
+                    "{step}: current"
+                );
+                let ticked = html.contains("class=\"bn-step done\"");
+                assert_eq!(
+                    ticked,
+                    with_results && step != "run",
+                    "{step}: the Run tick"
+                );
+                let core = html.find("/static/bench-core.js?v=").expect(step);
+                let shell = html.find("/static/bench-shell.js?v=").expect(step);
+                let page = html.find(&format!("/static/{script}?v=")).expect(script);
+                assert!(core < shell && shell < page, "{step}: script order");
+                assert!(
+                    super::super::pages::static_file(script).is_some(),
+                    "{script}"
+                );
+            }
+        }
+        // The empty states point at Run.
+        let (_, html) = crate::server::test_util::get_text(&state(), "/benchmark/compare").await;
+        assert!(
+            html.contains("id=\"cmp-empty\" class=\"bn-empty\">"),
+            "{html}"
+        );
+        assert!(html.contains("id=\"cmp-body\" hidden"), "{html}");
+        // The pages ask the evaluation endpoints, the shell polls the run.
+        let js = |n: &str| super::super::pages::static_file(n).unwrap();
+        assert!(js("bench-compare.js").contains("\"/v1/benchmark/compare\""));
+        assert!(js("bench-tune.js").contains("\"/v1/benchmark/tune\""));
+        assert!(js("bench-tune.js").contains("\"/v1/benchmark/tune/images\""));
+        assert!(js("bench-tune.js").contains("\"/v1/benchmark/apply-profiles\""));
+        assert!(js("bench-shell.js").contains("\"/v1/benchmark/goal\""));
+        assert!(js("bench-shell.js").contains("\"/v1/benchmark/rescore\""));
+        assert!(js("bench-history.js").contains("\"/v1/benchmark/history\""));
+        assert!(js("bench-images.js").contains("/v1/benchmark/tune/images?"));
+    }
+
+    #[tokio::test]
+    async fn the_run_step_lists_images_models_and_devices() {
+        let st = state();
+        let (s, html) = crate::server::test_util::get_text(&st, "/benchmark/run").await;
+        assert_eq!(s, StatusCode::OK);
         assert!(
             html.contains("name=\"model\" value=\"ipcam-general\""),
             "{html}"
         );
         // Files are missing: listed but not checked.
-        assert!(!html.contains("value=\"ipcam-general\" checked"));
-        assert!(html.contains("name=\"device\" value=\"openvino:cpu\" checked"));
-        // ONNX Runtime is not in this probe: listed, disabled.
-        assert!(html.contains("name=\"device\" value=\"ort:cpu\" disabled"));
-        // The configured datasets are checked; built-in sets offer a download.
+        assert!(!html.contains("value=\"ipcam-general\" data-timing=\"{}\" checked"));
         assert!(
-            html.contains("name=\"dataset\" value=\"coco-cctv\" checked"),
+            html.contains("name=\"device\" value=\"openvino:cpu\" checked"),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-cpu=\"1\""),
+            "the CPU reference is marked"
+        );
+        // ONNX Runtime is not in this probe: listed, disabled.
+        assert!(
+            html.contains("name=\"device\" value=\"ort:cpu\" disabled"),
+            "{html}"
+        );
+        // Your cameras first; the configured datasets are checked; built-in sets offer a download.
+        let cams = html.find("value=\"cameras\"").expect("Your cameras");
+        let coco = html
+            .find("name=\"dataset\" value=\"coco-cctv\"")
+            .expect("coco");
+        assert!(cams < coco, "Your cameras first");
+        assert!(
+            html.contains("name=\"dataset\" value=\"coco-cctv\" data-images=\""),
             "{html}"
         );
         assert!(html.contains("data-download=\"bench:coco-cctv\""));
-        assert!(html.contains("name=\"dataset\" value=\"sample\">"));
-        assert!(html.contains("competes") || html.contains("same CPU/GPU"));
-        // The page script lives in `/static/benchmark.js` (CSP: no inline scripts).
+        assert!(html.contains("name=\"dataset\" value=\"sample\" data-images=\"1\">"));
+        assert!(html.contains("same CPU/GPU"));
+        assert!(html.contains("id=\"o-served\""), "As served");
         assert!(
-            html.contains("<script src=\"/static/benchmark.js?v="),
-            "{html}"
+            html.contains("id=\"gpu-confirm\""),
+            "the in-page GPU confirmation"
         );
-        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
-        assert!(js.contains("fetch(\"/v1/benchmark\""));
-        // The tabs.
-        for id in [
-            "tab-compare",
-            "tab-run",
-            "tab-tune",
-            "tab-history",
-            "tab-details",
+        assert_eq!(html.matches("<dialog id=\"browse-dialog\">").count(), 1);
+        let js = super::super::pages::static_file("bench-run.js").unwrap();
+        for needle in [
+            "\"/v1/benchmark\"",
+            "\"/v1/benchmark/settings\"",
+            "BC.cpuReference",
+            "BC.estimate",
+            "BC.comboStates",
         ] {
-            assert!(html.contains(&format!("id=\"{id}\"")), "{id}: {html}");
-            assert!(html.contains(&format!("href=\"#{id}\"")), "{id}: {html}");
+            assert!(js.contains(needle), "{needle}");
         }
-        // The goal's plain name (the default weights are the Balanced preset).
-        assert!(
-            html.contains("<strong id=\"goal-label\">Balanced</strong>"),
-            "{html}"
-        );
-        // The profiles script.
-        assert!(
-            html.contains("<script src=\"/static/bench-profiles.js?v="),
-            "{html}"
-        );
-        assert!(super::super::pages::static_file("bench-profiles.js").is_some());
-        // Threshold objective (config default f1, in the Profiles step, part of the run form)
-        // and the threshold apply actions.
-        assert!(
-            html.contains("<select name=\"threshold_objective\" form=\"bench-form\""),
-            "{html}"
-        );
-        assert!(html.contains("<option value=\"f1\" selected>"), "{html}");
-        assert!(html.contains("<option value=\"precision:0.9\">"), "{html}");
-        assert!(html.contains("id=\"apply-all-thr\""));
-        assert!(
-            html.contains("/v1/benchmark/apply-threshold")
-                || js.contains("/v1/benchmark/apply-threshold")
-        );
-        assert!(html.contains("min_confidence") || js.contains("min_confidence"));
-        // Accuracy metric (config default ap50), the frame objectives and the ROC chart code.
-        assert!(
-            html.contains("<select name=\"accuracy_metric\" form=\"bench-form\""),
-            "{html}"
-        );
-        assert!(html.contains("<option value=\"ap50\" selected>"), "{html}");
-        assert!(html.contains("<option value=\"roc_auc\">"), "{html}");
-        assert!(html.contains("<option value=\"youden\">"), "{html}");
-        assert!(html.contains("<option value=\"fpr:0.05\">"), "{html}");
-        assert!(
-            super::super::pages::static_file("bench-charts.js")
-                .expect("bench-charts.js")
-                .contains("function rocSvg")
-        );
     }
 
     #[tokio::test]
     async fn saved_devices_that_cannot_run_here_are_not_ticked() {
         let st = state();
         let ticked = |html: &str, spec: &str| html.contains(&format!("value=\"{spec}\" checked"));
+        // (the device boxes carry no data-timing: `value` is followed by `checked` directly)
         // Only a vanished iGPU saved: the device the model runs on is ticked instead of none.
         st.config
             .update("test", |c| {
@@ -1192,7 +830,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark/run").await;
         assert!(ticked(&html, "openvino:cpu"), "{html}");
         assert!(!html.contains("value=\"openvino:gpu.0\""), "{html}");
         // Every saved one unavailable (ORT is not in this probe): the same, and a disabled box
@@ -1203,10 +841,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark/run").await;
         assert!(ticked(&html, "openvino:cpu"), "{html}");
         assert!(!ticked(&html, "ort:cpu"), "{html}");
-        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
+        let js = super::super::pages::static_file("bench-run.js").expect("bench-run.js");
         assert!(js.contains("Tick at least one device"));
     }
 
@@ -1249,14 +887,14 @@ mod tests {
         let snap = gpu_box();
         let ticked = |c: &Config, in_use: &[&str]| -> Vec<String> {
             let in_use: Vec<String> = in_use.iter().map(|s| s.to_string()).collect();
-            device_rows(&snap, c, &in_use)
+            super::pages::device_rows(&snap, c, &in_use)
                 .into_iter()
                 .filter(|r| r.checked)
                 .map(|r| r.spec)
                 .collect()
         };
         let mut c = Config::default();
-        let runnable = device_rows(&snap, &c, &[])
+        let runnable = super::pages::device_rows(&snap, &c, &[])
             .iter()
             .filter(|r| r.runnable)
             .count();
@@ -1276,23 +914,25 @@ mod tests {
         c.benchmark.devices = vec!["openvino:cpu".into()];
         assert_eq!(ticked(&c, &["openvino:gpu.1"]), ["openvino:cpu"]);
 
-        let rows = device_rows(&snap, &Config::default(), &[]);
+        let rows = super::pages::device_rows(&snap, &Config::default(), &[]);
         let gpu = |spec: &str| rows.iter().find(|r| r.spec == spec).unwrap().gpu;
         assert!(gpu("openvino:gpu.0") && gpu("openvino:gpu.1"));
         assert!(!gpu("openvino:cpu"));
     }
 
-    /// The form's side of the confirmation: the boxes are marked, the warning sits under them.
+    /// The form's side of the confirmation: the boxes are marked, the warning sits under them,
+    /// Start asks in the page (no `confirm()`) and then sends the field the server wants.
     #[tokio::test]
     async fn the_form_warns_about_several_gpus() {
         use crate::benchmark::service::SEVERAL_GPUS_WARNING;
-        let (_, html) = crate::server::test_util::get_text(&state(), "/benchmark").await;
-        assert!(html.contains("id=\"gpu-warning\" hidden"), "{html}");
+        let (_, html) = crate::server::test_util::get_text(&state(), "/benchmark/run").await;
+        assert!(html.contains("id=\"gpu-warn\" hidden"), "{html}");
         assert!(html.contains("never found"), "{html}");
         assert!(SEVERAL_GPUS_WARNING.contains("has hung a machine"));
-        let js = super::super::pages::static_file("benchmark.js").expect("benchmark.js");
-        assert!(js.contains("[data-gpu]") && js.contains("\"confirm_gpus\""));
-        let template = include_str!("../../../templates/benchmark.html");
+        let js = super::super::pages::static_file("bench-run.js").expect("bench-run.js");
+        assert!(js.contains("dataset.gpu") && js.contains("\"confirm_gpus\""));
+        assert!(!js.contains("confirm("), "asked in the page");
+        let template = include_str!("../../../templates/benchmark/run.html");
         assert!(template.contains("data-gpu=\"1\""));
     }
 
@@ -1302,7 +942,7 @@ mod tests {
         use crate::benchmark::service::breadcrumb::{BREADCRUMB_FILE, Breadcrumb};
         let st = crate::server::test_util::test_state();
         let file = st.config_read().data_root().join(BREADCRUMB_FILE);
-        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark/run").await;
         assert!(!html.contains("id=\"bench-interrupted\""), "nothing left");
         let crumb = Breadcrumb {
             device: "ort:directml:1".into(),
@@ -1310,12 +950,12 @@ mod tests {
             time: "2026-11-06T10:00:00Z".into(),
         };
         std::fs::write(&file, serde_json::to_vec(&crumb).unwrap()).unwrap();
-        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark/compare").await;
         assert!(html.contains("id=\"bench-interrupted\""), "{html}");
         assert!(html.contains("ort:directml:1"), "{html}");
         assert!(!html.contains("<b>m</b>"), "escaped");
         assert!(!file.exists(), "shown, so gone");
-        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark").await;
+        let (_, html) = crate::server::test_util::get_text(&st, "/benchmark/tune").await;
         assert!(!html.contains("id=\"bench-interrupted\""), "once");
     }
 
@@ -1399,8 +1039,12 @@ mod tests {
         let (_, v2) = call(&st, get("/v1/benchmark")).await;
         assert_eq!(advice(&v2), a);
 
-        // Apply all thresholds: Now is the new value, P/R/F1 evaluated there exactly.
-        let (s, j) = call(&st, post("/v1/benchmark/apply-threshold", "all=1")).await;
+        // A saved threshold: Now is the new value, P/R/F1 evaluated there exactly.
+        let (s, j) = call(
+            &st,
+            post("/v1/benchmark/apply-threshold", "model=m&threshold=0.35"),
+        )
+        .await;
         assert_eq!(s, StatusCode::OK, "{j}");
         let (_, v) = call(&st, get("/v1/benchmark")).await;
         assert!(SAVED_COMPUTED.load(Ordering::Relaxed) > computed);
@@ -1474,160 +1118,46 @@ mod tests {
             "{}",
             v["csv"]
         );
-
-        // The page renders the live view.
-        let (s, page) = call(&st, get("/benchmark")).await;
-        assert_eq!(s, StatusCode::OK);
-        let page = page.as_str().unwrap();
-        assert!(
-            page.contains("<script src=\"/static/benchmark.js?v="),
-            "{page}"
-        );
-        let js = crate::server::pages::static_file("benchmark.js").expect("benchmark.js");
-        assert!(js.contains("function nowOf(a)"));
-        assert!(js.contains("L.keep($(\"thresholds\")"));
     }
+    /// The status keeps the config's per-model view (profiles, sources), whether the results
+    /// were measured on other GPUs, and the goal as the views name it.
     #[tokio::test]
-    async fn status_lists_the_confidence_profiles() {
+    async fn status_shows_the_config_view_and_the_goal() {
         let st = state();
         let cfg_path = st.config_path.clone();
-        // No results: no profiles; the goal is the config's.
         let (_, v) = call(&st, get("/v1/benchmark")).await;
-        assert_eq!(v["profiles"], serde_json::json!([]));
-        assert_eq!(v["lineup"]["sets"], serde_json::json!([]));
-        assert_eq!(v["lineup"]["defaultSet"], serde_json::Value::Null);
         assert_eq!(v["otherHardware"], false);
-        assert_eq!(v["goal"]["label"], "Balanced");
-        assert_eq!(v["goal"]["objective"], "f1");
+        assert_eq!(v["goal"]["optimizeFor"], "f1");
+        assert_eq!(v["goal"]["summary"], "F1");
         assert_eq!(
             v["config"]["models"][0]["deviceThresholds"],
             serde_json::json!({})
         );
         assert_eq!(v["config"]["models"][0]["thresholdSource"], "global");
-
         // Measured on other hardware (an empty summary never matches this machine).
         profile_results(Default::default())
             .save(&results_path(&cfg_path))
             .unwrap();
         let (_, v) = call(&st, get("/v1/benchmark")).await;
         assert_eq!(v["otherHardware"], true);
-        let p = v["profiles"].as_array().unwrap();
-        assert_eq!(p.len(), 3);
-        let ip = &p[0];
-        assert_eq!(ip["model"], "ipcam-general");
-        assert_eq!(ip["configured"], true);
-        assert_eq!(ip["device"], "global");
-        assert_eq!(ip["running"], serde_json::Value::Null);
-        assert_eq!(ip["fallback"], 0.5);
-        assert_eq!(ip["fallbackSource"], "global");
-        assert_eq!(ip["status"], "unsaved");
-        let d = &ip["devices"];
-        assert_eq!(d.as_array().unwrap().len(), 3);
-        let cpu = &d[0];
-        assert_eq!(cpu["device"], "openvino:cpu");
-        assert_eq!(cpu["label"], "openvino:cpu");
-        assert_eq!(cpu["recommended"], true);
-        assert_eq!(cpu["ok"], true);
-        assert_eq!(cpu["error"], serde_json::Value::Null);
-        assert_eq!(cpu["fellBack"], false);
-        assert_eq!(cpu["ms"], 20.0);
-        // test_advice: TP 3, FP 1, FN 1 at the best threshold.
-        assert_eq!(cpu["finds"], 0.75);
-        assert_eq!(cpu["correct"], 0.75);
-        assert_eq!(cpu["best"], 0.4);
-        assert_eq!(cpu["saved"], serde_json::Value::Null);
-        assert_eq!(cpu["differs"], true);
-        assert!(cpu["now"].is_boolean());
-        assert_eq!(d[1]["best"], 0.33);
-        let gpu = &d[2];
-        assert_eq!(
-            (&gpu["ok"], &gpu["error"]),
-            (
-                &serde_json::json!(false),
-                &serde_json::json!("compile failed")
-            )
-        );
-        assert_eq!(
-            (&gpu["best"], &gpu["differs"], &gpu["ms"]),
-            (
-                &serde_json::Value::Null,
-                &serde_json::json!(false),
-                &serde_json::Value::Null
-            )
-        );
-        // Every field of the contract, nothing else.
-        let keys = |o: &serde_json::Value| {
-            let mut k: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
-            k.sort();
-            k
-        };
-        assert_eq!(
-            keys(ip),
-            [
-                "configured",
-                "device",
-                "devices",
-                "fallback",
-                "fallbackSource",
-                "model",
-                "running",
-                "status",
-                "trainedOnShare"
-            ]
-        );
-        assert_eq!(
-            keys(cpu),
-            [
-                "best",
-                "correct",
-                "device",
-                "differs",
-                "error",
-                "fellBack",
-                "finds",
-                "label",
-                "ms",
-                "now",
-                "ok",
-                "recommended",
-                "saved"
-            ]
-        );
-        assert_eq!(p[2]["model"], "removed");
-        assert_eq!(p[2]["configured"], false);
-
-        // Measured here; every profile applied: saved, and shown on the config models.
         profile_results(crate::benchmark::report::HardwareSummary::current())
             .save(&results_path(&cfg_path))
             .unwrap();
-        let (s, j) = call(&st, post("/v1/benchmark/apply-profiles", "all=1")).await;
-        assert_eq!(s, StatusCode::OK, "{j}");
-        let (_, v) = call(&st, get("/v1/benchmark")).await;
-        assert_eq!(v["otherHardware"], false);
-        assert_eq!(v["profiles"][0]["status"], "saved");
-        assert_eq!(v["profiles"][0]["devices"][0]["saved"], 0.4);
-        assert_eq!(v["profiles"][0]["devices"][0]["differs"], false);
-        assert_eq!(v["profiles"][1]["status"], "saved");
-        assert_eq!(
-            v["config"]["models"][0]["deviceThresholds"],
-            serde_json::json!({"openvino:cpu": 0.4, "ort:cpu": 0.33})
-        );
-        // One profile changed by hand: differs.
         st.config
             .update("test", |c| {
                 c.models[0].device_thresholds.insert("ort:cpu".into(), 0.5);
                 c.models[0].confidence_threshold = Some(0.45);
+                c.benchmark.goal.optimize_for = "f2".parse().unwrap();
                 Ok(())
             })
             .unwrap();
         let (_, v) = call(&st, get("/v1/benchmark")).await;
-        let ip = &v["profiles"][0];
-        assert_eq!(ip["status"], "differs");
+        assert_eq!(v["otherHardware"], false);
         assert_eq!(
-            (&ip["fallback"], &ip["fallbackSource"]),
-            (&serde_json::json!(0.45), &serde_json::json!("model"))
+            v["config"]["models"][0]["deviceThresholds"],
+            serde_json::json!({"ort:cpu": 0.5})
         );
-        assert_eq!(ip["devices"][1]["differs"], true);
         assert_eq!(v["config"]["models"][0]["thresholdSource"], "model");
+        assert_eq!(v["goal"]["metric"], "F2");
     }
 }

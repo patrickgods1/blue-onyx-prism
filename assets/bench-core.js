@@ -1,0 +1,464 @@
+// Blue Onyx Prism: Benchmark pages, the shared part (served from /static/; ES5, no build step,
+// no inline scripts under the CSP). Loaded first by every /benchmark/* page.
+// Two parts, like live.js: a pure first part (no DOM; tested in node by tests/it/js_bench.rs)
+// and helpers that need a document (PrismBench.el, post, getJSON), defined but only called in a
+// browser.
+//
+// Pure part (globalThis.BenchCore unless noted):
+// - fmt: n2 / n1 (two / one decimals, "-" for none), ms ("420 ms", "1.4 s"), pct ("87%"),
+//   ci(estimate) ("±0.02": the larger half of the 95% interval), signed(d, dp), duration(s).
+// - GOALS: the goal catalog of the Goal dialog (kind, label, long, target default and step,
+//   `rankOnly`, `more` = under "More goals"); parseGoal("precision:0.9") -> {kind, target};
+//   goalSpec(kind, target) -> "precision:0.9"; goalQuery(g) / tryParams(search): the `goal`,
+//   `tune_for`, `classes`, `budget` query of a goal tried without saving (the views and the
+//   Goal POST read the same fields); withTry(href, params) keeps them on a link.
+// - rowChips(row): the chips of a Compare / Tune row (default, trained here, too slow, target not
+//   met, served, stale rules, low confidence, relative, flat), each {cls, text, tip}.
+// - COLUMNS, columnsOf(stored) / columnsText(list): the Compare table's optional columns and their
+//   stored choice (localStorage `prism.bench.columns`, via store).
+// - comboStates(run): the run poll's per-combo list ({model, device, state, text, now}).
+// - cpuReference(devices, dismissed): the CPU device to tick when 2+ devices and no CPU one are
+//   ticked (without a CPU reference nothing is recommended); null when none is needed.
+// - estimate(o): seconds a run takes from the last run's time per image ({seconds, known, pairs}).
+// - mapHash(hash): the new address of an old /benchmark#tab-... link (null: none).
+// - disagree(a, b): the frames on which two combos' examples disagree (one misses or alerts where
+//   the other does not).
+// - boxRect(bbox, w, h): a box as percentages of its image.
+// - compareCsv(view): the Compare table as CSV.
+// - cellTag(tag) (also globalThis.BenchTags.cellTag): held-out per-camera tags the tag lists leave
+//   out (twin: `training::dataset::is_cell_tag`).
+// - globalThis.BenchPoll: runUri(modelsTag), step(last, answer): what a run poll's answer means
+//   (GET /v1/benchmark?only=run; src/server/benchmark/poll.rs checks it in node).
+// - TERMS / globalThis.PrismBench.tipText(key): the glossary behind `button.term[data-term]`
+//   (PrismTip, live.js).
+(function (root) {
+  "use strict";
+  function has(v) { return v !== null && v !== undefined && !(typeof v === "number" && isNaN(v)); }
+
+  // ---- formats ---------------------------------------------------------------------------------
+  var fmt = {
+    n2: function (v) { return has(v) ? Number(v).toFixed(2) : "-"; },
+    n1: function (v) { return has(v) ? Number(v).toFixed(1) : "-"; },
+    ms: function (v) { if (!has(v)) return "-"; return v >= 1000 ? (v / 1000).toFixed(1) + " s" : (v >= 100 ? Math.round(v) : Number(v).toFixed(v >= 10 ? 0 : 1)) + " ms"; },
+    pct: function (v) { return has(v) ? Math.round(v * 100) + "%" : "-"; },
+    // "±0.02": the larger half of a 95% interval {value, low, high}; "" without one.
+    ci: function (e) {
+      if (!e || !has(e.value) || !has(e.low) || !has(e.high)) return "";
+      return "±" + Math.max(e.value - e.low, e.high - e.value, 0).toFixed(2);
+    },
+    signed: function (d, dp) { if (!has(d)) return "-"; var p = dp === undefined ? 2 : dp; var t = Math.abs(d).toFixed(p); return (Number(t) === 0 ? "±" : d > 0 ? "+" : "−") + t; },
+    duration: function (s) { if (!has(s)) return "-"; s = Math.max(1, Math.round(s)); if (s < 90) return s + " s"; var m = Math.round(s / 60); if (m < 90) return m + " min"; return (m / 60).toFixed(1) + " h"; },
+    int: function (n) { return has(n) ? String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",") : "-"; }
+  };
+
+  // ---- goals -----------------------------------------------------------------------------------
+  // `prefix`: the target's name in the dialog ("N = ").
+  var GOALS = [
+    {kind: "f1", label: "F1", long: "Balanced: find objects and avoid false alerts equally"},
+    {kind: "f2", label: "F2", long: "Miss fewer objects: recall counts more than precision"},
+    {kind: "f05", label: "F0.5", long: "Fewer false alerts: precision counts more than recall"},
+    {kind: "recall_at_fa", label: "Recall at ≤ N false alerts", long: "Most objects found with at most N false alerts per 100 empty frames", target: 5, step: 0.5, min: 0, max: 100, prefix: "N"},
+    {kind: "precision", label: "Recall with precision ≥ p", long: "Most objects found while at least p of the detections are right", target: 0.9, step: 0.01, min: 0.01, max: 0.99, prefix: "p"},
+    {kind: "recall", label: "Precision with recall ≥ r", long: "Fewest wrong detections while finding at least r of the objects", target: 0.9, step: 0.01, min: 0.01, max: 0.99, prefix: "r"},
+    {kind: "youden", label: "Youden's J", long: "Alert rate on frames with an object minus the false-alert rate on empty frames", more: true},
+    {kind: "fpr", label: "Alert rate with FPR ≤ x", long: "Most frames with an object alerted, at most x of empty frames alerting", target: 0.05, step: 0.01, min: 0.01, max: 0.99, prefix: "x", more: true},
+    {kind: "ap50", label: "AP50", long: "Average precision at IoU 0.5 over every confidence", rankOnly: true, more: true},
+    {kind: "ap50_95", label: "AP50-95", long: "COCO average precision, IoU 0.5 to 0.95: also rewards tight boxes", rankOnly: true, more: true},
+    {kind: "roc_auc", label: "ROC AUC", long: "How well a frame's top confidence separates frames with and without objects", rankOnly: true, more: true},
+    {kind: "grade", label: "Grade", long: "The A-F grade: accuracy and speed, weighted", rankOnly: true, more: true}
+  ];
+  var TUNE_FOR = ["f1", "f2", "f05"];
+  function goalOf(kind) { for (var i = 0; i < GOALS.length; i++) if (GOALS[i].kind === kind) return GOALS[i]; return null; }
+  function parseGoal(spec) {
+    var s = String(spec || "").trim().toLowerCase(), i = s.indexOf(":");
+    var kind = i < 0 ? s : s.slice(0, i), g = goalOf(kind);
+    if (!g) return null;
+    if (g.target === undefined) return {kind: kind, target: null};
+    var t = i < 0 ? g.target : parseFloat(s.slice(i + 1));
+    return {kind: kind, target: isFinite(t) ? t : g.target};
+  }
+  // The target as the server writes it ("0.9", "5", "2.5"): up to 4 decimals, no trailing zeros.
+  function num(t) { return String(Number(Number(t).toFixed(4))); }
+  function goalSpec(kind, target) {
+    var g = goalOf(kind); if (!g) return null;
+    if (g.target === undefined) return kind;
+    return kind + ":" + num(has(target) && isFinite(target) ? target : g.target);
+  }
+  // Why a target cannot be used (null: fine).
+  function targetProblem(kind, target) {
+    var g = goalOf(kind); if (!g || g.target === undefined) return null;
+    if (!has(target) || !isFinite(target)) return g.label + ": enter a number.";
+    if (target < g.min || target > g.max) return g.label + ": use a value from " + g.min + " to " + g.max + ".";
+    return null;
+  }
+  // The query fields of goal `g` ({optimizeFor, tuneFor, classes [], budget (ms or null)}), as
+  // [[key, value]] pairs: what the views take to try it and POST /v1/benchmark/goal saves.
+  function goalPairs(g) {
+    return [
+      ["goal", g.optimizeFor],
+      ["tune_for", g.tuneFor || "f1"],
+      ["classes", g.classes && g.classes.length ? g.classes.join(",") : "all"],
+      ["budget", has(g.budget) ? String(g.budget) : "none"]
+    ];
+  }
+  function encodePairs(pairs) { return pairs.map(function (p) { return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]); }).join("&"); }
+  var TRY_KEYS = ["goal", "tune_for", "classes", "budget"];
+  // The goal fields of a page address's query (`?goal=f2&budget=500`): [[key, value]] (empty:
+  // nothing tried).
+  function tryParams(search) {
+    var out = [], q = String(search || "").replace(/^\?/, "");
+    if (!q) return out;
+    q.split("&").forEach(function (kv) {
+      var i = kv.indexOf("="), k, v;
+      try { k = decodeURIComponent((i < 0 ? kv : kv.slice(0, i)).replace(/\+/g, " ")); v = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, " ")); } catch (e) { return; }
+      if (TRY_KEYS.indexOf(k) >= 0 && v !== "") out.push([k, v]);
+    });
+    return out;
+  }
+  // `href` with the tried goal's fields (replacing any it has).
+  function withTry(href, pairs) {
+    if (!pairs || !pairs.length) return href;
+    var h = String(href), hash = "", qi;
+    var hi = h.indexOf("#"); if (hi >= 0) { hash = h.slice(hi); h = h.slice(0, hi); }
+    qi = h.indexOf("?");
+    var path = qi < 0 ? h : h.slice(0, qi), rest = qi < 0 ? "" : h.slice(qi + 1);
+    var kept = rest ? rest.split("&").filter(function (kv) { var k = kv.split("=")[0]; return kv && TRY_KEYS.indexOf(decodeURIComponent(k)) < 0; }) : [];
+    var q = kept.concat([encodePairs(pairs)]).filter(Boolean).join("&");
+    return path + (q ? "?" + q : "") + hash;
+  }
+  // The address without the tried goal's fields.
+  function withoutTry(href) {
+    var h = String(href), hash = "", hi = h.indexOf("#");
+    if (hi >= 0) { hash = h.slice(hi); h = h.slice(0, hi); }
+    var qi = h.indexOf("?"); if (qi < 0) return h + hash;
+    var kept = h.slice(qi + 1).split("&").filter(function (kv) { return kv && TRY_KEYS.indexOf(decodeURIComponent(kv.split("=")[0])) < 0; });
+    return h.slice(0, qi) + (kept.length ? "?" + kept.join("&") : "") + hash;
+  }
+
+  // ---- row chips -------------------------------------------------------------------------------
+  function rowChips(row) {
+    var f = (row && row.flags) || {}, out = [];
+    if (row && row.isDefault) out.push({cls: "tag", text: "default", tip: "The model Blue Iris's default detection route uses."});
+    if (f.trainedHere && f.unknownSeen) {
+      out.push({cls: "bn-chip warn", text: "training unknown", tip: "Which of these frames it trained on cannot be told (" + f.unknownSeen + "), so it is never ranked among the fair rows. Its training run's lists must be readable (Train area) for it to be judged on the frames it never saw."});
+    } else if (f.trainedHere) {
+      var share = has(f.trainedOnShare) ? Math.round(f.trainedOnShare * 100) + "% of" : "some of";
+      out.push({cls: "bn-chip warn", text: "trained here", tip: "It trained or validated on " + share + " these frames: its scores here say little about new frames, so it is never ranked among the fair rows."});
+    }
+    if (f.tooSlow) out.push({cls: "bn-chip bad", text: "too slow", tip: "Its p95 is over the goal's speed budget."});
+    if (f.unmet) out.push({cls: "bn-chip bad", text: "target not met", tip: "The goal's target does not hold on the 95% bound of its cross-validated counts."});
+    if (f.served) out.push({cls: "bn-chip same", text: "served", tip: "Scored as Blue Iris gets it: night model, night threshold, filters, enhancement and verifier applied."});
+    if (f.staleRules) out.push({cls: "bn-chip warn", text: "stale rules", tip: "Its serving settings changed since this run: run it again for current numbers."});
+    if (f.lowConfidence) out.push({cls: "bn-chip warn", text: "low confidence", tip: f.lowConfidence});
+    if (f.relative) out.push({cls: "bn-chip same", text: "relative", tip: "These images have no labels: scored against another model's detections, so its confidence cannot be saved."});
+    if (f.flat) out.push({cls: "bn-chip same", text: "flat curve", tip: "Every confidence scores about the same here: the pick says nothing about the confidence to use."});
+    return out;
+  }
+
+  // ---- Compare columns ------------------------------------------------------------------------
+  var COLUMNS = [
+    {key: "f1", label: "F1"}, {key: "f05", label: "F0.5"}, {key: "ap50", label: "AP50"}, {key: "ap50_95", label: "AP50-95"},
+    {key: "roc_auc", label: "ROC AUC"}, {key: "p50", label: "p50"}, {key: "p99", label: "p99"}, {key: "burst", label: "Burst p95"},
+    {key: "first_load", label: "First load"}, {key: "cpu", label: "CPU check"}
+  ];
+  function columnsOf(stored) {
+    var list = stored;
+    if (typeof stored === "string") { try { list = JSON.parse(stored); } catch (e) { list = null; } }
+    if (!Array.isArray(list)) return [];
+    var known = COLUMNS.map(function (c) { return c.key; });
+    return known.filter(function (k) { return list.indexOf(k) >= 0; });
+  }
+  function columnsText(list) { return JSON.stringify(columnsOf(list || [])); }
+  var AGREEMENT = {match: "agrees with CPU", agrees: "agrees with CPU", minor: "minor differences", differs: "differs from CPU", reference: "CPU reference", not_checked: "not checked against CPU"};
+  function agreementText(v) { return has(v) ? (AGREEMENT[v] || String(v).replace(/_/g, " ")) : "not checked against CPU"; }
+  // A run's first load (compile + request creation) as shown: "2.1 s, cached", "24 s, compiled",
+  // "3.0 s, cache off", "3.0 s, cache unknown", "0.8 s". Twin: `report::first_load_text`
+  // (tests/it/js_bench.rs).
+  function loadText(compileMs, cache) {
+    var s = Math.max(0, compileMs || 0) / 1e3, secs = (s >= 10 ? s.toFixed(0) : s.toFixed(1)) + " s";
+    return ({hit: secs + ", cached", miss: secs + ", compiled", disabled: secs + ", cache off", unknown: secs + ", cache unknown"})[cache] || secs;
+  }
+  function firstLoadText(fl) {
+    if (!fl || !has(fl.compileMs) || (!fl.compileMs && !fl.warmupMs && !fl.cache)) return "-";
+    return loadText(fl.compileMs, fl.cache);
+  }
+  function columnValue(row, key) {
+    var s = row.speed || {};
+    switch (key) {
+      case "f1": return fmt.n2(row.f1);
+      case "f05": return fmt.n2(row.f05);
+      case "ap50": return fmt.n2(row.ap50);
+      case "ap50_95": return fmt.n2(row.ap5095);
+      case "roc_auc": return fmt.n2(row.rocAuc);
+      case "p50": return fmt.ms(s.p50Ms);
+      case "p99": return fmt.ms(s.p99Ms);
+      case "burst": return has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : "not run";
+      case "first_load": return firstLoadText(s.firstLoad);
+      case "cpu": return agreementText(row.agreement);
+    }
+    return "-";
+  }
+
+  // ---- the run's combos ------------------------------------------------------------------------
+  function key(s) { return String(s || "").trim().toLowerCase(); }
+  function sameDevice(a, b) { var x = key(a).replace(/\.0$/, ""), y = key(b).replace(/\.0$/, ""); return x === y; }
+  var PHASE = {loading: "compiling", warmup: "warming up", timing: "scoring"};
+  // run: the `run` of GET /v1/benchmark?only=run ({request, progress, models, running, state}).
+  function comboStates(run) {
+    if (!run) return [];
+    var req = run.request || {}, prog = run.progress || null, done = run.models || [];
+    var names = (req.models || []).slice();
+    done.forEach(function (m) { if (!names.some(function (n) { return key(n) === key(m.model); })) names.push(m.model); });
+    if (prog && prog.model && !names.some(function (n) { return key(n) === key(prog.model); })) names.push(prog.model);
+    var out = [];
+    names.forEach(function (name) {
+      var m = null;
+      done.forEach(function (x) { if (key(x.model) === key(name)) m = x; });
+      var devs = (req.devices || []).slice();
+      if (!devs.length) {
+        if (m) m.devices.forEach(function (d) { devs.push(d.device); });
+        if (prog && key(prog.model) === key(name) && prog.device && !devs.some(function (d) { return sameDevice(d, prog.device); })) devs.push(prog.device);
+        if (!devs.length) devs.push("");
+      }
+      devs.forEach(function (dev) {
+        var d = null;
+        if (m) (m.devices || []).forEach(function (x) { if (sameDevice(x.device, dev)) d = x; });
+        var item = {model: (m && m.model) || name, device: dev, state: "queued", text: "queued", now: false};
+        var current = prog && prog.stage === "benchmark" && key(prog.model) === key(name) && (!dev || sameDevice(prog.device, dev));
+        if (d && d.error) { item.state = "failed"; item.text = "failed: " + d.error; }
+        else if (d && d.run) { item.state = "done"; item.text = "done"; }
+        else if (m && m.error) { item.state = "failed"; item.text = "failed: " + m.error; }
+        else if (current && run.running) {
+          item.now = true; item.state = PHASE[prog.phase] ? prog.phase : "timing";
+          item.text = prog.phase === "timing" && prog.total ? "scoring " + fmt.int(prog.done) + " of " + fmt.int(prog.total) + " images" : (PHASE[prog.phase] || "running");
+          if (!dev) item.device = prog.device;
+        } else if (!run.running) { item.state = "skipped"; item.text = run.state === "cancelled" ? "not run (cancelled)" : "not run"; }
+        out.push(item);
+      });
+    });
+    return out;
+  }
+
+  // ---- Run form rules ----------------------------------------------------------------------------
+  // devices: [{spec, checked, runnable, cpu}]; dismissed: the spec the user unticked after it was
+  // ticked for them (never ticked again). The CPU device to tick, else null.
+  function cpuReference(devices, dismissed) {
+    var ticked = (devices || []).filter(function (d) { return d.checked; });
+    if (ticked.length < 2 || ticked.some(function (d) { return d.cpu; })) return null;
+    var cpus = devices.filter(function (d) { return d.cpu && d.runnable && d.spec !== dismissed; });
+    var pick = null;
+    cpus.forEach(function (d) { if (!pick || (d.spec.indexOf("openvino:") === 0 && pick.spec.indexOf("openvino:") !== 0)) pick = d; });
+    return pick ? pick.spec : null;
+  }
+  // o: {models: [name], devices: [spec], timing: {model: {device: ms per image}}, images (total per
+  // run, after the per-set limit), repeat, warmup}. The warm-up lasts 2 to 20 s once on.
+  function estimate(o) {
+    var total = 0, known = 0, pairs = (o.models || []).length * (o.devices || []).length;
+    var repeat = Math.max(1, o.repeat || 1), warmup = Math.max(0, o.warmup || 0), n = o.images || 0;
+    (o.models || []).forEach(function (m) {
+      var t = (o.timing || {})[m] || {};
+      (o.devices || []).forEach(function (d) {
+        var per = null;
+        Object.keys(t).forEach(function (k) { if (sameDevice(k, d)) per = t[k]; });
+        if (!has(per) || !(per > 0) || !n) return;
+        var warm = warmup > 0 ? Math.min(20, Math.max(2, warmup * per / 1000)) : 0;
+        total += warm + repeat * n * per / 1000; known++;
+      });
+    });
+    return {seconds: known ? total : null, known: known, pairs: pairs};
+  }
+
+  // ---- old addresses ---------------------------------------------------------------------------
+  var OLD = {
+    "tab-compare": "compare", "tab-run": "run", "tab-tune": "tune", "tab-history": "history",
+    "tab-details": "compare", "tab-overview": "tune", "tab-results": "tune", "tab-profiles": "tune",
+    "tab-apply": "tune", "tune-apply": "tune", "goal": "tune", "tab-advanced": "compare",
+    "tab-confidence": "tune", "adv-confidence": "tune", "search-card": "tune", "tab-models": "compare",
+    "adv-details": "compare", "adv-compare": "compare", "adv-history": "history", "cmp-runs": "history",
+    "adv-report": "compare"
+  };
+  function mapHash(hash) {
+    var h = String(hash || "").replace(/^#/, "");
+    if (!h) return null;
+    if (OLD[h]) return "/benchmark/" + OLD[h];
+    var m = /^(m|d)-(.+)$/.exec(h);
+    if (!m) return null;
+    var name;
+    try { name = decodeURIComponent(m[2]); } catch (e) { return null; }
+    return (m[1] === "m" ? "/benchmark/tune?model=" : "/benchmark/compare?model=") + encodeURIComponent(name);
+  }
+
+  // ---- images ----------------------------------------------------------------------------------
+  // a, b: frames ({set, file, missed, falsePositives}) of two combos; the frames of `a` on which
+  // they disagree, each with `other` = b's frame.
+  function disagree(a, b) {
+    var byKey = {};
+    (b || []).forEach(function (f) { byKey[f.set + "\u0000" + f.file] = f; });
+    return (a || []).filter(function (f) {
+      var o = byKey[f.set + "\u0000" + f.file]; if (!o) return false;
+      return (f.missed > 0) !== (o.missed > 0) || (f.falsePositives > 0) !== (o.falsePositives > 0);
+    }).map(function (f) { return Object.assign({}, f, {other: byKey[f.set + "\u0000" + f.file]}); });
+  }
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function boxRect(b, w, h) {
+    if (!b || !(w > 0) || !(h > 0)) return null;
+    var x1 = clamp(Math.min(b[0], b[2]), 0, w), x2 = clamp(Math.max(b[0], b[2]), 0, w), y1 = clamp(Math.min(b[1], b[3]), 0, h), y2 = clamp(Math.max(b[1], b[3]), 0, h);
+    var r = function (v) { return Math.round(v * 1000) / 1000; };
+    return {left: r(x1 / w * 100), top: r(y1 / h * 100), width: r((x2 - x1) / w * 100), height: r((y2 - y1) / h * 100)};
+  }
+
+  // ---- CSV -------------------------------------------------------------------------------------
+  function csvCell(v) { var s = has(v) ? String(v) : ""; return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+  function compareCsv(view) {
+    var goal = (view && view.goal) || {}, rows = (view && view.rows) || [];
+    var head = ["rank", "model", "device", goal.metric || "metric", "low", "high", "recall", "precision", "f1", "f2", "f05", "fa_per_100_empty", "confidence", "ap50", "ap50_95", "roc_auc", "p50_ms", "p95_ms", "p99_ms", "flags"];
+    var lines = [head.join(",")];
+    rows.forEach(function (r) {
+      var m = r.metric || {}, s = r.speed || {};
+      var flags = rowChips(r).map(function (c) { return c.text; }).join("; ");
+      lines.push([r.block === "ok" ? r.rank : "", r.model, r.device, m.value, m.low, m.high, r.recall, r.precision, r.f1, r.f2, r.f05, r.fa100, r.confidence, r.ap50, r.ap5095, r.rocAuc, s.p50Ms, s.p95Ms, s.p99Ms, flags].map(csvCell).join(","));
+    });
+    return lines.join("\r\n") + "\r\n";
+  }
+
+  // Where each point's number goes so none covers another number or a point: items [{x, y, text}]
+  // (px, the point's centre), tried above, below, right, left, then the corners, a step further
+  // out each round; the first free spot wins (else above). Returns [{x, y, anchor}] (`y` is the
+  // text's baseline). `r`: the point's radius; `w`: width per character; `h`: the text's height.
+  function placeLabels(items, o) {
+    o = o || {}; var r = o.r || 7, cw = o.w || 7, h = o.h || 11, gap = 3;
+    var boxes = items.map(function (p) { return {x1: p.x - r, x2: p.x + r, y1: p.y - r, y2: p.y + r}; });
+    function hit(b) { return boxes.some(function (q) { return b.x1 < q.x2 && b.x2 > q.x1 && b.y1 < q.y2 && b.y2 > q.y1; }); }
+    return items.map(function (p) {
+      var w = String(p.text).length * cw, pick = null;
+      for (var k = 0; k < 3 && !pick; k++) {
+        var d = r + gap + k * (h + gap);
+        var tries = [[0, -d, "middle"], [0, d + h, "middle"], [d, h / 2 - 1, "start"], [-d, h / 2 - 1, "end"], [d, -d, "start"], [-d, -d, "end"], [d, d + h, "start"], [-d, d + h, "end"]];
+        for (var i = 0; i < tries.length; i++) {
+          var t = tries[i], x = p.x + t[0], y = p.y + t[1];
+          var x1 = t[2] === "middle" ? x - w / 2 : t[2] === "start" ? x : x - w;
+          var b = {x1: x1, x2: x1 + w, y1: y - h, y2: y};
+          if (!hit(b)) { pick = {x: x, y: y, anchor: t[2]}; boxes.push(b); break; }
+        }
+      }
+      return pick || {x: p.x, y: p.y - r - gap, anchor: "middle"};
+    });
+  }
+
+  // The equally good range of a pick ([first, last]): "0.20–0.24", or null when it is one value.
+  function rangeText(p) {
+    if (!p || !has(p[0]) || !has(p[1])) return null;
+    var a = fmt.n2(p[0]), b = fmt.n2(p[1]);
+    return a === b ? null : a + "–" + b;
+  }
+  function cellTag(k) { return String(k).indexOf("heldout:cam:") === 0 || String(k).indexOf("heldout:camscene:") === 0; }
+
+  // ---- the run poll ----------------------------------------------------------------------------
+  function runUri(modelsTag) {
+    return "/v1/benchmark?only=run" + (modelsTag ? "&models=" + encodeURIComponent(modelsTag) : "");
+  }
+  // last: {viewTag, modelsTag, models, running} (null: first poll); s: the answer. Returns
+  // {error} (not an answer), {refetch} (the models were left out under a tag the page does not
+  // have: ask again without one) or {running, state, run (models filled in), models, modelsTag,
+  // viewTag, viewChanged (the saved results or the config changed: reload the page's view),
+  // ended (a run just finished), started, labelsChanged}.
+  function step(last, s) {
+    if (!s || typeof s !== "object" || s.success === false || s.viewTag === undefined) return {error: true};
+    var run = s.run || {}, models = run.models;
+    if (models === undefined) {
+      if (!last || !last.modelsTag || last.modelsTag !== s.modelsTag) return {refetch: true};
+      models = last.models || [];
+    }
+    var wasRunning = !!(last && last.running);
+    return {
+      running: !!s.running, state: s.state, run: Object.assign({}, run, {models: models}), models: models,
+      modelsTag: s.modelsTag || null, viewTag: s.viewTag || null,
+      viewChanged: !!(last && last.viewTag && s.viewTag && last.viewTag !== s.viewTag),
+      ended: wasRunning && !s.running, started: !!last && !wasRunning && !!s.running,
+      labelsChanged: s.labelsChanged === undefined ? null : s.labelsChanged
+    };
+  }
+
+  // ---- glossary --------------------------------------------------------------------------------
+  var TERMS = {
+    oof: "Cross-validated: the confidence is picked on the other camera days (single images on public sets) and counted on the frames it never saw, so the number holds on new frames.",
+    ci: "± is the 95% interval of a cluster bootstrap over camera days: the range the true value is likely in.",
+    rank: "Rows that share a rank are not clearly different: the 95% interval of their paired difference includes zero.",
+    fa100: "False alerts per 100 empty frames: frames with no labelled object of the counted classes on which the model reports one.",
+    confidence: "The suggested confidence for this model on this device: the pick on every frame for your goal. 0.34 = 34% in Blue Iris.",
+    p95: "95th percentile of the whole request (decode, prepare, inference, post) one image at a time: 19 in 20 frames are this fast or faster.",
+    recall: "Share of the labelled objects found at the confidence shown.",
+    precision: "Share of the detections that were a labelled object at the confidence shown.",
+    f1: "Precision and recall with equal weight.", f2: "Recall counts more than precision: fewer missed objects.", f05: "Precision counts more than recall: fewer false alerts.",
+    ap50: "Average precision over every confidence, a box counting at IoU 0.5.", ap50_95: "Average precision over IoU 0.5 to 0.95: rewards tight boxes too.",
+    roc_auc: "How well a frame's top confidence separates frames with an object from empty ones (0.5 = chance).",
+    first_load: "Compile (or cache load) plus warm-up of this model on this device when it starts.",
+    cpu: "Detections compared image by image with the CPU device's, at this device's served confidence: catches a broken device path.",
+    burst: "p95 under a burst of cameras triggering together (the burst test).",
+    low_confidence: "Too little data to cross-validate (fewer than 4 camera days or 50 labelled objects): the figures are in-sample and the interval is wide."
+  };
+  function tipText(k) { return TERMS[k] || ""; }
+
+  var store = {
+    get: function (k, dflt) { try { var v = root.localStorage.getItem("prism.bench." + k); return v === null ? dflt : JSON.parse(v); } catch (e) { return dflt; } },
+    set: function (k, v) { try { root.localStorage.setItem("prism.bench." + k, JSON.stringify(v)); } catch (e) { /* no storage: the choice lasts for this page */ } }
+  };
+
+  root.BenchCore = {
+    has: has, fmt: fmt, GOALS: GOALS, TUNE_FOR: TUNE_FOR, goalOf: goalOf, parseGoal: parseGoal, goalSpec: goalSpec,
+    targetProblem: targetProblem, goalPairs: goalPairs, encodePairs: encodePairs, tryParams: tryParams, withTry: withTry,
+    withoutTry: withoutTry, rowChips: rowChips, COLUMNS: COLUMNS, columnsOf: columnsOf, columnsText: columnsText,
+    columnValue: columnValue, agreementText: agreementText, loadText: loadText, firstLoadText: firstLoadText, comboStates: comboStates,
+    sameDevice: sameDevice, cpuReference: cpuReference, estimate: estimate, mapHash: mapHash, disagree: disagree,
+    boxRect: boxRect, compareCsv: compareCsv, rangeText: rangeText, placeLabels: placeLabels, cellTag: cellTag, TERMS: TERMS, store: store
+  };
+  root.BenchTags = {cellTag: cellTag};
+  root.BenchPoll = {runUri: runUri, step: step};
+  var PB = root.PrismBench = root.PrismBench || {};
+  PB.tipText = tipText; PB.has = has;
+  PB.fmt = {thr: fmt.n2, ms: fmt.ms, pct: function (v) { return fmt.pct(v); }};
+
+  // ---- document helpers (called in a browser only) -----------------------------------------------
+  // el(tag, cls, text) or el(tag, {attr: value, text, class}, children).
+  PB.el = function (tag, a, b) {
+    var e = document.createElement(tag);
+    if (a && typeof a === "object") {
+      Object.keys(a).forEach(function (k) {
+        var v = a[k];
+        if (v === null || v === undefined || v === false) return;
+        if (k === "text") e.textContent = v; else if (k === "class") e.className = v; else e.setAttribute(k, v === true ? "" : v);
+      });
+      (b || []).forEach(function (c) { if (c !== null && c !== undefined && c !== false) e.appendChild(typeof c === "object" ? c : document.createTextNode(String(c))); });
+    } else {
+      if (a) e.className = a;
+      if (b !== undefined && b !== null) e.textContent = b;
+    }
+    return e;
+  };
+  // A `button.term` with a tooltip (PrismTip): `key` from TERMS, else `text` itself.
+  PB.term = function (label, keyOrText) {
+    var b = document.createElement("button"); b.type = "button"; b.className = "term";
+    b.textContent = label;
+    if (TERMS[keyOrText]) b.setAttribute("data-term", keyOrText); else b.setAttribute("data-tip", keyOrText);
+    b.setAttribute("aria-expanded", "false");
+    return b;
+  };
+  function why(r) {
+    return r.status === 403 ? " (refused: admin actions must come from this server's own HTTPS pages)" : r.status === 404 ? "" : r.status >= 500 ? " (see the Logs page)" : "";
+  }
+  function answer(r) {
+    return r.json().then(function (j) { if (j && typeof j === "object") j._status = r.status; return j; }, function () {
+      return {success: false, _status: r.status, message: "The server answered HTTP " + r.status + why(r) + "."};
+    });
+  }
+  function offline() { return {success: false, _status: 0, message: "No answer from the server: check that it is running, then try again."}; }
+  PB.post = function (url, body) {
+    return fetch(url, {method: "POST", body: body, headers: {"Accept": "application/json"}}).then(answer, offline);
+  };
+  PB.getJSON = function (url, init) {
+    return fetch(url, Object.assign({cache: "no-store", headers: {"Accept": "application/json"}}, init || {})).then(answer, function (e) {
+      if (e && e.name === "AbortError") return {success: false, aborted: true, _status: 0, message: "cancelled"};
+      return offline();
+    });
+  };
+})(typeof globalThis !== "undefined" ? globalThis : window);

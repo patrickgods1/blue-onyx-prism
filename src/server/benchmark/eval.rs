@@ -7,8 +7,8 @@
 //! - `GET /v1/benchmark/tune?model=&device=&set=&goal=&tune_for=&classes=`: one combo's 0.01
 //!   grid, suggested pick, interval, targets and the saved value
 //!   ([`crate::benchmark::eval::tune`]);
-//! - `GET /v1/benchmark/tune/images?model=&device=&set=&threshold=&kind=miss|fa&limit=`: the
-//!   frames for the Tune strips, worst first;
+//! - `GET /v1/benchmark/tune/images?model=&device=&set=&threshold=&kind=miss|fa|all&camera=
+//!   &scene=&offset=&limit=`: the frames for the Tune strips and the Images page, worst first;
 //! - `POST /v1/benchmark/goal` (form: `optimize_for` (or `goal`), `tune_for`, `classes`,
 //!   `speed_budget_ms` (or `budget`); absent = unchanged, `classes=all` / `budget=none` clear):
 //!   validates and saves `benchmark.goal` through `save_config`, answers the new ranking.
@@ -19,9 +19,9 @@
 //! not recompute.
 
 use super::{ApiError, file_stamp, json_error};
+use crate::benchmark::combos::{Inputs, Parts};
 use crate::benchmark::current::ModelNow;
 use crate::benchmark::eval::{Goal, compare, tune};
-use crate::benchmark::lineup::{Inputs, Parts};
 use crate::benchmark::search::{CACHE_IDLE, StoredPreds, preds_path};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::Config;
@@ -80,7 +80,7 @@ impl ViewCache {
 
 static VIEWS: ViewCache = ViewCache::new();
 
-/// The saved results seen through the config now, the stored predictions and what the lineup
+/// The saved results seen through the config now, the stored predictions and what the combos
 /// reads of the config.
 pub(super) struct Loaded {
     pub(super) results: BenchmarkResults,
@@ -139,12 +139,10 @@ impl Loaded {
         set: Option<&str>,
         scene: Option<&str>,
     ) -> compare::CompareView {
-        let history = crate::benchmark::history::History::default();
         let default_model = crate::training::switch::current_default(&self.cfg);
         let inputs = Inputs {
             results: &self.results,
             preds: Some(&self.preds),
-            history: &history,
             now: &self.now,
             default_model: default_model.as_deref(),
             configured: &self.parts.configured,
@@ -352,9 +350,22 @@ fn tune_images_blocking(
             .clamp(1, IMAGES_MAX),
         None => IMAGES_DEFAULT,
     };
+    let offset = match q(m, "offset") {
+        Some(v) => v
+            .parse::<usize>()
+            .map_err(|_| bad("offset: not a whole number".into()))?,
+        None => 0,
+    };
+    let camera = q(m, "camera").filter(|c| *c != "all").map(str::to_string);
+    let scene = q(m, "scene").filter(|s| *s != "all").map(str::to_string);
+    if let Some(s) = &scene
+        && !compare::SCENES.contains(&s.as_str())
+    {
+        return Err(bad(format!("scene '{s}': use all, day, night or ir")));
+    }
     let goal = goal_of(&cfg, m)?;
     let key = format!(
-        "images|{}|{}|{}|{device:?}|{set:?}|{threshold}|{kind:?}|{limit}",
+        "images|{}|{}|{}|{device:?}|{set:?}|{threshold}|{kind:?}|{limit}|{offset}|{camera:?}|{scene:?}",
         stamp_of(state, revision),
         goal.key(),
         tune::key_of(&model)
@@ -364,13 +375,18 @@ fn tune_images_blocking(
         let ex = tune::images(
             &l.results,
             &l.preds,
-            &model,
-            device.as_deref(),
-            set.as_deref(),
-            &goal,
-            threshold,
-            kind,
-            limit,
+            tune::ImagesRequest {
+                model: &model,
+                device: device.as_deref(),
+                set: set.as_deref(),
+                goal: &goal,
+                threshold,
+                kind,
+                camera: camera.as_deref(),
+                scene: scene.as_deref(),
+                offset,
+                limit,
+            },
         )
         .map_err(|e| ApiError::new(StatusCode::NOT_FOUND, format!("{e:#}")))?;
         Ok(serde_json::json!({ "success": true, "images": ex }))

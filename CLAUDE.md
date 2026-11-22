@@ -398,10 +398,17 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   (preds in `benchmark-preds.json`).
   - `history/`: `benchmark-history.json` (recent runs per model + one pinned baseline; failed runs never recorded); pure
     `comparable` / `compare` / `trust` with the noise rules as named constants in `history/compare.rs`.
-  - `lineup/`: models side by side on exactly the same images, rescored on shared classes; `comparable_models` is the
-    model-vs-model rule; a set with training frames is left out of "best" (`trained_on.rs`).
+  - `combos/`: which model x device combos hold each image set and on which fair frames (left-out frames, missing
+    models, trained share via `trained_on.rs`), for Compare.
+  - `eval/` (pure): `benchmark.goal`, cross-validation over camera-day groups, Wilson bounds for targets, cluster and
+    paired bootstrap (fixed seed), rank groups, speed budget; `compare.rs` / `tune.rs` build `GET /v1/benchmark/compare`
+    and `/tune`; `tune::suggestions` is the one rule every save uses (page, `apply all`, `--apply-threshold`).
+  - Threshold picks: exact on the 0.01 grid (`threshold.rs`); "As served" results (`<model>+served`, `served.rs`,
+    `variant.rs`) carry per-box threshold windows so filters and verifiers stay exact; `cameras/` is the "Your cameras"
+    set (reviewed frames, read-only, `benchmark-gt.json` snapshot, rescore).
   - Profiles: `POST /v1/benchmark/apply-profiles` / `--apply-threshold` save `device_thresholds`. Re-ranking saved
-    results: `benchmark/rescore.rs`.
+    results: `benchmark/rescore.rs`. Pages: `/benchmark/{run,compare,tune,history,images}` (`server/benchmark/pages.rs`,
+    `templates/benchmark/`, `assets/bench-*.js`; pure logic in `bench-core.js`, node-tested in `tests/it/js_bench.rs`).
   - A benchmark runs each model's own device by default; a sweep over two or more GPU devices needs `--confirm-gpus` / `confirm_gpus=1` (a sweep has hung a machine; a
     queue job refuses it); `benchmark-breadcrumb.json` names the last device after a hang.
 

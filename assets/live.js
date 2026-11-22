@@ -46,7 +46,7 @@
 // (PrismLive.view.busy defers a re-render of a section holding one). Not `:hover`, which a tap
 // leaves set on iOS until the next tap elsewhere, so a tapped chart froze its section.
 // PrismTip: the one tooltip bubble of every page for `button.term` (text in `data-tip`, or a
-// Benchmark glossary key in `data-term`): shown while a mouse is over it or it has keyboard
+// Benchmark glossary key in `data-term`, bench-core.js): shown while a mouse is over it or it has keyboard
 // focus, kept open by a click / tap until a tap elsewhere or Esc.
 (function (root) {
   "use strict";
@@ -669,8 +669,9 @@
   }
   function afterRestart() { waitRestart(last ? last.generation : null, last ? last.epoch : null); }
   // Restart (existing POST /config/restart flow), then reload once the next generation answers.
-  function restart(btn) {
-    if (!confirm("Restart the server now? It reloads the config file and recompiles the enabled models.")) return;
+  // `opts.confirmed`: the page asked in its own words already (the Benchmark pages ask in the page).
+  function restart(btn, opts) {
+    if (!(opts && opts.confirmed) && !confirm("Restart the server now? It reloads the config file and recompiles the enabled models.")) return;
     var gen = last ? last.generation : null, epoch = last ? last.epoch : null;
     if (btn) { if (btn.dataset.label === undefined) btn.dataset.label = btn.textContent; btn.disabled = true; btn.textContent = "Restarting…"; }
     restarting();
@@ -1095,7 +1096,7 @@
   // iOS turns the first tap on an element whose mouseover changes the page into a hover only, so
   // the tap never pinned the bubble. The listeners are delegated on the document in the capture
   // phase, so a term inside a sortable header never reaches the header's click / Enter / Space
-  // handlers. Text: `data-tip`, else the Benchmark glossary entry `data-term` (bench-glossary.js).
+  // handlers. Text: `data-tip`, else the Benchmark glossary entry `data-term` (bench-core.js TERMS).
   var tipBubble = null, tipAnchor = null, tipAnchorId = null, tipPinned = false, tipQuiet = null;
   function ensureBubble() {
     if (tipBubble) return tipBubble;

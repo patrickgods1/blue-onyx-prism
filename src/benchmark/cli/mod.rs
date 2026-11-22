@@ -1061,7 +1061,16 @@ impl RunCtx<'_> {
             report.applied = self.apply_devices(&plain)?;
         }
         if args.apply_threshold {
-            report.applied_thresholds = apply_thresholds(&plain, self.config_path, args.json)?;
+            let preds = crate::benchmark::search::StoredPreds::merge(None, &merged, swept);
+            let names: Vec<String> = plain.iter().map(|m| m.model.clone()).collect();
+            let suggested = crate::benchmark::eval::tune::suggestions(
+                &merged,
+                &preds,
+                self.goal,
+                self.weights,
+                Some(&names),
+            );
+            report.applied_thresholds = apply_thresholds(&suggested, self.config_path, args.json)?;
         }
         if let Some(out) = &args.report {
             self.write_report(&merged, swept, out)?;
@@ -1234,7 +1243,7 @@ impl RunCtx<'_> {
 }
 
 /// The Compare view of `results` on its default set (pure but for the config's training
-/// records and model files, [`crate::benchmark::lineup::Parts`]).
+/// records and model files, [`crate::benchmark::combos::Parts`]).
 pub(crate) fn compare_view(
     config: &Config,
     results: &BenchmarkResults,
@@ -1243,14 +1252,12 @@ pub(crate) fn compare_view(
     goal: &crate::benchmark::eval::Goal,
     weights: crate::benchmark::grade::Weights,
 ) -> crate::benchmark::eval::compare::CompareView {
-    use crate::benchmark::lineup::{Inputs, Parts};
+    use crate::benchmark::combos::{Inputs, Parts};
     let parts = Parts::of(results, config);
-    let history = crate::benchmark::history::History::seeded(Some(results));
     let default_model = crate::training::switch::current_default(config);
     let inputs = Inputs {
         results,
         preds: Some(preds),
-        history: &history,
         now,
         default_model: default_model.as_deref(),
         configured: &parts.configured,
@@ -1354,27 +1361,28 @@ fn search_request(args: &BenchArgs, config: &Config) -> crate::benchmark::search
     }
 }
 
-/// `--apply-threshold`: write the best threshold of every device each config model of `swept`
-/// ran on into its confidence profiles (`device_thresholds`, [`apply_device_thresholds`]); the
-/// model's `confidence_threshold` is left alone. Prints one line per model and device.
+/// `--apply-threshold`: write the suggested confidence of every device each config model ran on
+/// (`suggested`, [`crate::benchmark::eval::tune::suggestions`]: the Tune view's cross-validated
+/// pick for the run's goal, the same rule as the web UI's Save all) into its confidence profiles
+/// (`device_thresholds`, [`apply_device_thresholds`]); the model's `confidence_threshold` is left
+/// alone. A pick that must not be saved (pseudo labels, a target not met on its bound, a flat
+/// curve) is left alone and named; a low-confidence one is written (the command asked for it) and
+/// marked. Prints one line per model and device.
 fn apply_thresholds(
-    swept: &[ModelResult],
+    suggested: &[crate::benchmark::eval::tune::Suggested],
     config_path: &Path,
     quiet: bool,
 ) -> Result<Vec<ProfileChange>> {
     let mut cfg = Config::load(config_path)?;
     // Results may name models that are not configured (--model files): skip those.
-    let configured: Vec<&ModelResult> = swept
+    let configured: Vec<&crate::benchmark::eval::tune::Suggested> = suggested
         .iter()
-        .filter(|m| crate::benchmark::find_model(&cfg, &m.model).is_some())
+        .filter(|s| crate::benchmark::find_model(&cfg, &s.model).is_some())
         .collect();
     let entries: Vec<(String, String, Option<f32>)> = configured
         .iter()
-        .filter_map(|m| Some((m, m.threshold.as_ref()?.device_apply_values())))
-        .flat_map(|(m, v)| {
-            v.into_iter()
-                .map(move |(d, t)| (m.model.clone(), d, Some(t)))
-        })
+        .filter(|s| s.refusal.is_none())
+        .filter_map(|s| Some((s.model.clone(), s.device.clone(), Some(s.threshold?))))
         .collect();
     let changes = apply_device_thresholds(&mut cfg, &entries)?;
     if !changes.is_empty() {
@@ -1394,39 +1402,25 @@ fn apply_thresholds(
                 config_path.display()
             );
         }
-        for m in &configured {
-            let Some(a) = &m.threshold else {
-                println!("  {}: unchanged (no threshold curve)", m.model);
-                continue;
-            };
-            for d in &m.devices {
-                let changed = changes.iter().find(|c| {
-                    crate::registry::normalize_name(&c.model)
-                        == crate::registry::normalize_name(&m.model)
-                        && crate::config::same_device(&c.device, &d.device)
-                });
-                match (changed, a.apply_value_on(&d.device)) {
-                    (Some(c), _) => println!("  {}", c.describe()),
-                    (None, Some(t)) => {
-                        println!("  {} on {}: {t:.2} (unchanged)", m.model, d.device)
-                    }
-                    (None, None) => println!(
-                        "  {} on {}: unchanged ({})",
-                        m.model,
-                        d.device,
-                        a.by_device
-                            .iter()
-                            .find(|p| crate::config::same_device(&p.device, &d.device))
-                            .and_then(|p| p.best.as_ref())
-                            .and_then(|b| {
-                                if b.relative || a.relative {
-                                    Some(crate::benchmark::threshold::NOT_ON_LABELS.to_string())
-                                } else {
-                                    b.note.clone()
-                                }
-                            })
-                            .unwrap_or_else(|| "no usable threshold".into())
-                    ),
+        for s in &configured {
+            let changed = changes.iter().find(|c| {
+                crate::registry::normalize_name(&c.model)
+                    == crate::registry::normalize_name(&s.model)
+                    && crate::config::same_device(&c.device, &s.device)
+            });
+            let low = s
+                .low_confidence
+                .as_ref()
+                .map(|l| format!(" ({l})"))
+                .unwrap_or_default();
+            match (changed, s.threshold, &s.refusal) {
+                (_, _, Some(r)) => println!("  {} on {}: unchanged ({r})", s.model, s.device),
+                (Some(c), _, None) => println!("  {}{low}", c.describe()),
+                (None, Some(t), None) => {
+                    println!("  {} on {}: {t:.2} (unchanged){low}", s.model, s.device)
+                }
+                (None, None, None) => {
+                    println!("  {} on {}: unchanged (no suggestion)", s.model, s.device)
                 }
             }
         }
@@ -1775,13 +1769,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// `--apply-threshold` writes the suggestions (the Tune view's picks, the web UI's rule) of
+    /// the configured models into their profiles; an unsavable one stays as it was.
     #[test]
-    fn apply_thresholds_writes_the_config() {
+    fn apply_thresholds_writes_the_suggestions() {
+        use crate::benchmark::eval::tune::{Suggested, suggestions};
         let dir = std::env::temp_dir().join(format!("bop-bthr-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cfg.json");
         let cfg = Config {
-            models: ["a", "b"]
+            models: ["ipcam-general", "dfine-s"]
                 .iter()
                 .map(|n| ModelConfig {
                     name: Some(n.to_string()),
@@ -1792,62 +1789,46 @@ mod tests {
             ..Default::default()
         };
         cfg.save(&path).unwrap();
-        // Advice with one best per device: CPU 0.31, CoreML 0.27, GPU not applicable.
-        let mk = |name: &str, t: Option<f32>| {
-            let mut m = ModelResult::failed(name, "", String::new());
-            m.threshold = t.map(|t| {
-                let mut a = crate::benchmark::threshold::test_advice(t);
-                let pick = |t: f32, met: bool| {
-                    let mut p = a.best.clone().unwrap();
-                    p.threshold = t;
-                    p.met = met;
-                    Some(p)
-                };
-                a.by_device = vec![
-                    crate::benchmark::threshold::DevicePick {
-                        device: "openvino:cpu".into(),
-                        best: pick(t, true),
-                    },
-                    crate::benchmark::threshold::DevicePick {
-                        device: "ort:coreml".into(),
-                        best: pick(0.27, true),
-                    },
-                    crate::benchmark::threshold::DevicePick {
-                        device: "openvino:gpu".into(),
-                        best: pick(0.6, false),
-                    },
-                ];
-                a
-            });
-            m
-        };
-        let swept = [mk("a", Some(0.31)), mk("b", None), mk("c.onnx", Some(0.2))];
-        let changes = apply_thresholds(&swept, &path, true).unwrap();
+        let (results, preds) = crate::benchmark::eval::tests::fixture(10, 10);
+        let goal = crate::benchmark::eval::Goal::default();
+        let mut s = suggestions(&results, &preds, &goal, Default::default(), None);
+        assert_eq!(s.len(), 3, "every stored combo");
+        assert!(
+            s.iter()
+                .all(|x| x.threshold.is_some() && x.refusal.is_none()),
+            "{s:?}"
+        );
+        // One the page would refuse, and one of a model that is not configured.
+        s[2].refusal = Some("not savable: a flat curve".into());
+        s.push(Suggested {
+            model: "removed".into(),
+            device: "ort:cpu".into(),
+            threshold: Some(0.4),
+            refusal: None,
+            low_confidence: None,
+            recommended: true,
+        });
+        let changes = apply_thresholds(&s, &path, true).unwrap();
+        let want: Vec<(String, String, Option<f32>, Option<f32>)> = s[..2]
+            .iter()
+            .map(|x| (x.model.clone(), x.device.clone(), None, x.threshold))
+            .collect();
         assert_eq!(
             changes
                 .iter()
-                .map(|c| (c.model.as_str(), c.device.as_str(), c.from, c.to))
+                .map(|c| (c.model.clone(), c.device.clone(), c.from, c.to))
                 .collect::<Vec<_>>(),
-            [
-                ("a", "openvino:cpu", None, Some(0.31)),
-                ("a", "ort:coreml", None, Some(0.27))
-            ]
+            want
         );
         let saved = Config::load(&path).unwrap();
-        assert_eq!(
-            saved.models[0].device_thresholds,
-            [
-                ("openvino:cpu".to_string(), 0.31),
-                ("ort:coreml".to_string(), 0.27)
-            ]
-            .into()
+        assert_eq!(saved.models[0].device_thresholds.len(), 2);
+        assert!(
+            saved.models[1].device_thresholds.is_empty(),
+            "refused: unchanged"
         );
-        // The model thresholds (devices without a profile) are unchanged.
         assert_eq!(saved.models[0].confidence_threshold, None);
-        assert_eq!(saved.models[1].confidence_threshold, None);
-        assert!(saved.models[1].device_thresholds.is_empty());
         // Again: nothing to change (and printing works).
-        assert!(apply_thresholds(&swept, &path, false).unwrap().is_empty());
+        assert!(apply_thresholds(&s, &path, false).unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -57,13 +57,15 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("live.js", JS),
     asset!("time.js", JS),
     asset!("sort.js", JS),
-    asset!("bench-glossary.js", JS),
-    asset!("bench-table.js", JS),
+    asset!("bench-core.js", JS),
     asset!("bench-charts.js", JS),
+    asset!("bench-shell.js", JS),
+    asset!("bench-frames.js", JS),
+    asset!("bench-run.js", JS),
     asset!("bench-compare.js", JS),
-    asset!("bench-lineup.js", JS),
-    asset!("bench-profiles.js", JS),
-    asset!("benchmark.js", JS),
+    asset!("bench-tune.js", JS),
+    asset!("bench-history.js", JS),
+    asset!("bench-images.js", JS),
     asset!("config.js", JS),
     asset!("logs.js", JS),
     asset!("stats.js", JS),
@@ -1238,7 +1240,8 @@ mod tests {
         for name in [
             "live.js",
             "sort.js",
-            "benchmark.js",
+            "bench-core.js",
+            "bench-shell.js",
             "class-picker.js",
             "model-picker.js",
             "config.js",
@@ -1516,7 +1519,11 @@ mod tests {
             "/test",
             "/config",
             "/logs",
-            "/benchmark",
+            "/benchmark/run",
+            "/benchmark/compare",
+            "/benchmark/tune",
+            "/benchmark/history",
+            "/benchmark/images",
             "/train/collect",
             "/train/import",
             "/train/autolabel",
@@ -1855,7 +1862,13 @@ mod tests {
     #[tokio::test]
     async fn the_base_page_covers_the_screen_and_stays_zoomable() {
         let state = test_state();
-        for uri in ["/", "/config", "/train/review", "/benchmark", "/logs"] {
+        for uri in [
+            "/",
+            "/config",
+            "/train/review",
+            "/benchmark/compare",
+            "/logs",
+        ] {
             let (s, html) = get_text(&state, uri).await;
             assert_eq!(s, StatusCode::OK, "{uri}");
             assert!(
@@ -2056,7 +2069,7 @@ mod tests {
         for needle in [
             "height: calc(100vh - 1rem); height: calc(100dvh - 1rem);",
             "height: 65vh;\n  height: 65dvh;",
-            "max-height: 92vh; max-height: 92dvh;",
+            "max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px);",
             ".browse-list { max-height: 60vh; max-height: 60dvh;",
         ] {
             assert!(css.contains(needle), "{needle}");
@@ -2086,7 +2099,8 @@ mod tests {
         let state = test_state();
         for uri in [
             "/config",
-            "/benchmark",
+            "/benchmark/run",
+            "/benchmark/compare",
             "/train/review",
             "/train/dataset",
             "/train/collect",

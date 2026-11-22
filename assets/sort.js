@@ -31,7 +31,7 @@
 //   at its top (the Models tab's held-out groups: scores compare only inside one). Rows before the
 //   first "group" row are a section of their own.
 // - parseState(json): stored state, the current `[{col, dir}, ...]` or the Benchmark page's old
-//   `{col, dir}` (also inside `{sort: {col, dir}}`, as PrismBench.dataTable kept it), as a clean
+//   `{col, dir}`, as a clean
 //   list; null when there is nothing to use. serialize(keys) is its inverse.
 // - click(keys, col, shift, first): the keys after a click on `col` (Shift held or not; `first` is
 //   the column's first direction). describe(keys, label): "Sorted by X, descending, then by Y,
@@ -52,7 +52,7 @@
 // `button.term` there keeps its tooltip (PrismTip stops its clicks in the capture phase); `aria-sort`
 // on the first key's <th>; one polite status line announces each change. State per browser per
 // table: localStorage `prism.sort:<pathname>:<key>` (every access in try/catch: without storage the
-// choice lasts for the page), the Benchmark page's old `prism.bench.table:<key>` sort migrated once.
+// choice lasts for the page).
 // PrismSort.apply(table) re-applies it after a re-render (rows a render added get the next places of
 // the table's own order); PrismSort.state / restore carry it through PrismLive.view.capture /
 // restore.
@@ -92,7 +92,7 @@
   }
   // ---- a cell's text -------------------------------------------------------------------------
   var SKIP_TAGS = {SELECT: 1, OPTION: 1, TEXTAREA: 1, INPUT: 1, SCRIPT: 1, STYLE: 1, TEMPLATE: 1, DETAILS: 1, PROGRESS: 1, SVG: 1, CANVAS: 1, IMG: 1};
-  var SKIP_CLASS = /(^|\s)(sub|detail|tag|sr-only|visually-hidden|th-sort|lineup-sub|lineup-star|lineup-count)(\s|$)/;
+  var SKIP_CLASS = /(^|\s)(sub|detail|tag|sr-only|visually-hidden|th-sort)(\s|$)/;
   function classOf(n) {
     if (typeof n.className === "string") return n.className;
     return (n.getAttribute && n.getAttribute("class")) || "";
@@ -199,7 +199,6 @@
   function parseState(s) {
     var v = s;
     if (typeof s === "string") { try { v = JSON.parse(s); } catch (e) { return null; } }
-    if (v && typeof v === "object" && !Array.isArray(v) && Object.prototype.hasOwnProperty.call(v, "sort")) v = v.sort;
     if (v && typeof v === "object" && !Array.isArray(v)) v = [v];
     if (!Array.isArray(v)) return null;
     var out = clean(v);
@@ -249,7 +248,7 @@
   "use strict";
   if (typeof document === "undefined") return; // loaded by the node test for the pure part only
   var P = window.PrismSort;
-  var PREFIX = "prism.sort:", OLD_PREFIX = "prism.bench.table:";
+  var PREFIX = "prism.sort:";
 
   // ---- storage (every access in try/catch; undefined = no storage, null = nothing stored) ------
   function store() { try { return window.localStorage || null; } catch (e) { return null; } }
@@ -271,23 +270,6 @@
       return true;
     } catch (e) { return false; }
   }
-  // The Benchmark page's old per-table sort (`prism.bench.table:<key>` = {sort, q, ...}): moved
-  // once, and taken out of the old record so a later "Default order" stays default.
-  function migrate(key, defaults) {
-    try {
-      var s = store();
-      if (!s || s.getItem(storageKey(key)) !== null) return;
-      var raw = s.getItem(OLD_PREFIX + key);
-      if (raw === null || raw === undefined) return;
-      var keys = P.parseState(raw), obj = JSON.parse(raw);
-      if (keys && !P.same(keys, defaults)) s.setItem(storageKey(key), P.serialize(keys));
-      if (obj && typeof obj === "object" && !Array.isArray(obj) && Object.prototype.hasOwnProperty.call(obj, "sort")) {
-        delete obj.sort;
-        s.setItem(OLD_PREFIX + key, JSON.stringify(obj));
-      }
-    } catch (e) { /* nothing to move */ }
-  }
-
   // ---- cells ---------------------------------------------------------------------------------
   // A form control's value as the server last showed it (its default), so a row does not move
   // while the user edits it.
@@ -332,7 +314,7 @@
     (function walk(n) {
       Array.prototype.forEach.call(n.childNodes, function (c) {
         if (c.nodeType === 3) out.push(c.nodeValue);
-        else if (c.nodeType === 1 && !/(^|\s)(th-sort|tag|lineup-sub)(\s|$)/.test(c.getAttribute("class") || "")) walk(c);
+        else if (c.nodeType === 1 && !/(^|\s)(th-sort|tag)(\s|$)/.test(c.getAttribute("class") || "")) walk(c);
       });
     })(th);
     return out.join("").replace(/\s+/g, " ").trim();
@@ -583,7 +565,7 @@
       defaults: o.defaultKeys ? P.clean(o.defaultKeys) : P.parseDefault(table.getAttribute("data-sort-default")),
       columns: o.columns || {}, keys: null, cols: [], byCol: {}, index: {}, tools: null
     };
-    if (key) { migrate(key, S.defaults); var st = load(key); if (st) S.keys = P.same(st, S.defaults) ? null : st; }
+    if (key) { var st = load(key); if (st) S.keys = P.same(st, S.defaults) ? null : st; }
     apply(table);
     // Rows and the wrapper a builder adds right after attaching: sorted (and the tools placed) once
     // it is done.
