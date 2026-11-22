@@ -267,7 +267,10 @@ fn devices_for(
 }
 
 fn share_on(set: &CompareSet<'_>, m: &ModelResult, inputs: &Inputs<'_>) -> Option<f64> {
-    match inputs.trained.get(&normalize_name(&m.model)) {
+    match inputs
+        .trained
+        .get(&normalize_name(super::variant::base_name(&m.model)))
+    {
         Some(frames) => trained_on::share(set.images.iter().map(|i| i.info.file.as_str()), frames),
         None => m.trained_on_share,
     }

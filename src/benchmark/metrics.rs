@@ -39,6 +39,16 @@
 //! everything and keeping those at or above `t`. The same holds for the families' post-processing
 //! (see `Bench::time`): greedy NMS keeps or drops a box based only on more confident boxes, and
 //! the DETR top-Q selection keeps a prefix of the confidence order.
+//!
+//! A run with serving rules (`benchmark --served`, `--variants filters` / `verify:`) breaks that
+//! prefix: an overlap rule's evidence and the verifier's candidates are the boxes at the
+//! threshold, so a box can come back at a higher threshold (B2). Its predictions carry a
+//! [`Window`] ([`super::served`]: the thresholds at which the service returns them), every
+//! threshold test is [`PredBox::at`], and an image with windows is matched once per stretch of
+//! thresholds over which the same boxes are returned ([`SweepImage::with_iou`]); the sweep's
+//! steps add a prediction from its upper end and take it back below its lower one
+//! ([`Breakpoints::new`], [`super::roc::FrameSteps::of_spans`]). The threshold-free AP and ROC
+//! AUC of such a run rank every stored box by its confidence.
 
 use super::roc::{FrameRates, FrameSample, FrameSteps, frame_samples};
 use serde::{Deserialize, Serialize};
@@ -324,11 +334,73 @@ pub struct GtBox {
 }
 
 /// A prediction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PredBox {
     pub label: String,
     pub confidence: f32,
     pub bbox: BBox,
+    /// The thresholds at which the pipeline returns this box when that is not "confidence >=
+    /// threshold" (a run with serving rules, [`super::served`]); None for every plain run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<Window>,
+}
+
+impl PredBox {
+    /// Whether the pipeline returns this box at confidence threshold `t`: inside its
+    /// [`Window`] when it has one, else `confidence >= t`.
+    pub fn at(&self, t: f32) -> bool {
+        match self.window {
+            Some(w) => w.holds(t),
+            None => self.confidence >= t,
+        }
+    }
+
+    /// `(after, until)` of [`Self::at`]: returned at `t` exactly when `after < t <= until`.
+    pub fn span(&self) -> (f32, f32) {
+        match self.window {
+            Some(w) => (w.after, w.until),
+            None => (f32::NEG_INFINITY, self.confidence),
+        }
+    }
+}
+
+/// The confidence thresholds `t` with `after < t <= until` (serialized `[after, until]`): where
+/// a box of a run with serving rules is returned (B2). With overlap rules a box suppressed by a
+/// less confident one comes back once the threshold drops that one (`after` = its score); on a
+/// frame whose threshold does not follow the swept one (a night threshold, a night model) a
+/// box is returned at every threshold ([`Window::ALWAYS`]) or never (not stored).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(from = "[f32; 2]", into = "[f32; 2]")]
+pub struct Window {
+    pub after: f32,
+    pub until: f32,
+}
+
+impl Window {
+    /// Every threshold (they lie in (0, 1]).
+    pub const ALWAYS: Window = Window {
+        after: -1.0,
+        until: 2.0,
+    };
+
+    pub fn holds(&self, t: f32) -> bool {
+        self.after < t && t <= self.until
+    }
+}
+
+impl From<[f32; 2]> for Window {
+    fn from(v: [f32; 2]) -> Self {
+        Self {
+            after: v[0],
+            until: v[1],
+        }
+    }
+}
+
+impl From<Window> for [f32; 2] {
+    fn from(w: Window) -> Self {
+        [w.after, w.until]
+    }
 }
 
 /// COCO size bucket of a box.
@@ -865,7 +937,7 @@ impl AlertStats {
             let kept: Vec<PredBox> = img
                 .preds
                 .iter()
-                .filter(|p| p.confidence >= threshold && counted(&p.label))
+                .filter(|p| p.at(threshold) && counted(&p.label))
                 .cloned()
                 .collect();
             let gt: Vec<GtBox> = img
@@ -935,7 +1007,7 @@ pub fn image_counts(img: &EvalImage, threshold: f32) -> (Counts, Vec<PredBox>, I
     let kept: Vec<PredBox> = img
         .preds
         .iter()
-        .filter(|p| p.confidence >= threshold)
+        .filter(|p| p.at(threshold))
         .cloned()
         .collect();
     let m = match_image(&kept, &img.gt, 0.5);
@@ -1210,7 +1282,12 @@ impl FalseAlerts {
 /// A scored prediction after matching, for the threshold sweep.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SweepPred {
+    /// Counted at thresholds `t` with `after < t <= confidence`: a plain run's prediction at
+    /// every threshold up to its confidence (`after` = -inf); one of a run with serving rules
+    /// ([`PredBox::window`]) once per stretch of thresholds over which its outcome stays the
+    /// same ([`SweepImage::with_iou`]).
     pub confidence: f32,
+    pub after: f32,
     /// Scored class.
     pub class: String,
     pub tp: bool,
@@ -1239,7 +1316,7 @@ pub struct SweepImage {
 }
 
 /// One frame's alert sample in a scope ([`SweepImage::alert_sample`]).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AlertSample {
     /// The frame has a non-ignored object of a class in scope.
     pub positive: bool,
@@ -1248,6 +1325,10 @@ pub struct AlertSample {
     /// The highest confidence of its detections of a class in scope outside every ignore
     /// region (0 without one).
     pub score: f32,
+    /// The thresholds `t` at which the frame alerts, as disjoint `(after, until]` stretches
+    /// ascending: `[(-inf, score)]` for a plain run (it alerts exactly when `score >= t`), the
+    /// union of its predictions' stretches for a run with serving rules.
+    pub spans: Vec<(f32, f32)>,
 }
 
 impl SweepImage {
@@ -1257,28 +1338,34 @@ impl SweepImage {
         Self::with_iou(img, 0.5)
     }
 
-    /// [`SweepImage::of`] with matches at IoU >= `iou`.
+    /// [`SweepImage::of`] with matches at IoU >= `iou`. An image with windowed predictions (a
+    /// run with serving rules) is matched once per stretch of thresholds over which the same
+    /// boxes are returned ([`windowed_preds`]): greedy matching of what is returned there.
     pub fn with_iou(img: &EvalImage, iou: f32) -> Self {
-        let m = match_image(&img.preds, &img.gt, iou);
         let is_small = |b: &BBox| area(b) < SMALL_AREA;
-        let preds = img
-            .preds
-            .iter()
-            .zip(m.pred.iter().zip(&m.pred_gt))
-            .filter_map(|(p, (r, j))| {
-                let tp = (*r)?;
-                let small = match j {
-                    Some(j) => img.gt.get(*j).is_some_and(|g| is_small(&g.bbox)),
-                    None => is_small(&p.bbox),
-                };
-                Some(SweepPred {
-                    confidence: p.confidence,
-                    class: p.label.clone(),
-                    tp,
-                    small,
+        let preds = if img.preds.iter().any(|p| p.window.is_some()) {
+            windowed_preds(img, iou)
+        } else {
+            let m = match_image(&img.preds, &img.gt, iou);
+            img.preds
+                .iter()
+                .zip(m.pred.iter().zip(&m.pred_gt))
+                .filter_map(|(p, (r, j))| {
+                    let tp = (*r)?;
+                    let small = match j {
+                        Some(j) => img.gt.get(*j).is_some_and(|g| is_small(&g.bbox)),
+                        None => is_small(&p.bbox),
+                    };
+                    Some(SweepPred {
+                        confidence: p.confidence,
+                        after: f32::NEG_INFINITY,
+                        class: p.label.clone(),
+                        tp,
+                        small,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        };
         let mut ignored: Vec<String> = img
             .gt
             .iter()
@@ -1324,17 +1411,98 @@ impl SweepImage {
             return None;
         }
         let positive = self.gt.iter().any(|(c, _)| in_scope(c));
+        let mine = || self.preds.iter().filter(|p| in_scope(&p.class));
+        let spans = union_spans(mine().map(|p| (p.after, p.confidence)).collect());
         Some(AlertSample {
             positive,
             ignore_only: !positive && self.ignored.iter().any(|c| in_scope(c)),
-            score: self
-                .preds
-                .iter()
-                .filter(|p| in_scope(&p.class))
-                .map(|p| p.confidence)
-                .fold(0.0f32, f32::max),
+            score: mine().map(|p| p.confidence).fold(0.0f32, f32::max),
+            spans: if spans.is_empty() {
+                vec![(f32::NEG_INFINITY, 0.0)]
+            } else {
+                spans
+            },
         })
     }
+}
+
+/// The sweep predictions of an image with windowed predictions ([`PredBox::window`]). The
+/// returned boxes change only at their windows' ends, so between two consecutive ends
+/// (`(lower, t]`) the same boxes are returned at every threshold: they are matched as a
+/// run at `t` would match them ([`match_image`]), and each scored one counts on that stretch
+/// (extended over the stretches above while its outcome, TP or FP and small or not, stays the
+/// same). Exact at every threshold, not only on a grid.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "every index comes from enumerate() over the slice it indexes; `open` and `next`      have img.preds.len() entries, `out` indices come from its own pushes"
+)]
+fn windowed_preds(img: &EvalImage, iou: f32) -> Vec<SweepPred> {
+    let is_small = |b: &BBox| area(b) < SMALL_AREA;
+    let mut keys: Vec<f32> = img
+        .preds
+        .iter()
+        .flat_map(|p| {
+            let (a, u) = p.span();
+            [a, u]
+        })
+        .filter(|k| k.is_finite())
+        .collect();
+    keys.sort_by(f32::total_cmp);
+    keys.dedup();
+    let n = img.preds.len();
+    let mut out: Vec<SweepPred> = Vec::new();
+    // Per prediction: its entry on the stretch just below (index into `out`, TP, small).
+    let mut open: Vec<Option<(usize, bool, bool)>> = vec![None; n];
+    let mut lower = f32::NEG_INFINITY;
+    for &t in &keys {
+        let idx: Vec<usize> = (0..n).filter(|&i| img.preds[i].at(t)).collect();
+        let present: Vec<PredBox> = idx.iter().map(|&i| img.preds[i].clone()).collect();
+        let m = match_image(&present, &img.gt, iou);
+        let mut next: Vec<Option<(usize, bool, bool)>> = vec![None; n];
+        for (k, &i) in idx.iter().enumerate() {
+            let Some(tp) = m.pred[k] else {
+                continue;
+            };
+            let small = match m.pred_gt[k] {
+                Some(j) => img.gt.get(j).is_some_and(|g| is_small(&g.bbox)),
+                None => is_small(&present[k].bbox),
+            };
+            next[i] = Some(match open[i] {
+                Some((e, otp, osmall)) if otp == tp && osmall == small => {
+                    out[e].confidence = t;
+                    (e, tp, small)
+                }
+                _ => {
+                    out.push(SweepPred {
+                        confidence: t,
+                        after: lower,
+                        class: present[k].label.clone(),
+                        tp,
+                        small,
+                    });
+                    (out.len() - 1, tp, small)
+                }
+            });
+        }
+        open = next;
+        lower = t;
+    }
+    out
+}
+
+/// The union of `(after, until]` stretches as disjoint stretches, ascending (empty ones
+/// dropped; touching ones joined).
+pub(crate) fn union_spans(mut v: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    v.retain(|(a, u)| a < u);
+    v.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    for (a, u) in v {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(u),
+            _ => out.push((a, u)),
+        }
+    }
+    out
 }
 
 /// Which objects and predictions a curve counts.
@@ -1374,7 +1542,14 @@ impl SweepScope<'_> {
     }
 }
 
-/// Counts over `images` at `threshold` (predictions with confidence >= `threshold`).
+/// A running count of `+1` / `-1` entries as a count (never below 0: an entry's `-1` sorts
+/// below its `+1`).
+fn count(n: i64) -> usize {
+    usize::try_from(n.max(0)).unwrap_or(usize::MAX)
+}
+
+/// Counts over `images` at `threshold` (the predictions counted there: confidence >=
+/// `threshold`, and above their `after`).
 pub fn sweep_counts(images: &[&SweepImage], scope: SweepScope, threshold: f32) -> Counts {
     let mut c = Counts::default();
     for img in images {
@@ -1383,7 +1558,7 @@ pub fn sweep_counts(images: &[&SweepImage], scope: SweepScope, threshold: f32) -
         for p in img
             .preds
             .iter()
-            .filter(|p| p.confidence >= threshold && scope.pred(p))
+            .filter(|p| p.after < threshold && p.confidence >= threshold && scope.pred(p))
         {
             if p.tp {
                 tp += 1;
@@ -1435,29 +1610,31 @@ pub struct Breakpoints {
 
 impl Breakpoints {
     pub fn new(images: &[&SweepImage], scope: SweepScope) -> Self {
-        let mut preds: Vec<(f32, bool)> = Vec::new();
+        // (threshold, TP, +1 / -1): a prediction counts from its confidence down to just
+        // above its `after` (a plain run's: down to every threshold).
+        let mut preds: Vec<(f32, bool, i64)> = Vec::new();
         let mut npos = 0;
         for img in images {
             npos += img.gt.iter().filter(|(l, s)| scope.gt(l, *s)).count();
-            preds.extend(
-                img.preds
-                    .iter()
-                    .filter(|p| scope.pred(p))
-                    .map(|p| (p.confidence, p.tp)),
-            );
+            for p in img.preds.iter().filter(|p| scope.pred(p)) {
+                preds.push((p.confidence, p.tp, 1));
+                if p.after.is_finite() {
+                    preds.push((p.after, p.tp, -1));
+                }
+            }
         }
         preds.sort_by(|a, b| b.0.total_cmp(&a.0));
         let mut steps: Vec<(f32, usize, usize)> = Vec::new();
-        let (mut tp, mut fp) = (0, 0);
-        for (i, &(c, is_tp)) in preds.iter().enumerate() {
+        let (mut tp, mut fp) = (0i64, 0i64);
+        for (i, &(c, is_tp, w)) in preds.iter().enumerate() {
             if is_tp {
-                tp += 1;
+                tp += w;
             } else {
-                fp += 1;
+                fp += w;
             }
             // Close the step after the last prediction of this confidence.
             if preds.get(i + 1).is_none_or(|n| n.0 != c) {
-                steps.push((c, tp, fp));
+                steps.push((c, count(tp), count(fp)));
             }
         }
         let frames = FrameSteps::new(
@@ -1472,19 +1649,19 @@ impl Breakpoints {
             .collect();
         // Some (with no sample) whenever there are pooled samples, so an old point's pooled
         // rates are never taken for these ([`ThresholdPoint::alert_rates`]).
-        let per_frame = FrameSteps::of_pairs(
+        let per_frame = FrameSteps::of_spans(
             samples
                 .iter()
                 .filter(|a| a.positive || !a.ignore_only)
-                .map(|a| (a.score, a.positive))
+                .map(|a| (a.spans.as_slice(), a.positive))
                 .collect(),
         )
         .or_else(|| frames.as_ref().map(|_| FrameSteps::default()));
-        let empty = FrameSteps::of_pairs(
+        let empty = FrameSteps::of_spans(
             samples
                 .iter()
                 .filter(|a| !a.positive)
-                .map(|a| (a.score, false))
+                .map(|a| (a.spans.as_slice(), false))
                 .collect(),
         );
         Self {
@@ -1585,6 +1762,7 @@ mod tests {
             label: label.into(),
             confidence: c,
             bbox: b,
+            window: None,
         }
     }
 
@@ -2368,6 +2546,7 @@ mod tests {
                 img.preds.push(SweepPred {
                     // Coarse values so equal confidences occur.
                     confidence: 0.05 + ((rnd() * 0.95) * 60.0).floor() / 60.0,
+                    after: f32::NEG_INFINITY,
                     class: ["person", "car"][(rnd() * 2.0) as usize % 2].into(),
                     tp: rnd() < 0.5,
                     small: rnd() < 0.3,

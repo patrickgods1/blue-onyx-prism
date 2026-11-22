@@ -342,6 +342,7 @@ mod tests {
                 label: "dog".into(),
                 confidence: conf,
                 bbox: [0.0, 0.0, 10.0, 10.0],
+                window: None,
             }]];
             r
         };

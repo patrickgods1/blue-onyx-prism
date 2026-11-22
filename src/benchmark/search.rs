@@ -61,29 +61,45 @@ pub fn preds_path(config_path: &Path) -> PathBuf {
 }
 
 /// One stored prediction: `[class index, confidence, x_min, y_min, x_max, y_max]`, the box in
-/// integer pixels (the scored predictions are integer pixel boxes, so this is lossless).
+/// integer pixels (the scored predictions are integer pixel boxes, so this is lossless). A
+/// prediction of a run with serving rules adds its window ([`PredBox::window`]):
+/// `[..., after, until]`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(
-    from = "(u32, f32, u32, u32, u32, u32)",
-    into = "(u32, f32, u32, u32, u32, u32)"
-)]
+#[serde(from = "StoredRepr", into = "StoredRepr")]
 pub struct StoredPred {
     pub class: u32,
     pub confidence: f32,
     pub bbox: [f32; 4],
+    pub window: Option<super::metrics::Window>,
 }
 
-impl From<(u32, f32, u32, u32, u32, u32)> for StoredPred {
-    fn from(t: (u32, f32, u32, u32, u32, u32)) -> Self {
+/// The JSON array of a [`StoredPred`]: 6 numbers, or 8 with a window.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredRepr {
+    Plain(u32, f32, u32, u32, u32, u32),
+    Windowed(u32, f32, u32, u32, u32, u32, f32, f32),
+}
+
+impl From<StoredRepr> for StoredPred {
+    fn from(r: StoredRepr) -> Self {
+        let (t, window) = match r {
+            StoredRepr::Plain(a, b, c, d, e, f) => ((a, b, c, d, e, f), None),
+            StoredRepr::Windowed(a, b, c, d, e, f, after, until) => (
+                (a, b, c, d, e, f),
+                Some(super::metrics::Window { after, until }),
+            ),
+        };
         Self {
             class: t.0,
             confidence: t.1,
             bbox: [t.2 as f32, t.3 as f32, t.4 as f32, t.5 as f32],
+            window,
         }
     }
 }
 
-impl From<StoredPred> for (u32, f32, u32, u32, u32, u32) {
+impl From<StoredPred> for StoredRepr {
     fn from(p: StoredPred) -> Self {
         #[allow(
             clippy::cast_possible_truncation,
@@ -91,14 +107,13 @@ impl From<StoredPred> for (u32, f32, u32, u32, u32, u32) {
             reason = "clamped to >= 0 (NaN -> 0 via f32::max); `as` saturates large values"
         )]
         let c = |v: f32| v.max(0.0).round() as u32;
-        (
-            p.class,
-            p.confidence,
-            c(p.bbox[0]),
-            c(p.bbox[1]),
-            c(p.bbox[2]),
-            c(p.bbox[3]),
-        )
+        let [x1, y1, x2, y2] = p.bbox.map(c);
+        match p.window {
+            None => StoredRepr::Plain(p.class, p.confidence, x1, y1, x2, y2),
+            Some(w) => {
+                StoredRepr::Windowed(p.class, p.confidence, x1, y1, x2, y2, w.after, w.until)
+            }
+        }
     }
 }
 
@@ -166,6 +181,7 @@ impl StoredRun {
                                     class: *index.get(p.label.as_str())?,
                                     confidence: p.confidence,
                                     bbox: p.bbox,
+                                    window: p.window,
                                 })
                             })
                             .collect(),
@@ -188,6 +204,7 @@ impl StoredRun {
                     label: self.classes.get(p.class as usize)?.clone(),
                     confidence: p.confidence,
                     bbox: p.bbox,
+                    window: p.window,
                 })
             })
             .collect()
@@ -1358,6 +1375,26 @@ pub fn image_gt<'a>(results: &'a BenchmarkResults, set: &str, file: &str) -> Opt
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    /// A windowed prediction (a run with serving rules) keeps its window in the file; a plain
+    /// one keeps the six-number form.
+    #[test]
+    fn stored_predictions_keep_their_windows() {
+        let w = crate::benchmark::metrics::Window {
+            after: 0.07,
+            until: 0.8,
+        };
+        let p = |window| StoredPred {
+            class: 1,
+            confidence: 0.8,
+            bbox: [1.0, 2.0, 30.0, 40.0],
+            window,
+        };
+        let text = serde_json::to_string(&[p(None), p(Some(w))]).unwrap();
+        assert_eq!(text, "[[1,0.8,1,2,30,40],[1,0.8,1,2,30,40,0.07,0.8]]");
+        let back: Vec<StoredPred> = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, [p(None), p(Some(w))]);
+    }
     use super::*;
     use crate::benchmark::images::SetKind;
 
@@ -1433,6 +1470,7 @@ pub(crate) mod tests {
             class,
             confidence,
             bbox: b,
+            window: None,
         };
         let run = |device: &str, shift: f32| StoredRun {
             model: "m".into(),
@@ -1507,6 +1545,7 @@ pub(crate) mod tests {
                     label: "person".into(),
                     confidence: 0.05 + i as f32 * 1e-3,
                     bbox: [0.0; 4],
+                    window: None,
                 })
                 .collect()
         };
@@ -1881,6 +1920,7 @@ pub(crate) mod tests {
             class: 0,
             confidence: c,
             bbox: [c, 0.0, 1.0, 1.0],
+            window: None,
         };
         let conf = |v: &[StoredPred]| v.iter().map(|p| p.confidence).collect::<Vec<_>>();
         let few = vec![p(0.1), p(0.9)];

@@ -701,6 +701,26 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   threshold curves, the Compare columns) use it, and each scene has its own `scene:<day|night|ir>`
   breakdown beside the manifest's tags; results saved before it fall back to the manifest's
   `day` / `night` / `ir` tags.
+- **As served** (off by default: a run measures the bare model; `benchmark.served`, CLI
+  `benchmark --served`, the page's Run settings checkbox *As served*): each model also runs with
+  the serving settings Blue Iris gets it with, in the service's order: the frame's scene, its
+  `preprocess` / `night_preprocess`, the threshold of the scene (`night_threshold` on night / IR
+  frames when set), the filter rules (`label_thresholds`, the night rules, `person_aspect`,
+  `min_box_area_frac`, `suppress_overlaps`), the object filter and the `verify` verifier
+  (fail-open, as served). Night / IR frames of a model with a `night_model` are answered by the
+  night model with its own settings, compiled on the same device; when the night model is not a
+  served model or does not load they run on the model itself, as the service falls back, and the
+  result says why (`served.night_fallback`, beside `served.night_routed`). Static-box memory is
+  left out (it is per-camera history). Timing is what the request costs (enhancement, filters and
+  verifier included; a night frame's inference is the night model's). The threshold curves stay
+  exact at every threshold: what the service returns at each threshold is scored, so a weak
+  `potted plant` box only suppresses a person below its own confidence, as it does when served.
+  The results are stored as `<model>+served`, apart from the bare `<model>` results (history,
+  Compare and the stored predictions treat them as one more model); `auto` device ordering, the
+  device recommendation and Apply read the bare results only. A result records the fingerprint
+  of the settings it ran with, and `GET /v1/benchmark` marks it `stale_rules: true` once the
+  model's (or its night model's or verifier's) serving settings change; a new day threshold does
+  not, since the curves already cover it. `--served` is refused together with `--variants`.
 - **Accuracy**: AP@0.5, AP@[.5:.95] (COCO 101-point), precision/recall/F1 at the confidence the model
   serves on the device, recall by object size, by dataset and by tag (day/night, complexity,
   resolution, crowd, small objects, the computed scene). Scored classes: person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse
@@ -832,6 +852,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
 | `benchmark.low_priority` | `true` | Run benchmarks of CPU devices (`openvino:cpu`, `ort:cpu`, `CPU`) at below-normal process priority so the desktop stays responsive; GPU and NPU devices keep the normal priority, so the service keeps answering Blue Iris at full priority while they run (Windows: the whole process while a CPU device compiles and runs, restored before a GPU device and after the run; the log and the Benchmark page's progress line say which applied; CLI on Linux/macOS: nice 10 for a run whose devices are all CPUs, a running service is never lowered there). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
+| `benchmark.served` | `false` | Benchmark each model **as served**: with the serving settings Blue Iris gets it with (its `preprocess` / `night_preprocess`, filter rules, `night_threshold`, `night_model` routing of night / IR frames and `verify` verifier), timed as the request costs in the service. Results are stored as `<model>+served`, beside and never mixed with the bare results; `auto` device ordering, the device recommendation and Apply use the bare results only. A result whose model's serving settings changed since the run is marked stale (`stale_rules` in `GET /v1/benchmark`). `benchmark --served` turns it on for one run (refused together with `--variants`); the Benchmark page has a Run settings checkbox. Boolean. Applies: at once. UI: yes |
 | `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>` (false alerts per 100 empty frames), `youden`, `fpr:<x>`. UI: yes |
 | `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
 

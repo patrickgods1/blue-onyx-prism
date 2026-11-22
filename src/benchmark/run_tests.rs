@@ -656,3 +656,214 @@ fn live_load_during_the_timed_runs_is_recorded() {
     assert_eq!((r.live_requests, r.live_requests_per_min), (None, None));
     assert_eq!(crate::benchmark::report::shared_load_text(&r), None);
 }
+
+/// As served (`benchmark --served`): a config with the fake model `fake` (person, car, dog) and
+/// the night model `night` (cat, bird, horse: its answers are told apart by their labels),
+/// files and class sidecars in `dir`. `edit` changes the `fake` entry.
+fn served_config(dir: &Path, edit: impl FnOnce(&mut crate::config::ModelConfig)) -> Config {
+    let entry = |name: &str, labels: &str| {
+        std::fs::write(dir.join(format!("{name}.onnx")), b"x").unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.yaml")),
+            format!("names: [{labels}]\n"),
+        )
+        .unwrap();
+        crate::config::ModelConfig {
+            name: Some(name.into()),
+            path: dir.join(format!("{name}.onnx")),
+            family: ModelFamilyKind::Yolo26,
+            enabled: true,
+            ..Default::default()
+        }
+    };
+    let mut fake = entry("fake", "person, car, dog");
+    edit(&mut fake);
+    Config {
+        models: vec![fake, entry("night", "cat, bird, horse")],
+        ..Config::default()
+    }
+}
+
+/// Day, night and IR frames (the IR set is the grayscale NIR proxy).
+fn scene_sets(dir: &Path) -> Vec<ImageSet> {
+    let day = |n: &str, k: u32| write_png(dir, n, 320 + k * 16, 240, colour);
+    let dark = |n: &str, k: u32| {
+        write_png(dir, n, 320, 240 + k * 8, |x, y| {
+            colour(x + k, y).map(|v| v / 8)
+        })
+    };
+    vec![
+        set(
+            "mixed",
+            vec![
+                day("d1.png", 0),
+                dark("n1.png", 1),
+                day("d2.png", 2),
+                dark("n2.png", 3),
+            ],
+            None,
+        ),
+        set(
+            "nir",
+            vec![day("i1.png", 4)],
+            Some(ImageTransform::Grayscale),
+        ),
+    ]
+}
+
+/// `fake` as served under `config` (or bare with `served` false), run over `sets`.
+fn run_served(config: &Config, sets: &[ImageSet], served: bool) -> (RunResult, FakeScript) {
+    let m = super::find_model(config, "fake").unwrap();
+    let mut job = super::job_for_config(config, m, None).unwrap();
+    if served {
+        job.variant = Some(PipelineVariant::served(config, m, None));
+        job.name = super::variant::served_name(&job.name);
+    }
+    let mut script = FakeScript::new(1, INPUT);
+    script.infer_fn = Some(infer_fn());
+    let rt = Mutex::new(Runtimes::fake(script.clone()));
+    let mut bench = Bench::new(sets, 0, 1, PARAMS);
+    bench.warmup_rule = WarmupRule::COUNT_ONLY;
+    bench.read_ahead = ReadAhead::Off;
+    bench.max_stored_preds = 300;
+    let r = bench.run(&rt, &job, "openvino:cpu").unwrap();
+    (r, script)
+}
+
+fn labels_of(i: &ImageRun) -> Vec<String> {
+    i.preds.iter().map(|p| p.label.clone()).collect()
+}
+
+/// Night / IR frames of a model with a `night_model` are answered by the night model (its
+/// labels), compiled on the same device; day frames by the model; the run records how many
+/// went there. Their evaluation boxes keep the night model's own threshold at every threshold
+/// of the sweep.
+#[test]
+fn as_served_routes_night_frames_to_the_night_model() {
+    let dir = Dir::new();
+    let config = served_config(&dir.0, |m| m.night_model = Some("night".into()));
+    let sets = scene_sets(&dir.0);
+    let (r, rt) = run_served(&config, &sets, true);
+    let night_labels = ["cat", "bird", "horse"];
+    let day_labels = ["person", "car", "dog"];
+    let mut nights = 0;
+    for (img, eval) in r.per_image.iter().zip(&r.eval_preds) {
+        let scene = img.scene.unwrap();
+        let want: &[&str] = if scene.is_night() {
+            &night_labels
+        } else {
+            &day_labels
+        };
+        assert!(
+            labels_of(img).iter().all(|l| want.contains(&l.as_str())),
+            "{} {scene:?}: {:?}",
+            img.file,
+            labels_of(img)
+        );
+        if scene.is_night() {
+            nights += 1;
+            // The night model's classes are no scored class of `fake`: nothing to score.
+            assert!(eval.is_empty(), "{eval:?}");
+        }
+    }
+    assert_eq!(
+        nights,
+        3,
+        "{:?}",
+        r.per_image.iter().map(|i| i.scene).collect::<Vec<_>>()
+    );
+    let s = r.served.as_ref().unwrap();
+    assert_eq!(s.night_routed, 3);
+    assert_eq!(s.night_model.as_deref(), Some("night"));
+    assert_eq!(s.night_fallback, None);
+    assert!(
+        s.describe()
+            .contains("3 night / IR image(s) answered by the night model night")
+    );
+    // Both compiled on the device the model loaded on.
+    let compiles = rt.compiles();
+    assert_eq!(compiles.len(), 2, "{compiles:?}");
+    assert!(
+        compiles.iter().all(|(d, _)| d == "openvino:cpu"),
+        "{compiles:?}"
+    );
+    assert!(r.per_image.iter().any(|i| !i.preds.is_empty()));
+}
+
+/// `night_threshold` replaces the threshold on night / IR frames only: their answers keep only
+/// boxes at or above it (and their evaluation boxes are returned at every swept threshold), day
+/// frames are what the bare model returns.
+#[test]
+fn as_served_night_threshold_applies_to_night_frames_only() {
+    let dir = Dir::new();
+    let config = served_config(&dir.0, |m| m.night_threshold = Some(0.8));
+    let sets = scene_sets(&dir.0);
+    let (served, _) = run_served(&config, &sets, true);
+    let (bare, _) = run_served(&config, &sets, false);
+    let mut day_seen = false;
+    for ((s, b), eval) in served
+        .per_image
+        .iter()
+        .zip(&bare.per_image)
+        .zip(&served.eval_preds)
+    {
+        if s.scene.unwrap().is_night() {
+            assert!(s.preds.iter().all(|p| p.confidence >= 0.8), "{:?}", s.preds);
+            let want: Vec<_> = b.preds.iter().filter(|p| p.confidence >= 0.8).collect();
+            assert_eq!(s.preds.iter().collect::<Vec<_>>(), want, "{}", s.file);
+            assert!(
+                eval.iter()
+                    .all(|p| p.window == Some(crate::benchmark::metrics::Window::ALWAYS)),
+                "{eval:?}"
+            );
+            assert!(eval.iter().all(|p| p.confidence >= 0.8));
+        } else {
+            day_seen = true;
+            assert_eq!(labels_of(s), labels_of(b), "{}", s.file);
+            assert_eq!(s.preds.len(), b.preds.len());
+            assert!(eval.iter().all(|p| p.window.is_none()));
+        }
+    }
+    assert!(day_seen);
+    // The bare model returns boxes under 0.8 on some night frame: the threshold did something.
+    assert!(
+        bare.per_image
+            .iter()
+            .any(|i| i.scene.unwrap().is_night() && i.preds.iter().any(|p| p.confidence < 0.8))
+    );
+    assert_eq!(served.served.as_ref().unwrap().night_routed, 0);
+}
+
+/// A `night_model` that is no served model (missing, disabled, the model itself) leaves the
+/// night / IR frames on the model, as the service's fallback does, and the run says why.
+#[test]
+fn as_served_falls_back_when_the_night_model_is_missing() {
+    let dir = Dir::new();
+    let sets = scene_sets(&dir.0);
+    let (bare, _) = run_served(&served_config(&dir.0, |_| {}), &sets, false);
+    for (night, why) in [
+        ("nope", "not a configured model"),
+        ("fake", "it is the model itself"),
+        ("night-off", "it is disabled"),
+    ] {
+        let mut config = served_config(&dir.0, |m| m.night_model = Some(night.into()));
+        config.models.push(crate::config::ModelConfig {
+            name: Some("night-off".into()),
+            enabled: false,
+            ..config.models[1].clone()
+        });
+        let (r, rt) = run_served(&config, &sets, true);
+        let s = r.served.as_ref().unwrap();
+        assert_eq!(s.night_routed, 0, "{night}");
+        assert_eq!(s.night_fallback.as_deref(), Some(why), "{night}");
+        assert!(
+            s.describe().contains("ran on the model itself"),
+            "{}",
+            s.describe()
+        );
+        for (a, b) in r.per_image.iter().zip(&bare.per_image) {
+            assert_eq!(labels_of(a), labels_of(b), "{night} {}", a.file);
+        }
+        assert_eq!(rt.compiles().len(), 1);
+    }
+}

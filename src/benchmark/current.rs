@@ -34,6 +34,9 @@ pub struct ModelNow {
     /// The model's confidence profiles ([`ModelConfig::device_thresholds`]): an advice is
     /// compared with the profile of its own device ([`ModelNow::threshold_for`]).
     pub device_thresholds: BTreeMap<String, f32>,
+    /// The fingerprint of its serving settings now ([`super::variant::served_fingerprint`]):
+    /// an As served result with another one is stale ([`ModelResult::stale_rules`]).
+    pub served: Option<String>,
 }
 
 impl ModelNow {
@@ -44,6 +47,7 @@ impl ModelNow {
             running,
             device,
             device_thresholds: BTreeMap::new(),
+            served: None,
         }
     }
 
@@ -81,13 +85,16 @@ pub fn from_config(
                     running: running(&name),
                     device: device(m),
                     device_thresholds: m.device_thresholds.clone(),
+                    served: Some(super::variant::served_fingerprint(cfg, m)),
                 },
             )
         })
         .collect()
 }
 
-/// Rebase every model of `results` that the config has (see the module docs).
+/// Rebase every model of `results` that the config has (see the module docs); an As served
+/// result (`<model>+served`) is rebased on its model and marked [`ModelResult::stale_rules`]
+/// when the model's serving settings changed since its run.
 pub fn rebase(
     results: &mut BenchmarkResults,
     preds: Option<&StoredPreds>,
@@ -97,7 +104,15 @@ pub fn rebase(
         models, image_sets, ..
     } = results;
     for m in models {
-        if let Some(n) = now.get(&normalize_name(&m.model)) {
+        let served = super::variant::is_served(&m.model);
+        let key = normalize_name(super::variant::base_name(&m.model));
+        if let Some(n) = now.get(&key) {
+            if served {
+                m.stale_rules = Some(
+                    m.served.as_ref().map(|s| &s.fingerprint) != n.served.as_ref()
+                        || m.served.is_none(),
+                );
+            }
             rebase_model(m, image_sets, preds, n);
         }
     }
@@ -438,5 +453,137 @@ pub(crate) mod tests {
             "{}",
             r.models[0].recommendation
         );
+    }
+}
+
+#[cfg(test)]
+mod served_tests {
+    use super::*;
+    use crate::benchmark::report::ServedSettings;
+    use crate::benchmark::report::test_support::{dev, model, scene};
+    use crate::benchmark::variant::{base_name, is_served, served_fingerprint, served_name};
+
+    fn cfg(dir: &std::path::Path) -> Config {
+        let entry = |n: &str| {
+            std::fs::write(dir.join(format!("{n}.onnx")), b"x").unwrap();
+            ModelConfig {
+                name: Some(n.into()),
+                path: dir.join(format!("{n}.onnx")),
+                ..Default::default()
+            }
+        };
+        let mut m = entry("m");
+        m.night_model = Some("night".into());
+        Config {
+            models: vec![m, entry("night")],
+            ..Config::default()
+        }
+    }
+
+    fn result(name: &str, p50: f64) -> ModelResult {
+        let mut r = model(vec![dev("openvino:cpu", p50, scene())], None);
+        r.model = name.into();
+        r
+    }
+
+    /// As served results live beside the bare ones under their own name: a new bare run
+    /// replaces only the bare result, the bare result is what `find` (the `auto` order, Apply)
+    /// reads, and the names map back to the model.
+    #[test]
+    fn served_and_bare_results_are_kept_apart() {
+        assert_eq!(served_name("IPcam-general"), "IPcam-general+served");
+        assert_eq!(base_name("IPcam-general+served"), "IPcam-general");
+        assert_eq!(base_name("IPcam-general+SERVED"), "IPcam-general");
+        assert_eq!(
+            base_name("IPcam-general+pre:clahe"),
+            "IPcam-general+pre:clahe"
+        );
+        assert_eq!(base_name("+served"), "+served");
+        assert!(is_served("m+served") && !is_served("m") && !is_served("m+filters"));
+        let hw = crate::benchmark::report::HardwareSummary::default();
+        let saved = BenchmarkResults::new(
+            hw.clone(),
+            Default::default(),
+            vec![result("m", 10.0), result("m+served", 30.0)],
+        );
+        let again = BenchmarkResults::new(hw, Default::default(), vec![result("m", 12.0)]);
+        let merged = BenchmarkResults::merge(Some(saved), again);
+        assert_eq!(merged.models.len(), 2);
+        let p50 = |n: &str| {
+            merged.find(n).unwrap().devices[0]
+                .run
+                .as_ref()
+                .unwrap()
+                .stages_ms
+                .total
+                .p50
+        };
+        assert_eq!(p50("m"), 12.0);
+        assert_eq!(p50("m+served"), 30.0);
+    }
+
+    /// `GET /v1/benchmark` marks an As served result stale when the model's serving settings
+    /// changed since its run (its filter rules, its night model's settings), not when only its
+    /// own day threshold did (what the sweep varies); a bare result never carries the flag.
+    #[test]
+    fn a_changed_serving_rule_marks_the_served_result_stale() {
+        let dir = std::env::temp_dir().join(format!("bop-stale-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = cfg(&dir);
+        let fp = served_fingerprint(&config, &config.models[0]);
+        let saved = {
+            let mut s = result("m+served", 30.0);
+            s.served = Some(ServedSettings {
+                fingerprint: fp.clone(),
+                rules: String::new(),
+            });
+            BenchmarkResults::new(
+                Default::default(),
+                Default::default(),
+                vec![result("m", 10.0), s],
+            )
+        };
+        let stale = |c: &Config| {
+            let mut r = saved.clone();
+            rebase(&mut r, None, &from_config(c, &|_| None, &|_| None));
+            (r.models[0].stale_rules, r.models[1].stale_rules)
+        };
+        assert_eq!(stale(&config), (None, Some(false)));
+        // A new day threshold or device profile: not stale.
+        let mut c = config.clone();
+        c.models[0].confidence_threshold = Some(0.7);
+        c.models[0].device_thresholds = [("openvino:cpu".to_string(), 0.6)].into();
+        assert_eq!(stale(&c), (None, Some(false)));
+        // A filter rule, the night threshold, enhancement, the night model's settings: stale.
+        for edit in [
+            (|c: &mut Config| {
+                c.models[0].label_thresholds = Some([("person".to_string(), 0.6)].into())
+            }) as fn(&mut Config),
+            |c| c.models[0].night_threshold = Some(0.3),
+            |c| c.models[0].preprocess = Some(crate::model::enhance::Preprocess::CLAHE),
+            |c| c.models[1].confidence_threshold = Some(0.2),
+            |c| c.models[1].enabled = false,
+            |c| c.night_confidence_threshold = Some(0.5),
+            |c| c.models[0].night_model = None,
+        ] {
+            let mut c = config.clone();
+            edit(&mut c);
+            assert_eq!(stale(&c), (None, Some(true)));
+        }
+        // The answer carries it; the saved file never does.
+        let mut r = saved.clone();
+        let mut c = config.clone();
+        c.models[0].night_threshold = Some(0.3);
+        rebase(&mut r, None, &from_config(&c, &|_| None, &|_| None));
+        let v = serde_json::to_value(&r.models[1]).unwrap();
+        assert_eq!(v["stale_rules"], true);
+        let back: ModelResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back.stale_rules, None);
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("stale_rules")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

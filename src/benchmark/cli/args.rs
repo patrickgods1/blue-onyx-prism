@@ -171,6 +171,14 @@ pub struct BenchArgs {
     /// Default: none. --apply / --apply-threshold use the plain results only.
     #[arg(long, value_parser = parse_variants_arg)]
     pub variants: Option<crate::benchmark::variant::VariantList>,
+    /// Benchmark each model as served: with its own serving settings (preprocess /
+    /// night_preprocess, filter rules, night_threshold, night_model routing of night / IR
+    /// frames, verify), timed as the request costs in the service; results are named
+    /// `<model>+served`, beside the bare ones. Also on with benchmark.served (then --variants
+    /// runs instead). Refused together with --variants. --apply / --apply-threshold use the
+    /// bare results only.
+    #[arg(long)]
+    pub served: bool,
     /// Show info-level logs (on stderr).
     #[arg(long, short)]
     pub verbose: bool,

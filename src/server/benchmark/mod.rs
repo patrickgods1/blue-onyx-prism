@@ -114,6 +114,8 @@ struct BenchmarkTemplate {
     warmup: usize,
     /// `benchmark.low_priority`: the "Run at low priority" checkbox.
     low_priority: bool,
+    /// `benchmark.served`: the "As served" checkbox.
+    served: bool,
     max_images: usize,
     accuracy_weight: String,
     warning: &'static str,
@@ -429,6 +431,7 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
             repeat: b.repeat_per_image.max(1),
             warmup: b.warmup,
             low_priority: b.low_priority,
+            served: b.served,
             max_images: b.max_images_per_dataset,
             accuracy_weight: format!("{:.2}", b.weights.accuracy_share()),
             warning: LIVE_WARNING,
@@ -739,7 +742,10 @@ fn lineup_of(
         .iter()
         .filter_map(|m| {
             let name = m.effective_name();
-            results.find(&name)?;
+            // Its As served result (`<model>+served`) trained on the same frames.
+            results
+                .find(&name)
+                .or_else(|| results.find(&crate::benchmark::variant::served_name(&name)))?;
             let frames =
                 crate::training::autolabel::trained_frames(cfg, m, &mut Vec::new()).ok()?;
             (!frames.is_empty()).then(|| (key(&name), frames))

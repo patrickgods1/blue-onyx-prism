@@ -61,7 +61,8 @@ pub fn backfill(results: &mut BenchmarkResults, config: &Config) {
         if r.trained_on_share.is_some() {
             continue;
         }
-        let Some(m) = find_model(config, &r.model) else {
+        // An As served result trained on what its model did.
+        let Some(m) = find_model(config, super::variant::base_name(&r.model)) else {
             continue;
         };
         let files = sets

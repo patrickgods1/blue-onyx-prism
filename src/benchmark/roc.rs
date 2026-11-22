@@ -51,6 +51,11 @@ pub struct FrameSample {
     pub positive: bool,
     /// Highest confidence of a prediction of the class in the frame (0 = none).
     pub score: f32,
+    /// A run with serving rules ([`super::metrics::PredBox::window`]): the thresholds at which
+    /// the frame has a prediction of the class, as disjoint `(after, until]` stretches; None for
+    /// a plain run (it does exactly when `score >= t`). The rates at a threshold
+    /// ([`FrameSteps`]) follow them; the AUC ranks by `score`.
+    pub spans: Option<Vec<(f32, f32)>>,
 }
 
 /// The frame samples of one image (labels in the scored label space) for `classes`, the
@@ -64,16 +69,16 @@ pub fn frame_samples(img: &EvalImage, classes: &[String]) -> Vec<FrameSample> {
             if any && !positive {
                 return None;
             }
-            let score = img
-                .preds
-                .iter()
-                .filter(|p| p.label == *c)
-                .map(|p| p.confidence)
-                .fold(0.0f32, f32::max);
+            let mine = || img.preds.iter().filter(|p| p.label == *c);
+            let score = mine().map(|p| p.confidence).fold(0.0f32, f32::max);
+            let spans = mine()
+                .any(|p| p.window.is_some())
+                .then(|| super::metrics::union_spans(mine().map(|p| p.span()).collect()));
             Some(FrameSample {
                 class: c.clone(),
                 positive,
                 score,
+                spans,
             })
         })
         .collect()
@@ -151,7 +156,61 @@ pub struct FrameSteps {
 impl FrameSteps {
     /// None without samples.
     pub fn new<'a>(samples: impl IntoIterator<Item = &'a FrameSample>) -> Option<Self> {
-        Self::of_pairs(samples.into_iter().map(|s| (s.score, s.positive)).collect())
+        let samples: Vec<&FrameSample> = samples.into_iter().collect();
+        if samples.iter().all(|s| s.spans.is_none()) {
+            return Self::of_pairs(samples.iter().map(|s| (s.score, s.positive)).collect());
+        }
+        let plain: Vec<[(f32, f32); 1]> = samples
+            .iter()
+            .map(|s| [(f32::NEG_INFINITY, s.score)])
+            .collect();
+        Self::of_spans(
+            samples
+                .iter()
+                .zip(&plain)
+                .map(|(s, p)| (s.spans.as_deref().unwrap_or(p), s.positive))
+                .collect(),
+        )
+    }
+
+    /// The steps of frames alerting on disjoint `(after, until]` stretches of thresholds
+    /// (`(spans, positive)` per frame; a plain frame's is `[(-inf, score)]`, which gives
+    /// [`Self::of_pairs`]'s steps). A frame adds 1 from each `until` down and takes it back at
+    /// its `after`, so the counts at `t` are the frames with a stretch holding `t`. None
+    /// without frames.
+    pub fn of_spans(v: Vec<(&[(f32, f32)], bool)>) -> Option<Self> {
+        if v.is_empty() {
+            return None;
+        }
+        let positives = v.iter().filter(|s| s.1).count();
+        let mut entries: Vec<(f32, bool, i64)> = Vec::new();
+        for (spans, p) in &v {
+            for &(a, u) in *spans {
+                entries.push((u, *p, 1));
+                if a.is_finite() {
+                    entries.push((a, *p, -1));
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let count = |n: i64| usize::try_from(n.max(0)).unwrap_or(usize::MAX);
+        let mut steps = Vec::new();
+        let (mut tp, mut fp) = (0i64, 0i64);
+        for (i, &(c, p, w)) in entries.iter().enumerate() {
+            if p {
+                tp += w;
+            } else {
+                fp += w;
+            }
+            if entries.get(i + 1).is_none_or(|n| n.0 != c) {
+                steps.push((c, count(tp), count(fp)));
+            }
+        }
+        Some(Self {
+            positives,
+            negatives: v.len() - positives,
+            steps,
+        })
     }
 
     /// The steps of `(score, positive)` samples; None without samples.
@@ -430,6 +489,7 @@ mod tests {
                         class: "person".into(),
                         positive,
                         score,
+                        spans: None,
                     })
                     .collect();
                 let fs = FrameSteps::new(&samples).unwrap();
@@ -478,6 +538,7 @@ mod tests {
             label: label.into(),
             confidence: c,
             bbox: [0.0, 0.0, 10.0, 10.0],
+            window: None,
         }
     }
 
@@ -501,12 +562,14 @@ mod tests {
                 FrameSample {
                     class: "person".into(),
                     positive: true,
-                    score: 0.8
+                    score: 0.8,
+                    spans: None,
                 },
                 FrameSample {
                     class: "dog".into(),
                     positive: false,
-                    score: 0.0
+                    score: 0.0,
+                    spans: None,
                 },
             ]
         );
@@ -520,6 +583,7 @@ mod tests {
             class: class.into(),
             positive,
             score,
+            spans: None,
         };
         let samples = vec![
             mk("person", true, 0.9),
@@ -567,6 +631,7 @@ mod tests {
             class: class.into(),
             positive,
             score,
+            spans: None,
         };
         let mut samples = Vec::new();
         // person: 25 positive frames above 10 negatives: AUC 1.

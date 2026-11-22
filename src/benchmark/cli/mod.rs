@@ -81,6 +81,7 @@ struct Planned {
 }
 
 fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<Vec<Planned>> {
+    let served = served_mode(args, config)?;
     let device_override = if args.force_cpu {
         Some("CPU".to_string())
     } else {
@@ -121,7 +122,55 @@ fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<V
             p.job.device_thresholds.clear();
         }
     }
+    if served {
+        return Ok(as_served(out, args, config));
+    }
     Ok(with_variants(out, args, config, errors))
+}
+
+/// What `--served` and `--variants` refused together say.
+pub(crate) const SERVED_WITH_VARIANTS: &str = "--served and --variants cannot be combined: \
+     --served runs each model with its own serving settings (results `<model>+served`), \
+     --variants tries other settings on the plain model; run them separately";
+
+/// Whether this run benchmarks the models as served: `--served`, else `benchmark.served` unless
+/// `--variants` asks for other settings (said on stderr). `--served` with `--variants` is
+/// refused.
+pub(crate) fn served_mode(args: &BenchArgs, config: &Config) -> Result<bool> {
+    match (args.served, args.variants.is_some()) {
+        (true, true) => bail!("{SERVED_WITH_VARIANTS}"),
+        (true, false) => Ok(true),
+        (false, true) => {
+            if config.benchmark.served && !args.json {
+                eprintln!(
+                    "benchmark.served is on, but --variants runs instead (the two do not combine)"
+                );
+            }
+            Ok(false)
+        }
+        (false, false) => Ok(config.benchmark.served),
+    }
+}
+
+/// Every job as served ([`crate::benchmark::PipelineVariant::served`], named
+/// `<model>+served`); a `--model` file gets the global settings.
+fn as_served(jobs: Vec<Planned>, args: &BenchArgs, config: &Config) -> Vec<Planned> {
+    jobs.into_iter()
+        .map(|mut p| {
+            let file_entry = ModelConfig {
+                path: p.job.path.clone(),
+                ..ModelConfig::default()
+            };
+            let entry = p.entry.as_ref().unwrap_or(&file_entry);
+            let v = crate::benchmark::PipelineVariant::served(config, entry, None);
+            p.job.name = crate::benchmark::variant::served_name(&p.job.name);
+            if !args.json {
+                eprintln!("as served {}: {}", p.job.name, v.describe());
+            }
+            p.job.variant = Some(v);
+            p
+        })
+        .collect()
 }
 
 /// Every job once per `--variants` entry (in that order per model; the plain pipeline keeps
@@ -1164,6 +1213,28 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Result<BenchArgs, clap::Error> {
         Cli::try_parse_from(argv).map(|c| c.args)
+    }
+
+    /// `--served` with `--variants` is refused with a message saying why; `benchmark.served`
+    /// is the default, and `--variants` runs instead of it.
+    #[test]
+    fn served_mode_and_its_refusal() {
+        let mut config = Config::default();
+        let both = parse(&["x", "--served", "--variants", "filters"]).unwrap();
+        let e = served_mode(&both, &config).unwrap_err().to_string();
+        assert!(
+            e.contains("--served and --variants cannot be combined"),
+            "{e}"
+        );
+        let mut errors = Vec::new();
+        let e = jobs(&both, &config, &mut errors).err().unwrap().to_string();
+        assert!(e.contains("cannot be combined"), "{e}");
+        assert!(served_mode(&parse(&["x", "--served"]).unwrap(), &config).unwrap());
+        assert!(!served_mode(&parse(&["x"]).unwrap(), &config).unwrap());
+        config.benchmark.served = true;
+        assert!(served_mode(&parse(&["x"]).unwrap(), &config).unwrap());
+        let variants = parse(&["x", "--json", "--variants", "filters"]).unwrap();
+        assert!(!served_mode(&variants, &config).unwrap());
     }
 
     #[test]

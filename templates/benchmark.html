@@ -67,6 +67,7 @@
       <label>Timed runs per image <input inputmode="numeric" type="number" name="repeat" min="1" max="1000" value="{{ repeat }}"><span class="field-hint">More timed runs give steadier speeds (3 or more); accuracy does not change.</span></label>
       <label>Warm-up runs <input inputmode="numeric" type="number" name="warmup" min="0" max="100" value="{{ warmup }}"></label>
       <input type="hidden" name="low_priority" value="0"><label class="check"><input type="checkbox" name="low_priority" value="1"{% if low_priority %} checked{% endif %}> Run CPU devices at low priority (keeps the desktop responsive; GPU devices keep the normal priority)</label>
+      <input type="hidden" name="served" value="0"><label class="check"><input type="checkbox" name="served" value="1"{% if served %} checked{% endif %}> As served: apply each model's night model, night threshold, filters, enhancement and verifier<span class="field-hint">Scores and times each model as Blue Iris gets it. Results are kept apart as &lt;model&gt;+served and marked stale when those settings change; off measures the bare model.</span></label>
       <label>Reference model (stand-in labels for datasets without them)
         <select name="reference_model">
           <option value="">Automatic (most accurate installed)</option>

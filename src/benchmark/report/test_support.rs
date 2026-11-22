@@ -73,6 +73,7 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
         tag_recall: vec![],
         grades: Some(Grades::new(None, p50, Default::default(), false)),
         agreement: None,
+        served: None,
         per_image: Vec::new(),
         eval_preds: Vec::new(),
     }
@@ -110,6 +111,8 @@ pub(crate) fn model(devices: Vec<DeviceResult>, configured: Option<&str>) -> Mod
         threshold_objective: Objective::default(),
         threshold: None,
         trained_on_share: None,
+        served: None,
+        stale_rules: None,
     };
     m.finish();
     m
@@ -148,6 +151,7 @@ pub(crate) fn with_sweep(
             .iter()
             .map(|&(confidence, tp)| SweepPred {
                 confidence,
+                after: f32::NEG_INFINITY,
                 class: "person".into(),
                 tp,
                 small: false,

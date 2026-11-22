@@ -40,6 +40,7 @@ pub mod report;
 pub mod rescore;
 pub mod roc;
 pub mod search;
+pub mod served;
 pub mod service;
 pub mod threshold;
 pub mod trained_on;
@@ -602,6 +603,9 @@ pub struct RunResult {
     /// Detections compared with the CPU reference device (device sweeps only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agreement: Option<Agreement>,
+    /// An As served run ([`variant`]): what its served pipeline did on this device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<ServedRun>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_image: Vec<ImageRun>,
     /// Per image (same order as `per_image`): the predictions at the evaluation threshold in
@@ -613,6 +617,56 @@ pub struct RunResult {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// What the served pipeline of an As served run did on one device ([`RunResult::served`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ServedRun {
+    /// The model's `night_model` (None: it has none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub night_model: Option<String>,
+    /// Night / IR images the night model answered.
+    #[serde(default)]
+    pub night_routed: usize,
+    /// Why the night / IR images ran on the model itself although it has a night model (not a
+    /// served model, failed to load), as the service falls back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub night_fallback: Option<String>,
+    /// Images whose evaluation needed more verifier checks than `run::SWEEP_VERIFY_CAP`: there,
+    /// candidates the timed request did not check stay unverified at the thresholds that would.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub verify_capped_images: usize,
+    /// What ran otherwise than configured (a verifier that did not load: fail-open).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl ServedRun {
+    /// One line: where the night / IR images went and what ran otherwise than configured.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        match (&self.night_model, &self.night_fallback) {
+            (Some(n), None) => parts.push(format!(
+                "{} night / IR image(s) answered by the night model {n}",
+                self.night_routed
+            )),
+            (Some(n), Some(why)) => parts.push(format!(
+                "night / IR images ran on the model itself: its night_model {n} was not used \
+                 ({why})"
+            )),
+            (None, _) => {}
+        }
+        if self.verify_capped_images > 0 {
+            parts.push(format!(
+                "{} image(s) had more verifier candidates than the sweep checks ({}): the rest \
+                 stay unverified at the thresholds that would check them",
+                self.verify_capped_images,
+                run::SWEEP_VERIFY_CAP
+            ));
+        }
+        parts.extend(self.notes.iter().cloned());
+        parts.join("; ")
+    }
 }
 
 /// How a run's model was compiled ([`RunResult::tuning`]).
@@ -1207,6 +1261,7 @@ mod tests {
             label: l.into(),
             confidence: 0.9,
             bbox: b,
+            window: None,
         };
         let raccoon = [0.0, 0.0, 100.0, 100.0];
         let opossum = [200.0, 0.0, 300.0, 100.0];
@@ -1301,6 +1356,7 @@ mod tests {
             label: l.into(),
             confidence: c,
             bbox: b,
+            window: None,
         };
         let a = [0.0, 0.0, 100.0, 100.0];
         let b = [300.0, 0.0, 400.0, 100.0];
@@ -1379,6 +1435,7 @@ mod tests {
                         label: labels[(rnd() * 3.0) as usize % 3].into(),
                         confidence: 0.05 + rnd() * 0.95,
                         bbox: [x + 2.0, 0.0, x + 100.0, 100.0],
+                        window: None,
                     });
                 }
             }
