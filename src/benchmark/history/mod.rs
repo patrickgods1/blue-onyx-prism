@@ -181,6 +181,13 @@ pub struct DeviceSnap {
     /// entries of older versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_requests_per_min: Option<f64>,
+    /// The burst test's request p95 (ms; [`crate::benchmark::burst`]) and its load
+    /// ("8 x 4 x 500 ms"); None when no burst ran (or it measured nothing) and in entries of
+    /// older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_load: Option<String>,
 }
 
 /// One class of a [`DeviceSnap`]'s AP average.
@@ -311,6 +318,14 @@ fn device_snap(m: &ModelResult, d: &DeviceResult) -> DeviceSnap {
         ));
     }
     s.live_requests_per_min = run.live_requests_per_min;
+    if let Some(b) = run
+        .burst
+        .as_ref()
+        .filter(|b| b.error.is_none() && b.answered > 0)
+    {
+        s.burst_p95_ms = Some(b.latency_ms.p95);
+        s.burst_load = Some(b.load_text());
+    }
     s.total_p50_ms = Some(run.stages_ms.total.p50);
     s.total_p95_ms = Some(run.stages_ms.total.p95);
     s.infer_p50_ms = Some(run.stages_ms.infer.p50);

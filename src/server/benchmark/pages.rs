@@ -247,6 +247,9 @@ struct RunPage {
     max_images: usize,
     warning: &'static str,
     gpu_warning: &'static str,
+    /// `benchmark.burst` and its ranges ([`crate::config::BURST_CAMERAS`], ...).
+    burst: crate::config::BurstConfig,
+    burst_ranges: [(u64, u64); 3],
 }
 
 /// Per normalized model name: its last run's p50 per device (ms), from the run history (small;
@@ -533,7 +536,21 @@ pub(in crate::server) async fn run_page(State(state): State<Arc<AppState>>) -> R
             max_images: b.max_images_per_dataset,
             warning: LIVE_WARNING,
             gpu_warning: crate::benchmark::service::SEVERAL_GPUS_WARNING,
+            burst: b.burst,
+            burst_ranges: burst_ranges(),
         })
     })
     .await
+}
+
+/// The ranges of the burst test's cameras, images and interval (ms), for the form's inputs.
+fn burst_ranges() -> [(u64, u64); 3] {
+    use crate::config::{BURST_CAMERAS, BURST_IMAGES, BURST_INTERVAL_MS};
+    let u = |(lo, hi): (usize, usize)| {
+        (
+            u64::try_from(lo).unwrap_or(0),
+            u64::try_from(hi).unwrap_or(u64::MAX),
+        )
+    };
+    [u(BURST_CAMERAS), u(BURST_IMAGES), BURST_INTERVAL_MS]
 }

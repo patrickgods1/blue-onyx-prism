@@ -801,6 +801,20 @@ mod tests {
         assert!(html.contains("name=\"dataset\" value=\"sample\" data-images=\"1\">"));
         assert!(html.contains("same CPU/GPU"));
         assert!(html.contains("id=\"o-served\""), "As served");
+        // The burst test: off by default, its load from `benchmark.burst` in the ranges.
+        assert!(
+            html.contains("<input type=\"checkbox\" id=\"o-burst\"> "),
+            "unticked by default: {html}"
+        );
+        assert!(html.contains("id=\"o-burst-fields\" disabled"), "{html}");
+        assert!(
+            html.contains(
+                "id=\"o-burst-cameras\" min=\"1\" max=\"32\" inputmode=\"numeric\" value=\"8\""
+            ),
+            "{html}"
+        );
+        assert!(html.contains("id=\"o-burst-images\" min=\"1\" max=\"20\""));
+        assert!(html.contains("id=\"o-burst-interval\" min=\"50\" max=\"5000\""));
         assert!(
             html.contains("id=\"gpu-confirm\""),
             "the in-page GPU confirmation"
@@ -813,6 +827,10 @@ mod tests {
             "BC.cpuReference",
             "BC.estimate",
             "BC.comboStates",
+            "BC.burstSeconds",
+            "\"burst_cameras\"",
+            "\"burst_images\"",
+            "\"burst_interval_ms\"",
         ] {
             assert!(js.contains(needle), "{needle}");
         }

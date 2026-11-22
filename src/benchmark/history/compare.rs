@@ -516,6 +516,7 @@ fn metric_name(metric: &str) -> &'static str {
         "threshold" => "best confidence threshold",
         "goal" => "goal metric",
         "live_requests_per_min" => "live load",
+        "burst_p95_ms" => "burst p95",
         _ => "value",
     }
 }
@@ -602,6 +603,9 @@ fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
     }
     if a.live_requests_per_min.is_some() || b.live_requests_per_min.is_some() {
         v.push(live_load_change(dev, a, b));
+    }
+    if a.burst_p95_ms.is_some() || b.burst_p95_ms.is_some() {
+        v.push(burst_change(dev, a, b));
     }
     // False person alerts on frames without a person: a rate, lower is better.
     let (ra, rb) = (a.person_alert_rate(), b.person_alert_rate());
@@ -690,6 +694,22 @@ pub fn goal_change(dev: &str, a: &DeviceSnap, b: &DeviceSnap) -> Option<MetricCh
         );
     }
     Some(c)
+}
+
+/// The burst p95 of two runs of one device: a speed change when both ran the same load, not
+/// comparable under another load (more cameras wait longer by construction).
+fn burst_change(dev: &str, a: &DeviceSnap, b: &DeviceSnap) -> MetricChange {
+    let mut c = speed_change("burst_p95_ms", dev, a.burst_p95_ms, b.burst_p95_ms, false);
+    if let (Some(x), Some(y)) = (&a.burst_load, &b.burst_load)
+        && x != y
+        && c.delta.is_some()
+    {
+        c.verdict = Verdict::NotComparable;
+        c.delta = None;
+        c.rel = None;
+        c.why = format!("burst under another load ({x} -> {y})");
+    }
+    c
 }
 
 /// The live load of two runs of one device: shown, never a verdict (a busier run is slower and

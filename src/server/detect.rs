@@ -799,7 +799,11 @@ fn finish(
     resp
 }
 
-pub(super) async fn dispatch(
+/// Count `req` on `handle`, answer it at once when the model cannot take it (compiling, failed,
+/// queue full), else queue it on the worker and wait for the reply: what a detection request
+/// goes through once its body is read. Also the benchmark's burst test's path
+/// ([`crate::benchmark::burst`]), so a burst meets the same queue rules as Blue Iris.
+pub(crate) async fn dispatch(
     handle: &WorkerHandle,
     req: Result<VisionDetectionRequest, String>,
     start: Instant,

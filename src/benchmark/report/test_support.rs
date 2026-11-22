@@ -74,6 +74,7 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
         grades: Some(Grades::new(None, p50, Default::default(), false)),
         agreement: None,
         served: None,
+        burst: None,
         per_image: Vec::new(),
         eval_preds: Vec::new(),
     }

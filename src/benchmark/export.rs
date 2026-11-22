@@ -651,6 +651,16 @@ fn model_section(m: &ModelResult) -> Section {
         .to_vec(),
         rows: m.devices.iter().map(|d| device_row(m, d)).collect(),
     }];
+    if let Some(t) = burst_table(m) {
+        paragraphs.push(
+            "Burst test: cameras triggering together, each sending its images a fixed time \
+             apart, three bursts per device on a temporary worker of the serving code; each \
+             request is timed from when it was due (queue wait included), a trigger until its \
+             last answer."
+                .into(),
+        );
+        tables.push(t);
+    }
     let best = m
         .recommended
         .as_ref()
@@ -784,6 +794,82 @@ fn ap_basis_note(b: &super::metrics::ApBasis) -> String {
 }
 
 /// Speed per resolution bucket of `run` (every bucket; one without images is n/a).
+/// The burst test of each device of `m` that ran one ([`super::burst`]); None when none did.
+fn burst_table(m: &ModelResult) -> Option<Table> {
+    let ran: Vec<(&str, &super::burst::BurstResult)> = m
+        .devices
+        .iter()
+        .filter_map(|d| Some((d.device.as_str(), d.run.as_ref()?.burst.as_ref()?)))
+        .collect();
+    if ran.is_empty() {
+        return None;
+    }
+    let ok = |b: &super::burst::BurstResult| b.error.is_none() && b.answered > 0;
+    let rows: Vec<Vec<String>> = ran
+        .iter()
+        .map(|(dev, b)| {
+            let mut row = vec![dev.to_string(), b.load_text(), b.requests.to_string()];
+            if !ok(b) {
+                row.push(format!(
+                    "not measured: {}",
+                    b.error.as_deref().unwrap_or("no request was answered")
+                ));
+                row.resize(10, String::new());
+                return row;
+            }
+            let refused = b.refused_total();
+            row.extend([
+                msf(b.latency_ms.p50),
+                msf(b.latency_ms.p95),
+                msf(b.latency_ms.p99),
+                if b.triggers > b.triggers_incomplete {
+                    msf(b.trigger_ms.p50)
+                } else {
+                    "-".into()
+                },
+                if b.triggers > b.triggers_incomplete {
+                    msf(b.trigger_ms.p95)
+                } else {
+                    "-".into()
+                },
+                if refused == 0 {
+                    "0".into()
+                } else {
+                    format!(
+                        "{refused} ({})",
+                        b.refused
+                            .iter()
+                            .map(|(k, v)| format!("{k} {v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+                b.max_queue_depth.to_string(),
+            ]);
+            row
+        })
+        .collect();
+    Some(Table {
+        title: "Burst test (ms)".into(),
+        numbers: Numbers::default(),
+        head: [
+            "device",
+            "load (cameras x images x interval)",
+            "requests",
+            "request p50",
+            "request p95",
+            "request p99",
+            "last answer p50",
+            "last answer p95",
+            "refused",
+            "most waiting",
+        ]
+        .map(String::from)
+        .to_vec(),
+        rows,
+    })
+}
+
 fn resolution_table(run: &RunResult) -> Table {
     Table {
         title: format!("Speed by resolution on {} (ms)", run.requested_device),
@@ -1085,6 +1171,54 @@ mod tests {
             grades_section(AccuracyMetric::Ap50).paragraphs[2]
                 .contains("at least 20 ground-truth objects")
         );
+    }
+
+    /// A device's burst test is a table of the model's section (and its failure a row that
+    /// says why); a model without one has no such table.
+    #[test]
+    fn the_report_shows_the_burst_test() {
+        use super::super::burst::BurstResult;
+        use super::super::report::test_support::{dev, model, scene};
+        let mut d = dev("openvino:cpu", 20.0, scene());
+        let mut b = BurstResult {
+            cameras: 8,
+            images: 4,
+            interval_ms: 500,
+            bursts: 3,
+            requests: 96,
+            answered: 94,
+            triggers: 24,
+            triggers_incomplete: 2,
+            max_queue_depth: 12,
+            ..BurstResult::default()
+        };
+        b.latency_ms.p95 = 480.0;
+        b.trigger_ms.p95 = 1600.0;
+        b.refused.insert("queue_full".into(), 2);
+        d.run.as_mut().unwrap().burst = Some(b.clone());
+        let mut failed = dev("ort:coreml", 10.0, scene());
+        failed.run.as_mut().unwrap().burst = Some(BurstResult {
+            error: Some("its worker did not load on ort:coreml".into()),
+            ..b
+        });
+        let m = model(vec![d, failed], None);
+        let r = BenchmarkResults::new(Default::default(), Default::default(), vec![m]);
+        let md = markdown(&r);
+        assert!(md.contains("Burst test (ms)"), "{md}");
+        assert!(md.contains("8 x 4 x 500 ms"), "{md}");
+        assert!(
+            md.contains("| 480.0 |") && md.contains("| 1600.0 |"),
+            "{md}"
+        );
+        assert!(md.contains("2 (queue_full 2)"), "{md}");
+        assert!(
+            md.contains("not measured: its worker did not load on ort:coreml"),
+            "{md}"
+        );
+        assert!(html(&r).contains("Burst test (ms)"));
+        let plain = model(vec![dev("openvino:cpu", 20.0, scene())], None);
+        let r = BenchmarkResults::new(Default::default(), Default::default(), vec![plain]);
+        assert!(!markdown(&r).contains("Burst test"));
     }
 
     #[test]

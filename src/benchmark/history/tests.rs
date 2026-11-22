@@ -1214,3 +1214,60 @@ fn the_goal_metric_changes_only_when_the_intervals_part_and_old_entries_load() {
     let e = HistoryEntry::from(&m);
     assert_eq!(e.devices[0].live_requests_per_min, Some(3.5));
 }
+
+/// The burst p95 is recorded from a run's burst test (none without one, or when it measured
+/// nothing); two runs compare it as a speed only under the same load.
+#[test]
+fn the_burst_p95_is_recorded_and_compares_under_the_same_load() {
+    use crate::benchmark::burst::BurstResult;
+    let burst = |p95: f64, cameras: usize| BurstResult {
+        cameras,
+        images: 4,
+        interval_ms: 500,
+        bursts: 3,
+        requests: cameras * 12,
+        answered: cameras * 12,
+        latency_ms: crate::benchmark::Stats {
+            p95,
+            ..Default::default()
+        },
+        ..BurstResult::default()
+    };
+    let mut d = dev("ort:cpu", 10.0, scene());
+    d.run.as_mut().unwrap().burst = Some(burst(480.0, 8));
+    let e = HistoryEntry::from(&model(vec![d], None));
+    assert_eq!(e.devices[0].burst_p95_ms, Some(480.0));
+    assert_eq!(e.devices[0].burst_load.as_deref(), Some("8 x 4 x 500 ms"));
+    let mut failed = dev("ort:cpu", 10.0, scene());
+    failed.run.as_mut().unwrap().burst = Some(BurstResult {
+        error: Some("did not load".into()),
+        ..burst(0.0, 8)
+    });
+    let e = HistoryEntry::from(&model(vec![failed], None));
+    assert_eq!(e.devices[0].burst_p95_ms, None);
+    let with = |p95: Option<f64>, load: &str| DeviceSnap {
+        burst_p95_ms: p95,
+        burst_load: p95.map(|_| load.to_string()),
+        ..snap("ort:cpu", 20.0, Some(0.8), 400)
+    };
+    let m = |a: &DeviceSnap, b: &DeviceSnap| {
+        compare(&entry("r1", vec![a.clone()]), &entry("r2", vec![b.clone()]))
+            .metrics
+            .into_iter()
+            .find(|c| c.metric == "burst_p95_ms")
+    };
+    let slower = m(
+        &with(Some(400.0), "8 x 4 x 500 ms"),
+        &with(Some(800.0), "8 x 4 x 500 ms"),
+    );
+    assert_eq!(slower.unwrap().verdict, Verdict::Worse);
+    let other = m(
+        &with(Some(400.0), "8 x 4 x 500 ms"),
+        &with(Some(800.0), "10 x 5 x 500 ms"),
+    );
+    assert_eq!(other.unwrap().verdict, Verdict::NotComparable);
+    assert!(m(&with(None, ""), &with(None, "")).is_none());
+    // An entry of an older version has none.
+    let old: DeviceSnap = serde_json::from_str(r#"{"device":"ort:cpu"}"#).unwrap();
+    assert!(old.burst_p95_ms.is_none() && old.burst_load.is_none());
+}

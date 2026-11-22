@@ -88,6 +88,9 @@ pub struct RunRequest {
     /// `<model>+served`.
     #[serde(default)]
     pub served: bool,
+    /// The burst test after each device's timed runs (`benchmark.burst`, [`super::burst`]).
+    #[serde(default)]
+    pub burst: crate::config::BurstConfig,
 }
 
 fn default_true() -> bool {
@@ -119,6 +122,7 @@ impl RunRequest {
             accuracy_metric: b.accuracy_metric,
             low_priority: b.low_priority,
             served: b.served,
+            burst: b.burst,
         }
     }
 
@@ -127,8 +131,9 @@ impl RunRequest {
     /// `reference_model` ("" = automatic), `accuracy_weight` (0..1), `threshold_objective`
     /// (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>`, `youden`,
     /// `fpr:<x>`), `accuracy_metric`
-    /// (`ap50`, `roc_auc`), `low_priority` and `served` (the last value wins: the page sends a
-    /// hidden `0` followed by the checkbox's `1`).
+    /// (`ap50`, `roc_auc`), `low_priority`, `served` and `burst` (the last value wins: the page
+    /// sends a hidden `0` followed by the checkbox's `1`), `burst_cameras`, `burst_images` and
+    /// `burst_interval_ms` (`benchmark.burst`'s ranges).
     pub fn from_form(form: &[(String, String)], defaults: &BenchmarkConfig) -> Result<Self> {
         let has = |k: &str| form.iter().any(|(key, _)| key == k);
         let all = |k: &str| -> Vec<String> {
@@ -187,6 +192,16 @@ impl RunRequest {
         if let Some((_, v)) = form.iter().rev().find(|(key, _)| key == "served") {
             req.served = parse_form_bool("served", v)?;
         }
+        if let Some((_, v)) = form.iter().rev().find(|(key, _)| key == "burst") {
+            req.burst.enabled = parse_form_bool("burst", v)?;
+        }
+        req.burst.cameras = num("burst_cameras", req.burst.cameras)?;
+        req.burst.images = num("burst_images", req.burst.images)?;
+        let interval = num(
+            "burst_interval_ms",
+            usize::try_from(req.burst.interval_ms).unwrap_or(usize::MAX),
+        )?;
+        req.burst.interval_ms = u64::try_from(interval).unwrap_or(u64::MAX);
         req.validate()?;
         Ok(req)
     }
@@ -207,6 +222,7 @@ impl RunRequest {
         if self.datasets.is_empty() {
             bail!("choose at least one dataset");
         }
+        self.burst.validate()?;
         self.parsed_devices()?;
         Ok(())
     }
@@ -229,6 +245,7 @@ impl RunRequest {
         b.set_legacy(self.threshold_objective, self.accuracy_metric);
         b.low_priority = self.low_priority;
         b.served = self.served;
+        b.burst = self.burst;
     }
 }
 
@@ -871,6 +888,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         runs_total: run.runs_total(&entries),
         model_count: entries.len(),
         started: Instant::now(),
+        burst: req.burst.enabled,
     };
     // Summaries of the finished models (the full results are saved as each model finishes and
     // dropped: BM-11).
@@ -1031,6 +1049,8 @@ struct OverallProgress {
     runs_total: usize,
     model_count: usize,
     started: Instant,
+    /// The run has a burst test after each device's timed runs.
+    burst: bool,
 }
 
 impl OverallProgress {
@@ -1042,11 +1062,14 @@ impl OverallProgress {
         } else {
             p.done as f64 / p.total as f64
         };
-        // Loading and warm-up count as the first 10% of a device run, timing as the rest.
+        // Loading and warm-up count as the first 10% of a device run, timing as the rest; with
+        // the burst test, timing to 70% and the burst the last 30%.
+        let timing_share = if self.burst { 0.6 } else { 0.9 };
         let within = match p.phase {
             Phase::Loading => 0.0,
             Phase::Warmup => 0.1 * frac,
-            Phase::Timing => 0.1 + 0.9 * frac,
+            Phase::Timing => 0.1 + timing_share * frac,
+            Phase::Burst => 0.1 + timing_share + (0.9 - timing_share) * frac,
         };
         let percent = if self.runs_total == 0 {
             0.0
@@ -1275,6 +1298,13 @@ impl ServiceRun<'_> {
         let live_ref = live.as_ref().map(|f| f as &(dyn Fn() -> u64 + Sync));
         bench.live_requests = live_ref;
         bench.video_decode = true;
+        // The burst test on the registry's runtimes, with the run's config (never registered:
+        // the serving workers keep answering Blue Iris beside it).
+        let burst = req
+            .burst
+            .enabled
+            .then(|| super::burst::Burst::new(req.burst, &self.runtimes, &ctx.config));
+        bench.burst = burst.as_ref();
         let devices = self
             .devices
             .clone()
@@ -1516,6 +1546,55 @@ mod tests {
             // Tests never change the test process's priority.
             low_priority: false,
             served: false,
+            burst: crate::config::BurstConfig::default(),
+        }
+    }
+
+    /// `burst` on the form: off by default; the switch's last value wins, the three numbers
+    /// replace the configured load and are range-checked by name; Save as default writes
+    /// `benchmark.burst`.
+    #[test]
+    fn the_burst_test_on_the_form() {
+        let defaults = BenchmarkConfig::default();
+        let r = RunRequest::from_form(&form(&[("dataset", "sample")]), &defaults).unwrap();
+        assert_eq!(r.burst, crate::config::BurstConfig::default());
+        assert!(!r.burst.enabled);
+        let r = RunRequest::from_form(
+            &form(&[
+                ("dataset", "sample"),
+                ("burst", "0"),
+                ("burst", "1"),
+                ("burst_cameras", "5"),
+                ("burst_images", "3"),
+                ("burst_interval_ms", "250"),
+            ]),
+            &defaults,
+        )
+        .unwrap();
+        assert_eq!(
+            r.burst,
+            crate::config::BurstConfig {
+                enabled: true,
+                cameras: 5,
+                images: 3,
+                interval_ms: 250
+            }
+        );
+        let mut saved = BenchmarkConfig::default();
+        r.to_config(&mut saved);
+        assert_eq!(saved.burst, r.burst);
+        assert_eq!(RunRequest::defaults(&saved).burst, r.burst);
+        for (k, v, want) in [
+            ("burst_cameras", "33", "benchmark.burst.cameras"),
+            ("burst_images", "0", "benchmark.burst.images"),
+            ("burst_interval_ms", "10", "benchmark.burst.interval_ms"),
+            ("burst_images", "x", "burst_images: 'x' is not a number"),
+            ("burst", "maybe", "burst: 'maybe' is not a yes/no value"),
+        ] {
+            let e = RunRequest::from_form(&form(&[("dataset", "sample"), (k, v)]), &defaults)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(want), "{k}={v}: {e}");
         }
     }
 

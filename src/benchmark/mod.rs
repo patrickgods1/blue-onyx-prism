@@ -27,6 +27,7 @@
 //! server can benchmark through the registry's own runtimes (one OpenVINO `Core`, the ONNX
 //! Runtime flavor the process loaded) while the workers keep serving.
 
+pub mod burst;
 pub mod cameras;
 pub mod cli;
 pub mod combos;
@@ -608,6 +609,10 @@ pub struct RunResult {
     /// An As served run ([`variant`]): what its served pipeline did on this device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served: Option<ServedRun>,
+    /// The burst test on this device ([`burst`]); None when it did not run (off, or results
+    /// saved before it existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<burst::BurstResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_image: Vec<ImageRun>,
     /// Per image (same order as `per_image`): the predictions at the evaluation threshold in

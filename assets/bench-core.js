@@ -15,11 +15,17 @@
 // - rowChips(row): the chips of a Compare / Tune row (default, trained here, too slow, target not
 //   met, served, stale rules, low confidence, relative, flat), each {cls, text, tip}.
 // - COLUMNS, columnsOf(stored) / columnsText(list): the Compare table's optional columns and their
-//   stored choice (localStorage `prism.bench.columns`, via store).
+//   stored choice (localStorage `prism.bench.columns`, via store); burstFacts(b): the texts of a
+//   row's burst test (load, request p50 · p95 · p99, last answer, refused, queue).
 // - comboStates(run): the run poll's per-combo list ({model, device, state, text, now}).
 // - cpuReference(devices, dismissed): the CPU device to tick when 2+ devices and no CPU one are
 //   ticked (without a CPU reference nothing is recommended); null when none is needed.
-// - estimate(o): seconds a run takes from the last run's time per image ({seconds, known, pairs}).
+// - estimate(o): seconds a run takes from the last run's time per image ({seconds, known, pairs});
+//   with o.burst ({cameras, images, interval_ms}) each pair adds burstSeconds(b, ms per image)
+//   and `burst` is the share of it.
+// - burstSeconds(b, perMs): about how long one combo's burst test takes (src/benchmark/burst.rs:
+//   BURSTS bursts, the next one K x I + 2 s after the one before and 2 s after its last answer;
+//   the worker's load counted as BURST_LOAD_S).
 // - mapHash(hash): the new address of an old /benchmark#tab-... link (null: none).
 // - disagree(a, b): the frames on which two combos' examples disagree (one misses or alerts where
 //   the other does not).
@@ -159,7 +165,7 @@
   var COLUMNS = [
     {key: "f1", label: "F1"}, {key: "f05", label: "F0.5"}, {key: "ap50", label: "AP50"}, {key: "ap50_95", label: "AP50-95"},
     {key: "roc_auc", label: "ROC AUC"}, {key: "p50", label: "p50"}, {key: "p99", label: "p99"}, {key: "burst", label: "Burst p95"},
-    {key: "first_load", label: "First load"}, {key: "cpu", label: "CPU check"}
+    {key: "last_answer", label: "Last answer"}, {key: "first_load", label: "First load"}, {key: "cpu", label: "CPU check"}
   ];
   function columnsOf(stored) {
     var list = stored;
@@ -182,6 +188,25 @@
     if (!fl || !has(fl.compileMs) || (!fl.compileMs && !fl.warmupMs && !fl.cache)) return "-";
     return loadText(fl.compileMs, fl.cache);
   }
+  // b: a Compare row's speed.burst (src/benchmark/eval/compare.rs BurstSpeed). The texts of the
+  // row details and the Speed tab: load ("8 cameras × 4 images, 500 ms apart"), request
+  // percentiles, time to a trigger's last answer, refusals, the queue; `error` when it measured
+  // nothing.
+  function burstFacts(b) {
+    if (!b) return null;
+    var plural = function (n, w) { return n + " " + w + (n === 1 ? "" : "s"); };
+    var out = {
+      load: plural(b.cameras, "camera") + " × " + plural(b.images, "image") + ", " + b.intervalMs + " ms apart",
+      short: b.cameras + " × " + b.images + " × " + b.intervalMs + " ms",
+      error: b.error || null,
+      latency: fmt.ms(b.p50Ms) + " · " + fmt.ms(b.p95Ms) + " · " + fmt.ms(b.p99Ms),
+      lastAnswer: fmt.ms(b.lastAnswerP50Ms) + " · " + fmt.ms(b.lastAnswerP95Ms),
+      refused: b.refused ? fmt.int(b.refused) + " of " + fmt.int(b.requests) + " (" + b.refusedBy + ")" : "none of " + fmt.int(b.requests),
+      queue: "up to " + fmt.int(b.maxQueueDepth) + " waiting (queue " + fmt.int(b.queueCapacity) + ", " + fmt.int(b.inflight) + " in flight)"
+    };
+    if (b.error) { out.latency = out.lastAnswer = "-"; out.refused = "-"; out.queue = "-"; }
+    return out;
+  }
   function columnValue(row, key) {
     var s = row.speed || {};
     switch (key) {
@@ -192,7 +217,8 @@
       case "roc_auc": return fmt.n2(row.rocAuc);
       case "p50": return fmt.ms(s.p50Ms);
       case "p99": return fmt.ms(s.p99Ms);
-      case "burst": return has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : "not run";
+      case "burst": return has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : s.burst ? "no answer" : "not run";
+      case "last_answer": return s.burst && has(s.burst.lastAnswerP95Ms) ? fmt.ms(s.burst.lastAnswerP95Ms) : s.burst ? "-" : "not run";
       case "first_load": return firstLoadText(s.firstLoad);
       case "cpu": return agreementText(row.agreement);
     }
@@ -202,7 +228,7 @@
   // ---- the run's combos ------------------------------------------------------------------------
   function key(s) { return String(s || "").trim().toLowerCase(); }
   function sameDevice(a, b) { var x = key(a).replace(/\.0$/, ""), y = key(b).replace(/\.0$/, ""); return x === y; }
-  var PHASE = {loading: "compiling", warmup: "warming up", timing: "scoring"};
+  var PHASE = {loading: "compiling", warmup: "warming up", timing: "scoring", burst: "burst test"};
   // run: the `run` of GET /v1/benchmark?only=run ({request, progress, models, running, state}).
   function comboStates(run) {
     if (!run) return [];
@@ -230,7 +256,8 @@
         else if (m && m.error) { item.state = "failed"; item.text = "failed: " + m.error; }
         else if (current && run.running) {
           item.now = true; item.state = PHASE[prog.phase] ? prog.phase : "timing";
-          item.text = prog.phase === "timing" && prog.total ? "scoring " + fmt.int(prog.done) + " of " + fmt.int(prog.total) + " images" : (PHASE[prog.phase] || "running");
+          item.text = prog.phase === "timing" && prog.total ? "scoring " + fmt.int(prog.done) + " of " + fmt.int(prog.total) + " images"
+            : prog.phase === "burst" && prog.total ? "burst test: " + fmt.int(prog.done) + " of " + fmt.int(prog.total) + " answered" : (PHASE[prog.phase] || "running");
           if (!dev) item.device = prog.device;
         } else if (!run.running) { item.state = "skipped"; item.text = run.state === "cancelled" ? "not run (cancelled)" : "not run"; }
         out.push(item);
@@ -250,10 +277,25 @@
     cpus.forEach(function (d) { if (!pick || (d.spec.indexOf("openvino:") === 0 && pick.spec.indexOf("openvino:") !== 0)) pick = d; });
     return pick ? pick.spec : null;
   }
+  // The burst test (src/benchmark/burst.rs): BURSTS bursts; one lasts until its last send's answer
+  // ((K - 1) x I + one request) or until the work queued is done (C x K requests one at a time:
+  // the slowest case), whichever is later; the next starts K x I + 2 s after it began and 2 s
+  // after its last answer. The
+  // worker's compile (from the cache the timed run just filled) and warm-up: BURST_LOAD_S.
+  var BURSTS = 3, BURST_SETTLE_S = 2, BURST_LOAD_S = 3;
+  function burstSeconds(b, perMs) {
+    if (!b) return 0;
+    var c = Math.max(1, b.cameras || 1), k = Math.max(1, b.images || 1), i = Math.max(0, b.interval_ms || 0) / 1000;
+    var per = has(perMs) && perMs > 0 ? perMs / 1000 : 0;
+    var one = Math.max((k - 1) * i + per, c * k * per), total = BURST_LOAD_S;
+    for (var n = 0; n < BURSTS; n++) total += n < BURSTS - 1 ? Math.max(k * i + BURST_SETTLE_S, one + BURST_SETTLE_S) : one;
+    return total;
+  }
   // o: {models: [name], devices: [spec], timing: {model: {device: ms per image}}, images (total per
-  // run, after the per-set limit), repeat, warmup}. The warm-up lasts 2 to 20 s once on.
+  // run, after the per-set limit), repeat, warmup, burst (null: off)}. The warm-up lasts 2 to 20 s
+  // once on.
   function estimate(o) {
-    var total = 0, known = 0, pairs = (o.models || []).length * (o.devices || []).length;
+    var total = 0, known = 0, burst = 0, pairs = (o.models || []).length * (o.devices || []).length;
     var repeat = Math.max(1, o.repeat || 1), warmup = Math.max(0, o.warmup || 0), n = o.images || 0;
     (o.models || []).forEach(function (m) {
       var t = (o.timing || {})[m] || {};
@@ -262,10 +304,13 @@
         Object.keys(t).forEach(function (k) { if (sameDevice(k, d)) per = t[k]; });
         if (!has(per) || !(per > 0) || !n) return;
         var warm = warmup > 0 ? Math.min(20, Math.max(2, warmup * per / 1000)) : 0;
-        total += warm + repeat * n * per / 1000; known++;
+        var b = o.burst ? burstSeconds(o.burst, per) : 0;
+        total += warm + repeat * n * per / 1000 + b; burst += b; known++;
       });
     });
-    return {seconds: known ? total : null, known: known, pairs: pairs};
+    var out = {seconds: known ? total : null, known: known, pairs: pairs};
+    if (o.burst) out.burst = known ? burst : null;
+    return out;
   }
 
   // ---- old addresses ---------------------------------------------------------------------------
@@ -394,7 +439,8 @@
     roc_auc: "How well a frame's top confidence separates frames with an object from empty ones (0.5 = chance).",
     first_load: "Compile (or cache load) plus warm-up of this model on this device when it starts.",
     cpu: "Detections compared image by image with the CPU device's, at this device's served confidence: catches a broken device path.",
-    burst: "p95 under a burst of cameras triggering together (the burst test).",
+    burst: "p95 under a burst of cameras triggering together (the burst test): each request timed from when it was due, queue wait included.",
+    last_answer: "Burst test: from a trigger's first image being due to its last answer (p95 over the triggers), what Blue Iris waits for all of a trigger's answers.",
     low_confidence: "Too little data to cross-validate (fewer than 4 camera days or 50 labelled objects): the figures are in-sample and the interval is wide."
   };
   function tipText(k) { return TERMS[k] || ""; }
@@ -409,7 +455,7 @@
     targetProblem: targetProblem, goalPairs: goalPairs, encodePairs: encodePairs, tryParams: tryParams, withTry: withTry,
     withoutTry: withoutTry, rowChips: rowChips, COLUMNS: COLUMNS, columnsOf: columnsOf, columnsText: columnsText,
     columnValue: columnValue, agreementText: agreementText, loadText: loadText, firstLoadText: firstLoadText, comboStates: comboStates,
-    sameDevice: sameDevice, cpuReference: cpuReference, estimate: estimate, mapHash: mapHash, disagree: disagree,
+    sameDevice: sameDevice, cpuReference: cpuReference, estimate: estimate, burstSeconds: burstSeconds, burstFacts: burstFacts, mapHash: mapHash, disagree: disagree,
     boxRect: boxRect, compareCsv: compareCsv, rangeText: rangeText, placeLabels: placeLabels, cellTag: cellTag, TERMS: TERMS, store: store
   };
   root.BenchTags = {cellTag: cellTag};

@@ -113,6 +113,9 @@ pub fn run(
     req.datasets = sets;
     req.devices = devices;
     req.reference_model = None;
+    // The held-out scores of a trained model, not its latency under load: no burst test (the
+    // Benchmark page runs one when asked).
+    req.burst.enabled = false;
     req.validate()?;
     let started = Instant::now();
     let mut pending = Some(c);

@@ -871,6 +871,81 @@ pub struct BenchmarkConfig {
     /// `<model>+served` beside the bare ones ([`crate::benchmark::variant`]). Default false:
     /// the bare model.
     pub served: bool,
+    /// The burst test ([`crate::benchmark::burst`]): after each model x device's timed run, a
+    /// temporary worker of the serving code gets `cameras` triggers at once, each sending
+    /// `images` frames `interval_ms` apart (open loop). Off by default: it adds 10 s to a minute
+    /// per combo (more when the queue backs up) and loads the device like a busy Blue Iris.
+    pub burst: BurstConfig,
+}
+
+/// `benchmark.burst`: the burst test's switch and load ([`crate::benchmark::burst`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BurstConfig {
+    /// Run the burst test (default false).
+    pub enabled: bool,
+    /// Cameras that trigger at the same moment ([`BURST_CAMERAS`]).
+    pub cameras: usize,
+    /// Images each camera sends per trigger ([`BURST_IMAGES`]).
+    pub images: usize,
+    /// Time between one camera's images, ms ([`BURST_INTERVAL_MS`]).
+    pub interval_ms: u64,
+}
+
+/// Accepted range of `benchmark.burst.cameras`.
+pub const BURST_CAMERAS: (usize, usize) = (1, 32);
+/// Accepted range of `benchmark.burst.images`.
+pub const BURST_IMAGES: (usize, usize) = (1, 20);
+/// Accepted range of `benchmark.burst.interval_ms`.
+pub const BURST_INTERVAL_MS: (u64, u64) = (50, 5000);
+
+impl Default for BurstConfig {
+    /// 8 cameras x 4 images, 500 ms apart: inside the 5-10 cameras x 3-5 images a Blue Iris
+    /// trigger of a typical install sends (1 + "real-time images").
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cameras: 8,
+            images: 4,
+            interval_ms: 500,
+        }
+    }
+}
+
+impl BurstConfig {
+    /// Range-check the load (the switch is free); errors name the key.
+    pub fn validate(&self) -> Result<()> {
+        check_range(
+            "benchmark.burst.cameras",
+            self.cameras,
+            BURST_CAMERAS.0,
+            BURST_CAMERAS.1,
+        )?;
+        check_range(
+            "benchmark.burst.images",
+            self.images,
+            BURST_IMAGES.0,
+            BURST_IMAGES.1,
+        )?;
+        check_range(
+            "benchmark.burst.interval_ms",
+            self.interval_ms,
+            BURST_INTERVAL_MS.0,
+            BURST_INTERVAL_MS.1,
+        )
+    }
+
+    /// "8 cameras x 4 images, 500 ms apart".
+    pub fn describe(&self) -> String {
+        format!(
+            "{} camera{} x {} image{}, {} ms apart",
+            self.cameras,
+            if self.cameras == 1 { "" } else { "s" },
+            self.images,
+            if self.images == 1 { "" } else { "s" },
+            self.interval_ms
+        )
+    }
 }
 
 impl Default for BenchmarkConfig {
@@ -893,6 +968,7 @@ impl Default for BenchmarkConfig {
             accuracy_metric: Default::default(),
             low_priority: true,
             served: false,
+            burst: BurstConfig::default(),
         }
     }
 }
@@ -1843,6 +1919,7 @@ impl Config {
                 bail!("{field}: must be between 0 and 1, got {w}");
             }
         }
+        b.burst.validate()?;
         Ok(())
     }
 }
@@ -3547,6 +3624,64 @@ mod tests {
         assert!(check(|c| c.benchmark.max_images_per_dataset = usize::MAX).is_ok());
     }
 
+    /// `benchmark.burst`: off by default at 8 x 4 x 500 ms; each load key is range-checked by
+    /// name (cameras 1-32, images 1-20, interval 50-5000 ms) whether or not the test is on.
+    #[test]
+    fn validate_benchmark_burst() {
+        let b = Config::default().benchmark.burst;
+        assert_eq!(
+            (b.enabled, b.cameras, b.images, b.interval_ms),
+            (false, 8, 4, 500)
+        );
+        let parsed: BurstConfig = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert_eq!(
+            parsed,
+            BurstConfig {
+                enabled: true,
+                ..BurstConfig::default()
+            }
+        );
+        rejects(
+            |c| c.benchmark.burst.cameras = 0,
+            "benchmark.burst.cameras",
+            "1 and 32",
+        );
+        rejects(
+            |c| c.benchmark.burst.cameras = 33,
+            "benchmark.burst.cameras",
+            "1 and 32",
+        );
+        rejects(
+            |c| c.benchmark.burst.images = 21,
+            "benchmark.burst.images",
+            "1 and 20",
+        );
+        rejects(
+            |c| c.benchmark.burst.interval_ms = 49,
+            "benchmark.burst.interval_ms",
+            "50 and 5000",
+        );
+        rejects(
+            |c| c.benchmark.burst.interval_ms = 5001,
+            "benchmark.burst.interval_ms",
+            "50 and 5000",
+        );
+        for (c, k, i) in [(1, 1, 50), (32, 20, 5000)] {
+            assert!(
+                check(|cfg| {
+                    cfg.benchmark.burst = BurstConfig {
+                        enabled: true,
+                        cameras: c,
+                        images: k,
+                        interval_ms: i,
+                    }
+                })
+                .is_ok()
+            );
+        }
+        assert_eq!(b.describe(), "8 cameras x 4 images, 500 ms apart");
+    }
+
     // One test per validation rule of `Config::validate`, `validate_models` and `validate_config`
     // (PR-5 test gap): break exactly one field of a valid config, assert the error names it.
 
@@ -4002,6 +4137,9 @@ mod tests {
         }
         for k in bench {
             check(format!("benchmark.{k}"));
+        }
+        for k in serde_fields(BurstConfig::deserialize) {
+            check(format!("benchmark.burst.{k}"));
         }
         assert!(
             missing.is_empty(),

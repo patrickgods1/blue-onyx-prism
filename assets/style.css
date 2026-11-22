@@ -1876,6 +1876,14 @@ label.check.unavailable { opacity: 0.65; }
 .bn-opts .bn-grid3 { margin-top: 0.75rem; }
 .bench .bn-opts label { color: var(--fg); }
 .bench .bn-opts input[type="number"] { width: 5.5rem; }
+/* The Options' checkboxes, each on its own line (box beside its wrapped text). */
+.bn-opts label.check { display: flex; flex-direction: row; align-items: flex-start; gap: 0.5rem; margin: 0 0 0.6rem; }
+.bn-opts label.check input { flex: none; margin-top: 0.2rem; }
+/* The burst test's load under its checkbox: "[8] cameras × [4] images, [500] ms apart", wrapping. */
+.bn-burst { border: 0; margin: 0 0 0.6rem 1.6rem; padding: 0; min-width: 0; display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem; align-items: center; }
+.bench .bn-opts .bn-burst input[type="number"] { width: 4.5rem; }
+.bn-burst[disabled] { opacity: 0.6; }
+.bn-burst p { flex-basis: 100%; margin: 0; }
 
 .bn-start .bn-row { justify-content: space-between; }
 .bench .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.75rem; }

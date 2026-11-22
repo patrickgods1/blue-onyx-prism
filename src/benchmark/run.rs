@@ -65,6 +65,9 @@ pub enum Phase {
     Warmup,
     /// Timed iterations over the images.
     Timing,
+    /// The burst test after the timed runs ([`super::burst`]; done / total = requests answered
+    /// of those it sends).
+    Burst,
 }
 
 /// Progress of one device run, reported through [`Bench::progress`].
@@ -137,6 +140,8 @@ pub struct Bench<'a> {
     /// ([`RunResult::video_decode_pct`]; Windows only, a no-op elsewhere). Off for detections
     /// over frames.
     pub video_decode: bool,
+    /// The burst test after each device's timed run ([`super::burst`]); None = off.
+    pub burst: Option<&'a super::burst::Burst<'a>>,
     /// Test only: a pause in every evaluation post-process (the untimed work of B6).
     #[cfg(test)]
     pub(super) slow_eval: Option<Duration>,
@@ -241,6 +246,7 @@ impl std::fmt::Debug for Bench<'_> {
             .field("warmup_rule", &self.warmup_rule)
             .field("live_requests", &self.live_requests.is_some())
             .field("video_decode", &self.video_decode)
+            .field("burst", &self.burst)
             .finish()
     }
 }
@@ -412,6 +418,7 @@ impl<'a> Bench<'a> {
             warmup_rule: WarmupRule::DEFAULT,
             live_requests: None,
             video_decode: false,
+            burst: None,
             #[cfg(test)]
             slow_eval: None,
         }
@@ -430,14 +437,14 @@ impl<'a> Bench<'a> {
             .join(", ")
     }
 
-    fn check_cancel(&self) -> Result<()> {
+    pub(super) fn check_cancel(&self) -> Result<()> {
         if self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(Cancelled.into());
         }
         Ok(())
     }
 
-    fn report(
+    pub(super) fn report(
         &self,
         job: &Job,
         device: &str,
@@ -582,9 +589,16 @@ impl<'a> Bench<'a> {
             night,
             record,
         };
-        self.time(
+        // `time` owns the backend and its companions and drops them before it returns: the
+        // burst's worker never loads beside the benchmark's own copy.
+        let mut result = self.time(
             job, requested, backend, companions, compile_ms, cache, tuning,
-        )
+        )?;
+        if let Some(burst) = self.burst {
+            self.check_cancel()?;
+            result.burst = Some(burst.run(self, job, &result)?);
+        }
+        Ok(result)
     }
 
     /// As served: compile the night model (and its verifier) on `device`, the spec the model
@@ -872,6 +886,7 @@ impl<'a> Bench<'a> {
             grades: Some(grades),
             agreement: None,
             served: record,
+            burst: None,
             eval_preds,
             per_image: timed.per_image,
         })

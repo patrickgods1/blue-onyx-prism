@@ -737,6 +737,41 @@ pub(super) fn print_device_table(result: &ModelResult, m: &ModelReport) {
             println!("  {}: {w}", r.requested_device);
         }
     }
+    for r in &runs {
+        for line in burst_lines(r) {
+            println!("  {}: {line}", r.requested_device);
+        }
+    }
+}
+
+/// The burst test of `r` ([`crate::benchmark::burst`]): its numbers, then its notes; nothing
+/// when it did not run.
+pub(super) fn burst_lines(r: &RunResult) -> Vec<String> {
+    let Some(b) = &r.burst else {
+        return Vec::new();
+    };
+    let mut out = vec![b.describe()];
+    if b.error.is_none() {
+        out.push(format!(
+            "  {} triggers ({} incomplete), {} frames from {}, worker loaded in {}, longest send              lag {}{}",
+            b.triggers,
+            b.triggers_incomplete,
+            b.frames,
+            b.frame_sets.join(", "),
+            crate::benchmark::burst::ms_text(b.load_ms),
+            crate::benchmark::burst::ms_text(b.max_send_lag_ms),
+            b.live_requests_per_min
+                .filter(|v| *v > 0.0)
+                .map_or(String::new(), |v| format!(
+                    ", measured while serving {v:.1} requests/min"
+                ))
+        ));
+    }
+    if let Some(e) = &b.first_refusal {
+        out.push(format!("  first refusal: {e}"));
+    }
+    out.extend(b.notes.iter().map(|n| format!("  note: {n}")));
+    out
 }
 
 /// `AP50 / AP50-95: average over car, person (>= 20 objects each)`, or None without a recorded
@@ -954,6 +989,9 @@ pub(super) fn print_run(r: &RunResult) {
     if let Some(w) = crate::benchmark::report::shared_load_text(r) {
         println!("  {w}");
     }
+    for line in burst_lines(r) {
+        println!("  {line}");
+    }
     if let Some(s) = r
         .served
         .as_ref()
@@ -1106,10 +1144,18 @@ pub(super) fn print_compare(v: &crate::benchmark::eval::compare::CompareView) {
             f(r.precision),
             r.fa100.map_or("-".to_string(), |v| format!("{v:.1}")),
             r.confidence.map_or("-".to_string(), |c| format!("{c:.2}")),
-            r.speed
-                .p95_ms
-                .map_or("-".to_string(), |p| format!("{p:.1}")),
+            match (r.speed.burst_p95_ms, r.speed.p95_ms) {
+                (Some(b), _) => format!("{b:.1}b"),
+                (None, Some(p)) => format!("{p:.1}"),
+                (None, None) => "-".to_string(),
+            },
             flags.join(", ")
+        );
+    }
+    if v.rows.iter().any(|r| r.speed.burst_p95_ms.is_some()) {
+        println!(
+            "  p95 ms with b = the burst test's request p95 (queue wait included; the speed \
+             budget applies to it), else one image at a time."
         );
     }
     println!("  {}", v.headline);
@@ -1209,6 +1255,7 @@ mod tests {
             grades: None,
             agreement: None,
             served: None,
+            burst: None,
             per_image: Vec::new(),
             eval_preds: Vec::new(),
         };

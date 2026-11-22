@@ -395,6 +395,107 @@ fn the_cpu_reference_and_the_estimate() {
     assert_eq!(v["noImages"]["seconds"], Value::Null);
 }
 
+/// The burst test's time per combo (`burstSeconds`, the twin of `src/benchmark/burst.rs`'s
+/// schedule: 3 bursts, the next one K x I + 2 s after the one before and 2 s after its last
+/// answer, the worker's load 3 s) and the Run estimate with it.
+#[test]
+fn the_burst_test_estimate() {
+    if !have_node() {
+        return;
+    }
+    let v = eval(
+        r#"(function () {
+          var b = {cameras: 8, images: 4, interval_ms: 500};
+          return {
+            fast: BC.burstSeconds(b, 100),
+            unknown: BC.burstSeconds(b, null),
+            off: BC.burstSeconds(null, 100),
+            one: BC.burstSeconds({cameras: 1, images: 1, interval_ms: 50}, 20),
+            est: BC.estimate({models: ["m", "n"], devices: ["openvino:gpu", "openvino:cpu"], timing: {m: {"openvino:gpu.0": 100, "openvino:cpu": 400}, n: {}}, images: 50, repeat: 2, warmup: 3, burst: b}),
+            noBurst: BC.estimate({models: ["m"], devices: ["openvino:cpu"], timing: {m: {"openvino:cpu": 400}}, images: 50, repeat: 2, warmup: 3})
+          };
+        })()"#,
+    );
+    let f = |k: &str| v[k].as_f64().unwrap();
+    // 100 ms: a burst lasts max(1.5 s of sends + 0.1, 32 x 0.1 s queued) = 3.2 s; the next starts
+    // max(4 s, 3.2 + 2 s) later: 3 + 5.2 + 5.2 + 3.2.
+    assert!((f("fast") - 16.6).abs() < 1e-9, "{v}");
+    // Unknown speed: the sends alone, 3 + 4 + 4 + 1.5.
+    assert!((f("unknown") - 12.5).abs() < 1e-9, "{v}");
+    assert_eq!(f("off"), 0.0);
+    // One request of 20 ms: a burst lasts 0.02 s, the next starts max(0.05 + 2, 0.02 + 2) s
+    // later: 3 + 2.05 + 2.05 + 0.02.
+    assert!((f("one") - 7.12).abs() < 1e-9, "{v}");
+    // The run estimate: m on the GPU 12 s + 16.6 s, on the CPU 42 s + (3 + 14.8 + 14.8 +
+    // 12.8) s; n unknown.
+    let est = &v["est"];
+    assert!(
+        (est["seconds"].as_f64().unwrap() - (12.0 + 16.6 + 42.0 + 45.4)).abs() < 1e-9,
+        "{est}"
+    );
+    assert!(
+        (est["burst"].as_f64().unwrap() - (16.6 + 45.4)).abs() < 1e-9,
+        "{est}"
+    );
+    assert_eq!(
+        (est["known"].clone(), est["pairs"].clone()),
+        (json!(2), json!(4))
+    );
+    assert_eq!(
+        v["noBurst"]["burst"],
+        Value::Null,
+        "no burst asked: no share"
+    );
+    assert_eq!(v["noBurst"]["seconds"], json!(42));
+}
+
+/// A Compare row's burst texts (`burstFacts`) and its columns; the run poll's burst phase.
+#[test]
+fn the_burst_texts_and_the_burst_phase() {
+    if !have_node() {
+        return;
+    }
+    let v = eval(
+        r#"(function () {
+          var b = {cameras: 8, images: 4, intervalMs: 500, bursts: 3, requests: 96, answered: 94, p50Ms: 120, p95Ms: 480, p99Ms: 610,
+            lastAnswerP50Ms: 900, lastAnswerP95Ms: 1600, refused: 2, refusedBy: "queue_full 2", maxQueueDepth: 12, queueCapacity: 15, inflight: 2, notes: []};
+          var row = {speed: {burstP95Ms: 480, burst: b}}, none = {speed: {}}, failed = {speed: {burstP95Ms: null, burst: {cameras: 8, images: 4, intervalMs: 500, error: "its worker did not load", notes: []}}};
+          var run = {running: true, request: {models: ["m"], devices: ["openvino:cpu"]}, models: [],
+            progress: {stage: "benchmark", model: "m", device: "openvino:cpu", phase: "burst", done: 40, total: 96}};
+          return {
+            facts: BC.burstFacts(b), failed: BC.burstFacts(failed.speed.burst), none: BC.burstFacts(undefined),
+            cols: [BC.columnValue(row, "burst"), BC.columnValue(row, "last_answer"), BC.columnValue(none, "burst"), BC.columnValue(none, "last_answer"), BC.columnValue(failed, "burst")],
+            hasCol: BC.COLUMNS.some(function (c) { return c.key === "last_answer"; }),
+            combo: BC.comboStates(run).map(function (c) { return [c.state, c.text]; })
+          };
+        })()"#,
+    );
+    assert_eq!(
+        v["facts"],
+        json!({
+            "load": "8 cameras × 4 images, 500 ms apart",
+            "short": "8 × 4 × 500 ms",
+            "error": null,
+            "latency": "120 ms · 480 ms · 610 ms",
+            "lastAnswer": "900 ms · 1.6 s",
+            "refused": "2 of 96 (queue_full 2)",
+            "queue": "up to 12 waiting (queue 15, 2 in flight)"
+        })
+    );
+    assert_eq!(v["failed"]["error"], "its worker did not load");
+    assert_eq!(v["failed"]["latency"], "-");
+    assert_eq!(v["none"], Value::Null);
+    assert_eq!(
+        v["cols"],
+        json!(["480 ms", "1.6 s", "not run", "not run", "no answer"])
+    );
+    assert_eq!(v["hasCol"], true);
+    assert_eq!(
+        v["combo"],
+        json!([["burst", "burst test: 40 of 96 answered"]])
+    );
+}
+
 #[test]
 fn old_addresses_map_to_the_new_pages() {
     if !have_node() {

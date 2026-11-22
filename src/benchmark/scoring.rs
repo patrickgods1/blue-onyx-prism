@@ -618,6 +618,8 @@ pub(crate) fn pseudo_ground_truth(
         // Labels, not a measurement: nothing else to record.
         live_requests: None,
         video_decode: false,
+        // Labels: no burst test.
+        burst: None,
         #[cfg(test)]
         slow_eval: None,
     };

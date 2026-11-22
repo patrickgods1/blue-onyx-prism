@@ -7,7 +7,8 @@
 // - Two or more devices ticked and no CPU device: the CPU reference is ticked for the user with a
 //   note and Undo (BenchCore.cpuReference): without it no device is recommended.
 // - The estimate: the last run's time per image of each ticked model on each ticked device
-//   (BenchCore.estimate).
+//   (BenchCore.estimate), with the burst test's time per combo when it is ticked
+//   (BenchCore.burstSeconds; its three numbers are off while it is unticked).
 // - While a run goes: its combos and their state from the run poll (BenchCore.comboStates); Start
 //   is off; at the end "Compare results".
 // Downloads (POST /v1/resources/download) follow GET /v1/resources until done, then reload.
@@ -56,21 +57,42 @@
     if ($("add-folder").value.trim()) n += max || 0;
     return n;
   }
+  function burstLoad() {
+    if (!$("o-burst").checked) return null;
+    return {cameras: parseInt($("o-burst-cameras").value, 10) || 1, images: parseInt($("o-burst-images").value, 10) || 1, interval_ms: parseInt($("o-burst-interval").value, 10) || 0};
+  }
+  function burstNote(burst, models, devs, timing) {
+    var note = $("o-burst-est");
+    if (!burst) { note.textContent = "Off: each image is timed one at a time."; return; }
+    var lo = null, hi = null;
+    models.forEach(function (m) { devs.forEach(function (d) {
+      var t = timing[m.value] || {}, per = null;
+      Object.keys(t).forEach(function (k) { if (BC.sameDevice(k, d.value)) per = t[k]; });
+      var sec = BC.burstSeconds(burst, per);
+      lo = lo === null ? sec : Math.min(lo, sec); hi = hi === null ? sec : Math.max(hi, sec);
+    }); });
+    if (lo === null) lo = hi = BC.burstSeconds(burst, null);
+    var each = burst.cameras * burst.images * 3;
+    note.textContent = each + " requests per combo; about " + (Math.round(lo / 10) === Math.round(hi / 10) ? fmt.duration(hi) : fmt.duration(lo) + " to " + fmt.duration(hi)) + " per combo, added to the estimate below.";
+  }
   function estimate() {
     var models = ticked("model"), devs = ticked("device"), timing = {};
     models.forEach(function (c) { try { timing[c.value] = JSON.parse(c.dataset.timing || "{}"); } catch (e) { timing[c.value] = {}; } });
-    var n = images();
+    var n = images(), burst = burstLoad();
+    $("o-burst-fields").disabled = !burst;
+    burstNote(burst, models, devs, timing);
     var e = BC.estimate({models: models.map(function (c) { return c.value; }), devices: devs.map(function (c) { return c.value; }), timing: timing, images: n,
-      repeat: parseInt($("o-repeat").value, 10) || 1, warmup: parseInt($("o-warmup").value, 10) || 0});
+      repeat: parseInt($("o-repeat").value, 10) || 1, warmup: parseInt($("o-warmup").value, 10) || 0, burst: burst});
     var what = models.length + " model" + (models.length === 1 ? "" : "s") + " × " + devs.length + " device" + (devs.length === 1 ? "" : "s") + " × " + fmt.int(n) + " images";
     if (!e.pairs || !n) { $("est").textContent = "Tick images, models and devices"; $("est-detail").textContent = ""; return; }
     if (!BC.has(e.seconds)) { $("est").textContent = "Time unknown"; $("est-detail").textContent = "for " + what + " (no earlier run of these models on these devices)"; return; }
     $("est").textContent = "About " + fmt.duration(e.seconds);
-    $("est-detail").textContent = "for " + what + (e.known < e.pairs ? " (" + e.known + " of " + e.pairs + " pairs ran before; the others add to it)" : "") + ". Downloads and the reference model add to it.";
+    $("est-detail").textContent = "for " + what + (BC.has(e.burst) && e.burst > 0 ? ", burst test " + fmt.duration(e.burst) + " of it" : "") + (e.known < e.pairs ? " (" + e.known + " of " + e.pairs + " pairs ran before; the others add to it)" : "") + ". Downloads and the reference model add to it.";
   }
   form.addEventListener("change", function (e) { if (e.target && e.target.name === "device") deviceRules(e.target); estimate(); });
   form.addEventListener("input", estimate);
-  ["o-max", "o-repeat", "o-warmup"].forEach(function (id) { $(id).addEventListener("input", estimate); });
+  ["o-max", "o-repeat", "o-warmup", "o-burst-cameras", "o-burst-images", "o-burst-interval"].forEach(function (id) { $(id).addEventListener("input", estimate); });
+  $("o-burst").addEventListener("change", estimate);
 
   // ---- the form's body ---------------------------------------------------------------------------
   function folderField() { var f = $("add-folder").value.trim(); return f ? (f.indexOf("dir:") === 0 ? f : "dir:" + f) : null; }
@@ -86,6 +108,10 @@
     b.append("warmup", $("o-warmup").value || "0");
     b.append("low_priority", $("o-low").checked ? "1" : "0");
     b.append("served", $("o-served").checked ? "1" : "0");
+    b.append("burst", $("o-burst").checked ? "1" : "0");
+    b.append("burst_cameras", $("o-burst-cameras").value || "");
+    b.append("burst_images", $("o-burst-images").value || "");
+    b.append("burst_interval_ms", $("o-burst-interval").value || "");
     b.append("reference_model", $("o-ref").value);
     return b;
   }
