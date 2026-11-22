@@ -815,8 +815,14 @@ impl DatasetRef {
 
 /// Benchmark defaults (`benchmark` in the config file). Old config files without it get these
 /// defaults.
+///
+/// `remote = "Self"`: the derives become the inherent `BenchmarkConfig::serialize` /
+/// `BenchmarkConfig::deserialize`, wrapped by the trait impls below: a file without `goal` takes
+/// it from `threshold_objective` / `accuracy_metric` ([`crate::benchmark::eval::Goal::from_legacy`]),
+/// and both legacy keys are written from the goal ([`crate::benchmark::eval::Goal::legacy`]) so
+/// an older binary reading the file keeps working; `goal` wins when both are present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, remote = "Self")]
 pub struct BenchmarkConfig {
     /// Datasets to run on (see [`DatasetRef`]). Default: the three built-in sets.
     pub datasets: Vec<DatasetRef>,
@@ -839,6 +845,13 @@ pub struct BenchmarkConfig {
     /// Download the selected built-in datasets when a run starts (large ones still need
     /// `allow_large_downloads`).
     pub auto_download_datasets: bool,
+    /// What Compare ranks by and Tune picks the confidence for ([`crate::benchmark::eval::goal`]):
+    /// `optimize_for` (a threshold objective or `ap50` / `ap50_95` / `roc_auc` / `grade`),
+    /// `tune_for` (the objective of a rank-only goal), `classes` (counted classes, [] = every
+    /// scored class the set labels) and `speed_budget_ms` (null = none).
+    pub goal: crate::benchmark::eval::Goal,
+    /// Written from `goal` (its tuning objective) for older binaries; read only from files
+    /// without `goal`.
     /// What the best confidence threshold optimizes: `f1` (default), `f2` (favor recall), `f05`
     /// (favor precision), `precision:<p>` (highest recall with precision >= p), `recall:<r>`,
     /// `recall_at_fa:<N>` (highest recall with at most N false alerts per 100 empty frames),
@@ -875,11 +888,71 @@ impl Default for BenchmarkConfig {
             reference_model: None,
             weights: Default::default(),
             auto_download_datasets: true,
+            goal: Default::default(),
             threshold_objective: Default::default(),
             accuracy_metric: Default::default(),
             low_priority: true,
             served: false,
         }
+    }
+}
+
+impl BenchmarkConfig {
+    /// Write `threshold_objective` / `accuracy_metric` from the goal.
+    pub fn sync_legacy(&mut self) {
+        (self.threshold_objective, self.accuracy_metric) = self.goal.legacy();
+    }
+
+    /// What an older form or flag sets: a changed objective / metric pair becomes the goal
+    /// (keeping its classes and budget); the pair the goal already writes leaves it alone.
+    pub fn set_legacy(
+        &mut self,
+        objective: crate::benchmark::threshold::Objective,
+        metric: crate::benchmark::grade::AccuracyMetric,
+    ) {
+        let (o, m) = self.goal.legacy();
+        self.goal = self.goal.with_legacy(
+            (objective != o).then_some(objective),
+            (metric != m).then_some(metric),
+        );
+        self.sync_legacy();
+    }
+
+    /// Set the goal (the legacy keys follow).
+    pub fn set_goal(&mut self, goal: crate::benchmark::eval::Goal) {
+        self.goal = goal;
+        self.sync_legacy();
+    }
+}
+
+impl Serialize for BenchmarkConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut c = self.clone();
+        c.sync_legacy();
+        BenchmarkConfig::serialize(&c, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for BenchmarkConfig {
+    /// The derived fields; then, without `goal`, the goal from the legacy keys; the legacy keys
+    /// written from the goal.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error;
+        let mut v = serde_json::Value::deserialize(d)?;
+        let has_goal = v.get("goal").is_some_and(|g| !g.is_null());
+        if !has_goal && let Some(o) = v.as_object_mut() {
+            o.remove("goal");
+        }
+        let mut c = BenchmarkConfig::deserialize(v).map_err(D::Error::custom)?;
+        if !has_goal {
+            c.goal =
+                crate::benchmark::eval::Goal::from_legacy(c.threshold_objective, c.accuracy_metric);
+        }
+        c.goal
+            .validate()
+            .map_err(|e| D::Error::custom(format!("benchmark.goal: {e}")))?;
+        c.sync_legacy();
+        Ok(c)
     }
 }
 
@@ -2572,6 +2645,93 @@ mod tests {
             serde_json::from_str::<super::Config>(r#"{"benchmark":{"accuracy_metric":"map"}}"#)
                 .is_err()
         );
+    }
+
+    /// `benchmark.goal` from the legacy keys of an older file, the legacy keys written from the
+    /// goal for an older binary, and `goal` winning when both are present.
+    #[test]
+    fn benchmark_goal_migrates_from_and_to_the_legacy_keys() {
+        use crate::benchmark::eval::{Goal, Optimize};
+        use crate::benchmark::grade::AccuracyMetric;
+        use crate::benchmark::threshold::Objective;
+        let read = |j: &str| serde_json::from_str::<super::Config>(j).unwrap().benchmark;
+        // An older file: the goal comes from the legacy keys.
+        let b = read(r#"{"benchmark":{"threshold_objective":"precision:0.9"}}"#);
+        assert_eq!(
+            b.goal.optimize_for,
+            Optimize::Threshold(Objective::Precision(0.9))
+        );
+        let b = read(r#"{"benchmark":{"accuracy_metric":"roc_auc","threshold_objective":"f2"}}"#);
+        assert_eq!(
+            (b.goal.optimize_for, b.goal.tune_for),
+            (Optimize::RocAuc, Objective::F2)
+        );
+        // Written: the goal and both legacy keys, so an older binary reads the same objective.
+        let text = serde_json::to_string(&super::Config {
+            benchmark: b.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            text.contains(r#""goal":{"optimize_for":"roc_auc","tune_for":"f2""#),
+            "{text}"
+        );
+        assert!(text.contains(r#""threshold_objective":"f2""#), "{text}");
+        assert!(text.contains(r#""accuracy_metric":"roc_auc""#), "{text}");
+        let back: super::Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.benchmark, b);
+        // Both present: the goal wins, and the legacy keys follow it.
+        let b = read(
+            r#"{"benchmark":{"goal":{"optimize_for":"ap50_95","tune_for":"youden",
+               "classes":["person"],"speed_budget_ms":250},
+               "threshold_objective":"f1","accuracy_metric":"roc_auc"}}"#,
+        );
+        assert_eq!(b.goal.optimize_for, Optimize::Ap5095);
+        assert_eq!(b.goal.classes, ["person"]);
+        assert_eq!(b.goal.speed_budget_ms, Some(250.0));
+        assert_eq!(b.threshold_objective, Objective::Youden);
+        assert_eq!(b.accuracy_metric, AccuracyMetric::Ap50);
+        // `goal: null` is an absent goal; a bad goal is an error naming it.
+        let b = read(r#"{"benchmark":{"goal":null,"threshold_objective":"f05"}}"#);
+        assert_eq!(b.goal.optimize_for, Optimize::Threshold(Objective::F05));
+        let e = serde_json::from_str::<super::Config>(
+            r#"{"benchmark":{"goal":{"speed_budget_ms":-1}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("speed_budget_ms"), "{e}");
+        assert!(
+            serde_json::from_str::<super::Config>(
+                r#"{"benchmark":{"goal":{"optimize_for":"f3"}}}"#
+            )
+            .is_err()
+        );
+        // The old form's objective / metric pair: unchanged keeps the goal, changed maps onto it.
+        let mut b = super::BenchmarkConfig::default();
+        b.set_goal(Goal {
+            optimize_for: Optimize::Ap5095,
+            classes: vec!["car".into()],
+            ..Goal::default()
+        });
+        assert_eq!(
+            (b.threshold_objective, b.accuracy_metric),
+            (Objective::F1, AccuracyMetric::Ap50)
+        );
+        b.set_legacy(Objective::F1, AccuracyMetric::Ap50);
+        assert_eq!(
+            b.goal.optimize_for,
+            Optimize::Ap5095,
+            "an unchanged pair keeps the goal"
+        );
+        b.set_legacy(Objective::F2, AccuracyMetric::Ap50);
+        assert_eq!(
+            (b.goal.optimize_for, b.goal.tune_for),
+            (Optimize::Ap5095, Objective::F2)
+        );
+        b.set_legacy(Objective::F2, AccuracyMetric::RocAuc);
+        assert_eq!(b.goal.optimize_for, Optimize::RocAuc);
+        assert_eq!(b.goal.classes, ["car"]);
+        assert_eq!(b.accuracy_metric, AccuracyMetric::RocAuc);
     }
 
     #[test]

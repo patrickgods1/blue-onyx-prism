@@ -514,6 +514,8 @@ fn metric_name(metric: &str) -> &'static str {
         "f1" => "F1",
         "person_false_alerts" => "person false-alert rate",
         "threshold" => "best confidence threshold",
+        "goal" => "goal metric",
+        "live_requests_per_min" => "live load",
         _ => "value",
     }
 }
@@ -595,6 +597,12 @@ fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
         }
         v.push(proportion_change(m, dev, x, y, n, unit));
     }
+    if let Some(c) = goal_change(dev, a, b) {
+        v.push(c);
+    }
+    if a.live_requests_per_min.is_some() || b.live_requests_per_min.is_some() {
+        v.push(live_load_change(dev, a, b));
+    }
     // False person alerts on frames without a person: a rate, lower is better.
     let (ra, rb) = (a.person_alert_rate(), b.person_alert_rate());
     if ra.is_some() || rb.is_some() {
@@ -608,6 +616,101 @@ fn device_changes(a: &DeviceSnap, b: &DeviceSnap) -> Vec<MetricChange> {
         ));
     }
     v
+}
+
+/// The goal metric of two runs of one device ([`DeviceSnap::goal`]): better or worse only when
+/// their 95% intervals do not overlap (two runs are not paired: other frames, other labels, so
+/// the intervals' overlap is the conservative rule); not comparable for two different goals;
+/// None when neither run has one.
+pub fn goal_change(dev: &str, a: &DeviceSnap, b: &DeviceSnap) -> Option<MetricChange> {
+    let (ga, gb) = (a.goal.as_ref(), b.goal.as_ref());
+    if ga.is_none() && gb.is_none() {
+        return None;
+    }
+    let name = |g: &crate::benchmark::eval::tune::GoalSnap| {
+        g.optimize_for
+            .parse::<crate::benchmark::eval::Optimize>()
+            .map(|o| o.short())
+            .unwrap_or_else(|_| g.optimize_for.clone())
+    };
+    let mut c = MetricChange {
+        metric: "goal".to_string(),
+        device: Some(dev.to_string()),
+        before: ga.map(|g| g.value),
+        after: gb.map(|g| g.value),
+        delta: None,
+        rel: None,
+        verdict: Verdict::Same,
+        why: String::new(),
+    };
+    let (Some(x), Some(y)) = (ga, gb) else {
+        c.why = format!(
+            "no goal metric in the {} run",
+            if ga.is_none() { "earlier" } else { "later" }
+        );
+        return Some(c);
+    };
+    if x.optimize_for != y.optimize_for || x.classes != y.classes {
+        c.verdict = Verdict::NotComparable;
+        c.why = format!("another goal ({} -> {})", name(x), name(y));
+        return Some(c);
+    }
+    let delta = y.value - x.value;
+    c.delta = Some(delta);
+    let iv = |g: &crate::benchmark::eval::tune::GoalSnap| Some((g.low?, g.high?));
+    let (Some((xl, xh)), Some((yl, yh))) = (iv(x), iv(y)) else {
+        c.why = format!(
+            "{} without an interval in one of the runs: not judged",
+            name(x)
+        );
+        return Some(c);
+    };
+    if yl > xh || yh < xl {
+        c.verdict = if delta > 0.0 {
+            Verdict::Better
+        } else {
+            Verdict::Worse
+        };
+        c.why = format!(
+            "{} {:.3} -> {:.3}: the 95% intervals ({:.3}-{:.3}, {:.3}-{:.3}) do not overlap",
+            name(x),
+            x.value,
+            y.value,
+            xl,
+            xh,
+            yl,
+            yh
+        );
+    } else {
+        c.why = format!(
+            "{} {:.3} -> {:.3}, within the overlapping 95% intervals",
+            name(x),
+            x.value,
+            y.value
+        );
+    }
+    Some(c)
+}
+
+/// The live load of two runs of one device: shown, never a verdict (a busier run is slower and
+/// noisier).
+fn live_load_change(dev: &str, a: &DeviceSnap, b: &DeviceSnap) -> MetricChange {
+    let (x, y) = (a.live_requests_per_min, b.live_requests_per_min);
+    let txt = |v: Option<f64>| v.map_or_else(|| "not recorded".to_string(), |v| format!("{v:.1}"));
+    MetricChange {
+        metric: "live_requests_per_min".to_string(),
+        device: Some(dev.to_string()),
+        before: x,
+        after: y,
+        delta: x.zip(y).map(|(x, y)| y - x),
+        rel: None,
+        verdict: Verdict::Same,
+        why: format!(
+            "detection requests answered while it ran, per minute: {} -> {} (a busier run is              slower and noisier)",
+            txt(x),
+            txt(y)
+        ),
+    }
 }
 
 /// The best-threshold change of the model, or None when neither run has advice.
@@ -765,7 +868,7 @@ fn summary(b: &HistoryEntry, metrics: &[MetricChange]) -> String {
             on(m)
                 && matches!(
                     m.metric.as_str(),
-                    "ap50" | "precision" | "recall" | "f1" | "person_false_alerts"
+                    "ap50" | "precision" | "recall" | "f1" | "person_false_alerts" | "goal"
                 )
         })
         .collect();

@@ -226,8 +226,7 @@ impl RunRequest {
         b.warmup = self.warmup;
         b.reference_model = self.reference_model.clone();
         b.weights = self.weights;
-        b.threshold_objective = self.threshold_objective;
-        b.accuracy_metric = self.accuracy_metric;
+        b.set_legacy(self.threshold_objective, self.accuracy_metric);
         b.low_priority = self.low_priority;
         b.served = self.served;
     }
@@ -1359,7 +1358,16 @@ impl ServiceRun<'_> {
         let merge_ms = super::run::ms(t.elapsed()) - load_ms;
         merged.save(&ctx.results_path)?;
         let save_ms = super::run::ms(t.elapsed()) - load_ms - merge_ms;
-        for w in super::history::record(&ctx.results_path, &seeds, &merged, name.as_slice()) {
+        // The goal in force, with what this run's form chose.
+        let mut bench_cfg = ctx.config.benchmark.clone();
+        bench_cfg.set_legacy(req.threshold_objective, req.accuracy_metric);
+        for w in super::history::record(
+            &ctx.results_path,
+            &seeds,
+            &merged,
+            name.as_slice(),
+            Some((&bench_cfg.goal, req.weights)),
+        ) {
             self.h.warn(w);
         }
         let history_ms = super::run::ms(t.elapsed()) - load_ms - merge_ms - save_ms;

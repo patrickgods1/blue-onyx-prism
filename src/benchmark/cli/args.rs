@@ -66,6 +66,26 @@ pub struct BenchArgs {
     /// benchmark.accuracy_metric (ap50).
     #[arg(long, value_parser = parse_metric_arg)]
     pub accuracy_metric: Option<AccuracyMetric>,
+    /// What the comparison optimizes (benchmark.goal.optimize_for): a threshold objective
+    /// (f1, f2, f05, recall_at_fa:<N>, precision:<p>, recall:<r>, youden, fpr:<x>; scored at
+    /// each combo's cross-validated confidence pick) or a rank-only metric (ap50, ap50_95,
+    /// roc_auc, grade). --threshold-objective and --accuracy-metric map onto it. Default: the
+    /// config's goal.
+    #[arg(long, value_parser = parse_goal_arg)]
+    pub goal: Option<String>,
+    /// The threshold objective a rank-only --goal picks the confidence for (default:
+    /// benchmark.goal.tune_for, f1).
+    #[arg(long, value_parser = parse_objective_text)]
+    pub tune_for: Option<String>,
+    /// The classes that count, comma separated (e.g. person,car; `all` = every scored class the
+    /// set labels). Default: benchmark.goal.classes. (--classes is the class-names YAML of
+    /// --model.)
+    #[arg(long)]
+    pub goal_classes: Option<String>,
+    /// The p95 latency budget in ms (e.g. 250, 1.5s; `none` = no budget): slower combos rank
+    /// after the others, "too slow". Default: benchmark.goal.speed_budget_ms.
+    #[arg(long, value_parser = parse_budget_arg)]
+    pub speed_budget: Option<String>,
     /// Search the best confidence threshold over the predictions stored by the last benchmark
     /// (`benchmark-preds.json` beside the config; no inference), filtered by --dataset, --tag,
     /// --class, --search-model, --search-device and --iou, for --threshold-objective (also
@@ -193,6 +213,19 @@ pub struct BenchArgs {
 
 fn parse_variants_arg(s: &str) -> Result<crate::benchmark::variant::VariantList, String> {
     crate::benchmark::variant::parse_variants(s).map(crate::benchmark::variant::VariantList)
+}
+
+fn parse_goal_arg(s: &str) -> Result<String, String> {
+    s.parse::<crate::benchmark::eval::Optimize>()
+        .map(|_| s.to_string())
+}
+
+fn parse_objective_text(s: &str) -> Result<String, String> {
+    s.parse::<Objective>().map(|_| s.to_string())
+}
+
+fn parse_budget_arg(s: &str) -> Result<String, String> {
+    crate::benchmark::eval::goal::parse_budget(s).map(|_| s.to_string())
 }
 
 fn parse_objective_arg(s: &str) -> Result<Objective, String> {

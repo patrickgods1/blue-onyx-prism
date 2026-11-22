@@ -145,7 +145,7 @@ pub fn scorable<'a>(
         .collect()
 }
 
-fn eval_of(img: &SetImage<'_>, map: &ClassMap, run: &StoredRun, k: usize) -> EvalImage {
+pub(crate) fn eval_of(img: &SetImage<'_>, map: &ClassMap, run: &StoredRun, k: usize) -> EvalImage {
     let gt: &[GtBox] = img.info.objects.as_deref().unwrap_or_default();
     let preds: Vec<PredBox> = run
         .preds(k)

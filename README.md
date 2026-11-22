@@ -833,6 +833,54 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   request (when it does, it replaces the server threshold for that request), and each camera's
   minimum confidence filters the returned objects again on top.
 
+- **Goal, cross-validation and ranks** (`benchmark.goal`, `GET /v1/benchmark/compare`,
+  `GET /v1/benchmark/tune`, CLI `benchmark --goal <spec> [--tune-for] [--goal-classes]
+  [--speed-budget]`): one goal decides how combos (a model on a device) are compared and which
+  confidence is suggested. `optimize_for` is a threshold objective (scored at each combo's
+  cross-validated confidence) or a rank-only metric (`ap50`, `ap50_95`, `roc_auc`, `grade`; their
+  confidence is picked for `tune_for`); `classes` limits what counts; `speed_budget_ms` marks
+  slower combos "too slow".
+  - **Counts**: TP / FP / FN at IoU 0.5 of the counted classes on the 0.01 grid (0.05 to 1.00, every
+    value exact); an empty frame has no counted object (unsure regions alone leave it empty) and a
+    false alert is an empty frame with a counted detection outside every unsure region: FA/100 =
+    false alerts per 100 empty frames. Youden, `fpr:<x>` and ROC AUC use one sample per frame.
+  - **Cross-validation**: the frames are grouped by camera day on Your cameras (single images on
+    other sets) and dealt into K = min(5, groups) folds by the SHA-256 of the group (stable:
+    the same day always lands in the same fold). Each fold's confidence is picked on the other
+    folds and counted on it; the pooled counts are the reported figures (P, R, F1 / F2 / F0.5,
+    FA/100, frame TPR / FPR). The suggested confidence is the pick on every frame.
+  - **Targets** (`precision:p`, `recall:r`, `recall_at_fa:N`, `fpr:x`) are judged on the 95% Wilson
+    bound: the pick needs precision's (recall's) lower bound >= p (r), the upper bound of the false
+    alerts per empty frame x 100 <= N, the frame FPR's upper bound <= x; a target is met when that
+    holds on the cross-validated counts. An unmet target is shown and never saved. (On a
+    synthetic detector a `precision:0.9` pick on its bound held on fresh frames in 98.5% of 200
+    trials, the point estimate in 53%.)
+  - **Intervals**: a cluster bootstrap over the groups with a fixed seed (the same results give the
+    same interval): 1,000 resamples of the groups' counts for a threshold objective, 200 for AP50,
+    AP50-95, ROC AUC and the grade (recomputed from the resampled frames' matches); 95% percentile
+    interval. Two combos on the same frames are compared pair by pair (the same resamples):
+    "clearly better" when the interval of the difference excludes 0.
+  - **Ranks**: combos within the budget with the target met first, by the goal metric; then the
+    ones over the budget ("too slow"); then those whose target is not met; then models that trained
+    on these frames. The first combo is rank 1; each next one shares its group leader's rank unless
+    it is clearly worse than that leader, then it starts a new group at its position. The headline
+    names the best combo and those not clearly different (or why nothing meets the goal).
+  - **Low confidence**: under 4 groups or 50 labelled objects of the counted classes the figures
+    are in-sample (at the pick on every frame), flagged `lowConfidence` with the reason; the
+    interval is still computed and Save asks to confirm. A curve on which every grid value scores
+    within 0.002 of the best (every scored frame answered by the night model, or a fixed night
+    threshold) gives `pickInformative: false` and the pick is not savable.
+  - **Breakdowns** (at each combo's cross-validated picks): per scene (metric, recall, FA/100,
+    objects; under 50 objects flagged), per class (objects, P, R, F2, AP50, false alerts per 100
+    frames without the class), per camera on Your cameras (frames, objects, recall, FA/100, worst
+    scene, worst first), speed (stage p50s, p50 / p95 / p99 of the set's frames, first load).
+  - **History** records per run and device the goal metric with its interval (`goal`) and the live
+    load (`live_requests_per_min`); the A/B comparison calls a goal change only when the two runs'
+    intervals do not overlap. `benchmark` prints the Compare view after a sweep (`--json`:
+    `compare`); `--threshold-search` adds each combo's cross-validated pick and interval.
+  - The run's own threshold advice (`threshold` in `benchmark.json`, the current page's
+    Confidence tab and Apply) still picks on every frame with the target on its point estimate;
+    the goal views are the ones above.
 - **Confidence profiles**: the best confidence differs per device (a GPU's FP16 path scores a little
   differently from the CPU), so it is saved per model and device in `device_thresholds`. The Benchmark
   page has five tabs. **Compare** (opens first once there are results) is one table of the models on
@@ -883,8 +931,13 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
 | `benchmark.low_priority` | `true` | Run benchmarks of CPU devices (`openvino:cpu`, `ort:cpu`, `CPU`) at below-normal process priority so the desktop stays responsive; GPU and NPU devices keep the normal priority, so the service keeps answering Blue Iris at full priority while they run (Windows: the whole process while a CPU device compiles and runs, restored before a GPU device and after the run; the log and the Benchmark page's progress line say which applied; CLI on Linux/macOS: nice 10 for a run whose devices are all CPUs, a running service is never lowered there). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
 | `benchmark.served` | `false` | Benchmark each model **as served**: with the serving settings Blue Iris gets it with (its `preprocess` / `night_preprocess`, filter rules, `night_threshold`, `night_model` routing of night / IR frames and `verify` verifier), timed as the request costs in the service. Results are stored as `<model>+served`, beside and never mixed with the bare results; `auto` device ordering, the device recommendation and Apply use the bare results only. A result whose model's serving settings changed since the run is marked stale (`stale_rules` in `GET /v1/benchmark`). `benchmark --served` turns it on for one run (refused together with `--variants`); the Benchmark page has a Run settings checkbox. Boolean. Applies: at once. UI: yes |
-| `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>` (false alerts per 100 empty frames), `youden`, `fpr:<x>`. UI: yes |
-| `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
+| `benchmark.goal` | `{"optimize_for": "f1", "tune_for": "f1", "classes": [], "speed_budget_ms": null}` | What Compare ranks by and Tune picks the confidence for (see *Goal, cross-validation and ranks*). A file without it takes it from `threshold_objective` / `accuracy_metric` (`accuracy_metric: roc_auc` = `optimize_for: roc_auc` tuned for the objective, else `optimize_for` = the objective); when both are present `goal` wins. `POST /v1/benchmark/goal`, CLI `benchmark --goal`. UI: yes (`POST /v1/benchmark/goal`) |
+| `benchmark.goal.optimize_for` | `"f1"` | A threshold objective scored at each combo's cross-validated confidence: `f1`, `f2`, `f05`, `recall_at_fa:<N>`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`; or a rank-only metric: `ap50`, `ap50_95`, `roc_auc` (one sample per frame), `grade` (the A-F overall grade with `benchmark.weights`). CLI `--goal` |
+| `benchmark.goal.tune_for` | `"f1"` | The threshold objective the confidence is picked for when `optimize_for` is rank-only; ignored otherwise. CLI `--tune-for` |
+| `benchmark.goal.classes` | `[]` | The classes that count (exact classes; IPcam `vehicle` takes car, truck and bus labels); `[]` = every scored class the set labels. CLI `--goal-classes person,car` |
+| `benchmark.goal.speed_budget_ms` | `null` | The p95 latency (ms) a combo may take: the burst p95 once a burst test ran, else the one-at-a-time p95 on the set's frames; slower combos rank after the others, "too slow". `null` = no budget. Number > 0. CLI `--speed-budget 250` |
+| `benchmark.threshold_objective` | `"f1"` | Legacy, written from `goal` (its tuning objective) so an older version reads the file; read only from a file without `goal`, and `--threshold-objective` / the page's objective select map onto the goal (an objective becomes `optimize_for`, or `tune_for` of a rank-only goal). Values: `f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>` (false alerts per 100 empty frames), `youden`, `fpr:<x>`. UI: yes |
+| `benchmark.accuracy_metric` | `"ap50"` | Legacy, written from `goal` (`roc_auc` for a ROC AUC goal, else `ap50`); read only from a file without `goal`, and `--accuracy-metric` maps onto it (`roc_auc` = a ROC AUC goal, `ap50` turns one back into its objective). Still the metric of the A-F accuracy grade and the device recommendation's accuracy tie. UI: yes |
 
 All of them apply at once: they are read when a benchmark starts.
 
@@ -894,6 +947,7 @@ All of them apply at once: they are read when a benchmark starts.
   "max_images_per_dataset": 0, "devices": [], "models": [],
   "warmup": 3, "repeat_per_image": 1, "reference_model": null,
   "weights": {"accuracy": 0.6, "speed": 0.4}, "auto_download_datasets": true,
+  "goal": {"optimize_for": "f1", "tune_for": "f1", "classes": [], "speed_budget_ms": null},
   "threshold_objective": "f1", "accuracy_metric": "ap50"
 }
 ```
@@ -935,12 +989,17 @@ that belong to another (a run's training details) move with it, and summary rows
 
 What **Best first** means, table by table (the server decides it; the page only sorts by it):
 
-- **Home** and **Stats** models: the benchmark ranking (overall grade, then accuracy, then speed, each
-  model on its recommended device); models without benchmark results follow in config order.
+- **Home** and **Stats** models: the goal's rank on the default Compare set (`benchmark.goal`:
+  within the speed budget and the target met first, by the cross-validated goal metric; see
+  *Goal, cross-validation and ranks*), each model at the place of its recommended device's combo
+  (else its best combo); models the Compare set does not hold follow by the grades (overall grade,
+  then accuracy, then speed, on the recommended device), models without benchmark results in config
+  order.
 - **Config → Models**: no best order; the config order (the load order) is the table's own order.
 - **Benchmark → All results, Confidence, a model's devices (Details) and Tune**: each model on each
-  device ranked by the same grades (the `points` of `GET /v1/benchmark`); rows of runs picked from
-  the history follow.
+  device in the same goal order (the `points` of `GET /v1/benchmark`: the Compare position of the
+  combo, then the grades for combos the default set does not hold); rows of runs picked from the
+  history follow.
 - **Benchmark → Compare** (models on the same images): the headline's rule: people found, then
   vehicles, then all objects, a difference counting only past the noise; models level on all three
   by fewer false alerts; models that trained on these images last.
@@ -1430,7 +1489,11 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/review/restore-reopened` | puts frames a rerun reopened back to reviewed when nothing is pending; `dry_run` counts them |
 | GET | `/v1/training/switch-preview?id=` | What **Use as default** of a run would change (settings, classes, what copies, the suggested threshold, the comparison with the current default); saves nothing |
 | POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/retry-export`, `/training/use`, `/training/revert`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one (`delete_files` also deletes its folder); export a failed run's best checkpoint; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model (default: `copy`, `use_threshold`, `expect_current`; verifier: `replace_verifier`); no field, or `forget=1`: undo the last default switch, or drop its record; `add` / `remove`: a `training.datasets` folder; delete the training environment |
-| GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices, `labelsChanged` (Your cameras: `{frames, changed, left, joined}` since the run's labels snapshot, `{frames: null, computing: true}` before the first count, `folderMissing`; `null` without a snapshot) |
+| GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking (`ranking` and `points` in the goal's order on the default Compare set), per-model devices, `labelsChanged` (Your cameras: `{frames, changed, left, joined}` since the run's labels snapshot, `{frames: null, computing: true}` before the first count, `folderMissing`; `null` without a snapshot) |
+| GET | `/v1/benchmark/compare?set=&scene=&goal=&tune_for=&classes=&budget=` | every combo (model x device) on one compare set (default: the one most models share; `sets` lists them), judged for the goal: `rows` best first (`metric` `{value, low, high}`, `rank`, `block` `ok`/`too_slow`/`unmet`/`unfair`, `vsLeader`, recall, precision, F1/F2/F0.5, `fa100`, TPR/FPR, AP50, AP50-95, ROC AUC, grade, `confidence` (suggested), `plateau`, `pickInformative`, `target`, `servedThreshold`, `speed` (p50/p95/p99, stages, `burstP95Ms`, `firstLoad`), `agreement`, `flags` (`tooSlow`, `unmet`, `trainedHere`, `relative`, `served`, `staleRules`, `lowConfidence`, `liveLoad`, `videoDecode`, `flat`), `scenes`, `classes`, `cameras`), `headline`, `set` (frames, `framesLeftOut`, `leftOutBy`, counted `classes`, `ignoredClasses`, `groups`, `run`), `missing` (models not on the set, why, `device`, `blocked`). `goal=` etc. try a goal without saving it; `scene=day\|night\|ir`. Cached per files, config revision and query |
+| GET | `/v1/benchmark/tune?model=&device=&set=&goal=&tune_for=&classes=` | one combo: the 0.01 `grid` (threshold, tp/fp/fn, precision, recall, F1/F2/F0.5, FA/100, TPR/FPR, `score`, `bound`), `suggested` (`threshold`, `plateau`, `best`, `inSample`, `metric` with interval), `lowConfidence`, `pickInformative`, `target` (`met`, `bound`, `text`), `saved` (`threshold`, `source`: `profile for <device>`, `model`, `global`), `servedThreshold`, `relative`, `savable` / `notSavable`, `confirm`; 404 when the model has no stored predictions |
+| GET | `/v1/benchmark/tune/images?model=&device=&set=&threshold=&kind=miss\|fa&limit=` | the frames for the Tune strips at `threshold`, worst first (`miss`: most missed objects; `fa`: the most confident false positive), each with `set`, `file`, `camera`, `scene`, `date`, its labels (`ok` = matched) and predictions (`ok` = true positive); `limit` 1-200, default 24 |
+| POST | `/v1/benchmark/goal` | `optimize_for` (or `goal`), `tune_for`, `classes` (`all` = none), `speed_budget_ms` (or `budget`, `none` = no budget); absent fields keep their value. Validates, saves `benchmark.goal` (and the legacy keys) and answers `goal` and the new `ranking` on the default set; 400 on a bad value |
 | POST | `/v1/benchmark/rescore` | Your cameras: score the stored predictions against the current labels (no inference) and replace `benchmark-gt.json`; `{success, rescored: {models, runs, frames, changes, needRun, notRescored}}`; 409 while a benchmark runs, 503 `folder_missing`, 422 without a run on the set |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |

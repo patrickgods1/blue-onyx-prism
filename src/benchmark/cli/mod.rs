@@ -409,6 +409,23 @@ fn list_datasets(config: &Config) {
     );
 }
 
+/// The goal of a run: the config's, with `--threshold-objective` / `--accuracy-metric` mapped
+/// onto it ([`crate::benchmark::eval::Goal::with_legacy`]), then `--goal`, `--tune-for`,
+/// `--goal-classes` and `--speed-budget`.
+pub(crate) fn goal_of(args: &BenchArgs, config: &Config) -> Result<crate::benchmark::eval::Goal> {
+    let g = config
+        .benchmark
+        .goal
+        .with_legacy(args.threshold_objective, args.accuracy_metric);
+    g.try_with(
+        args.goal.as_deref(),
+        args.tune_for.as_deref(),
+        args.goal_classes.as_deref(),
+        args.speed_budget.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Run the benchmark described by `args`. Ok(false) when some model failed.
 pub fn run(args: BenchArgs) -> Result<bool> {
     let config_path = args
@@ -430,12 +447,8 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     }
     check_args(&args, &config_path)?;
     let low_priority = !args.no_low_priority && config.benchmark.low_priority;
-    let objective = args
-        .threshold_objective
-        .unwrap_or(config.benchmark.threshold_objective);
-    let metric = args
-        .accuracy_metric
-        .unwrap_or(config.benchmark.accuracy_metric);
+    let goal = goal_of(&args, &config)?;
+    let (objective, metric) = goal.legacy();
     let all_devices = args.all_devices
         || args.apply
         || args.apply_threshold
@@ -526,6 +539,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         sweep_devices: &sweep_devices,
         objective,
         metric,
+        goal: &goal,
         weights,
         variant_names: &variant_names,
         trail: &trail,
@@ -773,6 +787,8 @@ struct RunCtx<'a> {
     sweep_devices: &'a Option<Vec<spec::Device>>,
     objective: Objective,
     metric: AccuracyMetric,
+    /// The goal of this run (the config's, with the flags).
+    goal: &'a crate::benchmark::eval::Goal,
     weights: crate::benchmark::grade::Weights,
     /// Names of the variant jobs (`<model>+<variant>`): never applied to the config.
     variant_names: &'a std::collections::HashSet<String>,
@@ -1030,6 +1046,11 @@ impl RunCtx<'_> {
             print_frame_roc(swept);
         }
         let merged = self.save_results(results, swept, sets, cameras, report)?;
+        let view = self.compare(&merged, swept);
+        if !args.json {
+            print_compare(&view);
+        }
+        report.compare = Some(view);
         // Variants are measurements only: the config gets the plain pipeline's picks.
         let plain: Vec<ModelResult> = swept
             .iter()
@@ -1095,7 +1116,13 @@ impl RunCtx<'_> {
             report.warn(self.args.json, w);
         }
         let names: Vec<String> = swept.iter().map(|m| m.model.clone()).collect();
-        for w in crate::benchmark::history::record(&path, &seeds, &merged, &names) {
+        for w in crate::benchmark::history::record(
+            &path,
+            &seeds,
+            &merged,
+            &names,
+            Some((self.goal, self.weights)),
+        ) {
             report.warn(self.args.json, w);
         }
         if !self.args.json {
@@ -1103,6 +1130,30 @@ impl RunCtx<'_> {
         }
         report.results_file = Some(path.display().to_string());
         Ok(merged)
+    }
+
+    /// The Compare view of `merged` on its default set for the run's goal (the stored
+    /// predictions of the file beside the config, with this run's).
+    fn compare(
+        &self,
+        merged: &BenchmarkResults,
+        swept: &[ModelResult],
+    ) -> crate::benchmark::eval::compare::CompareView {
+        let preds = crate::benchmark::search::StoredPreds::merge(
+            crate::benchmark::search::StoredPreds::load(&crate::benchmark::search::preds_path(
+                self.config_path,
+            ))
+            .ok()
+            .flatten(),
+            merged,
+            swept,
+        );
+        let device = |m: &crate::config::ModelConfig| {
+            let sel = self.selection(&self.config.data_path(&m.path));
+            configured_device(self.config, m, &sel)
+        };
+        let now = crate::benchmark::current::from_config(self.config, &device, &|_| None);
+        compare_view(self.config, merged, &preds, &now, self.goal, self.weights)
     }
 
     /// `--apply`: write the recommended devices of `swept` into the config file.
@@ -1182,6 +1233,42 @@ impl RunCtx<'_> {
     }
 }
 
+/// The Compare view of `results` on its default set (pure but for the config's training
+/// records and model files, [`crate::benchmark::lineup::Parts`]).
+pub(crate) fn compare_view(
+    config: &Config,
+    results: &BenchmarkResults,
+    preds: &crate::benchmark::search::StoredPreds,
+    now: &std::collections::HashMap<String, crate::benchmark::current::ModelNow>,
+    goal: &crate::benchmark::eval::Goal,
+    weights: crate::benchmark::grade::Weights,
+) -> crate::benchmark::eval::compare::CompareView {
+    use crate::benchmark::lineup::{Inputs, Parts};
+    let parts = Parts::of(results, config);
+    let history = crate::benchmark::history::History::seeded(Some(results));
+    let default_model = crate::training::switch::current_default(config);
+    let inputs = Inputs {
+        results,
+        preds: Some(preds),
+        history: &history,
+        now,
+        default_model: default_model.as_deref(),
+        configured: &parts.configured,
+        trained: &parts.trained,
+        seen: &parts.seen,
+        reachable: &|s| s.dir.as_deref().is_some_and(Path::is_dir),
+    };
+    crate::benchmark::eval::compare::build(
+        &inputs,
+        crate::benchmark::eval::compare::Request {
+            goal,
+            weights,
+            set: None,
+            scene: None,
+        },
+    )
+}
+
 /// `--threshold-search`: search the stored predictions and print the results.
 fn threshold_search_cli(
     args: &BenchArgs,
@@ -1218,6 +1305,33 @@ fn threshold_search_cli(
     for r in &out.results {
         print_search_detail(r);
     }
+    // The cross-validated pick of each searched combo for the objective (on its default set).
+    let goal = goal_of(args, config)?;
+    let goal = crate::benchmark::eval::Goal {
+        optimize_for: crate::benchmark::eval::Optimize::Threshold(req.objective),
+        ..goal
+    };
+    for r in &out.results {
+        let saved = None;
+        match crate::benchmark::eval::tune::build(
+            results,
+            preds,
+            crate::benchmark::eval::tune::Request {
+                model: &r.model,
+                device: Some(&r.device),
+                set: None,
+                goal: &goal,
+                weights: config.benchmark.weights,
+                saved,
+            },
+        ) {
+            Ok(t) => print_cv_pick(&t),
+            Err(e) => println!(
+                "  {} on {}: no cross-validated pick ({e:#})",
+                r.model, r.device
+            ),
+        }
+    }
     for e in &out.errors {
         eprintln!("error: {e}");
     }
@@ -1233,8 +1347,8 @@ fn search_request(args: &BenchArgs, config: &Config) -> crate::benchmark::search
         datasets: args.dataset.clone(),
         tags: args.tag.clone(),
         classes: args.class.clone(),
-        objective: args
-            .threshold_objective
+        objective: goal_of(args, config)
+            .map(|g| g.tuning())
             .unwrap_or(config.benchmark.threshold_objective),
         iou: args.iou.unwrap_or(0.5),
     }
@@ -1340,6 +1454,63 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Result<BenchArgs, clap::Error> {
         Cli::try_parse_from(argv).map(|c| c.args)
+    }
+
+    /// `--goal` and its companions set the run's goal; the old flags map onto it.
+    #[test]
+    fn goal_flags_and_the_old_flags_map_onto_the_goal() {
+        use crate::benchmark::eval::Optimize;
+        let config = Config::default();
+        let a = parse(&[
+            "x",
+            "--goal",
+            "ap50_95",
+            "--tune-for",
+            "f2",
+            "--goal-classes",
+            "person,car",
+            "--speed-budget",
+            "1.5s",
+        ])
+        .unwrap();
+        let g = goal_of(&a, &config).unwrap();
+        assert_eq!(g.optimize_for, Optimize::Ap5095);
+        assert_eq!(g.tune_for, Objective::F2);
+        assert_eq!(g.classes, ["person", "car"]);
+        assert_eq!(g.speed_budget_ms, Some(1500.0));
+        assert_eq!(g.legacy(), (Objective::F2, AccuracyMetric::Ap50));
+        // The old flags.
+        let a = parse(&[
+            "x",
+            "--accuracy-metric",
+            "roc_auc",
+            "--threshold-objective",
+            "youden",
+        ])
+        .unwrap();
+        let g = goal_of(&a, &config).unwrap();
+        assert_eq!(
+            (g.optimize_for, g.tune_for),
+            (Optimize::RocAuc, Objective::Youden)
+        );
+        let a = parse(&["x", "--threshold-objective", "precision:0.9"]).unwrap();
+        assert_eq!(
+            goal_of(&a, &config).unwrap().optimize_for,
+            Optimize::Threshold(Objective::Precision(0.9))
+        );
+        // The config's goal is the default; bad values are refused by clap.
+        let mut c = Config::default();
+        c.benchmark.set_goal(crate::benchmark::eval::Goal {
+            optimize_for: Optimize::Grade,
+            ..Default::default()
+        });
+        assert_eq!(
+            goal_of(&parse(&["x"]).unwrap(), &c).unwrap().optimize_for,
+            Optimize::Grade
+        );
+        assert!(parse(&["x", "--goal", "f3"]).is_err());
+        assert!(parse(&["x", "--speed-budget", "-1"]).is_err());
+        assert!(parse(&["x", "--tune-for", "ap50"]).is_err());
     }
 
     /// `--served` with `--variants` is refused with a message saying why; `benchmark.served`
