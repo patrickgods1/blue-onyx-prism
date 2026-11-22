@@ -173,13 +173,22 @@ mod tests {
         std::fs::create_dir_all(export.parent().unwrap()).unwrap();
         std::fs::write(&export, b"person\n").unwrap();
 
-        let (code, _, body) = call(
-            &state,
-            Request::get("/v1/storage").body(Body::empty()).unwrap(),
-        )
-        .await;
-        assert_eq!(code, StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // The answer says `computing` while the measurement takes longer than the handler
+        // waits (a loaded CI machine): ask again, as the page does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let v = loop {
+            let (code, _, body) = call(
+                &state,
+                Request::get("/v1/storage").body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if v["computing"] != true || std::time::Instant::now() > deadline {
+                break v;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
         let report = &v["report"];
         assert!(
             report["safe"]
