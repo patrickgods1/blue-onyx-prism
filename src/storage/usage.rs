@@ -319,10 +319,17 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
     }
 }
 
+/// One finished measurement: when, of which folders ([`key_of`]), and the report.
+struct Measured {
+    at: Instant,
+    key: String,
+    report: Arc<Report>,
+}
+
 /// The last measurement and whether one is running.
 #[derive(Default)]
 struct Cache {
-    last: Option<(Instant, Arc<Report>)>,
+    last: Option<Measured>,
     running: bool,
 }
 
@@ -331,46 +338,73 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
     running: false,
 });
 
-/// The measurement to show: a fresh one is returned at once; otherwise one is started on its own
-/// thread (unless running) and awaited for at most `wait`. Returns the report (None before the
-/// first one ends) and whether a measurement is still running.
+/// The measurement to show: a fresh one of the same folders ([`key_of`]) is returned at once;
+/// otherwise one is started on its own thread (after a measurement of other folders has ended,
+/// and again when a Clear forgot it before it was read) and awaited for at most `wait`. Returns the report of these folders (None before the first
+/// one ends) and whether a measurement is still running.
 pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc<Report>>, bool) {
-    {
-        let mut c = CACHE.lock_recover();
-        if let Some((at, r)) = &c.last
-            && at.elapsed() < FRESH
-        {
-            return (Some(r.clone()), false);
-        }
-        if !c.running {
-            c.running = true;
-            let spawned = std::thread::Builder::new()
-                .name("storage-usage".into())
-                .spawn(move || {
-                    crate::backend::priority::lower_this_thread(
-                        crate::backend::priority::ThreadRole::Background,
-                    );
-                    let r = Arc::new(measure(&s, &runs));
-                    let mut c = CACHE.lock_recover();
-                    c.last = Some((Instant::now(), r));
-                    c.running = false;
-                });
-            if let Err(e) = spawned {
-                c.running = false;
-                tracing::warn!("storage: could not start measuring ({e})");
-            }
-        }
-    }
+    let key = key_of(&s);
     let until = Instant::now() + wait;
     loop {
         {
-            let c = CACHE.lock_recover();
-            if !c.running || Instant::now() >= until {
-                return (c.last.as_ref().map(|(_, r)| r.clone()), c.running);
+            let mut c = CACHE.lock_recover();
+            let last = c
+                .last
+                .as_ref()
+                .filter(|l| l.key == key)
+                .map(|l| (l.at, l.report.clone()));
+            if let Some((at, r)) = &last
+                && at.elapsed() < FRESH
+            {
+                return (Some(r.clone()), false);
+            }
+            // Nothing fresh of these folders and nothing running (none yet, another folder's
+            // ended, or a Clear forgot ours): measure them.
+            if !c.running {
+                let (s, runs) = (s.clone(), runs.clone());
+                c.running = true;
+                let k = key.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("storage-usage".into())
+                    .spawn(move || {
+                        crate::backend::priority::lower_this_thread(
+                            crate::backend::priority::ThreadRole::Background,
+                        );
+                        let report = Arc::new(measure(&s, &runs));
+                        let mut c = CACHE.lock_recover();
+                        c.last = Some(Measured {
+                            at: Instant::now(),
+                            key: k,
+                            report,
+                        });
+                        c.running = false;
+                    });
+                if let Err(e) = spawned {
+                    c.running = false;
+                    tracing::warn!("storage: could not start measuring ({e})");
+                    return (last.map(|(_, r)| r), false);
+                }
+            }
+            if Instant::now() >= until {
+                return (last.map(|(_, r)| r), c.running);
             }
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// The folders a measurement covers: a report counts only for the same ones (a generation
+/// restart that moves `download_dir`, or tests with their own data roots, measure others).
+fn key_of(s: &Settings) -> String {
+    format!(
+        "{:?}",
+        (
+            s.config().data_root(),
+            s.models_dir(),
+            s.training_dir(),
+            s.cache_root()
+        )
+    )
 }
 
 /// Forget the last measurement (after a Clear or Remove), so the next look measures again.
@@ -398,6 +432,40 @@ mod tests {
         assert_eq!(days_ago(99 * 86_400 - 5, now), "yesterday");
         assert_eq!(days_ago(88 * 86_400, now), "12 days ago");
         assert_eq!(days_ago(200 * 86_400, now), "today", "a future time");
+    }
+
+    #[test]
+    fn a_report_counts_only_for_the_folders_it_measured() {
+        let settings = |tag: &str| {
+            let root =
+                std::env::temp_dir().join(format!("bop-usage-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut c = crate::config::Config {
+                download_dir: Some(root.clone()),
+                cache_dir: root.join("cache").display().to_string(),
+                ..Default::default()
+            };
+            c.models.clear();
+            (root, Settings::for_config(&c))
+        };
+        let (ra, a) = settings("a");
+        let (rb, b) = settings("b");
+        assert_ne!(key_of(&a), key_of(&b));
+        let long = Duration::from_secs(60);
+        // Other tests share the process-wide cache: wait for each answer to be complete.
+        let (first, running) = current(a.clone(), Vec::new(), long);
+        assert!(!running);
+        let first = first.unwrap();
+        let (other, running) = current(b, Vec::new(), long);
+        assert!(!running);
+        let other = other.unwrap();
+        assert!(!Arc::ptr_eq(&first, &other), "b got a's report");
+        // a measures again rather than reusing b's report.
+        let (again, _) = current(a, Vec::new(), long);
+        assert!(!Arc::ptr_eq(&again.unwrap(), &other));
+        for r in [ra, rb] {
+            std::fs::remove_dir_all(r).ok();
+        }
     }
 
     #[test]
