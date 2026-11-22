@@ -1901,12 +1901,28 @@ label.check.unavailable { opacity: 0.65; }
    scroller, so they never widen the page. */
 .bench .scroll { position: relative; max-width: 100%; }
 .bn-table th, .bn-table td { vertical-align: middle; }
-.bn-table th { white-space: nowrap; }
-.bn-table td.num, .bn-table th.num { white-space: nowrap; }
+/* Headers wrap (a long one such as "False alerts /100 empty" would otherwise set its column's
+   width and push the table past its box); the sort button stays with the last word (below).
+   Numbers never wrap. */
+.bn-table th { white-space: normal; overflow-wrap: normal; max-width: 8.5rem; vertical-align: bottom; }
+.bn-table th .th-sort { margin-left: 0.15rem; }
+/* sort.js puts the header's last word (or last element) and the sort button in .th-sort-glue:
+   kept on one line here (other pages' tables let the button wrap, as their widths assume). */
+.bn-table th .th-sort-glue { white-space: nowrap; }
+/* A header that is a glossary button: the button wraps inside itself (beside the sort button,
+   sort.js's glue span) and keeps room for it. */
+.bn-table th .th-sort-glue > button.term { white-space: normal; max-width: calc(100% - 1.7em); text-align: inherit; }
+.bn-table td.num { white-space: nowrap; }
 .bn-table tr.top > td { background: var(--ok-bg); }
 .bn-table tr.top > td, .bn-table tr.top > td .bn-ci { color: var(--ok-fg); }
 .bn-table tr.slow > td { color: var(--muted); }
 .bn-table tr.bn-detail > td { background: var(--bg); padding: 0.75rem 1rem; }
+/* The details never widen the table: their content takes no width of its own and fills the
+   cell, so the facts grid wraps inside the table's width. */
+.bn-table tr.bn-detail > td > * { width: 0; min-width: 100%; box-sizing: border-box; }
+/* A table wider than its box (many optional columns): the details keep to the visible width
+   (--bn-box-w, set by bench-compare.js) and stay in view while the box scrolls. */
+.bn-table tr.bn-detail > td > .bn-details { min-width: min(100%, var(--bn-box-w, 100%)); position: sticky; left: 1rem; }
 .bn-table td.cell-low { color: var(--muted); font-style: italic; }
 .bn-table td.bn-lead { overflow-wrap: anywhere; min-width: 9rem; }
 .bn-table td.bn-lead .tag, .bn-table td.bn-lead .bn-chip { margin-left: 0.35rem; }

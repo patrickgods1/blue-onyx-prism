@@ -427,18 +427,34 @@
         th.addEventListener("mousedown", onHeadDown);
       }
       var b = th._prismSortBtn;
-      if (!b || b.parentNode !== th) {
+      if (!b || !th.contains(b)) {
         b = document.createElement("button");
         b.type = "button"; b.className = "th-sort";
         var arrow = document.createElement("span"); arrow.className = "th-sort-arrow"; arrow.setAttribute("aria-hidden", "true");
         var rank = document.createElement("span"); rank.className = "th-sort-rank"; rank.setAttribute("aria-hidden", "true");
         b.appendChild(arrow); b.appendChild(rank);
-        th.appendChild(b);
+        glue(th, b);
         th._prismSortBtn = b;
       }
       b.setAttribute("aria-label", "Sort by " + c.label);
       b.title = "Sort by " + c.label + " (Shift-click: add it as the next sort key)";
     });
+  }
+  // The button goes in a span with the header's last word (or its last element, such as a
+  // glossary button): where the CSS makes .th-sort-glue nowrap (the Benchmark tables), a header
+  // that wraps never leaves the button alone on a line (a word joiner does not hold before a
+  // button in Chrome).
+  function glue(th, b) {
+    var g = document.createElement("span"), last = th.lastChild;
+    g.className = "th-sort-glue";
+    while (last && last.nodeType === 3 && !/\S/.test(last.nodeValue)) last = last.previousSibling;
+    if (last && last.nodeType === 3) {
+      var v = last.nodeValue.replace(/\s+$/, ""), i = v.search(/\S+$/);
+      g.appendChild(document.createTextNode(v.slice(i)));
+      if (i > 0) last.nodeValue = v.slice(0, i); else th.removeChild(last);
+    } else if (last && last.nodeType === 1) g.appendChild(last);
+    g.appendChild(b);
+    th.appendChild(g);
   }
   function indicate(S, keys) {
     var rankOf = {};

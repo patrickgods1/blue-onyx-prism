@@ -643,7 +643,7 @@ function page(o) {
   class El {
     constructor(tag, id) {
       this.tagName = String(tag).toUpperCase(); this.id = id || ''; this.attrs = {}; this.children = [];
-      this.listeners = {}; this.dataset = {}; this.style = {}; this._text = ''; this.hidden = false;
+      this.listeners = {}; this.dataset = {}; this.style = {setProperty(k, v) { this[k] = v; }}; this._text = ''; this.hidden = false;
       this.className = ''; this.value = ''; this.checked = false; this.disabled = false; this.open = false;
       this.parentNode = null; this.isConnected = true; this.selected = false;
       const cls = new Set();
