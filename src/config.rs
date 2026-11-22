@@ -2580,7 +2580,12 @@ mod tests {
         let c: super::Config = serde_json::from_str(r#"{"port":1234}"#).unwrap();
         assert_eq!(c.benchmark, super::BenchmarkConfig::default());
         let ids: Vec<String> = c.benchmark.datasets.iter().map(|d| d.label()).collect();
-        assert_eq!(ids, ["coco-cctv", "bmd45-cctv", "exdark-night"]);
+        assert_eq!(ids, ["cameras", "coco-cctv", "bmd45-cctv", "exdark-night"]);
+        // A file that stores its own list keeps it.
+        let c: super::Config =
+            serde_json::from_str(r#"{"benchmark":{"datasets":["coco-cctv"]}}"#).unwrap();
+        let ids: Vec<String> = c.benchmark.datasets.iter().map(|d| d.label()).collect();
+        assert_eq!(ids, ["coco-cctv"]);
         assert_eq!((c.benchmark.warmup, c.benchmark.repeat_per_image), (3, 1));
         assert!(c.benchmark.auto_download_datasets);
         assert!((c.benchmark.weights.accuracy - 0.6).abs() < 1e-12);

@@ -421,6 +421,11 @@ pub struct ModelResult {
     /// ([`super::trained_on`]); None = unknown (no training record, or the run's list is gone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trained_on_share: Option<f64>,
+    /// "Your cameras" frames left out of this model's run because it trained or validated on
+    /// them ([`super::cameras::for_model`]); None for a model without a training record or a run
+    /// without the set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_out: Option<LeftOut>,
     /// An As served result (`<model>+served`, [`super::variant`]): the serving settings it ran
     /// with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -430,6 +435,38 @@ pub struct ModelResult {
     /// bare result or a model no longer configured. Never read from a file.
     #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub stale_rules: Option<bool>,
+}
+
+/// The frames of a set left out of one model's run ([`ModelResult::left_out`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOut {
+    /// The set ([`super::cameras::ID`]).
+    pub set: String,
+    /// Frames left out: `trained + validated`.
+    pub frames: usize,
+    /// In its training run's `train.txt`.
+    pub trained: usize,
+    /// In its training run's `valid.txt`.
+    pub validated: usize,
+    /// Its training record exists but its lists do not read: nothing could be left out (why).
+    /// Such a model is scored on every frame and never "best" on the set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<String>,
+}
+
+impl LeftOut {
+    /// Why, in one sentence.
+    pub fn why(&self) -> String {
+        if let Some(u) = &self.unknown {
+            return u.clone();
+        }
+        match (self.trained, self.validated) {
+            (0, 0) => "it trained and validated on none of these frames".into(),
+            (t, 0) => format!("{t} frame(s) it trained on left out"),
+            (0, v) => format!("{v} frame(s) it validated on left out"),
+            (t, v) => format!("{t} frame(s) it trained on and {v} it validated on left out"),
+        }
+    }
 }
 
 /// The serving settings of an As served result ([`ModelResult::served`]).
@@ -466,6 +503,7 @@ impl ModelResult {
             threshold_objective: Objective::default(),
             threshold: None,
             trained_on_share: None,
+            left_out: None,
             served: job.variant.as_ref().and_then(|v| {
                 v.served.as_ref().map(|s| ServedSettings {
                     fingerprint: s.fingerprint.clone(),
@@ -499,6 +537,7 @@ impl ModelResult {
             threshold_objective: Objective::default(),
             threshold: None,
             trained_on_share: None,
+            left_out: None,
             served: None,
             stale_rules: None,
         }
@@ -778,6 +817,10 @@ pub struct ImageInfo {
     /// recorded (the scene splits then read the manifest's tags, [`super::images::in_split`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene: Option<crate::image_stats::Scene>,
+    /// The image's cross-validation group: its camera day (`<camera>/<date>`) on "Your cameras"
+    /// ([`super::cameras::group_of`]); None on every other set (folded image by image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// A dataset as recorded in the results.
@@ -824,18 +867,28 @@ impl ImageSetInfo {
                     tags: i.tags.clone(),
                     objects: i.gt.clone(),
                     scene: None,
+                    group: (s.id == super::cameras::ID)
+                        .then(|| super::cameras::group_of(&i.tags))
+                        .flatten(),
                 })
                 .collect(),
         }
     }
 
     /// The file of image `file`, when it is one of this set's images (no other path is ever
-    /// served). None for the embedded sample.
+    /// served). None for the embedded sample. On "Your cameras" the name is the export's flat
+    /// name of a review frame: its `<scene>/<camera>/<date>/<stem>.jpg` must parse and resolve to
+    /// a regular file inside the folder ([`crate::collect::layout::resolve`]: no symlink out).
     pub fn image_path(&self, file: &str) -> Option<std::path::PathBuf> {
         if !super::images::safe_file_name(file) || !self.images.iter().any(|i| i.file == file) {
             return None;
         }
-        self.dir.as_ref().map(|d| d.join(file))
+        let dir = self.dir.as_ref()?;
+        if self.id == super::cameras::ID {
+            let rel = crate::collect::labels::export::parse_flat_name(file)?;
+            return crate::collect::layout::resolve(dir, &rel.jpg(), "jpg");
+        }
+        Some(dir.join(file))
     }
 }
 
@@ -1226,8 +1279,11 @@ impl BenchmarkResults {
         let Some(text) = read_if_exists(path)? else {
             return Ok((None, Vec::new()));
         };
-        let (mut r, models, warnings) = parse_lenient::<Self, ModelResult>(&text, "models", path)?;
+        let (mut r, models, mut warnings) =
+            parse_lenient::<Self, ModelResult>(&text, "models", path)?;
         r.models = models;
+        // "Your cameras" is scored against its snapshot, kept beside the file.
+        warnings.extend(super::cameras::snapshot::overlay(&mut r, path));
         Ok((Some(r), warnings))
     }
 
@@ -1248,8 +1304,10 @@ impl BenchmarkResults {
     }
 
     /// Write pretty JSON through a temporary file and a rename (readers never see half a file).
+    /// The labels of "Your cameras" stay out (they are its snapshot's,
+    /// [`super::cameras::snapshot::strip`]).
     pub fn save(&self, path: &Path) -> Result<()> {
-        let text = serde_json::to_string_pretty(self)?;
+        let text = serde_json::to_string_pretty(&*super::cameras::snapshot::strip(self))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).ok();
         }
@@ -2132,6 +2190,7 @@ mod tests {
                 tags: vec![],
                 objects: None,
                 scene: None,
+                group: None,
             }],
         };
         assert_eq!(info.image_path("a.jpg"), Some("/data/s/a.jpg".into()));

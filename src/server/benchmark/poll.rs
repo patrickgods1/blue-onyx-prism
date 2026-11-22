@@ -145,6 +145,8 @@ struct Views {
     config: Box<RawValue>,
     profiles: Box<RawValue>,
     goal: Box<RawValue>,
+    /// Your cameras' labels since the snapshot ([`super::cameras::labels_changed`]).
+    labels_changed: std::sync::Arc<RawValue>,
     other_hardware: bool,
     results_file: String,
     /// What the config says now about each model (the run's models are shown against it).
@@ -173,6 +175,7 @@ fn views(state: &AppState) -> Views {
         "objective": cfg.benchmark.threshold_objective.to_string(),
     }));
     let results_file = results_path(&state.config_path).display().to_string();
+    let labels_changed = super::cameras::labels_changed(state, &cfg);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (
         &saved.key,
@@ -181,6 +184,7 @@ fn views(state: &AppState) -> Views {
         config.get(),
         profile_rows.get(),
         goal.get(),
+        labels_changed.get(),
         other_hardware,
         &results_file,
     )
@@ -191,6 +195,7 @@ fn views(state: &AppState) -> Views {
         config,
         profiles: profile_rows,
         goal,
+        labels_changed,
         other_hardware,
         results_file,
         now,
@@ -217,6 +222,8 @@ struct RunAnswer<'a> {
 struct FullAnswer<'a> {
     config: &'a RawValue,
     goal: &'a RawValue,
+    #[serde(rename = "labelsChanged")]
+    labels_changed: &'a RawValue,
     latest_run_id: &'a Option<String>,
     lineup: &'a RawValue,
     noise: serde_json::Value,
@@ -303,6 +310,7 @@ pub(super) fn answer(
         json_response(serialize(&FullAnswer {
             config: &v.config,
             goal: &v.goal,
+            labels_changed: &v.labels_changed,
             latest_run_id: &saved.latest_run_id,
             lineup: &saved.lineup,
             noise: crate::benchmark::history::view::noise_json(),
@@ -548,6 +556,7 @@ mod tests {
                 [
                     "config",
                     "goal",
+                    "labelsChanged",
                     "latest_run_id",
                     "lineup",
                     "noise",

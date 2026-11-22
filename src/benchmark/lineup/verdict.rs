@@ -93,11 +93,14 @@ pub struct Contender {
     pub correct: Option<(f64, usize)>,
     /// False alerts per empty frame (lower is better): the tie-break of [`best_order`].
     pub false_alerts: Option<f64>,
+    /// On "Your cameras": what it saw cannot be told (why); named, never best. The frames a
+    /// model is known to have seen are out of the view instead (`trained_on` is then 0).
+    pub unknown_seen: Option<String>,
 }
 
 impl Contender {
     fn fair(&self) -> bool {
-        self.trained_on.is_none_or(|s| s <= 0.0)
+        self.trained_on.is_none_or(|s| s <= 0.0) && self.unknown_seen.is_none()
     }
 }
 
@@ -207,12 +210,16 @@ fn left_out(rows: &[Contender], unit: &str) -> String {
     let v: Vec<String> = rows
         .iter()
         .filter(|c| !c.fair())
-        .map(|c| {
-            format!(
+        .map(|c| match &c.unknown_seen {
+            Some(_) => format!(
+                "{} may have trained on these {unit} (its training lists do not read)",
+                c.model
+            ),
+            None => format!(
                 "{} trained on {} of these {unit}",
                 c.model,
                 pct(c.trained_on.unwrap_or(0.0))
-            )
+            ),
         })
         .collect();
     v.join("; ")
@@ -464,6 +471,7 @@ mod tests {
             all: of(all),
             correct: None,
             false_alerts,
+            unknown_seen: None,
         }
     }
 

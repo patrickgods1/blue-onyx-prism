@@ -1,0 +1,351 @@
+//! "Your cameras" on the Benchmark page ([`crate::benchmark::cameras`]): its row on the Run tab
+//! (first; the line of frames, cameras, days, sizes and scenes, or why it cannot be ticked),
+//! `labelsChanged` of `GET /v1/benchmark` (frames whose labels changed since the snapshot a run
+//! scored against), and `POST /v1/benchmark/rescore`. The counts come from the background walk of
+//! [`crate::benchmark::cameras::live`]: a poll never walks the review folder.
+
+use super::{AppState, DatasetRow, json_error, raw};
+use crate::benchmark::cameras::live::{self, Found};
+use crate::benchmark::cameras::snapshot::{self, GtSnapshot};
+use crate::benchmark::cameras::{ID, Source, TITLE};
+use crate::benchmark::results_path;
+use crate::config::Config;
+use crate::sync::LockExt;
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::value::RawValue;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How long the page waits for the first walk of the folder before it shows "counting".
+const PAGE_WAIT: Duration = Duration::from_millis(1500);
+
+/// The Run tab's row of the set.
+pub(super) fn dataset_row(c: &Config, checked: bool) -> DatasetRow {
+    let src = Source::of(c);
+    let mut current = live::peek(&src);
+    let deadline = Instant::now() + PAGE_WAIT;
+    while current.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        current = live::peek(&src);
+    }
+    let base = DatasetRow {
+        value: ID.to_string(),
+        title: TITLE.to_string(),
+        tests: String::new(),
+        size: String::new(),
+        license: String::new(),
+        state: "folder",
+        state_text: String::new(),
+        checked,
+        download_id: None,
+        folder: false,
+        selectable: true,
+    };
+    match current.as_deref().map(|c| &c.found) {
+        Some(Found::Ready { survey, .. }) => DatasetRow {
+            tests: survey.line(),
+            size: if survey.low_confidence() {
+                format!("{} labelled objects \u{b7} low confidence", survey.objects)
+            } else {
+                format!("{} labelled objects", survey.objects)
+            },
+            state_text: "your reviewed frames".into(),
+            ..base
+        },
+        Some(Found::Missing(why)) => DatasetRow {
+            tests: why.clone(),
+            state: "missing",
+            state_text: "folder missing".into(),
+            selectable: false,
+            ..base
+        },
+        Some(Found::Empty) => DatasetRow {
+            tests: "No reviewed frame yet: review frames on the Train tab's Review step to \
+                    benchmark on your own cameras"
+                .into(),
+            state: "unavailable",
+            state_text: "no reviewed frame".into(),
+            selectable: false,
+            ..base
+        },
+        None => DatasetRow {
+            tests: format!(
+                "Counting the reviewed frames of {} (reload for the numbers)",
+                src.dir.display()
+            ),
+            state_text: "counting".into(),
+            ..base
+        },
+    }
+}
+
+/// The last `labelsChanged` and what it was computed from (the snapshot's stamp, the walk's time,
+/// the source): the snapshot (MBs of labels) is parsed only when one of them changes.
+static LAST: Mutex<Option<(String, Arc<RawValue>)>> = Mutex::new(None);
+
+/// `labelsChanged` of `GET /v1/benchmark`: `null` without a snapshot; else `{frames, changed,
+/// left, joined}` ([`snapshot::Changes`]) from the last walk, `{frames: null, computing: true}`
+/// before the first one, `{frames: null, folderMissing: true, message}` when the folder cannot be
+/// read. Never waits for a walk.
+pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
+    let gt = snapshot::path_beside(&results_path(&state.config_path));
+    let stamp = super::file_stamp(&gt);
+    if stamp.is_none() {
+        return RawValue::NULL.to_owned().into();
+    }
+    let src = Source::of(c);
+    let current = live::peek(&src);
+    let key = format!(
+        "{}|{stamp:?}|{}|{:?}",
+        gt.display(),
+        src.key(),
+        current.as_ref().map(|c| c.at)
+    );
+    if let Some((k, v)) = LAST.lock_recover().as_ref()
+        && *k == key
+    {
+        return v.clone();
+    }
+    let value = match current.as_deref().map(|c| &c.found) {
+        None => serde_json::json!({ "frames": null, "computing": true }),
+        Some(Found::Missing(why)) => {
+            serde_json::json!({ "frames": null, "folderMissing": true, "message": why })
+        }
+        Some(found) => match GtSnapshot::load(&gt) {
+            Ok(Some(snap)) => {
+                let empty = std::collections::BTreeMap::new();
+                let now = match found {
+                    Found::Ready { reviewed, .. } => reviewed,
+                    _ => &empty,
+                };
+                serde_json::to_value(snapshot::changes(&snap, now)).unwrap_or_default()
+            }
+            Ok(None) => serde_json::Value::Null,
+            Err(e) => serde_json::json!({ "frames": null, "message": format!("{e:#}") }),
+        },
+    };
+    let value: Arc<RawValue> = raw(&value).into();
+    *LAST.lock_recover() = Some((key, value.clone()));
+    value
+}
+
+/// `POST /v1/benchmark/rescore`: the stored predictions of Your cameras scored against the
+/// labels now, no inference ([`crate::benchmark::cameras::rescore`]); the snapshot is replaced.
+/// 409 while a benchmark runs; 503 `folder_missing` when the review folder cannot be read.
+pub(in crate::server) async fn rescore(State(state): State<Arc<AppState>>) -> Response {
+    crate::server::blocking(move || {
+        if state.benchmark.status().running {
+            return json_error(
+                StatusCode::CONFLICT,
+                "a benchmark is running; re-score once it has finished".into(),
+            );
+        }
+        let cfg = state.config_read().clone();
+        let src = Source::of(&cfg);
+        if let Some(why) = src.problem {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "success": false, "folder_missing": true, "message": why,
+                })),
+            )
+                .into_response();
+        }
+        let path = results_path(&state.config_path);
+        let preds = crate::benchmark::search::preds_path(&state.config_path);
+        match crate::benchmark::cameras::rescore::rescore(&cfg, &path, &preds) {
+            Ok(r) => {
+                tracing::info!(
+                    runs = r.runs,
+                    frames = r.frames,
+                    changed = r.changes.changed,
+                    left = r.changes.left,
+                    need_run = r.need_run,
+                    "benchmark: {TITLE} re-scored against the current labels"
+                );
+                // The page's next poll walks again for the new counts.
+                live::walk(&src);
+                Json(serde_json::json!({ "success": true, "rescored": r })).into_response()
+            }
+            Err(e) => json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Not re-scored: {e:#}"),
+            ),
+        }
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{call, get, post, state};
+    use super::*;
+    use crate::benchmark::cameras::tests::{
+        flat, labels_path, lb, put, ready, reviewed, scored_results,
+    };
+    use crate::benchmark::images::CamerasLoaded;
+    use crate::collect::labels::{self, BoxState};
+
+    /// Two reviewed frames of the state's dataset folder, a scored run of them saved with its
+    /// snapshot; returns the dataset folder.
+    fn seeded(st: &Arc<AppState>) -> std::path::PathBuf {
+        let cfg = st.config_read().clone();
+        let dir = cfg.collect.resolved_review_dir(&cfg.data_root());
+        let person = lb("person", [4.0, 4.0, 40.0, 40.0], BoxState::Accepted);
+        put(
+            &dir,
+            "day/front/2026-11-01/a",
+            &reviewed(vec![person.clone()]),
+        );
+        put(&dir, "day/front/2026-11-02/b", &reviewed(vec![person]));
+        let src = Source::of(&cfg);
+        let l = ready(crate::benchmark::cameras::load(&src));
+        let (results, m) = scored_results(&l.set);
+        let path = results_path(&st.config_path);
+        crate::benchmark::cameras::write_snapshot(
+            &path,
+            std::slice::from_ref(&l.set),
+            Some(&CamerasLoaded {
+                source: src.clone(),
+                reviewed: l.reviewed.clone(),
+            }),
+        )
+        .unwrap();
+        results.save(&path).unwrap();
+        crate::benchmark::search::StoredPreds::merge(None, &results, &[m])
+            .save(&crate::benchmark::search::preds_path(&st.config_path))
+            .unwrap();
+        live::walk(&src);
+        dir
+    }
+
+    fn st_with_classes() -> Arc<AppState> {
+        let st = state();
+        st.config
+            .update("test", |c| {
+                c.collect.classes = vec!["person".into(), "car".into()];
+                Ok(())
+            })
+            .unwrap();
+        st
+    }
+
+    #[tokio::test]
+    async fn labels_changed_counts_edits_and_a_rescore_catches_up() {
+        let st = st_with_classes();
+        let dir = seeded(&st);
+        let (s, v) = call(&st, get("/v1/benchmark")).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["labelsChanged"]["frames"], 0, "{}", v["labelsChanged"]);
+        // An edit through the label write path, seen by the next walk.
+        labels::update(&labels_path(&dir, "day/front/2026-11-02/b"), |f| {
+            let mut f = f.unwrap();
+            f.boxes
+                .push(lb("person", [44.0, 4.0, 60.0, 40.0], BoxState::Accepted));
+            Ok(Some(f))
+        })
+        .unwrap();
+        live::walk(&Source::of(&st.config_read()));
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        let c = &v["labelsChanged"];
+        assert_eq!(
+            (c["frames"].as_u64(), c["changed"].as_u64()),
+            (Some(1), Some(1)),
+            "{c}"
+        );
+        let (s, v) = call(&st, post("/v1/benchmark/rescore", "")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["rescored"]["runs"], 1, "{v}");
+        assert_eq!(v["rescored"]["changes"]["changed"], 1, "{v}");
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert_eq!(v["labelsChanged"]["frames"], 0, "{}", v["labelsChanged"]);
+        // The folder gone: refused as folder_missing, never an empty set.
+        st.config
+            .update("test", |c| {
+                c.collect.review_dir = Some(dir.join("unplugged"));
+                Ok(())
+            })
+            .unwrap();
+        let (s, v) = call(&st, post("/v1/benchmark/rescore", "")).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["folder_missing"], true);
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert_eq!(
+            v["labelsChanged"]["folderMissing"], true,
+            "{}",
+            v["labelsChanged"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_image_route_serves_only_frames_of_the_snapshot() {
+        let st = st_with_classes();
+        let dir = seeded(&st);
+        let url = |file: &str| format!("/v1/benchmark/image?set={ID}&file={file}");
+        let (s, _) = call(&st, get(&url(&flat("day/front/2026-11-01/a")))).await;
+        assert_eq!(s, StatusCode::OK);
+        // A frame of the folder no run scored, a traversal, a nested path, another file.
+        put(
+            &dir,
+            "day/front/2026-11-03/c",
+            &reviewed(vec![lb(
+                "person",
+                [4.0, 4.0, 40.0, 40.0],
+                BoxState::Accepted,
+            )]),
+        );
+        for bad in [
+            flat("day/front/2026-11-03/c"),
+            "..%2F..%2Fcfg.json".to_string(),
+            "day%2Ffront%2F2026-11-01%2Fa.jpg".to_string(),
+            "day.front.2026-11-01.a.labels.json".to_string(),
+        ] {
+            let (s, v) = call(&st, get(&url(&bad))).await;
+            assert_eq!(s, StatusCode::NOT_FOUND, "{bad}: {v}");
+        }
+        // A frame of the results that is no longer in the snapshot is not served either.
+        let gt = snapshot::path_beside(&results_path(&st.config_path));
+        let mut snap = GtSnapshot::load(&gt).unwrap().unwrap();
+        snap.frames
+            .retain(|f| f.file != flat("day/front/2026-11-01/a"));
+        snap.save(&gt).unwrap();
+        let (s, _) = call(&st, get(&url(&flat("day/front/2026-11-01/a")))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call(&st, get(&url(&flat("day/front/2026-11-02/b")))).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_run_tab_lists_your_cameras_first() {
+        let st = st_with_classes();
+        seeded(&st);
+        let (s, v) = call(&st, get("/benchmark")).await;
+        assert_eq!(s, StatusCode::OK);
+        let html = v.as_str().unwrap();
+        let cams = html
+            .find("name=\"dataset\" value=\"cameras\"")
+            .expect("listed");
+        let coco = html.find("name=\"dataset\" value=\"coco-cctv\"").unwrap();
+        assert!(cams < coco, "first");
+        assert!(
+            html.contains("name=\"dataset\" value=\"cameras\" checked"),
+            "selected by default"
+        );
+        assert!(
+            html.contains("2 frames \u{b7} 1 camera \u{b7} 2 camera days"),
+            "the line"
+        );
+        // No reviewed frame: shown, not selectable, with what to do.
+        let st = state();
+        let (_, v) = call(&st, get("/benchmark")).await;
+        let html = v.as_str().unwrap();
+        assert!(
+            html.contains("name=\"dataset\" value=\"cameras\" disabled"),
+            "disabled"
+        );
+        assert!(html.contains("No reviewed frame yet"));
+    }
+}

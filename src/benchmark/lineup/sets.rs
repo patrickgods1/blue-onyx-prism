@@ -168,21 +168,23 @@ pub struct Candidate {
     /// Models scored on it that trained on none of its frames.
     pub fair_models: usize,
     pub images: usize,
+    /// It is "Your cameras" ([`crate::benchmark::cameras::ID`]), all of it: the headline set.
+    pub cameras: bool,
 }
 
 /// The order of [`default_set`], larger first.
-pub fn rank(c: &Candidate) -> (usize, usize, u8, usize) {
+pub fn rank(c: &Candidate) -> (usize, usize, bool, u8, usize) {
     let role = match c.role {
         SetRole::HeldOut => 2,
         SetRole::OwnCamera => 1,
         SetRole::Public => 0,
     };
-    (c.models, c.fair_models, role, c.images)
+    (c.models, c.fair_models, c.cameras, role, c.images)
 }
 
 /// The set to open with: the one the most models share; among those, the one where the most
-/// models are judged fairly, held-out frames, then own frames, then the most images. None when no
-/// model is scored on any set.
+/// models are judged fairly, "Your cameras", held-out frames, then own frames, then the most
+/// images. None when no model is scored on any set.
 pub fn default_set(candidates: &[Candidate]) -> Option<&str> {
     candidates
         .iter()
@@ -204,6 +206,7 @@ mod tests {
             role,
             fair_models: fair,
             images,
+            cameras: false,
         }
     }
 
@@ -271,6 +274,7 @@ mod tests {
             tags: tags.iter().map(ToString::to_string).collect(),
             objects: labelled.then(Vec::new),
             scene: None,
+            group: None,
         }
     }
 

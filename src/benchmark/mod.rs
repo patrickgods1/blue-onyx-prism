@@ -27,6 +27,7 @@
 //! server can benchmark through the registry's own runtimes (one OpenVINO `Core`, the ONNX
 //! Runtime flavor the process loaded) while the workers keep serving.
 
+pub mod cameras;
 pub mod cli;
 pub mod current;
 pub mod export;

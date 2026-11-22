@@ -6,7 +6,10 @@ default. Turn it on with `collect.enabled` or on the **Collect** tab (`/train/co
 applies at once; the README config table lists them.
 
 **Privacy:** the frames contain whatever your cameras see. They stay on this machine, in the dataset
-folder. Nothing is uploaded anywhere.
+folder. Nothing is uploaded anywhere. A benchmark of "Your cameras" reads the reviewed frames where
+they are and keeps the labels it scored against in `benchmark-gt.json` beside `benchmark.json`
+([How the later stages use it](#how-the-later-stages-use-it)): user data like the label files, never
+in a diagnostics bundle, never deleted by the storage sweeper, git-ignored.
 
 ## How a frame is saved
 
@@ -432,6 +435,26 @@ marks the request itself.
   days when a dataset is assembled.
 - **Import:** imported footage uses the same layout and sidecar, with `source` and `provenance`
   added ([Imported frames](#imported-frames)).
+- **Benchmark "Your cameras"** (dataset id `cameras`, README "Per-model devices and benchmarking"):
+  the reviewed frames of the folder under review, selected by the export's rules in memory (no
+  export, no lock, nothing written in the folder; a label file that changes while it is read is left
+  out that time). Each frame is named by its export flat name (`<scene>.<camera>.<date>.<stem>.jpg`)
+  and carries its camera day as its group. A trained model runs without the frames its run trained or
+  validated on. A run writes, beside `benchmark.json` (next to the config file):
+
+  ```
+  benchmark.json                         results; the cameras set's frames without their boxes
+  benchmark-preds.json                   stored predictions (per frame its `group`, the camera day)
+  benchmark-gt.json                      the labels the run scored the set against (version 1):
+                                           {version, set: "cameras", dir, created, classes, size_floor,
+                                            frames: [{file, frame, width, height, revision, boxes}],
+                                            reviewed: {<file>: <label revision>, ...}}
+  ```
+
+  `revision` is the label file's ([Saving, revisions and bulk accept](#saving-revisions-and-bulk-accept));
+  `reviewed` lists every reviewed frame at the time, so a frame reviewed later counts as new. The file
+  is written through a temporary file and a rename; one of a newer version is refused, never moved
+  aside. A re-score (`POST /v1/benchmark/rescore`, `benchmark --rescore`) replaces it.
 
 ## Review labels
 

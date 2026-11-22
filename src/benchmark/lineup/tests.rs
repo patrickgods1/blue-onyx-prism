@@ -41,6 +41,7 @@ fn img(file: &str, tags: &[&str], labels: &[&str]) -> ImageInfo {
                 .collect(),
         ),
         scene: None,
+        group: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn stored(
                         window: None,
                     })
                     .collect(),
+                group: None,
             })
             .collect(),
     }
@@ -121,6 +123,7 @@ struct World {
     now: HashMap<String, ModelNow>,
     configured: Vec<Configured>,
     trained: HashMap<String, BTreeSet<String>>,
+    seen: HashMap<String, crate::benchmark::cameras::seen::Seen>,
     default_model: Option<String>,
 }
 
@@ -143,6 +146,7 @@ impl World {
             now: HashMap::new(),
             configured,
             trained: HashMap::new(),
+            seen: HashMap::new(),
             default_model: None,
         }
     }
@@ -157,6 +161,7 @@ impl World {
             default_model: self.default_model.as_deref(),
             configured: &self.configured,
             trained: &self.trained,
+            seen: &self.seen,
             reachable: &|_| true,
         })
     }
@@ -581,6 +586,7 @@ fn an_unreachable_folder_blocks_the_button() {
         default_model: None,
         configured: &w.configured,
         trained: &w.trained,
+        seen: &w.seen,
         reachable: &|_| false,
     });
     assert!(
@@ -622,4 +628,83 @@ fn the_contract_of_a_cell_is_null_not_zero() {
             .as_u64()
             .is_some()
     );
+}
+
+/// "Your cameras": each trained model ran without the frames it trained or validated on, so
+/// Compare scores every listed model on the frames none of them saw, says how many were left out
+/// and by whom, and judges no one by a share of training frames. A model whose lists do not read
+/// is shown, never best.
+#[test]
+fn your_cameras_compares_on_the_frames_no_listed_model_saw() {
+    use crate::benchmark::cameras::{ID, seen::Seen};
+    let names: Vec<String> = (0..6)
+        .map(|i| format!("day.cam.2026-11-0{}.f{i}.jpg", 1 + i % 2))
+        .collect();
+    let id_of = |f: &str| crate::training::autolabel::frame_of_file(f).unwrap();
+    let images: Vec<ImageInfo> = names
+        .iter()
+        .map(|f| img(f, &["day"], &["person"]))
+        .collect();
+    let preds: Vec<(&str, Vec<Pred>)> = names
+        .iter()
+        .map(|f| (f.as_str(), vec![(0, 0.9, BOX)]))
+        .collect();
+    let ms: Vec<(&str, f64)> = names.iter().map(|f| (f.as_str(), 10.0)).collect();
+    let mut r = results();
+    r.image_sets = vec![set(ID, SetKind::Dir, images)];
+    r.models = vec![
+        model(
+            "plain",
+            &[ID],
+            vec![timed(dev("ort:coreml", 1.0, Vec::new()), ID, &ms)],
+        ),
+        // Its run left out frames 0 (trained) and 1 (validated).
+        model(
+            "tuned",
+            &[ID],
+            vec![timed(dev("ort:coreml", 1.0, Vec::new()), ID, &ms[2..])],
+        ),
+    ];
+    let runs = vec![
+        stored("plain", "ort:coreml", &["person"], ID, preds.clone()),
+        stored("tuned", "ort:coreml", &["person"], ID, preds[2..].to_vec()),
+    ];
+    let mut w = World::new(r, runs);
+    w.seen.insert(
+        "tuned".into(),
+        Seen::Frames {
+            trained: [id_of(&names[0])].into(),
+            validated: [id_of(&names[1])].into(),
+        },
+    );
+    let l = w.build();
+    let s = l.sets.iter().find(|s| s.id == ID).unwrap();
+    assert_eq!((s.images, s.frames_left_out), (4, 2));
+    assert_eq!(s.left_out_by, ["tuned"]);
+    for m in ["plain", "tuned"] {
+        let r = row(s, m);
+        assert!(!r.excluded, "{m}: the left-out frames make it fair");
+        assert_eq!(r.objects["all"].finds.all.n, 4, "{m}");
+    }
+    assert_eq!(l.default_set.as_deref(), Some(ID), "the headline set");
+
+    // Without knowing what it saw, its run lacks two frames: it is not on the set.
+    let mut blind = World::new(w.results.clone(), w.preds.runs.clone());
+    blind.seen.clear();
+    let l = blind.build();
+    let s = l.sets.iter().find(|s| s.id == ID).unwrap();
+    assert_eq!((s.images, s.frames_left_out), (6, 0));
+    let missing = s.missing.iter().find(|m| m.model == "tuned").unwrap();
+    assert!(missing.why.contains("4 of these 6"), "{}", missing.why);
+
+    // Lists that do not read: scored on everything it ran, never best.
+    w.seen.insert(
+        "plain".into(),
+        Seen::Unknown("its lists do not read".into()),
+    );
+    let l = w.build();
+    let s = l.sets.iter().find(|s| s.id == ID).unwrap();
+    let p = row(s, "plain");
+    assert!(p.excluded && p.unknown_seen.is_some());
+    assert!(!row(s, "tuned").excluded);
 }

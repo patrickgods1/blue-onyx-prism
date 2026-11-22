@@ -7,7 +7,10 @@
 //! - [`comparable`]: whether two models' results compare at all, accuracy and speed apart;
 //! - [`verdict`]: best-of-column marks and the sentence, on the run-vs-run noise rules.
 //!
-//! A model is on a set only when its stored run holds every image of it. Rescoring the stored
+//! A model is on a set only when its stored run holds every image of it (on "Your cameras", every
+//! frame it did not train or validate on: its run left those out, and the view holds the frames no
+//! listed model saw, [`SetView::frames_left_out`]; a model whose training lists do not read is
+//! shown, never best, which replaces the trained-share rule there). Rescoring the stored
 //! predictions against the set's recorded labels makes a slice of a larger run (one dataset of
 //! three, an export's held-out frames) as exact as a run on it alone. A device is chosen once per
 //! set: the same device for every model when they share one, so speed compares like with like;
@@ -20,6 +23,7 @@ pub mod score;
 pub mod sets;
 pub mod verdict;
 
+use super::cameras::seen::Seen;
 use super::current::ModelNow;
 use super::history::{History, HistoryEntry, run_key};
 use super::images::{GroundTruth, SetKind};
@@ -55,6 +59,11 @@ pub struct Inputs<'a> {
     /// The frames each trained model trained on, by normalized name. A model missing here is
     /// judged by its stored `trained_on_share`.
     pub trained: &'a HashMap<String, BTreeSet<String>>,
+    /// What each trained model saw of "Your cameras" (its run's train and validation lists), by
+    /// normalized name; a model missing here saw none of it. On a set with the cameras frames,
+    /// the frames any listed model saw are out of the view ([`SetView::frames_left_out`]), so
+    /// every model is scored on the frames none of them saw.
+    pub seen: &'a HashMap<String, Seen>,
     /// Whether a dataset's folder can be read now (a removed drive cannot).
     pub reachable: &'a dyn Fn(&ImageSetInfo) -> bool,
 }
@@ -85,8 +94,12 @@ pub struct Row {
     pub is_default: bool,
     /// Share of the set's frames the model trained on; None = unknown.
     pub trained_on_share: Option<f64>,
-    /// Trained on some of these frames: shown, never best.
+    /// Trained on some of these frames, or (on "Your cameras") what it saw cannot be told:
+    /// shown, never best.
     pub excluded: bool,
+    /// On "Your cameras": why what it saw cannot be told; None otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_seen: Option<String>,
     pub objects: BTreeMap<String, Objects>,
     /// False alerts per empty frame, 0..=1.
     pub false_alerts: Cell,
@@ -159,6 +172,12 @@ pub struct SetView {
     pub views: Vec<View>,
     pub missing: Vec<Missing>,
     pub run: RunHint,
+    /// "Your cameras": frames out of this view because a listed model trained or validated on
+    /// them (each model is scored on the frames none of them saw); 0 elsewhere.
+    pub frames_left_out: usize,
+    /// The listed models that saw some of the set's frames.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub left_out_by: Vec<String>,
 }
 
 /// `lineup` of `GET /v1/benchmark`.
@@ -186,10 +205,18 @@ enum Reach<'a> {
     NoStored,
 }
 
+/// Whether `seen` says its model saw `img`, a frame of "Your cameras".
+fn saw_image(seen: Option<&Seen>, img: &sets::SetImage<'_>) -> bool {
+    img.set.id == super::cameras::ID && seen.is_some_and(|s| s.saw(&img.info.file).is_some())
+}
+
+/// How much of `set` model `m` has; `excused` images (on "Your cameras", the frames it saw and
+/// so did not run) need not be in its run.
 fn reach<'a>(
     set: &CompareSet<'_>,
     m: &'a ModelResult,
     preds: Option<&'a StoredPreds>,
+    excused: &dyn Fn(&sets::SetImage<'_>) -> bool,
 ) -> Reach<'a> {
     let stored = preds.map(|p| p.runs_of(&m.model)).unwrap_or_default();
     let mut runs = Vec::new();
@@ -201,9 +228,13 @@ fn reach<'a>(
         let Some(s) = stored.iter().find(|s| s.device == d.device) else {
             continue;
         };
-        let got = score::covered(set, &score::index_of(s));
+        let index = score::index_of(s);
+        let got = score::covered(set, &index);
         most = most.max(got);
-        if got == set.images.len() {
+        let missed = set.images.iter().any(|i| {
+            !excused(i) && !index.contains_key(&(i.set.id.as_str(), i.info.file.as_str()))
+        });
+        if !missed {
             runs.push((d.device.as_str(), run, *s));
         }
     }
@@ -417,6 +448,7 @@ fn contender(r: &Row) -> Contender {
             .get("all")
             .and_then(|o| Some((o.correct.all.value?, o.correct.all.n))),
         false_alerts: r.false_alerts.value,
+        unknown_seen: r.unknown_seen.clone(),
     }
 }
 
@@ -427,6 +459,11 @@ struct Prepared<'a> {
     run: &'a RunResult,
     images: Vec<Scorable<'a>>,
     share: Option<f64>,
+    /// [`Row::unknown_seen`].
+    unknown_seen: Option<String>,
+    /// [`Row::excluded`]: on "Your cameras" only an unknown training list (the frames a model saw
+    /// are out of the view), elsewhere a share of training frames above 0.
+    excluded: bool,
 }
 
 fn row_of(
@@ -447,7 +484,8 @@ fn row_of(
         confidence,
         is_default: default_model.is_some_and(|d| normalize_name(d) == normalize_name(&p.m.model)),
         trained_on_share: p.share,
-        excluded: p.share.is_some_and(|s| s > 0.0),
+        excluded: p.excluded,
+        unknown_seen: p.unknown_seen.clone(),
         objects,
         false_alerts,
         alerts,
@@ -456,13 +494,25 @@ fn row_of(
     }
 }
 
-/// The set's view, or None when no model is on it.
-fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candidate)> {
-    let (relative, reference) = labels_of(set);
+/// What model `model` saw of "Your cameras" ([`Inputs::seen`]).
+fn seen_of<'i>(inputs: &Inputs<'i>, model: &str) -> Option<&'i Seen> {
+    inputs
+        .seen
+        .get(&normalize_name(super::variant::base_name(model)))
+}
+
+/// The set's view, or None when no model is on it. On "Your cameras" each model is required to
+/// have the frames it did not see, and the view holds the frames no listed model saw.
+fn set_view(full: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candidate)> {
+    let (relative, reference) = labels_of(full);
+    // "Your cameras": each model ran without the frames it saw.
+    let cams = full.datasets.iter().any(|d| d.id == super::cameras::ID);
+    let seen_by = |model: &str| cams.then(|| seen_of(inputs, model)).flatten();
     let mut entrants: Vec<Entrant<'_>> = Vec::new();
     let mut missing: Vec<(&ModelResult, Reach<'_>)> = Vec::new();
     for m in &inputs.results.models {
-        let r = reach(set, m, inputs.preds);
+        let seen = seen_by(&m.model);
+        let r = reach(full, m, inputs.preds, &|i| saw_image(seen, i));
         match r {
             Reach::Whole(e) if !is_reference(reference.as_deref(), &m.model) => entrants.push(e),
             other => missing.push((m, other)),
@@ -471,6 +521,29 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
     if entrants.is_empty() {
         return None;
     }
+    // The frames none of the listed models saw: the one fair view of them all.
+    let left_out_by: Vec<String> = entrants
+        .iter()
+        .filter(|e| {
+            let seen = seen_by(&e.m.model);
+            full.images.iter().any(|i| saw_image(seen, i))
+        })
+        .map(|e| e.m.model.clone())
+        .collect();
+    let fair = CompareSet {
+        images: full
+            .images
+            .iter()
+            .filter(|i| !entrants.iter().any(|e| saw_image(seen_by(&e.m.model), i)))
+            .copied()
+            .collect(),
+        ..full.clone()
+    };
+    if fair.images.is_empty() {
+        return None;
+    }
+    let frames_left_out = full.images.len() - fair.images.len();
+    let set = &fair;
     let devices = devices_for(&entrants, inputs.now, inputs.default_model);
     let chosen: Vec<(&Entrant<'_>, &str, &RunResult, &StoredRun)> = entrants
         .iter()
@@ -491,6 +564,19 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
             run,
             images: score::scorable(set, &map, stored, &score::index_of(stored)),
             share: share_on(set, e.m, inputs),
+            unknown_seen: match seen_by(&e.m.model) {
+                Some(Seen::Unknown(why)) => Some(why.clone()),
+                _ => None,
+            },
+            excluded: false,
+        })
+        .map(|mut p| {
+            p.excluded = if cams {
+                p.unknown_seen.is_some()
+            } else {
+                p.share.is_some_and(|s| s > 0.0)
+            };
+            p
         })
         .collect();
     let speed = {
@@ -578,7 +664,7 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
         .iter()
         .map(|(m, r)| Missing {
             model: m.model.clone(),
-            why: why_not(set, m, r, &inputs.results.image_sets),
+            why: why_not(full, m, r, &inputs.results.image_sets),
             device: set_device.clone().or_else(|| m.recommended.clone()),
             blocked: if matches!(r, Reach::Whole(_)) {
                 Some("its detections are the labels of these images".into())
@@ -624,6 +710,8 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
         speed,
         views,
         missing: out_of_set,
+        frames_left_out,
+        left_out_by,
         run: RunHint {
             datasets: set.datasets.iter().map(|d| d.id.clone()).collect(),
             max_images: set
@@ -640,6 +728,7 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
         role: set.role,
         fair_models,
         images: set.images.len(),
+        cameras: set.id == super::cameras::ID,
     };
     Some((view, candidate))
 }

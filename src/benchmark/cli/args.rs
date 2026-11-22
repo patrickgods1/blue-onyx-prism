@@ -107,8 +107,10 @@ pub struct BenchArgs {
     /// One JPEG/PNG to run on (overrides the datasets).
     #[arg(long, conflicts_with_all = ["dataset", "images"])]
     pub image: Option<PathBuf>,
-    /// Dataset, repeatable: a built-in set id (see --list-datasets), `sample` (the embedded
-    /// image) or `dir:<path>`. Default: `benchmark.datasets` of the config.
+    /// Dataset, repeatable: `cameras` (Your cameras: the reviewed frames of the config's review
+    /// folder, each trained model without the frames it trained or validated on), a built-in set
+    /// id (see --list-datasets), `sample` (the embedded image) or `dir:<path>`. Default:
+    /// `benchmark.datasets` of the config.
     #[arg(long)]
     pub dataset: Vec<String>,
     /// A directory of images (same as `--dataset dir:<path>`), with optional COCO JSON / YOLO
@@ -125,6 +127,11 @@ pub struct BenchArgs {
     /// List the datasets (built-in sets, their download state, the configured selection) and exit.
     #[arg(long)]
     pub list_datasets: bool,
+    /// Score the stored predictions of the last run on Your cameras (`cameras`) again against the
+    /// labels as they are now, without inference, and replace its ground-truth snapshot
+    /// (`benchmark-gt.json`); frames reviewed since the run need a run. Then exit.
+    #[arg(long, conflicts_with_all = ["list_datasets", "threshold_search", "all_devices", "apply", "apply_threshold"])]
+    pub rescore: bool,
     /// Model whose detections are the pseudo ground truth of datasets without ground truth
     /// (default: benchmark.reference_model, else the most accurate installed model).
     #[arg(long)]

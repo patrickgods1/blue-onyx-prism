@@ -26,7 +26,8 @@ use tracing::info;
 /// The folder set `id` names in `results`: a folder dataset with a name instead of a `dir:` id.
 /// The results record the images folder; `load_dir` wants the folder holding it.
 fn named_folder(results: &BenchmarkResults, id: &str) -> Option<DatasetRef> {
-    if id.starts_with(images::DIR_PREFIX) {
+    // Your cameras is an id of its own: the review folder is no flat folder of images.
+    if id.starts_with(images::DIR_PREFIX) || id == crate::benchmark::cameras::ID {
         return None;
     }
     let set = results
@@ -599,7 +600,14 @@ fn image_paths_in(
     cache: &std::sync::Mutex<ImagePathsCache>,
     path: &std::path::Path,
 ) -> Arc<ImagePaths> {
-    let key = format!("{}|{:?}", path.display(), file_stamp(path));
+    use crate::benchmark::cameras::{self, snapshot};
+    let gt = snapshot::path_beside(path);
+    let key = format!(
+        "{}|{:?}|{:?}",
+        path.display(),
+        file_stamp(path),
+        file_stamp(&gt)
+    );
     if let Some((k, v)) = cache.lock_recover().as_ref()
         && *k == key
     {
@@ -607,8 +615,21 @@ fn image_paths_in(
     }
     let mut map = ImagePaths::new();
     if let Some(r) = BenchmarkResults::load_or_warn(path) {
+        // Your cameras: only the frames of its snapshot, the frames a run scored.
+        let snap = snapshot::GtSnapshot::load(&gt)
+            .map_err(|e| tracing::warn!("{e:#}"))
+            .ok()
+            .flatten();
+        let snapped: std::collections::HashSet<&str> = snap
+            .as_ref()
+            .map(|s| s.frames.iter().map(|f| f.file.as_str()).collect())
+            .unwrap_or_default();
         for s in &r.image_sets {
+            let cams = s.id == cameras::ID;
             for i in &s.images {
+                if cams && !snapped.contains(i.file.as_str()) {
+                    continue;
+                }
                 if let Some(p) = s.image_path(&i.file) {
                     map.entry((s.id.clone(), i.file.clone())).or_insert(p);
                 }

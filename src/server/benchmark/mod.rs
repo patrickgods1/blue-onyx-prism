@@ -28,6 +28,7 @@
 //! `history` the run history endpoints.
 
 mod apply;
+mod cameras;
 mod history;
 mod poll;
 mod profiles;
@@ -37,6 +38,7 @@ mod run;
 use apply::BLUE_IRIS_THRESHOLD_NOTE;
 
 pub(super) use apply::{apply, apply_profiles, apply_threshold, search_options, threshold_search};
+pub(super) use cameras::rescore;
 pub(super) use history::{history_compare, history_delete, history_get, history_pin};
 pub(super) use report::save_report;
 pub(super) use run::{cancel, image_file, images_detail, remove_dataset, settings, start};
@@ -315,7 +317,11 @@ fn dataset_rows(state: &AppState, c: &Config) -> Vec<DatasetRow> {
             .filter(|r| r.kind == "bench-images")
             .map(|r| (r.id.to_string(), r))
             .collect();
-    let mut out = Vec::new();
+    // Your cameras first: the headline set.
+    let mut out = vec![cameras::dataset_row(
+        c,
+        is_sel(crate::benchmark::cameras::ID),
+    )];
     for m in images::builtin_manifests() {
         let (set, missing) = ImageSet::from_manifest(m, &images::builtin_dir(&root, &m.id));
         let rid = format!("{}{}", crate::resources::catalog::BENCH_ID_PREFIX, m.id);
@@ -659,14 +665,17 @@ fn saved_view(
     let path = results_path(&state.config_path);
     let preds = preds_path(&state.config_path);
     let hist = history_path(&path);
+    let gt = crate::benchmark::cameras::snapshot::path_beside(&path);
     let mut sorted: Vec<_> = now.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
+    // The snapshot too: the results are scored against it.
     let key = format!(
-        "{}|{:?}|{:?}|{:?}|{revision}|{sorted:?}",
+        "{}|{:?}|{:?}|{:?}|{:?}|{revision}|{sorted:?}",
         path.display(),
         file_stamp(&path),
         file_stamp(&preds),
-        file_stamp(&hist)
+        file_stamp(&hist),
+        file_stamp(&gt)
     );
     // Computed under the cache's lock: polls arriving together compute once.
     SAVED_CACHE.get_or_insert_with(key.clone(), || {
@@ -751,6 +760,24 @@ fn lineup_of(
             (!frames.is_empty()).then(|| (key(&name), frames))
         })
         .collect();
+    // What each trained model saw of Your cameras, when the results hold the set.
+    let seen: HashMap<String, crate::benchmark::cameras::seen::Seen> = results
+        .image_set(crate::benchmark::cameras::ID)
+        .map(|set| {
+            cfg.models
+                .iter()
+                .filter_map(|m| {
+                    let name = m.effective_name();
+                    results
+                        .find(&name)
+                        .or_else(|| results.find(&crate::benchmark::variant::served_name(&name)))?;
+                    let files = set.images.iter().map(|i| i.file.as_str());
+                    let s = crate::benchmark::cameras::seen::of_model(cfg, m, files);
+                    (s != crate::benchmark::cameras::seen::Seen::NoRecord).then(|| (key(&name), s))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let configured: Vec<Configured> = cfg
         .models
         .iter()
@@ -768,6 +795,7 @@ fn lineup_of(
         default_model: crate::training::switch::current_default(cfg).as_deref(),
         configured: &configured,
         trained: &trained,
+        seen: &seen,
         reachable: &|s| s.dir.as_deref().is_some_and(std::path::Path::is_dir),
     });
     raw(&lineup)
