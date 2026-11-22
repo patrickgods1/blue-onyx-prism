@@ -685,11 +685,15 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   page, the CLI and the report name the averaged classes; results of older versions keep the mean
   over every class they were saved with. The frame ROC AUC's class average follows the same rule
   (20 frames with the class).
-- **False alerts**: on empty frames (no object of any scored class), and per class on the frames
-  without that class (*False alerts by class*; a frame whose only box of the class is an unsure region
-  is left out). A camera that always sees a parked car has no empty frame, so its false person alerts
-  show only in the person row: frames without a person that still got a person detection at the
-  threshold. The run history compares that rate between runs (lower is better).
+- **False alerts**: on empty frames, and per class on the frames without that class (*False alerts
+  by class*; a frame whose only box of the class is an unsure region is left out). Only the classes a
+  dataset labels count on its frames: an empty frame has no object of any scored class its dataset
+  labels (unsure regions alone still leave it empty), and it alerts at a threshold when one of its
+  detections of such a class outside every unsure region is at or above it; a vehicle-only set such
+  as `bmd45-cctv` adds no frames without a person. A camera that always sees a parked car has no empty
+  frame, so its false person alerts show only in the person row: frames without a person that still
+  got a person detection at the threshold. The run history compares that rate between runs (lower is
+  better).
 - **Frame-level ROC AUC** (what Blue Iris decides: alert on this frame or not). Box-level ROC is
   undefined for detection, so each frame is one sample per scored class: positive when it has a
   non-ignored object of the class, negative when it has none (frames whose only objects of the class
@@ -712,18 +716,29 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   the configured device is kept. The page and the report also rank the models ("best model for this
   machine").
 - **Confidence threshold**: the same low-threshold (0.05) predictions are scored at every confidence
-  threshold, without extra inference: TP/FP/FN, precision, recall, F1, F2 and false positives per
-  image, overall, per dataset, per tag (day, night, small objects) and per class. The best threshold
-  per model is exact (precision and recall only change at the predictions' confidence values, so
-  every distinct confidence is evaluated; filtering 0.05-threshold output at a higher threshold equals
-  running at it, NMS included). Among thresholds within 0.002 of the best score the middle of the
-  widest range is taken, rounded down to 0.01 (at least 0.05). The objective is
+  threshold, without extra inference: TP/FP/FN, precision, recall, F1, F2, false positives per image
+  and false alerts per 100 empty frames, overall, per dataset, per tag (day, night, small objects) and
+  per class. The best threshold per model is chosen on the 0.01 grid: every step from 0.05 to 1.00 is
+  scored exactly (filtering 0.05-threshold output at a higher threshold equals running at it, NMS
+  included); the steps scoring within 0.002 of the best one form runs, and the middle of the widest
+  run is taken (the lower middle for an even count; equally wide runs: the higher one), so the pick
+  is always a step that scores within 0.002 of the best. The objective is
   `benchmark.threshold_objective` / `--threshold-objective`: `f1` (default), `f2` (favor recall: fewer
-  missed people), `precision:<p>` (highest recall with precision >= p, e.g. `precision:0.9` for fewer
-  false alerts), `recall:<r>` (highest precision with recall >= r), `youden` (highest frame-level
-  TPR - FPR, Youden's J, classes pooled) or `fpr:<x>` (highest frame alert rate with at most x of the
-  frames without an object alerting, e.g. `fpr:0.05`); ties go to the higher threshold. The
-  recommendation text adds P/R (and frame TPR / FPR) at the best threshold.
+  missed people), `f05` (F0.5, favor precision: fewer false alerts), `precision:<p>` (highest recall
+  with precision >= p, e.g. `precision:0.9` for fewer false alerts), `recall:<r>` (highest precision
+  with recall >= r), `recall_at_fa:<N>` (highest recall with at most N false alerts per 100 empty
+  frames, N in (0, 100], e.g. `recall_at_fa:5`), `youden` (highest frame-level TPR - FPR, Youden's J)
+  or `fpr:<x>` (highest frame alert rate with at most x of the frames without an object alerting,
+  e.g. `fpr:0.05`). A target that no step reaches picks the closest step (most precise, highest
+  recall, fewest false alerts) and is never applied. `youden` and `fpr:<x>` count one sample per
+  frame: positive when it has an object of a scored class its dataset labels, negative when it has
+  none (frames with only unsure regions are left out), scored by its most confident such detection
+  outside every unsure region; the TPR / FPR shown beside their picks are these rates (the ROC curve
+  and ROC AUC keep one sample per frame and class). The recommendation text adds P/R (and frame
+  TPR / FPR) at the best threshold. On a dataset without ground truth the reference model is not
+  scored at all (its detections are the labels), and a best threshold fitted on such a dataset is
+  shown but never applied ("fitted on another model's detections, not on labels"); a value you type
+  is.
   The server threshold is what a model reports: Blue Iris may send its own `min_confidence` per
   request (when it does, it replaces the server threshold for that request), and each camera's
   minimum confidence filters the returned objects again on top.
@@ -749,10 +764,14 @@ blue-onyx-prism benchmark --threshold-search --tag night --threshold-objective r
 blue-onyx-prism benchmark --threshold-search --dataset exdark-night --class person --iou 0.6 --json
 blue-onyx-prism benchmark --all-devices --accuracy-metric roc_auc --threshold-objective youden
 blue-onyx-prism benchmark --threshold-search --threshold-objective fpr:0.05   # frame ROC from stored predictions
+blue-onyx-prism benchmark --threshold-search --threshold-objective recall_at_fa:5   # most found, <= 5 false alerts per 100 empty frames
 ```
 
 The predictions behind the search are stored in `benchmark-preds.json` next to `benchmark.json`
-(`[class, confidence, x_min, y_min, x_max, y_max]` per prediction and image, per model and device). The
+(`[class, confidence, x_min, y_min, x_max, y_max]` per prediction and image, per model and device).
+At most the 100 most confident predictions per image are kept: the run counts the images that had
+more (`preds_capped_images`), and a search over them says so, since below their least confident kept
+prediction it can differ from the run. The
 Benchmark page's **Confidence search** card runs the same search (models, device, datasets, tags,
 classes, objective with target, IoU) in milliseconds and shows P/R/F1(/F2) vs threshold with hover
 values, the configured and best thresholds marked, the frame ROC curve (with ROC AUC per class and frame
@@ -773,7 +792,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
 | `benchmark.low_priority` | `true` | Run benchmarks of CPU devices (`openvino:cpu`, `ort:cpu`, `CPU`) at below-normal process priority so the desktop stays responsive; GPU and NPU devices keep the normal priority, so the service keeps answering Blue Iris at full priority while they run (Windows: the whole process while a CPU device compiles and runs, restored before a GPU device and after the run; the log and the Benchmark page's progress line say which applied; CLI on Linux/macOS: nice 10 for a run whose devices are all CPUs, a running service is never lowered there). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
-| `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`. UI: yes |
+| `benchmark.threshold_objective` | `"f1"` | Best-threshold objective: `f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>` (false alerts per 100 empty frames), `youden`, `fpr:<x>`. UI: yes |
 | `benchmark.accuracy_metric` | `"ap50"` | `ap50` or `roc_auc`: drives the accuracy grade, ranking and device recommendation. UI: yes |
 
 All of them apply at once: they are read when a benchmark starts.
@@ -1328,7 +1347,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/benchmark/apply` | `model` + `device` (`""`/`global` clears it), or `all=1` for every saved recommendation; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the best confidence of every measured device, `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |
-| GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, CSV; 400 when nothing is stored (run a benchmark first) |
+| GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>`, `youden`, `fpr:<x>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, `preds_capped_images`, CSV; 400 when nothing is stored (run a benchmark first) |
 | GET | `/v1/benchmark/images?model=&device=`, `/v1/benchmark/image?set=&file=` | per-image drill-down data; an image of the saved results |
 | POST | `/v1/resources/add-to-config` | form `id` of a downloaded model, or `local:<file>` for a model file in `models_dir` (family `auto`): append it to `models` |
 

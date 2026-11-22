@@ -279,7 +279,12 @@
 
   // ---- threshold detail (Details cards, Confidence > More detail) ------------------------------
   // Frame-level rates of a threshold point ("TPR / FPR" in %).
-  function tf(p) { return p && p.frame ? pct(p.frame.tpr) + " / " + pct(p.frame.fpr) : "-"; }
+  // Frame rates beside a pick: one sample per frame (`per_frame`); results of older versions
+  // only have the pooled (frame, class) rates of the ROC curve (`frame`).
+  function fr(p) { return p ? p.per_frame || p.frame || null : null; }
+  function tf(p) { var f = fr(p); return f ? pct(f.tpr) + " / " + pct(f.fpr) : "-"; }
+  // False alerts per 100 empty frames (null without empty frames).
+  function fa100(p) { var f = p && p.false_alerts; return f && f.empty_frames > 0 ? 100 * f.alerts / f.empty_frames : null; }
   function rocWrap(o) { var w = el("div", "thr-chart-wrap roc-chart-wrap"); w.appendChild(C.rocSvg(o)); return w; }
   // Per-class frame ROC table (frames with / without the class, AUC).
   function rocTable(roc) {
@@ -316,8 +321,8 @@
     var b = a.best, n = nowOf(a), np = n.point, p = el("p", b && b.met ? "notice" : "warn");
     if (b) {
       var cfgText = near(n.threshold, b.threshold) ? "the configured threshold" + (isRunning(n) ? "; running " + thr(n.running) + " until restart" : "")
-        : "configured " + nowText(n) + ": " + (np ? "P " + pct(np.precision) + " R " + pct(np.recall) + " F1 " + pct(np.f1) + (np.frame ? ", frame TPR / FPR " + tf(np) : "") : "not evaluated");
-      p.textContent = "Best " + F.thrBi(b.threshold) + " for " + a.objective + " on " + a.device + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + (b.point.frame ? ", frame TPR / FPR " + tf(b.point) : "") + " (" + cfgText + ")" + (b.note ? ". " + b.note : "") + (b.plateau && b.exact_threshold !== null && b.exact_threshold !== undefined ? ". Exact optimum at confidence " + b.exact_threshold.toFixed(3) + "; near-optimal range " + b.plateau[0].toFixed(3) + "–" + b.plateau[1].toFixed(3) + ", rounded down to 0.01." : ".");
+        : "configured " + nowText(n) + ": " + (np ? "P " + pct(np.precision) + " R " + pct(np.recall) + " F1 " + pct(np.f1) + (fr(np) ? ", frame TPR / FPR " + tf(np) : "") : "not evaluated");
+      p.textContent = "Best " + F.thrBi(b.threshold) + " for " + a.objective + " on " + a.device + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + (fr(b.point) ? ", frame TPR / FPR " + tf(b.point) : "") + " (" + cfgText + ")" + (b.note ? ". " + b.note : "") + (b.plateau && b.exact_threshold !== null && b.exact_threshold !== undefined ? ". Best 0.01 step " + b.exact_threshold.toFixed(2) + "; near-optimal range " + b.plateau[0].toFixed(2) + "–" + b.plateau[1].toFixed(2) + ", the middle taken." : ".") + (a.relative || b.relative ? " Not applied: fitted on another model's detections, not on labels." : "");
     } else p.textContent = "No ground truth for a threshold curve.";
     box.appendChild(p);
     var row = el("div", "chart-row"), wrapC = el("div", "thr-chart-wrap"); wrapC.appendChild(thresholdChart(m, a)); row.appendChild(wrapC);
@@ -424,7 +429,7 @@
       checks($("s-classes"), "s-class", j.options.classes, function () { return false; });
       if (!first) return; // a refresh keeps the user's objective
       var obj = String(j.objective || "f1"), kind = obj.split(":")[0];
-      $("s-objective").value = kind; if (obj.indexOf(":") > 0) $("s-target").value = obj.split(":")[1];
+      $("s-objective").value = kind; targetRange(kind); if (obj.indexOf(":") > 0) $("s-target").value = obj.split(":")[1];
       $("s-target-label").hidden = !hasTarget(kind);
     }).catch(function () { /* older server or no results: the card keeps its empty state */ });
   }
@@ -433,26 +438,38 @@
   function refreshSearch() {
     return loadSearch().then(function () { if (search.body) return runSearch(search.body, true); });
   }
-  function hasTarget(k) { return k === "precision" || k === "recall" || k === "fpr"; }
+  function hasTarget(k) { return k === "precision" || k === "recall" || k === "fpr" || k === "recall_at_fa"; }
+  // The target input's range: false alerts per 100 empty frames (0, 100], else a share 0..1.
+  function targetRange(k) {
+    var t = $("s-target"), per100 = k === "recall_at_fa";
+    t.min = per100 ? "0.5" : "0"; t.max = per100 ? "100" : "1"; t.step = per100 ? "0.5" : "0.01";
+    $("s-target-unit").textContent = per100 ? "(false alerts per 100 empty frames)" : "(0..1)";
+  }
   $("s-objective").addEventListener("change", function () {
     var k = $("s-objective").value, t = $("s-target"), v = parseFloat(t.value);
     $("s-target-label").hidden = !hasTarget(k);
-    // Sensible starting targets: few false alerts for fpr, a high bar for precision / recall.
+    targetRange(k);
+    // Sensible starting targets: few false alerts for fpr, a high bar for precision / recall,
+    // 5 per 100 empty frames.
     if (k === "fpr" && !(v < 0.5)) t.value = "0.05";
-    if ((k === "precision" || k === "recall") && !(v >= 0.5)) t.value = "0.9";
+    if ((k === "precision" || k === "recall") && !(v >= 0.5 && v <= 1)) t.value = "0.9";
+    if (k === "recall_at_fa" && !(v >= 0.5)) t.value = "5";
   });
   // The value an objective maximizes, for its gain column.
   function objScore(obj, p) {
     if (!p) return null;
     var k = obj.split(":")[0], t = parseFloat(obj.split(":")[1]);
     if (k === "f2") return p.f2;
+    if (k === "f05") { var d = 1.25 * p.tp + 0.25 * p["fn"] + p.fp; return p.tp + p["fn"] > 0 ? (d > 0 ? 1.25 * p.tp / d : 0) : null; }
+    if (k === "recall_at_fa") { var a = fa100(p); return a !== null && a <= t + 1e-9 ? p.recall : null; }
     if (k === "precision") return p.precision !== null && p.precision >= t - 1e-12 ? p.recall : null;
     if (k === "recall") return p.recall !== null && p.recall >= t - 1e-12 ? p.precision : null;
-    if (k === "youden") return p.frame && p.frame.tpr !== null && p.frame.fpr !== null ? p.frame.tpr - p.frame.fpr : null;
-    if (k === "fpr") return p.frame && p.frame.fpr !== null && p.frame.fpr <= t + 1e-12 ? p.frame.tpr : null;
+    var f = fr(p);
+    if (k === "youden") return f && f.tpr !== null && f.fpr !== null ? f.tpr - f.fpr : null;
+    if (k === "fpr") return f && f.fpr !== null && f.fpr <= t + 1e-12 ? f.tpr : null;
     return p.f1;
   }
-  function gainLabel(obj) { var k = obj.split(":")[0]; return k === "f2" ? "F2" : k === "precision" ? "recall" : k === "recall" ? "precision" : k === "youden" ? "J" : k === "fpr" ? "frame TPR" : "F1"; }
+  function gainLabel(obj) { var k = obj.split(":")[0]; return k === "f2" ? "F2" : k === "f05" ? "F0.5" : k === "precision" || k === "recall_at_fa" ? "recall" : k === "recall" ? "precision" : k === "youden" ? "J" : k === "fpr" ? "frame TPR" : "F1"; }
   function searchBody() {
     var b = new URLSearchParams(), checked = function (n) { return Array.prototype.map.call(document.querySelectorAll("input[name=" + n + "]:checked"), function (c) { return c.value; }); };
     var ms = checked("s-model"); if (!ms.length) ms = ["all"]; ms.forEach(function (m) { b.append("model", m); });
@@ -531,7 +548,7 @@
     var r = j.results.find(function (x) { return x.model === search.selected; }); if (!r) return;
     var b = r.best, f2 = r.objective === "f2", c = r.now || r.configured, run = searchRunning(r);
     box.appendChild(el("h3", null, r.model + " on " + r.device + " (" + r.ground_truth + ", IoU " + r.iou + ")"));
-    if (b) box.appendChild(el("p", b.met ? "notice" : "warn", "Best " + F.thrBi(b.threshold) + " for " + r.objective + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + " F2 " + pct(b.point.f2) + " · " + b.point.fp_per_image.toFixed(2) + " false positives per image" + (b.point.frame ? " · frame TPR / FPR " + tf(b.point) + " (configured " + thr(c.threshold) + ": " + tf(c) + ")" : "") + ". Exact optimum at " + (b.exact_threshold !== null && b.exact_threshold !== undefined ? b.exact_threshold.toFixed(3) : "-") + (b.plateau ? ", near-optimal range " + b.plateau[0].toFixed(3) + "–" + b.plateau[1].toFixed(3) : "") + "." + (b.note ? " " + b.note + "." : "")));
+    if (b) box.appendChild(el("p", b.met ? "notice" : "warn", "Best " + F.thrBi(b.threshold) + " for " + r.objective + ": P " + pct(b.point.precision) + " R " + pct(b.point.recall) + " F1 " + pct(b.point.f1) + " F2 " + pct(b.point.f2) + " · " + b.point.fp_per_image.toFixed(2) + " false positives per image" + (fr(b.point) ? " · frame TPR / FPR " + tf(b.point) + " (configured " + thr(c.threshold) + ": " + tf(c) + ")" : "") + (fa100(b.point) !== null ? " · " + fa100(b.point).toFixed(1) + " false alerts per 100 empty frames" : "") + ". Best 0.01 step " + (b.exact_threshold !== null && b.exact_threshold !== undefined ? b.exact_threshold.toFixed(2) : "-") + (b.plateau ? ", near-optimal range " + b.plateau[0].toFixed(2) + "–" + b.plateau[1].toFixed(2) : "") + "." + (b.note ? " " + b.note + "." : "") + (r.relative ? " Not applied: fitted on another model's detections, not on labels." : "") + (r.preds_capped_images ? " " + r.preds_capped_images + " image(s) had more than 100 predictions; only the most confident were stored, so this search can differ from the run below their least confident stored one." : "")));
     var crow = el("div", "chart-row"), cw = el("div", "thr-chart-wrap");
     cw.appendChild(C.chartSvg({
       key: "s-thr",
@@ -561,7 +578,7 @@
       if (run !== null && near(run, p.threshold)) marks.push("running");
       cell(tr, p.threshold.toFixed(2), p.threshold); [p.precision, p.recall, p.f1, p.f2].forEach(function (v) { cell(tr, pct(v), v === null ? null : -v); });
       cell(tr, p.fp_per_image.toFixed(2), p.fp_per_image); cell(tr, p.tp, p.tp); cell(tr, p.fp, p.fp); cell(tr, p["fn"], p["fn"]);
-      var ft = p.frame ? p.frame.tpr : null, ff = p.frame ? p.frame.fpr : null; cell(tr, pct(ft), ft === null ? null : -ft); cell(tr, pct(ff), ff);
+      var pf = fr(p), ft = pf ? pf.tpr : null, ff = pf ? pf.fpr : null; cell(tr, pct(ft), ft === null ? null : -ft); cell(tr, pct(ff), ff);
       cell(tr, marks.join(", "));
       g.tBodies[0].appendChild(tr);
     });
@@ -881,7 +898,7 @@
           return s; }},
         {id: "recall", head: "@finds", num: true, first: "desc", value: function (r) { return r.b && r.b.point ? r.b.point.recall : null; }, render: function (r) { return r.b && !findsNothing(r.b) ? F.pct(r.b.point.recall) : "-"; }},
         {id: "precision", head: "@correct", num: true, first: "desc", value: function (r) { return r.b && r.b.point ? r.b.point.precision : null; }, render: function (r) { return r.b && !findsNothing(r.b) ? F.pct(r.b.point.precision) : "-"; }},
-        {id: "fpr", head: "@fpr", num: true, value: function (r) { return r.b && r.b.point && r.b.point.frame ? r.b.point.frame.fpr : null; }, render: function (r) { return r.b && r.b.point && r.b.point.frame && !findsNothing(r.b) ? F.pct(r.b.point.frame.fpr) : "-"; }},
+        {id: "fpr", head: "@fpr", num: true, value: function (r) { var f = r.b && fr(r.b.point); return f ? f.fpr : null; }, render: function (r) { var f = r.b && fr(r.b.point); return f && !findsNothing(r.b) ? F.pct(f.fpr) : "-"; }},
         {id: "saved", head: "@saved_conf", num: true, value: function (r) { return PB.profiles.saved(r.model, r.device); }, render: function (r) { var v = PB.profiles.saved(r.model, r.device); return has(v) ? thrShort(v) : "not saved"; }},
         {id: "change", head: "@change", render: function (r) {
           var ch = r.m.changes, a = r.m.threshold;

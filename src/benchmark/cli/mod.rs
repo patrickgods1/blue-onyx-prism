@@ -11,6 +11,8 @@
 //!                                                       # search the stored predictions, no inference
 //! blue-onyx-prism-benchmark --all-devices --accuracy-metric roc_auc --threshold-objective youden
 //!                                                       # grade by frame ROC AUC, pick by Youden's J
+//! blue-onyx-prism-benchmark --threshold-search --threshold-objective recall_at_fa:5
+//!                                                       # most found, <= 5 false alerts / 100 empty frames
 //! ```
 
 use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, priority, spec};
@@ -679,8 +681,8 @@ impl RunCtx<'_> {
                 report.warn(
                     args.json,
                     format!(
-                        "{} is also the pseudo-ground-truth reference: its accuracy on the datasets \
-                         without ground truth is 100% by construction",
+                        "{} is also the pseudo-ground-truth reference: it is not scored on the \
+                         datasets without ground truth (their labels are its own detections)",
                         job.name
                     ),
                 );
@@ -1120,7 +1122,13 @@ fn apply_thresholds(
                             .iter()
                             .find(|p| crate::config::same_device(&p.device, &d.device))
                             .and_then(|p| p.best.as_ref())
-                            .and_then(|b| b.note.clone())
+                            .and_then(|b| {
+                                if b.relative || a.relative {
+                                    Some(crate::benchmark::threshold::NOT_ON_LABELS.to_string())
+                                } else {
+                                    b.note.clone()
+                                }
+                            })
                             .unwrap_or_else(|| "no usable threshold".into())
                     ),
                 }
@@ -1279,6 +1287,17 @@ mod tests {
         let a = parse(&["x", "--apply-threshold"]).unwrap();
         assert!(a.apply_threshold && !a.apply && a.threshold_objective.is_none());
         assert!(parse(&["x", "--threshold-objective", "f3"]).is_err());
+        let a = parse(&[
+            "x",
+            "--threshold-search",
+            "--threshold-objective",
+            "recall_at_fa:5",
+        ])
+        .unwrap();
+        assert_eq!(a.threshold_objective, Some(Objective::RecallAtFa(5.0)));
+        let a = parse(&["x", "--threshold-objective", "f0.5"]).unwrap();
+        assert_eq!(a.threshold_objective, Some(Objective::F05));
+        assert!(parse(&["x", "--threshold-objective", "recall_at_fa:0"]).is_err());
         assert!(parse(&["x", "--apply-threshold", "--model", "a.onnx"]).is_err());
         assert!(parse(&["x", "--apply-threshold", "--min-confidence", "0.3"]).is_err());
     }

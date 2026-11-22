@@ -272,8 +272,8 @@ pub(in crate::server) async fn search_options(State(state): State<Arc<AppState>>
 
 /// `POST /v1/benchmark/threshold-search` (urlencoded): `model` (repeated or comma separated;
 /// `all` or none = every model), `device` (none = recommended), `dataset`, `tag`, `class`
-/// (repeated), `objective` (`f1`, `f2`, `precision:<p>`, `recall:<r>`; default the configured
-/// one), `iou` (0.5). Answers per model the best threshold, P/R/F1/F2/FP per image at the best
+/// (repeated), `objective` (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`,
+/// `recall_at_fa:<N>`, `youden`, `fpr:<x>`; default the configured one), `iou` (0.5). Answers per model the best threshold, P/R/F1/F2/FP per image at the best
 /// and the configured thresholds, the exact curve and the 0.05 grid, per-dataset and per-class
 /// bests. 400 on bad input, when nothing is stored ("run a benchmark first") or nothing
 /// matches.
@@ -369,7 +369,7 @@ pub(in crate::server) async fn apply_threshold(
 /// [`apply_threshold`] off the runtime threads: it parses the results and writes the config
 /// (SV-06).
 fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
-    let picks = match threshold_picks(state, form) {
+    let (picks, skipped) = match threshold_picks(state, form) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
     };
@@ -426,6 +426,7 @@ fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) ->
     if !described.is_empty() {
         message.push_str(" Applied now: the next detections use it.");
     }
+    message.push_str(&skipped_note(&skipped));
     message.push(' ');
     message.push_str(BLUE_IRIS_THRESHOLD_NOTE);
     info!("benchmark threshold apply: {message}");
@@ -519,6 +520,37 @@ fn clear_model_thresholds(
     Ok(changes)
 }
 
+/// " Not applied for m: its best threshold was fitted on another model's detections, not on
+/// labels." (empty without `skipped` models).
+fn skipped_note(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Not applied for {}: the best threshold was {} (a set without ground truth); type a \
+         value to set one.",
+        skipped.join(", "),
+        crate::benchmark::threshold::NOT_ON_LABELS
+    )
+}
+
+/// The refusal of an "apply all" that found nothing to apply because every best threshold of
+/// `skipped` was fitted on pseudo ground truth (409), else the usual 404 `none`.
+fn nothing_to_apply(skipped: &[String], none: &str) -> ApiError {
+    if skipped.is_empty() {
+        return ApiError::new(StatusCode::NOT_FOUND, none.to_string());
+    }
+    ApiError::new(
+        StatusCode::CONFLICT,
+        format!(
+            "not applied: the best threshold of {} was {} (a set without ground truth); type a \
+             value to set one",
+            skipped.join(", "),
+            crate::benchmark::threshold::NOT_ON_LABELS
+        ),
+    )
+}
+
 /// One pick of an apply-threshold form: `threshold` None clears the model's own threshold, or
 /// removes the profile when `device` is given.
 struct ThresholdPick {
@@ -531,16 +563,23 @@ struct ThresholdPick {
 /// The picks of an apply-threshold form: `all=1` takes the saved best thresholds of the
 /// configured models (limited to the form's models, if any), else the `model` / `threshold`
 /// pairs (`threshold=global`: None, the model's own threshold is cleared), each optionally
-/// followed by a `device` (a profile for that device; `global` / `none` removes it).
+/// followed by a `device` (a profile for that device; `global` / `none` removes it). Also
+/// returns the models `all=1` left alone because their best threshold was fitted on pseudo
+/// ground truth (an explicit `threshold` is always written).
 fn threshold_picks(
     state: &AppState,
     form: &[(String, String)],
-) -> Result<Vec<ThresholdPick>, ApiError> {
+) -> Result<(Vec<ThresholdPick>, Vec<String>), ApiError> {
     let models = form_models(form);
     if form_field(form, "all").is_some_and(truthy) {
         let results = results_for_apply(state)?;
         let only = (!models.is_empty()).then_some(models.as_slice());
         let cfg = state.config_read().clone();
+        let skipped: Vec<String> = results
+            .not_on_labels(only)
+            .into_iter()
+            .filter(|m| crate::benchmark::find_model(&cfg, m).is_some())
+            .collect();
         let picks: Vec<ThresholdPick> = results
             .thresholds(only)
             .into_iter()
@@ -552,12 +591,12 @@ fn threshold_picks(
             })
             .collect();
         if picks.is_empty() {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
+            return Err(nothing_to_apply(
+                &skipped,
                 "the saved results have no best threshold for these models",
             ));
         }
-        return Ok(picks);
+        return Ok((picks, skipped));
     }
     let usage = || {
         ApiError::new(
@@ -597,7 +636,8 @@ fn threshold_picks(
                     device: None,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ApiError>>()
+            .map(|p| (p, Vec::new()));
     }
     // With profiles: each `model` starts a pick; its `threshold` and optional `device` follow.
     let mut groups: Vec<(String, Option<&str>, Option<&str>)> = Vec::new();
@@ -633,7 +673,8 @@ fn threshold_picks(
                 device,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, ApiError>>()
+        .map(|p| (p, Vec::new()))
 }
 
 /// `POST /v1/benchmark/apply-profiles` (urlencoded): write per-device confidence profiles
@@ -667,6 +708,8 @@ pub(in crate::server) async fn apply_profiles(
 struct ProfileForm {
     uses: Vec<(String, Option<String>)>,
     profiles: Vec<(String, String, Option<f32>)>,
+    /// Models `all=1` left alone: their best thresholds were fitted on pseudo ground truth.
+    skipped: Vec<String>,
 }
 
 /// Parse an apply-profiles form (see [`apply_profiles`]); `all=1` reads the saved results.
@@ -729,9 +772,14 @@ fn profile_form(state: &AppState, form: &[(String, String)]) -> Result<ProfileFo
             .filter(|(m, _, _)| crate::benchmark::find_model(&cfg, m).is_some())
             .map(|(m, d, t)| (m, d, Some(t)))
             .collect();
+        out.skipped = results
+            .not_on_labels(only)
+            .into_iter()
+            .filter(|m| crate::benchmark::find_model(&cfg, m).is_some())
+            .collect();
         if all.is_empty() && out.uses.is_empty() && out.profiles.is_empty() {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
+            return Err(nothing_to_apply(
+                &out.skipped,
                 "the saved results have no per-device best threshold for these models",
             ));
         }
@@ -807,6 +855,7 @@ fn apply_profiles_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> 
         );
         message.push_str(BLUE_IRIS_THRESHOLD_NOTE);
     }
+    message.push_str(&skipped_note(&asked.skipped));
     info!("benchmark apply-profiles: {message}");
     Json(serde_json::json!({
         "success": true,
@@ -1151,12 +1200,15 @@ mod tests {
         assert_eq!(r["objective"], "recall:0.5");
         assert_eq!(r["classes"], serde_json::json!(["person"]));
 
-        // Frame-level objective from stored data: Youden's J. Frames (real set): a person+ .85,
-        // a car+ .4, b person+ .6, b car- (no car prediction: 0). J = 1 for thresholds up to
-        // 0.4 -> plateau [0.05, 0.4], midpoint 0.22.
+        // Frame-level objective from stored data: Youden's J over one sample per frame, cars
+        // only (both frames have a person). Frames (real set): a car+ .4, b car- (no car
+        // prediction: 0). J = 1 for thresholds up to 0.4 -> grid 0.05 ..= 0.40, middle 0.22.
         let (s, v) = call(
             &st,
-            post("/v1/benchmark/threshold-search", "objective=youden"),
+            post(
+                "/v1/benchmark/threshold-search",
+                "objective=youden&class=car",
+            ),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
@@ -1164,8 +1216,8 @@ mod tests {
         assert_eq!(r["objective"], "youden");
         assert_eq!(r["best"]["threshold"].as_f64().unwrap() as f32, 0.22);
         assert_eq!(r["best"]["exact_threshold"].as_f64().unwrap() as f32, 0.4);
-        assert_eq!(r["best"]["point"]["frame"]["tpr"], 1.0);
-        assert_eq!(r["best"]["point"]["frame"]["fpr"], 0.0);
+        assert_eq!(r["best"]["point"]["per_frame"]["tpr"], 1.0);
+        assert_eq!(r["best"]["point"]["per_frame"]["fpr"], 0.0);
         assert_eq!(r["roc"]["auc"], 1.0);
         assert!(r["roc"]["curve"].as_array().unwrap().len() >= 2);
         assert!(v["csv"].as_str().unwrap().contains("roc_auc"));
@@ -1176,6 +1228,20 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["results"][0]["objective"], "fpr:0.05");
+        // recall_at_fa:N over stored predictions; both frames have objects, so no empty frame
+        // and no pick. Nothing was capped.
+        let (s, v) = call(
+            &st,
+            post(
+                "/v1/benchmark/threshold-search",
+                "objective=recall_at_fa%3A5",
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["results"][0]["objective"], "recall_at_fa:5");
+        assert!(v["results"][0]["best"].is_null(), "{v}");
+        assert_eq!(v["results"][0]["preds_capped_images"], 0);
 
         // Bad input / nothing matching: 400 with a message.
         for body in [
@@ -1190,6 +1256,81 @@ mod tests {
             assert!(v["message"].is_string());
         }
     }
+    /// B10: an "apply all" never writes a best threshold fitted on pseudo ground truth
+    /// (another model's detections); a value the user types still works.
+    #[tokio::test]
+    async fn picks_on_pseudo_labels_are_refused_by_apply() {
+        use crate::benchmark::threshold::NOT_ON_LABELS;
+        let st = state();
+        let cfg_path = st.config_path.clone();
+        let mut results = profile_results(Default::default());
+        let relative = |m: &mut crate::benchmark::report::ModelResult| {
+            let a = m.threshold.as_mut().unwrap();
+            a.relative = true;
+            for p in a
+                .best
+                .iter_mut()
+                .chain(a.by_device.iter_mut().filter_map(|d| d.best.as_mut()))
+            {
+                p.relative = true;
+            }
+        };
+        for m in &mut results.models {
+            relative(m);
+        }
+        results.save(&results_path(&cfg_path)).unwrap();
+        st.config.update("test", |_| Ok(())).unwrap();
+        for url in [
+            "/v1/benchmark/apply-profiles",
+            "/v1/benchmark/apply-threshold",
+        ] {
+            let (s, v) = call(&st, post(url, "all=1")).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{url}: {v}");
+            let m = v["message"].as_str().unwrap();
+            assert!(m.contains(NOT_ON_LABELS) && m.contains("dfine-s"), "{m}");
+        }
+        // Only dfine-s on pseudo labels: the others are written, dfine-s is named.
+        let mut results = profile_results(Default::default());
+        for m in results.models.iter_mut().filter(|m| m.model == "dfine-s") {
+            relative(m);
+        }
+        results.save(&results_path(&cfg_path)).unwrap();
+        let (s, v) = call(&st, post("/v1/benchmark/apply-profiles", "all=1")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let models: Vec<&str> = v["changes"]["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["model"].as_str().unwrap())
+            .collect();
+        assert!(
+            !models.is_empty() && models.iter().all(|m| *m != "dfine-s"),
+            "{models:?}"
+        );
+        let m = v["message"].as_str().unwrap();
+        assert!(m.contains("Not applied for dfine-s"), "{m}");
+        // A typed value is the user's: written.
+        let (s, v) = call(
+            &st,
+            post(
+                "/v1/benchmark/apply-profiles",
+                "profile=ort%3Acoreml%7C0.35%7Cdfine-s",
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, v) = call(
+            &st,
+            post(
+                "/v1/benchmark/apply-threshold",
+                "model=dfine-s&threshold=0.4",
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(!v["message"].as_str().unwrap().contains("Not applied"));
+    }
+
     #[tokio::test]
     async fn apply_profiles_all_use_and_undo() {
         let st = state();

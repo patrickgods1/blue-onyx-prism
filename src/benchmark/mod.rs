@@ -368,6 +368,18 @@ impl AccuracyReport {
     pub fn roc_auc(&self) -> Option<f64> {
         self.frame_roc.as_ref().and_then(|r| r.auc)
     }
+
+    /// Results of versions before B10: the overall score is against pseudo ground truth made
+    /// by `model` itself ([`AccuracyReport::ground_truth`] names the references). Such a score
+    /// is not graded ([`report::BenchmarkResults::regrade`]); new runs leave those sets out.
+    pub fn scored_on_own_labels(&self, model: &str) -> bool {
+        self.relative
+            && self
+                .ground_truth
+                .strip_prefix("relative to ")
+                .and_then(|r| r.strip_suffix(", not ground truth"))
+                .is_some_and(|refs| refs.split(", ").any(|r| is_reference(r, model)))
+    }
 }
 
 /// AP over all of a model's classes.
@@ -381,6 +393,15 @@ pub struct AllClasses {
     /// The classes `ap50` / `ap50_95` average (None in results of older versions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ap_basis: Option<ApBasis>,
+}
+
+/// The pseudo ground truth `reference` ("rt-detrv2-x on openvino:cpu", [`GroundTruth::Pseudo`])
+/// is the detections of the model `model` (normalized names, any device): its own labels, so
+/// it is never scored, ranked or advised on them (B10).
+pub(crate) fn is_reference(reference: &str, model: &str) -> bool {
+    reference.split(" on ").next().is_some_and(|r| {
+        crate::registry::normalize_name(r.trim()) == crate::registry::normalize_name(model)
+    })
 }
 
 /// The scored classes a dataset annotates: every class of `map`, or those of the set's
@@ -435,6 +456,9 @@ pub(crate) fn eval_input(
             .into_iter()
             .filter(|p| ok(&p.label))
             .collect(),
+        annotated: allowed
+            .as_ref()
+            .map(|a| frame_classes(map, Some(a.as_slice()))),
     };
     (mapped, eval, allowed)
 }
@@ -500,9 +524,20 @@ pub struct RunResult {
     pub by_resolution: Vec<BucketSpeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accuracy: Option<AccuracyReport>,
-    /// Why there is no accuracy (no ground truth, no scored classes).
+    /// Why there is no accuracy (no ground truth, no scored classes, the model made the
+    /// labels of every image).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accuracy_note: Option<String>,
+    /// The datasets whose pseudo ground truth is this model's own detections (it is their
+    /// reference, B10): left out of its accuracy, grades, curves and threshold advice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_for: Vec<String>,
+    /// Images with more scored predictions at the evaluation threshold than
+    /// `benchmark-preds.json` keeps (`search::MAX_STORED_PREDS_PER_IMAGE`, the most confident
+    /// ones; B12): a threshold search, re-score or Compare from the stored predictions can
+    /// differ from this run on them, at thresholds below their least confident kept one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub preds_capped_images: usize,
     /// Without `accuracy` only (a model with no CCTV class, such as a custom wildlife model):
     /// the per-class recall of each held-out tag (`scoring::tag_recall_only`), what a training
     /// run's recall cells read. Nothing else is scored for it.
@@ -520,6 +555,10 @@ pub struct RunResult {
     /// `search::PREDS_FILE` for the threshold search.
     #[serde(skip)]
     pub eval_preds: Vec<Vec<PredBox>>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Detections of one run matched against another's (`--compare-cpu`, agreement).
@@ -1121,5 +1160,151 @@ mod tests {
         ] {
             assert!(metrics::is_wildlife(l), "{l}");
         }
+    }
+
+    /// B1: a class a frame's dataset does not label is out of that frame's alert counts. A
+    /// vehicle-only set (bmd45-cctv: no person labels) adds no "frames without a person", and a
+    /// set that labels none of the model's classes adds no empty frame.
+    #[test]
+    fn alert_counts_skip_classes_the_dataset_does_not_label() {
+        let g = |l: &str, b: [f32; 4]| GtBox {
+            label: l.into(),
+            bbox: b,
+            ignore: false,
+            crowd: false,
+        };
+        let p = |l: &str, c: f32, b: [f32; 4]| PredBox {
+            label: l.into(),
+            confidence: c,
+            bbox: b,
+        };
+        let a = [0.0, 0.0, 100.0, 100.0];
+        let b = [300.0, 0.0, 400.0, 100.0];
+        let coco = ClassMap::for_model(&crate::model::classes::coco80());
+        let vehicles: Vec<String> = ["car", "bus", "truck"].map(String::from).to_vec();
+        let packages: Vec<String> = vec!["package".into()];
+        let inputs = [
+            // Vehicle-only set: a car, found; a person detection (not labelled there).
+            eval_input(
+                &coco,
+                Some(&vehicles),
+                &[g("car", a)],
+                &[p("car", 0.9, a), p("person", 0.9, b)],
+            )
+            .1,
+            // Vehicle-only set, no vehicle: empty for car / bus / truck only.
+            eval_input(&coco, Some(&vehicles), &[], &[p("person", 0.8, b)]).1,
+            // A set that labels none of the scored classes: in no count.
+            eval_input(&coco, Some(&packages), &[], &[p("car", 0.9, a)]).1,
+            // Every label scored: a car and a stray person detection, a false person alert.
+            eval_input(
+                &coco,
+                None,
+                &[g("car", a)],
+                &[p("car", 0.9, a), p("person", 0.7, b)],
+            )
+            .1,
+        ];
+        let s = metrics::evaluate(&inputs, &coco.classes, 0.5);
+        let person = s.class_alert("person").unwrap();
+        assert_eq!((person.frames_without, person.alerts), (1, 1), "{person:?}");
+        let car = s.class_alert("car").unwrap();
+        assert_eq!((car.frames_without, car.alerts), (1, 0), "{car:?}");
+        // The dog is labelled by the last set only.
+        let dog = s.class_alert("dog").unwrap();
+        assert_eq!(dog.frames_without, 1, "{dog:?}");
+        assert_eq!((s.empty_frames, s.empty_frame_alerts), (Some(1), Some(0)));
+    }
+
+    /// The run's empty-frame false alerts ([`metrics::AlertStats`], Summary) and the sweep's
+    /// ([`metrics::ThresholdPoint::false_alerts`], `recall_at_fa`) count the same frames at
+    /// every threshold, sets with and without `scored_labels` mixed, ignore regions included.
+    #[test]
+    fn alert_stats_and_the_sweep_count_the_same_false_alerts() {
+        use metrics::{AlertStats, Breakpoints, SweepImage, SweepScope};
+        let mut seed: u64 = 7;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let coco = ClassMap::for_model(&crate::model::classes::coco80());
+        let labels = ["person", "car", "dog"];
+        let vehicles: Vec<String> = vec!["car".into(), "truck".into()];
+        let mut evals = Vec::new();
+        let mut sweep = Vec::new();
+        for i in 0..200 {
+            let mut gt = Vec::new();
+            let mut preds = Vec::new();
+            for k in 0..3 {
+                let x = k as f32 * 200.0;
+                let b = [x, 0.0, x + 100.0, 100.0];
+                let l = labels[(rnd() * 3.0) as usize % 3];
+                let r = rnd();
+                if r < 0.3 {
+                    gt.push(GtBox {
+                        label: l.into(),
+                        bbox: b,
+                        ignore: rnd() < 0.3,
+                        crowd: false,
+                    });
+                }
+                if rnd() < 0.6 {
+                    preds.push(PredBox {
+                        label: labels[(rnd() * 3.0) as usize % 3].into(),
+                        confidence: 0.05 + rnd() * 0.95,
+                        bbox: [x + 2.0, 0.0, x + 100.0, 100.0],
+                    });
+                }
+            }
+            let scored = (i % 3 == 0).then_some(vehicles.as_slice());
+            let (_, e, allowed) = eval_input(&coco, scored, &gt, &preds);
+            let fc = frame_classes(&coco, allowed.as_deref());
+            sweep.push(SweepImage::of(&e).with_frames(&e, &fc));
+            evals.push(e);
+        }
+        let refs: Vec<&SweepImage> = sweep.iter().collect();
+        let bp = Breakpoints::new(&refs, SweepScope::All);
+        for t in threshold::grid() {
+            let a = AlertStats::of(&evals, &coco.classes, t);
+            let f = bp.false_alerts_at(t).unwrap();
+            assert_eq!(
+                (a.empty_frames, a.empty_frame_alerts),
+                (f.empty_frames, f.alerts),
+                "t {t}"
+            );
+        }
+        assert!(bp.false_alerts_at(0.05).unwrap().alerts > 0);
+    }
+
+    /// B10 for results of older versions: a relative score whose references name the model
+    /// itself is no accuracy when re-graded.
+    #[test]
+    fn old_scores_on_own_labels_are_recognized() {
+        let acc = |relative: bool, gt: &str| AccuracyReport {
+            ground_truth: gt.into(),
+            relative,
+            classes: vec![],
+            threshold: 0.5,
+            overall: Summary::default(),
+            by_dataset: vec![],
+            by_tag: vec![],
+            all_classes: None,
+            sweep: None,
+            frame_roc: None,
+        };
+        let own = acc(
+            true,
+            "relative to RT-DETRv2-X on openvino:cpu, not ground truth",
+        );
+        assert!(own.scored_on_own_labels("rt-detrv2-x"));
+        assert!(!own.scored_on_own_labels("yolo26s"));
+        let two = acc(
+            true,
+            "relative to a on openvino:cpu, b on ort:cpu, not ground truth",
+        );
+        assert!(two.scored_on_own_labels("b") && !two.scored_on_own_labels("c"));
+        assert!(!acc(false, "ground truth").scored_on_own_labels("rt-detrv2-x"));
     }
 }

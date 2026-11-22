@@ -29,7 +29,12 @@
 //!
 //! The alert decision at a confidence threshold `t` is "max confidence >= t": frame TPR (alert
 //! rate on positive frames) and FPR (false-alert rate on negative frames) at `t` come from the
-//! same samples ([`FrameSteps`]), pooled over classes for a single threshold.
+//! same samples ([`FrameSteps`]), pooled over classes for a single threshold
+//! ([`super::metrics::ThresholdPoint::frame`], drawn with the ROC curve). The threshold
+//! objectives `youden` and `fpr:<x>` and the rates shown beside their picks use one sample per
+//! frame instead ([`super::metrics::SweepImage::alert_sample`],
+//! [`super::metrics::ThresholdPoint::per_frame`]): pooled, every frame without a dog would be a
+//! negative, and the rare classes' negatives would decide the FPR.
 
 use serde::{Deserialize, Serialize};
 
@@ -146,7 +151,11 @@ pub struct FrameSteps {
 impl FrameSteps {
     /// None without samples.
     pub fn new<'a>(samples: impl IntoIterator<Item = &'a FrameSample>) -> Option<Self> {
-        let mut v: Vec<(f32, bool)> = samples.into_iter().map(|s| (s.score, s.positive)).collect();
+        Self::of_pairs(samples.into_iter().map(|s| (s.score, s.positive)).collect())
+    }
+
+    /// The steps of `(score, positive)` samples; None without samples.
+    pub fn of_pairs(mut v: Vec<(f32, bool)>) -> Option<Self> {
         if v.is_empty() {
             return None;
         }
@@ -482,6 +491,7 @@ mod tests {
                 pred("person", 0.8),
                 pred("vehicle", 0.6),
             ],
+            annotated: None,
         };
         let s = frame_samples(&img, &classes);
         // vehicle: only an ignore region -> excluded; dog: negative without prediction -> 0.

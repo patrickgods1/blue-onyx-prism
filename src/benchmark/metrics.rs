@@ -25,7 +25,9 @@
 //! otherwise let the 2 cats decide a third of the number.
 //!
 //! False alerts per class ([`ClassAlerts`]): frames without any box of a class that still get a
-//! detection of it at the threshold (see [`AlertStats`]).
+//! detection of it at the threshold (see [`AlertStats`]). Only the classes an image's dataset
+//! labels count on it ([`EvalImage::annotated`]): a vehicle-only set adds no frames without a
+//! person, and its frames are empty when they have no vehicle.
 //!
 //! Threshold sweep ([`SweepImage`], [`threshold_curve`]): TP / FP / FN, precision, recall, F1,
 //! F2 and false positives per image at every confidence threshold of [`SWEEP_THRESHOLDS`],
@@ -600,6 +602,19 @@ pub struct EvalImage {
     pub gt: Vec<GtBox>,
     /// Predictions at the low evaluation threshold.
     pub preds: Vec<PredBox>,
+    /// The scored classes the image's dataset annotates (its `scored_labels`, see
+    /// `benchmark::eval_input`); None = every class. A class it does not annotate is out of the
+    /// image's alert counts ([`AlertStats`]): nothing can be a false alert or a frame without it.
+    pub annotated: Option<Vec<String>>,
+}
+
+impl EvalImage {
+    /// The image's dataset annotates `class` ([`EvalImage::annotated`]).
+    pub fn annotates(&self, class: &str) -> bool {
+        self.annotated
+            .as_ref()
+            .is_none_or(|a| a.iter().any(|c| c == class))
+    }
 }
 
 /// AP and counts of one class.
@@ -705,14 +720,10 @@ impl Counts {
         (g > 0).then(|| self.tp as f64 / g as f64)
     }
 
-    /// Harmonic mean of precision and recall; 0 when either is 0, None when either is unknown.
+    /// [`Counts::f_beta`] with beta 1, the harmonic mean of precision and recall: None without
+    /// ground truth, 0 when no object is found (also without any detection).
     pub fn f1(&self) -> Option<f64> {
-        let (p, r) = (self.precision()?, self.recall()?);
-        Some(if p + r > 0.0 {
-            2.0 * p * r / (p + r)
-        } else {
-            0.0
-        })
+        self.f_beta(1.0)
     }
 }
 
@@ -804,16 +815,22 @@ pub fn is_vehicle_label(label: &str) -> bool {
 ///   confidence, one detection per object). A car taken by a `truck` detection is a hit here
 ///   (a miss plus a false positive in the per-class counts), the same as a model with an
 ///   IPcam-style `vehicle` class is scored. None without vehicle ground truth.
-/// - `empty_frames`: images with no non-ignored ground truth of any scored class (ignore
-///   regions alone still make a frame empty).
-/// - `empty_frame_alerts`: empty frames with at least one detection of a scored class at or
-///   above the threshold that is not inside an ignore region (a false positive by the
-///   matching; a detection on a crowd / "other" region is not counted, like everywhere else).
+/// - `empty_frames`: images with no non-ignored ground truth of any scored class their dataset
+///   annotates ([`EvalImage::annotated`]; ignore regions alone still make a frame empty). An
+///   image whose dataset annotates none of the scored classes is no empty frame.
+/// - `empty_frame_alerts`: empty frames with at least one detection of a scored, annotated
+///   class at or above the threshold that is not inside an ignore region (a false positive by
+///   the matching; a detection on a crowd / "other" region is not counted, like everywhere
+///   else). On an empty frame nothing can be matched, so whether a detection falls in an
+///   ignore region does not depend on the threshold: the frame alerts at `t` exactly when its
+///   most confident such detection is at or above `t` (the sweep's
+///   [`SweepImage::alert_sample`] relies on it).
 /// - `class_alerts`: per scored class `c` ([`ClassAlerts`], `person` first, then `classes`
-///   order): frames with no ground-truth box of `c` at all (a frame whose only `c` boxes are
-///   ignore regions is left out), and of those, the frames with a `c` detection at or above the
-///   threshold that the matching calls a false positive. Unlike `empty_frame_alerts`, a frame
-///   with a parked car still counts as a frame without a person.
+///   order): frames whose dataset annotates `c` and that have no ground-truth box of `c` at all
+///   (a frame whose only `c` boxes are ignore regions is left out), and of those, the frames
+///   with a `c` detection at or above the threshold that the matching calls a false positive.
+///   Unlike `empty_frame_alerts`, a frame with a parked car still counts as a frame without a
+///   person; a frame of a vehicle-only set (no person labels) never does (B1).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AlertStats {
     pub person_recall: Option<f64>,
@@ -843,16 +860,18 @@ impl AlertStats {
             })
             .collect();
         for img in images {
+            // Only the scored classes the image's dataset annotates count on it (B1).
+            let counted = |l: &str| scored(l) && img.annotates(l);
             let kept: Vec<PredBox> = img
                 .preds
                 .iter()
-                .filter(|p| p.confidence >= threshold && scored(&p.label))
+                .filter(|p| p.confidence >= threshold && counted(&p.label))
                 .cloned()
                 .collect();
             let gt: Vec<GtBox> = img
                 .gt
                 .iter()
-                .filter(|g| scored(&g.label))
+                .filter(|g| counted(&g.label))
                 .cloned()
                 .collect();
             let m = match_image(&kept, &gt, 0.5);
@@ -862,14 +881,14 @@ impl AlertStats {
                     person.fn_ += usize::from(!hit);
                 }
             }
-            if gt.iter().all(|g| g.ignore) {
+            if classes.iter().any(|c| img.annotates(c)) && gt.iter().all(|g| g.ignore) {
                 empty += 1;
                 alerts += usize::from(m.pred.contains(&Some(false)));
             }
             for ca in &mut class_alerts {
-                // Any box of the class (an object, or an ignore region that cannot be judged)
-                // takes the frame out.
-                if gt.iter().any(|g| g.label == ca.class) {
+                // A class the dataset does not label, or any box of the class (an object, or
+                // an ignore region that cannot be judged), takes the frame out.
+                if !img.annotates(&ca.class) || gt.iter().any(|g| g.label == ca.class) {
                     continue;
                 }
                 ca.frames_without += 1;
@@ -1083,8 +1102,10 @@ pub const SWEEP_THRESHOLDS: [f32; 19] = [
 
 impl Counts {
     /// F-beta from the counts, `(1 + b^2) TP / ((1 + b^2) TP + b^2 FN + FP)` (beta 1 = F1,
-    /// beta 2 weighs recall four times as much as precision). None without ground truth. Unlike
-    /// [`Counts::f1`], 0 (not None) when nothing is detected: every object was missed.
+    /// beta 2 weighs recall four times as much as precision, beta 0.5 precision four times as
+    /// much as recall). One rule for every F (B11): None without ground truth (recall is
+    /// undefined), 0 when there are objects and none is found, with or without detections
+    /// (precision alone is undefined without detections).
     pub fn f_beta(&self, beta: f64) -> Option<f64> {
         if self.tp + self.fn_ == 0 {
             return None;
@@ -1110,10 +1131,21 @@ pub struct ThresholdPoint {
     pub f2: Option<f64>,
     /// False positives per image (0 without images).
     pub fp_per_image: f64,
-    /// Frame-level alert rates at this threshold (see [`super::roc`]); None when the curve has
-    /// no frame samples (small-object scope, results of older versions).
+    /// Frame-level alert rates at this threshold over the pooled (frame, class) samples of the
+    /// frame ROC ([`super::roc`], what its curve is drawn from); None when the curve has no
+    /// frame samples (small-object scope, results of older versions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<FrameRates>,
+    /// Frame-level alert rates over one sample per frame ([`SweepImage::alert_sample`]): what
+    /// the `youden` and `fpr:<x>` objectives and the TPR / FPR shown beside their picks use.
+    /// None like `frame` (and in results of older versions, which have `frame` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_frame: Option<FrameRates>,
+    /// False alerts on the empty frames at this threshold (the `recall_at_fa:<N>` objective;
+    /// defined as [`AlertStats::empty_frame_alerts`]). None without empty frames (or frame
+    /// samples).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub false_alerts: Option<FalseAlerts>,
 }
 
 impl ThresholdPoint {
@@ -1131,6 +1163,8 @@ impl ThresholdPoint {
                 counts.fp as f64 / images as f64
             },
             frame: None,
+            per_frame: None,
+            false_alerts: None,
         }
     }
 
@@ -1138,6 +1172,38 @@ impl ThresholdPoint {
     pub fn with_frame(mut self, frame: Option<FrameRates>) -> Self {
         self.frame = frame;
         self
+    }
+
+    /// The frame rates of the frame objectives: [`ThresholdPoint::per_frame`], else (results of
+    /// older versions) the pooled [`ThresholdPoint::frame`].
+    pub fn alert_rates(&self) -> Option<&FrameRates> {
+        self.per_frame.as_ref().or(self.frame.as_ref())
+    }
+
+    /// Without any frame-level figure (the group curves' 0.05 grids keep `benchmark.json`
+    /// small).
+    pub fn without_frames(mut self) -> Self {
+        self.frame = None;
+        self.per_frame = None;
+        self.false_alerts = None;
+        self
+    }
+}
+
+/// False alerts on the empty frames at one threshold: frames with no non-ignored object of a
+/// scored class their dataset annotates, alerting when one of their detections of such a class
+/// outside every ignore region is at or above the threshold ([`AlertStats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FalseAlerts {
+    pub empty_frames: usize,
+    /// Of `empty_frames`, those that alert.
+    pub alerts: usize,
+}
+
+impl FalseAlerts {
+    /// False alerts per 100 empty frames (None without empty frames).
+    pub fn per_100(&self) -> Option<f64> {
+        (self.empty_frames > 0).then(|| 100.0 * self.alerts as f64 / self.empty_frames as f64)
     }
 }
 
@@ -1159,10 +1225,29 @@ pub struct SweepPred {
 pub struct SweepImage {
     /// Non-ignored ground truth: (class, small).
     pub gt: Vec<(String, bool)>,
+    /// Predictions outside every ignore region (a prediction the matching ignores is left
+    /// out).
     pub preds: Vec<SweepPred>,
+    /// Classes with an ignore region in the image (deduplicated).
+    pub ignored: Vec<String>,
     /// Frame samples of the classes annotated in the image ([`super::roc`]); empty unless added
     /// with [`SweepImage::with_frames`].
     pub frames: Vec<FrameSample>,
+    /// The scored classes the image's dataset annotates; empty unless added with
+    /// [`SweepImage::with_frames`] (then the image gives no [`SweepImage::alert_sample`]).
+    pub frame_classes: Vec<String>,
+}
+
+/// One frame's alert sample in a scope ([`SweepImage::alert_sample`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlertSample {
+    /// The frame has a non-ignored object of a class in scope.
+    pub positive: bool,
+    /// Not positive, but it has an ignore region of a class in scope.
+    pub ignore_only: bool,
+    /// The highest confidence of its detections of a class in scope outside every ignore
+    /// region (0 without one).
+    pub score: f32,
 }
 
 impl SweepImage {
@@ -1194,6 +1279,14 @@ impl SweepImage {
                 })
             })
             .collect();
+        let mut ignored: Vec<String> = img
+            .gt
+            .iter()
+            .filter(|g| g.ignore)
+            .map(|g| g.label.clone())
+            .collect();
+        ignored.sort();
+        ignored.dedup();
         Self {
             gt: img
                 .gt
@@ -1202,15 +1295,45 @@ impl SweepImage {
                 .map(|g| (g.label.clone(), is_small(&g.bbox)))
                 .collect(),
             preds,
+            ignored,
             frames: Vec::new(),
+            frame_classes: Vec::new(),
         }
     }
 
     /// With the frame samples of `img` for `classes` (the scored classes its dataset
-    /// annotates).
+    /// annotates): the per-class samples of the frame ROC and the classes of
+    /// [`SweepImage::alert_sample`].
     pub fn with_frames(mut self, img: &EvalImage, classes: &[String]) -> Self {
         self.frames = frame_samples(img, classes);
+        self.frame_classes = classes.to_vec();
         self
+    }
+
+    /// The frame as one alert sample over the classes of `scope` its dataset annotates (None:
+    /// it annotates none of them, the small-object scope, or no frame classes were added). A
+    /// prediction's match does not depend on the threshold (greedy matching, see the module
+    /// docs), and neither does a prediction falling in an ignore region; so "the frame alerts
+    /// at `t`" is exactly "`score >= t`", for empty frames and frames with objects alike.
+    pub fn alert_sample(&self, scope: SweepScope) -> Option<AlertSample> {
+        if matches!(scope, SweepScope::Small) {
+            return None;
+        }
+        let in_scope = |c: &str| scope.gt(c, false) && self.frame_classes.iter().any(|f| f == c);
+        if !self.frame_classes.iter().any(|c| scope.gt(c, false)) {
+            return None;
+        }
+        let positive = self.gt.iter().any(|(c, _)| in_scope(c));
+        Some(AlertSample {
+            positive,
+            ignore_only: !positive && self.ignored.iter().any(|c| in_scope(c)),
+            score: self
+                .preds
+                .iter()
+                .filter(|p| in_scope(&p.class))
+                .map(|p| p.confidence)
+                .fold(0.0f32, f32::max),
+        })
     }
 }
 
@@ -1301,6 +1424,13 @@ pub struct Breakpoints {
     /// Frame-level steps of the scope's frame samples, pooled over classes (None without
     /// samples).
     pub frames: Option<FrameSteps>,
+    /// Frame-level steps over one sample per frame ([`SweepImage::alert_sample`]): positive
+    /// with an object in scope, negative without (frames whose only boxes in scope are ignore
+    /// regions are left out). None without samples.
+    pub per_frame: Option<FrameSteps>,
+    /// The empty frames' alert scores as negative samples (frames without an object in scope,
+    /// ignore-only frames included): [`ThresholdPoint::false_alerts`]. None without samples.
+    pub empty: Option<FrameSteps>,
 }
 
 impl Breakpoints {
@@ -1336,17 +1466,53 @@ impl Breakpoints {
                 .flat_map(|i| i.frames.iter())
                 .filter(|f| scope.frame(f)),
         );
+        let samples: Vec<AlertSample> = images
+            .iter()
+            .filter_map(|i| i.alert_sample(scope))
+            .collect();
+        // Some (with no sample) whenever there are pooled samples, so an old point's pooled
+        // rates are never taken for these ([`ThresholdPoint::alert_rates`]).
+        let per_frame = FrameSteps::of_pairs(
+            samples
+                .iter()
+                .filter(|a| a.positive || !a.ignore_only)
+                .map(|a| (a.score, a.positive))
+                .collect(),
+        )
+        .or_else(|| frames.as_ref().map(|_| FrameSteps::default()));
+        let empty = FrameSteps::of_pairs(
+            samples
+                .iter()
+                .filter(|a| !a.positive)
+                .map(|a| (a.score, false))
+                .collect(),
+        );
         Self {
             npos,
             images: images.len(),
             steps,
             frames,
+            per_frame,
+            empty,
         }
     }
 
-    /// Frame rates at `t` (None without frame samples).
+    /// Pooled frame rates at `t` (None without frame samples).
     pub fn frame_at(&self, t: f32) -> Option<FrameRates> {
         self.frames.as_ref().map(|f| f.rates_at(t))
+    }
+
+    /// Frame rates at `t` over one sample per frame (None without samples).
+    pub fn per_frame_at(&self, t: f32) -> Option<FrameRates> {
+        self.per_frame.as_ref().map(|f| f.rates_at(t))
+    }
+
+    /// False alerts on the empty frames at `t` (None without frame samples).
+    pub fn false_alerts_at(&self, t: f32) -> Option<FalseAlerts> {
+        self.empty.as_ref().map(|e| FalseAlerts {
+            empty_frames: e.negatives,
+            alerts: e.rates_at(t).fp,
+        })
     }
 
     /// Counts with the predictions at or above `t` (binary search over the steps).
@@ -1364,7 +1530,11 @@ impl Breakpoints {
     }
 
     pub fn point_at(&self, t: f32) -> ThresholdPoint {
-        ThresholdPoint::new(t, self.counts_at(t), self.images).with_frame(self.frame_at(t))
+        ThresholdPoint {
+            per_frame: self.per_frame_at(t),
+            false_alerts: self.false_alerts_at(t),
+            ..ThresholdPoint::new(t, self.counts_at(t), self.images).with_frame(self.frame_at(t))
+        }
     }
 
     /// The exact curve (one point per distinct confidence, ascending threshold) thinned to at
@@ -1605,6 +1775,7 @@ mod tests {
             &EvalImage {
                 gt: ig,
                 preds: vec![],
+                annotated: None,
             },
             0.5,
         );
@@ -1665,10 +1836,12 @@ mod tests {
                     p("raccoon", 0.6, [400.0, 400.0, 460.0, 440.0]),
                     p("car", 0.9, [0.0, 500.0, 50.0, 550.0]), // FP of a class without gt
                 ],
+                annotated: None,
             },
             EvalImage {
                 gt: vec![gt("raccoon", [0.0, 0.0, 50.0, 50.0])], // missed
                 preds: vec![],
+                annotated: None,
             },
         ];
         let classes: Vec<String> = ["person", "raccoon", "car", "cat"]
@@ -1719,6 +1892,7 @@ mod tests {
                     p("person", 0.9, [2.0, 2.0, 100.0, 200.0]),
                     p("person", 0.1, [500.0, 0.0, 600.0, 100.0]), // low-confidence FP
                 ],
+                annotated: None,
             },
             EvalImage {
                 gt: vec![gt("car", [0.0, 0.0, 200.0, 100.0])],
@@ -1726,6 +1900,7 @@ mod tests {
                     p("car", 0.8, [0.0, 0.0, 200.0, 100.0]),
                     p("car", 0.7, [400.0, 0.0, 500.0, 100.0]), // FP
                 ],
+                annotated: None,
             },
         ];
         let classes: Vec<String> = vec!["person".into(), "car".into()];
@@ -1769,6 +1944,7 @@ mod tests {
                     } else {
                         vec![]
                     },
+                    annotated: None,
                 }
             })
             .collect()
@@ -1845,6 +2021,7 @@ mod tests {
             EvalImage {
                 gt: vec![gt("car", big(0.0))],
                 preds: vec![p("car", 0.9, big(0.0)), p("person", 0.8, big(300.0))],
+                annotated: None,
             },
             // B: only a person ignore region, a person detection on it: left out for person.
             EvalImage {
@@ -1853,16 +2030,19 @@ mod tests {
                     ..gt("person", big(0.0))
                 }],
                 preds: vec![p("person", 0.9, big(1.0))],
+                annotated: None,
             },
             // C: a person, found: not a frame without a person.
             EvalImage {
                 gt: vec![gt("person", big(0.0))],
                 preds: vec![p("person", 0.9, big(0.0))],
+                annotated: None,
             },
             // D: parked car, a person detection below the threshold: no alert.
             EvalImage {
                 gt: vec![gt("car", big(0.0))],
                 preds: vec![p("car", 0.9, big(0.0)), p("person", 0.3, big(300.0))],
+                annotated: None,
             },
             // E: empty, nothing detected.
             EvalImage::default(),
@@ -1930,16 +2110,19 @@ mod tests {
                     p("person", 0.3, big(200.0)),
                     p("truck", 0.8, big(401.0)),
                 ],
+                annotated: None,
             },
             // 2: empty with a false alert.
             EvalImage {
                 gt: vec![],
                 preds: vec![p("car", 0.6, big(0.0))],
+                annotated: None,
             },
             // 3: empty, detection below the threshold: no alert.
             EvalImage {
                 gt: vec![],
                 preds: vec![p("person", 0.4, big(0.0))],
+                annotated: None,
             },
             // 4: only an ignore region (empty); a detection inside it is no alert.
             EvalImage {
@@ -1948,11 +2131,13 @@ mod tests {
                     ..gt("person", big(0.0))
                 }],
                 preds: vec![p("person", 0.9, big(1.0))],
+                annotated: None,
             },
             // 5: empty, an unscored-class detection does not alert.
             EvalImage {
                 gt: vec![],
                 preds: vec![p("dog", 0.9, big(0.0))],
+                annotated: None,
             },
             // 6: two trucks, one truck detection and one car detection: both hits as
             // vehicles; one bus detection with no object: a false positive, not a hit.
@@ -1963,6 +2148,7 @@ mod tests {
                     p("car", 0.7, big(200.0)),
                     p("bus", 0.9, big(800.0)),
                 ],
+                annotated: None,
             },
         ];
         let a = AlertStats::of(&images, &classes, 0.5);
@@ -1988,6 +2174,7 @@ mod tests {
         let img = EvalImage {
             gt: vec![gt("vehicle", big(0.0)), gt("vehicle", big(200.0))],
             preds: vec![p("vehicle", 0.8, big(0.0))],
+            annotated: None,
         };
         let a = AlertStats::of(std::slice::from_ref(&img), &ip, 0.5);
         assert_eq!((a.person_recall, a.vehicle_recall), (None, Some(0.5)));
@@ -2016,7 +2203,11 @@ mod tests {
             fp: 0,
             fn_: 3,
         };
-        assert_eq!((c.precision(), c.recall(), c.f1()), (None, Some(0.0), None));
+        // Objects and no detection: precision undefined, F1 0 (every object missed).
+        assert_eq!(
+            (c.precision(), c.recall(), c.f1()),
+            (None, Some(0.0), Some(0.0))
+        );
         let c = Counts {
             tp: 0,
             fp: 2,
@@ -2043,6 +2234,7 @@ mod tests {
                 p("person", 0.3, [300.0, 300.0, 320.0, 320.0]), // TP (small)
                 p("person", 0.2, [2.0, 0.0, 100.0, 200.0]),   // duplicate: FP, large box
             ],
+            annotated: None,
         };
         let s = SweepImage::of(&img);
         assert_eq!(s.gt.len(), 2);
@@ -2231,5 +2423,37 @@ mod tests {
             assert_eq!(d[9].threshold, bp.steps[0].0);
             assert!(d.windows(2).all(|w| w[0].threshold < w[1].threshold));
         }
+    }
+
+    /// B11: the headline F1 and the sweep's F-scores follow one rule: undefined (None) only
+    /// without ground truth; 0 when there are objects and none is found, detections or not.
+    #[test]
+    fn f1_and_f_beta_agree() {
+        let c = |tp, fp, fn_| Counts { tp, fp, fn_ };
+        for k in [
+            c(0, 0, 3),
+            c(0, 2, 3),
+            c(2, 1, 1),
+            c(5, 0, 0),
+            c(0, 0, 0),
+            c(0, 4, 0),
+        ] {
+            assert_eq!(k.f1(), k.f_beta(1.0), "{k:?}");
+        }
+        assert_eq!(c(0, 0, 3).f1(), Some(0.0), "objects, nothing detected");
+        assert_eq!(c(0, 0, 3).precision(), None);
+        assert_eq!(c(0, 0, 0).f1(), None, "neither objects nor detections");
+        assert_eq!(c(0, 4, 0).recall(), None);
+        assert!((c(2, 1, 1).f1().unwrap() - 2.0 / 3.0).abs() < 1e-12);
+        let s = evaluate(
+            &[EvalImage {
+                gt: vec![gt("person", [0.0, 0.0, 10.0, 10.0])],
+                preds: vec![],
+                ..Default::default()
+            }],
+            &["person".to_string()],
+            0.5,
+        );
+        assert_eq!((s.precision, s.recall, s.f1), (None, Some(0.0), Some(0.0)));
     }
 }

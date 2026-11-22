@@ -33,6 +33,19 @@ pub(super) fn score(
             Some("no ground truth (and no pseudo ground truth) for these images".to_string()),
         );
     }
+    // B10: the pseudo ground truth of these sets is this model's own detections.
+    let own = reference_sets(&job.name, all);
+    let labelled = |s: &ImageSet| !own.contains(&s.id);
+    if !all.iter().any(|(s, i)| i.gt.is_some() && labelled(s)) {
+        return (
+            None,
+            Some(format!(
+                "the labels of these images are its own detections (it is the pseudo-ground-truth \
+                 reference of {}): it is not scored against itself",
+                own.join(", ")
+            )),
+        );
+    }
     // Per image: the eval input (None = no ground truth).
     let mut evals: Vec<Option<EvalImage>> = Vec::with_capacity(all.len());
     // Per image: the classes its dataset annotates (frame samples).
@@ -40,8 +53,12 @@ pub(super) fn score(
     for (k, (set, img)) in all.iter().enumerate() {
         // `per_image` and `eval_preds` are parallel to `all`; a missing entry scores as
         // "no ground truth" rather than panicking.
-        let (Some(gt), Some(preds), Some(run)) = (&img.gt, eval_preds.get(k), per_image.get_mut(k))
-        else {
+        let (Some(gt), Some(preds), Some(run), true) = (
+            &img.gt,
+            eval_preds.get(k),
+            per_image.get_mut(k),
+            labelled(set),
+        ) else {
             evals.push(None);
             fclasses.push(Vec::new());
             continue;
@@ -134,6 +151,21 @@ pub(super) fn score(
         }),
         None,
     )
+}
+
+/// The sets of `all` whose pseudo ground truth is the detections of the model `name` (B10):
+/// that model is never scored on them (it would score itself). Set ids, first-seen order.
+pub(crate) fn reference_sets(name: &str, all: &[(&ImageSet, &images::SetImage)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (s, _) in all {
+        if let GroundTruth::Pseudo(r) = &s.ground_truth
+            && is_reference(r, name)
+            && !out.contains(&s.id)
+        {
+            out.push(s.id.clone());
+        }
+    }
+    out
 }
 
 // The tag prefix whose breakdowns carry `Breakdown::per_class` (the held-out set's own tags).
@@ -450,7 +482,7 @@ impl<'a> Scored<'a> {
             .chain(per_class.iter_mut())
         {
             for p in &mut c.points {
-                p.frame = None;
+                *p = p.without_frames();
             }
         }
         threshold::ThresholdSweep {
@@ -518,6 +550,7 @@ impl CurveMaker<'_> {
                 .objectives
                 .iter()
                 .filter_map(|o| threshold::exact_pick(&bp, *o))
+                .map(|p| threshold::Pick { relative, ..p })
                 .collect(),
             exact: Vec::new(),
             roc_auc: match scope {
@@ -889,6 +922,97 @@ mod tests {
         assert!(acc.is_none() && note.unwrap().contains("no ground truth"));
     }
 
+    /// B10: the reference model's detections are the labels of a pseudo-ground-truth set, so
+    /// it is never scored on that set: alone, it gets no accuracy (a note says why); beside a
+    /// set with real ground truth, the pseudo set is left out of every breakdown.
+    #[test]
+    fn the_reference_is_not_scored_against_its_own_labels() {
+        let mut real = ImageSet::sample();
+        real.id = "real".into();
+        real.ground_truth = GroundTruth::Manifest;
+        real.images[0].gt = Some(vec![GtBox {
+            label: "dog".into(),
+            bbox: [0.0, 0.0, 100.0, 100.0],
+            ignore: false,
+            crowd: false,
+        }]);
+        let mut pseudo = real.clone();
+        pseudo.id = "pseudo".into();
+        pseudo.ground_truth = GroundTruth::Pseudo("Ref-Model on openvino:cpu".into());
+        let job = Job {
+            name: "ref-model".into(),
+            path: "m.onnx".into(),
+            family: ModelFamilyKind::Yolo5,
+            classes: crate::model::classes::coco80(),
+            device: "auto".into(),
+            gpu_precision: None,
+            confidence_threshold: None,
+            object_filter: None,
+            variant: None,
+        };
+        let eval = vec![PredBox {
+            label: "dog".into(),
+            confidence: 0.9,
+            bbox: [1.0, 1.0, 100.0, 100.0],
+        }];
+        let run = |s: &ImageSet| ImageRun {
+            set: s.id.clone(),
+            file: s.images[0].file.clone(),
+            total_ms: 1.0,
+            infer_ms: 1.0,
+            preds: vec![],
+            gt_matched: vec![],
+            counts: None,
+        };
+        // Alone: nothing to score it against.
+        let all = vec![(&pseudo, &pseudo.images[0])];
+        let mut pi = vec![run(&pseudo)];
+        let (acc, note) = score(
+            &job,
+            &all,
+            &mut pi,
+            std::slice::from_ref(&eval),
+            0.5,
+            Default::default(),
+        );
+        assert!(acc.is_none(), "{acc:?}");
+        let note = note.unwrap();
+        assert!(note.contains("own detections"), "{note}");
+        assert_eq!(reference_sets(&job.name, &all), ["pseudo"]);
+        // Another model is scored on it as before (relative).
+        let other = Job {
+            name: "other".into(),
+            ..job.clone()
+        };
+        let (acc, _) = score(
+            &other,
+            &all,
+            &mut pi,
+            std::slice::from_ref(&eval),
+            0.5,
+            Default::default(),
+        );
+        assert!(acc.unwrap().relative);
+        assert!(reference_sets(&other.name, &all).is_empty());
+        // Beside real ground truth: the pseudo set is in no breakdown or curve.
+        let all = vec![(&real, &real.images[0]), (&pseudo, &pseudo.images[0])];
+        let mut pi = vec![run(&real), run(&pseudo)];
+        let (acc, _) = score(
+            &job,
+            &all,
+            &mut pi,
+            &[eval.clone(), eval],
+            0.5,
+            Default::default(),
+        );
+        let acc = acc.unwrap();
+        assert!(!acc.relative);
+        let ids: Vec<&str> = acc.by_dataset.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(ids, ["real"]);
+        let sweep = acc.sweep.unwrap();
+        assert!(sweep.by_dataset.iter().all(|c| c.key != "pseudo"));
+    }
+
     #[test]
     fn scored_labels_limit_a_set() {
         // A vehicles-only set: the person prediction is neither TP nor FP, person ground truth
@@ -986,15 +1110,16 @@ mod tests {
         let classes: Vec<&str> = sw.per_class.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(classes, ["car"]);
         assert!(!sw.overall.exact.is_empty());
-        // F1 1 for thresholds in (0.3, 0.9]: midpoint 0.6.
+        // F1 1 for thresholds in (0.3, 0.9]: grid 0.31 ..= 0.90, the lower middle of 60.
         let best = sw.overall.best(threshold::Objective::F1).unwrap();
         assert_eq!(best.exact_threshold, Some(0.9));
-        assert_eq!(best.plateau, Some([0.3, 0.9]));
+        assert_eq!(best.plateau, Some([0.31, 0.9]));
         assert_eq!(best.threshold, 0.6);
         assert_eq!(best.point.f1, Some(1.0));
-        // Every standard objective has an exact pick (Youden too: the car frame is positive,
-        // the motorcycle frame negative).
-        assert_eq!(sw.overall.picks.len(), 4);
+        // Every standard objective but Youden has a pick: one sample per frame, and the only
+        // frame has a car (the pooled samples had its motorcycle class as a negative).
+        assert_eq!(sw.overall.picks.len(), 3);
+        assert!(sw.overall.picks.iter().all(|p| p.objective != "youden"));
         // Frame samples only for the set's scored labels: person is not a sample at all.
         let roc = acc.frame_roc.as_ref().unwrap();
         let keys: Vec<(&str, usize, usize)> = roc
@@ -1298,7 +1423,7 @@ mod tests {
         assert_eq!((f.tp, f.positives, f.fp, f.negatives), (3, 4, 2, 5));
         let y = sw.overall.best(threshold::Objective::Youden).unwrap();
         assert!(y.met);
-        // Brute force over the 0.01 grid: no threshold beats the exact optimum.
+        // Brute force over the grid: no threshold beats the pick's best value (per frame).
         let bp_best = y.exact_score.unwrap();
         for k in 5..=100 {
             let t = k as f32 / 100.0;
@@ -1307,7 +1432,7 @@ mod tests {
                 .points
                 .iter()
                 .find(|p| (p.threshold - t).abs() < 1e-6)
-                .and_then(|p| p.frame?.youden());
+                .and_then(|p| p.per_frame?.youden());
             if let Some(j) = j {
                 assert!(j <= bp_best + 1e-12, "{t}: {j} > {bp_best}");
             }
@@ -1316,9 +1441,18 @@ mod tests {
         let pc = sw.per_class.iter().find(|c| c.key == "vehicle").unwrap();
         assert!((pc.roc_auc.unwrap() - 8.0 / 9.0).abs() < 1e-12);
         // Group grids carry no frame rates (size); their configured points and picks do.
-        assert!(pc.points.iter().all(|p| p.frame.is_none()));
+        assert!(
+            pc.points
+                .iter()
+                .all(|p| p.frame.is_none() && p.per_frame.is_none() && p.false_alerts.is_none())
+        );
         assert!(pc.configured.frame.is_some());
-        assert!(sw.overall.points.iter().all(|p| p.frame.is_some()));
+        assert!(
+            sw.overall
+                .points
+                .iter()
+                .all(|p| p.frame.is_some() && p.per_frame.is_some())
+        );
     }
 
     /// The stored drill-down predictions are capped, but the pseudo ground truth run keeps

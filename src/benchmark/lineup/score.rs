@@ -170,6 +170,7 @@ fn only(img: &EvalImage, class: &str) -> EvalImage {
             .filter(|p| p.label == class)
             .cloned()
             .collect(),
+        annotated: img.annotated.clone(),
     }
 }
 

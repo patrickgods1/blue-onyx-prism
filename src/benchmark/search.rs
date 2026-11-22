@@ -43,6 +43,15 @@ pub(crate) const SEARCH_EXACT_POINTS: usize = 200;
 /// threshold above an image's most confident dropped prediction sees exactly what was scored.
 pub(crate) const MAX_STORED_PREDS_PER_IMAGE: usize = 100;
 
+/// How many images of `eval_preds` (a run's scored predictions per image) have more than
+/// [`MAX_STORED_PREDS_PER_IMAGE`]: [`super::RunResult::preds_capped_images`] (B12).
+pub(crate) fn capped_images(eval_preds: &[Vec<PredBox>]) -> usize {
+    eval_preds
+        .iter()
+        .filter(|p| p.len() > MAX_STORED_PREDS_PER_IMAGE)
+        .count()
+}
+
 /// `benchmark-preds.json` beside `config_path`.
 pub fn preds_path(config_path: &Path) -> PathBuf {
     config_path
@@ -720,6 +729,11 @@ pub struct SearchResult {
     /// Frame-level ROC of the searched images (macro / micro / per class AUC and the curve).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roc: Option<FrameRoc>,
+    /// Images of the searched device run with more scored predictions than were stored
+    /// ([`MAX_STORED_PREDS_PER_IMAGE`], [`super::RunResult::preds_capped_images`]): below their
+    /// least confident stored prediction this search can differ from the run (B12).
+    #[serde(default)]
+    pub preds_capped_images: usize,
 }
 
 /// A search over several models.
@@ -827,6 +841,16 @@ fn pick_run<'a>(
         .context("no stored predictions")
 }
 
+/// [`super::RunResult::preds_capped_images`] of the device run `run` was stored from (0 when the
+/// results no longer have it).
+fn capped_of(results: &BenchmarkResults, run: &StoredRun) -> usize {
+    results
+        .find(&run.model)
+        .and_then(|m| m.devices.iter().find(|d| d.device == run.device))
+        .and_then(|d| d.run.as_ref())
+        .map_or(0, |r| r.preds_capped_images)
+}
+
 /// Search the stored predictions (see the module docs). `current` gives a model's threshold in
 /// the config now. Errors when there are no stored predictions at all.
 pub fn search(
@@ -880,12 +904,20 @@ pub fn search(
             }
         };
         match search_run(run, &sets, req, current(&run.model)) {
-            Ok(r) => out.results.push(r),
+            Ok(mut r) => {
+                r.preds_capped_images = capped_of(results, run);
+                out.results.push(r);
+            }
             Err(e) => out.errors.push(format!("{name}: {e:#}")),
         }
     }
     out.elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
     Ok(out)
+}
+
+/// The pseudo ground truth of `set` is the detections of `model` (B10): never scored on it.
+fn own_labels(set: &ImageSetInfo, model: &str) -> bool {
+    matches!(&set.ground_truth, GroundTruth::Pseudo(r) if super::is_reference(r, model))
 }
 
 /// (set, image info, eval input, scored classes the set annotates) of one stored image.
@@ -908,6 +940,9 @@ fn scored_inputs<'a>(
         let Some(set) = sets.get(img.set.as_str()).copied() else {
             continue;
         };
+        if own_labels(set, &run.model) {
+            continue;
+        }
         let Some(info) = set.images.iter().find(|i| i.file == img.file) else {
             continue;
         };
@@ -919,6 +954,9 @@ fn scored_inputs<'a>(
             super::eval_input(map, set.scored_labels.as_deref(), gt, &run.preds(k));
         eval.gt.retain(|g| wanted.contains(&g.label));
         eval.preds.retain(|p| wanted.contains(&p.label));
+        if let Some(a) = &mut eval.annotated {
+            a.retain(|c| wanted.contains(c));
+        }
         let mut fc = super::frame_classes(map, allowed.as_deref());
         fc.retain(|c| wanted.contains(c));
         inputs.push((set, info, eval, fc));
@@ -1050,6 +1088,18 @@ fn search_run(
     let wanted = wanted_classes(&map, &req.classes)?;
     let inputs = scored_inputs(run, sets, &map, req, &wanted);
     if inputs.is_empty() {
+        let own = run.images.iter().any(|i| {
+            (req.datasets.is_empty() || req.datasets.contains(&i.set))
+                && sets
+                    .get(i.set.as_str())
+                    .is_some_and(|s| own_labels(s, &run.model))
+        });
+        if own {
+            bail!(
+                "the labels of these images are its own detections (the pseudo-ground-truth \
+                 reference): it is not scored against itself"
+            );
+        }
         bail!("no scored images match these filters");
     }
     let real: Vec<usize> = inputs
@@ -1084,13 +1134,17 @@ fn search_run(
     }
     // The threshold configured now (the run's when the config has none for the model).
     let now = current.unwrap_or(run.configured);
+    // A pick on pseudo ground truth is marked so it is never applied (B10).
+    let fit = |bp: &Breakpoints, o: Objective, relative: bool| {
+        exact_pick(bp, o).map(|p| Pick { relative, ..p })
+    };
     let group = |key: &str, bp: &Breakpoints, relative: bool, roc_auc: Option<f64>| GroupPick {
         key: key.to_string(),
         images: bp.images,
         gt: bp.npos,
         relative,
         configured: bp.point_at(run.configured),
-        best: exact_pick(bp, req.objective),
+        best: fit(bp, req.objective, relative),
         roc_auc,
         now: Some(bp.point_at(now)),
     };
@@ -1136,10 +1190,10 @@ fn search_run(
         current: current
             .filter(|c| (c - run.configured).abs() > 1e-6)
             .map(|c| overall.point_at(c)),
-        best: exact_pick(&overall, req.objective),
+        best: fit(&overall, req.objective, relative),
         alternatives: Objective::STANDARD
             .iter()
-            .filter_map(|o| exact_pick(&overall, *o))
+            .filter_map(|o| fit(&overall, *o, relative))
             .collect(),
         grid: SWEEP_THRESHOLDS
             .iter()
@@ -1149,6 +1203,7 @@ fn search_run(
         by_dataset,
         per_class,
         roc: (roc.positives + roc.negatives > 0).then_some(roc),
+        preds_capped_images: 0,
     })
 }
 
@@ -1440,6 +1495,54 @@ pub(crate) mod tests {
         );
     }
 
+    /// B12: the run counts the images with more scored predictions than are stored, and a
+    /// search over them says so.
+    #[test]
+    fn capped_images_are_counted_and_surfaced() {
+        use crate::benchmark::report::test_support::{dev, scene};
+        let many = |n: usize| -> Vec<PredBox> {
+            (0..n)
+                .map(|i| PredBox {
+                    label: "person".into(),
+                    confidence: 0.05 + i as f32 * 1e-3,
+                    bbox: [0.0; 4],
+                })
+                .collect()
+        };
+        let at_cap = MAX_STORED_PREDS_PER_IMAGE;
+        assert_eq!(
+            capped_images(&[many(at_cap), many(at_cap + 1), vec![], many(250)]),
+            2
+        );
+        let (mut results, preds) = fixture();
+        let none = |_: &str| None;
+        let out = search(&results, &preds, &SearchRequest::default(), &none).unwrap();
+        assert_eq!(
+            out.results[0].preds_capped_images, 0,
+            "no device run in the results"
+        );
+        let mut d = dev("ort:coreml", 10.0, scene());
+        let run = d.run.as_mut().unwrap();
+        run.preds_capped_images = 3;
+        // Written only when some image hit the cap; older results load as 0.
+        let j = serde_json::to_value(&*run).unwrap();
+        assert_eq!(j["preds_capped_images"], 3);
+        let mut old = j.clone();
+        old.as_object_mut().unwrap().remove("preds_capped_images");
+        let back: crate::benchmark::RunResult = serde_json::from_value(old).unwrap();
+        assert_eq!(back.preds_capped_images, 0);
+        assert!(
+            serde_json::to_value(&back)
+                .unwrap()
+                .get("preds_capped_images")
+                .is_none()
+        );
+        results.models[0].devices.push(d);
+        let out = search(&results, &preds, &SearchRequest::default(), &none).unwrap();
+        assert_eq!(out.results[0].device, "ort:coreml");
+        assert_eq!(out.results[0].preds_capped_images, 3);
+    }
+
     #[test]
     fn search_hand_computed_and_filters() {
         let (results, preds) = fixture();
@@ -1454,10 +1557,11 @@ pub(crate) mod tests {
         // At 0.5: person .85 TP, .7 ignored, b .6 TP; car .4 and FP .3 below -> 2 TP, 0 FP, 1 FN.
         let c = r.configured.counts;
         assert_eq!((c.tp, c.fp, c.fn_), (2, 0, 1));
-        // F1 by kept set: down to .6: 2/(2+0+1) -> .8; +car .4: 1.0; +FP .3: 6/7.
+        // F1 by kept set: down to .6: 2/(2+0+1) -> .8; +car .4: 1.0; +FP .3: 6/7. Grid
+        // 0.31 ..= 0.40, the lower middle of 10.
         let b = r.best.as_ref().unwrap();
         assert_eq!(b.exact_threshold, Some(0.4));
-        assert_eq!(b.plateau, Some([0.3, 0.4]));
+        assert_eq!(b.plateau, Some([0.31, 0.4]));
         assert_eq!(b.threshold, 0.35);
         assert_eq!(b.point.f1, Some(1.0));
         assert_eq!(r.grid.len(), 19);
@@ -1560,16 +1664,26 @@ pub(crate) mod tests {
         assert_eq!(roc.class_auc("car"), Some(1.0));
         assert_eq!((roc.auc, roc.micro_auc), (Some(1.0), Some(1.0)));
         assert_eq!((roc.positives, roc.negatives), (3, 1));
-        let b = r.best.as_ref().unwrap();
+        // One sample per frame: both frames have an object, so Youden is undefined over every
+        // class (the pooled samples above had the car-less frame b as a negative).
+        assert!(r.best.is_none(), "{:?}", r.best);
+        // Cars only: a car+ .4, b car- 0: J = 1 up to 0.4 -> 0.05 ..= 0.40, middle 0.22.
+        let req = SearchRequest {
+            objective: Objective::Youden,
+            classes: vec!["car".into()],
+            ..Default::default()
+        };
+        let rc = &search(&results, &preds, &req, &none).unwrap().results[0];
+        let b = rc.best.as_ref().unwrap();
         assert_eq!((b.threshold, b.exact_threshold), (0.22, Some(0.4)));
         assert_eq!(b.plateau, Some([0.05, 0.4]));
-        let f = b.point.frame.unwrap();
+        let f = b.point.per_frame.unwrap();
         assert_eq!((f.tpr, f.fpr), (Some(1.0), Some(0.0)));
         // At the configured 0.5 the car frame (.4) does not alert: TPR 2/3.
         let c = r.configured.frame.unwrap();
         assert_eq!((c.tp, c.positives), (2, 3));
-        // Youden is among the alternatives of every search.
-        assert!(r.alternatives.iter().any(|p| p.objective == "youden"));
+        // Youden is among the alternatives of a search with frames without objects.
+        assert!(rc.alternatives.iter().any(|p| p.objective == "youden"));
         // Per class / per dataset AUC.
         let car = r.per_class.iter().find(|g| g.key == "car").unwrap();
         assert_eq!(car.roc_auc, Some(1.0));
@@ -1586,10 +1700,11 @@ pub(crate) mod tests {
         // fpr:0 -> the highest TPR without false alerts: everything (the negative scores 0).
         let req = SearchRequest {
             objective: Objective::Fpr(0.0),
+            classes: vec!["car".into()],
             ..Default::default()
         };
         let r = &search(&results, &preds, &req, &none).unwrap().results[0];
-        let f = r.best.as_ref().unwrap().point.frame.unwrap();
+        let f = r.best.as_ref().unwrap().point.per_frame.unwrap();
         assert_eq!((f.tpr, f.fpr), (Some(1.0), Some(0.0)));
         // CSV carries the AUC and the frame rates.
         let csv = to_csv(&out_of(&results, &preds));

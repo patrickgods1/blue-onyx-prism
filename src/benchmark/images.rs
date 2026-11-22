@@ -23,7 +23,9 @@
 //!   SHA-256 checks and the files on disk are those of the source images.
 //! - `"images_from": "<set id>"`: the set reuses another built-in set's images and download
 //!   directory (`bench/<that id>/`, resource `bench:<that id>`). An empty `images` list inherits
-//!   that set's images and ground truth (`exdark-ir` = `exdark-night` + `grayscale`).
+//!   that set's images and ground truth (`exdark-ir` = `exdark-night` + `grayscale`). A
+//!   `grayscale` set's inherited images carry the scene tag `ir` instead of `night` (B9: the
+//!   model sees monochrome night frames, what the service would call IR).
 //!
 //! `crowd` marks a COCO `iscrowd` region (it implies `ignore`; detections inside it are
 //! ignored by intersection over the detection's area, like pycocotools).
@@ -241,6 +243,11 @@ fn parse_builtins(list: &[(&str, &str)]) -> Vec<Manifest> {
                 m.images_from = Some(id.clone());
                 if m.images.is_empty() {
                     m.images = images.clone();
+                    if m.transform == Some(ImageTransform::Grayscale) {
+                        for img in &mut m.images {
+                            ir_scene(&mut img.tags);
+                        }
+                    }
                 }
                 true
             }
@@ -255,6 +262,23 @@ fn parse_builtins(list: &[(&str, &str)]) -> Vec<Manifest> {
         }
     });
     out
+}
+
+/// The tags of an image made grayscale: `night` becomes `ir` (kept in place, never twice).
+fn ir_scene(tags: &mut Vec<String>) {
+    let has_ir = tags.iter().any(|t| t == "ir");
+    let mut seen_ir = has_ir;
+    tags.retain_mut(|t| {
+        if t != "night" {
+            return true;
+        }
+        if seen_ir {
+            return false;
+        }
+        *t = "ir".to_string();
+        seen_ir = true;
+        true
+    });
 }
 
 /// The embedded built-in manifests, parsed once.
@@ -1733,7 +1757,20 @@ mod tests {
         let ir = builtin_manifest("exdark-ir").unwrap();
         assert_eq!(ir.transform, Some(ImageTransform::Grayscale));
         assert_eq!(ir.images_set_id(), "exdark-night");
-        assert_eq!(ir.images, night.images);
+        // The same images and ground truth; only the scene tag differs (`ir`, B9).
+        assert_eq!(ir.images.len(), night.images.len());
+        for (a, b) in ir.images.iter().zip(&night.images) {
+            let no_scene = |t: &[String]| -> Vec<String> {
+                t.iter()
+                    .filter(|t| *t != "night" && *t != "ir")
+                    .cloned()
+                    .collect()
+            };
+            assert_eq!(
+                (&a.file, &a.sha256, &a.objects, no_scene(&a.tags)),
+                (&b.file, &b.sha256, &b.objects, no_scene(&b.tags))
+            );
+        }
         assert_eq!(ir.scored_labels, night.scored_labels);
         assert!(night.transform.is_none());
         let root = Path::new("/data");
@@ -1809,5 +1846,34 @@ mod tests {
         };
         ImageTransform::Grayscale.apply(&mut img);
         assert_eq!(img.rgb, [76, 76, 76]);
+    }
+
+    /// B9: a set that turns another set's images grayscale (a night IR stand-in) tags them
+    /// `ir`, not the source's `night`; the source keeps its own tags.
+    #[test]
+    fn grayscale_sets_tag_inherited_images_ir() {
+        let base = r#"{"id":"a","images":[{"file":"x.jpg","tags":["night","res:sd"]},{"file":"y.jpg","tags":["day","ir"]}]}"#;
+        let gray = r#"{"id":"b","images_from":"a","transform":"grayscale","images":[]}"#;
+        let plain = r#"{"id":"c","images_from":"a","images":[]}"#;
+        let ms = parse_builtins(&[("a", base), ("b", gray), ("c", plain)]);
+        let tags = |m: &Manifest| -> Vec<Vec<String>> {
+            m.images.iter().map(|i| i.tags.clone()).collect()
+        };
+        assert_eq!(tags(&ms[0]), [vec!["night", "res:sd"], vec!["day", "ir"]]);
+        assert_eq!(tags(&ms[1]), [vec!["ir", "res:sd"], vec!["day", "ir"]]);
+        assert_eq!(tags(&ms[2]), tags(&ms[0]), "no transform: inherited as is");
+        let ir = builtin_manifest("exdark-ir").unwrap();
+        assert!(!ir.images.is_empty());
+        for i in &ir.images {
+            assert!(i.tags.iter().any(|t| t == "ir"), "{:?}", i.tags);
+            assert!(!i.tags.iter().any(|t| t == "night"), "{:?}", i.tags);
+        }
+        let night = builtin_manifest("exdark-night").unwrap();
+        assert!(
+            night
+                .images
+                .iter()
+                .all(|i| i.tags.iter().any(|t| t == "night"))
+        );
     }
 }

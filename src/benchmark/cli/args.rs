@@ -50,11 +50,14 @@ pub struct BenchArgs {
     #[arg(long, conflicts_with_all = ["device", "force_cpu", "compare_cpu", "model", "min_confidence"])]
     pub apply_threshold: bool,
     /// What the best confidence threshold optimizes: f1 (balance), f2 (favor recall: fewer
-    /// missed objects) or precision:<p> (highest recall with precision >= p, e.g.
-    /// precision:0.9 for fewer false alerts) or recall:<r> (highest precision with recall >= r),
-    /// youden (frame-level Youden's J: alert rate on frames with objects minus false-alert rate
-    /// on frames without) or fpr:<x> (highest frame alert rate with at most x false alerts per
-    /// frame without objects, e.g. fpr:0.05). Default: benchmark.threshold_objective (f1).
+    /// missed objects), f05 (favor precision: fewer false alerts), precision:<p> (highest recall
+    /// with precision >= p, e.g. precision:0.9 for fewer false alerts), recall:<r> (highest
+    /// precision with recall >= r), recall_at_fa:<N> (highest recall with at most N false
+    /// alerts per 100 empty frames, e.g. recall_at_fa:5), youden (frame-level Youden's J, one
+    /// sample per frame: alert rate on frames with objects minus false-alert rate on frames
+    /// without) or fpr:<x> (highest frame alert rate with at most x false alerts per frame
+    /// without objects, e.g. fpr:0.05). Every 0.01 step from 0.05 is scored. Default:
+    /// benchmark.threshold_objective (f1).
     #[arg(long, value_parser = parse_objective_arg)]
     pub threshold_objective: Option<Objective>,
     /// What the accuracy grade, the ranking and the device recommendation use: ap50 (box-level

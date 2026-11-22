@@ -281,11 +281,10 @@ fn labels_of(set: &CompareSet<'_>) -> (bool, Option<String>) {
     (reference.is_some(), reference)
 }
 
-/// The reference model's own detections are the labels of a relative set: it would score itself.
+/// The reference model's own detections are the labels of a relative set: it would score itself
+/// ([`crate::benchmark::is_reference`]).
 fn is_reference(reference: Option<&str>, model: &str) -> bool {
-    reference
-        .and_then(|r| r.split(" on ").next())
-        .is_some_and(|r| normalize_name(r.trim()) == normalize_name(model))
+    reference.is_some_and(|r| crate::benchmark::is_reference(r, model))
 }
 
 /// Why `m` is not on `set`, from what it ran and how far it reached.

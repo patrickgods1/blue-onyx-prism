@@ -889,7 +889,13 @@ impl BenchmarkResults {
             for d in &mut m.devices {
                 let Some(run) = d.run.as_mut() else { continue };
                 let Some(old) = run.grades else { continue };
-                let score = run.accuracy.as_ref().and_then(|a| a.score(metric));
+                // A score against the model's own pseudo labels (results of older versions) is
+                // no accuracy (B10).
+                let score = run
+                    .accuracy
+                    .as_ref()
+                    .filter(|a| !a.scored_on_own_labels(&m.model))
+                    .and_then(|a| a.score(metric));
                 let g = Grades::with_metric(metric, score, old.p50_ms, weights, old.relative);
                 if g != old {
                     run.grades = Some(g);
@@ -1099,6 +1105,25 @@ impl BenchmarkResults {
             .filter(|m| wanted(only, &m.model))
             .filter_map(|m| Some((m, m.threshold.as_ref()?.device_apply_values())))
             .flat_map(|(m, v)| v.into_iter().map(|(d, t)| (m.model.clone(), d, t)))
+            .collect()
+    }
+
+    /// The models (optionally limited to `only`) whose best threshold, overall or on a device,
+    /// was fitted on pseudo ground truth: an "apply all" leaves them alone
+    /// ([`crate::benchmark::threshold::NOT_ON_LABELS`]).
+    pub fn not_on_labels(&self, only: Option<&[String]>) -> Vec<String> {
+        self.models
+            .iter()
+            .filter(|m| wanted(only, &m.model))
+            .filter(|m| {
+                m.threshold.as_ref().is_some_and(|a| {
+                    a.not_on_labels().is_some()
+                        || a.by_device
+                            .iter()
+                            .any(|d| d.best.as_ref().is_some_and(|b| b.relative))
+                })
+            })
+            .map(|m| m.model.clone())
             .collect()
     }
 
@@ -1549,9 +1574,10 @@ mod tests {
         assert_eq!(a.device, "ort:coreml");
         assert_eq!(a.objective, "f1");
         let best = a.best.as_ref().unwrap();
-        // F1: {.9,.6} .8, {+.55 FP} .667, {+.35} .857, {+.2 FP} .75 -> (0.2, 0.35] -> 0.27.
+        // F1: {.9,.6} .8, {+.55 FP} .667, {+.35} .857, {+.2 FP} .75 -> grid 0.21 ..= 0.35,
+        // the middle of 15: 0.28.
         assert_eq!(best.exact_threshold, Some(0.35));
-        assert_eq!(best.threshold, 0.27);
+        assert_eq!(best.threshold, 0.28);
         assert_eq!(a.configured.threshold, 0.5);
         assert_eq!(a.by_device.len(), 2);
         let cpu_best = a.by_device[0].best.as_ref().unwrap();
@@ -1562,7 +1588,7 @@ mod tests {
         assert!(!a.exact.is_empty() && a.curve.len() == 19);
         assert!(
             m.recommendation
-                .contains("P/R at the best confidence threshold 0.27 (F1)"),
+                .contains("P/R at the best confidence threshold 0.28 (F1)"),
             "{}",
             m.recommendation
         );
@@ -1581,7 +1607,7 @@ mod tests {
         }));
         assert_eq!(s.threshold, m.threshold);
         let r = BenchmarkResults::new(Default::default(), Default::default(), vec![m.clone()]);
-        assert_eq!(r.thresholds(None), [("m".to_string(), 0.27)]);
+        assert_eq!(r.thresholds(None), [("m".to_string(), 0.28)]);
         assert!(r.thresholds(Some(&["other".into()])).is_empty());
         // Per device: every scored device row whose pick applies.
         let per_device = r.device_thresholds(None);
