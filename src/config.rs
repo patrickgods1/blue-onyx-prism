@@ -839,9 +839,11 @@ pub struct BenchmarkConfig {
     /// Download the selected built-in datasets when a run starts (large ones still need
     /// `allow_large_downloads`).
     pub auto_download_datasets: bool,
-    /// What the best confidence threshold optimizes: `f1` (default), `f2` (favor recall),
-    /// `precision:<p>` (highest recall with precision >= p), `recall:<r>`, `youden` (frame-level
-    /// TPR - FPR) or `fpr:<x>` (highest frame TPR with frame FPR <= x).
+    /// What the best confidence threshold optimizes: `f1` (default), `f2` (favor recall), `f05`
+    /// (favor precision), `precision:<p>` (highest recall with precision >= p), `recall:<r>`,
+    /// `recall_at_fa:<N>` (highest recall with at most N false alerts per 100 empty frames),
+    /// `youden` (frame-level TPR - FPR, one sample per frame) or `fpr:<x>` (highest frame TPR
+    /// with frame FPR <= x).
     pub threshold_objective: crate::benchmark::threshold::Objective,
     /// What the accuracy grade, the ranking and the device recommendation use: `ap50` (default,
     /// box-level AP@0.5 with small-object recall) or `roc_auc` (macro frame-level ROC AUC).
@@ -2547,6 +2549,19 @@ mod tests {
         let c: super::Config =
             serde_json::from_str(r#"{"benchmark":{"threshold_objective":"fpr:0.05"}}"#).unwrap();
         assert_eq!(c.benchmark.threshold_objective, Objective::Fpr(0.05));
+        for (text, o) in [
+            ("f05", Objective::F05),
+            ("recall_at_fa:5", Objective::RecallAtFa(5.0)),
+        ] {
+            let json = format!(r#"{{"benchmark":{{"threshold_objective":"{text}"}}}}"#);
+            let c: super::Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(c.benchmark.threshold_objective, o);
+            let back = serde_json::to_string(&c).unwrap();
+            assert!(
+                back.contains(&format!(r#""threshold_objective":"{text}""#)),
+                "{back}"
+            );
+        }
         assert!(
             serde_json::from_str::<super::Config>(r#"{"benchmark":{"accuracy_metric":"map"}}"#)
                 .is_err()

@@ -9,33 +9,48 @@
 //!
 //! - `f1` (default): the highest F1, precision and recall balanced;
 //! - `f2`: the highest F2, recall weighted 4x (fewer missed people, more false alerts);
+//! - `f05`: the highest F0.5, precision weighted 4x (fewer false alerts, more missed objects);
 //! - `precision:<p>`: the highest recall with precision >= p (e.g. `precision:0.9` to limit false
 //!   alerts). When no threshold reaches p, the most precise threshold is picked, with a note;
 //! - `recall:<r>`: the highest precision with recall >= r (e.g. `recall:0.9`: miss at most 10%).
 //!   When no threshold reaches r, the threshold with the highest recall is picked, with a note;
+//! - `recall_at_fa:<N>`: the highest box recall with at most N false alerts per 100 empty frames
+//!   (N in (0, 100]; empty frames and false alerts as [`super::metrics::AlertStats`] counts
+//!   them: frames with no object of a scored class their dataset annotates, alerting when a
+//!   detection of such a class outside every ignore region is at or above the threshold). When
+//!   no threshold reaches N, the threshold with the fewest false alerts is picked, with a note;
 //! - `youden`: the highest frame-level Youden's J, TPR - FPR (alert rate on frames with an
-//!   object minus false-alert rate on frames without), over the frame samples of
-//!   [`super::roc`] pooled over the scored classes (one threshold for every class);
+//!   object minus false-alert rate on frames without);
 //! - `fpr:<x>`: the highest frame TPR with frame FPR <= x (e.g. `fpr:0.05`: at most 5% of the
 //!   frames without an object alert).
 //!
-//! The frame objectives use the same samples as the frame ROC AUC; frame TPR and FPR only
-//! change at the frames' maximum confidences, which are breakpoints of the exact sweep too.
+//! The frame objectives use one sample per frame ([`super::metrics::SweepImage::alert_sample`],
+//! [`ThresholdPoint::per_frame`]): positive when the frame has a non-ignored object of a scored
+//! class its dataset annotates, negative when it has none (frames whose only such boxes are
+//! ignore regions are left out); its score is the highest confidence of its scored-class
+//! detections outside every ignore region (0 without one). The pooled (frame, class) samples of
+//! the frame ROC AUC ([`super::roc`]) would let the rare classes' negatives (every frame without
+//! a dog) dominate the FPR and push the pick low.
 //!
-//! The pick is exact, not limited to the 0.05 grid ([`exact_pick`]): precision, recall and F
-//! only change at the predictions' confidence values, so one pass over the predictions sorted
-//! by confidence ([`Breakpoints`]) evaluates the objective at every distinct confidence. Among
-//! the thresholds within [`PLATEAU`] of the best score, the widest contiguous range wins and
-//! its midpoint is taken (robust to noise: a lone spike between two drops is not chosen over a
-//! broad flat top). The threshold is then rounded down to 0.01 (keeping a superset of the
-//! predictions; when that leaves the range, the range's top rounded down is used), at least
-//! [`MIN_THRESHOLD`] (the evaluation pass's floor), and P/R/F are re-evaluated at the rounded
-//! value. The 0.05 grid ([`SWEEP_THRESHOLDS`]) is only used for the curve tables and charts.
+//! The pick is evaluated exactly on the 0.01 grid ([`grid`], [`exact_pick`]): every value t
+//! from [`MIN_THRESHOLD`] (the evaluation pass's floor) to [`MAX_THRESHOLD`] is scored with the
+//! detections of confidence >= t ([`Breakpoints::point_at`]). The grid values scoring within
+//! [`PLATEAU`] of the best grid value form runs of consecutive values; the widest run wins
+//! (equally wide runs: the higher one) and its middle value is the pick (the lower middle for
+//! an even count): a lone spike between two drops is not chosen over a broad flat top, and the
+//! pick is always a configurable value within [`PLATEAU`] of the best one (B3: rounding the
+//! midpoint of a range narrower than 0.01 could land outside it). Target objectives
+//! (`precision:`, `recall:`, `recall_at_fa:`, `fpr:`) count only the grid values meeting the
+//! target on these point estimates; when none does, the fallback above applies (`met: false`,
+//! never applied). The 0.05 grid ([`SWEEP_THRESHOLDS`]) is only used for the curve tables and
+//! charts.
 //!
-//! Ties go to the higher threshold (fewer detections for the same score). The server's
-//! threshold is what the model reports; Blue Iris can send its own `min_confidence` per request
-//! (it then replaces the server threshold for that request) and filters the returned objects
-//! again with each camera's minimum confidence.
+//! A pick fitted on pseudo ground truth (another model's detections, [`Pick::relative`]) is
+//! never written into the config ([`ThresholdAdvice::apply_value`], [`NOT_ON_LABELS`]).
+//!
+//! The server's threshold is what the model reports; Blue Iris can send its own
+//! `min_confidence` per request (it then replaces the server threshold for that request) and
+//! filters the returned objects again with each camera's minimum confidence.
 
 use super::metrics::{Breakpoints, SWEEP_THRESHOLDS, ThresholdPoint};
 use super::report::DeviceResult;
@@ -46,10 +61,28 @@ use std::str::FromStr;
 
 /// Scores this close count as equal (the higher threshold wins).
 const TIE: f64 = 1e-12;
-/// Thresholds scoring within this of the best form the plateau whose midpoint is picked.
+/// Grid values scoring within this of the best form the plateau whose middle is picked.
 pub const PLATEAU: f64 = 0.002;
 /// Lowest threshold a pick can have: the floor of the evaluation pass.
 pub const MIN_THRESHOLD: f32 = super::EVAL_CONFIDENCE;
+/// Highest threshold a pick can have (above every prediction's confidence nothing is kept).
+pub const MAX_THRESHOLD: f32 = 1.0;
+/// Why a pick fitted on pseudo ground truth is not applied (apply endpoints, CLI).
+pub const NOT_ON_LABELS: &str = "fitted on another model's detections, not on labels";
+
+/// The thresholds a pick is chosen from: every 0.01 from [`MIN_THRESHOLD`] to
+/// [`MAX_THRESHOLD`], ascending (`k / 100` in f32, so 0.35 is the literal `0.35`).
+pub fn grid() -> Vec<f32> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "both bounds are thresholds in 0..=1, so the cents are in 0..=100"
+    )]
+    let cents = |t: f32| (f64::from(t) * 100.0).round() as u32;
+    (cents(MIN_THRESHOLD)..=cents(MAX_THRESHOLD))
+        .map(|k| k as f32 / 100.0)
+        .collect()
+}
 
 /// What the best threshold optimizes.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -60,6 +93,8 @@ pub enum Objective {
     F1,
     /// Highest F2 (recall-weighted).
     F2,
+    /// Highest F0.5 (precision-weighted: precision counts twice as much as recall in beta).
+    F05,
     /// Highest recall with precision at or above the target (0..1].
     Precision(f64),
     /// Highest precision with recall at or above the target (0..1].
@@ -68,6 +103,8 @@ pub enum Objective {
     Youden,
     /// Highest frame TPR with frame FPR at or below the target [0..1).
     Fpr(f64),
+    /// Highest box recall with at most this many false alerts per 100 empty frames (0..100].
+    RecallAtFa(f64),
 }
 
 impl Objective {
@@ -84,32 +121,48 @@ impl Objective {
         matches!(self, Objective::Youden | Objective::Fpr(_))
     }
 
-    /// The value maximized at `p`: F1, F2, or recall when the precision target is met.
+    /// Scored on false alerts per 100 empty frames ([`ThresholdPoint::false_alerts`]).
+    pub fn is_alerts(&self) -> bool {
+        matches!(self, Objective::RecallAtFa(_))
+    }
+
+    /// The value maximized at `p`: F1, F2, F0.5, or recall when the precision target is met.
     pub fn score(&self, p: &ThresholdPoint) -> Option<f64> {
         match self {
             Objective::F1 => p.f1,
             Objective::F2 => p.f2,
+            Objective::F05 => p.counts.f_beta(0.5),
             Objective::Precision(target) => {
                 p.precision.filter(|&v| v >= target - TIE).and(p.recall)
             }
             Objective::Recall(target) => p.recall.filter(|&v| v >= target - TIE).and(p.precision),
-            Objective::Youden => p.frame.as_ref().and_then(FrameRates::youden),
+            Objective::Youden => p.alert_rates().and_then(FrameRates::youden),
             Objective::Fpr(target) => {
-                let f = p.frame.as_ref()?;
+                let f = p.alert_rates()?;
                 f.fpr.filter(|&v| v <= target + TIE).and(f.tpr)
+            }
+            Objective::RecallAtFa(n) => {
+                let fa = p.false_alerts?.per_100()?;
+                p.recall.filter(|_| fa <= n + TIE)
             }
         }
     }
 
-    /// Whether `p` meets the objective's target (precision / frame FPR), None without one.
+    /// Whether `p` meets the objective's target (precision, recall, frame FPR, false alerts
+    /// per 100 empty frames), None without one.
     fn target_met(&self, p: &ThresholdPoint) -> Option<bool> {
         match self {
             Objective::Precision(t) => Some(p.precision.is_some_and(|v| v >= t - TIE)),
+            Objective::Recall(t) => Some(p.recall.is_some_and(|v| v >= t - TIE)),
             Objective::Fpr(t) => Some(
-                p.frame
-                    .as_ref()
+                p.alert_rates()
                     .and_then(|f| f.fpr)
                     .is_some_and(|v| v <= t + TIE),
+            ),
+            Objective::RecallAtFa(n) => Some(
+                p.false_alerts
+                    .and_then(|f| f.per_100())
+                    .is_some_and(|v| v <= n + TIE),
             ),
             _ => None,
         }
@@ -120,12 +173,23 @@ impl Objective {
         match self {
             Objective::F1 => "F1".into(),
             Objective::F2 => "F2 (favor recall)".into(),
+            Objective::F05 => "F0.5 (favor precision)".into(),
             Objective::Precision(p) => format!("recall at precision \u{2265} {}%", pct0(*p)),
             Objective::Recall(r) => format!("precision at recall \u{2265} {}%", pct0(*r)),
             Objective::Youden => "Youden's J (frame TPR \u{2212} FPR)".into(),
             Objective::Fpr(x) => format!("frame TPR at frame FPR \u{2264} {}%", pct0(*x)),
+            Objective::RecallAtFa(n) => format!(
+                "recall at \u{2264} {} false alerts per 100 empty frames",
+                num0(*n)
+            ),
         }
     }
+}
+
+/// `5`, `2.5`: a count per 100 frames without a trailing `.0`.
+fn num0(v: f64) -> String {
+    let s = format!("{v:.1}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
 }
 
 fn pct0(v: f64) -> String {
@@ -138,10 +202,12 @@ impl fmt::Display for Objective {
         match self {
             Objective::F1 => f.write_str("f1"),
             Objective::F2 => f.write_str("f2"),
+            Objective::F05 => f.write_str("f05"),
             Objective::Precision(p) => write!(f, "precision:{p}"),
             Objective::Recall(r) => write!(f, "recall:{r}"),
             Objective::Youden => f.write_str("youden"),
             Objective::Fpr(x) => write!(f, "fpr:{x}"),
+            Objective::RecallAtFa(n) => write!(f, "recall_at_fa:{n}"),
         }
     }
 }
@@ -154,8 +220,26 @@ impl FromStr for Objective {
         match t.as_str() {
             "f1" | "" => Ok(Objective::F1),
             "f2" => Ok(Objective::F2),
+            "f05" | "f0.5" => Ok(Objective::F05),
             "youden" | "youden_j" | "j" => Ok(Objective::Youden),
             _ => {
+                if let Some(x) = t
+                    .strip_prefix("recall_at_fa:")
+                    .or_else(|| t.strip_prefix("recall_at_fa="))
+                {
+                    let v: f64 = x.trim().parse().map_err(|_| {
+                        format!(
+                            "threshold objective '{s}': '{x}' is not a number (e.g. recall_at_fa:5)"
+                        )
+                    })?;
+                    if !(v > 0.0 && v <= 100.0) {
+                        return Err(format!(
+                            "threshold objective '{s}': the false alerts per 100 empty frames \
+                             must be in (0, 100]"
+                        ));
+                    }
+                    return Ok(Objective::RecallAtFa(v));
+                }
                 if let Some(x) = t.strip_prefix("fpr:").or_else(|| t.strip_prefix("fpr=")) {
                     let v: f64 = x.trim().parse().map_err(|_| {
                         format!("threshold objective '{s}': '{x}' is not a number (e.g. fpr:0.05)")
@@ -179,8 +263,9 @@ impl FromStr for Objective {
                     ("recall", p)
                 } else {
                     return Err(format!(
-                        "threshold objective '{s}': use f1, f2, precision:<0..1>, recall:<0..1>, \
-                         youden or fpr:<0..1>"
+                        "threshold objective '{s}': use f1, f2, f05, precision:<0..1>, \
+                         recall:<0..1>, recall_at_fa:<N per 100 empty frames>, youden or \
+                         fpr:<0..1>"
                     ));
                 };
                 let v: f64 = p.trim().parse().map_err(|_| {
@@ -221,21 +306,26 @@ pub struct Pick {
     pub objective: String,
     pub threshold: f32,
     pub point: ThresholdPoint,
-    /// False when a precision target is reached at no threshold (the most precise one was
-    /// picked instead).
+    /// False when a target is reached at no threshold (the closest one was picked instead).
     pub met: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Exact optimum before the plateau and the rounding: the confidence value it sits at
-    /// (None for a pick from the 0.05 grid only, e.g. results of older versions).
+    /// The best value of the 0.01 grid ([`grid`]; ties: the highest), before the plateau rule.
+    /// Results of versions before the grid hold the exact optimum over every distinct
+    /// confidence; None for a pick from the 0.05 grid only (results of older versions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_threshold: Option<f32>,
-    /// Objective score of the exact optimum.
+    /// Objective score at `exact_threshold`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exact_score: Option<f64>,
-    /// Threshold range `[lo, hi]` within [`PLATEAU`] of the best score the pick was taken from.
+    /// The run of grid values `[first, last]` within [`PLATEAU`] of the best score whose middle
+    /// is the pick (`[t, t]` for a fallback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plateau: Option<[f32; 2]>,
+    /// Fitted on pseudo ground truth (another model's detections): shown, never applied
+    /// ([`NOT_ON_LABELS`]). Set from the curve it was fitted on ([`Curve::best`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relative: bool,
 }
 
 /// Round down to a multiple of 0.01 (a hair of tolerance so 0.35 stays 0.35 in f32).
@@ -247,202 +337,135 @@ pub fn floor_cent(t: f64) -> f32 {
     ((t * 100.0 + 1e-4).floor() / 100.0) as f32
 }
 
-/// A threshold range over which the kept predictions do not change: thresholds in `(lo, hi]`
-/// (`[lo, hi]` for the lowest) keep the predictions at or above `hi`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Segment {
-    pub lo: f32,
-    pub hi: f32,
-    /// Objective score (None = undefined or a precision target missed).
-    pub score: Option<f64>,
+/// The run of grid values a pick is taken from: indices into the grid scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridRun {
+    /// The best-scoring value (ties: the highest).
+    pub best: usize,
+    /// First and last value of the widest run within the tolerance of the best (ties: the
+    /// higher run).
+    pub first: usize,
+    pub last: usize,
 }
 
-/// Index of the best-scoring segment (ties: the higher one). `segments` ascend.
-pub fn best_segment(segments: &[Segment]) -> Option<usize> {
+impl GridRun {
+    /// The picked value: the middle of the run, the lower one for an even count.
+    pub fn middle(&self) -> usize {
+        self.first + (self.last - self.first) / 2
+    }
+}
+
+/// The plateau rule over `scores` (one per grid value, ascending thresholds; None = undefined
+/// or the target missed): the best value, then the widest run of consecutive values scoring at
+/// least `best - tol` (ties: the higher run). None when no value has a score.
+pub fn grid_run(scores: &[Option<f64>], tol: f64) -> Option<GridRun> {
     let mut best: Option<(usize, f64)> = None;
-    for (i, sg) in segments.iter().enumerate() {
-        if let Some(v) = sg.score
+    for (i, v) in scores.iter().enumerate() {
+        if let Some(v) = *v
             && best.is_none_or(|(_, b)| v >= b - TIE)
         {
             best = Some((i, v));
         }
     }
-    best.map(|(i, _)| i)
-}
-
-/// The widest contiguous run `(first, last)` of segments scoring at least `best - tol`
-/// (ties: the higher run). `segments` ascend and are contiguous.
-pub fn plateau(segments: &[Segment], tol: f64) -> Option<(usize, usize)> {
-    let best = segments.get(best_segment(segments)?)?.score?;
-    let ok = |s: &Segment| s.score.is_some_and(|v| v >= best - tol - TIE);
-    let mut out: Option<(usize, usize, f32)> = None;
+    let (best, top) = best?;
+    let ok = |i: usize| {
+        scores
+            .get(i)
+            .copied()
+            .flatten()
+            .is_some_and(|v| v >= top - tol - TIE)
+    };
+    let mut out: Option<(usize, usize)> = None;
     let mut i = 0;
-    while let Some(first) = segments.get(i) {
-        if !ok(first) {
+    while i < scores.len() {
+        if !ok(i) {
             i += 1;
             continue;
         }
-        let a = i;
-        let mut last = first;
-        while let Some(next) = segments.get(i + 1).filter(|s| ok(s)) {
-            last = next;
+        let first = i;
+        while ok(i + 1) {
             i += 1;
         }
-        let width = last.hi - first.lo;
-        if out.is_none_or(|(_, _, w)| width >= w - 1e-6) {
-            out = Some((a, i, width));
+        if out.is_none_or(|(a, b)| i - first >= b - a) {
+            out = Some((first, i));
         }
         i += 1;
     }
-    out.map(|(a, b, _)| (a, b))
+    let (first, last) = out?;
+    Some(GridRun { best, first, last })
 }
 
-/// The reported threshold of the run `(a, b)`: its midpoint rounded down to 0.01; when that
-/// falls out of the run, the run's top rounded down; at least [`MIN_THRESHOLD`].
-fn round_in(segments: &[Segment], a: usize, b: usize) -> f32 {
-    let (Some(sa), Some(sb)) = (segments.get(a), segments.get(b)) else {
-        return MIN_THRESHOLD;
-    };
-    let (lo, hi) = (sa.lo, sb.hi);
-    let r = floor_cent((lo as f64 + hi as f64) / 2.0);
-    // The lowest segment includes its lower end.
-    let inside = r > lo || (a == 0 && r >= lo);
-    let r = if inside { r } else { floor_cent(hi as f64) };
-    r.max(MIN_THRESHOLD)
-}
-
-/// Segments of `bp` over `[MIN_THRESHOLD, 1]`, ascending, scored for `objective`.
-pub fn segments(bp: &Breakpoints, objective: Objective) -> Vec<Segment> {
-    let mut cs: Vec<f32> = bp
-        .steps
-        .iter()
-        .map(|s| s.0)
-        .chain(bp.frames.iter().flat_map(|f| f.steps.iter().map(|s| s.0)))
-        .filter(|c| (MIN_THRESHOLD..=1.0).contains(c))
-        .collect();
-    // Ascending and distinct (frame scores are prediction confidences, mostly already here).
-    cs.sort_by(f32::total_cmp);
-    cs.dedup();
-    // Above the most confident prediction nothing is kept.
-    if cs.last().is_none_or(|&c| c < 1.0) {
-        cs.push(1.0);
-    }
-    let mut out = Vec::with_capacity(cs.len());
-    let mut lo = MIN_THRESHOLD;
-    for &hi in &cs {
-        // The added top segment (above every prediction) keeps nothing.
-        let p = bp.point_at(hi);
-        out.push(Segment {
-            lo,
-            hi,
-            score: objective.score(&p),
-        });
-        lo = hi;
-    }
-    out
-}
-
-/// The exact best threshold of `bp` for `objective` (see the module docs): None without
-/// ground truth (or, for a precision target, without any detection).
+/// The best threshold of `bp` for `objective`, every value of the 0.01 grid scored exactly (see
+/// the module docs): None without ground truth (frame objectives: without frames with and
+/// without objects; `recall_at_fa`: without empty frames).
 pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
-    if objective.is_frame() {
-        // Frame objectives need positive and negative frames.
-        if !bp
-            .frames
-            .as_ref()
-            .is_some_and(|f| f.positives > 0 && f.negatives > 0)
-        {
-            return None;
-        }
-    } else if bp.npos == 0 {
+    if bp.npos == 0 && !objective.is_frame() {
         return None;
     }
-    let segs = segments(bp, objective);
-    let make =
-        |t: f32, met: bool, note: Option<String>, exact: (f32, Option<f64>), run: [f32; 2]| Pick {
+    if objective.is_frame()
+        && !bp
+            .per_frame
+            .as_ref()
+            .is_some_and(|f| f.positives > 0 && f.negatives > 0)
+    {
+        return None;
+    }
+    if objective.is_alerts() && !bp.empty.as_ref().is_some_and(|e| e.negatives > 0) {
+        return None;
+    }
+    let thresholds = grid();
+    let points: Vec<ThresholdPoint> = thresholds.iter().map(|&t| bp.point_at(t)).collect();
+    let scores: Vec<Option<f64>> = points.iter().map(|p| objective.score(p)).collect();
+    let at = |i: usize| thresholds.get(i).copied().unwrap_or(MIN_THRESHOLD);
+    if let Some(run) = grid_run(&scores, PLATEAU) {
+        let k = run.middle();
+        let p = points.get(k).copied()?;
+        let note = (p.counts.tp == 0).then(|| "no threshold finds any object".to_string());
+        // Every value of the run meets the target (a missed target scores None).
+        let met = objective.target_met(&p) != Some(false);
+        return Some(Pick {
             objective: objective.to_string(),
-            threshold: t,
-            point: bp.point_at(t),
+            threshold: p.threshold,
+            point: p,
             met,
             note,
-            exact_threshold: Some(exact.0),
-            exact_score: exact.1,
-            plateau: Some(run),
-        };
-    // `best_segment` and `plateau` return indices into `segs`.
-    if let Some((best, sbest)) = best_segment(&segs).and_then(|i| Some((i, segs.get(i)?))) {
-        let (a, b) = plateau(&segs, PLATEAU).unwrap_or((best, best));
-        let run = [
-            segs.get(a).map_or(sbest.lo, |s| s.lo),
-            segs.get(b).map_or(sbest.hi, |s| s.hi),
-        ];
-        let mut t = round_in(&segs, a, b);
-        let mut note = None;
-        if objective.target_met(&bp.point_at(t)) == Some(false) {
-            // Rounding down may let in enough false positives (false alerts) to miss the
-            // target: take the next 0.01 step up that meets it.
-            let meets = |t: f32| objective.target_met(&bp.point_at(t)) == Some(true);
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "t is a threshold clamped to 0..=1, so the value is in 0..=100"
-            )]
-            let start = (f64::from(t).clamp(0.0, 1.0) * 100.0).round() as u32 + 1;
-            match (start..=100).map(|k| k as f32 / 100.0).find(|&u| meets(u)) {
-                Some(up) => t = up,
-                None => {
-                    let (name, target) = match objective {
-                        Objective::Fpr(x) => ("frame FPR", x),
-                        Objective::Precision(p) => ("precision", p),
-                        _ => ("target", 0.0),
-                    };
-                    note = Some(format!(
-                        "{name} {}% is met only between 0.01 steps (exact optimum {:.3}), so no \
-                         configurable threshold meets it and it is not applied; choose a lower \
-                         target",
-                        pct0(target),
-                        sbest.hi
-                    ))
-                }
-            }
-        }
-        let p = bp.point_at(t);
-        if p.counts.tp == 0 {
-            note = Some("no threshold finds any object".to_string());
-        }
-        // `met` describes the reported (rounded) threshold, so `apply_value` never writes a
-        // value that misses the target (BQ-07).
-        let met = objective.target_met(&p) != Some(false);
-        return Some(make(t, met, note, (sbest.hi, sbest.score), run));
+            exact_threshold: Some(at(run.best)),
+            exact_score: scores.get(run.best).copied().flatten(),
+            plateau: Some([at(run.first), at(run.last)]),
+            relative: false,
+        });
     }
     let (_, primary, secondary) = fallback_keys(objective)?;
-    // Target not reached: the best range on the constrained metric (then the other metric,
-    // then the higher threshold).
-    let prim = |sg: &Segment| primary(&bp.point_at(sg.hi));
-    let sec = |sg: &Segment| secondary(&bp.point_at(sg.hi)).unwrap_or(0.0);
-    let mut best: Option<(usize, &Segment)> = None;
-    for (i, sg) in segs.iter().enumerate() {
-        let Some(v) = prim(sg) else { continue };
+    // Target not reached: the best grid value on the constrained metric (then the other
+    // metric, then the higher threshold).
+    let mut best: Option<&ThresholdPoint> = None;
+    for p in &points {
+        let Some(v) = primary(p) else { continue };
         let better = match best {
             None => true,
-            Some((_, b)) => {
-                let bv = prim(b).unwrap_or(0.0);
-                v > bv + TIE || ((v - bv).abs() <= TIE && sec(sg) >= sec(b) - TIE)
+            Some(b) => {
+                let bv = primary(b).unwrap_or(0.0);
+                v > bv + TIE
+                    || ((v - bv).abs() <= TIE
+                        && secondary(p).unwrap_or(0.0) >= secondary(b).unwrap_or(0.0) - TIE)
             }
         };
         if better {
-            best = Some((i, sg));
+            best = Some(p);
         }
     }
-    let (i, sg) = best?;
-    let t = round_in(&segs, i, i);
-    Some(make(
-        t,
-        false,
-        Some(unreached_note(objective, &bp.point_at(sg.hi))),
-        (sg.hi, None),
-        [sg.lo, sg.hi],
-    ))
+    let p = *best?;
+    Some(Pick {
+        objective: objective.to_string(),
+        threshold: p.threshold,
+        point: p,
+        met: false,
+        note: Some(unreached_note(objective, &p)),
+        exact_threshold: Some(p.threshold),
+        exact_score: None,
+        plateau: Some([p.threshold, p.threshold]),
+        relative: false,
+    })
 }
 
 /// The best point of `points` for `objective`; ties go to the higher threshold. None without
@@ -470,6 +493,7 @@ pub fn pick(points: &[ThresholdPoint], objective: Objective) -> Option<Pick> {
         exact_threshold: None,
         exact_score: None,
         plateau: None,
+        relative: false,
     };
     if let Some(p) = best_by(&|p| objective.score(p)) {
         let note = (p.counts.tp == 0).then(|| "no threshold finds any object".to_string());
@@ -507,8 +531,15 @@ fn fallback_keys(objective: Objective) -> Option<(f64, Metric, Metric)> {
         // Maximize 1 - FPR (the lowest false-alert rate), then TPR.
         Objective::Fpr(t) => Some((
             t,
-            |p| p.frame.as_ref()?.fpr.map(|v| 1.0 - v),
-            |p| p.frame.as_ref()?.tpr,
+            |p| p.alert_rates()?.fpr.map(|v| 1.0 - v),
+            |p| p.alert_rates()?.tpr,
+        )),
+        // Maximize 1 - the share of empty frames alerting (the fewest false alerts), then
+        // recall.
+        Objective::RecallAtFa(n) => Some((
+            n,
+            |p| p.false_alerts?.per_100().map(|v| 1.0 - v / 100.0),
+            |p| p.recall,
         )),
         _ => None,
     }
@@ -526,6 +557,15 @@ fn unreached_note(objective: Objective, p: &ThresholdPoint) -> String {
                 "frame FPR {}% is not reached at any threshold; the lowest is {}% at {:.2}",
                 pct0(target),
                 pct0(1.0 - metric(p).unwrap_or(0.0)),
+                p.threshold
+            );
+        }
+        Objective::RecallAtFa(_) => {
+            return format!(
+                "{} false alerts per 100 empty frames is not reached at any threshold; the \
+                 fewest is {} at {:.2}",
+                num0(target),
+                num0(100.0 * (1.0 - metric(p).unwrap_or(0.0))),
                 p.threshold
             );
         }
@@ -554,7 +594,7 @@ pub struct Curve {
     pub points: Vec<ThresholdPoint>,
     /// At the run's configured threshold (also when it is not on the grid).
     pub configured: ThresholdPoint,
-    /// Exact picks ([`exact_pick`]) for the run's objective and [`Objective::STANDARD`].
+    /// Grid picks ([`exact_pick`]) for the run's objective and [`Objective::STANDARD`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub picks: Vec<Pick>,
     /// The exact curve, thinned to at most [`EXACT_POINTS`] points (overall curve only).
@@ -569,8 +609,8 @@ pub struct Curve {
 pub const EXACT_POINTS: usize = 150;
 
 impl Curve {
-    /// The best threshold for `objective`: the exact pick when the run computed it, else from
-    /// the 0.05 grid.
+    /// The best threshold for `objective`: the grid pick when the run computed it, else from
+    /// the 0.05 grid; marked [`Pick::relative`] on a curve of pseudo ground truth.
     pub fn best(&self, objective: Objective) -> Option<Pick> {
         let key = objective.to_string();
         self.picks
@@ -578,6 +618,10 @@ impl Curve {
             .find(|p| p.objective == key)
             .cloned()
             .or_else(|| pick(&self.points, objective))
+            .map(|mut p| {
+                p.relative |= self.relative;
+                p
+            })
     }
 }
 
@@ -738,9 +782,10 @@ pub fn prf(p: &ThresholdPoint) -> String {
     )
 }
 
-/// "frame TPR 91.0% FPR 6.2%" (empty without frame rates).
+/// "frame TPR 91.0% FPR 6.2%" (empty without frame rates), one sample per frame
+/// ([`ThresholdPoint::alert_rates`]).
 pub fn frame_rates(p: &ThresholdPoint) -> String {
-    p.frame.as_ref().map_or(String::new(), |f| {
+    p.alert_rates().map_or(String::new(), |f| {
         format!("frame TPR {} FPR {}", pct(f.tpr), pct(f.fpr))
     })
 }
@@ -827,11 +872,20 @@ impl ThresholdAdvice {
         Some(s)
     }
 
-    /// The threshold to write into the config: the best one, when the objective was met and it
-    /// finds objects (an unreachable precision target or a model that finds nothing changes
-    /// nothing).
+    /// The threshold to write into the config: the best one, when the objective was met, it
+    /// finds objects and it was fitted on real labels (an unreachable precision target, a
+    /// model that finds nothing or a pick on pseudo ground truth changes nothing).
     pub fn apply_value(&self) -> Option<f32> {
+        if self.relative {
+            return None;
+        }
         applicable(self.best.as_ref())
+    }
+
+    /// Why the best threshold is not applied when it was fitted on pseudo ground truth
+    /// ([`NOT_ON_LABELS`]); None otherwise.
+    pub fn not_on_labels(&self) -> Option<&'static str> {
+        (self.relative || self.best.as_ref().is_some_and(|b| b.relative)).then_some(NOT_ON_LABELS)
     }
 
     /// The threshold to write into `device`'s confidence profile
@@ -863,10 +917,10 @@ impl ThresholdAdvice {
     }
 }
 
-/// A pick's threshold when it may be written into the config: the objective was met and the
-/// model finds objects there.
+/// A pick's threshold when it may be written into the config: the objective was met, the
+/// model finds objects there and the pick was fitted on real labels (not [`Pick::relative`]).
 fn applicable(pick: Option<&Pick>) -> Option<f32> {
-    pick.filter(|b| b.met && b.point.counts.tp > 0)
+    pick.filter(|b| b.met && !b.relative && b.point.counts.tp > 0)
         .map(|b| b.threshold)
 }
 
@@ -986,6 +1040,7 @@ pub(crate) fn test_advice(t: f32) -> ThresholdAdvice {
             exact_threshold: Some(t),
             exact_score: p(t).f1,
             plateau: Some([t, t]),
+            relative: false,
         }),
         alternatives: vec![],
         curve: SWEEP_THRESHOLDS.iter().map(|&t| p(t)).collect(),
@@ -1094,7 +1149,10 @@ mod tests {
         };
         (0..n)
             .map(|_| {
-                let mut img = SweepImage::default();
+                let mut img = SweepImage {
+                    frame_classes: vec!["person".into(), "car".into()],
+                    ..SweepImage::default()
+                };
                 for class in ["person", "car"] {
                     let positive = rnd() < 0.4;
                     let mut score = if rnd() < 0.25 {
@@ -1127,8 +1185,8 @@ mod tests {
             .collect()
     }
 
-    /// Youden and fpr:x picks equal brute force over every frame score; the reported (rounded)
-    /// threshold keeps the FPR target.
+    /// Youden and fpr:x picks equal brute force over the 0.01 grid of the per-frame rates; the
+    /// reported threshold keeps the FPR target and sits in the middle of its plateau.
     #[test]
     fn frame_objectives_match_brute_force() {
         use super::super::metrics::SweepScope;
@@ -1136,32 +1194,26 @@ mod tests {
             let imgs = random_frames(seed, 20 + seed as usize * 2, seed % 2 == 0);
             let refs: Vec<&super::super::metrics::SweepImage> = imgs.iter().collect();
             let bp = Breakpoints::new(&refs, SweepScope::All);
-            let fs = bp.frames.as_ref().unwrap();
-            // Every alert decision a threshold >= 0.05 can make: at each frame score, and above
-            // all of them.
-            let mut cands: Vec<f32> = fs
-                .steps
-                .iter()
-                .map(|s| s.0)
-                .filter(|&t| t >= MIN_THRESHOLD)
-                .collect();
-            cands.push(1.0);
+            let fs = bp.per_frame.as_ref().unwrap();
+            // One sample per frame: as many as frames (none is ignore-only here).
+            assert_eq!(fs.positives + fs.negatives, imgs.len());
             for o in [
                 Objective::Youden,
                 Objective::Fpr(0.0),
                 Objective::Fpr(0.05),
                 Objective::Fpr(0.2),
             ] {
-                let brute = cands
-                    .iter()
-                    .filter_map(|&t| {
-                        let r = fs.rates_at(t);
-                        match o {
-                            Objective::Youden => r.youden(),
-                            Objective::Fpr(x) => r.fpr.filter(|&v| v <= x + 1e-12).and(r.tpr),
-                            _ => unreachable!(),
-                        }
-                    })
+                let score = |t: f32| {
+                    let r = fs.rates_at(t);
+                    match o {
+                        Objective::Youden => r.youden(),
+                        Objective::Fpr(x) => r.fpr.filter(|&v| v <= x + 1e-12).and(r.tpr),
+                        _ => unreachable!(),
+                    }
+                };
+                let brute = grid()
+                    .into_iter()
+                    .filter_map(score)
                     .fold(f64::NEG_INFINITY, f64::max);
                 let p = exact_pick(&bp, o).unwrap();
                 assert!(p.met, "seed {seed} {o}");
@@ -1171,29 +1223,29 @@ mod tests {
                     p.exact_score
                 );
                 assert_eq!(p.point, bp.point_at(p.threshold));
+                assert_eq!(p.point.per_frame, Some(fs.rates_at(p.threshold)));
                 assert!(p.threshold >= MIN_THRESHOLD);
-                let f = p.point.frame.unwrap();
-                match o {
-                    Objective::Fpr(x) => {
-                        assert!(f.fpr.unwrap() <= x + 1e-12, "seed {seed} {o}: {f:?}")
-                    }
-                    _ => {
-                        // Every threshold of the plateau scores within PLATEAU of the optimum
-                        // (the reported value is its midpoint rounded to 0.01, as for F1).
-                        let [lo, hi] = p.plateau.unwrap();
-                        for k in 0..20 {
-                            let t = lo + (hi - lo) * (k as f32 + 0.5) / 20.0;
-                            let v = o.score(&bp.point_at(t)).unwrap();
-                            assert!(v >= brute - PLATEAU - 1e-9, "seed {seed} t {t}");
-                        }
-                    }
+                let f = p.point.per_frame.unwrap();
+                if let Objective::Fpr(x) = o {
+                    assert!(f.fpr.unwrap() <= x + 1e-12, "seed {seed} {o}: {f:?}");
                 }
-                // Ties go to the higher threshold: no higher candidate scores as well.
+                // Every grid value of the plateau scores within PLATEAU of the optimum, the
+                // pick is its middle.
+                let [lo, hi] = p.plateau.unwrap();
+                let run: Vec<f32> = grid()
+                    .into_iter()
+                    .filter(|&t| t >= lo - 1e-6 && t <= hi + 1e-6)
+                    .collect();
+                for &t in &run {
+                    let v = score(t).unwrap();
+                    assert!(v >= brute - PLATEAU - 1e-9, "seed {seed} t {t}");
+                }
+                assert_eq!(run.get((run.len() - 1) / 2).copied(), Some(p.threshold));
+                // Ties go to the higher threshold: no higher grid value scores as well.
                 let et = p.exact_threshold.unwrap();
-                for &t in cands.iter().filter(|&&t| t > et) {
-                    let v = o.score(&bp.point_at(t));
+                for t in grid().into_iter().filter(|&t| t > et) {
                     assert!(
-                        v.is_none_or(|v| v < p.exact_score.unwrap() - 1e-12),
+                        score(t).is_none_or(|v| v < brute - 1e-12),
                         "seed {seed} {o}: {t} ties {et}"
                     );
                 }
@@ -1204,7 +1256,6 @@ mod tests {
     #[test]
     fn frame_objectives_hand_computed_and_undefined() {
         use super::super::metrics::{SweepImage, SweepScope};
-        use super::super::roc::FrameSample;
         // Positive frames .9 .6 .3; negative frames .7 .2 0.
         let mut imgs = Vec::new();
         for (score, positive) in [
@@ -1215,44 +1266,47 @@ mod tests {
             (0.2, false),
             (0.0, false),
         ] {
-            let mut i = SweepImage::default();
+            let mut i = SweepImage {
+                frame_classes: vec!["person".into()],
+                ..SweepImage::default()
+            };
             if positive {
                 i.gt.push(("person".into(), false));
             }
-            i.frames.push(FrameSample {
-                class: "person".into(),
-                positive,
-                score,
-            });
+            if score > 0.0 {
+                i.preds.push(sp("person", score, positive));
+            }
             imgs.push(i);
         }
         let refs: Vec<&SweepImage> = imgs.iter().collect();
         let bp = Breakpoints::new(&refs, SweepScope::All);
         // J = TPR - FPR by alerting set: {.9} 1/3, {+.7} 0, {+.6} 1/3, {+.3} 2/3, {+.2} 1/3.
-        // Best: thresholds (0.2, 0.3].
+        // Best: thresholds (0.2, 0.3], grid 0.21 ..= 0.30, middle 0.25.
         let p = exact_pick(&bp, Objective::Youden).unwrap();
         assert_eq!(p.exact_threshold, Some(0.3));
         assert!((p.exact_score.unwrap() - 2.0 / 3.0).abs() < 1e-12);
-        assert_eq!(p.plateau, Some([0.2, 0.3]));
+        assert_eq!(p.plateau, Some([0.21, 0.3]));
         assert_eq!(p.threshold, 0.25);
-        let f = p.point.frame.unwrap();
+        let f = p.point.per_frame.unwrap();
         assert_eq!((f.tp, f.fp), (3, 1));
         // FPR <= 0.4 (1 of 3 negatives may alert): highest TPR keeps down to .3 (FPR 1/3).
         let q = exact_pick(&bp, Objective::Fpr(0.4)).unwrap();
         assert_eq!(q.exact_threshold, Some(0.3));
-        // FPR 0: only the .9 frame may alert -> (0.7, 0.9]; midpoint 0.80.
+        // FPR 0: only the .9 frame may alert -> 0.71 ..= 0.90; middle 0.80.
         let z = exact_pick(&bp, Objective::Fpr(0.0)).unwrap();
         assert_eq!((z.exact_threshold, z.threshold), (Some(0.9), 0.8));
-        assert_eq!(z.point.frame.unwrap().fp, 0);
+        assert_eq!(z.point.per_frame.unwrap().fp, 0);
         // No negative frames: frame objectives are undefined; box objectives still work.
         let only_pos: Vec<&SweepImage> = refs.iter().take(3).copied().collect();
         let bp = Breakpoints::new(&only_pos, SweepScope::All);
         assert!(exact_pick(&bp, Objective::Youden).is_none());
         assert!(exact_pick(&bp, Objective::Fpr(0.1)).is_none());
+        assert!(exact_pick(&bp, Objective::F1).is_some());
         // No frame samples at all (small-object scope).
         let bp = Breakpoints::new(&refs, SweepScope::Small);
-        assert!(bp.frames.is_none());
+        assert!(bp.frames.is_none() && bp.per_frame.is_none() && bp.empty.is_none());
         assert!(exact_pick(&bp, Objective::Youden).is_none());
+        assert!(exact_pick(&bp, Objective::RecallAtFa(5.0)).is_none());
     }
 
     #[test]
@@ -1396,41 +1450,42 @@ mod tests {
         }
     }
 
-    fn seg(lo: f32, hi: f32, score: Option<f64>) -> Segment {
-        Segment { lo, hi, score }
-    }
-
     #[test]
-    fn plateau_prefers_the_widest_near_best_range() {
-        // A lone spike (0.80 at (0.30, 0.31]) vs a broad top within 0.002 ((0.40, 0.70]).
-        let s = [
-            seg(0.05, 0.30, Some(0.70)),
-            seg(0.30, 0.31, Some(0.800)),
-            seg(0.31, 0.40, Some(0.70)),
-            seg(0.40, 0.55, Some(0.7985)),
-            seg(0.55, 0.70, Some(0.7990)),
-            seg(0.70, 1.00, Some(0.0)),
-        ];
-        assert_eq!(best_segment(&s), Some(1));
-        assert_eq!(plateau(&s, PLATEAU), Some((3, 4)));
-        // Midpoint 0.55 of (0.40, 0.70].
-        assert_eq!(round_in(&s, 3, 4), 0.55);
+    fn plateau_prefers_the_widest_near_best_run() {
+        let v = |x: &[Option<f64>]| x.to_vec();
+        // A lone spike (0.800 at index 1) vs a broad top within 0.002 (indices 3..=5).
+        let s = v(&[
+            Some(0.70),
+            Some(0.800),
+            Some(0.70),
+            Some(0.7985),
+            Some(0.7990),
+            Some(0.7981),
+            Some(0.0),
+        ]);
+        let r = grid_run(&s, PLATEAU).unwrap();
+        assert_eq!((r.best, r.first, r.last, r.middle()), (1, 3, 5, 4));
         // Without tolerance: the spike only.
-        assert_eq!(plateau(&s, 0.0), Some((1, 1)));
-        // The spike's midpoint 0.305 rounds down to 0.30, out of (0.30, 0.31]: its top, 0.31.
-        assert_eq!(round_in(&s, 1, 1), 0.31);
-        // Equal widths: the higher run; equal scores: the higher segment.
-        let t = [
-            seg(0.05, 0.25, Some(0.5)),
-            seg(0.25, 0.30, Some(0.1)),
-            seg(0.30, 0.50, Some(0.5)),
-        ];
-        assert_eq!(best_segment(&t), Some(2));
-        assert_eq!(plateau(&t, PLATEAU), Some((2, 2)));
-        // The lowest segment includes its lower end; never below the minimum.
-        let u = [seg(0.05, 0.059, Some(1.0)), seg(0.059, 1.0, Some(0.0))];
-        assert_eq!(round_in(&u, 0, 0), 0.05);
-        assert!(plateau(&[seg(0.05, 1.0, None)], PLATEAU).is_none());
+        let r = grid_run(&s, 0.0).unwrap();
+        assert_eq!((r.first, r.last), (1, 1));
+        // Equally wide runs: the higher one; equal scores: the higher value is the best. An
+        // even count takes the lower middle.
+        let t = v(&[Some(0.5), Some(0.5), Some(0.1), Some(0.5), Some(0.5), None]);
+        let r = grid_run(&t, PLATEAU).unwrap();
+        assert_eq!((r.best, r.first, r.last, r.middle()), (4, 3, 4, 3));
+        // A missed target (None) splits runs.
+        let u = v(&[Some(0.9), None, Some(0.9), Some(0.9)]);
+        assert_eq!(
+            grid_run(&u, PLATEAU).map(|r| (r.first, r.last)),
+            Some((2, 3))
+        );
+        assert!(grid_run(&[None, None], PLATEAU).is_none());
+        assert!(grid_run(&[], PLATEAU).is_none());
+        // The grid: 0.05 ..= 1.00 by 0.01, exact literals.
+        let g = grid();
+        assert_eq!(g.len(), 96);
+        assert_eq!((g[0], g[30], g[95]), (0.05, 0.35, 1.0));
+        assert!(g.iter().all(|t| *t == floor_cent(f64::from(*t))));
         assert_eq!(floor_cent(0.35f32 as f64), 0.35);
         assert_eq!(floor_cent(0.3549), 0.35);
         assert_eq!(floor_cent(0.0599), 0.05);
@@ -1466,37 +1521,37 @@ mod tests {
         Breakpoints::new(&[&img], SweepScope::All)
     }
 
-    /// The exact optimum equals brute force over every breakpoint and is at least the grid's;
-    /// the reported threshold is on 0.01, at least 0.05, and its numbers are re-evaluated.
+    /// The pick equals brute force over the 0.01 grid (so it is at least the 0.05 grid's best),
+    /// is the middle of its plateau, at least 0.05, and its numbers are its own.
     #[test]
-    fn exact_pick_matches_brute_force_and_beats_the_grid() {
+    fn exact_pick_matches_brute_force_on_the_grid() {
         for seed in 1..40u64 {
             let bp = random_breakpoints(seed, 30 + seed as usize * 3);
             for o in [
                 Objective::F1,
                 Objective::F2,
+                Objective::F05,
                 Objective::Precision(0.8),
                 Objective::Precision(0.9),
                 Objective::Recall(0.7),
                 Objective::Recall(0.95),
             ] {
-                let brute = bp
-                    .steps
-                    .iter()
-                    .filter_map(|s| o.score(&bp.point_at(s.0)))
+                let score = |t: f32| o.score(&bp.point_at(t));
+                let brute = grid()
+                    .into_iter()
+                    .filter_map(score)
                     .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))));
-                let grid: Vec<ThresholdPoint> =
+                let coarse: Vec<ThresholdPoint> =
                     SWEEP_THRESHOLDS.iter().map(|&t| bp.point_at(t)).collect();
-                let g = pick(&grid, o);
+                let g = pick(&coarse, o);
                 let Some(p) = exact_pick(&bp, o) else {
                     assert!(brute.is_none() && g.is_none(), "seed {seed} {o}");
                     continue;
                 };
                 if !p.met {
-                    // Unreachable, or reachable only between 0.01 steps (BQ-07).
-                    let between = (1..=100)
-                        .all(|k| o.target_met(&bp.point_at(k as f32 / 100.0)) != Some(true));
-                    assert!(brute.is_none() || between, "seed {seed} {o}");
+                    // No grid value meets the target.
+                    assert!(brute.is_none(), "seed {seed} {o}");
+                    assert!(p.note.as_deref().unwrap().contains("not reached"));
                     continue;
                 }
                 let exact = p.exact_score.unwrap();
@@ -1507,55 +1562,45 @@ mod tests {
                         "seed {seed} {o}"
                     );
                 }
-                // Reported: a 0.01 step >= 0.05, its own (re-evaluated) counts, inside or near
-                // the plateau.
                 assert!(p.threshold >= MIN_THRESHOLD);
                 assert!(((p.threshold * 100.0).round() / 100.0 - p.threshold).abs() < 1e-6);
                 assert_eq!(p.point, bp.point_at(p.threshold));
                 let [lo, hi] = p.plateau.unwrap();
-                assert!(lo < hi && lo >= MIN_THRESHOLD && hi <= 1.0);
-                // Every threshold of the plateau scores within PLATEAU of the optimum.
-                for k in 0..20 {
-                    let t = lo + (hi - lo) * (k as f32 + 0.5) / 20.0;
-                    let v = o.score(&bp.point_at(t)).unwrap();
+                assert!(lo <= hi && lo >= MIN_THRESHOLD && hi <= MAX_THRESHOLD);
+                let run: Vec<f32> = grid()
+                    .into_iter()
+                    .filter(|&t| t >= lo - 1e-6 && t <= hi + 1e-6)
+                    .collect();
+                for &t in &run {
+                    let v = score(t).unwrap();
                     assert!(v >= exact - PLATEAU - 1e-9, "seed {seed} {o} t {t}");
                 }
-                if let Objective::Precision(target) = o
-                    && p.point.precision.is_some_and(|v| v < target)
-                {
-                    // Only when no 0.01 step up meets the target.
-                    let up = (1..=100)
-                        .map(|k| k as f32 / 100.0)
-                        .filter(|&t| t > p.threshold)
-                        .any(|t| bp.point_at(t).precision.is_some_and(|v| v >= target));
-                    assert!(!up, "seed {seed} {o}");
-                }
+                assert_eq!(run.get((run.len() - 1) / 2).copied(), Some(p.threshold));
+                // The pick itself is within PLATEAU of the best grid value and meets the target.
+                assert!(score(p.threshold).unwrap() >= exact - PLATEAU - 1e-9);
+                assert!(o.target_met(&p.point).unwrap_or(true));
             }
         }
     }
 
-    /// A precision target met only between two 0.01 steps is not marked met, so it is never
+    /// A precision target met only between two 0.01 steps is unmet on the grid, so it is never
     /// applied (BQ-07). Detections: FP .519, TP .515, FP .512: precision 0.5 holds only for
     /// thresholds in (0.512, 0.515]; 0.51 keeps 1/3, 0.52 and above keep nothing.
     #[test]
     fn target_met_only_between_steps_is_not_applied() {
-        use super::super::metrics::{SweepImage, SweepPred, SweepScope};
+        use super::super::metrics::{SweepImage, SweepScope};
         let mut img = SweepImage::default();
         img.gt.push(("person".into(), false));
         for (c, tp) in [(0.519, false), (0.515, true), (0.512, false)] {
-            img.preds.push(SweepPred {
-                confidence: c,
-                class: "person".into(),
-                tp,
-                small: false,
-            });
+            img.preds.push(sp("person", c, tp));
         }
         let bp = Breakpoints::new(&[&img], SweepScope::All);
         let o = Objective::Precision(0.5);
         let p = exact_pick(&bp, o).unwrap();
-        assert_eq!(p.exact_threshold, Some(0.515));
         assert!(!p.met, "{p:?}");
-        assert!(p.note.as_deref().unwrap().contains("between 0.01 steps"));
+        assert!(p.note.as_deref().unwrap().contains("not reached"), "{p:?}");
+        // The most precise grid value: 0.05 ..= 0.51 all keep 1 of 3.
+        assert_eq!(p.threshold, 0.51);
         assert_eq!(o.target_met(&bp.point_at(p.threshold)), Some(false));
         let mut advice = test_advice(0.5);
         advice.best = Some(p.clone());
@@ -1567,7 +1612,7 @@ mod tests {
 
     #[test]
     fn exact_pick_hand_computed() {
-        use super::super::metrics::{SweepImage, SweepPred, SweepScope};
+        use super::super::metrics::{SweepImage, SweepScope};
         // 4 objects; detections by confidence: TP .92, TP .81, FP .63, TP .47, FP .12.
         let mut img = SweepImage::default();
         for _ in 0..4 {
@@ -1580,29 +1625,29 @@ mod tests {
             (0.47, true),
             (0.12, false),
         ] {
-            img.preds.push(SweepPred {
-                confidence: c,
-                class: "person".into(),
-                tp,
-                small: false,
-            });
+            img.preds.push(sp("person", c, tp));
         }
         let bp = Breakpoints::new(&[&img], SweepScope::All);
         // F1 by kept set: {.92} 2/5=.4, {..81} 4/6=.667, {..63} 4/7=.571, {..47} 6/8=.75,
-        // {..12} 6/9=.667. Best: keep down to .47, i.e. thresholds (0.12, 0.47].
+        // {..12} 6/9=.667. Best: keep down to .47, i.e. grid 0.13 ..= 0.47 (35 values).
         let p = exact_pick(&bp, Objective::F1).unwrap();
         assert_eq!(p.exact_threshold, Some(0.47));
         assert!((p.exact_score.unwrap() - 0.75).abs() < 1e-12);
-        assert_eq!(p.plateau, Some([0.12, 0.47]));
-        // Midpoint 0.295 -> 0.29, same kept set.
-        assert_eq!(p.threshold, 0.29);
+        assert_eq!(p.plateau, Some([0.13, 0.47]));
+        // The 18th of 35 values.
+        assert_eq!(p.threshold, 0.3);
         assert!((p.point.f1.unwrap() - 0.75).abs() < 1e-12);
-        // The grid would say 0.15..0.45 (equal F1), tie -> 0.45.
-        let grid: Vec<ThresholdPoint> = SWEEP_THRESHOLDS.iter().map(|&t| bp.point_at(t)).collect();
-        assert_eq!(pick(&grid, Objective::F1).unwrap().threshold, 0.45);
-        // Precision 1: highest recall is keeping {.92, .81} (R .5): (0.63, 0.81] -> 0.72.
+        // The 0.05 grid would say 0.15..0.45 (equal F1), tie -> 0.45.
+        let coarse: Vec<ThresholdPoint> =
+            SWEEP_THRESHOLDS.iter().map(|&t| bp.point_at(t)).collect();
+        assert_eq!(pick(&coarse, Objective::F1).unwrap().threshold, 0.45);
+        // Precision 1: highest recall is keeping {.92, .81} (R .5): 0.64 ..= 0.81 -> 0.72.
         let p = exact_pick(&bp, Objective::Precision(1.0)).unwrap();
         assert_eq!((p.threshold, p.point.recall), (0.72, Some(0.5)));
+        // F0.5 (precision counts more): {.92, .81} 1.25*2/(1.25*2+.25*2) = .833 beats
+        // {..47} 1.25*3/(3.75+.25+1)=.75.
+        let p = exact_pick(&bp, Objective::F05).unwrap();
+        assert_eq!(p.plateau, Some([0.64, 0.81]));
     }
 
     #[test]
@@ -1668,5 +1713,274 @@ mod tests {
         });
         assert_eq!(a.apply_value_on("openvino:gpu.1"), Some(0.41));
         assert_eq!(a.device_apply_values().len(), 3);
+    }
+
+    /// One detection of the sweep tests.
+    fn sp(class: &str, confidence: f32, tp: bool) -> super::super::metrics::SweepPred {
+        super::super::metrics::SweepPred {
+            confidence,
+            class: class.into(),
+            tp,
+            small: false,
+        }
+    }
+
+    /// B3: the best kept set lies between two 0.01 steps ((0.302, 0.308]: no multiple of 0.01
+    /// inside). The pick is the best value of the 0.01 grid, never a rounded value outside the
+    /// optimum that scores worse.
+    #[test]
+    fn grid_pick_is_the_best_grid_value_when_the_optimum_is_between_steps() {
+        use super::super::metrics::{SweepImage, SweepScope};
+        // 2 objects; TP .9, TP .308, 5 FP at .302.
+        let mut img = SweepImage {
+            gt: vec![("person".into(), false), ("person".into(), false)],
+            preds: vec![sp("person", 0.9, true), sp("person", 0.308, true)],
+            ..SweepImage::default()
+        };
+        img.preds.extend((0..5).map(|_| sp("person", 0.302, false)));
+        let bp = Breakpoints::new(&[&img], SweepScope::All);
+        let p = exact_pick(&bp, Objective::F1).unwrap();
+        let grid_best = (5..=100)
+            .filter_map(|k| bp.point_at(k as f32 / 100.0).f1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        // F1: 2/3 at 0.31 ..= 0.90 (TP .9 only), 4/9 at 0.30 and below.
+        assert!((grid_best - 2.0 / 3.0).abs() < 1e-12);
+        assert!(
+            (p.point.f1.unwrap() - grid_best).abs() < 1e-12,
+            "{} at {}",
+            p.point.f1.unwrap(),
+            p.threshold
+        );
+        // The 60 values 0.31 ..= 0.90 tie: the lower middle one.
+        assert_eq!(p.threshold, 0.60);
+        assert_eq!(p.plateau, Some([0.31, 0.90]));
+    }
+
+    /// F0.5 weighs precision four times as much as recall.
+    #[test]
+    fn f05_counts_precision_twice() {
+        let o: Objective = "f05".parse().unwrap();
+        assert_eq!("F0.5".parse::<Objective>().unwrap(), o);
+        assert_eq!(o.to_string(), "f05");
+        assert_eq!(serde_json::to_string(&o).unwrap(), "\"f05\"");
+        assert_eq!(serde_json::from_str::<Objective>("\"f0.5\"").unwrap(), o);
+        assert!(o.describe().contains("F0.5"), "{}", o.describe());
+        let c = curve();
+        for p in &c {
+            assert_eq!(o.score(p), p.counts.f_beta(0.5), "{}", p.threshold);
+        }
+        // F0.5 by threshold: .3 -> 10/12.5 = .8, .4 -> 8.75/10.5 = .833, .5 -> 7.5/8.5 = .882.
+        assert_eq!(pick(&c, o).unwrap().threshold, 0.5);
+    }
+
+    /// One image of the frame tests: its ground-truth labels and its (label, confidence)
+    /// predictions.
+    type FrameSpec<'a> = (&'a [&'a str], &'a [(&'a str, f32)]);
+
+    /// Images of the frame tests, classes person, car, dog, cat, every one annotated.
+    fn frame_images(spec: &[FrameSpec<'_>]) -> Vec<super::super::metrics::SweepImage> {
+        use super::super::metrics::{EvalImage, GtBox, PredBox, SweepImage};
+        let classes: Vec<String> = ["person", "car", "dog", "cat"].map(String::from).to_vec();
+        spec.iter()
+            .map(|(gt, preds)| {
+                let e = EvalImage {
+                    gt: gt
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| GtBox {
+                            label: l.to_string(),
+                            bbox: [i as f32 * 200.0, 0.0, i as f32 * 200.0 + 100.0, 100.0],
+                            ignore: false,
+                            crowd: false,
+                        })
+                        .collect(),
+                    preds: preds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (l, c))| PredBox {
+                            label: l.to_string(),
+                            confidence: *c,
+                            bbox: [i as f32 * 200.0, 0.0, i as f32 * 200.0 + 100.0, 100.0],
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                SweepImage::of(&e).with_frames(&e, &classes)
+            })
+            .collect()
+    }
+
+    /// Youden and fpr:x use one sample per frame: frames with an object (.8, .5) and five
+    /// without, three of them with a stray car at .6. Pooled (frame, class) samples would count
+    /// 26 negatives (each frame once per class it lacks) and pick a low threshold that alerts
+    /// on 3 of the 5 empty frames.
+    #[test]
+    fn frame_objectives_use_one_sample_per_frame() {
+        use super::super::metrics::{SweepImage, SweepScope};
+        let imgs = frame_images(&[
+            (&["person"], &[("person", 0.8)]),
+            (&["person"], &[("person", 0.5)]),
+            (&[], &[("car", 0.6)]),
+            (&[], &[("car", 0.6)]),
+            (&[], &[("car", 0.6)]),
+            (&[], &[]),
+            (&[], &[]),
+        ]);
+        let refs: Vec<&SweepImage> = imgs.iter().collect();
+        let bp = Breakpoints::new(&refs, SweepScope::All);
+        // J per frame: t <= .5: 1 - 3/5 = .4; (.6, .8]: .5 - 0 = .5 at 0.61 ..= 0.80.
+        let y = exact_pick(&bp, Objective::Youden).unwrap();
+        assert_eq!(y.threshold, 0.70, "{y:?}");
+        // FPR <= .2: no stray car may alert: 0.61 ..= 0.80 (TPR .5).
+        let f = exact_pick(&bp, Objective::Fpr(0.2)).unwrap();
+        assert_eq!(f.threshold, 0.70, "{f:?}");
+        // The rates beside the pick are per frame: 1 of 2 frames with an object, none of 5
+        // without; the pooled (frame, class) rates the ROC chart uses have 26 negatives.
+        let f = y.point.per_frame.unwrap();
+        assert_eq!((f.tp, f.fp, f.positives, f.negatives), (1, 0, 2, 5));
+        assert_eq!(y.point.frame.unwrap().negatives, 26);
+        assert_eq!(y.point.alert_rates(), Some(&f));
+        assert!(frame_rates(&y.point).contains("TPR 50.0% FPR 0.0%"));
+        // Empty frames: 5, three alert at 0.60 and below.
+        let fa = bp.point_at(0.6).false_alerts.unwrap();
+        assert_eq!((fa.empty_frames, fa.alerts), (5, 3));
+        assert_eq!(fa.per_100(), Some(60.0));
+        // An old point (pooled `frame` only) still scores the frame objectives.
+        let old = ThresholdPoint {
+            per_frame: None,
+            ..y.point
+        };
+        assert_eq!(
+            Objective::Youden.score(&old),
+            old.frame.as_ref().and_then(FrameRates::youden)
+        );
+    }
+
+    /// recall_at_fa:N: the highest box recall with at most N false alerts per 100 empty
+    /// frames. Empty frames: no object of a scored class (an ignore region alone keeps a
+    /// frame empty; a detection inside it is no alert).
+    #[test]
+    fn recall_at_false_alerts_per_100_empty_frames() {
+        use super::super::metrics::{EvalImage, GtBox, PredBox, SweepImage, SweepScope};
+        let mut imgs = frame_images(&[
+            (&["person"], &[("person", 0.9)]),
+            (&["person"], &[("person", 0.4)]),
+            (&[], &[("car", 0.6)]),
+            (&[], &[("person", 0.3)]),
+            (&[], &[]),
+        ]);
+        let region = [0.0, 0.0, 100.0, 100.0];
+        let e = EvalImage {
+            gt: vec![GtBox {
+                label: "person".into(),
+                bbox: region,
+                ignore: true,
+                crowd: false,
+            }],
+            preds: vec![PredBox {
+                label: "person".into(),
+                confidence: 0.8,
+                bbox: [1.0, 1.0, 100.0, 100.0],
+            }],
+            ..Default::default()
+        };
+        let classes: Vec<String> = ["person", "car", "dog", "cat"].map(String::from).to_vec();
+        imgs.push(SweepImage::of(&e).with_frames(&e, &classes));
+        let refs: Vec<&SweepImage> = imgs.iter().collect();
+        let bp = Breakpoints::new(&refs, SweepScope::All);
+        // 4 empty frames. <= 25 per 100: one may alert; recall 1 needs t <= .4, where only
+        // the car (.6) alerts above .3: 0.31 ..= 0.40.
+        let o: Objective = "recall_at_fa:25".parse().unwrap();
+        assert_eq!(o.to_string(), "recall_at_fa:25");
+        let p = exact_pick(&bp, o).unwrap();
+        assert!(p.met);
+        assert_eq!(p.threshold, 0.35, "{p:?}");
+        assert_eq!(p.point.recall, Some(1.0));
+        // <= 10 per 100: none may alert: 0.61 ..= 0.90 (recall .5).
+        let p = exact_pick(&bp, "recall_at_fa:10".parse().unwrap()).unwrap();
+        assert_eq!((p.threshold, p.point.recall), (0.75, Some(0.5)));
+        for bad in [
+            "recall_at_fa:0",
+            "recall_at_fa:101",
+            "recall_at_fa:x",
+            "recall_at_fa:",
+        ] {
+            assert!(bad.parse::<Objective>().is_err(), "{bad}");
+        }
+        let p = exact_pick(&bp, o).unwrap();
+        assert_eq!(
+            p.point.false_alerts,
+            Some(super::super::metrics::FalseAlerts {
+                empty_frames: 4,
+                alerts: 1
+            })
+        );
+        assert_eq!(
+            o.describe(),
+            "recall at \u{2264} 25 false alerts per 100 empty frames"
+        );
+        assert!(o.is_alerts() && !o.is_frame());
+        assert_eq!(serde_json::to_string(&o).unwrap(), "\"recall_at_fa:25\"");
+        assert_eq!(
+            "recall_at_fa:2.5".parse::<Objective>().unwrap(),
+            Objective::RecallAtFa(2.5)
+        );
+        // Unreachable (a detection at confidence 1 on an empty frame): the fewest false
+        // alerts (1 of 5 from 0.61 up), then the highest recall (.5 up to 0.90), unmet.
+        let mut loud = imgs.clone();
+        loud.push(frame_images(&[(&[], &[("car", 1.0)])]).remove(0));
+        let refs: Vec<&SweepImage> = loud.iter().collect();
+        let bp = Breakpoints::new(&refs, SweepScope::All);
+        let p = exact_pick(&bp, "recall_at_fa:10".parse().unwrap()).unwrap();
+        assert!(!p.met);
+        assert_eq!((p.threshold, p.point.recall), (0.9, Some(0.5)));
+        assert!(p.note.as_deref().unwrap().contains("not reached"), "{p:?}");
+        // No empty frame: undefined.
+        let busy: Vec<&SweepImage> = imgs.iter().take(2).collect();
+        assert!(exact_pick(&Breakpoints::new(&busy, SweepScope::All), o).is_none());
+    }
+
+    /// B10: a pick fitted on pseudo ground truth (another model's detections) is never
+    /// written into the config.
+    #[test]
+    fn picks_fitted_on_pseudo_labels_are_not_applied() {
+        let mut a = test_advice(0.3);
+        assert_eq!(a.apply_value(), Some(0.3));
+        assert_eq!(a.not_on_labels(), None);
+        a.relative = true;
+        assert_eq!(a.apply_value(), None);
+        assert_eq!(a.not_on_labels(), Some(NOT_ON_LABELS));
+        // A device row's pick from a curve of pseudo ground truth.
+        let curve = |relative: bool| Curve {
+            key: "overall".into(),
+            images: 2,
+            gt: 5,
+            relative,
+            points: a.curve.clone(),
+            configured: a.configured,
+            picks: vec![a.best.clone().unwrap()],
+            exact: vec![],
+            roc_auc: None,
+        };
+        let real = curve(false).best(Objective::F1).unwrap();
+        let pseudo = curve(true).best(Objective::F1).unwrap();
+        assert!(!real.relative && pseudo.relative);
+        let mut b = test_advice(0.3);
+        b.by_device = vec![
+            DevicePick {
+                device: "openvino:cpu".into(),
+                best: Some(real),
+            },
+            DevicePick {
+                device: "ort:coreml".into(),
+                best: Some(pseudo.clone()),
+            },
+        ];
+        assert_eq!(b.apply_value_on("openvino:cpu"), Some(0.3));
+        assert_eq!(b.apply_value_on("ort:coreml"), None);
+        assert_eq!(b.device_apply_values(), [("openvino:cpu".to_string(), 0.3)]);
+        b.best = Some(pseudo);
+        assert_eq!(b.apply_value(), None);
+        assert_eq!(b.not_on_labels(), Some(NOT_ON_LABELS));
     }
 }

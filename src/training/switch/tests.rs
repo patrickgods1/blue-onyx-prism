@@ -551,6 +551,8 @@ fn point(t: f32, precision: f64, recall: f64) -> ThresholdPoint {
         f2: Some(0.5),
         fp_per_image: 0.0,
         frame: None,
+        per_frame: None,
+        false_alerts: None,
     }
 }
 
@@ -564,6 +566,7 @@ fn pick(t: f32, precision: f64, recall: f64) -> Pick {
         exact_threshold: None,
         exact_score: None,
         plateau: None,
+        relative: false,
     }
 }
 

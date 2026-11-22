@@ -60,6 +60,8 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
         by_resolution: Vec::new(),
         accuracy: None,
         accuracy_note: None,
+        reference_for: Vec::new(),
+        preds_capped_images: 0,
         tag_recall: vec![],
         grades: Some(Grades::new(None, p50, Default::default(), false)),
         agreement: None,
@@ -144,6 +146,8 @@ pub(crate) fn with_sweep(
             })
             .collect(),
         frames: vec![],
+        ignored: Vec::new(),
+        frame_classes: Vec::new(),
     };
     let bp = Breakpoints::new(&[&img], SweepScope::All);
     let curve = |key: &str| Curve {

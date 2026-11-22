@@ -232,6 +232,27 @@ pub(super) fn print_search_summary(
             if r.relative { "  (relative)" } else { "" }
         );
     }
+    for r in &out.results {
+        if r.relative && r.best.is_some() {
+            println!(
+                "  {} on {}: not applied, {}",
+                r.model,
+                r.device,
+                crate::benchmark::threshold::NOT_ON_LABELS
+            );
+        }
+        if r.preds_capped_images > 0 {
+            println!(
+                "  {} on {}: {} image(s) had more than {} predictions; only the most confident \
+                 were stored, so below their least confident stored one this search can differ \
+                 from the run",
+                r.model,
+                r.device,
+                r.preds_capped_images,
+                crate::benchmark::search::MAX_STORED_PREDS_PER_IMAGE
+            );
+        }
+    }
 }
 
 /// The threshold table of one searched model (nothing without a best threshold), with the
@@ -240,18 +261,18 @@ pub(super) fn print_search_detail(r: &crate::benchmark::search::SearchResult) {
     let Some(b) = &r.best else { return };
     println!();
     println!(
-        "  {} on {}: best {:.2} (exact optimum {:.3}, near-optimal range {}){}",
+        "  {} on {}: best {:.2} (best 0.01 step {:.2}, near-optimal range {}){}",
         r.model,
         r.device,
         b.threshold,
         b.exact_threshold.unwrap_or(b.threshold),
         b.plateau
-            .map_or("-".into(), |[lo, hi]| format!("{lo:.3}..{hi:.3}")),
+            .map_or("-".into(), |[lo, hi]| format!("{lo:.2}..{hi:.2}")),
         b.note.as_ref().map_or(String::new(), |n| format!("; {n}"))
     );
     println!(
-        "    {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6}",
-        "conf", "P", "R", "F1", "F2", "FP/img", "TPR", "FPR"
+        "    {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6}",
+        "conf", "P", "R", "F1", "F2", "FP/img", "TPR", "FPR", "FA/100"
     );
     let mut extra = vec![r.configured, b.point];
     if let Some(c) = r.current {
@@ -271,15 +292,16 @@ pub(super) fn print_search_detail(r: &crate::benchmark::search::SearchResult) {
             marks.push("in config now");
         }
         println!(
-            "    {:>5.2} {:>6} {:>6} {:>6} {:>6} {:>7.2} {:>6} {:>6}{}",
+            "    {:>5.2} {:>6} {:>6} {:>6} {:>6} {:>7.2} {:>6} {:>6} {:>6}{}",
             p.threshold,
             pct1(p.precision),
             pct1(p.recall),
             pct1(p.f1),
             pct1(p.f2),
             p.fp_per_image,
-            pct1(p.frame.and_then(|f| f.tpr)),
-            pct1(p.frame.and_then(|f| f.fpr)),
+            pct1(p.alert_rates().and_then(|f| f.tpr)),
+            pct1(p.alert_rates().and_then(|f| f.fpr)),
+            fa100(&p),
             if marks.is_empty() {
                 String::new()
             } else {
@@ -314,10 +336,17 @@ pub(super) fn pct1(v: Option<f64>) -> String {
 }
 
 /// "91.0/6.2" (frame TPR / FPR in %), "-" without frame rates.
+/// Frame TPR / FPR over one sample per frame (`ThresholdPoint::alert_rates`).
 pub(super) fn tpr_fpr(p: &crate::benchmark::metrics::ThresholdPoint) -> String {
-    p.frame
-        .as_ref()
+    p.alert_rates()
         .map_or("-".into(), |f| format!("{}/{}", pct1(f.tpr), pct1(f.fpr)))
+}
+
+/// False alerts per 100 empty frames, `-` without empty frames.
+fn fa100(p: &crate::benchmark::metrics::ThresholdPoint) -> String {
+    p.false_alerts
+        .and_then(|f| f.per_100())
+        .map_or("-".into(), |v| format!("{v:.1}"))
 }
 
 /// "person 97.1 (120+/80-), vehicle 93.0 (..)".
@@ -466,9 +495,12 @@ pub(super) fn print_threshold_table(a: &ThresholdAdvice) {
         a.objective().describe(),
         if a.relative { ", relative" } else { "" }
     );
+    if let Some(why) = a.not_on_labels() {
+        println!("    not applied: {why}");
+    }
     println!(
-        "    {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6}",
-        "conf", "P", "R", "F1", "F2", "FP/img", "TPR", "FPR"
+        "    {:>5} {:>6} {:>6} {:>6} {:>6} {:>7} {:>6} {:>6} {:>6}",
+        "conf", "P", "R", "F1", "F2", "FP/img", "TPR", "FPR", "FA/100"
     );
     for p in crate::benchmark::threshold::table_points(&a.curve, &extra) {
         let mut marks = Vec::new();
@@ -479,15 +511,16 @@ pub(super) fn print_threshold_table(a: &ThresholdAdvice) {
             marks.push("configured");
         }
         println!(
-            "    {:>5.2} {:>6} {:>6} {:>6} {:>6} {:>7.2} {:>6} {:>6}{}",
+            "    {:>5.2} {:>6} {:>6} {:>6} {:>6} {:>7.2} {:>6} {:>6} {:>6}{}",
             p.threshold,
             pct1(p.precision),
             pct1(p.recall),
             pct1(p.f1),
             pct1(p.f2),
             p.fp_per_image,
-            pct1(p.frame.and_then(|f| f.tpr)),
-            pct1(p.frame.and_then(|f| f.fpr)),
+            pct1(p.alert_rates().and_then(|f| f.tpr)),
+            pct1(p.alert_rates().and_then(|f| f.fpr)),
+            fa100(&p),
             if marks.is_empty() {
                 String::new()
             } else {
@@ -764,6 +797,13 @@ pub(super) fn print_accuracy_breakdown(p: &RunResult) {
                     if b.relative { "  (relative)" } else { "" }
                 );
             }
+            if !p.reference_for.is_empty() {
+                println!(
+                    "    not scored on {}: their labels are its own detections (the \
+                     pseudo-ground-truth reference)",
+                    p.reference_for.join(", ")
+                );
+            }
         }
         None => {
             if let Some(n) = &p.accuracy_note {
@@ -957,6 +997,8 @@ mod tests {
             by_resolution: Vec::new(),
             accuracy: None,
             accuracy_note: None,
+            reference_for: Vec::new(),
+            preds_capped_images: 0,
             tag_recall: vec![],
             grades: None,
             agreement: None,

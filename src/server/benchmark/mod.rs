@@ -144,6 +144,7 @@ fn objective_options(
     let mut list = vec![
         (Objective::F1, "F1: balance precision and recall"),
         (Objective::F2, "F2: favor recall (fewer missed objects)"),
+        (Objective::F05, "F0.5: favor precision (fewer false alerts)"),
         (
             Objective::Precision(0.8),
             "Precision \u{2265} 80%, highest recall",
@@ -155,6 +156,14 @@ fn objective_options(
         (
             Objective::Precision(0.95),
             "Precision \u{2265} 95%, highest recall",
+        ),
+        (
+            Objective::RecallAtFa(2.0),
+            "\u{2264} 2 false alerts per 100 empty frames, highest recall",
+        ),
+        (
+            Objective::RecallAtFa(5.0),
+            "\u{2264} 5 false alerts per 100 empty frames, highest recall",
         ),
         (
             Objective::Youden,

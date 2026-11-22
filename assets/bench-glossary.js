@@ -80,10 +80,10 @@
     ap50_95: {name: "Box accuracy", term: "AP50-95", better: "higher", meaning: function () { return "AP averaged over overlap requirements from 50% to 95%: also rewards tight, well-placed boxes. Averaged over the same classes as AP50 (at least " + noise.min_class_gt + " labelled objects each)."; }},
     roc_auc: {name: "Alert separation", term: "ROC AUC (frame level)", better: "higher", meaning: "How well a frame's top confidence separates frames with an object from frames without one: 100% is perfect, 50% is chance. This is the alert decision Blue Iris makes."},
     tpr: {name: "Alert rate", term: "TPR (true-positive rate, frame level)", better: "higher", meaning: "Of the frames with an object, the share that would alert at this threshold."},
-    false_alerts: {name: "False alerts", term: "false alerts on empty frames", better: "lower", meaning: "Of the frames with nothing to find, how many would still alert, per 100 frames. A dash means the set has no empty frames."},
-    person_false_alerts: {name: "Person false alerts", term: "false alerts on frames without a person", better: "lower", meaning: "Of the frames with no person in them (parked cars and other objects allowed), the share where the model still reported a person at the confidence threshold. A camera that always sees a parked car has no empty frames, so this is where its false person alerts show."},
+    false_alerts: {name: "False alerts", term: "false alerts on empty frames", better: "lower", meaning: "Of the frames with nothing to find (no object of a class the set labels), how many would still alert, per 100 frames. A dash means the set has no empty frames."},
+    person_false_alerts: {name: "Person false alerts", term: "false alerts on frames without a person", better: "lower", meaning: "Of the frames with no person in them (parked cars and other objects allowed), the share where the model still reported a person at the confidence threshold. A camera that always sees a parked car has no empty frames, so this is where its false person alerts show. Sets that label no persons are left out."},
     class_alerts: {name: "False alerts by class", term: "false alerts per class", better: "lower", meaning: "Per class: the frames without that class (other objects allowed), and how many of them still got a detection of it at the confidence threshold. A frame whose only box of the class is an unsure region is left out."},
-    fpr: {name: "False-alert rate", term: "FPR (false-positive rate, frame level)", better: "lower", meaning: "Of the frames without an object, the share that would still alert at this threshold."},
+    fpr: {name: "False-alert rate", term: "FPR (false-positive rate, frame level)", better: "lower", meaning: "Of the frames without an object, the share that would still alert at this threshold (one sample per frame: its most confident detection of a class the set labels)."},
     youden: {name: "Alert minus false alert", term: "Youden's J", better: "higher", meaning: "Alert rate minus false-alert rate; the threshold that maximizes it separates the two best."},
     p50: {name: "Time per image", term: "p50 (median)", better: "lower", meaning: "The typical time for one image: half of the images took less. Whole request: decode, resize, inference and post-processing."},
     p95: {name: "Slow-image time", term: "p95", better: "lower", meaning: "95 in 100 images took less than this; shows the occasional slow image."},
@@ -94,7 +94,7 @@
     iou: {name: "Box overlap", term: "IoU (intersection over union)", better: null, meaning: "How much a detected box overlaps the real object: 0.5 means the shared area is half of their combined area."},
     fp_per_image: {name: "False detections per image", term: "FP / image", better: "lower", meaning: "Detections that match no real object, per image on average."},
     frame: {name: "Per frame", term: "frame level", better: null, meaning: "Scored per image (does this frame alert?) rather than per object, the way Blue Iris decides whether to alert."},
-    plateau: {name: "Near-optimal range", term: "plateau", better: null, meaning: function () { return "Every confidence in this range scores within " + noise.plateau_points + " points of the best. The value shown is the middle of the widest such range, rounded down to 0.01, so small shifts of the range edges can move it by 0.01."; }},
+    plateau: {name: "Near-optimal range", term: "plateau", better: null, meaning: function () { return "Every confidence in this range scores within " + noise.plateau_points + " points of the best. Every 0.01 step is scored; the value shown is the middle of the widest run of such steps (the lower middle for an even count), so small shifts of the range edges can move it by 0.01."; }},
     objective: {name: "What the confidence optimizes", term: "objective", better: null, meaning: "The score the best confidence threshold maximizes: balance (F1), fewer misses (F2), a precision target (fewer false alerts) or a frame false-alert limit."},
     grade: {name: "Grade", term: "grade A–F", better: "higher", meaning: "A is best, F worst. The overall grade mixes the accuracy and speed grades by the accuracy weight (\"What matters most\")."},
     relative: {name: "Relative grade (*)", term: "relative to a reference model", better: null, meaning: "Scored against a reference model's detections instead of human labels: it shows agreement with that model, not true accuracy."},
@@ -295,6 +295,8 @@
     o = String(o || "f1"); var k = o.split(":")[0], t = parseFloat(o.split(":")[1]);
     if (k === "f1") return "F1: balanced";
     if (k === "f2") return "F2: miss fewer objects";
+    if (k === "f05") return "F0.5: fewer false alerts";
+    if (k === "recall_at_fa") return "most found with \u2264 " + t + " false alerts per 100 empty frames";
     if (k === "precision") return "precision \u2265 " + Math.round(t * 100) + "%: fewer false alerts";
     if (k === "recall") return "recall \u2265 " + Math.round(t * 100) + "%";
     if (k === "fpr") return "false-alert frames \u2264 " + Math.round(t * 100) + "%";

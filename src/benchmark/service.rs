@@ -120,7 +120,8 @@ impl RunRequest {
     /// Parse form fields over the configured defaults: `model`, `device`, `dataset` (repeated:
     /// a given field replaces the default list), `max_images`, `repeat`, `warmup`,
     /// `reference_model` ("" = automatic), `accuracy_weight` (0..1), `threshold_objective`
-    /// (`f1`, `f2`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`), `accuracy_metric`
+    /// (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>`, `youden`,
+    /// `fpr:<x>`), `accuracy_metric`
     /// (`ap50`, `roc_auc`), `low_priority` (the last value wins: the page sends a hidden `0`
     /// followed by the checkbox's `1`).
     pub fn from_form(form: &[(String, String)], defaults: &BenchmarkConfig) -> Result<Self> {
@@ -1125,8 +1126,9 @@ impl ServiceRun<'_> {
                     Ok(_) => {
                         if self.in_run(&job.name) {
                             h.warn(format!(
-                                "{} is also the pseudo-ground-truth reference: its accuracy on \
-                                 the datasets without ground truth is 100% by construction",
+                                "{} is also the pseudo-ground-truth reference: it is not scored \
+                                 on the datasets without ground truth (their labels are its own \
+                                 detections)",
                                 job.name
                             ));
                         }

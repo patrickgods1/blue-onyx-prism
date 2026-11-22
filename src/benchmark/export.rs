@@ -166,13 +166,13 @@ fn pick_cell(p: Option<&Pick>) -> String {
     }
 }
 
-/// Frame TPR or FPR at a point ("-" without frame rates).
+/// Frame TPR or FPR at a point, one sample per frame ("-" without frame rates).
 fn tpr(p: Option<&ThresholdPoint>) -> String {
-    pct(p.and_then(|p| p.frame).and_then(|f| f.tpr))
+    pct(p.and_then(|p| p.alert_rates()).and_then(|f| f.tpr))
 }
 
 fn fpr(p: Option<&ThresholdPoint>) -> String {
-    pct(p.and_then(|p| p.frame).and_then(|f| f.fpr))
+    pct(p.and_then(|p| p.alert_rates()).and_then(|f| f.fpr))
 }
 
 /// "0.35", or "0.35 (running 0.50 until a restart)" while a restart is pending.
@@ -216,7 +216,7 @@ fn threshold_summary(r: &BenchmarkResults) -> Option<Section> {
         heading: "Best confidence threshold".into(),
         level: 2,
         paragraphs: vec![
-            "Per model on its recommended device: precision / recall / F1 (%, IoU 0.5) at the configured threshold and at the best one for the objective. The best threshold is exact (every distinct confidence is evaluated), taken from the middle of the widest range scoring within 0.002 of the optimum and rounded down to 0.01; F2, precision:0.9 and youden show what those objectives would pick. Apply with `benchmark --apply-threshold` or the Benchmark page. The server threshold is what a model reports; Blue Iris may send its own min_confidence per request (it then replaces the server threshold for that request), and each camera's minimum confidence filters the returned objects again."
+            "Per model on its recommended device: precision / recall / F1 (%, IoU 0.5) at the configured threshold and at the best one for the objective. The best threshold is exact on the 0.01 grid (every step from 0.05 is scored), the middle of the widest run of steps scoring within 0.002 of the best one; F2, precision:0.9 and youden show what those objectives would pick (youden over one sample per frame). A pick fitted on pseudo ground truth (another model's detections) is shown, never applied. Apply with `benchmark --apply-threshold` or the Benchmark page. The server threshold is what a model reports; Blue Iris may send its own min_confidence per request (it then replaces the server threshold for that request), and each camera's minimum confidence filters the returned objects again."
                 .into(),
             "Frame level: a frame alerts for a class when its most confident prediction of the class reaches the threshold. ROC AUC is the macro mean over classes of the chance that a frame with the class scores higher than a frame without it (ties count half); TPR is the alert rate on frames with an object, FPR the false-alert rate on frames without one (classes pooled). Computed from the 0.05+ predictions: frames below 0.05 score 0, which can only understate the AUC slightly."
                 .into(),
@@ -350,10 +350,16 @@ fn threshold_tables(a: &ThresholdAdvice, paragraphs: &mut Vec<String>, tables: &
             );
             if let (Some(e), Some([lo, hi])) = (b.exact_threshold, b.plateau) {
                 p.push_str(&format!(
-                    " Exact optimum at {e:.3}; near-optimal range {lo:.3}..{hi:.3}."
+                    " Best 0.01 step {e:.2}; near-optimal range {lo:.2}..{hi:.2}."
                 ));
             }
-            if let (Some(c), Some(f)) = (c.and_then(|c| c.frame), b.point.frame) {
+            if let Some(why) = a.not_on_labels() {
+                p.push_str(&format!(" Not applied: {why}."));
+            }
+            if let (Some(c), Some(f)) = (
+                c.and_then(|c| c.alert_rates().copied()),
+                b.point.alert_rates().copied(),
+            ) {
                 p.push_str(&format!(
                     " Frame TPR / FPR: {} / {} at the best, {} / {} at the configured.",
                     pct(f.tpr),
@@ -1192,6 +1198,7 @@ mod tests {
             exact_threshold: Some(t + 0.004),
             exact_score: Some(0.7),
             plateau: Some([t - 0.05, t + 0.05]),
+            relative: false,
         };
         let mut m = ModelResult::failed("yolo26n", "m.onnx", String::new());
         m.error = None;
@@ -1255,7 +1262,10 @@ mod tests {
         assert!(md.contains("| 0.37 |") && md.contains("| best |"), "{md}");
         assert!(md.contains("| configured |"));
         assert!(!md.contains("| 0.15 |") && md.contains("| 0.80 |"));
-        assert!(md.contains("Exact optimum at 0.374"));
+        assert!(
+            md.contains("Best 0.01 step 0.37; near-optimal range"),
+            "{md}"
+        );
         assert!(md.contains("min_confidence"));
         let h = html(&r);
         assert!(h.contains("<h2>Best confidence threshold</h2>"));

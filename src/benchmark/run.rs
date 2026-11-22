@@ -563,6 +563,10 @@ impl<'a> Bench<'a> {
             .first()
             .map(|r| r.preds.iter().map(Detection::from).collect())
             .unwrap_or_default();
+        let eval_preds: Vec<Vec<PredBox>> = {
+            let map = ClassMap::for_model(&job.classes);
+            timed.eval_preds.iter().map(|v| map.map_preds(v)).collect()
+        };
         Ok(RunResult {
             model: job.name.clone(),
             path: job.path.display().to_string(),
@@ -595,13 +599,12 @@ impl<'a> Bench<'a> {
             by_resolution: timed.by_resolution(),
             accuracy,
             accuracy_note,
+            reference_for: super::scoring::reference_sets(&job.name, &all),
+            preds_capped_images: super::search::capped_images(&eval_preds),
             tag_recall,
             grades: Some(grades),
             agreement: None,
-            eval_preds: {
-                let map = ClassMap::for_model(&job.classes);
-                timed.eval_preds.iter().map(|v| map.map_preds(v)).collect()
-            },
+            eval_preds,
             per_image: timed.per_image,
         })
     }
