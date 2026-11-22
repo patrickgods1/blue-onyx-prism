@@ -18,8 +18,8 @@ use super::goal::{Goal, objective_short};
 use super::pick::{bound, met, score, target, value};
 use super::stats::Estimate;
 use super::tally::sum_all;
+use crate::benchmark::combos::sets::{CompareSet, compare_sets};
 use crate::benchmark::images::GroundTruth;
-use crate::benchmark::lineup::sets::{CompareSet, compare_sets};
 use crate::benchmark::metrics::{ClassMap, EvalImage, canonical_label, image_counts};
 use crate::benchmark::report::BenchmarkResults;
 use crate::benchmark::search::{StoredPreds, StoredRun};
@@ -218,6 +218,8 @@ struct TuneFrame<'a> {
     eval: EvalImage,
     frame_classes: Vec<String>,
     group: String,
+    width: u32,
+    height: u32,
 }
 
 /// The frames of `run` on `cs` in the model's own label space, counted classes only.
@@ -248,6 +250,8 @@ fn frames_of<'a>(
             let mut fc = frame_classes(map, allowed.as_deref());
             fc.retain(|c| classes.contains(c));
             Some(TuneFrame {
+                width: img.info.width,
+                height: img.info.height,
                 set: img.set.id.as_str(),
                 file: img.info.file.as_str(),
                 tags: &img.info.tags,
@@ -523,6 +527,74 @@ pub fn build(
     })
 }
 
+/// One combo's suggested confidence as every "apply all" writes it ([`suggestions`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Suggested {
+    pub model: String,
+    pub device: String,
+    /// The suggestion; None when nothing could be picked (or the view failed: `refusal`).
+    pub threshold: Option<f32>,
+    /// Why it must not be saved (pseudo labels, a target not met on its bound, a flat curve, no
+    /// pick); None = savable.
+    pub refusal: Option<String>,
+    /// Too little data to cross-validate: saved only when asked for (the page confirms first).
+    pub low_confidence: Option<String>,
+    /// The model's recommended device of the saved results.
+    pub recommended: bool,
+}
+
+/// The suggested confidence of every bare combo (no `+served` variant) with stored
+/// predictions, models in result order, devices in stored order, limited to `only` (normalized
+/// names): the Tune view's pick ([`build`] on its default set), the one rule behind the page,
+/// `apply-threshold` / `apply-profiles` `all=1` and the CLI's `--apply-threshold`.
+pub fn suggestions(
+    results: &BenchmarkResults,
+    preds: &StoredPreds,
+    goal: &Goal,
+    weights: crate::benchmark::grade::Weights,
+    only: Option<&[String]>,
+) -> Vec<Suggested> {
+    let mut out = Vec::new();
+    for m in &results.models {
+        let key = normalize_name(&m.model);
+        if crate::benchmark::variant::base_name(&m.model) != m.model
+            || only.is_some_and(|o| !o.iter().any(|x| normalize_name(x) == key))
+        {
+            continue;
+        }
+        for run in preds.runs_of(&m.model) {
+            let recommended = m.recommended.as_deref() == Some(run.device.as_str());
+            let req = Request {
+                model: &m.model,
+                device: Some(&run.device),
+                set: None,
+                goal,
+                weights,
+                saved: None,
+            };
+            out.push(match build(results, preds, req) {
+                Ok(v) => Suggested {
+                    model: m.model.clone(),
+                    device: run.device.clone(),
+                    threshold: v.suggested.as_ref().map(|s| s.threshold),
+                    refusal: v.not_savable.clone(),
+                    low_confidence: v.low_confidence.clone(),
+                    recommended,
+                },
+                Err(e) => Suggested {
+                    model: m.model.clone(),
+                    device: run.device.clone(),
+                    threshold: None,
+                    refusal: Some(format!("not savable: {e:#}")),
+                    low_confidence: None,
+                    recommended,
+                },
+            });
+        }
+    }
+    out
+}
+
 /// Which frames [`images`] lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -530,6 +602,8 @@ pub enum Kind {
     Miss,
     /// Frames with false positives, the most confident one first.
     Fa,
+    /// Every frame, the most errors (missed objects and false positives) first.
+    All,
 }
 
 impl std::str::FromStr for Kind {
@@ -538,7 +612,8 @@ impl std::str::FromStr for Kind {
         match s.trim().to_ascii_lowercase().as_str() {
             "miss" | "misses" | "" => Ok(Kind::Miss),
             "fa" | "false_alerts" | "false-alerts" | "fp" => Ok(Kind::Fa),
-            _ => Err(format!("kind '{s}': use miss or fa")),
+            "all" => Ok(Kind::All),
+            _ => Err(format!("kind '{s}': use miss, fa or all")),
         }
     }
 }
@@ -562,6 +637,13 @@ pub struct FrameBox {
 pub struct ExampleFrame {
     pub set: String,
     pub file: String,
+    /// The image's size in pixels (the boxes' space).
+    pub width: u32,
+    pub height: u32,
+    /// Your cameras: the frame's id in the review folder (`<scene>/<camera>/<date>/<stem>.jpg`,
+    /// for a link into Review).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
     pub camera: Option<String>,
     pub scene: Option<String>,
     pub date: Option<String>,
@@ -582,34 +664,79 @@ pub struct Examples {
     pub set: String,
     pub threshold: f32,
     pub kind: String,
-    /// Frames of the kind (before the limit).
+    /// Frames of the kind and filters (before `offset` and the limit).
     pub total: usize,
+    /// Frames skipped before the first one listed.
+    pub offset: usize,
+    /// The cameras of the set's frames (Your cameras), for a filter.
+    pub cameras: Vec<String>,
     pub frames: Vec<ExampleFrame>,
 }
 
-/// Frames for the Tune strips: at `threshold`, the frames with misses or false positives,
-/// worst first, at most `limit`.
-#[allow(clippy::too_many_arguments)]
+/// What [`images`] lists.
+#[derive(Debug, Clone, Copy)]
+pub struct ImagesRequest<'a> {
+    pub model: &'a str,
+    pub device: Option<&'a str>,
+    pub set: Option<&'a str>,
+    pub goal: &'a Goal,
+    pub threshold: f32,
+    pub kind: Kind,
+    /// Only frames of this camera (`camera:` tag).
+    pub camera: Option<&'a str>,
+    /// Only frames of this scene (`day`, `night`, `ir`).
+    pub scene: Option<&'a str>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+/// Frames for the Tune strips and the Images page: at `threshold`, the frames with misses or
+/// false positives (or every frame), worst first, of one camera and scene when asked, from
+/// `offset`, at most `limit`.
 pub fn images(
     results: &BenchmarkResults,
     preds: &StoredPreds,
-    model: &str,
-    device: Option<&str>,
-    set: Option<&str>,
-    goal: &Goal,
-    threshold: f32,
-    kind: Kind,
-    limit: usize,
+    req: ImagesRequest<'_>,
 ) -> Result<Examples> {
+    let ImagesRequest {
+        model,
+        device,
+        set,
+        goal,
+        threshold,
+        kind,
+        camera,
+        scene,
+        offset,
+        limit,
+    } = req;
     let p = prepare(results, preds, model, device, set, goal)?;
     let tag = |tags: &[String], prefix: &str| {
         tags.iter()
             .find_map(|t| t.strip_prefix(prefix))
             .map(str::to_string)
     };
+    let scene_of = |f: &TuneFrame<'_>| {
+        f.scene.map(|s| s.as_str().to_string()).or_else(|| {
+            ["day", "night", "ir"]
+                .iter()
+                .find(|s| f.tags.iter().any(|t| t == *s))
+                .map(|s| (*s).to_string())
+        })
+    };
+    let mut cameras: Vec<String> = p
+        .frames
+        .iter()
+        .filter_map(|f| tag(f.tags, "camera:"))
+        .collect();
+    cameras.sort();
+    cameras.dedup();
+    let cameras_set = p.set.id == crate::benchmark::cameras::ID;
     let mut frames: Vec<ExampleFrame> = p
         .frames
         .iter()
+        .filter(|f| camera.is_none_or(|c| tag(f.tags, "camera:").as_deref() == Some(c)))
+        .filter(|f| scene.is_none_or(|s| scene_of(f).as_deref() == Some(s)))
         .filter_map(|f| {
             let (c, kept, m) = image_counts(&f.eval, threshold);
             let top_false = kept
@@ -621,17 +748,19 @@ pub fn images(
             let wanted = match kind {
                 Kind::Miss => c.fn_ > 0,
                 Kind::Fa => c.fp > 0,
+                Kind::All => true,
             };
             wanted.then(|| ExampleFrame {
                 set: f.set.to_string(),
                 file: f.file.to_string(),
+                width: f.width,
+                height: f.height,
+                review: cameras_set
+                    .then(|| crate::collect::labels::export::parse_flat_name(f.file))
+                    .flatten()
+                    .map(|rel| rel.jpg()),
                 camera: tag(f.tags, "camera:"),
-                scene: f.scene.map(|s| s.as_str().to_string()).or_else(|| {
-                    ["day", "night", "ir"]
-                        .iter()
-                        .find(|s| f.tags.iter().any(|t| t == *s))
-                        .map(|s| (*s).to_string())
-                }),
+                scene: scene_of(f),
                 date: tag(f.tags, "date:"),
                 missed: c.fn_,
                 false_positives: c.fp,
@@ -671,9 +800,14 @@ pub fn images(
                 .total_cmp(&a.top_false.unwrap_or(0.0))
                 .then(a.file.cmp(&b.file))
         }),
+        Kind::All => frames.sort_by(|a, b| {
+            (b.missed + b.false_positives)
+                .cmp(&(a.missed + a.false_positives))
+                .then(a.file.cmp(&b.file))
+        }),
     }
     let total = frames.len();
-    frames.truncate(limit);
+    let frames: Vec<ExampleFrame> = frames.into_iter().skip(offset).take(limit).collect();
     Ok(Examples {
         model: p.run.model.clone(),
         device: p.run.device.clone(),
@@ -682,9 +816,12 @@ pub fn images(
         kind: match kind {
             Kind::Miss => "miss",
             Kind::Fa => "fa",
+            Kind::All => "all",
         }
         .to_string(),
         total,
+        offset,
+        cameras,
         frames,
     })
 }

@@ -1,15 +1,16 @@
 //! Polling `GET /v1/benchmark` cheaply ([`answer`]).
 //!
 //! The answer is two parts: the run (state, progress, this run's models), which changes every
-//! second during a run, and the rest (saved results, lineup, profiles, config view), which
+//! second during a run, and the rest (saved results, ranking, config view, goal), which
 //! changes when a model's results are saved or the config, a worker or the saved files change.
 //! The rest has a tag (`viewTag`): the [`super::SAVED_CACHE`] key (the files' stamps, the config
 //! revision and what it says about each model), the registry generation and the config epoch,
-//! and the bytes of the small parts built per request (config view, profiles, goal). So a tag
+//! and the bytes of the small parts built per request (config view, goal). So a tag
 //! that matches means the same bytes, never a stale view the cache would not also serve.
 //!
-//! - `GET /v1/benchmark?only=run`: `{success, state, running, run, viewTag}`, what the page
-//!   polls during a run; it fetches the full answer when `viewTag` changes or the run ends.
+//! - `GET /v1/benchmark?only=run`: `{success, state, running, run, viewTag, modelsTag,
+//!   labelsChanged}`, what the Benchmark pages poll (the run's per-combo states, the shell's
+//!   Re-score banner); a page reloads its own view when `viewTag` changes or the run ends.
 //! - `GET /v1/benchmark`: the full answer, unchanged, with `ETag: W/"<viewTag>-<run hash>"`
 //!   (`If-None-Match` that matches = 304, no body) and `X-Benchmark-View: <viewTag>`.
 //!
@@ -17,8 +18,8 @@
 //! re-serializes them; the body is serialized here, inside `blocking`.
 
 use super::{
-    AppState, LIVE_WARNING, config_view, configured_device, devices_snapshot, loaded_devices,
-    models_now, profiles, raw, results_path, saved_view,
+    AppState, LIVE_WARNING, config_view, devices_snapshot, models_now, raw, results_path,
+    saved_view,
 };
 use crate::benchmark::service::{RunState, Status};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -143,7 +144,6 @@ struct Views {
     tag: String,
     saved: std::sync::Arc<super::SavedView>,
     config: Box<RawValue>,
-    profiles: Box<RawValue>,
     goal: Box<RawValue>,
     /// Your cameras' labels since the snapshot ([`super::cameras::labels_changed`]).
     labels_changed: std::sync::Arc<RawValue>,
@@ -159,21 +159,13 @@ fn views(state: &AppState) -> Views {
     let (revision, cfg) = state.config.snapshot();
     let now = models_now(state, &cfg, &snap);
     let saved = saved_view(state, revision, &now);
-    let loaded = loaded_devices(state);
-    let profile_rows = raw(&profiles::profiles(
-        &saved.facts,
-        &cfg,
-        &|name| loaded.get(&crate::registry::normalize_name(name)).cloned(),
-        &|m| configured_device(&cfg, m, &snap.model_selection(state, &cfg, m)),
-    ));
     let other_hardware = saved
         .hardware
         .as_ref()
         .is_some_and(|h| !h.same_gpus(&snap.hardware));
-    let goal = raw(&serde_json::json!({
-        "label": profiles::goal_label(&cfg.benchmark),
-        "objective": cfg.benchmark.threshold_objective.to_string(),
-    }));
+    let goal = raw(&crate::benchmark::eval::compare::GoalView::of(
+        &cfg.benchmark.goal,
+    ));
     let results_file = results_path(&state.config_path).display().to_string();
     let labels_changed = super::cameras::labels_changed(state, &cfg);
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -182,7 +174,6 @@ fn views(state: &AppState) -> Views {
         state.config.generation(),
         state.config.epoch(),
         config.get(),
-        profile_rows.get(),
         goal.get(),
         labels_changed.get(),
         other_hardware,
@@ -193,7 +184,6 @@ fn views(state: &AppState) -> Views {
         tag: format!("{revision}.{:016x}", h.finish()),
         saved,
         config,
-        profiles: profile_rows,
         goal,
         labels_changed,
         other_hardware,
@@ -214,6 +204,10 @@ struct RunAnswer<'a> {
     /// The tag of `run.models` (sent back as `models=`).
     #[serde(rename = "modelsTag")]
     models_tag: &'a str,
+    /// Your cameras' labels since the run's snapshot (as in the full answer): the pages' Re-score
+    /// banner.
+    #[serde(rename = "labelsChanged")]
+    labels_changed: &'a RawValue,
 }
 
 /// The full `GET /v1/benchmark`, fields in the order `json!` gave them (sorted), so the bytes
@@ -225,12 +219,9 @@ struct FullAnswer<'a> {
     #[serde(rename = "labelsChanged")]
     labels_changed: &'a RawValue,
     latest_run_id: &'a Option<String>,
-    lineup: &'a RawValue,
-    noise: serde_json::Value,
     #[serde(rename = "otherHardware")]
     other_hardware: bool,
     points: &'a RawValue,
-    profiles: &'a RawValue,
     ranking: &'a RawValue,
     results: &'a RawValue,
     #[serde(rename = "resultsFile")]
@@ -290,6 +281,7 @@ pub(super) fn answer(
             run: run_view(&run, (!same).then_some(&*models)),
             view_tag: &v.tag,
             models_tag: &models_tag,
+            labels_changed: &v.labels_changed,
         }));
     }
     let run_view = run_view(&run, Some(&models));
@@ -312,11 +304,8 @@ pub(super) fn answer(
             goal: &v.goal,
             labels_changed: &v.labels_changed,
             latest_run_id: &saved.latest_run_id,
-            lineup: &saved.lineup,
-            noise: crate::benchmark::history::view::noise_json(),
             other_hardware: v.other_hardware,
             points: &saved.points,
-            profiles: &v.profiles,
             ranking: &saved.ranking,
             results: &saved.results,
             results_file: &v.results_file,
@@ -558,11 +547,8 @@ mod tests {
                     "goal",
                     "labelsChanged",
                     "latest_run_id",
-                    "lineup",
-                    "noise",
                     "otherHardware",
                     "points",
-                    "profiles",
                     "ranking",
                     "results",
                     "resultsFile",
@@ -588,7 +574,7 @@ mod tests {
         for k in ["results", "ranking", "points", "latest_run_id"] {
             assert_eq!(v[k], serde_json::Value::Null, "{k}");
         }
-        assert_eq!(v["lineup"]["sets"], serde_json::json!([]));
+        assert_eq!(v["goal"]["optimizeFor"], "f1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -624,7 +610,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            ["modelsTag", "run", "running", "state", "success", "viewTag"]
+            [
+                "labelsChanged",
+                "modelsTag",
+                "run",
+                "running",
+                "state",
+                "success",
+                "viewTag"
+            ]
         );
         assert_eq!(small["viewTag"], tag.as_str());
         assert_eq!(small["state"], "running");
@@ -712,7 +706,7 @@ mod tests {
     }
 
     /// The view tag follows the saved view alone: results saved again with only their time
-    /// changed (profiles, config and goal the same) give a new tag and the new time; nothing
+    /// changed (config and goal the same) give a new tag and the new time; nothing
     /// changed, the same tag.
     #[tokio::test]
     async fn the_view_tag_follows_the_saved_results_alone() {
@@ -736,7 +730,7 @@ mod tests {
         results.save(&path).unwrap();
         let (tag2, v2) = full(st.clone()).await;
         assert_eq!(v2["results"]["timestamp"], "2026-11-02T10:00:00.123456Z");
-        for k in ["config", "profiles", "goal", "otherHardware"] {
+        for k in ["config", "goal", "otherHardware"] {
             assert_eq!(v2[k], v[k], "{k} is the same");
         }
         assert_ne!(tag2, tag, "the saved view changed");
@@ -831,12 +825,12 @@ mod tests {
         ok
     }
 
-    /// `BenchPoll` of `assets/benchmark.js` (loaded without a DOM): each case's `step(last, s)`
+    /// `BenchPoll` of `assets/bench-core.js` (loaded without a DOM): each case's `step(last, s)`
     /// and `runUri(tag)`.
     const STEP_DRIVER: &str = r#"
 const fs = require('fs'), vm = require('vm');
 const ctx = vm.createContext({});
-vm.runInContext(fs.readFileSync(process.env.BOP_BENCHMARK_JS, 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(process.env.BOP_BENCH_CORE_JS, 'utf8'), ctx);
 const P = ctx.BenchPoll;
 const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
 process.stdout.write(JSON.stringify({
@@ -847,10 +841,10 @@ process.stdout.write(JSON.stringify({
 
     fn node_steps(cases: &serde_json::Value) -> serde_json::Value {
         use std::io::Write;
-        let js = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/benchmark.js");
+        let js = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bench-core.js");
         let mut child = std::process::Command::new("node")
             .args(["-e", STEP_DRIVER])
-            .env("BOP_BENCHMARK_JS", js)
+            .env("BOP_BENCH_CORE_JS", js)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -871,121 +865,77 @@ process.stdout.write(JSON.stringify({
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    /// The page's decision per run poll: merge the run into what it shows, or fetch the full
-    /// answer (another view, the run ended, models it cannot fill in), or show an old server's
-    /// full answer as it is.
+    /// The pages' reading of a run poll: the run with its models (sent, or the page's own when
+    /// left out under the tag it sent), ask again without the tag when it does not match, the
+    /// view changed (reload it), a run that ended or started, and anything else is an error.
     #[test]
-    fn the_page_fetches_the_full_answer_only_when_it_must() {
+    fn the_pages_read_each_run_poll() {
         use serde_json::json;
         if !have_node() {
             return;
         }
-        let shown = json!({
-            "state": "running", "running": true, "results": {"models": [{"model": "a"}]},
-            "run": {"progress": {"percent": 10}, "models": [{"model": "a", "x": 1}]},
-        });
-        let last = |tag: Option<&str>, models: Option<&str>| json!({"status": shown, "viewTag": tag, "modelsTag": models});
-        let answer = |view: &str, running: bool, models: Option<serde_json::Value>| {
+        let models = json!([{"model": "a", "devices": []}]);
+        let last = |view: Option<&str>, tag: Option<&str>, running: bool| json!({"viewTag": view, "modelsTag": tag, "models": models, "running": running});
+        let answer = |view: &str, running: bool, m: Option<serde_json::Value>| {
             let mut run = json!({"progress": {"percent": 20}});
-            if let Some(m) = models {
+            if let Some(m) = m {
                 run["models"] = m;
             }
             json!({"success": true, "state": if running { "running" } else { "done" },
-                   "running": running, "run": run, "viewTag": view, "modelsTag": "m2"})
+                   "running": running, "run": run, "viewTag": view, "modelsTag": "m2",
+                   "labelsChanged": {"frames": 3, "changed": 3, "left": 0, "joined": 0}})
         };
-        let merged = |models: serde_json::Value, tag: &str| {
-            let mut s = shown.clone();
-            s["run"] = json!({"progress": {"percent": 20}, "models": models});
-            json!({"status": s, "modelsTag": tag})
-        };
-        let full = json!({"full": true});
-        let new_models = json!([{"model": "a", "x": 2}]);
-        let cases: Vec<(
-            &str,
-            serde_json::Value,
-            serde_json::Value,
-            serde_json::Value,
-        )> = vec![
-            (
-                "same view, models sent: merged",
-                last(Some("v1"), None),
-                answer("v1", true, Some(new_models.clone())),
-                merged(new_models.clone(), "m2"),
-            ),
-            (
-                "same view, models left out: the page's own",
-                last(Some("v1"), Some("m2")),
-                answer("v1", true, None),
-                merged(shown["run"]["models"].clone(), "m2"),
-            ),
-            (
-                "models left out under another tag: full",
-                last(Some("v1"), Some("m1")),
-                answer("v1", true, None),
-                full.clone(),
-            ),
-            (
-                "models left out, the page has no tag: full",
-                last(Some("v1"), None),
-                answer("v1", true, None),
-                full.clone(),
-            ),
-            (
-                "another view: full",
-                last(Some("v1"), Some("m2")),
-                answer("v2", true, None),
-                full.clone(),
-            ),
-            (
-                "the run ended: full",
-                last(Some("v1"), None),
-                answer("v1", false, Some(json!([]))),
-                full.clone(),
-            ),
-            (
-                "no view tag yet: full",
-                last(None, None),
-                answer("v1", true, Some(json!([]))),
-                full.clone(),
-            ),
-            (
-                "nothing shown yet: full",
-                json!({"status": null, "viewTag": "v1"}),
-                answer("v1", true, Some(json!([]))),
-                full.clone(),
-            ),
-            (
-                "an old server answers the full status",
-                last(Some("v1"), None),
-                json!({"success": true, "running": true, "run": {}, "results": null}),
-                json!({"old": true}),
-            ),
-            (
-                "not JSON: full",
-                last(Some("v1"), None),
-                json!(null),
-                full.clone(),
-            ),
-        ];
-        // A run that starts while the page shows an idle answer merges (no full answer).
-        let mut idle = last(Some("v1"), None);
-        idle["status"]["running"] = json!(false);
-        idle["status"]["state"] = json!("idle");
-        let started = answer("v1", true, Some(json!([])));
+        let fresh = json!([{"model": "b", "devices": []}]);
         let out = node_steps(&json!({
-            "steps": cases.iter().map(|c| json!({"last": c.1, "answer": c.2}))
-                .chain([json!({"last": idle, "answer": started})]).collect::<Vec<_>>(),
+            "steps": [
+                {"last": null, "answer": answer("v1", true, Some(fresh.clone()))},
+                {"last": last(Some("v1"), Some("m2"), true), "answer": answer("v1", true, None)},
+                {"last": last(Some("v1"), Some("m1"), true), "answer": answer("v1", true, None)},
+                {"last": null, "answer": answer("v1", true, None)},
+                {"last": last(Some("v1"), Some("m2"), true), "answer": answer("v2", true, Some(fresh.clone()))},
+                {"last": last(Some("v1"), Some("m2"), true), "answer": answer("v1", false, Some(json!([])))},
+                {"last": last(Some("v1"), Some("m2"), false), "answer": answer("v1", true, Some(json!([])))},
+                {"last": null, "answer": null},
+                {"last": null, "answer": {"success": false, "message": "x"}},
+                {"last": null, "answer": {"success": true, "running": true, "run": {}, "results": null}},
+            ],
             "uris": [null, "", "ab12", "a&b"],
         }));
-        for (i, (name, _, _, want)) in cases.iter().enumerate() {
-            assert_eq!(&out["steps"][i], want, "{name}");
-        }
-        let s = &out["steps"][cases.len()]["status"];
+        let st = &out["steps"];
+        let first = &st[0];
+        assert_eq!(first["models"], fresh);
+        assert_eq!(first["run"]["models"], fresh);
+        assert_eq!(first["run"]["progress"]["percent"], 20);
         assert_eq!(
-            (&s["running"], &s["state"]),
-            (&json!(true), &json!("running"))
+            (&first["running"], &first["viewTag"], &first["modelsTag"]),
+            (&json!(true), &json!("v1"), &json!("m2"))
         );
-        assert_eq!(s["results"], shown["results"], "the rest kept");
+        assert_eq!(
+            (&first["viewChanged"], &first["ended"], &first["started"]),
+            (&json!(false), &json!(false), &json!(false)),
+            "a first poll changes nothing"
+        );
+        assert_eq!(first["labelsChanged"]["frames"], 3);
+        assert_eq!(st[1]["models"], models, "left out: the page's own");
+        assert_eq!(
+            st[2],
+            json!({"refetch": true}),
+            "left out under another tag"
+        );
+        assert_eq!(
+            st[3],
+            json!({"refetch": true}),
+            "left out, the page has none"
+        );
+        assert_eq!(st[4]["viewChanged"], true);
+        assert_eq!(
+            (&st[5]["ended"], &st[5]["running"]),
+            (&json!(true), &json!(false))
+        );
+        assert_eq!(st[6]["started"], true);
+        for i in 7..10 {
+            assert_eq!(st[i], json!({"error": true}), "case {i}");
+        }
         assert_eq!(
             out["uris"],
             json!([
@@ -995,18 +945,25 @@ process.stdout.write(JSON.stringify({
                 "/v1/benchmark?only=run&models=a%26b"
             ])
         );
-        // The page polls through these, PrismPoll's loop, and the full answer with its ETag.
-        let js = crate::server::pages::static_file("benchmark.js").expect("benchmark.js");
+        // The shell polls through these and PrismPoll's chained loops, never an interval.
+        let js = crate::server::pages::static_file("bench-shell.js").expect("bench-shell.js");
         for needle in [
-            "BP.runUri(polled.modelsTag)",
-            "BP.step(polled, s)",
-            "PrismPoll.create({run: pollRun",
-            "\"If-None-Match\": etag",
-            "X-Benchmark-View",
+            "BenchPoll.runUri(",
+            "BenchPoll.step(polled, s)",
+            "PrismPoll.create({run: pollOnce",
+            "PrismPoll.fetch(uri",
         ] {
             assert!(js.contains(needle), "{needle}");
         }
-        assert!(!js.contains("setInterval"), "chained timeouts only");
+        for (name, _, _) in crate::server::pages::STATIC_FILES {
+            if name.starts_with("bench-") {
+                let body = crate::server::pages::static_file(name).unwrap();
+                assert!(
+                    !body.contains("setInterval"),
+                    "{name}: chained timeouts only"
+                );
+            }
+        }
     }
 
     /// Bytes and build time per poll on the saved results in `BOP_BENCH_FIXTURE` (a folder

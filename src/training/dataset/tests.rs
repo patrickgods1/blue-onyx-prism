@@ -4264,7 +4264,7 @@ fn a_jpeg_without_its_end_marker_is_copied_never_linked() {
     );
 }
 
-/// `BenchTags.cellTag` of `assets/benchmark.js` (the Benchmark page's By tag table) says what
+/// `BenchTags.cellTag` of `assets/bench-core.js` (the tag lists of the Benchmark pages) says what
 /// [`is_cell_tag`] says. Needs `node`: without it this says so and passes, unless
 /// `BOP_REQUIRE_NODE=1` (CI).
 #[test]
@@ -4300,14 +4300,14 @@ fn the_page_hides_the_same_tags_as_is_cell_tag() {
     const DRIVER: &str = r#"
 const fs = require('fs'), vm = require('vm');
 const ctx = vm.createContext({});
-vm.runInContext(fs.readFileSync(process.env.BOP_BENCHMARK_JS, 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(process.env.BOP_BENCH_CORE_JS, 'utf8'), ctx);
 const tags = JSON.parse(process.env.BOP_TAGS);
 process.stdout.write(JSON.stringify(tags.map((t) => ctx.BenchTags.cellTag(t))));
 "#;
-    let js = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/benchmark.js");
+    let js = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/bench-core.js");
     let out = std::process::Command::new("node")
         .args(["-e", DRIVER])
-        .env("BOP_BENCHMARK_JS", js)
+        .env("BOP_BENCH_CORE_JS", js)
         .env("BOP_TAGS", serde_json::to_string(&tags).unwrap())
         .output()
         .unwrap();

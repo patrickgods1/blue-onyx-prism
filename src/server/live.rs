@@ -596,7 +596,7 @@ fn build_payload(state: &AppState, inputs: &Inputs) -> Value {
                         "objective": f.objective,
                         "thresholdInUse": best_here.is_some_and(|t| thr(t) == effective),
                         "byDevice": f.devices,
-                        "href": format!("/benchmark#m-{}", super::encode_uri_component(&f.model)),
+                        "href": format!("/benchmark/tune?model={}", super::encode_uri_component(&f.model)),
                     })
                 }),
             })

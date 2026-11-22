@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Benchmark: Tune and save{% endblock %}
+{% block content %}
+<div class="bench" id="bench" data-step="tune" data-has-results="{{ shell.has_results }}">
+{% include "benchmark/shell.html" %}
+<section aria-labelledby="h-tune">
+  <h2 id="h-tune" class="sr-only">Tune and save</h2>
+  <div id="tune-body"{% if !shell.has_results %} hidden{% endif %}>
+    <div class="bn-row">
+      <label for="t-model">Model <select id="t-model"><option value="">Loading&hellip;</option></select></label>
+      <label for="t-device">on <select id="t-device"></select></label>
+      <label for="t-set">Images <select id="t-set"></select></label>
+    </div>
+    <p class="bn-error" id="t-error" role="alert" hidden></p>
+    <div class="bn-grid2">
+      <div class="card">
+        <div class="bn-chart-box" id="t-chart"><span class="bn-skel tall"></span></div>
+        <ul class="bn-legend" id="t-legend"></ul>
+        <div class="bn-slider">
+          <label for="t-slider" class="muted">Confidence</label>
+          <input type="range" id="t-slider" min="5" max="99" step="1" value="50" aria-describedby="t-out">
+          <output id="t-out" for="t-slider">-</output>
+          <button type="button" class="small secondary" id="t-reset">Back to suggested</button>
+        </div>
+        <details class="small" id="t-table-d"><summary>Show as table</summary><div class="scroll" id="t-table"></div></details>
+      </div>
+      <div class="card bn-side-card" id="t-side" aria-live="polite"><span class="bn-skel"></span><span class="bn-skel"></span><span class="bn-skel"></span></div>
+    </div>
+    <div class="bn-grid2">
+      <div class="card bn-examples" id="t-examples"><h3>What you would miss and what would alert</h3><span class="bn-skel tall"></span></div>
+      <div class="card primary bn-save" id="t-save"></div>
+    </div>
+    <h2>All models and devices</h2>
+    <p class="muted">The saved confidence follows the device a model actually runs on. Pick that device under <strong>Run on</strong>.</p>
+    <div class="scroll"><table class="bn-table rcards" id="t-all" data-sort="bench-tune-all"><tbody><tr><td><span class="bn-skel"></span></td></tr></tbody></table></div>
+    <div class="actions">
+      <button type="button" id="t-save-all">Save all suggested and use chosen devices</button>
+      <button type="button" class="secondary" id="t-save-conf">Save confidences only</button>
+    </div>
+    <div class="bn-confirm" id="t-all-confirm" role="alertdialog" aria-labelledby="t-all-confirm-text" hidden><p id="t-all-confirm-text"></p><div class="actions"><button type="button" id="t-all-yes">Save them too</button><button type="button" class="secondary" id="t-all-skip">Save without them</button><button type="button" class="secondary" id="t-all-no">Cancel</button></div></div>
+    <div class="bn-result" id="t-result" role="status" aria-live="polite"></div>
+    <p class="muted small">In Blue Iris, set each camera's minimum confidence at or below its model's saved confidence, or Blue Iris drops detections this server already reports. {{ blue_iris_note }}</p>
+  </div>
+  <div id="tune-empty" class="bn-empty"{% if shell.has_results %} hidden{% endif %}>
+    <p><strong>Nothing to tune yet.</strong></p>
+    <p>Run a benchmark, then come back to set the confidence of each model on each device.</p>
+    <p><a class="btn" href="/benchmark/run">Go to Run</a></p>
+  </div>
+</section>
+{% include "benchmark/image_dialog.html" %}
+</div>
+<script src="/static/bench-core.js?v={{ version }}"></script>
+<script src="/static/bench-charts.js?v={{ version }}"></script>
+<script src="/static/bench-shell.js?v={{ version }}"></script>
+<script src="/static/bench-frames.js?v={{ version }}"></script>
+<script src="/static/bench-tune.js?v={{ version }}"></script>
+{% endblock %}

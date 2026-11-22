@@ -29,6 +29,7 @@
 
 pub mod cameras;
 pub mod cli;
+pub mod combos;
 pub mod current;
 pub mod eval;
 pub mod export;
@@ -36,7 +37,6 @@ pub mod forget;
 pub mod grade;
 pub mod history;
 pub mod images;
-pub mod lineup;
 pub mod metrics;
 pub mod report;
 pub mod rescore;
@@ -363,7 +363,7 @@ impl AccuracyReport {
     /// The tag breakdowns a tag table shows: every one but the held-out set's per-camera tags
     /// (`heldout:cam:` / `heldout:camscene:`, [`crate::training::dataset::is_cell_tag`]), which
     /// repeat the `camera:` rows and only feed the training run's recall cells. Twin:
-    /// `BenchTags.cellTag` in `assets/benchmark.js`.
+    /// `BenchTags.cellTag` in `assets/bench-core.js`.
     pub fn shown_tags(&self) -> Vec<&Breakdown> {
         self.by_tag
             .iter()

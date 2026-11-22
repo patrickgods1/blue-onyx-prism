@@ -2,7 +2,7 @@
   <h2>Use a trained model</h2>
   {% include "revert.html" %}
   {% if results.is_empty() %}<p class="muted">No trained model yet: finished runs from the <a href="/train/train">Train</a> tab show here, with their held-out benchmark.</p>{% else %}
-  <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark#tab-compare">Benchmark</a> page.</p>
+  <p class="muted">The full results (per device, per class, history) are on the <a href="/benchmark/compare">Benchmark</a> page.</p>
   <p class="muted small">Grouped by held-out set: runs scored on the same held-out frames with the same classes and merges, newest group first. Scores compare only inside a group; each group lists its best run first (person recall, then vehicle recall, then AP50-95).</p>
   <div class="scroll">
   <table class="rcards tr-results" data-sort="results" data-sort-default="best" data-sort-cols=",,,,,,,,-">

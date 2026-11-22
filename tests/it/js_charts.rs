@@ -1,7 +1,7 @@
 //! Charts and hover on a touch screen: `assets/bench-charts.js` (the line charts' readout on a
 //! tap, kept until a tap elsewhere or Esc, a sideways finger drag that scrubs it, an up-down one
-//! that leaves nothing behind, the ROC dots above the hit rect with their text on a tap, the
-//! narrower viewBox of a phone, the scatter's bigger rings for a finger) and `assets/live.js`
+//! that leaves nothing behind, a line chart's dots above the hit rect with their text on a tap,
+//! the narrower viewBox of a phone, the scatter's bigger rings for a finger) and `assets/live.js`
 //! `PrismPointer` (a mouse over a chart defers a re-render of its section, a finger never does: iOS
 //! keeps `:hover` set after a tap, which froze the section), run in `node` with a stub DOM.
 //!
@@ -191,7 +191,7 @@ const DOTS_AND_SIZES: &str = r#"
   assert.deepStrictEqual(f(560, 290, NaN), [560, 290]);
   assert.deepStrictEqual(f(560, 290, 350), [350, 209], 'as wide as it shows, a bit taller than to scale');
   assert.deepStrictEqual(f(620, 340, 350), [350, 245]);
-  assert.deepStrictEqual(f(330, 300, 290), [290, 264], 'the ROC in a phone card');
+  assert.deepStrictEqual(f(330, 300, 290), [290, 264], 'a small chart in a phone card');
   assert.deepStrictEqual(f(320, 210, 311), [311, 204], 'the training chart in a phone card');
   assert.deepStrictEqual(f(330, 300, 340), [330, 300], 'never wider than asked');
   assert.deepStrictEqual(f(560, 290, 200), [240, 209], 'at least 240');
@@ -211,7 +211,7 @@ const DOTS_AND_SIZES: &str = r#"
   const {C} = load(390, true);
   assert.strictEqual(chart(C).svg.attrs.viewBox, '0 0 290 209');
 }
-{ // ROC dots: painted after the hit rect (their <title> gets the mouse), the readout on top of
+{ // Dots: painted after the hit rect (their <title> gets the mouse), the readout on top of
   // them; a tap on one shows its text and keeps it; a mouse gets the title instead.
   const {C} = load(1200, false);
   const c = chart(C, {hover: 'xy', dots: [{x: 0.5, y: 0.5, cls: 'roc-dot-best', label: 'best 0.4: alert rate 80%', lines: ['best 0.4', 'alert rate 80%']}]});
@@ -296,7 +296,7 @@ fn a_tap_shows_the_chart_readout_and_keeps_it() {
 }
 
 #[test]
-fn roc_dots_take_the_pointer_and_phones_get_readable_charts() {
+fn chart_dots_take_the_pointer_and_phones_get_readable_charts() {
     if !have_node() {
         return;
     }

@@ -1,526 +1,389 @@
-// Blue Onyx Prism: Benchmark page, Compare tab (PrismBench.compare).
-// One filter bar (models, devices, runtimes, datasets, which runs; remembered per browser)
-// drives "Side by side" (speed vs accuracy scatter, comparison table, overlaid quality-vs-
-// confidence and ROC curves) and "Across runs" (run history of one model: A/B comparison with
-// the server's verdicts, pin / delete, trend lines). The history is fetched only when the tab
-// opens. benchmark.js calls render(status, models) on every poll; each section re-renders only
-// when its data or the filters changed (PrismLive.keep keeps scroll, open details, sort).
+// Blue Onyx Prism: Benchmark step 2, Compare (templates/benchmark/compare.html; after
+// bench-charts.js and bench-shell.js). Draws GET /v1/benchmark/compare?set=&scene= (plus a goal
+// tried without saving, BenchShell.withGoal): the left-out line, the headline, the ranked table
+// (PrismSort; `data-best` = the server's order, so "Best first" is the server's rank), optional
+// columns (remembered in this browser), expandable details, Save report / Download CSV, the
+// combos not run on these images (with Run on these images), the scatter (goal metric against
+// p95, log scale) and the breakdown tabs (Day / Night / IR, Classes, Cameras, Speed).
+// The address keeps `set` and `scene` (history.replaceState); `?model=` opens that model's rows.
 (function () {
-  var PB = window.PrismBench, L = window.PrismLive, el = PB.el, has = PB.has, fmt = PB.fmt, C = PB.charts;
+  "use strict";
+  var BC = window.BenchCore, PB = window.PrismBench, S = window.BenchShell, C = PB.charts, el = PB.el, fmt = BC.fmt;
+  if (!S || !C) return;
   var $ = function (id) { return document.getElementById(id); };
-  var MAX_SERIES = 8;
-  var saved = PB.store.get("compare", null) || {};
-  var F = {
-    off: saved.off || {model: {}, device: {}, runtime: {}, dataset: {}},
-    onlyRec: !!saved.onlyRec, runs: saved.runs || "latest", picked: saved.picked || [],
-    y: saved.y || "score", curve: saved.curve || "f1"
-  };
-  ["model", "device", "runtime", "dataset"].forEach(function (k) { if (!F.off[k]) F.off[k] = {}; });
-  function remember() { PB.store.set("compare", F); }
-  var S = {j: null, models: [], selected: null, hist: {}, histErr: {}, histAll: null, histAllErr: null, cmp: {}, runModel: saved.runModel || null, a: null, b: null, trend: saved.trend || "p50", trendOff: {}, visible: false};
+  var params = new URLSearchParams(location.search);
+  var state = {set: params.get("set") || "", scene: params.get("scene") || "all", open: {}, tab: "scenes", pair: null, view: null, loading: null};
+  var focusModel = params.get("model");
+  var columns = BC.columnsOf(BC.store.get("columns", []));
+  var table = $("c-table"), body = $("cmp-body"), empty = $("cmp-empty");
+  if (["all", "day", "night", "ir"].indexOf(state.scene) < 0) state.scene = "all";
+  $("c-scene").value = state.scene;
 
-  // ---- rows: one per model x device ----------------------------------------------------------
-  function serverFlags(j) {
-    var flags = {};
-    (j && (j.points || []) || []).forEach(function (r) { if (r && r.model && r.device && r.best_tradeoff !== undefined) flags[r.model.toLowerCase() + "|" + r.device] = !!r.best_tradeoff; });
-    return flags;
+  function keyOf(r) { return r.model + "\u0000" + r.device; }
+  function isCpu(d) { return /(^|:)cpu$/.test(String(d)); }
+  function colors(rows) {
+    var by = {}, n = 0;
+    rows.forEach(function (r) { if (!by[r.model]) by[r.model] = (n++ % 8) + 1; });
+    return by;
   }
-  function rowsFromModels(models, j) {
-    var out = [];
-    models.forEach(function (m) {
-      if (F.runs === "this" && m.this_run === false) return;
-      (m.devices || []).forEach(function (d) {
-        var r = d.run; if (!r) return;
-        var acc = r.accuracy, ov = acc && acc.overall, st = r.stages_ms || {};
-        var sweep = acc && acc.sweep, adv = m.threshold && m.threshold.device === d.device ? m.threshold : null;
-        out.push({
-          key: m.model.toLowerCase() + "|" + d.device, model: m.model, device: d.device, devLabel: d.label, runtime: PB.runtimeOf(d.device, d.runtime),
-          label: m.model + " · " + d.device, p50: st.total ? st.total.p50 : null, p95: st.total ? st.total.p95 : null, infer: st.infer ? st.infer.p50 : null,
-          fps: r.throughput_fps, ap50: ov ? ov.ap50 : null, ap50_95: ov ? ov.ap50_95 : null, roc_auc: acc && acc.frame_roc ? acc.frame_roc.auc : null,
-          precision: ov ? ov.precision : null, recall: ov ? ov.recall : null, f1: ov ? ov.f1 : null,
-          score: r.grades ? r.grades.accuracy_score : null, grade: r.grades ? r.grades.overall : null, relative: !!(acc && acc.relative),
-          trust: d.trust, recommended: m.recommended === d.device, fellBack: !!r.fell_back, datasets: m.datasets || [], timestamp: m.timestamp, thisRun: m.this_run, trainedOn: m.trained_on_share,
-          curve: sweep && sweep.overall ? sweep.overall.points : adv ? adv.curve : null,
-          roc: sweep && sweep.roc && sweep.roc.curve && sweep.roc.curve.length ? sweep.roc.curve : adv && adv.roc ? adv.roc.curve : null,
-          threshold: acc ? acc.threshold : null,
-          best: PB.pointRank(j, m.model, d.device)
-        });
+  function chipsOf(r) {
+    return BC.rowChips(r).map(function (c) {
+      var b = el("button", {type: "button", class: "term " + c.cls, "data-tip": c.tip, "aria-expanded": "false"});
+      b.textContent = c.text; return b;
+    });
+  }
+  function metricCell(r, goal) {
+    if (goal.optimizeFor === "grade") return el("span", {text: r.grade || "-"});
+    var m = r.metric;
+    return el("span", {}, [fmt.n2(m && m.value), m && m.low !== null ? el("span", {class: "bn-ci", text: fmt.ci(m)}) : null]);
+  }
+  function td(label, content, cls, v) {
+    var c = el("td", {class: cls || null, "data-label": label});
+    if (content && typeof content === "object") c.appendChild(content); else c.textContent = content === undefined || content === null ? "-" : content;
+    if (v !== undefined) c.setAttribute("data-v", BC.has(v) ? String(v) : "");
+    return c;
+  }
+  function th(text, col, num, first, term) {
+    var h = el("th", {scope: "col", class: num ? "num" : null, "data-sort-col": col});
+    if (first) h.setAttribute("data-sort-first", first);
+    if (term) h.appendChild(PB.term(text, term)); else h.textContent = text;
+    return h;
+  }
+  function speedOf(r) { var s = r.speed || {}; return BC.has(s.burstP95Ms) ? s.burstP95Ms : s.p95Ms; }
+
+  // ---- the table ---------------------------------------------------------------------------------
+  function renderTable(v) {
+    var goal = v.goal, rows = v.rows, color = colors(rows);
+    var metricName = goal.metric + (goal.rankOnly ? "" : " (cross-validated)");
+    var head = el("tr", {}, [th("#", "rank", true, null, "rank"), th("Model", "model"), th("Device", "device"), th(metricName, "metric", true, "desc", goal.rankOnly ? null : "oof"),
+      th("Recall", "recall", true, "desc", "recall"), th("Precision", "precision", true, "desc", "precision"), th("False alerts /100 empty", "fa100", true, "asc", "fa100"),
+      th("Confidence", "conf", true, null, "confidence"), th("p95", "p95", true, "asc", "p95")]);
+    columns.forEach(function (k) { var c = BC.COLUMNS.filter(function (x) { return x.key === k; })[0]; head.appendChild(th(c.label, "x-" + k, ["first_load", "cpu"].indexOf(k) < 0, null, ({f1: "f1", f05: "f05", ap50: "ap50", ap50_95: "ap50_95", roc_auc: "roc_auc", first_load: "first_load", cpu: "cpu", burst: "burst"})[k])); });
+    var det = el("th", {scope: "col", "data-sort-off": ""}); det.appendChild(el("span", {class: "sr-only", text: "Details"})); head.appendChild(det);
+    var tbody = el("tbody");
+    rows.forEach(function (r) {
+      var k = keyOf(r), open = !!state.open[k], s = r.speed || {}, ok = r.block === "ok";
+      var tr = el("tr", {class: [r.rank === 1 && ok ? "top" : "", r.flags && r.flags.tooSlow ? "slow" : "", r.block === "unfair" ? "lineup-out" : ""].join(" ").trim() || null, "data-best": String(r.position || 0), "data-key": k});
+      var name = el("span", {}, [el("span", {class: "bn-dot ser-c" + color[r.model] + (isCpu(r.device) ? " hollow" : ""), "aria-hidden": "true"}), r.model]);
+      chipsOf(r).forEach(function (c) { name.appendChild(document.createTextNode(" ")); name.appendChild(c); });
+      tr.appendChild(td("Rank", el("span", {class: "bn-rank", text: ok ? String(r.rank) : "–"}), "num", ok ? r.rank : null));
+      tr.appendChild(td("Model", name, "bn-lead rc-title", r.model));
+      tr.appendChild(td("Device", el("code", {text: r.device, title: r.deviceLabel || null}), null, r.device));
+      tr.appendChild(td(metricName, metricCell(r, goal), "num", r.metric ? r.metric.value : null));
+      tr.appendChild(td("Recall", fmt.n2(r.recall), "num", r.recall));
+      tr.appendChild(td("Precision", fmt.n2(r.precision), "num", r.precision));
+      tr.appendChild(td("False alerts /100 empty", fmt.n1(r.fa100), "num", r.fa100));
+      tr.appendChild(td("Confidence", fmt.n2(r.confidence), "num", r.confidence));
+      tr.appendChild(td(BC.has(s.burstP95Ms) ? "p95 (burst)" : "p95", fmt.ms(speedOf(r)), "num", speedOf(r)));
+      columns.forEach(function (key) {
+        var c = BC.COLUMNS.filter(function (x) { return x.key === key; })[0];
+        var raw = {f1: r.f1, f05: r.f05, ap50: r.ap50, ap50_95: r.ap5095, roc_auc: r.rocAuc, p50: s.p50Ms, p99: s.p99Ms, burst: s.burstP95Ms}[key];
+        tr.appendChild(td(c.label, BC.columnValue(r, key), ["first_load", "cpu"].indexOf(key) < 0 ? "num" : null, raw === undefined ? undefined : raw));
       });
+      var b = el("button", {type: "button", class: "bn-expand", "aria-expanded": open ? "true" : "false", "aria-controls": "d-" + r.position, "aria-label": (open ? "Less about " : "More about ") + r.model + " on " + r.device, text: open ? "Less" : "More"});
+      b.addEventListener("click", function () { state.open[k] = !state.open[k]; render(); var nb = table.querySelector('tr[data-key="' + cssEsc(k) + '"] button.bn-expand'); if (nb) nb.focus(); });
+      tr.appendChild(td("Details", b, "rc-action"));
+      tbody.appendChild(tr);
+      if (open) {
+        var cell = el("td", {colspan: String(head.children.length), id: "d-" + r.position});
+        cell.appendChild(details(r, v));
+        tbody.appendChild(el("tr", {class: "bn-detail", "data-sort-follow": ""}, [cell]));
+      }
     });
-    return out;
+    table.replaceChildren(el("thead", {}, [head]), tbody);
+    if (window.PrismSort) PrismSort.apply(table);
+    if (window.PrismTip) PrismTip.refresh();
   }
-  function rowsFromHistory() {
-    var out = [];
-    if (!S.histAll) return out;
-    Object.keys(S.histAll).forEach(function (name) {
-      (S.histAll[name] || []).forEach(function (e) {
-        if (F.picked.indexOf(name.toLowerCase() + "|" + e.run_id) < 0) return;
-        (e.devices || []).forEach(function (dv) {
-          if (dv.error) return;
-          out.push({
-            key: name.toLowerCase() + "|" + dv.device + "|" + e.run_id, model: e.model || name, device: dv.device, devLabel: dv.label, runtime: PB.runtimeOf(dv.device, dv.runtime),
-            label: (e.model || name) + " · " + dv.device + " · " + fmt.day(e.timestamp), p50: dv.total_p50_ms, p95: dv.total_p95_ms, infer: dv.infer_p50_ms, fps: dv.fps,
-            ap50: dv.ap50, ap50_95: dv.ap50_95, roc_auc: dv.roc_auc, precision: dv.precision, recall: dv.recall, f1: dv.f1, score: null, grade: dv.grade,
-            trust: null, recommended: !!dv.recommended, fellBack: !!dv.fell_back, datasets: (e.settings && e.settings.datasets) || [], timestamp: e.timestamp, curve: null, roc: null, trainedOn: e.trained_on_share
-          });
-        });
+  function cssEsc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"); }
+  function fact(k, v) { return el("div", {}, [el("span", {class: "k", text: k}), el("span", {class: "v", text: v})]); }
+  function details(r, v) {
+    var s = r.speed || {}, f = r.flags || {}, box = el("div");
+    var facts = [
+      fact("Device", r.deviceLabel || r.device),
+      fact("F1 / F2 / F0.5", fmt.n2(r.f1) + " / " + fmt.n2(r.f2) + " / " + fmt.n2(r.f05)),
+      fact("AP50 · AP50-95", fmt.n2(r.ap50) + " · " + fmt.n2(r.ap5095)),
+      fact("ROC AUC (frames)", fmt.n2(r.rocAuc)),
+      fact("p50 · p95 · p99", fmt.ms(s.p50Ms) + " · " + fmt.ms(s.p95Ms) + " · " + fmt.ms(s.p99Ms)),
+      fact("Burst p95", BC.has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : "not run"),
+      fact("First load", BC.firstLoadText(s.firstLoad)),
+      fact("CPU check", BC.agreementText(r.agreement)),
+      fact("Saved confidence", BC.has(r.servedThreshold) ? fmt.n2(r.servedThreshold) : "none"),
+      fact("Equally good range", BC.rangeText(r.plateau) || (r.plateau ? "only " + fmt.n2(r.plateau[0]) : "-")),
+      fact("Cross-validation", r.folds > 1 ? r.folds + " folds" : "in-sample (too little data)")
+    ];
+    if (r.target) facts.push(fact("Target", (r.target.met ? "met" : "not met") + (BC.has(r.target.bound) ? ", 95% bound " + fmt.n2(r.target.bound) : "")));
+    if (r.grade) facts.push(fact("Grade", r.grade));
+    box.appendChild(el("div", {class: "bn-facts"}, facts));
+    var notes = [];
+    if (BC.has(f.liveLoad) && f.liveLoad > 0) notes.push("Measured while the service answered " + fmt.n1(f.liveLoad) + " requests a minute.");
+    if (BC.has(f.videoDecode) && f.videoDecode > 1) notes.push("The GPU's video decode was " + Math.round(f.videoDecode) + "% busy during the run (Blue Iris Quick Sync).");
+    notes.push(f.served ? "As served: night model, night threshold, filters, enhancement and verifier applied." : "Bare model: serving rules not applied.");
+    if (r.leader && r.vsLeader) notes.push("Against " + r.leader + ": " + fmt.signed(r.vsLeader.value) + (BC.has(r.vsLeader.low) ? " (95% interval " + fmt.signed(r.vsLeader.low) + " to " + fmt.signed(r.vsLeader.high) + ")" : "") + ".");
+    box.appendChild(el("p", {class: "small muted", text: notes.join(" ")}));
+    var set = v.set ? v.set.id : "";
+    var tune = "/benchmark/tune?model=" + encodeURIComponent(r.model) + "&device=" + encodeURIComponent(r.device) + (set ? "&set=" + encodeURIComponent(set) : "");
+    var imgs = "/benchmark/images?model=" + encodeURIComponent(r.model) + "&device=" + encodeURIComponent(r.device) + (set ? "&set=" + encodeURIComponent(set) : "") + (BC.has(r.confidence) ? "&threshold=" + r.confidence.toFixed(2) : "") + "&kind=miss";
+    box.appendChild(el("div", {class: "actions"}, [el("a", {class: "btn small", href: S.withGoal(tune), text: "Tune this"}), el("a", {class: "btn small secondary", href: S.withGoal(imgs), text: "See its misses"})]));
+    return box;
+  }
+
+  // ---- columns chooser ----------------------------------------------------------------------------
+  function renderColumns() {
+    var box = $("c-cols-list"); box.replaceChildren();
+    BC.COLUMNS.forEach(function (c) {
+      var cb = el("input", {type: "checkbox", value: c.key}); cb.checked = columns.indexOf(c.key) >= 0;
+      cb.addEventListener("change", function () {
+        columns = BC.columnsOf(BC.COLUMNS.map(function (x) { return x.key; }).filter(function (k) { return k === c.key ? cb.checked : columns.indexOf(k) >= 0; }));
+        BC.store.set("columns", columns);
+        if (state.view) renderTable(state.view);
       });
-    });
-    return out;
-  }
-  function allRows() { return F.runs === "pick" ? rowsFromHistory() : rowsFromModels(S.models, S.j); }
-  function values(rows, k) {
-    var seen = {}, out = [];
-    rows.forEach(function (r) { (k === "dataset" ? r.datasets : [r[k]]).forEach(function (v) { if (v !== undefined && v !== null && !seen[v]) { seen[v] = 1; out.push(v); } }); });
-    return out.sort();
-  }
-  function passes(r) {
-    if (F.off.model[r.model]) return false; if (F.off.device[r.device]) return false; if (F.off.runtime[r.runtime]) return false;
-    if (r.datasets.length && r.datasets.every(function (d) { return F.off.dataset[d]; })) return false;
-    if (F.onlyRec && !r.recommended) return false;
-    return true;
-  }
-  // Rows no other shown row beats on both speed and accuracy (`y`).
-  function pareto(rows, y) {
-    return rows.map(function (r) {
-      if (!has(r.p50) || !has(r[y]) || r.fellBack) return false;
-      return !rows.some(function (o) { return o !== r && has(o.p50) && has(o[y]) && !o.fellBack && o.p50 <= r.p50 && o[y] >= r[y] && (o.p50 < r.p50 || o[y] > r[y]); });
+      box.appendChild(el("label", {class: "check"}, [cb, " " + c.label]));
     });
   }
 
-  // ---- filter bar ------------------------------------------------------------------------------
-  function checkGroup(title, kind, vals, labelOf) {
-    var fs = el("fieldset", "cmp-group"); fs.appendChild(el("legend", null, title));
-    if (!vals.length) fs.appendChild(el("p", "muted", "none"));
-    vals.forEach(function (v) {
-      var l = el("label", "check"), i = el("input"); i.type = "checkbox"; i.value = v; i.checked = !F.off[kind][v];
-      i.addEventListener("change", function () { if (i.checked) delete F.off[kind][v]; else F.off[kind][v] = true; remember(); draw(true); });
-      l.appendChild(i);
-      if (kind === "model") { var sw = el("span", "swatch ser-" + PB.colorOf(v)); sw.setAttribute("aria-hidden", "true"); l.appendChild(sw); }
-      l.appendChild(document.createTextNode(" " + (labelOf ? labelOf(v) : v))); fs.appendChild(l);
+  // ---- not run here -------------------------------------------------------------------------------
+  function renderMissing(v) {
+    var box = $("c-missing"), list = v.missing || [];
+    box.hidden = !list.length;
+    if (!list.length) { box.replaceChildren(); return; }
+    var kids = [el("h3", {text: "Not run on these images"})];
+    list.forEach(function (m) {
+      var b = el("button", {type: "button", class: "small secondary", text: "Run on these images"});
+      if (m.blocked) { b.disabled = true; b.title = m.blocked; }
+      b.addEventListener("click", function () { runOn(m, v, b); });
+      kids.push(el("div", {class: "bn-row between"}, [el("span", {}, [el("strong", {text: m.model}), " ", el("span", {class: "muted small", text: m.why + (m.blocked ? " " + m.blocked : "")})]), b]));
     });
-    return fs;
+    box.replaceChildren.apply(box, kids);
   }
-  function buildFilters(rows) {
-    var box = $("cmp-filters"); box.replaceChildren();
-    var form = el("form", "cmp-filters card"); form.addEventListener("submit", function (e) { e.preventDefault(); });
-    var top = el("div", "cmp-quick");
-    var runs = el("fieldset", "cmp-runs-mode"); runs.appendChild(el("legend", null, "Runs"));
-    [["latest", "Latest of each model"], ["this", "This run only"], ["pick", "Pick runs…"]].forEach(function (o) {
-      var l = el("label", "check"), i = el("input"); i.type = "radio"; i.name = "cmp-runs"; i.value = o[0]; i.checked = F.runs === o[0];
-      i.addEventListener("change", function () { if (!i.checked) return; F.runs = o[0]; remember(); if (F.runs === "pick") loadAllHistory(); draw(true); });
-      l.appendChild(i); l.appendChild(document.createTextNode(" " + o[1])); runs.appendChild(l);
+  function runOn(m, v, b) {
+    var body = new URLSearchParams(), run = (v.set && v.set.run) || {datasets: [], maxImages: 0};
+    body.append("model", m.model);
+    if (m.device) body.append("device", m.device);
+    run.datasets.forEach(function (d) { body.append("dataset", d); });
+    body.append("max_images", String(run.maxImages || 0));
+    b.disabled = true; say("Starting " + m.model + "…");
+    PB.post("/v1/benchmark", body).then(function (j) {
+      say(j.success ? (j.message || "Started.") + " Follow it on the Run step." : (j.message || "Not started."), j.success ? "ok" : "error");
+      if (j.success) S.kick(); else b.disabled = false;
     });
-    top.appendChild(runs);
-    var qb = el("div", "actions");
-    [["All", function () { F.off = {model: {}, device: {}, runtime: {}, dataset: {}}; F.onlyRec = false; }],
-     ["None", function () { F.onlyRec = false; values(rows, "model").forEach(function (v) { F.off.model[v] = true; }); }],
-     ["Only recommended", function () { F.off = {model: {}, device: {}, runtime: {}, dataset: {}}; F.onlyRec = true; }]].forEach(function (b) {
-      var x = el("button", "small secondary" + (b[0] === "Only recommended" && F.onlyRec ? " active" : ""), b[0]); x.type = "button";
-      if (b[0] === "Only recommended") x.setAttribute("aria-pressed", F.onlyRec ? "true" : "false");
-      x.addEventListener("click", function () { b[1](); remember(); draw(true); }); qb.appendChild(x);
-    });
-    top.appendChild(qb);
-    form.appendChild(top);
-    if (F.runs === "pick") form.appendChild(pickRuns());
-    var grid = el("div", "cmp-grid");
-    grid.appendChild(checkGroup("Models", "model", values(rows, "model")));
-    grid.appendChild(checkGroup("Devices", "device", values(rows, "device")));
-    grid.appendChild(checkGroup("Runtimes", "runtime", values(rows, "runtime"), function (v) { return (PB.RUNTIME_NAMES[v] || v) + " (" + (v === "onnxruntime" ? "ort:*" : "openvino:*") + ")"; }));
-    grid.appendChild(checkGroup("Datasets", "dataset", values(rows, "dataset")));
-    form.appendChild(grid);
-    box.appendChild(form);
   }
-  function pickRuns() {
-    var fs = el("fieldset", "cmp-pick"); fs.appendChild(el("legend", null, "Runs to show"));
-    if (S.histAllErr) { fs.appendChild(el("p", "warn", S.histAllErr)); return fs; }
-    if (!S.histAll) { fs.appendChild(el("p", "muted", "loading the run history…")); return fs; }
-    var names = Object.keys(S.histAll).sort(); if (!names.length) fs.appendChild(el("p", "muted", "No runs in the history yet."));
-    names.forEach(function (name) {
-      var first = (S.histAll[name] || [])[0], row = el("div", "pick-model"); row.appendChild(el("strong", null, (first && first.model || name) + ": "));
-      (S.histAll[name] || []).forEach(function (e) {
-        var k = name.toLowerCase() + "|" + e.run_id, l = el("label", "check inline"), i = el("input"); i.type = "checkbox"; i.checked = F.picked.indexOf(k) >= 0;
-        i.addEventListener("change", function () { var at = F.picked.indexOf(k); if (i.checked && at < 0) F.picked.push(k); if (!i.checked && at >= 0) F.picked.splice(at, 1); remember(); draw(true); });
-        l.appendChild(i); l.appendChild(document.createTextNode(" " + fmt.day(e.timestamp) + (e.pinned ? " ★" : ""))); row.appendChild(l);
+
+  // ---- scatter ------------------------------------------------------------------------------------
+  var lastScatterWidth = 0;
+  function renderScatter(v) {
+    var box = $("c-scatter"), legend = $("c-scatter-legend"), color = colors(v.rows), goal = v.goal;
+    var pts = [], items = [];
+    v.rows.forEach(function (r, i) {
+      var x = speedOf(r), y = r.metric && r.metric.value;
+      var n = i + 1, label = r.model + " on " + r.device;
+      items.push(el("li", {}, [el("span", {class: "bn-dot ser-c" + color[r.model] + (isCpu(r.device) ? " hollow" : ""), "aria-hidden": "true"}), n + ". " + r.model + " · " + r.device.replace(/^openvino:/, "ov:") + (BC.has(y) && BC.has(x) ? "" : " (no point)")]));
+      if (BC.has(x) && BC.has(y)) pts.push({key: keyOf(r), n: n, x: x, y: y, low: r.metric.low, high: r.metric.high, color: color[r.model], hollow: isCpu(r.device), label: label});
+    });
+    items.push(el("li", {class: "muted", text: "filled = GPU or accelerator, hollow = CPU; bars = 95% interval"}));
+    legend.replaceChildren.apply(legend, items);
+    $("sc-title").textContent = goal.metric + " against " + (v.rows.some(function (r) { return r.speed && BC.has(r.speed.burstP95Ms); }) ? "burst p95" : "p95 latency");
+    lastScatterWidth = box.clientWidth;
+    box.replaceChildren(C.scatter(pts, {title: goal.metric + " against p95", desc: "One point per model and device: across, p95 latency on a log scale; up, " + goal.metric + ". The table above lists the same numbers.",
+      yLabel: goal.metric, budget: goal.speedBudgetMs, avail: box.clientWidth,
+      width: Math.min(1000, Math.max(300, box.clientWidth || 620)), height: box.clientWidth < 500 ? 260 : 320,
+      onPick: function (k) { state.open = {}; state.open[k] = true; render(); var tr = table.querySelector('tr[data-key="' + cssEsc(k) + '"]'); if (tr) tr.scrollIntoView({block: "center", behavior: "smooth"}); }}));
+  }
+
+  // ---- breakdowns ---------------------------------------------------------------------------------
+  var TABS = ["scenes", "classes", "cameras", "speed"];
+  function tabButtons() { return Array.prototype.slice.call(document.querySelectorAll("#c-tabs [role=tab]")); }
+  function selectTab(name, focus) {
+    state.tab = name;
+    tabButtons().forEach(function (b) { var on = b.dataset.bt === name; b.setAttribute("aria-selected", on ? "true" : "false"); b.tabIndex = on ? 0 : -1; if (on && focus) b.focus(); });
+    $("c-breakdown").setAttribute("aria-labelledby", "bt-" + name);
+    if (state.view) renderBreakdown(state.view);
+  }
+  tabButtons().forEach(function (b) {
+    b.addEventListener("click", function () { selectTab(b.dataset.bt, false); });
+    b.addEventListener("keydown", function (e) {
+      var i = TABS.indexOf(state.tab), n = TABS.length, j = null;
+      if (e.key === "ArrowRight") j = (i + 1) % n; else if (e.key === "ArrowLeft") j = (i + n - 1) % n; else if (e.key === "Home") j = 0; else if (e.key === "End") j = n - 1;
+      if (j !== null) { e.preventDefault(); selectTab(TABS[j], true); }
+    });
+  });
+  function bTable(head, rows, key) {
+    var t = el("table", {class: "bn-table rcards", "data-sort": key});
+    t.appendChild(el("thead", {}, [el("tr", {}, head.map(function (h, i) { return el("th", {scope: "col", class: i && h.num !== false ? "num" : null, text: h.text || h}); }))]));
+    t.appendChild(el("tbody", {}, rows));
+    var w = el("div", {class: "scroll"}, [t]);
+    if (window.PrismSort) setTimeout(function () { if (t.isConnected) PrismSort.attach(t); }, 0);
+    return w;
+  }
+  function pairSelect(v) {
+    if (!state.pair || !v.rows.some(function (r) { return keyOf(r) === state.pair; })) state.pair = v.rows.length ? keyOf(v.rows[0]) : null;
+    var sel = el("select", {id: "c-pair"});
+    v.rows.forEach(function (r) { var o = el("option", {value: keyOf(r), text: r.model + " · " + r.device}); o.selected = keyOf(r) === state.pair; sel.appendChild(o); });
+    sel.addEventListener("change", function () { state.pair = sel.value; renderBreakdown(v); var s2 = $("c-pair"); if (s2) s2.focus(); });
+    return el("label", {for: "c-pair"}, ["Model ", sel]);
+  }
+  function renderBreakdown(v) {
+    var p = $("c-breakdown"), goal = v.goal, kids = [], color = colors(v.rows);
+    var lead = function (r) { return el("td", {class: "bn-lead rc-title", "data-label": "Model · device"}, [el("span", {class: "bn-dot ser-c" + color[r.model] + (isCpu(r.device) ? " hollow" : ""), "aria-hidden": "true"}), r.model + " · " + r.device]); };
+    var cellLow = function (label, text, low, n) { var c = el("td", {class: "num" + (low ? " cell-low" : ""), "data-label": label, text: text}); if (low) c.title = n + " labelled objects: too few to judge"; return c; };
+    if (state.tab === "scenes") {
+      var scenes = ["day", "night", "ir"], names = {day: "Day", night: "Night", ir: "IR"};
+      kids.push(el("p", {class: "muted small", text: "Each pair at its confidence for your goal. Grey cells rest on fewer than 50 labelled objects: too few to judge."}));
+      var head = ["Model · device"];
+      scenes.forEach(function (s) { head.push(names[s] + " " + goal.metric, names[s] + " FA/100"); });
+      var rows = v.rows.map(function (r) {
+        var tr = el("tr", {"data-best": String(r.position || 0)}, [lead(r)]);
+        scenes.forEach(function (s) {
+          var c = (r.scenes || []).filter(function (x) { return x.scene === s; })[0];
+          tr.appendChild(cellLow(names[s] + " " + goal.metric, c ? fmt.n2(c.metric) : "-", c && c.fewObjects, c && c.objects));
+          tr.appendChild(el("td", {class: "num", "data-label": names[s] + " FA/100", text: c ? fmt.n1(c.fa100) : "-"}));
+        });
+        return tr;
       });
-      fs.appendChild(row);
-    });
-    return fs;
-  }
-
-  // ---- side by side ---------------------------------------------------------------------------
-  var Y_METRICS = [["score", "Accuracy score (ranking)", "accuracy_score"], ["ap50", "Detection quality (AP50)", "ap50"], ["ap50_95", "Box accuracy (AP50-95)", "ap50_95"], ["roc_auc", "Alert separation (ROC AUC)", "roc_auc"], ["recall", "Finds objects (recall)", "recall"], ["precision", "Correct detections (precision)", "precision"], ["f1", "Balance (F1)", "f1"]];
-  var CURVE_METRICS = [["f1", "Balance (F1)"], ["f2", "Miss-fewer (F2)"], ["precision", "Correct detections (precision)"], ["recall", "Finds objects (recall)"]];
-  function picker(labelText, opts, cur, onChange) {
-    var l = el("label", "inline-label"); l.appendChild(document.createTextNode(labelText + " "));
-    var s = el("select"); opts.forEach(function (o) { var x = el("option", null, o[1]); x.value = o[0]; if (o[0] === cur) x.selected = true; s.appendChild(x); });
-    s.addEventListener("change", function () { onChange(s.value); }); l.appendChild(s); return l;
-  }
-  function dashWithin(rows) {
-    var perModel = {}, out = {};
-    rows.forEach(function (r) { var k = r.model.toLowerCase(); perModel[k] = (perModel[k] || 0); out[r.key] = C.dashOf(perModel[k]); perModel[k]++; });
-    return out;
-  }
-  function shapeOf(rt) { return rt === "onnxruntime" ? "square" : rt === "openvino" ? "circle" : "triangle"; }
-  function buildSide(rows) {
-    var box = $("cmp-side"); box.replaceChildren();
-    box.appendChild(el("h2", null, "Side by side"));
-    var y = F.y; if (y === "score" && !rows.some(function (r) { return has(r.score); })) y = "ap50";
-    var yDef = Y_METRICS.find(function (m) { return m[0] === y; }) || Y_METRICS[1];
-    var tools = el("div", "chart-tools");
-    tools.appendChild(picker("Accuracy axis", Y_METRICS.map(function (m) { return [m[0], m[1]]; }), y, function (v) { F.y = v; remember(); draw(true); }));
-    tools.appendChild(PB.term("What is this?", yDef[2], "cmp"));
-    box.appendChild(tools);
-    // Best trade-offs: the server's (over every point, by the ranking's accuracy score) when the
-    // view shows all latest results on that score; otherwise computed over the shown rows.
-    var flags = serverFlags(S.j), useServer = y === "score" && F.runs === "latest" && rows.length === allRows().length && rows.every(function (r) { return flags[r.key] !== undefined; });
-    var front = useServer ? rows.map(function (r) { return flags[r.key]; }) : pareto(rows, y);
-    rows.forEach(function (r, i) { r.front = front[i]; });
-    var drawn = rows.filter(function (r) { return has(r.p50) && has(r[y]) && !r.fellBack; });
-    var sc = el("div", "scatter-wrap");
-    sc.appendChild(C.block({
-      key: "cmp-scatter", legend: false,
-      note: "Color = model, shape = runtime (● OpenVINO, ■ ONNX Runtime). The line joins the best trade-offs: no other shown result is both faster and more accurate. Click a point to find its row.",
-      draw: function () {
-        return C.scatter(drawn.map(function (r) { return {key: r.key, x: r.p50, y: r[y], color: PB.colorOf(r.model), shape: shapeOf(r.runtime), label: r.label, best: r.front}; }), {
-          title: "Speed vs accuracy", desc: drawn.length + " results: time per image (lower is better) against " + yDef[1] + " (higher is better). Best trade-offs: " + drawn.filter(function (r) { return r.front; }).map(function (r) { return r.label; }).join(", ") + ".",
-          yLabel: yDef[1] + " (%)", frontier: true, selected: S.selected,
-          onPick: function (k) { S.selected = k; highlight(); }
+      kids.push(bTable(head, rows, "bench-scenes"));
+      var sc = (v.set && v.set.scenes) || [];
+      kids.push(el("p", {class: "bn-foot", text: sc.map(function (s) { return names[s.scene] + " " + fmt.int(s.frames) + " frames"; }).join(" · ") + (sc.length ? ". " : "") + "Scenes are the service's own day / night / IR decision per frame."}));
+    } else if (state.tab === "classes") {
+      var r = v.rows.filter(function (x) { return keyOf(x) === state.pair; })[0];
+      kids.push(el("div", {class: "bn-row"}, [pairSelect(v), el("span", {class: "muted small", text: "Exact classes: a truck called a car is a miss and a false alert."})]));
+      r = v.rows.filter(function (x) { return keyOf(x) === state.pair; })[0];
+      var counted = (v.set && v.set.classes) || [], named = (goal.classes || []).length > 0;
+      var crow = ((r && r.classes) || []).map(function (c) {
+        var low = c.objects < 50;
+        var tag = named ? el("span", {class: "bn-chip " + (counted.indexOf(c["class"]) >= 0 ? "ok" : "same"), text: counted.indexOf(c["class"]) >= 0 ? "counts" : "detail only"}) : null;
+        return el("tr", {}, [el("td", {class: "bn-lead rc-title", "data-label": "Class"}, [c["class"], tag ? " " : null, tag]),
+          el("td", {class: "num", "data-label": "Objects", text: fmt.int(c.objects)}),
+          cellLow("Recall", fmt.n2(c.recall), low, c.objects), cellLow("Precision", fmt.n2(c.precision), low, c.objects),
+          cellLow("F2", fmt.n2(c.f2), low, c.objects), cellLow("AP50", fmt.n2(c.ap50), low, c.objects),
+          el("td", {class: "num", "data-label": "FA/100 frames without it", text: fmt.n1(c.fa100)})]);
+      });
+      kids.push(crow.length ? bTable(["Class", "Objects", "Recall", "Precision", "F2", "AP50", "FA/100 frames without it"], crow, "bench-classes") : el("p", {class: "bn-empty", text: "No class breakdown for this pair."}));
+      kids.push(el("p", {class: "bn-foot", text: "Grey: under 50 labelled objects, too few to judge. Choose which classes count in the goal."}));
+    } else if (state.tab === "cameras") {
+      if (!v.set || v.set.id !== "cameras") {
+        kids.push(el("p", {class: "bn-empty", text: "Per camera on Your cameras only: choose Your cameras under Images."}));
+      } else {
+        kids.push(el("div", {class: "bn-row"}, [pairSelect(v), el("span", {class: "muted small", text: "Worst camera first."})]));
+        var rr = v.rows.filter(function (x) { return keyOf(x) === state.pair; })[0];
+        var cams = ((rr && rr.cameras) || []).map(function (c) {
+          return el("tr", {}, [el("td", {class: "bn-lead rc-title", "data-label": "Camera", text: c.camera}), el("td", {class: "num", "data-label": "Frames", text: fmt.int(c.frames)}),
+            el("td", {class: "num", "data-label": "Objects", text: fmt.int(c.objects)}), el("td", {class: "num", "data-label": "Recall", text: fmt.n2(c.recall)}),
+            el("td", {class: "num", "data-label": "FA/100 empty", text: fmt.n1(c.fa100)}), el("td", {"data-label": "Worst scene", text: c.worstScene || "-"})]);
         });
-      },
-      table: function () { return {head: ["Result", "Time per image", yDef[1], "Best trade-off"], rows: drawn.map(function (r) { return [r.label, fmt.ms(r.p50), fmt.pct(r[y], 1), r.front ? "yes" : ""]; })}; }
-    }));
-    box.appendChild(sc);
-    var missing = rows.length - drawn.length;
-    if (missing > 0) box.appendChild(el("p", "muted", missing + " result" + (missing === 1 ? " is" : "s are") + " not drawn: no " + yDef[1].toLowerCase() + " or a device that fell back (they are in the table)."));
-    box.appendChild(compareTable(rows, y));
-    curves(box, rows);
-  }
-  // The comparison table: best value per column in bold, the gap to it on the others.
-  var COLS = [
-    ["p50", "p50", "lower", "ms"], ["p95", "p95", "lower", "ms"], ["infer", "infer_p50", "lower", "ms"], ["fps", "fps", "higher", "fps"],
-    ["score", "accuracy_score", "higher", "pct"], ["ap50", "ap50", "higher", "pct"], ["ap50_95", "ap50_95", "higher", "pct"], ["roc_auc", "roc_auc", "higher", "pct"],
-    ["recall", "recall", "higher", "pct"], ["precision", "precision", "higher", "pct"]
-  ];
-  function compareTable(rows, y) {
-    var cols = COLS.filter(function (c) { return rows.some(function (r) { return has(r[c[0]]); }); });
-    var best = {};
-    cols.forEach(function (c) {
-      var vs = rows.filter(function (r) { return !r.fellBack; }).map(function (r) { return r[c[0]]; }).filter(has);
-      best[c[0]] = vs.length ? (c[2] === "lower" ? Math.min.apply(null, vs) : Math.max.apply(null, vs)) : null;
-    });
-    var columns = [
-      {id: "model", head: "@model", value: function (r) { return r.model.toLowerCase(); }, render: function (r) {
-        var s = el("span"), sw = el("span", "swatch ser-" + PB.colorOf(r.model)); sw.setAttribute("aria-hidden", "true"); s.appendChild(sw); s.appendChild(document.createTextNode(" " + r.model + (r.relative ? " *" : "")));
-        if (r.recommended) { var t0 = el("span", "tag rec", "Recommended"); t0.title = "The best device for this model and your goal"; s.appendChild(t0); } var t1 = PB.trainedChip(r.trainedOn); if (t1) s.appendChild(t1); s.className = "nowrap"; return s; }},
-      {id: "device", head: "@device", value: function (r) { return r.device; }, render: function (r, td) { td.title = r.devLabel || ""; var s = el("span", "nowrap", r.device); if (r.fellBack) s.appendChild(el("span", "tag restart", "fell back")); return s; }},
-      {id: "runtime", head: "@runtime", value: function (r) { return r.runtime; }, render: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }}
-    ].concat(cols.map(function (c) {
-      return {id: c[0], head: "@" + c[1], num: true, first: c[2] === "lower" ? "asc" : "desc", value: function (r) { return r[c[0]]; }, render: function (r, td) {
-        var v = r[c[0]], b = best[c[0]], s = el("span", null, c[3] === "ms" ? fmt.ms(v) : c[3] === "fps" ? (has(v) ? v.toFixed(1) + "/s" : "-") : fmt.pct(v, 1));
-        if (has(v) && has(b) && !r.fellBack) {
-          if (Math.abs(v - b) < 1e-9) { td.classList.add("best"); td.title = "best in this column"; }
-          else s.appendChild(el("span", "gap", c[3] === "pct" ? fmt.points(v - b) : c[3] === "ms" ? "+" + (v - b).toFixed(1) + " ms" : "−" + (b - v).toFixed(1) + "/s"));
-        }
-        return s; }};
-    })).concat([
-      {id: "grade", head: "@grade", value: function (r) { return r.grade || null; }, render: function (r) { return el("span", "grade grade-" + (r.grade || "none"), r.grade || "-"); }},
-      {id: "trust", head: "@trust", value: function (r) { return r.trust ? {high: 0, medium: 1, low: 2}[r.trust.level] : null; }, render: function (r) { return PB.trustBadge(r.trust, "cmp"); }},
-      {id: "front", head: "@tradeoff", value: function (r) { return r.front ? 0 : 1; }, render: function (r) { return r.front ? PB.tip("★ best trade-off", PB.tipText("best_tradeoff"), "tag best-tradeoff", "cmp") : ""; }}
-    ]);
-    var d = el("div"); d.appendChild(el("h3", null, "Comparison table")); d.appendChild(el("p", "muted", "Bold = best in its column; the small number is the gap to the best. Accuracy at the run's confidence threshold."));
-    d.appendChild(PB.dataTable({
-      key: "compare", cls: "stack cmp-table", rows: rows, columns: columns,
-      filters: {model: function (r) { return r.model; }, device: function (r) { return r.device; }, runtime: function (r) { return PB.RUNTIME_NAMES[r.runtime] || r.runtime; }, thisRun: function (r) { return r.thisRun; }},
-      text: function (r) { return r.model + " " + r.device + " " + r.runtime; },
-      // Best first: the server's ranking of model x device (points); rows of picked history runs
-      // have none and follow.
-      sort: {col: "best", dir: "asc"}, best: function (r) { return r.best; },
-      rowAttrs: function (r, tr) {
-        tr.dataset.key = r.key; if (r.key === S.selected) tr.classList.add("hl");
-        tr.addEventListener("click", function (e) { if (e.target.closest("button")) return; S.selected = r.key; highlight(); });
+        kids.push(cams.length ? bTable(["Camera", "Frames", "Objects", "Recall", "FA/100 empty", {text: "Worst scene", num: false}], cams, "bench-cameras") : el("p", {class: "bn-empty", text: "No camera breakdown for this pair."}));
       }
-    }));
-    return d;
-  }
-  function highlight() {
-    document.querySelectorAll(".cmp-table tbody tr").forEach(function (r) { var on = r.dataset.key === S.selected; r.classList.toggle("hl", on); if (on) r.scrollIntoView({block: "nearest"}); });
-    document.querySelectorAll(".pb-scatter .pb-pt").forEach(function (g) { g.classList.toggle("selected", g.getAttribute("data-key") === S.selected); });
-  }
-  function curves(box, rows) {
-    var withCurve = rows.filter(function (r) { return r.curve && r.curve.length; }), withRoc = rows.filter(function (r) { return r.roc && r.roc.length; });
-    box.appendChild(el("h3", null, "Detection quality vs confidence"));
-    if (!withCurve.length) { box.appendChild(el("p", "empty", F.runs === "pick" ? "Curves come from the latest results only; switch Runs to “Latest of each model”." : "No curves: the shown results have no ground truth or reference labels.")); return; }
-    var dash = dashWithin(withCurve), m = F.curve, mDef = CURVE_METRICS.find(function (c) { return c[0] === m; }) || CURVE_METRICS[0];
-    var tools = el("div", "chart-tools");
-    tools.appendChild(picker("Show", CURVE_METRICS, m, function (v) { F.curve = v; remember(); draw(true); }));
-    tools.appendChild(PB.term("What is this?", m, "cmp")); box.appendChild(tools);
-    var shown = withCurve.slice(0, MAX_SERIES);
-    var series = shown.map(function (r) { return {id: r.key, label: r.label, cls: "ser ser-" + PB.colorOf(r.model), dash: dash[r.key], points: r.curve.map(function (p) { return {x: p.threshold, y: p[m]}; })}; });
-    var note = withCurve.length > MAX_SERIES ? "Showing " + MAX_SERIES + " of " + withCurve.length + " results; narrow the filters to see the others." : null;
-    var row = el("div", "chart-row");
-    var c1 = el("div", "thr-chart-wrap");
-    c1.appendChild(C.block({
-      key: "cmp-curves", series: series, note: note,
-      draw: function (hidden) {
-        return C.lineChart(series, {title: mDef[1] + " vs confidence threshold", desc: "One line per result: " + series.map(function (s) { return s.label; }).join(", ") + ".", hidden: hidden, xLabel: "Confidence threshold (\u00d7 100 = Blue Iris %)", yLabel: "%", xName: "confidence", xHover: function (v) { return v.toFixed(2); }, yHover: function (v) { return fmt.pct(v, 1); }, xTicks: [0, 0.2, 0.4, 0.6, 0.8, 1], yTicks: [0, 0.2, 0.4, 0.6, 0.8, 1]});
-      },
-      table: function () {
-        var th = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
-        return {head: ["Result"].concat(th.map(function (t) { return "at " + t.toFixed(1); })), rows: shown.map(function (r) { return [r.label].concat(th.map(function (t) { var p = r.curve.reduce(function (a, q) { return !a || Math.abs(q.threshold - t) < Math.abs(a.threshold - t) ? q : a; }, null); return p ? fmt.pct(p[m], 1) : "-"; })); })};
-      }
-    }));
-    row.appendChild(c1);
-    if (withRoc.length) {
-      var rshown = withRoc.slice(0, MAX_SERIES), rdash = dashWithin(rshown);
-      var rs = rshown.map(function (r) { return {id: r.key, label: r.label, cls: "ser ser-" + PB.colorOf(r.model), dash: rdash[r.key], points: [{x: 0, y: 0}].concat(r.roc.map(function (p) { return {x: p.fpr, y: p.tpr, t: p.t}; }))}; });
-      var c2 = el("div", "roc-chart-wrap wide");
-      c2.appendChild(C.block({
-        key: "cmp-roc", series: rs, note: withRoc.length > MAX_SERIES ? "Showing " + MAX_SERIES + " of " + withRoc.length + "; narrow the filters." : "Frame level: up and to the left is better; dashed diagonal = chance.",
-        draw: function (hidden) {
-          return C.lineChart(rs, {title: "Frame-level ROC", desc: "Alert rate against false-alert rate for " + rs.map(function (s) { return s.label; }).join(", ") + ".", hidden: hidden, width: 360, height: 320, left: 44, hover: "xy", diag: true, xGrid: true, xLabel: "False alerts on empty frames (%)", yLabel: "Alerts on frames with objects (%)", xFmt: function (v) { return (v * 100).toFixed(0); }, xName: "false alerts", yName: "alerts", xHover: function (v) { return fmt.pct(v, 1); }, yHover: function (v) { return fmt.pct(v, 1); }, xTicks: [0, 0.2, 0.4, 0.6, 0.8, 1], yTicks: [0, 0.2, 0.4, 0.6, 0.8, 1]});
-        },
-        table: function () {
-          return {head: ["Result", "ROC AUC"], rows: rshown.map(function (r) { return [r.label, fmt.pct(r.roc_auc, 1)]; })};
-        }
-      }));
-      row.appendChild(c2);
+    } else {
+      kids.push(el("p", {class: "muted small", text: "Time per image, one at a time, on these frames: decode, prepare, inference and post-processing (the run's medians), then the whole request's percentiles."}));
+      var srows = v.rows.map(function (r) {
+        var s = r.speed || {};
+        return el("tr", {"data-best": String(r.position || 0)}, [lead(r),
+          el("td", {class: "num", "data-label": "Decode", text: fmt.ms(s.decodeMs)}), el("td", {class: "num", "data-label": "Prepare", text: fmt.ms(s.preprocessMs)}),
+          el("td", {class: "num", "data-label": "Inference", text: fmt.ms(s.inferMs)}), el("td", {class: "num", "data-label": "Post", text: fmt.ms(s.postprocessMs)}),
+          el("td", {class: "num", "data-label": "p50", text: fmt.ms(s.p50Ms)}), el("td", {class: "num", "data-label": "p95", text: fmt.ms(s.p95Ms)}), el("td", {class: "num", "data-label": "p99", text: fmt.ms(s.p99Ms)}),
+          el("td", {class: "num", "data-label": "Burst p95", text: BC.has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : "not run"}),
+          el("td", {"data-label": "First load", text: BC.firstLoadText(s.firstLoad)})]);
+      });
+      kids.push(bTable(["Model · device", "Decode", "Prepare", "Inference", "Post", "p50", "p95", "p99", "Burst p95", {text: "First load", num: false}], srows, "bench-speed"));
+      var loaded = v.rows.filter(function (r) { return r.flags && ((r.flags.liveLoad || 0) > 0 || (r.flags.videoDecode || 0) > 1); });
+      if (loaded.length) kids.push(el("p", {class: "warn small", text: "Measured while the service answered live requests or the GPU decoded video (" + loaded.map(function (r) { return r.model + " on " + r.device; }).join(", ") + "): live speed under that load is what Blue Iris sees; an idle machine reads faster."}));
     }
-    box.appendChild(row);
+    p.replaceChildren.apply(p, kids);
   }
 
-  // ---- across runs ----------------------------------------------------------------------------
-  function histUrl(model) { return "/v1/benchmark/history" + (model ? "?model=" + encodeURIComponent(model) : ""); }
-  function entriesOf(j, model) {
-    var ms = (j && j.models) || {}; if (Array.isArray(ms)) return ms;
-    if (ms[model]) return ms[model];
-    var k = Object.keys(ms).find(function (x) { return x.toLowerCase() === String(model).toLowerCase(); });
-    return k ? ms[k] : [];
-  }
-  function loadHistory(model, force) {
-    if (!model || (!force && (S.hist[model] || S.histErr[model]))) return;
-    S.histErr[model] = null;
-    PB.getJSON(histUrl(model)).then(function (j) {
-      if (j.success === false || !j.models) { S.histErr[model] = j.message || j.error || "the run history is not available"; S.hist[model] = null; }
-      else {
-        // The server's comparability with the newest entry, per run.
-        var comp = entriesOf({models: j.comparability || {}}, model) || [];
-        S.hist[model] = entriesOf(j, model).map(function (e) {
-          var c = comp.find(function (x) { return x.run_id === e.run_id; });
-          return c ? Object.assign({}, e, {comparable: c.comparable, reasons: c.reasons || []}) : e;
-        });
-      }
-      if (S.runModel === model && S.hist[model]) defaults(S.hist[model], force);
-      drawRuns(true);
-    }, function () { S.histErr[model] = "the server did not answer"; drawRuns(true); });
-  }
-  function loadAllHistory(force) {
-    if (!force && (S.histAll || S.histAllErr)) return;
-    PB.getJSON(histUrl(null)).then(function (j) {
-      if (j.success === false || !j.models) { S.histAllErr = j.message || j.error || "the run history is not available on this server"; S.histAll = null; }
-      else { S.histAll = j.models; S.histAllErr = null; PB.colorsFor(Object.keys(j.models)); }
-      draw(true);
-    }, function () { S.histAllErr = "the server did not answer"; draw(true); });
-  }
-  // Why runs a and b are not comparable (the server's reasons when an entry carries them).
-  function reasonsBetween(a, b) {
-    var out = [], sa = a.settings || {}, sb = b.settings || {};
-    var ds = function (s) { return (s.datasets || []).slice().sort().join(", "); };
-    if (ds(sa) !== ds(sb)) out.push("different datasets: " + (ds(sa) || "none") + " → " + (ds(sb) || "none"));
-    if (has(sa.images) && has(sb.images) && sa.images !== sb.images) out.push("different image count: " + sa.images + " → " + sb.images);
-    if ((sa.reference || null) !== (sb.reference || null)) out.push("different reference model: " + (sa.reference || "none") + " → " + (sb.reference || "none"));
-    if (a.hardware_key && b.hardware_key && a.hardware_key !== b.hardware_key) out.push("different hardware: " + a.hardware_key + " → " + b.hardware_key);
-    var ra = a.runtimes || {}, rb = b.runtimes || {};
-    ["openvino", "onnxruntime"].forEach(function (k) { if (ra[k] && rb[k] && ra[k] !== rb[k]) out.push("different " + (PB.RUNTIME_NAMES[k] || k) + " version: " + ra[k] + " → " + rb[k]); });
-    return out;
-  }
-  function defaults(list, force) {
-    if (!list.length) { S.a = S.b = null; return; }
-    var ids = list.map(function (e) { return e.run_id; });
-    if (force || ids.indexOf(S.b) < 0) S.b = list[0].run_id;
-    if (force || ids.indexOf(S.a) < 0 || S.a === S.b) {
-      var b = list.find(function (e) { return e.run_id === S.b; }), pin = list.find(function (e) { return e.pinned && e.run_id !== S.b; });
-      var prev = list.find(function (e) { return e.run_id !== S.b && !reasonsBetween(e, b).length && new Date(e.timestamp) <= new Date(b.timestamp); });
-      var older = list.find(function (e) { return e.run_id !== S.b; });
-      S.a = (pin || prev || older || {}).run_id || null;
+  // ---- the whole view ----------------------------------------------------------------------------
+  function msgEl() { return $("c-msg"); }
+  function say(text, kind) { var m = msgEl(); m.className = "bn-msg small" + (kind === "error" ? " bn-error" : kind === "ok" ? " notice" : ""); m.textContent = text || ""; }
+  function render() {
+    var v = state.view; if (!v) return;
+    S.setGoal(v.goal);
+    var sel = $("c-set"); sel.replaceChildren();
+    (v.sets || []).forEach(function (s) { var o = el("option", {value: s.id, text: s.title + " · " + fmt.int(s.frames) + " frames"}); o.selected = v.set && v.set.id === s.id; sel.appendChild(o); });
+    if (!(v.sets || []).length) sel.appendChild(el("option", {value: "", text: "No image set yet"}));
+    var left = $("c-left"), set = v.set;
+    if (set && set.framesLeftOut > 0) {
+      left.replaceChildren(fmt.int(set.framesLeftOut) + " frames left out: " + (set.leftOutBy || []).join(", ") + " trained on them. ",
+        PB.term("Why", "Scores on a model's own training frames say little about new frames, so every model here is compared on the frames none of them trained on."));
+      left.hidden = false;
+    } else left.hidden = true;
+    $("c-headline").textContent = v.headline || "";
+    if (set && set.relative) $("c-headline").appendChild(el("span", {class: "muted small", text: " These images have no labels: scored against " + (set.reference || "the reference model") + "'s detections (relative)."}));
+    if (set && set.ignoredClasses && set.ignoredClasses.length) $("c-headline").appendChild(el("span", {class: "muted small", text: " Not scored here: " + set.ignoredClasses.join(", ") + "."}));
+    if (!v.rows.length) {
+      table.replaceChildren(el("tbody", {}, [el("tr", {}, [el("td", {text: v.headline || "Nothing to compare on these images."})])]));
+    } else renderTable(v);
+    $("c-foot").textContent = (v.notes || []).join(" ") + " p95 = the whole request, one image at a time.";
+    renderMissing(v); renderScatter(v); renderBreakdown(v);
+    if (focusModel) {
+      var first = v.rows.filter(function (r) { return r.model.toLowerCase() === focusModel.toLowerCase(); })[0];
+      focusModel = null;
+      if (first) { state.open[keyOf(first)] = true; renderTable(v); var tr = table.querySelector('tr[data-key="' + cssEsc(keyOf(first)) + '"]'); if (tr) tr.scrollIntoView({block: "center"}); }
     }
   }
-  function runModels() {
-    var names = S.models.map(function (m) { return m.model; });
-    var lower = names.map(function (n) { return n.toLowerCase(); });
-    if (S.histAll) Object.keys(S.histAll).forEach(function (n) { var e = (S.histAll[n] || [])[0], shown = (e && e.model) || n; if (lower.indexOf(shown.toLowerCase()) < 0) { names.push(shown); lower.push(shown.toLowerCase()); } });
-    return names;
+  function url() {
+    var q = [];
+    if (state.set) q.push("set=" + encodeURIComponent(state.set));
+    if (state.scene && state.scene !== "all") q.push("scene=" + encodeURIComponent(state.scene));
+    return "/v1/benchmark/compare" + (q.length ? "?" + q.join("&") : "");
   }
-  function entryLabel(e) {
-    var s = e.settings || {};
-    return fmt.day(e.timestamp) + " · " + ((s.datasets || []).join(", ") || "-") + " · " + (has(s.images) ? s.images + " images" : "") + (e.pinned ? " · ★ baseline" : "");
+  function remember() {
+    var p = new URLSearchParams(location.search);
+    if (state.set) p.set("set", state.set); else p.delete("set");
+    if (state.scene !== "all") p.set("scene", state.scene); else p.delete("scene");
+    p.delete("model");
+    var q = p.toString();
+    if (history.replaceState) history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
   }
-  function buildRuns() {
-    var box = $("cmp-runs"); box.replaceChildren();
-    box.appendChild(el("h2", null, "Across runs"));
-    var names = runModels();
-    if (!names.length) { box.appendChild(el("p", "empty", "No results yet: run a benchmark (twice, to compare runs).")); return; }
-    if (!S.runModel || names.indexOf(S.runModel) < 0) S.runModel = names[0];
-    var tools = el("div", "chart-tools");
-    tools.appendChild(picker("Model", names.map(function (n) { return [n, n]; }), S.runModel, function (v) { S.runModel = v; saved.runModel = v; F.runModel = v; remember(); S.a = S.b = null; loadHistory(v); drawRuns(true); }));
-    box.appendChild(tools);
-    var list = S.hist[S.runModel];
-    if (S.histErr[S.runModel]) { box.appendChild(el("p", "warn", "Run history: " + S.histErr[S.runModel] + ".")); return; }
-    if (!list) { box.appendChild(el("p", "muted", S.visible ? "loading the run history…" : "The run history loads when this tab opens.")); return; }
-    if (!list.length) { box.appendChild(el("p", "empty", "No runs of " + S.runModel + " in the history yet. Each finished benchmark adds one.")); return; }
-    if (!S.a || !S.b) defaults(list);
-    if (list.length === 1) box.appendChild(el("p", "muted", "Only one run of " + S.runModel + " so far: run the benchmark again (same datasets and images) to compare."));
-    // A / B pickers.
-    var ab = el("div", "ab-pickers");
-    [["a", "Before (A)"], ["b", "After (B)"]].forEach(function (p) {
-      var wrapL = el("div", "ab");
-      wrapL.appendChild(picker(p[1], list.map(function (e) { return [e.run_id, entryLabel(e)]; }), S[p[0]], function (v) { S[p[0]] = v; drawRuns(true); }));
-      var e = list.find(function (x) { return x.run_id === S[p[0]]; });
-      if (e) {
-        var pin = el("button", "small secondary", e.pinned ? "Unpin baseline" : "Pin as baseline"); pin.type = "button";
-        pin.title = e.pinned ? "Stop comparing new runs with this one" : "Compare new runs of this model with this one (instead of the previous run)";
-        pin.addEventListener("click", function () { act("/v1/benchmark/history/pin", {model: S.runModel, run_id: e.run_id, pinned: e.pinned ? "0" : "1"}); });
-        var del = el("button", "small danger", "Delete run"); del.type = "button";
-        del.addEventListener("click", function () { if (confirm("Delete the run of " + fmt.when(e.timestamp) + " of " + S.runModel + " from the history? The current results are not changed.")) act("/v1/benchmark/history/delete", {model: S.runModel, run_id: e.run_id}); });
-        wrapL.appendChild(pin); wrapL.appendChild(del);
-      }
-      ab.appendChild(wrapL);
-    });
-    box.appendChild(ab);
-    var msg = el("p", "muted"); msg.id = "cmp-run-msg"; msg.setAttribute("aria-live", "polite"); box.appendChild(msg);
-    if (S.a && S.b && S.a !== S.b) box.appendChild(abTable(list));
-    else box.appendChild(el("p", "muted", "Pick two different runs to compare."));
-    box.appendChild(trends(list));
-  }
-  function act(url, fields) {
-    PB.post(url, new URLSearchParams(fields)).then(function (j) {
-      var m = $("cmp-run-msg"); if (m) { m.className = j.success ? "ok-text" : "error-text"; m.textContent = j.message || j.error || (j.success ? "done" : "failed"); }
-      S.cmp = {}; S.histAll = null; S.histAllErr = null; loadHistory(S.runModel, true); if (F.runs === "pick") loadAllHistory(true);
-      if (PB.refresh) PB.refresh();
+  function load() {
+    if (state.loading) state.loading.abort();
+    var ctl = window.AbortController ? new AbortController() : null;
+    state.loading = ctl;
+    body.setAttribute("aria-busy", "true");
+    return PB.getJSON(S.withGoal(url()), ctl ? {signal: ctl.signal} : {}).then(function (j) {
+      if (j.aborted) return;
+      state.loading = null; body.removeAttribute("aria-busy");
+      if (j._status === 404) { body.hidden = true; empty.hidden = false; return; }
+      if (!j.success) { say((j.message || "The comparison did not load.") + " Reload the page to try again.", "error"); return; }
+      body.hidden = false; empty.hidden = true;
+      state.view = j.compare;
+      if (j.compare.set) state.set = j.compare.set.id;
+      S.setSet(state.set);
+      remember(); render();
     });
   }
-  function abTable(list) {
-    var key = S.runModel + "|" + S.a + "|" + S.b, d = el("div", "ab-result"), c = S.cmp[key];
-    if (c === undefined) {
-      S.cmp[key] = null;
-      PB.getJSON("/v1/benchmark/history/compare?model=" + encodeURIComponent(S.runModel) + "&a=" + encodeURIComponent(S.a) + "&b=" + encodeURIComponent(S.b)).then(function (j) {
-        S.cmp[key] = j.success === false || !j.changes ? {error: j.message || j.error || "comparison not available"} : j.changes; drawRuns(true);
-      }, function () { S.cmp[key] = {error: "the server did not answer"}; drawRuns(true); });
-    }
-    if (!c) { d.appendChild(el("p", "muted", "comparing…")); return d; }
-    if (c.error) { d.appendChild(el("p", "warn", c.error)); return d; }
-    if (!c.comparable) {
-      var p = el("div", "warn"); p.appendChild(PB.chip("not_comparable")); p.appendChild(document.createTextNode(" These runs are not compared, so no differences are shown:"));
-      var ul = el("ul"); (c.reasons || []).forEach(function (r) { ul.appendChild(el("li", null, r)); }); p.appendChild(ul); d.appendChild(p); return d;
-    }
-    if (c.summary) d.appendChild(el("p", "notice", c.summary));
-    var t = el("table", "bench stack ab-table"), th = el("thead"), tr = el("tr");
-    ["What", "Device", "A (before)", "B (after)", "Change", "Why"].forEach(function (h, i) { tr.appendChild(el("th", i >= 2 && i <= 4 ? "num" : null, h)); });
-    th.appendChild(tr); t.appendChild(th);
-    var tb = el("tbody");
-    (c.metrics || []).forEach(function (mc) {
-      var row = el("tr");
-      var cells = [[PB.METRIC_NAMES[mc.metric] || mc.metric, "What"], [mc.device || "model", "Device"]];
-      cells.forEach(function (x) { var td = el("td", null, x[0]); td.dataset.label = x[1]; row.appendChild(td); });
-      [[PB.metricValue(mc.metric, mc.before), "A (before)"], [PB.metricValue(mc.metric, mc.after), "B (after)"]].forEach(function (x) { var td = el("td", "num", x[0]); td.dataset.label = x[1]; row.appendChild(td); });
-      var ch = el("td", "num"); ch.dataset.label = "Change"; ch.appendChild(PB.metricChip(mc)); if (has(mc.delta)) ch.appendChild(el("span", "gap", PB.metricDelta(mc.metric, mc.delta) + (has(mc.rel) ? " (" + (mc.rel > 0 ? "+" : mc.rel < 0 ? "−" : "") + Math.abs(mc.rel * 100).toFixed(0) + "%)" : ""))); row.appendChild(ch);
-      var why = el("td", "why", mc.why || ""); why.dataset.label = "Why"; row.appendChild(why);
-      tb.appendChild(row);
-    });
-    t.appendChild(tb);
-    var w = el("div", "scroll"); w.dataset.keep = "w:ab"; w.appendChild(t); d.appendChild(w);
-    return d;
-  }
-  var TRENDS = [["p50", "Time per image (p50)"], ["ap50", "Detection quality (AP50)"], ["threshold", "Best confidence"]];
-  function trends(list) {
-    var d = el("div", "trends"); d.appendChild(el("h3", null, "Trend over runs"));
-    var ordered = list.slice(0, 20).reverse(), latest = list[0];
-    var tools = el("div", "chart-tools");
-    tools.appendChild(picker("Show", TRENDS, S.trend, function (v) { S.trend = v; F.trend = v; remember(); drawRuns(true); }));
-    var devs = []; ordered.forEach(function (e) { (e.devices || []).forEach(function (x) { if (devs.indexOf(x.device) < 0) devs.push(x.device); }); });
-    if (S.trend !== "threshold") devs.forEach(function (dv) {
-      var l = el("label", "check inline"), i = el("input"); i.type = "checkbox"; i.checked = !S.trendOff[dv];
-      i.addEventListener("change", function () { if (i.checked) delete S.trendOff[dv]; else S.trendOff[dv] = true; drawRuns(true); });
-      l.appendChild(i); l.appendChild(document.createTextNode(" " + dv)); tools.appendChild(l);
-    });
-    d.appendChild(tools);
-    var bad = ordered.map(function (e) { return e.comparable === undefined ? reasonsBetween(e, latest) : e.comparable ? [] : (e.reasons && e.reasons.length ? e.reasons : ["not comparable"]); });
-    // AP is a class average: a run that averaged other classes than the latest (another class
-    // set, or an older entry over every class) is a gap, never joined to the line.
-    var devOf = function (e, dv) { return (e.devices || []).find(function (q) { return q.device === dv; }); };
-    var basisOf = function (x) { return x ? PB.basisKey(x.ap_min_gt, (x.ap_classes || []).map(function (c) { return c["class"]; }), x.ap_fell_back) : ""; };
-    var otherBasis = {};
-    var val = function (e, dv) {
-      if (S.trend === "threshold") return e.threshold ? e.threshold.best : null;
-      var x = devOf(e, dv); if (!x || x.error) return null;
-      if (S.trend === "ap50" && has(x.ap50) && basisOf(x) !== basisOf(devOf(latest, dv))) { otherBasis[e.run_id] = e; return null; }
-      return S.trend === "p50" ? x.total_p50_ms : x.ap50;
-    };
-    var keys = S.trend === "threshold" ? ["model"] : devs.filter(function (dv) { return !S.trendOff[dv]; });
-    var series = keys.map(function (dv, i) { return {id: dv, label: S.trend === "threshold" ? "best confidence" : dv, cls: "ser ser-" + ((i % 8) + 1), dash: C.dashOf(i), points: ordered.map(function (e, k) { return {x: k, y: bad[k].length ? null : val(e, dv)}; })}; });
-    var ys = []; series.forEach(function (s) { s.points.forEach(function (p) { if (has(p.y)) ys.push(p.y); }); });
-    if (!ys.length) { d.appendChild(el("p", "empty", "Nothing to draw: no comparable runs with this value.")); }
-    else {
-      var isMs = S.trend === "p50", lo = isMs ? 0 : Math.max(0, Math.floor((Math.min.apply(null, ys) - 0.05) * 10) / 10), hi = isMs ? C.niceMax(Math.max.apply(null, ys) * 1.1) : Math.min(1, Math.ceil((Math.max.apply(null, ys) + 0.05) * 10) / 10);
-      var ticks = ordered.length <= 6 ? ordered.map(function (e, k) { return k; }) : C.niceTicks(0, ordered.length - 1, 5).filter(function (k) { return k === Math.round(k); });
-      d.appendChild(C.block({
-        key: "cmp-trend", series: series, legend: false,
-        draw: function () {
-          return C.lineChart(series, {
-            title: (TRENDS.find(function (t) { return t[0] === S.trend; }) || TRENDS[0])[1] + " over the last " + ordered.length + " runs of " + S.runModel,
-            desc: "One line per device; runs not comparable with the latest are gaps.", pointDots: true,
-            xMin: ordered.length > 1 ? 0 : -1, xMax: Math.max(1, ordered.length - 1), yMin: lo, yMax: hi, xTicks: ticks, xTickText: function (k) { var e = ordered[k]; return e ? fmt.day(e.timestamp).replace(/ dd:dd$/, "") : ""; },
-            yFmt: isMs ? function (v) { return v.toFixed(0); } : S.trend === "threshold" ? function (v) { return v.toFixed(2); } : function (v) { return (v * 100).toFixed(0); },
-            yLabel: isMs ? "ms (lower is better)" : S.trend === "threshold" ? "confidence" : "%", xName: "run",
-            xHover: function (k) { var e = ordered[Math.round(k)]; return e ? fmt.day(e.timestamp) : ""; },
-            yHover: isMs ? fmt.ms : S.trend === "threshold" ? fmt.thrBi : function (v) { return fmt.pct(v, 1); }
-          });
-        },
-        table: function () { return {head: ["Run"].concat(series.map(function (s) { return s.label; })), rows: ordered.map(function (e, k) { return [fmt.when(e.timestamp)].concat(series.map(function (s) { var v = s.points[k].y; return bad[k].length ? "not comparable" : isMs ? fmt.ms(v) : S.trend === "threshold" ? fmt.thr(v) : fmt.pct(v, 1); })); })}; }
-      }));
-    }
-    var ob = ordered.filter(function (e, k) { return !bad[k].length && otherBasis[e.run_id]; });
-    if (ob.length) {
-      var obox = el("div", "nc-list"); obox.appendChild(el("p", "muted", "AP50 averaged over other classes than in the latest run (a class counts with at least " + PB.noise.min_class_gt + " objects; runs of older versions averaged every class), drawn as gaps:"));
-      var oul = el("ul"); ob.forEach(function (e) { oul.appendChild(el("li", null, fmt.when(e.timestamp))); }); obox.appendChild(oul); d.appendChild(obox);
-    }
-    var nc = ordered.filter(function (e, k) { return bad[k].length; });
-    if (nc.length) {
-      var box = el("div", "nc-list"); box.appendChild(el("p", "muted", "Not comparable with the latest run (drawn as gaps):"));
-      var ul = el("ul"); nc.forEach(function (e) { var k = ordered.indexOf(e); ul.appendChild(el("li", null, fmt.when(e.timestamp) + ": " + bad[k].join("; "))); }); box.appendChild(ul); d.appendChild(box);
-    }
-    return d;
-  }
+  $("c-set").addEventListener("change", function (e) { state.set = e.target.value; state.open = {}; load(); });
+  $("c-scene").addEventListener("change", function (e) { state.scene = e.target.value; load(); });
 
-  // ---- wiring ---------------------------------------------------------------------------------
-  function drawRuns(force) { var b = $("cmp-runs"); if (b) L.keep(b, force ? undefined : JSON.stringify([runModels(), S.runModel, S.hist[S.runModel] || null, S.histErr[S.runModel] || null, S.a, S.b, S.visible]), buildRuns); }
-  function draw(force) {
-    if (!$("cmp-filters")) return;
-    var rows = allRows(), shown = rows.filter(passes), empty = $("cmp-empty");
-    var sigF = JSON.stringify([values(rows, "model"), values(rows, "device"), values(rows, "runtime"), values(rows, "dataset"), F, !!S.histAll, S.histAllErr]);
-    L.keep($("cmp-filters"), force ? undefined : sigF, function () { buildFilters(rows); });
-    var none = !S.models.length && F.runs !== "pick";
-    empty.hidden = !none && shown.length > 0;
-    empty.textContent = none ? "Nothing to compare yet: run a benchmark under Run (two or more models or devices)." : rows.length ? "Nothing matches the filters: check at least one model, device, runtime and dataset, or press All." : F.runs === "pick" ? "Pick one or more runs above." : F.runs === "this" ? "The latest run has no results yet; choose “Latest of each model”." : "No results to compare.";
-    var side = $("cmp-side"); side.hidden = !shown.length;
-    if (shown.length) L.keep(side, force ? undefined : JSON.stringify([shown, F.y, F.curve, S.selected]), function () { buildSide(shown); });
-    drawRuns(force);
-  }
-  function render(j, models) {
-    S.j = j; S.models = models;
-    PB.colorsFor(models.map(function (m) { return m.model; }));
-    if (F.runs === "pick" && S.visible) loadAllHistory();
-    draw(false);
-  }
-  // The tab became visible: fetch the run history once.
-  function shown() {
-    S.visible = true;
-    var names = runModels(); if (!S.runModel || names.indexOf(S.runModel) < 0) S.runModel = names[0] || null;
-    if (S.runModel) loadHistory(S.runModel);
-    if (F.runs === "pick") loadAllHistory();
-    drawRuns(false);
-  }
-  // A new run finished: the history has new entries.
-  function invalidate() { S.hist = {}; S.histErr = {}; S.cmp = {}; S.histAll = null; S.histAllErr = null; if (S.visible) shown(); }
-  PB.compare = {render: render, shown: shown, invalidate: invalidate, pareto: pareto};
+  // ---- report and CSV ----------------------------------------------------------------------------
+  var rdlg = $("report-dlg"), rdir = $("report-dir"), rmsg = $("report-msg");
+  $("c-report").addEventListener("click", function () { rdir.value = rdir.value || BC.store.get("reportDir", "") || ""; rmsg.textContent = ""; rdlg.showModal(); rdir.focus(); });
+  $("report-x").addEventListener("click", function () { rdlg.close(); });
+  $("report-cancel").addEventListener("click", function () { rdlg.close(); });
+  rdlg.addEventListener("close", function () { $("c-report").focus(); });
+  $("report-save").addEventListener("click", function () {
+    var d = rdir.value.trim(), b = $("report-save");
+    if (!d) { rmsg.className = "bn-msg small bn-error"; rmsg.textContent = "Choose a folder first (Browse…)."; return; }
+    b.disabled = true; rmsg.className = "bn-msg small"; rmsg.textContent = "Saving…";
+    PB.post("/v1/benchmark/report", new URLSearchParams({dir: d})).then(function (j) {
+      rmsg.className = "bn-msg small" + (j.success ? " notice" : " bn-error");
+      rmsg.textContent = j.success ? "Report saved to " + j.path + "." : (j.message || "The report was not saved.") + " Check the folder and try again.";
+      if (j.success) BC.store.set("reportDir", d);
+      b.disabled = false;
+    });
+  });
+  $("c-csv").addEventListener("click", function () {
+    if (!state.view) return;
+    var blob = new Blob([BC.compareCsv(state.view)], {type: "text/csv"}), a = el("a", {href: URL.createObjectURL(blob), download: "benchmark-compare-" + (state.set || "set") + (state.scene !== "all" ? "-" + state.scene : "") + ".csv"});
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+    say("CSV downloaded.", "ok");
+  });
+
+  // ---- redraws -----------------------------------------------------------------------------------
+  var rt = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(rt);
+    rt = setTimeout(function () { var w = $("c-scatter").clientWidth; if (state.view && Math.abs(w - lastScatterWidth) > 8) renderScatter(state.view); }, 150);
+  });
+  S.onView(function () { load(); });
+  renderColumns();
+  if (!body.hidden) load();
 })();

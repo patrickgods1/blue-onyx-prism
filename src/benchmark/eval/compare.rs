@@ -3,11 +3,11 @@
 //! one headline sentence and the breakdowns (scenes, classes, cameras, speed).
 //!
 //! - **Frames**: a set's frames that every listed combo ran and no listed model trained or
-//!   validated on ([`crate::benchmark::lineup`]'s rules; the left-out count is shown), optionally
+//!   validated on ([`crate::benchmark::combos`]'s rules; the left-out count is shown), optionally
 //!   one scene (`day`, `night`, `ir`). Every combo is scored on exactly these frames, so their
 //!   groups and bootstrap resamples are the same and two combos compare pair by pair.
 //! - **Classes**: the classes every combo is scored on (car, truck and bus are one `vehicle`, as
-//!   on the lineup), limited to the goal's classes when it names some (`ignoredClasses`: named
+//!   on every Compare set), limited to the goal's classes when it names some (`ignoredClasses`: named
 //!   but not scored here).
 //! - **Speed**: one-at-a-time p50 / p95 / p99 of the whole request on these frames (each frame's
 //!   p50 over its timed runs); the budget applies to the p95 (a burst p95 once a burst test ran;
@@ -28,10 +28,10 @@ use super::rank::{Block, Place, Rankable, rank};
 use super::rankfree::{ApData, AucData};
 use super::stats::{Difference, Estimate};
 use crate::benchmark::cameras::MIN_OBJECTS;
+use crate::benchmark::combos::sets::{CompareSet, compare_sets, default_set};
+use crate::benchmark::combos::{Combo, ComboSet, Inputs, Missing, RunHint, combos_on, score};
 use crate::benchmark::grade::Weights;
 use crate::benchmark::images::in_split;
-use crate::benchmark::lineup::sets::{CompareSet, compare_sets, default_set};
-use crate::benchmark::lineup::{Combo, ComboSet, Inputs, Missing, RunHint, combos_on, score};
 use crate::benchmark::metrics::{ClassMap, EvalImage, SweepScope, sweep_counts};
 use crate::benchmark::threshold::grid;
 use crate::registry::normalize_name;
@@ -41,7 +41,7 @@ use std::collections::HashMap;
 /// The scenes of the breakdown and the `scene=` filter.
 pub const SCENES: [&str; 3] = ["day", "night", "ir"];
 
-/// What [`build`] reads besides the lineup inputs.
+/// What [`build`] reads besides the combos' inputs ([`crate::benchmark::combos::Inputs`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Request<'a> {
     pub goal: &'a Goal,
@@ -120,6 +120,9 @@ pub struct SetInfo {
     pub reference: Option<String>,
     /// The counted classes.
     pub classes: Vec<String>,
+    /// Every class all combos here are scored on (what the goal may count; the Goal dialog's
+    /// choices).
+    pub scored_classes: Vec<String>,
     /// Classes the goal names that no combo here is scored on.
     pub ignored_classes: Vec<String>,
     /// Cross-validation groups (camera days on Your cameras, single images elsewhere).
@@ -240,6 +243,42 @@ pub struct CameraRow {
     pub worst_scene: Option<String>,
 }
 
+/// A combo's in-sample figures at one confidence on every frame of the view (Tune's "now ->
+/// new": the saved confidence against the suggested one, on the same frames).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtPoint {
+    /// The grid value the figures are at.
+    pub threshold: f32,
+    /// The tuning objective's value ([`super::pick::value`]).
+    pub value: Option<f64>,
+    pub recall: Option<f64>,
+    pub precision: Option<f64>,
+    pub fa100: Option<f64>,
+}
+
+/// [`AtPoint`] of `a` at the grid value nearest `t` (None off the grid's range).
+fn at_point(a: &super::assess::Assessment, t: f32) -> Option<AtPoint> {
+    let g = grid();
+    let k = g
+        .iter()
+        .enumerate()
+        .min_by(|x, y| (x.1 - t).abs().total_cmp(&(y.1 - t).abs()))
+        .filter(|(_, v)| (*v - t).abs() <= 0.006)
+        .map(|(k, _)| k)?;
+    let mut at = super::tally::At::default();
+    for img in &a.tallies {
+        at.add_image(img, k, 1);
+    }
+    Some(AtPoint {
+        threshold: *g.get(k)?,
+        value: value(a.objective, &at),
+        recall: at.recall(),
+        precision: at.precision(),
+        fa100: at.fa100(),
+    })
+}
+
 /// One combo.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,6 +315,9 @@ pub struct Row {
     pub target: Option<Target>,
     /// The confidence the config gives this combo now.
     pub served_threshold: Option<f32>,
+    /// In-sample figures at the confidence saved now and at the suggested one.
+    pub at_saved: Option<AtPoint>,
+    pub at_suggested: Option<AtPoint>,
     /// Cross-validation folds (0 or 1: none).
     pub folds: usize,
     pub speed: Speed,
@@ -680,6 +722,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
                 .map(|d| d.label.clone())
                 .unwrap_or_default();
         let p = &a.pooled;
+        let served_threshold = now.map(|n| n.threshold_for(c.device));
         rows.push(Row {
             model: c.m.model.clone(),
             device: c.device.to_string(),
@@ -708,7 +751,9 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
             plateau,
             pick_informative: a.pick_informative(),
             target: tgt,
-            served_threshold: now.map(|n| n.threshold_for(c.device)),
+            served_threshold,
+            at_saved: served_threshold.and_then(|t| at_point(&a, t)),
+            at_suggested: a.suggested_threshold().and_then(|t| at_point(&a, t)),
             folds: if a.low_confidence.is_some() {
                 0
             } else {
@@ -830,6 +875,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
         relative: combo_set.relative,
         reference: combo_set.reference.clone(),
         classes,
+        scored_classes: common,
         ignored_classes: ignored,
         groups,
         run: RunHint {

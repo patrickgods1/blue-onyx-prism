@@ -1,13 +1,19 @@
-//! The lineup end to end on synthetic runs: who is on a set, the shared label space, the marks and
-//! the dashes.
+//! Who is on a set and on which frames, end to end through the Compare view on synthetic runs: the
+//! shared label space, the fair frames of "Your cameras", the left-out and missing models, the
+//! reference model of a relative set.
 
 use super::*;
+use crate::benchmark::current::ModelNow;
+use crate::benchmark::eval::Goal;
+use crate::benchmark::eval::compare::{self, CompareView};
+use crate::benchmark::eval::rank::Block;
 use crate::benchmark::images::GroundTruth;
 use crate::benchmark::metrics::GtBox;
 use crate::benchmark::report::test_support::{dev, model as base_model};
 use crate::benchmark::report::{DeviceResult, ImageInfo};
 use crate::benchmark::search::{StoredImage, StoredPred, StoredPreds, StoredRun};
 use crate::benchmark::{ImageRun, images::SetKind};
+use sets::SetRole;
 
 pub(super) fn results() -> BenchmarkResults {
     serde_json::from_str("{}").unwrap()
@@ -151,20 +157,35 @@ impl World {
         }
     }
 
-    fn build(&self) -> Lineup {
-        let history = History::default();
-        build(&Inputs {
+    fn inputs(&self) -> Inputs<'_> {
+        Inputs {
             results: &self.results,
             preds: Some(&self.preds),
-            history: &history,
             now: &self.now,
             default_model: self.default_model.as_deref(),
             configured: &self.configured,
             trained: &self.trained,
             seen: &self.seen,
             reachable: &|_| true,
-        })
+        }
     }
+
+    /// The Compare view of `set` (None: the default set) for the default goal (F1).
+    fn compare(&self, set: Option<&str>) -> CompareView {
+        compare_on(&self.inputs(), set)
+    }
+}
+
+fn compare_on(inputs: &Inputs<'_>, set: Option<&str>) -> CompareView {
+    compare::build(
+        inputs,
+        compare::Request {
+            goal: &Goal::default(),
+            weights: Default::default(),
+            set,
+            scene: None,
+        },
+    )
 }
 
 fn now_at(t: f32, device: &str) -> ModelNow {
@@ -234,130 +255,139 @@ fn pair() -> World {
     w
 }
 
-fn row<'a>(s: &'a SetView, model: &str) -> &'a Row {
-    s.views[0].rows.iter().find(|r| r.model == model).unwrap()
+fn row<'a>(v: &'a CompareView, model: &str) -> &'a compare::Row {
+    v.rows
+        .iter()
+        .find(|r| r.model == model)
+        .unwrap_or_else(|| panic!("{model} is not on {:?}", v.set.as_ref().map(|s| &s.id)))
 }
 
+fn scene<'a>(r: &'a compare::Row, s: &str) -> Option<&'a compare::SceneRow> {
+    r.scenes.iter().find(|x| x.scene == s)
+}
+
+/// Every model answers for the same objects: one label space (car, truck and bus are one
+/// vehicle), the same frames, per scene where the set has them.
 #[test]
 fn every_model_answers_for_the_same_objects() {
-    let l = pair().build();
-    assert_eq!(l.default_set.as_deref(), Some("own"));
-    let s = &l.sets[0];
-    assert_eq!((s.images, s.objects, s.empty_frames), (25, 20, 5));
-    assert_eq!(s.classes, ["person", "vehicle"]);
-    let (g, p) = (row(s, "good"), row(s, "poor"));
-    assert_eq!(g.objects["all"].finds.all.value, Some(1.0));
-    assert_eq!(p.objects["all"].finds.all.value, Some(0.5));
-    assert_eq!(g.objects["all"].finds.all.n, 20);
-    assert_eq!(p.objects["all"].finds.all.n, 20);
-    // Per class and per scene.
-    assert_eq!(p.objects["person"].finds.all.value, Some(0.5));
-    assert_eq!(p.objects["vehicle"].finds.all.n, 10);
-    assert_eq!(p.objects["all"].finds.day.n, 10);
-    assert_eq!(p.objects["all"].finds.ir.value, Some(0.5));
-    // No night frames: a dash, not 0.
-    assert_eq!(g.objects["all"].finds.night.value, None);
-    assert_eq!(g.objects["all"].correct.night.value, None);
+    let v = pair().compare(None);
+    let s = v.set.as_ref().unwrap();
+    assert_eq!(s.id, "own");
+    assert_eq!((s.frames, s.objects, s.empty_frames), (25, 20, 5));
+    assert_eq!(s.scored_classes, ["person", "vehicle"]);
+    let (g, p) = (row(&v, "good"), row(&v, "poor"));
+    assert_eq!(g.recall, Some(1.0));
+    assert_eq!(p.recall, Some(0.5));
+    let person = p.classes.iter().find(|c| c.class == "person").unwrap();
+    assert_eq!((person.objects, person.recall), (10, Some(0.5)));
+    let vehicle = p.classes.iter().find(|c| c.class == "vehicle").unwrap();
+    assert_eq!(vehicle.objects, 10);
+    assert_eq!(scene(p, "day").unwrap().objects, 10);
+    assert_eq!(scene(p, "ir").unwrap().recall, Some(0.5));
+    // No night frames: no night row, not a row of zeros.
+    assert!(scene(g, "night").is_none_or(|n| n.frames == 0 && n.recall.is_none()));
 }
 
-/// The Day / Night / IR columns follow the scene the run computed for each frame over the
+/// The Day / Night / IR rows follow the scene the run computed for each frame over the
 /// manifest's tags (here every frame computed as night: the day and IR tags no longer count).
 #[test]
-fn scene_columns_follow_the_computed_scene() {
+fn scene_rows_follow_the_computed_scene() {
     let mut w = pair();
     for s in &mut w.results.image_sets {
         for i in &mut s.images {
             i.scene = Some(crate::image_stats::Scene::Night);
         }
     }
-    let l = w.build();
-    let p = row(&l.sets[0], "poor");
-    assert_eq!(p.objects["all"].finds.night.n, 20);
-    assert_eq!(p.objects["all"].finds.night.value, Some(0.5));
-    assert_eq!(p.objects["all"].finds.day.n, 0);
-    assert_eq!(p.objects["all"].finds.ir.value, None);
+    let v = w.compare(None);
+    let p = row(&v, "poor");
+    let night = scene(p, "night").unwrap();
+    assert_eq!((night.objects, night.recall), (20, Some(0.5)));
+    assert!(scene(p, "day").is_none_or(|d| d.objects == 0));
+    assert!(scene(p, "ir").is_none_or(|i| i.recall.is_none()));
 }
 
 #[test]
 fn false_alerts_are_measured_on_empty_frames_only() {
-    let l = pair().build();
-    let s = &l.sets[0];
-    assert_eq!(row(s, "poor").false_alerts.value, Some(0.2));
-    assert_eq!(row(s, "poor").alerts, 1);
-    assert_eq!(row(s, "poor").false_alerts.n, 5);
-    assert_eq!(row(s, "good").false_alerts.value, Some(0.0));
-    // A false alert on one frame of five is inside the noise (one frame in five).
-    assert!(!row(s, "good").false_alerts.best);
+    let v = pair().compare(None);
+    assert_eq!(v.set.as_ref().unwrap().empty_frames, 5);
+    assert_eq!(
+        row(&v, "poor").fa100,
+        Some(20.0),
+        "one of five empty frames"
+    );
+    assert_eq!(row(&v, "good").fa100, Some(0.0));
 }
 
+/// The better model ranks first, clearly; each row's speed is its p50 on these images.
 #[test]
-fn best_follows_the_noise_rule_and_time_comes_from_these_images() {
-    let l = pair().build();
-    let s = &l.sets[0];
-    let (g, p) = (row(s, "good"), row(s, "poor"));
-    assert!(g.objects["all"].finds.all.best, "100% against 50% of 20");
-    assert!(!p.objects["all"].finds.all.best);
-    assert_eq!(g.speed.value, Some(100.0));
-    assert_eq!(g.speed.n, 25);
-    assert!(p.speed.best && !g.speed.best);
-    assert_eq!(s.views[0].headline.call, verdict::Call::Clear);
+fn the_rank_follows_the_goal_and_time_comes_from_these_images() {
+    let v = pair().compare(None);
+    assert_eq!(v.rows[0].model, "good");
+    let (g, p) = (row(&v, "good"), row(&v, "poor"));
+    assert_eq!((g.rank, g.block), (1, Block::Ok));
     assert!(
-        s.views[0].headline.text.starts_with("good finds more"),
+        p.rank > 1,
+        "100% against 50% of 20 objects is clearly better"
+    );
+    assert_eq!(g.speed.p50_ms, Some(100.0));
+    assert_eq!(p.speed.p50_ms, Some(50.0));
+    assert_eq!(g.speed.frames, 25);
+    assert!(
+        v.headline.starts_with("good on ort:coreml"),
         "{}",
-        s.views[0].headline.text
+        v.headline
     );
 }
 
 #[test]
-fn a_model_with_training_frames_in_the_set_is_shown_but_not_best() {
+fn a_model_with_training_frames_in_the_set_is_shown_but_not_ranked_fairly() {
     let mut w = pair();
     w.results.models[0].trained_on_share = Some(0.4);
-    let l = w.build();
-    let s = &l.sets[0];
-    let g = row(s, "good");
-    assert!(g.excluded);
-    assert_eq!(g.trained_on_share, Some(0.4));
-    assert!(!g.objects["all"].finds.all.best, "excluded from best");
-    assert_eq!(s.views[0].headline.call, verdict::Call::Alone);
+    let v = w.compare(None);
+    let g = row(&v, "good");
+    assert!(g.flags.trained_here);
+    assert_eq!(g.flags.trained_on_share, Some(0.4));
+    assert_eq!(g.block, Block::Unfair);
+    assert_eq!(v.rows.last().unwrap().model, "good", "after the fair rows");
+    assert_eq!(row(&v, "poor").rank, 1);
     // The frame list, when known, decides per set: no frame of this set is in it.
     w.trained.insert(
         "good".into(),
         ["day/back/2026-10-25/other.jpg".to_string()].into(),
     );
-    let l = w.build();
-    assert!(!row(&l.sets[0], "good").excluded);
-    assert_eq!(row(&l.sets[0], "good").trained_on_share, Some(0.0));
+    let v = w.compare(None);
+    let g = row(&v, "good");
+    assert!(!g.flags.trained_here);
+    assert_eq!(g.flags.trained_on_share, Some(0.0));
+    assert_eq!((g.rank, g.block), (1, Block::Ok));
 }
 
 #[test]
 fn the_default_model_is_labelled() {
     let mut w = pair();
     w.default_model = Some("POOR".into());
-    let l = w.build();
-    assert!(row(&l.sets[0], "poor").is_default);
-    assert!(!row(&l.sets[0], "good").is_default);
+    let v = w.compare(None);
+    assert!(row(&v, "poor").is_default);
+    assert!(!row(&v, "good").is_default);
 }
 
+/// Each row shows the confidence the config gives it on that device beside the suggested one;
+/// the figures are at the suggestion, not at the saved value.
 #[test]
-fn each_model_sits_at_its_own_confidence_and_best_is_a_second_view() {
+fn each_row_carries_its_saved_and_its_suggested_confidence() {
     let mut w = pair();
     w.now.insert("good".into(), now_at(0.95, "ort:coreml"));
-    let l = w.build();
-    let s = &l.sets[0];
-    let g = row(s, "good");
-    assert!((g.confidence - 0.95).abs() < 1e-6);
+    let v = w.compare(None);
+    let g = row(&v, "good");
+    assert_eq!(g.served_threshold, Some(0.95));
+    assert!(g.confidence.unwrap() <= 0.9, "{:?}", g.confidence);
     assert_eq!(
-        g.objects["all"].finds.all.value,
-        Some(0.0),
-        "0.9 is under 0.95"
+        g.recall,
+        Some(1.0),
+        "0.9 detections count at the suggestion"
     );
-    assert_eq!(
-        s.views
-            .iter()
-            .map(|v| v.confidence.as_str())
-            .collect::<Vec<_>>(),
-        ["now", "best"]
-    );
+    let at = g.at_saved.as_ref().unwrap();
+    assert_eq!(at.recall, Some(0.0), "0.9 is under the saved 0.95");
 }
 
 #[test]
@@ -386,44 +416,45 @@ fn a_model_on_other_images_is_listed_with_why_and_a_way_to_run_it() {
         name: "fresh".into(),
         blocked: Some("the model file is missing".into()),
     });
-    let l = w.build();
-    let own = l.sets.iter().find(|s| s.id == "own").unwrap();
-    assert_eq!(own.views[0].rows.len(), 2);
-    let o = own.missing.iter().find(|m| m.model == "other").unwrap();
+    let v = w.compare(Some("own"));
+    assert_eq!(v.rows.len(), 2);
+    let o = v.missing.iter().find(|m| m.model == "other").unwrap();
     assert_eq!(o.why, "scored on 40 other images (coco)");
     assert_eq!(o.device.as_deref(), Some("ort:coreml"));
     assert_eq!(o.blocked, None);
-    let f = own.missing.iter().find(|m| m.model == "fresh").unwrap();
+    let f = v.missing.iter().find(|m| m.model == "fresh").unwrap();
     assert_eq!(f.why, "not benchmarked yet");
     assert_eq!(f.blocked.as_deref(), Some("the model file is missing"));
-    assert_eq!(own.run.datasets, ["own"]);
-    assert_eq!(own.run.max_images, 25);
-    // The one model on coco is alone there.
-    let coco = l.sets.iter().find(|s| s.id == "coco").unwrap();
-    assert_eq!(coco.views[0].headline.call, verdict::Call::Alone);
-    // The default is the set with the most models.
-    assert_eq!(l.default_set.as_deref(), Some("own"));
-    assert_eq!(l.sets[0].id, "own", "best set first");
+    let s = v.set.as_ref().unwrap();
+    assert_eq!(s.run.datasets, ["own"]);
+    assert_eq!(s.run.max_images, 25);
+    // The one model on coco is alone there; the default is the set with the most models.
+    let coco = w.compare(Some("coco"));
+    assert_eq!(coco.rows.len(), 1);
+    assert_eq!(
+        v.sets.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["own", "coco"]
+    );
+    assert_eq!(w.compare(None).set.unwrap().id, "own");
 }
 
 #[test]
 fn a_run_of_part_of_the_images_is_not_on_the_set() {
     let mut w = pair();
     w.preds.runs[1].images.truncate(10);
-    let l = w.build();
-    let s = &l.sets[0];
-    assert_eq!(s.views[0].rows.len(), 1);
-    assert_eq!(s.missing[0].model, "poor");
-    assert_eq!(s.missing[0].why, "scored on only 10 of these 25 frames");
+    let v = w.compare(None);
+    assert_eq!(v.rows.len(), 1);
+    assert_eq!(v.missing[0].model, "poor");
+    assert_eq!(v.missing[0].why, "scored on only 10 of these 25 frames");
 }
 
 #[test]
 fn a_run_without_stored_predictions_says_so() {
     let mut w = pair();
     w.preds.runs.remove(1);
-    let l = w.build();
+    let v = w.compare(None);
     assert_eq!(
-        l.sets[0].missing[0].why,
+        v.missing[0].why,
         "its last run kept no predictions to score on these images"
     );
 }
@@ -433,13 +464,22 @@ fn classes_only_some_models_output_are_left_out_for_all() {
     let mut w = pair();
     // `poor` has a vehicle group class and no person: only vehicles are shared.
     w.preds.runs[1].classes = vec!["vehicle".into(), "dog".into()];
-    let l = w.build();
-    let s = &l.sets[0];
-    assert_eq!(s.classes, ["vehicle"]);
-    assert_eq!(s.left_out, ["dog", "person"]);
+    let v = w.compare(None);
+    let s = v.set.as_ref().unwrap();
+    assert_eq!(s.scored_classes, ["vehicle"]);
     assert_eq!(s.objects, 10, "the persons left the count for everyone");
-    assert_eq!(row(s, "good").objects["all"].finds.all.n, 10);
-    assert_eq!(row(s, "poor").objects["all"].finds.all.n, 10);
+    for m in ["good", "poor"] {
+        let r = row(&v, m);
+        assert_eq!(
+            r.classes
+                .iter()
+                .map(|c| c.class.as_str())
+                .collect::<Vec<_>>(),
+            ["vehicle"],
+            "{m}"
+        );
+        assert_eq!(r.classes[0].objects, 10, "{m}");
+    }
 }
 
 #[test]
@@ -470,58 +510,55 @@ fn car_truck_and_bus_are_one_vehicle_for_every_model() {
             ),
         ],
     );
-    let l = w.build();
-    let s = &l.sets[0];
-    assert_eq!(s.classes, ["vehicle"]);
-    assert_eq!(row(s, "fine").objects["all"].finds.all.value, Some(1.0));
-    assert_eq!(row(s, "coarse").objects["all"].finds.all.value, Some(1.0));
+    let v = w.compare(None);
+    assert_eq!(v.set.as_ref().unwrap().scored_classes, ["vehicle"]);
+    assert_eq!(row(&v, "fine").recall, Some(1.0));
+    assert_eq!(row(&v, "coarse").recall, Some(1.0));
 }
 
+/// Every device a model ran the set on is its own row, each with its own speed; accuracy is the
+/// same predictions' wherever they ran.
 #[test]
-fn models_on_different_devices_flag_speed_and_keep_accuracy() {
+fn every_device_is_its_own_row() {
     let mut w = pair();
     w.results.models[1].devices = vec![dev("openvino:cpu", 1.0, Vec::new())];
     w.preds.runs[1].device = "openvino:cpu".into();
-    let l = w.build();
-    let s = &l.sets[0];
-    assert!(!s.speed.comparable);
-    assert!(
-        s.speed.reasons[0].contains("no device in common"),
-        "{:?}",
-        s.speed
-    );
-    assert!(!row(s, "good").speed.best && !row(s, "poor").speed.best);
-    assert!(
-        row(s, "good").objects["all"].finds.all.best,
-        "accuracy stays"
-    );
-}
-
-#[test]
-fn a_shared_device_is_preferred_over_each_models_own() {
-    let mut w = pair();
     for m in &mut w.results.models {
-        m.devices.push(dev("openvino:cpu", 2.0, Vec::new()));
+        if m.model == "good" {
+            m.devices.push(timed(
+                dev("openvino:cpu", 2.0, Vec::new()),
+                "own",
+                &[("d0.jpg", 300.0)],
+            ));
+        }
     }
-    let extra: Vec<StoredRun> = w
-        .preds
-        .runs
+    let mut extra = w.preds.runs[0].clone();
+    extra.device = "openvino:cpu".into();
+    w.preds.runs.push(extra);
+    let v = w.compare(None);
+    let combos: Vec<(&str, &str)> = v
+        .rows
         .iter()
-        .map(|r| {
-            let mut c = r.clone();
-            c.device = "openvino:cpu".into();
-            c
-        })
+        .map(|r| (r.model.as_str(), r.device.as_str()))
         .collect();
-    w.preds.runs.extend(extra);
-    w.now.insert("good".into(), now_at(0.5, "openvino:cpu"));
-    w.now.insert("poor".into(), now_at(0.5, "ort:coreml"));
-    w.default_model = Some("good".into());
-    let l = w.build();
-    let s = &l.sets[0];
-    assert_eq!(row(s, "good").device, "openvino:cpu");
-    assert_eq!(row(s, "poor").device, "openvino:cpu");
-    assert!(s.speed.comparable, "{:?}", s.speed);
+    assert_eq!(combos.len(), 3, "{combos:?}");
+    assert!(
+        combos.contains(&("good", "openvino:cpu")) && combos.contains(&("poor", "openvino:cpu"))
+    );
+    let on = |m: &str, d: &str| {
+        v.rows
+            .iter()
+            .find(|r| r.model == m && r.device == d)
+            .unwrap()
+    };
+    assert_eq!(
+        on("good", "ort:coreml").recall,
+        on("good", "openvino:cpu").recall
+    );
+    assert_ne!(
+        on("good", "ort:coreml").speed.p50_ms,
+        on("good", "openvino:cpu").speed.p50_ms
+    );
 }
 
 #[test]
@@ -546,51 +583,48 @@ fn held_out_frames_of_an_export_are_their_own_set_and_open_first() {
             i.file = format!("day.back.2026-10-10.{}", i.file);
         }
     }
-    let l = w.build();
-    assert_eq!(l.default_set.as_deref(), Some("own#split:val"));
-    let val = &l.sets[0];
-    assert_eq!(val.role, SetRole::HeldOut);
-    assert_eq!(row(val, "good").trained_on_share, Some(0.0));
-    let all = l.sets.iter().find(|s| s.id == "own").unwrap();
-    assert!(row(all, "good").excluded);
-    assert!(row(all, "good").trained_on_share.unwrap() > 0.0);
+    let v = w.compare(None);
+    let val = v.set.as_ref().unwrap();
+    assert_eq!(val.id, "own#split:val");
+    assert_eq!(val.what, SetRole::HeldOut.what());
+    let g = row(&v, "good");
+    assert_eq!(g.flags.trained_on_share, Some(0.0));
+    assert!(!g.flags.trained_here);
+    let all = w.compare(Some("own"));
+    let g = row(&all, "good");
+    assert!(g.flags.trained_here);
+    assert!(g.flags.trained_on_share.unwrap() > 0.0);
 }
 
 #[test]
 fn the_reference_model_does_not_score_itself() {
     let mut w = pair();
     w.results.image_sets[0].ground_truth = GroundTruth::Pseudo("good on openvino:cpu".into());
-    let l = w.build();
-    let s = &l.sets[0];
+    let v = w.compare(None);
+    let s = v.set.as_ref().unwrap();
     assert!(s.relative);
-    assert_eq!(s.views[0].rows.len(), 1);
-    assert_eq!(s.missing[0].model, "good");
+    assert_eq!(v.rows.len(), 1);
+    assert!(row(&v, "poor").flags.relative);
+    assert_eq!(v.missing[0].model, "good");
     assert!(
-        s.missing[0].why.contains("its own labels"),
+        v.missing[0].why.contains("its own labels"),
         "{}",
-        s.missing[0].why
+        v.missing[0].why
     );
-    assert!(s.missing[0].blocked.is_some(), "no button that cannot help");
+    assert!(v.missing[0].blocked.is_some(), "no button that cannot help");
 }
 
 #[test]
 fn an_unreachable_folder_blocks_the_button() {
     let mut w = pair();
     w.preds.runs.remove(1);
-    let history = History::default();
-    let l = build(&Inputs {
-        results: &w.results,
-        preds: Some(&w.preds),
-        history: &history,
-        now: &w.now,
-        default_model: None,
-        configured: &w.configured,
-        trained: &w.trained,
-        seen: &w.seen,
+    let inputs = Inputs {
         reachable: &|_| false,
-    });
+        ..w.inputs()
+    };
+    let v = compare_on(&inputs, None);
     assert!(
-        l.sets[0].missing[0]
+        v.missing[0]
             .blocked
             .as_deref()
             .unwrap()
@@ -599,41 +633,41 @@ fn an_unreachable_folder_blocks_the_button() {
 }
 
 #[test]
-fn no_results_no_sets_and_pairs_cover_the_models() {
+fn no_results_no_sets() {
     let w = World::new(results(), Vec::new());
-    let l = w.build();
-    assert!(l.sets.is_empty() && l.default_set.is_none());
-    let l = pair().build();
-    assert_eq!(l.pairs.len(), 1);
-    assert!(l.pairs[0].accuracy.comparable, "{:?}", l.pairs[0]);
+    let v = w.compare(None);
+    assert!(v.sets.is_empty() && v.set.is_none() && v.rows.is_empty());
+    assert!(
+        v.headline.starts_with("Nothing to compare"),
+        "{}",
+        v.headline
+    );
 }
 
+/// The JSON: no value is null, never 0; every row has its 1-based place (the table's
+/// `data-best`).
 #[test]
-fn the_contract_of_a_cell_is_null_not_zero() {
-    let l = pair().build();
-    let v = serde_json::to_value(&l).unwrap();
-    let cell = &v["sets"][0]["views"][0]["rows"][0]["objects"]["all"]["finds"]["night"];
-    assert!(cell["value"].is_null(), "{cell}");
-    assert_eq!(v["defaultSet"], "own");
-    assert_eq!(v["sets"][0]["views"][0]["rows"][0]["isDefault"], false);
-    assert_eq!(v["sets"][0]["views"][0]["headline"]["call"], "clear");
-    // Every row has its 1-based place in the view's Best first order (the table's data-best).
-    for view in l.sets[0].views.iter() {
-        let mut places: Vec<usize> = view.rows.iter().map(|r| r.best).collect();
-        places.sort_unstable();
-        assert_eq!(places, (1..=view.rows.len()).collect::<Vec<_>>());
-    }
-    assert!(
-        v["sets"][0]["views"][0]["rows"][0]["best"]
-            .as_u64()
-            .is_some()
-    );
+fn the_contract_of_a_row_is_null_not_zero() {
+    let v = pair().compare(None);
+    let j = serde_json::to_value(&v).unwrap();
+    let r0 = &j["rows"][0];
+    assert_eq!(r0["isDefault"], false);
+    assert!(r0["precision"].is_number());
+    let night = r0["scenes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["scene"] == "night");
+    assert!(night.is_none_or(|n| n["recall"].is_null()), "{night:?}");
+    let mut places: Vec<usize> = v.rows.iter().map(|r| r.position).collect();
+    places.sort_unstable();
+    assert_eq!(places, (1..=v.rows.len()).collect::<Vec<_>>());
 }
 
 /// "Your cameras": each trained model ran without the frames it trained or validated on, so
 /// Compare scores every listed model on the frames none of them saw, says how many were left out
-/// and by whom, and judges no one by a share of training frames. A model whose lists do not read
-/// is shown, never best.
+/// and by whom, and ranks them all (no trained share there). A model whose lists do not read is
+/// shown, never ranked among the fair rows.
 #[test]
 fn your_cameras_compares_on_the_frames_no_listed_model_saw() {
     use crate::benchmark::cameras::{ID, seen::Seen};
@@ -665,6 +699,8 @@ fn your_cameras_compares_on_the_frames_no_listed_model_saw() {
             vec![timed(dev("ort:coreml", 1.0, Vec::new()), ID, &ms[2..])],
         ),
     ];
+    // A trained share recorded with the run never counts here: the left-out frames decide.
+    r.models[1].trained_on_share = Some(0.33);
     let runs = vec![
         stored("plain", "ort:coreml", &["person"], ID, preds.clone()),
         stored("tuned", "ort:coreml", &["person"], ID, preds[2..].to_vec()),
@@ -677,34 +713,38 @@ fn your_cameras_compares_on_the_frames_no_listed_model_saw() {
             validated: [id_of(&names[1])].into(),
         },
     );
-    let l = w.build();
-    let s = l.sets.iter().find(|s| s.id == ID).unwrap();
-    assert_eq!((s.images, s.frames_left_out), (4, 2));
+    let v = w.compare(None);
+    let s = v.set.as_ref().unwrap();
+    assert_eq!(s.id, ID, "the headline set");
+    assert_eq!((s.frames, s.frames_left_out), (4, 2));
     assert_eq!(s.left_out_by, ["tuned"]);
     for m in ["plain", "tuned"] {
-        let r = row(s, m);
-        assert!(!r.excluded, "{m}: the left-out frames make it fair");
-        assert_eq!(r.objects["all"].finds.all.n, 4, "{m}");
+        let r = row(&v, m);
+        assert!(
+            !r.flags.trained_here,
+            "{m}: the left-out frames make it fair"
+        );
+        assert_eq!(r.block, Block::Ok, "{m}: ranked");
+        assert_eq!(r.speed.frames, 4, "{m}");
     }
-    assert_eq!(l.default_set.as_deref(), Some(ID), "the headline set");
 
     // Without knowing what it saw, its run lacks two frames: it is not on the set.
     let mut blind = World::new(w.results.clone(), w.preds.runs.clone());
     blind.seen.clear();
-    let l = blind.build();
-    let s = l.sets.iter().find(|s| s.id == ID).unwrap();
-    assert_eq!((s.images, s.frames_left_out), (6, 0));
-    let missing = s.missing.iter().find(|m| m.model == "tuned").unwrap();
+    let v = blind.compare(None);
+    let s = v.set.as_ref().unwrap();
+    assert_eq!((s.frames, s.frames_left_out), (6, 0));
+    let missing = v.missing.iter().find(|m| m.model == "tuned").unwrap();
     assert!(missing.why.contains("4 of these 6"), "{}", missing.why);
 
-    // Lists that do not read: scored on everything it ran, never best.
+    // Lists that do not read: scored on everything it ran, never ranked fairly.
     w.seen.insert(
         "plain".into(),
         Seen::Unknown("its lists do not read".into()),
     );
-    let l = w.build();
-    let s = l.sets.iter().find(|s| s.id == ID).unwrap();
-    let p = row(s, "plain");
-    assert!(p.excluded && p.unknown_seen.is_some());
-    assert!(!row(s, "tuned").excluded);
+    let v = w.compare(None);
+    let p = row(&v, "plain");
+    assert!(p.flags.trained_here && p.flags.unknown_seen.is_some());
+    assert_eq!(p.block, Block::Unfair);
+    assert_eq!(row(&v, "tuned").block, Block::Ok);
 }

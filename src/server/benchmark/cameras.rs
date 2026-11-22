@@ -1,10 +1,11 @@
-//! "Your cameras" on the Benchmark page ([`crate::benchmark::cameras`]): its row on the Run tab
+//! "Your cameras" on the Benchmark pages ([`crate::benchmark::cameras`]): its row on the Run step
 //! (first; the line of frames, cameras, days, sizes and scenes, or why it cannot be ticked),
 //! `labelsChanged` of `GET /v1/benchmark` (frames whose labels changed since the snapshot a run
 //! scored against), and `POST /v1/benchmark/rescore`. The counts come from the background walk of
 //! [`crate::benchmark::cameras::live`]: a poll never walks the review folder.
 
-use super::{AppState, DatasetRow, json_error, raw};
+use super::pages::DatasetRow;
+use super::{AppState, json_error, raw};
 use crate::benchmark::cameras::live::{self, Found};
 use crate::benchmark::cameras::snapshot::{self, GtSnapshot};
 use crate::benchmark::cameras::{ID, Source, TITLE};
@@ -22,7 +23,8 @@ use std::time::{Duration, Instant};
 /// How long the page waits for the first walk of the folder before it shows "counting".
 const PAGE_WAIT: Duration = Duration::from_millis(1500);
 
-/// The Run tab's row of the set.
+/// The Run step's row of the set: the line of frames, cameras, days, sizes and scenes, or why it
+/// cannot be ticked ("review frames first", a missing folder).
 pub(super) fn dataset_row(c: &Config, checked: bool) -> DatasetRow {
     let src = Source::of(c);
     let mut current = live::peek(&src);
@@ -36,9 +38,9 @@ pub(super) fn dataset_row(c: &Config, checked: bool) -> DatasetRow {
         title: TITLE.to_string(),
         tests: String::new(),
         size: String::new(),
-        license: String::new(),
-        state: "folder",
+        images: 0,
         state_text: String::new(),
+        chip: "same",
         checked,
         download_id: None,
         folder: false,
@@ -47,27 +49,34 @@ pub(super) fn dataset_row(c: &Config, checked: bool) -> DatasetRow {
     match current.as_deref().map(|c| &c.found) {
         Some(Found::Ready { survey, .. }) => DatasetRow {
             tests: survey.line(),
-            size: if survey.low_confidence() {
-                format!("{} labelled objects \u{b7} low confidence", survey.objects)
+            size: format!("{} labelled objects", survey.objects),
+            images: survey.frames,
+            state_text: if survey.low_confidence() {
+                "low confidence".into()
             } else {
-                format!("{} labelled objects", survey.objects)
+                "recommended".into()
             },
-            state_text: "your reviewed frames".into(),
+            chip: if survey.low_confidence() {
+                "warn"
+            } else {
+                "ok"
+            },
             ..base
         },
         Some(Found::Missing(why)) => DatasetRow {
             tests: why.clone(),
-            state: "missing",
             state_text: "folder missing".into(),
+            chip: "bad",
+            checked: false,
             selectable: false,
             ..base
         },
         Some(Found::Empty) => DatasetRow {
-            tests: "No reviewed frame yet: review frames on the Train tab's Review step to \
+            tests: "No reviewed frame yet: review frames on the Train area's Review step to \
                     benchmark on your own cameras"
                 .into(),
-            state: "unavailable",
             state_text: "no reviewed frame".into(),
+            checked: false,
             selectable: false,
             ..base
         },
@@ -319,10 +328,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_run_tab_lists_your_cameras_first() {
+    async fn the_run_step_lists_your_cameras_first() {
         let st = st_with_classes();
         seeded(&st);
-        let (s, v) = call(&st, get("/benchmark")).await;
+        let (s, v) = call(&st, get("/benchmark/run")).await;
         assert_eq!(s, StatusCode::OK);
         let html = v.as_str().unwrap();
         let cams = html
@@ -331,8 +340,8 @@ mod tests {
         let coco = html.find("name=\"dataset\" value=\"coco-cctv\"").unwrap();
         assert!(cams < coco, "first");
         assert!(
-            html.contains("name=\"dataset\" value=\"cameras\" checked"),
-            "selected by default"
+            html.contains("name=\"dataset\" value=\"cameras\" data-images=\"2\" checked"),
+            "selected by default, with its frame count for the estimate"
         );
         assert!(
             html.contains("2 frames \u{b7} 1 camera \u{b7} 2 camera days"),
@@ -340,10 +349,10 @@ mod tests {
         );
         // No reviewed frame: shown, not selectable, with what to do.
         let st = state();
-        let (_, v) = call(&st, get("/benchmark")).await;
+        let (_, v) = call(&st, get("/benchmark/run")).await;
         let html = v.as_str().unwrap();
         assert!(
-            html.contains("name=\"dataset\" value=\"cameras\" disabled"),
+            html.contains("name=\"dataset\" value=\"cameras\" data-images=\"0\" disabled"),
             "disabled"
         );
         assert!(html.contains("No reviewed frame yet"));

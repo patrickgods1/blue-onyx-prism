@@ -458,7 +458,7 @@ struct ResultRow {
     /// "merged: truck \u{2192} car" (empty without merges).
     merges: String,
     benchmark: String,
-    /// `/benchmark?set=...#tab-compare`: Compare on the run's held-out images.
+    /// `/benchmark/compare?set=...`: Compare on the run's held-out images.
     compare_href: String,
     /// The new model and the current default on the same frames, in words.
     compare: String,
@@ -1020,15 +1020,15 @@ fn extension(r: &RunRecord) -> Option<&crate::training::progress::ExtensionNotic
     r.progress.as_ref()?.extension.as_ref()
 }
 
-/// The Benchmark page's Compare tab on the images a run was benchmarked on: its held-out set
-/// comes first in `datasets`. Without a benchmark the page opens on its default set.
+/// The Benchmark's Compare step on the images a run was benchmarked on: its held-out set comes
+/// first in `datasets`. Without a benchmark the step opens on its default set.
 fn compare_href(b: Option<&BenchSummary>) -> String {
     match b.and_then(|b| b.datasets.first()) {
         Some(set) => format!(
-            "/benchmark?set={}#tab-compare",
+            "/benchmark/compare?set={}",
             super::config_page::encode_uri_component(set)
         ),
-        None => "/benchmark#tab-compare".to_string(),
+        None => "/benchmark/compare".to_string(),
     }
 }
 
@@ -5902,9 +5902,9 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(
             compare_href(Some(&b)),
-            "/benchmark?set=heldout-a%20b#tab-compare"
+            "/benchmark/compare?set=heldout-a%20b"
         );
-        assert_eq!(compare_href(None), "/benchmark#tab-compare");
+        assert_eq!(compare_href(None), "/benchmark/compare");
     }
 
     #[test]

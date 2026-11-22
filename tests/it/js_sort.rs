@@ -284,8 +284,6 @@ assert.deepStrictEqual(plain(S.click([], 3, false)), [{col: '3', dir: 'asc'}], '
 // The stored state: the list, and both old Benchmark shapes.
 assert.deepStrictEqual(plain(S.parseState('[{"col":"a","dir":"desc"},{"col":"b","dir":"asc"}]')), [{col: 'a', dir: 'desc'}, {col: 'b', dir: 'asc'}]);
 assert.deepStrictEqual(plain(S.parseState('{"col":"model","dir":"desc"}')), [{col: 'model', dir: 'desc'}]);
-assert.deepStrictEqual(plain(S.parseState('{"sort":{"col":"fps","dir":"desc"},"q":"gpu","model":"","device":"","runtime":"","thisRun":false}')), [{col: 'fps', dir: 'desc'}]);
-assert.deepStrictEqual(plain(S.parseState({sort: {col: 'model', dir: 'asc'}})), [{col: 'model', dir: 'asc'}]);
 // Nothing usable: null (the table's own order).
 for (const bad of [null, undefined, '', 'not json', '42', '"text"', '[]', '{}', '{"sort":null,"q":"x"}', '{"q":"x"}', '[{"dir":"asc"}]', '[{"col":""}]']) {
   assert.strictEqual(S.parseState(bad), null, String(bad));
@@ -506,18 +504,6 @@ Promise.resolve().then(() => {
   const sp = t4.tHead.rows[0].cells[2];
   sp.dispatch('click', {target: sp});
   assert.deepStrictEqual(names(t4), ['m1', 'm2', 'm0'], 'speed: 30 ms < 1.2 s');
-  // Migration of the old benchmark state.
-  store['prism.bench.table:compare'] = JSON.stringify({sort: {col: 'fps', dir: 'desc'}, q: 'gpu'});
-  win.location.pathname = '/benchmark';
-  const t5 = el('table', {}, [el('thead', {}, [el('tr', {}, [el('th', {text: 'Model', 'data-sort-col': 'model'}), el('th', {text: 'FPS', 'data-sort-col': 'fps'})])]), el('tbody', {}, [
-    el('tr', {}, [el('td', {text: 'a', 'data-v': 'a'}), el('td', {text: '12.0/s', 'data-v': '12'})]),
-    el('tr', {}, [el('td', {text: 'b', 'data-v': 'b'}), el('td', {text: '-', 'data-v': ''})]),
-    el('tr', {}, [el('td', {text: 'c', 'data-v': 'c'}), el('td', {text: '30.0/s', 'data-v': '30'})]),
-  ])]);
-  doc.body.appendChild(t5); S.attach(t5, {key: 'compare', defaultKeys: [{col: 'model', dir: 'asc'}]});
-  assert.deepStrictEqual(names(t5), ['c', 'a', 'b']);
-  assert.strictEqual(store['prism.sort:/benchmark:compare'], '[{"col":"fps","dir":"desc"}]');
-  assert.deepStrictEqual(JSON.parse(store['prism.bench.table:compare']), {q: 'gpu'}, 'old sort taken out');
   // state / restore for an unkeyed table.
   const t6 = el('table', {}, [el('thead', {}, [el('tr', {}, [el('th', {text: 'N'})])]), el('tbody', {}, [el('tr', {}, [el('td', {text: 'b'})]), el('tr', {}, [el('td', {text: 'a'})])])]);
   doc.body.appendChild(t6); S.attach(t6, {});

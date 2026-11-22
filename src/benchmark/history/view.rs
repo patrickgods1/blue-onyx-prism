@@ -1,12 +1,9 @@
-//! The history-derived fields of `GET /v1/benchmark`: the newest run id, the noise rules, and
-//! per saved model whether it is from the newest run, its trust and what changed since the
+//! The history-derived fields of `GET /v1/benchmark`: the newest run id and per saved model whether it is from the newest run, its trust and what changed since the
 //! baseline; per device its runtime and trust. Pure: works on the JSON of the saved results.
 
-use super::compare::{SE_FACTOR, SPEED_ABS_MS, SPEED_REL};
-use super::trust::{TRUST_LOW_OBJECTS, TRUST_MEDIUM_OBJECTS, device_trust, model_trust};
+use super::trust::{device_trust, model_trust};
 use super::{History, HistoryEntry, compare_with_history, runtime_of};
 use crate::benchmark::report::BenchmarkResults;
-use crate::benchmark::threshold::PLATEAU;
 
 /// The newest `run_id` over `results.models` (by time; None when no model has one).
 pub fn latest_run_id(results: &BenchmarkResults) -> Option<String> {
@@ -26,19 +23,6 @@ pub fn time_cmp(a: &str, b: &str) -> std::cmp::Ordering {
         (Some(_), None) => std::cmp::Ordering::Greater,
         (None, None) => a.cmp(b),
     }
-}
-
-/// The verdict rules, for the page's glossary.
-pub fn noise_json() -> serde_json::Value {
-    serde_json::json!({
-        "speed_rel": SPEED_REL,
-        "speed_abs_ms": SPEED_ABS_MS,
-        "se_factor": SE_FACTOR,
-        "plateau_points": PLATEAU * 100.0,
-        "trust_low_objects": TRUST_LOW_OBJECTS,
-        "trust_medium_objects": TRUST_MEDIUM_OBJECTS,
-        "min_class_gt": crate::benchmark::metrics::MIN_CLASS_GT,
-    })
 }
 
 /// Add to `value` (the JSON of `results`, models in the same order) per model `this_run`,

@@ -679,7 +679,7 @@ pub fn shared_load_text(r: &RunResult) -> Option<String> {
 /// A run's first load (compile + request creation) as shown: "2.1 s, cached" (an OpenVINO /
 /// TensorRT / CoreML cache hit), "24 s, compiled" (a miss: compiled and cached now), "0.8 s" (a
 /// runtime without a compile cache), "3.0 s, cache off", "3.0 s, cache unknown". Twin:
-/// `loadText` in `assets/benchmark.js`.
+/// `BenchCore.loadText` in `assets/bench-core.js` (tests/it/js_bench.rs).
 pub fn first_load_text(compile_ms: f64, cache: &str) -> String {
     let s = compile_ms.max(0.0) / 1e3;
     let secs = if s >= 10.0 {
@@ -1062,14 +1062,6 @@ pub struct BenchmarkResults {
     /// Datasets the models were run on (images, tags, ground truth).
     #[serde(default)]
     pub image_sets: Vec<ImageSetInfo>,
-}
-
-/// `name` is in `only` (normalized names), or `only` is None.
-fn wanted(only: Option<&[String]>, name: &str) -> bool {
-    only.is_none_or(|o| {
-        o.iter()
-            .any(|n| crate::registry::normalize_name(n) == crate::registry::normalize_name(name))
-    })
 }
 
 /// The text of `path`; None when it does not exist.
@@ -1463,53 +1455,6 @@ impl BenchmarkResults {
             .filter_map(|s| crate::backend::spec::parse(s).ok()?.device().copied())
             .collect();
         (!order.is_empty()).then_some(order)
-    }
-
-    /// `(model, best confidence threshold)` of every model with threshold advice, optionally
-    /// limited to `only` (normalized names).
-    pub fn thresholds(&self, only: Option<&[String]>) -> Vec<(String, f32)> {
-        self.models
-            .iter()
-            .filter(|m| wanted(only, &m.model))
-            .filter_map(|m| {
-                let t = m.threshold.as_ref()?.apply_value()?;
-                Some((m.model.clone(), t))
-            })
-            .collect()
-    }
-
-    /// `(model, device, best confidence threshold)` for every device that ran of every model
-    /// with threshold advice ([`ThresholdAdvice::device_apply_values`]: devices whose pick does
-    /// not apply are left out), optionally limited to `only` (normalized names). Models in
-    /// result order, devices in each model's [`ThresholdAdvice::by_device`] order. These are
-    /// the confidence profiles an "apply all" writes
-    /// ([`crate::config_form::apply_device_thresholds`]).
-    pub fn device_thresholds(&self, only: Option<&[String]>) -> Vec<(String, String, f32)> {
-        self.models
-            .iter()
-            .filter(|m| wanted(only, &m.model))
-            .filter_map(|m| Some((m, m.threshold.as_ref()?.device_apply_values())))
-            .flat_map(|(m, v)| v.into_iter().map(|(d, t)| (m.model.clone(), d, t)))
-            .collect()
-    }
-
-    /// The models (optionally limited to `only`) whose best threshold, overall or on a device,
-    /// was fitted on pseudo ground truth: an "apply all" leaves them alone
-    /// ([`crate::benchmark::threshold::NOT_ON_LABELS`]).
-    pub fn not_on_labels(&self, only: Option<&[String]>) -> Vec<String> {
-        self.models
-            .iter()
-            .filter(|m| wanted(only, &m.model))
-            .filter(|m| {
-                m.threshold.as_ref().is_some_and(|a| {
-                    a.not_on_labels().is_some()
-                        || a.by_device
-                            .iter()
-                            .any(|d| d.best.as_ref().is_some_and(|b| b.relative))
-                })
-            })
-            .map(|m| m.model.clone())
-            .collect()
     }
 
     /// `(model, recommended device)` of every model with a recommendation, optionally limited
@@ -2350,34 +2295,6 @@ mod tests {
                 .is_none()
         }));
         assert_eq!(s.threshold, m.threshold);
-        let r = BenchmarkResults::new(Default::default(), Default::default(), vec![m.clone()]);
-        assert_eq!(r.thresholds(None), [("m".to_string(), 0.28)]);
-        assert!(r.thresholds(Some(&["other".into()])).is_empty());
-        // Per device: every scored device row whose pick applies.
-        let per_device = r.device_thresholds(None);
-        let by_device = &m.threshold.as_ref().unwrap().by_device;
-        assert!(!per_device.is_empty());
-        assert_eq!(
-            per_device.len(),
-            by_device
-                .iter()
-                .filter(|p| p
-                    .best
-                    .as_ref()
-                    .is_some_and(|b| b.met && b.point.counts.tp > 0))
-                .count()
-        );
-        for (model, device, t) in &per_device {
-            assert_eq!(model, "m");
-            assert_eq!(
-                Some(*t),
-                m.threshold.as_ref().unwrap().apply_value_on(device),
-                "{device}"
-            );
-        }
-        assert_eq!(r.device_thresholds(Some(&["M".into()])), per_device);
-        assert!(r.device_thresholds(Some(&["other".into()])).is_empty());
-
         // Another objective: F2 favors the lower threshold that finds everything.
         let mut m2 = m.clone();
         m2.threshold_objective = Objective::F2;

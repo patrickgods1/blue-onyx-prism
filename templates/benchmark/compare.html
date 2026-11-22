@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Benchmark: Compare{% endblock %}
+{% block content %}
+<div class="bench" id="bench" data-step="compare" data-has-results="{{ shell.has_results }}">
+{% include "benchmark/shell.html" %}
+<section aria-labelledby="h-compare">
+  <h2 id="h-compare" class="sr-only">Compare</h2>
+  <div id="cmp-body"{% if !shell.has_results %} hidden{% endif %}>
+    <div class="bn-row between">
+      <div class="bn-row">
+        <label for="c-set">Images <select id="c-set"><option value="">Loading&hellip;</option></select></label>
+        <label for="c-scene">Scene <select id="c-scene"><option value="all">All</option><option value="day">Day</option><option value="night">Night</option><option value="ir">IR</option></select></label>
+      </div>
+      <p class="muted small" id="c-left" hidden></p>
+    </div>
+    <p class="bn-pick" id="c-headline" aria-live="polite"><span class="bn-skel"></span></p>
+    <div class="scroll" id="c-table-wrap"><table class="bn-table rcards" id="c-table" data-sort="bench-compare" data-sort-default="best"><tbody><tr><td><span class="bn-skel tall"></span></td></tr></tbody></table></div>
+    <p class="bn-foot" id="c-foot"></p>
+    <div class="bn-row between">
+      <details class="bn-cols" id="c-cols"><summary>Columns</summary><div class="bn-row small" id="c-cols-list" role="group" aria-label="Optional columns"></div></details>
+      <div class="actions"><button type="button" class="small secondary" id="c-report">Save report</button><button type="button" class="small secondary" id="c-csv">Download CSV</button></div>
+    </div>
+    <p class="bn-msg small" id="c-msg" role="status" aria-live="polite"></p>
+    <div class="card" id="c-missing" hidden></div>
+    <div class="card">
+      <h3 id="sc-title">Goal metric against speed</h3>
+      <div class="bn-chart-box" id="c-scatter"></div>
+      <ul class="bn-legend" id="c-scatter-legend"></ul>
+    </div>
+    <div class="bn-tabs" role="tablist" aria-label="Breakdowns" id="c-tabs">
+      <button type="button" role="tab" id="bt-scenes" aria-controls="c-breakdown" aria-selected="true" data-bt="scenes">Day / Night / IR</button>
+      <button type="button" role="tab" id="bt-classes" aria-controls="c-breakdown" aria-selected="false" tabindex="-1" data-bt="classes">Classes</button>
+      <button type="button" role="tab" id="bt-cameras" aria-controls="c-breakdown" aria-selected="false" tabindex="-1" data-bt="cameras">Cameras</button>
+      <button type="button" role="tab" id="bt-speed" aria-controls="c-breakdown" aria-selected="false" tabindex="-1" data-bt="speed">Speed</button>
+    </div>
+    <div id="c-breakdown" role="tabpanel" aria-labelledby="bt-scenes" tabindex="0"></div>
+  </div>
+  <div id="cmp-empty" class="bn-empty"{% if shell.has_results %} hidden{% endif %}>
+    <p><strong>No results yet.</strong></p>
+    <p>Run a benchmark first; this step then ranks every model on every device for your goal.</p>
+    <p><a class="btn" href="/benchmark/run">Go to Run</a></p>
+  </div>
+</section>
+<dialog class="bn-dialog" id="report-dlg" aria-labelledby="report-title">
+  <div class="bn-dh"><h2 id="report-title">Save report</h2><button type="button" class="small secondary" id="report-x" aria-label="Close">Close</button></div>
+  <div class="bn-db">
+    <p class="muted small">Writes a standalone HTML report of the saved results (the same as <code>benchmark --report</code>) into a folder on the server as <code>benchmark-report-&lt;time&gt;.html</code>.</p>
+    <div class="bn-addfolder"><label for="report-dir" class="sr-only">Folder</label><input autocapitalize="none" autocorrect="off" spellcheck="false" type="text" id="report-dir" placeholder="/path/to/reports"><button type="button" class="browse secondary small" data-browse="folder" data-target="report-dir" data-title="Choose a folder for the report" hidden>Browse&hellip;</button></div>
+    <p class="bn-msg small" id="report-msg" role="status" aria-live="polite"></p>
+    <div class="actions"><button type="button" class="secondary" id="report-cancel">Cancel</button><button type="button" id="report-save">Save report</button></div>
+  </div>
+</dialog>
+</div>
+{% include "file_browser.html" %}
+<script src="/static/bench-core.js?v={{ version }}"></script>
+<script src="/static/bench-charts.js?v={{ version }}"></script>
+<script src="/static/bench-shell.js?v={{ version }}"></script>
+<script src="/static/bench-compare.js?v={{ version }}"></script>
+<script src="/static/browse.js?v={{ version }}"></script>
+{% endblock %}

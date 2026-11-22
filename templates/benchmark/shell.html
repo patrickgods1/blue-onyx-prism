@@ -1,0 +1,28 @@
+{# The Benchmark shell of every step (src/server/benchmark/pages.rs `Shell`; bench-shell.js): the
+   title and the goal chip, the stepper, History / Images, and the status area. #}
+<div class="bn-head">
+  <h1>Benchmark</h1>
+  <button type="button" class="bn-goal-chip" id="goal-chip" aria-haspopup="dialog" aria-controls="goal-dlg"><span id="goal-chip-k">Goal:</span> <b id="goal-chip-v">{{ shell.goal_summary }}</b> <span class="bn-goal-edit">Change</span></button>
+</div>
+<nav class="bn-stepper" aria-label="Benchmark steps">
+  <ol>
+    <li><a class="bn-step{% if shell.run_done %} done{% endif %}" href="/benchmark/run" data-step="run"{% if shell.step == "run" %} aria-current="step"{% endif %}><span class="bn-n" aria-hidden="true">{% if shell.run_done %}&#10003;{% else %}1{% endif %}</span><span><span class="bn-t">Run{% if shell.run_done %}<span class="sr-only"> (done)</span>{% endif %}</span><span class="bn-s">Images, models, devices</span></span></a></li>
+    <li><a class="bn-step" href="/benchmark/compare" data-step="compare"{% if shell.step == "compare" %} aria-current="step"{% endif %}><span class="bn-n" aria-hidden="true">2</span><span><span class="bn-t">Compare</span><span class="bn-s">Best model for your goal</span></span></a></li>
+    <li><a class="bn-step" href="/benchmark/tune" data-step="tune"{% if shell.step == "tune" %} aria-current="step"{% endif %}><span class="bn-n" aria-hidden="true">3</span><span><span class="bn-t">Tune &amp; save</span><span class="bn-s">Confidence per device</span></span></a></li>
+  </ol>
+  <div class="bn-side"><a href="/benchmark/history" data-step="history"{% if shell.step == "history" %} aria-current="page"{% endif %}>History</a><a href="/benchmark/images" data-step="images"{% if shell.step == "images" %} aria-current="page"{% endif %}>Images</a></div>
+</nav>
+<div class="bn-status" id="bn-status">
+  {% if shell.force_cpu %}<p class="warn small">Force CPU is on: it overrides every per-model device until it is unchecked on the <a href="/config#inference">Config page</a>.</p>{% endif %}
+  {% if let Some(n) = shell.interrupted %}<p class="warn small" id="bench-interrupted">{{ n }}</p>{% endif %}
+  <div class="bn-progress" id="bn-progress" role="status" hidden>
+    <strong id="bn-progress-what"></strong>
+    <span class="bn-bar" aria-hidden="true"><i id="bn-progress-bar"></i></span>
+    <span class="muted small" id="bn-progress-text"></span>
+    <button type="button" class="small danger" id="bn-cancel">Cancel</button>
+  </div>
+  <p class="warn small" id="bn-labels" hidden><span id="bn-labels-text"></span> <span class="actions-inline"><button type="button" class="small secondary" id="bn-rescore">Re-score</button><span class="muted">No inference; takes seconds.</span></span></p>
+  <p class="notice small" id="bn-trying" hidden><span id="bn-trying-text"></span> <span class="actions-inline"><button type="button" class="small" id="bn-try-save">Save goal</button><a class="btn small secondary" id="bn-try-back" href="#">Back to the saved goal</a></span></p>
+  <p class="bn-msg small" id="bn-shell-msg" role="status" aria-live="polite"></p>
+</div>
+{% include "benchmark/goal_dialog.html" %}

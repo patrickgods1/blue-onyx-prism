@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Benchmark: History{% endblock %}
+{% block content %}
+<div class="bench" id="bench" data-step="history" data-has-results="{{ shell.has_results }}">
+{% include "benchmark/shell.html" %}
+<section aria-labelledby="h-hist">
+  <h2 id="h-hist">History</h2>
+  <p class="muted">One model across runs: what changed and whether the change is real.</p>
+  <div class="bn-row"><label for="h-model">Model <select id="h-model"><option value="">Loading&hellip;</option></select></label></div>
+  <p class="bn-error" id="h-error" role="alert" hidden></p>
+  <div class="scroll"><table class="bn-table rcards" id="h-runs" data-sort="bench-history"><tbody><tr><td><span class="bn-skel"></span></td></tr></tbody></table></div>
+  <div class="bn-confirm" id="h-confirm" role="alertdialog" aria-labelledby="h-confirm-text" hidden><p id="h-confirm-text"></p><div class="actions"><button type="button" class="danger" id="h-confirm-yes">Delete the run</button><button type="button" class="secondary" id="h-confirm-no">Keep it</button></div></div>
+  <p class="bn-msg small" id="h-msg" role="status" aria-live="polite"></p>
+  <div class="card">
+    <h3>Compare two runs</h3>
+    <div class="bn-row"><label for="h-a">A <select id="h-a"></select></label><label for="h-b">B <select id="h-b"></select></label></div>
+    <p class="muted small" id="h-ab-summary"></p>
+    <div class="scroll"><table class="bn-table rcards" id="h-ab" data-sort="bench-history-ab"></table></div>
+  </div>
+  <div class="card">
+    <h3>Trend</h3>
+    <div class="bn-row small"><label for="h-metric">Show <select id="h-metric"><option value="goal">Goal metric</option><option value="p95">p95 latency</option><option value="conf">Saved confidence</option></select></label><label for="h-device">Device <select id="h-device"></select></label></div>
+    <div class="bn-chart-box" id="h-trend"></div>
+    <p class="bn-foot">Bars are 95% intervals. Hollow points ran on other images, so they do not compare directly.</p>
+    <details class="small"><summary>Show as table</summary><div class="scroll" id="h-trend-table"></div></details>
+  </div>
+</section>
+</div>
+<script src="/static/bench-core.js?v={{ version }}"></script>
+<script src="/static/bench-charts.js?v={{ version }}"></script>
+<script src="/static/bench-shell.js?v={{ version }}"></script>
+<script src="/static/bench-history.js?v={{ version }}"></script>
+{% endblock %}

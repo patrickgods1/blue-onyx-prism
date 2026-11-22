@@ -735,26 +735,8 @@ mod tests {
             c.benchmark.low_priority,
             "checked checkbox after the hidden 0"
         );
-        let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
-        let html = String::from_utf8(
-            axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(
-            html.contains("<option value=\"roc_auc\" selected>"),
-            "{html}"
-        );
-        assert!(
-            html.contains("<option value=\"youden\" selected>"),
-            "{html}"
-        );
-        assert!(
-            html.contains(r#"name="low_priority" value="1" checked>"#),
-            "{html}"
-        );
+        let html = page_html(&st).await;
+        assert!(html.contains(r#"id="o-low" checked>"#), "{html}");
         // Unchecked: only the hidden 0 is sent.
         let (s, v) = call(
             &st,
@@ -764,15 +746,8 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         let c = crate::config::Config::load(&st.config_path).unwrap();
         assert!(!c.benchmark.low_priority);
-        let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
-        let html = String::from_utf8(
-            axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(html.contains(r#"name="low_priority" value="1">"#), "{html}");
+        let html = page_html(&st).await;
+        assert!(html.contains(r#"id="o-low">"#), "{html}");
         let (s, _) = call(
             &st,
             post(
@@ -899,9 +874,12 @@ mod tests {
         )
     }
 
-    /// The `/benchmark` page body (status checked).
+    /// The `/benchmark/run` page body (status checked).
     async fn page_html(st: &Arc<AppState>) -> String {
-        let resp = router(st.clone()).oneshot(get("/benchmark")).await.unwrap();
+        let resp = router(st.clone())
+            .oneshot(get("/benchmark/run"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         String::from_utf8(
             axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -961,7 +939,7 @@ mod tests {
         let folder = folder_ref(&gone);
         seed_datasets(&st, vec![folder.clone()]);
         let html = page_html(&st).await;
-        assert!(html.contains("directory not found"), "{html}");
+        assert!(html.contains("folder not found"), "{html}");
         // The settings form cannot do this (it validates the folder); the dedicated route can.
         let (s, v) = call(&st, remove_req(&folder.label())).await;
         assert_eq!(s, StatusCode::OK, "{v}");

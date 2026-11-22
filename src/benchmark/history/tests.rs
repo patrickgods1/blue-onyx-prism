@@ -853,11 +853,6 @@ fn view_annotates_status_json() {
         (f["this_run"].clone(), f["changes"].clone()),
         (false.into(), serde_json::Value::Null)
     );
-    let n = view::noise_json();
-    assert_eq!(n["speed_rel"], 0.05);
-    assert_eq!(n["trust_medium_objects"], 300);
-    assert_eq!(n["min_class_gt"], 20);
-    assert!((n["plateau_points"].as_f64().unwrap() - 0.2).abs() < 1e-9);
 }
 
 #[test]

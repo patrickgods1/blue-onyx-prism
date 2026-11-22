@@ -347,7 +347,9 @@ pub(super) const BLUE_IRIS_THRESHOLD_NOTE: &str = "Blue Iris may send its own mi
 /// - `model=<name>&threshold=<0..1>&device=<spec>`: a `device` right after a pair writes that
 ///   device's confidence profile instead (`threshold=global` or `none` removes it); the
 ///   model's own threshold is left alone (`device=` empty or `global`: the model's threshold);
-/// - `all=1` (optionally limited by repeated `model`): every best threshold of the saved results.
+/// - `all=1` (optionally limited by repeated `model`): every model's suggested confidence on its
+///   recommended device (the Tune view's cross-validated pick for the saved goal; not savable
+///   picks are left out and named, and low-confidence ones too unless `confirm=1`).
 ///
 /// Thresholds and profiles apply live (no restart; `restart=1` is accepted and ignored,
 /// `restarting` and `needsRestart` are always false). Answers JSON with the changes,
@@ -520,22 +522,19 @@ fn clear_model_thresholds(
     Ok(changes)
 }
 
-/// " Not applied for m: its best threshold was fitted on another model's detections, not on
-/// labels." (empty without `skipped` models).
+/// " Not applied: m on ort:cpu (not savable: ...)." (empty without `skipped` picks).
 fn skipped_note(skipped: &[String]) -> String {
     if skipped.is_empty() {
         return String::new();
     }
     format!(
-        " Not applied for {}: the best threshold was {} (a set without ground truth); type a \
-         value to set one.",
-        skipped.join(", "),
-        crate::benchmark::threshold::NOT_ON_LABELS
+        " Not applied: {}. Save those on the Benchmark's Tune step, or type a value.",
+        skipped.join("; ")
     )
 }
 
-/// The refusal of an "apply all" that found nothing to apply because every best threshold of
-/// `skipped` was fitted on pseudo ground truth (409), else the usual 404 `none`.
+/// The refusal of an "apply all" that found nothing to apply because every suggestion of
+/// `skipped` cannot be saved (409), else the usual 404 `none`.
 fn nothing_to_apply(skipped: &[String], none: &str) -> ApiError {
     if skipped.is_empty() {
         return ApiError::new(StatusCode::NOT_FOUND, none.to_string());
@@ -543,12 +542,60 @@ fn nothing_to_apply(skipped: &[String], none: &str) -> ApiError {
     ApiError::new(
         StatusCode::CONFLICT,
         format!(
-            "not applied: the best threshold of {} was {} (a set without ground truth); type a \
-             value to set one",
-            skipped.join(", "),
-            crate::benchmark::threshold::NOT_ON_LABELS
+            "not applied: {}; save those on the Benchmark's Tune step, or type a value",
+            skipped.join("; ")
         ),
     )
+}
+
+/// The suggested confidences an "apply all" writes ([`crate::benchmark::eval::tune::suggestions`],
+/// the Tune view's cross-validated pick with targets on their 95% bound, for the saved goal), of
+/// the configured models (limited to `only`): the applicable ones and, in words, the ones left
+/// alone (not savable; low confidence without `confirm`).
+fn suggested(
+    state: &AppState,
+    only: Option<&[String]>,
+    confirm: bool,
+) -> Result<(Vec<crate::benchmark::eval::tune::Suggested>, Vec<String>), ApiError> {
+    let results = results_for_apply(state)?;
+    let preds = crate::benchmark::search::StoredPreds::load_cached(
+        &crate::benchmark::search::preds_path(&state.config_path),
+    )
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+    .filter(|p| !p.runs.is_empty())
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no stored predictions: run a benchmark first",
+        )
+    })?;
+    let cfg = state.config_read().clone();
+    let mut ok = Vec::new();
+    let mut skipped = Vec::new();
+    for s in crate::benchmark::eval::tune::suggestions(
+        &results,
+        &preds,
+        &cfg.benchmark.goal,
+        cfg.benchmark.weights,
+        only,
+    ) {
+        if crate::benchmark::find_model(&cfg, &s.model).is_none() {
+            continue;
+        }
+        let why = match (&s.refusal, s.threshold, &s.low_confidence) {
+            (Some(r), _, _) => Some(r.clone()),
+            (None, None, _) => Some("no suggestion".to_string()),
+            (None, Some(_), Some(l)) if !confirm => {
+                Some(format!("{l} (send confirm=1 to save it anyway)"))
+            }
+            _ => None,
+        };
+        match why {
+            Some(w) => skipped.push(format!("{} on {} ({w})", s.model, s.device)),
+            None => ok.push(s),
+        }
+    }
+    Ok((ok, skipped))
 }
 
 /// One pick of an apply-threshold form: `threshold` None clears the model's own threshold, or
@@ -572,28 +619,35 @@ fn threshold_picks(
 ) -> Result<(Vec<ThresholdPick>, Vec<String>), ApiError> {
     let models = form_models(form);
     if form_field(form, "all").is_some_and(truthy) {
-        let results = results_for_apply(state)?;
         let only = (!models.is_empty()).then_some(models.as_slice());
-        let cfg = state.config_read().clone();
-        let skipped: Vec<String> = results
-            .not_on_labels(only)
-            .into_iter()
-            .filter(|m| crate::benchmark::find_model(&cfg, m).is_some())
-            .collect();
-        let picks: Vec<ThresholdPick> = results
-            .thresholds(only)
-            .into_iter()
-            .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
-            .map(|(model, t)| ThresholdPick {
-                model,
-                threshold: Some(t),
+        let confirm = form_field(form, "confirm").is_some_and(truthy);
+        let (ok, skipped) = suggested(state, only, confirm)?;
+        // Per model the suggestion of its recommended device, else of its first one.
+        let mut picks: Vec<ThresholdPick> = Vec::new();
+        for s in &ok {
+            let key = crate::registry::normalize_name(&s.model);
+            let have = picks
+                .iter()
+                .position(|p| crate::registry::normalize_name(&p.model) == key);
+            let pick = ThresholdPick {
+                model: s.model.clone(),
+                threshold: s.threshold,
                 device: None,
-            })
-            .collect();
+            };
+            match have {
+                None => picks.push(pick),
+                Some(i) if s.recommended => {
+                    if let Some(p) = picks.get_mut(i) {
+                        *p = pick;
+                    }
+                }
+                Some(_) => {}
+            }
+        }
         if picks.is_empty() {
             return Err(nothing_to_apply(
                 &skipped,
-                "the saved results have no best threshold for these models",
+                "the saved results have no suggested confidence for these models",
             ));
         }
         return Ok((picks, skipped));
@@ -680,8 +734,10 @@ fn threshold_picks(
 /// `POST /v1/benchmark/apply-profiles` (urlencoded): write per-device confidence profiles
 /// ([`crate::config::ModelConfig::device_thresholds`]) and per-model devices in one
 /// `save_config` (one revision, one Undo):
-/// - `all=1` (optionally limited by repeated `model`): every measured device's best threshold
-///   of every configured model of the saved results;
+/// - `all=1` (optionally limited by repeated `model`): every measured device's suggested
+///   confidence of every configured model of the saved results (the Tune view's
+///   cross-validated pick for the saved goal; not savable picks are left out and named, and
+///   low-confidence ones too unless `confirm=1`);
 /// - `use=<device>|<model>`: set the model's device (`global` = follow the global device);
 /// - `profile=<device>|<0.xx|none>|<model>`: one profile (`none` removes it); split on the first
 ///   two `|`, so the model name may contain `|`.
@@ -708,7 +764,7 @@ pub(in crate::server) async fn apply_profiles(
 struct ProfileForm {
     uses: Vec<(String, Option<String>)>,
     profiles: Vec<(String, String, Option<f32>)>,
-    /// Models `all=1` left alone: their best thresholds were fitted on pseudo ground truth.
+    /// What `all=1` left alone, in words (`model on device (why)`).
     skipped: Vec<String>,
 }
 
@@ -762,25 +818,18 @@ fn profile_form(state: &AppState, form: &[(String, String)]) -> Result<ProfileFo
     }
     if form_field(form, "all").is_some_and(truthy) {
         let models = form_models(form);
-        let results = results_for_apply(state)?;
         let only = (!models.is_empty()).then_some(models.as_slice());
-        let cfg = state.config_read().clone();
-        // Results may name models that were removed from the config since: skip those.
-        let all: Vec<(String, String, Option<f32>)> = results
-            .device_thresholds(only)
+        let confirm = form_field(form, "confirm").is_some_and(truthy);
+        let (ok, skipped) = suggested(state, only, confirm)?;
+        let all: Vec<(String, String, Option<f32>)> = ok
             .into_iter()
-            .filter(|(m, _, _)| crate::benchmark::find_model(&cfg, m).is_some())
-            .map(|(m, d, t)| (m, d, Some(t)))
+            .map(|s| (s.model, s.device, s.threshold))
             .collect();
-        out.skipped = results
-            .not_on_labels(only)
-            .into_iter()
-            .filter(|m| crate::benchmark::find_model(&cfg, m).is_some())
-            .collect();
+        out.skipped = skipped;
         if all.is_empty() && out.uses.is_empty() && out.profiles.is_empty() {
             return Err(nothing_to_apply(
                 &out.skipped,
-                "the saved results have no per-device best threshold for these models",
+                "the saved results have no per-device suggested confidence for these models",
             ));
         }
         // Explicit entries come after, so they win over the measured ones.
@@ -870,7 +919,7 @@ fn apply_profiles_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{call, form_body, get, post, profile_results, state};
+    use super::super::tests::{call, form_body, get, post, state};
     use super::*;
     use crate::server::router;
     use std::time::Duration;
@@ -1027,33 +1076,36 @@ mod tests {
             assert_eq!(Config::load(&cfg_path).unwrap(), saved, "{body}");
         }
 
-        // Every best threshold of the saved results; unconfigured models are skipped, a model
-        // without advice is left alone.
-        let mk = |name: &str, t: Option<f32>| {
-            let mut m = crate::benchmark::ModelResult::failed(name, "", String::new());
-            m.error = None;
-            m.threshold = t.map(crate::benchmark::threshold::test_advice);
-            m
-        };
-        let results = BenchmarkResults::new(
-            Default::default(),
-            Default::default(),
-            vec![
-                mk("ipcam-general", Some(0.42)),
-                mk("dfine-s", Some(0.35)),
-                mk("removed", Some(0.3)),
-                mk("none", None),
-            ],
-        );
+        // Every model's suggestion on its recommended (else first) device: the Tune view's pick
+        // for the saved goal (one rule with the page and the CLI).
+        let (results, preds) = crate::benchmark::eval::tests::fixture(10, 10);
         results.save(&results_path(&cfg_path)).unwrap();
+        preds
+            .save(&crate::benchmark::search::preds_path(&cfg_path))
+            .unwrap();
+        let goal = st.config_read().benchmark.goal.clone();
+        let all = crate::benchmark::eval::tune::suggestions(
+            &results,
+            &preds,
+            &goal,
+            Default::default(),
+            None,
+        );
+        let expect = |model: &str| {
+            let of: Vec<_> = all.iter().filter(|s| s.model == model).collect();
+            of.iter()
+                .find(|s| s.recommended)
+                .or(of.first())
+                .and_then(|s| s.threshold)
+                .unwrap()
+        };
         let (s, v) = call(
             &st,
-            post("/v1/benchmark/apply-threshold", "all=1&restart=1"),
+            post("/v1/benchmark/apply-threshold", "all=1&confirm=1&restart=1"),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        assert_eq!(v["changes"].as_array().unwrap().len(), 1, "{v}");
-        assert_eq!(v["changes"][0]["model"], "ipcam-general");
+        assert!(!v["changes"].as_array().unwrap().is_empty(), "{v}");
         // Thresholds apply live: no restart even when asked for.
         assert_eq!(v["restarting"], false);
         assert!(
@@ -1061,7 +1113,14 @@ mod tests {
             "{v}"
         );
         let saved = Config::load(&cfg_path).unwrap();
-        assert_eq!(saved.models[0].confidence_threshold, Some(0.42));
+        assert_eq!(
+            saved.models[0].confidence_threshold,
+            Some(expect("ipcam-general"))
+        );
+        assert_eq!(
+            saved.models[1].confidence_threshold,
+            Some(expect("dfine-s"))
+        );
         // Devices are untouched by the threshold apply.
         assert_eq!(saved.models[0].device, None);
         assert!(!st.restart.is_cancelled());
@@ -1101,25 +1160,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tab_browses_for_a_folder() {
+    async fn the_run_step_browses_for_a_folder() {
         let st = state();
-        let (s, page) = call(&st, get("/benchmark")).await;
+        let (s, page) = call(&st, get("/benchmark/run")).await;
         assert_eq!(s, StatusCode::OK);
         let page = page.as_str().unwrap();
         assert!(page.contains("data-browse=\"folder\" data-target=\"add-folder\""));
         assert!(page.contains("<dialog id=\"browse-dialog\">"));
         assert!(page.contains("<script src=\"/static/browse.js?v="));
-        // The low-priority box is a check label; device ids keep their line.
+        // The low-priority box is a check label; As served is off by default (the bare model).
         assert!(
-            page.contains("<label class=\"check\"><input type=\"checkbox\" name=\"low_priority\"")
+            page.contains("<label class=\"check\"><input type=\"checkbox\" id=\"o-low\" checked>")
         );
-        // As served: unchecked by default (the bare model), a hidden 0 before the box.
         assert!(page.contains(
-            "<input type=\"hidden\" name=\"served\" value=\"0\"><label class=\"check\">\
-             <input type=\"checkbox\" name=\"served\" value=\"1\"> As served: apply each \
-             model's night model, night threshold, filters, enhancement and verifier"
+            "<input type=\"checkbox\" id=\"o-served\"> <span><strong>As served</strong>"
         ));
-        assert!(page.contains("class=\"bench-settings\""));
+        let js = crate::server::pages::static_file("bench-run.js").unwrap();
+        assert!(js.contains("b.append(\"served\", $(\"o-served\").checked ? \"1\" : \"0\")"));
+        assert!(js.contains("b.append(\"low_priority\", $(\"o-low\").checked ? \"1\" : \"0\")"));
     }
 
     #[tokio::test]
@@ -1262,46 +1320,44 @@ mod tests {
             assert!(v["message"].is_string());
         }
     }
-    /// B10: an "apply all" never writes a best threshold fitted on pseudo ground truth
-    /// (another model's detections); a value the user types still works.
+    /// B10: an "apply all" never writes a suggestion fitted on pseudo ground truth (another
+    /// model's detections), nor one whose target is not met on its bound; it names them. A value
+    /// the user types still works.
     #[tokio::test]
     async fn picks_on_pseudo_labels_are_refused_by_apply() {
         use crate::benchmark::threshold::NOT_ON_LABELS;
         let st = state();
         let cfg_path = st.config_path.clone();
-        let mut results = profile_results(Default::default());
-        let relative = |m: &mut crate::benchmark::report::ModelResult| {
-            let a = m.threshold.as_mut().unwrap();
-            a.relative = true;
-            for p in a
-                .best
-                .iter_mut()
-                .chain(a.by_device.iter_mut().filter_map(|d| d.best.as_mut()))
-            {
-                p.relative = true;
-            }
-        };
-        for m in &mut results.models {
-            relative(m);
-        }
+        let (mut results, preds) = crate::benchmark::eval::tests::fixture(10, 10);
+        results.image_sets[0].ground_truth =
+            crate::benchmark::images::GroundTruth::Pseudo("ipcam-general".into());
         results.save(&results_path(&cfg_path)).unwrap();
+        preds
+            .save(&crate::benchmark::search::preds_path(&cfg_path))
+            .unwrap();
         st.config.update("test", |_| Ok(())).unwrap();
         for url in [
             "/v1/benchmark/apply-profiles",
             "/v1/benchmark/apply-threshold",
         ] {
-            let (s, v) = call(&st, post(url, "all=1")).await;
+            let (s, v) = call(&st, post(url, "all=1&confirm=1")).await;
             assert_eq!(s, StatusCode::CONFLICT, "{url}: {v}");
             let m = v["message"].as_str().unwrap();
             assert!(m.contains(NOT_ON_LABELS) && m.contains("dfine-s"), "{m}");
         }
-        // Only dfine-s on pseudo labels: the others are written, dfine-s is named.
-        let mut results = profile_results(Default::default());
-        for m in results.models.iter_mut().filter(|m| m.model == "dfine-s") {
-            relative(m);
-        }
+        // Real labels, a target only the good model meets: it is written, dfine-s is named.
+        let (results, preds) = crate::benchmark::eval::tests::fixture(10, 10);
         results.save(&results_path(&cfg_path)).unwrap();
-        let (s, v) = call(&st, post("/v1/benchmark/apply-profiles", "all=1")).await;
+        preds
+            .save(&crate::benchmark::search::preds_path(&cfg_path))
+            .unwrap();
+        st.config
+            .update("test", |c| {
+                c.benchmark.goal.optimize_for = "precision:0.9".parse().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let (s, v) = call(&st, post("/v1/benchmark/apply-profiles", "all=1&confirm=1")).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         let models: Vec<&str> = v["changes"]["profiles"]
             .as_array()
@@ -1314,7 +1370,10 @@ mod tests {
             "{models:?}"
         );
         let m = v["message"].as_str().unwrap();
-        assert!(m.contains("Not applied for dfine-s"), "{m}");
+        assert!(
+            m.contains("Not applied: dfine-s on ort:coreml (not savable: the target is not met"),
+            "{m}"
+        );
         // A typed value is the user's: written.
         let (s, v) = call(
             &st,
@@ -1347,39 +1406,48 @@ mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
         let (s, v) = call(&st, post(url, "")).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
-        profile_results(Default::default())
-            .save(&results_path(&cfg_path))
+        let (results, preds) = crate::benchmark::eval::tests::fixture(10, 10);
+        results.save(&results_path(&cfg_path)).unwrap();
+        preds
+            .save(&crate::benchmark::search::preds_path(&cfg_path))
             .unwrap();
+        // The suggestions every "Save all" writes (the Tune view's picks).
+        let want: Vec<(String, String, f64)> = crate::benchmark::eval::tune::suggestions(
+            &results,
+            &preds,
+            &crate::benchmark::eval::Goal::default(),
+            Default::default(),
+            None,
+        )
+        .into_iter()
+        .map(|s| {
+            let t = f64::from(crate::config::round_threshold(s.threshold.unwrap()));
+            (s.model, s.device, (t * 100.0).round() / 100.0)
+        })
+        .collect();
+        assert_eq!(want.len(), 3);
         // The config as it is before (saved once so the file and memory agree).
         st.config.update("test", |_| Ok(())).unwrap();
         let original = st.config_read().clone();
         let rev = st.config.snapshot().0;
 
-        // Every measured device of every configured model, in one revision; `removed` (not
-        // configured) is skipped, the failed GPU has no best.
-        let (s, v) = call(&st, post(url, "all=1")).await;
+        // Every measured device of every configured model, in one revision.
+        let (s, v) = call(&st, post(url, "all=1&confirm=1")).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(st.config.snapshot().0, rev + 1, "one save");
         let p = v["changes"]["profiles"].as_array().unwrap();
-        let got: Vec<(&str, &str, f64)> = p
+        let got: Vec<(String, String, f64)> = p
             .iter()
             .map(|c| {
                 assert_eq!(c["from"], serde_json::Value::Null);
                 (
-                    c["model"].as_str().unwrap(),
-                    c["device"].as_str().unwrap(),
-                    c["to"].as_f64().unwrap(),
+                    c["model"].as_str().unwrap().to_string(),
+                    c["device"].as_str().unwrap().to_string(),
+                    (c["to"].as_f64().unwrap() * 100.0).round() / 100.0,
                 )
             })
             .collect();
-        assert_eq!(
-            got,
-            [
-                ("ipcam-general", "openvino:cpu", 0.4),
-                ("ipcam-general", "ort:cpu", 0.33),
-                ("dfine-s", "ort:coreml", 0.3)
-            ]
-        );
+        assert_eq!(got, want);
         assert_eq!(v["changes"]["devices"], serde_json::json!([]));
         assert_eq!(
             (&v["needsRestart"], &v["restarting"]),
@@ -1388,31 +1456,21 @@ mod tests {
         assert!(v["message"].as_str().unwrap().contains("apply now"), "{v}");
         let saved = Config::load(&cfg_path).unwrap();
         assert_eq!(*st.config_read(), saved);
-        assert_eq!(
-            saved.models[0].device_thresholds,
-            [
-                ("openvino:cpu".to_string(), 0.4),
-                ("ort:cpu".to_string(), 0.33)
-            ]
-            .into()
-        );
-        assert_eq!(
-            saved.models[1].device_thresholds,
-            [("ort:coreml".to_string(), 0.3)].into()
-        );
+        assert_eq!(saved.models[0].device_thresholds.len(), 2);
+        assert_eq!(saved.models[1].device_thresholds.len(), 1);
         // Thresholds and devices untouched.
         assert_eq!(saved.models[0].confidence_threshold, None);
         assert_eq!(saved.models[0].device, None);
         assert_eq!(
             v["undo"],
             serde_json::json!([
+                ["profile", "ort:coreml|none|ipcam-general"],
                 ["profile", "openvino:cpu|none|ipcam-general"],
-                ["profile", "ort:cpu|none|ipcam-general"],
                 ["profile", "ort:coreml|none|dfine-s"]
             ])
         );
         // Again: nothing to change, no new revision.
-        let (s, v2) = call(&st, post(url, "all=1&model=dfine-s")).await;
+        let (s, v2) = call(&st, post(url, "all=1&confirm=1&model=dfine-s")).await;
         assert_eq!(s, StatusCode::OK, "{v2}");
         assert_eq!(v2["changes"]["profiles"], serde_json::json!([]));
         assert_eq!(st.config.snapshot().0, rev + 1);

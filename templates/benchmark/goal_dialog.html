@@ -1,0 +1,28 @@
+{# The Goal dialog (bench-shell.js fills the choices from BenchCore.GOALS). The saved goal comes
+   in data attributes; classes from the Compare view (`scoredClasses`), else `data-classes`. #}
+<dialog class="bn-dialog" id="goal-dlg" aria-labelledby="goal-dlg-title"
+  data-optimize="{{ shell.goal_optimize }}" data-tune="{{ shell.goal_tune }}" data-classes-chosen="{{ shell.goal_classes }}"
+  data-budget="{{ shell.goal_budget }}" data-weight="{{ shell.accuracy_weight }}" data-classes="{{ shell.class_choices }}">
+  <form method="dialog" id="goal-form" novalidate>
+    <div class="bn-dh"><h2 id="goal-dlg-title">What should the comparison optimize?</h2><button type="button" class="small secondary" id="goal-x" aria-label="Close">Close</button></div>
+    <div class="bn-db">
+      <p class="muted small">The goal ranks the models and picks each model's confidence on each device. Changing it needs no new run.</p>
+      <fieldset class="bn-plain"><legend class="sr-only">Optimize for</legend><div class="bn-goals" id="goal-main"></div>
+      <details class="bn-more-goals" id="goal-more-d"><summary>More goals: ROC, AP, grade</summary><div class="bn-goals" id="goal-more"></div></details></fieldset>
+      <div class="bn-row" id="goal-tunefor" hidden><label for="goal-tf">Tune confidence for</label><select id="goal-tf"><option value="f1">F1</option><option value="f2">F2</option><option value="f05">F0.5</option></select><span class="muted small">This goal ranks without a confidence: each row's confidence is picked for this.</span></div>
+      <div class="bn-row" id="goal-weight-row" hidden><label for="goal-weight">Accuracy weight</label><input type="number" id="goal-weight" min="0" max="1" step="0.05"><span class="muted small">0 to 1; speed gets the rest. Applies when saved.</span></div>
+      <h3>Classes that count</h3>
+      <div class="bn-classes" id="goal-classes" role="group" aria-label="Classes that count"></div>
+      <p class="muted small">None ticked: every class the images label.</p>
+      <h3>Speed budget</h3>
+      <div class="bn-row"><label class="check"><input type="checkbox" id="goal-budget-on"> Mark models slower than</label><label class="bn-field"><input type="number" id="goal-budget" min="1" step="50" value="1000" inputmode="numeric" aria-label="Speed budget in ms"> ms at p95</label></div>
+      <p class="muted small">Burst p95 when the burst test ran, else one image at a time.</p>
+      <p class="bn-error" id="goal-err" role="alert" hidden></p>
+      <div class="actions bn-dlg-actions">
+        <button type="button" class="secondary" id="goal-cancel">Cancel</button>
+        <button type="button" class="secondary" id="goal-try">Try without saving</button>
+        <button type="button" id="goal-save">Save goal</button>
+      </div>
+    </div>
+  </form>
+</dialog>

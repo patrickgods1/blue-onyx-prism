@@ -477,8 +477,6 @@ mod tests {
         let (s, v) = call(&st, get("/v1/benchmark")).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["latest_run_id"], T2);
-        assert_eq!(v["noise"]["speed_abs_ms"], 0.5);
-        assert_eq!(v["noise"]["se_factor"], 2.0);
         let m = &v["results"]["models"][0];
         assert_eq!(m["run_id"], T2);
         assert_eq!(m["this_run"], true);
