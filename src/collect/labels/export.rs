@@ -773,6 +773,12 @@ pub struct Selection {
     pub lost_frames: usize,
     /// [`ExportReport::unreadable_folders`].
     pub unreadable_folders: usize,
+    /// The label file [`super::revision`] of every selected frame, by its [`flat_name`] (read
+    /// with the labels, from the same bytes).
+    pub revisions: BTreeMap<String, String>,
+    /// Reviewed frames whose label file changed while the walk read them ([`reviewed_snapshot`]
+    /// only): left out, never read half-way.
+    pub changed: usize,
 }
 
 /// Whether the label file at `path` is, or may be, of a reviewed frame.
@@ -806,24 +812,38 @@ enum ReadFrame {
     Lost,
     /// The label file or sidecar does not read: why.
     Failed(String),
-    Reviewed(Box<(Frame, LabelFile, Record)>),
+    Reviewed(Box<(Frame, LabelFile, Record, String)>),
+    /// The label file changed while it was read (its revision before and after the sidecar).
+    Changed,
 }
 
-/// The reviewed frame of the label file at `path`; None when the frame is not reviewed, or is gone
-/// and was not.
-fn read_reviewed(walker: &mut Walker<'_>, rel: &str, path: &Path) -> Option<ReadFrame> {
+/// The reviewed frame of the label file at `path`, with its revision; None when the frame is not
+/// reviewed, or is gone and was not. `recheck`: the label file's revision is read again after the
+/// sidecar, and a frame whose file changed meanwhile is [`ReadFrame::Changed`].
+fn read_reviewed(
+    walker: &mut Walker<'_>,
+    rel: &str,
+    path: &Path,
+    recheck: bool,
+) -> Option<ReadFrame> {
     let Some(frame) = Frame::resolve_in(walker, rel) else {
         return may_be_reviewed(path).then_some(ReadFrame::Lost);
     };
-    let labels = match frame.labels() {
-        Ok(Some(l)) if l.status == Status::Reviewed => l,
+    let (labels, revision) = match super::read_with_revision(&frame.labels) {
+        Ok((Some(l), rev)) if l.status == Status::Reviewed => (l, rev),
         Ok(_) => return None,
         Err(e) => return Some(ReadFrame::Failed(format!("{e:#}"))),
     };
-    Some(match frame.record() {
-        Ok(rec) => ReadFrame::Reviewed(Box::new((frame, labels, rec))),
-        Err(e) => ReadFrame::Failed(format!("{e:#}")),
-    })
+    let rec = match frame.record() {
+        Ok(rec) => rec,
+        Err(e) => return Some(ReadFrame::Failed(format!("{e:#}"))),
+    };
+    if recheck && super::revision(&frame.labels).ok().as_ref() != Some(&revision) {
+        return Some(ReadFrame::Changed);
+    }
+    Some(ReadFrame::Reviewed(Box::new((
+        frame, labels, rec, revision,
+    ))))
 }
 
 /// [`reviewed_frames`] that `filter` keeps, split after filtering (so both sides hold kept
@@ -834,7 +854,21 @@ pub fn reviewed_frames_filtered(
     split: &SplitConfig,
     filter: &ClassFilter,
 ) -> Selection {
-    select_with(dir, classes, split, filter, &|_| {})
+    select_with(dir, classes, split, filter, false, &|_| {})
+}
+
+/// [`reviewed_frames_filtered`] for a reader that keeps what it read beside the label files (the
+/// benchmark's "Your cameras" set and its ground-truth snapshot, `crate::benchmark::cameras`): each
+/// label file's revision is read again after its sidecar, and a frame whose file changed
+/// meanwhile (a save during the walk) is left out and counted ([`Selection::changed`]). Reads only:
+/// no lock is taken and nothing is written.
+pub fn reviewed_snapshot(
+    dir: &Path,
+    classes: &[String],
+    split: &SplitConfig,
+    filter: &ClassFilter,
+) -> Selection {
+    select_with(dir, classes, split, filter, true, &|_| {})
 }
 
 /// Label files read between two [`ExportStep::Reading`] reports (the walk's threads share one
@@ -847,9 +881,12 @@ fn select_with(
     classes: &[String],
     split: &SplitConfig,
     filter: &ClassFilter,
+    recheck: bool,
     progress: ProgressFn<'_>,
 ) -> Selection {
     let mut filtered_out = 0;
+    let mut changed = 0;
+    let mut revisions = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut frames = Vec::new();
     progress(ExportStep::Listing);
@@ -876,7 +913,7 @@ fn select_with(
         let mut walker = walker.clone();
         day.iter()
             .filter_map(|(rel, path)| {
-                let read = read_reviewed(&mut walker, rel, path);
+                let read = read_reviewed(&mut walker, rel, path, recheck);
                 let done = read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if done.is_multiple_of(READ_REPORT_EVERY) || done == of {
                     progress(ExportStep::Reading { done, of });
@@ -886,13 +923,17 @@ fn select_with(
             .collect()
     });
     for (rel, read) in read {
-        let (frame, labels, rec) = match read {
+        let (frame, labels, rec, revision) = match read {
             ReadFrame::Lost => {
                 lost.push(rel);
                 continue;
             }
             ReadFrame::Failed(e) => {
                 warnings.push(format!("{rel}: {e}; left out"));
+                continue;
+            }
+            ReadFrame::Changed => {
+                changed += 1;
                 continue;
             }
             ReadFrame::Reviewed(read) => *read,
@@ -918,6 +959,7 @@ fn select_with(
             filtered_out += 1;
             continue;
         }
+        revisions.insert(flat_name(&frame.rel), revision);
         frames.push(ExportFrame {
             name: flat_name(&frame.rel),
             rel: frame.rel,
@@ -950,6 +992,8 @@ fn select_with(
         filtered_out,
         lost_frames: lost.len(),
         unreadable_folders: scan.unreadable.len(),
+        revisions,
+        changed,
     }
 }
 
@@ -1262,7 +1306,7 @@ pub fn run_filtered_with(
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
     filter.check(classes)?;
-    let mut selected = select_with(dir, classes, &req.split, filter, progress);
+    let mut selected = select_with(dir, classes, &req.split, filter, false, progress);
     let held = match &req.heldout {
         Some(policy) => Some(frozen_split(dir, &mut selected, &req.split, policy)?),
         None => None,
@@ -1416,6 +1460,7 @@ fn build_export(
         filtered_out,
         lost_frames,
         unreadable_folders,
+        ..
     } = selected;
     for f in &mut frames {
         f.floor = req.size_floor;

@@ -11,7 +11,9 @@
 //! device: the speed and grades of `benchmark.json`, without its per-image data) and
 //! `problems.txt` (each part that could not be collected, and why).
 //!
-//! What it never holds: camera frames, label files, datasets, model weights, and the secrets.
+//! What it never holds: camera frames, label files (nor the labels a benchmark of Your cameras
+//! scored against, `benchmark-gt.json`: the summary leaves every image's boxes out), datasets,
+//! model weights, and the secrets.
 //! The admin token, the Hugging Face token and everything in the private `auth` folder (the
 //! accounts' password hashes in `users.json`, `sessions.json`, `devices.json`, the setup code,
 //! the HTTPS key) live in their own files and are never read into a part; as a second line every
@@ -763,6 +765,62 @@ pub(crate) mod tests {
         assert_eq!(s["models"][0]["recommended"], "ort:cpu");
         assert_eq!(s["models"][0]["devices"][0]["error"], "boom");
         assert!(s["models"][0]["devices"][0]["totalP50Ms"].is_null());
+    }
+
+    /// The labels a benchmark of Your cameras scored against (`benchmark-gt.json`, beside
+    /// `benchmark.json`) never reach the bundle: no part is the file, and no part holds a label
+    /// of it, also with results that score that set.
+    #[test]
+    fn the_cameras_ground_truth_stays_out() {
+        let dir = Scratch::new();
+        let cfg = dir.0.join("cfg.json");
+        let config = Config {
+            download_dir: Some(dir.0.clone()),
+            ..Default::default()
+        };
+        let marker = "zebra-label-7f3a";
+        let results = crate::benchmark::results_path(&cfg);
+        std::fs::write(
+            &results,
+            serde_json::json!({
+                "version": "1",
+                "models": [{"model": "m", "datasets": ["cameras"], "recommended": null}],
+                "image_sets": [{
+                    "id": "cameras", "kind": "dir", "ground_truth": {"kind": "manifest"},
+                    "images": [{"file": "day.cam.2026-11-01.20261101T000000000Z_a.jpg",
+                                "width": 10, "height": 10}],
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::benchmark::cameras::snapshot::path_beside(&results),
+            serde_json::json!({
+                "version": 1, "set": "cameras", "dir": "/x", "created": "t",
+                "frames": [{"file": "day.cam.2026-11-01.20261101T000000000Z_a.jpg",
+                            "frame": "day/cam/2026-11-01/20261101T000000000Z_a.jpg",
+                            "width": 10, "height": 10, "revision": "r",
+                            "boxes": [{"label": marker, "bbox": [1.0, 1.0, 5.0, 5.0]}]}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The results load with the snapshot's labels (what the summary is made from).
+        let loaded = crate::benchmark::BenchmarkResults::load(&results)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.image_sets[0].images[0].objects.as_ref().unwrap()[0].label,
+            marker
+        );
+        let bytes = build(&config, &cfg, Live::default()).unwrap();
+        let all = entries(&bytes);
+        assert!(all.iter().any(|(n, _)| n == "benchmark-summary.json"));
+        for (name, text) in &all {
+            assert!(!name.contains("benchmark-gt"), "{name}");
+            assert!(!text.contains(marker), "{name} holds a label");
+        }
     }
 
     /// The CLI path writes a zip with a dated name into `--out`, for a config whose file does

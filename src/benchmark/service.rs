@@ -829,7 +829,7 @@ fn own_device(configured: Option<&str>) -> Option<Vec<Device>> {
 /// file (also when cancelled).
 pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> {
     let devices = req.parsed_devices()?;
-    let mut sets = resolve_sets(ctx, req, h)?;
+    let (mut sets, cameras) = resolve_sets(ctx, req, h)?;
     let runtimes = run_runtimes(ctx)?;
     let versions = RuntimeVersions::of(&runtimes.lock_recover());
     let run = ServiceRun {
@@ -846,6 +846,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         run_id: super::history::new_run_id(),
         trail: breadcrumb::Trail::new(&ctx.config.data_root()),
         priority: crate::backend::priority::DevicePriority::new(req.low_priority),
+        cameras,
     };
     let image_count: usize = sets.iter().map(|s| s.images.len()).sum();
 
@@ -882,6 +883,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         retain_sets: None,
         finalized: false,
         bookkeeping_ms: 0.0,
+        snapshot_written: false,
     };
 
     for (mi, (name, entry)) in entries.iter().enumerate() {
@@ -922,15 +924,22 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
 }
 
 /// The datasets of a run, downloading missing built-in sets first when the config allows it;
-/// resolution problems become run warnings.
-fn resolve_sets(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<Vec<ImageSet>> {
+/// resolution problems become run warnings. "Your cameras" comes from the config's review folder
+/// (what the run keeps of it for its snapshot beside).
+fn resolve_sets(
+    ctx: &RunContext,
+    req: &RunRequest,
+    h: &RunHandle,
+) -> Result<(Vec<ImageSet>, Option<images::CamerasLoaded>)> {
     let root = ctx.config.data_root();
-    let mut resolved = images::resolve(&req.datasets, &root, req.max_images)?;
+    let cameras = super::cameras::Source::of(&ctx.config);
+    let resolve = || images::resolve_with(&req.datasets, &root, req.max_images, Some(&cameras));
+    let mut resolved = resolve()?;
     if !resolved.not_downloaded.is_empty() && ctx.config.benchmark.auto_download_datasets {
         for w in download_datasets(ctx, &resolved.not_downloaded, h)? {
             h.warn(w);
         }
-        resolved = images::resolve(&req.datasets, &root, req.max_images)?;
+        resolved = resolve()?;
     }
     for w in &resolved.warnings {
         h.warn(w.clone());
@@ -939,7 +948,7 @@ fn resolve_sets(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<Vec
     if let Some(w) = cap_images(&mut sets, MAX_IMAGES_PER_RUN) {
         h.warn(w);
     }
-    Ok(sets)
+    Ok((sets, resolved.cameras))
 }
 
 /// Cut `sets` to about `cap` images in total (evenly spread within each set, each set keeping
@@ -1091,6 +1100,8 @@ struct ServiceRun<'a> {
     /// `benchmark.low_priority`: below normal while a CPU device runs, restored for the other
     /// devices and when the run ends (drop).
     priority: crate::backend::priority::DevicePriority,
+    /// "Your cameras" as resolved, for the snapshot the first save writes.
+    cameras: Option<images::CamerasLoaded>,
 }
 
 impl ServiceRun<'_> {
@@ -1231,6 +1242,27 @@ impl ServiceRun<'_> {
             job.variant = Some(v);
         }
         let progress = |p: &Progress| h.set_progress(overall.view(mi, p));
+        // "Your cameras" without the frames the model trained or validated on.
+        let (own_sets, left_out) = super::cameras::sets_for_model(&ctx.config, m, sets);
+        if let Some(w) = left_out.as_ref().and_then(|l| l.unknown.clone()) {
+            h.warn(format!(
+                "{w}; it is scored on every frame of {}",
+                super::cameras::TITLE
+            ));
+        }
+        let sets = own_sets.as_deref().unwrap_or(sets);
+        if sets.is_empty() {
+            let path = ctx.config.data_path(&m.path).display().to_string();
+            let mut r = ModelResult::failed(
+                &job.name,
+                &path,
+                super::cameras::nothing_left(left_out.as_ref()),
+            );
+            r.run_id = Some(self.run_id.clone());
+            r.left_out = left_out;
+            h.push_done(r.clone());
+            return Ok(r);
+        }
         let mut bench = Bench::new(sets, req.warmup, req.repeat, self.params);
         bench.object_filter = &ctx.config.object_filter;
         bench.cache_dir = self.cache_dir.as_deref();
@@ -1268,6 +1300,7 @@ impl ServiceRun<'_> {
             },
         )?;
         r.run_id = Some(self.run_id.clone());
+        r.left_out = left_out;
         for w in r.shared_load_warnings() {
             h.warn(w);
         }
@@ -1299,6 +1332,10 @@ impl ServiceRun<'_> {
         let (ctx, req) = (self.ctx, self.req);
         let key = crate::registry::normalize_name(&model.model);
         let t = Instant::now();
+        if !saver.snapshot_written {
+            super::cameras::write_snapshot(&ctx.results_path, sets, self.cameras.as_ref())?;
+            saver.snapshot_written = true;
+        }
         let results =
             BenchmarkResults::new(saver.hardware.clone(), saver.versions.clone(), vec![model])
                 .with_sets(sets);
@@ -1387,6 +1424,8 @@ struct Saver {
     /// Wall time of every [`ServiceRun::save`] so far (reading and rewriting benchmark.json, the
     /// history and benchmark-preds.json), logged at the end of the run.
     bookkeeping_ms: f64,
+    /// The run's "Your cameras" snapshot is written (before its first save).
+    snapshot_written: bool,
 }
 
 impl Saver {
@@ -2033,6 +2072,7 @@ mod tests {
                     retain_sets: None,
                     finalized: false,
                     bookkeeping_ms: 0.0,
+                    snapshot_written: false,
                 };
                 let mut file = prev.clone();
                 let n = models.len();

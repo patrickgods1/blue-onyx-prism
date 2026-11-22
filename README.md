@@ -667,6 +667,36 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
 **Advanced > Save report** writes the same standalone HTML report as `--report` into a folder you choose
 (Browse...) as `benchmark-report-<YYYYMMDD-HHMMSS>.html` (wall time in `timezone`); a folder added as a dataset must also be browsable or picked.
 
+- **Your cameras** (`cameras`, first in `benchmark.datasets` and on the Run tab): the frames you
+  reviewed on the Train tab (the folder under review: `collect.review_dir`, default `collect.dir`),
+  read where they are, so models are compared and tuned on the exact uploads Blue Iris sends. The
+  selection is the Review export's, in memory (nothing is exported or written, no lock is taken):
+  reviewed frames only (reopened and skipped frames are out, a frame with a label outside
+  `collect.classes` or a pending box is left out with a warning), unsure boxes, boxes rejected as too
+  small and boxes under `collect.size_floor` are ignore regions, frames confirmed empty count as empty
+  (`hard-negative` tag), every split (`split:train` and `split:val`, from the default split and
+  `heldout-days.json`, read only), tagged `<scene>`, `camera:<c>`, `date:<d>`, `bucket:<b>`; each frame
+  carries its camera day as its group (`group` in `benchmark.json` and `benchmark-preds.json`). The
+  Run tab shows its frames, cameras, camera days, frame sizes and day / night / IR counts; it cannot
+  be ticked while the folder is missing or holds no reviewed frame, and a run skips it with a note
+  then (never fails). Under 4 camera days or 50 labelled objects a run warns that its figures are low
+  confidence. **Trained models leave out what they saw**: a model with a training record
+  (`<model>.provenance.json`) runs without the frames its run trained or validated on
+  (`train.txt`, `valid.txt`, and the run's record of image sources), recorded per model as
+  `left_out` (`frames`, `trained`, `validated`, or `unknown` with why when its lists do not read:
+  then it is scored on every frame and never shown as best). Compare scores every listed model on the
+  frames none of them saw and says how many were left out (`framesLeftOut`, `leftOutBy` in
+  `lineup`); models without a record see every frame. **Labels snapshot**: a run stores the labels it
+  scored against in `benchmark-gt.json` beside `benchmark.json` (per frame: its name, identity, size,
+  boxes and the label file's revision; `benchmark.json` keeps the frames without their boxes), and
+  everything that re-scores the saved results (Compare, the confidence search, a regrade, the
+  threshold advice) reads it, so results stay put while you keep reviewing. `GET /v1/benchmark`
+  reports `labelsChanged` (`frames`, `changed`, `left`, `joined`: frames whose labels changed, that
+  left the reviewed set, or that were reviewed since; counted in the background, never during a
+  poll), and **Re-score** (`POST /v1/benchmark/rescore`, CLI `benchmark --rescore`) scores the
+  stored predictions against the current labels without inference and replaces the snapshot; frames
+  reviewed since the run need a run. The drill-down serves only frames of the snapshot.
+  `benchmark --dataset cameras --config <file>` runs it from the command line.
 - **Datasets** (`benchmark.datasets`, CLI `--dataset`): the built-in, pinned and SHA-256-checked sets
   `coco-cctv` (COCO val2017 CCTV-relevant subset, 180 images), `bmd45-cctv` (real 1080p CCTV,
   vehicles, 44 images) and `exdark-night` (low light, 160 images), downloaded on demand to
@@ -842,7 +872,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 
 | Field | Default | Meaning |
 |---|---|---|
-| `benchmark.datasets` | `["coco-cctv", "bmd45-cctv", "exdark-night"]` | Datasets to run: built-in ids, `sample`, `dir:<path>` or `{"dir", "gt", "name"}` objects. UI: yes |
+| `benchmark.datasets` | `["cameras", "coco-cctv", "bmd45-cctv", "exdark-night"]` | Datasets to run: `cameras` (Your cameras: the reviewed frames of the folder under review), built-in ids, `sample`, `dir:<path>` or `{"dir", "gt", "name"}` objects. A config that stores its own list keeps it. UI: yes |
 | `benchmark.max_images_per_dataset` | `0` | Images per dataset, evenly spread; 0 = all. Integer >= 0. UI: yes |
 | `benchmark.devices` | `[]` | Device specs to run; empty = the device each model runs on. Several GPUs need a confirmation, because a sweep of every device has hung a machine. UI: yes |
 | `benchmark.models` | `[]` | Model names; empty = the enabled models whose files are present. UI: yes |
@@ -860,7 +890,7 @@ All of them apply at once: they are read when a benchmark starts.
 
 ```json
 "benchmark": {
-  "datasets": ["coco-cctv", "bmd45-cctv", "exdark-night"],
+  "datasets": ["cameras", "coco-cctv", "bmd45-cctv", "exdark-night"],
   "max_images_per_dataset": 0, "devices": [], "models": [],
   "warmup": 3, "repeat_per_image": 1, "reference_model": null,
   "weights": {"accuracy": 0.6, "speed": 0.4}, "auto_download_datasets": true,
@@ -881,7 +911,7 @@ address. Every page below needs a sign-in:
 | `/stats` | Per-model state, runtime, device, CPU fallback, requests, dropped, queue, inference/process/round-trip avg/min/max; updates in place every 5 s from `/stats.json` |
 | `/test` | Pick, drop or paste an image, choose a model and `min_confidence`; the page posts to `/v1/vision/custom/{model}` and draws the boxes client-side, with a detections table and the raw JSON (same code path and metrics as the API, but uploads never enter the dataset; without JavaScript the form posts to `/test` and the server draws the image) |
 | `/config` | Models card (which models load, the default model, device and threshold per model; **Save** applies at once), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
-| `/benchmark` | Benchmark models x devices x datasets in the background (progress, ETA, cancel); grade cards, model ranking, sortable per-device tables (fastest, recommended and configured marked), breakdowns by dataset/tag/class/size/resolution, per-image drill-down with ground truth and predictions drawn; **Use <device>** / **Apply recommended to all** write per-model devices; best confidence threshold per model with a P/R/F1 vs threshold chart, **Apply threshold** / **Apply all thresholds**; **Confidence search** over the stored predictions (filters, objective, chart with hover values, tables, CSV) |
+| `/benchmark` | Benchmark models x devices x datasets in the background (progress, ETA, cancel), Your cameras (your reviewed frames) first; grade cards, model ranking, sortable per-device tables (fastest, recommended and configured marked), breakdowns by dataset/tag/class/size/resolution, per-image drill-down with ground truth and predictions drawn; **Use <device>** / **Apply recommended to all** write per-model devices; best confidence threshold per model with a P/R/F1 vs threshold chart, **Apply threshold** / **Apply all thresholds**; **Confidence search** over the stored predictions (filters, objective, chart with hover values, tables, CSV) |
 | `/train` | The Train area: one entry with eight tabs at their own URLs (the last, Jobs, lists every running and queued job with its step, percent, time left and a link to it: imports, auto-label runs, overlap and dataset checks and training runs on the queue, and beside it dataset exports, X-AnyLabeling imports, a benchmark run and model exports), a status strip (frames collected, to review, reviewed, exports, runs, models) and one suggested next action (`GET /v1/train/summary`). `/train` opens the most useful tab. The old `/dataset`, `/review` and `/training` redirect to Collect, Review and Train and keep their query string |
 | `/train/collect` | Dataset collector (`collect`): on/off and the caps (applied at once), with per-bucket toggles, rates, intervals, near-threshold margin and dHash distance under Advanced; frames per detected class and per camera, disk use, the newest frames per bucket with their sidecars, and **Send to review** (appends the ticked frames to `review-queue.jsonl`). Collection stops on its own on low disk space or a full disk; **Resume** re-arms it |
 | `/train/import` | Import footage (videos, Blue Iris folders, a URL, pinned MEVA clips), optionally auto-labelling the new frames, with the Jobs card |
@@ -1400,7 +1430,8 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/review/restore-reopened` | puts frames a rerun reopened back to reviewed when nothing is pending; `dry_run` counts them |
 | GET | `/v1/training/switch-preview?id=` | What **Use as default** of a run would change (settings, classes, what copies, the suggested threshold, the comparison with the current default); saves nothing |
 | POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/retry-export`, `/training/use`, `/training/revert`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one (`delete_files` also deletes its folder); export a failed run's best checkpoint; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model (default: `copy`, `use_threshold`, `expect_current`; verifier: `replace_verifier`); no field, or `forget=1`: undo the last default switch, or drop its record; `add` / `remove`: a `training.datasets` folder; delete the training environment |
-| GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices |
+| GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking, per-model devices, `labelsChanged` (Your cameras: `{frames, changed, left, joined}` since the run's labels snapshot, `{frames: null, computing: true}` before the first count, `folderMissing`; `null` without a snapshot) |
+| POST | `/v1/benchmark/rescore` | Your cameras: score the stored predictions against the current labels (no inference) and replace `benchmark-gt.json`; `{success, rescored: {models, runs, frames, changes, needRun, notRescored}}`; 409 while a benchmark runs, 503 `folder_missing`, 422 without a run on the set |
 | POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
 | POST | `/v1/benchmark/datasets/remove` | `dataset`: the saved folder dataset to drop from `benchmark.datasets` (e.g. `dir:/srv/alerts`; the list may end up empty); 404 for a built-in id or a folder that is not saved |
@@ -1409,7 +1440,7 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | POST | `/v1/benchmark/apply-threshold` | `model` + `threshold` (pairs, repeatable; a following `device` writes that device's profile instead, `threshold=none` removes it), or `all=1` for every saved best threshold; writes `confidence_threshold`; `restart=1` restarts |
 | POST | `/v1/benchmark/apply-profiles` | one config change: `all=1` (optionally with repeated `model`) saves the best confidence of every measured device, `use=<device>\|<model>` sets a device, `profile=<device>\|<0.xx or none>\|<model>` sets or removes one profile; answers `changes`, `undo` (form pairs that restore the previous values), `needsRestart` |
 | GET, POST | `/v1/benchmark/threshold-search` | GET: searchable models/devices/datasets/tags/classes; POST: `model` (repeated or `all`), `device` (default recommended), `dataset`, `tag`, `class` (repeated), `objective` (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>`, `youden`, `fpr:<x>`), `iou` (0.5): best threshold, P/R/F1/F2/FP per image at best vs configured, exact curve, 0.05 grid, per dataset/class, `preds_capped_images`, CSV; 400 when nothing is stored (run a benchmark first) |
-| GET | `/v1/benchmark/images?model=&device=`, `/v1/benchmark/image?set=&file=` | per-image drill-down data; an image of the saved results |
+| GET | `/v1/benchmark/images?model=&device=`, `/v1/benchmark/image?set=&file=` | per-image drill-down data; an image of the saved results (Your cameras: only a frame of the labels snapshot, resolved inside the folder under review) |
 | POST | `/v1/resources/add-to-config` | form `id` of a downloaded model, or `local:<file>` for a model file in `models_dir` (family `auto`): append it to `models` |
 
 The detection response is byte-compatible with CodeProject.AI: `success, message, error, predictions

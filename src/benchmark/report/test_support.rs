@@ -111,6 +111,7 @@ pub(crate) fn model(devices: Vec<DeviceResult>, configured: Option<&str>) -> Mod
         threshold_objective: Objective::default(),
         threshold: None,
         trained_on_share: None,
+        left_out: None,
         served: None,
         stale_rules: None,
     };

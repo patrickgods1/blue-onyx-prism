@@ -60,6 +60,7 @@
     p.appendChild(el("strong", null, s.what + ": "));
     p.appendChild(document.createTextNode(s.images + " " + s.unit + ", " + s.objects + " object" + (s.objects === 1 ? "" : "s") + ", " + s.emptyFrames + " empty. Every model is scored on " + (s.classes.length ? s.classes.join(", ") : "no shared class") + (s.classes.indexOf("vehicle") >= 0 ? " (car, truck and bus as one)" : "") + "."));
     if (s.leftOut && s.leftOut.length) p.appendChild(el("span", "muted", " Left out, not every model has them: " + s.leftOut.join(", ") + "."));
+    if (s.framesLeftOut) p.appendChild(el("span", "muted", " " + s.framesLeftOut + " " + s.unit + " left out: " + (s.leftOutBy || []).join(", ") + " trained or validated on them, so every model is scored on the " + s.unit + " none of them saw."));
     return p;
   }
   function pct1(c) { return has(c.value) ? (c.value * 100).toFixed(c.value === 1 || c.value === 0 ? 0 : 1) + "%" : "-"; }

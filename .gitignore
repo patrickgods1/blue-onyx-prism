@@ -56,6 +56,8 @@ Thumbs.db
 /.claude/worktrees/
 kernel.errors.txt
 benchmark-preds.json
+# The labels a benchmark of Your cameras scored against (user data).
+benchmark-gt.json
 
 # Deep-research output (local only)
 research_notes/

@@ -50,9 +50,16 @@ pub const KNOWN_SET_IDS: [&str; 5] = [
     "exdark-ir",
     "nir-night",
 ];
-/// Sets a config without a `benchmark.datasets` key runs. The night/IR sets (`exdark-ir`,
-/// `nir-night`) are opt-in: they add ~68 MB of downloads and ~360 images per model.
-pub const DEFAULT_SET_IDS: [&str; 3] = ["coco-cctv", "bmd45-cctv", "exdark-night"];
+/// Sets a config without a `benchmark.datasets` key runs: "Your cameras" first (the reviewed
+/// frames of the folder under review, [`super::cameras`]; skipped with a note while there are
+/// none), then the public sets. The night/IR sets (`exdark-ir`, `nir-night`) are opt-in: they add
+/// ~68 MB of downloads and ~360 images per model.
+pub const DEFAULT_SET_IDS: [&str; 4] = [
+    super::cameras::ID,
+    "coco-cctv",
+    "bmd45-cctv",
+    "exdark-night",
+];
 /// Id of the embedded sample image.
 pub const SAMPLE_ID: &str = "sample";
 /// Prefix of a user-directory dataset reference (`dir:/path/to/images`).
@@ -617,7 +624,7 @@ pub fn safe_file_name(f: &str) -> bool {
     )
 }
 
-fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
+pub(crate) fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
     let (w, h) = match (i.width, i.height) {
         (Some(w), Some(h)) => (w, h),
         _ => image::image_dimensions(&path).unwrap_or((0, 0)),
@@ -1132,11 +1139,22 @@ pub struct Resolved {
     pub warnings: Vec<String>,
     /// Built-in sets with no image on disk (download `bench:<id>`).
     pub not_downloaded: Vec<String>,
+    /// "Your cameras" as loaded (its source and every reviewed frame's revision), for the run's
+    /// ground-truth snapshot ([`super::cameras::snapshot`]); None when the run has no such set.
+    pub cameras: Option<CamerasLoaded>,
 }
 
-/// Every dataset id accepted besides `dir:<path>`: `sample` and the built-in sets.
+/// What a run keeps of "Your cameras" for its snapshot.
+#[derive(Debug, Clone)]
+pub struct CamerasLoaded {
+    pub source: super::cameras::Source,
+    /// File name -> label revision of every reviewed frame (before the run's image limit).
+    pub reviewed: std::collections::BTreeMap<String, String>,
+}
+
+/// Every dataset id accepted besides `dir:<path>`: `sample`, `cameras` and the built-in sets.
 pub fn valid_ids() -> Vec<String> {
-    let mut v = vec![SAMPLE_ID.to_string()];
+    let mut v = vec![SAMPLE_ID.to_string(), super::cameras::ID.to_string()];
     for id in KNOWN_SET_IDS {
         v.push(id.to_string());
     }
@@ -1206,6 +1224,19 @@ pub fn validate(refs: &[DatasetRef], data_root: &Path) -> Result<()> {
 /// whose id repeats an earlier one is skipped with a warning. When nothing is left otherwise,
 /// the embedded sample is used (with a warning), so a run always has an image.
 pub fn resolve(refs: &[DatasetRef], data_root: &Path, max_images: usize) -> Result<Resolved> {
+    resolve_with(refs, data_root, max_images, None)
+}
+
+/// [`resolve`], with "Your cameras" ([`super::cameras::ID`]) read from `cameras` (the config's
+/// review folder, [`super::cameras::Source::of`]). A folder that cannot be read, or one without
+/// a reviewed frame, skips the set with a note (never an error); few frames add a
+/// low-confidence warning. Without a source the set is skipped with a note.
+pub fn resolve_with(
+    refs: &[DatasetRef],
+    data_root: &Path,
+    max_images: usize,
+    cameras: Option<&super::cameras::Source>,
+) -> Result<Resolved> {
     validate(refs, data_root)?;
     let mut out = Resolved::default();
     let mut dir_error: Option<anyhow::Error> = None;
@@ -1234,7 +1265,35 @@ pub fn resolve(refs: &[DatasetRef], data_root: &Path, max_images: usize) -> Resu
             }
             None => {
                 let id = d.label();
-                if id.eq_ignore_ascii_case(SAMPLE_ID) {
+                if id.eq_ignore_ascii_case(super::cameras::ID) {
+                    let Some(src) = cameras else {
+                        out.warnings.push(format!(
+                            "{} was skipped: it needs the service's config (run with --config)",
+                            super::cameras::TITLE
+                        ));
+                        continue;
+                    };
+                    match super::cameras::load(src) {
+                        super::cameras::Load::Ready(l) => {
+                            let l = *l;
+                            out.warnings.extend(
+                                l.warnings
+                                    .iter()
+                                    .map(|w| format!("{}: {w}", super::cameras::TITLE)),
+                            );
+                            out.warnings.extend(l.survey.warning());
+                            out.cameras = Some(CamerasLoaded {
+                                source: src.clone(),
+                                reviewed: l.reviewed,
+                            });
+                            l.set
+                        }
+                        skipped => {
+                            out.warnings.extend(skipped.skip_note());
+                            continue;
+                        }
+                    }
+                } else if id.eq_ignore_ascii_case(SAMPLE_ID) {
                     ImageSet::sample()
                 } else if let Some(m) = builtin_manifest(&id) {
                     let (set, missing) = ImageSet::from_manifest(m, &builtin_dir(data_root, &m.id));

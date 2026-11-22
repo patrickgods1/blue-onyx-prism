@@ -80,6 +80,13 @@ struct Planned {
     entry: Option<ModelConfig>,
 }
 
+/// A job's own sets (Your cameras without what its model saw; None = the run's) and what was left
+/// out.
+type OwnSets = (
+    Option<Vec<ImageSet>>,
+    Option<crate::benchmark::report::LeftOut>,
+);
+
 fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<Vec<Planned>> {
     let served = served_mode(args, config)?;
     let device_override = if args.force_cpu {
@@ -227,17 +234,49 @@ fn dataset_refs(args: &BenchArgs, config: &Config) -> Vec<DatasetRef> {
     refs
 }
 
+/// `--rescore`: the stored predictions of Your cameras scored against the labels now.
+fn rescore_cli(args: &BenchArgs, config: &Config, config_path: &Path) -> Result<bool> {
+    let r = crate::benchmark::cameras::rescore::rescore(
+        config,
+        &results_path(config_path),
+        &crate::benchmark::search::preds_path(config_path),
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+    } else {
+        println!(
+            "{}: re-scored {} run(s) of {} model(s) on {} frames; {} frame(s) had changed labels, {} left the reviewed set, {} reviewed since need a run",
+            crate::benchmark::cameras::TITLE,
+            r.runs,
+            r.models,
+            r.frames,
+            r.changes.changed,
+            r.changes.left,
+            r.need_run
+        );
+        for n in &r.not_rescored {
+            println!("  not re-scored (no stored predictions): {n}");
+        }
+    }
+    Ok(true)
+}
+
+/// The datasets of a run and what it keeps of Your cameras for its snapshot.
+type LoadedSets = (Vec<ImageSet>, Vec<String>, Option<images::CamerasLoaded>);
+
 /// Resolve the datasets, downloading missing built-in sets first when the config allows it.
-fn load_sets(args: &BenchArgs, config: &Config) -> Result<(Vec<ImageSet>, Vec<String>)> {
+fn load_sets(args: &BenchArgs, config: &Config) -> Result<LoadedSets> {
     if let Some(p) = &args.image {
-        return Ok((vec![ImageSet::single_file(p)?], Vec::new()));
+        return Ok((vec![ImageSet::single_file(p)?], Vec::new(), None));
     }
     let refs = dataset_refs(args, config);
     let max = args
         .max_images
         .unwrap_or(config.benchmark.max_images_per_dataset);
     let root = config.data_root();
-    let mut r = images::resolve(&refs, &root, max)?;
+    let cameras = crate::benchmark::cameras::Source::of(config);
+    let resolve = || images::resolve_with(&refs, &root, max, Some(&cameras));
+    let mut r = resolve()?;
     if !r.not_downloaded.is_empty() && config.benchmark.auto_download_datasets {
         let req = crate::resources::commands::FetchRequest {
             for_config: false,
@@ -250,13 +289,13 @@ fn load_sets(args: &BenchArgs, config: &Config) -> Result<(Vec<ImageSet>, Vec<St
             allow_large: false,
         };
         match crate::resources::commands::fetch(config, &req) {
-            Ok(()) => r = images::resolve(&refs, &root, max)?,
+            Ok(()) => r = resolve()?,
             Err(e) => r
                 .warnings
                 .push(format!("downloading datasets failed: {e:#}")),
         }
     }
-    Ok((r.sets, r.warnings))
+    Ok((r.sets, r.warnings, r.cameras))
 }
 
 /// `--list-datasets`.
@@ -279,6 +318,32 @@ fn list_datasets(config: &Config) {
             ""
         }
     };
+    {
+        use crate::benchmark::cameras::{self, Load, Source, TITLE};
+        let src = Source::of(config);
+        let (count, state, about) = match cameras::load(&src) {
+            Load::Ready(l) => (
+                l.set.images.len().to_string(),
+                "reviewed",
+                format!("{TITLE}: {} ({})", l.survey.line(), src.dir.display()),
+            ),
+            Load::Empty(_) => (
+                "0".to_string(),
+                "no frames",
+                format!("{TITLE}: no reviewed frame yet ({})", src.dir.display()),
+            ),
+            Load::Missing(why) => ("-".to_string(), "missing", format!("{TITLE}: {why}")),
+        };
+        println!(
+            "  {:<16} {:>7} {:>9} {:<12} {:<10} {}",
+            cameras::ID,
+            count,
+            "-",
+            state,
+            mark(cameras::ID),
+            about
+        );
+    }
     let sample = ImageSet::sample();
     println!(
         "  {:<16} {:>7} {:>9} {:<12} {:<10} {}",
@@ -355,6 +420,9 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         list_datasets(&config);
         return Ok(true);
     }
+    if args.rescore {
+        return rescore_cli(&args, &config, &config_path);
+    }
     if args.threshold_search
         && let Some(ok) = stored_threshold_search(&args, &config, &config_path)?
     {
@@ -386,7 +454,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         .filter(|p| p.job.variant.is_some())
         .map(|p| p.job.name.clone())
         .collect();
-    let (mut sets, warnings) = load_sets(&args, &config)?;
+    let (mut sets, warnings, cameras) = load_sets(&args, &config)?;
     let (repeat, warmup, weights) = timing_settings(&args, &config, &sets);
     let cache_dir = cache_dir_arg(&args, &config);
     // Unix: before the runtimes exist, so their thread pools inherit the nice value, and only
@@ -472,6 +540,14 @@ pub fn run(args: BenchArgs) -> Result<bool> {
         ctx.pseudo_ground_truth(&pb, &jobs, &mut sets, &mut report);
     }
 
+    // Per job: Your cameras without the frames its model trained or validated on.
+    let own_sets: Vec<OwnSets> = jobs
+        .iter()
+        .map(|p| match &p.entry {
+            Some(m) => crate::benchmark::cameras::sets_for_model(&config, m, &sets),
+            None => (None, None),
+        })
+        .collect();
     let mut bench = Bench::new(&sets, warmup, repeat, params);
     bench.object_filter = &config.object_filter;
     bench.cache_dir = cache_dir.as_deref();
@@ -484,14 +560,22 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     bench.video_decode = true;
 
     let run_id = crate::benchmark::history::new_run_id();
-    let mut swept = ctx.run_jobs(&mut bench, &progress, &jobs, all_devices, &mut report)?;
+    let mut swept = ctx.run_jobs(
+        &mut bench,
+        &progress,
+        &jobs,
+        (&sets, &own_sets),
+        all_devices,
+        &mut report,
+    )?;
     for m in &mut swept {
         m.run_id = Some(run_id.clone());
     }
 
     if all_devices
         && !swept.is_empty()
-        && let Some(ok) = ctx.finish_sweep(&sets, versions, &swept, &mut report)?
+        && let Some(ok) =
+            ctx.finish_sweep(&sets, cameras.as_ref(), versions, &swept, &mut report)?
     {
         return Ok(ok);
     }
@@ -760,13 +844,51 @@ impl RunCtx<'_> {
         bench: &mut Bench<'b>,
         progress: &'b (dyn Fn(&crate::benchmark::Progress) + Sync),
         jobs: &[Planned],
+        (sets, own_sets): (&'b [ImageSet], &'b [OwnSets]),
         all_devices: bool,
         report: &mut Report,
     ) -> Result<Vec<ModelResult>> {
         let mut swept: Vec<ModelResult> = Vec::new();
-        for Planned { job, entry } in jobs {
+        for (k, Planned { job, entry }) in jobs.iter().enumerate() {
+            let (own, left_out) = own_sets
+                .get(k)
+                .map_or((None, None), |(s, l)| (s.as_deref(), l.clone()));
+            bench.sets = own.unwrap_or(sets);
+            if bench.sets.is_empty() {
+                report.error(
+                    self.args.json,
+                    format!(
+                        "{}: {}",
+                        job.name,
+                        crate::benchmark::cameras::nothing_left(left_out.as_ref())
+                    ),
+                );
+                continue;
+            }
+            if let Some(w) = left_out.as_ref().and_then(|l| l.unknown.as_deref()) {
+                report.warn(
+                    self.args.json,
+                    format!(
+                        "{w}; it is scored on every frame of {}",
+                        crate::benchmark::cameras::TITLE
+                    ),
+                );
+            }
             if all_devices {
-                let result = self.sweep_job(bench, progress, job, entry.as_ref(), report)?;
+                let mut result = self.sweep_job(bench, progress, job, entry.as_ref(), report)?;
+                if let Some(l) = left_out.as_ref().filter(|_| !self.args.json) {
+                    println!(
+                        "  {}: {} ({} of the set's frames run)",
+                        crate::benchmark::cameras::TITLE,
+                        l.why(),
+                        bench
+                            .sets
+                            .iter()
+                            .find(|s| s.id == crate::benchmark::cameras::ID)
+                            .map_or(0, |s| s.images.len())
+                    );
+                }
+                result.left_out = left_out;
                 swept.push(result);
                 continue;
             }
@@ -891,6 +1013,7 @@ impl RunCtx<'_> {
     fn finish_sweep(
         &self,
         sets: &[ImageSet],
+        cameras: Option<&images::CamerasLoaded>,
         versions: RuntimeVersions,
         swept: &[ModelResult],
         report: &mut Report,
@@ -906,7 +1029,7 @@ impl RunCtx<'_> {
             print_thresholds(swept, self.objective);
             print_frame_roc(swept);
         }
-        let merged = self.save_results(results, swept, report)?;
+        let merged = self.save_results(results, swept, sets, cameras, report)?;
         // Variants are measurements only: the config gets the plain pipeline's picks.
         let plain: Vec<ModelResult> = swept
             .iter()
@@ -942,12 +1065,16 @@ impl RunCtx<'_> {
         &self,
         results: BenchmarkResults,
         swept: &[ModelResult],
+        sets: &[ImageSet],
+        cameras: Option<&images::CamerasLoaded>,
         report: &mut Report,
     ) -> Result<BenchmarkResults> {
         if self.args.no_save {
             return Ok(results);
         }
         let path = results_path(self.config_path);
+        // The labels Your cameras was scored against, before the results that leave them out.
+        crate::benchmark::cameras::write_snapshot(&path, sets, cameras)?;
         let (prev, warnings) = BenchmarkResults::load_for_merge(&path)?;
         for w in warnings {
             report.warn(self.args.json, w);

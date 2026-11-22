@@ -884,6 +884,9 @@ mod tests {
             s.dataset_dirs()[0].join("night/cam/2026-11-07/a.labels.json"),
             root.join("logs/blue_onyx_prism.log.2026-01-01"),
             root.join("cfg.json"),
+            // Benchmark results and the labels Your cameras was scored against.
+            root.join("benchmark.json"),
+            root.join(crate::benchmark::cameras::snapshot::FILE),
         ];
         for p in &data {
             put(p, 7);

@@ -125,6 +125,10 @@ pub struct StoredImage {
     pub file: String,
     #[serde(default)]
     pub preds: Vec<StoredPred>,
+    /// Its cross-validation group ([`super::report::ImageInfo::group`]: the camera day on "Your
+    /// cameras"); None elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// The stored predictions of one model on one device.
@@ -187,6 +191,7 @@ impl StoredRun {
                             .collect(),
                         MAX_STORED_PREDS_PER_IMAGE,
                     ),
+                    group: None,
                 })
                 .collect(),
         })
@@ -343,11 +348,26 @@ impl StoredPreds {
                 r
             })
             .collect();
+        // The groups of the images (Your cameras' camera days), from the merged results.
+        let groups: HashMap<(&str, &str), &str> = merged
+            .image_sets
+            .iter()
+            .flat_map(|s| {
+                s.images.iter().filter_map(move |i| {
+                    Some(((s.id.as_str(), i.file.as_str()), i.group.as_deref()?))
+                })
+            })
+            .collect();
         for m in new {
             for d in &m.devices {
                 if let Some(run) = d.run.as_ref().filter(|_| d.ok())
-                    && let Some(s) = StoredRun::of(m, &d.device, run)
+                    && let Some(mut s) = StoredRun::of(m, &d.device, run)
                 {
+                    for img in &mut s.images {
+                        img.group = groups
+                            .get(&(img.set.as_str(), img.file.as_str()))
+                            .map(|g| (*g).to_string());
+                    }
                     runs.push(s);
                 }
             }
@@ -1417,6 +1437,7 @@ pub(crate) mod tests {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             objects: Some(objects),
             scene: None,
+            group: None,
         };
         let set = |id: &str, gt: GroundTruth, images: Vec<ImageInfo>| ImageSetInfo {
             id: id.into(),
@@ -1489,16 +1510,19 @@ pub(crate) mod tests {
                         p(0, 0.7, [400.0, 0.0, 500.0, 100.0]),       // ignore region
                         p(0, 0.3, [600.0, 300.0, 640.0, 400.0]),     // FP
                     ],
+                    group: None,
                 },
                 StoredImage {
                     set: "night-set".into(),
                     file: "b.jpg".into(),
                     preds: vec![p(0, 0.6, [0.0, 0.0, 50.0, 60.0])], // IoU 0.83: TP at 0.5
+                    group: None,
                 },
                 StoredImage {
                     set: "pseudo-set".into(),
                     file: "c.jpg".into(),
                     preds: vec![p(0, 0.8, [0.0, 0.0, 100.0, 100.0])],
+                    group: None,
                 },
             ],
         };

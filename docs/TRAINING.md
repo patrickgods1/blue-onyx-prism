@@ -1145,6 +1145,10 @@ Stages (page and `train run` show them with percent and ETA):
    `--report`) over two or more GPUs is refused before any model loads unless `--confirm-gpus` is
    given (or `benchmark.devices` lists fewer), and it leaves the same breadcrumb, reported by the
    next run or service start. A failed benchmark is reported but keeps the model.
+   Beyond the held-out set, the Benchmark page's **Your cameras** set (`cameras`, every reviewed
+   frame, README "Per-model devices and benchmarking") compares a trained model with the others on
+   all your reviewed frames: the frames its run trained or validated on (`train.txt`, `valid.txt`)
+   are left out of its run, and Compare scores every listed model on the frames none of them saw.
 
 Default name: `<scene>-<model>-<YYYYMMDD-HHMM>`: `custom-` for `all`, `day-`, `night-` for `night+ir`,
 `night-only-`, `ir-`, `day-night-`, `day-ir-`. Several models can be queued at once (one per ticked
