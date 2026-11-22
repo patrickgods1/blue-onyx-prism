@@ -206,9 +206,46 @@ pub struct BenchArgs {
     /// bare results only.
     #[arg(long)]
     pub served: bool,
+    /// Run the burst test after each model x device's timed runs: a temporary worker of the
+    /// serving code gets C cameras triggering at once, each sending K images I ms apart, three
+    /// bursts (open loop: each request's latency counts from when it was due), and the request
+    /// latency incl. queue wait, the time to each trigger's last answer and the refused requests
+    /// are recorded. `--burst` alone uses benchmark.burst's load (8,4,500 by default); `--burst
+    /// C,K,I` sets it (cameras 1-32, images 1-20, interval 50-5000 ms). Also on with
+    /// benchmark.burst.enabled. 10 s to a minute per model x device.
+    #[arg(long, num_args = 0..=1, value_name = "C,K,I", value_parser = parse_burst_arg)]
+    pub burst: Option<Option<crate::config::BurstConfig>>,
     /// Show info-level logs (on stderr).
     #[arg(long, short)]
     pub verbose: bool,
+}
+
+/// `--burst C,K,I`: cameras, images per camera, interval in ms, each in `benchmark.burst`'s
+/// range.
+fn parse_burst_arg(s: &str) -> Result<crate::config::BurstConfig, String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    let [c, k, i] = parts.as_slice() else {
+        return Err(format!(
+            "'{s}' is not C,K,I (cameras, images per camera, interval in ms; e.g. 8,4,500)"
+        ));
+    };
+    let (lo, hi) = crate::config::BURST_CAMERAS;
+    let cameras = parse_bounded(c, lo, hi).map_err(|e| format!("cameras: {e}"))?;
+    let (lo, hi) = crate::config::BURST_IMAGES;
+    let images = parse_bounded(k, lo, hi).map_err(|e| format!("images: {e}"))?;
+    let (lo, hi) = crate::config::BURST_INTERVAL_MS;
+    let interval = parse_bounded(
+        i,
+        usize::try_from(lo).unwrap_or(0),
+        usize::try_from(hi).unwrap_or(usize::MAX),
+    )
+    .map_err(|e| format!("interval (ms): {e}"))?;
+    Ok(crate::config::BurstConfig {
+        enabled: true,
+        cameras,
+        images,
+        interval_ms: u64::try_from(interval).unwrap_or(u64::MAX),
+    })
 }
 
 fn parse_variants_arg(s: &str) -> Result<crate::benchmark::variant::VariantList, String> {
@@ -216,12 +253,15 @@ fn parse_variants_arg(s: &str) -> Result<crate::benchmark::variant::VariantList,
 }
 
 fn parse_goal_arg(s: &str) -> Result<String, String> {
-    s.parse::<crate::benchmark::eval::Optimize>()
-        .map(|_| s.to_string())
+    let o = s.parse::<crate::benchmark::eval::Optimize>()?;
+    if let Some(o) = o.objective() {
+        o.reachable()?;
+    }
+    Ok(s.to_string())
 }
 
 fn parse_objective_text(s: &str) -> Result<String, String> {
-    s.parse::<Objective>().map(|_| s.to_string())
+    Objective::parse_target(s).map(|_| s.to_string())
 }
 
 fn parse_budget_arg(s: &str) -> Result<String, String> {
@@ -229,7 +269,7 @@ fn parse_budget_arg(s: &str) -> Result<String, String> {
 }
 
 fn parse_objective_arg(s: &str) -> Result<Objective, String> {
-    s.parse()
+    Objective::parse_target(s)
 }
 
 fn parse_metric_arg(s: &str) -> Result<AccuracyMetric, String> {

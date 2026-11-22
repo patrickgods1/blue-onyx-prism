@@ -607,12 +607,15 @@ struct ThresholdPick {
     device: Option<String>,
 }
 
-/// The picks of an apply-threshold form: `all=1` takes the saved best thresholds of the
-/// configured models (limited to the form's models, if any), else the `model` / `threshold`
-/// pairs (`threshold=global`: None, the model's own threshold is cleared), each optionally
-/// followed by a `device` (a profile for that device; `global` / `none` removes it). Also
-/// returns the models `all=1` left alone because their best threshold was fitted on pseudo
-/// ground truth (an explicit `threshold` is always written).
+/// The picks of an apply-threshold form: `all=1` takes, per configured model (limited to the
+/// form's models, if any), the Tune view's cross-validated suggestion for the saved goal
+/// ([`suggested`], [`crate::benchmark::eval::tune::suggestions`]: its recommended device's, else
+/// its first device's), written as the model's own threshold; unsavable suggestions (pseudo
+/// labels, a target not met on its 95% bound, a flat curve, no pick) are skipped, and
+/// low-confidence ones too unless `confirm=1`. Else the `model` / `threshold` pairs
+/// (`threshold=global`: None, the model's own threshold is cleared), each optionally followed by
+/// a `device` (a profile for that device; `global` / `none` removes it). Also returns, in words,
+/// the models `all=1` left alone and why (an explicit `threshold` is always written).
 fn threshold_picks(
     state: &AppState,
     form: &[(String, String)],

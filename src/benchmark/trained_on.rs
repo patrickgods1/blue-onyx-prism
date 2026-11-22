@@ -203,6 +203,8 @@ mod tests {
         other.model = "not-configured".into();
         let mut r = BenchmarkResults::new(Default::default(), Default::default(), vec![m, other]);
         r.image_sets = vec![ImageSetInfo {
+            snapshot: None,
+            labels_stale: None,
             id: "export".into(),
             title: String::new(),
             kind: crate::benchmark::images::SetKind::Dir,

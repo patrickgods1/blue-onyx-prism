@@ -35,7 +35,7 @@ use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 mod args;
 mod print;
@@ -133,6 +133,23 @@ fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<V
         return Ok(as_served(out, args, config));
     }
     Ok(with_variants(out, args, config, errors))
+}
+
+/// The burst test of this run: `--burst C,K,I`, `--burst` alone with `benchmark.burst`'s load,
+/// else `benchmark.burst` when it is enabled; None = no burst test.
+pub(crate) fn burst_of(args: &BenchArgs, config: &Config) -> Option<crate::config::BurstConfig> {
+    match args.burst {
+        Some(Some(b)) => Some(b),
+        Some(None) => Some(crate::config::BurstConfig {
+            enabled: true,
+            ..config.benchmark.burst
+        }),
+        None => config
+            .benchmark
+            .burst
+            .enabled
+            .then_some(config.benchmark.burst),
+    }
 }
 
 /// What `--served` and `--variants` refused together say.
@@ -256,6 +273,13 @@ fn rescore_cli(args: &BenchArgs, config: &Config, config_path: &Path) -> Result<
         );
         for n in &r.not_rescored {
             println!("  not re-scored (no stored predictions): {n}");
+        }
+        if !r.unknown.is_empty() {
+            println!(
+                "  {} frame(s) could not be read this time and kept their labels: {}",
+                r.unknown.len(),
+                r.unknown.join(", ")
+            );
         }
     }
     Ok(true)
@@ -505,7 +529,8 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     }
     let info = runtimes.info();
     let versions = RuntimeVersions::of(&runtimes);
-    let runtimes = Mutex::new(runtimes);
+    // Shared: the burst test's temporary workers compile through the same runtimes.
+    let runtimes = Arc::new(Mutex::new(runtimes));
     let mut report = Report::new(info, errors, &sets, warnings);
     // A sweep of this run takes the breadcrumb over: report the one a run that never ended left.
     let data_root = config.data_root();
@@ -572,6 +597,16 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     // Windows: the GPU's video-decode load during each timed phase (another process's decode,
     // such as Blue Iris', shares the iGPU).
     bench.video_decode = true;
+    let burst = burst_of(&args, &config)
+        .map(|b| crate::benchmark::burst::Burst::new(b, &runtimes, &config));
+    if let Some(b) = burst.as_ref().filter(|_| !args.json) {
+        eprintln!(
+            "burst test after each device's timed runs: {}, {} bursts",
+            b.settings.describe(),
+            b.bursts
+        );
+    }
+    bench.burst = burst.as_ref();
 
     let run_id = crate::benchmark::history::new_run_id();
     let mut swept = ctx.run_jobs(
@@ -719,6 +754,8 @@ fn cli_progress(quiet: bool) -> impl Fn(&crate::benchmark::Progress) + Sync {
         }
         if p.phase == Phase::Loading {
             eprintln!("  {} on {} ...", p.model, p.device);
+        } else if p.phase == Phase::Burst && p.done == 0 {
+            eprintln!("    burst test, {} requests ...", p.total);
         } else if p.phase == Phase::Timing
             && p.total >= 50
             && p.done > 0
@@ -1103,9 +1140,16 @@ impl RunCtx<'_> {
             return Ok(results);
         }
         let path = results_path(self.config_path);
-        // The labels Your cameras was scored against, before the results that leave them out.
-        crate::benchmark::cameras::write_snapshot(&path, sets, cameras)?;
+        // One load-modify-save at a time, in this process and against the service.
+        let _held = crate::benchmark::results_io::lock(
+            &path,
+            crate::benchmark::results_io::Holder::Writer,
+        )?;
         let (prev, warnings) = BenchmarkResults::load_for_merge(&path)?;
+        // The labels Your cameras was scored against, before the results that leave them out;
+        // with the frames the kept runs of `prev` still score.
+        let snapshot =
+            crate::benchmark::cameras::write_snapshot(&path, sets, cameras, prev.as_ref())?;
         for w in warnings {
             report.warn(self.args.json, w);
         }
@@ -1118,6 +1162,9 @@ impl RunCtx<'_> {
             .map(crate::benchmark::history::seed_entries)
             .unwrap_or_default();
         let mut merged = BenchmarkResults::merge(prev, results);
+        if let Some(id) = &snapshot {
+            crate::benchmark::cameras::snapshot::stamp(&mut merged, id);
+        }
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(self.metric, self.weights);
         merged.save(&path)?;
@@ -1450,6 +1497,15 @@ mod tests {
         Cli::try_parse_from(argv).map(|c| c.args)
     }
 
+    /// S2: `--goal`, `--tune-for` and `--threshold-objective` refuse a 100% target.
+    #[test]
+    fn a_target_no_finite_set_can_show_is_refused_on_the_command_line() {
+        for flag in ["--goal", "--tune-for", "--threshold-objective"] {
+            let e = parse(&["x", flag, "precision:1"]).unwrap_err().to_string();
+            assert!(e.contains("100%"), "{flag}: {e}");
+        }
+    }
+
     /// `--goal` and its companions set the run's goal; the old flags map onto it.
     #[test]
     fn goal_flags_and_the_old_flags_map_onto_the_goal() {
@@ -1505,6 +1561,51 @@ mod tests {
         assert!(parse(&["x", "--goal", "f3"]).is_err());
         assert!(parse(&["x", "--speed-budget", "-1"]).is_err());
         assert!(parse(&["x", "--tune-for", "ap50"]).is_err());
+    }
+
+    /// `--burst`: bare = the config's load turned on, `C,K,I` sets it, out-of-range or malformed
+    /// values are refused by clap; without the flag `benchmark.burst.enabled` decides.
+    #[test]
+    fn the_burst_flag() {
+        use crate::config::BurstConfig;
+        let mut config = Config::default();
+        assert_eq!(burst_of(&parse(&["x"]).unwrap(), &config), None);
+        config.benchmark.burst.cameras = 6;
+        let bare = parse(&["x", "--burst", "--all-devices"]).unwrap();
+        assert!(bare.all_devices, "a bare --burst takes no value");
+        assert_eq!(
+            burst_of(&bare, &config),
+            Some(BurstConfig {
+                enabled: true,
+                cameras: 6,
+                ..BurstConfig::default()
+            })
+        );
+        assert_eq!(
+            burst_of(&parse(&["x", "--burst", "5,3,250"]).unwrap(), &config),
+            Some(BurstConfig {
+                enabled: true,
+                cameras: 5,
+                images: 3,
+                interval_ms: 250
+            })
+        );
+        for bad in [
+            "0,3,250",
+            "33,3,250",
+            "5,21,250",
+            "5,3,49",
+            "5,3",
+            "a,b,c",
+            "5,3,250,1",
+        ] {
+            assert!(parse(&["x", "--burst", bad]).is_err(), "{bad}");
+        }
+        config.benchmark.burst.enabled = true;
+        assert_eq!(
+            burst_of(&parse(&["x"]).unwrap(), &config).map(|b| b.cameras),
+            Some(6)
+        );
     }
 
     /// `--served` with `--variants` is refused with a message saying why; `benchmark.served`
@@ -1807,6 +1908,7 @@ mod tests {
             refusal: None,
             low_confidence: None,
             recommended: true,
+            figures: None,
         });
         let changes = apply_thresholds(&s, &path, true).unwrap();
         let want: Vec<(String, String, Option<f32>, Option<f32>)> = s[..2]

@@ -29,7 +29,7 @@
 //! labels count on it ([`EvalImage::annotated`]): a vehicle-only set adds no frames without a
 //! person, and its frames are empty when they have no vehicle.
 //!
-//! Threshold sweep ([`SweepImage`], [`threshold_curve`]): TP / FP / FN, precision, recall, F1,
+//! Threshold sweep ([`SweepImage`], [`sweep_counts`]): TP / FP / FN, precision, recall, F1,
 //! F2 and false positives per image at every confidence threshold of [`SWEEP_THRESHOLDS`],
 //! from one matching of the low-threshold predictions. This is exact, not an approximation:
 //! greedy matching visits predictions by descending confidence, so whether a prediction is a
@@ -533,7 +533,9 @@ impl ClassMap {
             .collect()
     }
 
-    /// Ground truth in the scored label space (unscored boxes dropped).
+    /// Ground truth in the scored label space (unscored boxes dropped): the tests' view of
+    /// [`Self::gt_class`].
+    #[cfg(test)]
     pub fn map_gt(&self, gt: &[GtBox]) -> Vec<GtBox> {
         gt.iter()
             .filter_map(|g| {
@@ -1025,10 +1027,32 @@ pub fn image_counts(img: &EvalImage, threshold: f32) -> (Counts, Vec<PredBox>, I
     )
 }
 
-/// Keep the `MAX_DETS` most confident predictions per class.
+/// The distinct detections of `preds` for the threshold-free metrics (AP; every caller of AP
+/// goes through [`cap`]): an As served box returned on two separate threshold stretches is
+/// stored once per stretch ([`super::served::windows`]) and is one detection, not two (the copy
+/// would count as an unmatched false positive). Copies are equal in label, box and confidence
+/// and differ only in their [`PredBox::window`]; the first is kept. Plain runs have none.
+fn distinct(preds: &[PredBox]) -> Vec<&PredBox> {
+    let mut out: Vec<&PredBox> = Vec::with_capacity(preds.len());
+    for p in preds {
+        let copy = p.window.is_some()
+            && out.iter().any(|q| {
+                q.window.is_some()
+                    && q.label == p.label
+                    && q.confidence.to_bits() == p.confidence.to_bits()
+                    && q.bbox.map(f32::to_bits) == p.bbox.map(f32::to_bits)
+            });
+        if !copy {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Keep the `MAX_DETS` most confident distinct predictions ([`distinct`]) per class.
 pub(crate) fn cap(preds: &[PredBox]) -> Vec<PredBox> {
     let mut by: BTreeMap<&str, Vec<&PredBox>> = BTreeMap::new();
-    for p in preds {
+    for p in distinct(preds) {
         by.entry(p.label.as_str()).or_default().push(p);
     }
     let mut out = Vec::new();
@@ -1572,7 +1596,8 @@ pub fn sweep_counts(images: &[&SweepImage], scope: SweepScope, threshold: f32) -
     c
 }
 
-/// The curve over `thresholds`.
+/// The curve over `thresholds` (the tests' check of [`sweep_counts`]).
+#[cfg(test)]
 pub fn threshold_curve(
     images: &[&SweepImage],
     scope: SweepScope,

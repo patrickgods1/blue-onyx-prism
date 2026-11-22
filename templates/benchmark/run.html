@@ -50,7 +50,7 @@
     </fieldset>
   </form>
   <details class="card bn-opts" id="run-opts">
-    <summary><strong>Options</strong> <span class="muted small">images per set, timed runs, warm-up, priority, reference model, serving rules</span></summary>
+    <summary><strong>Options</strong> <span class="muted small">images per set, timed runs, warm-up, priority, reference model, serving rules, burst test</span></summary>
     <div class="bn-grid3">
       <div>
         <label class="bn-field" for="o-max">Images per set <input type="number" id="o-max" min="0" inputmode="numeric" value="{{ max_images }}"> <span class="muted small">0 = all</span></label>
@@ -65,6 +65,14 @@
       </div>
       <div>
         <label class="check"><input type="checkbox" id="o-served"{% if served %} checked{% endif %}> <span><strong>As served</strong> <span class="muted small">apply each model's night model, night threshold, filters, enhancement and verifier, as Blue Iris gets them; kept apart as &lt;model&gt;+served</span></span></label>
+        <label class="check"><input type="checkbox" id="o-burst"{% if burst.enabled %} checked{% endif %}> <span><strong>Burst test</strong> <span class="muted small">after each combo: cameras triggering together, as your Blue Iris sends them; latency with queue wait and time to the last answer</span></span></label>
+        <fieldset class="bn-burst" id="o-burst-fields"{% if !burst.enabled %} disabled{% endif %}>
+          <legend class="visually-hidden">Burst load</legend>
+          <label class="bn-field" for="o-burst-cameras"><input type="number" id="o-burst-cameras" min="{{ burst_ranges[0].0 }}" max="{{ burst_ranges[0].1 }}" inputmode="numeric" value="{{ burst.cameras }}"> cameras ×</label>
+          <label class="bn-field" for="o-burst-images"><input type="number" id="o-burst-images" min="{{ burst_ranges[1].0 }}" max="{{ burst_ranges[1].1 }}" inputmode="numeric" value="{{ burst.images }}"> images,</label>
+          <label class="bn-field" for="o-burst-interval"><input type="number" id="o-burst-interval" min="{{ burst_ranges[2].0 }}" max="{{ burst_ranges[2].1 }}" step="50" inputmode="numeric" value="{{ burst.interval_ms }}"> ms apart</label>
+          <p class="muted small" id="o-burst-est" aria-live="polite"></p>
+        </fieldset>
       </div>
     </div>
   </details>

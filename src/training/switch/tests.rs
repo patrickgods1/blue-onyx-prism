@@ -1,7 +1,5 @@
 use super::*;
-use crate::benchmark::metrics::{Counts, ThresholdPoint};
 use crate::benchmark::report::test_support::model;
-use crate::benchmark::threshold::{DevicePick, Pick, ThresholdAdvice};
 use crate::model::filters::OverlapRule;
 use crate::static_memory::StaticSuppression;
 use crate::verify::VerifyConfig;
@@ -538,69 +536,43 @@ fn a_different_verifier_needs_a_confirm_naming_it() {
     assert_eq!(verifiers(&c)["new"], "night");
 }
 
-fn point(t: f32, precision: f64, recall: f64) -> ThresholdPoint {
-    ThresholdPoint {
-        threshold: t,
-        counts: Counts {
-            tp: 1,
-            ..Default::default()
-        },
-        precision: Some(precision),
-        recall: Some(recall),
-        f1: Some(0.5),
-        f2: Some(0.5),
-        fp_per_image: 0.0,
-        frame: None,
-        per_frame: None,
-        false_alerts: None,
+/// The Tune view's suggestion of `new` on `device` (recall 0.91, precision 0.88 on 251 frames
+/// of its held-out set).
+fn tuned(device: &str, t: f32, recommended: bool) -> crate::benchmark::eval::tune::Suggested {
+    crate::benchmark::eval::tune::Suggested {
+        model: "new".into(),
+        device: device.into(),
+        threshold: Some(t),
+        refusal: None,
+        low_confidence: None,
+        recommended,
+        figures: Some(crate::benchmark::eval::tune::PickFigures {
+            set: "heldout-new".into(),
+            frames: 251,
+            recall: Some(0.91),
+            precision: Some(0.88),
+        }),
     }
 }
 
-fn pick(t: f32, precision: f64, recall: f64) -> Pick {
-    Pick {
-        objective: "f1".into(),
-        threshold: t,
-        point: point(t, precision, recall),
-        met: true,
-        note: None,
-        exact_threshold: None,
-        exact_score: None,
-        plateau: None,
-        relative: false,
-    }
-}
-
-fn advised(datasets: &[&str]) -> crate::benchmark::report::ModelResult {
+fn benchmarked(datasets: &[&str]) -> crate::benchmark::report::ModelResult {
     let mut m = model(vec![], None);
     m.model = "new".into();
     m.images = 251;
     m.datasets = names(datasets);
-    m.threshold = Some(ThresholdAdvice {
-        objective: "f1".into(),
-        device: "ort:cuda:0".into(),
-        relative: false,
-        configured: point(0.5, 0.8, 0.8),
-        best: Some(pick(0.42, 0.88, 0.91)),
-        alternatives: vec![],
-        curve: vec![],
-        exact: vec![],
-        by_dataset: vec![],
-        by_tag: vec![],
-        per_class: vec![],
-        by_device: vec![DevicePick {
-            device: "ort:cuda:0".into(),
-            best: Some(pick(0.42, 0.88, 0.91)),
-        }],
-        roc: None,
-        now: None,
-    });
     m
 }
 
+/// S1: "Use as" saves the Tune view's cross-validated suggestion of the device the model will
+/// run on (the rule of every other save), never the older threshold advice.
 #[test]
-fn the_suggestion_comes_from_the_heldout_result_in_words() {
-    let r = advised(&["heldout-new"]);
-    let s = suggest(&r, "new", Some("ort:cuda:0")).unwrap();
+fn the_suggestion_is_the_tune_views_pick_in_words() {
+    let r = benchmarked(&["heldout-new"]);
+    let picks = [
+        tuned("ort:cpu", 0.37, false),
+        tuned("ort:cuda:0", 0.42, true),
+    ];
+    let s = suggest(&r, "new", Some("ort:cuda:0"), &picks).unwrap();
     assert!((s.threshold - 0.42).abs() < 1e-6);
     assert_eq!(s.device.as_deref(), Some("ort:cuda:0"));
     assert!(s.words.contains("At 0.42"), "{}", s.words);
@@ -610,46 +582,62 @@ fn the_suggestion_comes_from_the_heldout_result_in_words() {
         s.words
     );
     assert!(s.words.contains("251 frames"), "{}", s.words);
-    assert!(s.notes.is_empty());
-    // Another device: the model's own threshold, and it says so.
-    let s = suggest(&r, "new", Some("ort:cpu")).unwrap();
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+    assert!(!s.confirm && s.low_confidence.is_none());
+    // Its own device's pick, not the recommended one's.
+    let s = suggest(&r, "new", Some("ort:cpu"), &picks).unwrap();
+    assert!((s.threshold - 0.37).abs() < 1e-6);
+    assert_eq!(s.device.as_deref(), Some("ort:cpu"));
+    // Another device: the recommended device's pick as the model's own threshold, said so.
+    let s = suggest(&r, "new", Some("openvino:gpu"), &picks).unwrap();
     assert_eq!(s.device, None);
-    assert!(s.notes[0].contains("not on ort:cpu"), "{:?}", s.notes);
+    assert!((s.threshold - 0.42).abs() < 1e-6);
+    assert!(s.notes[0].contains("not on openvino:gpu"), "{:?}", s.notes);
     // Other sets and its own frames in the figures are named.
-    let mut r = advised(&["heldout-new", "nir-night"]);
+    let mut r = benchmarked(&["heldout-new", "nir-night"]);
     r.trained_on_share = Some(0.4);
-    let s = suggest(&r, "new", Some("ort:cuda:0")).unwrap();
+    let s = suggest(&r, "new", Some("ort:cuda:0"), &picks).unwrap();
     assert!(
         s.notes.iter().any(|n| n.contains("nir-night")),
         "{:?}",
         s.notes
     );
     assert!(s.notes.iter().any(|n| n.contains("40%")), "{:?}", s.notes);
+    // Low confidence: returned, but saving asks for the confirmation.
+    let mut low = tuned("ort:cuda:0", 0.42, true);
+    low.low_confidence = Some("low confidence: 3 group(s)".into());
+    let s = suggest(
+        &benchmarked(&["heldout-new"]),
+        "new",
+        Some("ort:cuda:0"),
+        &[low],
+    )
+    .unwrap();
+    assert!(s.confirm);
+    assert!(s.low_confidence.as_deref().unwrap().contains("3 group"));
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["confirm"], true);
+    assert!(v["low_confidence"].is_string());
 }
 
 #[test]
-fn no_suggestion_without_heldout_frames_or_a_usable_result() {
-    let r = advised(&["export-1"]);
-    let e = suggest(&r, "new", None).unwrap_err();
+fn no_suggestion_without_heldout_frames_or_a_savable_pick() {
+    let picks = [tuned("ort:cuda:0", 0.42, true)];
+    let e = suggest(&benchmarked(&["export-1"]), "new", None, &picks).unwrap_err();
     assert!(e.contains("did not use its held-out frames"), "{e}");
-    let mut r = advised(&["heldout-new"]);
-    r.threshold.as_mut().unwrap().relative = true;
+    let r = benchmarked(&["heldout-new"]);
     assert!(
-        suggest(&r, "new", None)
+        suggest(&r, "new", None, &[])
             .unwrap_err()
-            .contains("human labels")
+            .contains("no stored predictions")
     );
-    let mut r = advised(&["heldout-new"]);
-    r.threshold = None;
-    assert!(suggest(&r, "new", None).is_err());
-    // A goal it did not reach writes nothing.
-    let mut r = advised(&["heldout-new"]);
-    let a = r.threshold.as_mut().unwrap();
-    a.best.as_mut().unwrap().met = false;
-    a.by_device[0].best.as_mut().unwrap().met = false;
-    assert!(
-        suggest(&r, "new", Some("ort:cuda:0"))
-            .unwrap_err()
-            .contains("goal")
-    );
+    // What the Tune step refuses to save is refused here too (pseudo labels, an unmet target,
+    // a flat curve), with its reason.
+    let mut refused = tuned("ort:cuda:0", 0.42, true);
+    refused.refusal = Some("not savable: the target is not met on its 95% bound".into());
+    let e = suggest(&r, "new", Some("ort:cuda:0"), &[refused]).unwrap_err();
+    assert!(e.contains("goal") && e.contains("95% bound"), "{e}");
+    let mut none = tuned("ort:cuda:0", 0.42, true);
+    none.threshold = None;
+    assert!(suggest(&r, "new", Some("ort:cuda:0"), &[none]).is_err());
 }

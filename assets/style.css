@@ -1876,6 +1876,14 @@ label.check.unavailable { opacity: 0.65; }
 .bn-opts .bn-grid3 { margin-top: 0.75rem; }
 .bench .bn-opts label { color: var(--fg); }
 .bench .bn-opts input[type="number"] { width: 5.5rem; }
+/* The Options' checkboxes, each on its own line (box beside its wrapped text). */
+.bn-opts label.check { display: flex; flex-direction: row; align-items: flex-start; gap: 0.5rem; margin: 0 0 0.6rem; }
+.bn-opts label.check input { flex: none; margin-top: 0.2rem; }
+/* The burst test's load under its checkbox: "[8] cameras × [4] images, [500] ms apart", wrapping. */
+.bn-burst { border: 0; margin: 0 0 0.6rem 1.6rem; padding: 0; min-width: 0; display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem; align-items: center; }
+.bench .bn-opts .bn-burst input[type="number"] { width: 4.5rem; }
+.bn-burst[disabled] { opacity: 0.6; }
+.bn-burst p { flex-basis: 100%; margin: 0; }
 
 .bn-start .bn-row { justify-content: space-between; }
 .bench .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.75rem; }
@@ -1993,7 +2001,8 @@ button.bn-thumb .bn-cap { position: absolute; left: 0; right: 0; bottom: 0; font
 .bn-box.ign { stroke: var(--muted); stroke-dasharray: 2 3; }
 .bn-big-img { position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--code-bg); }
 .bn-big-img .bn-box { stroke-width: 3; }
-.bn-big-img text { font-size: 13px; paint-order: stroke; stroke: #000; stroke-width: 3px; fill: #fff; }
+/* Labels: font-size and halo width are set by bench-frames.js (BenchCore.labelSize) in the image's pixels. */
+.bn-big-img text { paint-order: stroke; stroke: #000; stroke-linejoin: round; fill: #fff; }
 .bn-lg { display: inline-flex; align-items: center; gap: 0.3rem; margin-right: 0.8rem; font-size: 0.82rem; }
 .bn-lg i { width: 0.9rem; height: 0.6rem; border: 2px solid var(--box-ok); display: inline-block; border-radius: 2px; }
 .bn-lg i.miss { border-color: var(--box-miss); border-style: dashed; } .bn-lg i.fp { border-color: var(--box-fp); }

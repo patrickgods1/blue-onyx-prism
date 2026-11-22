@@ -75,7 +75,7 @@ use config_page::{
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
     schedule_restart,
 };
-pub(crate) use detect::BODY_LIMIT;
+pub(crate) use detect::{BODY_LIMIT, dispatch};
 use detect::{custom_list, detection_custom, detection_default};
 use devices::model_selection;
 use devices::{DevicesSnapshot, devices_json, devices_snapshot};

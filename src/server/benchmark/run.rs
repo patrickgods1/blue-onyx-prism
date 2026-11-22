@@ -205,6 +205,11 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         low_priority = req.low_priority,
         "benchmark started from the web UI"
     );
+    // Not while a Re-score holds the saved results (it checks for a run under the same lock).
+    let _starting = match crate::benchmark::results_io::hold_for_start(&ctx.results_path) {
+        Ok(h) => h,
+        Err(e) => return json_error(StatusCode::CONFLICT, e.to_string()),
+    };
     match state.benchmark.start(ctx, req) {
         Ok(()) => (
             StatusCode::ACCEPTED,
@@ -385,6 +390,21 @@ fn remove_dataset_blocking(state: &AppState, form: &[(String, String)]) -> Respo
 /// they changed: (changed, a note when it was not done).
 fn rescore_saved(state: &AppState, req: &RunRequest) -> (bool, Option<String>) {
     use crate::benchmark::search::{StoredPreds, preds_path};
+    let path = results_path(&state.config_path);
+    // The load-modify-save under the results lock; the run check under it too (a run's saves
+    // take the same lock).
+    let _held = match crate::benchmark::results_io::lock(
+        &path,
+        crate::benchmark::results_io::Holder::Writer,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                false,
+                Some(format!("The saved results were not re-ranked: {e:#}.")),
+            );
+        }
+    };
     if state.benchmark.is_running() {
         return (
             false,
@@ -394,7 +414,6 @@ fn rescore_saved(state: &AppState, req: &RunRequest) -> (bool, Option<String>) {
             ),
         );
     }
-    let path = results_path(&state.config_path);
     let mut results = match BenchmarkResults::load_with_warnings(&path) {
         Ok((Some(r), w)) if w.is_empty() => r,
         Ok((None, _)) => return (false, None),
@@ -654,6 +673,8 @@ mod tests {
     fn a_held_out_set_is_found_by_its_name_only() {
         let mut r: BenchmarkResults = serde_json::from_str("{}").unwrap();
         let set = |id: &str, kind, dir: &str| ImageSetInfo {
+            snapshot: None,
+            labels_stale: None,
             id: id.into(),
             title: String::new(),
             kind,

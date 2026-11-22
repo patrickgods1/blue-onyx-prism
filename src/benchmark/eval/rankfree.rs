@@ -389,4 +389,36 @@ mod tests {
         assert!(d.auc(None).is_some());
         assert_eq!(AucData::default().auc(None), None);
     }
+
+    /// S5: an As served box returned on two separate threshold stretches is stored once per
+    /// stretch; AP counts it once (the copy is not a second, unmatched detection).
+    #[test]
+    fn a_box_stored_per_stretch_counts_once_in_ap() {
+        use crate::benchmark::metrics::Window;
+        let windowed = |w: [f32; 2]| PredBox {
+            window: Some(Window::from(w)),
+            ..p("person", 0.8, 100.0)
+        };
+        // Three persons found at 0.9, 0.8 (stored once per stretch) and 0.7: a copy counted as a
+        // false positive before the 0.7 find would lower its precision.
+        let imgs = vec![EvalImage {
+            gt: vec![
+                gt("person", 0.0, false),
+                gt("person", 100.0, false),
+                gt("person", 200.0, false),
+            ],
+            preds: vec![
+                p("person", 0.9, 0.0),
+                windowed([f32::NEG_INFINITY, 0.3]),
+                windowed([0.5, 0.8]),
+                p("person", 0.7, 200.0),
+            ],
+            annotated: None,
+        }];
+        let classes = vec!["person".to_string()];
+        let groups = Groups::new(["a"]);
+        let d = ApData::new(&imgs, &groups, &classes, false);
+        assert_eq!(d.ap50(None), Some(1.0));
+        assert_eq!(evaluate(&imgs, &classes, 0.5).ap50, Some(1.0));
+    }
 }

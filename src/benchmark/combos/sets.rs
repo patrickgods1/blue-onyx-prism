@@ -280,6 +280,8 @@ mod tests {
 
     fn set(id: &str, kind: SetKind, images: Vec<ImageInfo>) -> ImageSetInfo {
         ImageSetInfo {
+            snapshot: None,
+            labels_stale: None,
             id: id.into(),
             title: format!("{id} title"),
             kind,

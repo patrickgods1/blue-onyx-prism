@@ -12,7 +12,8 @@
   if (!S || !C) return;
   var $ = function (id) { return document.getElementById(id); };
   var params = new URLSearchParams(location.search);
-  var state = {set: params.get("set") || "", scene: params.get("scene") || "all", open: {}, tab: "scenes", pair: null, view: null, loading: null};
+  var state = {set: params.get("set") || "", scene: params.get("scene") || "all", open: {}, tab: "scenes", pair: null, view: null, loadError: false};
+  var loads = BC.latest();
   var focusModel = params.get("model");
   var columns = BC.columnsOf(BC.store.get("columns", []));
   var table = $("c-table"), body = $("cmp-body"), empty = $("cmp-empty");
@@ -57,8 +58,8 @@
     var metricName = goal.metric + (goal.rankOnly ? "" : " (cross-validated)");
     var head = el("tr", {}, [th("#", "rank", true, null, "rank"), th("Model", "model"), th("Device", "device"), th(metricName, "metric", true, "desc", goal.rankOnly ? null : "oof"),
       th("Recall", "recall", true, "desc", "recall"), th("Precision", "precision", true, "desc", "precision"), th("False alerts /100 empty", "fa100", true, "asc", "fa100"),
-      th("Confidence", "conf", true, null, "confidence"), th("p95", "p95", true, "asc", "p95")]);
-    columns.forEach(function (k) { var c = BC.COLUMNS.filter(function (x) { return x.key === k; })[0]; head.appendChild(th(c.label, "x-" + k, ["first_load", "cpu"].indexOf(k) < 0, null, ({f1: "f1", f05: "f05", ap50: "ap50", ap50_95: "ap50_95", roc_auc: "roc_auc", first_load: "first_load", cpu: "cpu", burst: "burst"})[k])); });
+      th("Confidence", "conf", true, null, "confidence"), th(rows.some(function (r) { return r.speed && BC.has(r.speed.burstP95Ms); }) ? "p95 (burst when run)" : "p95", "p95", true, "asc", "p95")]);
+    columns.forEach(function (k) { var c = BC.COLUMNS.filter(function (x) { return x.key === k; })[0]; head.appendChild(th(c.label, "x-" + k, ["first_load", "cpu"].indexOf(k) < 0, null, ({f1: "f1", f05: "f05", ap50: "ap50", ap50_95: "ap50_95", roc_auc: "roc_auc", first_load: "first_load", cpu: "cpu", burst: "burst", last_answer: "last_answer"})[k])); });
     var det = el("th", {scope: "col", "data-sort-off": ""}); det.appendChild(el("span", {class: "sr-only", text: "Details"})); head.appendChild(det);
     var tbody = el("tbody");
     rows.forEach(function (r) {
@@ -77,7 +78,7 @@
       tr.appendChild(td(BC.has(s.burstP95Ms) ? "p95 (burst)" : "p95", fmt.ms(speedOf(r)), "num", speedOf(r)));
       columns.forEach(function (key) {
         var c = BC.COLUMNS.filter(function (x) { return x.key === key; })[0];
-        var raw = {f1: r.f1, f05: r.f05, ap50: r.ap50, ap50_95: r.ap5095, roc_auc: r.rocAuc, p50: s.p50Ms, p99: s.p99Ms, burst: s.burstP95Ms}[key];
+        var raw = {f1: r.f1, f05: r.f05, ap50: r.ap50, ap50_95: r.ap5095, roc_auc: r.rocAuc, p50: s.p50Ms, p99: s.p99Ms, burst: s.burstP95Ms, last_answer: s.burst ? s.burst.lastAnswerP95Ms : null}[key];
         tr.appendChild(td(c.label, BC.columnValue(r, key), ["first_load", "cpu"].indexOf(key) < 0 ? "num" : null, raw === undefined ? undefined : raw));
       });
       var b = el("button", {type: "button", class: "bn-expand", "aria-expanded": open ? "true" : "false", "aria-controls": "d-" + r.position, "aria-label": (open ? "Less about " : "More about ") + r.model + " on " + r.device, text: open ? "Less" : "More"});
@@ -104,13 +105,23 @@
       fact("AP50 · AP50-95", fmt.n2(r.ap50) + " · " + fmt.n2(r.ap5095)),
       fact("ROC AUC (frames)", fmt.n2(r.rocAuc)),
       fact("p50 · p95 · p99", fmt.ms(s.p50Ms) + " · " + fmt.ms(s.p95Ms) + " · " + fmt.ms(s.p99Ms)),
-      fact("Burst p95", BC.has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : "not run"),
+      fact("Burst p95", BC.has(s.burstP95Ms) ? fmt.ms(s.burstP95Ms) : s.burst ? "no answer" : "not run"),
       fact("First load", BC.firstLoadText(s.firstLoad)),
       fact("CPU check", BC.agreementText(r.agreement)),
       fact("Saved confidence", BC.has(r.servedThreshold) ? fmt.n2(r.servedThreshold) : "none"),
       fact("Equally good range", BC.rangeText(r.plateau) || (r.plateau ? "only " + fmt.n2(r.plateau[0]) : "-")),
-      fact("Cross-validation", r.folds > 1 ? r.folds + " folds" : "in-sample (too little data)")
+      fact("Cross-validation", BC.cvFact(r.folds, f.lowConfidence))
     ];
+    var vb = BC.vsBestText(r.vsBest);
+    if (vb) facts.push(fact("Against the best", vb.charAt(0).toUpperCase() + vb.slice(1)));
+    var bf = BC.burstFacts(s.burst);
+    if (bf && !bf.error) {
+      facts.push(fact("Burst load", bf.load));
+      facts.push(fact("Burst p50 · p95 · p99", bf.latency));
+      facts.push(fact("Last answer p50 · p95", bf.lastAnswer));
+      facts.push(fact("Burst refused", bf.refused));
+      facts.push(fact("Burst queue", bf.queue));
+    }
     if (r.target) facts.push(fact("Target", (r.target.met ? "met" : "not met") + (BC.has(r.target.bound) ? ", 95% bound " + fmt.n2(r.target.bound) : "")));
     if (r.grade) facts.push(fact("Grade", r.grade));
     box.appendChild(el("div", {class: "bn-facts"}, facts));
@@ -118,6 +129,8 @@
     if (BC.has(f.liveLoad) && f.liveLoad > 0) notes.push("Measured while the service answered " + fmt.n1(f.liveLoad) + " requests a minute.");
     if (BC.has(f.videoDecode) && f.videoDecode > 1) notes.push("The GPU's video decode was " + Math.round(f.videoDecode) + "% busy during the run (Blue Iris Quick Sync).");
     notes.push(f.served ? "As served: night model, night threshold, filters, enhancement and verifier applied." : "Bare model: serving rules not applied.");
+    if (bf && bf.error) notes.push("Burst test not measured: " + bf.error + ".");
+    if (bf && !bf.error) notes.push("Burst test (" + bf.short + ", " + s.burst.bursts + " bursts): each request timed from when it was due, so queue wait counts; the speed budget applies to its p95." + (s.burst.notes.length ? " " + s.burst.notes.join("; ") + "." : ""));
     if (r.leader && r.vsLeader) notes.push("Against " + r.leader + ": " + fmt.signed(r.vsLeader.value) + (BC.has(r.vsLeader.low) ? " (95% interval " + fmt.signed(r.vsLeader.low) + " to " + fmt.signed(r.vsLeader.high) + ")" : "") + ".");
     box.appendChild(el("p", {class: "small muted", text: notes.join(" ")}));
     var set = v.set ? v.set.id : "";
@@ -283,6 +296,22 @@
           el("td", {"data-label": "First load", text: BC.firstLoadText(s.firstLoad)})]);
       });
       kids.push(bTable(["Model · device", "Decode", "Prepare", "Inference", "Post", "p50", "p95", "p99", "Burst p95", {text: "First load", num: false}], srows, "bench-speed"));
+      var bursts = v.rows.filter(function (r) { return r.speed && r.speed.burst; });
+      if (bursts.length) {
+        kids.push(el("h3", {text: "Burst test"}));
+        kids.push(el("p", {class: "muted small", text: "Cameras triggering together, each sending its images a fixed time apart, three bursts per combo on a temporary worker of the serving code. Each request is timed from when it was due (queue wait included); a trigger lasts until its last answer."}));
+        var brows = v.rows.map(function (r) {
+          var b = r.speed && r.speed.burst, f = BC.burstFacts(b);
+          if (!b) return el("tr", {"data-best": String(r.position || 0)}, [lead(r), el("td", {colspan: "8", "data-label": "Burst", text: "not run"})]);
+          if (f.error) return el("tr", {"data-best": String(r.position || 0)}, [lead(r), el("td", {"data-label": "Load", text: f.short}), el("td", {colspan: "7", "data-label": "Burst", text: "not measured: " + f.error})]);
+          return el("tr", {"data-best": String(r.position || 0)}, [lead(r),
+            el("td", {"data-label": "Load", text: f.short}),
+            el("td", {class: "num", "data-label": "p50", text: fmt.ms(b.p50Ms)}), el("td", {class: "num", "data-label": "p95", text: fmt.ms(b.p95Ms)}), el("td", {class: "num", "data-label": "p99", text: fmt.ms(b.p99Ms)}),
+            el("td", {class: "num", "data-label": "Last answer p50", text: fmt.ms(b.lastAnswerP50Ms)}), el("td", {class: "num", "data-label": "Last answer p95", text: fmt.ms(b.lastAnswerP95Ms)}),
+            el("td", {"data-label": "Refused", text: f.refused}), el("td", {class: "num", "data-label": "Most waiting", text: fmt.int(b.maxQueueDepth)})]);
+        });
+        kids.push(bTable(["Model · device", {text: "Load", num: false}, "p50", "p95", "p99", "Last answer p50", "Last answer p95", {text: "Refused", num: false}, "Most waiting"], brows, "bench-burst"));
+      }
       var loaded = v.rows.filter(function (r) { return r.flags && ((r.flags.liveLoad || 0) > 0 || (r.flags.videoDecode || 0) > 1); });
       if (loaded.length) kids.push(el("p", {class: "warn small", text: "Measured while the service answered live requests or the GPU decoded video (" + loaded.map(function (r) { return r.model + " on " + r.device; }).join(", ") + "): live speed under that load is what Blue Iris sees; an idle machine reads faster."}));
     }
@@ -291,7 +320,7 @@
 
   // ---- the whole view ----------------------------------------------------------------------------
   function msgEl() { return $("c-msg"); }
-  function say(text, kind) { var m = msgEl(); m.className = "bn-msg small" + (kind === "error" ? " bn-error" : kind === "ok" ? " notice" : ""); m.textContent = text || ""; }
+  function say(text, kind) { state.loadError = false; var m = msgEl(); m.className = "bn-msg small" + (kind === "error" ? " bn-error" : kind === "ok" ? " notice" : ""); m.textContent = text || ""; }
   function render() {
     var v = state.view; if (!v) return;
     S.setGoal(v.goal);
@@ -332,16 +361,23 @@
     var q = p.toString();
     if (history.replaceState) history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
   }
+  // A failed load: the error, and in place of the skeletons (first load) a line saying so; the
+  // view of an earlier load stays as it was.
+  function failed(text) {
+    say(text + " Reload the page to try again.", "error"); state.loadError = true;
+    if (state.view) return;
+    $("c-headline").textContent = "The comparison did not load.";
+    table.replaceChildren(el("tbody", {}, [el("tr", {}, [el("td", {text: "Nothing to show: " + text})])]));
+  }
   function load() {
-    if (state.loading) state.loading.abort();
-    var ctl = window.AbortController ? new AbortController() : null;
-    state.loading = ctl;
+    var t = loads.begin();
     body.setAttribute("aria-busy", "true");
-    return PB.getJSON(S.withGoal(url()), ctl ? {signal: ctl.signal} : {}).then(function (j) {
-      if (j.aborted) return;
-      state.loading = null; body.removeAttribute("aria-busy");
+    return PB.getJSON(S.withGoal(url()), t.init).then(function (j) {
+      if (!t.wins(j)) return; // a newer load took its place
+      body.removeAttribute("aria-busy");
       if (j._status === 404) { body.hidden = true; empty.hidden = false; return; }
-      if (!j.success) { say((j.message || "The comparison did not load.") + " Reload the page to try again.", "error"); return; }
+      if (!j.success) { failed(j.message || "The comparison did not load."); return; }
+      if (state.loadError) { say(""); state.loadError = false; }
       body.hidden = false; empty.hidden = true;
       state.view = j.compare;
       if (j.compare.set) state.set = j.compare.set.id;

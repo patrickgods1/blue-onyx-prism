@@ -8,7 +8,8 @@
 // timeout, never an interval: the next run is scheduled when the last one has finished, so a slow
 // server never sees two requests of one loop at once. No timer runs while the tab is hidden; the
 // loop runs at once when it becomes visible again; errors back off (period x 2, 4, 8, ... up to
-// `max`); `kick()` asks for a run now (one more right after the current one if it is in flight).
+// `max`); `kick()` asks for a run now (one more right after the current one if it is in flight);
+// `later()` unparks the loop with its next run a period away (no run now).
 // PrismPoll.create({run, period, max, more, env}): `run()` returns a promise (a rejection counts
 // as a failure); `more(value)` false parks the loop until `kick()` (polling only while busy).
 // `env` is for tests: {hidden(), set(fn, ms), clear(id), onVisible(cb)}.
@@ -357,6 +358,8 @@
     return {
       start: function () { parked = false; go(); },
       kick: function () { parked = false; go(); },
+      // Unpark without a run now: the next one after a period (or after the one in flight).
+      later: function () { parked = false; if (!busy) schedule(); },
       stop: function () { stops++; parked = true; clear(); },
       state: function () { return {busy: busy, timer: timer !== null, parked: parked, failures: failures}; }
     };

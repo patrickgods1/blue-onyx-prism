@@ -799,7 +799,11 @@ fn finish(
     resp
 }
 
-pub(super) async fn dispatch(
+/// Count `req` on `handle`, answer it at once when the model cannot take it (compiling, failed,
+/// queue full), else queue it on the worker and wait for the reply: what a detection request
+/// goes through once its body is read. Also the benchmark's burst test's path
+/// ([`crate::benchmark::burst`]), so a burst meets the same queue rules as Blue Iris.
+pub(crate) async fn dispatch(
     handle: &WorkerHandle,
     req: Result<VisionDetectionRequest, String>,
     start: Instant,
@@ -841,7 +845,8 @@ fn answer_without_inference(handle: &WorkerHandle) -> Option<VisionDetectionResp
                 })
             });
             handle.metrics.record_drop(DropReason::Initializing);
-            return Some(VisionDetectionResponse::error(
+            return Some(refused(
+                DropReason::Initializing,
                 crate::worker::initializing_message(name, detail.as_deref()),
             ));
         }
@@ -854,7 +859,7 @@ fn answer_without_inference(handle: &WorkerHandle) -> Option<VisionDetectionResp
             } else {
                 format!("Model '{name}' failed to load: {m}")
             };
-            return Some(VisionDetectionResponse::error(text));
+            return Some(refused(DropReason::Failed, text));
         }
     }
     if handle.is_full() {
@@ -869,9 +874,20 @@ fn answer_without_inference(handle: &WorkerHandle) -> Option<VisionDetectionResp
             );
         }
         handle.metrics.record_drop(DropReason::QueueFull);
-        return Some(VisionDetectionResponse::error("Worker queue is full"));
+        return Some(refused(DropReason::QueueFull, "Worker queue is full"));
     }
     None
+}
+
+/// The error answer of a request refused for `reason`, the reason carried in
+/// [`VisionDetectionResponse::dropped`] (never serialized: Blue Iris gets the same JSON) so
+/// in-process callers (the benchmark's burst test, the verify lane) classify it without reading
+/// the message.
+fn refused(reason: DropReason, msg: impl Into<String>) -> VisionDetectionResponse {
+    VisionDetectionResponse {
+        dropped: Some(reason),
+        ..VisionDetectionResponse::error(msg)
+    }
 }
 
 /// Queue `req` on the worker and wait for its reply (request timeout plus [`RESPONSE_GRACE`]).
@@ -894,11 +910,14 @@ async fn send_to_worker(
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
             handle.metrics.record_drop(DropReason::QueueFull);
-            return VisionDetectionResponse::error("Worker queue is full");
+            return refused(DropReason::QueueFull, "Worker queue is full");
         }
         Err(TrySendError::Disconnected(_)) => {
             handle.metrics.record_drop(DropReason::WorkerGone);
-            return VisionDetectionResponse::error(format!("Model '{name}' worker is not running"));
+            return refused(
+                DropReason::WorkerGone,
+                format!("Model '{name}' worker is not running"),
+            );
         }
     }
 
@@ -907,12 +926,12 @@ async fn send_to_worker(
         Ok(Err(_)) => {
             warn!(model = %name, "worker dropped the request without replying");
             handle.metrics.record_drop(DropReason::WorkerGone);
-            VisionDetectionResponse::error("Worker dropped the request")
+            refused(DropReason::WorkerGone, "Worker dropped the request")
         }
         Err(_) => {
             warn!(model = %name, "timed out waiting for the worker");
             handle.metrics.record_drop(DropReason::Timeout);
-            VisionDetectionResponse::error("Operation timed out")
+            refused(DropReason::Timeout, "Operation timed out")
         }
     }
 }

@@ -267,7 +267,8 @@ impl FrameSteps {
         thin(pts, max)
     }
 
-    /// The trapezoidal area under the full curve (equals [`auc`]).
+    /// The trapezoidal area under the full curve (the tests' check that it equals [`auc`]).
+    #[cfg(test)]
     pub fn trapezoid_auc(&self) -> Option<f64> {
         if self.positives == 0 || self.negatives == 0 {
             return None;

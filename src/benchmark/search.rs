@@ -20,7 +20,7 @@
 
 use super::images::GroundTruth;
 use super::metrics::{
-    Breakpoints, ClassMap, EvalImage, GtBox, PredBox, SWEEP_THRESHOLDS, SweepImage, SweepScope,
+    Breakpoints, ClassMap, EvalImage, PredBox, SWEEP_THRESHOLDS, SweepImage, SweepScope,
     ThresholdPoint, canonical_label,
 };
 use super::report::{BenchmarkResults, ImageInfo, ImageSetInfo, ModelResult};
@@ -316,15 +316,11 @@ impl StoredPreds {
         Ok((Some(Self { version, runs }), warnings))
     }
 
-    /// Compact JSON through a temporary file and a rename.
+    /// Compact JSON through a temporary file of its own and a rename
+    /// ([`super::results_io::write_atomic`]).
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = serde_json::to_string(self)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        super::results_io::write_atomic(path, text.as_bytes())
     }
 
     /// The previous runs of models still in `merged` and not re-run in `new`, plus the runs of
@@ -706,7 +702,7 @@ impl SearchRequest {
             tags: all("tag"),
             classes: all("class"),
             objective: match one("objective") {
-                Some(o) => o.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                Some(o) => Objective::parse_target(o).map_err(|e: String| anyhow::anyhow!(e))?,
                 None => default_objective,
             },
             iou: match one("iou") {
@@ -1382,17 +1378,6 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-/// Ground truth of a stored image (tests and tools).
-pub fn image_gt<'a>(results: &'a BenchmarkResults, set: &str, file: &str) -> Option<&'a [GtBox]> {
-    results
-        .image_set(set)?
-        .images
-        .iter()
-        .find(|i| i.file == file)?
-        .objects
-        .as_deref()
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
 
@@ -1417,6 +1402,7 @@ pub(crate) mod tests {
     }
     use super::*;
     use crate::benchmark::images::SetKind;
+    use crate::benchmark::metrics::GtBox;
 
     fn gt(label: &str, b: [f32; 4], ignore: bool) -> GtBox {
         GtBox {
@@ -1440,6 +1426,8 @@ pub(crate) mod tests {
             group: None,
         };
         let set = |id: &str, gt: GroundTruth, images: Vec<ImageInfo>| ImageSetInfo {
+            snapshot: None,
+            labels_stale: None,
             id: id.into(),
             title: id.into(),
             kind: SetKind::Builtin,

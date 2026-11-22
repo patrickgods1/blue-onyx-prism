@@ -6,7 +6,9 @@
 //!   With too little data ([`MIN_GROUPS`] groups or [`MIN_OBJECTS`] objects of the counted
 //!   classes) there is no cross-validated claim: the figures are the in-sample ones at the pick
 //!   on every frame, flagged [`Assessment::low_confidence`] with the reason (the interval is
-//!   still computed).
+//!   still computed). A fold that had to borrow the pick on every frame ([`Cv::borrowed`]: no
+//!   counted object on its other folds) makes the figures partly in-sample: low confidence too,
+//!   with that note ([`borrowed_note`]).
 //! - **Goal metric**: a threshold objective's value ([`super::pick::value`]) of the reported
 //!   counts; a rank-only goal's AP50 / AP50-95 / frame ROC AUC over every frame (no threshold),
 //!   or the overall grade points (accuracy score from AP50 and the small-object recall at the
@@ -76,8 +78,12 @@ pub struct Assessment {
     pub tallies: Vec<ImageTally>,
     pub groups: Groups,
     pub cv: Cv,
-    /// Why the figures are in-sample (too little data); None = cross-validated.
+    /// Why the figures are in-sample (too little data), or partly in-sample (a fold borrowed
+    /// the pick on every frame, [`Cv::borrowed`]); None = cross-validated.
     pub low_confidence: Option<String>,
+    /// Every image is counted at the pick on every frame (too little data, or one group): no
+    /// fold counts.
+    pub in_sample: bool,
     /// Per image: the grid index its reported counts are at.
     pub image_index: Vec<Option<usize>>,
     /// Per group: its reported counts.
@@ -161,13 +167,17 @@ pub fn assess(input: Input<'_>) -> Assessment {
     let groups = Groups::new(input.groups.iter().map(String::as_str));
     let cv = cross_validate(objective, &tallies, &groups, n);
     let objects: usize = tallies.iter().map(|t| t.objects as usize).sum();
-    let low_confidence = low_confidence(groups.len(), objects);
+    let mut low_confidence = low_confidence(groups.len(), objects);
     let all_index = cv.all.map(|p| p.index);
-    let image_index: Vec<Option<usize>> = if low_confidence.is_some() || !cv.validated() {
+    let in_sample = low_confidence.is_some() || !cv.validated();
+    let image_index: Vec<Option<usize>> = if in_sample {
         vec![all_index; tallies.len()]
     } else {
         cv.image_index.clone()
     };
+    if !in_sample && cv.borrowed > 0 {
+        low_confidence = Some(borrowed_note(cv.borrowed, cv.k));
+    }
     let mut reported = vec![At::default(); groups.len()];
     let mut small = vec![(0usize, 0usize); groups.len()];
     for (i, (img, &grp)) in tallies.iter().zip(&groups.of_image).enumerate() {
@@ -262,6 +272,7 @@ pub fn assess(input: Input<'_>) -> Assessment {
         groups,
         cv,
         low_confidence,
+        in_sample,
         image_index,
         reported,
         pooled,
@@ -275,6 +286,16 @@ pub fn assess(input: Input<'_>) -> Assessment {
         grade,
         objects,
     }
+}
+
+/// Why figures where `borrowed` of `k` folds were counted at the pick on every frame (their
+/// other folds held no counted object to pick on) are low confidence.
+pub fn borrowed_note(borrowed: usize, k: usize) -> String {
+    format!(
+        "low confidence: in {borrowed} of the {k} folds the other folds had no labelled object of \
+         the counted classes to pick a confidence on, so those folds are counted at the pick on \
+         every frame: the figures are partly in-sample."
+    )
 }
 
 /// Why `groups` groups with `objects` objects are too little to cross-validate (None: enough).

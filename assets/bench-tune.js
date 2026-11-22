@@ -20,7 +20,9 @@
   if (!S || !C || !F) return;
   var $ = function (id) { return document.getElementById(id); };
   var params = new URLSearchParams(location.search);
-  var st = {model: params.get("model") || "", device: params.get("device") || "", set: params.get("set") || "", compare: null, tune: null, t: null, useDev: {}, cfg: null, loading: null, strips: null};
+  var st = {model: params.get("model") || "", device: params.get("device") || "", set: params.get("set") || "", compare: null, tune: null, t: null, useDev: {}, cfg: null, strips: null, err: null};
+  // One Compare and one tune request at a time, the latest choice wins (BenchCore.latest).
+  var compareLoads = BC.latest(), tuneLoads = BC.latest();
   var bodyEl = $("tune-body"), emptyEl = $("tune-empty");
   function say(box, text, kind, extra) {
     var p = el("div", {class: kind === "error" ? "bn-error" : "notice"}, [el("span", {text: text})].concat(extra || []));
@@ -62,25 +64,40 @@
     var q = p.toString();
     if (history.replaceState) history.replaceState(null, "", location.pathname + (q ? "?" + q : ""));
   }
+  // The Compare rows of the chosen set (the table and Save all): true once they are in.
   function loadCompare() {
-    return PB.getJSON(api("/v1/benchmark/compare", {set: st.set})).then(function (j) {
+    var t = compareLoads.begin();
+    bodyEl.setAttribute("aria-busy", "true"); // until the set's rows (and its tune view) show
+    return PB.getJSON(api("/v1/benchmark/compare", {set: st.set}), t.init).then(function (j) {
+      if (!t.wins(j)) return false; // a newer choice took its place
+      if (!tuneLoads.busy()) bodyEl.removeAttribute("aria-busy");
       if (j._status === 404) { bodyEl.hidden = true; emptyEl.hidden = false; return false; }
-      if (!j.success) { showError((j.message || "The results did not load.") + " Reload the page to try again."); return false; }
+      if (!j.success) { showError((j.message || "The results did not load.") + " Reload the page to try again.", "compare"); return false; }
+      if (st.err === "compare") showError("");
       st.compare = j.compare;
       if (!st.set && j.compare.set) st.set = j.compare.set.id;
       S.setGoal(j.compare.goal);
       return true;
     });
   }
-  function showError(text) { var e = $("t-error"); e.textContent = text; e.hidden = !text; }
+  // The Compare rows Save all would post: only those of the set the page shows.
+  function tableSet() { return st.compare && st.compare.set ? st.compare.set.id : null; }
+  // `from`: which load failed ("compare" | "tune"), so a later success of the same clears it.
+  function showError(text, from) {
+    var e = $("t-error"); e.textContent = text; e.hidden = !text; st.err = text ? from || "tune" : null;
+    if (!text) return;
+    // Skeletons give way to a line saying nothing loaded (what did load stays).
+    var none = function () { return el("p", {class: "muted small", text: "Not loaded."}); };
+    if (!st.tune) { $("t-chart").replaceChildren(none()); $("t-side").replaceChildren(none()); $("t-examples").replaceChildren(el("h3", {text: "What you would miss and what would alert"}), none()); }
+    if (!st.compare) $("t-all").replaceChildren(el("tbody", {}, [el("tr", {}, [el("td", {text: "Not loaded."})])]));
+  }
   function loadTune() {
-    if (st.loading) st.loading.abort();
-    var ctl = window.AbortController ? new AbortController() : null; st.loading = ctl;
+    var t = tuneLoads.begin();
     bodyEl.setAttribute("aria-busy", "true");
-    return PB.getJSON(api("/v1/benchmark/tune", {model: st.model, device: st.device, set: st.set}), ctl ? {signal: ctl.signal} : {}).then(function (j) {
-      if (j.aborted) return;
-      st.loading = null; bodyEl.removeAttribute("aria-busy");
-      if (!j.success) { showError((j.message || "This combo did not load.") + " Choose another model or device."); return; }
+    return PB.getJSON(api("/v1/benchmark/tune", {model: st.model, device: st.device, set: st.set}), t.init).then(function (j) {
+      if (!t.wins(j)) return; // a newer choice took its place
+      if (!compareLoads.busy()) bodyEl.removeAttribute("aria-busy");
+      if (!j.success) { showError((j.message || "This combo did not load.") + " Choose another model or device.", "tune"); return; }
       showError("");
       st.tune = j.tune; st.model = j.tune.model; st.device = j.tune.device; st.set = j.tune.set;
       resultBox.replaceChildren();
@@ -90,14 +107,19 @@
       remember(); renderSelects(); renderTune(); loadStrips();
     });
   }
-  function start() {
-    loadCompare().then(function (ok) {
+  // The set's rows, then the combo's tune view when the one shown is of another set (or none),
+  // or always with `fresh` (the saved results changed). Whichever call wins does both, so a
+  // refresh that replaces a set change's load still loads that set's tune view.
+  function loadSet(fresh) {
+    return loadCompare().then(function (ok) {
       if (!ok) return;
       if (!st.model) { var r0 = st.compare.rows.filter(function (r) { return r.block === "ok"; })[0] || st.compare.rows[0]; if (r0) { st.model = r0.model; st.device = r0.device; } }
       if (!st.model) { bodyEl.hidden = true; emptyEl.hidden = false; return; }
-      renderAll(); loadTune();
+      renderAll();
+      if (fresh || !st.tune || st.tune.set !== st.set || tuneLoads.busy()) loadTune();
     });
   }
+  function start() { loadSet(false); }
 
   // ---- selects ------------------------------------------------------------------------------------
   function option(v, text, on) { var o = el("option", {value: v, text: text}); o.selected = !!on; return o; }
@@ -117,7 +139,8 @@
   }
   $("t-model").addEventListener("change", function (e) { st.model = e.target.value; st.device = ""; loadTune(); });
   $("t-device").addEventListener("change", function (e) { st.device = e.target.value; loadTune(); });
-  $("t-set").addEventListener("change", function (e) { st.set = e.target.value; loadCompare().then(function (ok) { if (ok) { renderAll(); loadTune(); } }); });
+  // A set change: the tune answer in flight is of the set before (it would pull the page back).
+  $("t-set").addEventListener("change", function (e) { st.set = e.target.value; tuneLoads.stop(); loadSet(false); });
 
   // ---- chart ----------------------------------------------------------------------------------------
   var chartSvg = null;
@@ -200,8 +223,9 @@
     slider.setAttribute("aria-valuetext", fmt.n2(st.t) + (sug && Math.abs(st.t - sug.threshold) < 0.004 ? ", suggested" : ""));
     if (sug) {
       kids.push(el("h3", {text: "Suggested " + fmt.n2(sug.threshold)}));
-      var cv = t.lowConfidence ? "In-sample pick (too little data to cross-validate)." :
-        "Cross-validated over " + fmt.int(t.groups) + (t.set === "cameras" ? " camera days" : " groups") + " (" + t.folds + " folds)" + (sug.metric ? ": " + t.objectiveName + " " + fmt.n2(sug.metric.value) + " " + fmt.ci(sug.metric) + " on frames the pick never saw" : "") + ".";
+      // How it was validated; the server's low-confidence reason (too little data, or a fold that
+      // borrowed the pick on every frame) follows as its own line.
+      var cv = BC.cvText(t);
       var range = BC.rangeText(sug.plateau);
       kids.push(el("p", {class: "small muted", text: cv + " " + (range ? "Equally good: " + range + "." : "No other value scores as well.")}));
     } else kids.push(el("h3", {text: "No suggestion"}));
@@ -403,6 +427,7 @@
   }
   function doSaveAll(useDevices, button) {
     var box = $("t-result"), conf = $("t-all-confirm");
+    if (tableSet() !== st.set) { say(box, "The table of these images is still loading: save once it shows.", "error"); return; }
     var plan = saveAll(useDevices, false);
     var go = function (includeLow) {
       conf.hidden = true;
@@ -431,9 +456,10 @@
   function renderAll() { renderSelects(); renderAllTable(); }
   function refresh() {
     // Saved values changed: the tune view's saved line and the table follow.
-    loadCompare().then(function (ok) { if (ok) renderAllTable(); });
+    loadSet(false);
     PB.getJSON(api("/v1/benchmark/tune", {model: st.model, device: st.device, set: st.set})).then(function (j) {
-      if (j.success && st.tune && j.tune.model === st.tune.model && j.tune.device === st.tune.device) { st.tune = j.tune; drawChart(); setT(st.t, false); renderSave(); }
+      // Only onto the same combo and set, and never over a choice still loading.
+      if (j.success && st.tune && !tuneLoads.busy() && j.tune.model === st.tune.model && j.tune.device === st.tune.device && j.tune.set === st.tune.set) { st.tune = j.tune; drawChart(); setT(st.t, false); renderSave(); }
     });
   }
   if (window.PrismLive) window.PrismLive.onConfig(function (p) {
@@ -447,6 +473,6 @@
     clearTimeout(rt);
     rt = setTimeout(function () { var w = $("t-chart").clientWidth; if (st.tune && Math.abs(w - lastW) > 8) { lastW = w; drawChart(); } }, 150);
   });
-  S.onView(function (why) { if (why === "run" || why === "rescore") { loadCompare().then(function (ok) { if (ok) { renderAll(); loadTune(); } }); } });
+  S.onView(function (why) { if (why === "run" || why === "rescore") loadSet(true); });
   if (!bodyEl.hidden) start();
 })();

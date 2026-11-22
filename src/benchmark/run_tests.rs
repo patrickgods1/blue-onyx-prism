@@ -550,6 +550,30 @@ fn throughput_leaves_out_the_evaluation() {
     }
 }
 
+/// R7: serially (a CPU device) the throughput timer starts after the file read and the set's
+/// transform: a slow disk does not lower req/s (the service gets the bytes with the request).
+#[test]
+fn serial_throughput_leaves_out_the_file_read() {
+    let dir = Dir::new();
+    let sets = sets(&dir.0);
+    let job = job(&dir.0);
+    let pause = Duration::from_millis(60);
+    let rt = runtimes();
+    let mut bench = Bench::new(&sets, 0, 1, PARAMS);
+    bench.read_ahead = ReadAhead::Off;
+    bench.slow_read = Some(pause);
+    let r = bench.run(&rt, &job, &job.device).unwrap();
+    assert!(!r.pipelined);
+    let n = r.per_image.len() as f64;
+    let loop_ms = n / r.throughput_fps * 1e3;
+    let served_ms = r.stages_ms.total.mean * n;
+    let read_ms = pause.as_secs_f64() * 1e3 * n;
+    assert!(
+        loop_ms < served_ms + read_ms / 2.0,
+        "loop {loop_ms:.1} ms, stages {served_ms:.1} ms, reads {read_ms:.0} ms"
+    );
+}
+
 /// With read ahead an iteration lasts at least its frame's decode: the reader's head start
 /// during the untimed evaluation is not counted as free decode time.
 #[test]

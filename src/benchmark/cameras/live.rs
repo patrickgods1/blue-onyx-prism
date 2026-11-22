@@ -145,8 +145,3 @@ fn start(src: Source) {
         tracing::warn!("could not start the walk of {}: {e}", super::TITLE);
     }
 }
-
-/// A background walk is running (tests wait for it).
-pub fn walking() -> bool {
-    WALKING.load(Ordering::Acquire)
-}

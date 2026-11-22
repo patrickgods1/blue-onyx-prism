@@ -617,7 +617,8 @@ impl ModelResult {
         out
     }
 
-    /// Grades of the recommended device.
+    /// Grades of the recommended device (tests).
+    #[cfg(test)]
     pub fn recommended_grades(&self) -> Option<&Grades> {
         let rec = self.recommended.as_deref()?;
         self.devices.iter().find(|d| d.device == rec)?.grades()
@@ -843,11 +844,21 @@ pub struct ImageSetInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scored_labels: Option<Vec<String>>,
     pub images: Vec<ImageInfo>,
+    /// "Your cameras" only: the ground-truth snapshot these results were saved with
+    /// ([`super::cameras::snapshot::SnapshotId`]); `overlay` compares it with the file beside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<super::cameras::snapshot::SnapshotId>,
+    /// Set by a load whose snapshot is not the one recorded in [`Self::snapshot`]: why (the
+    /// page offers a Re-score). Never written.
+    #[serde(skip)]
+    pub labels_stale: Option<String>,
 }
 
 impl ImageSetInfo {
     pub fn of(s: &ImageSet) -> Self {
         Self {
+            snapshot: None,
+            labels_stale: None,
             id: s.id.clone(),
             title: s.title.clone(),
             kind: s.kind,
@@ -1333,17 +1344,13 @@ impl BenchmarkResults {
             .flatten()
     }
 
-    /// Write pretty JSON through a temporary file and a rename (readers never see half a file).
-    /// The labels of "Your cameras" stay out (they are its snapshot's,
-    /// [`super::cameras::snapshot::strip`]).
+    /// Write pretty JSON through a temporary file of its own and a rename (readers never see
+    /// half a file, [`super::results_io::write_atomic`]). The labels of "Your cameras" stay out
+    /// (they are its snapshot's, [`super::cameras::snapshot::strip`]). A load-modify-save holds
+    /// [`super::results_io::lock`].
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = serde_json::to_string_pretty(&*super::cameras::snapshot::strip(self))?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        super::results_io::write_atomic(path, text.as_bytes())
     }
 
     /// Why `self`'s results (an earlier run) are not comparable with `new`'s, or None: the
@@ -1404,7 +1411,9 @@ impl BenchmarkResults {
     /// Fold `new` into the previous results: models in `new` replace their previous entries
     /// (matched by normalized name), other models are kept, unless the hardware or runtime
     /// versions changed ([`Self::incomparable`]; then the previous results are dropped as not
-    /// comparable, see [`Self::merge_warning`]).
+    /// comparable, see [`Self::merge_warning`]). A set of `new` replaces the previous one but
+    /// keeps the previous images the kept models' runs still score ([`upsert_sets`]): a later
+    /// run of fewer frames leaves the earlier runs their frames.
     pub fn merge(previous: Option<Self>, new: Self) -> Self {
         let Some(prev) = previous else { return new };
         if prev.incomparable(&new).is_some() {
@@ -1418,13 +1427,7 @@ impl BenchmarkResults {
                 None => models.push(m),
             }
         }
-        let mut image_sets = prev.image_sets;
-        for s in new.image_sets {
-            match image_sets.iter_mut().find(|p| p.id == s.id) {
-                Some(slot) => *slot = s,
-                None => image_sets.push(s),
-            }
-        }
+        let mut image_sets = upsert_sets(prev.image_sets, new.image_sets, &models);
         // Keep only the sets some model still refers to.
         image_sets.retain(|s| models.iter().any(|m| m.datasets.contains(&s.id)));
         Self {
@@ -1473,6 +1476,40 @@ impl BenchmarkResults {
             .filter_map(|m| m.recommended.as_ref().map(|d| (m.model.clone(), d.clone())))
             .collect()
     }
+}
+
+/// `sets` with each of `new` in the place of the set of the same id (else appended): the new
+/// set, followed by the images of the previous one it does not hold that a run of `models`
+/// still scores (`per_image` of that set; the new set's labels win for the images both hold).
+pub fn upsert_sets(
+    mut sets: Vec<ImageSetInfo>,
+    new: Vec<ImageSetInfo>,
+    models: &[ModelResult],
+) -> Vec<ImageSetInfo> {
+    for s in new {
+        match sets.iter_mut().find(|p| p.id == s.id) {
+            Some(slot) => {
+                let old = std::mem::replace(slot, s);
+                let scored: std::collections::HashSet<&str> = models
+                    .iter()
+                    .flat_map(|m| m.devices.iter())
+                    .filter_map(|d| d.run.as_ref())
+                    .flat_map(|r| r.per_image.iter())
+                    .filter(|i| i.set == old.id)
+                    .map(|i| i.file.as_str())
+                    .collect();
+                let have: std::collections::HashSet<String> =
+                    slot.images.iter().map(|i| i.file.clone()).collect();
+                slot.images.extend(
+                    old.images
+                        .into_iter()
+                        .filter(|i| scored.contains(i.file.as_str()) && !have.contains(&i.file)),
+                );
+            }
+            None => sets.push(s),
+        }
+    }
+    sets
 }
 
 #[cfg(test)]
@@ -1549,6 +1586,58 @@ mod tests {
         assert_eq!(agreement(&off, &r, "x").verdict, Verdict::Disagrees);
         // Both empty: agrees.
         assert_eq!(agreement(&[], &[], "x").verdict, Verdict::Agrees);
+    }
+
+    /// D2: concurrent saves of the results, the snapshot and the stored predictions to one path
+    /// each use their own temporary file: every save succeeds and the file is always whole.
+    #[test]
+    fn concurrent_saves_use_their_own_temporary_files() {
+        let dir = std::env::temp_dir().join(format!("bop-bench-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESULTS_FILE);
+        let gt = super::super::cameras::snapshot::path_beside(&path);
+        let preds = dir.join(super::super::search::PREDS_FILE);
+        let mut a = model(vec![dev("openvino:cpu", 37.0, scene())], None);
+        a.model = "IPcam-general".into();
+        let r = BenchmarkResults::new(Default::default(), Default::default(), vec![a.clone()]);
+        let snap: super::super::cameras::snapshot::GtSnapshot = serde_json::from_str(
+            r#"{"version":1,"set":"cameras","dir":"/x","created":"t","frames":[]}"#,
+        )
+        .unwrap();
+        let stored = super::super::search::StoredPreds::merge(None, &r, &[a]);
+        let errors = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    for _ in 0..25 {
+                        for e in [
+                            r.save(&path).err(),
+                            snap.save(&gt).err(),
+                            stored.save(&preds).err(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            errors.lock().unwrap().push(format!("{e:#}"));
+                        }
+                    }
+                });
+            }
+        });
+        let errors = errors.into_inner().unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            BenchmarkResults::load(&path).unwrap().unwrap().models.len(),
+            1
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2213,6 +2302,8 @@ mod tests {
     #[test]
     fn image_paths_are_restricted_to_the_set() {
         let info = ImageSetInfo {
+            snapshot: None,
+            labels_stale: None,
             id: "s".into(),
             title: "s".into(),
             kind: SetKind::Dir,

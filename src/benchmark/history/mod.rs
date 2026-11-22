@@ -181,6 +181,13 @@ pub struct DeviceSnap {
     /// entries of older versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_requests_per_min: Option<f64>,
+    /// The burst test's request p95 (ms; [`crate::benchmark::burst`]) and its load
+    /// ("8 x 4 x 500 ms"); None when no burst ran (or it measured nothing) and in entries of
+    /// older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_load: Option<String>,
 }
 
 /// One class of a [`DeviceSnap`]'s AP average.
@@ -311,6 +318,14 @@ fn device_snap(m: &ModelResult, d: &DeviceResult) -> DeviceSnap {
         ));
     }
     s.live_requests_per_min = run.live_requests_per_min;
+    if let Some(b) = run
+        .burst
+        .as_ref()
+        .filter(|b| b.error.is_none() && b.answered > 0)
+    {
+        s.burst_p95_ms = Some(b.latency_ms.p95);
+        s.burst_load = Some(b.load_text());
+    }
     s.total_p50_ms = Some(run.stages_ms.total.p50);
     s.total_p95_ms = Some(run.stages_ms.total.p95);
     s.infer_p50_ms = Some(run.stages_ms.infer.p50);
@@ -685,12 +700,7 @@ impl History {
         let mut out = self.clone();
         out.version = FORMAT_VERSION;
         let text = serde_json::to_string_pretty(&out)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        super::results_io::write_atomic(path, text.as_bytes())
     }
 
     /// Load the file at `path` (a file that does not load is moved aside with a warning;
@@ -731,6 +741,15 @@ pub fn add_goal(
     goal: &crate::benchmark::eval::Goal,
     weights: crate::benchmark::grade::Weights,
 ) {
+    let groups: std::collections::HashMap<(&str, &str), &Option<String>> = results
+        .image_sets
+        .iter()
+        .flat_map(|s| {
+            s.images
+                .iter()
+                .map(move |i| ((s.id.as_str(), i.file.as_str()), &i.group))
+        })
+        .collect();
     for snap in &mut e.devices {
         let Some(d) = m.devices.iter().find(|d| d.device == snap.device && d.ok()) else {
             continue;
@@ -740,15 +759,14 @@ pub fn add_goal(
             continue;
         };
         for img in &mut stored.images {
-            img.group = results
-                .image_set(&img.set)
-                .and_then(|s| s.images.iter().find(|i| i.file == img.file))
-                .and_then(|i| i.group.clone());
+            img.group = groups
+                .get(&(img.set.as_str(), img.file.as_str()))
+                .and_then(|g| (*g).clone());
         }
         snap.goal = crate::benchmark::eval::tune::run_snapshot(
             &results.image_sets,
             &stored,
-            Some(run.stages_ms.total.p50),
+            &run.per_image,
             goal,
             weights,
         );

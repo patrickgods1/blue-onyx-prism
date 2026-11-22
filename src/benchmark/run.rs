@@ -19,11 +19,12 @@
 //! - Decode: the service's decode stage, the frame's statistics and its [`Scene`] included
 //!   (`prep.rs`); the set's transform (a NIR proxy's grayscale) is applied between them, untimed,
 //!   so the scene is the one of the frame the set sends.
-//! - Throughput ([`RunResult::throughput_fps`]): the loop timer covers the wait for the frame and
-//!   the served stages only; the evaluation post-process and the verifier's copy of the frame,
-//!   which the service never does per request, are outside it (B6). With read ahead an
-//!   iteration lasts at least its frame's decode ([`iteration_time`]), so the time taken out
-//!   does not hand the reader free decode time.
+//! - Throughput ([`RunResult::throughput_fps`]): the loop timer covers the frame's decode (the
+//!   wait for it with read ahead) and the served stages only; the evaluation post-process and
+//!   the verifier's copy of the frame, which the service never does per request, are outside it
+//!   (B6), and so are the file read and the set's transform of the serial loop (the service gets
+//!   the bytes with the request). With read ahead an iteration lasts at least its frame's decode
+//!   ([`iteration_time`]), so the time taken out does not hand the reader free decode time.
 //! - Warm-up: [`WarmupRule`] (several images, a minimum time), recorded as
 //!   [`RunResult::warmup_runs`] / [`RunResult::warmup_ms`].
 //! - What else ran: the live detection requests the service answered during the timed phase
@@ -65,6 +66,9 @@ pub enum Phase {
     Warmup,
     /// Timed iterations over the images.
     Timing,
+    /// The burst test after the timed runs ([`super::burst`]; done / total = requests answered
+    /// of those it sends).
+    Burst,
 }
 
 /// Progress of one device run, reported through [`Bench::progress`].
@@ -137,9 +141,14 @@ pub struct Bench<'a> {
     /// ([`RunResult::video_decode_pct`]; Windows only, a no-op elsewhere). Off for detections
     /// over frames.
     pub video_decode: bool,
+    /// The burst test after each device's timed run ([`super::burst`]); None = off.
+    pub burst: Option<&'a super::burst::Burst<'a>>,
     /// Test only: a pause in every evaluation post-process (the untimed work of B6).
     #[cfg(test)]
     pub(super) slow_eval: Option<Duration>,
+    /// Test only: a pause in every file read of the serial frame source (a slow disk).
+    #[cfg(test)]
+    pub(super) slow_read: Option<Duration>,
 }
 
 /// Warm-up images: the first this many of the run, in turn (frames of several sizes and formats
@@ -241,6 +250,7 @@ impl std::fmt::Debug for Bench<'_> {
             .field("warmup_rule", &self.warmup_rule)
             .field("live_requests", &self.live_requests.is_some())
             .field("video_decode", &self.video_decode)
+            .field("burst", &self.burst)
             .finish()
     }
 }
@@ -412,8 +422,11 @@ impl<'a> Bench<'a> {
             warmup_rule: WarmupRule::DEFAULT,
             live_requests: None,
             video_decode: false,
+            burst: None,
             #[cfg(test)]
             slow_eval: None,
+            #[cfg(test)]
+            slow_read: None,
         }
     }
 
@@ -430,14 +443,26 @@ impl<'a> Bench<'a> {
             .join(", ")
     }
 
-    fn check_cancel(&self) -> Result<()> {
+    pub(super) fn check_cancel(&self) -> Result<()> {
         if self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return Err(Cancelled.into());
         }
         Ok(())
     }
 
-    fn report(
+    /// The test pause of the serial frame source's file reads (none outside tests).
+    fn read_pause(&self) -> Duration {
+        #[cfg(test)]
+        {
+            self.slow_read.unwrap_or_default()
+        }
+        #[cfg(not(test))]
+        {
+            Duration::ZERO
+        }
+    }
+
+    pub(super) fn report(
         &self,
         job: &Job,
         device: &str,
@@ -582,9 +607,16 @@ impl<'a> Bench<'a> {
             night,
             record,
         };
-        self.time(
+        // `time` owns the backend and its companions and drops them before it returns: the
+        // burst's worker never loads beside the benchmark's own copy.
+        let mut result = self.time(
             job, requested, backend, companions, compile_ms, cache, tuning,
-        )
+        )?;
+        if let Some(burst) = self.burst {
+            self.check_cancel()?;
+            result.burst = Some(burst.run(self, job, &result)?);
+        }
+        Ok(result)
     }
 
     /// As served: compile the night model (and its verifier) on `device`, the spec the model
@@ -775,7 +807,8 @@ impl<'a> Bench<'a> {
                 &all,
                 &mut pipe,
                 repeat,
-                &mut serial_frames(&all),
+                Source::Serial,
+                &mut serial_frames(&all, self.read_pause()),
             )
         };
         let timed_wall = timed_from.elapsed();
@@ -872,6 +905,7 @@ impl<'a> Bench<'a> {
             grades: Some(grades),
             agreement: None,
             served: record,
+            burst: None,
             eval_preds,
             per_image: timed.per_image,
         })
@@ -1030,7 +1064,8 @@ impl<'a> Bench<'a> {
                         all,
                         pipe,
                         repeat,
-                        &mut serial_frames(all),
+                        Source::Serial,
+                        &mut serial_frames(all, self.read_pause()),
                     );
                 }
             };
@@ -1046,7 +1081,15 @@ impl<'a> Bench<'a> {
                     }
                 }
             };
-            let timed = self.timed_runs(job, requested, all, pipe, repeat, &mut source);
+            let timed = self.timed_runs(
+                job,
+                requested,
+                all,
+                pipe,
+                repeat,
+                Source::Ahead,
+                &mut source,
+            );
             drop(source);
             let joined = reader.join();
             match (timed, joined) {
@@ -1062,7 +1105,12 @@ impl<'a> Bench<'a> {
 
     /// `repeat` timed runs of every image; the last run of each image keeps its predictions
     /// (production and evaluation threshold). `frames` gives each run's decoded frame, in
-    /// order (image by image, `repeat` per image; its argument is the image's index in `all`).
+    /// order (image by image, `repeat` per image; its argument is the image's index in `all`);
+    /// `source` says where it reads them (what of its wait the throughput counts).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the timed loop's pieces, passed from its two callers"
+    )]
     fn timed_runs(
         &self,
         job: &Job,
@@ -1070,6 +1118,7 @@ impl<'a> Bench<'a> {
         all: &[(&ImageSet, &images::SetImage)],
         pipe: &mut Pipeline,
         repeat: usize,
+        source: Source,
         frames: &mut dyn FnMut(usize) -> Result<Frame>,
     ) -> Result<Timings> {
         let total_iters = all.len().saturating_mul(repeat);
@@ -1100,6 +1149,12 @@ impl<'a> Bench<'a> {
                 let waited = t.elapsed();
                 let decoded = frame.with_context(|| format!("image {}", img.file))?;
                 let decode_ms = decoded.decode_ms;
+                // Serially the wait also holds the file read and the set's transform, which the
+                // service never does (the bytes come with the request): only the decode counts.
+                let waited = match source {
+                    Source::Ahead => waited,
+                    Source::Serial => ms_duration(decode_ms),
+                };
                 // Not timed: the service keeps its decoded frame for the verifier without a
                 // copy (B6).
                 let original = pipe
@@ -1133,6 +1188,20 @@ impl<'a> Bench<'a> {
         }
         Ok(timed)
     }
+}
+
+/// Where the timed loop's frames come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Read and decoded on this thread: the throughput counts the decode, not the wait.
+    Serial,
+    /// Read and decoded ahead on the reader thread: the throughput counts the wait for it.
+    Ahead,
+}
+
+/// `ms` milliseconds (0 for a negative or not finite value).
+fn ms_duration(ms: f64) -> Duration {
+    Duration::try_from_secs_f64(ms.max(0.0) / 1e3).unwrap_or(Duration::ZERO)
 }
 
 /// One timed run's decoded frame, or why it did not decode (a frame source's `Err` = the image
@@ -1181,11 +1250,10 @@ pub(super) fn decode_scene(bytes: &[u8], transform: Option<images::ImageTransfor
 /// served stages (B6: nothing the service does not do per request), and at least the frame's
 /// decode. With read ahead the reader decodes the next frame during the untimed evaluation
 /// too; without the floor a decode-bound run would look faster than the 1-frame pipeline is
-/// (the service's steady state is max(decode, serve) per frame). Serially the wait holds the
-/// decode, so the floor never applies.
+/// (the service's steady state is max(decode, serve) per frame). Serially the loop passes the
+/// decode as the wait ([`Source::Serial`]), so the floor never applies.
 pub(super) fn iteration_time(waited: Duration, served: Duration, decode_ms: f64) -> Duration {
-    let decode = Duration::try_from_secs_f64(decode_ms.max(0.0) / 1e3).unwrap_or(Duration::ZERO);
-    (waited + served).max(decode)
+    (waited + served).max(ms_duration(decode_ms))
 }
 
 /// `n` events over `over` as a rate per minute (0 over no time).
@@ -1209,13 +1277,19 @@ fn run_tuning(backend: &Backend, tuning: &crate::profile::DeviceTuning) -> RunTu
 /// on the calling thread.
 fn serial_frames<'s>(
     all: &'s [(&ImageSet, &images::SetImage)],
+    read_pause: Duration,
 ) -> impl FnMut(usize) -> Result<Frame> + 's {
     let mut cached: Option<(usize, std::borrow::Cow<'static, [u8]>)> = None;
     move |i| {
         let (set, img) = all.get(i).context("frame index out of range")?;
         let bytes = match cached.take() {
             Some((at, b)) if at == i => b,
-            _ => img.bytes()?,
+            _ => {
+                if !read_pause.is_zero() {
+                    std::thread::sleep(read_pause);
+                }
+                img.bytes()?
+            }
         };
         let frame = decode(&bytes, set.transform);
         cached = Some((i, bytes));

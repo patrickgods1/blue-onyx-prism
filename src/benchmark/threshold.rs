@@ -52,7 +52,7 @@
 //! `min_confidence` per request (it then replaces the server threshold for that request) and
 //! filters the returned objects again with each camera's minimum confidence.
 
-use super::metrics::{Breakpoints, SWEEP_THRESHOLDS, ThresholdPoint};
+use super::metrics::{Breakpoints, ThresholdPoint};
 use super::report::DeviceResult;
 use super::roc::{FrameRates, FrameRoc};
 use serde::{Deserialize, Serialize};
@@ -286,6 +286,45 @@ impl FromStr for Objective {
     }
 }
 
+impl Objective {
+    /// Why a target no finite set can show is refused where a user sets one (a goal, a flag, a
+    /// form): precision or recall 1, or a false positive rate of 0, is met only when the 95%
+    /// Wilson bound reaches it, which it never does on a finite count. Stored objectives (older
+    /// results, older configs) still parse ([`FromStr`] accepts them).
+    pub fn reachable(&self) -> Result<(), String> {
+        let unreachable = match *self {
+            Objective::Precision(v) | Objective::Recall(v) => v >= 1.0,
+            Objective::Fpr(v) => v <= 0.0,
+            _ => false,
+        };
+        if unreachable {
+            return Err(format!(
+                "threshold objective '{self}': a 100% target can never be shown on a finite set \
+                 (its 95% bound never reaches it); use 0.99 or lower (for fpr, 0.01 or higher)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The nearest objective release 0.2.0 parses (it knows `f1`, `f2`, `precision:<p>`,
+    /// `recall:<r>`, `youden` and `fpr:<x>`): `f05` and `recall_at_fa:<N>` become `f1`. What the
+    /// config's legacy `threshold_objective` is written as, so an older binary still loads the
+    /// file (the goal, which it ignores, stays authoritative for this one).
+    pub fn for_previous_release(self) -> Self {
+        match self {
+            Objective::F05 | Objective::RecallAtFa(_) => Objective::F1,
+            o => o,
+        }
+    }
+
+    /// `s` parsed and [`Self::reachable`]: an objective a user sets.
+    pub fn parse_target(s: &str) -> Result<Self, String> {
+        let o: Self = s.parse()?;
+        o.reachable()?;
+        Ok(o)
+    }
+}
+
 impl TryFrom<String> for Objective {
     type Error = String;
     fn try_from(s: String) -> Result<Self, String> {
@@ -328,7 +367,9 @@ pub struct Pick {
     pub relative: bool,
 }
 
-/// Round down to a multiple of 0.01 (a hair of tolerance so 0.35 stays 0.35 in f32).
+/// Round down to a multiple of 0.01 (a hair of tolerance so 0.35 stays 0.35 in f32): the tests'
+/// check that every grid value is a whole cent.
+#[cfg(test)]
 #[allow(
     clippy::cast_possible_truncation,
     reason = "a threshold in 0..=1: the f64 -> f32 narrowing only drops precision"
@@ -905,16 +946,6 @@ impl ThresholdAdvice {
             })?;
         applicable(pick.best.as_ref())
     }
-
-    /// `(device, threshold)` for every device row whose pick applies
-    /// ([`ThresholdAdvice::apply_value_on`]), in [`ThresholdAdvice::by_device`] order: the
-    /// profiles an "apply all" writes.
-    pub fn device_apply_values(&self) -> Vec<(String, f32)> {
-        self.by_device
-            .iter()
-            .filter_map(|p| Some((p.device.clone(), applicable(p.best.as_ref())?)))
-            .collect()
-    }
 }
 
 /// A pick's threshold when it may be written into the config: the objective was met, the
@@ -1006,11 +1037,6 @@ pub fn table_points(curve: &[ThresholdPoint], extra: &[ThresholdPoint]) -> Vec<T
     v
 }
 
-/// Whether `t` is one of [`SWEEP_THRESHOLDS`].
-pub fn on_grid(t: f32) -> bool {
-    SWEEP_THRESHOLDS.iter().any(|g| (g - t).abs() < 1e-6)
-}
-
 /// Advice whose best threshold is `t` (tests of the apply paths).
 #[cfg(test)]
 pub(crate) fn test_advice(t: f32) -> ThresholdAdvice {
@@ -1043,7 +1069,10 @@ pub(crate) fn test_advice(t: f32) -> ThresholdAdvice {
             relative: false,
         }),
         alternatives: vec![],
-        curve: SWEEP_THRESHOLDS.iter().map(|&t| p(t)).collect(),
+        curve: super::metrics::SWEEP_THRESHOLDS
+            .iter()
+            .map(|&t| p(t))
+            .collect(),
         exact: vec![],
         by_dataset: vec![],
         by_tag: vec![],
@@ -1058,6 +1087,7 @@ pub(crate) fn test_advice(t: f32) -> ThresholdAdvice {
 mod tests {
     use super::super::metrics::Counts;
     use super::*;
+    use crate::benchmark::metrics::SWEEP_THRESHOLDS;
 
     fn pt(t: f32, tp: usize, fp: usize, fn_: usize) -> ThresholdPoint {
         ThresholdPoint::new(t, Counts { tp, fp, fn_ }, 10)
@@ -1390,7 +1420,6 @@ mod tests {
         assert_eq!(rows.len(), 15);
         assert_eq!(rows[0].threshold, 0.1);
         assert!(rows.iter().any(|p| p.threshold == 0.42));
-        assert!(on_grid(0.35) && !on_grid(0.42));
     }
 
     /// NMS families post-processed at 0.05 and filtered at `t` give exactly the detections of
@@ -1700,13 +1729,6 @@ mod tests {
         assert_eq!(a.apply_value_on("ort:cuda"), None);
         assert_eq!(a.apply_value_on("ort:cpu"), None);
         assert_eq!(a.apply_value_on("ort:directml"), None, "did not run");
-        assert_eq!(
-            a.device_apply_values(),
-            [
-                ("ort:coreml".to_string(), 0.3),
-                ("openvino:cpu".to_string(), 0.34)
-            ]
-        );
         // The overall pick is independent of the device rows.
         assert_eq!(a.apply_value(), Some(0.3));
         a.by_device[1].best = pick(0.34, true, 3);
@@ -1715,7 +1737,6 @@ mod tests {
             best: pick(0.41, true, 2),
         });
         assert_eq!(a.apply_value_on("openvino:gpu.1"), Some(0.41));
-        assert_eq!(a.device_apply_values().len(), 3);
     }
 
     /// One detection of the sweep tests.
@@ -1984,7 +2005,6 @@ mod tests {
         ];
         assert_eq!(b.apply_value_on("openvino:cpu"), Some(0.3));
         assert_eq!(b.apply_value_on("ort:coreml"), None);
-        assert_eq!(b.device_apply_values(), [("openvino:cpu".to_string(), 0.3)]);
         b.best = Some(pseudo);
         assert_eq!(b.apply_value(), None);
         assert_eq!(b.not_on_labels(), Some(NOT_ON_LABELS));

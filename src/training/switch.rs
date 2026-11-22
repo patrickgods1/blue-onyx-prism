@@ -693,18 +693,32 @@ pub struct Suggestion {
     pub words: String,
     /// What to keep in mind (other sets mixed in, its own training frames, another device).
     pub notes: Vec<String>,
+    /// Too little data to cross-validate the pick (the Tune view's low-confidence reason): it
+    /// is saved only when the owner confirms (`confirm=1`), as on the Tune step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_confidence: Option<String>,
+    /// Saving it needs the confirmation (`low_confidence` is set).
+    pub confirm: bool,
 }
 
 fn pct(v: f64) -> String {
     format!("{:.0}%", v * 100.0)
 }
 
-/// The threshold [`ModelResult::threshold`] suggests for `model` running on `device`. The result
-/// must cover the model's held-out frames. Err says why there is none.
+/// The threshold to save for `model` running on `device`, from `picks`: the Tune view's
+/// cross-validated suggestions of that model on each device it ran on
+/// ([`crate::benchmark::eval::tune::suggestions`], the one rule every save of a suggested
+/// confidence follows). The device's own suggestion becomes its confidence profile; without one
+/// (the benchmark did not run there) the recommended device's (else the first) becomes the
+/// model's own threshold, and a note says so. `r` (the model's saved result) must cover its
+/// held-out frames. Err says why there is none: no held-out frames, no pick, or a pick that must
+/// not be saved (pseudo labels, a target not met on its 95% bound, a flat curve). A
+/// low-confidence pick is returned with [`Suggestion::confirm`].
 pub fn suggest(
     r: &ModelResult,
     model: &str,
     device: Option<&str>,
+    picks: &[crate::benchmark::eval::tune::Suggested],
 ) -> std::result::Result<Suggestion, String> {
     let held = format!("heldout-{model}");
     if !r.datasets.iter().any(|d| d == &held) {
@@ -714,50 +728,51 @@ pub fn suggest(
             r.datasets.join(", ")
         ));
     }
-    let advice = r
-        .threshold
-        .as_ref()
-        .ok_or_else(|| format!("the benchmark of {model} has no threshold result"))?;
-    if advice.relative {
+    let on_device = device.and_then(|d| {
+        let p = picks.iter().find(|p| p.device == d).or_else(|| {
+            picks
+                .iter()
+                .find(|p| crate::config::same_device(&p.device, d))
+        })?;
+        Some((p, crate::config::device_threshold_key(d).ok()?))
+    });
+    let (pick, profile) = match on_device {
+        Some((p, key)) => (p, Some(key)),
+        None => (
+            picks
+                .iter()
+                .find(|p| p.recommended)
+                .or_else(|| picks.first())
+                .ok_or_else(|| {
+                    format!(
+                        "the benchmark of {model} has no stored predictions to pick a threshold \
+                         from; run it again"
+                    )
+                })?,
+            None,
+        ),
+    };
+    if let Some(why) = &pick.refusal {
         return Err(format!(
-            "the benchmark of {model} had no human labels to measure a threshold against"
+            "the benchmark of {model} on {} has no threshold to save for the goal: {why}; \
+             change the goal on the Benchmark page, or keep the threshold",
+            pick.device
         ));
     }
-    let on_device = device.and_then(|d| {
-        let t = advice.apply_value_on(d)?;
-        let key = crate::config::device_threshold_key(d).ok()?;
-        let row = advice
-            .by_device
-            .iter()
-            .find(|p| p.device == d)
-            .or_else(|| {
-                advice
-                    .by_device
-                    .iter()
-                    .find(|p| crate::config::same_device(&p.device, d))
-            })?;
-        Some((t, Some(key), row.best.as_ref()?.point))
-    });
-    let (threshold, profile, point) = match on_device {
-        Some(x) => x,
-        None => {
-            let t = advice.apply_value().ok_or_else(|| {
-                format!(
-                    "the benchmark of {model} found no threshold that meets the goal \
-                     ({}); change the goal on the Benchmark page, or keep the threshold",
-                    r.threshold_objective.describe()
-                )
-            })?;
-            let best = advice
-                .best
-                .as_ref()
-                .ok_or_else(|| format!("the benchmark of {model} has no best threshold"))?;
-            (t, None, best.point)
-        }
-    };
-    let (Some(recall), Some(precision)) = (point.recall, point.precision) else {
+    let threshold = pick.threshold.ok_or_else(|| {
+        format!(
+            "the benchmark of {model} on {} found no threshold for the goal; change the goal on \
+             the Benchmark page, or keep the threshold",
+            pick.device
+        )
+    })?;
+    let figures = pick.figures.as_ref();
+    let (Some(recall), Some(precision)) = (
+        figures.and_then(|f| f.recall),
+        figures.and_then(|f| f.precision),
+    ) else {
         return Err(format!(
-            "the benchmark of {model} has no finds or correct figures at its best threshold"
+            "the benchmark of {model} has no finds or correct figures at its suggested threshold"
         ));
     };
     let mut notes = Vec::new();
@@ -765,15 +780,16 @@ pub fn suggest(
         notes.push(format!(
             "Measured on {}, not on {d}, where this model will run: saved as the model's own \
              threshold.",
-            advice.device
+            pick.device
         ));
     }
+    let set = figures.map(|f| f.set.as_str()).unwrap_or_default();
     if r.datasets.len() > 1 {
         notes.push(format!(
-            "The figures also cover {}.",
+            "Picked on {set}; the benchmark also covered {}.",
             r.datasets
                 .iter()
-                .filter(|d| *d != &held)
+                .filter(|d| *d != set)
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -785,7 +801,10 @@ pub fn suggest(
     {
         notes.push(format!("{chip}: the real result will be lower."));
     }
-    let frames = r.images;
+    if let Some(l) = &pick.low_confidence {
+        notes.push(format!("{l} Saving it asks for a confirmation."));
+    }
+    let frames = figures.map_or(0, |f| f.frames);
     Ok(Suggestion {
         threshold,
         device: profile,
@@ -797,6 +816,8 @@ pub fn suggest(
             pct(precision),
         ),
         notes,
+        low_confidence: pick.low_confidence.clone(),
+        confirm: pick.low_confidence.is_some(),
     })
 }
 

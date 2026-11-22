@@ -33,7 +33,10 @@ fn device_of(state: &AppState, cfg: &Config, m: &ModelConfig) -> String {
         .unwrap_or_else(|| cfg.device_for(m))
 }
 
-/// What the page's threshold line shows.
+/// What the page's threshold line shows, and what "Use as" with `use_threshold` saves: the
+/// Tune view's cross-validated suggestion of the model on the device it runs on, for the saved
+/// goal ([`crate::benchmark::eval::tune::suggestions`], the rule of every other save; see
+/// [`switch::suggest`]).
 pub(super) fn suggestion_for(
     state: &AppState,
     cfg: &Config,
@@ -49,7 +52,19 @@ pub(super) fn suggestion_for(
         .iter()
         .find(|r| key(&r.model) == key(&name))
         .ok_or_else(|| format!("{name} has no benchmark yet"))?;
-    switch::suggest(r, &name, Some(&device))
+    let preds = crate::benchmark::search::StoredPreds::load_cached(
+        &crate::benchmark::search::preds_path(&state.config_path),
+    )
+    .map_err(|e| format!("the stored benchmark predictions do not read: {e:#}"))?
+    .ok_or_else(|| format!("{name} has no stored benchmark predictions; benchmark it again"))?;
+    let picks = crate::benchmark::eval::tune::suggestions(
+        &results,
+        &preds,
+        &cfg.benchmark.goal,
+        cfg.benchmark.weights,
+        Some(std::slice::from_ref(&name)),
+    );
+    switch::suggest(r, &name, Some(&device), &picks)
 }
 
 /// `GET /v1/training/switch-preview` answer.
@@ -204,4 +219,47 @@ pub(super) async fn revert(
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::test_util::test_state_with;
+
+    /// S1: the threshold "Use as" saves is the Tune view's suggestion for the device the model
+    /// runs on, for the saved goal (as every other save of a suggestion), and a low-confidence
+    /// one asks for the confirmation.
+    #[test]
+    fn use_as_takes_the_tune_views_suggestion() {
+        let state = test_state_with(|c| c.models[0].device = Some("openvino:cpu".into()));
+        let (mut results, preds) = crate::benchmark::eval::tests::fixture(10, 10);
+        results.models[0].datasets = vec!["heldout-ipcam-general".into(), "own".into()];
+        results.save(&results_path(&state.config_path)).unwrap();
+        preds
+            .save(&crate::benchmark::search::preds_path(&state.config_path))
+            .unwrap();
+        let cfg = state.config_read().clone();
+        let m = find_model(&cfg, "ipcam-general").unwrap().clone();
+        let s = suggestion_for(&state, &cfg, &m).unwrap();
+        let want = crate::benchmark::eval::tune::suggestions(
+            &results,
+            &preds,
+            &cfg.benchmark.goal,
+            cfg.benchmark.weights,
+            Some(&["ipcam-general".to_string()]),
+        );
+        let on_cpu = want.iter().find(|p| p.device == "openvino:cpu").unwrap();
+        assert_eq!(Some(s.threshold), on_cpu.threshold);
+        assert_eq!(s.device.as_deref(), Some("openvino:cpu"));
+        assert!(!s.confirm);
+        // Too little data: the same pick, with the confirmation.
+        let (mut small, preds) = crate::benchmark::eval::tests::fixture(3, 10);
+        small.models[0].datasets = vec!["heldout-ipcam-general".into()];
+        small.save(&results_path(&state.config_path)).unwrap();
+        preds
+            .save(&crate::benchmark::search::preds_path(&state.config_path))
+            .unwrap();
+        let s = suggestion_for(&state, &cfg, &m).unwrap();
+        assert!(s.confirm && s.low_confidence.is_some(), "{s:?}");
+    }
 }

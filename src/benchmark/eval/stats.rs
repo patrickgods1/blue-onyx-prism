@@ -175,11 +175,6 @@ impl Difference {
         }
     }
 
-    /// `a` is clearly above `b`: the interval lies above 0.
-    pub fn clearly_above(&self) -> bool {
-        self.low.is_some_and(|l| l > 0.0)
-    }
-
     /// `a` is clearly below `b`.
     pub fn clearly_below(&self) -> bool {
         self.high.is_some_and(|h| h < 0.0)
@@ -248,7 +243,7 @@ mod tests {
         assert_eq!(ab.value, -ba.value);
         assert_eq!(ab.low.map(|x| -x), ba.high);
         assert_eq!(ab.high.map(|x| -x), ba.low);
-        assert_eq!(ab.clearly_above(), ba.clearly_below());
+        assert_eq!(ab.low.is_some_and(|l| l > 0.0), ba.clearly_below());
     }
 
     #[test]

@@ -10,8 +10,9 @@
 //!   on every Compare set), limited to the goal's classes when it names some (`ignoredClasses`: named
 //!   but not scored here).
 //! - **Speed**: one-at-a-time p50 / p95 / p99 of the whole request on these frames (each frame's
-//!   p50 over its timed runs); the budget applies to the p95 (a burst p95 once a burst test ran;
-//!   none yet). Stage split and first load (compile, warm-up, cache) are the run's.
+//!   p50 over its timed runs); the budget applies to the p95, the burst test's request p95 once
+//!   one ran on the combo ([`crate::benchmark::burst`]: latency under load, queue wait included).
+//!   Stage split, first load (compile, warm-up, cache) and the burst's figures are the run's.
 //! - **Rank**: [`super::rank`]; a row over the budget is "too slow", a target not met on its
 //!   bound is "unmet", a model that trained on these frames (or whose training lists do not
 //!   read) is shown, never ranked among the fair rows.
@@ -160,9 +161,86 @@ pub struct Speed {
     pub preprocess_ms: f64,
     pub infer_ms: f64,
     pub postprocess_ms: f64,
-    /// A burst test's p95 (none ran yet: phase 6).
+    /// The burst test's request p95 (None: no burst ran on this combo, or it measured nothing).
     pub burst_p95_ms: Option<f64>,
+    /// The burst test's figures (None: none ran).
+    pub burst: Option<BurstSpeed>,
     pub first_load: FirstLoad,
+}
+
+/// What a combo's burst test measured ([`crate::benchmark::burst::BurstResult`]), for the page.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BurstSpeed {
+    /// "8 x 4 x 500 ms" (cameras x images x interval).
+    pub load: String,
+    pub cameras: usize,
+    pub images: usize,
+    pub interval_ms: u64,
+    pub bursts: usize,
+    pub requests: usize,
+    pub answered: usize,
+    /// Request latency from the intended send time (queue wait included).
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+    /// Per trigger: from its first intended send to its last answer.
+    pub last_answer_p50_ms: Option<f64>,
+    pub last_answer_p95_ms: Option<f64>,
+    pub triggers: usize,
+    pub triggers_incomplete: usize,
+    pub refused: u64,
+    /// "queue_full 3, timeout 1".
+    pub refused_by: String,
+    pub max_queue_depth: usize,
+    pub queue_capacity: usize,
+    pub inflight: usize,
+    pub served: bool,
+    /// Why it measured nothing.
+    pub error: Option<String>,
+    pub notes: Vec<String>,
+    /// Detection requests per minute the service answered meanwhile.
+    pub live_load: Option<f64>,
+}
+
+impl BurstSpeed {
+    pub fn of(b: &crate::benchmark::burst::BurstResult) -> Self {
+        let measured = b.error.is_none() && b.answered > 0;
+        let some = |v: f64| measured.then_some(v);
+        let last = b.error.is_none() && b.triggers > b.triggers_incomplete;
+        Self {
+            load: b.load_text(),
+            cameras: b.cameras,
+            images: b.images,
+            interval_ms: b.interval_ms,
+            bursts: b.bursts,
+            requests: b.requests,
+            answered: b.answered,
+            p50_ms: some(b.latency_ms.p50),
+            p95_ms: some(b.latency_ms.p95),
+            p99_ms: some(b.latency_ms.p99),
+            max_ms: some(b.latency_ms.max),
+            last_answer_p50_ms: last.then_some(b.trigger_ms.p50),
+            last_answer_p95_ms: last.then_some(b.trigger_ms.p95),
+            triggers: b.triggers,
+            triggers_incomplete: b.triggers_incomplete,
+            refused: b.refused_total(),
+            refused_by: b
+                .refused
+                .iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            max_queue_depth: b.max_queue_depth,
+            queue_capacity: b.queue_capacity,
+            inflight: b.inflight,
+            served: b.served,
+            error: b.error.clone(),
+            notes: b.notes.clone(),
+            live_load: b.live_requests_per_min,
+        }
+    }
 }
 
 /// Flags of a row.
@@ -295,6 +373,9 @@ pub struct Row {
     /// Its rank group's leader (`model on device`), when not itself.
     pub leader: Option<String>,
     pub vs_leader: Option<Difference>,
+    /// Its paired difference from the best row (the first of the `ok` block), for the rows of
+    /// that block but the best itself: what the headline's "not clearly different" reads.
+    pub vs_best: Option<Difference>,
     pub recall: Option<f64>,
     pub precision: Option<f64>,
     pub f1: Option<f64>,
@@ -398,20 +479,41 @@ fn frames_of(set: &CompareSet<'_>, map: &ClassMap, c: &Combo<'_>, classes: &[Str
     f
 }
 
-fn speed_of(set: &CompareSet<'_>, c: &Combo<'_>) -> Speed {
-    let by: HashMap<(&str, &str), f64> = c
-        .run
-        .per_image
+/// The one-at-a-time request times (ms) of `per_image` on the frames `frames` names (set id,
+/// file), in their order: the basis of a set's p50 / p95 / p99 and of the grade's speed
+/// wherever a grade is shown (Compare, Tune, the history's goal metric).
+pub(crate) fn times_on<'a>(
+    per_image: &[crate::benchmark::ImageRun],
+    frames: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<f64> {
+    let by: HashMap<(&str, &str), f64> = per_image
         .iter()
         .map(|i| ((i.set.as_str(), i.file.as_str()), i.total_ms))
         .collect();
-    let times: Vec<f64> = set
-        .images
-        .iter()
-        .filter_map(|i| by.get(&(i.set.id.as_str(), i.info.file.as_str())).copied())
+    frames
+        .into_iter()
+        .filter_map(|k| by.get(&k).copied())
         .filter(|t| t.is_finite())
-        .collect();
+        .collect()
+}
+
+/// The p50 of [`times_on`]: the grade's speed on those frames.
+pub(crate) fn p50_on<'a>(
+    per_image: &[crate::benchmark::ImageRun],
+    frames: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<f64> {
+    pct_of(&times_on(per_image, frames), 50.0)
+}
+
+fn speed_of(set: &CompareSet<'_>, c: &Combo<'_>) -> Speed {
+    let times = times_on(
+        &c.run.per_image,
+        set.images
+            .iter()
+            .map(|i| (i.set.id.as_str(), i.info.file.as_str())),
+    );
     let st = &c.run.stages_ms;
+    let burst = c.run.burst.as_ref().map(BurstSpeed::of);
     Speed {
         p50_ms: pct_of(&times, 50.0),
         p95_ms: pct_of(&times, 95.0),
@@ -421,7 +523,8 @@ fn speed_of(set: &CompareSet<'_>, c: &Combo<'_>) -> Speed {
         preprocess_ms: st.preprocess.p50,
         infer_ms: st.infer.p50,
         postprocess_ms: st.postprocess.p50,
-        burst_p95_ms: None,
+        burst_p95_ms: burst.as_ref().and_then(|b| b.p95_ms),
+        burst,
         first_load: FirstLoad {
             compile_ms: c.run.compile_ms,
             warmup_ms: c.run.warmup_ms,
@@ -734,6 +837,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
             block: Block::Ok,
             leader: None,
             vs_leader: None,
+            vs_best: None,
             recall: p.recall(),
             precision: p.precision(),
             f1: p.f_beta(1.0),
@@ -754,11 +858,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
             served_threshold,
             at_saved: served_threshold.and_then(|t| at_point(&a, t)),
             at_suggested: a.suggested_threshold().and_then(|t| at_point(&a, t)),
-            folds: if a.low_confidence.is_some() {
-                0
-            } else {
-                a.cv.k
-            },
+            folds: if a.in_sample { 0 } else { a.cv.k },
             agreement: c
                 .run
                 .agreement
@@ -818,6 +918,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
         r.rank = p.rank;
         r.block = p.block;
         r.vs_leader = p.vs_leader;
+        r.vs_best = p.vs_best;
         r.leader = l;
     }
     let mut by_index: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
@@ -893,7 +994,8 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
     view
 }
 
-/// One sentence: the best combo, those not clearly different, or why nothing meets the goal.
+/// One sentence: the best combo, the ok rows not clearly different from it ([`Row::vs_best`]),
+/// or why nothing meets the goal.
 pub fn headline(rows: &[Row], goal: &Goal) -> String {
     let metric = goal.optimize_for.short();
     let within = if goal.speed_budget_ms.is_some() {
@@ -923,10 +1025,12 @@ pub fn headline(rows: &[Row], goal: &Goal) -> String {
             why.join(", ")
         );
     };
+    // Exactly the ok rows whose paired difference from the best row is not clearly below 0
+    // (whatever rank group a row landed in).
     let ties: Vec<String> = rows
         .iter()
         .skip(1)
-        .filter(|r| r.block == Block::Ok && r.rank == best.rank)
+        .filter(|r| r.block == Block::Ok && !r.vs_best.is_some_and(|d| d.clearly_below()))
         .map(|r| format!("{} on {}", r.model, r.device))
         .collect();
     let mut s = format!(
@@ -942,7 +1046,7 @@ pub fn headline(rows: &[Row], goal: &Goal) -> String {
         _ => s.push_str(&format!("; {} are not clearly different", ties.join(", "))),
     }
     if best.flags.low_confidence.is_some() {
-        s.push_str(" (low confidence: little data)");
+        s.push_str(" (low confidence)");
     }
     s.push('.');
     s

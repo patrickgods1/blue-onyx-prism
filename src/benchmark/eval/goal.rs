@@ -236,8 +236,15 @@ impl Goal {
         g
     }
 
-    /// Checks what serde cannot: a budget is a positive, finite number of ms.
+    /// Checks what serde cannot: a budget is a positive, finite number of ms, and no objective
+    /// is a target no finite set can show ([`Objective::reachable`]).
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(o) = self.optimize_for.objective() {
+            o.reachable()?;
+        }
+        self.tune_for
+            .reachable()
+            .map_err(|e| format!("tune_for: {e}"))?;
         if let Some(b) = self.speed_budget_ms
             && !(b.is_finite() && b > 0.0)
         {
@@ -479,5 +486,32 @@ mod tests {
         );
         assert_eq!(ms_text(1000.0), "1 s");
         assert_eq!(ms_text(420.4), "420 ms");
+    }
+
+    /// S2: a 100% target (precision or recall 1, a false positive rate of 0) can never be shown
+    /// on the 95% bound of a finite set: refused wherever a goal is set.
+    #[test]
+    fn a_target_no_finite_set_can_show_is_refused() {
+        for bad in ["precision:1", "recall:1.0", "fpr:0", "precision:1.00"] {
+            let e = Goal::default()
+                .try_with(Some(bad), None, None, None)
+                .unwrap_err();
+            assert!(e.contains("100%") && e.contains("0.99"), "{bad}: {e}");
+            let e = Goal::default()
+                .try_with(Some("ap50"), Some(bad), None, None)
+                .unwrap_err();
+            assert!(e.contains("100%"), "tune_for {bad}: {e}");
+        }
+        for ok in [
+            "precision:0.99",
+            "recall:0.5",
+            "fpr:0.01",
+            "recall_at_fa:0.5",
+        ] {
+            assert!(
+                Goal::default().try_with(Some(ok), None, None, None).is_ok(),
+                "{ok}"
+            );
+        }
     }
 }

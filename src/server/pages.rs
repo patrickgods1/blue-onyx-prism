@@ -112,7 +112,7 @@ fn static_body(name: &str, _embedded: &'static str) -> std::io::Result<Cow<'stat
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
 }
 
-/// Body of the static file `name` (`"benchmark.js"`), for tests that check page code.
+/// Body of the static file `name` (`"bench-shell.js"`), for tests that check page code.
 #[cfg(test)]
 pub(super) fn static_file(name: &str) -> Option<&'static str> {
     let (_, _, embedded) = STATIC_FILES.iter().find(|(n, _, _)| *n == name)?;

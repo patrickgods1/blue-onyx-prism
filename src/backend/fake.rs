@@ -5,6 +5,9 @@
 //! Each `submit` takes the next [`Step`] of the shared [`FakeScript`] (a FIFO queue) and every
 //! backend call is appended to the script's call log ([`Call`]). Completions are delivered on
 //! the backend's channel like the real runtimes do (from another thread, after the step's delay).
+//! The script counts the compiled models alive (compiled and not dropped yet, as a backend or
+//! before it became one): [`FakeScript::alive`], [`FakeScript::max_alive`] and
+//! [`FakeScript::dropped`] tell a test how many copies of the model were held at once.
 
 use super::{Completion, DeviceInfo, LoadRequest, ModelInfo, SessionDead};
 use crate::model::{ExtraInput, NamedOutput, OutputBuf, PortElem, PortSpec};
@@ -12,6 +15,7 @@ use crate::sync::LockExt;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -90,6 +94,30 @@ struct ScriptState {
 struct Shared {
     state: Mutex<ScriptState>,
     cv: Condvar,
+    /// Compiled models alive now, the most at once, and the ones dropped.
+    alive: AtomicUsize,
+    max_alive: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+/// One compiled model alive ([`FakeScript::alive`]): made by a compile, moved from the
+/// [`FakeCompiled`] into its [`FakeBackend`], counted out when it drops.
+#[derive(Debug)]
+struct Alive(Arc<Shared>);
+
+impl Alive {
+    fn new(shared: &Arc<Shared>) -> Self {
+        let now = shared.alive.fetch_add(1, Ordering::SeqCst) + 1;
+        shared.max_alive.fetch_max(now, Ordering::SeqCst);
+        Self(shared.clone())
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.0.alive.fetch_sub(1, Ordering::SeqCst);
+        self.0.dropped.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// The test's handle on the fake: steps to play, the call log, hung inferences to release.
@@ -160,6 +188,21 @@ impl FakeScript {
     /// Every compile so far: (device spec, the tuning `compile_tuned` was given).
     pub(crate) fn compiles(&self) -> Vec<(String, crate::profile::DeviceTuning)> {
         self.shared.state.lock_recover().compiles.clone()
+    }
+
+    /// Compiled models alive now (compiled, not dropped).
+    pub(crate) fn alive(&self) -> usize {
+        self.shared.alive.load(Ordering::SeqCst)
+    }
+
+    /// The most compiled models alive at once so far.
+    pub(crate) fn max_alive(&self) -> usize {
+        self.shared.max_alive.load(Ordering::SeqCst)
+    }
+
+    /// Compiled models dropped so far.
+    pub(crate) fn dropped(&self) -> usize {
+        self.shared.dropped.load(Ordering::SeqCst)
     }
 
     /// Steps not taken yet.
@@ -235,6 +278,7 @@ impl FakeScript {
             },
             script: self.clone(),
             hint: tuning.hint,
+            alive: Alive::new(&self.shared),
         }
     }
 }
@@ -245,6 +289,7 @@ pub struct FakeCompiled {
     pub(crate) info: ModelInfo,
     script: FakeScript,
     hint: crate::profile::PerfHint,
+    alive: Alive,
 }
 
 impl FakeCompiled {
@@ -261,6 +306,7 @@ impl FakeCompiled {
             done_tx,
             done_rx,
             seq: 0,
+            _alive: self.alive,
         }
     }
 }
@@ -285,6 +331,8 @@ pub struct FakeBackend {
     done_tx: Sender<Completion>,
     done_rx: Receiver<Completion>,
     seq: u64,
+    /// Counted alive until this backend drops.
+    _alive: Alive,
 }
 
 impl FakeBackend {

@@ -1727,6 +1727,31 @@
       var cancel = mk("button", "secondary", "Close");
       cancel.type = "button"; cancel.addEventListener("click", close);
       bar.appendChild(go); bar.appendChild(cancel); form.appendChild(bar);
+      // A low-confidence suggestion (s.confirm) is saved only with confirm=1: asked in the page
+      // first, naming why, when the form would save it (always when already the default, else
+      // with "Use the suggested threshold" ticked). Without the answer the server refuses.
+      if (s && s.confirm) {
+        var ask = mk("div", "warn"), yes = mk("button", null, "Save anyway"), no = mk("button", "secondary", "Cancel"), answered = false;
+        ask.setAttribute("role", "alertdialog"); ask.hidden = true;
+        yes.type = "button"; no.type = "button";
+        var acts = mk("div", "actions"); acts.appendChild(yes); acts.appendChild(no);
+        var why = String(s.low_confidence || "too little data to cross-validate").replace(/^low confidence:\s*/i, "").trim();
+        ask.appendChild(mk("p", null, "The suggested threshold " + s.threshold.toFixed(2) + " is low confidence: " + why + (/[.!?]$/.test(why) ? "" : ".") + " Save it anyway?"));
+        ask.appendChild(acts);
+        form.insertBefore(ask, bar);
+        form.addEventListener("submit", function (e) {
+          if (answered || !(already || (use && use.input.checked))) return;
+          e.preventDefault(); e.stopImmediatePropagation();
+          ask.hidden = false; yes.focus();
+        });
+        yes.addEventListener("click", function () {
+          answered = true; ask.hidden = true;
+          form.appendChild(hidden("confirm", "1"));
+          if (form.requestSubmit) form.requestSubmit(go); else form.submit();
+        });
+        no.addEventListener("click", function () { ask.hidden = true; go.focus(); });
+        if (use) use.input.addEventListener("change", function () { if (!use.input.checked) ask.hidden = true; });
+      }
       nodes.push(form);
       host.replaceChildren.apply(host, nodes);
       if (already) return;

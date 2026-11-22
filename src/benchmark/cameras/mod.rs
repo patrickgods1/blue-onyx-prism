@@ -445,15 +445,26 @@ pub fn nothing_left(left: Option<&super::report::LeftOut>) -> String {
 }
 
 /// Write the ground-truth snapshot of a run's `sets` beside `results_path` when they hold "Your
-/// cameras" (`loaded`: what the run's resolution kept of it). Called before the run's first save of
-/// `benchmark.json`, whose copy of the set has no labels.
+/// cameras" (`loaded`: what the run's resolution kept of it), keeping the frames of the
+/// snapshot there that the runs of `prev` (the results the save merges into) still score
+/// ([`snapshot::GtSnapshot::merged_with`]); returns its identity, which the results saved next
+/// record ([`snapshot::stamp`]). Called under the results lock before the run's first save of
+/// `benchmark.json`, whose copy of the set has no labels. None when the run has no such set.
 pub fn write_snapshot(
     results_path: &Path,
     sets: &[ImageSet],
     loaded: Option<&super::images::CamerasLoaded>,
-) -> anyhow::Result<()> {
+    prev: Option<&super::report::BenchmarkResults>,
+) -> anyhow::Result<Option<snapshot::SnapshotId>> {
     let (Some(set), Some(l)) = (sets.iter().find(|s| s.id == ID), loaded) else {
-        return Ok(());
+        return Ok(None);
     };
-    snapshot::GtSnapshot::of(&l.source, set, &l.reviewed).save(&snapshot::path_beside(results_path))
+    let path = snapshot::path_beside(results_path);
+    let old = snapshot::GtSnapshot::load(&path).unwrap_or_else(|e| {
+        tracing::warn!("{e:#}; the new snapshot keeps none of its frames");
+        None
+    });
+    let snap =
+        snapshot::GtSnapshot::of(&l.source, set, &l.reviewed).merged_with(old.as_ref(), prev);
+    snap.save(&path).map(Some)
 }

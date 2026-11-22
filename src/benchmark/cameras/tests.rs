@@ -630,15 +630,19 @@ fn the_snapshot_keeps_results_put_and_a_rescore_catches_up_with_label_edits() {
     assert_eq!(recall(&results), Some(1.0));
     let results_path = t.0.join("benchmark.json");
     let preds_path = t.0.join("benchmark-preds.json");
-    write_snapshot(
+    let id = write_snapshot(
         &results_path,
         std::slice::from_ref(&l.set),
         Some(&CamerasLoaded {
             source: src.clone(),
             reviewed: l.reviewed.clone(),
         }),
+        None,
     )
+    .unwrap()
     .unwrap();
+    let mut results = results;
+    snapshot::stamp(&mut results, &id);
     results.save(&results_path).unwrap();
     StoredPreds::merge(None, &results, &[m])
         .save(&preds_path)
@@ -690,6 +694,7 @@ fn the_snapshot_keeps_results_put_and_a_rescore_catches_up_with_label_edits() {
             changed: 1,
             left: 1,
             joined: 1,
+            unknown: 0,
         }
     );
     // The saved results stay put meanwhile: still scored against the snapshot.
@@ -721,6 +726,7 @@ fn the_snapshot_keeps_results_put_and_a_rescore_catches_up_with_label_edits() {
             changed: 0,
             left: 0,
             joined: 1,
+            unknown: 0,
         },
         "z still needs a run"
     );
@@ -791,4 +797,184 @@ fn only_review_frames_inside_the_folder_are_served() {
     ] {
         assert!(info.image_path(bad).is_none(), "{bad}");
     }
+}
+
+/// Three reviewed frames scored by `models` (each the same scored run of every frame), saved
+/// with their snapshot; returns (results path, preds path, review folder, config).
+fn saved_run(t: &Tmp, models: &[&str]) -> (PathBuf, PathBuf, PathBuf, Config) {
+    let cfg = config(&t.0);
+    let dir = cfg.collect.resolved_review_dir(&cfg.data_root());
+    let person = lb("person", [4.0, 4.0, 24.0, 40.0], BoxState::Accepted);
+    for rel in [
+        "day/front/2026-11-01/a",
+        "day/front/2026-11-02/b",
+        "day/back/2026-11-01/c",
+    ] {
+        put(&dir, rel, &reviewed(vec![person.clone()]));
+    }
+    let src = Source::of(&cfg);
+    let l = ready(load(&src));
+    let results_path = t.0.join("benchmark.json");
+    let preds_path = t.0.join("benchmark-preds.json");
+    let id = write_snapshot(
+        &results_path,
+        std::slice::from_ref(&l.set),
+        Some(&CamerasLoaded {
+            source: src.clone(),
+            reviewed: l.reviewed.clone(),
+        }),
+        None,
+    )
+    .unwrap()
+    .unwrap();
+    let mut all = Vec::new();
+    for name in models {
+        let (_, mut m) = scored_results(&l.set);
+        m.model = (*name).to_string();
+        all.push(m);
+    }
+    let mut r = BenchmarkResults::new(Default::default(), Default::default(), all.clone())
+        .with_sets(std::slice::from_ref(&l.set));
+    snapshot::stamp(&mut r, &id);
+    r.save(&results_path).unwrap();
+    StoredPreds::merge(None, &r, &all)
+        .save(&preds_path)
+        .unwrap();
+    (results_path, preds_path, dir, cfg)
+}
+
+/// D1: a frame the walk could not read this time (its label file does not parse) is unknown,
+/// not "left": it keeps its place, its labels and its figures, and the re-score lists it.
+#[test]
+fn a_rescore_keeps_frames_it_could_not_read() {
+    let t = Tmp::new();
+    let (results_path, preds_path, dir, cfg) = saved_run(&t, &["m"]);
+    std::fs::write(labels_path(&dir, "day/back/2026-11-01/c"), b"{ not json").unwrap();
+    let r = rescore::rescore(&cfg, &results_path, &preds_path).unwrap();
+    assert_eq!(r.changes.left, 0, "{:?}", r.changes);
+    assert_eq!(r.frames, 3);
+    let after = BenchmarkResults::load(&results_path).unwrap().unwrap();
+    assert_eq!(after.image_set(ID).unwrap().images.len(), 3);
+    let run = after.models[0].devices[0].run.as_ref().unwrap();
+    assert_eq!(run.per_image.len(), 3);
+    let c = after
+        .image_set(ID)
+        .unwrap()
+        .images
+        .iter()
+        .find(|i| i.file == flat("day/back/2026-11-01/c"))
+        .unwrap();
+    assert_eq!(c.objects.as_ref().map(Vec::len), Some(1), "its old labels");
+    let snap = GtSnapshot::load(&snapshot::path_beside(&results_path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(snap.frames.len(), 3);
+    let listed = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        listed["unknown"],
+        serde_json::json!([flat("day/back/2026-11-01/c")]),
+        "{listed}"
+    );
+}
+
+/// D1: a re-score against another folder or another class list is refused: the snapshot is of
+/// another set.
+#[test]
+fn a_rescore_of_another_folder_or_class_list_is_refused() {
+    let t = Tmp::new();
+    let (results_path, preds_path, _dir, mut cfg) = saved_run(&t, &["m"]);
+    cfg.collect.classes.push("bicycle".into());
+    let e = rescore::rescore(&cfg, &results_path, &preds_path).unwrap_err();
+    assert!(format!("{e:#}").contains("run the benchmark"), "{e:#}");
+    let mut cfg2 = config(&t.0);
+    cfg2.collect.dir = Some(t.0.join("elsewhere"));
+    std::fs::create_dir_all(t.0.join("elsewhere")).unwrap();
+    put(
+        &t.0.join("elsewhere"),
+        "day/front/2026-11-01/a",
+        &reviewed(vec![lb(
+            "person",
+            [4.0, 4.0, 24.0, 40.0],
+            BoxState::Accepted,
+        )]),
+    );
+    let e = rescore::rescore(&cfg2, &results_path, &preds_path).unwrap_err();
+    assert!(format!("{e:#}").contains("run the benchmark"), "{e:#}");
+}
+
+/// D3: a snapshot that is not the one the results were saved with (a crash between the two
+/// writes, a hand edit) is reported, not scored silently.
+#[test]
+fn a_snapshot_of_another_save_marks_the_set_stale() {
+    let t = Tmp::new();
+    let (results_path, _preds, _dir, cfg) = saved_run(&t, &["m"]);
+    let (_, w) = BenchmarkResults::load_with_warnings(&results_path).unwrap();
+    assert!(w.is_empty(), "{w:?}");
+    // Another snapshot over it, the results untouched.
+    let src = Source::of(&cfg);
+    let l = ready(load(&src));
+    let mut other = GtSnapshot::of(&src, &l.set, &l.reviewed);
+    other.created = "2030-01-01T00:00:00Z".into();
+    other.save(&snapshot::path_beside(&results_path)).unwrap();
+    let (r, w) = BenchmarkResults::load_with_warnings(&results_path).unwrap();
+    assert!(
+        w.iter().any(|w| w.contains("Re-score")),
+        "a warning that offers a re-score: {w:?}"
+    );
+    assert!(r.unwrap().image_set(ID).unwrap().labels_stale.is_some());
+}
+
+/// D4: a later run of fewer frames keeps the snapshot entries (and set images) the kept runs
+/// still score: the earlier models re-score and compare on their frames.
+#[test]
+fn a_smaller_later_run_keeps_the_frames_of_earlier_runs() {
+    let t = Tmp::new();
+    let (results_path, preds_path, _dir, cfg) = saved_run(&t, &["m1", "m2"]);
+    // m2 alone on the first two frames.
+    let src = Source::of(&cfg);
+    let l = ready(load(&src));
+    let mut two = l.set.clone();
+    two.images.truncate(2);
+    // As a run's save does it: the previous results, the snapshot, the merge, the identity.
+    let prev = BenchmarkResults::load(&results_path).unwrap();
+    let id = write_snapshot(
+        &results_path,
+        std::slice::from_ref(&two),
+        Some(&CamerasLoaded {
+            source: src.clone(),
+            reviewed: l.reviewed.clone(),
+        }),
+        prev.as_ref(),
+    )
+    .unwrap()
+    .unwrap();
+    let (_, mut m2) = scored_results(&two);
+    m2.model = "m2".into();
+    let new = BenchmarkResults::new(Default::default(), Default::default(), vec![m2.clone()])
+        .with_sets(std::slice::from_ref(&two));
+    let mut merged = BenchmarkResults::merge(prev, new);
+    snapshot::stamp(&mut merged, &id);
+    merged.save(&results_path).unwrap();
+    let warnings = crate::benchmark::search::save_beside(&results_path, &merged, &[m2]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let back = BenchmarkResults::load(&results_path).unwrap().unwrap();
+    let set = back.image_set(ID).unwrap();
+    assert_eq!(set.images.len(), 3, "m1 still scores the third frame");
+    assert!(set.images.iter().all(|i| i.objects.is_some()), "{set:?}");
+    let snap = GtSnapshot::load(&snapshot::path_beside(&results_path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(snap.frames.len(), 3);
+    let r = rescore::rescore(&cfg, &results_path, &preds_path).unwrap();
+    assert!(r.not_rescored.is_empty(), "{:?}", r.not_rescored);
+    let after = BenchmarkResults::load(&results_path).unwrap().unwrap();
+    let images = |name: &str| {
+        after.find(name).unwrap().devices[0]
+            .run
+            .as_ref()
+            .unwrap()
+            .per_image
+            .len()
+    };
+    assert_eq!((images("m1"), images("m2")), (3, 2));
 }

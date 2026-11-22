@@ -691,11 +691,16 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   boxes and the label file's revision; `benchmark.json` keeps the frames without their boxes), and
   everything that re-scores the saved results (Compare, the confidence search, a regrade, the
   threshold advice) reads it, so results stay put while you keep reviewing. `GET /v1/benchmark`
-  reports `labelsChanged` (`frames`, `changed`, `left`, `joined`: frames whose labels changed, that
-  left the reviewed set, or that were reviewed since; counted in the background, never during a
-  poll), and **Re-score** (`POST /v1/benchmark/rescore`, CLI `benchmark --rescore`) scores the
-  stored predictions against the current labels without inference and replaces the snapshot; frames
-  reviewed since the run need a run. The drill-down serves only frames of the snapshot.
+  reports `labelsChanged` (`frames`, `changed`, `left`, `joined`, `unknown`: frames whose labels
+  changed, that left the reviewed set, that were reviewed since, or that the walk could not read
+  this time; counted in the background, never during a poll; `stale: true` with a `message` when
+  the snapshot is not the one the results were saved with, e.g. after an interrupted save), and
+  **Re-score** (`POST /v1/benchmark/rescore`, CLI `benchmark --rescore`) scores the stored
+  predictions against the current labels without inference and replaces the snapshot; frames
+  reviewed since the run need a run, and frames that could not be read keep their labels and
+  figures (listed in `unknown`). A Re-score after the folder under review or `collect.classes`
+  changed is refused (409: run the benchmark again). A later run of fewer frames keeps the frames
+  the earlier runs still score. The drill-down serves only frames of the snapshot.
   `benchmark --dataset cameras --config <file>` runs it from the command line.
 - **Datasets** (`benchmark.datasets`, CLI `--dataset`): the built-in, pinned and SHA-256-checked sets
   `coco-cctv` (COCO val2017 CCTV-relevant subset, 180 images), `bmd45-cctv` (real 1080p CCTV,
@@ -751,6 +756,40 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   of the settings it ran with, and `GET /v1/benchmark` marks it `stale_rules: true` once the
   model's (or its night model's or verifier's) serving settings change; a new day threshold does
   not, since the curves already cover it. `--served` is refused together with `--variants`.
+- **Burst test** (off by default; `benchmark.burst`, CLI `benchmark --burst [C,K,I]`, the Run
+  page's Options *Burst test*): the timed runs send one image at a time, but a Blue Iris with
+  several cameras sends them together (each trigger is 1 + "real-time images" a fixed time apart),
+  and then the queue decides how long the last answer takes. After each model x device's timed
+  runs, the benchmark drops its own compiled copy, then starts a temporary worker of the serving
+  code on exactly that device: the same compile tuning and inferences in flight, a decode +
+  preprocess pool sized as the service sizes its own, `worker_queue_size` and
+  `request_timeout_secs`, and the threshold the timed run used there (the model's serving rules in
+  an As served run, the bare model otherwise; the night model and the verifier are other workers
+  and stay out, and nothing is saved or collected). It never joins the served models: Blue Iris
+  never reaches it and the served models keep answering beside it (two copies of the model at
+  most, the serving one and this one). Three bursts: in each, C cameras trigger at once and each
+  sends K frames I ms apart (default 8 x 4 x 500 ms), the next burst K x I + 2 s later and at
+  least 2 s after the last answer. The frames are the run's, Your cameras first, sent as their
+  encoded bytes through the path an upload takes after its body is read (the queue-full and
+  timeout rules included). The load is open loop: each request's latency counts from when it was
+  due, so a send that ran late still counts from its intended time and queue wait is in it
+  (`burst.latency_ms` p50 / p95 / p99); a trigger lasts from its first image being due to its last
+  answer (`burst.trigger_ms`, "last answer"); each refused request is counted once, by the reason
+  its own answer carries (`burst.refused`: `queue_full`, `timeout`, `worker_gone`, ...; `error` for
+  a failed answer without one, so answered + refused = requests), with the most requests waiting at
+  once, the live requests and the GPU video-decode load meanwhile, as for the timed runs.
+  Afterwards the worker is stopped and waited for at most the request timeout + 5 s (its thread
+  frees the device memory as it ends); a worker still compiling, or blocked in the runtime (a GPU
+  reset), is left behind to end on its own and the burst's notes say so. A cancel stops a burst
+  (also during its worker's load) within a fraction of a second, and a device the worker cannot
+  load on, or not within 10 min, records why and the run goes on.
+  The speed budget then applies to the burst p95 (Compare's *p95 (burst)*, *Burst p95* and *Last
+  answer* columns, its row details and the Speed tab), the CLI prints a burst line per device, the
+  HTML / Markdown report has a *Burst test* table and the history records the burst p95 (compared
+  only under the same load). It is off by default because it adds 10 s to a minute per combo, more
+  when the queue backs up (the Run page's estimate includes it), and loads the device like a busy
+  Blue Iris: run it when choosing a device for many cameras. On an iGPU that also decodes Blue Iris' video (Quick Sync),
+  a run beside the live service is the realistic one; its video-decode load is recorded.
 - **Accuracy**: AP@0.5, AP@[.5:.95] (COCO 101-point), precision/recall/F1 at the confidence the model
   serves on the device, recall by object size, by dataset and by tag (day/night, complexity,
   resolution, crowd, small objects, the computed scene). Scored classes: person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse
@@ -854,7 +893,12 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
     alerts per empty frame x 100 <= N, the frame FPR's upper bound <= x; a target is met when that
     holds on the cross-validated counts. An unmet target is shown and never saved. (On a
     synthetic detector a `precision:0.9` pick on its bound held on fresh frames in 98.5% of 200
-    trials, the point estimate in 53%.)
+    trials, the point estimate in 53%.) A 100% target (`precision:1`, `recall:1`, `fpr:0`) can
+    never be shown on a finite set (its bound never reaches it) and is refused: use 0.99 or lower
+    (fpr 0.01 or higher). `recall_at_fa:N` needs enough empty frames: even with no false alert at
+    all, the upper bound of FA/100 on E empty frames is 100 x 3.84 / (E + 3.84), so the target can
+    be met only with more than about 384 / N - 3.84 empty frames of the counted classes (N = 5:
+    about 73 empty frames; N = 1: about 381).
   - **Intervals**: a cluster bootstrap over the groups with a fixed seed (the same results give the
     same interval): 1,000 resamples of the groups' counts for a threshold objective, 200 for AP50,
     AP50-95, ROC AUC and the grade (recomputed from the resampled frames' matches); 95% percentile
@@ -862,12 +906,16 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
     "clearly better" when the interval of the difference excludes 0.
   - **Ranks**: combos within the budget with the target met first, by the goal metric; then the
     ones over the budget ("too slow"); then those whose target is not met; then models that trained
-    on these frames. The first combo is rank 1; each next one shares its group leader's rank unless
-    it is clearly worse than that leader, then it starts a new group at its position. The headline
-    names the best combo and those not clearly different (or why nothing meets the goal).
+    on these frames. The first combo is rank 1; each next one is compared with the group leaders
+    so far, best first, and shares the rank of the first one it is not clearly worse than; clearly
+    worse than all of them, it starts a new group at its position (so a combo with a wide interval
+    that is not clearly worse than the best shares rank 1). The headline names the best combo and
+    exactly the combos not clearly worse than it (`vsBest`), or why nothing meets the goal.
   - **Low confidence**: under 4 groups or 50 labelled objects of the counted classes the figures
     are in-sample (at the pick on every frame), flagged `lowConfidence` with the reason; the
-    interval is still computed and Save asks to confirm. A curve on which every grid value scores
+    interval is still computed and Save asks to confirm. A fold whose other folds hold no counted
+    object is counted at the pick on every frame: the figures are partly in-sample and flagged the
+    same way. A curve on which every grid value scores
     within 0.002 of the best (every scored frame answered by the night model, or a fixed night
     threshold) gives `pickInformative: false` and the pick is not savable.
   - **Breakdowns** (at each combo's cross-validated picks): per scene (metric, recall, FA/100,
@@ -947,12 +995,17 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.auto_download_datasets` | `true` | Download the selected built-in datasets when a run starts (large ones still need `allow_large_downloads`). Boolean. UI: no |
 | `benchmark.low_priority` | `true` | Run benchmarks of CPU devices (`openvino:cpu`, `ort:cpu`, `CPU`) at below-normal process priority so the desktop stays responsive; GPU and NPU devices keep the normal priority, so the service keeps answering Blue Iris at full priority while they run (Windows: the whole process while a CPU device compiles and runs, restored before a GPU device and after the run; the log and the Benchmark page's progress line say which applied; CLI on Linux/macOS: nice 10 for a run whose devices are all CPUs, a running service is never lowered there). `benchmark --no-low-priority` overrides it. Boolean. Applies: at once. UI: yes |
 | `benchmark.served` | `false` | Benchmark each model **as served**: with the serving settings Blue Iris gets it with (its `preprocess` / `night_preprocess`, filter rules, `night_threshold`, `night_model` routing of night / IR frames and `verify` verifier), timed as the request costs in the service. Results are stored as `<model>+served`, beside and never mixed with the bare results; `auto` device ordering, the device recommendation and Apply use the bare results only. A result whose model's serving settings changed since the run is marked stale (`stale_rules` in `GET /v1/benchmark`). `benchmark --served` turns it on for one run (refused together with `--variants`); the Benchmark page has a Run settings checkbox. Boolean. Applies: at once. UI: yes |
-| `benchmark.goal` | `{"optimize_for": "f1", "tune_for": "f1", "classes": [], "speed_budget_ms": null}` | What Compare ranks by and Tune picks the confidence for (see *Goal, cross-validation and ranks*). A file without it takes it from `threshold_objective` / `accuracy_metric` (`accuracy_metric: roc_auc` = `optimize_for: roc_auc` tuned for the objective, else `optimize_for` = the objective); when both are present `goal` wins. `POST /v1/benchmark/goal`, CLI `benchmark --goal`. UI: yes (`POST /v1/benchmark/goal`) |
+| `benchmark.burst` | `{"enabled": false, "cameras": 8, "images": 4, "interval_ms": 500}` | The **burst test** (see *Burst test*): after each model x device's timed run, a temporary worker of the serving code takes `cameras` triggers at once, each camera sending `images` frames `interval_ms` apart, three bursts; it records request latency incl. queue wait, the time to a trigger's last answer and what was refused. Off by default (10 s to a minute per combo; it loads the device as a busy Blue Iris would). CLI `benchmark --burst [C,K,I]`; the Run page's Options. UI: yes |
+| `benchmark.burst.enabled` | `false` | Run the burst test. Boolean. CLI `--burst` (bare: with the configured load). UI: yes |
+| `benchmark.burst.cameras` | `8` | Cameras that trigger at the same moment. Integer 1-32. UI: yes |
+| `benchmark.burst.images` | `4` | Images each camera sends per trigger (Blue Iris: 1 + "real-time images"). Integer 1-20. UI: yes |
+| `benchmark.burst.interval_ms` | `500` | Time between one camera's images, ms (Blue Iris' "+ real-time images" interval). Integer 50-5000. UI: yes |
+| `benchmark.goal` | `{"optimize_for": "f1", "tune_for": "f1", "classes": [], "speed_budget_ms": null}` | What Compare ranks by and Tune picks the confidence for (see *Goal, cross-validation and ranks*). A file without it takes it from `threshold_objective` / `accuracy_metric` (`accuracy_metric: roc_auc` = `optimize_for: roc_auc` tuned for the objective, else `optimize_for` = the objective); when both are present `goal` wins. A `goal` that does not validate (an unknown `optimize_for`, a bad budget, a 100% target) does not stop the service: it loads as the legacy keys' goal, with a warning. **Release note:** release 0.2.0 reading this file keeps working (the legacy keys are written in spellings it parses), but it drops `goal`, `served` and `burst` when it saves the config. `POST /v1/benchmark/goal`, CLI `benchmark --goal`. UI: yes (`POST /v1/benchmark/goal`) |
 | `benchmark.goal.optimize_for` | `"f1"` | A threshold objective scored at each combo's cross-validated confidence: `f1`, `f2`, `f05`, `recall_at_fa:<N>`, `precision:<p>`, `recall:<r>`, `youden`, `fpr:<x>`; or a rank-only metric: `ap50`, `ap50_95`, `roc_auc` (one sample per frame), `grade` (the A-F overall grade with `benchmark.weights`). CLI `--goal` |
 | `benchmark.goal.tune_for` | `"f1"` | The threshold objective the confidence is picked for when `optimize_for` is rank-only; ignored otherwise. CLI `--tune-for` |
 | `benchmark.goal.classes` | `[]` | The classes that count (exact classes; IPcam `vehicle` takes car, truck and bus labels); `[]` = every scored class the set labels. CLI `--goal-classes person,car` |
 | `benchmark.goal.speed_budget_ms` | `null` | The p95 latency (ms) a combo may take: the burst p95 once a burst test ran, else the one-at-a-time p95 on the set's frames; slower combos rank after the others, "too slow". `null` = no budget. Number > 0. CLI `--speed-budget 250` |
-| `benchmark.threshold_objective` | `"f1"` | Legacy, written from `goal` (its tuning objective) so an older version reads the file; read only from a file without `goal`, and `--threshold-objective` / the page's objective select map onto the goal (an objective becomes `optimize_for`, or `tune_for` of a rank-only goal). Values: `f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>` (false alerts per 100 empty frames), `youden`, `fpr:<x>`. UI: yes |
+| `benchmark.threshold_objective` | `"f1"` | Legacy, written from `goal` (its tuning objective, as the nearest one release 0.2.0 parses: `f05` and `recall_at_fa:<N>` are written as `f1`) so an older version reads the file; read only from a file without `goal`, and `--threshold-objective` / the page's objective select map onto the goal (an objective becomes `optimize_for`, or `tune_for` of a rank-only goal). Values: `f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>` (false alerts per 100 empty frames), `youden`, `fpr:<x>`. UI: yes |
 | `benchmark.accuracy_metric` | `"ap50"` | Legacy, written from `goal` (`roc_auc` for a ROC AUC goal, else `ap50`); read only from a file without `goal`, and `--accuracy-metric` maps onto it (`roc_auc` = a ROC AUC goal, `ap50` turns one back into its objective). Still the metric of the A-F accuracy grade and the device recommendation's accuracy tie. UI: yes |
 
 All of them apply at once: they are read when a benchmark starts.
@@ -981,7 +1034,7 @@ address. Every page below needs a sign-in:
 | `/stats` | Per-model state, runtime, device, CPU fallback, requests, dropped, queue, inference/process/round-trip avg/min/max; updates in place every 5 s from `/stats.json` |
 | `/test` | Pick, drop or paste an image, choose a model and `min_confidence`; the page posts to `/v1/vision/custom/{model}` and draws the boxes client-side, with a detections table and the raw JSON (same code path and metrics as the API, but uploads never enter the dataset; without JavaScript the form posts to `/test` and the server draws the image) |
 | `/config` | Models card (which models load, the default model, device and threshold per model; **Save** applies at once), Resources, server/inference/logging settings with "applies now" / "needs restart" tags and the `models` list as JSON under *Advanced*; **Restart server** reloads the file and recompiles the enabled models without restarting the process; the listener stays up and the old models answer until the new ones are swapped in (a `port` or `log_path` change needs a process restart) |
-| `/benchmark` | Three steps at their own addresses (`/benchmark` opens Compare once results exist, else Run): **Run** (`/benchmark/run`: Your cameras first, built-in sets with their download, folders; models; devices with the CPU reference ticked for you when two or more devices and no CPU are ticked; options; estimate; progress per model and device, Cancel), **Compare** (`/benchmark/compare`: every model on every device ranked for the goal with intervals, chips, optional columns, details, the scatter of the goal metric against p95, Day / Night / IR, Classes, Cameras and Speed, Save report, Download CSV), **Tune & save** (`/benchmark/tune`: the confidence curve and slider, the suggested value, the misses and false alerts at it, Save per device with Undo, Save all); **History** (`/benchmark/history`: runs, pin, delete, A/B, trend) and **Images** (`/benchmark/images`: every scored frame with its boxes, filters, Open in Review). The goal chip on every step opens the Goal dialog (try without saving, or save) |
+| `/benchmark` | Three steps at their own addresses (`/benchmark` opens Compare once results exist, else Run): **Run** (`/benchmark/run`: Your cameras first, built-in sets with their download, folders; models; devices with the CPU reference ticked for you when two or more devices and no CPU are ticked; options (the burst test among them, off by default); estimate; progress per model and device, Cancel), **Compare** (`/benchmark/compare`: every model on every device ranked for the goal with intervals, chips, optional columns, details, the scatter of the goal metric against p95, Day / Night / IR, Classes, Cameras and Speed, Save report, Download CSV), **Tune & save** (`/benchmark/tune`: the confidence curve and slider, the suggested value, the misses and false alerts at it, Save per device with Undo, Save all); **History** (`/benchmark/history`: runs, pin, delete, A/B, trend) and **Images** (`/benchmark/images`: every scored frame with its boxes, filters, Open in Review). The goal chip on every step opens the Goal dialog (try without saving, or save) |
 | `/train` | The Train area: one entry with eight tabs at their own URLs (the last, Jobs, lists every running and queued job with its step, percent, time left and a link to it: imports, auto-label runs, overlap and dataset checks and training runs on the queue, and beside it dataset exports, X-AnyLabeling imports, a benchmark run and model exports), a status strip (frames collected, to review, reviewed, exports, runs, models) and one suggested next action (`GET /v1/train/summary`). `/train` opens the most useful tab. The old `/dataset`, `/review` and `/training` redirect to Collect, Review and Train and keep their query string |
 | `/train/collect` | Dataset collector (`collect`): on/off and the caps (applied at once), with per-bucket toggles, rates, intervals, near-threshold margin and dHash distance under Advanced; frames per detected class and per camera, disk use, the newest frames per bucket with their sidecars, and **Send to review** (appends the ticked frames to `review-queue.jsonl`). Collection stops on its own on low disk space or a full disk; **Resume** re-arms it |
 | `/train/import` | Import footage (videos, Blue Iris folders, a URL, pinned MEVA clips), optionally auto-labelling the new frames, with the Jobs card |
@@ -1506,12 +1559,12 @@ The container's health check polls `/v1/status` (`docker ps` shows `healthy` onc
 | GET | `/v1/training/switch-preview?id=` | What **Use as default** of a run would change (settings, classes, what copies, the suggested threshold, the comparison with the current default); saves nothing |
 | POST | `/training/cancel`, `/training/finish`, `/training/remove`, `/training/retry-export`, `/training/use`, `/training/revert`, `/training/datasets`, `/training/remove-env` | `id`: cancel a run; finish it after the current epoch keeping the best checkpoint; forget a finished one (`delete_files` also deletes its folder); export a failed run's best checkpoint; `id` + `role` (`default`, `night`, `verify`) + `target`: use a trained model (default: `copy`, `use_threshold`, `expect_current`; verifier: `replace_verifier`); no field, or `forget=1`: undo the last default switch, or drop its record; `add` / `remove`: a `training.datasets` folder; delete the training environment |
 | GET | `/v1/benchmark` | benchmark state, progress (ETA), partial results of a running benchmark, the saved results (`benchmark.json` without per-image details), model ranking (`ranking` and `points` in the goal's order on the default Compare set), per-model devices, `labelsChanged` (Your cameras: `{frames, changed, left, joined}` since the run's labels snapshot, `{frames: null, computing: true}` before the first count, `folderMissing`; `null` without a snapshot), `goal` (the saved goal as the views name it). `?only=run` answers the run alone (`run` with `progress`, `request` and this run's `models`, `viewTag`, `modelsTag`, `labelsChanged`): what the Benchmark pages poll |
-| GET | `/v1/benchmark/compare?set=&scene=&goal=&tune_for=&classes=&budget=` | every combo (model x device) on one compare set (default: the one most models share; `sets` lists them), judged for the goal: `rows` best first (`metric` `{value, low, high}`, `rank`, `block` `ok`/`too_slow`/`unmet`/`unfair`, `vsLeader`, recall, precision, F1/F2/F0.5, `fa100`, TPR/FPR, AP50, AP50-95, ROC AUC, grade, `confidence` (suggested), `plateau`, `pickInformative`, `target`, `servedThreshold`, `speed` (p50/p95/p99, stages, `burstP95Ms`, `firstLoad`), `agreement`, `flags` (`tooSlow`, `unmet`, `trainedHere`, `relative`, `served`, `staleRules`, `lowConfidence`, `liveLoad`, `videoDecode`, `flat`), `scenes`, `classes`, `cameras`), `headline`, `set` (frames, `framesLeftOut`, `leftOutBy`, counted `classes`, `ignoredClasses`, `groups`, `run`), `missing` (models not on the set, why, `device`, `blocked`). `goal=` etc. try a goal without saving it; `scene=day\|night\|ir`. Cached per files, config revision and query |
+| GET | `/v1/benchmark/compare?set=&scene=&goal=&tune_for=&classes=&budget=` | every combo (model x device) on one compare set (default: the one most models share; `sets` lists them), judged for the goal: `rows` best first (`metric` `{value, low, high}`, `rank`, `block` `ok`/`too_slow`/`unmet`/`unfair`, `vsLeader`, `vsBest`, recall, precision, F1/F2/F0.5, `fa100`, TPR/FPR, AP50, AP50-95, ROC AUC, grade, `confidence` (suggested), `plateau`, `pickInformative`, `target`, `servedThreshold`, `speed` (p50/p95/p99, stages, `burstP95Ms`, `burst` (the burst test: load, request p50/p95/p99, `lastAnswerP50Ms`/`lastAnswerP95Ms`, `refused`, `refusedBy`, `maxQueueDepth`, `error`), `firstLoad`), `agreement`, `flags` (`tooSlow`, `unmet`, `trainedHere`, `relative`, `served`, `staleRules`, `lowConfidence`, `liveLoad`, `videoDecode`, `flat`), `scenes`, `classes`, `cameras`), `headline`, `set` (frames, `framesLeftOut`, `leftOutBy`, counted `classes`, `ignoredClasses`, `groups`, `run`), `missing` (models not on the set, why, `device`, `blocked`). `goal=` etc. try a goal without saving it; `scene=day\|night\|ir`. Cached per files, config revision and query |
 | GET | `/v1/benchmark/tune?model=&device=&set=&goal=&tune_for=&classes=` | one combo: the 0.01 `grid` (threshold, tp/fp/fn, precision, recall, F1/F2/F0.5, FA/100, TPR/FPR, `score`, `bound`), `suggested` (`threshold`, `plateau`, `best`, `inSample`, `metric` with interval), `lowConfidence`, `pickInformative`, `target` (`met`, `bound`, `text`), `saved` (`threshold`, `source`: `profile for <device>`, `model`, `global`), `servedThreshold`, `relative`, `savable` / `notSavable`, `confirm`; 404 when the model has no stored predictions |
 | GET | `/v1/benchmark/tune/images?model=&device=&set=&threshold=&kind=miss\|fa\|all&camera=&scene=&offset=&limit=` | the frames for the Tune strips and the Images step at `threshold`, worst first (`miss`: most missed objects; `fa`: the most confident false positive; `all`: every frame, the most errors first), of one camera / scene when asked, from `offset`; each with `set`, `file`, `width`, `height`, `camera`, `scene`, `date`, `review` (Your cameras: the frame's id for `/train/review?frame=`), its labels (`ok` = matched) and predictions (`ok` = true positive); `total` before the page, `cameras` of the set; `limit` 1-200, default 24 |
 | POST | `/v1/benchmark/goal` | `optimize_for` (or `goal`), `tune_for`, `classes` (`all` = none), `speed_budget_ms` (or `budget`, `none` = no budget); absent fields keep their value. Validates, saves `benchmark.goal` (and the legacy keys) and answers `goal` and the new `ranking` on the default set; 400 on a bad value |
-| POST | `/v1/benchmark/rescore` | Your cameras: score the stored predictions against the current labels (no inference) and replace `benchmark-gt.json`; `{success, rescored: {models, runs, frames, changes, needRun, notRescored}}`; 409 while a benchmark runs, 503 `folder_missing`, 422 without a run on the set |
-| POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight` |
+| POST | `/v1/benchmark/rescore` | Your cameras: score the stored predictions against the current labels (no inference) and replace `benchmark-gt.json`; `{success, rescored: {models, runs, frames, changes, needRun, notRescored, unknown}}`; 409 while a benchmark runs and when the folder under review or the class list changed since the run (run it again), 503 `folder_missing`, 422 without a run on the set. A run's start (`POST /v1/benchmark`) answers 409 while a Re-score runs |
+| POST | `/v1/benchmark` | start (202; 409 while one runs); form fields, all optional with the `benchmark` config as default: `model`, `device`, `dataset` (repeated), `max_images`, `repeat`, `warmup`, `reference_model`, `accuracy_weight`, `low_priority`, `served`, `burst` (1/0) with `burst_cameras`, `burst_images`, `burst_interval_ms` (`benchmark.burst`'s ranges; also saved by `POST /v1/benchmark/settings`) |
 | POST | `/v1/benchmark/cancel`, `/v1/benchmark/settings` | cancel; save the form fields as the `benchmark` config defaults |
 | POST | `/v1/benchmark/datasets/remove` | `dataset`: the saved folder dataset to drop from `benchmark.datasets` (e.g. `dir:/srv/alerts`; the list may end up empty); 404 for a built-in id or a folder that is not saved |
 | POST | `/v1/benchmark/report` | `dir`: write the HTML report of the saved results there as `benchmark-report-<YYYYMMDD-HHMMSS>.html`, wall time in `timezone` (folder inside the browsable folders or natively picked); `{success, path}`, 404 without results |
@@ -1677,8 +1730,10 @@ for throwaway test servers only).
   and under-reports compute work; look at the *Compute_0* / *3D* engine graphs or `nvidia-smi dmon -s u`.
   The server runs two ONNX Runtime sessions per model on a discrete GPU (`ort_sessions`) so one request's
   compute overlaps the other's copy and NMS; Blue Iris sends one request per trigger, so 100 % is not
-  expected, and the benchmark measures latency one request at a time by design (compiled with the
-  same sessions and in-flight requests as the service, `tuning` in its results). On an Intel iGPU
+  expected, and the benchmark's timed runs measure latency one request at a time by design (compiled
+  with the same sessions and in-flight requests as the service, `tuning` in its results); the
+  optional burst test (`benchmark.burst`, `--burst`) measures it under several cameras at once,
+  queue wait included. On an Intel iGPU
   Blue Iris' Quick Sync decode runs on the same GPU (the *Video Decode* engine in Task Manager): a
   benchmark on Windows records that engine's load during each device's run and says so beside the
   numbers when it was busy.

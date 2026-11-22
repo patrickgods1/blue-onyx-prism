@@ -14,7 +14,10 @@
   var q = new URLSearchParams(location.search);
   var st = {model: q.get("model") || "", device: q.get("device") || "", set: q.get("set") || "", threshold: parseFloat(q.get("threshold")),
     kind: q.get("kind") || "miss", camera: q.get("camera") || "all", scene: q.get("scene") || "all", other: q.get("other") || "",
-    compare: null, offset: 0, frames: [], total: 0, dis: null, ctl: null};
+    compare: null, offset: 0, frames: [], total: 0, dis: null};
+  // One frames request (or "disagrees with" walk) and one Compare request at a time: the latest
+  // choice wins (BenchCore.latest).
+  var frameLoads = BC.latest(), compareLoads = BC.latest();
   if (["miss", "fa", "all", "dis"].indexOf(st.kind) < 0) st.kind = "miss";
   if (st.kind === "fp") st.kind = "fa";
   $("i-kind").value = st.kind; $("i-scene").value = ["all", "day", "night", "ir"].indexOf(st.scene) >= 0 ? st.scene : "all";
@@ -67,18 +70,18 @@
   function base() { return {model: st.model, device: st.device, set: st.set, threshold: st.threshold.toFixed(2), camera: st.camera, scene: st.scene}; }
   function fetchPage(o, signal) { return PB.getJSON(api(o), signal ? {signal: signal} : {}); }
   function load(append) {
-    if (!st.model || !BC.has(st.threshold)) return;
-    if (st.ctl) st.ctl.abort();
-    var ctl = window.AbortController ? new AbortController() : null; st.ctl = ctl;
-    var signal = ctl && ctl.signal, grid = $("i-grid");
+    if (!st.model || !BC.has(st.threshold)) { $("i-grid").removeAttribute("aria-busy"); return; }
+    var t = frameLoads.begin(), signal = t.init.signal, grid = $("i-grid");
     err(""); remember();
     if (!append) { st.offset = 0; grid.setAttribute("aria-busy", "true"); if (!grid.children.length) grid.replaceChildren(el("span", {class: "bn-skel tall"})); }
     $("i-more").disabled = true;
-    var done = function () { st.ctl = null; grid.removeAttribute("aria-busy"); $("i-more").disabled = false; };
+    var done = function () { grid.removeAttribute("aria-busy"); $("i-more").disabled = false; };
+    // A failure: the error, and no skeleton left in the grid.
+    var failed = function (j) { done(); err(((j && j.message) || "The frames did not load.") + " Change a filter or reload the page."); if (grid.firstChild && /\bbn-skel\b/.test(grid.firstChild.className)) grid.replaceChildren(); };
     if (st.kind === "dis") {
-      if (append) { st.offset += PAGE; show(true); done(); return; }
+      if (append) { t.wins(null); st.offset += PAGE; show(true); done(); return; }
       var other = rowOf(st.other);
-      if (!other) { done(); grid.replaceChildren(el("p", {class: "bn-empty", text: "Only one combo ran on these images: nothing to disagree with."})); $("i-count").textContent = ""; return; }
+      if (!other) { t.wins(null); done(); grid.replaceChildren(el("p", {class: "bn-empty", text: "Only one combo ran on these images: nothing to disagree with."})); $("i-count").textContent = ""; return; }
       var all = function (o) {
         var out = [], total = null;
         var page = function (k) {
@@ -93,15 +96,16 @@
       };
       var o2 = Object.assign(base(), {model: other.model, device: other.device, threshold: (BC.has(other.confidence) ? other.confidence : st.threshold).toFixed(2)});
       Promise.all([all(base()), all(o2)]).then(function (r) {
-        st.dis = BC.disagree(r[0], r[1]); st.offset = PAGE; done(); show(false);
-      }, function (j) { if (j && j.aborted) return; done(); err((j && j.message || "The frames did not load.") + " Change a filter or reload the page."); });
+        if (!t.wins(null)) return;
+        st.dis = BC.disagree(r[0], r[1]); st.offset = PAGE; done(); err(""); show(false);
+      }, function (j) { if (!t.wins(j)) return; failed(j); });
       return;
     }
     var o = Object.assign(base(), {kind: st.kind, offset: append ? st.frames.length : 0, limit: PAGE});
     fetchPage(o, signal).then(function (j) {
-      if (j.aborted) return;
-      done();
-      if (!j.success) { err((j.message || "The frames did not load.") + " Change a filter or reload the page."); grid.replaceChildren(); return; }
+      if (!t.wins(j)) return; // a newer choice took its place
+      if (!j.success) { failed(j); if (!append) grid.replaceChildren(); return; }
+      done(); err("");
       cameras(j.images.cameras);
       st.total = j.images.total; st.lastPage = j.images.frames.length;
       st.frames = append ? st.frames.concat(j.images.frames) : j.images.frames;
@@ -109,8 +113,15 @@
     });
   }
   function start() {
-    PB.getJSON(S.withGoal("/v1/benchmark/compare" + (st.set ? "?set=" + encodeURIComponent(st.set) : ""))).then(function (j) {
-      if (!j.success) { err(j._status === 404 ? "No results yet: run a benchmark first (step 1)." : (j.message || "The results did not load.") + " Reload the page."); return; }
+    var t = compareLoads.begin();
+    $("i-grid").setAttribute("aria-busy", "true"); // until the set's frames show
+    PB.getJSON(S.withGoal("/v1/benchmark/compare" + (st.set ? "?set=" + encodeURIComponent(st.set) : "")), t.init).then(function (j) {
+      if (!t.wins(j)) return; // a newer set took its place
+      if (!j.success) {
+        $("i-grid").removeAttribute("aria-busy");
+        err(j._status === 404 ? "No results yet: run a benchmark first (step 1)." : (j.message || "The results did not load.") + " Reload the page.");
+        return;
+      }
       st.compare = j.compare; S.setGoal(j.compare.goal);
       if (!st.set && j.compare.set) st.set = j.compare.set.id;
       S.setSet(st.set);
@@ -122,7 +133,8 @@
     });
   }
   $("i-combo").addEventListener("change", function (e) { var r = rowOf(e.target.value); if (!r) return; st.model = r.model; st.device = r.device; if (BC.has(r.confidence)) st.threshold = r.confidence; renderSelects(); load(false); });
-  $("i-set").addEventListener("change", function (e) { st.set = e.target.value; st.camera = "all"; start(); });
+  // A set change: the frames in flight are of the set before.
+  $("i-set").addEventListener("change", function (e) { st.set = e.target.value; st.camera = "all"; frameLoads.stop(); start(); });
   var thrTimer = null;
   $("i-thr").addEventListener("input", function (e) {
     var v = parseFloat(e.target.value);

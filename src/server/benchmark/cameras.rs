@@ -95,12 +95,39 @@ pub(super) fn dataset_row(c: &Config, checked: bool) -> DatasetRow {
 /// the source): the snapshot (MBs of labels) is parsed only when one of them changes.
 static LAST: Mutex<Option<(String, Arc<RawValue>)>> = Mutex::new(None);
 
+/// The snapshot identity the saved results recorded for Your cameras and its frame count, read
+/// without loading the results (None: no such set).
+fn recorded_snapshot(results: &std::path::Path) -> Option<(Option<snapshot::SnapshotId>, usize)> {
+    #[derive(serde::Deserialize)]
+    struct Set {
+        id: String,
+        #[serde(default)]
+        snapshot: Option<snapshot::SnapshotId>,
+        #[serde(default)]
+        images: Vec<serde::de::IgnoredAny>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Head {
+        #[serde(default)]
+        image_sets: Vec<Set>,
+    }
+    let bytes = std::fs::read(results).ok()?;
+    let head: Head = serde_json::from_slice(&bytes).ok()?;
+    head.image_sets
+        .into_iter()
+        .find(|s| s.id == ID)
+        .map(|s| (s.snapshot, s.images.len()))
+}
+
 /// `labelsChanged` of `GET /v1/benchmark`: `null` without a snapshot; else `{frames, changed,
-/// left, joined}` ([`snapshot::Changes`]) from the last walk, `{frames: null, computing: true}`
-/// before the first one, `{frames: null, folderMissing: true, message}` when the folder cannot be
-/// read. Never waits for a walk.
+/// left, joined, unknown}` ([`snapshot::Changes`]) from the last walk, `{frames: null, computing:
+/// true}` before the first one, `{frames: null, folderMissing: true, message}` when the folder
+/// cannot be read. When the snapshot is not the one the results were saved with
+/// ([`snapshot::mismatch`]): `stale: true` and the `message`, `frames` at least the set's frames,
+/// so the page offers a Re-score. Never waits for a walk.
 pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
-    let gt = snapshot::path_beside(&results_path(&state.config_path));
+    let results = results_path(&state.config_path);
+    let gt = snapshot::path_beside(&results);
     let stamp = super::file_stamp(&gt);
     if stamp.is_none() {
         return RawValue::NULL.to_owned().into();
@@ -108,8 +135,9 @@ pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
     let src = Source::of(c);
     let current = live::peek(&src);
     let key = format!(
-        "{}|{stamp:?}|{}|{:?}",
+        "{}|{stamp:?}|{:?}|{}|{:?}",
         gt.display(),
+        super::file_stamp(&results),
         src.key(),
         current.as_ref().map(|c| c.at)
     );
@@ -123,14 +151,26 @@ pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
         Some(Found::Missing(why)) => {
             serde_json::json!({ "frames": null, "folderMissing": true, "message": why })
         }
-        Some(found) => match GtSnapshot::load(&gt) {
-            Ok(Some(snap)) => {
+        Some(found) => match GtSnapshot::load_with_id(&gt) {
+            Ok(Some((snap, id))) => {
                 let empty = std::collections::BTreeMap::new();
                 let now = match found {
                     Found::Ready { reviewed, .. } => reviewed,
                     _ => &empty,
                 };
-                serde_json::to_value(snapshot::changes(&snap, now)).unwrap_or_default()
+                let mut changes = snapshot::changes(&snap, now);
+                let stale = recorded_snapshot(&results).and_then(|(recorded, frames)| {
+                    snapshot::mismatch(recorded.as_ref(), &id).map(|why| (why, frames))
+                });
+                if let Some((_, frames)) = &stale {
+                    changes.frames = changes.frames.max(*frames);
+                }
+                let mut v = serde_json::to_value(changes).unwrap_or_default();
+                if let (Some((why, _)), Some(o)) = (stale, v.as_object_mut()) {
+                    o.insert("stale".into(), true.into());
+                    o.insert("message".into(), why.into());
+                }
+                v
             }
             Ok(None) => serde_json::Value::Null,
             Err(e) => serde_json::json!({ "frames": null, "message": format!("{e:#}") }),
@@ -143,10 +183,22 @@ pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
 
 /// `POST /v1/benchmark/rescore`: the stored predictions of Your cameras scored against the
 /// labels now, no inference ([`crate::benchmark::cameras::rescore`]); the snapshot is replaced.
-/// 409 while a benchmark runs; 503 `folder_missing` when the review folder cannot be read.
+/// Under the results lock as a Re-score (a run's start answers 409 meanwhile). 409 while a
+/// benchmark runs (checked under the lock) and when the snapshot is of another folder or class
+/// list (run the benchmark again); 503 `folder_missing` when the review folder cannot be read.
 pub(in crate::server) async fn rescore(State(state): State<Arc<AppState>>) -> Response {
     crate::server::blocking(move || {
-        if state.benchmark.status().running {
+        let path = results_path(&state.config_path);
+        let held = match crate::benchmark::results_io::lock(
+            &path,
+            crate::benchmark::results_io::Holder::Rescore,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                return json_error(StatusCode::CONFLICT, format!("Not re-scored: {e:#}"));
+            }
+        };
+        if state.benchmark.is_running() {
             return json_error(
                 StatusCode::CONFLICT,
                 "a benchmark is running; re-score once it has finished".into(),
@@ -163,15 +215,17 @@ pub(in crate::server) async fn rescore(State(state): State<Arc<AppState>>) -> Re
             )
                 .into_response();
         }
-        let path = results_path(&state.config_path);
         let preds = crate::benchmark::search::preds_path(&state.config_path);
-        match crate::benchmark::cameras::rescore::rescore(&cfg, &path, &preds) {
+        let done = crate::benchmark::cameras::rescore::rescore_locked(&held, &cfg, &path, &preds);
+        drop(held);
+        match done {
             Ok(r) => {
                 tracing::info!(
                     runs = r.runs,
                     frames = r.frames,
                     changed = r.changes.changed,
                     left = r.changes.left,
+                    unknown = r.unknown.len(),
                     need_run = r.need_run,
                     "benchmark: {TITLE} re-scored against the current labels"
                 );
@@ -180,7 +234,13 @@ pub(in crate::server) async fn rescore(State(state): State<Arc<AppState>>) -> Re
                 Json(serde_json::json!({ "success": true, "rescored": r })).into_response()
             }
             Err(e) => json_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
+                if e.downcast_ref::<crate::benchmark::cameras::rescore::SourceChanged>()
+                    .is_some()
+                {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
                 format!("Not re-scored: {e:#}"),
             ),
         }
@@ -214,15 +274,19 @@ mod tests {
         let l = ready(crate::benchmark::cameras::load(&src));
         let (results, m) = scored_results(&l.set);
         let path = results_path(&st.config_path);
-        crate::benchmark::cameras::write_snapshot(
+        let id = crate::benchmark::cameras::write_snapshot(
             &path,
             std::slice::from_ref(&l.set),
             Some(&CamerasLoaded {
                 source: src.clone(),
                 reviewed: l.reviewed.clone(),
             }),
+            None,
         )
+        .unwrap()
         .unwrap();
+        let mut results = results;
+        crate::benchmark::cameras::snapshot::stamp(&mut results, &id);
         results.save(&path).unwrap();
         crate::benchmark::search::StoredPreds::merge(None, &results, &[m])
             .save(&crate::benchmark::search::preds_path(&st.config_path))
@@ -284,6 +348,58 @@ mod tests {
         let (_, v) = call(&st, get("/v1/benchmark")).await;
         assert_eq!(
             v["labelsChanged"]["folderMissing"], true,
+            "{}",
+            v["labelsChanged"]
+        );
+    }
+
+    /// D2: a run does not start while a Re-score holds the saved results (and a Re-score checks
+    /// for a run under the same lock).
+    #[tokio::test]
+    async fn a_start_is_refused_while_a_rescore_holds_the_results() {
+        use crate::benchmark::results_io::{Holder, lock};
+        let st = st_with_classes();
+        seeded(&st);
+        let held = lock(&results_path(&st.config_path), Holder::Rescore).unwrap();
+        let (s, v) = call(&st, post("/v1/benchmark", "dataset=sample")).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("re-scored"),
+            "{v}"
+        );
+        assert!(!st.benchmark.is_running());
+        drop(held);
+    }
+
+    /// D3: results whose snapshot was replaced without them (an interrupted save) are reported
+    /// stale through `labelsChanged`, so the page offers a Re-score, which clears it.
+    #[tokio::test]
+    async fn a_snapshot_the_results_were_not_saved_with_is_reported_stale() {
+        let st = st_with_classes();
+        seeded(&st);
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert!(
+            v["labelsChanged"].get("stale").is_none(),
+            "{}",
+            v["labelsChanged"]
+        );
+        let gt = snapshot::path_beside(&results_path(&st.config_path));
+        let mut snap = GtSnapshot::load(&gt).unwrap().unwrap();
+        snap.created = "2030-01-01T00:00:00Z".into();
+        snap.save(&gt).unwrap();
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        let c = &v["labelsChanged"];
+        assert_eq!(c["stale"], true, "{c}");
+        assert_eq!(c["frames"], 2, "{c}");
+        assert!(c["message"].as_str().unwrap().contains("Re-score"), "{c}");
+        let (s, v) = call(&st, post("/v1/benchmark/rescore", "")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = call(&st, get("/v1/benchmark")).await;
+        assert!(
+            v["labelsChanged"].get("stale").is_none(),
             "{}",
             v["labelsChanged"]
         );
