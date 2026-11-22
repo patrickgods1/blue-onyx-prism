@@ -90,6 +90,9 @@ struct SpotSlot {
     /// When it was built (or a build of it last failed).
     at: Instant,
     table: Arc<statics::Table>,
+    /// Dropped by a rescan ([`forget_spots`]), or built from files read before one: due without
+    /// waiting its interval, once its rows changed (or at once without an index).
+    forgotten: bool,
 }
 
 /// Keys kept at once (folders and class lists): one is in use, the others are switches back.
@@ -101,6 +104,8 @@ struct Slots {
     building: bool,
     /// The latest build asked for while one ran.
     queued: Option<Job>,
+    /// Bumped by [`forget_spots`]: a build that began before keeps its table forgotten.
+    epoch: u64,
 }
 
 impl Slots {
@@ -117,6 +122,7 @@ impl Slots {
                 stamp,
                 at: Instant::now(),
                 table,
+                forgotten: false,
             },
         );
         while self.slots.len() > SLOTS {
@@ -136,8 +142,27 @@ impl Slots {
     fn ask(&self, job: &Job, every: Duration) -> (Arc<statics::Table>, bool) {
         let slot = self.slots.get(&job.key);
         let table = slot.map(|s| s.table.clone()).unwrap_or_default();
-        let due = refresh_due(slot.map(|s| (s.stamp, s.at.elapsed())), job.stamp, every);
+        // A forgotten table is as old as can be: due when its rows changed, or without rows.
+        let age = |s: &SpotSlot| {
+            if s.forgotten {
+                Duration::MAX
+            } else {
+                s.at.elapsed()
+            }
+        };
+        let due = refresh_due(slot.map(|s| (s.stamp, age(s))), job.stamp, every);
         (table, due)
+    }
+
+    /// Forget the tables of the folder `dir` ([`forget_spots`]).
+    fn forget(&mut self, dir: &Path) {
+        self.epoch = self.epoch.wrapping_add(1);
+        let prefix = format!("{}\u{1f}", dir.display());
+        for (key, slot) in &mut self.slots {
+            if key.starts_with(&prefix) {
+                slot.forgotten = true;
+            }
+        }
     }
 }
 
@@ -190,6 +215,7 @@ impl Drop for Building<'_> {
                         stamp: None,
                         at: Instant::now(),
                         table: Arc::default(),
+                        forgotten: false,
                     },
                 );
             }
@@ -233,11 +259,22 @@ impl SpotCache {
                 key: job.key.clone(),
                 done: false,
             };
+            let epoch = self
+                .slots
+                .lock_recover()
+                .get_or_insert_with(Slots::default)
+                .epoch;
             let (stamp, table) = build(&job);
             let next = {
                 let mut g = self.slots.lock_recover();
                 let s = g.get_or_insert_with(Slots::default);
                 s.store(&job.key, stamp, table);
+                if s.epoch != epoch
+                    && let Some(slot) = s.slots.get_mut(&job.key)
+                {
+                    // A rescan during the build: what it read may be from before.
+                    slot.forgotten = true;
+                }
                 let next = s.queued.take().filter(|q| *q != job);
                 if next.is_none() {
                     s.building = false;
@@ -274,6 +311,14 @@ impl SpotCache {
                 .store(&job.key, stamp, table);
         }
         self.table_of(&job.key).unwrap_or_default()
+    }
+
+    /// Forget the tables of `dir` ([`forget_spots`]).
+    fn forget(&self, dir: &Path) {
+        self.slots
+            .lock_recover()
+            .get_or_insert_with(Slots::default)
+            .forget(dir);
     }
 
     /// The table last built for `key`, if any.
@@ -315,6 +360,14 @@ pub(super) fn build(job: &Job) -> (Option<u64>, statics::Table) {
 }
 
 static SPOTS: SpotCache = SpotCache::new();
+
+/// The folder `dir` was rescanned: its spot tables are due again without waiting their
+/// interval: a walked folder's at the next Next, an indexed one's once the index's walk of
+/// everything changed its rows. Each keeps serving its table until the new one is in; a build
+/// running now stores what it found, still due ([`SpotSlot::forgotten`]).
+pub(super) fn forget_spots(dir: &Path) {
+    SPOTS.forget(dir);
+}
 
 /// The job of `dir` and the class list now.
 fn job_of(dir: &Path, classes: &[String], hidden: &[String]) -> Job {
@@ -840,6 +893,45 @@ mod tests {
             cache.run(due.unwrap(), &|_| (None, table("cam", 1)));
         }
         assert!(cache.table_of("b").is_none() && cache.table_of("f").is_some());
+    }
+
+    /// A rescan ([`forget_spots`]) makes the folder's tables due without their interval, the old
+    /// table serving meanwhile; a build it overtook stores its table still due; other folders'
+    /// tables are left alone; an indexed table waits for its rows to change.
+    #[test]
+    fn a_rescan_makes_its_folders_tables_due_and_a_build_it_overtook_stays_due() {
+        let cache = SpotCache::new();
+        let (dir, other) = (PathBuf::from("/rescanned"), PathBuf::from("/other"));
+        let key = |d: &Path| format!("{}\u{1f}car\u{1f}", d.display());
+        let job = |d: &Path, stamp: Option<u64>| job_for(d, &key(d), stamp);
+        let every = Duration::from_secs(3600);
+        for d in [&dir, &other] {
+            let (_, due) = cache.get(job(d, None), every);
+            cache.run(due.unwrap(), &|j| (j.stamp, table("cam", 1)));
+        }
+        assert!(cache.get(job(&dir, None), every).1.is_none(), "fresh");
+        cache.forget(&dir);
+        let (t, due) = cache.get(job(&dir, None), every);
+        assert_eq!(t.len(), 1, "the old table serves");
+        assert!(
+            cache.get(job(&other, None), every).1.is_none(),
+            "other folder"
+        );
+        // A rescan while that build runs: its table is in, and due again.
+        cache.run(due.unwrap(), &|j| {
+            cache.forget(&dir);
+            (j.stamp, table("cam", 2))
+        });
+        assert_eq!(cache.table_of(&key(&dir)).unwrap().len(), 2);
+        let (_, due) = cache.get(job(&dir, None), every);
+        cache.run(due.unwrap(), &|j| (j.stamp, table("cam", 2)));
+        assert!(cache.get(job(&dir, None), every).1.is_none(), "built after");
+        // Indexed: the same rows make the same table; changed rows are due at once.
+        let (_, due) = cache.get(job(&dir, Some(5)), Duration::ZERO);
+        cache.run(due.unwrap(), &|j| (j.stamp, table("cam", 2)));
+        cache.forget(&dir);
+        assert!(cache.get(job(&dir, Some(5)), every).1.is_none());
+        assert!(cache.get(job(&dir, Some(6)), every).1.is_some());
     }
 
     #[test]

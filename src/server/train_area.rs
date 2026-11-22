@@ -536,6 +536,9 @@ struct Kept {
     done: Option<(Instant, Duration, Walked)>,
     /// A walk is running.
     walking: bool,
+    /// Dropped by a rescan ([`forget_tally`]): what is kept is not fresh, whatever its age, until
+    /// a walk that started after the drop is in.
+    redo: bool,
 }
 
 /// The walks, per folder: the review folder, and few others over a process's life.
@@ -674,12 +677,14 @@ pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
 pub(super) fn walked_of(dir: &Path, wait: Duration) -> Option<Walked> {
     let mut kept = KEPT.lock_recover();
     let k = kept.entry(dir.to_path_buf()).or_default();
-    let fresh = k
-        .done
-        .as_ref()
-        .is_some_and(|(at, took, _)| at.elapsed() < keep_for(*took));
+    let fresh = !k.redo
+        && k.done
+            .as_ref()
+            .is_some_and(|(at, took, _)| at.elapsed() < keep_for(*took));
     if !fresh && !k.walking {
         k.walking = true;
+        // Under the lock and before the walk reads a file: a drop after this redoes it again.
+        k.redo = false;
         let dir = dir.to_path_buf();
         std::thread::spawn(move || {
             crate::backend::priority::lower_this_thread(
@@ -706,6 +711,15 @@ pub(super) fn walked_of(dir: &Path, wait: Duration) -> Option<Walked> {
             .wait_timeout(kept, left)
             .unwrap_or_else(|e| e.into_inner())
             .0;
+    }
+}
+
+/// The folder `dir` was rescanned: the next ask walks it again. What is kept still answers
+/// meanwhile, as when it is old; a walk running now stores its answer, which is not fresh (it may
+/// have read the files before), so the ask after it walks again. No thread is started here.
+pub(super) fn forget_tally(dir: &Path) {
+    if let Some(k) = KEPT.lock_recover().get_mut(dir) {
+        k.redo = true;
     }
 }
 
@@ -2203,10 +2217,69 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &stale));
     }
 
+    /// A rescan: the kept answer still serves at once, a new walk starts; one running at the
+    /// drop is not taken as fresh.
+    #[test]
+    fn a_forgotten_tally_is_walked_again_and_serves_meanwhile() {
+        let dir = scratch();
+        let first = tally_of(&dir, Duration::from_secs(60)).unwrap();
+        forget_tally(&dir);
+        let served = tally_of(&dir, Duration::ZERO).unwrap();
+        assert!(Arc::ptr_eq(&first, &served), "served while the walk runs");
+        let walk_in = |was: &Arc<Tally>| {
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                {
+                    let kept = KEPT.lock_recover();
+                    let k = kept.get(&dir).unwrap();
+                    let now = k.done.as_ref().map(|d| d.2.0.clone()).unwrap();
+                    if !k.walking && !Arc::ptr_eq(&now, was) {
+                        return now;
+                    }
+                }
+                assert!(Instant::now() < until, "no new walk");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let second = walk_in(&first);
+        // A drop while a walk runs: its answer lands, and is not fresh.
+        KEPT.lock_recover().get_mut(&dir).unwrap().walking = true;
+        forget_tally(&dir);
+        KEPT.lock_recover().get_mut(&dir).unwrap().walking = false;
+        tally_of(&dir, Duration::ZERO).unwrap();
+        let third = walk_in(&second);
+        // Walked after the drop: fresh, kept.
+        let again = tally_of(&dir, Duration::ZERO).unwrap();
+        assert!(Arc::ptr_eq(&third, &again));
+    }
+
     #[test]
     fn slow_walks_are_kept_longer() {
         assert_eq!(keep_for(Duration::from_millis(5)), Duration::from_secs(10));
         assert_eq!(keep_for(Duration::from_secs(3)), Duration::from_secs(60));
+    }
+
+    /// Rescan folder sits in the folder form, after its submit button, as a plain button (Enter
+    /// in the path still submits "Review this folder"), with no inline handler or style.
+    #[tokio::test]
+    async fn the_review_tab_has_its_rescan_button_in_the_folder_form() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let (_, html) = get_text(&state, "/train/review").await;
+        let form = html
+            .find("<form id=\"rv-folder\"")
+            .expect("the folder form");
+        let end = form + html[form..].find("</form>").unwrap();
+        let button = html.find("id=\"rv-rescan\"").expect("the rescan button");
+        assert!(form < button && button < end, "inside #rv-folder");
+        assert_eq!(html.matches("id=\"rv-rescan\"").count(), 1);
+        let submit = form + html[form..end].find("type=\"submit\"").unwrap();
+        assert!(submit < button, "after the submit button");
+        let open = html[..button].rfind('<').unwrap();
+        let tag = &html[open..button + html[button..].find('>').unwrap()];
+        assert!(tag.starts_with("<button type=\"button\""), "{tag}");
+        assert!(!tag.contains(" on") && !tag.contains("style="), "{tag}");
+        assert!(html[button..end].contains(">Rescan folder</button>"));
     }
 
     #[tokio::test]

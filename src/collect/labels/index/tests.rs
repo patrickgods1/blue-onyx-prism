@@ -3661,4 +3661,174 @@ mod cases {
         assert_eq!(json(&a), walk(&dir, &f, None));
         assert!(json(&a).get("indexing").is_none());
     }
+
+    // ---- a requested walk of everything (`rescan`) ------------------------------------------
+
+    /// A frame of `rels` whose label file is there and reads, not skipped: an edit of it in place
+    /// changes no folder time and the answer.
+    fn edited_in_place(dir: &Path, rels: &[String]) -> Frame {
+        let frame = rels
+            .iter()
+            .filter_map(|r| Frame::resolve(dir, r))
+            .find(|f| {
+                f.record().is_ok()
+                    && f.labels()
+                        .is_ok_and(|l| l.is_some_and(|l| l.status != Status::Skipped))
+            })
+            .unwrap();
+        let skipped = LabelFile {
+            status: Status::Skipped,
+            disagreement: Some("edited in place".into()),
+            ..LabelFile::default()
+        };
+        std::fs::write(&frame.labels, serde_json::to_vec(&skipped).unwrap()).unwrap();
+        frame
+    }
+
+    #[test]
+    fn a_rescan_reads_the_in_place_edits_a_scan_misses() {
+        let dir = Dir::new();
+        // Nothing racy: a scan trusts the folder times, which an edit in place does not move.
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        let rels = generate(&dir, 89, 40, false);
+        let f = all_any();
+        from_index(&dir, &f, None);
+        let index = index_of(&dir).unwrap();
+        edited_in_place(&dir, &rels);
+        index.pass(Pass::Scan, &|| {});
+        assert_ne!(
+            json(&from_index(&dir, &f, None)),
+            walk(&dir, &f, None),
+            "a scan misses an edit in place"
+        );
+        in_place_edits(&dir, &mut Rng::new(89), &rels);
+        let walked = frames_walked(&dir);
+        assert!(super::super::rescan(&dir));
+        // The thread walks everything now (its minute's scan is far off); the query waits for it.
+        assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        let all = queue::candidates(&dir, QueueSource::All).len() as u64;
+        assert!(frames_walked(&dir) - walked >= all, "a walk of everything");
+        for f in [recommended_all(), recommended_default(), balance_all()] {
+            assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        }
+        assert!(
+            Arc::ptr_eq(&index, &index_of(&dir).unwrap()),
+            "the same index"
+        );
+    }
+
+    #[test]
+    fn a_rescan_shows_as_indexing_from_the_request_to_its_swap() {
+        let dir = Dir::new();
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        let rels = generate(&dir, 97, 20, false);
+        let f = all_any();
+        from_index(&dir, &f, None);
+        edited_in_place(&dir, &rels);
+        let hold = hold(&dir);
+        assert!(super::super::rescan(&dir));
+        // At once, whether the thread took the request yet or not: the rows are the old ones.
+        let first = super::super::answer(&dir, &f, None, None).unwrap();
+        assert!(first.indexing.is_some(), "{:?}", first.indexing);
+        assert!(hold.reached(), "the walk of everything starts at once");
+        let all = queue::candidates(&dir, QueueSource::All).len() as u64;
+        let during = super::super::answer(&dir, &f, None, None).unwrap();
+        assert_eq!(
+            during.indexing,
+            Some(Indexing {
+                done: 0,
+                total: all
+            })
+        );
+        // The old rows serve meanwhile: the edit is not in them yet.
+        let mut old = json(&during);
+        old.as_object_mut().unwrap().remove("indexing");
+        assert_ne!(old, walk(&dir, &f, None));
+        drop(hold);
+        let after = from_index(&dir, &f, None);
+        assert_eq!(json(&after), walk(&dir, &f, None));
+        assert!(json(&after).get("indexing").is_none());
+    }
+
+    /// Never `done == total` while a requested walk's swap is not in, whatever the counters say.
+    #[test]
+    fn a_requested_walk_never_says_all_of_them_are_done() {
+        let dir = Dir::new();
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        generate(&dir, 101, 20, false);
+        let f = all_any();
+        from_index(&dir, &f, None);
+        let index = index_of(&dir).unwrap();
+        let rows = index.state.read_recover().rows();
+        // The thread cannot start a pass while this is held: the states below stay put.
+        let walking = index.walk.lock_recover();
+        index.full_running.store(true, Ordering::SeqCst);
+        index.done.store(rows, Ordering::Release);
+        index.total.store(rows, Ordering::Release);
+        assert_eq!(
+            index.indexing(),
+            Some(Indexing {
+                done: rows - 1,
+                total: rows
+            })
+        );
+        index.full_running.store(false, Ordering::SeqCst);
+        assert_eq!(index.indexing(), None);
+        // Asked for and not taken yet: none of the rows are known current.
+        index.full_due.store(true, Ordering::SeqCst);
+        assert_eq!(
+            index.indexing(),
+            Some(Indexing {
+                done: 0,
+                total: rows
+            })
+        );
+        index.full_due.store(false, Ordering::SeqCst);
+        drop(walking);
+        assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+    }
+
+    /// Asked for twice more while a requested walk runs: exactly one more walk, none lost, none
+    /// extra.
+    #[test]
+    fn rescans_during_a_walk_are_one_more_walk() {
+        let dir = Dir::new();
+        set_clock_ahead(&dir, Duration::from_secs(3600));
+        let rels = generate(&dir, 103, 20, false);
+        let f = all_any();
+        from_index(&dir, &f, None);
+        let all = queue::candidates(&dir, QueueSource::All).len() as u64;
+        let hold = hold(&dir);
+        let before = frames_walked(&dir);
+        assert!(super::super::rescan(&dir));
+        assert!(hold.reached());
+        // An edit while the first walk runs: whichever walk reads it, the last one has it.
+        edited_in_place(&dir, &rels);
+        assert!(super::super::rescan(&dir));
+        assert!(super::super::rescan(&dir));
+        drop(hold);
+        assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        assert_eq!(frames_walked(&dir) - before, 2 * all, "two walks");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(frames_walked(&dir) - before, 2 * all, "and no third");
+    }
+
+    #[test]
+    fn a_rescan_of_a_folder_without_an_index_asks_nothing() {
+        let (dir, other) = (Dir::new(), Dir::new());
+        generate(&dir, 107, 10, false);
+        generate(&other, 109, 10, false);
+        assert!(!super::super::rescan(&dir), "no index yet");
+        let f = all_any();
+        from_index(&dir, &f, None);
+        assert!(!super::super::rescan(&other), "another folder's");
+        assert!(!super::super::rescan(&dir.join("day")), "a folder in it");
+        assert!(
+            super::super::rescan(&dir.canonicalize().unwrap()),
+            "canonical"
+        );
+        assert!(super::super::rescan(&dir));
+        assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        assert!(index_of(&other).is_none(), "none made");
+    }
 }

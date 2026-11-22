@@ -15,7 +15,8 @@
 //! [`repeats`], the rejected and parked spots a labelers run remembers in [`spots`], the duplicate
 //! boxes on one object (stacks, overlaps) in [`stacks`], the static spots of fixed cameras (the
 //! same object labelled at one place on many frames) in [`statics`], the stored suggestions for
-//! overlapping boxes in [`overlaps`] and those of the dataset check in [`refine`]. The cover rule both a
+//! overlapping boxes in [`overlaps`] and those of the dataset check in [`refine`]; the images no
+//! frame of the layout names (for the Review tab's Rescan folder) in [`strays`]. The cover rule both a
 //! missing-label run and the dataset check use ([`covers`], [`unjudged_reject`]) is here.
 
 pub mod bulk;
@@ -32,6 +33,7 @@ pub mod repeats;
 pub mod spots;
 pub mod stacks;
 pub mod statics;
+pub mod strays;
 pub mod xany;
 
 use super::layout::{self, Rel};

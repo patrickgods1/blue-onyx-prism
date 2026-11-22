@@ -15,7 +15,8 @@
 //! benchmark set), `POST /v1/review/import` (X-AnyLabeling files), `POST /v1/review/classes`
 //! (`collect.classes` and `collect.hidden_classes`; classes that become unwanted have their
 //! pending boxes rejected right away), `GET /v1/review/class-catalog` (the class picker's
-//! catalog, [`crate::training::autolabel::catalog`]) and the spot memory
+//! catalog, [`crate::training::autolabel::catalog`]), `POST /v1/review/rescan` (the folder under
+//! review read again, and the images no frame of its layout names) and the spot memory
 //! ([`labels::spots`]): `GET /v1/review/spots`, `POST /v1/review/spots/parked`, `.../retire` and
 //! `.../moved`.
 //! Every frame reference goes through
@@ -42,7 +43,7 @@ pub(super) use bulk_routes::{
     accept_auto, accept_repeats, reject_low, reject_other_class, reject_stacked,
     reject_unwanted_reviewed, restore_reopened, suggest_overlaps,
 };
-pub(super) use files::{allowed_folder, class_catalog, classes, export, folder, import};
+pub(super) use files::{allowed_folder, class_catalog, classes, export, folder, import, rescan};
 pub(super) use spots::{
     accept_spot, history, reject_spot, spots, spots_moved, spots_parked, spots_retire,
 };
@@ -3603,6 +3604,9 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         assert_eq!(v["folder_missing"], true, "{v}");
+        let (s, v) = json(&d.state, post_json("/v1/review/rescan", "{}")).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["folder_missing"], true, "{v}");
         // Back again: the frame is there, nothing happened to it.
         std::fs::rename(&moved, &d.dir).unwrap();
         let (s, v) = json(
@@ -4424,6 +4428,133 @@ mod tests {
             before["counts"],
             "the walk sees the direct edit"
         );
+
+        // Rescan folder: the index reads everything again, the answers say `indexing` until that
+        // walk is in, then they are the walk's.
+        let (s, v) = json(&d.state, post_json("/v1/review/rescan", "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["indexed"], true, "{v}");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut got = next_of(&d, &[("status", "any")]).await;
+        while got.get("indexing").is_some() && std::time::Instant::now() < until {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            got = next_of(&d, &[("status", "any")]).await;
+        }
+        assert_eq!(got, walked(&d, &[("status", "any")]), "after a rescan");
+        same_as_the_walk(&d, "after a rescan").await;
+    }
+
+    both_ways!(
+        a_rescan_says_whether_an_index_took_it,
+        a_rescan_says_whether_an_index_took_it_indexed,
+        a_rescan_says_whether_an_index_took_it_in
+    );
+
+    /// `POST /v1/review/rescan` with `{}` or no body: `indexed` when the folder has an index (the
+    /// walked folder has none), the folder it read and no strays in a folder of frames only; the
+    /// answers after it are the walk's. A body that is not JSON is refused.
+    async fn a_rescan_says_whether_an_index_took_it_in(way: Way) {
+        let d = way.ds();
+        put_auto_frames(&d.dir);
+        same_as_the_walk(&d, "before a rescan").await;
+        let (s, v) = json(&d.state, post_json("/v1/review/rescan", "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["success"], true, "{v}");
+        assert_eq!(v["indexed"], way == Way::Index, "{v}");
+        assert_eq!(v["dir"], d.dir.display().to_string(), "{v}");
+        assert_eq!(
+            v["strays"],
+            serde_json::json!({"count": 0, "sample": [], "unreadable": 0}),
+            "{v}"
+        );
+        let (s, v) = json(
+            &d.state,
+            Request::post("/v1/review/rescan")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "no body: {v}");
+        // One at a time per folder: a second while one runs is 409, and it ran nothing.
+        let running = files::Rescanning::start(&d.dir).unwrap();
+        let (s, v) = json(&d.state, post_json("/v1/review/rescan", "{}")).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("already running"),
+            "{v}"
+        );
+        drop(running);
+        let req = Request::post("/v1/review/rescan")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("go"))
+            .unwrap();
+        assert_eq!(
+            json(&d.state, req).await.0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        let big = format!(r#"{{"pad": "{}"}}"#, "x".repeat(SMALL_BODY_LIMIT));
+        let (s, _) = json(&d.state, post_json("/v1/review/rescan", &big)).await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+        same_as_the_walk(&d, "after a rescan").await;
+    }
+
+    /// Every path under `dir`, sorted, with each file's bytes.
+    fn tree(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if e.file_type().unwrap().is_dir() {
+                    todo.push(p.clone());
+                    out.push((p, Vec::new()));
+                } else {
+                    let bytes = std::fs::read(&p).unwrap();
+                    out.push((p, bytes));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The images no frame of the layout names: one copied into a day folder and one at the
+    /// folder's root, not the frame itself nor an export's images; nothing in the folder changes.
+    #[tokio::test]
+    async fn a_rescan_names_the_images_no_frame_names_and_writes_nothing() {
+        let d = ds();
+        put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        std::fs::write(d.dir.join("ir/drive/2026-10-21/copied.jpg"), b"x").unwrap();
+        std::fs::write(d.dir.join("top.jpg"), b"x").unwrap();
+        std::fs::create_dir_all(d.dir.join("export/images")).unwrap();
+        std::fs::write(d.dir.join("export/images/x.jpg"), b"x").unwrap();
+        let before = tree(&d.dir);
+        let (s, v) = json(&d.state, post_json("/v1/review/rescan", "{}")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["strays"],
+            serde_json::json!({
+                "count": 2,
+                "sample": ["ir/drive/2026-10-21/copied.jpg", "top.jpg"],
+                "unreadable": 0,
+            }),
+            "{v}"
+        );
+        assert_eq!(tree(&d.dir), before, "nothing written");
+    }
+
+    /// Sign-in and HTTPS come from the router's layers, as for every review POST.
+    #[tokio::test]
+    async fn a_rescan_needs_a_signed_in_https_request() {
+        use super::super::test_util::{REMOTE, anonymous, from_peer, plain};
+        let d = ds();
+        put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+        let req = anonymous(from_peer(post_json("/v1/review/rescan", "{}"), REMOTE));
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED);
+        let req = from_peer(plain(post_json("/v1/review/rescan", "{}")), REMOTE);
+        let (s, _, _) = call(&d.state, req).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
     }
 
     /// While the index is built, the answer says how far it is (`indexing: {done, total}`) and

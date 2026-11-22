@@ -371,9 +371,15 @@ fn history_with(key: Key, scan: &dyn Fn() -> History) -> Arc<History> {
     }
 }
 
-/// Drop the cached histories of `dir`.
+/// Drop the cached histories of `dir`, and keep a scan of it running now from being cached (it
+/// may have read the files before what made the caller drop them), as [`written`] does.
 pub fn invalidate(dir: &Path) {
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if let Ok(mut s) = scanning().lock() {
+        for (d, dirty) in s.values_mut() {
+            *dirty |= *d == root;
+        }
+    }
     if let Ok(mut c) = cache().lock() {
         c.retain(|(d, _), _| *d != root);
     }
@@ -823,6 +829,35 @@ mod tests {
         // That one saw no write: it is cached.
         let cached = history_with(key, &|| panic!("cached"));
         assert_eq!(cached.camera, "scan 2");
+    }
+
+    /// A rescan drops the folder's histories while a scan of it runs: that scan's answer, read
+    /// before the drop, is not cached over it.
+    #[test]
+    fn a_scan_running_when_its_folder_is_invalidated_is_not_cached() {
+        let (g, started, go) = gated();
+        let key = fresh_key();
+        let lead = call(&key, &g);
+        started.recv().unwrap();
+        invalidate(&key.0);
+        go.send(()).unwrap();
+        assert_eq!(lead.join().unwrap().camera, "scan 1", "its caller's answer");
+        let again = call(&key, &g);
+        started.recv().unwrap();
+        go.send(()).unwrap();
+        assert_eq!(again.join().unwrap().camera, "scan 2", "scanned again");
+        // Another folder's drop leaves a running scan alone.
+        let other = fresh_key();
+        let lead = call(&other, &g);
+        started.recv().unwrap();
+        invalidate(&key.0);
+        go.send(()).unwrap();
+        lead.join().unwrap();
+        assert_eq!(
+            history_with(other, &|| panic!("cached")).camera,
+            "scan 3",
+            "cached"
+        );
     }
 
     #[test]

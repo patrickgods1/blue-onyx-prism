@@ -14,11 +14,15 @@
 //! - **Other processes and the collector**: the thread stats the folders every minute and walks what
 //!   changed; every 30 minutes it reads everything again, which is what heals a file system with
 //!   unreliable folder times. Rows keep serving meanwhile.
+//! - **A rescan** (the Review tab's Rescan folder, [`rescan`]): the thread reads everything again
+//!   now, and answers say [`Answer::indexing`] from the request until that walk's swap, so a page
+//!   never takes the old counts for the new ones. A request during a walk is one more walk after
+//!   it; requests while one waits are that one.
 //! - **A write during a walk** is seen again after the swap, atomically with it ([`apply`]).
 //! - **Deleted frames** retention got to first: the frames an answer shows are checked.
 //!
-//! An answer has [`Answer::indexing`] while rows it counts are still to come (a build, stale days:
-//! never `done == total`), and otherwise holds every write of this process that finished before
+//! An answer has [`Answer::indexing`] while rows it counts are still to come (a build, stale days,
+//! a requested walk of everything: never `done == total`), and otherwise holds every write of this process that finished before
 //! the query began, but for frames of a day folder new since the last walk that the thread had not
 //! walked within the query's wait.
 //!
@@ -162,7 +166,12 @@ struct Index {
     building: AtomicBool,
     /// A pass is walking stale days.
     catching_up: AtomicBool,
-    /// Frames walked, and to walk, of the running build or stale pass.
+    /// A walk of everything is asked for ([`rescan`]): the thread runs one at its next wake.
+    /// Set under [`HUB`]; taken by the thread only after it set [`Self::full_running`].
+    full_due: AtomicBool,
+    /// The walk of everything a [`rescan`] asked for is running, until its swap is in.
+    full_running: AtomicBool,
+    /// Frames walked, and to walk, of the running build, stale pass or walk of everything.
     done: AtomicU64,
     total: AtomicU64,
     started: Instant,
@@ -188,6 +197,8 @@ impl Index {
             cancelled: AtomicBool::new(false),
             building: AtomicBool::new(true),
             catching_up: AtomicBool::new(false),
+            full_due: AtomicBool::new(false),
+            full_running: AtomicBool::new(false),
             done: AtomicU64::new(0),
             total: AtomicU64::new(0),
             started: Instant::now(),
@@ -230,7 +241,17 @@ impl Index {
 
     /// Frames still to come into the rows, or days known to be out of date.
     fn behind(&self, stale: bool) -> bool {
-        stale || self.building.load(Ordering::Acquire) || self.catching_up.load(Ordering::Acquire)
+        stale
+            || self.building.load(Ordering::Acquire)
+            || self.catching_up.load(Ordering::Acquire)
+            || self.full_wanted()
+    }
+
+    /// A [`rescan`] asked for a walk of everything whose swap is not in yet. The request is read
+    /// before the running walk: the thread sets [`Self::full_running`] before it takes the
+    /// request, so a reader that finds the request taken finds the walk running (or done).
+    fn full_wanted(&self) -> bool {
+        self.full_due.load(Ordering::SeqCst) || self.full_running.load(Ordering::SeqCst)
     }
 
     fn bytes(&self) -> usize {
@@ -277,6 +298,10 @@ impl Index {
     /// frame counted is current: the last day of a build is in and only its swap is left, or the
     /// stale days hold no row (a label file of a frame no line names). A query has waited for
     /// those, and its drain applied this process's writes to every row there is.
+    ///
+    /// A walk of everything a [`rescan`] asked for counts the frames it walked of the frames there
+    /// are, and one still waiting none of the rows: every row may be out of date until its swap,
+    /// so that is always Some, short of the last frame.
     fn indexing(self: &Arc<Self>) -> Option<Indexing> {
         let stale: Vec<String> = {
             let mut hub = HUB.lock_recover();
@@ -284,24 +309,38 @@ impl Index {
                 .map(|c| c.log.stale.iter().cloned().collect())
                 .unwrap_or_default()
         };
-        let (done, total) =
-            if self.building.load(Ordering::Acquire) || self.catching_up.load(Ordering::Acquire) {
-                (
-                    self.done.load(Ordering::Acquire),
-                    self.total.load(Ordering::Acquire),
-                )
-            } else if !stale.is_empty() {
-                let state = self.state.read_recover();
-                let behind: u64 = stale
-                    .iter()
-                    .filter_map(|day| state.shards.get(day))
-                    .map(|s| s.rows.len() as u64)
-                    .sum();
-                let rows = state.rows();
-                (rows.saturating_sub(behind), rows)
-            } else {
-                return None;
-            };
+        // In this order ([`Self::full_wanted`]).
+        let due = self.full_due.load(Ordering::SeqCst);
+        let running = self.full_running.load(Ordering::SeqCst);
+        let (done, total) = if self.building.load(Ordering::Acquire)
+            || running
+            || self.catching_up.load(Ordering::Acquire)
+        {
+            (
+                self.done.load(Ordering::Acquire),
+                self.total.load(Ordering::Acquire),
+            )
+        } else if due {
+            (0, self.state.read_recover().rows())
+        } else if !stale.is_empty() {
+            let state = self.state.read_recover();
+            let behind: u64 = stale
+                .iter()
+                .filter_map(|day| state.shards.get(day))
+                .map(|s| s.rows.len() as u64)
+                .sum();
+            let rows = state.rows();
+            (rows.saturating_sub(behind), rows)
+        } else {
+            return None;
+        };
+        if due || running {
+            let total = total.max(1);
+            return Some(Indexing {
+                done: done.min(total - 1),
+                total,
+            });
+        }
         (done < total).then_some(Indexing { done, total })
     }
 
@@ -561,6 +600,29 @@ pub fn day_written(day: &Path) {
             CHANGED.notify_all();
         }
     }
+}
+
+/// Read every file of `dir` again now, as the 30 minute walk does: its index's thread walks
+/// everything at its next wake, and every answer until that walk's swap is in has
+/// [`Answer::indexing`]. What a file system does not show in its folder times (a label file or
+/// sidecar edited in place) is in the rows after it. A request while that walk runs is one more
+/// walk after it, so none is lost, and requests while one waits are that one. True when an index
+/// of `dir` took it; false with none (a small folder, an index dropped while idle or refused):
+/// the next query then walks the files or builds an index from them anyway. A leaf like
+/// [`day_written`]: only [`HUB`] is taken.
+pub fn rescan(dir: &Path) -> bool {
+    let hub = HUB.lock_recover();
+    let mut asked = false;
+    for c in &hub.current {
+        if c.log.root == dir || c.log.canon.as_deref() == Some(dir) {
+            c.index.full_due.store(true, Ordering::SeqCst);
+            asked = true;
+        }
+    }
+    if asked {
+        CHANGED.notify_all();
+    }
+    asked
 }
 
 /// The current index of `dir` for `wanted` once built (none is made here).

@@ -423,6 +423,10 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
             "/v1/review/folder",
             post(review::folder).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
         ),
+        (
+            "/v1/review/rescan",
+            post(review::rescan).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+        ),
         ("/training", get(train_area::old_training)),
         ("/v1/training", get(training::json)),
         (
@@ -1434,6 +1438,7 @@ mod tests {
             "/v1/review/spots/retire",
             "/v1/review/spots/moved",
             "/v1/review/folder",
+            "/v1/review/rescan",
             "/training",
             "/v1/training",
             "/v1/training/metric-columns",
