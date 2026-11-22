@@ -233,6 +233,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let params = PostParams {
             confidence_threshold: 0.5,
@@ -285,6 +287,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let params = PostParams {
             confidence_threshold: 0.5,
@@ -332,6 +336,7 @@ mod tests {
                 preds: Vec::new(),
                 gt_matched: Vec::new(),
                 counts: None,
+                scene: None,
             }];
             r.eval_preds = vec![vec![PredBox {
                 label: "dog".into(),

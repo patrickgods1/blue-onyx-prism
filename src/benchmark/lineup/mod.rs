@@ -552,7 +552,7 @@ fn set_view(set: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Candi
             let images = set
                 .images
                 .iter()
-                .filter(|i| i.info.tags.iter().any(|t| t == id))
+                .filter(|i| super::images::in_split(&i.info.tags, i.info.scene, id))
                 .count();
             (images > 0 && images < set.images.len()).then(|| Scene {
                 id: (*id).to_string(),

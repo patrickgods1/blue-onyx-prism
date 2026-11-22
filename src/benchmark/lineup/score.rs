@@ -116,10 +116,12 @@ pub fn covered(set: &CompareSet<'_>, index: &Index<'_>) -> usize {
         .count()
 }
 
-/// An image ready to score, with the tags that split it by scene.
+/// An image ready to score, with what splits it by scene: its computed scene when the run
+/// recorded one, else its manifest tags ([`super::super::images::in_split`]).
 #[derive(Debug)]
 pub struct Scorable<'a> {
     pub tags: &'a [String],
+    pub scene: Option<crate::image_stats::Scene>,
     pub eval: EvalImage,
 }
 
@@ -136,6 +138,7 @@ pub fn scorable<'a>(
             let k = *index.get(&(img.set.id.as_str(), img.info.file.as_str()))?;
             Some(Scorable {
                 tags: &img.info.tags,
+                scene: img.info.scene,
                 eval: eval_of(img, map, run, k),
             })
         })
@@ -198,13 +201,22 @@ fn correct_cell(c: Counts) -> Cell {
     }
 }
 
-fn objects_of(images: &[(&[String], &EvalImage)], t: f32) -> Objects {
+/// An image's scene split inputs and its evaluation input.
+type Split<'s, 'e> = (
+    &'s [String],
+    Option<crate::image_stats::Scene>,
+    &'e EvalImage,
+);
+
+fn objects_of(images: &[Split<'_, '_>], t: f32) -> Objects {
     let scene = |tag: Option<&str>| {
         counts_of(
             images
                 .iter()
-                .filter(|(tags, _)| tag.is_none_or(|x| tags.iter().any(|y| y == x)))
-                .map(|(_, e)| *e),
+                .filter(|(tags, sc, _)| {
+                    tag.is_none_or(|x| super::super::images::in_split(tags, *sc, x))
+                })
+                .map(|(_, _, e)| *e),
             t,
         )
     };
@@ -233,7 +245,7 @@ fn objects_of(images: &[(&[String], &EvalImage)], t: f32) -> Objects {
 /// The accuracy cells of `images` at confidence `t`. `classes` is the shared label space.
 pub fn score(images: &[Scorable<'_>], classes: &[String], t: f32) -> Scored {
     let mut objects = BTreeMap::new();
-    let all: Vec<(&[String], &EvalImage)> = images.iter().map(|i| (i.tags, &i.eval)).collect();
+    let all: Vec<Split<'_, '_>> = images.iter().map(|i| (i.tags, i.scene, &i.eval)).collect();
     objects.insert("all".to_string(), objects_of(&all, t));
     for class in ["person", "vehicle"] {
         if !classes.iter().any(|c| c == class) {
@@ -243,8 +255,11 @@ pub fn score(images: &[Scorable<'_>], classes: &[String], t: f32) -> Scored {
         if !one.iter().any(|e| e.gt.iter().any(|g| !g.ignore)) {
             continue;
         }
-        let refs: Vec<(&[String], &EvalImage)> =
-            images.iter().zip(&one).map(|(i, e)| (i.tags, e)).collect();
+        let refs: Vec<Split<'_, '_>> = images
+            .iter()
+            .zip(&one)
+            .map(|(i, e)| (i.tags, i.scene, e))
+            .collect();
         objects.insert(class.to_string(), objects_of(&refs, t));
     }
     let evals: Vec<EvalImage> = images.iter().map(|i| i.eval.clone()).collect();
@@ -356,6 +371,7 @@ mod tests {
     fn an_empty_frame_alone_gives_a_rate_of_zero_not_a_dash() {
         let img = Scorable {
             tags: &[],
+            scene: None,
             eval: EvalImage::default(),
         };
         let s = score(&[img], &["person".to_string()], 0.5);

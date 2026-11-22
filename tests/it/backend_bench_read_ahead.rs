@@ -139,6 +139,8 @@ fn backend_bench_read_ahead_matches_serial_on_cpu() {
         confidence_threshold: None,
         object_filter: None,
         variant: None,
+        concurrency: None,
+        device_thresholds: Default::default(),
     };
     let rt = Runtimes::new(&CoreOptions {
         cache_dir: Some(root.join("cache")),

@@ -46,6 +46,10 @@ pub(super) fn score(
             )),
         );
     }
+    // Per image: the scene the service computed (the scene splits and `scene:*` tags).
+    let scenes: Vec<Option<crate::image_stats::Scene>> = (0..all.len())
+        .map(|k| per_image.get(k).and_then(|r| r.scene))
+        .collect();
     // Per image: the eval input (None = no ground truth).
     let mut evals: Vec<Option<EvalImage>> = Vec::with_capacity(all.len());
     // Per image: the classes its dataset annotates (frame samples).
@@ -67,7 +71,7 @@ pub(super) fn score(
         fclasses.push(classes);
         evals.push(Some(eval));
     }
-    let scored = Scored::new(all, evals, fclasses);
+    let scored = Scored::new(all, evals, fclasses, scenes);
     let chosen = &scored.chosen;
     let relative = scored.relative;
     let overall = metrics::evaluate(&scored.subset(chosen), &map.classes, threshold);
@@ -108,30 +112,30 @@ pub(super) fn score(
             )
         })
         .collect();
-    // Per tag, over the images of the overall score.
-    let mut tags: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    // Per tag, over the images of the overall score: the manifest's tags and the computed
+    // scene's `scene:<day|night|ir>`.
+    let mut tags: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for &k in chosen {
         let Some((_, img)) = all.get(k) else { continue };
         for t in &img.tags {
-            tags.entry(t.as_str()).or_default().push(k);
+            tags.entry(t.clone()).or_default().push(k);
+        }
+        if let Some(sc) = scored.scenes.get(k).copied().flatten() {
+            tags.entry(images::scene_tag(sc)).or_default().push(k);
         }
     }
     let by_tag = tags
-        .into_iter()
+        .iter()
+        .map(|(t, ks)| (t.as_str(), ks.as_slice()))
         .map(|(t, ks)| {
-            let sum = metrics::evaluate(&scored.subset(&ks), &map.classes, threshold);
+            let sum = metrics::evaluate(&scored.subset(ks), &map.classes, threshold);
             Breakdown {
                 per_class: if t.starts_with(HELDOUT_TAG) {
-                    class_recall(&ks)
+                    class_recall(ks)
                 } else {
                     Vec::new()
                 },
-                ..Breakdown::of(
-                    t,
-                    &sum,
-                    relative,
-                    scored.frame_roc(&ks, &map.classes, 0).auc,
-                )
+                ..Breakdown::of(t, &sum, relative, scored.frame_roc(ks, &map.classes, 0).auc)
             }
         })
         .collect();
@@ -331,6 +335,8 @@ pub(super) struct Scored<'a> {
     /// Per image: the classes its dataset annotates.
     frame_classes: Vec<Vec<String>>,
     frames: Vec<Vec<roc::FrameSample>>,
+    /// Per image: the scene the service computed (None in old results' re-scores).
+    scenes: Vec<Option<crate::image_stats::Scene>>,
     /// The images with real ground truth, else every scored image (pseudo ground truth).
     chosen: Vec<usize>,
     /// `chosen` is scored against pseudo ground truth.
@@ -342,6 +348,7 @@ impl<'a> Scored<'a> {
         all: &'a [(&'a ImageSet, &'a images::SetImage)],
         evals: Vec<Option<EvalImage>>,
         frame_classes: Vec<Vec<String>>,
+        scenes: Vec<Option<crate::image_stats::Scene>>,
     ) -> Self {
         let real: Vec<usize> = all
             .iter()
@@ -374,6 +381,7 @@ impl<'a> Scored<'a> {
             evals,
             frame_classes,
             frames,
+            scenes,
             chosen,
             relative,
         }
@@ -446,13 +454,15 @@ impl<'a> Scored<'a> {
             .map(|(s, ks)| curves.curve(&s.id, &ks, SweepScope::All, !s.ground_truth.is_real()))
             .collect();
         let mut by_tag = Vec::new();
+        // Day / night / IR by the computed scene (the service's split), other tags as tagged.
         for tag in threshold::SWEEP_TAGS {
             let ks: Vec<usize> = chosen
                 .iter()
                 .copied()
                 .filter(|&k| {
-                    all.get(k)
-                        .is_some_and(|(_, i)| i.tags.iter().any(|t| t == tag))
+                    all.get(k).is_some_and(|(_, i)| {
+                        images::in_split(&i.tags, self.scenes.get(k).copied().flatten(), tag)
+                    })
                 })
                 .collect();
             if !ks.is_empty() {
@@ -603,6 +613,12 @@ pub(crate) fn pseudo_ground_truth(
         priority: bench.priority,
         // Only its detections are kept, so the time per frame is all that counts.
         read_ahead: super::ReadAhead::Always,
+        warmup_rule: super::WarmupRule::DEFAULT,
+        // Labels, not a measurement: nothing else to record.
+        live_requests: None,
+        video_decode: false,
+        #[cfg(test)]
+        slow_eval: None,
     };
     let run = pb
         .run_exact(runtimes, &job, device)
@@ -832,6 +848,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let pred = |l: &str, c: f32, b: [f32; 4]| PredBox {
             label: l.into(),
@@ -864,6 +882,7 @@ mod tests {
                 preds: stored(&eval),
                 gt_matched: vec![],
                 counts: None,
+                scene: None,
             })
             .collect();
         let (acc, note) = score(
@@ -949,6 +968,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let eval = vec![PredBox {
             label: "dog".into(),
@@ -963,6 +984,7 @@ mod tests {
             preds: vec![],
             gt_matched: vec![],
             counts: None,
+            scene: None,
         };
         // Alone: nothing to score it against.
         let all = vec![(&pseudo, &pseudo.images[0])];
@@ -1044,6 +1066,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let p = |l: &str, b: [f32; 4]| PredBox {
             label: l.into(),
@@ -1076,6 +1100,7 @@ mod tests {
                 .collect(),
             gt_matched: vec![],
             counts: None,
+            scene: None,
         }];
         let (acc, _) = score(&job, &all, &mut pi, &[eval], 0.5, Default::default());
         let acc = acc.unwrap();
@@ -1204,6 +1229,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let all: Vec<_> = set.images.iter().map(|i| (&set, i)).collect();
         let mut pi: Vec<ImageRun> = all
@@ -1216,6 +1243,7 @@ mod tests {
                 preds: vec![],
                 gt_matched: vec![],
                 counts: None,
+                scene: None,
             })
             .collect();
         let (acc, note) = score(&job, &all, &mut pi, &preds, 0.5, Default::default());
@@ -1347,6 +1375,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         };
         let eval = vec![
             vec![p("person", 0.9), p("vehicle", 0.4)],
@@ -1372,6 +1402,7 @@ mod tests {
                 preds: vec![],
                 gt_matched: vec![],
                 counts: None,
+                scene: None,
             })
             .collect();
         let (acc, _) = score(
@@ -1455,6 +1486,73 @@ mod tests {
         );
     }
 
+    /// The computed scene splits the run: each image's `scene:<scene>` breakdown beside the
+    /// manifest's tags, and the day / night / IR threshold curves by the computed scene, an
+    /// image without one (an older result) by its tags.
+    #[test]
+    fn the_computed_scene_splits_the_run() {
+        use crate::image_stats::Scene;
+        let img = |file: &str| images::SetImage {
+            file: file.into(),
+            path: None,
+            width: 640,
+            height: 480,
+            tags: vec!["night".into()],
+            gt: Some(vec![GtBox {
+                label: "person".into(),
+                bbox: [0.0, 0.0, 100.0, 100.0],
+                ignore: false,
+                crowd: false,
+            }]),
+        };
+        let mut set = ImageSet::sample();
+        set.id = "s".into();
+        set.ground_truth = GroundTruth::Manifest;
+        set.images = vec![img("a"), img("b"), img("c"), img("d")];
+        let job = job_of(&["person".into()]);
+        let eval: Vec<Vec<PredBox>> = (0..4)
+            .map(|_| {
+                vec![PredBox {
+                    label: "person".into(),
+                    confidence: 0.9,
+                    bbox: [0.0, 0.0, 100.0, 100.0],
+                }]
+            })
+            .collect();
+        let all: Vec<(&ImageSet, &images::SetImage)> =
+            set.images.iter().map(|i| (&set, i)).collect();
+        let scenes = [Some(Scene::Day), Some(Scene::Night), Some(Scene::Ir), None];
+        let mut pi: Vec<ImageRun> = all
+            .iter()
+            .zip(scenes)
+            .map(|((s, i), scene)| ImageRun {
+                set: s.id.clone(),
+                file: i.file.clone(),
+                total_ms: 1.0,
+                infer_ms: 1.0,
+                preds: vec![],
+                gt_matched: vec![],
+                counts: None,
+                scene,
+            })
+            .collect();
+        let (acc, _) = score(&job, &all, &mut pi, &eval, 0.5, Default::default());
+        let acc = acc.unwrap();
+        let tag = |k: &str| acc.by_tag.iter().find(|b| b.key == k).map(|b| b.images);
+        assert_eq!(tag("night"), Some(4), "the manifest's tag stays");
+        assert_eq!(
+            (tag("scene:day"), tag("scene:night"), tag("scene:ir")),
+            (Some(1), Some(1), Some(1))
+        );
+        let sw = acc.sweep.unwrap();
+        let curve = |k: &str| sw.by_tag.iter().find(|c| c.key == k).map(|c| c.images);
+        // Night: b (computed) and d (tagged, no computed scene); day a, IR c.
+        assert_eq!(
+            (curve("day"), curve("night"), curve("ir")),
+            (Some(1), Some(2), Some(1))
+        );
+    }
+
     /// The stored drill-down predictions are capped, but the pseudo ground truth run keeps
     /// every reference detection, so a crowded image's 101st object is still ground truth
     /// (BM-10).
@@ -1478,6 +1576,7 @@ mod tests {
             stages: [1.0; 4],
             predictions,
             eval: Vec::new(),
+            scene: crate::image_stats::Scene::Day,
         };
         let (capped, _) = image_run(&set, img, &last, &[4.0], &[1.0], MAX_STORED_PREDS);
         assert_eq!(capped.preds.len(), MAX_STORED_PREDS);
@@ -1562,6 +1661,8 @@ mod tests {
             confidence_threshold: None,
             object_filter: None,
             variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
         }
     }
 
@@ -1576,6 +1677,7 @@ mod tests {
                 preds: vec![],
                 gt_matched: vec![],
                 counts: None,
+                scene: None,
             })
             .collect()
     }

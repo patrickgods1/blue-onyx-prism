@@ -646,7 +646,8 @@ and links the latest benchmark recommendation.
 
 Which device suits a model differs per model and machine (on an M1, IPcam-general runs fastest on
 `openvino:cpu`, D-FINE on `ort:coreml`). The benchmark measures it: each model on each runnable device
-over a set of images, graded for accuracy and speed, with a detection check against the CPU:
+over a set of images, graded for accuracy and speed, with a detection check against the CPU when
+the run includes a CPU device:
 
 ```sh
 blue-onyx-prism benchmark --all-devices                     # config models x runnable devices x configured datasets
@@ -660,7 +661,8 @@ A sweep over two or more GPU devices is refused unless you add `--confirm-gpus`.
 Or open **Benchmark** in the web UI: choose datasets, models, devices and settings, **Start**
 (runs in the background, one run at a time, cancelable, live progress and ETA), then **Use <device>**
 per row or **Apply recommended devices to all models** (offers a restart). Benchmarking while serving
-competes for the CPU/GPU with live requests. Results go to `benchmark.json` next to the config file;
+competes for the CPU/GPU with live requests (each device result records them, see *What is timed*).
+Results go to `benchmark.json` next to the config file;
 the CLI and the UI read and write the same file (it stays there: `auto` device ordering reads it).
 **Advanced > Save report** writes the same standalone HTML report as `--report` into a folder you choose
 (Browse...) as `benchmark-report-<YYYYMMDD-HHMMSS>.html` (wall time in `timezone`); a folder added as a dataset must also be browsable or picked.
@@ -674,9 +676,34 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   ground truth as COCO instances JSON or YOLO txt labels and tags in `manifest.json`. Without ground
   truth a dataset is scored against a reference model (the most accurate installed one, or
   `benchmark.reference_model`); such scores are marked *relative*.
-- **Accuracy**: AP@0.5, AP@[.5:.95] (COCO 101-point), precision/recall/F1 at the model's confidence
-  threshold, recall by object size, by dataset and by tag (day/night, complexity, resolution, crowd,
-  small objects). Scored classes: person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse
+- **What is timed**: each model runs as it serves. It is compiled with its worker's settings on that
+  device (the hardware profile's performance hint, in-flight requests and ONNX Runtime sessions with
+  the config's `performance_hint`, `inflight` and `ort_sessions`; OpenVINO's hint is part of its cache
+  key, so this is also the compiled model the service then loads), recorded per device as `tuning`.
+  Its predictions use the confidence it serves on that device (its profile in `device_thresholds`,
+  else its own `confidence_threshold`, else the global one), recorded as `served_threshold` and
+  `served_threshold_source`. Each image goes through decode (with the frame's statistics and scene,
+  as the service's decode stage), preprocess, inference and postprocess, one request at a time; the
+  stage times give min / mean / p50 / p95 / p99 / max (nearest rank). The warm-up (`benchmark.warmup`
+  runs, 0 = none) cycles over the first 5 images until at least that many runs and 2 s have passed, at
+  most 20 s or max(warmup, 200) runs (`warmup_runs`, `warmup_ms`). The first load (`compile_ms` and
+  `cache`: hit, miss, unknown, none) shows as e.g. "2.1 s, cached" or "24 s, compiled". req/s counts
+  the wait for each image plus its served stages, never the benchmark's own scoring; on a GPU only
+  the next image's read and decode overlap each inference, and the service can do more (a decode
+  pool, several inferences in flight). A run from the web UI records the live detection requests the
+  service answered during each device's timed runs (`live_requests`, `live_requests_per_min`; the CLI
+  records none) and, on Windows, the GPU video-decode engine's load (`video_decode_pct`: mean and max
+  of the busiest decode engine, sampled once a second: Blue Iris' Quick Sync shares the iGPU); a
+  device measured beside either gets a warning on the page and in the run's warnings ("measured
+  while serving 14 requests/min").
+- **Scenes**: each image's scene (day, night, IR) is computed as the service computes it after decode
+  (a NIR proxy set's grayscale frames are IR) and stored per image. The Day / Night / IR splits (the
+  threshold curves, the Compare columns) use it, and each scene has its own `scene:<day|night|ir>`
+  breakdown beside the manifest's tags; results saved before it fall back to the manifest's
+  `day` / `night` / `ir` tags.
+- **Accuracy**: AP@0.5, AP@[.5:.95] (COCO 101-point), precision/recall/F1 at the confidence the model
+  serves on the device, recall by object size, by dataset and by tag (day/night, complexity,
+  resolution, crowd, small objects, the computed scene). Scored classes: person, bicycle, car, motorcycle, bus, truck, dog, cat, bird, horse
   as far as the model has them (IPcam `vehicle` = car/truck/bus); AP over all of a COCO model's classes
   is reported too. AP50 and AP50-95 are the average over the classes with at least 20 labelled objects
   in the scored images (`MIN_CLASS_GT`; every class with objects when none has 20, said so); rarer
@@ -711,9 +738,22 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   (`benchmark.weights`, default 60% accuracy / 40% speed). The metric also drives the ranking and the
   device recommendation's accuracy tie (0.015 AP50, 0.01 AUC); results kept from earlier runs are
   re-graded with the current metric when a run is saved.
-- **Recommendation**: the best-graded device whose detections agree with the CPU reference device
-  (devices that disagree, e.g. a broken FP16 path, are never recommended); within 5% of the best p50
-  the configured device is kept. The page and the report also rank the models ("best model for this
+- **Agreement**: when the run includes a CPU device (`openvino:cpu`, else `ort:cpu`), every other
+  device of the model is compared with it image by image over the images both ran (by dataset and
+  file name), both at one confidence: the checked device's served confidence, applied to both
+  devices' 0.05 predictions (results reloaded from `benchmark.json`, which keeps none, use the stored
+  predictions at the higher of the two served confidences). The check catches a broken device path,
+  not a difference between saved confidence profiles. Per image: the matched objects (same label,
+  IoU >= 0.5) over the larger of the two counts (1 when both found nothing), averaged over the
+  images, plus the mean confidence difference of the matched pairs. *Agrees*: at least 0.8 and at most 0.05 apart;
+  *minor*: at least 0.5 and at most 0.15; else *disagrees*. Without a CPU device in the run (the
+  default: each model on the device it runs on) a device is *not checked against CPU*.
+- **Recommendation**: the best-graded device that agrees with the CPU reference (or is it); a device
+  with minor differences or that disagrees (e.g. a broken FP16 path) is reported, never recommended.
+  An unchecked device is recommended only when it is the only device of its model that ran (so a
+  default run still recommends the configured device), never over or beside another device; the
+  measured `auto` order follows the same rule. Within 5% of the best p50 the configured device is
+  kept. The page and the report also rank the models ("best model for this
   machine").
 - **Confidence threshold**: the same low-threshold (0.05) predictions are scored at every confidence
   threshold, without extra inference: TP/FP/FN, precision, recall, F1, F2, false positives per image
@@ -786,7 +826,7 @@ The `benchmark` config section holds the defaults (**Save as default** on the pa
 | `benchmark.max_images_per_dataset` | `0` | Images per dataset, evenly spread; 0 = all. Integer >= 0. UI: yes |
 | `benchmark.devices` | `[]` | Device specs to run; empty = the device each model runs on. Several GPUs need a confirmation, because a sweep of every device has hung a machine. UI: yes |
 | `benchmark.models` | `[]` | Model names; empty = the enabled models whose files are present. UI: yes |
-| `benchmark.warmup` | `3` | Untimed warm-up runs per model and device. Integer 0-1000. UI: yes |
+| `benchmark.warmup` | `3` | Untimed warm-up runs per model and device, at least: the warm-up cycles over the first 5 images until this many runs and 2 s have passed (at most 20 s or max(warmup, 200) runs); 0 = none. Integer 0-1000. UI: yes |
 | `benchmark.repeat_per_image` | `1` | Timed runs per image. Integer 0-1000. UI: yes |
 | `benchmark.reference_model` | `null` | Model whose detections score datasets without ground truth; `null` = the most accurate installed one. UI: yes |
 | `benchmark.weights` | `{"accuracy": 0.6, "speed": 0.4}` | Weights of the overall grade, each 0-1. UI: yes (accuracy weight) |
@@ -1506,7 +1546,11 @@ for throwaway test servers only).
   and under-reports compute work; look at the *Compute_0* / *3D* engine graphs or `nvidia-smi dmon -s u`.
   The server runs two ONNX Runtime sessions per model on a discrete GPU (`ort_sessions`) so one request's
   compute overlaps the other's copy and NMS; Blue Iris sends one request per trigger, so 100 % is not
-  expected, and the benchmark measures latency one request at a time by design.
+  expected, and the benchmark measures latency one request at a time by design (compiled with the
+  same sessions and in-flight requests as the service, `tuning` in its results). On an Intel iGPU
+  Blue Iris' Quick Sync decode runs on the same GPU (the *Video Decode* engine in Task Manager): a
+  benchmark on Windows records that engine's load during each device's run and says so beside the
+  numbers when it was busy.
 - **`Unable to find the openvino_c library`:** run `blue-onyx-prism setup-openvino` or set
   `openvino_dir` / `OPENVINO_INSTALL_DIR`. On Windows the release zip and the MSI ship the Visual C++ runtime next to the exe; a build of your own needs the Visual C++ redistributable.
 - **Windows: crash with an illegal instruction (`0xC000001D`) on the first CPU inference:** on Xeons with AMX

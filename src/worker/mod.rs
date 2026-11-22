@@ -387,10 +387,11 @@ impl LiveSettings {
     /// else the fallback ([`Self::confidence_threshold`]). A request's `min_confidence` still
     /// wins over it.
     pub fn threshold_for(&self, device: &str) -> (f32, ThresholdSource) {
-        match crate::config::lookup_device_threshold_entry(&self.device_thresholds, device) {
-            Some((k, t)) => (t, ThresholdSource::Device(k.to_string())),
-            None => (self.confidence_threshold, self.fallback_source.clone()),
-        }
+        served_threshold(
+            &self.device_thresholds,
+            (self.confidence_threshold, self.fallback_source.clone()),
+            device,
+        )
     }
 
     /// A shareable cell holding `self` (what [`WorkerConfig::live`] and the handle share).
@@ -448,6 +449,50 @@ impl Default for LiveSettings {
 pub struct Concurrency {
     pub profile: Profile,
     pub overrides: Overrides,
+}
+
+impl Concurrency {
+    /// The concurrency of config model `m` under `profile`: the profile with the config's
+    /// explicit values ([`Config::concurrency_overrides`]), what the registry gives each worker.
+    pub fn for_model(profile: Profile, config: &Config, m: &ModelConfig) -> Self {
+        Self {
+            profile,
+            overrides: config.concurrency_overrides(m),
+        }
+    }
+}
+
+/// The compile hint, in-flight count and ONNX Runtime sessions a model gets on `device`: the
+/// hardware profile's tuning for the device's class with the config's overrides
+/// ([`Profile::tuning_with`]), serial ([`crate::profile::DeviceTuning::SERIAL`]) without a
+/// profile. The one rule for the worker and the benchmark: OpenVINO's `PERFORMANCE_HINT` is
+/// part of its compile-cache key, so a benchmark compiled any other way would measure (and
+/// cache) another compiled model than the one serving.
+pub fn device_tuning(
+    concurrency: Option<&Concurrency>,
+    rt: &Runtimes,
+    device: &crate::backend::spec::Device,
+) -> crate::profile::DeviceTuning {
+    match concurrency {
+        Some(c) => c.profile.tuning_with(rt.device_class(device), c.overrides),
+        None => crate::profile::DeviceTuning::SERIAL,
+    }
+}
+
+/// The threshold that runs on `device` (a spec such as the loaded `DeviceInfo.spec`) and where it
+/// comes from: the profile of `device_thresholds` for that device
+/// ([`crate::config::lookup_device_threshold_entry`]: `openvino:gpu` == `openvino:gpu.0`), else
+/// `fallback` (the model's own threshold, else the global one). [`LiveSettings::threshold_for`]
+/// and the benchmark's served threshold.
+pub fn served_threshold(
+    device_thresholds: &BTreeMap<String, f32>,
+    fallback: (f32, ThresholdSource),
+    device: &str,
+) -> (f32, ThresholdSource) {
+    match crate::config::lookup_device_threshold_entry(device_thresholds, device) {
+        Some((k, t)) => (t, ThresholdSource::Device(k.to_string())),
+        None => fallback,
+    }
 }
 
 /// One-shot "this worker is done with its startup load" signal, used by the registry to make

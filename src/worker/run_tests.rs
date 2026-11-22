@@ -78,6 +78,20 @@ impl Harness {
         peers: Peers,
         faults: TestFaults,
     ) -> Self {
+        Self::start_cfg(name, slots, live, peers, faults, None, None)
+    }
+
+    /// [`Self::start_faulty`] with the worker's `concurrency` (hardware profile + config
+    /// overrides) and the one candidate `only` it loads on.
+    fn start_cfg(
+        name: &str,
+        slots: usize,
+        live: LiveSettings,
+        peers: Peers,
+        faults: TestFaults,
+        concurrency: Option<Concurrency>,
+        only: Option<Candidate>,
+    ) -> Self {
         let script = FakeScript::new(slots, INPUT);
         let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
         let path = PathBuf::from("fake.onnx");
@@ -102,10 +116,10 @@ impl Harness {
             lazy: false,
             can_use_gpu: false,
             wait: None,
-            concurrency: None,
+            concurrency,
             prep: Some(prep.clone()),
             peers,
-            only: None,
+            only,
             make_room: None,
             recovering_from: None,
             faults,
@@ -1618,4 +1632,59 @@ fn images_are_saved_after_the_reply() {
     assert!(saves.try_recv().is_err());
     h.stop();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B4: the worker compiles with [`super::device_tuning`] for the device it loads on (the hardware
+/// profile's tuning with the config's overrides), the one rule the benchmark compiles with too
+/// (`benchmark::run_tests::the_benchmark_compiles_with_the_workers_tuning`): THROUGHPUT on a CPU
+/// with 16 logical cores, `performance_hint: throughput` on an integrated GPU, LATENCY with 2 in
+/// flight there by default.
+#[test]
+fn the_worker_compiles_with_the_shared_tuning() {
+    use crate::backend::spec::{Device, Runtime, Target};
+    use crate::profile::{Facts, PerfHint, PerformanceHint, classify};
+    let hw = crate::backend::HardwareInfo::new("linux", "x86_64", vec![]);
+    let profile = classify(&Facts::from_hardware(16, Some(32.0), &hw));
+    let cpu = Device::new(Runtime::OpenVino, Target::Cpu, None).unwrap();
+    let gpu = Device::new(Runtime::OpenVino, Target::Gpu, None).unwrap();
+    for (device, hint, expected) in [
+        (cpu, None, PerfHint::Throughput),
+        (gpu, None, PerfHint::Latency),
+        (gpu, Some(PerformanceHint::Throughput), PerfHint::Throughput),
+    ] {
+        let m = ModelConfig {
+            path: "fake.onnx".into(),
+            performance_hint: hint,
+            ..ModelConfig::default()
+        };
+        let config = Config {
+            models: vec![m.clone()],
+            ..Config::default()
+        };
+        let c = Concurrency::for_model(profile.clone(), &config, &m);
+        let only = Candidate {
+            device,
+            fell_back: false,
+            note: None,
+        };
+        let h = Harness::start_cfg(
+            "fake",
+            1,
+            LiveSettings::default(),
+            Peers::new(),
+            TestFaults::default(),
+            Some(c.clone()),
+            Some(only),
+        );
+        let compiles = h.script.compiles();
+        let rt = Runtimes::fake(FakeScript::new(1, INPUT));
+        let want = super::device_tuning(Some(&c), &rt, &device);
+        assert_eq!(want.hint, expected, "{device} {hint:?}");
+        assert_eq!(
+            compiles,
+            vec![(device.to_string(), want)],
+            "{device} {hint:?}"
+        );
+        h.stop();
+    }
 }

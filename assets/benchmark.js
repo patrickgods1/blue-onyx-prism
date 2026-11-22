@@ -184,7 +184,31 @@
   function verdictText(a) {
     if (!a) return "-";
     var total = a.matched + Math.max(a.only_device, a.only_reference);
-    return {reference: "reference", agrees: "agrees", minor: "minor (" + a.matched + "/" + total + ")", disagrees: "DISAGREES (" + a.matched + "/" + total + ")"}[a.verdict] || a.verdict;
+    return {reference: "reference", agrees: "agrees", minor: "minor (" + a.matched + "/" + total + ")", disagrees: "DISAGREES (" + a.matched + "/" + total + ")", not_checked: "not checked against CPU"}[a.verdict] || a.verdict;
+  }
+  // Twin of `report::first_load_text`: "2.1 s, cached" / "24 s, compiled" / "0.8 s".
+  function loadText(compileMs, cache) {
+    var s = Math.max(0, compileMs || 0) / 1000, t = (s >= 10 ? s.toFixed(0) : s.toFixed(1)) + " s";
+    return t + ({hit: ", cached", miss: ", compiled", disabled: ", cache off", unknown: ", cache unknown"}[cache] || "");
+  }
+  // Twin of `report::shared_load_text`: what the run shared the machine with, or "".
+  function sharedLoadText(r) {
+    var parts = [];
+    if (r.live_requests > 0 && typeof r.live_requests_per_min === "number") {
+      var pm = r.live_requests_per_min;
+      parts.push("measured while serving " + (pm >= 10 ? pm.toFixed(0) : pm.toFixed(1)) + " requests/min (" + r.live_requests + " live requests during the timed runs)");
+    }
+    var v = r.video_decode_pct;
+    if (v && v.mean >= 1) parts.push("Blue Iris / other video decode on the GPU: " + v.mean.toFixed(0) + "% during the run (max " + v.max.toFixed(0) + "%)");
+    return parts.join("; ");
+  }
+  // How the run was set up: compile tuning, warm-up, the served threshold (the Load cell's title).
+  function setupText(r) {
+    var parts = [];
+    if (r.tuning) parts.push("compiled as served: " + (r.tuning.hint ? r.tuning.hint + ", " + r.tuning.inflight + " in flight" : r.tuning.ort_sessions + " ORT session" + (r.tuning.ort_sessions === 1 ? "" : "s")));
+    if (r.warmup_runs) parts.push("warm-up " + r.warmup_runs + " runs in " + (r.warmup_ms / 1000).toFixed(1) + " s");
+    if (typeof r.served_threshold === "number") parts.push("confidence " + r.served_threshold.toFixed(2) + " (" + (r.served_threshold_source || "?") + ")");
+    return parts.join("; ");
   }
 
   // ---- apply from Details, with before -> after and Undo --------------------------------------
@@ -1046,7 +1070,7 @@
     } else if (m.changes && m.changes.baseline && !m.changes.comparable) {
       card.appendChild(el("p", "muted", "⚠ Not compared with the run of " + when(m.changes.baseline.timestamp) + ": " + ((m.changes.reasons || []).join("; ") || "the runs differ") + "."));
     }
-    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]), "devices", [{col: "best", dir: "asc"}]);
+    var t = sortable(table("devices", ["Device", "@load_ms", "Infer p50", "Infer mean", "Total p50", "Total p95", "Total p99", "@fps", "@ap50", "@ap50_95", "@roc_auc", "@precision", "@recall", "@grade", "@agreement", "@trust", ""]), "devices", [{col: "best", dir: "asc"}]);
     var okRuns = m.devices.filter(function (d) { return d.run && !d.run.fell_back; });
     var fastest = okRuns.reduce(function (a, d) { return !a || d.run.stages_ms.total.p50 < a.run.stages_ms.total.p50 ? d : a; }, null);
     m.devices.forEach(function (d, k) {
@@ -1058,11 +1082,14 @@
       if (d.device === configured) name.appendChild(el("span", "tag cfg", "Now"));
       if (running && running !== configured && d.device === running) { var rt = el("span", "tag", "running"); rt.title = "loaded on this device until a restart"; name.appendChild(rt); }
       if (!r || r.fell_back) {
-        var e = el("td", "error-text", d.error || ("fell back to " + (r && r.device))); e.colSpan = 15; tr.classList.add("failed"); tr.appendChild(e);
+        var e = el("td", "error-text", d.error || ("fell back to " + (r && r.device))); e.colSpan = 16; tr.classList.add("failed"); tr.appendChild(e);
       } else {
         var acc = r.accuracy ? r.accuracy.overall : null;
-        cell(tr, r.compile_ms.toFixed(0), r.compile_ms, "Load ms"); cell(tr, ms(r.stages_ms.infer.p50), r.stages_ms.infer.p50, "Infer p50"); cell(tr, ms(r.stages_ms.infer.mean), r.stages_ms.infer.mean, "Infer mean");
-        cell(tr, ms(r.stages_ms.total.p50), r.stages_ms.total.p50, "Total p50"); cell(tr, ms(r.stages_ms.total.p95), r.stages_ms.total.p95, "Total p95"); cell(tr, r.throughput_fps.toFixed(1), -r.throughput_fps, "req/s");
+        var lc = cell(tr, loadText(r.compile_ms, r.cache), r.compile_ms, "Load"); lc.title = setupText(r);
+        cell(tr, ms(r.stages_ms.infer.p50), r.stages_ms.infer.p50, "Infer p50"); cell(tr, ms(r.stages_ms.infer.mean), r.stages_ms.infer.mean, "Infer mean");
+        cell(tr, ms(r.stages_ms.total.p50), r.stages_ms.total.p50, "Total p50"); cell(tr, ms(r.stages_ms.total.p95), r.stages_ms.total.p95, "Total p95");
+        var p99 = r.stages_ms.total.p99 > 0 ? r.stages_ms.total.p99 : null; cell(tr, p99 === null ? "-" : ms(p99), p99, "Total p99");
+        cell(tr, r.throughput_fps.toFixed(1), -r.throughput_fps, "req/s");
         var rauc = r.accuracy && r.accuracy.frame_roc ? r.accuracy.frame_roc.auc : null;
         apCell(tr, acc && acc.ap50, acc && acc.ap_basis, "AP50", "AP50"); apCell(tr, acc && acc.ap50_95, acc && acc.ap_basis, "AP50-95", "AP50-95");
         [["ROC AUC", rauc], ["P", acc && acc.precision], ["R", acc && acc.recall]].forEach(function (p) { cell(tr, pct(p[1]), p[1] === null || p[1] === undefined ? null : -p[1], p[0]); });
@@ -1070,6 +1097,8 @@
         if (r.grades) { g.append(gradeEl(r.grades.overall), " ", gradeEl(r.grades.accuracy, r.grades.relative), " ", gradeEl(r.grades.speed)); g.title = "overall / accuracy" + metricTag(r.grades) + " / speed"; }
         var ag = cell(tr, verdictText(r.agreement), undefined, "Agreement");
         if (r.agreement && r.agreement.verdict === "disagrees") { tr.classList.add("bad"); ag.title = "detections differ from " + r.agreement.reference + "; never recommended"; }
+        else if (r.agreement && r.agreement.verdict === "minor") ag.title = "minor differences from " + r.agreement.reference + " (mean per-image match " + pct(r.agreement.score) + "); reported, never recommended";
+        else if (r.agreement && r.agreement.verdict === "not_checked") ag.title = "no CPU device ran in this run, so nothing was compared; recommended only when it is the only device that ran";
         var tc = cell(tr, "", undefined, "Trust"); tc.appendChild(PB.trustBadge(d.trust, "dev"));
         var act = el("td", "actions-cell");
         if (!(c.device && c.device === d.device)) { var u = el("button", "small", "Use " + d.device); u.type = "button"; u.title = "Run " + m.model + " on " + d.device + "; its confidence follows the device through the saved profiles (save them in Tune)"; u.addEventListener("click", function () { u.disabled = true; useDevice(m.model, d.device); }); act.appendChild(u); }
@@ -1079,6 +1108,7 @@
       t.tBodies[0].appendChild(tr);
     });
     card.appendChild(wrap(t, "dev:" + key));
+    m.devices.forEach(function (d) { var sl = d.run && sharedLoadText(d.run); if (sl) card.appendChild(el("p", "warn", "⚠ " + d.device + ": " + sl + ".")); });
     if (m.skipped && m.skipped.length) card.appendChild(el("p", "muted", "Not runnable here: " + m.skipped.join("; ")));
     card.appendChild(thresholdBlock(m));
     var rr = recRun(m) || (fastest && fastest.run); if (rr) card.appendChild(details(key, rr));
@@ -1106,7 +1136,7 @@
       var c = im.counts || {tp: 0, fp: 0, fn: 0};
       if (f === "miss" && !c.fn) return; if (f === "fp" && !c.fp) return; if (f === "err" && !c.fn && !c.fp) return;
       var fig = el("figure", "thumb"), cv = el("canvas"); fig.appendChild(cv);
-      fig.appendChild(el("figcaption", null, im.file + " · " + ms(im.totalMs) + " ms · TP " + c.tp + " FP " + c.fp + " FN " + c["fn"] + (im.tags.length ? " · " + im.tags.join(", ") : "")));
+      fig.appendChild(el("figcaption", null, im.file + " · " + ms(im.totalMs) + " ms · TP " + c.tp + " FP " + c.fp + " FN " + c["fn"] + (im.scene ? " · scene " + im.scene : "") + (im.tags.length ? " · " + im.tags.join(", ") : "")));
       body.appendChild(fig);
       var img = new Image();
       img.onload = function () {
@@ -1139,7 +1169,9 @@
         var d = (m.devices || []).find(function (x) { return x.device === dv; }), r = d && d.run; if (!r || !r.stages_ms || !r.stages_ms.total) return;
         var n = maxImages > 0 ? maxImages * Math.max(1, nsets) : m.images; if (!n) return;
         var per = r.stages_ms.total.mean || r.stages_ms.total.p50;
-        total += (r.compile_ms || 0) / 1000 + (warmup + repeat * n) * per / 1000; known++;
+        // The warm-up lasts 2 to 20 s once it is on (`run::WarmupRule`).
+        var warm = warmup > 0 ? Math.min(20, Math.max(2, warmup * per / 1000)) : 0;
+        total += (r.compile_ms || 0) / 1000 + warm + repeat * n * per / 1000; known++;
       });
     });
     if (!pairs) { out.textContent = ""; return; }

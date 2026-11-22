@@ -677,6 +677,16 @@ impl Metrics {
         }
     }
 
+    /// Detection requests received so far over every model (`requests_total` summed): what a
+    /// benchmark records as the live load it ran beside.
+    pub fn detection_requests(&self) -> u64 {
+        self.models
+            .read_recover()
+            .iter()
+            .map(|m| m.requests.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Detection requests being handled now.
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::Acquire)

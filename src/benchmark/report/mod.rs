@@ -1,6 +1,9 @@
-//! Benchmark results: per-device agreement with the CPU reference, the recommended device per
-//! model, and the persisted `benchmark.json` (the latest run of every model, next to the config
-//! file) that the CLI and the web UI both read and write.
+//! Benchmark results: per-device agreement with the CPU reference (image by image over the
+//! images both ran, the mean per-image share of matched objects; "not checked" without a CPU
+//! reference, B7), the recommended device per model (only a device that agrees, or the one
+//! device of a run without a reference), what a run shared the machine with
+//! ([`shared_load_text`]), and the persisted `benchmark.json` (the latest run of every model,
+//! next to the config file) that the CLI and the web UI both read and write.
 
 use super::grade::{AccuracyMetric, Grade, Grades, Weights};
 use super::images::{GroundTruth, ImageSet, SetKind};
@@ -43,24 +46,29 @@ pub enum Verdict {
     Reference,
     /// Same objects, confidences within a few hundredths.
     Agrees,
-    /// Mostly the same objects (e.g. one borderline detection more or less).
+    /// Mostly the same objects (e.g. one borderline detection more or less). Reported, never
+    /// recommended (B7: a device down to half the objects matched is weak evidence).
     Minor,
     /// Different objects or confidences: the device computes something else (precision
     /// problem, broken kernel). Never recommended.
     Disagrees,
+    /// No CPU reference ran for this model (or the two shared no image): nothing was compared.
+    /// Recommended only as the one device of its model that ran ([`DeviceResult::eligible`]).
+    #[serde(rename = "not_checked")]
+    NotChecked,
 }
 
 impl Verdict {
-    /// Can be recommended.
+    /// Checked and close enough to be recommended (the reference itself, or agreeing).
     pub fn acceptable(self) -> bool {
-        self != Verdict::Disagrees
+        matches!(self, Verdict::Reference | Verdict::Agrees)
     }
 }
 
 /// Agreement of one device's detections with the reference device's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Agreement {
-    /// Reference device spec ("openvino:cpu" or "ort:cpu").
+    /// Reference device spec ("openvino:cpu" or "ort:cpu"); empty when not checked.
     pub reference: String,
     pub matched: usize,
     /// Detections only this device found.
@@ -69,60 +77,200 @@ pub struct Agreement {
     pub only_reference: usize,
     pub max_confidence_diff: f32,
     pub mean_confidence_diff: f32,
-    /// `matched / max(device, reference)` detections (1 when both found nothing).
+    /// Mean over the images both ran of `matched / max(device, reference)` detections (1 for
+    /// an image where both found nothing); results of older versions pooled every image.
     pub score: f32,
     pub verdict: Verdict,
+    /// Images compared (by set and file name; [`run_agreement`]). 0 in results of older
+    /// versions and for an unchecked device.
+    #[serde(default)]
+    pub images: usize,
 }
 
-/// Score at or above which (with small confidence differences) a device agrees.
+impl Agreement {
+    /// The agreement of a device no reference checked ([`Verdict::NotChecked`]).
+    pub fn not_checked() -> Self {
+        Self {
+            reference: String::new(),
+            matched: 0,
+            only_device: 0,
+            only_reference: 0,
+            max_confidence_diff: 0.0,
+            mean_confidence_diff: 0.0,
+            score: 0.0,
+            verdict: Verdict::NotChecked,
+            images: 0,
+        }
+    }
+}
+
+/// Mean per-image score at or above which (with small confidence differences) a device agrees.
 const AGREE_SCORE: f32 = 0.8;
 const AGREE_CONF: f32 = 0.05;
 /// Below this score (or above this mean confidence difference) a device disagrees.
 const MINOR_SCORE: f32 = 0.5;
 const MINOR_CONF: f32 = 0.15;
 
-/// Compare `device` detections with `reference` detections (IoU >= [`MATCH_IOU`], same label).
+/// Compare `device` detections with `reference` detections of one image (IoU >= [`MATCH_IOU`],
+/// same label).
 pub(crate) fn agreement(
     device: &[Detection],
     reference: &[Detection],
     reference_spec: &str,
 ) -> Agreement {
     let c: Comparison = compare(device, reference, MATCH_IOU);
-    verdict_of(&c, device.len().max(reference.len()), reference_spec)
+    let mut a = verdict_of(
+        &c,
+        image_score(&c, device.len(), reference.len()),
+        reference_spec,
+    );
+    a.images = 1;
+    a
 }
 
-/// Agreement of `device`'s detections with `reference`'s over every image both ran.
+/// One image's agreement score: `matched / max(n_device, n_reference)`, 1 when both are empty.
+fn image_score(c: &Comparison, n_device: usize, n_reference: usize) -> f32 {
+    match n_device.max(n_reference) {
+        0 => 1.0,
+        n => c.matched as f32 / n as f32,
+    }
+}
+
+/// Agreement of `device`'s detections with `reference`'s, image by image over the images both
+/// ran (matched by set and file name, B7), both at the same threshold, so the only difference
+/// left is the hardware path (a broken kernel, an FP16 overflow), never the user's saved
+/// confidence profiles: [`agreement_threshold`] applied to both sides ([`agreement_dets`]). The
+/// score is the mean per-image score ([`image_score`]), the counts and confidence differences
+/// are summed over those images. Two runs without per-image results (results of old versions)
+/// compare their first image's detections; runs that share no image are
+/// [`Verdict::NotChecked`].
 pub(crate) fn run_agreement(
     device: &RunResult,
     reference: &RunResult,
     reference_spec: &str,
 ) -> Agreement {
-    let dets = |r: &RunResult, k: usize| -> Vec<Detection> {
-        r.per_image
-            .get(k)
-            .map(|i| i.preds.iter().map(Detection::from).collect())
-            .unwrap_or_default()
-    };
-    if device.per_image.is_empty() || device.per_image.len() != reference.per_image.len() {
+    if device.per_image.is_empty() && reference.per_image.is_empty() {
         return agreement(&device.detections, &reference.detections, reference_spec);
     }
-    let mut total = Comparison::default();
-    let (mut n_dev, mut n_ref) = (0, 0);
-    for k in 0..device.per_image.len() {
-        let (a, b) = (dets(device, k), dets(reference, k));
-        n_dev += a.len();
-        n_ref += b.len();
-        total.merge(&compare(&a, &b, MATCH_IOU));
+    let (source, t) = agreement_threshold(device, reference);
+    // A name listed twice (a hand-made set) pairs its occurrences in order.
+    let mut by_name: HashMap<(&str, &str), std::collections::VecDeque<usize>> = HashMap::new();
+    for (k, i) in reference.per_image.iter().enumerate() {
+        by_name
+            .entry((i.set.as_str(), i.file.as_str()))
+            .or_default()
+            .push_back(k);
     }
-    verdict_of(&total, n_dev.max(n_ref), reference_spec)
+    let mut total = Comparison::default();
+    let (mut sum, mut n) = (0.0f64, 0usize);
+    for (k, img) in device.per_image.iter().enumerate() {
+        let Some(r) = by_name
+            .get_mut(&(img.set.as_str(), img.file.as_str()))
+            .and_then(std::collections::VecDeque::pop_front)
+        else {
+            continue;
+        };
+        let a = agreement_dets(device, k, source, t);
+        let b = agreement_dets(reference, r, source, t);
+        let c = compare(&a, &b, MATCH_IOU);
+        sum += f64::from(image_score(&c, a.len(), b.len()));
+        n += 1;
+        total.merge(&c);
+    }
+    if n == 0 {
+        return Agreement {
+            reference: reference_spec.to_string(),
+            ..Agreement::not_checked()
+        };
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a mean of scores in 0..=1, kept as f32 like the other fields"
+    )]
+    let score = (sum / n as f64) as f32;
+    let mut a = verdict_of(&total, score, reference_spec);
+    a.images = n;
+    a
 }
 
-fn verdict_of(c: &Comparison, n: usize, reference_spec: &str) -> Agreement {
-    let score = if n == 0 {
-        1.0
-    } else {
-        c.matched as f32 / n as f32
+/// Which predictions [`run_agreement`] compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgreementSource {
+    /// The 0.05 evaluation predictions of both runs (a run in memory; the same class mapping
+    /// and no object filter or cap on either side).
+    Eval,
+    /// The stored per-image predictions (results loaded from `benchmark.json`, which keeps no
+    /// evaluation predictions): each holds only boxes at or above its own served threshold.
+    Stored,
+}
+
+/// The predictions and the one threshold both sides are compared at: the evaluation predictions
+/// at the checked `device`'s served threshold when both runs hold them for every image (and
+/// they are not empty everywhere while the stored ones are not: a model without a scored class
+/// has no evaluation boxes); else the stored predictions at the higher of the two served
+/// thresholds (below it one side kept nothing). None = no threshold recorded (results of
+/// older versions): the stored predictions as they are.
+fn agreement_threshold(
+    device: &RunResult,
+    reference: &RunResult,
+) -> (AgreementSource, Option<f32>) {
+    let has_eval = |r: &RunResult| {
+        r.eval_preds.len() == r.per_image.len()
+            && (r.eval_preds.iter().any(|v| !v.is_empty())
+                || r.per_image.iter().all(|i| i.preds.is_empty()))
     };
+    if has_eval(device) && has_eval(reference) {
+        let t = device.served_threshold.unwrap_or(super::EVAL_CONFIDENCE);
+        return (AgreementSource::Eval, Some(t));
+    }
+    let t = match (device.served_threshold, reference.served_threshold) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    (AgreementSource::Stored, t)
+}
+
+/// Image `k`'s predictions of `run` for [`run_agreement`], at or above `t`.
+fn agreement_dets(
+    run: &RunResult,
+    k: usize,
+    source: AgreementSource,
+    t: Option<f32>,
+) -> Vec<Detection> {
+    let keep = |c: f32| t.is_none_or(|t| c >= t);
+    match source {
+        AgreementSource::Eval => run
+            .eval_preds
+            .get(k)
+            .map(|v| {
+                v.iter()
+                    .filter(|p| keep(p.confidence))
+                    .map(|p| {
+                        Detection::from(&super::ImagePred {
+                            label: p.label.clone(),
+                            confidence: p.confidence,
+                            bbox: p.bbox,
+                            tp: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        AgreementSource::Stored => run
+            .per_image
+            .get(k)
+            .map(|i| {
+                i.preds
+                    .iter()
+                    .filter(|p| keep(p.confidence))
+                    .map(Detection::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn verdict_of(c: &Comparison, score: f32, reference_spec: &str) -> Agreement {
     let verdict = if score >= AGREE_SCORE && c.mean_confidence_diff <= AGREE_CONF {
         Verdict::Agrees
     } else if score >= MINOR_SCORE && c.mean_confidence_diff <= MINOR_CONF {
@@ -139,6 +287,7 @@ fn verdict_of(c: &Comparison, n: usize, reference_spec: &str) -> Agreement {
         mean_confidence_diff: c.mean_confidence_diff,
         score,
         verdict,
+        images: 0,
     }
 }
 
@@ -199,9 +348,20 @@ impl DeviceResult {
             .and_then(|r| r.grades.as_ref())
     }
 
-    /// Ran and its detections are acceptable (or could not be checked: no reference).
-    pub fn eligible(&self) -> bool {
-        self.ok() && self.agreement().is_none_or(|a| a.verdict.acceptable())
+    /// Ran, and may be recommended among `devices` (its model's sweep, this one included): its
+    /// detections were checked and agree with the CPU reference (or it is the reference), or
+    /// nothing was checked ([`Verdict::NotChecked`], no agreement at all) and it is the only
+    /// device of the sweep that ran: a default run (each model on its own device) still
+    /// recommends the configured device, and an unchecked device is never put over a checked
+    /// one (B7).
+    pub fn eligible(&self, devices: &[DeviceResult]) -> bool {
+        if !self.ok() {
+            return false;
+        }
+        match self.agreement().map(|a| a.verdict) {
+            Some(v) if v != Verdict::NotChecked => v.acceptable(),
+            _ => devices.iter().filter(|d| d.ok()).count() == 1,
+        }
     }
 }
 
@@ -333,15 +493,22 @@ impl ModelResult {
             run.agreement = match &reference {
                 Some((spec, _)) if ok && *spec == d.device => Some(Agreement {
                     reference: spec.clone(),
-                    matched: run.detections.len(),
+                    // Every image's detections (the first image's for results of old versions).
+                    matched: if run.per_image.is_empty() {
+                        run.detections.len()
+                    } else {
+                        run.per_image.iter().map(|i| i.preds.len()).sum()
+                    },
                     only_device: 0,
                     only_reference: 0,
                     max_confidence_diff: 0.0,
                     mean_confidence_diff: 0.0,
                     score: 1.0,
                     verdict: Verdict::Reference,
+                    images: run.per_image.len().max(1),
                 }),
                 Some((spec, reference)) if ok => Some(run_agreement(run, reference, spec)),
+                None if ok => Some(Agreement::not_checked()),
                 _ => None,
             };
         }
@@ -349,8 +516,8 @@ impl ModelResult {
         self.recommended = rec.device;
         self.recommendation = match &self.reference {
             Some(_) => rec.reason,
-            None if self.devices.iter().any(DeviceResult::ok) => format!(
-                "{} (no CPU reference ran, detections not checked)",
+            None if self.recommended.is_some() => format!(
+                "{} (no CPU reference ran, detections not checked against CPU)",
                 rec.reason
             ),
             None => rec.reason,
@@ -366,6 +533,21 @@ impl ModelResult {
             self.recommendation.push_str("; ");
             self.recommendation.push_str(&t);
         }
+    }
+
+    /// What the run shared the machine with, one sentence per device that ran beside live
+    /// detection requests ([`RunResult::live_requests`]) or GPU video decode
+    /// ([`RunResult::video_decode_pct`], mean of at least [`SHOWN_DECODE_PCT`]): the run's
+    /// warnings and the page say so next to its numbers.
+    pub fn shared_load_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for d in &self.devices {
+            let Some(r) = d.run.as_ref() else { continue };
+            if let Some(w) = shared_load_text(r) {
+                out.push(format!("{} on {}: {w}", self.model, d.device));
+            }
+        }
+        out
     }
 
     /// Grades of the recommended device.
@@ -397,6 +579,62 @@ impl ModelResult {
             .filter_map(|d| d.total_p50().map(|p| (d, p)))
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(d, _)| d)
+    }
+}
+
+/// A mean GPU video-decode load below this (percent) is not worth a warning (an idle engine
+/// reads 0-1%).
+pub const SHOWN_DECODE_PCT: f64 = 1.0;
+
+/// What a run shared the machine with: "measured while serving 14 requests/min; Blue Iris /
+/// other video decode on the GPU: 31% during the run (max 48%)"; None when neither was seen.
+pub fn shared_load_text(r: &RunResult) -> Option<String> {
+    let mut parts = Vec::new();
+    if let (Some(n), Some(per_min)) = (r.live_requests, r.live_requests_per_min)
+        && n > 0
+    {
+        parts.push(format!(
+            "measured while serving {} requests/min ({n} live requests during the timed runs)",
+            round_rate(per_min)
+        ));
+    }
+    if let Some(v) = r.video_decode_pct
+        && v.mean >= SHOWN_DECODE_PCT
+    {
+        parts.push(format!(
+            "Blue Iris / other video decode on the GPU: {:.0}% during the run (max {:.0}%)",
+            v.mean, v.max
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// A run's first load (compile + request creation) as shown: "2.1 s, cached" (an OpenVINO /
+/// TensorRT / CoreML cache hit), "24 s, compiled" (a miss: compiled and cached now), "0.8 s" (a
+/// runtime without a compile cache), "3.0 s, cache off", "3.0 s, cache unknown". Twin:
+/// `loadText` in `assets/benchmark.js`.
+pub fn first_load_text(compile_ms: f64, cache: &str) -> String {
+    let s = compile_ms.max(0.0) / 1e3;
+    let secs = if s >= 10.0 {
+        format!("{s:.0} s")
+    } else {
+        format!("{s:.1} s")
+    };
+    match cache {
+        "hit" => format!("{secs}, cached"),
+        "miss" => format!("{secs}, compiled"),
+        "disabled" => format!("{secs}, cache off"),
+        "unknown" => format!("{secs}, cache unknown"),
+        _ => secs,
+    }
+}
+
+/// A requests/min figure as shown: whole numbers from 10 up, one decimal below.
+fn round_rate(per_min: f64) -> String {
+    if per_min >= 10.0 {
+        format!("{per_min:.0}")
+    } else {
+        format!("{per_min:.1}")
     }
 }
 
@@ -507,6 +745,11 @@ pub struct ImageInfo {
     /// Ground truth (or pseudo ground truth) used for scoring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objects: Option<Vec<GtBox>>,
+    /// The scene the service computes for the frame ([`super::ImageRun::scene`], filled from
+    /// the runs by [`BenchmarkResults::with_sets`]); None in results saved before it was
+    /// recorded (the scene splits then read the manifest's tags, [`super::images::in_split`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<crate::image_stats::Scene>,
 }
 
 /// A dataset as recorded in the results.
@@ -552,6 +795,7 @@ impl ImageSetInfo {
                     height: i.height,
                     tags: i.tags.clone(),
                     objects: i.gt.clone(),
+                    scene: None,
                 })
                 .collect(),
         }
@@ -829,8 +1073,25 @@ impl BenchmarkResults {
     }
 
     /// With the datasets the models ran on.
+    /// The results with `sets` as their image sets, each image's computed scene taken from the
+    /// runs ([`super::ImageRun::scene`]: every run of the same frame computes the same one).
     pub fn with_sets(mut self, sets: &[ImageSet]) -> Self {
         self.image_sets = sets.iter().map(ImageSetInfo::of).collect();
+        let mut scenes: HashMap<(String, String), crate::image_stats::Scene> = HashMap::new();
+        for m in &self.models {
+            for r in m.devices.iter().filter_map(|d| d.run.as_ref()) {
+                for i in &r.per_image {
+                    if let Some(sc) = i.scene {
+                        scenes.entry((i.set.clone(), i.file.clone())).or_insert(sc);
+                    }
+                }
+            }
+        }
+        for set in &mut self.image_sets {
+            for img in &mut set.images {
+                img.scene = scenes.get(&(set.id.clone(), img.file.clone())).copied();
+            }
+        }
         self
     }
 
@@ -1149,6 +1410,33 @@ impl BenchmarkResults {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// One image of a run with `dets` as its stored predictions.
+    fn image_run(file: &str, dets: Vec<Detection>) -> super::super::ImageRun {
+        super::super::ImageRun {
+            set: "s".into(),
+            file: file.into(),
+            total_ms: 1.0,
+            infer_ms: 1.0,
+            preds: dets
+                .iter()
+                .map(|d| super::super::ImagePred {
+                    label: d.label.clone(),
+                    confidence: d.confidence,
+                    bbox: [
+                        d.x_min as f32,
+                        d.y_min as f32,
+                        d.x_max as f32,
+                        d.y_max as f32,
+                    ],
+                    tp: None,
+                })
+                .collect(),
+            gt_matched: vec![],
+            counts: None,
+            scene: None,
+        }
+    }
 
     #[test]
     fn agreement_verdicts() {
@@ -1479,47 +1767,320 @@ mod tests {
 
     #[test]
     fn agreement_over_many_images() {
-        let img = |dets: Vec<Detection>| super::super::ImageRun {
-            set: "s".into(),
-            file: "f".into(),
-            total_ms: 1.0,
-            infer_ms: 1.0,
-            preds: dets
-                .iter()
-                .map(|d| super::super::ImagePred {
-                    label: d.label.clone(),
-                    confidence: d.confidence,
-                    bbox: [
-                        d.x_min as f32,
-                        d.y_min as f32,
-                        d.x_max as f32,
-                        d.y_max as f32,
-                    ],
-                    tp: None,
-                })
-                .collect(),
-            gt_matched: vec![],
-            counts: None,
-        };
         let mut reference = run("openvino:cpu", 10.0, vec![]);
-        reference.per_image = vec![img(scene()), img(scene())];
+        reference.per_image = vec![image_run("a", scene()), image_run("b", scene())];
         let mut same = run("ort:coreml", 5.0, vec![]);
-        same.per_image = vec![img(scene()), img(scene())];
+        same.per_image = vec![image_run("a", scene()), image_run("b", scene())];
         let a = run_agreement(&same, &reference, "openvino:cpu");
-        assert_eq!((a.matched, a.verdict), (6, Verdict::Agrees));
-        // Second image empty: 3 of 6 -> minor.
+        assert_eq!((a.matched, a.verdict, a.images), (6, Verdict::Agrees, 2));
+        // Second image empty: 3 of 6 matched, per image 1 and 0 -> minor.
         let mut half = run("ort:coreml", 5.0, vec![]);
-        half.per_image = vec![img(scene()), img(vec![])];
+        half.per_image = vec![image_run("a", scene()), image_run("b", vec![])];
         let a = run_agreement(&half, &reference, "openvino:cpu");
         assert_eq!(
-            (a.matched, a.only_reference, a.verdict),
-            (3, 3, Verdict::Minor)
+            (a.matched, a.only_reference, a.score, a.verdict),
+            (3, 3, 0.5, Verdict::Minor)
         );
         let mut none = run("ort:coreml", 5.0, vec![]);
-        none.per_image = vec![img(vec![]), img(vec![])];
+        none.per_image = vec![image_run("a", vec![]), image_run("b", vec![])];
         assert_eq!(
             run_agreement(&none, &reference, "x").verdict,
             Verdict::Disagrees
+        );
+    }
+
+    /// B7: images are matched by set and file name, not by position, and runs of different
+    /// image counts compare the images both ran (the old rule fell back to the first image's
+    /// detections then, which agreed here).
+    #[test]
+    fn agreement_compares_the_images_both_ran_by_name() {
+        let mut reference = run("openvino:cpu", 10.0, scene());
+        reference.per_image = vec![
+            image_run("a", scene()),
+            image_run("b", scene()),
+            image_run("c", scene()),
+        ];
+        // The first image agrees; the two others both ran are empty on the device; "x" only ran
+        // here.
+        let mut device = run("ort:coreml", 5.0, scene());
+        device.per_image = vec![
+            image_run("x", scene()),
+            image_run("b", vec![]),
+            image_run("c", vec![]),
+        ];
+        let a = run_agreement(&device, &reference, "openvino:cpu");
+        assert_eq!(
+            (a.images, a.matched, a.only_reference, a.verdict),
+            (2, 0, 6, Verdict::Disagrees)
+        );
+        // In another order, the same images agree.
+        device.per_image = vec![image_run("c", scene()), image_run("b", scene())];
+        let a = run_agreement(&device, &reference, "openvino:cpu");
+        assert_eq!((a.images, a.matched, a.verdict), (2, 6, Verdict::Agrees));
+        // Another set's image of the same name is another image.
+        let mut other = image_run("b", scene());
+        other.set = "t".into();
+        device.per_image = vec![other];
+        let a = run_agreement(&device, &reference, "openvino:cpu");
+        assert_eq!((a.images, a.verdict), (0, Verdict::NotChecked));
+    }
+
+    /// B7: the score is the mean of the per-image scores (1 for an image both left empty), not
+    /// the pooled share, so one crowded image does not outweigh the others; the confidence rule
+    /// still applies.
+    #[test]
+    fn agreement_is_the_mean_per_image_score() {
+        let cars = |n: usize, conf: f32| -> Vec<Detection> {
+            (0..n)
+                .map(|i| det("car", conf, [i * 100, 0, i * 100 + 50, 50]))
+                .collect()
+        };
+        let mut reference = run("openvino:cpu", 10.0, vec![]);
+        reference.per_image = vec![
+            image_run("a", cars(1, 0.9)),
+            image_run("b", vec![]),
+            image_run("c", cars(8, 0.9)),
+        ];
+        let mut device = run("ort:coreml", 5.0, vec![]);
+        device.per_image = vec![
+            image_run("a", cars(1, 0.9)),
+            image_run("b", vec![]),
+            image_run("c", cars(4, 0.9)),
+        ];
+        // Per image 1, 1 and 4/8: mean 0.83 agrees (pooled 5 of 9 was "minor").
+        let a = run_agreement(&device, &reference, "openvino:cpu");
+        assert!((a.score - 2.5 / 3.0).abs() < 1e-6, "{}", a.score);
+        assert_eq!((a.matched, a.verdict), (5, Verdict::Agrees));
+        // The same boxes 0.1 apart in confidence: minor, 0.2 apart: disagrees.
+        for (conf, verdict) in [(0.8, Verdict::Minor), (0.7, Verdict::Disagrees)] {
+            device.per_image = vec![
+                image_run("a", cars(1, conf)),
+                image_run("b", vec![]),
+                image_run("c", cars(8, conf)),
+            ];
+            let a = run_agreement(&device, &reference, "openvino:cpu");
+            assert_eq!((a.score, a.verdict), (1.0, verdict), "{conf}");
+        }
+    }
+
+    /// The agreement compares both devices at the checked device's served threshold, applied
+    /// to both sides' 0.05 evaluation predictions: saved confidence profiles (GPU 0.35, CPU
+    /// 0.40) over identical raw outputs agree. Results loaded from `benchmark.json` (no
+    /// evaluation predictions) compare the stored predictions at the higher of the two
+    /// thresholds, again the same on both sides.
+    #[test]
+    fn agreement_compares_both_devices_at_one_threshold() {
+        use super::super::metrics::PredBox;
+        let raw = |k: usize| -> Vec<PredBox> {
+            [0.9f32, 0.38, 0.36]
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| PredBox {
+                    label: "person".into(),
+                    confidence: c,
+                    bbox: [
+                        (k * 10 + i * 200) as f32,
+                        0.0,
+                        (k * 10 + i * 200 + 50) as f32,
+                        80.0,
+                    ],
+                })
+                .collect()
+        };
+        let run_at = |spec: &str, t: f32| {
+            let mut r = run(spec, 10.0, vec![]);
+            r.served_threshold = Some(t);
+            r.eval_preds = (0..3).map(raw).collect();
+            r.per_image = (0..3)
+                .map(|k| {
+                    let dets: Vec<Detection> = raw(k)
+                        .iter()
+                        .filter(|p| p.confidence >= t)
+                        .map(|p| {
+                            let b = p.bbox.map(|v| v as usize);
+                            det(&p.label, p.confidence, b)
+                        })
+                        .collect();
+                    image_run(&format!("{k}.jpg"), dets)
+                })
+                .collect();
+            r
+        };
+        let gpu = run_at("openvino:gpu.0", 0.35);
+        let cpu = run_at("openvino:cpu", 0.40);
+        let a = run_agreement(&gpu, &cpu, "openvino:cpu");
+        assert_eq!(
+            (a.verdict, a.score, a.matched, a.images),
+            (Verdict::Agrees, 1.0, 9, 3),
+            "{a:?}"
+        );
+        // Loaded results: no evaluation predictions; the stored ones at max(0.35, 0.40).
+        let (mut g, mut c) = (gpu.clone(), cpu.clone());
+        g.eval_preds.clear();
+        c.eval_preds.clear();
+        let a = run_agreement(&g, &c, "openvino:cpu");
+        assert_eq!(
+            (a.verdict, a.score, a.matched),
+            (Verdict::Agrees, 1.0, 3),
+            "{a:?}"
+        );
+        // A different hardware path still shows: the GPU loses its strongest box.
+        let mut broken = gpu.clone();
+        for v in &mut broken.eval_preds {
+            v.remove(0);
+        }
+        let a = run_agreement(&broken, &cpu, "openvino:cpu");
+        assert_ne!(a.verdict, Verdict::Agrees, "{a:?}");
+    }
+
+    /// B7: only a checked, agreeing device (or the reference) is recommended: a faster device
+    /// with minor differences is reported, never recommended. The reference row counts every
+    /// image's detections.
+    #[test]
+    fn a_minor_device_is_never_recommended() {
+        let mut cpu = dev("openvino:cpu", 50.0, scene());
+        let mut gpu = dev("openvino:gpu.0", 5.0, scene());
+        if let (Some(c), Some(g)) = (cpu.run.as_mut(), gpu.run.as_mut()) {
+            c.per_image = vec![image_run("a", scene()), image_run("b", scene())];
+            // Two of three objects on each image: 0.67, minor.
+            g.per_image = vec![
+                image_run("a", scene()[..2].to_vec()),
+                image_run("b", scene()[..2].to_vec()),
+            ];
+        }
+        let m = model(vec![gpu, cpu], None);
+        let verdicts: Vec<_> = m
+            .devices
+            .iter()
+            .map(|d| d.agreement().map(|a| (a.verdict, a.matched)))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [Some((Verdict::Minor, 4)), Some((Verdict::Reference, 6))]
+        );
+        assert!(!m.devices[0].eligible(&m.devices));
+        assert_eq!(m.recommended.as_deref(), Some("openvino:cpu"));
+        assert!(
+            m.recommendation
+                .contains("openvino:gpu.0 (minor differences)"),
+            "{}",
+            m.recommendation
+        );
+        assert_eq!(speed_order(&m.devices), ["openvino:cpu"]);
+    }
+
+    /// B7: without a CPU reference a device is "not checked": alone (a default run, each model on
+    /// its own device) it is still recommended, with that said; two unchecked devices are not
+    /// ranked against each other, and one that ran beside a failed one is still alone.
+    #[test]
+    fn unchecked_devices_are_recommended_only_alone() {
+        let m = model(vec![dev("ort:coreml", 5.0, scene())], Some("ort:coreml"));
+        assert_eq!(
+            m.devices[0].agreement().map(|a| a.verdict),
+            Some(Verdict::NotChecked)
+        );
+        assert_eq!(m.recommended.as_deref(), Some("ort:coreml"));
+        assert!(
+            m.recommendation.contains("not checked against CPU"),
+            "{}",
+            m.recommendation
+        );
+        let m = model(
+            vec![
+                dev("ort:coreml", 5.0, scene()),
+                dev("openvino:gpu.0", 9.0, scene()),
+            ],
+            Some("ort:coreml"),
+        );
+        assert_eq!(m.recommended, None);
+        assert!(
+            m.recommendation.contains("no CPU reference ran"),
+            "{}",
+            m.recommendation
+        );
+        assert!(speed_order(&m.devices).is_empty());
+        let m = model(
+            vec![dev("ort:coreml", 5.0, scene()), failed("openvino:gpu.0")],
+            None,
+        );
+        assert_eq!(m.recommended.as_deref(), Some("ort:coreml"));
+        // The verdict round-trips; results of older versions without `images` load.
+        let json = serde_json::to_value(m.devices[0].agreement().unwrap()).unwrap();
+        assert_eq!(json["verdict"], "not_checked");
+        let old: Agreement = serde_json::from_value(serde_json::json!({
+            "reference": "openvino:cpu", "matched": 3, "only_device": 0, "only_reference": 0,
+            "max_confidence_diff": 0.0, "mean_confidence_diff": 0.0, "score": 1.0,
+            "verdict": "minor"
+        }))
+        .unwrap();
+        assert_eq!((old.verdict, old.images), (Verdict::Minor, 0));
+        assert!(!Verdict::Minor.acceptable() && !Verdict::NotChecked.acceptable());
+    }
+
+    /// The stored image sets carry each frame's computed scene from the runs (what the
+    /// Compare view and threshold search split Day / Night / IR by).
+    #[test]
+    fn stored_sets_carry_the_computed_scene() {
+        use crate::image_stats::Scene;
+        let mut set = ImageSet::sample();
+        set.id = "s".into();
+        let file = set.images[0].file.clone();
+        let mut m = model(vec![dev("openvino:cpu", 5.0, vec![])], None);
+        if let Some(r) = m.devices[0].run.as_mut() {
+            let mut i = image_run(&file, vec![]);
+            i.scene = Some(Scene::Ir);
+            r.per_image = vec![i];
+        }
+        let results =
+            BenchmarkResults::new(HardwareSummary::default(), Default::default(), vec![m])
+                .with_sets(std::slice::from_ref(&set));
+        let info = &results.image_sets[0].images[0];
+        assert_eq!(info.scene, Some(Scene::Ir));
+        let json = serde_json::to_value(info).unwrap();
+        assert_eq!(json["scene"], "ir");
+        // Without a run of the frame, no scene (the manifest's tags then split it).
+        let bare = BenchmarkResults::new(HardwareSummary::default(), Default::default(), vec![])
+            .with_sets(std::slice::from_ref(&set));
+        assert_eq!(bare.image_sets[0].images[0].scene, None);
+        assert!(serde_json::to_value(&bare.image_sets[0].images[0]).unwrap()["scene"].is_null());
+    }
+
+    /// The first-load cell ("2.1 s, cached" / "24 s, compiled") and the shared-load sentence.
+    #[test]
+    fn first_load_and_shared_load_texts() {
+        assert_eq!(first_load_text(2_140.0, "hit"), "2.1 s, cached");
+        assert_eq!(first_load_text(24_300.0, "miss"), "24 s, compiled");
+        assert_eq!(first_load_text(800.0, "none"), "0.8 s");
+        assert_eq!(first_load_text(3_000.0, "disabled"), "3.0 s, cache off");
+        assert_eq!(first_load_text(3_000.0, "unknown"), "3.0 s, cache unknown");
+        let mut r = run("openvino:gpu.0", 5.0, vec![]);
+        assert_eq!(shared_load_text(&r), None);
+        r.live_requests = Some(0);
+        r.live_requests_per_min = Some(0.0);
+        assert_eq!(shared_load_text(&r), None);
+        r.live_requests = Some(7);
+        r.live_requests_per_min = Some(14.2);
+        r.video_decode_pct = Some(crate::backend::video_decode::VideoDecode {
+            mean: 31.4,
+            max: 48.0,
+            samples: 20,
+        });
+        assert_eq!(
+            shared_load_text(&r).as_deref(),
+            Some(
+                "measured while serving 14 requests/min (7 live requests during the timed \
+                 runs); Blue Iris / other video decode on the GPU: 31% during the run (max 48%)"
+            )
+        );
+        let mut m = model(vec![dev("openvino:gpu.0", 5.0, vec![])], None);
+        if let Some(run) = m.devices[0].run.as_mut() {
+            run.video_decode_pct = r.video_decode_pct;
+        }
+        assert_eq!(
+            m.shared_load_warnings(),
+            [
+                "m on openvino:gpu.0: Blue Iris / other video decode on the GPU: 31% during the run (max 48%)"
+            ]
         );
     }
 
@@ -1541,6 +2102,7 @@ mod tests {
                 height: 1,
                 tags: vec![],
                 objects: None,
+                scene: None,
             }],
         };
         assert_eq!(info.image_path("a.jpg"), Some("/data/s/a.jpg".into()));

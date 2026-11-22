@@ -616,6 +616,12 @@ pub struct RunContext {
     pub loaded: HashMap<String, String>,
     /// Download manager access (auto-download of built-in datasets).
     pub resources: Option<crate::resources::status::ResourcesCtx>,
+    /// The serving registry's hardware profile: models compile with their worker's tuning
+    /// (B4). None = this machine's profile under the config's `hardware_profile`.
+    pub profile: Option<crate::profile::Profile>,
+    /// The service's metrics: the live detection requests answered during each device's timed
+    /// phase are recorded ([`super::RunResult::live_requests`]). None outside a server.
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl std::fmt::Debug for RunContext {
@@ -625,6 +631,8 @@ impl std::fmt::Debug for RunContext {
             .field("runtimes", &self.runtimes.is_some())
             .field("loaded", &self.loaded)
             .field("resources", &self.resources.is_some())
+            .field("profile", &self.profile.is_some())
+            .field("metrics", &self.metrics.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1190,7 +1198,8 @@ impl ServiceRun<'_> {
             h.push_done(r.clone());
             return Ok(r);
         };
-        let job = match job_for_config(&ctx.config, m, None) {
+        // Compiled with its worker's tuning and thresholded per device as it serves (B4, B5).
+        let job = match super::job_as_served(&ctx.config, m, None, ctx.profile.clone()) {
             Ok(j) => j,
             Err(e) => {
                 let path = ctx.config.data_path(&m.path).display().to_string();
@@ -1215,6 +1224,10 @@ impl ServiceRun<'_> {
         bench.threshold_objective = req.threshold_objective;
         bench.accuracy_metric = req.accuracy_metric;
         bench.priority = Some(&self.priority);
+        let live = ctx.metrics.clone().map(|m| move || m.detection_requests());
+        let live_ref = live.as_ref().map(|f| f as &(dyn Fn() -> u64 + Sync));
+        bench.live_requests = live_ref;
+        bench.video_decode = true;
         let devices = self
             .devices
             .clone()
@@ -1239,6 +1252,9 @@ impl ServiceRun<'_> {
             },
         )?;
         r.run_id = Some(self.run_id.clone());
+        for w in r.shared_load_warnings() {
+            h.warn(w);
+        }
         let files = sets
             .iter()
             .flat_map(|s| s.images.iter())
@@ -1723,6 +1739,8 @@ mod tests {
             runtimes: Some(Arc::new(Mutex::new(rt))),
             loaded: HashMap::new(),
             resources: None,
+            profile: None,
+            metrics: None,
         };
         let svc = BenchmarkService::new();
         let mut req = request(&["gone", "nope"]);
@@ -1804,6 +1822,8 @@ mod tests {
             runtimes: Some(Arc::new(Mutex::new(rt))),
             loaded: HashMap::new(),
             resources: None,
+            profile: None,
+            metrics: None,
         };
         let svc = BenchmarkService::new();
         svc.start(ctx, request(&["m"])).unwrap();

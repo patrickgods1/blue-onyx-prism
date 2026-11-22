@@ -29,6 +29,7 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
         mean: p50,
         p50,
         p95: p50,
+        p99: p50,
         max: p50,
     };
     RunResult {
@@ -48,6 +49,13 @@ pub(crate) fn run(spec: &str, p50: f64, dets: Vec<Detection>) -> RunResult {
         cache: "disabled".into(),
         warmup_iterations: 0,
         warmup_ms: 0.0,
+        warmup_runs: 0,
+        tuning: None,
+        served_threshold: None,
+        served_threshold_source: None,
+        live_requests: None,
+        live_requests_per_min: None,
+        video_decode_pct: None,
         repeat: 1,
         stages_ms: StageStats {
             infer: total,

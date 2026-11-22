@@ -1074,12 +1074,7 @@ impl WorkerCtx {
 
     /// The compile hint and in-flight count for `cand` (serial without a profile).
     fn tuning_for(&self, rt: &Runtimes, cand: &Candidate) -> DeviceTuning {
-        match &self.cfg.concurrency {
-            Some(c) => c
-                .profile
-                .tuning_with(rt.device_class(&cand.device), c.overrides),
-            None => DeviceTuning::SERIAL,
-        }
+        super::device_tuning(self.cfg.concurrency.as_ref(), rt, &cand.device)
     }
 
     /// Compile (under the runtimes lock), create the requests and warm up on one candidate.
@@ -1840,7 +1835,14 @@ mod tests {
             gpu_precision: None,
             no_cache: false,
         };
-        let b = script.compile(&req, "openvino:cpu", false).into_backend();
+        let b = script
+            .compile(
+                &req,
+                "openvino:cpu",
+                false,
+                &crate::profile::DeviceTuning::SERIAL,
+            )
+            .into_backend();
         (Backend::Fake(b), script)
     }
 

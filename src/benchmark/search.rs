@@ -1033,7 +1033,7 @@ pub fn points_at(image_sets: &[ImageSetInfo], run: &StoredRun, t: f32) -> Option
             .filter(|&k| {
                 inputs
                     .get(k)
-                    .is_some_and(|i| i.1.tags.iter().any(|x| x == tag))
+                    .is_some_and(|i| super::images::in_split(&i.1.tags, i.1.scene, tag))
             })
             .collect();
         if !ks.is_empty() {
@@ -1379,6 +1379,7 @@ pub(crate) mod tests {
             height: 480,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             objects: Some(objects),
+            scene: None,
         };
         let set = |id: &str, gt: GroundTruth, images: Vec<ImageInfo>| ImageSetInfo {
             id: id.into(),

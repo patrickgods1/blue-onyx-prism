@@ -424,6 +424,25 @@ pub fn resolution_bucket(w: u32, h: u32) -> &'static str {
 /// Bucket order for tables.
 pub const RESOLUTION_BUCKETS: [&str; 4] = ["sd", "hd", "fhd", "4mp+"];
 
+/// The scene splits (Day / Night / IR columns, the `day` / `night` / `ir` threshold curves).
+pub const SCENE_KEYS: [&str; 3] = ["day", "night", "ir"];
+
+/// The derived tag of a computed scene: `scene:day`, `scene:night`, `scene:ir` (a breakdown of
+/// its own beside the manifest's tags).
+pub fn scene_tag(scene: crate::image_stats::Scene) -> String {
+    format!("scene:{scene}")
+}
+
+/// Whether an image is in the split `key`: for a scene split ([`SCENE_KEYS`]) its computed scene
+/// when one was recorded (what the service would call the frame), else its manifest tags
+/// (results saved before the scene was recorded); any other key is a manifest tag.
+pub fn in_split(tags: &[String], computed: Option<crate::image_stats::Scene>, key: &str) -> bool {
+    match computed {
+        Some(s) if SCENE_KEYS.contains(&key) => s.as_str() == key,
+        _ => tags.iter().any(|t| t == key),
+    }
+}
+
 fn add_resolution_tag(tags: &mut Vec<String>, w: u32, h: u32) {
     if w > 0 && h > 0 && !tags.iter().any(|t| t.starts_with("res:")) {
         tags.push(format!("res:{}", resolution_bucket(w, h)));

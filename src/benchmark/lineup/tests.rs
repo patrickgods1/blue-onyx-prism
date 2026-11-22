@@ -40,6 +40,7 @@ fn img(file: &str, tags: &[&str], labels: &[&str]) -> ImageInfo {
                 })
                 .collect(),
         ),
+        scene: None,
     }
 }
 
@@ -106,6 +107,7 @@ fn timed(mut d: DeviceResult, set: &str, files: &[(&str, f64)]) -> DeviceResult 
                 preds: Vec::new(),
                 gt_matched: Vec::new(),
                 counts: None,
+                scene: None,
             })
             .collect();
     }
@@ -250,6 +252,24 @@ fn every_model_answers_for_the_same_objects() {
     // No night frames: a dash, not 0.
     assert_eq!(g.objects["all"].finds.night.value, None);
     assert_eq!(g.objects["all"].correct.night.value, None);
+}
+
+/// The Day / Night / IR columns follow the scene the run computed for each frame over the
+/// manifest's tags (here every frame computed as night: the day and IR tags no longer count).
+#[test]
+fn scene_columns_follow_the_computed_scene() {
+    let mut w = pair();
+    for s in &mut w.results.image_sets {
+        for i in &mut s.images {
+            i.scene = Some(crate::image_stats::Scene::Night);
+        }
+    }
+    let l = w.build();
+    let p = row(&l.sets[0], "poor");
+    assert_eq!(p.objects["all"].finds.night.n, 20);
+    assert_eq!(p.objects["all"].finds.night.value, Some(0.5));
+    assert_eq!(p.objects["all"].finds.day.n, 0);
+    assert_eq!(p.objects["all"].finds.ir.value, None);
 }
 
 #[test]
