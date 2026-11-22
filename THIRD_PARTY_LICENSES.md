@@ -229,7 +229,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | foreign-types | 0.5.0 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types |
 | foreign-types-macros | 0.2.4 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types |
 | foreign-types-shared | 0.3.1 | MIT/Apache-2.0 | https://github.com/sfackler/foreign-types |
-| form_urlencoded | 1.2.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
+| form_urlencoded | 1.2.3 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
 | fs4 | 1.1.0 | MIT OR Apache-2.0 | https://github.com/al8n/fs4 |
 | fs_extra | 1.3.0 | MIT | https://github.com/webdesus/fs_extra |
 | futures-channel | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs |
@@ -513,7 +513,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
 | untrusted | 0.7.1 | ISC | https://github.com/briansmith/untrusted |
 | untrusted | 0.9.0 | ISC | https://github.com/briansmith/untrusted |
-| url | 2.5.8 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
+| url | 2.5.9 | MIT OR Apache-2.0 | https://github.com/servo/rust-url |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | https://github.com/hsivonen/utf8_iter |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | https://github.com/alacritty/vte |
 | uuid | 1.29.2 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid |
