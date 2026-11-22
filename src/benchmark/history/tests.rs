@@ -732,6 +732,7 @@ fn record_seeds_appends_once_per_model_and_skips_failures() {
         &seed_entries(&before),
         &after,
         &["gone".into()],
+        None,
     );
     assert!(w.is_empty() && !path.exists(), "{w:?}");
 
@@ -741,6 +742,7 @@ fn record_seeds_appends_once_per_model_and_skips_failures() {
         &seed_entries(&before),
         &after,
         &["IPcam-general".into(), "gone".into()],
+        None,
     );
     assert!(w.is_empty(), "{w:?}");
     let h = History::load(&path).unwrap().unwrap();
@@ -761,6 +763,7 @@ fn record_seeds_appends_once_per_model_and_skips_failures() {
         &seed_entries(&after),
         &after,
         &["IPcam-general".into()],
+        None,
     );
     assert_eq!(
         History::load(&path)
@@ -777,6 +780,7 @@ fn record_seeds_appends_once_per_model_and_skips_failures() {
         &seed_entries(&after),
         &third,
         &["IPcam-general".into()],
+        None,
     );
     assert_eq!(
         History::load(&path)
@@ -795,6 +799,7 @@ fn record_seeds_appends_once_per_model_and_skips_failures() {
         &[],
         &third,
         &["IPcam-general".into()],
+        None,
     );
     assert_eq!(w.len(), 1);
     assert!(
@@ -1155,4 +1160,62 @@ fn snapshots_record_the_ap_basis_and_person_alerts() {
     ] {
         assert!(back.get(k).is_none(), "{k}");
     }
+}
+
+#[test]
+fn the_goal_metric_changes_only_when_the_intervals_part_and_old_entries_load() {
+    use crate::benchmark::eval::tune::GoalSnap;
+    let g = |value: f64, low: f64, high: f64, opt: &str| GoalSnap {
+        optimize_for: opt.into(),
+        tuning: "f1".into(),
+        value,
+        low: Some(low),
+        high: Some(high),
+        confidence: Some(0.4),
+        low_confidence: false,
+        frames: 500,
+        objects: 400,
+        classes: Vec::new(),
+    };
+    let with = |goal: Option<GoalSnap>, live: Option<f64>| DeviceSnap {
+        goal,
+        live_requests_per_min: live,
+        ..snap("ort:coreml", 20.0, Some(0.8), 400)
+    };
+    let a = with(Some(g(0.80, 0.77, 0.83, "f1")), Some(0.0));
+    let same = with(Some(g(0.82, 0.79, 0.85, "f1")), Some(14.0));
+    let better = with(Some(g(0.90, 0.88, 0.92, "f1")), None);
+    let other = with(Some(g(0.90, 0.88, 0.92, "f2")), None);
+    assert_eq!(goal_change("d", &a, &same).unwrap().verdict, Verdict::Same);
+    assert_eq!(
+        goal_change("d", &a, &better).unwrap().verdict,
+        Verdict::Better
+    );
+    assert_eq!(
+        goal_change("d", &better, &a).unwrap().verdict,
+        Verdict::Worse
+    );
+    assert_eq!(
+        goal_change("d", &a, &other).unwrap().verdict,
+        Verdict::NotComparable
+    );
+    assert!(goal_change("d", &with(None, None), &with(None, None)).is_none());
+    // The comparison shows both, the live load without a verdict.
+    let changes = compare(
+        &entry("r1", vec![a.clone()]),
+        &entry("r2", vec![same.clone()]),
+    );
+    let m = |k: &str| changes.metrics.iter().find(|c| c.metric == k).unwrap();
+    assert_eq!(m("goal").verdict, Verdict::Same);
+    assert_eq!(m("live_requests_per_min").after, Some(14.0));
+    assert!(m("live_requests_per_min").why.contains("14.0"));
+    // An entry of an older version has neither field.
+    let old: DeviceSnap = serde_json::from_str(r#"{"device":"ort:cpu"}"#).unwrap();
+    assert!(old.goal.is_none() && old.live_requests_per_min.is_none());
+    // A snapshot of a run records its live load.
+    let mut d = dev("ort:cpu", 10.0, scene());
+    d.run.as_mut().unwrap().live_requests_per_min = Some(3.5);
+    let m = model(vec![d], None);
+    let e = HistoryEntry::from(&m);
+    assert_eq!(e.devices[0].live_requests_per_min, Some(3.5));
 }

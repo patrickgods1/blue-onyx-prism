@@ -733,6 +733,157 @@ fn set_view(full: &CompareSet<'_>, inputs: &Inputs<'_>) -> Option<(SetView, Cand
     Some((view, candidate))
 }
 
+/// One model on one device on a set ([`combos_on`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Combo<'a> {
+    pub(crate) m: &'a ModelResult,
+    pub(crate) device: &'a str,
+    pub(crate) run: &'a RunResult,
+    pub(crate) stored: &'a StoredRun,
+    /// Share of the set's frames the model trained on; None = unknown.
+    pub(crate) share: Option<f64>,
+    /// On "Your cameras": why what it saw cannot be told.
+    pub(crate) unknown_seen: Option<&'a str>,
+    /// Shown, never best ([`Row::excluded`]).
+    pub(crate) excluded: bool,
+}
+
+/// Every combo (model x device) whose stored run holds a set, on the frames none of them saw
+/// (the Compare view of the evaluation core, [`crate::benchmark::eval::compare`]).
+pub(crate) struct ComboSet<'a> {
+    /// The fair frames: every listed combo ran them and no listed model saw them.
+    pub(crate) fair: CompareSet<'a>,
+    pub(crate) frames_left_out: usize,
+    pub(crate) left_out_by: Vec<String>,
+    pub(crate) combos: Vec<Combo<'a>>,
+    /// Models not on the set, why, and how to run them.
+    pub(crate) missing: Vec<Missing>,
+    pub(crate) relative: bool,
+    pub(crate) reference: Option<String>,
+    /// What [`default_set`] weighs.
+    pub(crate) candidate: Candidate,
+}
+
+/// The combos on `full` (see [`ComboSet`]); None when no combo holds the set. The rules of
+/// [`set_view`]: a run holds the set when it has every frame its model did not see; the
+/// reference model of a relative set is never on it.
+pub(crate) fn combos_on<'a>(full: &CompareSet<'a>, inputs: &Inputs<'a>) -> Option<ComboSet<'a>> {
+    let (relative, reference) = labels_of(full);
+    let cams = full.datasets.iter().any(|d| d.id == super::cameras::ID);
+    let seen_by = |model: &str| cams.then(|| seen_of(inputs, model)).flatten();
+    let mut entrants: Vec<Entrant<'a>> = Vec::new();
+    let mut missing: Vec<(&ModelResult, Reach<'a>)> = Vec::new();
+    for m in &inputs.results.models {
+        let seen = seen_by(&m.model);
+        match reach(full, m, inputs.preds, &|i| saw_image(seen, i)) {
+            Reach::Whole(e) if !is_reference(reference.as_deref(), &m.model) => entrants.push(e),
+            other => missing.push((m, other)),
+        }
+    }
+    if entrants.is_empty() {
+        return None;
+    }
+    let left_out_by: Vec<String> = entrants
+        .iter()
+        .filter(|e| {
+            let seen = seen_by(&e.m.model);
+            full.images.iter().any(|i| saw_image(seen, i))
+        })
+        .map(|e| e.m.model.clone())
+        .collect();
+    let fair = CompareSet {
+        images: full
+            .images
+            .iter()
+            .filter(|i| !entrants.iter().any(|e| saw_image(seen_by(&e.m.model), i)))
+            .copied()
+            .collect(),
+        ..full.clone()
+    };
+    if fair.images.is_empty() {
+        return None;
+    }
+    let frames_left_out = full.images.len() - fair.images.len();
+    let mut combos = Vec::new();
+    for e in &entrants {
+        let share = share_on(&fair, e.m, inputs);
+        let unknown_seen = match seen_by(&e.m.model) {
+            Some(Seen::Unknown(why)) => Some(why.as_str()),
+            _ => None,
+        };
+        let excluded = if cams {
+            unknown_seen.is_some()
+        } else {
+            share.is_some_and(|s| s > 0.0)
+        };
+        for &(device, run, stored) in &e.runs {
+            combos.push(Combo {
+                m: e.m,
+                device,
+                run,
+                stored,
+                share,
+                unknown_seen,
+                excluded,
+            });
+        }
+    }
+    let mut out_of_set: Vec<Missing> = missing
+        .iter()
+        .map(|(m, r)| Missing {
+            model: m.model.clone(),
+            why: why_not(full, m, r, &inputs.results.image_sets),
+            device: inputs
+                .now
+                .get(&normalize_name(&m.model))
+                .and_then(|n| n.device.clone())
+                .or_else(|| m.recommended.clone()),
+            blocked: if matches!(r, Reach::Whole(_)) {
+                Some("its detections are the labels of these images".into())
+            } else {
+                blocked_for(&fair, &m.model, inputs)
+            },
+        })
+        .collect();
+    for c in inputs.configured {
+        let key = normalize_name(&c.name);
+        let known = inputs
+            .results
+            .models
+            .iter()
+            .any(|m| normalize_name(&m.model) == key);
+        if !known {
+            out_of_set.push(Missing {
+                model: c.name.clone(),
+                why: "not benchmarked yet".into(),
+                device: inputs.now.get(&key).and_then(|n| n.device.clone()),
+                blocked: blocked_for(&fair, &c.name, inputs),
+            });
+        }
+    }
+    let candidate = Candidate {
+        id: fair.id.clone(),
+        models: entrants.len(),
+        role: fair.role,
+        fair_models: entrants
+            .iter()
+            .filter(|e| !combos.iter().any(|c| std::ptr::eq(c.m, e.m) && c.excluded))
+            .count(),
+        images: fair.images.len(),
+        cameras: fair.id == super::cameras::ID,
+    };
+    Some(ComboSet {
+        fair,
+        frames_left_out,
+        left_out_by,
+        combos,
+        missing: out_of_set,
+        relative,
+        reference,
+        candidate,
+    })
+}
+
 /// The confidence of a row: the one the config gives the model on the device (else the run's), or
 /// its best for the goal on that device (else the same).
 fn confidence_of(p: &Prepared<'_>, kind: &str, now: &HashMap<String, ModelNow>) -> f32 {
@@ -753,6 +904,73 @@ fn confidence_of(p: &Prepared<'_>, kind: &str, now: &HashMap<String, ModelNow>) 
             .unwrap_or(configured)
     } else {
         configured
+    }
+}
+
+/// What [`Inputs`] reads of the config and the training records: the frames each trained model
+/// trained on, what each saw of "Your cameras" (when the results hold the set) and which
+/// configured models can run.
+#[derive(Debug, Clone, Default)]
+pub struct Parts {
+    pub trained: HashMap<String, BTreeSet<String>>,
+    pub seen: HashMap<String, Seen>,
+    pub configured: Vec<Configured>,
+}
+
+impl Parts {
+    /// Read from `cfg` (training records, model files) for the models of `results`.
+    pub fn of(results: &BenchmarkResults, cfg: &crate::config::Config) -> Self {
+        let in_results = |name: &str| {
+            results
+                .find(name)
+                .or_else(|| results.find(&super::variant::served_name(name)))
+                .is_some()
+        };
+        let trained = cfg
+            .models
+            .iter()
+            .filter_map(|m| {
+                let name = m.effective_name();
+                if !in_results(&name) {
+                    return None;
+                }
+                // Its As served result (`<model>+served`) trained on the same frames.
+                let frames =
+                    crate::training::autolabel::trained_frames(cfg, m, &mut Vec::new()).ok()?;
+                (!frames.is_empty()).then(|| (normalize_name(&name), frames))
+            })
+            .collect();
+        let seen = results
+            .image_set(super::cameras::ID)
+            .map(|set| {
+                cfg.models
+                    .iter()
+                    .filter_map(|m| {
+                        let name = m.effective_name();
+                        if !in_results(&name) {
+                            return None;
+                        }
+                        let files = set.images.iter().map(|i| i.file.as_str());
+                        let s = super::cameras::seen::of_model(cfg, m, files);
+                        (s != Seen::NoRecord).then(|| (normalize_name(&name), s))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let configured = cfg
+            .models
+            .iter()
+            .map(|m| Configured {
+                name: m.effective_name(),
+                blocked: (!cfg.data_path(&m.path).is_file())
+                    .then(|| "its model file is missing".to_string()),
+            })
+            .collect();
+        Self {
+            trained,
+            seen,
+            configured,
+        }
     }
 }
 

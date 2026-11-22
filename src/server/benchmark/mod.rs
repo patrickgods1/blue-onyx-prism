@@ -18,6 +18,9 @@
 //! - `GET /v1/benchmark/images?model=&device=`: per-image drill-down (ground truth and
 //!   predictions); `GET /v1/benchmark/image?set=&file=`: the image file itself (only files
 //!   listed in the saved results);
+//! - `GET /v1/benchmark/compare`, `GET /v1/benchmark/tune`, `GET /v1/benchmark/tune/images`,
+//!   `POST /v1/benchmark/goal`: the evaluation core's views and the goal (`eval`,
+//!   [`crate::benchmark::eval`]);
 //! - `GET /v1/benchmark/history[?model=]`, `GET /v1/benchmark/history/compare?model=&a=&b=`,
 //!   `POST /v1/benchmark/history/pin`, `POST /v1/benchmark/history/delete`: the run history
 //!   (`benchmark-history.json`, [`crate::benchmark::history`]).
@@ -29,6 +32,7 @@
 
 mod apply;
 mod cameras;
+mod eval;
 mod history;
 mod poll;
 mod profiles;
@@ -39,6 +43,7 @@ use apply::BLUE_IRIS_THRESHOLD_NOTE;
 
 pub(super) use apply::{apply, apply_profiles, apply_threshold, search_options, threshold_search};
 pub(super) use cameras::rescore;
+pub(super) use eval::{compare_route, goal_route, tune_images_route, tune_route};
 pub(super) use history::{history_compare, history_delete, history_get, history_pin};
 pub(super) use report::save_report;
 pub(super) use run::{cancel, image_file, images_detail, remove_dataset, settings, start};
@@ -594,18 +599,35 @@ fn ranks_of(ranking: &[crate::benchmark::report::RankRow]) -> HashMap<String, us
 static RANKS_CACHE: crate::benchmark::search::IdleCache<String, Arc<HashMap<String, usize>>> =
     crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE);
 
-/// [`ranks_of`] of the results beside `config_path` (empty without results). Blocking: it may
-/// parse the file.
-pub(in crate::server) fn model_ranks(config_path: &std::path::Path) -> Arc<HashMap<String, usize>> {
-    let path = results_path(config_path);
+/// [`ranks_of`] of the results beside the config (empty without results), in the goal's order
+/// on the default Compare set ([`goal_order`]). Blocking: it may parse the files.
+pub(in crate::server) fn model_ranks(state: &AppState) -> Arc<HashMap<String, usize>> {
+    let path = results_path(&state.config_path);
     let Some(stamp) = file_stamp(&path) else {
         return Arc::default();
     };
-    let key = format!("{}|{stamp:?}", path.display());
+    let preds = crate::benchmark::search::preds_path(&state.config_path);
+    let gt = crate::benchmark::cameras::snapshot::path_beside(&path);
+    let revision = state.config.revision();
+    let key = format!(
+        "{}|{stamp:?}|{:?}|{:?}|{revision}",
+        path.display(),
+        file_stamp(&preds),
+        file_stamp(&gt)
+    );
     RANKS_CACHE.get_or_insert_with(key, || {
         Arc::new(
             BenchmarkResults::load_or_warn(&path)
-                .map(|r| ranks_of(&r.ranking()))
+                .map(|r| {
+                    let stored = crate::benchmark::search::StoredPreds::load_cached(&preds)
+                        .ok()
+                        .flatten();
+                    let snap = devices_snapshot(state);
+                    let cfg = state.config_read().clone();
+                    let now = models_now(state, &cfg, &snap);
+                    let order = goal_order(state, &r, stored.as_deref(), &now);
+                    ranks_of(&crate::benchmark::report::follow_order(r.ranking(), &order))
+                })
                 .unwrap_or_default(),
         )
     })
@@ -697,12 +719,14 @@ fn compute_saved_view(
     SAVED_COMPUTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match BenchmarkResults::load_or_warn(path) {
         Some(mut r) => {
-            let ranking = raw(&r.ranking());
-            let points = raw(&r.points());
             let stored = StoredPreds::load_cached(preds)
                 .map_err(|e| warn!("{e:#}"))
                 .ok()
                 .flatten();
+            // `ranking` and `points` follow the goal's rank on the default Compare set.
+            let order = goal_order(state, &r, stored.as_deref(), now);
+            let ranking = raw(&crate::benchmark::report::follow_order(r.ranking(), &order));
+            let points = raw(&crate::benchmark::report::follow_order(r.points(), &order));
             crate::benchmark::current::rebase(&mut r, stored.as_deref(), now);
             crate::benchmark::trained_on::backfill(&mut r, &state.config_read());
             let facts = profiles::facts(&r);
@@ -735,8 +759,54 @@ fn compute_saved_view(
     }
 }
 
+/// The (model, device) order of the goal's Compare view on the default set of `results`
+/// ([`crate::benchmark::eval::compare`], the saved goal); empty without stored predictions.
+fn goal_order(
+    state: &AppState,
+    results: &BenchmarkResults,
+    preds: Option<&crate::benchmark::search::StoredPreds>,
+    now: &HashMap<String, crate::benchmark::current::ModelNow>,
+) -> Vec<(String, String)> {
+    use crate::benchmark::lineup::{Inputs, Parts};
+    let Some(preds) = preds else {
+        return Vec::new();
+    };
+    let cfg = state.config_read();
+    let mut view = results.clone();
+    crate::benchmark::current::rebase(&mut view, Some(preds), now);
+    crate::benchmark::trained_on::backfill(&mut view, &cfg);
+    let parts = Parts::of(&view, &cfg);
+    let history = crate::benchmark::history::History::default();
+    let default_model = crate::training::switch::current_default(&cfg);
+    let inputs = Inputs {
+        results: &view,
+        preds: Some(preds),
+        history: &history,
+        now,
+        default_model: default_model.as_deref(),
+        configured: &parts.configured,
+        trained: &parts.trained,
+        seen: &parts.seen,
+        reachable: &|s| s.dir.as_deref().is_some_and(std::path::Path::is_dir),
+    };
+    crate::benchmark::eval::compare::build(
+        &inputs,
+        crate::benchmark::eval::compare::Request {
+            goal: &cfg.benchmark.goal,
+            weights: cfg.benchmark.weights,
+            set: None,
+            scene: None,
+        },
+    )
+    .rows
+    .into_iter()
+    .map(|r| (r.model, r.device))
+    .collect()
+}
+
 /// The `lineup` of the saved results: the frames each trained model trained on, what can run and
-/// which dataset folders can be read now are read here, the rest is pure.
+/// which dataset folders can be read now are read here ([`crate::benchmark::lineup::Parts`]), the
+/// rest is pure.
 fn lineup_of(
     results: &BenchmarkResults,
     preds: Option<&crate::benchmark::search::StoredPreds>,
@@ -744,58 +814,17 @@ fn lineup_of(
     now: &HashMap<String, crate::benchmark::current::ModelNow>,
     cfg: &Config,
 ) -> Box<RawValue> {
-    use crate::benchmark::lineup::{Configured, Inputs, build};
-    let key = crate::registry::normalize_name;
-    let trained = cfg
-        .models
-        .iter()
-        .filter_map(|m| {
-            let name = m.effective_name();
-            // Its As served result (`<model>+served`) trained on the same frames.
-            results
-                .find(&name)
-                .or_else(|| results.find(&crate::benchmark::variant::served_name(&name)))?;
-            let frames =
-                crate::training::autolabel::trained_frames(cfg, m, &mut Vec::new()).ok()?;
-            (!frames.is_empty()).then(|| (key(&name), frames))
-        })
-        .collect();
-    // What each trained model saw of Your cameras, when the results hold the set.
-    let seen: HashMap<String, crate::benchmark::cameras::seen::Seen> = results
-        .image_set(crate::benchmark::cameras::ID)
-        .map(|set| {
-            cfg.models
-                .iter()
-                .filter_map(|m| {
-                    let name = m.effective_name();
-                    results
-                        .find(&name)
-                        .or_else(|| results.find(&crate::benchmark::variant::served_name(&name)))?;
-                    let files = set.images.iter().map(|i| i.file.as_str());
-                    let s = crate::benchmark::cameras::seen::of_model(cfg, m, files);
-                    (s != crate::benchmark::cameras::seen::Seen::NoRecord).then(|| (key(&name), s))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let configured: Vec<Configured> = cfg
-        .models
-        .iter()
-        .map(|m| Configured {
-            name: m.effective_name(),
-            blocked: (!cfg.data_path(&m.path).is_file())
-                .then(|| "its model file is missing".to_string()),
-        })
-        .collect();
+    use crate::benchmark::lineup::{Inputs, Parts, build};
+    let parts = Parts::of(results, cfg);
     let lineup = build(&Inputs {
         results,
         preds,
         history,
         now,
         default_model: crate::training::switch::current_default(cfg).as_deref(),
-        configured: &configured,
-        trained: &trained,
-        seen: &seen,
+        configured: &parts.configured,
+        trained: &parts.trained,
+        seen: &parts.seen,
         reachable: &|s| s.dir.as_deref().is_some_and(std::path::Path::is_dir),
     });
     raw(&lineup)

@@ -65,6 +65,10 @@ pub(super) struct Report {
     /// `--all-devices`: models ranked on their recommended devices.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) ranking: Vec<crate::benchmark::report::RankRow>,
+    /// `--all-devices`: every combo on the default compare set judged for the goal
+    /// ([`crate::benchmark::eval::compare`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) compare: Option<crate::benchmark::eval::compare::CompareView>,
 }
 
 /// The banner of a table run: versions, devices, cache, datasets, iterations, then the
@@ -135,6 +139,7 @@ impl Report {
             datasets: sets.iter().map(|s| s.id.clone()).collect(),
             warnings,
             ranking: Vec::new(),
+            compare: None,
         }
     }
 
@@ -1022,6 +1027,141 @@ pub(super) fn print_model(m: &ModelReport) {
     if p.stages_ms.infer.p50 > cpu.stages_ms.infer.p50 && p.device != "CPU" {
         println!("  WARNING: {} inference is slower than CPU", p.device);
     }
+}
+
+/// "0.812 ± 0.021" of an estimate (`-` without one).
+pub(super) fn estimate_text(e: Option<&crate::benchmark::eval::stats::Estimate>) -> String {
+    match e {
+        None => "-".to_string(),
+        Some(e) => match e.half_width() {
+            Some(h) => format!("{:.3} \u{b1} {h:.3}", e.value),
+            None => format!("{:.3}", e.value),
+        },
+    }
+}
+
+/// The Compare view of the default set: per combo the goal metric (out-of-fold) with its 95%
+/// interval, the rank group, the cross-validated pick and the flags.
+pub(super) fn print_compare(v: &crate::benchmark::eval::compare::CompareView) {
+    let Some(set) = &v.set else {
+        println!("\n== Compare: {}", v.headline);
+        return;
+    };
+    println!();
+    println!(
+        "== Compare on {} ({} {}, {} cross-validation groups; goal: {})",
+        set.title, set.frames, set.unit, set.groups, v.goal.summary
+    );
+    if set.frames_left_out > 0 {
+        println!(
+            "  {} {} left out: {} trained or validated on them",
+            set.frames_left_out,
+            set.unit,
+            set.left_out_by.join(", ")
+        );
+    }
+    println!(
+        "  {:>3} {:<24} {:<14} {:>17} {:>6} {:>6} {:>6} {:>5} {:>9}  flags",
+        "#", "model", "device", v.goal.metric, "recall", "prec", "FA/100", "conf", "p95 ms"
+    );
+    for r in &v.rows {
+        let mut flags: Vec<String> = Vec::new();
+        if r.flags.too_slow {
+            flags.push("too slow".into());
+        }
+        if let Some(t) = &r.target
+            && !t.met
+        {
+            flags.push(format!(
+                "unmet (bound {})",
+                t.bound.map_or("-".to_string(), |b| format!("{b:.3}"))
+            ));
+        }
+        if r.flags.low_confidence.is_some() {
+            flags.push("low confidence".into());
+        }
+        if r.flags.flat {
+            flags.push("pick not informative".into());
+        }
+        if r.flags.trained_here {
+            flags.push("trained on these frames".into());
+        }
+        if r.flags.relative {
+            flags.push("relative".into());
+        }
+        if r.flags.stale_rules {
+            flags.push("serving rules changed".into());
+        }
+        if let Some(l) = r.flags.live_load.filter(|l| *l > 0.0) {
+            flags.push(format!("measured while serving {l:.0} req/min"));
+        }
+        let f = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.3}"));
+        println!(
+            "  {:>3} {:<24} {:<14} {:>17} {:>6} {:>6} {:>6} {:>5} {:>9}  {}",
+            r.rank,
+            r.model,
+            r.device,
+            estimate_text(r.metric.as_ref()),
+            f(r.recall),
+            f(r.precision),
+            r.fa100.map_or("-".to_string(), |v| format!("{v:.1}")),
+            r.confidence.map_or("-".to_string(), |c| format!("{c:.2}")),
+            r.speed
+                .p95_ms
+                .map_or("-".to_string(), |p| format!("{p:.1}")),
+            flags.join(", ")
+        );
+    }
+    println!("  {}", v.headline);
+    for m in &v.missing {
+        println!("  not on these images: {} ({})", m.model, m.why);
+    }
+    println!(
+        "  # = rank group (rows sharing it are not clearly different, paired bootstrap); conf = \
+         the suggested confidence (picked on every frame); figures cross-validated over camera \
+         days (single images on public sets), \u{b1} = 95% interval."
+    );
+}
+
+/// One line per searched combo: the cross-validated pick and the out-of-fold figure with its
+/// interval ([`crate::benchmark::eval::tune`]).
+pub(super) fn print_cv_pick(t: &crate::benchmark::eval::tune::TuneView) {
+    let Some(s) = &t.suggested else {
+        println!(
+            "  {} on {} ({}): no cross-validated pick for {}",
+            t.model, t.device, t.set_title, t.objective_name
+        );
+        return;
+    };
+    let mut extra = Vec::new();
+    if let Some(l) = &t.low_confidence {
+        extra.push(l.clone());
+    }
+    if let Some(tg) = &t.target {
+        extra.push(tg.text.clone());
+    }
+    if !t.pick_informative {
+        extra.push("pick not informative (flat curve)".to_string());
+    }
+    println!(
+        "  {} on {} ({}, {} frames, {} folds): cross-validated pick {:.2} (plateau {:.2}-{:.2}), \
+         {} {} out of fold{}",
+        t.model,
+        t.device,
+        t.set_title,
+        t.frames,
+        t.folds,
+        s.threshold,
+        s.plateau[0],
+        s.plateau[1],
+        t.objective_name,
+        estimate_text(s.metric.as_ref()),
+        if extra.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", extra.join("; "))
+        }
+    );
 }
 
 #[cfg(test)]

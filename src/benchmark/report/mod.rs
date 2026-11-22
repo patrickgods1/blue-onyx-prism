@@ -986,6 +986,44 @@ impl RankRow {
     }
 }
 
+/// `rows` (a [`BenchmarkResults::ranking`] or [`BenchmarkResults::points`]) in the order of
+/// the goal's Compare view ([`crate::benchmark::eval::compare`] on the default set): a row's
+/// place is its (model, device) position there, else the best position of its model; rows the
+/// view does not have keep their order after those. `rank` is renumbered 1, 2, ...
+pub fn follow_order(rows: Vec<RankRow>, order: &[(String, String)]) -> Vec<RankRow> {
+    let key = crate::registry::normalize_name;
+    // (position, 0 for the combo itself / 1 for its model's best place): a combo the view has
+    // goes before another device of its model placed by that model's best combo.
+    let place = |r: &RankRow| {
+        let m = key(&r.model);
+        order
+            .iter()
+            .position(|(om, od)| key(om) == m && *od == r.device)
+            .map(|p| (p, 0))
+            .or_else(|| {
+                order
+                    .iter()
+                    .position(|(om, _)| key(om) == m)
+                    .map(|p| (p, 1))
+            })
+    };
+    type Keyed = (Option<(usize, u8)>, usize, RankRow);
+    let mut keyed: Vec<Keyed> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| (place(&r), i, r))
+        .collect();
+    keyed.sort_by_key(|(p, i, _)| (p.is_none(), p.unwrap_or((0, 0)), *i));
+    keyed
+        .into_iter()
+        .enumerate()
+        .map(|(n, (_, _, mut r))| {
+            r.rank = n + 1;
+            r
+        })
+        .collect()
+}
+
 /// Rank `rows` (best first, [`Grades::rank_cmp`]) and mark the best trade-offs among them.
 fn ranked(mut rows: Vec<(RankRow, Grades)>) -> Vec<RankRow> {
     rows.sort_by(|a, b| Grades::rank_cmp(&a.1, &b.1));
@@ -1776,6 +1814,62 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(&aside[0]), "{}", warnings[0]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rank_rows_follow_the_goal_order() {
+        let r = BenchmarkResults::new(
+            HardwareSummary::default(),
+            RuntimeVersions::default(),
+            vec![
+                {
+                    let mut m = model(
+                        vec![
+                            dev("ort:cpu", 10.0, scene()),
+                            dev("openvino:cpu", 20.0, scene()),
+                        ],
+                        None,
+                    );
+                    m.model = "a".into();
+                    m.recommended = Some("ort:cpu".into());
+                    m
+                },
+                {
+                    let mut m = model(vec![dev("ort:cpu", 30.0, scene())], None);
+                    m.model = "b".into();
+                    m.recommended = Some("ort:cpu".into());
+                    m
+                },
+                {
+                    let mut m = model(vec![dev("ort:cpu", 5.0, scene())], None);
+                    m.model = "c".into();
+                    m.recommended = Some("ort:cpu".into());
+                    m
+                },
+            ],
+        );
+        // b's combo first, then a on openvino:cpu; c is not in the view.
+        let order = vec![
+            ("B".to_string(), "ort:cpu".to_string()),
+            ("a".to_string(), "openvino:cpu".to_string()),
+        ];
+        let ranking = follow_order(r.ranking(), &order);
+        let names: Vec<(&str, usize)> =
+            ranking.iter().map(|x| (x.model.as_str(), x.rank)).collect();
+        // a's recommended combo is not in the view: its model's best place counts.
+        assert_eq!(names, [("b", 1), ("a", 2), ("c", 3)]);
+        let points = follow_order(r.points(), &order);
+        let first: Vec<(&str, &str)> = points
+            .iter()
+            .take(2)
+            .map(|x| (x.model.as_str(), x.device.as_str()))
+            .collect();
+        assert_eq!(first, [("b", "ort:cpu"), ("a", "openvino:cpu")]);
+        assert_eq!(
+            follow_order(r.ranking(), &[]),
+            r.ranking(),
+            "no view: the grades"
+        );
     }
 
     #[test]

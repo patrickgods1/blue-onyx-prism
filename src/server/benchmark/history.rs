@@ -336,6 +336,7 @@ mod tests {
             &crate::benchmark::history::seed_entries(&first),
             &second,
             &["ipcam-general".into()],
+            None,
         );
         assert!(w.is_empty(), "{w:?}");
         let (_, v) = call(&st, get("/v1/benchmark/history")).await;

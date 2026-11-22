@@ -30,6 +30,7 @@
 pub mod cameras;
 pub mod cli;
 pub mod current;
+pub mod eval;
 pub mod export;
 pub mod forget;
 pub mod grade;

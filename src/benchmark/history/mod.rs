@@ -171,6 +171,16 @@ pub struct DeviceSnap {
     pub person_free_frames: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_false_alerts: Option<usize>,
+    /// The goal metric on the run's own frames (cross-validated, with its 95% interval) for the
+    /// goal in force when it ran ([`crate::benchmark::eval::tune::run_snapshot`]); None for
+    /// entries of older versions and runs without stored predictions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::benchmark::eval::tune::GoalSnap>,
+    /// Detection requests per minute the service answered during the device's timed runs
+    /// ([`crate::benchmark::RunResult::live_requests_per_min`]); None outside the service and in
+    /// entries of older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_requests_per_min: Option<f64>,
 }
 
 /// One class of a [`DeviceSnap`]'s AP average.
@@ -300,6 +310,7 @@ fn device_snap(m: &ModelResult, d: &DeviceResult) -> DeviceSnap {
             d.device
         ));
     }
+    s.live_requests_per_min = run.live_requests_per_min;
     s.total_p50_ms = Some(run.stages_ms.total.p50);
     s.total_p95_ms = Some(run.stages_ms.total.p95);
     s.infer_p50_ms = Some(run.stages_ms.infer.p50);
@@ -711,6 +722,39 @@ fn cap(list: &mut Vec<HistoryEntry>, max: usize) {
     }
 }
 
+/// The goal metric of each device of `e` (from `m`'s runs, which hold their evaluation
+/// predictions right after a run) for `goal`.
+pub fn add_goal(
+    e: &mut HistoryEntry,
+    m: &ModelResult,
+    results: &BenchmarkResults,
+    goal: &crate::benchmark::eval::Goal,
+    weights: crate::benchmark::grade::Weights,
+) {
+    for snap in &mut e.devices {
+        let Some(d) = m.devices.iter().find(|d| d.device == snap.device && d.ok()) else {
+            continue;
+        };
+        let Some(run) = d.run.as_ref() else { continue };
+        let Some(mut stored) = crate::benchmark::search::StoredRun::of(m, &d.device, run) else {
+            continue;
+        };
+        for img in &mut stored.images {
+            img.group = results
+                .image_set(&img.set)
+                .and_then(|s| s.images.iter().find(|i| i.file == img.file))
+                .and_then(|i| i.group.clone());
+        }
+        snap.goal = crate::benchmark::eval::tune::run_snapshot(
+            &results.image_sets,
+            &stored,
+            Some(run.stages_ms.total.p50),
+            goal,
+            weights,
+        );
+    }
+}
+
 /// Record the finished models `models` of `merged` (just saved to `results_file`) in the
 /// history beside it. `seeds` are the entries of the results file before this save
 /// ([`seed_entries`] of it): a missing history file starts from all of them, and a model with
@@ -721,12 +765,22 @@ pub fn record(
     seeds: &[HistoryEntry],
     merged: &BenchmarkResults,
     models: &[String],
+    goal: Option<(
+        &crate::benchmark::eval::Goal,
+        crate::benchmark::grade::Weights,
+    )>,
 ) -> Vec<String> {
     let entries: Vec<HistoryEntry> = models
         .iter()
         .filter_map(|n| merged.find(n))
         .filter(|m| recordable(m))
-        .map(|m| HistoryEntry::of(m, merged))
+        .map(|m| {
+            let mut e = HistoryEntry::of(m, merged);
+            if let Some((g, w)) = goal {
+                add_goal(&mut e, m, merged, g, w);
+            }
+            e
+        })
         .collect();
     if entries.is_empty() {
         return Vec::new();

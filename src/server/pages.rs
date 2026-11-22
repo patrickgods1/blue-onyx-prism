@@ -253,7 +253,7 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
         let snap = devices_snapshot(&state);
         let default = default_name(reg);
         let pending = crate::config_merge::pending(&state.running(), &state.config_read());
-        let ranks = super::benchmark::model_ranks(&state.config_path);
+        let ranks = super::benchmark::model_ranks(&state);
         let models = reg
             .workers()
             .iter()
@@ -488,8 +488,8 @@ pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
 
 /// [`super::benchmark::model_ranks`] off the runtime threads (a new results file is parsed).
 async fn ranks(state: &Arc<AppState>) -> Arc<std::collections::HashMap<String, usize>> {
-    let path = state.config_path.clone();
-    blocking(move || super::benchmark::model_ranks(&path)).await
+    let state = state.clone();
+    blocking(move || super::benchmark::model_ranks(&state)).await
 }
 
 pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

@@ -1026,7 +1026,7 @@ pub fn image_counts(img: &EvalImage, threshold: f32) -> (Counts, Vec<PredBox>, I
 }
 
 /// Keep the `MAX_DETS` most confident predictions per class.
-fn cap(preds: &[PredBox]) -> Vec<PredBox> {
+pub(crate) fn cap(preds: &[PredBox]) -> Vec<PredBox> {
     let mut by: BTreeMap<&str, Vec<&PredBox>> = BTreeMap::new();
     for p in preds {
         by.entry(p.label.as_str()).or_default().push(p);
