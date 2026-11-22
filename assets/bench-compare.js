@@ -82,7 +82,9 @@
         tr.appendChild(td(c.label, BC.columnValue(r, key), ["first_load", "cpu"].indexOf(key) < 0 ? "num" : null, raw === undefined ? undefined : raw));
       });
       var b = el("button", {type: "button", class: "bn-expand", "aria-expanded": open ? "true" : "false", "aria-controls": "d-" + r.position, "aria-label": (open ? "Less about " : "More about ") + r.model + " on " + r.device, text: open ? "Less" : "More"});
-      b.addEventListener("click", function () { state.open[k] = !state.open[k]; render(); var nb = table.querySelector('tr[data-key="' + cssEsc(k) + '"] button.bn-expand'); if (nb) nb.focus(); });
+      // Re-rendered: the focus goes back to the button without scrolling the box sideways, and
+      // the box starts at its left edge, where the model and the details begin.
+      b.addEventListener("click", function () { state.open[k] = !state.open[k]; render(); var nb = table.querySelector('tr[data-key="' + cssEsc(k) + '"] button.bn-expand'); if (nb) nb.focus({preventScroll: true}); $("c-table-wrap").scrollLeft = 0; });
       tr.appendChild(td("Details", b, "rc-action"));
       tbody.appendChild(tr);
       if (open) {
@@ -92,13 +94,16 @@
       }
     });
     table.replaceChildren(el("thead", {}, [head]), tbody);
+    boxWidth();
     if (window.PrismSort) PrismSort.apply(table);
     if (window.PrismTip) PrismTip.refresh();
   }
+  // The box's visible width for the details row (style.css, .bn-details): its padding aside.
+  function boxWidth() { var w = $("c-table-wrap"); if (w) w.style.setProperty("--bn-box-w", Math.max(0, w.clientWidth - 34) + "px"); }
   function cssEsc(s) { return window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"); }
   function fact(k, v) { return el("div", {}, [el("span", {class: "k", text: k}), el("span", {class: "v", text: v})]); }
   function details(r, v) {
-    var s = r.speed || {}, f = r.flags || {}, box = el("div");
+    var s = r.speed || {}, f = r.flags || {}, box = el("div", "bn-details");
     var facts = [
       fact("Device", r.deviceLabel || r.device),
       fact("F1 / F2 / F0.5", fmt.n2(r.f1) + " / " + fmt.n2(r.f2) + " / " + fmt.n2(r.f05)),
@@ -417,7 +422,7 @@
   var rt = null;
   window.addEventListener("resize", function () {
     clearTimeout(rt);
-    rt = setTimeout(function () { var w = $("c-scatter").clientWidth; if (state.view && Math.abs(w - lastScatterWidth) > 8) renderScatter(state.view); }, 150);
+    rt = setTimeout(function () { boxWidth(); var w = $("c-scatter").clientWidth; if (state.view && Math.abs(w - lastScatterWidth) > 8) renderScatter(state.view); }, 150);
   });
   S.onView(function () { load(); });
   renderColumns();

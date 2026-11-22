@@ -334,6 +334,7 @@ class Node {
   set textContent(t) { this.childNodes.slice().forEach((k) => this.removeChild(k)); if (t !== '' && t != null) this.appendChild(new Text(String(t))); }
   get firstChild() { return this.childNodes[0] || null; }
   get lastChild() { return this.childNodes[this.childNodes.length - 1] || null; }
+  get previousSibling() { const p = this.parentNode; if (!p) return null; const i = p.childNodes.indexOf(this); return i > 0 ? p.childNodes[i - 1] : null; }
 }
 class Text extends Node { constructor(t) { super(3); this.nodeValue = t; this.nodeName = '#text'; } }
 class Frag extends Node { constructor() { super(11); } }
@@ -403,6 +404,7 @@ doc.readyState = 'complete';
 doc.activeElement = doc.body;
 doc.createElement = (t) => new El(t);
 doc.createDocumentFragment = () => new Frag();
+doc.createTextNode = (t) => new Text(String(t));
 doc.addEventListener = () => {};
 const win = {document: doc, location: {pathname: '/stats'}, console, Promise, setTimeout: (f) => f(),
   localStorage: {getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }, removeItem: (k) => { delete store[k]; }}};
@@ -535,6 +537,22 @@ Promise.resolve().then(() => {
   assert.deepStrictEqual(names(t8), ['set A', 'a1', 'a1-detail', 'a2', 'set B', 'b2', 'b1'], 'R descending, the sections stay');
   t8._prismSort.reset.dispatch('click');
   assert.deepStrictEqual(names(t8), ['set A', 'a2', 'a1', 'a1-detail', 'set B', 'b1', 'b2']);
+  // The sort button goes in a nowrap span with the header's last word, or with its last element
+  // (a glossary button): a wrapping header never leaves it alone on a line. The label is the same.
+  const gTerm = el('button', {class: 'term', text: 'Recall'});
+  const t9 = el('table', {'data-sort': 'glue'}, [el('thead', {}, [el('tr', {}, [el('th', {text: 'False alerts /100 empty '}), el('th', {}, [gTerm]), el('th', {text: 'p95'})])]),
+    el('tbody', {}, [el('tr', {}, [el('td', {text: '1'}), el('td', {text: '2'}), el('td', {text: '3'})])])]);
+  doc.body.appendChild(t9); S.scan(doc);
+  const [g0, g1, g2] = t9.tHead.rows[0].cells;
+  const glueOf = (th) => th.querySelector('button.th-sort').parentNode;
+  assert.strictEqual(glueOf(g0).className, 'th-sort-glue');
+  assert.strictEqual(glueOf(g0).firstChild.nodeValue, 'empty', 'the last word');
+  assert.strictEqual(g0.firstChild.nodeValue, 'False alerts /100 ', 'the rest stays before it');
+  assert.strictEqual(g0.querySelector('button.th-sort').getAttribute('aria-label'), 'Sort by False alerts /100 empty');
+  assert.strictEqual(glueOf(g1).firstChild, gTerm, 'a glossary button goes in with it');
+  assert.strictEqual(g1.querySelector('button.th-sort').getAttribute('aria-label'), 'Sort by Recall');
+  assert.strictEqual(glueOf(g2).firstChild.nodeValue, 'p95');
+  assert.strictEqual(g2.childNodes.length, 1, 'a one-word header: only the span');
   console.log('dom ok');
 }).catch((e) => { console.error(e); process.exit(1); });
 "#;
