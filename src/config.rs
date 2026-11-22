@@ -853,6 +853,11 @@ pub struct BenchmarkConfig {
     /// device runs, restored before a GPU device and after the run; CLI on Unix: nice 10 for a
     /// CPU-only run). Applies at once.
     pub low_priority: bool,
+    /// Benchmark each model "as served" (`benchmark --served`): with its live serving settings
+    /// (enhancement, filter rules, night threshold, night model, verifier), results named
+    /// `<model>+served` beside the bare ones ([`crate::benchmark::variant`]). Default false:
+    /// the bare model.
+    pub served: bool,
 }
 
 impl Default for BenchmarkConfig {
@@ -873,6 +878,7 @@ impl Default for BenchmarkConfig {
             threshold_objective: Default::default(),
             accuracy_metric: Default::default(),
             low_priority: true,
+            served: false,
         }
     }
 }

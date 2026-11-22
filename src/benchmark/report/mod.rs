@@ -421,6 +421,25 @@ pub struct ModelResult {
     /// ([`super::trained_on`]); None = unknown (no training record, or the run's list is gone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trained_on_share: Option<f64>,
+    /// An As served result (`<model>+served`, [`super::variant`]): the serving settings it ran
+    /// with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<ServedSettings>,
+    /// Answers only (`GET /v1/benchmark`, [`super::current::rebase`]): the model's serving
+    /// settings changed since this As served run (their fingerprint differs now); None for a
+    /// bare result or a model no longer configured. Never read from a file.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub stale_rules: Option<bool>,
+}
+
+/// The serving settings of an As served result ([`ModelResult::served`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedSettings {
+    /// [`super::variant::served_fingerprint`] at the run.
+    pub fingerprint: String,
+    /// What ran ([`super::PipelineVariant::describe`]).
+    #[serde(default)]
+    pub rules: String,
 }
 
 impl ModelResult {
@@ -447,6 +466,13 @@ impl ModelResult {
             threshold_objective: Objective::default(),
             threshold: None,
             trained_on_share: None,
+            served: job.variant.as_ref().and_then(|v| {
+                v.served.as_ref().map(|s| ServedSettings {
+                    fingerprint: s.fingerprint.clone(),
+                    rules: v.describe(),
+                })
+            }),
+            stale_rules: None,
         }
     }
 
@@ -473,6 +499,8 @@ impl ModelResult {
             threshold_objective: Objective::default(),
             threshold: None,
             trained_on_share: None,
+            served: None,
+            stale_rules: None,
         }
     }
 
@@ -1884,6 +1912,7 @@ mod tests {
                         (k * 10 + i * 200 + 50) as f32,
                         80.0,
                     ],
+                    window: None,
                 })
                 .collect()
         };

@@ -9,6 +9,13 @@
 //!   ONNX Runtime sessions; recorded as [`RunResult::tuning`]), so the run times and caches the
 //!   compiled model that serves (B4). Timing stays one request at a time.
 //! - Threshold: [`crate::worker::served_threshold`] for the device the model loaded on (B5).
+//! - A variant (`--variants`, As served; [`super::variant`] has the order of operations): its
+//!   enhancement in preprocess, the threshold of the frame's scene, filter rules, object filter
+//!   and verifier in postprocess ([`super::served::returned_at`]), a night / IR frame of an As
+//!   served model with a night model answered by the night model ([`Pipeline::serve`]). The
+//!   untimed evaluation stores what is returned at every threshold of the sweep
+//!   ([`super::served::windows`], B2), asking the verifier about each crop once
+//!   ([`SWEEP_VERIFY_CAP`] more per image at most).
 //! - Decode: the service's decode stage, the frame's statistics and its [`Scene`] included
 //!   (`prep.rs`); the set's transform (a NIR proxy's grayscale) is applied between them, untimed,
 //!   so the scene is the one of the frame the set sends.
@@ -242,9 +249,12 @@ impl std::fmt::Debug for Bench<'_> {
 pub(super) struct Sample {
     pub(super) stages: [f64; 4],
     pub(super) predictions: Vec<Prediction>,
-    pub(super) eval: Vec<Prediction>,
+    /// The evaluation boxes (with their windows for a variant, [`super::served`]).
+    pub(super) eval: Vec<PredBox>,
     /// The frame's computed scene (the service's, after decode).
     pub(super) scene: Scene,
+    /// The night model answered it (As served).
+    pub(super) routed: bool,
 }
 
 /// Folder levels below the cache root [`cache_files`] lists: OpenVINO blobs are one level down
@@ -375,6 +385,7 @@ pub(super) fn to_pred(p: &Prediction) -> PredBox {
             p.x_max as f32,
             p.y_max as f32,
         ],
+        window: None,
     }
 }
 
@@ -534,20 +545,115 @@ impl<'a> Bench<'a> {
                 cache_status(&before, &cache_files(dir), &backend.info().device)
             }
         };
+        let loaded_spec = backend.info().device.spec.clone();
+        let mut record = job
+            .variant
+            .as_ref()
+            .and_then(|v| v.served.as_ref())
+            .map(|s| ServedRun {
+                night_model: s.night.as_ref().map(|n| n.model().to_string()),
+                notes: s.notes.clone(),
+                ..ServedRun::default()
+            });
         let verifier = match job.variant.as_ref().and_then(|v| v.verify.as_ref()) {
-            Some(v) => Some(self.load_verifier(runtimes, &v.job, &backend.info().device.spec)?),
+            Some(v) => match (
+                self.load_on(runtimes, &v.job, &loaded_spec, "the verifier"),
+                record.as_mut(),
+            ) {
+                (Ok(b), _) => Some(b),
+                // As served: a verifier that does not load leaves the candidates unverified,
+                // as the service's fail-open does.
+                (Err(e), Some(r)) => {
+                    self.check_cancel()?;
+                    r.notes.push(format!(
+                        "verifier {} did not load ({e:#}): candidates stay unverified \
+                         (fail-open, as served)",
+                        v.job.name
+                    ));
+                    None
+                }
+                (Err(e), None) => return Err(e),
+            },
             None => None,
         };
-        self.time(job, requested, backend, verifier, compile_ms, cache, tuning)
+        let night = self.load_night(runtimes, job, &loaded_spec, record.as_mut())?;
+        let companions = Companions {
+            verifier,
+            night,
+            record,
+        };
+        self.time(
+            job, requested, backend, companions, compile_ms, cache, tuning,
+        )
     }
 
-    /// Compile the verifier of a `verify:<model>` variant on `device` (the spec the verified
-    /// model loaded on; falls back like the service would).
-    fn load_verifier(
+    /// As served: compile the night model (and its verifier) on `device`, the spec the model
+    /// loaded on, with the night model's worker tuning. A night model that cannot be used is
+    /// recorded in `record` as the reason its frames run on the model itself.
+    fn load_night<'j>(
+        &self,
+        runtimes: &Mutex<Runtimes>,
+        job: &'j Job,
+        device: &str,
+        record: Option<&mut ServedRun>,
+    ) -> Result<Option<NightLoaded<'j>>> {
+        let (Some(route), Some(record)) = (
+            job.variant
+                .as_ref()
+                .and_then(|v| v.served.as_ref())
+                .and_then(|s| s.night.as_ref()),
+            record,
+        ) else {
+            return Ok(None);
+        };
+        let (njob, nvariant) = match route {
+            super::variant::NightRoute::Model { job, variant } => (&**job, &**variant),
+            super::variant::NightRoute::Fallback { reason, .. } => {
+                record.night_fallback = Some(reason.clone());
+                return Ok(None);
+            }
+        };
+        let backend = match self.load_on(runtimes, njob, device, "the night model") {
+            Ok(b) => b,
+            Err(e) => {
+                self.check_cancel()?;
+                record.night_fallback = Some(format!("it did not load on {device}: {e:#}"));
+                return Ok(None);
+            }
+        };
+        let night_spec = backend.info().device.spec.clone();
+        let verifier = match nvariant.verify.as_ref() {
+            Some(v) => match self.load_on(runtimes, &v.job, &night_spec, "the verifier") {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    self.check_cancel()?;
+                    record.notes.push(format!(
+                        "the night model's verifier {} did not load ({e:#}): its candidates \
+                         stay unverified (fail-open, as served)",
+                        v.job.name
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        Ok(Some(NightLoaded {
+            job: njob,
+            variant: nvariant,
+            backend,
+            verifier,
+        }))
+    }
+
+    /// Compile `vjob` (the verifier of a `verify:<model>` variant, or a served model's night
+    /// model or verifier: `what`) on `device` (the spec the benchmarked model loaded on; falls
+    /// back like the service would), with its worker's tuning.
+    fn load_on(
         &self,
         runtimes: &Mutex<Runtimes>,
         vjob: &Job,
         device: &str,
+        what: &str,
     ) -> Result<Backend> {
         let spec = spec::parse(device)?;
         let candidates = lock(runtimes).plan(&spec, &vjob.path);
@@ -557,7 +663,7 @@ impl<'a> Bench<'a> {
             gpu_precision: vjob.gpu_precision.clone(),
             no_cache: false,
         };
-        let label = format!("verifier {}", vjob.name);
+        let label = format!("{what} {}", vjob.name);
         let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {
             self.check_cancel()?;
             let compiled = {
@@ -569,7 +675,7 @@ impl<'a> Bench<'a> {
             compiled.into_backend()
         });
         self.check_cancel()?;
-        loaded.with_context(|| format!("loading the verifier {}", vjob.path.display()))
+        loaded.with_context(|| format!("loading {what} {}", vjob.path.display()))
     }
 
     /// Warm up and time `backend` over every image, then score its detections.
@@ -582,11 +688,16 @@ impl<'a> Bench<'a> {
         job: &Job,
         requested: &str,
         backend: Backend,
-        verifier: Option<Backend>,
+        companions: Companions,
         compile_ms: f64,
         cache: String,
         tuning: RunTuning,
     ) -> Result<RunResult> {
+        let Companions {
+            verifier,
+            night,
+            mut record,
+        } = companions;
         let info = backend.info();
         let dev = info.device.clone();
         let (in_w, in_h) = info.input_size;
@@ -598,6 +709,15 @@ impl<'a> Bench<'a> {
             dev.spec.clone()
         };
         let (threshold, threshold_source) = self.served_threshold(job, &loaded_on);
+        let night_threshold = job
+            .variant
+            .as_ref()
+            .and_then(|v| v.served.as_ref())
+            .and_then(|s| s.night_threshold);
+        let night = match night {
+            Some(n) => Some(Box::new(self.night_pipeline(n)?)),
+            None => None,
+        };
         let mut pipe = Pipeline {
             pre: Preprocessor::for_family(in_w, in_h, family.as_ref()),
             family,
@@ -607,7 +727,9 @@ impl<'a> Bench<'a> {
                 nms_iou: self.params.nms_iou,
             },
             eval_params: PostParams {
-                confidence_threshold: EVAL_CONFIDENCE.min(threshold),
+                confidence_threshold: EVAL_CONFIDENCE
+                    .min(threshold)
+                    .min(night_threshold.unwrap_or(EVAL_CONFIDENCE)),
                 nms_iou: self.params.nms_iou,
             },
             classes: &job.classes,
@@ -620,6 +742,10 @@ impl<'a> Bench<'a> {
                 (Some(b), Some(v)) => Some(Verifier::new(b, v, self.params)?),
                 _ => None,
             },
+            night_threshold,
+            night,
+            fixed: false,
+            verify_capped: 0,
             #[cfg(test)]
             slow_eval: self.slow_eval,
         };
@@ -660,6 +786,11 @@ impl<'a> Bench<'a> {
             .map(|(a, b)| b.saturating_sub(a));
         let live_requests_per_min = live_requests.map(|n| per_minute(n, timed_wall));
         let loop_s = timed.loop_time.as_secs_f64();
+        if let Some(r) = record.as_mut() {
+            r.night_routed = timed.routed;
+            r.verify_capped_images =
+                pipe.verify_capped + pipe.night.as_ref().map_or(0, |n| n.verify_capped);
+        }
 
         let stages_ms = timed.stage_stats();
         let (accuracy, accuracy_note) = score(
@@ -740,8 +871,61 @@ impl<'a> Bench<'a> {
             tag_recall,
             grades: Some(grades),
             agreement: None,
+            served: record,
             eval_preds,
             per_image: timed.per_image,
+        })
+    }
+
+    /// The night model's pipeline of an As served run: its own stages, threshold
+    /// (`threshold_for_scene` on the device it loaded on: its `night_threshold`, else its served
+    /// threshold there; every frame it gets is a night / IR one), filters, object filter and
+    /// verifier; never routed again.
+    fn night_pipeline<'s>(&'s self, n: NightLoaded<'s>) -> Result<Pipeline<'s>> {
+        let NightLoaded {
+            job,
+            variant,
+            backend,
+            verifier,
+        } = n;
+        let info = backend.info();
+        let (in_w, in_h) = info.input_size;
+        let family =
+            crate::model::make_family(job.family, &info.inputs, &info.outputs, job.classes.len())?;
+        let loaded_on = if info.device.spec.is_empty() {
+            info.device.actual.clone()
+        } else {
+            info.device.spec.clone()
+        };
+        let threshold = match variant.served.as_ref().and_then(|s| s.night_threshold) {
+            Some(t) => t,
+            None => self.served_threshold(job, &loaded_on).0,
+        };
+        Ok(Pipeline {
+            pre: Preprocessor::for_family(in_w, in_h, family.as_ref()),
+            family,
+            backend,
+            params: PostParams {
+                confidence_threshold: threshold,
+                nms_iou: self.params.nms_iou,
+            },
+            eval_params: PostParams {
+                confidence_threshold: EVAL_CONFIDENCE.min(threshold),
+                nms_iou: self.params.nms_iou,
+            },
+            classes: &job.classes,
+            filter: self.object_filter_for(job),
+            variant: Some(variant),
+            verifier: match (verifier, variant.verify.as_ref()) {
+                (Some(b), Some(v)) => Some(Verifier::new(b, v, self.params)?),
+                _ => None,
+            },
+            night_threshold: None,
+            night: None,
+            fixed: true,
+            verify_capped: 0,
+            #[cfg(test)]
+            slow_eval: None,
         })
     }
 
@@ -897,6 +1081,7 @@ impl<'a> Bench<'a> {
             total_iters,
             loop_time: Duration::ZERO,
             pipelined: false,
+            routed: 0,
         };
         let mut done = 0;
         self.report(job, requested, Phase::Timing, 0, total_iters, "");
@@ -917,7 +1102,9 @@ impl<'a> Bench<'a> {
                 let decode_ms = decoded.decode_ms;
                 // Not timed: the service keeps its decoded frame for the verifier without a
                 // copy (B6).
-                let original = pipe.verifier.is_some().then(|| decoded.img.clone());
+                let original = pipe
+                    .needs_original(decoded.scene)
+                    .then(|| decoded.img.clone());
                 let t = Instant::now();
                 let served = pipe
                     .serve(decoded, original)
@@ -936,6 +1123,7 @@ impl<'a> Bench<'a> {
             }
             timed.by_res.entry(bucket).or_default().1 += 1;
             let last = last.context("no timed run (repeat must be >= 1)")?;
+            timed.routed += usize::from(last.routed);
             let (run, eval) = image_run(set, img, &last, &totals, &infers, self.max_stored_preds);
             if let Some(f) = self.on_image {
                 f(&run);
@@ -1069,28 +1257,60 @@ fn read_frames(
     }
 }
 
+/// What a run compiles beside the model: the verifier, the night model (As served) and the
+/// record of what the served pipeline did.
+struct Companions<'j> {
+    verifier: Option<Backend>,
+    night: Option<NightLoaded<'j>>,
+    record: Option<ServedRun>,
+}
+
+/// The compiled night model of an As served run.
+struct NightLoaded<'j> {
+    job: &'j Job,
+    variant: &'j PipelineVariant,
+    backend: Backend,
+    verifier: Option<Backend>,
+}
+
+/// Verifier runs an image's evaluation may make beyond those of its timed request (the sweep
+/// asks about the candidates of every threshold, [`super::served`]): crowded frames with many
+/// verified candidates are bounded. Past it a candidate stays unverified (kept) at the
+/// thresholds that would check it, as a crop the service cannot check does; the run counts
+/// such images ([`ServedRun::verify_capped_images`]).
+pub const SWEEP_VERIFY_CAP: usize = 32;
+
 /// One compiled model with the production per-request stages (the code `worker.rs` runs).
 pub(super) struct Pipeline<'j> {
     backend: Backend,
     family: Box<dyn crate::model::Family>,
     pre: Preprocessor,
+    /// The served threshold (a day frame's; the night model's own on the night pipeline).
     params: PostParams,
     eval_params: PostParams,
     classes: &'j [String],
     filter: Option<&'j [String]>,
-    /// Enhancement and filter rules on top of the plain stages ([`super::variant`]).
+    /// Enhancement, filter rules and verifier on top of the plain stages ([`super::variant`]).
     variant: Option<&'j PipelineVariant>,
-    /// The verifier of a `verify:<model>` variant.
+    /// The verifier of the variant.
     verifier: Option<Verifier<'j>>,
+    /// As served: the threshold of night / IR frames run here (`night_threshold`).
+    night_threshold: Option<f32>,
+    /// As served: the night model's pipeline (night / IR frames go there).
+    night: Option<Box<Pipeline<'j>>>,
+    /// The night model's pipeline: its threshold stays whatever threshold the sweep scores.
+    fixed: bool,
+    /// Images whose evaluation hit [`SWEEP_VERIFY_CAP`].
+    verify_capped: usize,
     /// Test only: a pause in [`Pipeline::evaluate`] (untimed work).
     #[cfg(test)]
     slow_eval: Option<Duration>,
 }
 
-/// The second model of a `verify:<model>` variant: the stages the verifier's worker runs on a
-/// verifier check (`worker::Purpose::Verify`): its own enhancement for the frame's scene, the
-/// resize, inference, and its raw detections at `min_confidence` (no night rules, no object
-/// filter).
+/// The second model of a `verify:<model>` variant (and of an As served model with `verify`):
+/// the stages the verifier's worker runs on a verifier check (`worker::Purpose::Verify`): its
+/// own enhancement for the frame's scene, the resize, inference, and its raw detections at
+/// `min_confidence` (no night rules, no object filter).
 pub(super) struct Verifier<'j> {
     backend: Backend,
     family: Box<dyn crate::model::Family>,
@@ -1148,43 +1368,70 @@ impl<'j> Verifier<'j> {
             None,
         ))
     }
+}
 
-    /// Check the candidates of `preds` ([`crate::verify::plan`]) on `frame` (the original,
-    /// not enhanced): the kept predictions and the rejected ones (dropped from the evaluation
-    /// boxes later, [`Pipeline::evaluate`]; candidates are taken from `preds`, so evaluation
-    /// boxes below the production threshold stay unverified).
-    fn apply(
-        &mut self,
-        frame: crate::image::RgbImage,
-        scene: Scene,
-        preds: Vec<Prediction>,
-    ) -> Result<(Vec<Prediction>, Vec<Prediction>)> {
-        use crate::verify::VerifyMode;
-        let cfg = &self.variant.config;
-        let plan = crate::verify::plan(&preds, frame.width, frame.height, scene, cfg);
-        if plan.is_empty() {
-            return Ok((preds, Vec::new()));
-        }
-        let found: Vec<Option<Vec<Prediction>>> = match cfg.mode {
-            VerifyMode::Crop => {
-                let mut out = Vec::with_capacity(plan.checks.len());
-                for c in &plan.checks {
-                    out.push(match c.crop {
-                        Some(r) => Some(self.detect(crate::verify::crop(&frame, r), scene)?),
-                        None => None,
-                    });
-                }
-                out
+/// The verifier's answers on one frame so far (each crop asked once per image, the timed
+/// request's answers reused by the evaluation).
+#[derive(Debug, Default)]
+pub(super) struct AnswerCache {
+    crops: Vec<(crate::verify::CropRect, Option<Vec<Prediction>>)>,
+    frame: Option<Option<Vec<Prediction>>>,
+}
+
+/// [`super::served::Answers`] from the verifier model on the original frame (fail-open: no
+/// verifier, no frame, an error or the evaluation's cap leaves a candidate unverified).
+struct VerifierAnswers<'a, 'j> {
+    verifier: Option<&'a mut Verifier<'j>>,
+    frame: Option<&'a crate::image::RgbImage>,
+    scene: Scene,
+    cache: &'a mut AnswerCache,
+    /// Verifier runs still allowed (None: no cap, the timed request).
+    budget: Option<usize>,
+    capped: bool,
+}
+
+impl VerifierAnswers<'_, '_> {
+    /// One more verifier run allowed (the budget counted down).
+    fn spend(&mut self) -> bool {
+        match self.budget.as_mut() {
+            Some(0) => {
+                self.capped = true;
+                false
             }
-            VerifyMode::Frame => vec![Some(self.detect(frame, scene)?)],
-        };
-        let outcomes = crate::verify::outcomes(&plan, &found, &self.variant.config);
-        let rejected: Vec<Prediction> = outcomes
-            .iter()
-            .filter(|(_, o)| *o == crate::verify::Outcome::Rejected)
-            .filter_map(|(i, _)| preds.get(*i).cloned())
-            .collect();
-        Ok((crate::verify::apply(preds, &outcomes).0, rejected))
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+            None => true,
+        }
+    }
+}
+
+impl super::served::Answers for VerifierAnswers<'_, '_> {
+    fn crop(&mut self, r: crate::verify::CropRect) -> Option<Vec<Prediction>> {
+        if let Some((_, a)) = self.cache.crops.iter().find(|(c, _)| *c == r) {
+            return a.clone();
+        }
+        if self.verifier.is_none() || self.frame.is_none() || !self.spend() {
+            return None;
+        }
+        let (v, frame) = (self.verifier.as_deref_mut()?, self.frame?);
+        let a = v.detect(crate::verify::crop(frame, r), self.scene).ok();
+        self.cache.crops.push((r, a.clone()));
+        a
+    }
+
+    fn frame(&mut self) -> Option<Vec<Prediction>> {
+        if let Some(a) = &self.cache.frame {
+            return a.clone();
+        }
+        if self.verifier.is_none() || self.frame.is_none() || !self.spend() {
+            return None;
+        }
+        let (v, frame) = (self.verifier.as_deref_mut()?, self.frame?);
+        let a = v.detect(frame.clone(), self.scene).ok();
+        self.cache.frame = Some(a.clone());
+        a
     }
 }
 
@@ -1196,11 +1443,33 @@ pub(super) struct Served {
     outputs: Vec<crate::model::NamedOutput>,
     ctx: crate::model::PreprocessCtx,
     scene: Scene,
-    /// Production predictions the verifier rejected (left out of the evaluation boxes too).
-    rejected: Vec<Prediction>,
+    /// The night model answered it (As served).
+    routed: bool,
+    /// The frame before enhancement (for the evaluation's verifier checks).
+    frame: Option<crate::image::RgbImage>,
+    /// The verifier's answers of the timed request.
+    answers: AnswerCache,
 }
 
 impl Pipeline<'_> {
+    /// The frame before enhancement is needed (a verifier here, or on the night model a night /
+    /// IR frame of `scene` goes to).
+    fn needs_original(&self, scene: Scene) -> bool {
+        match &self.night {
+            Some(n) if scene.is_night() => n.needs_original(scene),
+            _ => self.verifier.is_some(),
+        }
+    }
+
+    /// The threshold of a frame of `scene` ([`crate::worker::LiveSettings::threshold_for_scene`]):
+    /// `night_threshold` on night / IR frames when set, else the served one.
+    fn threshold_for(&self, scene: Scene) -> f32 {
+        match self.night_threshold {
+            Some(t) if scene.is_night() && !self.fixed => t,
+            _ => self.params.confidence_threshold,
+        }
+    }
+
     /// One request from the decoded frame on through the worker's stages, serially, with
     /// per-stage timings; its decode time is `frame.decode_ms` (measured where it was decoded,
     /// possibly the read-ahead thread). The set's `transform` (an image-set property, not a
@@ -1208,10 +1477,12 @@ impl Pipeline<'_> {
     /// `original` is the frame before enhancement, for the verifier (None without one).
     ///
     /// A variant adds what the service does with the same options: the enhancement for the
-    /// frame's scene counts as preprocess time, its filter rules run on the family's
-    /// detections (postprocess time) and on the evaluation detections too, so AP, false
-    /// positives and the threshold sweep see the filtered boxes. The verifier cascade counts as
-    /// postprocess time (the service adds it to processMs).
+    /// frame's scene counts as preprocess time; the threshold of the frame's scene, the filter
+    /// rules, the object filter and the verifier ([`super::served::returned_at`]) count as
+    /// postprocess time (the service adds the verifier to processMs). As served, a night / IR
+    /// frame of a model with a night model runs this model's enhancement and resize (the
+    /// service's prep pool does before routing; preprocess time), then the night model's
+    /// stages on the original frame.
     fn serve(
         &mut self,
         frame: Decoded,
@@ -1222,6 +1493,29 @@ impl Pipeline<'_> {
             decode_ms: decode,
             scene,
         } = frame;
+
+        if scene.is_night()
+            && let Some(night) = self.night.as_mut()
+        {
+            let t = Instant::now();
+            let mut mine = img.clone();
+            if let Some(v) = self.variant {
+                crate::model::enhance::apply(&mut mine, v.modes().for_scene(scene));
+            }
+            let _ = self.pre.run(&mine.rgb, mine.width, mine.height)?;
+            let before = ms(t.elapsed());
+            let mut served = night.serve(
+                Decoded {
+                    img,
+                    decode_ms: decode,
+                    scene,
+                },
+                original,
+            )?;
+            served.stages[1] += before;
+            served.routed = true;
+            return Ok(served);
+        }
 
         let t = Instant::now();
         if let Some(v) = self.variant {
@@ -1236,15 +1530,34 @@ impl Pipeline<'_> {
         let infer = ms(t.elapsed());
 
         let t = Instant::now();
-        let dets = self.filtered(
-            self.family.postprocess(&outputs, &ctx, &self.params)?,
-            &ctx,
-            scene,
-        );
-        let preds = crate::model::to_predictions(&dets, &ctx, self.classes, self.filter);
-        let (preds, rejected) = match (self.verifier.as_mut(), original) {
-            (Some(v), Some(frame)) => v.apply(frame, scene, preds)?,
-            _ => (preds, Vec::new()),
+        let threshold = self.threshold_for(scene);
+        let params = PostParams {
+            confidence_threshold: threshold,
+            nms_iou: self.params.nms_iou,
+        };
+        let dets = self.family.postprocess(&outputs, &ctx, &params)?;
+        let mut answers = AnswerCache::default();
+        let preds = match self.variant {
+            None => crate::model::to_predictions(&dets, &ctx, self.classes, self.filter),
+            Some(v) => {
+                let (filters, verify) = variant_rules(v);
+                let rules = super::served::PostRules {
+                    classes: self.classes,
+                    filters,
+                    object_filter: self.filter,
+                    verify,
+                };
+                let mut ask = VerifierAnswers {
+                    verifier: self.verifier.as_mut(),
+                    frame: original.as_ref(),
+                    scene,
+                    cache: &mut answers,
+                    budget: None,
+                    capped: false,
+                };
+                super::served::returned_at(&dets, &ctx, scene, threshold, &rules, &mut ask)
+                    .predictions
+            }
         };
         let postprocess = ms(t.elapsed());
         Ok(Served {
@@ -1253,32 +1566,29 @@ impl Pipeline<'_> {
             outputs,
             ctx,
             scene,
-            rejected,
+            routed: false,
+            frame: original,
+            answers,
         })
     }
 
-    /// The variant's filter rules over `dets` (none without a variant).
-    fn filtered(
-        &self,
-        dets: Vec<crate::model::Detection>,
-        ctx: &crate::model::PreprocessCtx,
-        scene: Scene,
-    ) -> Vec<crate::model::Detection> {
-        match self.variant.and_then(|v| v.filters.as_ref()) {
-            Some(r) => {
-                crate::model::filters::apply(dets, self.classes, ctx.orig_w, ctx.orig_h, scene, r).0
-            }
-            None => dets,
-        }
-    }
-
     /// The benchmark's own work after a served request (untimed): with `eval`, the same outputs
-    /// post-processed again at the evaluation threshold, without the object filter and without
-    /// the boxes the verifier rejected.
-    fn evaluate(&self, served: Served, eval: bool) -> Result<Sample> {
+    /// post-processed again at the evaluation threshold without the object filter; with a
+    /// variant, every box the pipeline returns at some threshold of the sweep, with where
+    /// ([`super::served::windows`], B2). A frame the night model answered is evaluated by it,
+    /// its labels scored as this model's classes ([`night_labels`]).
+    fn evaluate(&mut self, served: Served, eval: bool) -> Result<Sample> {
         #[cfg(test)]
         if let Some(d) = self.slow_eval.filter(|_| eval) {
             std::thread::sleep(d);
+        }
+        if served.routed
+            && let Some(night) = self.night.as_mut()
+        {
+            let mut sample = night.evaluate(served, eval)?;
+            night_labels(&ClassMap::for_model(self.classes), &mut sample.eval);
+            sample.routed = true;
+            return Ok(sample);
         }
         let Served {
             stages,
@@ -1286,17 +1596,55 @@ impl Pipeline<'_> {
             outputs,
             ctx,
             scene,
-            rejected,
+            routed,
+            frame,
+            mut answers,
         } = served;
         let eval = if eval {
-            let dets = self.filtered(
-                self.family.postprocess(&outputs, &ctx, &self.eval_params)?,
-                &ctx,
-                scene,
-            );
-            let mut eval = crate::model::to_predictions(&dets, &ctx, self.classes, None);
-            eval.retain(|e| !rejected.contains(e));
-            eval
+            let dets = self.family.postprocess(&outputs, &ctx, &self.eval_params)?;
+            match self.variant {
+                None => crate::model::to_predictions(&dets, &ctx, self.classes, None)
+                    .iter()
+                    .map(to_pred)
+                    .collect(),
+                Some(v) => {
+                    let threshold = match (self.fixed, self.night_threshold) {
+                        (true, _) => {
+                            super::served::Threshold::Fixed(self.params.confidence_threshold)
+                        }
+                        (false, Some(t)) if scene.is_night() => super::served::Threshold::Fixed(t),
+                        _ => super::served::Threshold::Sweep,
+                    };
+                    let (filters, verify) = variant_rules(v);
+                    let rules = super::served::PostRules {
+                        classes: self.classes,
+                        filters,
+                        object_filter: self.filter,
+                        verify,
+                    };
+                    let mut ask = VerifierAnswers {
+                        verifier: self.verifier.as_mut(),
+                        frame: frame.as_ref(),
+                        scene,
+                        cache: &mut answers,
+                        budget: Some(SWEEP_VERIFY_CAP),
+                        capped: false,
+                    };
+                    let w = super::served::windows(
+                        &dets,
+                        &ctx,
+                        scene,
+                        threshold,
+                        self.eval_params.confidence_threshold,
+                        &rules,
+                        &mut ask,
+                    );
+                    if ask.capped {
+                        self.verify_capped += 1;
+                    }
+                    w
+                }
+            }
         } else {
             Vec::new()
         };
@@ -1305,7 +1653,31 @@ impl Pipeline<'_> {
             predictions,
             eval,
             scene,
+            routed,
         })
+    }
+}
+
+/// The filter rules and verifier settings of `v` ([`super::served::PostRules`]).
+fn variant_rules(
+    v: &PipelineVariant,
+) -> (
+    Option<&crate::model::filters::FilterRules>,
+    Option<&crate::verify::VerifyConfig>,
+) {
+    (v.filters.as_ref(), v.verify.as_ref().map(|vv| &vv.config))
+}
+
+/// Labels of the night model's evaluation boxes the model's class map does not score, scored as
+/// the class its ground truth maps them to (a night model's `car` is a `vehicle` of a model with
+/// a `vehicle` class, as a `car` label is for its ground truth).
+fn night_labels(map: &ClassMap, preds: &mut [PredBox]) {
+    for p in preds {
+        if map.pred_class(&p.label).is_none()
+            && let Some(c) = map.gt_class(&p.label)
+        {
+            p.label = c.to_string();
+        }
     }
 }
 
@@ -1325,6 +1697,8 @@ pub(super) struct Timings {
     loop_time: Duration,
     /// The frames were read and decoded ahead ([`Bench::timed_runs_ahead`]).
     pipelined: bool,
+    /// Images the night model answered (As served).
+    routed: usize,
 }
 
 impl Timings {
@@ -1399,7 +1773,7 @@ pub(super) fn image_run(
         .collect();
     preds.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
     preds.truncate(max_preds);
-    let eval = last.eval.iter().map(to_pred).collect();
+    let eval = last.eval.clone();
     let run = ImageRun {
         set: set.id.clone(),
         file: img.file.clone(),
@@ -1509,12 +1883,14 @@ mod tests {
             total_iters: 3,
             loop_time: Duration::ZERO,
             pipelined: false,
+            routed: 0,
         };
         let sample = |stages: [f64; 4]| Sample {
             stages,
             predictions: Vec::new(),
             eval: Vec::new(),
             scene: Scene::Day,
+            routed: false,
         };
         assert_eq!(t.record("sd", &sample([1.0, 2.0, 10.0, 0.5])), 13.5);
         assert_eq!(t.record("sd", &sample([1.0, 4.0, 20.0, 0.5])), 25.5);

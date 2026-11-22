@@ -66,6 +66,24 @@ blue-onyx-prism benchmark --dataset nir-night --dataset exdark-ir --dataset exda
 - person aspect between 0.2 and 0.9;
 - drop a person box that overlaps a potted plant.
 
+To measure a model as it serves at night, with its own settings rather than trial variants, run
+it **as served** (off by default; `benchmark.served`, the Benchmark page's *As served* checkbox):
+
+```
+blue-onyx-prism benchmark --dataset nir-night --dataset exdark-night --served
+```
+
+Each night / IR frame goes through what the service does with it: the model's `night_preprocess`,
+its `night_threshold` instead of the day threshold, its night rules, and its verifier; with a
+`night_model` the frame is answered by the night model (its own enhancement, threshold, filters
+and verifier, compiled on the same device), and when that model is missing, disabled or fails
+to load the frame runs on the model itself and the result says why. Day frames sweep the
+threshold as usual; night / IR frames with a `night_threshold`, and those the night model
+answers, keep their threshold across the sweep, so the curves show what changing the day
+threshold does to the whole stream. The results are `<model>+served`, beside the bare model's,
+and are marked stale (`stale_rules`) when any of these settings change. `--served` does not
+combine with `--variants`.
+
 ## Results (2026-10, Apple M1, `openvino:cpu`, threshold 0.5)
 
 Person false positives per image, on frames that contain no person:
@@ -113,7 +131,8 @@ What these numbers do not show:
 
 - Real IR person accuracy. nir-night has only 2 persons, and exdark-ir is a grayscale approximation.
 - Statistically solid differences. The false-positive counts are 0–14 boxes, so a difference of 0.014 is one box.
-- The `night_model` switch end to end. The benchmark runs each model on its own, not with routing.
+- The `night_model` switch end to end. These runs scored each model on its own; `benchmark --served`
+  (below) now runs the switch.
 
 Benchmarking your own night snapshots (`--dataset dir:<path>`) is the next step.
 

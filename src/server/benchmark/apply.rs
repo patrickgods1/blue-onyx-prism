@@ -1113,6 +1113,12 @@ mod tests {
         assert!(
             page.contains("<label class=\"check\"><input type=\"checkbox\" name=\"low_priority\"")
         );
+        // As served: unchecked by default (the bare model), a hidden 0 before the box.
+        assert!(page.contains(
+            "<input type=\"hidden\" name=\"served\" value=\"0\"><label class=\"check\">\
+             <input type=\"checkbox\" name=\"served\" value=\"1\"> As served: apply each \
+             model's night model, night threshold, filters, enhancement and verifier"
+        ));
         assert!(page.contains("class=\"bench-settings\""));
     }
 

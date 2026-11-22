@@ -658,6 +658,14 @@ pub(super) fn print_all_devices(result: &ModelResult, m: &ModelReport) {
     for s in &m.skipped_devices {
         println!("  skipped {s}");
     }
+    for d in &result.devices {
+        if let Some(s) = d.run.as_ref().and_then(|r| r.served.as_ref()) {
+            let text = s.describe();
+            if !text.is_empty() {
+                println!("  as served on {}: {text}", d.device);
+            }
+        }
+    }
     match &m.recommended {
         Some(d) => println!("  recommended: {d} ({})", result.recommendation),
         None => println!("  recommended: none ({})", result.recommendation),
@@ -941,6 +949,14 @@ pub(super) fn print_run(r: &RunResult) {
     if let Some(w) = crate::benchmark::report::shared_load_text(r) {
         println!("  {w}");
     }
+    if let Some(s) = r
+        .served
+        .as_ref()
+        .map(|s| s.describe())
+        .filter(|s| !s.is_empty())
+    {
+        println!("  as served: {s}");
+    }
     if let Some(g) = &r.grades {
         println!(
             "  grades: overall {} (accuracy {} by {}, speed {})",
@@ -1052,6 +1068,7 @@ mod tests {
             tag_recall: vec![],
             grades: None,
             agreement: None,
+            served: None,
             per_image: Vec::new(),
             eval_preds: Vec::new(),
         };

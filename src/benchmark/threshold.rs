@@ -1169,6 +1169,7 @@ mod tests {
                     if score > 0.0 {
                         img.preds.push(SweepPred {
                             confidence: score,
+                            after: f32::NEG_INFINITY,
                             class: class.into(),
                             tp: positive,
                             small: false,
@@ -1178,6 +1179,7 @@ mod tests {
                         class: class.into(),
                         positive,
                         score,
+                        spans: None,
                     });
                 }
                 img
@@ -1513,6 +1515,7 @@ mod tests {
             tps += usize::from(tp);
             img.preds.push(SweepPred {
                 confidence: c,
+                after: f32::NEG_INFINITY,
                 class: "person".into(),
                 tp,
                 small: false,
@@ -1719,6 +1722,7 @@ mod tests {
     fn sp(class: &str, confidence: f32, tp: bool) -> super::super::metrics::SweepPred {
         super::super::metrics::SweepPred {
             confidence,
+            after: f32::NEG_INFINITY,
             class: class.into(),
             tp,
             small: false,
@@ -1801,6 +1805,7 @@ mod tests {
                             label: l.to_string(),
                             confidence: *c,
                             bbox: [i as f32 * 200.0, 0.0, i as f32 * 200.0 + 100.0, 100.0],
+                            window: None,
                         })
                         .collect(),
                     ..Default::default()
@@ -1881,6 +1886,7 @@ mod tests {
                 label: "person".into(),
                 confidence: 0.8,
                 bbox: [1.0, 1.0, 100.0, 100.0],
+                window: None,
             }],
             ..Default::default()
         };

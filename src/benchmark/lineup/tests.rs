@@ -88,6 +88,7 @@ fn stored(
                         class,
                         confidence,
                         bbox,
+                        window: None,
                     })
                     .collect(),
             })

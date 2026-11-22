@@ -3,9 +3,11 @@
 //! filter rules ([`crate::model::filters`]), so their effect on accuracy, false positives and
 //! speed can be compared on the same images. A variant's results are named
 //! `<model>+<variant>` (e.g. `IPcam-general+pre:clahe`), so the report, `benchmark.json` and the
-//! run history treat it as one more model. `Pipeline::run` applies a variant with the functions
-//! the service calls (scene statistics on the decoded frame, `enhance::apply`, `filters::apply`
-//! before scoring), so the benchmark and the service cannot drift apart.
+//! run history treat it as one more model. The run applies a variant with the functions the
+//! service calls (scene statistics on the decoded frame, `enhance::apply`, `filters::apply`,
+//! the verifier's `plan` / `outcomes`; [`super::served`]), so the benchmark and the service
+//! cannot drift apart, and scores what the pipeline returns at each threshold of the sweep (B2:
+//! overlap evidence and verifier candidates are the boxes at that threshold).
 //!
 //! Syntax: a comma list of variants; each is `none` (the plain pipeline) or `+`-joined parts:
 //! `filters`, `pre:<mode>` (every frame), `night-pre:<mode>` (night / IR frames only),
@@ -16,6 +18,45 @@
 //! settings when they name `<model>`, else the defaults of [`VerifyConfig`]; the verifier is
 //! compiled in-process on the device the model runs on and checks the candidates with the
 //! service's [`crate::verify`] functions (after the filters, like the service).
+//!
+//! **As served** (`benchmark --served`, `benchmark.served`, the page's "As served"; refused
+//! together with `--variants`): one variant per model, [`PipelineVariant::served`], named
+//! `<model>+served` ([`served_name`]), built from the model's config entry through the functions
+//! the worker builds its [`crate::worker::LiveSettings`] with, so nothing is re-implemented. One
+//! image runs what one request does in the service, in the worker's order:
+//!
+//! 1. decode, then the frame's [`crate::image_stats::Scene`] (`prep.rs`);
+//! 2. the model's enhancement for that scene ([`crate::config::Config::preprocess_modes`]:
+//!    `night_preprocess` on night / IR frames, else `preprocess`) and the letterbox / resize;
+//! 3. a night / IR frame of a model with a `night_model` goes to the night model
+//!    ([`NightRoute::Model`], `worker::run::route`): the request has already paid for the
+//!    model's own enhancement and resize (the prep pool runs before routing, so they count in
+//!    its preprocess time), then the night model prepares the original frame with its own
+//!    enhancement and runs steps 4-6 with its own settings (threshold `threshold_for_scene` on
+//!    the device, its filters, its object filter, its verifier). A forwarded frame is never
+//!    forwarded again. When the night model is not a served model (missing, disabled, the model
+//!    itself, its file missing) or fails to compile, night frames run on the model itself, as
+//!    the service's fallback does, and the result records why ([`NightRoute::Fallback`],
+//!    `RunResult::served`);
+//! 4. inference and the family's post-processing at the frame's threshold:
+//!    `LiveSettings::threshold_for_scene` (the model's `night_threshold` on night / IR frames
+//!    when set, else the device's served threshold);
+//! 5. the filter rules ([`crate::worker::filter_rules`], evidence from the boxes at that
+//!    threshold only), then the object filter;
+//! 6. the verifier ([`crate::worker::verify_settings`]) on that answer, fail-open: a verifier
+//!    that is not served or cannot compile, or a crop it cannot check, leaves the candidates
+//!    unverified (kept).
+//!
+//! Static-box memory is left out (per-camera history of a live stream). Timing counts steps
+//! 1-6 as the request costs them (enhancement in preprocess, filters and verifier in
+//! postprocess, a night frame's inference is the night model's, compiled on the same device with
+//! its worker's tuning). The evaluation scores what is returned at each threshold of the sweep
+//! exactly ([`super::served`]: day frames follow the swept threshold, night / IR frames with a
+//! `night_threshold` and frames the night model answers keep theirs). The results carry the
+//! fingerprint of these settings ([`served_fingerprint`]); `GET /v1/benchmark` marks a result
+//! `stale_rules` when the config's fingerprint differs now. `auto` device ordering, the device
+//! recommendation and Apply read the bare `<model>` results only (a `+served` name is no
+//! configured model).
 
 use crate::config::{Config, ModelConfig};
 use crate::model::enhance::{Preprocess, PreprocessModes};
@@ -38,6 +79,73 @@ pub struct PipelineVariant {
     pub filters_source: Option<&'static str>,
     /// The verifier cascade (`verify:<model>`).
     pub verify: Option<VerifyVariant>,
+    /// As served: the rest of the model's serving settings (None for `--variants`).
+    pub served: Option<ServedRoute>,
+}
+
+/// What an As served variant adds ([`PipelineVariant::served`]).
+#[derive(Debug, Clone)]
+pub struct ServedRoute {
+    /// `night_threshold`: the threshold of night / IR frames run on the model itself.
+    pub night_threshold: Option<f32>,
+    /// `night_model` (None: the model has none).
+    pub night: Option<NightRoute>,
+    /// What could not be set up as configured (a verifier that is not served: fail-open).
+    pub notes: Vec<String>,
+    /// [`served_fingerprint`] of the settings this variant was built from.
+    pub fingerprint: String,
+}
+
+/// Where the night / IR frames of an As served model go.
+#[derive(Debug, Clone)]
+pub enum NightRoute {
+    /// To this night model, with its own As served pipeline (never routed again).
+    Model {
+        job: Box<super::Job>,
+        variant: Box<PipelineVariant>,
+    },
+    /// `night_model` names a model that cannot take them: they run on the model itself.
+    Fallback { model: String, reason: String },
+}
+
+impl NightRoute {
+    /// The configured night model's name.
+    pub fn model(&self) -> &str {
+        match self {
+            NightRoute::Model { job, .. } => &job.name,
+            NightRoute::Fallback { model, .. } => model,
+        }
+    }
+}
+
+/// The result-name suffix of the As served variant (`<model>+served`).
+pub const SERVED: &str = "served";
+
+/// The result name of `model` benchmarked as served.
+pub fn served_name(model: &str) -> String {
+    format!("{model}+{SERVED}")
+}
+
+/// Whether the result `name` is an As served one (`<model>+served`).
+pub fn is_served(name: &str) -> bool {
+    base_name(name).len() != name.len()
+}
+
+/// The model a result name belongs to: `<model>` of `<model>+served`, else `name`.
+pub fn base_name(name: &str) -> &str {
+    let suffix = SERVED.len() + 1;
+    match name.len().checked_sub(suffix) {
+        Some(at)
+            if at > 0
+                && name.is_char_boundary(at)
+                && name
+                    .get(at..)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("+served")) =>
+        {
+            name.get(..at).unwrap_or(name)
+        }
+        _ => name,
+    }
 }
 
 /// The verifier of a `verify:<model>` variant.
@@ -79,8 +187,201 @@ impl PipelineVariant {
         if let Some(v) = &self.verify {
             parts.push(format!("verify ({}): {}", v.source, v.config.describe()));
         }
+        if let Some(s) = &self.served {
+            if let Some(t) = s.night_threshold {
+                parts.push(format!("night / IR threshold {t}"));
+            }
+            match &s.night {
+                Some(NightRoute::Model { job, .. }) => {
+                    parts.push(format!("night / IR frames to {}", job.name))
+                }
+                Some(NightRoute::Fallback { model, reason }) => parts.push(format!(
+                    "night_model {model} unused ({reason}): night / IR frames run here"
+                )),
+                None => {}
+            }
+            parts.extend(s.notes.iter().cloned());
+            if parts.is_empty() {
+                parts.push("no serving rules: the bare pipeline".into());
+            }
+        }
         parts.join("; ")
     }
+
+    /// Model `m` (its entry; `name` is its effective name) as it serves under `config` (see
+    /// the module docs). `profile`: the hardware profile the night model and verifier compile
+    /// with (None: this machine's under the config). Never fails: what cannot be set up as
+    /// configured falls back as the service does and is noted.
+    pub fn served(
+        config: &Config,
+        m: &ModelConfig,
+        profile: Option<crate::profile::Profile>,
+    ) -> PipelineVariant {
+        Self::served_with(config, m, profile, true)
+    }
+
+    fn served_with(
+        config: &Config,
+        m: &ModelConfig,
+        profile: Option<crate::profile::Profile>,
+        route: bool,
+    ) -> PipelineVariant {
+        let live = crate::worker::LiveSettings::for_model(config, m);
+        let mut notes = Vec::new();
+        let verify =
+            live.verify
+                .as_ref()
+                .and_then(|v| match served_verifier(config, v, profile.clone()) {
+                    Ok(vv) => Some(vv),
+                    Err(why) => {
+                        notes.push(format!(
+                            "verifier {} {why}: candidates stay unverified (fail-open, as served)",
+                            v.model
+                        ));
+                        None
+                    }
+                });
+        let night = if route {
+            live.night_model
+                .as_deref()
+                .map(|n| night_route(config, m, n, profile.clone()))
+        } else {
+            None
+        };
+        let modes = live.preprocess;
+        PipelineVariant {
+            name: SERVED.to_string(),
+            preprocess: (modes.preprocess != Preprocess::None).then_some(modes.preprocess),
+            night_preprocess: modes.night_preprocess,
+            filters: (!live.filters.is_noop()).then_some(live.filters),
+            filters_source: Some("configured"),
+            verify,
+            served: Some(ServedRoute {
+                night_threshold: live.night_threshold,
+                night,
+                notes,
+                fingerprint: served_fingerprint(config, m),
+            }),
+        }
+    }
+}
+
+/// The verifier `v` names, as its worker would serve it; Err says why it would not be.
+fn served_verifier(
+    config: &Config,
+    v: &VerifyConfig,
+    profile: Option<crate::profile::Profile>,
+) -> Result<VerifyVariant, String> {
+    let entry = super::find_model(config, v.model.trim())
+        .ok_or_else(|| "is not a configured model".to_string())?;
+    if !entry.enabled {
+        return Err("is disabled".into());
+    }
+    let job = super::job_as_served(config, entry, None, profile).map_err(|e| format!("{e:#}"))?;
+    Ok(VerifyVariant {
+        config: v.clone(),
+        job: Box::new(job),
+        modes: config.preprocess_modes(entry),
+        source: "configured",
+    })
+}
+
+/// Where the night / IR frames of `m` go when its `night_model` is `night` (`worker::run`'s
+/// `night_target`: a served model other than itself).
+fn night_route(
+    config: &Config,
+    m: &ModelConfig,
+    night: &str,
+    profile: Option<crate::profile::Profile>,
+) -> NightRoute {
+    use crate::registry::normalize_name;
+    let fallback = |reason: String| NightRoute::Fallback {
+        model: night.to_string(),
+        reason,
+    };
+    let Some(entry) = super::find_model(config, night) else {
+        return fallback("not a configured model".into());
+    };
+    if normalize_name(&entry.effective_name()) == normalize_name(&m.effective_name()) {
+        return fallback("it is the model itself".into());
+    }
+    if !entry.enabled {
+        return fallback("it is disabled".into());
+    }
+    match super::job_as_served(config, entry, None, profile.clone()) {
+        Ok(job) => NightRoute::Model {
+            job: Box::new(job),
+            variant: Box::new(PipelineVariant::served_with(config, entry, profile, false)),
+        },
+        Err(e) => fallback(format!("{e:#}")),
+    }
+}
+
+/// A fingerprint (16 hex digits of a SHA-256) of the serving settings an As served result of
+/// `m` depends on: its enhancement, filter rules, object filter, `night_threshold` and verifier
+/// (settings and the verifier's file), and its night model (name, file, and that model's
+/// enhancement, filter rules, object filter, thresholds and verifier). The model's own day
+/// thresholds (`confidence_threshold`, `device_thresholds`) are left out: they are what the
+/// sweep varies, and `GET /v1/benchmark` reads any of them off the stored predictions
+/// ([`super::current`]), so applying a pick does not make the result stale. A file is its path,
+/// size and modification time.
+pub fn served_fingerprint(config: &Config, m: &ModelConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let file = |e: &ModelConfig| {
+        let path = config.data_path(&e.path);
+        let meta = std::fs::metadata(&path).ok();
+        let modified = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        format!(
+            "{}|{:?}|{modified:?}",
+            path.display(),
+            meta.map(|m| m.len())
+        )
+    };
+    let verifier = |live: &crate::worker::LiveSettings| match &live.verify {
+        Some(v) => format!(
+            "{v:?}|{}",
+            super::find_model(config, v.model.trim())
+                .map(|e| format!("{}|{}", e.enabled, file(e)))
+                .unwrap_or_default()
+        ),
+        None => String::new(),
+    };
+    let own = |live: &crate::worker::LiveSettings| {
+        format!(
+            "{:?}|{:?}|{:?}|{:?}|{}",
+            live.preprocess,
+            live.filters,
+            live.object_filter,
+            live.night_threshold,
+            verifier(live)
+        )
+    };
+    let live = crate::worker::LiveSettings::for_model(config, m);
+    let night = live
+        .night_model
+        .as_deref()
+        .map(|n| match super::find_model(config, n) {
+            Some(e) => {
+                let nl = crate::worker::LiveSettings::for_model(config, e);
+                format!(
+                    "{}|{}|{}|{}|{:?}|{}",
+                    e.effective_name(),
+                    e.enabled,
+                    file(e),
+                    nl.confidence_threshold,
+                    nl.device_thresholds,
+                    own(&nl)
+                )
+            }
+            None => format!("{n}|missing"),
+        });
+    let text = format!("v1|{}|{night:?}", own(&live));
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 fn describe_rules(f: &FilterRules) -> String {
@@ -166,6 +467,7 @@ impl VariantSpec {
             filters,
             filters_source,
             verify,
+            served: None,
         }))
     }
 }
@@ -483,6 +785,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("not a configured model"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod served_tests {
+    use super::*;
+
+    /// As served is built from the model's live settings; a verifier that is not served is
+    /// left out with a note (fail-open, as the service), a model without rules says so.
+    #[test]
+    fn served_variants_follow_the_live_settings() {
+        let dir = std::env::temp_dir().join(format!("bop-served-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.onnx"), b"x").unwrap();
+        let a = ModelConfig {
+            name: Some("a".into()),
+            path: dir.join("a.onnx"),
+            ..ModelConfig::default()
+        };
+        let plain = PipelineVariant::served(&Config::default(), &a, None);
+        assert_eq!(plain.name, SERVED);
+        assert!(plain.filters.is_none() && plain.verify.is_none() && plain.preprocess.is_none());
+        assert_eq!(plain.describe(), "no serving rules: the bare pipeline");
+
+        let mut m = a.clone();
+        m.night_threshold = Some(0.3);
+        m.night_preprocess = Some(Preprocess::CLAHE);
+        m.label_thresholds = Some(BTreeMap::from([("person".to_string(), 0.6)]));
+        m.verify = Some(VerifyConfig::with_model("ghost"));
+        let config = Config {
+            models: vec![m.clone()],
+            ..Config::default()
+        };
+        let v = PipelineVariant::served(&config, &m, None);
+        let s = v.served.as_ref().unwrap();
+        assert_eq!(s.night_threshold, Some(0.3));
+        assert!(s.night.is_none());
+        assert_eq!(v.night_preprocess, Some(Preprocess::CLAHE));
+        assert_eq!(
+            v.filters.as_ref().unwrap().label_thresholds.get("person"),
+            Some(&0.6)
+        );
+        assert!(v.verify.is_none());
+        assert!(
+            s.notes[0].contains("verifier ghost is not a configured model"),
+            "{:?}",
+            s.notes
+        );
+        let text = v.describe();
+        assert!(text.contains("night / IR threshold 0.3"), "{text}");
+        assert!(text.contains("unverified (fail-open"), "{text}");
+        assert_eq!(s.fingerprint, served_fingerprint(&config, &m));
+        assert_eq!(s.fingerprint.len(), 16);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

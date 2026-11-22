@@ -84,6 +84,10 @@ pub struct RunRequest {
     /// (`benchmark.low_priority`, see [`crate::backend::priority`]).
     #[serde(default = "default_true")]
     pub low_priority: bool,
+    /// Benchmark each model as served (`benchmark.served`, [`super::variant`]): results named
+    /// `<model>+served`.
+    #[serde(default)]
+    pub served: bool,
 }
 
 fn default_true() -> bool {
@@ -114,6 +118,7 @@ impl RunRequest {
             threshold_objective: b.threshold_objective,
             accuracy_metric: b.accuracy_metric,
             low_priority: b.low_priority,
+            served: b.served,
         }
     }
 
@@ -122,8 +127,8 @@ impl RunRequest {
     /// `reference_model` ("" = automatic), `accuracy_weight` (0..1), `threshold_objective`
     /// (`f1`, `f2`, `f05`, `precision:<p>`, `recall:<r>`, `recall_at_fa:<N>`, `youden`,
     /// `fpr:<x>`), `accuracy_metric`
-    /// (`ap50`, `roc_auc`), `low_priority` (the last value wins: the page sends a hidden `0`
-    /// followed by the checkbox's `1`).
+    /// (`ap50`, `roc_auc`), `low_priority` and `served` (the last value wins: the page sends a
+    /// hidden `0` followed by the checkbox's `1`).
     pub fn from_form(form: &[(String, String)], defaults: &BenchmarkConfig) -> Result<Self> {
         let has = |k: &str| form.iter().any(|(key, _)| key == k);
         let all = |k: &str| -> Vec<String> {
@@ -179,6 +184,9 @@ impl RunRequest {
         if let Some((_, v)) = form.iter().rev().find(|(key, _)| key == "low_priority") {
             req.low_priority = parse_form_bool("low_priority", v)?;
         }
+        if let Some((_, v)) = form.iter().rev().find(|(key, _)| key == "served") {
+            req.served = parse_form_bool("served", v)?;
+        }
         req.validate()?;
         Ok(req)
     }
@@ -221,6 +229,7 @@ impl RunRequest {
         b.threshold_objective = self.threshold_objective;
         b.accuracy_metric = self.accuracy_metric;
         b.low_priority = self.low_priority;
+        b.served = self.served;
     }
 }
 
@@ -1199,7 +1208,7 @@ impl ServiceRun<'_> {
             return Ok(r);
         };
         // Compiled with its worker's tuning and thresholded per device as it serves (B4, B5).
-        let job = match super::job_as_served(&ctx.config, m, None, ctx.profile.clone()) {
+        let mut job = match super::job_as_served(&ctx.config, m, None, ctx.profile.clone()) {
             Ok(j) => j,
             Err(e) => {
                 let path = ctx.config.data_path(&m.path).display().to_string();
@@ -1214,6 +1223,13 @@ impl ServiceRun<'_> {
             .get(&crate::registry::normalize_name(&job.name))
             .cloned()
             .or_else(|| configured_device(&ctx.config, m, &self.lock().selection(Some(&job.path))));
+        // As served: the model's serving settings on top, a result of its own.
+        if req.served {
+            let v = super::PipelineVariant::served(&ctx.config, m, ctx.profile.clone());
+            job.name = super::variant::served_name(&job.name);
+            tracing::info!(model = %job.name, "benchmark as served: {}", v.describe());
+            job.variant = Some(v);
+        }
         let progress = |p: &Progress| h.set_progress(overall.view(mi, p));
         let mut bench = Bench::new(sets, req.warmup, req.repeat, self.params);
         bench.object_filter = &ctx.config.object_filter;
@@ -1452,7 +1468,33 @@ mod tests {
             accuracy_metric: AccuracyMetric::default(),
             // Tests never change the test process's priority.
             low_priority: false,
+            served: false,
         }
+    }
+
+    /// `served` on the form: the config's default when absent, the last value wins (the page's
+    /// hidden 0, then the checkbox's 1), saved as `benchmark.served` by Save as default.
+    #[test]
+    fn the_served_switch_on_the_form() {
+        let defaults = BenchmarkConfig::default();
+        assert!(!defaults.served, "off by default: the bare model");
+        let r = RunRequest::from_form(&form(&[("dataset", "sample")]), &defaults).unwrap();
+        assert!(!r.served);
+        let on = BenchmarkConfig {
+            served: true,
+            ..BenchmarkConfig::default()
+        };
+        assert!(RunRequest::from_form(&form(&[]), &on).unwrap().served);
+        let r =
+            RunRequest::from_form(&form(&[("served", "0"), ("served", "1")]), &defaults).unwrap();
+        assert!(r.served);
+        let mut b = BenchmarkConfig::default();
+        r.to_config(&mut b);
+        assert!(b.served);
+        let r = RunRequest::from_form(&form(&[("served", "0")]), &on).unwrap();
+        assert!(!r.served);
+        let e = RunRequest::from_form(&form(&[("served", "maybe")]), &defaults).unwrap_err();
+        assert!(e.to_string().contains("served"), "{e}");
     }
 
     #[test]

@@ -257,6 +257,7 @@ pub(super) fn score_image(
                             label: c.to_string(),
                             confidence: p.confidence,
                             bbox: p.bbox,
+                            window: None,
                         },
                     )
                 })
@@ -855,6 +856,7 @@ mod tests {
             label: l.into(),
             confidence: c,
             bbox: b,
+            window: None,
         };
         let eval = vec![
             pred("dog", 0.9, [1.0, 1.0, 100.0, 100.0]),
@@ -975,6 +977,7 @@ mod tests {
             label: "dog".into(),
             confidence: 0.9,
             bbox: [1.0, 1.0, 100.0, 100.0],
+            window: None,
         }];
         let run = |s: &ImageSet| ImageRun {
             set: s.id.clone(),
@@ -1073,6 +1076,7 @@ mod tests {
             label: l.into(),
             confidence: 0.9,
             bbox: b,
+            window: None,
         };
         let eval = vec![
             p("car", [0.0, 0.0, 100.0, 100.0]),
@@ -1176,6 +1180,7 @@ mod tests {
             label: l.into(),
             confidence: c,
             bbox: b,
+            window: None,
         };
         let mut set = ImageSet::sample();
         set.id = "heldout-m".into();
@@ -1342,6 +1347,7 @@ mod tests {
             label: l.into(),
             confidence: c,
             bbox: [0.0, 0.0, 100.0, 100.0],
+            window: None,
         };
         let img = |file: &str, gt: Vec<GtBox>| images::SetImage {
             file: file.into(),
@@ -1516,6 +1522,7 @@ mod tests {
                     label: "person".into(),
                     confidence: 0.9,
                     bbox: [0.0, 0.0, 100.0, 100.0],
+                    window: None,
                 }]
             })
             .collect();
@@ -1577,6 +1584,7 @@ mod tests {
             predictions,
             eval: Vec::new(),
             scene: crate::image_stats::Scene::Day,
+            routed: false,
         };
         let (capped, _) = image_run(&set, img, &last, &[4.0], &[1.0], MAX_STORED_PREDS);
         assert_eq!(capped.preds.len(), MAX_STORED_PREDS);
@@ -1612,6 +1620,7 @@ mod tests {
             label: l.into(),
             confidence: c,
             bbox: b,
+            window: None,
         };
         let mut set = ImageSet::sample();
         set.id = "heldout-m".into();
