@@ -33,17 +33,27 @@
 //! minus its *intended* send time, so a request the driver sent late still counts from when Blue
 //! Iris would have sent it (no coordinated omission); p50 / p95 / p99 over the answered requests.
 //! A trigger (camera x burst) lasts from its first intended send to its last answer (p50 / p95
-//! over the triggers whose every request was answered; the others are counted). Refused requests
-//! by reason (the worker's drop counters: `queue_full`, `timeout`, ...; any other failed answer is
-//! `error`), the most requests waiting or in progress at once, and, as for the timed phase, the
-//! live requests the service answered meanwhile and the GPU video-decode load (Windows).
+//! over the triggers whose every request was answered; the others are counted). Each request is
+//! classified from its own answer: answered, refused by the reason its answer carries
+//! ([`crate::api::VisionDetectionResponse::dropped`]: `queue_full`, `timeout`, `worker_gone`,
+//! `failed`, `initializing`) or [`ERROR_REASON`] (a failed answer without one), so answered +
+//! refused == requests (the worker's shared drop counters would count a request the server timed
+//! out and the worker dropped later twice). Also the most requests waiting or in progress at once
+//! and, as for the timed phase, the live requests the service answered meanwhile and the GPU
+//! video-decode load (Windows).
 //!
-//! **Teardown.** Always, also on cancel and on errors: the worker's token is cancelled (in-flight
-//! inferences are aborted, queued requests answered), its thread joined (its backend drops on that
-//! thread, freeing the device and its VRAM holders), then its prep pool's threads. A worker whose
-//! inference is stuck is not joined (it may never return; the stuck watchdog has handed its backend
-//! to a reaper) and the result says so. A cancel is checked every [`TICK`]; a worker that cannot
-//! load is the result's `error`, and the run goes on.
+//! **Teardown.** Always, also on cancel, on a load timeout and on errors: the worker's token is
+//! cancelled (in-flight inferences are aborted, queued requests answered), then its thread is
+//! waited for at most [`Burst::stop_wait`] ([`stop_wait`]: the request timeout plus
+//! [`STOP_GRACE`]; [`WorkerHandle::join_within`]): its backend drops on that thread, freeing the
+//! device and its VRAM holders. A thread that has not ended by then is left behind, never joined
+//! (a compile cannot be interrupted, and an inference blocked in the runtime after a GPU reset, or
+//! the shutdown's abort waiting on it, may never return; a stuck inference was handed to a reaper
+//! by the stuck watchdog): a worker still loading finishes in the background and drops its copy
+//! when it ends, and the result's notes say which. Then the prep pool's threads go. A cancel is
+//! checked every [`TICK`], during the load too; a worker that cannot load (or not within
+//! [`Burst::load_timeout`]) and a timer that cannot start are the result's `error`, and the run
+//! goes on.
 
 use super::images::ImageSet;
 use super::run::{Bench, Cancelled, Phase, ms};
@@ -54,8 +64,8 @@ use crate::backend::{Candidate, LoadRequest, Runtimes};
 use crate::config::{BurstConfig, Config, ModelConfig};
 use crate::metrics::{DropReason, ModelMetrics};
 use crate::startup::ModelState;
-use crate::worker::{LiveSettings, WorkerConfig, WorkerHandle};
-use anyhow::{Context, Result};
+use crate::worker::{Joined, LiveSettings, WorkerConfig, WorkerHandle};
+use anyhow::Result;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -74,8 +84,18 @@ pub const MAX_FRAMES: usize = 64;
 pub const MAX_FRAME_BYTES: usize = 96 * 1024 * 1024;
 /// Longest the burst waits for its worker to compile and warm up.
 pub const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
-/// How often a waiting burst looks at the cancel flag.
+/// How often a waiting burst looks at the cancel flag (and, during the load, at the worker's
+/// state).
 pub const TICK: Duration = Duration::from_millis(25);
+/// Added to the request timeout for the worker's thread to end after its token is cancelled.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// How long teardown waits for the worker's thread: the request timeout (an inference in
+/// progress when the token is cancelled is aborted, or ends within it) plus [`STOP_GRACE`].
+pub fn stop_wait(config: &Config) -> Duration {
+    config.request_timeout() + STOP_GRACE
+}
+
 /// The refusal reason of a failed answer no drop counter took.
 pub const ERROR_REASON: &str = "error";
 
@@ -103,8 +123,9 @@ pub struct BurstResult {
     /// Triggers with a refused request (not in `trigger_ms`).
     #[serde(default)]
     pub triggers_incomplete: usize,
-    /// Refused requests by reason (`queue_full`, `timeout`, `worker_gone`, `failed`,
-    /// `initializing`, `error`).
+    /// Refused requests by the reason their answer carries (`queue_full`, `timeout`,
+    /// `worker_gone`, `failed`, `initializing`), and `error` for failed answers without one:
+    /// `answered` + their sum == `requests`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub refused: BTreeMap<String, u64>,
     /// The first failed answer's text.
@@ -164,9 +185,14 @@ impl BurstResult {
         }
     }
 
-    /// Refused requests in total.
+    /// Refused requests in total ([`Self::errors`] included).
     pub fn refused_total(&self) -> u64 {
         self.refused.values().sum()
+    }
+
+    /// Failed answers that carried no refusal reason ([`ERROR_REASON`]).
+    pub fn errors(&self) -> u64 {
+        self.refused.get(ERROR_REASON).copied().unwrap_or(0)
     }
 
     /// "8 x 4 x 500 ms".
@@ -253,14 +279,17 @@ pub struct Outcome {
     pub sent: Duration,
     pub answered: Duration,
     pub ok: bool,
+    /// Why a failed answer was refused, as the answer says
+    /// ([`crate::api::VisionDetectionResponse::dropped`]); None: answered, or an error.
+    pub dropped: Option<DropReason>,
     /// The failed answer's text.
     pub error: Option<String>,
 }
 
 /// The numbers of [`BurstResult`] from the requests' outcomes: latency from the intended send
-/// time, trigger times, refusals (`drops`: the worker's drop counters by reason; failed answers
-/// beyond them are [`ERROR_REASON`]).
-pub fn summarize(out: &mut BurstResult, outcomes: &[Outcome], drops: &[(DropReason, u64)]) {
+/// time, trigger times, refusals by each failed answer's own reason ([`Outcome::dropped`];
+/// [`ERROR_REASON`] without one).
+pub fn summarize(out: &mut BurstResult, outcomes: &[Outcome]) {
     let ms_of = |d: Duration| ms(d);
     out.requests = outcomes.len();
     let ok: Vec<&Outcome> = outcomes.iter().filter(|o| o.ok).collect();
@@ -292,18 +321,10 @@ pub fn summarize(out: &mut BurstResult, outcomes: &[Outcome], drops: &[(DropReas
         .collect();
     out.triggers_incomplete = out.triggers - complete.len();
     out.trigger_ms = Stats::from_samples(&complete);
-    let failed = outcomes.len() - ok.len();
-    let mut refused = BTreeMap::new();
-    let mut counted = 0u64;
-    for (r, n) in drops {
-        if *n > 0 {
-            refused.insert(r.as_str().to_string(), *n);
-            counted += n;
-        }
-    }
-    let other = (failed as u64).saturating_sub(counted);
-    if other > 0 {
-        refused.insert(ERROR_REASON.to_string(), other);
+    let mut refused: BTreeMap<String, u64> = BTreeMap::new();
+    for o in outcomes.iter().filter(|o| !o.ok) {
+        let reason = o.dropped.map_or(ERROR_REASON, DropReason::as_str);
+        *refused.entry(reason.to_string()).or_default() += 1;
     }
     out.refused = refused;
     out.first_refusal = outcomes.iter().find_map(|o| o.error.clone());
@@ -398,9 +419,14 @@ pub struct Burst<'a> {
     pub settle: Duration,
     /// [`LOAD_TIMEOUT`].
     pub load_timeout: Duration,
+    /// How long teardown waits for the worker's thread to end ([`stop_wait`]).
+    pub stop_wait: Duration,
     /// What a test makes go wrong in the burst's worker.
     #[cfg(test)]
     pub(crate) faults: crate::worker::TestFaults,
+    /// Test only: the burst's timer runtime fails to start.
+    #[cfg(test)]
+    pub(crate) runtime_fault: bool,
 }
 
 impl std::fmt::Debug for Burst<'_> {
@@ -427,8 +453,11 @@ impl<'a> Burst<'a> {
             bursts: BURSTS,
             settle: SETTLE,
             load_timeout: LOAD_TIMEOUT,
+            stop_wait: stop_wait(config),
             #[cfg(test)]
             faults: Default::default(),
+            #[cfg(test)]
+            runtime_fault: false,
         }
     }
 
@@ -479,29 +508,56 @@ impl<'a> Burst<'a> {
         let prep = cfg.prep.clone();
         let t_load = Instant::now();
         let handle =
-            crate::worker::spawn_worker(self.runtimes.clone(), cfg, metrics.clone(), token.clone());
+            crate::worker::spawn_worker(self.runtimes.clone(), cfg, metrics, token.clone());
         let worker = Temporary {
             handle: Some(handle),
             token,
             prep,
+            stop_wait: self.stop_wait,
         };
         let outcome =
             self.load_and_drive(bench, job, &device_text, &worker, &frames, &mut out, t_load);
-        let stuck = worker.teardown();
-        if stuck {
-            out.notes.push(
-                "the burst's worker had a stuck inference and was left to end on its own (its \
-                 backend was handed to a reaper)"
+        let loading = worker
+            .handle
+            .as_ref()
+            .is_some_and(|h| h.state.get() == ModelState::Initializing);
+        match worker.teardown() {
+            Joined::Ended => {}
+            Joined::Stuck => out.notes.push(
+                "the burst's worker had a stuck inference and was left behind to end on its own \
+                 (its backend was handed to a reaper)"
                     .into(),
-            );
+            ),
+            Joined::Running if loading => {
+                tracing::warn!(
+                    "burst of {} on {device_text}: its worker was still loading; left to finish \
+                     in the background",
+                    job.name
+                );
+                out.notes.push(
+                    "the burst's worker was still loading when the burst ended; it was left to \
+                     finish in the background and drops its copy of the model when it ends (the \
+                     next combo may run beside that compile)"
+                        .into(),
+                );
+            }
+            Joined::Running => {
+                tracing::warn!(
+                    "burst of {} on {device_text}: its worker did not end within {:.0} s of its \
+                     stop; its thread was left behind",
+                    job.name,
+                    self.stop_wait.as_secs_f64()
+                );
+                out.notes.push(format!(
+                    "the burst's worker did not end within {:.0} s of its stop (an inference \
+                     blocked in the runtime, as after a GPU reset?); its thread was left behind \
+                     and frees the device when it returns",
+                    self.stop_wait.as_secs_f64()
+                ));
+            }
         }
-        let outcomes = outcome?;
-        if let Some(outcomes) = outcomes {
-            let drops: Vec<(DropReason, u64)> = DropReason::ALL
-                .iter()
-                .map(|r| (*r, metrics.dropped(*r)))
-                .collect();
-            summarize(&mut out, &outcomes, &drops);
+        if let Some(outcomes) = outcome? {
+            summarize(&mut out, &outcomes);
         }
         Ok(out)
     }
@@ -543,7 +599,7 @@ impl<'a> Burst<'a> {
                         ));
                         return Ok(None);
                     }
-                    std::thread::sleep(TICK.min(Duration::from_millis(10)));
+                    std::thread::sleep(TICK);
                 }
             }
         }
@@ -561,10 +617,13 @@ impl<'a> Burst<'a> {
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             bench.report(job, device, Phase::Burst, n, total, "");
         };
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .context("starting the burst's timer runtime")?;
+        let rt = match self.timer_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                out.error = Some(format!("the burst's timer runtime did not start: {e}"));
+                return Ok(None);
+            }
+        };
         let started = Instant::now();
         let driven = rt.block_on(drive(
             handle,
@@ -585,6 +644,17 @@ impl<'a> Burst<'a> {
         out.max_queue_depth = max_depth;
         out.wall_ms = wall_ms;
         Ok(Some(outcomes))
+    }
+
+    /// The current-thread runtime that times the burst's sends.
+    fn timer_runtime(&self) -> std::io::Result<tokio::runtime::Runtime> {
+        #[cfg(test)]
+        if self.runtime_fault {
+            return Err(std::io::Error::other("no timer (test)"));
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
     }
 
     /// The temporary worker's config for `job` on `device`, its prep thread count and notes.
@@ -697,28 +767,26 @@ struct Temporary {
     handle: Option<WorkerHandle>,
     token: tokio_util::sync::CancellationToken,
     prep: Option<Arc<crate::prep::PrepPool>>,
+    /// [`Burst::stop_wait`].
+    stop_wait: Duration,
 }
 
 impl Temporary {
-    /// Cancel the worker, join its thread (its backend drops there) unless it is stuck, then
-    /// drop its prep pool (joining its threads). True when it was stuck and left behind.
-    fn teardown(mut self) -> bool {
+    /// Cancel the worker, wait at most `stop_wait` for its thread (its backend drops there;
+    /// a stuck or still running thread is left behind, see the module docs), then drop the prep
+    /// pool (its threads are joined once the worker's thread no longer holds it).
+    fn teardown(mut self) -> Joined {
         self.end()
     }
 
-    fn end(&mut self) -> bool {
+    fn end(&mut self) -> Joined {
         self.token.cancel();
-        let mut stuck = false;
-        if let Some(h) = self.handle.take() {
-            if h.is_stuck() {
-                stuck = true;
-                drop(h);
-            } else {
-                h.join();
-            }
-        }
+        let joined = match self.handle.take() {
+            Some(h) => h.join_within(Instant::now() + self.stop_wait),
+            None => Joined::Ended,
+        };
         drop(self.prep.take());
-        stuck
+        joined
     }
 }
 
@@ -786,6 +854,7 @@ async fn drive(
                     sent: sent.saturating_duration_since(t0),
                     answered: answered.saturating_duration_since(t0),
                     ok: resp.success,
+                    dropped: if resp.success { None } else { resp.dropped },
                     error: (!resp.success).then(|| resp.message.clone()),
                 }
             });

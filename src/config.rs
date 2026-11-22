@@ -1002,31 +1002,61 @@ impl BenchmarkConfig {
 }
 
 impl Serialize for BenchmarkConfig {
+    /// The legacy keys are written from the goal, in spellings release 0.2.0 parses
+    /// ([`crate::benchmark::threshold::Objective::for_previous_release`]): an objective it does
+    /// not know would make it refuse the whole config file.
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let mut c = self.clone();
         c.sync_legacy();
+        c.threshold_objective = c.threshold_objective.for_previous_release();
         BenchmarkConfig::serialize(&c, s)
     }
 }
 
 impl<'de> Deserialize<'de> for BenchmarkConfig {
-    /// The derived fields; then, without `goal`, the goal from the legacy keys; the legacy keys
+    /// The derived fields (the goal read on its own); then the goal: `goal` when it parses and
+    /// validates, else (absent, or with a warning: an unknown `optimize_for`, a bad budget, a
+    /// target no finite set can show) the goal of the legacy keys
+    /// ([`crate::benchmark::eval::Goal::from_legacy`], the default goal when that one does not
+    /// validate either): a goal never stops the service from starting. The legacy keys are then
     /// written from the goal.
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use crate::benchmark::eval::Goal;
         use serde::de::Error;
         let mut v = serde_json::Value::deserialize(d)?;
-        let has_goal = v.get("goal").is_some_and(|g| !g.is_null());
-        if !has_goal && let Some(o) = v.as_object_mut() {
-            o.remove("goal");
-        }
+        let goal = v
+            .as_object_mut()
+            .and_then(|o| o.remove("goal"))
+            .filter(|g| !g.is_null());
         let mut c = BenchmarkConfig::deserialize(v).map_err(D::Error::custom)?;
-        if !has_goal {
-            c.goal =
-                crate::benchmark::eval::Goal::from_legacy(c.threshold_objective, c.accuracy_metric);
-        }
-        c.goal
-            .validate()
-            .map_err(|e| D::Error::custom(format!("benchmark.goal: {e}")))?;
+        let legacy = Goal::from_legacy(c.threshold_objective, c.accuracy_metric);
+        let legacy = match legacy.validate() {
+            Ok(()) => legacy,
+            Err(e) => {
+                tracing::warn!(
+                    "benchmark.threshold_objective: {e}; the benchmark goal is the default ({})",
+                    Goal::default().describe()
+                );
+                Goal::default()
+            }
+        };
+        c.goal = match goal.map(|g| {
+            serde_json::from_value::<Goal>(g)
+                .map_err(|e| e.to_string())
+                .and_then(|g| g.validate().map(|()| g))
+        }) {
+            None => legacy,
+            Some(Ok(g)) => g,
+            Some(Err(e)) => {
+                tracing::warn!(
+                    "benchmark.goal is not used: {e}. The benchmark goal is {} (from \
+                     threshold_objective / accuracy_metric) until the goal is set again on the \
+                     Benchmark page",
+                    legacy.describe()
+                );
+                legacy
+            }
+        };
         c.sync_legacy();
         Ok(c)
     }
@@ -2712,11 +2742,15 @@ mod tests {
             let json = format!(r#"{{"benchmark":{{"threshold_objective":"{text}"}}}}"#);
             let c: super::Config = serde_json::from_str(&json).unwrap();
             assert_eq!(c.benchmark.threshold_objective, o);
+            // Written for release 0.2.0 as the nearest objective it parses; the goal keeps it.
             let back = serde_json::to_string(&c).unwrap();
+            assert!(back.contains(r#""threshold_objective":"f1""#), "{back}");
             assert!(
-                back.contains(&format!(r#""threshold_objective":"{text}""#)),
+                back.contains(&format!(r#""optimize_for":"{text}""#)),
                 "{back}"
             );
+            let again: super::Config = serde_json::from_str(&back).unwrap();
+            assert_eq!(again.benchmark.goal, c.benchmark.goal);
         }
         assert!(
             serde_json::from_str::<super::Config>(r#"{"benchmark":{"accuracy_metric":"map"}}"#)
@@ -2768,21 +2802,10 @@ mod tests {
         assert_eq!(b.goal.speed_budget_ms, Some(250.0));
         assert_eq!(b.threshold_objective, Objective::Youden);
         assert_eq!(b.accuracy_metric, AccuracyMetric::Ap50);
-        // `goal: null` is an absent goal; a bad goal is an error naming it.
+        // `goal: null` is an absent goal (a bad goal: see
+        // `a_bad_benchmark_goal_falls_back_and_older_binaries_read_the_legacy_keys`).
         let b = read(r#"{"benchmark":{"goal":null,"threshold_objective":"f05"}}"#);
         assert_eq!(b.goal.optimize_for, Optimize::Threshold(Objective::F05));
-        let e = serde_json::from_str::<super::Config>(
-            r#"{"benchmark":{"goal":{"speed_budget_ms":-1}}}"#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(e.contains("speed_budget_ms"), "{e}");
-        assert!(
-            serde_json::from_str::<super::Config>(
-                r#"{"benchmark":{"goal":{"optimize_for":"f3"}}}"#
-            )
-            .is_err()
-        );
         // The old form's objective / metric pair: unchanged keeps the goal, changed maps onto it.
         let mut b = super::BenchmarkConfig::default();
         b.set_goal(Goal {
@@ -2809,6 +2832,65 @@ mod tests {
         assert_eq!(b.goal.optimize_for, Optimize::RocAuc);
         assert_eq!(b.goal.classes, ["car"]);
         assert_eq!(b.accuracy_metric, AccuracyMetric::RocAuc);
+    }
+
+    /// D5: a goal that does not validate, names an unknown `optimize_for` or a target no finite
+    /// set can show loads as the legacy keys' goal (a warning, never a config the service cannot
+    /// start with); the legacy keys are written in spellings the previous release reads.
+    #[test]
+    fn a_bad_benchmark_goal_falls_back_and_older_binaries_read_the_legacy_keys() {
+        use crate::benchmark::eval::Optimize;
+        use crate::benchmark::threshold::Objective;
+        let read = |j: &str| serde_json::from_str::<super::Config>(j).unwrap().benchmark;
+        for bad in [
+            r#"{"speed_budget_ms":-1}"#,
+            r#"{"optimize_for":"f3"}"#,
+            r#"{"optimize_for":"precision:1"}"#,
+            r#"{"optimize_for":"f1","tune_for":"fpr:0"}"#,
+            r#"{"classes":[""]}"#,
+            r#"[1,2]"#,
+        ] {
+            let b = read(&format!(
+                r#"{{"benchmark":{{"goal":{bad},"threshold_objective":"f2"}}}}"#
+            ));
+            assert_eq!(
+                b.goal.optimize_for,
+                Optimize::Threshold(Objective::F2),
+                "{bad}: the legacy keys' goal"
+            );
+        }
+        // An older file whose legacy objective is a 100% target still loads.
+        let b = read(r#"{"benchmark":{"threshold_objective":"precision:1"}}"#);
+        assert_eq!(b.goal.optimize_for, Optimize::Threshold(Objective::F1));
+        // Objectives the previous release cannot parse are written as the nearest it knows; the
+        // goal keeps the new one and wins on the next read.
+        for (goal, legacy) in [
+            ("f05", "f1"),
+            ("recall_at_fa:5", "f1"),
+            ("f2", "f2"),
+            ("precision:0.9", "precision:0.9"),
+            ("youden", "youden"),
+        ] {
+            let b = read(&format!(
+                r#"{{"benchmark":{{"goal":{{"optimize_for":"{goal}"}}}}}}"#
+            ));
+            let text = serde_json::to_string(&super::Config {
+                benchmark: b.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                text.contains(&format!(r#""threshold_objective":"{legacy}""#)),
+                "{goal}: {text}"
+            );
+            let back: super::Config = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.benchmark.goal, b.goal, "{goal}");
+        }
+        // A rank-only goal tuned for F0.5 too.
+        let b = read(r#"{"benchmark":{"goal":{"optimize_for":"roc_auc","tune_for":"f05"}}}"#);
+        let text = serde_json::to_string(&b).unwrap();
+        assert!(text.contains(r#""threshold_objective":"f1""#), "{text}");
+        assert!(text.contains(r#""accuracy_metric":"roc_auc""#), "{text}");
     }
 
     #[test]

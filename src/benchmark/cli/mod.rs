@@ -274,6 +274,13 @@ fn rescore_cli(args: &BenchArgs, config: &Config, config_path: &Path) -> Result<
         for n in &r.not_rescored {
             println!("  not re-scored (no stored predictions): {n}");
         }
+        if !r.unknown.is_empty() {
+            println!(
+                "  {} frame(s) could not be read this time and kept their labels: {}",
+                r.unknown.len(),
+                r.unknown.join(", ")
+            );
+        }
     }
     Ok(true)
 }
@@ -1133,9 +1140,16 @@ impl RunCtx<'_> {
             return Ok(results);
         }
         let path = results_path(self.config_path);
-        // The labels Your cameras was scored against, before the results that leave them out.
-        crate::benchmark::cameras::write_snapshot(&path, sets, cameras)?;
+        // One load-modify-save at a time, in this process and against the service.
+        let _held = crate::benchmark::results_io::lock(
+            &path,
+            crate::benchmark::results_io::Holder::Writer,
+        )?;
         let (prev, warnings) = BenchmarkResults::load_for_merge(&path)?;
+        // The labels Your cameras was scored against, before the results that leave them out;
+        // with the frames the kept runs of `prev` still score.
+        let snapshot =
+            crate::benchmark::cameras::write_snapshot(&path, sets, cameras, prev.as_ref())?;
         for w in warnings {
             report.warn(self.args.json, w);
         }
@@ -1148,6 +1162,9 @@ impl RunCtx<'_> {
             .map(crate::benchmark::history::seed_entries)
             .unwrap_or_default();
         let mut merged = BenchmarkResults::merge(prev, results);
+        if let Some(id) = &snapshot {
+            crate::benchmark::cameras::snapshot::stamp(&mut merged, id);
+        }
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(self.metric, self.weights);
         merged.save(&path)?;
@@ -1478,6 +1495,15 @@ mod tests {
 
     fn parse(argv: &[&str]) -> Result<BenchArgs, clap::Error> {
         Cli::try_parse_from(argv).map(|c| c.args)
+    }
+
+    /// S2: `--goal`, `--tune-for` and `--threshold-objective` refuse a 100% target.
+    #[test]
+    fn a_target_no_finite_set_can_show_is_refused_on_the_command_line() {
+        for flag in ["--goal", "--tune-for", "--threshold-objective"] {
+            let e = parse(&["x", flag, "precision:1"]).unwrap_err().to_string();
+            assert!(e.contains("100%"), "{flag}: {e}");
+        }
     }
 
     /// `--goal` and its companions set the run's goal; the old flags map onto it.
@@ -1882,6 +1908,7 @@ mod tests {
             refusal: None,
             low_confidence: None,
             recommended: true,
+            figures: None,
         });
         let changes = apply_thresholds(&s, &path, true).unwrap();
         let want: Vec<(String, String, Option<f32>, Option<f32>)> = s[..2]

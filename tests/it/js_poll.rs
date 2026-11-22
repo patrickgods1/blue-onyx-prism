@@ -166,6 +166,19 @@ function world() {
     p.stop(); await w.answer('busy');
     assert.strictEqual(w.timers.length, 0, 'stop() wins over a late answer');
   }
+  { // later() unparks without a run now: the next one a period away (after the one in flight).
+    const w = world(), p = Poll.create({run: w.run, period: 1000, more: v => v === 'busy', env: w.env});
+    p.start(); await tick(); await w.answer('idle');
+    p.later(); await tick();
+    assert.strictEqual(w.calls.length, 1, 'no run now');
+    assert.deepStrictEqual(w.timers.map(t => t.ms), [1000]);
+    await w.advance(1000);
+    assert.strictEqual(w.calls.length, 2);
+    p.later(); p.later(); await tick();
+    assert.strictEqual(w.timers.length, 0, 'in flight: nothing scheduled beside it');
+    await w.answer('busy');
+    assert.deepStrictEqual(w.timers.map(t => t.ms), [1000], 'then one timer');
+  }
   console.log('ok');
 })().catch(e => { console.error(e); process.exit(1); });
 "#;

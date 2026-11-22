@@ -3154,8 +3154,11 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
 /// `POST /training/use` (`id`, `role` = `default` | `night` | `verify`, `target`): use a
 /// trained model as the default model, or as the night model / verifier of `target`. Default:
 /// `copy` copies the settings of the current default, `use_threshold` takes the suggested
-/// threshold (the benchmark's, recomputed here), `expect_current` the default the page's preview
-/// compared with. Verifier: `replace_verifier` names the existing verifier it may replace.
+/// threshold (the Tune view's cross-validated suggestion for the saved goal, recomputed here,
+/// [`super::training_switch::suggestion_for`]; refused when it must not be saved, and a
+/// low-confidence one only with `confirm=1`, as the Tune step asks), `expect_current` the
+/// default the page's preview compared with. Verifier: `replace_verifier` names the existing
+/// verifier it may replace.
 pub(super) async fn use_model(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
@@ -3181,6 +3184,14 @@ pub(super) async fn use_model(
                 })?;
                 let s = super::training_switch::suggestion_for(&state, &config, m)
                     .map_err(anyhow::Error::msg)?;
+                if s.confirm && field(&f, "confirm").is_none() {
+                    anyhow::bail!(
+                        "the suggested threshold {:.2} rests on little data ({}); confirm to \
+                         save it anyway (send confirm=1), or keep the threshold",
+                        s.threshold,
+                        s.low_confidence.as_deref().unwrap_or("low confidence")
+                    );
+                }
                 Some(crate::training::switch::Accepted::from(&s))
             } else {
                 None

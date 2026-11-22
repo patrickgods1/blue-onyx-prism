@@ -845,6 +845,47 @@ impl WorkerHandle {
             error!("worker thread panicked");
         }
     }
+
+    /// [`Self::join`] with a deadline (the sender is dropped first, as there): waits while the
+    /// thread runs, looking every [`JOIN_POLL`], until `deadline`; a thread whose inference is
+    /// stuck ([`Self::is_stuck`], seen while waiting) or that is still running at `deadline` is
+    /// left behind (detached: it ends on its own, dropping what it holds), as
+    /// `registry::retire_worker` does for a worker leaving the registry.
+    pub fn join_within(mut self, deadline: Instant) -> Joined {
+        let join = self.join.take();
+        let stuck = self.stuck.clone();
+        drop(self);
+        let Some(j) = join else {
+            return Joined::Ended;
+        };
+        while !j.is_finished() {
+            if stuck.load(Ordering::Acquire) {
+                return Joined::Stuck;
+            }
+            if Instant::now() >= deadline {
+                return Joined::Running;
+            }
+            std::thread::sleep(JOIN_POLL);
+        }
+        if j.join().is_err() {
+            error!("worker thread panicked");
+        }
+        Joined::Ended
+    }
+}
+
+/// How often [`WorkerHandle::join_within`] looks at its thread.
+pub const JOIN_POLL: Duration = Duration::from_millis(20);
+
+/// How [`WorkerHandle::join_within`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Joined {
+    /// The thread ended and was joined (or there was none).
+    Ended,
+    /// Its inference is stuck: the thread was left behind.
+    Stuck,
+    /// Still running at the deadline: left behind.
+    Running,
 }
 
 /// Prefix of the state detail while a candidate compiles ("compiling on openvino:gpu").

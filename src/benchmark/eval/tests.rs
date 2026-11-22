@@ -168,6 +168,8 @@ pub(crate) fn fixture(groups: usize, per: usize) -> (BenchmarkResults, StoredPre
         .collect();
     let mut r: BenchmarkResults = serde_json::from_str("{}").unwrap();
     r.image_sets = vec![ImageSetInfo {
+        snapshot: None,
+        labels_stale: None,
         id: "own".into(),
         title: "Own frames".into(),
         kind: SetKind::Dir,
@@ -616,10 +618,15 @@ fn a_flat_curve_is_not_informative_and_not_savable() {
 fn the_run_snapshot_carries_the_goal_metric() {
     let w = World::new(6, 10);
     let run = &w.preds.runs[0];
+    let per_image = &w.results.models[0].devices[0]
+        .run
+        .as_ref()
+        .unwrap()
+        .per_image;
     let s = tune::run_snapshot(
         &w.results.image_sets,
         run,
-        Some(40.0),
+        per_image,
         &Goal::default(),
         Weights::default(),
     )
@@ -630,10 +637,15 @@ fn the_run_snapshot_carries_the_goal_metric() {
     // 48 labelled persons: under the 50 objects of the low-confidence rule.
     assert!(s.low_confidence);
     let w = World::new(10, 10);
+    let per_image = &w.results.models[0].devices[0]
+        .run
+        .as_ref()
+        .unwrap()
+        .per_image;
     let s = tune::run_snapshot(
         &w.results.image_sets,
         &w.preds.runs[0],
-        Some(40.0),
+        per_image,
         &Goal::default(),
         Weights::default(),
     )
@@ -829,4 +841,126 @@ fn eval_on_saved_results() {
             started.elapsed().as_secs_f64() * 1e3
         );
     }
+}
+
+/// S4: the headline names exactly the ok rows not clearly below the best one (their paired
+/// difference from it), whatever their rank group.
+#[test]
+fn the_headline_names_the_rows_not_clearly_below_the_best() {
+    use super::stats::Difference;
+    let w = World::new(10, 10);
+    let v = w.compare(&Goal::default(), None);
+    let mut rows = v.rows.clone();
+    assert_eq!(rows.len(), 3);
+    for r in &mut rows {
+        r.block = Block::Ok;
+    }
+    let below = Difference {
+        value: -0.1,
+        low: Some(-0.11),
+        high: Some(-0.09),
+    };
+    let unclear = Difference {
+        value: -0.11,
+        low: Some(-0.4),
+        high: Some(0.2),
+    };
+    rows[0].rank = 1;
+    rows[0].vs_best = None;
+    rows[1].rank = 2;
+    rows[1].vs_best = Some(below);
+    // Grouped under the second row by an older rule, but not clearly below the best.
+    rows[2].rank = 2;
+    rows[2].vs_best = Some(unclear);
+    let h = compare::headline(&rows, &Goal::default());
+    let third = format!("{} on {}", rows[2].model, rows[2].device);
+    let second = format!("{} on {}", rows[1].model, rows[1].device);
+    assert!(
+        h.contains(&format!("{third} is not clearly different")),
+        "{h}"
+    );
+    assert!(!h.contains(&second), "{h}");
+}
+
+/// S3: a fold whose other folds hold no counted object borrows the pick on every frame: its
+/// figures are partly in-sample, so the row and the Tune view are low confidence (Save asks).
+#[test]
+fn a_fold_that_borrows_the_all_frames_pick_is_low_confidence() {
+    let mut w = World::new(5, 80);
+    let keep = w.results.image_sets[0].images[0].group.clone().unwrap();
+    for i in &mut w.results.image_sets[0].images {
+        if i.group.as_deref() != Some(keep.as_str()) {
+            i.objects = Some(Vec::new());
+        }
+    }
+    for run in &mut w.preds.runs {
+        for img in &mut run.images {
+            if img.group.as_deref() != Some(keep.as_str()) {
+                img.preds.retain(|p| p.bbox != BOX);
+            }
+        }
+    }
+    let v = w.compare(&Goal::default(), None);
+    let good = row(&v, "ipcam-general", "ort:coreml");
+    assert_eq!(good.folds, 5);
+    let lc = good
+        .flags
+        .low_confidence
+        .as_deref()
+        .expect("low confidence");
+    assert!(lc.contains("in-sample"), "{lc}");
+    let t = tune::build(
+        &w.results,
+        &w.preds,
+        tune::Request {
+            model: "ipcam-general",
+            device: Some("ort:coreml"),
+            set: None,
+            goal: &Goal::default(),
+            weights: Weights::default(),
+            saved: None,
+        },
+    )
+    .unwrap();
+    assert!(t.low_confidence.is_some());
+    assert!(t.confirm);
+}
+
+/// S8: the grade's speed is the set's p50 wherever a grade is shown: Compare's row and the
+/// history's goal metric agree, also when the run-wide p50 differs from the set's.
+#[test]
+fn the_grade_uses_the_sets_p50_everywhere() {
+    let mut w = World::new(10, 10);
+    // The set's frames took 400 ms each; the run-wide stage p50 says 40 ms.
+    let run = w.results.models[0].devices[0].run.as_mut().unwrap();
+    for i in &mut run.per_image {
+        i.total_ms = 400.0;
+    }
+    assert_eq!(run.stages_ms.total.p50, 40.0);
+    let goal = Goal {
+        optimize_for: Optimize::Grade,
+        ..Goal::default()
+    };
+    let v = w.compare(&goal, None);
+    let good = row(&v, "ipcam-general", "ort:coreml");
+    assert_eq!(good.speed.p50_ms, Some(400.0));
+    let per_image = &w.results.models[0].devices[0]
+        .run
+        .as_ref()
+        .unwrap()
+        .per_image;
+    let snap = tune::run_snapshot(
+        &w.results.image_sets,
+        &w.preds.runs[0],
+        per_image,
+        &goal,
+        Weights::default(),
+    )
+    .unwrap();
+    let m = good.metric.unwrap().value;
+    assert!(
+        (snap.value - m).abs() < 1e-9,
+        "history {} vs compare {m}",
+        snap.value
+    );
 }

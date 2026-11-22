@@ -381,7 +381,10 @@ fn assess_prepared(
         groups: &groups,
         classes: &p.classes,
         goal,
-        p50_ms: p.rr.map(|r| r.stages_ms.total.p50),
+        // The set's p50, as Compare grades it.
+        p50_ms: p.rr.and_then(|r| {
+            super::compare::p50_on(&r.per_image, p.frames.iter().map(|f| (f.set, f.file)))
+        }),
         weights,
         relative: p.relative,
     })
@@ -501,11 +504,7 @@ pub fn build(
         objects: a.objects,
         empty_frames: points.first().map_or(0, |x| x.empty),
         groups: a.groups.len(),
-        folds: if a.low_confidence.is_some() {
-            0
-        } else {
-            a.cv.k
-        },
+        folds: if a.in_sample { 0 } else { a.cv.k },
         classes: p.classes.clone(),
         grid: grid_rows,
         suggested,
@@ -541,6 +540,32 @@ pub struct Suggested {
     pub low_confidence: Option<String>,
     /// The model's recommended device of the saved results.
     pub recommended: bool,
+    /// What the suggestion found on the frames it was picked on (in-sample, at the
+    /// suggestion); None without one.
+    pub figures: Option<PickFigures>,
+}
+
+/// The in-sample figures at a suggestion ([`Suggested::figures`]): what "Use as" puts in words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickFigures {
+    /// The compare set it was picked on and its frames.
+    pub set: String,
+    pub frames: usize,
+    pub recall: Option<f64>,
+    pub precision: Option<f64>,
+}
+
+impl PickFigures {
+    fn of(v: &TuneView) -> Option<Self> {
+        let t = v.suggested.as_ref()?.threshold;
+        let row = v.grid.iter().find(|r| (r.threshold - t).abs() < 1e-6)?;
+        Some(Self {
+            set: v.set.clone(),
+            frames: v.frames,
+            recall: row.recall,
+            precision: row.precision,
+        })
+    }
 }
 
 /// The suggested confidence of every bare combo (no `+served` variant) with stored
@@ -580,6 +605,7 @@ pub fn suggestions(
                     refusal: v.not_savable.clone(),
                     low_confidence: v.low_confidence.clone(),
                     recommended,
+                    figures: PickFigures::of(&v),
                 },
                 Err(e) => Suggested {
                     model: m.model.clone(),
@@ -588,6 +614,7 @@ pub fn suggestions(
                     refusal: Some(format!("not savable: {e:#}")),
                     low_confidence: None,
                     recommended,
+                    figures: None,
                 },
             });
         }
@@ -861,23 +888,37 @@ pub struct GoalSnap {
     pub classes: Vec<String>,
 }
 
+/// One frame of [`run_snapshot`]: real labels, its evaluation input, its frame classes, its
+/// cross-validation group and its (set id, file).
+type SnapFrame<'a> = (bool, EvalImage, Vec<String>, String, (&'a str, &'a str));
+
 /// The [`GoalSnap`] of `run` (the stored form of a device run) over every frame it scored with
-/// real labels (else every scored frame, relative); None when nothing is scored.
+/// real labels (else every scored frame, relative); None when nothing is scored. A grade's
+/// speed is the p50 of `per_image` (the device run's request times) on those frames, as
+/// Compare grades a set.
 pub fn run_snapshot(
     image_sets: &[crate::benchmark::report::ImageSetInfo],
     run: &StoredRun,
-    p50_ms: Option<f64>,
+    per_image: &[crate::benchmark::ImageRun],
     goal: &Goal,
     weights: crate::benchmark::grade::Weights,
 ) -> Option<GoalSnap> {
     let sets: HashMap<&str, &crate::benchmark::report::ImageSetInfo> =
         image_sets.iter().map(|s| (s.id.as_str(), s)).collect();
+    let infos: HashMap<(&str, &str), &crate::benchmark::report::ImageInfo> = image_sets
+        .iter()
+        .flat_map(|s| {
+            s.images
+                .iter()
+                .map(move |i| ((s.id.as_str(), i.file.as_str()), i))
+        })
+        .collect();
     let map = ClassMap::for_model(&run.classes);
     let classes = counted(&map, goal);
     if classes.is_empty() {
         return None;
     }
-    let mut frames: Vec<(bool, EvalImage, Vec<String>, String)> = Vec::new();
+    let mut frames: Vec<SnapFrame<'_>> = Vec::new();
     for (k, img) in run.images.iter().enumerate() {
         let Some(set) = sets.get(img.set.as_str()) else {
             continue;
@@ -885,7 +926,7 @@ pub fn run_snapshot(
         if matches!(&set.ground_truth, GroundTruth::Pseudo(r) if is_reference(r, &run.model)) {
             continue;
         }
-        let Some(info) = set.images.iter().find(|i| i.file == img.file) else {
+        let Some(info) = infos.get(&(img.set.as_str(), img.file.as_str())) else {
             continue;
         };
         let Some(gt) = &info.objects else { continue };
@@ -902,7 +943,13 @@ pub fn run_snapshot(
             .group
             .clone()
             .unwrap_or_else(|| format!("{}/{}", set.id, info.file));
-        frames.push((set.ground_truth.is_real(), eval, fc, group));
+        frames.push((
+            set.ground_truth.is_real(),
+            eval,
+            fc,
+            group,
+            (img.set.as_str(), img.file.as_str()),
+        ));
     }
     let real = frames.iter().any(|f| f.0);
     frames.retain(|f| f.0 == real);
@@ -912,6 +959,7 @@ pub fn run_snapshot(
     let images: Vec<EvalImage> = frames.iter().map(|f| f.1.clone()).collect();
     let fcs: Vec<Vec<String>> = frames.iter().map(|f| f.2.clone()).collect();
     let groups: Vec<String> = frames.iter().map(|f| f.3.clone()).collect();
+    let p50_ms = super::compare::p50_on(per_image, frames.iter().map(|f| f.4));
     let a = assess(Input {
         images: &images,
         frame_classes: &fcs,

@@ -12,6 +12,8 @@
   var $ = function (id) { return document.getElementById(id); };
   var params = new URLSearchParams(location.search);
   var st = {model: params.get("model") || "", entries: [], comp: [], a: null, b: null, device: params.get("device") || "", models: []};
+  // The history and the A / B comparison: the latest request wins (BenchCore.latest).
+  var loads = BC.latest(), abLoads = BC.latest();
   function say(text, kind) { var m = $("h-msg"); m.className = "bn-msg small" + (kind === "error" ? " bn-error" : kind === "ok" ? " notice" : ""); m.textContent = text || ""; }
   function when(ts) { return window.PrismTime && PrismTime.when ? PrismTime.when(ts) : String(ts || "").replace("T", " ").slice(0, 16); }
   function day(ts) { return window.PrismTime && PrismTime.date ? PrismTime.date(ts) : String(ts || "").slice(0, 10); }
@@ -22,9 +24,16 @@
   function comparable(e) { var c = st.comp.filter(function (x) { return x.run_id === e.run_id; })[0]; return c ? c : {comparable: true, reasons: []}; }
 
   function load() {
-    $("h-error").hidden = true;
-    return PB.getJSON("/v1/benchmark/history").then(function (j) {
-      if (!j.success) { $("h-error").textContent = (j.message || j.error || "The history did not load.") + " Reload the page to try again."; $("h-error").hidden = false; return; }
+    var t = loads.begin();
+    return PB.getJSON("/v1/benchmark/history", t.init).then(function (j) {
+      if (!t.wins(j)) return; // a newer load took its place
+      if (!j.success) {
+        $("h-error").textContent = (j.message || j.error || "The history did not load.") + " Reload the page to try again."; $("h-error").hidden = false;
+        // The skeleton gives way (a table of an earlier load stays).
+        if (!st.all) $("h-runs").replaceChildren(el("tbody", {}, [el("tr", {}, [el("td", {text: "Not loaded."})])]));
+        return;
+      }
+      $("h-error").hidden = true;
       st.all = j; st.models = Object.keys(j.models || {});
       var key = st.models.filter(function (n) { return n.toLowerCase() === String(st.model).toLowerCase(); })[0];
       st.model = key || st.models[0] || "";
@@ -95,14 +104,17 @@
       if (j.success) load();
     });
   }
+  // The model and run are the ones asked about, taken now: the question goes when the model or
+  // A / B changes (closeAsk), and its yes never deletes another model's run of the same id.
   function askDelete(e, button) {
-    var box = $("h-confirm");
-    $("h-confirm-text").textContent = "Delete the run of " + when(e.timestamp) + " of " + st.model + " from the history? The current results do not change.";
+    var box = $("h-confirm"), model = st.model, runId = e.run_id;
+    $("h-confirm-text").textContent = "Delete the run of " + when(e.timestamp) + " of " + model + " from the history? The current results do not change.";
     box.hidden = false;
-    $("h-confirm-yes").onclick = function () { box.hidden = true; act(button, "/v1/benchmark/history/delete", {model: st.model, run_id: e.run_id}); };
+    $("h-confirm-yes").onclick = function () { box.hidden = true; act(button, "/v1/benchmark/history/delete", {model: model, run_id: runId}); };
     $("h-confirm-no").onclick = function () { box.hidden = true; button.focus(); };
     $("h-confirm-yes").focus();
   }
+  function closeAsk() { $("h-confirm").hidden = true; }
 
   // ---- A / B -------------------------------------------------------------------------------------
   var VERDICT = {better: ["ok", "clearly better"], worse: ["bad", "worse"], same: ["same", "within noise"], not_comparable: ["warn", "not comparable"]};
@@ -120,11 +132,13 @@
     };
     opts(a, st.a); opts(b, st.b);
     var t = $("h-ab"), sum = $("h-ab-summary");
-    if (!st.a || !st.b || st.a === st.b) { t.replaceChildren(); sum.textContent = st.entries.length < 2 ? "One run so far: a second run compares here." : "Choose two different runs."; return; }
+    if (!st.a || !st.b || st.a === st.b) { abLoads.stop(); t.replaceChildren(); sum.textContent = st.entries.length < 2 ? "One run so far: a second run compares here." : "Choose two different runs."; return; }
     var ea = st.entries.filter(function (e) { return e.run_id === st.a; })[0], eb = st.entries.filter(function (e) { return e.run_id === st.b; })[0];
     var later = ea.timestamp >= eb.timestamp ? ea : eb, earlier = later === ea ? eb : ea;
     sum.textContent = "Loading…";
-    PB.getJSON("/v1/benchmark/history/compare?model=" + encodeURIComponent(st.model) + "&a=" + encodeURIComponent(earlier.run_id) + "&b=" + encodeURIComponent(later.run_id)).then(function (j) {
+    var ticket = abLoads.begin();
+    PB.getJSON("/v1/benchmark/history/compare?model=" + encodeURIComponent(st.model) + "&a=" + encodeURIComponent(earlier.run_id) + "&b=" + encodeURIComponent(later.run_id), ticket.init).then(function (j) {
+      if (!ticket.wins(j)) return; // A, B or the model changed since
       if (!j.success) { sum.textContent = (j.message || j.error || "Not compared.") + " Reload the page."; return; }
       var ch = j.changes, flip = later !== ea;
       sum.textContent = (ch.summary || "") + (ch.comparable ? "" : " Not directly comparable: " + (ch.reasons || []).join("; ") + ".");
@@ -141,8 +155,8 @@
       t.replaceChildren(el("thead", {}, [head]), el("tbody", {}, rows));
     });
   }
-  $("h-a").addEventListener("change", function (e) { st.a = e.target.value; renderAB(); });
-  $("h-b").addEventListener("change", function (e) { st.b = e.target.value; renderAB(); });
+  $("h-a").addEventListener("change", function (e) { st.a = e.target.value; closeAsk(); renderAB(); });
+  $("h-b").addEventListener("change", function (e) { st.b = e.target.value; closeAsk(); renderAB(); });
 
   // ---- trend -------------------------------------------------------------------------------------
   function renderTrend() {
@@ -174,7 +188,7 @@
   }
   $("h-metric").addEventListener("change", renderTrend);
   $("h-device").addEventListener("change", function (e) { st.device = e.target.value; renderRuns(); renderTrend(); });
-  $("h-model").addEventListener("change", function (e) { st.model = e.target.value; st.a = st.b = null; choose(); });
+  $("h-model").addEventListener("change", function (e) { st.model = e.target.value; st.a = st.b = null; closeAsk(); choose(); });
   var rt = null;
   window.addEventListener("resize", function () { clearTimeout(rt); rt = setTimeout(renderTrend, 150); });
   S.onView(function (why) { if (why === "run") load(); });

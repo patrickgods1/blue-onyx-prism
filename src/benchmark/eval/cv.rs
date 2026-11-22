@@ -11,7 +11,8 @@
 //! ([`Cv::all`]): cross-validation measures the procedure, the suggestion uses all the data.
 //!
 //! A fold whose other folds cannot be picked on (no objects there) is counted at the pick on
-//! every frame instead ([`Cv::borrowed`]); with fewer than two groups there is no
+//! every frame instead ([`Cv::borrowed`]; the assessment then flags the figures low confidence,
+//! partly in-sample); with fewer than two groups there is no
 //! cross-validation at all and the out-of-fold figures are the in-sample ones.
 
 use super::pick::{GridPick, pick};
@@ -97,15 +98,6 @@ pub struct Cv {
 }
 
 impl Cv {
-    /// The pooled out-of-fold counts.
-    pub fn pooled(&self) -> At {
-        let mut a = At::default();
-        for g in &self.oof {
-            a.add(g);
-        }
-        a
-    }
-
     /// Cross-validated at all (two groups or more).
     pub fn validated(&self) -> bool {
         self.k >= 2
@@ -278,10 +270,11 @@ mod tests {
         assert!((1..5).any(|f| after.fold_pick[f] != base.fold_pick[f]));
         // The pooled counts hold every group once.
         assert_eq!(after.oof.len(), 10);
-        assert_eq!(
-            after.pooled().objects(),
-            4 * (10 - fold0.len()) + 40 * fold0.len()
-        );
+        let mut pooled = At::default();
+        for g in &after.oof {
+            pooled.add(g);
+        }
+        assert_eq!(pooled.objects(), 4 * (10 - fold0.len()) + 40 * fold0.len());
     }
 
     #[test]

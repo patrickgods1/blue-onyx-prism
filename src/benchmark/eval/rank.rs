@@ -6,11 +6,15 @@
 //! no metric). Within a block: the goal metric (higher is better for every goal), then the p95
 //! (faster first), then the input order.
 //!
-//! Rank groups: the first row is rank 1 and leads its group; each next row of the same block
-//! shares the leader's rank unless it is clearly worse than the leader (the paired bootstrap
-//! difference's 95% interval lies below 0, [`super::stats::Difference`]), in which case it
-//! starts a new group with itself as leader and its position as rank. The first row of each
-//! block starts a new group too.
+//! Rank groups: the first row is rank 1 and leads its group. Each next row of the same block is
+//! compared with the block's group leaders in rank order and joins the first one it is not
+//! clearly worse than (the paired bootstrap difference's 95% interval does not lie below 0,
+//! [`super::stats::Difference`]), sharing its rank; clearly worse than every leader, it starts a
+//! new group with itself as leader and its position as rank. So a row with a wide interval
+//! shares rank 1 with the best row when it is not clearly worse than it, even after a row that
+//! is (it never lands in a lower group than the evidence says). The first row of each block
+//! starts a new group too. Each row also keeps its difference from the best row
+//! ([`Place::vs_best`]), which the headline's "not clearly different" reads.
 
 use super::stats::Difference;
 
@@ -62,10 +66,12 @@ pub struct Place {
     /// The input index of its group's leader.
     pub leader: usize,
     pub block: Block,
-    /// Its paired difference from the leader it was compared with: its group's leader, or for a
-    /// row that starts a new group, the leader of the group before (None for the first row of a
-    /// block).
+    /// Its paired difference from its group's leader, or for a row that starts a new group,
+    /// from the leader of the group before (None for the first row of a block).
     pub vs_leader: Option<Difference>,
+    /// Its paired difference from the best row (the first of the order) when it is in the same
+    /// block; None for the best row itself.
+    pub vs_best: Option<Difference>,
 }
 
 /// The order (input indices, best first) and each input row's place.
@@ -97,34 +103,50 @@ pub fn rank(rows: &[Rankable<'_>]) -> (Vec<usize>, Vec<Place>) {
             leader: 0,
             block: Block::Unfair,
             vs_leader: None,
+            vs_best: None,
         };
         rows.len()
     ];
-    let mut leader: Option<(usize, usize)> = None; // (input index, rank)
+    let diff = |a: Rankable<'_>, b: Rankable<'_>| -> Option<Difference> {
+        Some(Difference::of(
+            a.metric?,
+            b.metric?,
+            a.resampled,
+            b.resampled,
+        ))
+    };
+    let best = order.first().and_then(|&b| key(b).map(|r| (b, r)));
+    // The leaders of the current block's groups, in rank order: (input index, rank).
+    let mut leaders: Vec<(usize, usize)> = Vec::new();
+    let mut block_of_leaders: Option<Block> = None;
     for (pos, &i) in order.iter().enumerate() {
         let Some(r) = key(i) else { continue };
         let position = pos + 1;
         let block = r.block();
-        let same_block = leader
-            .and_then(|(l, _)| key(l))
-            .is_some_and(|l| l.block() == block);
-        let vs = match leader {
-            Some((l, _)) if same_block => key(l).and_then(|lr| {
-                Some(Difference::of(
-                    r.metric?,
-                    lr.metric?,
-                    r.resampled,
-                    lr.resampled,
-                ))
-            }),
-            _ => None,
+        if block_of_leaders != Some(block) {
+            leaders.clear();
+            block_of_leaders = Some(block);
+        }
+        // The first leader it is not clearly worse than (a difference that cannot be taken is
+        // no evidence either way: it joins).
+        let joined = leaders.iter().find_map(|&(l, rank)| {
+            let d = key(l).and_then(|lr| diff(r, lr));
+            (!d.is_some_and(|d| d.clearly_below())).then_some((l, rank, d))
+        });
+        let (l, rank, vs) = match joined {
+            Some(x) => x,
+            None => {
+                let before = leaders
+                    .last()
+                    .and_then(|&(l, _)| key(l))
+                    .and_then(|lr| diff(r, lr));
+                leaders.push((i, position));
+                (i, position, before)
+            }
         };
-        let starts = !same_block || vs.is_some_and(|d| d.clearly_below());
-        let (l, rank) = match leader {
-            Some(x) if !starts => x,
-            _ => (i, position),
-        };
-        leader = Some((l, rank));
+        let vs_best = best
+            .filter(|(b, br)| *b != i && br.block() == block)
+            .and_then(|(_, br)| diff(r, br));
         if let Some(p) = places.get_mut(i) {
             *p = Place {
                 position,
@@ -132,6 +154,7 @@ pub fn rank(rows: &[Rankable<'_>]) -> (Vec<usize>, Vec<Place>) {
                 leader: l,
                 block,
                 vs_leader: vs,
+                vs_best,
             };
         }
     }
@@ -184,6 +207,36 @@ mod tests {
         assert_eq!(places[2].block, Block::TooSlow);
         assert!(places[0].vs_leader.unwrap().clearly_below());
         assert!(places[1].vs_leader.is_none());
+    }
+
+    /// S4, the reviewers' case: A 0.80 ± 0.005, B 0.70 ± 0.005, C 0.69 with very wide resamples.
+    /// B is clearly worse than A: rank 2. C is not clearly worse than A, the first leader in
+    /// rank order, so it shares rank 1 (comparing it with B's group alone put it at rank 2).
+    #[test]
+    fn a_row_joins_the_first_leader_it_is_not_clearly_worse_than() {
+        let a = draws(0.80, 0.005);
+        let b = draws(0.70, 0.005);
+        let c = draws(0.69, 0.5);
+        let rows: Vec<Rankable<'_>> = [(0.80, &a), (0.70, &b), (0.69, &c)]
+            .iter()
+            .map(|(m, r)| Rankable {
+                metric: Some(*m),
+                resampled: r,
+                too_slow: false,
+                unmet: false,
+                unfair: false,
+                p95_ms: Some(100.0),
+            })
+            .collect();
+        let (order, places) = rank(&rows);
+        assert_eq!(order, [0, 1, 2]);
+        assert_eq!(places[0].rank, 1);
+        assert_eq!(places[1].rank, 2, "B is clearly worse than A");
+        assert_eq!(places[2].rank, 1, "C is not clearly worse than A");
+        assert_eq!(places[2].leader, 0);
+        assert!(places[1].vs_best.unwrap().clearly_below());
+        assert!(!places[2].vs_best.unwrap().clearly_below());
+        assert!(places[0].vs_best.is_none());
     }
 
     #[test]

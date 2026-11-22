@@ -3,7 +3,7 @@
 // - Old links: /benchmark#tab-tune, #m-<model>, ... go to their new page (BenchCore.mapHash).
 // - The goal chip opens the Goal dialog (a native modal <dialog>: the rest of the page is inert,
 //   Esc closes it, the focus goes back to the chip). "Try without saving" reloads the page with
-//   the goal in its query (`?goal=f2&budget=500`); every view reads it (BenchShell.tryQuery()) and
+//   the goal in its query (`?goal=f2&budget=500`); every view sends it (BenchShell.withGoal(url)) and
 //   the shell shows the "trying" banner with Save / Back. Save posts POST /v1/benchmark/goal
 //   (and POST /v1/benchmark/settings for the grade's accuracy weight).
 // - The status area: the run's progress from the run poll (GET /v1/benchmark?only=run, BenchPoll:
@@ -25,7 +25,6 @@
 
   // ---- a goal tried without saving -----------------------------------------------------------------
   var tried = BC.tryParams(location.search);
-  function tryQuery() { return tried.length ? BC.encodePairs(tried) : ""; }
   // `url` with the tried goal's fields added (an API query or a link).
   function withGoal(url) { return BC.withTry(url, tried); }
   if (tried.length) {
@@ -74,12 +73,16 @@
       showRun(st); showLabels(st.labelsChanged);
       pollListeners.forEach(function (fn) { try { fn(st); } catch (e) { /* keep polling */ } });
       if (st.ended || st.viewChanged) viewChanged(st.ended ? "run" : "view");
-      if (st.running) fast.kick();
+      // A run seen by the slow loop: the fast one takes over a period from now (this answer is
+      // the poll of now). Seen by the fast loop, its `more` keeps it going: a kick here would
+      // run it again at once, back to back for the whole run.
+      if (st.running && fast.state().parked) fast.later();
       return st;
     });
   }
   var fast = PrismPoll.create({run: pollOnce, period: 1500, max: 30000, more: function (st) { return !!(st && st.running); }});
-  var slow = PrismPoll.create({run: function () { return fast.state().busy ? null : pollOnce(); }, period: 20000, max: 60000});
+  // The slow loop asks only while the fast one is parked (no run going).
+  var slow = PrismPoll.create({run: function () { return fast.state().parked ? pollOnce() : null; }, period: 20000, max: 60000});
   slow.start();
 
   // ---- progress --------------------------------------------------------------------------------------
@@ -111,22 +114,18 @@
 
   // ---- labels changed since the run -----------------------------------------------------------------
   var labels = $("bn-labels"), rescore = $("bn-rescore");
+  // BenchCore.labelsText: the differing frames (or, `stale`, the server's message: results and
+  // labels saved apart) and the frames it could not read.
   function showLabels(lc) {
-    var n = lc && BC.has(lc.frames) ? lc.frames : 0;
-    labels.hidden = step === "run" || !n || (last && last.running);
-    if (labels.hidden) return;
-    var bits = [];
-    if (lc.changed) bits.push(lc.changed + " changed");
-    if (lc.left) bits.push(lc.left + " no longer reviewed");
-    if (lc.joined) bits.push(lc.joined + " newly reviewed (a run scores those)");
-    $("bn-labels-text").textContent = "Labels of " + fmt.int(n) + " frame" + (n === 1 ? "" : "s") + " of Your cameras differ from this run's: " + bits.join(", ") + ".";
+    var text = BC.labelsText(lc);
+    labels.hidden = step === "run" || !text || !!(last && last.running);
+    if (!labels.hidden) $("bn-labels-text").textContent = text;
   }
   rescore.addEventListener("click", function () {
     rescore.disabled = true; say("Re-scoring against the current labels…");
     PB.post("/v1/benchmark/rescore", "").then(function (j) {
       if (j.success) {
-        var r = j.rescored || {};
-        say("Re-scored " + fmt.int(r.frames || 0) + " frames of " + fmt.int(r.runs || 0) + " runs against the current labels." + (r.needRun ? " Frames reviewed since the run need a new run." : ""), "ok");
+        say(BC.rescoredText(j.rescored), "ok");
         labels.hidden = true; viewChanged("rescore"); fast.kick();
       } else say((j.message || "Not re-scored.") + (j._status === 409 ? "" : " Nothing changed."), "error");
     }).then(function () { rescore.disabled = false; });
@@ -261,7 +260,7 @@
     });
   }
   window.BenchShell = {
-    step: step, tryQuery: tryQuery, withGoal: withGoal, trying: function () { return tried.length > 0; },
+    step: step, withGoal: withGoal,
     setGoal: setGoal, setSet: setSet, say: say, onPoll: onPoll, onView: onView, viewChanged: viewChanged,
     kick: function () { fast.kick(); }, last: function () { return last; }
   };

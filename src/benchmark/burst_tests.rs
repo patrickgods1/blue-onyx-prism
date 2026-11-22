@@ -224,9 +224,9 @@ fn open_loop_latency_includes_the_queue_wait_from_the_intended_time() {
     assert_eq!(script.submits(), 6, "every burst request inferred once");
 }
 
-/// A late send still counts from when it was due (no coordinated omission); refusals are the
-/// drop counters by reason plus `error` for the rest; a trigger with a refused request is
-/// incomplete and stays out of the trigger times.
+/// A late send still counts from when it was due (no coordinated omission); refusals are each
+/// failed answer's own reason, `error` without one (answered + refused == requests); a trigger
+/// with a refused request is incomplete and stays out of the trigger times.
 #[test]
 fn the_summary_counts_from_the_intended_time() {
     let ms = Duration::from_millis;
@@ -235,28 +235,32 @@ fn the_summary_counts_from_the_intended_time() {
         image,
         at: ms(at),
     };
-    let o = |burst, d: Due, sent, answered, ok: bool| Outcome {
+    let o = |burst, d: Due, sent, answered, ok: bool, dropped: Option<DropReason>| Outcome {
         burst,
         due: d,
         sent: ms(sent),
         answered: ms(answered),
         ok,
+        dropped,
         error: (!ok).then(|| "Worker queue is full".to_string()),
     };
     let outcomes = vec![
         // Sent 400 ms late, answered 100 ms after its send: 500 ms from when it was due.
-        o(0, due(0, 0, 0), 400, 500, true),
-        o(0, due(0, 1, 100), 400, 600, true),
-        o(0, due(1, 0, 0), 0, 50, true),
-        o(0, due(1, 1, 100), 100, 101, false),
-        o(1, due(0, 0, 0), 0, 30, false),
+        o(0, due(0, 0, 0), 400, 500, true, None),
+        o(0, due(0, 1, 100), 400, 600, true, None),
+        o(0, due(1, 0, 0), 0, 50, true, None),
+        o(
+            0,
+            due(1, 1, 100),
+            100,
+            101,
+            false,
+            Some(DropReason::QueueFull),
+        ),
+        o(1, due(0, 0, 0), 0, 30, false, None),
     ];
     let mut r = BurstResult::default();
-    summarize(
-        &mut r,
-        &outcomes,
-        &[(DropReason::QueueFull, 1), (DropReason::Timeout, 0)],
-    );
+    summarize(&mut r, &outcomes);
     assert_eq!((r.requests, r.answered), (5, 3));
     assert_eq!(r.latency_ms.max, 500.0);
     assert_eq!(r.latency_ms.min, 50.0);
@@ -270,6 +274,8 @@ fn the_summary_counts_from_the_intended_time() {
         .collect();
     assert_eq!(r.refused, want);
     assert_eq!(r.refused_total(), 2);
+    assert_eq!(r.errors(), 1);
+    assert_eq!(r.answered as u64 + r.refused_total(), r.requests as u64);
     assert_eq!(r.first_refusal.as_deref(), Some("Worker queue is full"));
 }
 
@@ -499,4 +505,181 @@ fn the_result_text_names_the_load_and_the_refusals() {
     assert!(t.starts_with("burst 8 x 4 x 500 ms"), "{t}");
     assert!(t.contains("p95 480 ms") && t.contains("p95 1.6 s"), "{t}");
     assert!(t.contains("2 refused (queue_full 2)"), "{t}");
+}
+
+/// A test fault that blocks its thread until `release` is set (at most `limit`).
+fn blocking_until(release: &Arc<AtomicBool>, limit: Duration) -> impl Fn() + Send + Sync + 'static {
+    let release = release.clone();
+    move || {
+        let until = Instant::now() + limit;
+        while !release.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Wait until every compiled copy of `script` is dropped (at most `limit`).
+fn wait_all_dropped(script: &FakeScript, limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    while script.alive() > 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    script.alive() == 0
+}
+
+/// R1: a worker thread that does not end (blocked in the runtime, as an inference after a GPU
+/// reset) is left behind after the bounded wait, recorded in the result, and the run goes on.
+#[test]
+fn a_hung_worker_thread_is_left_behind_after_a_bounded_wait() {
+    let dir = Dir::new();
+    let script = FakeScript::new(1, INPUT);
+    let rt = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let cfg = Config {
+        request_timeout_secs: 1,
+        ..config(0)
+    };
+    let s = sets(&dir.0);
+    slow(&script, 4, 10);
+    let release = Arc::new(AtomicBool::new(false));
+    let mut b = burst(load(1, 1, 50), &rt, &cfg, 1);
+    b.stop_wait = Duration::from_millis(300);
+    let block = blocking_until(&release, Duration::from_secs(12));
+    b.faults.submit = Some(Arc::new(move || {
+        block();
+        Ok(())
+    }));
+    let mut bench = bench(&s);
+    bench.burst = Some(&b);
+    let t = Instant::now();
+    let r = bench.run_exact(&rt, &job(&dir.0), cpu()).unwrap();
+    let took = t.elapsed();
+    release.store(true, Ordering::SeqCst);
+    let br = r.burst.unwrap();
+    assert!(
+        took < Duration::from_secs(6),
+        "the run waited {took:?} for a hung worker"
+    );
+    assert!(
+        br.notes.iter().any(|n| n.contains("left behind")),
+        "{:?}",
+        br.notes
+    );
+    assert_eq!(br.requests, 1);
+    assert!(wait_all_dropped(&script, Duration::from_secs(10)));
+}
+
+/// R3: a worker still compiling at the load timeout, or at a cancel, is not waited for: it is
+/// left to finish in the background (its copy is dropped when it ends) and the run goes on.
+#[test]
+fn a_load_past_its_timeout_or_a_cancel_is_left_to_finish_in_the_background() {
+    let dir = Dir::new();
+    let script = FakeScript::new(1, INPUT);
+    let rt = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let cfg = config(0);
+    let s = sets(&dir.0);
+    for cancel_it in [false, true] {
+        let release = Arc::new(AtomicBool::new(false));
+        let mut b = burst(load(2, 2, 50), &rt, &cfg, 1);
+        b.load_timeout = Duration::from_millis(200);
+        b.stop_wait = Duration::from_millis(300);
+        let block = blocking_until(&release, Duration::from_secs(12));
+        b.faults.load = Some(Arc::new(move |_c: &Candidate| {
+            block();
+            Ok(())
+        }));
+        let cancel = AtomicBool::new(false);
+        let progress = |p: &crate::benchmark::Progress| {
+            if cancel_it && p.phase == Phase::Burst {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        };
+        let mut bench = bench(&s);
+        bench.burst = Some(&b);
+        bench.cancel = Some(&cancel);
+        bench.progress = Some(&progress);
+        let t = Instant::now();
+        let out = bench.run_exact(&rt, &job(&dir.0), cpu());
+        let took = t.elapsed();
+        release.store(true, Ordering::SeqCst);
+        assert!(
+            took < Duration::from_secs(5),
+            "cancel {cancel_it}: waited {took:?} for a compiling worker"
+        );
+        if cancel_it {
+            assert!(is_cancelled(&out.unwrap_err()));
+        } else {
+            let br = out.unwrap().burst.unwrap();
+            let e = br.error.as_deref().unwrap();
+            assert!(e.contains("within"), "{e}");
+            assert!(
+                br.notes.iter().any(|n| n.contains("background")),
+                "{:?}",
+                br.notes
+            );
+            assert_eq!(br.requests, 0);
+        }
+        assert!(wait_all_dropped(&script, Duration::from_secs(10)));
+    }
+}
+
+/// R2: each request is classified from its own answer: a request the server timed out and the
+/// worker dropped later as late counts once, and answered + refused == requests.
+#[test]
+fn a_request_timed_out_twice_counts_once() {
+    let dir = Dir::new();
+    let script = FakeScript::new(1, INPUT);
+    let rt = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    // Server timeout 2 s + grace; the first inference takes 3.2 s (the stuck watchdog would
+    // fire at 4 s): both first requests time out at the server, and the worker drops the
+    // second as late when the slot frees at 3.2 s. The next two, at 3.5 s, are answered.
+    let cfg = Config {
+        request_timeout_secs: 2,
+        ..config(0)
+    };
+    let s = sets(&dir.0);
+    slow(&script, 1, 3200);
+    slow(&script, 4, 10);
+    let b = burst(load(2, 2, 3500), &rt, &cfg, 1);
+    let mut bench = bench(&s);
+    bench.burst = Some(&b);
+    let br = bench
+        .run_exact(&rt, &job(&dir.0), cpu())
+        .unwrap()
+        .burst
+        .unwrap();
+    assert_eq!(br.requests, 4);
+    assert_eq!(br.answered, 2, "{:?}", br.refused);
+    assert_eq!(
+        br.answered as u64 + br.refused_total(),
+        br.requests as u64,
+        "{:?}",
+        br.refused
+    );
+    assert_eq!(
+        br.refused.get("timeout").copied(),
+        Some(2),
+        "{:?}",
+        br.refused
+    );
+}
+
+/// R5: a timer runtime that does not start is the burst's error; the timed result stands.
+#[test]
+fn a_timer_runtime_that_does_not_start_is_the_bursts_error() {
+    let dir = Dir::new();
+    let script = FakeScript::new(1, INPUT);
+    let rt = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let cfg = config(0);
+    let s = sets(&dir.0);
+    let mut b = burst(load(2, 2, 50), &rt, &cfg, 1);
+    b.runtime_fault = true;
+    let mut bench = bench(&s);
+    bench.burst = Some(&b);
+    let r = bench.run_exact(&rt, &job(&dir.0), cpu()).unwrap();
+    assert_eq!(r.images, 3, "the timed run stands");
+    let br = r.burst.unwrap();
+    let e = br.error.as_deref().unwrap_or_default();
+    assert!(e.contains("timer runtime"), "{e}");
+    assert!(br.load_ms > 0.0);
+    assert_eq!(script.alive(), 0);
 }

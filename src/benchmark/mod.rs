@@ -41,6 +41,7 @@ pub mod images;
 pub mod metrics;
 pub mod report;
 pub mod rescore;
+pub mod results_io;
 pub mod roc;
 pub mod search;
 pub mod served;

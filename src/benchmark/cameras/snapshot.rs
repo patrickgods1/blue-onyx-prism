@@ -11,6 +11,15 @@
 //! change. [`changes`] counts what changed since; [`super::rescore`] scores the stored
 //! predictions against the current labels and writes a new snapshot.
 //!
+//! **One unit with the results.** Every writer saves the snapshot first, then `benchmark.json`
+//! with the snapshot's identity in the cameras set ([`SnapshotId`]: its `created` and the
+//! SHA-256 of its bytes), all under the results lock ([`crate::benchmark::results_io::lock`]).
+//! A load whose snapshot is not that one (a crash between the two writes, a hand edit) warns and
+//! marks the set stale ([`crate::benchmark::report::ImageSetInfo::labels_stale`]; the page
+//! offers a Re-score) instead of scoring silently. A run's snapshot keeps the frames of the
+//! earlier runs still in the results ([`merged_with`]), so a later run of fewer frames does not
+//! take their labels away.
+//!
 //! It is user data (it holds labels): written through a temporary file and a rename, never
 //! deleted by the storage sweeper, never in a diagnostics bundle, git-ignored.
 
@@ -65,6 +74,28 @@ pub struct GtSnapshot {
     pub reviewed: BTreeMap<String, String>,
 }
 
+/// Which snapshot a results file was saved with: the snapshot's `created` and the SHA-256 of
+/// its file's bytes ([`ImageSetInfo::snapshot`](crate::benchmark::report::ImageSetInfo)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotId {
+    pub created: String,
+    pub sha256: String,
+}
+
+impl SnapshotId {
+    fn of(snap: &GtSnapshot, bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        let sha256 = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Self {
+            created: snap.created.clone(),
+            sha256,
+        }
+    }
+}
+
 /// The snapshot beside the results file `results`.
 pub fn path_beside(results: &Path) -> PathBuf {
     results.with_file_name(FILE)
@@ -104,6 +135,11 @@ impl GtSnapshot {
     /// The file at `path`; None when there is none. A later format, or a file that does not
     /// parse, is an error (never moved aside: it is user data).
     pub fn load(path: &Path) -> Result<Option<Self>> {
+        Ok(Self::load_with_id(path)?.map(|(s, _)| s))
+    }
+
+    /// [`Self::load`] with the file's identity.
+    pub fn load_with_id(path: &Path) -> Result<Option<(Self, SnapshotId)>> {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -124,38 +160,69 @@ impl GtSnapshot {
                 super::TITLE
             );
         }
-        serde_json::from_slice(&bytes)
-            .map(Some)
-            .with_context(|| format!("parsing {}", path.display()))
+        let snap: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let id = SnapshotId::of(&snap, &bytes);
+        Ok(Some((snap, id)))
     }
 
-    /// Write it through a temporary file in the same folder, flushed, then renamed over `path`:
-    /// a reader sees the old snapshot or the new one, never part of one.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        use std::io::Write;
+    /// Write it through a temporary file of its own in the same folder, flushed, then renamed
+    /// over `path` ([`crate::benchmark::results_io::write_atomic`]): a reader sees the old
+    /// snapshot or the new one, never part of one. Returns its identity, for the results saved
+    /// with it.
+    pub fn save(&self, path: &Path) -> Result<SnapshotId> {
         let text = serde_json::to_vec_pretty(self)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let write = || -> std::io::Result<()> {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&text)?;
-            f.sync_all()
-        };
-        if let Err(e) = write() {
-            std::fs::remove_file(&tmp).ok();
-            return Err(e).with_context(|| format!("writing {}", tmp.display()));
-        }
-        std::fs::rename(&tmp, path).map_err(|e| {
-            std::fs::remove_file(&tmp).ok();
-            anyhow::anyhow!("writing {}: {e}", path.display())
-        })
+        crate::benchmark::results_io::write_atomic(path, &text)?;
+        Ok(SnapshotId::of(self, &text))
     }
 
     /// The scored frames by file name.
     pub fn by_file(&self) -> HashMap<&str, &GtFrame> {
         self.frames.iter().map(|f| (f.file.as_str(), f)).collect()
+    }
+
+    /// This snapshot (a run's) with the frames of `old` (the snapshot on disk) that a run of
+    /// `prev` (the results the run's save merges into) still scores and this one does not hold,
+    /// so a later run of fewer frames leaves the earlier runs their labels. Nothing is added
+    /// from a snapshot of another folder or class list (its runs are of another set).
+    #[must_use]
+    pub fn merged_with(
+        mut self,
+        old: Option<&GtSnapshot>,
+        prev: Option<&BenchmarkResults>,
+    ) -> Self {
+        let (Some(old), Some(prev)) = (old, prev) else {
+            return self;
+        };
+        if old.dir != self.dir || old.classes != self.classes {
+            return self;
+        }
+        let scored: std::collections::HashSet<&str> = prev
+            .models
+            .iter()
+            .flat_map(|m| m.devices.iter())
+            .filter_map(|d| d.run.as_ref())
+            .flat_map(|r| r.per_image.iter())
+            .filter(|i| i.set == ID)
+            .map(|i| i.file.as_str())
+            .collect();
+        let have: std::collections::HashSet<String> =
+            self.frames.iter().map(|f| f.file.clone()).collect();
+        for f in &old.frames {
+            if scored.contains(f.file.as_str()) && !have.contains(&f.file) {
+                self.frames.push(f.clone());
+            }
+        }
+        self
+    }
+}
+
+/// Record `id` (the snapshot just written beside it) in the cameras set of `results`, which is
+/// then no longer stale.
+pub fn stamp(results: &mut BenchmarkResults, id: &SnapshotId) {
+    for s in results.image_sets.iter_mut().filter(|s| s.id == ID) {
+        s.snapshot = Some(id.clone());
+        s.labels_stale = None;
     }
 }
 
@@ -174,15 +241,38 @@ pub fn strip(results: &BenchmarkResults) -> std::borrow::Cow<'_, BenchmarkResult
     std::borrow::Cow::Owned(r)
 }
 
+/// Why the snapshot `found` is not the one `recorded` in the results (None: it is, or the
+/// results predate the identity).
+pub fn mismatch(recorded: Option<&SnapshotId>, found: &SnapshotId) -> Option<String> {
+    let recorded = recorded?;
+    (recorded != found).then(|| {
+        format!(
+            "the labels of {} ({FILE}, taken {}) are not the ones these results were saved with \
+             (taken {}): the results were saved before or after another snapshot (an interrupted \
+             save?). Re-score {} against the current labels, or run the benchmark on it again",
+            super::TITLE,
+            found.created,
+            recorded.created,
+            super::TITLE
+        )
+    })
+}
+
 /// Fill the boxes of the cameras set of `results` (loaded from `results_path`) from the snapshot
 /// beside it; an image the snapshot does not hold has none (it is not scored). A warning when the
-/// snapshot is missing or does not read: the set is then not scored until the next run or
-/// re-score.
+/// snapshot is missing or does not read (the set is then not scored until the next run or
+/// re-score), and when it is not the one the results were saved with ([`mismatch`]: the set is
+/// marked [`crate::benchmark::report::ImageSetInfo::labels_stale`], scored against the file
+/// found until it is re-scored).
 pub fn overlay(results: &mut BenchmarkResults, results_path: &Path) -> Option<String> {
     let set = results.image_sets.iter_mut().find(|s| s.id == ID)?;
     let path = path_beside(results_path);
-    let (snap, warning) = match GtSnapshot::load(&path) {
-        Ok(Some(s)) => (Some(s), None),
+    let (snap, warning) = match GtSnapshot::load_with_id(&path) {
+        Ok(Some((s, id))) => {
+            let stale = mismatch(set.snapshot.as_ref(), &id);
+            set.labels_stale.clone_from(&stale);
+            (Some(s), stale)
+        }
         Ok(None) => (
             None,
             Some(format!(
@@ -218,13 +308,33 @@ pub struct Changes {
     /// Reviewed frames the snapshot did not know (reviewed since): a run scores them, a re-score
     /// cannot (no predictions).
     pub joined: usize,
+    /// Scored frames the walk could not read this time (changed while read, a label file that
+    /// does not parse, a lost image or sidecar, an unreadable folder): neither changed nor
+    /// left, as far as anyone can tell; a re-score keeps them as they were.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unknown: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// What changed between `snap` and `current` (file name -> revision of the reviewed frames now).
 pub fn changes(snap: &GtSnapshot, current: &BTreeMap<String, String>) -> Changes {
+    changes_with(snap, current, &|_| false)
+}
+
+/// [`changes`], with `unknown(frame)` true for a scored frame the walk could not read (see
+/// [`Changes::unknown`]).
+pub fn changes_with(
+    snap: &GtSnapshot,
+    current: &BTreeMap<String, String>,
+    unknown: &dyn Fn(&GtFrame) -> bool,
+) -> Changes {
     let mut c = Changes::default();
     for f in &snap.frames {
         match current.get(&f.file) {
+            None if unknown(f) => c.unknown += 1,
             None => c.left += 1,
             Some(r) if *r != f.revision => c.changed += 1,
             Some(_) => {}

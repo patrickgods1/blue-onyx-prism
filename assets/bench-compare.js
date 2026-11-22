@@ -12,7 +12,8 @@
   if (!S || !C) return;
   var $ = function (id) { return document.getElementById(id); };
   var params = new URLSearchParams(location.search);
-  var state = {set: params.get("set") || "", scene: params.get("scene") || "all", open: {}, tab: "scenes", pair: null, view: null, loading: null};
+  var state = {set: params.get("set") || "", scene: params.get("scene") || "all", open: {}, tab: "scenes", pair: null, view: null, loadError: false};
+  var loads = BC.latest();
   var focusModel = params.get("model");
   var columns = BC.columnsOf(BC.store.get("columns", []));
   var table = $("c-table"), body = $("cmp-body"), empty = $("cmp-empty");
@@ -109,8 +110,10 @@
       fact("CPU check", BC.agreementText(r.agreement)),
       fact("Saved confidence", BC.has(r.servedThreshold) ? fmt.n2(r.servedThreshold) : "none"),
       fact("Equally good range", BC.rangeText(r.plateau) || (r.plateau ? "only " + fmt.n2(r.plateau[0]) : "-")),
-      fact("Cross-validation", r.folds > 1 ? r.folds + " folds" : "in-sample (too little data)")
+      fact("Cross-validation", BC.cvFact(r.folds, f.lowConfidence))
     ];
+    var vb = BC.vsBestText(r.vsBest);
+    if (vb) facts.push(fact("Against the best", vb.charAt(0).toUpperCase() + vb.slice(1)));
     var bf = BC.burstFacts(s.burst);
     if (bf && !bf.error) {
       facts.push(fact("Burst load", bf.load));
@@ -317,7 +320,7 @@
 
   // ---- the whole view ----------------------------------------------------------------------------
   function msgEl() { return $("c-msg"); }
-  function say(text, kind) { var m = msgEl(); m.className = "bn-msg small" + (kind === "error" ? " bn-error" : kind === "ok" ? " notice" : ""); m.textContent = text || ""; }
+  function say(text, kind) { state.loadError = false; var m = msgEl(); m.className = "bn-msg small" + (kind === "error" ? " bn-error" : kind === "ok" ? " notice" : ""); m.textContent = text || ""; }
   function render() {
     var v = state.view; if (!v) return;
     S.setGoal(v.goal);
@@ -358,16 +361,23 @@
     var q = p.toString();
     if (history.replaceState) history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + location.hash);
   }
+  // A failed load: the error, and in place of the skeletons (first load) a line saying so; the
+  // view of an earlier load stays as it was.
+  function failed(text) {
+    say(text + " Reload the page to try again.", "error"); state.loadError = true;
+    if (state.view) return;
+    $("c-headline").textContent = "The comparison did not load.";
+    table.replaceChildren(el("tbody", {}, [el("tr", {}, [el("td", {text: "Nothing to show: " + text})])]));
+  }
   function load() {
-    if (state.loading) state.loading.abort();
-    var ctl = window.AbortController ? new AbortController() : null;
-    state.loading = ctl;
+    var t = loads.begin();
     body.setAttribute("aria-busy", "true");
-    return PB.getJSON(S.withGoal(url()), ctl ? {signal: ctl.signal} : {}).then(function (j) {
-      if (j.aborted) return;
-      state.loading = null; body.removeAttribute("aria-busy");
+    return PB.getJSON(S.withGoal(url()), t.init).then(function (j) {
+      if (!t.wins(j)) return; // a newer load took its place
+      body.removeAttribute("aria-busy");
       if (j._status === 404) { body.hidden = true; empty.hidden = false; return; }
-      if (!j.success) { say((j.message || "The comparison did not load.") + " Reload the page to try again.", "error"); return; }
+      if (!j.success) { failed(j.message || "The comparison did not load."); return; }
+      if (state.loadError) { say(""); state.loadError = false; }
       body.hidden = false; empty.hidden = true;
       state.view = j.compare;
       if (j.compare.set) state.set = j.compare.set.id;

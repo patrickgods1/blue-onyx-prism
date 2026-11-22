@@ -90,13 +90,24 @@ pub(super) struct Loaded {
     pub(super) parts: Parts,
 }
 
-/// The file stamps and the config revision the answers depend on.
-fn stamp_of(state: &AppState, revision: u64) -> String {
+/// What the config and the registry say about each model now ([`super::models_now`]: the
+/// threshold each loaded worker runs with, the device the config resolves to).
+fn now_of(state: &AppState, cfg: &Config) -> HashMap<String, ModelNow> {
+    let snap = crate::server::devices_snapshot(state);
+    super::models_now(state, cfg, &snap)
+}
+
+/// The file stamps, the config revision and the models' state now (sorted: a reload, a
+/// fallback to another device or a new running threshold changes it, as for `saved_view`)
+/// the answers depend on.
+fn stamp_of(state: &AppState, revision: u64, now: &HashMap<String, ModelNow>) -> String {
     let path = results_path(&state.config_path);
     let preds = preds_path(&state.config_path);
     let gt = crate::benchmark::cameras::snapshot::path_beside(&path);
+    let mut sorted: Vec<_> = now.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
     format!(
-        "{:?}|{:?}|{:?}|{revision}",
+        "{:?}|{:?}|{:?}|{revision}|{sorted:?}",
         file_stamp(&path),
         file_stamp(&preds),
         file_stamp(&gt)
@@ -105,9 +116,8 @@ fn stamp_of(state: &AppState, revision: u64) -> String {
 
 /// Load what the views read; 404 without results or stored predictions.
 pub(super) fn load(state: &AppState) -> Result<Loaded, ApiError> {
-    let snap = crate::server::devices_snapshot(state);
     let (_, cfg) = state.config.snapshot();
-    let now = super::models_now(state, &cfg, &snap);
+    let now = now_of(state, &cfg);
     let mut results = BenchmarkResults::load_or_warn(&results_path(&state.config_path))
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no benchmark results yet"))?;
     let preds = StoredPreds::load_cached(&preds_path(&state.config_path))
@@ -241,7 +251,7 @@ fn compare_blocking(
     }
     let key = format!(
         "compare|{}|{}|{set:?}|{scene:?}",
-        stamp_of(state, revision),
+        stamp_of(state, revision, &now_of(state, &cfg)),
         goal.key()
     );
     cached(key, || {
@@ -283,7 +293,7 @@ fn tune_blocking(
     let goal = goal_of(&cfg, m)?;
     let key = format!(
         "tune|{}|{}|{}|{device:?}|{set:?}",
-        stamp_of(state, revision),
+        stamp_of(state, revision, &now_of(state, &cfg)),
         goal.key(),
         tune::key_of(&model)
     );
@@ -366,7 +376,7 @@ fn tune_images_blocking(
     let goal = goal_of(&cfg, m)?;
     let key = format!(
         "images|{}|{}|{}|{device:?}|{set:?}|{threshold}|{kind:?}|{limit}|{offset}|{camera:?}|{scene:?}",
-        stamp_of(state, revision),
+        stamp_of(state, revision, &now_of(state, &cfg)),
         goal.key(),
         tune::key_of(&model)
     );
@@ -466,6 +476,42 @@ mod tests {
         let (r, p) = crate::benchmark::eval::tests::fixture(10, 10);
         r.save(&results_path(&st.config_path)).unwrap();
         p.save(&preds_path(&st.config_path)).unwrap();
+    }
+
+    /// R4: a model reload on another device, or a new running threshold, is another cache key
+    /// for the Compare and Tune views (files and config unchanged).
+    #[test]
+    fn the_view_stamp_follows_the_models_now() {
+        let st = state();
+        let one = |running: Option<f32>, device: &str| {
+            let mut now = HashMap::new();
+            now.insert(
+                "ipcam-general".to_string(),
+                ModelNow::new(0.5, running, Some(device.into())),
+            );
+            now.insert(
+                "dfine-s".to_string(),
+                ModelNow::new(0.4, None, Some("ort:cpu".into())),
+            );
+            now
+        };
+        let base = stamp_of(&st, 7, &one(Some(0.5), "openvino:gpu"));
+        assert_eq!(base, stamp_of(&st, 7, &one(Some(0.5), "openvino:gpu")));
+        assert_ne!(
+            base,
+            stamp_of(&st, 7, &one(Some(0.5), "openvino:cpu")),
+            "fallback"
+        );
+        assert_ne!(
+            base,
+            stamp_of(&st, 7, &one(Some(0.35), "openvino:gpu")),
+            "threshold"
+        );
+        assert_ne!(
+            base,
+            stamp_of(&st, 7, &one(None, "openvino:gpu")),
+            "unloaded"
+        );
     }
 
     #[tokio::test]

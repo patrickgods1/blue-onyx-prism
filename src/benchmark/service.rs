@@ -181,7 +181,8 @@ impl RunRequest {
             };
         }
         if let Some(o) = one("threshold_objective").filter(|o| !o.is_empty()) {
-            req.threshold_objective = o.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            req.threshold_objective =
+                Objective::parse_target(o).map_err(|e: String| anyhow::anyhow!(e))?;
         }
         if let Some(m) = one("accuracy_metric").filter(|m| !m.is_empty()) {
             req.accuracy_metric = m.parse().map_err(|e: String| anyhow::anyhow!(e))?;
@@ -901,6 +902,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         finalized: false,
         bookkeeping_ms: 0.0,
         snapshot_written: false,
+        snapshot: None,
     };
 
     for (mi, (name, entry)) in entries.iter().enumerate() {
@@ -1361,14 +1363,24 @@ impl ServiceRun<'_> {
         let (ctx, req) = (self.ctx, self.req);
         let key = crate::registry::normalize_name(&model.model);
         let t = Instant::now();
-        if !saver.snapshot_written {
-            super::cameras::write_snapshot(&ctx.results_path, sets, self.cameras.as_ref())?;
-            saver.snapshot_written = true;
-        }
+        // One load-modify-save of the results and the files saved with them at a time, in this
+        // process and against a `benchmark` command.
+        let _held = super::results_io::lock(&ctx.results_path, super::results_io::Holder::Writer)?;
         let results =
             BenchmarkResults::new(saver.hardware.clone(), saver.versions.clone(), vec![model])
                 .with_sets(sets);
         let (prev, warnings) = BenchmarkResults::load_for_merge(&ctx.results_path)?;
+        if !saver.snapshot_written {
+            // The labels Your cameras is scored against, before the results that leave them out;
+            // with the frames the kept runs of `prev` still score.
+            saver.snapshot = super::cameras::write_snapshot(
+                &ctx.results_path,
+                sets,
+                self.cameras.as_ref(),
+                prev.as_ref(),
+            )?;
+            saver.snapshot_written = true;
+        }
         let load_ms = super::run::ms(t.elapsed());
         for w in warnings {
             self.h.with(|g| g.warnings.push(w));
@@ -1383,6 +1395,9 @@ impl ServiceRun<'_> {
             .unwrap_or_default();
         let name = results.models.first().map(|m| m.model.clone());
         let mut merged = saver.merge(prev, results, last);
+        if let Some(id) = &saver.snapshot {
+            super::cameras::snapshot::stamp(&mut merged, id);
+        }
         // Models kept from earlier runs are graded like this run's.
         merged.regrade(req.accuracy_metric, req.weights);
         let merge_ms = super::run::ms(t.elapsed()) - load_ms;
@@ -1433,6 +1448,7 @@ impl ServiceRun<'_> {
             return Ok(());
         }
         let path = &self.ctx.results_path;
+        let _held = super::results_io::lock(path, super::results_io::Holder::Writer)?;
         let Some(mut r) = BenchmarkResults::load(path)? else {
             return Ok(());
         };
@@ -1464,6 +1480,8 @@ struct Saver {
     bookkeeping_ms: f64,
     /// The run's "Your cameras" snapshot is written (before its first save).
     snapshot_written: bool,
+    /// Its identity, recorded in every save of the run ([`super::cameras::snapshot::stamp`]).
+    snapshot: Option<super::cameras::snapshot::SnapshotId>,
 }
 
 impl Saver {
@@ -1478,32 +1496,21 @@ impl Saver {
             .is_some_and(|p| p.incomparable(&new).is_none());
         let retain = *self.retain_sets.get_or_insert(comparable);
         // The sets before `merge` drops the unreferenced ones (kept until the end).
-        let sets = match prev.as_ref().filter(|_| comparable) {
-            Some(p) => upsert_sets(p.image_sets.clone(), new.image_sets.clone()),
-            None => new.image_sets.clone(),
-        };
+        let prev_sets = prev
+            .as_ref()
+            .filter(|_| comparable)
+            .map(|p| p.image_sets.clone());
+        let new_sets = new.image_sets.clone();
         let mut merged = BenchmarkResults::merge(prev, new);
-        merged.image_sets = sets;
+        merged.image_sets = match prev_sets {
+            Some(p) => super::report::upsert_sets(p, new_sets, &merged.models),
+            None => new_sets,
+        };
         if last && retain {
             retain_referenced_sets(&mut merged);
         }
         merged
     }
-}
-
-/// `sets` with each of `new` replacing the set of the same id in place, else appended (the
-/// order [`BenchmarkResults::merge`] gives).
-fn upsert_sets(
-    mut sets: Vec<super::report::ImageSetInfo>,
-    new: Vec<super::report::ImageSetInfo>,
-) -> Vec<super::report::ImageSetInfo> {
-    for s in new {
-        match sets.iter_mut().find(|p| p.id == s.id) {
-            Some(slot) => *slot = s,
-            None => sets.push(s),
-        }
-    }
-    sets
 }
 
 /// Keep only the image sets some model refers to (as [`BenchmarkResults::merge`] does).
@@ -2160,6 +2167,7 @@ mod tests {
                     finalized: false,
                     bookkeeping_ms: 0.0,
                     snapshot_written: false,
+                    snapshot: None,
                 };
                 let mut file = prev.clone();
                 let n = models.len();

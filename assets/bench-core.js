@@ -9,13 +9,13 @@
 //   ci(estimate) ("±0.02": the larger half of the 95% interval), signed(d, dp), duration(s).
 // - GOALS: the goal catalog of the Goal dialog (kind, label, long, target default and step,
 //   `rankOnly`, `more` = under "More goals"); parseGoal("precision:0.9") -> {kind, target};
-//   goalSpec(kind, target) -> "precision:0.9"; goalQuery(g) / tryParams(search): the `goal`,
+//   goalSpec(kind, target) -> "precision:0.9"; goalPairs(g) / tryParams(search): the `goal`,
 //   `tune_for`, `classes`, `budget` query of a goal tried without saving (the views and the
 //   Goal POST read the same fields); withTry(href, params) keeps them on a link.
 // - rowChips(row): the chips of a Compare / Tune row (default, trained here, too slow, target not
 //   met, served, stale rules, low confidence, relative, flat), each {cls, text, tip}.
-// - COLUMNS, columnsOf(stored) / columnsText(list): the Compare table's optional columns and their
-//   stored choice (localStorage `prism.bench.columns`, via store); burstFacts(b): the texts of a
+// - COLUMNS, columnsOf(stored): the Compare table's optional columns and their stored choice
+//   (localStorage `prism.bench.columns`, via store); burstFacts(b): the texts of a
 //   row's burst test (load, request p50 · p95 · p99, last answer, refused, queue).
 // - comboStates(run): the run poll's per-combo list ({model, device, state, text, now}).
 // - cpuReference(devices, dismissed): the CPU device to tick when 2+ devices and no CPU one are
@@ -29,7 +29,12 @@
 // - mapHash(hash): the new address of an old /benchmark#tab-... link (null: none).
 // - disagree(a, b): the frames on which two combos' examples disagree (one misses or alerts where
 //   the other does not).
-// - boxRect(bbox, w, h): a box as percentages of its image.
+// - labelSize(w, h, boxW, boxH, px): the frame dialog's label size in image pixels;
+//   placeBoxLabels(items, o): where its labels go (inside the image, clear of each other).
+// - latest(): "latest request wins" for a view a select change fetches (ticket.wins(answer)).
+// - labelsText(lc) / rescoredText(r): the shell's "labels changed" banner and Re-score result;
+//   vsBestText(d): a Compare row against the best; cvText(tune) / cvFact(folds, low): how a pick
+//   was validated (cross-validated, partly in-sample, in-sample).
 // - compareCsv(view): the Compare table as CSV.
 // - cellTag(tag) (also globalThis.BenchTags.cellTag): held-out per-camera tags the tag lists leave
 //   out (twin: `training::dataset::is_cell_tag`).
@@ -174,7 +179,6 @@
     var known = COLUMNS.map(function (c) { return c.key; });
     return known.filter(function (k) { return list.indexOf(k) >= 0; });
   }
-  function columnsText(list) { return JSON.stringify(columnsOf(list || [])); }
   var AGREEMENT = {match: "agrees with CPU", agrees: "agrees with CPU", minor: "minor differences", differs: "differs from CPU", reference: "CPU reference", not_checked: "not checked against CPU"};
   function agreementText(v) { return has(v) ? (AGREEMENT[v] || String(v).replace(/_/g, " ")) : "not checked against CPU"; }
   // A run's first load (compile + request creation) as shown: "2.1 s, cached", "24 s, compiled",
@@ -344,12 +348,55 @@
       return (f.missed > 0) !== (o.missed > 0) || (f.falsePositives > 0) !== (o.falsePositives > 0);
     }).map(function (f) { return Object.assign({}, f, {other: byKey[f.set + "\u0000" + f.file]}); });
   }
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-  function boxRect(b, w, h) {
-    if (!b || !(w > 0) || !(h > 0)) return null;
-    var x1 = clamp(Math.min(b[0], b[2]), 0, w), x2 = clamp(Math.max(b[0], b[2]), 0, w), y1 = clamp(Math.min(b[1], b[3]), 0, h), y2 = clamp(Math.max(b[1], b[3]), 0, h);
-    var r = function (v) { return Math.round(v * 1000) / 1000; };
-    return {left: r(x1 / w * 100), top: r(y1 / h * 100), width: r((x2 - x1) / w * 100), height: r((y2 - y1) / h * 100)};
+
+  // The frame dialog's box labels (bench-frames.js) are SVG text in the image's own pixels
+  // (viewBox = w x h, fitted into a box of boxW x boxH CSS px with "meet"), so a fixed size would
+  // shrink with the frame: 1920 px wide on a 390 px phone is 2-7 px. labelSize gives the size in
+  // image pixels that renders at `px` CSS px (default 13), its halo (stroke) width (3 px at 13 px)
+  // and the gap above its box; without a measured box (0), about 1/32 of the shorter side.
+  var LABEL_PX = 13;
+  function labelSize(w, h, boxW, boxH, px) {
+    px = px || LABEL_PX;
+    var scale = w > 0 && h > 0 && boxW > 0 && boxH > 0 ? Math.min(boxW / w, boxH / h) : 0;
+    var size = scale ? px / scale : Math.max(12, Math.round(Math.min(w || 1, h || 1) / 32));
+    return {size: size, halo: size * 3 / LABEL_PX, gap: size * 4 / LABEL_PX, scale: scale};
+  }
+
+  // Where the frame dialog's box labels go (bench-frames.js), in image pixels: items [{x1, y1, x2,
+  // y2 (the box), text, width (the text's advance, measured; else about 0.6 x size per
+  // character)}], o {w, h (the image), size (font size), gap, halo (stroke width)}. Each label
+  // tries, in order: above its box, inside its top edge (no room above), lower inside the box a
+  // line at a time, below its box, inside its bottom edge, then further above and below a line
+  // at a time; x starts at the box's left and shifts left to end inside the image. The first spot
+  // inside the image that covers no label placed before wins; with none free, the first inside
+  // the image. Returns [{x, y (baseline), x1, y1, x2, y2 (the text's box, halo included)}]: from
+  // the baseline 0.95 x size up and a quarter down, as browsers measure a line of text.
+  function placeBoxLabels(items, o) {
+    var w = o.w, h = o.h, size = o.size, gap = has(o.gap) ? o.gap : size * 0.3, hh = (o.halo || 0) / 2, pad = gap / 2, placed = [];
+    var up = size * 0.95 + hh, down = size * 0.25 + hh, line = up + down + gap / 2;
+    function hit(r) { return placed.some(function (q) { return r.x1 < q.x2 && r.x2 > q.x1 && r.y1 < q.y2 && r.y2 > q.y1; }); }
+    function at(x, y, tw) { return {x: x, y: y, x1: x - hh, x2: x + tw + hh, y1: y - up, y2: y + down}; }
+    return (items || []).map(function (it) {
+      var tw = has(it.width) && it.width > 0 ? it.width : String(it.text || "").length * size * 0.6;
+      var x = Math.max(hh, Math.min(Math.min(it.x1, it.x2) + pad, w - tw - hh));
+      var top = Math.min(it.y1, it.y2), bottom = Math.max(it.y1, it.y2), k;
+      var above = top - gap - down, inside = top + pad + up, below = bottom + gap + up;
+      var ys = [above, inside];
+      for (k = 1; k <= 4 && inside + k * line + down < bottom - pad; k++) ys.push(inside + k * line);
+      ys.push(below, bottom - pad - down);
+      for (k = 1; k <= 3; k++) ys.push(above - k * line, below + k * line);
+      var pick = null, first = null;
+      ys.forEach(function (y) {
+        if (pick) return;
+        var r = at(x, y, tw);
+        if (r.y1 < 0 || r.y2 > h) return;
+        if (!first) first = r;
+        if (!hit(r)) pick = r;
+      });
+      if (!pick) pick = first || at(x, Math.max(up, Math.min(h - down, inside)), tw);
+      placed.push(pick);
+      return pick;
+    });
   }
 
   // ---- CSV -------------------------------------------------------------------------------------
@@ -424,6 +471,102 @@
     };
   }
 
+  // ---- texts of the server's answers -----------------------------------------------------------
+  function cap(t) { t = String(t || ""); return t.charAt(0).toUpperCase() + t.slice(1); }
+  function stop(t) { t = String(t || "").trim(); return t && !/[.!?]$/.test(t) ? t + "." : t; }
+  function frames(n) { return fmt.int(n) + " frame" + (n === 1 ? "" : "s"); }
+  // lc: `labelsChanged` of the run poll ({frames, changed, left, joined, unknown, stale,
+  // message}). The shell's banner (with Re-score) as text, or null when it hides: nothing
+  // differs, or not known yet (computing, the folder unreadable: no Re-score to offer). `stale`:
+  // the results were saved apart from their labels snapshot, the server's message says so.
+  // `unknown`: scored frames the walk could not read this time (neither changed nor left).
+  function labelsText(lc) {
+    if (!lc) return null;
+    var n = has(lc.frames) ? lc.frames : 0, u = has(lc.unknown) ? lc.unknown : 0;
+    var unread = u ? " " + frames(u) + " could not be read this time; a re-score keeps their figures." : "";
+    if (lc.stale) return stop(cap(lc.message || "these results were saved with other labels than the ones beside them")) + unread;
+    if (!n) return null;
+    var bits = [];
+    if (lc.changed) bits.push(fmt.int(lc.changed) + " changed");
+    if (lc.left) bits.push(fmt.int(lc.left) + " no longer reviewed");
+    if (lc.joined) bits.push(fmt.int(lc.joined) + " newly reviewed (a run scores those)");
+    return "Labels of " + frames(n) + " of Your cameras differ from this run's: " + bits.join(", ") + "." + unread;
+  }
+  // r: `rescored` of POST /v1/benchmark/rescore ({frames, runs, needRun, notRescored, unknown
+  // [file names]}): the result line.
+  function rescoredText(r) {
+    r = r || {};
+    var t = "Re-scored " + frames(r.frames || 0) + " of " + fmt.int(r.runs || 0) + " run" + (r.runs === 1 ? "" : "s") + " against the current labels.";
+    if (r.needRun) t += " Frames reviewed since the run need a new run.";
+    var un = r.unknown || [];
+    if (un.length) t += " " + frames(un.length) + " could not be read (" + un.slice(0, 3).join(", ") + (un.length > 3 ? ", and " + (un.length - 3) + " more" : "") + ") and keep their old figures; re-score again once they read.";
+    var nr = r.notRescored || [];
+    if (nr.length) t += " Not re-scored (no stored detections): " + nr.join(", ") + ".";
+    return t;
+  }
+  // d: a Compare row's `vsBest` ({value, low, high}: the row minus the best row, paired on the
+  // same frames; null for the best itself). "Not clearly different" while the 95% interval of
+  // the difference holds 0.
+  function vsBestText(d) {
+    if (!d || !has(d.value)) return null;
+    // Three decimals: differences between close rows are often under 0.01.
+    var sg = function (x) { return fmt.signed(x, 3); }, n3 = function (x) { return Number(x).toFixed(3); };
+    var iv = has(d.low) && has(d.high) ? " (95% interval of the difference " + sg(d.low) + " to " + sg(d.high) + ")" : "";
+    if (!iv) return sg(d.value) + " against the best (no interval: too few groups to tell)";
+    if (d.high < 0) return "clearly below the best by " + n3(-d.value) + iv;
+    if (d.low > 0) return "clearly above the best by " + n3(d.value) + iv;
+    return "not clearly different from the best: " + sg(d.value) + iv;
+  }
+  // How a pick was validated: folds (0 = in-sample), low (the server's low-confidence reason,
+  // shown beside it). Partly in-sample = folds with a low-confidence reason (a fold borrowed the
+  // pick on every frame).
+  function cvKind(folds, low) { return !(folds > 0) ? "in-sample" : low ? "partly" : "validated"; }
+  // The Tune view's first line: t {folds, groups, set, lowConfidence, objectiveName, suggested}.
+  function cvText(t) {
+    var k = cvKind(t.folds, t.lowConfidence), sug = t.suggested || {};
+    if (k === "in-sample") return "In-sample pick: counted on the frames it was picked on.";
+    var over = "Cross-validated over " + fmt.int(t.groups) + (t.set === "cameras" ? " camera days" : " groups") + " (" + t.folds + " folds)";
+    var fig = sug.metric ? ": " + t.objectiveName + " " + fmt.n2(sug.metric.value) + " " + fmt.ci(sug.metric) : "";
+    if (k === "partly") return over + ", partly in-sample" + fig + ".";
+    return over + (fig ? fig + " on frames the pick never saw." : ".");
+  }
+  // The Compare details' "Cross-validation" fact.
+  function cvFact(folds, low) {
+    var k = cvKind(folds, low);
+    return k === "in-sample" ? "in-sample (too little data)" : folds + " folds" + (k === "partly" ? ", partly in-sample" : "");
+  }
+
+  // ---- latest request wins --------------------------------------------------------------------
+  // For a view a select (or a reload) fetches: begin() aborts the request before it and returns a
+  // ticket {init (fetch options with its signal), current(), wins(answer)}. wins(answer) is true
+  // for the latest ticket's real answer only (an array: all of them) and ends it; an aborted
+  // answer, or any answer of a ticket a newer begin() replaced, is false: the caller drops it and
+  // leaves the page (error line, busy mark) to the newer one. stop() aborts the one in flight;
+  // busy() says whether one is. `make` builds the AbortController (default: the browser's; none:
+  // answers still go by the sequence).
+  function latest(make) {
+    var cur = null, n = 0;
+    make = make || function () { return typeof root.AbortController === "function" ? new root.AbortController() : null; };
+    function stop() { var t = cur; cur = null; if (t && t.ctl) t.ctl.abort(); }
+    return {
+      begin: function () {
+        stop();
+        var ctl = make(), t = {n: ++n, ctl: ctl, init: ctl ? {signal: ctl.signal} : {}};
+        t.current = function () { return cur === t; };
+        t.wins = function (j) {
+          if (cur !== t) return false;
+          cur = null;
+          var list = Array.isArray(j) ? j : [j];
+          return !list.some(function (x) { return x && x.aborted; });
+        };
+        cur = t;
+        return t;
+      },
+      stop: stop,
+      busy: function () { return cur !== null; }
+    };
+  }
+
   // ---- glossary --------------------------------------------------------------------------------
   var TERMS = {
     oof: "Cross-validated: the confidence is picked on the other camera days (single images on public sets) and counted on the frames it never saw, so the number holds on new frames.",
@@ -452,17 +595,17 @@
 
   root.BenchCore = {
     has: has, fmt: fmt, GOALS: GOALS, TUNE_FOR: TUNE_FOR, goalOf: goalOf, parseGoal: parseGoal, goalSpec: goalSpec,
-    targetProblem: targetProblem, goalPairs: goalPairs, encodePairs: encodePairs, tryParams: tryParams, withTry: withTry,
-    withoutTry: withoutTry, rowChips: rowChips, COLUMNS: COLUMNS, columnsOf: columnsOf, columnsText: columnsText,
+    targetProblem: targetProblem, goalPairs: goalPairs, tryParams: tryParams, withTry: withTry,
+    withoutTry: withoutTry, rowChips: rowChips, COLUMNS: COLUMNS, columnsOf: columnsOf,
     columnValue: columnValue, agreementText: agreementText, loadText: loadText, firstLoadText: firstLoadText, comboStates: comboStates,
     sameDevice: sameDevice, cpuReference: cpuReference, estimate: estimate, burstSeconds: burstSeconds, burstFacts: burstFacts, mapHash: mapHash, disagree: disagree,
-    boxRect: boxRect, compareCsv: compareCsv, rangeText: rangeText, placeLabels: placeLabels, cellTag: cellTag, TERMS: TERMS, store: store
+    compareCsv: compareCsv, rangeText: rangeText, placeLabels: placeLabels, labelSize: labelSize, placeBoxLabels: placeBoxLabels, cellTag: cellTag, latest: latest, labelsText: labelsText, rescoredText: rescoredText, vsBestText: vsBestText, cvText: cvText, cvFact: cvFact, TERMS: TERMS, store: store
   };
   root.BenchTags = {cellTag: cellTag};
   root.BenchPoll = {runUri: runUri, step: step};
   var PB = root.PrismBench = root.PrismBench || {};
   PB.tipText = tipText; PB.has = has;
-  PB.fmt = {thr: fmt.n2, ms: fmt.ms, pct: function (v) { return fmt.pct(v); }};
+  PB.fmt = {ms: fmt.ms}; // bench-charts.js
 
   // ---- document helpers (called in a browser only) -----------------------------------------------
   // el(tag, cls, text) or el(tag, {attr: value, text, class}, children).
@@ -492,8 +635,13 @@
   function why(r) {
     return r.status === 403 ? " (refused: admin actions must come from this server's own HTTPS pages)" : r.status === 404 ? "" : r.status >= 500 ? " (see the Logs page)" : "";
   }
+  // A request given up by its caller (AbortController): before the headers or while the body is
+  // read. The caller ignores it (a newer request took its place).
+  function aborted(e) { return !!(e && e.name === "AbortError"); }
+  var ABORTED = {success: false, aborted: true, _status: 0, message: "cancelled"};
   function answer(r) {
-    return r.json().then(function (j) { if (j && typeof j === "object") j._status = r.status; return j; }, function () {
+    return r.json().then(function (j) { if (j && typeof j === "object") j._status = r.status; return j; }, function (e) {
+      if (aborted(e)) return Object.assign({}, ABORTED);
       return {success: false, _status: r.status, message: "The server answered HTTP " + r.status + why(r) + "."};
     });
   }
@@ -503,8 +651,7 @@
   };
   PB.getJSON = function (url, init) {
     return fetch(url, Object.assign({cache: "no-store", headers: {"Accept": "application/json"}}, init || {})).then(answer, function (e) {
-      if (e && e.name === "AbortError") return {success: false, aborted: true, _status: 0, message: "cancelled"};
-      return offline();
+      return aborted(e) ? Object.assign({}, ABORTED) : offline();
     });
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);

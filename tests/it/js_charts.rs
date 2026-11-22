@@ -88,7 +88,7 @@ function load(vw, coarse) {
   const window = {
     innerWidth: vw,
     matchMedia: q => ({matches: q === '(pointer: coarse)' ? coarse : false}),
-    PrismBench: {el: (t, c, x) => { const e = new N(t); if (c) e.className = c; if (x !== undefined) e.textContent = x; return e; }, has, fmt: {thr: v => String(v), ms: v => v + ' ms', pct: v => v + '%'}},
+    PrismBench: {el: (t, c, x) => { const e = new N(t); if (c) e.className = c; if (x !== undefined) e.textContent = x; return e; }, has, fmt: {ms: v => v + ' ms'}},
   };
   const ctx = vm.createContext({console, document, window, setTimeout});
   vm.runInContext(src, ctx);

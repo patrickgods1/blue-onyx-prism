@@ -373,6 +373,9 @@ pub struct Row {
     /// Its rank group's leader (`model on device`), when not itself.
     pub leader: Option<String>,
     pub vs_leader: Option<Difference>,
+    /// Its paired difference from the best row (the first of the `ok` block), for the rows of
+    /// that block but the best itself: what the headline's "not clearly different" reads.
+    pub vs_best: Option<Difference>,
     pub recall: Option<f64>,
     pub precision: Option<f64>,
     pub f1: Option<f64>,
@@ -476,19 +479,39 @@ fn frames_of(set: &CompareSet<'_>, map: &ClassMap, c: &Combo<'_>, classes: &[Str
     f
 }
 
-fn speed_of(set: &CompareSet<'_>, c: &Combo<'_>) -> Speed {
-    let by: HashMap<(&str, &str), f64> = c
-        .run
-        .per_image
+/// The one-at-a-time request times (ms) of `per_image` on the frames `frames` names (set id,
+/// file), in their order: the basis of a set's p50 / p95 / p99 and of the grade's speed
+/// wherever a grade is shown (Compare, Tune, the history's goal metric).
+pub(crate) fn times_on<'a>(
+    per_image: &[crate::benchmark::ImageRun],
+    frames: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<f64> {
+    let by: HashMap<(&str, &str), f64> = per_image
         .iter()
         .map(|i| ((i.set.as_str(), i.file.as_str()), i.total_ms))
         .collect();
-    let times: Vec<f64> = set
-        .images
-        .iter()
-        .filter_map(|i| by.get(&(i.set.id.as_str(), i.info.file.as_str())).copied())
+    frames
+        .into_iter()
+        .filter_map(|k| by.get(&k).copied())
         .filter(|t| t.is_finite())
-        .collect();
+        .collect()
+}
+
+/// The p50 of [`times_on`]: the grade's speed on those frames.
+pub(crate) fn p50_on<'a>(
+    per_image: &[crate::benchmark::ImageRun],
+    frames: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<f64> {
+    pct_of(&times_on(per_image, frames), 50.0)
+}
+
+fn speed_of(set: &CompareSet<'_>, c: &Combo<'_>) -> Speed {
+    let times = times_on(
+        &c.run.per_image,
+        set.images
+            .iter()
+            .map(|i| (i.set.id.as_str(), i.info.file.as_str())),
+    );
     let st = &c.run.stages_ms;
     let burst = c.run.burst.as_ref().map(BurstSpeed::of);
     Speed {
@@ -814,6 +837,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
             block: Block::Ok,
             leader: None,
             vs_leader: None,
+            vs_best: None,
             recall: p.recall(),
             precision: p.precision(),
             f1: p.f_beta(1.0),
@@ -834,11 +858,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
             served_threshold,
             at_saved: served_threshold.and_then(|t| at_point(&a, t)),
             at_suggested: a.suggested_threshold().and_then(|t| at_point(&a, t)),
-            folds: if a.low_confidence.is_some() {
-                0
-            } else {
-                a.cv.k
-            },
+            folds: if a.in_sample { 0 } else { a.cv.k },
             agreement: c
                 .run
                 .agreement
@@ -898,6 +918,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
         r.rank = p.rank;
         r.block = p.block;
         r.vs_leader = p.vs_leader;
+        r.vs_best = p.vs_best;
         r.leader = l;
     }
     let mut by_index: Vec<Option<Row>> = rows.into_iter().map(Some).collect();
@@ -973,7 +994,8 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
     view
 }
 
-/// One sentence: the best combo, those not clearly different, or why nothing meets the goal.
+/// One sentence: the best combo, the ok rows not clearly different from it ([`Row::vs_best`]),
+/// or why nothing meets the goal.
 pub fn headline(rows: &[Row], goal: &Goal) -> String {
     let metric = goal.optimize_for.short();
     let within = if goal.speed_budget_ms.is_some() {
@@ -1003,10 +1025,12 @@ pub fn headline(rows: &[Row], goal: &Goal) -> String {
             why.join(", ")
         );
     };
+    // Exactly the ok rows whose paired difference from the best row is not clearly below 0
+    // (whatever rank group a row landed in).
     let ties: Vec<String> = rows
         .iter()
         .skip(1)
-        .filter(|r| r.block == Block::Ok && r.rank == best.rank)
+        .filter(|r| r.block == Block::Ok && !r.vs_best.is_some_and(|d| d.clearly_below()))
         .map(|r| format!("{} on {}", r.model, r.device))
         .collect();
     let mut s = format!(
@@ -1022,7 +1046,7 @@ pub fn headline(rows: &[Row], goal: &Goal) -> String {
         _ => s.push_str(&format!("; {} are not clearly different", ties.join(", "))),
     }
     if best.flags.low_confidence.is_some() {
-        s.push_str(" (low confidence: little data)");
+        s.push_str(" (low confidence)");
     }
     s.push('.');
     s

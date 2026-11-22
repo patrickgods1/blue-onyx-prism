@@ -30,6 +30,8 @@ pub fn forget_model(results_file: &Path, name: &str) -> Result<Forgotten> {
     let key = normalize_name(name);
     let same = |m: &str| normalize_name(m) == key;
     let mut out = Forgotten::default();
+    // One load-modify-save of the results files at a time.
+    let _held = super::results_io::lock(results_file, super::results_io::Holder::Writer)?;
 
     if let Some(mut r) = BenchmarkResults::load(results_file)? {
         let before = r.models.len();

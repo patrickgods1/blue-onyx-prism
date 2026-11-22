@@ -622,6 +622,8 @@ pub(crate) fn pseudo_ground_truth(
         burst: None,
         #[cfg(test)]
         slow_eval: None,
+        #[cfg(test)]
+        slow_read: None,
     };
     let run = pb
         .run_exact(runtimes, &job, device)

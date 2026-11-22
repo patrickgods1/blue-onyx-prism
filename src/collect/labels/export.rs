@@ -779,6 +779,13 @@ pub struct Selection {
     /// Reviewed frames whose label file changed while the walk read them ([`reviewed_snapshot`]
     /// only): left out, never read half-way.
     pub changed: usize,
+    /// The [`flat_name`]s of the frames this walk could not judge: changed while read, a label
+    /// file or sidecar that does not read, an image or sidecar gone from a frame that may be
+    /// reviewed. Whether they are still reviewed is unknown (a reader that compares with an
+    /// earlier walk must not take them as gone).
+    pub unsure: BTreeSet<String>,
+    /// The folders of [`Self::unreadable_folders`]: their frames are unknown too.
+    pub unreadable_dirs: Vec<PathBuf>,
 }
 
 /// Whether the label file at `path` is, or may be, of a reviewed frame.
@@ -886,6 +893,8 @@ fn select_with(
 ) -> Selection {
     let mut filtered_out = 0;
     let mut changed = 0;
+    let mut unsure = BTreeSet::new();
+    let flat_of = |rel: &str| layout::parse_rel(rel).map(|r| flat_name(&r));
     let mut revisions = BTreeMap::new();
     let mut warnings = Vec::new();
     let mut frames = Vec::new();
@@ -929,10 +938,12 @@ fn select_with(
                 continue;
             }
             ReadFrame::Failed(e) => {
+                unsure.extend(flat_of(&rel));
                 warnings.push(format!("{rel}: {e}; left out"));
                 continue;
             }
             ReadFrame::Changed => {
+                unsure.extend(flat_of(&rel));
                 changed += 1;
                 continue;
             }
@@ -983,6 +994,7 @@ fn select_with(
             .copied()
             .unwrap_or(Split::Train);
     }
+    unsure.extend(lost.iter().filter_map(|rel| flat_of(rel)));
     if !lost.is_empty() {
         warnings.push(lost_warning(&lost));
     }
@@ -994,6 +1006,8 @@ fn select_with(
         unreadable_folders: scan.unreadable.len(),
         revisions,
         changed,
+        unsure,
+        unreadable_dirs: scan.unreadable,
     }
 }
 

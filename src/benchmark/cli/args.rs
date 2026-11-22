@@ -253,12 +253,15 @@ fn parse_variants_arg(s: &str) -> Result<crate::benchmark::variant::VariantList,
 }
 
 fn parse_goal_arg(s: &str) -> Result<String, String> {
-    s.parse::<crate::benchmark::eval::Optimize>()
-        .map(|_| s.to_string())
+    let o = s.parse::<crate::benchmark::eval::Optimize>()?;
+    if let Some(o) = o.objective() {
+        o.reachable()?;
+    }
+    Ok(s.to_string())
 }
 
 fn parse_objective_text(s: &str) -> Result<String, String> {
-    s.parse::<Objective>().map(|_| s.to_string())
+    Objective::parse_target(s).map(|_| s.to_string())
 }
 
 fn parse_budget_arg(s: &str) -> Result<String, String> {
@@ -266,7 +269,7 @@ fn parse_budget_arg(s: &str) -> Result<String, String> {
 }
 
 fn parse_objective_arg(s: &str) -> Result<Objective, String> {
-    s.parse()
+    Objective::parse_target(s)
 }
 
 fn parse_metric_arg(s: &str) -> Result<AccuracyMetric, String> {

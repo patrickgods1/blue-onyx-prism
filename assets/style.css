@@ -2001,7 +2001,8 @@ button.bn-thumb .bn-cap { position: absolute; left: 0; right: 0; bottom: 0; font
 .bn-box.ign { stroke: var(--muted); stroke-dasharray: 2 3; }
 .bn-big-img { position: relative; width: 100%; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden; background: var(--code-bg); }
 .bn-big-img .bn-box { stroke-width: 3; }
-.bn-big-img text { font-size: 13px; paint-order: stroke; stroke: #000; stroke-width: 3px; fill: #fff; }
+/* Labels: font-size and halo width are set by bench-frames.js (BenchCore.labelSize) in the image's pixels. */
+.bn-big-img text { paint-order: stroke; stroke: #000; stroke-linejoin: round; fill: #fff; }
 .bn-lg { display: inline-flex; align-items: center; gap: 0.3rem; margin-right: 0.8rem; font-size: 0.82rem; }
 .bn-lg i { width: 0.9rem; height: 0.6rem; border: 2px solid var(--box-ok); display: inline-block; border-radius: 2px; }
 .bn-lg i.miss { border-color: var(--box-miss); border-style: dashed; } .bn-lg i.fp { border-color: var(--box-fp); }

@@ -361,17 +361,18 @@ impl WorkerCtx {
         let Some(eng) = engine.as_ref() else {
             // Only reachable for a lazy model (between the server's trigger and the state
             // update) or after a failed load: answer at once, never block.
-            let msg = match self.state.get() {
-                ModelState::Failed(_) => {
-                    self.metrics.record_drop(DropReason::Failed);
-                    self.unavailable_message()
-                }
-                _ => {
-                    self.metrics.record_drop(DropReason::Initializing);
-                    initializing_message(name, self.state.detail().as_deref())
-                }
+            let (reason, msg) = match self.state.get() {
+                ModelState::Failed(_) => (DropReason::Failed, self.unavailable_message()),
+                _ => (
+                    DropReason::Initializing,
+                    initializing_message(name, self.state.detail().as_deref()),
+                ),
             };
-            let _ = meta.reply.send(self.error_response(msg, 0, 0));
+            self.metrics.record_drop(reason);
+            let _ = meta.reply.send(VisionDetectionResponse {
+                dropped: Some(reason),
+                ..self.error_response(msg, 0, 0)
+            });
             return;
         };
         trace!(
