@@ -192,6 +192,7 @@ mod tests {
             height: 1,
             tags: vec![],
             objects: None,
+            scene: None,
         };
         let mut m = model(vec![], None);
         m.model = "custom".into();

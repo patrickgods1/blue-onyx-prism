@@ -23,8 +23,8 @@ use crate::benchmark::service::breadcrumb::{self, Trail};
 use crate::benchmark::threshold::Objective;
 use crate::benchmark::{
     Bench, BenchmarkResults, Comparison, Job, MATCH_IOU, ModelResult, Phase, SweepOptions, compare,
-    config_models, configured_device, export, job_for_config, job_for_file, no_pseudo_gt_device,
-    pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path,
+    config_models, configured_device, export, job_as_served, job_for_config, job_for_file,
+    no_pseudo_gt_device, pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path,
 };
 use crate::config::{Config, DatasetRef, ModelConfig};
 use crate::config_form::{
@@ -100,8 +100,9 @@ fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<V
             });
         }
     } else {
+        // Each model compiled and thresholded as its worker would (B4, B5).
         for m in config_models(config)? {
-            match job_for_config(config, m, device_override.as_deref()) {
+            match job_as_served(config, m, device_override.as_deref(), None) {
                 Ok(job) => out.push(Planned {
                     job,
                     entry: Some(m.clone()),
@@ -115,7 +116,9 @@ fn jobs(args: &BenchArgs, config: &Config, errors: &mut Vec<String>) -> Result<V
             p.job.family = f;
         }
         if let Some(c) = args.min_confidence {
+            // Asked for on the command line: this threshold on every device.
             p.job.confidence_threshold = Some(c);
+            p.job.device_thresholds.clear();
         }
     }
     Ok(with_variants(out, args, config, errors))
@@ -427,6 +430,9 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     bench.threshold_objective = objective;
     bench.accuracy_metric = metric;
     bench.priority = priority::PER_DEVICE.then_some(&per_device);
+    // Windows: the GPU's video-decode load during each timed phase (another process's decode,
+    // such as Blue Iris', shares the iGPU).
+    bench.video_decode = true;
 
     let run_id = crate::benchmark::history::new_run_id();
     let mut swept = ctx.run_jobs(&mut bench, &progress, &jobs, all_devices, &mut report)?;

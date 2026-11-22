@@ -94,10 +94,11 @@ fn device_row(m: &ModelResult, d: &DeviceResult) -> Vec<String> {
             let [o, a, s] = grade_cells(r);
             vec![
                 device,
-                format!("{:.0}", r.compile_ms),
+                super::report::first_load_text(r.compile_ms, &r.cache),
                 msf(r.stages_ms.infer.p50),
                 msf(r.stages_ms.total.p50),
                 msf(r.stages_ms.total.p95),
+                r.stages_ms.total.p99_of().map_or("-".to_string(), msf),
                 format!("{:.1}", r.throughput_fps),
                 pct(acc.and_then(|s| s.ap50)),
                 pct(acc.and_then(|s| s.ap50_95)),
@@ -112,7 +113,7 @@ fn device_row(m: &ModelResult, d: &DeviceResult) -> Vec<String> {
         }
         (Some(r), _) => {
             let mut v = vec![device, format!("fell back to {}", r.device)];
-            v.resize(15, String::new());
+            v.resize(16, String::new());
             v
         }
         (None, e) => {
@@ -120,7 +121,7 @@ fn device_row(m: &ModelResult, d: &DeviceResult) -> Vec<String> {
                 device,
                 format!("failed: {}", e.as_deref().unwrap_or("did not run")),
             ];
-            v.resize(15, String::new());
+            v.resize(16, String::new());
             v
         }
     }
@@ -624,15 +625,17 @@ fn model_section(m: &ModelResult) -> Section {
     if !m.skipped.is_empty() {
         paragraphs.push(format!("Not runnable here: {}", m.skipped.join("; ")));
     }
+    paragraphs.extend(m.shared_load_warnings());
     let mut tables = vec![Table {
         title: "Devices".into(),
         numbers: Numbers::default(),
         head: [
             "device",
-            "load ms",
+            "first load",
             "infer p50",
             "total p50",
             "total p95",
+            "total p99",
             "req/s",
             "AP50",
             "AP50-95",

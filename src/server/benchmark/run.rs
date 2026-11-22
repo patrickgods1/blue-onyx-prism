@@ -192,6 +192,8 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         runtimes: state.registry.runtimes().cloned(),
         loaded: loaded_devices(state),
         resources: state.resources.clone(),
+        profile: state.registry.profile().map(|(p, _)| p.clone()),
+        metrics: Some(state.metrics.clone()),
     };
     info!(
         models = ?req.models,
@@ -514,6 +516,8 @@ fn images_detail_blocking(state: &AppState, q: &HashMap<String, String>) -> Resp
                 "counts": r.counts,
                 "totalMs": r.total_ms,
                 "inferMs": r.infer_ms,
+                // The scene the service computes for the frame (None: an older run).
+                "scene": r.scene.or(info.and_then(|i| i.scene)),
             })
         })
         .collect();

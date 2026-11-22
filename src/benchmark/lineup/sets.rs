@@ -270,6 +270,7 @@ mod tests {
             height: 10,
             tags: tags.iter().map(ToString::to_string).collect(),
             objects: labelled.then(Vec::new),
+            scene: None,
         }
     }
 

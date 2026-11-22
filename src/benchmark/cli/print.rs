@@ -631,7 +631,8 @@ pub(super) fn model_report(m: &ModelResult) -> Result<ModelReport> {
     })
 }
 
-/// Short agreement text for tables: "ref", "ok", "minor (2/3)", "BAD (0/3)", "-".
+/// Short agreement text for tables: "ref", "ok", "minor (2/3)", "BAD (0/3)", "unchecked",
+/// "-".
 pub(crate) fn agreement_text(r: &RunResult) -> String {
     match &r.agreement {
         None => "-".to_string(),
@@ -644,6 +645,7 @@ pub(crate) fn agreement_text(r: &RunResult) -> String {
                 Verdict::Agrees => "ok".to_string(),
                 Verdict::Minor => format!("minor ({}/{total})", a.matched),
                 Verdict::Disagrees => format!("BAD ({}/{total})", a.matched),
+                Verdict::NotChecked => "unchecked".to_string(),
             }
         }
     }
@@ -678,13 +680,14 @@ pub(super) fn print_device_table(result: &ModelResult, m: &ModelReport) {
         m.primary.model, m.primary.images, m.primary.repeat
     );
     println!(
-        "  {:<16} {:<26} {:>7} {:>9} {:>9} {:>9} {:>7} {:>6} {:>6} {:>6} {:>5} {:>5} {:<7} {:<12}",
+        "  {:<16} {:<26} {:>16} {:>9} {:>9} {:>9} {:>9} {:>7} {:>6} {:>6} {:>6} {:>5} {:>5} {:<7} {:<12}",
         "requested",
         "device",
-        "compile",
+        "first load",
         "infer p50",
         "total p50",
         "total p95",
+        "total p99",
         "req/s",
         "AP50",
         "AP-95",
@@ -716,6 +719,11 @@ pub(super) fn print_device_table(result: &ModelResult, m: &ModelReport) {
     if let Some(note) = runs.iter().find_map(|r| ap_footnote(r)) {
         println!("  {note}");
     }
+    for r in &runs {
+        if let Some(w) = crate::benchmark::report::shared_load_text(r) {
+            println!("  {}: {w}", r.requested_device);
+        }
+    }
 }
 
 /// `AP50 / AP50-95: average over car, person (>= 20 objects each)`, or None without a recorded
@@ -744,13 +752,17 @@ pub(super) fn device_row(r: &RunResult, marks: &[&str]) -> String {
         )
     });
     format!(
-        "  {:<16} {:<26} {:>7.0} {:>9.2} {:>9.2} {:>9.2} {:>7.1} {:>6} {:>6} {:>6} {:>5} {:>5} {:<7} {:<12}{}",
+        "  {:<16} {:<26} {:>16} {:>9.2} {:>9.2} {:>9.2} {:>9} {:>7.1} {:>6} {:>6} {:>6} {:>5} {:>5} {:<7} {:<12}{}",
         r.requested_device,
         name,
-        r.compile_ms,
+        crate::benchmark::report::first_load_text(r.compile_ms, &r.cache),
         r.stages_ms.infer.p50,
         r.stages_ms.total.p50,
         r.stages_ms.total.p95,
+        r.stages_ms
+            .total
+            .p99_of()
+            .map_or("-".to_string(), |v| format!("{v:.2}")),
         r.throughput_fps,
         pct1(acc.and_then(|a| a.ap50)),
         pct1(acc.and_then(|a| a.ap50_95)),
@@ -829,9 +841,40 @@ pub(super) fn print_resolution_speeds(p: &RunResult) {
 
 pub(super) fn stats_row(name: &str, s: &Stats) -> String {
     format!(
-        "  {name:<12} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9.2}",
-        s.min, s.mean, s.p50, s.p95, s.max
+        "  {name:<12} {:>9.2} {:>9.2} {:>9.2} {:>9.2} {:>9} {:>9.2}",
+        s.min,
+        s.mean,
+        s.p50,
+        s.p95,
+        s.p99_of().map_or("-".to_string(), |v| format!("{v:.2}")),
+        s.max
     )
+}
+
+/// The run's setup line: first load, compile tuning, warm-up and the served threshold.
+pub(super) fn setup_line(r: &RunResult) -> String {
+    let mut parts = vec![format!(
+        "first load {}",
+        crate::benchmark::report::first_load_text(r.compile_ms, &r.cache)
+    )];
+    if let Some(t) = &r.tuning {
+        parts.push(format!("compiled as served: {}", t.describe()));
+    }
+    parts.push(if r.warmup_runs > 0 || r.warmup_iterations == 0 {
+        format!(
+            "warm-up {} runs in {:.0} ms (at least {})",
+            r.warmup_runs, r.warmup_ms, r.warmup_iterations
+        )
+    } else {
+        format!("warm-up {} x in {:.1} ms", r.warmup_iterations, r.warmup_ms)
+    });
+    if let Some(t) = r.served_threshold {
+        parts.push(format!(
+            "threshold {t:.2} ({})",
+            r.served_threshold_source.as_deref().unwrap_or("?")
+        ));
+    }
+    format!("  {}", parts.join(" | "))
 }
 
 pub(super) fn print_run(r: &RunResult) {
@@ -856,13 +899,10 @@ pub(super) fn print_run(r: &RunResult) {
         "  path {} | input {} | image {}",
         r.path, r.input, r.image_size
     );
+    println!("{}", setup_line(r));
     println!(
-        "  compile {:.0} ms (cache: {}) | warmup {} x in {:.1} ms",
-        r.compile_ms, r.cache, r.warmup_iterations, r.warmup_ms
-    );
-    println!(
-        "  {:<12} {:>9} {:>9} {:>9} {:>9} {:>9}   (ms, {} runs)",
-        "stage", "min", "mean", "p50", "p95", "max", r.repeat
+        "  {:<12} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}   (ms, {} runs)",
+        "stage", "min", "mean", "p50", "p95", "p99", "max", r.repeat
     );
     let s = &r.stages_ms;
     println!("{}", stats_row("decode", &s.decode));
@@ -874,7 +914,7 @@ pub(super) fn print_run(r: &RunResult) {
         "  throughput {:.1} img/s ({}) | {} detections (first image) | {} image(s): {}",
         r.throughput_fps,
         if r.pipelined {
-            "pipelined: next image decoded during inference"
+            "one request at a time, the next image decoded during it; the service overlaps more"
         } else {
             "one image at a time"
         },
@@ -897,6 +937,9 @@ pub(super) fn print_run(r: &RunResult) {
         if let Some(note) = ap_footnote(r) {
             println!("  {note}");
         }
+    }
+    if let Some(w) = crate::benchmark::report::shared_load_text(r) {
+        println!("  {w}");
     }
     if let Some(g) = &r.grades {
         println!(
@@ -989,6 +1032,13 @@ mod tests {
             cache: String::new(),
             warmup_iterations: 0,
             warmup_ms: 0.0,
+            warmup_runs: 0,
+            tuning: None,
+            served_threshold: None,
+            served_threshold_source: None,
+            live_requests: None,
+            live_requests_per_min: None,
+            video_decode_pct: None,
             repeat: 1,
             stages_ms: Default::default(),
             throughput_fps: 0.0,
@@ -1015,6 +1065,7 @@ mod tests {
             mean_confidence_diff: 0.0,
             score: 0.0,
             verdict,
+            images: 1,
         };
         r.agreement = Some(a(Verdict::Minor, 2, 0, 1));
         assert_eq!(agreement_text(&r), "minor (2/3)");
@@ -1022,6 +1073,8 @@ mod tests {
         assert_eq!(agreement_text(&r), "BAD (0/3)");
         r.agreement = Some(a(Verdict::Reference, 3, 0, 0));
         assert_eq!(agreement_text(&r), "ref");
+        r.agreement = Some(Agreement::not_checked());
+        assert_eq!(agreement_text(&r), "unchecked");
         // BM-07: counts near usize::MAX from a hand-edited benchmark.json do not overflow.
         r.agreement = Some(a(Verdict::Minor, usize::MAX, usize::MAX, 1));
         assert_eq!(

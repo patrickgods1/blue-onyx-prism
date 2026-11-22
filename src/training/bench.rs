@@ -664,6 +664,8 @@ mod tests {
             runtimes: None,
             loaded: Default::default(),
             resources: None,
+            profile: None,
+            metrics: None,
         }
     }
 

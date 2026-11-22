@@ -2094,6 +2094,8 @@ impl Hooks for CliHooks {
             runtimes: None,
             loaded: Default::default(),
             resources: None,
+            profile: None,
+            metrics: None,
         };
         super::bench::run(
             &svc,

@@ -82,6 +82,8 @@ struct ScriptState {
     released: Option<Result<Vec<NamedOutput>, String>>,
     /// Hung inferences waiting for a release: their completion channel, slot and sequence.
     hung: Vec<(Sender<Completion>, usize, u64)>,
+    /// Every compile: the device spec and the tuning it was asked for, in order.
+    compiles: Vec<(String, crate::profile::DeviceTuning)>,
 }
 
 #[derive(Debug, Default)]
@@ -155,6 +157,11 @@ impl FakeScript {
             .count()
     }
 
+    /// Every compile so far: (device spec, the tuning `compile_tuned` was given).
+    pub(crate) fn compiles(&self) -> Vec<(String, crate::profile::DeviceTuning)> {
+        self.shared.state.lock_recover().compiles.clone()
+    }
+
     /// Steps not taken yet.
     pub(crate) fn remaining(&self) -> usize {
         self.shared.state.lock_recover().steps.len()
@@ -194,8 +201,20 @@ impl FakeScript {
         (inputs, outputs)
     }
 
-    /// "Compile" for `req` on `device` (what `Runtimes::compile_tuned` returns in a fake runtime).
-    pub(crate) fn compile(&self, req: &LoadRequest, device: &str, fell_back: bool) -> FakeCompiled {
+    /// "Compile" for `req` on `device` with `tuning` (what `Runtimes::compile_tuned` returns in a
+    /// fake runtime; the tuning is logged, [`Self::compiles`], and its hint reported back).
+    pub(crate) fn compile(
+        &self,
+        req: &LoadRequest,
+        device: &str,
+        fell_back: bool,
+        tuning: &crate::profile::DeviceTuning,
+    ) -> FakeCompiled {
+        self.shared
+            .state
+            .lock_recover()
+            .compiles
+            .push((device.to_string(), *tuning));
         let (inputs, outputs) = self.ports();
         FakeCompiled {
             info: ModelInfo {
@@ -215,6 +234,7 @@ impl FakeScript {
                 compile_ms: 0,
             },
             script: self.clone(),
+            hint: tuning.hint,
         }
     }
 }
@@ -224,6 +244,7 @@ impl FakeScript {
 pub struct FakeCompiled {
     pub(crate) info: ModelInfo,
     script: FakeScript,
+    hint: crate::profile::PerfHint,
 }
 
 impl FakeCompiled {
@@ -232,6 +253,7 @@ impl FakeCompiled {
         let slots = self.script.slots;
         FakeBackend {
             info: self.info,
+            hint: self.hint,
             slots: (0..slots).map(|_| Slot::Idle).collect(),
             // The worker warms every slot up through `submit` (slot 0 first, timed).
             warmup_left: slots,
@@ -254,6 +276,8 @@ enum Slot {
 #[derive(Debug)]
 pub struct FakeBackend {
     info: ModelInfo,
+    /// The hint it was "compiled" with.
+    hint: crate::profile::PerfHint,
     script: FakeScript,
     slots: Vec<Slot>,
     /// Submits still owed to the warm-up of slots 1.. (they do not consume steps).
@@ -270,6 +294,10 @@ impl FakeBackend {
 
     pub(crate) fn slots(&self) -> usize {
         self.slots.len()
+    }
+
+    pub(crate) fn hint(&self) -> crate::profile::PerfHint {
+        self.hint
     }
 
     pub(crate) fn completions(&self) -> &Receiver<Completion> {
@@ -455,7 +483,14 @@ mod tests {
             gpu_precision: None,
             no_cache: false,
         };
-        let b = script.compile(&req, "openvino:cpu", false).into_backend();
+        let b = script
+            .compile(
+                &req,
+                "openvino:cpu",
+                false,
+                &crate::profile::DeviceTuning::SERIAL,
+            )
+            .into_backend();
         (script, b)
     }
 

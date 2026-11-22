@@ -1,19 +1,21 @@
 //! Benchmark core shared by the `blue-onyx-prism-benchmark` binary, the `benchmark` subcommand
 //! and the web UI's Benchmark page.
 //!
-//! A run compiles a model on a device, warms it up, then sends every image of the chosen
-//! datasets ([`images`]) through the production per-request stages (decode -> preprocess ->
-//! infer -> postprocess, the code `worker.rs` runs), one image at a time on one thread with one
-//! infer request, `repeat` timed times per image. The service is faster than these per-image
-//! latencies imply: it decodes and preprocesses on a pool while inferring and can keep several
-//! inferences in flight (`crate::profile`), so measure its throughput with
-//! `test-blue-onyx-prism --repeat 200 --parallel 6`. Timing
-//! uses the model's configured confidence threshold; the same inference outputs are also
+//! A run compiles a model on a device as its worker would (the same tuning, B4), warms it up,
+//! then sends every image of the chosen datasets ([`images`]) through the production per-request
+//! stages (decode with the frame's scene -> preprocess -> infer -> postprocess, the code
+//! `worker.rs` runs), one image at a time on one thread with one infer request, `repeat` timed
+//! times per image (see `run.rs` for what is timed and recorded). The service is faster than
+//! these per-image latencies imply: it decodes and preprocesses on a pool while inferring and can
+//! keep several inferences in flight (`crate::profile`), so measure its throughput with
+//! `test-blue-onyx-prism --repeat 200 --parallel 6`. Timing uses the confidence threshold the
+//! service uses on the device the model loaded on (B5); the same inference outputs are also
 //! post-processed (untimed) at [`EVAL_CONFIDENCE`] for AP. Accuracy ([`metrics`]) is measured
 //! against the dataset's ground truth, or against pseudo ground truth from a reference model
 //! (`pseudo_ground_truth`) for datasets without it; [`grade`] turns accuracy and speed into
 //! letter grades. [`sweep`] runs one model on every chosen device, checks each device's
-//! detections against a CPU reference device and recommends a device ([`report::recommend`]).
+//! detections against a CPU reference device when one ran (image by image, B7; else every
+//! device is "not checked") and recommends a device ([`report::recommend`]).
 //! [`report`] holds the persisted results (`benchmark.json` next to the config file),
 //! [`history`] the run history beside it (`benchmark-history.json`: what changed between runs),
 //! [`service`] the background run behind `/v1/benchmark`, [`cli`] the command line, and
@@ -55,7 +57,10 @@ pub use report::{
 };
 
 pub use metrics::ClassRecall;
-pub use run::{Bench, Cancelled, Phase, Progress, ReadAhead, is_cancelled};
+pub use run::{
+    Bench, Cancelled, Phase, Progress, ReadAhead, WARMUP_IMAGES, WARMUP_MAX_RUNS, WARMUP_MAX_TIME,
+    WARMUP_MIN_TIME, WarmupRule, is_cancelled,
+};
 pub(crate) use scoring::{
     REFERENCE_DEVICES, no_pseudo_gt_device, pseudo_ground_truth, pseudo_gt_device,
 };
@@ -97,13 +102,16 @@ pub(crate) const PSEUDO_IGNORE_CONFIDENCE: f32 = 0.3;
 /// Predictions kept per image in the results (drill-down), most confident first.
 pub(crate) const MAX_STORED_PREDS: usize = 100;
 
-/// min / mean / p50 / p95 / max in milliseconds.
+/// min / mean / p50 / p95 / p99 / max in milliseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct Stats {
     pub min: f64,
     pub mean: f64,
     pub p50: f64,
     pub p95: f64,
+    /// 0 in results saved before it was recorded ([`Stats::p99_of`] tells them apart).
+    #[serde(default)]
+    pub p99: f64,
     pub max: f64,
 }
 
@@ -120,8 +128,14 @@ impl Stats {
             mean: s.iter().sum::<f64>() / s.len() as f64,
             p50: percentile(&s, 50.0),
             p95: percentile(&s, 95.0),
+            p99: percentile(&s, 99.0),
             max: s.last().copied().unwrap_or(0.0),
         }
+    }
+
+    /// The p99, None for results saved before it was recorded (0 with samples above 0).
+    pub fn p99_of(&self) -> Option<f64> {
+        (self.p99 > 0.0 || self.max <= 0.0).then_some(self.p99)
     }
 }
 
@@ -242,6 +256,13 @@ pub struct ImageRun {
     pub gt_matched: Vec<Option<bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counts: Option<Counts>,
+    /// The scene the service computes for this frame after decode
+    /// ([`crate::image_stats::ImageStats::scene`], of the frame as the set sends it: a NIR
+    /// proxy set's grayscale frames are `ir`). None in results saved before it was recorded:
+    /// the scene splits then fall back to the manifest's `day` / `night` / `ir` tags
+    /// ([`images::in_split`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<crate::image_stats::Scene>,
 }
 
 /// Metrics of a subset of images (one dataset or one tag).
@@ -500,10 +521,43 @@ pub struct RunResult {
     /// ORT CPU, CUDA, DirectML); `run::cache_status`.
     #[serde(default)]
     pub cache: String,
+    /// The warm-up asked for (`benchmark.warmup`, the minimum of [`Self::warmup_runs`]).
     #[serde(default)]
     pub warmup_iterations: usize,
+    /// Wall time of the warm-up (ms).
     #[serde(default)]
     pub warmup_ms: f64,
+    /// Warm-up runs made ([`run::WarmupRule`]: at least `warmup_iterations` and
+    /// [`run::WARMUP_MIN_TIME`] over the first [`run::WARMUP_IMAGES`] images). 0 in results saved
+    /// before the rule (they repeated the first image `warmup_iterations` times).
+    #[serde(default)]
+    pub warmup_runs: usize,
+    /// How the model was compiled on this device: its worker's tuning (B4). None in results
+    /// saved before it was recorded (compiled serially: LATENCY, one request, one session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning: Option<RunTuning>,
+    /// The confidence threshold the service uses on the device this ran on (B5: the model's
+    /// profile for the device, else its own threshold, else the global one): the production
+    /// predictions and the accuracy report's threshold use it; the CPU agreement compares both
+    /// devices at the checked device's one (`report::run_agreement`). None in
+    /// results saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_threshold: Option<f32>,
+    /// Where [`Self::served_threshold`] comes from ("profile for openvino:gpu", "model",
+    /// "global"; [`crate::config::ThresholdSource::label`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_threshold_source: Option<String>,
+    /// Detection requests the service answered (all models) during this device's timed phase:
+    /// the run shared the machine with them. None outside the service (the CLI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_requests: Option<u64>,
+    /// [`Self::live_requests`] per minute of the timed phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_requests_per_min: Option<f64>,
+    /// The GPU video-decode engine's load during the timed phase (Windows; Blue Iris' Quick Sync
+    /// decode shares the iGPU). None elsewhere or when the counter is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_decode_pct: Option<crate::backend::video_decode::VideoDecode>,
     /// Timed runs per image.
     #[serde(default)]
     pub repeat: usize,
@@ -559,6 +613,31 @@ pub struct RunResult {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// How a run's model was compiled ([`RunResult::tuning`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTuning {
+    /// OpenVINO's performance hint (`LATENCY` / `THROUGHPUT`); None for ONNX Runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Inferences the compiled model keeps in flight in the service (after OpenVINO's
+    /// `NUM_STREAMS` / `OPTIMAL_NUMBER_OF_INFER_REQUESTS` clamps). The benchmark still times one
+    /// request at a time.
+    pub inflight: usize,
+    /// ONNX Runtime sessions (1 for OpenVINO).
+    pub ort_sessions: usize,
+}
+
+impl RunTuning {
+    /// "THROUGHPUT, 4 in flight", "2 ORT sessions", "LATENCY, 1 in flight".
+    pub fn describe(&self) -> String {
+        match &self.hint {
+            Some(h) => format!("{h}, {} in flight", self.inflight),
+            None if self.ort_sessions == 1 => "1 ORT session".to_string(),
+            None => format!("{} ORT sessions", self.ort_sessions),
+        }
+    }
 }
 
 /// Detections of one run matched against another's (`--compare-cpu`, agreement).
@@ -669,6 +748,15 @@ pub struct Job {
     /// Enhancement and filter rules on top of the plain pipeline ([`variant`]); `name` is then
     /// `<model>+<variant>`.
     pub variant: Option<PipelineVariant>,
+    /// What decides the model's compile tuning on each device, as for its worker
+    /// ([`crate::worker::device_tuning`]): a benchmark of a served model compiles what serves
+    /// (B4). None = serial ([`crate::profile::DeviceTuning::SERIAL`]: detections over frames,
+    /// files given on the command line without a config).
+    pub concurrency: Option<crate::worker::Concurrency>,
+    /// The model's per-device confidence profiles (`device_thresholds`): the threshold of a run
+    /// is the one the service uses on the device it loaded on ([`crate::worker::served_threshold`],
+    /// B5).
+    pub device_thresholds: BTreeMap<String, f32>,
 }
 
 /// Models to benchmark from a config: every enabled entry, in order.
@@ -713,6 +801,8 @@ pub(crate) fn job_for_file(
         confidence_threshold: None,
         object_filter: None,
         variant: None,
+        concurrency: None,
+        device_thresholds: BTreeMap::new(),
     })
 }
 
@@ -743,7 +833,27 @@ pub(crate) fn job_for_config(
         object_filter: m.object_filter.clone(),
         path,
         variant: None,
+        concurrency: None,
+        device_thresholds: BTreeMap::new(),
     })
+}
+
+/// [`job_for_config`] for a benchmark of the model as it serves: its worker's compile tuning
+/// under `profile` (the serving registry's; None = this machine's under the config's
+/// `hardware_profile`, read only once the model file is found) (B4) and its per-device
+/// confidence profiles (B5). Detections over frames (auto-label, pseudo ground truth, the
+/// dataset check) keep [`job_for_config`]: their own threshold and serial compiles.
+pub(crate) fn job_as_served(
+    config: &Config,
+    m: &ModelConfig,
+    device_override: Option<&str>,
+    profile: Option<crate::profile::Profile>,
+) -> Result<Job> {
+    let mut job = job_for_config(config, m, device_override)?;
+    let profile = profile.unwrap_or_else(|| config.profile());
+    job.concurrency = Some(crate::worker::Concurrency::for_model(profile, config, m));
+    job.device_thresholds = m.device_thresholds.clone();
+    Ok(job)
 }
 
 /// The device a config model runs on (or would, after a restart), as a canonical spec:
@@ -899,7 +1009,21 @@ mod tests {
         assert_eq!(s.max, 100.0);
         assert_eq!(s.p50, 50.0);
         assert_eq!(s.p95, 95.0);
+        assert_eq!(s.p99, 99.0);
+        assert_eq!(s.p99_of(), Some(99.0));
         assert!((s.mean - 50.5).abs() < 1e-12);
+        // Nearest rank: of 200 samples the 198th, of 20 the largest.
+        let v: Vec<f64> = (1..=200).map(f64::from).collect();
+        assert_eq!(Stats::from_samples(&v).p99, 198.0);
+        let v: Vec<f64> = (1..=20).map(f64::from).collect();
+        assert_eq!(Stats::from_samples(&v).p99, 20.0);
+        // Results saved before p99: it reads 0, shown as unknown.
+        let old: Stats = serde_json::from_value(
+            serde_json::json!({"min": 1.0, "mean": 2.0, "p50": 2.0, "p95": 3.0, "max": 3.0}),
+        )
+        .unwrap();
+        assert_eq!((old.p99, old.p99_of()), (0.0, None));
+        assert_eq!(Stats::default().p99_of(), Some(0.0));
 
         // Unsorted input, small n: p95 of 3 samples is the max; p50 the middle.
         let s = Stats::from_samples(&[3.0, 1.0, 2.0]);

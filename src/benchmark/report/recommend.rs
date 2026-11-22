@@ -53,7 +53,7 @@ impl<'a> Ranked<'a> {
     fn of(devices: &'a [DeviceResult]) -> Self {
         let eligible: Vec<(&DeviceResult, Grades)> = devices
             .iter()
-            .filter(|d| d.eligible())
+            .filter(|d| d.eligible(devices))
             .filter_map(|d| {
                 let g = d.grades().copied().or_else(|| {
                     d.total_p50()
@@ -133,26 +133,39 @@ pub fn recommend(
     let ranked = Ranked::of(devices);
     let (eligible, metric) = (&ranked.eligible, ranked.metric);
     let Some((best, bg)) = ranked.fastest_accurate().next() else {
-        let reason = if devices.iter().any(DeviceResult::ok) {
-            "no device's detections agree with the CPU reference".to_string()
-        } else {
+        let unchecked = devices.iter().filter(|d| d.ok()).all(|d| {
+            d.agreement()
+                .is_none_or(|a| a.verdict == Verdict::NotChecked)
+        });
+        let reason = if !devices.iter().any(DeviceResult::ok) {
             "no device could run this model".to_string()
+        } else if unchecked {
+            "no CPU reference ran, so these devices' detections were not checked against CPU \
+             (an unchecked device is recommended only when it is the only one that ran); add \
+             openvino:cpu or ort:cpu to the run"
+                .to_string()
+        } else {
+            "no device's detections agree with the CPU reference".to_string()
         };
         return Recommendation {
             device: None,
             reason,
         };
     };
-    let excluded: Vec<&str> = devices
+    let excluded: Vec<String> = devices
         .iter()
-        .filter(|d| d.ok() && !d.eligible())
-        .map(|d| d.device.as_str())
+        .filter(|d| d.ok() && !d.eligible(devices))
+        .map(|d| match d.agreement().map(|a| a.verdict) {
+            Some(Verdict::Minor) => format!("{} (minor differences)", d.device),
+            Some(Verdict::NotChecked) | None => format!("{} (not checked)", d.device),
+            _ => d.device.clone(),
+        })
         .collect();
     let excluded = if excluded.is_empty() {
         String::new()
     } else {
         format!(
-            "; excluded (detections disagree with the reference): {}",
+            "; excluded (detections do not agree with the reference): {}",
             excluded.join(", ")
         )
     };
@@ -259,7 +272,7 @@ mod tests {
             m.devices[0].agreement().unwrap().verdict,
             Verdict::Disagrees
         );
-        assert!(!m.devices[0].eligible());
+        assert!(!m.devices[0].eligible(&m.devices));
         assert_eq!(m.recommended.as_deref(), Some("ort:cpu"));
         assert!(
             m.recommendation.contains("excluded"),
@@ -495,24 +508,36 @@ mod tests {
             ],
             None,
         );
-        assert!(!m.devices[2].eligible());
+        assert!(!m.devices[2].eligible(&m.devices));
         assert_eq!(speed_order(&m.devices), ["openvino:cpu"]);
 
         // Accuracy: within the tie of the best counts as equal (speed decides); clearly less
-        // accurate devices are out, however fast. No reference ran: all are checked by grades.
+        // accurate devices are out, however fast.
         let m = model(
             vec![
                 graded("ort:directml:0", 10.0, Some(0.480)),
                 graded("openvino:gpu.0", 40.0, Some(0.490)),
                 graded("ort:directml:1", 5.0, Some(0.40)),
+                graded("openvino:cpu", 90.0, Some(0.488)),
+            ],
+            None,
+        );
+        assert_eq!(m.reference.as_deref(), Some("openvino:cpu"));
+        assert_eq!(
+            speed_order(&m.devices),
+            ["ort:directml:0", "openvino:gpu.0", "openvino:cpu"]
+        );
+        // B7: the same devices without a CPU reference are not checked, and an unchecked device
+        // is never put in the measured order beside another one.
+        let m = model(
+            vec![
+                graded("ort:directml:0", 10.0, Some(0.480)),
+                graded("openvino:gpu.0", 40.0, Some(0.490)),
             ],
             None,
         );
         assert_eq!(m.reference, None);
-        assert_eq!(
-            speed_order(&m.devices),
-            ["ort:directml:0", "openvino:gpu.0"]
-        );
+        assert!(speed_order(&m.devices).is_empty());
 
         // Nothing ran: empty (the static ranking stays).
         let m = model(vec![failed("ort:directml:0")], None);
@@ -554,6 +579,7 @@ mod tests {
             vec![
                 dev("openvino:gpu.0", 41.6, scene()),
                 dev("ort:directml:0", 10.5, scene()),
+                dev("openvino:cpu", 90.0, scene()),
             ],
             None,
         );
@@ -565,7 +591,11 @@ mod tests {
         let d = |s: &str| *crate::backend::spec::parse(s).unwrap().device().unwrap();
         assert_eq!(
             results.auto_order("ipcam-general.onnx", &hw),
-            Some(vec![d("ort:directml:0"), d("openvino:gpu.0")])
+            Some(vec![
+                d("ort:directml:0"),
+                d("openvino:gpu.0"),
+                d("openvino:cpu")
+            ])
         );
         assert_eq!(results.auto_order("yolo26n", &hw), None);
         assert_eq!(results.auto_order("other", &hw), None);

@@ -44,6 +44,7 @@ pub mod plan;
 pub mod priority;
 pub mod select;
 pub mod spec;
+pub mod video_decode;
 pub mod vram;
 
 pub use detect::{GpuAdapter, GpuVendor, HardwareInfo};
@@ -416,7 +417,7 @@ impl Backend {
             #[cfg(feature = "onnxruntime")]
             Backend::Ort(_) => (PerfHint::Latency, None),
             #[cfg(test)]
-            Backend::Fake(_) => (PerfHint::Latency, None),
+            Backend::Fake(b) => (b.hint(), None),
         }
     }
 
@@ -899,7 +900,12 @@ impl Runtimes {
         #[cfg(test)]
         if let Some(script) = &self.fake {
             let device = cand.device.to_string();
-            return Ok(Compiled::Fake(script.compile(req, &device, cand.fell_back)));
+            return Ok(Compiled::Fake(script.compile(
+                req,
+                &device,
+                cand.fell_back,
+                tuning,
+            )));
         }
         match cand.device.runtime {
             Runtime::OpenVino => {

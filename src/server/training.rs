@@ -181,6 +181,8 @@ impl Hooks for ServerHooks {
                 runtimes: st.registry.runtimes().cloned(),
                 loaded: super::benchmark::loaded_devices(&st),
                 resources: st.resources.clone(),
+                profile: st.registry.profile().map(|(p, _)| p.clone()),
+                metrics: Some(st.metrics.clone()),
             }
         };
         bench::run(
@@ -247,6 +249,8 @@ impl Hooks for ServerHooks {
                 runtimes: st.registry.runtimes().cloned(),
                 loaded: super::benchmark::loaded_devices(&st),
                 resources: st.resources.clone(),
+                profile: st.registry.profile().map(|(p, _)| p.clone()),
+                metrics: Some(st.metrics.clone()),
             }
         };
         // What it would measure (None: cannot tell, measured as before); a baseline of the same

@@ -486,10 +486,11 @@ impl Spawner {
             queue_size: config.worker_queue_size,
             lazy,
             can_use_gpu: self.can_use_gpu,
-            concurrency: Some(crate::worker::Concurrency {
-                profile: self.profile.clone(),
-                overrides: config.concurrency_overrides(&model),
-            }),
+            concurrency: Some(crate::worker::Concurrency::for_model(
+                self.profile.clone(),
+                config,
+                &model,
+            )),
             model,
             wait,
             prep: Some(self.prep.clone()),

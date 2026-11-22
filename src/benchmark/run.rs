@@ -1,7 +1,27 @@
 //! The benchmark run itself: `Bench` compiles a model on a device, warms it up and times the
-//! per-image pipeline (decode -> preprocess -> infer -> postprocess) at the configured and the
-//! evaluation confidence. Progress and cancellation are reported through `Progress`/`Cancelled`.
-//! One inference at a time; the runtimes mutex is held only while compiling.
+//! per-image pipeline (decode -> preprocess -> infer -> postprocess) at the threshold the service
+//! uses on that device, and post-processes the same outputs again (untimed) at the evaluation
+//! confidence. Progress and cancellation are reported through `Progress`/`Cancelled`. One
+//! inference at a time; the runtimes mutex is held only while compiling.
+//!
+//! What serving does, measured the same way:
+//! - Compile: the worker's tuning ([`crate::worker::device_tuning`]: hint, in-flight requests,
+//!   ONNX Runtime sessions; recorded as [`RunResult::tuning`]), so the run times and caches the
+//!   compiled model that serves (B4). Timing stays one request at a time.
+//! - Threshold: [`crate::worker::served_threshold`] for the device the model loaded on (B5).
+//! - Decode: the service's decode stage, the frame's statistics and its [`Scene`] included
+//!   (`prep.rs`); the set's transform (a NIR proxy's grayscale) is applied between them, untimed,
+//!   so the scene is the one of the frame the set sends.
+//! - Throughput ([`RunResult::throughput_fps`]): the loop timer covers the wait for the frame and
+//!   the served stages only; the evaluation post-process and the verifier's copy of the frame,
+//!   which the service never does per request, are outside it (B6). With read ahead an
+//!   iteration lasts at least its frame's decode ([`iteration_time`]), so the time taken out
+//!   does not hand the reader free decode time.
+//! - Warm-up: [`WarmupRule`] (several images, a minimum time), recorded as
+//!   [`RunResult::warmup_runs`] / [`RunResult::warmup_ms`].
+//! - What else ran: the live detection requests the service answered during the timed phase
+//!   ([`Bench::live_requests`]) and, on Windows, the GPU video-decode load
+//!   ([`crate::backend::video_decode`]).
 //!
 //! Read ahead: during the timed runs a helper thread (`bench-read`) reads and decodes the next
 //! frame while the current one infers, as the service's prep pool does. The hand-over is a
@@ -13,7 +33,7 @@
 //! Results, their order and the `on_image` order are those of the serial loop
 //! ([`ReadAhead::Off`], kept for the parity test and as the fallback when the thread cannot
 //! start). The helper is a scoped thread: it ends on cancel, on an error of either side and with
-//! the run, never outliving it. Warm-up stays serial (it repeats one frame).
+//! the run, never outliving it. Warm-up stays serial.
 //!
 //! A benchmark does not read ahead on a CPU device ([`ReadAhead::ExceptCpu`], the default): the
 //! decode would take cores from the CPU inference and inflate the CPU's latency figures (on the
@@ -25,6 +45,8 @@
 
 use super::scoring::score;
 use super::*;
+use crate::config::ThresholdSource;
+use crate::image_stats::{ImageStats, Scene};
 
 /// What a benchmark is doing right now (for progress reporting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -98,6 +120,69 @@ pub struct Bench<'a> {
     /// When to read and decode the next frame on a helper thread while the current one infers
     /// (see the module docs).
     pub read_ahead: ReadAhead,
+    /// When the warm-up ends ([`WarmupRule::DEFAULT`]).
+    pub warmup_rule: WarmupRule,
+    /// The detection requests the process has answered so far, over every model (the
+    /// service's metrics), read around each device's timed phase ([`RunResult::live_requests`]);
+    /// None outside the service.
+    pub live_requests: Option<&'a (dyn Fn() -> u64 + Sync)>,
+    /// Sample the GPU video-decode load during each timed phase
+    /// ([`RunResult::video_decode_pct`]; Windows only, a no-op elsewhere). Off for detections
+    /// over frames.
+    pub video_decode: bool,
+    /// Test only: a pause in every evaluation post-process (the untimed work of B6).
+    #[cfg(test)]
+    pub(super) slow_eval: Option<Duration>,
+}
+
+/// Warm-up images: the first this many of the run, in turn (frames of several sizes and formats
+/// warm their decode and resize paths, not one frame repeated).
+pub const WARMUP_IMAGES: usize = 5;
+/// The warm-up lasts at least this long once it has made `warmup` runs: a count alone can be
+/// over in milliseconds (a 3-run warm-up of a 5 ms model is 15 ms), before a GPU has left its
+/// idle clocks.
+pub const WARMUP_MIN_TIME: Duration = Duration::from_secs(2);
+/// ...and at most this long, whatever the count (a slow model on a CPU)...
+pub const WARMUP_MAX_TIME: Duration = Duration::from_secs(20);
+/// ...or this many runs (or `warmup`, when larger), whichever comes first.
+pub const WARMUP_MAX_RUNS: usize = 200;
+
+/// When the warm-up ends: with `warmup` > 0, runs cycle over the first [`Self::images`] images
+/// until at least `warmup` runs and [`Self::min_time`] have passed, capped at
+/// [`Self::max_time`] or max(`warmup`, [`Self::max_runs`]) runs, whichever comes first;
+/// `warmup` = 0 means no warm-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmupRule {
+    pub images: usize,
+    pub min_time: Duration,
+    pub max_time: Duration,
+    pub max_runs: usize,
+}
+
+impl WarmupRule {
+    pub const DEFAULT: WarmupRule = WarmupRule {
+        images: WARMUP_IMAGES,
+        min_time: WARMUP_MIN_TIME,
+        max_time: WARMUP_MAX_TIME,
+        max_runs: WARMUP_MAX_RUNS,
+    };
+
+    /// The count only: `warmup` runs, no minimum time (tests and quick runs).
+    pub const COUNT_ONLY: WarmupRule = WarmupRule {
+        min_time: Duration::ZERO,
+        ..Self::DEFAULT
+    };
+
+    /// Whether a warm-up asked for `warmup` runs is over after `runs` runs and `elapsed`.
+    pub fn done(&self, warmup: usize, runs: usize, elapsed: Duration) -> bool {
+        if warmup == 0 {
+            return true;
+        }
+        if runs >= warmup.max(self.max_runs) || elapsed >= self.max_time {
+            return true;
+        }
+        runs >= warmup && elapsed >= self.min_time
+    }
 }
 
 /// When the timed loop reads ahead (see the module docs).
@@ -146,6 +231,9 @@ impl std::fmt::Debug for Bench<'_> {
             .field("no_cache", &self.no_cache)
             .field("priority", &self.priority)
             .field("read_ahead", &self.read_ahead)
+            .field("warmup_rule", &self.warmup_rule)
+            .field("live_requests", &self.live_requests.is_some())
+            .field("video_decode", &self.video_decode)
             .finish()
     }
 }
@@ -155,6 +243,8 @@ pub(super) struct Sample {
     pub(super) stages: [f64; 4],
     pub(super) predictions: Vec<Prediction>,
     pub(super) eval: Vec<Prediction>,
+    /// The frame's computed scene (the service's, after decode).
+    pub(super) scene: Scene,
 }
 
 /// Folder levels below the cache root [`cache_files`] lists: OpenVINO blobs are one level down
@@ -308,6 +398,11 @@ impl<'a> Bench<'a> {
             no_cache: false,
             priority: None,
             read_ahead: ReadAhead::ExceptCpu,
+            warmup_rule: WarmupRule::DEFAULT,
+            live_requests: None,
+            video_decode: false,
+            #[cfg(test)]
+            slow_eval: None,
         }
     }
 
@@ -412,13 +507,21 @@ impl<'a> Bench<'a> {
             // The compile counts as the device's run (OpenVINO's GPU compile is CPU work too,
             // and it keeps the normal priority with the GPU).
             self.enter_priority(&cand.device.to_string());
-            let compiled = lock(runtimes).compile(cand, &req)?;
-            compiled.into_backend()
+            // The worker's tuning on this device (B4): what serves is what is timed and cached.
+            let (compiled, tuning) = {
+                let mut rt = lock(runtimes);
+                let tuning =
+                    crate::worker::device_tuning(job.concurrency.as_ref(), &rt, &cand.device);
+                (rt.compile_tuned(cand, &req, &tuning)?, tuning)
+            };
+            Ok((compiled.into_backend()?, tuning))
         });
         // A cancel during the compiles is a cancel, not a load failure (the error of several
         // failed candidates no longer carries `Cancelled`).
         self.check_cancel()?;
-        let backend = loaded.with_context(|| format!("loading {}", job.path.display()))?;
+        let (backend, tuning) =
+            loaded.with_context(|| format!("loading {}", job.path.display()))?;
+        let tuning = run_tuning(&backend, &tuning);
         let compile_ms = ms(t.elapsed());
         // Decided again on the device it loaded on (a fallback to CPU is a CPU run).
         match backend.info().device.spec.as_str() {
@@ -435,7 +538,7 @@ impl<'a> Bench<'a> {
             Some(v) => Some(self.load_verifier(runtimes, &v.job, &backend.info().device.spec)?),
             None => None,
         };
-        self.time(job, requested, backend, verifier, compile_ms, cache)
+        self.time(job, requested, backend, verifier, compile_ms, cache, tuning)
     }
 
     /// Compile the verifier of a `verify:<model>` variant on `device` (the spec the verified
@@ -457,7 +560,12 @@ impl<'a> Bench<'a> {
         let label = format!("verifier {}", vjob.name);
         let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {
             self.check_cancel()?;
-            let compiled = lock(runtimes).compile(cand, &req)?;
+            let compiled = {
+                let mut rt = lock(runtimes);
+                let tuning =
+                    crate::worker::device_tuning(vjob.concurrency.as_ref(), &rt, &cand.device);
+                rt.compile_tuned(cand, &req, &tuning)?
+            };
             compiled.into_backend()
         });
         self.check_cancel()?;
@@ -465,6 +573,10 @@ impl<'a> Bench<'a> {
     }
 
     /// Warm up and time `backend` over every image, then score its detections.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the loaded backend and what its load measured, passed once"
+    )]
     fn time(
         &self,
         job: &Job,
@@ -473,15 +585,19 @@ impl<'a> Bench<'a> {
         verifier: Option<Backend>,
         compile_ms: f64,
         cache: String,
+        tuning: RunTuning,
     ) -> Result<RunResult> {
         let info = backend.info();
         let dev = info.device.clone();
         let (in_w, in_h) = info.input_size;
         let family =
             crate::model::make_family(job.family, &info.inputs, &info.outputs, job.classes.len())?;
-        let threshold = job
-            .confidence_threshold
-            .unwrap_or(self.params.confidence_threshold);
+        let loaded_on = if dev.spec.is_empty() {
+            dev.actual.clone()
+        } else {
+            dev.spec.clone()
+        };
+        let (threshold, threshold_source) = self.served_threshold(job, &loaded_on);
         let mut pipe = Pipeline {
             pre: Preprocessor::for_family(in_w, in_h, family.as_ref()),
             family,
@@ -504,6 +620,8 @@ impl<'a> Bench<'a> {
                 (Some(b), Some(v)) => Some(Verifier::new(b, v, self.params)?),
                 _ => None,
             },
+            #[cfg(test)]
+            slow_eval: self.slow_eval,
         };
 
         let all: Vec<(&ImageSet, &images::SetImage)> = self
@@ -511,15 +629,19 @@ impl<'a> Bench<'a> {
             .iter()
             .flat_map(|s| s.images.iter().map(move |i| (s, i)))
             .collect();
-        let warmup_ms = self.warm_up(job, requested, &all, &mut pipe)?;
+        let (warmup_runs, warmup_ms) = self.warm_up(job, requested, &all, &mut pipe)?;
         let repeat = self.repeat.max(1);
-        let loaded_on = if dev.spec.is_empty() {
-            dev.actual.as_str()
+        // What else the machine served during the timed phase (the service's live requests,
+        // Windows' GPU video decode).
+        let live_before = self.live_requests.map(|f| f());
+        let decode_load = if self.video_decode {
+            crate::backend::video_decode::Sampler::start()
         } else {
-            dev.spec.as_str()
+            None
         };
-        let mut timed = if self.read_ahead.applies(loaded_on) {
-            self.timed_runs_ahead(job, requested, &all, &mut pipe, repeat)?
+        let timed_from = Instant::now();
+        let timed = if self.read_ahead.applies(&loaded_on) {
+            self.timed_runs_ahead(job, requested, &all, &mut pipe, repeat)
         } else {
             self.timed_runs(
                 job,
@@ -528,8 +650,15 @@ impl<'a> Bench<'a> {
                 &mut pipe,
                 repeat,
                 &mut serial_frames(&all),
-            )?
+            )
         };
+        let timed_wall = timed_from.elapsed();
+        let video_decode_pct = decode_load.and_then(|s| s.finish());
+        let mut timed = timed?;
+        let live_requests = live_before
+            .zip(self.live_requests.map(|f| f()))
+            .map(|(a, b)| b.saturating_sub(a));
+        let live_requests_per_min = live_requests.map(|n| per_minute(n, timed_wall));
         let loop_s = timed.loop_time.as_secs_f64();
 
         let stages_ms = timed.stage_stats();
@@ -587,6 +716,13 @@ impl<'a> Bench<'a> {
             cache,
             warmup_iterations: self.warmup,
             warmup_ms,
+            warmup_runs,
+            tuning: Some(tuning),
+            served_threshold: Some(threshold),
+            served_threshold_source: Some(threshold_source.label()),
+            live_requests,
+            live_requests_per_min,
+            video_decode_pct,
             repeat,
             stages_ms,
             throughput_fps: if loop_s > 0.0 {
@@ -609,6 +745,17 @@ impl<'a> Bench<'a> {
         })
     }
 
+    /// The threshold the service uses for `job` on `device` (the spec it loaded on) and where it
+    /// comes from ([`crate::worker::served_threshold`]: the device's profile, else the model's
+    /// own threshold, else the run's global one).
+    fn served_threshold(&self, job: &Job, device: &str) -> (f32, ThresholdSource) {
+        let fallback = match job.confidence_threshold {
+            Some(t) => (t, ThresholdSource::Model),
+            None => (self.params.confidence_threshold, ThresholdSource::Global),
+        };
+        crate::worker::served_threshold(&job.device_thresholds, fallback, device)
+    }
+
     /// The object filter of `job`'s production predictions: its own (an empty list = none),
     /// else the global one (empty = none).
     fn object_filter_for<'s>(&'s self, job: &'s Job) -> Option<&'s [String]> {
@@ -619,27 +766,55 @@ impl<'a> Bench<'a> {
         }
     }
 
-    /// The untimed warm-up iterations on the first image; returns their wall time (ms).
+    /// The untimed warm-up ([`WarmupRule`]: the first [`WARMUP_IMAGES`] images in turn, each
+    /// decoded and run through the served stages); returns its runs and wall time (ms).
     fn warm_up(
         &self,
         job: &Job,
         requested: &str,
         all: &[(&ImageSet, &images::SetImage)],
         pipe: &mut Pipeline,
-    ) -> Result<f64> {
+    ) -> Result<(usize, f64)> {
         let t = Instant::now();
         self.report(job, requested, Phase::Warmup, 0, self.warmup, "");
-        if self.warmup > 0 {
-            let (set, img) = all.first().context("no benchmark images")?;
-            let first = img.bytes()?;
-            for i in 0..self.warmup {
-                self.check_cancel()?;
-                pipe.run(&first, false, set.transform)
-                    .context("warm-up inference")?;
-                self.report(job, requested, Phase::Warmup, i + 1, self.warmup, "");
-            }
+        if self.warmup == 0 {
+            return Ok((0, ms(t.elapsed())));
         }
-        Ok(ms(t.elapsed()))
+        // An image that cannot be read or decoded is left out here: the timed runs report it
+        // in its own context, after the images before it.
+        let mut frames: Vec<_> = all
+            .iter()
+            .take(self.warmup_rule.images.max(1))
+            .filter_map(|(set, img)| Some((set.transform, img.bytes().ok()?)))
+            .collect();
+        let mut runs = 0;
+        let mut next = 0;
+        while !self.warmup_rule.done(self.warmup, runs, t.elapsed()) {
+            self.check_cancel()?;
+            if frames.is_empty() {
+                break;
+            }
+            next %= frames.len();
+            let Some((transform, bytes)) = frames.get(next) else {
+                break;
+            };
+            let Ok(frame) = decode(bytes, *transform) else {
+                frames.remove(next);
+                continue;
+            };
+            pipe.serve(frame, None).context("warm-up inference")?;
+            next += 1;
+            runs += 1;
+            self.report(
+                job,
+                requested,
+                Phase::Warmup,
+                runs,
+                self.warmup.max(runs),
+                "",
+            );
+        }
+        Ok((runs, ms(t.elapsed())))
     }
 
     /// [`Self::timed_runs`] with the frames read and decoded ahead on a scoped helper thread
@@ -737,10 +912,21 @@ impl<'a> Bench<'a> {
                 // A read failure as it is, a decode failure in the image's context (as before
                 // read ahead).
                 let frame = frames(i)?;
-                let sample = frame
-                    .and_then(|d| pipe.run_decoded(d, r + 1 == repeat))
+                let waited = t.elapsed();
+                let decoded = frame.with_context(|| format!("image {}", img.file))?;
+                let decode_ms = decoded.decode_ms;
+                // Not timed: the service keeps its decoded frame for the verifier without a
+                // copy (B6).
+                let original = pipe.verifier.is_some().then(|| decoded.img.clone());
+                let t = Instant::now();
+                let served = pipe
+                    .serve(decoded, original)
                     .with_context(|| format!("image {}", img.file))?;
-                timed.loop_time += t.elapsed();
+                timed.loop_time += iteration_time(waited, t.elapsed(), decode_ms);
+                // Not timed either: the evaluation post-process is the benchmark's own (B6).
+                let sample = pipe
+                    .evaluate(served, r + 1 == repeat)
+                    .with_context(|| format!("image {}", img.file))?;
                 let total = timed.record(bucket, &sample);
                 totals.push(total);
                 infers.push(sample.stages[2]);
@@ -765,22 +951,70 @@ impl<'a> Bench<'a> {
 /// could not be read).
 pub(super) type Frame = Result<Decoded>;
 
-/// A decoded frame (the set's transform applied) and its decode time.
+/// A decoded frame (the set's transform applied), its decode time and its scene.
 pub(super) struct Decoded {
     img: crate::image::RgbImage,
-    /// Decode only, without reading the file or the transform (ms).
+    /// Decode and the frame's statistics, as the service's decode stage counts them, without
+    /// reading the file or the transform (ms).
     decode_ms: f64,
+    /// The scene the service computes after decode ([`ImageStats::scene`]).
+    scene: Scene,
 }
 
-/// Decode `bytes` (timed) and apply the set's `transform` (not part of any stage time).
+/// Decode `bytes` and take the frame's statistics, both timed as the service's decode stage
+/// (`prep.rs`); the set's `transform` (not part of any stage time) is applied between them, so
+/// the scene is that of the frame the set stands for (a NIR proxy's grayscale frame is `ir`).
 fn decode(bytes: &[u8], transform: Option<images::ImageTransform>) -> Result<Decoded> {
     let t = Instant::now();
     let mut img = crate::image::decode(bytes)?;
-    let decode_ms = ms(t.elapsed());
+    let mut decode = t.elapsed();
     if let Some(tr) = transform {
         tr.apply(&mut img);
     }
-    Ok(Decoded { img, decode_ms })
+    let t = Instant::now();
+    let scene = ImageStats::compute(&img).scene();
+    decode += t.elapsed();
+    Ok(Decoded {
+        img,
+        decode_ms: ms(decode),
+        scene,
+    })
+}
+
+/// The scene [`decode`] computes for `bytes` (tests).
+#[cfg(test)]
+pub(super) fn decode_scene(bytes: &[u8], transform: Option<images::ImageTransform>) -> Scene {
+    decode(bytes, transform)
+        .map(|d| d.scene)
+        .unwrap_or_else(|e| panic!("{e:#}"))
+}
+
+/// The time one timed iteration counts toward the throughput: the wait for its frame plus the
+/// served stages (B6: nothing the service does not do per request), and at least the frame's
+/// decode. With read ahead the reader decodes the next frame during the untimed evaluation
+/// too; without the floor a decode-bound run would look faster than the 1-frame pipeline is
+/// (the service's steady state is max(decode, serve) per frame). Serially the wait holds the
+/// decode, so the floor never applies.
+pub(super) fn iteration_time(waited: Duration, served: Duration, decode_ms: f64) -> Duration {
+    let decode = Duration::try_from_secs_f64(decode_ms.max(0.0) / 1e3).unwrap_or(Duration::ZERO);
+    (waited + served).max(decode)
+}
+
+/// `n` events over `over` as a rate per minute (0 over no time).
+pub(super) fn per_minute(n: u64, over: Duration) -> f64 {
+    let min = over.as_secs_f64() / 60.0;
+    if min > 0.0 { n as f64 / min } else { 0.0 }
+}
+
+/// What a compiled backend records of its tuning ([`RunResult::tuning`]): OpenVINO's hint as it
+/// compiled, the in-flight requests it created (after its clamps) and the ONNX Runtime sessions.
+fn run_tuning(backend: &Backend, tuning: &crate::profile::DeviceTuning) -> RunTuning {
+    let ov = backend.info().device.runtime == Runtime::OpenVino;
+    RunTuning {
+        hint: ov.then(|| backend.hint_and_streams().0.as_str().to_string()),
+        inflight: backend.slots(),
+        ort_sessions: if ov { 1 } else { tuning.ort_sessions },
+    }
 }
 
 /// The serial frame source: each image read once (cached across its runs), decoded per run
@@ -848,6 +1082,9 @@ pub(super) struct Pipeline<'j> {
     variant: Option<&'j PipelineVariant>,
     /// The verifier of a `verify:<model>` variant.
     verifier: Option<Verifier<'j>>,
+    /// Test only: a pause in [`Pipeline::evaluate`] (untimed work).
+    #[cfg(test)]
+    slow_eval: Option<Duration>,
 }
 
 /// The second model of a `verify:<model>` variant: the stages the verifier's worker runs on a
@@ -898,11 +1135,7 @@ impl<'j> Verifier<'j> {
     }
 
     /// The verifier's predictions on `img` (a crop or the frame) of a frame of `scene`.
-    fn detect(
-        &mut self,
-        mut img: crate::image::RgbImage,
-        scene: crate::image_stats::Scene,
-    ) -> Result<Vec<Prediction>> {
+    fn detect(&mut self, mut img: crate::image::RgbImage, scene: Scene) -> Result<Vec<Prediction>> {
         crate::model::enhance::apply(&mut img, self.variant.modes.for_scene(scene));
         let (chw, ctx) = self.pre.run(&img.rgb, img.width, img.height)?;
         let extra = self.family.extra_inputs(&ctx);
@@ -917,21 +1150,20 @@ impl<'j> Verifier<'j> {
     }
 
     /// Check the candidates of `preds` ([`crate::verify::plan`]) on `frame` (the original,
-    /// not enhanced) and drop the rejected ones from `preds` and from `eval` (the same boxes
-    /// at the evaluation threshold; candidates are taken from `preds`, so evaluation boxes
-    /// below the production threshold stay unverified).
+    /// not enhanced): the kept predictions and the rejected ones (dropped from the evaluation
+    /// boxes later, [`Pipeline::evaluate`]; candidates are taken from `preds`, so evaluation
+    /// boxes below the production threshold stay unverified).
     fn apply(
         &mut self,
         frame: crate::image::RgbImage,
-        scene: crate::image_stats::Scene,
+        scene: Scene,
         preds: Vec<Prediction>,
-        eval: &mut Vec<Prediction>,
-    ) -> Result<Vec<Prediction>> {
+    ) -> Result<(Vec<Prediction>, Vec<Prediction>)> {
         use crate::verify::VerifyMode;
         let cfg = &self.variant.config;
         let plan = crate::verify::plan(&preds, frame.width, frame.height, scene, cfg);
         if plan.is_empty() {
-            return Ok(preds);
+            return Ok((preds, Vec::new()));
         }
         let found: Vec<Option<Vec<Prediction>>> = match cfg.mode {
             VerifyMode::Crop => {
@@ -952,50 +1184,49 @@ impl<'j> Verifier<'j> {
             .filter(|(_, o)| *o == crate::verify::Outcome::Rejected)
             .filter_map(|(i, _)| preds.get(*i).cloned())
             .collect();
-        eval.retain(|e| !rejected.contains(e));
-        Ok(crate::verify::apply(preds, &outcomes).0)
+        Ok((crate::verify::apply(preds, &outcomes).0, rejected))
     }
 }
 
-impl Pipeline<'_> {
-    /// One request through the worker's stages, serially, with per-stage timings; with `eval`,
-    /// the same outputs are post-processed again at the evaluation threshold (untimed, without
-    /// the object filter). The set's `transform` (an image-set property, not a production
-    /// stage) is applied after decode and is not part of any stage time.
-    ///
-    /// A variant adds what the service does with the same options: the scene statistics of the
-    /// (transformed) frame and its enhancement count as preprocess time, its filter rules run
-    /// on the family's detections (postprocess time) and on the evaluation detections too, so
-    /// AP, false positives and the threshold sweep see the filtered boxes.
-    fn run(
-        &mut self,
-        bytes: &[u8],
-        eval: bool,
-        transform: Option<images::ImageTransform>,
-    ) -> Result<Sample> {
-        self.run_decoded(decode(bytes, transform)?, eval)
-    }
+/// One request after the served stages ([`Pipeline::serve`]): its stage times and production
+/// predictions, and what the untimed evaluation ([`Pipeline::evaluate`]) post-processes again.
+pub(super) struct Served {
+    stages: [f64; 4],
+    predictions: Vec<Prediction>,
+    outputs: Vec<crate::model::NamedOutput>,
+    ctx: crate::model::PreprocessCtx,
+    scene: Scene,
+    /// Production predictions the verifier rejected (left out of the evaluation boxes too).
+    rejected: Vec<Prediction>,
+}
 
-    /// [`Self::run`] from the decoded frame on: its decode time is `frame.decode_ms` (measured
-    /// where it was decoded, possibly the read-ahead thread).
-    fn run_decoded(&mut self, frame: Decoded, eval: bool) -> Result<Sample> {
+impl Pipeline<'_> {
+    /// One request from the decoded frame on through the worker's stages, serially, with
+    /// per-stage timings; its decode time is `frame.decode_ms` (measured where it was decoded,
+    /// possibly the read-ahead thread). The set's `transform` (an image-set property, not a
+    /// production stage) was applied after decode and is not part of any stage time.
+    /// `original` is the frame before enhancement, for the verifier (None without one).
+    ///
+    /// A variant adds what the service does with the same options: the enhancement for the
+    /// frame's scene counts as preprocess time, its filter rules run on the family's
+    /// detections (postprocess time) and on the evaluation detections too, so AP, false
+    /// positives and the threshold sweep see the filtered boxes. The verifier cascade counts as
+    /// postprocess time (the service adds it to processMs).
+    fn serve(
+        &mut self,
+        frame: Decoded,
+        original: Option<crate::image::RgbImage>,
+    ) -> Result<Served> {
         let Decoded {
             mut img,
             decode_ms: decode,
+            scene,
         } = frame;
-        // The verifier crops the original frame, as the service does (not timed: the service
-        // keeps the decoded frame without a copy).
-        let original = self.verifier.is_some().then(|| img.clone());
 
         let t = Instant::now();
-        let scene = match self.variant {
-            Some(v) => {
-                let scene = crate::image_stats::ImageStats::compute(&img).scene();
-                crate::model::enhance::apply(&mut img, v.modes().for_scene(scene));
-                scene
-            }
-            None => crate::image_stats::Scene::Day,
-        };
+        if let Some(v) = self.variant {
+            crate::model::enhance::apply(&mut img, v.modes().for_scene(scene));
+        }
         let (chw, ctx) = self.pre.run(&img.rgb, img.width, img.height)?;
         let extra = self.family.extra_inputs(&ctx);
         let preprocess = ms(t.elapsed());
@@ -1004,36 +1235,76 @@ impl Pipeline<'_> {
         let outputs = self.backend.infer(chw, &extra)?;
         let infer = ms(t.elapsed());
 
-        let rules = self.variant.and_then(|v| v.filters.as_ref());
-        let filtered = |dets: Vec<crate::model::Detection>| match rules {
+        let t = Instant::now();
+        let dets = self.filtered(
+            self.family.postprocess(&outputs, &ctx, &self.params)?,
+            &ctx,
+            scene,
+        );
+        let preds = crate::model::to_predictions(&dets, &ctx, self.classes, self.filter);
+        let (preds, rejected) = match (self.verifier.as_mut(), original) {
+            (Some(v), Some(frame)) => v.apply(frame, scene, preds)?,
+            _ => (preds, Vec::new()),
+        };
+        let postprocess = ms(t.elapsed());
+        Ok(Served {
+            stages: [decode, preprocess, infer, postprocess],
+            predictions: preds,
+            outputs,
+            ctx,
+            scene,
+            rejected,
+        })
+    }
+
+    /// The variant's filter rules over `dets` (none without a variant).
+    fn filtered(
+        &self,
+        dets: Vec<crate::model::Detection>,
+        ctx: &crate::model::PreprocessCtx,
+        scene: Scene,
+    ) -> Vec<crate::model::Detection> {
+        match self.variant.and_then(|v| v.filters.as_ref()) {
             Some(r) => {
                 crate::model::filters::apply(dets, self.classes, ctx.orig_w, ctx.orig_h, scene, r).0
             }
             None => dets,
-        };
-        let t = Instant::now();
-        let dets = filtered(self.family.postprocess(&outputs, &ctx, &self.params)?);
-        let preds = crate::model::to_predictions(&dets, &ctx, self.classes, self.filter);
-        let postprocess = ms(t.elapsed());
-        let mut eval = if eval {
-            let dets = filtered(self.family.postprocess(&outputs, &ctx, &self.eval_params)?);
-            crate::model::to_predictions(&dets, &ctx, self.classes, None)
+        }
+    }
+
+    /// The benchmark's own work after a served request (untimed): with `eval`, the same outputs
+    /// post-processed again at the evaluation threshold, without the object filter and without
+    /// the boxes the verifier rejected.
+    fn evaluate(&self, served: Served, eval: bool) -> Result<Sample> {
+        #[cfg(test)]
+        if let Some(d) = self.slow_eval.filter(|_| eval) {
+            std::thread::sleep(d);
+        }
+        let Served {
+            stages,
+            predictions,
+            outputs,
+            ctx,
+            scene,
+            rejected,
+        } = served;
+        let eval = if eval {
+            let dets = self.filtered(
+                self.family.postprocess(&outputs, &ctx, &self.eval_params)?,
+                &ctx,
+                scene,
+            );
+            let mut eval = crate::model::to_predictions(&dets, &ctx, self.classes, None);
+            eval.retain(|e| !rejected.contains(e));
+            eval
         } else {
             Vec::new()
         };
-        // The verifier cascade counts as postprocess time (the service adds it to processMs).
-        let (preds, postprocess) = match (self.verifier.as_mut(), original) {
-            (Some(v), Some(frame)) => {
-                let t = Instant::now();
-                let preds = v.apply(frame, scene, preds, &mut eval)?;
-                (preds, postprocess + ms(t.elapsed()))
-            }
-            _ => (preds, postprocess),
-        };
         Ok(Sample {
-            stages: [decode, preprocess, infer, postprocess],
-            predictions: preds,
+            stages,
+            predictions,
             eval,
+            scene,
         })
     }
 }
@@ -1049,8 +1320,8 @@ pub(super) struct Timings {
     /// Per image: the last run's predictions at the evaluation threshold.
     eval_preds: Vec<Vec<PredBox>>,
     total_iters: usize,
-    /// Wall time of the timed iterations (throughput): with read ahead, each run's wait for its
-    /// frame plus its stages on the inference thread.
+    /// Time of the timed iterations (throughput): each run's wait for its frame plus its served
+    /// stages, at least its frame's decode ([`iteration_time`]; B6).
     loop_time: Duration,
     /// The frames were read and decoded ahead ([`Bench::timed_runs_ahead`]).
     pipelined: bool,
@@ -1137,6 +1408,7 @@ pub(super) fn image_run(
         preds,
         gt_matched: Vec::new(),
         counts: None,
+        scene: Some(last.scene),
     };
     (run, eval)
 }
@@ -1242,6 +1514,7 @@ mod tests {
             stages,
             predictions: Vec::new(),
             eval: Vec::new(),
+            scene: Scene::Day,
         };
         assert_eq!(t.record("sd", &sample([1.0, 2.0, 10.0, 0.5])), 13.5);
         assert_eq!(t.record("sd", &sample([1.0, 4.0, 20.0, 0.5])), 25.5);
