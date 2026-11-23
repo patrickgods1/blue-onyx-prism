@@ -4253,9 +4253,9 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-048 | `server-core/server-core-4` | crash-recovery | low | 2 | fixed (phase 0, checked in phase 2): `auth/` and `auth/tls/` are in the temp sweep | Temporary secret files from private_dir::write_file are never cleaned after a crash: `.<name>.<uuid>.tmp` in <data root>/auth and auth/tls accumulate, and no sweep covers that folder |
 | RA-049 | `training-jobs/training-jobs-3` | crash-recovery | low | 1 | fixed (phase 1): a Busy dropped while panicking keeps its marker (reads Crashed, the sweep recovers it) | A panic inside a job deletes its busy marker while unwinding, stranding the work folder and making a finished auto-label unrecoverable |
 | RA-050 | `workers-registry/workers-registry-4` | crash-recovery | low | 1 | fixed (phase 1): a worker panic sets Failed and the stuck flag, and a drop guard opens the LoadGate | A panic on a worker thread leaves the model Ready (or Initializing) with a dead thread, and a panic during load never opens the LoadGate, so every later model in config order waits forever |
-| RA-051 | `gap-startup-recovery-as/recovery-2` | crash-recovery | medium | 3 | open | open_records marks every queued or running record "interrupted" without checking that its process is dead, so the service's lazy queue start turns a live CLI `train` run into a failed one, and Remove (with files) and Remove export then delete that run's folder or export |
-| RA-052 | `resources/resources-12` | storage | medium | 3 | open | 'Remove export toolchain' and 'Remove training environment' do not take the export lock, so they can delete uv, Python and uv-cache under a running training-env build |
-| RA-053 | `training-core/training-core-4` | storage | medium | 3 | open | runs.json / tasks.json have no owner across processes: a CLI `train` run beside the service drops records and leaves run folders nothing lists or cleans |
+| RA-051 | `gap-startup-recovery-as/recovery-2` | crash-recovery | medium | 3 | fixed (phase 3): runs hold `<run dir>.busy`; the owner's open tells Live / crashed / ended; Remove with files, Retry export and Remove export refuse a Live run | open_records marks every queued or running record "interrupted" without checking that its process is dead, so the service's lazy queue start turns a live CLI `train` run into a failed one, and Remove (with files) and Remove export then delete that run's folder or export |
+| RA-052 | `resources/resources-12` | storage | medium | 3 | fixed (phase 3): toolchain / train-env removal holds `.train.lock` + `.model-export.lock` (409 while held, any process); lock files kept; Tool row blocked by a lock probe | 'Remove export toolchain' and 'Remove training environment' do not take the export lock, so they can delete uv, Python and uv-cache under a running training-env build |
+| RA-053 | `training-core/training-core-4` | storage | medium | 3 | fixed (phase 3): `.queue.lock` owner; guests read only; CLI job commands refuse beside the service; orphaned run folders listed by `train list` (Storage card row: phase 4) | runs.json / tasks.json have no owner across processes: a CLI `train` run beside the service drops records and leaves run folders nothing lists or cleans |
 | RA-054 | `backend/backend-1` | storage | medium | 4 | open | OpenVINO compiled blobs and TensorRT engines of removed or replaced models are never deleted while their cache folder is in use |
 | RA-055 | `collect/collect-5` | storage | medium | 4 | fixed (phase 2): see RA-060 | A crashed or killed export leaves its hidden `.building-<uuid>` staging folder forever, and no sweeper knows the name |
 | RA-056 | `platform-storage/platform-1` | storage | medium | 4 | fixed (phase 2): review-export scratch (RA-060), model-export staging (RA-041) and install-dir staging (RA-071) | Storage sweep never removes three kinds of crash-orphaned staging: review-export `.building-*` folders, model-export `.export-staging` folders, and training staging under a custom install_dir |
@@ -4342,18 +4342,18 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-009 | `platform-config/platform-3` | bug | low | 0 | fixed (phase 0): unique temp, mode kept, rename retried on a sharing violation | Config::save uses one fixed temp name `<config>.tmp`, so two processes saving at once can rename a mixed or truncated file into place |
 | QA-010 | `resources/resources-10` | refactor | low | 0 | fixed (phase 0): nine poll loops on `fsx::lock_wait_with`; `DownloadLock::acquire` kept (rewrites its PID per try) | Four hand-rolled file-lock poll loops |
 | QA-011 | `training-core/tcore-12` | refactor | low | 0 | fixed (phase 0): `fsx::write_atomic` | task::save_file is a second atomic-write implementation, weaker than layout::write_atomic (fixed tmp name) |
-| QA-012 | `training-core/tcore-1` | bug | high | 3 | open | The service and a CLI `train` process both own the same runs.json/tasks.json: each overwrites the other's records, and the CLI marks the service's running job as interrupted |
-| QA-013 | `gap-six-processes-write/cfgw-4` | test-gap | medium | 3 | open | No test of a save by another process landing inside ConfigStore::update's hash-to-write window |
-| QA-014 | `benchmark/bench-10` | bug | low | 3 | open | breadcrumb::clear / left_behind unlock before removing: another run's fresh breadcrumb can be deleted |
-| QA-015 | `benchmark/bench-9` | bug | low | 3 | open | benchmark-history.json load-modify-save is serialized in-process only; the web routes race a CLI run |
-| QA-016 | `gap-six-processes-write/cfgw-1` | bug | low | 3 | open | Config writers outside ConfigStore race the running service's saves with no cross-process lock, so either side's change can be lost (in memory too) |
-| QA-017 | `gap-six-processes-write/cfgw-3` | bug | low | 3 | open | FileConfigWriter rewrites the config even when the edit changed nothing, and reports 'saved' |
-| QA-018 | `gap-six-processes-write/cfgw-5` | test-gap | low | 3 | open | The new benchmark --apply writer and the CLI config writers have no test for a file changed between their load and save |
-| QA-019 | `resources/resources-12` | refactor | low | 3 | open | 'Is it installed?' is decided by five slightly different predicates |
-| QA-020 | `server-core/srvcore-3` | bug | low | 3 | open | admin_token::ensure / rotate are check-then-write without auth/.lock: a concurrent `admin-token` CLI can print a token that is overwritten right after |
-| QA-021 | `server-handlers/handlers-7` | bug | low | 3 | open | Busy check and destructive action are not atomic: remove-env, set_dir and SAM 3 remove can race a job being queued |
-| QA-022 | `training-core/tcore-17` | bug | low | 3 | open | write_runs/write_tasks hold the `stores` mutex across the fsync of runs.json, nested in the opposite order to set_store |
-| QA-023 | `training-core/tcore-18` | bug | low | 3 | open | One Condvar (`changed`) is waited on with two different mutexes (runs and tasks) |
+| QA-012 | `training-core/tcore-1` | bug | high | 3 | fixed (phase 3): one owner per training folder (`.queue.lock`), guest mode, CLI refusal | The service and a CLI `train` process both own the same runs.json/tasks.json: each overwrites the other's records, and the CLI marks the service's running job as interrupted |
+| QA-013 | `gap-six-processes-write/cfgw-4` | test-gap | medium | 3 | fixed (phase 3): `a_save_by_another_process_during_a_ui_save_is_kept` | No test of a save by another process landing inside ConfigStore::update's hash-to-write window |
+| QA-014 | `benchmark/bench-10` | bug | low | 3 | fixed (phase 3): remove under the lock; `Trail::open` checks the path still names its handle; waits 300 ms for a probe's lock (extra 29) | breadcrumb::clear / left_behind unlock before removing: another run's fresh breadcrumb can be deleted |
+| QA-015 | `benchmark/bench-9` | bug | low | 3 | fixed (phase 3): History edits take the results lock first (503 on timeout); a `models` that is not an object is moved aside (extra 52) | benchmark-history.json load-modify-save is serialized in-process only; the web routes race a CLI run |
+| QA-016 | `gap-six-processes-write/cfgw-1` | bug | low | 3 | fixed (phase 3): `.<config>.lock` taken by every command writer (`config_file::edit_file`) and by `ConfigStore::update` (3 s) | Config writers outside ConfigStore race the running service's saves with no cross-process lock, so either side's change can be lost (in memory too) |
+| QA-017 | `gap-six-processes-write/cfgw-3` | bug | low | 3 | fixed (phase 3): writes only a changed text; says "unchanged <path>" | FileConfigWriter rewrites the config even when the edit changed nothing, and reports 'saved' |
+| QA-018 | `gap-six-processes-write/cfgw-5` | test-gap | low | 3 | fixed (phase 3): `config_file` tests (two threads, two processes, held lock, later format) | The new benchmark --apply writer and the CLI config writers have no test for a file changed between their load and save |
+| QA-019 | `resources/resources-12` | refactor | low | 3 | fixed (phase 3): one rule (`status::is_installed`); truncated manifest + VERSION is not installed; damaged flavor never active | 'Is it installed?' is decided by five slightly different predicates |
+| QA-020 | `server-core/srvcore-3` | bug | low | 3 | fixed (phase 3): ensure / rotate / the one-off rotation under `auth/.lock` | admin_token::ensure / rotate are check-then-write without auth/.lock: a concurrent `admin-token` CLI can print a token that is overwritten right after |
+| QA-021 | `server-handlers/handlers-7` | bug | low | 3 | fixed (phase 3): remove-env, training-folder move and SAM 3 Remove run in `TrainingService::while_idle`; TrainLock held = 409 | Busy check and destructive action are not atomic: remove-env, set_dir and SAM 3 remove can race a job being queued |
+| QA-022 | `training-core/tcore-17` | bug | low | 3 | fixed (phase 3): path copied out before other locks; lock order documented on `Inner` | write_runs/write_tasks hold the `stores` mutex across the fsync of runs.json, nested in the opposite order to set_store |
+| QA-023 | `training-core/tcore-18` | bug | low | 3 | fixed (phase 3): `runs_changed` / `tasks_changed` | One Condvar (`changed`) is waited on with two different mutexes (runs and tasks) |
 | QA-024 | `platform-config/platform-1` | bug | high | 7 | open | Install scripts treat a program-written config as 'already sets download_dir' and copy it verbatim, so the service's data root stays in the read-only program dir |
 | QA-025 | `resources/resources-1` | bug | high | 7 | open | A second install into a user --dir/--dest swaps the whole directory and deletes the user's other files |
 | QA-026 | `backend/backend-1` | bug | medium | 5 | open | PL-04 is only half fixed: the model input size is never checked at load, and the worker allocates its warm-up frame before any check |
@@ -4759,3 +4759,50 @@ kill -9 and after a graceful stop, no process survives; the data root holds only
 
 Not verified here: the Windows DACL probe and repair were type-checked and linted for `x86_64-pc-windows-msvc` and
 run only in CI; the Linux `/proc` group listing and boot id run only in the ubuntu job.
+
+### Audit 2026-11, phase 3 notes
+
+Cross-process ownership of shared files. The scope is the ledger's phase 3 items plus the verifier extras the plan
+names for it: readers that marked another process's live job interrupted (quality extra 22), a dataset-check plan that
+could move `runs.json` aside (extra 43), lock files deleted under their holders and a toolchain removal that left a
+dangling training environment (resource extras 10 and 11), a breadcrumb run that went without a record during a page's
+probe (extra 29), a benchmark history whose `models` was not an object saved over as empty (extra 52), and the four
+copies of "load the config, else the default" (extra 49).
+
+| shared file | who writes it now | IDs |
+|---|---|---|
+| `runs.json`, `tasks.json` | the queue holding `<training dir>/.queue.lock`; another queue on the folder is a guest (reads, refuses jobs and removals, the server's retries on each read); the CLI's job commands refuse while the service owns it | QA-012, RA-053, extra 22 |
+| a run's folder and export | its training, which holds `<run dir>.busy`; Remove with files, Retry export and Remove export refuse a Live one | RA-051 |
+| the config file | every writer under `.<config name>.lock` (`config_file::edit_file`, `ConfigStore::update`); unchanged edits write nothing | QA-016, -017, -013, -018, extra 49 |
+| `tools/` toolchain and `train-env` | removals under `.train.lock` + `.model-export.lock`; lock files never deleted | RA-052, QA-021, extras 10, 11 |
+| `auth/admin-token` | `ensure` / `rotate` under `auth/.lock` | QA-020 |
+| `benchmark-history.json` | under the results lock, also from the History page | QA-015, extra 52 |
+| `benchmark-breadcrumb.json` | removed under its lock; a run checks its handle is still the file | QA-014, extra 29 |
+
+What a user notices:
+- `train run`, `retry-export`, import, auto-label, overlaps and refine commands refuse once the service's training
+  queue has started (first Train-tab use): "the service's training queue owns <dir>; queue it on the Train tab, or
+  stop the service and run the command again". `train list` still works. While a command owns the folder, the Train
+  tab shows its records and refuses jobs and removals until it ends.
+- Remove export toolchain / Remove training environment are refused (409) while a training, import, auto-label,
+  dataset check, environment setup or export runs in any process; `tools/` keeps its two zero-byte lock files. SAM 3
+  Remove is refused while any job is queued or running. After Remove export toolchain the next training rebuilds
+  `train-env` (Windows used to fail with "No Python at ...").
+- New zero-byte files, never removed: `<training dir>/.queue.lock`, `.<config name>.lock` beside the config. A
+  `<run id>.busy` beside a run folder exists while it trains (or after a crash, until the owner's next open).
+- `list-resources` uses the Resources card's installed rule: OpenVINO with a truncated `.installed.json` beside a
+  `VERSION` file now counts as not installed and is downloaded again.
+- Writes by commands are validated before they are saved; a no-op `train autolabel` / `--review-folder` config write
+  says "unchanged <path>".
+
+Also fixed on the way: the queue's one condition variable was waited on with two mutexes (QA-023; on macOS std
+panics), and `write_runs` held the store mutex across the fsync (QA-022).
+
+Tests: every fix has a test that fails without it, shown in a private copy with its own target folder (the queue's
+guest mode, reader, run marker and condition variables; the config lock in one process and in two; the toolchain
+locks and lock files; the installed rule; the admin token race; the history `models` check; the breadcrumb's handle
+check). Two tests run a second process from the test binary (`queue_owner_child`, `config_lock_child`).
+
+Left for later: the Storage card row for run folders no record names (listed by `train list` only; phase 4), and the
+verifier's optional TrainLock check for runs of older binaries without a busy marker. Not verified here: the Windows
+`names_file` (volume serial + file index) was type-checked and linted for `x86_64-pc-windows-msvc` and runs only in CI.

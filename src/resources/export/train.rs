@@ -12,7 +12,10 @@
 //!   and the Ultralytics base weights (`tools/export-weights/<name>`). The environment is built
 //!   by [`super::prepare_env`] under the export lock, so an export and a training setup never
 //!   run uv at the same time; the training itself holds its own lock (`tools/.train.lock`) so
-//!   one training runs at a time across processes while exports go on.
+//!   one training runs at a time across processes while exports go on. "Remove training
+//!   environment" ([`remove_train_env`]) holds both locks while it deletes and never deletes
+//!   either lock file. An environment whose base Python (`pyvenv.cfg`'s `home`) is gone is not
+//!   ready and is rebuilt.
 //! - **Extending**: the import / auto-label stages add their packages to
 //!   `scripts/requirements-model-train.txt` and regenerate the locks; the environment marker
 //!   (lock name + SHA-256) makes every existing environment rebuild once.
@@ -127,7 +130,7 @@ pub struct TrainPaths {
 impl TrainPaths {
     pub fn new(root: &Path, models: PathBuf) -> Self {
         let mut export = Paths::new(root, models);
-        export.env = export.tools.join("train-env");
+        export.env = export.tools.join(TRAIN_ENV_DIR);
         Self {
             weights: root.join(catalog::TRAIN_WEIGHTS_DEST),
             config: export.tools.join("train-config"),
@@ -160,7 +163,7 @@ impl TrainPaths {
 
     /// Cross-process training lock (one training at a time).
     pub fn train_lock_file(&self) -> PathBuf {
-        self.export.tools.join(".train.lock")
+        self.export.tools.join(TRAIN_LOCK_NAME)
     }
 
     /// What "Remove training environment" deletes (the shared uv / Python stay for the export).
@@ -181,12 +184,16 @@ pub fn train_env_ready(paths: &TrainPaths, platform: Platform, lane: TrainLane) 
 }
 
 /// Delete the training environment, its base weights and settings (not uv or Python, which the
-/// export shares, nor the training runs).
+/// export shares, nor the training runs), holding both tool locks (`hold_tools`):
+/// refused with [`super::ToolsBusy`] while a training, import, auto-label, dataset check, an
+/// environment setup or an export (of this process or another) holds one. The lock files stay.
 pub fn remove_train_env(paths: &TrainPaths) -> Result<()> {
+    let Some(_held) = hold_tools(&paths.export)? else {
+        return Ok(());
+    };
     for d in paths.removable() {
         manager::remove_any(&d)?;
     }
-    let _ = std::fs::remove_file(paths.train_lock_file());
     Ok(())
 }
 
@@ -278,6 +285,11 @@ pub(crate) fn prepare_train_env(
 /// How long [`TrainLock::try_acquire`] retries a lock that looks held.
 pub const LOCK_GRACE: Duration = Duration::from_secs(1);
 
+/// File name of the training lock in `tools/` ([`TrainPaths::train_lock_file`]).
+pub(crate) const TRAIN_LOCK_NAME: &str = ".train.lock";
+/// Folder of the training environment in `tools/`.
+pub(crate) const TRAIN_ENV_DIR: &str = "train-env";
+
 /// Exclusive cross-process training lock; released on drop.
 #[derive(Debug)]
 pub struct TrainLock {
@@ -302,32 +314,36 @@ impl TrainLock {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        match Self::try_hold(path).with_context(|| format!("locking {}", path.display()))? {
+            Some(lock) => Ok(lock),
+            None => bail!(
+                "another process (the service or a `blue-onyx-prism train` command) is training \
+                 a model and holds {}; wait for it to finish or cancel it, then try again",
+                path.display()
+            ),
+        }
+    }
+
+    /// [`Self::try_acquire`] in an existing folder, None when the lock stays held for
+    /// [`LOCK_GRACE`] (for callers that refuse with their own message).
+    pub(crate) fn try_hold(path: &Path) -> std::io::Result<Option<Self>> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(path)
-            .with_context(|| format!("opening {}", path.display()))?;
+            .open(path)?;
         let waited = crate::fsx::lock_wait_with(
             &file,
             crate::fsx::LockKind::Exclusive,
             crate::fsx::deadline_after(LOCK_GRACE),
             crate::fsx::Pauses::fixed(Duration::from_millis(20)),
             || true,
-        )
-        .with_context(|| format!("locking {}", path.display()))?;
-        match waited {
-            crate::fsx::Waited::Held => Ok(Self {
-                _file: file,
-                path: path.to_path_buf(),
-            }),
-            crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped => bail!(
-                "another process (the service or a `blue-onyx-prism train` command) is training \
-                 a model and holds {}; wait for it to finish or cancel it, then try again",
-                path.display()
-            ),
-        }
+        )?;
+        Ok(matches!(waited, crate::fsx::Waited::Held).then(|| Self {
+            _file: file,
+            path: path.to_path_buf(),
+        }))
     }
 }
 

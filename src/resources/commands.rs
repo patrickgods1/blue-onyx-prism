@@ -270,12 +270,11 @@ pub fn fetch(config: &Config, req: &FetchRequest) -> Result<()> {
 /// `list-resources` as text.
 pub fn list_resources(config: &Config, hw: &HardwareInfo, installed: &Installed) -> String {
     let r: Resolution = resolve::needed(config, hw, installed);
-    let models_dir = config.data_path(&config.models_dir);
     let mut out = String::new();
     let _ = writeln!(out, "Resources for {}/{}:", hw.os, hw.arch);
     let _ = writeln!(out, "  {:<24} {:>8}  {:<28} TITLE", "ID", "SIZE", "STATE");
     for res in catalog::for_platform(&hw.os, &hw.arch) {
-        let state = state_of(res, &r, installed, &models_dir, &config.data_root());
+        let state = state_of(res, &r, installed, config);
         let _ = writeln!(
             out,
             "  {:<24} {:>8}  {:<28} {}",
@@ -339,27 +338,9 @@ pub fn list_resources(config: &Config, hw: &HardwareInfo, installed: &Installed)
     out
 }
 
-fn state_of(
-    res: &Resource,
-    r: &Resolution,
-    installed: &Installed,
-    models_dir: &Path,
-    root: &Path,
-) -> String {
-    let installed_now = match res.kind {
-        ResourceKind::Model => {
-            manager::is_installed(res, models_dir)
-                || res
-                    .parts
-                    .iter()
-                    .all(|p| models_dir.join(p.file_name).is_file())
-        }
-        ResourceKind::BenchImages | ResourceKind::Tool => {
-            manager::is_installed(res, &root.join(res.dest))
-        }
-        ResourceKind::ExportModel => super::export::is_exported(res, models_dir),
-        _ => installed.has(res.id),
-    };
+fn state_of(res: &Resource, r: &Resolution, installed: &Installed, config: &Config) -> String {
+    // The Resources card's rule, so the two never disagree.
+    let installed_now = super::status::is_installed(res, installed, config);
     if res.kind == ResourceKind::ExportModel && !installed_now {
         let users: Vec<&str> = r
             .models

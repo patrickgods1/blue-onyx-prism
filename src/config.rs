@@ -1193,6 +1193,18 @@ impl Config {
         Ok(config)
     }
 
+    /// The config in the file at `path` ([`Self::load`]), or the default config when there is no
+    /// such file: what every command that edits the config starts from. A file that cannot be
+    /// used is an error that says what to do (fix it, or pass another file), never the default
+    /// config (which a save would write over the user's file).
+    pub fn load_or_default(path: &Path) -> Result<Self> {
+        if path.exists() {
+            Self::load(path).context("fix the config file, or pass --config <another file>")
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     /// The switches a command-line flag turns on for one run only (`force_cpu`,
     /// `save_ref_image`): every write of a config that may hold such a flag has to put the file's
     /// values back ([`Self::set_one_off_flags`]).
@@ -4118,6 +4130,28 @@ mod tests {
         std::fs::write(&path, r#"{"format": "two"}"#).unwrap();
         let err = format!("{:#}", Config::load(&path).unwrap_err());
         assert!(err.contains("not valid config JSON"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Extra 49: the one "file, else the default" loader of the commands that edit the config.
+    /// A missing file is the default; a broken one is an error naming the way out, never the
+    /// default (which a save would write over the user's file).
+    #[test]
+    fn load_or_default_never_replaces_a_broken_file_with_the_default() {
+        let dir = std::env::temp_dir().join(format!("bop-cfg-lod-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        assert_eq!(Config::load_or_default(&path).unwrap(), Config::default());
+        assert!(!path.exists(), "loading creates nothing");
+        std::fs::write(&path, r#"{"port": 4000}"#).unwrap();
+        assert_eq!(Config::load_or_default(&path).unwrap().port, 4000);
+        std::fs::write(&path, r#"{"port": "#).unwrap();
+        let err = format!("{:#}", Config::load_or_default(&path).unwrap_err());
+        assert!(
+            err.starts_with("fix the config file, or pass --config <another file>"),
+            "{err}"
+        );
+        assert!(err.contains(&path.display().to_string()), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

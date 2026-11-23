@@ -17,13 +17,21 @@
 //! the previous config at once instead of waiting for the `fsync`.
 //!
 //! Lock order: readers take no lock. Writers ([`ConfigStore::update`], [`ConfigStore::adopt`],
-//! [`ConfigStore::check_disk`]) serialize on `writer`, the store's only lock, held across the
-//! external-edit check, the edit, the file write (its `fsync`) and the publish. When a writer
+//! [`ConfigStore::check_disk`]) serialize on `writer`, the store's in-process lock, held across
+//! the external-edit check, the edit, the file write (its `fsync`) and the publish. When a writer
 //! also holds `server::AppState::apply_lock` (`save_config`), that lock is taken first:
 //! `apply_lock` -> `writer`, never the reverse (nothing done under `writer`, an edit closure
 //! included, may take `apply_lock` or call a writer of this store: the mutex is not reentrant).
-//! [`ConfigStore::check_disk`] only tries `writer`: the polls that call it never queue behind a
-//! save.
+//! [`ConfigStore::update`] then takes the config file lock ([`crate::config_file::lock`], an
+//! fs4 lock on `.<config name>.lock` that the commands editing the file hold too, through
+//! [`crate::config_file::edit_file`]), waiting at most [`crate::config_file::STORE_LOCK_WAIT`]
+//! (an error naming the lock file after that), and holds it across the external-edit check, the
+//! later-format check, the edit, the write and the read-back, so no command's save lands between
+//! the hash and the write and none saves a copy read before this save. The full order is
+//! `apply_lock` -> `writer` -> config file lock; nothing under the file lock calls a writer of
+//! this store or `edit_file`. [`ConfigStore::check_disk`] only tries `writer` and, like
+//! [`ConfigStore::adopt`], takes no file lock (it only reads, and every save is an atomic
+//! rename): the polls that call it never queue behind a save.
 //!
 //! Edits on disk: each generation runs a disk watch ([`spawn_disk_watch`], every
 //! [`DISK_POLL`]) that calls `server::sync_config`, which applies a changed file exactly like a
@@ -257,6 +265,9 @@ pub struct ConfigStore {
     current: ArcSwap<Published>,
     /// Serializes the writers (see the module doc for the lock order).
     writer: Mutex<Writer>,
+    /// How long [`Self::update`] waits for another process's hold of the config file lock
+    /// ([`crate::config_file::STORE_LOCK_WAIT`]).
+    file_wait: std::time::Duration,
     #[cfg(test)]
     write_hook: Mutex<Option<WriteHook>>,
 }
@@ -300,6 +311,7 @@ impl ConfigStore {
                 serial: 1,
             }),
             writer: Mutex::new(Writer { disk }),
+            file_wait: crate::config_file::STORE_LOCK_WAIT,
             #[cfg(test)]
             write_hook: Mutex::new(None),
         }
@@ -522,6 +534,10 @@ impl ConfigStore {
         edit: impl FnOnce(&mut Config) -> Result<R>,
     ) -> Result<Updated<R>> {
         let mut w = self.writer.lock_recover();
+        // The file lock of every config writer (QA-016), held to the end of the save: a command
+        // editing the file (add-model, train, benchmark --apply) saves before the hash below or
+        // after this save, never inside it.
+        let _file = crate::config_file::lock(&self.path, self.file_wait)?;
         // Always hash here (rare, and about to overwrite the file): the stat-only shortcut of
         // the poll can miss an external edit, which this write would then destroy.
         self.sync_disk(&mut w, true);
@@ -916,6 +932,109 @@ mod tests {
                 "config page"
             ]
         );
+    }
+
+    /// QA-013 (the lost update of QA-016): a command saving the file (here
+    /// [`crate::config_file::edit_file`] adding a model, as `add-model` does) while a page save
+    /// is between its hash of the file and its write. Before the file lock the command's save
+    /// landed inside that window and the page save wrote over it; now the command waits for the
+    /// page save and edits its result, so the file and the store keep both changes. The 500 ms
+    /// wait only decides the order (it can never fail the test after the fix).
+    #[test]
+    fn a_save_by_another_process_during_a_ui_save_is_kept() {
+        let path = tmp();
+        let s = Arc::new(ConfigStore::new(cfg(), path.clone()));
+        s.update("test", |_| Ok(())).unwrap();
+        let p = park(&s);
+        let page = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                s.update("config page", |c| {
+                    c.port = 4000;
+                    Ok(())
+                })
+                .unwrap()
+            })
+        };
+        p.entered
+            .recv_timeout(STEP)
+            .expect("the page save reached its write");
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let command = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let r = crate::config_file::edit_file(
+                    &path,
+                    crate::config_file::Missing::Default,
+                    |c| {
+                        c.models.push(ModelConfig {
+                            name: Some("added-by-command".into()),
+                            path: "models/added-by-command.onnx".into(),
+                            ..Default::default()
+                        });
+                        Ok(())
+                    },
+                );
+                done_tx.send(()).unwrap();
+                r.unwrap()
+            })
+        };
+        let _ = done.recv_timeout(std::time::Duration::from_millis(500));
+        p.release.send(()).unwrap();
+        page.join().unwrap();
+        assert!(command.join().unwrap().changed);
+        let names = |c: &Config| -> Vec<String> {
+            c.models.iter().map(ModelConfig::effective_name).collect()
+        };
+        let both = (
+            4000,
+            vec!["IPcam-general".to_string(), "added-by-command".into()],
+        );
+        let on_disk = Config::load(&path).unwrap();
+        assert_eq!((on_disk.port, names(&on_disk)), both, "the file keeps both");
+        s.check_disk();
+        let r = s.read();
+        assert_eq!((r.port, names(&r)), both, "the service keeps both");
+    }
+
+    /// A page save waits a short while for a command's hold of the config file lock, then
+    /// fails with an error naming the lock file; nothing is written or published.
+    #[test]
+    fn a_save_gives_up_on_a_config_lock_held_too_long() {
+        let path = tmp();
+        let mut store = ConfigStore::new(cfg(), path.clone());
+        store.file_wait = std::time::Duration::from_millis(100);
+        let s = store;
+        s.update("test", |_| Ok(())).unwrap();
+        let before = std::fs::read(&*path).unwrap();
+        let lock = crate::config_file::lock_path(&path);
+        let held = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+        let err = s
+            .update("config page", |c| {
+                c.port = 4000;
+                Ok(())
+            })
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&lock.display().to_string()), "{msg}");
+        assert!(msg.contains("another blue-onyx-prism process"), "{msg}");
+        assert_eq!(std::fs::read(&*path).unwrap(), before);
+        assert_eq!((s.revision(), s.read().port), (1, crate::DEFAULT_PORT));
+        assert!(s.writer.try_lock().is_ok(), "the writer lock was released");
+        drop(held);
+        s.update("config page", |c| {
+            c.port = 4000;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(Config::load(&path).unwrap().port, 4000);
     }
 
     /// Every publish changes the serial; a write that changes nothing publishes nothing, so a

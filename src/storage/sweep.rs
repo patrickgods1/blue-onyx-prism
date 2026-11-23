@@ -1154,7 +1154,8 @@ pub fn clear(s: &Settings, what: &Clear) -> anyhow::Result<Report> {
 
 /// Remove the review export `name` of `training_dir`'s `exports` folder (the Storage card's
 /// Remove). The name must be one the card lists, never a path; an export a queued or running
-/// training run reads is refused, and so is one `configured` (`training.datasets`, resolved)
+/// training run reads is refused (also one whose run's busy marker another process holds,
+/// [`crate::training::service::run_in_use`]), and so is one `configured` (`training.datasets`, resolved)
 /// lists, which `train run` and the Train tab would then miss.
 pub fn remove_export(
     training_dir: &Path,
@@ -1185,6 +1186,18 @@ pub fn remove_export(
         anyhow::bail!(
             "training run {} ({}) uses the export {name}; wait for it to finish or cancel it, \
              then remove the export",
+            r.name,
+            r.id
+        );
+    }
+    // Whatever its record says (another process may run it, or a record read before it
+    // started): a run whose busy marker is held is training on it now.
+    if let Some(r) = runs.iter().find(|r| {
+        r.request.datasets.iter().any(|d| same(d)) && matches!(busy::probe(&r.run_dir), State::Live)
+    }) {
+        anyhow::bail!(
+            "a training in another process (run {}, {}) is using the export {name}; wait for it \
+             to finish, then remove the export",
             r.name,
             r.id
         );

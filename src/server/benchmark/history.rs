@@ -158,6 +158,24 @@ fn edit_history(
     edit: impl FnOnce(&mut History) -> anyhow::Result<String>,
 ) -> Response {
     let path = results_path(&state.config_path);
+    // The results lock first (it excludes a `blue-onyx-prism benchmark` run's record in another
+    // process), then History::update's own in-process lock: the order of `record` and `forget`.
+    let _results_lock = match crate::benchmark::results_io::lock(
+        &path,
+        crate::benchmark::results_io::Holder::Writer,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("benchmark history {what} waited for the results lock in vain: {e:#}");
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "The benchmark history was not changed: the benchmark results are busy ({e:#}). \
+                     Wait for the running benchmark command to finish, then try again."
+                ),
+            );
+        }
+    };
     let results = BenchmarkResults::load_or_warn(&path);
     let hist = history_path(&path);
     match History::update(&hist, results.as_ref(), edit) {
@@ -308,6 +326,27 @@ mod tests {
     const T1: &str = "2026-10-16T14:00:00.000Z";
     const T2: &str = "2026-10-16T15:00:00.000Z";
     const T1_FORM: &str = "2026-10-16T14%3A00%3A00.000Z";
+
+    /// A pin waits for the results lock another handle holds (a CLI run saving), and writes
+    /// nothing meanwhile.
+    #[tokio::test]
+    async fn a_pin_waits_for_the_results_lock() {
+        use crate::benchmark::results_io::{Holder, lock};
+        let st = state();
+        let path = results_path(&st.config_path);
+        let hist = history_path(&path);
+        results_with(T1, 40.0).save(&path).unwrap();
+        let held = lock(&path, Holder::Writer).unwrap();
+        let body = format!("model=ipcam-general&run_id={T1_FORM}&pinned=1");
+        let (answer, ()) =
+            tokio::join!(call(&st, post("/v1/benchmark/history/pin", &body)), async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert!(!hist.exists(), "the pin was saved while the lock was held");
+                drop(held);
+            });
+        assert_eq!(answer.0, StatusCode::OK, "{}", answer.1);
+        assert!(hist.exists());
+    }
 
     #[tokio::test]
     async fn history_get_compare_pin_delete() {

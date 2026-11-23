@@ -217,10 +217,19 @@ pub fn read(path: &Path) -> Result<AdminToken> {
     }
 }
 
-/// Replace `path` with a new token (a new file: whatever was there, even unusable, goes). Its
-/// folder must exist ([`prepare`] makes the real one). A failure leaves the old token working,
-/// and no copy of the new one behind. Run as root, the file goes to the folder's owner.
-pub fn rotate(path: &Path) -> Result<AdminToken> {
+/// Run `f` under `auth/.lock` (the lock of the folder holding `path`), the one lock of every
+/// read-modify-write in `auth/`: the service's `ensure_for` and the CLI's `admin-token` never
+/// interleave their check and their write.
+fn locked<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let dir = path
+        .parent()
+        .context("the admin token file has no parent folder")?;
+    let _held = crate::accounts::lock::lock(dir)?;
+    f()
+}
+
+/// [`rotate`] without the lock, for a caller that holds `auth/.lock` already.
+fn write_new(path: &Path) -> Result<AdminToken> {
     let dir = path
         .parent()
         .context("the admin token file has no parent folder")?;
@@ -233,16 +242,27 @@ pub fn rotate(path: &Path) -> Result<AdminToken> {
     Ok(AdminToken(value))
 }
 
+/// Replace `path` with a new token (a new file: whatever was there, even unusable, goes). Its
+/// folder must exist ([`prepare`] makes the real one). A failure leaves the old token working,
+/// and no copy of the new one behind. Run as root, the file goes to the folder's owner. Under
+/// `auth/.lock`.
+pub fn rotate(path: &Path) -> Result<AdminToken> {
+    locked(path, || write_new(path))
+}
+
 /// The token in `path`, made if there is none (true: made now). A file that exists and cannot be
 /// used is an error and stays: replacing it silently would lock out whoever holds the token,
-/// and it may only be unreadable for this account.
+/// and it may only be unreadable for this account. Load, write and read back are one step under
+/// `auth/.lock`, so of two first starts (service and CLI) one makes the token and the other
+/// returns that same one.
 pub fn ensure(path: &Path) -> Result<(AdminToken, bool)> {
-    if let Some(t) = load(path)? {
-        return Ok((t, false));
-    }
-    rotate(path)?;
-    // Another process may have made one at the same moment: what is on disk counts.
-    Ok((read(path)?, true))
+    locked(path, || {
+        if let Some(t) = load(path)? {
+            return Ok((t, false));
+        }
+        write_new(path)?;
+        Ok((read(path)?, true))
+    })
 }
 
 /// Make the token when there is none, after moving a token of an earlier version into `auth/`
@@ -279,16 +299,18 @@ pub fn rotate_once_after_remote_admin(config: &Config) -> Result<bool> {
     let auth = path
         .parent()
         .context("the admin token file has no parent folder")?;
-    if auth.join(ROTATED_MARKER).exists() {
-        return Ok(false);
-    }
-    rotate(&path)?;
-    crate::private_dir::write_file(
-        auth,
-        ROTATED_MARKER,
-        "The API token was rotated once by the upgrade that retired allow_remote_admin.\n",
-    )?;
-    Ok(true)
+    locked(&path, || {
+        if auth.join(ROTATED_MARKER).exists() {
+            return Ok(false);
+        }
+        write_new(&path)?;
+        crate::private_dir::write_file(
+            auth,
+            ROTATED_MARKER,
+            "The API token was rotated once by the upgrade that retired allow_remote_admin.\n",
+        )?;
+        Ok(true)
+    })
 }
 
 /// `blue-onyx-prism admin-token [--rotate]` for `config`: the token to print (made when there is
@@ -358,7 +380,7 @@ mod tests {
         assert_eq!(a.reveal(), b.reveal());
         assert_eq!(read(&p).unwrap().reveal(), a.reveal());
         let left: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
-        assert_eq!(left.len(), 1, "a temporary file stayed behind");
+        assert_eq!(left.len(), 2, "the token and the lock only");
     }
 
     fn config_in(root: &Path) -> Config {
@@ -513,7 +535,39 @@ mod tests {
         // An unusable file does not stop a rotation: it is the way out.
         std::fs::write(&p, "").unwrap();
         assert!(hex64(rotate(&p).unwrap().reveal()));
-        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2, "token + lock");
+    }
+
+    /// A service and a CLI starting together: every caller gets the token that ends up on disk and
+    /// only one made it.
+    #[test]
+    fn concurrent_first_starts_agree_on_one_token() {
+        let d = dir();
+        let p = d.join(FILE_NAME);
+        let results: Vec<(AdminToken, bool)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| ensure(&p).unwrap())).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let on_disk = read(&p).unwrap();
+        for (t, _) in &results {
+            assert_eq!(t.reveal(), on_disk.reveal());
+        }
+        assert_eq!(results.iter().filter(|(_, made)| *made).count(), 1);
+    }
+
+    /// A held `auth/.lock` holds `ensure` back: nothing is written until it is released.
+    #[test]
+    fn ensure_waits_for_the_auth_lock() {
+        let d = dir();
+        let p = d.join(FILE_NAME);
+        let held = crate::accounts::lock::lock(&d).unwrap();
+        std::thread::scope(|s| {
+            let h = s.spawn(|| ensure(&p).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(!p.exists(), "written while another holder had the lock");
+            drop(held);
+            assert!(h.join().unwrap().1);
+        });
     }
 
     #[cfg(unix)]

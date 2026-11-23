@@ -13,6 +13,18 @@ fn yolo26n() -> &'static Resource {
     catalog::export_model("yolo26n").unwrap()
 }
 
+/// After "Remove export toolchain": `tools/` holds the two zero-byte lock files only (never
+/// deleted, audit 2026-11 extra 10).
+fn assert_only_locks_left(tools: &Path) {
+    let mut left: Vec<String> = std::fs::read_dir(tools)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, [".model-export.lock", ".train.lock"]);
+}
+
 /// RS-09: `install_outputs` moves `.yaml`, then `.onnx`, then the manifest; a failure at the
 /// last step restores the previous files and leaves no new manifest.
 #[test]
@@ -231,7 +243,7 @@ fn full_export_runs_every_stage_in_order() {
     assert!(manifest(yolo26n(), &root.join("models")).is_none());
     remove_toolchain(&j.paths).unwrap();
     assert!(!toolchain_state(&j.paths, MAC).present);
-    assert!(!root.join("tools").exists());
+    assert_only_locks_left(&root.join("tools"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1396,7 +1408,7 @@ fn deimv2_export_fetches_the_source_and_passes_it() {
 
     // Remove toolchain: the source goes with it.
     remove_toolchain(&j.paths).unwrap();
-    assert!(!root.join("tools").exists());
+    assert_only_locks_left(&root.join("tools"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1685,7 +1697,7 @@ fn windows_old_runtime_gets_the_private_copy() {
     assert!(lines.iter().all(|l| !l.contains("placed")), "{lines:?}");
     // Remove export toolchain removes the private runtime and the copies with tools/python.
     remove_toolchain(&j.paths).unwrap();
-    assert!(!root.join("tools").exists());
+    assert_only_locks_left(&root.join("tools"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1798,4 +1810,118 @@ fn self_check_failure_is_classified() {
     );
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&root2);
+}
+
+/// A toolchain on disk with every shared part (uv, Python, the uv cache, the export and training
+/// environments); returns the paths.
+fn toolchain_on_disk(root: &Path) -> Paths {
+    let p = Paths::new(root, root.join("models"));
+    for d in [&p.uv_dir, &p.python_installs, &p.uv_cache, &p.env] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join("f"), b"x").unwrap();
+    }
+    p
+}
+
+/// Audit 2026-11 (RA-052, QA-021): "Remove export toolchain" refuses while a training (or an
+/// import, auto-label, dataset check) holds `.train.lock`, or an export or training setup holds
+/// `.model-export.lock`, through another handle as another process would; nothing is deleted.
+/// Once both are free it removes the toolchain and leaves both lock files (extra 10: a holder
+/// keeps its lock on an unlinked file while the next taker creates a new one).
+#[test]
+fn remove_toolchain_refuses_a_held_tool_lock_and_keeps_the_lock_files() {
+    let root = tmp("remove-locked");
+    let p = toolchain_on_disk(&root);
+    let train_lock = p.tools.join(".train.lock");
+    for lock in [train_lock.clone(), p.lock_file()] {
+        let held = train::TrainLock::try_acquire(&lock).unwrap();
+        assert!(tools_in_use(&p).is_some_and(|w| w.contains(&lock.display().to_string())));
+        let e = remove_toolchain(&p).unwrap_err();
+        assert!(e.is::<ToolsBusy>(), "{e:#}");
+        assert!(format!("{e:#}").contains("wait for it to finish"), "{e:#}");
+        assert!(p.python_installs.join("f").exists(), "nothing removed");
+        assert!(p.uv_dir.join("f").exists(), "nothing removed");
+        drop(held);
+    }
+    // A lock just dropped can look held for a moment while a child forked by a parallel test
+    // shares the file (the removal's own try has the phase-2 grace).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tools_in_use(&p).is_some() {
+        assert!(Instant::now() < deadline, "the locks stay held");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    remove_toolchain(&p).unwrap();
+    assert!(!toolchain_state(&p, MAC).present);
+    assert!(
+        train_lock.is_file() && p.lock_file().is_file(),
+        "lock files kept"
+    );
+    assert_only_locks_left(&p.tools);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A look at the locks creates nothing; without a `tools` folder a removal is a no-op.
+#[test]
+fn tools_in_use_and_remove_create_nothing_without_tools() {
+    let root = tmp("no-tools");
+    let p = Paths::new(&root, root.join("models"));
+    assert_eq!(tools_in_use(&p), None);
+    remove_toolchain(&p).unwrap();
+    assert!(!p.tools.exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Audit 2026-11 extra 11: `tools/python` is the training environment's base interpreter. A
+/// removed toolchain makes the training environment not ready (its marker goes, and an env whose
+/// `pyvenv.cfg` `home` is gone is not ready either), so the next job rebuilds it instead of
+/// failing with "No Python at ...".
+#[test]
+fn removing_the_toolchain_makes_the_training_env_not_ready() {
+    let root = tmp("train-env-home");
+    let tp = train::TrainPaths::new(&root, root.join("models"));
+    let fake = Fake::new();
+    let res = yolo26n();
+    let job = train::env_job(&tp, res, LINUX);
+    let lane = train::TrainLane::Cu126;
+    train::prepare_train_env(
+        &job,
+        lane,
+        &fake,
+        &fake,
+        &mut |_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(train::train_env_ready(&tp, LINUX, lane));
+
+    // Only the base Python goes (what a removal on Windows that kept the copied launcher, or a
+    // user, leaves): not ready.
+    let home = vc_runtime::pyvenv_home(
+        &std::fs::read_to_string(tp.export.env.join("pyvenv.cfg")).unwrap(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    assert!(tp.export.env_python(false).is_file(), "the launcher stays");
+    assert!(!train::train_env_ready(&tp, LINUX, lane), "dangling env");
+    // No pyvenv.cfg at all: not ready.
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(train::train_env_ready(&tp, LINUX, lane));
+    std::fs::remove_file(tp.export.env.join("pyvenv.cfg")).unwrap();
+    assert!(!train::train_env_ready(&tp, LINUX, lane));
+
+    // Rebuilt, then the toolchain removed: the marker goes with tools/python.
+    train::prepare_train_env(
+        &job,
+        lane,
+        &fake,
+        &fake,
+        &mut |_| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(train::train_env_ready(&tp, LINUX, lane));
+    remove_toolchain(&Paths::new(&root, root.join("models"))).unwrap();
+    assert!(!tp.export.env.join(ENV_MARKER).exists());
+    assert!(!train::train_env_ready(&tp, LINUX, lane));
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -356,7 +356,7 @@ it; every key can also be set in the file.
 | `collect.hidden_classes` | (none) | Classes of `collect.classes` left out of the Review tab's class pickers, new-box list and 1-0 keys; they keep their class ids and stay in exports and auto-label runs. Applies: at once. UI: Dataset tab, Classes |
 | `collect.size_floor` | unset (off) | `{"px": 10, "input": 384}`: a training box whose short side at a model input of `input` pixels (`min(w / W, h / H) * input`) is under `px` is exported as an ignore region (YOLO and benchmark ground truth leave it out, `ignore.json` marks it `size_floor`); the dataset check judges by it (its fold models train without it), and a training run at a larger input gives back the regions not under it there. Accepted labels are never rewritten; the Refine tab can only hide pending proposals under it on unreviewed frames (`reason: size_floor`, a dismissal) and restore them later. Scores before and after a change do not compare. `px` 1-64, `input` 64-4096. Applies: at the next export. UI: Refine tab, Too small |
 | `training` | defaults | Model training ([docs/TRAINING.md](docs/TRAINING.md)): where runs go, the review exports offered, dataset defaults. Read when a run is queued. Applies: at once. UI: Train tab |
-| `training.dir` | `null` | Folder of the training runs (prepared dataset, `train.log`, held-out benchmark set, `runs.json`); `null` = `training` under the data folder; relative paths resolve there. Applies: at once (refused on the page while a training job is queued or running; old runs stay in the old folder). UI: Train tab, Advanced (Folders and training environment) |
+| `training.dir` | `null` | Folder of the training runs (prepared dataset, `train.log`, held-out benchmark set, `runs.json`); `null` = `training` under the data folder; relative paths resolve there. Applies: at once (refused on the page while a training job is queued or running, or while a `train` command uses the new folder; old runs stay in the old folder). UI: Train tab, Advanced (Folders and training environment) |
 | `training.datasets` | `[]` | Review export folders (YOLO layout) offered on the Train tab and used by `train run` without `--dataset`. Applies: at once. UI: Train tab |
 | `training.epochs` | unset | Epochs of every run (1-1000; a cap while early stopping is on); unset = the model family's recommendation (YOLO / RF-DETR 100, RT-DETRv2 / D-FINE 80). A stored `50` (the old default) reads as unset. Applies: at once. UI: Train tab |
 | `training.patience` | unset | Epochs without a gain (> 0.001) of the selected metric (`training.select_metric`, mAP by default) before a run stops and keeps its best epoch (0 = off, at most `training.epochs`); unset = the family's recommendation (YOLO 15, others 10). Applies: at once. UI: Train tab |
@@ -498,7 +498,10 @@ Headless: `blue-onyx-prism fetch --resource model:yolo11s --allow-large` (`--all
 Where things live: everything is under `<download_dir or exe dir>/tools/`: `uv/`, `python/`,
 `export-env/` (the virtual environment), `export-weights/<name>/`, `export-work/`,
 `export-config/` (Ultralytics / Hugging Face settings), `deimv2-src/`. *Remove export toolchain* on
-the `tool:uv` row (or deleting `tools/`) frees it; exported models stay. Removing an exported row
+the `tool:uv` row (or deleting `tools/` while nothing runs) frees it; exported models stay. It is
+refused while an export, a training or its environment setup runs (in the service or a `fetch` /
+`train` command), and leaves the two zero-byte lock files `tools/.model-export.lock` and
+`tools/.train.lock`. Removing an exported row
 deletes its `.onnx` / `.yaml`. The YOLO26-only toolchain of earlier versions (`yolo26-env/` ...) is
 replaced by the first export.
 

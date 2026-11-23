@@ -566,7 +566,9 @@ pub trait ConfigWriter: Send + Sync {
 }
 
 /// The CLI's [`ConfigWriter`]: the config file at `path` (a missing file is the default
-/// config).
+/// config), edited under the config lock ([`crate::config_file::edit_file`]), so a page save of
+/// a running service is never undone. An edit that changes nothing leaves the file untouched
+/// and says "unchanged `<path>`" (QA-017).
 #[derive(Debug, Clone)]
 pub struct FileConfigWriter {
     pub path: PathBuf,
@@ -574,15 +576,12 @@ pub struct FileConfigWriter {
 
 impl ConfigWriter for FileConfigWriter {
     fn update(&self, edit: &mut dyn FnMut(&mut Config) -> Result<()>) -> Result<(Config, String)> {
-        let mut c = if self.path.exists() {
-            Config::load(&self.path)
-                .context("fix the config file, or pass --config <another file>")?
-        } else {
-            Config::default()
-        };
-        edit(&mut c)?;
-        c.save(&self.path)?;
-        Ok((c, format!("saved {}", self.path.display())))
+        let e =
+            crate::config_file::edit_file(&self.path, crate::config_file::Missing::Default, |c| {
+                edit(c)
+            })?;
+        let what = if e.changed { "saved" } else { "unchanged" };
+        Ok((e.config, format!("{what} {}", self.path.display())))
     }
 }
 
@@ -933,5 +932,24 @@ mod tests {
         assert!(msg.contains("cfg.json"));
         assert_eq!(c.collect.classes, ["person"]);
         assert_eq!(Config::load(&path).unwrap().collect.classes, ["person"]);
+        // QA-017: an edit that changes nothing (the Review folder it already has) leaves the
+        // file alone, bytes and modification time, and does not say "saved".
+        let dir = t.0.join("review");
+        std::fs::create_dir_all(&dir).unwrap();
+        w.update(&mut |c| crate::collect::config::set_review_dir(c, Some(dir.clone())))
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (c, msg) = w
+            .update(&mut |c| crate::collect::config::set_review_dir(c, Some(dir.clone())))
+            .unwrap();
+        assert!(!msg.contains("saved"), "{msg}");
+        assert!(
+            msg.starts_with("unchanged ") && msg.contains("cfg.json"),
+            "{msg}"
+        );
+        assert_eq!(c.collect.classes, ["person"]);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
     }
 }

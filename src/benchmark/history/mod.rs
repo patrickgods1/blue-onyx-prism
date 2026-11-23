@@ -645,6 +645,17 @@ impl History {
             models: BTreeMap::new(),
         };
         let mut warnings = Vec::new();
+        // A `models` that is present but not an object (a later format, a hand edit) is no
+        // empty history: bail, so `update` moves the file aside instead of saving over it.
+        if let Some(m) = obj.get("models")
+            && !m.is_null()
+            && !m.is_object()
+        {
+            bail!(
+                "parsing {}: `models` is not an object (a later format or a hand edit)",
+                path.display()
+            );
+        }
         if let Some(models) = obj.get("models").and_then(serde_json::Value::as_object) {
             for (name, list) in models {
                 let Some(list) = list.as_array() else {
@@ -704,7 +715,10 @@ impl History {
     }
 
     /// Load the file at `path` (a file that does not load is moved aside with a warning;
-    /// missing: seeded from `seed`), apply `edit`, save. Serialized in this process. Returns
+    /// missing: seeded from `seed`), apply `edit`, save. Serialized in this process by
+    /// `HISTORY_LOCK`; **the caller holds `results_io::lock(results_file, Holder::Writer)`**
+    /// (it is not reentrant, so this does not take it), which excludes other processes. The
+    /// order is the results lock, then `HISTORY_LOCK`, as in `record` and `forget`. Returns
     /// `edit`'s value and the warnings.
     pub fn update<T>(
         path: &Path,

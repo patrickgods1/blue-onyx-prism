@@ -12,6 +12,15 @@
 //! damaged file or a record this build cannot read is set aside as `<name>.corrupt-<time>` before
 //! the next save could write over it. Each saved record carries a `format` ([`RECORD_FORMAT`]); the
 //! file stays a bare JSON list, so an older build (which ignores unknown fields) still reads it.
+//!
+//! One owner per training folder. The queue that writes `runs.json` and `tasks.json` holds
+//! [`QueueLock`] (`<training dir>/.queue.lock`, a zero-byte fs4 lock file that is never deleted)
+//! for as long as that folder is its store, so the service and a `train` command never both write
+//! the files (each would save its own list over the other's). Only the owner uses
+//! [`load_or_move_aside`] and turns a busy record a crash left into an interrupted failure
+//! ([`open_records`]). Every other reader ([`load_records`], [`read_records`]) only reads: the
+//! file is never renamed, moved aside, copied or written, and a busy record is shown interrupted
+//! only when its owner is provably gone ([`queue_owned`] is false).
 
 use super::service::RunState;
 use crate::resources::export::{CommandRunner, Fetcher};
@@ -280,8 +289,8 @@ const READ_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 ///   itself keeps it until the next save, so a later load finds it again: the same records are not
 ///   copied twice.
 ///
-/// Every reader comes through here, including those that never save (the page before the queue
-/// starts, `train list`): a damaged file is damaged for all of them.
+/// Only the queue that owns the folder ([`QueueLock`]) loads through here; readers use
+/// [`read_records`] (a damaged file is no records for them, and stays where it is).
 pub fn load_or_move_aside<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
     load_checked(path)
 }
@@ -505,25 +514,127 @@ pub fn save_file<T: Serialize>(path: &Path, records: &[T]) {
     }
 }
 
-/// [`load_or_move_aside`]; busy records become interrupted failures.
+/// The owner's load ([`load_or_move_aside`], the caller holds the folder's [`QueueLock`]): busy
+/// records become interrupted failures ([`interrupt`]), since no other queue can be running them.
 pub fn open_records(path: &Path) -> Loaded<TaskRecord> {
     let mut loaded = load_or_move_aside::<TaskRecord>(path);
-    for r in &mut loaded.records {
-        if r.state.is_busy() {
-            r.state = RunState::Failed;
-            r.error = Some(
-                "interrupted: the service stopped while this job was queued or running; start \
-                 it again"
-                    .into(),
-            );
-        }
-    }
+    interrupt_busy(&mut loaded.records);
     loaded
 }
 
-/// [`open_records`], for a reader that does not save.
+/// [`interrupt`] every busy record of `tasks`; how many there were.
+pub fn interrupt_busy(tasks: &mut [TaskRecord]) -> usize {
+    let mut n = 0;
+    for r in tasks.iter_mut().filter(|r| r.state.is_busy()) {
+        interrupt(r);
+        n += 1;
+    }
+    n
+}
+
+/// The words a task gets when the queue that ran it stopped under it (a crash read back by the
+/// next owner, the service's stop for exit).
+pub fn interrupt(r: &mut TaskRecord) {
+    r.state = RunState::Failed;
+    r.error = Some(
+        "interrupted: the service stopped while this job was queued or running; start it again"
+            .into(),
+    );
+}
+
+/// The task records of `path` for a reader that never saves (the pages before the queue starts,
+/// a queue that is not the folder's owner): [`read_records`], so the file is never moved aside or
+/// written. A busy record shows as interrupted ([`interrupt`], in memory only) when no queue owns
+/// the folder ([`queue_owned`] is false), else it keeps its state: another process runs it.
 pub fn load_records(path: &Path) -> Vec<TaskRecord> {
-    open_records(path).records
+    let mut tasks = read_records::<TaskRecord>(path);
+    if tasks.iter().any(|r| r.state.is_busy()) && !queue_owned(&queue_lock_file(path)) {
+        for r in tasks.iter_mut().filter(|r| r.state.is_busy()) {
+            interrupt(r);
+        }
+    }
+    tasks
+}
+
+/// Name of the queue's owner lock in the training folder ([`QueueLock`]).
+pub const QUEUE_LOCK_FILE: &str = ".queue.lock";
+
+/// `.queue.lock` beside `file` (`runs.json` or `tasks.json`).
+pub fn queue_lock_file(file: &Path) -> PathBuf {
+    file.with_file_name(QUEUE_LOCK_FILE)
+}
+
+/// The training queue's hold on its folder (see the module docs): an exclusive fs4 lock on
+/// [`QUEUE_LOCK_FILE`], released on drop (explicitly, so a child process spawned meanwhile, which
+/// shares the open file until it execs, does not keep it). The file is never deleted: a holder
+/// keeps its lock on a deleted file while the next taker creates a new one and also gets it.
+#[derive(Debug)]
+pub struct QueueLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl QueueLock {
+    /// Take the lock at `path` (the folder is created when missing), retrying for `grace` while
+    /// another holder has it. `Ok(None)`: another queue (this process's or another's) holds it.
+    /// `Err`: the file cannot be made or locked (a read-only folder, a file system without
+    /// locks); the caller decides.
+    pub fn try_take(path: &Path, grace: std::time::Duration) -> std::io::Result<Option<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let waited = crate::fsx::lock_wait_with(
+            &file,
+            crate::fsx::LockKind::Exclusive,
+            crate::fsx::deadline_after(grace),
+            crate::fsx::Pauses::fixed(std::time::Duration::from_millis(20)),
+            || true,
+        )?;
+        Ok((waited == crate::fsx::Waited::Held).then(|| Self {
+            file,
+            path: path.to_path_buf(),
+        }))
+    }
+
+    /// The lock file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for QueueLock {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
+/// Whether a queue holds the lock file `lock` ([`QueueLock`]) now: tried once and let go at once.
+/// A missing file is no owner (no queue of this version ever opened the folder); a file that
+/// cannot be opened or locked counts as owned (nothing is known, so a reader keeps what the
+/// records say).
+pub fn queue_owned(lock: &Path) -> bool {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _ = fs4::FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
 }
 
 /// Save `records` to `path` ([`save_file`]).
@@ -839,13 +950,17 @@ mod tests {
             let dir = scratch("corrupt");
             let p = dir.join(TASKS_FILE);
             std::fs::write(&p, bytes).unwrap();
+            // A reader leaves it where it is; the owner's load moves it.
             assert!(load_records(&p).is_empty());
+            assert_eq!(std::fs::read(&p).unwrap(), bytes);
+            assert!(asides(&p).is_empty());
+            assert!(open_records(&p).records.is_empty());
             assert!(!p.exists(), "moved, not copied");
             let aside = asides(&p);
             assert_eq!(aside.len(), 1);
             assert_eq!(std::fs::read(&aside[0]).unwrap(), bytes);
             save_records(&p, &[record("a")]);
-            assert_eq!(load_records(&p).len(), 1);
+            assert_eq!(open_records(&p).records.len(), 1);
             assert_eq!(std::fs::read(&aside[0]).unwrap(), bytes, "still there");
             assert_eq!(asides(&p).len(), 1);
             let _ = std::fs::remove_dir_all(&dir);
@@ -878,18 +993,22 @@ mod tests {
         let list = serde_json::json!([record("a"), newer, record("b")]);
         std::fs::write(&p, serde_json::to_vec(&list).unwrap()).unwrap();
         let ids = |v: &[TaskRecord]| v.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        // A reader skips it and copies nothing.
         assert_eq!(ids(&load_records(&p)), ["a", "b"]);
+        assert!(asides(&p).is_empty());
+        let own = || open_records(&p).records;
+        assert_eq!(ids(&own()), ["a", "b"]);
         let aside = asides(&p);
         assert_eq!(aside.len(), 1);
         let kept: Vec<serde_json::Value> =
             serde_json::from_slice(&std::fs::read(&aside[0]).unwrap()).unwrap();
         assert_eq!(kept, [newer.clone()]);
-        // Loading again (the page reads the file while no queue is running) adds no copy.
-        assert_eq!(ids(&load_records(&p)), ["a", "b"]);
+        // Loading again (the owner opens the folder once more, after a restart) adds no copy.
+        assert_eq!(ids(&own()), ["a", "b"]);
         assert_eq!(asides(&p).len(), 1);
         // The next save drops it from the file, not from the disk.
-        save_records(&p, &load_records(&p));
-        assert_eq!(ids(&load_records(&p)), ["a", "b"]);
+        save_records(&p, &own());
+        assert_eq!(ids(&own()), ["a", "b"]);
         assert_eq!(asides(&p).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -971,9 +1090,9 @@ mod tests {
         let dir = scratch("twice");
         let p = dir.join(TASKS_FILE);
         std::fs::write(&p, b"first").unwrap();
-        load_records(&p);
+        open_records(&p);
         std::fs::write(&p, b"second").unwrap();
-        load_records(&p);
+        open_records(&p);
         let texts: std::collections::BTreeSet<Vec<u8>> = asides(&p)
             .iter()
             .map(|a| std::fs::read(a).unwrap())
@@ -983,6 +1102,53 @@ mod tests {
             [b"first".to_vec(), b"second".to_vec()]
                 .into_iter()
                 .collect()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// quality extra 22: a reader never shows another process's live job as interrupted. While a
+    /// second handle holds `.queue.lock` (what the owner's process does), a running record reads
+    /// as running; with the lock free it reads interrupted; the file is never written.
+    #[test]
+    fn a_reader_keeps_a_live_owners_busy_record_and_never_writes() {
+        let dir = scratch("reader-owner");
+        let p = dir.join(TASKS_FILE);
+        let mut r = record("live");
+        r.state = RunState::Running;
+        save_records(&p, &[r]);
+        let before = std::fs::read(&p).unwrap();
+        // No lock file at all: no queue of this version ever owned the folder.
+        assert_eq!(load_records(&p)[0].state, RunState::Failed);
+        assert!(
+            !queue_lock_file(&p).exists(),
+            "a reader creates no lock file"
+        );
+        let held = QueueLock::try_take(&queue_lock_file(&p), std::time::Duration::ZERO)
+            .unwrap()
+            .expect("free");
+        assert!(queue_owned(&queue_lock_file(&p)));
+        assert_eq!(load_records(&p)[0].state, RunState::Running);
+        assert!(
+            QueueLock::try_take(&queue_lock_file(&p), std::time::Duration::ZERO)
+                .unwrap()
+                .is_none(),
+            "one owner at a time"
+        );
+        drop(held);
+        assert!(!queue_owned(&queue_lock_file(&p)));
+        let shown = load_records(&p);
+        assert_eq!(shown[0].state, RunState::Failed);
+        assert!(
+            shown[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("interrupted")
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), before, "the file is unchanged");
+        assert!(
+            queue_lock_file(&p).exists(),
+            "the lock file is never deleted"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

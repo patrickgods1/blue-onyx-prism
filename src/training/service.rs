@@ -9,6 +9,20 @@
 //! Footage imports and auto-label runs ([`super::task::Task`]) go through the same queue and
 //! thread (one GPU job at a time); their records are kept in `tasks.json`.
 //!
+//! One owner per folder. A queue writes its folder's files only while it holds the folder's
+//! [`task::QueueLock`] (`.queue.lock`), from the moment that folder becomes its store until it
+//! moves, stops or is dropped. A queue that finds the lock held by another process (the service
+//! beside a `train` command) is a *guest* ([`TrainingService::foreign_owner`]): it shows that
+//! folder's records as the files hold them, writes nothing and refuses every job and removal
+//! until it gets the lock ([`TrainingService::refresh`]); the CLI refuses to run at all
+//! ([`TrainingService::start_owner`]). Only the owner marks busy records interrupted when it opens
+//! the folder (`open_records`), and a run's own busy marker (`<run dir>.busy`, held by
+//! [`super::job`] for the whole run) tells a run another process still trains (left alone,
+//! failed with [`STILL_RUNNING`]) from one a crash left. Readers ([`load_records`],
+//! [`load_bare_records`]) never write, and show a busy record interrupted only when its owner is
+//! provably gone. Remove with files and Retry export refuse a run whose marker is held
+//! ([`run_in_use`]).
+//!
 //! What reaches the disk: a state or stage change at once, progress at most every
 //! [`PROGRESS_SAVE_EVERY`] (a crash loses at most that much of the progress shown, never a state
 //! change or a result), and a run's per-epoch metrics in its own `history.jsonl`, appended per
@@ -47,6 +61,7 @@ use super::job::{
 use super::progress::{EpochPoint, TrainProgress};
 use super::task::{self, Task, TaskContext, TaskRecord, TaskReport};
 use crate::resources::export::{CommandRunner, Fetcher, PausableRunner};
+use crate::storage::busy;
 use crate::sync::LockExt;
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
@@ -314,15 +329,80 @@ pub fn new_run_id() -> String {
     )
 }
 
-/// [`task::load_or_move_aside`]; busy records become interrupted failures ([`interrupt`]).
-fn open_records(path: &Path) -> task::Loaded<RunRecord> {
+/// What the owner's open says of a busy run whose folder another process still holds (a run of an
+/// older version, or of a process outside the queue): it is no longer this queue's to follow.
+pub const STILL_RUNNING: &str =
+    "still running in another process when this queue opened the folder; its files are kept";
+
+/// The owner's load ([`task::load_or_move_aside`]; the caller holds the folder's
+/// [`task::QueueLock`]). Each run's busy marker ([`busy::probe`] of its folder) decides a busy
+/// record: held by another process -> failed with [`STILL_RUNNING`]; a crash's -> interrupted
+/// ([`interrupt`]) and the marker deleted; none -> interrupted. A crash's marker of a finished
+/// record is deleted too (a panic in a run, a process that ended under a run it had left behind).
+/// Also returns whether a record changed (the owner saves the file then).
+fn open_records(path: &Path) -> (task::Loaded<RunRecord>, bool) {
     let mut loaded = task::load_or_move_aside::<RunRecord>(path);
+    let mut changed = false;
     for r in &mut loaded.records {
-        if r.state.is_busy() {
-            interrupt(r);
+        let busy_now = r.state.is_busy();
+        changed |= busy_now;
+        match busy::probe(&r.run_dir) {
+            busy::State::Live => {
+                if busy_now {
+                    r.state = RunState::Failed;
+                    r.error = Some(STILL_RUNNING.into());
+                    r.retrying = false;
+                }
+            }
+            busy::State::Crashed(claim) => {
+                if busy_now {
+                    interrupt(r);
+                }
+                claim.finish();
+            }
+            busy::State::Ended => {
+                if busy_now {
+                    interrupt(r);
+                }
+            }
         }
     }
-    loaded
+    (loaded, changed)
+}
+
+/// Why run `r` cannot be removed with its files or retried: a training in another process (or a
+/// queue thread this process left behind) holds its folder's busy marker. Checked for every record
+/// whatever its stored state; a crash's marker is let go at once (the owner's next open deletes
+/// it).
+pub fn run_in_use(r: &RunRecord) -> Option<String> {
+    matches!(busy::probe(&r.run_dir), busy::State::Live).then(|| {
+        format!(
+            "a training in another process is using run {} ({}) and its folder {}; wait for it \
+             to finish (or stop that `train` command), then try again",
+            r.name,
+            r.id,
+            r.run_dir.display()
+        )
+    })
+}
+
+/// Why a guest queue ([`TrainingService::foreign_owner`]) takes no job and removes nothing.
+fn guest_refusal(dir: &Path) -> String {
+    format!(
+        "another blue-onyx-prism process (a `train` command) is using the training folder {}; \
+         wait for it to finish, then try again",
+        dir.display()
+    )
+}
+
+/// Why a `train` command does not run beside a queue that owns its folder
+/// ([`TrainingService::start_owner`]).
+pub fn owner_refusal(dir: &Path) -> String {
+    format!(
+        "the service's training queue owns {}; queue it on the Train tab, or stop the service and \
+         run the command again",
+        dir.display()
+    )
 }
 
 /// A run the service stopped under (a crash read back at the next start, or
@@ -349,15 +429,6 @@ fn interrupt(r: &mut RunRecord) {
     r.retrying = false;
 }
 
-/// [`interrupt`] for a task: the words [`task::open_records`] gives a task a crash left busy.
-fn interrupt_task(r: &mut TaskRecord) {
-    r.state = RunState::Failed;
-    r.error = Some(
-        "interrupted: the service stopped while this job was queued or running; start it again"
-            .into(),
-    );
-}
-
 /// What a job that panicked tells the user (the panic itself is in the log).
 fn internal_error(panic: &str, run: bool) -> String {
     let next = if run {
@@ -379,6 +450,9 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "a panic without a message".into())
 }
 
+/// [`TrainingService::while_idle`]'s rule: why not, given the run and task records as they stand.
+pub type IdleRule<'a> = dyn Fn(&[RunRecord], &[TaskRecord]) -> Option<String> + 'a;
+
 /// Why a stopped queue takes no job.
 const STOPPED: &str = "the training queue has stopped (the service is stopping or restarting); \
                        queue it again once the service is back";
@@ -386,28 +460,75 @@ const STOPPED: &str = "the training queue has stopped (the service is stopping o
 const THREAD_GONE: &str = "the training thread has stopped, so this job never ran; restart the \
                            service and queue it again";
 
-/// [`open_records`], for a reader that does not save, with each run's epochs
-/// ([`history::attach`]).
+/// [`load_bare_records`] with each run's epochs ([`history::attach`]): `train list`, the page
+/// before the queue starts.
 pub fn load_records(path: &Path) -> Vec<RunRecord> {
-    let mut runs = open_records(path).records;
+    let mut runs = load_bare_records(path);
     for r in &mut runs {
         history::attach(r, None);
     }
     runs
 }
 
-/// [`open_records`] as stored, for a reader that neither saves nor shows epochs (the Jobs list,
-/// the storage card): no history file is read.
+/// The run records of `path` as stored, for a reader that never saves (the Jobs list, the
+/// storage card, a dataset check's plan, the Review queue's steer, a guest queue): the records
+/// that parse ([`task::read_records`]: a damaged file is no records and stays where it is, nothing
+/// is ever renamed, moved aside, copied or written; an older record keeps its epochs, migrated
+/// only by the owner). A busy record is shown interrupted (`interrupt`, in memory) only when its
+/// owner is provably gone: no queue holds the folder's lock ([`task::queue_owned`]) and no process
+/// holds its run's busy marker; otherwise it keeps its state.
 pub fn load_bare_records(path: &Path) -> Vec<RunRecord> {
-    open_records(path).records
+    let mut runs = task::read_records::<RunRecord>(path);
+    if runs.iter().any(|r| r.state.is_busy()) && !task::queue_owned(&task::queue_lock_file(path)) {
+        for r in runs.iter_mut().filter(|r| r.state.is_busy()) {
+            if !matches!(busy::probe(&r.run_dir), busy::State::Live) {
+                interrupt(r);
+            }
+        }
+    }
+    runs
 }
 
+/// Folders of `training_dir` holding a run's files (`train.log` or `history.jsonl`) that no
+/// record of `records` names, by folder or by run id: runs whose record an earlier version lost
+/// (two processes saving `runs.json` over each other). Report only: nothing removes them.
+pub fn unlisted_run_dirs(training_dir: &Path, records: &[RunRecord]) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(training_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|p| {
+            p.join(super::job::LOG_FILE).is_file() || p.join(history::HISTORY_FILE).is_file()
+        })
+        .filter(|p| {
+            !records.iter().any(|r| {
+                r.run_dir == *p
+                    || p.file_name()
+                        .is_some_and(|n| n == std::ffi::OsStr::new(&r.id))
+            })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The queue's state. Lock order (a lock is only ever taken while holding locks before it):
+/// `admit` > `persist_lock` > `runs` > `tasks` > `stores`. `current` is held over others only by
+/// [`TrainingService::set_paused`] (`current` > `runs` / `tasks` > `clock`, with no `persist_lock`
+/// or `stores` under it); `cancelled`, `clock` and `live` are leaves.
 struct Inner {
     runner: Arc<dyn CommandRunner>,
     fetcher: Arc<dyn Fetcher>,
     hooks: Arc<dyn Hooks>,
     runs: Mutex<Vec<RunRecord>>,
-    changed: Condvar,
+    /// Waited on with `runs` only ([`TrainingService::wait`]): a condvar must always be used with
+    /// the same mutex (std may panic otherwise, and does on macOS).
+    runs_changed: Condvar,
+    /// Waited on with `tasks` only ([`TrainingService::wait_task`]).
+    tasks_changed: Condvar,
     current: Mutex<Option<Current>>,
     cancelled: Mutex<HashSet<String>>,
     /// `runs.json` and `tasks.json` beside it (None = memory only); moved by
@@ -416,6 +537,11 @@ struct Inner {
     /// Serializes snapshot + write, so the file always ends with the latest state (and a
     /// store move never splits an update from its write).
     persist_lock: Mutex<()>,
+    /// Taken by every enqueue (runs, retries, tasks) for its check and push, and by
+    /// [`TrainingService::while_idle`] for its whole action: an action that needs the queue idle
+    /// (removing the training environment, the SAM 3 weights) never has a job queued under it.
+    /// Taken before any other lock of the queue.
+    admit: Mutex<()>,
     /// No job starts any more (set by [`TrainingService::shutdown`] and
     /// [`TrainingService::stop_for_exit`]); new jobs are refused.
     stop: AtomicBool,
@@ -449,14 +575,21 @@ impl Current {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct Stores {
     runs: Option<PathBuf>,
     tasks: Option<PathBuf>,
-    /// This file holds damage that could not be set aside: this process does not write it
-    /// ([`task::Loaded::writable`]), and its records live in memory.
+    /// This file holds damage that could not be set aside, or another process owns it (a
+    /// guest): this process does not write it ([`task::Loaded::writable`]), and its records live
+    /// in memory.
     hold_runs: bool,
     hold_tasks: bool,
+    /// The folder's owner lock, held for as long as this is the store (None: memory only, a
+    /// guest, or a folder whose lock cannot work, warned).
+    _lock: Option<task::QueueLock>,
+    /// Another process's queue owns the folder: its records are read, never written, and every
+    /// job and removal is refused ([`guest_refusal`]).
+    guest: bool,
 }
 
 /// What [`Stores::open`] read.
@@ -464,32 +597,95 @@ struct Opened {
     stores: Stores,
     runs: Vec<RunRecord>,
     tasks: Vec<TaskRecord>,
-    /// Records of an older `runs.json` whose history moved to their files
-    /// ([`history::migrate`]): `runs.json` is to be saved once.
-    migrated: bool,
+    /// The owner changed run records as it opened them (busy ones interrupted, histories of an
+    /// older `runs.json` moved to their files, [`history::migrate`]): `runs.json` is to be saved
+    /// once.
+    runs_changed: bool,
+    /// Busy task records were interrupted: `tasks.json` is to be saved once.
+    tasks_changed: bool,
 }
 
 impl Stores {
-    /// The stores at `runs` and the records they hold (histories moved out, [`history::migrate`]).
-    fn open(runs: Option<PathBuf>) -> Opened {
-        let tasks = runs.as_deref().map(task::tasks_file);
-        let mut run_records = runs.as_deref().map(open_records);
-        let task_records = tasks.as_deref().map(task::open_records);
-        let migrated = run_records
-            .as_mut()
-            .is_some_and(|l| history::migrate(&mut l.records) > 0);
-        let stores = Self {
-            hold_runs: run_records.as_ref().is_some_and(|l| !l.writable),
-            hold_tasks: task_records.as_ref().is_some_and(|l| !l.writable),
-            runs,
-            tasks,
+    /// The stores at `runs` and the records they hold. With the folder's lock (tried for
+    /// `grace`) this queue is its owner: busy records a crash left are interrupted
+    /// ([`open_records`]) and histories moved out ([`history::migrate`]). Held by another queue:
+    /// a guest, with the records as a reader sees them ([`load_bare_records`],
+    /// [`task::load_records`]). A lock that cannot work (a read-only folder, a file system
+    /// without locks) is warned and the queue owns the folder without it, as before locks.
+    fn open(runs: Option<PathBuf>, grace: Duration) -> Opened {
+        let Some(path) = runs else {
+            return Opened {
+                stores: Self::default(),
+                runs: Vec::new(),
+                tasks: Vec::new(),
+                runs_changed: false,
+                tasks_changed: false,
+            };
         };
-        Opened {
-            stores,
-            runs: run_records.map(|l| l.records).unwrap_or_default(),
-            tasks: task_records.map(|l| l.records).unwrap_or_default(),
-            migrated,
+        let lock_file = task::queue_lock_file(&path);
+        match task::QueueLock::try_take(&lock_file, grace) {
+            Ok(Some(lock)) => Self::own(path, Some(lock)),
+            Ok(None) => Self::visit(path),
+            Err(e) => {
+                tracing::warn!(
+                    "cannot lock {} ({e}): this queue writes the training folder without the \
+                     check that keeps a second blue-onyx-prism process (the service and a `train` \
+                     command) from writing it too; check the permissions of the folder",
+                    lock_file.display()
+                );
+                Self::own(path, None)
+            }
         }
+    }
+
+    /// The owner's open of `runs` and `tasks.json` beside it.
+    fn own(runs: PathBuf, lock: Option<task::QueueLock>) -> Opened {
+        let tasks = task::tasks_file(&runs);
+        let (mut run_records, interrupted) = open_records(&runs);
+        let mut task_records = task::load_or_move_aside::<TaskRecord>(&tasks);
+        let tasks_changed = task::interrupt_busy(&mut task_records.records) > 0;
+        let migrated = history::migrate(&mut run_records.records) > 0;
+        Opened {
+            stores: Self {
+                hold_runs: !run_records.writable,
+                hold_tasks: !task_records.writable,
+                runs: Some(runs),
+                tasks: Some(tasks),
+                _lock: lock,
+                guest: false,
+            },
+            runs: run_records.records,
+            tasks: task_records.records,
+            runs_changed: interrupted || migrated,
+            tasks_changed,
+        }
+    }
+
+    /// A guest's open: the records as the files hold them, nothing to write.
+    fn visit(runs: PathBuf) -> Opened {
+        let tasks = task::tasks_file(&runs);
+        Opened {
+            runs: load_bare_records(&runs),
+            tasks: task::load_records(&tasks),
+            stores: Self {
+                hold_runs: true,
+                hold_tasks: true,
+                runs: Some(runs),
+                tasks: Some(tasks),
+                _lock: None,
+                guest: true,
+            },
+            runs_changed: false,
+            tasks_changed: false,
+        }
+    }
+
+    /// The training folder of a guest ([`Self::guest`]).
+    fn guest_dir(&self) -> Option<PathBuf> {
+        self.runs.as_deref().filter(|_| self.guest).map(|p| {
+            p.parent()
+                .map_or_else(|| p.to_path_buf(), Path::to_path_buf)
+        })
     }
 
     fn runs_to_write(&self) -> Option<PathBuf> {
@@ -508,7 +704,32 @@ impl Inner {
             f(r);
         }
         drop(runs);
-        self.changed.notify_all();
+        self.runs_changed.notify_all();
+    }
+
+    /// Save what an owner's open changed ([`Opened::runs_changed`], [`Opened::tasks_changed`];
+    /// the caller holds `persist_lock`, or no other thread has the queue yet).
+    fn save_opened(&self, runs: bool, tasks: bool) {
+        if runs {
+            self.write_runs();
+        }
+        if tasks {
+            self.write_tasks();
+        }
+    }
+
+    /// Wake every waiter (a store move, a stop).
+    fn notify_all(&self) {
+        self.runs_changed.notify_all();
+        self.tasks_changed.notify_all();
+    }
+
+    /// Refused with [`guest_refusal`] while another process owns the folder.
+    fn refuse_guest(&self) -> Result<(), String> {
+        match self.stores.lock_recover().guest_dir() {
+            Some(dir) => Err(guest_refusal(&dir)),
+            None => Ok(()),
+        }
     }
 
     fn persist(&self) {
@@ -516,9 +737,11 @@ impl Inner {
         self.write_runs();
     }
 
-    /// Write the runs (the caller holds `persist_lock`).
+    /// Write the runs (the caller holds `persist_lock`). The path is copied out first: `stores`
+    /// is never held while `runs` is taken or the file written (the lock order on [`Inner`]).
     fn write_runs(&self) {
-        if let Some(p) = self.stores.lock_recover().runs_to_write() {
+        let path = self.stores.lock_recover().runs_to_write();
+        if let Some(p) = path {
             let runs = self.runs.lock_recover().clone();
             task::save_file(&p, &runs);
         }
@@ -559,7 +782,7 @@ impl Inner {
             f(r);
         }
         drop(tasks);
-        self.changed.notify_all();
+        self.tasks_changed.notify_all();
     }
 
     fn persist_tasks(&self) {
@@ -567,9 +790,11 @@ impl Inner {
         self.write_tasks();
     }
 
-    /// Write the tasks (the caller holds `persist_lock`).
+    /// Write the tasks (the caller holds `persist_lock`; the path copied out first, as in
+    /// [`Self::write_runs`]).
     fn write_tasks(&self) {
-        if let Some(p) = self.stores.lock_recover().tasks_to_write() {
+        let path = self.stores.lock_recover().tasks_to_write();
+        if let Some(p) = path {
             let tasks = self.tasks.lock_recover().clone();
             task::save_records(&p, &tasks);
         }
@@ -604,21 +829,24 @@ impl Inner {
             .iter_mut()
             .filter(|r| pick(r.state))
         {
-            interrupt_task(r);
+            task::interrupt(r);
             r.finished.get_or_insert_with(|| stamp.clone());
             n += 1;
         }
-        self.changed.notify_all();
+        self.notify_all();
         self.write_runs();
         self.write_tasks();
         n
     }
 
-    /// Never write `runs.json` or `tasks.json` again (a stopped queue whose thread may still
-    /// end a job: the files are the next queue's).
+    /// Never write `runs.json` or `tasks.json` again, and let go of the folder's lock (a stopped
+    /// queue whose thread may still end a job: the files are the next queue's, in this process
+    /// after an in-process restart or in another).
     fn forget_stores(&self) {
         let _order = self.persist_lock.lock_recover();
-        *self.stores.lock_recover() = Stores::default();
+        let old = std::mem::take(&mut *self.stores.lock_recover());
+        drop(old);
+        self.notify_all();
     }
 
     /// The stage run `id`'s record is in.
@@ -685,25 +913,28 @@ impl TrainingService {
         hooks: Arc<dyn Hooks>,
         store: Option<PathBuf>,
     ) -> Arc<Self> {
-        let opened = Stores::open(store);
+        let opened = Stores::open(store, crate::resources::export::train::LOCK_GRACE);
         let inner = Arc::new(Inner {
             runner,
             fetcher,
             hooks,
             runs: Mutex::new(opened.runs),
-            changed: Condvar::new(),
+            runs_changed: Condvar::new(),
+            tasks_changed: Condvar::new(),
             current: Mutex::new(None),
             clock: Mutex::new(None),
             live: Mutex::new(None),
             cancelled: Mutex::new(HashSet::new()),
             stores: Mutex::new(opened.stores),
             persist_lock: Mutex::new(()),
+            admit: Mutex::new(()),
             stop: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
             tasks: Mutex::new(opened.tasks),
         });
-        if opened.migrated {
-            inner.persist();
+        {
+            let _order = inner.persist_lock.lock_recover();
+            inner.save_opened(opened.runs_changed, opened.tasks_changed);
         }
         let (tx, rx) = crossbeam_channel::unbounded();
         let worker = Arc::clone(&inner);
@@ -716,6 +947,65 @@ impl TrainingService {
             tx,
             thread: Mutex::new(Some(thread)),
         })
+    }
+
+    /// [`Self::start`] for a command that must own `store`'s folder (the CLI's `train run`,
+    /// `retry-export`, import, auto-label, overlaps and dataset check): when another process's
+    /// queue owns it, the queue is shut down unwritten and the answer is [`owner_refusal`].
+    pub fn start_owner(
+        runner: Arc<dyn CommandRunner>,
+        fetcher: Arc<dyn Fetcher>,
+        hooks: Arc<dyn Hooks>,
+        store: PathBuf,
+    ) -> Result<Arc<Self>, String> {
+        let svc = Self::start(runner, fetcher, hooks, Some(store));
+        let guest = svc.inner.stores.lock_recover().guest_dir();
+        match guest {
+            Some(dir) => {
+                svc.shutdown();
+                Err(owner_refusal(&dir))
+            }
+            None => Ok(svc),
+        }
+    }
+
+    /// Another process's queue owns this queue's folder: its records are shown as the files hold
+    /// them, nothing is written, and every job and removal is refused until [`Self::refresh`]
+    /// gets the folder's lock.
+    pub fn foreign_owner(&self) -> bool {
+        self.inner.stores.lock_recover().guest
+    }
+
+    /// A guest ([`Self::foreign_owner`]) tries once more to own its folder: with the lock it
+    /// loads the folder as at start (as the owner: busy records a crash left are interrupted, the
+    /// file saved); else it reads the files again, so it shows the owner's records as they stand.
+    /// Nothing for an owner, a memory-only or a stopped queue.
+    pub fn refresh(&self) {
+        // An owner's reads never wait for a save (`persist_lock`).
+        if !self.foreign_owner() {
+            return;
+        }
+        let _order = self.inner.persist_lock.lock_recover();
+        let mut runs = self.inner.runs.lock_recover();
+        let mut tasks = self.inner.tasks.lock_recover();
+        let mut stores = self.inner.stores.lock_recover();
+        if !stores.guest || self.stopped() {
+            return;
+        }
+        let Some(path) = stores.runs.clone() else {
+            return;
+        };
+        let opened = Stores::open(Some(path), Duration::ZERO);
+        let owner = !opened.stores.guest;
+        let save = (opened.runs_changed, opened.tasks_changed);
+        (*stores, *runs, *tasks) = (opened.stores, opened.runs, opened.tasks);
+        drop((stores, tasks, runs));
+        if owner {
+            tracing::info!("the training queue owns its folder again");
+            // `_order` is held: no other write can come between.
+            self.inner.save_opened(save.0, save.1);
+        }
+        self.inner.notify_all();
     }
 
     /// A queue that is stopped from the start: no thread, no store, no records; every job is
@@ -732,13 +1022,15 @@ impl TrainingService {
                 fetcher,
                 hooks,
                 runs: Mutex::new(Vec::new()),
-                changed: Condvar::new(),
+                runs_changed: Condvar::new(),
+                tasks_changed: Condvar::new(),
                 current: Mutex::new(None),
                 clock: Mutex::new(None),
                 live: Mutex::new(None),
                 cancelled: Mutex::new(HashSet::new()),
                 stores: Mutex::new(Stores::default()),
                 persist_lock: Mutex::new(()),
+                admit: Mutex::new(()),
                 stop: AtomicBool::new(true),
                 exiting: AtomicBool::new(true),
                 tasks: Mutex::new(Vec::new()),
@@ -760,8 +1052,10 @@ impl TrainingService {
 
     /// Keep the runs in `store` (and `tasks.json` beside it) from now on: the records shown
     /// become that folder's (loaded like at start); the old folder's files stay where they are.
-    /// `Ok(false)` when it already is the store; refused while a run or task is queued or
-    /// running (its records belong to the old folder).
+    /// The new folder's lock is taken before the old one is let go. `Ok(false)` when it already
+    /// is the store; refused while a run or task is queued or running (its records belong to the
+    /// old folder), and when another process's queue owns the new folder (the queue stays where
+    /// it is).
     pub fn set_store(&self, store: &Path) -> Result<bool, String> {
         let _order = self.inner.persist_lock.lock_recover();
         let mut runs = self.inner.runs.lock_recover();
@@ -780,26 +1074,32 @@ impl TrainingService {
                     .into(),
             );
         }
-        let opened = Stores::open(Some(store.to_path_buf()));
+        let opened = Stores::open(Some(store.to_path_buf()), Duration::ZERO);
+        if let Some(dir) = opened.stores.guest_dir() {
+            return Err(guest_refusal(&dir));
+        }
+        let save = (opened.runs_changed, opened.tasks_changed);
+        // The old folder's lock goes with the old stores, after the new one was taken.
         (*stores, *runs, *tasks) = (opened.stores, opened.runs, opened.tasks);
         drop((stores, tasks, runs));
-        if opened.migrated {
-            // `_order` is held: no other write can come between.
-            self.inner.write_runs();
-        }
-        self.inner.changed.notify_all();
+        // `_order` is held: no other write can come between.
+        self.inner.save_opened(save.0, save.1);
+        self.inner.notify_all();
         Ok(true)
     }
 
     /// Queue a run. Refused while another queued or running run trains the same model name.
     pub fn enqueue(&self, job: TrainJob) -> Result<String, String> {
         let id = job.id.clone();
+        let _admit = self.inner.admit.lock_recover();
         {
             let mut runs = self.inner.runs.lock_recover();
             // Under the runs lock: a stop that comes later finds this record and marks it.
             if self.stopped() {
                 return Err(STOPPED.into());
             }
+            // Under the runs lock too: a store move cannot come between the check and the push.
+            self.inner.refuse_guest()?;
             if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
                 return Err(format!(
                     "a run training {} is already queued or running",
@@ -813,7 +1113,7 @@ impl TrainingService {
             runs.push(RunRecord::new(&job));
         }
         self.inner.persist();
-        self.inner.changed.notify_all();
+        self.inner.runs_changed.notify_all();
         if self.tx.send(Msg::Job(Box::new(job))).is_err() {
             self.inner.update_persist(&id, |r| {
                 if r.state == RunState::Queued {
@@ -831,12 +1131,14 @@ impl TrainingService {
     /// record: same id, folder and history. A cancelled retry goes back to the failure it came from.
     pub fn enqueue_retry(&self, job: TrainJob) -> Result<String, String> {
         let id = job.id.clone();
+        let _admit = self.inner.admit.lock_recover();
         let before;
         {
             let mut runs = self.inner.runs.lock_recover();
             if self.stopped() {
                 return Err(STOPPED.into());
             }
+            self.inner.refuse_guest()?;
             if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
                 return Err(format!(
                     "a run training {} is already queued or running",
@@ -849,13 +1151,16 @@ impl TrainingService {
             if r.state != RunState::Failed {
                 return Err(format!("run {id} is {}, not failed", r.describe()));
             }
+            if let Some(why) = run_in_use(r) {
+                return Err(why);
+            }
             before = (r.percent, std::mem::take(&mut r.detail), r.finished.take());
             r.state = RunState::Queued;
             r.retrying = true;
             r.percent = 0;
         }
         self.inner.persist();
-        self.inner.changed.notify_all();
+        self.inner.runs_changed.notify_all();
         if self.tx.send(Msg::Job(Box::new(job))).is_err() {
             // Back to the failure it was, its checkpoint still there to retry.
             let (percent, detail, finished) = before;
@@ -891,11 +1196,13 @@ impl TrainingService {
         refuse: &dyn Fn(&[TaskRecord]) -> Option<String>,
     ) -> Result<String, NotQueued> {
         let id = task.id().to_string();
+        let _admit = self.inner.admit.lock_recover();
         {
             let mut tasks = self.inner.tasks.lock_recover();
             if self.stopped() {
                 return Err(NotQueued::Failed(STOPPED.into()));
             }
+            self.inner.refuse_guest().map_err(NotQueued::Failed)?;
             if let Some(why) = refuse(&tasks) {
                 return Err(NotQueued::Refused(why));
             }
@@ -906,7 +1213,7 @@ impl TrainingService {
             task::cap_finished(&mut tasks);
         }
         self.inner.persist_tasks();
-        self.inner.changed.notify_all();
+        self.inner.tasks_changed.notify_all();
         if self.tx.send(Msg::Task(task)).is_err() {
             self.inner.update_persist_task(&id, |r| {
                 if r.state == RunState::Queued {
@@ -928,7 +1235,7 @@ impl TrainingService {
         tasks.retain(|t| t.id != r.id);
         tasks.push(r);
         drop(tasks);
-        self.inner.changed.notify_all();
+        self.inner.tasks_changed.notify_all();
     }
 
     /// The import and auto-label records.
@@ -959,7 +1266,7 @@ impl TrainingService {
             };
             tasks = self
                 .inner
-                .changed
+                .tasks_changed
                 .wait_timeout(tasks, left.min(Duration::from_secs(1)))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
@@ -967,8 +1274,12 @@ impl TrainingService {
     }
 
     /// Cancel a queued or running run or task; returns whether there was one. The queued tasks
-    /// that follow a cancelled task ([`Task::after`]) are cancelled with it.
+    /// that follow a cancelled task ([`Task::after`]) are cancelled with it. A guest
+    /// ([`Self::foreign_owner`]) cancels nothing: the jobs it shows are another process's.
     pub fn cancel(&self, id: &str) -> bool {
+        if self.foreign_owner() {
+            return false;
+        }
         if let Some(st) = self.get_task(id).map(|r| r.state) {
             let done = match st {
                 RunState::Queued => self.cancel_queued_task(id, None),
@@ -1233,6 +1544,38 @@ impl TrainingService {
             .cloned()
     }
 
+    /// Run `act` while no run or task is queued or running and none can be queued (every enqueue
+    /// waits for it), unless `refuse` answers a reason for the records as they stand. Refused with
+    /// a message when the queue is busy (`refuse` is asked only when it is idle) or stopped.
+    /// `refuse` must take no lock of this queue. `act` runs with no lock of the queue held but
+    /// `admit`: it may use the queue (`set_store`), never enqueue, and may take its time (readers
+    /// of the queue are not held up, only enqueues).
+    pub fn while_idle<T>(
+        &self,
+        refuse: &IdleRule<'_>,
+        act: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let _admit = self.inner.admit.lock_recover();
+        if self.stopped() {
+            return Err(STOPPED.into());
+        }
+        self.inner.refuse_guest()?;
+        if self.busy() {
+            return Err(
+                "a training run, import or auto-label job is queued or running; wait for it or \
+                 cancel it first"
+                    .into(),
+            );
+        }
+        let runs = self.inner.runs.lock_recover().clone();
+        let tasks = self.inner.tasks.lock_recover().clone();
+        if let Some(why) = refuse(&runs, &tasks) {
+            return Err(why);
+        }
+        drop((runs, tasks));
+        Ok(act())
+    }
+
     /// A run or task is queued or running.
     pub fn busy(&self) -> bool {
         self.inner
@@ -1249,20 +1592,26 @@ impl TrainingService {
     }
 
     /// Forget the finished run `id` and delete its folder ([`super::retry::delete_run_files`]),
-    /// in that order of checks: nothing is forgotten when the files cannot go. Returns the record.
+    /// in that order of checks: nothing is forgotten when the files cannot go. Refused while a
+    /// training in another process holds the folder ([`run_in_use`]), whatever the record says.
+    /// Returns the record.
     pub fn remove_with_files(
         &self,
         id: &str,
         delete: impl FnOnce(&RunRecord) -> anyhow::Result<()>,
     ) -> Result<RunRecord, String> {
+        if self.stopped() {
+            return Err(STOPPED.into());
+        }
+        self.inner.refuse_guest()?;
         let Some(r) = self.get_bare(id) else {
             return Err(format!("no run {id}"));
         };
         if r.state.is_busy() {
             return Err("the run is queued or running; cancel it first".into());
         }
-        if self.stopped() {
-            return Err(STOPPED.into());
+        if let Some(why) = run_in_use(&r) {
+            return Err(why);
         }
         delete(&r).map_err(|e| {
             format!(
@@ -1280,6 +1629,7 @@ impl TrainingService {
         if self.stopped() {
             return Err(STOPPED.into());
         }
+        self.inner.refuse_guest()?;
         {
             let mut tasks = self.inner.tasks.lock_recover();
             if let Some(i) = tasks.iter().position(|r| r.id == id) {
@@ -1321,14 +1671,16 @@ impl TrainingService {
             let left = deadline.saturating_duration_since(Instant::now());
             runs = self
                 .inner
-                .changed
+                .runs_changed
                 .wait_timeout(runs, left.min(Duration::from_secs(1)))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
     }
 
-    /// Stop: the running run is cancelled (its processes killed), the thread joined.
+    /// Stop: the running run is cancelled (its processes killed), the thread joined, and the
+    /// folder let go (`Inner::forget_stores`): its records stay readable in memory, its files
+    /// are the next queue's.
     pub fn shutdown(&self) {
         self.inner.stop.store(true, Ordering::SeqCst);
         if let Some(c) = self.inner.current.lock_recover().as_ref() {
@@ -1338,6 +1690,7 @@ impl TrainingService {
         if let Some(h) = self.thread.lock_recover().take() {
             let _ = h.join();
         }
+        self.inner.forget_stores();
     }
 
     /// Stop for the process's exit (see the module docs): queued jobs are written as interrupted,
@@ -1620,6 +1973,10 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
             cancelled: false,
         })
     });
+    // The run ended here: a marker a panic left unlocked ([`busy`]) is a crash's no more.
+    if let busy::State::Crashed(claim) = busy::probe(&job.run_dir) {
+        claim.finish();
+    }
     drop(clear);
     match result {
         Ok(out) => {
@@ -1782,7 +2139,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         Ok(out) if inner.exiting.load(Ordering::SeqCst) => {
             tracing::warn!(job = %id, "{} interrupted: the service is stopping ({})", t.kind().as_str(), out.summary);
             inner.update_persist_task(&id, |r| {
-                interrupt_task(r);
+                task::interrupt(r);
                 r.summary = Some(out.summary);
                 r.result = Some(out.result);
                 r.finished = Some(now());
@@ -1791,7 +2148,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         Err(_) if inner.exiting.load(Ordering::SeqCst) => {
             tracing::warn!(job = %id, "{} interrupted: the service is stopping", t.kind().as_str());
             inner.update_persist_task(&id, |r| {
-                interrupt_task(r);
+                task::interrupt(r);
                 r.finished = Some(now());
             });
         }

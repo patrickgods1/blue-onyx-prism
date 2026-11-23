@@ -9,6 +9,7 @@
 //! - [`config`]    JSON config next to the executable, merged with CLI flags
 //! - [`config_form`] applying the web UI's forms (config page, models, devices, thresholds) to a `Config`
 //! - [`config_store`] the live config with a revision and change log (every writer goes through it)
+//! - [`config_file`] the cross-process config file lock and the commands' load-edit-save (`edit_file`)
 //! - [`config_merge`] field-level config view: change summaries, pending restart, 3-way form merge
 //! - [`backend`]   runtimes (OpenVINO today), device specs, load plans, inference backends
 //! - [`model`]     model families (yolo26, yolo5, yolo8, rtdetr): pre/post-processing
@@ -82,6 +83,7 @@ pub mod clock;
 pub mod collect;
 pub mod command;
 pub mod config;
+pub mod config_file;
 pub mod config_form;
 pub mod config_merge;
 pub mod config_store;

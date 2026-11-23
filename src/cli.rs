@@ -325,17 +325,17 @@ pub struct Cli {
 /// it back when it differs from the file (or the file does not exist yet). The one-off flags
 /// (`--force-cpu`, `--save-ref-image`) apply to the returned config only and are never written
 /// back (`without_one_off_flags`). The retired `--allow-remote-admin` is ignored with a warning.
+/// The load and the write-back hold the config lock ([`crate::config_file::lock`]).
 pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
     let path = cli
         .config
         .clone()
         .unwrap_or_else(Config::default_config_path);
+    // The load and the save under the config lock (QA-016): a command or a running service
+    // saving the file meanwhile is never undone by this start's write-back.
+    let _held = crate::config_file::lock(&path, crate::config_file::LOCK_WAIT)?;
     let existed = path.exists();
-    let mut config = if existed {
-        Config::load(&path)?
-    } else {
-        Config::default()
-    };
+    let mut config = Config::load_or_default(&path)?;
     let loaded = config.clone();
     let base = std::env::current_dir().context("reading current directory")?;
     if cli.allow_remote_admin {
@@ -375,7 +375,8 @@ pub fn resolve_config(cli: &Cli) -> Result<(Config, PathBuf)> {
 /// ([`Config::seed_default_model`]), written to `path`, so a first start binds the HTTP port,
 /// serves the web UI and downloads the model (`auto_download`). Messages go through
 /// [`crate::logbuf::early`] (this runs before logging is set up). Returns whether a model was
-/// added. `config` may hold the one-off flags of this run: the file keeps its own values.
+/// added. `config` may hold the one-off flags of this run: the file keeps its own values (the
+/// seed is added to the file as it is now, through [`crate::config_file::edit_file`]).
 pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
     let Some(name) = config.seed_default_model() else {
         return false;
@@ -398,8 +399,13 @@ pub fn seed_default_model(config: &mut Config, path: &Path) -> bool {
         tracing::Level::INFO,
         seeded_model_note(&name, config.auto_download),
     );
-    let file = Config::parse_file(path).unwrap_or_default();
-    if let Err(e) = without_one_off_flags(config, &file).save(path) {
+    // Seeded into the file as it is now, under the config lock (QA-016): this run's one-off
+    // flags stay out, and an edit saved since the start's load is kept.
+    let seeded = crate::config_file::edit_file(path, crate::config_file::Missing::Default, |c| {
+        c.seed_default_model();
+        Ok(())
+    });
+    if let Err(e) = seeded {
         crate::logbuf::early(
             tracing::Level::WARN,
             format!(
@@ -860,27 +866,37 @@ fn for_service_at_in(path: &Path, exe_dir: &Path) -> Result<Config> {
     let mut config = if path.exists() {
         Config::load(path)?
     } else {
-        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let dir = abs
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| exe_dir.to_path_buf());
-        let config = service_default_config(&dir, exe_dir);
-        std::fs::create_dir_all(&dir)
-            .map_err(anyhow::Error::from)
-            .and_then(|()| config.save(path))
-            .with_context(|| {
-                format!(
-                    "could not create the default service config {} (its folder {} is probably \
-                     read-only for the service account, e.g. the install folder or the folder \
-                     named by --config); grant it write access or create the file by hand",
-                    path.display(),
-                    dir.display()
-                )
-            })?;
-        config
+        create_service_config(path, exe_dir)?
     };
     seed_default_model(&mut config, path);
+    Ok(config)
+}
+
+/// The first start of the service with no config at `path`: write [`service_default_config`]
+/// there, under the config lock (QA-016), so a command that created the file meanwhile
+/// (`add-model` before the first start) is loaded instead of written over.
+fn create_service_config(path: &Path, exe_dir: &Path) -> Result<Config> {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = abs
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| exe_dir.to_path_buf());
+    let cannot = || {
+        format!(
+            "could not create the default service config {} (its folder {} is probably \
+             read-only for the service account, e.g. the install folder or the folder named by \
+             --config); grant it write access or create the file by hand",
+            path.display(),
+            dir.display()
+        )
+    };
+    std::fs::create_dir_all(&dir).with_context(cannot)?;
+    let _held = crate::config_file::lock(path, crate::config_file::LOCK_WAIT)?;
+    if path.exists() {
+        return Config::load(path);
+    }
+    let config = service_default_config(&dir, exe_dir);
+    config.save(path).with_context(cannot)?;
     Ok(config)
 }
 
