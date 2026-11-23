@@ -431,15 +431,23 @@ struct Measured {
     report: Arc<Report>,
 }
 
-/// The last measurement and whether one is running.
+/// The last measurement of each set of folders (newest first, at most [`KEPT`]) and whether one
+/// is running. One slot per set: with a single slot shared by all, two callers of different
+/// folders (tests with their own data roots; a generation restart that moved `download_dir`)
+/// overwrite each other's report before the other looks, and each measures again, round after
+/// round, until its wait runs out (seen on Linux CI, where measuring an empty folder takes less
+/// than one 25 ms look).
 #[derive(Default)]
 struct Cache {
-    last: Option<Measured>,
+    last: Vec<Measured>,
     running: bool,
 }
 
+/// How many sets of folders [`Cache`] keeps a report of (the service has one; tests have more).
+const KEPT: usize = 8;
+
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
-    last: None,
+    last: Vec::new(),
     running: false,
 });
 
@@ -477,8 +485,8 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
             let mut c = CACHE.lock_recover();
             let last = c
                 .last
-                .as_ref()
-                .filter(|l| l.key == key)
+                .iter()
+                .find(|l| l.key == key)
                 .map(|l| (l.at, l.report.clone()));
             if let Some((at, r)) = &last
                 && at.elapsed() < FRESH
@@ -504,11 +512,17 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
                             panic!("test: measuring panics");
                         }
                         let report = Arc::new(measure(&s, &runs));
-                        CACHE.lock_recover().last = Some(Measured {
-                            at: Instant::now(),
-                            key: k,
-                            report,
-                        });
+                        let mut c = CACHE.lock_recover();
+                        c.last.retain(|l| l.key != k);
+                        c.last.insert(
+                            0,
+                            Measured {
+                                at: Instant::now(),
+                                key: k,
+                                report,
+                            },
+                        );
+                        c.last.truncate(KEPT);
                     });
                 if let Err(e) = spawned {
                     c.running = false;
@@ -540,7 +554,7 @@ fn key_of(s: &Settings) -> String {
 
 /// Forget the last measurement (after a Clear or Remove), so the next look measures again.
 pub fn invalidate() {
-    CACHE.lock_recover().last = None;
+    CACHE.lock_recover().last.clear();
 }
 
 #[cfg(test)]
@@ -596,6 +610,46 @@ mod tests {
         assert!(!Arc::ptr_eq(&again.unwrap(), &other));
         for r in [ra, rb] {
             std::fs::remove_dir_all(r).ok();
+        }
+    }
+
+    /// A caller that keeps measuring other folders never starves ours: each set of folders keeps
+    /// its own report (with one shared slot this failed 10 of 10 runs; on Linux CI two tests of
+    /// this module starved each other that way until their 60 s waits ran out).
+    #[test]
+    fn a_look_gets_its_report_while_others_measure() {
+        let settings = |tag: &str| {
+            let root =
+                std::env::temp_dir().join(format!("bop-usage-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut c = crate::config::Config {
+                download_dir: Some(root.clone()),
+                cache_dir: root.join("cache").display().to_string(),
+                ..Default::default()
+            };
+            c.models.clear();
+            (root, Settings::for_config(&c))
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (other_root, other) = settings("other");
+        let st = stop.clone();
+        let t = std::thread::spawn(move || {
+            while !st.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = current(other.clone(), Vec::new(), Duration::ZERO);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let (mine_root, mine) = settings("mine");
+        let (r, running) = current(mine, Vec::new(), Duration::from_secs(30));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        t.join().unwrap();
+        assert!(
+            r.is_some() && !running,
+            "starved (still running: {running})"
+        );
+        for root in [other_root, mine_root] {
+            std::fs::remove_dir_all(root).ok();
         }
     }
 

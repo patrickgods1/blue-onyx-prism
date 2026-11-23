@@ -4738,7 +4738,11 @@ description until it execs, so the dropped flock stays held for that moment (sho
 20 tries blocked). The service only skips one sweep in that case. On the PR, macOS CI failed `burst::open_loop_latency_includes_the_queue_wait_from_the_intended_time`
 (untouched here): its numbers fit a constant 103-125 ms per-request cost on the loaded VM, which compounds through the
 FIFO queue past a flat slack. The upper bounds now scale with the cost measured on the first answer; the lower bounds
-are unchanged. Injecting 105 ms per request failed the old test 10/10 and the new one 0/10.
+are unchanged. Injecting 105 ms per request failed the old test 10/10 and the new one 0/10. After the merge, main's ubuntu job failed
+two `storage::usage` tests: the Storage card's cache held one report for the whole process, so two callers of
+different folders (tests with their own data roots) took turns overwriting it, and each measured again, round after
+round, until its 60 s wait ran out (measuring an empty folder there takes less than one 25 ms look). It now keeps
+one report per set of folders (#231); a test with another caller measuring in a loop failed 10/10 before, 0/10 after.
 
 Measured after this phase (release build on the development Mac, short smoke run): unchanged from phase 1. After
 kill -9 and after a graceful stop, no process survives; the data root holds only its own files, now including
