@@ -1350,8 +1350,9 @@ mod tree_tests {
     #[test]
     fn a_helper_outside_the_group_does_not_hang_the_runner() {
         let t = Ticker::new("escaped");
-        // `set -m`: the background job gets a process group of its own.
-        let cmd = sh_cmd(&t.dir, "set -m; sleep 60 & echo $!; exit 0");
+        // `set -m` in bash: the background job gets a process group of its own (dash, Ubuntu's
+        // `/bin/sh`, only warns without a terminal and keeps the job in the group).
+        let cmd = sh_cmd(&t.dir, "bash -c 'set -m; sleep 60 & echo $!; exit 0'");
         let mut lines = Vec::new();
         let t0 = Instant::now();
         SystemRunner
@@ -1362,7 +1363,10 @@ mod tree_tests {
             )
             .unwrap();
         let took = t0.elapsed();
-        let helper: u32 = lines.first().unwrap().parse().unwrap();
+        let helper: u32 = lines
+            .iter()
+            .find_map(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no helper pid in {lines:?}"));
         let _ = crate::backend::process::kill_pid(helper);
         assert!(took < Duration::from_secs(30), "{took:?}");
         assert!(took >= ORPHAN_GRACE + DRAIN_AFTER_KILL, "{took:?}");
@@ -1374,7 +1378,7 @@ mod tree_tests {
     #[test]
     fn a_cancel_ends_the_drain() {
         let t = Ticker::new("drain-cancel");
-        let cmd = sh_cmd(&t.dir, "set -m; sleep 60 & echo $!; exit 0");
+        let cmd = sh_cmd(&t.dir, "bash -c 'set -m; sleep 60 & echo $!; exit 0'");
         let cancel = Arc::new(AtomicBool::new(false));
         let setter = {
             let cancel = cancel.clone();
@@ -1389,7 +1393,10 @@ mod tree_tests {
             .run(&cmd, &mut |l| lines.push(l.to_string()), &cancel)
             .unwrap_err();
         setter.join().unwrap();
-        let helper: u32 = lines.first().unwrap().parse().unwrap();
+        let helper: u32 = lines
+            .iter()
+            .find_map(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no helper pid in {lines:?}"));
         let _ = crate::backend::process::kill_pid(helper);
         assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
         assert!(
