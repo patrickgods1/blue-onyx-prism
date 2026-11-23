@@ -4508,6 +4508,170 @@ fn a_crashed_runs_proposals_are_written_by_the_sweep_before_its_folder_goes() {
     assert_eq!(review_queue(&dir).len(), 3);
 }
 
+/// The crash state of [`a_crashed_runs_proposals_are_written_by_the_sweep_before_its_folder_goes`]:
+/// a run whose label writes all failed keeps its proposals, then its process "died" (the marker
+/// left behind, unlocked); the label files are writable again and the review queue is empty. The
+/// job, the frames and their dataset folder.
+fn crashed_run(root: &Path) -> (AutolabelJob, Vec<String>, PathBuf) {
+    use crate::storage::busy::marker_of;
+    let rels = frames(root, 3, false);
+    let dir = root.join("dataset");
+    let cfg = config(root);
+    let job = plan_autolabel(&cfg, AutolabelRequest::new(FrameFilter::default()), &host()).unwrap();
+    let paths = label_paths(&dir, &rels);
+    let fake = LabelFake {
+        broken_during_run: paths.clone(),
+        ..LabelFake::default()
+    };
+    run_job(&job, &fake).unwrap_err();
+    assert!(job.work.join(PROPOSALS_FILE).is_file());
+    std::fs::write(marker_of(&job.work), b"1\n").unwrap();
+    for p in &paths {
+        std::fs::remove_file(p).unwrap();
+    }
+    let _ = std::fs::remove_file(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE));
+    (job, rels, dir)
+}
+
+/// A sweep that runs while the folder under review is not available (a drive or share not mounted
+/// yet at startup) keeps the crashed run's folder and marker, saying why: every frame would
+/// otherwise read as gone and the finished proposals be deleted with the folder. Once the folder is
+/// back, the next sweep writes them.
+#[test]
+fn a_crashed_run_waits_for_its_folder_under_review() {
+    use crate::storage::busy::marker_of;
+    use crate::storage::sweep;
+    let t = tmp("crash-unmounted");
+    let (job, rels, dir) = crashed_run(&t.0);
+    let mut cfg = config(&t.0);
+    cfg.collect.review_dir = Some(dir.clone());
+    let s = crate::storage::Settings::for_config(&cfg);
+    let away = t.0.join("unplugged");
+    std::fs::rename(&dir, &away).unwrap();
+    let mut rep = sweep::Report::default();
+    sweep::sweep_work(&s, &mut rep);
+    assert!(
+        job.work.join(PROPOSALS_FILE).is_file(),
+        "the proposals stay"
+    );
+    assert!(
+        marker_of(&job.work).is_file(),
+        "so the next sweep tries again"
+    );
+    assert!(rep.removed.is_empty(), "{rep:?}");
+    assert_eq!(rep.kept.len(), 1, "{rep:?}");
+    assert!(
+        rep.kept[0].contains("The folder under review is not available"),
+        "{}",
+        rep.kept[0]
+    );
+    // Back again: written, queued, removed.
+    std::fs::rename(&away, &dir).unwrap();
+    let mut rep = sweep::Report::default();
+    sweep::sweep_work(&s, &mut rep);
+    assert!(rep.kept.is_empty(), "{rep:?}");
+    assert!(!job.work.exists());
+    assert!(!marker_of(&job.work).exists());
+    for r in &rels {
+        assert!(labels_of(&dir, r).auto_run.is_some(), "{r}");
+    }
+    assert_eq!(review_queue(&dir).len(), 3);
+}
+
+/// A recovery that wrote every frame marks the proposals written: a second one (the folder's
+/// removal failed, so the next sweep finds it again) writes and queues nothing, and the sweep then
+/// only removes the folder.
+#[test]
+fn a_recovered_run_is_never_written_twice() {
+    use crate::storage::busy::marker_of;
+    use crate::storage::sweep;
+    let t = tmp("crash-twice");
+    let (job, rels, dir) = crashed_run(&t.0);
+    let cfg = config(&t.0);
+    let first = recover_crashed(&job.work, &cfg).unwrap();
+    assert_eq!(
+        (first.frames_saved, first.frames_failed),
+        (3, 0),
+        "{first:?}"
+    );
+    assert_eq!(first.queued, 3);
+    assert!(!job.work.join(PROPOSALS_FILE).exists());
+    assert!(job.work.join(APPLIED_FILE).is_file());
+    let labels: Vec<LabelFile> = rels.iter().map(|r| labels_of(&dir, r)).collect();
+    let queue = std::fs::read(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE)).unwrap();
+
+    let again = recover_crashed(&job.work, &cfg).unwrap();
+    assert_eq!(
+        again,
+        Recovered::default(),
+        "nothing written the second time"
+    );
+    let mut rep = sweep::Report::default();
+    sweep::sweep_work(&crate::storage::Settings::for_config(&cfg), &mut rep);
+    assert!(rep.kept.is_empty(), "{rep:?}");
+    assert_eq!(rep.removed.len(), 1, "{rep:?}");
+    assert!(!job.work.exists());
+    assert!(!marker_of(&job.work).exists());
+    let after: Vec<LabelFile> = rels.iter().map(|r| labels_of(&dir, r)).collect();
+    assert_eq!(after, labels, "the label files are untouched");
+    assert_eq!(
+        std::fs::read(dir.join(crate::collect::layout::REVIEW_QUEUE_FILE)).unwrap(),
+        queue,
+        "no review-queue line twice"
+    );
+}
+
+/// A run's end removes its proposals before its folder: a folder that cannot be removed then keeps
+/// its marker, unlocked, and the next sweep removes it without writing anything again. Proposals
+/// that cannot be removed end the old way (marker deleted, the folder kept), never written twice.
+#[cfg(unix)]
+#[test]
+fn a_work_folder_that_cannot_be_removed_is_left_to_the_sweep_without_its_proposals() {
+    use crate::storage::Busy;
+    use crate::storage::busy::{self, State, marker_of};
+    use std::os::unix::fs::PermissionsExt;
+    let t = tmp("remove-stuck");
+    let cfg = config(&t.0);
+    let work = crate::training::training_dir(&cfg).join("autolabel/20261123-1");
+    let stuck = work.join("enhanced");
+    let set = |p: &Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    std::fs::create_dir_all(&stuck).unwrap();
+    std::fs::write(stuck.join("a.jpg"), b"x").unwrap();
+    std::fs::write(work.join(PROPOSALS_FILE), b"{}\n").unwrap();
+    set(&stuck, 0o555);
+    if std::fs::write(stuck.join("probe"), b"x").is_ok() {
+        set(&stuck, 0o755);
+        eprintln!("skipped: permissions are not enforced for this user");
+        return;
+    }
+    remove_work(Busy::hold(&work), &work);
+    assert!(work.is_dir(), "the removal failed");
+    assert!(
+        !work.join(PROPOSALS_FILE).exists(),
+        "the proposals went first"
+    );
+    let State::Crashed(claim) = busy::probe(&work) else {
+        panic!("left to the sweep as a crashed job's folder")
+    };
+    drop(claim);
+    set(&stuck, 0o755);
+    let mut rep = crate::storage::sweep::Report::default();
+    crate::storage::sweep::sweep_work(&crate::storage::Settings::for_config(&cfg), &mut rep);
+    assert!(!work.exists(), "{rep:?}");
+    assert!(!marker_of(&work).exists());
+
+    // Proposals that cannot be removed: the marker goes, the folder (and its proposals) stay.
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join(PROPOSALS_FILE), b"{}\n").unwrap();
+    set(&work, 0o555);
+    remove_work(Busy::hold(&work), &work);
+    set(&work, 0o755);
+    assert!(work.join(PROPOSALS_FILE).is_file());
+    assert!(matches!(busy::probe(&work), State::Ended));
+}
+
 /// `labeler_ms`: nearest-rank median and p90 per labeler, lossy per line (a torn line, a line
 /// without `ms` and non-numbers are left out); a report without them serializes no key (task
 /// results are stored as JSON values, so older records without it load as before).

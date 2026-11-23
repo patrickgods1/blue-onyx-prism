@@ -135,6 +135,63 @@ fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Resu
     Ok(())
 }
 
+/// The `train` subcommands that run jobs (spawn Python or uv trees, take the training or
+/// export lock, trust busy markers, remove the training environment): the orphan sweep runs
+/// before them. Exhaustive on purpose, so a new subcommand has to choose.
+fn train_sweeps_orphans(cmd: &blue_onyx_prism::training::cli::TrainCommand) -> bool {
+    use blue_onyx_prism::training::cli::TrainCommand as T;
+    match cmd {
+        T::Run { .. }
+        | T::Import(_)
+        | T::Autolabel(_)
+        | T::Overlaps(_)
+        | T::Refine(_)
+        | T::RetryExport { .. }
+        | T::RemoveEnv => true,
+        T::Capability { .. } | T::Estimate { .. } | T::Prepare { .. } | T::Classes(_) | T::List => {
+            false
+        }
+    }
+}
+
+/// RA-011: end the children an earlier, now dead, process left in this config's data root
+/// ([`blue_onyx_prism::children::sweep_orphans_once`]) before a command that takes a job lock
+/// or trusts a busy marker: those locks die with a crashed process while its children may still
+/// write. Said on stderr (these commands have no info-level log). A config that cannot be read
+/// is left to the command to report.
+fn sweep_orphans(cli: &Cli) {
+    let Ok(cfg) = read_config(cli) else {
+        return;
+    };
+    let Some(report) = blue_onyx_prism::children::sweep_orphans_once(&cfg.data_root()) else {
+        return;
+    };
+    for k in &report.killed {
+        match &k.error {
+            None => eprintln!(
+                "ended {} process {} ({}), left running by an earlier run",
+                k.kind,
+                k.pid,
+                k.exe.display()
+            ),
+            Some(e) => eprintln!(
+                "warning: could not end {} process {} ({}), left running by an earlier run: {e}; \
+                 end it by hand",
+                k.kind,
+                k.pid,
+                k.exe.display()
+            ),
+        }
+    }
+    if let Some(e) = &report.error {
+        eprintln!(
+            "warning: the check for processes an earlier run left running could not run: {e}; \
+             if a training, export or auto-label process from a crashed run still runs, end it \
+             by hand"
+        );
+    }
+}
+
 /// `--config` or the default config path.
 fn config_path(cli: &Cli) -> PathBuf {
     cli.config
@@ -427,6 +484,8 @@ fn run(cli: Cli) -> Result<()> {
             all_for_platform,
             allow_large,
         }) => {
+            // Exports take the export lock and replace tools: orphans first (RA-011).
+            sweep_orphans(&cli);
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             let req = resources::commands::FetchRequest {
                 for_config,
@@ -464,6 +523,9 @@ fn run(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Some(Command::Train(args)) => {
+            if train_sweeps_orphans(&args.command) {
+                sweep_orphans(&cli);
+            }
             let code = blue_onyx_prism::training::cli::main(*args, cli.config.clone());
             if code != ExitCode::SUCCESS {
                 exit_flushed(1);
@@ -697,5 +759,39 @@ async fn windows_signal() -> Signal {
             Signal::Closing("Windows is shutting down")
         }
         else => std::future::pending::<Signal>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn train(args: &[&str]) -> blue_onyx_prism::training::cli::TrainCommand {
+        let mut argv = vec!["blue-onyx-prism", "train"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).expect("parses").command {
+            Some(Command::Train(a)) => a.command,
+            other => panic!("not a train command: {other:?}"),
+        }
+    }
+
+    /// RA-011: the job-running `train` subcommands sweep orphans first; the read-only ones do
+    /// not.
+    #[test]
+    fn job_running_train_commands_sweep_orphans_first() {
+        for args in [
+            &["run", "--model", "yolo26n"][..],
+            &["import", "--path", "clips"],
+            &["autolabel"],
+            &["overlaps"],
+            &["refine"],
+            &["remove-env"],
+            &["retry-export", "run-1"],
+        ] {
+            assert!(train_sweeps_orphans(&train(args)), "{args:?}");
+        }
+        for args in [&["capability"][..], &["list"]] {
+            assert!(!train_sweeps_orphans(&train(args)), "{args:?}");
+        }
     }
 }

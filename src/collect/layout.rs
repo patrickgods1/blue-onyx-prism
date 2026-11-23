@@ -11,6 +11,11 @@
 //!
 //! The JSONL files survive a crash or a full disk: [`append_line`] ends a torn last line before
 //! writing, and [`read_lines`] costs a damaged line only that line, and counts it.
+//!
+//! Every writer of a day's `index.jsonl` (the collector's and the import's [`append_index`],
+//! retention's [`rewrite_index`] and its removal of emptied folders) holds the dataset's
+//! cross-process [`INDEX_LOCK_FILE`]; the frame files themselves go in through [`write_in_day`],
+//! which survives retention removing a just-created, still empty day folder.
 
 use super::record::{Bucket, IndexLine, Record};
 use anyhow::{Context, Result, bail};
@@ -133,6 +138,13 @@ fn stem_ok(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Whether `stem` is a frame's file stem the collector or an import writes: the layout's alphabet
+/// and length, starting with a frame stamp ([`crate::clock::parse_frame_stamp`]; both zones'
+/// shapes). Retention removes an orphan `<stem>.json` only under such a name.
+pub fn is_frame_stem(stem: &str) -> bool {
+    stem_ok(stem) && crate::clock::parse_frame_stamp(stem).is_some()
 }
 
 /// Parse `<scene>/<camera>/<YYYY-MM-DD>/<stem>.jpg` (or `.json`): exactly four components of
@@ -490,9 +502,17 @@ pub fn read_index(path: &Path) -> Vec<IndexLine> {
     read_lines(path).lines
 }
 
-/// Rewrite `day`'s index without the frames whose image is gone (after retention), atomically.
-/// Returns the lines kept.
+/// Rewrite `day`'s index without the frames whose image is gone (after retention), atomically,
+/// under [`INDEX_LOCK_FILE`] ([`lock_index`]: an error when another holds it too long). Returns
+/// the lines kept.
 pub fn rewrite_index(day: &Path) -> Result<usize> {
+    let lock = lock_index(day)?;
+    rewrite_index_locked(day, &lock)
+}
+
+/// [`rewrite_index`] under the caller's [`lock_index`] of the same dataset (retention holds it
+/// on through the removal of emptied folders).
+pub fn rewrite_index_locked(day: &Path, _lock: &IndexLock) -> Result<usize> {
     let path = day.join(INDEX_FILE);
     let index = read_lines::<IndexLine>(&path);
     // Rewriting from an index that could not be read would drop every frame's line.
@@ -593,62 +613,196 @@ const QUEUE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Longest wait of a compaction for the queue lock: it is a chore, tried again at the next sweep.
 const COMPACT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// What [`queue_lock`] holds: the folder lock (None when it could not be had), then this
-/// process's.
-struct QueueLock {
+/// What [`folder_lock`] holds: the folder lock (None when it could not be had), then this
+/// process's mutex.
+#[derive(Debug)]
+struct FolderLock {
     folder: Option<std::fs::File>,
+    /// The lock was held by someone else for the whole wait, or the wait was stopped (as opposed
+    /// to a lock that cannot work here: a network share, a read-only folder).
+    busy: bool,
     _process: Option<std::sync::MutexGuard<'static, ()>>,
 }
 
-impl Drop for QueueLock {
+impl Drop for FolderLock {
     fn drop(&mut self) {
+        // Explicitly, before the process mutex: a child spawned right now shares this open file
+        // until it execs, and closing alone would leave the lock held for that moment.
         if let Some(f) = &self.folder {
             let _ = fs4::FileExt::unlock(f);
         }
     }
 }
 
-/// The queue lock of the dataset `dir`: this process's mutex (unless `process` is false, which
-/// only the tests use, to act as another process), then [`QUEUE_LOCK_FILE`], waiting at most
-/// `wait` for it.
-fn queue_lock(dir: &Path, wait: std::time::Duration, process: bool) -> QueueLock {
-    let held = process.then(|| REVIEW_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-    let path = dir.join(QUEUE_LOCK_FILE);
-    let file = std::fs::OpenOptions::new()
+/// The zero-byte lock file `path` (created, never deleted), exclusively, after `mutex` (unless
+/// `process` is false, which only the tests use, to act as another process). A held lock is
+/// waited for at most `wait`, polling every 2 ms, and while `keep_waiting` says yes. A lock file
+/// another account made is locked through a read handle.
+fn folder_lock(
+    path: &Path,
+    mutex: &'static std::sync::Mutex<()>,
+    wait: std::time::Duration,
+    process: bool,
+    keep_waiting: impl FnMut() -> bool,
+) -> FolderLock {
+    let held = process.then(|| mutex.lock().unwrap_or_else(|e| e.into_inner()));
+    let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path);
-    let folder = match file {
+        .open(path)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            std::fs::File::open(path).map_err(|_| e)
+        }
+        r => r,
+    };
+    let (folder, busy) = match file {
         Ok(f) => {
             let waited = crate::fsx::lock_wait_with(
                 &f,
                 crate::fsx::LockKind::Exclusive,
                 crate::fsx::deadline_after(wait),
                 crate::fsx::Pauses::fixed(std::time::Duration::from_millis(2)),
-                || true,
+                keep_waiting,
             );
             match waited {
-                Ok(crate::fsx::Waited::Held) => Some(f),
+                Ok(crate::fsx::Waited::Held) => (Some(f), false),
                 Ok(crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped) => {
                     tracing::debug!("{}: still locked after {wait:?}", path.display());
-                    None
+                    (None, true)
                 }
                 Err(e) => {
                     tracing::debug!("{}: {e}", path.display());
-                    None
+                    (None, false)
                 }
             }
         }
         Err(e) => {
             tracing::debug!("{}: {e}", path.display());
-            None
+            (None, false)
         }
     };
-    QueueLock {
+    FolderLock {
         folder,
+        busy,
         _process: held,
+    }
+}
+
+/// The queue lock of the dataset `dir`: this process's mutex (unless `process` is false, which
+/// only the tests use, to act as another process), then [`QUEUE_LOCK_FILE`], waiting at most
+/// `wait` for it.
+fn queue_lock(dir: &Path, wait: std::time::Duration, process: bool) -> FolderLock {
+    folder_lock(
+        &dir.join(QUEUE_LOCK_FILE),
+        &REVIEW_LOCK,
+        wait,
+        process,
+        || true,
+    )
+}
+
+/// Serializes the writers of the day folders' `index.jsonl` within the process. Taken before
+/// [`INDEX_LOCK_FILE`].
+static INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The cross-process lock of every day folder's `index.jsonl` at the dataset's root (zero bytes,
+/// never deleted; audit 2026-11 phase 2). Its writers: the collector's and the import's appends
+/// ([`append_index`]: the import runs on a job thread of the service or in a `blue-onyx-prism
+/// train import` process) and retention's rewrite ([`rewrite_index`]), which also removes the
+/// emptied day, camera and scene folders under it. Without it a rewrite that read the index
+/// before an import's append and renamed its copy after would drop the imported frame's line,
+/// hiding the frame from the Collect tab and the review walk.
+pub const INDEX_LOCK_FILE: &str = ".index.lock";
+/// Longest wait for [`INDEX_LOCK_FILE`]. Holders keep it for one append or one day's rewrite
+/// (milliseconds); running out means a stopped process. An append then goes on without it
+/// (saving a frame wins over waiting), a rewrite is left for the next retention pass.
+pub const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The folder [`INDEX_LOCK_FILE`] of the day folder `day` lives in: the dataset root
+/// (`<root>/<scene>/<camera>/<date>`), or `day` itself when it is not in the layout.
+fn index_root(day: &Path) -> &Path {
+    let mut up = day.ancestors().skip(2);
+    up.next()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .filter(|n| SCENES.contains(n))
+        .and_then(|_| up.next())
+        .unwrap_or(day)
+}
+
+/// [`INDEX_LOCK_FILE`] held for a rewrite of a day's index ([`lock_index`]), released on drop.
+#[derive(Debug)]
+pub struct IndexLock {
+    _held: FolderLock,
+}
+
+/// The index lock of the dataset holding the day folder `day`, for a writer that must not go on
+/// while another holds it ([`rewrite_index`], and retention around its folder removal). Waits at
+/// most [`INDEX_LOCK_WAIT`], and stops waiting when the collector thread running it is asked to
+/// stop ([`super::stop_requested`]); either is an error (try again later). Where a lock cannot
+/// work at all (some network shares) it goes on under this process's own lock.
+pub fn lock_index(day: &Path) -> Result<IndexLock> {
+    lock_index_with(day, true)
+}
+
+fn lock_index_with(day: &Path, process: bool) -> Result<IndexLock> {
+    let path = index_root(day).join(INDEX_LOCK_FILE);
+    let held = folder_lock(&path, &INDEX_LOCK, INDEX_LOCK_WAIT, process, || {
+        !super::stop_requested()
+    });
+    if held.busy {
+        bail!(
+            "{} is held by another process (an import writing frames?) or the service is \
+             stopping; the index of {} is left as it is and the next retention pass tries again",
+            path.display(),
+            day.display()
+        );
+    }
+    Ok(IndexLock { _held: held })
+}
+
+/// Append `line` to the index of the day folder `day` under [`INDEX_LOCK_FILE`] (the one way a
+/// frame is listed: the collector and the import call it after the frame's image and sidecar
+/// are in). A lock still held after [`INDEX_LOCK_WAIT`], or one that cannot work, does not stop
+/// the append.
+pub fn append_index(day: &Path, line: &IndexLine) -> std::io::Result<()> {
+    append_index_with(day, line, true)
+}
+
+fn append_index_with(day: &Path, line: &IndexLine, process: bool) -> std::io::Result<()> {
+    let text = serde_json::to_string(line).map_err(std::io::Error::other)?;
+    let path = index_root(day).join(INDEX_LOCK_FILE);
+    let held = folder_lock(&path, &INDEX_LOCK, INDEX_LOCK_WAIT, process, || true);
+    if held.folder.is_none() {
+        tracing::debug!(
+            "{}: appending without the folder lock (it could not be had)",
+            path.display()
+        );
+    }
+    let out = append_line(&day.join(INDEX_FILE), &text);
+    drop(held);
+    out
+}
+
+/// Write `bytes` to `path`, a file of the day folder `day` the caller has just created, through
+/// [`write_atomic`]; when the folder is gone, create it once more and write again. Retention
+/// removes an empty day folder (left by an interrupted write, or emptied by the caps) under
+/// [`INDEX_LOCK_FILE`], and a writer's `create_dir_all` can land just before that removal. A
+/// writer does not hold the lock from its `create_dir_all` to its index append instead: an import
+/// decodes and re-encodes images in between, and the collector thread would wait behind it for
+/// every frame Blue Iris sends. Once the image is in, the folder is not empty and `remove_dir`
+/// cannot take it, so the only window is up to the first write, and one retry covers it (another
+/// removal needs another retention pass).
+pub fn write_in_day(day: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match write_atomic(path, bytes) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !day.is_dir() => {
+            std::fs::create_dir_all(day)?;
+            write_atomic(path, bytes)
+        }
+        r => r,
     }
 }
 
@@ -1290,5 +1444,135 @@ mod tests {
         assert!(w.resolve(&rel("2026-10-22", "a"), "jpg").is_some());
         assert_eq!(w.day_lookups, 2, "another folder");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dataset's index lock as another process holds it: a handle of its own, no mutex.
+    fn hold_index_lock(dir: &Path) -> std::fs::File {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(INDEX_LOCK_FILE))
+            .unwrap();
+        fs4::FileExt::try_lock(&f).unwrap();
+        f
+    }
+
+    /// Wait (bounded) for `t` to end, then its answer.
+    fn finished<T>(t: std::thread::JoinHandle<T>) -> T {
+        t.join().unwrap()
+    }
+
+    /// Audit 2026-11 phase 2 (Q:collect-1): a rewrite that read the index before an import's
+    /// append and renamed its copy after would lose the imported frame's line. The rewrite waits
+    /// for the index lock the import holds, then keeps the line.
+    #[test]
+    fn an_import_append_during_a_rewrite_is_never_lost() {
+        let dir = tmp("index-lock-rewrite");
+        let day = dir.join("ir/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("kept.jpg"), b"x").unwrap();
+        for id in ["kept", "deleted"] {
+            append_line(
+                &day.join(INDEX_FILE),
+                &serde_json::to_string(&index_line(id, "ir", &[])).unwrap(),
+            )
+            .unwrap();
+        }
+        // "The import" holds the lock while it writes its frame and appends the line.
+        let held = hold_index_lock(&dir);
+        let rewrite = {
+            let day = day.clone();
+            std::thread::spawn(move || rewrite_index(&day))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !rewrite.is_finished(),
+            "the rewrite waits for the index lock"
+        );
+        std::fs::write(day.join("imported.jpg"), b"x").unwrap();
+        append_line(
+            &day.join(INDEX_FILE),
+            &serde_json::to_string(&index_line("imported", "ir", &[])).unwrap(),
+        )
+        .unwrap();
+        fs4::FileExt::unlock(&held).unwrap();
+        assert_eq!(finished(rewrite).unwrap(), 2);
+        let ids: Vec<String> = read_index(&day.join(INDEX_FILE))
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids, ["kept", "imported"]);
+        assert!(dir.join(INDEX_LOCK_FILE).is_file(), "the lock file stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_index_append_waits_for_the_lock_and_lands_after_it() {
+        let dir = tmp("index-lock-append");
+        let day = dir.join("night/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        let held = hold_index_lock(&dir);
+        let append = {
+            let day = day.clone();
+            std::thread::spawn(move || append_index(&day, &index_line("a", "night", &["dog"])))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!append.is_finished(), "the append waits for the index lock");
+        assert!(read_index(&day.join(INDEX_FILE)).is_empty());
+        fs4::FileExt::unlock(&held).unwrap();
+        finished(append).unwrap();
+        let read = read_index(&day.join(INDEX_FILE));
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].labels, ["dog"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_index_lock_lives_at_the_dataset_root() {
+        let root = Path::new("data");
+        let day = root.join("ir").join("cam").join("2026-10-22");
+        assert_eq!(index_root(&day), root);
+        // Not in the layout: beside the index itself.
+        let other = root.join("photos").join("cam").join("2026-10-22");
+        assert_eq!(index_root(&other), other.as_path());
+        assert_eq!(index_root(Path::new("x")), Path::new("x"));
+    }
+
+    #[test]
+    fn a_day_folder_removed_before_the_first_write_is_made_again() {
+        let dir = tmp("write-in-day");
+        let day = dir.join("day/cam/2026-10-22");
+        std::fs::create_dir_all(&day).unwrap();
+        // Retention removed it, still empty, between `create_dir_all` and the image.
+        std::fs::remove_dir(&day).unwrap();
+        std::fs::remove_dir(day.parent().unwrap()).unwrap();
+        let jpg = day.join("a.jpg");
+        write_in_day(&day, &jpg, b"img").unwrap();
+        assert_eq!(std::fs::read(&jpg).unwrap(), b"img");
+        // A folder that is there and another error stay errors.
+        let file_as_day = day.join("a.jpg");
+        assert!(write_in_day(&file_as_day, &file_as_day.join("b.jpg"), b"x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frame_stems_are_the_written_ones() {
+        let zone = crate::clock::Zone::Utc;
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+        let collector = format!("{}_{}", zone.frame_stamp(t), safe_id("req-1"));
+        assert!(is_frame_stem(&collector), "{collector}");
+        assert!(is_frame_stem("20261116T140211583-0800_abc"));
+        assert!(is_frame_stem("20261022T120000000Z_imp-ab12-00001"));
+        for no in [
+            "",
+            "notes",
+            "a.labels",
+            "20261022T120000000Z_a.b",
+            "2026-10-22",
+        ] {
+            assert!(!is_frame_stem(no), "{no}");
+        }
     }
 }

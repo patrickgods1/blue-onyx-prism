@@ -454,7 +454,7 @@ not reviewed yet, and disk needed against free per volume.
 
 The checks run when a run is queued (page, `train run`) and again when it starts. Warnings stay with the
 run: on its row, in `dataset.json` and in `train.log`. The disk need is the frames that cannot be hard-linked
-(another volume, or exFAT, probed with one link), labels, five times the base weights for the work folder
+(another volume, or exFAT, probed with one link made in `<training dir>/runs`), labels, five times the base weights for the work folder
 (`WORK_WEIGHT_FACTOR`; measured: YOLO26n 16 MB, RT-DETRv2 S 77 MB, RF-DETR nano 1.1 GB without rfdetr's interval
 archives, which the script turns off; two full nano runs that kept them used 1.6 and 3.5 GB), RF-DETR's augmented
 copies, the model, and what the environment and weights still have to download. The frames are counted at full
@@ -955,7 +955,7 @@ row states their size. Cancelling a retry returns the run to its failure.
 |---|---|---|
 | YOLO26, YOLO11, YOLOv8 | `run/weights/best.pt`, else `last.pt` | yes, the best epoch so far |
 | RF-DETR | `rfdetr-out/checkpoint_best_total.pth`, else the running `checkpoint_best_ema.pth` / `_regular.pth` | yes, the best epoch so far |
-| RT-DETRv2, D-FINE | `hf-best/` (saved at every new best epoch; `save_strategy="no"` keeps nothing else) | yes, the best epoch so far; not for runs of older versions |
+| RT-DETRv2, D-FINE | `hf-best/` (saved at every new best epoch; `save_strategy="no"` keeps nothing else; after a crash between saves, `hf-best.old`, else `hf-best.tmp`) | yes, the best epoch so far; not for runs of older versions |
 
 rfdetr's interval archives (`checkpoint_<epoch>.ckpt`, 483 MB each for a nano, every 10 epochs by default;
 one run left 3.1 GB of them) are off: the script passes `checkpoint_interval = epochs + 1`, an interval
@@ -1630,7 +1630,8 @@ both the work folder and the dataset (the two add up when they share a volume). 
 volume keeps 5 % of its size free (at least 1 GiB, at most 5 GiB), and the message says what to lower (Candidates per
 video, the sampling rate, Frames to keep) or where to move `training.dir` / Save frames to. While it runs it stops
 the helpers once free space falls below half that margin; a full disk (ENOSPC from Rust or the helper) ends the
-import with the same advice. The work folder is removed in both cases (unless keep work), and frames already
+import with the same advice. The work folder is removed in both cases (unless keep work; one that cannot be
+removed is left to the next storage sweep), and frames already
 written to the dataset stay complete and are queued for review. If a source video is gone or one of its kept
 frames cannot be found again, that frame is skipped with a warning; a downscaled candidate is never written to the
 dataset.
@@ -2193,7 +2194,9 @@ checked, and pairs already answered stay answered, so tick **Ask again** on *Sug
 as a witness has not been measured.
 
 **If a run fails.** A labelers run that fails after some frames finished (a crash, a reset GPU) writes
-those frames like a Cancel does, then still reports the failure; run it again and it resumes.
+those frames like a Cancel does, then still reports the failure; run it again and it resumes. After a crash
+of the service itself, the storage sweep writes the finished frames at the next start (it waits while the
+folder under review is unavailable) and renames them `proposals.jsonl.applied`, so they are never written twice.
 
 ### Label with any model
 
@@ -2717,8 +2720,8 @@ folds (twice the selected images, five times the base weights, the labels, plus 
 of an import), the fold folders go to `<parent of the folder under review>/.blue-onyx-prism-work/refine/<id>/fold-N`
 instead (`refine/place.rs`; never inside the dataset or review folder), so each fold's export hard-links
 the frames rather than copying them across volumes. That folder is held busy like a work folder, named in
-the work folder (`elsewhere.txt`) before it is made, and removed at the end; after a crash the sweep
-removes it by its own marker (`NEAR_WORK_DIRS` under `.blue-onyx-prism-work` beside the configured dataset
+the work folder (`elsewhere.txt`) before it is made, and removed at the end with an emptied `.blue-onyx-prism-work/refine/`; after a crash the sweep
+removes it, and the emptied folders above it, by its own marker (`NEAR_WORK_DIRS` under `.blue-onyx-prism-work` beside the configured dataset
 and review folders) or through the work folder that names it, and the Storage card lists it with the other
 work folders. Pause suspends the training
 processes; the export, prediction and writes of the running fold finish first.

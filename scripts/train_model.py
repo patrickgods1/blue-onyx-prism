@@ -71,7 +71,8 @@ in its work folder, on the CPU (a fresh process, so the GPU and the training mem
                 best `checkpoint_best_ema.pth` / `checkpoint_best_regular.pth`, beside the
                 `training_config.json` rfdetr writes before and after training.
   transformers  `<work>/hf-best/` (`config.json` + `model.safetensors`): `save_strategy="no"` keeps
-                nothing on disk, so this script saves the best epoch there (`save_hf_best`).
+                nothing on disk, so this script saves the best epoch there (`save_hf_best`); after
+                a crash between its renames, `hf-best.old`, else `hf-best.tmp`.
 
 The service runs this file (embedded in the binary) inside its pinned training environment
 (<data root>/tools/train-env), offline: YOLO_OFFLINE=1, HF_HUB_OFFLINE=1, TRANSFORMERS_OFFLINE=1;
@@ -2878,18 +2879,42 @@ def train_transformers(a, device: str, names: list[str], em) -> dict:
     return export_transformers_model(a, model, device, names, em)
 
 
+def hf_complete(d: Path) -> bool:
+    """Whether `d` holds a whole `save_pretrained` checkpoint (what the service's Retry export
+    accepts, retry.rs `best_checkpoint`)."""
+    return (d / "config.json").is_file() and (d / "model.safetensors").is_file()
+
+
 def save_hf_best(model, work: Path) -> None:
-    """The best epoch's weights as `<work>/hf-best` (`save_pretrained`, written beside it and
-    renamed): with `save_strategy="no"` nothing else on disk survives a failed export or a crash.
-    A failure here (a full disk) costs the Retry export, never the run."""
-    tmp, dst = work / "hf-best.tmp", work / "hf-best"
+    """The best epoch's weights as `<work>/hf-best` (`save_pretrained`, written beside it as
+    `hf-best.tmp`, the previous best renamed aside to `hf-best.old`, the new one renamed in, then the
+    old one deleted): with `save_strategy="no"` nothing else on disk survives a failed export or a
+    crash, and a process killed at any point leaves a whole checkpoint under one of those three
+    names (the service looks in that order). A stale `hf-best.old` is deleted only beside a whole
+    `hf-best`. A failure here (a full disk) costs the Retry export, never the run."""
+    tmp, dst, old = work / "hf-best.tmp", work / "hf-best", work / "hf-best.old"
     try:
+        if old.exists() and hf_complete(dst):
+            shutil.rmtree(old, ignore_errors=True)
         shutil.rmtree(tmp, ignore_errors=True)
         model.save_pretrained(str(tmp))
-        shutil.rmtree(dst, ignore_errors=True)
+        if dst.exists():
+            if old.exists():
+                # The fallback of an earlier save that could not be cleared stays the fallback.
+                shutil.rmtree(dst, ignore_errors=True)
+            else:
+                dst.replace(old)
         tmp.replace(dst)
+        shutil.rmtree(old, ignore_errors=True)
     except Exception as e:
-        log(f"the best epoch was not saved to {dst} ({type(e).__name__}: {e}); training goes on, but a failed export cannot be retried")
+        if not dst.exists() and hf_complete(old):
+            try:
+                old.replace(dst)
+            except OSError:
+                pass
+        kept = "the previous best stays for a Retry export" if hf_complete(dst) or hf_complete(old) \
+            else "a failed export cannot be retried"
+        log(f"the best epoch was not saved to {dst} ({type(e).__name__}: {e}); training goes on; {kept}")
         shutil.rmtree(tmp, ignore_errors=True)
 
 

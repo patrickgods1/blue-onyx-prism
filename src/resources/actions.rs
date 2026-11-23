@@ -418,7 +418,11 @@ pub fn remove(
         ResourceKind::ExportModel => {
             !export::export_leftovers(res, &paths, cache_dir.as_deref()).is_empty()
         }
-        _ => is_installed(res, &installed, config),
+        // A runtime's downloaded update counts too, also without the install it was meant for.
+        _ => {
+            is_installed(res, &installed, config)
+                || super::status::pending_update(res, config).is_some()
+        }
     };
     if !present {
         return Err(ActionError::Conflict(format!(
@@ -482,7 +486,9 @@ pub fn remove(
             let _ = std::fs::remove_file(m);
         }
         _ => {
-            std::fs::remove_dir_all(&dir).map_err(|e| fail(e, &dir))?;
+            if std::fs::symlink_metadata(&dir).is_ok() {
+                std::fs::remove_dir_all(&dir).map_err(|e| fail(e, &dir))?;
+            }
             // An update waiting for the next start would otherwise bring it back.
             if let Some(p) = manager::pending_dir(&dir).filter(|p| p.exists()) {
                 std::fs::remove_dir_all(&p).map_err(|e| fail(e, &p))?;
@@ -1349,6 +1355,40 @@ mod remove_tests {
         for p in res.parts {
             std::fs::write(root.join("models").join(p.file_name), b"x").unwrap();
         }
+    }
+
+    /// RA resources-11: a runtime's downloaded update whose install is gone (deleted by hand) is
+    /// still removable; nothing else is touched.
+    #[test]
+    fn remove_deletes_a_pending_update_without_its_install() {
+        let (root, c) = setup(Vec::new());
+        let p = catalog::Platform::current();
+        let Some(res) = catalog::openvino_runtime(p.os, p.arch) else {
+            return;
+        };
+        let dir = target_dir(&c, res);
+        assert!(!dir.exists());
+        let e = remove(None, &c, res.id).unwrap_err();
+        assert!(e.message().contains("not installed"), "{e}");
+        let pending = manager::pending_dir(&dir).unwrap();
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("lib.bin"), b"x").unwrap();
+        let m = manager::Manifest {
+            id: res.id.into(),
+            version: res.version.into(),
+            sha256: Vec::new(),
+            files: vec!["lib.bin".into()],
+        };
+        std::fs::write(
+            pending.join(manager::MANIFEST_FILE),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        let other = root.0.join("models").join("keep.onnx");
+        std::fs::write(&other, b"x").unwrap();
+        remove(None, &c, res.id).unwrap();
+        assert!(!pending.exists() && !dir.exists());
+        assert!(other.exists());
     }
 
     #[test]

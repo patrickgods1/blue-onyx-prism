@@ -12,6 +12,12 @@
 //!   macOS `proc_pidinfo(PROC_PIDTBSDINFO)` and `proc_pidpath`, Windows `GetProcessTimes` and
 //!   `QueryFullProcessImageNameW`.
 //!
+//! - [`group_members`] lists the processes of a group (Linux: `/proc/*/stat` field 5; macOS:
+//!   `proc_listpids(PROC_PGRP_ONLY)`; Windows: none, the Job holds the tree) and [`boot_id`] names
+//!   this boot (Linux `/proc/sys/kernel/random/boot_id`, macOS `kern.bootsessionuuid`), so the
+//!   orphan sweep can end what is left of a group whose leader died
+//!   ([`crate::children::decide`]) without ever sending a blind `killpg`.
+//!
 //! Safety rails: a PID or process group of 0 or 1, one that does not fit `pid_t`, this process
 //! itself or this process's own group is refused (`InvalidInput`): `kill(0, ..)` / `killpg(0, ..)`
 //! would signal our own group and `kill(-1, ..)` every process we may signal. A group or process
@@ -392,9 +398,188 @@ fn windows_exe_path(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_wide(wide)))
 }
 
+/// The processes whose process group is `pgid` (the leader included while it lives), or `None`
+/// when this OS cannot list them (Windows and others) or the listing failed. A process that
+/// exits during the listing may be missing or listed; callers re-check each one's identity.
+pub fn group_members(pgid: u32) -> Option<Vec<u32>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_group_members(pgid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_group_members(pgid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pgid;
+        None
+    }
+}
+
+/// Field 5 (`pgrp`) of a `/proc/<pid>/stat` line, counted after the last `)` like
+/// [`parse_stat_start`].
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "used on Linux and in tests")
+)]
+fn parse_stat_pgrp(stat: &str) -> Option<u32> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    // `rest` starts at field 3 (state): field 5 is the 3rd.
+    rest.split_whitespace().nth(5 - 3)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_group_members(pgid: u32) -> Option<Vec<u32>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        // A process that exited since the directory was read has no stat any more.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if parse_stat_pgrp(&stat) == Some(pgid) {
+            found.push(pid);
+        }
+    }
+    Some(found)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_group_members(pgid: u32) -> Option<Vec<u32>> {
+    /// `PROC_PGRP_ONLY` from `<libproc.h>` (not exported by the libc crate).
+    const PROC_PGRP_ONLY: u32 = 2;
+    let int = std::mem::size_of::<libc::c_int>();
+    let mut cap = 256usize;
+    loop {
+        let mut buf: Vec<libc::c_int> = vec![0; cap];
+        let bytes = libc::c_int::try_from(cap.checked_mul(int)?).ok()?;
+        // SAFETY: `buf` is live and writable for `bytes` bytes; the kernel writes at most that
+        // many and returns how many it wrote.
+        let n =
+            unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pgid, buf.as_mut_ptr().cast(), bytes) };
+        let n = usize::try_from(n).ok()? / int;
+        if n >= cap && cap < 65_536 {
+            // Maybe cut short: ask again with room to spare.
+            cap *= 4;
+            continue;
+        }
+        buf.truncate(n.min(cap));
+        return Some(
+            buf.into_iter()
+                .filter_map(|p| u32::try_from(p).ok())
+                .filter(|&p| p > 0)
+                .collect(),
+        );
+    }
+}
+
+/// An identifier of the current boot (Linux `/proc/sys/kernel/random/boot_id`, macOS
+/// `kern.bootsessionuuid`), or `None` where there is none to read (Windows and others). Start
+/// times of processes are only comparable within one boot.
+pub fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(id.trim().to_string()).filter(|s| !s.is_empty())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_boot_session()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_boot_session() -> Option<String> {
+    let mut buf = [0u8; 128];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: the name is a NUL-terminated C string literal; `buf` is live and writable for
+    // `len` bytes and `len` is updated to the bytes written; no new value is set (null, 0).
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let bytes = buf.get(..len)?;
+    let text = std::ffi::CStr::from_bytes_until_nul(bytes)
+        .ok()
+        .and_then(|c| c.to_str().ok())
+        .or_else(|| std::str::from_utf8(bytes).ok())?;
+    Some(text.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stat_pgrp_is_field_5_counted_after_the_last_paren() {
+        assert_eq!(parse_stat_pgrp("42 (sleep) S 1 4242 7 0"), Some(4242));
+        assert_eq!(parse_stat_pgrp("42 (a) (b c)) S 1 4242 7"), Some(4242));
+        assert_eq!(parse_stat_pgrp("42 (sleep) S 1"), None);
+        assert_eq!(parse_stat_pgrp("no parens"), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn boot_id_is_stable() {
+        let id = boot_id().expect("boot id");
+        assert!(!id.is_empty());
+        assert_eq!(boot_id(), Some(id));
+    }
+
+    /// A group whose leader exited still lists its other members.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn group_members_lists_a_group_after_its_leader_is_gone() {
+        // The leader starts a background sleep (same group, its output not on the pipe) and
+        // exits at once.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped());
+        prepare(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sh");
+        let pid = child.id();
+        let mut out = String::new();
+        use std::io::Read as _;
+        child
+            .stdout
+            .take()
+            .expect("stdout")
+            .read_to_string(&mut out)
+            .expect("read");
+        let member: u32 = out.trim().parse().expect("member pid");
+        child.wait().expect("wait");
+        let listed = group_members(pid).expect("listing works here");
+        assert_eq!(listed, vec![member], "leader reaped, member left");
+        kill_pid(member).expect("kill");
+        assert!(wait_gone(member));
+        let after = group_members(pid).expect("listing");
+        assert!(
+            after.iter().all(|&p| !running(p)),
+            "group still has live members: {after:?}"
+        );
+        // Nobody's group: empty, not an error.
+        assert_eq!(group_members(4_000_001), Some(Vec::new()));
+    }
 
     #[test]
     fn stat_start_is_field_22_counted_after_the_last_paren() {

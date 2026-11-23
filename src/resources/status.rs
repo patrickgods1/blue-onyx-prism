@@ -9,6 +9,9 @@
 //!   loaded ONNX Runtime flavor, preloaded CUDA libraries: "restart required"), and when an
 //!   enabled model of the config uses the model files. Disabled config entries using them are
 //!   dropped with them (`actions::Removed::config_entries`, saved by the server's config writer).
+//!   A runtime's downloaded update waiting for the next start that loads it (`.<name>.pending`)
+//!   is shown with its size ([`ResourceRow::pending_bytes`]) and removed with the install, or
+//!   alone when the install it was meant for is gone.
 //! - **Add to config** appends an installed catalog model to `models` with the same rules as
 //!   `download-models --add-to-config`, or a model file found in `models_dir` that no config
 //!   entry references (id `local:<file>`, see [`local_models`]; family `auto`).
@@ -116,6 +119,10 @@ pub struct ResourceRow {
     /// Installed in another version than the catalog's: the catalog version Download installs
     /// (the UI labels the button Update).
     pub update_available: Option<&'static str>,
+    /// Bytes of a downloaded update of this runtime waiting beside it (`.<name>.pending`) for the
+    /// next start that loads it; Remove deletes it with the install (also alone, when the install
+    /// it was meant for is gone).
+    pub pending_bytes: Option<u64>,
 }
 
 fn kind_str(k: ResourceKind) -> &'static str {
@@ -495,10 +502,27 @@ pub(super) fn model_paths(res: &Resource, config: &Config) -> Vec<PathBuf> {
     }
 }
 
-/// Our install of `res` (manifest names it), not a user-managed directory.
+/// Our install of `res` (manifest names it), not a user-managed directory; for a runtime also a
+/// downloaded update of ours waiting beside a missing install ([`pending_update`]).
 fn ours(res: &Resource, config: &Config) -> bool {
     let dir = target_dir(config, res);
     manager::read_manifest(&manager::manifest_path(res, &dir)).is_some_and(|m| m.id == res.id)
+        || pending_update(res, config).is_some()
+}
+
+/// The downloaded update of the runtime `res` waiting beside its install for the next start
+/// that loads it (`manager::pending_dir`, its manifest names `res`), with its size on disk.
+pub(super) fn pending_update(res: &Resource, config: &Config) -> Option<(PathBuf, u64)> {
+    if !matches!(
+        res.kind,
+        ResourceKind::OpenVinoRuntime | ResourceKind::OnnxRuntime(_) | ResourceKind::CudaLibs
+    ) {
+        return None;
+    }
+    let p = manager::pending_dir(&target_dir(config, res)).filter(|p| p.is_dir())?;
+    manager::read_manifest(&p.join(manager::MANIFEST_FILE)).filter(|m| m.id == res.id)?;
+    let bytes = crate::storage::size_of(&p);
+    Some((p, bytes))
 }
 
 /// Config models (enabled or not) whose file is part of `res` (for an export also its IR, which
@@ -636,6 +660,7 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
             let update = on_disk && installed.outdated(r);
             // The catalog's version is downloaded and waits for the next start.
             let staged = on_disk && installed.update_staged(r);
+            let pending = pending_update(r, config);
             let need = res.needs.iter().find(|n| n.id() == r.id);
             let optional = res.optional.iter().any(|n| n.id() == r.id);
             let (state, progress, error, retry_in) = match status.map(|s| &s.state) {
@@ -693,14 +718,18 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                     update_note(r, need, loaded)
                 ),
                 (_, "installed") if staged => format!(
-                    "installed {}; {} is downloaded and replaces it at the next start (restart \
-                     the service to use it)",
+                    "installed {}; {} is downloaded ({}) and replaces it at the next start that \
+                     loads it (restart the service to use it; Remove deletes both)",
                     installed.installed_version(r.id).unwrap_or("?"),
-                    r.version
+                    r.version,
+                    catalog::format_size(pending.as_ref().map_or(0, |(_, b)| *b))
                 ),
                 (_, s) => s.to_string(),
             };
-            let blocked = if on_disk {
+            let state_text = with_pending(state_text, pending.as_ref(), on_disk, staged);
+            // A pending update alone can be removed too (RA resources-11).
+            let present = on_disk || pending.is_some();
+            let blocked = if present {
                 remove_blocked(ctx, r, config, status)
             } else {
                 Some("not installed".into())
@@ -734,8 +763,8 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                     && (flavor.map(|f| f.as_str()) == active_flavor.as_deref()
                         || flavor == ctx.and_then(|c| c.ort_loaded)),
                 loaded,
-                removable: on_disk && blocked.is_none(),
-                remove_blocked: if on_disk { blocked } else { None },
+                removable: present && blocked.is_none(),
+                remove_blocked: if present { blocked } else { None },
                 can_add_to_config: can_add,
                 target: target_dir(config, r).display().to_string(),
                 action: "download",
@@ -751,9 +780,35 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
                 size_note: None,
                 log: Vec::new(),
                 update_available: update.then_some(r.version),
+                pending_bytes: pending.as_ref().map(|(_, b)| *b),
             }
         })
         .collect()
+}
+
+/// `state_text` with the downloaded update waiting beside the install (`pending`: folder, bytes)
+/// when the text does not tell of it already (`staged`: it is the catalog's version, which the
+/// installed state's text names).
+fn with_pending(
+    state_text: String,
+    pending: Option<&(PathBuf, u64)>,
+    on_disk: bool,
+    staged: bool,
+) -> String {
+    match pending {
+        Some((p, bytes)) if !on_disk => format!(
+            "{state_text}; a downloaded update ({}) waits in {} for an install that is gone; \
+             Remove deletes it",
+            catalog::format_size(*bytes),
+            p.display()
+        ),
+        Some((p, bytes)) if !staged => format!(
+            "{state_text}; an earlier downloaded update ({}) waits in {} (Remove deletes both)",
+            catalog::format_size(*bytes),
+            p.display()
+        ),
+        _ => state_text,
+    }
 }
 
 /// The tail of an "update available" state: who waits for it and when it is used.
@@ -868,6 +923,7 @@ fn export_row(
         size_note: None,
         log: Vec::new(),
         update_available: None,
+        pending_bytes: None,
     };
     if r.kind == ResourceKind::Tool {
         let dl = status_of(statuses, r.id).filter(|s| !s.state.is_final());
@@ -1032,7 +1088,71 @@ mod tests {
             size_note: None,
             log: Vec::new(),
             update_available: None,
+            pending_bytes: None,
         }
+    }
+
+    /// RA resources-11: a staged update is reported with its size: beside an install as an
+    /// earlier download (Remove deletes both), alone as waiting for an install that is gone; the
+    /// catalog's version already named by the installed text adds nothing.
+    #[test]
+    fn a_pending_update_is_reported_with_its_size() {
+        let p = (PathBuf::from("rt/.cpu.pending"), 3_000_000);
+        let alone = with_pending("available".into(), Some(&p), false, false);
+        assert!(
+            alone.starts_with("available; a downloaded update (3"),
+            "{alone}"
+        );
+        assert!(
+            alone.contains("install that is gone; Remove deletes it"),
+            "{alone}"
+        );
+        let beside = with_pending("installed".into(), Some(&p), true, false);
+        assert!(beside.contains("earlier downloaded update"), "{beside}");
+        assert!(beside.contains(".cpu.pending"), "{beside}");
+        assert_eq!(
+            with_pending("installed x".into(), Some(&p), true, true),
+            "installed x"
+        );
+        assert_eq!(
+            with_pending("available".into(), None, false, false),
+            "available"
+        );
+    }
+
+    /// `pending_update`: only a runtime's `.pending` whose manifest names it, with its size.
+    #[test]
+    fn pending_update_is_ours_only() {
+        let root = std::env::temp_dir().join(format!("bop-status-pend-{}", uuid::Uuid::new_v4()));
+        let c = Config {
+            download_dir: Some(root.clone()),
+            ..Default::default()
+        };
+        let res = catalog::all()
+            .find(|r| r.kind == ResourceKind::OpenVinoRuntime)
+            .unwrap();
+        let pending = manager::pending_dir(&target_dir(&c, res)).unwrap();
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("lib.bin"), vec![0u8; 5000]).unwrap();
+        assert_eq!(pending_update(res, &c), None, "no manifest: not ours");
+        let m = manager::Manifest {
+            id: res.id.into(),
+            version: "9".into(),
+            sha256: Vec::new(),
+            files: vec!["lib.bin".into()],
+        };
+        std::fs::write(
+            pending.join(manager::MANIFEST_FILE),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        let (p, bytes) = pending_update(res, &c).unwrap();
+        assert_eq!(p, pending);
+        assert!(bytes >= 5000, "{bytes}");
+        assert!(ours(res, &c), "a pending of ours makes it ours to remove");
+        let model = catalog::model("dfine-m").unwrap();
+        assert_eq!(pending_update(model, &c), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The "update available" tail: an update blocks nobody and says when it is used.

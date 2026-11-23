@@ -5,7 +5,9 @@
 //! review's volume allows hard links and has room ([`need`], the import's free-space margin kept),
 //! the fold folders go to `<parent of the folder under review>/.blue-onyx-prism-work/refine/<id>`
 //! instead ([`crate::storage::sweep::near_dataset_base`]: never inside the dataset or review
-//! folder), where the export hard-links the frames; anything else keeps today's place.
+//! folder), where the export hard-links the frames; anything else keeps today's place. The links
+//! are probed in that base folder itself (made for the probe, removed again when empty and unused),
+//! where the storage sweep clears a probe a crash left.
 //!
 //! That folder is held busy like the work folder ([`crate::storage::Busy`]) and named in the work
 //! folder before it is made ([`crate::storage::sweep::ELSEWHERE_FILE`]), so a sweep after a crash
@@ -86,13 +88,20 @@ impl FoldRoot {
         let Some(base) = near_dataset_base(review_dir, dataset_dirs) else {
             return Self::in_work(work);
         };
+        let work_on_dataset_volume = disk::same_volume(work, review_dir);
+        let near_on_dataset_volume = disk::same_volume(&base, review_dir);
+        // Probed only where it can matter: the probe makes the near base.
+        let links = !work_on_dataset_volume
+            && near_on_dataset_volume
+            && sample.is_some_and(|f| links_into(f, &base));
         let facts = Facts {
-            work_on_dataset_volume: disk::same_volume(work, review_dir),
-            near_on_dataset_volume: disk::same_volume(&base, review_dir),
-            links: sample.is_some_and(|f| preflight::hard_links_work(f, &base)),
+            work_on_dataset_volume,
+            near_on_dataset_volume,
+            links,
             space: disk::space(&base),
         };
         if !near(&facts, need) {
+            remove_empty(&base);
             return Self::in_work(work);
         }
         let dir = base.join("refine").join(id);
@@ -137,6 +146,19 @@ impl FoldRoot {
     }
 }
 
+/// Whether `frame` can be hard-linked into the near base `base`: probed in `base` itself (made
+/// for it), where the storage sweep clears probes a crash left
+/// ([`crate::storage::sweep::LINK_PROBE_PREFIX`]); a base that cannot be made takes no fold.
+fn links_into(frame: &Path, base: &Path) -> bool {
+    match std::fs::create_dir_all(base) {
+        Ok(()) => preflight::hard_links_work(frame, base, base),
+        Err(e) => {
+            tracing::debug!("dataset check: cannot create {} ({e})", base.display());
+            false
+        }
+    }
+}
+
 /// Remove `base/refine` and `base` when empty.
 fn remove_empty(base: &Path) {
     let _ = std::fs::remove_dir(base.join("refine"));
@@ -148,19 +170,9 @@ impl Drop for FoldRoot {
         let Some((busy, base)) = self.near.take() else {
             return;
         };
-        match crate::resources::manager::remove_any(&self.dir) {
-            Ok(()) => {
-                drop(busy);
-                remove_empty(&base);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "dataset check: could not remove its fold folder {} ({e:#}); the next storage \
-                     sweep removes it",
-                    self.dir.display()
-                );
-                busy.abandon();
-            }
+        // A removal that fails keeps the marker, unlocked: the next sweep removes the folder.
+        if busy.finish_removing() {
+            remove_empty(&base);
         }
     }
 }
@@ -219,13 +231,28 @@ mod tests {
         let review = d.join("dataset");
         std::fs::create_dir_all(&review).unwrap();
         // Same volume (a temp folder): today's place.
-        let r = FoldRoot::choose(&work, "r1", &review, std::slice::from_ref(&review), None, 0);
+        std::fs::write(review.join("a.jpg"), b"x").unwrap();
+        let sample = review.join("a.jpg");
+        let r = FoldRoot::choose(
+            &work,
+            "r1",
+            &review,
+            std::slice::from_ref(&review),
+            Some(&sample),
+            0,
+        );
         assert!(!r.is_near());
         assert_eq!(r.dir, work);
         drop(r);
         // The near place itself, as `choose` makes it on another volume.
         let base = near_dataset_base(&review, std::slice::from_ref(&review)).unwrap();
         assert_eq!(base, d.join(crate::storage::sweep::NEAR_DATASET_DIR));
+        assert!(!base.exists(), "no probe where it cannot matter");
+        // The link probe goes in the base (where the sweep clears probes) and leaves it empty.
+        assert!(links_into(&sample, &base));
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0);
+        remove_empty(&base);
+        assert!(!base.exists());
         let dir = base.join("refine/r1");
         let root = FoldRoot {
             dir: dir.clone(),

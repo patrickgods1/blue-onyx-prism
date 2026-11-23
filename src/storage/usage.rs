@@ -1,11 +1,15 @@
 //! The Storage card's numbers (Config page, Resources tab): what is safe to clear and what is
 //! the user's data, each with its size.
 //!
-//! - Safe to clear: each cache folder ([`super::caches`]), leftover staging folders, the work
-//!   folders of crashed jobs, old log files. Each has a Clear ([`super::sweep::clear`]).
-//! - Your data: the dataset and review folders, each review export (with Remove), training runs,
-//!   the checkpoints failed runs keep for a retry, models, and work folders kept on purpose. Sizes
-//!   only: nothing here is deleted automatically, and only exports have a Remove on this card.
+//! - Safe to clear: each cache folder ([`super::caches`]), leftover staging folders (training
+//!   runs' in the models folder and in every install folder a run record names, and the scratch
+//!   folders of review exports that crashed), the work folders of crashed jobs, old log files.
+//!   Each has a Clear ([`super::sweep::clear`]).
+//! - Your data: the dataset and review folders, each review export (with Remove), unfinished
+//!   review exports no sweep removes (no busy marker: an older version's, or a finished export
+//!   whose final move failed), training runs, the checkpoints failed runs keep for a retry, models,
+//!   and work folders kept on purpose. Sizes only: nothing here is deleted automatically, and only
+//!   exports have a Remove on this card.
 //!
 //! Sizes are bytes deleting a thing frees ([`crate::training::retry::disk_use`]: an export's frames
 //! are hard links to the dataset's, so they count where they are not shared). Measuring walks
@@ -160,6 +164,107 @@ pub fn exports(training_dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// The "Leftover staging" row (Clear `staging`): training runs' staging folders and the scratch
+/// folders of review exports that crashed. None when there is neither.
+fn staging_item(
+    staging: &[PathBuf],
+    crashed_exports: &[sweep::ExportScratch],
+    models: &Path,
+    training: &Path,
+) -> Option<Item> {
+    if staging.is_empty() && crashed_exports.is_empty() {
+        return None;
+    }
+    let bytes: u64 = staging
+        .iter()
+        .map(|p| size_of(p))
+        .chain(crashed_exports.iter().map(|x| size_of(&x.path)))
+        .sum();
+    let mut notes = Vec::new();
+    if !staging.is_empty() {
+        let elsewhere: Vec<String> = staging
+            .iter()
+            .filter(|p| p.parent() != Some(models))
+            .map(|p| p.display().to_string())
+            .collect();
+        let mut n = format!(
+            "{} folder(s) of training runs that stopped before installing their model",
+            staging.len()
+        );
+        if !elsewhere.is_empty() {
+            n.push_str(&format!(
+                " (outside the models folder: {})",
+                elsewhere.join(", ")
+            ));
+        }
+        notes.push(n);
+    }
+    if !crashed_exports.is_empty() {
+        notes.push(format!(
+            "{} unfinished review export(s) a crash or stop cut off: {}",
+            crashed_exports.len(),
+            crashed_exports
+                .iter()
+                .take(5)
+                .map(|x| x.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let (title, path) = if crashed_exports.is_empty() {
+        ("Leftover training staging", models)
+    } else if staging.is_empty() {
+        ("Unfinished review exports", training)
+    } else {
+        ("Leftover staging (training runs, review exports)", training)
+    };
+    Some(
+        Item::new("staging", title, path, bytes)
+            .note(notes.join("; "))
+            .action("clear"),
+    )
+}
+
+/// The report-only row of review exports' scratch folders no sweep removes (no busy marker: an
+/// older version's, or a complete export whose final move failed), except those inside a folder
+/// `listed` as an export (counted in its row). None when there are none.
+fn unfinished_item(
+    unfinished: &[sweep::ExportScratch],
+    listed: &[PathBuf],
+    training: &Path,
+) -> Option<Item> {
+    let shown: Vec<&PathBuf> = unfinished
+        .iter()
+        .map(|x| &x.path)
+        .filter(|p| !listed.iter().any(|e| p.parent() == Some(e.as_path())))
+        .collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let bytes: u64 = shown.iter().map(|p| size_of(p)).sum();
+    Some(
+        Item::new(
+            "unfinished-exports",
+            "Unfinished review exports (kept)",
+            training,
+            bytes,
+        )
+        .note(format!(
+            "{} hidden folder(s) of exports that never got into place: left by an older version, \
+             or complete but not moved (the export said where); never deleted automatically. Move \
+             one into place or delete it by hand: their frames are hard links to the dataset's, so \
+             they keep the bytes of frames the dataset has since deleted. {}",
+            shown.len(),
+            shown
+                .iter()
+                .take(5)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    )
+}
+
 /// Measure the card for `s`, with the training runs `runs` (their folders are skipped while
 /// busy).
 pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
@@ -193,24 +298,20 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
         }
     }
     let models = s.models_dir();
-    let staging = sweep::leftover_staging(&models);
-    let staging_bytes: u64 = staging.iter().map(|p| size_of(p)).sum();
-    if !staging.is_empty() {
-        safe.push(
-            Item::new(
-                "staging",
-                "Leftover training staging",
-                &models,
-                staging_bytes,
-            )
-            .note(format!(
-                "{} folder(s) of training runs that stopped before installing their model",
-                staging.len()
-            ))
-            .action("clear"),
-        );
-    }
     let training = s.training_dir();
+    let staging = sweep::leftover_staging_all(s);
+    // Only what lies in the models folder is inside the Models row below.
+    let staging_bytes: u64 = staging
+        .iter()
+        .filter(|p| p.parent() == Some(models.as_path()))
+        .map(|p| size_of(p))
+        .sum();
+    let (crashed_exports, unfinished_exports): (Vec<_>, Vec<_>) = sweep::export_scratch(s)
+        .into_iter()
+        .partition(|x| x.crashed);
+    if let Some(item) = staging_item(&staging, &crashed_exports, &models, &training) {
+        safe.push(item);
+    }
     let crashed = sweep::crashed_all(s);
     if !crashed.is_empty() {
         let bytes: u64 = crashed.iter().map(|w| size_of(&w.dir)).sum();
@@ -260,7 +361,11 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
             crate::training::retry::disk_use(dir),
         ));
     }
-    for e in exports(&training) {
+    let listed = exports(&training);
+    if let Some(item) = unfinished_item(&unfinished_exports, &listed, &training) {
+        data.push(item);
+    }
+    for e in listed {
         let name = e
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -575,6 +680,53 @@ mod tests {
                 .iter()
                 .all(|i| i.action.is_none() || i.id.starts_with("export:"))
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2: a crashed review export's scratch folder is safe to clear (in the
+    /// staging row); one without a marker is the user's to look at, listed with its size.
+    #[test]
+    fn export_scratch_rows_split_crashed_from_kept() {
+        let root = std::env::temp_dir().join(format!("bop-usage-scratch-{}", uuid::Uuid::new_v4()));
+        let put = |p: &Path, n: usize| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; n]).unwrap();
+        };
+        let mut c = crate::config::Config {
+            download_dir: Some(root.clone()),
+            cache_dir: String::new(),
+            ..Default::default()
+        };
+        c.models.clear();
+        let s = Settings::for_config(&c);
+        let ex = s.training_dir().join("exports");
+        let id = |i: u128| format!("{i:032x}");
+        let crashed = ex.join(format!(".a.building-{}", id(1)));
+        let kept = ex.join(format!(".b.building-{}", id(2)));
+        put(&crashed.join("export/images/a.jpg"), 40);
+        std::fs::write(super::super::busy::marker_of(&crashed), b"1").unwrap();
+        put(&kept.join("export/images/a.jpg"), 25);
+        put(&ex.join("e1/classes.txt"), 10);
+        let r = measure(&s, &[]);
+        let staging = r.safe.iter().find(|i| i.id == "staging").unwrap();
+        assert_eq!(
+            (staging.bytes, staging.title.as_str()),
+            (40, "Unfinished review exports")
+        );
+        assert!(
+            staging.note.contains(&*crashed.to_string_lossy()),
+            "{}",
+            staging.note
+        );
+        let unfinished = r
+            .data
+            .iter()
+            .find(|i| i.id == "unfinished-exports")
+            .unwrap();
+        assert_eq!(unfinished.bytes, 25);
+        assert_eq!(unfinished.action, None, "never removed from the card");
+        assert!(unfinished.note.contains(&*kept.to_string_lossy()));
+        assert_eq!(r.data_bytes, r.data.iter().map(|i| i.bytes).sum::<u64>());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

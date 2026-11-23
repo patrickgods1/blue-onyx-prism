@@ -69,7 +69,9 @@
 //! label files read and two files written; once it says yes the export ends with [`Stopped`]
 //! (before the held-out list is touched when it comes during the walk) and its staging folder is
 //! removed. [`Staging`] also removes itself when dropped unpublished, so a panic leaves no
-//! `.building-<id>` folder either.
+//! `.building-<id>` folder either; one a kill or a crash leaves is held busy, so the next storage
+//! sweep removes it ([`crate::storage::sweep`]; [`run_filtered_recorded`] also records it, for a
+//! folder of the user's choice).
 
 use super::super::layout::{self, Rel, Walker};
 use super::super::record::{Bucket, Record};
@@ -1208,6 +1210,13 @@ const PUBLISHED_LAST: [&str; 3] = ["classes.txt", "data.yaml", "export.json"];
 /// be a mount point, or sit in a parent this service cannot write, and a user's folder keeps its
 /// owner and permissions: it is built in a hidden folder inside the target and moved up file by
 /// file, the files that make a folder look like an export last.
+///
+/// The scratch folder is held busy ([`crate::storage::Busy`], its marker beside it) from before it
+/// is made until it is dealt with, so a storage sweep after a crash or a kill removes it
+/// ([`crate::storage::sweep`]: under `<training dir>/exports` by its name, elsewhere through the
+/// record [`crate::storage::sweep::write_export_record`] writes when the caller names a pending
+/// folder). Removed, or kept on purpose by a failed publish: the marker goes (a kept export then
+/// reads as ended, never swept). A removal that fails keeps the marker, unlocked, for the sweep.
 #[derive(Debug)]
 struct Staging {
     target: PathBuf,
@@ -1219,10 +1228,23 @@ struct Staging {
     inside: bool,
     /// Published, kept on purpose by a failed publish, or discarded: the drop leaves it alone.
     settled: std::cell::Cell<bool>,
+    /// The hold on `scratch` until it is dealt with ([`Self::release`]).
+    busy: std::cell::RefCell<Option<crate::storage::Busy>>,
+    /// The record naming `scratch` in the pending folder, when one was written.
+    record: Option<PathBuf>,
 }
 
 impl Staging {
+    /// The staging of `target`, unrecorded (a caller whose scratch folders a sweep finds by
+    /// their place: under `<training dir>/exports`, or inside a job's work folder).
+    #[cfg(test)]
     fn new(target: &Path) -> Result<Self> {
+        Self::recorded(target, None)
+    }
+
+    /// The staging of `target`; with `pending`, a record of its scratch folder is written there
+    /// first ([`crate::storage::sweep::EXPORTS_PENDING_DIR`]).
+    fn recorded(target: &Path, pending: Option<&Path>) -> Result<Self> {
         let id = uuid::Uuid::new_v4().simple();
         let inside = target.is_dir();
         let scratch = if inside {
@@ -1243,25 +1265,81 @@ impl Staging {
         } else {
             scratch.join("export")
         };
-        std::fs::create_dir_all(&build).with_context(|| format!("creating {}", build.display()))?;
-        Ok(Self {
+        // Recorded, then held, then made: a crash at any point leaves nothing a sweep cannot
+        // tell from a running export.
+        let record = pending.and_then(|dir| {
+            crate::storage::sweep::write_export_record(dir, &scratch)
+                .map_err(|e| {
+                    tracing::warn!(
+                        "export: could not note {} in {} ({e}); if the service stops during this \
+                         export, delete that folder by hand",
+                        scratch.display(),
+                        dir.display()
+                    );
+                })
+                .ok()
+        });
+        let staging = Self {
             target: target.to_path_buf(),
+            busy: std::cell::RefCell::new(Some(crate::storage::Busy::hold(&scratch))),
             build,
             scratch,
             inside,
             settled: std::cell::Cell::new(false),
-        })
+            record,
+        };
+        if let Err(e) = std::fs::create_dir_all(&staging.build) {
+            staging.discard();
+            return Err(e).with_context(|| format!("creating {}", staging.build.display()));
+        }
+        Ok(staging)
+    }
+
+    /// The scratch folder is dealt with: `gone` (removed, or kept on purpose by a failed
+    /// publish) lets its marker and record go; otherwise the marker stays, unlocked, so the next
+    /// storage sweep sees a crashed export and removes the folder.
+    fn release(&self, gone: bool) {
+        let Some(busy) = self.busy.borrow_mut().take() else {
+            return;
+        };
+        if !gone {
+            busy.abandon();
+            return;
+        }
+        // A hold dropped while a panic unwinds keeps its marker (the job did not end in order),
+        // but this scratch folder is gone: nothing is left for a sweep. Deleted while still
+        // locked, as the hold's own drop does.
+        if std::thread::panicking()
+            && let Err(e) = std::fs::remove_file(busy.marker())
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("export: removing {}: {e}", busy.marker().display());
+        }
+        drop(busy);
+        if let Some(r) = &self.record
+            && let Err(e) = std::fs::remove_file(r)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!("export: removing the record {}: {e}", r.display());
+        }
     }
 
     /// Give up: nothing of the export stays (the dataset is its source).
     fn discard(&self) {
         self.settled.set(true);
-        if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
-            tracing::warn!(
-                "export: could not remove the unfinished {}: {e}; delete it by hand",
-                self.scratch.display()
-            );
-        }
+        let gone = match std::fs::remove_dir_all(&self.scratch) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                tracing::warn!(
+                    "export: could not remove the unfinished {}: {e}; the next storage sweep \
+                     removes it",
+                    self.scratch.display()
+                );
+                false
+            }
+        };
+        self.release(gone);
     }
 
     fn move_up(&self) -> std::io::Result<()> {
@@ -1291,6 +1369,10 @@ impl Staging {
         } else {
             rename_patiently(&self.build, &self.target)
         };
+        if moved.is_err() {
+            // Kept on purpose: its marker goes, so no sweep ever takes it.
+            self.release(true);
+        }
         moved.with_context(|| {
             format!(
                 "the export is complete in {} but could not be moved to {} (the folder is in use, \
@@ -1300,12 +1382,17 @@ impl Staging {
                 self.target.display()
             )
         })?;
-        if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
-            tracing::warn!(
-                "export: could not remove the empty {}: {e}; delete it by hand",
-                self.scratch.display()
-            );
-        }
+        let gone = match std::fs::remove_dir_all(&self.scratch) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "export: could not remove the empty {}: {e}; the next storage sweep removes it",
+                    self.scratch.display()
+                );
+                false
+            }
+        };
+        self.release(gone);
         Ok(())
     }
 }
@@ -1380,6 +1467,22 @@ pub fn run_filtered_until(
     progress: ProgressFn<'_>,
     stop: StopFn<'_>,
 ) -> Result<ExportReport> {
+    run_filtered_recorded(dir, classes, req, filter, (progress, stop), None)
+}
+
+/// [`run_filtered_until`] (`hooks` = its progress and stop), first writing a record of the
+/// export's scratch folder into `pending` when given
+/// ([`crate::storage::sweep::EXPORTS_PENDING_DIR`] of the training folder): an export into a
+/// folder of the user's choice, which a sweep after a crash finds only through it.
+pub fn run_filtered_recorded(
+    dir: &Path,
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+    hooks: (ProgressFn<'_>, StopFn<'_>),
+    pending: Option<&Path>,
+) -> Result<ExportReport> {
+    let (progress, stop) = hooks;
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
@@ -1392,7 +1495,16 @@ pub fn run_filtered_until(
         Some(policy) => Some(frozen_split(dir, &mut selected, &req.split, policy)?),
         None => None,
     };
-    run_selected_with(dir, classes, req, filter, selected, held, progress, stop)
+    run_selected_with(
+        dir,
+        classes,
+        req,
+        filter,
+        selected,
+        held,
+        (progress, stop),
+        pending,
+    )
 }
 
 /// The split of `selected` by [`heldout::apply`] (the listed days held out, the list grown by an
@@ -1441,16 +1553,25 @@ pub fn run_selected(
     filter: &ClassFilter,
     selected: Selection,
 ) -> Result<ExportReport> {
-    run_selected_with(dir, classes, req, filter, selected, None, &|_| {}, &|| {
-        false
-    })
+    run_selected_with(
+        dir,
+        classes,
+        req,
+        filter,
+        selected,
+        None,
+        (&|_| {}, &|| false),
+        None,
+    )
 }
 
-/// [`run_selected`], telling `progress` where it is and asking `stop` between two files;
-/// `heldout` is what [`frozen_split`] did.
+/// [`run_selected`], telling `progress` where it is and asking `stop` between two files
+/// (`hooks`); `heldout` is what [`frozen_split`] did; `pending` is where the scratch folder is
+/// recorded ([`Staging::recorded`]).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the export's inputs, what the split did, and the caller's progress and stop"
+    reason = "the export's inputs, what the split did, the caller's progress and stop, and where \
+              its scratch folder is recorded"
 )]
 fn run_selected_with(
     dir: &Path,
@@ -1459,9 +1580,10 @@ fn run_selected_with(
     filter: &ClassFilter,
     selected: Selection,
     heldout: Option<HeldoutReport>,
-    progress: ProgressFn<'_>,
-    stop: StopFn<'_>,
+    hooks: (ProgressFn<'_>, StopFn<'_>),
+    pending: Option<&Path>,
 ) -> Result<ExportReport> {
+    let (progress, stop) = hooks;
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
@@ -1504,7 +1626,7 @@ fn run_selected_with(
         return Err(Stopped.into());
     }
     let target = prepare_out(dir, &req.out_dir, std::time::SystemTime::now())?;
-    let staging = Staging::new(&target)?;
+    let staging = Staging::recorded(&target, pending)?;
     let report = build_export(
         selected,
         &unreviewed,
@@ -3325,6 +3447,145 @@ mod tests {
         s.publish().unwrap_err();
         assert!(root.join("ignore.json").is_file(), "first");
         assert!(!root.join("export.json").exists(), "last");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2 (RA-055, RA-060): the scratch folder is held busy (marker beside it)
+    /// and recorded while the export runs; a publish, a discard and a panic each leave neither
+    /// marker nor record; a failed publish keeps the complete export with no marker (ended, never
+    /// swept); a scratch folder that cannot be removed keeps its marker, unlocked, for the sweep.
+    #[test]
+    fn the_scratch_folder_is_held_while_building_and_released_when_dealt_with() {
+        use crate::storage::busy::{self, State};
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let pending = root
+            .join("training")
+            .join(crate::storage::sweep::EXPORTS_PENDING_DIR);
+        let records = || names_in_or_none(&pending);
+        // A new target: published.
+        let s = Staging::recorded(&root.join("exports/new"), Some(&pending)).unwrap();
+        assert!(busy::marker_of(&s.scratch).is_file());
+        assert!(
+            matches!(busy::probe(&s.scratch), State::Live),
+            "held while building"
+        );
+        assert_eq!(records().len(), 1);
+        let rec = pending.join(&records()[0]);
+        assert_eq!(
+            std::fs::read_to_string(&rec).unwrap(),
+            std::path::absolute(&s.scratch)
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        write_file(&s.build.join("classes.txt"), b"person\n").unwrap();
+        s.publish().unwrap();
+        assert!(!busy::marker_of(&s.scratch).exists() && !s.scratch.exists());
+        assert_eq!(records(), Vec::<String>::new());
+        assert_eq!(names_in(&root.join("exports")), ["new"]);
+        // An existing folder: discarded.
+        let chosen = root.join("chosen");
+        std::fs::create_dir_all(&chosen).unwrap();
+        let s = Staging::recorded(&chosen, Some(&pending)).unwrap();
+        assert!(busy::marker_of(&s.scratch).starts_with(&chosen));
+        s.discard();
+        assert_eq!(names_in(&chosen), Vec::<String>::new());
+        assert_eq!(records(), Vec::<String>::new());
+        // A panic while building: dropped unsettled while unwinding.
+        let target = root.join("exports/panicked");
+        let r = std::panic::catch_unwind(|| {
+            let s = Staging::recorded(&target, Some(&pending)).unwrap();
+            write_file(&s.build.join("a.txt"), b"x").unwrap();
+            panic!("a bug while building");
+        });
+        assert!(r.is_err());
+        assert_eq!(names_in(&root.join("exports")), ["new"]);
+        assert_eq!(records(), Vec::<String>::new());
+        // A failed publish keeps the export, which then reads as ended (never swept).
+        let target = root.join("exports/taken");
+        let s = Staging::recorded(&target, Some(&pending)).unwrap();
+        write_file(&s.build.join("classes.txt"), b"person\n").unwrap();
+        write_file(&target.join("x.txt"), b"x").unwrap();
+        s.publish().unwrap_err();
+        assert!(s.build.join("classes.txt").is_file());
+        assert!(!busy::marker_of(&s.scratch).exists());
+        assert!(matches!(busy::probe(&s.scratch), State::Ended));
+        assert_eq!(records(), Vec::<String>::new());
+        drop(s);
+        assert!(target.parent().unwrap().is_dir());
+        // A scratch folder that cannot be removed: its marker stays, unlocked (a crash to the sweep).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let s = Staging::recorded(&root.join("exports/stuck"), Some(&pending)).unwrap();
+            let sub = s.build.join("images");
+            write_file(&sub.join("a.jpg"), b"x").unwrap();
+            std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if std::fs::write(sub.join("probe"), b"x").is_err() {
+                s.discard();
+                assert!(s.scratch.is_dir());
+                let State::Crashed(claim) = busy::probe(&s.scratch) else {
+                    panic!("a scratch folder its export could not remove reads as crashed")
+                };
+                drop(claim);
+                assert_eq!(records().len(), 1, "the record stays for the sweep");
+            } else {
+                eprintln!("skipped: permissions are not enforced for this user");
+                s.discard();
+            }
+            let _ = std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The names in `dir`, none when it does not exist.
+    fn names_in_or_none(dir: &Path) -> Vec<String> {
+        if dir.exists() {
+            names_in(dir)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// An export cut off by a crash: what the next storage sweep finds of it and removes,
+    /// beside a new target under exports/ and inside a folder of the user's choice.
+    #[test]
+    fn a_crashed_exports_scratch_is_what_the_storage_sweep_removes() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let mut c = crate::config::Config {
+            download_dir: Some(root.clone()),
+            cache_dir: String::new(),
+            ..Default::default()
+        };
+        c.models.clear();
+        let settings = crate::storage::sweep::Settings::for_config(&c);
+        let training = settings.training_dir();
+        let pending = training.join(crate::storage::sweep::EXPORTS_PENDING_DIR);
+        let chosen = root.join("chosen");
+        std::fs::create_dir_all(&chosen).unwrap();
+        let mut scratch = Vec::new();
+        for target in [training.join("exports/20261123-1200"), chosen.clone()] {
+            let s = Staging::recorded(&target, Some(&pending)).unwrap();
+            write_file(&s.build.join("images/a.jpg"), b"x").unwrap();
+            // A crash: the process is gone, so its lock is, while marker and folder stay.
+            let busy = s.busy.borrow_mut().take().unwrap();
+            busy.abandon();
+            s.settled.set(true);
+            scratch.push(s.scratch.clone());
+        }
+        let mut out = Vec::new();
+        crate::storage::sweep::sweep_export_scratch(
+            &settings,
+            std::time::SystemTime::now(),
+            &mut out,
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        for p in &scratch {
+            assert!(!p.exists(), "{}", p.display());
+            assert!(!crate::storage::busy::marker_of(p).exists());
+        }
+        assert_eq!(names_in(&chosen), Vec::<String>::new());
+        assert_eq!(names_in_or_none(&pending), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

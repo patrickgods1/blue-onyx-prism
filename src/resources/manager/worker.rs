@@ -1,6 +1,7 @@
 //! The download worker: `worker_loop` (queue, backoff, bounded retries, panic containment), the
-//! HTTPS-only client, `run_job` (download, verify, extract, swap into place), stale-file cleanup
-//! and the SHA-256 helpers. Nothing downloaded is executed here.
+//! HTTPS-only client, `run_job` (download, verify, extract, swap into place) and the SHA-256
+//! helpers (the cleanup of what interrupted installs leave is `super::leftovers`). Nothing
+//! downloaded is executed here.
 
 use super::*;
 
@@ -12,6 +13,15 @@ pub(super) fn unix_now() -> u64 {
 
 pub(super) fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
     let _exit = WorkerExit(shared);
+    // What interrupted installs left, before the first job (on this thread: a caller that starts
+    // the manager under a lock does not wait for it). Skipped while another process downloads.
+    super::leftovers::clean(
+        &shared.opts.root,
+        &[],
+        SystemTime::now(),
+        &mut Vec::new(),
+        &|| shared.stop.load(Ordering::Relaxed),
+    );
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -297,9 +307,13 @@ fn run_job(
     let res = job.resource;
     let local = job.local_archives.is_some();
     // Installed, or downloaded already and waiting for the next start (`in_use::place`).
+    // A staged update counts only beside the install it replaces: with that install gone (deleted
+    // by hand), nothing would ever swap it in (RA resources-11).
     let done = || {
         is_installed(res, &job.target)
-            || super::in_use::staged_version(res.id, &job.target).as_deref() == Some(job.version())
+            || (read_manifest(&job.target.join(MANIFEST_FILE)).is_some_and(|m| m.id == res.id)
+                && super::in_use::staged_version(res.id, &job.target).as_deref()
+                    == Some(job.version()))
     };
     if !local && done() {
         return Ok(());
@@ -466,9 +480,18 @@ fn run_job(
         return Err(e);
     }
     super::in_use::place(res, &staging, &job.target)?;
-    if !local && !job.keep_downloads {
+    if !local {
         for a in &archives {
-            let _ = std::fs::remove_file(a);
+            let keep = super::leftovers::keep_marker(a);
+            if job.keep_downloads {
+                // Kept on purpose: the cleanup leaves an archive with this marker alone.
+                if let Err(e) = std::fs::write(&keep, b"") {
+                    tracing::debug!("{}: {e}", keep.display());
+                }
+            } else {
+                let _ = std::fs::remove_file(a);
+                let _ = std::fs::remove_file(keep);
+            }
         }
     }
     if job.activate_ort
@@ -488,69 +511,6 @@ fn archive_kind_of(p: &Path) -> Option<ArchiveKind> {
         Some(ArchiveKind::TarGz)
     } else {
         None
-    }
-}
-
-/// `.partial` files not touched for this long are leftovers of a download nobody resumed.
-pub(crate) const STALE_PARTIAL_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Staging / swap-aside directories (`.<name>.staging`, `.<name>.old-<pid>`) not touched for
-/// this long belong to an interrupted install (a live one is rewritten continuously and the
-/// download lock keeps a second process out).
-pub(crate) const STALE_STAGING_AGE: Duration = Duration::from_secs(60 * 60);
-/// How deep below the download root [`cleanup_stale`] looks.
-const CLEANUP_MAX_DEPTH: usize = 4;
-
-/// Startup cleanup under `root`: delete `*.partial` files older than [`STALE_PARTIAL_AGE`] and
-/// stale staging directories ([`STALE_STAGING_AGE`]) left by an interrupted install. Only plain
-/// files and directories are removed (symlinks are skipped); failures are ignored. Logs what
-/// was removed at info. Returns the number of entries removed.
-pub(crate) fn cleanup_stale(root: &Path, now: SystemTime) -> usize {
-    let mut removed = 0;
-    cleanup_dir(root, now, 0, &mut removed);
-    if removed > 0 {
-        tracing::info!(
-            "download cleanup: removed {removed} stale partial file(s) / staging dir(s) under {}",
-            root.display()
-        );
-    }
-    removed
-}
-
-fn is_staging_name(name: &str) -> bool {
-    name.starts_with('.') && (name.contains(".staging") || name.contains(".old-"))
-}
-
-fn older_than(meta: &std::fs::Metadata, now: SystemTime, age: Duration) -> bool {
-    meta.modified()
-        .ok()
-        .and_then(|m| now.duration_since(m).ok())
-        .is_some_and(|d| d >= age)
-}
-
-fn cleanup_dir(dir: &Path, now: SystemTime, depth: usize, removed: &mut usize) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for ent in rd.flatten() {
-        let Ok(ft) = ent.file_type() else { continue };
-        let path = ent.path();
-        let name = ent.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = ent.metadata() else { continue };
-        if ft.is_file() && name.ends_with(".partial") {
-            if older_than(&meta, now, STALE_PARTIAL_AGE) && std::fs::remove_file(&path).is_ok() {
-                tracing::info!("removed stale partial download {}", path.display());
-                *removed += 1;
-            }
-        } else if ft.is_dir() {
-            if is_staging_name(&name) {
-                if older_than(&meta, now, STALE_STAGING_AGE) && remove_any(&path).is_ok() {
-                    tracing::info!("removed stale staging directory {}", path.display());
-                    *removed += 1;
-                }
-            } else if depth < CLEANUP_MAX_DEPTH {
-                cleanup_dir(&path, now, depth + 1, removed);
-            }
-        }
     }
 }
 
@@ -904,47 +864,6 @@ mod tests {
     use crate::resources::catalog::{Part, Platform, Provides};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
-
-    #[cfg(unix)]
-    fn age_file(p: &Path, by: Duration) {
-        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
-        f.set_modified(SystemTime::now() - by).unwrap();
-    }
-
-    /// Unix only: setting a directory's mtime needs `File::open` on a directory.
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_removes_stale_partials_and_staging_only() {
-        let root = tmp("cleanup");
-        let dl = root.join(".downloads");
-        let models = root.join("models");
-        std::fs::create_dir_all(&dl).unwrap();
-        std::fs::create_dir_all(models.join(".yolo.staging/inner")).unwrap();
-        std::fs::create_dir_all(models.join(".yolo.old-123")).unwrap();
-        std::fs::create_dir_all(models.join(".fresh.staging")).unwrap();
-        std::fs::write(models.join(".yolo.staging/inner/f"), b"x").unwrap();
-        let old = dl.join("a.zip.partial");
-        let fresh = dl.join("b.zip.partial");
-        let other = dl.join("c.zip");
-        for p in [&old, &fresh, &other] {
-            std::fs::write(p, b"x").unwrap();
-        }
-        age_file(&old, STALE_PARTIAL_AGE + Duration::from_secs(60));
-        age_file(&other, STALE_PARTIAL_AGE * 2);
-        for d in [".yolo.staging", ".yolo.old-123"] {
-            let f = std::fs::File::open(models.join(d)).unwrap();
-            f.set_modified(SystemTime::now() - STALE_STAGING_AGE * 2)
-                .unwrap();
-        }
-        assert_eq!(cleanup_stale(&root, SystemTime::now()), 3);
-        assert!(!old.exists());
-        assert!(fresh.exists() && other.exists());
-        assert!(!models.join(".yolo.staging").exists());
-        assert!(!models.join(".yolo.old-123").exists());
-        assert!(models.join(".fresh.staging").exists());
-        assert_eq!(cleanup_stale(&root, SystemTime::now()), 0);
-        std::fs::remove_dir_all(&root).ok();
-    }
 
     #[test]
     fn backoff_schedule() {
@@ -2044,6 +1963,43 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
         assert!(is_installed(res, &dir));
         m.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RA resources-11: an update staged beside an install that is gone (deleted by hand) is no
+    /// install: the download runs, installs, and the stale staged copy goes. `keep_downloads`
+    /// marks the archive it keeps.
+    #[test]
+    fn a_staged_update_without_its_install_is_downloaded_again() {
+        const LIBRARY: &[u8] = b"the runtime library";
+        let archive = runtime_archive(LIBRARY);
+        let server = serve(archive.clone(), false);
+        let res = runtime_resource(&server.url, &archive);
+        let root = tmp("pending-alone");
+        let dir = root.join(res.dest);
+        let pending = super::super::in_use::pending_dir(&dir).unwrap();
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("lib.bin"), b"x").unwrap();
+        let m = Manifest {
+            id: res.id.into(),
+            version: res.version.into(),
+            sha256: Vec::new(),
+            files: vec!["lib.bin".into()],
+        };
+        write_manifest(&pending.join(MANIFEST_FILE), &m, &pending).unwrap();
+        let mut job = Job::new(res, &root);
+        job.keep_downloads = true;
+        let st = install_all(ManagerOptions::new(&root), vec![job]).unwrap();
+        assert_eq!(st[0].state, State::Installed);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read(dir.join("libonnxruntime.so")).unwrap(),
+            LIBRARY
+        );
+        assert!(!pending.exists());
+        let kept = root.join(DOWNLOADS_DIR).join(res.parts[0].file_name);
+        assert!(kept.is_file());
+        assert!(super::super::leftovers::keep_marker(&kept).is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 

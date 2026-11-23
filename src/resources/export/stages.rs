@@ -353,9 +353,15 @@ fn run_stages(
     std::fs::create_dir_all(&p.models)
         .with_context(|| format!("creating {}", p.models.display()))?;
     let staging = p.staging(name);
+    // Held before the folder is touched (RA resources-2, -3): every early return, a cancel that
+    // lands after the exporter's successful exit included, removes it, and a crash leaves an
+    // unlocked marker by which the storage sweep tells it from a running export's
+    // (`super::leftovers`).
+    let _staging = crate::storage::Busy::hold(&staging).remove_target_on_drop();
     manager::remove_any(&staging)?;
     std::fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let work = p.work.join(name);
+    let _work = RemoveOnDrop(work.clone());
     manager::remove_any(&work)?;
     // Ultralytics and RT-DETRv2 take the weights file (`.pt` / `.pth`); the Hugging Face recipes
     // the directory with `model.safetensors` + `config.json`.
@@ -426,6 +432,17 @@ fn run_stages(
     let out = out?;
     enter!(Stage::Install, Some(100), "installed");
     Ok(out)
+}
+
+/// Removes a folder (the exporters' work files) when the export ends, however it ends.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Err(e) = manager::remove_any(&self.0) {
+            tracing::warn!("{e:#}; the next storage sweep removes it");
+        }
+    }
 }
 
 /// Stages 1-4 shared by the model export and training ([`crate::resources::export::train`]): `tool:uv`

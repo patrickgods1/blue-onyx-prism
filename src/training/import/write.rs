@@ -6,6 +6,12 @@
 //! index line, like the collector does; when the sidecar or the index line fails (a full disk),
 //! the frame's files are removed again, so a frame is either complete or absent. A write that
 //! stops part way ([`write_frames_with`]) answers the frames written so far.
+//!
+//! The dataset folder is shared with the collector thread, whose retention rewrites day indexes and
+//! removes emptied folders: index lines go through [`layout::append_index`] (the dataset's
+//! cross-process index lock), and the image through [`layout::write_in_day`], which makes the day
+//! folder again when retention removed it, still empty, after this made it (why a retry rather than
+//! holding the lock across the frame's decode: its doc).
 
 use crate::clock::Zone;
 use crate::collect::layout::{self, Rel};
@@ -255,7 +261,6 @@ fn write_into(
             );
         }
         let day = dir.join(&rel.scene).join(&rel.camera).join(&rel.date);
-        std::fs::create_dir_all(&day).with_context(|| format!("creating {}", day.display()))?;
         let raw =
             std::fs::read(&f.file).with_context(|| format!("reading {}", f.file.display()))?;
         let (bytes, original) = if raw.starts_with(&[0xFF, 0xD8]) {
@@ -265,8 +270,11 @@ fn write_into(
                 .with_context(|| format!("decoding {}", f.file.display()))?;
             (crate::image::encode_jpeg(&img, 92)?, false)
         };
+        // Made after the decode, right before the image goes in: the folder is empty until then.
+        std::fs::create_dir_all(&day).with_context(|| format!("creating {}", day.display()))?;
         let jpg = rel.to_path(dir, "jpg");
-        layout::write_atomic(&jpg, &bytes).with_context(|| format!("writing {}", jpg.display()))?;
+        layout::write_in_day(&day, &jpg, &bytes)
+            .with_context(|| format!("writing {}", jpg.display()))?;
         let rec = record_of(f, &rel, import_id, bytes.len() as u64, original);
         let json = serde_json::to_vec_pretty(&rec)?;
         let side = rel.to_path(dir, "json");
@@ -275,10 +283,7 @@ fn write_into(
             return Err(e).with_context(|| format!("writing {}", side.display()));
         }
         let line = IndexLine::of(&rec, (bytes.len() + json.len()) as u64);
-        if let Err(e) = layout::append_line(
-            &day.join(layout::INDEX_FILE),
-            &serde_json::to_string(&line)?,
-        ) {
+        if let Err(e) = layout::append_index(&day, &line) {
             let _ = std::fs::remove_file(&side);
             let _ = std::fs::remove_file(&jpg);
             return Err(e)
@@ -390,6 +395,55 @@ mod tests {
         // The matching helper of the import job gives the stem's start.
         let la_zone: Zone = "America/Los_Angeles".parse().unwrap();
         assert!(la[0].contains(&stamp(la_zone, frame_time(base, Some(12.5)))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2 (Q:collect-1): the import lists its frames under the dataset's index
+    /// lock, which retention's index rewrite holds, so the line is appended only once a rewrite
+    /// in hand is done (and never lost to it).
+    #[test]
+    fn an_import_lists_its_frame_under_the_index_lock() {
+        let root = std::env::temp_dir().join(format!("bop-import-lock-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = root.join("f.jpg");
+        let bytes = jpeg(false);
+        std::fs::write(&src, &bytes).unwrap();
+        let img = crate::image::decode(&bytes).unwrap();
+        let f = Frame {
+            file: src.clone(),
+            image_name: "c.mp4".into(),
+            camera: "cam".into(),
+            time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_520_812_500),
+            width: img.width,
+            height: img.height,
+            stats: ImageStats::compute(&img),
+            dhash: 7,
+            provenance: Provenance::default(),
+        };
+        // Retention (another process, or the collector thread) holds the lock.
+        let held = std::fs::File::create(dir.join(layout::INDEX_LOCK_FILE)).unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+        let write = {
+            let dir = dir.clone();
+            std::thread::spawn(move || utc(&dir, "20261022-120000-ab12", &[f]))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!write.is_finished(), "the append waits for the index lock");
+        let day = dir.join("day/cam/2018-03-11");
+        assert!(
+            std::fs::read_dir(&day)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(".jpg")),
+            "the image is in before the lock is asked for"
+        );
+        assert!(layout::read_index(&day.join(layout::INDEX_FILE)).is_empty());
+        fs4::FileExt::unlock(&held).unwrap();
+        let (rels, _) = write.join().unwrap().unwrap();
+        let index = layout::read_index(&day.join(layout::INDEX_FILE));
+        assert_eq!(index.len(), 1);
+        assert!(rels[0].ends_with(&format!("{}.jpg", index[0].id)));
         let _ = std::fs::remove_dir_all(&root);
     }
 

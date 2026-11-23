@@ -13,9 +13,13 @@
 //!   SYSTEM full control, the account creating it full control, the installed service's account
 //!   modify, nothing inherited, no Users. The MSI creates the folder with the same DACL first
 //!   (`ProtectAuthFolder` in `packaging/windows/main.wxs`), and `scripts/install_service.ps1`
-//!   for archive installs. A folder that exists is left as it is: the service (LocalService,
-//!   modify) could not rewrite the DACL of the folder the installer made, and resetting it on
-//!   every start would only log a failure each time. Its subfolders and files inherit it.
+//!   for archive installs. A folder that exists is protected again only when its DACL is not
+//!   protected ([`crate::backend::acl::dacl_protected`], checked once per folder and process):
+//!   a start that crashed or failed between creating it and restricting it left it with the data
+//!   root's permissions, so the next start repairs it and warns that the secrets written while
+//!   it was open (the HTTPS key, the admin token) should be replaced. A protected folder (the
+//!   installer's) is left as it is: the service (LocalService, modify) could not rewrite its
+//!   DACL. Its subfolders and files inherit it.
 //! - **Writes** ([`write_file`]) go through a temporary file made inside the folder, never in the
 //!   data root (which Users can read on Windows), then a rename over the old file, retried for a
 //!   short while when Windows reports a sharing violation (an antivirus or indexer holding it).
@@ -41,18 +45,40 @@ pub fn path(data_root: &Path) -> PathBuf {
 /// DACL that could not be set is logged as a warning and the folder is used anyway (the files
 /// then keep the data root's permissions); everything else that fails is an error.
 pub fn ensure(data_root: &Path) -> Result<PathBuf> {
-    let (dir, warning) = ensure_with(data_root, &protect_new_folder)?;
+    let (dir, warning) = ensure_with(data_root, &protect_new_folder, &first_check_protected)?;
     if let Some(w) = warning {
         tracing::warn!("{w}");
     }
     Ok(dir)
 }
 
-/// [`ensure`] with `protect` as the Windows protection of a folder made now (`Err`: why not),
-/// returning the warning instead of logging it.
+/// Folders whose DACL [`first_check_protected`] already looked at in this process.
+static CHECKED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// [`crate::backend::acl::dacl_protected`] the first time this process asks about `dir`; later
+/// calls answer `Ok(true)`. `ensure` runs on every write of a secret, so a folder that cannot be
+/// protected (an account without the right) is tried, and warned about, once per process.
+fn first_check_protected(dir: &Path) -> Result<bool> {
+    {
+        let mut checked = CHECKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if checked.iter().any(|d| d == dir) {
+            return Ok(true);
+        }
+        checked.push(dir.to_path_buf());
+    }
+    crate::backend::acl::dacl_protected(dir)
+}
+
+/// [`ensure`] with `protect` as the Windows protection of a folder (`Err`: why not) and
+/// `protected` telling whether an existing folder's DACL is already protected, returning the
+/// warning instead of logging it. A folder made now is protected; an existing one only when
+/// `protected` says `Ok(false)` (an `Err` leaves it alone: nothing proves it needs it).
 fn ensure_with(
     data_root: &Path,
     protect: &dyn Fn(&Path) -> Result<(), String>,
+    protected: &dyn Fn(&Path) -> Result<bool>,
 ) -> Result<(PathBuf, Option<String>)> {
     std::fs::create_dir_all(data_root).with_context(|| {
         format!(
@@ -62,8 +88,20 @@ fn ensure_with(
     })?;
     let dir = path(data_root);
     let created = make_dir(&dir)?;
-    let warning = if created {
-        protect(&dir).err().map(|why| acl_warning(&dir, &why))
+    let repair = !created
+        && match protected(&dir) {
+            Ok(p) => !p,
+            Err(e) => {
+                tracing::debug!("not checking the permissions of {}: {e:#}", dir.display());
+                false
+            }
+        };
+    let warning = if created || repair {
+        match protect(&dir) {
+            Err(why) => Some(acl_warning(&dir, &why)),
+            Ok(()) if repair => Some(repaired_warning(&dir)),
+            Ok(()) => None,
+        }
     } else {
         None
     };
@@ -103,15 +141,33 @@ fn acl_warning(dir: &Path, why: &str) -> String {
         "could not restrict {} to the service's account and Administrators ({why}); the folder \
          keeps the data folder's permissions, so other accounts on this computer may be able to \
          read the secrets in it (the HTTPS key, the accounts' password hashes, the admin \
-         token). Run the service (or this command) once as an administrator, or reinstall \
-         with the MSI, which protects the folder; on a drive without NTFS permissions keep the \
-         data folder on an NTFS drive instead",
+         token). Every start tries again while the folder is not restricted: run \
+         `blue-onyx-prism admin-token --rotate --config <the service's config>` once as an \
+         administrator (it restricts the folder, then replaces the token) and then \
+         `blue-onyx-prism tls-regenerate --config <the service's config>`, or reinstall with \
+         the MSI, which protects the folder. On a drive without NTFS permissions keep the data \
+         folder on an NTFS drive instead",
         dir.display()
     )
 }
 
-/// Windows: protect a folder made now ([`hf_token::protect_private_folder`], the service gets
-/// modify). Elsewhere: nothing to do here (Unix uses modes, see `close_unix`).
+/// The warning of an existing Windows folder that was protected now: its secrets were readable
+/// until this start.
+fn repaired_warning(dir: &Path) -> String {
+    format!(
+        "{} had kept the data folder's permissions (an earlier start stopped, or failed, before \
+         restricting it) and is now restricted to the service's account and Administrators. \
+         Until now other accounts on this computer could read the secrets in it: replace the \
+         HTTPS key with `blue-onyx-prism tls-regenerate` and the admin token with \
+         `blue-onyx-prism admin-token --rotate` (both with `--config <the service's config>`, \
+         run as the service's account)",
+        dir.display()
+    )
+}
+
+/// Windows: protect the folder ([`hf_token::protect_private_folder`], the service gets modify;
+/// `icacls /reset` then `/inheritance:r`, so it is safe to run again on a folder that has files).
+/// Elsewhere: nothing to do here (Unix uses modes, see `close_unix`).
 fn protect_new_folder(dir: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -238,6 +294,11 @@ mod tests {
         n
     }
 
+    /// A probe answering "protected" (the installer's folder, or any Unix folder).
+    fn protected(_: &Path) -> Result<bool> {
+        Ok(true)
+    }
+
     #[test]
     fn ensure_makes_the_folder_once_and_protects_only_a_new_one() {
         let root = scratch();
@@ -248,24 +309,92 @@ mod tests {
             calls.set(calls.get() + 1);
             Ok(())
         };
-        let (dir, warning) = ensure_with(&data_root, &protect).unwrap();
+        let probed = std::cell::Cell::new(0);
+        let probe = |_: &Path| {
+            probed.set(probed.get() + 1);
+            Ok(true)
+        };
+        let (dir, warning) = ensure_with(&data_root, &protect, &probe).unwrap();
         assert_eq!(dir, data_root.join(DIR_NAME));
         assert_eq!(warning, None);
-        let (again, _) = ensure_with(&data_root, &protect).unwrap();
+        assert_eq!(
+            probed.get(),
+            0,
+            "a folder made now is protected without asking"
+        );
+        let (again, warning) = ensure_with(&data_root, &protect, &probe).unwrap();
         assert_eq!(again, dir);
-        assert_eq!(calls.get(), 1, "an existing folder keeps its DACL");
+        assert_eq!(warning, None);
+        assert_eq!(
+            calls.get(),
+            1,
+            "an existing protected folder keeps its DACL"
+        );
+        assert_eq!(probed.get(), 1);
         // A file in its place is an error, never replaced.
         let other = root.0.join("other");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join(DIR_NAME), "x").unwrap();
-        assert!(ensure_with(&other, &protect).is_err());
+        assert!(ensure_with(&other, &protect, &probe).is_err());
+    }
+
+    /// RA-044: a start that crashed (or failed) between creating the folder and restricting it
+    /// left an existing, unprotected folder; the next start protects it and says which secrets to
+    /// replace. A probe that cannot read the DACL leaves the folder alone.
+    #[test]
+    fn an_existing_unprotected_folder_is_protected_again() {
+        let root = scratch();
+        // The crash: the folder exists, its DACL was never restricted.
+        std::fs::create_dir_all(path(&root.0)).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let protect = |_: &Path| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        let (dir, warning) = ensure_with(&root.0, &protect, &|_| Ok(false)).unwrap();
+        assert_eq!(calls.get(), 1, "the unprotected folder is protected");
+        let w = warning.unwrap();
+        assert!(w.contains("tls-regenerate"), "{w}");
+        assert!(w.contains("admin-token --rotate"), "{w}");
+        assert!(w.contains(&dir.display().to_string()), "{w}");
+        // Unknown (the DACL cannot be read): nothing proves it needs it, nothing is tried.
+        let (_, warning) =
+            ensure_with(&root.0, &protect, &|_| Err(anyhow::anyhow!("denied"))).unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(calls.get(), 1);
+        // Protecting it fails (LocalService without WRITE_DAC): the advice says the next start
+        // tries again.
+        let (_, warning) = ensure_with(&root.0, &|_| Err("Access is denied".to_string()), &|_| {
+            Ok(false)
+        })
+        .unwrap();
+        let w = warning.unwrap();
+        assert!(w.contains("Access is denied"), "{w}");
+        assert!(w.contains("Every start tries again"), "{w}");
+    }
+
+    /// The real probe runs once per folder and process (every secret write calls `ensure`).
+    #[test]
+    fn the_real_probe_asks_once_per_folder() {
+        let root = scratch();
+        let dir = ensure(&root.0).unwrap();
+        // Off Windows the probe always says protected; on Windows `ensure` made and protected
+        // it. Either way the next ask is answered from memory.
+        assert!(first_check_protected(&dir).unwrap());
+        let gone = root.0.join("never-made");
+        assert!(first_check_protected(&gone).unwrap_or(false) || cfg!(windows));
+        assert!(first_check_protected(&gone).unwrap(), "asked once");
     }
 
     #[test]
     fn a_failed_acl_is_a_warning_and_the_folder_is_still_usable() {
         let root = scratch();
-        let (dir, warning) =
-            ensure_with(&root.0, &|_| Err("Access is denied".to_string())).unwrap();
+        let (dir, warning) = ensure_with(
+            &root.0,
+            &|_| Err("Access is denied".to_string()),
+            &protected,
+        )
+        .unwrap();
         let w = warning.unwrap();
         assert!(w.contains("Access is denied"), "{w}");
         assert!(w.contains("administrator"), "{w}");
@@ -333,13 +462,40 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
+    /// RA-044 on the real OS: an `auth` folder left with the inherited DACL (a crash before
+    /// icacls) is protected by the next `ensure`, and then reads as protected.
+    #[cfg(windows)]
+    #[test]
+    fn an_inherited_windows_folder_is_repaired() {
+        let root = scratch();
+        let dir = path(&root.0);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!crate::backend::acl::dacl_protected(&dir).unwrap());
+        let (_, warning) = ensure_with(
+            &root.0,
+            &protect_new_folder,
+            &crate::backend::acl::dacl_protected,
+        )
+        .unwrap();
+        let w = warning.unwrap();
+        assert!(w.contains("tls-regenerate"), "{w}");
+        assert!(crate::backend::acl::dacl_protected(&dir).unwrap());
+        let (_, warning) = ensure_with(
+            &root.0,
+            &protect_new_folder,
+            &crate::backend::acl::dacl_protected,
+        )
+        .unwrap();
+        assert_eq!(warning, None, "a protected folder is left alone");
+    }
+
     /// The real Windows DACL: nothing for Users (S-1-5-32-545), Administrators and SYSTEM in it,
     /// nothing inherited.
     #[cfg(windows)]
     #[test]
     fn the_windows_folder_has_no_users_entry() {
         let root = scratch();
-        let (dir, warning) = ensure_with(&root.0, &protect_new_folder).unwrap();
+        let (dir, warning) = ensure_with(&root.0, &protect_new_folder, &protected).unwrap();
         assert_eq!(warning, None);
         // Passed as -EncodedCommand (base64 of UTF-16LE): quotes inside a -Command argument do
         // not survive Windows' command-line parsing intact. Stop on the first error, so a failed

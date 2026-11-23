@@ -36,6 +36,12 @@
 //! and why ([`AutolabelJob::write_note`]). `work`, which holds the only copy of those proposals,
 //! then stays, and a run that saved no frame at all fails.
 //!
+//! `work` is held busy while the run runs ([`crate::storage::Busy`]) and removed at its end unless
+//! kept ([`remove_work`]: the proposals first, so a folder left to the storage sweep is never
+//! written twice). After a crash the sweep writes the finished proposals ([`recover_crashed`]; not
+//! while the folder under review is unavailable) and renames them to [`APPLIED_FILE`] before the
+//! folder goes.
+//!
 //! [`AutolabelJob::preview`] is stage 1 alone: the same walk ([`AutolabelJob::select`]), written
 //! nowhere, for the pages' Preview and `train autolabel --dry-run`.
 
@@ -88,6 +94,8 @@ fn cancelled(cancel: &AtomicBool) -> bool {
 
 /// The labelers' proposals in `work`, one flushed JSONL line per finished frame.
 pub const PROPOSALS_FILE: &str = "proposals.jsonl";
+/// [`PROPOSALS_FILE`] once a crashed run's recovery wrote all of them ([`recover_crashed`]).
+pub const APPLIED_FILE: &str = "proposals.jsonl.applied";
 /// The selected frames in `work` (`frame`, `path`, `width`, `height`, `scene` per line).
 pub const FRAMES_FILE: &str = "frames.jsonl";
 /// What the run is ([`WorkRecord`]), in `work` beside the proposals.
@@ -1467,9 +1475,7 @@ impl AutolabelJob {
             .context("queueing the labelled frames for review")?;
         rep.sample = changed.iter().take(20).cloned().collect();
         rep.seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-        if !*keep_work {
-            let _ = crate::resources::manager::remove_any(&self.work);
-        }
+        // The work folder goes in `run`, with the hold on it ([`remove_work`]).
         self.step(report, 5, 100, &format!("{} frames changed", changed.len()));
         let summary = if r.missing_only {
             let mut s = if stopped {
@@ -2065,7 +2071,7 @@ impl Task for AutolabelJob {
     ) -> Result<TaskOutcome> {
         // Until this returns, a storage sweep leaves `work` alone; after a crash it writes the
         // finished proposals and removes it ([`crate::storage::sweep`]).
-        let _busy = crate::storage::Busy::hold(&self.work);
+        let busy = crate::storage::Busy::hold(&self.work);
         let mut keep_work = false;
         let mut overridden = false;
         let r = self.stages(
@@ -2077,8 +2083,10 @@ impl Task for AutolabelJob {
             cancel,
             &mut keep_work,
         );
-        if r.is_err() && !keep_work {
-            let _ = crate::resources::manager::remove_any(&self.work);
+        if keep_work {
+            drop(busy);
+        } else {
+            remove_work(busy, &self.work);
         }
         let mut out = crate::training::commit::noted(r, overridden)?;
         if let Some(fin) = self.finish.as_ref().filter(|f| !f.is_empty())
@@ -2109,12 +2117,48 @@ impl Task for AutolabelJob {
     }
 }
 
+/// Remove the work folder `work` of a run that ended, `busy` its hold. Its proposals go first: once
+/// they are gone, a folder that cannot be removed (a file still open) keeps its marker, unlocked,
+/// and the next storage sweep only removes it ([`crate::storage::Busy::finish_removing`]). While
+/// they cannot be removed, that sweep would write them again (they were written already, or the run
+/// chose to drop them), so the folder then ends as before: marker deleted, the folder listed
+/// as kept on the Storage card until it is removed by hand.
+fn remove_work(busy: crate::storage::Busy, work: &std::path::Path) {
+    let proposals = work.join(PROPOSALS_FILE);
+    match std::fs::remove_file(&proposals) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(
+                "auto-label: could not remove {} ({e}); its work folder stays until it is \
+                 removed by hand (the storage sweep would write these proposals again)",
+                proposals.display()
+            );
+            if let Err(e) = crate::resources::manager::remove_any(work) {
+                tracing::warn!("auto-label: {e:#}");
+            }
+            drop(busy);
+            return;
+        }
+    }
+    busy.finish_removing();
+}
+
 /// Write the finished proposals of the labelers run whose process died, from its `work` folder:
 /// the frames' label files get them through the run's own write stage, markers included, as a
 /// Cancel does, and the changed frames are queued for review. The config gives the current class
 /// lists (the run's own classes are in the record). Frames gone since are counted, not failed. Err
-/// when the folder holds no readable record or proposals: then nothing was written.
+/// when the folder holds no readable record or proposals, or the folder under review is not
+/// available (an unmounted drive or share would otherwise read as every frame gone): then nothing
+/// was written, and the sweep keeps the folder for the next try.
+///
+/// Once every frame is written and queued, the proposals are renamed to [`APPLIED_FILE`], so a
+/// folder whose removal then fails is never written twice: a later call finds them applied and
+/// writes nothing.
 pub fn recover_crashed(work: &std::path::Path, config: &Config) -> Result<Recovered> {
+    if !work.join(PROPOSALS_FILE).exists() && work.join(APPLIED_FILE).is_file() {
+        return Ok(Recovered::default());
+    }
     let job_file = work.join(JOB_FILE);
     let rec: WorkRecord = serde_json::from_slice(
         &std::fs::read(&job_file).with_context(|| format!("reading {}", job_file.display()))?,
@@ -2126,6 +2170,9 @@ pub fn recover_crashed(work: &std::path::Path, config: &Config) -> Result<Recove
             job_file.display(),
             rec.version
         );
+    }
+    if let Some(why) = config.collect.review_folder_problem(&rec.dataset_dir) {
+        bail!("{why}");
     }
     let frames_file = work.join(FRAMES_FILE);
     let list = crate::collect::layout::read_lines::<FrameLine>(&frames_file);
@@ -2193,6 +2240,15 @@ pub fn recover_crashed(work: &std::path::Path, config: &Config) -> Result<Recove
     out.first_error = rep.first_write_error;
     out.queued = crate::collect::layout::append_review(&job.dataset_dir, &changed)
         .context("queueing the labelled frames for review")?;
+    if out.frames_failed == 0
+        && let Err(e) = std::fs::rename(&proposals, work.join(APPLIED_FILE))
+    {
+        tracing::warn!(
+            "auto-label: wrote the proposals of {} but could not mark them written ({e}); if its \
+             folder stays, the next storage sweep writes them again",
+            work.display()
+        );
+    }
     Ok(out)
 }
 

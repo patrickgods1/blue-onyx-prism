@@ -10,6 +10,11 @@
 //! - the marker is there and unlocked: the job died, [`State::Crashed`], whose [`Claim`] holds the
 //!   lock so no job or second sweep can take the folder meanwhile.
 //!
+//! A job that meant to remove its folder and could not ([`Busy::finish_removing`], the drop of a
+//! [`Busy::remove_target_on_drop`] hold: a file still open, an antivirus scan on Windows) keeps
+//! the marker too, unlocked, so the next sweep sees a crashed job and removes the folder; a deleted
+//! marker would read as a folder kept on purpose, never swept.
+//!
 //! The marker lives beside the folder, never in it: a folder holding an open, locked file cannot
 //! be removed on Windows.
 //!
@@ -98,6 +103,28 @@ impl Busy {
             let _ = fs4::FileExt::unlock(&f);
         }
     }
+
+    /// The job is done with its folder: remove it, then release the hold. Whether the folder is
+    /// gone. When the removal fails (a file still open: an antivirus scan, a child's handles not
+    /// closed yet on Windows), the hold is [abandoned](Busy::abandon) instead, so the next storage
+    /// sweep finds a crashed job's folder and removes it, rather than a folder kept on purpose that
+    /// stays for good.
+    pub fn finish_removing(self) -> bool {
+        match crate::resources::manager::remove_any(&self.target) {
+            Ok(()) => {
+                drop(self);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{e:#}; a file in it is probably still in use; the next storage sweep \
+                     removes it"
+                );
+                self.abandon();
+                false
+            }
+        }
+    }
 }
 
 impl Drop for Busy {
@@ -114,6 +141,12 @@ impl Drop for Busy {
             && let Err(e) = crate::resources::manager::remove_any(&self.target)
         {
             tracing::warn!("{e:#}; the next storage sweep removes it");
+            // Kept, unlocked: the sweep sees a crash and removes the folder (a deleted marker
+            // would read as a folder kept on purpose).
+            if let Some(f) = self.file.take() {
+                let _ = fs4::FileExt::unlock(&f);
+            }
+            return;
         }
         let Some(f) = self.file.take() else { return };
         // Deleted while still locked: a sweep that opened the marker meanwhile gets the lock only
@@ -339,6 +372,79 @@ mod tests {
             };
             claim.finish();
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `sub` made unwritable, so removing the folder above it fails; None when it still can be
+    /// written (root ignores the mode): the test then has nothing to check.
+    #[cfg(unix)]
+    fn lock_down(sub: &Path) -> Option<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(sub).unwrap();
+        std::fs::write(sub.join("f_012345.jpg"), b"x").unwrap();
+        std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(sub.join("probe"), b"x").is_ok() {
+            eprintln!("skipped: permissions are not enforced for this user");
+            return None;
+        }
+        Some(())
+    }
+
+    #[cfg(unix)]
+    fn unlock_down(sub: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(sub, std::fs::Permissions::from_mode(0o755));
+    }
+
+    /// A job done with its folder removes it and its marker; one whose removal fails keeps the
+    /// marker, unlocked, so the next sweep sees a crashed job and removes the folder.
+    #[test]
+    fn finish_removing_removes_the_folder_or_leaves_it_to_the_sweep() {
+        let d = tmp("finish");
+        let work = d.join("job");
+        let busy = Busy::hold(&work);
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        std::fs::write(work.join("sub/proposals.jsonl"), b"{}\n").unwrap();
+        assert!(busy.finish_removing());
+        assert!(!work.exists());
+        assert!(!marker_of(&work).exists());
+        assert!(matches!(probe(&work), State::Ended));
+
+        #[cfg(unix)]
+        {
+            let sub = work.join("candidates");
+            let busy = Busy::hold(&work);
+            if lock_down(&sub).is_some() {
+                assert!(!busy.finish_removing(), "the removal failed");
+                assert!(work.is_dir());
+                assert!(marker_of(&work).is_file(), "the marker stays");
+                let State::Crashed(claim) = probe(&work) else {
+                    panic!("a folder its job could not remove reads as crashed")
+                };
+                claim.finish();
+            }
+            unlock_down(&sub);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A staging folder that cannot be removed when its hold drops keeps its marker, unlocked.
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_folder_that_cannot_be_removed_reads_as_crashed() {
+        let d = tmp("staging-stuck");
+        let staging = d.join(".m.train-staging");
+        let sub = staging.join("sub");
+        let held = Busy::hold(&staging).remove_target_on_drop();
+        if lock_down(&sub).is_some() {
+            drop(held);
+            assert!(staging.is_dir());
+            let State::Crashed(claim) = probe(&staging) else {
+                panic!("a staging folder its job could not remove reads as crashed")
+            };
+            claim.finish();
+        }
+        unlock_down(&sub);
         let _ = std::fs::remove_dir_all(&d);
     }
 

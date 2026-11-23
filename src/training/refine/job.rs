@@ -35,7 +35,8 @@
 //! the folds before it keep their suggestions and the report says how far it got.
 //!
 //! The work folder (`<training dir>/refine/<id>`) is held busy for the whole run, so a storage sweep
-//! leaves it alone, and removed at the end however the run ends. The fold folders go in it, or, when
+//! leaves it alone, and removed at the end however the run ends (when a file in it is still open,
+//! its marker stays and the next sweep removes it). The fold folders go in it, or, when
 //! the training folder is on another volume than the folder under review, on that folder's volume
 //! ([`place::FoldRoot`]: held busy and named in the work folder, removed when the folds end, left
 //! to the sweep after a crash), so the fold exports hard-link the frames instead of copying them.
@@ -1678,15 +1679,11 @@ impl Task for RefineJob {
             cancel,
         );
         let r = commit::noted(r, overridden);
-        if let Err(e) = manager::remove_any(&self.work) {
-            tracing::warn!(
-                "dataset check: could not remove its work folder {}: {e:#}",
-                self.work.display()
-            );
-        }
-        // The marker beside the work folder goes with the hold; then an empty `refine/` parent.
-        drop(busy);
-        if let Some(parent) = self.work.parent() {
+        // The marker beside the work folder goes with the hold, then an empty `refine/` parent; a
+        // folder that cannot be removed keeps its marker, unlocked, for the next storage sweep.
+        if busy.finish_removing()
+            && let Some(parent) = self.work.parent()
+        {
             let _ = std::fs::remove_dir(parent);
         }
         r

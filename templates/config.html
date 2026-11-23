@@ -181,6 +181,7 @@
       {% if r.large %}<input type="hidden" name="confirm_large" value="1"><button type="submit" class="small{% if r.state != "needed" %} secondary{% endif %}" data-confirm="{{ r.title }} is {{ r.size_text }} ({{ r.license }}). Download it?">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %} {{ r.size_text }} (large)</button>
       {% else %}<button type="submit" class="small{% if r.state != "needed" %} secondary{% endif %}">{% if r.update_available.is_some() %}Update{% else %}Download{% endif %}</button>{% endif %}
       </form>
+      {% if r.removable && r.pending_bytes.is_some() %}<form method="post" action="/v1/resources/remove#resource-{{ r.id }}" class="inline" data-ajax><input type="hidden" name="id" value="{{ r.id }}"><button type="submit" class="danger small" data-confirm="Remove the downloaded {{ r.title }} update?">Remove</button></form>{% endif %}
     {% endif %}
     {% if at_row == r.id %}{% call notices("resources-row") %}{% endcall %}{% endif %}
     </td>

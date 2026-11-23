@@ -406,15 +406,63 @@ fn frames_that_cannot_be_linked_count_as_copies() {
         train: vec![((0, 0), 1)],
         ..Plan::default()
     };
-    // Same volume, hard links work: nothing to copy, and the probe left nothing behind.
+    // Same volume, hard links work: nothing to copy, and the probe, made in the training
+    // folder's `runs` (where the storage sweep looks), left nothing behind.
     assert_eq!(copied_bytes(&p, &sources, &root.join("run")), 0);
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["images", LINK_PROBE_DIR]);
+    assert_eq!(
+        std::fs::read_dir(root.join(LINK_PROBE_DIR))
+            .unwrap()
+            .count(),
+        0
+    );
     // The base weights set the rest of the need.
     let recipe = TrainRecipe::new(crate::resources::catalog::TrainFamily::Yolo26, "n").unwrap();
     let n = run_needs(&p, &sources, &recipe, &root.join("run"), &root.join("m")).unwrap();
     let w = recipe.base().unwrap().size();
     assert_eq!(n[0].bytes, LABEL_BYTES_PER_FRAME + WORK_WEIGHT_FACTOR * w);
     assert_eq!(n[1].bytes, w);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The probe goes where the storage sweep looks: `<training dir>/runs`, named with the sweep's
+/// prefix, and is removed. A training folder that is not there gets no `runs` made under it.
+#[test]
+fn link_probes_are_made_where_the_sweep_clears_them() {
+    let root = std::env::temp_dir().join(format!("bop-probe-{}", uuid::Uuid::new_v4()));
+    let training = root.join("training");
+    std::fs::create_dir_all(&training).unwrap();
+    let img = root.join("a.jpg");
+    std::fs::write(&img, b"x").unwrap();
+    let run = training.join("20261123-1");
+    assert_eq!(probe_dir(&run), Some(training.join(LINK_PROBE_DIR)));
+    assert!(training.join(LINK_PROBE_DIR).is_dir());
+    assert!(hard_links_work(&img, &run, &training.join(LINK_PROBE_DIR)));
+    assert_eq!(
+        std::fs::read_dir(training.join(LINK_PROBE_DIR))
+            .unwrap()
+            .count(),
+        0
+    );
+    // No training folder: nothing made, the nearest existing folder as before.
+    let gone = root.join("unplugged/training");
+    assert_eq!(probe_dir(&gone.join("r")), Some(root.clone()));
+    assert!(!gone.exists());
+    let probe = probe_path(&training.join(LINK_PROBE_DIR));
+    assert_eq!(
+        probe.parent(),
+        Some(training.join(LINK_PROBE_DIR).as_path())
+    );
+    let name = probe.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        name.starts_with(crate::storage::sweep::LINK_PROBE_PREFIX),
+        "{name}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -4,8 +4,15 @@
 //! one folder, [`prune_dataset`] to the dataset collector's folder tree ([`crate::collect`]),
 //! and [`spawn_sweeper`] runs them periodically on a background thread, reading the current
 //! settings each tick so a config change applies without a restart. The dataset is pruned on
-//! the collector's own thread (its only writer): the sweeper asks it to. The same thread runs the
+//! the collector's own thread (the collector's writes and the prune never meet; an import is the
+//! other writer, see [`prune_dataset`]): the sweeper asks it to. The same thread runs the
 //! storage sweep of rebuildable files once a day ([`crate::storage::sweep`]).
+//!
+//! Crash repair (audit 2026-11 phase 2): the dataset prune's walk also finds what an interrupted
+//! write or a killed pass left (stale temporary files, orphan sidecars, day folders whose index
+//! names deleted frames, empty day folders) and puts it right ([`prune_dataset`]). Index rewrites
+//! and folder removals hold the dataset's cross-process index lock, which the import's appends take
+//! as well ([`crate::collect::layout::INDEX_LOCK_FILE`]).
 //!
 //! Stopping (audit 2026-11 phase 1): the dataset prune checks the collector's stop flag
 //! ([`crate::collect::stop_requested`]) between two frames and handles one day at a time, its
@@ -84,6 +91,11 @@ pub struct PruneReport {
     pub usage: DatasetUsage,
     /// The pass ended early for a stop ([`prune_dataset_until`]); the rest goes at the next one.
     pub stopped: bool,
+    /// Day folders an interrupted prune or write had left out of step, put right
+    /// ([`prune_dataset`]: index lines of deleted frames dropped, emptied folders removed).
+    pub repaired_days: usize,
+    /// Sidecars whose image was gone, removed ([`prune_dataset`]).
+    pub orphan_sidecars: usize,
 }
 
 /// How the dataset folder's frames (image + sidecar, label files not counted) divide up. The size
@@ -162,19 +174,51 @@ pub fn prune_saved_images(dir: &Path, max_age_days: u32, max_mb: u64) -> Result<
     Ok(report)
 }
 
-/// The frames of the dataset folder `dir` retention may delete, as (path, modified, bytes), and
-/// how the folder divides up. With `clean`, temporary files of an interrupted write older than an
-/// hour are removed on the way. `stop` is asked between two day folders: once it says yes the walk
-/// ends there, incomplete (the caller checks `stop` again).
-fn walk_dataset(
-    dir: &Path,
-    now: SystemTime,
-    clean: bool,
-    stop: &dyn Fn() -> bool,
-) -> (Vec<(PathBuf, SystemTime, u64)>, DatasetUsage) {
+/// How old a leftover of an interrupted write must be before a cleaning walk removes it (a
+/// temporary file of [`crate::fsx::write_atomic`], an orphan sidecar): older than any write in
+/// progress, so a live writer in this or another process never loses one.
+pub const LEFTOVER_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// What [`walk_dataset`] found.
+#[derive(Debug, Default)]
+struct Walked {
+    /// The frames retention may delete, as (path, modified, bytes).
+    entries: Vec<(PathBuf, SystemTime, u64)>,
+    usage: DatasetUsage,
+    /// Day folders an interrupted prune or write left out of step (cleaning walks only): an
+    /// `index.jsonl` naming a frame whose image is not in the folder, or nothing in the folder at
+    /// all. [`prune_dataset`] rewrites their index and removes the emptied folders.
+    repair: Vec<PathBuf>,
+    /// Orphan sidecars removed (cleaning walks only).
+    orphan_sidecars: usize,
+}
+
+fn is_stale(now: SystemTime, modified: SystemTime) -> bool {
+    now.duration_since(modified).is_ok_and(|d| d > LEFTOVER_AGE)
+}
+
+/// The frames of the dataset folder `dir` retention may delete and how the folder divides up.
+/// `stop` is asked between two day folders: once it says yes the walk ends there, incomplete
+/// (the caller checks `stop` again).
+///
+/// With `clean` (audit 2026-11 phase 2), what an interrupted write or prune left is dealt with on
+/// the way, each kind matched exactly:
+/// - [`crate::fsx::write_atomic`]'s temporary files ([`crate::fsx::is_temp_name`]) older than
+///   [`LEFTOVER_AGE`] are removed;
+/// - a label file whose image is gone, unless it holds human work;
+/// - an orphan sidecar: a regular file `<stem>.json` (never `*.labels.json`) whose stem is a frame
+///   stem ([`layout::is_frame_stem`]), older than [`LEFTOVER_AGE`], with no `<stem>.jpg` on disk and
+///   no protected label file. Images go in before their sidecar, so only a deletion that stopped
+///   part way leaves one;
+/// - the day folders to repair ([`Walked::repair`]) are listed, by reading their index.
+///
+/// A frame whose image and sidecar are in but whose index line is not (a kill between the two) is
+/// not repaired: the caps still count and delete it, and adding its line would race the writer.
+/// An image with no sidecar is left alone (the Review tab's Rescan folder lists it).
+fn walk_dataset(dir: &Path, now: SystemTime, clean: bool, stop: &dyn Fn() -> bool) -> Walked {
     use crate::collect::{labels, layout};
-    let mut entries = Vec::new();
-    let mut usage = DatasetUsage::default();
+    use std::collections::HashSet;
+    let mut out = Walked::default();
     for day in layout::day_dirs(dir) {
         if stop() {
             break;
@@ -182,7 +226,11 @@ fn walk_dataset(
         let Ok(rd) = std::fs::read_dir(&day) else {
             continue;
         };
+        // What is still in the folder, and the stems of its images.
+        let mut left = 0usize;
+        let mut images: HashSet<String> = HashSet::new();
         for ent in rd.flatten() {
+            left += 1;
             let Ok(ft) = ent.file_type() else { continue };
             if !ft.is_file() {
                 continue;
@@ -191,24 +239,43 @@ fn walk_dataset(
             let name = ent.file_name().to_string_lossy().into_owned();
             let Ok(meta) = ent.metadata() else { continue };
             let modified = meta.modified().unwrap_or(now);
-            if name.starts_with('.') && name.ends_with(".tmp") {
-                let stale = now
-                    .duration_since(modified)
-                    .is_ok_and(|d| d > Duration::from_secs(3600));
-                if stale && clean {
-                    let _ = std::fs::remove_file(&path);
+            if crate::fsx::is_temp_name(&name) {
+                if clean && is_stale(now, modified) && std::fs::remove_file(&path).is_ok() {
+                    left -= 1;
                 }
                 continue;
             }
             // A run that was labelling a frame as it went leaves a label file behind.
             if let Some(stem) = name.strip_suffix(labels::LABELS_SUFFIX) {
-                if clean && !day.join(format!("{stem}.jpg")).exists() {
-                    labels::unless_protected(&path, || std::fs::remove_file(&path));
+                if clean
+                    && !day.join(format!("{stem}.jpg")).exists()
+                    && matches!(
+                        labels::unless_protected(&path, || std::fs::remove_file(&path)),
+                        Some(Ok(()))
+                    )
+                {
+                    left -= 1;
+                }
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(".json") {
+                if clean
+                    && layout::is_frame_stem(stem)
+                    && is_stale(now, modified)
+                    && orphan_sidecar(&day, stem)
+                    && std::fs::remove_file(&path).is_ok()
+                {
+                    tracing::debug!("retention: removed the orphan sidecar {}", path.display());
+                    out.orphan_sidecars += 1;
+                    left -= 1;
                 }
                 continue;
             }
             if path.extension().and_then(|e| e.to_str()) != Some("jpg") {
                 continue;
+            }
+            if let Some(stem) = name.strip_suffix(".jpg") {
+                images.insert(stem.to_string());
             }
             let side_len = std::fs::symlink_metadata(path.with_extension("json"))
                 .ok()
@@ -216,21 +283,41 @@ fn walk_dataset(
                 .map_or(0, |m| m.len());
             let size = meta.len().saturating_add(side_len);
             if labels::is_protected(&labels::path_of_frame(&path)) {
-                usage.protected_bytes = usage.protected_bytes.saturating_add(size);
-                usage.protected_frames += 1;
+                out.usage.protected_bytes = out.usage.protected_bytes.saturating_add(size);
+                out.usage.protected_frames += 1;
             } else {
-                usage.prunable_bytes = usage.prunable_bytes.saturating_add(size);
-                entries.push((path, modified, size));
+                out.usage.prunable_bytes = out.usage.prunable_bytes.saturating_add(size);
+                out.entries.push((path, modified, size));
             }
         }
+        if clean && (left == 0 || names_a_missing_image(&day, &images)) {
+            out.repair.push(day);
+        }
     }
-    (entries, usage)
+    out
+}
+
+/// Whether the sidecar `<day>/<stem>.json` has lost its frame: no `<stem>.jpg` (not even a
+/// symlink) and no label file that retention must keep ([`labels::is_protected`]).
+fn orphan_sidecar(day: &Path, stem: &str) -> bool {
+    use crate::collect::labels;
+    let jpg = day.join(format!("{stem}.jpg"));
+    std::fs::symlink_metadata(&jpg).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        && !labels::is_protected(&labels::path_of_frame(&jpg))
+}
+
+/// Whether `day`'s index lists a frame whose image is not among `images` (the folder's listing).
+/// An index that cannot be read names nothing here (the rewrite would refuse it anyway).
+fn names_a_missing_image(day: &Path, images: &std::collections::HashSet<String>) -> bool {
+    use crate::collect::{layout, record::IndexLine};
+    let index = layout::read_lines::<IndexLine>(&day.join(layout::INDEX_FILE));
+    index.failed.is_none() && index.lines.iter().any(|l| !images.contains(&l.id))
 }
 
 /// How the frames of the dataset folder `dir` divide up (reads every label file; call it off the
 /// async runtime). A missing folder is empty.
 pub fn dataset_usage(dir: &Path) -> DatasetUsage {
-    walk_dataset(dir, SystemTime::now(), false, &|| false).1
+    walk_dataset(dir, SystemTime::now(), false, &|| false).usage
 }
 
 /// Delete the oldest frames of the dataset folder `dir` (`<scene>/<camera>/<date>/<stem>.jpg`
@@ -240,11 +327,23 @@ pub fn dataset_usage(dir: &Path) -> DatasetUsage {
 /// frames and frames with a human decision are never deleted and do not count toward the cap; a
 /// label file with nothing human on it (an auto-label run writes one even when it finds nothing)
 /// goes with its frame. Only those names are touched (no symlinks, nothing outside the layout,
-/// never `review-queue.jsonl`); temporary files of an interrupted write older than an hour go
-/// too. A missing folder is not an error. Frames are written only by the collector thread, where
-/// this runs; label files can change at any time, so each frame's is read again, under the label
-/// write lock, right before the frame goes. Stops between two frames when the collector thread
-/// running it is asked to stop ([`crate::collect::stop_requested`]; never elsewhere).
+/// never `review-queue.jsonl`).
+///
+/// Crash repair (audit 2026-11 phase 2): what an interrupted write or an earlier pass that was
+/// killed left behind is put right on the way ([`walk_dataset`]): temporary files and orphan
+/// sidecars older than [`LEFTOVER_AGE`] go, and each day folder whose index names a frame whose
+/// image is gone, or that holds nothing, gets the same index rewrite and folder removal as a day
+/// whose frames were just deleted. A missing folder is not an error.
+///
+/// Writers: the collector thread, where this runs, and an import (a job thread of the service or a
+/// `train import` process) write frames and index lines into the same day folders. Each day's
+/// index rewrite and the removal of its emptied folders run under the dataset's index lock
+/// ([`crate::collect::layout::lock_index`]), which every index append takes too, so no appended
+/// line is lost; an import whose freshly made, still empty day folder goes makes it again
+/// ([`crate::collect::layout::write_in_day`]). Label files can change at any time, so each frame's
+/// is read again, under the label write lock, right before the frame goes. Stops between two
+/// frames when the collector thread running it is asked to stop
+/// ([`crate::collect::stop_requested`]; never elsewhere).
 pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<PruneReport> {
     prune_dataset_until(
         dir,
@@ -272,7 +371,12 @@ pub fn prune_dataset_until(
         return Ok(PruneReport::default());
     }
     let now = SystemTime::now();
-    let (entries, mut usage) = walk_dataset(dir, now, true, stop);
+    let Walked {
+        entries,
+        mut usage,
+        repair,
+        orphan_sidecars,
+    } = walk_dataset(dir, now, true, stop);
     if stop() {
         // The walk may be incomplete: a cap decided on it would be wrong.
         tracing::info!(
@@ -284,6 +388,7 @@ pub fn prune_dataset_until(
             remaining: entries.len(),
             usage,
             stopped: true,
+            orphan_sidecars,
             ..PruneReport::default()
         });
     }
@@ -294,8 +399,11 @@ pub fn prune_dataset_until(
     let sizes: HashMap<&Path, u64> = entries.iter().map(|e| (e.0.as_path(), e.2)).collect();
     let mut report = PruneReport {
         remaining: entries.len(),
+        orphan_sidecars,
         ..PruneReport::default()
     };
+    let mut to_repair: std::collections::HashSet<&Path> =
+        repair.iter().map(PathBuf::as_path).collect();
     // One day folder at a time, oldest doomed frame first.
     let mut days: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
     let mut day_of: HashMap<PathBuf, usize> = HashMap::new();
@@ -350,12 +458,39 @@ pub fn prune_dataset_until(
                 }
             }
         }
-        if deleted_here {
-            finish_day(day);
+        let repairing = to_repair.remove(day.as_path());
+        if (deleted_here || repairing) && finish_day(day) && repairing {
+            report.repaired_days += 1;
         }
         if report.stopped {
             break;
         }
+    }
+    // The days left out of step that lost no frame in this pass, in walk order.
+    for day in &repair {
+        if report.stopped {
+            break;
+        }
+        if !to_repair.contains(day.as_path()) {
+            continue;
+        }
+        if stop() {
+            report.stopped = true;
+            break;
+        }
+        if finish_day(day) {
+            report.repaired_days += 1;
+        }
+    }
+    if report.repaired_days > 0 || report.orphan_sidecars > 0 {
+        tracing::info!(
+            "dataset in {}: repaired {} day folder(s) and removed {} orphan sidecar(s) left by an \
+             interrupted write or retention pass (a crash or a forced stop): index lines of \
+             deleted frames dropped, empty folders removed",
+            dir.display(),
+            report.repaired_days,
+            report.orphan_sidecars
+        );
     }
     report.usage = usage;
     if report.deleted > 0 || report.failed > 0 || report.stopped {
@@ -376,10 +511,22 @@ pub fn prune_dataset_until(
     Ok(report)
 }
 
-/// After frames of `day` were deleted: its index without them, and the emptied day, camera and
-/// scene folders removed (`remove_dir` fails on a non-empty one).
-fn finish_day(day: &Path) {
-    if let Err(e) = crate::collect::layout::rewrite_index(day) {
+/// After frames of `day` were deleted (or the walk found it out of step): its index without them,
+/// and the emptied day, camera and scene folders removed (`remove_dir` fails on a non-empty one),
+/// all under the dataset's index lock, so an append of an import is never lost to the rewrite.
+/// When the lock cannot be had (another process holds it past the wait, or the service is
+/// stopping) the day is left as it is, and false: the next pass finds it out of step and finishes
+/// it.
+fn finish_day(day: &Path) -> bool {
+    use crate::collect::layout;
+    let lock = match layout::lock_index(day) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::warn!("dataset retention: {e:#}");
+            return false;
+        }
+    };
+    if let Err(e) = layout::rewrite_index_locked(day, &lock) {
         tracing::warn!("dataset retention: {e:#}");
     }
     let mut p = Some(day);
@@ -390,6 +537,8 @@ fn finish_day(day: &Path) {
         }
         p = d.parent();
     }
+    drop(lock);
+    true
 }
 
 /// A warning text when the file system holding `data_root` has less than `min_free_mb` MB
@@ -943,6 +1092,154 @@ mod tests {
         back.join().unwrap();
         let panics = std::thread::spawn(|| panic!("test panic"));
         assert!(join_within(panics, Instant::now() + Duration::from_secs(10), "t").is_ok());
+    }
+
+    /// Set the modified time of `p` to `ago` before now.
+    fn age(p: &Path, ago: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(SystemTime::now() - ago)
+            .unwrap();
+    }
+
+    const TWO_HOURS: Duration = Duration::from_secs(2 * 3600);
+    /// Frame stems as the collector writes them.
+    const S1: &str = "20260101T000000000Z_req1";
+    const S2: &str = "20260101T000001000Z_req2";
+    const S3: &str = "20260101T000002000Z_req3";
+
+    /// Audit 2026-11 phase 2 (R:collect-4): a kill mid-prune (or a failed write) leaves index
+    /// lines of deleted frames, orphan sidecars and empty day folders; one prune with no caps
+    /// repairs them all, and leaves what may still be in use or holds human work.
+    #[test]
+    fn a_prune_repairs_what_an_interrupted_prune_or_write_left() {
+        use crate::collect::labels::{self, LabelFile, Status};
+        use crate::collect::layout::{INDEX_FILE, Summary, read_index};
+        let d = Tmp::new();
+        let p = d.path();
+        // A day whose prune was killed after its images went: index, sidecars, no images.
+        let gone_day = p.join("ir/cam/2026-01-01");
+        dataset_frame(p, "ir/cam/2026-01-01", S1, 100, 1);
+        dataset_frame(p, "ir/cam/2026-01-01", S2, 100, 1);
+        for stem in [S1, S2] {
+            std::fs::remove_file(gone_day.join(format!("{stem}.jpg"))).unwrap();
+        }
+        // A day that keeps a frame, with a dangling line and an orphan sidecar beside it.
+        let kept_day = p.join("day/yard/2026-01-02");
+        dataset_frame(p, "day/yard/2026-01-02", "kept", 100, 1);
+        dataset_frame(p, "day/yard/2026-01-02", S1, 100, 1);
+        std::fs::remove_file(kept_day.join(format!("{S1}.jpg"))).unwrap();
+        // Left alone: a fresh orphan sidecar (its writer may be mid-way), one whose frame holds a
+        // reviewed label file, a .json that is no frame's, and a reviewed label file.
+        std::fs::write(kept_day.join(format!("{S2}.json")), b"{}").unwrap();
+        std::fs::write(kept_day.join(format!("{S3}.json")), b"{}").unwrap();
+        age(&kept_day.join(format!("{S3}.json")), TWO_HOURS);
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        labels::write(&kept_day.join(format!("{S3}.labels.json")), &reviewed).unwrap();
+        std::fs::write(kept_day.join("notes.json"), b"{}").unwrap();
+        age(&kept_day.join("notes.json"), TWO_HOURS);
+        // An empty day folder a failed write left, alone in its camera folder.
+        let empty_day = p.join("night/porch/2026-01-03");
+        std::fs::create_dir_all(&empty_day).unwrap();
+        // Temporary files: write_atomic's exact shape goes when old, anything else stays.
+        let temp = kept_day.join(format!(
+            ".kept.jpg.{}.tmp",
+            "0123456789abcdef0123456789abcdef"
+        ));
+        let fresh_temp = kept_day.join(format!(
+            ".kept.json.{}.tmp",
+            "fedcba9876543210fedcba9876543210"
+        ));
+        let lookalike = kept_day.join(".mine.tmp");
+        for t in [&temp, &fresh_temp, &lookalike] {
+            std::fs::write(t, b"t").unwrap();
+        }
+        age(&temp, TWO_HOURS);
+        age(&lookalike, TWO_HOURS);
+
+        assert_eq!(Summary::scan(p).frames, 4, "the dangling lines are counted");
+        let r = prune_dataset(p, 0, 0).unwrap();
+        assert_eq!((r.deleted, r.failed, r.repaired_days), (0, 0, 3), "{r:?}");
+        assert_eq!(
+            r.orphan_sidecars, 3,
+            "two in the gone day, one beside 'kept'"
+        );
+        assert!(!gone_day.exists(), "the emptied day folder goes");
+        assert!(!p.join("ir").exists(), "and its camera and scene folders");
+        assert!(
+            !p.join("night/porch").exists(),
+            "the empty day and its camera"
+        );
+        let ids: Vec<String> = read_index(&kept_day.join(INDEX_FILE))
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids, ["kept"]);
+        assert_eq!(Summary::scan(p).frames, 1);
+        for f in [
+            "kept.jpg".to_string(),
+            "kept.json".into(),
+            format!("{S2}.json"),
+            format!("{S3}.json"),
+            format!("{S3}.labels.json"),
+            "notes.json".into(),
+        ] {
+            assert!(kept_day.join(&f).exists(), "{f} stays");
+        }
+        assert!(!kept_day.join(format!("{S1}.json")).exists());
+        assert!(!temp.exists());
+        assert!(fresh_temp.exists() && lookalike.exists());
+        // Nothing left to repair: a second pass does nothing.
+        let r = prune_dataset(p, 0, 0).unwrap();
+        assert_eq!((r.repaired_days, r.orphan_sidecars), (0, 0));
+    }
+
+    /// The emptied-folder removal holds the index lock: an import that made the day folder and
+    /// takes the lock to list its frame never sees it go under it.
+    #[test]
+    fn an_empty_day_is_not_removed_while_another_process_holds_the_index_lock() {
+        use crate::collect::layout::{INDEX_FILE, INDEX_LOCK_FILE, read_index};
+        let d = Tmp::new();
+        let p = d.path();
+        let day = p.join("ir/cam/2026-01-04");
+        std::fs::create_dir_all(&day).unwrap();
+        let held = std::fs::File::create(p.join(INDEX_LOCK_FILE)).unwrap();
+        fs4::FileExt::try_lock(&held).unwrap();
+        let prune = {
+            let p = p.to_path_buf();
+            std::thread::spawn(move || prune_dataset(&p, 0, 0).unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!prune.is_finished(), "the prune waits for the index lock");
+        assert!(day.is_dir(), "nothing is removed meanwhile");
+        // The other process writes its frame and lists it, then lets go.
+        std::fs::write(day.join(format!("{S1}.jpg")), b"x").unwrap();
+        std::fs::write(day.join(format!("{S1}.json")), b"{}").unwrap();
+        let line = crate::collect::record::IndexLine {
+            id: S1.into(),
+            timestamp: "t".into(),
+            scene: "ir".into(),
+            camera: "cam".into(),
+            model: "m".into(),
+            buckets: vec![crate::collect::Bucket::Empty],
+            labels: Vec::new(),
+            bytes: 2,
+        };
+        crate::collect::layout::append_line(
+            &day.join(INDEX_FILE),
+            &serde_json::to_string(&line).unwrap(),
+        )
+        .unwrap();
+        fs4::FileExt::unlock(&held).unwrap();
+        let r = prune.join().unwrap();
+        assert_eq!(r.repaired_days, 1);
+        assert!(day.join(format!("{S1}.jpg")).is_file());
+        assert_eq!(read_index(&day.join(INDEX_FILE)).len(), 1);
     }
 
     #[cfg(unix)]
