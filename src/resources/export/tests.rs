@@ -1833,6 +1833,16 @@ fn remove_toolchain_refuses_a_held_tool_lock_and_keeps_the_lock_files() {
     let root = tmp("remove-locked");
     let p = toolchain_on_disk(&root);
     let train_lock = p.tools.join(".train.lock");
+    // A lock just dropped can look held for a moment while a child forked by a parallel test
+    // shares the file (the removal's own try has the phase-2 grace; a look has none): wait until
+    // both read free after each drop, so the next check names the lock it holds.
+    let free = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tools_in_use(&p).is_some() {
+            assert!(Instant::now() < deadline, "the locks stay held");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     for lock in [train_lock.clone(), p.lock_file()] {
         let held = train::TrainLock::try_acquire(&lock).unwrap();
         assert!(tools_in_use(&p).is_some_and(|w| w.contains(&lock.display().to_string())));
@@ -1842,13 +1852,7 @@ fn remove_toolchain_refuses_a_held_tool_lock_and_keeps_the_lock_files() {
         assert!(p.python_installs.join("f").exists(), "nothing removed");
         assert!(p.uv_dir.join("f").exists(), "nothing removed");
         drop(held);
-    }
-    // A lock just dropped can look held for a moment while a child forked by a parallel test
-    // shares the file (the removal's own try has the phase-2 grace).
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while tools_in_use(&p).is_some() {
-        assert!(Instant::now() < deadline, "the locks stay held");
-        std::thread::sleep(Duration::from_millis(20));
+        free();
     }
     remove_toolchain(&p).unwrap();
     assert!(!toolchain_state(&p, MAC).present);

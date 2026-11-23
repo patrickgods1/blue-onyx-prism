@@ -539,14 +539,15 @@ mod tests {
             .unwrap()
             .expect("locked");
         // Checked through the path, not through `names_file`: what the run writes must be what
-        // a later start reads.
+        // a later start reads. Read once the handle is closed: on Windows its lock is mandatory,
+        // so a read beside it fails.
         std::io::Write::write_all(&mut file, b"written by the run").unwrap();
+        drop(file);
         assert_eq!(
             std::fs::read(path_in(&root)).ok().as_deref(),
             Some(&b"written by the run"[..]),
             "the run holds a file the path no longer names"
         );
-        drop(file);
         std::fs::remove_dir_all(&root).ok();
     }
 

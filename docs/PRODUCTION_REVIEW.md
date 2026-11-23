@@ -4803,6 +4803,8 @@ guest mode, reader, run marker and condition variables; the config lock in one p
 locks and lock files; the installed rule; the admin token race; the history `models` check; the breadcrumb's handle
 check). Two tests run a second process from the test binary (`queue_owner_child`, `config_lock_child`).
 
+On the PR, two new tests failed in CI. On macOS, `remove_toolchain_refuses_a_held_tool_lock_and_keeps_the_lock_files` looked at the locks right after dropping one; a child forked by a parallel test still shared that file, so the next look named the wrong lock (the phase 2 mechanism). It now waits for both to read free after each drop; with a thread forking children that pause 30 ms before exec, the old test failed 9/10 and the new one 0/10. On Windows, `a_path_removed_between_open_and_lock_is_opened_again` read the file beside the handle that held its (mandatory) lock; it now closes the handle first.
+
 Left for later: the Storage card row for run folders no record names (listed by `train list` only; phase 4), and the
 verifier's optional TrainLock check for runs of older binaries without a busy marker. Not verified here: the Windows
 `names_file` (volume serial + file index) was type-checked and linted for `x86_64-pc-windows-msvc` and runs only in CI.
