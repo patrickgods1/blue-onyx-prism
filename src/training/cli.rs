@@ -724,12 +724,14 @@ fn run_tasks_cli(
     verbose: bool,
 ) -> Result<Vec<Option<super::task::TaskRecord>>> {
     let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
-    let svc = TrainingService::start(
+    // Refused, before anything is written, while the service's queue owns the training folder.
+    let svc = TrainingService::start_owner(
         Arc::new(crate::resources::export::SystemRunner),
         fetcher,
         Arc::new(super::job::NoHooks),
-        Some(super::runs_file(config)),
-    );
+        super::runs_file(config),
+    )
+    .map_err(anyhow::Error::msg)?;
     let cancel = Arc::new(AtomicBool::new(false));
     let _ctrl_c = crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the job");
     let mut ids = Vec::new();
@@ -994,11 +996,7 @@ pub fn main(args: TrainArgs, config_path: Option<PathBuf>) -> ExitCode {
 }
 
 fn load_config(path: &Path) -> Result<Config> {
-    if path.exists() {
-        Config::load(path).context("fix the config file, or pass --config <another file>")
-    } else {
-        Ok(Config::default())
-    }
+    Config::load_or_default(path)
 }
 
 pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool> {
@@ -1276,12 +1274,13 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 eprintln!("{BASELINE_NOTE}");
             }
             let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
-            let svc = TrainingService::start(
+            let svc = TrainingService::start_owner(
                 Arc::new(crate::resources::export::SystemRunner),
                 fetcher,
                 hooks,
-                Some(super::runs_file(&config)),
-            );
+                super::runs_file(&config),
+            )
+            .map_err(anyhow::Error::msg)?;
             let cancel = Arc::new(AtomicBool::new(false));
             let _ctrl_c =
                 crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the training");
@@ -1512,14 +1511,13 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             run_task_cli(&config, Box::new(job), a.verbose)
         }
         TrainCommand::List => {
+            // A reader: never writes runs.json, and a run another process trains shows running.
             let runs = service::load_records(&super::runs_file(&config));
+            let dir = super::training_dir(&config);
             if runs.is_empty() {
-                println!(
-                    "no training runs in {}",
-                    super::training_dir(&config).display()
-                );
+                println!("no training runs in {}", dir.display());
             }
-            for r in runs {
+            for r in &runs {
                 println!(
                     "{}  {}  {}  {}",
                     r.id,
@@ -1527,6 +1525,20 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                     r.request.recipe.label(),
                     r.describe()
                 );
+            }
+            let unlisted = service::unlisted_run_dirs(&dir, &runs);
+            if !unlisted.is_empty() {
+                println!(
+                    "run folders no record names (their record was lost by an earlier version; \
+                     delete them by hand if you do not need them):"
+                );
+                for p in unlisted {
+                    println!(
+                        "  {}  {}",
+                        p.display(),
+                        crate::resources::catalog::format_size(super::retry::disk_use(&p))
+                    );
+                }
             }
             Ok(true)
         }
@@ -1544,12 +1556,13 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 eprintln!("{BASELINE_NOTE}");
             }
             let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
-            let svc = TrainingService::start(
+            let svc = TrainingService::start_owner(
                 Arc::new(crate::resources::export::SystemRunner),
                 fetcher,
                 hooks,
-                Some(super::runs_file(&config)),
-            );
+                super::runs_file(&config),
+            )
+            .map_err(anyhow::Error::msg)?;
             let rec = svc
                 .get(&run)
                 .with_context(|| format!("no run {run} (train list shows the runs)"))?;
@@ -2070,10 +2083,13 @@ impl Hooks for CliHooks {
                 out.name
             ));
         }
-        let mut cfg = load_config(&self.config_path)?;
-        let msg = add_trained_model(&mut cfg, out)?;
-        cfg.save(&self.config_path)?;
-        Ok(format!("{msg} ({})", self.config_path.display()))
+        // Under the config lock (QA-016): a page save of a running service is never undone.
+        let edited = crate::config_file::edit_file(
+            &self.config_path,
+            crate::config_file::Missing::Default,
+            |cfg| add_trained_model(cfg, out),
+        )?;
+        Ok(format!("{} ({})", edited.value, self.config_path.display()))
     }
 
     fn benchmark(

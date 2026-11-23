@@ -18,12 +18,13 @@
 )]
 #![deny(unsafe_code)]
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use blue_onyx_prism::backend::{CoreOptions, DeviceSpec, OrtOptions, Runtimes, select};
 use blue_onyx_prism::cli::{self, Cli, Command};
 use blue_onyx_prism::config::{Config, LogLevel, ModelConfig};
 use blue_onyx_prism::{
-    benchmark, download, resources, runner, setup_onnxruntime, setup_openvino, system_info,
+    benchmark, config_file, download, resources, runner, setup_onnxruntime, setup_openvino,
+    system_info,
 };
 use clap::Parser;
 use std::path::PathBuf;
@@ -218,12 +219,7 @@ fn command_config_path(cli: &Cli) -> PathBuf {
 /// The config file (`--config` or the default path) if it exists, else defaults. Read-only.
 /// A file that exists but cannot be read or parsed is an error (the message names the path).
 fn read_config(cli: &Cli) -> Result<Config> {
-    let path = config_path(cli);
-    if path.exists() {
-        Config::load(&path).context("fix the config file, or pass --config <another file>")
-    } else {
-        Ok(Config::default())
-    }
+    Config::load_or_default(&config_path(cli))
 }
 
 /// `--dir` if given, else the configured `models_dir` (from the config file when it exists),
@@ -427,21 +423,13 @@ fn run(cli: Cli) -> Result<()> {
                     .config
                     .clone()
                     .unwrap_or_else(Config::default_config_path);
-                let mut cfg = if path.exists() {
-                    Config::load(&path)?
-                } else {
-                    Config::default()
-                };
                 let models = download::model_configs(&files, &blue_onyx_prism::exe_dir());
-                let outcomes = download::add_to_config(&mut cfg, models);
-                for o in &outcomes {
+                // Under the config lock: a page save of a running service is never undone.
+                let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
+                    Ok(download::add_to_config(cfg, models))
+                })?;
+                for o in &edited.value {
                     println!("{}", o.describe(&path));
-                }
-                if outcomes
-                    .iter()
-                    .any(|o| matches!(o, download::AddOutcome::Added { .. }))
-                {
-                    cfg.save(&path)?;
                 }
             }
             return Ok(());
@@ -456,21 +444,18 @@ fn run(cli: Cli) -> Result<()> {
                 .config
                 .clone()
                 .unwrap_or_else(Config::default_config_path);
-            let mut cfg = if path.exists() {
-                Config::load(&path)?
-            } else {
-                Config::default()
-            };
             let req = resources::actions::CustomModel {
                 path: model_path.to_string_lossy().to_string(),
                 name,
                 family,
                 classes: classes.map(|c| c.to_string_lossy().to_string()),
             };
-            let msg = resources::actions::add_custom_model(&mut cfg, &req)
-                .map_err(|e| anyhow::anyhow!("{}", e.message()))?;
-            cfg.save(&path)?;
-            println!("{msg}");
+            // Under the config lock: a page save of a running service is never undone.
+            let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
+                resources::actions::add_custom_model(cfg, &req)
+                    .map_err(|e| anyhow::anyhow!("{}", e.message()))
+            })?;
+            println!("{}", edited.value);
             println!("config: {}", path.display());
             return Ok(());
         }

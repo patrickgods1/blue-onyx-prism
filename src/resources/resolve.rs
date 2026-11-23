@@ -1198,14 +1198,13 @@ pub fn download_root(config: &Config) -> PathBuf {
     config.data_root()
 }
 
-/// `dir` holds a completed install of resource `id`: the manager's `.installed.json` names it,
-/// or (installs from before the manager) a `VERSION` file is present.
+/// `dir` holds a completed install of resource `id`: the manager's `.installed.json` names it
+/// and its files are intact, or (installs from before the manager) there is no manifest and a
+/// `VERSION` file is present. A manifest that cannot be read (truncated, damaged) is a damaged
+/// install, never a legacy one: the ONNX Runtime flavors' rule in [`detect_installed`].
 fn installed_in(dir: &Path, id: &str) -> bool {
-    let path = dir.join(super::manager::MANIFEST_FILE);
-    match super::manager::read_manifest(&path) {
-        Some(m) => m.id == id && super::manager::install_damage(&path, dir).is_none(),
-        None => dir.join("VERSION").is_file(),
-    }
+    intact_manifest(dir, id).is_some()
+        || (!dir.join(super::manager::MANIFEST_FILE).exists() && dir.join("VERSION").is_file())
 }
 
 /// The manifest of `id` in `dir`, when there is one and the files it lists are intact.
@@ -1407,6 +1406,86 @@ mod install_damage_tests {
         for (_, id) in &installs {
             assert!(!found.resources.contains(*id), "{id} lost its file");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One rule for OpenVINO and an ONNX Runtime flavor (audit 2026-11, QA-019): a manifest cut
+    /// short (a crash, a full disk) beside a `VERSION` file is a damaged install, not a legacy
+    /// one; without any manifest the `VERSION` file still speaks for an install from before the
+    /// manager.
+    #[test]
+    fn a_truncated_manifest_beside_version_is_not_installed() {
+        let root = std::env::temp_dir().join(format!("bop-resolve-{}", uuid::Uuid::new_v4()));
+        let config = Config::default();
+        let flavor = Flavor::Cpu;
+        let installs = [
+            (
+                root.join(crate::backend::libs::BUNDLED_DIR_NAME),
+                catalog::OPENVINO_RUNTIME_ID,
+            ),
+            (root.join(flavor.dest()), flavor.resource_id()),
+        ];
+        for (dir, id) in &installs {
+            install(dir, id);
+            std::fs::write(dir.join("VERSION"), "1\n").unwrap();
+            std::fs::write(
+                dir.join(crate::backend::libs::ORT_FLAVOR_FILE),
+                flavor.as_str(),
+            )
+            .unwrap();
+            let manifest = dir.join(super::super::manager::MANIFEST_FILE);
+            let bytes = std::fs::read(&manifest).unwrap();
+            std::fs::write(&manifest, &bytes[..bytes.len() / 2]).unwrap();
+        }
+        let found = detect_installed(&config, &root, None);
+        for (dir, id) in &installs {
+            assert!(!found.resources.contains(*id), "{id}: damaged manifest");
+            assert!(!installed_in(dir, id), "{id}");
+        }
+        // No manifest at all: the VERSION file (OpenVINO) or the flavor marker (ORT) speaks.
+        for (dir, _) in &installs {
+            std::fs::remove_file(dir.join(super::super::manager::MANIFEST_FILE)).unwrap();
+        }
+        let found = detect_installed(&config, &root, None);
+        for (_, id) in &installs {
+            assert!(found.resources.contains(*id), "{id}: legacy install");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A flavor whose manifest names it but whose files went is never marked active.
+    #[test]
+    fn a_damaged_flavor_is_never_marked_active() {
+        let root = std::env::temp_dir().join(format!("bop-resolve-{}", uuid::Uuid::new_v4()));
+        let flavor = Flavor::Cpu;
+        let dir = root.join(flavor.dest());
+        let file = install(&dir, flavor.resource_id());
+        let resolution = Resolution {
+            needs: Vec::new(),
+            optional: Vec::new(),
+            models: Vec::new(),
+            ort_flavor: Some(flavor),
+            active_ort: None,
+            ort_pinned: false,
+            auto_download: true,
+        };
+        let ort_root = root.join(crate::backend::libs::ORT_DIR_NAME);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            super::super::manager::apply_ort_activation(&resolution, &root).unwrap(),
+            None
+        );
+        assert_eq!(crate::backend::libs::read_active_flavor(&ort_root), None);
+        // Intact: marked.
+        install(&dir, flavor.resource_id());
+        assert_eq!(
+            super::super::manager::apply_ort_activation(&resolution, &root).unwrap(),
+            Some(flavor)
+        );
+        assert_eq!(
+            crate::backend::libs::read_active_flavor(&ort_root).as_deref(),
+            Some(flavor.as_str())
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

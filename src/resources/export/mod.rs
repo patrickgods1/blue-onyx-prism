@@ -28,7 +28,9 @@
 //!   `YOLO_AUTOINSTALL=false`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` (nothing reaches the network or pip-installs anything), with its
 //!   settings and caches in our own `tools/export-config`.
 //! - **Contained**: everything lives under `<data root>/tools/` (see [`Paths`]); "Remove export
-//!   toolchain" deletes it. Each export runs in a fresh work directory under `tools/work/`.
+//!   toolchain" deletes it but the zero-byte lock files, and only while no export, training
+//!   setup or training holds `tools/.model-export.lock` or `tools/.train.lock` (`hold_tools`,
+//!   [`ToolsBusy`]). Each export runs in a fresh work directory under `tools/work/`.
 //!
 //! # Trust model of the child processes
 //!
@@ -324,13 +326,27 @@ fn marker_for(lock: &PackageLock) -> EnvMarker {
     }
 }
 
-/// The environment is complete and built from this binary's lock.
+/// The environment is complete and built from this binary's lock, and its base interpreter (the
+/// `home` of its `pyvenv.cfg`, under `tools/python`) is still there. A venv's interpreter is a
+/// link to, or on Windows a launcher of, that base: without it every Python step fails ("No
+/// Python at ..."), so such an environment is rebuilt rather than used (audit 2026-11: "Remove
+/// export toolchain" deletes `tools/python`, which `tools/train-env` shares).
 fn env_ready(paths: &Paths, platform: Platform, lock: &PackageLock) -> bool {
     let windows = platform.os == "windows";
     let marker: Option<EnvMarker> = std::fs::read(paths.env.join(ENV_MARKER))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
-    marker.is_some_and(|m| m == marker_for(lock)) && paths.env_python(windows).is_file()
+    marker.is_some_and(|m| m == marker_for(lock))
+        && paths.env_python(windows).is_file()
+        && base_python_present(&paths.env)
+}
+
+/// The base interpreter's directory named by `env/pyvenv.cfg` (`home = <dir>`) exists.
+fn base_python_present(env: &Path) -> bool {
+    std::fs::read_to_string(env.join("pyvenv.cfg"))
+        .ok()
+        .and_then(|text| vc_runtime::pyvenv_home(&text))
+        .is_some_and(|home| home.is_dir())
 }
 
 /// What of the toolchain is on disk.
@@ -397,16 +413,102 @@ pub fn manifest(res: &Resource, models: &Path) -> Option<Manifest> {
 }
 
 /// Delete the export toolchain (uv, Python, the environment, weights, work files, the DEIMv2
-/// source, the private Visual C++ runtime).
+/// source, the private Visual C++ runtime), holding both tool locks (`hold_tools`); refused
+/// with [`ToolsBusy`] while an export, a training environment setup or a training holds one.
+/// The training environment's ready marker goes too: `tools/python`, deleted here, is its base
+/// interpreter, so the next training rebuilds it. The lock files stay (see `hold_tools`).
 pub fn remove_toolchain(paths: &Paths) -> Result<()> {
+    let Some(_held) = hold_tools(paths)? else {
+        return Ok(());
+    };
     for d in paths.toolchain_dirs() {
         manager::remove_any(&d)?;
     }
-    let _ = std::fs::remove_file(paths.lock_file());
-    let _ = std::fs::remove_file(paths.tools.join(LOCKFILE_NAME));
-    // Only when nothing else is in there.
-    let _ = std::fs::remove_dir(&paths.tools);
+    manager::remove_any(&paths.tools.join(LOCKFILE_NAME))?;
+    manager::remove_any(&paths.tools.join(train::TRAIN_ENV_DIR).join(ENV_MARKER))?;
     Ok(())
+}
+
+/// The toolchain or the training environment is in use: an export, a training environment setup
+/// or a training (of this process or another) holds `tools/.model-export.lock` or
+/// `tools/.train.lock`. Removals refuse with it (HTTP 409); callers tell it apart with
+/// `anyhow::Error::is::<ToolsBusy>()`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct ToolsBusy(pub String);
+
+fn tools_busy(lock: &Path) -> ToolsBusy {
+    ToolsBusy(format!(
+        "an export, a training setup or a training is running (in this service or a \
+         `blue-onyx-prism fetch` / `train` command) and holds {}; wait for it to finish or \
+         cancel it, then remove again",
+        lock.display()
+    ))
+}
+
+/// Both tool locks, held by a removal under `tools/` for its whole length.
+#[derive(Debug)]
+pub(crate) struct ToolsHeld {
+    _train: train::TrainLock,
+    _export: ExportLock,
+}
+
+/// Take `tools/.train.lock`, then `tools/.model-export.lock` (a training's own order), each with
+/// [`train::LOCK_GRACE`] of retries; [`ToolsBusy`] when either stays held. None when there is no
+/// `tools` folder (nothing to remove, no lock to create). The lock files are never deleted: a
+/// holder keeps its lock on the unlinked file while the next taker creates a new one and also
+/// "gets" it.
+pub(crate) fn hold_tools(paths: &Paths) -> Result<Option<ToolsHeld>> {
+    if !paths.tools.is_dir() {
+        return Ok(None);
+    }
+    let train_lock = paths.tools.join(train::TRAIN_LOCK_NAME);
+    let Some(train) = train::TrainLock::try_hold(&train_lock)
+        .with_context(|| format!("locking {}", train_lock.display()))?
+    else {
+        return Err(anyhow!(tools_busy(&train_lock)));
+    };
+    let export_lock = paths.lock_file();
+    let Some(export) = ExportLock::try_acquire(&export_lock)
+        .with_context(|| format!("locking {}", export_lock.display()))?
+    else {
+        return Err(anyhow!(tools_busy(&export_lock)));
+    };
+    Ok(Some(ToolsHeld {
+        _train: train,
+        _export: export,
+    }))
+}
+
+/// Why the toolchain cannot be removed now, from one look at its locks without waiting (for the
+/// Resources card and the Remove button's refusal; the removal itself takes them,
+/// `hold_tools`). Opens existing lock files only, creates nothing.
+pub fn tools_in_use(paths: &Paths) -> Option<String> {
+    [paths.tools.join(train::TRAIN_LOCK_NAME), paths.lock_file()]
+        .into_iter()
+        .find(|p| lock_held_now(p))
+        .map(|p| tools_busy(&p).0)
+}
+
+/// Another handle holds the fs4 lock on the existing file `path` (one try, no wait).
+fn lock_held_now(path: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return false;
+    };
+    matches!(
+        crate::fsx::lock_wait_with(
+            &file,
+            crate::fsx::LockKind::Exclusive,
+            None,
+            crate::fsx::Pauses::fixed(Duration::ZERO),
+            || false,
+        ),
+        Ok(crate::fsx::Waited::Stopped)
+    )
 }
 
 /// OpenVINO IR of an export of `res` (`<name>.xml`, `<name>.bin`): written into the models
@@ -508,6 +610,7 @@ pub fn remove_export(res: &Resource, paths: &Paths, cache_dir: Option<&Path>) ->
 }
 
 /// Exclusive cross-process export lock; released on drop.
+#[derive(Debug)]
 struct ExportLock {
     _file: std::fs::File,
 }

@@ -1,7 +1,8 @@
 //! Writing the saved benchmark results safely: one writer at a time, whole files only.
 //!
 //! - **The results lock** ([`lock`]): every load-modify-save of `benchmark.json` and the files
-//!   saved with it (`benchmark-gt.json`, `benchmark-preds.json`) holds it, never longer than
+//!   saved with it (`benchmark-gt.json`, `benchmark-preds.json`, `benchmark-history.json`: a
+//!   record, a forget, a pin or a delete) holds it, never longer than
 //!   that one load-modify-save (never across a run): a run's save of each
 //!   model and its final tidy-up (service and CLI), a Re-score of Your cameras (route and
 //!   `benchmark --rescore`), the re-rank of saved results for new settings and the removal of a

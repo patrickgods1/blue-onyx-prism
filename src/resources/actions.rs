@@ -458,7 +458,15 @@ pub fn remove(
             }
         }
         ResourceKind::Tool => {
-            export::remove_toolchain(&paths).map_err(|e| ActionError::Failed(format!("{e:#}")))?;
+            // A lock taken between `remove_blocked` and here (a job, setup or export that just
+            // started) is a refusal in the current state, not a failure.
+            export::remove_toolchain(&paths).map_err(|e| {
+                if e.is::<export::ToolsBusy>() {
+                    ActionError::Conflict(format!("cannot remove {}: {e:#}", res.title))
+                } else {
+                    ActionError::Failed(format!("{e:#}"))
+                }
+            })?;
             // The manager remembers the uv and weights downloads as installed.
             if let Some(m) = ctx.and_then(|c| c.provisioner.manager()) {
                 for s in m.statuses().iter().filter(|s| {

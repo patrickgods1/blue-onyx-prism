@@ -1155,7 +1155,8 @@ pub fn jobs_for(
 }
 
 /// Mark the resolution's wanted ORT flavor active when it is already installed under `root`
-/// (no download needed). Returns the flavor marked.
+/// (no download needed): its manifest names it and its files are intact ([`install_damage`]; a
+/// damaged flavor is downloaded again, never marked active). Returns the flavor marked.
 pub fn apply_ort_activation(
     resolution: &super::resolve::Resolution,
     root: &Path,
@@ -1164,7 +1165,10 @@ pub fn apply_ort_activation(
         return Ok(None);
     };
     let dir = root.join(f.dest());
-    if read_manifest(&dir.join(MANIFEST_FILE)).is_some_and(|m| m.id == f.resource_id()) {
+    let manifest = dir.join(MANIFEST_FILE);
+    if read_manifest(&manifest).is_some_and(|m| m.id == f.resource_id())
+        && install_damage(&manifest, &dir).is_none()
+    {
         let ort_root = root.join(crate::backend::libs::ORT_DIR_NAME);
         crate::backend::libs::write_active_flavor(&ort_root, f.as_str())
             .with_context(|| format!("marking {f} active in {}", ort_root.display()))?;

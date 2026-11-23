@@ -12,6 +12,12 @@
 //! stops, [`stop_for_exit`] interrupts the job (its checkpoint kept), shuts the queue down and
 //! empties its slot: nothing of the finished run is kept, and the next run of the same process (an
 //! in-process restart of the Windows service) starts a fresh queue on its own state.
+//!
+//! The queue owns its training folder ([`crate::training::task::QueueLock`]). While a `train`
+//! command of another process owns it, the queue is a guest ([`TrainingService::foreign_owner`]):
+//! the page shows that process's records, read afresh at each call, every job and removal is
+//! refused with a message naming the folder, and each call tries the lock again
+//! ([`TrainingService::refresh`]).
 
 use super::train_area::{AUTOLABEL, IMPORT, MODELS, TRAIN, jobs_tab, tab_title};
 use super::{AppState, Shared, blocking, render, save_config};
@@ -86,7 +92,7 @@ pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
 }
 
 /// The started queue, if any (readers: they show the files otherwise).
-fn started_queue() -> Option<Arc<TrainingService>> {
+pub(super) fn started_queue() -> Option<Arc<TrainingService>> {
     QUEUE.get()
 }
 
@@ -270,19 +276,32 @@ impl crate::resources::export::Fetcher for RunFetcher {
 
 /// Keep the started queue on the configured training folder (`training.dir` saved on this page,
 /// or edited on disk: then at the next queue, import, auto-label or remove): it moves when idle
-/// ([`TrainingService::set_store`]); while a job is queued or running it stays with the job and
-/// moves on a later call. Reads (the page, `GET /v1/training`) never move it.
+/// ([`TrainingService::set_store`]); while a job is queued or running, or while another process
+/// owns the new folder, it stays and moves on a later call. A guest on the right folder tries to
+/// own it again ([`TrainingService::refresh`]). Reads (the page, `GET /v1/training`) never move it.
 fn sync_store(svc: &TrainingService, want: &std::path::Path) {
-    if svc.store().as_deref() != Some(want)
-        && let Err(e) = svc.set_store(want)
-    {
-        tracing::debug!("training folder {} not used yet: {e}", want.display());
+    if svc.store().as_deref() != Some(want) {
+        if let Err(e) = svc.set_store(want) {
+            tracing::debug!("training folder {} not used yet: {e}", want.display());
+        }
+    } else {
+        svc.refresh();
     }
 }
 
-/// The import and auto-label jobs (the queue's, else `tasks.json`).
+/// The started queue, its records brought up to date first when it is a guest (another process
+/// owns its folder: [`TrainingService::refresh`] reads that process's records, or takes the folder
+/// over once it is free).
+fn started_fresh() -> Option<Arc<TrainingService>> {
+    let s = started_queue()?;
+    s.refresh();
+    Some(s)
+}
+
+/// The import and auto-label jobs (the queue's, else `tasks.json` read as a reader:
+/// [`crate::training::task::load_records`] never writes it).
 pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> {
-    match started_queue() {
+    match started_fresh() {
         Some(s) => s.tasks(),
         None => crate::training::task::load_records(&crate::training::task::tasks_file(
             &crate::training::runs_file(&state.config_read()),
@@ -291,9 +310,10 @@ pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> 
 }
 
 /// A training run or task of this process's queue is queued or running, so it may be using the
-/// GPU. A `train` command in another process is not seen.
+/// GPU. A `train` command in another process is seen once this process's queue has started on
+/// its folder (the queue is then a guest showing that process's records); before that it is not.
 pub(crate) fn queue_busy() -> bool {
-    started_queue().is_some_and(|s| s.busy())
+    started_fresh().is_some_and(|s| s.busy())
 }
 
 /// The clock of job `id` ([`TrainingService::timing`]).
@@ -302,9 +322,11 @@ pub(super) fn job_timing(id: &str) -> Option<crate::training::eta::JobTiming> {
 }
 
 /// [`runs`] without their epochs, for readers that do not show them (the Jobs list, the storage
-/// card): no history file is read and no history cloned.
+/// card): no history file is read and no history cloned. Before the queue starts, `runs.json` as a
+/// reader sees it ([`crate::training::service::load_bare_records`]: never written, a run another
+/// process trains keeps its state).
 pub(super) fn records(state: &AppState) -> Vec<RunRecord> {
-    match started_queue() {
+    match started_fresh() {
         Some(s) => s.records(),
         None => crate::training::service::load_bare_records(&crate::training::runs_file(
             &state.config_read(),
@@ -324,9 +346,10 @@ pub(super) fn records_read_only(state: &AppState) -> Vec<RunRecord> {
     }
 }
 
-/// The queue if it was started (the page shows `runs.json` otherwise).
+/// The queue if it was started (the page shows `runs.json` otherwise, as a reader:
+/// [`crate::training::service::load_records`]).
 pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
-    match started_queue() {
+    match started_fresh() {
         Some(s) => s.runs(),
         None => crate::training::service::load_records(&crate::training::runs_file(
             &state.config_read(),
@@ -3584,43 +3607,53 @@ pub(super) async fn datasets(
 /// `POST /training/dir` (`training_dir`; empty = the default `<data root>/training`): the
 /// training folder (`training.dir`), saved with [`save_config`]. The folder must exist and pass
 /// [`checked_folder`]. Refused (409) while a run or task is queued or running; otherwise the
-/// queue moves to the new folder at once ([`sync_store`]): runs, imports and exports in the old
-/// folder stay there.
+/// save and the queue's move to the new folder ([`sync_store`]) run with every enqueue held off
+/// ([`while_queue_idle`]), so no job is queued into the old folder in between: runs, imports
+/// and exports in the old folder stay there.
 pub(super) async fn set_dir(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
-        if started_queue().is_some_and(|s| s.busy()) {
-            return (
+        let refused = |message: String| {
+            (
                 StatusCode::CONFLICT,
-                render(&view(
-                    &state,
-                    TRAIN,
-                    None,
-                    Some(
-                        "Not saved: a training run, import or auto-label job is queued or \
-                         running; wait for it or cancel it, then change the training folder."
-                            .into(),
-                    ),
-                )),
+                render(&view(&state, TRAIN, None, Some(message))),
             )
-                .into_response();
+                .into_response()
+        };
+        if started_queue().is_some_and(|s| s.busy()) {
+            return refused(
+                "Not saved: a training run, import or auto-label job is queued or running; wait \
+                 for it or cancel it, then change the training folder."
+                    .into(),
+            );
         }
         let f = super::dataset::parse_form(&body);
         let config = state.config_read().clone();
-        let result = (|| -> anyhow::Result<String> {
-            let root = config.data_root();
-            let new = checked_folder(
-                "training folder",
-                field(&f, "training_dir"),
-                &root,
-                &allow_in(&config),
-            )?;
+        let root = config.data_root();
+        let new = match checked_folder(
+            "training folder",
+            field(&f, "training_dir"),
+            &root,
+            &allow_in(&config),
+        ) {
             // The default folder is kept as the default (it follows the data root).
-            let default = crate::training::config::TrainingConfig::default().dir_in(&root);
-            let new = new.filter(|p| default.canonicalize().ok().as_ref() != Some(p));
-            let old = crate::training::training_dir(&config);
+            Ok(new) => {
+                let default = crate::training::config::TrainingConfig::default().dir_in(&root);
+                new.filter(|p| default.canonicalize().ok().as_ref() != Some(p))
+            }
+            Err(e) => {
+                return render(&view(
+                    &state,
+                    TRAIN,
+                    None,
+                    Some(format!("Not saved: {e:#}")),
+                ));
+            }
+        };
+        let save = || -> anyhow::Result<String> {
+            let old = crate::training::training_dir(&state.config_read());
             let saved = save_config(&state, "training page", |c| {
                 c.training.dir.clone_from(&new);
                 Ok(())
@@ -3639,10 +3672,11 @@ pub(super) async fn set_dir(
                     old.display()
                 )
             })
-        })();
-        match result {
-            Ok(m) => render(&view(&state, TRAIN, Some(m), None)),
-            Err(e) => render(&view(
+        };
+        match while_queue_idle(started_queue().as_deref(), save) {
+            Err(why) => refused(format!("Not saved: {why}.")),
+            Ok(Ok(m)) => render(&view(&state, TRAIN, Some(m), None)),
+            Ok(Err(e)) => render(&view(
                 &state,
                 TRAIN,
                 None,
@@ -3653,38 +3687,58 @@ pub(super) async fn set_dir(
     .await
 }
 
-/// `POST /training/remove-env`: delete the training environment (refused while a run is busy).
+/// `POST /training/remove-env`: delete the training environment ([`remove_env_in`]).
 pub(super) async fn remove_env(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
-        if started_queue().is_some_and(|s| s.busy()) {
-            return (
-                StatusCode::CONFLICT,
-                render(&view(
-                    &state,
-                    TRAIN,
-                    None,
-                    Some("A run is queued or running; cancel it first.".into()),
-                )),
-            )
-                .into_response();
-        }
         let paths = TrainPaths::for_config(&state.config_read());
-        match env::remove_train_env(&paths) {
-            Ok(()) => render(&view(
-                &state,
-                TRAIN,
-                Some("Removed the training environment.".into()),
-                None,
-            )),
-            Err(e) => render(&view(
-                &state,
-                TRAIN,
-                None,
-                Some(format!("Not removed: {e:#}")),
-            )),
+        match remove_env_in(started_queue().as_deref(), &paths) {
+            Ok(message) => render(&view(&state, TRAIN, Some(message), None)),
+            Err((code, message)) => {
+                (code, render(&view(&state, TRAIN, None, Some(message)))).into_response()
+            }
         }
     })
     .await
+}
+
+/// Run `act` with every enqueue of `queue` held off ([`TrainingService::while_idle`]); refused
+/// with its reason while the queue is busy or stopped. Without a started queue nothing of this
+/// process can run, so `act` runs at once (the tool locks cover a job that starts meanwhile).
+fn while_queue_idle<T>(
+    queue: Option<&TrainingService>,
+    act: impl FnOnce() -> T,
+) -> Result<T, String> {
+    match queue {
+        Some(q) => q.while_idle(&|_, _| None, act),
+        None => Ok(act()),
+    }
+}
+
+/// Delete the training environment under `paths`: refused (409) while `queue` has a job queued
+/// or running, and while a training, import, auto-label, dataset check, environment setup or
+/// export of any process holds a tool lock ([`env::remove_train_env`], [`ToolsBusy`]). The
+/// removal runs with enqueues held off ([`while_queue_idle`]). Another failure is shown with
+/// 200, as the page always did.
+///
+/// [`ToolsBusy`]: crate::resources::export::ToolsBusy
+fn remove_env_in(
+    queue: Option<&TrainingService>,
+    paths: &TrainPaths,
+) -> Result<String, (StatusCode, String)> {
+    if queue.is_some_and(TrainingService::busy) {
+        return Err((
+            StatusCode::CONFLICT,
+            "A run is queued or running; cancel it first.".into(),
+        ));
+    }
+    match while_queue_idle(queue, || env::remove_train_env(paths)) {
+        Err(why) => Err((StatusCode::CONFLICT, format!("Not removed: {why}."))),
+        Ok(Ok(())) => Ok("Removed the training environment.".into()),
+        Ok(Err(e)) if e.is::<crate::resources::export::ToolsBusy>() => {
+            Err((StatusCode::CONFLICT, format!("Not removed: {e:#}.")))
+        }
+        Ok(Err(e)) => Err((StatusCode::OK, format!("Not removed: {e:#}"))),
+    }
 }
 
 #[cfg(test)]
@@ -6603,5 +6657,169 @@ pub(super) mod tests {
         assert!(page.contains("value=\"6\">"));
         assert!(page.contains("name=\"balance_cap_on\" id=\"train-bal-cap-on\" checked>"));
         assert!(page.contains("value=\"2.5\""));
+    }
+
+    /// A task that ends at once, or (`hold`) runs until cancelled.
+    struct EnvTask {
+        id: &'static str,
+        hold: bool,
+    }
+
+    impl crate::training::task::Task for EnvTask {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn kind(&self) -> crate::training::task::TaskKind {
+            crate::training::task::TaskKind::Import
+        }
+        fn title(&self) -> String {
+            self.id.into()
+        }
+        fn steps(&self) -> usize {
+            1
+        }
+        fn run(
+            &self,
+            _ctx: crate::training::task::TaskContext<'_>,
+            _report: &mut dyn FnMut(crate::training::task::TaskReport<'_>),
+            cancel: &AtomicBool,
+        ) -> anyhow::Result<crate::training::task::TaskOutcome> {
+            while self.hold && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(crate::training::task::TaskOutcome {
+                summary: "done".into(),
+                result: serde_json::Value::Null,
+            })
+        }
+    }
+
+    fn env_queue() -> Arc<TrainingService> {
+        let fake = Arc::new(crate::resources::export::fake::Fake::new());
+        TrainingService::start(
+            fake.clone(),
+            fake,
+            Arc::new(crate::training::job::NoHooks),
+            None,
+        )
+    }
+
+    /// A training environment on disk under a fresh root.
+    fn env_on_disk(tag: &str) -> (PathBuf, TrainPaths) {
+        let root =
+            std::env::temp_dir().join(format!("bop-remove-env-{tag}-{}", uuid::Uuid::new_v4()));
+        let paths = TrainPaths::new(&root, root.join("models"));
+        std::fs::create_dir_all(&paths.export.env).unwrap();
+        std::fs::write(paths.export.env.join("pyvenv.cfg"), b"home = x").unwrap();
+        (root, paths)
+    }
+
+    /// Audit 2026-11 (QA-021): Remove training environment and the training folder's save run
+    /// with every enqueue held off: a job queued from another request while the action runs
+    /// waits until it returns, so no job starts on an environment being deleted or is queued
+    /// into the old folder.
+    #[test]
+    fn an_enqueue_waits_for_the_idle_action() {
+        let q = env_queue();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let queued = Arc::new(AtomicBool::new(false));
+        let action = {
+            let (q, entered, release) = (q.clone(), entered.clone(), release.clone());
+            std::thread::spawn(move || {
+                while_queue_idle(Some(&q), || {
+                    entered.wait();
+                    release.wait();
+                })
+            })
+        };
+        entered.wait();
+        let enqueue = {
+            let (q, queued) = (q.clone(), queued.clone());
+            std::thread::spawn(move || {
+                q.enqueue_task(Box::new(EnvTask {
+                    id: "after",
+                    hold: false,
+                }))
+                .unwrap();
+                queued.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !queued.load(std::sync::atomic::Ordering::SeqCst),
+            "the enqueue waits for the action"
+        );
+        release.wait();
+        action.join().unwrap().unwrap();
+        enqueue.join().unwrap();
+        assert!(queued.load(std::sync::atomic::Ordering::SeqCst));
+        // A busy queue refuses the action without running it.
+        q.enqueue_task(Box::new(EnvTask {
+            id: "holds",
+            hold: true,
+        }))
+        .unwrap();
+        let ran = AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !q.busy() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            while_queue_idle(Some(&q), || ran
+                .store(true, std::sync::atomic::Ordering::SeqCst))
+            .is_err()
+        );
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        q.cancel("holds");
+        q.shutdown();
+    }
+
+    /// Audit 2026-11 (RA-052, QA-021): a training, import or auto-label of another process (here
+    /// another handle) holds `tools/.train.lock`: 409 and nothing removed, with or without a
+    /// queue in this process. Once free, the environment goes and the lock file stays.
+    #[test]
+    fn remove_env_refuses_a_held_training_lock() {
+        let (root, paths) = env_on_disk("locked");
+        let q = env_queue();
+        let held = env::TrainLock::try_acquire(&paths.train_lock_file()).unwrap();
+        for queue in [None, Some(&*q)] {
+            let (code, message) = remove_env_in(queue, &paths).unwrap_err();
+            assert_eq!(code, StatusCode::CONFLICT, "{message}");
+            assert!(message.contains("wait for it to finish"), "{message}");
+            assert!(
+                paths.export.env.join("pyvenv.cfg").exists(),
+                "nothing removed"
+            );
+        }
+        drop(held);
+        assert_eq!(
+            remove_env_in(Some(&q), &paths).unwrap(),
+            "Removed the training environment."
+        );
+        assert!(!paths.export.env.exists());
+        assert!(paths.train_lock_file().is_file(), "the lock file stays");
+        q.shutdown();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A job queued or running in this process: 409 with the page's sentence, nothing removed.
+    #[test]
+    fn remove_env_refuses_a_busy_queue() {
+        let (root, paths) = env_on_disk("busy");
+        let q = env_queue();
+        q.enqueue_task(Box::new(EnvTask {
+            id: "holds",
+            hold: true,
+        }))
+        .unwrap();
+        let (code, message) = remove_env_in(Some(&q), &paths).unwrap_err();
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(message, "A run is queued or running; cancel it first.");
+        assert!(paths.export.env.exists());
+        q.cancel("holds");
+        q.shutdown();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

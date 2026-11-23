@@ -22,9 +22,16 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// The file, under the data root.
 pub const BREADCRUMB_FILE: &str = "benchmark-breadcrumb.json";
+
+/// How long a run waits for a lock that looks held before it takes it for another run's: the
+/// probes of [`left_behind`] and [`clear`] hold it for microseconds.
+const HELD_WAIT: Duration = Duration::from_millis(300);
+/// Opens a run tries when the path stops naming the file it locked.
+const OPEN_TRIES: usize = 5;
 
 /// What a run was about to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,25 +175,53 @@ impl Trail {
 
     /// The file, created and locked; None when another run holds it.
     fn open(&self) -> std::io::Result<Option<File>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        self.open_with(&|_| {})
+    }
+
+    /// [`Self::open`]; `between` runs after the file is opened and before it is locked (a test
+    /// seam: a probe unlinking the path there).
+    ///
+    /// Two things keep a run from writing a breadcrumb nobody will find. A probe
+    /// ([`left_behind`], [`clear`]) takes the same lock for a moment, so a held lock is waited
+    /// for [`HELD_WAIT`] before it counts as another run's (a run that started during a page
+    /// load's probe would otherwise write nothing for its whole life). And a probe removes the
+    /// file while it holds the lock, so a handle opened just before may name an unlinked file:
+    /// once locked, the path must still be this file, else it is opened again.
+    fn open_with(&self, between: &dyn Fn(&Path)) -> std::io::Result<Option<File>> {
+        for _ in 0..OPEN_TRIES {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&self.path)?;
+            between(&self.path);
+            let waited = crate::fsx::lock_wait_with(
+                &file,
+                crate::fsx::LockKind::Exclusive,
+                crate::fsx::deadline_after(HELD_WAIT),
+                crate::fsx::Pauses::doubling(Duration::from_millis(1), Duration::from_millis(20)),
+                || true,
+            )?;
+            if waited != crate::fsx::Waited::Held {
+                return Ok(None);
+            }
+            if !names_file(&file, &self.path) {
+                continue;
+            }
+            // A new name lives in its directory: flush that too. Directories cannot be opened
+            // like this on Windows, where the journal covers the name.
+            if let Some(dir) = self.path.parent()
+                && let Ok(d) = File::open(dir)
+            {
+                let _ = d.sync_all();
+            }
+            return Ok(Some(file));
         }
-        // A new name lives in its directory: flush that too. Directories cannot be opened like
-        // this on Windows, where the journal covers the name.
-        if let Some(dir) = self.path.parent()
-            && let Ok(d) = File::open(dir)
-        {
-            let _ = d.sync_all();
-        }
-        Ok(Some(file))
+        Err(std::io::Error::other(format!(
+            "{} was removed again and again while it was being locked",
+            self.path.display()
+        )))
     }
 
     fn warn(&self, e: &std::io::Error) {
@@ -196,6 +231,42 @@ impl Trail {
             self.path.display()
         );
     }
+}
+
+/// Whether `path` still names the open `file` (a probe may have removed it, or removed it and
+/// a newer run made a new one): same device and file number on Unix, the volume serial and
+/// file index on Windows. False when the path is gone.
+#[cfg(unix)]
+fn names_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn names_file(file: &File, path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `FILE_READ_ATTRIBUTES`; the lock holder may have the file open for more.
+    const READ_ATTRIBUTES: u32 = 0x80;
+    let Ok(other) = OpenOptions::new().access_mode(READ_ATTRIBUTES).open(path) else {
+        return false;
+    };
+    match (
+        winapi_util::file::information(file),
+        winapi_util::file::information(&other),
+    ) {
+        (Ok(a), Ok(b)) => {
+            a.volume_serial_number() == b.volume_serial_number() && a.file_index() == b.file_index()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn names_file(_file: &File, _path: &Path) -> bool {
+    true
 }
 
 fn write_crumb(file: &mut File, crumb: &Left) -> std::io::Result<()> {
@@ -259,8 +330,11 @@ pub(crate) fn left_behind(data_root: &Path) -> Option<Left> {
     match read.ok().and_then(|_| serde_json::from_str(&text).ok()) {
         Some(crumb) => Some(crumb),
         None => {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
+            // Still under the lock, so a run starting now never has its file removed.
+            if std::fs::remove_file(&path).is_err() {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
             None
         }
     }
@@ -272,9 +346,13 @@ pub(super) fn clear(data_root: &Path) {
     if let Ok(file) = File::open(&path)
         && file.try_lock().is_ok()
     {
-        drop(file);
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!("could not remove {}: {e}", path.display());
+        // Under the lock (as `Trail::drop` does): a run starting now never has its file removed.
+        // Where that is refused, after the lock is released.
+        if std::fs::remove_file(&path).is_err() {
+            drop(file);
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::warn!("could not remove {}: {e}", path.display());
+            }
         }
     }
 }
@@ -415,6 +493,79 @@ mod tests {
         assert!(!path_in(&root).exists());
         let trail = Trail::new(&root.join("gone"));
         trail.note("ort:cpu", "m");
+        drop(trail);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A probe (a page load's `clear` / `left_behind`) holding the lock for a moment while a run
+    /// starts: the run waits and still writes its breadcrumb.
+    #[test]
+    fn a_run_starting_during_a_probe_still_writes() {
+        let root = tmp();
+        let probe = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path_in(&root))
+            .unwrap();
+        probe.try_lock().unwrap();
+        let trail = Trail::new(&root);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                drop(probe);
+            });
+            trail.note("ort:cpu", "m");
+        });
+        assert_eq!(trail.recorded().device, "ort:cpu");
+        drop(trail);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A probe removed the file between the run's open and its lock: the run must not keep
+    /// writing to the unlinked file; it opens the path again.
+    #[test]
+    fn a_path_removed_between_open_and_lock_is_opened_again() {
+        let root = tmp();
+        let trail = Trail::new(&root);
+        let first = std::cell::Cell::new(true);
+        let mut file = trail
+            .open_with(&|p| {
+                if first.replace(false) {
+                    std::fs::remove_file(p).unwrap();
+                }
+            })
+            .unwrap()
+            .expect("locked");
+        // Checked through the path, not through `names_file`: what the run writes must be what
+        // a later start reads. Read once the handle is closed: on Windows its lock is mandatory,
+        // so a read beside it fails.
+        std::io::Write::write_all(&mut file, b"written by the run").unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::read(path_in(&root)).ok().as_deref(),
+            Some(&b"written by the run"[..]),
+            "the run holds a file the path no longer names"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `clear` removes the file under its lock: after it, a run can open a fresh one.
+    #[test]
+    fn clear_and_left_behind_remove_what_they_report() {
+        let root = tmp();
+        std::fs::write(
+            path_in(&root),
+            br#"{"device":"ort:cpu","model":"m","time":"2026-11-06T10:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(left_behind(&root).is_some());
+        clear(&root);
+        assert!(!path_in(&root).exists());
+        let trail = Trail::new(&root);
+        trail.note("ort:cpu", "m");
+        assert_eq!(trail.recorded().model, "m");
         drop(trail);
         std::fs::remove_dir_all(&root).ok();
     }

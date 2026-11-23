@@ -209,11 +209,16 @@ fn a_running_task_pauses_resumes_keeps_its_place_and_cancels_while_paused() {
     until("the helper to see the pause", || {
         runner.paused.load(Ordering::Relaxed)
     });
-    // Persisted as paused (a restart turns it into the interrupted failure).
+    // Persisted as paused (a restart turns it into the interrupted failure); a reader sees it
+    // paused while this queue owns the folder, never interrupted.
     let raw = std::fs::read_to_string(dir.join(task::TASKS_FILE)).unwrap();
     assert!(raw.contains(r#""state": "paused""#), "{raw}");
     let back = task::load_records(&dir.join(task::TASKS_FILE));
-    assert_eq!(back[0].state, RunState::Failed);
+    assert_eq!(back[0].state, RunState::Paused);
+    assert_eq!(
+        std::fs::read_to_string(dir.join(task::TASKS_FILE)).unwrap(),
+        raw
+    );
     // The paused job keeps its place.
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(state(&svc, &second), RunState::Queued);
@@ -1015,4 +1020,376 @@ fn a_panic_message_is_read_from_either_payload() {
     assert_eq!(panic_text(p.as_ref()), "formatted 3");
     let p = std::panic::catch_unwind(|| std::panic::panic_any(7u8)).unwrap_err();
     assert_eq!(panic_text(p.as_ref()), "a panic without a message");
+}
+
+fn hold_service(runner: &Arc<HoldRunner>, store: Option<PathBuf>) -> Arc<TrainingService> {
+    TrainingService::start(
+        runner.clone(),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        store,
+    )
+}
+
+fn lock_of(store: &Path) -> PathBuf {
+    task::queue_lock_file(store)
+}
+
+/// QA-012 / RA-053: two queues on one folder (the service and a `train` command). The second is a
+/// guest: it shows the owner's running job as running, refuses every job and removal with the
+/// message naming the folder, cancels nothing, writes nothing, and the CLI's start is refused.
+/// Once the owner is gone, the guest's next refresh makes it the owner.
+#[test]
+fn a_second_queue_on_a_folder_is_a_guest_until_the_owner_is_gone() {
+    let dir = std::env::temp_dir().join(format!("bop-queue-guest-{}", uuid::Uuid::new_v4()));
+    let store = dir.join(RUNS_FILE);
+    let runner = Arc::new(HoldRunner::default());
+    let owner = hold_service(&runner, Some(store.clone()));
+    assert!(!owner.foreign_owner());
+    assert!(lock_of(&store).is_file());
+    let id = owner
+        .enqueue_task(Box::new(HoldTask {
+            id: "busy".into(),
+            keep: false,
+        }))
+        .unwrap();
+    until("the owner's job", || {
+        runner.started.load(Ordering::Relaxed) == 1
+    });
+    until("its stage saved", || {
+        task::read_records::<TaskRecord>(&task::tasks_file(&store))
+            .first()
+            .is_some_and(|r| r.state == RunState::Running && r.stage.is_some())
+    });
+    let tasks_file = task::tasks_file(&store);
+    let before = (
+        std::fs::read(&tasks_file).unwrap(),
+        std::fs::read(&store).ok(),
+    );
+    let guest = hold_service(&runner, Some(store.clone()));
+    assert!(guest.foreign_owner());
+    assert_eq!(guest.store().as_deref(), Some(store.as_path()));
+    assert_eq!(guest.get_task(&id).unwrap().state, RunState::Running);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let refusal = guest_refusal(&dir);
+    assert!(
+        refusal.starts_with(
+            "another blue-onyx-prism process (a `train` command) is using the training folder"
+        ),
+        "{refusal}"
+    );
+    assert_eq!(
+        guest
+            .enqueue_task(Box::new(QuickTask::new("q", None, &ran)))
+            .unwrap_err(),
+        refusal
+    );
+    assert_eq!(guest.remove(&id).unwrap_err(), refusal);
+    assert_eq!(guest.while_idle(&|_, _| None, || ()).unwrap_err(), refusal);
+    assert!(
+        !guest.cancel(&id),
+        "the owner's job is not the guest's to cancel"
+    );
+    // Still a guest after a refresh, which reads the owner's records again.
+    guest.refresh();
+    assert!(guest.foreign_owner());
+    assert_eq!(guest.get_task(&id).unwrap().state, RunState::Running);
+    // A CLI command refuses to run at all.
+    let e = TrainingService::start_owner(
+        runner.clone(),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        store.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(e, owner_refusal(&dir));
+    assert!(e.starts_with("the service's training queue owns "), "{e}");
+    assert!(
+        e.ends_with("; queue it on the Train tab, or stop the service and run the command again"),
+        "{e}"
+    );
+    assert_eq!(
+        (
+            std::fs::read(&tasks_file).unwrap(),
+            std::fs::read(&store).ok()
+        ),
+        before,
+        "nobody but the owner wrote"
+    );
+    assert_eq!(owner.get_task(&id).unwrap().state, RunState::Running);
+
+    // The owner ends its job and goes: the guest owns the folder on its next refresh.
+    assert!(owner.cancel(&id));
+    owner.wait_task(&id, Duration::from_secs(10)).unwrap();
+    owner.shutdown();
+    assert!(
+        !task::queue_owned(&lock_of(&store)),
+        "a shut-down queue lets go"
+    );
+    guest.refresh();
+    assert!(!guest.foreign_owner());
+    assert!(task::queue_owned(&lock_of(&store)));
+    assert_eq!(guest.get_task(&id).unwrap().state, RunState::Cancelled);
+    let q = guest
+        .enqueue_task(Box::new(QuickTask::new("q", None, &ran)))
+        .unwrap();
+    assert_eq!(
+        guest.wait_task(&q, Duration::from_secs(10)).unwrap().state,
+        RunState::Done
+    );
+    drop(guest);
+    assert!(
+        !task::queue_owned(&lock_of(&store)),
+        "a dropped queue lets go"
+    );
+    assert!(lock_of(&store).is_file(), "the lock file is never deleted");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The guest never turns the owner's running record into an interrupted one, in memory or on
+/// disk; the owner that opens a folder nobody holds does, and saves it.
+#[test]
+fn only_an_owner_interrupts_a_busy_record_and_saves_it() {
+    let dir = std::env::temp_dir().join(format!("bop-queue-interrupt-{}", uuid::Uuid::new_v4()));
+    let store = dir.join(RUNS_FILE);
+    let tasks_file = task::tasks_file(&store);
+    let mut rec = TaskRecord::new(
+        &HoldTask {
+            id: "elsewhere".into(),
+            keep: false,
+        },
+        "c".into(),
+    );
+    rec.state = RunState::Running;
+    task::save_records(&tasks_file, &[rec]);
+    let saved = std::fs::read(&tasks_file).unwrap();
+    let other = task::QueueLock::try_take(&lock_of(&store), Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    let runner = Arc::new(HoldRunner::default());
+    let guest = hold_service(&runner, Some(store.clone()));
+    assert!(guest.foreign_owner());
+    assert_eq!(guest.tasks()[0].state, RunState::Running);
+    guest.shutdown();
+    assert_eq!(std::fs::read(&tasks_file).unwrap(), saved);
+    drop(other);
+    let owner = hold_service(&runner, Some(store.clone()));
+    assert!(!owner.foreign_owner());
+    assert_eq!(owner.tasks()[0].state, RunState::Failed);
+    let on_disk = task::read_records::<TaskRecord>(&tasks_file);
+    assert_eq!(on_disk[0].state, RunState::Failed, "saved at the open");
+    assert!(
+        on_disk[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("interrupted")
+    );
+    owner.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `set_store` takes the new folder's lock before it lets the old one go, and refuses a folder
+/// another queue owns, staying where it was.
+#[test]
+fn set_store_moves_the_folders_lock_and_refuses_an_owned_folder() {
+    let dir = std::env::temp_dir().join(format!("bop-queue-move-{}", uuid::Uuid::new_v4()));
+    let (a, b, c) = (
+        dir.join("a").join(RUNS_FILE),
+        dir.join("b").join(RUNS_FILE),
+        dir.join("c").join(RUNS_FILE),
+    );
+    let runner = Arc::new(HoldRunner::default());
+    let svc = hold_service(&runner, Some(a.clone()));
+    assert!(task::queue_owned(&lock_of(&a)));
+    assert!(svc.set_store(&b).unwrap());
+    assert!(!task::queue_owned(&lock_of(&a)), "the old folder is free");
+    assert!(task::queue_owned(&lock_of(&b)));
+    let held = task::QueueLock::try_take(&lock_of(&c), Duration::ZERO)
+        .unwrap()
+        .unwrap();
+    let e = svc.set_store(&c).unwrap_err();
+    assert_eq!(e, guest_refusal(&dir.join("c")));
+    assert_eq!(svc.store().as_deref(), Some(b.as_path()), "it stays");
+    assert!(!svc.foreign_owner());
+    assert!(task::queue_owned(&lock_of(&b)), "and keeps its lock");
+    drop(held);
+    assert!(svc.set_store(&c).unwrap());
+    assert!(!task::queue_owned(&lock_of(&b)));
+    svc.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stop for exit that leaves its thread behind still lets the folder go: the next queue of
+/// the process (an in-process restart) owns it.
+#[test]
+fn stop_for_exit_lets_the_folder_go_even_with_its_thread_left_behind() {
+    struct Stuck(Arc<AtomicBool>);
+    impl Task for Stuck {
+        fn id(&self) -> &str {
+            "stuck"
+        }
+        fn kind(&self) -> task::TaskKind {
+            task::TaskKind::Import
+        }
+        fn title(&self) -> String {
+            "stuck".into()
+        }
+        fn steps(&self) -> usize {
+            1
+        }
+        fn run(
+            &self,
+            _ctx: TaskContext<'_>,
+            _report: &mut dyn FnMut(TaskReport<'_>),
+            _cancel: &AtomicBool,
+        ) -> Result<task::TaskOutcome> {
+            while !self.0.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            anyhow::bail!("ended late")
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("bop-queue-exit-lock-{}", uuid::Uuid::new_v4()));
+    let store = dir.join(RUNS_FILE);
+    let release = Arc::new(AtomicBool::new(false));
+    let runner = Arc::new(HoldRunner::default());
+    let old = hold_service(&runner, Some(store.clone()));
+    let id = old.enqueue_task(Box::new(Stuck(release.clone()))).unwrap();
+    until("the start", || state(&old, &id) == RunState::Running);
+    assert!(!old.stop_for_exit(Instant::now() + Duration::from_millis(50)));
+    let new = hold_service(&runner, Some(store.clone()));
+    assert!(!new.foreign_owner(), "the next queue owns the folder");
+    new.shutdown();
+    release.store(true, Ordering::Relaxed);
+    drop(old);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other process of [`a_queue_of_another_process_makes_this_one_a_guest`]; idle in a normal
+/// run. Holds a queue on the folder until the release file appears.
+#[test]
+fn queue_owner_child() {
+    let Ok(dir) = std::env::var("BOP_TEST_QUEUE_OWNER_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let svc = hold_service(&Arc::new(HoldRunner::default()), Some(dir.join(RUNS_FILE)));
+    assert!(!svc.foreign_owner());
+    std::fs::write(dir.join("ready"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !dir.join("release").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    svc.shutdown();
+}
+
+/// Two processes: while the other process's queue owns the folder, a queue here is a guest and
+/// the CLI's start is refused with its message; when that process ends, the guest becomes the
+/// owner.
+#[test]
+fn a_queue_of_another_process_makes_this_one_a_guest() {
+    let dir = std::env::temp_dir().join(format!("bop-queue-2proc-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join(RUNS_FILE);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["training::service::tests::queue_owner_child", "--exact"])
+        .env("BOP_TEST_QUEUE_OWNER_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    until("the other process's queue", || dir.join("ready").exists());
+    let runner = Arc::new(HoldRunner::default());
+    let guest = hold_service(&runner, Some(store.clone()));
+    assert!(guest.foreign_owner());
+    let e = TrainingService::start_owner(
+        runner.clone(),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        store.clone(),
+    )
+    .unwrap_err();
+    assert_eq!(e, owner_refusal(&dir));
+    std::fs::write(dir.join("release"), b"").unwrap();
+    assert!(child.wait().unwrap().success());
+    guest.refresh();
+    assert!(!guest.foreign_owner());
+    guest.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `while_idle`: an enqueue from another thread waits until the action returns; a busy queue is
+/// refused (the action never runs); the caller's rule refuses with its own words.
+#[test]
+fn while_idle_holds_every_enqueue_and_refuses_a_busy_queue() {
+    let runner = Arc::new(HoldRunner::default());
+    let svc = hold_service(&runner, None);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let acting = Arc::new(AtomicBool::new(false));
+    let acted = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|s| {
+        let (svc2, acting2, acted2) = (&svc, acting.clone(), acted.clone());
+        let act = s.spawn(move || {
+            svc2.while_idle(&|_, _| None, || {
+                acting2.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                acted2.store(true, Ordering::SeqCst);
+            })
+        });
+        until("the action", || acting.load(Ordering::SeqCst));
+        svc.enqueue_task(Box::new(QuickTask::new("after", None, &ran)))
+            .unwrap();
+        assert!(
+            acted.load(Ordering::SeqCst),
+            "the enqueue waited for the action"
+        );
+        act.join().unwrap().unwrap();
+    });
+    svc.wait_task("after", Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        svc.while_idle(&|_, _| Some("not now".into()), || unreachable!())
+            .unwrap_err(),
+        "not now"
+    );
+    let id = svc
+        .enqueue_task(Box::new(HoldTask {
+            id: "hold".into(),
+            keep: false,
+        }))
+        .unwrap();
+    let e = svc.while_idle(&|_, _| None, || unreachable!()).unwrap_err();
+    assert!(e.contains("queued or running"), "{e}");
+    assert!(svc.cancel(&id));
+    svc.wait_task(&id, Duration::from_secs(10)).unwrap();
+    svc.shutdown();
+}
+
+/// quality extra 43: planning a dataset check reads `runs.json` as a reader: a damaged one stays
+/// where it is (the queue's owner deals with it).
+#[test]
+fn planning_a_dataset_check_never_moves_runs_json_aside() {
+    let root = std::env::temp_dir().join(format!("bop-plan-refine-{}", uuid::Uuid::new_v4()));
+    let mut config = crate::config::Config {
+        download_dir: Some(root.clone()),
+        allow_large_downloads: true,
+        ..crate::config::Config::default()
+    };
+    config.seed_default_model();
+    config.collect.dir = Some(root.join("dataset"));
+    let store = super::super::runs_file(&config);
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(&store, b"[{\"id\": \"cut off").unwrap();
+    super::super::refine::plan_refine(
+        &config,
+        super::super::refine::RefineRequest::default(),
+        &super::super::capability::host_for_tests(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&store).unwrap(), b"[{\"id\": \"cut off");
+    let names: Vec<String> = std::fs::read_dir(store.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(!names.iter().any(|n| n.contains(".corrupt-")), "{names:?}");
+    let _ = std::fs::remove_dir_all(&root);
 }

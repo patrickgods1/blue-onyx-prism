@@ -7,19 +7,22 @@
 //!   no token and no large-download gate, so the manager adopts the folder by hash without a request;
 //!   otherwise one request for the pinned `config.json` answers `needs_login` or `needs_access` at
 //!   once, then free space is checked, then the download is queued.
-//! - `POST /v1/autolabel/sam3/remove`: refused while a run uses the folder.
+//! - `POST /v1/autolabel/sam3/remove`: refused while a run uses the folder, decided under the
+//!   training queue's admission lock (`TrainingService::while_idle`: refused while any job is
+//!   queued or running) and the training lock (a `train` command in another process).
 //!
 //! A refusal is remembered per data root and token, without keeping the token (only its hash), so
 //! the panel can still show step 3 after a reload and a new login clears it.
 
-use super::{AppState, blocking};
+use super::{AppState, Shared, blocking};
 use crate::config::Config;
 use crate::resources::catalog::{self, Gated, Resource};
-use crate::resources::export::train::TrainPaths;
+use crate::resources::export::train::{TrainLock, TrainPaths};
 use crate::resources::hf_token::{self, Access, HfToken, Lookup, Refusal};
 use crate::resources::manager::{self, Job, Manager, State as JobState};
 use crate::sync::LockExt;
 use crate::training::pyenv;
+use crate::training::service::TrainingService;
 use crate::training::task::{TaskKind, TaskRecord};
 use axum::Json;
 use axum::extract::State;
@@ -412,33 +415,47 @@ async fn download_with(state: Arc<AppState>, t: Arc<Target>) -> Response {
 }
 
 /// `POST /v1/autolabel/sam3/remove`.
-pub(super) async fn remove(State(state): State<Arc<AppState>>) -> Response {
+pub(super) async fn remove(State(shared): State<Shared>) -> Response {
+    let state = shared.current();
+    drop(shared);
     let root = state.config_read().data_root();
     let Some(t) = Target::real(root) else {
         return no_pin();
     };
     blocking(move || {
+        // The queue only when it was started: a Remove never makes this process the owner of
+        // the training folder. Without one, the training lock covers a job of another process.
+        let queue = super::training::started_queue();
         let tasks = super::training::tasks(&state);
-        remove_with(&state, &t, &tasks)
+        remove_with(&state, &t, queue.as_deref(), &tasks)
     })
     .await
 }
 
-fn remove_with(state: &AppState, t: &Target, tasks: &[TaskRecord]) -> Response {
+/// Remove the SAM 3 folder. Refused (409) while an auto-label run with SAM 3 is queued or
+/// running (`tasks`, the friendly early answer), while SAM 3 downloads, and while `queue` has any
+/// job queued or running: the removal runs with every enqueue held off and decides on the
+/// queue's task list of that moment ([`TrainingService::while_idle`]), so no auto-label run is
+/// queued between the check and the delete. It also holds the training lock (refused while a
+/// training, import or auto-label of another process holds it).
+fn remove_with(
+    state: &AppState,
+    t: &Target,
+    queue: Option<&TrainingService>,
+    tasks: &[TaskRecord],
+) -> Response {
     let cfg = state.config_read().clone();
     let dir = folder_of(&cfg, t.res);
     let refuse = |code, message: String| {
-        let mut body = view(state, t, tasks);
+        let fresh = queue.map(TrainingService::tasks);
+        let mut body = view(state, t, fresh.as_deref().unwrap_or(tasks));
         body.message = message;
         reply(code, body)
     };
+    const IN_USE: &str =
+        "an auto-label run with SAM 3 is queued or running; wait for it or cancel it, then remove";
     if run_uses_folder(tasks, t.res) {
-        return refuse(
-            StatusCode::CONFLICT,
-            "an auto-label run with SAM 3 is queued or running; wait for it or cancel it, then \
-             remove"
-                .to_string(),
-        );
+        return refuse(StatusCode::CONFLICT, IN_USE.to_string());
     }
     let key = Job::into_dir(t.res, dir.clone()).key();
     let manager = state
@@ -455,17 +472,35 @@ fn remove_with(state: &AppState, t: &Target, tasks: &[TaskRecord]) -> Response {
             "SAM 3 is downloading or being checked; wait for it to finish, then remove".to_string(),
         );
     }
-    if let Err(e) = manager::remove_any(&dir) {
-        return refuse(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{e:#}; if another program has the files open, close it and try again"),
-        );
+    let lock_file = TrainPaths::for_config(&cfg).train_lock_file();
+    let delete = || -> Result<(), (StatusCode, String)> {
+        let _lock = TrainLock::try_acquire(&lock_file)
+            .map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
+        manager::remove_any(&dir).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{e:#}; if another program has the files open, close it and try again"),
+            )
+        })
+    };
+    let done = match queue {
+        Some(q) => q
+            .while_idle(
+                &|_, fresh| run_uses_folder(fresh, t.res).then(|| IN_USE.to_string()),
+                delete,
+            )
+            .unwrap_or_else(|why| Err((StatusCode::CONFLICT, why))),
+        None => delete(),
+    };
+    if let Err((code, message)) = done {
+        return refuse(code, message);
     }
     if let Some(m) = manager {
         m.forget(&key);
     }
     clear_refusal(&cfg.data_root());
-    let mut body = view(state, t, tasks);
+    let fresh = queue.map(TrainingService::tasks);
+    let mut body = view(state, t, fresh.as_deref().unwrap_or(tasks));
     body.message = format!("Removed {}.", dir.display());
     reply(StatusCode::OK, body)
 }
@@ -950,12 +985,12 @@ mod tests {
             "step": 0, "steps": 1, "percent": 0, "uses": [res.id],
         }))
         .unwrap();
-        let (code, _, v) = body_of(remove_with(&state, &t, &[busy])).await;
+        let (code, _, v) = body_of(remove_with(&state, &t, None, &[busy])).await;
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(v["in_use"], true);
         assert!(dir.join("model.safetensors").exists());
 
-        let (code, _, v) = body_of(remove_with(&state, &t, &[])).await;
+        let (code, _, v) = body_of(remove_with(&state, &t, None, &[])).await;
         assert_eq!(code, StatusCode::OK, "{v}");
         assert_eq!(v["state"], "not_requested", "{v}");
         assert!(!dir.exists());
@@ -998,6 +1033,96 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A task that runs until cancelled.
+    struct Holds;
+
+    impl crate::training::task::Task for Holds {
+        fn id(&self) -> &str {
+            "holds"
+        }
+        fn kind(&self) -> TaskKind {
+            TaskKind::Autolabel
+        }
+        fn title(&self) -> String {
+            "holds".into()
+        }
+        fn steps(&self) -> usize {
+            1
+        }
+        fn run(
+            &self,
+            _ctx: crate::training::task::TaskContext<'_>,
+            _report: &mut dyn FnMut(crate::training::task::TaskReport<'_>),
+            cancel: &std::sync::atomic::AtomicBool,
+        ) -> anyhow::Result<crate::training::task::TaskOutcome> {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(anyhow::anyhow!(crate::resources::export::Cancelled))
+        }
+    }
+
+    fn queue() -> Arc<TrainingService> {
+        let fake = Arc::new(crate::resources::export::fake::Fake::new());
+        TrainingService::start(
+            fake.clone(),
+            fake,
+            Arc::new(crate::training::job::NoHooks),
+            None,
+        )
+    }
+
+    /// Audit 2026-11 (QA-021): the decision reads the queue as it is when the removal runs, not
+    /// the list the route read before: a job queued after that snapshot refuses the removal and
+    /// the folder stays.
+    #[tokio::test]
+    async fn remove_decides_on_the_queue_of_the_moment() {
+        let (state, root) = resources_state();
+        let res = fixture("http://127.0.0.1:9");
+        let dir = put_files(&state, res);
+        let t = target(res, Lookup::Missing);
+        let q = queue();
+        let stale = q.tasks();
+        q.enqueue_task(Box::new(Holds)).unwrap();
+        let (code, _, v) = body_of(remove_with(&state, &t, Some(&q), &stale)).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
+        assert!(dir.join("model.safetensors").exists());
+        q.cancel("holds");
+        q.shutdown();
+        // Idle: removed.
+        let q = queue();
+        let (code, _, v) = body_of(remove_with(&state, &t, Some(&q), &[])).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(!dir.exists());
+        q.shutdown();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A training, import or auto-label of another process holds the training lock: 409, and the
+    /// folder stays.
+    #[tokio::test]
+    async fn remove_refuses_while_the_training_lock_is_held() {
+        let (state, root) = resources_state();
+        let res = fixture("http://127.0.0.1:9");
+        let dir = put_files(&state, res);
+        let t = target(res, Lookup::Missing);
+        let lock = TrainPaths::for_config(&state.config_read()).train_lock_file();
+        let held = TrainLock::try_acquire(&lock).unwrap();
+        let (code, _, v) = body_of(remove_with(&state, &t, None, &[])).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{v}");
+        assert!(
+            v["message"].as_str().unwrap().contains("another process"),
+            "{v}"
+        );
+        assert!(dir.join("model.safetensors").exists());
+        drop(held);
+        let (code, _, v) = body_of(remove_with(&state, &t, None, &[])).await;
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert!(!dir.exists());
+        assert!(lock.is_file(), "the lock file stays");
         std::fs::remove_dir_all(&root).ok();
     }
 }

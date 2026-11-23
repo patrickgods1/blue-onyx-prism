@@ -21,7 +21,11 @@
 //!   `confirm_large` unless `allow_large_downloads`); **Cancel** stops it. Remove deletes
 //!   everything of that one export (`export::export_leftovers`: files, IR of earlier versions,
 //!   weights, work files, CoreML rewrites), also when only leftovers are on disk; removing `tool:uv` removes the whole export toolchain (including the DEIMv2
-//!   source, which has no row of its own).
+//!   source, which has no row of its own). That removal is refused while an export runs, and
+//!   while a training, import, auto-label or environment setup (this service's queue or a
+//!   command in another process) holds `tools/.train.lock` or `tools/.model-export.lock`
+//!   (`export::tools_in_use`, a look at the locks; the removal takes both,
+//!   `export::remove_toolchain`).
 //!
 //! Rows carry a `group` ([`group_of`]) so the UI shows Runtimes, GPU libraries and Models
 //! (by family) as separate tables ([`grouped`]).
@@ -573,6 +577,13 @@ pub(super) fn remove_blocked(
     match res.kind {
         ResourceKind::Tool if exporting => {
             return Some("an export is running; cancel it or wait until it finishes".into());
+        }
+        // A training, import, auto-label or environment setup (this service's queue or a
+        // command in another process) holds a tool lock: `tools/python` is its interpreter.
+        ResourceKind::Tool => {
+            if let Some(why) = export::tools_in_use(&export::Paths::for_config(config)) {
+                return Some(why);
+            }
         }
         ResourceKind::ExportModel
             if ctx

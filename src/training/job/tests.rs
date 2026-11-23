@@ -2781,3 +2781,296 @@ fn the_queue_records_resources_and_passes_them_on() {
         "{log_b}"
     );
 }
+
+/// RA-051: a run whose busy marker another process holds (a `train` command training it, as an
+/// open handle of its marker here) is neither removed with its files, nor retried, nor has its
+/// export removed, whatever its record says; once the marker is free they work again. A second
+/// queue on the folder (a guest) refuses every job, and writes nothing.
+#[test]
+fn a_run_another_process_trains_keeps_its_folder_and_export() {
+    let t = tmp("run-marker");
+    let root = t.0.join("training");
+    let store = root.join(service::RUNS_FILE);
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.run_dir = root.join(&j.id);
+    let exp = root.join("exports").join("e1");
+    std::fs::create_dir_all(&exp).unwrap();
+    export(&exp);
+    j.request.datasets = vec![exp.clone()];
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        export_fails: vec!["RuntimeError: disagree"],
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(store.clone()),
+    );
+    let id = svc.enqueue(j.clone()).unwrap();
+    let r = svc.wait(&id, Duration::from_secs(20)).unwrap();
+    assert_eq!(r.state, RunState::Failed);
+    let marker = crate::storage::busy::marker_of(&r.run_dir);
+    assert!(!marker.exists(), "an orderly end deletes the run's marker");
+    // `wait` answers on the change in memory; the save follows.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while service::load_bare_records(&store)[0].state != RunState::Failed {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failure was never saved"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // A second queue on the folder is a guest: it refuses and writes nothing.
+    let saved = std::fs::read(&store).unwrap();
+    let guest = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(store.clone()),
+    );
+    assert!(guest.foreign_owner());
+    assert_eq!(guest.records(), svc.records());
+    let mut other = job(&t.0, TrainFamily::Yolo26, "s", mps(), Platform::MACOS_ARM64);
+    other.run_dir = root.join(&other.id);
+    for e in [
+        guest.enqueue(other).unwrap_err(),
+        guest.enqueue_retry(retry_of(&j)).unwrap_err(),
+        guest.remove_with_files(&id, |_| Ok(())).unwrap_err(),
+        guest.remove(&id).unwrap_err(),
+    ] {
+        assert!(
+            e.starts_with(
+                "another blue-onyx-prism process (a `train` command) is using the training folder"
+            ),
+            "{e}"
+        );
+    }
+    drop(guest);
+    assert_eq!(std::fs::read(&store).unwrap(), saved);
+    assert!(r.run_dir.is_dir());
+
+    // Another process trains the run now.
+    let held = crate::storage::Busy::hold(&r.run_dir);
+    let e = svc
+        .remove_with_files(&id, |_| panic!("nothing is deleted"))
+        .unwrap_err();
+    assert!(
+        e.starts_with("a training in another process is using run"),
+        "{e}"
+    );
+    assert!(r.run_dir.is_dir());
+    let e = svc.enqueue_retry(retry_of(&j)).unwrap_err();
+    assert!(
+        e.starts_with("a training in another process is using run"),
+        "{e}"
+    );
+    assert_eq!(svc.get(&id).unwrap().state, RunState::Failed);
+    let e = crate::storage::sweep::remove_export(&root, "e1", &svc.records(), &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.starts_with("a training in another process (run"), "{e}");
+    assert!(exp.join("classes.txt").is_file());
+    drop(held);
+
+    // Free again: the export goes, and so does the run with its files.
+    crate::storage::sweep::remove_export(&root, "e1", &svc.records(), &[]).unwrap();
+    assert!(!exp.exists());
+    svc.remove_with_files(&id, |r| {
+        super::super::retry::delete_run_files(&r.run_dir, &r.id, &root)
+    })
+    .unwrap();
+    assert!(!r.run_dir.exists());
+    svc.shutdown();
+}
+
+/// RA-051 / quality extra 22: busy records of runs whose markers say live (another process),
+/// crashed (a marker left unlocked) or nothing. A reader keeps a live run running and shows the
+/// others interrupted (none at all while a queue owns the folder), writing nothing; the sweep
+/// never takes a run's marker for a work folder; the owner's open fails the live one with
+/// [`service::STILL_RUNNING`] and interrupts the others, deleting the crash's marker.
+#[test]
+fn the_owners_open_tells_a_run_another_process_trains_from_a_crash() {
+    let t = tmp("run-markers-open");
+    let root = t.0.join("training");
+    let store = root.join(service::RUNS_FILE);
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake::new());
+    // One finished record to copy from.
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(store.clone()),
+    );
+    let id = svc.enqueue(j).unwrap();
+    svc.wait(&id, Duration::from_secs(20)).unwrap();
+    let base = serde_json::to_value(svc.records().remove(0)).unwrap();
+    svc.shutdown();
+    std::fs::remove_dir_all(base["run_dir"].as_str().unwrap()).unwrap();
+    let records: Vec<serde_json::Value> = ["live", "crashed", "ended"]
+        .iter()
+        .map(|id| {
+            let dir = root.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(LOG_FILE), "log\n").unwrap();
+            let mut v = base.clone();
+            v["id"] = (*id).into();
+            v["name"] = format!("night-{id}").into();
+            v["state"] = "running".into();
+            v["output"] = serde_json::Value::Null;
+            v["registered"] = serde_json::Value::Null;
+            v["run_dir"] = dir.to_string_lossy().into_owned().into();
+            v
+        })
+        .collect();
+    std::fs::write(&store, serde_json::to_vec(&records).unwrap()).unwrap();
+    let saved = std::fs::read(&store).unwrap();
+    let held = crate::storage::Busy::hold(&root.join("live"));
+    let crashed_marker = crate::storage::busy::marker_of(&root.join("crashed"));
+    std::fs::write(&crashed_marker, "12345\n").unwrap();
+    let states = |runs: &[service::RunRecord]| -> Vec<(String, RunState)> {
+        runs.iter().map(|r| (r.id.clone(), r.state)).collect()
+    };
+    let read = service::load_bare_records(&store);
+    assert_eq!(
+        states(&read),
+        [
+            ("live".into(), RunState::Running),
+            ("crashed".into(), RunState::Failed),
+            ("ended".into(), RunState::Failed),
+        ]
+    );
+    assert!(read[2].error.as_deref().unwrap().starts_with("interrupted"));
+    assert!(crashed_marker.exists(), "a reader deletes no marker");
+    // While a queue owns the folder (another handle of its lock), nothing is interrupted.
+    let owner = crate::training::task::QueueLock::try_take(
+        &crate::training::task::queue_lock_file(&store),
+        Duration::ZERO,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        service::load_bare_records(&store)
+            .iter()
+            .all(|r| r.state == RunState::Running)
+    );
+    drop(owner);
+    assert_eq!(
+        std::fs::read(&store).unwrap(),
+        saved,
+        "readers write nothing"
+    );
+    // The sweep's work folders are elsewhere: a run's marker is none of them.
+    assert!(crate::storage::sweep::crashed_work(&root).is_empty());
+    assert!(crate::storage::sweep::kept_work(&root).is_empty());
+    // And no run folder is unlisted.
+    assert!(service::unlisted_run_dirs(&root, &read).is_empty());
+
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(store.clone()),
+    );
+    assert!(!svc.foreign_owner());
+    let opened = svc.records();
+    assert_eq!(
+        states(&opened),
+        [
+            ("live".into(), RunState::Failed),
+            ("crashed".into(), RunState::Failed),
+            ("ended".into(), RunState::Failed),
+        ]
+    );
+    assert_eq!(opened[0].error.as_deref(), Some(service::STILL_RUNNING));
+    for r in &opened[1..] {
+        assert!(
+            r.error.as_deref().unwrap().starts_with("interrupted"),
+            "{r:?}"
+        );
+    }
+    assert!(!crashed_marker.exists(), "the crash's marker is dealt with");
+    assert!(crate::storage::busy::marker_of(&root.join("live")).exists());
+    assert_eq!(states(&service::load_bare_records(&store)), states(&opened));
+    // Its files are kept, guarded by the marker.
+    assert!(svc.remove_with_files("live", |_| Ok(())).is_err());
+    drop(held);
+    svc.shutdown();
+    // A folder whose record is gone is reported, never removed.
+    let lost = root.join("20260101-000000-lost");
+    std::fs::create_dir_all(&lost).unwrap();
+    std::fs::write(lost.join(service::history::HISTORY_FILE), "").unwrap();
+    std::fs::create_dir_all(root.join("exports")).unwrap();
+    assert_eq!(
+        service::unlisted_run_dirs(&root, &service::load_bare_records(&store)),
+        std::slice::from_ref(&lost)
+    );
+    assert!(lost.is_dir());
+}
+
+/// A task that ends at once (the queue's tests of runs and tasks together).
+struct NoopTask(String);
+
+impl super::super::task::Task for NoopTask {
+    fn id(&self) -> &str {
+        &self.0
+    }
+    fn kind(&self) -> super::super::task::TaskKind {
+        super::super::task::TaskKind::Import
+    }
+    fn title(&self) -> String {
+        "noop".into()
+    }
+    fn steps(&self) -> usize {
+        1
+    }
+    fn run(
+        &self,
+        _ctx: super::super::task::TaskContext<'_>,
+        _report: &mut dyn FnMut(super::super::task::TaskReport<'_>),
+        _cancel: &AtomicBool,
+    ) -> Result<super::super::task::TaskOutcome> {
+        Ok(super::super::task::TaskOutcome {
+            summary: "done".into(),
+            result: serde_json::Value::Null,
+        })
+    }
+}
+
+/// QA-023: waiting for a task and then for a run on one queue and one thread (each times out
+/// while both are busy). One condvar waited on with both lists' mutexes panics on macOS ("a
+/// condition variable with two mutexes").
+#[test]
+fn waiting_for_a_task_then_a_run_on_one_thread_is_fine() {
+    let t = tmp("two-waits");
+    let fake = Arc::new(TrainFake {
+        hang: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.run_dir = t.0.join("training/a");
+    let run = svc.enqueue(j).unwrap();
+    let task = svc.enqueue_task(Box::new(NoopTask("t".into()))).unwrap();
+    for _ in 0..2 {
+        let r = svc.wait_task(&task, Duration::from_millis(30)).unwrap();
+        assert!(r.state.is_busy());
+        let r = svc.wait(&run, Duration::from_millis(30)).unwrap();
+        assert!(r.state.is_busy());
+    }
+    assert!(svc.cancel(&run));
+    assert!(
+        !svc.wait(&run, Duration::from_secs(20))
+            .unwrap()
+            .state
+            .is_busy()
+    );
+    assert_eq!(
+        svc.wait_task(&task, Duration::from_secs(20)).unwrap().state,
+        RunState::Done
+    );
+    svc.shutdown();
+}

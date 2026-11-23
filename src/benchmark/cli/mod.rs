@@ -74,11 +74,7 @@ pub fn main(mut args: BenchArgs, config_fallback: Option<PathBuf>) -> ExitCode {
 }
 
 fn load_config(path: &Path) -> Result<Config> {
-    if path.exists() {
-        Config::load(path)
-    } else {
-        Ok(Config::default())
-    }
+    Config::load_or_default(path)
 }
 
 /// One job, with its config entry when it came from the config file.
@@ -1398,11 +1394,13 @@ impl RunCtx<'_> {
             .iter()
             .filter_map(|m| m.recommended.clone().map(|d| (m.model.clone(), Some(d))))
             .collect();
-        let mut cfg = Config::load(config_path)?;
-        let changes = apply_model_devices(&mut cfg, &picks)?;
-        if !changes.is_empty() {
-            cfg.save(config_path)?;
-        }
+        // Under the config lock (QA-016): a page save of a running service is never undone.
+        let edited = crate::config_file::edit_file(
+            config_path,
+            crate::config_file::Missing::Error,
+            |cfg| apply_model_devices(cfg, &picks),
+        )?;
+        let (cfg, changes) = (edited.config, edited.value);
         if !self.args.json {
             println!();
             if changes.is_empty() {
@@ -1599,21 +1597,23 @@ fn apply_thresholds(
     config_path: &Path,
     quiet: bool,
 ) -> Result<Vec<ProfileChange>> {
-    let mut cfg = Config::load(config_path)?;
-    // Results may name models that are not configured (--model files): skip those.
-    let configured: Vec<&crate::benchmark::eval::tune::Suggested> = suggested
-        .iter()
-        .filter(|s| crate::benchmark::find_model(&cfg, &s.model).is_some())
-        .collect();
-    let entries: Vec<(String, String, Option<f32>)> = configured
-        .iter()
-        .filter(|s| s.refusal.is_none())
-        .filter_map(|s| Some((s.model.clone(), s.device.clone(), Some(s.threshold?))))
-        .collect();
-    let changes = apply_device_thresholds(&mut cfg, &entries)?;
-    if !changes.is_empty() {
-        cfg.save(config_path)?;
-    }
+    // Under the config lock (QA-016): a page save of a running service is never undone.
+    let (configured, changes) =
+        crate::config_file::edit_file(config_path, crate::config_file::Missing::Error, |cfg| {
+            // Results may name models that are not configured (--model files): skip those.
+            let configured: Vec<&crate::benchmark::eval::tune::Suggested> = suggested
+                .iter()
+                .filter(|s| crate::benchmark::find_model(cfg, &s.model).is_some())
+                .collect();
+            let entries: Vec<(String, String, Option<f32>)> = configured
+                .iter()
+                .filter(|s| s.refusal.is_none())
+                .filter_map(|s| Some((s.model.clone(), s.device.clone(), Some(s.threshold?))))
+                .collect();
+            let changes = apply_device_thresholds(cfg, &entries)?;
+            Ok((configured, changes))
+        })?
+        .value;
     if !quiet {
         println!();
         if changes.is_empty() {

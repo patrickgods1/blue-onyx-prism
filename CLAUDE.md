@@ -80,6 +80,9 @@ default true; `allow_large_downloads`, default false, gates > 500 MB; `download_
 **Model export** (`src/resources/export/`, the only code that runs downloaded programs; user-triggered only, never by
 `auto_download`): `tool:uv` + hashed `scripts/model-export/locks/*.txt` (regenerate with `gen_locks.sh` /
 `gen_train_locks.sh`) + the embedded `scripts/export_model.py`, all under `<data root>/tools/`.
+- Removing the toolchain or `train-env` holds `tools/.train.lock` and `tools/.model-export.lock` (`hold_tools`; refused
+  with `ToolsBusy` while either is held, in any process) and never deletes a lock file. A venv whose `pyvenv.cfg` home
+  is gone is not ready (rebuilt).
 - Recipes (`catalog::ExportRecipe`): Ultralytics YOLOv8/9/10/11/12/26 (AGPL-3.0), RF-DETR L, DEIMv2 (code pinned to
   the last Apache-2.0 commit; marked non-commercial, the upstream licence now covers the weights), MegaDetector v6, the
   ExDark RF-DETRs. Static-shape ONNX checked against PyTorch with ONNX Runtime, stamped with `COREML_CACHE_KEY` (ORT's
@@ -219,6 +222,10 @@ loaded library's version (the resolver's hypothetical probe carries the version 
 
 - **Config** (`src/config.rs`, `config_store.rs`, `config_merge.rs`): JSON next to the exe; CLI overrides only non-default
   values and writes back. Every UI writer goes through `save_config` (last write wins).
+  - Every writer of the config file holds `.<config name>.lock` beside it (`config_file::lock`, never deleted): commands
+    through `config_file::edit_file` (30 s wait; writes only when the text changed), `ConfigStore::update` right after
+    `writer` (3 s). Order `apply_lock` -> `writer` -> config file lock; nothing under it calls a store writer or
+    `edit_file`; `check_disk` / adopt take no file lock. The "file, else default" load is `Config::load_or_default`.
   - `ConfigStore` publishes an `Arc<Published>` through `ArcSwap` (`config_read()` = one atomic load, never waits for a
     save's fsync; writers serialize on `writer`, taken after `apply_lock`, never before); `config_store::spawn_disk_watch`
     applies on-disk edits within 2 s.
@@ -257,8 +264,11 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - One label write path: `labels::update` under `<dataset root>/.labels.lock` (`fs4`, CLI and service alike; a held
     lock is never given up on, only one that cannot work falls back to the process lock). A failed label write keeps the
     job's `work` and is named in its summary.
-  - `task::load_or_move_aside` moves a damaged `runs.json` / `tasks.json` to `.corrupt-<time>` and leaves an unreadable
-    one alone, unwritten. Runs are never dropped. JSONL reads are lossy per line and appends repair a torn tail
+  - `runs.json` / `tasks.json` have one owner, the queue holding `<training dir>/.queue.lock` (fs4, never deleted): only
+    it uses `task::load_or_move_aside` (a damaged file to `.corrupt-<time>`, an unreadable one left alone, unwritten)
+    and marks busy records interrupted. Readers (`service::load_records` / `load_bare_records`, `task::load_records`)
+    never rename or write and show a busy record interrupted only when the lock is free and its run's `.busy` marker is
+    not Live. Runs are never dropped. JSONL reads are lossy per line and appends repair a torn tail
     (`layout::read_lines`); `layout::compact_review` and appends to `review-queue.jsonl` share `.review-queue.lock`.
   - `heldout-days.json` (review folder) only grows: one writer, `labels::heldout::update` under `.heldout-days.lock`
     (fs4, never under `.labels.lock`); a newer or damaged one refuses the export and is never moved aside.
@@ -364,6 +374,12 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - One convergence rule for every trainer: `Convergence` in `train_model.py`, Rust twin `progress::convergence_run`,
     parity-tested. `RunSettings` records what changes results (ignore mode, negative share, static cap) and
     `compare.rs` warns on mixed values.
+  - Ownership: a queue that finds `.queue.lock` held is a guest (records read-only, every job and removal refused;
+    the server's queue retries on each read through `refresh`); the CLI's job commands (`start_owner`) refuse while the
+    service owns the folder, `train list` only reads. A run holds `<run dir>.busy` (`storage::busy`) for its whole
+    training; Remove with files, Retry export and the Storage card's Remove export refuse while it is Live
+    (`service::run_in_use`). `TrainingService::while_idle` (holds `admit`, which every enqueue takes first) runs
+    remove-env, the training-folder move and SAM 3 Remove with no job queued under them.
   - Protection: a failed run keeps `work` (`training/retry.rs`, `train retry-export`; training itself does not resume);
     an OOM restarts only before 3 finished epochs; an early GPU OOM retries at half the batch, a host OOM halves the
     loader workers, never the batch (`training::workers_for`); `check_disk` refuses up front.

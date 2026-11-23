@@ -710,6 +710,33 @@ fn file_round_trip_and_lenient_load() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A `models` that is not an object is no empty history: the file is moved aside, not saved over.
+#[test]
+fn a_models_value_that_is_not_an_object_is_moved_aside() {
+    let dir = temp_dir();
+    let path = dir.join("benchmark-history.json");
+    let text = r#"{"version":1,"models":[]}"#;
+    std::fs::write(&path, text).unwrap();
+    assert!(History::load_with_warnings(&path).is_err());
+    let ((), warnings) = History::update(&path, None, |h| {
+        h.append(entry("r1", vec![]));
+        Ok(())
+    })
+    .unwrap();
+    assert!(warnings[0].contains("moved it aside"), "{warnings:?}");
+    let aside: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".bad-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "no copy of the old file was kept");
+    assert_eq!(std::fs::read_to_string(aside[0].path()).unwrap(), text);
+    // null is the same as absent.
+    std::fs::write(&path, r#"{"version":1,"models":null}"#).unwrap();
+    assert!(History::load(&path).unwrap().unwrap().models.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn record_seeds_appends_once_per_model_and_skips_failures() {
     let dir = temp_dir();

@@ -23,6 +23,10 @@
 //! otherwise cost the whole training. [`TrainJob::export_only`] exports such a run again
 //! ([`super::retry`]): setup, self-check, then only the export and the stages after it. A run out
 //! of memory restarts only while that costs little ([`keeps_checkpoints`]).
+//!
+//! A run holds the training lock (`tools/.train.lock`) and its own busy marker (`<run dir>.busy`,
+//! [`crate::storage::busy`]) from the lock to its end, so another process sees that it trains
+//! ([`super::service::run_in_use`]).
 
 use super::capability::Accelerator;
 use super::dataset::{self, Prepared, SceneFilter};
@@ -847,6 +851,13 @@ fn stages(
         ),
         None => Some(TrainLock::try_acquire(&paths.train_lock_file())?),
     };
+    // The run's liveness marker (`<run dir>.busy`, [`crate::storage::busy`]) for the whole run: a
+    // queue that opens the folder, Remove with files and Retry export tell from it a run another
+    // process trains from one a crash left ([`super::service::run_in_use`]). Its folder stays when
+    // the run ends. A fold of a dataset check (`held`) is no queue run and holds none.
+    let _alive = held
+        .is_none()
+        .then(|| crate::storage::Busy::hold(&job.run_dir));
 
     // The memory commit, before the run's first Python process (the environment's tools, the
     // self-check, the trainer). Each run of a queue (a seed, another model) is checked at its own

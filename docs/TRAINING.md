@@ -156,7 +156,8 @@ benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on
 - Shared with the export: uv, `tools/python`, the uv cache and the Ultralytics `.pt` files
   (`tools/export-weights/<name>`). The environment is built under the export lock (an export and a
   training setup never run uv at the same time); a run holds `tools/.train.lock`, so one training
-  runs at a time across processes while exports go on.
+  runs at a time across processes while exports go on. The records (`runs.json`, `tasks.json`) have
+  one writer: the queue that holds `<training dir>/.queue.lock` (see [Command line](#command-line)).
 - Other base weights: `tools/train-weights/<family>-<size>`. Settings and caches of the libraries:
   `tools/train-config` (`YOLO_CONFIG_DIR`, `HF_HOME`, `TORCH_HOME`, `MPLCONFIGDIR`, `RF_HOME`).
 - Offline: `YOLO_OFFLINE=1`, `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; the child starts from an
@@ -165,7 +166,11 @@ benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on
 - **Remove training environment** (page) or `train remove-env` deletes `train-env`,
   `train-weights`, `train-config` and `train-work`; uv and Python stay for the export. The Config
   page's *Remove export toolchain* deletes uv and `tools/python` too; the training environment is then
-  downloaded and rebuilt on the next run.
+  downloaded and rebuilt on the next run (an environment whose base Python is gone counts as not
+  installed). Both are refused while a training, import, auto-label, dataset check, environment
+  setup or export runs, in the service or in a `train` / `fetch` command (they hold
+  `tools/.train.lock` or `tools/.model-export.lock`; the removal holds both while it deletes, and
+  the page's button also waits for the service's queue to be empty). The two lock files stay.
 - **Extending it**: add the packages to `requirements-model-train.txt`, regenerate the locks and
   extend the scripts' `--self-check`. The environment's marker records the lock's name and SHA-256,
   so every existing environment is rebuilt once with the new packages (the import / auto-label
@@ -2066,8 +2071,10 @@ app's own `hf-login` as the account that runs the service, with the service's co
 - Docker: `docker exec -it <container> blue-onyx-prism hf-login`, or start the container with
   `HF_TOKEN` set.
 
-**Remove** (the panel's button) deletes the whole SAM 3 weights folder and is refused while a queued or
-running auto-label uses it.
+**Remove** (the panel's button) deletes the whole SAM 3 weights folder and is refused while any job
+of the service's queue is queued or running (the decision and the delete happen with new jobs held
+off, so no auto-label run is queued in between) and while a `train` command in another process
+holds `tools/.train.lock`.
 
 ### Night and IR frames
 
@@ -3344,6 +3351,24 @@ job](#a-run)); `prepare --dry-run` says when a run would be refused now.
 
 Model labels: `yolo26n`..`yolo26x`, `yolo11n`.., `yolov8n`.., `rfdetr-nano|small|medium|base|large`,
 `rt-detrv2-s|m|l|x`, `dfine-s|m|l|x`.
+
+**Beside the service.** A training folder has one writer of `runs.json` and `tasks.json`: the queue
+that holds `<training dir>/.queue.lock` (a zero-byte lock file that stays). The service's queue takes
+it when it starts (the first visit to a Train page or any queue action) and keeps it while it runs;
+a `train` command takes it for as long as it runs. So `train run`, `train retry-export`,
+`train import`, `train autolabel`, `train overlaps` and `train refine` refuse while the service's queue
+owns the folder ("the service's training queue owns <dir>; queue it on the Train tab, or stop the
+service and run the command again"), before writing anything. While a command owns it, the Train tab
+shows that command's runs and jobs as the files hold them and refuses to queue, cancel or remove
+("another blue-onyx-prism process (a `train` command) is using the training folder <dir>; wait for it to
+finish, then try again"); it takes the folder over at the next visit after the command ends. `train
+list`, `--dry-run` and the pages only read: they never write or move the files, and they show a job
+interrupted only when no queue holds the lock (and, for a run, no process holds its busy marker
+`<training dir>/<run id>.busy`, which a run holds while it trains). Remove with files, Retry export and
+the Storage card's Remove of an export refuse a run whose busy marker another process holds. `train
+list` also names run folders (holding `train.log` or `history.jsonl`) that no record lists: an earlier
+version could lose the record of a run made beside the service; they are only listed, delete them by
+hand if not needed.
 
 ## Still to verify on an NVIDIA machine
 
