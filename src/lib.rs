@@ -36,6 +36,9 @@
 //! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
 //! - [`storage`]   disk use and the cleanup of rebuildable files (caches, staging, crashed job folders)
 //! - [`parallel`]  work-stealing maps on scoped threads (import analysis, dataset walks)
+//! - [`fsx`]       atomic writes, file-lock waits and safe on-disk names shared by every writer
+//! - [`children`]  registry of child processes the service started; the post-crash orphan sweep
+//! - [`command`]   the bounded runner for short helper programs (output drained and capped, stopped at the deadline)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
 //! # Lint policy
@@ -73,15 +76,18 @@ pub mod api;
 )]
 pub mod backend;
 pub mod benchmark;
+pub mod children;
 pub mod cli;
 pub mod clock;
 pub mod collect;
+pub mod command;
 pub mod config;
 pub mod config_form;
 pub mod config_merge;
 pub mod config_store;
 pub mod diagnostics;
 pub mod download;
+pub mod fsx;
 pub mod image;
 pub mod image_stats;
 pub mod logbuf;

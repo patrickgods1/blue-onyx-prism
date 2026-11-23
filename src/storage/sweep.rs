@@ -1,7 +1,7 @@
 //! The storage sweep: at startup and once a day on the retention thread
 //! ([`crate::retention::spawn_sweeper`]), and piece by piece from the Storage card's Clear.
 //!
-//! In order: cache folders unused for [`super::caches::UNUSED_DAYS`] and the CoreML orphans
+//! In order: crash-left temporary files of the atomic writes ([`sweep_temp_files`]); cache folders unused for [`super::caches::UNUSED_DAYS`] and the CoreML orphans
 //! ([`super::caches`]); `.<name>.train-staging` folders no running training holds; work folders
 //! of auto-label, import, overlap and dataset-check jobs that crashed ([`super::busy`]; a dataset
 //! check's fold folders on the dataset's volume too, [`NEAR_WORK_DIRS`], [`ELSEWHERE_FILE`]), an
@@ -86,13 +86,72 @@ impl WorkKind {
 #[derive(Debug, Clone)]
 pub struct Settings {
     config: Box<Config>,
+    /// The config file, when known: its folder holds the config's and the benchmark files' temps.
+    config_path: Option<PathBuf>,
 }
 
 impl Settings {
     pub fn for_config(config: &Config) -> Self {
         Self {
             config: Box::new(config.clone()),
+            config_path: None,
         }
+    }
+
+    /// The same, also sweeping the temporary files beside the config file `path`.
+    pub fn with_config_path(mut self, path: &Path) -> Self {
+        self.config_path = Some(path.to_path_buf());
+        self
+    }
+
+    /// The folders whose crash-left temporary files [`sweep_temp_files`] removes (not recursive):
+    /// the config's folder, the data root, `auth/` and `auth/tls/`, `tools/hf/`, the ONNX Runtime
+    /// folder, the training folder, the dataset and review folders and `save_image_path`.
+    /// Dataset day folders are covered by the dataset prune.
+    pub fn temp_dirs(&self) -> Vec<PathBuf> {
+        let root = self.config.data_root();
+        let auth = root.join(crate::private_dir::DIR_NAME);
+        let mut v = vec![
+            root.clone(),
+            auth.join(crate::tls::DIR_NAME),
+            auth,
+            root.join(crate::resources::export::TOOLS_DIR).join("hf"),
+            root.join("onnxruntime"),
+            self.training_dir(),
+        ];
+        if let Some(dir) = self.config_path.as_deref().and_then(Path::parent) {
+            v.push(if dir.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                dir.to_path_buf()
+            });
+        }
+        v.extend(self.dataset_dirs());
+        if let Some(p) = self.config.save_image_path.as_deref() {
+            v.push(crate::resolve_path(p));
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Fixed temporary names that writers used before [`crate::fsx::write_atomic`]: a crash of
+    /// an older version may have left one, and nothing writes them any more.
+    fn legacy_temp_names(&self) -> Vec<String> {
+        let mut v = vec![
+            "runs.json.tmp".to_string(),
+            "tasks.json.tmp".to_string(),
+            format!("{}.tmp", crate::backend::libs::ORT_ACTIVE_FILE),
+        ];
+        if let Some(name) = self
+            .config_path
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str())
+        {
+            v.push(format!("{name}.tmp"));
+        }
+        v
     }
 
     pub fn config(&self) -> &Config {
@@ -179,6 +238,7 @@ pub struct Report {
 pub fn run(s: &Settings) -> Report {
     let now = SystemTime::now();
     let mut rep = Report::default();
+    sweep_temp_files(s, now, &mut rep.removed);
     sweep_caches(s, now, &mut rep.removed);
     sweep_staging(&s.models_dir(), &mut rep.removed);
     sweep_work(s, &mut rep);
@@ -216,6 +276,48 @@ pub fn run(s: &Settings) -> Report {
         );
     }
     rep
+}
+
+/// How old a temporary file must be before [`sweep_temp_files`] removes it: an atomic write lives
+/// for milliseconds, so one this old was left by a crash, a kill or a full disk.
+pub const TEMP_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Whether `name` in one of [`Settings::temp_dirs`] is a temporary file of an atomic write:
+/// the [`crate::fsx::is_temp_name`] shape, or one of the `legacy` fixed names.
+pub fn is_leftover_temp(name: &str, legacy: &[String]) -> bool {
+    crate::fsx::is_temp_name(name) || legacy.iter().any(|l| l == name)
+}
+
+/// Remove the temporary files of atomic writes that a crash, a kill or a full disk left in
+/// [`Settings::temp_dirs`]: regular files only, of the exact shapes [`is_leftover_temp`]
+/// accepts, last modified at least [`TEMP_MIN_AGE`] before `now` (a write in progress is never
+/// that old).
+pub fn sweep_temp_files(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
+    let legacy = s.legacy_temp_names();
+    for dir in s.temp_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !is_leftover_temp(&name, &legacy) {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= TEMP_MIN_AGE);
+            if meta.is_file() && old {
+                remove_counted(&e.path(), "temporary file of a write a crash cut off", out);
+            }
+        }
+    }
 }
 
 /// Unused cache folders and the CoreML orphans.
@@ -650,6 +752,73 @@ mod tests {
         };
         c.models.clear();
         Settings::for_config(&c)
+    }
+
+    /// Set `p`'s modification time `age` ago.
+    fn age(p: &Path, age: Duration) {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    #[test]
+    fn crash_left_temp_files_go_once_old_and_nothing_else_does() {
+        let root = tmp("temps");
+        let s = settings(&root).with_config_path(&root.join("cfg").join("prism.json"));
+        let auth = root.join("auth");
+        let tls = auth.join("tls");
+        let cfg = root.join("cfg");
+        let training = s.training_dir();
+        for d in [&auth, &tls, &cfg, &training] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let id = "0123456789abcdef0123456789abcdef";
+        let hour = Duration::from_secs(3600);
+        let old_temps = [
+            auth.join(format!(".users.json.{id}.tmp")),
+            tls.join(format!(".cert.pem.{id}.tmp")),
+            cfg.join(format!(".prism.json.{id}.tmp")),
+            cfg.join("prism.json.tmp"),
+            training.join("runs.json.tmp"),
+            root.join(format!(".children.json.{id}.tmp")),
+        ];
+        let kept = [
+            // Too young: a write may be in progress.
+            (
+                auth.join(format!(".sessions.json.{}.tmp", "f".repeat(32))),
+                Duration::ZERO,
+            ),
+            // Not the exact shape.
+            (auth.join(".users.json.tmp"), 2 * hour),
+            (
+                cfg.join(format!(".prism.json.{}.tmp", "g".repeat(32))),
+                2 * hour,
+            ),
+            (cfg.join("prism.json"), 2 * hour),
+            // A folder of the right name is never a temp file.
+            (training.join(format!(".x.{id}.tmp")), 2 * hour),
+        ];
+        for p in &old_temps {
+            put(p, 3);
+            age(p, 2 * hour);
+        }
+        for (p, a) in &kept {
+            if p.ends_with(format!(".x.{id}.tmp")) {
+                std::fs::create_dir_all(p).unwrap();
+                continue;
+            }
+            put(p, 3);
+            age(p, *a);
+        }
+        let mut out = Vec::new();
+        sweep_temp_files(&s, SystemTime::now(), &mut out);
+        for p in &old_temps {
+            assert!(!p.exists(), "{} should be gone", p.display());
+        }
+        for (p, _) in &kept {
+            assert!(p.exists(), "{} should stay", p.display());
+        }
+        assert_eq!(out.len(), old_temps.len());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

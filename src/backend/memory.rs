@@ -7,7 +7,8 @@
 //! `K32GetProcessMemoryInfo` on Windows and `proc_pid_rusage` on macOS; Linux reads
 //! `/proc/self/status` in [`crate::metrics`], with no FFI. [`PageIns`] is the system's page-in
 //! (hard fault) rate: PDH on Windows, `/proc/vmstat` on Linux, none elsewhere. Never panics; a
-//! failed call is `None`.
+//! failed call is `None`. [`trim`] asks the allocator to give freed heap memory back to the OS
+//! (glibc `malloc_trim`, macOS `malloc_zone_pressure_relief`, Windows `HeapCompact`).
 //!
 //! Paging files: [`parse_paging_files`] reads the registry's `PagingFiles` lines and
 //! [`growable_bytes`] (pure) how far they can still grow. That is commit a process gets on
@@ -334,6 +335,111 @@ pub fn process_memory() -> Option<ProcessMemory> {
     None
 }
 
+/// What one [`trim`] call did and could measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Trimmed {
+    /// The allocator was asked to give memory back (false on musl and other platforms, where
+    /// [`trim`] is a no-op).
+    pub asked: bool,
+    /// Bytes the allocator reports it released: macOS only (`malloc_zone_pressure_relief`'s
+    /// answer). glibc's `malloc_trim` answers only "something / nothing" and `HeapCompact` the
+    /// largest free block, neither of which is a released amount.
+    pub released: Option<u64>,
+    /// This process's resident memory before and after the call (working set on Windows, the
+    /// resident size on macOS, `VmRSS` on Linux), when it can be read.
+    pub resident_before: Option<u64>,
+    pub resident_after: Option<u64>,
+    /// macOS only: the physical footprint before and after (what Activity Monitor shows).
+    pub footprint_before: Option<u64>,
+    pub footprint_after: Option<u64>,
+}
+
+/// Give freed heap memory back to the OS, once, on the calling thread (audit 2026-11, memgap-1):
+/// Linux glibc `malloc_trim(0)` (also returns free pages in the middle of every arena), macOS
+/// `malloc_zone_pressure_relief(NULL, 0)` (every zone), Windows `HeapCompact` on the process heap
+/// only (the heap Rust std and the UCRT malloc of ONNX Runtime / OpenVINO use; other modules'
+/// heaps may be `HEAP_NO_SERIALIZE` and are never touched; never `EmptyWorkingSet`, which lowers
+/// no commit and makes the next detection fault the model back in). No-op elsewhere.
+///
+/// It recovers only what the allocator holds free: live runtime pools (ORT's CPU arena, OpenVINO
+/// compiled models) count as in use. Cheap, but it takes the allocator's locks while it walks
+/// them, so callers run it after a big release (a retired generation or worker), never per
+/// request. Logs one debug line with the before / after resident memory.
+pub fn trim() -> Trimmed {
+    let before = crate::metrics::ProcessStats::read();
+    let (asked, released) = trim_now();
+    let after = crate::metrics::ProcessStats::read();
+    let out = Trimmed {
+        asked,
+        released,
+        resident_before: before.resident_memory_bytes,
+        resident_after: after.resident_memory_bytes,
+        footprint_before: before.memory_footprint_bytes,
+        footprint_after: after.memory_footprint_bytes,
+    };
+    let mb = |b: Option<u64>| b.map_or_else(|| "?".to_string(), |b| format!("{:.1}", mib(b)));
+    tracing::debug!(
+        "memory trim: asked={asked} released_mb={} resident_mb={} -> {} footprint_mb={} -> {}",
+        mb(out.released),
+        mb(out.resident_before),
+        mb(out.resident_after),
+        mb(out.footprint_before),
+        mb(out.footprint_after),
+    );
+    out
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / f64::from(1u32 << 20)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_now() -> (bool, Option<u64>) {
+    // SAFETY: malloc_trim takes glibc's arena locks itself and is safe to call from any thread;
+    // 0 = keep no extra padding at the top of the main heap.
+    let _ = unsafe { libc::malloc_trim(0) };
+    (true, None)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    /// libsystem_malloc (macOS 10.7+): ask `zone` (null = every zone) to release free memory,
+    /// `goal` bytes (0 = as much as possible); returns the bytes released.
+    fn malloc_zone_pressure_relief(
+        zone: *mut libc::malloc_zone_t,
+        goal: libc::size_t,
+    ) -> libc::size_t;
+}
+
+#[cfg(target_os = "macos")]
+fn trim_now() -> (bool, Option<u64>) {
+    // SAFETY: a null zone means "every registered zone"; the allocator takes its own locks.
+    let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    (true, u64::try_from(released).ok())
+}
+
+#[cfg(windows)]
+fn trim_now() -> (bool, Option<u64>) {
+    use windows::Win32::System::Memory::{GetProcessHeap, HEAP_FLAGS, HeapCompact};
+    // SAFETY: GetProcessHeap has no preconditions; the process heap lives as long as the process.
+    let Ok(heap) = (unsafe { GetProcessHeap() }) else {
+        return (false, None);
+    };
+    // SAFETY: the process heap is serialized (no HEAP_NO_SERIALIZE), so HeapCompact may run
+    // beside other threads' allocations; it returns the largest free block (not a released size).
+    let _ = unsafe { HeapCompact(heap, HEAP_FLAGS(0)) };
+    (true, None)
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_env = "gnu"),
+    target_os = "macos",
+    windows
+)))]
+fn trim_now() -> (bool, Option<u64>) {
+    (false, None)
+}
+
 /// One `GlobalMemoryStatusEx` call; None when it fails.
 #[cfg(windows)]
 fn status() -> Option<windows::Win32::System::SystemInformation::MEMORYSTATUSEX> {
@@ -539,6 +645,34 @@ pub fn parse_vmstat_majfault(text: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trim_returns_and_reports_what_it_did() {
+        let block = vec![1u8; 32 << 20];
+        std::hint::black_box(&block);
+        drop(block);
+        let t = super::trim();
+        let expected = cfg!(any(
+            all(target_os = "linux", target_env = "gnu"),
+            target_os = "macos",
+            windows
+        ));
+        assert_eq!(t.asked, expected, "{t:?}");
+        assert_eq!(t.released.is_some(), cfg!(target_os = "macos"), "{t:?}");
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            assert!(
+                t.resident_before.is_some() && t.resident_after.is_some(),
+                "{t:?}"
+            );
+        }
+        assert_eq!(
+            t.footprint_after.is_some(),
+            cfg!(target_os = "macos"),
+            "{t:?}"
+        );
+        // A second call right after is harmless.
+        let _ = super::trim();
+    }
+
     /// Grows by a large touched allocation. Other tests of this binary free memory at any moment,
     /// so one attempt showing the growth is enough; a counter that does not move fails them all.
     #[cfg(any(windows, target_os = "macos"))]

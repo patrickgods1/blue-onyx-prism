@@ -119,23 +119,22 @@ impl Drop for Busy {
 /// from run to run, so a sweep may be removing the last crash's folder of the same name.
 const HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Lock `f`, waiting up to `wait` while another holder has it.
+/// Lock `f`, waiting up to `wait` while another holder has it ([`crate::fsx::lock_wait_with`],
+/// every 20 ms); a holder that keeps it past `wait` is a `WouldBlock` error.
 fn lock_waiting(f: &File, wait: std::time::Duration) -> std::io::Result<()> {
-    let start = std::time::Instant::now();
-    loop {
-        match fs4::FileExt::try_lock(f) {
-            Ok(()) => return Ok(()),
-            Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(fs4::TryLockError::WouldBlock) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    format!("still held after {} s", wait.as_secs()),
-                ));
-            }
-            Err(fs4::TryLockError::Error(e)) => return Err(e),
-        }
+    let waited = crate::fsx::lock_wait_with(
+        f,
+        crate::fsx::LockKind::Exclusive,
+        crate::fsx::deadline_after(wait),
+        crate::fsx::Pauses::fixed(std::time::Duration::from_millis(20)),
+        || true,
+    )?;
+    match waited {
+        crate::fsx::Waited::Held => Ok(()),
+        crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("still held after {} s", wait.as_secs()),
+        )),
     }
 }
 
@@ -237,6 +236,24 @@ mod tests {
         let d = std::env::temp_dir().join(format!("bop-busy-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A held lock is waited for, then a `WouldBlock` error naming the wait; a free one at once.
+    #[test]
+    fn lock_waiting_waits_then_gives_up() {
+        let d = tmp("wait");
+        let open = || open_marker(&d.join("m.busy")).unwrap();
+        let held = open();
+        fs4::FileExt::try_lock(&held).unwrap();
+        let f = open();
+        let started = std::time::Instant::now();
+        let e = lock_waiting(&f, std::time::Duration::from_millis(60)).unwrap_err();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(e.to_string().starts_with("still held after"), "{e}");
+        fs4::FileExt::unlock(&held).unwrap();
+        lock_waiting(&f, std::time::Duration::ZERO).unwrap();
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

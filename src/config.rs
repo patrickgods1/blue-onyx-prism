@@ -1244,26 +1244,23 @@ impl Config {
         Ok(serde_json::to_string_pretty(&named)?)
     }
 
-    /// Write the config as pretty JSON ([`Self::saved_text`]), atomically: the text goes to
-    /// `<path>.tmp` in the same directory, is flushed to disk, then renamed over `path`
-    /// (`std::fs::rename` replaces the target on Windows too). A crash or a full disk leaves
-    /// the previous file intact; on failure the temp file is removed.
+    /// Write the config as pretty JSON ([`Self::saved_text`]), atomically
+    /// ([`crate::fsx::write_atomic_with`]): the text goes to a temporary file of its own in the
+    /// same directory (`.<name>.<uuid>.tmp`, so two processes saving at once never write into
+    /// one file), keeps the existing file's permissions (an installer's `chmod 0640` stays), is
+    /// flushed to disk, then renamed over `path`, retried for up to a second while Windows
+    /// reports the file in use (an antivirus or indexer). A crash or a full disk leaves the
+    /// previous file intact; on failure the temp file is removed.
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = self.saved_text()?;
-        let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp = path.with_file_name(tmp_name);
-        let write = || -> std::io::Result<()> {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, path)
+        let opts = crate::fsx::Options {
+            rename_attempts: crate::fsx::RENAME_ATTEMPTS,
+            rename_pause: crate::fsx::RENAME_PAUSE,
+            ..crate::fsx::Options::default()
         };
-        write().map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::Error::new(e).context(format!("writing config {}", path.display()))
+        crate::fsx::write_atomic_with(path, text.as_bytes(), &opts).map_err(|e| {
+            anyhow::Error::new(std::io::Error::from(e))
+                .context(format!("writing config {}", path.display()))
         })
     }
 
@@ -4139,12 +4136,81 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             c.saved_text().unwrap()
         );
-        assert!(!dir.join("c.json.tmp").exists());
+        let names = || -> Vec<String> {
+            let mut n: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(), ["c.json"], "no temporary file is left");
         // A failed write (the target is a directory) keeps nothing behind.
         let bad = dir.join("sub");
         std::fs::create_dir_all(bad.join("x")).unwrap();
-        assert!(c.save(&bad).is_err());
-        assert!(!dir.join("sub.tmp").exists());
+        let err = format!("{:#}", c.save(&bad).unwrap_err());
+        assert!(err.starts_with("writing config "), "{err}");
+        assert_eq!(names(), ["c.json", "sub"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Saves keep the file's mode: the installers' `chmod 0640` survives the service's first save.
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("bop-cfg-mode-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        Config::default().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two writers saving the same file at once (as the service and a CLI command can) never
+    /// leave a mixed file: every read loads as one of the two configs.
+    #[test]
+    fn concurrent_saves_never_mix() {
+        let dir = std::env::temp_dir().join(format!("bop-cfg-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::sync::Arc::new(dir.join("c.json"));
+        let configs: Vec<Config> = [1111u16, 2222]
+            .into_iter()
+            .map(|port| Config {
+                port,
+                allowed_hosts: if port == 1111 {
+                    (0..30)
+                        .map(|i| format!("camera-host-{i}-{}.example", "x".repeat(40)))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            })
+            .collect();
+        let texts: Vec<String> = configs.iter().map(|c| c.saved_text().unwrap()).collect();
+        let writers: Vec<_> = configs
+            .into_iter()
+            .map(|c| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        c.save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let got = std::fs::read_to_string(&*path).unwrap();
+        assert!(texts.contains(&got));
+        Config::load(&path).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(left.len(), 1, "no temporary file is left");
         std::fs::remove_dir_all(&dir).ok();
     }
 

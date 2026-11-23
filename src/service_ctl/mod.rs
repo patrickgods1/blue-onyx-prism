@@ -203,33 +203,51 @@ pub fn systemd_state(load_state: &str, active_state: &str) -> ServiceState {
     }
 }
 
-/// Whether the effective user is root (`id -u`; no `unsafe` outside `backend/`). False when
-/// `id` cannot be run.
+/// Whether the effective user is root ([`crate::command::euid`]). False when `id` cannot be run.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn is_root() -> bool {
-    std::process::Command::new("/usr/bin/id")
-        .arg("-u")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+    crate::command::euid() == Some(0)
 }
 
-/// Run a command and capture its output; a command that cannot be started is an error naming
-/// it.
+/// Longest wait for a service-manager query (`launchctl print`, `systemctl show`): it answers in
+/// milliseconds, so a longer wait means launchd or systemd is wedged (the tray polls with it).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn run(program: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
+pub(crate) const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Longest wait for a state change (`launchctl bootstrap|bootout|kickstart|enable`,
+/// `systemctl start|stop|restart`, which waits for the job): above systemd's default 90 s start
+/// timeout and the unit's 30 s stop timeout.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) const CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Run a command for at most `timeout` ([`QUERY_TIMEOUT`] or [`CHANGE_TIMEOUT`]) through
+/// [`crate::command::run_within`] and capture its output. A command that cannot be started or
+/// does not answer in time (it is stopped) is an error naming it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn run(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> anyhow::Result<crate::command::RunOutput> {
     use anyhow::Context;
-    std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("could not run `{program} {}`", args.join(" ")))
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    let out = crate::command::run_within(cmd, timeout, None)
+        .with_context(|| format!("could not run `{program} {}`", args.join(" ")))?;
+    if out.ended != crate::command::Ended::Exited {
+        anyhow::bail!(
+            "`{program} {}` did not answer within {} s and was stopped: the service manager is \
+             busy or hung (during boot or shutdown, or under heavy load). Try again in a minute.",
+            args.join(" "),
+            timeout.as_secs()
+        );
+    }
+    Ok(out)
 }
 
 /// stderr (else stdout) of a finished command, trimmed, for error messages.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn output_text(out: &std::process::Output) -> String {
+pub(crate) fn output_text(out: &crate::command::RunOutput) -> String {
     let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if err.is_empty() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -340,5 +358,36 @@ mod tests {
         assert!(msg.starts_with("Stopping the service needs administrator rights"));
         assert!(msg.contains("sudo blue-onyx-prism service stop"));
         assert!(msg.contains("administrator terminal"));
+    }
+
+    /// `run` answers a tool's output and exit status, and stops a tool that hangs (the tray's
+    /// poll must not freeze on a wedged launchctl) with a message naming it.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn run_is_bounded_and_names_the_command() {
+        let out = run("/bin/sh", &["-c", "echo said >&2; exit 2"], QUERY_TIMEOUT).unwrap();
+        assert!(!out.success());
+        assert_eq!(output_text(&out), "said");
+        let out = run("/bin/sh", &["-c", "echo state=ok"], QUERY_TIMEOUT).unwrap();
+        assert!(out.success());
+        assert_eq!(output_text(&out), "state=ok");
+        let t = std::time::Instant::now();
+        let e = run(
+            "/bin/sh",
+            &["-c", "sleep 60"],
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(t.elapsed() < std::time::Duration::from_secs(8));
+        assert!(
+            e.starts_with("`/bin/sh -c sleep 60` did not answer within 1 s and was stopped"),
+            "{e}"
+        );
+        let e = run("/nonexistent/launchctl", &["print"], QUERY_TIMEOUT)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "could not run `/nonexistent/launchctl print`");
+        assert_eq!(is_root(), crate::command::euid() == Some(0));
     }
 }

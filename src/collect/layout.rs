@@ -527,22 +527,10 @@ pub fn rewrite_index(day: &Path) -> Result<usize> {
 }
 
 /// Write `bytes` to `path` through a temporary file in the same folder and a rename, so a
-/// reader never sees a half-written file.
+/// reader never sees a half-written file ([`crate::fsx::write_atomic`]: `.<name>.<uuid>.tmp`,
+/// synced, the target's permissions kept). The folder must exist.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_data()?;
-        drop(f);
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    crate::fsx::write_atomic(path, bytes)
 }
 
 /// Whether the file `f` is empty or ends in a newline (a crash or a full disk mid-append leaves
@@ -634,17 +622,22 @@ fn queue_lock(dir: &Path, wait: std::time::Duration, process: bool) -> QueueLock
         .open(&path);
     let folder = match file {
         Ok(f) => {
-            let start = std::time::Instant::now();
-            loop {
-                match fs4::FileExt::try_lock(&f) {
-                    Ok(()) => break Some(f),
-                    Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(e) => {
-                        tracing::debug!("{}: {e}", path.display());
-                        break None;
-                    }
+            let waited = crate::fsx::lock_wait_with(
+                &f,
+                crate::fsx::LockKind::Exclusive,
+                crate::fsx::deadline_after(wait),
+                crate::fsx::Pauses::fixed(std::time::Duration::from_millis(2)),
+                || true,
+            );
+            match waited {
+                Ok(crate::fsx::Waited::Held) => Some(f),
+                Ok(crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped) => {
+                    tracing::debug!("{}: still locked after {wait:?}", path.display());
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!("{}: {e}", path.display());
+                    None
                 }
             }
         }

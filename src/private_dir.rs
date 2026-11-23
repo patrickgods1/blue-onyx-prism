@@ -5,7 +5,7 @@
 //! ([`crate::accounts::lock`]).
 //!
 //! - **Unix:** the folder and its subfolders are 0700, files 0600 from their first byte
-//!   ([`crate::resources::hf_token::write_private`]). Run as root (a `sudo` CLI command), what is
+//!   ([`crate::fsx::Options::private`]). Run as root (a `sudo` CLI command), what is
 //!   made is handed to the owner of the folder above it, so the service account can still read
 //!   and replace it.
 //! - **Windows:** the data root's DACL lets every local user read (the tray reads the config
@@ -148,29 +148,39 @@ fn close_unix(dir: &Path, parent: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `text` as `<dir>/<name>`, replacing what is there: a temporary file inside `dir` (0600
-/// on Unix from its first byte, handed to `dir`'s owner when run as root), then a rename, tried
-/// again for up to a second while Windows reports the target in use. A failure leaves the old
-/// file and no temporary one.
+/// Write `text` as `<dir>/<name>`, replacing what is there: a temporary file inside `dir`
+/// (`.<name>.<uuid>.tmp`, 0600 on Unix from its first byte, handed to `dir`'s owner when run as
+/// root; [`crate::fsx::write_atomic_with`] with [`crate::fsx::Options::private`]), then a rename,
+/// tried again for up to a second while Windows reports the target in use. A failure leaves the
+/// old file and no temporary one.
 pub fn write_file(dir: &Path, name: &str, text: &str) -> Result<()> {
     let target = dir.join(name);
-    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = hf_token::write_private(&tmp, text).and_then(|()| {
+    #[cfg(unix)]
+    let hand_over = |tmp: &Path| {
+        give_to_folder_owner(tmp, dir).map_err(|e| std::io::Error::other(format!("{e:#}")))
+    };
+    let opts = crate::fsx::Options {
+        private: true,
+        rename_attempts: RENAME_ATTEMPTS,
+        rename_pause: RENAME_PAUSE,
         #[cfg(unix)]
-        give_to_folder_owner(&tmp, dir)?;
-        rename_retrying(&tmp, &target, RENAME_ATTEMPTS, RENAME_PAUSE).with_context(|| {
-            format!(
-                "replacing {}; check that this account may write there and that no other \
-                 program holds the file open",
-                target.display()
-            )
-        })
-    });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+        before_rename: Some(&hand_over),
+        ..crate::fsx::Options::default()
+    };
+    crate::fsx::write_atomic_with(&target, text.as_bytes(), &opts).map_err(|e| match e.step {
+        crate::fsx::Step::Rename => anyhow::Error::new(e.source).context(format!(
+            "replacing {}; check that this account may write there and that no other program \
+             holds the file open",
+            target.display()
+        )),
+        crate::fsx::Step::Create | crate::fsx::Step::CreateParent => {
+            anyhow::Error::new(e.source).context(format!("creating {}", e.temp.display()))
+        }
+        crate::fsx::Step::Write => {
+            anyhow::Error::new(e.source).context(format!("writing {}", e.temp.display()))
+        }
+        crate::fsx::Step::Prepare => anyhow::Error::new(e.source),
+    })
 }
 
 /// Run as root, `made` goes to the owner of `dir` (see `close_unix`).
@@ -188,34 +198,16 @@ fn give_to_folder_owner(made: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `rename(from, to)`, tried `attempts` times `pause` apart while the error is a Windows sharing
-/// violation ([`is_sharing_violation`]); any other error at once. Also used for folders: a
-/// folder whose new files a virus scanner or the search indexer still holds open is refused with
-/// ERROR_ACCESS_DENIED for a moment after they were written.
+/// `rename(from, to)`, retried while Windows reports a sharing violation
+/// ([`crate::fsx::rename_retrying`], [`crate::fsx::is_sharing_violation`]; kept here for its
+/// callers). Also used for folders.
 pub(crate) fn rename_retrying(
     from: &Path,
     to: &Path,
     attempts: u32,
     pause: std::time::Duration,
 ) -> std::io::Result<()> {
-    let mut left = attempts.max(1);
-    loop {
-        match std::fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) if left > 1 && is_sharing_violation(&e) => {
-                left -= 1;
-                std::thread::sleep(pause);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Whether `e` is Windows saying another process has the file open: ERROR_ACCESS_DENIED (5, a
-/// file open without delete sharing), ERROR_SHARING_VIOLATION (32), ERROR_LOCK_VIOLATION (33).
-/// Never on other systems, where a rename over an open file works.
-pub(crate) fn is_sharing_violation(e: &std::io::Error) -> bool {
-    cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
+    crate::fsx::rename_retrying(from, to, attempts, pause)
 }
 
 #[cfg(test)]
@@ -322,9 +314,11 @@ mod tests {
     #[test]
     fn only_windows_sharing_violations_are_retried() {
         let err = |code| std::io::Error::from_raw_os_error(code);
-        assert_eq!(is_sharing_violation(&err(32)), cfg!(windows));
-        assert_eq!(is_sharing_violation(&err(5)), cfg!(windows));
-        assert!(!is_sharing_violation(&std::io::Error::other("x")));
+        assert_eq!(crate::fsx::is_sharing_violation(&err(32)), cfg!(windows));
+        assert_eq!(crate::fsx::is_sharing_violation(&err(5)), cfg!(windows));
+        assert!(!crate::fsx::is_sharing_violation(&std::io::Error::other(
+            "x"
+        )));
         // A missing source fails at once, with its own error.
         let root = scratch();
         let started = std::time::Instant::now();

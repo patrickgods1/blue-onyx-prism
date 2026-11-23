@@ -309,27 +309,24 @@ impl TrainLock {
             .write(true)
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        let until = std::time::Instant::now() + LOCK_GRACE;
-        let mut res = file.try_lock();
-        while matches!(res, Err(std::fs::TryLockError::WouldBlock))
-            && std::time::Instant::now() < until
-        {
-            std::thread::sleep(Duration::from_millis(20));
-            res = file.try_lock();
-        }
-        match res {
-            Ok(()) => Ok(Self {
+        let waited = crate::fsx::lock_wait_with(
+            &file,
+            crate::fsx::LockKind::Exclusive,
+            crate::fsx::deadline_after(LOCK_GRACE),
+            crate::fsx::Pauses::fixed(Duration::from_millis(20)),
+            || true,
+        )
+        .with_context(|| format!("locking {}", path.display()))?;
+        match waited {
+            crate::fsx::Waited::Held => Ok(Self {
                 _file: file,
                 path: path.to_path_buf(),
             }),
-            Err(std::fs::TryLockError::WouldBlock) => bail!(
+            crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped => bail!(
                 "another process (the service or a `blue-onyx-prism train` command) is training \
                  a model and holds {}; wait for it to finish or cancel it, then try again",
                 path.display()
             ),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(e).with_context(|| format!("locking {}", path.display()))
-            }
         }
     }
 }

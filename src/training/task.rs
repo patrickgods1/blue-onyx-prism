@@ -17,7 +17,6 @@ use super::service::RunState;
 use crate::resources::export::{CommandRunner, Fetcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -480,10 +479,10 @@ fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &str) -> bool {
 }
 
 /// Write `records` to `path` as a JSON list, each stamped with its `format` ([`RECORD_FORMAT`]):
-/// through a temporary file, on the disk before the rename, so a crash leaves the old file or the
-/// new one. A failure only warns.
+/// through a temporary file of its own (`.<name>.<uuid>.tmp`, [`crate::fsx::write_atomic_with`]),
+/// on the disk before the rename, so a crash leaves the old file or the new one. The folder is
+/// created when missing. A failure only warns.
 pub fn save_file<T: Serialize>(path: &Path, records: &[T]) {
-    let tmp = path.with_extension("json.tmp");
     let stamped: Vec<Stamped<'_, T>> = records
         .iter()
         .map(|record| Stamped {
@@ -491,21 +490,17 @@ pub fn save_file<T: Serialize>(path: &Path, records: &[T]) {
             record,
         })
         .collect();
+    let opts = crate::fsx::Options {
+        create_parent: true,
+        ..crate::fsx::Options::default()
+    };
     let r = serde_json::to_vec_pretty(&stamped)
         .map_err(anyhow::Error::from)
         .and_then(|b| {
-            if let Some(p) = path.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&b)?;
-            f.sync_all()?;
-            drop(f);
-            std::fs::rename(&tmp, path)?;
+            crate::fsx::write_atomic_with(path, &b, &opts).map_err(std::io::Error::from)?;
             Ok(())
         });
     if let Err(e) = r {
-        let _ = std::fs::remove_file(&tmp);
         tracing::warn!("saving {}: {e:#}", path.display());
     }
 }
@@ -547,6 +542,41 @@ pub fn overall(step: usize, steps: usize, pct: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Saves create the folder, leave no temporary file, and two writers at once (the tcore-1
+    /// case: the service and a CLI command) never rename a mixed file into place.
+    #[test]
+    fn save_file_is_atomic_per_writer() {
+        let dir = std::env::temp_dir().join(format!("bop-save-file-{}", uuid::Uuid::new_v4()));
+        let path = std::sync::Arc::new(dir.join("sub").join("runs.json"));
+        save_file(&path, &[serde_json::json!({"n": 0})]);
+        assert_eq!(read_records::<serde_json::Value>(&path).len(), 1);
+        let writers: Vec<_> = [1usize, 300]
+            .into_iter()
+            .map(|n| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let records: Vec<serde_json::Value> =
+                        (0..n).map(|i| serde_json::json!({ "n": i })).collect();
+                    for _ in 0..50 {
+                        save_file(&path, &records);
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let text = std::fs::read(&*path).unwrap();
+        let list: Vec<serde_json::Value> = serde_json::from_slice(&text).unwrap();
+        assert!(matches!(list.len(), 1 | 300), "{}", list.len());
+        let names: Vec<String> = std::fs::read_dir(dir.join("sub"))
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+        assert_eq!(names, ["runs.json"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The pure reader takes what parses and leaves the file exactly as it was, damaged or not.
     #[test]

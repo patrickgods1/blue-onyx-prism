@@ -1,6 +1,7 @@
 //! `save_image_path` off the detection path: after a request is answered, its frame and
 //! predictions go to one writer thread (`image-save`) that draws the boxes, encodes the
-//! annotated JPEG and writes it ([`crate::image::save_annotated`]); the reply never waits for
+//! annotated JPEG and writes it ([`crate::image::save_annotated`], through a temporary file and a
+//! rename, so a stop or crash mid-write never leaves a truncated JPEG); the reply never waits for
 //! it, so `analysisRoundTripMs` holds no encode. The collector's pattern: a bounded queue fed by
 //! `try_send`; a full queue drops the save, counted, with a warning at most once per
 //! [`crate::metrics::LOG_THROTTLE_INTERVAL`].
@@ -209,6 +210,15 @@ mod tests {
         // The queued one is written by whoever drains the queue.
         write(rx.try_recv().unwrap());
         assert!(dir.join("cam1_od.jpg").is_file());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            ["cam1_od.jpg"],
+            "written in place by a rename, no temporary file"
+        );
         assert!(rx.try_recv().is_err(), "the dropped ones are gone");
         // A writer that is gone drops too.
         drop(rx);

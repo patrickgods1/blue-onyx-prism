@@ -175,7 +175,7 @@ pub fn failure_text(action: Action, code: Option<i32>, output: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+use crate::command::CREATE_NO_WINDOW;
 
 /// Windows PowerShell running `script` (`-EncodedCommand`) with no window of its own, through
 /// [`crate::system_info::windows_powershell_command`]: no inherited `PSModulePath`, so

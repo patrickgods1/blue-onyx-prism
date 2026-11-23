@@ -736,8 +736,9 @@ pub(crate) fn read_active_flavor(ort_root: &Path) -> Option<String> {
     ORT_FLAVOR_DIRS.contains(&f.as_str()).then_some(f)
 }
 
-/// Make `flavor` the active one (`<ort_root>/active.txt`, replaced atomically). It is used from
-/// the next process start (a process keeps the ONNX Runtime library it loaded).
+/// Make `flavor` the active one (`<ort_root>/active.txt`, replaced atomically,
+/// [`crate::fsx::write_atomic`]). It is used from the next process start (a process keeps the
+/// ONNX Runtime library it loaded).
 pub(crate) fn write_active_flavor(ort_root: &Path, flavor: &str) -> std::io::Result<()> {
     if !ORT_FLAVOR_DIRS.contains(&flavor) {
         return Err(std::io::Error::new(
@@ -746,9 +747,12 @@ pub(crate) fn write_active_flavor(ort_root: &Path, flavor: &str) -> std::io::Res
         ));
     }
     std::fs::create_dir_all(ort_root)?;
-    let tmp = ort_root.join(format!("{ORT_ACTIVE_FILE}.tmp"));
-    std::fs::write(&tmp, format!("{flavor}\n"))?;
-    std::fs::rename(&tmp, ort_root.join(ORT_ACTIVE_FILE))
+    // A temporary file of its own, synced before the rename: two writers (the service and a
+    // `setup-onnxruntime` command) never share one, and a power loss never leaves it empty.
+    crate::fsx::write_atomic(
+        &ort_root.join(ORT_ACTIVE_FILE),
+        format!("{flavor}\n").as_bytes(),
+    )
 }
 
 /// Why a file named anywhere but in `ORT_DYLIB_PATH` is not loaded.
@@ -1663,6 +1667,15 @@ mod tests {
             Some(root.join(lib))
         );
         assert!(write_active_flavor(&root, "../evil").is_err());
+        let temps: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "no active.txt temporary file is left: {temps:?}"
+        );
         std::fs::write(root.join(ORT_ACTIVE_FILE), "nonsense").unwrap();
         assert_eq!(read_active_flavor(&root), None);
         std::fs::remove_dir_all(&root).ok();

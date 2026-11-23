@@ -19,10 +19,8 @@ fn cpu_name_impl() -> String {
 fn cpu_name_impl() -> String {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("/usr/sbin/sysctl")
-            .args(["-n", "machdep.cpu.brand_string"])
-            .output()
-            && out.status.success()
+        if let Some(out) = sysctl("machdep.cpu.brand_string")
+            && out.success()
             && let Ok(s) = String::from_utf8(out.stdout)
             && !s.trim().is_empty()
         {
@@ -126,11 +124,34 @@ fn total_memory_bytes() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn total_memory_bytes() -> Option<u64> {
-    let out = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
+    let out = sysctl("hw.memsize")?;
     String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+/// How long one `sysctl` read may take.
+#[cfg(target_os = "macos")]
+const SYSCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `/usr/sbin/sysctl -n <name>` through [`crate::command::run_within`]; `None` (logged at debug)
+/// when it cannot run or does not answer within [`SYSCTL_TIMEOUT`].
+#[cfg(target_os = "macos")]
+fn sysctl(name: &str) -> Option<crate::command::RunOutput> {
+    let mut cmd = std::process::Command::new("/usr/sbin/sysctl");
+    cmd.args(["-n", name]);
+    match crate::command::run_within(cmd, SYSCTL_TIMEOUT, None) {
+        Ok(out) if out.ended == crate::command::Ended::Exited => Some(out),
+        Ok(_) => {
+            tracing::debug!(
+                "sysctl -n {name} did not answer within {} s",
+                SYSCTL_TIMEOUT.as_secs()
+            );
+            None
+        }
+        Err(e) => {
+            tracing::debug!("could not run /usr/sbin/sysctl -n {name}: {e}");
+            None
+        }
+    }
 }
 
 /// Environment variable Windows PowerShell 5.1 finds its modules through.
@@ -192,9 +213,11 @@ fn total_memory_bytes() -> Option<u64> {
 #[cfg(windows)]
 fn total_memory_bytes_powershell() -> Option<u64> {
     let exe = windows_powershell_exe();
-    match output_within(memory_query_command(&exe), MEMORY_QUERY_TIMEOUT) {
-        Ok(Some(out)) => String::from_utf8(out).ok()?.trim().parse().ok(),
-        Ok(None) => {
+    match crate::command::run_within(memory_query_command(&exe), MEMORY_QUERY_TIMEOUT, None) {
+        Ok(out) if out.ended == crate::command::Ended::Exited => {
+            String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+        }
+        Ok(_) => {
             tracing::warn!(
                 "the memory query ({}) did not answer within {} s; the hardware profile is \
                  classified without the RAM size (set hardware_profile to low/mid/high to \
@@ -226,38 +249,6 @@ fn memory_query_command(exe: &std::path::Path) -> std::process::Command {
         "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
     ]);
     cmd
-}
-
-/// Run `cmd` and return its stdout, or `Ok(None)` (the child is killed) when it does not
-/// exit within `timeout`. For commands with small output (the pipe cannot fill up).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn output_within(
-    mut cmd: std::process::Command,
-    timeout: std::time::Duration,
-) -> std::io::Result<Option<Vec<u8>>> {
-    use std::io::Read;
-    use std::process::Stdio;
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            let mut out = Vec::new();
-            if let Some(mut s) = child.stdout.take() {
-                s.read_to_end(&mut out)?;
-            }
-            return Ok(Some(out));
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -356,31 +347,12 @@ pub(crate) mod tests {
         assert_eq!(text.trim(), "ok", "{err}");
     }
 
-    #[cfg(unix)]
+    /// The sysctl reads go through the bounded runner and still answer.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn output_within_returns_stdout_or_times_out() {
-        use std::time::Duration;
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "echo 42"]);
-        let out = super::output_within(cmd, Duration::from_secs(10))
-            .unwrap()
-            .unwrap();
-        assert_eq!(String::from_utf8(out).unwrap().trim(), "42");
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "sleep 5"]);
-        let t = std::time::Instant::now();
-        assert!(
-            super::output_within(cmd, Duration::from_millis(200))
-                .unwrap()
-                .is_none()
-        );
-        assert!(t.elapsed() < Duration::from_secs(4));
-        assert!(
-            super::output_within(
-                std::process::Command::new("/nonexistent/prog"),
-                Duration::from_secs(1)
-            )
-            .is_err()
-        );
+    fn sysctl_reads_the_memory_size() {
+        assert!(super::total_memory_bytes().is_some_and(|b| b > 1 << 30));
+        assert!(super::sysctl("hw.memsize").is_some_and(|o| o.success()));
+        assert!(super::sysctl("no.such.sysctl.name").is_some_and(|o| !o.success()));
     }
 }

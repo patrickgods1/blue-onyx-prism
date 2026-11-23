@@ -2,15 +2,22 @@
 //! by blue-onyx-prism.exe (PID 4120)").
 //!
 //! Asks the OS tools rather than the socket tables (no `unsafe` outside `backend/`): Windows
-//! `netstat -ano` then `tasklist`, elsewhere `lsof`, then `ss` on Linux. Their output is parsed
-//! by pure functions tested on every OS. The answer is best effort: a tool that is missing, slow
-//! or not allowed to see another account's processes gives [`Lookup::Unknown`], with the reason.
+//! `netstat -ano` then `tasklist` (both by their `System32` path), elsewhere `lsof`, then `ss` on
+//! Linux. They run through [`crate::command`], which reads their output while they run (`netstat
+//! -ano` on a busy host prints far more than a pipe holds). Their output is parsed by pure
+//! functions tested on every OS. The answer is best effort: a tool that is missing, slow or not
+//! allowed to see another account's processes gives [`Lookup::Unknown`], with the reason.
 
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::ffi::OsStr;
+use std::process::Command;
+use std::time::Duration;
 
 /// How long one tool may run.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bytes of a tool's output read: `netstat -ano` lists every socket of the machine (about 80
+/// bytes a line), so 1 MiB holds some 13 000 of them; the other tools print one line or a few.
+const TOOL_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// A process listening on the port.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,27 +73,56 @@ pub fn lookup(port: u16) -> Lookup {
 
 #[cfg(windows)]
 fn lookup_windows(port: u16) -> Lookup {
-    let netstat = match run("netstat", &["-ano"]) {
+    let netstat = crate::command::system32("netstat.exe");
+    let netstat = match run(&netstat, &["-ano"], TOOL_TIMEOUT) {
         Ok(out) => out,
         Err(e) => return Lookup::Unknown(format!("netstat: {e}")),
     };
-    let Some(pid) = parse_netstat(&netstat, port) else {
-        return Lookup::Free;
+    let pid = match netstat_pid(&netstat, port) {
+        Ok(pid) => pid,
+        Err(lookup) => return lookup,
     };
     let filter = format!("PID eq {pid}");
-    let name = run("tasklist", &["/FI", &filter, "/FO", "CSV", "/NH"])
-        .ok()
-        .and_then(|out| parse_tasklist(&out, pid));
+    let tasklist = crate::command::system32("tasklist.exe");
+    let name = run(
+        &tasklist,
+        &["/FI", &filter, "/FO", "CSV", "/NH"],
+        TOOL_TIMEOUT,
+    )
+    .ok()
+    .and_then(|out| parse_tasklist(&out.text, pid));
     Lookup::Held(Holder { pid, name })
+}
+
+/// The listener's PID in a `netstat -ano` run, else what to answer: [`Lookup::Free`], or
+/// [`Lookup::Unknown`] when the output was cut off before the listener could have been listed.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "Windows only; tested everywhere")
+)]
+fn netstat_pid(out: &Ran, port: u16) -> Result<u32, Lookup> {
+    match parse_netstat(&out.text, port) {
+        Some(pid) => Ok(pid),
+        None if out.truncated => Err(Lookup::Unknown(format!(
+            "netstat listed more than {} KiB of sockets and the port was not among the first; \
+             run `netstat -ano | findstr :{port}` to see the holder",
+            TOOL_OUTPUT_LIMIT / 1024
+        ))),
+        None => Err(Lookup::Free),
+    }
 }
 
 #[cfg(not(windows))]
 fn lookup_unix(port: u16) -> Lookup {
     let spec = format!("-iTCP:{port}");
-    let lsof = run("lsof", &["-nP", &spec, "-sTCP:LISTEN", "-Fpc"]);
+    let lsof = run(
+        "lsof",
+        &["-nP", &spec, "-sTCP:LISTEN", "-Fpc"],
+        TOOL_TIMEOUT,
+    );
     match &lsof {
         Ok(out) => {
-            if let Some(h) = parse_lsof(out) {
+            if let Some(h) = parse_lsof(&out.text) {
                 return Lookup::Held(h);
             }
         }
@@ -96,8 +132,8 @@ fn lookup_unix(port: u16) -> Lookup {
     }
     if cfg!(target_os = "linux") {
         let filter = format!("sport = :{port}");
-        match run("ss", &["-ltnpH", &filter]) {
-            Ok(out) => return parse_ss(&out),
+        match run("ss", &["-ltnpH", &filter], TOOL_TIMEOUT) {
+            Ok(out) => return parse_ss(&out.text),
             Err(e) => {
                 let lsof = lsof.err().unwrap_or_default();
                 return Lookup::Unknown(format!("ss: {e}; lsof: {lsof}"));
@@ -107,41 +143,29 @@ fn lookup_unix(port: u16) -> Lookup {
     Lookup::Free
 }
 
-/// Run `program args`, at most [`TOOL_TIMEOUT`]; stdout as text. A non-zero exit with output
-/// still counts (lsof exits 1 when nothing matches).
-fn run(program: &str, args: &[&str]) -> Result<String, String> {
+/// A tool's stdout as text, and whether it was cut at [`TOOL_OUTPUT_LIMIT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ran {
+    text: String,
+    truncated: bool,
+}
+
+/// Run `program args` for at most `timeout` ([`TOOL_TIMEOUT`] in the lookups); stdout as text,
+/// stderr dropped. A non-zero exit with output still counts (lsof exits 1 when nothing matches).
+fn run(program: impl AsRef<OsStr>, args: &[&str], timeout: Duration) -> Result<Ran, String> {
     let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        /// No console window for a tool started by the tray or a console-less process.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd
-        .spawn()
+    cmd.args(args);
+    let out = crate::command::run_capped(cmd, timeout, None, TOOL_OUTPUT_LIMIT)
         .map_err(|e| format!("could not start it: {e}"))?;
-    let deadline = Instant::now() + TOOL_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("no answer within {} s", TOOL_TIMEOUT.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("waiting for it failed: {e}")),
+    match out.ended {
+        crate::command::Ended::Exited => Ok(Ran {
+            text: out.stdout_text(),
+            truncated: out.stdout_truncated,
+        }),
+        crate::command::Ended::TimedOut | crate::command::Ended::Abandoned => {
+            Err(format!("no answer within {} s", timeout.as_secs()))
         }
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("reading its output failed: {e}"))?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The port of a `host:port` / `[v6]:port` address column.
@@ -321,13 +345,68 @@ Active Connections\r
 
     /// The real lookup on this machine finds the listener this test opens (where the tools
     /// exist and may see this process; otherwise it must at least not claim another holder).
+    /// netstat always exists on Windows and lists every account's sockets, so there it must
+    /// find it (it used to time out on a full pipe).
     #[test]
     fn lookup_finds_a_listener_of_this_process() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         match lookup(port) {
             Lookup::Held(h) => assert_eq!(h.pid, std::process::id()),
+            other if cfg!(windows) => panic!("{other:?}"),
             Lookup::Unknown(_) | Lookup::Free => {}
         }
+    }
+
+    /// A tool printing more than a pipe buffer (here 3 MB) answers with the first
+    /// TOOL_OUTPUT_LIMIT bytes, marked cut; a silent one times out with the old text; a missing
+    /// one cannot start.
+    #[cfg(unix)]
+    #[test]
+    fn run_reads_big_output_and_keeps_its_texts() {
+        let t = std::time::Instant::now();
+        let out = run(
+            "/bin/sh",
+            &[
+                "-c",
+                "yes 'TCP 0.0.0.0:1 0.0.0.0:0 LISTENING 1' | head -c 3000000; exit 1",
+            ],
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        assert!(t.elapsed() < Duration::from_secs(15));
+        assert_eq!(out.text.len(), TOOL_OUTPUT_LIMIT);
+        assert!(out.truncated);
+        assert_eq!(parse_netstat(&out.text, 1), Some(1));
+        let small = run("/bin/sh", &["-c", "echo p7"], Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            small,
+            Ran {
+                text: "p7\n".into(),
+                truncated: false
+            }
+        );
+        assert_eq!(
+            run("/bin/sh", &["-c", "sleep 30"], Duration::from_secs(1)),
+            Err("no answer within 1 s".to_string())
+        );
+        let e = run("/nonexistent/netstat", &[], Duration::from_secs(1)).unwrap_err();
+        assert!(e.starts_with("could not start it: "), "{e}");
+    }
+
+    /// A listener missing from a cut-off netstat listing is unknown, never "free".
+    #[test]
+    fn cut_netstat_output_is_not_free() {
+        let ran = |text: &str, truncated| Ran {
+            text: text.into(),
+            truncated,
+        };
+        assert_eq!(netstat_pid(&ran(NETSTAT, false), 32168), Ok(4120));
+        assert_eq!(netstat_pid(&ran(NETSTAT, true), 32168), Ok(4120));
+        assert_eq!(netstat_pid(&ran(NETSTAT, false), 80), Err(Lookup::Free));
+        let Err(Lookup::Unknown(why)) = netstat_pid(&ran(NETSTAT, true), 80) else {
+            panic!("a cut listing gave an answer");
+        };
+        assert!(why.contains("findstr :80"), "{why}");
     }
 }

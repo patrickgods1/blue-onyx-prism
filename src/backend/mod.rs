@@ -42,6 +42,7 @@ pub mod onnx_rewrite;
 pub mod ort;
 pub mod plan;
 pub mod priority;
+pub mod process;
 pub mod select;
 pub mod spec;
 pub mod video_decode;

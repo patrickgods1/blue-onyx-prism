@@ -3,8 +3,9 @@
 //! enables and bootstraps the plist; restart is `kickstart -k`.
 
 use super::{
-    Action, LAUNCHD_LABEL, LAUNCHD_PLIST, ServiceState, admin_rights_error, is_root,
-    not_installed_error, output_text, parse_launchctl_pid, parse_launchctl_print, run,
+    Action, CHANGE_TIMEOUT, LAUNCHD_LABEL, LAUNCHD_PLIST, QUERY_TIMEOUT, ServiceState,
+    admin_rights_error, is_root, not_installed_error, output_text, parse_launchctl_pid,
+    parse_launchctl_print, run,
 };
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -24,8 +25,8 @@ fn target() -> String {
 
 /// The loaded job: its state and pid, or None when launchd does not know it.
 fn loaded() -> Result<Option<(ServiceState, Option<u32>)>> {
-    let out = run(LAUNCHCTL, &["print", &target()])?;
-    if !out.status.success() {
+    let out = run(LAUNCHCTL, &["print", &target()], QUERY_TIMEOUT)?;
+    if !out.success() {
         return Ok(None);
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -75,10 +76,14 @@ fn start() -> Result<ServiceState> {
             }
             // A `launchctl disable` (by hand or an older uninstall) would make bootstrap fail.
             launchctl(&["enable", &target()], "start")?;
-            let out = run(LAUNCHCTL, &["bootstrap", "system", LAUNCHD_PLIST])?;
+            let out = run(
+                LAUNCHCTL,
+                &["bootstrap", "system", LAUNCHD_PLIST],
+                CHANGE_TIMEOUT,
+            )?;
             // "Bootstrap failed: 5: Input/output error" also means "already loaded" (e.g. a
             // concurrent start); only an unloaded job after the call is a failure.
-            if !out.status.success() && loaded()?.is_none() {
+            if !out.success() && loaded()?.is_none() {
                 bail!(
                     "Starting the service failed: `launchctl bootstrap system {LAUNCHD_PLIST}` \
                      said: {}. Check the plist with `plutil -lint {LAUNCHD_PLIST}` and the log \
@@ -97,14 +102,14 @@ fn stop() -> Result<ServiceState> {
     }
     // bootout may report an error such as "36: Operation now in progress" while the job is
     // still exiting; whether the job is gone in the end is what counts.
-    let out = run(LAUNCHCTL, &["bootout", &target()])?;
+    let out = run(LAUNCHCTL, &["bootout", &target()], CHANGE_TIMEOUT)?;
     let deadline = Instant::now() + STOP_TIMEOUT;
     loop {
         if loaded()?.is_none() {
             return Ok(ServiceState::Stopped);
         }
         if Instant::now() >= deadline {
-            let said = if out.status.success() {
+            let said = if out.success() {
                 String::new()
             } else {
                 format!(" (`launchctl bootout` said: {})", output_text(&out))
@@ -140,10 +145,10 @@ fn wait_running(old_pid: Option<u32>) -> Result<ServiceState> {
     }
 }
 
-/// Run `launchctl <args>`, failing with its message.
+/// Run `launchctl <args>` (a state change: `kickstart`, `enable`), failing with its message.
 fn launchctl(args: &[&str], what: &str) -> Result<()> {
-    let out = run(LAUNCHCTL, args)?;
-    if !out.status.success() {
+    let out = run(LAUNCHCTL, args, CHANGE_TIMEOUT)?;
+    if !out.success() {
         bail!(
             "Could not {what} the service: `launchctl {}` said: {}. Check the log in \
              /var/log/blue-onyx-prism/ or reinstall the service.",

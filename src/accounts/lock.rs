@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The lock file's name in `auth/`.
 pub const LOCK_FILE: &str = ".lock";
@@ -55,28 +55,27 @@ pub fn lock_within(auth: &Path, wait: Duration) -> Result<AuthLock> {
             path.display()
         )
     })?;
-    let start = Instant::now();
-    let mut pause = Duration::from_micros(100);
-    loop {
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => return Ok(AuthLock { file, path }),
-            Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
-                std::thread::sleep(pause);
-                pause = (pause * 2).min(LOCK_POLL);
-            }
-            Err(fs4::TryLockError::WouldBlock) => bail!(
-                "{} stayed locked for {} s, so nothing was changed: another blue-onyx-prism \
-                 process (the service or a command) is changing accounts and seems stuck. Try \
-                 again; if it persists, restart the service",
-                path.display(),
-                wait.as_secs()
-            ),
-            Err(fs4::TryLockError::Error(e)) => bail!(
-                "could not lock {} ({e}), so nothing was changed; keep the data folder on a \
-                 local disk",
-                path.display()
-            ),
-        }
+    let waited = crate::fsx::lock_wait_with(
+        &file,
+        crate::fsx::LockKind::Exclusive,
+        crate::fsx::deadline_after(wait),
+        crate::fsx::Pauses::doubling(Duration::from_micros(100), LOCK_POLL),
+        || true,
+    );
+    match waited {
+        Ok(crate::fsx::Waited::Held) => Ok(AuthLock { file, path }),
+        Ok(crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped) => bail!(
+            "{} stayed locked for {} s, so nothing was changed: another blue-onyx-prism \
+             process (the service or a command) is changing accounts and seems stuck. Try \
+             again; if it persists, restart the service",
+            path.display(),
+            wait.as_secs()
+        ),
+        Err(e) => bail!(
+            "could not lock {} ({e}), so nothing was changed; keep the data folder on a \
+             local disk",
+            path.display()
+        ),
     }
 }
 
@@ -120,6 +119,7 @@ fn hand_over(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn a_held_lock_makes_the_next_wait_then_fail_closed() {
