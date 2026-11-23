@@ -417,6 +417,7 @@ impl Process {
         registry: &Arc<ModelRegistry>,
         provision: &Arc<Provision>,
         generation: &CancellationToken,
+        shutdown: &CancellationToken,
         loaded_ort: Option<crate::resources::catalog::Flavor>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
@@ -439,6 +440,7 @@ impl Process {
             config_path: self.config_path.clone(),
             log_reload: Some(self.log.clone()),
             restart: generation.clone(),
+            shutdown: shutdown.clone(),
             resources: Some(crate::resources::status::ResourcesCtx {
                 provisioner: self.provisioner.clone(),
                 provision: provision.clone(),
@@ -900,7 +902,14 @@ fn run_server_inner(
         if loaded_ort.is_none() {
             loaded_ort = registry.loaded_runtimes().ort;
         }
-        let state = process.state_for(&config, &registry, &provision, &generation, loaded_ort);
+        let state = process.state_for(
+            &config,
+            &registry,
+            &provision,
+            &generation,
+            &shutdown,
+            loaded_ort,
+        );
         process.note_data_root(&config);
         // The token of the data root the process started with: the one the service checks.
         crate::admin_token::ensure_for(&Config {

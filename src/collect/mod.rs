@@ -260,6 +260,13 @@ pub fn submit(frame: Frame) {
 }
 
 impl Collector {
+    /// The process is stopping (audit 2026-11 phase 1): finish the frame in hand, stop a prune
+    /// between two frames, and return by `deadline`. Idempotent. Phase 1 stub: implemented by
+    /// the collector work.
+    pub fn stop_for_exit(&self, deadline: std::time::Instant) {
+        let _ = deadline;
+    }
+
     fn sender(&self) -> Option<&Sender<Msg>> {
         self.tx
             .get_or_init(|| {

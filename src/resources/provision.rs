@@ -74,6 +74,13 @@ impl Default for Provisioner {
 }
 
 impl Provisioner {
+    /// The process is stopping (audit 2026-11 phase 1, step 1 of the stop): cancel a running
+    /// or queued model export and its child tree and stop the download thread, without waiting
+    /// past `deadline`. Idempotent. Phase 1 stub: implemented by the resources work.
+    pub fn stop_for_exit(&self, deadline: std::time::Instant) {
+        let _ = deadline;
+    }
+
     pub fn new() -> Self {
         Self::with_options(ProvisionOptions::default())
     }

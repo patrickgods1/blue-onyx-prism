@@ -115,6 +115,10 @@ pub struct AppState {
     /// This generation's token, cancelled by `POST /config/restart`: the run loop
     /// (`runner`) then builds the next generation and swaps it in ([`Shared::swap`]).
     pub(crate) restart: CancellationToken,
+    /// The run's stop request (Ctrl-C, SIGTERM, the service's Stop): cancelled once when the
+    /// process is going away, never by a generation restart. Long jobs that a restart must not
+    /// cut off (a dataset export, an X-AnyLabeling import) stop on this one.
+    pub(crate) shutdown: CancellationToken,
     /// Download manager and this generation's provisioning plan (None in tests that do not
     /// exercise resources).
     pub(crate) resources: Option<crate::resources::status::ResourcesCtx>,
@@ -173,6 +177,7 @@ impl AppState {
             config_path,
             log_reload: None,
             restart: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
             side_jobs: Arc::default(),

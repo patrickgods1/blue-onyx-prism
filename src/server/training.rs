@@ -56,6 +56,15 @@ pub(super) async fn own_queue(state: &Arc<AppState>) -> tokio::sync::MutexGuard<
     queue
 }
 
+/// The process (or this run, for an in-process restart) is stopping (audit 2026-11 phase 1, step
+/// 1 of the stop): stop the running job's child tree keeping the run's retry checkpoint (not a
+/// user Cancel), leave queued records retryable, shut the queue down and empty the slot so a
+/// later run starts a fresh queue on its own state. Returns by `deadline`. Idempotent. Phase 1
+/// stub: implemented by the training-queue work.
+pub(crate) fn stop_for_exit(deadline: std::time::Instant) {
+    let _ = deadline;
+}
+
 /// The process's training queue, started on first use.
 pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
     let svc = SERVICE
